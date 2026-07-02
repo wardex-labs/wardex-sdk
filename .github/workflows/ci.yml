@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: bufbuild/buf-action@v1
+      - name: cargo fmt --check
+        run: cargo fmt --all --check
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: cargo test (workspace; includes proto roundtrip)
+        run: cargo test --workspace
+      - name: buf lint
+        run: buf lint
+
+  python:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+          # uv.lock is gitignored (library convention); key the cache on pyproject instead.
+          cache-dependency-glob: "**/pyproject.toml"
+      - name: uv sync (builds wardex_sdk via maturin)
+        run: uv sync --python ${{ matrix.python-version }}
+      - name: ruff check
+        run: uv run ruff check sdks/python
+      - name: ruff format --check
+        run: uv run ruff format --check sdks/python
+      - name: pytest
+        run: uv run pytest sdks/python/tests -v

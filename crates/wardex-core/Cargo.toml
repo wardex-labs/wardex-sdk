@@ -1,0 +1,14 @@
+[package]
+name                   = "wardex-core"
+version                = "0.1.0"
+edition.workspace      = true
+rust-version.workspace = true
+authors.workspace      = true
+license.workspace      = true
+description            = "Unified facade for Wardex Rust core (re-exports protocol/codec/pipeline/replay)"
+
+[dependencies]
+wardex-codec    = { path = "../wardex-codec" }
+wardex-pipeline = { path = "../wardex-pipeline" }
+wardex-protocol = { path = "../wardex-protocol" }
+wardex-replay   = { path = "../wardex-replay" }

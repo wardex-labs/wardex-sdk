@@ -1,0 +1,39 @@
+syntax = "proto3";
+package wardex.v1;
+
+import "wardex/v1/common.proto";
+
+option java_package = "io.wardex.proto.v1";
+option java_multiple_files = true;
+
+message StateSnapshot {
+  bytes trace_id = 1;
+  bytes span_id = 2;
+  fixed64 timestamp_ns = 3;
+  SnapshotType snapshot_type = 4;
+  int32 turn_index = 5;
+  repeated KeyValue attributes = 6;        // opaque kv (LogRecord attributes)
+  bytes conversation_state = 7;            // accumulated conversation (LogRecord body)
+  repeated InputRef input_refs = 8;        // external content reference (hash)
+  ToolDefinitionSet tool_definitions = 9;  // universal (gen_ai tools)
+}
+
+message InputRef {
+  string key = 1;          // opaque identifier
+  string content_hash = 2; // "sha256:..."
+  string blob_ref = 3;     // reference to large body content (optional)
+}
+
+message ToolDefinition {
+  string name = 1;
+  string description = 2;
+  bytes parameters_schema = 3;             // JSON Schema
+  string version = 4;
+  string type = 5;                         // function/extension/datastore
+  string hash = 6;                         // individual tool identity
+}
+
+message ToolDefinitionSet {
+  repeated ToolDefinition tools = 1;
+  string set_hash = 2;                     // → gen_ai.tool.definitions
+}

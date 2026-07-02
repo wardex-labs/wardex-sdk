@@ -1,0 +1,47 @@
+# Rust
+target/
+**/*.rs.bk
+Cargo.lock
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+.env
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.ruff_cache/
+
+# maturin / native
+*.so
+*.dylib
+*.dll
+*.pyd
+
+# proto generated stubs (in case they land outside build.rs OUT_DIR)
+**/*_pb2.py
+**/*_pb2.pyi
+
+# IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# uv
+.uv-cache/
+uv.lock
+
+# Local design docs (kept out of the public tree)
+docs/
+
+# AI assistant local state / scratch
+.claude/
+.serena/
+.superpowers/
+
+# Tooling caches
+.mypy_cache/

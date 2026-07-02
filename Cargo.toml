@@ -1,0 +1,48 @@
+[workspace]
+resolver = "2"
+members  = [
+    "bindings/python",
+    "crates/wardex-codec",
+    "crates/wardex-core",
+    "crates/wardex-pipeline",
+    "crates/wardex-protocol",
+    "crates/wardex-replay",
+]
+
+[workspace.package]
+edition       = "2021"
+rust-version  = "1.83"
+authors       = ["Wardex Team"]
+license       = "Apache-2.0"
+
+[workspace.dependencies]
+# Core
+bytes         = "1"
+thiserror     = "2"
+tracing       = "0.1"
+
+# Protobuf
+prost                 = "0.13"
+prost-types           = "0.13"
+prost-build           = "0.13"
+protoc-bin-vendored   = "3"
+
+# Compression
+zstd          = "0.13"
+
+# Python FFI
+pyo3          = { version = "0.22", features = ["extension-module", "abi3-py310"] }
+
+# HTTP/1 parsing (Phase 2)
+httparse      = "1"
+
+# HTTP/2 HPACK decode (Phase 2 Slice 2)
+fluke-hpack   = "0.3"
+
+# JSON serialization (Phase 2 semantic parsing)
+serde         = { version = "1", features = ["derive"] }
+serde_json    = "1"
+flate2        = "1"
+
+# Test tooling (used from Phase 1+; Phase 0 only registers the dependency)
+insta         = "1"

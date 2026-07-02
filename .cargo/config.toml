@@ -1,0 +1,11 @@
+# Workspace-level Cargo configuration.
+#
+# macOS: allow undefined symbols when linking cdylib targets so that PyO3
+# extension modules can be built without linking against a specific
+# libpython. The Python interpreter provides the symbols at runtime when
+# it loads the extension via `import`.
+[target.aarch64-apple-darwin]
+rustflags = ["-C", "link-arg=-undefined", "-C", "link-arg=dynamic_lookup"]
+
+[target.x86_64-apple-darwin]
+rustflags = ["-C", "link-arg=-undefined", "-C", "link-arg=dynamic_lookup"]

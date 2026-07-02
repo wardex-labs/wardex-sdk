@@ -1,0 +1,11 @@
+[package]
+name                   = "wardex-pipeline"
+version                = "0.1.0"
+edition.workspace      = true
+rust-version.workspace = true
+authors.workspace      = true
+license.workspace      = true
+description            = "Normalizer + Sampler + PII regex for Wardex SDK"
+
+[dependencies]
+wardex-codec = { path = "../wardex-codec" }

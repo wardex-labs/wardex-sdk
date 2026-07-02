@@ -1,0 +1,59 @@
+[build-system]
+requires      = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name            = "wardex-sdk"
+version         = "0.1.0b1"
+description     = "Open-source observability SDK for AI agents — zero-instrumentation capture, OpenTelemetry-native"
+readme          = "README.md"
+requires-python = ">=3.10"
+license         = { text = "Apache-2.0" }
+authors         = [{ name = "Wardex Labs" }]
+maintainers     = [{ name = "Wardex Labs" }]
+keywords        = ["observability", "ai-agents", "opentelemetry", "llm", "tracing"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Software Development :: Libraries",
+    "Topic :: System :: Monitoring",
+]
+
+[project.urls]
+Homepage   = "https://github.com/wardex-labs/wardex-sdk"
+Repository = "https://github.com/wardex-labs/wardex-sdk"
+Issues     = "https://github.com/wardex-labs/wardex-sdk/issues"
+
+[tool.maturin]
+manifest-path  = "../../bindings/python/Cargo.toml"
+python-source  = "src"
+module-name    = "wardex_sdk._wardex_native"
+features       = ["pyo3/extension-module"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.24",
+    "syrupy>=4",
+    "ruff>=0.7",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "strict"
+
+[tool.ruff]
+line-length    = 100
+target-version = "py310"
+src            = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "W", "UP"]
+
+[tool.ruff.format]
+quote-style = "double"

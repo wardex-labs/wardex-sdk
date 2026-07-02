@@ -1,0 +1,109 @@
+syntax = "proto3";
+package wardex.v1;
+
+option java_package = "io.wardex.proto.v1";
+option java_multiple_files = true;
+
+// --- Enums ---
+
+enum SpanKind {
+  SPAN_KIND_UNSPECIFIED = 0;
+  SPAN_KIND_INTERNAL = 1;
+  SPAN_KIND_CLIENT = 2;
+  SPAN_KIND_SERVER = 3;
+}
+
+enum StatusCode {
+  STATUS_CODE_UNSET = 0;
+  STATUS_CODE_OK = 1;
+  STATUS_CODE_ERROR = 2;
+}
+
+enum Protocol {
+  PROTOCOL_UNSPECIFIED = 0;
+  PROTOCOL_HTTP = 1;
+  PROTOCOL_GRPC = 2;
+  PROTOCOL_WEBSOCKET = 3;
+  PROTOCOL_MCP_STDIO = 4;
+  PROTOCOL_SSE = 5;
+}
+
+enum Modality {
+  MODALITY_UNSPECIFIED = 0;
+  MODALITY_TEXT = 1;
+  MODALITY_IMAGE = 2;
+  MODALITY_AUDIO = 3;
+  MODALITY_VIDEO = 4;
+  MODALITY_EMBEDDING = 5;
+}
+
+enum Direction {
+  DIRECTION_UNSPECIFIED = 0;
+  DIRECTION_OUTBOUND = 1;
+  DIRECTION_INBOUND = 2;
+}
+
+enum SnapshotType {
+  SNAPSHOT_TYPE_UNSPECIFIED = 0;
+  SNAPSHOT_TYPE_SPAN_START = 1;
+  SNAPSHOT_TYPE_SPAN_END = 2;
+  SNAPSHOT_TYPE_TURN_START = 3;
+}
+
+enum SessionStatus {
+  SESSION_STATUS_UNSPECIFIED = 0;
+  SESSION_STATUS_ACTIVE = 1;
+  SESSION_STATUS_COMPLETED = 2;
+  SESSION_STATUS_INTERRUPTED = 3;
+  SESSION_STATUS_CRASHED = 4;
+}
+
+enum CaptureSource {
+  CAPTURE_SOURCE_UNSPECIFIED = 0;
+  CAPTURE_SOURCE_ADAPTER = 1;
+  CAPTURE_SOURCE_SSL = 2;
+  CAPTURE_SOURCE_STDIO = 3;
+  CAPTURE_SOURCE_GRPC = 4;
+  CAPTURE_SOURCE_WEBSOCKET = 5;
+  CAPTURE_SOURCE_MANUAL = 6;
+  CAPTURE_SOURCE_SOCKET = 7;  // plaintext raw-socket seam (http/ws/h2c)
+}
+
+enum RetentionClass {
+  RETENTION_CLASS_UNSPECIFIED = 0;
+  RETENTION_CLASS_SUMMARY_ONLY = 1;   // metadata/metrics only. replay not possible
+  RETENTION_CLASS_REPLAYABLE = 2;     // full captured I/O → cached replay possible
+  RETENTION_CLASS_FORENSIC = 3;       // + headers/integrity/raw long-term retention (placeholder for P2 extension)
+}
+
+// --- Common Value Types ---
+
+message AnyValue {
+  oneof value {
+    string string_value = 1;
+    bool bool_value = 2;
+    int64 int_value = 3;
+    double double_value = 4;
+    bytes bytes_value = 5;
+    ArrayValue array_value = 6;
+    KeyValueList kvlist_value = 7;
+  }
+}
+
+message ArrayValue {
+  repeated AnyValue values = 1;
+}
+
+message KeyValueList {
+  repeated KeyValue values = 1;
+}
+
+message KeyValue {
+  string key = 1;
+  AnyValue value = 2;
+}
+
+message Status {
+  StatusCode code = 1;
+  string message = 2;
+}

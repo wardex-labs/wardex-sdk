@@ -1,0 +1,57 @@
+syntax = "proto3";
+package wardex.v1;
+
+import "wardex/v1/span.proto";
+import "wardex/v1/state.proto";
+import "wardex/v1/common.proto";
+
+option java_package = "io.wardex.proto.v1";
+option java_multiple_files = true;
+
+message Envelope {
+  EnvelopeHeader header = 1;
+  repeated EnvelopeItem items = 2;
+}
+
+message EnvelopeHeader {
+  string event_id = 1;
+  string api_key = 2;
+  SdkInfo sdk = 3;
+  fixed64 sent_at_unix_nano = 4;
+  SessionStatus session_status = 5;
+  RetentionClass retention_class = 6;  // retention grade for this batch trace (v2)
+}
+
+message SdkInfo {
+  string name = 1;
+  string version = 2;
+  string python_version = 3;
+  string os = 4;
+  string arch = 5;
+  repeated string adapters = 6;
+  repeated string interceptors = 7;
+  string otel_semconv_version = 8;  // "1.36.0"
+  string shell = 9;                 // "zsh", "bash" (static host metadata, v2 alignment #1)
+}
+
+message EnvelopeItem {
+  EnvelopeItemHeader header = 1;
+  oneof payload {
+    Span span = 2;
+    StateSnapshot state_snapshot = 3;
+    ClientReport client_report = 4;
+  }
+}
+
+message EnvelopeItemHeader {
+  string type = 1;
+  int32 length = 2;
+}
+
+message ClientReport {
+  fixed64 timestamp_ns = 1;
+  map<string, int32> discarded_events = 2;
+  int32 failed_sends = 3;
+  int32 queue_depth = 4;
+  int64 uptime_ms = 5;
+}

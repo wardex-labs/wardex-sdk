@@ -1,0 +1,28 @@
+syntax = "proto3";
+package wardex.v1;
+
+import "wardex/v1/envelope.proto";
+
+option java_package = "io.wardex.proto.v1";
+option java_multiple_files = true;
+
+service IngestionService {
+  rpc Ingest(IngestRequest) returns (IngestResponse);
+  rpc IngestStream(stream IngestRequest) returns (IngestResponse);
+}
+
+message IngestRequest {
+  Envelope envelope = 1;
+}
+
+message IngestResponse {
+  bool accepted = 1;
+  string error_message = 2;
+  RateLimitInfo rate_limit = 3;
+}
+
+message RateLimitInfo {
+  int32 remaining = 1;
+  int32 limit = 2;
+  int32 retry_after_ms = 3;
+}

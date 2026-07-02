@@ -1,0 +1,11 @@
+# Line endings
+* text=auto eol=lf
+*.bat text eol=crlf
+*.sh text eol=lf
+
+# Binary
+*.so binary
+*.dylib binary
+*.dll binary
+*.pyd binary
+*.whl binary

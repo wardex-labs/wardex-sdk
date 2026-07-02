@@ -1,0 +1,18 @@
+[package]
+name                   = "wardex-codec"
+version                = "0.1.0"
+edition.workspace      = true
+rust-version.workspace = true
+authors.workspace      = true
+license.workspace      = true
+description            = "Protobuf encoding (prost) + Zstd compression for Wardex SDK"
+
+[dependencies]
+prost       = { workspace = true }
+prost-types = { workspace = true }
+bytes       = { workspace = true }
+zstd        = { workspace = true }
+
+[build-dependencies]
+prost-build           = { workspace = true }
+protoc-bin-vendored   = { workspace = true }

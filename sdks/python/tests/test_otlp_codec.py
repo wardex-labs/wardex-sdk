@@ -1,0 +1,196 @@
+"""OTLP/HTTP traces marshaling.
+
+InternalEnvelope -> encode_otlp_traces -> decode -> field preservation.
+"""
+
+from __future__ import annotations
+
+from wardex_sdk import _wardex_native
+from wardex_sdk._enums import (
+    Direction,
+    OperationName,
+    Protocol,
+    SpanKind,
+    StatusCode,
+)
+from wardex_sdk._types import (
+    EnvelopeHeader,
+    GenAIAttributes,
+    HttpMeta,
+    InputRef,
+    InternalEnvelope,
+    InternalSpan,
+    InternalStateSnapshot,
+    SdkInfo,
+    SpanContext,
+    SpanId,
+    TraceId,
+    TransportAttributes,
+    TransportTiming,
+)
+
+
+def _header() -> EnvelopeHeader:
+    return EnvelopeHeader(
+        event_id="evt-1",
+        api_key="k",
+        sdk=SdkInfo(
+            name="wardex.python",
+            version="0.1.0",
+            python_version="3.12",
+            os="mac",
+            arch="arm64",
+        ),
+        sent_at_ns=42,
+    )
+
+
+def _span(**kw) -> InternalSpan:
+    base = dict(
+        context=SpanContext(trace_id=TraceId(b"\x01" * 16), span_id=SpanId(b"\x02" * 8)),
+        parent_span_id=None,
+        name="HTTP POST /v1/chat",
+        kind=SpanKind.CLIENT,
+        start_time_ns=1000,
+        end_time_ns=2000,
+        status=StatusCode.OK,
+    )
+    base.update(kw)
+    return InternalSpan(**base)
+
+
+def _envelope_with_span() -> InternalEnvelope:
+    return InternalEnvelope(
+        header=_header(),
+        spans=(
+            _span(
+                server_address="api.openai.com",
+                server_port=443,
+                input_data=b"req-bytes",
+                output_data=b"resp-bytes",
+                transport=TransportAttributes(
+                    protocol=Protocol.HTTP,
+                    direction=Direction.OUTBOUND,
+                    timing=TransportTiming(ttfb_ms=30.0),
+                    http=HttpMeta(
+                        method="POST",
+                        url="https://api.openai.com/v1/chat",
+                        status_code=200,
+                    ),
+                ),
+            ),
+        ),
+    )
+
+
+def _envelope_with_gen_ai(model: str, input_tokens: int) -> InternalEnvelope:
+    return InternalEnvelope(
+        header=_header(),
+        spans=(
+            _span(
+                gen_ai=GenAIAttributes(
+                    operation=OperationName.CHAT,
+                    request_model=model,
+                    input_tokens=input_tokens,
+                    output_tokens=5,
+                    temperature=0.7,
+                    finish_reasons=("stop",),
+                ),
+            ),
+        ),
+    )
+
+
+def _envelope_no_spans() -> InternalEnvelope:
+    return InternalEnvelope(header=_header())
+
+
+def _envelope_with_snapshot_only() -> InternalEnvelope:
+    snap = InternalStateSnapshot(
+        trace_id=TraceId(b"\x03" * 16),
+        span_id=SpanId(b"\x04" * 8),
+        timestamp_ns=999,
+        snapshot_type="turn_start",
+        turn_index=1,
+        conversation_state=b"history",
+        input_refs=(InputRef(key="doc.md", content_hash="sha256:abc"),),
+    )
+    return InternalEnvelope(header=_header(), state_snapshots=(snap,))
+
+
+def _first_span(env: InternalEnvelope) -> dict:
+    data = _wardex_native.codec.encode_otlp_traces(env)
+    d = _wardex_native.codec.decode_otlp_traces(data)
+    return d["resource_spans"][0]["scope_spans"][0]["spans"][0]
+
+
+def test_encode_decode_roundtrip_core_fields():
+    env = _envelope_with_span()
+    data = _wardex_native.codec.encode_otlp_traces(env)
+    assert isinstance(data, bytes) and len(data) > 0
+    d = _wardex_native.codec.decode_otlp_traces(data)
+    span = d["resource_spans"][0]["scope_spans"][0]["spans"][0]
+    assert span["name"] == "HTTP POST /v1/chat"
+    assert span["kind"] == 3  # OTLP CLIENT
+    assert span["status"]["code"] == 1  # OTLP OK
+    assert span["start_time_unix_nano"] == 1000
+    assert span["end_time_unix_nano"] == 2000
+    assert span["trace_id"] == "01" * 16
+    assert span["span_id"] == "02" * 8
+    attrs = span["attributes"]
+    assert attrs["server.address"] == "api.openai.com"
+    assert attrs["server.port"] == 443
+    assert attrs["network.protocol.name"] == "http"
+    assert attrs["http.request.method"] == "POST"
+    assert attrs["http.response.status_code"] == 200
+    assert attrs["wardex.input_data"] == b"req-bytes"
+    assert attrs["wardex.output_data"] == b"resp-bytes"
+
+
+def test_gen_ai_flattened_to_attributes():
+    env = _envelope_with_gen_ai(model="gpt-4o", input_tokens=10)
+    attrs = _first_span(env)["attributes"]
+    assert attrs["gen_ai.request.model"] == "gpt-4o"
+    assert attrs["gen_ai.usage.input_tokens"] == 10
+    assert attrs["gen_ai.usage.output_tokens"] == 5
+    assert attrs["gen_ai.request.temperature"] == 0.7
+    assert attrs["gen_ai.operation.name"] == "chat"
+    assert attrs["gen_ai.response.finish_reasons"] == "stop"
+
+
+def test_resource_service_name():
+    env = _envelope_with_span()
+    d = _wardex_native.codec.decode_otlp_traces(_wardex_native.codec.encode_otlp_traces(env))
+    res_attrs = d["resource_spans"][0]["resource"]["attributes"]
+    assert res_attrs["service.name"] == "wardex.python"
+    assert res_attrs["service.version"] == "0.1.0"
+    assert res_attrs["telemetry.sdk.name"] == "wardex.python"
+    assert res_attrs["telemetry.sdk.version"] == "0.1.0"
+    assert res_attrs["telemetry.sdk.language"] == "python"
+
+
+def test_instrumentation_scope():
+    env = _envelope_with_span()
+    d = _wardex_native.codec.decode_otlp_traces(_wardex_native.codec.encode_otlp_traces(env))
+    scope = d["resource_spans"][0]["scope_spans"][0]["scope"]
+    assert scope["name"] == "wardex.python"
+    assert scope["version"] == "0.1.0"
+
+
+def test_determinism():
+    env = _envelope_with_span()
+    a = _wardex_native.codec.encode_otlp_traces(env)
+    b = _wardex_native.codec.encode_otlp_traces(env)
+    assert a == b
+
+
+def test_empty_envelope_no_resource_spans():
+    env = _envelope_no_spans()
+    d = _wardex_native.codec.decode_otlp_traces(_wardex_native.codec.encode_otlp_traces(env))
+    assert d["resource_spans"] == []
+
+
+def test_state_snapshot_skipped():
+    env = _envelope_with_snapshot_only()
+    d = _wardex_native.codec.decode_otlp_traces(_wardex_native.codec.encode_otlp_traces(env))
+    assert d["resource_spans"] == []
