@@ -20,6 +20,11 @@ publishes to PyPI via Trusted Publishing (OIDC) — no API token.
 
 Version scheme (PEP 440): `0.1.0b1` → `0.1.0b2` → `0.1.0rc1` → `0.1.0` → `0.1.1` / `0.2.0`.
 
+Suffixes: `aN` alpha, `bN` beta, `rcN` release candidate — pre-releases sort
+before the final version (`0.1.0b1` < `0.1.0`). Note: `pip install wardex-sdk`
+skips pre-releases by default; testers need `pip install wardex-sdk --pre`
+(or an exact pin like `wardex-sdk==0.1.0b1`).
+
 ## Notes
 
 - **A tag triggers the release, not a branch push.** Pushing `main` alone runs CI
