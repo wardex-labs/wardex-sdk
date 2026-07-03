@@ -23,33 +23,24 @@ jobs:
           - { runner: windows-latest, target: x64,     manylinux: "" }
     steps:
       - uses: actions/checkout@v4
+      # Run maturin from the package dir so it reads sdks/python/pyproject.toml
+      # (which points at the real crate via [tool.maturin] manifest-path). maturin's
+      # own --manifest-path expects a Cargo.toml, not pyproject.toml.
       - uses: PyO3/maturin-action@v1
         with:
           command: build
-          args: --release --out dist --manifest-path sdks/python/pyproject.toml
+          args: --release --out dist
           target: ${{ matrix.platform.target }}
           manylinux: ${{ matrix.platform.manylinux }}
+          working-directory: sdks/python
       - uses: actions/upload-artifact@v4
         with:
           name: wheels-${{ matrix.platform.runner }}-${{ matrix.platform.target }}
-          path: dist
-
-  sdist:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: PyO3/maturin-action@v1
-        with:
-          command: sdist
-          args: --out dist --manifest-path sdks/python/pyproject.toml
-      - uses: actions/upload-artifact@v4
-        with:
-          name: wheels-sdist
-          path: dist
+          path: sdks/python/dist
 
   publish:
     name: publish to PyPI
-    needs: [build, sdist]
+    needs: [build]
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
