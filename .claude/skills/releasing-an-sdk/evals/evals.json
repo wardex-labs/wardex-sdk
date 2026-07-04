@@ -1,0 +1,46 @@
+{
+  "skill_name": "releasing-an-sdk",
+  "evals": [
+    {
+      "id": 0,
+      "name": "cut-next-beta",
+      "prompt": "let's cut the next beta of the python sdk and get it up on pypi",
+      "expected_output": "Runs preflight; notices current 0.1.0b1 is NOT on PyPI so the target is finishing 0.1.0b1 (re-tag) rather than bumping to b2; drafts CHANGELOG from the diff; stops at the push gate without publishing.",
+      "files": [],
+      "assertions": [
+        "Runs the preflight checks (branch is main, clean tree, in sync with origin, CI green on HEAD, CHANGELOG has an Unreleased section)",
+        "Checks whether the current version 0.1.0b1 is already on PyPI before deciding the target",
+        "Given 0.1.0b1 is unpublished, targets finishing 0.1.0b1 (re-release) rather than proposing a bump to 0.1.0b2",
+        "Drafts CHANGELOG entries from git log since the last tag, grouped by Conventional Commit type",
+        "Reaches the tag-push gate and stops for explicit confirmation; does not push",
+        "Does not execute git push or publish anything"
+      ]
+    },
+    {
+      "id": 1,
+      "name": "recover-build-failure",
+      "prompt": "the release-python run for 0.1.0b2 died during the wheel build step. what should i do?",
+      "expected_output": "Explains a build failure means the publish job was skipped, so 0.1.0b2 is still free; recommends fixing the bug in repo files and re-tagging the SAME version at the fixed commit; does not recommend bumping.",
+      "files": [],
+      "assertions": [
+        "Recognizes that a build failure means the publish job was skipped, so the version is still free",
+        "Recommends re-tagging the SAME version (0.1.0b2), not bumping to a new version",
+        "Includes the caveat that the re-tag must point at the fixed commit (tag-triggered workflow uses the workflow file at the tagged commit)",
+        "Does not recommend bumping to a new version number"
+      ]
+    },
+    {
+      "id": 2,
+      "name": "publish-final-version",
+      "prompt": "i think we're ready to publish wardex-sdk 0.1.0 — the real one, out of beta",
+      "expected_output": "Honors the explicit 0.1.0 target; runs preflight incl. PyPI check for 0.1.0; drafts changelog; notes 0.1.0 is a final (installed by pip by default, unlike betas); stops at the gate.",
+      "files": [],
+      "assertions": [
+        "Runs preflight including a PyPI check for the 0.1.0 target",
+        "Honors the user's explicit 0.1.0 target instead of overriding it with a different version",
+        "Notes that 0.1.0 is a final release (pip installs it by default, unlike a pre-release)",
+        "Reaches the push gate and stops without publishing"
+      ]
+    }
+  ]
+}

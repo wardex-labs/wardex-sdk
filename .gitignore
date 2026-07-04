@@ -38,8 +38,13 @@ uv.lock
 # Local design docs (kept out of the public tree)
 docs/
 
-# AI assistant local state / scratch
-.claude/
+# AI assistant local state / scratch — ignore everything under .claude/ except
+# the release skill, which is versioned tooling (like RELEASING.md). The eval
+# workspace beside it stays ignored (it matches .claude/skills/*).
+.claude/*
+!.claude/skills/
+.claude/skills/*
+!.claude/skills/releasing-an-sdk/
 .serena/
 .superpowers/
 
