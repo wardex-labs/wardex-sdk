@@ -43,9 +43,29 @@ jobs:
           name: wheels-${{ matrix.platform.runner }}-${{ matrix.platform.target }}
           path: sdks/python/dist
 
+  smoke:
+    name: smoke-test wheel (linux x86_64)
+    needs: [build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheels-ubuntu-latest-x86_64
+          path: dist
+      # Import the built wheel (--no-index so it can't silently fall back to PyPI)
+      # to catch a broken native extension or missing files before we publish.
+      - name: install and import the built wheel
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --pre --no-index --find-links dist wardex-sdk
+          python -c "import wardex_sdk; print('smoke ok:', wardex_sdk.__version__)"
+
   publish:
     name: publish to PyPI
-    needs: [build]
+    needs: [build, smoke]
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
