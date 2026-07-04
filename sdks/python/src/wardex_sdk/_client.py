@@ -13,13 +13,14 @@ from ._types import (
     InternalStateSnapshot,
     SdkInfo,
 )
+from ._version import __version__
 from .transport._base import Transport
 
 
 def build_sdk_info() -> SdkInfo:
     return SdkInfo(
         name="wardex.python",
-        version="0.1.0",
+        version=__version__,
         python_version=platform.python_version(),
         os=sys.platform,
         arch=platform.machine(),

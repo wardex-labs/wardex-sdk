@@ -34,14 +34,14 @@ from ._types import (
     InternalStateSnapshot,
     ToolDefinitionSet,
 )
+from ._version import __version__
 from .transport._base import Transport
 from .transport._console import ConsoleTransport
 from .transport._noop import NoOpTransport
 from .transport._otlp_http import OtlpHttpTransport
 
-__version__ = "0.1.0"
-
 __all__ = [
+    "__version__",
     "init",
     "trace",
     "span",

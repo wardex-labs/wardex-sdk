@@ -399,7 +399,7 @@ class InternalStateSnapshot:
 @dataclass(frozen=True, slots=True)
 class SdkInfo:
     name: str  # "wardex.python"
-    version: str  # "0.1.0"
+    version: str  # SDK version, from package metadata (e.g. "0.1.0b1")
     python_version: str
     os: str
     arch: str
