@@ -5,6 +5,12 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0b2] - 2026-07-04
+
+### Fixed
+- `wardex_sdk.__version__` and the SDK version reported in exported telemetry now
+  reflect the actual installed version instead of a stale hardcoded string.
+
 ## [0.1.0b1] - 2026-07-02
 
 ### Added
