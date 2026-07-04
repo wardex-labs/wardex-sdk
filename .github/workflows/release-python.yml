@@ -12,13 +12,18 @@ jobs:
   build:
     name: build wheels (${{ matrix.platform.target }} on ${{ matrix.platform.runner }})
     runs-on: ${{ matrix.platform.runner }}
+    # Fail fast if a runner label has no capacity, instead of hanging up to the
+    # 24h "awaiting a runner" ceiling and silently skipping publish (needs: build).
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
         platform:
           - { runner: ubuntu-latest,  target: x86_64,  manylinux: auto }
           - { runner: ubuntu-latest,  target: aarch64, manylinux: auto }
-          - { runner: macos-13,       target: x86_64,  manylinux: "" }
+          # Intel macOS wheel is cross-compiled on an Apple Silicon runner —
+          # the macos-13 Intel hosted runner is retired / capacity-starved.
+          - { runner: macos-14,       target: x86_64,  manylinux: "" }
           - { runner: macos-14,       target: aarch64, manylinux: "" }
           - { runner: windows-latest, target: x64,     manylinux: "" }
     steps:
