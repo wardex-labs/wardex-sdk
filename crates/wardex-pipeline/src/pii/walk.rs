@@ -6,6 +6,7 @@
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
+use wardex_codec::otlp::otlp_pb;
 use wardex_codec::proto::wardex::v1 as pb;
 
 use super::{PiiEngine, PII_FILTER_ERROR};
@@ -408,6 +409,168 @@ fn mask_snapshot(engine: &PiiEngine, snap: &mut pb::StateSnapshot) {
     }
 }
 
+// --- OTLP masking (design §4.2, OTLP path) ---
+
+/// Mask an OTLP export request (design §4.2, OTLP path). A span that panics
+/// is scrubbed whole; a span with replacements gains `wardex.redacted=true`
+/// (OTLP spans have no capture_integrity — this is the OTLP equivalent).
+pub fn mask_otlp(engine: &PiiEngine, req: &mut otlp_pb::trace_service::ExportTraceServiceRequest) {
+    let otlp_pb::trace_service::ExportTraceServiceRequest { resource_spans } = req;
+    for rs in resource_spans {
+        // Destructure exhaustively; if the vendored OTLP proto carries extra
+        // fields the compiler will list them — bind non-text ones to `_`.
+        let otlp_pb::trace::ResourceSpans {
+            resource,
+            scope_spans,
+            schema_url,
+        } = rs;
+        if let Some(otlp_pb::resource::Resource {
+            attributes,
+            dropped_attributes_count: _,
+        }) = resource
+        {
+            mask_otlp_kvs(engine, attributes);
+        }
+        mask_string(engine, schema_url);
+        for ss in scope_spans {
+            let otlp_pb::trace::ScopeSpans {
+                scope,
+                spans,
+                schema_url,
+            } = ss;
+            if let Some(otlp_pb::common::InstrumentationScope {
+                name,
+                version,
+                attributes,
+                dropped_attributes_count: _,
+            }) = scope
+            {
+                mask_string(engine, name);
+                mask_string(engine, version);
+                mask_otlp_kvs(engine, attributes);
+            }
+            mask_string(engine, schema_url);
+            for span in spans {
+                match catch_unwind(AssertUnwindSafe(|| mask_otlp_span(engine, span))) {
+                    Err(_) => scrub_otlp_span_fail_closed(span),
+                    Ok(true) => span.attributes.push(otlp_kv_bool("wardex.redacted", true)),
+                    Ok(false) => {}
+                }
+            }
+        }
+    }
+}
+
+fn mask_otlp_span(engine: &PiiEngine, span: &mut otlp_pb::trace::Span) -> bool {
+    let otlp_pb::trace::Span {
+        trace_id: _,
+        span_id: _,
+        trace_state,
+        parent_span_id: _,
+        flags: _,
+        name,
+        kind: _,
+        start_time_unix_nano: _,
+        end_time_unix_nano: _,
+        attributes,
+        dropped_attributes_count: _,
+        events,
+        dropped_events_count: _,
+        links,
+        dropped_links_count: _,
+        status,
+    } = span;
+    let mut hit = false;
+    hit |= mask_string(engine, trace_state);
+    hit |= mask_string(engine, name);
+    hit |= mask_otlp_kvs(engine, attributes);
+    for ev in events {
+        let otlp_pb::trace::span::Event {
+            time_unix_nano: _,
+            name,
+            attributes,
+            dropped_attributes_count: _,
+        } = ev;
+        hit |= mask_string(engine, name);
+        hit |= mask_otlp_kvs(engine, attributes);
+    }
+    for link in links {
+        let otlp_pb::trace::span::Link {
+            trace_id: _,
+            span_id: _,
+            trace_state,
+            attributes,
+            dropped_attributes_count: _,
+            flags: _,
+        } = link;
+        hit |= mask_string(engine, trace_state);
+        hit |= mask_otlp_kvs(engine, attributes);
+    }
+    if let Some(otlp_pb::trace::Status { message, code: _ }) = status {
+        hit |= mask_string(engine, message);
+    }
+    hit
+}
+
+fn mask_otlp_kvs(engine: &PiiEngine, kvs: &mut [otlp_pb::common::KeyValue]) -> bool {
+    let mut hit = false;
+    for kv in kvs.iter_mut() {
+        let otlp_pb::common::KeyValue { key: _, value } = kv;
+        if let Some(v) = value {
+            hit |= mask_otlp_any(engine, v);
+        }
+    }
+    hit
+}
+
+fn mask_otlp_any(engine: &PiiEngine, v: &mut otlp_pb::common::AnyValue) -> bool {
+    use otlp_pb::common::any_value::Value;
+    let otlp_pb::common::AnyValue { value } = v;
+    match value {
+        Some(Value::StringValue(s)) => mask_string(engine, s),
+        Some(Value::BytesValue(b)) => mask_bytes(engine, b),
+        Some(Value::ArrayValue(arr)) => {
+            let otlp_pb::common::ArrayValue { values } = arr;
+            let mut hit = false;
+            for item in values {
+                hit |= mask_otlp_any(engine, item);
+            }
+            hit
+        }
+        Some(Value::KvlistValue(kvl)) => {
+            let otlp_pb::common::KeyValueList { values } = kvl;
+            mask_otlp_kvs(engine, values)
+        }
+        Some(Value::BoolValue(_))
+        | Some(Value::IntValue(_))
+        | Some(Value::DoubleValue(_))
+        | None => false,
+    }
+}
+
+fn otlp_kv_bool(key: &str, v: bool) -> otlp_pb::common::KeyValue {
+    otlp_pb::common::KeyValue {
+        key: key.into(),
+        value: Some(otlp_pb::common::AnyValue {
+            value: Some(otlp_pb::common::any_value::Value::BoolValue(v)),
+        }),
+    }
+}
+
+fn scrub_otlp_span_fail_closed(span: &mut otlp_pb::trace::Span) {
+    *span = otlp_pb::trace::Span {
+        trace_id: span.trace_id.clone(),
+        span_id: span.span_id.clone(),
+        parent_span_id: span.parent_span_id.clone(),
+        kind: span.kind,
+        start_time_unix_nano: span.start_time_unix_nano,
+        end_time_unix_nano: span.end_time_unix_nano,
+        name: PII_FILTER_ERROR.into(),
+        attributes: vec![otlp_kv_bool("wardex.redacted", true)],
+        ..Default::default()
+    };
+}
+
 // --- fail-closed scrubs (§8): identity/timing survive, no text does ---
 
 fn scrub_span_fail_closed(span: &mut pb::Span) {
@@ -581,5 +744,95 @@ mod tests {
         assert!(s.input_data.is_empty());
         assert!(s.status.is_none());
         assert!(s.capture_integrity.as_ref().unwrap().redacted);
+    }
+
+    // --- OTLP tests ---
+
+    use wardex_codec::otlp::otlp_pb;
+
+    fn otlp_kv_str(key: &str, v: &str) -> otlp_pb::common::KeyValue {
+        otlp_pb::common::KeyValue {
+            key: key.into(),
+            value: Some(otlp_pb::common::AnyValue {
+                value: Some(otlp_pb::common::any_value::Value::StringValue(v.into())),
+            }),
+        }
+    }
+
+    fn otlp_req_with_pii() -> otlp_pb::trace_service::ExportTraceServiceRequest {
+        otlp_pb::trace_service::ExportTraceServiceRequest {
+            resource_spans: vec![otlp_pb::trace::ResourceSpans {
+                resource: None,
+                scope_spans: vec![otlp_pb::trace::ScopeSpans {
+                    scope: None,
+                    spans: vec![otlp_pb::trace::Span {
+                        name: "chat for john@x.io".into(),
+                        attributes: vec![
+                            otlp_kv_str("gen_ai.output.messages", "reply to jane@y.io"),
+                            otlp_pb::common::KeyValue {
+                                key: "wardex.input_data".into(),
+                                value: Some(otlp_pb::common::AnyValue {
+                                    value: Some(otlp_pb::common::any_value::Value::BytesValue(
+                                        b"card 4111-1111-1111-1111".to_vec(),
+                                    )),
+                                }),
+                            },
+                        ],
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        }
+    }
+
+    fn otlp_attr<'a>(
+        span: &'a otlp_pb::trace::Span,
+        key: &str,
+    ) -> Option<&'a otlp_pb::common::any_value::Value> {
+        span.attributes
+            .iter()
+            .find(|kv| kv.key == key)?
+            .value
+            .as_ref()?
+            .value
+            .as_ref()
+    }
+
+    #[test]
+    fn otlp_spans_are_masked_and_flagged() {
+        let mut req = otlp_req_with_pii();
+        mask_otlp(&engine(), &mut req);
+        let span = &req.resource_spans[0].scope_spans[0].spans[0];
+        assert_eq!(span.name, "chat for [EMAIL]");
+        match otlp_attr(span, "gen_ai.output.messages").unwrap() {
+            otlp_pb::common::any_value::Value::StringValue(s) => {
+                assert_eq!(s, "reply to [EMAIL]");
+            }
+            other => panic!("unexpected value: {other:?}"),
+        }
+        match otlp_attr(span, "wardex.input_data").unwrap() {
+            otlp_pb::common::any_value::Value::BytesValue(b) => {
+                assert_eq!(b, &b"card ****-****-****-1111".to_vec());
+            }
+            other => panic!("unexpected value: {other:?}"),
+        }
+        match otlp_attr(span, "wardex.redacted").unwrap() {
+            otlp_pb::common::any_value::Value::BoolValue(v) => assert!(*v),
+            other => panic!("unexpected value: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn otlp_clean_span_gets_no_redacted_attr() {
+        let mut req = otlp_req_with_pii();
+        req.resource_spans[0].scope_spans[0].spans[0] = otlp_pb::trace::Span {
+            name: "plain".into(),
+            ..Default::default()
+        };
+        mask_otlp(&engine(), &mut req);
+        let span = &req.resource_spans[0].scope_spans[0].spans[0];
+        assert!(otlp_attr(span, "wardex.redacted").is_none());
     }
 }

@@ -6,7 +6,7 @@
 mod patterns;
 mod walk;
 
-pub use walk::mask_envelope;
+pub use walk::{mask_envelope, mask_otlp};
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
