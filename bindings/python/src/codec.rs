@@ -1008,6 +1008,8 @@ fn pii_apply_envelope(
     }
 }
 
+/// Apply the PII policy to a marshalled OTLP export request (design §4.2).
+/// Same "mask" | "off" contract as `pii_apply_envelope`.
 fn pii_apply_otlp(
     req: &mut otlp_pb::trace_service::ExportTraceServiceRequest,
     pii_mode: &str,

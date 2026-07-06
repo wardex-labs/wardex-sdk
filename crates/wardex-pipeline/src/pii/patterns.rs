@@ -18,6 +18,10 @@ pub(crate) struct PatternDef {
     pub regex: &'static str,
     pub validator: Option<fn(&str) -> bool>,
     pub replacement: Replacement,
+    /// Rescan policy after a validator rejection (see `Compiled::retry_on_reject`
+    /// in `mod.rs`). Declarative per-row so adding a category never requires
+    /// touching the engine.
+    pub retry_on_reject: bool,
 }
 
 /// Category identifiers — the FFI contract with the Python `PIICategory` enum.
@@ -38,6 +42,7 @@ pub(crate) static BUILTINS: &[PatternDef] = &[
         regex: r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}",
         validator: None,
         replacement: Replacement::Label("[EMAIL]"),
+        retry_on_reject: false,
     },
     // NANP with mandatory separators (or +1): bare 10-digit runs are NOT matched
     // to avoid masking ids/timestamps (design §5.1).
@@ -46,18 +51,21 @@ pub(crate) static BUILTINS: &[PatternDef] = &[
         regex: r"(?:\+1[ .-]?)?\(?[2-9][0-9]{2}\)?[ .-][0-9]{3}[ .-][0-9]{4}\b",
         validator: None,
         replacement: Replacement::Label("[PHONE]"),
+        retry_on_reject: false,
     },
     PatternDef {
         category: "credit_card",
         regex: r"\b[0-9](?:[ -]?[0-9]){12,18}\b",
         validator: Some(luhn_valid),
         replacement: Replacement::CardLast4,
+        retry_on_reject: true,
     },
     PatternDef {
         category: "us_ssn",
         regex: r"\b[0-9]{3}-[0-9]{2}-[0-9]{4}\b",
         validator: Some(ssn_valid),
         replacement: Replacement::Label("[SSN]"),
+        retry_on_reject: false,
     },
     // The {3,} tail makes version strings ("1.2.3.4.5") match as a whole and
     // then fail Ipv4Addr parsing — rejecting the false positive outright.
@@ -66,24 +74,28 @@ pub(crate) static BUILTINS: &[PatternDef] = &[
         regex: r"\b[0-9]{1,3}(?:\.[0-9]{1,3}){3,}\b",
         validator: Some(ipv4_valid),
         replacement: Replacement::Label("[IP_ADDRESS]"),
+        retry_on_reject: false,
     },
     PatternDef {
         category: "ip_address",
         regex: r"\b(?:[0-9A-Fa-f]{1,4}:){2,}[0-9A-Fa-f:]*[0-9A-Fa-f]\b",
         validator: Some(ipv6_valid),
         replacement: Replacement::Label("[IP_ADDRESS]"),
+        retry_on_reject: false,
     },
     PatternDef {
         category: "us_bank_routing",
         regex: r"\b[0-9]{9}\b",
         validator: Some(aba_valid),
         replacement: Replacement::Label("[BANK_ROUTING]"),
+        retry_on_reject: false,
     },
     PatternDef {
         category: "iban",
         regex: r"\b[A-Z]{2}[0-9]{2}[A-Z0-9]{11,30}\b",
         validator: Some(iban_valid),
         replacement: Replacement::Label("[IBAN]"),
+        retry_on_reject: false,
     },
     // Secrets: fixed prefixes only — deterministic, no entropy guessing (§5.1).
     PatternDef {
@@ -91,42 +103,49 @@ pub(crate) static BUILTINS: &[PatternDef] = &[
         regex: r"\bsk-[A-Za-z0-9_-]{16,}", // covers sk- and sk-ant-
         validator: None,
         replacement: Replacement::Label("[SECRET]"),
+        retry_on_reject: false,
     },
     PatternDef {
         category: "secret",
         regex: r"\bAKIA[0-9A-Z]{16}\b",
         validator: None,
         replacement: Replacement::Label("[SECRET]"),
+        retry_on_reject: false,
     },
     PatternDef {
         category: "secret",
         regex: r"\bgh[pousr]_[A-Za-z0-9]{36}\b",
         validator: None,
         replacement: Replacement::Label("[SECRET]"),
+        retry_on_reject: false,
     },
     PatternDef {
         category: "secret",
         regex: r"\bxox[abpos]-[A-Za-z0-9-]{10,}",
         validator: None,
         replacement: Replacement::Label("[SECRET]"),
+        retry_on_reject: false,
     },
     PatternDef {
         category: "secret",
         regex: r"\bAIza[0-9A-Za-z_-]{35}\b",
         validator: None,
         replacement: Replacement::Label("[SECRET]"),
+        retry_on_reject: false,
     },
     PatternDef {
         category: "secret",
         regex: r"(?i)\bbearer\s+[A-Za-z0-9._~+/-]{16,}=*",
         validator: None,
         replacement: Replacement::Label("[SECRET]"),
+        retry_on_reject: false,
     },
     PatternDef {
         category: "secret",
         regex: r"(?s)-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----",
         validator: None,
         replacement: Replacement::Label("[SECRET]"),
+        retry_on_reject: false,
     },
 ];
 

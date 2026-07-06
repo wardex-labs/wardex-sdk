@@ -462,6 +462,10 @@ pub fn mask_otlp(engine: &PiiEngine, req: &mut otlp_pb::trace_service::ExportTra
 }
 
 fn mask_otlp_span(engine: &PiiEngine, span: &mut otlp_pb::trace::Span) -> bool {
+    #[cfg(test)]
+    if span.name == TEST_PANIC_SPAN_NAME {
+        panic!("injected test panic");
+    }
     let otlp_pb::trace::Span {
         trace_id: _,
         span_id: _,
@@ -822,6 +826,29 @@ mod tests {
             otlp_pb::common::any_value::Value::BoolValue(v) => assert!(*v),
             other => panic!("unexpected value: {other:?}"),
         }
+    }
+
+    #[test]
+    fn otlp_panicking_span_is_scrubbed_fail_closed() {
+        let mut req = otlp_req_with_pii();
+        let span = &mut req.resource_spans[0].scope_spans[0].spans[0];
+        span.name = TEST_PANIC_SPAN_NAME.into();
+        span.trace_id = vec![0xAB; 16];
+        span.span_id = vec![0xCD; 8];
+        span.start_time_unix_nano = 1000;
+        span.end_time_unix_nano = 2000;
+        mask_otlp(&engine(), &mut req);
+        let span = &req.resource_spans[0].scope_spans[0].spans[0];
+        assert_eq!(span.name, crate::pii::PII_FILTER_ERROR);
+        assert_eq!(span.trace_id, vec![0xAB; 16]);
+        assert_eq!(span.span_id, vec![0xCD; 8]);
+        assert_eq!(span.start_time_unix_nano, 1000);
+        assert_eq!(span.end_time_unix_nano, 2000);
+        assert_eq!(
+            span.attributes,
+            vec![otlp_kv_bool("wardex.redacted", true)],
+            "attributes reduced to wardex.redacted=true only"
+        );
     }
 
     #[test]

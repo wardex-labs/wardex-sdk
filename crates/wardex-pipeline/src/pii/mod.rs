@@ -70,7 +70,7 @@ impl PiiEngine {
                 regex,
                 validator: def.validator,
                 replacement: &def.replacement,
-                retry_on_reject: def.category == "credit_card",
+                retry_on_reject: def.retry_on_reject,
             });
         }
         Ok(PiiEngine { active })
@@ -121,7 +121,15 @@ impl PiiEngine {
         let mut pos = 0usize;
         for (start, end, rep) in hits {
             if start < pos {
-                continue; // overlapped by an earlier winner
+                // Overlapped by an earlier winner. An overlapped-but-validated
+                // hit still masks its remainder — never emit a validated
+                // span's tail raw (e.g. a Luhn-passing card that bled
+                // backwards into a preceding IP match).
+                if end > pos {
+                    out.push_str(&rep);
+                    pos = end;
+                }
+                continue;
             }
             out.push_str(&text[pos..start]);
             out.push_str(&rep);
@@ -165,6 +173,13 @@ fn apply(r: &Replacement, matched: &str) -> String {
         Replacement::Label(l) => (*l).to_string(),
         Replacement::CardLast4 => {
             let digits: String = matched.chars().filter(|c| c.is_ascii_digit()).collect();
+            // Invariant: only a Luhn-valid candidate reaches here, and Luhn
+            // requires >=13 digits (patterns::luhn_valid) — the >=4 floor for
+            // the last-4 slice below is guaranteed, never a real underflow.
+            debug_assert!(
+                digits.len() >= 4,
+                "CardLast4 requires the >=13-digit Luhn floor"
+            );
             format!("****-****-****-{}", &digits[digits.len() - 4..])
         }
     }
@@ -280,6 +295,17 @@ mod tests {
             mask("5 4111 1111 1111 1111 999"),
             "5 ****-****-****-1111 999"
         );
+    }
+
+    #[test]
+    fn luhn_passing_bleed_never_ships_the_pan() {
+        // leading "0" from the IP octet keeps the Luhn sum valid -> the bled candidate
+        // is accepted, overlaps the IP hit, and must still mask its remainder.
+        // Output is deterministic: the IP hit consumes "10.0.0.0" (0..8), the
+        // card hit (7..28, overlapping) contributes only its replacement.
+        let out = mask("10.0.0.0 4111 1111 1111 1111");
+        assert!(!out.contains("4111"), "raw PAN leaked: {out}");
+        assert_eq!(out, "[IP_ADDRESS]****-****-****-1111");
     }
 
     #[test]
