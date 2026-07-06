@@ -5,7 +5,7 @@
 //! `PIICategory` member on the Python side — engine/FFI/marshalling untouched.
 
 /// What replaces a validated match.
-#[allow(dead_code)]
+#[derive(Debug)]
 pub(crate) enum Replacement {
     /// Fixed label such as `[EMAIL]`.
     Label(&'static str),
@@ -13,7 +13,6 @@ pub(crate) enum Replacement {
     CardLast4,
 }
 
-#[allow(dead_code)]
 pub(crate) struct PatternDef {
     pub category: &'static str,
     pub regex: &'static str,
@@ -22,7 +21,6 @@ pub(crate) struct PatternDef {
 }
 
 /// Category identifiers — the FFI contract with the Python `PIICategory` enum.
-#[allow(dead_code)]
 pub(crate) const CATEGORIES: [&str; 8] = [
     "email",
     "phone_number",
@@ -34,7 +32,6 @@ pub(crate) const CATEGORIES: [&str; 8] = [
     "secret",
 ];
 
-#[allow(dead_code)]
 pub(crate) static BUILTINS: &[PatternDef] = &[
     PatternDef {
         category: "email",
@@ -142,7 +139,6 @@ fn digits_of(s: &str) -> Vec<u8> {
         .collect()
 }
 
-#[allow(dead_code)]
 pub(crate) fn luhn_valid(m: &str) -> bool {
     let d = digits_of(m);
     if !(13..=19).contains(&d.len()) {
@@ -164,7 +160,6 @@ pub(crate) fn luhn_valid(m: &str) -> bool {
     sum % 10 == 0
 }
 
-#[allow(dead_code)]
 pub(crate) fn ssn_valid(m: &str) -> bool {
     // matched shape is fixed by the regex: ddd-dd-dddd
     let area: u32 = m[0..3].parse().unwrap_or(0);
@@ -173,17 +168,14 @@ pub(crate) fn ssn_valid(m: &str) -> bool {
     area != 0 && area != 666 && area < 900 && group != 0 && serial != 0
 }
 
-#[allow(dead_code)]
 pub(crate) fn ipv4_valid(m: &str) -> bool {
     m.parse::<std::net::Ipv4Addr>().is_ok()
 }
 
-#[allow(dead_code)]
 pub(crate) fn ipv6_valid(m: &str) -> bool {
     m.parse::<std::net::Ipv6Addr>().is_ok()
 }
 
-#[allow(dead_code)]
 pub(crate) fn aba_valid(m: &str) -> bool {
     let d = digits_of(m);
     if d.len() != 9 || d.iter().all(|&x| x == 0) {
@@ -196,7 +188,6 @@ pub(crate) fn aba_valid(m: &str) -> bool {
     sum % 10 == 0
 }
 
-#[allow(dead_code)]
 pub(crate) fn iban_valid(m: &str) -> bool {
     // ISO 13616: move the first 4 chars to the end, map A..Z to 10..35, mod 97 == 1
     let mut rem: u32 = 0;
