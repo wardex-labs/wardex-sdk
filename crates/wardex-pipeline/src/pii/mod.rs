@@ -29,6 +29,14 @@ struct Compiled {
     regex: Regex,
     validator: Option<fn(&str) -> bool>,
     replacement: &'static Replacement,
+    /// Rescan policy after a validator rejection. A rejected candidate
+    /// normally suppresses its whole span — that is how the `{3,}` IPv4 tail
+    /// rejects version strings like "1.2.3.4.5" outright. Credit cards are
+    /// the exception: the separator-tolerant regex can greedily bleed into a
+    /// neighboring token (e.g. the last octet of a preceding IP), and that
+    /// spurious Luhn failure must not swallow the valid card starting inside
+    /// the rejected span. Luhn re-confirms every retried candidate.
+    retry_on_reject: bool,
 }
 
 /// Compiled pattern set. Build once per config via `engine_for` (design §4.3).
@@ -59,6 +67,7 @@ impl PiiEngine {
                 regex,
                 validator: def.validator,
                 replacement: &def.replacement,
+                retry_on_reject: def.category == "credit_card",
             });
         }
         Ok(PiiEngine { active })
@@ -70,9 +79,21 @@ impl PiiEngine {
     pub fn mask_text(&self, text: &str) -> Option<String> {
         let mut hits: Vec<(usize, usize, String)> = Vec::new();
         for p in &self.active {
-            for m in p.regex.find_iter(text) {
+            let mut at = 0;
+            while let Some(m) = p.regex.find_at(text, at) {
                 if p.validator.is_none_or(|v| v(m.as_str())) {
                     hits.push((m.start(), m.end(), apply(p.replacement, m.as_str())));
+                    at = m.end();
+                } else if p.retry_on_reject {
+                    // Resume just past the rejected candidate's first char so
+                    // a valid match starting inside the span is still found.
+                    at = m.start() + text[m.start()..].chars().next().map_or(1, char::len_utf8);
+                } else {
+                    // Rejection consumes the span (find_iter semantics).
+                    at = m.end();
+                }
+                if at >= text.len() {
+                    break;
                 }
             }
         }
@@ -173,8 +194,7 @@ mod tests {
             "GB00WEST12345698765432",   // IBAN mod-97 fails
         ];
         for text in negatives {
-            // "id 123456789": 123456789 actually fails the ABA checksum (sum=165? verify);
-            // if it happens to pass, swap the digits for a checksum-failing 9-digit run.
+            // "id 123456789": fails the ABA checksum (3*12 + 7*15 + 1*18 = 159, 159 % 10 != 0)
             assert_eq!(engine().mask_text(text), None, "false positive on: {text}");
         }
     }
@@ -191,7 +211,7 @@ mod tests {
 
     #[test]
     fn masking_is_deterministic_and_idempotent() {
-        let text = "john@x.io 10.0.0.5 abc123";
+        let text = "john@x.io 10.0.0.5 4111 1111 1111 1111";
         let once = mask(text);
         assert_eq!(once, mask(text));
         // placeholders must not re-match anything
