@@ -74,7 +74,8 @@ impl PiiEngine {
     }
 
     /// Mask every validated match. `None` means "no change".
-    /// Single pass over the original text; replaced regions are never
+    /// Single pass over the original text (retry-on-reject patterns may
+    /// re-probe within a rejected candidate); replaced regions are never
     /// rescanned, so placeholders cannot re-match (design §5.2).
     pub fn mask_text(&self, text: &str) -> Option<String> {
         let mut hits: Vec<(usize, usize, String)> = Vec::new();
@@ -84,9 +85,20 @@ impl PiiEngine {
                 if p.validator.is_none_or(|v| v(m.as_str())) {
                     hits.push((m.start(), m.end(), apply(p.replacement, m.as_str())));
                     at = m.end();
+                } else if let Some((end, rep)) = p
+                    .retry_on_reject
+                    .then(|| shrink_to_valid(p, text, m.start(), m.end()))
+                    .flatten()
+                {
+                    // The greedy candidate bled into a trailing digit run; a
+                    // shorter end at the same start re-validated (e.g. the
+                    // 16-digit PAN inside "4111 1111 1111 1111 999").
+                    hits.push((m.start(), end, rep));
+                    at = end;
                 } else if p.retry_on_reject {
                     // Resume just past the rejected candidate's first char so
-                    // a valid match starting inside the span is still found.
+                    // a valid match starting inside the span is still found
+                    // (leading bleed, e.g. out of a preceding IP octet).
                     at = m.start() + text[m.start()..].chars().next().map_or(1, char::len_utf8);
                 } else {
                     // Rejection consumes the span (find_iter semantics).
@@ -115,6 +127,34 @@ impl PiiEngine {
         out.push_str(&text[pos..]);
         Some(out)
     }
+}
+
+/// After a rejected retry-on-reject candidate, probe progressively shorter
+/// end positions at the same start. The separator-tolerant card regex can
+/// greedily bleed into a trailing digit run ("4111 1111 1111 1111 999"), and
+/// the Luhn failure of that overlong candidate must not ship the embedded
+/// valid PAN unmasked. Probes only end on a digit-run boundary (never cut a
+/// digit run in half) and must keep at least 13 digits — the regex's own
+/// minimum (`[0-9]` + `{12,18}` tail). The validator re-confirms each probe,
+/// longest first; the first pass wins.
+fn shrink_to_valid(p: &Compiled, text: &str, start: usize, end: usize) -> Option<(usize, String)> {
+    let validator = p.validator?;
+    // The matched span is pure ASCII (digits and `[ -]` separators), so byte
+    // positions inside it are always char boundaries.
+    let bytes = text.as_bytes();
+    for e in (start + 1..end).rev() {
+        if !bytes[e - 1].is_ascii_digit() || bytes[e].is_ascii_digit() {
+            continue; // candidate must end a digit run, not split one
+        }
+        let cand = &text[start..e];
+        if cand.bytes().filter(u8::is_ascii_digit).count() < 13 {
+            break; // shorter probes only lose more digits
+        }
+        if validator(cand) {
+            return Some((e, apply(p.replacement, cand)));
+        }
+    }
+    None
 }
 
 fn apply(r: &Replacement, matched: &str) -> String {
@@ -207,6 +247,36 @@ mod tests {
         let out = mask("Bearer sk-abcdefghijklmnop1234");
         assert_eq!(out, "[SECRET]");
         assert_eq!(out.matches("[SECRET]").count(), 1);
+    }
+
+    #[test]
+    fn trailing_digit_bleed_still_masks_the_card() {
+        // The greedy candidate "4111-1111-1111-1111 999" fails Luhn; the
+        // engine must shrink to the embedded 16-digit PAN, not ship it raw.
+        assert_eq!(
+            mask("card 4111-1111-1111-1111 999 total"),
+            "card ****-****-****-1111 999 total"
+        );
+    }
+
+    #[test]
+    fn leading_digit_bleed_still_masks_the_card() {
+        // The candidate "5 4111 1111 1111 1111" (IP octet bleed) fails Luhn;
+        // the start+1 retry must still find and mask the real PAN.
+        assert_eq!(
+            mask("john@x.io 10.0.0.5 4111 1111 1111 1111"),
+            "[EMAIL] [IP_ADDRESS] ****-****-****-1111"
+        );
+    }
+
+    #[test]
+    fn bleed_on_both_sides_still_masks_the_card() {
+        // Leading "5 " forces the start+1 retry; the retried candidate then
+        // bleeds into the trailing "999" and needs the shrink probe too.
+        assert_eq!(
+            mask("5 4111 1111 1111 1111 999"),
+            "5 ****-****-****-1111 999"
+        );
     }
 
     #[test]
