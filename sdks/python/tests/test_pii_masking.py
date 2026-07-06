@@ -82,3 +82,43 @@ class TestNativeContract:
     def test_unknown_mode_raises(self):
         with pytest.raises(ValueError, match="redact"):
             _codec.encode(_env(_span()), pii_mode="redact", pii_disabled=())
+
+
+class TestTransportPolicy:
+    def test_transport_defaults_are_secure(self):
+        from wardex_sdk.transport._noop import NoOpTransport
+
+        t = NoOpTransport()
+        assert t._pii_mode == "mask"
+        assert t._pii_disabled == ()
+
+    def test_init_propagates_policy_to_transport(self):
+        import wardex_sdk
+        from wardex_sdk._enums import PIICategory, PIIMode
+        from wardex_sdk.transport._noop import NoOpTransport
+
+        t = NoOpTransport()
+        wardex_sdk.init(
+            transport=t,
+            pii_mode=PIIMode.MASK,
+            pii_disabled_categories=frozenset({PIICategory.IP_ADDRESS}),
+        )
+        assert t._pii_mode == "mask"
+        assert t._pii_disabled == ("ip_address",)
+
+    def test_otlp_wire_bytes_are_masked(self):
+        from wardex_sdk import _wardex_native
+
+        env = _env(_span(input_data=PII_INPUT))
+        data = _wardex_native.codec.encode_otlp_traces(env, "mask", [])
+        out = _wardex_native.codec.decode_otlp_traces(data)
+        span = out["resource_spans"][0]["scope_spans"][0]["spans"][0]
+        attrs = span["attributes"]
+        assert b"john.doe@acme.com" not in attrs["wardex.input_data"]
+        assert b"[EMAIL]" in attrs["wardex.input_data"]
+        assert attrs["wardex.redacted"] is True
+
+    def test_pii_category_is_public_api(self):
+        import wardex_sdk
+
+        assert wardex_sdk.PIICategory.EMAIL.value == "email"

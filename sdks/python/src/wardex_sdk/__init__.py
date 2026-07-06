@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 import time
 from collections.abc import Iterable, Iterator, Mapping
 from contextlib import contextmanager
@@ -17,6 +18,7 @@ from ._enums import (
     Modality,
     OperationName,
     OutputType,
+    PIICategory,
     PIIMode,
     Protocol,
     ProviderName,
@@ -63,6 +65,7 @@ __all__ = [
     "Modality",
     "OperationName",
     "OutputType",
+    "PIICategory",
     "PIIMode",
     "Protocol",
     "ProviderName",
@@ -96,7 +99,17 @@ def init(
         intercept_hosts=tuple(intercept_hosts) if intercept_hosts else None,
         **config_kwargs,
     )
-    client = Client(config, transport or NoOpTransport())
+    resolved_transport = transport or NoOpTransport()
+    resolved_transport.set_pii_policy(
+        config.pii_mode.value,
+        tuple(sorted(c.value for c in config.pii_disabled_categories)),
+    )
+    if config.pii_mode.value == "off" and config.pii_disabled_categories and config.debug:
+        print(
+            "[wardex] pii_disabled_categories has no effect when pii_mode=OFF",
+            file=sys.stderr,
+        )
+    client = Client(config, resolved_transport)
     _hub.set_client(client)
     if config.intercept:
         from .interceptors._registry import get_registry
