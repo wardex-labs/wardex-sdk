@@ -23,20 +23,38 @@ pub fn mask_envelope(engine: &PiiEngine, env: &mut pb::Envelope) {
         mask_header(engine, h);
     }
     for item in items {
-        let pb::EnvelopeItem { header: _, payload } = item; // item header: structural type/length only
+        let pb::EnvelopeItem { header, payload } = item;
+        if let Some(pb::EnvelopeItemHeader { r#type, length: _ }) = header {
+            // Item-level metadata, masked at the same tier as the envelope
+            // header — it does not feed any per-span redacted flag.
+            mask_string(engine, r#type);
+        }
         match payload {
             Some(pb::envelope_item::Payload::Span(span)) => {
-                if catch_unwind(AssertUnwindSafe(|| mask_span(engine, span))).is_err() {
+                let masked = catch_unwind(AssertUnwindSafe(|| mask_span(engine, span)));
+                if masked.is_err() {
                     scrub_span_fail_closed(span);
                 }
             }
             Some(pb::envelope_item::Payload::StateSnapshot(snap)) => {
-                if catch_unwind(AssertUnwindSafe(|| mask_snapshot(engine, snap))).is_err() {
+                let masked = catch_unwind(AssertUnwindSafe(|| mask_snapshot(engine, snap)));
+                if masked.is_err() {
                     scrub_snapshot_fail_closed(snap);
                 }
             }
-            // ClientReport carries numeric counters only.
-            Some(pb::envelope_item::Payload::ClientReport(_)) | None => {}
+            Some(pb::envelope_item::Payload::ClientReport(report)) => {
+                let pb::ClientReport {
+                    timestamp_ns: _,
+                    // Map keys are our own internal event-type tags (same
+                    // tier as KeyValue.key, deliberately unmasked); values
+                    // are numeric counters.
+                    discarded_events: _,
+                    failed_sends: _,
+                    queue_depth: _,
+                    uptime_ms: _,
+                } = report;
+            }
+            None => {}
         }
     }
 }
@@ -232,7 +250,7 @@ fn mask_span(engine: &PiiEngine, span: &mut pb::Span) {
         operation_id,
         request_id,
         attempt_id,
-        active_span_id_at_capture: _,
+        active_span_id_at_capture: _, // binary id
         confidence: _,
         strategy,
     }) = correlation
@@ -269,7 +287,7 @@ fn mask_transport(engine: &PiiEngine, t: &mut pb::TransportAttributes) -> bool {
         connection_id,
         protocol: _,
         direction: _,
-        timing: _, // numeric
+        timing,
         request_size: _,
         response_size: _,
         http,
@@ -289,6 +307,16 @@ fn mask_transport(engine: &PiiEngine, t: &mut pb::TransportAttributes) -> bool {
     } = t;
     let mut hit = false;
     hit |= mask_string(engine, connection_id);
+    // All numeric today; the exhaustive destructure is the §4.3 compile-time
+    // tripwire for future text fields.
+    if let Some(pb::TransportTiming {
+        tcp_connect_ms: _,
+        tls_handshake_ms: _,
+        ttfb_ms: _,
+        transfer_ms: _,
+        ttft_ms: _,
+    }) = timing
+    {}
     if let Some(pb::HttpMeta {
         method,
         status_code: _,
@@ -449,7 +477,10 @@ mod tests {
                 ..Default::default()
             }),
             items: vec![pb::EnvelopeItem {
-                header: None,
+                header: Some(pb::EnvelopeItemHeader {
+                    r#type: "span for john.doe@acme.com".into(),
+                    length: 0,
+                }),
                 payload: Some(pb::envelope_item::Payload::Span(span)),
             }],
         }
@@ -473,6 +504,10 @@ mod tests {
         assert_eq!(span.status.as_ref().unwrap().message, "failed for [EMAIL]");
         let url = &span.transport.as_ref().unwrap().http.as_ref().unwrap().url;
         assert_eq!(url, "https://api.x.com?key=[SECRET]");
+        assert_eq!(
+            env.items[0].header.as_ref().unwrap().r#type,
+            "span for [EMAIL]"
+        );
     }
 
     #[test]
