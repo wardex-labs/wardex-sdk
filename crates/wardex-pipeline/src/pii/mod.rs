@@ -4,6 +4,9 @@
 //! confirm (design §5.1). No ML/entropy heuristics.
 
 mod patterns;
+mod walk;
+
+pub use walk::mask_envelope;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
