@@ -8,6 +8,20 @@ class PIIMode(Enum):
     OFF = "off"
 
 
+class PIICategory(Enum):
+    """Built-in PII detection categories (design §5.1). Values are the FFI
+    contract with the Rust pattern registry — never rename casually."""
+
+    EMAIL = "email"
+    PHONE_NUMBER = "phone_number"
+    CREDIT_CARD = "credit_card"
+    US_SSN = "us_ssn"
+    IP_ADDRESS = "ip_address"
+    US_BANK_ROUTING = "us_bank_routing"
+    IBAN = "iban"
+    SECRET = "secret"
+
+
 class AdapterName(Enum):
     ANTHROPIC_AGENT_SDK = "anthropic_agent_sdk"
     LANGGRAPH = "langgraph"

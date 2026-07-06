@@ -1,13 +1,13 @@
 import pytest
 
 from wardex_sdk._config import WardexConfig
-from wardex_sdk._enums import CaptureTrigger, PIIMode, RetentionClass
+from wardex_sdk._enums import CaptureTrigger, PIICategory, PIIMode, RetentionClass
 
 
 def test_defaults():
     c = WardexConfig()
     assert c.default_retention == RetentionClass.SUMMARY_ONLY
-    assert c.pii_mode == PIIMode.OFF
+    assert c.pii_mode == PIIMode.MASK
     assert c.replay_buffer_size == 100
     assert CaptureTrigger.ERROR in c.retention_triggers
 
@@ -41,3 +41,31 @@ def test_from_env_explicit_debug_override_wins(monkeypatch):
     assert WardexConfig.from_env(debug=False).debug is False
     # without an override, the environment variable is read
     assert WardexConfig.from_env().debug is True
+
+
+class TestPiiConfig:
+    def test_pii_mode_defaults_to_mask(self):
+        assert WardexConfig().pii_mode is PIIMode.MASK
+
+    def test_disabled_categories_default_empty(self):
+        assert WardexConfig().pii_disabled_categories == frozenset()
+
+    def test_redact_raises_not_implemented(self):
+        with pytest.raises(NotImplementedError, match="REDACT"):
+            WardexConfig(pii_mode=PIIMode.REDACT)
+
+    def test_hash_raises_not_implemented(self):
+        with pytest.raises(NotImplementedError, match="HASH"):
+            WardexConfig(pii_mode=PIIMode.HASH)
+
+    def test_category_values_match_ffi_contract(self):
+        assert {c.value for c in PIICategory} == {
+            "email",
+            "phone_number",
+            "credit_card",
+            "us_ssn",
+            "ip_address",
+            "us_bank_routing",
+            "iban",
+            "secret",
+        }
