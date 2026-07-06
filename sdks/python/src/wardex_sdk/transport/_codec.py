@@ -12,8 +12,16 @@ from .. import _wardex_native
 from .._types import InternalEnvelope
 
 
-def encode(envelope: InternalEnvelope) -> bytes:
-    return _wardex_native.codec.encode_envelope(envelope)
+def encode(
+    envelope: InternalEnvelope,
+    pii_mode: str = "off",
+    pii_disabled: tuple[str, ...] = (),
+) -> bytes:
+    """Encode to wire bytes. PII policy is applied inside the native call
+    (marshal -> mask -> serialize, design §4.2). Transports always pass the
+    policy explicitly; the "off" default keeps this usable as a pure
+    round-trip fidelity tool in tests."""
+    return _wardex_native.codec.encode_envelope(envelope, pii_mode, list(pii_disabled))
 
 
 def decode(data: bytes) -> dict[str, Any]:

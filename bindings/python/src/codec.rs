@@ -15,6 +15,7 @@ use pyo3::types::{PyBool, PyBytes, PyDict, PyList};
 use wardex_core::codec::otlp::{self, otlp_pb};
 use wardex_core::codec::proto::wardex::v1 as pb;
 use wardex_core::codec::{decode_envelope, encode_envelope};
+use wardex_core::pipeline::pii;
 
 // --- getattr helpers ---
 
@@ -645,6 +646,7 @@ fn span_to_dict(py: Python<'_>, sp: &pb::Span) -> PyResult<PyObject> {
         cd.set_item("request_body_captured", c.request_body_captured)?;
         cd.set_item("response_body_captured", c.response_body_captured)?;
         cd.set_item("truncated", c.truncated)?;
+        cd.set_item("redacted", c.redacted)?;
         cd.set_item("limitations", c.limitations.clone())?;
         d.set_item("capture_integrity", cd)?;
     }
@@ -984,9 +986,57 @@ fn otlp_traces_to_dict(
 
 // --- pyfunctions + submodule ---
 
+/// Apply the PII policy to a marshalled wardex envelope (design §4.2).
+/// pii_mode contract: "mask" | "off" — anything else is a hard error
+/// (REDACT/HASH are rejected earlier by Python init; defense in depth here).
+fn pii_apply_envelope(
+    proto: &mut pb::Envelope,
+    pii_mode: &str,
+    pii_disabled: &[String],
+) -> PyResult<()> {
+    match pii_mode {
+        "off" => Ok(()),
+        "mask" => {
+            let engine = pii::engine_for(pii_disabled)
+                .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+            pii::mask_envelope(&engine, proto);
+            Ok(())
+        }
+        other => Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "unsupported pii_mode {other:?} (expected \"mask\" or \"off\")"
+        ))),
+    }
+}
+
+fn pii_apply_otlp(
+    req: &mut otlp_pb::trace_service::ExportTraceServiceRequest,
+    pii_mode: &str,
+    pii_disabled: &[String],
+) -> PyResult<()> {
+    match pii_mode {
+        "off" => Ok(()),
+        "mask" => {
+            let engine = pii::engine_for(pii_disabled)
+                .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+            pii::mask_otlp(&engine, req);
+            Ok(())
+        }
+        other => Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "unsupported pii_mode {other:?} (expected \"mask\" or \"off\")"
+        ))),
+    }
+}
+
 #[pyfunction]
-fn encode_envelope_py(py: Python<'_>, envelope: &Bound<'_, PyAny>) -> PyResult<Py<PyBytes>> {
-    let proto = envelope_to_proto(envelope)?;
+#[pyo3(signature = (envelope, pii_mode = "off", pii_disabled = Vec::new()))]
+fn encode_envelope_py(
+    py: Python<'_>,
+    envelope: &Bound<'_, PyAny>,
+    pii_mode: &str,
+    pii_disabled: Vec<String>,
+) -> PyResult<Py<PyBytes>> {
+    let mut proto = envelope_to_proto(envelope)?;
+    pii_apply_envelope(&mut proto, pii_mode, &pii_disabled)?;
     let bytes = encode_envelope(&proto)
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
     Ok(PyBytes::new_bound(py, &bytes).unbind())
@@ -1000,8 +1050,15 @@ fn decode_envelope_py(py: Python<'_>, data: &[u8]) -> PyResult<PyObject> {
 }
 
 #[pyfunction]
-fn encode_otlp_traces(py: Python<'_>, envelope: &Bound<'_, PyAny>) -> PyResult<Py<PyBytes>> {
-    let req = envelope_to_otlp(envelope)?;
+#[pyo3(signature = (envelope, pii_mode = "off", pii_disabled = Vec::new()))]
+fn encode_otlp_traces(
+    py: Python<'_>,
+    envelope: &Bound<'_, PyAny>,
+    pii_mode: &str,
+    pii_disabled: Vec<String>,
+) -> PyResult<Py<PyBytes>> {
+    let mut req = envelope_to_otlp(envelope)?;
+    pii_apply_otlp(&mut req, pii_mode, &pii_disabled)?;
     let bytes = otlp::encode_traces(&req)
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
     Ok(PyBytes::new_bound(py, &bytes).unbind())
