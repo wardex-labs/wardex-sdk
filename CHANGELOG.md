@@ -5,6 +5,20 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- PII masking: built-in detection for emails, NANP phone numbers, credit cards
+  (Luhn-verified), US SSNs, IPv4/IPv6 addresses, ABA routing numbers, IBANs, and
+  API-key/token secrets. Masking runs as a single Rust pass on every export path
+  (wardex-native and OTLP) right before serialization. Per-category opt-out via
+  `pii_disabled_categories`; spans with replacements carry
+  `capture_integrity.redacted` (wardex) / `wardex.redacted` (OTLP).
+
+### Changed
+- `pii_mode` now **defaults to `PIIMode.MASK`** (secure by default). Set
+  `pii_mode=PIIMode.OFF` to restore the previous cleartext behavior.
+- `PIIMode.REDACT` / `PIIMode.HASH` now raise `NotImplementedError` at config
+  time instead of being silently ignored.
+
 ## [0.1.0b2] - 2026-07-04
 
 ### Fixed

@@ -6,9 +6,9 @@
 Open-source observability SDK for AI agents — zero-instrumentation capture,
 OpenTelemetry-native.
 
-> ⚠️ **Beta (0.1.0b1).** No PII masking yet: captured prompts and responses
-> are sent to your backend in cleartext. Not suitable for production or
-> sensitive data. Use in development/staging, or wait for the PII release.
+> ⚠️ **Beta (0.1.0b1).** PII masking is on by default (see below), but the
+> SDK is still early: review the caveats below before sending sensitive data
+> through it.
 
 ## Install
 
@@ -42,9 +42,12 @@ wardex.close()
 - Transport metrics (TCP/TLS timing, TTFT), gRPC (grpclib), WebSocket (`wss`), MCP stdio
 - Export to any OpenTelemetry backend via `OtlpHttpTransport`
 - Manual span decorators: `@workflow` / `@agent` / `@task` / `@tool` / `@span`
+- PII masking on by default: emails, phone numbers, credit cards (Luhn-verified),
+  US SSNs, IP addresses, bank routing numbers, IBANs, and API-key/token secrets
+  are masked before anything leaves the process (`pii_mode=PIIMode.OFF` to disable,
+  `pii_disabled_categories={PIICategory.IP_ADDRESS}` for per-category opt-out)
 
 **Not yet (see Roadmap)**
-- PII masking (prompts sent in cleartext today)
 - Background batching / periodic & at-exit flush (manual `flush()`/`close()` only)
 - Framework adapters (LangGraph, Anthropic/OpenAI Agent SDKs)
 - Distributed context propagation (W3C traceparent)
@@ -52,11 +55,15 @@ wardex.close()
 
 ## Roadmap
 
-1. PII masking (pre-send safety)
+1. ~~PII masking (pre-send safety)~~ — shipped
 2. Batching & lifecycle (background worker, at-exit/periodic flush, concurrency)
 3. Framework adapters
 4. Distributed propagation (W3C)
 5. Node/TS and Java SDKs
+
+> PII masking caveats: `before_send` sees pre-masking data (masking runs inside
+> the encoder), the Console transport prints raw (local debugging only), and
+> non-UTF-8 binary payloads pass through unmasked.
 
 ## License
 
