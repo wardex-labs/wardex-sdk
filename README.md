@@ -6,7 +6,7 @@
 Open-source observability SDK for AI agents — zero-instrumentation capture,
 OpenTelemetry-native.
 
-> ⚠️ **Beta (0.1.0b1).** PII masking is on by default (see below), but the
+> ⚠️ **Beta.** PII masking is on by default (see below), but the
 > SDK is still early: review the caveats below before sending sensitive data
 > through it.
 

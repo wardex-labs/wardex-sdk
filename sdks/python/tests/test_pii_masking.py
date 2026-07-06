@@ -122,3 +122,20 @@ class TestTransportPolicy:
         import wardex_sdk
 
         assert wardex_sdk.PIICategory.EMAIL.value == "email"
+
+    def test_send_batch_passes_policy_to_native(self, monkeypatch):
+        from wardex_sdk import _wardex_native
+        from wardex_sdk.transport._otlp_http import OtlpHttpTransport
+
+        captured = {}
+
+        def fake_encode(envelope, pii_mode, pii_disabled):
+            captured["pii_mode"] = pii_mode
+            captured["pii_disabled"] = pii_disabled
+            return b""  # empty body; the subsequent POST fails silently (endpoint is unreachable)
+
+        monkeypatch.setattr(_wardex_native.codec, "encode_otlp_traces", fake_encode)
+        t = OtlpHttpTransport(endpoint="http://localhost:1")
+        t.set_pii_policy("mask", ("ip_address",))
+        t._send_batch(_env(_span(input_data=PII_INPUT)))
+        assert captured == {"pii_mode": "mask", "pii_disabled": ["ip_address"]}

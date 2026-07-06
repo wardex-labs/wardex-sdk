@@ -20,6 +20,8 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: cargo test (workspace; includes proto roundtrip)
         run: cargo test --workspace
+      - name: PII perf guard (release)
+        run: cargo test -p wardex-pipeline --release --test pii_perf -- --ignored
       - name: buf lint
         run: buf lint
 
