@@ -216,7 +216,8 @@ def test_reentrant_flush_from_before_send_does_not_deadlock():
     c = Client(WardexConfig(api_key="k", before_send=reenter), t)
     holder["client"] = c
     c.capture_span(_span())
-    worker = threading.Thread(target=c.flush)
+    # daemon: on a regression this thread hangs forever; it must not block process exit
+    worker = threading.Thread(target=c.flush, daemon=True)
     worker.start()
     worker.join(timeout=5.0)
     assert not worker.is_alive(), "reentrant flush deadlocked"

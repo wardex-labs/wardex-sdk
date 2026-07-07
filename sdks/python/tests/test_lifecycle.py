@@ -161,21 +161,20 @@ def test_partial_signal_install_rolls_back(monkeypatch):
     assert signal.getsignal(signal.SIGINT) is before  # rolled back, not left as _handler
 
 
-def test_signal_handler_chains_even_if_flush_raises():
+def test_signal_handler_chains_even_if_flush_raises(monkeypatch):
     seen = []
     prev = lambda signum, frame: seen.append(signum)  # noqa: E731
     old = signal.signal(signal.SIGINT, prev)
     try:
-
-        class _Exploding(Transport):
-            def export(self, envelope):
-                raise ValueError("boom")
-
-            def flush(self, timeout: float = 5.0) -> None:
-                raise ValueError("boom")
-
-        c = Client(WardexConfig(api_key="k"), _Exploding())
+        c = _client()
         _lifecycle.install(c, c.config)
+
+        # Force Client.flush itself to raise — _drain's internal guards must not
+        # be what saves the chain; the handler's own try/except must.
+        def boom(timeout: float = 5.0) -> None:
+            raise ValueError("boom")
+
+        monkeypatch.setattr(c, "flush", boom)
         _lifecycle._handler(signal.SIGINT, None)  # must not raise, must still chain
         assert seen == [signal.SIGINT]
     finally:
