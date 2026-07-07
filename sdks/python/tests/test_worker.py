@@ -114,3 +114,17 @@ def test_thread_is_daemon_and_named():
         assert w._thread.name == "wardex-batch-worker"
     finally:
         w.stop()
+
+
+def test_start_twice_keeps_single_thread():
+    w = BatchWorker(lambda: None, interval=3600.0)
+    w.start()
+    first_thread = w._thread
+    w.start()  # idempotent — must not spawn a second thread
+    try:
+        assert w._thread is first_thread
+        assert (
+            sum(1 for t in threading.enumerate() if t.name == "wardex-batch-worker") == 1
+        )
+    finally:
+        w.stop()

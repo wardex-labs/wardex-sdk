@@ -34,6 +34,8 @@ class BatchWorker:
 
     def start(self) -> None:
         with self._spawn_lock:
+            if self.is_alive():
+                return  # exactly one SDK thread — start() is idempotent
             self._spawn_locked()
 
     def wake(self) -> None:
@@ -65,8 +67,10 @@ class BatchWorker:
         """Signal the loop to exit and join. The final drain is the caller's job."""
         self._stopped = True
         self._wake.set()
-        thread = self._thread
-        if thread is not None and self._thread_for_pid == os.getpid() and thread.is_alive():
+        with self._spawn_lock:  # serialize with an in-flight spawn (start/ensure_alive)
+            thread = self._thread
+            pid = self._thread_for_pid
+        if thread is not None and pid == os.getpid() and thread.is_alive():
             thread.join(timeout)
 
     def _spawn_locked(self) -> None:
@@ -84,6 +88,6 @@ class BatchWorker:
                 break  # no drain here — Client.close() owns the final drain
             try:
                 self._drain_fn()
-            except Exception as exc:  # the worker must never die
+            except Exception as exc:  # never die; BaseException (SystemExit etc.) deliberately excluded
                 if self._debug:
                     print(f"[wardex] background flush failed: {exc}", file=sys.stderr)
