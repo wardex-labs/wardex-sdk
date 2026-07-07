@@ -5,6 +5,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0b4] - 2026-07-07
+
 ### Added
 - Background batching: a dedicated daemon worker flushes every 5s
   (`flush_interval`) or when the buffer reaches its threshold; spans are
