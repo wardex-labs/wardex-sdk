@@ -1,0 +1,89 @@
+"""Background batch worker — thread & timing only; knows nothing about spans.
+
+Owns the SDK's single daemon thread. It wakes on whichever comes first:
+interval elapsed, wake() (buffer size threshold), or stop(). The loop survives
+drain exceptions — an observability SDK must never crash the app, and the
+worker must never die (design §10).
+
+Fork recovery (design §8, Sentry-style PID check): start() records the PID the
+thread was created in; ensure_alive() lazily respawns the thread when the
+recorded PID no longer matches (we are in a forked child) or the thread died.
+No code runs at fork time, which sidesteps fork-safety traps entirely.
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+import threading
+from collections.abc import Callable
+
+
+class BatchWorker:
+    def __init__(
+        self, drain_fn: Callable[[], None], interval: float, *, debug: bool = False
+    ) -> None:
+        self._drain_fn = drain_fn
+        self._interval = interval
+        self._debug = debug
+        self._wake = threading.Event()
+        self._stopped = False
+        self._thread: threading.Thread | None = None
+        self._thread_for_pid: int | None = None
+        self._spawn_lock = threading.Lock()
+
+    def start(self) -> None:
+        with self._spawn_lock:
+            self._spawn_locked()
+
+    def wake(self) -> None:
+        """Request an immediate drain (buffer threshold reached). Lock-free."""
+        self._wake.set()
+
+    def is_alive(self) -> bool:
+        return (
+            self._thread is not None
+            and self._thread_for_pid == os.getpid()
+            and self._thread.is_alive()
+        )
+
+    def ensure_alive(self) -> None:
+        """Respawn the thread if it died or belongs to a pre-fork parent.
+
+        Called on every capture; the happy path costs one os.getpid().
+        """
+        if self._stopped or self.is_alive():
+            return
+        with self._spawn_lock:
+            if self._stopped or self.is_alive():
+                return  # another thread respawned it while we waited
+            if self._debug:
+                print("[wardex] batch worker restarted (fork or thread death)", file=sys.stderr)
+            self._spawn_locked()
+
+    def stop(self, timeout: float = 5.0) -> None:
+        """Signal the loop to exit and join. The final drain is the caller's job."""
+        self._stopped = True
+        self._wake.set()
+        thread = self._thread
+        if thread is not None and self._thread_for_pid == os.getpid() and thread.is_alive():
+            thread.join(timeout)
+
+    def _spawn_locked(self) -> None:
+        self._thread = threading.Thread(
+            target=self._run, daemon=True, name="wardex-batch-worker"
+        )
+        self._thread_for_pid = os.getpid()
+        self._thread.start()
+
+    def _run(self) -> None:
+        while True:
+            self._wake.wait(timeout=self._interval)
+            self._wake.clear()
+            if self._stopped:
+                break  # no drain here — Client.close() owns the final drain
+            try:
+                self._drain_fn()
+            except Exception as exc:  # the worker must never die
+                if self._debug:
+                    print(f"[wardex] background flush failed: {exc}", file=sys.stderr)
