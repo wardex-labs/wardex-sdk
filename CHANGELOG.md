@@ -5,6 +5,30 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- Background batching: a dedicated daemon worker flushes every 5s
+  (`flush_interval`) or when the buffer reaches its threshold; spans are
+  flushed at exit (`atexit`) and on SIGINT/SIGTERM via chained signal handlers
+  (`flush_on_signals=False` to opt out). Manual `flush()` is no longer required.
+- Bounded span buffer (`max_buffer_spans`, default 2048) with drop-oldest
+  backpressure; drops are counted and reported in debug mode.
+- Fork recovery: the worker respawns lazily in a forked child on first capture
+  (Sentry-style PID check).
+
+### Changed
+- **`before_send` now runs on the background worker thread** (except during a
+  manual `flush()`); callbacks touching shared state must synchronize. If
+  `before_send` raises, the envelope is dropped (fail-closed) instead of the
+  exception propagating.
+- Calling `init()` again now cleanly shuts down the previous client (final
+  flush + worker join) before installing the new one.
+- PII masking + protobuf/zstd encoding now release the GIL, so application
+  threads keep running while the worker encodes.
+
+### Fixed
+- `Client` buffer is now thread-safe: concurrent `capture_span` during a flush
+  can no longer lose spans (pre-existing race in the copy-then-clear flush).
+
 ## [0.1.0b3] - 2026-07-07
 
 ### Added

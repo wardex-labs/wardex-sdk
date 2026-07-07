@@ -29,8 +29,7 @@ wardex.init(
 
 # your app code — OpenAI/Anthropic calls are captured automatically
 
-wardex.flush()   # manual flush (background batching is on the roadmap)
-wardex.close()
+wardex.close()   # optional — spans auto-flush every 5s, on buffer threshold, and at exit
 ```
 
 ## Status
@@ -46,12 +45,16 @@ wardex.close()
   US SSNs, IP addresses, bank routing numbers, IBANs, and API-key/token secrets
   are masked before anything leaves the process (`pii_mode=PIIMode.OFF` to disable,
   `pii_disabled_categories={PIICategory.IP_ADDRESS}` for per-category opt-out)
+- Background batching: automatic flush every 5s / on buffer threshold /
+  at exit and on SIGINT/SIGTERM (chained; opt out with `flush_on_signals=False`)
 
 **Not yet (see Roadmap)**
-- Background batching / periodic & at-exit flush (manual `flush()`/`close()` only)
 - Framework adapters (LangGraph, Anthropic/OpenAI Agent SDKs)
 - Distributed context propagation (W3C traceparent)
 - Node/TS and Java SDKs
+- After `os.fork()` the worker respawns lazily in the child on first capture;
+  spans buffered before the fork may be sent by both processes (duplicates,
+  never loss). Under uWSGI enable threads (`--enable-threads`).
 
 ## Roadmap
 
