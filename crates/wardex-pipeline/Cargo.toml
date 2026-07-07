@@ -9,3 +9,5 @@ description            = "Normalizer + Sampler + PII regex for Wardex SDK"
 
 [dependencies]
 wardex-codec = { path = "../wardex-codec" }
+regex.workspace     = true
+thiserror.workspace = true

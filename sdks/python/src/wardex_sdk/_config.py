@@ -13,6 +13,7 @@ from ._enums import (
     AdapterName,
     CaptureTrigger,
     InterceptorName,
+    PIICategory,
     PIIMode,
     RetentionClass,
 )
@@ -32,7 +33,8 @@ class WardexConfig:
         {CaptureTrigger.ERROR, CaptureTrigger.MANUAL_MARK}
     )
 
-    pii_mode: PIIMode = PIIMode.OFF
+    pii_mode: PIIMode = PIIMode.MASK
+    pii_disabled_categories: frozenset[PIICategory] = frozenset()
 
     adapters: tuple[AdapterName, ...] | None = None
     interceptors: tuple[InterceptorName, ...] | None = None
@@ -50,6 +52,11 @@ class WardexConfig:
         """Validation: replay_buffer_size >= 1."""
         if self.replay_buffer_size < 1:
             raise ValueError(f"replay_buffer_size must be >= 1, got {self.replay_buffer_size}")
+        if self.pii_mode in (PIIMode.REDACT, PIIMode.HASH):
+            raise NotImplementedError(
+                f"PIIMode.{self.pii_mode.name} is not implemented yet "
+                "(v1 supports MASK/OFF; see the PII masking design doc)"
+            )
 
     @property
     def effective_retention(self) -> RetentionClass:

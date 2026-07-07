@@ -36,7 +36,9 @@ class OtlpHttpTransport(Transport):
         # zero spans means an empty batch — skip the POST.
         if not envelope.spans:
             return
-        data = _wardex_native.codec.encode_otlp_traces(envelope)  # encode=fail-loud
+        data = _wardex_native.codec.encode_otlp_traces(
+            envelope, self._pii_mode, list(self._pii_disabled)
+        )  # encode=fail-loud
         headers = {"Content-Type": "application/x-protobuf", **self._headers}
         req = urllib.request.Request(self._endpoint, data=data, headers=headers, method="POST")
 
