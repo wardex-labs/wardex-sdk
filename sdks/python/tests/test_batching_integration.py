@@ -72,6 +72,7 @@ def test_periodic_flush_posts_encoded_batch_without_manual_flush():
         c.close()
     finally:
         server.shutdown()
+        server.server_close()  # release the listening socket
 
 
 _SIGTERM_CHILD = """
@@ -118,6 +119,7 @@ def test_sigterm_flushes_and_preserves_exit_code(tmp_path):
     finally:
         if proc.poll() is None:
             proc.kill()
+            proc.wait()  # reap — no zombie on the failure path
     assert rc == -signal.SIGTERM  # default termination (exit code) preserved
     assert marker.read_text() == "1"  # our handler flushed the span first
 
