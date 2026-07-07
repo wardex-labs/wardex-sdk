@@ -189,3 +189,53 @@ def test_init_twice_closes_previous_client():
     wardex.init(transport=_Recording(), api_key="k", flush_interval=3600.0)
     assert first._closed
     assert sum(len(e.spans) for e in t1.envelopes) == 1
+
+
+def test_reinit_uninstalls_interceptors_before_closing_previous_client():
+    """I2/I3 regression.
+
+    Re-init (_lifecycle.install with a live previous client) must uninstall
+    interceptors bound to the previous client before closing it — mirroring
+    wardex.close()'s deliberate ordering. Otherwise interceptors stay bound to
+    a closed (no-op) client forever (I2), and anything an interceptor's
+    uninstall() flushes via capture_span (e.g. a pending WS session) is lost
+    because the client already rejects captures (I3).
+    """
+    from wardex_sdk.interceptors._base import InterceptorInterface
+    from wardex_sdk.interceptors._registry import get_registry
+
+    class _FakeInterceptor(InterceptorInterface):
+        """Minimal interceptor matching the registry's expected interface."""
+
+        def __init__(self) -> None:
+            self.client: Client | None = None
+
+        def name(self) -> str:
+            return "fake-lifecycle"
+
+        def install(self, client: Client | None) -> None:
+            self.client = client
+
+        def uninstall(self) -> None:
+            # Simulates flushing a pending WS session on uninstall: this must
+            # succeed, which requires uninstall() to run before the bound
+            # client is closed.
+            self.client.capture_span(_span())
+
+    registry = get_registry()
+    try:
+        t1 = _Recording()
+        first = _client(t1, flush_interval=3600.0)
+        _lifecycle.install(first, first.config)
+        fake = _FakeInterceptor()
+        registry.install(fake, first)
+
+        second = _client(flush_interval=3600.0)
+        _lifecycle.install(second, second.config)  # re-init path
+
+        assert not registry.is_installed("fake-lifecycle")  # uninstall_all ran
+        # The span captured inside uninstall() reached client A's transport —
+        # proof uninstall() ran (and its capture succeeded) before close().
+        assert sum(len(e.spans) for e in t1.envelopes) == 1
+    finally:
+        registry.uninstall_all()

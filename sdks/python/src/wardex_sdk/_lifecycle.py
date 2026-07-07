@@ -33,12 +33,25 @@ def current_client() -> Client | None:
     return _current_client
 
 
+def _teardown(client: Client) -> None:
+    """Uninstall interceptors, then close.
+
+    Uninstall must run first: it flushes pending interceptor state (e.g. WS
+    sessions) via capture_span, which close() rejects once _closed is set —
+    same ordering wardex.close() uses.
+    """
+    from .interceptors._registry import get_registry
+
+    get_registry().uninstall_all()
+    client.close()
+
+
 def install(client: Client, config: WardexConfig) -> None:
     """Make `client` the process-wide client; tear down the previous one."""
     global _current_client, _atexit_registered
     previous = _current_client
     if previous is not None:
-        previous.close()  # flush remainder, join its worker — no zombie threads
+        _teardown(previous)  # uninstall interceptors, flush remainder, join worker
     _current_client = client
     if not _atexit_registered:
         atexit.register(_atexit_handler)
@@ -52,7 +65,7 @@ def install(client: Client, config: WardexConfig) -> None:
 def _atexit_handler() -> None:
     client = _current_client
     if client is not None:
-        client.close()
+        _teardown(client)
 
 
 def _handler(signum: int, frame: object) -> None:

@@ -55,8 +55,10 @@ wardex.close()   # optional — spans auto-flush every 5s, on buffer threshold, 
 
 **Notes**
 - After `os.fork()` the worker respawns lazily in the child on first capture;
-  spans buffered before the fork may be sent by both processes (duplicates,
-  never loss). Under uWSGI enable threads (`--enable-threads`).
+  spans buffered before the fork may be sent by both processes (duplicates
+  are possible; a fork landing mid-export can also strand the child's
+  pre-fork buffer — re-init in the child for a clean slate). Under uWSGI
+  enable threads (`--enable-threads`).
 
 ## Roadmap
 

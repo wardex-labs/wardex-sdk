@@ -225,6 +225,23 @@ def test_reentrant_flush_from_before_send_does_not_deadlock():
     c.close()
 
 
+def test_signal_flush_while_buffer_lock_held_does_not_deadlock():
+    """A signal handler may call flush() on a thread that holds _buffer_lock."""
+    t = _Recording()
+    c = Client(WardexConfig(api_key="k", flush_interval=3600.0), t)
+    done = threading.Event()
+
+    def simulate_signal_during_append():
+        with c._buffer_lock:  # the frame the signal interrupts
+            c.flush()  # handler's flush → same-thread nested buffer-lock acquire
+        done.set()
+
+    th = threading.Thread(target=simulate_signal_during_append, daemon=True)
+    th.start()
+    assert done.wait(timeout=5.0), "flush deadlocked on _buffer_lock"
+    c.close()
+
+
 def test_transport_flush_exception_does_not_propagate():
     class _FlushExploding(Transport):
         def export(self, envelope):
