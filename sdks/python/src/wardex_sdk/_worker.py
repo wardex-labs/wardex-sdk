@@ -74,9 +74,7 @@ class BatchWorker:
             thread.join(timeout)
 
     def _spawn_locked(self) -> None:
-        self._thread = threading.Thread(
-            target=self._run, daemon=True, name="wardex-batch-worker"
-        )
+        self._thread = threading.Thread(target=self._run, daemon=True, name="wardex-batch-worker")
         self._thread_for_pid = os.getpid()
         self._thread.start()
 
@@ -88,6 +86,7 @@ class BatchWorker:
                 break  # no drain here — Client.close() owns the final drain
             try:
                 self._drain_fn()
-            except Exception as exc:  # never die; BaseException (SystemExit etc.) deliberately excluded
+            # Never die. BaseException (SystemExit etc.) is deliberately excluded.
+            except Exception as exc:
                 if self._debug:
                     print(f"[wardex] background flush failed: {exc}", file=sys.stderr)

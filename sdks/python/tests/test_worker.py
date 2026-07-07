@@ -123,8 +123,6 @@ def test_start_twice_keeps_single_thread():
     w.start()  # idempotent — must not spawn a second thread
     try:
         assert w._thread is first_thread
-        assert (
-            sum(1 for t in threading.enumerate() if t.name == "wardex-batch-worker") == 1
-        )
+        assert sum(1 for t in threading.enumerate() if t.name == "wardex-batch-worker") == 1
     finally:
         w.stop()
