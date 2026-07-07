@@ -36,15 +36,11 @@ def _close_hub_client_after_test():
     if client is not None:
         try:
             client.close()
-        except Exception:
-            # Cleanup-only: Client.close() stops+joins the worker thread before
-            # draining/closing the transport, so the thread is already reaped
-            # by this point regardless. Some tests build a ConsoleTransport
-            # against capsys's captured stdout and never intended for it to
-            # survive past the test body (e.g. flush()-then-close() after
-            # capsys has already restored/closed its buffer); that is a
-            # pre-existing transport quirk unrelated to worker-thread cleanup,
-            # so we don't let it fail unrelated tests here.
+        except ValueError:
+            # Cleanup-only: ConsoleTransport may raise ValueError flushing
+            # a closed stdout at teardown (capsys has already restored the
+            # buffer). This is a benign transport quirk unrelated to the
+            # worker-thread cleanup this fixture manages, so ignore it.
             pass
 
 

@@ -97,7 +97,11 @@ class Client:
             if dropped and self._config.debug:
                 print(f"[wardex] dropped {dropped} spans (buffer full)", file=sys.stderr)
             if not spans and not snapshots:
-                self._transport.flush(timeout)
+                try:
+                    self._transport.flush(timeout)
+                except Exception as exc:  # fail-silent: never crash the app or the exit path
+                    if self._config.debug:
+                        print(f"[wardex] transport flush failed ({exc})", file=sys.stderr)
                 return
             header = EnvelopeHeader(
                 event_id=str(uuid.uuid4()),
@@ -121,7 +125,11 @@ class Client:
                 if self._config.debug:
                     print(f"[wardex] envelope dropped ({exc})", file=sys.stderr)
                 return
-            self._transport.flush(timeout)
+            try:
+                self._transport.flush(timeout)
+            except Exception as exc:  # fail-silent: never crash the app or the exit path
+                if self._config.debug:
+                    print(f"[wardex] transport flush failed ({exc})", file=sys.stderr)
 
     def close(self, timeout: float = 5.0) -> None:
         with self._close_lock:

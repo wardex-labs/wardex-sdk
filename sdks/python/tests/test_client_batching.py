@@ -202,3 +202,18 @@ def test_capture_after_close_is_rejected():
     c.capture_span(_span())
     c.flush()
     assert sum(len(e.spans) for e in t.envelopes) == 0
+
+
+def test_transport_flush_exception_does_not_propagate():
+    class _FlushExploding(Transport):
+        def export(self, envelope):
+            pass
+
+        def flush(self, timeout: float = 5.0) -> None:
+            raise ValueError("stream closed")
+
+    c = Client(WardexConfig(api_key="k"), _FlushExploding())
+    c.flush()  # empty-buffer branch must not raise
+    c.capture_span(_span())
+    c.flush()  # post-export branch must not raise
+    c.close()
