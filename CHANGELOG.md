@@ -5,6 +5,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0b3] - 2026-07-07
+
 ### Added
 - PII masking: built-in detection for emails, NANP phone numbers, credit cards
   (Luhn-verified), US SSNs, IPv4/IPv6 addresses, ABA routing numbers, IBANs, and
