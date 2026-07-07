@@ -36,6 +36,10 @@ class WardexConfig:
     pii_mode: PIIMode = PIIMode.MASK
     pii_disabled_categories: frozenset[PIICategory] = frozenset()
 
+    flush_interval: float = 5.0
+    max_buffer_spans: int = 2048
+    flush_on_signals: bool = True
+
     adapters: tuple[AdapterName, ...] | None = None
     interceptors: tuple[InterceptorName, ...] | None = None
 
@@ -49,7 +53,7 @@ class WardexConfig:
     tags: tuple[tuple[str, str], ...] = ()
 
     def __post_init__(self) -> None:
-        """Validation: replay_buffer_size >= 1."""
+        """Validate field invariants (buffer sizes, intervals, PII mode support)."""
         if self.replay_buffer_size < 1:
             raise ValueError(f"replay_buffer_size must be >= 1, got {self.replay_buffer_size}")
         if self.pii_mode in (PIIMode.REDACT, PIIMode.HASH):
@@ -57,6 +61,10 @@ class WardexConfig:
                 f"PIIMode.{self.pii_mode.name} is not implemented yet "
                 "(v1 supports MASK/OFF; see the PII masking design doc)"
             )
+        if self.flush_interval <= 0:
+            raise ValueError(f"flush_interval must be > 0, got {self.flush_interval}")
+        if self.max_buffer_spans < 1:
+            raise ValueError(f"max_buffer_spans must be >= 1, got {self.max_buffer_spans}")
 
     @property
     def effective_retention(self) -> RetentionClass:

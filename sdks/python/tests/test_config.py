@@ -69,3 +69,22 @@ class TestPiiConfig:
             "iban",
             "secret",
         }
+
+
+def test_batching_defaults():
+    c = WardexConfig()
+    assert c.flush_interval == 5.0
+    assert c.max_buffer_spans == 2048
+    assert c.flush_on_signals is True
+
+
+def test_post_init_rejects_nonpositive_flush_interval():
+    with pytest.raises(ValueError):
+        WardexConfig(flush_interval=0)
+    with pytest.raises(ValueError):
+        WardexConfig(flush_interval=-1.0)
+
+
+def test_post_init_rejects_bad_max_buffer_spans():
+    with pytest.raises(ValueError):
+        WardexConfig(max_buffer_spans=0)
