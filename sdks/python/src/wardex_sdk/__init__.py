@@ -110,6 +110,9 @@ def init(
             file=sys.stderr,
         )
     client = Client(config, resolved_transport)
+    from . import _lifecycle
+
+    _lifecycle.install(client, config)
     _hub.set_client(client)
     if config.intercept:
         from .interceptors._registry import get_registry
