@@ -14,8 +14,18 @@ _client: Client | None = None
 
 
 def reset_for_test() -> None:
-    """For test isolation — resets global state."""
+    """For test isolation — resets global state.
+
+    Closes any client left over from a prior test first: Client now always
+    owns a live background worker thread (Task 4, Slice C), so silently
+    dropping the reference would leak that thread for the rest of the test
+    process instead of actually resetting state. This mirrors the eventual
+    `init()` re-initialization semantics (spec §2: re-init auto-closes the
+    previous client) for this test-only helper.
+    """
     global _global_scope, _client
+    if _client is not None:
+        _client.close()
     _global_scope = Scope()
     _current_scope.set(None)
     _isolation_scope.set(None)

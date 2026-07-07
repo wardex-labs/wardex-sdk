@@ -45,6 +45,7 @@ def test_flush_emits_buffered_spans_in_one_envelope():
     c.flush()
     assert len(t.envelopes) == 1
     assert len(t.envelopes[0].spans) == 2
+    c.close()
 
 
 def test_close_flushes_and_is_idempotent():
@@ -62,3 +63,4 @@ def test_flush_stamps_sent_at_ns():
     c.capture_span(_span())
     c.flush()
     assert t.envelopes[0].header.sent_at_ns > 0
+    c.close()

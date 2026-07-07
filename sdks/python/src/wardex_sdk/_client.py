@@ -16,6 +16,7 @@ from ._types import (
     SdkInfo,
 )
 from ._version import __version__
+from ._worker import BatchWorker
 from .transport._base import Transport
 
 
@@ -43,6 +44,12 @@ class Client:
         self._snapshots: deque[InternalStateSnapshot] = deque()
         self._dropped = 0
         self._closed = False
+        self._close_lock = threading.Lock()
+        self._flush_threshold = max(1, config.max_buffer_spans // 4)
+        self._worker = BatchWorker(
+            lambda: self._drain(5.0), interval=config.flush_interval, debug=config.debug
+        )
+        self._worker.start()
 
     @property
     def config(self) -> WardexConfig:
@@ -51,15 +58,20 @@ class Client:
     def capture_span(self, span: InternalSpan) -> None:
         if self._closed:
             return
+        self._worker.ensure_alive()  # fork/thread-death recovery (design §8)
         with self._buffer_lock:
             if len(self._spans) >= self._config.max_buffer_spans:
                 self._spans.popleft()  # drop-oldest: recent spans are worth more
                 self._dropped += 1
             self._spans.append(span)
+            should_wake = len(self._spans) >= self._flush_threshold
+        if should_wake:
+            self._worker.wake()
 
     def capture_snapshot(self, snapshot: InternalStateSnapshot) -> None:
         if self._closed:
             return
+        self._worker.ensure_alive()
         with self._buffer_lock:
             if len(self._snapshots) >= self._config.max_buffer_spans:
                 self._snapshots.popleft()
@@ -112,8 +124,10 @@ class Client:
             self._transport.flush(timeout)
 
     def close(self, timeout: float = 5.0) -> None:
-        if self._closed:
-            return
-        self._closed = True  # reject new captures before the final drain
-        self._drain(timeout)
-        self._transport.close(timeout)
+        with self._close_lock:
+            if self._closed:
+                return
+            self._closed = True  # 1. reject new captures
+        self._worker.stop(timeout)  # 2. worker exits without draining
+        self._drain(timeout)  # 3. final drain, owned by the closing thread
+        self._transport.close(timeout)  # 4.

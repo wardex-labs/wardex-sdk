@@ -15,6 +15,39 @@ CERT = _FIXTURES / "cert.pem"
 KEY = _FIXTURES / "key.pem"
 
 
+@pytest.fixture(autouse=True)
+def _close_hub_client_after_test():
+    """Join the background worker thread (Task 4, Slice C) any test may have started.
+
+    Client now always spawns a daemon "wardex-batch-worker" thread on
+    construction. Many tests across the suite reach the SDK through
+    `wardex_sdk.init()`/`_hub.set_client()` and predate that thread; they were
+    never written to call `close()` because there was previously nothing to
+    clean up. Left alone, every one of those clients leaks its worker thread
+    for the rest of the pytest process — which trips thread-count assertions
+    in test_worker.py. Closing whatever the hub currently holds after each
+    test, at this single choke point, joins those threads without touching
+    the ~15 individual test files that construct a client through the hub.
+    """
+    yield
+    from wardex_sdk import _hub
+
+    client = _hub.get_client()
+    if client is not None:
+        try:
+            client.close()
+        except Exception:
+            # Cleanup-only: Client.close() stops+joins the worker thread before
+            # draining/closing the transport, so the thread is already reaped
+            # by this point regardless. Some tests build a ConsoleTransport
+            # against capsys's captured stdout and never intended for it to
+            # survive past the test body (e.g. flush()-then-close() after
+            # capsys has already restored/closed its buffer); that is a
+            # pre-existing transport quirk unrelated to worker-thread cleanup,
+            # so we don't let it fail unrelated tests here.
+            pass
+
+
 class _Handler(http.server.BaseHTTPRequestHandler):
     # enables keep-alive (default HTTP/1.0 closes the connection after every response)
     protocol_version = "HTTP/1.1"
