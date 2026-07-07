@@ -38,8 +38,17 @@ class Client:
         # Lock order is always drain lock → buffer lock (one-way; no deadlock).
         # The buffer lock only ever guards an append or a swap — never I/O,
         # encoding, or callbacks (design §5).
+        # _drain_lock is reentrant: the same-thread signal handler may call
+        # flush() (and so re-enter _drain) while the main thread is already
+        # mid-drain (manual flush() in progress, or install()'s
+        # previous.close() during re-init). Each drain operates on its own
+        # buffer snapshot swapped out under the buffer lock, so nested
+        # reentrant drains cannot corrupt or duplicate data — a plain Lock
+        # would instead hang forever on that same-thread re-acquire.
+        # Cross-thread serialization (the invariant this lock exists for) is
+        # unchanged: RLock still blocks other threads until fully released.
         self._buffer_lock = threading.Lock()
-        self._drain_lock = threading.Lock()
+        self._drain_lock = threading.RLock()
         self._spans: deque[InternalSpan] = deque()
         self._snapshots: deque[InternalStateSnapshot] = deque()
         self._dropped = 0

@@ -144,6 +144,44 @@ def test_uninstall_leaves_foreign_handler_alone():
     signal.signal(signal.SIGINT, signal.default_int_handler)
 
 
+def test_partial_signal_install_rolls_back(monkeypatch):
+    real_signal = signal.signal
+
+    def failing_signal(signum, handler):
+        if signum == signal.SIGTERM and handler is _lifecycle._handler:
+            raise OSError("no SIGTERM here")
+        return real_signal(signum, handler)
+
+    monkeypatch.setattr(_lifecycle.signal, "signal", failing_signal)
+    before = signal.getsignal(signal.SIGINT)
+    c = _client()
+    _lifecycle.install(c, c.config)
+    assert not _lifecycle._signals_installed
+    assert _lifecycle._prev_handlers == {}
+    assert signal.getsignal(signal.SIGINT) is before  # rolled back, not left as _handler
+
+
+def test_signal_handler_chains_even_if_flush_raises():
+    seen = []
+    prev = lambda signum, frame: seen.append(signum)  # noqa: E731
+    old = signal.signal(signal.SIGINT, prev)
+    try:
+
+        class _Exploding(Transport):
+            def export(self, envelope):
+                raise ValueError("boom")
+
+            def flush(self, timeout: float = 5.0) -> None:
+                raise ValueError("boom")
+
+        c = Client(WardexConfig(api_key="k"), _Exploding())
+        _lifecycle.install(c, c.config)
+        _lifecycle._handler(signal.SIGINT, None)  # must not raise, must still chain
+        assert seen == [signal.SIGINT]
+    finally:
+        signal.signal(signal.SIGINT, old)
+
+
 def test_init_twice_closes_previous_client():
     t1 = _Recording()
     wardex.init(transport=t1, api_key="k", flush_interval=3600.0)

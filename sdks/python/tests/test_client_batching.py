@@ -204,6 +204,26 @@ def test_capture_after_close_is_rejected():
     assert sum(len(e.spans) for e in t.envelopes) == 0
 
 
+def test_reentrant_flush_from_before_send_does_not_deadlock():
+    """The signal handler re-enters _drain on the same thread; RLock must allow it."""
+    t = _Recording()
+    holder = {}
+
+    def reenter(envelope):
+        holder["client"].flush()  # same-thread nested drain (empty buffer) — must not hang
+        return envelope
+
+    c = Client(WardexConfig(api_key="k", before_send=reenter), t)
+    holder["client"] = c
+    c.capture_span(_span())
+    worker = threading.Thread(target=c.flush)
+    worker.start()
+    worker.join(timeout=5.0)
+    assert not worker.is_alive(), "reentrant flush deadlocked"
+    assert sum(len(e.spans) for e in t.envelopes) == 1
+    c.close()
+
+
 def test_transport_flush_exception_does_not_propagate():
     class _FlushExploding(Transport):
         def export(self, envelope):

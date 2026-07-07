@@ -58,7 +58,10 @@ def _atexit_handler() -> None:
 def _handler(signum: int, frame: object) -> None:
     client = _current_client
     if client is not None:
-        client.flush(timeout=_SIGNAL_FLUSH_TIMEOUT)
+        try:
+            client.flush(timeout=_SIGNAL_FLUSH_TIMEOUT)
+        except Exception:
+            pass  # a failed flush must never block the chain to the app's handler
     prev = _prev_handlers.get(signum)
     if callable(prev):
         prev(signum, frame)
@@ -85,6 +88,10 @@ def _install_signal_handlers(*, debug: bool) -> None:
             _prev_handlers[signum] = signal.getsignal(signum)
             signal.signal(signum, _handler)
     except (ValueError, OSError) as exc:  # exotic embedding/platform — never crash init
+        # Roll back any handler we already installed this attempt.
+        for signum, prev in _prev_handlers.items():
+            if signal.getsignal(signum) is _handler:
+                signal.signal(signum, prev)
         _prev_handlers.clear()
         if debug:
             print(f"[wardex] signal handlers skipped ({exc})", file=sys.stderr)
