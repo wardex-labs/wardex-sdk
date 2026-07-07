@@ -52,6 +52,8 @@ wardex.close()   # optional — spans auto-flush every 5s, on buffer threshold, 
 - Framework adapters (LangGraph, Anthropic/OpenAI Agent SDKs)
 - Distributed context propagation (W3C traceparent)
 - Node/TS and Java SDKs
+
+**Notes**
 - After `os.fork()` the worker respawns lazily in the child on first capture;
   spans buffered before the fork may be sent by both processes (duplicates,
   never loss). Under uWSGI enable threads (`--enable-threads`).
@@ -59,7 +61,7 @@ wardex.close()   # optional — spans auto-flush every 5s, on buffer threshold, 
 ## Roadmap
 
 1. ~~PII masking (pre-send safety)~~ — shipped
-2. Batching & lifecycle (background worker, at-exit/periodic flush, concurrency)
+2. ~~Batching & lifecycle (background worker, at-exit/periodic flush, concurrency)~~ — shipped
 3. Framework adapters
 4. Distributed propagation (W3C)
 5. Node/TS and Java SDKs
