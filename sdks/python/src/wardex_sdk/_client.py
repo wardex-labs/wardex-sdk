@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import platform
 import sys
+import threading
 import time
 import uuid
+from collections import deque
 
 from ._config import WardexConfig
 from ._types import (
@@ -32,8 +34,14 @@ class Client:
         self._config = config
         self._transport = transport
         self._sdk_info = build_sdk_info()
-        self._spans: list[InternalSpan] = []
-        self._snapshots: list[InternalStateSnapshot] = []
+        # Lock order is always drain lock → buffer lock (one-way; no deadlock).
+        # The buffer lock only ever guards an append or a swap — never I/O,
+        # encoding, or callbacks (design §5).
+        self._buffer_lock = threading.Lock()
+        self._drain_lock = threading.Lock()
+        self._spans: deque[InternalSpan] = deque()
+        self._snapshots: deque[InternalStateSnapshot] = deque()
+        self._dropped = 0
         self._closed = False
 
     @property
@@ -43,43 +51,69 @@ class Client:
     def capture_span(self, span: InternalSpan) -> None:
         if self._closed:
             return
-        self._spans.append(span)
+        with self._buffer_lock:
+            if len(self._spans) >= self._config.max_buffer_spans:
+                self._spans.popleft()  # drop-oldest: recent spans are worth more
+                self._dropped += 1
+            self._spans.append(span)
 
     def capture_snapshot(self, snapshot: InternalStateSnapshot) -> None:
         if self._closed:
             return
-        self._snapshots.append(snapshot)
+        with self._buffer_lock:
+            if len(self._snapshots) >= self._config.max_buffer_spans:
+                self._snapshots.popleft()
+                self._dropped += 1
+            self._snapshots.append(snapshot)
 
     def flush(self, timeout: float = 5.0) -> None:
-        if not self._spans and not self._snapshots:
-            self._transport.flush(timeout)
-            return
-        header = EnvelopeHeader(
-            event_id=str(uuid.uuid4()),
-            api_key=self._config.api_key or "",
-            sdk=self._sdk_info,
-            sent_at_ns=time.time_ns(),
-        )
-        envelope = InternalEnvelope(
-            header=header,
-            spans=tuple(self._spans),
-            state_snapshots=tuple(self._snapshots),
-        )
-        if self._config.before_send is not None:
-            maybe = self._config.before_send(envelope)
-            if maybe is None:
-                self._spans.clear()
-                self._snapshots.clear()
+        self._drain(timeout)
+
+    def _drain(self, timeout: float) -> None:
+        """Swap the buffer out under the lock, then assemble/export lock-free.
+
+        Serialized by the drain lock so a manual flush() and the periodic
+        worker can never interleave envelopes. Errors from before_send or the
+        export path drop the envelope (fail-closed) and never propagate.
+        """
+        with self._drain_lock:
+            with self._buffer_lock:
+                spans, self._spans = self._spans, deque()
+                snapshots, self._snapshots = self._snapshots, deque()
+                dropped, self._dropped = self._dropped, 0
+            # -- lock-free from here (buffer lock released; new captures flow) --
+            if dropped and self._config.debug:
+                print(f"[wardex] dropped {dropped} spans (buffer full)", file=sys.stderr)
+            if not spans and not snapshots:
+                self._transport.flush(timeout)
                 return
-            envelope = maybe
-        self._transport.export(envelope)
-        self._transport.flush(timeout)
-        self._spans.clear()
-        self._snapshots.clear()
+            header = EnvelopeHeader(
+                event_id=str(uuid.uuid4()),
+                api_key=self._config.api_key or "",
+                sdk=self._sdk_info,
+                sent_at_ns=time.time_ns(),
+            )
+            envelope = InternalEnvelope(
+                header=header,
+                spans=tuple(spans),
+                state_snapshots=tuple(snapshots),
+            )
+            try:
+                if self._config.before_send is not None:
+                    maybe = self._config.before_send(envelope)
+                    if maybe is None:
+                        return
+                    envelope = maybe
+                self._transport.export(envelope)
+            except Exception as exc:  # fail-closed: drop, never ship half-filtered data
+                if self._config.debug:
+                    print(f"[wardex] envelope dropped ({exc})", file=sys.stderr)
+                return
+            self._transport.flush(timeout)
 
     def close(self, timeout: float = 5.0) -> None:
         if self._closed:
             return
-        self.flush(timeout)
+        self._closed = True  # reject new captures before the final drain
+        self._drain(timeout)
         self._transport.close(timeout)
-        self._closed = True
