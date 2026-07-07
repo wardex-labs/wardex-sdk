@@ -1037,10 +1037,14 @@ fn encode_envelope_py(
     pii_mode: &str,
     pii_disabled: Vec<String>,
 ) -> PyResult<Py<PyBytes>> {
+    // Marshalling walks Python objects — the only part that needs the GIL.
     let mut proto = envelope_to_proto(envelope)?;
-    pii_apply_envelope(&mut proto, pii_mode, &pii_disabled)?;
-    let bytes = encode_envelope(&proto)
-        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+    // Masking + protobuf + zstd are pure Rust: release the GIL so app threads
+    // keep running while the batch worker encodes (design §9).
+    let bytes = py.allow_threads(|| -> PyResult<Vec<u8>> {
+        pii_apply_envelope(&mut proto, pii_mode, &pii_disabled)?;
+        encode_envelope(&proto).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    })?;
     Ok(PyBytes::new_bound(py, &bytes).unbind())
 }
 
@@ -1059,10 +1063,15 @@ fn encode_otlp_traces(
     pii_mode: &str,
     pii_disabled: Vec<String>,
 ) -> PyResult<Py<PyBytes>> {
+    // Marshalling walks Python objects — the only part that needs the GIL.
     let mut req = envelope_to_otlp(envelope)?;
-    pii_apply_otlp(&mut req, pii_mode, &pii_disabled)?;
-    let bytes = otlp::encode_traces(&req)
-        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+    // Masking + protobuf + zstd are pure Rust: release the GIL so app threads
+    // keep running while the batch worker encodes (design §9).
+    let bytes = py.allow_threads(|| -> PyResult<Vec<u8>> {
+        pii_apply_otlp(&mut req, pii_mode, &pii_disabled)?;
+        otlp::encode_traces(&req)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    })?;
     Ok(PyBytes::new_bound(py, &bytes).unbind())
 }
 
