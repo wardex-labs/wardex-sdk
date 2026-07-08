@@ -5,6 +5,22 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- Correct span parenting under `asyncio.gather` — spans now fork the current
+  scope via ContextVar (Phase 4a).
+- W3C trace propagation: `continue_trace()`, `get_traceparent()`,
+  `get_trace_headers()` (opaque tracestate pass-through), `continue_from_otel()`,
+  `WardexMiddleware` (ASGI), `WardexWSGIMiddleware`, and opt-in outbound
+  injection via `init(propagate_trace=True, propagate_targets=[...])`
+  (httpx/requests/aiohttp).
+- `run_in_context()` helper for propagating trace context into threads.
+
+### Changed
+- **`capture_mode` defaults to `"agent"`**: LLM-semantic traffic is always
+  captured; generic HTTP/gRPC/WS is captured only inside an active local
+  wardex span. Set `capture_mode="all"` for the previous capture-everything
+  behavior.
+
 ## [0.1.0b4] - 2026-07-07
 
 ### Added

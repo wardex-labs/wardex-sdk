@@ -50,7 +50,6 @@ wardex.close()   # optional — spans auto-flush every 5s, on buffer threshold, 
 
 **Not yet (see Roadmap)**
 - Framework adapters (LangGraph, Anthropic/OpenAI Agent SDKs)
-- Distributed context propagation (W3C traceparent)
 - Node/TS and Java SDKs
 
 **Notes**
@@ -60,12 +59,108 @@ wardex.close()   # optional — spans auto-flush every 5s, on buffer threshold, 
   pre-fork buffer — re-init in the child for a clean slate). Under uWSGI
   enable threads (`--enable-threads`).
 
+## Distributed tracing
+
+Trace context propagation is **opt-in** — a plain `wardex.init(...)` never
+touches your outbound requests or headers. Turn it on with:
+
+```python
+wardex.init(
+    transport=OtlpHttpTransport(endpoint="https://<your-collector>/v1/traces"),
+    intercept=True,
+    propagate_trace=True,                       # inject W3C headers on outbound calls
+    propagate_targets=["api.internal.example.com", "*.svc.cluster.local"],  # optional glob allowlist; default None = all hosts
+)
+```
+
+With `propagate_trace=True`, outbound calls made through httpx (sync + async),
+requests, or aiohttp get a `traceparent` (and `tracestate`, if one was
+received) header attached automatically, as long as an active trace context
+exists and the request doesn't already carry a `traceparent`. **If
+`propagate_targets` is left unset, the trace ID is sent to every host you
+call — including third-party LLM providers.** Set it to an allowlist of glob
+patterns to scope injection to your own services.
+
+### Joining an inbound trace
+
+Drop the middleware in front of your app to join whatever trace the caller
+started:
+
+```python
+# ASGI (FastAPI, Starlette, Django ASGI)
+app.add_middleware(wardex.WardexMiddleware)
+
+# WSGI (Flask, Django WSGI)
+app.wsgi_app = wardex.WardexWSGIMiddleware(app.wsgi_app)
+```
+
+Both extract the incoming `traceparent`/`tracestate` and continue the trace
+for the lifetime of the request; a missing or malformed header just starts a
+fresh trace (never raises).
+
+### Manual propagation (the universal escape hatch)
+
+`get_traceparent()` / `get_trace_headers()` / `continue_trace()` are plain
+functions — they work over any channel that can carry a string, not just
+HTTP. Use them directly wherever the automatic client patches or ASGI/WSGI
+middleware don't reach:
+
+```python
+# gRPC metadata
+stub.Check(req, metadata=[("traceparent", wardex.get_traceparent())])
+
+# WebSocket handshake
+websockets.connect(uri, extra_headers=wardex.get_trace_headers())
+
+# Celery: put get_trace_headers() on the task's headers when sending it,
+# then wardex.continue_trace(task.request.headers) inside the worker.
+
+# Kafka: put get_trace_headers() on the message headers when producing,
+# then wardex.continue_trace(dict(msg.headers())) inside the consumer.
+```
+
+`wardex.continue_from_otel()` is a one-line alternative to `continue_trace()`
+for code that already runs under an active OpenTelemetry span — it adopts
+that span as the remote parent (no-op if `opentelemetry` isn't installed or
+there's no active span).
+
+### Propagating into threads
+
+`asyncio` tasks inherit the current trace context automatically; threads do
+not. Wrap the target with `wardex.run_in_context()` at the point where you
+still have the right context:
+
+```python
+thread = threading.Thread(target=wardex.run_in_context(worker_fn), args=(...,))
+thread.start()
+```
+
+### `capture_mode`: what gets captured without an active span
+
+`capture_mode` defaults to `"agent"`: LLM-semantic traffic (recognized
+`gen_ai` calls, MCP stdio) is always captured, but generic HTTP/gRPC/WS
+traffic is only captured while it happens inside an active *local* wardex
+span (a `traceparent` received from an upstream caller doesn't count on its
+own — this keeps a service mesh stamping every request with a traceparent
+from reviving the pre-Phase-4 "capture everything" noise).
+
+This means a bare, unwrapped call to an LLM provider wardex doesn't
+recognize (or a WS-based provider such as OpenAI Realtime, which carries no
+parseable semantics) can be silently dropped if it isn't inside a local
+span. Wrap it with `@wardex.workflow` (or any of the span decorators), or set
+`capture_mode=wardex.CaptureMode.ALL` to restore the previous
+capture-everything behavior:
+
+```python
+wardex.init(..., capture_mode=wardex.CaptureMode.ALL)
+```
+
 ## Roadmap
 
 1. ~~PII masking (pre-send safety)~~ — shipped
 2. ~~Batching & lifecycle (background worker, at-exit/periodic flush, concurrency)~~ — shipped
-3. Framework adapters
-4. Distributed propagation (W3C)
+3. ~~Distributed propagation (W3C)~~ — shipped
+4. Framework adapters
 5. Node/TS and Java SDKs
 
 > PII masking caveats: `before_send` sees pre-masking data (masking runs inside
