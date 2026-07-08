@@ -89,3 +89,33 @@ def test_asgi_app_exceptions_propagate():
         raise AssertionError("should have raised")
     except RuntimeError:
         pass
+
+
+def test_wsgi_joins_traceparent():
+    _setup()
+    seen = {}
+
+    def app(environ, start_response):
+        active = _hub.get_current_scope().active_span_context
+        seen["trace"] = active.trace_id.hex() if active else None
+        start_response("200 OK", [])
+        return [b"ok"]
+
+    mw = wardex_sdk.WardexWSGIMiddleware(app)
+    environ = {"REQUEST_METHOD": "GET", "HTTP_TRACEPARENT": TP}
+    body = mw(environ, lambda status, headers: None)
+    assert list(body) == [b"ok"]
+    assert seen["trace"] == "4bf92f3577b34da6a3ce929d0e0e4736"
+
+
+def test_wsgi_no_header_starts_fresh():
+    _setup()
+    seen = {}
+
+    def app(environ, start_response):
+        seen["active"] = _hub.get_current_scope().active_span_context
+        return [b"ok"]
+
+    mw = wardex_sdk.WardexWSGIMiddleware(app)
+    mw({"REQUEST_METHOD": "GET"}, lambda s, h: None)
+    assert seen["active"] is None

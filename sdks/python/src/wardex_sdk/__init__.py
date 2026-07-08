@@ -45,6 +45,7 @@ from .context._propagate import (
     get_trace_headers,
     get_traceparent,
 )
+from .context._wsgi import WardexWSGIMiddleware
 from .transport._base import Transport
 from .transport._console import ConsoleTransport
 from .transport._noop import NoOpTransport
@@ -72,6 +73,7 @@ __all__ = [
     "get_traceparent",
     "get_trace_headers",
     "WardexMiddleware",
+    "WardexWSGIMiddleware",
     # Enums — importable directly from user code
     "AdapterName",
     "Direction",
