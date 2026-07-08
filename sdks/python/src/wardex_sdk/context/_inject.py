@@ -119,6 +119,7 @@ def _uninstall_requests() -> None:
 def _install_aiohttp() -> None:
     try:
         import aiohttp  # noqa: PLC0415
+        from multidict import CIMultiDict  # noqa: PLC0415
         from yarl import URL  # noqa: PLC0415
     except ImportError:
         return
@@ -130,11 +131,13 @@ def _install_aiohttp() -> None:
     async def _request(self: Any, method: Any, str_or_url: Any, **kwargs: Any) -> Any:
         try:
             host = URL(str_or_url).host or ""
-            merged = dict(kwargs.get("headers") or {})
-            if not any(str(k).lower() == "traceparent" for k in merged):
+            # CIMultiDict accepts mappings and iterables of pairs while
+            # preserving duplicate keys (both are valid aiohttp LooseHeaders).
+            merged = CIMultiDict(kwargs.get("headers") or {})
+            if "traceparent" not in merged:  # CIMultiDict lookup is case-insensitive
                 inject = _build_inject_headers(host)
                 if inject:
-                    merged.update(inject)
+                    merged.extend(inject)
                     kwargs["headers"] = merged
         except Exception:
             pass

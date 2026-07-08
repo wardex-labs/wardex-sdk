@@ -134,9 +134,11 @@ def test_install_uninstall_idempotent():
 
 class _HeaderEcho(http.server.BaseHTTPRequestHandler):
     seen: list[dict] = []
+    multi: list = []  # repeated x-multi values; dict(self.headers) collapses duplicates
 
     def do_GET(self):
         _HeaderEcho.seen.append(dict(self.headers))
+        _HeaderEcho.multi.append(self.headers.get_all("x-multi"))
         self.send_response(200)
         self.send_header("Content-Length", "2")
         self.end_headers()
@@ -149,6 +151,7 @@ class _HeaderEcho(http.server.BaseHTTPRequestHandler):
 @pytest.fixture()
 def echo_server():
     _HeaderEcho.seen = []
+    _HeaderEcho.multi = []
     srv = http.server.HTTPServer(("127.0.0.1", 0), _HeaderEcho)
     th = threading.Thread(target=srv.serve_forever, daemon=True)
     th.start()
@@ -183,6 +186,26 @@ def test_aiohttp_injects(echo_server):
 
     tid = asyncio.run(main())
     assert _HeaderEcho.seen[-1].get("traceparent", "").split("-")[1] == tid
+
+
+def test_aiohttp_preserves_duplicate_headers(echo_server):
+    import asyncio
+
+    import aiohttp
+
+    _setup(propagate_trace=True)
+    install_propagation()
+
+    async def main():
+        with trace("root"):
+            async with aiohttp.ClientSession() as s:
+                headers = [("x-multi", "a"), ("x-multi", "b")]
+                async with s.get(f"{echo_server}/x", headers=headers) as resp:
+                    await resp.read()
+
+    asyncio.run(main())
+    assert _HeaderEcho.multi[-1] == ["a", "b"]
+    assert "traceparent" in _HeaderEcho.seen[-1]
 
 
 def test_tracestate_forwarded_verbatim(echo_server):
