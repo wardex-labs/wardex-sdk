@@ -21,6 +21,7 @@ from ._types import (
     ToolAttributes,
     TraceId,
 )
+from .context._contextvar import fork_active_span
 
 
 class SpanBuilder:
@@ -113,19 +114,10 @@ def _begin(
     conv = conversation if conversation is not None else scope.conversation
 
     builder = SpanBuilder(ctx, parent_id, name, kind, conv)
-    # Swap in the current span context, and restore it on exit
-    # Known limitation (to be resolved in Phase 4): active_span_context is stored directly
-    # on the shared Scope object that the ContextVar points to, so spans started
-    # concurrently via asyncio.gather under the same parent context can mistake each
-    # other for the parent. This is accurate for a single (sequential) flow.
-    # Cross async/thread propagation will be handled via ContextVar in Phase 4
-    # (context/_contextvar.py).
-    token_span = scope.active_span_context
-    scope.active_span_context = ctx
     try:
-        yield builder
+        with fork_active_span(ctx):
+            yield builder
     finally:
-        scope.active_span_context = token_span
         finished = builder.finish()
         client = _hub.get_client()
         if client is not None:
