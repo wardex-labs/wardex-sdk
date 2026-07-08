@@ -9,7 +9,7 @@ import pytest
 
 import wardex_sdk as wardex
 from wardex_sdk import _hub
-from wardex_sdk._enums import SpanKind
+from wardex_sdk._enums import CaptureMode, SpanKind
 from wardex_sdk.interceptors._base import InterceptorInterface
 from wardex_sdk.interceptors._registry import InterceptorRegistry
 
@@ -68,7 +68,9 @@ def _verify_ctx() -> ssl.SSLContext:
 
 
 def test_sync_https_call_is_captured(tls_server):
-    wardex.init(intercept=True)
+    # capture_mode=ALL: targets generic HTTP span assembly, not the AGENT-mode
+    # policy gate; no active local span here for AGENT mode to latch onto.
+    wardex.init(intercept=True, capture_mode=CaptureMode.ALL)
     resp = httpx.post(
         f"{tls_server}/v1/messages",
         headers={"Authorization": "Bearer sk-secret-xyz"},
@@ -94,7 +96,8 @@ def test_sync_https_call_is_captured(tls_server):
 
 @pytest.mark.asyncio
 async def test_async_https_call_is_captured(tls_server):
-    wardex.init(intercept=True)
+    # capture_mode=ALL: same rationale as the sync variant above.
+    wardex.init(intercept=True, capture_mode=CaptureMode.ALL)
     async with httpx.AsyncClient(verify=_verify_ctx()) as client:
         resp = await client.post(f"{tls_server}/v1/messages", json={"model": "y"})
     assert resp.status_code == 200
@@ -124,7 +127,8 @@ def test_capture_nests_under_active_span(tls_server):
 
 
 def test_sync_capture_populates_connect_and_handshake(tls_server):
-    wardex.init(intercept=True)
+    # capture_mode=ALL: targets connect/handshake timing, not the policy gate.
+    wardex.init(intercept=True, capture_mode=CaptureMode.ALL)
     resp = httpx.post(f"{tls_server}/v1/ping", json={}, verify=_verify_ctx())
     assert resp.status_code == 200
 
@@ -135,7 +139,8 @@ def test_sync_capture_populates_connect_and_handshake(tls_server):
 
 
 def test_sync_keepalive_second_request_is_reused(tls_server):
-    wardex.init(intercept=True)
+    # capture_mode=ALL: targets connection-reuse tracking, not the policy gate.
+    wardex.init(intercept=True, capture_mode=CaptureMode.ALL)
     with httpx.Client(verify=_verify_ctx()) as client:
         r1 = client.post(f"{tls_server}/v1/ping", json={})
         r2 = client.post(f"{tls_server}/v1/ping", json={})
@@ -153,7 +158,8 @@ def test_sync_keepalive_second_request_is_reused(tls_server):
 
 @pytest.mark.asyncio
 async def test_async_capture_populates_handshake(tls_server):
-    wardex.init(intercept=True)
+    # capture_mode=ALL: targets async handshake timing, not the policy gate.
+    wardex.init(intercept=True, capture_mode=CaptureMode.ALL)
     async with httpx.AsyncClient(verify=_verify_ctx()) as client:
         resp = await client.post(f"{tls_server}/v1/messages", json={"model": "y"})
     assert resp.status_code == 200

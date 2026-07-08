@@ -6,7 +6,7 @@ import pytest
 
 import wardex_sdk as wardex
 from wardex_sdk import _hub
-from wardex_sdk._enums import SpanKind
+from wardex_sdk._enums import CaptureMode, SpanKind
 
 uvloop = pytest.importorskip("uvloop")
 
@@ -27,7 +27,9 @@ def _verify_ctx() -> ssl.SSLContext:
 
 
 def test_uvloop_async_capture_populates_handshake(tls_server):
-    wardex.init(intercept=True)
+    # capture_mode=ALL: this test targets connect/handshake timing, not the
+    # AGENT-mode policy gate, and the server response has no LLM semantics.
+    wardex.init(intercept=True, capture_mode=CaptureMode.ALL)
 
     async def call() -> int:
         async with httpx.AsyncClient(verify=_verify_ctx()) as client:

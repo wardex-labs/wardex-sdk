@@ -5,7 +5,7 @@ import pytest
 
 import wardex_sdk as wardex
 from wardex_sdk import _hub
-from wardex_sdk._enums import SpanKind
+from wardex_sdk._enums import CaptureMode, SpanKind
 
 _CERT = Path(__file__).parent / "fixtures" / "cert.pem"
 
@@ -31,7 +31,10 @@ def _client_spans():
 
 
 def test_h2_call_is_captured(h2_server):
-    wardex.init(intercept=True)
+    # capture_mode=ALL: this test targets HTTP/2 span assembly (method/status/
+    # body/headers-stripped), not the AGENT-mode policy gate, and there is no
+    # active local span for AGENT mode to latch onto.
+    wardex.init(intercept=True, capture_mode=CaptureMode.ALL)
     with httpx.Client(http2=True, verify=_verify_ctx()) as client:
         resp = client.post(
             f"{h2_server}/v1/messages",

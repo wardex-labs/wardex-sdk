@@ -2,7 +2,7 @@ import pytest
 
 import wardex_sdk as wardex
 from wardex_sdk import _hub
-from wardex_sdk._enums import SpanKind
+from wardex_sdk._enums import CaptureMode, SpanKind
 
 
 @pytest.fixture(autouse=True)
@@ -38,7 +38,11 @@ def _ws_spans():
 
 
 def test_ws_upgrade_to_close_emits_one_span():
-    wardex.init(intercept=True)
+    # capture_mode=ALL: WS spans carry no LLM semantics (sem is always None in
+    # _emit_ws), so under the AGENT-mode default this generic-traffic test
+    # needs an active local span to latch onto, which it deliberately has
+    # none of — it targets WS frame/tracker capture, not the policy gate.
+    wardex.init(intercept=True, capture_mode=CaptureMode.ALL)
     from wardex_sdk.interceptors._registry import get_registry
 
     interceptor = get_registry()._installed["ssl"]  # type: ignore[attr-defined]
@@ -72,7 +76,8 @@ def test_ws_upgrade_to_close_emits_one_span():
 
 
 def test_no_close_flushes_on_uninstall_with_marker():
-    wardex.init(intercept=True)
+    # capture_mode=ALL: see rationale in test_ws_upgrade_to_close_emits_one_span.
+    wardex.init(intercept=True, capture_mode=CaptureMode.ALL)
     from wardex_sdk.interceptors._registry import get_registry
 
     registry = get_registry()
@@ -96,7 +101,8 @@ def test_no_close_flushes_on_uninstall_with_marker():
 
 
 def test_deflate_negotiation_marks_compressed():
-    wardex.init(intercept=True)
+    # capture_mode=ALL: see rationale in test_ws_upgrade_to_close_emits_one_span.
+    wardex.init(intercept=True, capture_mode=CaptureMode.ALL)
     from wardex_sdk.interceptors._registry import get_registry
 
     registry = get_registry()
@@ -119,7 +125,8 @@ def test_deflate_negotiation_marks_compressed():
 
 
 def test_client_close_error_code_maps_error_status():
-    wardex.init(intercept=True)
+    # capture_mode=ALL: see rationale in test_ws_upgrade_to_close_emits_one_span.
+    wardex.init(intercept=True, capture_mode=CaptureMode.ALL)
     from wardex_sdk._enums import StatusCode
     from wardex_sdk.interceptors._registry import get_registry
 
@@ -156,7 +163,8 @@ def test_close_flushes_ws_span_to_transport():
         def close(self, timeout: float = 5.0):
             pass
 
-    wardex.init(intercept=True)
+    # capture_mode=ALL: see rationale in test_ws_upgrade_to_close_emits_one_span.
+    wardex.init(intercept=True, capture_mode=CaptureMode.ALL)
     rec = _RecordingTransport()
     _hub.get_client()._transport = rec
     from wardex_sdk.interceptors._registry import get_registry

@@ -12,6 +12,7 @@ from abc import abstractmethod
 from typing import TYPE_CHECKING, Any
 
 from .._enums import (
+    CaptureMode,
     CaptureSource,
     Direction,
     OperationName,
@@ -81,7 +82,24 @@ class ByteSeamInterceptor(InterceptorInterface):
         return True
 
     def _should_capture(self, st: _ConnectionState, txn: Any, sem: Any) -> bool:
-        return True
+        """Capture-policy gate (Phase 4c, design §5.1).
+
+        AGENT (default): LLM-semantic traffic always; anything else only when
+        the tracker latched a *local* wardex span as parent. Remote-only
+        context (a joined trace with no local span) does not open the gate —
+        service meshes attach traceparent to every request, and that must not
+        resurrect the firehose. Fails open: losing data is worse than noise.
+        """
+        try:
+            client = self._client
+            if client is None or client.config.capture_mode is CaptureMode.ALL:
+                return True
+            if sem is not None and _has_core_semantics(sem):
+                return True
+            parent = getattr(txn, "parent", None)
+            return parent is not None and not getattr(parent, "is_remote", False)
+        except Exception:
+            return True
 
     def _capture_source(self) -> CaptureSource:
         return CaptureSource.SSL
