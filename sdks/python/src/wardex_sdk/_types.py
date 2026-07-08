@@ -56,6 +56,7 @@ class SpanContext:
     trace_id: TraceId
     span_id: SpanId
     trace_flags: int = 0
+    is_remote: bool = False
 
 
 # --- GenAI attributes (typed; OTel mapping is handled by the Normalizer) ---

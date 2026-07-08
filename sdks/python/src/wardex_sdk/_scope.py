@@ -22,6 +22,7 @@ class Scope:
     contexts: dict[str, dict[str, Any]] = field(default_factory=dict)
     active_span_context: SpanContext | None = None
     conversation: ConversationContext | None = None
+    tracestate: str | None = None
 
     def set_tag(self, key: str, value: str) -> None:
         self.tags[key] = value
@@ -39,6 +40,7 @@ class Scope:
             contexts=copy.deepcopy(self.contexts),
             active_span_context=self.active_span_context,
             conversation=self.conversation,
+            tracestate=self.tracestate,
         )
 
 
@@ -54,4 +56,6 @@ def merge_scopes(global_: Scope, isolation: Scope, current: Scope) -> Scope:
             merged.active_span_context = layer.active_span_context
         if layer.conversation is not None:
             merged.conversation = layer.conversation
+        if layer.tracestate is not None:
+            merged.tracestate = layer.tracestate
     return merged
