@@ -37,6 +37,7 @@ from ._types import (
     ToolDefinitionSet,
 )
 from ._version import __version__
+from .context._contextvar import run_in_context
 from .transport._base import Transport
 from .transport._console import ConsoleTransport
 from .transport._noop import NoOpTransport
@@ -58,6 +59,7 @@ __all__ = [
     "new_scope",
     "flush",
     "close",
+    "run_in_context",
     # Enums — importable directly from user code
     "AdapterName",
     "Direction",

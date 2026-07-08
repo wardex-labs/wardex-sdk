@@ -1,6 +1,7 @@
 """Phase 4a — ContextVar fork parenting. Repro tests for the gather mis-parenting bug."""
 
 import asyncio
+import threading
 
 from wardex_sdk import _hub
 from wardex_sdk._client import Client
@@ -93,3 +94,37 @@ def test_tags_set_before_span_survive_after():
     with trace("root"):
         pass
     assert _hub.get_current_scope().tags["k"] == "v"
+
+
+def test_run_in_context_carries_active_span_to_thread():
+    _setup()
+    results: dict[str, object] = {}
+
+    import wardex_sdk
+
+    with trace("root") as root:
+
+        def work():
+            active = _hub.get_current_scope().active_span_context
+            results["sid"] = active.span_id if active else None
+
+        th = threading.Thread(target=wardex_sdk.run_in_context(work))
+        th.start()
+        th.join()
+    assert results["sid"] == root.context.span_id
+
+
+def test_bare_thread_does_not_inherit_context():
+    """Documents the Python behavior the helper exists for."""
+    _setup()
+    results: dict[str, object] = {}
+    with trace("root"):
+
+        def work():
+            active = _hub.get_current_scope().active_span_context
+            results["sid"] = active.span_id if active else None
+
+        th = threading.Thread(target=work)
+        th.start()
+        th.join()
+    assert results["sid"] is None
