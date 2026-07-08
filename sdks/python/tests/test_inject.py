@@ -10,7 +10,7 @@ import wardex_sdk
 from wardex_sdk import _hub
 from wardex_sdk._client import Client
 from wardex_sdk._config import WardexConfig
-from wardex_sdk._tracing import trace
+from wardex_sdk._tracing import span, trace
 from wardex_sdk._types import InternalEnvelope
 from wardex_sdk.context._inject import install_propagation, uninstall_propagation
 from wardex_sdk.transport._base import Transport
@@ -218,3 +218,69 @@ def test_tracestate_forwarded_verbatim(echo_server):
         with trace("root"):
             requests.get(f"{echo_server}/x", timeout=5)
     assert _HeaderEcho.seen[-1].get("tracestate") == "dd=s:1"
+
+
+def test_init_wires_propagation_and_close_unwires():
+    import httpx
+
+    _hub.reset_for_test()
+    orig = httpx.Client.send
+    wardex_sdk.init(propagate_trace=True)
+    assert httpx.Client.send is not orig
+    wardex_sdk.close()
+    assert httpx.Client.send is orig
+
+
+def test_init_without_flag_does_not_patch():
+    import httpx
+
+    _hub.reset_for_test()
+    orig = httpx.Client.send
+    wardex_sdk.init()
+    assert httpx.Client.send is orig
+    wardex_sdk.close()
+
+
+def test_exporter_post_not_injected():
+    """The OTLP exporter's own POST must never carry traceparent (self-exclusion)."""
+    from wardex_sdk.context._inject import _build_inject_headers
+    from wardex_sdk.interceptors._exclusion import suppress_capture
+
+    _setup(propagate_trace=True)
+    with trace("root"):
+        assert _build_inject_headers("collector.mycorp.com") != {}
+        with suppress_capture():
+            assert _build_inject_headers("collector.mycorp.com") == {}
+
+
+def test_end_to_end_chain_one_trace():
+    """Design §9(1) programmatically: join -> agent span -> gather tools ->
+    outbound injection, all sharing the inbound trace_id."""
+    import asyncio
+
+    TP = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+    inbound_tid = TP.split("-")[1]
+    _setup(propagate_trace=True)
+    install_propagation()
+    injected: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        injected.append(request.headers.get("traceparent", ""))
+        return httpx.Response(200)
+
+    async def tool(n: int):
+        with span(f"tool-{n}"):
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as c:
+                await c.get("https://billing.mycorp.com/x")
+
+    async def main():
+        with wardex_sdk.continue_trace({"traceparent": TP}):
+            with trace("agent-turn"):
+                await asyncio.gather(tool(1), tool(2))
+
+    asyncio.run(main())
+    # every outbound call carried the inbound trace id
+    assert len(injected) == 2
+    assert all(h.split("-")[1] == inbound_tid for h in injected)
+    # and the two injected parent span ids differ (each tool's own span)
+    assert injected[0].split("-")[2] != injected[1].split("-")[2]
