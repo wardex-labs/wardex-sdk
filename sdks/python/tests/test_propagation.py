@@ -117,3 +117,16 @@ def test_continue_from_otel_no_active_otel_span_is_noop():
     _setup()
     with wardex_sdk.continue_from_otel():
         assert _hub.get_current_scope().active_span_context is None
+
+
+def test_continue_trace_joins_with_bytes_headers():
+    """Kafka clients (confluent-kafka, kafka-python) deliver header values as
+    bytes; continue_trace must decode them instead of silently starting a
+    fresh trace (README Kafka recipe: `continue_trace(dict(msg.headers()))`)."""
+    t = _setup()
+    with wardex_sdk.continue_trace({b"traceparent": TP.encode("ascii"), b"tracestate": b"dd=s:1"}):
+        with span("inner"):
+            headers = wardex_sdk.get_trace_headers()
+    sp = _all_spans(t)["inner"]
+    assert sp.context.trace_id.hex() == TP.split("-")[1]
+    assert headers["tracestate"] == "dd=s:1"

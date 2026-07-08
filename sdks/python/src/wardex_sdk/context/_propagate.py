@@ -27,7 +27,11 @@ def continue_trace(headers: Mapping[str, str]) -> Iterator[None]:
     parsed = None
     tracestate: str | None = None
     try:
-        norm = {str(k).lower(): str(v) for k, v in dict(headers).items()}
+
+        def _norm_str(x: object) -> str:
+            return x.decode("latin-1") if isinstance(x, (bytes, bytearray)) else str(x)
+
+        norm = {_norm_str(k).lower(): _norm_str(v) for k, v in dict(headers).items()}
         raw = norm.get("traceparent")
         if raw:
             parsed = parse_traceparent(raw)

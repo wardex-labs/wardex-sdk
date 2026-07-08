@@ -165,6 +165,10 @@ capture-everything behavior:
 wardex.init(..., capture_mode=wardex.CaptureMode.ALL)
 ```
 
+Plaintext hosts you've explicitly named via `intercept_hosts` are always
+captured regardless of `capture_mode` — a targeted allowlist entry is a
+stronger opt-in than the default policy.
+
 ## Roadmap
 
 1. ~~PII masking (pre-send safety)~~ — shipped

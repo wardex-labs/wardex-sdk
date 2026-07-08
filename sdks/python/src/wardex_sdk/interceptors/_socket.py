@@ -123,6 +123,14 @@ class RawSocketInterceptor(ByteSeamInterceptor):
         return st.gate in ("http", "h2c")
 
     def _should_capture(self, st: _ConnectionState, txn: Any, sem: Any) -> bool:
+        # Deliberate decision: an explicit `intercept_hosts` allowlist match bypasses
+        # the 4c `capture_mode` policy gate (which normally requires an active local
+        # span for non-LLM-semantic traffic — see _seam.py._emit_span). The user
+        # naming a plaintext host here is a stronger, more specific opt-in than the
+        # global capture_mode default; composing both gates would silently drop
+        # traffic the user explicitly asked to capture. This only applies to hosts
+        # the user listed by hand — it does not widen capture_mode=AGENT for anyone
+        # else.
         if _is_link_local(st.server_address):
             return False
         if sem is not None and _has_core_semantics(sem):
