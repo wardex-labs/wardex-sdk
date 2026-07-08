@@ -5,9 +5,9 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0b5] - 2026-07-08
+
 ### Added
-- Correct span parenting under `asyncio.gather` — spans now fork the current
-  scope via ContextVar (Phase 4a).
 - W3C trace propagation: `continue_trace()`, `get_traceparent()`,
   `get_trace_headers()` (opaque tracestate pass-through), `continue_from_otel()`,
   `WardexMiddleware` (ASGI), `WardexWSGIMiddleware`, and opt-in outbound
@@ -20,6 +20,12 @@ All notable changes to this project are documented here. The format follows
   captured; generic HTTP/gRPC/WS is captured only inside an active local
   wardex span. Set `capture_mode=CaptureMode.ALL` for the previous
   capture-everything behavior.
+
+### Fixed
+- Correct span parenting under `asyncio.gather` — spans started concurrently
+  under one parent no longer mistake a sibling for their parent (spans now
+  fork the current scope via ContextVar). Auto-captured client spans inherit
+  the fix.
 
 ## [0.1.0b4] - 2026-07-07
 
