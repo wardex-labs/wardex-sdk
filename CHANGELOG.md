@@ -18,8 +18,8 @@ All notable changes to this project are documented here. The format follows
 ### Changed
 - **`capture_mode` defaults to `"agent"`**: LLM-semantic traffic is always
   captured; generic HTTP/gRPC/WS is captured only inside an active local
-  wardex span. Set `capture_mode="all"` for the previous capture-everything
-  behavior.
+  wardex span. Set `capture_mode=CaptureMode.ALL` for the previous
+  capture-everything behavior.
 
 ## [0.1.0b4] - 2026-07-07
 

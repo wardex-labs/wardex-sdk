@@ -96,14 +96,18 @@ app.wsgi_app = wardex.WardexWSGIMiddleware(app.wsgi_app)
 
 Both extract the incoming `traceparent`/`tracestate` and continue the trace
 for the lifetime of the request; a missing or malformed header just starts a
-fresh trace (never raises).
+fresh trace (never raises). One WSGI caveat: the joined context covers the
+app callable only, so streaming responses (work done while iterating the
+returned iterable) run outside it.
 
 ### Manual propagation (the universal escape hatch)
 
-`get_traceparent()` / `get_trace_headers()` / `continue_trace()` are plain
-functions — they work over any channel that can carry a string, not just
-HTTP. Use them directly wherever the automatic client patches or ASGI/WSGI
-middleware don't reach:
+The baton is just a string, so it travels over any channel that can carry
+one — not just HTTP. `get_traceparent()` and `get_trace_headers()` are plain
+functions that return the current trace headers; `continue_trace(headers)`
+is a **context manager** — the remote parent is only installed inside the
+`with` block, so it must be entered, not merely called. Use them directly
+wherever the automatic client patches or ASGI/WSGI middleware don't reach:
 
 ```python
 # gRPC metadata
@@ -113,16 +117,22 @@ stub.Check(req, metadata=[("traceparent", wardex.get_traceparent())])
 websockets.connect(uri, extra_headers=wardex.get_trace_headers())
 
 # Celery: put get_trace_headers() on the task's headers when sending it,
-# then wardex.continue_trace(task.request.headers) inside the worker.
+# then inside the worker:
+with wardex.continue_trace(task.request.headers):
+    ...  # task body
 
 # Kafka: put get_trace_headers() on the message headers when producing,
-# then wardex.continue_trace(dict(msg.headers())) inside the consumer.
+# then inside the consumer:
+with wardex.continue_trace(dict(msg.headers())):
+    ...  # process the message
 ```
 
-`wardex.continue_from_otel()` is a one-line alternative to `continue_trace()`
-for code that already runs under an active OpenTelemetry span — it adopts
-that span as the remote parent (no-op if `opentelemetry` isn't installed or
-there's no active span).
+`with wardex.continue_from_otel():` is a one-line alternative to
+`continue_trace()` for code that already runs under an active OpenTelemetry
+span — it adopts that span as the remote parent for the duration of the
+`with` block (no-op if `opentelemetry` isn't installed or there's no active
+span). Like `continue_trace()`, it is a context manager and must be entered
+with `with`.
 
 ### Propagating into threads
 
