@@ -88,3 +88,26 @@ def test_post_init_rejects_nonpositive_flush_interval():
 def test_post_init_rejects_bad_max_buffer_spans():
     with pytest.raises(ValueError):
         WardexConfig(max_buffer_spans=0)
+
+
+def test_propagation_defaults_off():
+    from wardex_sdk._config import WardexConfig
+    from wardex_sdk._enums import CaptureMode
+
+    cfg = WardexConfig(api_key="k")
+    assert cfg.propagate_trace is False
+    assert cfg.propagate_targets is None
+    assert cfg.capture_mode is CaptureMode.AGENT
+
+
+def test_propagate_targets_validated_at_init():
+    import pytest
+
+    from wardex_sdk._config import WardexConfig
+
+    with pytest.raises(ValueError):
+        WardexConfig(api_key="k", propagate_targets=("",))
+    with pytest.raises(ValueError):
+        WardexConfig(api_key="k", propagate_targets=(123,))  # type: ignore[arg-type]
+    # valid globs pass
+    WardexConfig(api_key="k", propagate_targets=("*.mycorp.com", "api.internal"))

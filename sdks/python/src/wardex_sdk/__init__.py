@@ -13,6 +13,7 @@ from ._client import Client
 from ._config import WardexConfig
 from ._enums import (
     AdapterName,
+    CaptureMode,
     Direction,
     InterceptorName,
     Modality,
@@ -76,6 +77,7 @@ __all__ = [
     "WardexWSGIMiddleware",
     # Enums — importable directly from user code
     "AdapterName",
+    "CaptureMode",
     "Direction",
     "InterceptorName",
     "Modality",

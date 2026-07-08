@@ -11,6 +11,7 @@ from dataclasses import dataclass
 
 from ._enums import (
     AdapterName,
+    CaptureMode,
     CaptureTrigger,
     InterceptorName,
     PIICategory,
@@ -48,6 +49,10 @@ class WardexConfig:
     intercept: bool = False
     intercept_hosts: tuple[str, ...] | None = None
 
+    propagate_trace: bool = False
+    propagate_targets: tuple[str, ...] | None = None
+    capture_mode: CaptureMode = CaptureMode.AGENT
+
     release: str | None = None
     environment: str | None = None
     tags: tuple[tuple[str, str], ...] = ()
@@ -65,6 +70,12 @@ class WardexConfig:
             raise ValueError(f"flush_interval must be > 0, got {self.flush_interval}")
         if self.max_buffer_spans < 1:
             raise ValueError(f"max_buffer_spans must be >= 1, got {self.max_buffer_spans}")
+        if self.propagate_targets is not None:
+            for pattern in self.propagate_targets:
+                if not isinstance(pattern, str) or not pattern:
+                    raise ValueError(
+                        f"propagate_targets entries must be non-empty glob strings, got {pattern!r}"
+                    )
 
     @property
     def effective_retention(self) -> RetentionClass:

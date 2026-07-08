@@ -1,6 +1,17 @@
 from enum import Enum
 
 
+class CaptureMode(Enum):
+    """Which intercepted traffic becomes spans (design §5.1).
+
+    AGENT (default): LLM-semantic traffic always; generic HTTP/gRPC/WS only
+    inside a *local* wardex span. ALL: everything (pre-Phase-4 behavior).
+    """
+
+    AGENT = "agent"
+    ALL = "all"
+
+
 class PIIMode(Enum):
     MASK = "mask"
     REDACT = "redact"
