@@ -37,6 +37,7 @@ from ._types import (
     ToolDefinitionSet,
 )
 from ._version import __version__
+from .context._asgi import WardexMiddleware
 from .context._contextvar import run_in_context
 from .context._propagate import (
     continue_from_otel,
@@ -70,6 +71,7 @@ __all__ = [
     "continue_from_otel",
     "get_traceparent",
     "get_trace_headers",
+    "WardexMiddleware",
     # Enums — importable directly from user code
     "AdapterName",
     "Direction",
