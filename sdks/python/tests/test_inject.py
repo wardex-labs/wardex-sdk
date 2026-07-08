@@ -1,8 +1,12 @@
 """Opt-in traceparent injection into HTTP client libraries."""
 
+import http.server
+import threading
+
 import httpx
 import pytest
 
+import wardex_sdk
 from wardex_sdk import _hub
 from wardex_sdk._client import Client
 from wardex_sdk._config import WardexConfig
@@ -126,3 +130,68 @@ def test_install_uninstall_idempotent():
     uninstall_propagation()
     uninstall_propagation()
     assert httpx.Client.send is orig
+
+
+class _HeaderEcho(http.server.BaseHTTPRequestHandler):
+    seen: list[dict] = []
+
+    def do_GET(self):
+        _HeaderEcho.seen.append(dict(self.headers))
+        self.send_response(200)
+        self.send_header("Content-Length", "2")
+        self.end_headers()
+        self.wfile.write(b"ok")
+
+    def log_message(self, *a):
+        pass
+
+
+@pytest.fixture()
+def echo_server():
+    _HeaderEcho.seen = []
+    srv = http.server.HTTPServer(("127.0.0.1", 0), _HeaderEcho)
+    th = threading.Thread(target=srv.serve_forever, daemon=True)
+    th.start()
+    yield f"http://127.0.0.1:{srv.server_port}"
+    srv.shutdown()
+
+
+def test_requests_injects(echo_server):
+    import requests
+
+    _setup(propagate_trace=True)
+    install_propagation()
+    with trace("root") as root:
+        requests.get(f"{echo_server}/x", timeout=5)
+    assert _HeaderEcho.seen[-1].get("traceparent", "").split("-")[1] == root.context.trace_id.hex()
+
+
+def test_aiohttp_injects(echo_server):
+    import asyncio
+
+    import aiohttp
+
+    _setup(propagate_trace=True)
+    install_propagation()
+
+    async def main():
+        with trace("root") as root:
+            async with aiohttp.ClientSession() as s:
+                async with s.get(f"{echo_server}/x") as resp:
+                    await resp.read()
+            return root.context.trace_id.hex()
+
+    tid = asyncio.run(main())
+    assert _HeaderEcho.seen[-1].get("traceparent", "").split("-")[1] == tid
+
+
+def test_tracestate_forwarded_verbatim(echo_server):
+    import requests
+
+    tp = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+    _setup(propagate_trace=True)
+    install_propagation()
+    with wardex_sdk.continue_trace({"traceparent": tp, "tracestate": "dd=s:1"}):
+        with trace("root"):
+            requests.get(f"{echo_server}/x", timeout=5)
+    assert _HeaderEcho.seen[-1].get("tracestate") == "dd=s:1"

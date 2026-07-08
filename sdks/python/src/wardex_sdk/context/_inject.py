@@ -82,9 +82,84 @@ def _uninstall_httpx() -> None:
         httpx.AsyncClient.send = _orig.pop("httpx.AsyncClient.send")
 
 
+def _install_requests() -> None:
+    try:
+        import requests  # noqa: PLC0415
+    except ImportError:
+        return
+    if "requests.Session.send" in _orig:
+        return
+    from urllib.parse import urlparse  # noqa: PLC0415
+
+    orig_send = requests.Session.send
+
+    def send(self: Any, request: Any, **kwargs: Any) -> Any:
+        try:
+            if "traceparent" not in request.headers:
+                host = urlparse(request.url).hostname or ""
+                for k, v in _build_inject_headers(host).items():
+                    request.headers[k] = v
+        except Exception:
+            pass
+        return orig_send(self, request, **kwargs)
+
+    _orig["requests.Session.send"] = orig_send
+    requests.Session.send = send
+
+
+def _uninstall_requests() -> None:
+    try:
+        import requests  # noqa: PLC0415
+    except ImportError:
+        return
+    if "requests.Session.send" in _orig:
+        requests.Session.send = _orig.pop("requests.Session.send")
+
+
+def _install_aiohttp() -> None:
+    try:
+        import aiohttp  # noqa: PLC0415
+        from yarl import URL  # noqa: PLC0415
+    except ImportError:
+        return
+    if "aiohttp.ClientSession._request" in _orig:
+        return
+
+    orig_request = aiohttp.ClientSession._request
+
+    async def _request(self: Any, method: Any, str_or_url: Any, **kwargs: Any) -> Any:
+        try:
+            host = URL(str_or_url).host or ""
+            merged = dict(kwargs.get("headers") or {})
+            if not any(str(k).lower() == "traceparent" for k in merged):
+                inject = _build_inject_headers(host)
+                if inject:
+                    merged.update(inject)
+                    kwargs["headers"] = merged
+        except Exception:
+            pass
+        return await orig_request(self, method, str_or_url, **kwargs)
+
+    _orig["aiohttp.ClientSession._request"] = orig_request
+    aiohttp.ClientSession._request = _request
+
+
+def _uninstall_aiohttp() -> None:
+    try:
+        import aiohttp  # noqa: PLC0415
+    except ImportError:
+        return
+    if "aiohttp.ClientSession._request" in _orig:
+        aiohttp.ClientSession._request = _orig.pop("aiohttp.ClientSession._request")
+
+
 def install_propagation() -> None:
     _install_httpx()
+    _install_requests()
+    _install_aiohttp()
 
 
 def uninstall_propagation() -> None:
     _uninstall_httpx()
+    _uninstall_requests()
+    _uninstall_aiohttp()

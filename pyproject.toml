@@ -3,9 +3,11 @@ members = ["sdks/python"]
 
 [dependency-groups]
 dev = [
+    "aiohttp>=3.9",
     "h2>=4.0",
     "httpx[http2]>=0.28.1",
     "opentelemetry-api>=1.20",
     "opentelemetry-sdk>=1.20",
+    "requests>=2.31",
     "uvloop>=0.17",
 ]
