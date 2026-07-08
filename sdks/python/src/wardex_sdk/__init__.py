@@ -38,7 +38,12 @@ from ._types import (
 )
 from ._version import __version__
 from .context._contextvar import run_in_context
-from .context._propagate import continue_trace, get_trace_headers, get_traceparent
+from .context._propagate import (
+    continue_from_otel,
+    continue_trace,
+    get_trace_headers,
+    get_traceparent,
+)
 from .transport._base import Transport
 from .transport._console import ConsoleTransport
 from .transport._noop import NoOpTransport
@@ -62,6 +67,7 @@ __all__ = [
     "close",
     "run_in_context",
     "continue_trace",
+    "continue_from_otel",
     "get_traceparent",
     "get_trace_headers",
     # Enums — importable directly from user code

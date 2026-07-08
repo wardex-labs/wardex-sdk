@@ -96,3 +96,24 @@ def test_get_trace_headers_carries_tracestate_opaque():
             headers = wardex_sdk.get_trace_headers()
             assert headers["tracestate"] == TS
             assert headers["traceparent"].split("-")[1] == TP.split("-")[1]
+
+
+def test_continue_from_otel_adopts_current_otel_span():
+    from opentelemetry import trace as otel_api  # noqa: F401
+    from opentelemetry.sdk.trace import TracerProvider
+
+    _setup()
+    tracer = TracerProvider().get_tracer("t")
+    with tracer.start_as_current_span("otel-parent") as otel_span:
+        otel_ctx = otel_span.get_span_context()
+        with wardex_sdk.continue_from_otel():
+            active = _hub.get_current_scope().active_span_context
+            assert active is not None and active.is_remote is True
+            assert active.trace_id.value == otel_ctx.trace_id.to_bytes(16, "big")
+            assert active.span_id.value == otel_ctx.span_id.to_bytes(8, "big")
+
+
+def test_continue_from_otel_no_active_otel_span_is_noop():
+    _setup()
+    with wardex_sdk.continue_from_otel():
+        assert _hub.get_current_scope().active_span_context is None

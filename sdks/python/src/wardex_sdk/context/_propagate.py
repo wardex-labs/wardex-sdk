@@ -62,3 +62,32 @@ def get_trace_headers() -> dict[str, str]:
     if ts:
         headers["tracestate"] = ts
     return headers
+
+
+@contextmanager
+def continue_from_otel() -> Iterator[None]:
+    """Adopt the current OpenTelemetry span (if any) as a remote parent.
+
+    Entry semantics match continue_trace (isolation + remote parent).
+    No opentelemetry installed, or no active/valid span -> plain isolation.
+    """
+    ctx: SpanContext | None = None
+    try:
+        from opentelemetry import trace as _otel  # noqa: PLC0415
+
+        sc = _otel.get_current_span().get_span_context()
+        if sc.is_valid:
+            from .._types import SpanId, TraceId  # noqa: PLC0415
+
+            ctx = SpanContext(
+                trace_id=TraceId(sc.trace_id.to_bytes(16, "big")),
+                span_id=SpanId(sc.span_id.to_bytes(8, "big")),
+                trace_flags=int(sc.trace_flags),
+                is_remote=True,
+            )
+    except Exception:
+        ctx = None
+    with _hub.isolation_scope():
+        if ctx is not None:
+            _hub.get_current_scope().active_span_context = ctx
+        yield
