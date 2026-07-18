@@ -43,4 +43,7 @@ def test_tool_attributes_flatten_to_extra():
 def test_absent_blocks_add_no_keys():
     out = _codec.decode(_codec.encode(_env(_span())))
     extra = _extra_dict(out["items"][0]["span"])
-    assert not any(k.startswith(("gen_ai.agent.", "gen_ai.tool.", "wardex.agent.", "wardex.tool.")) for k in extra)
+    assert not any(
+        k.startswith(("gen_ai.agent.", "gen_ai.tool.", "wardex.agent.", "wardex.tool."))
+        for k in extra
+    )
