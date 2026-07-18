@@ -2,6 +2,7 @@
 //!
 //! Phase 0 scaffold — modules are empty placeholders.
 
+pub mod claude_stream_json;
 pub mod grpc;
 pub mod http1;
 pub mod http2;
