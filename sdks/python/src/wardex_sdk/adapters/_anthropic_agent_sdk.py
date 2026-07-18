@@ -203,6 +203,7 @@ class AnthropicAgentSdkAdapter(AdapterInterface):
 
         # (2) custom-transport path + hook merge: wrap public entry points
         self._originals["query"] = sdk.query
+        orig_query = self._originals["query"]
 
         def query(*, prompt, options=None, transport=None, **kwargs):  # noqa: ANN001
             try:
@@ -211,11 +212,9 @@ class AnthropicAgentSdkAdapter(AdapterInterface):
                     transport = _TransportTee(transport, adapter)
             except Exception:  # noqa: BLE001
                 pass
-            return self._originals["query"](
-                prompt=prompt, options=options, transport=transport, **kwargs
-            )
+            return orig_query(prompt=prompt, options=options, transport=transport, **kwargs)
 
-        query.__wrapped__ = self._originals["query"]
+        query.__wrapped__ = orig_query
         sdk.query = query
 
         self._originals["client_init"] = sdk.ClaudeSDKClient.__init__

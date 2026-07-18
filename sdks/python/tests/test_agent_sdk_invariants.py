@@ -80,3 +80,23 @@ def test_uninstalled_adapter_leaves_sdk_untouched():
     assert claude_agent_sdk.query is before_query
     received = _collect([INIT_LINE, RESULT_LINE])
     assert len(received) == 2
+
+
+def test_held_query_reference_survives_uninstall():
+    """A module-level `from claude_agent_sdk import query` reference grabbed while
+    wardex is installed must keep working after uninstall() — the wrapper closes
+    over the original by value, not via a dict lookup that uninstall() clears.
+    """
+    adapter = AnthropicAgentSdkAdapter()
+    adapter.install(FakeClient())
+    held_query = claude_agent_sdk.query  # simulates a user's long-held import
+    adapter.uninstall()
+
+    received = []
+
+    async def main():
+        async for msg in held_query(prompt="x", transport=FakeTransport([INIT_LINE, RESULT_LINE])):
+            received.append(msg)
+
+    anyio.run(main)  # must not raise KeyError
+    assert len(received) == 2

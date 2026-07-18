@@ -138,6 +138,11 @@ class SessionAssembler:
                     sess.first_delta_ns = now
             elif ev.kind == "session_result":
                 sess.result = ev
+            elif ev.kind == "task_lifecycle":
+                # Deliberately unconsumed for now: subagent spans are built from
+                # SubagentStart/Stop hooks; task usage enrichment is a deferred
+                # follow-up. Parsed and exposed so the wire surface is stable.
+                pass
 
     def on_close(self, key: int, error: str | None) -> None:
         now = time.time_ns()
