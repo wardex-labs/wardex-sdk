@@ -47,9 +47,11 @@ wardex.close()   # optional — spans auto-flush every 5s, on buffer threshold, 
   `pii_disabled_categories={PIICategory.IP_ADDRESS}` for per-category opt-out)
 - Background batching: automatic flush every 5s / on buffer threshold /
   at exit and on SIGINT/SIGTERM (chained; opt out with `flush_on_signals=False`)
+- Framework adapter: Anthropic Agent SDK (`claude_agent_sdk`) — auto-detected,
+  zero-instrumentation `invoke_agent`/`chat` spans with tool-call correlation
 
 **Not yet (see Roadmap)**
-- Framework adapters (LangGraph, Anthropic/OpenAI Agent SDKs)
+- Framework adapters for LangGraph and OpenAI Agents SDK
 - Node/TS and Java SDKs
 
 **Notes**
@@ -174,7 +176,8 @@ stronger opt-in than the default policy.
 1. ~~PII masking (pre-send safety)~~ — shipped
 2. ~~Batching & lifecycle (background worker, at-exit/periodic flush, concurrency)~~ — shipped
 3. ~~Distributed propagation (W3C)~~ — shipped
-4. Framework adapters
+4. Framework adapters — ~~Anthropic Agent SDK~~ shipped; LangGraph and OpenAI
+   Agents SDK next
 5. Node/TS and Java SDKs
 
 > PII masking caveats: `before_send` sees pre-masking data (masking runs inside
