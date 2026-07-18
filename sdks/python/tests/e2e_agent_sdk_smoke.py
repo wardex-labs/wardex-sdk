@@ -26,31 +26,44 @@ async def main() -> int:
     record_path = os.environ.get("WARDEX_RECORD")
     wardex_sdk.init(transport=ConsoleTransport())
 
-    if record_path:
-        from claude_agent_sdk._internal.transport import subprocess_cli
+    rec = None
+    try:
+        if record_path:
+            from claude_agent_sdk._internal.transport import subprocess_cli
 
-        cls = subprocess_cli.SubprocessCLITransport
-        orig_read = cls.read_messages
-        rec = open(record_path, "a", encoding="utf-8")
+            cls = subprocess_cli.SubprocessCLITransport
+            orig_read = cls.read_messages
+            rec = open(record_path, "a", encoding="utf-8")
 
-        def read_messages(self):
-            inner = orig_read(self)
+            def read_messages(self):
+                inner = orig_read(self)
 
-            async def gen():
-                async for msg in inner:
-                    rec.write(json.dumps(msg) + "\n")
-                    yield msg
+                async def gen():
+                    async for msg in inner:
+                        try:
+                            rec.write(json.dumps(msg) + "\n")
+                        except Exception:
+                            pass
+                        yield msg
 
-            return gen()
+                return gen()
 
-        cls.read_messages = read_messages
+            cls.read_messages = read_messages
 
-    async for message in claude_agent_sdk.query(prompt="What is 2 + 2? Answer with one number."):
-        print(type(message).__name__)
+        async for message in claude_agent_sdk.query(
+            prompt="What is 2 + 2? Answer with one number."
+        ):
+            print(type(message).__name__)
 
-    wardex_sdk.close()
-    print("smoke OK — spans printed above by ConsoleTransport")
-    return 0
+        print("smoke OK — spans printed above by ConsoleTransport")
+        return 0
+    finally:
+        if rec is not None:
+            try:
+                rec.close()
+            except Exception:
+                pass
+        wardex_sdk.close()
 
 
 if __name__ == "__main__":
