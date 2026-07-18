@@ -23,6 +23,19 @@ class _FakeAdapter(AdapterInterface):
         self.uninstalled += 1
 
 
+class _BrokenInstallAdapter(AdapterInterface):
+    """install() itself raises — simulates a broken adapter's monkey-patching."""
+
+    def name(self) -> str:
+        return "broken-install"
+
+    def install(self, client) -> None:
+        raise RuntimeError("boom")
+
+    def uninstall(self) -> None:
+        pass
+
+
 def test_registry_install_is_idempotent():
     reg = get_registry()
     reg.uninstall_all()
@@ -83,4 +96,20 @@ def test_explicit_tuple_installs_even_without_detection():
         make.return_value = _FakeAdapter()
         install_configured_adapters(None, _config((AdapterName.ANTHROPIC_AGENT_SDK,)))
         make.assert_called_once()
+    get_registry().uninstall_all()
+
+
+def test_broken_adapter_install_does_not_break_init():
+    """Regression: a raising adapter.install() must not propagate out of
+    install_configured_adapters(), and the registry must not report the
+    broken adapter as installed (get_registry().install() calls adapter.
+    install() before recording it — see AdapterRegistry.install)."""
+    get_registry().uninstall_all()
+    with (
+        mock.patch("wardex_sdk.adapters._detect_package", return_value=True),
+        mock.patch("wardex_sdk.adapters._make_adapter") as make,
+    ):
+        make.return_value = _BrokenInstallAdapter()
+        install_configured_adapters(None, _config(None))  # must not raise
+        assert not get_registry().is_installed("broken-install")
     get_registry().uninstall_all()

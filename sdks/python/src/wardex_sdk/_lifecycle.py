@@ -34,15 +34,20 @@ def current_client() -> Client | None:
 
 
 def _teardown(client: Client) -> None:
-    """Uninstall interceptors, then close.
+    """Uninstall interceptors and adapters, then close.
 
     Uninstall must run first: it flushes pending interceptor state (e.g. WS
     sessions) via capture_span, which close() rejects once _closed is set —
-    same ordering wardex.close() uses.
+    same ordering wardex.close() uses. Adapters are uninstalled here too, so
+    a re-init() (or atexit) doesn't leave a previous adapter bound to the
+    closed client — AdapterRegistry.install() is idempotent by name, so a
+    stale registration would otherwise make the next init() silently no-op.
     """
-    from .interceptors._registry import get_registry
+    from .adapters._registry import get_registry as get_adapter_registry
+    from .interceptors._registry import get_registry as get_interceptor_registry
 
-    get_registry().uninstall_all()
+    get_interceptor_registry().uninstall_all()
+    get_adapter_registry().uninstall_all()
     client.close()
 
 

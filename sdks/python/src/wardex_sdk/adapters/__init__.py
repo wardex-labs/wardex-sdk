@@ -42,8 +42,8 @@ def install_configured_adapters(client: Client | None, config: WardexConfig) -> 
     for name in wanted:
         try:
             adapter = _make_adapter(name)
+            if adapter is not None:
+                get_registry().install(adapter, client)
         except Exception as exc:  # noqa: BLE001 — a broken adapter must not break init()
             print(f"[wardex] adapter {name.value} failed to load ({exc})", file=sys.stderr)
             continue
-        if adapter is not None:
-            get_registry().install(adapter, client)
