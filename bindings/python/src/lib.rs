@@ -16,6 +16,7 @@ use wardex_core::protocol::semantic::{parse_llm, LlmSemantics as CoreLlmSemantic
 use wardex_core::protocol::websocket::{
     WsFeedResult as CoreWsFeedResult, WsFrame as CoreWsFrame, WsParser as CoreWsParser,
 };
+use wardex_protocol::claude_stream_json as ccs;
 
 /// A single parsed HTTP message (for Python exposure).
 #[pyclass]
@@ -490,6 +491,127 @@ impl WsParser {
     }
 }
 
+/// One parsed claude stream-json event (flat; kind discriminates).
+#[pyclass]
+struct ClaudeStreamEvent {
+    inner: ccs::ClaudeStreamEvent,
+}
+
+#[pymethods]
+impl ClaudeStreamEvent {
+    #[getter]
+    fn kind(&self) -> &'static str {
+        match self.inner.kind {
+            ccs::EventKind::SessionInit => "session_init",
+            ccs::EventKind::UserPrompt => "user_prompt",
+            ccs::EventKind::AssistantTurn => "assistant_turn",
+            ccs::EventKind::ToolResult => "tool_result",
+            ccs::EventKind::StreamDelta => "stream_delta",
+            ccs::EventKind::TaskLifecycle => "task_lifecycle",
+            ccs::EventKind::SessionResult => "session_result",
+        }
+    }
+    #[getter]
+    fn session_id(&self) -> Option<String> {
+        self.inner.session_id.clone()
+    }
+    #[getter]
+    fn model(&self) -> Option<String> {
+        self.inner.model.clone()
+    }
+    #[getter]
+    fn message_id(&self) -> Option<String> {
+        self.inner.message_id.clone()
+    }
+    #[getter]
+    fn stop_reason(&self) -> Option<String> {
+        self.inner.stop_reason.clone()
+    }
+    #[getter]
+    fn parent_tool_use_id(&self) -> Option<String> {
+        self.inner.parent_tool_use_id.clone()
+    }
+    #[getter]
+    fn subtype(&self) -> Option<String> {
+        self.inner.subtype.clone()
+    }
+    #[getter]
+    fn task_id(&self) -> Option<String> {
+        self.inner.task_id.clone()
+    }
+    #[getter]
+    fn task_status(&self) -> Option<String> {
+        self.inner.task_status.clone()
+    }
+    #[getter]
+    fn task_tool_use_id(&self) -> Option<String> {
+        self.inner.task_tool_use_id.clone()
+    }
+    #[getter]
+    fn content_json<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyBytes>> {
+        self.inner
+            .content_json
+            .as_ref()
+            .map(|b| PyBytes::new_bound(py, b))
+    }
+    #[getter]
+    fn tool_uses(&self) -> Vec<(String, String, Vec<u8>)> {
+        self.inner
+            .tool_uses
+            .iter()
+            .map(|t| (t.id.clone(), t.name.clone(), t.input_json.clone()))
+            .collect()
+    }
+    #[getter]
+    fn input_tokens(&self) -> Option<i64> {
+        self.inner.usage.as_ref().and_then(|u| u.input_tokens)
+    }
+    #[getter]
+    fn output_tokens(&self) -> Option<i64> {
+        self.inner.usage.as_ref().and_then(|u| u.output_tokens)
+    }
+    #[getter]
+    fn cache_read_tokens(&self) -> Option<i64> {
+        self.inner
+            .usage
+            .as_ref()
+            .and_then(|u| u.cache_read_input_tokens)
+    }
+    #[getter]
+    fn cache_creation_tokens(&self) -> Option<i64> {
+        self.inner
+            .usage
+            .as_ref()
+            .and_then(|u| u.cache_creation_input_tokens)
+    }
+    #[getter]
+    fn num_turns(&self) -> Option<i64> {
+        self.inner.num_turns
+    }
+    #[getter]
+    fn total_cost_usd(&self) -> Option<f64> {
+        self.inner.total_cost_usd
+    }
+    #[getter]
+    fn duration_ms(&self) -> Option<i64> {
+        self.inner.duration_ms
+    }
+    #[getter]
+    fn duration_api_ms(&self) -> Option<i64> {
+        self.inner.duration_api_ms
+    }
+    #[getter]
+    fn is_error(&self) -> bool {
+        self.inner.is_error
+    }
+}
+
+/// Parse one stream-json line. Returns None for unknown/non-semantic lines.
+#[pyfunction]
+fn parse_claude_stream_line(data: &[u8], outbound: bool) -> Option<ClaudeStreamEvent> {
+    ccs::parse_stream_line(data, outbound).map(|inner| ClaudeStreamEvent { inner })
+}
+
 #[pyfunction]
 fn parse_grpc_frames(body: &[u8]) -> GrpcFrames {
     GrpcFrames {
@@ -527,6 +649,8 @@ fn _wardex_native(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     protocol.add_class::<GrpcFrames>()?;
     protocol.add_function(wrap_pyfunction!(parse_grpc_frames, &protocol)?)?;
     protocol.add_function(wrap_pyfunction!(grpc_status_name, &protocol)?)?;
+    protocol.add_class::<ClaudeStreamEvent>()?;
+    protocol.add_function(wrap_pyfunction!(parse_claude_stream_line, &protocol)?)?;
     m.add_submodule(&protocol)?;
     // Register in sys.modules so that `import wardex_sdk._wardex_native.protocol` works
     py.import_bound("sys")?

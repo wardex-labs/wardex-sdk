@@ -12,5 +12,6 @@ name       = "_wardex_native"
 crate-type = ["cdylib"]
 
 [dependencies]
-pyo3        = { workspace = true }
-wardex-core = { path = "../../crates/wardex-core" }
+pyo3               = { workspace = true }
+wardex-core        = { path = "../../crates/wardex-core" }
+wardex-protocol    = { path = "../../crates/wardex-protocol" }
