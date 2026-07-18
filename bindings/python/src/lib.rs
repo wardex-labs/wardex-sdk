@@ -5,6 +5,7 @@ mod codec;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use pyo3::wrap_pyfunction;
+use wardex_core::protocol::claude_stream_json as ccs;
 use wardex_core::protocol::grpc::{
     grpc_status_name as core_grpc_status_name, parse_grpc_frames as core_parse_grpc_frames,
     GrpcFrames as CoreGrpcFrames, GrpcMessage as CoreGrpcMessage,
@@ -16,7 +17,6 @@ use wardex_core::protocol::semantic::{parse_llm, LlmSemantics as CoreLlmSemantic
 use wardex_core::protocol::websocket::{
     WsFeedResult as CoreWsFeedResult, WsFrame as CoreWsFrame, WsParser as CoreWsParser,
 };
-use wardex_protocol::claude_stream_json as ccs;
 
 /// A single parsed HTTP message (for Python exposure).
 #[pyclass]
