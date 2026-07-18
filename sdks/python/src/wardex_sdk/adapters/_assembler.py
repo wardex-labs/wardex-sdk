@@ -307,7 +307,9 @@ class SessionAssembler:
             stream_name, stream_input = meta
             if stream_name:
                 tool.name = stream_name
-            if not tool.input_data:
+            # Content authority: the byte-exact stream input always wins over
+            # the hook's re-serialized tool_input when the stream saw it.
+            if stream_input:
                 tool.input_data = stream_input
         if "tool_response" in payload:
             tool.output_data = _safe_json_bytes(payload.get("tool_response"))

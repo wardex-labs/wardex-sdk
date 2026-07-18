@@ -38,6 +38,24 @@ RESULT = {
     "duration_ms": 100,
     "duration_api_ms": 80,
 }
+DIVERGENT_ASSISTANT = {
+    "type": "assistant",
+    "session_id": "s-1",
+    "message": {
+        "id": "m2",
+        "model": "claude-sonnet-5",
+        "stop_reason": "tool_use",
+        "usage": {"input_tokens": 10, "output_tokens": 25},
+        "content": [
+            {
+                "type": "tool_use",
+                "id": "toolu_03",
+                "name": "Bash",
+                "input": {"command": "ls -la /stream"},
+            }
+        ],
+    },
+}
 
 
 class FakeClient:
@@ -103,6 +121,33 @@ def test_tool_span_from_hooks_joins_stream_content():
     assert tool.correlation.confidence == 1.0
     assert tool.correlation.strategy == "adapter_hook"
     assert b"ls" in tool.input_data
+
+
+def test_close_tool_stream_input_wins_over_hook_reserialization():
+    """Design rule (spec §6.2): stream is content authority. A hook's
+    re-serialized tool_input must not shadow the byte-exact stream input_json
+    when both are present and diverge."""
+    client = FakeClient()
+    asm = SessionAssembler(client)
+    _outbound(asm, key=1)
+    asm.on_inbound(1, INIT)
+    asm.on_inbound(1, DIVERGENT_ASSISTANT)
+    asm.on_hook(
+        "PreToolUse",
+        {"session_id": "s-1", "tool_name": "Bash", "tool_input": {"command": "hook-version"}},
+        "toolu_03",
+    )
+    asm.on_hook(
+        "PostToolUse",
+        {"session_id": "s-1", "tool_name": "Bash", "tool_response": "ok"},
+        "toolu_03",
+    )
+    asm.on_inbound(1, RESULT)
+    asm.on_close(1, None)
+
+    tool = next(s for s in client.spans if s.name == "execute_tool Bash")
+    assert b"/stream" in tool.input_data
+    assert b"hook-version" not in tool.input_data
 
 
 def test_stream_only_degrades_confidence():
