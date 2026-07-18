@@ -101,10 +101,16 @@ class FakeTransport(Transport):
 def test_install_uninstall_restores_surface():
     adapter = AnthropicAgentSdkAdapter()
     orig_query = claude_agent_sdk.query
+    orig_create_sdk_mcp_server = claude_agent_sdk.create_sdk_mcp_server
+    assert adapter._assembler is None
     adapter.install(None)
     assert claude_agent_sdk.query is not orig_query
+    assert claude_agent_sdk.create_sdk_mcp_server is not orig_create_sdk_mcp_server
+    assert adapter._assembler is not None
     adapter.uninstall()
     assert claude_agent_sdk.query is orig_query
+    assert claude_agent_sdk.create_sdk_mcp_server is orig_create_sdk_mcp_server
+    assert adapter._assembler is None
 
 
 def test_hook_merge_preserves_user_hooks():

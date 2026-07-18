@@ -79,6 +79,12 @@ def _wrap_sdk_tool(sdk_tool: Any, wrapped_names: set[str]) -> Any:
     tool_name = getattr(sdk_tool, "name", "unknown")
     wrapped_names.add(tool_name)
 
+    if getattr(handler, "__wardex_wrapped__", False):
+        # Idempotent: the same SdkMcpTool object (module-level @tool definition)
+        # may be registered again via a fresh create_sdk_mcp_server call — don't
+        # nest another span wrapper around an already-wrapped handler.
+        return sdk_tool
+
     async def wrapped(args):  # noqa: ANN001
         with span(
             f"execute_tool {tool_name}",
@@ -91,6 +97,7 @@ def _wrap_sdk_tool(sdk_tool: Any, wrapped_names: set[str]) -> Any:
                 pass
             return await handler(args)
 
+    wrapped.__wardex_wrapped__ = True
     sdk_tool.handler = wrapped
     return sdk_tool
 

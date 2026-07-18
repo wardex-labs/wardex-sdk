@@ -9,8 +9,20 @@ from test_agent_sdk_adapter_install import (
     RESULT_LINE,
     FakeTransport,
 )
+from wardex_sdk import _hub
+from wardex_sdk._client import Client
+from wardex_sdk._config import WardexConfig
 from wardex_sdk._enums import CaptureSource, StatusCode
 from wardex_sdk.adapters._anthropic_agent_sdk import AnthropicAgentSdkAdapter
+from wardex_sdk.transport._base import Transport
+
+
+class _Recording(Transport):
+    def __init__(self):
+        self.envelopes = []
+
+    def export(self, envelope):
+        self.envelopes.append(envelope)
 
 
 class FakeClient:
@@ -107,3 +119,38 @@ def test_parallel_sessions_do_not_cross():
     by_trace = {r.context.trace_id: r.conversation.session_id for r in roots}
     for c in chats:
         assert c.context.trace_id in by_trace  # each chat belongs to exactly one root's trace
+
+
+def test_repeated_sdk_tool_registration_does_not_double_wrap():
+    """Finding 1 regression: fresh options per query, reused @tool definitions —
+    calling the patched create_sdk_mcp_server twice with the same SdkMcpTool
+    object must not nest the wrapper (which would emit duplicate execute_tool
+    spans for a single handler invocation)."""
+    _hub.reset_for_test()
+    t = _Recording()
+    _hub.set_client(Client(WardexConfig(api_key="k"), t))
+
+    async def handler(args):
+        return {"content": [{"type": "text", "text": "ok"}]}
+
+    tool_def = claude_agent_sdk.SdkMcpTool(
+        name="greet", description="d", input_schema={}, handler=handler
+    )
+
+    adapter = AnthropicAgentSdkAdapter()
+    adapter.install(None)
+    try:
+        claude_agent_sdk.create_sdk_mcp_server("srv", tools=[tool_def])
+        first_handler = tool_def.handler
+        claude_agent_sdk.create_sdk_mcp_server("srv", tools=[tool_def])
+        second_handler = tool_def.handler
+        # No re-wrap on the second registration: same handler object.
+        assert first_handler is second_handler
+
+        anyio.run(first_handler, {"x": 1})
+    finally:
+        adapter.uninstall()
+
+    _hub.get_client().flush()
+    spans = [s for s in t.envelopes[0].spans if s.name == "execute_tool greet"]
+    assert len(spans) == 1

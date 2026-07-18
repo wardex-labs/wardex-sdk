@@ -211,6 +211,68 @@ def test_abort_closes_open_spans_with_markers():
     assert asm.open_session_count() == 0
 
 
+def test_skip_tool_names_suppresses_hook_driven_span():
+    """Finding 2 regression: a tool wrapped by the adapter's in-process
+    handler (execution runs inside its own execute_tool span, opened directly
+    around the handler call) must not also get a hook-driven span here — the
+    skip-list guards in _open_tool/_close_tool/_on_stream_tool_result exist to
+    prevent double emission for the same call."""
+    client = FakeClient()
+    asm = SessionAssembler(client, skip_tool_names={"mcp__srv__greet"})
+    _outbound(asm, key=1)
+    asm.on_inbound(1, INIT)
+    assistant = {
+        "type": "assistant",
+        "session_id": "s-1",
+        "message": {
+            "id": "m1",
+            "model": "claude-sonnet-5",
+            "stop_reason": "tool_use",
+            "usage": {"input_tokens": 10, "output_tokens": 25},
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "toolu_greet",
+                    "name": "mcp__srv__greet",
+                    "input": {"name": "world"},
+                }
+            ],
+        },
+    }
+    asm.on_inbound(1, assistant)
+    asm.on_hook(
+        "PreToolUse",
+        {"session_id": "s-1", "tool_name": "mcp__srv__greet", "tool_input": {"name": "world"}},
+        "toolu_greet",
+    )
+    asm.on_hook(
+        "PostToolUse",
+        {"session_id": "s-1", "tool_name": "mcp__srv__greet", "tool_response": "hi world"},
+        "toolu_greet",
+    )
+    tool_result = {
+        "type": "user",
+        "session_id": "s-1",
+        "parent_tool_use_id": "toolu_greet",
+        "message": {
+            "role": "user",
+            "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_greet", "content": "hi world"}
+            ],
+        },
+    }
+    asm.on_inbound(1, tool_result)
+    asm.on_inbound(1, RESULT)
+    asm.on_close(1, None)
+
+    names = [s.name for s in client.spans]
+    assert "execute_tool mcp__srv__greet" not in names
+    # root/chat spans still emitted normally
+    assert "invoke_agent" in names
+    assert "chat claude-sonnet-5" in names
+    assert asm.open_session_count() == 0
+
+
 def test_open_entry_cap():
     client = FakeClient()
     asm = SessionAssembler(client)
