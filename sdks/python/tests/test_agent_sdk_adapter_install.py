@@ -124,8 +124,16 @@ def test_hook_merge_preserves_user_hooks():
 
 
 def test_query_passthrough_with_fake_transport():
+    class RecordingClient:
+        def __init__(self):
+            self.spans = []
+
+        def capture_span(self, span):
+            self.spans.append(span)
+
+    client = RecordingClient()
     adapter = AnthropicAgentSdkAdapter()
-    adapter.install(None)
+    adapter.install(client)
     try:
         received = []
 
@@ -137,7 +145,11 @@ def test_query_passthrough_with_fake_transport():
         anyio.run(main)
         # user sees every message despite the tee
         assert len(received) == 3
-        # tee observed inbound traffic
-        assert adapter._debug_inbound_count >= 3
+        # the tee fed the assembler enough to close the session cleanly
+        assert adapter._assembler.open_session_count() == 0
+        # and to emit at least the root span plus one chat turn
+        names = [s.name for s in client.spans]
+        assert "invoke_agent" in names
+        assert any(n.startswith("chat") for n in names)
     finally:
         adapter.uninstall()

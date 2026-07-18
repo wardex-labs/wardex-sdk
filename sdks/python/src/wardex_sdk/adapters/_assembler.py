@@ -83,11 +83,15 @@ class _Session:
 
 
 class SessionAssembler:
-    def __init__(self, client: Any) -> None:
+    def __init__(self, client: Any, skip_tool_names: set[str] | None = None) -> None:
         self._client = client
         self._lock = threading.RLock()
         self._by_key: dict[int, _Session] = {}
         self._by_session_id: dict[str, _Session] = {}
+        # Tool names handled by the adapter's in-process tool wrapper (execute_tool
+        # spans opened directly around the handler call); hook-driven spans for
+        # these names are skipped here to avoid emitting the call twice.
+        self.skip_tool_names: set[str] = skip_tool_names if skip_tool_names is not None else set()
 
     def open_session_count(self) -> int:
         with self._lock:
@@ -272,6 +276,10 @@ class SessionAssembler:
     def _open_tool(self, sess: _Session, payload: dict, tool_use_id: str | None, now: int) -> None:
         if tool_use_id is None:
             return
+        if payload.get("tool_name") in self.skip_tool_names:
+            # In-process tool: the adapter's handler wrapper opens its own
+            # execute_tool span; skip the hook-driven one to avoid double emission.
+            return
         if len(sess.open_tools) >= _MAX_OPEN_TOOLS:
             # Evict the oldest open entry (FIFO via dict insertion order) so the
             # session cannot accumulate unbounded open-tool state.
@@ -291,6 +299,11 @@ class SessionAssembler:
         self, sess: _Session, payload: dict, tool_use_id: str | None, now: int, failed: bool
     ) -> None:
         if tool_use_id is None:
+            return
+        if payload.get("tool_name") in self.skip_tool_names:
+            # Matches the _open_tool skip: nothing was opened for this call, and
+            # the in-process handler wrapper owns its own span's lifecycle.
+            sess.stream_tool_meta.pop(tool_use_id, None)
             return
         tool = sess.open_tools.pop(tool_use_id, None)
         if tool is None:
@@ -373,6 +386,11 @@ class SessionAssembler:
             # stream_tool_meta are empty for this id) -> nothing to do.
             return
         name, input_json = meta
+        if name in self.skip_tool_names:
+            # In-process tool without a matching hook observation (or one that
+            # hasn't landed yet): the handler wrapper's own span is authoritative,
+            # so skip the stream-only fallback path too.
+            return
         tool = _OpenTool(
             tool_use_id=tool_use_id,
             name=name,

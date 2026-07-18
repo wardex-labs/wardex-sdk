@@ -9,10 +9,12 @@ Invariant: never alter or break the host application (observe-only).
 
 from __future__ import annotations
 
+import json
 import sys
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
+from ._assembler import SessionAssembler
 from ._base import AdapterInterface
 
 if TYPE_CHECKING:
@@ -65,30 +67,64 @@ def _prepare_options(options: Any, adapter: AnthropicAgentSdkAdapter) -> Any:
     return replace(options, hooks=merged)
 
 
+def _wrap_sdk_tool(sdk_tool: Any, wrapped_names: set[str]) -> Any:
+    """Wrap an SdkMcpTool handler in an execute_tool span (execution_type=in_process)."""
+    from .._enums import OperationName, ToolExecutionType
+    from .._tracing import span
+    from .._types import ToolAttributes
+
+    handler = getattr(sdk_tool, "handler", None)
+    if handler is None:
+        return sdk_tool
+    tool_name = getattr(sdk_tool, "name", "unknown")
+    wrapped_names.add(tool_name)
+
+    async def wrapped(args):  # noqa: ANN001
+        with span(
+            f"execute_tool {tool_name}",
+            op=OperationName.EXECUTE_TOOL,
+            tool=ToolAttributes(name=tool_name, execution_type=ToolExecutionType.IN_PROCESS),
+        ) as s:
+            try:
+                s.input_data = json.dumps(args).encode()
+            except (TypeError, ValueError):
+                pass
+            return await handler(args)
+
+    sdk_tool.handler = wrapped
+    return sdk_tool
+
+
 class AnthropicAgentSdkAdapter(AdapterInterface):
     def __init__(self) -> None:
         self._client: Client | None = None
         self._originals: dict[str, Any] = {}
         self._installed = False
-        # Task 5 debug counters; Task 7 replaces the callback bodies with the assembler.
-        self._debug_inbound_count = 0
+        self._assembler: SessionAssembler | None = None
+        # Tool names wrapped by the in-process capture gate (Step 2); the
+        # assembler skips hook-driven spans for these to avoid double emission.
+        self._wrapped_tool_names: set[str] = set()
 
     def name(self) -> str:
         return "anthropic_agent_sdk"
 
-    # --- observation callbacks (wired to _SessionAssembler in a later task) ---
+    # --- observation callbacks (delegate to the SessionAssembler) ---
 
     def _on_outbound(self, key: int, data: str) -> None:
-        pass
+        if self._assembler is not None:
+            self._assembler.on_outbound(key, data)
 
     def _on_inbound(self, key: int, msg: dict) -> None:
-        self._debug_inbound_count += 1
+        if self._assembler is not None:
+            self._assembler.on_inbound(key, msg)
 
     def _on_close(self, key: int, error: str | None) -> None:
-        pass
+        if self._assembler is not None:
+            self._assembler.on_close(key, error)
 
     def _on_hook(self, event: str, payload: dict, tool_use_id: str | None) -> None:
-        pass
+        if self._assembler is not None:
+            self._assembler.on_hook(event, payload, tool_use_id)
 
     # --- install / uninstall ---
 
@@ -188,6 +224,26 @@ class AnthropicAgentSdkAdapter(AdapterInterface):
             orig_client_init(client_self, options=options, transport=transport, **kwargs)
 
         sdk.ClaudeSDKClient.__init__ = client_init
+
+        # (3) in-process custom tools: wrap handlers so execution runs inside a
+        # wardex execute_tool span — this opens the capture_mode="agent" gate
+        # for any outbound HTTP the tool performs in-process.
+        if hasattr(sdk, "create_sdk_mcp_server"):
+            self._originals["create_sdk_mcp_server"] = sdk.create_sdk_mcp_server
+            orig_create = self._originals["create_sdk_mcp_server"]
+            wrapped_tool_names = self._wrapped_tool_names  # set[str], init in __init__
+
+            def create_sdk_mcp_server(name, version="1.0.0", tools=None, **kwargs):  # noqa: ANN001
+                try:
+                    if tools:
+                        tools = [_wrap_sdk_tool(t, wrapped_tool_names) for t in tools]
+                except Exception:  # noqa: BLE001
+                    pass
+                return orig_create(name=name, version=version, tools=tools, **kwargs)
+
+            sdk.create_sdk_mcp_server = create_sdk_mcp_server
+
+        self._assembler = SessionAssembler(client, skip_tool_names=self._wrapped_tool_names)
         self._installed = True
 
     def uninstall(self) -> None:
@@ -202,7 +258,11 @@ class AnthropicAgentSdkAdapter(AdapterInterface):
         cls.close = self._originals["close"]
         sdk.query = self._originals["query"]
         sdk.ClaudeSDKClient.__init__ = self._originals["client_init"]
+        if "create_sdk_mcp_server" in self._originals:
+            sdk.create_sdk_mcp_server = self._originals["create_sdk_mcp_server"]
         self._originals.clear()
+        self._wrapped_tool_names.clear()
+        self._assembler = None
         self._installed = False
 
 
