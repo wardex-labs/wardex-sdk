@@ -146,6 +146,10 @@ def init(
 
         get_registry().install(RawSocketInterceptor(list(config.intercept_hosts or ())), client)
 
+    from .adapters import install_configured_adapters
+
+    install_configured_adapters(client, config)
+
     from .context._inject import install_propagation, uninstall_propagation
 
     uninstall_propagation()  # re-init: drop patches from a previous init
@@ -220,6 +224,10 @@ def close(timeout: float = 5.0) -> None:
     # This must run before client.close() sets _closed=True, or the WS-close span
     # would be blocked and lost.
     get_registry().uninstall_all()
+
+    from .adapters._registry import get_registry as _adapter_registry
+
+    _adapter_registry().uninstall_all()
 
     from .context._inject import uninstall_propagation
 

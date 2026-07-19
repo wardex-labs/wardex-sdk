@@ -226,6 +226,50 @@ fn flatten_gen_ai(g: &Bound<PyAny>, out: &mut Vec<pb::KeyValue>) -> PyResult<()>
     Ok(())
 }
 
+/// AgentAttributes → extra KeyValue. Only populated fields.
+fn flatten_agent(a: &Bound<PyAny>, out: &mut Vec<pb::KeyValue>) -> PyResult<()> {
+    out.push(kv_str("gen_ai.agent.name", a.getattr("name")?.extract()?));
+    for (attr, key) in [
+        ("id", "gen_ai.agent.id"),
+        ("description", "gen_ai.agent.description"),
+        ("version", "wardex.agent.version"),
+        ("parent_agent", "wardex.agent.parent"),
+    ] {
+        if let Some(v) = opt(a, attr)? {
+            out.push(kv_str(key, v.extract()?));
+        }
+    }
+    if let Some(t) = opt(a, "agent_type")? {
+        out.push(kv_str("wardex.agent.type", enum_str(&t)?));
+    }
+    Ok(())
+}
+
+/// ToolAttributes → extra KeyValue. Only populated fields.
+fn flatten_tool(t: &Bound<PyAny>, out: &mut Vec<pb::KeyValue>) -> PyResult<()> {
+    out.push(kv_str("gen_ai.tool.name", t.getattr("name")?.extract()?));
+    for (attr, key) in [
+        ("call_id", "gen_ai.tool.call.id"),
+        ("description", "gen_ai.tool.description"),
+    ] {
+        if let Some(v) = opt(t, attr)? {
+            out.push(kv_str(key, v.extract()?));
+        }
+    }
+    if let Some(ty) = opt(t, "type")? {
+        let ty_s: String = if ty.hasattr("value")? {
+            enum_str(&ty)?
+        } else {
+            ty.extract()?
+        };
+        out.push(kv_str("gen_ai.tool.type", ty_s));
+    }
+    if let Some(ex) = opt(t, "execution_type")? {
+        out.push(kv_str("wardex.tool.execution_type", enum_str(&ex)?));
+    }
+    Ok(())
+}
+
 // --- enum mapping (transport/state) ---
 
 fn map_protocol(s: &str) -> i32 {
@@ -489,6 +533,12 @@ fn span_to_proto(sp: &Bound<PyAny>) -> PyResult<pb::Span> {
     // gen_ai flattening → extra
     if let Some(g) = opt(sp, "gen_ai")? {
         flatten_gen_ai(&g, &mut span.extra)?;
+    }
+    if let Some(a) = opt(sp, "agent")? {
+        flatten_agent(&a, &mut span.extra)?;
+    }
+    if let Some(t) = opt(sp, "tool")? {
+        flatten_tool(&t, &mut span.extra)?;
     }
     if let Some(t) = opt(sp, "transport")? {
         span.transport = Some(transport_to_proto(&t)?);
@@ -813,6 +863,12 @@ fn span_to_otlp(sp: &Bound<PyAny>) -> PyResult<otlp_pb::trace::Span> {
     kv_list(&sp.getattr("extra")?, &mut wkv)?;
     if let Some(g) = opt(sp, "gen_ai")? {
         flatten_gen_ai(&g, &mut wkv)?;
+    }
+    if let Some(a) = opt(sp, "agent")? {
+        flatten_agent(&a, &mut wkv)?;
+    }
+    if let Some(t) = opt(sp, "tool")? {
+        flatten_tool(&t, &mut wkv)?;
     }
     let mut attrs: Vec<otlp_pb::common::KeyValue> = wkv.iter().map(wardex_kv_to_otlp).collect();
 

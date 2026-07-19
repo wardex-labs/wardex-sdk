@@ -239,3 +239,42 @@ def test_reinit_uninstalls_interceptors_before_closing_previous_client():
         assert sum(len(e.spans) for e in t1.envelopes) == 1
     finally:
         registry.uninstall_all()
+
+
+def test_reinit_uninstalls_adapters_before_closing_previous_client():
+    """Regression: re-init (_lifecycle.install with a live previous client)
+    must uninstall adapters bound to the previous client, not just
+    interceptors. Otherwise a previously installed adapter stays bound to
+    the closed client, and since AdapterRegistry.install() is idempotent by
+    name, the next init() silently no-ops for that adapter.
+    """
+    from wardex_sdk.adapters._base import AdapterInterface
+    from wardex_sdk.adapters._registry import get_registry
+
+    class _FakeAdapter(AdapterInterface):
+        def __init__(self) -> None:
+            self.uninstalled = 0
+
+        def name(self) -> str:
+            return "fake-lifecycle-adapter"
+
+        def install(self, client: Client | None) -> None:
+            pass
+
+        def uninstall(self) -> None:
+            self.uninstalled += 1
+
+    registry = get_registry()
+    try:
+        first = _client(flush_interval=3600.0)
+        _lifecycle.install(first, first.config)
+        fake = _FakeAdapter()
+        registry.install(fake, first)
+
+        second = _client(flush_interval=3600.0)
+        _lifecycle.install(second, second.config)  # re-init path
+
+        assert fake.uninstalled == 1
+        assert not registry.is_installed("fake-lifecycle-adapter")
+    finally:
+        registry.uninstall_all()
