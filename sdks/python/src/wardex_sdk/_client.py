@@ -121,17 +121,16 @@ class Client:
 
     # -- test-only internal accessors -----------------------------------
     # `_spans`/`_buffered_bytes` are not part of the public API; several
-    # tests read (and one, deliberately, swaps out) the resident deque to
-    # exercise reentrancy edge cases. Keeping these as thin properties over
-    # self._buffer preserves that surface without reintroducing a second,
-    # separately-swappable piece of state.
+    # tests read the resident deque and its byte total to assert on
+    # reentrancy edge cases. Both are deliberately read-only views onto
+    # self._buffer: a setter for either would let a caller replace one half
+    # of the pair and leave the other describing something that no longer
+    # exists, which is precisely the two-piece state _SpanBuffer exists to
+    # rule out. A test that must swap the deque itself reaches through
+    # `_buffer.spans` directly, so the hazard has no general route.
     @property
     def _spans(self) -> deque[InternalSpan]:
         return self._buffer.spans
-
-    @_spans.setter
-    def _spans(self, value: deque[InternalSpan]) -> None:
-        self._buffer.spans = value
 
     @property
     def _buffered_bytes(self) -> int:
@@ -179,18 +178,32 @@ class Client:
             #     in the call, so the span lands in whatever buffer is live
             #     at that statement, never one read earlier and orphaned by
             #     an intervening drain.
-            # What's NOT eliminated: a window narrower than one statement,
-            # between resolving self._buffer for that trailing call and
-            # _SpanBuffer.append's own first line running. A drain landing
-            # exactly there still exports without our span, and the append
-            # then lands in the (already-exported, now orphaned) pre-drain
-            # buffer -- the span is captured by neither self._buffer nor the
-            # export that just happened, and only reaches the wire at the
-            # *next* drain if nothing else evicts it first. This is the same
-            # class of bytecode-internal, no-second-line gap already present
-            # in self._snapshots.append() below and in the pre-byte-budget
-            # code; it cannot be closed further without giving up per-thread
-            # signal-handler reentrancy entirely.
+            # What's NOT eliminated, stated plainly because it is worse than
+            # a delay: a window narrower than one statement, between
+            # resolving self._buffer for that trailing call and
+            # _SpanBuffer.append's own first line running. Only a same-thread
+            # signal handler can land there -- a drain on another thread
+            # blocks on the buffer lock this whole block holds -- and such a
+            # handler runs to completion before the interrupted statement
+            # resumes. By then it has already swapped self._buffer *and*
+            # serialized the old buffer's spans into an envelope (_drain
+            # materializes them with tuple(spans) before returning), without
+            # ours. The resumed append therefore mutates the pre-drain
+            # buffer, which at that point nothing references: self._buffer
+            # holds the replacement, _drain's locals died with its frame, and
+            # `buf` above is never read again. The span is lost outright --
+            # not deferred to the next drain, never on the wire at all -- and
+            # it is not counted in self._dropped either, because nothing
+            # still alive can observe that it happened. Byte accounting is
+            # unaffected (the orphan stays internally consistent and is
+            # simply collected), so this is span loss, never counter drift.
+            # This is the same class of bytecode-internal, no-second-line gap
+            # already present in self._snapshots.append() below and in the
+            # pre-byte-budget code. It cannot be closed without giving up
+            # same-thread signal-handler reentrancy, and it cannot be counted
+            # either: any detection step is itself a statement with a window
+            # of the same kind, so it would narrow the silent gap rather than
+            # remove it, at the cost of permanent state and a hot-path branch.
             while (buf := self._buffer).spans and (
                 len(buf.spans) >= self._max_buffer_spans
                 or buf.bytes + size > self._max_buffer_bytes

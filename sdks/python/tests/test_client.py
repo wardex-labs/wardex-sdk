@@ -193,7 +193,12 @@ def test_byte_counter_survives_a_reentrant_drain_mid_append():
                     _TripwireDeque.fired = True
                     c._drain(5.0)  # reentrant: same thread, same RLock as capture_span holds
 
-        c._spans = _TripwireDeque(c._spans)
+        # Reach through _buffer directly: Client._spans is a read-only view,
+        # deliberately, so that nothing can replace the deque without its
+        # byte total. Swapping in a same-contents subclass here keeps the
+        # pair consistent (identical sizes), and being explicit about
+        # touching the internal object is honest about what this test does.
+        c._buffer.spans = _TripwireDeque(c._buffer.spans)
         c.capture_span(_span(output_data=b"y" * 50))  # must not raise, must not overstate
 
         assert c._buffered_bytes >= 0
