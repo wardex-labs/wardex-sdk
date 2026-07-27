@@ -13,9 +13,14 @@ OpenTelemetry-native form.
 ## Build & develop
 
 ```bash
-uv sync                                 # builds the native module via maturin
+uv sync --reinstall-package wardex-sdk  # rebuilds the native module via maturin
 cargo build --workspace                 # Rust core
 ```
+
+Use `--reinstall-package wardex-sdk` whenever Rust changed. A bare `uv sync`
+treats the already-installed wheel as up to date and leaves the previous
+native module in place, so the Python tests exercise stale code and report a
+false green while every Rust test passes.
 
 ## Test
 
