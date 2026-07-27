@@ -97,8 +97,13 @@ impl Http1Stream {
         }
     }
 
-    /// Total bytes examined since construction. A single-pass parser stays close
-    /// to the stream length; a re-parsing one grows quadratically.
+    /// Buffer bytes examined since construction, counted conservatively: the
+    /// header path charges the whole available buffer rather than `header_len`,
+    /// and a re-scan after an incomplete header block or chunk-size line is
+    /// charged again in full. The count is therefore an upper bound, which is
+    /// the safe direction for the complexity assertion it exists to support —
+    /// a single-pass parser still stays close to the stream length, while a
+    /// re-parsing one grows quadratically.
     pub fn bytes_scanned(&self) -> u64 {
         self.bytes_scanned
     }
@@ -614,20 +619,33 @@ mod tests {
         v
     }
 
-    /// Streams whose framing exercises a different corner of the machine:
-    /// Content-Length, multi-chunk, a trailer section, a keep-alive pair, and
-    /// the bodyless-response path.
-    fn split_invariance_cases() -> Vec<Vec<u8>> {
-        let mut keep_alive =
+    /// Streams whose framing exercises a different corner of the machine, as
+    /// `(is_request, bytes)`: Content-Length, multi-chunk, a trailer section, a
+    /// keep-alive pair, and the bodyless-response path — on both directions, so
+    /// the request path (`httparse::Request`, the `Framing::None` → `Done`
+    /// request branch, request keep-alive) is split-fed too.
+    fn split_invariance_cases() -> Vec<(bool, Vec<u8>)> {
+        let mut resp_keep_alive =
             b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\nX-Trace: abc\r\n\r\n"
                 .to_vec();
-        keep_alive.extend_from_slice(b"HTTP/1.1 201 Created\r\nContent-Length: 2\r\n\r\nok");
+        resp_keep_alive.extend_from_slice(b"HTTP/1.1 201 Created\r\nContent-Length: 2\r\n\r\nok");
+
+        // A body-carrying request, then a bodyless one: covers the request
+        // Content-Length path, the `Framing::None` → `Done` request branch, and
+        // request keep-alive in one stream.
+        let mut req_keep_alive =
+            b"POST /v1/messages HTTP/1.1\r\nHost: api.x\r\nContent-Length: 7\r\n\r\nhello!!"
+                .to_vec();
+        req_keep_alive.extend_from_slice(b"GET /b HTTP/1.1\r\nHost: api.x\r\n\r\n");
+
         vec![
-            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello".to_vec(),
-            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n".to_vec(),
-            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\nX-Trace: abc\r\n\r\n".to_vec(),
-            keep_alive,
-            b"HTTP/1.1 204 No Content\r\nX-Request-Id: abc\r\n\r\n".to_vec(),
+            (false, b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello".to_vec()),
+            (false, b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n".to_vec()),
+            (false, b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\nX-Trace: abc\r\n\r\n".to_vec()),
+            (false, resp_keep_alive),
+            (false, b"HTTP/1.1 204 No Content\r\nX-Request-Id: abc\r\n\r\n".to_vec()),
+            (true, req_keep_alive),
+            (true, b"POST /x HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\nX-Trace: abc\r\n\r\n".to_vec()),
         ]
     }
 
@@ -636,6 +654,8 @@ mod tests {
         for (a, b) in got.iter().zip(expected.iter()) {
             assert_eq!(a.body, b.body, "body differs: {ctx}");
             assert_eq!(a.status, b.status, "status differs: {ctx}");
+            assert_eq!(a.method, b.method, "method differs: {ctx}");
+            assert_eq!(a.path, b.path, "path differs: {ctx}");
             assert_eq!(a.header_len, b.header_len, "header_len differs: {ctx}");
         }
     }
@@ -643,11 +663,11 @@ mod tests {
     #[test]
     fn split_invariance_one_byte_at_a_time() {
         // The worst possible split: every state transition is interrupted.
-        for raw in split_invariance_cases() {
-            let mut whole = Http1Stream::new(false, Limits::default());
+        for (is_request, raw) in split_invariance_cases() {
+            let mut whole = Http1Stream::new(is_request, Limits::default());
             let expected = whole.feed(&raw);
 
-            let mut split = Http1Stream::new(false, Limits::default());
+            let mut split = Http1Stream::new(is_request, Limits::default());
             let got = feed_chunked(&mut split, &raw, 1);
 
             assert_same_messages(&got, &expected, &format!("{raw:?}"));
@@ -656,12 +676,12 @@ mod tests {
 
     #[test]
     fn split_invariance_every_two_way_split() {
-        for raw in split_invariance_cases() {
-            let mut whole = Http1Stream::new(false, Limits::default());
+        for (is_request, raw) in split_invariance_cases() {
+            let mut whole = Http1Stream::new(is_request, Limits::default());
             let expected = whole.feed(&raw);
 
             for split_at in 1..raw.len() {
-                let mut s = Http1Stream::new(false, Limits::default());
+                let mut s = Http1Stream::new(is_request, Limits::default());
                 let mut got = s.feed(&raw[..split_at]);
                 got.extend(s.feed(&raw[split_at..]));
                 assert_same_messages(&got, &expected, &format!("split at {split_at}"));
@@ -688,14 +708,140 @@ mod tests {
 
     #[test]
     fn buffer_stays_small_during_a_large_body() {
+        // Reads are 64 KiB; actual retention is a partial chunk-size line or a
+        // torn CRLF. The bound is one read, so retaining even two would fail.
         let raw = chunked_response(4 * 1024 * 1024);
         let mut s = Http1Stream::new(false, Limits::default());
         for part in raw.chunks(64 * 1024) {
             s.feed(part);
             assert!(
-                s.buffered_len() < 256 * 1024,
+                s.buffered_len() < 64 * 1024,
                 "buffer grew to {}",
                 s.buffered_len()
+            );
+        }
+    }
+
+    #[test]
+    fn flush_truncated_decodes_a_partial_chunked_body() {
+        // Cut mid-chunk on close. Retaining decode state means the caller gets
+        // decoded payload — chunk-size lines and CRLF framing must not leak in.
+        let mut s = Http1Stream::new(false, Limits::default());
+        assert_eq!(
+            s.feed(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n6\r\n wo")
+                .len(),
+            0
+        );
+        let m = s.flush_truncated().expect("truncated message");
+        assert_eq!(m.status, Some(200));
+        assert_eq!(m.body, b"hello wo");
+        assert!(m.truncated);
+        // The only digits and CRLFs in this stream belong to the framing.
+        assert!(
+            !m.body
+                .iter()
+                .any(|b| b.is_ascii_digit() || *b == b'\r' || *b == b'\n'),
+            "chunk framing leaked into the body: {:?}",
+            m.body
+        );
+    }
+
+    #[test]
+    fn flush_truncated_returns_a_short_content_length_body() {
+        // Headers promised 11 bytes, 5 arrived, then the peer closed.
+        let mut s = Http1Stream::new(false, Limits::default());
+        assert_eq!(
+            s.feed(b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\nhello")
+                .len(),
+            0
+        );
+        let m = s.flush_truncated().expect("truncated message");
+        assert_eq!(m.status, Some(200));
+        assert_eq!(m.body, b"hello");
+        assert!(m.truncated);
+    }
+
+    #[test]
+    fn flush_truncated_returns_none_when_no_message_is_in_flight() {
+        // A header block that never completed carries nothing to report.
+        let mut partial = Http1Stream::new(false, Limits::default());
+        assert_eq!(partial.feed(b"HTTP/1.1 200 OK\r\nContent-Len").len(), 0);
+        assert!(partial.flush_truncated().is_none());
+
+        // Nor does a connection whose last message completed cleanly.
+        let mut done = Http1Stream::new(false, Limits::default());
+        assert_eq!(
+            done.feed(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi")
+                .len(),
+            1
+        );
+        assert!(done.flush_truncated().is_none());
+
+        // Nor an untouched stream.
+        assert!(Http1Stream::new(false, Limits::default())
+            .flush_truncated()
+            .is_none());
+    }
+
+    #[test]
+    fn body_cap_truncates_but_framing_keeps_advancing() {
+        // A cap below the body size. The message is marked, and — the whole
+        // reason we cap rather than disable — the next keep-alive message on the
+        // same connection must still parse. Both framings.
+        let limits = Limits {
+            max_body_bytes: 4,
+            ..Default::default()
+        };
+        let next = b"HTTP/1.1 201 Created\r\nContent-Length: 2\r\n\r\nok";
+
+        let mut content_length =
+            b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\nhello world".to_vec();
+        content_length.extend_from_slice(next);
+
+        let mut chunked =
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n"
+                .to_vec();
+        chunked.extend_from_slice(next);
+
+        for (label, raw) in [("content-length", content_length), ("chunked", chunked)] {
+            let mut s = Http1Stream::new(false, limits);
+            let msgs = s.feed(&raw);
+
+            assert_eq!(msgs.len(), 2, "framing stalled at the cap: {label}");
+            assert_eq!(msgs[0].body, b"hell", "{label}");
+            assert!(msgs[0].truncated, "{label}");
+            // Exactly one marker: a body that overruns the cap many times over
+            // must not push one per append.
+            assert_eq!(msgs[0].limitations, vec!["body_cap_exceeded"], "{label}");
+
+            // The capped body did not disturb the next message.
+            assert_eq!(msgs[1].status, Some(201), "{label}");
+            assert_eq!(msgs[1].body, b"ok", "{label}");
+            assert!(!msgs[1].truncated, "{label}");
+            assert!(msgs[1].limitations.is_empty(), "{label}");
+        }
+    }
+
+    #[test]
+    fn body_cap_survives_a_split_arrival() {
+        // The cap is applied per append, so a body crossing the cap on a feed
+        // boundary must still land on the same bytes.
+        let limits = Limits {
+            max_body_bytes: 4,
+            ..Default::default()
+        };
+        let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n";
+        for split_at in 1..raw.len() {
+            let mut s = Http1Stream::new(false, limits);
+            let mut msgs = s.feed(&raw[..split_at]);
+            msgs.extend(s.feed(&raw[split_at..]));
+            assert_eq!(msgs.len(), 1, "split at {split_at}");
+            assert_eq!(msgs[0].body, b"hell", "split at {split_at}");
+            assert!(msgs[0].truncated, "split at {split_at}");
+            assert_eq!(
+                msgs[0].limitations,
+                vec!["body_cap_exceeded"],
+                "split at {split_at}"
             );
         }
     }
