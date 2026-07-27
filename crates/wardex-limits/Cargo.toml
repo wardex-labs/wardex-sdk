@@ -1,0 +1,10 @@
+[package]
+name                   = "wardex-limits"
+version                = "0.1.0"
+edition.workspace      = true
+rust-version.workspace = true
+authors.workspace      = true
+license.workspace      = true
+description            = "Configurable resource limits shared by every Wardex core crate and language SDK"
+
+[dependencies]

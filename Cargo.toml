@@ -4,6 +4,7 @@ members  = [
     "bindings/python",
     "crates/wardex-codec",
     "crates/wardex-core",
+    "crates/wardex-limits",
     "crates/wardex-pipeline",
     "crates/wardex-protocol",
     "crates/wardex-replay",
