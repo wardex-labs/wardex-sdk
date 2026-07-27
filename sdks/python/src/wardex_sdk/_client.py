@@ -30,6 +30,15 @@ def build_sdk_info() -> SdkInfo:
     )
 
 
+# Fixed per-span overhead: context, timing, attributes, and the deque slot.
+# An exact figure would mean encoding every span on the hot path.
+_SPAN_OVERHEAD_BYTES = 512
+
+
+def _span_size(span: InternalSpan) -> int:
+    return _SPAN_OVERHEAD_BYTES + len(span.input_data or b"") + len(span.output_data or b"")
+
+
 class Client:
     def __init__(self, config: WardexConfig, transport: Transport) -> None:
         self._config = config
@@ -54,7 +63,10 @@ class Client:
         self._dropped = 0
         self._closed = False
         self._close_lock = threading.Lock()
-        self._max_buffer_spans = config.limits.resolved()["max_buffer_spans"]
+        limits = config.limits.resolved()
+        self._max_buffer_spans = limits["max_buffer_spans"]
+        self._max_buffer_bytes = limits["max_buffer_bytes"]
+        self._buffered_bytes = 0
         self._flush_threshold = max(1, self._max_buffer_spans // 4)
         self._worker = BatchWorker(
             lambda: self._drain(5.0), interval=config.flush_interval, debug=config.debug
@@ -69,11 +81,20 @@ class Client:
         if self._closed:
             return
         self._worker.ensure_alive()  # fork/thread-death recovery (design §8)
+        size = _span_size(span)
         with self._buffer_lock:
-            if len(self._spans) >= self._max_buffer_spans:
-                self._spans.popleft()  # drop-oldest: recent spans are worth more
+            # Drop-oldest on either bound: recent spans are worth more. The byte
+            # budget is the backstop that keeps resident memory bounded even
+            # when a single span is far larger than the average.
+            while self._spans and (
+                len(self._spans) >= self._max_buffer_spans
+                or self._buffered_bytes + size > self._max_buffer_bytes
+            ):
+                evicted = self._spans.popleft()
+                self._buffered_bytes -= _span_size(evicted)
                 self._dropped += 1
             self._spans.append(span)
+            self._buffered_bytes += size
             should_wake = len(self._spans) >= self._flush_threshold
         if should_wake:
             self._worker.wake()
@@ -103,6 +124,7 @@ class Client:
                 spans, self._spans = self._spans, deque()
                 snapshots, self._snapshots = self._snapshots, deque()
                 dropped, self._dropped = self._dropped, 0
+                self._buffered_bytes = 0
             # -- lock-free from here (buffer lock released; new captures flow) --
             if dropped and self._config.debug:
                 print(f"[wardex] dropped {dropped} spans (buffer full)", file=sys.stderr)
