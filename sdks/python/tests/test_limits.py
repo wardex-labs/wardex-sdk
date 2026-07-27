@@ -101,3 +101,35 @@ def test_body_cap_reaches_the_parser_end_to_end():
         assert txns == [], "max_headers=1 must block parsing of a 2-header response"
     finally:
         wardex_sdk.close()
+
+
+def test_python_side_fallback_defaults_match_core():
+    """Every Python-side object that accepts a resource-bound parameter with a
+    default of None must resolve that default from the core (limits_defaults()),
+    never from a hardcoded literal that lives only in Python.
+
+    A hardcoded fallback (e.g. `sample_cap: int = 64 * 1024`) would pass every
+    other test in this suite yet silently disagree with crates/wardex-limits the
+    moment someone changes the core default without touching Python — exactly
+    the drift class this task exists to close. This test fails immediately if
+    that happens, because it compares the *effective* default against the core,
+    not against another Python literal.
+    """
+    from wardex_sdk.adapters._assembler import SessionAssembler
+    from wardex_sdk.interceptors._conn_timing import ConnTimingStore
+    from wardex_sdk.interceptors._mcp_stdio import _ProcState
+    from wardex_sdk.interceptors._trackers import _WebSocketTracker
+
+    core = _wardex_native.limits_defaults()
+
+    asm = SessionAssembler(client=None)
+    assert asm._max_sessions == core["max_sessions"]
+    assert asm._max_session_entries == core["max_session_entries"]
+
+    assert _ProcState.SNIFF_LIMIT == core["mcp_sniff_bytes"]
+    assert _ProcState()._sniff_limit == core["mcp_sniff_bytes"]
+
+    tracker = _WebSocketTracker(path="/x", deflate=False, parent=None, start_ns=1)
+    assert tracker._sample_cap == core["ws_sample_bytes"]
+
+    assert ConnTimingStore()._cap == core["max_connections"]

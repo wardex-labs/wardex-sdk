@@ -21,6 +21,7 @@ from .._enums import (
     SpanKind,
     StatusCode,
 )
+from .._limits import CaptureLimits
 from .._types import (
     CaptureIntegrity,
     CorrelationInfo,
@@ -60,8 +61,6 @@ class ByteSeamInterceptor(InterceptorInterface):
     Seam-specific behavior is a subclass hook."""
 
     def __init__(self) -> None:
-        from .._limits import CaptureLimits
-
         self._client: Client | None = None
         self._conns: dict[int, _ConnectionState] = {}
         self._orig: dict[str, Any] = {}
@@ -73,8 +72,6 @@ class ByteSeamInterceptor(InterceptorInterface):
 
     def _load_limits(self, client: Client | None) -> None:
         """Cache resolved limits at install time; config is frozen after init."""
-        from .._limits import CaptureLimits
-
         config = getattr(client, "config", None)
         lim = config.limits if config is not None else CaptureLimits()
         self._limits = lim.resolved()

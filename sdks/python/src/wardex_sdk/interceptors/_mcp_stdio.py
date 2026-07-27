@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING, Any
 
 import anyio._backends._asyncio as _aio_backend
 
-from .. import _hub
+from .. import _hub, _wardex_native
 from .._enums import (
     CaptureSource,
     Direction,
@@ -62,15 +62,15 @@ class _Pending:
 class _ProcState:
     """JSON-RPC correlation state for a single subprocess (stdin request <-> stdout response)."""
 
-    # Default sniff threshold (matches the core's mcp_sniff_bytes default): if no
-    # JSON-RPC is found within this many bytes, treat the subprocess as non-MCP
-    # (detach). Kept as a class attribute for direct-construction callers/tests;
-    # the interceptor overrides it per-instance via the sniff_limit constructor
-    # argument, sourced from the resolved config at install() time.
-    SNIFF_LIMIT = 8192
+    # Sourced from the core default (not a hardcoded literal), so it can never
+    # silently drift from crates/wardex-limits. Kept as a class attribute for
+    # direct-construction callers/tests; the interceptor overrides it per-instance
+    # via the sniff_limit constructor argument, sourced from the resolved config
+    # at install() time.
+    SNIFF_LIMIT = _wardex_native.limits_defaults()["mcp_sniff_bytes"]
 
-    def __init__(self, sniff_limit: int = SNIFF_LIMIT) -> None:
-        self._sniff_limit = sniff_limit
+    def __init__(self, sniff_limit: int | None = None) -> None:
+        self._sniff_limit = sniff_limit if sniff_limit is not None else self.SNIFF_LIMIT
         self._req = JsonRpcParser()
         self._resp = JsonRpcParser()
         self._latch: dict[str, _Pending] = {}

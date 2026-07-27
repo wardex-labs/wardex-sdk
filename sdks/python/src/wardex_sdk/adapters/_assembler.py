@@ -14,7 +14,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-from .. import _hub
+from .. import _hub, _wardex_native
 from .._enums import (
     AgentType,
     CaptureSource,
@@ -86,15 +86,22 @@ class SessionAssembler:
         self,
         client: Any,
         skip_tool_names: set[str] | None = None,
-        max_sessions: int = 512,
-        max_session_entries: int = 256,
+        max_sessions: int | None = None,
+        max_session_entries: int | None = None,
     ) -> None:
         self._client = client
         self._lock = threading.RLock()
         self._by_key: dict[int, _Session] = {}
         self._by_session_id: dict[str, _Session] = {}
-        self._max_sessions = max_sessions
-        self._max_session_entries = max_session_entries
+        # None means "use the core default" — resolved here (rather than hardcoded)
+        # so this can never silently drift from crates/wardex-limits.
+        defaults = _wardex_native.limits_defaults()
+        self._max_sessions = max_sessions if max_sessions is not None else defaults["max_sessions"]
+        self._max_session_entries = (
+            max_session_entries
+            if max_session_entries is not None
+            else defaults["max_session_entries"]
+        )
         # Tool names handled by the adapter's in-process tool wrapper (execute_tool
         # spans opened directly around the handler call); hook-driven spans for
         # these names are skipped here to avoid emitting the call twice.

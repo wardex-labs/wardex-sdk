@@ -11,7 +11,7 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
-from .. import _hub
+from .. import _hub, _wardex_native
 from .._types import SpanContext
 from ..protocol import WsParser
 from ..protocol._http1 import Http1RequestParser, Http1ResponseParser
@@ -260,7 +260,7 @@ class _WebSocketTracker:
         parent: SpanContext | None,
         start_ns: int,
         limits: object | None = None,
-        sample_cap: int = 64 * 1024,
+        sample_cap: int | None = None,
     ) -> None:
         self._sent = WsParser(limits)  # client -> server
         self._recv = WsParser(limits)  # server -> client
@@ -268,7 +268,13 @@ class _WebSocketTracker:
         self._deflate = deflate
         self._parent = parent
         self._start_ns = start_ns
-        self._sample_cap = sample_cap
+        # None means "use the core default" — resolved here (rather than hardcoded)
+        # so this can never silently drift from crates/wardex-limits.
+        self._sample_cap = (
+            sample_cap
+            if sample_cap is not None
+            else _wardex_native.limits_defaults()["ws_sample_bytes"]
+        )
         self._sent_msgs = 0
         self._recv_msgs = 0
         self._sent_bytes = 0

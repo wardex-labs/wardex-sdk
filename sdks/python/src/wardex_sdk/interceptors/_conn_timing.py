@@ -17,6 +17,8 @@ import time
 from contextvars import ContextVar
 from typing import Any
 
+from .. import _wardex_native
+
 # ContextVar that carries the timing record the async probe stamps onto the SSLObject
 _establishing: ContextVar[_TimingRecord | None] = ContextVar("_wardex_establishing", default=None)
 
@@ -63,9 +65,11 @@ class ConnTimingStore:
     order (FIFO).
     """
 
-    def __init__(self, cap: int = 4096) -> None:
+    def __init__(self, cap: int | None = None) -> None:
         self._by_fileno: dict[int, list[float]] = {}
-        self._cap = cap
+        # None means "use the core default" — resolved here (rather than hardcoded)
+        # so this can never silently drift from crates/wardex-limits.
+        self._cap = cap if cap is not None else _wardex_native.limits_defaults()["max_connections"]
 
     def _slot(self, fileno: int) -> list[float]:
         slot = self._by_fileno.get(fileno)
@@ -233,15 +237,15 @@ _shared_probe: ConnTimingProbe | None = None
 _shared_refcount = 0
 
 
-def shared_timing_store(cap: int = 4096) -> ConnTimingStore:
+def shared_timing_store(cap: int | None = None) -> ConnTimingStore:
     global _shared_store, _shared_probe
     if _shared_store is None:
-        _shared_store = ConnTimingStore(cap)
+        _shared_store = ConnTimingStore(cap)  # cap=None → ConnTimingStore resolves the core default
         _shared_probe = ConnTimingProbe(_shared_store)
     return _shared_store
 
 
-def install_shared_timing(cap: int = 4096) -> None:
+def install_shared_timing(cap: int | None = None) -> None:
     global _shared_refcount
     shared_timing_store(cap)  # ensure the singleton exists
     if _shared_refcount == 0:
