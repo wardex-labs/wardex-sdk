@@ -86,15 +86,38 @@ class Client:
             # Drop-oldest on either bound: recent spans are worth more. The byte
             # budget is the backstop that keeps resident memory bounded even
             # when a single span is far larger than the average.
-            while self._spans and (
-                len(self._spans) >= self._max_buffer_spans
+            #
+            # Re-entrancy hazard: a same-thread signal handler can call
+            # flush() (and so _drain()) between any two statements in this
+            # block via the reentrant _buffer_lock (see the class-level
+            # comment on the lock). _drain() swaps self._spans for a fresh
+            # deque and resets self._buffered_bytes to 0. To stay correct
+            # across that swap:
+            #   - the walrus below re-reads self._spans into `spans` on
+            #     every loop condition check, and the loop body always pops
+            #     from that same `spans` local -- never a separately re-read
+            #     self._spans -- so a drain can never swap in an empty deque
+            #     between "checked non-empty" and "popped" (which would
+            #     otherwise raise IndexError on the empty deque);
+            #   - every counter update (_buffered_bytes, _dropped) is gated
+            #     on `self._spans is spans` -- if a drain interleaved, the
+            #     item we just popped or are about to append belongs to a
+            #     deque that's already been handed off (exported, for an
+            #     eviction, or orphaned, for the final append), so its delta
+            #     no longer applies to the fresh buffer and is skipped
+            #     rather than corrupting the reset total.
+            while (spans := self._spans) and (
+                len(spans) >= self._max_buffer_spans
                 or self._buffered_bytes + size > self._max_buffer_bytes
             ):
-                evicted = self._spans.popleft()
-                self._buffered_bytes -= _span_size(evicted)
-                self._dropped += 1
-            self._spans.append(span)
-            self._buffered_bytes += size
+                evicted = spans.popleft()
+                evicted_size = _span_size(evicted)
+                if self._spans is spans:
+                    self._buffered_bytes -= evicted_size
+                    self._dropped += 1
+            spans.append(span)
+            if self._spans is spans:
+                self._buffered_bytes += size
             should_wake = len(self._spans) >= self._flush_threshold
         if should_wake:
             self._worker.wake()
@@ -104,9 +127,15 @@ class Client:
             return
         self._worker.ensure_alive()
         with self._buffer_lock:
-            if len(self._snapshots) >= self._max_buffer_spans:
-                self._snapshots.popleft()
-                self._dropped += 1
+            # Same reentrancy hazard as capture_span (see its comment): check
+            # and pop against the same local reference so a reentrant drain
+            # can never swap in an empty deque between "checked non-empty"
+            # and "popped".
+            snapshots = self._snapshots
+            if snapshots and len(snapshots) >= self._max_buffer_spans:
+                snapshots.popleft()
+                if self._snapshots is snapshots:
+                    self._dropped += 1
             self._snapshots.append(snapshot)
 
     def flush(self, timeout: float = 5.0) -> None:
