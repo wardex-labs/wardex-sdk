@@ -60,16 +60,6 @@ impl JsonRpcStream {
             return Vec::new();
         }
         self.buf.extend_from_slice(data);
-        if self.buf.len() > self.limits.max_stream_buffer_bytes {
-            // A line that never terminates: bytes keep arriving but no message
-            // ever completes. Latch off rather than growing without bound.
-            // Checked immediately after the append and before any parse
-            // attempt, so the buffer is released as soon as the ceiling is
-            // crossed rather than after one more scan.
-            self.disabled_reason = Some("stream_buffer_exceeded");
-            self.buf = Vec::new();
-            return Vec::new();
-        }
         let mut out = Vec::new();
         while let Some(nl) = self.buf.iter().position(|&b| b == b'\n') {
             let line: Vec<u8> = self.buf.drain(..=nl).collect(); // consume including '\n'
@@ -84,6 +74,19 @@ impl JsonRpcStream {
             if let Some(msg) = parse_line(line) {
                 out.push(msg);
             }
+        }
+        // What is left after every complete line has been drained is a line
+        // that never terminates: bytes keep arriving but no message ever
+        // completes. Latch off rather than growing without bound.
+        //
+        // Measured after the drain, not on the raw appended buffer: a single
+        // write carrying many complete lines is fully consumed here, and
+        // disabling the stream over it would cost every later message on it.
+        // Peak memory is identical either way — `data` is appended before
+        // either check.
+        if self.buf.len() > self.limits.max_stream_buffer_bytes {
+            self.disabled_reason = Some("stream_buffer_exceeded");
+            self.buf = Vec::new();
         }
         out
     }
@@ -237,6 +240,35 @@ mod tests {
         let v = s.feed(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"a\"}\n");
         assert_eq!(v.len(), 0);
         assert_eq!(s.buffered_len(), 0);
+    }
+
+    #[test]
+    fn a_single_write_of_complete_lines_larger_than_the_ceiling_is_not_latched() {
+        // The ceiling bounds an unterminated line, not a large write that the
+        // drain consumes entirely. A writer that flushes many messages at once
+        // must not cost the stream every message that follows.
+        let limits = Limits {
+            max_stream_buffer_bytes: 512,
+            ..Default::default()
+        };
+        let mut s = JsonRpcStream::new(limits);
+        let mut data = Vec::new();
+        for i in 0..50 {
+            data.extend_from_slice(
+                format!("{{\"jsonrpc\":\"2.0\",\"id\":{i},\"method\":\"tools/call\"}}\n")
+                    .as_bytes(),
+            );
+        }
+        assert!(data.len() > 512, "the write must exceed the ceiling");
+
+        let v = s.feed(&data);
+        assert_eq!(v.len(), 50);
+        assert_eq!(s.disabled_reason(), None);
+
+        // The stream keeps working afterwards.
+        let v = s.feed(b"{\"jsonrpc\":\"2.0\",\"id\":99,\"method\":\"ping\"}\n");
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].id.as_deref(), Some("99"));
     }
 
     #[test]

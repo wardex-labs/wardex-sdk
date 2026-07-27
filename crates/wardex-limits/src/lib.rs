@@ -15,7 +15,13 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Limits {
     // --- Enforced by the Rust parsers ---
-    /// Maximum header count in a single HTTP/1 or HTTP/2 message.
+    /// Maximum header count in a single HTTP/1 message. HTTP/1 needs it
+    /// because httparse fills a caller-allocated header array, so the array
+    /// has to be sized up front. HTTP/2 has no equivalent bound and does not
+    /// need one: HPACK is stateful, so every header block on the connection
+    /// must be decoded in full to keep the dynamic table in sync — refusing
+    /// one after a count check would desync the table and corrupt every later
+    /// message rather than protect anything.
     pub max_headers: usize,
     /// Body cap for content types carrying extractable meaning (JSON, text,
     /// SSE, form-encoded, gRPC). Defaults above the Anthropic Messages API
@@ -26,6 +32,17 @@ pub struct Limits {
     pub max_opaque_body_bytes: usize,
     /// Maximum size of the incomplete-message buffer held by a stream parser.
     /// Exceeding it means the peer is not speaking the expected protocol.
+    ///
+    /// It bounds a different quantity than `max_body_bytes` and deliberately
+    /// need not be larger than it. A parser measures this against the residue
+    /// left *after* a parse pass — a header block with no terminator, a torn
+    /// chunk-size line, an unterminated JSON-RPC line, or bytes that are not
+    /// the expected protocol at all. Body bytes never appear in that residue:
+    /// the parser moves them into the message as it consumes them, and how
+    /// many are stored is `max_body_bytes`'s decision alone. A body of any
+    /// declared size therefore passes through whatever this value is, so the
+    /// two are not comparable quantities and no ordering between them is
+    /// validated.
     pub max_stream_buffer_bytes: usize,
     /// Maximum size of a decompressed body during semantic extraction.
     pub max_decoded_bytes: usize,
@@ -52,7 +69,10 @@ pub struct Limits {
     /// Maximum approximate bytes buffered across pending spans. The final
     /// backstop: resident memory stays bounded even if every parser cap fails.
     pub max_buffer_bytes: usize,
-    /// Replay ring-buffer depth.
+    /// Replay ring-buffer depth. Reserved: no SDK reads this value today, so
+    /// setting it changes nothing. It stays in the schema because it is part
+    /// of the published configuration surface, and callers are told it is
+    /// inert wherever the knob is documented rather than left to discover it.
     pub replay_buffer_size: usize,
 
     // --- Enforced by the codec ---

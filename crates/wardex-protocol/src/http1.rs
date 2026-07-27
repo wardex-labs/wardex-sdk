@@ -139,18 +139,6 @@ impl Http1Stream {
             return Vec::new();
         }
         self.buf.extend_from_slice(data);
-        if self.buf.len() > self.limits.max_stream_buffer_bytes {
-            // Bytes keep arriving but no message ever completes: this is not a
-            // stream we can parse (e.g. non-HTTP traffic whose bytes never
-            // produce a recognizable terminator). Latch off rather than
-            // growing without bound. Checked immediately after the append and
-            // before any parse attempt, so the buffer is released as soon as
-            // the ceiling is crossed rather than after one more parse pass.
-            self.state = State::Disabled("stream_buffer_exceeded");
-            self.buf = Vec::new();
-            self.pos = 0;
-            return Vec::new();
-        }
         let mut out = Vec::new();
         loop {
             match self.step() {
@@ -171,6 +159,28 @@ impl Http1Stream {
             }
         }
         self.compact();
+        // What is still buffered after a full parse pass is residue no amount
+        // of parsing can consume: a header block with no terminator, a torn
+        // chunk-size line, or bytes that are not HTTP at all. Bytes keep
+        // arriving and no message ever completes, so latch off rather than
+        // growing without bound.
+        //
+        // The check must come after the pass, not before it. `sendall` hands
+        // the whole remaining buffer to `send` and the seam tees that entire
+        // argument in, so a body written in one call arrives as a single feed
+        // of the whole body — measured against the raw appended read it would
+        // trip this ceiling and disable the connection, silently dropping
+        // every later message on a pooled connection, even though the parser
+        // consumes those bytes on the spot and the body cap already governs
+        // how many of them are stored. Nothing is gained by checking earlier:
+        // `data` is appended before either check, so peak memory is identical.
+        if !matches!(self.state, State::Disabled(_))
+            && self.buffered_len() > self.limits.max_stream_buffer_bytes
+        {
+            self.state = State::Disabled("stream_buffer_exceeded");
+            self.buf = Vec::new();
+            self.pos = 0;
+        }
         out
     }
 
@@ -1226,6 +1236,59 @@ mod tests {
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].body.len(), size);
         assert_eq!(s.disabled_reason(), None);
+    }
+
+    #[test]
+    fn a_single_write_larger_than_the_stream_buffer_is_capped_not_disabled() {
+        // `ssl.SSLSocket.sendall` hands the whole remaining buffer to `send`,
+        // and the seam tees that entire argument into `feed`, so a body written
+        // in one call — what an HTTP client does for `content=<bytes>` — arrives
+        // as a single feed of the whole body. The stream-buffer ceiling bounds
+        // residue that no amount of parsing can consume, not a body the parser
+        // consumes on the spot, so such a write must be governed by the body cap
+        // alone: kept whole when it fits, capped when it does not, and never
+        // disabling the connection either way.
+        let ceiling = 64 * 1024;
+        let size = 4 * ceiling;
+        let mut raw = format!(
+            "POST /v1/messages HTTP/1.1\r\nHost: api.x\r\nContent-Type: application/json\r\nContent-Length: {size}\r\n\r\n"
+        )
+        .into_bytes();
+        raw.extend(std::iter::repeat_n(b'x', size));
+
+        // (label, max_body_bytes, expected stored body length, expected truncation)
+        for (label, max_body_bytes, kept, capped) in [
+            ("under the body cap", size * 2, size, false),
+            ("over the body cap", size / 2, size / 2, true),
+        ] {
+            let limits = Limits {
+                max_stream_buffer_bytes: ceiling,
+                max_body_bytes,
+                ..Default::default()
+            };
+            let mut s = Http1Stream::new(true, limits);
+            let msgs = s.feed(&raw);
+
+            assert_eq!(msgs.len(), 1, "single large write dropped: {label}");
+            assert_eq!(msgs[0].body.len(), kept, "{label}");
+            assert_eq!(msgs[0].truncated, capped, "{label}");
+            assert_eq!(
+                msgs[0].limitations.is_empty(),
+                !capped,
+                "capping must be reported: {label}"
+            );
+            assert_eq!(
+                s.disabled_reason(),
+                None,
+                "a parsed body must not latch the connection off: {label}"
+            );
+
+            // The whole point of capping rather than disabling: the next
+            // keep-alive message on this pooled connection still parses.
+            let next = s.feed(b"GET /b HTTP/1.1\r\nHost: api.x\r\n\r\n");
+            assert_eq!(next.len(), 1, "connection latched off: {label}");
+            assert_eq!(next[0].path.as_deref(), Some("/b"), "{label}");
+        }
     }
 
     #[test]
