@@ -39,7 +39,6 @@ from .._types import (
 from ..protocol._claude_stream import AgentStreamEvent, parse_line
 
 _BASE_LIMITATION = "transport_timing_unavailable_subprocess"
-_MAX_OPEN_TOOLS = 256
 
 
 def _safe_json_bytes(value: Any) -> bytes:
@@ -83,11 +82,19 @@ class _Session:
 
 
 class SessionAssembler:
-    def __init__(self, client: Any, skip_tool_names: set[str] | None = None) -> None:
+    def __init__(
+        self,
+        client: Any,
+        skip_tool_names: set[str] | None = None,
+        max_sessions: int = 512,
+        max_session_entries: int = 256,
+    ) -> None:
         self._client = client
         self._lock = threading.RLock()
         self._by_key: dict[int, _Session] = {}
         self._by_session_id: dict[str, _Session] = {}
+        self._max_sessions = max_sessions
+        self._max_session_entries = max_session_entries
         # Tool names handled by the adapter's in-process tool wrapper (execute_tool
         # spans opened directly around the handler call); hook-driven spans for
         # these names are skipped here to avoid emitting the call twice.
@@ -130,7 +137,8 @@ class SessionAssembler:
             elif ev.kind == "assistant_turn":
                 self._emit_chat(sess, ev, now)
                 for tu_id, tu_name, tu_input in ev.tool_uses:
-                    sess.stream_tool_meta[tu_id] = (tu_name, tu_input)
+                    if len(sess.stream_tool_meta) < self._max_session_entries:
+                        sess.stream_tool_meta[tu_id] = (tu_name, tu_input)
             elif ev.kind == "tool_result":
                 self._on_stream_tool_result(sess, ev, now)
             elif ev.kind == "stream_delta":
@@ -166,7 +174,7 @@ class SessionAssembler:
                 self._close_tool(sess, payload, tool_use_id, now, failed=event.endswith("Failure"))
             elif event == "SubagentStart":
                 agent_id = payload.get("agent_id")
-                if agent_id:
+                if agent_id and len(sess.subagents) < self._max_session_entries:
                     ctx = SpanContext(trace_id=sess.trace_id, span_id=SpanId.generate())
                     sess.subagents[agent_id] = (ctx, payload.get("agent_type") or "sub_agent", now)
             elif event == "SubagentStop":
@@ -192,8 +200,21 @@ class SessionAssembler:
             parent_span_id=parent_span_id,
             start_ns=now,
         )
-        self._by_key[key] = sess
+        self._new_session(key, sess)
         return sess
+
+    def _new_session(self, key: int, sess: _Session) -> None:
+        """Insert a session, evicting the oldest when the cap is reached.
+
+        Sessions are removed on close, but a transport that never closes would
+        otherwise accumulate them for the process lifetime.
+        """
+        if len(self._by_key) >= self._max_sessions:
+            old_key = next(iter(self._by_key))
+            old = self._by_key.pop(old_key)
+            if old.session_id:
+                self._by_session_id.pop(old.session_id, None)
+        self._by_key[key] = sess
 
     def _session_for_hook(self, payload: dict) -> _Session | None:
         session_id = payload.get("session_id")
@@ -285,7 +306,7 @@ class SessionAssembler:
             # In-process tool: the adapter's handler wrapper opens its own
             # execute_tool span; skip the hook-driven one to avoid double emission.
             return
-        if len(sess.open_tools) >= _MAX_OPEN_TOOLS:
+        if len(sess.open_tools) >= self._max_session_entries:
             # Evict the oldest open entry (FIFO via dict insertion order) so the
             # session cannot accumulate unbounded open-tool state.
             oldest_id, oldest = next(iter(sess.open_tools.items()))

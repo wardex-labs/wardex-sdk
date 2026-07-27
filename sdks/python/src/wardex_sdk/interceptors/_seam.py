@@ -60,10 +60,25 @@ class ByteSeamInterceptor(InterceptorInterface):
     Seam-specific behavior is a subclass hook."""
 
     def __init__(self) -> None:
+        from .._limits import CaptureLimits
+
         self._client: Client | None = None
         self._conns: dict[int, _ConnectionState] = {}
         self._orig: dict[str, Any] = {}
         self._installed = False
+        # Defaults match the core's, so behavior is unchanged until _load_limits
+        # resolves an actual config at install() time.
+        self._limits: dict[str, int] = CaptureLimits().resolved()
+        self._native_limits: Any = None
+
+    def _load_limits(self, client: Client | None) -> None:
+        """Cache resolved limits at install time; config is frozen after init."""
+        from .._limits import CaptureLimits
+
+        config = getattr(client, "config", None)
+        lim = config.limits if config is not None else CaptureLimits()
+        self._limits = lim.resolved()
+        self._native_limits = lim.to_native()
 
     # --- Subclass hooks ---
 
@@ -119,7 +134,7 @@ class ByteSeamInterceptor(InterceptorInterface):
         if st is None:
             addr, port = _peer(obj)
             st = _ConnectionState(self._select_tracker(obj), addr, port)
-            if len(self._conns) > 4096:
+            if len(self._conns) > self._limits["max_connections"]:
                 old_cid = next(iter(self._conns))
                 old_st = self._conns.pop(old_cid)
                 if isinstance(old_st.tracker, _WebSocketTracker):
@@ -162,6 +177,8 @@ class ByteSeamInterceptor(InterceptorInterface):
                     deflate=txn.ws_deflate,
                     parent=txn.parent,
                     start_ns=txn.start_ns,
+                    limits=self._native_limits,
+                    sample_cap=self._limits["ws_sample_bytes"],
                 )
                 st.tracker = ws
                 if txn.ws_leftover:

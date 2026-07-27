@@ -39,12 +39,13 @@ class SSLInterceptor(ByteSeamInterceptor):
         if self._installed:
             return
         self._client = client
+        self._load_limits(client)
         self._patch(ssl.SSLSocket, "send", self._mk_send("send", "SSLSocket"))
         self._patch(ssl.SSLSocket, "recv", self._mk_recv("recv", "SSLSocket"))
         self._patch(ssl.SSLSocket, "recv_into", self._mk_recv_into())
         self._patch(ssl.SSLObject, "write", self._mk_send("write", "SSLObject"))
         self._patch(ssl.SSLObject, "read", self._mk_read())
-        install_shared_timing()
+        install_shared_timing(self._limits["max_connections"])
         self._installed = True
 
     def uninstall(self) -> None:
@@ -68,10 +69,10 @@ class SSLInterceptor(ByteSeamInterceptor):
     def _select_tracker(self, obj: Any) -> Any:
         try:
             if obj.selected_alpn_protocol() == "h2":
-                return _Http2Tracker()
+                return _Http2Tracker(self._native_limits)
         except Exception:
             pass
-        return _Http1Tracker()
+        return _Http1Tracker(self._native_limits)
 
     # --- send family (request) ---
 

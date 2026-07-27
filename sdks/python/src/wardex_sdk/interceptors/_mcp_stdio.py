@@ -62,9 +62,15 @@ class _Pending:
 class _ProcState:
     """JSON-RPC correlation state for a single subprocess (stdin request <-> stdout response)."""
 
-    SNIFF_LIMIT = 8192  # if no JSON-RPC found within this many bytes, treat as non-MCP (detach)
+    # Default sniff threshold (matches the core's mcp_sniff_bytes default): if no
+    # JSON-RPC is found within this many bytes, treat the subprocess as non-MCP
+    # (detach). Kept as a class attribute for direct-construction callers/tests;
+    # the interceptor overrides it per-instance via the sniff_limit constructor
+    # argument, sourced from the resolved config at install() time.
+    SNIFF_LIMIT = 8192
 
-    def __init__(self) -> None:
+    def __init__(self, sniff_limit: int = SNIFF_LIMIT) -> None:
+        self._sniff_limit = sniff_limit
         self._req = JsonRpcParser()
         self._resp = JsonRpcParser()
         self._latch: dict[str, _Pending] = {}
@@ -99,7 +105,7 @@ class _ProcState:
         return out
 
     def should_detach(self) -> bool:
-        return self._msgs == 0 and self._req_bytes > self.SNIFF_LIMIT
+        return self._msgs == 0 and self._req_bytes > self._sniff_limit
 
 
 def _build_mcp_span(p: _Pending, resp: Any) -> InternalSpan:
@@ -195,6 +201,7 @@ class McpStdioInterceptor(InterceptorInterface):
         self._orig_backend_desc: Any = None  # original classmethod descriptor (for restoration)
         self._orig_cse: Any = None  # original asyncio.create_subprocess_exec
         self._asyncio_wrap_count: int = 0  # test-only counter: number of actual asyncio seam wraps
+        self._sniff_limit: int = _ProcState.SNIFF_LIMIT
 
     def name(self) -> str:
         return "mcp_stdio"
@@ -203,6 +210,11 @@ class McpStdioInterceptor(InterceptorInterface):
         if self._installed:
             return
         self._client = client
+        from .._limits import CaptureLimits
+
+        config = getattr(client, "config", None)
+        lim = config.limits if config is not None else CaptureLimits()
+        self._sniff_limit = lim.resolved()["mcp_sniff_bytes"]
         try:
             self._orig_backend_desc = _aio_backend.AsyncIOBackend.__dict__["open_process"]
             orig_callable = _aio_backend.AsyncIOBackend.open_process  # bound classmethod
@@ -264,7 +276,7 @@ class McpStdioInterceptor(InterceptorInterface):
     def _wrap_proc(self, proc: Any) -> None:
         if getattr(proc, "stdin", None) is None or getattr(proc, "stdout", None) is None:
             return
-        state = _ProcState()
+        state = _ProcState(self._sniff_limit)
         client = self._client
         stdin = proc.stdin
         stdout = proc.stdout
@@ -309,7 +321,7 @@ class McpStdioInterceptor(InterceptorInterface):
         self._asyncio_wrap_count += (
             1  # counted when a wrap actually occurs (for verifying the dual-seam guard)
         )
-        state = _ProcState()
+        state = _ProcState(self._sniff_limit)
         client = self._client
         writer = proc.stdin
         reader = proc.stdout

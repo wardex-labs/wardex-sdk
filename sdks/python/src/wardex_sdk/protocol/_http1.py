@@ -22,8 +22,8 @@ def _to_parsed(raw: object) -> ParsedMessage:
 
 
 class _Http1Parser(ProtocolParserInterface):
-    def __init__(self, is_request: bool) -> None:
-        self._native = _wardex_native.protocol.Http1Parser(is_request)
+    def __init__(self, is_request: bool, limits: object | None = None) -> None:
+        self._native = _wardex_native.protocol.Http1Parser(is_request, limits)
 
     def protocol_name(self) -> str:
         return "http/1.1"
@@ -37,10 +37,10 @@ class _Http1Parser(ProtocolParserInterface):
 
 
 class Http1RequestParser(_Http1Parser):
-    def __init__(self) -> None:
-        super().__init__(True)
+    def __init__(self, limits: object | None = None) -> None:
+        super().__init__(True, limits)
 
 
 class Http1ResponseParser(_Http1Parser):
-    def __init__(self) -> None:
-        super().__init__(False)
+    def __init__(self, limits: object | None = None) -> None:
+        super().__init__(False, limits)

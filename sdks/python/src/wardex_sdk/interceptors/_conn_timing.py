@@ -233,17 +233,17 @@ _shared_probe: ConnTimingProbe | None = None
 _shared_refcount = 0
 
 
-def shared_timing_store() -> ConnTimingStore:
+def shared_timing_store(cap: int = 4096) -> ConnTimingStore:
     global _shared_store, _shared_probe
     if _shared_store is None:
-        _shared_store = ConnTimingStore()
+        _shared_store = ConnTimingStore(cap)
         _shared_probe = ConnTimingProbe(_shared_store)
     return _shared_store
 
 
-def install_shared_timing() -> None:
+def install_shared_timing(cap: int = 4096) -> None:
     global _shared_refcount
-    shared_timing_store()  # ensure the singleton exists
+    shared_timing_store(cap)  # ensure the singleton exists
     if _shared_refcount == 0:
         assert _shared_probe is not None
         _shared_probe.install()

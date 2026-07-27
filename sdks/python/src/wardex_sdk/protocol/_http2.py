@@ -10,8 +10,8 @@ from .. import _wardex_native
 class Http2Parser:
     """Incremental parser for a single h2 connection. Passes through to the native Http2Parser."""
 
-    def __init__(self) -> None:
-        self._native = _wardex_native.protocol.Http2Parser()
+    def __init__(self, limits: object | None = None) -> None:
+        self._native = _wardex_native.protocol.Http2Parser(limits)
 
     def feed(self, from_client: bool, data: bytes) -> tuple[list[int], list[Any]]:
         # returns: (opened_request_streams, [native Http2Transaction ...])

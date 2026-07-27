@@ -48,13 +48,14 @@ class RawSocketInterceptor(ByteSeamInterceptor):
         if self._installed:
             return
         self._client = client
+        self._load_limits(client)
         # base _patch uses the key f"{cls.__name__}.{meth}".
         # socket.socket.__name__ == "socket" → keys become "socket.send", etc.
         self._patch(socket.socket, "send", self._mk_send("send"))
         self._patch(socket.socket, "sendall", self._mk_sendall())
         self._patch(socket.socket, "recv", self._mk_recv("recv"))
         self._patch(socket.socket, "recv_into", self._mk_recv_into())
-        install_shared_timing()
+        install_shared_timing(self._limits["max_connections"])
         self._installed = True
 
     def uninstall(self) -> None:
@@ -81,7 +82,7 @@ class RawSocketInterceptor(ByteSeamInterceptor):
 
     def _select_tracker(self, obj: Any) -> Any:
         # Initial value is h1. When an h2c preface is detected, _gate SWAPs it to _Http2Tracker.
-        return _Http1Tracker()
+        return _Http1Tracker(self._native_limits)
 
     def _url_scheme(self, is_ws: bool) -> str:
         return "ws" if is_ws else "http"
@@ -117,7 +118,7 @@ class RawSocketInterceptor(ByteSeamInterceptor):
                 st.gate = "http"
             elif data.startswith(_H2_PREFACE):
                 st.gate = "h2c"  # plaintext HTTP/2 (prior-knowledge)
-                st.tracker = _Http2Tracker()  # swap the h1 tracker for h2
+                st.tracker = _Http2Tracker(self._native_limits)  # swap the h1 tracker for h2
             else:
                 st.gate = "ignore"  # non-HTTP protocols such as Redis, Memcached, etc.
         return st.gate in ("http", "h2c")

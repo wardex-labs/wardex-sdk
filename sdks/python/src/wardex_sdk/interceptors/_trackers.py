@@ -86,9 +86,9 @@ class _Txn:
 class _Http1Tracker:
     """HTTP/1.1 — per-direction parser + single-slot latch (unchanged from Slice 1 behavior)."""
 
-    def __init__(self) -> None:
-        self._req = Http1RequestParser()
-        self._resp = Http1ResponseParser()
+    def __init__(self, limits: object | None = None) -> None:
+        self._req = Http1RequestParser(limits)
+        self._resp = Http1ResponseParser(limits)
         self._method: str | None = None
         self._path: str | None = None
         self._req_body: bytes = b""
@@ -195,8 +195,8 @@ class _Http1Tracker:
 class _Http2Tracker:
     """HTTP/2 — native parser + per-stream_id latch (multiplexing correlation)."""
 
-    def __init__(self) -> None:
-        self._conn = Http2Parser()
+    def __init__(self, limits: object | None = None) -> None:
+        self._conn = Http2Parser(limits)
         # stream_id -> (active span at request time, request start ns)
         # TODO: evict stale entries for streams that closed without a response (Phase 3 close hook)
         self._latch: dict[int, tuple[SpanContext | None, int]] = {}
@@ -249,20 +249,26 @@ class _Http2Tracker:
         )
 
 
-WS_SAMPLE_CAP = 64 * 1024
-
-
 class _WebSocketTracker:
     """One WS connection — per-direction frame parser + aggregation + 64KB content sample.
     Emits 1 span on close/flush."""
 
-    def __init__(self, path: str, deflate: bool, parent: SpanContext | None, start_ns: int) -> None:
-        self._sent = WsParser()  # client -> server
-        self._recv = WsParser()  # server -> client
+    def __init__(
+        self,
+        path: str,
+        deflate: bool,
+        parent: SpanContext | None,
+        start_ns: int,
+        limits: object | None = None,
+        sample_cap: int = 64 * 1024,
+    ) -> None:
+        self._sent = WsParser(limits)  # client -> server
+        self._recv = WsParser(limits)  # server -> client
         self._path = path
         self._deflate = deflate
         self._parent = parent
         self._start_ns = start_ns
+        self._sample_cap = sample_cap
         self._sent_msgs = 0
         self._recv_msgs = 0
         self._sent_bytes = 0
@@ -302,11 +308,11 @@ class _WebSocketTracker:
         return self._maybe_emit()
 
     def _append_sample(self, buf: bytearray, messages: list[bytes]) -> bool:
-        """Accumulate messages into buf (up to a total of WS_SAMPLE_CAP).
+        """Accumulate messages into buf (up to a total of self._sample_cap).
         Returns True if truncated."""
         truncated = False
         for m in messages:
-            room = WS_SAMPLE_CAP - len(buf)
+            room = self._sample_cap - len(buf)
             if room <= 0:
                 truncated = True
                 break

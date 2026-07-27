@@ -63,3 +63,41 @@ def test_moved_fields_raise_helpful_error():
 
     with pytest.raises(TypeError, match="limits=CaptureLimits"):
         WardexConfig(max_buffer_spans=100)
+
+
+def test_body_cap_reaches_the_parser_end_to_end():
+    """A limit set on the config must reach the native parser via _Http1Tracker,
+    not just sit in config.
+
+    Uses max_headers rather than max_body_bytes/max_opaque_body_bytes: those two
+    fields are declared on Limits but are not yet enforced anywhere on the HTTP/1
+    path (crates/wardex-protocol/src/http1.rs only wires max_headers today — see
+    Task 2's brief; max_body_bytes truncation exists only in http2.rs, and its own
+    comment documents the opaque-body-aware cap as a "later change", not yet
+    landed). A truncation-based assertion on HTTP/1 would pass or fail identically
+    whether or not the config value actually reached the tracker, which is exactly
+    the kind of non-discriminating test the task's self-review explicitly warns
+    against. max_headers, by contrast, is genuinely enforced by the native
+    parser (crates/wardex-protocol/src/http1.rs::try_parse_one), so this test
+    still proves the value travels from CaptureLimits through _Http1Tracker into
+    the native Http1Parser.
+    """
+    import wardex_sdk
+    from wardex_sdk import _hub
+
+    wardex_sdk.init(limits=CaptureLimits(max_headers=1))
+    try:
+        from wardex_sdk.interceptors._trackers import _Http1Tracker
+
+        client = _hub.get_client()
+        assert client is not None
+        t = _Http1Tracker(client.config.limits.to_native())
+        t.on_request_bytes(b"GET / HTTP/1.1\r\nContent-Length: 0\r\n\r\n")
+        # Two headers exceeds the configured cap of one — with the default
+        # max_headers=96 this response would parse into one transaction, so
+        # getting zero here proves the cap reached the native parser.
+        raw = b"HTTP/1.1 200 OK\r\nA: 1\r\nB: 2\r\nContent-Length: 0\r\n\r\n"
+        txns = t.on_response_bytes(raw)
+        assert txns == [], "max_headers=1 must block parsing of a 2-header response"
+    finally:
+        wardex_sdk.close()

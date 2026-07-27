@@ -249,7 +249,17 @@ class AnthropicAgentSdkAdapter(AdapterInterface):
 
             sdk.create_sdk_mcp_server = create_sdk_mcp_server
 
-        self._assembler = SessionAssembler(client, skip_tool_names=self._wrapped_tool_names)
+        from .._limits import CaptureLimits
+
+        config = getattr(client, "config", None)
+        lim = config.limits if config is not None else CaptureLimits()
+        resolved = lim.resolved()
+        self._assembler = SessionAssembler(
+            client,
+            skip_tool_names=self._wrapped_tool_names,
+            max_sessions=resolved["max_sessions"],
+            max_session_entries=resolved["max_session_entries"],
+        )
         self._installed = True
 
     def uninstall(self) -> None:
