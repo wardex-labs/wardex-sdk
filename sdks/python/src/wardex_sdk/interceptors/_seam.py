@@ -8,6 +8,7 @@ plaintext (ws/http) seams inherit this and override only seam-specific behavior
 
 from __future__ import annotations
 
+import sys
 from abc import abstractmethod
 from typing import TYPE_CHECKING, Any
 
@@ -53,7 +54,7 @@ class _ConnectionState:
         self.server_address = server_address
         self.server_port = server_port
         self.timing_consumed = False
-        self.gate: str | None = None  # None=undetermined, "http", "h2c", "ignore"
+        self.gate: str | None = None  # None=undetermined, "http", "h2c", "ignore", "disabled"
 
 
 class ByteSeamInterceptor(InterceptorInterface):
@@ -167,7 +168,23 @@ class ByteSeamInterceptor(InterceptorInterface):
         st = self._state(obj)
         if not self._gate(st, data, "response"):
             return
-        for txn in st.tracker.on_response_bytes(data):
+        txns = st.tracker.on_response_bytes(data)
+        try:
+            # No span exists to carry a disable reason (the whole point of
+            # the latch is that no message was ever parsed), so debug mode
+            # logs it instead. Guarded by st.gate so a disabled connection
+            # logs once, not once per subsequent read.
+            if self._client is not None and self._client.config.debug:
+                reason = getattr(st.tracker, "disabled_reason", lambda: None)()
+                if reason is not None and st.gate != "disabled":
+                    st.gate = "disabled"
+                    print(
+                        f"[wardex] parser disabled for {st.server_address}: {reason}",
+                        file=sys.stderr,
+                    )
+        except Exception:  # noqa: BLE001 — debug-only logging must never break capture
+            pass
+        for txn in txns:
             if getattr(txn, "ws_upgrade", False):
                 ws = _WebSocketTracker(
                     path=txn.ws_upgrade_path or "/",

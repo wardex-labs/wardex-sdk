@@ -174,6 +174,12 @@ impl Http1Parser {
             .flush_truncated()
             .map(|inner| RawHttpMessage { inner })
     }
+
+    /// Why the parser latched off, if it did. `None` while the stream is
+    /// still parsing normally.
+    fn disabled_reason(&self) -> Option<&'static str> {
+        self.inner.disabled_reason()
+    }
 }
 
 /// LLM body semantic extraction result (wrapper around core LlmSemantics).

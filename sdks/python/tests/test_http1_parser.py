@@ -34,3 +34,13 @@ def test_response_parser_propagates_header_len():
     msgs = p.feed(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi")
     assert len(msgs) == 1
     assert msgs[0].header_len == len(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n")
+
+
+def test_wrapper_delegates_disabled_reason_to_the_native_parser():
+    # The thin Python wrapper (_Http1Parser) must forward disabled_reason()
+    # to the native parser rather than silently dropping it — no span exists
+    # to carry it, so this is the only place a caller can observe the latch.
+    p = Http1ResponseParser()
+    assert p.disabled_reason() is None
+    assert p.feed(b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n") == []
+    assert p.disabled_reason() == "not_http"

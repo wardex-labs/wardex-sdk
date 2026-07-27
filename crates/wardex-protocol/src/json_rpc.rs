@@ -26,9 +26,12 @@ pub struct JsonRpcMessage {
 #[derive(Default)]
 pub struct JsonRpcStream {
     buf: Vec<u8>,
-    // Stored but not yet enforced — a later task adds a buffer-size ceiling for this stream.
-    #[allow(dead_code)]
     limits: Limits,
+    /// Why the parser latched off, if it did. Mirrors `http1::Http1Stream`'s
+    /// disable latch: a line that never terminates (the stdio equivalent of
+    /// non-HTTP TLS traffic reaching the HTTP/1 parser) must not grow the
+    /// buffer without bound.
+    disabled_reason: Option<&'static str>,
 }
 
 impl JsonRpcStream {
@@ -36,12 +39,37 @@ impl JsonRpcStream {
         Self {
             buf: Vec::new(),
             limits,
+            disabled_reason: None,
         }
+    }
+
+    /// Bytes currently held awaiting a newline.
+    pub fn buffered_len(&self) -> usize {
+        self.buf.len()
+    }
+
+    /// Why the parser latched off, if it did. Surfaced for debug logging: no
+    /// span exists to carry it, because no message was ever parsed.
+    pub fn disabled_reason(&self) -> Option<&'static str> {
+        self.disabled_reason
     }
 
     /// Accumulates bytes and returns zero or more completed (newline-terminated) JSON-RPC messages. Non-JSON-RPC lines are skipped.
     pub fn feed(&mut self, data: &[u8]) -> Vec<JsonRpcMessage> {
+        if self.disabled_reason.is_some() {
+            return Vec::new();
+        }
         self.buf.extend_from_slice(data);
+        if self.buf.len() > self.limits.max_stream_buffer_bytes {
+            // A line that never terminates: bytes keep arriving but no message
+            // ever completes. Latch off rather than growing without bound.
+            // Checked immediately after the append and before any parse
+            // attempt, so the buffer is released as soon as the ceiling is
+            // crossed rather than after one more scan.
+            self.disabled_reason = Some("stream_buffer_exceeded");
+            self.buf = Vec::new();
+            return Vec::new();
+        }
         let mut out = Vec::new();
         while let Some(nl) = self.buf.iter().position(|&b| b == b'\n') {
             let line: Vec<u8> = self.buf.drain(..=nl).collect(); // consume including '\n'
@@ -178,6 +206,37 @@ mod tests {
         assert_eq!(v.len(), 2);
         assert_eq!(v[0].id.as_deref(), Some("1"));
         assert_eq!(v[1].id.as_deref(), Some("2"));
+    }
+
+    #[test]
+    fn unbounded_line_latches_off() {
+        let limits = Limits {
+            max_stream_buffer_bytes: 512,
+            ..Default::default()
+        };
+        let mut s = JsonRpcStream::new(limits);
+        for _ in 0..100 {
+            s.feed(&[b'x'; 64]); // never a newline
+        }
+        assert_eq!(s.disabled_reason(), Some("stream_buffer_exceeded"));
+        assert!(s.buffered_len() <= 512);
+    }
+
+    #[test]
+    fn latched_stream_discards_further_bytes() {
+        let limits = Limits {
+            max_stream_buffer_bytes: 64,
+            ..Default::default()
+        };
+        let mut s = JsonRpcStream::new(limits);
+        for _ in 0..10 {
+            s.feed(&[b'x'; 64]);
+        }
+        assert_eq!(s.disabled_reason(), Some("stream_buffer_exceeded"));
+        // Even a well-formed line is ignored once latched.
+        let v = s.feed(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"a\"}\n");
+        assert_eq!(v.len(), 0);
+        assert_eq!(s.buffered_len(), 0);
     }
 
     #[test]

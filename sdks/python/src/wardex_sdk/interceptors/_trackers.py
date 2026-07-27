@@ -191,6 +191,9 @@ class _Http1Tracker:
             self._resp_raw = b""
         return out
 
+    def disabled_reason(self) -> str | None:
+        return self._resp.disabled_reason() or self._req.disabled_reason()
+
 
 class _Http2Tracker:
     """HTTP/2 — native parser + per-stream_id latch (multiplexing correlation)."""

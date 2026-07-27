@@ -12,6 +12,7 @@ from wardex_sdk import _hub
 from wardex_sdk._enums import CaptureMode, SpanKind
 from wardex_sdk.interceptors._base import InterceptorInterface
 from wardex_sdk.interceptors._registry import InterceptorRegistry
+from wardex_sdk.interceptors._ssl import SSLInterceptor
 
 
 @pytest.fixture(autouse=True)
@@ -206,3 +207,54 @@ def test_install_uninstall_restores_originals():
     # everything is restored to the original
     for (cls, meth), orig in originals.items():
         assert getattr(cls, meth) is orig
+
+
+class _DebugConfig:
+    debug = True
+
+
+class _DebugRecordingClient:
+    """Minimal client stand-in exposing just what the seam's debug-logging
+    branch needs (`config.debug` + `capture_span`) — no real Client/transport
+    required for a unit test of the log itself."""
+
+    def __init__(self) -> None:
+        self.spans: list[object] = []
+        self.config = _DebugConfig()
+
+    def capture_span(self, span: object) -> None:
+        self.spans.append(span)
+
+
+def test_disabled_reason_logged_once_per_connection_in_debug(capsys):
+    # Non-HTTP TLS traffic (the Redis/Mongo/Kafka-over-TLS incident this task
+    # exists to guard against) latches the tracker off. No span is ever
+    # produced to carry the reason, so debug mode logs it instead — exactly
+    # once per connection, not once per subsequent read that keeps arriving
+    # and keeps being discarded by the already-latched parser.
+    interceptor = SSLInterceptor()
+    interceptor._client = _DebugRecordingClient()
+    obj = object()  # no getpeername/selected_alpn_protocol → falls back in _peer/_select_tracker
+    not_http = b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n"
+
+    interceptor._on_response_bytes(obj, not_http)
+    interceptor._on_response_bytes(obj, not_http)
+    interceptor._on_response_bytes(obj, not_http)
+
+    err = capsys.readouterr().err
+    assert err.count("[wardex] parser disabled for") == 1
+    assert "not_http" in err
+
+
+def test_disabled_reason_not_logged_without_debug(capsys):
+    # The same latch, without debug=True, must stay silent.
+    interceptor = SSLInterceptor()
+    client = _DebugRecordingClient()
+    client.config.debug = False
+    interceptor._client = client
+    obj = object()
+    not_http = b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n"
+
+    interceptor._on_response_bytes(obj, not_http)
+
+    assert capsys.readouterr().err == ""

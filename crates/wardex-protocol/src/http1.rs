@@ -52,8 +52,10 @@ enum State {
         dec: ChunkState,
         cap: usize,
     },
-    /// The peer is not speaking HTTP; the parser has latched off.
-    Disabled,
+    /// The peer is not speaking HTTP, or the stream exceeded a resource
+    /// ceiling; the parser has latched off. Carries a machine-readable
+    /// reason, since no message was ever parsed to attach it to.
+    Disabled(&'static str),
 }
 
 /// Where the chunked decoder is within the current chunk.
@@ -75,9 +77,27 @@ enum Step {
     Done(ParsedHttp),
     /// More bytes are required.
     NeedMore,
-    /// The stream is not HTTP; the parser latches off.
-    Fail,
+    /// The stream cannot be parsed further; carries why, so the caller can
+    /// distinguish "not HTTP" from "valid HTTP with more headers than we
+    /// chose to parse" rather than losing the message silently.
+    Fail(&'static str),
 }
+
+/// Sanity bound on a single declared chunk size (RFC 7230 §4.1 chunk-size
+/// line). This is not a memory cap — `cap`/`append_capped` already stop
+/// storing bytes once the body cap is reached, and the stream buffer stays
+/// small regardless of the declared size. It exists to catch a value like
+/// `ffffffffffffffff` (usize::MAX), which would otherwise wedge the decoder
+/// in `ChunkState::Data` for the rest of the connection: every subsequent
+/// byte the peer sends is consumed as body of a message that can never reach
+/// `remaining == 0`, so the connection is silently swallowed rather than
+/// latched off.
+///
+/// Set to 1 TiB — far above any plausible single legitimate chunk (real
+/// servers chunk multi-gigabyte bodies into many KB-to-MB pieces rather than
+/// declaring the whole body as one chunk), so it can only reject input that
+/// is already nonsensical.
+const MAX_CHUNK_SIZE: usize = 1 << 40;
 
 enum Framing {
     Length(usize),
@@ -115,10 +135,22 @@ impl Http1Stream {
 
     /// Accumulates bytes and returns zero or more completed messages (handles keep-alive).
     pub fn feed(&mut self, data: &[u8]) -> Vec<ParsedHttp> {
-        if matches!(self.state, State::Disabled) {
+        if matches!(self.state, State::Disabled(_)) {
             return Vec::new();
         }
         self.buf.extend_from_slice(data);
+        if self.buf.len() > self.limits.max_stream_buffer_bytes {
+            // Bytes keep arriving but no message ever completes: this is not a
+            // stream we can parse (e.g. non-HTTP traffic whose bytes never
+            // produce a recognizable terminator). Latch off rather than
+            // growing without bound. Checked immediately after the append and
+            // before any parse attempt, so the buffer is released as soon as
+            // the ceiling is crossed rather than after one more parse pass.
+            self.state = State::Disabled("stream_buffer_exceeded");
+            self.buf = Vec::new();
+            self.pos = 0;
+            return Vec::new();
+        }
         let mut out = Vec::new();
         loop {
             match self.step() {
@@ -130,8 +162,8 @@ impl Http1Stream {
                     }
                 }
                 Step::NeedMore => break,
-                Step::Fail => {
-                    self.state = State::Disabled;
+                Step::Fail(reason) => {
+                    self.state = State::Disabled(reason);
                     self.buf = Vec::new();
                     self.pos = 0;
                     break;
@@ -140,6 +172,15 @@ impl Http1Stream {
         }
         self.compact();
         out
+    }
+
+    /// Why the parser latched off, if it did. Surfaced for debug logging: no
+    /// span exists to carry it, because no message was ever parsed.
+    pub fn disabled_reason(&self) -> Option<&'static str> {
+        match self.state {
+            State::Disabled(reason) => Some(reason),
+            _ => None,
+        }
     }
 
     /// Called on connection close — carves off the message in flight, whose body
@@ -196,8 +237,8 @@ impl Http1Stream {
                 cap,
             } => self.step_body(msg, remaining, cap),
             State::Chunked { msg, dec, cap } => self.step_chunked(msg, dec, cap),
-            State::Disabled => {
-                self.state = State::Disabled;
+            State::Disabled(reason) => {
+                self.state = State::Disabled(reason);
                 Step::NeedMore
             }
         }
@@ -215,14 +256,16 @@ impl Http1Stream {
             match req.parse(self.avail()) {
                 Ok(httparse::Status::Complete(n)) => (n, request_to_parsed(&req)),
                 Ok(httparse::Status::Partial) => return Step::NeedMore,
-                Err(_) => return Step::Fail,
+                Err(httparse::Error::TooManyHeaders) => return Step::Fail("headers_exceeded"),
+                Err(_) => return Step::Fail("not_http"),
             }
         } else {
             let mut resp = httparse::Response::new(&mut headers);
             match resp.parse(self.avail()) {
                 Ok(httparse::Status::Complete(n)) => (n, response_to_parsed(&resp)),
                 Ok(httparse::Status::Partial) => return Step::NeedMore,
-                Err(_) => return Step::Fail,
+                Err(httparse::Error::TooManyHeaders) => return Step::Fail("headers_exceeded"),
+                Err(_) => return Step::Fail("not_http"),
             }
         };
 
@@ -305,13 +348,16 @@ impl Http1Stream {
                     };
                     self.bytes_scanned += (idx + 2) as u64;
                     let Ok(line) = std::str::from_utf8(&self.avail()[..idx]) else {
-                        return Step::Fail;
+                        return Step::Fail("not_http");
                     };
                     let Ok(size) =
                         usize::from_str_radix(line.split(';').next().unwrap_or("").trim(), 16)
                     else {
-                        return Step::Fail;
+                        return Step::Fail("not_http");
                     };
+                    if size > MAX_CHUNK_SIZE {
+                        return Step::Fail("chunk_size_exceeded");
+                    }
                     self.consume(idx + 2);
                     dec = if size == 0 {
                         ChunkState::Trailer
@@ -1080,6 +1126,106 @@ mod tests {
         assert_eq!(msgs[0].body, b"hell");
         assert!(msgs[0].truncated);
         assert_eq!(msgs[1].status, Some(201));
+    }
+
+    #[test]
+    fn non_http_traffic_latches_off_and_frees_the_buffer() {
+        // Redis over TLS reaching the HTTP parser is the OOM path this guards.
+        let mut s = Http1Stream::new(true, Limits::default());
+        assert_eq!(
+            s.feed(b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n").len(),
+            0
+        );
+        assert_eq!(s.disabled_reason(), Some("not_http"));
+        assert_eq!(s.buffered_len(), 0, "buffer must be released on latch");
+
+        // Even valid HTTP is ignored once latched.
+        assert_eq!(
+            s.feed(b"GET /a HTTP/1.1\r\nContent-Length: 0\r\n\r\n")
+                .len(),
+            0
+        );
+    }
+
+    #[test]
+    fn unbounded_incomplete_headers_latch_off() {
+        let limits = Limits {
+            max_stream_buffer_bytes: 1024,
+            ..Default::default()
+        };
+        let mut s = Http1Stream::new(false, limits);
+        // A valid status line, then a header block that never reaches the
+        // blank line ending it — httparse keeps returning Partial forever, so
+        // only the stream-buffer ceiling (not a parse error) can end this.
+        s.feed(b"HTTP/1.1 200 OK\r\n");
+        for _ in 0..100 {
+            s.feed(b"X-Padding: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n");
+        }
+        assert_eq!(s.disabled_reason(), Some("stream_buffer_exceeded"));
+        assert!(s.buffered_len() <= 1024);
+    }
+
+    #[test]
+    fn header_count_overflow_is_reported_not_silent() {
+        let limits = Limits {
+            max_headers: 2,
+            ..Default::default()
+        };
+        let mut s = Http1Stream::new(false, limits);
+        let raw = b"HTTP/1.1 200 OK\r\nA: 1\r\nB: 2\r\nC: 3\r\nContent-Length: 0\r\n\r\n";
+        assert_eq!(s.feed(raw).len(), 0);
+        assert_eq!(s.disabled_reason(), Some("headers_exceeded"));
+    }
+
+    #[test]
+    fn partial_still_accumulates_without_latching() {
+        // The row where a regression would break normal traffic: an incomplete
+        // header block (well under the ceiling) must keep waiting, not latch off.
+        let mut s = Http1Stream::new(false, Limits::default());
+        assert_eq!(s.feed(b"HTTP/1.1 200 OK\r\nContent-Len").len(), 0);
+        assert_eq!(s.disabled_reason(), None);
+        let msgs = s.feed(b"gth: 2\r\n\r\nhi");
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].body, b"hi");
+        assert_eq!(s.disabled_reason(), None);
+    }
+
+    #[test]
+    fn absurd_chunk_size_latches_off_instead_of_swallowing_the_connection() {
+        // `ffffffffffffffff` decodes to usize::MAX. Without a sanity bound, the
+        // decoder would enter ChunkState::Data{remaining: usize::MAX} and
+        // consume every subsequent byte on the connection as body of a message
+        // that can never complete — not a memory leak (buf stays small, body is
+        // capped), but a silently swallowed connection.
+        let mut s = Http1Stream::new(false, Limits::default());
+        let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nffffffffffffffff\r\n";
+        assert_eq!(s.feed(raw).len(), 0);
+        assert_eq!(s.disabled_reason(), Some("chunk_size_exceeded"));
+        assert_eq!(s.buffered_len(), 0);
+    }
+
+    #[test]
+    fn plausible_large_chunk_size_is_not_rejected() {
+        // A single 64 MiB chunk is well within real-world territory (a large
+        // streamed file/video) and must parse normally, not latch off. Fed as
+        // realistic socket reads (64 KiB at a time, like
+        // `chunked_decode_is_linear_not_quadratic`) so the unrelated
+        // stream-buffer ceiling — which bounds one accumulated read, not a
+        // decoded body — never enters into it.
+        let limits = Limits {
+            max_body_bytes: 128 * 1024 * 1024,
+            ..Default::default()
+        };
+        let size = 64 * 1024 * 1024;
+        let mut raw = format!("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{size:x}\r\n")
+            .into_bytes();
+        raw.extend(std::iter::repeat_n(b'x', size));
+        raw.extend_from_slice(b"\r\n0\r\n\r\n");
+        let mut s = Http1Stream::new(false, limits);
+        let msgs = feed_chunked(&mut s, &raw, 64 * 1024);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].body.len(), size);
+        assert_eq!(s.disabled_reason(), None);
     }
 
     #[test]

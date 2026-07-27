@@ -103,6 +103,31 @@ def test_body_cap_reaches_the_parser_end_to_end():
         wardex_sdk.close()
 
 
+def test_native_parser_exposes_disabled_reason():
+    """`Http1Parser.disabled_reason()` (bindings/python/src/lib.rs) must delegate
+    to the core Http1Stream, not just exist as a stub — None while parsing
+    normally, and the machine-readable reason once the parser latches off.
+    """
+    p = _wardex_native.protocol.Http1Parser(False)
+    assert p.disabled_reason() is None
+    # Not HTTP at all → "not_http".
+    assert p.feed(b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n") == []
+    assert p.disabled_reason() == "not_http"
+
+
+def test_http1_tracker_reports_disabled_reason_from_either_direction():
+    """`_Http1Tracker.disabled_reason()` must surface a latch on either the
+    request or the response parser — whichever direction actually saw the
+    non-HTTP traffic.
+    """
+    from wardex_sdk.interceptors._trackers import _Http1Tracker
+
+    t = _Http1Tracker()
+    assert t.disabled_reason() is None
+    t.on_response_bytes(b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n")
+    assert t.disabled_reason() == "not_http"
+
+
 def test_python_side_fallback_defaults_match_core():
     """Every Python-side object that accepts a resource-bound parameter with a
     default of None must resolve that default from the core (limits_defaults()),

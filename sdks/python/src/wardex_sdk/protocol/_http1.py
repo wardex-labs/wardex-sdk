@@ -35,6 +35,9 @@ class _Http1Parser(ProtocolParserInterface):
         raw = self._native.flush_truncated()
         return _to_parsed(raw) if raw is not None else None
 
+    def disabled_reason(self) -> str | None:
+        return self._native.disabled_reason()  # type: ignore[no-any-return]
+
 
 class Http1RequestParser(_Http1Parser):
     def __init__(self, limits: object | None = None) -> None:
