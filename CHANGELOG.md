@@ -12,11 +12,12 @@ All notable changes to this project are documented here. The format follows
   `WardexConfig` into `WardexConfig(limits=CaptureLimits(...))`. Passing
   either at the top level now raises a `TypeError` naming the new home; the
   fix is `wardex.init(limits=CaptureLimits(max_buffer_spans=..., replay_buffer_size=...))`.
-- The HTTP/2 body cap default changed shape: 8 MiB flat becomes 32 MiB for
+- Bodies are now capped by content type on both HTTP/1 and HTTP/2: 32 MiB for
   content types carrying extractable meaning (JSON, text, SSE, form-encoded,
-  gRPC) and 256 KiB for opaque ones. Content-heavy but non-semantic traffic
-  (binary uploads, opaque blobs) now captures a smaller body sample than
-  before; raise `max_opaque_body_bytes` via `CaptureLimits` if you need more.
+  gRPC) and 256 KiB for opaque ones. HTTP/2 previously had a flat 8 MiB cap;
+  HTTP/1 had none at all — a large opaque HTTP/1 body (a binary upload,
+  say) was captured in full before and is now sampled to 256 KiB. Raise
+  `max_opaque_body_bytes` via `CaptureLimits` if you need more.
 
 ### Added
 - `CaptureLimits` — every resource bound in the SDK is now configurable via
@@ -37,8 +38,8 @@ All notable changes to this project are documented here. The format follows
   parser is now single-pass — measured at 10.6 MB scanned for the same
   10 MB stream.
 - A response with more headers than the parser's fixed-size array could
-  never be parsed, and the failure was silent. It now surfaces as a reported
-  capture limitation instead of hanging indefinitely.
+  never be parsed, and said nothing about it — it now surfaces as a reported
+  capture limitation instead.
 - `CONNECT` and `TRACE` were missing from the HTTP method list used to
   classify traffic, so proxied connections were treated as non-HTTP and
   never captured.
