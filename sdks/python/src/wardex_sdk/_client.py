@@ -54,7 +54,8 @@ class Client:
         self._dropped = 0
         self._closed = False
         self._close_lock = threading.Lock()
-        self._flush_threshold = max(1, config.max_buffer_spans // 4)
+        self._max_buffer_spans = config.limits.resolved()["max_buffer_spans"]
+        self._flush_threshold = max(1, self._max_buffer_spans // 4)
         self._worker = BatchWorker(
             lambda: self._drain(5.0), interval=config.flush_interval, debug=config.debug
         )
@@ -69,7 +70,7 @@ class Client:
             return
         self._worker.ensure_alive()  # fork/thread-death recovery (design §8)
         with self._buffer_lock:
-            if len(self._spans) >= self._config.max_buffer_spans:
+            if len(self._spans) >= self._max_buffer_spans:
                 self._spans.popleft()  # drop-oldest: recent spans are worth more
                 self._dropped += 1
             self._spans.append(span)
@@ -82,7 +83,7 @@ class Client:
             return
         self._worker.ensure_alive()
         with self._buffer_lock:
-            if len(self._snapshots) >= self._config.max_buffer_spans:
+            if len(self._snapshots) >= self._max_buffer_spans:
                 self._snapshots.popleft()
                 self._dropped += 1
             self._snapshots.append(snapshot)

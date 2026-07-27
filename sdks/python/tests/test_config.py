@@ -2,13 +2,14 @@ import pytest
 
 from wardex_sdk._config import WardexConfig
 from wardex_sdk._enums import CaptureTrigger, PIICategory, PIIMode, RetentionClass
+from wardex_sdk._limits import CaptureLimits
 
 
 def test_defaults():
     c = WardexConfig()
     assert c.default_retention == RetentionClass.SUMMARY_ONLY
     assert c.pii_mode == PIIMode.MASK
-    assert c.replay_buffer_size == 100
+    assert c.limits.resolved()["replay_buffer_size"] == 100
     assert CaptureTrigger.ERROR in c.retention_triggers
 
 
@@ -24,7 +25,7 @@ def test_effective_retention_production_keeps_default():
 
 def test_post_init_rejects_bad_buffer_size():
     with pytest.raises(ValueError):
-        WardexConfig(replay_buffer_size=0)
+        WardexConfig(limits=CaptureLimits(replay_buffer_size=0))
 
 
 def test_from_env_reads_environment(monkeypatch):
@@ -74,7 +75,7 @@ class TestPiiConfig:
 def test_batching_defaults():
     c = WardexConfig()
     assert c.flush_interval == 5.0
-    assert c.max_buffer_spans == 2048
+    assert c.limits.resolved()["max_buffer_spans"] == 2048
     assert c.flush_on_signals is True
 
 
@@ -87,7 +88,7 @@ def test_post_init_rejects_nonpositive_flush_interval():
 
 def test_post_init_rejects_bad_max_buffer_spans():
     with pytest.raises(ValueError):
-        WardexConfig(max_buffer_spans=0)
+        WardexConfig(limits=CaptureLimits(max_buffer_spans=0))
 
 
 def test_propagation_defaults_off():

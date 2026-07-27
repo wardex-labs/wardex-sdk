@@ -13,6 +13,7 @@ import pytest
 from wardex_sdk._client import Client
 from wardex_sdk._config import WardexConfig
 from wardex_sdk._enums import SpanKind, StatusCode
+from wardex_sdk._limits import CaptureLimits
 from wardex_sdk._types import InternalEnvelope, InternalSpan, SpanContext, SpanId, TraceId
 from wardex_sdk.transport._base import Transport
 from wardex_sdk.transport._otlp_http import OtlpHttpTransport
@@ -128,7 +129,10 @@ def test_sigterm_flushes_and_preserves_exit_code(tmp_path):
 def test_fork_child_respawns_worker_and_flushes():
     t = _Recording()
     # interval 3600: parent worker sits idle in wait() holding no locks → fork-safe
-    c = Client(WardexConfig(api_key="k", flush_interval=3600.0, max_buffer_spans=8), t)
+    c = Client(
+        WardexConfig(api_key="k", flush_interval=3600.0, limits=CaptureLimits(max_buffer_spans=8)),
+        t,
+    )
     pid = os.fork()
     if pid == 0:
         # child: the worker thread did not survive the fork; ensure_alive respawns

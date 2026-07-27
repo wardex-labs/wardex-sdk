@@ -29,6 +29,7 @@ from ._enums import (
     StatusCode,
     ToolType,
 )
+from ._limits import CaptureLimits
 from ._scope import UserInfo
 from ._tracing import agent, span, task, tool, trace, workflow
 from ._types import (
@@ -75,6 +76,7 @@ __all__ = [
     "get_trace_headers",
     "WardexMiddleware",
     "WardexWSGIMiddleware",
+    "CaptureLimits",
     # Enums — importable directly from user code
     "AdapterName",
     "CaptureMode",

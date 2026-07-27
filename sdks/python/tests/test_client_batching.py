@@ -6,6 +6,7 @@ import time
 from wardex_sdk._client import Client
 from wardex_sdk._config import WardexConfig
 from wardex_sdk._enums import SpanKind
+from wardex_sdk._limits import CaptureLimits
 from wardex_sdk._types import (
     InternalEnvelope,
     InternalSpan,
@@ -48,7 +49,7 @@ def _span(name="s"):
 def test_concurrent_capture_and_drain_loses_nothing():
     """The core regression guard of this slice (spec §11): no loss, no dup."""
     t = _Recording()
-    c = Client(WardexConfig(api_key="k", max_buffer_spans=100_000), t)
+    c = Client(WardexConfig(api_key="k", limits=CaptureLimits(max_buffer_spans=100_000)), t)
     n_threads, m_spans = 8, 500
     stop_draining = threading.Event()
 
@@ -77,7 +78,7 @@ def test_concurrent_capture_and_drain_loses_nothing():
 
 def test_backpressure_drops_oldest_keeps_newest():
     t = _Recording()
-    c = Client(WardexConfig(api_key="k", max_buffer_spans=10), t)
+    c = Client(WardexConfig(api_key="k", limits=CaptureLimits(max_buffer_spans=10)), t)
     # This test predates the background worker (Task 3) and asserts on the
     # *manual* flush()'s view of a single overflow burst. With max_buffer_spans=10
     # the wake threshold is max(1, 10 // 4) = 2, so the live worker can (and, on
@@ -98,7 +99,7 @@ def test_backpressure_drops_oldest_keeps_newest():
 
 def test_dropped_count_reported_once_in_debug(capsys):
     t = _Recording()
-    c = Client(WardexConfig(api_key="k", max_buffer_spans=2, debug=True), t)
+    c = Client(WardexConfig(api_key="k", limits=CaptureLimits(max_buffer_spans=2), debug=True), t)
     # max_buffer_spans=2 gives a wake threshold of max(1, 2 // 4) = 1, so the
     # live worker (Task 4) would race this tight burst and drain early,
     # splitting the "dropped 3" report. Stop it so only the explicit flush()
@@ -177,7 +178,10 @@ def test_auto_flush_without_manual_flush():
 def test_threshold_wakes_worker_before_interval():
     t = _Recording()
     # max_buffer_spans=8 → threshold max(1, 8//4)=2; interval too long to fire
-    c = Client(WardexConfig(api_key="k", flush_interval=3600.0, max_buffer_spans=8), t)
+    c = Client(
+        WardexConfig(api_key="k", flush_interval=3600.0, limits=CaptureLimits(max_buffer_spans=8)),
+        t,
+    )
     c.capture_span(_span())
     c.capture_span(_span())
     assert _wait_for(lambda: sum(len(e.spans) for e in t.envelopes) >= 2)

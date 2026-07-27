@@ -7,7 +7,7 @@ sensible defaults.
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from ._enums import (
     AdapterName,
@@ -18,7 +18,13 @@ from ._enums import (
     PIIMode,
     RetentionClass,
 )
+from ._limits import CaptureLimits
 from ._types import BeforeSendCallback
+
+# Fields moved into limits=CaptureLimits(...) in 0.2.0b1. Guarded in __new__
+# below so callers get a message naming the new home instead of a bare
+# unknown-keyword TypeError from the generated dataclass __init__.
+_MOVED_TO_LIMITS = ("max_buffer_spans", "replay_buffer_size")
 
 
 @dataclass(frozen=True, slots=True)
@@ -29,7 +35,6 @@ class WardexConfig:
     endpoint: str | None = None
 
     default_retention: RetentionClass = RetentionClass.SUMMARY_ONLY
-    replay_buffer_size: int = 100
     retention_triggers: frozenset[CaptureTrigger] = frozenset(
         {CaptureTrigger.ERROR, CaptureTrigger.MANUAL_MARK}
     )
@@ -38,8 +43,8 @@ class WardexConfig:
     pii_disabled_categories: frozenset[PIICategory] = frozenset()
 
     flush_interval: float = 5.0
-    max_buffer_spans: int = 2048
     flush_on_signals: bool = True
+    limits: CaptureLimits = field(default_factory=CaptureLimits)
 
     adapters: tuple[AdapterName, ...] | None = None
     interceptors: tuple[InterceptorName, ...] | None = None
@@ -57,10 +62,19 @@ class WardexConfig:
     environment: str | None = None
     tags: tuple[tuple[str, str], ...] = ()
 
+    def __new__(cls, **kwargs: object) -> WardexConfig:
+        moved = [name for name in _MOVED_TO_LIMITS if name in kwargs]
+        if moved:
+            names = ", ".join(moved)
+            raise TypeError(
+                f"{names} moved into limits= in 0.2.0b1. "
+                f"Use limits=CaptureLimits({moved[0]}=...) instead."
+            )
+        return super().__new__(cls)
+
     def __post_init__(self) -> None:
-        """Validate field invariants (buffer sizes, intervals, PII mode support)."""
-        if self.replay_buffer_size < 1:
-            raise ValueError(f"replay_buffer_size must be >= 1, got {self.replay_buffer_size}")
+        """Validate field invariants (intervals, PII mode support). Limit values
+        (buffer sizes, etc.) are validated by CaptureLimits.__post_init__."""
         if self.pii_mode in (PIIMode.REDACT, PIIMode.HASH):
             raise NotImplementedError(
                 f"PIIMode.{self.pii_mode.name} is not implemented yet "
@@ -68,8 +82,6 @@ class WardexConfig:
             )
         if self.flush_interval <= 0:
             raise ValueError(f"flush_interval must be > 0, got {self.flush_interval}")
-        if self.max_buffer_spans < 1:
-            raise ValueError(f"max_buffer_spans must be >= 1, got {self.max_buffer_spans}")
         if self.propagate_targets is not None:
             for pattern in self.propagate_targets:
                 if not isinstance(pattern, str) or not pattern:
