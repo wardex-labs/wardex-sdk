@@ -179,10 +179,13 @@ def fake_ssl_socket():
 
 
 @pytest.fixture
-def installed_ssl_interceptor():
-    """A bare SSLInterceptor with `_client` set, bypassing the real
-    ssl.SSLSocket monkeypatch — tests drive `_on_request_bytes`/
-    `_on_response_bytes` directly against fake sockets."""
+def bare_ssl_interceptor():
+    """A bare SSLInterceptor with `_client` set, but never `.install()`-ed —
+    no ssl.SSLSocket monkeypatch happens. Tests drive `_on_request_bytes`/
+    `_on_response_bytes` directly against fake sockets. Named "bare" (not
+    "installed") to avoid colliding, in name and in implication, with
+    test_install_uninstall_restores_originals, which exercises the real
+    monkeypatch install/uninstall path in this same test file."""
     from wardex_sdk.interceptors._ssl import SSLInterceptor
 
     class _Config:

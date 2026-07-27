@@ -54,7 +54,7 @@ class _ConnectionState:
         self.server_address = server_address
         self.server_port = server_port
         self.timing_consumed = False
-        self.gate: str | None = None  # None=undetermined, "http", "h2c", "ignore"
+        self.gate: str | None = None  # None=undetermined, "http", "h2c", "h2", "ignore"
         # Guards the once-per-connection debug log below. Deliberately a
         # separate field from `gate`: `gate` is owned by the plaintext seam's
         # protocol sniff-latch (_socket.py), which never re-evaluates once

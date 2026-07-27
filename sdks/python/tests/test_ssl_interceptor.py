@@ -282,42 +282,87 @@ def test_non_http_tls_traffic_produces_no_log(capsys):
     assert capsys.readouterr().err == ""
 
 
-def test_non_http_tls_traffic_is_not_parsed(fake_ssl_socket, installed_ssl_interceptor):
+def test_non_http_tls_traffic_is_not_parsed(fake_ssl_socket, bare_ssl_interceptor):
     """Redis over TLS must never reach the HTTP parser."""
-    itc = installed_ssl_interceptor
+    itc = bare_ssl_interceptor
     sock = fake_ssl_socket(alpn=None)
     itc._on_request_bytes(sock, b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n")
     st = itc._conns[id(sock)]
     assert st.gate == "ignore"
 
 
-def test_https_request_is_parsed(fake_ssl_socket, installed_ssl_interceptor):
-    itc = installed_ssl_interceptor
+def test_https_request_is_parsed(fake_ssl_socket, bare_ssl_interceptor):
+    itc = bare_ssl_interceptor
     sock = fake_ssl_socket(alpn="http/1.1")
     itc._on_request_bytes(sock, b"POST /v1/messages HTTP/1.1\r\nContent-Length: 0\r\n\r\n")
     assert itc._conns[id(sock)].gate == "http"
 
 
-def test_alpn_h2_is_trusted(fake_ssl_socket, installed_ssl_interceptor):
-    itc = installed_ssl_interceptor
+def test_alpn_h2_is_trusted(fake_ssl_socket, bare_ssl_interceptor):
+    itc = bare_ssl_interceptor
     sock = fake_ssl_socket(alpn="h2")
     itc._on_request_bytes(sock, b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
     assert itc._conns[id(sock)].gate == "h2"
 
 
-def test_connect_proxy_is_recognised(fake_ssl_socket, installed_ssl_interceptor):
+def test_alpn_h2_is_trusted_without_the_preface(fake_ssl_socket, bare_ssl_interceptor):
+    """ALPN must be trusted unconditionally, not just when the triggering call
+    happens to carry the h2 connection preface.
+
+    `send`/`write` can be called again after the preface has already gone out
+    on the wire — the negotiated-ALPN check has to fire before the
+    preface/method branches even run, or a healthy h2 connection whose first
+    *observed* call is a plain data frame would be misclassified. Unlike
+    test_alpn_h2_is_trusted (whose data independently satisfies the preface
+    branch and so would pass even with the ALPN-first check deleted), this
+    case only passes if ALPN is actually checked first.
+    """
+    itc = bare_ssl_interceptor
+    sock = fake_ssl_socket(alpn="h2")
+    itc._on_request_bytes(sock, b"\x00\x00\x04\x01\x00\x00\x00\x00\x01arbitrary-h2-frame")
+    assert itc._conns[id(sock)].gate == "h2"
+
+
+def test_connect_proxy_is_recognised(fake_ssl_socket, bare_ssl_interceptor):
     """A proxied connection opens with CONNECT, which was missing from the list."""
-    itc = installed_ssl_interceptor
+    itc = bare_ssl_interceptor
     sock = fake_ssl_socket(alpn=None)
     itc._on_request_bytes(sock, b"CONNECT api.anthropic.com:443 HTTP/1.1\r\n\r\n")
     assert itc._conns[id(sock)].gate == "http"
 
 
-def test_server_first_protocol_is_ignored(fake_ssl_socket, installed_ssl_interceptor):
+def test_server_first_protocol_is_ignored(fake_ssl_socket, bare_ssl_interceptor):
     """A response arriving before any request means we cannot classify it."""
-    itc = installed_ssl_interceptor
+    itc = bare_ssl_interceptor
     sock = fake_ssl_socket(alpn=None)
     itc._on_response_bytes(sock, b"\x00\x00\x00\x08postgres-greeting")
+    assert itc._conns[id(sock)].gate == "ignore"
+
+
+def test_latch_stays_http_once_open(fake_ssl_socket, bare_ssl_interceptor):
+    """Once classified "http", later non-HTTP-looking bytes must not flip the
+    gate — the decision is made once, from the first request bytes, and never
+    revisited."""
+    itc = bare_ssl_interceptor
+    sock = fake_ssl_socket(alpn=None)
+    itc._on_request_bytes(sock, b"POST /v1/messages HTTP/1.1\r\nContent-Length: 0\r\n\r\n")
+    assert itc._conns[id(sock)].gate == "http"
+    itc._on_request_bytes(sock, b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n")
+    assert itc._conns[id(sock)].gate == "http"
+
+
+def test_latch_stays_ignore_once_closed(fake_ssl_socket, bare_ssl_interceptor):
+    """Once classified "ignore" (non-HTTP), later bytes that happen to look
+    like an HTTP method must not re-arm the gate. This is the direction that
+    matters for the OOM path this task closes: a Redis/Mongo/Kafka-over-TLS
+    connection latched off must stay off for its whole life, or a coincidental
+    later payload resembling a method line would let it start streaming into
+    the parser again."""
+    itc = bare_ssl_interceptor
+    sock = fake_ssl_socket(alpn=None)
+    itc._on_request_bytes(sock, b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n")
+    assert itc._conns[id(sock)].gate == "ignore"
+    itc._on_request_bytes(sock, b"GET / HTTP/1.1\r\n\r\n")
     assert itc._conns[id(sock)].gate == "ignore"
 
 
