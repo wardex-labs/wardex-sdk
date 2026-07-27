@@ -5,7 +5,7 @@ import anyio
 import pytest
 
 import wardex_sdk as wardex
-from wardex_sdk import _hub
+from wardex_sdk import CaptureLimits, _hub
 from wardex_sdk._enums import SpanKind, StatusCode
 
 
@@ -112,3 +112,68 @@ async def test_anyio_spawn_does_not_double_wrap_via_asyncio_seam():
     assert interceptor._asyncio_wrap_count == 0
     mcp = [s for s in _client_spans() if s.transport and s.transport.mcp is not None]
     assert len(mcp) == 1
+
+
+# a single burst well under the core default ceiling (16 MiB) but past a small
+# override — writes bytes that never form a newline-terminated JSON-RPC line
+_JUNK_BURST = "import sys\nsys.stdout.write('x' * 200)\nsys.stdout.flush()\n"
+
+# the same junk, spread across several separate flushed writes so the
+# interceptor's tee sees multiple reads after the parser has already latched off
+_JUNK_LOOP = (
+    "import sys, time\n"
+    "for _ in range(10):\n"
+    "    sys.stdout.write('x' * 40)\n"
+    "    sys.stdout.flush()\n"
+    "    time.sleep(0.02)\n"
+)
+
+
+async def _drain_stdout(proc: anyio.abc.Process) -> None:
+    try:
+        while True:
+            chunk = await proc.stdout.receive()
+            if not chunk:
+                break
+    except anyio.EndOfStream:
+        pass
+
+
+@pytest.mark.asyncio
+async def test_mcp_stream_buffer_limit_reaches_the_parser_through_the_interceptor(capsys):
+    """A max_stream_buffer_bytes override set on client config must reach the
+    native JsonRpcParser via McpStdioInterceptor.install() -> _wrap_proc ->
+    _ProcState, not just sit in config.
+
+    200 bytes of junk with no newline is far below the core default ceiling
+    (16 MiB) — under the default it would just sit in the buffer waiting for
+    more, producing no observable signal either way. A 64-byte override is
+    the only thing that can make it trip the stream-buffer latch, so seeing
+    the debug log fire is a genuinely discriminating proof that the override
+    travelled from CaptureLimits through the interceptor into the native
+    parser (not a value re-derived independently, e.g. re-reading config).
+    """
+    wardex.init(intercept=True, debug=True, limits=CaptureLimits(max_stream_buffer_bytes=64))
+    proc = await anyio.open_process([sys.executable, "-c", _JUNK_BURST])
+    await _drain_stdout(proc)
+    await proc.wait()
+
+    err = capsys.readouterr().err
+    assert "stream_buffer_exceeded" in err
+
+
+@pytest.mark.asyncio
+async def test_disabled_reason_logged_once_per_mcp_stream(capsys):
+    # A subprocess that never sends a newline-terminated JSON-RPC line — the
+    # stdio equivalent of the non-HTTP-over-TLS incident this slice guards
+    # against. No span is ever produced (nothing to carry the reason), so
+    # debug mode logs it instead — exactly once per stream, not once per read
+    # that keeps arriving after the parser has already latched off.
+    wardex.init(intercept=True, debug=True, limits=CaptureLimits(max_stream_buffer_bytes=64))
+    proc = await anyio.open_process([sys.executable, "-c", _JUNK_LOOP])
+    await _drain_stdout(proc)
+    await proc.wait()
+
+    err = capsys.readouterr().err
+    assert err.count("[wardex] json-rpc parser disabled") == 1
+    assert "stream_buffer_exceeded" in err

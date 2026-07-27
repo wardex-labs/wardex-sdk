@@ -54,7 +54,15 @@ class _ConnectionState:
         self.server_address = server_address
         self.server_port = server_port
         self.timing_consumed = False
-        self.gate: str | None = None  # None=undetermined, "http", "h2c", "ignore", "disabled"
+        self.gate: str | None = None  # None=undetermined, "http", "h2c", "ignore"
+        # Guards the once-per-connection debug log below. Deliberately a
+        # separate field from `gate`: `gate` is owned by the plaintext seam's
+        # protocol sniff-latch (_socket.py), which never re-evaluates once
+        # set — reusing it here would let a disable-log event permanently
+        # gate off all further bytes on that seam, including a still-healthy
+        # direction, as an unintended side effect of two unrelated concerns
+        # sharing one field.
+        self.disabled_logged = False
 
 
 class ByteSeamInterceptor(InterceptorInterface):
@@ -172,12 +180,13 @@ class ByteSeamInterceptor(InterceptorInterface):
         try:
             # No span exists to carry a disable reason (the whole point of
             # the latch is that no message was ever parsed), so debug mode
-            # logs it instead. Guarded by st.gate so a disabled connection
-            # logs once, not once per subsequent read.
+            # logs it instead. Guarded by st.disabled_logged (not st.gate,
+            # which the plaintext seam's sniff-latch owns) so a disabled
+            # connection logs once, not once per subsequent read.
             if self._client is not None and self._client.config.debug:
                 reason = getattr(st.tracker, "disabled_reason", lambda: None)()
-                if reason is not None and st.gate != "disabled":
-                    st.gate = "disabled"
+                if reason is not None and not st.disabled_logged:
+                    st.disabled_logged = True
                     print(
                         f"[wardex] parser disabled for {st.server_address}: {reason}",
                         file=sys.stderr,

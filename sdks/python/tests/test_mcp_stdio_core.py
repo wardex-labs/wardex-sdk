@@ -76,3 +76,32 @@ def test_no_detach_when_jsonrpc_seen():
     st = _ProcState()
     st.feed_request(b'{"jsonrpc":"2.0","id":1,"method":"a"}\n')
     assert st.should_detach() is False
+
+
+def test_proc_state_reports_disabled_reason_from_either_direction():
+    """_ProcState.disabled_reason() must surface a latch on either the
+    request or the response parser, mirroring _Http1Tracker's equivalent —
+    the JSON-RPC path must not keep the silent-failure mode that this slice
+    exists to remove."""
+    from wardex_sdk import CaptureLimits
+
+    limits = CaptureLimits(max_stream_buffer_bytes=64).to_native()
+
+    st_req = _ProcState(limits=limits)
+    assert st_req.disabled_reason() is None
+    st_req.feed_request(b"x" * 200)  # never a newline, past the 64-byte ceiling
+    assert st_req.disabled_reason() == "stream_buffer_exceeded"
+
+    st_resp = _ProcState(limits=limits)
+    assert st_resp.disabled_reason() is None
+    st_resp.feed_response(b"x" * 200)
+    assert st_resp.disabled_reason() == "stream_buffer_exceeded"
+
+
+def test_proc_state_constructor_default_uses_core_limits():
+    # No override → the core default ceiling (16 MiB) applies; 200 bytes must
+    # not trip it. Guards against a regression where `limits=None` stopped
+    # falling back to `JsonRpcParser`'s own default.
+    st = _ProcState()
+    st.feed_request(b"x" * 200)
+    assert st.disabled_reason() is None

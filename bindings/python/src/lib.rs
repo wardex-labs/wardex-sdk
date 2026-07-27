@@ -383,6 +383,17 @@ impl JsonRpcParser {
             .map(|inner| JsonRpcMessage { inner })
             .collect()
     }
+
+    /// Why the parser latched off, if it did. `None` while the stream is
+    /// still parsing normally.
+    fn disabled_reason(&self) -> Option<&'static str> {
+        self.inner.disabled_reason()
+    }
+
+    /// Bytes currently held awaiting a newline.
+    fn buffered_len(&self) -> usize {
+        self.inner.buffered_len()
+    }
 }
 
 /// Metadata for a single gRPC message (for Python exposure).

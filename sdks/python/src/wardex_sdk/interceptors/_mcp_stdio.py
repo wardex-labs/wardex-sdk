@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import json
+import sys
 import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -69,13 +70,20 @@ class _ProcState:
     # at install() time.
     SNIFF_LIMIT = _wardex_native.limits_defaults()["mcp_sniff_bytes"]
 
-    def __init__(self, sniff_limit: int | None = None) -> None:
+    def __init__(self, sniff_limit: int | None = None, limits: object | None = None) -> None:
         self._sniff_limit = sniff_limit if sniff_limit is not None else self.SNIFF_LIMIT
-        self._req = JsonRpcParser()
-        self._resp = JsonRpcParser()
+        self._req = JsonRpcParser(limits)
+        self._resp = JsonRpcParser(limits)
         self._latch: dict[str, _Pending] = {}
         self._req_bytes = 0
         self._msgs = 0
+        # Guards the once-per-stream debug log in McpStdioInterceptor — mirrors
+        # the seam's st.gate-adjacent dedupe for the HTTP/1 path, but on a
+        # field owned solely by this concern (nothing else reads or writes it).
+        self.disabled_logged = False
+
+    def disabled_reason(self) -> str | None:
+        return self._resp.disabled_reason() or self._req.disabled_reason()
 
     def feed_request(self, data: bytes) -> None:
         self._req_bytes += len(data)
@@ -188,6 +196,27 @@ def _build_mcp_span(p: _Pending, resp: Any) -> InternalSpan:
     )
 
 
+def _maybe_log_disabled(client: Client | None, state: _ProcState, pid: int | None) -> None:
+    """Debug-mode visibility for the JSON-RPC disable latch — mirrors
+    _seam.py's HTTP/1 equivalent. No span exists to carry a disable reason
+    (the whole point of the latch is that no message was ever parsed), so
+    this is the only way a caller can observe that an MCP stream stopped
+    being captured. Fires once per subprocess stream, not once per read.
+    """
+    try:
+        if client is None or not client.config.debug:
+            return
+        if state.disabled_logged:
+            return
+        reason = state.disabled_reason()
+        if reason is None:
+            return
+        state.disabled_logged = True
+        print(f"[wardex] json-rpc parser disabled (pid={pid}): {reason}", file=sys.stderr)
+    except Exception:  # noqa: BLE001 — debug-only logging must never break capture
+        pass
+
+
 class McpStdioInterceptor(InterceptorInterface):
     """Patches the anyio subprocess backend to capture MCP stdio (JSON-RPC) traffic.
 
@@ -202,6 +231,7 @@ class McpStdioInterceptor(InterceptorInterface):
         self._orig_cse: Any = None  # original asyncio.create_subprocess_exec
         self._asyncio_wrap_count: int = 0  # test-only counter: number of actual asyncio seam wraps
         self._sniff_limit: int = _ProcState.SNIFF_LIMIT
+        self._native_limits: Any = None
 
     def name(self) -> str:
         return "mcp_stdio"
@@ -215,6 +245,7 @@ class McpStdioInterceptor(InterceptorInterface):
         config = getattr(client, "config", None)
         lim = config.limits if config is not None else CaptureLimits()
         self._sniff_limit = lim.resolved()["mcp_sniff_bytes"]
+        self._native_limits = lim.to_native()
         try:
             self._orig_backend_desc = _aio_backend.AsyncIOBackend.__dict__["open_process"]
             orig_callable = _aio_backend.AsyncIOBackend.open_process  # bound classmethod
@@ -276,8 +307,9 @@ class McpStdioInterceptor(InterceptorInterface):
     def _wrap_proc(self, proc: Any) -> None:
         if getattr(proc, "stdin", None) is None or getattr(proc, "stdout", None) is None:
             return
-        state = _ProcState(self._sniff_limit)
+        state = _ProcState(self._sniff_limit, self._native_limits)
         client = self._client
+        pid = getattr(proc, "pid", None)
         stdin = proc.stdin
         stdout = proc.stdout
         _osend = stdin.send
@@ -286,6 +318,7 @@ class McpStdioInterceptor(InterceptorInterface):
         async def send(data: Any, *, _osend: Any = _osend, state: _ProcState = state) -> Any:
             try:
                 state.feed_request(bytes(data))
+                _maybe_log_disabled(client, state, pid)
                 if state.should_detach():
                     stdin.send = _osend  # non-MCP subprocess -> remove the tee
                     stdout.receive = _orecv
@@ -301,6 +334,7 @@ class McpStdioInterceptor(InterceptorInterface):
                 for span in state.feed_response(bytes(data)):
                     if client is not None:
                         client.capture_span(span)
+                _maybe_log_disabled(client, state, pid)
             except Exception:  # noqa: BLE001 — fail-silent
                 pass
             return data
@@ -321,8 +355,9 @@ class McpStdioInterceptor(InterceptorInterface):
         self._asyncio_wrap_count += (
             1  # counted when a wrap actually occurs (for verifying the dual-seam guard)
         )
-        state = _ProcState(self._sniff_limit)
+        state = _ProcState(self._sniff_limit, self._native_limits)
         client = self._client
+        pid = getattr(proc, "pid", None)
         writer = proc.stdin
         reader = proc.stdout
         _owrite = writer.write
@@ -331,6 +366,7 @@ class McpStdioInterceptor(InterceptorInterface):
         def write(data: Any, *, _owrite: Any = _owrite, state: _ProcState = state) -> Any:
             try:
                 state.feed_request(bytes(data))
+                _maybe_log_disabled(client, state, pid)
             except Exception:  # noqa: BLE001 — fail-silent
                 pass
             return _owrite(data)
@@ -341,6 +377,7 @@ class McpStdioInterceptor(InterceptorInterface):
                 for span in state.feed_response(bytes(data)):
                     if client is not None:
                         client.capture_span(span)
+                _maybe_log_disabled(client, state, pid)
             except Exception:  # noqa: BLE001 — fail-silent
                 pass
             return data
