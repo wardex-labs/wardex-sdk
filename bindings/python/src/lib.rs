@@ -64,6 +64,14 @@ impl RawHttpMessage {
     fn header_len(&self) -> usize {
         self.inner.header_len
     }
+    /// Capture-limitation markers the parser attached to this message (e.g.
+    /// `body_cap_exceeded`). Without this the host SDK cannot report that a
+    /// body was capped, and HTTP/1 would truncate silently while HTTP/2 does
+    /// not.
+    #[getter]
+    fn limitations(&self) -> Vec<&'static str> {
+        self.inner.limitations.clone()
+    }
 }
 
 /// A completed HTTP/2 transaction (for Python exposure).

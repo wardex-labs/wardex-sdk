@@ -447,6 +447,11 @@ class ParsedMessage:
     headers: tuple[tuple[str, str], ...] = ()
     body: bytes = b""
     header_len: int = 0
+    # True when the parser stored fewer body bytes than arrived. `limitations`
+    # says why (e.g. "body_cap_exceeded"); both travel to CaptureIntegrity so a
+    # capped body is visible to the user rather than silently short.
+    truncated: bool = False
+    limitations: tuple[str, ...] = ()
 
 
 # --- Callback protocols (concrete signatures instead of Callable) ---

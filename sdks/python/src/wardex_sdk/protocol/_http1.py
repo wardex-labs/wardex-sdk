@@ -18,6 +18,8 @@ def _to_parsed(raw: object) -> ParsedMessage:
         headers=tuple(tuple(h) for h in raw.headers),  # type: ignore[attr-defined]
         body=raw.body,  # type: ignore[attr-defined]
         header_len=raw.header_len,  # type: ignore[attr-defined]
+        truncated=raw.truncated,  # type: ignore[attr-defined]
+        limitations=tuple(raw.limitations),  # type: ignore[attr-defined]
     )
 
 

@@ -38,6 +38,18 @@ def _header_get(headers: object, name: str) -> str | None:
     return None
 
 
+def _merge_markers(*groups: tuple[str, ...]) -> tuple[str, ...]:
+    """Concatenate limitation markers, keeping first-seen order and dropping
+    duplicates. A request and a response that both hit the body cap describe
+    one limitation of the transaction, not two."""
+    out: list[str] = []
+    for group in groups:
+        for m in group:
+            if m not in out:
+                out.append(m)
+    return tuple(out)
+
+
 def _is_ws_upgrade_request(headers: object) -> bool:
     up = _header_get(headers, "upgrade")
     conn = _header_get(headers, "connection")
@@ -63,6 +75,10 @@ class _Txn:
     end_ns: int
     ttfb_ms: float
     truncated: bool = False
+    # Capture-limitation markers the protocol parser attached to this
+    # transaction (e.g. "body_cap_exceeded"), merged into the span's
+    # CaptureIntegrity.limitations by the seam.
+    limitations: tuple[str, ...] = ()
     version: str = "1.1"
     ttft_ms: float = 0.0
     content_type: str | None = None
@@ -92,6 +108,8 @@ class _Http1Tracker:
         self._method: str | None = None
         self._path: str | None = None
         self._req_body: bytes = b""
+        self._req_truncated: bool = False
+        self._req_limitations: tuple[str, ...] = ()
         self._req_start_ns: int = 0
         self._resp_first_ns: int = 0
         self._parent: SpanContext | None = None
@@ -108,6 +126,8 @@ class _Http1Tracker:
             self._method = msg.method
             self._path = msg.url
             self._req_body = msg.body
+            self._req_truncated = msg.truncated
+            self._req_limitations = msg.limitations
             if _is_ws_upgrade_request(msg.headers):
                 self._expect_ws = True
         return []
@@ -175,6 +195,8 @@ class _Http1Tracker:
                     start_ns=self._req_start_ns or now,
                     end_ns=now,
                     ttfb_ms=ttfb,
+                    truncated=self._req_truncated or msg.truncated,
+                    limitations=_merge_markers(self._req_limitations, msg.limitations),
                     version="1.1",
                     ttft_ms=ttft,
                 )
@@ -182,6 +204,8 @@ class _Http1Tracker:
             self._method = None
             self._path = None
             self._req_body = b""
+            self._req_truncated = False
+            self._req_limitations = ()
             self._req_start_ns = 0
             self._resp_first_ns = 0
             self._parent = None
