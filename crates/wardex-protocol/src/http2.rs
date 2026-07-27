@@ -347,6 +347,10 @@ impl Http2Connection {
             return;
         }
         let body = &payload[..payload.len() - pad_len];
+        // Raises the effective cap from the previous hardcoded 8 MiB to max_body_bytes
+        // (32 MiB by default), which is derived from the Anthropic Messages API request
+        // ceiling so a valid LLM request is never truncated. A later change makes this
+        // content-type aware; opaque bodies then take the much smaller opaque cap.
         let max_body = self.limits.max_body_bytes;
         {
             let st = self.streams.entry(frame.stream_id).or_default();
