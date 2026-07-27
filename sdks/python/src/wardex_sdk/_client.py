@@ -39,6 +39,49 @@ def _span_size(span: InternalSpan) -> int:
     return _SPAN_OVERHEAD_BYTES + len(span.input_data or b"") + len(span.output_data or b"")
 
 
+class _SpanBuffer:
+    """A span deque and its approximate byte total, folded into one object so
+    _drain() can only ever replace the *whole* pair via a single attribute
+    assignment (`self._buffer = ...`).
+
+    A prior design kept the deque and the byte total as two separate Client
+    attributes, guarded by an `if self._spans is spans:` identity check
+    before every counter update. That check and the update it guarded were
+    still two separate statements, and a reentrant drain landing between
+    them could invalidate the check's premise: the drain resets the counter
+    to 0 out from under a subtraction that already passed the check,
+    producing a negative total, or exports the just-appended span and resets
+    to 0 out from under an increment that already passed, producing an
+    overstated total. No amount of additional checking closes that gap,
+    because every check is itself a statement a drain can land after.
+
+    Folding spans+bytes into one object sidesteps the problem instead of
+    arguing around it: every mutation here (evict_oldest, append) is
+    unconditional and operates on *this* object's own fields. Whether or not
+    `self` is still the live `Client._buffer` by the time the mutation
+    returns is irrelevant, because nothing here ever depends on that -- an
+    eviction subtracts from the same object it popped from, so it can never
+    go negative; an append adds to the same object it appended to, so it can
+    never overstate. There is no separate counter left for a reentrant swap
+    to desynchronize.
+    """
+
+    __slots__ = ("spans", "bytes")
+
+    def __init__(self) -> None:
+        self.spans: deque[InternalSpan] = deque()
+        self.bytes = 0
+
+    def evict_oldest(self) -> InternalSpan:
+        evicted = self.spans.popleft()
+        self.bytes -= _span_size(evicted)
+        return evicted
+
+    def append(self, span: InternalSpan, size: int) -> None:
+        self.spans.append(span)
+        self.bytes += size
+
+
 class Client:
     def __init__(self, config: WardexConfig, transport: Transport) -> None:
         self._config = config
@@ -51,14 +94,14 @@ class Client:
         # flush() (and so re-enter _drain, and re-acquire the buffer lock) while
         # the main thread is already mid-append or mid-drain (manual flush() in
         # progress, or install()'s previous.close() during re-init). Every
-        # guarded block re-reads self._spans/self._snapshots fresh each time, so
+        # guarded block re-reads self._buffer/self._snapshots fresh each time, so
         # nested reentrant acquisition cannot corrupt or duplicate state — a
         # plain Lock would instead hang forever on that same-thread re-acquire.
         # Cross-thread serialization (the invariant these locks exist for) is
         # unchanged: RLock still blocks other threads until fully released.
         self._buffer_lock = threading.RLock()
         self._drain_lock = threading.RLock()
-        self._spans: deque[InternalSpan] = deque()
+        self._buffer = _SpanBuffer()
         self._snapshots: deque[InternalStateSnapshot] = deque()
         self._dropped = 0
         self._closed = False
@@ -66,7 +109,6 @@ class Client:
         limits = config.limits.resolved()
         self._max_buffer_spans = limits["max_buffer_spans"]
         self._max_buffer_bytes = limits["max_buffer_bytes"]
-        self._buffered_bytes = 0
         self._flush_threshold = max(1, self._max_buffer_spans // 4)
         self._worker = BatchWorker(
             lambda: self._drain(5.0), interval=config.flush_interval, debug=config.debug
@@ -76,6 +118,24 @@ class Client:
     @property
     def config(self) -> WardexConfig:
         return self._config
+
+    # -- test-only internal accessors -----------------------------------
+    # `_spans`/`_buffered_bytes` are not part of the public API; several
+    # tests read (and one, deliberately, swaps out) the resident deque to
+    # exercise reentrancy edge cases. Keeping these as thin properties over
+    # self._buffer preserves that surface without reintroducing a second,
+    # separately-swappable piece of state.
+    @property
+    def _spans(self) -> deque[InternalSpan]:
+        return self._buffer.spans
+
+    @_spans.setter
+    def _spans(self, value: deque[InternalSpan]) -> None:
+        self._buffer.spans = value
+
+    @property
+    def _buffered_bytes(self) -> int:
+        return self._buffer.bytes
 
     def capture_span(self, span: InternalSpan) -> None:
         if self._closed:
@@ -90,49 +150,55 @@ class Client:
             # Re-entrancy hazard: a same-thread signal handler can call
             # flush() (and so _drain()) between any two statements in this
             # block via the reentrant _buffer_lock (see the class-level
-            # comment on the lock). _drain() swaps self._spans for a fresh
-            # deque and resets self._buffered_bytes to 0. To stay correct
-            # across that swap:
-            #   - the walrus below re-reads self._spans into `spans` on
-            #     every loop condition check, and the loop body always pops
-            #     from that same `spans` local -- never a separately re-read
-            #     self._spans -- so a drain can never swap in an empty deque
-            #     between "checked non-empty" and "popped" (which would
-            #     otherwise raise IndexError on the empty deque);
-            #   - every counter update (_buffered_bytes, _dropped) is gated
-            #     on `self._spans is spans` -- if a drain interleaved, the
-            #     item we just popped belongs to a deque that's already been
-            #     handed off (exported), so its delta no longer applies to
-            #     the fresh buffer and is skipped rather than corrupting the
-            #     reset total.
-            #   - the final append always targets self._spans fresh (never
-            #     the loop-cached `spans` local) so the span itself is never
-            #     lost to an orphaned deque -- only the *counter* update is
-            #     gated on identity. If a drain fires before the append, the
-            #     span lands in the fresh deque and survives, but the
-            #     identity check (comparing against the pre-append `spans`)
-            #     correctly sees a mismatch and skips the increment: the
-            #     counter understates by one span's size until the next
-            #     drain resets it -- bounded and self-healing, never data
-            #     loss. If a drain fires after the append but before the
-            #     check, the span was already captured in the exported
-            #     batch, and skipping the increment is exactly correct (the
-            #     fresh buffer doesn't contain it, so 0 is exact). The
-            #     counter can therefore only ever understate, never overstate
-            #     or go negative, and the span is never dropped silently.
-            while (spans := self._spans) and (
-                len(spans) >= self._max_buffer_spans
-                or self._buffered_bytes + size > self._max_buffer_bytes
+            # comment on the lock). _drain() replaces self._buffer wholesale
+            # (see _SpanBuffer's docstring for why the deque and its byte
+            # total are folded into one object rather than two separately
+            # guarded attributes -- a prior version of this method used an
+            # `if self._spans is spans:` identity check before each counter
+            # update, but that check and the update were themselves two
+            # statements, and a drain landing between them could invalidate
+            # a check that had already passed, producing a negative or
+            # overstated total; reproduced and fixed, see git history and
+            # the tests below). With the fold:
+            #   - the walrus below re-reads self._buffer into `buf` on every
+            #     loop condition check, and the loop body always evicts from
+            #     that same `buf` local -- never a separately re-read
+            #     self._buffer -- so a drain can never swap in an empty
+            #     buffer between "checked non-empty" and "popped" (which
+            #     would otherwise raise IndexError);
+            #   - evict_oldest() and append() are unconditional: no identity
+            #     check guards them, because none is needed -- each mutates
+            #     only the object it was called on, which stays internally
+            #     coherent (spans and bytes always agree) whether or not
+            #     that object is still the live self._buffer by the time the
+            #     call returns. An eviction can never drive a *stale*
+            #     buffer's byte total negative, because the total and the
+            #     deque it describes are always the same object's own
+            #     fields;
+            #   - the final append resolves self._buffer fresh, right there
+            #     in the call, so the span lands in whatever buffer is live
+            #     at that statement, never one read earlier and orphaned by
+            #     an intervening drain.
+            # What's NOT eliminated: a window narrower than one statement,
+            # between resolving self._buffer for that trailing call and
+            # _SpanBuffer.append's own first line running. A drain landing
+            # exactly there still exports without our span, and the append
+            # then lands in the (already-exported, now orphaned) pre-drain
+            # buffer -- the span is captured by neither self._buffer nor the
+            # export that just happened, and only reaches the wire at the
+            # *next* drain if nothing else evicts it first. This is the same
+            # class of bytecode-internal, no-second-line gap already present
+            # in self._snapshots.append() below and in the pre-byte-budget
+            # code; it cannot be closed further without giving up per-thread
+            # signal-handler reentrancy entirely.
+            while (buf := self._buffer).spans and (
+                len(buf.spans) >= self._max_buffer_spans
+                or buf.bytes + size > self._max_buffer_bytes
             ):
-                evicted = spans.popleft()
-                evicted_size = _span_size(evicted)
-                if self._spans is spans:
-                    self._buffered_bytes -= evicted_size
-                    self._dropped += 1
-            self._spans.append(span)
-            if self._spans is spans:
-                self._buffered_bytes += size
-            should_wake = len(self._spans) >= self._flush_threshold
+                buf.evict_oldest()
+                self._dropped += 1
+            self._buffer.append(span, size)
+            should_wake = len(self._buffer.spans) >= self._flush_threshold
         if should_wake:
             self._worker.wake()
 
@@ -164,10 +230,10 @@ class Client:
         """
         with self._drain_lock:
             with self._buffer_lock:
-                spans, self._spans = self._spans, deque()
+                buf, self._buffer = self._buffer, _SpanBuffer()
+                spans = buf.spans
                 snapshots, self._snapshots = self._snapshots, deque()
                 dropped, self._dropped = self._dropped, 0
-                self._buffered_bytes = 0
             # -- lock-free from here (buffer lock released; new captures flow) --
             if dropped and self._config.debug:
                 print(f"[wardex] dropped {dropped} spans (buffer full)", file=sys.stderr)
