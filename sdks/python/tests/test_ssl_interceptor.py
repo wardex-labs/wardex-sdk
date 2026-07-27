@@ -227,23 +227,98 @@ class _DebugRecordingClient:
 
 
 def test_disabled_reason_logged_once_per_connection_in_debug(capsys):
-    # Non-HTTP TLS traffic (the Redis/Mongo/Kafka-over-TLS incident this task
-    # exists to guard against) latches the tracker off. No span is ever
-    # produced to carry the reason, so debug mode logs it instead — exactly
-    # once per connection, not once per subsequent read that keeps arriving
-    # and keeps being discarded by the already-latched parser.
+    # Pure non-HTTP traffic (Redis/Mongo/Kafka-over-TLS) no longer reaches the
+    # parser at all — the seam gate (this task) stops it first, before
+    # anything is fed to the tracker. See
+    # test_non_http_tls_traffic_produces_no_log below for that property.
+    #
+    # So reaching the parser's own disable-latch through the seam now requires
+    # traffic that *passes* the gate: a real request line classifies the
+    # connection "http", and only then does a response the parser refuses to
+    # keep parsing latch it off. Here the response carries more headers than
+    # the parser will track (`max_headers`, default 96) — real HTTP we
+    # deliberately stop parsing rather than let grow unbounded, which is
+    # exactly the "headers_exceeded" reason. No span is ever produced to
+    # carry the reason (the whole point of the latch is that no message was
+    # ever completed), so debug mode logs it instead — exactly once per
+    # connection, not once per subsequent read that keeps arriving and keeps
+    # being discarded by the already-latched parser.
     interceptor = SSLInterceptor()
     interceptor._client = _DebugRecordingClient()
     obj = object()  # no getpeername/selected_alpn_protocol → falls back in _peer/_select_tracker
+    interceptor._on_request_bytes(obj, b"POST /v1/messages HTTP/1.1\r\nContent-Length: 0\r\n\r\n")
+    too_many_headers = (
+        b"HTTP/1.1 200 OK\r\n" + b"".join(f"X-{i}: v\r\n".encode() for i in range(100)) + b"\r\n"
+    )
+
+    interceptor._on_response_bytes(obj, too_many_headers)
+    interceptor._on_response_bytes(obj, too_many_headers)
+    interceptor._on_response_bytes(obj, too_many_headers)
+
+    err = capsys.readouterr().err
+    assert err.count("[wardex] parser disabled for") == 1
+    assert "headers_exceeded" in err
+
+
+def test_non_http_tls_traffic_produces_no_log(capsys):
+    """Layering check: pure non-HTTP traffic is stopped by the seam gate
+    before it ever reaches the parser, so the parser's own disable-latch
+    (exercised above via headers_exceeded, on traffic that passes the gate)
+    is never even reached here — no parser-level disabled_reason, and
+    therefore no debug log either. This is the property the test above used
+    to cover by accident, before the gate existed; now it is pinned directly."""
+    interceptor = SSLInterceptor()
+    interceptor._client = _DebugRecordingClient()
+    obj = object()
     not_http = b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n"
 
     interceptor._on_response_bytes(obj, not_http)
     interceptor._on_response_bytes(obj, not_http)
     interceptor._on_response_bytes(obj, not_http)
 
-    err = capsys.readouterr().err
-    assert err.count("[wardex] parser disabled for") == 1
-    assert "not_http" in err
+    st = interceptor._conns[id(obj)]
+    assert st.gate == "ignore"
+    assert st.tracker.disabled_reason() is None  # the tracker was never fed
+    assert capsys.readouterr().err == ""
+
+
+def test_non_http_tls_traffic_is_not_parsed(fake_ssl_socket, installed_ssl_interceptor):
+    """Redis over TLS must never reach the HTTP parser."""
+    itc = installed_ssl_interceptor
+    sock = fake_ssl_socket(alpn=None)
+    itc._on_request_bytes(sock, b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n")
+    st = itc._conns[id(sock)]
+    assert st.gate == "ignore"
+
+
+def test_https_request_is_parsed(fake_ssl_socket, installed_ssl_interceptor):
+    itc = installed_ssl_interceptor
+    sock = fake_ssl_socket(alpn="http/1.1")
+    itc._on_request_bytes(sock, b"POST /v1/messages HTTP/1.1\r\nContent-Length: 0\r\n\r\n")
+    assert itc._conns[id(sock)].gate == "http"
+
+
+def test_alpn_h2_is_trusted(fake_ssl_socket, installed_ssl_interceptor):
+    itc = installed_ssl_interceptor
+    sock = fake_ssl_socket(alpn="h2")
+    itc._on_request_bytes(sock, b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+    assert itc._conns[id(sock)].gate == "h2"
+
+
+def test_connect_proxy_is_recognised(fake_ssl_socket, installed_ssl_interceptor):
+    """A proxied connection opens with CONNECT, which was missing from the list."""
+    itc = installed_ssl_interceptor
+    sock = fake_ssl_socket(alpn=None)
+    itc._on_request_bytes(sock, b"CONNECT api.anthropic.com:443 HTTP/1.1\r\n\r\n")
+    assert itc._conns[id(sock)].gate == "http"
+
+
+def test_server_first_protocol_is_ignored(fake_ssl_socket, installed_ssl_interceptor):
+    """A response arriving before any request means we cannot classify it."""
+    itc = installed_ssl_interceptor
+    sock = fake_ssl_socket(alpn=None)
+    itc._on_response_bytes(sock, b"\x00\x00\x00\x08postgres-greeting")
+    assert itc._conns[id(sock)].gate == "ignore"
 
 
 def test_disabled_reason_not_logged_without_debug(capsys):

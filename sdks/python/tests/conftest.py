@@ -149,6 +149,58 @@ def h2_server():
             pass
 
 
+class _FakeSSLSocket:
+    """Minimal ssl.SSLSocket-shaped stub for driving SSLInterceptor._gate in
+    isolation, without a real TLS handshake. Only exposes what the seam
+    actually touches: the negotiated ALPN protocol, the peer address (for
+    _peer()), and a file descriptor (for the connection-timing store)."""
+
+    def __init__(self, alpn: str | None) -> None:
+        self._alpn = alpn
+
+    def selected_alpn_protocol(self) -> str | None:
+        return self._alpn
+
+    def getpeername(self) -> tuple[str, int]:
+        return ("127.0.0.1", 443)
+
+    def fileno(self) -> int:
+        return -1
+
+
+@pytest.fixture
+def fake_ssl_socket():
+    """Factory: fake_ssl_socket(alpn=...) -> a fresh _FakeSSLSocket stub."""
+
+    def _make(alpn: str | None = None) -> _FakeSSLSocket:
+        return _FakeSSLSocket(alpn)
+
+    return _make
+
+
+@pytest.fixture
+def installed_ssl_interceptor():
+    """A bare SSLInterceptor with `_client` set, bypassing the real
+    ssl.SSLSocket monkeypatch — tests drive `_on_request_bytes`/
+    `_on_response_bytes` directly against fake sockets."""
+    from wardex_sdk.interceptors._ssl import SSLInterceptor
+
+    class _Config:
+        debug = False
+
+    class _RecordingClient:
+        def __init__(self) -> None:
+            self.config = _Config()
+            self.spans: list[object] = []
+
+        def capture_span(self, span: object) -> None:
+            self.spans.append(span)
+
+    itc = SSLInterceptor()
+    itc._client = _RecordingClient()
+    return itc
+
+
 @pytest.fixture
 def sse_tls_server():
     """Streams OpenAI-shaped SSE (text/event-stream) as chunked. Delays after

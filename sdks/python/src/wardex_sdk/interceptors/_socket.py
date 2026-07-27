@@ -21,7 +21,17 @@ from ._trackers import _Http1Tracker, _Http2Tracker
 if TYPE_CHECKING:
     from .._client import Client
 
-_HTTP_METHODS = (b"GET ", b"POST ", b"PUT ", b"DELETE ", b"HEAD ", b"PATCH ", b"OPTIONS ")
+_HTTP_METHODS = (
+    b"GET ",
+    b"POST ",
+    b"PUT ",
+    b"DELETE ",
+    b"HEAD ",
+    b"PATCH ",
+    b"OPTIONS ",
+    b"CONNECT ",  # proxied connections open with this
+    b"TRACE ",
+)
 
 # HTTP/2 connection preface (prior-knowledge h2c). TLS h2 sends the same bytes.
 _H2_PREFACE = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"

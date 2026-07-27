@@ -19,6 +19,7 @@ from ._seam import (
     _build_grpc_fields,  # backward-compat re-export (keeps the existing test import path)
     _ConnectionState,
 )
+from ._socket import _H2_PREFACE, _HTTP_METHODS
 from ._trackers import _Http1Tracker, _Http2Tracker, _WebSocketTracker
 
 if TYPE_CHECKING:
@@ -73,6 +74,40 @@ class SSLInterceptor(ByteSeamInterceptor):
         except Exception:
             pass
         return _Http1Tracker(self._native_limits)
+
+    def _gate(self, st: _ConnectionState, data: bytes, phase: str) -> bool:
+        """Sniff-latch: classify the connection once, from the first request bytes.
+
+        Without this, every ssl.SSLSocket in the process — a TLS-backed Redis,
+        Mongo, or Kafka client included — streams into the HTTP parser and
+        accumulates there for the life of the connection (the plaintext seam
+        has had this protection since it shipped; this ports it to TLS).
+
+        ALPN is trusted first when present: the handshake already negotiated
+        the protocol, so there is nothing to sniff. This matters because
+        `send`/`write` may be called again after the h2 connection preface has
+        already gone out, so requiring the preface to reappear in every call
+        would misclassify a healthy h2 connection. `_select_tracker` already
+        picked an _Http2Tracker from ALPN, so checking the tracker type here
+        reuses that decision instead of re-deriving it.
+
+        Otherwise the first request bytes decide, mirroring the plaintext seam:
+        a response arriving before any request means the peer spoke first (a
+        server-first protocol such as Postgres/MySQL over TLS), which cannot
+        be classified, so it is ignored.
+        """
+        if st.gate is None:
+            if isinstance(st.tracker, _Http2Tracker):
+                st.gate = "h2"
+            elif phase != "request":
+                st.gate = "ignore"
+            elif data.startswith(_H2_PREFACE):
+                st.gate = "h2"
+            elif data.startswith(_HTTP_METHODS):
+                st.gate = "http"
+            else:
+                st.gate = "ignore"
+        return st.gate in ("http", "h2")
 
     # --- send family (request) ---
 
