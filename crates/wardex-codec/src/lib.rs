@@ -17,11 +17,9 @@ pub mod proto {
 pub mod otlp;
 
 use prost::Message;
+use wardex_limits::Limits;
 
 use crate::proto::wardex::v1 as pb;
-
-/// zstd compression level (default balancing speed/ratio). Making this configurable is a follow-up.
-pub const ZSTD_LEVEL: i32 = 3;
 
 #[derive(Debug)]
 pub enum CodecError {
@@ -43,9 +41,9 @@ impl std::fmt::Display for CodecError {
 impl std::error::Error for CodecError {}
 
 /// Envelope → protobuf serialize → zstd compress.
-pub fn encode_envelope(env: &pb::Envelope) -> Result<Vec<u8>, CodecError> {
+pub fn encode_envelope(env: &pb::Envelope, limits: Limits) -> Result<Vec<u8>, CodecError> {
     let proto_bytes = env.encode_to_vec();
-    zstd::stream::encode_all(&proto_bytes[..], ZSTD_LEVEL).map_err(CodecError::Compress)
+    zstd::stream::encode_all(&proto_bytes[..], limits.zstd_level).map_err(CodecError::Compress)
 }
 
 /// zstd decompress → protobuf deserialize → Envelope.
@@ -93,7 +91,7 @@ mod tests {
     #[test]
     fn roundtrip_preserves_envelope() {
         let env = sample();
-        let back = decode_envelope(&encode_envelope(&env).unwrap()).unwrap();
+        let back = decode_envelope(&encode_envelope(&env, Limits::default()).unwrap()).unwrap();
         assert_eq!(env, back);
     }
 
@@ -101,14 +99,14 @@ mod tests {
     fn encode_is_deterministic() {
         let env = sample();
         assert_eq!(
-            encode_envelope(&env).unwrap(),
-            encode_envelope(&env).unwrap()
+            encode_envelope(&env, Limits::default()).unwrap(),
+            encode_envelope(&env, Limits::default()).unwrap()
         );
     }
 
     #[test]
     fn zstd_compresses_repetitive_bodies() {
-        let bytes = encode_envelope(&sample()).unwrap();
+        let bytes = encode_envelope(&sample(), Limits::default()).unwrap();
         assert!(
             bytes.len() < 2000,
             "expected compression, got {} bytes",

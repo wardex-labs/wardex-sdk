@@ -1,12 +1,8 @@
 //! WebSocket (RFC 6455) incremental frame parser (library/transport-layer agnostic).
 //! For one direction (client or server) of a stream. Handles split arrival, multiple frames, and fragment reassembly.
-//! Content samples are kept only up to WS_SAMPLE_CAP per message (the per-direction cumulative cap is owned by the caller).
+//! Content samples are kept only up to the configured sample cap per message (the per-direction cumulative cap is owned by the caller).
 
-/// Sample cap for a single reassembled message (memory bound). The per-direction cumulative total is owned by the Python tracker.
-pub const WS_SAMPLE_CAP: usize = 64 * 1024;
-
-/// Max payload a single frame may claim on the wire. If exceeded, parsing for that connection is disabled (memory defense).
-const MAX_WS_FRAME: u64 = 1024 * 1024;
+use wardex_limits::Limits;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WsOpcode {
@@ -57,7 +53,7 @@ pub struct WsFrame {
 #[derive(Default)]
 pub struct WsFeedResult {
     pub frames: Vec<WsFrame>,
-    pub messages: Vec<Vec<u8>>, // reassembled messages (single message ≤ WS_SAMPLE_CAP)
+    pub messages: Vec<Vec<u8>>, // reassembled messages (single message ≤ the configured sample cap)
 }
 
 enum ParseStep {
@@ -71,21 +67,23 @@ pub struct WsParser {
     frag_opcode: Option<WsOpcode>,
     frag_payload: Vec<u8>,
     disabled: bool,
+    limits: Limits,
 }
 
 impl Default for WsParser {
     fn default() -> Self {
-        Self::new()
+        Self::new(Limits::default())
     }
 }
 
 impl WsParser {
-    pub fn new() -> Self {
+    pub fn new(limits: Limits) -> Self {
         Self {
             buf: Vec::new(),
             frag_opcode: None,
             frag_payload: Vec::new(),
             disabled: false,
+            limits,
         }
     }
 
@@ -146,7 +144,7 @@ impl WsParser {
         };
 
         // Oversized frame defense — blocks unbounded buffering.
-        if payload_len > MAX_WS_FRAME {
+        if payload_len > self.limits.max_ws_frame_bytes as u64 {
             return ParseStep::Error;
         }
 
@@ -169,7 +167,7 @@ impl WsParser {
 
         // Unmask — copy separately only up to the sample cap (wire length is preserved in payload_len).
         let raw = &self.buf[offset..offset + plen];
-        let take = plen.min(WS_SAMPLE_CAP);
+        let take = plen.min(self.limits.ws_sample_bytes);
         let mut payload = Vec::with_capacity(take);
         if let Some(k) = mask_key {
             for (i, &byte) in raw[..take].iter().enumerate() {
@@ -218,7 +216,10 @@ impl WsParser {
     }
 
     fn append_frag(&mut self, payload: &[u8]) {
-        let room = WS_SAMPLE_CAP.saturating_sub(self.frag_payload.len());
+        let room = self
+            .limits
+            .ws_sample_bytes
+            .saturating_sub(self.frag_payload.len());
         let take = payload.len().min(room);
         self.frag_payload.extend_from_slice(&payload[..take]);
     }
@@ -256,7 +257,7 @@ mod tests {
 
     #[test]
     fn parses_unmasked_text() {
-        let mut p = WsParser::new();
+        let mut p = WsParser::new(Limits::default());
         let r = p.feed(&frame(true, 0x1, None, b"hello"));
         assert_eq!(r.frames.len(), 1);
         assert_eq!(r.frames[0].opcode, WsOpcode::Text);
@@ -267,7 +268,7 @@ mod tests {
 
     #[test]
     fn unmasks_client_frame() {
-        let mut p = WsParser::new();
+        let mut p = WsParser::new(Limits::default());
         let r = p.feed(&frame(true, 0x1, Some([0x01, 0x02, 0x03, 0x04]), b"hello"));
         assert_eq!(r.messages, vec![b"hello".to_vec()]);
         assert!(r.frames[0].masked);
@@ -275,7 +276,7 @@ mod tests {
 
     #[test]
     fn reassembles_fragmented_message() {
-        let mut p = WsParser::new();
+        let mut p = WsParser::new(Limits::default());
         let mut buf = frame(false, 0x1, None, b"he"); // text, FIN=0
         buf.extend(frame(false, 0x0, None, b"ll")); // continuation, FIN=0
         buf.extend(frame(true, 0x0, None, b"o")); // continuation, FIN=1
@@ -285,7 +286,7 @@ mod tests {
 
     #[test]
     fn handles_split_arrival() {
-        let mut p = WsParser::new();
+        let mut p = WsParser::new(Limits::default());
         let raw = frame(true, 0x2, None, b"abcdef"); // binary
         assert!(p.feed(&raw[..3]).frames.is_empty());
         let r = p.feed(&raw[3..]);
@@ -295,7 +296,7 @@ mod tests {
 
     #[test]
     fn extracts_close_code() {
-        let mut p = WsParser::new();
+        let mut p = WsParser::new(Limits::default());
         // close payload: 2-byte code (1000=normal) + reason
         let mut payload = 1000u16.to_be_bytes().to_vec();
         payload.extend_from_slice(b"bye");
@@ -308,7 +309,7 @@ mod tests {
 
     #[test]
     fn ping_pong_are_not_messages() {
-        let mut p = WsParser::new();
+        let mut p = WsParser::new(Limits::default());
         let mut buf = frame(true, 0x9, None, b"p"); // ping
         buf.extend(frame(true, 0xA, None, b"p")); // pong
         let r = p.feed(&buf);
@@ -320,8 +321,8 @@ mod tests {
 
     #[test]
     fn oversize_frame_disables() {
-        let mut p = WsParser::new();
-        // claim a 64-bit length that exceeds MAX_WS_FRAME
+        let mut p = WsParser::new(Limits::default());
+        // claim a 64-bit length that exceeds the configured max WS frame size
         let mut hdr = vec![0x82u8, 127];
         hdr.extend_from_slice(&(2 * 1024 * 1024u64).to_be_bytes());
         let r = p.feed(&hdr);
@@ -331,10 +332,25 @@ mod tests {
 
     #[test]
     fn sample_capped_but_length_counted() {
-        let mut p = WsParser::new();
-        let big = vec![b'x'; WS_SAMPLE_CAP + 100];
+        let mut p = WsParser::new(Limits::default());
+        let big = vec![b'x'; Limits::default().ws_sample_bytes + 100];
         let r = p.feed(&frame(true, 0x2, None, &big));
-        assert_eq!(r.frames[0].payload_len, (WS_SAMPLE_CAP + 100) as u64); // full wire length
-        assert_eq!(r.messages[0].len(), WS_SAMPLE_CAP); // sample only up to the cap
+        assert_eq!(
+            r.frames[0].payload_len,
+            (Limits::default().ws_sample_bytes + 100) as u64
+        ); // full wire length
+        assert_eq!(r.messages[0].len(), Limits::default().ws_sample_bytes); // sample only up to the cap
+    }
+
+    #[test]
+    fn frame_cap_comes_from_limits() {
+        let limits = Limits {
+            max_ws_frame_bytes: 2,
+            ..Default::default()
+        };
+        let mut s = WsParser::new(limits);
+        // 5-byte payload text frame, unmasked
+        let r = s.feed(b"\x81\x05hello");
+        assert!(r.frames.is_empty(), "frame above the cap must be rejected");
     }
 }

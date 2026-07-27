@@ -16,6 +16,7 @@ use wardex_core::codec::otlp::{self, otlp_pb};
 use wardex_core::codec::proto::wardex::v1 as pb;
 use wardex_core::codec::{decode_envelope, encode_envelope};
 use wardex_core::pipeline::pii;
+use wardex_limits::Limits;
 
 // --- getattr helpers ---
 
@@ -1099,7 +1100,8 @@ fn encode_envelope_py(
     // keep running while the batch worker encodes (design §9).
     let bytes = py.allow_threads(|| -> PyResult<Vec<u8>> {
         pii_apply_envelope(&mut proto, pii_mode, &pii_disabled)?;
-        encode_envelope(&proto).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+        encode_envelope(&proto, Limits::default())
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
     })?;
     Ok(PyBytes::new_bound(py, &bytes).unbind())
 }

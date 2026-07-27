@@ -17,6 +17,7 @@ use wardex_core::protocol::semantic::{parse_llm, LlmSemantics as CoreLlmSemantic
 use wardex_core::protocol::websocket::{
     WsFeedResult as CoreWsFeedResult, WsFrame as CoreWsFrame, WsParser as CoreWsParser,
 };
+use wardex_limits::Limits;
 
 /// A single parsed HTTP message (for Python exposure).
 #[pyclass]
@@ -125,7 +126,7 @@ impl Http2Parser {
     #[new]
     fn new() -> Self {
         Self {
-            inner: Http2Connection::new(),
+            inner: Http2Connection::new(Limits::default()),
         }
     }
 
@@ -151,7 +152,7 @@ impl Http1Parser {
     #[new]
     fn new(is_request: bool) -> Self {
         Self {
-            inner: Http1Stream::new(is_request),
+            inner: Http1Stream::new(is_request, Limits::default()),
         }
     }
 
@@ -358,7 +359,7 @@ impl JsonRpcParser {
     #[new]
     fn new() -> Self {
         Self {
-            inner: JsonRpcStream::new(),
+            inner: JsonRpcStream::new(Limits::default()),
         }
     }
 
@@ -478,7 +479,7 @@ impl WsParser {
     #[new]
     fn new() -> Self {
         Self {
-            inner: CoreWsParser::new(),
+            inner: CoreWsParser::new(Limits::default()),
         }
     }
     fn feed(&mut self, data: &[u8]) -> WsFeedResult {
@@ -626,7 +627,7 @@ fn grpc_status_name(code: i32) -> &'static str {
 
 #[pyfunction]
 fn parse_llm_semantics(host: &str, path: &str, req: &[u8], resp: &[u8]) -> Option<LlmSemantics> {
-    parse_llm(host, path, req, resp).map(|inner| LlmSemantics { inner })
+    parse_llm(host, path, req, resp, Limits::default()).map(|inner| LlmSemantics { inner })
 }
 
 #[pymodule]

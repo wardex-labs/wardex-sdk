@@ -12,6 +12,7 @@ prost       = { workspace = true }
 prost-types = { workspace = true }
 bytes       = { workspace = true }
 zstd        = { workspace = true }
+wardex-limits = { workspace = true }
 
 [build-dependencies]
 prost-build           = { workspace = true }

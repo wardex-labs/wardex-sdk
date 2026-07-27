@@ -14,3 +14,4 @@ crate-type = ["cdylib"]
 [dependencies]
 pyo3               = { workspace = true }
 wardex-core        = { path = "../../crates/wardex-core" }
+wardex-limits      = { workspace = true }

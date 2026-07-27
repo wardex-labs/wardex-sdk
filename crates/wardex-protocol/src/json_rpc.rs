@@ -2,6 +2,7 @@
 //! MCP-agnostic, pyo3-free. params/result/error are preserved as raw JSON bytes (semantic extraction happens upstream).
 
 use serde_json::Value;
+use wardex_limits::Limits;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JsonRpcKind {
@@ -25,11 +26,17 @@ pub struct JsonRpcMessage {
 #[derive(Default)]
 pub struct JsonRpcStream {
     buf: Vec<u8>,
+    // Stored but not yet enforced — a later task adds a buffer-size ceiling for this stream.
+    #[allow(dead_code)]
+    limits: Limits,
 }
 
 impl JsonRpcStream {
-    pub fn new() -> Self {
-        Self { buf: Vec::new() }
+    pub fn new(limits: Limits) -> Self {
+        Self {
+            buf: Vec::new(),
+            limits,
+        }
     }
 
     /// Accumulates bytes and returns zero or more completed (newline-terminated) JSON-RPC messages. Non-JSON-RPC lines are skipped.
@@ -106,7 +113,7 @@ mod tests {
     use super::*;
 
     fn one(line: &str) -> JsonRpcMessage {
-        let mut s = JsonRpcStream::new();
+        let mut s = JsonRpcStream::new(Limits::default());
         let mut v = s.feed(line.as_bytes());
         assert_eq!(v.len(), 1, "exactly 1 message");
         v.pop().unwrap()
@@ -157,7 +164,7 @@ mod tests {
 
     #[test]
     fn handles_split_arrival() {
-        let mut s = JsonRpcStream::new();
+        let mut s = JsonRpcStream::new(Limits::default());
         assert_eq!(s.feed(b"{\"jsonrpc\":\"2.0\",\"id\":1,").len(), 0);
         let v = s.feed(b"\"method\":\"a\"}\n");
         assert_eq!(v.len(), 1);
@@ -166,7 +173,7 @@ mod tests {
 
     #[test]
     fn handles_multiple_and_crlf() {
-        let mut s = JsonRpcStream::new();
+        let mut s = JsonRpcStream::new(Limits::default());
         let v = s.feed(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"a\"}\r\n{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"b\"}\n");
         assert_eq!(v.len(), 2);
         assert_eq!(v[0].id.as_deref(), Some("1"));
@@ -175,7 +182,7 @@ mod tests {
 
     #[test]
     fn skips_malformed_and_non_jsonrpc_lines() {
-        let mut s = JsonRpcStream::new();
+        let mut s = JsonRpcStream::new(Limits::default());
         // non-JSON line + not a jsonrpc shape (an object but missing method/result/error) → skipped, no panic
         let v = s.feed(
             b"not json at all\n{\"hello\":1}\n{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"c\"}\n",

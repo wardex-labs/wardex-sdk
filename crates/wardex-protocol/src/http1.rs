@@ -1,7 +1,7 @@
 //! Incremental HTTP/1.x parser — the destination the SSL interceptor streams plaintext bytes into.
 //! Parses headers with httparse and handles Content-Length / chunked body boundaries directly.
 
-const MAX_HEADERS: usize = 96;
+use wardex_limits::Limits;
 
 /// A single parsed HTTP message (request or response).
 #[derive(Debug, Clone)]
@@ -21,6 +21,7 @@ pub struct ParsedHttp {
 pub struct Http1Stream {
     buf: Vec<u8>,
     is_request: bool,
+    limits: Limits,
 }
 
 enum Framing {
@@ -30,10 +31,11 @@ enum Framing {
 }
 
 impl Http1Stream {
-    pub fn new(is_request: bool) -> Self {
+    pub fn new(is_request: bool, limits: Limits) -> Self {
         Self {
             buf: Vec::new(),
             is_request,
+            limits,
         }
     }
 
@@ -53,7 +55,7 @@ impl Http1Stream {
 
     /// Called on connection close — carves off a truncated response whose headers arrived but had no body boundary.
     pub fn flush_truncated(&mut self) -> Option<ParsedHttp> {
-        let mut headers = [httparse::EMPTY_HEADER; MAX_HEADERS];
+        let mut headers = vec![httparse::EMPTY_HEADER; self.limits.max_headers];
         if self.is_request {
             return None;
         }
@@ -72,7 +74,7 @@ impl Http1Stream {
     }
 
     fn try_parse_one(&self) -> Option<(ParsedHttp, usize)> {
-        let mut headers = [httparse::EMPTY_HEADER; MAX_HEADERS];
+        let mut headers = vec![httparse::EMPTY_HEADER; self.limits.max_headers];
         let (header_len, mut msg) = if self.is_request {
             let mut req = httparse::Request::new(&mut headers);
             match req.parse(&self.buf) {
@@ -225,7 +227,7 @@ mod tests {
     #[test]
     fn parses_complete_request_with_body() {
         let raw = b"POST /v1/messages HTTP/1.1\r\nHost: api.x\r\nContent-Length: 7\r\n\r\nhello!!";
-        let mut s = Http1Stream::new(true);
+        let mut s = Http1Stream::new(true, Limits::default());
         let msgs = s.feed(raw);
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].method.as_deref(), Some("POST"));
@@ -236,7 +238,7 @@ mod tests {
     #[test]
     fn parses_complete_response_with_content_length() {
         let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi";
-        let mut s = Http1Stream::new(false);
+        let mut s = Http1Stream::new(false, Limits::default());
         let msgs = s.feed(raw);
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].status, Some(200));
@@ -246,7 +248,7 @@ mod tests {
     #[test]
     fn parses_chunked_response() {
         let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n";
-        let mut s = Http1Stream::new(false);
+        let mut s = Http1Stream::new(false, Limits::default());
         let msgs = s.feed(raw);
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].body, b"hello world");
@@ -254,7 +256,7 @@ mod tests {
 
     #[test]
     fn handles_split_arrival() {
-        let mut s = Http1Stream::new(false);
+        let mut s = Http1Stream::new(false, Limits::default());
         assert_eq!(s.feed(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n").len(), 0);
         assert_eq!(s.feed(b"\r\nhel").len(), 0);
         let msgs = s.feed(b"lo");
@@ -265,7 +267,7 @@ mod tests {
     #[test]
     fn handles_keep_alive_two_messages() {
         let raw = b"GET /a HTTP/1.1\r\nContent-Length: 0\r\n\r\nGET /b HTTP/1.1\r\nContent-Length: 0\r\n\r\n";
-        let mut s = Http1Stream::new(true);
+        let mut s = Http1Stream::new(true, Limits::default());
         let msgs = s.feed(raw);
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0].path.as_deref(), Some("/a"));
@@ -274,7 +276,7 @@ mod tests {
 
     #[test]
     fn malformed_yields_no_messages_without_panic() {
-        let mut s = Http1Stream::new(false);
+        let mut s = Http1Stream::new(false, Limits::default());
         // not valid HTTP, so zero completed messages (without panicking)
         assert_eq!(s.feed(b"this is not http \x00\x01\x02").len(), 0);
     }
@@ -283,7 +285,7 @@ mod tests {
     fn chunked_response_with_trailer_fields() {
         // chunked response with trailer headers — only the body should be decoded, and the trailer should be consumed
         let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\nX-Trace: abc\r\n\r\n";
-        let mut s = Http1Stream::new(false);
+        let mut s = Http1Stream::new(false, Limits::default());
         let msgs = s.feed(raw);
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].body, b"hello");
@@ -294,7 +296,7 @@ mod tests {
         // after a chunked response with a trailer, the next keep-alive message should parse correctly
         let mut buf = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\nX-Trace: abc\r\n\r\n".to_vec();
         buf.extend_from_slice(b"HTTP/1.1 201 Created\r\nContent-Length: 2\r\n\r\nok");
-        let mut s = Http1Stream::new(false);
+        let mut s = Http1Stream::new(false, Limits::default());
         let msgs = s.feed(&buf);
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0].body, b"hello");
@@ -305,7 +307,7 @@ mod tests {
     #[test]
     fn flush_truncated_returns_partial_body() {
         // a response with neither Content-Length nor chunked → flush on close
-        let mut s = Http1Stream::new(false);
+        let mut s = Http1Stream::new(false, Limits::default());
         assert_eq!(
             s.feed(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\npartial")
                 .len(),
@@ -320,7 +322,7 @@ mod tests {
     #[test]
     fn exposes_header_len_for_response() {
         let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi";
-        let mut s = Http1Stream::new(false);
+        let mut s = Http1Stream::new(false, Limits::default());
         let msgs = s.feed(raw);
         assert_eq!(msgs.len(), 1);
         // end of headers (right after the blank line \r\n\r\n) = the offset where "hi" starts
@@ -338,7 +340,7 @@ mod tests {
         let header_only_len = raw.len();
         raw.extend_from_slice(ws_frame);
 
-        let mut s = Http1Stream::new(false);
+        let mut s = Http1Stream::new(false, Limits::default());
         let msgs = s.feed(&raw);
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].status, Some(101));
@@ -351,11 +353,23 @@ mod tests {
     fn emits_204_no_content_without_content_length() {
         // RFC 7230 §3.3.3: 204 has no body → must be emitted immediately even without Content-Length.
         let raw = b"HTTP/1.1 204 No Content\r\nX-Request-Id: abc\r\n\r\n";
-        let mut s = Http1Stream::new(false);
+        let mut s = Http1Stream::new(false, Limits::default());
         let msgs = s.feed(raw);
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].status, Some(204));
         assert_eq!(msgs[0].body, b"");
         assert_eq!(msgs[0].header_len, raw.len());
+    }
+
+    #[test]
+    fn header_count_comes_from_limits() {
+        let limits = Limits {
+            max_headers: 1,
+            ..Default::default()
+        };
+        let mut s = Http1Stream::new(false, limits);
+        // Two headers exceeds the cap of one.
+        let raw = b"HTTP/1.1 200 OK\r\nA: 1\r\nB: 2\r\nContent-Length: 0\r\n\r\n";
+        assert_eq!(s.feed(raw).len(), 0);
     }
 }

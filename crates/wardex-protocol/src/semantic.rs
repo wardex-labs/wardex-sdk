@@ -5,6 +5,7 @@ use std::io::Read;
 
 use crate::sse::{self, SseEvent};
 use serde::Deserialize;
+use wardex_limits::Limits;
 
 /// Neutral semantic fields absorbing per-provider differences. All Option (None = not extracted).
 #[derive(Debug, Default, Clone, PartialEq)]
@@ -1226,34 +1227,39 @@ fn try_parse_sse(host: &str, path: &str, req: &[u8], decoded: &[u8]) -> Option<L
     }
 }
 
-/// Upper bound on the decompressed size — defense against decompression bombs. Same as h2's MAX_BODY (8 MiB).
-const MAX_DECODED: usize = 8 * 1024 * 1024;
-
 /// Decompresses if gzip/zlib/deflate, otherwise copies the original. Returns the original on failure.
-fn decode_body(resp: &[u8]) -> Vec<u8> {
+/// `limits.max_decoded_bytes` bounds the decompressed size — defense against decompression bombs.
+fn decode_body(resp: &[u8], limits: Limits) -> Vec<u8> {
+    let max_decoded = limits.max_decoded_bytes;
     if resp.len() >= 2 && resp[0] == 0x1f && resp[1] == 0x8b {
         let mut out = Vec::new();
         let r = flate2::read::GzDecoder::new(resp)
-            .take((MAX_DECODED + 1) as u64)
+            .take((max_decoded + 1) as u64)
             .read_to_end(&mut out);
-        if r.is_ok() && out.len() <= MAX_DECODED {
+        if r.is_ok() && out.len() <= max_decoded {
             return out;
         }
     } else if resp.len() >= 2 && resp[0] == 0x78 {
         // zlib (deflate) header
         let mut out = Vec::new();
         let r = flate2::read::ZlibDecoder::new(resp)
-            .take((MAX_DECODED + 1) as u64)
+            .take((max_decoded + 1) as u64)
             .read_to_end(&mut out);
-        if r.is_ok() && out.len() <= MAX_DECODED {
+        if r.is_ok() && out.len() <= max_decoded {
             return out;
         }
     }
     resp.to_vec()
 }
 
-pub fn parse_llm(host: &str, path: &str, req: &[u8], resp: &[u8]) -> Option<LlmSemantics> {
-    let decoded = decode_body(resp);
+pub fn parse_llm(
+    host: &str,
+    path: &str,
+    req: &[u8],
+    resp: &[u8],
+    limits: Limits,
+) -> Option<LlmSemantics> {
+    let decoded = decode_body(resp, limits);
     if let Some(s) = try_parse_sse(host, path, req, &decoded) {
         return Some(s);
     }
@@ -1294,6 +1300,7 @@ mod tests {
             "/v1/chat/completions",
             OPENAI_REQ,
             OPENAI_CHAT,
+            Limits::default(),
         )
         .expect("supported host");
         assert_eq!(s.provider, "openai");
@@ -1315,8 +1322,42 @@ mod tests {
     }
 
     #[test]
+    fn decoded_cap_comes_from_limits() {
+        // The cap only bites on the decompression path (plain bodies pass through uncapped),
+        // so gzip-compress the body to exercise it — mirrors `gzip_response_is_decompressed_and_parsed`.
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+        let limits = Limits {
+            max_decoded_bytes: 1,
+            ..Default::default()
+        };
+        let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(OPENAI_CHAT).unwrap();
+        let gz = enc.finish().unwrap();
+
+        let sem = parse_llm(
+            "api.openai.com",
+            "/v1/chat/completions",
+            OPENAI_REQ,
+            &gz,
+            limits,
+        );
+        // The decompressed response exceeds the tiny decode cap, so decompression is
+        // rejected and no semantics can be extracted from the (still-compressed) bytes.
+        assert!(sem.is_none() || sem.unwrap().response_model.is_none());
+    }
+
+    #[test]
     fn unsupported_host_returns_none() {
-        assert!(parse_llm("example.com", "/v1/foo", b"{}", b"{\"ok\":true}").is_none());
+        assert!(parse_llm(
+            "example.com",
+            "/v1/foo",
+            b"{}",
+            b"{\"ok\":true}",
+            Limits::default()
+        )
+        .is_none());
     }
 
     const ANTHROPIC_MSG: &[u8] = br#"{
@@ -1328,7 +1369,14 @@ mod tests {
 
     #[test]
     fn anthropic_messages_extracts_tokens() {
-        let s = parse_llm("api.anthropic.com", "/v1/messages", b"{}", ANTHROPIC_MSG).unwrap();
+        let s = parse_llm(
+            "api.anthropic.com",
+            "/v1/messages",
+            b"{}",
+            ANTHROPIC_MSG,
+            Limits::default(),
+        )
+        .unwrap();
         assert_eq!(s.provider, "anthropic");
         assert_eq!(s.operation, "chat");
         assert_eq!(s.response_model.as_deref(), Some("claude-opus-4-8"));
@@ -1343,7 +1391,14 @@ mod tests {
 
     #[test]
     fn openai_embeddings_extracts_input_tokens() {
-        let s = parse_llm("api.openai.com", "/v1/embeddings", b"{}", OPENAI_EMB).unwrap();
+        let s = parse_llm(
+            "api.openai.com",
+            "/v1/embeddings",
+            b"{}",
+            OPENAI_EMB,
+            Limits::default(),
+        )
+        .unwrap();
         assert_eq!(s.operation, "embeddings");
         assert_eq!(s.input_tokens, Some(8));
         assert_eq!(s.output_tokens, None);
@@ -1352,10 +1407,24 @@ mod tests {
     #[test]
     fn body_shape_fallback_detects_provider_on_localhost() {
         // even when the host is unsupported (127.0.0.1), infer the provider from the response shape
-        let oa = parse_llm("127.0.0.1", "/v1/chat/completions", OPENAI_REQ, OPENAI_CHAT).unwrap();
+        let oa = parse_llm(
+            "127.0.0.1",
+            "/v1/chat/completions",
+            OPENAI_REQ,
+            OPENAI_CHAT,
+            Limits::default(),
+        )
+        .unwrap();
         assert_eq!(oa.provider, "openai");
         assert_eq!(oa.input_tokens, Some(12));
-        let an = parse_llm("127.0.0.1", "/v1/messages", b"{}", ANTHROPIC_MSG).unwrap();
+        let an = parse_llm(
+            "127.0.0.1",
+            "/v1/messages",
+            b"{}",
+            ANTHROPIC_MSG,
+            Limits::default(),
+        )
+        .unwrap();
         assert_eq!(an.provider, "anthropic");
         assert_eq!(an.input_tokens, Some(12));
     }
@@ -1366,7 +1435,8 @@ mod tests {
             "127.0.0.1",
             "/v1/chat/completions",
             b"{}",
-            br#"{"ok":true}"#
+            br#"{"ok":true}"#,
+            Limits::default(),
         )
         .is_none());
     }
@@ -1381,7 +1451,14 @@ mod tests {
         let gz = enc.finish().unwrap();
         assert_eq!(&gz[..2], &[0x1f, 0x8b]); // gzip magic
 
-        let s = parse_llm("api.openai.com", "/v1/chat/completions", OPENAI_REQ, &gz).unwrap();
+        let s = parse_llm(
+            "api.openai.com",
+            "/v1/chat/completions",
+            OPENAI_REQ,
+            &gz,
+            Limits::default(),
+        )
+        .unwrap();
         assert_eq!(s.input_tokens, Some(12)); // parsed after decompression
         assert_eq!(s.decoded_response.as_deref(), Some(OPENAI_CHAT)); // decoded body stored
     }
@@ -1397,7 +1474,7 @@ mod tests {
         let gz = enc.finish().unwrap();
         assert!(gz.len() < big.len()); // compressed
                                        // exceeds cap → not decompressed, original (gz) returned
-        assert_eq!(decode_body(&gz), gz);
+        assert_eq!(decode_body(&gz, Limits::default()), gz);
     }
 
     #[test]
@@ -1409,7 +1486,7 @@ mod tests {
         let mut enc = GzEncoder::new(Vec::new(), Compression::default());
         enc.write_all(small).unwrap();
         let gz = enc.finish().unwrap();
-        assert_eq!(decode_body(&gz), small);
+        assert_eq!(decode_body(&gz, Limits::default()), small);
     }
 
     #[test]
@@ -1418,7 +1495,14 @@ mod tests {
             "id":"msg_2","model":"claude-opus-4-8","stop_reason":"end_turn",
             "usage":{"input_tokens":5,"output_tokens":2,"cache_creation_input_tokens":7}
         }"#;
-        let s = parse_llm("api.anthropic.com", "/v1/messages", b"{}", resp).unwrap();
+        let s = parse_llm(
+            "api.anthropic.com",
+            "/v1/messages",
+            b"{}",
+            resp,
+            Limits::default(),
+        )
+        .unwrap();
         assert_eq!(s.cache_creation_input_tokens, Some(7));
         assert_eq!(s.input_tokens, Some(5));
         assert_eq!(s.output_tokens, Some(2));
@@ -1433,7 +1517,14 @@ mod tests {
             "choices":[{"finish_reason":"stop"}],
             "usage":{"prompt_tokens":1,"completion_tokens":1}
         }"#;
-        let s = parse_llm("api.openai.com", "/v1/chat/completions", req, resp).unwrap();
+        let s = parse_llm(
+            "api.openai.com",
+            "/v1/chat/completions",
+            req,
+            resp,
+            Limits::default(),
+        )
+        .unwrap();
         assert_eq!(
             s.stop_sequences.as_deref(),
             Some(&["A".to_string(), "B".to_string()][..])
@@ -1444,7 +1535,14 @@ mod tests {
 
     #[test]
     fn openai_sse_stream_reassembles_text_and_finish_no_usage() {
-        let s = parse_llm("api.openai.com", "/v1/chat/completions", b"{}", OPENAI_SSE).unwrap();
+        let s = parse_llm(
+            "api.openai.com",
+            "/v1/chat/completions",
+            b"{}",
+            OPENAI_SSE,
+            Limits::default(),
+        )
+        .unwrap();
         assert_eq!(s.provider, "openai");
         assert!(s.reassembled_from_stream);
         assert_eq!(s.response_model.as_deref(), Some("gpt-4o-mini"));
@@ -1458,7 +1556,14 @@ mod tests {
     #[test]
     fn openai_sse_with_usage_chunk_extracts_tokens() {
         let sse = b"data: {\"id\":\"c\",\"model\":\"gpt-4o\",\"choices\":[{\"delta\":{\"content\":\"x\"},\"finish_reason\":\"stop\"}]}\n\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":2}}\n\ndata: [DONE]\n\n";
-        let s = parse_llm("api.openai.com", "/v1/chat/completions", b"{}", sse).unwrap();
+        let s = parse_llm(
+            "api.openai.com",
+            "/v1/chat/completions",
+            b"{}",
+            sse,
+            Limits::default(),
+        )
+        .unwrap();
         assert_eq!(s.input_tokens, Some(11));
         assert_eq!(s.output_tokens, Some(2));
     }
@@ -1466,7 +1571,14 @@ mod tests {
     #[test]
     fn anthropic_sse_stream_extracts_tokens_text_stop() {
         let sse = b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_s\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":9,\"output_tokens\":1}}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"Hel\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"lo\"}}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":5}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
-        let s = parse_llm("api.anthropic.com", "/v1/messages", b"{}", sse).unwrap();
+        let s = parse_llm(
+            "api.anthropic.com",
+            "/v1/messages",
+            b"{}",
+            sse,
+            Limits::default(),
+        )
+        .unwrap();
         assert_eq!(s.provider, "anthropic");
         assert!(s.reassembled_from_stream);
         assert_eq!(s.response_model.as_deref(), Some("claude-opus-4-8"));
@@ -1483,7 +1595,7 @@ mod tests {
     #[test]
     fn unknown_provider_sse_returns_raw_concat_no_semantics() {
         let sse = b"data: {\"foo\":1}\n\ndata: {\"bar\":2}\n\n";
-        let s = parse_llm("127.0.0.1", "/v1/stream", b"{}", sse).unwrap();
+        let s = parse_llm("127.0.0.1", "/v1/stream", b"{}", sse, Limits::default()).unwrap();
         assert!(s.reassembled_from_stream);
         assert_eq!(s.provider, ""); // unidentified
         assert_eq!(s.response_model, None);
@@ -1499,6 +1611,7 @@ mod tests {
             "/v1/chat/completions",
             OPENAI_REQ,
             OPENAI_CHAT,
+            Limits::default(),
         )
         .unwrap();
         assert!(!s.reassembled_from_stream);
@@ -1513,7 +1626,14 @@ mod tests {
         let mut enc = GzEncoder::new(Vec::new(), Compression::default());
         enc.write_all(OPENAI_SSE).unwrap();
         let gz = enc.finish().unwrap();
-        let s = parse_llm("api.openai.com", "/v1/chat/completions", b"{}", &gz).unwrap();
+        let s = parse_llm(
+            "api.openai.com",
+            "/v1/chat/completions",
+            b"{}",
+            &gz,
+            Limits::default(),
+        )
+        .unwrap();
         assert!(s.reassembled_from_stream);
         assert_eq!(s.response_model.as_deref(), Some("gpt-4o-mini"));
     }
@@ -1522,7 +1642,14 @@ mod tests {
     fn openai_chat_extracts_tool_call() {
         let req = br#"{"model":"gpt-4o-mini"}"#;
         let resp = br#"{"id":"chatcmpl-x","model":"gpt-4o-mini","choices":[{"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"add","arguments":"{\"a\":17,\"b\":25}"}}]},"finish_reason":"tool_calls"}]}"#;
-        let s = parse_llm("api.openai.com", "/v1/chat/completions", req, resp).expect("some");
+        let s = parse_llm(
+            "api.openai.com",
+            "/v1/chat/completions",
+            req,
+            resp,
+            Limits::default(),
+        )
+        .expect("some");
         let om = s.output_messages.expect("output_messages");
         let v: serde_json::Value = serde_json::from_str(&om).unwrap();
         let part = &v[0]["parts"][0];
@@ -1538,7 +1665,14 @@ mod tests {
     fn openai_chat_multiple_parallel_tool_calls() {
         let req = br#"{"model":"gpt-4o-mini"}"#;
         let resp = br#"{"model":"gpt-4o-mini","choices":[{"message":{"tool_calls":[{"id":"c1","function":{"name":"a","arguments":"{}"}},{"id":"c2","function":{"name":"b","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}"#;
-        let s = parse_llm("api.openai.com", "/v1/chat/completions", req, resp).unwrap();
+        let s = parse_llm(
+            "api.openai.com",
+            "/v1/chat/completions",
+            req,
+            resp,
+            Limits::default(),
+        )
+        .unwrap();
         let v: serde_json::Value = serde_json::from_str(&s.output_messages.unwrap()).unwrap();
         let parts = v[0]["parts"].as_array().unwrap();
         assert_eq!(parts.len(), 2);
@@ -1550,7 +1684,14 @@ mod tests {
     fn text_only_response_emits_text_part() {
         let req = br#"{"model":"gpt-4o-mini"}"#;
         let resp = br#"{"model":"gpt-4o-mini","choices":[{"message":{"content":"hi"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}"#;
-        let s = parse_llm("api.openai.com", "/v1/chat/completions", req, resp).unwrap();
+        let s = parse_llm(
+            "api.openai.com",
+            "/v1/chat/completions",
+            req,
+            resp,
+            Limits::default(),
+        )
+        .unwrap();
         let v: serde_json::Value = serde_json::from_str(&s.output_messages.unwrap()).unwrap();
         assert_eq!(v[0]["parts"][0]["type"], "text");
         assert_eq!(v[0]["parts"][0]["content"], "hi");
@@ -1561,7 +1702,14 @@ mod tests {
     fn openai_tool_args_unparsable_keeps_raw_and_marks() {
         let req = br#"{"model":"gpt-4o-mini"}"#;
         let resp = br#"{"model":"gpt-4o-mini","choices":[{"message":{"tool_calls":[{"id":"c1","function":{"name":"a","arguments":"{not json"}}]},"finish_reason":"tool_calls"}]}"#;
-        let s = parse_llm("api.openai.com", "/v1/chat/completions", req, resp).unwrap();
+        let s = parse_llm(
+            "api.openai.com",
+            "/v1/chat/completions",
+            req,
+            resp,
+            Limits::default(),
+        )
+        .unwrap();
         let v: serde_json::Value = serde_json::from_str(&s.output_messages.unwrap()).unwrap();
         assert_eq!(v[0]["parts"][0]["arguments"], "{not json");
         assert!(s.tool_args_unparsed);
@@ -1571,7 +1719,14 @@ mod tests {
     fn anthropic_extracts_tool_use() {
         let req = br#"{"model":"claude-3"}"#;
         let resp = br#"{"id":"msg_1","model":"claude-3","stop_reason":"tool_use","content":[{"type":"text","text":"let me calculate"},{"type":"tool_use","id":"toolu_1","name":"add","input":{"a":17,"b":25}}],"usage":{"input_tokens":5,"output_tokens":2}}"#;
-        let s = parse_llm("api.anthropic.com", "/v1/messages", req, resp).unwrap();
+        let s = parse_llm(
+            "api.anthropic.com",
+            "/v1/messages",
+            req,
+            resp,
+            Limits::default(),
+        )
+        .unwrap();
         let v: serde_json::Value = serde_json::from_str(&s.output_messages.unwrap()).unwrap();
         let parts = v[0]["parts"].as_array().unwrap();
         assert_eq!(parts.len(), 2);
@@ -1591,6 +1746,7 @@ mod tests {
             "/v1/messages",
             br#"{"model":"c"}"#,
             resp,
+            Limits::default(),
         )
         .unwrap();
         let v: serde_json::Value = serde_json::from_str(&s.output_messages.unwrap()).unwrap();
@@ -1611,6 +1767,7 @@ mod tests {
             "/v1/messages",
             br#"{"model":"c"}"#,
             resp,
+            Limits::default(),
         )
         .unwrap();
         let v: serde_json::Value = serde_json::from_str(&s.output_messages.unwrap()).unwrap();
@@ -1627,6 +1784,7 @@ mod tests {
             "/v1/messages",
             br#"{"model":"c"}"#,
             resp,
+            Limits::default(),
         )
         .unwrap();
         let v: serde_json::Value = serde_json::from_str(&s.output_messages.unwrap()).unwrap();
@@ -1648,6 +1806,7 @@ mod tests {
             "/v1/messages",
             br#"{"model":"c"}"#,
             resp,
+            Limits::default(),
         )
         .unwrap();
         let v: serde_json::Value = serde_json::from_str(&s.output_messages.unwrap()).unwrap();
@@ -1664,6 +1823,7 @@ mod tests {
             "/v1/messages",
             br#"{"model":"c"}"#,
             resp,
+            Limits::default(),
         )
         .unwrap();
         let v: serde_json::Value = serde_json::from_str(&s.output_messages.unwrap()).unwrap();
@@ -1674,10 +1834,10 @@ mod tests {
     fn openai_and_anthropic_tool_call_same_shape() {
         let oa = parse_llm("api.openai.com", "/v1/chat/completions",
             br#"{"model":"m"}"#,
-            br#"{"model":"m","choices":[{"message":{"tool_calls":[{"id":"x","function":{"name":"add","arguments":"{\"a\":1}"}}]}}]}"#).unwrap();
+            br#"{"model":"m","choices":[{"message":{"tool_calls":[{"id":"x","function":{"name":"add","arguments":"{\"a\":1}"}}]}}]}"#, Limits::default()).unwrap();
         let an = parse_llm("api.anthropic.com", "/v1/messages",
             br#"{"model":"m"}"#,
-            br#"{"model":"m","content":[{"type":"tool_use","id":"x","name":"add","input":{"a":1}}]}"#).unwrap();
+            br#"{"model":"m","content":[{"type":"tool_use","id":"x","name":"add","input":{"a":1}}]}"#, Limits::default()).unwrap();
         let ov: serde_json::Value = serde_json::from_str(&oa.output_messages.unwrap()).unwrap();
         let av: serde_json::Value = serde_json::from_str(&an.output_messages.unwrap()).unwrap();
         assert_eq!(ov[0]["parts"][0], av[0]["parts"][0]);
@@ -1705,6 +1865,7 @@ mod tests {
             "/v1/chat/completions",
             br#"{"model":"gpt-4o-mini","stream":true}"#,
             &resp,
+            Limits::default(),
         )
         .unwrap();
         assert!(s.reassembled_from_stream);
@@ -1725,6 +1886,7 @@ mod tests {
             "/v1/chat/completions",
             br#"{"stream":true}"#,
             &resp,
+            Limits::default(),
         )
         .unwrap();
         let v: serde_json::Value = serde_json::from_str(&s.output_messages.unwrap()).unwrap();
@@ -1746,6 +1908,7 @@ mod tests {
             "/v1/chat/completions",
             br#"{"stream":true}"#,
             &resp,
+            Limits::default(),
         )
         .unwrap();
         let v: serde_json::Value = serde_json::from_str(&s.output_messages.unwrap()).unwrap();
@@ -1801,7 +1964,14 @@ mod tests {
     fn openai_text_then_tool_call_order() {
         let req = br#"{"model":"m"}"#;
         let resp = br#"{"model":"m","choices":[{"message":{"content":"calc","tool_calls":[{"id":"c1","function":{"name":"add","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}"#;
-        let s = parse_llm("api.openai.com", "/v1/chat/completions", req, resp).unwrap();
+        let s = parse_llm(
+            "api.openai.com",
+            "/v1/chat/completions",
+            req,
+            resp,
+            Limits::default(),
+        )
+        .unwrap();
         let v: serde_json::Value = serde_json::from_str(&s.output_messages.unwrap()).unwrap();
         let parts = v[0]["parts"].as_array().unwrap();
         assert_eq!(parts[0]["type"], "text");
@@ -1813,7 +1983,14 @@ mod tests {
     fn openai_multiple_choices_emit_multiple_messages() {
         let req = br#"{"model":"m"}"#;
         let resp = br#"{"model":"m","choices":[{"message":{"content":"a"},"finish_reason":"stop"},{"message":{"content":"b"},"finish_reason":"tool_calls"}]}"#;
-        let s = parse_llm("api.openai.com", "/v1/chat/completions", req, resp).unwrap();
+        let s = parse_llm(
+            "api.openai.com",
+            "/v1/chat/completions",
+            req,
+            resp,
+            Limits::default(),
+        )
+        .unwrap();
         let v: serde_json::Value = serde_json::from_str(&s.output_messages.unwrap()).unwrap();
         assert_eq!(v.as_array().unwrap().len(), 2);
         assert_eq!(v[0]["parts"][0]["content"], "a");
@@ -1837,6 +2014,7 @@ mod tests {
             "/v1/messages",
             br#"{"model":"claude-3","stream":true}"#,
             raw.as_bytes(),
+            Limits::default(),
         )
         .unwrap();
         assert!(s.reassembled_from_stream);
@@ -1865,6 +2043,7 @@ mod tests {
             "/v1/messages",
             br#"{"model":"c","stream":true}"#,
             raw.as_bytes(),
+            Limits::default(),
         )
         .unwrap();
         assert!(s.reassembled_from_stream);
@@ -1900,6 +2079,7 @@ mod tests {
             "/v1/chat/completions",
             OPENAI_REQ_MESSAGES,
             OPENAI_RESP_MIN,
+            Limits::default(),
         )
         .expect("supported");
         let si: serde_json::Value = serde_json::from_str(
@@ -1920,6 +2100,7 @@ mod tests {
             "/v1/chat/completions",
             OPENAI_REQ_MESSAGES,
             OPENAI_RESP_MIN,
+            Limits::default(),
         )
         .expect("supported");
         let im: serde_json::Value =
@@ -1951,6 +2132,7 @@ mod tests {
             "/v1/chat/completions",
             req,
             OPENAI_RESP_MIN,
+            Limits::default(),
         )
         .expect("supported");
         let si: serde_json::Value = serde_json::from_str(
@@ -1970,6 +2152,7 @@ mod tests {
             "/v1/chat/completions",
             req,
             OPENAI_RESP_MIN,
+            Limits::default(),
         )
         .expect("supported");
         assert!(s.input_messages_has_unmapped);
@@ -1986,6 +2169,7 @@ mod tests {
             "/v1/chat/completions",
             OPENAI_REQ,
             OPENAI_CHAT,
+            Limits::default(),
         )
         .expect("supported");
         assert!(s.input_messages.is_none());
@@ -2007,6 +2191,7 @@ mod tests {
             "/v1/chat/completions",
             req,
             OPENAI_RESP_MIN,
+            Limits::default(),
         )
         .expect("supported");
         let im: serde_json::Value =
@@ -2030,6 +2215,7 @@ mod tests {
             "/v1/chat/completions",
             req,
             OPENAI_RESP_MIN,
+            Limits::default(),
         )
         .expect("supported");
         let im: serde_json::Value =
@@ -2050,6 +2236,7 @@ mod tests {
             "/v1/chat/completions",
             req,
             OPENAI_RESP_MIN,
+            Limits::default(),
         )
         .expect("supported");
         let im: serde_json::Value =
@@ -2071,6 +2258,7 @@ mod tests {
             "/v1/chat/completions",
             req,
             OPENAI_RESP_MIN,
+            Limits::default(),
         )
         .expect("supported");
         let im: serde_json::Value =
@@ -2089,8 +2277,14 @@ mod tests {
     #[test]
     fn anthropic_top_level_system_string_to_system_instructions() {
         let req = r#"{"model":"claude-3-5-sonnet","system":"You are an assistant.","messages":[{"role":"user","content":"hi"}]}"#.as_bytes();
-        let s = parse_llm("api.anthropic.com", "/v1/messages", req, ANTHROPIC_RESP_MIN)
-            .expect("supported");
+        let s = parse_llm(
+            "api.anthropic.com",
+            "/v1/messages",
+            req,
+            ANTHROPIC_RESP_MIN,
+            Limits::default(),
+        )
+        .expect("supported");
         let si: serde_json::Value =
             serde_json::from_str(s.system_instructions.as_deref().unwrap()).unwrap();
         assert_eq!(si[0]["type"], "text");
@@ -2105,8 +2299,14 @@ mod tests {
     #[test]
     fn anthropic_system_array_to_system_instructions() {
         let req = br#"{"model":"claude-3-5-sonnet","system":[{"type":"text","text":"A"},{"type":"text","text":"B"}],"messages":[{"role":"user","content":"hi"}]}"#;
-        let s = parse_llm("api.anthropic.com", "/v1/messages", req, ANTHROPIC_RESP_MIN)
-            .expect("supported");
+        let s = parse_llm(
+            "api.anthropic.com",
+            "/v1/messages",
+            req,
+            ANTHROPIC_RESP_MIN,
+            Limits::default(),
+        )
+        .expect("supported");
         let si: serde_json::Value =
             serde_json::from_str(s.system_instructions.as_deref().unwrap()).unwrap();
         assert_eq!(si.as_array().unwrap().len(), 2);
@@ -2119,8 +2319,14 @@ mod tests {
             {"role":"assistant","content":[{"type":"tool_use","id":"tu_1","name":"get_weather","input":{"city":"Seoul"}}]},
             {"role":"user","content":[{"type":"tool_result","tool_use_id":"tu_1","content":"18 degrees"}]}
         ]}"#.as_bytes();
-        let s = parse_llm("api.anthropic.com", "/v1/messages", req, ANTHROPIC_RESP_MIN)
-            .expect("supported");
+        let s = parse_llm(
+            "api.anthropic.com",
+            "/v1/messages",
+            req,
+            ANTHROPIC_RESP_MIN,
+            Limits::default(),
+        )
+        .expect("supported");
         let im: serde_json::Value =
             serde_json::from_str(s.input_messages.as_deref().unwrap()).unwrap();
         assert_eq!(im[0]["parts"][0]["type"], "tool_call");
@@ -2136,8 +2342,14 @@ mod tests {
         let req = br#"{"model":"claude-3-5-sonnet","messages":[{"role":"user","content":[
             {"type":"image","source":{"type":"base64","media_type":"image/jpeg","data":"/9j/4AAQ="}}
         ]}]}"#;
-        let s = parse_llm("api.anthropic.com", "/v1/messages", req, ANTHROPIC_RESP_MIN)
-            .expect("supported");
+        let s = parse_llm(
+            "api.anthropic.com",
+            "/v1/messages",
+            req,
+            ANTHROPIC_RESP_MIN,
+            Limits::default(),
+        )
+        .expect("supported");
         let im: serde_json::Value =
             serde_json::from_str(s.input_messages.as_deref().unwrap()).unwrap();
         let p = &im[0]["parts"][0];
@@ -2152,8 +2364,14 @@ mod tests {
         let req = br#"{"model":"claude-3-5-sonnet","messages":[{"role":"user","content":[
             {"type":"image","source":{"type":"url","url":"https://example.com/a.jpg"}}
         ]}]}"#;
-        let s = parse_llm("api.anthropic.com", "/v1/messages", req, ANTHROPIC_RESP_MIN)
-            .expect("supported");
+        let s = parse_llm(
+            "api.anthropic.com",
+            "/v1/messages",
+            req,
+            ANTHROPIC_RESP_MIN,
+            Limits::default(),
+        )
+        .expect("supported");
         let im: serde_json::Value =
             serde_json::from_str(s.input_messages.as_deref().unwrap()).unwrap();
         let p = &im[0]["parts"][0];
@@ -2169,8 +2387,14 @@ mod tests {
             "message":{"role":"assistant","content":"hi",
                 "audio":{"id":"a1","data":"UklGRg==","transcript":"hi"}}}]}"#
             .as_bytes();
-        let s = parse_llm("api.openai.com", "/v1/chat/completions", OPENAI_REQ, resp)
-            .expect("supported");
+        let s = parse_llm(
+            "api.openai.com",
+            "/v1/chat/completions",
+            OPENAI_REQ,
+            resp,
+            Limits::default(),
+        )
+        .expect("supported");
         let om: serde_json::Value =
             serde_json::from_str(s.output_messages.as_deref().unwrap()).unwrap();
         let parts = om[0]["parts"].as_array().unwrap();
@@ -2197,6 +2421,7 @@ mod tests {
             "/v1/messages",
             br#"{"model":"c","stream":true}"#,
             raw.as_bytes(),
+            Limits::default(),
         )
         .unwrap();
         // An orphan partial_json must not create a tool call (parts must be empty).
@@ -2244,6 +2469,7 @@ mod tests {
             "/v1/messages",
             b"{}",
             ANTHROPIC_SSE_SERVER_TOOL,
+            Limits::default(),
         )
         .expect("supported");
         assert!(s.reassembled_from_stream);
@@ -2265,6 +2491,7 @@ mod tests {
             "/v1/messages",
             b"{}",
             ANTHROPIC_SSE_SERVER_TOOL,
+            Limits::default(),
         )
         .expect("supported");
         let om: serde_json::Value =

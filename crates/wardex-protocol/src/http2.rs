@@ -62,6 +62,7 @@ impl Http2FrameDecoder {
 
 use fluke_hpack::Decoder;
 use std::collections::HashMap;
+use wardex_limits::Limits;
 
 const FRAME_DATA: u8 = 0x0;
 const FRAME_HEADERS: u8 = 0x1;
@@ -75,8 +76,6 @@ const FLAG_PADDED: u8 = 0x8;
 const FLAG_PRIORITY: u8 = 0x20;
 
 const PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
-const MAX_BODY: usize = 8 * 1024 * 1024;
-const MAX_STREAMS: usize = 1024;
 
 /// A completed request/response transaction for one stream.
 pub struct Http2Transaction {
@@ -131,16 +130,17 @@ pub struct Http2Connection {
     preface_buf: Vec<u8>,
     preface_seen: bool,
     disabled: bool,
+    limits: Limits,
 }
 
 impl Default for Http2Connection {
     fn default() -> Self {
-        Self::new()
+        Self::new(Limits::default())
     }
 }
 
 impl Http2Connection {
-    pub fn new() -> Self {
+    pub fn new(limits: Limits) -> Self {
         Self {
             client_frames: Http2FrameDecoder::new(),
             server_frames: Http2FrameDecoder::new(),
@@ -151,6 +151,7 @@ impl Http2Connection {
             preface_buf: Vec::new(),
             preface_seen: false,
             disabled: false,
+            limits,
         }
     }
 
@@ -301,7 +302,7 @@ impl Http2Connection {
             };
             decoder.decode(block).map_err(|_| ())?
         };
-        if self.streams.len() > MAX_STREAMS {
+        if self.streams.len() > self.limits.max_streams {
             if let Some(&k) = self.streams.keys().next() {
                 self.streams.remove(&k);
             }
@@ -346,6 +347,7 @@ impl Http2Connection {
             return;
         }
         let body = &payload[..payload.len() - pad_len];
+        let max_body = self.limits.max_body_bytes;
         {
             let st = self.streams.entry(frame.stream_id).or_default();
             let target = if from_client {
@@ -353,7 +355,7 @@ impl Http2Connection {
             } else {
                 &mut st.resp_body
             };
-            let room = MAX_BODY.saturating_sub(target.len());
+            let room = max_body.saturating_sub(target.len());
             if body.len() <= room {
                 target.extend_from_slice(body);
             } else {
@@ -502,7 +504,7 @@ mod tests {
 
     #[test]
     fn captures_grpc_content_type_and_trailers() {
-        let mut c = Http2Connection::new();
+        let mut c = Http2Connection::new(Limits::default());
 
         // client: HEADERS(:method POST, :path /echo.Echo/Say, content-type application/grpc)
         //       + DATA(1 gRPC message, END_STREAM)
@@ -537,7 +539,7 @@ mod tests {
     // trailers-only: must correctly parse the gRPC error response pattern where the server
     // carries grpc-status on the first HEADERS frame without a DATA frame and closes with END_STREAM.
     fn captures_trailers_only_grpc_error() {
-        let mut c = Http2Connection::new();
+        let mut c = Http2Connection::new(Limits::default());
 
         // client: HEADERS(POST /pkg.Svc/M, content-type application/grpc, END_HEADERS|END_STREAM)
         // empty-body request — the client side can be simple since we're only reproducing a trailers-only error
@@ -575,7 +577,7 @@ mod tests {
 
     #[test]
     fn reassembles_simple_request_response() {
-        let mut c = Http2Connection::new();
+        let mut c = Http2Connection::new(Limits::default());
 
         // client: HEADERS(:method GET, :path /v1/x, END_HEADERS+END_STREAM)
         let req_block = hpack(&[(b":method", b"GET"), (b":path", b"/v1/x")]);
@@ -599,7 +601,7 @@ mod tests {
 
     #[test]
     fn request_with_body_emits_after_response() {
-        let mut c = Http2Connection::new();
+        let mut c = Http2Connection::new(Limits::default());
         let req_block = hpack(&[(b":method", b"POST"), (b":path", b"/p")]);
         // HEADERS(END_HEADERS, no END_STREAM) + DATA(body, END_STREAM)
         let mut req = frame(0x1, FH, 1, &req_block);
@@ -619,7 +621,7 @@ mod tests {
 
     #[test]
     fn multiplexed_streams_correlate_independently() {
-        let mut c = Http2Connection::new();
+        let mut c = Http2Connection::new(Limits::default());
         let b1 = hpack(&[(b":method", b"GET"), (b":path", b"/a")]);
         let b3 = hpack(&[(b":method", b"GET"), (b":path", b"/b")]);
         // interleave requests on stream 1, 3
@@ -646,7 +648,7 @@ mod tests {
 
     #[test]
     fn continuation_frames_join_header_block() {
-        let mut c = Http2Connection::new();
+        let mut c = Http2Connection::new(Limits::default());
         let block = hpack(&[(b":method", b"GET"), (b":path", b"/long")]);
         let mid = block.len() / 2;
         // HEADERS(no END_HEADERS) + CONTINUATION(END_HEADERS), END_STREAM on HEADERS
@@ -662,7 +664,7 @@ mod tests {
 
     #[test]
     fn skips_unknown_frames_and_preface() {
-        let mut c = Http2Connection::new();
+        let mut c = Http2Connection::new(Limits::default());
         // client preface + SETTINGS + WINDOW_UPDATE + HEADERS
         let mut buf = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
         buf.extend_from_slice(&frame(0x4, 0x0, 0, b"")); // SETTINGS
@@ -675,7 +677,7 @@ mod tests {
 
     #[test]
     fn padded_data_strips_padding() {
-        let mut c = Http2Connection::new();
+        let mut c = Http2Connection::new(Limits::default());
         let req_block = hpack(&[(b":method", b"GET"), (b":path", b"/")]);
         c.feed(true, &frame(0x1, FH | FS, 1, &req_block));
         let s = hpack(&[(b":status", b"200")]);
@@ -691,7 +693,7 @@ mod tests {
 
     #[test]
     fn desync_disables_capture_without_panic() {
-        let mut c = Http2Connection::new();
+        let mut c = Http2Connection::new(Limits::default());
         // send a bad HPACK block with END_HEADERS → decode fails → disabled
         let r = c.feed(true, &frame(0x1, FH | FS, 1, &[0xff, 0xff, 0xff, 0xff]));
         // passes through without panicking + subsequent normal traffic also isn't captured
@@ -699,5 +701,27 @@ mod tests {
         let r2 = c.feed(true, &frame(0x1, FH | FS, 3, &block));
         assert!(r.transactions.is_empty());
         assert!(r2.opened_request_streams.is_empty());
+    }
+
+    #[test]
+    fn body_cap_comes_from_limits() {
+        // A tiny cap must truncate where the default (much larger) cap would not.
+        let limits = Limits {
+            max_body_bytes: 4,
+            ..Default::default()
+        };
+        let mut c = Http2Connection::new(limits);
+
+        let req_block = hpack(&[(b":method", b"POST"), (b":path", b"/p")]);
+        let mut req = frame(0x1, FH, 1, &req_block);
+        req.extend_from_slice(&frame(0x0, FS, 1, b"hello world"));
+        c.feed(true, &req);
+
+        let resp_block = hpack(&[(b":status", b"200")]);
+        let r = c.feed(false, &frame(0x1, FH | FS, 1, &resp_block));
+
+        let txn = r.transactions.first().expect("one transaction");
+        assert!(txn.truncated);
+        assert!(txn.request_body.len() <= 4);
     }
 }
