@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import tracemalloc
+
 from wardex_sdk import CaptureLimits, WardexConfig, _wardex_native
 
 
@@ -158,3 +160,173 @@ def test_python_side_fallback_defaults_match_core():
     assert tracker._sample_cap == core["ws_sample_bytes"]
 
     assert ConnTimingStore()._cap == core["max_connections"]
+
+
+# --- End-to-end plumbing + the OOM regression -------------------------------
+#
+# Everything above proves a single layer in isolation: the Rust side takes a
+# Limits object directly, the Python side mocks its neighbours. Both can be
+# green while the chain connecting init() to the native parser is severed and
+# everything silently runs on core defaults -- that exact failure already
+# happened once in this slice, in the opposite direction (a stale native
+# module served old behavior while every Rust test passed). The tests below
+# drive the real public entry points end to end instead.
+#
+# Three limits stand in for the three layers a configured value has to cross:
+#   - max_headers: enforced inside the native Rust parser. Already pinned end
+#     to end by test_body_cap_reaches_the_parser_end_to_end above (it drives
+#     init() -> _hub.get_client() -> config.limits.to_native() -> a real
+#     _Http1Tracker -> the native Http1Parser), so it is not repeated here.
+#   - max_buffer_bytes: enforced by the Python Client's span buffer
+#     (Client.capture_span / _SpanBuffer), independent of anything native.
+#   - max_connections: enforced by the interceptor's own per-connection
+#     eviction (ByteSeamInterceptor._state), a third layer distinct from both
+#     the parser and the Client -- this is the "one more of your choosing".
+# max_body_bytes/max_opaque_body_bytes were considered and rejected: neither
+# is wired into the HTTP/1 path yet (see the docstring on
+# test_body_cap_reaches_the_parser_end_to_end), so a test built on either
+# would pass or fail identically whether or not the value actually reached
+# anything -- exactly the non-discriminating shape this file's tests avoid.
+
+
+def test_max_buffer_bytes_reaches_the_client():
+    """max_buffer_bytes must reach Client.capture_span's eviction, not just
+    sit in config. With the configured cap far below what 20 spans of 8KB
+    payload would need, eviction must have actually run.
+    """
+    import wardex_sdk
+    from wardex_sdk import _hub
+    from wardex_sdk._enums import SpanKind
+    from wardex_sdk._types import InternalSpan, SpanContext, SpanId, TraceId
+
+    def span(payload: bytes) -> InternalSpan:
+        return InternalSpan(
+            context=SpanContext(TraceId.generate(), SpanId.generate()),
+            parent_span_id=None,
+            name="s",
+            kind=SpanKind.INTERNAL,
+            start_time_ns=1,
+            end_time_ns=2,
+            output_data=payload,
+        )
+
+    wardex_sdk.init(limits=CaptureLimits(max_buffer_bytes=32 * 1024))
+    try:
+        client = _hub.get_client()
+        assert client is not None
+        for _ in range(20):
+            client.capture_span(span(b"x" * 8192))
+        # Unbounded (core default is 64MB), 20 * (~8192 + per-span overhead)
+        # would sit well under the cap and nothing would ever be evicted --
+        # so this only passes if the 32KB override actually reached the
+        # buffer's eviction check.
+        assert client._buffered_bytes <= 32 * 1024
+        assert len(client._spans) < 20
+    finally:
+        wardex_sdk.close()
+
+
+def test_max_connections_reaches_the_seam():
+    """max_connections must reach ByteSeamInterceptor._state's per-connection
+    eviction. Loads limits the same way SSLInterceptor.install() does
+    (_load_limits), without the global ssl.SSLSocket monkeypatch that a full
+    install() would perform -- this test only needs the seam's own state
+    dict, not real TLS traffic.
+    """
+    import wardex_sdk
+    from wardex_sdk import _hub
+    from wardex_sdk.interceptors._ssl import SSLInterceptor
+
+    wardex_sdk.init(limits=CaptureLimits(max_connections=1))
+    try:
+        client = _hub.get_client()
+        assert client is not None
+        itc = SSLInterceptor()
+        itc._client = client
+        itc._load_limits(client)
+        assert itc._limits["max_connections"] == 1
+
+        class _FakeSock:
+            def selected_alpn_protocol(self) -> str | None:
+                return None
+
+            def getpeername(self) -> tuple[str, int]:
+                return ("127.0.0.1", 443)
+
+            def fileno(self) -> int:
+                return -1
+
+        socks = [_FakeSock() for _ in range(4)]
+        for s in socks:
+            itc._on_request_bytes(s, b"GET / HTTP/1.1\r\n\r\n")
+
+        # Default max_connections (4096) would never evict after just 4
+        # connections -- eviction only fires here because the override of 1
+        # reached the seam. Steady-state size is max_connections + 1 (the
+        # eviction check runs before the new entry is added), so the two
+        # oldest connections must be gone and the two newest must remain.
+        assert len(itc._conns) == 2
+        assert id(socks[0]) not in itc._conns
+        assert id(socks[1]) not in itc._conns
+        assert id(socks[2]) in itc._conns
+        assert id(socks[3]) in itc._conns
+    finally:
+        wardex_sdk.close()
+
+
+def test_non_http_tls_traffic_does_not_grow_memory(fake_ssl_socket, bare_ssl_interceptor):
+    """Regression for the production incident: the SDK patches ssl.SSLSocket
+    globally, so a TLS-backed Redis/Mongo/Kafka client sharing the process
+    streams into the same seam as instrumented HTTP traffic.
+
+    Before the sniff-latch gate (SSLInterceptor._gate) existed, a connection
+    that never spoke HTTP still reached _Http1Tracker.on_response_bytes on
+    every read. That method appends to a plain Python list
+    (_resp_marks) on every single call, unconditionally and without any
+    cap -- unlike the raw bytes, which the native parser's own
+    max_stream_buffer_bytes latch does eventually bound. Held open for the
+    life of a long-running non-HTTP connection (and multiplied across every
+    such connection sharing the process), that per-call bookkeeping is what
+    grew memory until the host was OOM-killed.
+
+    The gate closes this by classifying a connection once, from its first
+    request bytes, and short-circuiting every later call once it is latched
+    "ignore" -- so neither direction ever reaches the tracker again. Traced
+    allocation must stay flat as far more traffic arrives, not scale with the
+    volume of traffic fed.
+    """
+    itc = bare_ssl_interceptor
+    sock = fake_ssl_socket(alpn=None)
+    # A real Redis client's first write over the connection: enough to
+    # classify (and latch) it as non-HTTP, exactly like a live TLS-backed
+    # Redis client would.
+    itc._on_request_bytes(sock, b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n")
+    assert itc._conns[id(sock)].gate == "ignore"
+
+    # A bulk-string reply carrying a multi-KB value, the shape a Redis GET
+    # under load would return, repeated as if the connection stayed open and
+    # kept serving traffic.
+    response = b"$4096\r\n" + b"v" * 4096 + b"\r\n"
+
+    tracemalloc.start()
+    try:
+        for _ in range(20):
+            itc._on_response_bytes(sock, response)
+        baseline = tracemalloc.get_traced_memory()[0]
+        for _ in range(2000):
+            itc._on_response_bytes(sock, response)
+        peak = tracemalloc.get_traced_memory()[0]
+    finally:
+        tracemalloc.stop()
+
+    # 100x more traffic must not retain anywhere close to 100x more memory.
+    # The threshold is derived from this test's own chunk size (not a bare
+    # literal) so it tracks the test's inputs rather than an arbitrary
+    # constant: it sits far above the handful of bytes any legitimate
+    # per-call bookkeeping could cost, and far below what even a few retained
+    # response chunks would cost, let alone 2000 of them.
+    growth = peak - baseline
+    assert growth < len(response) * 10, (
+        f"traced allocation grew by {growth} bytes over 2000 calls "
+        f"(baseline={baseline}, peak={peak}) -- expected it to stay flat"
+    )
