@@ -375,18 +375,49 @@ fn append_capped(msg: &mut ParsedHttp, data: &[u8], cap: usize) {
     }
 }
 
+/// Strips any `; parameter=...` suffix from a Content-Type value and normalizes
+/// case, leaving the bare media type — e.g.
+/// `application/vnd.api+json; charset=utf-8` -> `application/vnd.api+json`.
+///
+/// Matching against the bare media type (not the raw header value) is what lets
+/// a `*+json` suffix match even when a parameter follows it, and lets a
+/// present-but-empty value be told apart from a real media type.
+fn bare_media_type(ct: &str) -> String {
+    ct.split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase()
+}
+
 /// Content types whose bodies carry extractable meaning. Everything else is
 /// opaque to us, so only a small diagnostic sample is worth keeping.
 ///
 /// Shared with `http2.rs` so the classification lives in exactly one place.
 pub(crate) fn is_meaningful_content_type(ct: &str) -> bool {
-    let ct = ct.trim().to_ascii_lowercase();
+    let ct = bare_media_type(ct);
     ct.starts_with("application/json")
         || ct.starts_with("text/")
         || ct.starts_with("application/x-www-form-urlencoded")
         // gRPC is binary, but grpc.rs extracts message counts and status from it.
         || ct.starts_with("application/grpc")
         || ct.ends_with("+json")
+}
+
+/// Selects the body cap for a (possibly absent) Content-Type value.
+///
+/// Absent, empty, or otherwise unparseable Content-Type resolves to the
+/// generous cap: being wrongly generous costs memory that the span-buffer
+/// budget absorbs, while being wrongly stingy silently loses data.
+///
+/// Shared with `http2.rs` so both protocols apply the exact same rule.
+pub(crate) fn cap_for_content_type(ct: Option<&str>, limits: &Limits) -> usize {
+    let media_type = ct.map(bare_media_type);
+    match media_type.as_deref() {
+        None | Some("") => limits.max_body_bytes,
+        Some(mt) if is_meaningful_content_type(mt) => limits.max_body_bytes,
+        Some(_) => limits.max_opaque_body_bytes,
+    }
 }
 
 /// Selects the body cap for a message, based on Content-Type.
@@ -397,14 +428,10 @@ pub(crate) fn is_meaningful_content_type(ct: &str) -> bool {
 fn body_cap(headers: &[(String, String)], limits: &Limits) -> usize {
     for (k, v) in headers {
         if k.eq_ignore_ascii_case("content-type") {
-            return if is_meaningful_content_type(v) {
-                limits.max_body_bytes
-            } else {
-                limits.max_opaque_body_bytes
-            };
+            return cap_for_content_type(Some(v), limits);
         }
     }
-    limits.max_body_bytes
+    cap_for_content_type(None, limits)
 }
 
 fn request_to_parsed(req: &httparse::Request) -> ParsedHttp {
@@ -889,6 +916,76 @@ mod tests {
         for ct in ["application/octet-stream", "image/png", "video/mp4"] {
             assert!(!is_meaningful_content_type(ct), "{ct} should be opaque");
         }
+    }
+
+    #[test]
+    fn plus_json_suffix_matches_even_with_a_trailing_parameter() {
+        // `ends_with("+json")` alone breaks the moment a `; charset=...` parameter
+        // is appended, because it no longer ends with "+json" — it ends with the
+        // parameter. JSON:API and HAL+JSON both carry a charset in practice.
+        assert!(is_meaningful_content_type(
+            "application/vnd.api+json; charset=utf-8"
+        ));
+    }
+
+    #[test]
+    fn empty_content_type_value_resolves_generous() {
+        // "absent or unparseable" must include a present-but-empty value: it is
+        // exactly as unparseable as a missing header, and the same rationale
+        // applies (wrongly generous costs memory; wrongly stingy loses data).
+        let limits = Limits {
+            max_body_bytes: 100,
+            max_opaque_body_bytes: 4,
+            ..Default::default()
+        };
+        assert_eq!(cap_for_content_type(Some(""), &limits), 100);
+        assert_eq!(cap_for_content_type(Some("   "), &limits), 100);
+        assert_eq!(cap_for_content_type(None, &limits), 100);
+    }
+
+    #[test]
+    fn parameterized_plus_json_body_uses_the_generous_cap() {
+        let limits = Limits {
+            max_body_bytes: 100,
+            max_opaque_body_bytes: 4,
+            ..Default::default()
+        };
+        let mut s = Http1Stream::new(false, limits);
+        let raw = b"HTTP/1.1 200 OK\r\nContent-Type: application/vnd.api+json; charset=utf-8\r\nContent-Length: 10\r\n\r\n0123456789";
+        let msgs = s.feed(raw);
+        assert_eq!(msgs[0].body, b"0123456789");
+        assert!(!msgs[0].truncated);
+    }
+
+    #[test]
+    fn empty_content_type_header_uses_the_generous_cap() {
+        let limits = Limits {
+            max_body_bytes: 100,
+            max_opaque_body_bytes: 4,
+            ..Default::default()
+        };
+        let mut s = Http1Stream::new(false, limits);
+        let raw = b"HTTP/1.1 200 OK\r\nContent-Type: \r\nContent-Length: 10\r\n\r\n0123456789";
+        let msgs = s.feed(raw);
+        assert_eq!(msgs[0].body, b"0123456789");
+        assert!(!msgs[0].truncated);
+    }
+
+    #[test]
+    fn event_stream_body_uses_the_generous_cap() {
+        // Promoted to an end-to-end test: SSE is the streaming-LLM path this
+        // slice exists to protect, so it deserves coverage through the parser,
+        // not just through the classifier predicate.
+        let limits = Limits {
+            max_body_bytes: 100,
+            max_opaque_body_bytes: 4,
+            ..Default::default()
+        };
+        let mut s = Http1Stream::new(false, limits);
+        let raw = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 10\r\n\r\n0123456789";
+        let msgs = s.feed(raw);
+        assert_eq!(msgs[0].body, b"0123456789");
+        assert!(!msgs[0].truncated);
     }
 
     #[test]

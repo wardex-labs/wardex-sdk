@@ -103,7 +103,13 @@ struct StreamState {
     method: Option<String>,
     path: Option<String>,
     status: Option<u16>,
-    content_type: Option<String>,
+    // Tracked per direction, not merged: the cap for a DATA frame must be
+    // decided from that direction's own Content-Type only. A response that
+    // omits its Content-Type must not inherit the request's — that would
+    // silently apply the tight cap to a body the rule says should get the
+    // generous one.
+    req_content_type: Option<String>,
+    resp_content_type: Option<String>,
     grpc_status: Option<i32>,
     grpc_message: Option<String>,
     req_body: Vec<u8>,
@@ -316,7 +322,12 @@ impl Http2Connection {
                     st.status = String::from_utf8_lossy(&value).trim().parse().ok();
                 }
                 b"content-type" => {
-                    st.content_type = Some(String::from_utf8_lossy(&value).into_owned());
+                    let ct = String::from_utf8_lossy(&value).into_owned();
+                    if from_client {
+                        st.req_content_type = Some(ct);
+                    } else {
+                        st.resp_content_type = Some(ct);
+                    }
                 }
                 b"grpc-status" => {
                     st.grpc_status = String::from_utf8_lossy(&value).trim().parse().ok();
@@ -355,13 +366,17 @@ impl Http2Connection {
             // never truncated. Content types carrying no extractable meaning
             // (and gRPC's binary framing aside) take the much smaller opaque
             // cap; an absent or unparseable Content-Type gets the generous cap.
-            let cap = match st.content_type.as_deref() {
-                Some(ct) if crate::http1::is_meaningful_content_type(ct) => {
-                    self.limits.max_body_bytes
-                }
-                Some(_) => self.limits.max_opaque_body_bytes,
-                None => self.limits.max_body_bytes,
+            //
+            // The cap is decided from *this direction's own* Content-Type only
+            // — a response DATA frame must not fall back to the request's
+            // Content-Type (or vice versa). Doing so would be wrongly stingy
+            // whenever one direction is unlabeled and the other is opaque.
+            let this_direction_ct = if from_client {
+                st.req_content_type.as_deref()
+            } else {
+                st.resp_content_type.as_deref()
             };
+            let cap = crate::http1::cap_for_content_type(this_direction_ct, &self.limits);
             let target = if from_client {
                 &mut st.req_body
             } else {
@@ -430,7 +445,12 @@ impl Http2Connection {
                     method: s.method.unwrap_or_default(),
                     path: s.path.unwrap_or_default(),
                     status: s.status.unwrap_or(0),
-                    content_type: s.content_type,
+                    // Preserves the transaction-level field's prior semantics
+                    // (response overwrote request when both HEADERS blocks
+                    // set it): the response's declared type wins when present,
+                    // falling back to the request's. Cap selection in on_data
+                    // does *not* use this merged value — see the comment there.
+                    content_type: s.resp_content_type.or(s.req_content_type),
                     grpc_status: s.grpc_status,
                     grpc_message: s.grpc_message,
                     request_body: s.req_body,
@@ -866,5 +886,77 @@ mod tests {
             assert!(!txn.truncated);
             assert_eq!(txn.request_body, b"0123456789");
         }
+    }
+
+    #[test]
+    fn response_without_content_type_does_not_inherit_request_content_type() {
+        // A response that omits its own Content-Type must get the generous cap
+        // ("absent → generous") — not the request's opaque cap. Content-type is
+        // tracked per direction precisely so a binary upload followed by an
+        // unlabeled response doesn't silently truncate that response.
+        let limits = Limits {
+            max_body_bytes: 100,
+            max_opaque_body_bytes: 4,
+            ..Default::default()
+        };
+        let mut c = Http2Connection::new(limits);
+
+        let req_block = hpack(&[
+            (b":method", b"POST"),
+            (b":path", b"/p"),
+            (b"content-type", b"application/octet-stream"),
+        ]);
+        let mut req = frame(0x1, FH, 1, &req_block);
+        req.extend_from_slice(&frame(0x0, FS, 1, b"0123456789"));
+        c.feed(true, &req);
+
+        // Response HEADERS carry no content-type at all.
+        let resp_block = hpack(&[(b":status", b"200")]);
+        let mut resp = frame(0x1, FH, 1, &resp_block);
+        resp.extend_from_slice(&frame(0x0, FS, 1, b"0123456789"));
+        let r = c.feed(false, &resp);
+
+        let txn = r.transactions.first().expect("one transaction");
+        // Request used the opaque cap for its own (declared) content type.
+        assert_eq!(txn.request_body, b"0123");
+        // Response used the generous cap: it declared no content type of its
+        // own, and must not inherit the request's.
+        assert_eq!(txn.response_body, b"0123456789");
+    }
+
+    #[test]
+    fn each_direction_uses_its_own_content_type_for_its_cap() {
+        // Existing-behavior check to pair with the test above: when a direction
+        // *does* declare its own Content-Type, that declared type — not the
+        // other direction's — is what decides its cap.
+        let limits = Limits {
+            max_body_bytes: 100,
+            max_opaque_body_bytes: 4,
+            ..Default::default()
+        };
+        let mut c = Http2Connection::new(limits);
+
+        let req_block = hpack(&[
+            (b":method", b"POST"),
+            (b":path", b"/p"),
+            (b"content-type", b"application/json"),
+        ]);
+        let mut req = frame(0x1, FH, 1, &req_block);
+        req.extend_from_slice(&frame(0x0, FS, 1, b"0123456789"));
+        c.feed(true, &req);
+
+        let resp_block = hpack(&[
+            (b":status", b"200"),
+            (b"content-type", b"application/octet-stream"),
+        ]);
+        let mut resp = frame(0x1, FH, 1, &resp_block);
+        resp.extend_from_slice(&frame(0x0, FS, 1, b"0123456789"));
+        let r = c.feed(false, &resp);
+
+        let txn = r.transactions.first().expect("one transaction");
+        // Request declared json → generous cap, full body kept.
+        assert_eq!(txn.request_body, b"0123456789");
+        // Response declared octet-stream → opaque cap, truncated to 4.
+        assert_eq!(txn.response_body, b"0123");
     }
 }
