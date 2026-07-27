@@ -347,19 +347,27 @@ impl Http2Connection {
             return;
         }
         let body = &payload[..payload.len() - pad_len];
-        // Raises the effective cap from the previous hardcoded 8 MiB to max_body_bytes
-        // (32 MiB by default), which is derived from the Anthropic Messages API request
-        // ceiling so a valid LLM request is never truncated. A later change makes this
-        // content-type aware; opaque bodies then take the much smaller opaque cap.
-        let max_body = self.limits.max_body_bytes;
         {
             let st = self.streams.entry(frame.stream_id).or_default();
+            // Raises the effective cap from the previous hardcoded 8 MiB to
+            // max_body_bytes (32 MiB by default), which is derived from the
+            // Anthropic Messages API request ceiling so a valid LLM request is
+            // never truncated. Content types carrying no extractable meaning
+            // (and gRPC's binary framing aside) take the much smaller opaque
+            // cap; an absent or unparseable Content-Type gets the generous cap.
+            let cap = match st.content_type.as_deref() {
+                Some(ct) if crate::http1::is_meaningful_content_type(ct) => {
+                    self.limits.max_body_bytes
+                }
+                Some(_) => self.limits.max_opaque_body_bytes,
+                None => self.limits.max_body_bytes,
+            };
             let target = if from_client {
                 &mut st.req_body
             } else {
                 &mut st.resp_body
             };
-            let room = max_body.saturating_sub(target.len());
+            let room = cap.saturating_sub(target.len());
             if body.len() <= room {
                 target.extend_from_slice(body);
             } else {
@@ -727,5 +735,136 @@ mod tests {
         let txn = r.transactions.first().expect("one transaction");
         assert!(txn.truncated);
         assert!(txn.request_body.len() <= 4);
+    }
+
+    #[test]
+    fn json_body_uses_the_generous_cap() {
+        let limits = Limits {
+            max_body_bytes: 100,
+            max_opaque_body_bytes: 4,
+            ..Default::default()
+        };
+        let mut c = Http2Connection::new(limits);
+
+        let req_block = hpack(&[
+            (b":method", b"POST"),
+            (b":path", b"/p"),
+            (b"content-type", b"application/json"),
+        ]);
+        let mut req = frame(0x1, FH, 1, &req_block);
+        req.extend_from_slice(&frame(0x0, FS, 1, b"0123456789"));
+        c.feed(true, &req);
+
+        let resp_block = hpack(&[(b":status", b"200")]);
+        let r = c.feed(false, &frame(0x1, FH | FS, 1, &resp_block));
+
+        let txn = r.transactions.first().expect("one transaction");
+        assert!(!txn.truncated);
+        assert_eq!(txn.request_body, b"0123456789");
+    }
+
+    #[test]
+    fn opaque_body_uses_the_tight_cap() {
+        let limits = Limits {
+            max_body_bytes: 100,
+            max_opaque_body_bytes: 4,
+            ..Default::default()
+        };
+        let mut c = Http2Connection::new(limits);
+
+        let req_block = hpack(&[
+            (b":method", b"POST"),
+            (b":path", b"/p"),
+            (b"content-type", b"application/octet-stream"),
+        ]);
+        let mut req = frame(0x1, FH, 1, &req_block);
+        req.extend_from_slice(&frame(0x0, FS, 1, b"0123456789"));
+        c.feed(true, &req);
+
+        let resp_block = hpack(&[(b":status", b"200")]);
+        let r = c.feed(false, &frame(0x1, FH | FS, 1, &resp_block));
+
+        let txn = r.transactions.first().expect("one transaction");
+        assert!(txn.truncated);
+        assert_eq!(txn.request_body, b"0123");
+    }
+
+    #[test]
+    fn missing_content_type_uses_the_generous_cap() {
+        let limits = Limits {
+            max_body_bytes: 100,
+            max_opaque_body_bytes: 4,
+            ..Default::default()
+        };
+        let mut c = Http2Connection::new(limits);
+
+        let req_block = hpack(&[(b":method", b"POST"), (b":path", b"/p")]);
+        let mut req = frame(0x1, FH, 1, &req_block);
+        req.extend_from_slice(&frame(0x0, FS, 1, b"0123456789"));
+        c.feed(true, &req);
+
+        let resp_block = hpack(&[(b":status", b"200")]);
+        let r = c.feed(false, &frame(0x1, FH | FS, 1, &resp_block));
+
+        let txn = r.transactions.first().expect("one transaction");
+        assert!(!txn.truncated);
+        assert_eq!(txn.request_body, b"0123456789");
+    }
+
+    #[test]
+    fn grpc_body_uses_the_generous_cap() {
+        let limits = Limits {
+            max_body_bytes: 100,
+            max_opaque_body_bytes: 4,
+            ..Default::default()
+        };
+        let mut c = Http2Connection::new(limits);
+
+        let req_block = hpack(&[
+            (b":method", b"POST"),
+            (b":path", b"/echo.Echo/Say"),
+            (b"content-type", b"application/grpc+proto"),
+        ]);
+        let mut req = frame(0x1, FH, 1, &req_block);
+        req.extend_from_slice(&frame(0x0, FS, 1, b"0123456789"));
+        c.feed(true, &req);
+
+        let resp_block = hpack(&[(b":status", b"200")]);
+        let r = c.feed(false, &frame(0x1, FH | FS, 1, &resp_block));
+
+        let txn = r.transactions.first().expect("one transaction");
+        assert!(!txn.truncated);
+        assert_eq!(txn.request_body.len(), 10);
+    }
+
+    #[test]
+    fn content_type_matching_is_case_insensitive_and_ignores_parameters() {
+        let limits = Limits {
+            max_body_bytes: 100,
+            max_opaque_body_bytes: 4,
+            ..Default::default()
+        };
+
+        for ct in [
+            &b"APPLICATION/JSON"[..],
+            &b"application/json; charset=utf-8"[..],
+        ] {
+            let mut c = Http2Connection::new(limits);
+            let req_block = hpack(&[
+                (b":method", b"POST"),
+                (b":path", b"/p"),
+                (b"content-type", ct),
+            ]);
+            let mut req = frame(0x1, FH, 1, &req_block);
+            req.extend_from_slice(&frame(0x0, FS, 1, b"0123456789"));
+            c.feed(true, &req);
+
+            let resp_block = hpack(&[(b":status", b"200")]);
+            let r = c.feed(false, &frame(0x1, FH | FS, 1, &resp_block));
+
+            let txn = r.transactions.first().expect("one transaction");
+            assert!(!txn.truncated);
+            assert_eq!(txn.request_body, b"0123456789");
+        }
     }
 }

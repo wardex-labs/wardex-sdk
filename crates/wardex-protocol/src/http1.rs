@@ -375,8 +375,35 @@ fn append_capped(msg: &mut ParsedHttp, data: &[u8], cap: usize) {
     }
 }
 
-/// Selects the body cap for a message. A later slice makes this content-type aware.
-fn body_cap(_headers: &[(String, String)], limits: &Limits) -> usize {
+/// Content types whose bodies carry extractable meaning. Everything else is
+/// opaque to us, so only a small diagnostic sample is worth keeping.
+///
+/// Shared with `http2.rs` so the classification lives in exactly one place.
+pub(crate) fn is_meaningful_content_type(ct: &str) -> bool {
+    let ct = ct.trim().to_ascii_lowercase();
+    ct.starts_with("application/json")
+        || ct.starts_with("text/")
+        || ct.starts_with("application/x-www-form-urlencoded")
+        // gRPC is binary, but grpc.rs extracts message counts and status from it.
+        || ct.starts_with("application/grpc")
+        || ct.ends_with("+json")
+}
+
+/// Selects the body cap for a message, based on Content-Type.
+///
+/// A message with no parseable Content-Type gets the generous cap: being
+/// wrongly generous costs memory that the span-buffer budget absorbs, while
+/// being wrongly stingy silently loses data.
+fn body_cap(headers: &[(String, String)], limits: &Limits) -> usize {
+    for (k, v) in headers {
+        if k.eq_ignore_ascii_case("content-type") {
+            return if is_meaningful_content_type(v) {
+                limits.max_body_bytes
+            } else {
+                limits.max_opaque_body_bytes
+            };
+        }
+    }
     limits.max_body_bytes
 }
 
@@ -844,5 +871,134 @@ mod tests {
                 "split at {split_at}"
             );
         }
+    }
+
+    #[test]
+    fn is_meaningful_content_type_covers_every_table_row() {
+        for ct in [
+            "application/json",
+            "text/plain",
+            "text/event-stream",
+            "application/x-www-form-urlencoded",
+            "application/grpc",
+            "application/grpc+proto",
+            "application/ld+json",
+        ] {
+            assert!(is_meaningful_content_type(ct), "{ct} should be meaningful");
+        }
+        for ct in ["application/octet-stream", "image/png", "video/mp4"] {
+            assert!(!is_meaningful_content_type(ct), "{ct} should be opaque");
+        }
+    }
+
+    #[test]
+    fn json_body_uses_the_generous_cap() {
+        let limits = Limits {
+            max_body_bytes: 100,
+            max_opaque_body_bytes: 4,
+            ..Default::default()
+        };
+        let mut s = Http1Stream::new(false, limits);
+        let raw = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 10\r\n\r\n0123456789";
+        let msgs = s.feed(raw);
+        assert_eq!(msgs[0].body, b"0123456789");
+        assert!(!msgs[0].truncated);
+    }
+
+    #[test]
+    fn opaque_body_uses_the_tight_cap() {
+        let limits = Limits {
+            max_body_bytes: 100,
+            max_opaque_body_bytes: 4,
+            ..Default::default()
+        };
+        let mut s = Http1Stream::new(false, limits);
+        let raw = b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: 10\r\n\r\n0123456789";
+        let msgs = s.feed(raw);
+        assert_eq!(msgs[0].body, b"0123");
+        assert!(msgs[0].truncated);
+        assert!(msgs[0].limitations.contains(&"body_cap_exceeded"));
+    }
+
+    #[test]
+    fn missing_content_type_uses_the_generous_cap() {
+        // Being wrongly generous costs memory the span-buffer budget absorbs;
+        // being wrongly stingy silently loses data.
+        let limits = Limits {
+            max_body_bytes: 100,
+            max_opaque_body_bytes: 4,
+            ..Default::default()
+        };
+        let mut s = Http1Stream::new(false, limits);
+        let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n0123456789";
+        let msgs = s.feed(raw);
+        assert_eq!(msgs[0].body, b"0123456789");
+    }
+
+    #[test]
+    fn grpc_body_uses_the_generous_cap() {
+        let limits = Limits {
+            max_body_bytes: 100,
+            max_opaque_body_bytes: 4,
+            ..Default::default()
+        };
+        let mut s = Http1Stream::new(false, limits);
+        let raw = b"HTTP/1.1 200 OK\r\nContent-Type: application/grpc+proto\r\nContent-Length: 10\r\n\r\n0123456789";
+        assert_eq!(s.feed(raw)[0].body.len(), 10);
+    }
+
+    #[test]
+    fn keep_alive_survives_a_capped_body() {
+        // The whole point of capping rather than disabling: a large transfer must
+        // not cost us the next request on a pooled connection. This exercises the
+        // opaque-cap path specifically, not just the generous cap used by the
+        // pre-existing body_cap_truncates_but_framing_keeps_advancing test.
+        let limits = Limits {
+            max_opaque_body_bytes: 4,
+            ..Default::default()
+        };
+        let mut s = Http1Stream::new(false, limits);
+        let mut raw = b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: 10\r\n\r\n0123456789".to_vec();
+        raw.extend_from_slice(
+            b"HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\nok",
+        );
+        let msgs = s.feed(&raw);
+        assert_eq!(msgs.len(), 2);
+        assert!(msgs[0].truncated);
+        assert_eq!(msgs[1].status, Some(201));
+        assert_eq!(msgs[1].body, b"ok");
+    }
+
+    #[test]
+    fn chunked_keep_alive_survives_a_capped_body() {
+        let limits = Limits {
+            max_opaque_body_bytes: 4,
+            ..Default::default()
+        };
+        let mut s = Http1Stream::new(false, limits);
+        let mut raw = b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n".to_vec();
+        raw.extend_from_slice(b"HTTP/1.1 201 Created\r\nContent-Length: 2\r\n\r\nok");
+        let msgs = s.feed(&raw);
+        assert_eq!(msgs.len(), 2, "framing must survive a capped chunked body");
+        assert_eq!(msgs[0].body, b"hell");
+        assert!(msgs[0].truncated);
+        assert_eq!(msgs[1].status, Some(201));
+    }
+
+    #[test]
+    fn content_type_matching_is_case_insensitive_and_ignores_parameters() {
+        let limits = Limits {
+            max_body_bytes: 100,
+            max_opaque_body_bytes: 4,
+            ..Default::default()
+        };
+
+        let mut s = Http1Stream::new(false, limits);
+        let raw = b"HTTP/1.1 200 OK\r\nContent-Type: APPLICATION/JSON\r\nContent-Length: 10\r\n\r\n0123456789";
+        assert_eq!(s.feed(raw)[0].body, b"0123456789");
+
+        let mut s = Http1Stream::new(false, limits);
+        let raw = b"HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: 10\r\n\r\n0123456789";
+        assert_eq!(s.feed(raw)[0].body, b"0123456789");
     }
 }
