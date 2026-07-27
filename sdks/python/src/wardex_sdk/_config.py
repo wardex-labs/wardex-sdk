@@ -62,7 +62,7 @@ class WardexConfig:
     environment: str | None = None
     tags: tuple[tuple[str, str], ...] = ()
 
-    def __new__(cls, **kwargs: object) -> WardexConfig:
+    def __new__(cls, *args: object, **kwargs: object) -> WardexConfig:
         moved = [name for name in _MOVED_TO_LIMITS if name in kwargs]
         if moved:
             names = ", ".join(moved)
@@ -70,7 +70,11 @@ class WardexConfig:
                 f"{names} moved into limits= in 0.2.0b1. "
                 f"Use limits=CaptureLimits({moved[0]}=...) instead."
             )
-        return super().__new__(cls)
+        # object.__new__, not super().__new__: @dataclass(slots=True) rebuilds
+        # the class to attach __slots__, which invalidates the zero-arg
+        # super() closure cell on some interpreters (observed on CPython
+        # 3.13; not 3.14). object.__new__(cls) sidesteps that entirely.
+        return object.__new__(cls)
 
     def __post_init__(self) -> None:
         """Validate field invariants (intervals, PII mode support). Limit values

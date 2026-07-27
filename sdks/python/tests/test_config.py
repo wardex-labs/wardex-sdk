@@ -13,6 +13,21 @@ def test_defaults():
     assert CaptureTrigger.ERROR in c.retention_triggers
 
 
+def test_new_accepts_zero_arguments():
+    # Regression: a hand-written __new__ guarding the moved kwargs must not
+    # break the plain no-argument construction path.
+    c = WardexConfig()
+    assert c.api_key is None
+
+
+def test_new_accepts_positional_construction():
+    # Regression: __new__ must accept *args — positional construction worked
+    # via the generated __init__ before the moved-field guard was added and
+    # must keep working for every field, not just the two that moved.
+    c = WardexConfig("my-key")
+    assert c.api_key == "my-key"
+
+
 def test_effective_retention_upgrades_local():
     assert WardexConfig(environment="local").effective_retention == RetentionClass.REPLAYABLE
     assert WardexConfig(environment="staging").effective_retention == RetentionClass.REPLAYABLE
