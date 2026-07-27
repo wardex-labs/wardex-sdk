@@ -182,3 +182,86 @@ def test_byte_counter_survives_a_reentrant_drain_mid_append():
         assert len(t.envelopes[0].spans) == 2
     finally:
         c.close()
+
+
+def test_trailing_append_is_never_lost_to_a_reentrant_drain():
+    """The narrowest and most severe reentrancy window: a same-thread signal
+    handler's flush() firing at the *bare statement boundary* between the
+    eviction loop's last (failing) condition check and `self._spans.append`
+    -- no function call happens between those two statements, so no
+    monkeypatched call boundary (the technique the other two reentrancy
+    tests use) can inject a drain there. This uses sys.settrace's line-level
+    hook instead, which fires before a given source line executes regardless
+    of whether that line makes a call.
+
+    If the append targeted a loop-cached local instead of self._spans fresh,
+    a drain firing in this exact window would swap self._spans out from
+    under that stale reference, and the span would land in an orphaned
+    deque -- appended, but never resident, never exported, never counted.
+    Silent, total data loss, and nothing about the counter's own consistency
+    would reveal it. Appending to self._spans fresh instead means the span
+    always lands in whatever is live *at the moment of the append call* --
+    if a drain preempted it, that's the fresh deque, and the span survives.
+    The byte counter may then undercount by one span's size until the next
+    drain resets it (bounded, self-healing) -- but the span itself is never
+    lost.
+    """
+    import inspect
+    import sys
+
+    import wardex_sdk._client as client_module
+
+    src_lines, start_line = inspect.getsourcelines(client_module.Client.capture_span)
+    target_line = next(
+        start_line + i
+        for i, line in enumerate(src_lines)
+        if line.strip() == "self._spans.append(span)"
+    )
+
+    t = _Recording()
+    cfg = WardexConfig(api_key="k", limits=CaptureLimits(max_buffer_bytes=5000))
+    c = Client(cfg, t)
+    fired = {"done": False}
+
+    def line_tracer(frame, event, arg):
+        if (
+            event == "line"
+            and frame.f_code is client_module.Client.capture_span.__code__
+            and frame.f_lineno == target_line
+            and not fired["done"]
+        ):
+            fired["done"] = True
+            sys.settrace(None)  # disable before the reentrant call, avoid tracing _drain too
+            c._drain(5.0)  # reentrant: same thread, same RLock capture_span already holds
+            return None
+        return line_tracer
+
+    def call_tracer(frame, event, arg):
+        if event == "call" and frame.f_code is client_module.Client.capture_span.__code__:
+            return line_tracer
+        return call_tracer
+
+    try:
+        c.capture_span(_span(output_data=b"x" * 100))  # baseline resident span, 612 bytes
+
+        sys.settrace(call_tracer)
+        try:
+            new_span = _span(output_data=b"y" * 50)  # 562 bytes; well under the budget
+            c.capture_span(new_span)  # the injected drain fires right before this appends
+        finally:
+            sys.settrace(None)
+
+        assert fired["done"], "trace hook never reached the target line -- test is stale"
+        # The core assertion: the span must be present, never silently dropped.
+        assert any(s is new_span for s in c._spans)
+        # The injected drain fired *before* the append (self._spans held only
+        # the baseline at that point), so it exported just the baseline.
+        assert len(t.envelopes) == 1
+        assert len(t.envelopes[0].spans) == 1
+        # The counter may understate against the freshly-swapped-in deque
+        # (bounded, self-healing) but must never go negative or overstate.
+        actual = sum(len(s.output_data) + 512 for s in c._spans)
+        assert 0 <= c._buffered_bytes <= actual
+    finally:
+        sys.settrace(None)
+        c.close()

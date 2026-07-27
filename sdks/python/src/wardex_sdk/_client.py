@@ -101,11 +101,25 @@ class Client:
             #     otherwise raise IndexError on the empty deque);
             #   - every counter update (_buffered_bytes, _dropped) is gated
             #     on `self._spans is spans` -- if a drain interleaved, the
-            #     item we just popped or are about to append belongs to a
-            #     deque that's already been handed off (exported, for an
-            #     eviction, or orphaned, for the final append), so its delta
-            #     no longer applies to the fresh buffer and is skipped
-            #     rather than corrupting the reset total.
+            #     item we just popped belongs to a deque that's already been
+            #     handed off (exported), so its delta no longer applies to
+            #     the fresh buffer and is skipped rather than corrupting the
+            #     reset total.
+            #   - the final append always targets self._spans fresh (never
+            #     the loop-cached `spans` local) so the span itself is never
+            #     lost to an orphaned deque -- only the *counter* update is
+            #     gated on identity. If a drain fires before the append, the
+            #     span lands in the fresh deque and survives, but the
+            #     identity check (comparing against the pre-append `spans`)
+            #     correctly sees a mismatch and skips the increment: the
+            #     counter understates by one span's size until the next
+            #     drain resets it -- bounded and self-healing, never data
+            #     loss. If a drain fires after the append but before the
+            #     check, the span was already captured in the exported
+            #     batch, and skipping the increment is exactly correct (the
+            #     fresh buffer doesn't contain it, so 0 is exact). The
+            #     counter can therefore only ever understate, never overstate
+            #     or go negative, and the span is never dropped silently.
             while (spans := self._spans) and (
                 len(spans) >= self._max_buffer_spans
                 or self._buffered_bytes + size > self._max_buffer_bytes
@@ -115,7 +129,7 @@ class Client:
                 if self._spans is spans:
                     self._buffered_bytes -= evicted_size
                     self._dropped += 1
-            spans.append(span)
+            self._spans.append(span)
             if self._spans is spans:
                 self._buffered_bytes += size
             should_wake = len(self._spans) >= self._flush_threshold
