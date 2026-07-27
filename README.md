@@ -171,6 +171,26 @@ Plaintext hosts you've explicitly named via `intercept_hosts` are always
 captured regardless of `capture_mode` — a targeted allowlist entry is a
 stronger opt-in than the default policy.
 
+## Resource limits
+
+Every resource bound in the SDK — body size caps, buffer sizes, connection
+and session tracking — is configurable, but the defaults suit most
+workloads and most users never need to touch this. The body cap is set
+above the Anthropic Messages API's request size ceiling, so a request the
+API itself accepts is never truncated by capture.
+
+```python
+import wardex_sdk as wardex
+from wardex_sdk import CaptureLimits
+
+wardex.init(
+    limits=CaptureLimits(
+        max_body_bytes=64 * 1024 * 1024,  # larger multimodal payloads
+        max_buffer_bytes=16 * 1024 * 1024,  # tighter memory budget
+    )
+)
+```
+
 ## Roadmap
 
 1. ~~PII masking (pre-send safety)~~ — shipped

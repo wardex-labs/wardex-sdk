@@ -49,6 +49,11 @@ def test_public_exports_exist():
         assert hasattr(wardex_sdk, name), name
 
 
+def test_capture_limits_is_public():
+    assert "CaptureLimits" in wardex_sdk.__all__
+    assert wardex_sdk.CaptureLimits().max_body_bytes is None
+
+
 def test_capture_state_snapshot_with_input_refs():
     wardex_sdk.init(api_key="k")
     with wardex_sdk.trace("s"):

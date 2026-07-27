@@ -5,6 +5,47 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.0b1] - 2026-07-28
+
+### Breaking
+- `max_buffer_spans` and `replay_buffer_size` moved from top-level
+  `WardexConfig` into `WardexConfig(limits=CaptureLimits(...))`. Passing
+  either at the top level now raises a `TypeError` naming the new home; the
+  fix is `wardex.init(limits=CaptureLimits(max_buffer_spans=..., replay_buffer_size=...))`.
+- The HTTP/2 body cap default changed shape: 8 MiB flat becomes 32 MiB for
+  content types carrying extractable meaning (JSON, text, SSE, form-encoded,
+  gRPC) and 256 KiB for opaque ones. Content-heavy but non-semantic traffic
+  (binary uploads, opaque blobs) now captures a smaller body sample than
+  before; raise `max_opaque_body_bytes` via `CaptureLimits` if you need more.
+
+### Added
+- `CaptureLimits` — every resource bound in the SDK is now configurable via
+  `wardex.init(limits=CaptureLimits(...))`. The core owns the default values;
+  the Python class holds overrides only, and a test asserts the two can never
+  drift apart.
+- `max_buffer_bytes`: a byte budget on the span buffer, bounding resident
+  memory independently of span count.
+
+### Fixed
+- Non-HTTP traffic over TLS (a Redis, Mongo, or Kafka client sharing the
+  process) accumulated in the HTTP/1 parser for the life of the connection —
+  an unbounded-memory-growth path. The TLS seam now classifies connections
+  the way the plaintext seam always has, and the parser distinguishes
+  malformed input from incomplete input instead of treating both the same.
+- Chunked HTTP/1 responses were re-parsed from the start on every read: a
+  10 MB streaming response scanned roughly 854 MB while holding the GIL. The
+  parser is now single-pass — measured at 10.6 MB scanned for the same
+  10 MB stream.
+- A response with more headers than the parser's fixed-size array could
+  never be parsed, and the failure was silent. It now surfaces as a reported
+  capture limitation instead of hanging indefinitely.
+- `CONNECT` and `TRACE` were missing from the HTTP method list used to
+  classify traffic, so proxied connections were treated as non-HTTP and
+  never captured.
+- The adapter's session maps, streamed tool metadata, and subagent maps had
+  no bound; only open tools were capped. All four are now bounded by
+  `max_session_entries` / `max_sessions`.
+
 ## [0.1.0b5] - 2026-07-08
 
 ### Added
