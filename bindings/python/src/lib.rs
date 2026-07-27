@@ -1,9 +1,16 @@
 //! PyO3 entry point for the `_wardex_native` extension module.
 
+// In the trampoline code generated when the pyo3 #[pyfunction] macro wraps a function
+// returning `PyResult<T>`, clippy mistakes the `?`'s `From<PyErr> for PyErr` (identity)
+// conversion for a useless conversion
+// (a pre-existing pyo3 0.22 issue; a function-level #[allow] can't cover macro-generated sibling items).
+#![allow(clippy::useless_conversion)]
+
 mod codec;
 
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
+use pyo3::types::PyDict;
 use pyo3::wrap_pyfunction;
 use wardex_core::protocol::claude_stream_json as ccs;
 use wardex_core::protocol::grpc::{
@@ -18,6 +25,158 @@ use wardex_core::protocol::websocket::{
     WsFeedResult as CoreWsFeedResult, WsFrame as CoreWsFrame, WsParser as CoreWsParser,
 };
 use wardex_limits::Limits;
+
+/// Python-visible resource limits. Unspecified fields keep the core default.
+#[pyclass(name = "Limits")]
+#[derive(Clone, Copy)]
+struct PyLimits {
+    inner: Limits,
+}
+
+#[pymethods]
+impl PyLimits {
+    #[new]
+    #[pyo3(signature = (
+        max_headers=None, max_body_bytes=None, max_opaque_body_bytes=None,
+        max_stream_buffer_bytes=None, max_decoded_bytes=None, max_streams=None,
+        max_ws_frame_bytes=None, ws_sample_bytes=None, max_connections=None,
+        max_sessions=None, max_session_entries=None, mcp_sniff_bytes=None,
+        max_buffer_spans=None, max_buffer_bytes=None, replay_buffer_size=None,
+        zstd_level=None
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        max_headers: Option<usize>,
+        max_body_bytes: Option<usize>,
+        max_opaque_body_bytes: Option<usize>,
+        max_stream_buffer_bytes: Option<usize>,
+        max_decoded_bytes: Option<usize>,
+        max_streams: Option<usize>,
+        max_ws_frame_bytes: Option<usize>,
+        ws_sample_bytes: Option<usize>,
+        max_connections: Option<usize>,
+        max_sessions: Option<usize>,
+        max_session_entries: Option<usize>,
+        mcp_sniff_bytes: Option<usize>,
+        max_buffer_spans: Option<usize>,
+        max_buffer_bytes: Option<usize>,
+        replay_buffer_size: Option<usize>,
+        zstd_level: Option<i32>,
+    ) -> Self {
+        let d = Limits::default();
+        Self {
+            inner: Limits {
+                max_headers: max_headers.unwrap_or(d.max_headers),
+                max_body_bytes: max_body_bytes.unwrap_or(d.max_body_bytes),
+                max_opaque_body_bytes: max_opaque_body_bytes.unwrap_or(d.max_opaque_body_bytes),
+                max_stream_buffer_bytes: max_stream_buffer_bytes
+                    .unwrap_or(d.max_stream_buffer_bytes),
+                max_decoded_bytes: max_decoded_bytes.unwrap_or(d.max_decoded_bytes),
+                max_streams: max_streams.unwrap_or(d.max_streams),
+                max_ws_frame_bytes: max_ws_frame_bytes.unwrap_or(d.max_ws_frame_bytes),
+                ws_sample_bytes: ws_sample_bytes.unwrap_or(d.ws_sample_bytes),
+                max_connections: max_connections.unwrap_or(d.max_connections),
+                max_sessions: max_sessions.unwrap_or(d.max_sessions),
+                max_session_entries: max_session_entries.unwrap_or(d.max_session_entries),
+                mcp_sniff_bytes: mcp_sniff_bytes.unwrap_or(d.mcp_sniff_bytes),
+                max_buffer_spans: max_buffer_spans.unwrap_or(d.max_buffer_spans),
+                max_buffer_bytes: max_buffer_bytes.unwrap_or(d.max_buffer_bytes),
+                replay_buffer_size: replay_buffer_size.unwrap_or(d.replay_buffer_size),
+                zstd_level: zstd_level.unwrap_or(d.zstd_level),
+            },
+        }
+    }
+
+    #[getter]
+    fn max_headers(&self) -> usize {
+        self.inner.max_headers
+    }
+    #[getter]
+    fn max_body_bytes(&self) -> usize {
+        self.inner.max_body_bytes
+    }
+    #[getter]
+    fn max_opaque_body_bytes(&self) -> usize {
+        self.inner.max_opaque_body_bytes
+    }
+    #[getter]
+    fn max_stream_buffer_bytes(&self) -> usize {
+        self.inner.max_stream_buffer_bytes
+    }
+    #[getter]
+    fn max_decoded_bytes(&self) -> usize {
+        self.inner.max_decoded_bytes
+    }
+    #[getter]
+    fn max_streams(&self) -> usize {
+        self.inner.max_streams
+    }
+    #[getter]
+    fn max_ws_frame_bytes(&self) -> usize {
+        self.inner.max_ws_frame_bytes
+    }
+    #[getter]
+    fn ws_sample_bytes(&self) -> usize {
+        self.inner.ws_sample_bytes
+    }
+    #[getter]
+    fn max_connections(&self) -> usize {
+        self.inner.max_connections
+    }
+    #[getter]
+    fn max_sessions(&self) -> usize {
+        self.inner.max_sessions
+    }
+    #[getter]
+    fn max_session_entries(&self) -> usize {
+        self.inner.max_session_entries
+    }
+    #[getter]
+    fn mcp_sniff_bytes(&self) -> usize {
+        self.inner.mcp_sniff_bytes
+    }
+    #[getter]
+    fn max_buffer_spans(&self) -> usize {
+        self.inner.max_buffer_spans
+    }
+    #[getter]
+    fn max_buffer_bytes(&self) -> usize {
+        self.inner.max_buffer_bytes
+    }
+    #[getter]
+    fn replay_buffer_size(&self) -> usize {
+        self.inner.replay_buffer_size
+    }
+    #[getter]
+    fn zstd_level(&self) -> i32 {
+        self.inner.zstd_level
+    }
+}
+
+/// The core's default limits as a plain dict. The Python mirror asserts key
+/// parity against this so a new limit cannot be added without mirroring it.
+#[pyfunction]
+fn limits_defaults(py: Python<'_>) -> PyResult<Bound<'_, PyDict>> {
+    let d = Limits::default();
+    let out = PyDict::new_bound(py);
+    out.set_item("max_headers", d.max_headers)?;
+    out.set_item("max_body_bytes", d.max_body_bytes)?;
+    out.set_item("max_opaque_body_bytes", d.max_opaque_body_bytes)?;
+    out.set_item("max_stream_buffer_bytes", d.max_stream_buffer_bytes)?;
+    out.set_item("max_decoded_bytes", d.max_decoded_bytes)?;
+    out.set_item("max_streams", d.max_streams)?;
+    out.set_item("max_ws_frame_bytes", d.max_ws_frame_bytes)?;
+    out.set_item("ws_sample_bytes", d.ws_sample_bytes)?;
+    out.set_item("max_connections", d.max_connections)?;
+    out.set_item("max_sessions", d.max_sessions)?;
+    out.set_item("max_session_entries", d.max_session_entries)?;
+    out.set_item("mcp_sniff_bytes", d.mcp_sniff_bytes)?;
+    out.set_item("max_buffer_spans", d.max_buffer_spans)?;
+    out.set_item("max_buffer_bytes", d.max_buffer_bytes)?;
+    out.set_item("replay_buffer_size", d.replay_buffer_size)?;
+    out.set_item("zstd_level", d.zstd_level)?;
+    Ok(out)
+}
 
 /// A single parsed HTTP message (for Python exposure).
 #[pyclass]
@@ -124,9 +283,11 @@ struct Http2Parser {
 #[pymethods]
 impl Http2Parser {
     #[new]
-    fn new() -> Self {
+    #[pyo3(signature = (limits=None))]
+    fn new(limits: Option<PyLimits>) -> Self {
+        let l = limits.map(|p| p.inner).unwrap_or_default();
         Self {
-            inner: Http2Connection::new(Limits::default()),
+            inner: Http2Connection::new(l),
         }
     }
 
@@ -150,9 +311,11 @@ struct Http1Parser {
 #[pymethods]
 impl Http1Parser {
     #[new]
-    fn new(is_request: bool) -> Self {
+    #[pyo3(signature = (is_request, limits=None))]
+    fn new(is_request: bool, limits: Option<PyLimits>) -> Self {
+        let l = limits.map(|p| p.inner).unwrap_or_default();
         Self {
-            inner: Http1Stream::new(is_request, Limits::default()),
+            inner: Http1Stream::new(is_request, l),
         }
     }
 
@@ -357,9 +520,11 @@ struct JsonRpcParser {
 #[pymethods]
 impl JsonRpcParser {
     #[new]
-    fn new() -> Self {
+    #[pyo3(signature = (limits=None))]
+    fn new(limits: Option<PyLimits>) -> Self {
+        let l = limits.map(|p| p.inner).unwrap_or_default();
         Self {
-            inner: JsonRpcStream::new(Limits::default()),
+            inner: JsonRpcStream::new(l),
         }
     }
 
@@ -477,9 +642,11 @@ struct WsParser {
 #[pymethods]
 impl WsParser {
     #[new]
-    fn new() -> Self {
+    #[pyo3(signature = (limits=None))]
+    fn new(limits: Option<PyLimits>) -> Self {
+        let l = limits.map(|p| p.inner).unwrap_or_default();
         Self {
-            inner: CoreWsParser::new(Limits::default()),
+            inner: CoreWsParser::new(l),
         }
     }
     fn feed(&mut self, data: &[u8]) -> WsFeedResult {
@@ -626,13 +793,23 @@ fn grpc_status_name(code: i32) -> &'static str {
 }
 
 #[pyfunction]
-fn parse_llm_semantics(host: &str, path: &str, req: &[u8], resp: &[u8]) -> Option<LlmSemantics> {
-    parse_llm(host, path, req, resp, Limits::default()).map(|inner| LlmSemantics { inner })
+#[pyo3(signature = (host, path, req, resp, limits=None))]
+fn parse_llm_semantics(
+    host: &str,
+    path: &str,
+    req: &[u8],
+    resp: &[u8],
+    limits: Option<PyLimits>,
+) -> Option<LlmSemantics> {
+    let l = limits.map(|p| p.inner).unwrap_or_default();
+    parse_llm(host, path, req, resp, l).map(|inner| LlmSemantics { inner })
 }
 
 #[pymodule]
 fn _wardex_native(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
+    m.add_class::<PyLimits>()?;
+    m.add_function(wrap_pyfunction!(limits_defaults, m)?)?;
 
     let protocol = PyModule::new_bound(py, "protocol")?;
     protocol.add_class::<Http1Parser>()?;
