@@ -16,7 +16,8 @@ use wardex_core::codec::otlp::{self, otlp_pb};
 use wardex_core::codec::proto::wardex::v1 as pb;
 use wardex_core::codec::{decode_envelope, encode_envelope};
 use wardex_core::pipeline::pii;
-use wardex_limits::Limits;
+
+use crate::limits::PyLimits;
 
 // --- getattr helpers ---
 
@@ -1087,20 +1088,25 @@ fn pii_apply_otlp(
 }
 
 #[pyfunction]
-#[pyo3(signature = (envelope, pii_mode = "off", pii_disabled = Vec::new()))]
+#[pyo3(signature = (envelope, pii_mode = "off", pii_disabled = Vec::new(), limits = None))]
 fn encode_envelope_py(
     py: Python<'_>,
     envelope: &Bound<'_, PyAny>,
     pii_mode: &str,
     pii_disabled: Vec<String>,
+    limits: Option<PyLimits>,
 ) -> PyResult<Py<PyBytes>> {
+    // `zstd_level` is the only limit the codec reads, and it must come from
+    // the caller's resolved limits: hardcoding the default here would let a
+    // configured level be validated and then silently discarded.
+    let limits = limits.map(|p| p.inner).unwrap_or_default();
     // Marshalling walks Python objects — the only part that needs the GIL.
     let mut proto = envelope_to_proto(envelope)?;
     // Masking + protobuf + zstd are pure Rust: release the GIL so app threads
     // keep running while the batch worker encodes (design §9).
     let bytes = py.allow_threads(|| -> PyResult<Vec<u8>> {
         pii_apply_envelope(&mut proto, pii_mode, &pii_disabled)?;
-        encode_envelope(&proto, Limits::default())
+        encode_envelope(&proto, limits)
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
     })?;
     Ok(PyBytes::new_bound(py, &bytes).unbind())

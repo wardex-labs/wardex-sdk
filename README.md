@@ -191,6 +191,9 @@ wardex.init(
 )
 ```
 
+One exception: `replay_buffer_size` is reserved and currently inert — nothing
+reads it yet, so setting it has no effect.
+
 ## Roadmap
 
 1. ~~PII masking (pre-send safety)~~ — shipped

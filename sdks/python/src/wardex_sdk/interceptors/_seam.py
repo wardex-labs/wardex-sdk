@@ -236,6 +236,14 @@ class ByteSeamInterceptor(InterceptorInterface):
 
         connect_ms, handshake_ms, reused, limitations = self._resolve_timing(obj, st)
 
+        # Markers the protocol parser attached to the transaction (a body that
+        # hit its cap, say). CaptureIntegrity.limitations is where a user reads
+        # them, so a cap applied in Rust has to arrive here or it truncates
+        # invisibly.
+        limitations = limitations + tuple(
+            m for m in getattr(txn, "limitations", ()) if m not in limitations
+        )
+
         # Default values for common span fields (HTTP path). If gRPC, _build_grpc_fields
         # overrides them.
         sem: Any = None
@@ -263,7 +271,16 @@ class ByteSeamInterceptor(InterceptorInterface):
         else:
             # --- LLM semantic extraction (body parser) ---
             try:
-                sem = parse_llm_semantics(url_host, txn.path, txn.request_body, txn.response_body)
+                # The resolved limits must travel with the call: the semantic
+                # parser bounds decompression by max_decoded_bytes, and
+                # omitting them here would silently run on the core default.
+                sem = parse_llm_semantics(
+                    url_host,
+                    txn.path,
+                    txn.request_body,
+                    txn.response_body,
+                    self._native_limits,
+                )
             except Exception:
                 sem = None
             if sem is not None:
