@@ -347,9 +347,12 @@ def test_non_http_tls_traffic_does_not_grow_memory(fake_ssl_socket, bare_ssl_int
 # _PROBES closes that. Each probe drives the real code path twice, once with an
 # override and once on the core defaults, and returns True only if the two
 # outcomes differ: a probe that would still pass with the limit ignored proves
-# nothing. _NOT_ENFORCED names the fields no probe can cover, each with its
-# reason. The two must partition the mirror's field set, so neither adding a
-# limit nor quietly unwiring one can pass without this file saying which it is.
+# nothing. _NOT_ENFORCED names the fields no honest probe can cover, each with
+# its reason -- including one, zstd_level, that a probe *could* exercise while
+# the user-visible behavior stayed fixed, because the component it reaches sits
+# off the live export path. The two tables must partition the mirror's field
+# set, so neither adding a limit nor quietly unwiring one can pass without this
+# file saying which it is.
 
 
 def _native(**kw: int):
@@ -665,16 +668,6 @@ def _dropped_under(limits: CaptureLimits) -> int:
         wardex_sdk.close()
 
 
-def _probe_zstd_level() -> bool:
-    from test_codec import _env, _span
-    from wardex_sdk.transport import _codec
-
-    envelope = _env(_span(output_data=bytes(i % 251 for i in range(200_000))))
-    fast = _codec.encode(envelope, limits=_native(zstd_level=1))
-    dense = _codec.encode(envelope, limits=_native(zstd_level=19))
-    return len(dense) < len(fast)
-
-
 _PROBES = {
     "max_headers": _probe_max_headers,
     "max_body_bytes": _probe_max_body_bytes,
@@ -690,10 +683,17 @@ _PROBES = {
     "mcp_sniff_bytes": _probe_mcp_sniff_bytes,
     "max_buffer_spans": _probe_max_buffer_spans,
     "max_buffer_bytes": _probe_max_buffer_bytes,
-    "zstd_level": _probe_zstd_level,
 }
 
 _NOT_ENFORCED = {
+    "zstd_level": (
+        "Wired but unobservable: encode_envelope reads it, and nothing in the "
+        "live export path calls encode_envelope -- the OTLP exporter uses "
+        "encode_otlp_traces, which neither takes limits nor compresses. A probe "
+        "through the codec would pass while a user's override still changed no "
+        "shipped byte, which is exactly the false green this table exists to "
+        "prevent. Move it back to _PROBES when an envelope transport ships."
+    ),
     "replay_buffer_size": (
         "Reserved: nothing in the SDK reads it, so setting it changes nothing. "
         "Documented as inert in crates/wardex-limits and in the README's "
@@ -709,6 +709,12 @@ def test_every_limit_is_either_probed_or_named_inert():
     A limit added to the core and mirrored into CaptureLimits without any
     consumer would otherwise be advertised as configurable and silently do
     nothing -- which is how zstd_level and max_decoded_bytes shipped inert.
+
+    What this catches is a limit with no consumer. What it does not catch on
+    its own is wiring dropped between the config object and the component:
+    most probes hand the value straight to the component under test rather
+    than routing it through wardex.init(), so a limit could reach its
+    enforcement site here and still never leave CaptureLimits in production.
     """
     fields = set(CaptureLimits.__dataclass_fields__)
     covered = set(_PROBES) | set(_NOT_ENFORCED)

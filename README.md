@@ -29,7 +29,7 @@ wardex.init(
 
 # your app code — OpenAI/Anthropic calls are captured automatically
 
-wardex.close()   # optional — spans auto-flush every 5s, on buffer threshold, and at exit
+wardex.close()  # optional — spans auto-flush every 5s, on buffer threshold, and at exit
 ```
 
 ## Status
@@ -70,8 +70,11 @@ touches your outbound requests or headers. Turn it on with:
 wardex.init(
     transport=OtlpHttpTransport(endpoint="https://<your-collector>/v1/traces"),
     intercept=True,
-    propagate_trace=True,                       # inject W3C headers on outbound calls
-    propagate_targets=["api.internal.example.com", "*.svc.cluster.local"],  # optional glob allowlist; default None = all hosts
+    propagate_trace=True,  # inject W3C headers on outbound calls
+    propagate_targets=[
+        "api.internal.example.com",
+        "*.svc.cluster.local",
+    ],  # optional glob allowlist; default None = all hosts
 )
 ```
 
@@ -191,8 +194,10 @@ wardex.init(
 )
 ```
 
-One exception: `replay_buffer_size` is reserved and currently inert — nothing
-reads it yet, so setting it has no effect.
+Two exceptions are inert today, so setting them has no effect:
+`replay_buffer_size` (nothing reads it yet) and `zstd_level` (read only by the
+envelope encoder, which no live export path calls — the OTLP exporter neither
+takes limits nor compresses).
 
 ## Roadmap
 

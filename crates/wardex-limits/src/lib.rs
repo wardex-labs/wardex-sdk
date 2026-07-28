@@ -76,7 +76,12 @@ pub struct Limits {
     pub replay_buffer_size: usize,
 
     // --- Enforced by the codec ---
-    /// Zstd compression level.
+    /// Zstd compression level. Read by `encode_envelope`, which nothing in the
+    /// live export path calls today: the OTLP exporter uses
+    /// `encode_otlp_traces`, which neither takes limits nor compresses. So the
+    /// wiring is real but the knob is currently unobservable to a user, and it
+    /// is documented as inert alongside `replay_buffer_size` until an envelope
+    /// transport ships.
     pub zstd_level: i32,
 }
 

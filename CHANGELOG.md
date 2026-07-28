@@ -18,18 +18,23 @@ All notable changes to this project are documented here. The format follows
   HTTP/1 had none at all — a large opaque HTTP/1 body (a binary upload,
   say) was captured in full before and is now sampled to 256 KiB. Raise
   `max_opaque_body_bytes` via `CaptureLimits` if you need more. Capping is
-  never silent: a capped message reports `body_cap_exceeded` in
-  `capture_integrity.limitations` and sets `capture_integrity.truncated`.
+  never silent, but it is reported differently per protocol: an HTTP/1
+  message sets `capture_integrity.truncated` and adds `body_cap_exceeded` to
+  `capture_integrity.limitations`; an HTTP/2 transaction carries no
+  `limitations` field and signals the cap through `truncated` alone.
 
 ### Added
 - `CaptureLimits` — every resource bound in the SDK is now configurable via
-  `wardex.init(limits=CaptureLimits(...))`, with one exception noted below.
+  `wardex.init(limits=CaptureLimits(...))`, with two exceptions named below.
   The core owns the default values; the Python class holds overrides only, and
   a test asserts the two can never drift apart. A second test drives each
   limit through the code path that enforces it, so a bound cannot be
-  advertised here while doing nothing.
-- `replay_buffer_size` is the exception: it is reserved and currently inert —
-  nothing in the SDK reads it, so setting it has no effect.
+  advertised here while doing nothing — and any bound that cannot be driven
+  that way has to be listed as inert instead of quietly skipped.
+- Two limits are inert today and have no effect when set: `replay_buffer_size`
+  (nothing in the SDK reads it) and `zstd_level` (read only by the envelope
+  encoder, which no live export path calls — the OTLP exporter neither takes
+  limits nor compresses).
 - `max_buffer_bytes`: a byte budget on the span buffer, bounding resident
   memory independently of span count.
 
