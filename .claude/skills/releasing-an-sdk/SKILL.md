@@ -265,7 +265,12 @@ commit) — there's nothing to undo remotely.
 - **First-time PyPI/OIDC setup** (Trusted Publisher, org creation, project
   transfer) — one-time admin, already done. Assume it exists.
 - **js/java publish** — not wired up; say so rather than improvising.
-- **A wheel smoke-test** — the release workflow builds wheels but doesn't test
-  the built artifact (CI tests a dev build). Closing that gap is a workflow
-  change (install the built wheel, `import wardex_sdk`), not this skill's job.
-  Mention it as a follow-up if a release surfaces an install-only bug.
+- **Widening the wheel smoke-test** — the release workflow already installs the
+  built wheel and imports it in a `smoke-test wheel` job, but only on
+  linux x86_64; the macOS, aarch64, and Windows wheels publish untested. Closing
+  that gap is a workflow change (matrix the smoke job), not this skill's job.
+  Mention it as a follow-up if a release surfaces a platform-specific install
+  bug.
+- **Publishing an sdist** — the workflow ships wheels only (abi3, five
+  platforms). `pip install` on anything outside that set has no source fallback
+  and fails. Adding one is a workflow change, not this skill's job.
