@@ -355,7 +355,7 @@ class Limitation(Enum):
     """A gRPC message runs past the end of the captured body: the last
     length-prefixed frame is incomplete, so its payload is not the whole message.
 
-    Emitted from ``interceptors/_seam.py::_build_grpc_fields`` when
+    Emitted from ``semantics/_grpc.py::build_grpc_fields`` when
     ``parse_grpc_frames`` (``crates/wardex-protocol/src/grpc.rs``) reports
     ``truncated`` — which it does when fewer than 5 bytes remain for a prefix or
     the declared length runs past the buffer. That parser takes no ``Limits`` at
@@ -411,7 +411,7 @@ class Limitation(Enum):
     """The framing layer failed, so the transport fields on this span are
     partial or synthesized.
 
-    Emitted from ``interceptors/_seam.py::_build_grpc_fields`` (gRPC frame
+    Emitted from ``semantics/_grpc.py::build_grpc_fields`` (gRPC frame
     parse raised; the span falls back to plain h2 fields) and
     ``interceptors/_trackers.py::_WebSocketTracker._build_txn`` (either
     direction's frame parser latched off). Until step 3a those two sites emitted
@@ -442,7 +442,7 @@ class Limitation(Enum):
     """The payload was observed compressed and wardex did not decompress it, so
     body bytes on this span are not readable content.
 
-    Emitted from ``interceptors/_seam.py::_build_grpc_fields`` (any request or
+    Emitted from ``semantics/_grpc.py::build_grpc_fields`` (any request or
     response message had its compressed flag set) and
     ``interceptors/_trackers.py::_WebSocketTracker._build_txn``
     (permessage-deflate negotiated). Until step 3a those two sites emitted the
@@ -518,7 +518,7 @@ class Limitation(Enum):
     """No ``grpc-status`` was observed — trailers-only response, or trailers the
     seam never saw — so the span's status is derived from HTTP alone.
 
-    Emitted from ``interceptors/_seam.py::_build_grpc_fields``.
+    Emitted from ``semantics/_grpc.py::build_grpc_fields``.
     """
 
     WS_NO_CLOSE = "ws_no_close"

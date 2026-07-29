@@ -393,7 +393,7 @@ class SessionAssembler:
 
         is_first_turn = sess.turn_index == 0
         # `attempted`, not `bool(payload)`. Only the first turn carries the
-        # prompt on this path (WAR-34 #2 is the fix for that, at step 9); saying
+        # prompt on this path (delta prompt accounting lands at step 9); saying
         # so is different from reporting an empty capture as a failed one.
         draft.set_io(
             input_data=sess.prompt if is_first_turn else b"",
@@ -523,8 +523,8 @@ class SessionAssembler:
         )
         draft.set_status(StatusCode.ERROR if failed else StatusCode.OK)
         if failed:
-            # `finish()` refuses ERROR without a type, which is WAR-34 #5 turned
-            # into a mechanism. The hook payload carries a richer reason
+            # `finish()` refuses ERROR without a type, which turns the
+            # untyped-failure defect into a mechanism. The hook payload carries a richer reason
             # (`PostToolUseFailureHookInput.error` / `is_interrupt`); reading it
             # is step 9's, and until then this is a coarse-but-true type rather
             # than an absent one.

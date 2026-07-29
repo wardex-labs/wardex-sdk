@@ -501,6 +501,95 @@ def test_adapters_and_interceptors_do_not_import_each_other():
     )
 
 
+# semantics/ answers "what does this parsed body mean in gen_ai terms". It reads
+# the protocol layer and writes assembly's closed vocabularies, and that is the
+# whole of it. A positive allowlist for the same reason assembly has one: a new
+# module in the package must force a decision rather than silently widen the
+# layer.
+_SEMANTICS_MAY_IMPORT = frozenset(
+    {
+        f"{_PKG}",
+        f"{_PKG}._types",
+        f"{_PKG}._enums",
+    }
+)
+_SEMANTICS_MAY_IMPORT_PACKAGES = (f"{_PKG}.assembly", f"{_PKG}.protocol")
+
+
+def test_semantics_imports_neither_sibling_observer():
+    """The rule the package's own docstring asserts, made checkable.
+
+    Before this existed, `semantics/__init__.py` claimed it "imports NEITHER
+    sibling" and nothing enforced it — the extraction was a sentence. Adding
+    `from ..interceptors._trackers import _Txn` to `semantics/_grpc.py` — the
+    single edit that destroys the reason the package exists — left every test in
+    this file green.
+
+    It matters because the annotation is the visible half of the same problem:
+    `build_grpc_fields` takes `txn: Any` PRECISELY because naming `_Txn` would
+    be this import. Without the rule, the weaker type buys nothing and the next
+    author simply adds the import back.
+    """
+    violations: list[str] = []
+    for rel, tree in _modules().items():
+        if not rel.startswith("semantics/"):
+            continue
+        for target in sorted(_imported_modules(rel, tree)):
+            if target.startswith(f"{_PKG}.semantics"):
+                continue
+            if target in _SEMANTICS_MAY_IMPORT:
+                continue
+            # `pkg + ":"` is the pseudo-target `_imported_modules` produces for a
+            # symbol re-exported by a PACKAGE (`from ..assembly import
+            # Limitation`). Allowed here, and only here: that IS assembly's and
+            # protocol's declared public surface, which is exactly what a layer
+            # below is supposed to consume. The colon form stays opt-in per
+            # package, so a re-export cannot smuggle in a module this layer may
+            # not reach.
+            if any(
+                target == pkg or target.startswith(pkg + ".") or target.startswith(pkg + ":")
+                for pkg in _SEMANTICS_MAY_IMPORT_PACKAGES
+            ):
+                continue
+            violations.append(f"{rel} -> {target}")
+
+    assert not violations, (
+        f"semantics/ reached outside its layer: {violations}\n\n"
+        "WHY: semantics/ exists so a SECOND byte seam — and eventually a second\n"
+        "language SDK — can reuse the protocol-to-gen_ai mapping without\n"
+        "dragging in the interceptor that happens to call it today. One import\n"
+        "of interceptors/ or adapters/ makes the package a private helper of\n"
+        "that caller again, and the extraction was for nothing."
+    )
+
+
+def test_semantics_internal_modules_stay_private():
+    public = sorted(
+        rel
+        for rel in _modules()
+        if rel.startswith("semantics/")
+        and not rel.rsplit("/", 1)[-1].startswith("_")
+        and rel != "semantics/__init__.py"
+    )
+    assert not public, f"semantics/ modules must stay underscore-private: {public}"
+
+
+def test_semantics_public_surface_is_declared_and_resolvable():
+    """The move promoted four module-private names onto a public package.
+
+    `from wardex_sdk.semantics import build_grpc_fields` is now an import path a
+    user can pin, on a package already published to PyPI. That surface gets the
+    same two rules assembly's does, rather than being de-facto conforming and
+    de-jure unenforced.
+    """
+    import wardex_sdk.semantics as semantics
+
+    assert semantics.__all__, "semantics must declare __all__ — it is the stable surface"
+    assert list(semantics.__all__) == sorted(semantics.__all__), "keep __all__ sorted"
+    missing = [name for name in semantics.__all__ if not hasattr(semantics, name)]
+    assert not missing, f"semantics.__all__ names nothing importable: {missing}"
+
+
 def test_assembly_internal_modules_stay_private():
     public = sorted(
         rel
@@ -780,9 +869,17 @@ _CS4_BUDGET = {
     "adapters/_assembler.py": 2,
     "interceptors/_conn_timing.py": 10,
     "interceptors/_mcp_stdio.py": 13,
-    "interceptors/_seam.py": 5,
+    # 5 -> 4 at step 4, and the line below is where the fifth went. Extracting
+    # `build_grpc_fields` into `semantics/` took its `except Exception:` with it.
+    # Leaving this at 5 would have handed the seam a free slot for a BRAND NEW
+    # silent swallow that no test would notice, because `_assert_within_budget`
+    # only fails on `actual > budget` — a stale-high number passes in silence.
+    # The pair of edits records a transfer; a lone decrement would be a discount
+    # for work nobody did.
+    "interceptors/_seam.py": 4,
     "interceptors/_socket.py": 6,
     "interceptors/_ssl.py": 6,
+    "semantics/_grpc.py": 1,
 }
 
 
@@ -799,8 +896,13 @@ def test_no_silent_swallow_in_assembly():
 
 
 def test_silent_swallows_do_not_spread():
+    # `semantics/` joined the scope the moment the package existed. A rule whose
+    # scope is a list of directories goes blind the instant a refactor creates a
+    # new one, and the failure is invisible: the suite gets GREENER, because the
+    # tallied total drops by whatever moved out of scope. That is the same shape
+    # as raising a budget, arrived at without anyone typing a number.
     _assert_within_budget(
-        _tally(_is_silent_swallow, under=("adapters/", "interceptors/")),
+        _tally(_is_silent_swallow, under=("adapters/", "interceptors/", "semantics/")),
         _CS4_BUDGET,
         "C-S4 (silent swallow in adapters/ or interceptors/)",
         "wardex must not raise into the host, but a swallow that leaves no\n"

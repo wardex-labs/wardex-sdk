@@ -91,7 +91,7 @@ def _llm_semantics_by_marker(monkeypatch):
     not the body parser, so the one input the parser contributes is stubbed and
     the seam is driven with it directly.
     """
-    monkeypatch.setattr(_seam, "_has_core_semantics", lambda sem: bool(getattr(sem, "core", False)))
+    monkeypatch.setattr(_seam, "has_core_semantics", lambda sem: bool(getattr(sem, "core", False)))
 
 
 @contextmanager

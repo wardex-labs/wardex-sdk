@@ -15,18 +15,14 @@ from typing import TYPE_CHECKING, Any
 
 from ..assembly import Limitation
 from ._conn_timing import install_shared_timing, shared_timing_store, uninstall_shared_timing
-from ._seam import (
-    ByteSeamInterceptor,
-    _build_grpc_fields,  # backward-compat re-export (keeps the existing test import path)
-    _ConnectionState,
-)
+from ._seam import ByteSeamInterceptor, _ConnectionState
 from ._socket import _H2_PREFACE, _HTTP_METHODS
 from ._trackers import _Http1Tracker, _Http2Tracker, _WebSocketTracker
 
 if TYPE_CHECKING:
     from .._client import Client
 
-__all__ = ["SSLInterceptor", "_build_grpc_fields"]
+__all__ = ["SSLInterceptor"]
 
 
 class SSLInterceptor(ByteSeamInterceptor):

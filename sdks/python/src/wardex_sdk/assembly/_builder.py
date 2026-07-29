@@ -450,7 +450,7 @@ class SpanDraft:
     def set_error(self, error_type: str | None, message: str = "") -> None:
         """Declare the failure. `finish()` refuses `status=ERROR` without one.
 
-        WAR-34 #5 is this assertion: the adapter shipped `is_error=true` spans
+        This method exists because the adapter shipped `is_error=true` spans
         with no `error.type`, while the payload that carries the reason was
         sitting in the hook input the whole time.
         """
@@ -669,8 +669,8 @@ class SpanDraft:
 
         MANUAL only. The two modes wardex names itself always know what failed
         (a gRPC status, an HTTP status, a JSON-RPC code, a WS close code), so
-        for them the hard refusal in `_check_status` stays the check that made
-        WAR-34 #5 impossible to reintroduce.
+        for them the hard refusal in `_check_status` stays the check that makes
+        an untyped failure impossible to reintroduce.
         """
         if self._manual_name is None:
             return

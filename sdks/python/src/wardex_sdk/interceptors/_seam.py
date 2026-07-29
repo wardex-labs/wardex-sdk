@@ -15,14 +15,11 @@ from typing import TYPE_CHECKING, Any
 from .._enums import (
     CaptureSource,
     Direction,
-    OperationName,
     Protocol,
-    ProviderName,
     StatusCode,
 )
 from .._limits import CaptureLimits
 from .._types import (
-    GenAIAttributes,
     HttpMeta,
     TransportAttributes,
     TransportTiming,
@@ -38,8 +35,8 @@ from ..assembly import (
     resolve_parentage,
     should_capture,
 )
-from ..assembly._vocab import transport_name
-from ..protocol import grpc_status_name, parse_grpc_frames, parse_llm_semantics
+from ..protocol import parse_llm_semantics
+from ..semantics import build_gen_ai, build_grpc_fields, has_core_semantics, ws_close_name
 from ._base import InterceptorInterface
 from ._trackers import _Txn, _WebSocketTracker
 
@@ -135,7 +132,7 @@ class ByteSeamInterceptor(InterceptorInterface):
 
         The policy itself lives in `assembly._policy` and is asked here, at the
         single point where both halves are known. Failing open around it is
-        this method's job rather than the policy's: `_has_core_semantics` runs
+        this method's job rather than the policy's: `has_core_semantics` runs
         parser output through host-supplied objects and can raise, while
         `should_capture` cannot — so the swallow stays where the risk is.
         """
@@ -148,7 +145,7 @@ class ByteSeamInterceptor(InterceptorInterface):
             return should_capture(
                 capture_mode_of(self._client),
                 parent=getattr(txn, "parent", None),
-                agent_semantic=sem is not None and _has_core_semantics(sem),
+                agent_semantic=sem is not None and has_core_semantics(sem),
             )
         except Exception:
             return True  # losing data is worse than noise (design §5.1)
@@ -359,7 +356,7 @@ class ByteSeamInterceptor(InterceptorInterface):
 
         if is_grpc:
             # gRPC fields; `sem` is already None (see the parse above).
-            _name, status_code, error_type, grpc_extra, grpc_markers = _build_grpc_fields(
+            _name, status_code, error_type, grpc_extra, grpc_markers = build_grpc_fields(
                 txn, (), ()
             )
             for key, value in grpc_extra:
@@ -377,8 +374,8 @@ class ByteSeamInterceptor(InterceptorInterface):
                 if sem.decoded_response is not None:
                     output_data = bytes(sem.decoded_response)
                 streamed = bool(getattr(sem, "reassembled_from_stream", False))
-                if _has_core_semantics(sem):
-                    draft.set_gen_ai(_build_gen_ai(sem))
+                if has_core_semantics(sem):
+                    draft.set_gen_ai(build_gen_ai(sem))
                     if streamed:
                         draft.add_limitation(Limitation.REASSEMBLED_FROM_STREAM)
                         if sem.output_tokens is None:
@@ -464,7 +461,7 @@ class ByteSeamInterceptor(InterceptorInterface):
             error_type = None
         else:
             status_code = StatusCode.ERROR
-            error_type = _ws_close_name(code)
+            error_type = ws_close_name(code)
 
         draft = SpanDraft.transport(
             p,
@@ -530,144 +527,6 @@ def _latched(txn: _Txn) -> Ambient:
     belongs with the seam decomposition (design §3.3), not with this step.
     """
     return Ambient(span_context=txn.parent, conversation=None, tracestate=None)
-
-
-_OPERATION_MAP = {"chat": OperationName.CHAT, "embeddings": OperationName.EMBEDDINGS}
-_PROVIDER_MAP = {"openai": ProviderName.OPENAI, "anthropic": ProviderName.ANTHROPIC}
-
-
-def _has_core_semantics(sem: Any) -> bool:
-    """True if at least one core semantic (model, tokens) is present."""
-    return (
-        sem.input_tokens is not None
-        or sem.output_tokens is not None
-        or sem.response_model is not None
-    )
-
-
-def _ws_close_name(code: int) -> str:
-    return {
-        1002: "protocol_error",
-        1003: "unsupported_data",
-        1007: "invalid_payload",
-        1008: "policy_violation",
-        1009: "message_too_big",
-        1010: "mandatory_extension",
-        1011: "internal_error",
-    }.get(code, f"close_{code}")
-
-
-def _build_grpc_fields(
-    txn: _Txn,
-    extra: tuple[tuple[str, str | int | float | bool], ...],
-    limitations: tuple[Limitation, ...],
-) -> tuple[
-    str,
-    StatusCode,
-    str | None,
-    tuple[tuple[str, str | int | float | bool], ...],
-    tuple[Limitation, ...],
-]:
-    """Assemble gRPC span fields → (name, status_code, error_type, extra, limitations).
-
-    Pure, and deliberately still returning a tuple rather than mutating a draft:
-    it is the one branch of the seam with enough protocol logic to be worth
-    testing without a socket, and it is where the census scanner's R6 rule finds
-    the gRPC markers.
-
-    On a framing-parse failure the span falls back to plain h2 (HTTP) fields plus
-    `Limitation.FRAME_PARSE_FAILED`. The caller keys its own label off exactly
-    that marker, so the name and the marker cannot disagree about whether this
-    was gRPC.
-
-    Markers are `Limitation` members as of step 3a, and two of these values
-    changed name on the way in (§6.5.1): `grpc_parse_failed` became
-    `FRAME_PARSE_FAILED` because a WebSocket framing failure is the same fact,
-    and `grpc_compressed` became `PAYLOAD_COMPRESSED` because
-    `TransportAttributes.protocol` already carries which protocol it was and
-    encoding that into the marker duplicates a field.
-    """
-    try:
-        req = parse_grpc_frames(txn.request_body)
-        resp = parse_grpc_frames(txn.response_body)
-    except Exception:
-        http_status = StatusCode.OK if 200 <= txn.status < 400 else StatusCode.ERROR
-        return (
-            transport_name(TransportLabel.HTTP, f"{txn.method} {txn.path}"),
-            http_status,
-            # Plain-h2 fallback, so the plain-h2 error type: the HTTP status as
-            # a string. Returning `None` here alongside an ERROR status is what
-            # `finish()` deletes the span for.
-            str(txn.status) if http_status is StatusCode.ERROR else None,
-            extra,
-            limitations + (Limitation.FRAME_PARSE_FAILED,),
-        )
-
-    name = transport_name(TransportLabel.GRPC, txn.path)
-    code = txn.grpc_status
-    status_code = StatusCode.ERROR if code not in (0, None) else StatusCode.OK
-    error_type = grpc_status_name(code) if status_code is StatusCode.ERROR else None
-
-    # "/pkg.Svc/Method" → service="pkg.Svc", method="Method"
-    service, method = "", ""
-    trimmed = txn.path.lstrip("/")
-    if "/" in trimmed:
-        service, method = trimmed.rsplit("/", 1)
-    else:
-        method = trimmed
-
-    extra = extra + (
-        ("rpc.system", "grpc"),
-        ("rpc.service", service),
-        ("rpc.method", method),
-        ("rpc.grpc.request.message_count", len(req.messages)),
-        ("rpc.grpc.response.message_count", len(resp.messages)),
-    )
-    if code is not None:
-        extra = extra + (("rpc.grpc.status_code", code),)
-    # If grpc-message is present, include it on the span — useful for diagnosing errors
-    # (e.g. "NOT_FOUND: collection x missing")
-    if txn.grpc_message:
-        extra = extra + (("rpc.grpc.status_message", txn.grpc_message),)
-
-    if code is None:
-        limitations = limitations + (Limitation.GRPC_STATUS_UNAVAILABLE,)
-    if any(m.compressed for m in req.messages) or any(m.compressed for m in resp.messages):
-        limitations = limitations + (Limitation.PAYLOAD_COMPRESSED,)
-    if req.truncated or resp.truncated:
-        limitations = limitations + (Limitation.GRPC_MESSAGE_TRUNCATED,)
-
-    return name, status_code, error_type, extra, limitations
-
-
-def _build_gen_ai(sem: Any) -> GenAIAttributes:
-    """Convert LlmSemantics → GenAIAttributes."""
-    stops = tuple(sem.stop_sequences) if sem.stop_sequences else None
-    finishes = tuple(sem.finish_reasons) if sem.finish_reasons else None
-    return GenAIAttributes(
-        operation=_OPERATION_MAP.get(sem.operation, sem.operation),
-        provider=_PROVIDER_MAP.get(sem.provider, sem.provider),
-        request_model=sem.request_model,
-        response_model=sem.response_model,
-        response_id=sem.response_id,
-        input_tokens=sem.input_tokens,
-        output_tokens=sem.output_tokens,
-        cache_read_input_tokens=sem.cache_read_input_tokens,
-        cache_creation_input_tokens=sem.cache_creation_input_tokens,
-        reasoning_output_tokens=sem.reasoning_output_tokens,
-        temperature=sem.temperature,
-        max_tokens=sem.max_tokens,
-        top_p=sem.top_p,
-        top_k=sem.top_k,
-        seed=sem.seed,
-        frequency_penalty=sem.frequency_penalty,
-        presence_penalty=sem.presence_penalty,
-        choice_count=sem.choice_count,
-        stop_sequences=stops,
-        stream=sem.stream,
-        finish_reasons=finishes,
-        output_type=sem.output_type,
-    )
 
 
 def _peer(obj: Any) -> tuple[str, int]:

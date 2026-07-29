@@ -104,13 +104,15 @@ _MEMBER_SITES: dict[str, frozenset[str]] = {
     "TTFT_IPC_APPROXIMATION": frozenset({"adapters/_assembler.py"}),
     "TRANSPORT_TIMING_UNAVAILABLE_SUBPROCESS": frozenset({"adapters/_assembler.py"}),
     # --- caps ---
-    "GRPC_MESSAGE_TRUNCATED": frozenset({"interceptors/_seam.py"}),
+    "GRPC_MESSAGE_TRUNCATED": frozenset({"semantics/_grpc.py"}),
     "WS_PAYLOAD_TRUNCATED": frozenset({"interceptors/_seam.py", "interceptors/_trackers.py"}),
     "CONNECTION_EVICTED": frozenset({"interceptors/_seam.py"}),
     # --- parsing / interpretation ---
-    "FRAME_PARSE_FAILED": frozenset({"interceptors/_seam.py", "interceptors/_trackers.py"}),
+    "FRAME_PARSE_FAILED": frozenset(
+        {"interceptors/_seam.py", "interceptors/_trackers.py", "semantics/_grpc.py"}
+    ),
     "SEMANTIC_PARSE_FAILED": frozenset({"interceptors/_seam.py"}),
-    "PAYLOAD_COMPRESSED": frozenset({"interceptors/_seam.py", "interceptors/_trackers.py"}),
+    "PAYLOAD_COMPRESSED": frozenset({"interceptors/_trackers.py", "semantics/_grpc.py"}),
     "TOOL_ARGS_UNPARSED": frozenset({"interceptors/_seam.py"}),
     "OUTPUT_MESSAGES_UNMAPPED_PART": frozenset({"interceptors/_seam.py"}),
     "INPUT_MESSAGES_UNMAPPED_PART": frozenset({"interceptors/_seam.py"}),
@@ -120,7 +122,7 @@ _MEMBER_SITES: dict[str, frozenset[str]] = {
     "SSE_UNKNOWN_PROVIDER": frozenset({"interceptors/_seam.py"}),
     # --- protocol-specific ---
     "GRPC_WEB_UNSUPPORTED": frozenset({"interceptors/_seam.py"}),
-    "GRPC_STATUS_UNAVAILABLE": frozenset({"interceptors/_seam.py"}),
+    "GRPC_STATUS_UNAVAILABLE": frozenset({"semantics/_grpc.py"}),
     "WS_NO_CLOSE": frozenset({"interceptors/_socket.py", "interceptors/_ssl.py"}),
     # --- unit / adapter lifecycle ---
     "CHILD_SPAN_UNCLOSED": frozenset({"adapters/_assembler.py"}),
@@ -137,12 +139,20 @@ emitter rather than a renamed one, because 3a is also the step that closes
 The site sets are the same files the strings were emitted from, with three
 exceptions that are the census's merges landing:
 
-  * `FRAME_PARSE_FAILED` and `PAYLOAD_COMPRESSED` each now list TWO files,
-    because `grpc_parse_failed` (`_seam.py`) and `ws_parse_failed`
+  * `FRAME_PARSE_FAILED` and `PAYLOAD_COMPRESSED` each list more than one file,
+    because `grpc_parse_failed` (the gRPC field builder) and `ws_parse_failed`
     (`_trackers.py`) were one fact, and so were `grpc_compressed` and
     `ws_compressed`.
   * `CONNECT_TIMING_UNAVAILABLE` absorbed `async_connect_unavailable`, which
     shared `_ssl.py` with it, so the file set is unchanged.
+
+Migration step 4 moved four gRPC sites without changing a line of their logic:
+`build_grpc_fields` left `interceptors/_seam.py` for `semantics/_grpc.py`, so
+`GRPC_MESSAGE_TRUNCATED`, `GRPC_STATUS_UNAVAILABLE` and `PAYLOAD_COMPRESSED`
+moved with it. `FRAME_PARSE_FAILED` GAINED that file rather than moving,
+because the seam still names the member — `if Limitation.FRAME_PARSE_FAILED not
+in grpc_markers` is how the span's label stays consistent with the marker the
+builder returned, and R7 sees it.
 
 These are SOURCE sites — the place a member NAME appears in a marker slot — and
 that is not the same as the set of markers that reach a span.
@@ -760,7 +770,6 @@ _UNRESOLVED_PY: frozenset[tuple[str, str]] = frozenset(
         ("assembly/_snapshot.py", "Call:list"),
         ("assembly/_snapshot.py", "List"),
         ("assembly/_snapshot.py", "Name:marker"),
-        ("interceptors/_seam.py", "Name:limitations"),
         ("interceptors/_seam.py", "Name:marker"),
         ("interceptors/_seam.py", "Tuple"),
         ("interceptors/_socket.py", "Tuple"),
@@ -778,6 +787,14 @@ _UNRESOLVED_PY: frozenset[tuple[str, str]] = frozenset(
         # a member or None, and the Rust half of this census bounds which
         # members it can return.
         ("protocol/_http1.py", "Call:_resolve_markers"),
+        # `build_grpc_fields` returns its `limitations` accumulator, which is a
+        # parameter rebound three times — R8 will not guess at a name bound more
+        # than once, and R6 reads the tuple slot it lands in. The hole is the
+        # container, not a value: every member that reaches it is spelled out at
+        # the rebinding a few lines above and is censused there. Step 4 moved
+        # this entry from `interceptors/_seam.py` when the function moved; the
+        # expression is byte-identical.
+        ("semantics/_grpc.py", "Name:limitations"),
     }
 )
 """Every marker-ish slot the scanner could NOT resolve to a value, frozen.
@@ -1284,7 +1301,7 @@ def test_scanner_is_not_blind(py_census: _PythonCensus, rust_census: _RustCensus
         "R4 derived no marker-taking helpers — `ws_no_close` and `ws_evicted` "
         "are reachable only through `flush(marker)` and nothing else finds them"
     )
-    assert {"_resolve_timing", "_build_grpc_fields"} <= {name for name, _ in py_census.producers}, (
+    assert {"_resolve_timing", "build_grpc_fields"} <= {name for name, _ in py_census.producers}, (
         "R6 derived no marker-producing functions; the transport-timing markers are behind it"
     )
     assert "_merge_markers" in py_census.marker_functions, (

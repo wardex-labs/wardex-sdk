@@ -168,8 +168,8 @@ def _build_mcp_span(p: _Pending, resp: Any) -> InternalSpan:
     tool: ToolAttributes | None = None
     status = StatusCode.ERROR if resp.error is not None else StatusCode.OK
     # `SpanDraft.finish()` refuses `status=ERROR` without an `error_type`, and
-    # this span shipped exactly that pair until now — the same defect WAR-34 #5
-    # records on the adapter side. The JSON-RPC error object carries the answer
+    # this span shipped exactly that pair until now — the same defect the
+    # adapter had. The JSON-RPC error object carries the answer
     # (`{"code": -32601, ...}`), so the type is derived from it rather than
     # invented; an unreadable error body degrades to the generic name instead of
     # deleting the span.

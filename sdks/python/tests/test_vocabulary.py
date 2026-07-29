@@ -148,7 +148,7 @@ def test_execute_step_requires_its_namespaced_key():
 
 
 def test_status_error_requires_an_error_type():
-    """WAR-34 #5, as a mechanism rather than a review note.
+    """The untyped-failure defect, as a mechanism rather than a review note.
 
     The adapter shipped `is_error=true` spans with no `error.type` while the
     hook payload that carries the reason sat unread.
