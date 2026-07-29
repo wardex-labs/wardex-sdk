@@ -101,33 +101,31 @@ fn kv_list(extra: &Bound<PyAny>, out: &mut Vec<pb::KeyValue>) -> PyResult<()> {
 }
 
 // --- enum mapping (unmapped → *_UNSPECIFIED) ---
+//
+// Every one of these was a hand-written `match` from the Python enum value to
+// the proto number — a second declaration of a list the `.proto` already owns,
+// with nothing to make the compiler compare the two. `wardex_core::codec::vocab`
+// derives the mapping from the schema instead (design §6.6), so the tables here
+// are only about what to do when the schema has no such value.
+//
+// That decision is per-vocabulary and stays visible at the call site rather
+// than buried in the mapper:
+//
+//   * `status_code` falls back to UNSET, which is a real "no status" value;
+//   * everything else falls back to UNSPECIFIED, and for those the caller side
+//     already refuses to produce an unlisted value (`SpanDraft` takes enums,
+//     not strings), so the fallback is a backstop rather than a path;
+//   * `limitation` alone has somewhere honest to put the fact — see
+//     `integrity_to_proto`.
 
 fn map_span_kind(s: &str) -> i32 {
-    (match s {
-        "internal" => pb::SpanKind::Internal,
-        "client" => pb::SpanKind::Client,
-        "server" => pb::SpanKind::Server,
-        _ => pb::SpanKind::Unspecified,
-    }) as i32
+    vocab::span_kind_to_proto(s).unwrap_or(pb::SpanKind::Unspecified as i32)
 }
 fn map_status_code(s: &str) -> i32 {
-    (match s {
-        "ok" => pb::StatusCode::Ok,
-        "error" => pb::StatusCode::Error,
-        _ => pb::StatusCode::Unset,
-    }) as i32
+    vocab::status_code_to_proto(s).unwrap_or(pb::StatusCode::Unset as i32)
 }
 fn map_capture_source(s: &str) -> i32 {
-    (match s {
-        "adapter" => pb::CaptureSource::Adapter,
-        "ssl" => pb::CaptureSource::Ssl,
-        "socket" => pb::CaptureSource::Socket,
-        "stdio" => pb::CaptureSource::Stdio,
-        "grpc" => pb::CaptureSource::Grpc,
-        "websocket" => pb::CaptureSource::Websocket,
-        "manual" => pb::CaptureSource::Manual,
-        _ => pb::CaptureSource::Unspecified,
-    }) as i32
+    vocab::capture_source_to_proto(s).unwrap_or(pb::CaptureSource::Unspecified as i32)
 }
 
 // --- span vocabulary registry (design §6.2, §6.3, §6.6) ---
@@ -148,55 +146,18 @@ fn map_capture_source(s: &str) -> i32 {
 // instead of trusting that they do.
 
 fn map_operation_name(s: &str) -> i32 {
-    (match s {
-        "chat" => pb::OperationName::Chat,
-        "text_completion" => pb::OperationName::TextCompletion,
-        "embeddings" => pb::OperationName::Embeddings,
-        "execute_tool" => pb::OperationName::ExecuteTool,
-        "create_agent" => pb::OperationName::CreateAgent,
-        "invoke_agent" => pb::OperationName::InvokeAgent,
-        "invoke_workflow" => pb::OperationName::InvokeWorkflow,
-        "generate_content" => pb::OperationName::GenerateContent,
-        "retrieval" => pb::OperationName::Retrieval,
-        "execute_step" => pb::OperationName::ExecuteStep,
-        "handoff" => pb::OperationName::Handoff,
-        "evaluate" => pb::OperationName::Evaluate,
-        _ => pb::OperationName::Unspecified,
-    }) as i32
+    vocab::operation_name_to_proto(s).unwrap_or(pb::OperationName::Unspecified as i32)
 }
 
 fn map_tool_execution_type(s: &str) -> i32 {
-    (match s {
-        "network" => pb::ToolExecutionType::Network,
-        "in_process" => pb::ToolExecutionType::InProcess,
-        "ipc" => pb::ToolExecutionType::Ipc,
-        "unknown" => pb::ToolExecutionType::Unknown,
-        _ => pb::ToolExecutionType::Unspecified,
-    }) as i32
+    vocab::tool_execution_type_to_proto(s).unwrap_or(pb::ToolExecutionType::Unspecified as i32)
 }
 
 fn map_link_reason(s: &str) -> i32 {
-    (match s {
-        "triggered_by" => pb::LinkReason::TriggeredBy,
-        "handoff_from" => pb::LinkReason::HandoffFrom,
-        "resumed_from" => pb::LinkReason::ResumedFrom,
-        "retried_from" => pb::LinkReason::RetriedFrom,
-        "cache_source" => pb::LinkReason::CacheSource,
-        _ => pb::LinkReason::Unspecified,
-    }) as i32
+    vocab::link_reason_to_proto(s).unwrap_or(pb::LinkReason::Unspecified as i32)
 }
 
-// The decode direction lives in `wardex-codec` (`link_reason_name`), next to the
-// generated enum and inside a crate `cargo test` can build a harness for — this
-// one is `crate-type = ["cdylib"]`, so a unit test here would never run. Its
-// unknown-value branch is the whole point of the function, which makes an
-// untestable home the wrong home.
-//
-// Note the asymmetry that remains: `map_link_reason` above still flattens an
-// unmapped STRING to UNSPECIFIED with no breadcrumb. Design R11 defers that
-// class of fix to step 3b, and it is bounded meanwhile — `SpanDraft.add_link`
-// takes the `LinkReason` enum, so no caller inside the SDK can produce one.
-use wardex_core::codec::link_reason_name;
+use wardex_core::codec::vocab::{self, link_reason_name};
 
 // --- gen_ai flattening ---
 
@@ -343,31 +304,13 @@ fn flatten_tool(t: &Bound<PyAny>, out: &mut Vec<pb::KeyValue>) -> PyResult<()> {
 // --- enum mapping (transport/state) ---
 
 fn map_protocol(s: &str) -> i32 {
-    (match s {
-        "http" => pb::Protocol::Http,
-        "grpc" => pb::Protocol::Grpc,
-        "websocket" => pb::Protocol::Websocket,
-        "mcp_stdio" => pb::Protocol::McpStdio,
-        "sse" => pb::Protocol::Sse,
-        _ => pb::Protocol::Unspecified,
-    }) as i32
+    vocab::protocol_to_proto(s).unwrap_or(pb::Protocol::Unspecified as i32)
 }
 fn map_direction(s: &str) -> i32 {
-    (match s {
-        "outbound" => pb::Direction::Outbound,
-        "inbound" => pb::Direction::Inbound,
-        _ => pb::Direction::Unspecified,
-    }) as i32
+    vocab::direction_to_proto(s).unwrap_or(pb::Direction::Unspecified as i32)
 }
 fn map_modality(s: &str) -> i32 {
-    (match s {
-        "text" => pb::Modality::Text,
-        "image" => pb::Modality::Image,
-        "audio" => pb::Modality::Audio,
-        "video" => pb::Modality::Video,
-        "embedding" => pb::Modality::Embedding,
-        _ => pb::Modality::Unspecified,
-    }) as i32
+    vocab::modality_to_proto(s).unwrap_or(pb::Modality::Unspecified as i32)
 }
 
 // --- transport / capture_integrity / correlation / state ---
@@ -457,17 +400,63 @@ fn transport_to_proto(t: &Bound<PyAny>) -> PyResult<pb::TransportAttributes> {
     Ok(tr)
 }
 
-fn integrity_to_proto(c: &Bound<PyAny>) -> PyResult<pb::CaptureIntegrity> {
-    Ok(pb::CaptureIntegrity {
-        request_headers_captured: c.getattr("request_headers_captured")?.extract()?,
-        request_body_captured: c.getattr("request_body_captured")?.extract()?,
-        response_headers_captured: c.getattr("response_headers_captured")?.extract()?,
-        response_body_captured: c.getattr("response_body_captured")?.extract()?,
-        redacted: c.getattr("redacted")?.extract()?,
-        truncated: c.getattr("truncated")?.extract()?,
-        dropped_chunk_count: c.getattr("dropped_chunk_count")?.extract()?,
-        limitations: c.getattr("limitations")?.extract()?,
-    })
+/// The key that carries a marker the schema could not name. Read the comment on
+/// `UNMAPPED_LIMITATION_KEY`'s use in `integrity_to_proto` before changing it —
+/// it is the only thing standing between a vocabulary gap and a silent drop.
+const UNMAPPED_LIMITATION_KEY: &str = "wardex.limitation.unmapped";
+
+/// `CaptureIntegrity` → proto, returning any marker the schema has no value for.
+///
+/// The second half of that return type is the point. `limitations` used to be
+/// `repeated string`, so anything the Python side held reached the wire
+/// verbatim; now it is a closed enum and a value with no proto counterpart has
+/// nowhere to go. Dropping it would produce exactly the failure the vocabulary
+/// exists to prevent — a span that reads as fully captured because the reason it
+/// was not could not be spelled.
+///
+/// So an unmapped marker becomes `LIMITATION_VOCABULARY_UNMAPPED` (a meta value,
+/// deliberately outside the vocabulary's number band) and the caller writes the
+/// original string into `Span.extra`. The two together say "something was
+/// wrong, here is what the sender called it" without pretending the schema knew.
+///
+/// This should be unreachable: `test_vocabulary.py` asserts the Python enum and
+/// the proto enum agree member for member, so a gap fails CI before it ships.
+/// It exists because "unreachable" is a property of today's build, and the
+/// decode side of this same file has to survive an envelope written by a NEWER
+/// SDK — where the gap is not a bug but the normal case.
+fn integrity_to_proto(c: &Bound<PyAny>) -> PyResult<(pb::CaptureIntegrity, Vec<String>)> {
+    let mut codes: Vec<i32> = Vec::new();
+    let mut unmapped: Vec<String> = Vec::new();
+    for m in c.getattr("limitations")?.iter()? {
+        let m = m?;
+        // A `Limitation` member normally; a bare string is still accepted so
+        // this cannot become the reason a span dies at the boundary.
+        let value: String = if m.hasattr("value")? {
+            enum_str(&m)?
+        } else {
+            m.extract()?
+        };
+        match vocab::limitation_to_proto(&value) {
+            Some(n) => codes.push(n),
+            None => {
+                codes.push(pb::Limitation::VocabularyUnmapped as i32);
+                unmapped.push(value);
+            }
+        }
+    }
+    Ok((
+        pb::CaptureIntegrity {
+            request_headers_captured: c.getattr("request_headers_captured")?.extract()?,
+            request_body_captured: c.getattr("request_body_captured")?.extract()?,
+            response_headers_captured: c.getattr("response_headers_captured")?.extract()?,
+            response_body_captured: c.getattr("response_body_captured")?.extract()?,
+            redacted: c.getattr("redacted")?.extract()?,
+            truncated: c.getattr("truncated")?.extract()?,
+            dropped_chunk_count: c.getattr("dropped_chunk_count")?.extract()?,
+            limitation_codes: codes,
+        },
+        unmapped,
+    ))
 }
 
 fn correlation_to_proto(c: &Bound<PyAny>) -> PyResult<pb::CorrelationInfo> {
@@ -485,7 +474,18 @@ fn correlation_to_proto(c: &Bound<PyAny>) -> PyResult<pb::CorrelationInfo> {
         corr.attempt_id = v.extract()?;
     }
     if let Some(v) = opt(c, "strategy")? {
-        corr.strategy = v.extract()?;
+        // `ParentSource` member or its value string. An unlisted value maps to
+        // UNSPECIFIED, which is honest here in a way it would not be for
+        // `Limitation`: "wardex does not claim to know how this parent was
+        // derived" is a meaningful statement, and the confidence field beside it
+        // already carries the trust level separately.
+        let value: String = if v.hasattr("value")? {
+            enum_str(&v)?
+        } else {
+            v.extract()?
+        };
+        corr.parent_source =
+            vocab::parent_source_to_proto(&value).unwrap_or(pb::ParentSource::Unspecified as i32);
     }
     if let Some(v) = opt(c, "active_span_id_at_capture")? {
         corr.active_span_id_at_capture = id_bytes(&v)?;
@@ -500,12 +500,7 @@ fn correlation_to_proto(c: &Bound<PyAny>) -> PyResult<pb::CorrelationInfo> {
 /// `Limitation.SNAPSHOT_TYPE_UNKNOWN` at the point of coercion instead of
 /// letting this function flatten it in silence.
 fn map_snapshot_type(v: &str) -> i32 {
-    (match v {
-        "span_start" => pb::SnapshotType::SpanStart,
-        "span_end" => pb::SnapshotType::SpanEnd,
-        "turn_start" => pb::SnapshotType::TurnStart,
-        _ => pb::SnapshotType::Unspecified,
-    }) as i32
+    vocab::snapshot_type_to_proto(v).unwrap_or(pb::SnapshotType::Unspecified as i32)
 }
 
 fn state_to_proto(s: &Bound<PyAny>) -> PyResult<pb::StateSnapshot> {
@@ -621,7 +616,21 @@ fn span_to_proto(sp: &Bound<PyAny>) -> PyResult<pb::Span> {
         span.transport = Some(transport_to_proto(&t)?);
     }
     if let Some(c) = opt(sp, "capture_integrity")? {
-        span.capture_integrity = Some(integrity_to_proto(&c)?);
+        let (integrity, unmapped) = integrity_to_proto(&c)?;
+        span.capture_integrity = Some(integrity);
+        // After the `extra` passthrough above, deliberately: a marker the schema
+        // could not name is wardex's own note about this encode, not something
+        // the caller supplied, and it must not be overwritten by a same-keyed
+        // caller value. Repeats are allowed — `extra` is a repeated KeyValue,
+        // and two unnameable markers are two facts.
+        for value in unmapped {
+            span.extra.push(pb::KeyValue {
+                key: UNMAPPED_LIMITATION_KEY.to_owned(),
+                value: Some(pb::AnyValue {
+                    value: Some(pb::any_value::Value::StringValue(value)),
+                }),
+            });
+        }
     }
     if let Some(c) = opt(sp, "correlation")? {
         span.correlation = Some(correlation_to_proto(&c)?);
@@ -829,12 +838,22 @@ fn span_to_dict(py: Python<'_>, sp: &pb::Span) -> PyResult<PyObject> {
         cd.set_item("response_body_captured", c.response_body_captured)?;
         cd.set_item("truncated", c.truncated)?;
         cd.set_item("redacted", c.redacted)?;
-        cd.set_item("limitations", c.limitations.clone())?;
+        // Numbers in, names out. Handing a consumer a raw `i32` would make it
+        // re-derive the vocabulary from the schema by hand — the exact drift
+        // §6.6 exists to stop — and an unrecognized number says so in its own
+        // name rather than passing for "unset".
+        cd.set_item(
+            "limitations",
+            c.limitation_codes
+                .iter()
+                .map(|n| vocab::limitation_name(*n))
+                .collect::<Vec<_>>(),
+        )?;
         d.set_item("capture_integrity", cd)?;
     }
     if let Some(c) = &sp.correlation {
         let cd = PyDict::new_bound(py);
-        cd.set_item("strategy", &c.strategy)?;
+        cd.set_item("strategy", vocab::parent_source_name(c.parent_source))?;
         cd.set_item("confidence", c.confidence)?;
         d.set_item("correlation", cd)?;
     }
@@ -1445,6 +1464,39 @@ fn vocabulary_tables(py: Python<'_>) -> PyResult<PyObject> {
         snaps.set_item(name, map_snapshot_type(name))?;
     }
     out.set_item("SnapshotType", snaps)?;
+
+    // The two vocabularies step 3b moved onto the wire, exposed the OTHER way
+    // round — number → name, walking the schema rather than a list written
+    // here. A table keyed by hand would only prove that this file agrees with
+    // itself; walking the numbers lets a Python test compare the SCHEMA against
+    // `assembly._integrity.Limitation` and `assembly._parentage.ParentSource`
+    // member for member, in both directions, which is what makes a missing
+    // member a CI failure instead of a silently unnameable span.
+    let limits_tbl = PyDict::new_bound(py);
+    for n in 1..=200 {
+        let name = vocab::limitation_name(n);
+        if !name.contains("unrecognized") {
+            limits_tbl.set_item(name, n)?;
+        }
+    }
+    out.set_item("Limitation", limits_tbl)?;
+
+    let sources = PyDict::new_bound(py);
+    for n in 1..=200 {
+        let name = vocab::parent_source_name(n);
+        if !name.contains("unrecognized") {
+            sources.set_item(name, n)?;
+        }
+    }
+    out.set_item("ParentSource", sources)?;
+
+    // The meta value, kept OUT of the vocabulary table above on purpose — a
+    // consumer iterating "the vocabulary" must not find it there — but exposed
+    // so a test can pin both its number and the fact that it is not vocabulary.
+    let meta = PyDict::new_bound(py);
+    let unmapped = pb::Limitation::VocabularyUnmapped as i32;
+    meta.set_item(vocab::limitation_name(unmapped), unmapped)?;
+    out.set_item("LimitationMeta", meta)?;
 
     Ok(out.into_py(py))
 }

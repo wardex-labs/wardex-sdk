@@ -4,6 +4,7 @@ import json
 
 from wardex_sdk._enums import CaptureSource, StatusCode
 from wardex_sdk.adapters._assembler import SessionAssembler
+from wardex_sdk.assembly import Limitation
 
 INIT = {"type": "system", "subtype": "init", "session_id": "s-1", "model": "claude-sonnet-5"}
 ASSISTANT = {
@@ -90,7 +91,7 @@ def test_happy_path_emits_root_and_chat_spans():
     assert root.status is StatusCode.OK
     assert root.conversation.session_id == "s-1"
     assert CaptureSource.ADAPTER in root.capture_sources
-    assert "transport_timing_unavailable_subprocess" in root.capture_integrity.limitations
+    assert Limitation.TRANSPORT_TIMING_UNAVAILABLE_SUBPROCESS in root.capture_integrity.limitations
     chat = next(s for s in client.spans if s.name.startswith("chat"))
     assert chat.gen_ai.input_tokens == 10
     assert chat.gen_ai.output_tokens == 25
@@ -118,8 +119,13 @@ def test_tool_span_from_hooks_joins_stream_content():
 
     tool = next(s for s in client.spans if s.name == "execute_tool Bash")
     assert tool.tool.call_id == "toolu_01"
+    # The retired "adapter_hook" string answered "which source observed this",
+    # not "how was the parent derived". What it stood for survives as the hook
+    # path's full confidence plus the framework's tool_use_id as a hint; the
+    # span itself makes no parentage claim.
     assert tool.correlation.confidence == 1.0
-    assert tool.correlation.strategy == "adapter_hook"
+    assert tool.correlation.request_id == "toolu_01"
+    assert tool.correlation.strategy is None
     assert b"ls" in tool.input_data
 
 
@@ -159,8 +165,11 @@ def test_stream_only_degrades_confidence():
     asm.on_close(1, None)
 
     tool = next(s for s in client.spans if s.name == "execute_tool Bash")
+    # The retired "adapter_stream" string: the stream-only path keeps its
+    # degraded confidence and the tool_use_id hint, and claims no parentage.
     assert tool.correlation.confidence == 0.7
-    assert tool.correlation.strategy == "adapter_stream"
+    assert tool.correlation.request_id == "toolu_01"
+    assert tool.correlation.strategy is None
 
 
 def test_subagent_span_attribution():
@@ -206,10 +215,10 @@ def test_abort_closes_open_spans_with_markers():
     root = next(s for s in client.spans if s.name == "invoke_agent")
     tool = next(s for s in client.spans if s.name == "execute_tool Bash")
     assert root.status is StatusCode.ERROR
-    assert "session_aborted" in root.capture_integrity.limitations
+    assert Limitation.SESSION_ABORTED in root.capture_integrity.limitations
     # Census rename (design §6.5.1): `tool_span_unclosed` folded into the
     # step-0 member CHILD_SPAN_UNCLOSED, which step 3a made the emitted value.
-    assert "child_span_unclosed" in tool.capture_integrity.limitations
+    assert Limitation.CHILD_SPAN_UNCLOSED in tool.capture_integrity.limitations
     assert asm.open_session_count() == 0
 
 
@@ -292,7 +301,7 @@ def test_open_entry_cap():
     unclosed = [
         s
         for s in client.spans
-        if s.capture_integrity and "child_span_unclosed" in s.capture_integrity.limitations
+        if s.capture_integrity and Limitation.CHILD_SPAN_UNCLOSED in s.capture_integrity.limitations
     ]
     assert len(unclosed) == 300  # all eventually closed, none leaked
     assert asm.open_session_count() == 0

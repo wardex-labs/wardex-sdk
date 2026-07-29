@@ -244,7 +244,14 @@ def resolve_parentage(ambient: Ambient, evidence: Evidence = AMBIENT) -> Parenta
             conversation=ambient.conversation,
             joined=False,
             correlation=CorrelationInfo(
-                strategy=src.value,
+                # The MEMBER, not `src.value`. Unwrapping here was left over
+                # from when the field was a free-form string, and it made the
+                # step-3b retype a lie on the one path that produces almost
+                # every span: `isinstance(strategy, ParentSource)` was False
+                # everywhere, so the closed vocabulary bought nothing and an
+                # assertion written in the member form failed while the old
+                # string form kept passing.
+                strategy=src,
                 confidence=_confidence_for(src, evidence),
                 request_id=evidence.request_id,
                 operation_id=evidence.operation_id,
@@ -266,7 +273,7 @@ def resolve_parentage(ambient: Ambient, evidence: Evidence = AMBIENT) -> Parenta
         conversation=ambient.conversation,
         joined=True,
         correlation=CorrelationInfo(
-            strategy=src.value,
+            strategy=src,  # the member — see the no-parent branch above
             confidence=_confidence_for(src, evidence),
             active_span_id_at_capture=parent.span_id,
             request_id=evidence.request_id,

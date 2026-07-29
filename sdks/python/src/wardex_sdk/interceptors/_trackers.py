@@ -39,11 +39,11 @@ def _header_get(headers: object, name: str) -> str | None:
     return None
 
 
-def _merge_markers(*groups: tuple[str, ...]) -> tuple[str, ...]:
+def _merge_markers(*groups: tuple[Limitation, ...]) -> tuple[Limitation, ...]:
     """Concatenate limitation markers, keeping first-seen order and dropping
     duplicates. A request and a response that both hit the body cap describe
     one limitation of the transaction, not two."""
-    out: list[str] = []
+    out: list[Limitation] = []
     for group in groups:
         for m in group:
             if m not in out:
@@ -77,9 +77,10 @@ class _Txn:
     ttfb_ms: float
     truncated: bool = False
     # Capture-limitation markers the protocol parser attached to this
-    # transaction (e.g. "body_cap_exceeded"), merged into the span's
-    # CaptureIntegrity.limitations by the seam.
-    limitations: tuple[str, ...] = ()
+    # transaction, merged into the span's CaptureIntegrity.limitations by the
+    # seam. Members, not strings: the parser's `&'static str` was resolved once
+    # at the PyO3 boundary (`protocol/_http1.py`).
+    limitations: tuple[Limitation, ...] = ()
     version: str = "1.1"
     ttft_ms: float = 0.0
     content_type: str | None = None
@@ -110,7 +111,7 @@ class _Http1Tracker:
         self._path: str | None = None
         self._req_body: bytes = b""
         self._req_truncated: bool = False
-        self._req_limitations: tuple[str, ...] = ()
+        self._req_limitations: tuple[Limitation, ...] = ()
         self._req_start_ns: int = 0
         self._resp_first_ns: int = 0
         self._parent: SpanContext | None = None

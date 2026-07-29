@@ -108,9 +108,9 @@ def test_several_links_keep_their_order_and_their_reasons():
     that reordered them would rewrite the causality it exists to carry."""
     span = _span(
         links=(
-            InternalSpanLink(_OTHER_TRACE, _OTHER_SPAN, LinkReason.TRIGGERED_BY.value),
-            InternalSpanLink(_OTHER_TRACE, SpanId(b"\xcc" * 8), LinkReason.HANDOFF_FROM.value),
-            InternalSpanLink(_OTHER_TRACE, SpanId(b"\xdd" * 8), LinkReason.RESUMED_FROM.value),
+            InternalSpanLink(_OTHER_TRACE, _OTHER_SPAN, LinkReason.TRIGGERED_BY),
+            InternalSpanLink(_OTHER_TRACE, SpanId(b"\xcc" * 8), LinkReason.HANDOFF_FROM),
+            InternalSpanLink(_OTHER_TRACE, SpanId(b"\xdd" * 8), LinkReason.RESUMED_FROM),
         )
     )
 
@@ -152,7 +152,7 @@ def test_links_and_events_survive_the_pii_pass():
     decision there. `reason` is a closed enum and cannot carry PII — the same
     disposition step 3b gives `CaptureIntegrity.limitations`."""
     span = _span(
-        links=(InternalSpanLink(_OTHER_TRACE, _OTHER_SPAN, LinkReason.HANDOFF_FROM.value),),
+        links=(InternalSpanLink(_OTHER_TRACE, _OTHER_SPAN, LinkReason.HANDOFF_FROM),),
         events=(
             InternalSpanEvent(
                 name="contact", timestamp_ns=1, attributes=(("email", "a@example.com"),)
@@ -193,7 +193,7 @@ def test_the_otlp_encoder_carries_events_and_links_too():
     is why the two surfaces are asserted to agree rather than assumed to.
     """
     span = _span(
-        links=(InternalSpanLink(_OTHER_TRACE, _OTHER_SPAN, LinkReason.HANDOFF_FROM.value),),
+        links=(InternalSpanLink(_OTHER_TRACE, _OTHER_SPAN, LinkReason.HANDOFF_FROM),),
         events=(
             InternalSpanEvent(name="cache_hit", timestamp_ns=1500, attributes=(("key", "k"),)),
         ),

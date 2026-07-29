@@ -277,7 +277,11 @@ def test_a_link_carries_its_reason():
 
     assert link.trace_id == other.trace_id
     assert link.span_id == other.span_id
-    assert link.reason == "triggered_by"
+    # The MEMBER. `== "triggered_by"` passed while the builder was storing
+    # `reason.value`, which meant `link.reason is LinkReason.HANDOFF_FROM` — the
+    # check a renderer needs in order to draw a sibling instead of nesting — was
+    # always False.
+    assert link.reason is LinkReason.TRIGGERED_BY
 
 
 def test_an_event_carries_its_timestamp_and_attributes():

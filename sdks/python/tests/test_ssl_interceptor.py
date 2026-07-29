@@ -10,6 +10,7 @@ import pytest
 import wardex_sdk as wardex
 from wardex_sdk import _hub
 from wardex_sdk._enums import CaptureMode, SpanKind
+from wardex_sdk.assembly import Limitation
 from wardex_sdk.interceptors._base import InterceptorInterface
 from wardex_sdk.interceptors._registry import InterceptorRegistry
 from wardex_sdk.interceptors._ssl import SSLInterceptor
@@ -173,7 +174,7 @@ async def test_async_capture_populates_handshake(tls_server):
     # Census merge (design §6.5.1): `async_connect_unavailable` folded into
     # CONNECT_TIMING_UNAVAILABLE. Both said the same thing — tcp_connect_ms is
     # unknown rather than zero — and differed only in provenance.
-    assert "connect_timing_unavailable" in sp.capture_integrity.limitations
+    assert Limitation.CONNECT_TIMING_UNAVAILABLE in sp.capture_integrity.limitations
 
 
 def test_install_uninstall_restores_originals():

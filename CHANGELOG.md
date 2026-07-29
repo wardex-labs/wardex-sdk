@@ -30,6 +30,47 @@ All notable changes to this project are documented here. The format follows
   `error.type = "_OTHER"`, OpenTelemetry's own "no classification available".
 
 ### Changed
+- **Wire schema break — `wardex.v1` (`CaptureIntegrity` and `CorrelationInfo`).**
+  `CaptureIntegrity.limitations` (field 8, `repeated string`) and
+  `CorrelationInfo.strategy` (field 6, `string`) are gone. Both tags are
+  `reserved`; the replacements are `repeated Limitation limitation_codes = 9`
+  and `ParentSource parent_source = 7`, two enums now declared in
+  `common.proto` — 37 values and 7 respectively. There is no compatibility
+  shim and no dual-write window.
+
+  This is free exactly once and this is that once: no wardex envelope has ever
+  left a user process. The default transport is a no-op, `endpoint` defaults to
+  `None`, and the only network egress — OTLP — never read either field. Zero
+  bytes are deployed and there are zero consumers, so the "break" renames
+  something nobody has. The tags are not reused, because both reuse directions
+  are unsafe: `repeated string` → packed enum shares wire type 2 and would
+  decode old bytes as one enum value per ASCII byte with no error, and a scalar
+  `string` → enum is a hard `DecodeError` that fails the whole envelope, so one
+  stale span would kill an entire batch.
+
+  On the Python side the same three fields are typed:
+  `CaptureIntegrity.limitations` is `tuple[Limitation, ...]`,
+  `CorrelationInfo.strategy` is `ParentSource | None`, and
+  `InternalSpanLink.reason` is `LinkReason | None`. If you read
+  `span.capture_integrity.limitations`, you now get members rather than strings
+  — compare against `Limitation.BODY_CAP_EXCEEDED`, not `"body_cap_exceeded"`.
+  This also removes a silent failure mode: a filter written against a
+  misspelled marker string used to match nothing and report zero, which reads
+  identically to "this never happened".
+- The Agent SDK adapter's tool spans no longer report
+  `strategy = "adapter_hook"` / `"adapter_stream"`. Those values answered
+  "which source observed this event" — already carried by `capture_sources` —
+  while sitting in the field that means "how was this span's parent derived".
+  A tool span now reports no parentage claim at all, keeping what is actually
+  known: the framework's `tool_use_id` as `request_id`, and the trust gap
+  between the two paths as `confidence` (1.0 from a hook, 0.7 from stream
+  content alone).
+- Enum values are now mapped to the wire by deriving the proto value name from
+  the schema rather than by hand-written tables in the PyO3 binding. Twelve
+  such tables are gone. They were a second declaration of a list the `.proto`
+  already owns, with nothing making the compiler compare them, so a value added
+  to one and forgotten in the other would have flattened silently to
+  `UNSPECIFIED` on the wire.
 - A tool span from the Agent SDK adapter now reports
   `wardex.tool.execution_type = "unknown"` instead of `"network"`, and an MCP
   stdio tool span reports `"ipc"`. Both used to say `network`, which was

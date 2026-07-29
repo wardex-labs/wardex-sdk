@@ -321,14 +321,23 @@ class ByteSeamInterceptor(InterceptorInterface):
         for marker in timing_markers:
             draft.add_limitation(marker)
         # Markers the protocol parser attached to the transaction (a body that
-        # hit its cap, say). They arrive as strings because the Rust half of the
-        # vocabulary is step 3b's; `from_wire` is the one place that crossing is
-        # resolved, and the census scanner is what keeps an unknown one from
-        # existing (see `Limitation.from_wire`).
-        for wire in getattr(txn, "limitations", ()):
-            member = Limitation.from_wire(wire)
-            if member is not None:
-                draft.add_limitation(member)
+        # hit its cap, say). They arrive as MEMBERS: the string-to-member
+        # crossing happens once, at the PyO3 boundary in `protocol/_http1.py`,
+        # which is where the Rust `&'static str` actually enters Python.
+        #
+        # It used to happen here as well, and that was survivable only while the
+        # first conversion did not exist. Two `from_wire` calls in series is not
+        # idempotent — the second is handed a member, finds no string key, and
+        # returns None — so the marker would be dropped by the very code written
+        # to preserve it. One boundary, and it is the earliest one.
+        # A plain attribute access, not `getattr(txn, "limitations", ())`. The
+        # default could never fire — `_Txn.limitations` is a declared field —
+        # but it is the exact shape that fails silently if the field is ever
+        # renamed or a non-`_Txn` reaches here: every parser marker would
+        # vanish with no error and no counter. An AttributeError is the correct
+        # outcome for that, and it is what the surrounding `guard()` is for.
+        for marker in txn.limitations:
+            draft.add_limitation(marker)
 
         output_data = txn.response_body
         status_code = StatusCode.OK if 200 <= txn.status < 400 else StatusCode.ERROR

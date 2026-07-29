@@ -8,6 +8,7 @@ import tracemalloc
 import pytest
 
 from wardex_sdk import CaptureLimits, WardexConfig, _wardex_native
+from wardex_sdk.assembly import Limitation
 
 
 def test_limits_defaults_returns_every_field():
@@ -757,7 +758,7 @@ def test_http1_body_cap_is_visible_to_the_user():
     span = _drive_seam(CaptureLimits(max_opaque_body_bytes=16), request, response, "files.example")
     assert span is not None
     assert span.capture_integrity.truncated
-    assert "body_cap_exceeded" in span.capture_integrity.limitations
+    assert Limitation.BODY_CAP_EXCEEDED in span.capture_integrity.limitations
     assert len(span.output_data) == 16
 
     # The same exchange under the default cap is neither truncated nor marked,
@@ -765,7 +766,7 @@ def test_http1_body_cap_is_visible_to_the_user():
     span = _drive_seam(CaptureLimits(), request, response, "files.example")
     assert span is not None
     assert not span.capture_integrity.truncated
-    assert "body_cap_exceeded" not in span.capture_integrity.limitations
+    assert Limitation.BODY_CAP_EXCEEDED not in span.capture_integrity.limitations
     assert span.output_data == body
 
 
@@ -789,5 +790,5 @@ def test_http1_request_body_cap_is_visible_to_the_user():
     assert span is not None
     assert span.capture_integrity.truncated
     # Both halves hit the cap; that is one limitation of the transaction.
-    assert span.capture_integrity.limitations.count("body_cap_exceeded") == 1
+    assert span.capture_integrity.limitations.count(Limitation.BODY_CAP_EXCEEDED) == 1
     assert len(span.input_data) == 16

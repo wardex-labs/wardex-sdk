@@ -14,6 +14,7 @@ from wardex_sdk._client import Client
 from wardex_sdk._config import WardexConfig
 from wardex_sdk._enums import CaptureSource, StatusCode
 from wardex_sdk.adapters._anthropic_agent_sdk import AnthropicAgentSdkAdapter
+from wardex_sdk.assembly import Limitation
 from wardex_sdk.transport._base import Transport
 
 
@@ -88,7 +89,7 @@ def test_transport_death_marks_session_aborted():
         adapter.uninstall()
     root = next(s for s in client.spans if s.name == "invoke_agent")
     assert root.status is StatusCode.ERROR
-    assert "session_aborted" in root.capture_integrity.limitations
+    assert Limitation.SESSION_ABORTED in root.capture_integrity.limitations
 
 
 def test_parallel_sessions_do_not_cross():

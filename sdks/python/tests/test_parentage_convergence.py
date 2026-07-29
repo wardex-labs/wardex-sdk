@@ -27,6 +27,7 @@ from wardex_sdk._enums import CaptureMode
 from wardex_sdk._tracing import span, trace
 from wardex_sdk._types import ToolDefinitionSet
 from wardex_sdk.adapters._assembler import SessionAssembler
+from wardex_sdk.assembly import ParentSource
 from wardex_sdk.interceptors._mcp_stdio import _ProcState
 from wardex_sdk.interceptors._seam import ByteSeamInterceptor, _ConnectionState
 from wardex_sdk.interceptors._trackers import _Txn
@@ -178,7 +179,7 @@ def test_every_site_reports_a_local_parent_identically(site):
     assert emitted.context.trace_id == root.context.trace_id
     assert emitted.parent_span_id == root.context.span_id
     assert emitted.correlation is not None
-    assert emitted.correlation.strategy == "contextvar"
+    assert emitted.correlation.strategy is ParentSource.CONTEXTVAR
     assert emitted.correlation.confidence == 1.0
     assert emitted.correlation.active_span_id_at_capture == root.context.span_id
 
@@ -196,7 +197,7 @@ def test_every_site_marks_its_own_root_identically(site):
 
     assert emitted.parent_span_id is None
     assert emitted.correlation is not None
-    assert emitted.correlation.strategy == "trace_root"
+    assert emitted.correlation.strategy is ParentSource.TRACE_ROOT
     assert emitted.correlation.confidence == 1.0
     # V9: wardex does not head-sample, so a trace wardex ORIGINATES is sampled.
     assert emitted.context.trace_flags == 1
@@ -215,7 +216,7 @@ def test_every_site_calls_a_joined_parent_a_header_parent(site):
     with wardex_sdk.continue_trace({"traceparent": SAMPLED}):
         emitted = _SPAN_SITES[site](client)
 
-    assert emitted.correlation.strategy == "header"
+    assert emitted.correlation.strategy is ParentSource.HEADER
     assert emitted.correlation.confidence == 1.0
     assert emitted.context.trace_id.hex() == SAMPLED.split("-")[1]
 
@@ -245,7 +246,7 @@ def test_no_site_disagrees_about_the_shape_of_one_run():
 
     assert {s.context.trace_id for s in emitted} == {root.context.trace_id}
     assert {s.parent_span_id for s in emitted} == {root.context.span_id}
-    assert {s.correlation.strategy for s in emitted} == {"contextvar"}
+    assert {s.correlation.strategy for s in emitted} == {ParentSource.CONTEXTVAR}
     # every span got its OWN id: `child_context()` is a factory, not an accessor
     assert len({s.context.span_id for s in emitted}) == len(emitted)
 
@@ -329,7 +330,7 @@ def test_only_the_adapter_root_gained_correlation_in_this_step():
         f"`correlation`; got {sorted(with_corr)}"
     )
     root = next(s for s in client.spans if s.name == "invoke_agent")
-    assert root.correlation.strategy == "contextvar"
+    assert root.correlation.strategy is ParentSource.CONTEXTVAR
 
 
 def test_no_undeclared_strategy_value_reaches_the_wire():
@@ -350,12 +351,21 @@ def test_no_undeclared_strategy_value_reaches_the_wire():
             site(client)
 
     shipped = {s.correlation.strategy for s in client.spans if s.correlation is not None}
-    # `adapter_hook`/`adapter_stream` are `_emit_tool`'s, predate this step and
-    # are step 3b's to retire; everything else must be one of the three values
-    # the step-1 release notes name.
-    assert shipped <= {"contextvar", "header", "trace_root", "adapter_hook", "adapter_stream"}, (
-        f"step 1 declares three strategy values; these reached a span: {sorted(shipped)}"
-    )
+    # STRENGTHENED at step 3b, which retired `adapter_hook`/`adapter_stream`:
+    # they answered "which source observed this", not "how was the parent
+    # derived", and a tool span now makes no parentage claim at all. The set is
+    # down to the three values the release notes name, plus `None` for the spans
+    # that deliberately claim nothing.
+    assert shipped <= {
+        ParentSource.CONTEXTVAR,
+        ParentSource.HEADER,
+        ParentSource.TRACE_ROOT,
+        None,
+    }, f"only three strategy values are declared; these reached a span: {sorted(map(str, shipped))}"
+    # ...and every one of them is a MEMBER. A raw string here would satisfy the
+    # subset check above only by accident of never being compared, which is how
+    # `strategy=src.value` survived the retype unnoticed.
+    assert all(s is None or isinstance(s, ParentSource) for s in shipped)
 
 
 # --------------------------------------------------------------------------
@@ -445,7 +455,7 @@ def test_snapshot_orphan_is_distinguishable_from_a_deliberate_root():
     rooted = _site_manual_span(client)
 
     assert dict(orphan.attributes)["wardex.limitations"] == "parent_unresolved"
-    assert rooted.correlation.strategy == "trace_root"
+    assert rooted.correlation.strategy is ParentSource.TRACE_ROOT
     assert not rooted.capture_integrity or "parent_unresolved" not in (
         rooted.capture_integrity.limitations
     )
@@ -466,7 +476,7 @@ def test_manual_span_now_carries_correlation():
 
     inner = next(s for s in client.spans if s.name == "inner")
     assert inner.correlation is not None
-    assert inner.correlation.strategy == "contextvar"
+    assert inner.correlation.strategy is ParentSource.CONTEXTVAR
     assert inner.correlation.active_span_id_at_capture == root.context.span_id
 
 
@@ -477,7 +487,7 @@ def test_manual_span_joined_from_a_header_is_labelled_header():
         with span("inner"):
             pass
 
-    assert client.spans[-1].correlation.strategy == "header"
+    assert client.spans[-1].correlation.strategy is ParentSource.HEADER
 
 
 def test_manual_root_still_emits_a_sampled_traceparent():

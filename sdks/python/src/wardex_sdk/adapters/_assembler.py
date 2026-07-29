@@ -533,17 +533,33 @@ class SessionAssembler:
         draft.add_limitation(_BASE_LIMITATION)
         for marker in markers:
             draft.add_limitation(marker)
-        # NOT the parentage's own record, deliberately. The edge above came from
-        # the core; this field is the OTHER axis, and today it still mixes the
-        # two: `adapter_hook`/`adapter_stream` answer "which source observed the
-        # event", which design §4.1 moves to `capture_sources` and §11 schedules
-        # for step 7b. Overwriting it here would silently retire a declared wire
-        # value one step early.
+        # `adapter_hook` / `adapter_stream` are gone. They were never parentage:
+        # they answered "which source observed this event", which
+        # `capture_sources` already carries, and putting that answer in the field
+        # that means "how was the parent derived" is what let a reader mistake an
+        # observation channel for evidence about the edge.
+        #
+        # What is genuinely known here survives, and only that: the framework's
+        # `tool_use_id` as a lookup HINT (never a parent — I2), and the trust
+        # gap between the two paths as confidence. `merge_correlation` takes the
+        # MINIMUM confidence and keeps the parentage core's own source, so a
+        # hint can lower trust in the edge but never invent or overwrite it.
+        #
+        # Design §11 scheduled this for step 7b. It cannot wait: step 3b closes
+        # `CorrelationInfo.strategy` into `ParentSource`, and neither string is a
+        # member — leaving them would ship a value the schema cannot name.
         draft.replace_correlation(
             CorrelationInfo(
                 request_id=tool.tool_use_id,
                 confidence=1.0 if tool.from_hook else 0.7,
-                strategy="adapter_hook" if tool.from_hook else "adapter_stream",
+                # No parentage claim, and this is the same rule every other
+                # sub-root span in this module already follows. Merging instead
+                # of replacing looked tidier and was wrong: it would publish the
+                # base edge's `unit_active`/1.0, which the module header
+                # forbids by name because the anchor may have come from
+                # `_resolve_subagent_anchor`'s fallback. Step 6 makes that
+                # claim true and fills this in with the evidence it has earned.
+                strategy=None,
             )
         )
         return draft.finish(end_ns)

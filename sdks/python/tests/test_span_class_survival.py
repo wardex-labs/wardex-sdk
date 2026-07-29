@@ -40,7 +40,7 @@ from wardex_sdk._enums import CaptureMode, CaptureSource, SpanKind, StatusCode, 
 from wardex_sdk._tracing import span as manual_span
 from wardex_sdk._tracing import trace
 from wardex_sdk.adapters._assembler import SessionAssembler
-from wardex_sdk.assembly import Limitation, counters
+from wardex_sdk.assembly import Limitation, ParentSource, counters
 from wardex_sdk.interceptors._mcp_stdio import _ProcState
 from wardex_sdk.interceptors._seam import ByteSeamInterceptor, _ConnectionState
 from wardex_sdk.interceptors._trackers import _Http1Tracker, _Http2Tracker, _WebSocketTracker
@@ -350,7 +350,7 @@ def test_grpc_span_survives_with_its_rpc_attributes(client):
     assert ("rpc.service", "pkg.Svc") in sp.extra
     assert ("rpc.method", "Do") in sp.extra
     # the marker that reaches this span through the closed vocabulary
-    assert Limitation.PAYLOAD_COMPRESSED.value in sp.capture_integrity.limitations
+    assert Limitation.PAYLOAD_COMPRESSED in sp.capture_integrity.limitations
 
 
 def test_grpc_frame_parse_failure_still_emits_a_span(client):
@@ -386,7 +386,7 @@ def test_grpc_frame_parse_failure_still_emits_a_span(client):
 
     (sp,) = client.spans
     assert sp.name == "gRPC /pkg.Svc/Do"
-    assert Limitation.GRPC_MESSAGE_TRUNCATED.value in sp.capture_integrity.limitations
+    assert Limitation.GRPC_MESSAGE_TRUNCATED in sp.capture_integrity.limitations
 
 
 # --------------------------------------------------------------------------
@@ -415,8 +415,8 @@ def test_streaming_chat_span_survives_with_gen_ai_and_its_markers(client):
     assert sp.gen_ai.response_model == "gpt-4o-mini"
     assert sp.gen_ai.finish_reasons == ("stop",)
     lims = sp.capture_integrity.limitations
-    assert Limitation.REASSEMBLED_FROM_STREAM.value in lims
-    assert Limitation.STREAM_USAGE_UNAVAILABLE.value in lims
+    assert Limitation.REASSEMBLED_FROM_STREAM in lims
+    assert Limitation.STREAM_USAGE_UNAVAILABLE in lims
     # gen_ai.operation.name is mirrored into the block, not double-carried in
     # `extra` — that unification is exactly what `finish()` decides once
     assert [k for k, _ in sp.extra if k == "gen_ai.operation.name"] == []
@@ -445,7 +445,7 @@ def test_websocket_span_survives(client):
     assert sp.status is StatusCode.OK
     assert ("network.protocol.version", "websocket") in sp.extra
     assert ("ws.close_code", 1000) in sp.extra
-    assert Limitation.PAYLOAD_COMPRESSED.value in sp.capture_integrity.limitations
+    assert Limitation.PAYLOAD_COMPRESSED in sp.capture_integrity.limitations
 
 
 def test_websocket_flush_span_survives_with_its_marker(client):
@@ -464,7 +464,7 @@ def test_websocket_flush_span_survives_with_its_marker(client):
 
     (sp,) = client.spans
     assert sp.name == "WS /x"
-    assert Limitation.WS_NO_CLOSE.value in sp.capture_integrity.limitations
+    assert Limitation.WS_NO_CLOSE in sp.capture_integrity.limitations
 
 
 # --------------------------------------------------------------------------
@@ -611,7 +611,14 @@ def test_every_adapter_span_class_survives(client):
 
     tool = next(s for s in client.spans if s.name == "execute_tool Bash")
     assert tool.tool is not None and tool.tool.call_id == "toolu_01"
-    assert tool.correlation.strategy == "adapter_hook"
+    # `adapter_hook` was retired: it answered "which source observed this", not
+    # "how was the parent derived", so a tool span makes NO parentage claim.
+    # What the hook path genuinely knew survives and is what is pinned here —
+    # full confidence (0.7 is the stream-only path) and the tool_use_id kept as
+    # a lookup hint rather than an edge.
+    assert tool.correlation.strategy is None
+    assert tool.correlation.confidence == 1.0
+    assert tool.correlation.request_id == "toolu_01"
 
     sub = next(s for s in client.spans if s.name == "invoke_agent researcher")
     assert sub.agent is not None and sub.agent.id == "a-1"
@@ -622,8 +629,7 @@ def test_every_adapter_span_class_survives(client):
     for sp in client.spans:
         assert CaptureSource.ADAPTER in sp.capture_sources
         assert (
-            Limitation.TRANSPORT_TIMING_UNAVAILABLE_SUBPROCESS.value
-            in sp.capture_integrity.limitations
+            Limitation.TRANSPORT_TIMING_UNAVAILABLE_SUBPROCESS in sp.capture_integrity.limitations
         )
 
 
@@ -698,8 +704,8 @@ def test_adapter_abort_emits_root_and_forces_children_closed(client):
     tool = next(s for s in client.spans if s.name == "execute_tool Bash")
     assert root.status is StatusCode.ERROR
     assert root.error_type == "session_error"
-    assert Limitation.SESSION_ABORTED.value in root.capture_integrity.limitations
-    assert Limitation.CHILD_SPAN_UNCLOSED.value in tool.capture_integrity.limitations
+    assert Limitation.SESSION_ABORTED in root.capture_integrity.limitations
+    assert Limitation.CHILD_SPAN_UNCLOSED in tool.capture_integrity.limitations
 
 
 # --------------------------------------------------------------------------
@@ -717,7 +723,7 @@ def test_manual_span_survives_and_gains_the_forensic_fields(client):
     # what the second constructor used to omit (§6.4)
     assert inner.capture_sources == (CaptureSource.MANUAL,)
     assert inner.correlation is not None
-    assert inner.correlation.strategy == "contextvar"
+    assert inner.correlation.strategy is ParentSource.CONTEXTVAR
 
 
 def test_manual_span_marked_error_by_the_host_survives(client):

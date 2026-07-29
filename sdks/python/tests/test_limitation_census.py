@@ -760,13 +760,8 @@ _UNRESOLVED_PY: frozenset[tuple[str, str]] = frozenset(
         ("assembly/_snapshot.py", "Call:list"),
         ("assembly/_snapshot.py", "List"),
         ("assembly/_snapshot.py", "Name:marker"),
-        # `Name:member` is `Limitation.from_wire(wire)`'s result, the one place a
-        # Rust-produced marker STRING is resolved to a member. It cannot
-        # introduce a value: `from_wire` returns a member or None, and the Rust
-        # half of this census is what bounds which members it can return.
         ("interceptors/_seam.py", "Name:limitations"),
         ("interceptors/_seam.py", "Name:marker"),
-        ("interceptors/_seam.py", "Name:member"),
         ("interceptors/_seam.py", "Tuple"),
         ("interceptors/_socket.py", "Tuple"),
         ("interceptors/_ssl.py", "Tuple"),
@@ -776,7 +771,13 @@ _UNRESOLVED_PY: frozenset[tuple[str, str]] = frozenset(
         ("interceptors/_trackers.py", "Call:list"),
         ("interceptors/_trackers.py", "Call:tuple"),
         ("interceptors/_trackers.py", "Tuple"),
-        ("protocol/_http1.py", "Call:tuple"),
+        # `_resolve_markers(raw)` is where a Rust-produced marker STRING becomes
+        # a member, and it is now the ONLY such crossing (step 3b moved it here
+        # from the byte seam, which is why `interceptors/_seam.py::Name:member`
+        # is no longer a hole). It cannot introduce a value: `from_wire` returns
+        # a member or None, and the Rust half of this census bounds which
+        # members it can return.
+        ("protocol/_http1.py", "Call:_resolve_markers"),
     }
 )
 """Every marker-ish slot the scanner could NOT resolve to a value, frozen.

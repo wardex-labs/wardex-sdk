@@ -200,11 +200,12 @@ class IntegrityBuilder:
             redacted=self._redacted,
             truncated=self._truncated,
             dropped_chunk_count=self._dropped_chunks,
-            # Still `tuple[str, ...]` on the wire: retyping
-            # `CaptureIntegrity.limitations` to a proto enum is step 3b, the
-            # deliberate `wardex.v1` break, and it is gated on its own decision.
-            # 3a's job is to make the strings come from the closed enum.
-            limitations=tuple(m.value for m in self._markers),
+            # Members, all the way to the encoder. Unwrapping to `.value` here
+            # was 3a's placeholder while the wire field was still
+            # `repeated string`; now that it is `repeated Limitation`, keeping
+            # the member means the type is checkable at every hop instead of
+            # only at the two ends.
+            limitations=tuple(self._markers),
         )
 
 
@@ -472,8 +473,13 @@ class SpanDraft:
         Nesting a handoff chain is what makes every duration in a flame graph
         wrong; the receiving agent is a SIBLING with a `HANDOFF_FROM` link.
         """
+        # The MEMBER, not `reason.value`. This is the only production site that
+        # builds an `InternalSpanLink`, so unwrapping here meant every link the
+        # SDK emits carried a string where the type says `LinkReason` — and
+        # `link.reason is LinkReason.HANDOFF_FROM`, the check a renderer needs
+        # to draw a sibling instead of nesting, was always False.
         self._links.append(
-            InternalSpanLink(trace_id=ctx.trace_id, span_id=ctx.span_id, reason=reason.value)
+            InternalSpanLink(trace_id=ctx.trace_id, span_id=ctx.span_id, reason=reason)
         )
 
     def add_event(self, name: str, ts_ns: int, **attrs: _Scalar) -> None:

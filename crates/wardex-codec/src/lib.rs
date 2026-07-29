@@ -15,6 +15,7 @@ pub mod proto {
 }
 
 pub mod otlp;
+pub mod vocab;
 
 use prost::Message;
 use wardex_limits::Limits;
@@ -52,43 +53,26 @@ pub fn decode_envelope(data: &[u8]) -> Result<pb::Envelope, CodecError> {
     pb::Envelope::decode(&proto_bytes[..]).map_err(CodecError::Decode)
 }
 
-/// `SpanLink.reason` (proto number) → the wardex value string, for decode.
-///
-/// Three outcomes, and they stay DISTINGUISHABLE:
-///
-///   * `UNSPECIFIED` → `""` — no reason was set;
-///   * a known value → its wardex string;
-///   * anything else → `link_reason_unrecognized_{v}`, a string that declares
-///     its own ignorance.
-///
-/// Collapsing the last two into `""` is silent coercion (design I4), and here it
-/// is not academic: §6.3 makes the reason load-bearing, because `handoff_from`
-/// is what tells a renderer to draw a SIBLING rather than nest. An unrecognized
-/// reason degrading to "no reason" silently reproduces the 5-level-nesting flame
-/// graph §6.3 exists to prevent, and whoever decodes an envelope written by a
-/// NEWER SDK is exactly who hits it.
-///
-/// It lives here rather than in the PyO3 binding for one practical reason: this
-/// crate owns the generated enum and can be unit-tested, while
-/// `bindings/python` is `crate-type = ["cdylib"]` with pyo3's
-/// `extension-module`, so `cargo test` builds no harness for it. A mapping whose
-/// unknown-value branch is the whole point needs a test that reaches it.
-pub fn link_reason_name(v: i32) -> String {
-    match pb::LinkReason::try_from(v) {
-        Ok(pb::LinkReason::Unspecified) => String::new(),
-        Ok(pb::LinkReason::TriggeredBy) => "triggered_by".to_owned(),
-        Ok(pb::LinkReason::HandoffFrom) => "handoff_from".to_owned(),
-        Ok(pb::LinkReason::ResumedFrom) => "resumed_from".to_owned(),
-        Ok(pb::LinkReason::RetriedFrom) => "retried_from".to_owned(),
-        Ok(pb::LinkReason::CacheSource) => "cache_source".to_owned(),
-        Err(_) => format!("link_reason_unrecognized_{v}"),
-    }
-}
+// Every enum mapping now lives in `vocab`, derived from the schema rather than
+// transcribed from it. The whole table used to sit here as a hand-written
+// `match` per enum; `Limitation` arriving with 37 members made that untenable,
+// and what replaced it removes the class of bug rather than one instance of it.
+//
+// These mappings live in this crate rather than in the PyO3 binding for one
+// practical reason: this crate owns the generated enums and `cargo test` can
+// build a harness for it, while `bindings/python` is `crate-type = ["cdylib"]`
+// with pyo3's `extension-module` and gets no test harness at all. A mapping
+// whose unknown-value branch is the entire point needs a test that reaches it.
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::proto::wardex::v1 as pb;
+    // Moved to `vocab` (schema-derived, no longer a hand table). The two tests
+    // below stay here unchanged: they pin the BEHAVIOUR the move had to
+    // preserve, so keeping them where they were is what makes the move
+    // reviewable.
+    use crate::vocab::link_reason_name;
 
     fn sample() -> pb::Envelope {
         pb::Envelope {

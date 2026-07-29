@@ -258,29 +258,21 @@ fn mask_span(engine: &PiiEngine, span: &mut pb::Span) {
         attempt_id,
         active_span_id_at_capture: _, // binary id
         confidence: _,
-        strategy,
+        // Was `strategy: String`, and the regexes ran over it. Now a closed
+        // enum, so there is nothing to scan and nothing that could match: the
+        // set of values is fixed by the schema and contains no user data.
+        parent_source: _,
     }) = correlation
     {
         hit |= mask_string(engine, operation_id);
         hit |= mask_string(engine, request_id);
         hit |= mask_string(engine, attempt_id);
-        hit |= mask_string(engine, strategy);
     }
-    if let Some(pb::CaptureIntegrity {
-        request_headers_captured: _,
-        request_body_captured: _,
-        response_headers_captured: _,
-        response_body_captured: _,
-        redacted: _, // set below from `hit`
-        truncated: _,
-        dropped_chunk_count: _,
-        limitations,
-    }) = capture_integrity
-    {
-        for l in limitations {
-            hit |= mask_string(engine, l);
-        }
-    }
+    // `CaptureIntegrity` is deliberately NOT destructured any more. Every one
+    // of its fields is a bool, an i32 or — as of step 3b — a repeated closed
+    // enum; none can carry PII, so masking it was work with no possible effect.
+    // Note the ordering that survives: `redacted` is still written below from
+    // `hit`, and it has to stay after every other field has been scanned.
     if hit {
         capture_integrity
             .get_or_insert_with(Default::default)

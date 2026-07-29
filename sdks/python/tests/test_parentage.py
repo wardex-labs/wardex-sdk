@@ -56,7 +56,7 @@ def test_no_ambient_parent_starts_a_declared_trace_root():
     assert p.parent_span_id is None
     assert p.joined is False
     assert p.correlation is not None
-    assert p.correlation.strategy == ParentSource.TRACE_ROOT.value
+    assert p.correlation.strategy is ParentSource.TRACE_ROOT
     assert p.correlation.confidence == 1.0
     # wardex does not head-sample, so a trace it ORIGINATES is sampled (V9).
     # This is the value `_w3c.format_traceparent` hardcodes as `-01` today; step
@@ -79,7 +79,7 @@ def test_expected_parent_that_is_missing_is_unresolved_not_root():
     p = resolve_parentage(EMPTY_AMBIENT, Evidence(ParentSource.UNRESOLVED))
 
     assert p.parent_span_id is None
-    assert p.correlation.strategy == ParentSource.UNRESOLVED.value
+    assert p.correlation.strategy is ParentSource.UNRESOLVED
     assert p.correlation.confidence == 0.0
 
 
@@ -105,7 +105,7 @@ def test_ambient_parent_is_joined_with_its_trace():
     assert p.joined is True
     assert p.trace_id == parent.trace_id
     assert p.parent_span_id == parent.span_id
-    assert p.correlation.strategy == ParentSource.CONTEXTVAR.value
+    assert p.correlation.strategy is ParentSource.CONTEXTVAR
     assert p.correlation.active_span_id_at_capture == parent.span_id
 
 
@@ -145,14 +145,14 @@ def test_conversation_and_tracestate_ride_along():
 def test_remote_parent_is_recorded_as_header_not_contextvar():
     p = resolve_parentage(Ambient(_ctx(remote=True), None, None), AMBIENT)
 
-    assert p.correlation.strategy == ParentSource.HEADER.value
+    assert p.correlation.strategy is ParentSource.HEADER
     assert p.correlation.confidence == 1.0
 
 
 def test_remote_correction_does_not_override_an_explicit_source():
     p = resolve_parentage(Ambient(_ctx(remote=True), None, None), Evidence(ParentSource.UNIT_ALIAS))
 
-    assert p.correlation.strategy == ParentSource.UNIT_ALIAS.value
+    assert p.correlation.strategy is ParentSource.UNIT_ALIAS
 
 
 def test_ambient_is_local_only_for_a_non_remote_parent():
@@ -408,7 +408,7 @@ def test_latch_ambient_outside_any_span_is_empty_but_usable():
     ambient = latch_ambient()
 
     assert ambient.span_context is None
-    assert resolve_parentage(ambient).correlation.strategy == ParentSource.TRACE_ROOT.value
+    assert resolve_parentage(ambient).correlation.strategy is ParentSource.TRACE_ROOT
 
 
 # --- guard: swallow, but never in silence (I6) ------------------------------

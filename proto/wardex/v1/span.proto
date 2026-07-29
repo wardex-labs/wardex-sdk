@@ -58,6 +58,13 @@ message ConversationContext {
 }
 
 message CaptureIntegrity {
+  // Tag 8 was `repeated string limitations`, an OPEN vocabulary. Retyping it in
+  // place is not an option in either direction: packed enum and
+  // length-delimited string share wire type 2, so old bytes would decode `Ok`
+  // as one enum value per ASCII byte — data corruption with no error path.
+  reserved 8;
+  reserved "limitations";
+
   bool request_headers_captured = 1;
   bool request_body_captured = 2;
   bool response_headers_captured = 3;
@@ -65,16 +72,25 @@ message CaptureIntegrity {
   bool redacted = 5;
   bool truncated = 6;
   int32 dropped_chunk_count = 7;
-  repeated string limitations = 8;
+
+  repeated Limitation limitation_codes = 9;
 }
 
 message CorrelationInfo {
+  // Tag 6 was `string strategy`, which mixed two axes — how the parent was
+  // derived, and which source observed the event — into one free-form field.
+  // A scalar string retyped to an enum is a hard DecodeError that prost
+  // propagates up the nesting, so one old span would fail an entire batch.
+  reserved 6;
+  reserved "strategy";
+
   string operation_id = 1;
   string request_id = 2;
   string attempt_id = 3;
   bytes active_span_id_at_capture = 4;
   float confidence = 5;                // 0.0~1.0
-  string strategy = 6;                 // contextvar|header|socket|timing|manual
+
+  ParentSource parent_source = 7;
 }
 
 message SpanEvent {
