@@ -44,16 +44,18 @@ marker (add a member) or a connection-level debug reason (add it to the
 exclusion set instead)".
 
 Migration status (design §11): this module is the **python half** of the census
-and it is a hard prerequisite for step 3a, which routes all six span-emit sites
-through ``SpanDraft.finish()`` — and ``finish()`` raises ``VocabularyError`` on
-a marker that is not a member here, which ``SpanSink.guard()`` swallows. Merged
-against an incomplete enum, 3a would silently delete every gRPC span, every
-streaming chat span, every WS span and every adapter span. Nothing imports this
-enum from the live emit path yet; the emitters still pass the equivalent free
-strings, seven of which differ from the member value they map to (the four
-renames below). Step 3a replaces those strings with members and the divergence
-ends; step 3b makes proto the single source of truth for every language SDK
-(§6.6).
+and it was the hard prerequisite for step 3a, which routed all six span-emit
+sites through ``SpanDraft.finish()`` — and ``finish()`` raises
+``VocabularyError`` on a marker that is not a member here, which the emit site's
+``guard()`` swallows. Merged against an incomplete enum, 3a would have silently
+deleted every gRPC span, every streaming chat span, every WS span and every
+adapter span. That step has landed: **every Python emitter now names a member**,
+the seven pre-rename free strings are gone from the tree, and
+``tests/test_limitation_census.py`` asserts an EMPTY string census as the
+standing rule. One producer is still textual — ``body_cap_exceeded``, built in
+``crates/wardex-protocol`` and resolved once at the PyO3 boundary by
+``Limitation.from_wire`` — and retyping that is step 3b, which also makes proto
+the single source of truth for every language SDK (§6.6).
 """
 
 from __future__ import annotations
@@ -76,6 +78,34 @@ class Limitation(Enum):
     step wires up — it is not dead code, and it is not evidence that the census
     missed something.
     """
+
+    @classmethod
+    def from_wire(cls, value: str) -> Limitation | None:
+        """A marker that arrived as a STRING, resolved to its member, or None.
+
+        Exactly one caller is legitimate and it is the PyO3 boundary: the Rust
+        protocol parsers still build `Vec<&'static str>` (retyping that is step
+        3b, along with `bindings/python/src/lib.rs` and the PII walk that runs
+        regexes over the strings), so a marker produced in Rust reaches Python
+        as text and has to be resolved once, at the seam that folds it into a
+        span. Python-side emitters name the member directly and must not come
+        here — a string-to-member lookup used as a general entry point is the
+        drift this enum exists to end.
+
+        Returns `None` rather than raising for an unrecognized string, because
+        the alternative on that path is deleting the span (`finish()` rejects a
+        marker it cannot type) over a marker wardex itself produced. That is
+        not a silent hole: `tests/test_limitation_census.py` scans `crates/`
+        and `bindings/` on every run and fails the build if the Rust side
+        starts emitting a string with no member here, so an unknown value is
+        unreachable rather than merely tolerated.
+
+        A dict lookup rather than `cls(value)` in a `try`: `assembly/` is held
+        to zero silent swallows (C-S4), and an `except ValueError: return None`
+        here would be one — indistinguishable in a diff from a swallow that is
+        hiding something.
+        """
+        return _BY_VALUE.get(value)
 
     # ------------------------------------------------------------------
     # Parentage: the edge exists but was not derived from a live scope
@@ -152,10 +182,11 @@ class Limitation(Enum):
     instead of by its own completion event, so its ``end_time_ns`` is the
     teardown instant and its status is synthesized.
 
-    Emitted today as the free string ``"tool_span_unclosed"`` from
-    ``adapters/_assembler.py::SessionAssembler._open_tool`` (open-tool table hit
-    ``max_session_entries``) and ``::_finalize`` (session ended with tools still
-    open), both via ``_emit_tool(markers=...)``.
+    Emitted from ``adapters/_assembler.py::SessionAssembler._open_tool``
+    (open-tool table hit ``max_session_entries``) and ``::_finalize`` (session
+    ended with tools still open), both via ``_emit_tool(markers=...)``. Until
+    step 3a rewired those two sites it was the free string
+    ``"tool_span_unclosed"``.
 
     NOTE (census): the four-way merge that loses nothing. ``tool_span_unclosed``
     folded into this step-0 member because the marker rides the tool span
@@ -228,7 +259,11 @@ class Limitation(Enum):
     """A snapshot arrived with a type outside ``SnapshotType``, so it was
     recorded as ``UNSPECIFIED``.
 
-    Declared; no emitter until step 3a closes ``SnapshotType`` (§11 row 3a).
+    Emitted from ``assembly/_snapshot.py::SnapshotDraft.__init__``, when
+    ``coerce_snapshot_type`` cannot resolve the value the caller handed
+    ``capture_state_snapshot``. Step 3a closed ``SnapshotType`` and built this
+    emitter; before it, an unrecognized type was flattened to ``UNSPECIFIED``
+    by ``codec.rs``'s ``map_snap`` with nothing recorded anywhere.
     """
 
     # ------------------------------------------------------------------
@@ -260,7 +295,7 @@ class Limitation(Enum):
     shared timing store had no record for this fileno; async path: no stamped
     ``_wardex_timing`` record at all).
 
-    NOTE (census): absorbed ``async_connect_unavailable``
+    NOTE (census): absorbed the free string ``async_connect_unavailable``
     (``_ssl.py::_resolve_timing``, anyio/httpx path where TLS and TCP are
     separate layers so ``total_ms`` is 0 and connect cannot be derived). What is
     lost is the provenance — sync fileno miss vs anyio layer split. Merged
@@ -357,9 +392,9 @@ class Limitation(Enum):
     """The connection table hit ``max_connections`` and this connection's
     tracker was flushed early, so its span ends at the eviction instant.
 
-    Emitted today as the free string ``"ws_evicted"`` from
-    ``interceptors/_seam.py::ByteSeamInterceptor._state``, via
-    ``_WebSocketTracker.flush(marker)``.
+    Emitted from ``interceptors/_seam.py::ByteSeamInterceptor._state`` via
+    ``_WebSocketTracker.flush(marker)``. Until step 3a rewired that site it was
+    the free string ``ws_evicted``.
 
     NOTE (census): renamed, NOT merged into ``UNIT_EVICTED``. Both say
     "something was evicted", but they name different tables and different
@@ -376,11 +411,11 @@ class Limitation(Enum):
     """The framing layer failed, so the transport fields on this span are
     partial or synthesized.
 
-    Emitted today as two free strings: ``"grpc_parse_failed"`` from
-    ``interceptors/_seam.py::_build_grpc_fields`` (gRPC frame parse raised; the
-    span falls back to plain h2 fields) and ``"ws_parse_failed"`` from
+    Emitted from ``interceptors/_seam.py::_build_grpc_fields`` (gRPC frame
+    parse raised; the span falls back to plain h2 fields) and
     ``interceptors/_trackers.py::_WebSocketTracker._build_txn`` (either
-    direction's frame parser latched off).
+    direction's frame parser latched off). Until step 3a those two sites emitted
+    the free strings ``grpc_parse_failed`` and ``ws_parse_failed``.
 
     This member carries a LIMIT as well as a bug, which its name does not say:
     a WebSocket frame whose declared payload exceeds ``max_ws_frame_bytes``
@@ -407,11 +442,11 @@ class Limitation(Enum):
     """The payload was observed compressed and wardex did not decompress it, so
     body bytes on this span are not readable content.
 
-    Emitted today as two free strings: ``"grpc_compressed"`` from
-    ``interceptors/_seam.py::_build_grpc_fields`` (any request or response
-    message had its compressed flag set) and ``"ws_compressed"`` from
+    Emitted from ``interceptors/_seam.py::_build_grpc_fields`` (any request or
+    response message had its compressed flag set) and
     ``interceptors/_trackers.py::_WebSocketTracker._build_txn``
-    (permessage-deflate negotiated).
+    (permessage-deflate negotiated). Until step 3a those two sites emitted the
+    free strings ``grpc_compressed`` and ``ws_compressed``.
 
     NOTE (census): merged. What is lost is which protocol it was —
     ``TransportAttributes.protocol`` already carries that, and encoding a
@@ -509,3 +544,8 @@ class Limitation(Enum):
     three of its terminal branches (result present but errored, no result and an
     error, no result and no error).
     """
+
+
+_BY_VALUE: dict[str, Limitation] = {m.value: m for m in Limitation}
+"""Wire value -> member, for `Limitation.from_wire`. See its docstring for why
+this is a table rather than a `try: Limitation(value)`."""

@@ -16,14 +16,18 @@ name to call.
 
 Migration status (design §11): step 0 landed `_parentage`, `_diag` and the
 `Limitation` enum; step 1 wired the six parentage sites onto `resolve_parentage`
-/ `child_of`, so `_parentage` is live on every span the SDK emits; step 2 landed
-`_policy`, so the capture gate has one implementation and the byte seams compose
-with it instead of overriding it. `_diag.guard` still has no caller outside this
-package — `interceptors/` and `adapters/` adopt it with the seam decomposition.
-`_units`, `_builder`, `_vocab`, `_emit`, `_snapshot` and `_patchset` arrive in
-later steps; `__all__` grows with them and does not shrink.
+/ `child_of`; step 2 landed `_policy`, so the capture gate has one
+implementation and the byte seams compose with it instead of overriding it;
+step 3a landed `_vocab`, `_builder` and `_snapshot`, so the same six sites now
+also share one span CONSTRUCTOR and one closed vocabulary — `InternalSpan(...)`
+appears nowhere outside `_types.py` and `_builder.py`, and `guard()` finally has
+callers outside this package (every draft is built inside one, because
+`finish()` throws on a vocabulary breach and I6 forbids that reaching the host).
+`_units`, `_emit` and `_patchset` arrive in later steps; `__all__` grows with
+them and does not shrink.
 """
 
+from ._builder import IntegrityBuilder, SpanDraft
 from ._diag import Counters, counters, guard
 from ._integrity import Limitation
 from ._parentage import (
@@ -38,22 +42,44 @@ from ._parentage import (
     resolve_parentage,
 )
 from ._policy import Prefilter, capture_mode_of, should_capture
+from ._snapshot import SnapshotDraft
+from ._vocab import (
+    Block,
+    LinkReason,
+    SnapshotType,
+    SpanIntent,
+    TransportLabel,
+    VocabularyError,
+    is_declared_extra_key,
+    vocabulary_name,
+)
 
 __all__ = [
     "AMBIENT",
     "Ambient",
+    "Block",
     "Counters",
     "EMPTY_AMBIENT",
     "Evidence",
+    "IntegrityBuilder",
     "Limitation",
+    "LinkReason",
     "ParentSource",
     "Parentage",
     "Prefilter",
+    "SnapshotDraft",
+    "SnapshotType",
+    "SpanDraft",
+    "SpanIntent",
+    "TransportLabel",
+    "VocabularyError",
     "capture_mode_of",
     "child_of",
     "counters",
     "guard",
+    "is_declared_extra_key",
     "latch_ambient",
     "resolve_parentage",
     "should_capture",
+    "vocabulary_name",
 ]

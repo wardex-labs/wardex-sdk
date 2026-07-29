@@ -52,6 +52,39 @@ pub fn decode_envelope(data: &[u8]) -> Result<pb::Envelope, CodecError> {
     pb::Envelope::decode(&proto_bytes[..]).map_err(CodecError::Decode)
 }
 
+/// `SpanLink.reason` (proto number) → the wardex value string, for decode.
+///
+/// Three outcomes, and they stay DISTINGUISHABLE:
+///
+///   * `UNSPECIFIED` → `""` — no reason was set;
+///   * a known value → its wardex string;
+///   * anything else → `link_reason_unrecognized_{v}`, a string that declares
+///     its own ignorance.
+///
+/// Collapsing the last two into `""` is silent coercion (design I4), and here it
+/// is not academic: §6.3 makes the reason load-bearing, because `handoff_from`
+/// is what tells a renderer to draw a SIBLING rather than nest. An unrecognized
+/// reason degrading to "no reason" silently reproduces the 5-level-nesting flame
+/// graph §6.3 exists to prevent, and whoever decodes an envelope written by a
+/// NEWER SDK is exactly who hits it.
+///
+/// It lives here rather than in the PyO3 binding for one practical reason: this
+/// crate owns the generated enum and can be unit-tested, while
+/// `bindings/python` is `crate-type = ["cdylib"]` with pyo3's
+/// `extension-module`, so `cargo test` builds no harness for it. A mapping whose
+/// unknown-value branch is the whole point needs a test that reaches it.
+pub fn link_reason_name(v: i32) -> String {
+    match pb::LinkReason::try_from(v) {
+        Ok(pb::LinkReason::Unspecified) => String::new(),
+        Ok(pb::LinkReason::TriggeredBy) => "triggered_by".to_owned(),
+        Ok(pb::LinkReason::HandoffFrom) => "handoff_from".to_owned(),
+        Ok(pb::LinkReason::ResumedFrom) => "resumed_from".to_owned(),
+        Ok(pb::LinkReason::RetriedFrom) => "retried_from".to_owned(),
+        Ok(pb::LinkReason::CacheSource) => "cache_source".to_owned(),
+        Err(_) => format!("link_reason_unrecognized_{v}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -117,5 +150,40 @@ mod tests {
     #[test]
     fn decode_rejects_corrupt_input() {
         assert!(decode_envelope(b"not a zstd frame").is_err());
+    }
+
+    #[test]
+    fn link_reason_unset_and_unknown_are_not_the_same_string() {
+        // The whole point of the mapping. A reader must be able to tell "no
+        // reason was set" from "a reason this build does not know" — the second
+        // is what arrives from a newer SDK, and reading it as the first turns a
+        // handoff sibling back into a nested child (design §6.3).
+        assert_eq!(link_reason_name(0), "");
+        assert_eq!(link_reason_name(99), "link_reason_unrecognized_99");
+        assert_ne!(link_reason_name(99), link_reason_name(0));
+    }
+
+    #[test]
+    fn every_declared_link_reason_maps_to_its_wardex_string() {
+        assert_eq!(
+            link_reason_name(pb::LinkReason::TriggeredBy as i32),
+            "triggered_by"
+        );
+        assert_eq!(
+            link_reason_name(pb::LinkReason::HandoffFrom as i32),
+            "handoff_from"
+        );
+        assert_eq!(
+            link_reason_name(pb::LinkReason::ResumedFrom as i32),
+            "resumed_from"
+        );
+        assert_eq!(
+            link_reason_name(pb::LinkReason::RetriedFrom as i32),
+            "retried_from"
+        );
+        assert_eq!(
+            link_reason_name(pb::LinkReason::CacheSource as i32),
+            "cache_source"
+        );
     }
 }

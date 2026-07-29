@@ -130,6 +130,74 @@ fn map_capture_source(s: &str) -> i32 {
     }) as i32
 }
 
+// --- span vocabulary registry (design §6.2, §6.3, §6.6) ---
+//
+// proto is the single source of truth for the span vocabulary, and these
+// functions are the mapping from the Python enum VALUE (`"execute_tool"`,
+// `"ipc"`, `"triggered_by"`) to the declared proto number. Node and Java get
+// the same table by generating from the same `.proto`, which is the whole point
+// of declaring the enums: a second SDK must not re-derive the vocabulary from
+// prose.
+//
+// `map_operation_name` and `map_tool_execution_type` intentionally fill no
+// `Span` field in this schema version — those two values ride as `extra` keys
+// (`gen_ai.operation.name`, `wardex.tool.execution_type`), and a typed field
+// alongside would double-carry them and force a precedence rule. They are
+// reachable, exercised and pinned through `vocabulary_tables()` below, which is
+// also what lets a Python test assert the two vocabularies agree value by value
+// instead of trusting that they do.
+
+fn map_operation_name(s: &str) -> i32 {
+    (match s {
+        "chat" => pb::OperationName::Chat,
+        "text_completion" => pb::OperationName::TextCompletion,
+        "embeddings" => pb::OperationName::Embeddings,
+        "execute_tool" => pb::OperationName::ExecuteTool,
+        "create_agent" => pb::OperationName::CreateAgent,
+        "invoke_agent" => pb::OperationName::InvokeAgent,
+        "invoke_workflow" => pb::OperationName::InvokeWorkflow,
+        "generate_content" => pb::OperationName::GenerateContent,
+        "retrieval" => pb::OperationName::Retrieval,
+        "execute_step" => pb::OperationName::ExecuteStep,
+        "handoff" => pb::OperationName::Handoff,
+        "evaluate" => pb::OperationName::Evaluate,
+        _ => pb::OperationName::Unspecified,
+    }) as i32
+}
+
+fn map_tool_execution_type(s: &str) -> i32 {
+    (match s {
+        "network" => pb::ToolExecutionType::Network,
+        "in_process" => pb::ToolExecutionType::InProcess,
+        "ipc" => pb::ToolExecutionType::Ipc,
+        "unknown" => pb::ToolExecutionType::Unknown,
+        _ => pb::ToolExecutionType::Unspecified,
+    }) as i32
+}
+
+fn map_link_reason(s: &str) -> i32 {
+    (match s {
+        "triggered_by" => pb::LinkReason::TriggeredBy,
+        "handoff_from" => pb::LinkReason::HandoffFrom,
+        "resumed_from" => pb::LinkReason::ResumedFrom,
+        "retried_from" => pb::LinkReason::RetriedFrom,
+        "cache_source" => pb::LinkReason::CacheSource,
+        _ => pb::LinkReason::Unspecified,
+    }) as i32
+}
+
+// The decode direction lives in `wardex-codec` (`link_reason_name`), next to the
+// generated enum and inside a crate `cargo test` can build a harness for — this
+// one is `crate-type = ["cdylib"]`, so a unit test here would never run. Its
+// unknown-value branch is the whole point of the function, which makes an
+// untestable home the wrong home.
+//
+// Note the asymmetry that remains: `map_link_reason` above still flattens an
+// unmapped STRING to UNSPECIFIED with no breadcrumb. Design R11 defers that
+// class of fix to step 3b, and it is bounded meanwhile — `SpanDraft.add_link`
+// takes the `LinkReason` enum, so no caller inside the SDK can produce one.
+use wardex_core::codec::link_reason_name;
+
 // --- gen_ai flattening ---
 
 /// GenAIAttributes → extra KeyValue (OTel keys). Only populated fields.
@@ -425,20 +493,27 @@ fn correlation_to_proto(c: &Bound<PyAny>) -> PyResult<pb::CorrelationInfo> {
     Ok(corr)
 }
 
+/// Lifted out of `state_to_proto` so `vocabulary_tables()` can pin it beside
+/// the other three registry enums. An unrecognized value still becomes
+/// UNSPECIFIED here, but it can no longer arrive unnoticed: `SnapshotType` is
+/// closed on the Python side as of step 3a, and `SnapshotDraft` attaches
+/// `Limitation.SNAPSHOT_TYPE_UNKNOWN` at the point of coercion instead of
+/// letting this function flatten it in silence.
+fn map_snapshot_type(v: &str) -> i32 {
+    (match v {
+        "span_start" => pb::SnapshotType::SpanStart,
+        "span_end" => pb::SnapshotType::SpanEnd,
+        "turn_start" => pb::SnapshotType::TurnStart,
+        _ => pb::SnapshotType::Unspecified,
+    }) as i32
+}
+
 fn state_to_proto(s: &Bound<PyAny>) -> PyResult<pb::StateSnapshot> {
-    let map_snap = |v: &str| -> i32 {
-        (match v {
-            "span_start" => pb::SnapshotType::SpanStart,
-            "span_end" => pb::SnapshotType::SpanEnd,
-            "turn_start" => pb::SnapshotType::TurnStart,
-            _ => pb::SnapshotType::Unspecified,
-        }) as i32
-    };
     let mut ss = pb::StateSnapshot {
         trace_id: id_bytes(&s.getattr("trace_id")?)?,
         span_id: id_bytes(&s.getattr("span_id")?)?,
         timestamp_ns: s.getattr("timestamp_ns")?.extract()?,
-        snapshot_type: map_snap(&s.getattr("snapshot_type")?.extract::<String>()?),
+        snapshot_type: map_snapshot_type(&s.getattr("snapshot_type")?.extract::<String>()?),
         turn_index: s.getattr("turn_index")?.extract()?,
         conversation_state: s.getattr("conversation_state")?.extract()?,
         ..Default::default()
@@ -551,7 +626,62 @@ fn span_to_proto(sp: &Bound<PyAny>) -> PyResult<pb::Span> {
     if let Some(c) = opt(sp, "correlation")? {
         span.correlation = Some(correlation_to_proto(&c)?);
     }
+    events_to_proto(sp, &mut span.events)?;
+    links_to_proto(sp, &mut span.links)?;
     Ok(span)
+}
+
+/// `InternalSpan.events` -> `Span.events` (tag 10).
+///
+/// This encoder did not exist. `Span.events` and `Span.links` were declared in
+/// `span.proto` and never filled, so `_types.py`'s `events`/`links` tuples were
+/// dropped whole at encode — and with them `InternalSpanLink.reason`, which
+/// made `LinkReason` dead vocabulary and design §6.3's entire graph model
+/// (TRIGGERED_BY edges, HANDOFF_FROM siblings, RESUMED_FROM across a
+/// checkpoint) impossible to transmit at all. Declaring the enum without this
+/// would have been theatre.
+fn events_to_proto(sp: &Bound<PyAny>, out: &mut Vec<pb::SpanEvent>) -> PyResult<()> {
+    for ev in sp.getattr("events")?.iter()? {
+        let ev = ev?;
+        let mut event = pb::SpanEvent {
+            name: ev.getattr("name")?.extract()?,
+            time_unix_nano: ev.getattr("timestamp_ns")?.extract()?,
+            ..Default::default()
+        };
+        kv_list(&ev.getattr("attributes")?, &mut event.attributes)?;
+        out.push(event);
+    }
+    Ok(())
+}
+
+/// `InternalSpan.links` -> `Span.links` (tag 11), including `reason` (tag 4).
+///
+/// `reason` is a `LinkReason` on the wire but a `str | None` on the Python
+/// dataclass, which is the same shape `CaptureIntegrity.limitations` has and
+/// for the same reason: retyping the Python side is step 3b's break, not 3a's.
+/// The mapping is one-way lossy by construction — an unrecognized reason
+/// becomes UNSPECIFIED — and that is bounded by `LinkReason` being closed and
+/// `SpanDraft.add_link` taking the enum, so no caller inside the SDK can
+/// produce a string that is not a member.
+fn links_to_proto(sp: &Bound<PyAny>, out: &mut Vec<pb::SpanLink>) -> PyResult<()> {
+    for ln in sp.getattr("links")?.iter()? {
+        let ln = ln?;
+        let mut link = pb::SpanLink {
+            trace_id: id_bytes(&ln.getattr("trace_id")?)?,
+            span_id: id_bytes(&ln.getattr("span_id")?)?,
+            ..Default::default()
+        };
+        if let Some(r) = opt(&ln, "reason")? {
+            let reason: String = if r.hasattr("value")? {
+                enum_str(&r)?
+            } else {
+                r.extract()?
+            };
+            link.reason = map_link_reason(&reason);
+        }
+        out.push(link);
+    }
+    Ok(())
 }
 
 // --- envelope ---
@@ -708,6 +838,33 @@ fn span_to_dict(py: Python<'_>, sp: &pb::Span) -> PyResult<PyObject> {
         cd.set_item("confidence", c.confidence)?;
         d.set_item("correlation", cd)?;
     }
+    // The decode half of the events/links encoder above. Both directions land in
+    // the same commit so the round-trip is testable: an encoder nobody can
+    // decode is indistinguishable from no encoder at all.
+    let events = PyList::empty_bound(py);
+    for ev in &sp.events {
+        let ed = PyDict::new_bound(py);
+        ed.set_item("name", &ev.name)?;
+        ed.set_item("timestamp_ns", ev.time_unix_nano)?;
+        ed.set_item("attributes", kv_to_py(py, &ev.attributes)?)?;
+        events.append(ed)?;
+    }
+    d.set_item("events", events)?;
+    let links = PyList::empty_bound(py);
+    for ln in &sp.links {
+        let ld = PyDict::new_bound(py);
+        ld.set_item("trace_id", PyBytes::new_bound(py, &ln.trace_id))?;
+        ld.set_item("span_id", PyBytes::new_bound(py, &ln.span_id))?;
+        // The wardex value string, not the raw i32 the rest of this function
+        // still hands back for enums. A number is not a vocabulary: a consumer
+        // reading `2` has to hold a copy of the enum to know what it means,
+        // which is the drift §6.6 exists to prevent. (Doing the same for the
+        // other enums here is step 3b's, where the fields change type anyway.)
+        ld.set_item("reason", link_reason_name(ln.reason))?;
+        ld.set_item("attributes", kv_to_py(py, &ln.attributes)?)?;
+        links.append(ld)?;
+    }
+    d.set_item("links", links)?;
     Ok(d.into_py(py))
 }
 
@@ -906,7 +1063,67 @@ fn span_to_otlp(sp: &Bound<PyAny>) -> PyResult<otlp_pb::trace::Span> {
         attrs.push(otlp_kv_bytes("wardex.output_data", output));
     }
     span.attributes = attrs;
+    events_to_otlp(sp, &mut span.events)?;
+    links_to_otlp(sp, &mut span.links)?;
     Ok(span)
+}
+
+/// `InternalSpan.events` -> OTLP `Span.events` (tag 11).
+///
+/// The envelope encoder is not enough on its own. OTLP is the surface that
+/// actually leaves the process today (`transport/_otlp_http.py`), so filling
+/// `Span.events`/`Span.links` on the wardex envelope and not here would leave
+/// the two encoders disagreeing about the same span — and a user configured for
+/// the OTLP exporter would lose §6.3's whole graph model with no counter, no
+/// `Limitation` marker and no failing test, indistinguishable from "this agent
+/// has no graph edges". That is the silent-loss shape I4 forbids.
+fn events_to_otlp(sp: &Bound<PyAny>, out: &mut Vec<otlp_pb::trace::span::Event>) -> PyResult<()> {
+    for ev in sp.getattr("events")?.iter()? {
+        let ev = ev?;
+        let mut wkv: Vec<pb::KeyValue> = Vec::new();
+        kv_list(&ev.getattr("attributes")?, &mut wkv)?;
+        out.push(otlp_pb::trace::span::Event {
+            time_unix_nano: ev.getattr("timestamp_ns")?.extract()?,
+            name: ev.getattr("name")?.extract()?,
+            attributes: wkv.iter().map(wardex_kv_to_otlp).collect(),
+            ..Default::default()
+        });
+    }
+    Ok(())
+}
+
+/// `InternalSpan.links` -> OTLP `Span.links` (tag 13).
+///
+/// `reason` has no OTLP-native home — `Link` carries `trace_state` and
+/// attributes and nothing else — so it travels as the `wardex.link.reason`
+/// attribute rather than being dropped. Emitting the wardex value string keeps
+/// it readable without a copy of the enum, which is the same argument §6.6
+/// makes for not shipping raw `i32`s.
+///
+/// `InternalSpanLink` carries no attributes of its own (`_types.py:235`), so
+/// `reason` is the only one there is to carry.
+fn links_to_otlp(sp: &Bound<PyAny>, out: &mut Vec<otlp_pb::trace::span::Link>) -> PyResult<()> {
+    for ln in sp.getattr("links")?.iter()? {
+        let ln = ln?;
+        let mut attributes: Vec<otlp_pb::common::KeyValue> = Vec::new();
+        if let Some(r) = opt(&ln, "reason")? {
+            let reason: String = if r.hasattr("value")? {
+                enum_str(&r)?
+            } else {
+                r.extract()?
+            };
+            if !reason.is_empty() {
+                attributes.push(otlp_kv_str("wardex.link.reason", &reason));
+            }
+        }
+        out.push(otlp_pb::trace::span::Link {
+            trace_id: id_bytes(&ln.getattr("trace_id")?)?,
+            span_id: id_bytes(&ln.getattr("span_id")?)?,
+            attributes,
+            ..Default::default()
+        });
+    }
+    Ok(())
 }
 
 /// InternalEnvelope → ExportTraceServiceRequest. state_snapshots are skipped (traces-only).
@@ -1030,6 +1247,28 @@ fn otlp_traces_to_dict(
                 }
                 spd.set_item("status", status)?;
                 spd.set_item("attributes", otlp_attrs_to_py(py, &sp.attributes)?)?;
+                // The decode half of `events_to_otlp`/`links_to_otlp`. An
+                // encoder nobody can decode is indistinguishable from no
+                // encoder, which is how these two fields went missing on this
+                // surface in the first place.
+                let events = PyList::empty_bound(py);
+                for ev in &sp.events {
+                    let ed = PyDict::new_bound(py);
+                    ed.set_item("name", &ev.name)?;
+                    ed.set_item("time_unix_nano", ev.time_unix_nano)?;
+                    ed.set_item("attributes", otlp_attrs_to_py(py, &ev.attributes)?)?;
+                    events.append(ed)?;
+                }
+                spd.set_item("events", events)?;
+                let links = PyList::empty_bound(py);
+                for ln in &sp.links {
+                    let ld = PyDict::new_bound(py);
+                    ld.set_item("trace_id", to_hex(&ln.trace_id))?;
+                    ld.set_item("span_id", to_hex(&ln.span_id))?;
+                    ld.set_item("attributes", otlp_attrs_to_py(py, &ln.attributes)?)?;
+                    links.append(ld)?;
+                }
+                spd.set_item("links", links)?;
                 spans_list.append(spd)?;
             }
             ssd.set_item("spans", spans_list)?;
@@ -1146,6 +1385,70 @@ fn decode_otlp_traces(py: Python<'_>, data: &[u8]) -> PyResult<PyObject> {
     otlp_traces_to_dict(py, &req)
 }
 
+/// The declared span vocabulary, as `{enum name: {wardex value: proto number}}`.
+///
+/// This is what makes "proto is the single source of truth" (§6.6) checkable
+/// rather than aspirational. `OperationName` and `ToolExecutionType` are
+/// declared in `common.proto` and referenced by no message field in this schema
+/// version — deliberately, because both already travel as `Span.extra` keys and
+/// a typed field would double-carry them. Without an export like this the two
+/// registry enums would be unreachable from any test, `map_operation_name` and
+/// `map_tool_execution_type` would be dead code, and the Python enums could
+/// drift from the proto ones with nothing to notice.
+///
+/// The tables are keyed by the WARDEX value (`"execute_tool"`), not the proto
+/// value name, because the wardex value is what actually reaches the wire today
+/// in `extra` — so a mismatch here is a mismatch a consumer would see.
+#[pyfunction]
+fn vocabulary_tables(py: Python<'_>) -> PyResult<PyObject> {
+    let out = PyDict::new_bound(py);
+
+    let ops = PyDict::new_bound(py);
+    for name in [
+        "chat",
+        "text_completion",
+        "embeddings",
+        "execute_tool",
+        "create_agent",
+        "invoke_agent",
+        "invoke_workflow",
+        "generate_content",
+        "retrieval",
+        "execute_step",
+        "handoff",
+        "evaluate",
+    ] {
+        ops.set_item(name, map_operation_name(name))?;
+    }
+    out.set_item("OperationName", ops)?;
+
+    let tools = PyDict::new_bound(py);
+    for name in ["network", "in_process", "ipc", "unknown"] {
+        tools.set_item(name, map_tool_execution_type(name))?;
+    }
+    out.set_item("ToolExecutionType", tools)?;
+
+    let links = PyDict::new_bound(py);
+    for name in [
+        "triggered_by",
+        "handoff_from",
+        "resumed_from",
+        "retried_from",
+        "cache_source",
+    ] {
+        links.set_item(name, map_link_reason(name))?;
+    }
+    out.set_item("LinkReason", links)?;
+
+    let snaps = PyDict::new_bound(py);
+    for name in ["span_start", "span_end", "turn_start"] {
+        snaps.set_item(name, map_snapshot_type(name))?;
+    }
+    out.set_item("SnapshotType", snaps)?;
+
+    Ok(out.into_py(py))
+}
+
 /// Registers the `_wardex_native.codec` submodule.
 pub fn register(parent: &Bound<'_, PyModule>) -> PyResult<()> {
     let m = PyModule::new_bound(parent.py(), "codec")?;
@@ -1153,6 +1456,7 @@ pub fn register(parent: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(decode_envelope_py, &m)?)?;
     m.add_function(wrap_pyfunction!(encode_otlp_traces, &m)?)?;
     m.add_function(wrap_pyfunction!(decode_otlp_traces, &m)?)?;
+    m.add_function(wrap_pyfunction!(vocabulary_tables, &m)?)?;
     // Exposed in Python as codec.encode_envelope / codec.decode_envelope
     m.add("encode_envelope", m.getattr("encode_envelope_py")?)?;
     m.add("decode_envelope", m.getattr("decode_envelope_py")?)?;

@@ -35,12 +35,17 @@ from ._tracing import agent, span, task, tool, trace, workflow
 from ._types import (
     GenAIAttributes,
     InputRef,
-    InternalStateSnapshot,
-    SpanId,
     ToolDefinitionSet,
 )
 from ._version import __version__
-from .assembly import Evidence, ParentSource, latch_ambient, resolve_parentage
+from .assembly import (
+    Evidence,
+    ParentSource,
+    SnapshotDraft,
+    guard,
+    latch_ambient,
+    resolve_parentage,
+)
 from .context._asgi import WardexMiddleware
 from .context._contextvar import run_in_context
 from .context._propagate import (
@@ -181,24 +186,6 @@ def new_scope() -> Iterator[Any]:
         yield s
 
 
-_NO_SPAN = SpanId(b"\x00" * 8)
-"""OTel's invalid-span id, for a record that names no span.
-
-Not a span id this module produced — I1 is about *deciding* parentage, and this
-decides nothing; it is the wire's way of spelling the absence that
-`resolve_parentage` already reported as `PARENT_UNRESOLVED`.
-"""
-
-_SNAPSHOT_INTEGRITY_KEY = "wardex.limitations"
-"""The attribute key the orphan-snapshot marker rides on until step 3's
-`SnapshotDraft` gives it a typed field.
-
-Deliberately not named `_LIMITATIONS_KEY`: `tests/test_limitation_census.py`
-treats any name matching `marker|limitation` as a marker SLOT and would read
-this attribute key as an emitted marker value with no `Limitation` member.
-"""
-
-
 def capture_state_snapshot(
     *,
     snapshot_type: str = "turn_start",
@@ -222,51 +209,25 @@ def capture_state_snapshot(
         if ambient.span_context is not None
         else Evidence(ParentSource.UNRESOLVED),
     )
-    norm_refs = tuple(
-        r if isinstance(r, InputRef) else InputRef(key=r[0], content_hash=r[1]) for r in input_refs
-    )
-    # `InternalStateSnapshot` has no limitations field of its own — the carrier
-    # arrives with `assembly.SnapshotDraft` (design §4.5, step 3), which owns
-    # this whole function afterwards. Until then the marker rides the snapshot's
-    # opaque kv, because emitting the orphan WITHOUT saying it is one would be
-    # the silent failure I4 forbids, and it is the only reason this call is now
-    # allowed to emit at all.
-    #
-    # `wardex.limitations` is the SDK's key on this record, so a caller-supplied
-    # one is dropped rather than appended next to it. `attributes` is a
-    # `repeated KeyValue` (`state.proto`) and nothing between here and the wire
-    # de-duplicates, so appending would ship the key twice; a consumer folding
-    # the list into a map keeps one, and if it keeps the caller's, the marker
-    # that makes this record honest is the half that disappears.
-    norm_attrs = (
-        tuple((k, v) for k, v in attributes.items() if k != _SNAPSHOT_INTEGRITY_KEY)
-        if attributes
-        else ()
-    )
-    if parentage.limitations:
-        norm_attrs = norm_attrs + (
-            (_SNAPSHOT_INTEGRITY_KEY, ",".join(m.value for m in parentage.limitations)),
-        )
-    snapshot = InternalStateSnapshot(
-        # The snapshot names an EXISTING span, so its span_id is the parent, not
-        # a freshly minted child. With no parent there is no such span, and this
-        # says so in the wire's own vocabulary: the all-zero span id is OTel's
-        # invalid-span sentinel, which every consumer already reads as "no span"
-        # without knowing anything about wardex. Minting a random id here would
-        # put a dangling reference on the wire that is byte-indistinguishable
-        # from a real one, leaving the `parent_unresolved` attribute — a
-        # wardex-private kv nothing else parses — as the only signal.
-        trace_id=parentage.trace_id,
-        span_id=parentage.parent_span_id if parentage.parent_span_id is not None else _NO_SPAN,
-        timestamp_ns=time.time_ns(),
-        snapshot_type=snapshot_type,
-        turn_index=turn_index,
-        conversation_state=conversation_state,
-        tool_definitions=tool_definitions,
-        attributes=norm_attrs,
-        input_refs=norm_refs,
-    )
-    client.capture_snapshot(snapshot)
+    snapshot = None
+    # `finish()` validates, and I6 forbids a validation failure reaching the
+    # host: `capture_state_snapshot` is called from the user's own code.
+    with guard("capture_state_snapshot", debug=bool(client.config.debug)):
+        # `snapshot_type` stays a `str` in the signature (published API) and is
+        # coerced to `SnapshotType` inside the draft, where an unrecognized
+        # value degrades to UNSPECIFIED *with* Limitation.SNAPSHOT_TYPE_UNKNOWN
+        # instead of being silently flattened by `codec.rs`'s `map_snap`.
+        draft = SnapshotDraft(parentage, snapshot_type=snapshot_type, turn_index=turn_index)
+        draft.set_conversation_state(conversation_state)
+        draft.set_tool_definitions(tool_definitions)
+        for ref in input_refs:
+            draft.add_input_ref(
+                ref if isinstance(ref, InputRef) else InputRef(key=ref[0], content_hash=ref[1])
+            )
+        draft.set_extras(attributes)
+        snapshot = draft.finish(time.time_ns())
+    if snapshot is not None:
+        client.capture_snapshot(snapshot)
 
 
 def flush(timeout: float = 5.0) -> None:

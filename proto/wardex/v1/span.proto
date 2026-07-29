@@ -87,6 +87,7 @@ message SpanLink {
   bytes trace_id = 1;
   bytes span_id = 2;
   repeated KeyValue attributes = 3;
+  LinkReason reason = 4;  // why this span points at that one (causality, not containment)
 }
 
 message TransportAttributes {

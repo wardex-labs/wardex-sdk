@@ -61,6 +61,17 @@ class SpanKind(Enum):
 
 
 class OperationName(Enum):
+    """CLOSED at twelve — design §6.2. The `operation` half of a span name.
+
+    The three added by migration step 3a (`EXECUTE_STEP`, `HANDOFF`,
+    `EVALUATE`) each cover a concept at least two surveyed frameworks have and
+    no existing member can hold honestly: a graph node is not an agent and not
+    a tool; an agent transition needs to be a span or every dashboard needs a
+    special case for it; a guardrail/judge already has `EvaluationAttributes`
+    and needed only a span kind. There is no fourth — protocol variants are
+    attributes (`ToolExecutionType.IPC`), never new operations.
+    """
+
     CHAT = "chat"
     TEXT_COMPLETION = "text_completion"
     EMBEDDINGS = "embeddings"
@@ -70,6 +81,9 @@ class OperationName(Enum):
     INVOKE_WORKFLOW = "invoke_workflow"
     GENERATE_CONTENT = "generate_content"
     RETRIEVAL = "retrieval"
+    EXECUTE_STEP = "execute_step"
+    HANDOFF = "handoff"
+    EVALUATE = "evaluate"
 
 
 class ProviderName(Enum):
@@ -110,8 +124,20 @@ class AgentType(Enum):
 
 
 class ToolExecutionType(Enum):
+    """How the tool body actually ran — design §6.2.
+
+    `IPC` and `UNKNOWN` are step 3a's additions and they exist for the same
+    reason: the two values this enum had forced a guess. Every adapter tool span
+    said `NETWORK`, which is false for an MCP call over a subprocess pipe (that
+    is `IPC`) and unknowable for a CLI's built-in tools, whose implementation
+    wardex never observes (that is `UNKNOWN`). A wrong value is worse than an
+    absent one — `UNKNOWN` is a legitimate, honest answer.
+    """
+
     NETWORK = "network"
     IN_PROCESS = "in_process"
+    IPC = "ipc"
+    UNKNOWN = "unknown"
 
 
 class Protocol(Enum):
@@ -125,6 +151,22 @@ class Protocol(Enum):
 class Direction(Enum):
     OUTBOUND = "outbound"
     INBOUND = "inbound"
+
+
+class SnapshotType(Enum):
+    """CLOSED, 1:1 with `proto/wardex/v1/common.proto`'s `SNAPSHOT_TYPE_*`.
+
+    `InternalStateSnapshot.snapshot_type` is still typed `str` for wire and
+    signature compatibility; this enum is what the SDK coerces to before the
+    record is built, so an unrecognized value degrades to
+    `Limitation.SNAPSHOT_TYPE_UNKNOWN` at one place instead of reaching the
+    codec, where `map_snap` would silently map it to `UNSPECIFIED` with nothing
+    recorded (design §4.5).
+    """
+
+    SPAN_START = "span_start"
+    SPAN_END = "span_end"
+    TURN_START = "turn_start"
 
 
 class SessionStatus(Enum):

@@ -170,7 +170,10 @@ async def test_async_capture_populates_handshake(tls_server):
     assert sp.transport.timing.tls_handshake_ms > 0.0
     # On the anyio/httpx path, TCP connect can't be derived by subtraction → connect=0 + marker
     assert sp.transport.timing.tcp_connect_ms == 0.0
-    assert "async_connect_unavailable" in sp.capture_integrity.limitations
+    # Census merge (design §6.5.1): `async_connect_unavailable` folded into
+    # CONNECT_TIMING_UNAVAILABLE. Both said the same thing — tcp_connect_ms is
+    # unknown rather than zero — and differed only in provenance.
+    assert "connect_timing_unavailable" in sp.capture_integrity.limitations
 
 
 def test_install_uninstall_restores_originals():

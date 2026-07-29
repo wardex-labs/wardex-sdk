@@ -13,6 +13,7 @@ from typing import Any
 
 from .. import _hub, _wardex_native
 from .._types import SpanContext
+from ..assembly import Limitation
 from ..protocol import WsParser
 from ..protocol._http1 import Http1RequestParser, Http1ResponseParser
 from ..protocol._http2 import Http2Parser
@@ -96,7 +97,7 @@ class _Txn:
     ws_messages_received: int = 0
     ws_bytes_sent: int = 0
     ws_bytes_received: int = 0
-    ws_markers: tuple[str, ...] = ()
+    ws_markers: tuple[Limitation, ...] = ()
 
 
 class _Http1Tracker:
@@ -361,20 +362,26 @@ class _WebSocketTracker:
             return [self._build_txn(())]
         return []
 
-    def flush(self, marker: str) -> list[_Txn]:
+    def flush(self, marker: Limitation) -> list[_Txn]:
         if self._emitted:
             return []
         return [self._build_txn((marker,))]
 
-    def _build_txn(self, extra_markers: tuple[str, ...]) -> _Txn:
+    def _build_txn(self, extra_markers: tuple[Limitation, ...]) -> _Txn:
         self._emitted = True
         markers = list(extra_markers)
         if self._in_trunc or self._out_trunc:
-            markers.append("ws_payload_truncated")
+            markers.append(Limitation.WS_PAYLOAD_TRUNCATED)
         if self._deflate:
-            markers.append("ws_compressed")
+            # Census merge (§6.5.1): `ws_compressed` folded into
+            # PAYLOAD_COMPRESSED. What is lost is which protocol it was, and
+            # `TransportAttributes.protocol` already carries that.
+            markers.append(Limitation.PAYLOAD_COMPRESSED)
         if self._sent.is_disabled() or self._recv.is_disabled():
-            markers.append("ws_parse_failed")
+            # Census merge: `ws_parse_failed` and `grpc_parse_failed` are one
+            # fact — the framing layer failed, so the transport fields on this
+            # span are partial or synthesized.
+            markers.append(Limitation.FRAME_PARSE_FAILED)
         now = time.time_ns()
         return _Txn(
             method="GET",

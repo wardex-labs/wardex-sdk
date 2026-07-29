@@ -69,6 +69,70 @@ enum CaptureSource {
   CAPTURE_SOURCE_SOCKET = 7;  // plaintext raw-socket seam (http/ws/h2c)
 }
 
+// --- Span vocabulary registry (design §6.2, §6.3, §6.6) ---
+//
+// proto is the single source of truth for the span vocabulary. wardex is a
+// multi-language SDK; leaving the vocabulary in each SDK's own enums means the
+// Node and Java adapters re-derive it from prose and drift, which is the same
+// failure `crates/wardex-limits` exists to prevent for resource bounds.
+//
+// The three enums below are DECLARED and, in this schema version, deliberately
+// UNREFERENCED by any message field except SpanLink.reason. `OperationName` and
+// `ToolExecutionType` already travel as `Span.extra` keys
+// (`gen_ai.operation.name`, `wardex.tool.execution_type`); adding a typed field
+// alongside would double-carry the same value and force a precedence rule
+// nobody has written. §6.6's purpose — stop other languages inventing the
+// vocabulary — is met in full by a registry enum with no field.
+//
+// Every value name carries its enum's prefix. proto3 file-level enum values
+// share the package namespace, so two unprefixed `UNSPECIFIED`s do not compile;
+// `buf.yaml`'s `lint: use: BASIC` does NOT include ENUM_VALUE_PREFIX and will
+// not warn. Value names and numbers are APPEND-ONLY: `buf breaking`'s FILE
+// category locks both (ENUM_VALUE_SAME_NAME, ENUM_VALUE_NO_DELETE).
+
+// The twelve span intents. CLOSED — a new operation costs a core PR, and a
+// protocol variant is an attribute, never an operation (an MCP tool call is
+// EXECUTE_TOOL with TOOL_EXECUTION_TYPE_IPC).
+enum OperationName {
+  OPERATION_NAME_UNSPECIFIED = 0;
+  OPERATION_NAME_CHAT = 1;
+  OPERATION_NAME_TEXT_COMPLETION = 2;
+  OPERATION_NAME_EMBEDDINGS = 3;
+  OPERATION_NAME_EXECUTE_TOOL = 4;
+  OPERATION_NAME_CREATE_AGENT = 5;
+  OPERATION_NAME_INVOKE_AGENT = 6;
+  OPERATION_NAME_INVOKE_WORKFLOW = 7;
+  OPERATION_NAME_GENERATE_CONTENT = 8;
+  OPERATION_NAME_RETRIEVAL = 9;
+  OPERATION_NAME_EXECUTE_STEP = 10;   // graph node / superstep / task
+  OPERATION_NAME_HANDOFF = 11;        // agent transition; a marker span, not a container
+  OPERATION_NAME_EVALUATE = 12;       // guardrail / judge / evaluator
+}
+
+// How a tool body actually ran. UNKNOWN is a legitimate value: wardex does not
+// observe how a CLI's built-in tool executes, and asserting NETWORK for it was
+// a guess that was simply wrong.
+enum ToolExecutionType {
+  TOOL_EXECUTION_TYPE_UNSPECIFIED = 0;
+  TOOL_EXECUTION_TYPE_NETWORK = 1;
+  TOOL_EXECUTION_TYPE_IN_PROCESS = 2;
+  TOOL_EXECUTION_TYPE_IPC = 3;        // subprocess pipe / MCP stdio
+  TOOL_EXECUTION_TYPE_UNKNOWN = 4;    // not observed — never guess
+}
+
+// Why one span points at another. A link is CAUSALITY; the parent edge is
+// CONTAINMENT. Rendering a 5-hop handoff chain as 5 levels of nesting makes
+// every duration in the flame graph a lie, so a handoff is a marker span plus
+// LINK_REASON_HANDOFF_FROM to a SIBLING.
+enum LinkReason {
+  LINK_REASON_UNSPECIFIED = 0;
+  LINK_REASON_TRIGGERED_BY = 1;   // a graph edge: the step that scheduled this one
+  LINK_REASON_HANDOFF_FROM = 2;
+  LINK_REASON_RESUMED_FROM = 3;   // checkpoint resume — a NEW trace, linked
+  LINK_REASON_RETRIED_FROM = 4;
+  LINK_REASON_CACHE_SOURCE = 5;
+}
+
 enum RetentionClass {
   RETENTION_CLASS_UNSPECIFIED = 0;
   RETENTION_CLASS_SUMMARY_ONLY = 1;   // metadata/metrics only. replay not possible

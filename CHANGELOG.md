@@ -5,7 +5,78 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- `OperationName` gains three members — `execute_step`, `handoff` and
+  `evaluate` — and `ToolExecutionType` gains two, `ipc` and `unknown`. All five
+  are also declared in `proto/wardex/v1/common.proto`, together with a new
+  `LinkReason` enum (`triggered_by`, `handoff_from`, `resumed_from`,
+  `retried_from`, `cache_source`). proto is the source of truth for the span
+  vocabulary in a multi-language SDK; the three enums are declared so the Node
+  and Java adapters generate them rather than re-deriving them from prose. Two
+  of the three intentionally fill no message field yet: `gen_ai.operation.name`
+  and `wardex.tool.execution_type` already travel as span attributes, and a
+  typed field alongside would carry the same value twice.
+- `Span.events` and `Span.links` are now encoded. Both fields have been
+  declared in `span.proto` since the first release and neither was ever
+  filled, so any events or links on a span — including a link's `reason` —
+  were dropped whole when the envelope was encoded. They now round-trip in
+  both directions, on the wardex envelope **and** on the OTLP export path
+  (a link's `reason` has no OTLP-native home, so it travels there as the
+  `wardex.link.reason` link attribute). This is additive: no span the SDK
+  builds today carries either, so nothing that used to be exported changes.
+- `SpanBuilder.set_error(error_type, message="")`, so a manual span that the
+  host marks as failed can name what failed. Marking a span
+  `set_status(StatusCode.ERROR)` without one is still valid and records
+  `error.type = "_OTHER"`, OpenTelemetry's own "no classification available".
+
 ### Changed
+- A tool span from the Agent SDK adapter now reports
+  `wardex.tool.execution_type = "unknown"` instead of `"network"`, and an MCP
+  stdio tool span reports `"ipc"`. Both used to say `network`, which was
+  simply false: wardex does not observe how a CLI's built-in tool (Bash, Read)
+  executes, and an MCP call runs over a subprocess pipe. If you filter or group
+  on that attribute, the adapter's tool spans move out of the `network` bucket.
+- Four limitation markers changed name, and three more were merged away.
+  `ws_evicted` → `connection_evicted`, `grpc_compressed` and `ws_compressed` →
+  `payload_compressed`, `grpc_parse_failed` and `ws_parse_failed` →
+  `frame_parse_failed`, `tool_span_unclosed` → `child_span_unclosed`, and
+  `async_connect_unavailable` → `connect_timing_unavailable`. The merged pairs
+  reported one fact under two names — which protocol it was is already carried
+  by `TransportAttributes.protocol` — and the markers a user would ACT on
+  differently all stayed separate (`connection_evicted` points at
+  `max_connections`, `unit_evicted` at `max_units`). `capture_integrity.limitations`
+  is now a closed vocabulary end to end: an emitter cannot invent a marker
+  string, and a dashboard filtering on the old spellings needs updating.
+- A span with `status=ERROR` now always carries `error.type`. Two spans shipped
+  the pair `is_error=true` with no type: an MCP stdio call that returned a
+  JSON-RPC error (now `json_rpc_<code>`, or `tool_error` for a tool result
+  flagged `isError`) and a failed Agent SDK tool span (now `tool_error`, or
+  `tool_unclosed` when the session ended with the tool still open). An aborted
+  agent session's root span reports `session_error` or `agent_error`. An HTTP
+  span with a 4xx or 5xx response now carries the status rendered as a string
+  (`"429"`, `"500"`), which is what OpenTelemetry's HTTP-client conventions
+  prescribe when the instrumentation observed the failure but not its cause;
+  the byte seam is exactly in that position. A manual span the host marked
+  ERROR without naming a type carries `"_OTHER"`.
+- `capture_integrity.request_body_captured` / `response_body_captured` now mean
+  "capture was attempted and succeeded", not "the payload is non-empty". A tool
+  invoked with `{}` used to be reported as a capture FAILURE on the field the
+  dashboard uses to judge whether a replay is trustworthy.
+- Manual spans (`wardex.span`/`trace` and the decorators) now carry
+  `capture_sources=("manual",)`. They previously carried an empty tuple, which
+  made an `execute_tool` span from the decorator structurally different from
+  one the adapter produced.
+- An Agent SDK session that has not reported a `session_id` now gets a
+  wardex-issued `gen_ai.conversation.id` instead of the empty string. An empty
+  conversation id collides across every session in any store that keys on it.
+  `session_id` itself is now absent rather than `""` when the CLI has not sent
+  one.
+- `wardex.capture_state_snapshot(snapshot_type=...)` now validates its
+  argument. The signature still takes a `str`, and the three known values are
+  unchanged; anything else is recorded as `SNAPSHOT_TYPE_UNSPECIFIED` **and**
+  marked `snapshot_type_unknown` in `wardex.limitations`. Previously an
+  unrecognized value was flattened to `UNSPECIFIED` inside the codec with
+  nothing recorded anywhere.
 - An inbound sampling decision is now honoured instead of being overridden.
   wardex used to emit `traceparent` with the sampled flag hardcoded to `01`,
   so a request that arrived with `-00` left with `-01` and every downstream

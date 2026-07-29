@@ -3,6 +3,7 @@
 from hpack import Encoder
 
 from wardex_sdk._enums import StatusCode
+from wardex_sdk.assembly import Limitation
 from wardex_sdk.interceptors._ssl import _build_grpc_fields
 from wardex_sdk.interceptors._trackers import _Txn
 
@@ -58,19 +59,21 @@ def test_missing_status_falls_back_to_ok_with_marker():
     name, status, error_type, extra, lims = _build_grpc_fields(_txn(None), _BASE, ())
     assert status is StatusCode.OK
     assert error_type is None
-    assert "grpc_status_unavailable" in lims
+    assert Limitation.GRPC_STATUS_UNAVAILABLE in lims
 
 
 def test_compressed_marker():
     txn = _txn(0, req=_msg(b"abc", compressed=1))
     _, _, _, _, lims = _build_grpc_fields(txn, _BASE, ())
-    assert "grpc_compressed" in lims
+    # Census rename (design §6.5.1): grpc_compressed -> PAYLOAD_COMPRESSED, and
+    # markers are Limitation members rather than free strings since step 3a.
+    assert Limitation.PAYLOAD_COMPRESSED in lims
 
 
 def test_truncated_marker():
     txn = _txn(0, resp=_msg(b"hello")[:7])
     _, _, _, _, lims = _build_grpc_fields(txn, _BASE, ())
-    assert "grpc_message_truncated" in lims
+    assert Limitation.GRPC_MESSAGE_TRUNCATED in lims
 
 
 def _frame(ftype: int, flags: int, stream_id: int, payload: bytes) -> bytes:
@@ -134,3 +137,43 @@ def test_status_message_absent_when_none():
     txn = _txn(0)
     _, _, _, extra, _ = _build_grpc_fields(txn, _BASE, ())
     assert all(k != "rpc.grpc.status_message" for k, _ in extra)
+
+
+def test_framing_failure_on_an_error_status_still_carries_an_error_type(monkeypatch):
+    """The fallback branch must not return `ERROR` with no type.
+
+    `SpanDraft.finish()` refuses that pair and the refusal DELETES the span, so
+    a gRPC call whose framing wardex cannot parse AND whose HTTP status is 5xx
+    would have vanished entirely. The fallback is plain-h2 fields, so the type
+    is the plain-h2 one: the status rendered as a string.
+    """
+    import wardex_sdk.interceptors._seam as seam_mod
+
+    def _boom(_body):
+        raise RuntimeError("unframeable")
+
+    monkeypatch.setattr(seam_mod, "parse_grpc_frames", _boom)
+    txn = _txn(None)
+    txn.status = 503
+
+    name, status, error_type, extra, lims = _build_grpc_fields(txn, _BASE, ())
+
+    assert name == "HTTP POST /echo.Echo/Say"
+    assert status is StatusCode.ERROR
+    assert error_type == "503"
+    assert Limitation.FRAME_PARSE_FAILED in lims
+
+
+def test_framing_failure_on_a_2xx_status_has_no_error_type(monkeypatch):
+    import wardex_sdk.interceptors._seam as seam_mod
+
+    def _boom(_body):
+        raise RuntimeError("unframeable")
+
+    monkeypatch.setattr(seam_mod, "parse_grpc_frames", _boom)
+
+    _, status, error_type, _, lims = _build_grpc_fields(_txn(None), _BASE, ())
+
+    assert status is StatusCode.OK
+    assert error_type is None
+    assert Limitation.FRAME_PARSE_FAILED in lims

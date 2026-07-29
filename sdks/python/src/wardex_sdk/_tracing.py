@@ -9,92 +9,204 @@ from contextlib import contextmanager
 from typing import Any
 
 from . import _hub
-from ._enums import OperationName, SpanKind, StatusCode
+from ._enums import CaptureSource, OperationName, SpanKind, StatusCode
 from ._types import (
     AgentAttributes,
     CallSite,
     ConversationContext,
-    CorrelationInfo,
     GenAIAttributes,
     InternalSpan,
-    SpanContext,
     ToolAttributes,
 )
-from .assembly import Parentage, latch_ambient, resolve_parentage
+from .assembly import SpanDraft, guard, latch_ambient, resolve_parentage
 from .context._contextvar import fork_active_span
 
 
 class SpanBuilder:
-    def __init__(
-        self,
-        parentage: Parentage,
-        context: SpanContext,
-        name: str,
-        kind: SpanKind,
-        conversation: ConversationContext | None,
-    ) -> None:
-        self.context = context
-        self.parent_span_id = parentage.parent_span_id
-        self.correlation: CorrelationInfo | None = parentage.correlation
-        self.name = name
-        self.kind = kind
-        self.conversation = conversation
-        self.start_time_ns = time.time_ns()
+    """The object `wardex.span()` yields — a published surface over a `SpanDraft`.
+
+    Every attribute below is a view onto the draft, so the manual path and the
+    observation paths build the same object through the same validation. That is
+    §6.4's point about the two `execute_tool` shapes: this path used to ship
+    spans with no `capture_sources`, no `capture_integrity` and no
+    `correlation`, purely because it was a second constructor.
+
+    The draft is in MANUAL mode, which changes exactly two things and no more:
+    the name is the host's (`wardex.span("anything")` is a published API), and
+    `set_attribute` takes any key (so is it). `operation` stays a LABEL — the
+    decorators make the typed block optional, so wardex has nothing to check a
+    `SpanIntent` against, and requiring one would be a public API change.
+    """
+
+    # NO `__slots__`. This object is yielded into a `with` block the host owns,
+    # and before the draft backed it, it was a plain object — so stashing
+    # `s.my_tag = 1` on it worked. Under `__slots__` that raises `AttributeError`
+    # in the middle of the host's own code, outside every `guard()`: wardex
+    # breaking the host, which is precisely what I6 forbids.
+
+    def __init__(self, draft: SpanDraft) -> None:
+        self._draft = draft
         self.end_time_ns = 0
-        self.status = StatusCode.UNSET
-        self.status_message = ""
-        self.gen_ai: GenAIAttributes | None = None
-        self.agent: AgentAttributes | None = None
-        self.tool: ToolAttributes | None = None
-        self.input_data = b""
-        self.output_data = b""
-        # fields filled in by decorator sugar (Task 12)
-        self.operation: OperationName | str | None = None
-        self.workflow_name: str | None = None
-        self.call_site: CallSite | None = None
-        self._extra: list[tuple[str, str | int | float | bool]] = []
+
+    @property
+    def context(self):  # noqa: ANN201 — SpanContext; kept untyped to avoid the import
+        return self._draft.context
+
+    @property
+    def start_time_ns(self) -> int:
+        return self._draft._start_ns
+
+    @start_time_ns.setter
+    def start_time_ns(self, value: int) -> None:
+        self._draft._start_ns = value
+
+    # Views onto the draft of what this object exposed as plain attributes
+    # before the draft backed it. They stay WRITABLE: every one of them was a
+    # settable attribute on a published object, and turning a working assignment
+    # into an `AttributeError` inside a user's `with` block is a break wardex
+    # gains nothing from — the draft still decides what a legal span is, in
+    # `finish()`, which is where the check belongs.
+    #
+    # `correlation` and `parent_span_id` are the two exceptions and they are
+    # read-only on purpose: parentage is decided by `assembly/_parentage.py`
+    # (I1) and a span whose parent the host overwrote after the fact would
+    # contradict the trace it was already forked into.
+
+    @property
+    def name(self) -> str:
+        return self._draft.name
+
+    @name.setter
+    def name(self, value: str) -> None:
+        self._draft.rename(value)
+
+    @property
+    def kind(self) -> SpanKind:
+        return self._draft._kind or SpanKind.INTERNAL
+
+    @kind.setter
+    def kind(self, value: SpanKind) -> None:
+        self._draft._kind = value
+
+    @property
+    def status(self) -> StatusCode:
+        return self._draft._status
+
+    @status.setter
+    def status(self, value: StatusCode) -> None:
+        self._draft.set_status(value, self._draft._status_message)
+
+    @property
+    def status_message(self) -> str:
+        return self._draft._status_message
+
+    @status_message.setter
+    def status_message(self, value: str) -> None:
+        self._draft._status_message = value
+
+    @property
+    def conversation(self) -> ConversationContext | None:
+        return self._draft._conversation
+
+    @conversation.setter
+    def conversation(self, value: ConversationContext | None) -> None:
+        self._draft.set_conversation(value)
+
+    @property
+    def correlation(self):  # noqa: ANN201 — CorrelationInfo | None
+        return self._draft._correlation
+
+    @property
+    def parent_span_id(self):  # noqa: ANN201 — SpanId | None
+        return self._draft._parentage.parent_span_id
 
     def set_status(self, code: StatusCode, message: str = "") -> None:
-        self.status = code
-        self.status_message = message
+        self._draft.set_status(code, message)
+
+    def set_error(self, error_type: str, message: str = "") -> None:
+        """Name the failure. Pairs with `set_status(StatusCode.ERROR)`.
+
+        Without this the published surface could express the state that makes a
+        span illegal (`set_status(ERROR)`) and had no way to express the state
+        that makes it legal — so the only span a host ever marks as failed was
+        the only span the host could not keep. `finish()` still supplies OTel's
+        `_OTHER` when a manual span is ERROR with no type, so forgetting this
+        call degrades the span rather than deleting it.
+        """
+        self._draft.set_error(error_type, message)
 
     def set_gen_ai(self, attrs: GenAIAttributes) -> None:
-        self.gen_ai = attrs
+        self._draft.set_gen_ai(attrs)
 
     def set_attribute(self, key: str, value: str | int | float | bool) -> None:
-        self._extra.append((key, value))
+        self._draft.set_extra(key, value)
+
+    @property
+    def gen_ai(self) -> GenAIAttributes | None:
+        return self._draft._gen_ai
+
+    @gen_ai.setter
+    def gen_ai(self, value: GenAIAttributes | None) -> None:
+        self._draft._gen_ai = value
+
+    @property
+    def agent(self) -> AgentAttributes | None:
+        return self._draft._agent
+
+    @agent.setter
+    def agent(self, value: AgentAttributes | None) -> None:
+        self._draft._agent = value
+
+    @property
+    def tool(self) -> ToolAttributes | None:
+        return self._draft._tool
+
+    @tool.setter
+    def tool(self, value: ToolAttributes | None) -> None:
+        self._draft._tool = value
+
+    @property
+    def operation(self) -> OperationName | str | None:
+        return self._draft._operation_label
+
+    @operation.setter
+    def operation(self, value: OperationName | str | None) -> None:
+        self._draft.set_operation_label(value)
+
+    @property
+    def workflow_name(self) -> str | None:
+        return self._draft._workflow_name
+
+    @workflow_name.setter
+    def workflow_name(self, value: str | None) -> None:
+        self._draft.set_workflow_name(value)
+
+    @property
+    def call_site(self) -> CallSite | None:
+        return self._draft._call_site
+
+    @call_site.setter
+    def call_site(self, value: CallSite | None) -> None:
+        self._draft.set_call_site(value)
+
+    @property
+    def input_data(self) -> bytes:
+        return self._draft._input_data
+
+    @input_data.setter
+    def input_data(self, value: bytes) -> None:
+        self._draft._input_data = value
+
+    @property
+    def output_data(self) -> bytes:
+        return self._draft._output_data
+
+    @output_data.setter
+    def output_data(self, value: bytes) -> None:
+        self._draft._output_data = value
 
     def finish(self) -> InternalSpan:
-        extra_list: list[tuple[str, str | int | float | bool]] = []
-        if self.operation is not None:
-            op_val = (
-                self.operation.value
-                if isinstance(self.operation, OperationName)
-                else self.operation
-            )
-            extra_list.append(("gen_ai.operation.name", op_val))
-        extra_list.extend(self._extra)
-        extra = tuple(extra_list)
-        return InternalSpan(
-            context=self.context,
-            parent_span_id=self.parent_span_id,
-            name=self.name,
-            kind=self.kind,
-            start_time_ns=self.start_time_ns,
-            end_time_ns=self.end_time_ns or time.time_ns(),
-            status=self.status,
-            status_message=self.status_message,
-            gen_ai=self.gen_ai,
-            agent=self.agent,
-            tool=self.tool,
-            conversation=self.conversation,
-            workflow_name=self.workflow_name,
-            call_site=self.call_site,
-            input_data=self.input_data,
-            output_data=self.output_data,
-            correlation=self.correlation,
-            extra=extra,
-        )
+        return self._draft.finish(self.end_time_ns or time.time_ns())
 
 
 @contextmanager
@@ -107,21 +219,39 @@ def _begin(
     # the evidence is the default (`AMBIENT`): a parent means the ContextVar
     # held one, a remote parent is re-labelled `header` by the core, and no
     # parent at all means this span deliberately roots a new trace. Manual spans
-    # and adapter spans now agree on all three because they ask the same
-    # function.
+    # and adapter spans agree on all three because they ask the same function —
+    # and since step 3a they also build the same object through the same
+    # constructor.
     parentage = resolve_parentage(latch_ambient())
-    ctx = parentage.child_context()
-    conv = conversation if conversation is not None else parentage.conversation
+    draft = SpanDraft.manual(
+        parentage,
+        name=name,
+        kind=kind,
+        start_ns=time.time_ns(),
+        source=CaptureSource.MANUAL,
+    )
+    if conversation is not None:
+        draft.set_conversation(conversation)
 
-    builder = SpanBuilder(parentage, ctx, name, kind, conv)
+    builder = SpanBuilder(draft)
     try:
-        with fork_active_span(ctx):
+        with fork_active_span(draft.context):
             yield builder
     finally:
-        finished = builder.finish()
+        finished = None
+        # `finish()` validates, and a vocabulary breach must not reach the host
+        # (I6) — a `with wardex.span(...)` block would otherwise raise on the
+        # way out of code that has nothing to do with wardex.
+        with guard("tracing.manual_span", debug=_debug_enabled()):
+            finished = builder.finish()
         client = _hub.get_client()
-        if client is not None:
+        if client is not None and finished is not None:
             client.capture_span(finished)
+
+
+def _debug_enabled() -> bool:
+    config = getattr(_hub.get_client(), "config", None)
+    return bool(getattr(config, "debug", False))
 
 
 @contextmanager

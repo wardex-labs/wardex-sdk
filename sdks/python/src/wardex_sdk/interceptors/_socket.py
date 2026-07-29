@@ -20,7 +20,7 @@ import socket
 from typing import TYPE_CHECKING, Any
 
 from .._enums import CaptureSource
-from ..assembly import Prefilter
+from ..assembly import Limitation, Prefilter
 from ._conn_timing import install_shared_timing, shared_timing_store, uninstall_shared_timing
 from ._seam import ByteSeamInterceptor, _ConnectionState
 from ._trackers import _Http1Tracker, _Http2Tracker
@@ -87,7 +87,7 @@ class RawSocketInterceptor(ByteSeamInterceptor):
 
         for st in list(self._conns.values()):
             if isinstance(st.tracker, _WebSocketTracker):
-                for txn in st.tracker.flush("ws_no_close"):
+                for txn in st.tracker.flush(Limitation.WS_NO_CLOSE):
                     self._emit_ws(st, txn)
         self._conns.clear()
         self._installed = False
@@ -106,7 +106,7 @@ class RawSocketInterceptor(ByteSeamInterceptor):
 
     def _resolve_timing(
         self, obj: Any, st: _ConnectionState
-    ) -> tuple[float, float, bool, tuple[str, ...]]:
+    ) -> tuple[float, float, bool, tuple[Limitation, ...]]:
         if st.timing_consumed:
             return (0.0, 0.0, True, ())
         st.timing_consumed = True
@@ -116,7 +116,7 @@ class RawSocketInterceptor(ByteSeamInterceptor):
             popped = None
         if popped is not None:
             return (popped[0], 0.0, False, ())  # plaintext: no TLS handshake
-        return (0.0, 0.0, False, ("connect_timing_unavailable",))
+        return (0.0, 0.0, False, (Limitation.CONNECT_TIMING_UNAVAILABLE,))
 
     def _gate(self, st: _ConnectionState, data: bytes, phase: str) -> bool:
         """Sniff-latch: determine the protocol from the first request bytes; never re-decided.

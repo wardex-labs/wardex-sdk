@@ -216,6 +216,11 @@ fn mask_span(engine: &PiiEngine, span: &mut pb::Span) {
             trace_id: _,
             span_id: _,
             attributes,
+            // A closed enum cannot carry PII by construction, and there is no
+            // regex to run over an i32. This is the same disposition step 3b
+            // gives `CaptureIntegrity.limitations` when it stops being
+            // `repeated string` — see design §6.5.1's "what Rust must receive".
+            reason: _,
         } = link;
         hit |= mask_kvs(engine, attributes);
     }

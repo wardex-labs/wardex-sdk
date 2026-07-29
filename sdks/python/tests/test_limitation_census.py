@@ -64,54 +64,21 @@ _RUST_ROOTS = (_REPO / "crates", _REPO / "bindings")
 # The census, frozen
 # ==========================================================================
 
-_CENSUS_PY: dict[str, frozenset[str]] = {
-    # transport timing
-    "connect_timing_unavailable": frozenset({"interceptors/_socket.py", "interceptors/_ssl.py"}),
-    "async_connect_unavailable": frozenset({"interceptors/_ssl.py"}),
-    "ttft_unavailable_h2": frozenset({"interceptors/_seam.py"}),
-    "ttft_ipc_approximation": frozenset({"adapters/_assembler.py"}),
-    "transport_timing_unavailable_subprocess": frozenset({"adapters/_assembler.py"}),
-    # caps
-    "grpc_message_truncated": frozenset({"interceptors/_seam.py"}),
-    "ws_payload_truncated": frozenset({"interceptors/_seam.py", "interceptors/_trackers.py"}),
-    "ws_evicted": frozenset({"interceptors/_seam.py"}),
-    # parsing / interpretation
-    "grpc_parse_failed": frozenset({"interceptors/_seam.py"}),
-    "ws_parse_failed": frozenset({"interceptors/_trackers.py"}),
-    "semantic_parse_failed": frozenset({"interceptors/_seam.py"}),
-    "grpc_compressed": frozenset({"interceptors/_seam.py"}),
-    "ws_compressed": frozenset({"interceptors/_trackers.py"}),
-    "tool_args_unparsed": frozenset({"interceptors/_seam.py"}),
-    "output_messages_unmapped_part": frozenset({"interceptors/_seam.py"}),
-    "input_messages_unmapped_part": frozenset({"interceptors/_seam.py"}),
-    # streaming
-    "reassembled_from_stream": frozenset({"interceptors/_seam.py"}),
-    "stream_usage_unavailable": frozenset({"interceptors/_seam.py"}),
-    "sse_unknown_provider": frozenset({"interceptors/_seam.py"}),
-    # protocol-specific
-    "grpc_web_unsupported": frozenset({"interceptors/_seam.py"}),
-    "grpc_status_unavailable": frozenset({"interceptors/_seam.py"}),
-    "ws_no_close": frozenset({"interceptors/_socket.py", "interceptors/_ssl.py"}),
-    # unit / adapter lifecycle
-    "tool_span_unclosed": frozenset({"adapters/_assembler.py"}),
-    "session_aborted": frozenset({"adapters/_assembler.py"}),
-}
-"""Every limitation string Python can attach to a span today (24), BY SITE.
+_CENSUS_PY: dict[str, frozenset[str]] = {}
+"""Every limitation string Python can attach to a span today: **none**.
 
-Frozen as a mapping and not as a set of names, because a set cannot tell a new
-emit site apart from an old one. Seven of these strings — the four renames plus
-the three merges — are not `Limitation` values at all, so a NEW site emitting
-one of them is a span that step 3a deletes, and a name-level check would call
-that change clean. `ws_payload_truncated` appearing in two files is the shape
-that makes this concrete: `_trackers.py` produces it and `_seam.py` tests for it
-by membership, and a third file joining that list is a fact worth a human.
+Step 3a emptied this table, which is what it was for. Before it, 24 free strings
+reached `CaptureIntegrity.limitations` from six modules, and seven of them — the
+four renames plus the three merges — were not `Limitation` values at all, so
+routing their sites through `SpanDraft.finish()` without rewiring them would
+have deleted the spans and left a counter. Every one of those sites now names a
+member and appears in `_MEMBER_SITES` below; the move IS the migration record.
 
-Two markers are reachable only through an indirection and neither shows up in a
-naive grep for an emit site: `ws_no_close` and `ws_evicted` are arguments to
-`_WebSocketTracker.flush(marker)`, three call sites away from the tuple they
-land in. The scanner closes that by deriving marker-taking helpers from their
-PARAMETER NAMES rather than from a hand-kept list, so a new `def f(..., marker)`
-is covered the day it is written.
+It stays here, empty, rather than being deleted. An empty expectation is a live
+assertion: `test_python_census_matches_source` now says *no Python site may
+emit a free-string marker again*, which is the post-3a rule and is stronger
+than anything the populated table said. Deleting it would retire that rule
+silently.
 """
 
 _CENSUS_RUST: dict[str, frozenset[str]] = {
@@ -127,31 +94,67 @@ file exists.
 """
 
 _MEMBER_SITES: dict[str, frozenset[str]] = {
+    # --- assembly/ itself ---
     "PARENT_UNRESOLVED": frozenset({"assembly/_parentage.py"}),
     "UNIT_INFERRED_SOLE": frozenset({"assembly/_parentage.py"}),
+    "SNAPSHOT_TYPE_UNKNOWN": frozenset({"assembly/_snapshot.py"}),
+    # --- transport timing ---
+    "CONNECT_TIMING_UNAVAILABLE": frozenset({"interceptors/_socket.py", "interceptors/_ssl.py"}),
+    "TTFT_UNAVAILABLE_H2": frozenset({"interceptors/_seam.py"}),
+    "TTFT_IPC_APPROXIMATION": frozenset({"adapters/_assembler.py"}),
+    "TRANSPORT_TIMING_UNAVAILABLE_SUBPROCESS": frozenset({"adapters/_assembler.py"}),
+    # --- caps ---
+    "GRPC_MESSAGE_TRUNCATED": frozenset({"interceptors/_seam.py"}),
+    "WS_PAYLOAD_TRUNCATED": frozenset({"interceptors/_seam.py", "interceptors/_trackers.py"}),
+    "CONNECTION_EVICTED": frozenset({"interceptors/_seam.py"}),
+    # --- parsing / interpretation ---
+    "FRAME_PARSE_FAILED": frozenset({"interceptors/_seam.py", "interceptors/_trackers.py"}),
+    "SEMANTIC_PARSE_FAILED": frozenset({"interceptors/_seam.py"}),
+    "PAYLOAD_COMPRESSED": frozenset({"interceptors/_seam.py", "interceptors/_trackers.py"}),
+    "TOOL_ARGS_UNPARSED": frozenset({"interceptors/_seam.py"}),
+    "OUTPUT_MESSAGES_UNMAPPED_PART": frozenset({"interceptors/_seam.py"}),
+    "INPUT_MESSAGES_UNMAPPED_PART": frozenset({"interceptors/_seam.py"}),
+    # --- streaming ---
+    "REASSEMBLED_FROM_STREAM": frozenset({"interceptors/_seam.py"}),
+    "STREAM_USAGE_UNAVAILABLE": frozenset({"interceptors/_seam.py"}),
+    "SSE_UNKNOWN_PROVIDER": frozenset({"interceptors/_seam.py"}),
+    # --- protocol-specific ---
+    "GRPC_WEB_UNSUPPORTED": frozenset({"interceptors/_seam.py"}),
+    "GRPC_STATUS_UNAVAILABLE": frozenset({"interceptors/_seam.py"}),
+    "WS_NO_CLOSE": frozenset({"interceptors/_socket.py", "interceptors/_ssl.py"}),
+    # --- unit / adapter lifecycle ---
+    "CHILD_SPAN_UNCLOSED": frozenset({"adapters/_assembler.py"}),
+    "SESSION_ABORTED": frozenset({"adapters/_assembler.py"}),
 }
 """Every place a `Limitation` MEMBER (rather than a free string) reaches a
-marker slot, by site — the other half of the census, and the half that grows.
+marker slot, by site — the other half of the census, and the half that grew.
 
-Today it is two entries, both inside `assembly/` itself: `_parentage.py`'s
-`_MARKER` table, which attaches a member automatically for the two
-`ParentSource` values whose definition is interpretation.
+Step 3a moved 21 entries into this table out of `_CENSUS_PY`, one per rewired
+site, and added `SNAPSHOT_TYPE_UNKNOWN` — the one member that gained a NEW
+emitter rather than a renamed one, because 3a is also the step that closes
+`SnapshotType`.
 
-Both entries are SOURCE sites — the place a member NAME appears in a marker
-slot — and that is not the same as the set of markers that reach a span. Since
-migration step 1, `PARENT_UNRESOLVED` does reach one: `capture_state_snapshot`
-stringifies `parentage.limitations` onto the orphan snapshot's opaque kv. It
-does not appear below, and must not, because `__init__.py` names no member —
-the member reference is still `_MARKER`'s, one call away. Adding the file here
-would record a source fact that is not in the source, and the scanner
-(correctly) would not find it. `UNIT_INFERRED_SOLE` still fires for no one: no
-caller passes `ParentSource.UNIT_SOLE` yet.
+The site sets are the same files the strings were emitted from, with three
+exceptions that are the census's merges landing:
 
-This is where step 3a's progress is recorded. Rewiring a site moves its entry
-out of `_CENSUS_PY` and into this table; the two tables together are the whole
-marker surface, and their combined size is what `test_scanner_is_not_blind`
-stands on once `_CENSUS_PY` is empty. Do not lower a bound to make a migration
-pass — move the entry.
+  * `FRAME_PARSE_FAILED` and `PAYLOAD_COMPRESSED` each now list TWO files,
+    because `grpc_parse_failed` (`_seam.py`) and `ws_parse_failed`
+    (`_trackers.py`) were one fact, and so were `grpc_compressed` and
+    `ws_compressed`.
+  * `CONNECT_TIMING_UNAVAILABLE` absorbed `async_connect_unavailable`, which
+    shared `_ssl.py` with it, so the file set is unchanged.
+
+These are SOURCE sites — the place a member NAME appears in a marker slot — and
+that is not the same as the set of markers that reach a span.
+`capture_state_snapshot` ships `PARENT_UNRESOLVED` onto real records and does
+not appear here, because `__init__.py` names no member: the reference is
+`_MARKER`'s and `SnapshotDraft`'s, one call away. `UNIT_INFERRED_SOLE` still
+fires for no one — nothing passes `ParentSource.UNIT_SOLE` yet.
+
+`BODY_CAP_EXCEEDED` is absent for a different reason: it is produced in Rust and
+crosses the PyO3 boundary as a string, so `_CENSUS_RUST` is where it is
+recorded. `interceptors/_seam.py` resolves it with `Limitation.from_wire`, which
+names no member and correctly does not appear here.
 """
 
 _DISABLED_REASONS: frozenset[str] = frozenset(
@@ -274,6 +277,12 @@ _EMITTED_MEMBERS: frozenset[str] = frozenset(
         "SESSION_ABORTED",
         # step 0's, which the census found an emitter for
         "CHILD_SPAN_UNCLOSED",
+        # step 0's, whose emitter step 3a BUILT rather than renamed: closing
+        # `SnapshotType` is 3a's, and `SnapshotDraft` attaches this when a
+        # caller hands `capture_state_snapshot` a type outside the enum. The one
+        # legitimate way this set grows — a member moving from "declared" to
+        # "emitted" — as opposed to the migration, which never changes it.
+        "SNAPSHOT_TYPE_UNKNOWN",
         # step 0's, whose emitter is the _parentage.py _MARKER table. A source
         # reference and a live caller are not the same thing and this set keeps
         # them apart: since step 1 wired `capture_state_snapshot`,
@@ -726,19 +735,39 @@ _UNRESOLVED_PY: frozenset[tuple[str, str]] = frozenset(
         ("__init__.py", "Name:timeout"),
         ("_client.py", "Name:timeout"),
         ("_types.py", "Tuple"),
-        # every one below is a marker CONTAINER being passed along, not a marker
-        ("adapters/_assembler.py", "Name:limitations"),
+        # `_build_tool(sess, tool, end_ns, failed, markers, error_type)` declares
+        # a marker-ish parameter, so R4 registers it; R9 then makes it read-all
+        # because a marker container goes in. Its other arguments land here.
+        # None of them can hold a marker string — they are a session, a tool
+        # record, a timestamp, a bool and an `error.type`.
+        ("adapters/_assembler.py", "Name:end_ns"),
+        ("adapters/_assembler.py", "Name:error_type"),
+        ("adapters/_assembler.py", "Name:failed"),
+        ("adapters/_assembler.py", "Name:marker"),
+        ("adapters/_assembler.py", "Name:markers"),
+        ("adapters/_assembler.py", "Name:sess"),
+        ("adapters/_assembler.py", "Name:tool"),
+        # every one below is a marker CONTAINER being passed along, or a
+        # marker-typed PARAMETER being forwarded, not a marker
+        ("assembly/_builder.py", "Attribute:markers"),
+        ("assembly/_builder.py", "Call:tuple"),
+        ("assembly/_builder.py", "List"),
+        ("assembly/_builder.py", "Name:marker"),
         ("assembly/_parentage.py", "BinOp"),
         ("assembly/_parentage.py", "Call:_markers_for"),
         ("assembly/_parentage.py", "Name:marker"),
         ("assembly/_parentage.py", "Tuple"),
-        ("interceptors/_seam.py", "Attribute:ws_markers"),
-        ("interceptors/_seam.py", "BinOp"),
-        ("interceptors/_seam.py", "Call:tuple"),
-        ("interceptors/_seam.py", "Name:extra"),
+        ("assembly/_snapshot.py", "Call:list"),
+        ("assembly/_snapshot.py", "List"),
+        ("assembly/_snapshot.py", "Name:marker"),
+        # `Name:member` is `Limitation.from_wire(wire)`'s result, the one place a
+        # Rust-produced marker STRING is resolved to a member. It cannot
+        # introduce a value: `from_wire` returns a member or None, and the Rust
+        # half of this census is what bounds which members it can return.
         ("interceptors/_seam.py", "Name:limitations"),
-        ("interceptors/_seam.py", "Name:m"),
-        ("interceptors/_seam.py", "Name:txn"),
+        ("interceptors/_seam.py", "Name:marker"),
+        ("interceptors/_seam.py", "Name:member"),
+        ("interceptors/_seam.py", "Tuple"),
         ("interceptors/_socket.py", "Tuple"),
         ("interceptors/_ssl.py", "Tuple"),
         ("interceptors/_trackers.py", "Attribute:_req_limitations"),
@@ -1211,22 +1240,36 @@ def test_scanner_is_not_blind(py_census: _PythonCensus, rust_census: _RustCensus
     down: markers and members are summed, and `sites` counts a slot the same
     whether it holds `"ws_compressed"` or `Limitation.PAYLOAD_COMPRESSED`.
 
-    Every bound may be RAISED as the SDK grows. None of them should ever need
-    lowering; if a legitimate change makes one fail, the change is a census
-    change and belongs in the frozen tables.
+    Every bound may be RAISED as the SDK grows. Both were lowered exactly once,
+    by step 3a, and each drop is arithmetic that can be checked rather than a
+    number that was in the way — see below. If a bound fails on you, do the same
+    thing: derive what the number SHOULD be and show the derivation, or accept
+    that the scanner went blind.
     """
     surface = len(py_census.markers) + len(py_census.members)
-    assert surface >= 26, (
-        f"the scan found {surface} distinct marker values (24 strings + 2 members on "
-        "2026-07-29). Migrating a site under step 3a moves an entry between "
-        "_CENSUS_PY and _MEMBER_SITES and leaves this sum alone — so a drop here "
-        "means the scanner stopped seeing something, not that the migration "
-        "advanced. Do not lower this bound."
+    # 26 -> 24, and the two are the census's own merges landing. Before 3a the
+    # scan saw 24 distinct STRINGS plus 2 members; after it, 24 distinct
+    # MEMBERS. The difference: three pairs collapsed into one member each
+    # (async_connect_unavailable+connect_timing_unavailable,
+    # ws_compressed+grpc_compressed, ws_parse_failed+grpc_parse_failed) for -3,
+    # and SNAPSHOT_TYPE_UNKNOWN gained its first emitter for +1. 26-3+1 = 24.
+    # The draft of this test claimed the sum was invariant under 3a; it is not,
+    # because merging two spellings of one fact is the point of the census.
+    assert surface >= 24, (
+        f"the scan found {surface} distinct marker values (24 members on "
+        "2026-07-29, post-3a). A drop below this means the scanner stopped "
+        "seeing something — the member-by-member, site-by-site equality tests "
+        "above are what say WHICH. Do not lower this bound without the "
+        "arithmetic."
     )
-    assert py_census.sites >= 56, (
-        f"only {py_census.sites} marker-ish slots resolved to a value (56 on "
-        "2026-07-29). A slot counts the same before and after step 3a rewires "
-        "it, because `Limitation.X` resolves exactly where the string did."
+    # 56 -> 45. A slot is a marker-ish SLOT, not a marker, and 3a deleted the
+    # accumulator plumbing that made up the difference: `limitations =
+    # limitations + ("x",)` counted a slot per rebinding, and eleven of those
+    # rebindings became `draft.add_limitation(Limitation.X)` calls with no
+    # intermediate. Every marker is still found — that is what the equality
+    # tests establish — and only the plumbing between them is gone.
+    assert py_census.sites >= 45, (
+        f"only {py_census.sites} marker-ish slots resolved to a value (45 on 2026-07-29, post-3a)."
     )
     assert len(rust_census.markers) >= 1, "the Rust scan found no markers at all"
     assert len(rust_census.files) >= 20, (
@@ -1246,6 +1289,14 @@ def test_scanner_is_not_blind(py_census: _PythonCensus, rust_census: _RustCensus
     assert "_merge_markers" in py_census.marker_functions, (
         "R9 registered no marker sink; a helper that takes a marker container "
         "without declaring a marker-ish parameter is then invisible"
+    )
+    # Step 3a's own indirection: every rewired site reaches the vocabulary
+    # through `SpanDraft.add_limitation(marker)` / `IntegrityBuilder.limitation`
+    # rather than by writing into a tuple. If R4 stopped deriving those two, the
+    # scan would go blind on the entire migrated surface at once and every
+    # equality table above would agree with it.
+    assert {"add_limitation", "limitation"} <= py_census.marker_functions, (
+        "R4 derived no draft-side marker sink; after step 3a that is the path every marker takes"
     )
 
 
@@ -1312,12 +1363,14 @@ def test_alias_sites_are_the_step_3a_worklist(py_census: _PythonCensus) -> None:
         assert old not in values, f"{old} became a member; it is supposed to be replaced by one"
 
 
-def test_the_four_renames_are_recorded() -> None:
+def test_the_four_renames_are_recorded(py_census: _PythonCensus) -> None:
     """§6.5.1's four value-name changes, asserted from both ends.
 
-    The old string must still be what the code emits (until 3a rewires it), the
-    new value must be a member, and the old value must NOT be — a vocabulary
-    that carries both names is exactly the drift the census was run to end.
+    Before step 3a this asserted the old string was still what the code emits.
+    3a rewired every site, so the assertion inverts and gets STRONGER: the old
+    spelling must now appear nowhere the scanner can see, the new value must be
+    a member, and the old value must NOT be — a vocabulary that carries both
+    names is exactly the drift the census was run to end.
     """
     assert set(_RENAMES) == {
         "ws_evicted",
@@ -1327,7 +1380,7 @@ def test_the_four_renames_are_recorded() -> None:
     }
     values = {m.value for m in Limitation}
     for old, member in _RENAMES.items():
-        assert old in _CENSUS_PY, old
+        assert old not in py_census.markers, f"{old} is still emitted; 3a should have rewired it"
         assert member.value in values
         assert old not in values, f"{old} survived as a member alongside {member.value}"
 

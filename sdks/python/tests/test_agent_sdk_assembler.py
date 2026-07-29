@@ -207,7 +207,9 @@ def test_abort_closes_open_spans_with_markers():
     tool = next(s for s in client.spans if s.name == "execute_tool Bash")
     assert root.status is StatusCode.ERROR
     assert "session_aborted" in root.capture_integrity.limitations
-    assert "tool_span_unclosed" in tool.capture_integrity.limitations
+    # Census rename (design §6.5.1): `tool_span_unclosed` folded into the
+    # step-0 member CHILD_SPAN_UNCLOSED, which step 3a made the emitted value.
+    assert "child_span_unclosed" in tool.capture_integrity.limitations
     assert asm.open_session_count() == 0
 
 
@@ -290,7 +292,7 @@ def test_open_entry_cap():
     unclosed = [
         s
         for s in client.spans
-        if s.capture_integrity and "tool_span_unclosed" in s.capture_integrity.limitations
+        if s.capture_integrity and "child_span_unclosed" in s.capture_integrity.limitations
     ]
     assert len(unclosed) == 300  # all eventually closed, none leaked
     assert asm.open_session_count() == 0

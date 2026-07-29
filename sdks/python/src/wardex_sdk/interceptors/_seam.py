@@ -18,25 +18,27 @@ from .._enums import (
     OperationName,
     Protocol,
     ProviderName,
-    SpanKind,
     StatusCode,
 )
 from .._limits import CaptureLimits
 from .._types import (
-    CaptureIntegrity,
     GenAIAttributes,
     HttpMeta,
-    InternalSpan,
     TransportAttributes,
     TransportTiming,
 )
 from ..assembly import (
     Ambient,
+    Limitation,
     Prefilter,
+    SpanDraft,
+    TransportLabel,
     capture_mode_of,
+    guard,
     resolve_parentage,
     should_capture,
 )
+from ..assembly._vocab import transport_name
 from ..protocol import grpc_status_name, parse_grpc_frames, parse_llm_semantics
 from ._base import InterceptorInterface
 from ._trackers import _Txn, _WebSocketTracker
@@ -96,7 +98,18 @@ class ByteSeamInterceptor(InterceptorInterface):
     @abstractmethod
     def _resolve_timing(
         self, obj: Any, st: _ConnectionState
-    ) -> tuple[float, float, bool, tuple[str, ...]]: ...
+    ) -> tuple[float, float, bool, tuple[Limitation, ...]]: ...
+
+    def _guard(self, where: str) -> guard:
+        """The one authorized swallow, wired to this seam's debug setting.
+
+        Span assembly runs `SpanDraft.finish()`, which raises `VocabularyError`
+        on a vocabulary breach, and I6 forbids that reaching the host. It is
+        counted and — under `config.debug` — logged with a traceback, so the
+        span this deletes is at least findable.
+        """
+        config = getattr(self._client, "config", None)
+        return guard(where, debug=bool(getattr(config, "debug", False)))
 
     def _url_scheme(self, is_ws: bool) -> str:
         return "wss" if is_ws else "https"
@@ -162,7 +175,7 @@ class ByteSeamInterceptor(InterceptorInterface):
                 old_cid = next(iter(self._conns))
                 old_st = self._conns.pop(old_cid)
                 if isinstance(old_st.tracker, _WebSocketTracker):
-                    for txn in old_st.tracker.flush("ws_evicted"):
+                    for txn in old_st.tracker.flush(Limitation.CONNECTION_EVICTED):
                         self._emit_ws(old_st, txn)
             self._conns[cid] = st
         return st
@@ -254,8 +267,16 @@ class ByteSeamInterceptor(InterceptorInterface):
             return None
 
     def _emit_span(self, obj: Any, st: _ConnectionState, txn: _Txn) -> None:
-        if self._client is None:
+        client = self._client
+        if client is None:
             return
+        span = None
+        with self._guard("interceptors.seam.emit_span"):
+            span = self._build_span(obj, st, txn)
+        if span is not None:
+            client.capture_span(span)
+
+    def _build_span(self, obj: Any, st: _ConnectionState, txn: _Txn) -> Any:
         url_host = getattr(obj, "server_hostname", None) or st.server_address
 
         ct = txn.content_type or ""
@@ -277,44 +298,70 @@ class ByteSeamInterceptor(InterceptorInterface):
         # false measurement is worse than a connect cost nobody claims.
         # Running it for a dropped transaction also keeps that connection's slot
         # from sitting in the FIFO-capped store until eviction.
-        connect_ms, handshake_ms, reused, limitations = self._resolve_timing(obj, st)
+        connect_ms, handshake_ms, reused, timing_markers = self._resolve_timing(obj, st)
 
         if not self._should_capture(st, txn, sem):
-            return
+            return None
 
         p = resolve_parentage(_latched(txn))
-        ctx = p.child_context()
         url = f"{self._url_scheme(False)}://{url_host}:{st.server_port}{txn.path}"
         transfer = max(0.0, (txn.end_ns - txn.start_ns) / 1e6 - txn.ttfb_ms)
 
+        # TRANSPORT mode, not an intent (design §6.1 correction in `_vocab.py`):
+        # the seam knows a request happened and, on the branches below, what the
+        # body meant — but `HTTP POST /v1/messages` reports the observation, and
+        # §6.2's twelve intents hold no member for uninterpreted traffic.
+        draft = SpanDraft.transport(
+            p,
+            label=TransportLabel.HTTP,
+            subject=f"{txn.method} {txn.path}",
+            source=self._capture_source(),
+            start_ns=txn.start_ns,
+        )
+        for marker in timing_markers:
+            draft.add_limitation(marker)
         # Markers the protocol parser attached to the transaction (a body that
-        # hit its cap, say). CaptureIntegrity.limitations is where a user reads
-        # them, so a cap applied in Rust has to arrive here or it truncates
-        # invisibly.
-        limitations = limitations + tuple(
-            m for m in getattr(txn, "limitations", ()) if m not in limitations
-        )
+        # hit its cap, say). They arrive as strings because the Rust half of the
+        # vocabulary is step 3b's; `from_wire` is the one place that crossing is
+        # resolved, and the census scanner is what keeps an unknown one from
+        # existing (see `Limitation.from_wire`).
+        for wire in getattr(txn, "limitations", ()):
+            member = Limitation.from_wire(wire)
+            if member is not None:
+                draft.add_limitation(member)
 
-        # Default values for common span fields (HTTP path). If gRPC, _build_grpc_fields
-        # overrides them.
-        gen_ai = None
         output_data = txn.response_body
-        name = f"HTTP {txn.method} {txn.path}"
         status_code = StatusCode.OK if 200 <= txn.status < 400 else StatusCode.ERROR
-        error_type: str | None = None
-        extra: tuple[tuple[str, str | int | float | bool], ...] = (
-            ("network.protocol.version", txn.version),
-        )
+        # `finish()` refuses `status=ERROR` with no `error.type` and a refused
+        # span is a DELETED span, so this may not be left `None`: without it
+        # every 4xx/5xx on every byte seam — the rate limit, the auth failure,
+        # the provider outage, i.e. the highest-value spans this SDK captures —
+        # disappears into a counter. The value is the response status rendered
+        # as a string, which is what OTel's HTTP-client semconv prescribes when
+        # the instrumentation has no richer classification. That is exactly
+        # wardex's position here: the seam observed a 500, it did not observe
+        # why. Low cardinality, and a fact rather than a guess.
+        error_type: str | None = str(txn.status) if status_code is StatusCode.ERROR else None
+        draft.set_extra("network.protocol.version", txn.version)
 
         if ct.startswith("application/grpc-web"):
             # grpc-web uses different framing and is unsupported — leave it as plain h2 but mark it.
-            limitations = limitations + ("grpc_web_unsupported",)
+            draft.add_limitation(Limitation.GRPC_WEB_UNSUPPORTED)
 
         if is_grpc:
             # gRPC fields; `sem` is already None (see the parse above).
-            name, status_code, error_type, extra, limitations = _build_grpc_fields(
-                txn, extra, limitations
+            _name, status_code, error_type, grpc_extra, grpc_markers = _build_grpc_fields(
+                txn, (), ()
             )
+            for key, value in grpc_extra:
+                draft.set_extra(key, value)
+            for marker in grpc_markers:
+                draft.add_limitation(marker)
+            # The helper falls back to plain h2 when the framing parse fails and
+            # says so with FRAME_PARSE_FAILED; the label follows the same
+            # decision, so the span's name and its marker cannot disagree.
+            if Limitation.FRAME_PARSE_FAILED not in grpc_markers:
+                draft.relabel(TransportLabel.GRPC, txn.path)
         else:
             # --- LLM semantics (parsed above the gate) ---
             if sem is not None:
@@ -322,36 +369,36 @@ class ByteSeamInterceptor(InterceptorInterface):
                     output_data = bytes(sem.decoded_response)
                 streamed = bool(getattr(sem, "reassembled_from_stream", False))
                 if _has_core_semantics(sem):
-                    gen_ai = _build_gen_ai(sem)
+                    draft.set_gen_ai(_build_gen_ai(sem))
                     if streamed:
-                        limitations = limitations + ("reassembled_from_stream",)
+                        draft.add_limitation(Limitation.REASSEMBLED_FROM_STREAM)
                         if sem.output_tokens is None:
-                            limitations = limitations + ("stream_usage_unavailable",)
+                            draft.add_limitation(Limitation.STREAM_USAGE_UNAVAILABLE)
                         if txn.version == "2":
-                            limitations = limitations + ("ttft_unavailable_h2",)
+                            draft.add_limitation(Limitation.TTFT_UNAVAILABLE_H2)
                 elif streamed:
-                    limitations = limitations + ("sse_unknown_provider",)
+                    draft.add_limitation(Limitation.SSE_UNKNOWN_PROVIDER)
                 else:
                     # No need for semantic_parse_failed if tool_calls extraction succeeded.
                     if sem.output_messages is None:
-                        limitations = limitations + ("semantic_parse_failed",)
+                        draft.add_limitation(Limitation.SEMANTIC_PARSE_FAILED)
                 # Structured extraction of output.messages
                 om = sem.output_messages
                 if om is not None:
-                    extra = extra + (("gen_ai.output.messages", om),)
+                    draft.set_extra("gen_ai.output.messages", om)
                     if sem.tool_args_unparsed:
-                        limitations = limitations + ("tool_args_unparsed",)
+                        draft.add_limitation(Limitation.TOOL_ARGS_UNPARSED)
                     if sem.output_messages_has_unmapped:
-                        limitations = limitations + ("output_messages_unmapped_part",)
+                        draft.add_limitation(Limitation.OUTPUT_MESSAGES_UNMAPPED_PART)
                 # Structured extraction of input.messages / system_instructions
                 im = sem.input_messages
                 if im is not None:
-                    extra = extra + (("gen_ai.input.messages", im),)
+                    draft.set_extra("gen_ai.input.messages", im)
                     if sem.input_messages_has_unmapped:
-                        limitations = limitations + ("input_messages_unmapped_part",)
+                        draft.add_limitation(Limitation.INPUT_MESSAGES_UNMAPPED_PART)
                 si = sem.system_instructions
                 if si is not None:
-                    extra = extra + (("gen_ai.system_instructions", si),)
+                    draft.set_extra("gen_ai.system_instructions", si)
 
         timing = TransportTiming(
             tcp_connect_ms=connect_ms,
@@ -362,56 +409,44 @@ class ByteSeamInterceptor(InterceptorInterface):
         )
         # response_size is the wire (compressed) size, while output_data is the
         # decompressed body, so lengths may differ for gzip responses (intended behavior).
-        transport = TransportAttributes(
-            connection_id=str(id(obj)),
-            protocol=Protocol.HTTP,
-            direction=Direction.OUTBOUND,
-            timing=timing,
-            request_size=len(txn.request_body),
-            response_size=len(txn.response_body),
-            http=HttpMeta(method=txn.method, url=url, status_code=txn.status),
-            connection_reused=reused,
+        draft.set_transport(
+            TransportAttributes(
+                connection_id=str(id(obj)),
+                protocol=Protocol.HTTP,
+                direction=Direction.OUTBOUND,
+                timing=timing,
+                request_size=len(txn.request_body),
+                response_size=len(txn.response_body),
+                http=HttpMeta(method=txn.method, url=url, status_code=txn.status),
+                connection_reused=reused,
+            )
         )
-        integrity = CaptureIntegrity(
-            request_headers_captured=False,
-            request_body_captured=True,
-            response_headers_captured=False,
-            response_body_captured=True,
-            truncated=txn.truncated,
-            limitations=limitations,
-        )
-        span = InternalSpan(
-            context=ctx,
-            parent_span_id=p.parent_span_id,
-            name=name,
-            kind=SpanKind.CLIENT,
-            start_time_ns=txn.start_ns,
-            end_time_ns=txn.end_ns,
-            status=status_code,
-            error_type=error_type,
-            gen_ai=gen_ai,
-            transport=transport,
-            server_address=st.server_address,
-            server_port=st.server_port,
-            input_data=txn.request_body,
-            output_data=output_data,
-            capture_sources=(self._capture_source(),),
-            capture_integrity=integrity,
-            correlation=p.correlation,
-            extra=extra,
-        )
-        self._client.capture_span(span)
+        draft.set_server(st.server_address, st.server_port)
+        draft.set_status(status_code)
+        draft.set_error(error_type)
+        # "attempted and succeeded", not "non-empty": the seam read both bodies
+        # off the tracker, and a zero-length body is a captured zero-length body.
+        draft.set_io(input_data=txn.request_body, output_data=output_data)
+        draft.integrity.truncated(txn.truncated)
+        return draft.finish(txn.end_ns)
 
     def _emit_ws(self, st: _ConnectionState, txn: _Txn) -> None:
-        if self._client is None:
+        client = self._client
+        if client is None:
             return
+        span = None
+        with self._guard("interceptors.seam.emit_ws"):
+            span = self._build_ws_span(st, txn)
+        if span is not None:
+            client.capture_span(span)
+
+    def _build_ws_span(self, st: _ConnectionState, txn: _Txn) -> Any:
         # `agent_semantic=False`: a WS session carries no parsed LLM semantics
         # (`sem` is None on this path by construction), so it is captured only
         # under ALL, an allowlisted host, or a live local span.
         if not self._should_capture(st, txn, None):
-            return
+            return None
         p = resolve_parentage(_latched(txn))
-        ctx = p.child_context()
 
         code = txn.ws_close_code
         # Status based on close code: 1000/1001/none = OK, otherwise = ERROR
@@ -422,15 +457,20 @@ class ByteSeamInterceptor(InterceptorInterface):
             status_code = StatusCode.ERROR
             error_type = _ws_close_name(code)
 
-        extra: tuple[tuple[str, str | int | float | bool], ...] = (
-            ("network.protocol.version", "websocket"),
-            ("ws.messages.sent", txn.ws_messages_sent),
-            ("ws.messages.received", txn.ws_messages_received),
-            ("ws.bytes.sent", txn.ws_bytes_sent),
-            ("ws.bytes.received", txn.ws_bytes_received),
+        draft = SpanDraft.transport(
+            p,
+            label=TransportLabel.WEBSOCKET,
+            subject=txn.path,
+            source=self._capture_source(),
+            start_ns=txn.start_ns,
         )
+        draft.set_extra("network.protocol.version", "websocket")
+        draft.set_extra("ws.messages.sent", txn.ws_messages_sent)
+        draft.set_extra("ws.messages.received", txn.ws_messages_received)
+        draft.set_extra("ws.bytes.sent", txn.ws_bytes_sent)
+        draft.set_extra("ws.bytes.received", txn.ws_bytes_received)
         if code is not None:
-            extra = extra + (("ws.close_code", code),)
+            draft.set_extra("ws.close_code", code)
 
         timing = TransportTiming(
             tcp_connect_ms=0.0,
@@ -439,48 +479,32 @@ class ByteSeamInterceptor(InterceptorInterface):
             ttft_ms=0.0,
             transfer_ms=max(0.0, (txn.end_ns - txn.start_ns) / 1e6),
         )
-        transport = TransportAttributes(
-            connection_id=str(id(st)),
-            protocol=Protocol.HTTP,
-            direction=Direction.OUTBOUND,
-            timing=timing,
-            request_size=txn.ws_bytes_sent,
-            response_size=txn.ws_bytes_received,
-            http=HttpMeta(
-                method="GET",
-                url=f"{self._url_scheme(True)}://{st.server_address}:{st.server_port}{txn.path}",
-                status_code=101,
-            ),
-            connection_reused=False,
+        draft.set_transport(
+            TransportAttributes(
+                connection_id=str(id(st)),
+                protocol=Protocol.HTTP,
+                direction=Direction.OUTBOUND,
+                timing=timing,
+                request_size=txn.ws_bytes_sent,
+                response_size=txn.ws_bytes_received,
+                http=HttpMeta(
+                    method="GET",
+                    url=(
+                        f"{self._url_scheme(True)}://{st.server_address}:{st.server_port}{txn.path}"
+                    ),
+                    status_code=101,
+                ),
+                connection_reused=False,
+            )
         )
-        integrity = CaptureIntegrity(
-            request_headers_captured=False,
-            request_body_captured=True,
-            response_headers_captured=False,
-            response_body_captured=True,
-            truncated="ws_payload_truncated" in txn.ws_markers,
-            limitations=txn.ws_markers,
-        )
-        span = InternalSpan(
-            context=ctx,
-            parent_span_id=p.parent_span_id,
-            name=f"WS {txn.path}",
-            kind=SpanKind.CLIENT,
-            start_time_ns=txn.start_ns,
-            end_time_ns=txn.end_ns,
-            status=status_code,
-            error_type=error_type,
-            transport=transport,
-            server_address=st.server_address,
-            server_port=st.server_port,
-            input_data=txn.request_body,
-            output_data=txn.response_body,
-            capture_sources=(self._capture_source(),),
-            capture_integrity=integrity,
-            correlation=p.correlation,
-            extra=extra,
-        )
-        self._client.capture_span(span)
+        draft.set_server(st.server_address, st.server_port)
+        draft.set_status(status_code)
+        draft.set_error(error_type)
+        draft.set_io(input_data=txn.request_body, output_data=txn.response_body)
+        draft.integrity.truncated(Limitation.WS_PAYLOAD_TRUNCATED in txn.ws_markers)
+        for marker in txn.ws_markers:
+            draft.add_limitation(marker)
+        return draft.finish(txn.end_ns)
 
 
 def _latched(txn: _Txn) -> Ambient:
@@ -527,17 +551,32 @@ def _ws_close_name(code: int) -> str:
 def _build_grpc_fields(
     txn: _Txn,
     extra: tuple[tuple[str, str | int | float | bool], ...],
-    limitations: tuple[str, ...],
+    limitations: tuple[Limitation, ...],
 ) -> tuple[
     str,
     StatusCode,
     str | None,
     tuple[tuple[str, str | int | float | bool], ...],
-    tuple[str, ...],
+    tuple[Limitation, ...],
 ]:
     """Assemble gRPC span fields → (name, status_code, error_type, extra, limitations).
 
-    On parse failure, falls back to plain h2 (HTTP) fields + grpc_parse_failed marker.
+    Pure, and deliberately still returning a tuple rather than mutating a draft:
+    it is the one branch of the seam with enough protocol logic to be worth
+    testing without a socket, and it is where the census scanner's R6 rule finds
+    the gRPC markers.
+
+    On a framing-parse failure the span falls back to plain h2 (HTTP) fields plus
+    `Limitation.FRAME_PARSE_FAILED`. The caller keys its own label off exactly
+    that marker, so the name and the marker cannot disagree about whether this
+    was gRPC.
+
+    Markers are `Limitation` members as of step 3a, and two of these values
+    changed name on the way in (§6.5.1): `grpc_parse_failed` became
+    `FRAME_PARSE_FAILED` because a WebSocket framing failure is the same fact,
+    and `grpc_compressed` became `PAYLOAD_COMPRESSED` because
+    `TransportAttributes.protocol` already carries which protocol it was and
+    encoding that into the marker duplicates a field.
     """
     try:
         req = parse_grpc_frames(txn.request_body)
@@ -545,14 +584,17 @@ def _build_grpc_fields(
     except Exception:
         http_status = StatusCode.OK if 200 <= txn.status < 400 else StatusCode.ERROR
         return (
-            f"HTTP {txn.method} {txn.path}",
+            transport_name(TransportLabel.HTTP, f"{txn.method} {txn.path}"),
             http_status,
-            None,
+            # Plain-h2 fallback, so the plain-h2 error type: the HTTP status as
+            # a string. Returning `None` here alongside an ERROR status is what
+            # `finish()` deletes the span for.
+            str(txn.status) if http_status is StatusCode.ERROR else None,
             extra,
-            limitations + ("grpc_parse_failed",),
+            limitations + (Limitation.FRAME_PARSE_FAILED,),
         )
 
-    name = f"gRPC {txn.path}"
+    name = transport_name(TransportLabel.GRPC, txn.path)
     code = txn.grpc_status
     status_code = StatusCode.ERROR if code not in (0, None) else StatusCode.OK
     error_type = grpc_status_name(code) if status_code is StatusCode.ERROR else None
@@ -580,11 +622,11 @@ def _build_grpc_fields(
         extra = extra + (("rpc.grpc.status_message", txn.grpc_message),)
 
     if code is None:
-        limitations = limitations + ("grpc_status_unavailable",)
+        limitations = limitations + (Limitation.GRPC_STATUS_UNAVAILABLE,)
     if any(m.compressed for m in req.messages) or any(m.compressed for m in resp.messages):
-        limitations = limitations + ("grpc_compressed",)
+        limitations = limitations + (Limitation.PAYLOAD_COMPRESSED,)
     if req.truncated or resp.truncated:
-        limitations = limitations + ("grpc_message_truncated",)
+        limitations = limitations + (Limitation.GRPC_MESSAGE_TRUNCATED,)
 
     return name, status_code, error_type, extra, limitations
 

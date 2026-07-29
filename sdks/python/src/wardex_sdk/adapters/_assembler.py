@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import threading
 import time
+import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -18,27 +19,25 @@ from .. import _wardex_native
 from .._enums import (
     AgentType,
     CaptureSource,
-    OperationName,
     ProviderName,
-    SpanKind,
     StatusCode,
     ToolExecutionType,
 )
 from .._types import (
     AgentAttributes,
-    CaptureIntegrity,
     ConversationContext,
     CorrelationInfo,
     GenAIAttributes,
-    InternalSpan,
-    SpanContext,
     ToolAttributes,
 )
 from ..assembly import (
     Evidence,
-    Parentage,
+    Limitation,
     ParentSource,
+    SpanDraft,
+    SpanIntent,
     child_of,
+    guard,
     latch_ambient,
     resolve_parentage,
 )
@@ -63,7 +62,10 @@ from ..protocol._claude_stream import AgentStreamEvent, parse_line
 # the confidence and the marker the guess has earned.
 _IN_SESSION = Evidence(ParentSource.UNIT_ACTIVE)
 
-_BASE_LIMITATION = "transport_timing_unavailable_subprocess"
+# Rides EVERY span this adapter builds. The LLM call happened inside a CLI
+# subprocess and wardex observed only the IPC stream, so there is no transport
+# timing at all — not zero timing, absent timing.
+_BASE_LIMITATION = Limitation.TRANSPORT_TIMING_UNAVAILABLE_SUBPROCESS
 
 
 def _safe_json_bytes(value: Any) -> bytes:
@@ -86,9 +88,24 @@ class _OpenTool:
 
 
 @dataclass
+class _OpenSubagent:
+    """A subagent span opened at `SubagentStart` and finished at `SubagentStop`.
+
+    The DRAFT is what is held, not a bare `SpanContext`. Before step 3a this
+    entry carried a context allocated at open time plus the fields needed to
+    rebuild the span at close time, which is a two-phase span written by hand;
+    holding the draft makes it one object, and `draft.context` is the anchor
+    children hang off — the same context the span will eventually be emitted
+    with, by construction rather than by care.
+    """
+
+    draft: SpanDraft
+    agent_type: str
+
+
+@dataclass
 class _Session:
-    parentage: Parentage  # the resolved edge from the user's scope to this session
-    root_ctx: SpanContext  # the session root's own context — the anchor for P2
+    root: SpanDraft  # the session's own two-phase span; `root.context` is the P2 anchor
     start_ns: int
     session_id: str | None = None
     model: str | None = None  # from init -> request_model
@@ -96,9 +113,13 @@ class _Session:
     first_delta_ns: int = 0
     prompt: bytes = b""
     open_tools: dict[str, _OpenTool] = field(default_factory=dict)  # keyed by tool_use_id
-    subagents: dict[str, tuple[SpanContext, str, int, Parentage]] = field(default_factory=dict)
-    # ^ agent_id -> (ctx, agent_type, start_ns, parentage)
+    subagents: dict[str, _OpenSubagent] = field(default_factory=dict)  # keyed by agent_id
     turn_index: int = 0
+    # Issued by wardex when the CLI has not (yet) reported a session id. §6.3:
+    # `conversation_id` may not be the empty string — every span in one session
+    # would otherwise collide with every span of every other session in any
+    # store that keys on it, and `SpanDraft.finish()` now refuses to ship "".
+    issued_conversation_id: str = field(default_factory=lambda: uuid.uuid4().hex)
     stream_tool_meta: dict[str, tuple[str, bytes]] = field(default_factory=dict)
     # ^ tool_use_id -> (name, input_json) observed on the stream
     result: AgentStreamEvent | None = None
@@ -206,34 +227,69 @@ class SessionAssembler:
             elif event == "SubagentStart":
                 agent_id = payload.get("agent_id")
                 if agent_id and len(sess.subagents) < self._max_session_entries:
-                    p = child_of(sess.root_ctx, _IN_SESSION)
-                    sess.subagents[agent_id] = (
-                        p.child_context(),
-                        payload.get("agent_type") or "sub_agent",
-                        now,
-                        p,
+                    agent_type = payload.get("agent_type") or "sub_agent"
+                    draft = SpanDraft(
+                        child_of(sess.root.context, _IN_SESSION),
+                        intent=SpanIntent.INVOKE_AGENT,
+                        subject=agent_type,
+                        source=CaptureSource.ADAPTER,
+                        start_ns=now,
                     )
+                    draft.set_agent(
+                        AgentAttributes(
+                            name=agent_type, id=agent_id, agent_type=AgentType.SUB_AGENT
+                        )
+                    )
+                    draft.add_limitation(_BASE_LIMITATION)
+                    # See `_IN_SESSION`: which session this hook belongs to is
+                    # `_session_for_hook`'s guess, so the span makes no claim.
+                    draft.replace_correlation(None)
+                    sess.subagents[agent_id] = _OpenSubagent(draft=draft, agent_type=agent_type)
             elif event == "SubagentStop":
                 self._emit_subagent(sess, payload.get("agent_id"), now)
 
-    # --- emission helpers (all emit InternalSpan via self._client.capture_span) ---
+    # --- emission helpers (all build via SpanDraft, emit via capture_span) ---
+
+    def _guard(self, where: str) -> guard:
+        """The authorized swallow. `SpanDraft.finish()` raises `VocabularyError`
+        on a vocabulary breach, and this code runs inside the host's own hook
+        callbacks and transport tee — I6 forbids that reaching them."""
+        config = getattr(self._client, "config", None)
+        return guard(where, debug=bool(getattr(config, "debug", False)))
 
     def _ensure_session(self, key: int, now: int) -> _Session:
         sess = self._by_key.get(key)
         if sess is not None:
             return sess
         # The one scope read of the whole adapter. Everything below the root is
-        # anchored to `root_ctx`, so `child_context()` is called exactly once
-        # here: calling it again would anchor the children to a span id that is
-        # never emitted (see `Parentage.child_context`).
+        # anchored to `sess.root.context`, and that context exists exactly once
+        # because the ROOT SPAN ITSELF holds it: the draft opened here is the
+        # span `_finalize` eventually emits. Allocating a bare context and
+        # rebuilding the span from it later is what made it possible to anchor
+        # children to a span id that is never emitted.
         parentage = resolve_parentage(latch_ambient())
-        sess = _Session(
-            parentage=parentage,
-            root_ctx=parentage.child_context(),
+        root = SpanDraft(
+            parentage,
+            intent=SpanIntent.INVOKE_AGENT,
+            source=CaptureSource.ADAPTER,
             start_ns=now,
         )
+        sess = _Session(root=root, start_ns=now)
         self._new_session(key, sess)
         return sess
+
+    def _conversation(self, sess: _Session, *, turn_index: int = 0) -> ConversationContext:
+        """The session's conversation identity, never the empty string (§6.3).
+
+        `session_id` stays optional — it is the CLI's id and the CLI may not
+        have reported one yet — but `conversation_id` is what a store keys on,
+        so wardex issues a stable one per session rather than shipping "".
+        """
+        return ConversationContext(
+            conversation_id=sess.session_id or sess.issued_conversation_id,
+            session_id=sess.session_id,
+            turn_index=turn_index,
+        )
 
     def _new_session(self, key: int, sess: _Session) -> None:
         """Insert a session, evicting the oldest when the cap is reached.
@@ -260,9 +316,7 @@ class SessionAssembler:
             return next(iter(self._by_key.values()))
         return None
 
-    def _resolve_subagent_anchor(
-        self, sess: _Session, parent_tool_use_id: str | None
-    ) -> SpanContext:
+    def _resolve_subagent_anchor(self, sess: _Session, parent_tool_use_id: str | None) -> Any:
         """Best-effort join from a stream-side parent_tool_use_id to a subagent span.
 
         Direct match: parent_tool_use_id happens to be a known agent_id.
@@ -281,74 +335,77 @@ class SessionAssembler:
         edge — see `_IN_SESSION`.
         """
         if not parent_tool_use_id:
-            return sess.root_ctx
+            return sess.root.context
         sub = sess.subagents.get(parent_tool_use_id)
         if sub is None:
             open_tool = sess.open_tools.get(parent_tool_use_id)
             if open_tool is not None and open_tool.agent_id is not None:
                 sub = sess.subagents.get(open_tool.agent_id)
-        return sub[0] if sub is not None else sess.root_ctx
+        return sub.draft.context if sub is not None else sess.root.context
 
     def _emit_chat(self, sess: _Session, ev: AgentStreamEvent, now: int) -> None:
+        span = None
+        with self._guard("adapters.assembler.emit_chat"):
+            span = self._build_chat(sess, ev, now)
+        sess.turn_index += 1
+        if span is not None:
+            self._client.capture_span(span)
+
+    def _build_chat(self, sess: _Session, ev: AgentStreamEvent, now: int) -> Any:
         p = child_of(self._resolve_subagent_anchor(sess, ev.parent_tool_use_id), _IN_SESSION)
         start_ns = sess.turn_start_ns or now
 
         ttft: float | None = None
         if sess.first_delta_ns:
             ttft = (sess.first_delta_ns - sess.turn_start_ns) / 1e9
-        limitations = (_BASE_LIMITATION,)
+
+        # `subject=ev.model`, not an f-string. A turn whose stream never reported
+        # a model used to produce the literal span name "chat None"; the grammar
+        # yields the bare operation instead, and there is no interpolation left
+        # at this site to get wrong.
+        draft = SpanDraft(
+            p,
+            intent=SpanIntent.CHAT,
+            subject=ev.model,
+            source=CaptureSource.ADAPTER,
+            start_ns=start_ns,
+        )
+        draft.set_gen_ai(
+            GenAIAttributes(
+                operation=SpanIntent.CHAT.operation,
+                provider=ProviderName.ANTHROPIC,
+                request_model=sess.model,
+                response_model=ev.model,
+                response_id=ev.message_id,
+                input_tokens=ev.input_tokens,
+                output_tokens=ev.output_tokens,
+                cache_read_input_tokens=ev.cache_read_tokens,
+                cache_creation_input_tokens=ev.cache_creation_tokens,
+                finish_reasons=(ev.stop_reason,) if ev.stop_reason else None,
+                time_to_first_chunk_s=ttft,
+            )
+        )
+        draft.set_conversation(self._conversation(sess, turn_index=sess.turn_index))
+        draft.set_status(StatusCode.OK)
+        draft.add_limitation(_BASE_LIMITATION)
         if ttft is not None:
-            limitations = limitations + ("ttft_ipc_approximation",)
+            draft.add_limitation(Limitation.TTFT_IPC_APPROXIMATION)
 
-        gen_ai = GenAIAttributes(
-            operation=OperationName.CHAT,
-            provider=ProviderName.ANTHROPIC,
-            request_model=sess.model,
-            response_model=ev.model,
-            response_id=ev.message_id,
-            input_tokens=ev.input_tokens,
-            output_tokens=ev.output_tokens,
-            cache_read_input_tokens=ev.cache_read_tokens,
-            cache_creation_input_tokens=ev.cache_creation_tokens,
-            finish_reasons=(ev.stop_reason,) if ev.stop_reason else None,
-            time_to_first_chunk_s=ttft,
-        )
-        conversation = ConversationContext(
-            conversation_id=sess.session_id or "",
-            session_id=sess.session_id or "",
-            turn_index=sess.turn_index,
-        )
         is_first_turn = sess.turn_index == 0
-        input_data = sess.prompt if is_first_turn else b""
-        output_data = ev.content_json or b""
-
-        span = InternalSpan(
-            context=p.child_context(),
-            parent_span_id=p.parent_span_id,
-            name=f"chat {ev.model}",
-            kind=SpanKind.CLIENT,
-            start_time_ns=start_ns,
-            end_time_ns=now,
-            status=StatusCode.OK,
-            gen_ai=gen_ai,
-            conversation=conversation,
-            input_data=input_data,
-            output_data=output_data,
-            capture_sources=(CaptureSource.ADAPTER,),
-            capture_integrity=CaptureIntegrity(
-                request_body_captured=bool(input_data),
-                response_body_captured=bool(output_data),
-                limitations=limitations,
-            ),
-            # No `correlation=p.correlation`: the anchor above may be a fallback
-            # (see `_resolve_subagent_anchor`), and `p.correlation` would report
-            # it as `unit_active`/1.0 with no marker. Unchanged from before step
-            # 1 — this span still makes no claim — because a claim it cannot
-            # back is strictly worse than no claim (I4). Step 6 supplies the
-            # evidence, and the field arrives with it.
+        # `attempted`, not `bool(payload)`. Only the first turn carries the
+        # prompt on this path (WAR-34 #2 is the fix for that, at step 9); saying
+        # so is different from reporting an empty capture as a failed one.
+        draft.set_io(
+            input_data=sess.prompt if is_first_turn else b"",
+            output_data=ev.content_json or b"",
+            input_attempted=is_first_turn,
         )
-        sess.turn_index += 1
-        self._client.capture_span(span)
+        # No correlation: the anchor above may be a fallback (see
+        # `_resolve_subagent_anchor`), and the parentage's own record would
+        # report it as `unit_active`/1.0 with no marker — a claim this span
+        # cannot back (I4). Step 6 supplies the evidence and the field with it.
+        draft.replace_correlation(None)
+        return draft.finish(now)
 
     def _open_tool(self, sess: _Session, payload: dict, tool_use_id: str | None, now: int) -> None:
         if tool_use_id is None:
@@ -362,7 +419,17 @@ class SessionAssembler:
             # session cannot accumulate unbounded open-tool state.
             oldest_id, oldest = next(iter(sess.open_tools.items()))
             del sess.open_tools[oldest_id]
-            self._emit_tool(sess, oldest, now, markers=("tool_span_unclosed",))
+            self._emit_tool(
+                sess,
+                oldest,
+                now,
+                # Census rename (§6.5.1): `tool_span_unclosed` folded into the
+                # step-0 member `CHILD_SPAN_UNCLOSED`. Nothing is lost — the
+                # marker rides the tool span itself, where
+                # `gen_ai.operation.name=execute_tool` already says the child
+                # was a tool.
+                markers=(Limitation.CHILD_SPAN_UNCLOSED,),
+            )
         sess.open_tools[tool_use_id] = _OpenTool(
             tool_use_id=tool_use_id,
             name=payload.get("tool_name") or "unknown",
@@ -411,52 +478,75 @@ class SessionAssembler:
         tool: _OpenTool,
         end_ns: int,
         failed: bool = False,
-        markers: tuple[str, ...] = (),
+        markers: tuple[Limitation, ...] = (),
+        error_type: str | None = None,
     ) -> None:
-        anchor = sess.root_ctx
+        span = None
+        with self._guard("adapters.assembler.emit_tool"):
+            span = self._build_tool(sess, tool, end_ns, failed, markers, error_type)
+        if span is not None:
+            self._client.capture_span(span)
+
+    def _build_tool(
+        self,
+        sess: _Session,
+        tool: _OpenTool,
+        end_ns: int,
+        failed: bool,
+        markers: tuple[Limitation, ...],
+        error_type: str | None,
+    ) -> Any:
+        anchor = sess.root.context
         if tool.agent_id is not None:
             sub = sess.subagents.get(tool.agent_id)
             if sub is not None:
-                anchor = sub[0]
+                anchor = sub.draft.context
         p = child_of(anchor, _IN_SESSION)
 
-        span = InternalSpan(
-            context=p.child_context(),
-            parent_span_id=p.parent_span_id,
-            name=f"execute_tool {tool.name}",
-            kind=SpanKind.INTERNAL,
-            start_time_ns=tool.start_ns,
-            end_time_ns=end_ns,
-            status=StatusCode.ERROR if failed else StatusCode.OK,
-            tool=ToolAttributes(
+        draft = SpanDraft(
+            p,
+            intent=SpanIntent.EXECUTE_TOOL,
+            subject=tool.name,
+            source=CaptureSource.ADAPTER,
+            start_ns=tool.start_ns,
+        )
+        draft.set_tool(
+            ToolAttributes(
                 name=tool.name,
                 call_id=tool.tool_use_id,
-                execution_type=ToolExecutionType.NETWORK,
-            ),
-            input_data=tool.input_data,
-            output_data=tool.output_data,
-            capture_sources=(CaptureSource.ADAPTER,),
-            capture_integrity=CaptureIntegrity(
-                request_body_captured=bool(tool.input_data),
-                response_body_captured=bool(tool.output_data),
-                limitations=(_BASE_LIMITATION, *markers),
-            ),
-            # NOT `p.correlation`, deliberately. The edge above came from the
-            # core; this field is the OTHER axis, and today it still mixes the
-            # two: `adapter_hook`/`adapter_stream` answer "which source observed
-            # the event", which design §4.1 moves to `capture_sources` and §11
-            # schedules for step 3b. Overwriting it here would silently retire a
-            # declared wire value one step early, so it stays until the step that
-            # owns the vocabulary change replaces it with
-            # `capture_sources=(ADAPTER,)` + `strategy=unit_active`.
-            correlation=CorrelationInfo(
+                # UNKNOWN, not NETWORK. wardex never observes how a Claude Code
+                # built-in (Bash, Read) executes, and asserting NETWORK for it
+                # was a guess that happened to be wrong — §6.2 adds UNKNOWN
+                # because an honest "not observed" beats a confident lie.
+                execution_type=ToolExecutionType.UNKNOWN,
+            )
+        )
+        draft.set_status(StatusCode.ERROR if failed else StatusCode.OK)
+        if failed:
+            # `finish()` refuses ERROR without a type, which is WAR-34 #5 turned
+            # into a mechanism. The hook payload carries a richer reason
+            # (`PostToolUseFailureHookInput.error` / `is_interrupt`); reading it
+            # is step 9's, and until then this is a coarse-but-true type rather
+            # than an absent one.
+            draft.set_error(error_type or "tool_error")
+        draft.set_io(input_data=tool.input_data, output_data=tool.output_data)
+        draft.add_limitation(_BASE_LIMITATION)
+        for marker in markers:
+            draft.add_limitation(marker)
+        # NOT the parentage's own record, deliberately. The edge above came from
+        # the core; this field is the OTHER axis, and today it still mixes the
+        # two: `adapter_hook`/`adapter_stream` answer "which source observed the
+        # event", which design §4.1 moves to `capture_sources` and §11 schedules
+        # for step 7b. Overwriting it here would silently retire a declared wire
+        # value one step early.
+        draft.replace_correlation(
+            CorrelationInfo(
                 request_id=tool.tool_use_id,
                 confidence=1.0 if tool.from_hook else 0.7,
                 strategy="adapter_hook" if tool.from_hook else "adapter_stream",
-            ),
-            extra=(("gen_ai.operation.name", OperationName.EXECUTE_TOOL.value),),
+            )
         )
-        self._client.capture_span(span)
+        return draft.finish(end_ns)
 
     def _on_stream_tool_result(self, sess: _Session, ev: AgentStreamEvent, now: int) -> None:
         tool_use_id = ev.parent_tool_use_id
@@ -494,78 +584,73 @@ class SessionAssembler:
         entry = sess.subagents.pop(agent_id, None)
         if entry is None:
             return
-        ctx, agent_type, start_ns, p = entry
-        span = InternalSpan(
-            context=ctx,
-            parent_span_id=p.parent_span_id,
-            name=f"invoke_agent {agent_type}",
-            kind=SpanKind.INTERNAL,
-            start_time_ns=start_ns,
-            end_time_ns=now,
-            status=StatusCode.OK,
-            agent=AgentAttributes(name=agent_type, id=agent_id, agent_type=AgentType.SUB_AGENT),
-            capture_sources=(CaptureSource.ADAPTER,),
-            capture_integrity=CaptureIntegrity(limitations=(_BASE_LIMITATION,)),
-            # No `correlation=p.correlation`, for the reason at `_IN_SESSION`:
-            # the edge to the session root is exact, but WHICH session this hook
-            # belongs to is `_session_for_hook`'s sole-live-session guess, and
-            # `p.correlation` reports the whole thing at confidence 1.0 with no
-            # marker. Unchanged from before step 1.
-            extra=(("gen_ai.operation.name", OperationName.INVOKE_AGENT.value),),
-        )
-        self._client.capture_span(span)
+        span = None
+        with self._guard("adapters.assembler.emit_subagent"):
+            entry.draft.set_status(StatusCode.OK)
+            span = entry.draft.finish(now)
+        if span is not None:
+            self._client.capture_span(span)
 
     def _finalize(self, sess: _Session, error: str | None, now: int) -> None:
         # (1) Force-close any still-open tool spans — they never got a matching
         # PostToolUse/PostToolUseFailure hook before session teardown.
         for tool_use_id in list(sess.open_tools.keys()):
             tool = sess.open_tools.pop(tool_use_id)
-            self._emit_tool(sess, tool, now, failed=True, markers=("tool_span_unclosed",))
+            self._emit_tool(
+                sess,
+                tool,
+                now,
+                failed=True,
+                markers=(Limitation.CHILD_SPAN_UNCLOSED,),
+                error_type="tool_unclosed",
+            )
 
         # (2) Emit any subagent spans that never received a SubagentStop.
         for agent_id in list(sess.subagents.keys()):
             self._emit_subagent(sess, agent_id, now)
 
-        # (3) Root invoke_agent span.
-        extra: list[tuple[str, str | int | float | bool]] = [
-            ("gen_ai.operation.name", OperationName.INVOKE_AGENT.value)
-        ]
-        limitations = (_BASE_LIMITATION,)
+        # (3) Root invoke_agent span — the draft opened in `_ensure_session`,
+        # whose context every span above is anchored to.
+        span = None
+        with self._guard("adapters.assembler.finalize"):
+            span = self._build_root(sess, error, now)
+        if span is not None:
+            self._client.capture_span(span)
+
+    def _build_root(self, sess: _Session, error: str | None, now: int) -> Any:
+        draft = sess.root
+        # `agent.name` is still the model id here, which §6.3 calls out as wrong
+        # — the model belongs in `gen_ai.request.model`. Correcting it changes a
+        # field a dashboard groups by, and §11 keeps 3a's span fields identical,
+        # so it rides the adapter rewrite (step 7b/8) with the rest of the
+        # Anthropic semantics.
+        draft.set_agent(AgentAttributes(name=sess.model or "agent", agent_type=AgentType.PRIMARY))
+        draft.set_conversation(self._conversation(sess))
+        draft.add_limitation(_BASE_LIMITATION)
+
         result = sess.result
         if result is not None:
             if result.num_turns is not None:
-                extra.append(("wardex.agent.num_turns", result.num_turns))
+                draft.set_extra("wardex.agent.num_turns", result.num_turns)
             if result.total_cost_usd is not None:
-                extra.append(("wardex.agent.cost_usd", result.total_cost_usd))
+                draft.set_extra("wardex.agent.cost_usd", result.total_cost_usd)
             if result.duration_api_ms is not None:
-                extra.append(("wardex.agent.api_duration_ms", result.duration_api_ms))
+                draft.set_extra("wardex.agent.api_duration_ms", result.duration_api_ms)
             status = StatusCode.ERROR if result.is_error else StatusCode.OK
             if error is not None:
                 status = StatusCode.ERROR
-                limitations = limitations + ("session_aborted",)
+                draft.add_limitation(Limitation.SESSION_ABORTED)
         elif error is not None:
             status = StatusCode.ERROR
-            limitations = limitations + ("session_aborted",)
+            draft.add_limitation(Limitation.SESSION_ABORTED)
         else:
             status = StatusCode.UNSET
-            limitations = limitations + ("session_aborted",)
+            draft.add_limitation(Limitation.SESSION_ABORTED)
 
-        span = InternalSpan(
-            context=sess.root_ctx,
-            parent_span_id=sess.parentage.parent_span_id,
-            name="invoke_agent",
-            kind=SpanKind.INTERNAL,
-            start_time_ns=sess.start_ns,
-            end_time_ns=now,
-            status=status,
-            agent=AgentAttributes(name=sess.model or "agent", agent_type=AgentType.PRIMARY),
-            conversation=ConversationContext(
-                conversation_id=sess.session_id or "",
-                session_id=sess.session_id or "",
-            ),
-            capture_sources=(CaptureSource.ADAPTER,),
-            capture_integrity=CaptureIntegrity(limitations=limitations),
-            correlation=sess.parentage.correlation,
-            extra=tuple(extra),
-        )
-        self._client.capture_span(span)
+        draft.set_status(status)
+        if status is StatusCode.ERROR:
+            # ERROR requires a type. `error` is the transport-close reason and
+            # `result.is_error` is the CLI's own verdict; naming which of the two
+            # ended the session is the honest low-cardinality answer.
+            draft.set_error("session_error" if error is not None else "agent_error")
+        return draft.finish(now)

@@ -121,7 +121,10 @@ def test_deflate_negotiation_marks_compressed():
     interceptor._on_response_bytes(obj, _frame(True, 0x8, (1000).to_bytes(2, "big")))
     spans = _ws_spans()
     assert len(spans) == 1
-    assert "ws_compressed" in spans[0].capture_integrity.limitations
+    # Census merge (design §6.5.1): `ws_compressed` and `grpc_compressed` folded
+    # into PAYLOAD_COMPRESSED; TransportAttributes.protocol already carries
+    # which protocol it was.
+    assert "payload_compressed" in spans[0].capture_integrity.limitations
 
 
 def test_client_close_error_code_maps_error_status():

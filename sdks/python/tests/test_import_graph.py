@@ -572,10 +572,13 @@ _CS1_DEBT: dict[str, frozenset[str]] = {
     # reads the scope — `assembly.resolve_parentage()`/`child_of()` do both. It
     # still names `InternalSpan` (step 3, SpanDraft) and `SpanContext` (the
     # anchor type it holds per session; step 6, Unit).
+    # Step 3a shrank this by two: `InternalSpan` and `SpanContext` are gone,
+    # because the assembler no longer constructs a span or holds a bare anchor
+    # context — `assembly.SpanDraft` does both, and `draft.context` IS the
+    # anchor. What is left is the `wardex_sdk` package object (`_wardex_native`
+    # for the limits defaults) and `_types` for the typed attribute blocks.
     "adapters/_assembler.py": frozenset(
         {
-            "InternalSpan",
-            "SpanContext",
             _PKG,
             f"{_PKG}._types",
         }
@@ -618,25 +621,14 @@ def test_adapters_do_not_import_span_machinery():
 # hard: I1 is now literally true — one call site in the whole SDK — and the
 # assertion below says so directly instead of tolerating a count.
 
-_CS3_SPAN_BUDGET = {
-    "_tracing.py": 1,
-    "adapters/_assembler.py": 4,
-    "interceptors/_mcp_stdio.py": 1,
-    "interceptors/_seam.py": 2,
-}
-
-# Step 1 lowered `adapters/_assembler.py` 5 -> 4: `_Session` no longer carries a
-# hand-computed `parent_span_id` field, it carries the `Parentage` the core
-# returned. The four that remain are the four `InternalSpan(...)` calls, and
-# each now passes `p.parent_span_id` — a value assembly/ decided — rather than
-# one the emitter worked out. Step 3 removes the keyword itself along with the
-# constructor, which is what empties this budget.
-_CS3_PARENT_BUDGET = {
-    "_tracing.py": 1,
-    "adapters/_assembler.py": 4,
-    "interceptors/_mcp_stdio.py": 1,
-    "interceptors/_seam.py": 2,
-}
+# C-S3 has no budget any more either. Migration step 3a routed all six emit
+# sites through `assembly.SpanDraft`, which drove the four pre-existing
+# `InternalSpan(...)` construction sites (`_tracing.py` 1,
+# `adapters/_assembler.py` 4, `interceptors/_mcp_stdio.py` 1,
+# `interceptors/_seam.py` 2 — nine calls across four files) to zero, and took
+# every `parent_span_id=` keyword outside `assembly/` with them: a draft is
+# built FROM a `Parentage` and fills the field itself. Per this file's header
+# that is the moment the budget is DELETED and the rule becomes hard.
 
 
 def test_trace_id_is_generated_only_in_parentage():
@@ -658,38 +650,37 @@ def test_trace_id_is_generated_only_in_parentage():
 
 
 def test_internal_span_is_constructed_in_one_place():
-    inside = _tally(_constructs_internal_span, under=("assembly/",))
-    assert inside == {}, (
-        f"C-S3: assembly/ constructs InternalSpan at {inside}. Until\n"
-        "assembly/_builder.py lands (migration step 3), the assembly package\n"
-        "resolves parentage and does not build spans.\n\n"
+    """C-S3, now a HARD RULE: exactly one InternalSpan(...) in the whole SDK."""
+    everywhere = _tally(_constructs_internal_span)
+    assert everywhere == {"assembly/_builder.py": 1}, (
+        f"C-S3: InternalSpan is constructed at {everywhere}, expected exactly\n"
+        "{'assembly/_builder.py': 1}.\n\n"
         "WHY: one constructor is what keeps every span carrying correlation,\n"
-        "capture_sources and capture_integrity. Today's two execute_tool\n"
-        "variants differ precisely because they are built in two places."
-    )
-    _assert_within_budget(
-        _tally(_constructs_internal_span),
-        _CS3_SPAN_BUDGET,
-        "C-S3 (InternalSpan constructed outside assembly/_builder.py)",
-        "a second constructor is how spans start disagreeing about which\n"
-        "forensic fields are mandatory. Migration step 3 routes all of these\n"
-        "through assembly.SpanDraft.",
+        "capture_sources and capture_integrity. The two execute_tool variants\n"
+        "this SDK shipped differed precisely because they were built in two\n"
+        "places — one had all three forensic fields and the other had none —\n"
+        "and the span literally named 'chat None' existed because a name was\n"
+        "interpolated at an emit site instead of built by the grammar.\n"
+        "This was a budget over nine pre-existing calls until migration step\n"
+        "3a routed them through assembly.SpanDraft; it is not a budget any\n"
+        "more, so a new site here is a change to make, not a number to raise."
     )
 
 
 def test_parent_span_id_is_passed_only_from_assembly():
-    """C-S3, second half: `parent_span_id=` is assembly/'s keyword.
+    """C-S3, second half, also HARD: `parent_span_id=` is assembly/'s keyword.
 
     Inside assembly/ it is unrestricted — that is where the edge is decided.
     """
-    _assert_within_budget(
-        {k: v for k, v in _tally(_passes_parent_span_id).items() if not k.startswith("assembly/")},
-        _CS3_PARENT_BUDGET,
-        "C-S3 (parent_span_id= outside assembly/)",
-        "a parent edge written outside assembly/ is an edge nobody resolved:\n"
-        "no Evidence, no confidence, no limitation marker when it was a guess\n"
-        "(design I1, I4). Ask assembly.resolve_parentage() for a Parentage and\n"
-        "let it fill the field.",
+    outside = {
+        k: v for k, v in _tally(_passes_parent_span_id).items() if not k.startswith("assembly/")
+    }
+    assert outside == {}, (
+        f"C-S3: parent_span_id= is passed outside assembly/ at {outside}.\n\n"
+        "WHY: a parent edge written outside assembly/ is an edge nobody\n"
+        "resolved: no Evidence, no confidence, no limitation marker when it was\n"
+        "a guess (design I1, I4). Ask assembly.resolve_parentage() for a\n"
+        "Parentage and hand it to SpanDraft, which fills the field itself."
     )
 
 
