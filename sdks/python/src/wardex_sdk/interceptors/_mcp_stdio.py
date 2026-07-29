@@ -19,6 +19,7 @@ import anyio._backends._asyncio as _aio_backend
 
 from .. import _wardex_native
 from .._enums import (
+    CaptureMode,
     CaptureSource,
     Direction,
     Protocol,
@@ -33,7 +34,7 @@ from .._types import (
     TransportAttributes,
     TransportTiming,
 )
-from ..assembly import Ambient, latch_ambient, resolve_parentage
+from ..assembly import Ambient, capture_mode_of, latch_ambient, resolve_parentage, should_capture
 from ..protocol import JsonRpcParser
 from ._base import InterceptorInterface
 
@@ -67,8 +68,20 @@ class _ProcState:
     # at install() time.
     SNIFF_LIMIT = _wardex_native.limits_defaults()["mcp_sniff_bytes"]
 
-    def __init__(self, sniff_limit: int | None = None, limits: object | None = None) -> None:
+    def __init__(
+        self,
+        sniff_limit: int | None = None,
+        limits: object | None = None,
+        mode: CaptureMode = CaptureMode.ALL,
+    ) -> None:
         self._sniff_limit = sniff_limit if sniff_limit is not None else self.SNIFF_LIMIT
+        # The configured capture policy, resolved once at wrap time the way
+        # `_sniff_limit` and the native limits already are (config is frozen
+        # after init). `ALL` is the default for the same reason
+        # `assembly.capture_mode_of(None)` returns it: a state built without a
+        # client has no policy to apply, and an unconfigured wardex filters
+        # nothing.
+        self._mode = mode
         self._req = JsonRpcParser(limits)
         self._resp = JsonRpcParser(limits)
         self._latch: dict[str, _Pending] = {}
@@ -107,6 +120,19 @@ class _ProcState:
                 continue
             pending = self._latch.pop(m.id, None)
             if pending is None:
+                continue
+            # The gate this path never had. `agent_semantic=True` is the claim
+            # the site makes about itself and it is the whole reason MCP stdio
+            # survives `capture_mode=AGENT`: a JSON-RPC tool call over a
+            # subprocess pipe is agent traffic or it is nothing. Stating it as
+            # an ARGUMENT rather than as the absence of a gate is the point —
+            # the answer now comes from the same predicate the byte seams ask,
+            # so a future mode cannot reach three sites and miss this one.
+            if not should_capture(
+                self._mode,
+                parent=pending.ambient.span_context,
+                agent_semantic=True,
+            ):
                 continue
             out.append(_build_mcp_span(pending, m))
         return out
@@ -219,6 +245,7 @@ class McpStdioInterceptor(InterceptorInterface):
         self._asyncio_wrap_count: int = 0  # test-only counter: number of actual asyncio seam wraps
         self._sniff_limit: int = _ProcState.SNIFF_LIMIT
         self._native_limits: Any = None
+        self._mode: CaptureMode = CaptureMode.ALL
 
     def name(self) -> str:
         return "mcp_stdio"
@@ -233,6 +260,7 @@ class McpStdioInterceptor(InterceptorInterface):
         lim = config.limits if config is not None else CaptureLimits()
         self._sniff_limit = lim.resolved()["mcp_sniff_bytes"]
         self._native_limits = lim.to_native()
+        self._mode = capture_mode_of(client)
         try:
             self._orig_backend_desc = _aio_backend.AsyncIOBackend.__dict__["open_process"]
             orig_callable = _aio_backend.AsyncIOBackend.open_process  # bound classmethod
@@ -294,7 +322,7 @@ class McpStdioInterceptor(InterceptorInterface):
     def _wrap_proc(self, proc: Any) -> None:
         if getattr(proc, "stdin", None) is None or getattr(proc, "stdout", None) is None:
             return
-        state = _ProcState(self._sniff_limit, self._native_limits)
+        state = _ProcState(self._sniff_limit, self._native_limits, self._mode)
         client = self._client
         pid = getattr(proc, "pid", None)
         stdin = proc.stdin
@@ -342,7 +370,7 @@ class McpStdioInterceptor(InterceptorInterface):
         self._asyncio_wrap_count += (
             1  # counted when a wrap actually occurs (for verifying the dual-seam guard)
         )
-        state = _ProcState(self._sniff_limit, self._native_limits)
+        state = _ProcState(self._sniff_limit, self._native_limits, self._mode)
         client = self._client
         pid = getattr(proc, "pid", None)
         writer = proc.stdin

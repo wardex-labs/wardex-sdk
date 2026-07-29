@@ -290,6 +290,39 @@ def _constructs_ambient(rel: str, tree: ast.Module):
     return predicate
 
 
+def _reads_capture_mode(rel: str, tree: ast.Module):
+    """Every way a module can reach `config.capture_mode`.
+
+    Two spellings, because the codebase already uses both: the attribute
+    (`client.config.capture_mode`, which is how the seam read it before step 2)
+    and the string (`getattr(config, "capture_mode", None)`, which is how
+    `assembly/_policy.py` reads it now, duck-typed). A rule that saw only the
+    first would be one `getattr` away from meaning nothing.
+
+    The DECLARATION is deliberately not a read: `_config.py`'s
+    `capture_mode: CaptureMode = CaptureMode.AGENT` is an AnnAssign onto a
+    Name, and `init(**config_kwargs)` never names it at all.
+    """
+
+    def predicate(node: ast.AST) -> bool:
+        if isinstance(node, ast.Attribute):
+            return node.attr == "capture_mode"
+        return isinstance(node, ast.Constant) and node.value == "capture_mode"
+
+    return predicate
+
+
+def _defines_a_capture_predicate(rel: str, tree: ast.Module):
+    """`def should_capture` / `def _should_capture`, however it is spelled."""
+
+    def predicate(node: ast.AST) -> bool:
+        return isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.endswith(
+            "should_capture"
+        )
+
+    return predicate
+
+
 def _calls_sink(rel: str, tree: ast.Module):
     def predicate(node: ast.AST) -> bool:
         return (
@@ -688,6 +721,51 @@ def test_ambient_is_latched_not_hand_built():
         "the only remaining way to hand resolve_parentage a parent the scope\n"
         "never held — a framework id dressed as a SpanContext (design I2).\n"
         "Call assembly.latch_ambient() on the task that ISSUES the work.",
+    )
+
+
+# --------------------------------------------------------------------------
+# design §4.4 / §5.1 — one capture gate (HARD RULES from migration step 2)
+# --------------------------------------------------------------------------
+#
+# Both of these are hard from the day they land, and deliberately so. There was
+# never a budget to ratchet here: the drift step 2 closed was not N copies of a
+# helper, it was TWO implementations of one predicate that had silently grown
+# apart (`ByteSeamInterceptor._should_capture` and the `RawSocketInterceptor`
+# override that replaced it). A budget of 2 would have been a licence to keep
+# them.
+
+
+def test_the_capture_mode_is_read_in_one_place():
+    """The configured policy is consulted only by the module that owns it."""
+    everywhere = _tally(_reads_capture_mode)
+    assert everywhere == {"assembly/_policy.py": 1}, (
+        f"capture_mode is read at {everywhere}, expected exactly\n"
+        "{'assembly/_policy.py': 1}.\n\n"
+        "WHY: a second reader is a second policy. That is not hypothetical —\n"
+        "`interceptors/_socket.py` overrode the gate without ever reading the\n"
+        "mode, so `capture_mode=ALL` did nothing on the plaintext seam and a\n"
+        "plaintext request inside a live wardex span was dropped while the same\n"
+        "bytes over TLS were kept. Neither was decided by anyone; both are what\n"
+        "'the same rule, written twice' looks like later (design §4.4).\n"
+        "A seam with an opinion about a CONNECTION returns a Prefilter; a seam\n"
+        "with an opinion about the POLICY is a bug being written."
+    )
+
+
+def test_the_capture_predicate_has_one_implementation_and_one_composition():
+    everywhere = _tally(_defines_a_capture_predicate)
+    assert everywhere == {"assembly/_policy.py": 1, "interceptors/_seam.py": 1}, (
+        f"capture predicates are defined at {everywhere}, expected exactly\n"
+        "{'assembly/_policy.py': 1, 'interceptors/_seam.py': 1}.\n\n"
+        "WHY: those two are different jobs and the rule names both so that\n"
+        "neither can quietly become the other. `assembly._policy.should_capture`\n"
+        "IS the policy. `ByteSeamInterceptor._should_capture` composes it with\n"
+        "the seam's `_transport_prefilter` and fails open around the semantic\n"
+        "parse — it decides nothing itself (design §4.4).\n"
+        "A third entry is an override, and an override is how this diverged the\n"
+        "first time. Override `_transport_prefilter` instead: that is the hook\n"
+        "for 'this seam knows something about this connection'."
     )
 
 

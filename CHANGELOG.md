@@ -38,6 +38,24 @@ All notable changes to this project are documented here. The format follows
 - Emitted spans now carry the trace's `trace_flags` on their span context
   rather than a hardcoded `0`. This is not visible on the wire yet: the OTLP
   span message has no flags field today.
+- The plaintext (non-TLS) seam now obeys `capture_mode`, which it previously
+  ignored. Two consequences, both of which mean MORE spans on that seam.
+  `capture_mode=CaptureMode.ALL` now captures plaintext HTTP; it used to mean
+  "everything except plaintext HTTP", so a user who asked for everything
+  silently did not get it. And plaintext traffic issued inside a live wardex
+  span (a `wardex.span()`, an adapter's `execute_tool` span) is now captured
+  the way the identical request over TLS always was — the two seams used to
+  disagree about the same bytes. Link-local addresses are still never
+  captured, and an `intercept_hosts` allowlist match still bypasses the mode
+  entirely. If the extra plaintext spans are unwanted, the lever is the same
+  one it always was: leave `capture_mode` at its `AGENT` default and do not
+  wrap the calls in a wardex span.
+- A `capture_mode` the SDK cannot read now falls back to the `agent` default
+  instead of to `all`. The field is typed `CaptureMode` and is not validated,
+  so a value like the string `"agent"` is accepted in silence; it previously
+  fell through to the `agent` policy by accident, and only "wardex is not
+  configured at all" ever meant "filter nothing". That is now what the code
+  says. Nothing changes for a `capture_mode` set to a `CaptureMode` member.
 
 ## [0.2.0b1] - 2026-07-28
 

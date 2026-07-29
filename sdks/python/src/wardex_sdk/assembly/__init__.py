@@ -16,11 +16,12 @@ name to call.
 
 Migration status (design §11): step 0 landed `_parentage`, `_diag` and the
 `Limitation` enum; step 1 wired the six parentage sites onto `resolve_parentage`
-/ `child_of`, so `_parentage` is live on every span the SDK emits. `_diag.guard`
-still has no caller outside this package — `interceptors/` and `adapters/` adopt
-it with the seam decomposition. `_units`, `_builder`, `_vocab`, `_policy`,
-`_emit`, `_snapshot` and `_patchset` arrive in later steps; `__all__` grows with
-them and does not shrink.
+/ `child_of`, so `_parentage` is live on every span the SDK emits; step 2 landed
+`_policy`, so the capture gate has one implementation and the byte seams compose
+with it instead of overriding it. `_diag.guard` still has no caller outside this
+package — `interceptors/` and `adapters/` adopt it with the seam decomposition.
+`_units`, `_builder`, `_vocab`, `_emit`, `_snapshot` and `_patchset` arrive in
+later steps; `__all__` grows with them and does not shrink.
 """
 
 from ._diag import Counters, counters, guard
@@ -36,6 +37,7 @@ from ._parentage import (
     latch_ambient,
     resolve_parentage,
 )
+from ._policy import Prefilter, capture_mode_of, should_capture
 
 __all__ = [
     "AMBIENT",
@@ -46,9 +48,12 @@ __all__ = [
     "Limitation",
     "ParentSource",
     "Parentage",
+    "Prefilter",
+    "capture_mode_of",
     "child_of",
     "counters",
     "guard",
     "latch_ambient",
     "resolve_parentage",
+    "should_capture",
 ]

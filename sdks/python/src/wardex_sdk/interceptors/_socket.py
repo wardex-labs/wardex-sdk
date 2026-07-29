@@ -1,7 +1,13 @@
 """Plaintext raw-socket interceptor — monkeypatches socket.socket.
 
-Tracks only HTTP via a method sniff-latch, hard-excludes link-local addresses,
-and emits LLM-only (+ allowlist). Reuses the existing _Http1Tracker/_WebSocketTracker.
+Tracks only HTTP via a method sniff-latch. What it captures is not this seam's
+decision: it contributes a `Prefilter` about the CONNECTION — link-local
+addresses (cloud metadata) are hard-excluded whatever the mode says, an
+explicit `intercept_hosts` match bypasses the mode — and everything else defers
+to the one shared policy in `assembly._policy`, the same rule the TLS seam
+answers to. Under the `agent` default that is LLM-semantic traffic plus
+anything issued inside a live local wardex span; under `all` it is everything.
+Reuses the existing _Http1Tracker/_WebSocketTracker.
 h2c and uvloop async are not supported.
 SSLSocket is a subclass of socket.socket but implements its own send/recv, so
 this patch does not double-capture TLS application data (regression-safe).
@@ -14,8 +20,9 @@ import socket
 from typing import TYPE_CHECKING, Any
 
 from .._enums import CaptureSource
+from ..assembly import Prefilter
 from ._conn_timing import install_shared_timing, shared_timing_store, uninstall_shared_timing
-from ._seam import ByteSeamInterceptor, _ConnectionState, _has_core_semantics
+from ._seam import ByteSeamInterceptor, _ConnectionState
 from ._trackers import _Http1Tracker, _Http2Tracker
 
 if TYPE_CHECKING:
@@ -133,20 +140,34 @@ class RawSocketInterceptor(ByteSeamInterceptor):
                 st.gate = "ignore"  # non-HTTP protocols such as Redis, Memcached, etc.
         return st.gate in ("http", "h2c")
 
-    def _should_capture(self, st: _ConnectionState, txn: Any, sem: Any) -> bool:
-        # Deliberate decision: an explicit `intercept_hosts` allowlist match bypasses
-        # the 4c `capture_mode` policy gate (which normally requires an active local
-        # span for non-LLM-semantic traffic — see _seam.py._emit_span). The user
-        # naming a plaintext host here is a stronger, more specific opt-in than the
-        # global capture_mode default; composing both gates would silently drop
-        # traffic the user explicitly asked to capture. This only applies to hosts
-        # the user listed by hand — it does not widen capture_mode=AGENT for anyone
-        # else.
+    def _transport_prefilter(self, st: _ConnectionState) -> Prefilter:
+        """What this seam knows about the PEER, and nothing beyond it.
+
+        Two opinions, both about the connection rather than the traffic on it:
+
+        DENY — link-local (cloud metadata endpoints). Never captured, whatever
+        the mode says, because the bodies carry instance credentials.
+
+        ALLOW — an explicit `intercept_hosts` match. The user naming a
+        plaintext host by hand is a stronger, more specific opt-in than the
+        global `capture_mode` default, so it stays a bypass rather than
+        composing; composing it would silently drop traffic the user asked for
+        by name. This only ever applies to hosts listed by hand.
+
+        Everything else DEFERs, and that is the change. This method used to be
+        `_should_capture`, overriding the base outright, which meant the
+        plaintext seam re-implemented the LLM-semantics clause (fine) and
+        silently dropped BOTH of the other two: `capture_mode=ALL` did nothing
+        here, and a plaintext request issued inside a live wardex span was
+        dropped while the identical request over TLS was captured. Deferring
+        gives the shared policy back both clauses without giving up either
+        opinion above.
+        """
         if _is_link_local(st.server_address):
-            return False
-        if sem is not None and _has_core_semantics(sem):
-            return True
-        return self._in_allow(st)  # the allowlist is populated in Task 4
+            return Prefilter.DENY
+        if self._in_allow(st):
+            return Prefilter.ALLOW
+        return Prefilter.DEFER
 
     def _in_allow(self, st: _ConnectionState) -> bool:
         if not self._allow:

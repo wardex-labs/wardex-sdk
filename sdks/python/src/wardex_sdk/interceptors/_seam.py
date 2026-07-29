@@ -13,7 +13,6 @@ from abc import abstractmethod
 from typing import TYPE_CHECKING, Any
 
 from .._enums import (
-    CaptureMode,
     CaptureSource,
     Direction,
     OperationName,
@@ -31,7 +30,13 @@ from .._types import (
     TransportAttributes,
     TransportTiming,
 )
-from ..assembly import Ambient, resolve_parentage
+from ..assembly import (
+    Ambient,
+    Prefilter,
+    capture_mode_of,
+    resolve_parentage,
+    should_capture,
+)
 from ..protocol import grpc_status_name, parse_grpc_frames, parse_llm_semantics
 from ._base import InterceptorInterface
 from ._trackers import _Txn, _WebSocketTracker
@@ -99,25 +104,41 @@ class ByteSeamInterceptor(InterceptorInterface):
     def _gate(self, st: _ConnectionState, data: bytes, phase: str) -> bool:
         return True
 
-    def _should_capture(self, st: _ConnectionState, txn: Any, sem: Any) -> bool:
-        """Capture-policy gate (Phase 4c, design §5.1).
+    def _transport_prefilter(self, st: _ConnectionState) -> Prefilter:
+        """This seam's opinion about the connection itself, before the policy.
 
-        AGENT (default): LLM-semantic traffic always; anything else only when
-        the tracker latched a *local* wardex span as parent. Remote-only
-        context (a joined trace with no local span) does not open the gate —
-        service meshes attach traceparent to every request, and that must not
-        resurrect the firehose. Fails open: losing data is worse than noise.
+        `DEFER` is the base answer, and it is the honest one for a TLS seam: it
+        knows nothing about the peer that `assembly.should_capture` does not
+        already know better. A seam that DOES know something — the plaintext
+        socket seam, which must never read a link-local metadata endpoint and
+        must always honour `intercept_hosts` — overrides this, and only this.
+        Overriding `_should_capture` itself is what produced the two bugs
+        design §4.4 names.
+        """
+        return Prefilter.DEFER
+
+    def _should_capture(self, st: _ConnectionState, txn: Any, sem: Any) -> bool:
+        """Compose this seam's transport prefilter with the one shared policy.
+
+        The policy itself lives in `assembly._policy` and is asked here, at the
+        single point where both halves are known. Failing open around it is
+        this method's job rather than the policy's: `_has_core_semantics` runs
+        parser output through host-supplied objects and can raise, while
+        `should_capture` cannot — so the swallow stays where the risk is.
         """
         try:
-            client = self._client
-            if client is None or client.config.capture_mode is CaptureMode.ALL:
+            pre = self._transport_prefilter(st)
+            if pre is Prefilter.DENY:
+                return False
+            if pre is Prefilter.ALLOW:
                 return True
-            if sem is not None and _has_core_semantics(sem):
-                return True
-            parent = getattr(txn, "parent", None)
-            return parent is not None and not getattr(parent, "is_remote", False)
+            return should_capture(
+                capture_mode_of(self._client),
+                parent=getattr(txn, "parent", None),
+                agent_semantic=sem is not None and _has_core_semantics(sem),
+            )
         except Exception:
-            return True
+            return True  # losing data is worse than noise (design §5.1)
 
     def _capture_source(self) -> CaptureSource:
         return CaptureSource.SSL
@@ -209,16 +230,62 @@ class ByteSeamInterceptor(InterceptorInterface):
             else:
                 self._emit_span(obj, st, txn)
 
+    def _parse_semantics(self, url_host: str, txn: _Txn) -> Any:
+        """LLM semantics for this transaction, or None. Pure — no seam state.
+
+        Split out of `_emit_span` because the gate needs its answer: whether a
+        transaction is agent traffic is one of the policy's three inputs, so
+        the parse has to happen before the gate can run. It is safe there
+        precisely because it is pure — it reads bodies the tracker already
+        buffered and touches nothing on the connection.
+        """
+        try:
+            # The resolved limits must travel with the call: the semantic
+            # parser bounds decompression by max_decoded_bytes, and omitting
+            # them here would silently run on the core default.
+            return parse_llm_semantics(
+                url_host,
+                txn.path,
+                txn.request_body,
+                txn.response_body,
+                self._native_limits,
+            )
+        except Exception:
+            return None
+
     def _emit_span(self, obj: Any, st: _ConnectionState, txn: _Txn) -> None:
         if self._client is None:
             return
+        url_host = getattr(obj, "server_hostname", None) or st.server_address
+
+        ct = txn.content_type or ""
+        # gRPC: skip LLM semantic extraction (protobuf isn't LLM JSON).
+        is_grpc = ct.startswith("application/grpc") and not ct.startswith("application/grpc-web")
+        sem: Any = None if is_grpc else self._parse_semantics(url_host, txn)
+
+        # ABOVE the gate on purpose, and it must stay there. `_resolve_timing`
+        # is DESTRUCTIVE — it sets `st.timing_consumed` and pops this
+        # connection's record out of the shared store (`_ssl.py`, `_socket.py`)
+        # — and the fact it encodes is "was this the FIRST transaction on this
+        # connection", which is what `connection_reused` means (span.proto:
+        # "whether the connection was reused via pooling"). Move it below the
+        # gate and "first" silently becomes "first CAPTURED", so on a keep-alive
+        # connection whose first request was dropped, the next request — one
+        # that reused an established socket and paid no connect or handshake —
+        # reports the previous request's `tcp_connect_ms` with
+        # `connection_reused=False`. Both are false, and a present span with a
+        # false measurement is worse than a connect cost nobody claims.
+        # Running it for a dropped transaction also keeps that connection's slot
+        # from sitting in the FIFO-capped store until eviction.
+        connect_ms, handshake_ms, reused, limitations = self._resolve_timing(obj, st)
+
+        if not self._should_capture(st, txn, sem):
+            return
+
         p = resolve_parentage(_latched(txn))
         ctx = p.child_context()
-        url_host = getattr(obj, "server_hostname", None) or st.server_address
         url = f"{self._url_scheme(False)}://{url_host}:{st.server_port}{txn.path}"
         transfer = max(0.0, (txn.end_ns - txn.start_ns) / 1e6 - txn.ttfb_ms)
-
-        connect_ms, handshake_ms, reused, limitations = self._resolve_timing(obj, st)
 
         # Markers the protocol parser attached to the transaction (a body that
         # hit its cap, say). CaptureIntegrity.limitations is where a user reads
@@ -230,7 +297,6 @@ class ByteSeamInterceptor(InterceptorInterface):
 
         # Default values for common span fields (HTTP path). If gRPC, _build_grpc_fields
         # overrides them.
-        sem: Any = None
         gen_ai = None
         output_data = txn.response_body
         name = f"HTTP {txn.method} {txn.path}"
@@ -240,33 +306,17 @@ class ByteSeamInterceptor(InterceptorInterface):
             ("network.protocol.version", txn.version),
         )
 
-        ct = txn.content_type or ""
         if ct.startswith("application/grpc-web"):
             # grpc-web uses different framing and is unsupported — leave it as plain h2 but mark it.
             limitations = limitations + ("grpc_web_unsupported",)
 
-        is_grpc = ct.startswith("application/grpc") and not ct.startswith("application/grpc-web")
-
         if is_grpc:
-            # gRPC: skip LLM semantic extraction (protobuf isn't LLM JSON), assemble gRPC fields.
+            # gRPC fields; `sem` is already None (see the parse above).
             name, status_code, error_type, extra, limitations = _build_grpc_fields(
                 txn, extra, limitations
             )
         else:
-            # --- LLM semantic extraction (body parser) ---
-            try:
-                # The resolved limits must travel with the call: the semantic
-                # parser bounds decompression by max_decoded_bytes, and
-                # omitting them here would silently run on the core default.
-                sem = parse_llm_semantics(
-                    url_host,
-                    txn.path,
-                    txn.request_body,
-                    txn.response_body,
-                    self._native_limits,
-                )
-            except Exception:
-                sem = None
+            # --- LLM semantics (parsed above the gate) ---
             if sem is not None:
                 if sem.decoded_response is not None:
                     output_data = bytes(sem.decoded_response)
@@ -330,8 +380,6 @@ class ByteSeamInterceptor(InterceptorInterface):
             truncated=txn.truncated,
             limitations=limitations,
         )
-        if not self._should_capture(st, txn, sem):
-            return
         span = InternalSpan(
             context=ctx,
             parent_span_id=p.parent_span_id,
@@ -357,6 +405,11 @@ class ByteSeamInterceptor(InterceptorInterface):
     def _emit_ws(self, st: _ConnectionState, txn: _Txn) -> None:
         if self._client is None:
             return
+        # `agent_semantic=False`: a WS session carries no parsed LLM semantics
+        # (`sem` is None on this path by construction), so it is captured only
+        # under ALL, an allowlisted host, or a live local span.
+        if not self._should_capture(st, txn, None):
+            return
         p = resolve_parentage(_latched(txn))
         ctx = p.child_context()
 
@@ -378,9 +431,6 @@ class ByteSeamInterceptor(InterceptorInterface):
         )
         if code is not None:
             extra = extra + (("ws.close_code", code),)
-
-        if not self._should_capture(st, txn, None):
-            return
 
         timing = TransportTiming(
             tcp_connect_ms=0.0,
