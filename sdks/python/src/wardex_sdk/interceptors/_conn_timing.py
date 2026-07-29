@@ -18,6 +18,7 @@ from contextvars import ContextVar
 from typing import Any
 
 from .. import _wardex_native
+from ..assembly import PatchSet
 
 # ContextVar that carries the timing record the async probe stamps onto the SSLObject
 _establishing: ContextVar[_TimingRecord | None] = ContextVar("_wardex_establishing", default=None)
@@ -102,7 +103,7 @@ class ConnTimingProbe:
 
     def __init__(self, store: ConnTimingStore) -> None:
         self._store = store
-        self._orig: dict[tuple[type, str], Any] = {}
+        self._patches = PatchSet("interceptors.conn_timing")
         self._installed = False
 
     def install(self) -> None:
@@ -125,15 +126,11 @@ class ConnTimingProbe:
     def uninstall(self) -> None:
         if not self._installed:
             return
-        for (cls, attr), orig in self._orig.items():
-            setattr(cls, attr, orig)
-        self._orig.clear()
+        self._patches.restore_all()
         self._installed = False
 
     def _patch(self, cls: type, attr: str, make_wrapper: Any) -> None:
-        orig = getattr(cls, attr)
-        self._orig[(cls, attr)] = orig
-        setattr(cls, attr, make_wrapper(orig))
+        self._patches.patch(cls, attr, make_wrapper(getattr(cls, attr)))
 
     def _mk_connect(self, orig: Any):  # noqa: ANN202
         store = self._store

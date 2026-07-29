@@ -22,9 +22,12 @@ step 3a landed `_vocab`, `_builder` and `_snapshot`, so the same six sites now
 also share one span CONSTRUCTOR and one closed vocabulary — `InternalSpan(...)`
 appears nowhere outside `_types.py` and `_builder.py`, and `guard()` finally has
 callers outside this package (every draft is built inside one, because
-`finish()` throws on a vocabulary breach and I6 forbids that reaching the host).
-`_units`, `_emit` and `_patchset` arrive in later steps; `__all__` grows with
-them and does not shrink.
+`finish()` throws on a vocabulary breach and I6 forbids that reaching the host);
+step 5 landed `_patchset`, so the six hand-rolled monkeypatch dictionaries are
+one mechanism whose uninstall is identity-checked, LIFO and individually
+guarded — and `Limitation.PATCH_SUPERSEDED` has an emitter for the first time.
+`_units` and `_emit` arrive in later steps; `__all__` grows with them and does
+not shrink.
 """
 
 from ._builder import IntegrityBuilder, SpanDraft
@@ -41,6 +44,7 @@ from ._parentage import (
     latch_ambient,
     resolve_parentage,
 )
+from ._patchset import PatchSet
 from ._policy import Prefilter, capture_mode_of, should_capture
 from ._snapshot import SnapshotDraft
 from ._vocab import (
@@ -66,6 +70,7 @@ __all__ = [
     "LinkReason",
     "ParentSource",
     "Parentage",
+    "PatchSet",
     "Prefilter",
     "SnapshotDraft",
     "SnapshotType",

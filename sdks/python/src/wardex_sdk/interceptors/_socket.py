@@ -66,22 +66,23 @@ class RawSocketInterceptor(ByteSeamInterceptor):
             return
         self._client = client
         self._load_limits(client)
-        # base _patch uses the key f"{cls.__name__}.{meth}".
-        # socket.socket.__name__ == "socket" → keys become "socket.send", etc.
-        self._patch(socket.socket, "send", self._mk_send("send"))
-        self._patch(socket.socket, "sendall", self._mk_sendall())
-        self._patch(socket.socket, "recv", self._mk_recv("recv"))
-        self._patch(socket.socket, "recv_into", self._mk_recv_into())
+        self._patches = self._fresh_patchset()
+        # Each wrapper closes over the original it replaces, rather than looking
+        # it up per call in a dict the uninstall clears — that dict is how a
+        # wrapper another library still holds raised `KeyError` into the host
+        # after `uninstall()`.
+        sock = socket.socket
+        self._patches.patch(sock, "send", self._mk_send(sock.send))
+        self._patches.patch(sock, "sendall", self._mk_sendall(sock.sendall))
+        self._patches.patch(sock, "recv", self._mk_recv(sock.recv))
+        self._patches.patch(sock, "recv_into", self._mk_recv_into(sock.recv_into))
         install_shared_timing(self._limits["max_connections"])
         self._installed = True
 
     def uninstall(self) -> None:
         if not self._installed:
             return
-        for key, fn in self._orig.items():
-            _, meth = key.split(".", 1)
-            setattr(socket.socket, meth, fn)
-        self._orig.clear()
+        self._patches.restore_all()
         uninstall_shared_timing()
         from ._trackers import _WebSocketTracker
 
@@ -177,13 +178,10 @@ class RawSocketInterceptor(ByteSeamInterceptor):
             or f"{st.server_address}:{st.server_port}" in self._allow
         )
 
-    # --- socket.socket wrappers (base_patch key = "socket.<meth>") ---
+    # --- socket.socket wrappers ---
 
-    def _mk_send(self, meth: str):  # noqa: ANN202
-        key = f"socket.{meth}"
-
+    def _mk_send(self, real: Any):  # noqa: ANN202
         def wrapper(this: Any, data: Any, *args: Any, **kwargs: Any) -> Any:
-            real = self._orig[key]
             ret = real(this, data, *args, **kwargs)
             try:
                 sent = bytes(data)[:ret] if isinstance(ret, int) else data
@@ -194,9 +192,8 @@ class RawSocketInterceptor(ByteSeamInterceptor):
 
         return wrapper
 
-    def _mk_sendall(self):  # noqa: ANN202
+    def _mk_sendall(self, real: Any):  # noqa: ANN202
         def wrapper(this: Any, data: Any, *args: Any, **kwargs: Any) -> Any:
-            real = self._orig["socket.sendall"]
             ret = real(this, data, *args, **kwargs)
             try:
                 self._on_request_bytes(this, bytes(data))
@@ -206,11 +203,8 @@ class RawSocketInterceptor(ByteSeamInterceptor):
 
         return wrapper
 
-    def _mk_recv(self, meth: str):  # noqa: ANN202
-        key = f"socket.{meth}"
-
+    def _mk_recv(self, real: Any):  # noqa: ANN202
         def wrapper(this: Any, *args: Any, **kwargs: Any) -> Any:
-            real = self._orig[key]
             ret = real(this, *args, **kwargs)
             try:
                 if isinstance(ret, (bytes, bytearray)) and ret:
@@ -221,9 +215,8 @@ class RawSocketInterceptor(ByteSeamInterceptor):
 
         return wrapper
 
-    def _mk_recv_into(self):  # noqa: ANN202
+    def _mk_recv_into(self, real: Any):  # noqa: ANN202
         def wrapper(this: Any, buffer: Any, *args: Any, **kwargs: Any) -> int:
-            real = self._orig["socket.recv_into"]
             n = real(this, buffer, *args, **kwargs)
             try:
                 if n:

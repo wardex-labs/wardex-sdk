@@ -868,7 +868,15 @@ _CS4_BUDGET = {
     "adapters/_anthropic_agent_sdk.py": 14,
     "adapters/_assembler.py": 2,
     "interceptors/_conn_timing.py": 10,
-    "interceptors/_mcp_stdio.py": 13,
+    # 13 -> 7 at step 5. The six that went are the ones the patch mechanism made
+    # unnecessary: two `except Exception: self._orig_* = None` around install,
+    # two `except Exception: pass` around the uninstall `setattr`s (all four
+    # replaced by `PatchSet`, whose restore is guarded per patch), and the two
+    # fail-silent wrappers around `_wrap_proc`/`_wrap_asyncio_proc`, which are
+    # now `guard()` blocks. Lowered in the same commit rather than left stale:
+    # `_assert_within_budget` only fails on `actual > budget`, so a number left
+    # high is a free slot for a brand-new silent swallow that no test notices.
+    "interceptors/_mcp_stdio.py": 7,
     # 5 -> 4 at step 4, and the line below is where the fifth went. Extracting
     # `build_grpc_fields` into `semantics/` took its `except Exception:` with it.
     # Leaving this at 5 would have handed the seam a free slot for a BRAND NEW

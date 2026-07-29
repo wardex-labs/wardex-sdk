@@ -14,6 +14,7 @@ import sys
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
+from ..assembly import PatchSet
 from ._assembler import SessionAssembler
 from ._base import AdapterInterface
 
@@ -105,7 +106,7 @@ def _wrap_sdk_tool(sdk_tool: Any, wrapped_names: set[str]) -> Any:
 class AnthropicAgentSdkAdapter(AdapterInterface):
     def __init__(self) -> None:
         self._client: Client | None = None
-        self._originals: dict[str, Any] = {}
+        self._patches = PatchSet("adapters.anthropic_agent_sdk")
         self._installed = False
         self._assembler: SessionAssembler | None = None
         # Tool names wrapped by the in-process capture gate (Step 2); the
@@ -151,17 +152,24 @@ class AnthropicAgentSdkAdapter(AdapterInterface):
             return
         self._client = client
         adapter = self
-
-        # (1) default path: tee SubprocessCLITransport at class level
-        cls = subprocess_cli.SubprocessCLITransport
-        self._originals["write"] = cls.write
-        self._originals["read_messages"] = cls.read_messages
-        self._originals["close"] = cls.close
-        orig_write, orig_read, orig_close = (
-            self._originals["write"],
-            self._originals["read_messages"],
-            self._originals["close"],
+        self._patches = PatchSet(
+            "adapters.anthropic_agent_sdk",
+            debug=bool(getattr(getattr(client, "config", None), "debug", False)),
         )
+
+        # (1) default path: tee SubprocessCLITransport at CLASS level.
+        #
+        # These stay class patches, and the reason is that this adapter never
+        # holds a transport instance at patch time. `install()` runs before any
+        # session exists, and the SDK builds its own `SubprocessCLITransport`
+        # inside `ClaudeSDKClient.connect()` / `InternalClient.process_query()`
+        # — neither of which hands it back to anything wardex wraps. The one
+        # transport the adapter DOES receive is the user's own, passed to
+        # `query(transport=...)` or `ClaudeSDKClient(transport=...)`, and that
+        # one is not patched at all: it is wrapped in `_TransportTee`, which
+        # leaves the host's object untouched.
+        cls = subprocess_cli.SubprocessCLITransport
+        orig_write, orig_read, orig_close = cls.write, cls.read_messages, cls.close
 
         async def write(self, data):  # noqa: ANN001
             try:
@@ -197,13 +205,12 @@ class AnthropicAgentSdkAdapter(AdapterInterface):
                 pass
             return await orig_close(self)
 
-        cls.write = write
-        cls.read_messages = read_messages
-        cls.close = close
+        self._patches.patch(cls, "write", write)
+        self._patches.patch(cls, "read_messages", read_messages)
+        self._patches.patch(cls, "close", close)
 
         # (2) custom-transport path + hook merge: wrap public entry points
-        self._originals["query"] = sdk.query
-        orig_query = self._originals["query"]
+        orig_query = sdk.query
 
         def query(*, prompt, options=None, transport=None, **kwargs):  # noqa: ANN001
             try:
@@ -215,10 +222,9 @@ class AnthropicAgentSdkAdapter(AdapterInterface):
             return orig_query(prompt=prompt, options=options, transport=transport, **kwargs)
 
         query.__wrapped__ = orig_query
-        sdk.query = query
+        self._patches.patch(sdk, "query", query)
 
-        self._originals["client_init"] = sdk.ClaudeSDKClient.__init__
-        orig_client_init = self._originals["client_init"]
+        orig_client_init = sdk.ClaudeSDKClient.__init__
 
         def client_init(client_self, options=None, transport=None, **kwargs):  # noqa: ANN001
             try:
@@ -229,14 +235,13 @@ class AnthropicAgentSdkAdapter(AdapterInterface):
                 pass
             orig_client_init(client_self, options=options, transport=transport, **kwargs)
 
-        sdk.ClaudeSDKClient.__init__ = client_init
+        self._patches.patch(sdk.ClaudeSDKClient, "__init__", client_init)
 
         # (3) in-process custom tools: wrap handlers so execution runs inside a
         # wardex execute_tool span — this opens the capture_mode="agent" gate
         # for any outbound HTTP the tool performs in-process.
         if hasattr(sdk, "create_sdk_mcp_server"):
-            self._originals["create_sdk_mcp_server"] = sdk.create_sdk_mcp_server
-            orig_create = self._originals["create_sdk_mcp_server"]
+            orig_create = sdk.create_sdk_mcp_server
             wrapped_tool_names = self._wrapped_tool_names  # set[str], init in __init__
 
             def create_sdk_mcp_server(name, version="1.0.0", tools=None, **kwargs):  # noqa: ANN001
@@ -247,7 +252,7 @@ class AnthropicAgentSdkAdapter(AdapterInterface):
                     pass
                 return orig_create(name=name, version=version, tools=tools, **kwargs)
 
-            sdk.create_sdk_mcp_server = create_sdk_mcp_server
+            self._patches.patch(sdk, "create_sdk_mcp_server", create_sdk_mcp_server)
 
         from .._limits import CaptureLimits
 
@@ -265,18 +270,11 @@ class AnthropicAgentSdkAdapter(AdapterInterface):
     def uninstall(self) -> None:
         if not self._installed:
             return
-        import claude_agent_sdk as sdk
-        from claude_agent_sdk._internal.transport import subprocess_cli
-
-        cls = subprocess_cli.SubprocessCLITransport
-        cls.write = self._originals["write"]
-        cls.read_messages = self._originals["read_messages"]
-        cls.close = self._originals["close"]
-        sdk.query = self._originals["query"]
-        sdk.ClaudeSDKClient.__init__ = self._originals["client_init"]
-        if "create_sdk_mcp_server" in self._originals:
-            sdk.create_sdk_mcp_server = self._originals["create_sdk_mcp_server"]
-        self._originals.clear()
+        # No re-import and no key lookups: the PatchSet holds the targets it
+        # patched. The old form re-imported `claude_agent_sdk` here and indexed
+        # `self._originals` by hand, so an install that had patched only some of
+        # the surface raised `KeyError` out of `uninstall()` — into the host.
+        self._patches.restore_all()
         self._wrapped_tool_names.clear()
         self._assembler = None
         self._installed = False

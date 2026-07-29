@@ -98,6 +98,7 @@ _MEMBER_SITES: dict[str, frozenset[str]] = {
     "PARENT_UNRESOLVED": frozenset({"assembly/_parentage.py"}),
     "UNIT_INFERRED_SOLE": frozenset({"assembly/_parentage.py"}),
     "SNAPSHOT_TYPE_UNKNOWN": frozenset({"assembly/_snapshot.py"}),
+    "PATCH_SUPERSEDED": frozenset({"assembly/_patchset.py"}),
     # --- transport timing ---
     "CONNECT_TIMING_UNAVAILABLE": frozenset({"interceptors/_socket.py", "interceptors/_ssl.py"}),
     "TTFT_UNAVAILABLE_H2": frozenset({"interceptors/_seam.py"}),
@@ -293,6 +294,12 @@ _EMITTED_MEMBERS: frozenset[str] = frozenset(
         # legitimate way this set grows — a member moving from "declared" to
         # "emitted" — as opposed to the migration, which never changes it.
         "SNAPSHOT_TYPE_UNKNOWN",
+        # step 0's, whose emitter step 5 BUILT: `assembly/_patchset.py` is the
+        # SDK's one patch mechanism, and its identity-checked restore is the
+        # first code able to observe that something else re-patched a symbol
+        # wardex had patched. The second member to move from "declared" to
+        # "emitted" by gaining a NEW emitter rather than a renamed one.
+        "PATCH_SUPERSEDED",
         # step 0's, whose emitter is the _parentage.py _MARKER table. A source
         # reference and a live caller are not the same thing and this set keeps
         # them apart: since step 1 wired `capture_state_snapshot`,

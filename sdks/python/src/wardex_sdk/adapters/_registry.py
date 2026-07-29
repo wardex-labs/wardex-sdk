@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from ..assembly import guard
 from ._base import AdapterInterface
 
 if TYPE_CHECKING:
@@ -22,9 +23,21 @@ class AdapterRegistry:
         self._installed[name] = adapter
 
     def uninstall_all(self) -> None:
-        for adapter in self._installed.values():
-            adapter.uninstall()
-        self._installed.clear()
+        """Uninstall every adapter. Total: one failure cannot stop the rest.
+
+        Same rule as `InterceptorRegistry.uninstall_all`, and the same reason:
+        this loop runs inside `_lifecycle._teardown`, immediately before
+        `client.close()`. An adapter whose `uninstall()` raised took the close
+        with it and every span still in the buffer, left `_installed`
+        populated so the next `init()` silently no-ops for that adapter by
+        name, and did it from `atexit`, where nothing reports the exception.
+        Pop-then-uninstall so a failure is neither retried nor double-counted.
+        """
+        while self._installed:
+            name = next(iter(self._installed))
+            adapter = self._installed.pop(name)
+            with guard(f"adapters.{name}.uninstall"):
+                adapter.uninstall()
 
     def is_installed(self, name: str) -> bool:
         return name in self._installed

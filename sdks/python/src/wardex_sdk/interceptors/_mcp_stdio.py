@@ -35,6 +35,7 @@ from .._types import (
 )
 from ..assembly import (
     Ambient,
+    PatchSet,
     SpanDraft,
     TransportLabel,
     capture_mode_of,
@@ -292,8 +293,7 @@ class McpStdioInterceptor(InterceptorInterface):
     def __init__(self) -> None:
         self._client: Client | None = None
         self._installed = False
-        self._orig_backend_desc: Any = None  # original classmethod descriptor (for restoration)
-        self._orig_cse: Any = None  # original asyncio.create_subprocess_exec
+        self._patches = PatchSet("interceptors.mcp_stdio")
         self._asyncio_wrap_count: int = 0  # test-only counter: number of actual asyncio seam wraps
         self._sniff_limit: int = _ProcState.SNIFF_LIMIT
         self._native_limits: Any = None
@@ -315,8 +315,14 @@ class McpStdioInterceptor(InterceptorInterface):
         self._native_limits = lim.to_native()
         self._mode = capture_mode_of(client)
         self._debug = bool(getattr(config, "debug", False))
-        try:
-            self._orig_backend_desc = _aio_backend.AsyncIOBackend.__dict__["open_process"]
+        self._patches = PatchSet("interceptors.mcp_stdio", debug=self._debug)
+
+        # `patch()` records `AsyncIOBackend.__dict__["open_process"]` — the raw
+        # classmethod DESCRIPTOR, not the bound callable `getattr` would hand
+        # back — so the restore puts the attribute's binding behaviour back
+        # exactly as it was. `orig_callable` is the bound form, which is what the
+        # wrapper has to call.
+        with guard("interceptors.mcp_stdio.install_anyio", debug=self._debug):
             orig_callable = _aio_backend.AsyncIOBackend.open_process  # bound classmethod
 
             async def wrapped(command: Any, **kwargs: Any) -> Any:
@@ -325,52 +331,37 @@ class McpStdioInterceptor(InterceptorInterface):
                     proc = await orig_callable(command, **kwargs)
                 finally:
                     _in_anyio_open.reset(token)
-                try:
+                with guard("interceptors.mcp_stdio.wrap_proc", debug=self._debug):
                     self._wrap_proc(proc)
-                except Exception:  # noqa: BLE001 — fail-silent
-                    pass
                 return proc
 
-            _aio_backend.AsyncIOBackend.open_process = staticmethod(wrapped)
-        except Exception:  # noqa: BLE001 — app stays healthy even if the patch fails
-            self._orig_backend_desc = None
+            self._patches.patch(_aio_backend.AsyncIOBackend, "open_process", staticmethod(wrapped))
 
         # auxiliary seam: capture the raw-asyncio (non-anyio) path
-        try:
-            self._orig_cse = asyncio.create_subprocess_exec
+        with guard("interceptors.mcp_stdio.install_asyncio", debug=self._debug):
+            orig_cse = asyncio.create_subprocess_exec
 
             async def wrapped_cse(*args: Any, **kwargs: Any) -> Any:
-                proc = await self._orig_cse(*args, **kwargs)
+                # Closed over, not read off `self` per call. The old form looked
+                # up `self._orig_cse`, which `uninstall()` set to None — so a
+                # wrapper another library still held raised `TypeError: NoneType
+                # is not callable` into the host after wardex was gone.
+                proc = await orig_cse(*args, **kwargs)
                 if (
                     not _in_anyio_open.get()
                 ):  # wrap if this wasn't called by anyio (i.e. raw asyncio)
-                    try:
+                    with guard("interceptors.mcp_stdio.wrap_asyncio_proc", debug=self._debug):
                         self._wrap_asyncio_proc(proc)
-                    except Exception:  # noqa: BLE001 — fail-silent
-                        pass
                 return proc
 
-            asyncio.create_subprocess_exec = wrapped_cse  # type: ignore[assignment]
-        except Exception:  # noqa: BLE001
-            self._orig_cse = None
+            self._patches.patch(asyncio, "create_subprocess_exec", wrapped_cse)
 
         self._installed = True
 
     def uninstall(self) -> None:
         if not self._installed:
             return
-        if self._orig_backend_desc is not None:
-            try:
-                _aio_backend.AsyncIOBackend.open_process = self._orig_backend_desc
-            except Exception:  # noqa: BLE001
-                pass
-            self._orig_backend_desc = None
-        if self._orig_cse is not None:
-            try:
-                asyncio.create_subprocess_exec = self._orig_cse  # type: ignore[assignment]
-            except Exception:  # noqa: BLE001
-                pass
-            self._orig_cse = None
+        self._patches.restore_all()
         self._installed = False
 
     def _wrap_proc(self, proc: Any) -> None:

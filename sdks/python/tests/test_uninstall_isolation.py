@@ -1,0 +1,290 @@
+"""Uninstall must damage neither the host nor the rest of wardex.
+
+Two failure modes, one rule, at two different altitudes.
+
+BELOW — a single patch site. wardex is not the only thing that patches
+`httpx.Client.send`; OpenTelemetry's HTTPX instrumentor patches exactly that
+attribute, and so do retry shims, second APM agents and `mock.patch` in the
+host's own test suite. An uninstall that writes the original back
+unconditionally deletes whatever arrived after wardex, and does it while
+announcing that wardex is gone — the host is then running an interception
+nobody installed and nobody can see.
+
+ABOVE — the loop over the components. `PatchSet.restore_all()` guards each
+restore so one failure cannot abandon the others; the registry loop that calls
+it used to undo that guarantee wholesale, by letting one raising `uninstall()`
+abandon every component behind it. Worse, both registries run inside
+`_lifecycle._teardown` immediately before `client.close()`, from `atexit` — so
+the exception went nowhere anyone reads, and took every buffered span with it.
+"""
+
+from __future__ import annotations
+
+import httpx
+import pytest
+import requests
+
+from wardex_sdk import _hub, _lifecycle
+from wardex_sdk._client import Client
+from wardex_sdk._config import WardexConfig
+from wardex_sdk._enums import SpanKind
+from wardex_sdk._types import InternalEnvelope, InternalSpan, SpanContext, SpanId, TraceId
+from wardex_sdk.adapters._base import AdapterInterface
+from wardex_sdk.adapters._registry import AdapterRegistry
+from wardex_sdk.assembly import Limitation, counters
+from wardex_sdk.context._inject import install_propagation, uninstall_propagation
+from wardex_sdk.interceptors._base import InterceptorInterface
+from wardex_sdk.interceptors._registry import InterceptorRegistry
+from wardex_sdk.transport._base import Transport
+
+_SUPERSEDED = f"context.inject.{Limitation.PATCH_SUPERSEDED.value}"
+
+
+class _Recording(Transport):
+    def __init__(self) -> None:
+        self.envelopes: list[InternalEnvelope] = []
+
+    def export(self, envelope: InternalEnvelope) -> None:
+        self.envelopes.append(envelope)
+
+
+def _span() -> InternalSpan:
+    return InternalSpan(
+        context=SpanContext(TraceId.generate(), SpanId.generate()),
+        parent_span_id=None,
+        name="s",
+        kind=SpanKind.INTERNAL,
+        start_time_ns=1,
+        end_time_ns=2,
+    )
+
+
+# --------------------------------------------------------------------------
+# below — the patch site
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture
+def pristine_http_clients():
+    """The three patched attributes as they were, put back whatever happens.
+
+    Every test here deliberately leaves a foreign patch installed at the point
+    it asserts, which is the whole subject; without this the next test in the
+    session runs through a wrapper this file wrote.
+    """
+    targets = (
+        (httpx.Client, "send"),
+        (httpx.AsyncClient, "send"),
+        (requests.Session, "send"),
+    )
+    saved = [(cls, name, cls.__dict__[name]) for cls, name in targets]
+    try:
+        yield
+    finally:
+        uninstall_propagation()
+        for cls, name, original in saved:
+            setattr(cls, name, original)
+
+
+def _foreign_patch(cls: type, name: str):  # noqa: ANN202
+    """Patch `cls.name` the way another instrumentor would: over whatever is
+    there now, keeping the current value to call through to."""
+    previous = getattr(cls, name)
+
+    def wrapper(self, *args, **kwargs):  # noqa: ANN001, ANN002, ANN003, ANN202
+        return previous(self, *args, **kwargs)
+
+    setattr(cls, name, wrapper)
+    return wrapper
+
+
+def test_uninstall_leaves_a_foreign_patch_over_wardex_alone(pristine_http_clients):
+    """The OpenTelemetry case, which is not hypothetical.
+
+    `init()` calls `uninstall_propagation()` on every re-init and `close()`
+    calls it too, so the destructive window is not exotic: any host that
+    re-inits wardex after its OTel instrumentor is up loses the instrumentor.
+
+    The last two assertions are here rather than in a test of their own because
+    they are only worth anything in this scenario: the three libraries share
+    one module-level PatchSet, so a foreign patch on the FIRST attribute it
+    restores is exactly what would strand wardex's wrappers on the other two
+    for the life of the process.
+    """
+    untouched = {
+        (httpx.AsyncClient, "send"): httpx.AsyncClient.__dict__["send"],
+        (requests.Session, "send"): requests.Session.__dict__["send"],
+    }
+    before = httpx.Client.__dict__["send"]
+    install_propagation()
+    assert httpx.Client.__dict__["send"] is not before, "precondition: wardex patched it"
+
+    otel = _foreign_patch(httpx.Client, "send")
+
+    counters.reset()
+    uninstall_propagation()
+
+    assert httpx.Client.__dict__["send"] is otel, (
+        "wardex destroyed a patch installed after its own and reinstated a "
+        "function nobody asked for"
+    )
+    assert counters.get(_SUPERSEDED) == 1, "the supersession was not recorded anywhere"
+    for (cls, name), original in untouched.items():
+        assert cls.__dict__[name] is original, (
+            f"{cls.__name__}.{name} was left patched — one superseded attribute "
+            "stranded the rest of the set"
+        )
+
+
+def test_reinstall_after_supersession_does_not_double_wrap(pristine_http_clients):
+    """`_installed` is cleared by uninstall even when a restore was skipped.
+
+    Otherwise the next `install_propagation()` sees the library as still
+    patched and silently injects nothing, or — if the bookkeeping is read the
+    other way — stacks a second wrapper on the ones already there.
+    """
+    install_propagation()
+    _foreign_patch(requests.Session, "send")
+    uninstall_propagation()
+
+    install_propagation()
+    reinstalled = requests.Session.__dict__["send"]
+    uninstall_propagation()
+
+    assert reinstalled.__module__ == "wardex_sdk.context._inject"
+    assert requests.Session.__dict__["send"] is not reinstalled, "the re-patch was not undone"
+
+
+# --------------------------------------------------------------------------
+# above — the loop over the components
+# --------------------------------------------------------------------------
+
+
+class _Boom(InterceptorInterface):
+    def name(self) -> str:
+        return "boom"
+
+    def install(self, client) -> None:  # noqa: ANN001
+        pass
+
+    def uninstall(self) -> None:
+        raise RuntimeError("teardown blew up")
+
+
+class _Counting(InterceptorInterface):
+    def __init__(self) -> None:
+        self.uninstalls = 0
+
+    def name(self) -> str:
+        return "counting"
+
+    def install(self, client) -> None:  # noqa: ANN001
+        pass
+
+    def uninstall(self) -> None:
+        self.uninstalls += 1
+
+
+class _BoomAdapter(AdapterInterface):
+    def name(self) -> str:
+        return "boom-adapter"
+
+    def install(self, client) -> None:  # noqa: ANN001
+        pass
+
+    def uninstall(self) -> None:
+        raise RuntimeError("teardown blew up")
+
+
+class _CountingAdapter(AdapterInterface):
+    def __init__(self) -> None:
+        self.uninstalls = 0
+
+    def name(self) -> str:
+        return "counting-adapter"
+
+    def install(self, client) -> None:  # noqa: ANN001
+        pass
+
+    def uninstall(self) -> None:
+        self.uninstalls += 1
+
+
+def test_one_raising_interceptor_does_not_abandon_the_ones_behind_it():
+    reg = InterceptorRegistry()
+    later = _Counting()
+    reg.install(_Boom(), client=None)
+    reg.install(later, client=None)
+
+    counters.reset()
+    reg.uninstall_all()  # must not raise
+
+    assert later.uninstalls == 1, "an interceptor queued behind a failure was never uninstalled"
+    assert not reg.is_installed("boom"), (
+        "the failed interceptor stayed registered, so install() no-ops by name forever"
+    )
+    assert not reg.is_installed("counting")
+    assert counters.get("interceptors.boom.uninstall") == 1, "the failure left no trace"
+
+
+def test_a_raising_interceptor_uninstall_is_not_retried():
+    """Pop-then-uninstall: the second `uninstall_all()` is a no-op, not a
+    second failure counted against a component nobody asked to tear down
+    again."""
+    reg = InterceptorRegistry()
+    reg.install(_Boom(), client=None)
+    reg.uninstall_all()
+
+    counters.reset()
+    reg.uninstall_all()
+
+    assert counters.get("interceptors.boom.uninstall") == 0
+
+
+def test_one_raising_adapter_does_not_abandon_the_ones_behind_it():
+    reg = AdapterRegistry()
+    later = _CountingAdapter()
+    reg.install(_BoomAdapter(), client=None)
+    reg.install(later, client=None)
+
+    counters.reset()
+    reg.uninstall_all()  # must not raise
+
+    assert later.uninstalls == 1
+    assert not reg.is_installed("boom-adapter")
+    assert not reg.is_installed("counting-adapter")
+    assert counters.get("adapters.boom-adapter.uninstall") == 1
+
+
+def test_teardown_still_closes_the_client_when_an_uninstall_raises():
+    """The consequence the guard exists for, asserted end to end.
+
+    `_teardown` is interceptors → adapters → `client.close()`, and it is what
+    `atexit` runs. A raising `uninstall()` used to propagate out of the first
+    line, so the adapters were never uninstalled and the close never happened:
+    every span still in the buffer was lost at exit, silently, because nothing
+    reads an exception raised from an atexit hook.
+    """
+    from wardex_sdk.adapters._registry import get_registry as adapter_registry
+    from wardex_sdk.interceptors._registry import get_registry as interceptor_registry
+
+    transport = _Recording()
+    client = Client(WardexConfig(api_key="k", flush_interval=3600.0), transport)
+    adapter = _CountingAdapter()
+    try:
+        interceptor_registry().install(_Boom(), client)
+        adapter_registry().install(adapter, client)
+        client.capture_span(_span())
+
+        _lifecycle._teardown(client)  # must not raise
+
+        assert adapter.uninstalls == 1, "the adapter registry never ran"
+        assert client._closed, "the client was never closed"
+        assert sum(len(e.spans) for e in transport.envelopes) == 1, (
+            "the buffered span was lost — close() never ran"
+        )
+    finally:
+        interceptor_registry().uninstall_all()
+        adapter_registry().uninstall_all()
+        _lifecycle._current_client = None
+        _hub.reset_for_test()

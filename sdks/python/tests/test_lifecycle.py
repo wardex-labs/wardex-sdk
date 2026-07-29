@@ -38,8 +38,58 @@ def _client(transport=None, **cfg):
     return Client(WardexConfig(api_key="k", **cfg), transport or _Recording())
 
 
+_SIGNALS = (signal.SIGINT, signal.SIGTERM)
+
+# The dispositions this pytest session started with, read at import — i.e. at
+# collection, before any test anywhere has run. The audit at the bottom of this
+# file compares the table against these.
+_DISPOSITIONS_AT_IMPORT = {signum: signal.getsignal(signum) for signum in _SIGNALS}
+
+
 @pytest.fixture(autouse=True)
-def clean_lifecycle():
+def real_signal_table():
+    """Put the PROCESS's real SIGINT/SIGTERM dispositions back after every test.
+
+    Separate from `clean_lifecycle`, which restores wardex's *module* state,
+    and depended on by it so that this one is set up first and torn down LAST —
+    the poisoning below happens *inside* `clean_lifecycle`'s teardown, so a
+    fixture that finalized before it would restore the table and then watch it
+    be re-broken.
+
+    Several tests here drive `_lifecycle._handler` by writing a disposition
+    into `_lifecycle._prev_handlers[SIGTERM]` by hand, which is the only way to
+    exercise the SIG_DFL and SIG_IGN branches without actually killing pytest.
+    Both then leak into the real table: `_handler` calls
+    `signal.signal(signum, SIG_DFL)` itself on the SIG_DFL branch, and on the
+    SIG_IGN branch `_uninstall_signal_handlers()` — which restores whatever
+    `_prev_handlers` holds — writes SIG_IGN into it at teardown.
+
+    SIG_IGN is the one that hurts, because it survives `exec`: every
+    subprocess spawned for the rest of the session inherits an ignored SIGTERM.
+    `test_batching_integration.py::test_sigterm_flushes_and_preserves_exit_code`
+    sends SIGTERM to a child and waits for it to die, so it hung for 15s and
+    failed — in a file that had done nothing wrong, from a fault it could not
+    see.
+
+    The snapshot is taken AFTER dropping any wardex handler still in the table,
+    not before. Earlier files in the session `init()` without closing, so
+    `_lifecycle._handler` is frequently sitting in the table when this file
+    starts; snapshotting first would save that and hand it back after every
+    test, which is the opposite of the job — and it would break the tests below
+    that assert `_handler` is *not* installed.
+    """
+    _lifecycle._uninstall_signal_handlers()
+    saved = {signum: signal.getsignal(signum) for signum in _SIGNALS}
+    yield
+    for signum, handler in saved.items():
+        # None means the disposition was installed from C and cannot be written
+        # back through the signal module; nothing to restore it to.
+        if handler is not None:
+            signal.signal(signum, handler)
+
+
+@pytest.fixture(autouse=True)
+def clean_lifecycle(real_signal_table):
     """Restore signal table and module state around every test."""
     _lifecycle._uninstall_signal_handlers()
     _lifecycle._current_client = None
@@ -278,3 +328,30 @@ def test_reinit_uninstalls_adapters_before_closing_previous_client():
         assert not registry.is_installed("fake-lifecycle-adapter")
     finally:
         registry.uninstall_all()
+
+
+# Deliberately the last test in the file: it audits what everything above it
+# left behind, so anything appended after it moves out of its view.
+def test_this_file_leaves_the_process_signal_table_clean():
+    """The signal tests above must not charge the rest of the session for it.
+
+    A test file that installs signal handlers is writing to interpreter-global
+    state that no other file can see it holding, and SIG_IGN in particular is
+    inherited across `exec` — so a leak here reaches every subprocess any later
+    test spawns, and lands as a 15-second timeout in a file that never touched
+    signals. That is a test suite reporting a fault in the wrong place, which
+    is worse than reporting none.
+
+    Compared against the session's dispositions rather than against the ones
+    this file happened to inherit, because a wardex handler left in the table
+    by an earlier file is a leak too — this file's fixture clears it, and the
+    stricter comparison is what keeps that from silently regressing.
+
+    This asserts the disposition rather than the fixture, because the fixture
+    is only the current answer: what must stay true is that the file gives the
+    process back a signal table nobody has to work around.
+    """
+    now = {signum: signal.getsignal(signum) for signum in _SIGNALS}
+    assert now == _DISPOSITIONS_AT_IMPORT, (
+        f"signal dispositions changed: {_DISPOSITIONS_AT_IMPORT} -> {now}"
+    )

@@ -215,7 +215,17 @@ class Limitation(Enum):
     """Something else re-patched a symbol wardex had already patched, so the
     interception wardex installed is no longer the one in effect.
 
-    Declared; no emitter until ``assembly/_patchset.py``.
+    Emitted from ``assembly/_patchset.py::PatchSet._restore``, when the attribute
+    being restored no longer holds the exact wrapper this ``PatchSet`` installed
+    — another library patched over wardex, or removed wardex's patch outright.
+    That patch is then LEFT IN PLACE, which is the point: restoring over it would
+    delete the other library's interception from a component that has just
+    announced it is gone.
+
+    Detectable only at restore time, when the component has stopped producing
+    spans — so the live signal is the counter ``PatchSet`` bumps
+    (``<owner>.patch_superseded``), and ``PatchSet.limitations()`` offers the
+    member to any caller that does hold a span to hang it on.
     """
 
     # ------------------------------------------------------------------

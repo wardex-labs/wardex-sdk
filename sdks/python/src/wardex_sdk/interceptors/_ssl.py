@@ -38,22 +38,24 @@ class SSLInterceptor(ByteSeamInterceptor):
             return
         self._client = client
         self._load_limits(client)
-        self._patch(ssl.SSLSocket, "send", self._mk_send("send", "SSLSocket"))
-        self._patch(ssl.SSLSocket, "recv", self._mk_recv("recv", "SSLSocket"))
-        self._patch(ssl.SSLSocket, "recv_into", self._mk_recv_into())
-        self._patch(ssl.SSLObject, "write", self._mk_send("write", "SSLObject"))
-        self._patch(ssl.SSLObject, "read", self._mk_read())
+        self._patches = self._fresh_patchset()
+        # The original is read here and closed over by the wrapper, rather than
+        # looked up per call out of a dict the uninstall clears. That dict was
+        # how a wrapper still referenced by another library raised `KeyError`
+        # into the host after `uninstall()`.
+        sock, obj = ssl.SSLSocket, ssl.SSLObject
+        self._patches.patch(sock, "send", self._mk_send("send", sock.send))
+        self._patches.patch(sock, "recv", self._mk_recv(sock.recv))
+        self._patches.patch(sock, "recv_into", self._mk_recv_into(sock.recv_into))
+        self._patches.patch(obj, "write", self._mk_send("write", obj.write))
+        self._patches.patch(obj, "read", self._mk_read(obj.read))
         install_shared_timing(self._limits["max_connections"])
         self._installed = True
 
     def uninstall(self) -> None:
         if not self._installed:
             return
-        for key, fn in self._orig.items():
-            cls_name, meth = key.split(".", 1)
-            cls = ssl.SSLSocket if cls_name == "SSLSocket" else ssl.SSLObject
-            setattr(cls, meth, fn)
-        self._orig.clear()
+        self._patches.restore_all()
         uninstall_shared_timing()
         for st in list(self._conns.values()):
             if isinstance(st.tracker, _WebSocketTracker):
@@ -108,11 +110,8 @@ class SSLInterceptor(ByteSeamInterceptor):
 
     # --- send family (request) ---
 
-    def _mk_send(self, meth: str, cls_name: str):  # noqa: ANN202
-        key = f"{cls_name}.{meth}"
-
+    def _mk_send(self, meth: str, real: Any):  # noqa: ANN202
         def wrapper(this: Any, data: Any, *args: Any, **kwargs: Any) -> Any:
-            real = self._orig[key]
             ret = real(this, data, *args, **kwargs)
             try:
                 sent = data
@@ -127,11 +126,8 @@ class SSLInterceptor(ByteSeamInterceptor):
 
     # --- recv family (response) ---
 
-    def _mk_recv(self, meth: str, cls_name: str):  # noqa: ANN202
-        key = f"{cls_name}.{meth}"
-
+    def _mk_recv(self, real: Any):  # noqa: ANN202
         def wrapper(this: Any, *args: Any, **kwargs: Any) -> Any:
-            real = self._orig[key]
             ret = real(this, *args, **kwargs)
             try:
                 if isinstance(ret, (bytes, bytearray)) and ret:
@@ -142,9 +138,8 @@ class SSLInterceptor(ByteSeamInterceptor):
 
         return wrapper
 
-    def _mk_recv_into(self):  # noqa: ANN202
+    def _mk_recv_into(self, real: Any):  # noqa: ANN202
         def wrapper(this: Any, buffer: Any, *args: Any, **kwargs: Any) -> int:
-            real = self._orig["SSLSocket.recv_into"]
             n = real(this, buffer, *args, **kwargs)
             try:
                 if n:
@@ -155,9 +150,8 @@ class SSLInterceptor(ByteSeamInterceptor):
 
         return wrapper
 
-    def _mk_read(self):  # noqa: ANN202
+    def _mk_read(self, real: Any):  # noqa: ANN202
         def wrapper(this: Any, *args: Any, **kwargs: Any) -> Any:
-            real = self._orig["SSLObject.read"]
             ret = real(this, *args, **kwargs)
             try:
                 buffer = None

@@ -27,6 +27,7 @@ from .._types import (
 from ..assembly import (
     Ambient,
     Limitation,
+    PatchSet,
     Prefilter,
     SpanDraft,
     TransportLabel,
@@ -73,7 +74,7 @@ class ByteSeamInterceptor(InterceptorInterface):
     def __init__(self) -> None:
         self._client: Client | None = None
         self._conns: dict[int, _ConnectionState] = {}
-        self._orig: dict[str, Any] = {}
+        self._patches = PatchSet(f"interceptors.{self.name()}")
         self._installed = False
         # Defaults match the core's, so behavior is unchanged until _load_limits
         # resolves an actual config at install() time.
@@ -86,6 +87,18 @@ class ByteSeamInterceptor(InterceptorInterface):
         lim = config.limits if config is not None else CaptureLimits()
         self._limits = lim.resolved()
         self._native_limits = lim.to_native()
+
+    def _fresh_patchset(self) -> PatchSet:
+        """This seam's PatchSet, wired to the client's debug setting.
+
+        Built at install() rather than in `__init__` because `config.debug` is
+        not known until a client arrives, and a restore that fails invisibly
+        under `debug=True` is exactly what `_diag` exists to prevent. The empty
+        set `__init__` makes is what keeps `uninstall()` safe before any
+        `install()`.
+        """
+        config = getattr(self._client, "config", None)
+        return PatchSet(f"interceptors.{self.name()}", debug=bool(getattr(config, "debug", False)))
 
     # --- Subclass hooks ---
 
@@ -152,13 +165,6 @@ class ByteSeamInterceptor(InterceptorInterface):
 
     def _capture_source(self) -> CaptureSource:
         return CaptureSource.SSL
-
-    # --- Monkeypatch helpers ---
-
-    def _patch(self, cls: type, meth: str, wrapper: Any) -> None:
-        key = f"{cls.__name__}.{meth}"
-        self._orig[key] = getattr(cls, meth)
-        setattr(cls, meth, wrapper)
 
     # --- Connection state ---
 
