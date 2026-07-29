@@ -11,8 +11,12 @@ the span; there is deliberately no function here that turns one into a
 `SpanContext`. Replace every framework id in a workload with a fresh UUID and
 the tree must come out the same shape (conformance C-3).
 
-Step 0 of the migration (design §11) lands this module with **no callers**. The
-six existing parentage sites are rewritten onto `resolve_parentage()` in step 1.
+Migration status (design §11): step 1 has landed, so all six parentage sites —
+`_seam._emit_span`, `_seam._emit_ws`, `_mcp_stdio._build_mcp_span`, the Agent
+SDK assembler, `_tracing._begin` and `capture_state_snapshot` — now get their
+edge from `resolve_parentage()` or `child_of()`. There is no second answer left
+in the SDK: `tests/test_import_graph.py` asserts a single `TraceId.generate()`
+call site as a hard rule rather than a budget.
 """
 
 from __future__ import annotations

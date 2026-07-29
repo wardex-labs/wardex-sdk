@@ -14,10 +14,13 @@ reachable is not extraction. Adapters cannot import `InternalSpan`, `TraceId`,
 adapter to obtain parentage is to ask this package for it — the shortcut has no
 name to call.
 
-Migration status (design §11): step 0 has landed `_parentage`, `_diag` and the
-`Limitation` enum, with **no callers anywhere in the SDK**. `_units`,
-`_builder`, `_vocab`, `_policy`, `_emit`, `_snapshot` and `_patchset` arrive in
-later steps; `__all__` grows with them and does not shrink.
+Migration status (design §11): step 0 landed `_parentage`, `_diag` and the
+`Limitation` enum; step 1 wired the six parentage sites onto `resolve_parentage`
+/ `child_of`, so `_parentage` is live on every span the SDK emits. `_diag.guard`
+still has no caller outside this package — `interceptors/` and `adapters/` adopt
+it with the seam decomposition. `_units`, `_builder`, `_vocab`, `_policy`,
+`_emit`, `_snapshot` and `_patchset` arrive in later steps; `__all__` grows with
+them and does not shrink.
 """
 
 from ._diag import Counters, counters, guard

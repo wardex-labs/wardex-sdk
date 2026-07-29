@@ -5,6 +5,40 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+- An inbound sampling decision is now honoured instead of being overridden.
+  wardex used to emit `traceparent` with the sampled flag hardcoded to `01`,
+  so a request that arrived with `-00` left with `-01` and every downstream
+  service recorded a trace its own upstream had declined to sample. Received
+  flags now propagate unchanged, and only traces wardex itself originates
+  assert `01` — which is still every trace where wardex is the entry point,
+  because wardex does not head-sample (retention is decided later by the
+  RetentionClassifier). If you relied on the old promotion to force sampling
+  downstream, set the flag upstream instead.
+- More spans now carry `correlation`, including the ones that start a new
+  trace. Manual spans (`wardex.span`/`trace` and the decorators), the Agent
+  SDK adapter's session-root `invoke_agent` span, and any interceptor span
+  with no ambient parent previously reported `correlation=None`, which read
+  as "a parent was expected and lost" and was indistinguishable from a
+  deliberate trace root. The only new `strategy` values are `"trace_root"`,
+  when a span starts its own trace, and `"header"`, when the parent was
+  joined from a W3C `traceparent`; a joined parent used to be reported as
+  `contextvar`. The adapter's `chat` and subagent spans still report no
+  `correlation` — their parent is chosen by a lookup that can silently fall
+  back to the session root, and a `confidence` those edges have not earned
+  would be worse than none.
+- `wardex.capture_state_snapshot()` called with no active span now emits the
+  snapshot instead of discarding it. The snapshot carries
+  `wardex.limitations="parent_unresolved"` in its attributes and the all-zero
+  `span_id` (OTel's invalid-span id), because no span existed to name.
+  Previously the call returned silently and the data was lost with no counter,
+  log or marker. `wardex.limitations` is now the SDK's key on this record: a
+  value passed in `attributes=` under that key is dropped rather than emitted
+  alongside it.
+- Emitted spans now carry the trace's `trace_flags` on their span context
+  rather than a hardcoded `0`. This is not visible on the wire yet: the OTLP
+  span message has no flags field today.
+
 ## [0.2.0b1] - 2026-07-28
 
 ### Breaking

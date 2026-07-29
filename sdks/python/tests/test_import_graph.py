@@ -281,6 +281,15 @@ def _passes_parent_span_id(rel: str, tree: ast.Module):
     return predicate
 
 
+def _constructs_ambient(rel: str, tree: ast.Module):
+    def predicate(node: ast.AST) -> bool:
+        return isinstance(node, ast.Call) and _reaches_symbol(
+            node.func, "Ambient", _local_names(tree, "Ambient"), _module_aliases(rel, tree)
+        )
+
+    return predicate
+
+
 def _calls_sink(rel: str, tree: ast.Module):
     def predicate(node: ast.AST) -> bool:
         return (
@@ -525,15 +534,16 @@ _CS1_DEBT: dict[str, frozenset[str]] = {
     "adapters/_anthropic_agent_sdk.py": frozenset(
         {"Client", f"{_PKG}._client", f"{_PKG}._types", f"{_PKG}._tracing"}
     ),
+    # Step 1 shrank this by four: `TraceId`, `SpanId`, `_hub` and
+    # `wardex_sdk._hub` are gone, because the assembler no longer mints ids or
+    # reads the scope — `assembly.resolve_parentage()`/`child_of()` do both. It
+    # still names `InternalSpan` (step 3, SpanDraft) and `SpanContext` (the
+    # anchor type it holds per session; step 6, Unit).
     "adapters/_assembler.py": frozenset(
         {
             "InternalSpan",
             "SpanContext",
-            "SpanId",
-            "TraceId",
-            "_hub",
             _PKG,
-            f"{_PKG}._hub",
             f"{_PKG}._types",
         }
     ),
@@ -567,12 +577,13 @@ def test_adapters_do_not_import_span_machinery():
 # C-S2 / C-S3 — one parentage source, one span constructor
 # --------------------------------------------------------------------------
 
-_CS2_BUDGET = {
-    "_tracing.py": 1,
-    "adapters/_assembler.py": 1,
-    "interceptors/_mcp_stdio.py": 1,
-    "interceptors/_seam.py": 2,
-}
+# C-S2 has no budget any more. Migration step 1 routed all six parentage sites
+# through `assembly.resolve_parentage()`, which drove the five pre-existing
+# `TraceId.generate()` calls (`_tracing.py` 1, `adapters/_assembler.py` 1,
+# `interceptors/_mcp_stdio.py` 1, `interceptors/_seam.py` 2) to zero. Per this
+# file's header that is the moment the budget is DELETED and the rule becomes
+# hard: I1 is now literally true — one call site in the whole SDK — and the
+# assertion below says so directly instead of tolerating a count.
 
 _CS3_SPAN_BUDGET = {
     "_tracing.py": 1,
@@ -581,32 +592,35 @@ _CS3_SPAN_BUDGET = {
     "interceptors/_seam.py": 2,
 }
 
+# Step 1 lowered `adapters/_assembler.py` 5 -> 4: `_Session` no longer carries a
+# hand-computed `parent_span_id` field, it carries the `Parentage` the core
+# returned. The four that remain are the four `InternalSpan(...)` calls, and
+# each now passes `p.parent_span_id` — a value assembly/ decided — rather than
+# one the emitter worked out. Step 3 removes the keyword itself along with the
+# constructor, which is what empties this budget.
 _CS3_PARENT_BUDGET = {
     "_tracing.py": 1,
-    "adapters/_assembler.py": 5,
+    "adapters/_assembler.py": 4,
     "interceptors/_mcp_stdio.py": 1,
     "interceptors/_seam.py": 2,
 }
 
 
 def test_trace_id_is_generated_only_in_parentage():
-    """C-S2, in the form that is already true: inside assembly/, exactly one site."""
-    inside = _tally(_calls_traceid_generate, under=("assembly/",))
-    assert inside == {"assembly/_parentage.py": 1}, (
-        f"C-S2: TraceId.generate() inside assembly/ is {inside}, expected exactly\n"
+    """C-S2, now a HARD RULE: exactly one TraceId.generate() in the whole SDK."""
+    everywhere = _tally(_calls_traceid_generate)
+    assert everywhere == {"assembly/_parentage.py": 1}, (
+        f"C-S2: TraceId.generate() call sites are {everywhere}, expected exactly\n"
         "{'assembly/_parentage.py': 1}.\n\n"
         "WHY: a new trace id is the statement 'this work has no parent'. One\n"
         "call site is what makes that statement auditable — and it is why the\n"
         "'started a new trace' case can be told apart from the 'expected a\n"
-        "parent and lost it' case at all (design I1, I4)."
-    )
-    _assert_within_budget(
-        {k: v for k, v in _tally(_calls_traceid_generate).items() if not k.startswith("assembly/")},
-        _CS2_BUDGET,
-        "C-S2 (TraceId.generate outside assembly/)",
-        "every extra generator is another place a subtree can silently detach\n"
-        "into its own trace. Migration step 1 rewrites these six sites onto\n"
-        "assembly.resolve_parentage() and empties this budget.",
+        "parent and lost it' case at all (design I1, I4). Every extra generator\n"
+        "is another place a subtree can silently detach into its own trace.\n"
+        "This was a budget over five pre-existing sites until migration step 1\n"
+        "routed them through assembly.resolve_parentage(); it is not a budget\n"
+        "any more, so a new site here is a change to make, not a number to\n"
+        "raise."
     )
 
 
@@ -643,6 +657,37 @@ def test_parent_span_id_is_passed_only_from_assembly():
         "no Evidence, no confidence, no limitation marker when it was a guess\n"
         "(design I1, I4). Ask assembly.resolve_parentage() for a Parentage and\n"
         "let it fill the field.",
+    )
+
+
+# Hand-built `Ambient(...)` outside assembly/. Migration step 1 opened this
+# surface and it needs the same ratchet as the ones it closed: `latch_ambient()`
+# reads the scope, and a hand-built Ambient is the one way to feed
+# `resolve_parentage` a SpanContext that never came from the scope at all —
+# `Ambient(SpanContext(trace_id=TraceId(run_id[:16]), ...), ...)` is a framework
+# id becoming a parent, which is I2 exactly. C-S2 does not see it (no
+# `TraceId.generate()`), C-S3 does not see it (the `parent_span_id=` still comes
+# off the returned Parentage), and C-S1 covers only adapters/.
+#
+# The one entry is legitimate and is why this is a budget rather than a hard
+# rule: `_seam._latched` wraps what `_trackers.py` latched at REQUEST time, and
+# the emit path it serves runs on the response side where `latch_ambient()`
+# would read the wrong scope. Widening that latch to a real Ambient belongs to
+# the seam decomposition (design §3.3), which empties this dict.
+_AMBIENT_BUDGET = {
+    "interceptors/_seam.py": 1,
+}
+
+
+def test_ambient_is_latched_not_hand_built():
+    _assert_within_budget(
+        {k: v for k, v in _tally(_constructs_ambient).items() if not k.startswith("assembly/")},
+        _AMBIENT_BUDGET,
+        "C-S2 (Ambient constructed outside assembly/)",
+        "an Ambient is a snapshot of the wardex scope. Building one by hand is\n"
+        "the only remaining way to hand resolve_parentage a parent the scope\n"
+        "never held — a framework id dressed as a SpanContext (design I2).\n"
+        "Call assembly.latch_ambient() on the task that ISSUES the work.",
     )
 
 

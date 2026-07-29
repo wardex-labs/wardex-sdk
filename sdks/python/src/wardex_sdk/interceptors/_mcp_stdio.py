@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING, Any
 
 import anyio._backends._asyncio as _aio_backend
 
-from .. import _hub, _wardex_native
+from .. import _wardex_native
 from .._enums import (
     CaptureSource,
     Direction,
@@ -27,16 +27,13 @@ from .._enums import (
 )
 from .._types import (
     CaptureIntegrity,
-    CorrelationInfo,
     InternalSpan,
     McpMeta,
-    SpanContext,
-    SpanId,
     ToolAttributes,
-    TraceId,
     TransportAttributes,
     TransportTiming,
 )
+from ..assembly import Ambient, latch_ambient, resolve_parentage
 from ..protocol import JsonRpcParser
 from ._base import InterceptorInterface
 
@@ -57,7 +54,7 @@ class _Pending:
     method: str
     params: bytes
     start_ns: int
-    parent: SpanContext | None
+    ambient: Ambient
 
 
 class _ProcState:
@@ -91,12 +88,14 @@ class _ProcState:
             if m.kind in ("request", "response", "notification"):
                 self._msgs += 1
             if m.kind == "request" and m.id is not None:
-                parent = _hub.get_current_scope().active_span_context
+                # Latched on the stdin-write path — the task that ISSUED the
+                # request. The response arrives on the subprocess reader, whose
+                # scope says nothing about who asked (design §4.1).
                 self._latch[m.id] = _Pending(
                     method=m.method or "?",
                     params=m.params or b"",
                     start_ns=time.time_ns(),
-                    parent=parent,
+                    ambient=latch_ambient(),
                 )
             if len(self._latch) > 4096:  # leak-defense cap
                 self._latch.pop(next(iter(self._latch)))
@@ -119,20 +118,8 @@ class _ProcState:
 def _build_mcp_span(p: _Pending, resp: Any) -> InternalSpan:
     now = time.time_ns()
     method = p.method
-    if p.parent is not None:
-        trace_id = p.parent.trace_id
-        parent_span_id: SpanId | None = p.parent.span_id
-        correlation: CorrelationInfo | None = CorrelationInfo(
-            strategy="contextvar",
-            active_span_id_at_capture=p.parent.span_id,
-            confidence=1.0,
-        )
-    else:
-        trace_id = TraceId.generate()
-        parent_span_id = None
-        correlation = None
-
-    ctx = SpanContext(trace_id=trace_id, span_id=SpanId.generate())
+    parentage = resolve_parentage(p.ambient)
+    ctx = parentage.child_context()
     params_bytes = p.params
     result_bytes = resp.result if resp.result is not None else (resp.error or b"")
     input_data = params_bytes
@@ -180,7 +167,7 @@ def _build_mcp_span(p: _Pending, resp: Any) -> InternalSpan:
     )
     return InternalSpan(
         context=ctx,
-        parent_span_id=parent_span_id,
+        parent_span_id=parentage.parent_span_id,
         name=f"MCP {method}",
         kind=SpanKind.CLIENT,
         start_time_ns=p.start_ns,
@@ -192,7 +179,7 @@ def _build_mcp_span(p: _Pending, resp: Any) -> InternalSpan:
         output_data=output_data,
         capture_sources=(CaptureSource.STDIO,),
         capture_integrity=integrity,
-        correlation=correlation,
+        correlation=parentage.correlation,
     )
 
 

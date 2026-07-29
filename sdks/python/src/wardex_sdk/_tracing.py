@@ -14,27 +14,28 @@ from ._types import (
     AgentAttributes,
     CallSite,
     ConversationContext,
+    CorrelationInfo,
     GenAIAttributes,
     InternalSpan,
     SpanContext,
-    SpanId,
     ToolAttributes,
-    TraceId,
 )
+from .assembly import Parentage, latch_ambient, resolve_parentage
 from .context._contextvar import fork_active_span
 
 
 class SpanBuilder:
     def __init__(
         self,
+        parentage: Parentage,
         context: SpanContext,
-        parent_span_id: SpanId | None,
         name: str,
         kind: SpanKind,
         conversation: ConversationContext | None,
     ) -> None:
         self.context = context
-        self.parent_span_id = parent_span_id
+        self.parent_span_id = parentage.parent_span_id
+        self.correlation: CorrelationInfo | None = parentage.correlation
         self.name = name
         self.kind = kind
         self.conversation = conversation
@@ -91,6 +92,7 @@ class SpanBuilder:
             call_site=self.call_site,
             input_data=self.input_data,
             output_data=self.output_data,
+            correlation=self.correlation,
             extra=extra,
         )
 
@@ -99,21 +101,19 @@ class SpanBuilder:
 def _begin(
     name: str,
     kind: SpanKind,
-    trace_id: TraceId | None,
     conversation: ConversationContext | None,
 ) -> Iterator[SpanBuilder]:
-    scope = _hub.get_current_scope()
-    parent_ctx = scope.active_span_context
-    tid = (
-        trace_id
-        if trace_id is not None
-        else (parent_ctx.trace_id if parent_ctx is not None else TraceId.generate())
-    )
-    ctx = SpanContext(trace_id=tid, span_id=SpanId.generate())
-    parent_id = parent_ctx.span_id if parent_ctx is not None else None
-    conv = conversation if conversation is not None else scope.conversation
+    # A manual span is issued on the caller's own task, so the latch is here and
+    # the evidence is the default (`AMBIENT`): a parent means the ContextVar
+    # held one, a remote parent is re-labelled `header` by the core, and no
+    # parent at all means this span deliberately roots a new trace. Manual spans
+    # and adapter spans now agree on all three because they ask the same
+    # function.
+    parentage = resolve_parentage(latch_ambient())
+    ctx = parentage.child_context()
+    conv = conversation if conversation is not None else parentage.conversation
 
-    builder = SpanBuilder(ctx, parent_id, name, kind, conv)
+    builder = SpanBuilder(parentage, ctx, name, kind, conv)
     try:
         with fork_active_span(ctx):
             yield builder
@@ -141,7 +141,7 @@ def trace(
     prev_conv = scope.conversation
     scope.conversation = conversation
     try:
-        with _begin(name, SpanKind.INTERNAL, None, conversation) as builder:
+        with _begin(name, SpanKind.INTERNAL, conversation) as builder:
             builder.operation = op
             yield builder
     finally:
@@ -156,7 +156,7 @@ def span(
     agent: AgentAttributes | None = None,
     tool: ToolAttributes | None = None,
 ) -> Iterator[SpanBuilder]:
-    with _begin(name, kind, None, None) as builder:
+    with _begin(name, kind, None) as builder:
         builder.agent = agent
         builder.tool = tool
         builder.operation = op

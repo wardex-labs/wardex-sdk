@@ -25,16 +25,13 @@ from .._enums import (
 from .._limits import CaptureLimits
 from .._types import (
     CaptureIntegrity,
-    CorrelationInfo,
     GenAIAttributes,
     HttpMeta,
     InternalSpan,
-    SpanContext,
-    SpanId,
-    TraceId,
     TransportAttributes,
     TransportTiming,
 )
+from ..assembly import Ambient, resolve_parentage
 from ..protocol import grpc_status_name, parse_grpc_frames, parse_llm_semantics
 from ._base import InterceptorInterface
 from ._trackers import _Txn, _WebSocketTracker
@@ -215,21 +212,8 @@ class ByteSeamInterceptor(InterceptorInterface):
     def _emit_span(self, obj: Any, st: _ConnectionState, txn: _Txn) -> None:
         if self._client is None:
             return
-        active = txn.parent
-        if active is not None:
-            trace_id = active.trace_id
-            parent_span_id: SpanId | None = active.span_id
-            correlation: CorrelationInfo | None = CorrelationInfo(
-                strategy="contextvar",
-                active_span_id_at_capture=active.span_id,
-                confidence=1.0,
-            )
-        else:
-            trace_id = TraceId.generate()
-            parent_span_id = None
-            correlation = None
-
-        ctx = SpanContext(trace_id=trace_id, span_id=SpanId.generate())
+        p = resolve_parentage(_latched(txn))
+        ctx = p.child_context()
         url_host = getattr(obj, "server_hostname", None) or st.server_address
         url = f"{self._url_scheme(False)}://{url_host}:{st.server_port}{txn.path}"
         transfer = max(0.0, (txn.end_ns - txn.start_ns) / 1e6 - txn.ttfb_ms)
@@ -350,7 +334,7 @@ class ByteSeamInterceptor(InterceptorInterface):
             return
         span = InternalSpan(
             context=ctx,
-            parent_span_id=parent_span_id,
+            parent_span_id=p.parent_span_id,
             name=name,
             kind=SpanKind.CLIENT,
             start_time_ns=txn.start_ns,
@@ -365,7 +349,7 @@ class ByteSeamInterceptor(InterceptorInterface):
             output_data=output_data,
             capture_sources=(self._capture_source(),),
             capture_integrity=integrity,
-            correlation=correlation,
+            correlation=p.correlation,
             extra=extra,
         )
         self._client.capture_span(span)
@@ -373,20 +357,8 @@ class ByteSeamInterceptor(InterceptorInterface):
     def _emit_ws(self, st: _ConnectionState, txn: _Txn) -> None:
         if self._client is None:
             return
-        active = txn.parent
-        if active is not None:
-            trace_id = active.trace_id
-            parent_span_id: SpanId | None = active.span_id
-            correlation: CorrelationInfo | None = CorrelationInfo(
-                strategy="contextvar",
-                active_span_id_at_capture=active.span_id,
-                confidence=1.0,
-            )
-        else:
-            trace_id = TraceId.generate()
-            parent_span_id = None
-            correlation = None
-        ctx = SpanContext(trace_id=trace_id, span_id=SpanId.generate())
+        p = resolve_parentage(_latched(txn))
+        ctx = p.child_context()
 
         code = txn.ws_close_code
         # Status based on close code: 1000/1001/none = OK, otherwise = ERROR
@@ -441,7 +413,7 @@ class ByteSeamInterceptor(InterceptorInterface):
         )
         span = InternalSpan(
             context=ctx,
-            parent_span_id=parent_span_id,
+            parent_span_id=p.parent_span_id,
             name=f"WS {txn.path}",
             kind=SpanKind.CLIENT,
             start_time_ns=txn.start_ns,
@@ -455,10 +427,26 @@ class ByteSeamInterceptor(InterceptorInterface):
             output_data=txn.response_body,
             capture_sources=(self._capture_source(),),
             capture_integrity=integrity,
-            correlation=correlation,
+            correlation=p.correlation,
             extra=extra,
         )
         self._client.capture_span(span)
+
+
+def _latched(txn: _Txn) -> Ambient:
+    """The scope as it was when this transaction's request was ISSUED.
+
+    Both emit paths run on the RESPONSE side, where the ambient context has
+    already moved on — so neither may call `latch_ambient()` itself. The tracker
+    did the latching at request time (`_trackers.py`, `self._parent`), and this
+    wraps what it captured in the shape `resolve_parentage` consumes.
+
+    `conversation` and `tracestate` are None because the tracker latches neither
+    today; that is exactly the pre-existing behaviour (the seam never set
+    `InternalSpan.conversation`), and widening the latch to a full `Ambient`
+    belongs with the seam decomposition (design §3.3), not with this step.
+    """
+    return Ambient(span_context=txn.parent, conversation=None, tracestate=None)
 
 
 _OPERATION_MAP = {"chat": OperationName.CHAT, "embeddings": OperationName.EMBEDDINGS}

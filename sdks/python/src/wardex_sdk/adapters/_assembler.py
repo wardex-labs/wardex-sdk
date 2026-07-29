@@ -14,7 +14,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-from .. import _hub, _wardex_native
+from .. import _wardex_native
 from .._enums import (
     AgentType,
     CaptureSource,
@@ -32,11 +32,36 @@ from .._types import (
     GenAIAttributes,
     InternalSpan,
     SpanContext,
-    SpanId,
     ToolAttributes,
-    TraceId,
+)
+from ..assembly import (
+    Evidence,
+    Parentage,
+    ParentSource,
+    child_of,
+    latch_ambient,
+    resolve_parentage,
 )
 from ..protocol._claude_stream import AgentStreamEvent, parse_line
+
+# Every span this assembler emits below the session root hangs off a context the
+# parentage core produced and the session is holding — rule P2. Naming the
+# evidence once here is what keeps the four emit paths from each inventing their
+# own answer to "how did I know this was the parent". `UNIT_ACTIVE` is the
+# forward-compatible spelling: step 6 turns the session into a real
+# `assembly._units.Unit` that is activated around the framework call.
+#
+# NOTHING BELOW THE ROOT PUTS THIS ON THE WIRE, and that is deliberate. Only the
+# session root's own edge — resolved from a real scope read in `_ensure_session`
+# — reports a `CorrelationInfo` in step 1, which is exactly the delta design §11
+# declares. The sub-root edges are still picked by heuristics this step does not
+# own (`_resolve_subagent_anchor`'s fallback, `_session_for_hook`'s sole-session
+# guess), so publishing `unit_active`/1.0 for them would assert certainty about
+# a guess — I4's exact prohibition — and would ship a `strategy` value step 1
+# never declared. Step 6 replaces those heuristics with `UnitRegistry.resolve()`,
+# which returns evidence per edge; the correlation goes on the wire then, with
+# the confidence and the marker the guess has earned.
+_IN_SESSION = Evidence(ParentSource.UNIT_ACTIVE)
 
 _BASE_LIMITATION = "transport_timing_unavailable_subprocess"
 
@@ -62,9 +87,8 @@ class _OpenTool:
 
 @dataclass
 class _Session:
-    trace_id: TraceId
-    root_ctx: SpanContext
-    parent_span_id: SpanId | None  # user's ambient span at entry, if any
+    parentage: Parentage  # the resolved edge from the user's scope to this session
+    root_ctx: SpanContext  # the session root's own context — the anchor for P2
     start_ns: int
     session_id: str | None = None
     model: str | None = None  # from init -> request_model
@@ -72,8 +96,8 @@ class _Session:
     first_delta_ns: int = 0
     prompt: bytes = b""
     open_tools: dict[str, _OpenTool] = field(default_factory=dict)  # keyed by tool_use_id
-    subagents: dict[str, tuple[SpanContext, str, int]] = field(default_factory=dict)
-    # ^ agent_id -> (ctx, agent_type, start_ns)
+    subagents: dict[str, tuple[SpanContext, str, int, Parentage]] = field(default_factory=dict)
+    # ^ agent_id -> (ctx, agent_type, start_ns, parentage)
     turn_index: int = 0
     stream_tool_meta: dict[str, tuple[str, bytes]] = field(default_factory=dict)
     # ^ tool_use_id -> (name, input_json) observed on the stream
@@ -182,8 +206,13 @@ class SessionAssembler:
             elif event == "SubagentStart":
                 agent_id = payload.get("agent_id")
                 if agent_id and len(sess.subagents) < self._max_session_entries:
-                    ctx = SpanContext(trace_id=sess.trace_id, span_id=SpanId.generate())
-                    sess.subagents[agent_id] = (ctx, payload.get("agent_type") or "sub_agent", now)
+                    p = child_of(sess.root_ctx, _IN_SESSION)
+                    sess.subagents[agent_id] = (
+                        p.child_context(),
+                        payload.get("agent_type") or "sub_agent",
+                        now,
+                        p,
+                    )
             elif event == "SubagentStop":
                 self._emit_subagent(sess, payload.get("agent_id"), now)
 
@@ -193,18 +222,14 @@ class SessionAssembler:
         sess = self._by_key.get(key)
         if sess is not None:
             return sess
-        active = _hub.get_current_scope().active_span_context
-        if active is not None:
-            trace_id = active.trace_id
-            parent_span_id: SpanId | None = active.span_id
-        else:
-            trace_id = TraceId.generate()
-            parent_span_id = None
-        root_ctx = SpanContext(trace_id=trace_id, span_id=SpanId.generate())
+        # The one scope read of the whole adapter. Everything below the root is
+        # anchored to `root_ctx`, so `child_context()` is called exactly once
+        # here: calling it again would anchor the children to a span id that is
+        # never emitted (see `Parentage.child_context`).
+        parentage = resolve_parentage(latch_ambient())
         sess = _Session(
-            trace_id=trace_id,
-            root_ctx=root_ctx,
-            parent_span_id=parent_span_id,
+            parentage=parentage,
+            root_ctx=parentage.child_context(),
             start_ns=now,
         )
         self._new_session(key, sess)
@@ -235,24 +260,37 @@ class SessionAssembler:
             return next(iter(self._by_key.values()))
         return None
 
-    def _resolve_subagent_parent(self, sess: _Session, parent_tool_use_id: str | None) -> SpanId:
+    def _resolve_subagent_anchor(
+        self, sess: _Session, parent_tool_use_id: str | None
+    ) -> SpanContext:
         """Best-effort join from a stream-side parent_tool_use_id to a subagent span.
 
         Direct match: parent_tool_use_id happens to be a known agent_id.
         Indirect match: parent_tool_use_id is a currently open tool that itself
         belongs to a subagent (nested activity inside a subagent's tool call).
+
+        Returns the ANCHOR (a context this session already holds), not a span id:
+        the edge itself is `child_of`'s to build. Selecting which anchor is still
+        this method's job, and it is still a heuristic — a `parent_tool_use_id`
+        that resolves to nothing (the hook has not landed yet, or the subagent
+        was never recorded because `_max_session_entries` was reached) silently
+        re-parents to the session root. That is unchanged from before step 1 and
+        step 6 is where it gets fixed: `UnitRegistry.resolve()` returns the
+        evidence alongside the unit, so the guess reports itself (design §3.4).
+        Until it does, no span this method feeds may claim a confidence for its
+        edge — see `_IN_SESSION`.
         """
         if not parent_tool_use_id:
-            return sess.root_ctx.span_id
+            return sess.root_ctx
         sub = sess.subagents.get(parent_tool_use_id)
         if sub is None:
             open_tool = sess.open_tools.get(parent_tool_use_id)
             if open_tool is not None and open_tool.agent_id is not None:
                 sub = sess.subagents.get(open_tool.agent_id)
-        return sub[0].span_id if sub is not None else sess.root_ctx.span_id
+        return sub[0] if sub is not None else sess.root_ctx
 
     def _emit_chat(self, sess: _Session, ev: AgentStreamEvent, now: int) -> None:
-        parent_span_id = self._resolve_subagent_parent(sess, ev.parent_tool_use_id)
+        p = child_of(self._resolve_subagent_anchor(sess, ev.parent_tool_use_id), _IN_SESSION)
         start_ns = sess.turn_start_ns or now
 
         ttft: float | None = None
@@ -285,8 +323,8 @@ class SessionAssembler:
         output_data = ev.content_json or b""
 
         span = InternalSpan(
-            context=SpanContext(trace_id=sess.trace_id, span_id=SpanId.generate()),
-            parent_span_id=parent_span_id,
+            context=p.child_context(),
+            parent_span_id=p.parent_span_id,
             name=f"chat {ev.model}",
             kind=SpanKind.CLIENT,
             start_time_ns=start_ns,
@@ -302,6 +340,12 @@ class SessionAssembler:
                 response_body_captured=bool(output_data),
                 limitations=limitations,
             ),
+            # No `correlation=p.correlation`: the anchor above may be a fallback
+            # (see `_resolve_subagent_anchor`), and `p.correlation` would report
+            # it as `unit_active`/1.0 with no marker. Unchanged from before step
+            # 1 — this span still makes no claim — because a claim it cannot
+            # back is strictly worse than no claim (I4). Step 6 supplies the
+            # evidence, and the field arrives with it.
         )
         sess.turn_index += 1
         self._client.capture_span(span)
@@ -369,15 +413,16 @@ class SessionAssembler:
         failed: bool = False,
         markers: tuple[str, ...] = (),
     ) -> None:
-        parent_span_id = sess.root_ctx.span_id
+        anchor = sess.root_ctx
         if tool.agent_id is not None:
             sub = sess.subagents.get(tool.agent_id)
             if sub is not None:
-                parent_span_id = sub[0].span_id
+                anchor = sub[0]
+        p = child_of(anchor, _IN_SESSION)
 
         span = InternalSpan(
-            context=SpanContext(trace_id=sess.trace_id, span_id=SpanId.generate()),
-            parent_span_id=parent_span_id,
+            context=p.child_context(),
+            parent_span_id=p.parent_span_id,
             name=f"execute_tool {tool.name}",
             kind=SpanKind.INTERNAL,
             start_time_ns=tool.start_ns,
@@ -396,6 +441,14 @@ class SessionAssembler:
                 response_body_captured=bool(tool.output_data),
                 limitations=(_BASE_LIMITATION, *markers),
             ),
+            # NOT `p.correlation`, deliberately. The edge above came from the
+            # core; this field is the OTHER axis, and today it still mixes the
+            # two: `adapter_hook`/`adapter_stream` answer "which source observed
+            # the event", which design §4.1 moves to `capture_sources` and §11
+            # schedules for step 3b. Overwriting it here would silently retire a
+            # declared wire value one step early, so it stays until the step that
+            # owns the vocabulary change replaces it with
+            # `capture_sources=(ADAPTER,)` + `strategy=unit_active`.
             correlation=CorrelationInfo(
                 request_id=tool.tool_use_id,
                 confidence=1.0 if tool.from_hook else 0.7,
@@ -441,10 +494,10 @@ class SessionAssembler:
         entry = sess.subagents.pop(agent_id, None)
         if entry is None:
             return
-        ctx, agent_type, start_ns = entry
+        ctx, agent_type, start_ns, p = entry
         span = InternalSpan(
             context=ctx,
-            parent_span_id=sess.root_ctx.span_id,
+            parent_span_id=p.parent_span_id,
             name=f"invoke_agent {agent_type}",
             kind=SpanKind.INTERNAL,
             start_time_ns=start_ns,
@@ -453,6 +506,11 @@ class SessionAssembler:
             agent=AgentAttributes(name=agent_type, id=agent_id, agent_type=AgentType.SUB_AGENT),
             capture_sources=(CaptureSource.ADAPTER,),
             capture_integrity=CaptureIntegrity(limitations=(_BASE_LIMITATION,)),
+            # No `correlation=p.correlation`, for the reason at `_IN_SESSION`:
+            # the edge to the session root is exact, but WHICH session this hook
+            # belongs to is `_session_for_hook`'s sole-live-session guess, and
+            # `p.correlation` reports the whole thing at confidence 1.0 with no
+            # marker. Unchanged from before step 1.
             extra=(("gen_ai.operation.name", OperationName.INVOKE_AGENT.value),),
         )
         self._client.capture_span(span)
@@ -494,7 +552,7 @@ class SessionAssembler:
 
         span = InternalSpan(
             context=sess.root_ctx,
-            parent_span_id=sess.parent_span_id,
+            parent_span_id=sess.parentage.parent_span_id,
             name="invoke_agent",
             kind=SpanKind.INTERNAL,
             start_time_ns=sess.start_ns,
@@ -507,6 +565,7 @@ class SessionAssembler:
             ),
             capture_sources=(CaptureSource.ADAPTER,),
             capture_integrity=CaptureIntegrity(limitations=limitations),
+            correlation=sess.parentage.correlation,
             extra=tuple(extra),
         )
         self._client.capture_span(span)

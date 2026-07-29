@@ -13,9 +13,10 @@ So this file is not a unit test of the enum. It is the census itself, re-run
 from source on every test run, and it is the mechanism that keeps the two
 halves from drifting apart again. Two drifts produced the situation it guards:
 
-  vocabulary without an emitter — the 15 members step 0 declared, none of which
-  is emitted anywhere today, because nothing in `wardex_sdk/` imports
-  `assembly/` yet;
+  vocabulary without an emitter — the 15 members step 0 declared, of which
+  migration step 1 has since given exactly one a live emitter
+  (`PARENT_UNRESOLVED`, on the orphan-snapshot path in `__init__.py`) and the
+  other 14 still reach no span;
 
   an emitter without vocabulary — the 25 free strings the live code actually
   attaches to spans, none of which was a member before the census.
@@ -134,10 +135,17 @@ marker slot, by site — the other half of the census, and the half that grows.
 
 Today it is two entries, both inside `assembly/` itself: `_parentage.py`'s
 `_MARKER` table, which attaches a member automatically for the two
-`ParentSource` values whose definition is interpretation. Nothing in
-`wardex_sdk/` imports `assembly/` yet, so these fire for no one — which is
-exactly the "vocabulary without an emitter" drift, visible here as a mapping
-rather than as prose.
+`ParentSource` values whose definition is interpretation.
+
+Both entries are SOURCE sites — the place a member NAME appears in a marker
+slot — and that is not the same as the set of markers that reach a span. Since
+migration step 1, `PARENT_UNRESOLVED` does reach one: `capture_state_snapshot`
+stringifies `parentage.limitations` onto the orphan snapshot's opaque kv. It
+does not appear below, and must not, because `__init__.py` names no member —
+the member reference is still `_MARKER`'s, one call away. Adding the file here
+would record a source fact that is not in the source, and the scanner
+(correctly) would not find it. `UNIT_INFERRED_SOLE` still fires for no one: no
+caller passes `ParentSource.UNIT_SOLE` yet.
 
 This is where step 3a's progress is recorded. Rewiring a site moves its entry
 out of `_CENSUS_PY` and into this table; the two tables together are the whole
@@ -266,9 +274,11 @@ _EMITTED_MEMBERS: frozenset[str] = frozenset(
         "SESSION_ABORTED",
         # step 0's, which the census found an emitter for
         "CHILD_SPAN_UNCLOSED",
-        # step 0's, whose emitter is the _parentage.py _MARKER table. Declared
-        # vocabulary with a real reference and no live caller — the two are not
-        # the same thing and this set keeps them apart
+        # step 0's, whose emitter is the _parentage.py _MARKER table. A source
+        # reference and a live caller are not the same thing and this set keeps
+        # them apart: since step 1 wired `capture_state_snapshot`,
+        # PARENT_UNRESOLVED reaches real records, while UNIT_INFERRED_SOLE is
+        # still reference-only (nothing passes `ParentSource.UNIT_SOLE`)
         "PARENT_UNRESOLVED",
         "UNIT_INFERRED_SOLE",
     }

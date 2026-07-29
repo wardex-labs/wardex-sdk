@@ -43,12 +43,32 @@ def test_parse_unknown_version_lenient():
 
 
 def test_format_roundtrip():
-    ctx = SpanContext(trace_id=TraceId.generate(), span_id=SpanId.generate())
+    ctx = SpanContext(trace_id=TraceId.generate(), span_id=SpanId.generate(), trace_flags=1)
     tid, sid, flags = parse_traceparent(format_traceparent(ctx))
-    assert tid == ctx.trace_id and sid == ctx.span_id and flags == 1
+    assert tid == ctx.trace_id and sid == ctx.span_id and flags == ctx.trace_flags
 
 
 def test_format_shape():
-    ctx = SpanContext(trace_id=TraceId.generate(), span_id=SpanId.generate())
+    ctx = SpanContext(trace_id=TraceId.generate(), span_id=SpanId.generate(), trace_flags=1)
     out = format_traceparent(ctx)
     assert out.startswith("00-") and out.endswith("-01") and len(out) == 55
+
+
+def test_format_emits_the_contexts_own_flags_not_a_constant():
+    """V9: the always-sampled invariant moved to `resolve_parentage`.
+
+    It used to live here as a hardcoded `-01`, which promoted an upstream's
+    `-00` to `-01` on the way out. The formatter is now honest, and the reason
+    that is safe is asserted next door: `test_propagation.py`'s
+    `test_get_traceparent_inside_and_outside_span` still reads `-01` for a
+    wardex-rooted trace, because the parentage core stamps flags=1 at
+    origination. Both halves are needed — this one alone would ship `-00`
+    everywhere.
+    """
+    ids = {"trace_id": TraceId.generate(), "span_id": SpanId.generate()}
+
+    assert format_traceparent(SpanContext(**ids, trace_flags=0)).endswith("-00")
+    assert format_traceparent(SpanContext(**ids, trace_flags=1)).endswith("-01")
+    # a flags byte we never set ourselves still round-trips instead of being
+    # rewritten: only bits we were told about reach the wire.
+    assert parse_traceparent(format_traceparent(SpanContext(**ids, trace_flags=0xFF)))[2] == 0xFF
