@@ -24,6 +24,16 @@ All notable changes to this project are documented here. The format follows
   `limitations` field and signals the cap through `truncated` alone.
 
 ### Added
+- Framework adapter for the Anthropic Agent SDK (`claude_agent_sdk`),
+  auto-installed at `init()` when the package is importable. It emits an
+  `invoke_agent` span per run (and one per subagent), with
+  `execute_tool <name>` children correlated back to the turn that issued the
+  call — no instrumentation in your code. Spans are assembled from the SDK's
+  own stream and hook events, so a tool's input is recorded as it was sent
+  rather than re-serialized. Opt out with `wardex.init(adapters=())`, or pin
+  an explicit set with `adapters=(AdapterName.ANTHROPIC_AGENT_SDK,)`. An
+  adapter that fails to install prints a warning and leaves the rest of the
+  SDK running.
 - `CaptureLimits` — every resource bound in the SDK is now configurable via
   `wardex.init(limits=CaptureLimits(...))`, with two exceptions named below.
   The core owns the default values; the Python class holds overrides only, and
