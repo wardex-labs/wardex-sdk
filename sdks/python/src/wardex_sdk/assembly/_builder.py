@@ -443,6 +443,19 @@ class SpanDraft:
         self._integrity.request_body(attempted=input_attempted)
         self._integrity.response_body(attempted=output_attempted)
 
+    def set_end_ns(self, end_ns: int) -> None:
+        """Stamp the end instant on a TWO-PHASE span.
+
+        A unit's span is opened by one framework callback and closed by another,
+        and it is materialized later still — by the sink, which is the only
+        caller of `finish()`. Without a slot for the end instant it would have to
+        travel beside the draft in every table that holds one, which is exactly
+        the two-object shape the adapter's subagent entry had before the draft
+        itself became the thing held. `finish(end_ns=...)` still wins when given,
+        so a one-phase site is unaffected.
+        """
+        self._end_ns = end_ns
+
     def set_status(self, code: StatusCode, message: str = "") -> None:
         self._status = code
         self._status_message = message

@@ -29,6 +29,8 @@ class CaptureLimits:
     max_connections: int | None = None
     max_sessions: int | None = None
     max_session_entries: int | None = None
+    max_units: int | None = None
+    max_entries_per_unit: int | None = None
     mcp_sniff_bytes: int | None = None
     max_buffer_spans: int | None = None
     max_buffer_bytes: int | None = None

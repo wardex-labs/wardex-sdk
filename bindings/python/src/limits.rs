@@ -30,7 +30,8 @@ impl PyLimits {
         max_headers=None, max_body_bytes=None, max_opaque_body_bytes=None,
         max_stream_buffer_bytes=None, max_decoded_bytes=None, max_streams=None,
         max_ws_frame_bytes=None, ws_sample_bytes=None, max_connections=None,
-        max_sessions=None, max_session_entries=None, mcp_sniff_bytes=None,
+        max_sessions=None, max_session_entries=None, max_units=None,
+        max_entries_per_unit=None, mcp_sniff_bytes=None,
         max_buffer_spans=None, max_buffer_bytes=None, replay_buffer_size=None,
         zstd_level=None
     ))]
@@ -47,6 +48,8 @@ impl PyLimits {
         max_connections: Option<usize>,
         max_sessions: Option<usize>,
         max_session_entries: Option<usize>,
+        max_units: Option<usize>,
+        max_entries_per_unit: Option<usize>,
         mcp_sniff_bytes: Option<usize>,
         max_buffer_spans: Option<usize>,
         max_buffer_bytes: Option<usize>,
@@ -68,6 +71,8 @@ impl PyLimits {
                 max_connections: max_connections.unwrap_or(d.max_connections),
                 max_sessions: max_sessions.unwrap_or(d.max_sessions),
                 max_session_entries: max_session_entries.unwrap_or(d.max_session_entries),
+                max_units: max_units.unwrap_or(d.max_units),
+                max_entries_per_unit: max_entries_per_unit.unwrap_or(d.max_entries_per_unit),
                 mcp_sniff_bytes: mcp_sniff_bytes.unwrap_or(d.mcp_sniff_bytes),
                 max_buffer_spans: max_buffer_spans.unwrap_or(d.max_buffer_spans),
                 max_buffer_bytes: max_buffer_bytes.unwrap_or(d.max_buffer_bytes),
@@ -122,6 +127,14 @@ impl PyLimits {
         self.inner.max_session_entries
     }
     #[getter]
+    fn max_units(&self) -> usize {
+        self.inner.max_units
+    }
+    #[getter]
+    fn max_entries_per_unit(&self) -> usize {
+        self.inner.max_entries_per_unit
+    }
+    #[getter]
     fn mcp_sniff_bytes(&self) -> usize {
         self.inner.mcp_sniff_bytes
     }
@@ -160,6 +173,8 @@ fn limits_defaults(py: Python<'_>) -> PyResult<Bound<'_, PyDict>> {
     out.set_item("max_connections", d.max_connections)?;
     out.set_item("max_sessions", d.max_sessions)?;
     out.set_item("max_session_entries", d.max_session_entries)?;
+    out.set_item("max_units", d.max_units)?;
+    out.set_item("max_entries_per_unit", d.max_entries_per_unit)?;
     out.set_item("mcp_sniff_bytes", d.mcp_sniff_bytes)?;
     out.set_item("max_buffer_spans", d.max_buffer_spans)?;
     out.set_item("max_buffer_bytes", d.max_buffer_bytes)?;

@@ -24,6 +24,17 @@ All notable changes to this project are documented here. The format follows
   (a link's `reason` has no OTLP-native home, so it travels there as the
   `wardex.link.reason` link attribute). This is additive: no span the SDK
   builds today carries either, so nothing that used to be exported changes.
+- Two resource limits, `max_units` (512) and `max_entries_per_unit` (256), on
+  `CaptureLimits` and in `crates/wardex-limits`. They bound a logical-unit
+  registry that has not shipped, so both are **inert today** and are listed as
+  such in the README alongside `replay_buffer_size` and `zstd_level`. They are
+  declared ahead of that consumer so its ceilings resolve from the core rather
+  than from Python literals that could drift from it. Neither is a rename of
+  `max_sessions` / `max_session_entries`, which keep their present meaning and
+  their consumer: a per-session table and a cap over one flat table of sessions
+  are not the same quantity as a cap over units of four kinds sharing a single
+  entry point, and reusing the number would silently reinterpret what a user
+  set it to.
 - `SpanBuilder.set_error(error_type, message="")`, so a manual span that the
   host marks as failed can name what failed. Marking a span
   `set_status(StatusCode.ERROR)` without one is still valid and records

@@ -194,10 +194,13 @@ wardex.init(
 )
 ```
 
-Two exceptions are inert today, so setting them has no effect:
-`replay_buffer_size` (nothing reads it yet) and `zstd_level` (read only by the
+Four exceptions are inert today, so setting them has no effect:
+`replay_buffer_size` (nothing reads it yet); `zstd_level` (read only by the
 envelope encoder, which no live export path calls — the OTLP exporter neither
-takes limits nor compresses).
+takes limits nor compresses); and `max_units` / `max_entries_per_unit`, which
+bound a logical-unit registry that has not shipped. The last two are published
+early so that the registry, when it lands, reads its ceilings from the same
+place every other bound comes from.
 
 ## Roadmap
 

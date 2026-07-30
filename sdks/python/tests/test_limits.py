@@ -17,7 +17,9 @@ def test_limits_defaults_returns_every_field():
     assert d["max_body_bytes"] == 32 * 1024 * 1024
     assert d["max_opaque_body_bytes"] == 256 * 1024
     assert d["zstd_level"] == 3
-    assert len(d) == 16
+    assert d["max_units"] == 512
+    assert d["max_entries_per_unit"] == 256
+    assert len(d) == 18
 
 
 def test_limits_construction_defaults_unspecified_fields():
@@ -42,6 +44,25 @@ def test_parser_without_limits_uses_defaults():
 def test_mirror_field_set_matches_core():
     core = _wardex_native.limits_defaults()
     assert set(CaptureLimits.__dataclass_fields__) == set(core)
+
+
+def test_every_mirrored_field_is_readable_on_the_native_object():
+    """Each field must have a #[getter] on the native Limits, not only a slot in
+    limits_defaults() and an argument on __new__.
+
+    Those three sites are separate hand-written lists in bindings/python/src/
+    limits.rs, and only two of them are covered by the tests above: a field can
+    be constructible and present in the defaults dict while unreadable, so a
+    host component that resolves its ceiling off the Limits object would raise
+    AttributeError the first time it ran -- in production, not here.
+    """
+    core = _wardex_native.limits_defaults()
+    native = _wardex_native.Limits()
+    for name in CaptureLimits.__dataclass_fields__:
+        assert getattr(native, name) == core[name], (
+            f"{name} is missing a #[getter] on the native Limits pyclass, or it "
+            f"disagrees with limits_defaults()"
+        )
 
 
 def test_mirror_holds_no_values():
@@ -338,8 +359,8 @@ def test_non_http_tls_traffic_does_not_grow_memory(fake_ssl_socket, bare_ssl_int
 
 # --- Structural guard: every advertised limit must actually be enforced ------
 #
-# The end-to-end tests above pin three fields. The other thirteen were never
-# audited, and two of them were inert: the codec encoder hardcoded the default
+# The end-to-end tests above pin three fields. The rest were never audited,
+# and two of them were inert: the codec encoder hardcoded the default
 # limits (so a configured zstd_level was validated and then discarded) and the
 # byte seam called the semantic parser without limits (so max_decoded_bytes was
 # equally inert) -- while the README and the changelog both promised that every
@@ -700,6 +721,33 @@ _NOT_ENFORCED = {
         "Documented as inert in crates/wardex-limits and in the README's "
         "resource-limits section rather than left for a user to discover. "
         "Delete this entry and add a probe when a replay buffer lands."
+    ),
+    "max_units": (
+        "Declared ahead of its consumer: it bounds the concurrently tracked "
+        "root units of the unit registry, and no registry exists yet -- "
+        "nothing reads the field, so an override changes nothing. It is in the "
+        "catalogue now precisely so the registry cannot be written against a "
+        "Python literal that drifts from crates/wardex-limits; the same reason "
+        "Limitation.UNIT_EVICTED is already declared with no emitter. Note it "
+        "is NOT max_sessions under a new name -- max_sessions bounds one flat "
+        "table of sessions, while a root-unit cap has to survive units of "
+        "several kinds sharing one entry point, so the two cannot be merged "
+        "without silently reinterpreting the number a user set. Delete this "
+        "entry and add a probe when assembly/_units.py lands: drive "
+        "max_units + 1 root units through the registry and assert the evicted "
+        "root's span is emitted carrying Limitation.UNIT_EVICTED, since a "
+        "bound whose enforcement drops data silently is a worse failure than "
+        "an unenforced one."
+    ),
+    "max_entries_per_unit": (
+        "Declared ahead of its consumer, same as max_units: it bounds each "
+        "per-unit table (child units, aliases, dedup keys, open drafts) and no "
+        "unit registry exists yet, so nothing reads it. It generalizes "
+        "max_session_entries rather than replacing it -- that field still has "
+        "a live consumer in adapters/_assembler.py and stays probed above. "
+        "Delete this entry and add a probe when assembly/_units.py lands: "
+        "overflow one unit's child table and assert the rejected child is "
+        "still accounted for on the parent span rather than dropped."
     ),
 }
 

@@ -62,6 +62,26 @@ pub struct Limits {
     /// Maximum entries in each per-session tracking map (open tools, streamed
     /// tool metadata, subagents).
     pub max_session_entries: usize,
+    /// Maximum concurrently tracked *root* logical units.
+    ///
+    /// Deliberately not a flat cap over units of every kind. Children are
+    /// bounded per-unit by `max_entries_per_unit`, and a flat ceiling would
+    /// make "evict the oldest" pick a long-lived session root nearly every
+    /// time, so one chatty session would evict *other* sessions' roots.
+    /// Scoping it to roots keeps the arithmetic a reader expects from a
+    /// concurrency ceiling: N here means N concurrent runs, whatever each run
+    /// does inside itself.
+    ///
+    /// Not read by anything today — the unit registry that consumes it has not
+    /// shipped, so setting it changes nothing. It is declared here, ahead of
+    /// that consumer, so the bound is never expressed as a Python literal that
+    /// could drift from this crate.
+    pub max_units: usize,
+    /// Maximum entries in each per-unit table (child units, lookup aliases,
+    /// de-duplication keys, open span drafts). Generalizes
+    /// `max_session_entries` to units of every kind; same order, same
+    /// semantics. Inert today for the same reason as `max_units`.
+    pub max_entries_per_unit: usize,
     /// Bytes read before giving up on detecting JSON-RPC over a stdio stream.
     pub mcp_sniff_bytes: usize,
     /// Maximum spans buffered before the oldest are dropped.
@@ -99,6 +119,8 @@ impl Default for Limits {
             max_connections: 4096,
             max_sessions: 512,
             max_session_entries: 256,
+            max_units: 512,
+            max_entries_per_unit: 256,
             mcp_sniff_bytes: 8192,
             max_buffer_spans: 2048,
             max_buffer_bytes: 64 * 1024 * 1024,
@@ -126,6 +148,8 @@ mod tests {
         assert_eq!(l.max_connections, 4096);
         assert_eq!(l.max_sessions, 512);
         assert_eq!(l.max_session_entries, 256);
+        assert_eq!(l.max_units, 512);
+        assert_eq!(l.max_entries_per_unit, 256);
         assert_eq!(l.mcp_sniff_bytes, 8192);
         assert_eq!(l.max_buffer_spans, 2048);
         assert_eq!(l.max_buffer_bytes, 64 * 1024 * 1024);
