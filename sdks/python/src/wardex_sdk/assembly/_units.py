@@ -1304,13 +1304,39 @@ class UnitRegistry:
         self._flush(pending)
 
     def close_all(self, *, reason: Limitation) -> None:
-        """Close every live root. Called by adapter uninstall and client teardown.
+        """Close every live root. The teardown BACKSTOP, not the teardown itself.
+
+        A caller that owns state ABOUT a unit — the Agent SDK assembler owns a
+        session's model, conversation and still-open tool spans — must finalize
+        through its own path first, or this emits a root stripped of everything
+        that caller had not yet stamped onto it. What is left afterwards is the
+        units no such caller owns: an in-process tool call opened with no
+        holder is registered as a root here and is reachable from nowhere else.
+        Those are what this closes.
 
         `reason` is the caller's — `ADAPTER_UNINSTALLED` from an uninstall,
         `UNIT_INTERRUPTED` from a cancelled or shutting-down process — so the
         limitation census records this as a slot it cannot follow rather than
         pretending to have read it.
+
+        Declines rather than proceeds when this thread already holds the lock.
+        The lock is an `RLock`, so re-entering does not deadlock — it does
+        something worse, and quietly: a signal handler runs on the main thread
+        at an arbitrary bytecode boundary, so it can land INSIDE a half-finished
+        mutation, walk `self._roots` while an outer frame is mid-update, and
+        emit from state no reader was ever supposed to see. Declining costs a
+        teardown that was already racing a dying process; proceeding costs
+        correctness at the one moment nothing can be re-run.
         """
+        # `_is_owned()` and not `acquire(blocking=False)`: on an `RLock` the
+        # non-blocking acquire SUCCEEDS for the thread that already owns it, so
+        # spelling the guard that way passes every re-entry straight through
+        # while looking like it checks something. The attribute is private but
+        # not optional — this SDK ships a compiled extension and runs only where
+        # that imports, and there `threading.RLock()` is `_thread.RLock`.
+        if self._lock._is_owned():
+            counters.bump("assembly._units.close_all_reentrant")
+            return
         end = time.time_ns()
         with self._lock:
             pending: list[SpanDraft] = []

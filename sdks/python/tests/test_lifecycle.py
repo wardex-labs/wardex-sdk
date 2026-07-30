@@ -1,5 +1,6 @@
 """_lifecycle — atexit single registration, signal chaining, re-init teardown."""
 
+import json
 import os
 import signal
 import threading
@@ -12,6 +13,9 @@ from wardex_sdk._client import Client
 from wardex_sdk._config import WardexConfig
 from wardex_sdk._enums import SpanKind
 from wardex_sdk._types import InternalEnvelope, InternalSpan, SpanContext, SpanId, TraceId
+from wardex_sdk.adapters._base import AdapterInterface
+from wardex_sdk.adapters._registry import get_registry as get_adapter_registry
+from wardex_sdk.assembly import Limitation
 from wardex_sdk.transport._base import Transport
 
 
@@ -355,3 +359,155 @@ def test_this_file_leaves_the_process_signal_table_clean():
     assert now == _DISPOSITIONS_AT_IMPORT, (
         f"signal dispositions changed: {_DISPOSITIONS_AT_IMPORT} -> {now}"
     )
+
+
+# ==========================================================================
+# Shutdown reaches the units, not only the buffer
+# ==========================================================================
+#
+# `client.flush()` sends what is already IN the buffer. A run still in flight
+# has nothing there — its root span does not exist yet, because the thing that
+# creates it is the close. So a shutdown that only flushes is a shutdown that
+# loses exactly the span an interrupted run is about.
+
+
+class _UnitAdapter(AdapterInterface):
+    """An adapter holding one live session, on the real assembler."""
+
+    def __init__(self, client):
+        from wardex_sdk.adapters._assembler import SessionAssembler
+
+        self._asm = SessionAssembler(client)
+        self.close_units_calls: list = []
+
+    def name(self) -> str:
+        return "test_unit_adapter"
+
+    def install(self, client) -> None:
+        self._asm.on_outbound(
+            1,
+            json.dumps(
+                {"type": "user", "session_id": "s-1", "message": {"role": "user", "content": "go"}}
+            ),
+        )
+        self._asm.on_inbound(
+            1,
+            {"type": "system", "subtype": "init", "session_id": "s-1", "model": "claude-sonnet-5"},
+        )
+
+    def uninstall(self) -> None:
+        self._asm.close_all_sessions(marker=Limitation.ADAPTER_UNINSTALLED)
+
+    def close_units(self, *, marker: Limitation) -> None:
+        self.close_units_calls.append(marker)
+        self._asm.close_all_sessions(marker=marker)
+
+
+def _root_names(transport):
+    return [s.name for e in transport.envelopes for s in e.spans]
+
+
+@pytest.fixture
+def unit_adapter():
+    """A registered adapter with a live session; always deregistered after."""
+    registry = get_adapter_registry()
+    made: list = []
+
+    def build(client):
+        adapter = _UnitAdapter(client)
+        registry.install(adapter, client)
+        made.append(adapter)
+        return adapter
+
+    yield build
+    registry._installed.pop("test_unit_adapter", None)
+
+
+def test_teardown_closes_units_while_the_client_can_still_send_them(unit_adapter):
+    """The ordering inside `_teardown` is what makes this fix reachable at all.
+
+    Adapters are uninstalled BEFORE `client.close()`, so a span the uninstall
+    produces still has somewhere to go. Reverse the two lines and the teardown
+    still runs, still walks every session, still builds every span — and
+    `capture_span` drops each one on the floor, which is the same missing span
+    this whole path exists to stop, arriving by a longer route.
+    """
+    transport = _Recording()
+    client = _client(transport, flush_interval=3600.0)
+    _lifecycle.install(client, client.config)
+    unit_adapter(client)
+
+    _lifecycle._teardown(client)
+
+    assert "invoke_agent" in _root_names(transport)
+
+
+def test_the_signal_handler_closes_live_units_when_the_process_is_about_to_die(unit_adapter):
+    """SIGTERM under the default disposition never reaches atexit.
+
+    The handler ends the process itself — it restores SIG_DFL and re-raises, so
+    the interpreter never runs its exit hooks and the adapter is never
+    uninstalled. That is the shape `docker stop` and a kubelet send. Closing the
+    units here, before the flush that follows, is the only chance the run's span
+    gets.
+    """
+    transport = _Recording()
+    client = _client(transport, flush_interval=3600.0)
+    _lifecycle.install(client, client.config)
+    adapter = unit_adapter(client)
+
+    _lifecycle._prev_handlers[signal.SIGTERM] = signal.SIG_IGN  # do not kill pytest
+    _lifecycle._handler(signal.SIGTERM, None)
+
+    assert adapter.close_units_calls == []  # SIG_IGN is not the dying disposition
+
+    _lifecycle._prev_handlers[signal.SIGTERM] = signal.SIG_DFL
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(os, "kill", lambda *a: None)
+        _lifecycle._handler(signal.SIGTERM, None)
+
+    assert adapter.close_units_calls == [Limitation.UNIT_INTERRUPTED]
+    assert "invoke_agent" in _root_names(transport)
+
+
+def test_the_signal_handler_leaves_units_open_when_the_app_carries_on(unit_adapter):
+    """A callable prior handler means the app decided what a signal means, and
+    the program may well keep running. Closing every live unit there would end
+    sessions that are still being driven — reporting a run as interrupted while
+    it goes on producing spans that now have no parent.
+    """
+    transport = _Recording()
+    client = _client(transport, flush_interval=3600.0)
+    _lifecycle.install(client, client.config)
+    adapter = unit_adapter(client)
+
+    seen: list = []
+    _lifecycle._prev_handlers[signal.SIGTERM] = lambda signum, frame: seen.append(signum)
+    _lifecycle._handler(signal.SIGTERM, None)
+
+    assert seen == [signal.SIGTERM], "the chain to the app's handler broke"
+    assert adapter.close_units_calls == []
+    assert "invoke_agent" not in _root_names(transport)
+
+
+def test_an_adapter_whose_close_units_raises_cannot_take_the_flush_with_it(unit_adapter):
+    """This runs from a signal handler on a dying process. An exception escaping
+    into `_handler` would skip the flush and lose the buffer as well as the
+    units — one adapter's failure costing every other adapter's spans.
+    """
+    transport = _Recording()
+    client = _client(transport, flush_interval=3600.0)
+    _lifecycle.install(client, client.config)
+    adapter = unit_adapter(client)
+
+    def boom(*, marker):
+        raise RuntimeError("adapter is broken")
+
+    adapter.close_units = boom
+    client.capture_span(_span())
+    _lifecycle._prev_handlers[signal.SIGTERM] = signal.SIG_DFL
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(os, "kill", lambda *a: None)
+        _lifecycle._handler(signal.SIGTERM, None)  # must not raise
+
+    assert transport.envelopes, "the flush was lost with the failing adapter"

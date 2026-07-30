@@ -241,12 +241,19 @@ class Limitation(Enum):
     """The unit was torn down by cancellation or interpreter shutdown rather
     than by a normal end-of-run.
 
-    Declared; no emitter. The mechanism has landed and the caller has not:
-    ``assembly/_units.py::UnitRegistry.close_all`` takes a ``Limitation`` as its
-    ``reason`` and notes it on every live root before closing it, and this
-    member is one of the two that method is built for. Nothing in the SDK calls
-    ``close_all`` yet, so neither this nor its sibling ``ADAPTER_UNINSTALLED``
-    reaches a span.
+    Emitted by ``_lifecycle.py``'s signal handler, and by that one alone. It is
+    reached only on the disposition where the app left the signal at its
+    default: there the handler ends the process itself, so ``atexit`` never
+    runs and the ordinary teardown never gets its turn. Under any other
+    disposition the program either exits through the interpreter — where atexit
+    reaches the adapter's ``uninstall`` and the span carries
+    ``ADAPTER_UNINSTALLED`` instead — or carries on running, and closing a
+    session that is still being driven would be the lie this marker exists to
+    avoid telling.
+
+    Reads as the more honest of the pair: it says a shutdown cut the run off,
+    which is what a user wants to know, where its sibling says only that wardex
+    stopped watching.
     """
 
     CHILD_SPAN_UNCLOSED = "child_span_unclosed"
@@ -289,11 +296,17 @@ class Limitation(Enum):
     ADAPTER_UNINSTALLED = "adapter_uninstalled"
     """The span was closed by ``uninstall()`` rather than by the framework.
 
-    Declared; no emitter. Deliberately NOT merged with ``WS_NO_CLOSE`` even
-    though both of today's ``ws_no_close`` sites sit inside ``uninstall()``:
-    the fact a user reads off ``WS_NO_CLOSE`` is capture completeness (no CLOSE
-    frame, so close code and duration are untrustworthy), not lifecycle. The
-    two are correct *together*.
+    Emitted from ``adapters/_anthropic_agent_sdk.py::uninstall``, which is also
+    the path an ordinary interpreter exit takes: ``atexit`` tears the adapter
+    down, so this — not ``UNIT_INTERRUPTED`` — is what a Ctrl-C ultimately puts
+    on the span. The two are not interchangeable. This one is mechanical and
+    always true of an uninstall; its sibling additionally claims the process was
+    cut off, which is only knowable in the signal handler.
+
+    Deliberately NOT merged with ``WS_NO_CLOSE`` even though both of today's
+    ``ws_no_close`` sites sit inside ``uninstall()``: the fact a user reads off
+    ``WS_NO_CLOSE`` is capture completeness (no CLOSE frame, so close code and
+    duration are untrustworthy), not lifecycle. The two are correct *together*.
     """
 
     PATCH_SUPERSEDED = "patch_superseded"

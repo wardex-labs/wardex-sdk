@@ -19,6 +19,7 @@ import threading
 
 from ._client import Client
 from ._config import WardexConfig
+from .assembly import Limitation
 
 _SIGNALS = (signal.SIGINT, signal.SIGTERM)
 _SIGNAL_FLUSH_TIMEOUT = 2.0  # short bound — never delay shutdown (design §4.3)
@@ -27,6 +28,11 @@ _current_client: Client | None = None
 _atexit_registered = False
 _signals_installed = False
 _prev_handlers: dict[int, object] = {}  # signum → handler we chained over
+#: `AdapterRegistry.close_units_all`, resolved at install time. Bound here
+#: rather than imported in `_handler` for two reasons: this module reaches
+#: `adapters` only inside a function (layering), and a signal can land in the
+#: middle of an import and hand the handler a half-initialized module.
+_close_units: object | None = None
 
 
 def current_client() -> Client | None:
@@ -76,6 +82,22 @@ def _atexit_handler() -> None:
 def _handler(signum: int, frame: object) -> None:
     client = _current_client
     if client is not None:
+        if _prev_handlers.get(signum) is signal.SIG_DFL and _close_units is not None:
+            # Close live units BEFORE the flush, or the flush has nothing of
+            # them to send. Gated on SIG_DFL because that is exactly the
+            # disposition where the process ends in `_handler` below, via
+            # `os.kill`, and atexit does NOT run — measured for SIGTERM. Any
+            # other disposition either exits through the interpreter (atexit
+            # runs, and the adapter uninstall closes the units there) or keeps
+            # the program running, and closing every live unit under a program
+            # that carries on would truncate sessions still being driven.
+            #
+            # No `try` around it, and that is not an oversight: `close_units_all`
+            # guards every adapter individually with the one sanctioned swallow
+            # (I6), so a failing adapter is already counted and already cannot
+            # reach the flush below. Adding a second net here would add an
+            # unsanctioned one and hide nothing that is not already caught.
+            _close_units(marker=Limitation.UNIT_INTERRUPTED)
         try:
             client.flush(timeout=_SIGNAL_FLUSH_TIMEOUT)
         except Exception:
@@ -91,9 +113,12 @@ def _handler(signum: int, frame: object) -> None:
 
 
 def _install_signal_handlers(*, debug: bool) -> None:
-    global _signals_installed
+    global _signals_installed, _close_units
     if _signals_installed:
         return
+    from .adapters._registry import get_registry as get_adapter_registry
+
+    _close_units = get_adapter_registry().close_units_all
     if threading.current_thread() is not threading.main_thread():
         if debug:
             print(

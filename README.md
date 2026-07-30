@@ -47,6 +47,9 @@ wardex.close()  # optional — spans auto-flush every 5s, on buffer threshold, a
   `pii_disabled_categories={PIICategory.IP_ADDRESS}` for per-category opt-out)
 - Background batching: automatic flush every 5s / on buffer threshold /
   at exit and on SIGINT/SIGTERM (chained; opt out with `flush_on_signals=False`)
+- Shutdown closes agent runs that are still in flight, so an interrupted run
+  still exports its span — marked `unit_interrupted` or `adapter_uninstalled`
+  — instead of vanishing along with its open tool calls
 - Framework adapter: Anthropic Agent SDK (`claude_agent_sdk`) — auto-detected,
   zero-instrumentation `invoke_agent`/`chat` spans with tool-call correlation
 

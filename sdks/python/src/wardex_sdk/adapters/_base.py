@@ -5,6 +5,8 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING
 
+from ..assembly import Limitation
+
 if TYPE_CHECKING:
     from .._client import Client
 
@@ -24,3 +26,14 @@ class AdapterInterface(ABC):
 
     @abstractmethod
     def uninstall(self) -> None: ...
+
+    def close_units(self, *, marker: Limitation) -> None:
+        """Close whatever spans are still open, but stay installed.
+
+        Concrete and not abstract, deliberately. This exists for the shutdown
+        signal path, which most adapters have nothing to answer for — an
+        adapter that holds no open span across calls is already correct doing
+        nothing. Making it abstract would break every out-of-tree adapter to
+        force them all to write the same empty body.
+        """
+        return None

@@ -227,6 +227,24 @@ All notable changes to this project are documented here. The format follows
   configured at all" ever meant "filter nothing". That is now what the code
   says. Nothing changes for a `capture_mode` set to a `CaptureMode` member.
 
+### Fixed
+- An agent run still in flight when the process stopped exported **nothing**.
+  A session's root span is created by its close, so a run that never reached
+  one left no span at all — not a truncated one, not a marked one, and no
+  counter moved. An interrupted run and a run that never started produced
+  identical data, which is the shape of loss nothing can find later. Shutdown
+  now finalizes live sessions: their still-open tool calls and unstopped
+  sub-agents are emitted first, then the root, carrying `adapter_uninstalled`
+  or `unit_interrupted` depending on how the process ended. This affects
+  Ctrl-C, `SIGTERM` (what `docker stop` and a kubelet send), an explicit
+  `wardex.close()`, and a second `wardex.init()` — a re-init flushes the
+  previous client's live runs into that client rather than abandoning them.
+  Under `SIGTERM` the units are closed inside the signal handler, before the
+  flush, because there the process ends in the handler and `atexit` never
+  runs. That only happens when the signal was left at its default
+  disposition: an app that installed its own handler may well keep running,
+  and ending its live sessions would be a worse lie than a missing span.
+
 ## [0.2.0b1] - 2026-07-28
 
 ### Breaking

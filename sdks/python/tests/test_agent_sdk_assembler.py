@@ -597,3 +597,173 @@ def test_closing_a_retired_transport_does_not_restamp_the_span_it_already_shippe
     assert shipped.conversation is None
     assert [s for s in client.spans if s.name == "invoke_agent"] == [shipped]
     assert asm.open_session_count() == 1  # only the second session is left
+
+
+# ==========================================================================
+# Shutdown — the session that is still live when the process stops
+# ==========================================================================
+#
+# The whole class of bug here is a span that simply does not exist. There is no
+# marker to look for, no counter that moves, and no failing assertion anywhere
+# else in this file: a run that was interrupted looks exactly like a run that
+# was never started. So these tests assert on the presence and the CONTENTS of
+# a span that the code they defend is the only reason to expect at all.
+
+
+def _live_session(client=None):
+    """A session mid-run: init seen, one tool open, one subagent unstopped."""
+    asm = SessionAssembler(client if client is not None else FakeClient())
+    _outbound(asm, key=1)
+    asm.on_inbound(1, INIT)
+    asm.on_hook(
+        "SubagentStart", {"session_id": "s-1", "agent_id": "a-1", "agent_type": "researcher"}, None
+    )
+    asm.on_hook(
+        "PreToolUse",
+        {"session_id": "s-1", "tool_name": "Bash", "tool_input": {"command": "ls"}},
+        "toolu_01",
+    )
+    return asm
+
+
+def test_a_live_session_emits_its_root_when_teardown_arrives():
+    """The bug in one assertion: before this, the span did not exist.
+
+    A run still in flight at shutdown produced nothing — not a truncated span,
+    not a marked one, nothing — because the only thing that closes a session is
+    the transport closing, and an interrupted process never gets there. The
+    marker is what tells a reader the run did not simply stop being interesting.
+    """
+    client = FakeClient()
+    asm = _live_session(client)
+
+    asm.close_all_sessions(marker=Limitation.ADAPTER_UNINSTALLED)
+
+    roots = [s for s in client.spans if s.name == "invoke_agent"]
+    assert len(roots) == 1
+    assert Limitation.ADAPTER_UNINSTALLED in roots[0].capture_integrity.limitations
+
+
+def test_the_torn_down_root_carries_the_runs_identity_not_a_stub():
+    """Which is why teardown runs through the assembler and not the registry.
+
+    `UnitRegistry.close_all` can end a unit, but everything that says WHICH run
+    it was — the model, the conversation id, the turn totals — lives in the
+    assembler's `_Session`, not in the unit. Closing from below emits an
+    `invoke_agent` still carrying the open-time placeholder name and no
+    conversation at all: a span that exists but cannot be attributed to
+    anything, which is barely better than the one that was missing.
+    """
+    client = FakeClient()
+    asm = _live_session(client)
+
+    asm.close_all_sessions(marker=Limitation.ADAPTER_UNINSTALLED)
+
+    root = next(s for s in client.spans if s.name == "invoke_agent")
+    assert root.conversation is not None
+    assert root.conversation.session_id == "s-1"
+    assert root.agent.name == "claude-sonnet-5"
+
+
+def test_teardown_drains_open_tools_and_unstopped_subagents_before_the_root():
+    """A session's children do not live in the registry, so a registry-only
+    teardown drops them silently — the tool call that was running when the
+    process died is exactly the one an operator goes looking for.
+
+    Order is asserted too, and it is not cosmetic: a consumer that streams sees
+    the subtree before its root, so a child arriving after its parent has
+    already been reported closed is a child with nowhere to attach.
+    """
+    client = FakeClient()
+    asm = _live_session(client)
+
+    asm.close_all_sessions(marker=Limitation.ADAPTER_UNINSTALLED)
+
+    names = [s.name for s in client.spans]
+    assert any(n.startswith("execute_tool") for n in names), names
+    assert any(n.startswith("invoke_agent researcher") for n in names), names
+    assert names.index("invoke_agent") == len(names) - 1, names
+
+
+def test_teardown_empties_the_assemblers_tables():
+    """Left populated, they poison a bound's audit rather than merely leaking.
+
+    A straggler for a session this loop already finalized routes into
+    `_live_session`, which reads a retired entry as a registry eviction and
+    bumps the counter that exists to tell a user their `max_units` is too low.
+    """
+    client = FakeClient()
+    asm = _live_session(client)
+
+    asm.close_all_sessions(marker=Limitation.ADAPTER_UNINSTALLED)
+
+    assert asm._by_key == {}
+    assert asm._by_session_id == {}
+    assert asm.open_session_count() == 0
+
+
+def test_teardown_declines_when_this_thread_already_holds_the_lock(tallies):
+    """The signal-handler case, and the reason the guard is not a try-lock.
+
+    A handler runs on the main thread at an arbitrary bytecode boundary, so it
+    can land INSIDE a half-finished mutation. The lock is an `RLock`, so
+    re-entering does not deadlock — it walks the tables mid-update and emits
+    from state no reader was meant to see. Declining loses a teardown that was
+    already racing a dying process; proceeding loses correctness.
+    """
+    client = FakeClient()
+    asm = _live_session(client)
+
+    with asm._lock:
+        asm.close_all_sessions(marker=Limitation.ADAPTER_UNINSTALLED)
+        assert client.spans == []
+
+    assert tallies("adapters.assembler.close_all_sessions_reentrant") == 1
+
+    asm.close_all_sessions(marker=Limitation.ADAPTER_UNINSTALLED)
+    assert [s.name for s in client.spans if s.name == "invoke_agent"] == ["invoke_agent"]
+
+
+def test_a_second_teardown_does_not_emit_the_root_twice():
+    """Two shutdown paths can both fire — the signal handler closes units and
+    then the interpreter runs atexit, which uninstalls. The second must be a
+    no-op rather than a duplicate run in the user's trace.
+    """
+    client = FakeClient()
+    asm = _live_session(client)
+
+    asm.close_all_sessions(marker=Limitation.UNIT_INTERRUPTED)
+    asm.close_all_sessions(marker=Limitation.ADAPTER_UNINSTALLED)
+
+    assert [s.name for s in client.spans].count("invoke_agent") == 1
+
+
+def test_teardown_also_closes_a_call_unit_no_session_owns():
+    """Why the registry sweep runs as well, and not as belt-and-braces.
+
+    An in-process tool handler that runs with no session to hang off — the pin
+    did not reach it and nothing else is live — opens its CALL unit with no
+    parent, which makes it a ROOT of the registry that appears in no `_Session`
+    at all. Walking the assembler's own tables cannot find it by construction.
+    It is also the span most worth having: a tool call wardex could not attach
+    to a run is already the anomalous one.
+    """
+    from wardex_sdk._types import ToolAttributes
+    from wardex_sdk.assembly import EMPTY_AMBIENT, SpanIntent
+
+    client = FakeClient()
+    asm = _live_session(client)
+    orphan = asm._units.open(
+        UnitKind.CALL,
+        UnitKey("mcp.tool.call", "srv/greet#1"),
+        ambient=EMPTY_AMBIENT,
+        intent=SpanIntent.EXECUTE_TOOL,
+        subject="greet",
+    )
+    orphan.draft.set_tool(ToolAttributes(name="greet"))
+    assert orphan in asm._units._roots, "the no-holder branch stopped producing a root"
+
+    asm.close_all_sessions(marker=Limitation.ADAPTER_UNINSTALLED)
+
+    assert not orphan.is_live
+    assert any(s.name == "execute_tool greet" for s in client.spans), [s.name for s in client.spans]

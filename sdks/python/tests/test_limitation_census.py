@@ -177,6 +177,18 @@ _MEMBER_SITES: dict[str, frozenset[str]] = {
     # its root with no marker and no test, which is the silent drop I10 forbids.
     "UNIT_EVICTED": frozenset({"adapters/_assembler.py", "assembly/_units.py"}),
     "SESSION_ABORTED": frozenset({"adapters/_assembler.py"}),
+    # The two shutdown markers, and the split between them is which shutdown
+    # actually happened rather than which code path ran. The adapter's
+    # `uninstall()` names ADAPTER_UNINSTALLED, and it is what an ordinary exit
+    # reaches, because atexit tears the adapter down. `_lifecycle.py` names
+    # UNIT_INTERRUPTED from the signal handler, on the one disposition where
+    # the process dies inside the handler and atexit provably never runs.
+    #
+    # Both members existed here as declarations with no emitter for as long as
+    # `close_all` had no production caller — the state this table is designed to
+    # make visible rather than comfortable.
+    "ADAPTER_UNINSTALLED": frozenset({"adapters/_anthropic_agent_sdk.py"}),
+    "UNIT_INTERRUPTED": frozenset({"_lifecycle.py"}),
 }
 """Every place a `Limitation` MEMBER (rather than a free string) reaches a
 marker slot, by site — the other half of the census, and the half that grew.
@@ -386,6 +398,17 @@ _EMITTED_MEMBERS: frozenset[str] = frozenset(
         # correction stops being a declaration.
         "TOOL_CALL_ID_UNAVAILABLE_IN_PROCESS",
         "TOOL_NAME_COLLISION",
+        # pre-census declared, and the seventh and eighth to move from
+        # "declared" to "emitted" — but by a route neither of the others took.
+        # No emitter was built for these: `UnitRegistry.close_all` could always
+        # attach them and had no production caller, so they sat in the
+        # vocabulary describing a shutdown that never wrote anything down. What
+        # moved is not the marker but the teardown — the adapter's `uninstall`
+        # and the SIG_DFL branch of the signal handler now finalize live
+        # sessions instead of dropping them. A span that used to simply not
+        # exist now exists and says why it is short.
+        "ADAPTER_UNINSTALLED",
+        "UNIT_INTERRUPTED",
     }
 )
 """Which MEMBERS have an emit site today, derived independently below.
@@ -873,6 +896,13 @@ _UNRESOLVED_PY: frozenset[tuple[str, str]] = frozenset(
         ("assembly/_units.py", "Name:inherited"),
         ("assembly/_units.py", "Name:marker"),
         ("assembly/_units.py", "Name:reason"),
+        # The two forwards that carry a shutdown marker down to the assembler:
+        # `AnthropicAgentSdkAdapter.close_units` and `close_units_all`. Both are
+        # one-line passes with no value of their own. The members they carry are
+        # spelled as literals at the two sites that DECIDE them — the adapter's
+        # `uninstall` and the signal handler — and both are in `_MEMBER_SITES`.
+        ("adapters/_anthropic_agent_sdk.py", "Name:marker"),
+        ("adapters/_registry.py", "Name:marker"),
         ("interceptors/_seam.py", "Name:marker"),
         ("interceptors/_seam.py", "Tuple"),
         ("interceptors/_socket.py", "Tuple"),

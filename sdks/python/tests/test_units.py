@@ -774,10 +774,13 @@ def test_a_pin_from_another_registry_is_not_this_registrys_parent():
     a second `init()` — a new adapter, a new registry — reads the previous
     registry's pin verbatim: same object, `is_live` True, no counter.
 
-    The staleness gate below it never fires on that path, because nothing in
-    production closes a dropped registry's units (`close_all` has no production
-    caller). So the leaked unit is handed out at `UNIT_ACTIVE`/1.0 and the work
-    is filed into a registry that no longer exists.
+    The staleness gate below it never fires on that path. Teardown does now
+    close a registry's units, but it is reached from the adapter's `uninstall`,
+    and a re-`init()` uninstalls the PREVIOUS adapter — not a registry someone
+    dropped on the floor without one. So the leaked unit is still handed out at
+    `UNIT_ACTIVE`/1.0 and the work is filed into a registry that no longer
+    exists; the foreign-registry check below is what catches it, and it is the
+    only thing that does.
     """
     reg_a = registry()
     unit_a = open_session(reg_a, "a")
@@ -1238,3 +1241,72 @@ def _a_context():
     from wardex_sdk.assembly import resolve_parentage
 
     return resolve_parentage(EMPTY_AMBIENT).child_context()
+
+
+def test_close_all_declines_when_this_thread_already_holds_the_lock():
+    """The registry lock is an `RLock`, so the failure this guards is not a hang.
+
+    A signal handler runs on the main thread wherever the interpreter happened
+    to be, which includes the middle of a registry mutation. Re-entering an
+    RLock succeeds, so `close_all` would walk `_roots` while an outer frame is
+    partway through updating it and emit spans built from state nobody meant to
+    be readable. Declining costs a teardown that was already racing a dying
+    process.
+    """
+    sink = RecordingSink()
+    reg = registry(sink=sink)
+    root = open_session(reg)
+
+    with reg._lock:
+        reg.close_all(reason=Limitation.UNIT_INTERRUPTED)
+        assert sink.drafts == []
+        assert root.is_live
+
+    assert counters.get("assembly._units.close_all_reentrant") == 1
+
+    reg.close_all(reason=Limitation.UNIT_INTERRUPTED)
+    assert not root.is_live
+    assert len(sink.drafts) == 1
+
+
+def test_a_non_blocking_acquire_could_not_be_that_guard():
+    """Pins the SPELLING, because the obvious simplification is silently broken.
+
+    `acquire(blocking=False)` reads like "is the lock free?" and on an `RLock`
+    it is not: the owning thread's non-blocking acquire SUCCEEDS. A guard
+    written that way passes every re-entry straight through while looking, in
+    review and in a green suite, exactly like a guard.
+    """
+    reg = registry()
+
+    with reg._lock:
+        acquired = reg._lock.acquire(blocking=False)
+        if acquired:
+            reg._lock.release()
+        assert acquired is True, "an RLock stopped re-admitting its owner"
+        assert reg._lock._is_owned() is True
+
+    assert reg._lock._is_owned() is False
+
+
+def test_the_registry_lock_must_stay_reentrant():
+    """`close_all` re-enters its own lock through `Unit.note()`, with no signal
+    involved. Spelling the lock as a plain `Lock` — the reflex when a comment
+    says "held from a signal handler" — deadlocks the ordinary teardown.
+    """
+    sink = RecordingSink()
+    reg = registry(sink=sink)
+    open_session(reg)
+
+    done: list[bool] = []
+
+    def drive():
+        reg.close_all(reason=Limitation.UNIT_INTERRUPTED)
+        done.append(True)
+
+    thread = threading.Thread(target=drive, daemon=True)
+    thread.start()
+    thread.join(timeout=5.0)
+
+    assert done == [True], "close_all did not return — the lock is no longer reentrant"
+    assert len(sink.drafts) == 1

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from ..assembly import guard
+from ..assembly import Limitation, guard
 from ._base import AdapterInterface
 
 if TYPE_CHECKING:
@@ -38,6 +38,20 @@ class AdapterRegistry:
             adapter = self._installed.pop(name)
             with guard(f"adapters.{name}.uninstall"):
                 adapter.uninstall()
+
+    def close_units_all(self, *, marker: Limitation) -> None:
+        """Ask every INSTALLED adapter to close its open spans, and keep it installed.
+
+        Iterates without popping, which is the difference from `uninstall_all`:
+        this runs from the signal handler, where the process may or may not be
+        about to die, and an adapter that stopped being installed because a
+        shutdown signal arrived would stop capturing for a program that then
+        carries on. Guarded per adapter for `uninstall_all`'s reason — one
+        failure here must not cost the flush that follows it.
+        """
+        for name, adapter in list(self._installed.items()):
+            with guard(f"adapters.{name}.close_units"):
+                adapter.close_units(marker=marker)
 
     def is_installed(self, name: str) -> bool:
         return name in self._installed

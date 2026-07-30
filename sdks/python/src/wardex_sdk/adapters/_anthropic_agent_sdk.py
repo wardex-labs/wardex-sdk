@@ -597,6 +597,18 @@ class AnthropicAgentSdkAdapter(AdapterInterface):
         )
         self._installed = True
 
+    def close_units(self, *, marker: Limitation) -> None:
+        """Close live sessions WITHOUT uninstalling — the shutdown-signal path.
+
+        Separate from `uninstall` because the two shutdowns differ in what may
+        still arrive afterwards. An uninstall has removed the patches, so
+        nothing new can reach the assembler; a signal handler leaves them in
+        place and returns to the interpreter.
+        """
+        assembler = self._assembler
+        if assembler is not None:
+            assembler.close_all_sessions(marker=marker)
+
     def uninstall(self) -> None:
         if not self._installed:
             return
@@ -606,8 +618,17 @@ class AnthropicAgentSdkAdapter(AdapterInterface):
         # the surface raised `KeyError` out of `uninstall()` — into the host.
         self._patches.restore_all()
         self._names.clear()
+        # Latch first, drain second. Every callback into this adapter gates on
+        # `self._assembler is not None`, so nulling it before the drain leaves a
+        # straggler — a read already in flight on the reader task — no session
+        # table to open a fresh root in. Draining first would leave that window
+        # open for the whole walk, and the root it opened would be live in a
+        # registry nothing will ever close again.
+        assembler = self._assembler
         self._assembler = None
         self._installed = False
+        if assembler is not None:
+            assembler.close_all_sessions(marker=Limitation.ADAPTER_UNINSTALLED)
 
 
 class _TransportTee:

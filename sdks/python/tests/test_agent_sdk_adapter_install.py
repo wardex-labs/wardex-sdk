@@ -15,6 +15,7 @@ from wardex_sdk.adapters._anthropic_agent_sdk import (
     AnthropicAgentSdkAdapter,
     _prepare_options,
 )
+from wardex_sdk.assembly import Limitation
 
 RESULT_LINE = {
     "type": "result",
@@ -157,5 +158,105 @@ def test_query_passthrough_with_fake_transport():
         names = [s.name for s in client.spans]
         assert "invoke_agent" in names
         assert any(n.startswith("chat") for n in names)
+    finally:
+        adapter.uninstall()
+
+
+def test_uninstall_emits_the_span_of_a_run_that_never_finished():
+    """The real Ctrl-C path, end to end through the adapter.
+
+    An interpreter exit reaches `atexit` -> `_teardown` -> this `uninstall()`,
+    and until it closed the units a run interrupted mid-flight left NOTHING —
+    not a truncated span, not a marked one. The `_assembler is None` assertion
+    below is the interesting half: the drain has to survive the latch that the
+    same method sets, because the latch has to come first.
+    """
+
+    class RecordingClient:
+        def __init__(self):
+            self.spans = []
+
+        def capture_span(self, span):
+            self.spans.append(span)
+
+    client = RecordingClient()
+    adapter = AnthropicAgentSdkAdapter()
+    adapter.install(client)
+    try:
+        adapter._assembler.on_outbound(
+            1,
+            json.dumps(
+                {"type": "user", "session_id": "s-1", "message": {"role": "user", "content": "hi"}}
+            ),
+        )
+        adapter._assembler.on_inbound(1, INIT_LINE)  # ...and no RESULT_LINE ever arrives
+        assert adapter._assembler.open_session_count() == 1
+
+        adapter.uninstall()
+
+        assert adapter._assembler is None
+        roots = [s for s in client.spans if s.name == "invoke_agent"]
+        assert len(roots) == 1
+        assert roots[0].conversation.session_id == "s-1"
+        assert Limitation.ADAPTER_UNINSTALLED in roots[0].capture_integrity.limitations
+    finally:
+        adapter.uninstall()  # idempotent; must not emit a second root
+
+
+def test_a_read_still_in_flight_cannot_reopen_a_session_during_uninstall():
+    """Why the latch is set BEFORE the drain rather than after.
+
+    The reader task can be mid-`read_messages` when teardown starts, so the
+    window that matters is the one DURING the walk, not after it — after it,
+    both orderings look identical and a test written that way proves nothing.
+    Here the straggler is fired from inside the drain, which is where a real one
+    lands.
+
+    Every callback gates on `self._assembler is not None`, so latching first
+    leaves the straggler no table to open a fresh root in. Drain first and it
+    opens one behind the walk: live, in a registry nothing will close again —
+    the original bug, reintroduced by the code that fixes it.
+    """
+
+    class RecordingClient:
+        def __init__(self):
+            self.spans = []
+
+        def capture_span(self, span):
+            self.spans.append(span)
+
+    client = RecordingClient()
+    adapter = AnthropicAgentSdkAdapter()
+    adapter.install(client)
+    assembler = adapter._assembler
+    try:
+        adapter._assembler.on_outbound(
+            1,
+            json.dumps(
+                {"type": "user", "session_id": "s-1", "message": {"role": "user", "content": "hi"}}
+            ),
+        )
+        adapter._assembler.on_inbound(1, INIT_LINE)
+
+        original = assembler._stamp_root
+
+        def stamp_then_straggle(sess, error):
+            adapter._on_outbound(
+                2,
+                json.dumps(
+                    {
+                        "type": "user",
+                        "session_id": "s-2",
+                        "message": {"role": "user", "content": "x"},
+                    }
+                ),
+            )
+            return original(sess, error)
+
+        assembler._stamp_root = stamp_then_straggle
+        adapter.uninstall()
+
+        assert assembler.open_session_count() == 0, "a straggler opened a root behind the drain"
+        assert [s.name for s in client.spans].count("invoke_agent") == 1
     finally:
         adapter.uninstall()

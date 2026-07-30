@@ -997,6 +997,46 @@ class SessionAssembler:
         if span is not None:
             self._client.capture_span(span)
 
+    def close_all_sessions(self, *, marker: Limitation) -> None:
+        """Finalize every live session, then close whatever the registry still holds.
+
+        The shutdown counterpart of `_finalize`, and it deliberately reuses that
+        path rather than reaching for `UnitRegistry.close_all` directly. The
+        registry can close a root; only this class can SAY what the root was.
+        Closing from below emits an `invoke_agent` still carrying the open-time
+        placeholder name, no conversation id, no turn totals — and drops the
+        session's open tool spans and unstopped subagents on the floor, because
+        those live in `_Session`, not in the unit.
+
+        The registry sweep still runs, last and outside the lock, because it
+        answers a question this loop cannot: an in-process tool call opened when
+        no session could be found is a registry root that no `_Session` owns.
+
+        Declines when this thread already holds the lock, for the reason
+        `UnitRegistry.close_all` gives — this is reachable from a signal
+        handler, and a handler lands wherever the interpreter happened to be.
+        """
+        if self._lock._is_owned():
+            counters.bump("adapters.assembler.close_all_sessions_reentrant")
+            return
+        now = time.time_ns()
+        with self._lock:
+            for key in list(self._by_key):
+                sess = self._by_key.pop(key)
+                if sess.session_id:
+                    self._by_session_id.pop(sess.session_id, None)
+                # Popped BEFORE the drain, so a straggler that arrives mid-
+                # teardown cannot be handed a session this loop has already
+                # finalized — it opens a fresh one or is dropped, and either
+                # way it does not resurrect a root that is on its way out.
+                sess.unit.note(marker)
+                self._drain_children(sess, now)
+                status, error_type = StatusCode.UNSET, None
+                with self._guard("adapters.assembler.close_all_sessions"):
+                    status, error_type = self._stamp_root(sess, None)
+                self._units.close(sess.unit, status=status, error_type=error_type, end_ns=now)
+        self._units.close_all(reason=marker)
+
     def _drain_children(self, sess: _Session, now: int) -> None:
         """Force-close and EMIT everything the session still holds open.
 
