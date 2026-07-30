@@ -161,11 +161,12 @@ def test_python_side_fallback_defaults_match_core():
     A hardcoded fallback (e.g. `sample_cap: int = 64 * 1024`) would pass every
     other test in this suite yet silently disagree with crates/wardex-limits the
     moment someone changes the core default without touching Python — exactly
-    the drift class this task exists to close. This test fails immediately if
-    that happens, because it compares the *effective* default against the core,
-    not against another Python literal.
+    the drift this test exists to catch. It fails immediately when that happens,
+    because it compares the *effective* default against the core, not against
+    another Python literal.
     """
     from wardex_sdk.adapters._assembler import SessionAssembler
+    from wardex_sdk.assembly import UnitRegistry
     from wardex_sdk.interceptors._conn_timing import ConnTimingStore
     from wardex_sdk.interceptors._mcp_stdio import _ProcState
     from wardex_sdk.interceptors._trackers import _WebSocketTracker
@@ -175,6 +176,15 @@ def test_python_side_fallback_defaults_match_core():
     asm = SessionAssembler(client=None)
     assert asm._max_sessions == core["max_sessions"]
     assert asm._max_session_entries == core["max_session_entries"]
+
+    # The unit registry, which is the only consumer of the two newest fields.
+    # Both are `int | None = None`, so a literal fallback here would be
+    # invisible to the probes above: they pass a value in explicitly, and would
+    # keep passing while the DEFAULT drifted from the core.
+    reg = UnitRegistry(sink=_DraftSink())
+    assert reg._max_units == core["max_units"]
+    assert reg._max_entries_per_unit == core["max_entries_per_unit"]
+    assert reg._max_record_bytes == core["max_body_bytes"]
 
     assert _ProcState.SNIFF_LIMIT == core["mcp_sniff_bytes"]
     assert _ProcState()._sniff_limit == core["mcp_sniff_bytes"]
@@ -190,9 +200,9 @@ def test_python_side_fallback_defaults_match_core():
 # Everything above proves a single layer in isolation: the Rust side takes a
 # Limits object directly, the Python side mocks its neighbours. Both can be
 # green while the chain connecting init() to the native parser is severed and
-# everything silently runs on core defaults -- that exact failure already
-# happened once in this slice, in the opposite direction (a stale native
-# module served old behavior while every Rust test passed). The tests below
+# everything silently runs on core defaults -- that exact failure has already
+# happened once, in the opposite direction (a stale native module served old
+# behavior while every Rust test passed). The tests below
 # drive the real public entry points end to end instead.
 #
 # Three limits stand in for the three layers a configured value has to cross:
@@ -609,6 +619,97 @@ def _assembler(limits: CaptureLimits):
     )
 
 
+class _DraftSink:
+    """A `SpanSink`-shaped double for the unit registry. Keeps what it is given."""
+
+    def __init__(self) -> None:
+        self.drafts: list = []
+
+    def emit(self, draft, *, agent_semantic: bool) -> bool:
+        self.drafts.append(draft)
+        return True
+
+
+def _unit_registry(limits: CaptureLimits, sink: _DraftSink):
+    """Built the way an adapter builds it: values routed through CaptureLimits.
+
+    The point of going through `resolved()` rather than passing an int straight
+    in is that this probe then fails if the field stops being mirrored, not only
+    if the registry stops reading it.
+    """
+    from wardex_sdk.assembly import UnitRegistry
+
+    resolved = limits.resolved()
+    return UnitRegistry(
+        sink=sink,
+        max_units=resolved["max_units"],
+        max_entries_per_unit=resolved["max_entries_per_unit"],
+    )
+
+
+def _open_unit(reg, key: str, parent=None):
+    from wardex_sdk._types import AgentAttributes
+    from wardex_sdk.assembly import EMPTY_AMBIENT, SpanIntent, UnitKey, UnitKind
+
+    unit = reg.open(
+        UnitKind.SESSION if parent is None else UnitKind.AGENT,
+        UnitKey("probe", key),
+        ambient=EMPTY_AMBIENT,
+        parent_unit=parent,
+        intent=SpanIntent.INVOKE_AGENT,
+        subject="agent",
+    )
+    unit.draft.set_agent(AgentAttributes(name="agent", id=key))
+    return unit
+
+
+def _probe_max_units() -> bool:
+    """Over the cap, the oldest ROOT unit is closed and its span is EMITTED.
+
+    Asserting the marker and not merely the count is the point: a bound whose
+    enforcement drops data silently is a worse failure than an unenforced one,
+    and that is exactly what the assembler this replaces does.
+    """
+
+    def evicted(limits: CaptureLimits) -> list:
+        sink = _DraftSink()
+        reg = _unit_registry(limits, sink)
+        for i in range(2):
+            _open_unit(reg, f"root-{i}")
+        return sink.drafts
+
+    tight = evicted(CaptureLimits(max_units=1))
+    return (
+        len(tight) == 1
+        and Limitation.UNIT_EVICTED in tight[0].integrity.markers
+        and evicted(CaptureLimits()) == []
+    )
+
+
+def _probe_max_entries_per_unit() -> bool:
+    """Over the per-unit cap, the oldest CHILD is force-closed and emitted.
+
+    Same rule as above, one level down: the child that made room leaves a span
+    saying it was ended by its parent's bookkeeping rather than by its own
+    completion event.
+    """
+
+    def evicted(limits: CaptureLimits) -> list:
+        sink = _DraftSink()
+        reg = _unit_registry(limits, sink)
+        root = _open_unit(reg, "root")
+        for i in range(2):
+            _open_unit(reg, f"child-{i}", parent=root)
+        return sink.drafts
+
+    tight = evicted(CaptureLimits(max_entries_per_unit=1))
+    return (
+        len(tight) == 1
+        and Limitation.CHILD_SPAN_UNCLOSED in tight[0].integrity.markers
+        and evicted(CaptureLimits()) == []
+    )
+
+
 def _probe_max_sessions() -> bool:
     def open_sessions(limits: CaptureLimits) -> int:
         asm = _assembler(limits)
@@ -702,6 +803,8 @@ _PROBES = {
     "max_connections": _probe_max_connections,
     "max_sessions": _probe_max_sessions,
     "max_session_entries": _probe_max_session_entries,
+    "max_units": _probe_max_units,
+    "max_entries_per_unit": _probe_max_entries_per_unit,
     "mcp_sniff_bytes": _probe_mcp_sniff_bytes,
     "max_buffer_spans": _probe_max_buffer_spans,
     "max_buffer_bytes": _probe_max_buffer_bytes,
@@ -721,33 +824,6 @@ _NOT_ENFORCED = {
         "Documented as inert in crates/wardex-limits and in the README's "
         "resource-limits section rather than left for a user to discover. "
         "Delete this entry and add a probe when a replay buffer lands."
-    ),
-    "max_units": (
-        "Declared ahead of its consumer: it bounds the concurrently tracked "
-        "root units of the unit registry, and no registry exists yet -- "
-        "nothing reads the field, so an override changes nothing. It is in the "
-        "catalogue now precisely so the registry cannot be written against a "
-        "Python literal that drifts from crates/wardex-limits; the same reason "
-        "Limitation.UNIT_EVICTED is already declared with no emitter. Note it "
-        "is NOT max_sessions under a new name -- max_sessions bounds one flat "
-        "table of sessions, while a root-unit cap has to survive units of "
-        "several kinds sharing one entry point, so the two cannot be merged "
-        "without silently reinterpreting the number a user set. Delete this "
-        "entry and add a probe when assembly/_units.py lands: drive "
-        "max_units + 1 root units through the registry and assert the evicted "
-        "root's span is emitted carrying Limitation.UNIT_EVICTED, since a "
-        "bound whose enforcement drops data silently is a worse failure than "
-        "an unenforced one."
-    ),
-    "max_entries_per_unit": (
-        "Declared ahead of its consumer, same as max_units: it bounds each "
-        "per-unit table (child units, aliases, dedup keys, open drafts) and no "
-        "unit registry exists yet, so nothing reads it. It generalizes "
-        "max_session_entries rather than replacing it -- that field still has "
-        "a live consumer in adapters/_assembler.py and stays probed above. "
-        "Delete this entry and add a probe when assembly/_units.py lands: "
-        "overflow one unit's child table and assert the rejected child is "
-        "still accounted for on the parent span rather than dropped."
     ),
 }
 

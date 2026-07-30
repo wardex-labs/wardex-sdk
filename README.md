@@ -194,13 +194,41 @@ wardex.init(
 )
 ```
 
-Four exceptions are inert today, so setting them has no effect:
-`replay_buffer_size` (nothing reads it yet); `zstd_level` (read only by the
+Two exceptions are inert today, so setting them has no effect:
+`replay_buffer_size` (nothing reads it yet) and `zstd_level` (read only by the
 envelope encoder, which no live export path calls — the OTLP exporter neither
-takes limits nor compresses); and `max_units` / `max_entries_per_unit`, which
-bound a logical-unit registry that has not shipped. The last two are published
-early so that the registry, when it lands, reads its ceilings from the same
-place every other bound comes from.
+takes limits nor compresses).
+
+`max_units` and `max_entries_per_unit` were on that list until the logical-unit
+registry landed and became their consumer. What crossing one of them looks like
+from your data depends on whether the evicted entry has a span of its own.
+
+**Evictions you can see in your traces.** A root unit evicted at `max_units`,
+and a child unit or an in-flight span evicted at `max_entries_per_unit`, are
+each closed and **exported**, marked `unit_evicted` or `child_span_unclosed`.
+Outgrowing one of these ceilings shows up as marked spans rather than as traces
+that quietly stop appearing.
+
+**Evictions you cannot.** `max_entries_per_unit` also bounds bookkeeping tables
+whose entries are not spans — the lookup aliases that map a framework's own
+identifiers onto units, the keys that de-duplicate two observers of one event,
+and the table of in-process MCP servers wardex has wrapped. Evicting from any of
+them exports nothing, because there is no span to mark. They are counted
+internally instead — `wardex_sdk.assembly.counters.snapshot()` reports them
+under `assembly._units.alias_table_full`, `assembly._units.claim_table_full` and
+`adapters.anthropic.server_table_full` — and what reaches your data is the
+consequence rather than the eviction. A dropped de-duplication key, or a dropped
+server handle, can let one tool call be reported twice.
+
+A dropped **alias** is the one to know about, because it does not look like a
+loss. That identifier stops resolving, so the parent is decided one rung further
+down: if the work carries an ambient wardex span, the span arrives at confidence
+**1.0 with no marker** — hanging off the enclosing session instead of the
+sub-agent it belonged to. A sub-agent's subtree flattens and nothing in the data
+says so. Only when there is no ambient span does it arrive marked
+`unit_inferred_sole` (0.5) or `parent_unresolved`.
+
+Raise `max_entries_per_unit` if you see any of these counters move.
 
 ## Roadmap
 

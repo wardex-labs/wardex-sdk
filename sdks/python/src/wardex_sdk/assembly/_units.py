@@ -1,0 +1,1447 @@
+"""Logical units — design §4.2/§5.2/§5.6, invariants I2, I3, I10, I11.
+
+A *unit* is one logical piece of agent work — a session, a sub-agent, a graph
+step, a single call — and it exists so that an adapter has somewhere to put a
+parent WITHOUT ever computing one. The registry hands out three things and
+nothing else: a `Parentage` (via `Unit.child`), a carrier that makes a unit the
+ambient parent for the calling task (`Unit.activate` / `Unit.bind` /
+`UnitRegistry.pin_driver`), and a lookup from a framework identifier to a unit
+this module already produced (`alias` / `find` / `resolve`).
+
+**Why that list is the whole API.** The product claim is that the causal tree
+comes out of in-process context propagation, not out of a framework's callback
+identifiers. Competitors reconstruct the tree from `run_id`/`parent_run_id` and
+are therefore married to the frameworks that emit them. Here a framework id can
+only ever be a `UnitKey` — a lookup ALIAS that selects a unit whose
+`SpanContext` was produced by `assembly/_parentage.py` from a real scope read.
+There is deliberately no `create_from_framework_id`, no way to seed a trace id
+from a string, and no way to become a parent other than entering the context
+(I3). Replace every framework id in a workload with a fresh UUID and the tree
+must come out the same shape.
+
+**Lock discipline (I11).** The registry's `RLock` covers map mutation only.
+Every method that can emit builds its list of drafts under the lock and calls
+the sink AFTER releasing it. This is not hygiene, it is the shape of a live
+hazard: today `adapters/_assembler.py` calls `capture_span` while holding its
+own `RLock`, and `Client`'s buffer lock is re-entrant from a same-thread signal
+handler — two re-entrant locks taken in a fixed order across an async callback
+and a signal path. Reproducing that here would put it under every adapter.
+
+**Bounds (I10).** `max_units` bounds concurrently tracked ROOT units;
+`max_entries_per_unit` bounds each per-unit table (children, aliases, claim
+keys, open drafts). Both come from `crates/wardex-limits` and never from a
+Python literal.
+
+Whether an eviction is VISIBLE ON THE WIRE is decided by one thing: does the
+evicted entry own a span? Five tables are bounded — the root table, and per
+unit the children, the aliases, the claim keys and the open drafts — and three
+of them hold entries that do. Crossing those three CLOSES the oldest entry and
+emits it: `UNIT_EVICTED` on a root evicted by `max_units`,
+`CHILD_SPAN_UNCLOSED` on a child unit or an open draft force-closed by someone
+else's bookkeeping. The one
+exception is an open draft that had already LOST a `claim()` arbitration: it is
+discarded rather than emitted (`claim_superseded`), because the bound is a
+reason to stop tracking a draft and never a reason to promote one the
+arbitration rejected.
+
+The other two hold no span, so their evictions emit NOTHING and no marker for
+them exists. A dropped lookup alias counts `alias_table_full`; a dropped
+de-duplication key counts `claim_table_full`. Neither is undetectable, but
+neither is detectable from the exported spans alone: the counters are the
+record, and what shows up in the data is only the CONSEQUENCE.
+
+The alias consequence is worth stating exactly, because the obvious reading of
+it is backwards. An alias edge is `UNIT_ALIAS` at 0.9 and carries no marker.
+Losing the alias makes the id stop resolving, which sends `_edge` back down the
+ladder — and the next rung is the ambient scope, not the sole-live guess. So
+when the task carries an ambient span the replacement edge is `CONTEXTVAR` at
+1.0 with no marker: confidence goes UP while the edge gets WORSE, because a
+sub-agent that was hanging off its own unit now hangs off the enclosing
+session. That is the flattening `_edge`'s own docstring says most-specific-wins
+exists to prevent, arrived at from the other direction. Only when there is no
+ambient span at all does the ladder reach `UNIT_INFERRED_SOLE` at 0.5 or
+`PARENT_UNRESOLVED`.
+
+An evicted claim key forgets who owned the arbitration, so a lower-ranked
+observer of the same event can win it a second time and open a second span for
+one logical call.
+
+Every per-unit eviction counts (`child_table_full`, `open_span_table_full`,
+`alias_table_full`, `claim_table_full`); the root evictions do not, because the
+marked span they emit is already the record. What the emitting half replaces is
+an overflow path that dropped the oldest session and its root span outright,
+with no marker and no test, so a workload that crossed the cap simply stopped
+producing traces and nothing on the wire said why.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import contextvars
+import functools
+import inspect
+import threading
+import time
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager
+from dataclasses import dataclass
+from enum import Enum
+from typing import Any, Protocol
+
+from .._enums import CaptureSource, StatusCode
+from .._limits import CaptureLimits
+from .._scope import Scope
+from .._types import ConversationContext, SpanContext
+from ..context._contextvar import activate_span, install_span, restore_scope
+from ._builder import SpanDraft
+from ._diag import counters, guard
+from ._integrity import Limitation
+from ._parentage import (
+    AMBIENT,
+    EMPTY_AMBIENT,
+    Ambient,
+    Evidence,
+    Parentage,
+    ParentSource,
+    child_of,
+    latch_ambient,
+    resolve_parentage,
+)
+from ._vocab import SpanIntent
+
+
+class UnitKind(Enum):
+    """CLOSED — design §4.2. What kind of work a unit stands for.
+
+    Framework-neutral on purpose: a LangGraph superstep, a CrewAI task and a
+    Claude turn are all `STEP`, and the framework's own word for it rides the
+    span's `wardex.framework` attribute rather than splitting this enum.
+    """
+
+    SESSION = "session"  # one agent run / graph invocation / conversation
+    AGENT = "agent"  # a sub-agent / delegated agent within a session
+    STEP = "step"  # a graph node / superstep / turn
+    CALL = "call"  # a single tool call / model call bracket
+
+
+@dataclass(frozen=True, slots=True)
+class UnitKey:
+    """A framework-supplied lookup ALIAS. NEVER a parentage source (I2).
+
+    `namespace` says whose identifier this is (`"claude.session_id"`,
+    `"langgraph.thread_id"`, `"transport.id"`) so that two frameworks using the
+    same opaque string cannot collide, and so a reader of a correlation record
+    can tell which vocabulary the value came from.
+
+    The type exists to make the invariant visible at every call site: a
+    `UnitKey` goes INTO `find`/`alias`/`claim` and comes back as a `Unit` or as
+    `None`. Nothing here turns one into a `SpanContext`.
+    """
+
+    namespace: str
+    value: str
+
+
+class SpanSink(Protocol):
+    """Where finished drafts go. STRUCTURAL, so that no implementation is named.
+
+    Design §4.4 gives `assembly/_emit.py` the concrete `SpanSink` — the only
+    caller of `Client.capture_span` — and this registry is specified against
+    that type. A Protocol is what lets it be specified against a type it cannot
+    name, and neither alternative is open: the concrete sink lives in
+    `adapters/`, which `assembly/` may not import (design §3.1, enforced by
+    `tests/test_import_graph.py`), and importing `_client` here instead would
+    put a second emit path under the adapters — the exact thing a single funnel
+    exists to prevent. That same test asserts no module under `assembly/` calls
+    the sink at all (C-S5), so the shape is all this package needs to know.
+
+    `emit()` MUST NOT raise: it is called from the host's own callbacks. The
+    registry wraps each call in `guard()` anyway, because a Protocol cannot
+    enforce that on an implementation it does not own.
+    """
+
+    def emit(self, draft: SpanDraft, *, agent_semantic: bool) -> bool: ...
+
+
+#: The evidence a unit hands to its own children. A child unit's parent was not
+#: read from a ContextVar — it is the unit itself, whose context this package
+#: produced — so recording it as `contextvar` would be the same drift that once
+#: left `header` declared in the vocabulary with no producer at all.
+_IN_UNIT = Evidence(ParentSource.UNIT_ACTIVE)
+
+
+@dataclass(frozen=True, slots=True)
+class _AmbientUnit:
+    """What `activate()` / `pin_driver()` install in the ContextVar."""
+
+    unit: Unit
+    owner: object  # the task/thread object observed when this was installed
+    pinned: bool
+
+
+#: The ambient UNIT, alongside (not instead of) the ambient span context that
+#: `activate_span` installs in the scope. Two carriers because they answer two
+#: questions: `latch_ambient()` asks "what span do I hang off", `current()` asks
+#: "which logical unit am I inside" — and the second is what an adapter needs in
+#: order to `claim()`, to open a two-phase span, or to record turn I/O.
+_ambient_unit: contextvars.ContextVar[_AmbientUnit | None] = contextvars.ContextVar(
+    "wardex_ambient_unit", default=None
+)
+
+
+def _current_task() -> object:
+    """The identity of the task (or thread) running right now.
+
+    An asyncio Task when there is one, otherwise the thread — the two carriers a
+    ContextVar Token is scoped to. Used only for the pin's ownership check;
+    nothing about parentage depends on it.
+
+    `suppress` and not an `except` block, and the distinction is not cosmetic:
+    C-S4 forbids a handler that leaves no trace of a swallowed FAILURE, and
+    there is no failure here. "There is no running event loop" is the ANSWER to
+    the question this function asks, and the answer is returned — the thread.
+    `asyncio.current_task()` is simply the only public spelling of the question,
+    and it reports "no loop" by raising. A counter here would fire on every
+    synchronous `activate()` and would be noise, not evidence.
+    """
+    task: object | None = None
+    with contextlib.suppress(RuntimeError):
+        task = asyncio.current_task()
+    return task if task is not None else threading.current_thread()
+
+
+class _Carrier:
+    """One installed activation: the scope fork plus the ambient-unit entry.
+
+    Deliberately not a context manager. `activate()` is balanced and uses one of
+    these under a `try/finally`; `pin_driver()` installs one and never removes
+    it on that task, which is the whole point of a pin (design §5.6) — the
+    driver task's lifetime is bounded by the unit, so the unbalanced `set()`
+    cannot outlive it.
+
+    The two modes therefore use two different scope carriers, and that is
+    load-bearing rather than tidy. A pin's fork is installed by `install_span`,
+    which HAS NO FINALISER BY DESIGN — do not "simplify" it back into a context
+    manager. `activate_span` is a generator-backed CM, so its `finally` runs as
+    soon as nothing references the generator; the pin's only strong reference is
+    the `PinToken` the registry hands back, and a caller that reads `.installed`
+    off a temporary undoes the fork on the very statement that installed it,
+    silently, leaving the ambient UNIT installed and the ambient SPAN not. That
+    asymmetry ships a wrong parent at confidence 1.0 with no marker.
+    """
+
+    __slots__ = ("_prev_scope", "_span_cm", "_token", "owner", "unit")
+
+    def __init__(self, unit: Unit, *, pinned: bool) -> None:
+        self.unit = unit
+        self.owner = _current_task()
+        # The ONE entry point, in both modes. `context/_contextvar.py` installs
+        # the conversation identity and the tracestate the unit carries, not
+        # only the span context — a carrier that installed only the context
+        # would drop the conversation id on every task the unit spans — and
+        # `_fork` states that override rule once for both forms.
+        self._span_cm: contextlib.AbstractContextManager[None] | None
+        self._prev_scope: Scope | None
+        if pinned:
+            self._span_cm = None
+            self._prev_scope = install_span(
+                unit.context, conversation=unit.conversation, tracestate=unit.tracestate
+            )
+        else:
+            self._prev_scope = None
+            self._span_cm = activate_span(
+                unit.context, conversation=unit.conversation, tracestate=unit.tracestate
+            )
+            self._span_cm.__enter__()
+        self._token = _ambient_unit.set(_AmbientUnit(unit, self.owner, pinned))
+
+    def remove(self, *, where: str, debug: bool) -> None:
+        """Undo the installation. MUST run on the task that installed it.
+
+        Both halves are attempted, each guarded on its own, and that is not
+        belt-and-braces. A cross-task removal raises `ValueError` from the FIRST
+        reset — a Token may only be reset in the Context that created it — and
+        bailing there would leave `activate_span`'s generator suspended at its
+        `yield`. The garbage collector closes such a generator on some later,
+        unrelated frame; its `finally` raises the same `ValueError` again, and
+        THAT one lands as an unraisable exception in the host's stderr with a
+        traceback the host cannot connect to anything it called. Driving the
+        generator to completion here — even into its failure — is what keeps a
+        misuse of `activate()` a counter instead of noise in someone's logs.
+
+        The pinned half has no generator to drive, so it enforces the same rule
+        by hand: a bare `set()` from another task would silently land on THAT
+        task's scope, which is worse than the `ValueError` a Token gives for
+        free. Raising here keeps a foreign unpin counted rather than silent.
+
+        Two counts for one cross-task exit is therefore the honest tally: two
+        installations were left standing, and neither could be taken down.
+        """
+        with guard(where, debug=debug):
+            _ambient_unit.reset(self._token)
+        with guard(where, debug=debug):
+            if self._span_cm is not None:
+                self._span_cm.__exit__(None, None, None)
+            elif self.owner is not _current_task():
+                raise ValueError("a pin may only be removed on the task that installed it")
+            else:
+                restore_scope(self._prev_scope)
+
+
+class PinToken:
+    """The handle returned by `UnitRegistry.pin_driver`.
+
+    `installed` is False when the pin was REFUSED — see `pin_driver`. A refused
+    token is still a real object with a real `unpin()` so that an adapter's
+    teardown path has nothing to branch on; unpinning it is a no-op.
+    """
+
+    __slots__ = ("_carrier", "installed", "owner", "unit")
+
+    def __init__(self, unit: Unit, owner: object, carrier: _Carrier | None) -> None:
+        self.unit = unit
+        self.owner = owner
+        self._carrier = carrier
+        self.installed = carrier is not None
+
+
+@dataclass(frozen=True, slots=True)
+class _OpenDraft:
+    """A two-phase span in flight, plus what it needs to lose an arbitration."""
+
+    draft: SpanDraft
+    claim_key: UnitKey | None
+    rank_at_open: int
+
+
+class Unit:
+    """One logical piece of work, and the only way an adapter obtains a parent.
+
+    A unit owns its own span: `open()` builds the draft, the adapter fills in
+    semantics through `draft`, and `UnitRegistry.close()` materializes it. The
+    context children hang off IS that span's context, so anchoring a subtree to
+    a span id that is never emitted — an orphaned subtree that looks healthy
+    downstream, same trace, confidence 1.0, no marker — is not expressible.
+    """
+
+    __slots__ = (
+        "_alias_keys",
+        "_children",
+        "_claims",
+        "_draft",
+        "_input",
+        "_input_recorded",
+        "_input_truncated",
+        "_live",
+        "_open",
+        "_output",
+        "_output_recorded",
+        "_output_truncated",
+        "_registry",
+        "conversation",
+        "key",
+        "kind",
+        "parent",
+        "parentage",
+        "start_ns",
+        "tracestate",
+    )
+
+    def __init__(
+        self,
+        registry: UnitRegistry,
+        *,
+        key: UnitKey,
+        kind: UnitKind,
+        draft: SpanDraft,
+        parentage: Parentage,
+        conversation: ConversationContext | None,
+        tracestate: str | None,
+        start_ns: int,
+        parent: Unit | None,
+    ) -> None:
+        self._registry = registry
+        self.key = key
+        self.kind = kind
+        self._draft = draft
+        self.parentage = parentage
+        self.conversation = conversation
+        self.tracestate = tracestate
+        self.start_ns = start_ns
+        self.parent = parent
+        self._live = True
+        self._children: dict[Unit, None] = {}
+        self._alias_keys: list[UnitKey] = []
+        self._claims: dict[UnitKey, int] = {}
+        self._open: dict[object, _OpenDraft] = {}
+        self._input = bytearray()
+        self._output = bytearray()
+        self._input_recorded = False
+        self._output_recorded = False
+        self._input_truncated = False
+        self._output_truncated = False
+
+    # -- identity --------------------------------------------------------
+
+    @property
+    def context(self) -> SpanContext:
+        """The unit's own span context — the anchor every child hangs off."""
+        return self._draft.context
+
+    @property
+    def draft(self) -> SpanDraft:
+        """The unit's own span, still under construction.
+
+        NOT in design §4.2's listing, and it has to be: every intent worth
+        opening a unit for requires a typed block (`invoke_agent` requires
+        `agent`, `execute_step` requires `wardex.step.name`), so without a way
+        to reach the draft `finish()` would raise `VocabularyError` and the
+        unit's span — the product's exhibit A — would be deleted by `guard()`
+        with only a counter left. Exposing the draft rather than mirroring
+        fifteen typed setters onto `Unit` also keeps `SpanDraft` the single
+        constructor (I5) instead of growing a parallel one here.
+        """
+        return self._draft
+
+    @property
+    def is_live(self) -> bool:
+        return self._live
+
+    # -- parentage handout -----------------------------------------------
+
+    def child(self, evidence: Evidence = _IN_UNIT) -> Parentage:
+        """The only way an adapter obtains a parent.
+
+        `child_of` is what actually builds the edge; this method exists so that
+        the anchor cannot be anything other than a context the registry owns.
+        The conversation identity and the tracestate ride along, so a sub-agent
+        span does not silently lose the conversation id its session issued.
+        """
+        return child_of(
+            self.context,
+            evidence,
+            conversation=self.conversation,
+            tracestate=self.tracestate,
+        )
+
+    # -- carriers --------------------------------------------------------
+
+    @contextmanager
+    def activate(self) -> Iterator[None]:
+        """Make this unit the ambient parent for the CALLING TASK.
+
+        Enter and exit MUST happen on the same task/thread: a ContextVar Token
+        may only be reset in the Context it was created in. This is the ONLY way
+        to become a parent (I3) — computing a `SpanContext` and putting it in a
+        dict is not parenthood, because it opens neither the nested-manual-span
+        path, nor the interceptor latch, nor the `capture_mode=AGENT` gate.
+
+        A cross-task exit is COUNTED rather than raised: the reset would throw
+        `ValueError` into the host on a path the host did not ask for, and I6
+        forbids that. The leaked fork is bounded by the offending task's life.
+        """
+        carrier = _Carrier(self, pinned=False)
+        try:
+            yield
+        finally:
+            carrier.remove(where="assembly._units.activate_exit", debug=self._registry._debug)
+
+    def bind(self, fn: Callable[..., Any]) -> Callable[..., Any]:
+        """Wrap `fn` so each INVOCATION runs inside a fresh activation.
+
+        NOT `context.run_in_context`, and the difference is load-bearing rather
+        than stylistic: that helper replays ONE captured `contextvars.Context`,
+        and entering the same Context twice concurrently raises
+        `RuntimeError: cannot enter context ... is already entered`. For a
+        framework callback invoked from two tasks — the ordinary case for a
+        thread-pool tool handler — that error surfaces INTO USER CODE. Entering
+        a fresh fork per call is re-entrant and concurrency-safe.
+
+        A coroutine function gets an async wrapper so the activation spans the
+        whole await rather than only the call that creates the coroutine.
+        """
+        if inspect.iscoroutinefunction(fn):
+
+            @functools.wraps(fn)
+            async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
+                with self.activate():
+                    return await fn(*args, **kwargs)
+
+            return async_wrapper
+
+        @functools.wraps(fn)
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            with self.activate():
+                return fn(*args, **kwargs)
+
+        return wrapper
+
+    # -- de-duplication, id-keyed, framework-neutral ----------------------
+
+    def claim(self, key: UnitKey, *, rank: int = 0) -> bool:
+        """Arbitrate between observers of the same logical event.
+
+        The HIGHEST rank owns the key. NOT first-come: arrival order is a
+        property of the framework's event schedule, not of who has the better
+        evidence. Claude's `PreToolUse` hook fires BEFORE the handler body runs,
+        so first-come would hand every in-process tool to the hook observer —
+        the exact inversion of the rule that ownership belongs to the layer that
+        wrapped the real execution. Ranks are the adapter's: handler wrapper 10,
+        hook 0.
+
+        Because a higher-ranked observer can arrive LATER, a grant is revocable:
+        the first claimant of a key is told True (nobody outranks it yet) and
+        loses that ownership the moment something outranks it. A claimant that
+        opened its span through `open_span(key=...)` needs no discipline for
+        that — `close_span` sees the higher rank and DISCARDS the loser's draft,
+        so the double emit the arbitration exists to prevent cannot happen even
+        if the loser never asks again. A claimant that emits some other way must
+        re-`claim()` before it does.
+
+        A losing claimant may still contribute semantics to the winner's span;
+        what it may not do is open a second one.
+        """
+        with self._registry._lock:
+            best = self._claims.get(key)
+            if best is not None and rank <= best:
+                return False
+            if best is None:
+                self._evict_oldest(self._claims, "claim")
+            self._claims[key] = rank
+            return True
+
+    def owner_rank(self, key: UnitKey) -> int | None:
+        """The rank currently owning `key`, or None if nobody has claimed it."""
+        with self._registry._lock:
+            return self._claims.get(key)
+
+    # -- two-phase spans -------------------------------------------------
+
+    def open_span(
+        self,
+        intent: SpanIntent,
+        *,
+        subject: str | None = None,
+        evidence: Evidence = _IN_UNIT,
+        key: UnitKey | None = None,
+        start_ns: int | None = None,
+        source: CaptureSource = CaptureSource.ADAPTER,
+    ) -> SpanDraft:
+        """Open a child span of this unit. Close it with `close_span`.
+
+        `key` ties the draft to a `claim()` arbitration: the rank owning the key
+        at open time is recorded, and `close_span` discards the draft if
+        something has outranked it since. That is what makes the arbitration
+        mechanical instead of a convention every adapter has to remember.
+
+        A draft opened here is tracked, so `UnitRegistry.close()` can force-close
+        it with `CHILD_SPAN_UNCLOSED` rather than leaving it to vanish.
+        """
+        now = time.time_ns()
+        parentage = self.child(evidence)
+        draft = SpanDraft(
+            parentage,
+            intent=intent,
+            subject=subject,
+            source=source,
+            start_ns=start_ns if start_ns is not None else now,
+        )
+        _carry_limitations(draft, parentage)
+
+        pending: list[SpanDraft] = []
+        with self._registry._lock:
+            if self._live:
+                evicted = self._evict_oldest(self._open, "open_span")
+                if evicted is not None:
+                    # An arbitration loser is DISCARDED here rather than
+                    # force-closed, exactly as `close_span` would discard it.
+                    # The bound is a reason to stop tracking a draft, never a
+                    # reason to promote one the arbitration already rejected.
+                    if self._superseded_locked(evicted[1]):
+                        counters.bump("assembly._units.claim_superseded")
+                    else:
+                        pending.append(
+                            _force_close(evicted[1].draft, Limitation.CHILD_SPAN_UNCLOSED, now)
+                        )
+                # Keyed by the DRAFT, never by `key`. Two observers of one
+                # logical event open with the same `key` by design — that is
+                # what `claim()` arbitrates — so a key-keyed table would drop
+                # the first draft on the floor: unfindable at close, and no
+                # longer force-closable by the unit either.
+                self._open[id(draft)] = _OpenDraft(
+                    draft=draft,
+                    claim_key=key,
+                    rank_at_open=self._claims.get(key, 0) if key is not None else 0,
+                )
+            else:
+                # A dead unit's span is already emitted, so its context is a
+                # perfectly good parent — what it cannot do is force-close this
+                # draft later. Counted so "spans opened after their unit closed"
+                # is a number rather than a theory.
+                counters.bump("assembly._units.open_span_after_close")
+        self._registry._flush(pending)
+        return draft
+
+    def close_span(
+        self,
+        draft: SpanDraft,
+        *,
+        status: StatusCode = StatusCode.OK,
+        error_type: str | None = None,
+        end_ns: int | None = None,
+    ) -> None:
+        """Finish a span opened by `open_span` and hand it to the sink.
+
+        Emits OUTSIDE the registry lock (I11). Discards the draft instead when a
+        higher-ranked observer took the key over since it was opened.
+
+        A draft that is no longer tracked was ALREADY force-closed and emitted —
+        by its unit's teardown, by `close_all`, by the open-table eviction, or by
+        an earlier `close_span`. Saying so by name here rather than leaving it to
+        `_flush`'s latch: "the handler returned after its session ended" is the
+        ordinary shape of that race (it is what `CHILD_SPAN_UNCLOSED` exists
+        for), and a counter that names it separates it from a genuine double
+        emit inside the registry.
+        """
+        end = end_ns if end_ns is not None else time.time_ns()
+        emit = True
+        with self._registry._lock:
+            entry = self._pop_open(draft)
+            if entry is None:
+                counters.bump("assembly._units.close_span_after_emit")
+                return
+            if self._superseded_locked(entry):
+                counters.bump("assembly._units.claim_superseded")
+                emit = False
+        if not emit:
+            return
+        draft.set_status(status)
+        if error_type is not None:
+            draft.set_error(error_type)
+        draft.set_end_ns(end)
+        self._registry._flush([draft])
+
+    def _superseded_locked(self, entry: _OpenDraft) -> bool:
+        """Has something outranked this draft's claim since it was opened?
+
+        Caller holds the registry lock. One function rather than the three lines
+        inline in `close_span`, because the two FORCE-CLOSE paths — the unit's
+        teardown and the open-table eviction — used to skip the question
+        entirely, and that is precisely the case `claim()`'s docstring promises
+        cannot happen: a hook that opened at rank 0, lost to the handler at rank
+        10 and never got its `PostToolUse` (the session aborted) had its losing
+        draft force-closed and EMITTED. Two spans for one tool call, and
+        `claim_superseded` at zero — downstream it just looks like the agent
+        called the tool twice.
+        """
+        if entry.claim_key is None:
+            return False
+        owner = self._claims.get(entry.claim_key)
+        return owner is not None and owner > entry.rank_at_open
+
+    def _pop_open(self, draft: SpanDraft) -> _OpenDraft | None:
+        # Deletes from `self._open` while iterating it, which is legal ONLY
+        # because it returns immediately afterwards. Turning this into a
+        # "collect every match" loop raises `RuntimeError: dictionary changed
+        # size during iteration` at close time, inside the registry lock, on the
+        # host's own callback.
+        for table_key, entry in self._open.items():
+            if entry.draft is draft:
+                del self._open[table_key]
+                return entry
+        return None
+
+    # -- annotation ------------------------------------------------------
+
+    def note(self, marker: Limitation) -> None:
+        """Attach a limitation to the unit's OWN span.
+
+        Under the registry lock — re-entrantly, since `_close_locked` notes the
+        marker that closed a unit while already holding it. The lock is what
+        makes "the marker is on the draft" and "the draft is being finalized"
+        two states a reader cannot land between.
+        """
+        with self._registry._lock:
+            if not self._live:
+                counters.bump("assembly._units.note_after_close")
+                return
+            self._draft.add_limitation(marker)
+
+    def record_input(self, data: bytes) -> None:
+        """Accumulate task input onto the unit's own span.
+
+        Accumulating rather than assigning is the point: a multi-turn session
+        root that keeps only the first prompt is how the adapter lost every turn
+        after the first. Bounded by the core's `max_body_bytes`; passing it sets
+        `truncated` rather than growing without limit (I10).
+
+        Locked for the same reason as `note`: `_finalize_locked` reads the
+        buffer and the truncation flag together, and `flag |= f(...)` is a
+        read-modify-write that two framework callbacks on two threads can
+        interleave — losing the flag, not the bytes, which is the direction that
+        turns a truncated payload into one that claims to be complete.
+        """
+        with self._registry._lock:
+            self._input_recorded = True
+            self._input_truncated |= _append_capped(
+                self._input, data, self._registry._max_record_bytes
+            )
+
+    def record_output(self, data: bytes) -> None:
+        """Accumulate task output onto the unit's own span. See `record_input`."""
+        with self._registry._lock:
+            self._output_recorded = True
+            self._output_truncated |= _append_capped(
+                self._output, data, self._registry._max_record_bytes
+            )
+
+    # -- internal --------------------------------------------------------
+
+    def _evict_oldest(self, table: dict[Any, Any], where: str) -> tuple[Any, Any] | None:
+        """Make room in a per-unit table. Caller holds the registry lock.
+
+        FIFO, matching the open-tool eviction this replaces. Returns the evicted
+        `(key, value)` — BOTH, because the per-unit tables put the payload on
+        different sides: `_children` is an ordered SET of units keyed by the
+        unit, while `_open` maps an opaque id to the record. Returning only the
+        value silently evicts nothing from `_children`, since every value there
+        is `None`.
+        """
+        if len(table) < self._registry._max_entries_per_unit:
+            return None
+        oldest = next(iter(table))
+        value = table.pop(oldest)
+        counters.bump(f"assembly._units.{where}_table_full")
+        return oldest, value
+
+    def _evict_alias(self) -> UnitKey | None:
+        """The same bound over the alias list. Caller holds the registry lock.
+
+        A separate helper rather than a call into `_evict_oldest` above, and the
+        difference is the container, not the policy: `_evict_oldest` pops a
+        `(key, value)` pair out of a DICT, because `_children` and `_open` put
+        the payload on different sides, while an alias list has no value to
+        return. Both read the same `_max_entries_per_unit` and both count, which
+        is what keeps them one bound written twice rather than two bounds.
+        """
+        if len(self._alias_keys) < self._registry._max_entries_per_unit:
+            return None
+        counters.bump("assembly._units.alias_table_full")
+        return self._alias_keys.pop(0)
+
+    def _finalize_locked(
+        self,
+        *,
+        status: StatusCode,
+        error_type: str | None,
+        end_ns: int,
+    ) -> SpanDraft:
+        """Stamp the unit's own span. Caller holds the lock; does not emit.
+
+        Takes no marker argument, deliberately. A `marker=marker` keyword here
+        would hand the limitation census a value it cannot follow AND — because
+        any function passed a marker-ish name becomes a read-every-argument sink
+        for the whole program — would make `status`, `end_ns` and `error_type`
+        unreadable holes at every call site of every same-named method in the
+        SDK. A marker is attached where it is DECIDED, by `note()`, which is
+        also where the literal is spelled.
+        """
+        draft = self._draft
+        if self._input_recorded or self._output_recorded:
+            draft.set_io(
+                input_data=bytes(self._input),
+                output_data=bytes(self._output),
+                input_attempted=self._input_recorded,
+                output_attempted=self._output_recorded,
+            )
+            if self._input_truncated or self._output_truncated:
+                draft.integrity.truncated(True)
+        draft.set_status(status)
+        if error_type is not None:
+            draft.set_error(error_type)
+        draft.set_end_ns(end_ns)
+        return draft
+
+
+def _carry_limitations(draft: SpanDraft, parentage: Parentage) -> None:
+    """Move the edge's markers onto the span that edge produced.
+
+    `SpanDraft` is built FROM a `Parentage` but does not inherit its markers, so
+    without this an interpreted edge — `unit_sole`, `unresolved`, a recorded
+    `correlation_conflict` — would ship a confidence below 1.0 and NO marker.
+    That is half of I4 missing, and it is the half a dashboard renders.
+
+    One function rather than the loop inlined at both call sites, so the
+    limitation census records exactly one slot it cannot follow instead of two.
+    The value is a tuple of `Limitation` MEMBERS that `_parentage.py` built and
+    the census already recorded where they were decided; nothing here can
+    introduce a marker that was not already counted there.
+    """
+    for inherited in parentage.limitations:
+        draft.add_limitation(inherited)
+
+
+def _append_capped(buf: bytearray, data: bytes, cap: int) -> bool:
+    """Append what fits. True when something was dropped."""
+    room = cap - len(buf)
+    if room <= 0:
+        return bool(data)
+    if len(data) <= room:
+        buf += data
+        return False
+    buf += data[:room]
+    return True
+
+
+def _force_close(draft: SpanDraft, marker: Limitation, end_ns: int) -> SpanDraft:
+    """A span ended by someone else's teardown, said so on the span."""
+    draft.add_limitation(marker)
+    draft.set_status(StatusCode.UNSET)
+    draft.set_end_ns(end_ns)
+    return draft
+
+
+class UnitRegistry:
+    """The table of live units, and the arbiter of `resolve()`.
+
+    Everything that mutates state takes `_lock`; everything that emits does so
+    after releasing it (I11). The two are separated by construction: the
+    internal `_*_locked` helpers RETURN the drafts to emit and never touch the
+    sink, and `_flush` is the only method that does.
+    """
+
+    __slots__ = (
+        "_by_alias",
+        "_debug",
+        "_live_units",
+        "_lock",
+        "_max_entries_per_unit",
+        "_max_record_bytes",
+        "_max_total_units",
+        "_max_units",
+        "_roots",
+        "_sink",
+    )
+
+    def __init__(
+        self,
+        *,
+        sink: SpanSink,
+        max_units: int | None = None,
+        max_entries_per_unit: int | None = None,
+        debug: bool = False,
+    ) -> None:
+        """`max_*` default from the CORE, never from a Python literal.
+
+        `CaptureLimits().resolved()` reads `_wardex_native.limits_defaults()`, so
+        a default cannot drift from `crates/wardex-limits` — a hardcoded 512 here
+        would agree with the core today and silently disagree the moment someone
+        changed it there. TWO tests forbid the literal, and each fails on the
+        disagreement rather than on the spelling:
+        `test_limits.py::test_python_side_fallback_defaults_match_core` compares
+        every Python-side fallback in the SDK against `limits_defaults()`, and
+        `test_units.py::test_bounds_are_resolved_from_the_core_not_a_python_literal`
+        states the same rule locally. Nothing else notices a drifted default:
+        every other test that builds a registry either passes both bounds in
+        explicitly or never opens enough units to reach one.
+
+        Neither bound is `max_sessions`/`max_session_entries` under a new name:
+        those bound one flat table of sessions and three per-session maps, while
+        `open()` is the single entry point for all four `UnitKind`s, so one
+        session plus 256 sub-agents plus 256 open calls would exhaust 512 on its
+        own and "512 concurrent sessions" would quietly become "about one".
+        """
+        resolved = CaptureLimits().resolved()
+        self._sink = sink
+        self._debug = debug
+        self._max_units = max_units if max_units is not None else resolved["max_units"]
+        self._max_entries_per_unit = (
+            max_entries_per_unit
+            if max_entries_per_unit is not None
+            else resolved["max_entries_per_unit"]
+        )
+        # Bytes a unit may accumulate through record_input/record_output. Not a
+        # knob of its own: the payload ceiling the rest of the SDK already
+        # applies to a captured body is the honest ceiling for one assembled
+        # from many fragments.
+        self._max_record_bytes = resolved["max_body_bytes"]
+        # `max_units` bounds ROOTS, deliberately (a flat LRU would make "evict
+        # the oldest unit" pick a long-lived session root nearly every time, so
+        # one chatty session would evict OTHER sessions' roots). Children are
+        # bounded per parent — which bounds BREADTH but not DEPTH, so a chain of
+        # child-of-child units would grow forever under one live root. This
+        # derived ceiling closes that without inventing a knob a user would have
+        # to discover, and it is safe to enforce by evicting a ROOT because
+        # every live unit is reachable from one: a child opened under a closed
+        # parent is registered as a root (see `open`), so "live units exist but
+        # no root does" is unreachable.
+        self._max_total_units = self._max_units * self._max_entries_per_unit
+        self._lock = threading.RLock()
+        self._roots: dict[Unit, None] = {}
+        self._live_units: dict[Unit, None] = {}
+        self._by_alias: dict[UnitKey, Unit] = {}
+
+    # -- lifecycle -------------------------------------------------------
+
+    def open(
+        self,
+        kind: UnitKind,
+        key: UnitKey,
+        *,
+        ambient: Ambient,
+        evidence: Evidence = AMBIENT,
+        intent: SpanIntent,
+        subject: str | None = None,
+        parent_unit: Unit | None = None,
+        aliases: Sequence[UnitKey] = (),
+        start_ns: int | None = None,
+    ) -> Unit:
+        """Open a unit and the span it owns.
+
+        `ambient` has no default on purpose. It is a snapshot taken by
+        `latch_ambient()` at the moment the work was ISSUED, on the task that
+        issued it; letting the registry latch it for the caller would move that
+        read to whenever the framework happened to call us, which is the single
+        most likely way an adapter silently breaks the tree. A unit that hangs
+        off another unit passes `EMPTY_AMBIENT` and `parent_unit`.
+
+        A scope left behind by a STALE PIN is refused here for the same reason
+        `resolve()` refuses it: it is a finished unit's own context, so a unit
+        opened from it would be a fresh subtree hanging off a dead session at
+        confidence 1.0 with nothing on the wire to say so. The unit becomes a
+        trace root instead and carries `CORRELATION_CONFLICT`.
+        """
+        now = start_ns if start_ns is not None else time.time_ns()
+        if parent_unit is not None:
+            if evidence is AMBIENT:
+                evidence = _IN_UNIT
+            parentage = parent_unit.child(evidence)
+            conversation = parent_unit.conversation
+            tracestate = parent_unit.tracestate
+        elif self._poisoned(ambient):
+            counters.bump("assembly._units.stale_pin_ambient")
+            parentage = resolve_parentage(EMPTY_AMBIENT, evidence).with_limitation(
+                Limitation.CORRELATION_CONFLICT
+            )
+            conversation = parentage.conversation
+            tracestate = parentage.tracestate
+        else:
+            parentage = resolve_parentage(ambient, evidence)
+            conversation = parentage.conversation
+            tracestate = parentage.tracestate
+
+        draft = SpanDraft(
+            parentage,
+            intent=intent,
+            subject=subject,
+            source=CaptureSource.ADAPTER,
+            start_ns=now,
+        )
+        _carry_limitations(draft, parentage)
+
+        unit = Unit(
+            self,
+            key=key,
+            kind=kind,
+            draft=draft,
+            parentage=parentage,
+            conversation=conversation,
+            tracestate=tracestate,
+            start_ns=now,
+            parent=parent_unit,
+        )
+
+        pending: list[SpanDraft] = []
+        with self._lock:
+            # Make room BEFORE attaching. Attaching first and evicting after
+            # lets the arriving unit be closed as part of the very subtree its
+            # own arrival evicted — it would be handed to the sink before it was
+            # ever returned, and then tracked as live anyway.
+            while len(self._live_units) >= self._max_total_units and self._roots:
+                pending += self._evict_root_locked(now)
+            if parent_unit is not None and parent_unit.is_live and parent_unit._registry is self:
+                evicted = parent_unit._evict_oldest(parent_unit._children, "child")
+                if evicted is not None:
+                    evicted[0].note(Limitation.CHILD_SPAN_UNCLOSED)
+                    pending += self._close_locked(
+                        evicted[0], status=StatusCode.UNSET, error_type=None, end_ns=now
+                    )
+                parent_unit._children[unit] = None
+            else:
+                # A child of a CLOSED — or FOREIGN — parent is a root for
+                # bookkeeping. Its span still hangs off the parent's context (a
+                # closed unit's span was already emitted, so it is a perfectly
+                # good parent) but its LIFETIME cannot be managed by a unit this
+                # registry does not own or that no longer has a child table:
+                # left as a child it would be reachable from no root of EITHER
+                # registry, so no bound would ever evict it and `close_all`
+                # would never see it. A foreign parent also means the per-parent
+                # breadth bound applied would be the OTHER registry's.
+                if parent_unit is not None and not parent_unit.is_live:
+                    counters.bump("assembly._units.parent_closed")
+                elif parent_unit is not None:
+                    counters.bump("assembly._units.parent_foreign_registry")
+                while len(self._roots) >= self._max_units:
+                    pending += self._evict_root_locked(now)
+                self._roots[unit] = None
+            self._live_units[unit] = None
+            self._bind_alias_locked(key, unit)
+            for extra in aliases:
+                self._bind_alias_locked(extra, unit)
+        self._flush(pending)
+        return unit
+
+    def alias(self, key: UnitKey, alias: UnitKey) -> None:
+        """Point `alias` at whatever `key` already resolves to.
+
+        A no-op when `key` names nothing live — an alias for a unit that does not
+        exist would otherwise be a parent edge waiting to be handed out from a
+        table nobody populated.
+        """
+        with self._lock:
+            unit = self._by_alias.get(key)
+            if unit is None or not unit.is_live:
+                counters.bump("assembly._units.alias_unknown_key")
+                return
+            self._bind_alias_locked(alias, unit)
+
+    def find(self, alias: UnitKey) -> Unit | None:
+        """Resolve a framework id to a live unit, or None.
+
+        Returns `Unit | None` and nothing else. That is the mechanical half of
+        I2: on a miss the caller's only options are `sole_live()` (0.5 plus a
+        marker) or a new trace (0.0 plus `PARENT_UNRESOLVED`). "Silently
+        re-parent an uninterpretable id into the ambient scope, indistinguishable
+        from a real attachment" is not expressible.
+        """
+        with self._lock:
+            unit = self._by_alias.get(alias)
+            if unit is None:
+                return None
+            if not unit.is_live:
+                del self._by_alias[alias]
+                return None
+            return unit
+
+    def current(self) -> Unit | None:
+        """The unit made ambient by `activate()` or a pin, if any.
+
+        ContextVar-backed, so an asyncio task created after the installation
+        inherits it by ordinary context copying — which is exactly how a hook
+        callback and an in-process tool handler see their session with zero
+        framework identifiers and confidence 1.0.
+
+        A carrier whose unit has since CLOSED returns None rather than the dead
+        unit. That is the detection the pin restriction asks for: a pin leaked
+        onto a pooled worker is self-consistent (same task, same ContextVar) and
+        would otherwise parent unrelated later work into a finished unit, which
+        no confidence value or marker downstream could reveal.
+
+        Ownership is checked FIRST, ahead of liveness, and the order is not
+        cosmetic: a foreign CLOSED unit would otherwise bump `pin_stale` /
+        `pin_leaked` and attribute another registry's teardown to this
+        registry's pin discipline, polluting the very counters the pin
+        restriction is audited by.
+        """
+        entry = _ambient_unit.get()
+        if entry is None:
+            return None
+        if entry.unit._registry is not self:
+            # The ambient carrier is process-wide; a unit is not. A pin installed
+            # by a previous `init()`'s registry is not this registry's parent to
+            # hand out, and the staleness gate below does NOT catch it: nothing
+            # closes a dropped registry's units, so it is still `is_live`.
+            counters.bump("assembly._units.ambient_foreign_registry")
+            return None
+        if not entry.unit.is_live:
+            same_task = entry.owner is _current_task()
+            if entry.pinned:
+                counters.bump(
+                    "assembly._units.pin_stale" if same_task else "assembly._units.pin_leaked"
+                )
+            else:
+                counters.bump("assembly._units.ambient_stale")
+            return None
+        return entry.unit
+
+    def stale_pin_in_scope(self) -> bool:
+        """Is the scope on this task the leftover of a pin whose unit has died?
+
+        `current()` refusing the dead unit is only half of the pin's safety, and
+        the other half is what makes the first half matter. A pin installs TWO
+        things (`_Carrier.__init__`): the ambient UNIT, which `current()` gates
+        on liveness, and the ambient SPAN CONTEXT in the scope, which nothing
+        can invalidate — `close()` runs on a different task, and a ContextVar
+        cannot be reset from one. So after the pinned unit closes, the very next
+        `latch_ambient()` still returns the DEAD unit's own span context, and an
+        edge built from it reads `contextvar` / 1.0 / no marker: the failure
+        `current()`'s docstring says it exists to prevent, arriving by the other
+        carrier.
+
+        This predicate is what lets `open()` and `resolve()` refuse that scope
+        and SAY SO on the span whose parent edge it would have decided — design
+        §5.6 asks for a hard `CORRELATION_CONFLICT` rather than an internal
+        count, because the consequence is a tree shape and a tree shape has to
+        be falsifiable from the data.
+
+        LIVENESS, not §5.6's literal "any read from a different task id". Every
+        hook callback and every in-process tool handler runs on a descendant
+        task, which is the mechanism the whole design rests on; the literal rule
+        would stamp `CORRELATION_CONFLICT` on the product's own exhibit A.
+        """
+        return self._stale_pin_context() is not None
+
+    def _stale_pin_context(self) -> SpanContext | None:
+        """The span context a dead pin left standing in this task's scope."""
+        entry = _ambient_unit.get()
+        if entry is None or not entry.pinned or entry.unit.is_live:
+            return None
+        return entry.unit.context
+
+    def _poisoned(self, amb: Ambient) -> bool:
+        """Is `amb` the leftover fork of a pin whose unit has died?
+
+        The identity check, not merely `stale_pin_in_scope()`, and the narrowing
+        is deliberate. A stale pin says the TASK is descended from a dead
+        driver; it does not say the scope still holds the dead unit's own span.
+        A host that opened its own span inside that task, or a handler inside an
+        `activate()`, put a real span on top of the leftover — refusing THAT
+        would move live work out of the host's trace to escape a ghost that is
+        no longer in front of us, which is a wrong tree of a different shape.
+
+        What is refused is exactly the measured failure: the fork the pin
+        installed, still current after `close()` could not take it down, read
+        back as `contextvar` / 1.0 / no marker into a finished unit.
+        """
+        stale = self._stale_pin_context()
+        return stale is not None and amb.span_context is not None and amb.span_context == stale
+
+    def sole_live(self, kind: UnitKind) -> Unit | None:
+        """A unit ONLY when exactly one of `kind` is live.
+
+        Callers must stamp `ParentSource.UNIT_SOLE` (0.5) and
+        `Limitation.UNIT_INFERRED_SOLE`; `resolve()` does. It exists because the
+        adapter it replaces DROPS a hook entirely when two sessions are live,
+        with no marker at all — and a marked low-confidence edge beats unmarked
+        data loss.
+        """
+        with self._lock:
+            found: Unit | None = None
+            for unit in self._live_units:
+                if unit.kind is not kind:
+                    continue
+                if found is not None:
+                    return None
+                found = unit
+            return found
+
+    # -- the whole of I2 -------------------------------------------------
+
+    def resolve(self, alias: UnitKey | None, *, ambient: Ambient | None = None) -> Parentage:
+        """Turn an optional framework id plus the live scope into one edge.
+
+        MOST-SPECIFIC-WINS. The earlier rule — "ambient wins whenever the traces
+        match" — flattens sub-agent subtrees: under a pin the hook task's ambient
+        is always the session root, while an alias carrying an `agent_id`
+        resolves to the sub-agent span, a STRICT DESCENDANT of that root and
+        therefore the more specific answer. Getting it backwards collapses every
+        sub-agent into its session, silently and at confidence 1.0.
+
+        A scope left behind by a STALE PIN is refused before any of that. It is
+        the dead unit's own context, so every branch that consults `amb` would
+        re-attach unrelated later work to a finished unit — at 1.0 with no
+        marker on the widest branch. The edge is rebuilt from the remaining
+        tiers (alias -> sole_live -> UNRESOLVED) and carries
+        `CORRELATION_CONFLICT`, which is the same mechanism this method already
+        uses for a cross-trace disagreement: a wrong tree is invisible, a marked
+        conflict is a shippable bug report.
+        """
+        amb = ambient if ambient is not None else latch_ambient()
+        if self._poisoned(amb):
+            counters.bump("assembly._units.stale_pin_ambient")
+            return self._edge(alias, EMPTY_AMBIENT).with_limitation(Limitation.CORRELATION_CONFLICT)
+        return self._edge(alias, amb)
+
+    def _edge(self, alias: UnitKey | None, amb: Ambient) -> Parentage:
+        """`resolve()`'s precedence ladder, with the ambient already vetted.
+
+        Split out so the staleness refusal is stated once instead of at each of
+        the six returns below — and so a later tier added here cannot forget it.
+        """
+        unit = self.find(alias) if alias is not None else None
+        hint = alias.value if alias is not None else None
+
+        if unit is not None and amb.span_context is not None:
+            if unit.context.trace_id == amb.span_context.trace_id:
+                if self._is_descendant(unit, amb.span_context):
+                    # Context established the tree; the id picked the node inside
+                    # it. Design §5.2 asks for confidence 1.0 here and does not
+                    # get it: `Evidence.confidence` is CLAMPED to the source's
+                    # table default (0.9 for an alias) because a hint may only
+                    # LOWER trust, and that clamp is what stops any caller
+                    # promoting a guess into a fact. Corroboration by descent is
+                    # real, but spending the clamp on it would reopen the hole
+                    # for every other caller; the alias still WINS the branch,
+                    # which is the part that decides the tree's shape.
+                    return unit.child(Evidence(ParentSource.UNIT_ALIAS, request_id=hint))
+                # Same trace, not a descendant: the live context is the better
+                # answer and the id merely corroborates it.
+                return resolve_parentage(amb, Evidence(ParentSource.CONTEXTVAR, request_id=hint))
+            # Different traces. Context wins and the disagreement is RECORDED —
+            # a wrong tree is invisible, a marked conflict is a shippable bug
+            # report.
+            return resolve_parentage(
+                amb, Evidence(ParentSource.CONTEXTVAR, confidence=0.8, request_id=hint)
+            ).with_limitation(Limitation.CORRELATION_CONFLICT)
+
+        if unit is not None:
+            # Context did not reach us (IPC, a bare thread). Attach to a context
+            # captured earlier ON THE CORRECT TASK, addressed by the framework id.
+            return unit.child(Evidence(ParentSource.UNIT_ALIAS, request_id=hint))
+
+        if amb.span_context is not None:
+            return resolve_parentage(amb, AMBIENT)
+
+        sole = self.sole_live(UnitKind.SESSION)
+        if sole is not None:
+            return sole.child(Evidence(ParentSource.UNIT_SOLE, request_id=hint)).with_limitation(
+                Limitation.UNIT_INFERRED_SOLE
+            )
+
+        return resolve_parentage(
+            EMPTY_AMBIENT, Evidence(ParentSource.UNRESOLVED, request_id=hint)
+        ).with_limitation(Limitation.PARENT_UNRESOLVED)
+
+    def _is_descendant(self, unit: Unit, ancestor: SpanContext) -> bool:
+        """Is `unit` strictly below the span `ancestor` names?
+
+        Decided by walking the unit's ANCESTOR CHAIN, which this registry owns —
+        not by a reverse index over arbitrary span contexts. A reverse index
+        would let any span id that happened to be in the table claim ancestry,
+        which is the framework-id-becomes-parent move I2 rules out.
+        """
+        node = unit.parent
+        while node is not None:
+            if node.context.span_id == ancestor.span_id:
+                return True
+            node = node.parent
+        return False
+
+    # -- the restricted primitive ----------------------------------------
+
+    def pin_driver(self, unit: Unit, *, owner_task: object) -> PinToken:
+        """Install `unit` as ambient for the REMAINDER OF THE CURRENT TASK.
+
+        RESTRICTED. Legal only on a long-lived driver task the adapter itself
+        created or patched and whose lifetime is bounded by the unit — a
+        transport read loop. It is ILLEGAL on a pooled or shared worker, where a
+        leaked pin would silently parent unrelated later work into a dead unit.
+        Reachable only through the registry, never exported as a free function,
+        because the free-function form put that leak one import away for every
+        adapter author (a CrewAI ThreadPoolExecutor worker, a uvicorn/anyio
+        worker, an ADK `run_in_executor` thread).
+
+        `owner_task` is the caller's DECLARATION of which task it is pinning, and
+        the registry checks it against the task it actually observes. A mismatch
+        is refused, not corrected: a `ContextVar.set()` lands on the calling
+        task, so pinning "on behalf of" another task would install the unit
+        somewhere the caller did not mean and leave the named task unpinned —
+        a self-consistent lie. The refusal is recorded as a hard
+        `CORRELATION_CONFLICT` on the unit's own span rather than an internal
+        counter, because the consequence is a tree shape and a tree shape has to
+        be falsifiable from the data.
+
+        The returned token is a HANDLE, not the pin. The pin's scope fork is
+        installed by `install_span`, which has no finaliser by design, so
+        dropping the token cannot undo it — `_assembler.py` reads `.installed`
+        off a temporary and discards the rest, which is the shape a handle whose
+        only advertised member is a bool has to survive.
+
+        Staleness is the other half and is enforced in `current()`: a pinned unit
+        that has closed stops being ambient.
+        """
+        observed = _current_task()
+        if owner_task is not observed:
+            counters.bump("assembly._units.pin_foreign_task")
+            unit.note(Limitation.CORRELATION_CONFLICT)
+            return PinToken(unit, observed, None)
+        return PinToken(unit, observed, _Carrier(unit, pinned=True))
+
+    def unpin(self, token: PinToken) -> None:
+        """Remove a pin. MUST run on the task that installed it.
+
+        Counted rather than raised when it does not: `ContextVar.reset` throws
+        `ValueError` from another Context, and a teardown path is exactly where
+        that would reach the host.
+        """
+        if token._carrier is None:
+            return
+        token._carrier.remove(where="assembly._units.unpin", debug=self._debug)
+        token._carrier = None
+        token.installed = False
+
+    # -- closing ---------------------------------------------------------
+
+    def close(
+        self,
+        unit: Unit,
+        *,
+        status: StatusCode = StatusCode.OK,
+        error_type: str | None = None,
+        end_ns: int | None = None,
+    ) -> None:
+        """Close a unit, its surviving children and its open spans.
+
+        Children and open drafts are force-closed with `CHILD_SPAN_UNCLOSED`;
+        the unit's own span is emitted LAST so a consumer that streams sees the
+        subtree before its root. Every span is handed to the sink AFTER the lock
+        is released (I11).
+        """
+        end = end_ns if end_ns is not None else time.time_ns()
+        with self._lock:
+            pending = self._close_locked(unit, status=status, error_type=error_type, end_ns=end)
+        self._flush(pending)
+
+    def close_all(self, *, reason: Limitation) -> None:
+        """Close every live root. Called by adapter uninstall and client teardown.
+
+        `reason` is the caller's — `ADAPTER_UNINSTALLED` from an uninstall,
+        `UNIT_INTERRUPTED` from a cancelled or shutting-down process — so the
+        limitation census records this as a slot it cannot follow rather than
+        pretending to have read it.
+        """
+        end = time.time_ns()
+        with self._lock:
+            pending: list[SpanDraft] = []
+            while self._roots:
+                root = next(iter(self._roots))
+                root.note(reason)
+                pending += self._close_locked(
+                    root, status=StatusCode.UNSET, error_type=None, end_ns=end
+                )
+        self._flush(pending)
+
+    def _evict_root_locked(self, end_ns: int) -> list[SpanDraft]:
+        """Close the oldest ROOT because a bound was reached. Caller holds the lock.
+
+        The eviction EMITS. What this replaces dropped the oldest session and
+        its root span outright — no marker, no test — so a user whose workload
+        crossed the cap saw traces simply stop appearing (I10).
+        """
+        oldest = next(iter(self._roots))
+        oldest.note(Limitation.UNIT_EVICTED)
+        return self._close_locked(oldest, status=StatusCode.UNSET, error_type=None, end_ns=end_ns)
+
+    def _close_locked(
+        self,
+        unit: Unit,
+        *,
+        status: StatusCode,
+        error_type: str | None,
+        end_ns: int,
+    ) -> list[SpanDraft]:
+        """Detach a unit's whole subtree and return the drafts to emit.
+
+        Never touches the sink. That separation is what makes I11 a property of
+        the code rather than a rule reviewers have to remember.
+
+        Closing a dead unit is a COUNTED no-op, not a silent one. Every other
+        "you asked me to act on a unit that is gone" path here already counts
+        (`note_after_close`, `open_span_after_close`, `ambient_stale`,
+        `pin_stale`); this is the one that discards a whole ROOT span, because a
+        caller holding its own table of sessions finalizes one the registry
+        already evicted — it stamps the conversation id, the model name and the
+        turn totals onto the draft, hands it here, and gets nothing emitted.
+        The counter is the difference between a class of bug that is invisible
+        and one that shows up in a counter snapshot.
+        """
+        if not unit.is_live:
+            counters.bump("assembly._units.close_after_close")
+            return []
+        unit._live = False
+        pending: list[SpanDraft] = []
+
+        for child in list(unit._children):
+            child.note(Limitation.CHILD_SPAN_UNCLOSED)
+            pending += self._close_locked(
+                child, status=StatusCode.UNSET, error_type=None, end_ns=end_ns
+            )
+        unit._children.clear()
+
+        for entry in list(unit._open.values()):
+            # The loser of an arbitration stays lost. A teardown that emitted it
+            # would produce the double emit the arbitration exists to prevent,
+            # in the one case `claim()` names as safe: the loser that never asks
+            # again because the session was aborted between the two observers.
+            if unit._superseded_locked(entry):
+                counters.bump("assembly._units.claim_superseded")
+                continue
+            pending.append(_force_close(entry.draft, Limitation.CHILD_SPAN_UNCLOSED, end_ns))
+        unit._open.clear()
+
+        self._roots.pop(unit, None)
+        self._live_units.pop(unit, None)
+        if unit.parent is not None:
+            unit.parent._children.pop(unit, None)
+        for key in unit._alias_keys:
+            if self._by_alias.get(key) is unit:
+                del self._by_alias[key]
+        unit._alias_keys.clear()
+
+        pending.append(unit._finalize_locked(status=status, error_type=error_type, end_ns=end_ns))
+        return pending
+
+    # -- plumbing --------------------------------------------------------
+
+    def _bind_alias_locked(self, key: UnitKey, unit: Unit) -> None:
+        existing = self._by_alias.get(key)
+        if existing is not None and existing is not unit:
+            counters.bump("assembly._units.alias_rebound")
+        if key not in unit._alias_keys:
+            evicted = unit._evict_alias()
+            if evicted is not None and self._by_alias.get(evicted) is unit:
+                del self._by_alias[evicted]
+            unit._alias_keys.append(key)
+        self._by_alias[key] = unit
+
+    def _flush(self, pending: list[SpanDraft]) -> None:
+        """Hand finished drafts to the sink. NEVER called holding `_lock`.
+
+        Each emit is guarded individually so one bad draft cannot take the rest
+        of a subtree with it, and so a sink that raises — the Protocol asks it
+        not to, but this registry does not own the implementation — cannot reach
+        the host.
+
+        THE EMIT-ONCE FUNNEL. Every path that ships a span goes through here —
+        `close_span`, `_close_locked`, `close_all`, `_evict_root_locked`,
+        `open_span`'s eviction, and any path added after them — so latching the
+        draft HERE covers every one of them by construction instead of asking
+        each caller to remember. `unit._open` was doing that
+        job by accident and enforced only half of it: a draft removed by a
+        force-close is no longer findable, and `close_span` read "not in the
+        table" as "nothing to arbitrate, emit" rather than "already gone".
+
+        The latch is taken under the lock and the sink is called outside it
+        (I11): the window is one attribute test-and-set, never the emit.
+        FIRST WRITER WINS, which keeps the force-closed record — `UNSET` plus
+        `CHILD_SPAN_UNCLOSED`, the honest one — and makes the loss countable.
+        """
+        for draft in pending:
+            with self._lock:
+                fresh = draft.claim_emit()
+            if not fresh:
+                counters.bump("assembly._units.emit_duplicate")
+                continue
+            with guard("assembly._units.emit", debug=self._debug):
+                self._sink.emit(draft, agent_semantic=True)
+
+
+__all__ = [
+    "PinToken",
+    "SpanSink",
+    "Unit",
+    "UnitKey",
+    "UnitKind",
+    "UnitRegistry",
+]

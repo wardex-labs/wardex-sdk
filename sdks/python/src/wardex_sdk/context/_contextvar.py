@@ -1,4 +1,4 @@
-"""Span-scoped context forking (Phase 4a) — design §5.6.
+"""Span-scoped context forking — design §5.6.
 
 Starting a span forks the *current* scope: the fork carries the new
 active_span_context, and the ContextVar points at the fork for the span's
@@ -12,6 +12,10 @@ conversation identity and a tracestate alongside its span context, and a
 carrier that installs only the context leaves the other two behind on every
 task the unit spans — so a sub-agent's spans would silently lose the
 conversation id the session issued.
+
+`install_span` is the UNBALANCED form of the same fork, for a carrier that is
+never exited. Both build the fork through `_fork`, so the override semantics
+below are stated once.
 """
 
 from __future__ import annotations
@@ -23,7 +27,72 @@ from contextlib import contextmanager
 from typing import Any
 
 from .. import _hub
+from .._scope import Scope
 from .._types import ConversationContext, SpanContext
+
+
+def _fork(
+    prev: Scope,
+    ctx: SpanContext,
+    conversation: ConversationContext | None,
+    tracestate: str | None,
+) -> Scope:
+    """Clone `prev` with `ctx` active. The one place the fork rule is written.
+
+    `conversation` and `tracestate` are OVERRIDES, not assignments: `None`
+    leaves whatever the cloned scope already carried. That is what keeps
+    `activate_span` a true generalization of `fork_active_span` — the old
+    two-line body inherited both fields from the parent scope, and a version
+    that wrote `None` through would clear a conversation id merely because the
+    caller did not restate it.
+
+    Factored out rather than duplicated into `install_span` because a second
+    copy of these five lines is a second place for that rule to drift, which is
+    the drift the whole `assembly/` extraction exists to end.
+    """
+    forked = prev.clone()
+    forked.active_span_context = ctx
+    if conversation is not None:
+        forked.conversation = conversation
+    if tracestate is not None:
+        forked.tracestate = tracestate
+    return forked
+
+
+def install_span(
+    ctx: SpanContext,
+    *,
+    conversation: ConversationContext | None = None,
+    tracestate: str | None = None,
+) -> Scope:
+    """Fork the scope with NO finaliser. Returns the scope that was current.
+
+    For a carrier that is never exited — a pin (design §5.6), whose whole point
+    is that the driver task keeps the unit ambient for the rest of its life.
+    `activate_span` is the balanced form and is wrong for that job: a `finally`
+    is a promise that the block WILL be exited, so the only way a pin's intent
+    can be violated is by that finaliser running, and a suspended generator
+    runs its `finally` the moment nothing references it. A caller that reads
+    `.installed` off a temporary `PinToken` and drops it would silently undo
+    the fork on the statement that installed it.
+
+    This form cannot be undone by dropping a reference. `restore_scope` is the
+    deliberate, same-task way back, and there is no other.
+    """
+    prev = _hub.get_current_scope()
+    _hub._current_scope.set(_fork(prev, ctx, conversation, tracestate))
+    return prev
+
+
+def restore_scope(prev: Scope) -> None:
+    """Put `prev` back as the current scope. MUST run on the installing task.
+
+    A plain `set()` rather than a Token reset, because `install_span` has no
+    Token to reset — and because a `set()` from another task would land on THAT
+    task's scope, silently. The caller checks task identity; see
+    `assembly/_units.py::_Carrier.remove`.
+    """
+    _hub._current_scope.set(prev)
 
 
 @contextmanager
@@ -42,18 +111,11 @@ def activate_span(
     rule rather than around it.
 
     `conversation` and `tracestate` are OVERRIDES, not assignments: `None`
-    leaves whatever the cloned scope already carried. That is what keeps this a
-    true generalization of `fork_active_span` — the old two-line body inherited
-    both fields from the parent scope, and a version that wrote `None` through
-    would clear a conversation id merely because the caller did not restate it.
+    leaves whatever the cloned scope already carried — see `_fork`, which both
+    forms share.
     """
-    forked = _hub.get_current_scope().clone()
-    forked.active_span_context = ctx
-    if conversation is not None:
-        forked.conversation = conversation
-    if tracestate is not None:
-        forked.tracestate = tracestate
-    token = _hub._current_scope.set(forked)
+    prev = _hub.get_current_scope()
+    token = _hub._current_scope.set(_fork(prev, ctx, conversation, tracestate))
     try:
         yield
     finally:

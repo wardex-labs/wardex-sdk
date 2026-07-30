@@ -14,20 +14,36 @@ reachable is not extraction. Adapters cannot import `InternalSpan`, `TraceId`,
 adapter to obtain parentage is to ask this package for it — the shortcut has no
 name to call.
 
-Migration status (design §11): step 0 landed `_parentage`, `_diag` and the
-`Limitation` enum; step 1 wired the six parentage sites onto `resolve_parentage`
-/ `child_of`; step 2 landed `_policy`, so the capture gate has one
-implementation and the byte seams compose with it instead of overriding it;
-step 3a landed `_vocab`, `_builder` and `_snapshot`, so the same six sites now
-also share one span CONSTRUCTOR and one closed vocabulary — `InternalSpan(...)`
-appears nowhere outside `_types.py` and `_builder.py`, and `guard()` finally has
-callers outside this package (every draft is built inside one, because
-`finish()` throws on a vocabulary breach and I6 forbids that reaching the host);
-step 5 landed `_patchset`, so the six hand-rolled monkeypatch dictionaries are
-one mechanism whose uninstall is identity-checked, LIFO and individually
-guarded — and `Limitation.PATCH_SUPERSEDED` has an emitter for the first time.
-`_units` and `_emit` arrive in later steps; `__all__` grows with them and does
-not shrink.
+What lives here, and the duplication each module exists to remove:
+
+* `_parentage` + `_diag` + the `Limitation` enum are the base. All six
+  parentage sites resolve through `resolve_parentage` / `child_of`, so "how
+  did I know this was the parent" has one answer and one vocabulary.
+* `_policy` holds the capture gate, so it has one implementation and the byte
+  seams compose with it instead of overriding it.
+* `_vocab`, `_builder` and `_snapshot` give those same six sites one span
+  CONSTRUCTOR and one closed vocabulary — `InternalSpan(...)` appears nowhere
+  outside `_types.py` and `_builder.py`, and `guard()` has callers outside
+  this package because every draft is built inside one (`finish()` throws on a
+  vocabulary breach and I6 forbids that reaching the host).
+* `_patchset` is the SDK's one monkeypatch mechanism, replacing six
+  hand-rolled dictionaries with an uninstall that is identity-checked, LIFO
+  and individually guarded — it is what gives `Limitation.PATCH_SUPERSEDED` an
+  emitter.
+* `_units` is where a framework identifier is a LOOKUP KEY rather than a
+  parent: `UnitRegistry.resolve()` holds the whole of I2 in one function — the
+  entry point for a caller that has an id to offer, which the Agent SDK adapter
+  does not, since it carries the session in context and reaches the registry
+  through `current()` / `sole_live()` / `Unit.child()` instead. And
+  `UNIT_EVICTED` / `CHILD_SPAN_UNCLOSED` are the emitters that put an evicted
+  entry's own span on the wire (I10) instead of dropping it unmarked. Only the
+  three bounded tables whose entries OWN a span can be marked that way; evicting
+  a lookup alias or a de-duplication key emits nothing, because there is no span
+  to mark, and is recorded in the `alias_table_full` / `claim_table_full`
+  counters instead.
+
+`_emit` — the one sink `tests/test_import_graph.py` reserves the name for — is
+not here yet. `__all__` grows as modules land and does not shrink.
 """
 
 from ._builder import IntegrityBuilder, SpanDraft
@@ -47,6 +63,7 @@ from ._parentage import (
 from ._patchset import PatchSet
 from ._policy import Prefilter, capture_mode_of, should_capture
 from ._snapshot import SnapshotDraft
+from ._units import PinToken, SpanSink, Unit, UnitKey, UnitKind, UnitRegistry
 from ._vocab import (
     Block,
     LinkReason,
@@ -71,12 +88,18 @@ __all__ = [
     "ParentSource",
     "Parentage",
     "PatchSet",
+    "PinToken",
     "Prefilter",
     "SnapshotDraft",
     "SnapshotType",
     "SpanDraft",
     "SpanIntent",
+    "SpanSink",
     "TransportLabel",
+    "Unit",
+    "UnitKey",
+    "UnitKind",
+    "UnitRegistry",
     "VocabularyError",
     "capture_mode_of",
     "child_of",

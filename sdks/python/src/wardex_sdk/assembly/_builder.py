@@ -201,7 +201,7 @@ class IntegrityBuilder:
             truncated=self._truncated,
             dropped_chunk_count=self._dropped_chunks,
             # Members, all the way to the encoder. Unwrapping to `.value` here
-            # was 3a's placeholder while the wire field was still
+            # was a placeholder while the wire field was still
             # `repeated string`; now that it is `repeated Limitation`, keeping
             # the member means the type is checkable at every hop instead of
             # only at the two ends.
@@ -231,6 +231,7 @@ class SpanDraft:
         "_correlation",
         "_cost_usd",
         "_embeddings",
+        "_emitted",
         "_end_ns",
         "_evaluation",
         "_events",
@@ -307,6 +308,7 @@ class SpanDraft:
         self._extra: list[tuple[str, _Scalar]] = []
         self._links: list[InternalSpanLink] = []
         self._events: list[InternalSpanEvent] = []
+        self._emitted = False
 
     # -- the two non-vocabulary modes ------------------------------------
 
@@ -513,7 +515,7 @@ class SpanDraft:
         A label, not an intent: the host said "call this an `execute_tool`" and
         wardex has no `ToolAttributes` to check it against, because the public
         decorator signature makes that argument optional. Closing that gap means
-        changing a published API and is not step 3a's to do.
+        changing a published API, which is not this constructor's to make.
         """
         if operation is None:
             self._operation_label = None
@@ -526,28 +528,31 @@ class SpanDraft:
         MANUAL spans are exempt: `SpanBuilder.set_attribute` is a published API
         that has always taken any key, and rejecting one now would delete a
         user's span to enforce a namespace wardex has not yet given them a way
-        to declare (§6.5 tier 1's `FRAMEWORK_EXTRAS` arrives in step 8).
+        to declare (§6.5 tier 1's `FRAMEWORK_EXTRAS` does not exist yet).
         """
         self._extra.append((key, value))
 
     def replace_correlation(self, correlation: CorrelationInfo | None) -> None:
         """Override the edge's own `CorrelationInfo`, or withhold it entirely.
 
-        PRE-STEP-6 DEBT, and it is here so the debt is countable. Two adapter
-        cases need it and both disappear when `UnitRegistry.resolve()` returns
-        evidence per edge:
+        DEBT, and it is here so the debt is countable. Two adapter cases need
+        it, and both disappear once every adapter edge is opened by the unit
+        registry against a context a pin delivered, so `resolve()` can supply
+        evidence for that edge instead of the adapter guessing:
 
-          * `None` — the edge was picked by a heuristic this step does not own
-            (`_resolve_subagent_anchor`'s fallback, `_session_for_hook`'s
+          * `None` — the edge was picked by a heuristic outside the parentage
+            core (`_resolve_subagent_anchor`'s fallback, `_session_for_hook`'s
             sole-live-session guess). `Parentage.correlation` would report it as
             `unit_active` at confidence 1.0 with no marker, which is I4's exact
             prohibition: a claim wardex cannot back is worse than no claim.
 
-          * a replacement — the tool span's `adapter_hook`/`adapter_stream`
-            strategy, which answers "which source observed this", not "how was
-            the parent derived". Design §11 retires it at step 7b, together with
-            the two assertions that pin it; retiring it here would ship a
-            `strategy` value nothing declared.
+          * a replacement — the tool span's own `CorrelationInfo`, carrying the
+            framework's call id as a hint and the trust gap between the hook and
+            stream paths as confidence, with `strategy=None` because this path
+            cannot yet say how the parent was derived. It goes away with the
+            same ingestion move, together with the two assertions that pin it;
+            dropping the override here would republish the base edge's
+            `unit_active`/1.0, which is the claim the first bullet forbids.
         """
         self._correlation = correlation
 
@@ -586,6 +591,30 @@ class SpanDraft:
             return vocabulary_name(self._intent, self._subject)
         return ""
 
+    def claim_emit(self) -> bool:
+        """True exactly once per draft: may this draft be handed to a sink?
+
+        The state a draft was missing. A draft's `context` — and therefore its
+        span id — is decided at construction, and `finish()` re-materializes
+        from it happily, so a second emit of the same draft puts TWO spans on
+        the wire under ONE span id. Downstream that is not a duplicate, it is a
+        contradiction: the second copy keeps the `CHILD_SPAN_UNCLOSED` a
+        force-close added while reporting `status=OK` and a later end, and a
+        backend doing last-write-wins shows a span that says both "completed
+        successfully" and "was killed by someone else's teardown". Nothing after
+        this point can undo it.
+
+        Deliberately NOT folded into `finish()`. `finish()` is a pure
+        materializer that tests and future readers call to inspect a draft;
+        one-shotting it would make inspection destructive and would put the
+        count at a place that cannot tell "materialized twice" from "emitted
+        twice". The caller latches here and materializes there.
+        """
+        if self._emitted:
+            return False
+        self._emitted = True
+        return True
+
     def finish(self, end_ns: int | None = None) -> InternalSpan:
         """Validate and materialize. Raises `VocabularyError` on a vocabulary breach.
 
@@ -616,7 +645,7 @@ class SpanDraft:
         # out of the block); an intent without one stamps the key directly.
         # Writing both would put the key on the wire twice and force a
         # precedence rule nobody has — the same double-carry that keeps
-        # `OperationName` out of `Span` as a typed field in 3a (§6.6, V11).
+        # `OperationName` out of `Span` as a typed field (§6.6, V11).
         if self._intent is not None:
             if gen_ai is not None:
                 gen_ai = replace(gen_ai, operation=self._intent.operation)

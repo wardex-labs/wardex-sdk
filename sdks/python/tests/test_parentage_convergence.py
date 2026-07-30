@@ -1,6 +1,6 @@
-"""Migration step 1 (design §11): the six parentage sites now share one core.
+"""The six parentage sites share one core — `assembly.resolve_parentage` (I1).
 
-Before this step each site answered "who is my parent" on its own, and the six
+Each site used to answer "who is my parent" on its own, and the six
 answers had drifted: two of them dropped `trace_flags`, three produced
 `correlation=None` when they started a new trace, one recorded a joined W3C
 parent as if it had come from the ContextVar, and one dropped the call on the
@@ -207,9 +207,10 @@ def test_every_site_marks_its_own_root_identically(site):
 def test_every_site_calls_a_joined_parent_a_header_parent(site):
     """A remote parent is not a ContextVar parent, at any site.
 
-    `header` was a declared `ParentSource` with zero producers before step 1:
-    every site labelled a joined W3C parent `contextvar`, so a trace that came
-    in over the wire was indistinguishable from one started in-process.
+    `header` was a declared `ParentSource` with zero producers until this
+    convergence: every site labelled a joined W3C parent `contextvar`, so a
+    trace that came in over the wire was indistinguishable from one started
+    in-process.
     """
     client = _client()
 
@@ -252,7 +253,8 @@ def test_no_site_disagrees_about_the_shape_of_one_run():
 
 
 # --------------------------------------------------------------------------
-# site-4 — the edges BELOW the adapter root, which step 1 does not resolve
+# site-4 — the edges BELOW the adapter root, which the parentage core does not
+# resolve: the adapter still picks the anchor itself
 # --------------------------------------------------------------------------
 
 
@@ -294,7 +296,8 @@ def test_a_guessed_adapter_edge_makes_no_confidence_claim():
 
     `_resolve_subagent_anchor` falls back to the session root whenever the id
     resolves to nothing, so this `chat` span is re-parented and flattened. That
-    is pre-existing and step 6 fixes it. What must NOT happen meanwhile is the
+    is pre-existing, and the ingestion move design §3.4 schedules is what fixes
+    it. What must NOT happen meanwhile is the
     span claiming `strategy="unit_active", confidence=1.0` with no marker —
     which would make the flattened subtree byte-indistinguishable from a correct
     one and invisible to the standard triage query (`confidence < 1.0` or a
@@ -310,8 +313,8 @@ def test_a_guessed_adapter_edge_makes_no_confidence_claim():
     assert chat.correlation is None
 
 
-def test_only_the_adapter_root_gained_correlation_in_this_step():
-    """The §11 step-1 delta, asserted as a boundary rather than as prose.
+def test_only_the_adapter_root_publishes_a_resolved_correlation():
+    """The boundary of what the adapter may claim, asserted rather than described.
 
     Widening it later is a decision to make deliberately; drifting into it by
     passing `p.correlation` at one more emit site is not.
@@ -326,7 +329,7 @@ def test_only_the_adapter_root_gained_correlation_in_this_step():
 
     with_corr = {s.name for s in client.spans if s.correlation is not None}
     assert with_corr == {"invoke_agent", "root"}, (
-        "the adapter's session root is the only span this step gives a resolved "
+        "the adapter's session root is the only span with a resolved "
         f"`correlation`; got {sorted(with_corr)}"
     )
     root = next(s for s in client.spans if s.name == "invoke_agent")
@@ -334,11 +337,15 @@ def test_only_the_adapter_root_gained_correlation_in_this_step():
 
 
 def test_no_undeclared_strategy_value_reaches_the_wire():
-    """`unit_active` is a `ParentSource` member, not yet a shipped wire value.
+    """Every `strategy` reaching a span is a `ParentSource` member, and few are.
 
-    `span.proto`'s `CorrelationInfo.strategy` documents the vocabulary and step
-    3b is what re-declares it. Emitting a value the release notes and the schema
-    do not name buckets it as unknown in every consumer that maps strategies.
+    `ParentSource` declares more members than the set below — `unit_active` and
+    `unit_alias` among them — and they are reachable through the unit registry,
+    which none of these scenarios goes through. So a value appearing here is a
+    site that started answering "how was the parent derived" with something new.
+    That is a decision to make deliberately, not one to discover on a user's
+    wire, where a value the release notes do not name buckets as unknown in
+    every consumer that maps strategies.
     """
     client = _client()
 
@@ -351,17 +358,16 @@ def test_no_undeclared_strategy_value_reaches_the_wire():
             site(client)
 
     shipped = {s.correlation.strategy for s in client.spans if s.correlation is not None}
-    # STRENGTHENED at step 3b, which retired `adapter_hook`/`adapter_stream`:
-    # they answered "which source observed this", not "how was the parent
-    # derived", and a tool span now makes no parentage claim at all. The set is
-    # down to the three values the release notes name, plus `None` for the spans
-    # that deliberately claim nothing.
+    # STRENGTHENED when `adapter_hook`/`adapter_stream` were retired: they
+    # answered "which source observed this", not "how was the parent derived",
+    # and a tool span now makes no parentage claim at all. The set is down to
+    # three values plus `None` for the spans that deliberately claim nothing.
     assert shipped <= {
         ParentSource.CONTEXTVAR,
         ParentSource.HEADER,
         ParentSource.TRACE_ROOT,
         None,
-    }, f"only three strategy values are declared; these reached a span: {sorted(map(str, shipped))}"
+    }, f"a new strategy value reached a span; the set is now: {sorted(map(str, shipped))}"
     # ...and every one of them is a MEMBER. A raw string here would satisfy the
     # subset check above only by accident of never being compared, which is how
     # `strategy=src.value` survived the retype unnoticed.
@@ -387,7 +393,7 @@ def test_snapshot_still_attaches_to_the_active_span():
 
 
 def test_snapshot_without_an_active_span_is_emitted_and_says_so():
-    """BEHAVIOUR CHANGE. This call produced nothing at all before step 1.
+    """BEHAVIOUR CHANGE. This call used to produce nothing at all.
 
     It returned at the `active is None` check — no span, no snapshot, no marker,
     no counter — so a user whose snapshot never arrived had nothing to look at.

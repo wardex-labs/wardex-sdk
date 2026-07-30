@@ -16,8 +16,9 @@ Two kinds of assertion live here, and the difference matters when one fails:
   BUDGET — a ratchet over code that predates the `assembly/` package. Each file
   gets the count it has today; the test fails if a count goes UP or if a file
   not on the list acquires its first occurrence. These numbers may only be
-  lowered. The migration (design §11) drives each budget to zero, at which
-  point the budget dict is deleted and the rule becomes hard. Adding a line to
+  lowered. Each budget is driven to zero as the code it covers moves onto
+  `assembly/`, at which point the budget dict is deleted and the rule becomes
+  hard. Adding a line to
   a budget to make your change pass is the one edit this file is not for.
 """
 
@@ -294,7 +295,7 @@ def _reads_capture_mode(rel: str, tree: ast.Module):
     """Every way a module can reach `config.capture_mode`.
 
     Two spellings, because the codebase already uses both: the attribute
-    (`client.config.capture_mode`, which is how the seam read it before step 2)
+    (`client.config.capture_mode`, which is how the seam used to read it)
     and the string (`getattr(config, "capture_mode", None)`, which is how
     `assembly/_policy.py` reads it now, duck-typed). A rule that saw only the
     first would be one `getattr` away from meaning nothing.
@@ -361,16 +362,39 @@ def _is_silent_swallow(rel: str, tree: ast.Module):
     return _silent_swallow_node
 
 
+def _suppress_items(node: ast.AST) -> list[ast.Call]:
+    """The `contextlib.suppress(...)` calls a `with` statement enters, if any.
+
+    Matched on the callee NAME, so both spellings the stdlib offers count
+    (`contextlib.suppress(E)` and a bare `suppress(E)` after `from contextlib
+    import suppress`) and nothing else does. `interceptors/_exclusion.py`
+    exports a context manager called `suppress_capture`, which suppresses
+    CAPTURE rather than an exception and is not this.
+    """
+    if not isinstance(node, (ast.With, ast.AsyncWith)):
+        return []
+    found = []
+    for item in node.items:
+        call = item.context_expr
+        if not isinstance(call, ast.Call):
+            continue
+        func = call.func
+        name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
+        if name == "suppress":
+            found.append(call)
+    return found
+
+
 def _silent_swallow_node(node: ast.AST) -> bool:
-    """An `except` handler that leaves NO trace that it ran.
+    """A construct that discards an exception and leaves NO trace it ran.
 
     Deliberately not "the body is literally `pass`". Two things go wrong with the
     literal reading. It misses `except Exception: return None`, which is the same
     swallow with different punctuation and is already the shape of 13 handlers in
     `adapters/`/`interceptors/`. Worse, it makes the C-S4 ratchet satisfiable by
     laundering: rewriting `pass` as `return None` lowers the count, turns the
-    budget green, and fixes nothing — which would defeat the migration this
-    budget exists to drive (design §11 step 9).
+    budget green, and fixes nothing — which would defeat the conversion onto
+    `guard()` this budget exists to drive.
 
     So the question asked is the one the rule's WHY actually asks: after this
     handler runs, is there any evidence anywhere? A handler is NOT silent if it
@@ -378,7 +402,21 @@ def _silent_swallow_node(node: ast.AST) -> bool:
     (`guard`, `counters.bump`, any logging spelling). Everything else — `pass`,
     `return`, `return b""`, `self._disabled = True` — is a swallow that is
     indistinguishable from wardex not being installed.
+
+    `contextlib.suppress(...)` is the SECOND spelling of the same act, and the
+    rule would go blind the moment someone reached for it: a `try/except` and a
+    `with suppress` compile to the same discarded exception, and only one of
+    them used to be visible here. It gets no escape hatch, because it CANNOT
+    report. An `except` body runs only when the failure happened, so a
+    `counters.bump` there is evidence about that failure; a `with suppress` body
+    runs on the success path and the exception unwinds straight out of it, so
+    nothing written inside can say the swallow occurred. Every
+    `contextlib.suppress` is therefore silent by construction, and the one
+    sanctioned occurrence in `assembly/` is recorded by name in
+    `_ASSEMBLY_SUPPRESS` rather than exempted by predicate.
     """
+    if _suppress_items(node):
+        return True
     if not isinstance(node, ast.ExceptHandler):
         return False
     for child in ast.walk(node):
@@ -416,7 +454,7 @@ def _assert_within_budget(
         "These budgets are a ratchet over code that predates wardex_sdk.assembly.\n"
         "They may only be LOWERED. If you need a new occurrence, you need the\n"
         "assembly/ entry point instead — that is the whole point of the rule.\n"
-        "See design §10.4 and the migration table in §11."
+        "See design §10.4."
     )
 
 
@@ -603,7 +641,7 @@ def test_assembly_internal_modules_stay_private():
         "WHY: assembly.__all__ is a semver-stable boundary (design §3.1). A\n"
         "module without a leading underscore invites `from wardex_sdk.assembly\n"
         "import somemodule`, which freezes an internal layout we intend to keep\n"
-        "moving through the migration."
+        "moving as more of the SDK routes through this package."
     )
 
 
@@ -646,26 +684,30 @@ _FORBIDDEN_MODULES_IN_ADAPTERS = frozenset(
 )
 
 # Pre-assembly debt. Each entry is the set of forbidden names and module targets
-# that file still reaches today; the sets may only SHRINK. Emptied by migration
-# steps 6-8, when the Anthropic adapter moves onto AdapterContext + assembly/ and
-# this dict is deleted along with the budget machinery.
+# that file still reaches today; the sets may only SHRINK. The adapter rewrite
+# empties it, when the Anthropic adapter moves onto AdapterContext + assembly/
+# and this dict is deleted along with the budget machinery.
 _CS1_DEBT: dict[str, frozenset[str]] = {
     "adapters/__init__.py": frozenset({"Client", f"{_PKG}._client"}),
     "adapters/_base.py": frozenset({"Client", f"{_PKG}._client"}),
     "adapters/_registry.py": frozenset({"Client", f"{_PKG}._client"}),
-    "adapters/_anthropic_agent_sdk.py": frozenset(
-        {"Client", f"{_PKG}._client", f"{_PKG}._types", f"{_PKG}._tracing"}
-    ),
-    # Step 1 shrank this by four: `TraceId`, `SpanId`, `_hub` and
-    # `wardex_sdk._hub` are gone, because the assembler no longer mints ids or
-    # reads the scope — `assembly.resolve_parentage()`/`child_of()` do both. It
-    # still names `InternalSpan` (step 3, SpanDraft) and `SpanContext` (the
-    # anchor type it holds per session; step 6, Unit).
-    # Step 3a shrank this by two: `InternalSpan` and `SpanContext` are gone,
-    # because the assembler no longer constructs a span or holds a bare anchor
-    # context — `assembly.SpanDraft` does both, and `draft.context` IS the
-    # anchor. What is left is the `wardex_sdk` package object (`_wardex_native`
-    # for the limits defaults) and `_types` for the typed attribute blocks.
+    # The unit registry shrank this by one: `wardex_sdk._tracing` is gone, because the
+    # in-process tool wrapper no longer opens a MANUAL span through the public
+    # `trace()` API. It opens a CALL unit instead, so the tool span is a child of
+    # the session by construction rather than a root that happened to be started
+    # inside one — the parent edge now comes from the unit that owns the call,
+    # not from whatever the ambient scope happened to hold when `trace()` ran.
+    # What is left is the `Client` type (an install() parameter annotation) and
+    # `_types` for the typed blocks.
+    "adapters/_anthropic_agent_sdk.py": frozenset({"Client", f"{_PKG}._client", f"{_PKG}._types"}),
+    # Shrank by four when the assembler stopped minting ids and reading the
+    # scope: `TraceId`, `SpanId`, `_hub` and `wardex_sdk._hub` are gone, because
+    # `assembly.resolve_parentage()`/`child_of()` do both.
+    # Shrank by two more when it stopped constructing spans and holding a bare
+    # anchor context: `InternalSpan` and `SpanContext` are gone, because
+    # `assembly.SpanDraft` does both and `draft.context` IS the anchor. What is
+    # left is the `wardex_sdk` package object (`_wardex_native` for the limits
+    # defaults) and `_types` for the typed attribute blocks.
     "adapters/_assembler.py": frozenset(
         {
             _PKG,
@@ -702,7 +744,7 @@ def test_adapters_do_not_import_span_machinery():
 # C-S2 / C-S3 — one parentage source, one span constructor
 # --------------------------------------------------------------------------
 
-# C-S2 has no budget any more. Migration step 1 routed all six parentage sites
+# C-S2 has no budget any more. All six parentage sites route
 # through `assembly.resolve_parentage()`, which drove the five pre-existing
 # `TraceId.generate()` calls (`_tracing.py` 1, `adapters/_assembler.py` 1,
 # `interceptors/_mcp_stdio.py` 1, `interceptors/_seam.py` 2) to zero. Per this
@@ -710,8 +752,8 @@ def test_adapters_do_not_import_span_machinery():
 # hard: I1 is now literally true — one call site in the whole SDK — and the
 # assertion below says so directly instead of tolerating a count.
 
-# C-S3 has no budget any more either. Migration step 3a routed all six emit
-# sites through `assembly.SpanDraft`, which drove the four pre-existing
+# C-S3 has no budget any more either. All six emit sites route
+# through `assembly.SpanDraft`, which drove the four pre-existing
 # `InternalSpan(...)` construction sites (`_tracing.py` 1,
 # `adapters/_assembler.py` 4, `interceptors/_mcp_stdio.py` 1,
 # `interceptors/_seam.py` 2 — nine calls across four files) to zero, and took
@@ -731,8 +773,8 @@ def test_trace_id_is_generated_only_in_parentage():
         "'started a new trace' case can be told apart from the 'expected a\n"
         "parent and lost it' case at all (design I1, I4). Every extra generator\n"
         "is another place a subtree can silently detach into its own trace.\n"
-        "This was a budget over five pre-existing sites until migration step 1\n"
-        "routed them through assembly.resolve_parentage(); it is not a budget\n"
+        "This was a budget over five pre-existing sites until they were\n"
+        "routed through assembly.resolve_parentage(); it is not a budget\n"
         "any more, so a new site here is a change to make, not a number to\n"
         "raise."
     )
@@ -750,8 +792,8 @@ def test_internal_span_is_constructed_in_one_place():
         "places — one had all three forensic fields and the other had none —\n"
         "and the span literally named 'chat None' existed because a name was\n"
         "interpolated at an emit site instead of built by the grammar.\n"
-        "This was a budget over nine pre-existing calls until migration step\n"
-        "3a routed them through assembly.SpanDraft; it is not a budget any\n"
+        "This was a budget over nine pre-existing calls until they were\n"
+        "routed through assembly.SpanDraft; it is not a budget any\n"
         "more, so a new site here is a change to make, not a number to raise."
     )
 
@@ -773,8 +815,9 @@ def test_parent_span_id_is_passed_only_from_assembly():
     )
 
 
-# Hand-built `Ambient(...)` outside assembly/. Migration step 1 opened this
-# surface and it needs the same ratchet as the ones it closed: `latch_ambient()`
+# Hand-built `Ambient(...)` outside assembly/. Routing the six sites through
+# `resolve_parentage()` opened this surface, and it needs the same ratchet as
+# the ones that routing closed: `latch_ambient()`
 # reads the scope, and a hand-built Ambient is the one way to feed
 # `resolve_parentage` a SpanContext that never came from the scope at all —
 # `Ambient(SpanContext(trace_id=TraceId(run_id[:16]), ...), ...)` is a framework
@@ -805,11 +848,11 @@ def test_ambient_is_latched_not_hand_built():
 
 
 # --------------------------------------------------------------------------
-# design §4.4 / §5.1 — one capture gate (HARD RULES from migration step 2)
+# design §4.4 / §5.1 — one capture gate (HARD RULES, never budgets)
 # --------------------------------------------------------------------------
 #
 # Both of these are hard from the day they land, and deliberately so. There was
-# never a budget to ratchet here: the drift step 2 closed was not N copies of a
+# never a budget to ratchet here: the drift they closed was not N copies of a
 # helper, it was TWO implementations of one predicate that had silently grown
 # apart (`ByteSeamInterceptor._should_capture` and the `RawSocketInterceptor`
 # override that replaced it). A budget of 2 would have been a licence to keep
@@ -856,7 +899,7 @@ def test_the_capture_predicate_has_one_implementation_and_one_composition():
 # design §10.4 scopes C-S4 to adapters/ and interceptors/; assembly/ is held to
 # zero from day one. (`_lifecycle.py`, `context/_inject.py`, `context/_asgi.py`,
 # `context/_propagate.py` and `context/_wsgi.py` also swallow silently today and
-# are out of the rule's declared scope — migration step 9.)
+# are out of the rule's declared scope, so they are not counted below.)
 #
 # These numbers went UP once, on the commit that widened `_silent_swallow_node`
 # from "the body is literally `pass`" to "the handler leaves no trace" (44 -> 57).
@@ -865,10 +908,18 @@ def test_the_capture_predicate_has_one_implementation_and_one_composition():
 # the misuse this file's header forbids — from here they only go down.
 _CS4_BUDGET = {
     "adapters/__init__.py": 1,
-    "adapters/_anthropic_agent_sdk.py": 14,
+    # 14 -> 2. Twelve of them were the `try/except Exception: pass`
+    # pairs around every tee callback, every patched entry point and the tool
+    # wrapper; they are `guard()` blocks now, so the same swallow is counted and
+    # logged under `config.debug` instead of being indistinguishable from wardex
+    # not being installed. The two that remain are absences rather than failures:
+    # `import claude_agent_sdk` (the package is not installed — the answer to the
+    # question install() asks) and `asyncio.current_task()` outside a loop, which
+    # is how the stdlib spells "the carrier here is the thread".
+    "adapters/_anthropic_agent_sdk.py": 2,
     "adapters/_assembler.py": 2,
     "interceptors/_conn_timing.py": 10,
-    # 13 -> 7 at step 5. The six that went are the ones the patch mechanism made
+    # 13 -> 7. The six that went are the ones the patch mechanism made
     # unnecessary: two `except Exception: self._orig_* = None` around install,
     # two `except Exception: pass` around the uninstall `setattr`s (all four
     # replaced by `PatchSet`, whose restore is guarded per patch), and the two
@@ -877,7 +928,7 @@ _CS4_BUDGET = {
     # `_assert_within_budget` only fails on `actual > budget`, so a number left
     # high is a free slot for a brand-new silent swallow that no test notices.
     "interceptors/_mcp_stdio.py": 7,
-    # 5 -> 4 at step 4, and the line below is where the fifth went. Extracting
+    # 5 -> 4, and the line below is where the fifth went. Extracting
     # `build_grpc_fields` into `semantics/` took its `except Exception:` with it.
     # Leaving this at 5 would have handed the seam a free slot for a BRAND NEW
     # silent swallow that no test would notice, because `_assert_within_budget`
@@ -891,15 +942,75 @@ _CS4_BUDGET = {
 }
 
 
+# C-S4's second spelling, and the only place `assembly/` is allowed one. A
+# `contextlib.suppress` is a silent swallow wherever it appears — it cannot
+# report, for the reason `_silent_swallow_node` gives — so the ones that are
+# nonetheless CORRECT are listed here by name instead of being exempted by
+# predicate. Keyed by module, naming the exceptions each block suppresses, one
+# entry per occurrence.
+#
+# Asserted with `==` and never with a subset test, which is the difference
+# between a record and a loophole: a table that only had to be a superset would
+# let a SECOND suppress land in a module already listed and change nothing that
+# any test can see, and that arrival is the entire reason this table exists.
+# It may only shrink.
+_ASSEMBLY_SUPPRESS: dict[str, tuple[str, ...]] = {
+    # `_current_task()` asks "is there a running event loop" and RETURNS the
+    # answer — the thread, when there is not. `asyncio.current_task()` is the
+    # only public spelling of that question and reports "no loop" by raising, so
+    # the RuntimeError is the answer rather than a failure, and nothing is being
+    # hidden from anyone. A counter here would fire on every synchronous
+    # `activate()` and be noise, not evidence.
+    "assembly/_units.py": ("RuntimeError",),
+}
+
+
+def _suppressed_exceptions(under: tuple[str, ...]) -> dict[str, tuple[str, ...]]:
+    """{module path: what each `contextlib.suppress` under `under` suppresses}.
+
+    One entry per OCCURRENCE, ordered by line, so two blocks suppressing the
+    same class read as two entries rather than collapsing into one. The entry is
+    the argument list as written (`"RuntimeError"`, `"OSError, ValueError"`),
+    because widening an existing block from `RuntimeError` to `Exception` is the
+    change that turns a sanctioned answer into a swallowed failure, and a count
+    alone would not see it.
+    """
+    out: dict[str, tuple[str, ...]] = {}
+    for rel, tree in _modules().items():
+        if not rel.startswith(under):
+            continue
+        found: list[tuple[int, str]] = []
+        for node in ast.walk(tree):
+            for call in _suppress_items(node):
+                found.append((call.lineno, ", ".join(ast.unparse(a) for a in call.args)))
+        if found:
+            out[rel] = tuple(spelling for _, spelling in sorted(found))
+    return out
+
+
 def test_no_silent_swallow_in_assembly():
+    sanctioned = _suppressed_exceptions(under=("assembly/",))
+    assert sanctioned == _ASSEMBLY_SUPPRESS, (
+        f"the `contextlib.suppress` blocks in assembly/ are {sanctioned},\n"
+        f"and the recorded set is {_ASSEMBLY_SUPPRESS}.\n\n"
+        "WHY: `suppress` is the one silent-swallow spelling that can never\n"
+        "report itself — its body runs on the SUCCESS path, so a counter written\n"
+        "inside it says nothing about the exception that unwound past it. A new\n"
+        "one is only correct when the raise is an ANSWER the code goes on to\n"
+        "return, never when it is a failure. If that is what you have, add it\n"
+        "here with the reason; if it is not, use assembly._diag.guard()."
+    )
+
     inside = _tally(_is_silent_swallow, under=("assembly/",))
-    assert inside == {}, (
+    assert inside == {rel: len(v) for rel, v in _ASSEMBLY_SUPPRESS.items()}, (
         f"C-S4: silent swallow inside assembly/ at {inside}.\n\n"
         "WHY: assembly/ owns the ONE authorized swallow — assembly._diag.guard(),\n"
         "which always counts and logs with a traceback under config.debug. A\n"
         "bare `except Exception: pass` in the module that defines the rule turns\n"
         "an SDK bug into 'wardex just doesn't capture this' with no evidence\n"
-        "anywhere (design I6)."
+        "anywhere (design I6).\n"
+        "The expected counts are the `_ASSEMBLY_SUPPRESS` entries and nothing\n"
+        "else, so a handler added ALONGSIDE a recorded suppress still fires this."
     )
 
 
@@ -916,7 +1027,7 @@ def test_silent_swallows_do_not_spread():
         "wardex must not raise into the host, but a swallow that leaves no\n"
         "counter and no debug traceback is indistinguishable from wardex not\n"
         "being installed. Wrap the block in assembly._diag.guard(where=...)\n"
-        "instead; migration step 9 converts the ones already here.",
+        "instead; the ones already here are converted as they are touched.",
     )
 
 
@@ -937,7 +1048,7 @@ def test_sink_is_not_called_from_assembly_yet():
     inside = _tally(_calls_sink, under=("assembly/",))
     assert inside == {}, (
         f"C-S5: assembly/ calls the client sink at {inside}. When it does, it is\n"
-        "from assembly/_emit.py and nowhere else (migration step 3).\n\n"
+        "from assembly/_emit.py and nowhere else.\n\n"
         "WHY: one sink is where the capture-mode gate, the limitation markers\n"
         "and 'never hold a wardex lock while emitting' (I11) can be enforced\n"
         "once instead of per caller."
@@ -1070,6 +1181,52 @@ def test_c_s4_does_not_flag_a_handler_that_reports_itself(body):
 
     assert not [n for n in ast.walk(tree) if _silent_swallow_node(n)], (
         f"C-S4 false positive on a self-reporting handler: {body!r}"
+    )
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "import contextlib\n\ndef f():\n    with contextlib.suppress(Exception):\n        g()\n",
+        "from contextlib import suppress\n\ndef f():\n    with suppress(Exception):\n        g()\n",
+        (
+            "import contextlib\n\nasync def f():\n"
+            "    async with contextlib.suppress(Exception):\n        await g()\n"
+        ),
+        # The escape hatch an `except` handler gets does NOT apply here: this
+        # body runs on the success path, so the bump proves nothing about the
+        # exception that unwound past it.
+        (
+            "import contextlib\n\ndef f():\n"
+            "    with contextlib.suppress(Exception):\n        counters.bump('x')\n"
+        ),
+    ],
+)
+def test_c_s4_sees_the_suppress_spelling_of_a_swallow(source):
+    tree = _parse(source)
+
+    assert [n for n in ast.walk(tree) if _silent_swallow_node(n)], (
+        "C-S4 blind to a `contextlib.suppress` swallow:\n"
+        f"{source}\n"
+        "A `try/except: pass` and a `with suppress` discard the same exception."
+    )
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        # wardex's own CM in `interceptors/_exclusion.py`. It suppresses CAPTURE
+        # so the exporter's own HTTP call is not re-captured; it swallows no
+        # exception, and reading it as one would put a false entry in the table.
+        "def f():\n    with suppress_capture():\n        g()\n",
+        "def f():\n    with open('x') as fh:\n        fh.read()\n",
+    ],
+)
+def test_c_s4_does_not_flag_a_with_that_swallows_nothing(source):
+    tree = _parse(source)
+
+    assert not [n for n in ast.walk(tree) if _silent_swallow_node(n)], (
+        f"C-S4 false positive on a `with` that discards no exception:\n{source}"
     )
 
 

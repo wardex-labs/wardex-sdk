@@ -36,36 +36,74 @@ from ..assembly import (
     ParentSource,
     SpanDraft,
     SpanIntent,
+    Unit,
+    UnitKey,
+    UnitKind,
+    UnitRegistry,
     child_of,
+    counters,
     guard,
     latch_ambient,
-    resolve_parentage,
 )
 from ..protocol._claude_stream import AgentStreamEvent, parse_line
+from ._anthropic_names import McpToolCatalog
 
 # Every span this assembler emits below the session root hangs off a context the
 # parentage core produced and the session is holding — rule P2. Naming the
 # evidence once here is what keeps the four emit paths from each inventing their
-# own answer to "how did I know this was the parent". `UNIT_ACTIVE` is the
-# forward-compatible spelling: step 6 turns the session into a real
-# `assembly._units.Unit` that is activated around the framework call.
+# own answer to "how did I know this was the parent". The anchor is a real
+# `assembly._units.Unit`, which is what makes `UNIT_ACTIVE` literally
+# true: the session unit is pinned onto the SDK's reader task, so the hook
+# callbacks and in-process tool handlers that arrive on tasks spawned from it
+# inherit it by ordinary ContextVar copying.
 #
-# NOTHING BELOW THE ROOT PUTS THIS ON THE WIRE, and that is deliberate. Only the
-# session root's own edge — resolved from a real scope read in `_ensure_session`
-# — reports a `CorrelationInfo` in step 1, which is exactly the delta design §11
-# declares. The sub-root edges are still picked by heuristics this step does not
-# own (`_resolve_subagent_anchor`'s fallback, `_session_for_hook`'s sole-session
-# guess), so publishing `unit_active`/1.0 for them would assert certainty about
-# a guess — I4's exact prohibition — and would ship a `strategy` value step 1
-# never declared. Step 6 replaces those heuristics with `UnitRegistry.resolve()`,
-# which returns evidence per edge; the correlation goes on the wire then, with
-# the confidence and the marker the guess has earned.
+# NOTHING BELOW THE ROOT PUTS THIS ON THE WIRE, and that is STILL deliberate.
+# The session root's own edge is resolved from a real scope read, and an
+# in-process tool call's edge is resolved by the registry — both publish a
+# `CorrelationInfo` and both have earned it. The remaining sub-root edges here
+# do not: which sub-agent a stream event belongs to is
+# `_resolve_subagent_anchor`'s guess and which session a hook belongs to is
+# `_session_for_hook`'s, and both silently fall back to the session root. Those
+# two are the ingestion code design §3.4 moves into `_normalize.py`, where they
+# produce a `UnitKey` for `UnitRegistry.resolve()` instead of choosing an anchor
+# themselves; until then, publishing `unit_active`/1.0 for an edge picked that
+# way would assert certainty about a guess, which is I4's exact prohibition.
 _IN_SESSION = Evidence(ParentSource.UNIT_ACTIVE)
 
-# Rides EVERY span this adapter builds. The LLM call happened inside a CLI
-# subprocess and wardex observed only the IPC stream, so there is no transport
-# timing at all — not zero timing, absent timing.
+# Rides all four span classes THIS MODULE builds — the root `invoke_agent`, a
+# sub-agent `invoke_agent`, `chat`, and the hook/stream-driven `execute_tool` —
+# because every one of them is assembled out of the IPC stream and the hook
+# payloads: the work happened inside a CLI subprocess and wardex observed only
+# the pipe, so there is no transport timing at all — not zero timing, absent
+# timing.
+#
+# NOT the whole adapter. The in-process `execute_tool` span that
+# `_anthropic_agent_sdk.py::_open_tool_call` opens brackets a handler wardex
+# wrapped in this process, so its duration is measured directly; attaching this
+# marker there would claim the timing is absent when it is the one timing the
+# adapter owns.
 _BASE_LIMITATION = Limitation.TRANSPORT_TIMING_UNAVAILABLE_SUBPROCESS
+
+
+#: The rank the HOOK observer claims a tool call at. The in-process handler
+#: wrapper claims the same key at 10, and the higher rank wins however late it
+#: arrives — `PreToolUse` fires BEFORE the handler body, so first-come would hand
+#: every in-process tool to the observer that did not wrap the execution.
+HOOK_RANK = 0
+
+
+def outranked(unit: Unit, key: UnitKey, rank: int) -> bool:
+    """Has a HIGHER-ranked observer taken `key` since we claimed it?
+
+    Not `claim() is False`. `claim()` refuses an EQUAL rank too, which is how it
+    keeps one observer from silently replacing another of the same standing — but
+    two hook observations of two concurrent `Bash` calls share one name key at
+    one rank, and reading that refusal as "someone else owns this" would delete
+    the second call's span. The question that decides ownership is strictly
+    "does something outrank me", and this is it.
+    """
+    owner = unit.owner_rank(key)
+    return owner is not None and owner > rank
 
 
 def _safe_json_bytes(value: Any) -> bytes:
@@ -74,6 +112,40 @@ def _safe_json_bytes(value: Any) -> bytes:
         return json.dumps(value).encode()
     except (TypeError, ValueError):
         return b""
+
+
+class _ClientSink:
+    """The `assembly.SpanSink` the unit registry emits through.
+
+    Materializing the draft here rather than at each call site is what lets the
+    registry own two-phase spans end to end: `UnitRegistry.close()` stamps the
+    status and the end instant under its lock and hands the draft over AFTER
+    releasing it (I11), and this is the last step. `finish()` may raise
+    `VocabularyError`; the registry calls every sink inside `guard()`, so a
+    breach is a counted, debug-logged deletion rather than an exception in the
+    host's own hook callback.
+
+    Design §4.4 puts this line — and the capture-mode gate that belongs beside
+    it — in `assembly/_emit.py`, so that one place decides whether a span ships
+    instead of each caller deciding for itself. No module under `assembly/`
+    reaches the sink today; `tests/test_import_graph.py` asserts exactly that
+    and reserves the name (C-S5), so the adapter holds the line. It is a class
+    rather than a closure over the hook wiring for the same reason: a named
+    object is something the gate can be added to and something that can move
+    whole, where a lambda would have to be disentangled from this adapter's
+    construction first.
+    """
+
+    __slots__ = ("_client",)
+
+    def __init__(self, client: Any) -> None:
+        self._client = client
+
+    def emit(self, draft: SpanDraft, *, agent_semantic: bool) -> bool:
+        if self._client is None:
+            return False
+        self._client.capture_span(draft.finish())
+        return True
 
 
 @dataclass
@@ -85,14 +157,19 @@ class _OpenTool:
     input_data: bytes
     from_hook: bool
     output_data: bytes = b""
+    #: This call's slot in the shared key space (`_anthropic_names`). The hook
+    #: observer holds it at rank 0 and re-checks it at emit time, because the
+    #: in-process handler wrapper may have taken the key over in between — which
+    #: is exactly what happens for every SDK MCP tool.
+    claim_key: UnitKey | None = None
 
 
 @dataclass
 class _OpenSubagent:
     """A subagent span opened at `SubagentStart` and finished at `SubagentStop`.
 
-    The DRAFT is what is held, not a bare `SpanContext`. Before step 3a this
-    entry carried a context allocated at open time plus the fields needed to
+    The DRAFT is what is held, not a bare `SpanContext`. The earlier shape was
+    a context allocated at open time plus the fields needed to
     rebuild the span at close time, which is a two-phase span written by hand;
     holding the draft makes it one object, and `draft.context` is the anchor
     children hang off — the same context the span will eventually be emitted
@@ -105,8 +182,17 @@ class _OpenSubagent:
 
 @dataclass
 class _Session:
-    root: SpanDraft  # the session's own two-phase span; `root.context` is the P2 anchor
+    #: The session's logical unit. `unit.draft` is its own two-phase span and
+    #: `unit.context` is the P2 anchor every span below it hangs off — the same
+    #: context the pin installs on the SDK's reader task, which is how a hook
+    #: callback and an in-process tool handler reach it with no framework id.
+    unit: Unit
     start_ns: int
+    #: The transport key this session is filed under in `_by_key`. Carried on
+    #: the record so that a lookup arriving by any other route — the CLI's
+    #: `session_id`, the scope a hook runs in — can re-enter the one liveness
+    #: check (`_live_session`) instead of growing its own copy of it.
+    key: int
     session_id: str | None = None
     model: str | None = None  # from init -> request_model
     turn_start_ns: int = 0
@@ -130,9 +216,12 @@ class SessionAssembler:
     def __init__(
         self,
         client: Any,
-        skip_tool_names: set[str] | None = None,
+        *,
+        names: McpToolCatalog | None = None,
         max_sessions: int | None = None,
         max_session_entries: int | None = None,
+        max_units: int | None = None,
+        max_entries_per_unit: int | None = None,
     ) -> None:
         self._client = client
         self._lock = threading.RLock()
@@ -147,14 +236,60 @@ class SessionAssembler:
             if max_session_entries is not None
             else defaults["max_session_entries"]
         )
-        # Tool names handled by the adapter's in-process tool wrapper (execute_tool
-        # spans opened directly around the handler call); hook-driven spans for
-        # these names are skipped here to avoid emitting the call twice.
-        self.skip_tool_names: set[str] = skip_tool_names if skip_tool_names is not None else set()
+        # The unit registry is what makes a framework identifier a LOOKUP KEY and
+        # nothing else: every parent this assembler hands out comes from a unit
+        # whose own context `assembly/_parentage.py` produced from a real scope
+        # read. `skip_tool_names` — a set of raw strings, passed by reference and
+        # compared against a name the CLI spells differently — is what it
+        # replaces; `Unit.claim()` arbitrates on a normalized key instead.
+        self._units = UnitRegistry(
+            sink=_ClientSink(client),
+            max_units=max_units,
+            max_entries_per_unit=max_entries_per_unit,
+            debug=bool(getattr(getattr(client, "config", None), "debug", False)),
+        )
+        # The shared tool-name space (design §5.4). Empty when the adapter did not
+        # supply one, which is the correct reading for an assembler with no
+        # in-process servers registered: every hook name then resolves to its own
+        # key and the hook observer owns every call.
+        self._names = names if names is not None else McpToolCatalog()
+
+    @property
+    def units(self) -> UnitRegistry:
+        """The registry, for the adapter's in-process tool wrapper and the pin."""
+        return self._units
 
     def open_session_count(self) -> int:
         with self._lock:
             return len(self._by_key)
+
+    def unit_for(self, key: int) -> Unit | None:
+        """The live session unit for a transport key, if there is one."""
+        with self._lock:
+            sess = self._by_key.get(key)
+        return sess.unit if sess is not None and sess.unit.is_live else None
+
+    def pin_reader(self, key: int, owner_task: object) -> bool:
+        """Pin the session unit onto the task driving this transport's reader.
+
+        The whole mechanism, in one call. An async generator body has no context
+        of its own — its frames run in the context of the task that DRIVES it —
+        so a `ContextVar.set()` performed inside the transport's message loop
+        lands on the SDK's reader task and stays there. Every hook callback and
+        every in-process MCP tool handler is dispatched from tasks spawned by
+        that loop, so they inherit the session by ordinary context copying:
+        confidence 1.0, zero framework identifiers.
+
+        Returns whether the pin is installed. Refused pins are the registry's
+        business (a pin declared for a task other than the caller is recorded as
+        a `CORRELATION_CONFLICT` on the unit's own span); the caller retries on
+        the next message, which is what covers the ordinary case of the reader
+        being driven before the first outbound write created the session.
+        """
+        unit = self.unit_for(key)
+        if unit is None:
+            return False
+        return self._units.pin_driver(unit, owner_task=owner_task).installed
 
     # --- ingestion ---
 
@@ -186,6 +321,24 @@ class SessionAssembler:
                 sess.model = ev.model
                 if ev.session_id:
                     self._by_session_id[ev.session_id] = sess
+                    # The CLI's own session id, recorded in the registry as a
+                    # lookup ALIAS onto the session unit — the only shape I2 lets
+                    # a framework id take, and the reason it goes here as well as
+                    # into `_by_session_id` below.
+                    #
+                    # A RECORD, not a route. Nothing in this SDK calls
+                    # `UnitRegistry.find()` or `resolve()`, so if the pin ever
+                    # stopped holding, this alias would not be consulted and no
+                    # `CORRELATION_CONFLICT` would come from it. What answers
+                    # instead is one tier down and marks itself: on the hook path
+                    # `_session_for_hook` falls from the scope to this adapter's
+                    # own `_by_session_id` table and then to a counted sole-live
+                    # inference, and `_open_tool_call` falls to
+                    # `sole_live(SESSION)` at 0.5 with `UNIT_INFERRED_SOLE`.
+                    self._units.alias(
+                        UnitKey("transport.id", str(key)),
+                        UnitKey("claude.session_id", ev.session_id),
+                    )
             elif ev.kind == "assistant_turn":
                 self._emit_chat(sess, ev, now)
                 for tu_id, tu_name, tu_input in ev.tool_uses:
@@ -207,9 +360,19 @@ class SessionAssembler:
     def on_close(self, key: int, error: str | None) -> None:
         now = time.time_ns()
         with self._lock:
-            sess = self._by_key.pop(key, None)
+            # The liveness check and not a bare pop, because a transport can
+            # close AFTER the registry evicted its root and nothing else arrived
+            # in between — the one route to `_finalize` that no other event
+            # guards. Finalizing a retired session would `_stamp_root` a draft
+            # whose span shipped seconds ago (`finish()` neither freezes nor
+            # refuses a second call) and then emit nothing, since
+            # `UnitRegistry.close()` returns empty for a unit already closed. The
+            # retirement path drains what the session still held open against the
+            # span it actually hung off, and says so in a counter.
+            sess = self._live_session(key, now)
             if sess is None:
                 return
+            self._by_key.pop(key, None)
             if sess.session_id:
                 self._by_session_id.pop(sess.session_id, None)
             self._finalize(sess, error, now)
@@ -217,7 +380,7 @@ class SessionAssembler:
     def on_hook(self, event: str, payload: dict, tool_use_id: str | None) -> None:
         now = time.time_ns()
         with self._lock:
-            sess = self._session_for_hook(payload)
+            sess = self._session_for_hook(payload, now)
             if sess is None:
                 return
             if event == "PreToolUse":
@@ -229,7 +392,7 @@ class SessionAssembler:
                 if agent_id and len(sess.subagents) < self._max_session_entries:
                     agent_type = payload.get("agent_type") or "sub_agent"
                     draft = SpanDraft(
-                        child_of(sess.root.context, _IN_SESSION),
+                        child_of(sess.unit.context, _IN_SESSION),
                         intent=SpanIntent.INVOKE_AGENT,
                         subject=agent_type,
                         source=CaptureSource.ADAPTER,
@@ -257,25 +420,110 @@ class SessionAssembler:
         config = getattr(self._client, "config", None)
         return guard(where, debug=bool(getattr(config, "debug", False)))
 
-    def _ensure_session(self, key: int, now: int) -> _Session:
+    def _live_session(self, key: int, now: int) -> _Session | None:
+        """The session filed under `key`, but only while its unit is still alive.
+
+        Caller holds `self._lock`.
+
+        Two tables hold the same objects: this assembler's `_by_key`, bounded by
+        `max_sessions`, and `UnitRegistry._roots`, bounded by `max_units`. They
+        are independent knobs sourced from different fields of the same core
+        struct, and nothing relates them — so the REGISTRY can evict a session
+        root while this side still believes the session is running. Nothing
+        tells us. The eviction has already shipped that root as a semantic stub
+        (`UNIT_EVICTED`, no model, no conversation), and every event after it
+        would be built against a corpse: the pin can no longer be installed,
+        `claim()` arbitrates on a unit the in-process handler path can no longer
+        reach, and `UnitRegistry.close()` would emit nothing at all — silently
+        discarding everything `_stamp_root` had just written onto the draft.
+
+        So this asks, on every lookup. `unit_for` was already the one place that
+        did; this is that check made unavoidable.
+
+        ASKING, not being told, and the choice is forced. The registry evicts
+        from inside `open()` while holding its own lock, and this assembler
+        calls `open()` while holding `self._lock` — a callback would therefore
+        take the two locks in opposite orders on two threads. One attribute read
+        on a path we already walk has no ordering to get wrong.
+
+        The retired session is NOT re-finalized. Its draft has already been
+        emitted, and `SpanDraft.finish()` neither freezes the draft nor refuses a
+        second call, so stamping it now would mutate a span that shipped seconds
+        ago. What it still held open is closed out against the span it actually
+        belongs to, and the run's IDENTITY is carried onto the replacement root
+        by `_resume`.
+        """
         sess = self._by_key.get(key)
+        if sess is None:
+            return None
+        if sess.unit.is_live:
+            return sess
+        counters.bump("adapters.assembler.session_unit_evicted")
+        self._by_key.pop(key, None)
+        if sess.session_id:
+            self._by_session_id.pop(sess.session_id, None)
+        self._drain_children(sess, now)
+        return None
+
+    def _resume(self, sess: _Session, previous: _Session) -> None:
+        """Carry a retired session's identity onto the root that replaces it.
+
+        A fresh unit issues a fresh `issued_conversation_id`, so without this the
+        stub the eviction shipped and everything recorded after it would land in
+        different conversation buckets — one run would read as two unrelated
+        agents, and neither would say why. The identity carries; the in-flight
+        state does not, because `_live_session` has already closed that out
+        against the span it hung off. `UNIT_EVICTED` rides the NEW root as well,
+        which is what turns "a second root appeared from nowhere" into "this run
+        was truncated and resumes here".
+        """
+        sess.session_id = previous.session_id
+        sess.issued_conversation_id = previous.issued_conversation_id
+        sess.model = previous.model
+        # Turn numbering is per CONVERSATION and the conversation continues.
+        # Restarting at 0 would give the resumed turns the indices the retired
+        # ones already used, under the same `conversation_id`.
+        sess.turn_index = previous.turn_index
+        sess.unit.note(Limitation.UNIT_EVICTED)
+        if sess.session_id:
+            self._by_session_id[sess.session_id] = sess
+
+    def _ensure_session(self, key: int, now: int) -> _Session:
+        # Read BEFORE the liveness check, because that check is what retires a
+        # session whose root the registry evicted. `previous` is therefore the
+        # session that was just retired, or None — never a live one, since a live
+        # one returns below.
+        previous = self._by_key.get(key)
+        sess = self._live_session(key, now)
         if sess is not None:
             return sess
-        # The one scope read of the whole adapter. Everything below the root is
-        # anchored to `sess.root.context`, and that context exists exactly once
-        # because the ROOT SPAN ITSELF holds it: the draft opened here is the
-        # span `_finalize` eventually emits. Allocating a bare context and
+        # The one scope read of the whole adapter, and it happens HERE — on the
+        # task that issued the work — because `latch_ambient()` on the response
+        # path reads a scope that has already moved on. Everything below the root
+        # is anchored to `sess.unit.context`, and that context exists exactly once
+        # because the ROOT SPAN ITSELF holds it: the draft the registry opens here
+        # is the span `_finalize` eventually emits. Allocating a bare context and
         # rebuilding the span from it later is what made it possible to anchor
         # children to a span id that is never emitted.
-        parentage = resolve_parentage(latch_ambient())
-        root = SpanDraft(
-            parentage,
+        self._make_room(now)
+        unit = self._units.open(
+            UnitKind.SESSION,
+            UnitKey("transport.id", str(key)),
+            ambient=latch_ambient(),
             intent=SpanIntent.INVOKE_AGENT,
-            source=CaptureSource.ADAPTER,
             start_ns=now,
         )
-        sess = _Session(root=root, start_ns=now)
-        self._new_session(key, sess)
+        # The required block AT OPEN, not only at finalize. A unit the registry
+        # evicts is emitted immediately, and a draft missing `agent` is one
+        # `finish()` refuses — so an eviction would leave a counter and no span,
+        # which is the silent drop I10 exists to end. `_stamp_root` overwrites it
+        # once the stream reports a model.
+        unit.draft.set_agent(AgentAttributes(name="agent", agent_type=AgentType.PRIMARY))
+        unit.draft.add_limitation(_BASE_LIMITATION)
+        sess = _Session(unit=unit, start_ns=now, key=key)
+        if previous is not None:
+            self._resume(sess, previous)
+        self._by_key[key] = sess
         return sess
 
     def _conversation(self, sess: _Session, *, turn_index: int = 0) -> ConversationContext:
@@ -291,29 +539,128 @@ class SessionAssembler:
             turn_index=turn_index,
         )
 
-    def _new_session(self, key: int, sess: _Session) -> None:
-        """Insert a session, evicting the oldest when the cap is reached.
+    def _make_room(self, now: int) -> None:
+        """Evict the oldest session when the cap is reached, and EMIT it.
 
         Sessions are removed on close, but a transport that never closes would
-        otherwise accumulate them for the process lifetime.
+        otherwise accumulate them for the process lifetime. The eviction itself
+        is what changed: this used to drop the session AND its root span
+        with no marker and no test, so a workload that crossed the cap simply
+        stopped producing traces. Now the whole session is finalized and its root
+        carries `UNIT_EVICTED` — a bound whose enforcement is invisible is worse
+        than one nobody enforces (I10).
         """
-        if len(self._by_key) >= self._max_sessions:
+        while len(self._by_key) >= self._max_sessions:
             old_key = next(iter(self._by_key))
             old = self._by_key.pop(old_key)
             if old.session_id:
                 self._by_session_id.pop(old.session_id, None)
-        self._by_key[key] = sess
+            old.unit.note(Limitation.UNIT_EVICTED)
+            self._finalize(old, None, now)
 
-    def _session_for_hook(self, payload: dict) -> _Session | None:
+    def _session_in_scope(self) -> _Session | None:
+        """The session whose unit is ambient on the task this hook is running on.
+
+        The mechanism the whole adapter is built on, finally read on the path
+        that needs it most. `claude_agent_sdk` dispatches every hook callback
+        from a task spawned inside the transport's message loop, and the tee
+        pinned the session unit onto that loop — so the answer is already in this
+        task's scope, obtained from a real scope read, needing no framework
+        identifier at all.
+
+        The walk to the SESSION unit is what makes it usable from anywhere: a
+        hook fired from inside an in-process tool handler sees the CALL unit that
+        handler activated, and the session is that unit's ancestor. A chain that
+        reaches no session (a CALL opened with no parent when nothing was
+        resolvable) yields None and the id tiers answer instead.
+
+        A linear scan of `_by_key` rather than a unit-keyed index, deliberately:
+        `_by_key` holds one entry per live CLI subprocess, and the split this
+        adapter ALREADY carries — `_by_key` and `UnitRegistry._roots` holding the
+        same sessions under two independent bounds, which `_live_session` has to
+        reconcile on every single lookup — is the standing proof that a second
+        table of the same objects is a reconciliation bug waiting to be written.
+        """
+        unit = self._units.current()
+        while unit is not None and unit.kind is not UnitKind.SESSION:
+            unit = unit.parent
+        if unit is None:
+            return None
+        for sess in self._by_key.values():
+            if sess.unit is unit:
+                return sess
+        return None
+
+    def _session_for_hook(self, payload: dict, now: int) -> _Session | None:
+        """Which session does this hook belong to? CONTEXT first, the id second.
+
+        The order is the product's whole claim (I2). What this replaces asked
+        `payload["session_id"]` FIRST and never consulted the scope at all, which
+        made the hook path competitor-shaped in two measurable ways: a hook fired
+        from session A's reader but carrying session B's id was parented under B
+        at confidence 1.0 with no marker, and a hook whose id resolved to nothing
+        while more than one session was live was DISCARDED — no span, no counter,
+        no limitation. The second is the exact failure `sole_live`'s docstring
+        says this design exists to end, one layer above the code that says it.
+
+        So: the scope decides, and the id is a corroborating LOOKUP KEY. When the
+        two disagree the scope wins and the disagreement is counted, because a
+        hook callback cannot run on a task descended from a session it does not
+        belong to, while an id is whatever the CLI wrote in the payload. When the
+        scope is empty the id still answers — hooks legitimately arrive before
+        the pin is installed. When neither answers and exactly one session is
+        live, that is a marked inference rather than a guess. When nothing at all
+        answers, the observation is dropped WITH A COUNTER: with two sessions
+        live and an id naming neither, there is no defensible parent to prefer,
+        and inventing one would be the wrong tree this method exists to avoid.
+        """
+        by_context = self._session_in_scope()
+
+        by_id: _Session | None = None
         session_id = payload.get("session_id")
         if session_id is not None:
             sess = self._by_session_id.get(session_id)
-            if sess is not None:
-                return sess
-        # Simple fallback: exactly one live session -> attribute the hook to it
-        # (covers hooks arriving before the stream's session_init line lands).
+            # `is sess`, not `is not None`: `_live_session` answers for a
+            # TRANSPORT key, and `_by_key` may since have been re-filed under
+            # that key by a resumed run. Anything but the same object means this
+            # id no longer names a session we are driving.
+            if sess is not None and self._live_session(sess.key, now) is sess:
+                by_id = sess
+
+        if by_context is not None:
+            if by_id is not None and by_id is not by_context:
+                # COUNTED, not marked, and the reason is that there is nothing
+                # here to mark. This method chooses a SESSION; it builds no span,
+                # and the only span in hand is that session's own root — whose
+                # edge came from a real scope read and is not what disagreed, so
+                # stamping `CORRELATION_CONFLICT` on it would charge one payload's
+                # disagreement to the whole run. The spans the choice feeds make
+                # no correlation claim at all (see `_IN_SESSION`), precisely
+                # because which session a hook belongs to is this method's guess.
+                # Design §3.4 is what ends the guess: the payload becomes a
+                # `UnitKey` handed to `UnitRegistry.resolve()`, which already
+                # emits that member when an id and the live context land in
+                # different traces. Until then the counter is the record, the
+                # same way it is for the unattributable hook below.
+                counters.bump("adapters.assembler.hook_session_conflict")
+            return by_context
+        if by_id is not None:
+            return by_id
+        # Exactly one live session -> attribute the hook to it. Covers hooks
+        # arriving before the pin is installed or before the stream's
+        # session_init line lands, and it is an inference, so it is counted.
         if len(self._by_key) == 1:
-            return next(iter(self._by_key.values()))
+            only = next(iter(self._by_key.values()))
+            sole = self._live_session(only.key, now)
+            if sole is not None:
+                counters.bump("adapters.assembler.hook_session_inferred_sole")
+                return sole
+        # Nothing answered, so the observation is dropped — but never in silence.
+        # `on_hook` returns on None, which leaves no span, no limitation and, if
+        # this line were missing, nothing whatsoever to distinguish a hook that
+        # could not be attributed from a hook that never fired. There is no span
+        # to hang a limitation on, so the counter IS the record.
+        counters.bump("adapters.assembler.hook_session_unresolved")
         return None
 
     def _resolve_subagent_anchor(self, sess: _Session, parent_tool_use_id: str | None) -> Any:
@@ -328,20 +675,22 @@ class SessionAssembler:
         this method's job, and it is still a heuristic — a `parent_tool_use_id`
         that resolves to nothing (the hook has not landed yet, or the subagent
         was never recorded because `_max_session_entries` was reached) silently
-        re-parents to the session root. That is unchanged from before step 1 and
-        step 6 is where it gets fixed: `UnitRegistry.resolve()` returns the
-        evidence alongside the unit, so the guess reports itself (design §3.4).
-        Until it does, no span this method feeds may claim a confidence for its
-        edge — see `_IN_SESSION`.
+        re-parents to the session root. Making the session a unit and giving
+        in-process tool calls a real edge did NOT change that, deliberately:
+        rewriting this method is the ingestion move design §3.4 schedules
+        separately — it stops choosing an anchor and produces a `UnitKey` for
+        `UnitRegistry.resolve()`, which returns the evidence with the unit so the
+        guess reports itself. Until then, no span this method feeds may claim a
+        confidence for its edge — see `_IN_SESSION`.
         """
         if not parent_tool_use_id:
-            return sess.root.context
+            return sess.unit.context
         sub = sess.subagents.get(parent_tool_use_id)
         if sub is None:
             open_tool = sess.open_tools.get(parent_tool_use_id)
             if open_tool is not None and open_tool.agent_id is not None:
                 sub = sess.subagents.get(open_tool.agent_id)
-        return sub.draft.context if sub is not None else sess.root.context
+        return sub.draft.context if sub is not None else sess.unit.context
 
     def _emit_chat(self, sess: _Session, ev: AgentStreamEvent, now: int) -> None:
         span = None
@@ -393,8 +742,9 @@ class SessionAssembler:
 
         is_first_turn = sess.turn_index == 0
         # `attempted`, not `bool(payload)`. Only the first turn carries the
-        # prompt on this path (delta prompt accounting lands at step 9); saying
-        # so is different from reporting an empty capture as a failed one.
+        # prompt on this path, because per-turn delta prompt accounting does not
+        # exist yet; saying so is different from reporting an empty capture as a
+        # failed one.
         draft.set_io(
             input_data=sess.prompt if is_first_turn else b"",
             output_data=ev.content_json or b"",
@@ -403,16 +753,39 @@ class SessionAssembler:
         # No correlation: the anchor above may be a fallback (see
         # `_resolve_subagent_anchor`), and the parentage's own record would
         # report it as `unit_active`/1.0 with no marker — a claim this span
-        # cannot back (I4). Step 6 supplies the evidence and the field with it.
+        # cannot back (I4). The ingestion move that turns that fallback into a
+        # `UnitKey` is what earns this field.
         draft.replace_correlation(None)
         return draft.finish(now)
+
+    def _claim_key(self, sess: _Session, tool_name: str) -> UnitKey | None:
+        """This hook observation's slot in the shared key space, or None.
+
+        None is "do not claim and do not emit": the CLI reported a bare name two
+        wrapped servers both export, so no key is right. Attributing it to one of
+        them fails in both directions at once — a double emit for one server and
+        a LOST handler span for the other. The handler wrapper owns the call and
+        its span carries `TOOL_NAME_COLLISION`.
+        """
+        key = self._names.key_for_hook(tool_name)
+        if key is None:
+            counters.bump("adapters.assembler.tool_name_unattributable")
+        return key
 
     def _open_tool(self, sess: _Session, payload: dict, tool_use_id: str | None, now: int) -> None:
         if tool_use_id is None:
             return
-        if payload.get("tool_name") in self.skip_tool_names:
-            # In-process tool: the adapter's handler wrapper opens its own
-            # execute_tool span; skip the hook-driven one to avoid double emission.
+        key = self._claim_key(sess, payload.get("tool_name") or "unknown")
+        if key is None:
+            return
+        # Claim at the hook's rank, then ask whether anything OUTRANKS it. The
+        # claim is not a gate (two concurrent calls to one tool share a name key
+        # at one rank and both must be observed); the rank comparison is.
+        sess.unit.claim(key, rank=HOOK_RANK)
+        if outranked(sess.unit, key, HOOK_RANK):
+            # An in-process handler wrapper owns this call: it wrapped the real
+            # execution, so §8.4 gives it the span. Nothing is opened here, which
+            # is also what keeps `_finalize` from force-closing a phantom.
             return
         if len(sess.open_tools) >= self._max_session_entries:
             # Evict the oldest open entry (FIFO via dict insertion order) so the
@@ -424,7 +797,7 @@ class SessionAssembler:
                 oldest,
                 now,
                 # Census rename (§6.5.1): `tool_span_unclosed` folded into the
-                # step-0 member `CHILD_SPAN_UNCLOSED`. Nothing is lost — the
+                # declared member `CHILD_SPAN_UNCLOSED`. Nothing is lost — the
                 # marker rides the tool span itself, where
                 # `gen_ai.operation.name=execute_tool` already says the child
                 # was a tool.
@@ -437,6 +810,7 @@ class SessionAssembler:
             agent_id=payload.get("agent_id"),
             input_data=_safe_json_bytes(payload.get("tool_input", {})),
             from_hook=True,
+            claim_key=key,
         )
 
     def _close_tool(
@@ -444,13 +818,14 @@ class SessionAssembler:
     ) -> None:
         if tool_use_id is None:
             return
-        if payload.get("tool_name") in self.skip_tool_names:
-            # Matches the _open_tool skip: nothing was opened for this call, and
-            # the in-process handler wrapper owns its own span's lifecycle.
-            sess.stream_tool_meta.pop(tool_use_id, None)
-            return
         tool = sess.open_tools.pop(tool_use_id, None)
         if tool is None:
+            key = self._claim_key(sess, payload.get("tool_name") or "unknown")
+            if key is None:
+                # Unattributable name: the handler owns it. Drop the stream side
+                # too, or the tool would resurface through the stream-only path.
+                sess.stream_tool_meta.pop(tool_use_id, None)
+                return
             tool = _OpenTool(
                 tool_use_id=tool_use_id,
                 name=payload.get("tool_name") or "unknown",
@@ -458,6 +833,7 @@ class SessionAssembler:
                 agent_id=payload.get("agent_id"),
                 input_data=_safe_json_bytes(payload.get("tool_input", {})),
                 from_hook=False,
+                claim_key=key,
             )
         meta = sess.stream_tool_meta.pop(tool_use_id, None)
         if meta is not None:
@@ -481,6 +857,15 @@ class SessionAssembler:
         markers: tuple[Limitation, ...] = (),
         error_type: str | None = None,
     ) -> None:
+        if tool.claim_key is not None and outranked(sess.unit, tool.claim_key, HOOK_RANK):
+            # Re-checked HERE and not only at open, because the handler wrapper
+            # claims the key while the tool body runs — i.e. AFTER `PreToolUse`
+            # opened this entry and before `PostToolUse` closes it. That is the
+            # ordinary order for every in-process SDK MCP tool, so without this
+            # the call ships twice: once from the layer that wrapped the
+            # execution and once from the hook that only watched it.
+            counters.bump("adapters.assembler.tool_claim_lost")
+            return
         span = None
         with self._guard("adapters.assembler.emit_tool"):
             span = self._build_tool(sess, tool, end_ns, failed, markers, error_type)
@@ -496,7 +881,7 @@ class SessionAssembler:
         markers: tuple[Limitation, ...],
         error_type: str | None,
     ) -> Any:
-        anchor = sess.root.context
+        anchor = sess.unit.context
         if tool.agent_id is not None:
             sub = sess.subagents.get(tool.agent_id)
             if sub is not None:
@@ -525,9 +910,9 @@ class SessionAssembler:
         if failed:
             # `finish()` refuses ERROR without a type, which turns the
             # untyped-failure defect into a mechanism. The hook payload carries a richer reason
-            # (`PostToolUseFailureHookInput.error` / `is_interrupt`); reading it
-            # is step 9's, and until then this is a coarse-but-true type rather
-            # than an absent one.
+            # (`PostToolUseFailureHookInput.error` / `is_interrupt`) that nothing
+            # reads yet, so this is a coarse-but-true type rather than an absent
+            # one.
             draft.set_error(error_type or "tool_error")
         draft.set_io(input_data=tool.input_data, output_data=tool.output_data)
         draft.add_limitation(_BASE_LIMITATION)
@@ -545,9 +930,10 @@ class SessionAssembler:
         # MINIMUM confidence and keeps the parentage core's own source, so a
         # hint can lower trust in the edge but never invent or overwrite it.
         #
-        # Design §11 scheduled this for step 7b. It cannot wait: step 3b closes
-        # `CorrelationInfo.strategy` into `ParentSource`, and neither string is a
-        # member — leaving them would ship a value the schema cannot name.
+        # This could not wait for the adapter rewrite that retires the rest of
+        # the Anthropic semantics: `CorrelationInfo.strategy` is now closed into
+        # `ParentSource`, and neither string is a member — leaving them would
+        # ship a value the schema cannot name.
         draft.replace_correlation(
             CorrelationInfo(
                 request_id=tool.tool_use_id,
@@ -557,8 +943,10 @@ class SessionAssembler:
                 # of replacing looked tidier and was wrong: it would publish the
                 # base edge's `unit_active`/1.0, which the module header
                 # forbids by name because the anchor may have come from
-                # `_resolve_subagent_anchor`'s fallback. Step 6 makes that
-                # claim true and fills this in with the evidence it has earned.
+                # `_resolve_subagent_anchor`'s fallback. The in-process tool
+                # span DOES publish its edge — it is opened by the unit registry
+                # against a context the pin delivered — and this path will too,
+                # once the same ingestion move gives it evidence per edge.
                 strategy=None,
             )
         )
@@ -578,10 +966,11 @@ class SessionAssembler:
             # stream_tool_meta are empty for this id) -> nothing to do.
             return
         name, input_json = meta
-        if name in self.skip_tool_names:
-            # In-process tool without a matching hook observation (or one that
-            # hasn't landed yet): the handler wrapper's own span is authoritative,
-            # so skip the stream-only fallback path too.
+        key = self._claim_key(sess, name)
+        if key is None:
+            # In-process tool the hook cannot attribute to one server: the
+            # handler wrapper's span is authoritative, so the stream-only
+            # fallback stands down too.
             return
         tool = _OpenTool(
             tool_use_id=tool_use_id,
@@ -591,6 +980,7 @@ class SessionAssembler:
             input_data=input_json,
             from_hook=False,
             output_data=ev.content_json or b"",
+            claim_key=key,
         )
         self._emit_tool(sess, tool, now)
 
@@ -607,9 +997,19 @@ class SessionAssembler:
         if span is not None:
             self._client.capture_span(span)
 
-    def _finalize(self, sess: _Session, error: str | None, now: int) -> None:
+    def _drain_children(self, sess: _Session, now: int) -> None:
+        """Force-close and EMIT everything the session still holds open.
+
+        Two callers, and they are the two ways a session stops being driven: the
+        transport closed (`_finalize`) or the registry evicted its root out from
+        under us (`_live_session`). Both must drain, and the second is why this
+        is a method rather than the first half of `_finalize`: a retired session
+        cannot be finalized — its root already shipped — but the tool calls it
+        was still holding are ordinary observations that belong on the wire with
+        a marker, not dropped on the floor (I10).
+        """
         # (1) Force-close any still-open tool spans — they never got a matching
-        # PostToolUse/PostToolUseFailure hook before session teardown.
+        # PostToolUse/PostToolUseFailure hook before the session ended.
         for tool_use_id in list(sess.open_tools.keys()):
             tool = sess.open_tools.pop(tool_use_id)
             self._emit_tool(
@@ -625,24 +1025,37 @@ class SessionAssembler:
         for agent_id in list(sess.subagents.keys()):
             self._emit_subagent(sess, agent_id, now)
 
-        # (3) Root invoke_agent span — the draft opened in `_ensure_session`,
-        # whose context every span above is anchored to.
-        span = None
-        with self._guard("adapters.assembler.finalize"):
-            span = self._build_root(sess, error, now)
-        if span is not None:
-            self._client.capture_span(span)
+    def _finalize(self, sess: _Session, error: str | None, now: int) -> None:
+        self._drain_children(sess, now)
 
-    def _build_root(self, sess: _Session, error: str | None, now: int) -> Any:
-        draft = sess.root
+        # (3) Root invoke_agent span — the unit opened in `_ensure_session`,
+        # whose context every span above is anchored to. Closing the UNIT rather
+        # than emitting its draft is what makes the two facts one action: the
+        # registry drops it from the live tables, force-closes anything still
+        # attached to it, and hands the span to the sink after releasing its lock
+        # (I11). A pin left on the reader task also stops being ambient here,
+        # because `current()` refuses a unit that is no longer live.
+        status, error_type = StatusCode.UNSET, None
+        with self._guard("adapters.assembler.finalize"):
+            status, error_type = self._stamp_root(sess, error)
+        self._units.close(sess.unit, status=status, error_type=error_type, end_ns=now)
+
+    def _stamp_root(self, sess: _Session, error: str | None) -> tuple[StatusCode, str | None]:
+        """Fill in the session root's own fields; the registry stamps the rest.
+
+        Returns the verdict instead of setting it, because `UnitRegistry.close()`
+        is what ends a unit's span — status, `error.type` and the end instant
+        together, under the lock that also detaches it.
+        """
+        draft = sess.unit.draft
         # `agent.name` is still the model id here, which §6.3 calls out as wrong
         # — the model belongs in `gen_ai.request.model`. Correcting it changes a
-        # field a dashboard groups by, and §11 keeps 3a's span fields identical,
-        # so it rides the adapter rewrite (step 7b/8) with the rest of the
-        # Anthropic semantics.
+        # field a dashboard groups by, and the extraction work that moved these
+        # sites onto `assembly/` deliberately kept every span field identical,
+        # so it rides the adapter rewrite with the rest of the Anthropic
+        # semantics.
         draft.set_agent(AgentAttributes(name=sess.model or "agent", agent_type=AgentType.PRIMARY))
         draft.set_conversation(self._conversation(sess))
-        draft.add_limitation(_BASE_LIMITATION)
 
         result = sess.result
         if result is not None:
@@ -663,10 +1076,9 @@ class SessionAssembler:
             status = StatusCode.UNSET
             draft.add_limitation(Limitation.SESSION_ABORTED)
 
-        draft.set_status(status)
-        if status is StatusCode.ERROR:
-            # ERROR requires a type. `error` is the transport-close reason and
-            # `result.is_error` is the CLI's own verdict; naming which of the two
-            # ended the session is the honest low-cardinality answer.
-            draft.set_error("session_error" if error is not None else "agent_error")
-        return draft.finish(now)
+        if status is not StatusCode.ERROR:
+            return status, None
+        # ERROR requires a type. `error` is the transport-close reason and
+        # `result.is_error` is the CLI's own verdict; naming which of the two
+        # ended the session is the honest low-cardinality answer.
+        return status, ("session_error" if error is not None else "agent_error")

@@ -2,9 +2,12 @@
 
 import json
 
+import pytest
+
 from wardex_sdk._enums import CaptureSource, StatusCode
+from wardex_sdk.adapters._anthropic_names import McpToolCatalog
 from wardex_sdk.adapters._assembler import SessionAssembler
-from wardex_sdk.assembly import Limitation
+from wardex_sdk.assembly import Limitation, UnitKey, UnitKind, counters
 
 INIT = {"type": "system", "subtype": "init", "session_id": "s-1", "model": "claude-sonnet-5"}
 ASSISTANT = {
@@ -59,12 +62,31 @@ DIVERGENT_ASSISTANT = {
 }
 
 
+INIT_B = {"type": "system", "subtype": "init", "session_id": "s-2", "model": "claude-sonnet-5"}
+
+
 class FakeClient:
     def __init__(self):
         self.spans = []
 
     def capture_span(self, span):
         self.spans.append(span)
+
+
+@pytest.fixture
+def tallies():
+    """Counter DELTAS for one test, without clearing the process-wide table.
+
+    `counters` is a module global shared by every test in the session, so a
+    `reset()` here would silently move another file's baseline. Deltas need no
+    such cooperation.
+    """
+    before = counters.snapshot()
+
+    def delta(where):
+        return counters.get(where) - before.get(where, 0)
+
+    return delta
 
 
 def _outbound(asm, key, session="s-1", text="go"):
@@ -216,20 +238,34 @@ def test_abort_closes_open_spans_with_markers():
     tool = next(s for s in client.spans if s.name == "execute_tool Bash")
     assert root.status is StatusCode.ERROR
     assert Limitation.SESSION_ABORTED in root.capture_integrity.limitations
-    # Census rename (design §6.5.1): `tool_span_unclosed` folded into the
-    # step-0 member CHILD_SPAN_UNCLOSED, which step 3a made the emitted value.
+    # Census rename (design §6.5.1): the free string `tool_span_unclosed` folded
+    # into the already-declared member CHILD_SPAN_UNCLOSED, which is what the
+    # assembler emits now.
     assert Limitation.CHILD_SPAN_UNCLOSED in tool.capture_integrity.limitations
     assert asm.open_session_count() == 0
 
 
-def test_skip_tool_names_suppresses_hook_driven_span():
-    """Finding 2 regression: a tool wrapped by the adapter's in-process
-    handler (execution runs inside its own execute_tool span, opened directly
-    around the handler call) must not also get a hook-driven span here — the
-    skip-list guards in _open_tool/_close_tool/_on_stream_tool_result exist to
-    prevent double emission for the same call."""
+def test_a_claimed_tool_gets_no_hook_driven_span():
+    """Successor to the `skip_tool_names` regression, and a stronger statement.
+
+    Same rule — a tool whose execution the adapter wrapped must not ALSO get a
+    hook-driven span — but the mechanism it tests is the one that works. The
+    skip list held BARE names (`greet`, which is all the handler wrapper knows)
+    and was compared against the CLI's NAMESPACED `tool_name`
+    (`mcp__srv__greet`), so it never matched and every in-process tool shipped
+    twice; the old test passed only because it hand-fed the set the namespaced
+    spelling nothing produced. Here both observers normalize into one key space
+    and the handler's rank 10 beats the hook's 0 whenever it arrives — which is
+    always AFTER, since `PreToolUse` fires before the tool body runs.
+    """
     client = FakeClient()
-    asm = SessionAssembler(client, skip_tool_names={"mcp__srv__greet"})
+    names = McpToolCatalog()
+    handle = names.handle_for("srv")
+    handle.tools.add("greet")
+    handle.instance = object()
+    # The token is the mcp_servers KEY, and it is only knowable here.
+    names.resolve_tokens({"srv": {"type": "sdk", "instance": handle.instance}})
+    asm = SessionAssembler(client, names=names)
     _outbound(asm, key=1)
     asm.on_inbound(1, INIT)
     assistant = {
@@ -251,6 +287,9 @@ def test_skip_tool_names_suppresses_hook_driven_span():
         },
     }
     asm.on_inbound(1, assistant)
+    # What the handler wrapper does when the tool body starts: it claims the
+    # call at its own rank, on the SESSION unit both observers share.
+    asm._by_key[1].unit.claim(handle.key_for("greet"), rank=10)
     asm.on_hook(
         "PreToolUse",
         {"session_id": "s-1", "tool_name": "mcp__srv__greet", "tool_input": {"name": "world"}},
@@ -305,3 +344,256 @@ def test_open_entry_cap():
     ]
     assert len(unclosed) == 300  # all eventually closed, none leaked
     assert asm.open_session_count() == 0
+
+
+def test_the_session_id_becomes_a_lookup_alias_for_the_units_own_context():
+    """The CLI's `session_id` is registered as a lookup ALIAS (design §5.3-iii).
+
+    What this pins is the DIRECTION of the arrow, which is I2: the id selects a
+    unit whose own span context came from a real scope read, and `find()` hands
+    back that unit or None. There is no call that turns the string into a span
+    context, so the id cannot become a parent.
+
+    It exercises no failover, and there is none to exercise: nothing in the SDK
+    calls `find()`/`resolve()`, so the alias is a record in the registry rather
+    than a route the adapter falls back on. When the pin does not answer, what
+    answers is a lower tier that marks itself — `_session_for_hook` uses the
+    adapter's own `_by_session_id` table, and `_open_tool_call` drops to
+    `sole_live(SESSION)` at 0.5 with `UNIT_INFERRED_SOLE`.
+    """
+    client = FakeClient()
+    asm = SessionAssembler(client)
+    _outbound(asm, key=1)
+    asm.on_inbound(1, INIT)
+
+    unit = asm.units.find(UnitKey("claude.session_id", "s-1"))
+
+    assert unit is asm.unit_for(1)
+    assert unit.kind is UnitKind.SESSION
+
+
+def test_an_evicted_session_emits_its_root_and_says_which_bound_evicted_it():
+    """A ceiling that drops state silently is a worse failure than an unenforced
+    one (I10). The code this replaces popped the session out of its dict and
+    dropped the root span with it — no marker, no counter, no test — so a
+    workload that crossed `max_sessions` simply stopped producing traces.
+    """
+    client = FakeClient()
+    asm = SessionAssembler(client, max_sessions=1)
+    _outbound(asm, key=1)
+    asm.on_inbound(1, INIT)
+
+    _outbound(asm, key=2)  # evicts the first
+
+    assert asm.open_session_count() == 1
+    root = next(s for s in client.spans if s.name == "invoke_agent")
+    assert Limitation.UNIT_EVICTED in root.capture_integrity.limitations
+    assert root.conversation.session_id == "s-1"
+
+
+def test_a_hook_is_attributed_to_the_session_in_scope_not_the_one_its_id_names(tallies):
+    """I2 on the hook path: a framework identifier is a LOOKUP KEY, not a parent.
+
+    Two sessions are live in one process. A hook fires on session A's reader
+    task — the task A's unit is ambient on, which is where `claude_agent_sdk`
+    dispatches every hook callback from — and its payload carries session B's
+    id. Exactly one of those two facts is evidence about the tree: a callback
+    cannot run on a task descended from a session it does not belong to, while
+    an id is whatever the CLI wrote in the payload.
+
+    The code this replaces read the id and nothing else, so the tool span landed
+    under B's root, in B's TRACE, at confidence 1.0 with no marker — a wrong
+    tree with nothing on the wire to reveal it. Shape alone cannot catch that
+    (both roots produce a well-formed subtree), so this asserts IDENTITY: whose
+    span id the tool actually points at.
+    """
+    client = FakeClient()
+    asm = SessionAssembler(client)
+    _outbound(asm, key=1)
+    asm.on_inbound(1, INIT)
+    _outbound(asm, key=2, session="s-2")
+    asm.on_inbound(2, INIT_B)
+    a, b = asm._by_key[1], asm._by_key[2]
+
+    with a.unit.activate():  # the hook runs on a task descended from A's reader
+        asm.on_hook(
+            "PreToolUse",
+            {"session_id": "s-2", "tool_name": "Bash", "tool_input": {"command": "ls"}},
+            "toolu_x",
+        )
+        asm.on_hook(
+            "PostToolUse",
+            {"session_id": "s-2", "tool_name": "Bash", "tool_response": "ok"},
+            "toolu_x",
+        )
+
+    tool = next(s for s in client.spans if s.name == "execute_tool Bash")
+    assert tool.parent_span_id == a.unit.context.span_id
+    assert tool.parent_span_id != b.unit.context.span_id
+    assert tool.context.trace_id == a.unit.context.trace_id
+    # And the disagreement is recorded rather than resolved in silence — twice,
+    # once per observation, because each one was independently wrong.
+    assert tallies("adapters.assembler.hook_session_conflict") == 2
+
+
+def test_an_unattributable_hook_is_counted_rather_than_silently_discarded(tallies):
+    """The other half of the same defect: data loss with no trace of itself.
+
+    Two sessions live, an id that names neither, and no session in scope. There
+    is no defensible parent here — `sole_live`'s rule needs exactly one live
+    unit — so the observation really is dropped. What must not happen is
+    dropping it INVISIBLY: the shipped code returned None from
+    `_session_for_hook` and `on_hook` returned, leaving no span, no limitation
+    and no counter, which is indistinguishable from a hook that never fired.
+    """
+    client = FakeClient()
+    asm = SessionAssembler(client)
+    _outbound(asm, key=1)
+    asm.on_inbound(1, INIT)
+    _outbound(asm, key=2, session="s-2")
+    asm.on_inbound(2, INIT_B)
+
+    asm.on_hook(
+        "PreToolUse",
+        {"session_id": "s-nobody", "tool_name": "Bash", "tool_input": {}},
+        "toolu_y",
+    )
+    asm.on_hook(
+        "PostToolUse",
+        {"session_id": "s-nobody", "tool_name": "Bash", "tool_response": "ok"},
+        "toolu_y",
+    )
+
+    assert [s for s in client.spans if s.name == "execute_tool Bash"] == []
+    assert tallies("adapters.assembler.hook_session_unresolved") == 2
+
+
+def test_a_registry_evicted_session_is_retired_and_the_run_resumes_on_a_fresh_root(tallies):
+    """The OTHER bound, and the one that had no reconciliation path at all.
+
+    `max_sessions` bounds this assembler's `_by_key`; `max_units` bounds
+    `UnitRegistry._roots`. They are independent knobs from different fields of
+    the same core struct, so the REGISTRY can evict a session root while this
+    side still believes the session is running — and nothing tells it. The test
+    above covers the assembler evicting itself, which was always well-behaved
+    because `_finalize` runs BEFORE the unit dies. This is the identical
+    scenario with the two steps in the opposite order.
+
+    What used to happen: every subsequent event was driven against a dead unit,
+    and the semantically complete root — model, conversation id, num_turns,
+    cost — was stamped onto its draft and then dropped on the floor, because
+    `UnitRegistry.close()` emits nothing for a unit that is already closed. No
+    span, no counter, no marker. The only root on the wire was the stub the
+    eviction shipped, with `agent.name="agent"` and no conversation at all,
+    sitting in a different conversation bucket from its own chat children.
+    """
+    client = FakeClient()
+    asm = SessionAssembler(client, max_units=1)
+    _outbound(asm, key=1)
+    asm.on_inbound(1, INIT)
+    retired = asm._by_key[1]
+    issued = retired.issued_conversation_id
+
+    # A second transport takes the registry's only root slot.
+    _outbound(asm, key=2, session="s-2")
+    asm.on_inbound(2, INIT_B)
+    assert not retired.unit.is_live, "the registry did not evict — the bound moved"
+
+    # ...and the first transport keeps talking, as a live CLI subprocess does.
+    asm.on_inbound(1, ASSISTANT)
+    resumed = asm._by_key[1]
+    asm.on_inbound(1, RESULT)
+    asm.on_close(1, None)
+
+    assert tallies("adapters.assembler.session_unit_evicted") == 1
+    assert resumed is not retired
+
+    # The replacement root ships, and it ships COMPLETE: everything
+    # `_stamp_root` writes is on the wire rather than on a garbage-collected
+    # draft.
+    fresh = client.spans[-1]
+    assert fresh.name == "invoke_agent"
+    assert fresh.status is StatusCode.OK
+    assert fresh.agent.name == "claude-sonnet-5"
+    assert ("wardex.agent.num_turns", 1) in fresh.extra
+    assert ("wardex.agent.cost_usd", 0.01) in fresh.extra
+
+    # One run, one conversation. The stub and the replacement have to be
+    # joinable or the eviction reads downstream as two unrelated agents.
+    assert fresh.conversation.session_id == "s-1"
+    assert fresh.conversation.conversation_id == "s-1"
+    assert resumed.issued_conversation_id == issued
+    chat = next(s for s in client.spans if s.name.startswith("chat"))
+    assert chat.conversation.conversation_id == fresh.conversation.conversation_id
+    assert chat.parent_span_id == fresh.context.span_id
+
+    # And it says why it exists.
+    assert Limitation.UNIT_EVICTED in fresh.capture_integrity.limitations
+
+
+def test_a_retired_sessions_open_tool_is_still_emitted(tallies):
+    """Retiring a session must not become a second, quieter way to lose a span.
+
+    The retired session is the only holder of its open-tool records — they are
+    the assembler's state, not the unit's, so the registry's eviction does not
+    force-close them — and after this change `on_close` finalizes the
+    REPLACEMENT session, which has never heard of them. Draining at retirement
+    is what keeps the fix from trading one silent drop for another.
+    """
+    client = FakeClient()
+    asm = SessionAssembler(client, max_units=1)
+    _outbound(asm, key=1)
+    asm.on_inbound(1, INIT)
+    asm.on_hook(
+        "PreToolUse", {"session_id": "s-1", "tool_name": "Bash", "tool_input": {}}, "toolu_evict"
+    )
+
+    _outbound(asm, key=2, session="s-2")  # the registry evicts session one's root
+    asm.on_inbound(1, ASSISTANT)  # ...and the assembler notices on the next event
+
+    assert tallies("adapters.assembler.session_unit_evicted") == 1
+    tool = next(s for s in client.spans if s.name == "execute_tool Bash")
+    assert tool.tool.call_id == "toolu_evict"
+    assert Limitation.CHILD_SPAN_UNCLOSED in tool.capture_integrity.limitations
+
+
+def test_closing_a_retired_transport_does_not_restamp_the_span_it_already_shipped(tallies):
+    """The teardown route no other event guards.
+
+    Every other entry point re-enters the liveness check because it goes through
+    `_ensure_session` or `_session_for_hook`. `on_close` does not: a transport
+    can close after the registry evicted its root with nothing arriving in
+    between, and finalizing then reaches `_stamp_root` — which writes the model,
+    the conversation id and the result extras onto a draft whose span was
+    emitted seconds earlier, because `SpanDraft.finish()` neither freezes the
+    draft nor refuses a second call. The write lands on an object nobody will
+    read again, and then `UnitRegistry.close()` emits nothing at all, so the
+    only visible trace of the whole sequence is a registry-internal counter.
+
+    The stray write itself has no observer — the span object already handed to
+    the client is a separate, finished value, so editing the draft behind it
+    changes nothing anyone can read. That is the whole hazard, and it is why the
+    guard is on the two counters that DO distinguish the paths: retiring names
+    the eviction on the assembler's own tally, while finalizing a corpse names
+    itself only in the registry's `close_after_close`.
+    """
+    client = FakeClient()
+    asm = SessionAssembler(client, max_units=1)
+    _outbound(asm, key=1)
+    asm.on_inbound(1, INIT)
+    retired = asm._by_key[1]
+
+    _outbound(asm, key=2, session="s-2")  # the registry evicts session one's root
+    asm.on_inbound(2, INIT_B)
+    assert not retired.unit.is_live, "the registry did not evict — the bound moved"
+    shipped = next(s for s in client.spans if s.name == "invoke_agent")
+
+    asm.on_close(1, None)  # ...and nothing arrived for transport 1 in between
+
+    assert tallies("adapters.assembler.session_unit_evicted") == 1
+    assert tallies("assembly._units.close_after_close") == 0
+    # The stub is what shipped, and nothing ships after it: a second root would
+    # mean the retired unit was closed twice.
+    assert shipped.conversation is None
+    assert [s for s in client.spans if s.name == "invoke_agent"] == [shipped]
+    assert asm.open_session_count() == 1  # only the second session is left

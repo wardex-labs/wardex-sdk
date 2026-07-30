@@ -1,4 +1,4 @@
-"""Phase 4a — ContextVar fork parenting. Repro tests for the gather mis-parenting bug."""
+"""ContextVar fork parenting — repro tests for the gather mis-parenting bug."""
 
 import asyncio
 import threading
@@ -128,3 +128,70 @@ def test_bare_thread_does_not_inherit_context():
         th.start()
         th.join()
     assert results["sid"] is None
+
+
+# --- activate_span: the general carrier fork_active_span is now an alias of ---
+#
+# The generalization exists because a logical unit carries a conversation
+# identity and a tracestate alongside its span context, and a carrier that
+# installs only the context leaves the other two behind on every task the unit
+# spans — a sub-agent's spans would silently lose the conversation id its
+# session issued. Both extra arguments are OVERRIDES, not assignments: `None`
+# means "keep whatever the cloned scope had", which is what keeps this a true
+# generalization rather than a replacement that clears a field merely because
+# the caller did not restate it.
+
+
+def _ctx():
+    from wardex_sdk.assembly import EMPTY_AMBIENT, resolve_parentage
+
+    return resolve_parentage(EMPTY_AMBIENT).child_context()
+
+
+def test_fork_active_span_is_activate_span():
+    """A delegating wrapper would be a second entry point to grow a second
+    opinion in, which is the drift the assembly/ extraction exists to end."""
+    from wardex_sdk.context._contextvar import activate_span, fork_active_span
+
+    assert fork_active_span is activate_span
+
+
+def test_activate_span_installs_and_restores_the_span_context():
+    _setup()
+    from wardex_sdk.context import activate_span
+
+    ctx = _ctx()
+    with activate_span(ctx):
+        assert _hub.get_current_scope().active_span_context == ctx
+    assert _hub.get_current_scope().active_span_context is None
+
+
+def test_activate_span_installs_conversation_and_tracestate():
+    _setup()
+    from wardex_sdk._types import ConversationContext
+    from wardex_sdk.context import activate_span
+
+    conv = ConversationContext(conversation_id="c-1")
+    with activate_span(_ctx(), conversation=conv, tracestate="a=1"):
+        scope = _hub.get_current_scope()
+        assert scope.conversation == conv
+        assert scope.tracestate == "a=1"
+    assert _hub.get_current_scope().conversation is None
+
+
+def test_activate_span_omitting_a_field_keeps_the_inherited_one():
+    """The override rule. Writing `None` through would clear a conversation id
+    the enclosing scope issued, on every nested activation that did not restate
+    it — which is exactly the loss the generalization was introduced to stop."""
+    _setup()
+    from wardex_sdk._types import ConversationContext
+    from wardex_sdk.context import activate_span
+
+    conv = ConversationContext(conversation_id="c-1")
+    with activate_span(_ctx(), conversation=conv, tracestate="a=1"):
+        inner = _ctx()
+        with activate_span(inner):
+            scope = _hub.get_current_scope()
+            assert scope.active_span_context == inner
+            assert scope.conversation == conv
+            assert scope.tracestate == "a=1"

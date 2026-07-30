@@ -123,13 +123,24 @@ def test_parallel_sessions_do_not_cross():
 
 
 def test_repeated_sdk_tool_registration_does_not_double_wrap():
-    """Finding 1 regression: fresh options per query, reused @tool definitions —
-    calling the patched create_sdk_mcp_server twice with the same SdkMcpTool
-    object must not nest the wrapper (which would emit duplicate execute_tool
-    spans for a single handler invocation)."""
+    """The regression: a host that builds fresh options per query while reusing
+    its `@tool` definitions. Calling the patched `create_sdk_mcp_server` twice
+    with the same `SdkMcpTool` object must not nest the wrapper, which would emit
+    duplicate `execute_tool` spans for a single handler invocation.
+
+    `install(client)` and not `install(None)`, and that is a real change to what
+    this test sets up. The tool wrapper used to reach the hub directly through
+    `_tracing.span()` — the one span this adapter emitted that did NOT go through
+    the client it was installed with — so the test could install with None and
+    still see the span. Now every span the adapter produces, this one included,
+    is handed to the adapter's own client, which is what `install_configured_
+    adapters` always passes in production. The regression the test defends is
+    untouched: one handler invocation, exactly one span.
+    """
     _hub.reset_for_test()
     t = _Recording()
-    _hub.set_client(Client(WardexConfig(api_key="k"), t))
+    client = Client(WardexConfig(api_key="k"), t)
+    _hub.set_client(client)
 
     async def handler(args):
         return {"content": [{"type": "text", "text": "ok"}]}
@@ -139,7 +150,7 @@ def test_repeated_sdk_tool_registration_does_not_double_wrap():
     )
 
     adapter = AnthropicAgentSdkAdapter()
-    adapter.install(None)
+    adapter.install(client)
     try:
         claude_agent_sdk.create_sdk_mcp_server("srv", tools=[tool_def])
         first_handler = tool_def.handler

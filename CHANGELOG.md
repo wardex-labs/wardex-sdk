@@ -25,16 +25,47 @@ All notable changes to this project are documented here. The format follows
   `wardex.link.reason` link attribute). This is additive: no span the SDK
   builds today carries either, so nothing that used to be exported changes.
 - Two resource limits, `max_units` (512) and `max_entries_per_unit` (256), on
-  `CaptureLimits` and in `crates/wardex-limits`. They bound a logical-unit
-  registry that has not shipped, so both are **inert today** and are listed as
-  such in the README alongside `replay_buffer_size` and `zstd_level`. They are
-  declared ahead of that consumer so its ceilings resolve from the core rather
-  than from Python literals that could drift from it. Neither is a rename of
-  `max_sessions` / `max_session_entries`, which keep their present meaning and
-  their consumer: a per-session table and a cap over one flat table of sessions
-  are not the same quantity as a cap over units of four kinds sharing a single
-  entry point, and reusing the number would silently reinterpret what a user
-  set it to.
+  `CaptureLimits` and in `crates/wardex-limits`. `max_units` bounds
+  concurrently tracked *root* logical units; `max_entries_per_unit` bounds each
+  per-unit table (child units, lookup aliases, de-duplication keys, open span
+  drafts). Where the evicted entry has a span — a root unit, a child unit, an
+  in-flight span — crossing the bound **closes it and exports it**, marked
+  `unit_evicted` or `child_span_unclosed`, because a ceiling that dropped state
+  silently would be a worse failure than an unenforced one. The other two
+  tables hold no span, so evicting a lookup alias or a de-duplication key
+  exports nothing and is recorded only in the internal counters
+  `assembly._units.alias_table_full` and `assembly._units.claim_table_full`
+  (`wardex_sdk.assembly.counters.snapshot()`). `max_entries_per_unit` also
+  bounds the adapter's table of wrapped in-process MCP servers, counted under
+  `adapters.anthropic.server_table_full`, so lowering it shrinks that too.
+  Those evictions still change what you see. A dropped de-duplication key, or a
+  dropped server handle, can let one tool call be reported twice. A dropped
+  **alias** is subtler: that identifier stops resolving, the parent is decided
+  one rung further down, and if the work carries an ambient wardex span the
+  edge arrives at confidence **1.0 with no marker** — hanging off the enclosing
+  session rather than the sub-agent it belonged to, so a subtree flattens and
+  nothing in the data says so. Only with no ambient span does it ship
+  `unit_inferred_sole` (0.5) or `parent_unresolved`. Neither limit is a rename of
+  `max_sessions` / `max_session_entries`, which keep their present meaning
+  and their consumer: a per-session table and a cap over one flat table of
+  sessions are not the same quantity as a cap over units of four kinds sharing a
+  single entry point, and reusing the number would silently reinterpret what a
+  user set it to.
+- A logical-unit registry (`wardex_sdk.assembly.UnitRegistry`, `Unit`,
+  `UnitKey`, `UnitKind`). A *unit* is one logical piece of agent work — a
+  session, a sub-agent, a graph step, a call — and it is where an adapter gets a
+  parent from without ever computing one. A framework identifier can reach it
+  only as a `UnitKey`: a lookup alias that selects a unit whose span context
+  wardex produced from a real scope read. There is no API that turns an
+  identifier into a span context, so the causal tree stays a product of
+  in-process context propagation rather than of a framework's callback ids.
+  `resolve()` is most-specific-wins and records what it could not establish —
+  a cross-trace disagreement ships `correlation_conflict`, a sole-live-unit
+  guess ships confidence 0.5 with `unit_inferred_sole`, and an edge that could
+  not be established at all ships `parent_unresolved` rather than nothing.
+  The Agent SDK adapter is its first consumer: its session and each in-process
+  tool call are units, and every other span it emits is anchored to the
+  session unit's own context.
 - `SpanBuilder.set_error(error_type, message="")`, so a manual span that the
   host marks as failed can name what failed. Marking a span
   `set_status(StatusCode.ERROR)` without one is still valid and records
@@ -72,10 +103,21 @@ All notable changes to this project are documented here. The format follows
   `strategy = "adapter_hook"` / `"adapter_stream"`. Those values answered
   "which source observed this event" — already carried by `capture_sources` —
   while sitting in the field that means "how was this span's parent derived".
-  A tool span now reports no parentage claim at all, keeping what is actually
-  known: the framework's `tool_use_id` as `request_id`, and the trust gap
-  between the two paths as `confidence` (1.0 from a hook, 0.7 from stream
-  content alone).
+  The tool span **assembled from hook and stream events** now reports no
+  parentage claim at all, keeping what is actually known: the framework's
+  `tool_use_id` as `request_id`, and the trust gap between the two paths as
+  `confidence` (1.0 from a hook, 0.7 from stream content alone). Which
+  sub-agent such a span belongs to is still a heuristic, so it publishes no
+  `parent_source`. The **in-process** tool span — the one wardex's own handler
+  wrapper opens for a `create_sdk_mcp_server` tool — is the exception and does
+  publish its edge, because the unit registry resolved that edge from a real
+  scope read: `parent_source = unit_active` at confidence 1.0 with no
+  `request_id`. When the session did not reach the handler it falls through
+  three further tiers, and only two of them leave a marker: the sole live
+  session (`unit_sole`, 0.5, marked `unit_inferred_sole`); failing that the
+  ambient wardex span, if the task carries one (`contextvar`, 1.0, **no
+  marker** — the tool hangs off whatever span enclosed it rather than off a
+  session); and finally `unresolved` (0.0, marked `parent_unresolved`).
 - Enum values are now mapped to the wire by deriving the proto value name from
   the schema rather than by hand-written tables in the PyO3 binding. Twelve
   such tables are gone. They were a second declaration of a list the `.proto`
@@ -95,10 +137,15 @@ All notable changes to this project are documented here. The format follows
   `async_connect_unavailable` → `connect_timing_unavailable`. The merged pairs
   reported one fact under two names — which protocol it was is already carried
   by `TransportAttributes.protocol` — and the markers a user would ACT on
-  differently all stayed separate (`connection_evicted` points at
-  `max_connections`, `unit_evicted` at `max_units`). `capture_integrity.limitations`
-  is now a closed vocabulary end to end: an emitter cannot invent a marker
-  string, and a dashboard filtering on the old spellings needs updating.
+  differently all stayed separate: `connection_evicted` points at
+  `max_connections`, while `unit_evicted` points at a *unit* bound — `max_units`
+  in the registry, or `max_sessions` in the Agent SDK adapter's own session
+  table. (`unit_evicted` also rides the **new** root that continues a run whose
+  predecessor was evicted, which is what separates "this run was truncated and
+  resumes here" from "a second root appeared from nowhere".)
+  `capture_integrity.limitations` is now a closed vocabulary end to end: an
+  emitter cannot invent a marker string, and a dashboard filtering on the old
+  spellings needs updating.
 - A span with `status=ERROR` now always carries `error.type`. Two spans shipped
   the pair `is_error=true` with no type: an MCP stdio call that returned a
   JSON-RPC error (now `json_rpc_<code>`, or `tool_error` for a tool result
@@ -224,6 +271,55 @@ All notable changes to this project are documented here. The format follows
   memory independently of span count.
 
 ### Fixed
+- **An in-process MCP tool's span is now part of the agent's trace.** A tool
+  registered with `create_sdk_mcp_server` used to be connected to nothing: the
+  handler wrapper opened a span with no ambient parent, so it started a trace of
+  its own, invisible from the session — and every HTTP request the tool made
+  in-process was captured accurately *into that orphan trace*. What you saw
+  alongside that orphan depended on one environment variable, and both outcomes
+  were wrong:
+
+  * **Default (the CLI prefixes SDK tool names).** You got the call **twice**.
+    The suppression meant to prevent that never fired, because the skip list
+    held the tool's bare name (`greet`, all the wrapper knows) and was compared
+    against the name the CLI reports (`mcp__tools__greet`). So the hook-driven
+    span appeared in the session tree *and* the orphan span appeared outside it.
+  * **With `CLAUDE_AGENT_SDK_MCP_NO_PREFIX` set**, the CLI reports the bare
+    name, the skip list matched, and the suppression did fire — so the tool node
+    was **missing from the session tree** entirely and the orphan was the only
+    record of the call.
+
+  The tool span is now a child of the session's `invoke_agent` span at
+  confidence 1.0, and the session's own span is what the tool body runs inside —
+  so in-process HTTP attaches to the tool rather than to an orphan root. The
+  edge carries no framework identifier at all: the session is pinned onto the
+  task that drives the SDK's transport read loop, and the handler inherits it by
+  ordinary ContextVar copying, because the SDK dispatches `tools/call` from that
+  loop. `session_id` is still recorded — as a lookup alias and a correlation
+  hint, never as a source of parentage.
+
+  Two observers of one call are now arbitrated on a normalized key rather than
+  on a raw name, so the double emit is not expressible: the handler wrapper owns
+  the call because it wrapped the execution, and the hook observer stands down.
+  Where the two names genuinely cannot be reconciled — an unresolved server
+  token, or `CLAUDE_AGENT_SDK_MCP_NO_PREFIX` with two servers exporting the same
+  bare name — the span says so with `tool_name_collision` instead of guessing.
+  In-process tool spans also carry `tool_call_id_unavailable_in_process`: the
+  handler is dispatched with `{name, arguments}` and no id, and matching one by
+  name and arguments against the stream would be exactly the framework-id
+  heuristic this design removes.
+- An Agent SDK tool handler is restored to the host's own function on
+  `uninstall()`. The wrapper was written directly onto the `SdkMcpTool` instance
+  and was never recorded, so it survived uninstall and re-install for the life
+  of the process.
+- An Agent SDK session evicted at `max_sessions` now emits its root span marked
+  `unit_evicted`. It used to be dropped along with its whole subtree, with no
+  marker, no counter and no log — a workload above the cap simply stopped
+  producing traces.
+- Every swallowed failure in the Agent SDK adapter is now counted and, under
+  `init(debug=True)`, logged with its traceback. Twelve `except Exception: pass`
+  handlers around the transport tee, the patched entry points and the tool
+  wrapper made an SDK bug indistinguishable from wardex not being installed.
 - Non-HTTP traffic over TLS (a Redis, Mongo, or Kafka client sharing the
   process) accumulated in the HTTP/1 parser for the life of the connection —
   an unbounded-memory-growth path. The TLS seam now classifies connections

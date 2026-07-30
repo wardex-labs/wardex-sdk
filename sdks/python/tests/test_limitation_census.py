@@ -1,22 +1,22 @@
-"""Limitation vocabulary census — design §6.5.1, the hard prerequisite for step 3a.
+"""Limitation vocabulary census — design §6.5.1, and the reason the enum is complete.
 
-`assembly/_integrity.Limitation` is a CLOSED vocabulary, and step 3a puts every
-span-emit site under `SpanDraft.finish()`, which raises `VocabularyError` on a
+`assembly/_integrity.Limitation` is a CLOSED vocabulary, and every span-emit
+site runs under `SpanDraft.finish()`, which raises `VocabularyError` on a
 marker that is not a member of it — an exception `SpanSink.guard()` swallows.
 A marker string that exists in the emitters and not in the enum therefore does
 not produce a warning, a partial span or a log line: it deletes the whole span,
-and the only trace left is a counter. Merged against the 15-member enum step 0
-landed, 3a would have silently deleted every gRPC span, every streaming chat
-span, every WebSocket span and every Agent-SDK adapter span.
+and the only trace left is a counter. Routed against the 15-member enum that
+predated this census, that would have silently deleted every gRPC span, every
+streaming chat span, every WebSocket span and every Agent-SDK adapter span.
 
 So this file is not a unit test of the enum. It is the census itself, re-run
 from source on every test run, and it is the mechanism that keeps the two
 halves from drifting apart again. Two drifts produced the situation it guards:
 
-  vocabulary without an emitter — the 15 members step 0 declared, of which
-  migration step 1 has since given exactly one a live emitter
-  (`PARENT_UNRESOLVED`, on the orphan-snapshot path in `__init__.py`) and the
-  other 14 still reach no span;
+  vocabulary without an emitter — the 15 members declared before the census, of
+  which 8 have since acquired an emit site (`PARENT_UNRESOLVED` was the first,
+  on the orphan-snapshot path in `__init__.py`) while the other 7 still reach no
+  span. `_EMITTED_MEMBERS` below is the current split, asserted not described;
 
   an emitter without vocabulary — the 25 free strings the live code actually
   attaches to spans, none of which was a member before the census.
@@ -31,14 +31,14 @@ which matters because seven of the censused strings are pre-rename aliases that
 `SpanDraft.finish()` would reject *today*, so a site added to one of them after
 the freeze is a span-deleting change no name-level check would notice.
 
-HOW STEP 3a INTERACTS WITH THIS FILE. 3a replaces a free string with a
-`Limitation` member at the same slot. The scanner resolves `Limitation.X`
-references as well as string literals, so a migrated site does not disappear
-from the scan — it moves. The commit that migrates a site therefore moves its
+HOW A REWIRED SITE MOVES THROUGH THIS FILE. Replacing a free string with a
+`Limitation` member happens at the same slot. The scanner resolves `Limitation.X`
+references as well as string literals, so a rewired site does not disappear
+from the scan — it moves. The commit that rewires a site therefore moves its
 entry from `_CENSUS_PY` to `_MEMBER_SITES`, and that move is the evidence the
-site actually changed hands. Nothing in this file needs its bounds lowered as
-3a proceeds; if a test here tells you to lower a number, that is a bug in the
-test and not an instruction.
+site actually changed hands. Nothing in this file needs its bounds lowered to
+let that happen; if a test here tells you to lower a number, that is a bug in
+the test and not an instruction.
 
 Scope note: everything here reads *source text*. Nothing imports the Rust
 extension, so a stale `_wardex_native` wheel cannot make these tests lie, and
@@ -67,18 +67,17 @@ _RUST_ROOTS = (_REPO / "crates", _REPO / "bindings")
 _CENSUS_PY: dict[str, frozenset[str]] = {}
 """Every limitation string Python can attach to a span today: **none**.
 
-Step 3a emptied this table, which is what it was for. Before it, 24 free strings
-reached `CaptureIntegrity.limitations` from six modules, and seven of them — the
-four renames plus the three merges — were not `Limitation` values at all, so
-routing their sites through `SpanDraft.finish()` without rewiring them would
-have deleted the spans and left a counter. Every one of those sites now names a
-member and appears in `_MEMBER_SITES` below; the move IS the migration record.
+Emptying this table is what it was for. It once held 24 free strings reaching
+`CaptureIntegrity.limitations` from six modules, and seven of them — the four
+renames plus the three merges — were not `Limitation` values at all, so routing
+their sites through `SpanDraft.finish()` without rewiring them would have
+deleted the spans and left a counter. Every one of those sites now names a
+member and appears in `_MEMBER_SITES` below; the move IS the record of it.
 
 It stays here, empty, rather than being deleted. An empty expectation is a live
 assertion: `test_python_census_matches_source` now says *no Python site may
-emit a free-string marker again*, which is the post-3a rule and is stronger
-than anything the populated table said. Deleting it would retire that rule
-silently.
+emit a free-string marker again*, which is stronger than anything the populated
+table said. Deleting it would retire that rule silently.
 """
 
 _CENSUS_RUST: dict[str, frozenset[str]] = {
@@ -95,10 +94,54 @@ file exists.
 
 _MEMBER_SITES: dict[str, frozenset[str]] = {
     # --- assembly/ itself ---
-    "PARENT_UNRESOLVED": frozenset({"assembly/_parentage.py"}),
-    "UNIT_INFERRED_SOLE": frozenset({"assembly/_parentage.py"}),
+    # `_parentage.py` attaches these two from its `_MARKER` table, which fires
+    # for the source; `_units.py` attaches them again from `resolve()`, which is
+    # the only place that CHOOSES a heuristic source in the first place. Two
+    # sites for one fact is not duplication here: one is the mechanism, the
+    # other is the decision.
+    # The adapter is the third site for both, and it is where they stop being
+    # theory: an in-process tool handler that the pin did not reach falls back to
+    # the sole live session (0.5 + `UNIT_INFERRED_SOLE`), and one called with no
+    # session and no ambient span at all starts a trace and says the parent it
+    # expected was not found.
+    "PARENT_UNRESOLVED": frozenset(
+        {
+            "adapters/_anthropic_agent_sdk.py",
+            "assembly/_parentage.py",
+            "assembly/_units.py",
+        }
+    ),
+    "UNIT_INFERRED_SOLE": frozenset(
+        {
+            "adapters/_anthropic_agent_sdk.py",
+            "assembly/_parentage.py",
+            "assembly/_units.py",
+        }
+    ),
+    # The two §5.4 markers, both on the in-process tool span: the handler is
+    # never told the tool_use_id, and the two observers' key spaces can be split
+    # or ambiguous in two narrow, detectable configurations.
+    "TOOL_CALL_ID_UNAVAILABLE_IN_PROCESS": frozenset({"adapters/_anthropic_agent_sdk.py"}),
+    "TOOL_NAME_COLLISION": frozenset({"adapters/_anthropic_agent_sdk.py"}),
     "SNAPSHOT_TYPE_UNKNOWN": frozenset({"assembly/_snapshot.py"}),
     "PATCH_SUPERSEDED": frozenset({"assembly/_patchset.py"}),
+    # `resolve()` records an alias and a live context disagreeing about
+    # the trace, `pin_driver()` records a pin declared for a task other than the
+    # one calling it, and `open()`/`resolve()` record the scope a CLOSED pin
+    # left standing. All were declared vocabulary with no emitter until the unit
+    # registry landed.
+    # The adapter is the fourth site and the one that reaches a span the
+    # registry cannot mark: when a stale pin sends `_open_tool_call` past
+    # `current()`, the tier that answers instead is deciding this edge in the
+    # shadow of a finished session, and the tool span says so — the pinned
+    # unit's own span was materialized and shipped inside the `close()` that
+    # made the pin stale, so it is not an editable place to record it.
+    "CORRELATION_CONFLICT": frozenset(
+        {
+            "adapters/_anthropic_agent_sdk.py",
+            "assembly/_units.py",
+        }
+    ),
     # --- transport timing ---
     "CONNECT_TIMING_UNAVAILABLE": frozenset({"interceptors/_socket.py", "interceptors/_ssl.py"}),
     "TTFT_UNAVAILABLE_H2": frozenset({"interceptors/_seam.py"}),
@@ -126,16 +169,22 @@ _MEMBER_SITES: dict[str, frozenset[str]] = {
     "GRPC_STATUS_UNAVAILABLE": frozenset({"semantics/_grpc.py"}),
     "WS_NO_CLOSE": frozenset({"interceptors/_socket.py", "interceptors/_ssl.py"}),
     # --- unit / adapter lifecycle ---
-    "CHILD_SPAN_UNCLOSED": frozenset({"adapters/_assembler.py"}),
+    "CHILD_SPAN_UNCLOSED": frozenset({"adapters/_assembler.py", "assembly/_units.py"}),
+    # Two emitters, one per bound that can evict a session: the registry closes
+    # the oldest ROOT unit at `max_units`, and the
+    # assembler closes the oldest SESSION at `max_sessions`. Both EMIT the root
+    # span carrying this marker; the code they replace dropped the session and
+    # its root with no marker and no test, which is the silent drop I10 forbids.
+    "UNIT_EVICTED": frozenset({"adapters/_assembler.py", "assembly/_units.py"}),
     "SESSION_ABORTED": frozenset({"adapters/_assembler.py"}),
 }
 """Every place a `Limitation` MEMBER (rather than a free string) reaches a
 marker slot, by site — the other half of the census, and the half that grew.
 
-Step 3a moved 21 entries into this table out of `_CENSUS_PY`, one per rewired
-site, and added `SNAPSHOT_TYPE_UNKNOWN` — the one member that gained a NEW
-emitter rather than a renamed one, because 3a is also the step that closes
-`SnapshotType`.
+21 entries moved into this table out of `_CENSUS_PY`, one per rewired site,
+plus `SNAPSHOT_TYPE_UNKNOWN` — the one member that gained a NEW emitter rather
+than a renamed one, because closing `SnapshotType` created the condition it
+reports.
 
 The site sets are the same files the strings were emitted from, with three
 exceptions that are the census's merges landing:
@@ -147,8 +196,8 @@ exceptions that are the census's merges landing:
   * `CONNECT_TIMING_UNAVAILABLE` absorbed `async_connect_unavailable`, which
     shared `_ssl.py` with it, so the file set is unchanged.
 
-Migration step 4 moved four gRPC sites without changing a line of their logic:
-`build_grpc_fields` left `interceptors/_seam.py` for `semantics/_grpc.py`, so
+Extracting the gRPC semantics moved four sites without changing a line of their
+logic: `build_grpc_fields` left `interceptors/_seam.py` for `semantics/_grpc.py`, so
 `GRPC_MESSAGE_TRUNCATED`, `GRPC_STATUS_UNAVAILABLE` and `PAYLOAD_COMPRESSED`
 moved with it. `FRAME_PARSE_FAILED` GAINED that file rather than moving,
 because the seam still names the member — `if Limitation.FRAME_PARSE_FAILED not
@@ -156,16 +205,20 @@ in grpc_markers` is how the span's label stays consistent with the marker the
 builder returned, and R7 sees it.
 
 These are SOURCE sites — the place a member NAME appears in a marker slot — and
-that is not the same as the set of markers that reach a span.
-`capture_state_snapshot` ships `PARENT_UNRESOLVED` onto real records and does
-not appear here, because `__init__.py` names no member: the reference is
-`_MARKER`'s and `SnapshotDraft`'s, one call away. `UNIT_INFERRED_SOLE` still
-fires for no one — nothing passes `ParentSource.UNIT_SOLE` yet.
+that is not the same as the set of markers that reach a span, in either
+direction. `capture_state_snapshot` ships `PARENT_UNRESOLVED` onto real records
+and does not appear here, because `__init__.py` names no member: the reference
+is `_MARKER`'s and `SnapshotDraft`'s, one call away. `UNIT_INFERRED_SOLE` is the
+mirror image — three source sites for two decisions, because `_units.py` and the
+adapter each name it at the tier that CHOSE `ParentSource.UNIT_SOLE` and
+`_parentage.py`'s table would have attached it there regardless.
 
 `BODY_CAP_EXCEEDED` is absent for a different reason: it is produced in Rust and
 crosses the PyO3 boundary as a string, so `_CENSUS_RUST` is where it is
-recorded. `interceptors/_seam.py` resolves it with `Limitation.from_wire`, which
-names no member and correctly does not appear here.
+recorded. `protocol/_http1.py` resolves it with `Limitation.from_wire` — the one
+string-to-member crossing left — and `interceptors/_seam.py` copies the
+resulting member onto the span. Neither spells a member out, so neither appears
+here, and correctly so.
 """
 
 _DISABLED_REASONS: frozenset[str] = frozenset(
@@ -182,8 +235,8 @@ members.
 These say why a Rust parser latched itself off for an entire connection. No span
 exists to carry them — the latch fires precisely because no message was ever
 parsed — so `init(debug=True)` prints them once per connection to stderr instead.
-Design §6.5.1 requires step 3b to keep them out of the `Limitation` proto enum:
-the two vocabularies have different lifetimes and different consumers, one a wire
+Design §6.5.1 keeps them out of the `Limitation` proto enum: the two
+vocabularies have different lifetimes and different consumers, one a wire
 contract and one a debug string.
 """
 
@@ -226,10 +279,10 @@ _RENAMES: dict[str, Limitation] = {
 }
 """The four value-name changes §6.5.1 mandates.
 
-Each is a wire-value change in its own right. Step 3b already breaks
-`wardex.v1` deliberately (§6.7), and `buf`'s `ENUM_VALUE_SAME_NAME` locks a
-value name the instant it is declared — so a rename that does not ride 3b never
-happens at all.
+Each is a wire-value change in its own right. They rode the one deliberate
+`wardex.v1` break that put these vocabularies on the wire (§6.7), because
+`buf`'s `ENUM_VALUE_SAME_NAME` locks a value name the instant it is declared —
+so a rename that does not ride such a break never happens at all.
 """
 
 _MERGES: dict[str, Limitation] = {
@@ -286,35 +339,61 @@ _EMITTED_MEMBERS: frozenset[str] = frozenset(
         "GRPC_STATUS_UNAVAILABLE",
         "WS_NO_CLOSE",
         "SESSION_ABORTED",
-        # step 0's, which the census found an emitter for
+        # pre-census declared, and the census found an emitter for it
         "CHILD_SPAN_UNCLOSED",
-        # step 0's, whose emitter step 3a BUILT rather than renamed: closing
-        # `SnapshotType` is 3a's, and `SnapshotDraft` attaches this when a
-        # caller hands `capture_state_snapshot` a type outside the enum. The one
-        # legitimate way this set grows — a member moving from "declared" to
-        # "emitted" — as opposed to the migration, which never changes it.
+        # pre-census declared, whose emitter was BUILT rather than renamed:
+        # closing `SnapshotType` created the condition, and `SnapshotDraft`
+        # attaches this when a caller hands `capture_state_snapshot` a type
+        # outside the enum. The one legitimate way this set grows — a member
+        # moving from "declared" to "emitted" — as opposed to rewiring a site,
+        # which never changes it.
         "SNAPSHOT_TYPE_UNKNOWN",
-        # step 0's, whose emitter step 5 BUILT: `assembly/_patchset.py` is the
-        # SDK's one patch mechanism, and its identity-checked restore is the
+        # pre-census declared, whose emitter was BUILT by `assembly/_patchset.py`:
+        # the SDK's one patch mechanism, whose identity-checked restore is the
         # first code able to observe that something else re-patched a symbol
         # wardex had patched. The second member to move from "declared" to
         # "emitted" by gaining a NEW emitter rather than a renamed one.
         "PATCH_SUPERSEDED",
-        # step 0's, whose emitter is the _parentage.py _MARKER table. A source
-        # reference and a live caller are not the same thing and this set keeps
-        # them apart: since step 1 wired `capture_state_snapshot`,
-        # PARENT_UNRESOLVED reaches real records, while UNIT_INFERRED_SOLE is
-        # still reference-only (nothing passes `ParentSource.UNIT_SOLE`)
+        # pre-census declared, whose first emitter is the _parentage.py _MARKER table.
+        # PARENT_UNRESOLVED reached real records first, on the orphan-snapshot
+        # path `capture_state_snapshot` opened. Both now have callers that name
+        # them at the slot as well: the unit registry's `resolve()` and the
+        # Anthropic adapter's in-process tool path each PICK
+        # `ParentSource.UNRESOLVED` or `ParentSource.UNIT_SOLE` and say so on
+        # the span, rather than leaving the table to speak for them
         "PARENT_UNRESOLVED",
         "UNIT_INFERRED_SOLE",
+        # pre-census declared, whose emitters the unit registry BUILT — the
+        # third and fourth members
+        # to move from "declared" to "emitted" by gaining a NEW emitter rather
+        # than a renamed one. `UNIT_EVICTED` fires when the unit registry closes
+        # the oldest root at `max_units`; `CORRELATION_CONFLICT` fires four
+        # ways, all of them "two answers to one parent question, and the
+        # disagreement is on the wire rather than in a counter": an alias and
+        # the live context land in different traces, a pin is declared for a
+        # task other than the caller, `open()`/`resolve()` refuse the scope a
+        # CLOSED pin left standing, and — the one site outside the registry —
+        # the adapter marks the tool span whose edge a stale pin decided.
+        "UNIT_EVICTED",
+        "CORRELATION_CONFLICT",
+        # pre-census declared and §5.4's, whose emitters were BUILT in the
+        # Anthropic adapter — the fifth and sixth members to move from "declared" to
+        # "emitted". Both ride the in-process tool span: the handler is never
+        # given a `tool_use_id`, and the two observers' key spaces can be split
+        # (an unresolved server token) or ambiguous (`NO_PREFIX` plus two servers
+        # exporting one bare name). `TOOL_NAME_COLLISION` is also the member the
+        # 37-value vocabulary was extended for, so this is the moment §5.4's V3
+        # correction stops being a declaration.
+        "TOOL_CALL_ID_UNAVAILABLE_IN_PROCESS",
+        "TOOL_NAME_COLLISION",
     }
 )
 """Which MEMBERS have an emit site today, derived independently below.
 
-Invariant under step 3a: rewiring `"ws_compressed"` to
+Invariant under rewiring: turning `"ws_compressed"` into
 `Limitation.PAYLOAD_COMPRESSED` changes how a member is reached, never whether
-it is reached. So this set is a decision record that survives the migration,
-where a count of census entries would not.
+it is reached. So this set is a decision record that survives a rewiring, where
+a count of census entries would not.
 """
 
 
@@ -471,9 +550,9 @@ def _bindings(scope: ast.AST) -> dict[str, list[ast.expr | None]]:
 def _is_member_ref(node: ast.expr) -> str | None:
     """`Limitation.WS_NO_CLOSE` -> `"WS_NO_CLOSE"`, for anything else None.
 
-    Step 3a's whole edit is replacing a literal with one of these at the same
-    slot, so the scanner has to see both or a migrated site looks like a deleted
-    one — which is how a vacuity bound ends up being lowered.
+    Rewiring a site is exactly the edit that replaces a literal with one of
+    these at the same slot, so the scanner has to see both or a rewired site
+    looks like a deleted one — which is how a vacuity bound ends up lowered.
     """
     if isinstance(node, ast.Attribute) and node.attr in _MEMBER_NAMES:
         if _bound_name(node.value) == "Limitation":
@@ -777,6 +856,23 @@ _UNRESOLVED_PY: frozenset[tuple[str, str]] = frozenset(
         ("assembly/_snapshot.py", "Call:list"),
         ("assembly/_snapshot.py", "List"),
         ("assembly/_snapshot.py", "Name:marker"),
+        # Three forwards in the unit registry, none of which can introduce a
+        # value. `Name:inherited` is `_carry_limitations`, which copies the
+        # `Limitation` MEMBERS `_parentage.py` already put on the edge onto the
+        # span that edge produced — every one of them is censused at the
+        # `_MARKER` table where it was decided. `Name:marker` is `Unit.note`,
+        # a one-line forward onto the unit's own draft. `Name:reason` is
+        # `close_all(reason=...)`, whose member is the CALLER's (an adapter
+        # uninstall passes `ADAPTER_UNINSTALLED`, a cancelled process passes
+        # `UNIT_INTERRUPTED`) and therefore unreadable from here by
+        # construction. The markers this module DECIDES — `UNIT_EVICTED`,
+        # `CHILD_SPAN_UNCLOSED`, `CORRELATION_CONFLICT` and the three that
+        # `resolve()` stamps — are spelled out as literals at their slots and
+        # appear in `_MEMBER_SITES`, which is what keeps this trio a set of
+        # pipes rather than a hiding place.
+        ("assembly/_units.py", "Name:inherited"),
+        ("assembly/_units.py", "Name:marker"),
+        ("assembly/_units.py", "Name:reason"),
         ("interceptors/_seam.py", "Name:marker"),
         ("interceptors/_seam.py", "Tuple"),
         ("interceptors/_socket.py", "Tuple"),
@@ -788,7 +884,7 @@ _UNRESOLVED_PY: frozenset[tuple[str, str]] = frozenset(
         ("interceptors/_trackers.py", "Call:tuple"),
         ("interceptors/_trackers.py", "Tuple"),
         # `_resolve_markers(raw)` is where a Rust-produced marker STRING becomes
-        # a member, and it is now the ONLY such crossing (step 3b moved it here
+        # a member, and it is now the ONLY such crossing (it moved here
         # from the byte seam, which is why `interceptors/_seam.py::Name:member`
         # is no longer a hole). It cannot introduce a value: `from_wire` returns
         # a member or None, and the Rust half of this census bounds which
@@ -798,8 +894,8 @@ _UNRESOLVED_PY: frozenset[tuple[str, str]] = frozenset(
         # parameter rebound three times — R8 will not guess at a name bound more
         # than once, and R6 reads the tuple slot it lands in. The hole is the
         # container, not a value: every member that reaches it is spelled out at
-        # the rebinding a few lines above and is censused there. Step 4 moved
-        # this entry from `interceptors/_seam.py` when the function moved; the
+        # the rebinding a few lines above and is censused there. This entry
+        # moved from `interceptors/_seam.py` when the function moved; the
         # expression is byte-identical.
         ("semantics/_grpc.py", "Name:limitations"),
     }
@@ -858,7 +954,8 @@ _RUST_VEC_DECLARATIONS: dict[str, str] = {
 
 Equality is asserted. A new one is not necessarily a marker channel — but it has
 the exact shape of one, and the cost of being wrong is a marker the Rust scan
-never sees and step 3a silently deletes. If yours carries something else, add it
+never sees and `SpanDraft.finish()` silently deletes. If yours carries something
+else, add it
 here with a comment saying what; if it carries markers, the derived receiver
 name means the scan already covers it and the census will tell you what it found.
 """
@@ -952,7 +1049,7 @@ def rust_census() -> _RustCensus:
 
 
 _VOCABULARY: dict[str, str] = {
-    # --- step 0 (15), values unchanged by the census ---
+    # --- declared before the census (15), values unchanged by it ---
     "PARENT_UNRESOLVED": "parent_unresolved",
     "UNIT_INFERRED_SOLE": "unit_inferred_sole",
     "CORRELATION_CONFLICT": "correlation_conflict",
@@ -996,19 +1093,19 @@ _VOCABULARY: dict[str, str] = {
 
 
 def test_the_vocabulary_is_exactly_these_thirty_seven() -> None:
-    """15 from step 0 + 21 from the census + 1 from §5.4, pinned name by name.
+    """15 declared before the census + 21 from it + 1 from §5.4, name by name.
 
     A count alone is not enough: a RENAME keeps the count and is the single most
-    expensive mistake available here. Step 3b declares these as proto enum
-    values, at which point `buf`'s `ENUM_VALUE_SAME_NAME` (FILE category) locks
+    expensive mistake available here. These are proto enum values in
+    `common.proto`, so `buf`'s `ENUM_VALUE_SAME_NAME` (FILE category) locks
     every name and `ENUM_VALUE_NO_DELETE` locks every number. A name that is
-    wrong at that moment costs a SECOND deliberate schema break to correct, and
-    §6.7's argument for why the first one is free — no backend, no deployed
-    envelope bytes — expires the day the first ingest endpoint stores anything.
+    wrong costs a SECOND deliberate schema break to correct, and §6.7's argument
+    for why the first one was free — no backend, no deployed envelope bytes —
+    expires the day the first ingest endpoint stores anything.
 
     So this table is a decision record, not a duplicate of the enum. Changing it
-    is meant to be as annoying as changing the wire, because after 3b it IS
-    changing the wire.
+    is meant to be as annoying as changing the wire, because it IS changing the
+    wire.
     """
     assert {m.name: m.value for m in Limitation} == _VOCABULARY
 
@@ -1050,9 +1147,9 @@ def _member_docs() -> dict[str, str]:
 def _members_with_an_emitter() -> set[str]:
     """The members the census reaches, however they are spelled at the site.
 
-    Derived from the frozen tables rather than counted, so step 3a moving a site
-    from a free string to a member does not change the answer — which member has
-    an emitter is invariant under that migration, and a bare count is not.
+    Derived from the frozen tables rather than counted, so moving a site from a
+    free string to a member does not change the answer — which member has an
+    emitter is invariant under a rewiring, and a bare count is not.
     """
     by_value = {m.value: m for m in Limitation}
     strings = set(_CENSUS_PY) | set(_CENSUS_RUST)
@@ -1076,7 +1173,7 @@ def test_every_member_carries_its_own_provenance() -> None:
         "the set of members with an emit site changed.\n"
         f"  gained: {sorted(emitted - _EMITTED_MEMBERS)}\n"
         f"  lost:   {sorted(_EMITTED_MEMBERS - emitted)}\n"
-        "This set is invariant under step 3a — migrating a site changes HOW a "
+        "This set is invariant under a rewiring — it changes HOW a "
         "member is reached, not WHETHER. If you moved an entry from _CENSUS_PY "
         "to _MEMBER_SITES and this fired, the two entries do not name the same "
         "member and one of them is wrong."
@@ -1125,7 +1222,7 @@ def test_python_census_matches_source(py_census: _PythonCensus) -> None:
 
     A marker that gains a site is the case a name-level check waves through, and
     for the seven pre-rename aliases it is a span-deleting change: those strings
-    are not `Limitation` values, so under step 3a `SpanDraft.finish()` raises on
+    are not `Limitation` values, so `SpanDraft.finish()` raises on
     them and `guard()` eats the span. The site map is what makes "one more place
     emits `grpc_parse_failed`" a build failure instead of a diff nobody reads.
     """
@@ -1136,8 +1233,8 @@ def test_python_census_matches_source(py_census: _PythonCensus) -> None:
         "if it is a connection-level parser disable reason with no span to carry "
         "it, it does not belong in `limitations` at all — see _integrity.py's "
         "module docstring.\n"
-        "A marker that LOST every site: if step 3a rewired it, move its entry to "
-        "_MEMBER_SITES in the same commit. That move is the evidence the site "
+        "A marker that LOST every site: if it was rewired to a member, move its "
+        "entry to _MEMBER_SITES in the same commit. That move is the evidence the site "
         "changed hands, and nothing else in this file needs to be touched."
     )
 
@@ -1145,16 +1242,18 @@ def test_python_census_matches_source(py_census: _PythonCensus) -> None:
 def test_member_reference_sites_match_source(py_census: _PythonCensus) -> None:
     """The other half: where a `Limitation` member (not a string) is used.
 
-    Today this is `assembly/_parentage.py`'s `_MARKER` table and nothing else,
-    which is the "vocabulary without an emitter" drift stated as a fact rather
-    than as prose. Step 3a grows this table as it shrinks `_CENSUS_PY`.
+    It began as `assembly/_parentage.py`'s `_MARKER` table and nothing else —
+    the "vocabulary without an emitter" drift stated as a fact rather than as
+    prose. It grew as `_CENSUS_PY` emptied, so it now reaches every
+    Python site that names a marker, across `assembly/`, `adapters/`,
+    `interceptors/` and `semantics/`.
     """
     drift = _diff_sites(py_census.members, _MEMBER_SITES)
     assert not drift, (
         f"Limitation member usage drifted: {drift} (member -> (sites gained, sites lost)).\n"
-        "A member that GAINED a site is a step 3a migration: record the site in "
+        "A member that GAINED a site is a rewiring: record the site in "
         "_MEMBER_SITES and delete the free string's entry from _CENSUS_PY, in "
-        "the same commit. Those two edits are the whole migration bookkeeping — "
+        "the same commit. Those two edits are the whole bookkeeping — "
         "no bound in this file needs to move."
     )
 
@@ -1259,42 +1358,43 @@ def test_scanner_is_not_blind(py_census: _PythonCensus, rust_census: _RustCensus
     """The vacuous-pass trap: a scanner that finds nothing passes everything.
 
     Every mapping above is satisfied by an empty result set once the frozen
-    table it is compared against is also empty — and step 3a empties
-    `_CENSUS_PY` on purpose. So the quantities here are chosen to be INVARIANT
-    under that migration rather than to be counts that 3a necessarily drives
-    down: markers and members are summed, and `sites` counts a slot the same
-    whether it holds `"ws_compressed"` or `Limitation.PAYLOAD_COMPRESSED`.
+    table it is compared against is also empty — and `_CENSUS_PY` is empty on
+    purpose. So the quantities here are chosen to be INVARIANT under a rewiring
+    rather than to be counts a rewiring necessarily drives down: markers and
+    members are summed, and `sites` counts a slot the same whether it holds
+    `"ws_compressed"` or `Limitation.PAYLOAD_COMPRESSED`.
 
     Every bound may be RAISED as the SDK grows. Both were lowered exactly once,
-    by step 3a, and each drop is arithmetic that can be checked rather than a
-    number that was in the way — see below. If a bound fails on you, do the same
-    thing: derive what the number SHOULD be and show the derivation, or accept
-    that the scanner went blind.
+    when the free strings were rewired, and each drop is arithmetic that can be
+    checked rather than a number that was in the way — see below. If a bound
+    fails on you, do the same thing: derive what the number SHOULD be and show
+    the derivation, or accept that the scanner went blind.
     """
     surface = len(py_census.markers) + len(py_census.members)
-    # 26 -> 24, and the two are the census's own merges landing. Before 3a the
-    # scan saw 24 distinct STRINGS plus 2 members; after it, 24 distinct
+    # 26 -> 24, and the two are the census's own merges landing. Beforehand the
+    # scan saw 24 distinct STRINGS plus 2 members; afterwards, 24 distinct
     # MEMBERS. The difference: three pairs collapsed into one member each
     # (async_connect_unavailable+connect_timing_unavailable,
     # ws_compressed+grpc_compressed, ws_parse_failed+grpc_parse_failed) for -3,
     # and SNAPSHOT_TYPE_UNKNOWN gained its first emitter for +1. 26-3+1 = 24.
-    # The draft of this test claimed the sum was invariant under 3a; it is not,
-    # because merging two spellings of one fact is the point of the census.
+    # The draft of this test claimed the sum was invariant under the rewiring;
+    # it is not, because merging two spellings of one fact is the point of the
+    # census.
     assert surface >= 24, (
         f"the scan found {surface} distinct marker values (24 members on "
-        "2026-07-29, post-3a). A drop below this means the scanner stopped "
+        "2026-07-29). A drop below this means the scanner stopped "
         "seeing something — the member-by-member, site-by-site equality tests "
         "above are what say WHICH. Do not lower this bound without the "
         "arithmetic."
     )
-    # 56 -> 45. A slot is a marker-ish SLOT, not a marker, and 3a deleted the
-    # accumulator plumbing that made up the difference: `limitations =
+    # 56 -> 45. A slot is a marker-ish SLOT, not a marker, and the rewiring
+    # deleted the accumulator plumbing that made up the difference: `limitations =
     # limitations + ("x",)` counted a slot per rebinding, and eleven of those
     # rebindings became `draft.add_limitation(Limitation.X)` calls with no
     # intermediate. Every marker is still found — that is what the equality
     # tests establish — and only the plumbing between them is gone.
     assert py_census.sites >= 45, (
-        f"only {py_census.sites} marker-ish slots resolved to a value (45 on 2026-07-29, post-3a)."
+        f"only {py_census.sites} marker-ish slots resolved to a value (45 on 2026-07-29)."
     )
     assert len(rust_census.markers) >= 1, "the Rust scan found no markers at all"
     assert len(rust_census.files) >= 20, (
@@ -1315,18 +1415,18 @@ def test_scanner_is_not_blind(py_census: _PythonCensus, rust_census: _RustCensus
         "R9 registered no marker sink; a helper that takes a marker container "
         "without declaring a marker-ish parameter is then invisible"
     )
-    # Step 3a's own indirection: every rewired site reaches the vocabulary
+    # The indirection every rewired site uses: it reaches the vocabulary
     # through `SpanDraft.add_limitation(marker)` / `IntegrityBuilder.limitation`
     # rather than by writing into a tuple. If R4 stopped deriving those two, the
-    # scan would go blind on the entire migrated surface at once and every
+    # scan would go blind on the entire rewired surface at once and every
     # equality table above would agree with it.
     assert {"add_limitation", "limitation"} <= py_census.marker_functions, (
-        "R4 derived no draft-side marker sink; after step 3a that is the path every marker takes"
+        "R4 derived no draft-side marker sink; that is the path every marker takes"
     )
 
 
 # ==========================================================================
-# The gate on step 3a
+# The gate: no emitted string outside the vocabulary
 # ==========================================================================
 
 
@@ -1337,9 +1437,9 @@ def test_every_emitted_marker_has_a_member(
 
     This is NOT the same test `SpanDraft.finish()` runs. `finish()` rejects any
     string that is not a `Limitation` VALUE, and the seven aliases below are not
-    values — they are pre-rename spellings that step 3a is going to replace. So
+    values — they are pre-rename spellings a member replaces. So
     this test is deliberately the weaker one: it asks whether the census knows
-    about the string at all. `test_alias_sites_are_the_step_3a_worklist` carries
+    about the string at all. `test_alias_sites_are_the_rewiring_worklist` carries
     the stronger half, and the two must not be collapsed — folding the aliases
     into the pass path here is what would let a NEW site for one of them look
     clean.
@@ -1353,20 +1453,20 @@ def test_every_emitted_marker_has_a_member(
     }
     assert unmapped == {}, (
         f"limitation marker(s) with no Limitation member: {unmapped}. "
-        "Under step 3a these spans are DELETED silently."
+        "`SpanDraft.finish()` DELETES these spans silently."
     )
 
 
-def test_alias_sites_are_the_step_3a_worklist(py_census: _PythonCensus) -> None:
+def test_alias_sites_are_the_rewiring_worklist(py_census: _PythonCensus) -> None:
     """The strings `SpanDraft.finish()` would reject today, and where.
 
     Reported as their own list rather than folded into the test above, because
     they are the actual work item: every site here emits a string that is not a
-    `Limitation` value, so the moment 3a routes that site through `finish()`
-    without rewiring it, the span is dropped and only a counter remains.
+    `Limitation` value, so a site left un-rewired while routed through
+    `finish()` drops its span and leaves only a counter.
 
     The expectation is DERIVED from `_CENSUS_PY` rather than written out, so the
-    one edit a migration makes — moving an entry to `_MEMBER_SITES` — is the only
+    one edit a rewiring makes — moving an entry to `_MEMBER_SITES` — is the only
     edit it makes. A hardcoded list here would be a third table to keep in step,
     and the first contributor to hit it would reach for the shortest fix.
     """
@@ -1375,13 +1475,13 @@ def test_alias_sites_are_the_step_3a_worklist(py_census: _PythonCensus) -> None:
     }
     expected = {old: sorted(_CENSUS_PY[old]) for old in sorted(_ALIASES) if old in _CENSUS_PY}
     assert remaining == expected, (
-        f"the step 3a alias worklist is {remaining}, but _CENSUS_PY says {expected}"
+        f"the alias worklist is {remaining}, but _CENSUS_PY says {expected}"
     )
     sites = sum(len(where) for where in remaining.values())
     assert sites <= 7, (
         f"{sites} sites still emit a pre-rename string (7 on 2026-07-29): {remaining}.\n"
-        "This is a RATCHET — step 3a drives it to zero and nothing may push it "
-        "back up. A new site for one of these strings is a span that 3a deletes."
+        "This is a RATCHET — it is at zero and nothing may push it back up. "
+        "A new site for one of these strings is a span that `finish()` deletes."
     )
     values = {m.value for m in Limitation}
     for old in _ALIASES:
@@ -1391,9 +1491,9 @@ def test_alias_sites_are_the_step_3a_worklist(py_census: _PythonCensus) -> None:
 def test_the_four_renames_are_recorded(py_census: _PythonCensus) -> None:
     """§6.5.1's four value-name changes, asserted from both ends.
 
-    Before step 3a this asserted the old string was still what the code emits.
-    3a rewired every site, so the assertion inverts and gets STRONGER: the old
-    spelling must now appear nowhere the scanner can see, the new value must be
+    This used to assert the old string was still what the code emits. Every
+    site is rewired now, so the assertion inverts and gets STRONGER: the old
+    spelling must appear nowhere the scanner can see, the new value must be
     a member, and the old value must NOT be — a vocabulary that carries both
     names is exactly the drift the census was run to end.
     """
@@ -1405,7 +1505,7 @@ def test_the_four_renames_are_recorded(py_census: _PythonCensus) -> None:
     }
     values = {m.value for m in Limitation}
     for old, member in _RENAMES.items():
-        assert old not in py_census.markers, f"{old} is still emitted; 3a should have rewired it"
+        assert old not in py_census.markers, f"{old} is still emitted; it should be a member now"
         assert member.value in values
         assert old not in values, f"{old} survived as a member alongside {member.value}"
 

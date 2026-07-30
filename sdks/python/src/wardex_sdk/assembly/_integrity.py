@@ -10,12 +10,12 @@ The enum is CLOSED, and as of the 2026-07-29 census (design §6.5.1) it is also
 **complete**: it is the full vocabulary, not a sample of it. Every limitation
 string the SDK can attach to a span today — Python and Rust — has a member
 below. Adding a member is a core change on purpose: the dashboard renders these
-and step 3b makes them a proto enum whose value names lock the moment they are
-declared (``buf`` ``ENUM_VALUE_SAME_NAME``), so a late correction costs a
-second deliberate schema break. Emitters must never invent a marker string
-inline.
+and they are a proto enum (``wardex.v1.Limitation``) whose value names lock the
+moment they are declared (``buf`` ``ENUM_VALUE_SAME_NAME``), so a late
+correction costs a second deliberate schema break. Emitters must never invent a
+marker string inline.
 
-**37 members = 15 declared in step 0 + 21 from the census + 1 from §5.4.**
+**37 members = 15 originally declared + 21 from the census + 1 from §5.4.**
 The census read every assignment and append site that reaches
 ``CaptureIntegrity.limitations`` and found 25 distinct strings (24 Python, 1
 Rust). Four of those merged away — see the ``NOTE (census)`` comments on
@@ -31,9 +31,9 @@ The trap is ``stream_buffer_exceeded``, which is **both**: the HTTP/1 latch
 (``crates/wardex-protocol/src/http1.rs``) is a debug reason and stays out,
 while the MCP-stdio JSON-RPC instance (``json_rpc.rs``) happens with a pending
 request already open, so a span exists and design §4.6 site-3 makes it
-reportable — that is why ``STREAM_BUFFER_EXCEEDED`` is a member. Step 3b must
-keep the two vocabularies in separate proto enums; they have different
-lifetimes and different consumers (wire contract vs stderr).
+reportable — that is why ``STREAM_BUFFER_EXCEEDED`` is a member. The two
+vocabularies must stay in separate proto enums; they have different lifetimes
+and different consumers (wire contract vs stderr).
 
 **Read this before adding a member.** ``tests/test_limitation_census.py``
 re-runs the census against the source on every test run and fails if any marker
@@ -43,19 +43,19 @@ to answer is not "how do I make it pass" but "is my new string a wire-contract
 marker (add a member) or a connection-level debug reason (add it to the
 exclusion set instead)".
 
-Migration status (design §11): this module is the **python half** of the census
-and it was the hard prerequisite for step 3a, which routed all six span-emit
-sites through ``SpanDraft.finish()`` — and ``finish()`` raises
-``VocabularyError`` on a marker that is not a member here, which the emit site's
-``guard()`` swallows. Merged against an incomplete enum, 3a would have silently
-deleted every gRPC span, every streaming chat span, every WS span and every
-adapter span. That step has landed: **every Python emitter now names a member**,
-the seven pre-rename free strings are gone from the tree, and
-``tests/test_limitation_census.py`` asserts an EMPTY string census as the
-standing rule. One producer is still textual — ``body_cap_exceeded``, built in
-``crates/wardex-protocol`` and resolved once at the PyO3 boundary by
-``Limitation.from_wire`` — and retyping that is step 3b, which also makes proto
-the single source of truth for every language SDK (§6.6).
+This module is the **python half** of the census, and completing it was the
+hard prerequisite for routing all six span-emit sites through
+``SpanDraft.finish()`` — ``finish()`` raises ``VocabularyError`` on a marker
+that is not a member here, which the emit site's ``guard()`` swallows. Against
+an incomplete enum that routing would have silently deleted every gRPC span,
+every streaming chat span, every WS span and every adapter span. It is done:
+**every Python emitter now names a member**, the seven pre-rename free strings
+are gone from the tree, and ``tests/test_limitation_census.py`` asserts an
+EMPTY string census as the standing rule. One producer is still textual —
+``body_cap_exceeded``, built in ``crates/wardex-protocol`` and resolved once at
+the PyO3 boundary by ``Limitation.from_wire``. Retyping the Rust side is the
+remaining work, and it is what would make proto the single source of truth for
+every language SDK (§6.6).
 """
 
 from __future__ import annotations
@@ -69,13 +69,18 @@ class Limitation(Enum):
     Values are the wire contract (``CaptureIntegrity.limitations``); they are
     lower_snake to match every other wardex enum and must not be renamed
     casually. Four values below were renamed by the census on the way in — that
-    rename is itself a wire change and rides step 3b, the one commit that
-    already breaks ``wardex.v1`` on purpose (§6.7). There is no second chance.
+    rename is itself a wire change, and it rode the same deliberate
+    ``wardex.v1`` break that put this enum on the wire (§6.7). There is no
+    second chance.
 
     Each member records the condition that emits it and the site that does so,
-    as module-qualified functions rather than line numbers. A member marked
-    "declared; no emitter" is vocabulary the design named and a later migration
-    step wires up — it is not dead code, and it is not evidence that the census
+    as module-qualified functions rather than line numbers. The site named is
+    the function that ATTACHES the marker, which on the byte seam and in the
+    Agent SDK assembler is the ``_build_*`` half of a ``_build_*``/``_emit_*``
+    pair — the ``_emit_*`` wrapper only guards the build and hands the finished
+    span to the sink, so it holds no marker to grep for. A member marked
+    "declared; no emitter" is vocabulary the design named and a later seam
+    wires up — it is not dead code, and it is not evidence that the census
     missed something.
     """
 
@@ -84,9 +89,9 @@ class Limitation(Enum):
         """A marker that arrived as a STRING, resolved to its member, or None.
 
         Exactly one caller is legitimate and it is the PyO3 boundary: the Rust
-        protocol parsers still build `Vec<&'static str>` (retyping that is step
-        3b, along with `bindings/python/src/lib.rs` and the PII walk that runs
-        regexes over the strings), so a marker produced in Rust reaches Python
+        protocol parsers still build `Vec<&'static str>` (retyping them means
+        touching `bindings/python/src/lib.rs` and the PII walk that runs
+        regexes over the strings too), so a marker produced in Rust reaches Python
         as text and has to be resolved once, at the seam that folds it into a
         span. Python-side emitters name the member directly and must not come
         here — a string-to-member lookup used as a general entry point is the
@@ -116,23 +121,70 @@ class Limitation(Enum):
     PARENT_UNRESOLVED = "parent_unresolved"
     """A parent was expected and no scope, unit or header supplied one.
 
-    Attached automatically by ``assembly/_parentage.py``'s ``_MARKER`` table for
-    ``ParentSource.UNRESOLVED``. Declared; fires the moment ``resolve_parentage``
-    acquires its first caller in step 1.
+    Three emit sites, and the first is the mechanism the other two restate.
+    ``assembly/_parentage.py``'s ``_MARKER`` table attaches it to every edge
+    ``resolve_parentage`` builds for ``ParentSource.UNRESOLVED``, so no caller
+    can name that source and omit the marker — I4 as a mechanism rather than as
+    caller discipline. The other two name the member at the slot where that
+    source is CHOSEN, which is where a reader greps for it, and both are
+    idempotent: ``Parentage.with_limitation`` and ``IntegrityBuilder.limitation``
+    each no-op on a marker already present.
+
+    * ``assembly/_units.py::UnitRegistry._edge`` — ``resolve()``'s last tier,
+      via ``Parentage.with_limitation``. No alias resolved to a unit, no live
+      scope reached us and no single session was live, so the span roots its own
+      trace and says the parent it expected was never found.
+    * ``adapters/_anthropic_agent_sdk.py::_open_tool_call`` — ``Unit.note`` on
+      the CALL unit, when no pin reached the handler, no single session was live
+      to fall back on, and the task carried no ambient wardex span either.
+
+    The path that puts it on the most records is none of the three:
+    ``__init__.py``'s ``capture_state_snapshot`` passes
+    ``ParentSource.UNRESOLVED`` for a snapshot taken outside any span and names
+    no member itself, leaving the ``_MARKER`` table to do it.
     """
 
     UNIT_INFERRED_SOLE = "unit_inferred_sole"
     """Exactly one logical unit was live, so it was taken as the parent.
 
-    Attached automatically by ``assembly/_parentage.py``'s ``_MARKER`` table for
-    ``ParentSource.UNIT_SOLE``. Declared; fires in step 1.
+    Three emit sites, the same shape as ``PARENT_UNRESOLVED`` above: the
+    ``_MARKER`` table in ``assembly/_parentage.py`` attaches it to every edge
+    built for ``ParentSource.UNIT_SOLE``, and the two tiers that CHOOSE that
+    source name it again at their own slot.
+
+    * ``assembly/_units.py::UnitRegistry._edge`` — ``resolve()``'s sole-live
+      tier, via ``Parentage.with_limitation``. No alias and no live scope, but
+      exactly one SESSION unit is open, so it is taken as the parent at
+      confidence 0.5.
+    * ``adapters/_anthropic_agent_sdk.py::_open_tool_call`` — ``Unit.note`` on
+      the CALL unit, for the tier that answers when no pin reached the
+      in-process handler and exactly one session is live. What that replaces
+      dropped an unattributable handler outright, with no marker; a marked 0.5
+      edge beats unmarked data loss.
     """
 
     CORRELATION_CONFLICT = "correlation_conflict"
     """A framework-id alias and the live context disagreed about the trace.
 
-    Design §5.5. Declared; no emitter — the caller attaches it explicitly via
-    ``Parentage.with_limitation``, which arrives with ``assembly/_units.py``.
+    Design §5.5. Five emit sites, four of them in ``assembly/_units.py`` and all
+    of them the same shape: two answers to one parent question, with the
+    disagreement put on the wire rather than into a counter.
+
+    * ``UnitRegistry._edge`` — ``resolve()``'s precedence ladder — attaches it
+      via ``Parentage.with_limitation`` when an alias resolves into a DIFFERENT
+      trace than the live context. The context wins and the disagreement ships.
+    * ``UnitRegistry.pin_driver`` attaches it to the unit's own span when a pin
+      is declared for a task other than the one calling — a self-consistent lie
+      that no confidence value downstream could reveal.
+    * ``UnitRegistry.open`` and ``UnitRegistry.resolve`` attach it when they
+      REFUSE the scope a CLOSED pin left standing: the opened unit becomes a
+      trace root, or the edge is rebuilt from the remaining tiers, instead of
+      hanging later work off a finished unit at confidence 1.0.
+    * ``adapters/_anthropic_agent_sdk.py::_open_tool_call`` — the only emitter
+      outside the registry — marks the in-process tool span whose edge that same
+      stale pin decided. The pinned session's own span is not reachable: it was
+      materialized and shipped inside the very ``close()`` that made the pin
+      stale, and ``Unit.note()`` on a closed unit is a no-op.
     """
 
     # ------------------------------------------------------------------
@@ -145,14 +197,16 @@ class Limitation(Enum):
     """The seam propagates context, but not with full fidelity — a thread-pool
     tool handler that copies the context at submit time, say.
 
-    Declared; no emitter until the adapter seams of step 6.
+    Declared; no emitter yet. No seam in the SDK can currently tell a
+    partially-copied context from a fully propagated one.
     """
 
     CONTEXT_PROPAGATION_UNAVAILABLE = "context_propagation_unavailable"
     """The seam cannot propagate context at all on this runtime, so every span
     below it is a root.
 
-    Declared; no emitter until step 6.
+    Declared; no emitter yet. Every runtime the SDK supports today propagates
+    a ContextVar across the seams it patches.
     """
 
     # ------------------------------------------------------------------
@@ -161,20 +215,38 @@ class Limitation(Enum):
     # ------------------------------------------------------------------
 
     UNIT_EVICTED = "unit_evicted"
-    """The correlation table hit ``max_units`` and this unit was evicted before
-    the framework closed it.
+    """A unit hit a capacity bound and was evicted before the framework closed
+    it — ``max_units`` in the registry, ``max_sessions`` in the Anthropic
+    adapter's own session table.
 
-    Points at ``max_units`` specifically. Deliberately NOT merged with
-    ``CONNECTION_EVICTED``, which points at ``max_connections``: merging them
-    would send a user to turn the wrong knob. Declared; no emitter until
-    ``assembly/_units.py``.
+    Points at a UNIT bound. Deliberately NOT merged with ``CONNECTION_EVICTED``,
+    which points at ``max_connections``: merging them would send a user to turn
+    the wrong knob.
+
+    Three emit sites. ``assembly/_units.py::UnitRegistry._evict_root_locked``
+    CLOSES the oldest root at ``max_units``, so its span is emitted carrying
+    this marker, and ``adapters/_assembler.py::SessionAssembler._make_room``
+    does the same for ``max_sessions``. The third,
+    ``adapters/_assembler.py::SessionAssembler._resume``, is not an eviction: it
+    puts the marker on the NEW root that continues a run whose predecessor was
+    evicted, which is what turns "a second root appeared from nowhere" into
+    "this run was truncated and resumes here".
+
+    What both of the evictions replace dropped the unit and its root span
+    outright, with no marker and no test, so a workload that crossed a cap
+    simply stopped producing traces (I10).
     """
 
     UNIT_INTERRUPTED = "unit_interrupted"
     """The unit was torn down by cancellation or interpreter shutdown rather
     than by a normal end-of-run.
 
-    Declared; no emitter until ``assembly/_units.py``.
+    Declared; no emitter. The mechanism has landed and the caller has not:
+    ``assembly/_units.py::UnitRegistry.close_all`` takes a ``Limitation`` as its
+    ``reason`` and notes it on every live root before closing it, and this
+    member is one of the two that method is built for. Nothing in the SDK calls
+    ``close_all`` yet, so neither this nor its sibling ``ADAPTER_UNINSTALLED``
+    reaches a span.
     """
 
     CHILD_SPAN_UNCLOSED = "child_span_unclosed"
@@ -182,14 +254,27 @@ class Limitation(Enum):
     instead of by its own completion event, so its ``end_time_ns`` is the
     teardown instant and its status is synthesized.
 
-    Emitted from ``adapters/_assembler.py::SessionAssembler._open_tool``
-    (open-tool table hit ``max_session_entries``) and ``::_finalize`` (session
-    ended with tools still open), both via ``_emit_tool(markers=...)``. Until
-    step 3a rewired those two sites it was the free string
-    ``"tool_span_unclosed"``.
+    Six emit sites across two modules, all of them the same rule: a bound or a
+    teardown CLOSES what it stops tracking, it never drops it.
+
+    In ``assembly/_units.py`` — ``Unit.open_span`` and ``UnitRegistry.open``,
+    when a per-unit table (open drafts, children) hits
+    ``max_entries_per_unit``; and ``UnitRegistry._close_locked``, for both the
+    surviving children and the still-open drafts of a unit being closed. The one
+    thing evicted WITHOUT this marker is an arbitration loser, which is discarded
+    exactly as ``close_span`` would discard it: a bound is a reason to stop
+    tracking a draft, never a reason to promote one ``claim()`` already rejected.
+
+    In ``adapters/_assembler.py`` — ``SessionAssembler._open_tool``, when the
+    open-tool table hits ``max_session_entries``; and ``::_drain_children``, when
+    a session stops being driven with tools still open, which happens either
+    because the transport closed or because the registry evicted the session's
+    root out from under the assembler. Both go through
+    ``_emit_tool(markers=...)``. Before the census rewired the assembler's two
+    sites it was the free string ``"tool_span_unclosed"``.
 
     NOTE (census): the four-way merge that loses nothing. ``tool_span_unclosed``
-    folded into this step-0 member because the marker rides the tool span
+    folded into this already-declared member because the marker rides the tool span
     itself, where ``gen_ai.operation.name=execute_tool`` already says the child
     was a tool. This is the single point where the two drifts overlapped —
     vocabulary without an emitter meeting an emitter without vocabulary — and
@@ -262,7 +347,12 @@ class Limitation(Enum):
     """The framework ran the tool in-process and never exposed a tool-call id,
     so the tool span cannot be joined to the assistant message that requested it.
 
-    Declared; no emitter until step 6.
+    Emitted from ``adapters/_anthropic_agent_sdk.py::_open_tool_call``, on every
+    span an in-process SDK MCP tool produces. The handler is dispatched with
+    ``{name, arguments}`` and nothing else, so the id genuinely does not reach
+    it; the alternative — matching name and arguments against the stream in
+    arrival order — is the framework-identifier heuristic this design exists to
+    remove, and it would be indistinguishable from a real join downstream.
     """
 
     SNAPSHOT_TYPE_UNKNOWN = "snapshot_type_unknown"
@@ -271,24 +361,30 @@ class Limitation(Enum):
 
     Emitted from ``assembly/_snapshot.py::SnapshotDraft.__init__``, when
     ``coerce_snapshot_type`` cannot resolve the value the caller handed
-    ``capture_state_snapshot``. Step 3a closed ``SnapshotType`` and built this
+    ``capture_state_snapshot``. Closing ``SnapshotType`` is what built this
     emitter; before it, an unrecognized type was flattened to ``UNSPECIFIED``
     by ``codec.rs``'s ``map_snap`` with nothing recorded anywhere.
     """
 
     # ------------------------------------------------------------------
-    # Identity ambiguity (§5.4) — the census found no emitter for this one
+    # Identity ambiguity (§5.4)
     # ------------------------------------------------------------------
 
     TOOL_NAME_COLLISION = "tool_name_collision"
     """Two distinct MCP servers exposed tools that sanitize to the same
     CLI-visible name, so the name on this span cannot identify which server ran.
 
-    Design §5.4's V3 correction. Declared; no emitter — the census found none,
-    because the detector is built by step 6 with the rest of
-    ``adapters/anthropic/_names.py``. It is the 37th member and the one that
-    comes from neither step 0 nor the census; §6.5.1 resolves that discrepancy
-    explicitly in favor of declaring it now, since 3b locks value names.
+    Design §5.4's V3 correction. Both emitters are in
+    ``adapters/_anthropic_agent_sdk.py::_open_tool_call``, and both
+    mean "the two observers of this call may not have met on one key":
+
+      * the server's CLI token was never resolved (nothing in any options'
+        ``mcp_servers`` matched this server instance), so the handler keys on the
+        server's own name while the hook keys on the dict key — a key SPLIT,
+        which ``claim()`` cannot arbitrate, so the call is reported twice;
+      * ``CLAUDE_AGENT_SDK_MCP_NO_PREFIX`` is set and two wrapped servers export
+        the same bare name, so the hook cannot attribute its observation at all
+        and stands down — this span is the only record of the call.
     """
 
     # ------------------------------------------------------------------
@@ -317,7 +413,7 @@ class Limitation(Enum):
     """Time-to-first-token is absent on a streamed HTTP/2 response: the seam
     sees DATA frames, not SSE event boundaries.
 
-    Emitted from ``interceptors/_seam.py::ByteSeamInterceptor._emit_span`` when
+    Emitted from ``interceptors/_seam.py::ByteSeamInterceptor._build_span`` when
     a reassembled stream carries core semantics and ``txn.version == "2"``.
     """
 
@@ -325,8 +421,8 @@ class Limitation(Enum):
     """Time-to-first-token was measured at the IPC boundary, not at the wire, so
     it includes subprocess and pipe latency.
 
-    Emitted from ``adapters/_assembler.py::SessionAssembler._emit_chat`` whenever
-    a first-delta timestamp exists for the turn.
+    Emitted from ``adapters/_assembler.py::SessionAssembler._build_chat``
+    whenever a first-delta timestamp exists for the turn.
     """
 
     TRANSPORT_TIMING_UNAVAILABLE_SUBPROCESS = "transport_timing_unavailable_subprocess"
@@ -334,8 +430,16 @@ class Limitation(Enum):
     and wardex observed only the IPC stream.
 
     Emitted from ``adapters/_assembler.py`` as the module constant
-    ``_BASE_LIMITATION``, which rides *every* span the Agent SDK adapter builds
-    — chat, tool, subagent and the root ``invoke_agent``.
+    ``_BASE_LIMITATION``, on the four span classes that module assembles out of
+    the IPC stream and the hook payloads: the root ``invoke_agent``, a sub-agent
+    ``invoke_agent``, ``chat``, and the hook/stream-driven ``execute_tool``.
+
+    The adapter's FIFTH span class does not carry it, and must not. The
+    in-process ``execute_tool`` span opened by
+    ``adapters/_anthropic_agent_sdk.py::_open_tool_call`` brackets a handler
+    wardex wrapped in *this* process, so its duration is measured directly
+    rather than inferred from an IPC stream — attaching the marker there would
+    claim the timing is absent when it is the one timing the adapter owns.
     """
 
     # ------------------------------------------------------------------
@@ -346,8 +450,9 @@ class Limitation(Enum):
     # (BODY_CAP_EXCEEDED, GRPC_MESSAGE_TRUNCATED) are driven by the same
     # `max_body_bytes`, and a fifth limit — `max_ws_frame_bytes` — surfaces
     # under FRAME_PARSE_FAILED rather than here. Each docstring below names the
-    # knob that was MEASURED to drive it; step 3b copies these into the proto
-    # enum comments, so a knob named from memory becomes a wire-visible lie.
+    # knob that was MEASURED to drive it, because these values are what a
+    # dashboard turns into "raise this setting" advice — a knob named from
+    # memory sends the user to a tunable that changes nothing.
     # ------------------------------------------------------------------
 
     BODY_CAP_EXCEEDED = "body_cap_exceeded"
@@ -358,7 +463,7 @@ class Limitation(Enum):
     ``append_capped``. It crosses the PyO3 boundary as
     ``Vec<&'static str>`` (``bindings/python/src/lib.rs``), is read back at
     ``protocol/_http1.py``, and is folded into the span's markers by
-    ``interceptors/_seam.py::ByteSeamInterceptor._emit_span``.
+    ``interceptors/_seam.py::ByteSeamInterceptor._build_span``.
     """
 
     GRPC_MESSAGE_TRUNCATED = "grpc_message_truncated"
@@ -403,8 +508,8 @@ class Limitation(Enum):
     tracker was flushed early, so its span ends at the eviction instant.
 
     Emitted from ``interceptors/_seam.py::ByteSeamInterceptor._state`` via
-    ``_WebSocketTracker.flush(marker)``. Until step 3a rewired that site it was
-    the free string ``ws_evicted``.
+    ``_WebSocketTracker.flush(marker)``. Before the census rewired that site it
+    was the free string ``ws_evicted``.
 
     NOTE (census): renamed, NOT merged into ``UNIT_EVICTED``. Both say
     "something was evicted", but they name different tables and different
@@ -424,8 +529,8 @@ class Limitation(Enum):
     Emitted from ``semantics/_grpc.py::build_grpc_fields`` (gRPC frame
     parse raised; the span falls back to plain h2 fields) and
     ``interceptors/_trackers.py::_WebSocketTracker._build_txn`` (either
-    direction's frame parser latched off). Until step 3a those two sites emitted
-    the free strings ``grpc_parse_failed`` and ``ws_parse_failed``.
+    direction's frame parser latched off). Before the census those two sites
+    emitted the free strings ``grpc_parse_failed`` and ``ws_parse_failed``.
 
     This member carries a LIMIT as well as a bug, which its name does not say:
     a WebSocket frame whose declared payload exceeds ``max_ws_frame_bytes``
@@ -445,7 +550,7 @@ class Limitation(Enum):
     """Framing succeeded but the LLM body parser produced no core semantics and
     no output messages, so the span has transport truth and no gen_ai truth.
 
-    Emitted from ``interceptors/_seam.py::ByteSeamInterceptor._emit_span``.
+    Emitted from ``interceptors/_seam.py::ByteSeamInterceptor._build_span``.
     """
 
     PAYLOAD_COMPRESSED = "payload_compressed"
@@ -455,8 +560,8 @@ class Limitation(Enum):
     Emitted from ``semantics/_grpc.py::build_grpc_fields`` (any request or
     response message had its compressed flag set) and
     ``interceptors/_trackers.py::_WebSocketTracker._build_txn``
-    (permessage-deflate negotiated). Until step 3a those two sites emitted the
-    free strings ``grpc_compressed`` and ``ws_compressed``.
+    (permessage-deflate negotiated). Before the census those two sites emitted
+    the free strings ``grpc_compressed`` and ``ws_compressed``.
 
     NOTE (census): merged. What is lost is which protocol it was —
     ``TransportAttributes.protocol`` already carries that, and encoding a
@@ -467,14 +572,14 @@ class Limitation(Enum):
     """A tool call was found in the response but its arguments were not valid
     JSON, so they are carried as an opaque string.
 
-    Emitted from ``interceptors/_seam.py::ByteSeamInterceptor._emit_span``.
+    Emitted from ``interceptors/_seam.py::ByteSeamInterceptor._build_span``.
     """
 
     OUTPUT_MESSAGES_UNMAPPED_PART = "output_messages_unmapped_part"
     """``gen_ai.output.messages`` was reconstructed with at least one part the
     mapper did not recognize, so the *response* replay is incomplete.
 
-    Emitted from ``interceptors/_seam.py::ByteSeamInterceptor._emit_span``.
+    Emitted from ``interceptors/_seam.py::ByteSeamInterceptor._build_span``.
     Deliberately NOT merged with the input-side marker: in a forensic replay,
     an incomplete response and an incomplete prompt support different
     conclusions.
@@ -484,7 +589,7 @@ class Limitation(Enum):
     """``gen_ai.input.messages`` was reconstructed with at least one part the
     mapper did not recognize, so the *prompt* replay is incomplete.
 
-    Emitted from ``interceptors/_seam.py::ByteSeamInterceptor._emit_span``.
+    Emitted from ``interceptors/_seam.py::ByteSeamInterceptor._build_span``.
     """
 
     # ------------------------------------------------------------------
@@ -495,7 +600,7 @@ class Limitation(Enum):
     """The response body on this span is wardex's reassembly of a token stream,
     not a single response the server sent.
 
-    Emitted from ``interceptors/_seam.py::ByteSeamInterceptor._emit_span`` when
+    Emitted from ``interceptors/_seam.py::ByteSeamInterceptor._build_span`` when
     the semantic parser reports a stream and core semantics were recovered.
     """
 
@@ -503,14 +608,14 @@ class Limitation(Enum):
     """A stream was reassembled but carried no usage block, so output token
     counts are absent rather than zero.
 
-    Emitted from ``interceptors/_seam.py::ByteSeamInterceptor._emit_span``.
+    Emitted from ``interceptors/_seam.py::ByteSeamInterceptor._build_span``.
     """
 
     SSE_UNKNOWN_PROVIDER = "sse_unknown_provider"
     """An SSE stream was detected and reassembled but matched no known provider
     shape, so nothing was mapped out of it.
 
-    Emitted from ``interceptors/_seam.py::ByteSeamInterceptor._emit_span``.
+    Emitted from ``interceptors/_seam.py::ByteSeamInterceptor._build_span``.
     """
 
     # ------------------------------------------------------------------
@@ -521,7 +626,7 @@ class Limitation(Enum):
     """The content type was ``application/grpc-web``, whose framing wardex does
     not parse; the span was left as plain HTTP/2.
 
-    Emitted from ``interceptors/_seam.py::ByteSeamInterceptor._emit_span``.
+    Emitted from ``interceptors/_seam.py::ByteSeamInterceptor._build_span``.
     """
 
     GRPC_STATUS_UNAVAILABLE = "grpc_status_unavailable"
@@ -550,9 +655,9 @@ class Limitation(Enum):
     """The agent session ended without a clean result: an error was raised, or
     teardown arrived with no result message at all.
 
-    Emitted from ``adapters/_assembler.py::SessionAssembler._finalize``, on all
-    three of its terminal branches (result present but errored, no result and an
-    error, no result and no error).
+    Emitted from ``adapters/_assembler.py::SessionAssembler._stamp_root``, on
+    all three of its terminal branches (result present but errored, no result
+    and an error, no result and no error).
     """
 
 
