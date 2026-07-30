@@ -20,6 +20,7 @@ the exception went nowhere anyone reads, and took every buffered span with it.
 
 from __future__ import annotations
 
+import aiohttp
 import httpx
 import pytest
 import requests
@@ -64,19 +65,30 @@ def _span() -> InternalSpan:
 # --------------------------------------------------------------------------
 
 
+def _propagation_targets() -> tuple[tuple[type, str], ...]:
+    """Every attribute `install_propagation()` actually patches — all four.
+
+    Derived from `context/_inject.py` rather than listed by hand, and aiohttp is
+    included rather than skipped: it is installed in this environment, so a
+    wrapper leaking out of a test would be a real leak nobody was watching for.
+    """
+    return (
+        (httpx.Client, "send"),
+        (httpx.AsyncClient, "send"),
+        (requests.Session, "send"),
+        (aiohttp.ClientSession, "_request"),
+    )
+
+
 @pytest.fixture
 def pristine_http_clients():
-    """The three patched attributes as they were, put back whatever happens.
+    """The four patched attributes as they were, put back whatever happens.
 
     Every test here deliberately leaves a foreign patch installed at the point
     it asserts, which is the whole subject; without this the next test in the
     session runs through a wrapper this file wrote.
     """
-    targets = (
-        (httpx.Client, "send"),
-        (httpx.AsyncClient, "send"),
-        (requests.Session, "send"),
-    )
+    targets = _propagation_targets()
     saved = [(cls, name, cls.__dict__[name]) for cls, name in targets]
     try:
         yield
@@ -98,41 +110,54 @@ def _foreign_patch(cls: type, name: str):  # noqa: ANN202
     return wrapper
 
 
-def test_uninstall_leaves_a_foreign_patch_over_wardex_alone(pristine_http_clients):
+@pytest.mark.parametrize(
+    ("cls", "name"),
+    _propagation_targets(),
+    ids=lambda value: value if isinstance(value, str) else value.__name__,
+)
+def test_uninstall_leaves_a_foreign_patch_over_wardex_alone(cls, name, pristine_http_clients):
     """The OpenTelemetry case, which is not hypothetical.
 
     `init()` calls `uninstall_propagation()` on every re-init and `close()`
     calls it too, so the destructive window is not exotic: any host that
     re-inits wardex after its OTel instrumentor is up loses the instrumentor.
 
-    The last two assertions are here rather than in a test of their own because
-    they are only worth anything in this scenario: the three libraries share
-    one module-level PatchSet, so a foreign patch on the FIRST attribute it
-    restores is exactly what would strand wardex's wrappers on the other two
-    for the life of the process.
+    Parametrized over EVERY attribute wardex patches, and that is the point
+    rather than thoroughness for its own sake. Written against `httpx.Client`
+    alone, reverting any of the other three shims to the original bug —
+    unconditional `setattr` on restore — left the whole suite green. The OTel
+    HTTPX instrumentor patches `Client` and `AsyncClient` both, so exactly half
+    of the case this test is named for went unguarded.
+
+    The `untouched` assertions are here rather than in a test of their own
+    because they are only worth anything in this scenario: the four libraries
+    share one module-level PatchSet, so a foreign patch on the attribute it
+    restores FIRST is what would strand wardex's wrappers on the rest for the
+    life of the process.
     """
     untouched = {
-        (httpx.AsyncClient, "send"): httpx.AsyncClient.__dict__["send"],
-        (requests.Session, "send"): requests.Session.__dict__["send"],
+        (other_cls, other_name): other_cls.__dict__[other_name]
+        for other_cls, other_name in _propagation_targets()
+        if (other_cls, other_name) != (cls, name)
     }
-    before = httpx.Client.__dict__["send"]
+    before = cls.__dict__[name]
     install_propagation()
-    assert httpx.Client.__dict__["send"] is not before, "precondition: wardex patched it"
+    assert cls.__dict__[name] is not before, "precondition: wardex patched it"
 
-    otel = _foreign_patch(httpx.Client, "send")
+    otel = _foreign_patch(cls, name)
 
     counters.reset()
     uninstall_propagation()
 
-    assert httpx.Client.__dict__["send"] is otel, (
+    assert cls.__dict__[name] is otel, (
         "wardex destroyed a patch installed after its own and reinstated a "
         "function nobody asked for"
     )
     assert counters.get(_SUPERSEDED) == 1, "the supersession was not recorded anywhere"
-    for (cls, name), original in untouched.items():
-        assert cls.__dict__[name] is original, (
-            f"{cls.__name__}.{name} was left patched — one superseded attribute "
-            "stranded the rest of the set"
+    for (other_cls, other_name), original in untouched.items():
+        assert other_cls.__dict__[other_name] is original, (
+            f"{other_cls.__name__}.{other_name} was left patched — one superseded "
+            "attribute stranded the rest of the set"
         )
 
 

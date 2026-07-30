@@ -164,6 +164,74 @@ def test_uninstall_does_not_destroy_a_second_librarys_patch():
         Transport.write = original
 
 
+class _TransparentProxy:
+    """The shape `wrapt.ObjectProxy` has, and therefore the shape OTel installs.
+
+    Every `opentelemetry-instrumentation-*` package patches through
+    `wrap_function_wrapper`, which installs a `wrapt.FunctionWrapper` — an
+    `ObjectProxy` that forwards `__eq__` to the object it wraps. So a proxy
+    placed OVER wardex's wrapper is a different object that compares EQUAL to
+    it.
+
+    Reproduced here rather than imported: `wrapt` is not a dependency of this
+    SDK, and the property under test is the proxy's equality behaviour, not
+    wrapt's implementation of it.
+    """
+
+    def __init__(self, wrapped: Any) -> None:
+        self.__wrapped__ = wrapped
+
+    def __eq__(self, other: Any) -> bool:
+        return bool(self.__wrapped__ == other)
+
+    def __hash__(self) -> int:
+        return hash(self.__wrapped__)
+
+    def __call__(self, *args: Any, **kwargs: Any) -> str:
+        return "other-library"
+
+
+def test_a_transparent_proxy_over_wardex_is_still_a_supersession():
+    """Identity, not equality — and the whole suite passes if you get it wrong.
+
+    `_restore` asks whether the value in place is still wardex's. Spelled
+    `current != record.wrapper` instead of `is not`, every other test in this
+    file still passes, because they all install a plain function as the second
+    library's patch and `==` on a function degenerates to identity.
+
+    A transparent proxy does not. It compares equal to what it wraps, so under
+    `==` wardex concludes nothing changed, restores the original, and deletes
+    the other library's patch — the exact bug this module exists to remove,
+    against the exact library its own docstring names.
+    """
+    owner = "test.superseded_proxy"
+    original = Transport.write
+    before = counters.get(_superseded_key(owner))
+    patches = PatchSet(owner)
+
+    def wardex_wrapper(self: Any) -> str:
+        return "wardex"
+
+    patches.patch(Transport, "write", wardex_wrapper)
+    instrumented = _TransparentProxy(wardex_wrapper)
+    assert instrumented == wardex_wrapper, "the proxy under test is not transparent"
+    assert instrumented is not wardex_wrapper
+    Transport.write = instrumented  # OTel wraps wardex's wrapper
+
+    patches.restore_all()
+
+    try:
+        assert Transport.write is instrumented, (
+            "wardex's uninstall clobbered an OTel instrumentation wrapper"
+        )
+        assert Transport().write() == "other-library"
+        assert patches.superseded == 1
+        assert patches.limitations() == (Limitation.PATCH_SUPERSEDED,)
+        assert counters.get(_superseded_key(owner)) == before + 1
+    finally:
+        Transport.write = original
+
+
 def test_a_patch_removed_by_someone_else_is_reported_not_reinstated():
     """`del cls.attr` by a third party is supersession too.
 

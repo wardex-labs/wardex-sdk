@@ -479,6 +479,21 @@ def _markerish(name: str | None) -> bool:
     return name is not None and _MARKERISH.search(name) is not None
 
 
+def _defaults(a: ast.arguments):  # noqa: ANN202
+    """Each parameter paired with its default expression, or None.
+
+    Positional defaults align from the RIGHT — `ast.arguments.defaults` covers
+    the last N of `posonlyargs + args` — while `kw_defaults` is 1:1 with
+    `kwonlyargs` and holds None for the ones without. Getting the alignment
+    wrong would attribute a default to the wrong parameter, which is worse than
+    not reading defaults at all.
+    """
+    positional = [*a.posonlyargs, *a.args]
+    padding: list[ast.expr | None] = [None] * (len(positional) - len(a.defaults))
+    yield from zip(positional, [*padding, *a.defaults], strict=True)
+    yield from zip(a.kwonlyargs, a.kw_defaults, strict=True)
+
+
 def _bound_name(node: ast.expr) -> str | None:
     """The identifier a target/operand binds, for `x` and for `self.x` alike."""
     if isinstance(node, ast.Name):
@@ -727,6 +742,15 @@ class _PythonCensus:
                 for i, p in enumerate(positional):
                     if _markerish(p.arg):
                         slot_indices.add(i - offset)
+                # A marker-ish parameter's DEFAULT is a marker slot too, and the
+                # one slot the call-site scan can never reach: a default fires
+                # precisely when no call site supplies an argument. A string
+                # written there — `def add_limitation(self, marker=
+                # "some_marker")` — reaches a span every time the funnel is
+                # called bare, and the whole rest of this scanner is blind to it.
+                for param, default in _defaults(a):
+                    if default is not None and _markerish(param.arg):
+                        self._take(rel, default, [])
 
     def _collect_sinks(self, trees: dict[str, ast.Module]) -> None:
         """R9 — a function handed a marker container is a marker sink.
@@ -866,6 +890,15 @@ _UNRESOLVED_PY: frozenset[tuple[str, str]] = frozenset(
         ("adapters/_assembler.py", "Name:markers"),
         ("adapters/_assembler.py", "Name:sess"),
         ("adapters/_assembler.py", "Name:tool"),
+        # `_emit_tool(..., markers: tuple[Limitation, ...] = ())` — the DEFAULT,
+        # newly visible now that marker-ish parameters have theirs read. The
+        # tuple is empty and so demonstrably holds no marker, but slots are
+        # classified by shape rather than by contents, and a container that
+        # counts itself empty today would count itself empty after someone put
+        # a member in it. Recorded rather than special-cased, which is the
+        # conservative direction: a spurious hole is noise, a missing one is a
+        # marker nothing in this file can see.
+        ("adapters/_assembler.py", "Tuple"),
         # every one below is a marker CONTAINER being passed along, or a
         # marker-typed PARAMETER being forwarded, not a marker
         ("assembly/_builder.py", "Attribute:markers"),
@@ -967,9 +1000,55 @@ exactly this list.
 # string literal — `push(SOME_CONST)` — is recorded as unresolved rather than
 # passed over, for the same reason the Python half records its holes.
 
+#: The BORROWED spelling, which every marker channel uses today. Distinctive
+#: enough to be the discovery key on its own: `Vec<&'static str>` in this
+#: codebase is a marker channel and nothing else, so any NAME declared with it
+#: is scanned, including one nobody anticipated.
 _RUST_VEC_TYPE = r"Vec\s*<\s*&\s*(?:'static\s+)?str\s*>"
+#: The OWNED spelling, which none uses YET — and that "yet" is the hole. A
+#: marker vector that ever needs to build a string at runtime becomes
+#: `Vec<String>`; keyed on the borrowed form alone this scanner would not see
+#: the declaration, the name would not enter `receivers`, and the mutation regex
+#: would never look at the vector. The anti-blindness backstop below reads the
+#: same declarations, so it would go quiet in the same instant — the exact
+#: coupling that guard's docstring says it was designed to avoid.
+#:
+#: Gated on a marker-ish NAME, and that is a measured decision rather than a
+#: cautious one. Accepting every `Vec<String>` drags in seven declarations that
+#: are not marker channels at all — `data_lines` in the SSE parser, `into_vec`
+#: in the semantic parser, `key`, `items`, `unmapped` — and each would have to
+#: be recorded in `_RUST_VEC_DECLARATIONS` as though it carried markers. That
+#: does not merely add noise: the table's worth is that an entry MEANS
+#: something, and one full of unrelated vectors teaches the next reader to wave
+#: the new entry through, which is how a real channel gets recorded and ignored.
+#:
+#: The residual is stated rather than papered over: an owned marker vector whose
+#: name contains neither "marker" nor "limitation" is still invisible. The name
+#: rule is a pattern and not the identifier `limitations`, so it is not the
+#: circularity the backstop forbids — but it is not the type rule's coverage
+#: either, and a channel named for what it carries is the only thing keeping it.
+_RUST_OWNED_VEC_TYPE = r"Vec\s*<\s*String\s*>"
 _RUST_BINDING_DECL = re.compile(r"\b([A-Za-z_]\w*)\s*:\s*" + _RUST_VEC_TYPE)
 _RUST_FN_DECL = re.compile(r"\bfn\s+([A-Za-z_]\w*)\s*\([^)]*\)\s*->\s*" + _RUST_VEC_TYPE)
+_RUST_OWNED_BINDING_DECL = re.compile(r"\b([A-Za-z_]\w*)\s*:\s*" + _RUST_OWNED_VEC_TYPE)
+_RUST_OWNED_FN_DECL = re.compile(
+    r"\bfn\s+([A-Za-z_]\w*)\s*\([^)]*\)\s*->\s*" + _RUST_OWNED_VEC_TYPE
+)
+
+
+def _rust_declared_names(text: str) -> set[str]:
+    """Every marker-vector name declared in one Rust source file.
+
+    Two rules, deliberately asymmetric — see `_RUST_OWNED_VEC_TYPE` for why the
+    owned form is gated on the name and the borrowed form is not.
+    """
+    names = {m.group(1) for m in _RUST_BINDING_DECL.finditer(text)}
+    names |= {m.group(1) for m in _RUST_FN_DECL.finditer(text)}
+    for pattern in (_RUST_OWNED_BINDING_DECL, _RUST_OWNED_FN_DECL):
+        names |= {m.group(1) for m in pattern.finditer(text) if _markerish(m.group(1))}
+    return names
+
+
 _RUST_MUTATORS = r"(?:push|insert|extend|extend_from_slice|append)"
 _RUST_DISABLED = re.compile(
     r"(?:Disabled|Fail)\s*\(\s*\"([^\"]*)\"" r"|disabled_reason\s*=\s*Some\s*\(\s*\"([^\"]*)\""
@@ -1031,8 +1110,7 @@ class _RustCensus:
 
         # pass 1 — where is a marker vector declared, and what is it called?
         for rel, text in texts.items():
-            names = {m.group(1) for m in _RUST_BINDING_DECL.finditer(text)}
-            names |= {m.group(1) for m in _RUST_FN_DECL.finditer(text)}
+            names = _rust_declared_names(text)
             if names:
                 self.declarations[rel] = names
                 self.receivers |= names
@@ -1320,6 +1398,70 @@ def test_the_marker_vector_is_declared_only_where_recorded(rust_census: _RustCen
         "the receiver names the mutation regex looks for are derived from the "
         "declarations above; deriving nothing would make the Rust scan vacuous"
     )
+
+
+@pytest.mark.parametrize(
+    ("declaration", "expected"),
+    [
+        ("    limitations: Vec<&'static str>,", "limitations"),
+        ("    limitations: Vec<&str>,", "limitations"),
+        ("    limitations: Vec<String>,", "limitations"),
+        ("    limitations : Vec< String >,", "limitations"),
+        ("    markers: Vec<String>,", "markers"),
+        ("    fn limitations(&self) -> Vec<&'static str> {", "limitations"),
+        ("    fn limitations(&self) -> Vec<String> {", "limitations"),
+    ],
+)
+def test_an_owned_marker_vector_is_still_a_marker_vector(declaration, expected):
+    """Getting this wrong silences the scan AND its own backstop, together.
+
+    Everything downstream hangs off recognizing the declaration: an unrecognized
+    one never enters `receivers`, so the mutation regex — whose receiver names
+    are DERIVED from the declarations — never looks at the vector at all. And
+    `test_the_marker_vector_is_declared_only_where_recorded`, the guard whose
+    job is to notice a channel nobody recorded, reads the same declarations, so
+    it reports a clean census in the same instant.
+
+    Two guards going blind on one edit is the coupling that guard's docstring
+    says it was designed to avoid. It survived only because every marker vector
+    in the tree happens to borrow its strings today — the moment one needs to
+    build a marker at runtime it becomes `Vec<String>` and both go quiet.
+    """
+    assert _rust_declared_names(declaration) == {expected}
+
+
+@pytest.mark.parametrize(
+    "declaration",
+    [
+        "    data_lines: Vec<String>,",
+        "    into_vec: Vec<String>,",
+        "    pii_disabled: Vec<String>,",
+        "    fn key(&self) -> Vec<String> {",
+    ],
+)
+def test_an_ordinary_string_vector_is_not_mistaken_for_a_marker_channel(declaration):
+    """The other half of the same decision, and the reason it is a decision.
+
+    `Vec<String>` is an ordinary Rust type; the tree holds seven of them that
+    carry no markers. Accepting every one would force each into
+    `_RUST_VEC_DECLARATIONS` as though it were a marker channel — and a table
+    whose entries mostly mean nothing teaches the next reader to add the next
+    entry without looking, which is how a real channel gets recorded and
+    ignored. Every declaration here is a real one from `crates/`.
+    """
+    assert _rust_declared_names(declaration) == set()
+
+
+def test_an_owned_marker_is_still_extracted_as_a_literal():
+    """`push("x".to_string())` and `push(String::from("x"))` must yield `x`.
+
+    Widening the type regex is worth nothing if the literal inside the owned
+    construction is then unreadable — the vector would be scanned, every
+    mutation of it would resolve to no literal, and each one would land in
+    `unresolved` instead of being censused.
+    """
+    for expression in ('"body_cap_exceeded".to_string()', 'String::from("body_cap_exceeded")'):
+        assert _RUST_STR.findall(expression) == ["body_cap_exceeded"], expression
 
 
 def test_rust_markers_are_all_literals(rust_census: _RustCensus) -> None:
