@@ -38,6 +38,9 @@ wardex.close()  # optional — spans auto-flush every 5s, on buffer threshold, a
 - Zero-instrumentation capture of LLM HTTP calls (OpenAI, Anthropic) over
   `https`, cleartext `http`, and h2c
 - `gen_ai` semantics: model, tokens, parameters, finish reasons, input/output messages
+- Failed provider calls (429 rate limits, 401s, 5xx) are captured with the same
+  `gen_ai` identity and content as successful ones — only the response-side
+  fields are empty
 - Transport metrics (TCP/TLS timing, TTFT), gRPC (grpclib), WebSocket (`wss`), MCP stdio
 - Export to any OpenTelemetry backend via `OtlpHttpTransport`
 - Manual span decorators: `@workflow` / `@agent` / `@task` / `@tool` / `@span`
@@ -161,6 +164,10 @@ traffic is only captured while it happens inside an active *local* wardex
 span (a `traceparent` received from an upstream caller doesn't count on its
 own — this keeps a service mesh stamping every request with a traceparent
 from reviving the pre-Phase-4 "capture everything" noise).
+
+A recognized provider's **failed** calls count as LLM-semantic traffic too, so
+a 429 or a 401 is captured under the default mode even outside a local span —
+the response status decides the span's `status`, never whether it exists.
 
 This means a bare, unwrapped call to an LLM provider wardex doesn't
 recognize (or a WS-based provider such as OpenAI Realtime, which carries no

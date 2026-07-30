@@ -37,7 +37,13 @@ from ..assembly import (
     should_capture,
 )
 from ..protocol import parse_llm_semantics
-from ..semantics import build_gen_ai, build_grpc_fields, has_core_semantics, ws_close_name
+from ..semantics import (
+    build_gen_ai,
+    build_grpc_fields,
+    has_core_semantics,
+    identifies_llm_call,
+    ws_close_name,
+)
 from ._base import InterceptorInterface
 from ._trackers import _Txn, _WebSocketTracker
 
@@ -48,6 +54,33 @@ if TYPE_CHECKING:
 # Bodies are recorded, and their PII is masked later — in the Rust core, at encode
 # time (`codec.encode_otlp_traces` takes the mode and the disabled categories), not
 # here.
+
+
+def _http_error(txn: Any) -> bool:
+    """Did the peer answer with a 4xx/5xx? Absent status reads as success."""
+    return not 200 <= getattr(txn, "status", 200) < 400
+
+
+def _is_llm_traffic(txn: Any, sem: Any) -> bool:
+    """Is this an LLM call, for the capture policy and for the gen_ai block alike?
+
+    One predicate for both questions on purpose: a transaction the gate admits
+    as agent traffic and then leaves with `gen_ai=None` is worse than either
+    answer alone — captured volume with no identity on it.
+
+    The request-side half is admitted only for an HTTP ERROR, and that is the
+    narrow reading rather than the tidy one. Both provider gates in the Rust
+    parser are SUBSTRING matches on host and path, so an internal service at
+    `anthropic-proxy.corp/v1/messages` whose body happens to carry a `model`
+    field parses as an Anthropic chat call. On a 2xx that shape is genuinely
+    ambiguous — it may be an LLM endpoint wardex cannot read, or not an LLM
+    endpoint at all — and it is already dropped today, so admitting it would be
+    a behaviour change nobody asked for on traffic nobody identified. A 4xx/5xx
+    from a host and path that parse as a provider is not ambiguous in the same
+    way: the request was addressed to a chat endpoint with a model on it, and
+    the reply is the provider refusing. That is the call the fix is about.
+    """
+    return has_core_semantics(sem) or (_http_error(txn) and identifies_llm_call(sem))
 
 
 class _ConnectionState:
@@ -160,7 +193,7 @@ class ByteSeamInterceptor(InterceptorInterface):
             return should_capture(
                 capture_mode_of(self._client),
                 parent=getattr(txn, "parent", None),
-                agent_semantic=sem is not None and has_core_semantics(sem),
+                agent_semantic=sem is not None and _is_llm_traffic(txn, sem),
             )
         except Exception:
             return True  # losing data is worse than noise (design §5.1)
@@ -382,17 +415,35 @@ class ByteSeamInterceptor(InterceptorInterface):
                 if sem.decoded_response is not None:
                     output_data = bytes(sem.decoded_response)
                 streamed = bool(getattr(sem, "reassembled_from_stream", False))
-                if has_core_semantics(sem):
+                # The same predicate the capture gate used. Asking a different
+                # question here is what produced a span the policy admitted as
+                # agent traffic and then shipped with `gen_ai=None`.
+                identified = _is_llm_traffic(txn, sem)
+                if identified:
                     draft.set_gen_ai(build_gen_ai(sem))
-                    if streamed:
+                if streamed:
+                    # Keyed on `streamed` rather than on the response having
+                    # yielded semantics: a reassembled stream is reassembled
+                    # whatever came back, and hanging these off the identity
+                    # test makes a known provider's usage-less stream stop
+                    # saying it was reassembled at all.
+                    if identified:
                         draft.add_limitation(Limitation.REASSEMBLED_FROM_STREAM)
                         if sem.output_tokens is None:
                             draft.add_limitation(Limitation.STREAM_USAGE_UNAVAILABLE)
                         if txn.version == "2":
                             draft.add_limitation(Limitation.TTFT_UNAVAILABLE_H2)
-                elif streamed:
-                    draft.add_limitation(Limitation.SSE_UNKNOWN_PROVIDER)
-                else:
+                    else:
+                        draft.add_limitation(Limitation.SSE_UNKNOWN_PROVIDER)
+                elif not has_core_semantics(sem) and status_code is StatusCode.OK:
+                    # Narrowed to a SUCCESSFUL response the parser could not
+                    # read. A 4xx/5xx body is an error envelope; the parse did
+                    # not fail, so claiming it did sent every rate limit and
+                    # every auth failure out under a marker that says "wardex
+                    # could not understand this" when the truth — already on the
+                    # span as `status=ERROR` and `error.type` — is that the
+                    # provider refused.
+                    #
                     # No need for semantic_parse_failed if tool_calls extraction succeeded.
                     if sem.output_messages is None:
                         draft.add_limitation(Limitation.SEMANTIC_PARSE_FAILED)

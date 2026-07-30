@@ -31,11 +31,19 @@ one.
 `__all__` is the four mappings the byte seam asks for, and deliberately nothing
 else:
 
-  `build_gen_ai` / `has_core_semantics` — the gen_ai pair, exported together
-  because the second is the gate on the first. A parse result carrying neither a
-  response model nor a token count is not agent traffic, and the capture policy
-  asks that question BEFORE any attribute is built; splitting them would let a
-  caller build attributes for something the policy would have dropped.
+  `build_gen_ai` / `has_core_semantics` / `identifies_llm_call` — the gen_ai
+  trio, exported together because the last two are the gate on the first, and
+  the capture policy asks the same question BEFORE any attribute is built;
+  splitting them would let a caller build attributes for something the policy
+  would have dropped.
+
+  The two gates are not interchangeable and the split is the point.
+  `has_core_semantics` asks what the RESPONSE yielded — a model, a token count.
+  `identifies_llm_call` asks what the REQUEST already established — provider,
+  operation, model. A call the provider refused answers the second and not the
+  first, and it is exactly as much an LLM call as one that succeeded. Collapsing
+  them into a single predicate is how the refusal came to be treated as
+  uninterpretable traffic.
 
   `build_grpc_fields` — the gRPC branch, the one with enough protocol logic to
   be worth testing on its own.
@@ -50,7 +58,7 @@ the lookup and none of the fallback, so the mapping is the export and the table
 is not.
 """
 
-from ._genai import build_gen_ai, has_core_semantics
+from ._genai import build_gen_ai, has_core_semantics, identifies_llm_call
 from ._grpc import build_grpc_fields
 from ._ws import ws_close_name
 
@@ -58,5 +66,6 @@ __all__ = [
     "build_gen_ai",
     "build_grpc_fields",
     "has_core_semantics",
+    "identifies_llm_call",
     "ws_close_name",
 ]

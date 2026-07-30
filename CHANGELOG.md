@@ -228,6 +228,31 @@ All notable changes to this project are documented here. The format follows
   says. Nothing changes for a `capture_mode` set to a `CaptureMode` member.
 
 ### Fixed
+- A call the provider **refused** — a 429 rate limit, a 401, a 5xx — lost the
+  identity its own request had already established. `gen_ai.provider.name`,
+  `gen_ai.operation.name`, `gen_ai.request.model` and the request parameters
+  were all dropped, and the span was marked `semantic_parse_failed`, which was
+  false: the body parsed correctly and was an error envelope. Worse, the same
+  predicate fed the capture policy, so under the default `capture_mode="agent"`
+  a rate-limited call outside a wardex span produced **no span at all** — the
+  call an operator goes looking for was the one guaranteed to be missing.
+  The two questions are now separate: whether the RESPONSE yielded gen_ai truth
+  (tokens, a response model) and whether the REQUEST identified an LLM call
+  (provider, operation, model). A refusal answers the second, so it is now
+  captured and carries the same gen_ai block and the same
+  `gen_ai.input.messages` a successful call carries — **a behaviour change**:
+  the response status used to decide, silently, both whether a span existed and
+  what it could hold, and one prompt was therefore exported on success and
+  dropped on failure. Response-side fields stay empty, including
+  `gen_ai.output.type`, which the parser sets unconditionally and which would
+  otherwise claim the call produced text. `semantic_parse_failed` now means
+  what it says: a SUCCESSFUL response wardex could not read.
+  Two limits on the fix, both deliberate. Only a 4xx/5xx is admitted this way —
+  the provider gates in the parser are substring matches on host and path, so a
+  200 from an internal service at an `anthropic`-ish host is genuinely
+  ambiguous and stays dropped exactly as before. And a proxied or self-hosted
+  endpoint is still invisible: the parser classifies on the response body, and
+  an error envelope carries none of the markers it recognizes.
 - An agent run still in flight when the process stopped exported **nothing**.
   A session's root span is created by its close, so a run that never reached
   one left no span at all — not a truncated one, not a marked one, and no
