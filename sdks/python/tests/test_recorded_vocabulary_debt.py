@@ -1,11 +1,12 @@
-"""Vocabulary gaps step 3a deliberately does NOT close, pinned as live assertions.
+"""Vocabulary gaps the SDK deliberately does NOT close, pinned as live assertions.
 
 A deferral that lives only in a comment is a deferral the next reader has no way
 to learn about, and a deferral nothing asserts is one a later change can close —
 or widen — without anybody noticing. Each test below states a known-wrong
-behaviour, names the step §11 assigns it to, and fails the moment that behaviour
-changes. That is the point: the fix is *forced* to come here and rewrite the
-assertion, so closing the gap is a visible edit rather than a silent one.
+behaviour, names what has to land before it can be fixed, and fails the moment
+that behaviour changes. That is the point: the fix is *forced* to come here and
+rewrite the assertion, so closing the gap is a visible edit rather than a silent
+one.
 
 None of these is a bug report. Each is a decision, recorded where a decision can
 be checked.
@@ -74,15 +75,15 @@ def test_a_manual_span_may_still_name_an_operation_outside_the_vocabulary(client
     grouping by that key unbounded cardinality on the one axis §6.2 says is
     bounded.
 
-    Not closed in 3a, and the reason is not oversight: closing it changes what a
+    Not closed, and the reason is not oversight: closing it changes what a
     published setter accepts, and §6.5 tier 1's declaration mechanism
-    (`FRAMEWORK_EXTRAS`, where the unmapped original would go) arrives in step 8.
-    Rejecting the string before there is anywhere to put it would delete the
-    user's span to enforce a namespace wardex has not yet given them a way to
-    declare — the same trade `_check_extra` already refuses to make for
+    (`FRAMEWORK_EXTRAS`, where the unmapped original would go) does not exist
+    yet. Rejecting the string before there is anywhere to put it would delete
+    the user's span to enforce a namespace wardex has not yet given them a way
+    to declare — the same trade `_check_extra` already refuses to make for
     `set_attribute`.
 
-    When step 8 closes this, that step rewrites this test.
+    Whatever lands `FRAMEWORK_EXTRAS` rewrites this test.
     """
     with manual_span("custom") as s:
         s.operation = "my_custom_operation"
@@ -93,7 +94,7 @@ def test_a_manual_span_may_still_name_an_operation_outside_the_vocabulary(client
 
 # --------------------------------------------------------------------------
 # 2. The adapter root ships the MODEL ID as the agent name — retired by the
-#    adapter rewrite (§11 step 7b/8).
+#    Anthropic adapter rewrite.
 # --------------------------------------------------------------------------
 
 
@@ -105,9 +106,10 @@ def test_the_adapter_root_still_reports_the_model_as_the_agent_name(client):
     grouping `invoke_agent` spans by agent name renders `claude-sonnet-5` as an
     agent, and a session whose model changes mid-run renders as two agents.
 
-    Left as-is in 3a because §11 keeps 3a's span FIELDS identical, and this is a
-    field a dashboard groups by: changing it silently re-partitions existing
-    charts. It rides the adapter rewrite with the rest of the Anthropic
+    Left as-is because the extraction that moved these sites onto `assembly/`
+    deliberately kept every span FIELD identical, and this is a field a
+    dashboard groups by: changing it silently re-partitions existing charts.
+    It rides the adapter rewrite with the rest of the Anthropic
     semantics, where the root also gains the `gen_ai` block the model belongs in
     — moving the value with nowhere to move it TO would just lose it.
     """
@@ -134,7 +136,8 @@ def test_the_adapter_root_still_reports_the_model_as_the_agent_name(client):
 
 # --------------------------------------------------------------------------
 # 3. The ENCODE direction of `LinkReason` still flattens an unmapped string —
-#    retired by step 3b (design R11).
+#    retired by giving `LinkReason` the unmapped value `Limitation` already has
+#    (design R11).
 # --------------------------------------------------------------------------
 
 
@@ -161,9 +164,11 @@ def test_an_unmapped_link_reason_is_still_dropped_on_encode():
 
     `map_link_reason` returns UNSPECIFIED for a string it does not know, with no
     breadcrumb — so a reason that came from outside the SDK arrives on the wire
-    indistinguishable from no reason at all. Design R11 defers exactly this class
-    of fix to 3b, where an unmapped value gets `*_VOCABULARY_UNMAPPED` plus the
-    original preserved in `extra`.
+    indistinguishable from no reason at all. Design R11 names the fix, and
+    `Limitation` already has it: an unrecognized marker becomes
+    `LIMITATION_VOCABULARY_UNMAPPED` with the original preserved in
+    `extra["wardex.limitation.unmapped"]`. `LinkReason` has no such value in
+    `common.proto`, so adding one is a further schema change.
 
     The hole is bounded meanwhile, and this test says how: only a caller reaching
     past `SpanDraft.add_link` (which takes the enum) can produce one, i.e. a

@@ -27,7 +27,7 @@ from ._enums import (
 
 if TYPE_CHECKING:
     # Vocabulary that this module ANNOTATES but does not own. Three fields below
-    # were free-form strings until step 3b closed them; the members now live
+    # were free-form strings until the wire schema closed them; the members live
     # where the vocabulary is defined and enforced, which is one layer up.
     #
     # The import is deliberately type-only, and not to dodge a lint. `assembly`
@@ -221,7 +221,7 @@ class CaptureIntegrity:
     redacted: bool = False
     truncated: bool = False
     dropped_chunk_count: int = 0
-    # CLOSED as of step 3b. This was `tuple[str, ...]`, and the example the old
+    # CLOSED on the wire. This was `tuple[str, ...]`, and the example the old
     # comment gave — "tls_inner_only" — had never actually been emitted by
     # anything: a free-form field invented a marker to describe itself. On the
     # wire it is `repeated Limitation limitation_codes`.
@@ -239,7 +239,7 @@ class CorrelationInfo:
     attempt_id: str | None = None
     active_span_id_at_capture: SpanId | None = None
     confidence: float = 1.0  # 0.0~1.0
-    # CLOSED as of step 3b, and narrowed to ONE question: how was the parent
+    # CLOSED on the wire, and narrowed to ONE question: how was the parent
     # edge derived. The old comment listed `socket|timing|manual`, none of which
     # were ever produced, next to `adapter_hook`/`adapter_stream`, which were —
     # and those answered a different question ("which source observed this"),
@@ -262,7 +262,7 @@ class InternalSpanEvent:
 class InternalSpanLink:
     trace_id: TraceId
     span_id: SpanId
-    # CLOSED as of step 3b. A link is CAUSALITY where the parent edge is
+    # CLOSED on the wire. A link is CAUSALITY where the parent edge is
     # CONTAINMENT, and `handoff_from` is what tells a renderer to draw a sibling
     # instead of nesting — so an unrecognized reason degrading to "no reason"
     # silently rebuilds the flame graph the link exists to prevent.

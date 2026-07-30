@@ -1,4 +1,4 @@
-"""The two vocabularies step 3b put on the wire — design §6.5.1, §6.6, §6.7.
+"""The two closed vocabularies on the wire — design §6.5.1, §6.6, §6.7.
 
 `CaptureIntegrity.limitations` and `CorrelationInfo.strategy` were free-form
 strings. They are now `repeated Limitation limitation_codes` and

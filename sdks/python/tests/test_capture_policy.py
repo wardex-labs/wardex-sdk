@@ -1,7 +1,7 @@
-"""Migration step 2 (design §11): "capture this?" has one implementation.
+"""The capture gate has ONE implementation — `assembly.should_capture`.
 
-Before this step the question had three answers. `ByteSeamInterceptor` asked
-the design §5.1 policy. `RawSocketInterceptor` OVERRODE that method with a
+The question used to have three answers. `ByteSeamInterceptor` asked the
+design §5.1 policy. `RawSocketInterceptor` OVERRODE that method with a
 different predicate of the same name. `_mcp_stdio` never asked. The copies had
 drifted, and the drift was not theoretical — the override never learned about
 `CaptureMode.ALL`, and it replaced the local-parent clause instead of composing

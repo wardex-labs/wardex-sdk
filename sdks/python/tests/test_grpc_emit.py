@@ -66,7 +66,7 @@ def test_compressed_marker():
     txn = _txn(0, req=_msg(b"abc", compressed=1))
     _, _, _, _, lims = build_grpc_fields(txn, _BASE, ())
     # Census rename (design §6.5.1): grpc_compressed -> PAYLOAD_COMPRESSED, and
-    # markers are Limitation members rather than free strings since step 3a.
+    # markers are Limitation members rather than free strings.
     assert Limitation.PAYLOAD_COMPRESSED in lims
 
 

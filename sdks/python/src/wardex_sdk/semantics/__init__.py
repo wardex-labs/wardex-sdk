@@ -23,8 +23,10 @@ otherwise would be worse than the swallow itself, because it is the sentence a
 reviewer would trust instead of looking. It is counted, not waved through —
 `tests/test_import_graph.py` scopes its silent-swallow ratchet over this package
 and budgets `semantics/_grpc.py` at exactly one. Converting it to
-`assembly._diag.guard` is a behaviour change, so it belongs to the step that
-converts the rest of them rather than to a move.
+`assembly._diag.guard` is a behaviour change — the swallow starts counting and,
+in debug, starts printing — so it belongs with the sweep that converts every
+remaining bare `except` in the SDK, not with a move that only relocated this
+one.
 
 `__all__` is the four mappings the byte seam asks for, and deliberately nothing
 else:

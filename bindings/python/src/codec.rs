@@ -496,7 +496,7 @@ fn correlation_to_proto(c: &Bound<PyAny>) -> PyResult<pb::CorrelationInfo> {
 /// Lifted out of `state_to_proto` so `vocabulary_tables()` can pin it beside
 /// the other three registry enums. An unrecognized value still becomes
 /// UNSPECIFIED here, but it can no longer arrive unnoticed: `SnapshotType` is
-/// closed on the Python side as of step 3a, and `SnapshotDraft` attaches
+/// closed on the Python side too, and `SnapshotDraft` attaches
 /// `Limitation.SNAPSHOT_TYPE_UNKNOWN` at the point of coercion instead of
 /// letting this function flatten it in silence.
 fn map_snapshot_type(v: &str) -> i32 {
@@ -665,9 +665,10 @@ fn events_to_proto(sp: &Bound<PyAny>, out: &mut Vec<pb::SpanEvent>) -> PyResult<
 
 /// `InternalSpan.links` -> `Span.links` (tag 11), including `reason` (tag 4).
 ///
-/// `reason` is a `LinkReason` on the wire but a `str | None` on the Python
-/// dataclass, which is the same shape `CaptureIntegrity.limitations` has and
-/// for the same reason: retyping the Python side is step 3b's break, not 3a's.
+/// `reason` is a closed `LinkReason` on the wire, and this boundary accepts it
+/// either as that member or as its bare value string — the same duck-typed
+/// shape `CaptureIntegrity.limitations` crosses on, so a host that hand-builds
+/// an `InternalSpanLink` is not forced to import the enum.
 /// The mapping is one-way lossy by construction — an unrecognized reason
 /// becomes UNSPECIFIED — and that is bounded by `LinkReason` being closed and
 /// `SpanDraft.add_link` taking the enum, so no caller inside the SDK can
@@ -877,8 +878,8 @@ fn span_to_dict(py: Python<'_>, sp: &pb::Span) -> PyResult<PyObject> {
         // The wardex value string, not the raw i32 the rest of this function
         // still hands back for enums. A number is not a vocabulary: a consumer
         // reading `2` has to hold a copy of the enum to know what it means,
-        // which is the drift §6.6 exists to prevent. (Doing the same for the
-        // other enums here is step 3b's, where the fields change type anyway.)
+        // which is the drift §6.6 exists to prevent. (The other enums here
+        // still hand back numbers; converting them is separate work.)
         ld.set_item("reason", link_reason_name(ln.reason))?;
         ld.set_item("attributes", kv_to_py(py, &ln.attributes)?)?;
         links.append(ld)?;
@@ -1465,7 +1466,7 @@ fn vocabulary_tables(py: Python<'_>) -> PyResult<PyObject> {
     }
     out.set_item("SnapshotType", snaps)?;
 
-    // The two vocabularies step 3b moved onto the wire, exposed the OTHER way
+    // The two closed vocabularies that live on the wire, exposed the OTHER way
     // round — number → name, walking the schema rather than a list written
     // here. A table keyed by hand would only prove that this file agrees with
     // itself; walking the numbers lets a Python test compare the SCHEMA against

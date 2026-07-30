@@ -1,7 +1,8 @@
-"""Unit tests for the assembly core landed by migration step 0 — design §4.1, §7.6.
+"""Unit tests for the parentage core itself — design §4.1, §7.6.
 
-Nothing in the SDK calls this code yet; these tests are what makes step 0 a
-landing rather than a deposit. The one that matters most is
+Every other parentage test in this suite drives a real emit site; these drive
+`resolve_parentage` / `child_of` directly, so a rule can be pinned without a
+seam in the way. The one that matters most is
 `test_framework_ids_do_not_change_the_edge`: it is the in-the-small form of
 conformance C-3, the product claim that the causal tree comes from in-process
 context propagation and never from a framework's identifiers.
@@ -59,10 +60,10 @@ def test_no_ambient_parent_starts_a_declared_trace_root():
     assert p.correlation.strategy is ParentSource.TRACE_ROOT
     assert p.correlation.confidence == 1.0
     # wardex does not head-sample, so a trace it ORIGINATES is sampled (V9).
-    # This is the value `_w3c.format_traceparent` hardcodes as `-01` today; step
-    # 1 deletes that hardcode and reads the field, and if this is 0 then every
-    # wardex-rooted trace goes out `-00` and every downstream OTel service on the
-    # default ParentBased(ALWAYS_ON) sampler silently stops recording.
+    # `_w3c.format_traceparent` used to hardcode `-01`; it reads this field now,
+    # so if this is 0 then every wardex-rooted trace goes out `-00` and every
+    # downstream OTel service on the default ParentBased(ALWAYS_ON) sampler
+    # silently stops recording.
     assert p.trace_flags == 1
 
 

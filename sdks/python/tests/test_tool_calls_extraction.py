@@ -116,7 +116,7 @@ def test_tool_call_extracted_to_output_messages():
 
 
 def test_text_response_has_output_messages_with_text_part():
-    # After Task 1-3: text responses are also included in output_messages as a TextPart.
+    # A text-only response is still reported: it appears in output_messages as a TextPart.
     httpd, url = _server(_TEXT_RESP)
     try:
         wardex.init(transport=ConsoleTransport(), intercept=True)

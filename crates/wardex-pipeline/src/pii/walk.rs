@@ -217,9 +217,10 @@ fn mask_span(engine: &PiiEngine, span: &mut pb::Span) {
             span_id: _,
             attributes,
             // A closed enum cannot carry PII by construction, and there is no
-            // regex to run over an i32. This is the same disposition step 3b
-            // gives `CaptureIntegrity.limitations` when it stops being
-            // `repeated string` — see design §6.5.1's "what Rust must receive".
+            // regex to run over an i32. This is the same disposition
+            // `CaptureIntegrity.limitations` gets now that it is a repeated
+            // closed enum rather than `repeated string` — see design §6.5.1's
+            // "what Rust must receive".
             reason: _,
         } = link;
         hit |= mask_kvs(engine, attributes);
@@ -269,8 +270,8 @@ fn mask_span(engine: &PiiEngine, span: &mut pb::Span) {
         hit |= mask_string(engine, attempt_id);
     }
     // `CaptureIntegrity` is deliberately NOT destructured any more. Every one
-    // of its fields is a bool, an i32 or — as of step 3b — a repeated closed
-    // enum; none can carry PII, so masking it was work with no possible effect.
+    // of its fields is a bool, an i32 or a repeated closed enum; none can carry
+    // PII, so masking it was work with no possible effect.
     // Note the ordering that survives: `redacted` is still written below from
     // `hit`, and it has to stay after every other field has been scanned.
     if hit {

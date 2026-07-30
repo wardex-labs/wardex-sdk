@@ -63,13 +63,13 @@ class SpanKind(Enum):
 class OperationName(Enum):
     """CLOSED at twelve — design §6.2. The `operation` half of a span name.
 
-    The three added by migration step 3a (`EXECUTE_STEP`, `HANDOFF`,
-    `EVALUATE`) each cover a concept at least two surveyed frameworks have and
-    no existing member can hold honestly: a graph node is not an agent and not
-    a tool; an agent transition needs to be a span or every dashboard needs a
-    special case for it; a guardrail/judge already has `EvaluationAttributes`
-    and needed only a span kind. There is no fourth — protocol variants are
-    attributes (`ToolExecutionType.IPC`), never new operations.
+    The three newest members (`EXECUTE_STEP`, `HANDOFF`, `EVALUATE`) each cover a
+    concept at least two surveyed frameworks have and no existing member can hold
+    honestly: a graph node is not an agent and not a tool; an agent transition
+    needs to be a span or every dashboard needs a special case for it; a
+    guardrail/judge already has `EvaluationAttributes` and needed only a span
+    kind. There is no fourth — protocol variants are attributes
+    (`ToolExecutionType.IPC`), never new operations.
     """
 
     CHAT = "chat"
@@ -126,7 +126,7 @@ class AgentType(Enum):
 class ToolExecutionType(Enum):
     """How the tool body actually ran — design §6.2.
 
-    `IPC` and `UNKNOWN` are step 3a's additions and they exist for the same
+    `IPC` and `UNKNOWN` are the newest members and they exist for the same
     reason: the two values this enum had forced a guess. Every adapter tool span
     said `NETWORK`, which is false for an MCP call over a subprocess pipe (that
     is `IPC`) and unknowable for a CLI's built-in tools, whose implementation

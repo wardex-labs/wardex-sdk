@@ -12,9 +12,10 @@ catching `Exception` already lets them through; frameworks that signal control
 flow with an ordinary Exception subclass (LangGraph's `GraphBubbleUp`) declare
 it once via the adapter's `IGNORED_EXCEPTIONS` and pass it as `ignored=`.
 
-Step 0 of the migration (design §11) lands this module with no callers. The
-existing swallows in `adapters/` and `interceptors/` move onto it in later
-steps; `parser_disable_log` (design §3.2) moves here with the seam extraction.
+Not every swallow in the SDK has moved onto this yet; the remaining ones in
+`adapters/` and `interceptors/` are counted by `tests/test_import_graph.py` as
+a ratchet that only goes down. `parser_disable_log` (design §3.2) moves here
+with the seam extraction.
 """
 
 from __future__ import annotations
@@ -36,10 +37,10 @@ class Counters:
     `where` is a stable, low-cardinality label naming the site — not a message.
     "adapters.anthropic.on_hook", not f"failed to parse {payload}". The table is
     therefore bounded by the number of guarded sites in the SDK (I10). That
-    bound is a convention today, not a mechanism: giving it a real cap sourced
-    from `crates/wardex-limits` waits for the limit field that migration step 6
-    adds (design §6.5, V10), because a Python literal here is exactly the drift
-    `test_limits.py` forbids.
+    bound is a convention today, not a mechanism: giving it a real cap means
+    adding the field to `crates/wardex-limits` first (design §6.5, V10),
+    because a Python literal here is exactly the drift `test_limits.py`
+    forbids.
 
     Reentrancy: an RLock, because a guarded block can be interrupted by a signal
     handler that runs wardex code (`_lifecycle.py` installs one) and re-enters
@@ -132,9 +133,9 @@ class guard:  # noqa: N801 — a context manager reads as a verb at the call sit
     and reentrant, because it holds no per-entry state.
 
     Why a `__slots__` class and not the `@contextmanager` generator design §7.6
-    sketches: this is the SDK's single sanctioned swallow, so migration step 9
-    puts it on paths that run per response chunk (`interceptors/_seam.py:194` is
-    inside `on_response_bytes`, once per SSE chunk). A generator context manager
+    sketches: this is the SDK's single sanctioned swallow, so it ends up on
+    paths that run per response chunk (`interceptors/_seam.py:194` is inside
+    `on_response_bytes`, once per SSE chunk). A generator context manager
     allocates a generator, a `_GeneratorContextManager` and a frame per entry,
     and pays `__enter__`/`next`/`__exit__`/`StopIteration`: measured 539ns here,
     against 15ns for the bare `try` it is replacing. This shape measures ~150ns

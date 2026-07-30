@@ -102,7 +102,7 @@ class _Txn:
 
 
 class _Http1Tracker:
-    """HTTP/1.1 — per-direction parser + single-slot latch (unchanged from Slice 1 behavior)."""
+    """HTTP/1.1 — per-direction parser + single-slot latch."""
 
     def __init__(self, limits: object | None = None) -> None:
         self._req = Http1RequestParser(limits)
@@ -227,7 +227,10 @@ class _Http2Tracker:
     def __init__(self, limits: object | None = None) -> None:
         self._conn = Http2Parser(limits)
         # stream_id -> (active span at request time, request start ns)
-        # TODO: evict stale entries for streams that closed without a response (Phase 3 close hook)
+        # TODO: evict stale entries for streams that closed without a response.
+        # `_mk` pops on every transaction, so the only leak is a stream that ends
+        # without one; closing it needs a connection-close hook the seam does not
+        # expose yet.
         self._latch: dict[int, tuple[SpanContext | None, int]] = {}
 
     def on_request_bytes(self, data: bytes) -> list[_Txn]:
@@ -268,10 +271,10 @@ class _Http2Tracker:
             parent=parent,
             start_ns=start,
             end_ns=now,
-            ttfb_ms=0.0,  # per-h2-stream first-byte not tracked (limitation, Phase 4)
+            ttfb_ms=0.0,  # per-h2-stream first-byte not tracked (limitation)
             truncated=t.truncated,
             version="2",
-            ttft_ms=0.0,  # per-h2-stream first-body-byte not tracked (limitation, Phase 4)
+            ttft_ms=0.0,  # per-h2-stream first-body-byte not tracked (limitation)
             content_type=getattr(t, "content_type", None),
             grpc_status=getattr(t, "grpc_status", None),
             grpc_message=getattr(t, "grpc_message", None),

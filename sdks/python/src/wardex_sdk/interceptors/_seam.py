@@ -44,8 +44,10 @@ from ._trackers import _Txn, _WebSocketTracker
 if TYPE_CHECKING:
     from .._client import Client
 
-# Headers are parsed but intentionally not recorded on the span (secret protection);
-# PII masking is Phase 3.
+# Headers are parsed but intentionally not recorded on the span (secret protection).
+# Bodies are recorded, and their PII is masked later — in the Rust core, at encode
+# time (`codec.encode_otlp_traces` takes the mode and the disabled categories), not
+# here.
 
 
 class _ConnectionState:
@@ -530,7 +532,9 @@ def _latched(txn: _Txn) -> Ambient:
     `conversation` and `tracestate` are None because the tracker latches neither
     today; that is exactly the pre-existing behaviour (the seam never set
     `InternalSpan.conversation`), and widening the latch to a full `Ambient`
-    belongs with the seam decomposition (design §3.3), not with this step.
+    belongs with the seam decomposition (design §3.3) — it is a change to what
+    the tracker captures at request time, not to how this function shapes what
+    it already captured.
     """
     return Ambient(span_context=txn.parent, conversation=None, tracestate=None)
 

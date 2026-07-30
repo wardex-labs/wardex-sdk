@@ -220,8 +220,7 @@ def _begin(
     # held one, a remote parent is re-labelled `header` by the core, and no
     # parent at all means this span deliberately roots a new trace. Manual spans
     # and adapter spans agree on all three because they ask the same function —
-    # and since step 3a they also build the same object through the same
-    # constructor.
+    # and they also build the same object through the same constructor (I5).
     parentage = resolve_parentage(latch_ambient())
     draft = SpanDraft.manual(
         parentage,
@@ -263,8 +262,8 @@ def trace(
     """Opens a top-level trace session and yields a SpanBuilder.
 
     ``op`` is applied to the builder immediately and serialized as ``gen_ai.operation.name``.
-    ``tags`` is included in the signature for public API stability, but Scope -> Span tag
-    application is not implemented in Phase 1 and will be wired up in a later stage.
+    ``tags`` is accepted for public API stability and nothing reads it: no scope tag
+    reaches the span, so passing tags here changes nothing about what is exported.
     """
     conversation = ConversationContext(conversation_id=str(uuid.uuid4()))
     scope = _hub.get_current_scope()

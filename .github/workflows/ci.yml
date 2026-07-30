@@ -43,9 +43,9 @@ jobs:
         run: buf lint
       # `buf.yaml` has declared `breaking: use: [FILE]` all along with nothing
       # running it. This is what makes an unintended `wardex.v1` change fail the
-      # build — and therefore what makes the DELIBERATE break in migration step
-      # 3b a decision (it will need an explicit `ignore_only` in buf.yaml, which
-      # lives in the commit) rather than an accident nobody notices.
+      # build — and therefore what makes a deliberate one a decision, since
+      # landing it requires an explicit `ignore_only` entry in `buf.yaml` in the
+      # same commit, rather than an accident nobody notices.
       #
       # The baseline is the state the branch had BEFORE this event, NOT `HEAD~1`.
       # `HEAD~1` is correct only when the event carries exactly one commit: for a

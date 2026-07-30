@@ -1,4 +1,4 @@
-"""Phase 4b — continue_trace / get_traceparent / get_trace_headers."""
+"""continue_trace / get_traceparent / get_trace_headers."""
 
 import wardex_sdk
 from wardex_sdk import _hub

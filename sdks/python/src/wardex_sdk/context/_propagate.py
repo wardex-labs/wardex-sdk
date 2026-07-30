@@ -1,4 +1,4 @@
-"""Trace continuation and header emission (Phase 4b).
+"""Trace continuation and header emission.
 
 continue_trace/get_traceparent are the universal escape hatch: the baton is
 just a string, so manual propagation works over any channel that carries

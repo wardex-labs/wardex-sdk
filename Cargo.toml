@@ -34,21 +34,21 @@ zstd          = "0.13"
 # Python FFI
 pyo3          = { version = "0.22", features = ["extension-module", "abi3-py310"] }
 
-# HTTP/1 parsing (Phase 2)
+# HTTP/1 parsing
 httparse      = "1"
 
-# HTTP/2 HPACK decode (Phase 2 Slice 2)
+# HTTP/2 HPACK decode
 fluke-hpack   = "0.3"
 
-# JSON serialization (Phase 2 semantic parsing)
+# JSON serialization (semantic parsing) + response body decompression
 serde         = { version = "1", features = ["derive"] }
 serde_json    = "1"
 flate2        = "1"
 
-# PII masking (Phase 3) — linear-time regex engine, no backtracking
+# PII masking — linear-time regex engine, no backtracking
 regex         = "1"
 
-# Test tooling (used from Phase 1+; Phase 0 only registers the dependency)
+# Test tooling — snapshot assertions
 insta         = "1"
 
 # Shared resource limits

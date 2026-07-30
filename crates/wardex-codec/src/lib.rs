@@ -1,6 +1,7 @@
 //! Wardex codec — Protobuf encoding + Zstd compression.
 //!
-//! Phase 0 scaffold: expose proto types only. Actual encode/compress functions land in Phase 7.
+//! `proto` re-exports the generated wire types; `encode_envelope`/`decode_envelope`
+//! are the round trip over them, and `otlp` maps an envelope onto OTLP.
 
 pub mod proto {
     pub mod wardex {

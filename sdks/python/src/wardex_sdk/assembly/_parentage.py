@@ -11,10 +11,10 @@ the span; there is deliberately no function here that turns one into a
 `SpanContext`. Replace every framework id in a workload with a fresh UUID and
 the tree must come out the same shape (conformance C-3).
 
-Migration status (design §11): step 1 has landed, so all six parentage sites —
-`_seam._emit_span`, `_seam._emit_ws`, `_mcp_stdio._build_mcp_span`, the Agent
-SDK assembler, `_tracing._begin` and `capture_state_snapshot` — now get their
-edge from `resolve_parentage()` or `child_of()`. There is no second answer left
+All six parentage sites — `_seam._emit_span`, `_seam._emit_ws`,
+`_mcp_stdio._build_mcp_span`, the Agent SDK assembler, `_tracing._begin` and
+`capture_state_snapshot` — get their edge from `resolve_parentage()` or
+`child_of()`, and nowhere else (I1). There is no second answer left
 in the SDK: `tests/test_import_graph.py` asserts a single `TraceId.generate()`
 call site as a hard rule rather than a budget.
 """
@@ -229,8 +229,8 @@ def resolve_parentage(ambient: Ambient, evidence: Evidence = AMBIENT) -> Parenta
             # SAMPLED. wardex does not head-sample -- retention is decided later
             # by the RetentionClassifier -- so a trace wardex ORIGINATES is by
             # definition sampled, which is what `_w3c.format_traceparent` has
-            # always emitted (its hardcoded `-01`). Setting it here is what lets
-            # step 1 delete that hardcode: once origination says 1, a `0` on the
+            # always emitted (its hardcoded `-01`). Setting it here is what let
+            # that hardcode go: once origination says 1, a `0` on the
             # wire unambiguously means "an upstream told us -00" and we may
             # honour it. Shipping 0 here instead would make every wardex-rooted
             # trace emit `-00`, and every downstream OTel service on the default
@@ -238,7 +238,7 @@ def resolve_parentage(ambient: Ambient, evidence: Evidence = AMBIENT) -> Parenta
             # NOTE: design §4.1 (line 332) writes 0 here; the V9 resolution
             # (line 1577) says wardex-originated traces emit 01. The doc
             # contradicts itself and 1 is the resolution it reached. Correct the
-            # snippet before step 1 copies the other value.
+            # snippet, not this line.
             trace_flags=1,
             tracestate=ambient.tracestate,
             conversation=ambient.conversation,
@@ -246,7 +246,7 @@ def resolve_parentage(ambient: Ambient, evidence: Evidence = AMBIENT) -> Parenta
             correlation=CorrelationInfo(
                 # The MEMBER, not `src.value`. Unwrapping here was left over
                 # from when the field was a free-form string, and it made the
-                # step-3b retype a lie on the one path that produces almost
+                # closed retype a lie on the one path that produces almost
                 # every span: `isinstance(strategy, ParentSource)` was False
                 # everywhere, so the closed vocabulary bought nothing and an
                 # assertion written in the member form failed while the old

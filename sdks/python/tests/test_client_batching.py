@@ -47,7 +47,8 @@ def _span(name="s"):
 
 
 def test_concurrent_capture_and_drain_loses_nothing():
-    """The core regression guard of this slice (spec §11): no loss, no dup."""
+    """The core regression guard for the background flusher (spec §11): no loss,
+    no dup."""
     t = _Recording()
     c = Client(WardexConfig(api_key="k", limits=CaptureLimits(max_buffer_spans=100_000)), t)
     n_threads, m_spans = 8, 500
@@ -79,7 +80,7 @@ def test_concurrent_capture_and_drain_loses_nothing():
 def test_backpressure_drops_oldest_keeps_newest():
     t = _Recording()
     c = Client(WardexConfig(api_key="k", limits=CaptureLimits(max_buffer_spans=10)), t)
-    # This test predates the background worker (Task 3) and asserts on the
+    # This test predates the background worker and asserts on the
     # *manual* flush()'s view of a single overflow burst. With max_buffer_spans=10
     # the wake threshold is max(1, 10 // 4) = 2, so the live worker can (and, on
     # this machine, reliably does) race the tight capture loop and drain part of
@@ -101,7 +102,7 @@ def test_dropped_count_reported_once_in_debug(capsys):
     t = _Recording()
     c = Client(WardexConfig(api_key="k", limits=CaptureLimits(max_buffer_spans=2), debug=True), t)
     # max_buffer_spans=2 gives a wake threshold of max(1, 2 // 4) = 1, so the
-    # live worker (Task 4) would race this tight burst and drain early,
+    # live worker would race this tight burst and drain early,
     # splitting the "dropped 3" report. Stop it so only the explicit flush()
     # below drains (see test_backpressure_drops_oldest_keeps_newest for the
     # same reasoning).
@@ -167,7 +168,7 @@ def test_capture_during_export_goes_to_fresh_buffer():
 
 
 def test_auto_flush_without_manual_flush():
-    """The reason this slice exists: data leaves with no flush() call."""
+    """The reason the background flusher exists: data leaves with no flush() call."""
     t = _Recording()
     c = Client(WardexConfig(api_key="k", flush_interval=0.05), t)
     c.capture_span(_span())

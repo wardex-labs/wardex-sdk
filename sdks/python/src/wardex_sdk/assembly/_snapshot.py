@@ -3,12 +3,13 @@
 The sixth emit site, and the one every proposal forgot. `capture_state_snapshot`
 is a published API that writes a record naming a span, with a trace id, a span
 id and an attribute bag — which is to say it makes every decision a span makes
-and made all of them somewhere else. Before migration step 1 it made one of them
-by returning silently when no parent existed, so a snapshot taken outside a span
-was not degraded, marked or counted: it did not happen.
+and made all of them somewhere else. It used to make one of them by returning
+silently when no parent existed, so a snapshot taken outside a span was not
+degraded, marked or counted: it did not happen.
 
-This module finishes the job step 1 started. `SnapshotDraft` is to
-`InternalStateSnapshot` what `SpanDraft` is to `InternalSpan`, and it absorbs
+Routing it through `resolve_parentage()` fixed the edge; this module finishes
+the rest of the job. `SnapshotDraft` is to `InternalStateSnapshot` what
+`SpanDraft` is to `InternalSpan`, and it absorbs
 the ad-hoc path `__init__.py` was carrying inline — the orphan marker, the
 `wardex.limitations` attribute key it rides on, and the caller-key collision
 rule that keeps that key from shipping twice.
@@ -23,10 +24,10 @@ Two things are closed here that were open:
     takes a `str`, so nothing a caller writes today stops working.
 
   * the marker carrier. `InternalStateSnapshot` has no `limitations` field —
-    giving it one is a `state.proto` change and 3a is additive on the wire — so
-    markers ride the opaque kv under `wardex.limitations`, exactly as step 1
-    left them, but now via a draft that owns the key instead of a module
-    constant that had to explain itself to the census scanner.
+    giving it one is a `state.proto` change this extraction deliberately did
+    not make — so markers still ride the opaque kv under `wardex.limitations`,
+    but now via a draft that owns the key instead of a module constant that had
+    to explain itself to the census scanner.
 """
 
 from __future__ import annotations

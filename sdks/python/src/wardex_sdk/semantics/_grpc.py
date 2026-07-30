@@ -42,7 +42,7 @@ def build_grpc_fields(
     that marker, so the name and the marker cannot disagree about whether this
     was gRPC.
 
-    Markers are `Limitation` members as of step 3a, and two of these values
+    Markers are `Limitation` members, not free strings, and two of these values
     changed name on the way in (§6.5.1): `grpc_parse_failed` became
     `FRAME_PARSE_FAILED` because a WebSocket framing failure is the same fact,
     and `grpc_compressed` became `PAYLOAD_COMPRESSED` because

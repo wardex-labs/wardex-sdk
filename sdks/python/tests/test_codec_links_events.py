@@ -1,10 +1,11 @@
 """`Span.events` (tag 10) and `Span.links` (tag 11) — the encoder that was missing.
 
 `bindings/python/src/codec.rs` contained zero occurrences of `links` or `events`
-before migration step 3a. Both fields were declared in `span.proto` and neither
-was ever filled, so `_types.py`'s `events` and `links` tuples were dropped whole
-at encode — and with them `InternalSpanLink.reason`, which made `LinkReason` dead
-vocabulary and design §6.3's entire graph model impossible to transmit:
+until `events_to_proto` and `links_to_proto` were written. Both fields were declared
+in `span.proto` and neither was filled, so `_types.py`'s `events` and `links` tuples
+were dropped whole at encode — and with them `InternalSpanLink.reason`, which made
+`LinkReason` dead vocabulary and design §6.3's entire graph model impossible to
+transmit:
 
   * `TRIGGERED_BY` is how a conditional branch in a graph is represented at all
     (the edge that actually fired, which the wire cannot show);
@@ -150,7 +151,7 @@ def test_a_span_with_neither_still_round_trips():
 def test_links_and_events_survive_the_pii_pass():
     """PII masking destructures `SpanLink` exhaustively, so a new field forces a
     decision there. `reason` is a closed enum and cannot carry PII — the same
-    disposition step 3b gives `CaptureIntegrity.limitations`."""
+    disposition `CaptureIntegrity.limitations` gets."""
     span = _span(
         links=(InternalSpanLink(_OTHER_TRACE, _OTHER_SPAN, LinkReason.HANDOFF_FROM),),
         events=(

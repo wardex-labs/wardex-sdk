@@ -1,4 +1,4 @@
-"""`assembly.PatchSet` — the SDK's one patch mechanism (migration step 5).
+"""`assembly.PatchSet` — the SDK's one patch mechanism.
 
 Every test here is named for a way the SDK used to break the host application,
 because that is what the module replaced. The five hand-rolled patch dictionaries

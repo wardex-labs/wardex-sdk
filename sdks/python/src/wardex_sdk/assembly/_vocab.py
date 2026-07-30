@@ -38,7 +38,7 @@ one of the three kinds of span this SDK emits:
   which is recorded as `gen_ai.operation.name` exactly as before; what it does
   NOT do is trigger the structural requirement, because wardex cannot supply a
   typed block the host never handed it. Closing that gap means changing the
-  decorator signatures, which is a public API change and not step 3a's.
+  decorator signatures, which is a public API change this layer cannot make.
 
 `SpanDraft` names its mode at construction, so a site cannot slide from one to
 another by accident, and `tests/test_vocabulary.py` pins all three.
@@ -170,12 +170,12 @@ class LinkReason(Enum):
     A link is CAUSALITY; the parent edge is CONTAINMENT. Mixing them renders a
     flat sequence as N-deep nesting and makes every parent duration a lie.
 
-    Dead vocabulary until the encoder exists: `bindings/python/src/codec.rs`
+    This enum is only half of the feature: `bindings/python/src/codec.rs`
     carried no `links`/`events` handling at all, so `InternalSpanLink.reason`
     was dropped at encode and the whole graph story of §6.3 — `TRIGGERED_BY`
     edges, `HANDOFF_FROM` siblings, `RESUMED_FROM` across a checkpoint — could
-    not be transmitted. Step 3a writes that encoder in the same commit that
-    declares this enum, because either half alone is theatre.
+    not be transmitted. The encoder landed in the same commit that declared
+    this enum, because either half alone is theatre.
     """
 
     TRIGGERED_BY = "triggered_by"  # a graph edge: the step that scheduled this one
@@ -270,9 +270,9 @@ def is_declared_extra_key(key: str) -> bool:
     """Whether `key` may be written onto an SDK-assembled span.
 
     Per-adapter `FRAMEWORK_EXTRAS` (exact keys plus declared prefixes under
-    `wardex.{adapter}.*`, design §6.5) narrow this further and arrive with the
-    adapter contract in step 8. Until then a `wardex.*` key is accepted on the
-    strength of its namespace alone.
+    `wardex.{adapter}.*`, design §6.5) would narrow this further, but no
+    adapter declares one yet, so a `wardex.*` key is accepted on the strength
+    of its namespace alone.
     """
     return key.startswith(DECLARED_EXTRA_PREFIXES)
 

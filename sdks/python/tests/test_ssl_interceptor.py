@@ -232,7 +232,7 @@ class _DebugRecordingClient:
 
 def test_disabled_reason_logged_once_per_connection_in_debug(capsys):
     # Pure non-HTTP traffic (Redis/Mongo/Kafka-over-TLS) no longer reaches the
-    # parser at all — the seam gate (this task) stops it first, before
+    # parser at all — the seam gate stops it first, before
     # anything is fed to the tracker. See
     # test_non_http_tls_traffic_produces_no_log below for that property.
     #
@@ -358,7 +358,7 @@ def test_latch_stays_http_once_open(fake_ssl_socket, bare_ssl_interceptor):
 def test_latch_stays_ignore_once_closed(fake_ssl_socket, bare_ssl_interceptor):
     """Once classified "ignore" (non-HTTP), later bytes that happen to look
     like an HTTP method must not re-arm the gate. This is the direction that
-    matters for the OOM path this task closes: a Redis/Mongo/Kafka-over-TLS
+    matters for the OOM path the latch closes: a Redis/Mongo/Kafka-over-TLS
     connection latched off must stay off for its whole life, or a coincidental
     later payload resembling a method line would let it start streaming into
     the parser again."""

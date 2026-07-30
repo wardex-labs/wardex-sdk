@@ -17,9 +17,9 @@ KEY = _FIXTURES / "key.pem"
 
 @pytest.fixture(autouse=True)
 def _close_hub_client_after_test():
-    """Join the background worker thread (Task 4, Slice C) any test may have started.
+    """Join the background worker thread any test may have started.
 
-    Client now always spawns a daemon "wardex-batch-worker" thread on
+    A Client always spawns a daemon "wardex-batch-worker" thread on
     construction. Many tests across the suite reach the SDK through
     `wardex_sdk.init()`/`_hub.set_client()` and predate that thread; they were
     never written to call `close()` because there was previously nothing to

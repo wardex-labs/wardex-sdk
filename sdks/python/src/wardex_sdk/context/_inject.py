@@ -1,4 +1,4 @@
-"""Opt-in W3C header injection into HTTP client libraries (Phase 4b).
+"""Opt-in W3C header injection into HTTP client libraries.
 
 The byte seam stays observe-only forever; this module is the single place
 wardex mutates user traffic, and only when propagate_trace=True. Everything

@@ -35,7 +35,7 @@ def test_close_emits_span_with_counts_and_sample():
 def test_flush_emits_with_no_close_marker():
     t = _WebSocketTracker(path="/x", deflate=True, parent=None, start_ns=1)
     t.on_request_bytes(_frame(True, 0x1, b"hi"))
-    # `ws_markers` carries Limitation MEMBERS since step 3a, not free strings:
+    # `ws_markers` carries Limitation MEMBERS, not free strings:
     # the tracker is where `ws_compressed` and `ws_parse_failed` were produced,
     # and both are pre-rename spellings that SpanDraft.finish() would reject.
     out = t.flush(Limitation.WS_NO_CLOSE)

@@ -1,17 +1,17 @@
-"""Migration step 3a: no CLASS of span disappeared when the six emit sites were
-routed through `assembly.SpanDraft`.
+"""No CLASS of span disappeared when the six emit sites were routed through
+`assembly.SpanDraft`.
 
 **Why this file exists, precisely.** `SpanDraft.finish()` raises
 `VocabularyError` on a vocabulary breach, and every emit site builds inside
 `assembly._diag.guard()` because I6 forbids that exception reaching the host.
 The two together mean a breach does not warn, does not log at default settings
 and does not produce a partial span: it DELETES the span and increments a
-counter. A green test suite is therefore not proof that 3a preserved anything —
-a suite that never asserts on a given span class would stay green while that
-class vanished entirely. Design §6.5.1 is the same argument written as a
-prerequisite: merged against the 15-member `Limitation` enum step 0 landed, 3a
-would have silently deleted every gRPC span, every streaming chat span, every
-WebSocket span and every Agent-SDK adapter span.
+counter. A green test suite is therefore not proof that the routing preserved
+anything — a suite that never asserts on a given span class would stay green
+while that class vanished entirely. Design §6.5.1 is the same argument written
+as a prerequisite: routed against the 15-member `Limitation` enum that predated
+the census, this would have silently deleted every gRPC span, every streaming
+chat span, every WebSocket span and every Agent-SDK adapter span.
 
 So each test below drives one span class through the REAL path and asserts two
 things:
@@ -310,7 +310,8 @@ def test_http2_error_response_span_survives(client):
 
 
 # --------------------------------------------------------------------------
-# 3. gRPC — the class §6.5.1 names first among the ones 3a could have deleted
+# 3. gRPC — the class §6.5.1 names first among the ones the routing could have
+#    deleted
 # --------------------------------------------------------------------------
 
 
@@ -357,9 +358,9 @@ def test_grpc_frame_parse_failure_still_emits_a_span(client):
     """The fallback branch, which is a different construction path.
 
     A gRPC body wardex cannot frame falls back to plain h2 fields plus
-    FRAME_PARSE_FAILED, and the span's NAME follows the same decision — 3a is
-    where those two could have disagreed, because the name is now built by the
-    grammar and the marker by the vocabulary.
+    FRAME_PARSE_FAILED, and the span's NAME follows the same decision — this is
+    where those two could disagree, because the name is built by the grammar
+    and the marker by the vocabulary.
     """
     from hpack import Encoder
 
@@ -495,9 +496,9 @@ def test_mcp_stdio_tool_call_span_survives(client):
 def test_mcp_stdio_error_span_survives_and_gains_an_error_type(client):
     """`status=ERROR` with no `error_type` is what `finish()` refuses.
 
-    This span shipped exactly that pair, so it is one of the two places 3a had
-    to supply a type or delete the span. The type is derived from the JSON-RPC
-    error code rather than invented.
+    This span shipped exactly that pair, so it is one of the two places the
+    routing had to supply a type or delete the span. The type is derived from
+    the JSON-RPC error code rather than invented.
     """
     state = _ProcState(debug=True)
     state.feed_request(b'{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"t"}}\n')
@@ -797,7 +798,7 @@ def test_snapshot_survives_and_carries_its_orphan_marker(client):
 
 
 def test_snapshot_with_an_unknown_type_degrades_instead_of_disappearing(client):
-    """`SnapshotType` is closed as of 3a. An unrecognized value used to be
+    """`SnapshotType` is a closed vocabulary. An unrecognized value used to be
     flattened to UNSPECIFIED inside `codec.rs` with nothing recorded."""
     with trace("session"):
         wardex_sdk.capture_state_snapshot(snapshot_type="not_a_type")

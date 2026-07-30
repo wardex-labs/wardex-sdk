@@ -1,8 +1,8 @@
 """MCP stdio (JSON-RPC 2.0) interceptor — correlation core.
 
 Parses subprocess stdin (request) / stdout (response) bytes as JSON-RPC and correlates
-them by id to assemble CLIENT spans. Hooking (the anyio patch) lives in the interceptor
-class in the same file (Task 4).
+them by id to assemble CLIENT spans. Hooking (the anyio patch) lives in
+`McpStdioInterceptor`, further down this same file.
 """
 
 from __future__ import annotations
@@ -215,7 +215,8 @@ def _build_mcp_span(p: _Pending, resp: Any) -> InternalSpan:
     # calling a `ping` an `execute_tool` would be a vocabulary lie for the sake
     # of a table row. The tool SEMANTICS are still attached when the method
     # really is `tools/call`; promoting the span to the tool intent belongs with
-    # the units work that also gives it the tool's own parentage (step 6).
+    # the work that routes this seam through `assembly.UnitRegistry`, which is
+    # what would also give the call its own parentage instead of the ambient.
     draft = SpanDraft.transport(
         parentage,
         label=TransportLabel.MCP,
