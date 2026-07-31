@@ -1310,3 +1310,93 @@ def test_the_registry_lock_must_stay_reentrant():
 
     assert done == [True], "close_all did not return — the lock is no longer reentrant"
     assert len(sink.drafts) == 1
+
+
+# ==========================================================================
+# owner — whose unit is it, once one registry serves several adapters
+# ==========================================================================
+
+
+def test_sole_live_without_an_owner_answers_about_the_whole_process():
+    """Today's meaning, pinned so the filter cannot change it by accident."""
+    reg = registry()
+    a = open_session(reg, "a")
+
+    assert reg.sole_live(UnitKind.SESSION) is a
+
+    open_session(reg, "b")
+    assert reg.sole_live(UnitKind.SESSION) is None
+
+
+def test_sole_live_filters_to_one_adapters_units():
+    """The whole reason the filter exists.
+
+    "Exactly one SESSION is live" is a question about the PROCESS, and once two
+    frameworks share a registry the answer stops being about the asker. Two live
+    runs make the unfiltered question give up; filtered, each adapter still sees
+    its own.
+    """
+    reg = registry()
+    mine = open_session(reg, "mine", owner="anthropic")
+    theirs = open_session(reg, "theirs", owner="langgraph")
+
+    assert reg.sole_live(UnitKind.SESSION) is None
+    assert reg.sole_live(UnitKind.SESSION, owner="anthropic") is mine
+    assert reg.sole_live(UnitKind.SESSION, owner="langgraph") is theirs
+
+
+def test_an_unowned_unit_matches_no_owner_rather_than_every_owner():
+    """The direction an omitted owner degrades in, and it is not the tidy one.
+
+    Treating `owner is None` as "matches anything" would hand an adapter a unit
+    nobody said was its own — and this method's caller stamps that guess at 0.5
+    and ships it. Guessing across an unstated boundary is precisely what the
+    filter exists to stop, so it may not be how the filter fails open.
+    """
+    reg = registry()
+    open_session(reg, "unowned")
+
+    assert reg.sole_live(UnitKind.SESSION) is not None, "unfiltered still sees it"
+    assert reg.sole_live(UnitKind.SESSION, owner="anthropic") is None
+
+
+def test_close_all_with_an_owner_leaves_another_adapters_run_alone():
+    """An Anthropic uninstall must not end a LangGraph run that is still driven."""
+    sink = RecordingSink()
+    reg = registry(sink=sink)
+    mine = open_session(reg, "mine", owner="anthropic")
+    theirs = open_session(reg, "theirs", owner="langgraph")
+
+    reg.close_all(reason=Limitation.ADAPTER_UNINSTALLED, owner="anthropic")
+
+    assert not mine.is_live
+    assert theirs.is_live
+    assert len(sink.drafts) == 1
+
+
+def test_close_all_with_an_owner_terminates_when_the_first_root_is_not_its_own():
+    """`while self._roots` was correct only while the loop emptied the table.
+
+    With a filter it does not: the first root may be one this call must NOT
+    close, and `while` would take it again on every pass. A hang, not a wrong
+    answer — and one that only appears once a second adapter exists, which is
+    after the code shipped.
+    """
+    sink = RecordingSink()
+    reg = registry(sink=sink)
+    first = open_session(reg, "theirs", owner="langgraph")  # inserted FIRST
+    second = open_session(reg, "mine", owner="anthropic")
+
+    done: list[bool] = []
+
+    def drive():
+        reg.close_all(reason=Limitation.ADAPTER_UNINSTALLED, owner="anthropic")
+        done.append(True)
+
+    thread = threading.Thread(target=drive, daemon=True)
+    thread.start()
+    thread.join(timeout=5.0)
+
+    assert done == [True], "close_all did not return — the owner filter spins"
+    assert first.is_live
+    assert not second.is_live

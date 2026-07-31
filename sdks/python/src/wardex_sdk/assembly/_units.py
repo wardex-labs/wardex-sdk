@@ -342,6 +342,7 @@ class Unit:
         "conversation",
         "key",
         "kind",
+        "owner",
         "parent",
         "parentage",
         "start_ns",
@@ -360,10 +361,16 @@ class Unit:
         tracestate: str | None,
         start_ns: int,
         parent: Unit | None,
+        owner: str | None = None,
     ) -> None:
         self._registry = registry
         self.key = key
         self.kind = kind
+        #: Which adapter opened this unit, once one process-wide registry serves
+        #: several. None means "not stated", and every lookup that filters on it
+        #: treats None as matching nothing rather than everything — an
+        #: unattributed unit must not be handed to an adapter as its own.
+        self.owner = owner
         self._draft = draft
         self.parentage = parentage
         self.conversation = conversation
@@ -896,8 +903,14 @@ class UnitRegistry:
         parent_unit: Unit | None = None,
         aliases: Sequence[UnitKey] = (),
         start_ns: int | None = None,
+        owner: str | None = None,
     ) -> Unit:
         """Open a unit and the span it owns.
+
+        `owner` names the adapter this unit belongs to, for the day one
+        process-wide registry serves several at once. Defaulting it to None
+        keeps every caller's meaning unchanged; what it must never become is a
+        default that matches — see `sole_live`.
 
         `ambient` has no default on purpose. It is a snapshot taken by
         `latch_ambient()` at the moment the work was ISSUED, on the task that
@@ -950,6 +963,7 @@ class UnitRegistry:
             tracestate=tracestate,
             start_ns=now,
             parent=parent_unit,
+            owner=owner,
         )
 
         pending: list[SpanDraft] = []
@@ -1117,7 +1131,7 @@ class UnitRegistry:
         stale = self._stale_pin_context()
         return stale is not None and amb.span_context is not None and amb.span_context == stale
 
-    def sole_live(self, kind: UnitKind) -> Unit | None:
+    def sole_live(self, kind: UnitKind, *, owner: str | None = None) -> Unit | None:
         """A unit ONLY when exactly one of `kind` is live.
 
         Callers must stamp `ParentSource.UNIT_SOLE` (0.5) and
@@ -1125,11 +1139,23 @@ class UnitRegistry:
         adapter it replaces DROPS a hook entirely when two sessions are live,
         with no marker at all — and a marked low-confidence edge beats unmarked
         data loss.
+
+        `owner` is the filter that keeps this answer honest once one registry
+        serves several adapters. Without it "exactly one SESSION is live" is a
+        question about the PROCESS, so an Anthropic run with a LangGraph run
+        beside it would either find two and give up, or — worse, with only the
+        other framework running — hand the Anthropic adapter a LangGraph
+        session as the sole candidate and stamp it 0.5. An unowned unit matches
+        nothing rather than everything: guessing across an unstated boundary is
+        the failure this filter exists to prevent, so it may not be the way an
+        omitted owner degrades.
         """
         with self._lock:
             found: Unit | None = None
             for unit in self._live_units:
                 if unit.kind is not kind:
+                    continue
+                if owner is not None and unit.owner != owner:
                     continue
                 if found is not None:
                     return None
@@ -1303,7 +1329,7 @@ class UnitRegistry:
             pending = self._close_locked(unit, status=status, error_type=error_type, end_ns=end)
         self._flush(pending)
 
-    def close_all(self, *, reason: Limitation) -> None:
+    def close_all(self, *, reason: Limitation, owner: str | None = None) -> None:
         """Close every live root. The teardown BACKSTOP, not the teardown itself.
 
         A caller that owns state ABOUT a unit — the Agent SDK assembler owns a
@@ -1318,6 +1344,11 @@ class UnitRegistry:
         `UNIT_INTERRUPTED` from a cancelled or shutting-down process — so the
         limitation census records this as a slot it cannot follow rather than
         pretending to have read it.
+
+        `owner` scopes the sweep to one adapter, for the day one registry serves
+        several: an Anthropic uninstall must not close a LangGraph run that is
+        still being driven. Omitted, it closes everything, which is what a
+        process-wide teardown wants and what every caller means today.
 
         Declines rather than proceeds when this thread already holds the lock.
         The lock is an `RLock`, so re-entering does not deadlock — it does
@@ -1340,8 +1371,12 @@ class UnitRegistry:
         end = time.time_ns()
         with self._lock:
             pending: list[SpanDraft] = []
-            while self._roots:
-                root = next(iter(self._roots))
+            # Snapshot, not `while self._roots`, because with an owner filter the
+            # loop no longer empties the table and the old form would spin
+            # forever on the first root it must not close.
+            for root in list(self._roots):
+                if owner is not None and root.owner != owner:
+                    continue
                 root.note(reason)
                 pending += self._close_locked(
                     root, status=StatusCode.UNSET, error_type=None, end_ns=end
