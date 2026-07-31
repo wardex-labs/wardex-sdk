@@ -591,6 +591,11 @@ class AnthropicAgentSdkAdapter(AdapterInterface):
         resolved = lim.resolved()
         self._assembler = SessionAssembler(
             client,
+            # The context's registry, so the adapter and its assembler share ONE
+            # table. Two would make `owner` scoping decorative: the filter picks
+            # this adapter's units out of a table that also holds another
+            # adapter's, and a private table has nothing to pick them out of.
+            units=getattr(ctx, "_units", None),
             names=self._names,
             max_sessions=resolved["max_sessions"],
             max_session_entries=resolved["max_session_entries"],

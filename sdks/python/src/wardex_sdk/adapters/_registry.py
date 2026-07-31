@@ -77,11 +77,24 @@ class AdapterRegistry:
         """
         config = getattr(client, "config", None)
         limits = config.limits if config is not None else CaptureLimits()
+        resolved = limits.resolved()
+        debug = bool(getattr(config, "debug", False))
         return AdapterContext(
             name,
-            units=UnitRegistry(sink=_ClientSink(client)),
-            limits=limits.resolved(),
-            debug=bool(getattr(config, "debug", False)),
+            # The bounds are passed HERE and not left to the registry's defaults.
+            # Once an adapter shares this registry, this is the only place a
+            # user's `max_units` can reach it — a registry built with defaults
+            # would ignore the setting in silence, which is the shape of bug
+            # that looks like nothing at all until a workload crosses a cap the
+            # user thought they had raised.
+            units=UnitRegistry(
+                sink=_ClientSink(client),
+                max_units=resolved["max_units"],
+                max_entries_per_unit=resolved["max_entries_per_unit"],
+                debug=debug,
+            ),
+            limits=resolved,
+            debug=debug,
         )
 
     def uninstall_all(self) -> None:

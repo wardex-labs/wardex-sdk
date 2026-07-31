@@ -125,6 +125,7 @@ class SessionAssembler:
         self,
         client: Any,
         *,
+        units: UnitRegistry | None = None,
         names: McpToolCatalog | None = None,
         max_sessions: int | None = None,
         max_session_entries: int | None = None,
@@ -150,11 +151,23 @@ class SessionAssembler:
         # read. `skip_tool_names` — a set of raw strings, passed by reference and
         # compared against a name the CLI spells differently — is what it
         # replaces; `Unit.claim()` arbitrates on a normalized key instead.
-        self._units = UnitRegistry(
-            sink=_ClientSink(client),
-            max_units=max_units,
-            max_entries_per_unit=max_entries_per_unit,
-            debug=bool(getattr(getattr(client, "config", None), "debug", False)),
+        #
+        # SUPPLIED, not built, when the adapter has one: the registry the
+        # adapter's `AdapterContext` holds must be the SAME object, or `owner`
+        # scoping is meaningless — `sole_live(owner=...)` and
+        # `close_all(owner=...)` answer questions about one table, and two
+        # tables give two adapters no way to be told apart inside either. Built
+        # here only for a caller that has no context yet, which is every test
+        # that drives this class directly.
+        self._units = (
+            units
+            if units is not None
+            else UnitRegistry(
+                sink=_ClientSink(client),
+                max_units=max_units,
+                max_entries_per_unit=max_entries_per_unit,
+                debug=bool(getattr(getattr(client, "config", None), "debug", False)),
+            )
         )
         # The shared tool-name space (design §5.4). Empty when the adapter did not
         # supply one, which is the correct reading for an assembler with no

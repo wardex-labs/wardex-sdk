@@ -916,3 +916,35 @@ def test_http1_request_body_cap_is_visible_to_the_user():
     # Both halves hit the cap; that is one limitation of the transaction.
     assert span.capture_integrity.limitations.count(Limitation.BODY_CAP_EXCEEDED) == 1
     assert len(span.input_data) == 16
+
+
+def test_a_configured_bound_reaches_the_registry_the_adapter_actually_uses():
+    """The bound has to arrive where the units are, not merely where they used to be.
+
+    `SessionAssembler` reads `max_units` only when it BUILDS the registry, and it
+    stops building one the moment its adapter shares the context's. A context
+    constructed with the registry's defaults therefore ignores the user's
+    setting in silence — no error, no counter, nothing on the wire — until a
+    workload crosses a cap they believed they had raised and traces start
+    vanishing under `unit_evicted`.
+
+    Nothing asserted this before: the suite checked that the ASSEMBLER read the
+    core defaults, which stayed true while the registry underneath it quietly
+    stopped listening.
+    """
+    from wardex_sdk._config import WardexConfig
+    from wardex_sdk.adapters._registry import AdapterRegistry
+
+    class _Client:
+        config = WardexConfig(
+            api_key="k", limits=CaptureLimits(max_units=7, max_entries_per_unit=3)
+        )
+
+        def capture_span(self, span) -> None:
+            pass
+
+    ctx = AdapterRegistry._context_for("probe", _Client())
+
+    assert ctx._units._max_units == 7
+    assert ctx._units._max_entries_per_unit == 3
+    assert ctx.limits["max_units"] == 7
