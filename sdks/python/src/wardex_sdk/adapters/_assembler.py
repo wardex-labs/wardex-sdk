@@ -237,6 +237,25 @@ class SessionAssembler:
         with self._lock:
             sess = self._ensure_session(key, now)
             if ev.kind == "session_init":
+                if sess.session_id and ev.session_id and sess.session_id != ev.session_id:
+                    # A SECOND `system/init`, naming a different run, on a
+                    # session this table still holds live. One CLI subprocess
+                    # emits that line once, so the transport key now names a
+                    # different subprocess — the previous one went away without
+                    # its close reaching us, and CPython handed its identity to
+                    # the next object.
+                    #
+                    # MARKED, not split. Everything from here on is filed under
+                    # the earlier run's root, so two agent runs share one trace
+                    # and the tree says nothing about it; the marker is what
+                    # makes that legible. Retiring the old session instead is
+                    # the correct end state and is NOT done here: the same
+                    # symptom would follow from a CLI that legitimately re-inits
+                    # one transport, and splitting a real run into two traces to
+                    # fix a merge is a wrong tree of the other shape. That call
+                    # needs the lifecycle rework, and evidence from a live CLI.
+                    counters.bump("adapters.assembler.session_key_recycled")
+                    sess.unit.note(Limitation.CORRELATION_CONFLICT)
                 sess.session_id = ev.session_id
                 sess.model = ev.model
                 if ev.session_id:

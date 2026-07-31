@@ -140,6 +140,9 @@ _MEMBER_SITES: dict[str, frozenset[str]] = {
         {
             "adapters/_anthropic_agent_sdk.py",
             "assembly/_units.py",
+            # A second `system/init` naming a different run on a transport key
+            # this table still holds live: two agent runs sharing one root.
+            "adapters/_assembler.py",
         }
     ),
     # --- transport timing ---

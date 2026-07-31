@@ -19,6 +19,17 @@ All notable changes to this project are documented here. The format follows
   own home as the tool's `call_id`.
 
 ### Fixed
+- Two agent runs sharing one trace now say so. One CLI subprocess emits
+  `system/init` once, so a second one naming a different run — on a transport
+  identity this adapter still holds live — means the earlier subprocess went
+  away without its close arriving and CPython handed its address to the next
+  object. Everything after it was filed under the earlier run's root with
+  nothing in the data to show it; the run's span now carries
+  `correlation_conflict` and the event is counted under
+  `adapters.assembler.session_key_recycled`. The sessions are not split apart:
+  the same symptom would follow from a CLI that legitimately re-initialises one
+  transport, and splitting a real run in two to fix a merge is the same mistake
+  facing the other way.
 - A tool call that **failed** no longer ships as a success when its span was
   reconstructed from the CLI's stdout. `is_error` sits in the result block the
   CLI already sends and nothing read it, so the *arrival* of a result was taken

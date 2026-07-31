@@ -9,6 +9,17 @@ from wardex_sdk.adapters._anthropic_names import McpToolCatalog
 from wardex_sdk.adapters._assembler import SessionAssembler
 from wardex_sdk.assembly import Limitation, UnitKey, UnitKind, counters
 
+
+@pytest.fixture(autouse=True)
+def _fresh_counters():
+    """`counters` is a process-global dict, so without this a bump from one test
+    is readable by the next — which is how an assertion passes on evidence its
+    own test never produced."""
+    counters.reset()
+    yield
+    counters.reset()
+
+
 INIT = {"type": "system", "subtype": "init", "session_id": "s-1", "model": "claude-sonnet-5"}
 ASSISTANT = {
     "type": "assistant",
@@ -802,3 +813,40 @@ def test_teardown_also_closes_a_call_unit_no_session_owns():
 
     assert not orphan.is_live
     assert any(s.name == "execute_tool greet" for s in client.spans), [s.name for s in client.spans]
+
+
+def test_a_second_run_on_a_recycled_transport_key_does_not_pass_for_the_first():
+    """One CLI subprocess emits `system/init` once.
+
+    A second one naming a different run, on a key this table still holds live,
+    means the earlier subprocess went away without its close reaching us and
+    CPython handed its identity to the next object. Everything after it is filed
+    under the earlier run's root, so two agent runs share one trace — and
+    without this the tree says nothing at all about that.
+    """
+    client = FakeClient()
+    asm = SessionAssembler(client)
+    _outbound(asm, key=1)
+    asm.on_inbound(1, INIT)
+    asm.on_inbound(1, {**INIT, "session_id": "s-OTHER"})
+    asm.on_close(1, None)
+
+    root = next(s for s in client.spans if s.name.startswith("invoke_agent"))
+    assert Limitation.CORRELATION_CONFLICT in root.capture_integrity.limitations
+    assert counters.get("adapters.assembler.session_key_recycled") == 1
+
+
+def test_one_run_reporting_its_own_id_twice_is_not_a_conflict():
+    """The guard is about a DIFFERENT id, not about a repeated line. Keying it
+    on "init arrived again" would stamp a conflict on every ordinary re-read."""
+    client = FakeClient()
+    asm = SessionAssembler(client)
+    _outbound(asm, key=1)
+    asm.on_inbound(1, INIT)
+    asm.on_inbound(1, INIT)
+    asm.on_close(1, None)
+
+    root = next(s for s in client.spans if s.name.startswith("invoke_agent"))
+    markers = root.capture_integrity.limitations if root.capture_integrity else ()
+    assert Limitation.CORRELATION_CONFLICT not in markers
+    assert counters.get("adapters.assembler.session_key_recycled") == 0
