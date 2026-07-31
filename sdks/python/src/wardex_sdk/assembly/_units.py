@@ -1107,9 +1107,23 @@ class UnitRegistry:
         return self._stale_pin_context() is not None
 
     def _stale_pin_context(self) -> SpanContext | None:
-        """The span context a dead pin left standing in this task's scope."""
+        """The span context a dead pin left standing in this task's scope.
+
+        Ownership first, for the reason `current()` gives and one more. The
+        ambient carrier is process-wide and a unit is not, so a pin a previous
+        `init()`'s registry installed and then closed reads here as THIS
+        registry's corpse: `becomes_trace_root` would orphan a nested site and
+        `open()` would stamp `CORRELATION_CONFLICT`, both charging a conflict to
+        a pin this registry never installed — and doing it while the scope in
+        front of us is a perfectly ordinary one.
+        """
         entry = _ambient_unit.get()
-        if entry is None or not entry.pinned or entry.unit.is_live:
+        if entry is None or not entry.pinned:
+            return None
+        if entry.unit._registry is not self:
+            counters.bump("assembly._units.stale_pin_foreign_registry")
+            return None
+        if entry.unit.is_live:
             return None
         return entry.unit.context
 

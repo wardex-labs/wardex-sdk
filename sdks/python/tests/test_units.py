@@ -1400,3 +1400,31 @@ def test_close_all_with_an_owner_terminates_when_the_first_root_is_not_its_own()
     assert done == [True], "close_all did not return — the owner filter spins"
     assert first.is_live
     assert not second.is_live
+
+
+def test_another_registrys_dead_pin_is_not_this_registrys_conflict():
+    """`_ambient_unit` is process-wide; a unit belongs to one registry.
+
+    A re-`init()` builds a new registry while the previous one's pin stays
+    reachable on the carrier. Once that older run closes, its corpse read back
+    here as THIS registry's stale pin — so an ordinary scope in front of us
+    would have been refused and the span stamped `CORRELATION_CONFLICT`,
+    charging a conflict to a pin this registry never installed.
+    """
+    old = registry()
+    root = open_session(old, "old")
+    old.pin_driver(root, owner_task=threading.current_thread())
+    old.close(root)
+
+    fresh = registry()
+
+    assert fresh.stale_pin_in_scope() is False
+    assert fresh.becomes_trace_root(latch_ambient()) is False
+    # One per question asked, not one per foreign pin: both predicates above
+    # consult it, and each refusal is a real refusal to record.
+    assert counters.get("assembly._units.stale_pin_foreign_registry") >= 1
+
+    # And the ordinary scope survives: a unit opened here takes the ambient the
+    # older run left standing rather than becoming an orphan that blames it.
+    unit = open_session(fresh, "new", ambient=latch_ambient())
+    assert Limitation.CORRELATION_CONFLICT not in unit.draft.integrity.markers
