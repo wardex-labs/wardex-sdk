@@ -5,6 +5,20 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+- A tool a **sub-agent** ran now gets its own `execute_tool` span with its own
+  result. The Agent SDK writes one line for a tool result and puts two different
+  identifiers on it — `parent_tool_use_id` says which sub-agent produced the
+  line, the `tool_result` block's `tool_use_id` says which call the result
+  answers — and the parser folded both into one field. They are equal for a
+  main-agent tool and they diverge for every tool a sub-agent runs, so the
+  result was filed against the `Task` call that spawned the agent: `execute_tool
+  Task` shipped carrying the inner tool's output, the inner call shipped no
+  result at all, and nothing recorded either. A sub-agent's ordinary user
+  message is also no longer mistaken for a tool result — it carries
+  `parent_tool_use_id` and no result block, and refusing on that field admitted
+  it as a result whose content was the whole message.
+
 ### Added
 - A 38th `Limitation`, `instrumentation_degraded`, declared in
   `proto/wardex/v1/common.proto` and in `wardex_sdk.assembly.Limitation`. Every

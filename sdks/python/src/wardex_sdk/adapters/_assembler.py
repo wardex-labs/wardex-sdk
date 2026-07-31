@@ -874,7 +874,15 @@ class SessionAssembler:
         return draft.finish(end_ns)
 
     def _on_stream_tool_result(self, sess: _Session, ev: AgentStreamEvent, now: int) -> None:
-        tool_use_id = ev.parent_tool_use_id
+        # `tool_result_id`, never `parent_tool_use_id`. The two answer different
+        # questions about the same line -- which CALL this result belongs to, and
+        # which SUB-AGENT produced the line -- and they differ exactly when a
+        # sub-agent runs a tool, which is when getting it wrong costs the most:
+        # the result was filed against the `Task` call, so `execute_tool Task`
+        # shipped carrying the inner tool's output and the inner call shipped no
+        # result at all. One span with the wrong bytes, one span missing, and no
+        # counter anywhere.
+        tool_use_id = ev.tool_result_id
         if tool_use_id is None:
             return
         if tool_use_id in sess.open_tools:
