@@ -138,6 +138,18 @@ with wardex.continue_trace(dict(msg.headers())):
     ...  # process the message
 ```
 
+**Pass it a `traceparent` a caller actually sent you, and nothing else.**
+`continue_trace()` takes a string and takes it at its word — that is what makes
+it work over any channel, and it is also its one sharp edge. Any string of the
+right shape becomes a parent, so deriving one from something that is not a
+propagated trace context (a framework's `run_id`, a request id, a hash of a job
+name) manufactures a causal edge that never existed. Spans parented this way are
+recorded with `parent_source = header`, which is how they stay distinguishable
+from the in-process edges wardex derives itself; what wardex cannot tell you is
+whether the header was genuine, because both are just strings. Everywhere else,
+the parent comes from real context propagation and is never built from an
+identifier.
+
 `with wardex.continue_from_otel():` is a one-line alternative to
 `continue_trace()` for code that already runs under an active OpenTelemetry
 span — it adopts that span as the remote parent for the duration of the

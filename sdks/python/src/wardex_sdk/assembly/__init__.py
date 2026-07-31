@@ -1,8 +1,23 @@
 """Span assembly core — the SDK surface adapters and interceptors build on.
 
 This package is the one public boundary below `wardex_sdk` itself: `__all__`
-here is a semver-stable contract, every module inside stays underscore-private,
-and the layering is one-way. `assembly/` imports the leaf vocabulary
+here is the surface adapters and interceptors are written against, every module
+inside stays underscore-private, and the layering is one-way.
+
+WHILE THE SDK IS BETA, `__all__` HERE CARRIES NO SEMVER GUARANTEE. It said it
+did, and the claim was retracted rather than quietly broken, because it is about
+to be false: several of these names hand out a PARENT — `Ambient`, `Evidence`,
+`ParentSource`, `latch_ambient`, `UnitRegistry` among them — and a framework
+adapter holding them can assemble a causal edge by hand, at confidence 1.0, from
+whatever it likes. That is the one thing this SDK claims never happens, and
+closing it means those names stop being exported here. Nothing outside this
+repository can be affected today: there is no way to register a third-party
+adapter (`AdapterName` is a closed enum, `AdapterInterface` is exported from
+nowhere), so the surface has no users to break. Retracting the promise while
+that is still true is the honest order; discovering it after someone depends on
+it is not.
+
+`assembly/` imports the leaf vocabulary
 (`_types`, `_enums`, `_limits`) and the scope layer (`_hub`, `_scope`,
 `context/`) and nothing above it — never `interceptors/`, `adapters/`,
 `protocol/` or `semantics/` (design §3.1). `tests/test_import_graph.py`
