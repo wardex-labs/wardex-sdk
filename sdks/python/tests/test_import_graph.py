@@ -1038,7 +1038,15 @@ def test_silent_swallows_do_not_spread():
 _CS5_BUDGET = {
     "__init__.py": 1,
     "_tracing.py": 1,
-    "adapters/_assembler.py": 4,
+    # 4 -> 3 + 1: the assembler's `_ClientSink` moved WHOLE into `adapters/_sink.py`.
+    # A relocation, not a new occurrence — the total is unchanged and the
+    # assembler's own budget ratchets down, which is the only direction this
+    # table allows. The new entry is the last one that will need lowering: this
+    # rule's stated destination is `assembly/_emit.py`, and the sink standing
+    # alone in a module of its own is what lets it arrive there whole. When it
+    # does, the entry does not shrink — it disappears.
+    "adapters/_assembler.py": 3,
+    "adapters/_sink.py": 1,
     "interceptors/_mcp_stdio.py": 2,
     "interceptors/_seam.py": 2,
 }

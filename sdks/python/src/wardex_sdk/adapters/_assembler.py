@@ -4,6 +4,12 @@ Sources: the transport tee (raw JSON lines -> native parser) and SDK hooks.
 Rule (spec §6.2): hooks are the authority for lifecycle/attribution, the
 stream is the authority for content; joined on tool_use_id. All timestamps
 are host-arrival times (IPC level).
+
+Two things this module used to hold now live next door, and the split is by how
+long each one stays here. `_session_state.py` holds what the assembler
+REMEMBERS between two events — records shaped by the Agent SDK's own vocabulary,
+so adapter-specific by construction. `_sink.py` holds the one piece that is not
+about Anthropic at all, and its destination is `assembly/_emit.py`.
 """
 
 from __future__ import annotations
@@ -11,8 +17,6 @@ from __future__ import annotations
 import json
 import threading
 import time
-import uuid
-from dataclasses import dataclass, field
 from typing import Any
 
 from .. import _wardex_native
@@ -47,6 +51,8 @@ from ..assembly import (
 )
 from ..protocol._claude_stream import AgentStreamEvent, parse_line
 from ._anthropic_names import McpToolCatalog
+from ._session_state import _OpenSubagent, _OpenTool, _Session
+from ._sink import _ClientSink
 
 # Every span this assembler emits below the session root hangs off a context the
 # parentage core produced and the session is holding — rule P2. Naming the
@@ -112,104 +118,6 @@ def _safe_json_bytes(value: Any) -> bytes:
         return json.dumps(value).encode()
     except (TypeError, ValueError):
         return b""
-
-
-class _ClientSink:
-    """The `assembly.SpanSink` the unit registry emits through.
-
-    Materializing the draft here rather than at each call site is what lets the
-    registry own two-phase spans end to end: `UnitRegistry.close()` stamps the
-    status and the end instant under its lock and hands the draft over AFTER
-    releasing it (I11), and this is the last step. `finish()` may raise
-    `VocabularyError`; the registry calls every sink inside `guard()`, so a
-    breach is a counted, debug-logged deletion rather than an exception in the
-    host's own hook callback.
-
-    Design §4.4 puts this line — and the capture-mode gate that belongs beside
-    it — in `assembly/_emit.py`, so that one place decides whether a span ships
-    instead of each caller deciding for itself. No module under `assembly/`
-    reaches the sink today; `tests/test_import_graph.py` asserts exactly that
-    and reserves the name (C-S5), so the adapter holds the line. It is a class
-    rather than a closure over the hook wiring for the same reason: a named
-    object is something the gate can be added to and something that can move
-    whole, where a lambda would have to be disentangled from this adapter's
-    construction first.
-    """
-
-    __slots__ = ("_client",)
-
-    def __init__(self, client: Any) -> None:
-        self._client = client
-
-    def emit(self, draft: SpanDraft, *, agent_semantic: bool) -> bool:
-        if self._client is None:
-            return False
-        self._client.capture_span(draft.finish())
-        return True
-
-
-@dataclass
-class _OpenTool:
-    tool_use_id: str | None
-    name: str
-    start_ns: int
-    agent_id: str | None
-    input_data: bytes
-    from_hook: bool
-    output_data: bytes = b""
-    #: This call's slot in the shared key space (`_anthropic_names`). The hook
-    #: observer holds it at rank 0 and re-checks it at emit time, because the
-    #: in-process handler wrapper may have taken the key over in between — which
-    #: is exactly what happens for every SDK MCP tool.
-    claim_key: UnitKey | None = None
-
-
-@dataclass
-class _OpenSubagent:
-    """A subagent span opened at `SubagentStart` and finished at `SubagentStop`.
-
-    The DRAFT is what is held, not a bare `SpanContext`. The earlier shape was
-    a context allocated at open time plus the fields needed to
-    rebuild the span at close time, which is a two-phase span written by hand;
-    holding the draft makes it one object, and `draft.context` is the anchor
-    children hang off — the same context the span will eventually be emitted
-    with, by construction rather than by care.
-    """
-
-    draft: SpanDraft
-    agent_type: str
-
-
-@dataclass
-class _Session:
-    #: The session's logical unit. `unit.draft` is its own two-phase span and
-    #: `unit.context` is the P2 anchor every span below it hangs off — the same
-    #: context the pin installs on the SDK's reader task, which is how a hook
-    #: callback and an in-process tool handler reach it with no framework id.
-    unit: Unit
-    start_ns: int
-    #: The transport key this session is filed under in `_by_key`. Carried on
-    #: the record so that a lookup arriving by any other route — the CLI's
-    #: `session_id`, the scope a hook runs in — can re-enter the one liveness
-    #: check (`_live_session`) instead of growing its own copy of it.
-    key: int
-    session_id: str | None = None
-    model: str | None = None  # from init -> request_model
-    turn_start_ns: int = 0
-    first_delta_ns: int = 0
-    prompt: bytes = b""
-    open_tools: dict[str, _OpenTool] = field(default_factory=dict)  # keyed by tool_use_id
-    subagents: dict[str, _OpenSubagent] = field(default_factory=dict)  # keyed by agent_id
-    turn_index: int = 0
-    # Issued by wardex when the CLI has not (yet) reported a session id. §6.3:
-    # `conversation_id` may not be the empty string — every span in one session
-    # would otherwise collide with every span of every other session in any
-    # store that keys on it, and `SpanDraft.finish()` now refuses to ship "".
-    issued_conversation_id: str = field(default_factory=lambda: uuid.uuid4().hex)
-    stream_tool_meta: dict[str, tuple[str, bytes]] = field(default_factory=dict)
-    # ^ tool_use_id -> (name, input_json) observed on the stream
-    result: AgentStreamEvent | None = None
-    error: str | None = None
 
 
 class SessionAssembler:
