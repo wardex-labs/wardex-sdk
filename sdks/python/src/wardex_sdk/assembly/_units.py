@@ -1131,6 +1131,27 @@ class UnitRegistry:
         stale = self._stale_pin_context()
         return stale is not None and amb.span_context is not None and amb.span_context == stale
 
+    def becomes_trace_root(self, amb: Ambient) -> bool:
+        """Would a unit opened from `amb` alone begin a NEW trace?
+
+        The question a caller has to ask BEFORE `open()` in order to declare a
+        site that may not legitimately start one — and it is answered here, by
+        the object that will answer it again inside `open()`, because asking it
+        anywhere else in different words is precisely how the two drift.
+
+        They did. `AdapterContext._evidence` asked `stale_pin_in_scope()`, which
+        says this TASK descends from a dead driver, while `open()` refuses only
+        the dead fork ITSELF. A host that opened its own span inside that task
+        put a real parent on top of the leftover, so the two answers disagreed
+        exactly there: the adapter surface orphaned live work at confidence 0.0
+        to escape a ghost that was no longer in front of it, and dropped the
+        `CORRELATION_CONFLICT` that had been the only record of the dead pin.
+        `_poisoned`'s own docstring calls that a wrong tree of a different
+        shape, and `test_a_real_span_over_a_stale_pin_is_still_a_parent` is the
+        registry's standing promise not to build it.
+        """
+        return self._poisoned(amb) or amb.span_context is None
+
     def sole_live(self, kind: UnitKind, *, owner: str | None = None) -> Unit | None:
         """A unit ONLY when exactly one of `kind` is live.
 

@@ -39,6 +39,7 @@ from .._enums import StatusCode
 from ..assembly import (
     AMBIENT,
     EMPTY_AMBIENT,
+    Ambient,
     Evidence,
     Limitation,
     LinkReason,
@@ -344,7 +345,7 @@ class AdapterContext:
 
     # -- the causal surface ----------------------------------------------
 
-    def _evidence(self, placement: Placement) -> Evidence:
+    def _evidence(self, placement: Placement, ambient: Ambient) -> Evidence:
         """`AMBIENT`, or the orphan edge when a NESTED site has nothing above it.
 
         The whole parentage table, once the rows `UnitRegistry.open` already
@@ -352,14 +353,19 @@ class AdapterContext:
         header and dead-pin fork are all its decisions; the single divergence is
         that where a ROOT site legitimately becomes a trace root, a NESTED site
         has lost something it was promised, and must say so.
+
+        Which is why the "would this be a trace root" question is asked of the
+        REGISTRY on the very ambient that is about to be handed to it, rather
+        than re-derived here. Re-deriving it is what went wrong: a predicate
+        about the TASK stood in for one about the SPAN, and a NESTED site under
+        a host's own live span was orphaned to escape a dead pin that was not
+        in front of it. See `UnitRegistry.becomes_trace_root`.
         """
         if placement is Placement.ROOT:
             return AMBIENT
         if self._units.current() is not None:
             return AMBIENT
-        if self._units.stale_pin_in_scope():
-            return _ORPHAN
-        return AMBIENT if latch_ambient().span_context is not None else _ORPHAN
+        return _ORPHAN if self._units.becomes_trace_root(ambient) else AMBIENT
 
     def _open(
         self,
@@ -375,11 +381,16 @@ class AdapterContext:
         evidence: Evidence | None = None,
     ) -> Unit:
         holder = parent if parent is not None else self._units.current()
+        # Latched ONCE and used for both the declaration and the open. Two reads
+        # would be two different instants on the same carrier, and the whole
+        # point of the declaration is that it describes the ambient `open()`
+        # actually receives.
+        ambient = latch_ambient()
         return self._units.open(
             kind,
             selector if selector is not None else UnitKey(f"adapters.{self.name}", ""),
-            ambient=latch_ambient(),
-            evidence=evidence if evidence is not None else self._evidence(placement),
+            ambient=ambient,
+            evidence=evidence if evidence is not None else self._evidence(placement, ambient),
             intent=intent,
             subject=subject,
             parent_unit=holder,

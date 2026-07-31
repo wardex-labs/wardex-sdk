@@ -29,7 +29,7 @@ import pytest
 
 from wardex_sdk._enums import AgentType, StatusCode
 from wardex_sdk._hub import reset_for_test
-from wardex_sdk._types import AgentAttributes
+from wardex_sdk._types import AgentAttributes, ToolAttributes
 from wardex_sdk.adapters._context import (
     AdapterContext,
     Attachment,
@@ -40,6 +40,7 @@ from wardex_sdk.adapters._context import (
     Scope,
 )
 from wardex_sdk.assembly import (
+    EMPTY_AMBIENT,
     Limitation,
     LinkReason,
     ParentSource,
@@ -81,6 +82,11 @@ def context(name: str = "test", **kw) -> tuple[AdapterContext, RecordingSink]:
 def _agent(handle) -> None:
     """`invoke_agent` needs an agent block or the closed vocabulary refuses it."""
     handle.draft.set_agent(AgentAttributes(name="a", agent_type=AgentType.PRIMARY))
+
+
+def _tool(handle) -> None:
+    """`execute_tool` requires a tool block, for the same reason `_step` does."""
+    handle.draft.set_tool(ToolAttributes(name="t"))
 
 
 def _step(handle) -> None:
@@ -205,6 +211,82 @@ def test_placement_changes_nothing_when_a_real_parent_is_installed(placement):
         with ctx.enter(UnitKind.STEP, intent=SpanIntent.EXECUTE_STEP, placement=placement) as st:
             _step(st)
         assert _edge(sink) == (ParentSource.UNIT_ACTIVE, 1.0, ())
+
+
+def test_a_nested_site_under_a_dead_pin_is_an_orphan_that_names_the_conflict():
+    """The leftover fork a closed pin cannot take down is not a parent.
+
+    `close()` runs on another task and a ContextVar cannot be reset from one, so
+    the dead unit's own span context is still standing in this task's scope. An
+    edge built from it reads `contextvar` / 1.0 / no marker into a finished run,
+    which is the failure the pin restriction exists to prevent arriving by the
+    other carrier. NESTED turns it into 0.0 as well, because a site that
+    declared it is always inside something has lost what it was promised.
+    """
+    ctx, sink = context()
+    units = ctx._units
+
+    dead = units.open(
+        UnitKind.SESSION,
+        UnitKey("test.session", "dead"),
+        ambient=EMPTY_AMBIENT,
+        intent=SpanIntent.INVOKE_AGENT,
+        subject="a",
+    )
+    dead.draft.set_agent(AgentAttributes(name="a", agent_type=AgentType.PRIMARY))
+    units.pin_driver(dead, owner_task=threading.current_thread())
+    units.close(dead)
+
+    with ctx.enter(
+        UnitKind.CALL, intent=SpanIntent.EXECUTE_TOOL, placement=Placement.NESTED, subject="t"
+    ) as call:
+        _tool(call)
+
+    source, confidence, markers = _edge(sink)
+    assert (source, confidence) == (ParentSource.UNRESOLVED, 0.0)
+    assert set(markers) == {Limitation.PARENT_UNRESOLVED, Limitation.CORRELATION_CONFLICT}
+
+
+def test_a_real_host_span_over_a_dead_pin_is_still_the_parent():
+    """The refusal is the leftover FORK, not the task.
+
+    A stale pin says this task descends from a dead driver; it does not say the
+    scope still holds the corpse's span. A host that opened its own span inside
+    that task put a real parent on top, and orphaning THAT to escape a ghost no
+    longer in front of us is a wrong tree of a different shape — the one
+    `UnitRegistry._poisoned` narrows to avoid and
+    `test_a_real_span_over_a_stale_pin_is_still_a_parent` promises against.
+
+    Asking the registry the same question `open()` will ask is what keeps the
+    two from disagreeing: a predicate about the TASK once stood in here for one
+    about the SPAN, and this row orphaned live work at 0.0 while dropping the
+    only record that a pin had died.
+    """
+    ctx, sink = context()
+    units = ctx._units
+
+    dead = units.open(
+        UnitKind.SESSION,
+        UnitKey("test.session", "dead"),
+        ambient=EMPTY_AMBIENT,
+        intent=SpanIntent.INVOKE_AGENT,
+        subject="a",
+    )
+    dead.draft.set_agent(AgentAttributes(name="a", agent_type=AgentType.PRIMARY))
+    units.pin_driver(dead, owner_task=threading.current_thread())
+    units.close(dead)
+
+    host = _a_context()
+    with activate_span(host):
+        with ctx.enter(
+            UnitKind.CALL, intent=SpanIntent.EXECUTE_TOOL, placement=Placement.NESTED, subject="t"
+        ) as call:
+            _tool(call)
+
+    span = _emitted(sink)[-1]
+    assert span.parent_span_id == host.span_id
+    assert span.context.trace_id == host.trace_id
+    assert _edge(sink) == (ParentSource.CONTEXTVAR, 1.0, ())
 
 
 # ==========================================================================
