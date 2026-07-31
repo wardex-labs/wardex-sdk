@@ -478,8 +478,11 @@ class AnthropicAgentSdkAdapter(AdapterInterface):
     # --- install / uninstall ---
 
     def install(self, client: Client | None, ctx: object | None = None) -> None:
-        # `ctx` is accepted and not yet used; this adapter still builds its own
-        # registry inside `SessionAssembler`. Migrating is a change to this file.
+        # `ctx` is used for ONE thing so far: its unit registry, handed to the
+        # assembler below so the two share one table. Nothing here opens through
+        # `ctx.enter`/`open_run` yet, so this file still decides its own
+        # parentage; moving the open sites onto that surface is what retires the
+        # tier ladders in `_open_tool_call` and `_session_for_hook`.
         if self._installed:
             return
         try:
