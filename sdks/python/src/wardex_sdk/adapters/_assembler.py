@@ -30,7 +30,6 @@ from .._enums import (
 from .._types import (
     AgentAttributes,
     ConversationContext,
-    CorrelationInfo,
     GenAIAttributes,
     ToolAttributes,
 )
@@ -835,42 +834,32 @@ class SessionAssembler:
             # reads yet, so this is a coarse-but-true type rather than an absent
             # one.
             draft.set_error(error_type or "tool_error")
+        if not tool.from_hook:
+            # Reconstructed from the CLI's stdout rather than announced by a
+            # hook. The DIFFERENCE is real and worth publishing -- a stream-only
+            # span has no hook payload behind it -- but it is a fact about who
+            # observed the call, which is what `capture_sources` means.
+            draft.add_source(CaptureSource.STDIO)
         draft.set_io(input_data=tool.input_data, output_data=tool.output_data)
         draft.add_limitation(_BASE_LIMITATION)
         for marker in markers:
             draft.add_limitation(marker)
-        # `adapter_hook` / `adapter_stream` are gone. They were never parentage:
-        # they answered "which source observed this event", which
-        # `capture_sources` already carries, and putting that answer in the field
-        # that means "how was the parent derived" is what let a reader mistake an
-        # observation channel for evidence about the edge.
+        # NO CORRELATION, and `None` rather than leaving the base edge in place.
         #
-        # What is genuinely known here survives, and only that: the framework's
-        # `tool_use_id` as a lookup HINT (never a parent — I2), and the trust
-        # gap between the two paths as confidence. `merge_correlation` takes the
-        # MINIMUM confidence and keeps the parentage core's own source, so a
-        # hint can lower trust in the edge but never invent or overwrite it.
+        # What used to sit here was `CorrelationInfo(confidence=1.0 if from_hook
+        # else 0.7, strategy=None)`. Both halves were wrong. `strategy=None`
+        # encodes as `parent_source = UNSPECIFIED` on the wire, so the span
+        # published a confidence with no answer to the question confidence
+        # prices -- indistinguishable from a sender that never set the field.
+        # And the number was never about the parent EDGE at all: it was the
+        # observation channel, hook or stream, wearing a certainty's clothes.
+        # That answer belongs to `capture_sources`, which now carries it.
         #
-        # This could not wait for the adapter rewrite that retires the rest of
-        # the Anthropic semantics: `CorrelationInfo.strategy` is now closed into
-        # `ParentSource`, and neither string is a member — leaving them would
-        # ship a value the schema cannot name.
-        draft.replace_correlation(
-            CorrelationInfo(
-                request_id=tool.tool_use_id,
-                confidence=1.0 if tool.from_hook else 0.7,
-                # No parentage claim, and this is the same rule every other
-                # sub-root span in this module already follows. Merging instead
-                # of replacing looked tidier and was wrong: it would publish the
-                # base edge's `unit_active`/1.0, which the module header
-                # forbids by name because the anchor may have come from
-                # `_resolve_subagent_anchor`'s fallback. The in-process tool
-                # span DOES publish its edge — it is opened by the unit registry
-                # against a context the pin delivered — and this path will too,
-                # once the same ingestion move gives it evidence per edge.
-                strategy=None,
-            )
-        )
+        # `None` and not a deletion: `Parentage.correlation` is never None, so
+        # dropping the override republishes the base edge at `unit_active`/1.0 --
+        # on an anchor that may have come from a silent fallback, which is the
+        # claim this module's header forbids by name.
+        draft.replace_correlation(None)
         return draft.finish(end_ns)
 
     def _on_stream_tool_result(self, sess: _Session, ev: AgentStreamEvent, now: int) -> None:
@@ -911,7 +900,17 @@ class SessionAssembler:
             output_data=ev.content_json or b"",
             claim_key=key,
         )
-        self._emit_tool(sess, tool, now)
+        # The result block says whether the call failed. Reading it here is what
+        # keeps a reconstructed span honest: the arrival of a result was being
+        # taken for the success of the call, so a tool that raised shipped `ok`
+        # -- and status is the first field anyone filters an agent run by.
+        self._emit_tool(
+            sess,
+            tool,
+            now,
+            failed=ev.is_error,
+            error_type="tool_error" if ev.is_error else None,
+        )
 
     def _emit_subagent(self, sess: _Session, agent_id: str | None, now: int) -> None:
         if agent_id is None:

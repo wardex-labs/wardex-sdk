@@ -612,14 +612,13 @@ def test_every_adapter_span_class_survives(client):
 
     tool = next(s for s in client.spans if s.name == "execute_tool Bash")
     assert tool.tool is not None and tool.tool.call_id == "toolu_01"
-    # `adapter_hook` was retired: it answered "which source observed this", not
-    # "how was the parent derived", so a tool span makes NO parentage claim.
-    # What the hook path genuinely knew survives and is what is pinned here —
-    # full confidence (0.7 is the stream-only path) and the tool_use_id kept as
-    # a lookup hint rather than an edge.
-    assert tool.correlation.strategy is None
-    assert tool.correlation.confidence == 1.0
-    assert tool.correlation.request_id == "toolu_01"
+    # A tool span makes NO parentage claim: its anchor may have come from a
+    # silent fallback, so there is no edge here to price. It used to publish a
+    # confidence with `strategy=None` beside it, which encodes as
+    # `parent_source = UNSPECIFIED` — a number answering a question the span
+    # declined to answer. The framework's id survives where it belongs, as the
+    # tool's own `call_id` above.
+    assert tool.correlation is None
 
     sub = next(s for s in client.spans if s.name == "invoke_agent researcher")
     assert sub.agent is not None and sub.agent.id == "a-1"

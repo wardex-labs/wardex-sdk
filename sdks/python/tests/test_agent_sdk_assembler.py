@@ -141,13 +141,13 @@ def test_tool_span_from_hooks_joins_stream_content():
 
     tool = next(s for s in client.spans if s.name == "execute_tool Bash")
     assert tool.tool.call_id == "toolu_01"
-    # The retired "adapter_hook" string answered "which source observed this",
-    # not "how was the parent derived". What it stood for survives as the hook
-    # path's full confidence plus the framework's tool_use_id as a hint; the
-    # span itself makes no parentage claim.
-    assert tool.correlation.confidence == 1.0
-    assert tool.correlation.request_id == "toolu_01"
-    assert tool.correlation.strategy is None
+    # No correlation at all, which is what this span has earned: its anchor may
+    # have come from a silent fallback, so there is no edge here to price. The
+    # framework's id is not lost -- it travels as the tool's own `call_id`, in
+    # the field that means "which call", rather than as a hint inside a
+    # submessage about parentage.
+    assert tool.correlation is None
+    assert CaptureSource.STDIO not in tool.capture_sources
     assert b"ls" in tool.input_data
 
 
@@ -178,7 +178,15 @@ def test_close_tool_stream_input_wins_over_hook_reserialization():
     assert b"hook-version" not in tool.input_data
 
 
-def test_stream_only_degrades_confidence():
+def test_a_stream_only_tool_span_says_which_channel_saw_it():
+    """The hook/stream difference is real and belongs in `capture_sources`.
+
+    It used to travel as `confidence` 1.0 vs 0.7 — the observation channel
+    wearing a certainty's clothes, in the field that prices a PARENT EDGE. A
+    consumer filtering on low confidence was selecting spans wardex had watched
+    from a different vantage point, not spans whose place in the tree was a
+    guess.
+    """
     client = FakeClient()
     asm = SessionAssembler(client)
     _outbound(asm, key=1)
@@ -187,11 +195,38 @@ def test_stream_only_degrades_confidence():
     asm.on_close(1, None)
 
     tool = next(s for s in client.spans if s.name == "execute_tool Bash")
-    # The retired "adapter_stream" string: the stream-only path keeps its
-    # degraded confidence and the tool_use_id hint, and claims no parentage.
-    assert tool.correlation.confidence == 0.7
-    assert tool.correlation.request_id == "toolu_01"
-    assert tool.correlation.strategy is None
+    assert CaptureSource.STDIO in tool.capture_sources
+    assert tool.correlation is None
+
+
+def test_a_tool_that_failed_does_not_ship_as_a_success():
+    """`is_error` sits in the result block the CLI already sends. Nothing read
+    it, so the ARRIVAL of a result was taken for the SUCCESS of the call."""
+    client = FakeClient()
+    asm = SessionAssembler(client)
+    _outbound(asm, key=1)
+    failed = {
+        "type": "user",
+        "session_id": "s-1",
+        "message": {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_01",
+                    "content": "command not found",
+                    "is_error": True,
+                }
+            ],
+        },
+    }
+    for msg in (INIT, ASSISTANT, failed, RESULT):
+        asm.on_inbound(1, msg)
+    asm.on_close(1, None)
+
+    tool = next(s for s in client.spans if s.name == "execute_tool Bash")
+    assert tool.status is StatusCode.ERROR
+    assert tool.error_type == "tool_error"
 
 
 def test_subagent_span_attribution():

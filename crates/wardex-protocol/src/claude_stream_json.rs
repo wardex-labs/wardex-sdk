@@ -175,17 +175,25 @@ pub fn parse_stream_line(line: &[u8], outbound: bool) -> Option<ClaudeStreamEven
             let mut e = ClaudeStreamEvent::new(EventKind::ToolResult);
             e.session_id = s(&v, "session_id");
             e.parent_tool_use_id = s(&v, "parent_tool_use_id");
-            e.tool_result_id = v
+            let block = v
                 .get("message")
                 .and_then(|m| m.get("content"))
                 .and_then(Value::as_array)
                 .and_then(|blocks| {
-                    blocks.iter().find_map(|b| {
-                        (b.get("type").and_then(Value::as_str) == Some("tool_result"))
-                            .then(|| s(b, "tool_use_id"))
-                            .flatten()
-                    })
+                    blocks
+                        .iter()
+                        .find(|b| b.get("type").and_then(Value::as_str) == Some("tool_result"))
                 });
+            e.tool_result_id = block.and_then(|b| s(b, "tool_use_id"));
+            // The block says whether the call FAILED, and nothing read it. A
+            // reconstructed tool span was reported `ok` on the strength of the
+            // result having arrived at all -- so a failing tool and a succeeding
+            // one shipped the same status, which is the one field anyone filters
+            // an agent run by.
+            e.is_error = block
+                .and_then(|b| b.get("is_error"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
             // The tool_result BLOCK is what makes this line semantic here. Keying
             // the refusal on `parent_tool_use_id` also admitted a sub-agent's
             // ordinary user message, which carries that field and no result.
@@ -268,6 +276,17 @@ mod tests {
         let e = parse_stream_line(NESTED, false).unwrap();
         assert_eq!(e.tool_result_id.as_deref(), Some("toolu_BASH"));
         assert_eq!(e.parent_tool_use_id.as_deref(), Some("toolu_TASK"));
+    }
+
+    /// A tool that failed says so in its own result block.
+    #[test]
+    fn a_failed_tool_result_carries_its_failure() {
+        const FAILED: &[u8] = br#"{"type":"user","session_id":"s-1","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_01","content":"boom","is_error":true}]}}"#;
+        let e = parse_stream_line(FAILED, false).unwrap();
+        assert_eq!(e.tool_result_id.as_deref(), Some("toolu_01"));
+        assert!(e.is_error);
+        // and the ordinary one still does not
+        assert!(!parse_stream_line(TOOL_RESULT, false).unwrap().is_error);
     }
 
     /// A sub-agent's ordinary user message carries `parent_tool_use_id` and no

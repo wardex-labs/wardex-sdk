@@ -5,7 +5,25 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+- **An `execute_tool` span from the Agent SDK adapter no longer publishes a
+  `correlation`.** It used to carry `confidence` 1.0 (hook path) or 0.7
+  (stream-only) with no `parent_source` beside it — which encodes on the wire as
+  `parent_source = UNSPECIFIED`, indistinguishable from a sender that never set
+  the field. The number was never about the parent edge either: it was the
+  observation channel wearing a certainty's clothes, so anyone filtering on low
+  confidence was selecting spans wardex had watched from a different vantage
+  point rather than spans whose place in the tree was a guess. The channel now
+  travels where it means something — a stream-reconstructed span carries
+  `stdio` in `capture_sources` — and the framework's `tool_use_id` keeps its
+  own home as the tool's `call_id`.
+
 ### Fixed
+- A tool call that **failed** no longer ships as a success when its span was
+  reconstructed from the CLI's stdout. `is_error` sits in the result block the
+  CLI already sends and nothing read it, so the *arrival* of a result was taken
+  for the *success* of the call — and status is the first field anyone filters
+  an agent run by.
 - **`OtlpHttpTransport` now exports what wardex knows about its own uncertainty.**
   `correlation` and `capture_integrity` were encoded on the wardex envelope and
   dropped entirely by the OTLP encoder — and OTLP is the only transport exported
