@@ -6,6 +6,15 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- A 38th `Limitation`, `instrumentation_degraded`, declared in
+  `proto/wardex/v1/common.proto` and in `wardex_sdk.assembly.Limitation`. Every
+  other member of that vocabulary describes a limit of what could be
+  **observed** — the framework did not say, the protocol does not carry it, a
+  bound was reached. This one describes a limit of **wardex**, and it exists
+  because without it the two are indistinguishable downstream and the wrong one
+  gets blamed: a subtree missing because the SDK's own instrumentation failed
+  looks exactly like a subtree that never ran. Declared only; no span carries it
+  yet.
 - `OperationName` gains three members — `execute_step`, `handoff` and
   `evaluate` — and `ToolExecutionType` gains two, `ipc` and `unknown`. All five
   are also declared in `proto/wardex/v1/common.proto`, together with a new

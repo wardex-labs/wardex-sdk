@@ -164,6 +164,7 @@ enum Limitation {
   // -- Instrumentation lifecycle.
   LIMITATION_ADAPTER_UNINSTALLED = 9;
   LIMITATION_PATCH_SUPERSEDED = 10;
+  LIMITATION_INSTRUMENTATION_DEGRADED = 38;
 
   // -- Evidence quality.
   LIMITATION_NO_WIRE_EVIDENCE = 11;

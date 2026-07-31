@@ -326,6 +326,31 @@ class Limitation(Enum):
     member to any caller that does hold a span to hang it on.
     """
 
+    INSTRUMENTATION_DEGRADED = "instrumentation_degraded"
+    """wardex's own instrumentation failed at this site, so something that
+    belongs on this span — or the whole span below it — is missing.
+
+    Every other member of this vocabulary describes a limit of what could be
+    OBSERVED: the framework did not say, the protocol does not carry it, a bound
+    was reached. This one describes a limit of wardex. It exists because the two
+    are indistinguishable downstream without it, and the wrong one gets blamed:
+    a subtree missing because an adapter threw looks exactly like a subtree that
+    never ran.
+
+    Declared; no emitter until the adapter surface reports its own failures.
+    When it arrives it belongs to ``adapters/_context.py`` alone, and it is BEST
+    EFFORT by contract there: the span that would carry it is sometimes the very
+    one that could not be built, so it lands on the enclosing unit instead — and
+    where there is no enclosing unit it cannot land at all. What always survives
+    is the line the same failure prints to stderr, which touches nothing that
+    can itself be broken.
+
+    Deliberately not ``CONTEXT_PROPAGATION_DEGRADED``, which is declared as a
+    property of the RUNTIME — work whose carrier legitimately could not inherit
+    the context. Reusing it here would file a wardex bug under "the host's
+    threading model", which is the attribution this member exists to correct.
+    """
+
     # ------------------------------------------------------------------
     # Observation completeness (I8, §8.1 rule W)
     # ------------------------------------------------------------------

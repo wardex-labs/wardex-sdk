@@ -1205,11 +1205,14 @@ _VOCABULARY: dict[str, str] = {
     "SESSION_ABORTED": "session_aborted",
     # --- §5.4 V3, no emitter today (1) ---
     "TOOL_NAME_COLLISION": "tool_name_collision",
+    # --- the one member that describes wardex rather than the observation (1) ---
+    "INSTRUMENTATION_DEGRADED": "instrumentation_degraded",
 }
 
 
-def test_the_vocabulary_is_exactly_these_thirty_seven() -> None:
-    """15 declared before the census + 21 from it + 1 from §5.4, name by name.
+def test_the_vocabulary_is_exactly_these_thirty_eight() -> None:
+    """15 declared before the census + 21 from it + 1 from §5.4 + 1 for wardex
+    itself, name by name.
 
     A count alone is not enough: a RENAME keeps the count and is the single most
     expensive mistake available here. These are proto enum values in

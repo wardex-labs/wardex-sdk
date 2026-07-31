@@ -9,7 +9,7 @@
 //! table is a SECOND declaration of a list the `.proto` already declares, and
 //! nothing makes the compiler compare the two — a member added to one and
 //! forgotten in the other compiles, ships, and silently flattens to
-//! `UNSPECIFIED` on the wire. At 37 members (`Limitation`) that is not a
+//! `UNSPECIFIED` on the wire. At 38 members (`Limitation`) that is not a
 //! hypothetical.
 //!
 //! prost generates `from_str_name` / `as_str_name` from the schema itself, so
@@ -196,13 +196,13 @@ mod tests {
         }
     }
 
-    /// The whole 37-member vocabulary, round-tripped by number. A member added
+    /// The whole 38-member vocabulary, round-tripped by number. A member added
     /// to the schema with a name that breaks the convention fails here rather
     /// than flattening to UNSPECIFIED on a user's wire.
     #[test]
     fn every_limitation_round_trips() {
         let mut seen = 0;
-        for n in 1..=37 {
+        for n in 1..=38 {
             let value = limitation_name(n);
             assert!(!value.is_empty(), "no name for limitation {n}");
             assert!(
@@ -216,7 +216,7 @@ mod tests {
             );
             seen += 1;
         }
-        assert_eq!(seen, 37);
+        assert_eq!(seen, 38);
     }
 
     #[test]
@@ -233,7 +233,7 @@ mod tests {
 
     /// `VOCABULARY_UNMAPPED` is a META value, not vocabulary. It must be
     /// reachable for decode (a newer SDK can send it) and must NOT sit inside
-    /// the 1..=37 band a consumer iterates as "the vocabulary".
+    /// the 1..=38 band a consumer iterates as "the vocabulary".
     #[test]
     fn the_meta_value_is_outside_the_vocabulary_band() {
         assert_eq!(pb::Limitation::VocabularyUnmapped as i32, 9001);
