@@ -313,3 +313,159 @@ def test_teardown_still_closes_the_client_when_an_uninstall_raises():
         adapter_registry().uninstall_all()
         _lifecycle._current_client = None
         _hub.reset_for_test()
+
+
+# --------------------------------------------------------------------------
+# install is as total as uninstall, and teardown finishes whatever interrupts it
+# --------------------------------------------------------------------------
+
+
+class _InstallBoom(AdapterInterface):
+    """Raises partway through `install()`, having already patched something."""
+
+    def __init__(self) -> None:
+        self.uninstalls = 0
+
+    def name(self) -> str:
+        return "install-boom"
+
+    def install(self, client, ctx=None) -> None:  # noqa: ANN001
+        raise RuntimeError("half-patched, then failed")
+
+    def uninstall(self) -> None:
+        self.uninstalls += 1
+
+
+def test_an_adapter_that_raises_on_install_does_not_take_init_down_with_it():
+    """The asymmetry that was the bug: `uninstall_all` has always been total and
+    `install` was not. A component whose entire promise is never to alter the
+    host application crashed the host at startup.
+    """
+    reg = AdapterRegistry()
+    counters.reset()
+
+    reg.install(_InstallBoom(), client=None)  # must not raise
+
+    assert counters.get("adapters.install-boom.install") == 1, "the failure left no trace"
+    assert not reg.is_installed("install-boom"), "a failed install stayed registered"
+
+
+def test_a_failed_install_is_still_reachable_by_the_teardown_that_undoes_it():
+    """Filed BEFORE called, which is why the rollback can run at all.
+
+    An `install()` that raises halfway has already patched part of a framework.
+    An adapter the registry never recorded is one nothing can reach, so those
+    wrappers stayed in the host's classes for the life of the process.
+    """
+    reg = AdapterRegistry()
+    adapter = _InstallBoom()
+
+    reg.install(adapter, client=None)
+
+    assert adapter.uninstalls == 1, "the half-installed adapter was never undone"
+
+
+def test_a_later_adapter_is_torn_down_before_an_earlier_one():
+    """LIFO, for `PatchSet`'s reason. Two adapters that patched one attribute
+    leave the later one's wrapper in place; undoing the EARLIER first finds a
+    value that is not its own, declines, and the later undo then restores the
+    earlier adapter's wrapper as if it were the host's original.
+    """
+    order: list[str] = []
+
+    class _Ordered(AdapterInterface):
+        def __init__(self, tag: str) -> None:
+            self.tag = tag
+
+        def name(self) -> str:
+            return self.tag
+
+        def install(self, client, ctx=None) -> None:  # noqa: ANN001
+            pass
+
+        def uninstall(self) -> None:
+            order.append(self.tag)
+
+    reg = AdapterRegistry()
+    reg.install(_Ordered("first"), client=None)
+    reg.install(_Ordered("second"), client=None)
+
+    reg.uninstall_all()
+
+    assert order == ["second", "first"]
+
+
+def test_a_keyboard_interrupt_mid_teardown_still_reaches_the_host_and_the_rest():
+    """`guard()` re-raises BaseException on purpose — control flow is the host's
+    to decide. But re-raising it IN PLACE abandons every adapter behind the
+    interrupted one: their patches stay in the host's classes and their open
+    spans never ship, from atexit, where nothing reports why.
+    """
+
+    class _Interrupted(AdapterInterface):
+        def name(self) -> str:
+            return "interrupted"
+
+        def install(self, client, ctx=None) -> None:  # noqa: ANN001
+            pass
+
+        def uninstall(self) -> None:
+            raise KeyboardInterrupt
+
+    reg = AdapterRegistry()
+    later = _CountingAdapter()
+    reg.install(_Interrupted(), client=None)
+    reg.install(later, client=None)
+    counters.reset()
+
+    with pytest.raises(KeyboardInterrupt):
+        reg.uninstall_all()
+
+    assert later.uninstalls == 1, "an adapter behind the interrupt was abandoned"
+    assert not reg.is_installed("interrupted")
+    assert not reg.is_installed("counting-adapter")
+    assert counters.get("adapters.interrupted.uninstall_interrupted") == 1
+
+
+def test_an_interrupted_close_units_does_not_cost_the_other_adapters_theirs():
+    """Same rule on the signal path, where the process may be milliseconds from
+    ending and every span not yet closed is one that never existed.
+    """
+
+    class _InterruptedClose(AdapterInterface):
+        def name(self) -> str:
+            return "interrupted-close"
+
+        def install(self, client, ctx=None) -> None:  # noqa: ANN001
+            pass
+
+        def uninstall(self) -> None:
+            pass
+
+        def close_units(self, *, marker) -> None:  # noqa: ANN001
+            raise KeyboardInterrupt
+
+    closed: list = []
+
+    class _ClosingAdapter(AdapterInterface):
+        def name(self) -> str:
+            return "closing"
+
+        def install(self, client, ctx=None) -> None:  # noqa: ANN001
+            pass
+
+        def uninstall(self) -> None:
+            pass
+
+        def close_units(self, *, marker) -> None:  # noqa: ANN001
+            closed.append(marker)
+
+    reg = AdapterRegistry()
+    reg.install(_InterruptedClose(), client=None)
+    reg.install(_ClosingAdapter(), client=None)
+
+    with pytest.raises(KeyboardInterrupt):
+        reg.close_units_all(marker=Limitation.UNIT_INTERRUPTED)
+
+    assert closed == [Limitation.UNIT_INTERRUPTED]
+    assert reg.is_installed("interrupted-close"), "close_units must not uninstall"
