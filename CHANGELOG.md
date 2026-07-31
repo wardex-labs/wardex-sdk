@@ -6,6 +6,19 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Fixed
+- **`OtlpHttpTransport` now exports what wardex knows about its own uncertainty.**
+  `correlation` and `capture_integrity` were encoded on the wardex envelope and
+  dropped entirely by the OTLP encoder — and OTLP is the only transport exported
+  from the package root, so on the documented path every "this parent edge is a
+  guess" and every "this body was truncated" reached nobody, indistinguishable
+  from a span that had nothing to report. They now travel as span attributes,
+  the same way a link's `reason` already does: `wardex.parent_source`,
+  `wardex.parent_confidence`, `wardex.correlation.{request_id,operation_id,attempt_id}`,
+  `wardex.limitations` (a string array), `wardex.capture.{request_headers,
+  request_body,response_headers,response_body}` and — only when they happened —
+  `wardex.capture.{truncated,redacted,dropped_chunks}`. A span with nothing to
+  report still carries none of them. List-valued attributes also decode
+  correctly now; `decode_otlp_traces` reported them as unset.
 - A tool a **sub-agent** ran now gets its own `execute_tool` span with its own
   result. The Agent SDK writes one line for a tool result and puts two different
   identifiers on it — `parent_tool_use_id` says which sub-agent produced the

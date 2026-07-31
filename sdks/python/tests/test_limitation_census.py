@@ -1036,6 +1036,10 @@ _RUST_VEC_TYPE = r"Vec\s*<\s*&\s*(?:'static\s+)?str\s*>"
 #: circularity the backstop forbids — but it is not the type rule's coverage
 #: either, and a channel named for what it carries is the only thing keeping it.
 _RUST_OWNED_VEC_TYPE = r"Vec\s*<\s*String\s*>"
+
+#: A marker vector filled by stringifying members of the CLOSED Python enum.
+#: Readable, unlike an opaque constant: the vocabulary bounds it at the source.
+_RUST_FROM_CLOSED_ENUM = re.compile(r"\benum_str\s*\(")
 _RUST_BINDING_DECL = re.compile(r"\b([A-Za-z_]\w*)\s*:\s*" + _RUST_VEC_TYPE)
 _RUST_FN_DECL = re.compile(r"\bfn\s+([A-Za-z_]\w*)\s*\([^)]*\)\s*->\s*" + _RUST_VEC_TYPE)
 _RUST_OWNED_BINDING_DECL = re.compile(r"\b([A-Za-z_]\w*)\s*:\s*" + _RUST_OWNED_VEC_TYPE)
@@ -1066,6 +1070,12 @@ _RUST_STR = re.compile(r'"((?:[^"\\]|\\.)*)"')
 _RUST_VEC_DECLARATIONS: dict[str, str] = {
     "crates/wardex-protocol/src/http1.rs": "ParsedHttp.limitations — the marker vector itself",
     "bindings/python/src/lib.rs": "the PyO3 getter that hands it to protocol/_http1.py",
+    "bindings/python/src/codec.rs": (
+        "integrity_to_otlp — a PROJECTION of a span's markers onto an OTLP "
+        "attribute, not a place any marker is minted. Recorded rather than "
+        "renamed out of the scan: limitation strings really do flow through it "
+        "on their way to the wire, which is what this table is for."
+    ),
 }
 """Every declaration of a `Vec<&str>` in `crates/` and `bindings/`, by file.
 
@@ -1138,6 +1148,16 @@ class _RustCensus:
                 for match in pattern.finditer(text):
                     end = text.find(";", match.end())
                     segment = text[match.end() : end if end != -1 else match.end() + 400]
+                    if _RUST_FROM_CLOSED_ENUM.search(segment):
+                        # A value READ off the closed `Limitation` enum, not a
+                        # marker this file names. `enum_str` stringifies a Python
+                        # enum member, so every value is one of the declared
+                        # members by construction and there is nothing here the
+                        # census could learn from or the wire could be surprised
+                        # by. Kept narrow on purpose: `push(SOME_CONST)` is still
+                        # a hole, because a constant is a name this scan cannot
+                        # follow to a value.
+                        continue
                     literals = _RUST_STR.findall(segment)
                     if literals:
                         for literal in literals:

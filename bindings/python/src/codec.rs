@@ -1013,6 +1013,110 @@ fn otlp_kv_bytes(key: &str, v: Vec<u8>) -> otlp_pb::common::KeyValue {
         }),
     }
 }
+fn otlp_kv_bool(key: &str, v: bool) -> otlp_pb::common::KeyValue {
+    otlp_pb::common::KeyValue {
+        key: key.into(),
+        value: Some(otlp_pb::common::AnyValue {
+            value: Some(otlp_pb::common::any_value::Value::BoolValue(v)),
+        }),
+    }
+}
+fn otlp_kv_f64(key: &str, v: f64) -> otlp_pb::common::KeyValue {
+    otlp_pb::common::KeyValue {
+        key: key.into(),
+        value: Some(otlp_pb::common::AnyValue {
+            value: Some(otlp_pb::common::any_value::Value::DoubleValue(v)),
+        }),
+    }
+}
+fn otlp_kv_strs(key: &str, vs: Vec<String>) -> otlp_pb::common::KeyValue {
+    otlp_pb::common::KeyValue {
+        key: key.into(),
+        value: Some(otlp_pb::common::AnyValue {
+            value: Some(otlp_pb::common::any_value::Value::ArrayValue(
+                otlp_pb::common::ArrayValue {
+                    values: vs
+                        .into_iter()
+                        .map(|v| otlp_pb::common::AnyValue {
+                            value: Some(otlp_pb::common::any_value::Value::StringValue(v)),
+                        })
+                        .collect(),
+                },
+            )),
+        }),
+    }
+}
+
+/// `CorrelationInfo` and `CaptureIntegrity` -> OTLP span attributes.
+///
+/// OTLP has no native home for either, so they travel under `wardex.*` the same
+/// way a link's `reason` does. Leaving them out is not a smaller version of the
+/// same export -- it is the one that cannot be audited. Every marker this SDK
+/// spends its design on says what it could NOT establish, and `OtlpHttpTransport`
+/// is the only transport exported from the package root: a user on the
+/// documented path was receiving spans stripped of every "this edge is a guess"
+/// and every "this body was truncated", with nothing to distinguish them from
+/// spans that had nothing to report. `events_to_otlp` names this exact failure
+/// for a different field one screen below.
+fn integrity_to_otlp(
+    sp: &Bound<PyAny>,
+    attrs: &mut Vec<otlp_pb::common::KeyValue>,
+) -> PyResult<()> {
+    if let Some(c) = opt(sp, "correlation")? {
+        if let Some(src) = opt(&c, "strategy")? {
+            attrs.push(otlp_kv_str("wardex.parent_source", &enum_str(&src)?));
+        }
+        attrs.push(otlp_kv_f64(
+            "wardex.parent_confidence",
+            c.getattr("confidence")?.extract()?,
+        ));
+        // The identifier that was CONSULTED to pick a parent. Present only when
+        // one was, so a non-null value is actionable rather than decorative.
+        for (field, key) in [
+            ("request_id", "wardex.correlation.request_id"),
+            ("operation_id", "wardex.correlation.operation_id"),
+            ("attempt_id", "wardex.correlation.attempt_id"),
+        ] {
+            if let Some(v) = opt(&c, field)? {
+                attrs.push(otlp_kv_str(key, &v.extract::<String>()?));
+            }
+        }
+    }
+    if let Some(i) = opt(sp, "capture_integrity")? {
+        let mut markers: Vec<String> = Vec::new();
+        for m in i.getattr("limitations")?.iter()? {
+            markers.push(enum_str(&m?)?);
+        }
+        if !markers.is_empty() {
+            attrs.push(otlp_kv_strs("wardex.limitations", markers));
+        }
+        for (field, key) in [
+            ("request_headers_captured", "wardex.capture.request_headers"),
+            ("request_body_captured", "wardex.capture.request_body"),
+            (
+                "response_headers_captured",
+                "wardex.capture.response_headers",
+            ),
+            ("response_body_captured", "wardex.capture.response_body"),
+        ] {
+            attrs.push(otlp_kv_bool(key, i.getattr(field)?.extract()?));
+        }
+        // Emitted only when true / non-zero: unlike the four above, whose FALSE
+        // is the informative reading, these describe an event that either
+        // happened or did not.
+        if i.getattr("truncated")?.extract()? {
+            attrs.push(otlp_kv_bool("wardex.capture.truncated", true));
+        }
+        if i.getattr("redacted")?.extract()? {
+            attrs.push(otlp_kv_bool("wardex.capture.redacted", true));
+        }
+        let dropped: i64 = i.getattr("dropped_chunk_count")?.extract()?;
+        if dropped > 0 {
+            attrs.push(otlp_kv_int("wardex.capture.dropped_chunks", dropped));
+        }
+    }
+    Ok(())
+}
 
 /// InternalSpan(Python) → OTLP Span. Mirrors `span_to_proto` + OTLP enum/types.
 fn span_to_otlp(sp: &Bound<PyAny>) -> PyResult<otlp_pb::trace::Span> {
@@ -1082,6 +1186,7 @@ fn span_to_otlp(sp: &Bound<PyAny>) -> PyResult<otlp_pb::trace::Span> {
     if !output.is_empty() {
         attrs.push(otlp_kv_bytes("wardex.output_data", output));
     }
+    integrity_to_otlp(sp, &mut attrs)?;
     span.attributes = attrs;
     events_to_otlp(sp, &mut span.events)?;
     links_to_otlp(sp, &mut span.links)?;
@@ -1210,6 +1315,15 @@ fn otlp_any_to_py(py: Python<'_>, v: &otlp_pb::common::AnyValue) -> PyObject {
         Some(Value::DoubleValue(d)) => d.into_py(py),
         Some(Value::BoolValue(b)) => b.into_py(py),
         Some(Value::BytesValue(b)) => PyBytes::new_bound(py, b).into_py(py),
+        // A list attribute decoded as `None` is not a smaller answer, it is a
+        // wrong one: the encoder wrote the values and the reader reports the
+        // key as unset. `limitations` is the first array this SDK sends and it
+        // is exactly the field a consumer checks to decide whether to trust a
+        // span, so silence here would be indistinguishable from "nothing to
+        // report".
+        Some(Value::ArrayValue(a)) => {
+            PyList::new_bound(py, a.values.iter().map(|e| otlp_any_to_py(py, e))).into_py(py)
+        }
         _ => py.None(),
     }
 }

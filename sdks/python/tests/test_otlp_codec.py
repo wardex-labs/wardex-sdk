@@ -194,3 +194,81 @@ def test_state_snapshot_skipped():
     env = _envelope_with_snapshot_only()
     d = _wardex_native.codec.decode_otlp_traces(_wardex_native.codec.encode_otlp_traces(env))
     assert d["resource_spans"] == []
+
+
+# ==========================================================================
+# What wardex knows about its own uncertainty, on the path that leaves the process
+# ==========================================================================
+
+
+def _envelope_with_uncertainty() -> InternalEnvelope:
+    from wardex_sdk._types import CaptureIntegrity, CorrelationInfo
+    from wardex_sdk.assembly import Limitation
+    from wardex_sdk.assembly._parentage import ParentSource
+
+    return InternalEnvelope(
+        header=_header(),
+        spans=(
+            _span(
+                correlation=CorrelationInfo(
+                    strategy=ParentSource.UNIT_SOLE,
+                    confidence=0.5,
+                    request_id="toolu_9",
+                ),
+                capture_integrity=CaptureIntegrity(
+                    limitations=(
+                        Limitation.UNIT_INFERRED_SOLE,
+                        Limitation.BODY_CAP_EXCEEDED,
+                    ),
+                    request_body_captured=True,
+                    response_body_captured=False,
+                    truncated=True,
+                    dropped_chunk_count=3,
+                ),
+            ),
+        ),
+    )
+
+
+def test_a_guessed_edge_says_so_on_the_otlp_wire():
+    """OTLP is the only transport exported from the package root, so a marker
+    that reaches the wardex envelope and not this encoder reaches nobody.
+
+    Every marker this SDK spends its design on says what could NOT be
+    established. Stripping them here left a 0.5 guess and a 1.0 fact
+    indistinguishable for every user on the documented path — the silent-loss
+    shape `events_to_otlp` names for a different field in the same file.
+    """
+    attrs = _first_span(_envelope_with_uncertainty())["attributes"]
+
+    assert attrs["wardex.parent_source"] == "unit_sole"
+    assert attrs["wardex.parent_confidence"] == 0.5
+    assert attrs["wardex.correlation.request_id"] == "toolu_9"
+
+
+def test_every_limitation_a_span_carries_reaches_the_otlp_wire():
+    attrs = _first_span(_envelope_with_uncertainty())["attributes"]
+
+    assert attrs["wardex.limitations"] == ["unit_inferred_sole", "body_cap_exceeded"]
+
+
+def test_what_was_and_was_not_captured_reaches_the_otlp_wire():
+    """The four capture flags are always present because FALSE is their
+    informative reading; truncation and drops are events, so they appear only
+    when they happened."""
+    attrs = _first_span(_envelope_with_uncertainty())["attributes"]
+
+    assert attrs["wardex.capture.request_body"] is True
+    assert attrs["wardex.capture.response_body"] is False
+    assert attrs["wardex.capture.truncated"] is True
+    assert attrs["wardex.capture.dropped_chunks"] == 3
+
+
+def test_a_span_with_nothing_to_report_carries_no_uncertainty_attributes():
+    """Absence has to stay legible: a span that reports no limitation must not
+    be padded with keys that make it look examined and cleared."""
+    attrs = _first_span(_envelope_with_span())["attributes"]
+
+    assert "wardex.limitations" not in attrs
+    assert "wardex.capture.truncated" not in attrs
+    assert "wardex.parent_source" not in attrs
