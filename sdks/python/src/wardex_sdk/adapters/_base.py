@@ -9,6 +9,7 @@ from ..assembly import Limitation
 
 if TYPE_CHECKING:
     from .._client import Client
+    from ._context import AdapterContext
 
 
 class AdapterInterface(ABC):
@@ -22,7 +23,14 @@ class AdapterInterface(ABC):
     def name(self) -> str: ...
 
     @abstractmethod
-    def install(self, client: Client | None) -> None: ...
+    def install(self, client: Client | None, ctx: AdapterContext | None = None) -> None:
+        """Patch the framework's surface.
+
+        `ctx` is the contract an adapter is moving onto — see
+        `adapters/_context.py`. It is optional while adapters migrate one at a
+        time; an adapter that ignores it keeps today's behaviour exactly.
+        """
+        ...
 
     @abstractmethod
     def uninstall(self) -> None: ...

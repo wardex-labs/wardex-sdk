@@ -4,8 +4,11 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from ..assembly import Limitation, guard
+from .._limits import CaptureLimits
+from ..assembly import Limitation, UnitRegistry, guard
 from ._base import AdapterInterface
+from ._context import AdapterContext
+from ._sink import _ClientSink
 
 if TYPE_CHECKING:
     from .._client import Client
@@ -19,8 +22,31 @@ class AdapterRegistry:
         name = adapter.name()
         if name in self._installed:
             return
-        adapter.install(client)
+        adapter.install(client, self._context_for(name, client))
         self._installed[name] = adapter
+
+    @staticmethod
+    def _context_for(name: str, client: Client | None) -> AdapterContext:
+        """Build the surface this adapter will eventually be written against.
+
+        Passed now and ignored by every adapter, so that the signature change
+        lands apart from the behaviour change — an adapter migrating onto it is
+        then a change to that adapter alone, not to the interface plus the
+        registry plus everyone else at once.
+
+        TRANSITIONAL: the registry it holds is its own, while each assembler
+        still constructs one of its own too. Nothing opens a unit in this one
+        yet, so the two cannot interact; the step that moves an adapter onto
+        `ctx` is the step that collapses them.
+        """
+        config = getattr(client, "config", None)
+        limits = config.limits if config is not None else CaptureLimits()
+        return AdapterContext(
+            name,
+            units=UnitRegistry(sink=_ClientSink(client)),
+            limits=limits.resolved(),
+            debug=bool(getattr(config, "debug", False)),
+        )
 
     def uninstall_all(self) -> None:
         """Uninstall every adapter. Total: one failure cannot stop the rest.

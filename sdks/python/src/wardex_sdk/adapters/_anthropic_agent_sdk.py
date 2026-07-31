@@ -477,7 +477,9 @@ class AnthropicAgentSdkAdapter(AdapterInterface):
 
     # --- install / uninstall ---
 
-    def install(self, client: Client | None) -> None:
+    def install(self, client: Client | None, ctx: object | None = None) -> None:
+        # `ctx` is accepted and not yet used; this adapter still builds its own
+        # registry inside `SessionAssembler`. Migrating is a change to this file.
         if self._installed:
             return
         try:

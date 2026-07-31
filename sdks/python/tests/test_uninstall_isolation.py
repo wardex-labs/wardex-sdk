@@ -189,7 +189,7 @@ class _Boom(InterceptorInterface):
     def name(self) -> str:
         return "boom"
 
-    def install(self, client) -> None:  # noqa: ANN001
+    def install(self, client, ctx=None) -> None:  # noqa: ANN001
         pass
 
     def uninstall(self) -> None:
@@ -203,7 +203,7 @@ class _Counting(InterceptorInterface):
     def name(self) -> str:
         return "counting"
 
-    def install(self, client) -> None:  # noqa: ANN001
+    def install(self, client, ctx=None) -> None:  # noqa: ANN001
         pass
 
     def uninstall(self) -> None:
@@ -214,7 +214,7 @@ class _BoomAdapter(AdapterInterface):
     def name(self) -> str:
         return "boom-adapter"
 
-    def install(self, client) -> None:  # noqa: ANN001
+    def install(self, client, ctx=None) -> None:  # noqa: ANN001
         pass
 
     def uninstall(self) -> None:
@@ -228,7 +228,7 @@ class _CountingAdapter(AdapterInterface):
     def name(self) -> str:
         return "counting-adapter"
 
-    def install(self, client) -> None:  # noqa: ANN001
+    def install(self, client, ctx=None) -> None:  # noqa: ANN001
         pass
 
     def uninstall(self) -> None:

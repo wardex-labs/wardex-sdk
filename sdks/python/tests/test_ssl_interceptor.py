@@ -39,7 +39,7 @@ class _FakeInterceptor(InterceptorInterface):
     def name(self) -> str:
         return "fake"
 
-    def install(self, client) -> None:
+    def install(self, client, ctx=None) -> None:
         self.installs += 1
 
     def uninstall(self) -> None:

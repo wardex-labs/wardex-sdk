@@ -267,7 +267,7 @@ def test_reinit_uninstalls_interceptors_before_closing_previous_client():
         def name(self) -> str:
             return "fake-lifecycle"
 
-        def install(self, client: Client | None) -> None:
+        def install(self, client, ctx=None) -> None:
             self.client = client
 
         def uninstall(self) -> None:
@@ -312,7 +312,7 @@ def test_reinit_uninstalls_adapters_before_closing_previous_client():
         def name(self) -> str:
             return "fake-lifecycle-adapter"
 
-        def install(self, client: Client | None) -> None:
+        def install(self, client, ctx=None) -> None:
             pass
 
         def uninstall(self) -> None:
@@ -383,7 +383,7 @@ class _UnitAdapter(AdapterInterface):
     def name(self) -> str:
         return "test_unit_adapter"
 
-    def install(self, client) -> None:
+    def install(self, client, ctx=None) -> None:
         self._asm.on_outbound(
             1,
             json.dumps(

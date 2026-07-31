@@ -16,7 +16,7 @@ class _FakeAdapter(AdapterInterface):
     def name(self) -> str:
         return "fake"
 
-    def install(self, client) -> None:
+    def install(self, client, ctx=None) -> None:
         self.installed += 1
 
     def uninstall(self) -> None:
@@ -29,7 +29,7 @@ class _BrokenInstallAdapter(AdapterInterface):
     def name(self) -> str:
         return "broken-install"
 
-    def install(self, client) -> None:
+    def install(self, client, ctx=None) -> None:
         raise RuntimeError("boom")
 
     def uninstall(self) -> None:

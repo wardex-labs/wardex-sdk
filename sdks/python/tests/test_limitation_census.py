@@ -936,6 +936,14 @@ _UNRESOLVED_PY: frozenset[tuple[str, str]] = frozenset(
         # `uninstall` and the signal handler — and both are in `_MEMBER_SITES`.
         ("adapters/_anthropic_agent_sdk.py", "Name:marker"),
         ("adapters/_registry.py", "Name:marker"),
+        # The adapter contract's own two forwards. `Name:marker` is the `marker`
+        # parameter of `Scope.note` / `RunHandle.note` / `Attachment.note` and
+        # `AdapterContext.close_all`, each a one-line pass onto the registry.
+        # `Attribute:name` is `owner=self.name` riding along in that same
+        # `close_all` call — R9 makes every argument of a marker-taking callee
+        # read-all, and an adapter's own name is not a marker.
+        ("adapters/_context.py", "Attribute:name"),
+        ("adapters/_context.py", "Name:marker"),
         ("interceptors/_seam.py", "Name:marker"),
         ("interceptors/_seam.py", "Tuple"),
         ("interceptors/_socket.py", "Tuple"),

@@ -62,7 +62,7 @@ class _Seam(ByteSeamInterceptor):
     def name(self):
         return "test-seam"
 
-    def install(self, client):
+    def install(self, client, ctx=None):
         self._client = client
 
     def uninstall(self):
