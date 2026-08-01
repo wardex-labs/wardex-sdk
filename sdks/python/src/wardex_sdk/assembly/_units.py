@@ -1000,9 +1000,19 @@ class UnitRegistry:
                     pending += self._evict_root_locked(now)
                 self._roots[unit] = None
             self._live_units[unit] = None
-            self._bind_alias_locked(key, unit)
-            for extra in aliases:
-                self._bind_alias_locked(extra, unit)
+            # Guarded from the INSIDE, and the placement is the whole point. By
+            # this line the unit is already in `_roots` and `_live_units`, so a
+            # fault here is not "the open failed" — it is "the open succeeded
+            # and the lookup table did not". A guard one level up, around the
+            # whole call, would therefore contain the raise and LEAK the unit:
+            # registered, live, reachable from no caller, counting against
+            # `max_units` until it evicts a real session to make room for a
+            # phantom, once per call. Guarded here the fault costs the ALIAS —
+            # `find(key)` misses — and the span still ships.
+            with guard("assembly._units.open_bind", debug=self._debug):
+                self._bind_alias_locked(key, unit)
+                for extra in aliases:
+                    self._bind_alias_locked(extra, unit)
         self._flush(pending)
         return unit
 
@@ -1412,10 +1422,25 @@ class UnitRegistry:
             for root in list(self._roots):
                 if owner is not None and root.owner != owner:
                     continue
-                root.note(reason)
-                pending += self._close_locked(
-                    root, status=StatusCode.UNSET, error_type=None, end_ns=end
-                )
+                # PER ROOT, and then evict the one that failed. One guard around
+                # the whole loop would let a single torn subtree cost every root
+                # in the table — measured on 3 roots x 4 children with one fault:
+                # a whole-sweep guard emits 0 of 15 spans, per-root emits 10.
+                # And per-root ALONE leaves the failing root standing, so every
+                # later sweep walks back into the same fault and the table never
+                # empties; evicting it costs the two units already detached from
+                # it and un-wedges the sweep. Both losses are real and neither is
+                # a fix — see `_close_locked` for what a real one would take.
+                closed = False
+                with guard("assembly._units.close_all_root", debug=self._debug):
+                    root.note(reason)
+                    pending += self._close_locked(
+                        root, status=StatusCode.UNSET, error_type=None, end_ns=end
+                    )
+                    closed = True
+                if not closed:
+                    self._roots.pop(root, None)
+                    self._live_units.pop(root, None)
         self._flush(pending)
 
     def _evict_root_locked(self, end_ns: int) -> list[SpanDraft]:

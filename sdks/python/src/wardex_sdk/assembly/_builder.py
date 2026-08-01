@@ -53,7 +53,7 @@ from .._types import (
     TransportAttributes,
 )
 from ._integrity import Limitation
-from ._parentage import Parentage
+from ._parentage import EMPTY_AMBIENT, Evidence, Parentage, ParentSource, resolve_parentage
 from ._vocab import (
     Block,
     LinkReason,
@@ -778,4 +778,120 @@ class SpanDraft:
             raise VocabularyError("the draft's context left its parentage's trace")
 
 
-__all__ = ["OTEL_ERROR_TYPE_OTHER", "IntegrityBuilder", "SpanDraft"]
+#: The anchor a null draft answers `.context` with. Minted ONCE at import,
+#: through the sanctioned factory — this adds no `TraceId.generate()` site, and
+#: it names a span that is never emitted, which is exactly what a null anchor
+#: means. A caller that reads it and hangs a child off it gets a subtree in a
+#: trace nothing else is in, which is a visible loss rather than a subtree
+#: silently grafted onto a live span.
+_NULL_CONTEXT = resolve_parentage(EMPTY_AMBIENT, Evidence(ParentSource.UNRESOLVED)).child_context()
+
+
+class _NullDraft:
+    """Every verb reachable from a DEGRADED handle, as a total no-op.
+
+    Exists so that "wardex failed here" costs the span and never the host. An
+    adapter that has been handed a degraded scope keeps describing it — that is
+    the whole point of not making the adapter branch — and every one of those
+    calls has to land somewhere that cannot fail.
+
+    NOT a `SpanDraft`, and deliberately not built like one. Constructing a real
+    draft is `resolve_parentage()` + `SpanDraft(...)`, which is precisely the
+    code whose failure produced the degraded handle in the first place: a lazy
+    property would raise inside the host's `with` body and an eager one would
+    raise out of `__enter__`, so the host would never run at all. `__slots__ =
+    ()` and a module singleton leave nothing here that can fail.
+
+    NO `finish()`, and that absence is structural rather than an oversight: a
+    null draft may never reach a sink, and the only way to make that true by
+    construction is for the materializer not to exist. `claim_emit()` answers
+    False for the same reason — a sink that asks "may I emit this" gets an
+    answer, not an `AttributeError`.
+    """
+
+    __slots__ = ()
+
+    # -- SpanDraft, verb for verb ---------------------------------------
+    def rename(self, name: str) -> None: ...
+    def relabel(self, label: TransportLabel, subject: str | None) -> None: ...
+    def set_gen_ai(self, attrs: GenAIAttributes) -> None: ...
+    def set_agent(self, attrs: AgentAttributes) -> None: ...
+    def set_tool(self, attrs: ToolAttributes) -> None: ...
+    def set_retrieval(self, attrs: RetrievalAttributes) -> None: ...
+    def set_embeddings(self, attrs: EmbeddingsAttributes) -> None: ...
+    def set_evaluation(self, attrs: EvaluationAttributes) -> None: ...
+    def set_transport(self, attrs: TransportAttributes) -> None: ...
+    def set_conversation(self, conv: ConversationContext | None) -> None: ...
+    def set_call_site(self, call_site: CallSite | None) -> None: ...
+    def set_workflow_name(self, name: str | None) -> None: ...
+    def set_cost_usd(self, cost: float | None) -> None: ...
+    def set_server(self, address: str | None, port: int | None) -> None: ...
+    def set_io(self, **kw: Any) -> None: ...
+    def set_end_ns(self, end_ns: int) -> None: ...
+    def set_status(self, code: StatusCode, message: str = "") -> None: ...
+    def set_error(self, error_type: str | None, message: str = "") -> None: ...
+    def set_operation_label(self, operation: Any) -> None: ...
+    def set_extra(self, key: str, value: _Scalar) -> None: ...
+    def add_limitation(self, marker: Limitation) -> None: ...
+    def add_link(self, ctx: SpanContext, reason: LinkReason) -> None: ...
+    def add_event(self, name: str, ts_ns: int, **attrs: _Scalar) -> None: ...
+    def add_source(self, source: CaptureSource) -> None: ...
+    def replace_correlation(self, correlation: CorrelationInfo | None) -> None: ...
+    def merge_correlation(self, extra: CorrelationInfo) -> None: ...
+
+    # -- IntegrityBuilder, chained the way the real one chains -----------
+    def request_headers(self, *, attempted: bool, ok: bool = True) -> _NullDraft:
+        return self
+
+    def request_body(self, *, attempted: bool, ok: bool = True) -> _NullDraft:
+        return self
+
+    def response_headers(self, *, attempted: bool, ok: bool = True) -> _NullDraft:
+        return self
+
+    def response_body(self, *, attempted: bool, ok: bool = True) -> _NullDraft:
+        return self
+
+    def truncated(self, value: bool) -> _NullDraft:
+        return self
+
+    def redacted(self, value: bool) -> _NullDraft:
+        return self
+
+    def dropped_chunks(self, count: int) -> _NullDraft:
+        return self
+
+    def limitation(self, marker: Limitation) -> _NullDraft:
+        return self
+
+    def build(self) -> CaptureIntegrity | None:
+        return None
+
+    @property
+    def markers(self) -> tuple[Limitation, ...]:
+        return ()
+
+    # -- the three readers a caller may still reach ----------------------
+    @property
+    def integrity(self) -> _NullDraft:
+        return self
+
+    @property
+    def context(self) -> SpanContext:
+        return _NULL_CONTEXT
+
+    @property
+    def name(self) -> str:
+        return ""
+
+    def claim_emit(self) -> bool:
+        return False
+
+
+#: The one instance. Identity is load-bearing: `Scope.close_child` short-circuits
+#: on `draft is NULL_DRAFT`, so a degraded child draft cannot be handed to a
+#: registry that would try to close a span that was never opened.
+NULL_DRAFT = _NullDraft()
+
+
+__all__ = ["NULL_DRAFT", "OTEL_ERROR_TYPE_OTHER", "IntegrityBuilder", "SpanDraft"]

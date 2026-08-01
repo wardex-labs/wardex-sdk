@@ -1428,3 +1428,99 @@ def test_another_registrys_dead_pin_is_not_this_registrys_conflict():
     # older run left standing rather than becoming an orphan that blames it.
     unit = open_session(fresh, "new", ambient=latch_ambient())
     assert Limitation.CORRELATION_CONFLICT not in unit.draft.integrity.markers
+
+
+# ==========================================================================
+# A wardex bug costs the smallest thing it can
+# ==========================================================================
+
+
+def test_a_fault_binding_an_alias_costs_the_alias_and_not_the_unit():
+    """The guard's PLACEMENT is the assertion, not its presence.
+
+    By the time `open()` binds aliases the unit is already in `_roots` and
+    `_live_units`, so a fault there is not "the open failed" — it is "the open
+    succeeded and the lookup table did not". Guarded from OUTSIDE, the raise is
+    contained one level up and the unit is LEAKED: registered, live, reachable
+    from no caller, counting against `max_units` until it evicts a real session
+    to make room for a phantom — once per call, and invisible until traces stop
+    appearing. Guarded from inside, the fault costs the alias and nothing else.
+    """
+
+    class Broken(UnitRegistry):
+        __slots__ = ()
+
+        def _bind_alias_locked(self, key, unit):
+            raise RuntimeError("the alias table is gone")
+
+    sink = RecordingSink()
+    reg = Broken(sink=sink)
+
+    unit = open_session(reg, "s1")
+
+    # The unit came back live and fully registered: the span is not lost.
+    assert unit.is_live
+    reg.close(unit)
+    assert len(sink.spans()) == 1
+
+    # What WAS lost is the lookup, and only the lookup.
+    assert reg.find(UnitKey("test.session", "s1")) is None
+    assert counters.get("assembly._units.open_bind") >= 1
+
+    # And nothing leaked: the counterfactual an outside guard produces is a
+    # live root per call that no later sweep can reach.
+    assert len(reg._live_units) == 0
+    assert len(reg._roots) == 0
+
+
+def test_one_root_that_cannot_be_closed_costs_only_its_own_subtree():
+    """3 roots x 4 children = 15 spans owed, one fault in one child of root #0.
+
+    Three shapes were measured. A guard around the whole sweep emits 0 of 15 —
+    one torn subtree costs every root in the table. Per-root emits 10 of 15 but
+    leaves root #0 standing, so every later sweep walks back into the same fault
+    and the table never empties. Per-root plus eviction emits 10 and leaves
+    `_roots` empty.
+
+    The docstring records the loss honestly: 5 spans are gone and 2 units are
+    permanently unreachable. This is the best of three measured shapes, not a
+    fix. A real fix makes `_close_locked` two-phase — collect the subtree's
+    drafts without mutating, then mutate — which is surgery on a delicate
+    function plus a rule every future editor has to preserve.
+    """
+    victim: list = []
+
+    class Broken(UnitRegistry):
+        __slots__ = ()
+
+        def _close_locked(self, unit, **kw):
+            if victim and unit is victim[0]:
+                raise RuntimeError("this subtree is torn")
+            return super()._close_locked(unit, **kw)
+
+    sink = RecordingSink()
+    reg = Broken(sink=sink)
+
+    roots = [open_session(reg, f"root{i}", subject=f"root{i}") for i in range(3)]
+    for i, root in enumerate(roots):
+        for j in range(4):
+            open_subagent(reg, root, f"a{i}{j}")
+    victim.append(roots[0]._children and next(iter(roots[0]._children)))
+
+    reg.close_all(reason=Limitation.ADAPTER_UNINSTALLED)
+
+    # Ten of fifteen. The two other roots are untouched by root #0's fault.
+    assert len(sink.drafts) == 10
+    names = {d.name for d in sink.drafts}
+    assert "invoke_agent root1" in names
+    assert "invoke_agent root2" in names
+    assert "invoke_agent root0" not in names
+
+    # And the poisoned root is GONE from the table rather than wedged in it.
+    assert len(reg._roots) == 0
+    assert counters.get("assembly._units.close_all_root") == 1
+
+    # A second sweep is quiet: it finds nothing and does not re-trip.
+    reg.close_all(reason=Limitation.ADAPTER_UNINSTALLED)
+    assert len(sink.drafts) == 10
+    assert counters.get("assembly._units.close_all_root") == 1

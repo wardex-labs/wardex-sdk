@@ -1072,6 +1072,62 @@ def test_sink_is_not_called_from_assembly_yet():
 
 
 # --------------------------------------------------------------------------
+# the degraded draft answers everything the real one does
+# --------------------------------------------------------------------------
+
+
+def _public_names(cls: type) -> frozenset[str]:
+    return frozenset(n for n in vars(cls) if not n.startswith("_"))
+
+
+def test_the_degraded_draft_answers_every_verb_the_real_one_does():
+    """Reflection, not AST: a verb added to `SpanDraft` needs a null counterpart.
+
+    `NULL_DRAFT` is what an adapter is handed after wardex's own work failed,
+    and the whole reason the adapter does not have to branch on that is that
+    every verb still answers. A hand-written null draft covers the verbs its
+    author happened to remember — which is a list written from the same memory
+    that will later add a setter and forget it — so the superset is asserted
+    here instead, where the failure lands in this suite rather than in a host's
+    process as an `AttributeError` from inside a `with` body.
+
+    Three exclusions, and each is structural rather than convenient:
+
+      * `finish` — a null draft may never reach a sink. The only way to make
+        that true by construction is for the materializer not to exist, so its
+        ABSENCE is asserted rather than a no-op version being tolerated.
+      * `manual` / `transport` — constructors, not verbs. Nothing holding a
+        degraded draft calls them; they are how a real one is born.
+    """
+    from wardex_sdk.assembly._builder import NULL_DRAFT, IntegrityBuilder, SpanDraft
+
+    null = _public_names(type(NULL_DRAFT))
+    excluded = {"finish", "manual", "transport"}
+
+    missing = (_public_names(SpanDraft) - excluded) - null
+    assert missing == set(), (
+        f"NULL_DRAFT cannot answer {sorted(missing)}, which SpanDraft can. An\n"
+        "adapter handed a degraded scope keeps describing it — that is the point\n"
+        "of not making it branch — so every one of those calls has to land\n"
+        "somewhere that cannot fail. Add the no-op to assembly/_builder.py."
+    )
+    # Asked of what `.integrity` RETURNS, not of the null draft's own class.
+    # `_NullDraft` answers itself there, which is an implementation choice — the
+    # obligation is that whatever comes back speaks the builder's language.
+    missing_integrity = _public_names(IntegrityBuilder) - _public_names(type(NULL_DRAFT.integrity))
+    assert missing_integrity == set(), (
+        f"NULL_DRAFT.integrity cannot answer {sorted(missing_integrity)}, which\n"
+        "IntegrityBuilder can. `draft.integrity` is reached by every site that\n"
+        "needs the full attempted/ok vocabulary rather than set_io's shorthand."
+    )
+
+    assert not hasattr(NULL_DRAFT, "finish"), (
+        "NULL_DRAFT grew a finish(). A null draft that can be materialized is a\n"
+        "degraded span that can be emitted — the absence is the mechanism."
+    )
+
+
+# --------------------------------------------------------------------------
 # negative controls — the rules above must FAIL on a real bypass
 # --------------------------------------------------------------------------
 #

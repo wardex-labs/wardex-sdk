@@ -123,6 +123,57 @@ def _log_with_traceback(where: str, exc: BaseException) -> None:
         counters.bump(LOG_FAILED)
 
 
+_REPORTED: set[str] = set()
+_REPORT_LOCK = threading.Lock()
+
+
+def report_once(message: str, *, key: str) -> None:
+    """Print `message` to stderr the FIRST time `key` is seen. Never fails.
+
+    The channel a person actually reads. `counters` is not that channel and was
+    never going to be: `Counters.snapshot/total/get/reset` has no caller under
+    `sdks/python/src/`, `counters` is not in `wardex_sdk.__all__`, and
+    `WardexConfig().debug` is False by default — so a degradation recorded only
+    there is, in a production process, byte-identical to wardex never having
+    been installed. That is the failure this function exists to close, and it
+    costs one `print`.
+
+    Not a new invention either. `adapters/__init__.py` already prints when an
+    adapter fails to load, and `_anthropic_agent_sdk.py` already prints once
+    when the SDK's surface is not one it recognizes. Both are this same event
+    class — "wardex will not observe what you expected, and here is why" — and
+    both are unconditional. This is that idiom given a name and a dedup key.
+
+    BOUNDED BY CONSTRUCTION, which is what makes an unconditional print
+    acceptable on a per-call path: one line per key per process, so a site that
+    fails a thousand times in a loop writes one line and not a thousand.
+
+    Honest about its reach: stderr is the widest default-on channel this SDK
+    has, not an infallible one — see `_log_with_traceback` for the four ways fd
+    2 can be unwritable. It is strictly better than a table with no readers.
+    """
+    with _REPORT_LOCK:
+        if key in _REPORTED:
+            return
+        _REPORTED.add(key)
+    try:
+        print(message, file=sys.stderr)
+    except Exception:  # noqa: BLE001 — the reporting path may not become a throw
+        counters.bump(LOG_FAILED)
+
+
+def reset_reports_for_test() -> None:
+    """Test-only. `_REPORTED` is process-global and would leak across tests.
+
+    Deliberately not exported from `assembly/__init__.py`: it is reachable the
+    way tests already reach `assembly._units._ambient_unit`, and putting a
+    "forget what you reported" verb on the public surface would let production
+    code un-bound the bound above.
+    """
+    with _REPORT_LOCK:
+        _REPORTED.clear()
+
+
 class guard:  # noqa: N801 — a context manager reads as a verb at the call site
     """Swallow instrumentation failures at `where`, loudly enough to be found.
 

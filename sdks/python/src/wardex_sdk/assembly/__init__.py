@@ -61,8 +61,8 @@ What lives here, and the duplication each module exists to remove:
 not here yet. `__all__` grows as modules land and does not shrink.
 """
 
-from ._builder import IntegrityBuilder, SpanDraft
-from ._diag import Counters, counters, guard
+from ._builder import NULL_DRAFT, IntegrityBuilder, SpanDraft
+from ._diag import Counters, counters, guard, report_once
 from ._integrity import Limitation
 from ._parentage import (
     AMBIENT,
@@ -100,6 +100,7 @@ __all__ = [
     "IntegrityBuilder",
     "Limitation",
     "LinkReason",
+    "NULL_DRAFT",
     "ParentSource",
     "Parentage",
     "PatchSet",
@@ -122,6 +123,7 @@ __all__ = [
     "guard",
     "is_declared_extra_key",
     "latch_ambient",
+    "report_once",
     "resolve_parentage",
     "should_capture",
     "vocabulary_name",

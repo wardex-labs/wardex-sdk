@@ -19,6 +19,22 @@ All notable changes to this project are documented here. The format follows
   own home as the tool's `call_id`.
 
 ### Fixed
+- **One subtree wardex cannot close no longer costs every other one.** The
+  teardown sweep closed every live root under a single failure boundary, so a
+  fault anywhere in one root's subtree abandoned the whole table — measured on
+  three roots of four children each, with one fault: zero of fifteen spans
+  reached the sink. The boundary is now per root, and a root that could not be
+  closed is dropped from the table rather than left in it, because leaving it
+  meant every later sweep walked back into the same fault and the table never
+  emptied. Ten of fifteen ship. The five that do not, and the two units left
+  permanently unreachable, are a real loss and are recorded as one.
+- **A failure in the lookup table no longer leaks the unit it was indexing.**
+  A unit is registered before its aliases are bound, so a fault while binding
+  arrived after the unit was already live — and containing it at the caller
+  left that unit registered, reachable from nothing, and counting against the
+  bound on live units until it evicted a real session to make room for a
+  phantom, once per call. It is contained where the state is known instead, so
+  the fault costs the alias — the id lookup misses — and the span still ships.
 - Two agent runs sharing one trace now say so. One CLI subprocess emits
   `system/init` once, so a second one naming a different run — on a transport
   identity this adapter still holds live — means the earlier subprocess went
