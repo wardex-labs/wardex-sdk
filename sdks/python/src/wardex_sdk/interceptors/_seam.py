@@ -33,7 +33,8 @@ from ..assembly import (
     TransportLabel,
     capture_mode_of,
     guard,
-    resolve_parentage,
+    in_degraded_run,
+    resolve_observed,
     should_capture,
 )
 from ..protocol import parse_llm_semantics
@@ -194,6 +195,12 @@ class ByteSeamInterceptor(InterceptorInterface):
                 capture_mode_of(self._client),
                 parent=getattr(txn, "parent", None),
                 agent_semantic=sem is not None and _is_llm_traffic(txn, sem),
+                # "a span wardex FAILED to open is what should have been ambient
+                # here". Without it the gate reads an absent parent as "not
+                # agent work" and drops every request inside a run wardex broke
+                # at the top of — the one case where the absent parent is
+                # wardex's own doing rather than evidence about the traffic.
+                degraded=in_degraded_run(),
             )
         except Exception:
             return True  # losing data is worse than noise (design §5.1)
@@ -341,7 +348,7 @@ class ByteSeamInterceptor(InterceptorInterface):
         if not self._should_capture(st, txn, sem):
             return None
 
-        p = resolve_parentage(_latched(txn))
+        p = resolve_observed(_latched(txn))
         url = f"{self._url_scheme(False)}://{url_host}:{st.server_port}{txn.path}"
         transfer = max(0.0, (txn.end_ns - txn.start_ns) / 1e6 - txn.ttfb_ms)
 
@@ -511,7 +518,7 @@ class ByteSeamInterceptor(InterceptorInterface):
         # under ALL, an allowlisted host, or a live local span.
         if not self._should_capture(st, txn, None):
             return None
-        p = resolve_parentage(_latched(txn))
+        p = resolve_observed(_latched(txn))
 
         code = txn.ws_close_code
         # Status based on close code: 1000/1001/none = OK, otherwise = ERROR

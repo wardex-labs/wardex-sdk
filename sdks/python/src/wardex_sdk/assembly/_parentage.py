@@ -21,6 +21,9 @@ call site as a hard rule rather than a budget.
 
 from __future__ import annotations
 
+import contextvars
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from enum import Enum
 
@@ -298,3 +301,85 @@ def child_of(
     no API here that would let a caller try.
     """
     return resolve_parentage(Ambient(anchor, conversation, tracestate), evidence)
+
+
+# -- work issued inside a span wardex FAILED to open -----------------------
+#
+# A ContextVar and not a flag on any object, because the thing that has to know
+# is a byte seam three layers away that shares nothing with the site that
+# failed except the TASK the host's code is running on. That is the same
+# carrier the whole tree is built from, so it is the one thing the two ends
+# reliably agree about.
+
+_degraded_run: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "wardex_degraded_run", default=False
+)
+
+#: What an edge is worth when the span above it was one wardex could not open.
+#: `UNRESOLVED`, so `_MARKER` attaches `PARENT_UNRESOLVED` on its own — a parent
+#: was expected here, and the expectation is exactly what makes this not a
+#: trace root.
+_ORPHANED_BY_WARDEX = Evidence(ParentSource.UNRESOLVED)
+
+
+@contextmanager
+def degraded_run() -> Iterator[None]:
+    """Mark this task as running inside a span wardex FAILED to open.
+
+    Set for the duration of the block the host was given anyway. It says one
+    thing and only one: *the absence of a parent here is wardex's doing, not the
+    host's*. Two consequences follow, and both are losses this closes rather
+    than behaviour it adds.
+
+    First, the CAPTURE GATE. Under `capture_mode=AGENT` — the default — traffic
+    is captured when a local wardex span was ambient at the moment the work was
+    issued. A run entry that failed to open leaves nothing ambient, so every
+    HTTP request and every tool call inside the host's block is dropped at the
+    seam, with no counter and no marker: one wardex bug at the top turns into
+    total silence underneath it, and the user sees a run that looks like it
+    never happened rather than one wardex could not follow.
+
+    Second, the EDGE. Captured anyway, such a span would resolve as a trace root
+    at confidence 1.0 — the shattered-run shape `Placement` exists to prevent,
+    arriving through a different door. `resolve_observed` is what stops that.
+
+    Deliberately not reset by the seam or read anywhere else. A caller that
+    yields a degraded scope owns the block, so the flag's lifetime is the
+    block's, and a `ContextVar` restores itself on every task that forked from
+    this one without anyone remembering to.
+    """
+    token = _degraded_run.set(True)
+    try:
+        yield
+    finally:
+        _degraded_run.reset(token)
+
+
+def in_degraded_run() -> bool:
+    """Is this task inside a span wardex failed to open? See `degraded_run`."""
+    return _degraded_run.get()
+
+
+def resolve_observed(ambient: Ambient) -> Parentage:
+    """`resolve_parentage` for an OBSERVED byte seam, which has one extra case.
+
+    A seam latches whatever the host's carrier held. With nothing there the edge
+    is an honest TRACE ROOT: the host issued this request outside any agent
+    work, and under `capture_mode=AGENT` the gate would have dropped it long
+    before this line. The one way it arrives here anyway is that wardex failed
+    to open the span that would have been above it — and that is not a trace
+    root. It is a span whose parent exists and is missing, which is what
+    `PARENT_UNRESOLVED` means, with `INSTRUMENTATION_DEGRADED` saying whose
+    fault that is: not the host's threading, not a run entry the adapter forgot
+    to wrap, but wardex.
+
+    The distinction is the whole value of capturing it at all. Shipped as a
+    trace root the span is indistinguishable from a legitimate one and quietly
+    inflates the trace count; shipped like this it is one row a consumer can
+    filter, count, and file a bug about.
+    """
+    if ambient.span_context is None and in_degraded_run():
+        return resolve_parentage(ambient, _ORPHANED_BY_WARDEX).with_limitation(
+            Limitation.INSTRUMENTATION_DEGRADED
+        )
+    return resolve_parentage(ambient)

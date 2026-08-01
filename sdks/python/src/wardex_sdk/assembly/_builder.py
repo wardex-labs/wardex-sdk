@@ -310,6 +310,16 @@ class SpanDraft:
         self._events: list[InternalSpanEvent] = []
         self._emitted = False
 
+        # THE EDGE'S OWN MARKERS, carried here and not by each caller. A draft is
+        # built FROM a parentage, so an interpreted edge — `unit_sole`,
+        # `unresolved`, a recorded `correlation_conflict` — arrives already
+        # knowing what it is; leaving the caller to copy them across is how a
+        # span ships a confidence below 1.0 with an EMPTY limitation list, which
+        # is half of I4 missing and the half a dashboard renders. Two of the six
+        # parentage sites remembered to do it and the rest did not.
+        for inherited in parentage.limitations:
+            self._integrity.limitation(inherited)
+
     # -- the two non-vocabulary modes ------------------------------------
 
     @classmethod

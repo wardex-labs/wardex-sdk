@@ -71,6 +71,7 @@ from ..assembly import (
     UnitKind,
     UnitRegistry,
     counters,
+    degraded_run,
     guard,
     latch_ambient,
     report_once,
@@ -770,7 +771,13 @@ class AdapterContext:
         # `describe` is what raised. Same trap as `_run`'s activation.
         if not ok:
             self._abandon(unit, f"enter.{intent.value}", placement=placement)
-            yield Scope(None, self)
+            # The host's block runs with nothing ambient, so under
+            # `capture_mode=AGENT` every request and every tool call inside it
+            # would be dropped at the byte seam — one wardex bug here turning
+            # into total silence underneath. The flag says the absence of a
+            # parent is wardex's doing, and the gate reads it.
+            with degraded_run():
+                yield Scope(None, self)
             return
         yield from self._run(unit, scope, intent=intent)
 
@@ -896,7 +903,13 @@ class AdapterContext:
             ok = True
         if not ok:
             self._abandon(unit, f"rejoin.{intent.value}", placement=placement)
-            yield Scope(None, self)
+            # The host's block runs with nothing ambient, so under
+            # `capture_mode=AGENT` every request and every tool call inside it
+            # would be dropped at the byte seam — one wardex bug here turning
+            # into total silence underneath. The flag says the absence of a
+            # parent is wardex's doing, and the gate reads it.
+            with degraded_run():
+                yield Scope(None, self)
             return
         yield from self._run(unit, scope, intent=intent)
 

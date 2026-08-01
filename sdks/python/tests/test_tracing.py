@@ -163,3 +163,59 @@ def test_the_hosts_exception_leaves_a_manual_span_as_the_same_object():
             with span("llm-call"):
                 raise exc
         assert caught.value is exc
+
+
+def test_a_bug_in_wardexs_own_span_does_not_silence_the_work_inside_it(monkeypatch):
+    """The loss this closes, measured end to end on the default capture mode.
+
+    `capture_mode=AGENT` captures traffic that was issued while a local wardex
+    span was ambient. A `wardex.span()` that failed to open leaves nothing
+    ambient — so every HTTP request the host makes inside its block was dropped
+    at the byte seam, with no counter and no marker. One bug in wardex's own
+    span turned into total silence for exactly the work that span was opened to
+    watch, and the run read as one that never happened.
+    """
+    from types import SimpleNamespace
+
+    import wardex_sdk._tracing as tracing
+    from wardex_sdk._enums import CaptureMode
+    from wardex_sdk.assembly import latch_ambient
+    from wardex_sdk.assembly._diag import reset_reports_for_test
+    from wardex_sdk.interceptors._seam import ByteSeamInterceptor
+
+    class Seam(ByteSeamInterceptor):
+        def _select_tracker(self, obj):
+            raise NotImplementedError
+
+        def _resolve_timing(self, obj, st):
+            raise NotImplementedError
+
+        def name(self):
+            return "probe"
+
+        def install(self, client, ctx=None):
+            self._client = client
+
+        def uninstall(self):
+            pass
+
+    def kept(broken: bool) -> bool:
+        _hub.reset_for_test()
+        client = Client(WardexConfig(api_key="k", capture_mode=CaptureMode.AGENT), _Recording())
+        _hub.set_client(client)
+        reset_reports_for_test()
+        seam = Seam()
+        seam._client = client
+        if broken:
+            monkeypatch.setattr(
+                tracing,
+                "resolve_parentage",
+                lambda *a, **k: (_ for _ in ()).throw(RuntimeError("broken")),
+            )
+        with span("my agent turn"):
+            # What a real socket write does: latch the carrier the host is on.
+            txn = SimpleNamespace(parent=latch_ambient().span_context)
+            return seam._should_capture(SimpleNamespace(), txn, None)
+
+    assert kept(False) is True
+    assert kept(True) is True, "a wardex bug at the top silenced everything under it"

@@ -99,6 +99,7 @@ def should_capture(
     *,
     parent: SpanContext | None,
     agent_semantic: bool,
+    degraded: bool = False,
 ) -> bool:
     """Design §5.1, whole: the SDK's only answer to "capture this?".
 
@@ -117,9 +118,27 @@ def should_capture(
     pipe is agent traffic or it is nothing). Passing a constant `True` is
     therefore a statement a site makes about itself, and it is reviewable
     precisely because it is written at the call.
+
+    `degraded` is `assembly._parentage.in_degraded_run()` — "a span wardex
+    FAILED to open is what should have been ambient here". It is a DECLARED
+    input rather than a `ContextVar` read hidden inside this function, so the
+    policy stays what its docstring says it is: a pure function of its
+    arguments, testable by them, unable to raise on them.
+
+    What it buys is the difference between an agent run wardex could not follow
+    and one that never happened. The gate's whole premise is that an absent
+    local parent means "this traffic is not agent work"; when wardex is what
+    lost the parent, that inference is simply wrong, and acting on it turns one
+    bug at the top of a run into total silence underneath it. §5.1's rule is
+    that noise is filterable and lost data is not, and this is the one place
+    that rule was being applied backwards — against the user, on wardex's own
+    fault. What comes through is not passed off as ordinary: see
+    `resolve_observed`.
     """
     if mode is CaptureMode.ALL:
         return True
     if agent_semantic:
         return True
-    return parent is not None and not parent.is_remote
+    if parent is not None and not parent.is_remote:
+        return True
+    return degraded

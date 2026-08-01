@@ -573,7 +573,6 @@ class Unit:
             source=source,
             start_ns=start_ns if start_ns is not None else now,
         )
-        _carry_limitations(draft, parentage)
 
         pending: list[SpanDraft] = []
         with self._registry._lock:
@@ -790,24 +789,6 @@ class Unit:
         return draft
 
 
-def _carry_limitations(draft: SpanDraft, parentage: Parentage) -> None:
-    """Move the edge's markers onto the span that edge produced.
-
-    `SpanDraft` is built FROM a `Parentage` but does not inherit its markers, so
-    without this an interpreted edge — `unit_sole`, `unresolved`, a recorded
-    `correlation_conflict` — would ship a confidence below 1.0 and NO marker.
-    That is half of I4 missing, and it is the half a dashboard renders.
-
-    One function rather than the loop inlined at both call sites, so the
-    limitation census records exactly one slot it cannot follow instead of two.
-    The value is a tuple of `Limitation` MEMBERS that `_parentage.py` built and
-    the census already recorded where they were decided; nothing here can
-    introduce a marker that was not already counted there.
-    """
-    for inherited in parentage.limitations:
-        draft.add_limitation(inherited)
-
-
 def _append_capped(buf: bytearray, data: bytes, cap: int) -> bool:
     """Append what fits. True when something was dropped."""
     room = cap - len(buf)
@@ -970,7 +951,6 @@ class UnitRegistry:
             source=CaptureSource.ADAPTER,
             start_ns=now,
         )
-        _carry_limitations(draft, parentage)
 
         unit = Unit(
             self,

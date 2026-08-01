@@ -50,6 +50,30 @@ All notable changes to this project are documented here. The format follows
   own home as the tool's `call_id`.
 
 ### Fixed
+- **A run wardex failed to open no longer silences everything inside it.** Under
+  `capture_mode=AGENT` — the default — traffic is captured when a local wardex
+  span was ambient at the moment the work was issued. A run entry that could not
+  be opened leaves nothing ambient, so every HTTP request and every tool call in
+  the host's block was dropped at the byte seam with no counter and no marker:
+  one bug at the top turned into total silence underneath, and the run read as
+  one that never happened rather than one wardex could not follow. Measured
+  end-to-end through `wardex.span()` on the default mode: captured before the
+  block failed, dropped after.
+
+  The gate now takes "the missing parent is wardex's own doing" as a declared
+  input, set on the task for the duration of the block the host was given
+  anyway. What comes through is not passed off as ordinary: such a span resolves
+  as `unresolved` at confidence 0.0 carrying `parent_unresolved` and
+  `instrumentation_degraded`, never as a trace root — shipped as a root it would
+  be one run arriving as several, indistinguishable from genuine ones. An edge
+  wardex really did read is untouched, because the flag describes an ABSENT
+  parent and never a present one.
+- **A span built from an interpreted edge now carries the markers that edge
+  earned.** `SpanDraft` is built FROM a parentage but did not inherit its
+  markers, so a span could ship a confidence below 1.0 with an empty limitation
+  list — half of I4 missing, and the half a dashboard renders. Two of the six
+  parentage sites copied them across by hand and the rest did not; the draft's
+  own constructor does it now, so there is no site left that can forget.
 - **`wardex.span()` and `wardex.trace()` no longer raise into the block they
   wrap.** The SDK's own published context manager had the same hole as the
   adapter surface and on a shorter path to a user: latching the active scope,

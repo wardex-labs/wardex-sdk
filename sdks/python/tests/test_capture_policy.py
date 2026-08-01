@@ -507,3 +507,161 @@ def test_a_config_whose_mode_cannot_be_read_narrows_instead_of_widening(client):
 @pytest.mark.parametrize("mode", MODES, ids=lambda m: m.value)
 def test_a_configured_client_reports_its_own_mode(mode):
     assert capture_mode_of(_FakeClient(mode)) is mode
+
+
+# ==========================================================================
+# A run wardex failed to open is not a run that never happened
+# ==========================================================================
+#
+# The gate's premise is that an absent LOCAL parent means "this traffic is not
+# agent work". When WARDEX is what lost the parent, that inference is wrong —
+# and acting on it turns one bug at the top of a run into total silence
+# underneath: every request and every tool call inside the host's block dropped
+# at the seam, with no counter and no marker, so the run looks like it never
+# happened rather than like one wardex could not follow.
+
+
+def test_traffic_inside_a_run_wardex_failed_to_open_is_no_longer_dropped():
+    """§5.1's rule is that noise is filterable and lost data is not. This is the
+    one place it was being applied backwards — against the user, on wardex's own
+    fault."""
+    assert should_capture(CaptureMode.AGENT, parent=None, agent_semantic=False) is False
+    assert (
+        should_capture(CaptureMode.AGENT, parent=None, agent_semantic=False, degraded=True) is True
+    )
+
+
+def test_the_flag_is_a_declared_input_and_not_a_hidden_read():
+    """`should_capture` stays a pure function of its arguments — testable by
+    them, unable to raise on them. A `ContextVar` read inside it would make the
+    gate's answer depend on a carrier its own tests cannot see, which is exactly
+    the property this module's docstring is built on.
+    """
+    import inspect
+    import pathlib
+
+    from wardex_sdk.assembly import _parentage, _policy
+
+    assert "degraded" in inspect.signature(should_capture).parameters
+
+    # Read off the SHIPPED FILE, with the docstring cut away: a docstring that
+    # names the flag is documentation, a body that reads it is the thing being
+    # forbidden — and asking the live object would be asking whatever a test
+    # happened to patch.
+    src = pathlib.Path(_policy.__file__).read_text()
+    body = src[src.index("def should_capture") :]
+    body = body[body.index('"""', body.index('"""') + 3) :]
+    assert "in_degraded_run" not in body
+    assert "ContextVar" not in body
+    # And the flag itself lives with parentage, because that is what it is about.
+    assert hasattr(_parentage, "in_degraded_run")
+
+
+def test_the_flag_widens_nothing_a_healthy_run_would_have_been_denied():
+    """It answers ONE question — "is the missing parent wardex's doing" — and a
+    healthy process never asks it. Every other row of the matrix is untouched.
+    """
+    for mode in (CaptureMode.AGENT, CaptureMode.ALL):
+        for parent in (None, LOCAL, REMOTE):
+            for sem in (True, False):
+                plain = should_capture(mode, parent=parent, agent_semantic=sem)
+                if plain:
+                    assert should_capture(mode, parent=parent, agent_semantic=sem, degraded=True)
+
+
+def test_the_flag_lasts_exactly_as_long_as_the_block_it_was_set_for():
+    from wardex_sdk.assembly import degraded_run, in_degraded_run
+
+    assert in_degraded_run() is False
+    with degraded_run():
+        assert in_degraded_run() is True
+        with degraded_run():
+            assert in_degraded_run() is True
+        assert in_degraded_run() is True
+    assert in_degraded_run() is False
+
+
+def test_a_span_that_survived_a_degraded_run_does_not_ship_as_a_trace_root():
+    """Capturing it is half the fix; the other half is that it must not pass for
+    a legitimate root.
+
+    A trace root at confidence 1.0 with no marker is the shattered-run shape —
+    one run arriving as several, indistinguishable from genuine ones, silently
+    inflating the trace count. Shipped this way it is one row a consumer can
+    filter, count and file a bug about: the parent was expected
+    (`parent_unresolved`) and wardex is why it is missing
+    (`instrumentation_degraded`).
+    """
+    from wardex_sdk.assembly import (
+        EMPTY_AMBIENT,
+        Limitation,
+        ParentSource,
+        degraded_run,
+        resolve_observed,
+    )
+
+    healthy = resolve_observed(EMPTY_AMBIENT)
+    assert healthy.correlation.strategy is ParentSource.TRACE_ROOT
+    assert healthy.correlation.confidence == 1.0
+    assert healthy.limitations == ()
+
+    with degraded_run():
+        broken = resolve_observed(EMPTY_AMBIENT)
+    assert broken.correlation.strategy is ParentSource.UNRESOLVED
+    assert broken.correlation.confidence == 0.0
+    assert set(broken.limitations) == {
+        Limitation.PARENT_UNRESOLVED,
+        Limitation.INSTRUMENTATION_DEGRADED,
+    }
+
+
+def test_a_real_parent_is_still_the_parent_inside_a_degraded_run():
+    """The flag describes the ABSENCE of a parent, never a present one. A nested
+    site that degraded while its session is still live has a real edge, and
+    downgrading it would turn a wardex bug into a worse tree than the one it
+    caused.
+    """
+    from wardex_sdk.assembly import Ambient, ParentSource, degraded_run, resolve_observed
+
+    ambient = Ambient(span_context=LOCAL, conversation=None, tracestate=None)
+    with degraded_run():
+        p = resolve_observed(ambient)
+    assert p.correlation.strategy is ParentSource.CONTEXTVAR
+    assert p.correlation.confidence == 1.0
+    assert p.limitations == ()
+    assert p.parent_span_id == LOCAL.span_id
+
+
+def test_the_edges_markers_reach_the_span_without_the_caller_copying_them():
+    """`SpanDraft` is built FROM a parentage, so an interpreted edge arrives
+    already knowing what it is. Leaving each of the six parentage sites to copy
+    the markers across is how a span ships confidence below 1.0 with an EMPTY
+    limitation list — half of I4 missing, and the half a dashboard renders.
+    Two sites remembered; the rest did not.
+    """
+    from wardex_sdk._enums import CaptureSource, SpanKind
+    from wardex_sdk.assembly import (
+        EMPTY_AMBIENT,
+        Limitation,
+        SpanDraft,
+        TransportLabel,
+        degraded_run,
+        resolve_observed,
+    )
+
+    with degraded_run():
+        p = resolve_observed(EMPTY_AMBIENT)
+    span = SpanDraft.transport(
+        p,
+        label=TransportLabel.HTTP,
+        subject="/v1/messages",
+        source=CaptureSource.SSL,
+        start_ns=1,
+        kind=SpanKind.CLIENT,
+    ).finish(2)
+
+    assert span.capture_integrity is not None, "the edge's markers never reached the span"
+    assert set(span.capture_integrity.limitations) == {
+        Limitation.PARENT_UNRESOLVED,
+        Limitation.INSTRUMENTATION_DEGRADED,
+    }

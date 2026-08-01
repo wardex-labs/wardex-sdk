@@ -1359,3 +1359,41 @@ def test_a_claim_is_taken_on_the_run_and_not_on_the_scope_that_took_it():
     # The lower-ranked observer, arriving at the run where the hook stands.
     assert run.claim(selector, rank=Observer.CALLBACK.value) is False
     assert run.owner_rank(selector) == Observer.EXECUTOR.value
+
+
+def test_a_degraded_scope_says_so_on_the_carrier_the_capture_gate_reads():
+    """The block runs with nothing ambient, and under `capture_mode=AGENT` that
+    is indistinguishable — to the byte seam three layers away — from a host
+    doing ordinary non-agent work. So every request and every tool call inside
+    it would be dropped.
+
+    The flag is a `ContextVar` and not a value on the scope for the same reason:
+    the seam shares nothing with this module except the TASK the host's code
+    runs on, which is the carrier the whole tree is built from anyway.
+    """
+    from wardex_sdk.assembly import in_degraded_run
+
+    ctx, sink = broken("open")
+
+    assert in_degraded_run() is False
+    with ctx.enter(
+        UnitKind.SESSION, intent=SpanIntent.INVOKE_AGENT, placement=Placement.ROOT
+    ) as scope:
+        assert scope.degraded
+        assert in_degraded_run() is True
+    assert in_degraded_run() is False, "the flag outlived the block it was set for"
+
+
+def test_a_healthy_scope_leaves_the_carrier_alone():
+    """It answers one question — "is the missing parent wardex's doing" — and a
+    healthy run never asks it. A flag set on a working scope would widen the
+    capture gate for every host whose wardex is fine.
+    """
+    from wardex_sdk.assembly import in_degraded_run
+
+    ctx, sink = context()
+
+    with ctx.enter(
+        UnitKind.SESSION, intent=SpanIntent.INVOKE_AGENT, placement=Placement.ROOT, describe=_agent
+    ):
+        assert in_degraded_run() is False

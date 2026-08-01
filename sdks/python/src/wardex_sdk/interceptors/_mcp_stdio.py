@@ -41,7 +41,7 @@ from ..assembly import (
     capture_mode_of,
     guard,
     latch_ambient,
-    resolve_parentage,
+    resolve_observed,
     should_capture,
 )
 from ..protocol import JsonRpcParser
@@ -161,7 +161,12 @@ class _ProcState:
 def _build_mcp_span(p: _Pending, resp: Any) -> InternalSpan:
     now = time.time_ns()
     method = p.method
-    parentage = resolve_parentage(p.ambient)
+    # `resolve_observed`, not `resolve_parentage`: the gate above lets this
+    # traffic through on `agent_semantic=True` regardless, so a tool call
+    # issued inside a run wardex failed to open reaches this line with an
+    # empty ambient — and shipping it as a trace root would be one run
+    # arriving as several, indistinguishable from genuine ones.
+    parentage = resolve_observed(p.ambient)
     params_bytes = p.params
     result_bytes = resp.result if resp.result is not None else (resp.error or b"")
     input_data = params_bytes

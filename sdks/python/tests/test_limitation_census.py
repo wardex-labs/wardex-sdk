@@ -195,15 +195,22 @@ _MEMBER_SITES: dict[str, frozenset[str]] = {
     # make visible rather than comfortable.
     "ADAPTER_UNINSTALLED": frozenset({"adapters/_anthropic_agent_sdk.py"}),
     "UNIT_INTERRUPTED": frozenset({"_lifecycle.py"}),
-    # ONE site, and it is meant to stay one. This member says wardex's own
-    # instrumentation failed, and `adapters/_context.py` is the only place that
-    # knows it did — `_abandon` puts it on a unit whose open or description
-    # died, `_run` puts it on one whose activation died, and `_degrade` puts it
-    # on the enclosing unit when the span itself will not ship at all. A second
-    # site would mean some other module had started catching wardex's own
-    # failures, which is the thing the single sanctioned swallow exists to
-    # prevent. It was a declaration with no emitter for exactly one commit.
-    "INSTRUMENTATION_DEGRADED": frozenset({"adapters/_context.py"}),
+    # Two sites, and they are the two halves of one fact: where wardex failed,
+    # and where the consequence lands. `adapters/_context.py` knows it failed —
+    # `_abandon` marks a unit whose open or description died, `_run` marks one
+    # whose activation died, `_degrade` marks the enclosing unit when the span
+    # itself will not ship. `assembly/_parentage.py::resolve_observed` marks a
+    # span BELOW such a failure: a byte seam's transaction that reached the wire
+    # inside a block whose run entry never opened. Neither can see the other's
+    # span — that is the point of the second site, not an oversight — because
+    # the one that failed does not exist and the one that survived is three
+    # layers away with nothing in common but the task.
+    "INSTRUMENTATION_DEGRADED": frozenset(
+        {
+            "adapters/_context.py",
+            "assembly/_parentage.py",
+        }
+    ),
 }
 """Every place a `Limitation` MEMBER (rather than a free string) reaches a
 marker slot, by site — the other half of the census, and the half that grew.
@@ -923,10 +930,17 @@ _UNRESOLVED_PY: frozenset[tuple[str, str]] = frozenset(
         # marker nothing in this file can see.
         ("adapters/_assembler.py", "Tuple"),
         # every one below is a marker CONTAINER being passed along, or a
-        # marker-typed PARAMETER being forwarded, not a marker
+        # marker-typed PARAMETER being forwarded, not a marker.
+        # `Name:inherited` is `SpanDraft.__init__` copying the `Limitation`
+        # MEMBERS `_parentage.py` already put on the EDGE onto the span that
+        # edge produced — every one of them censused at the `_MARKER` table
+        # where it was decided. It moved here out of the unit registry, which
+        # is where it used to live as a helper two of the six parentage sites
+        # remembered to call.
         ("assembly/_builder.py", "Attribute:markers"),
         ("assembly/_builder.py", "Call:tuple"),
         ("assembly/_builder.py", "List"),
+        ("assembly/_builder.py", "Name:inherited"),
         ("assembly/_builder.py", "Name:marker"),
         ("assembly/_parentage.py", "BinOp"),
         ("assembly/_parentage.py", "Call:_markers_for"),
@@ -935,11 +949,8 @@ _UNRESOLVED_PY: frozenset[tuple[str, str]] = frozenset(
         ("assembly/_snapshot.py", "Call:list"),
         ("assembly/_snapshot.py", "List"),
         ("assembly/_snapshot.py", "Name:marker"),
-        # Three forwards in the unit registry, none of which can introduce a
-        # value. `Name:inherited` is `_carry_limitations`, which copies the
-        # `Limitation` MEMBERS `_parentage.py` already put on the edge onto the
-        # span that edge produced — every one of them is censused at the
-        # `_MARKER` table where it was decided. `Name:marker` is `Unit.note`,
+        # Two forwards in the unit registry, neither of which can introduce a
+        # value. `Name:marker` is `Unit.note`,
         # a one-line forward onto the unit's own draft. `Name:reason` is
         # `close_all(reason=...)`, whose member is the CALLER's (an adapter
         # uninstall passes `ADAPTER_UNINSTALLED`, a cancelled process passes
@@ -949,7 +960,6 @@ _UNRESOLVED_PY: frozenset[tuple[str, str]] = frozenset(
         # `resolve()` stamps — are spelled out as literals at their slots and
         # appear in `_MEMBER_SITES`, which is what keeps this trio a set of
         # pipes rather than a hiding place.
-        ("assembly/_units.py", "Name:inherited"),
         ("assembly/_units.py", "Name:marker"),
         ("assembly/_units.py", "Name:reason"),
         # The two forwards that carry a shutdown marker down to the assembler:

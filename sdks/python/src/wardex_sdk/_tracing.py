@@ -23,6 +23,7 @@ from .assembly import (
     Evidence,
     ParentSource,
     SpanDraft,
+    degraded_run,
     guard,
     latch_ambient,
     report_once,
@@ -274,11 +275,17 @@ def _begin(
             "(re-run with debug=True for the traceback)",
             key="wardex.span.manual_open",
         )
-        yield SpanBuilder(
-            SpanDraft.manual(
-                _NULL_PARENTAGE, name=name, kind=kind, start_ns=0, source=CaptureSource.MANUAL
+        # The host's block runs with nothing ambient, so under
+        # `capture_mode=AGENT` every request inside it would be dropped at the
+        # byte seam — a bug in wardex's own span turning into silence for the
+        # work the span was opened to watch. The flag says the missing parent is
+        # wardex's doing, and the gate and the seam's edge both read it.
+        with degraded_run():
+            yield SpanBuilder(
+                SpanDraft.manual(
+                    _NULL_PARENTAGE, name=name, kind=kind, start_ns=0, source=CaptureSource.MANUAL
+                )
             )
-        )
         return
 
     builder = SpanBuilder(draft)
