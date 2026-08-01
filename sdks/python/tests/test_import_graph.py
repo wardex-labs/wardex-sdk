@@ -1072,6 +1072,202 @@ def test_sink_is_not_called_from_assembly_yet():
 
 
 # --------------------------------------------------------------------------
+# C-S7 — a guarded step is tested by a flag, never by what it assigns
+# --------------------------------------------------------------------------
+#
+# The most valuable rule here, because it caught a live bug in a design that was
+# about to ship — twice, written by two authors an hour apart. `guard()` swallows
+# a failure and execution continues at the statement after the block, so the code
+# has to ask "did that work?". The obvious spelling asks a variable the block
+# ASSIGNS:
+#
+#     with self.guard("activate"):
+#         activation = unit.activate()      # <- binds
+#         activation.__enter__()            # <- raises
+#     if activation is None:                # <- DEAD. It is already bound.
+#
+# The branch never runs, so the degradation is never recorded and the span ships
+# byte-identical to a healthy one. The only spelling that is not dead is a bare
+# flag set False before the block and True as its LAST statement, because that
+# assignment is the one thing a failure anywhere in the block prevents.
+
+
+def _is_guard_with(node: ast.stmt) -> bool:
+    if not isinstance(node, ast.With):
+        return False
+    for item in node.items:
+        call = item.context_expr
+        if not isinstance(call, ast.Call):
+            continue
+        fn = call.func
+        name = fn.attr if isinstance(fn, ast.Attribute) else getattr(fn, "id", None)
+        if name == "guard":
+            return True
+    return False
+
+
+def _names_assigned_in(body: list[ast.stmt]) -> set[str]:
+    out: set[str] = set()
+    for stmt in body:
+        for node in ast.walk(stmt):
+            if isinstance(node, ast.Assign):
+                out |= {t.id for t in node.targets if isinstance(t, ast.Name)}
+            elif isinstance(node, ast.AnnAssign | ast.AugAssign) and isinstance(
+                node.target, ast.Name
+            ):
+                out.add(node.target.id)
+    return out
+
+
+def _assigns_literal(stmt: ast.stmt | None, name: str, value: bool) -> bool:
+    return (
+        isinstance(stmt, ast.Assign)
+        and len(stmt.targets) == 1
+        and isinstance(stmt.targets[0], ast.Name)
+        and stmt.targets[0].id == name
+        and isinstance(stmt.value, ast.Constant)
+        and stmt.value.value is value
+    )
+
+
+def _flag_violations(tree: ast.AST) -> list[int]:
+    """Line numbers where a guarded step is tested by something other than a flag.
+
+    Scope is narrow on purpose: the `if` IMMEDIATELY following the `with`, in
+    the SAME body, testing a name the block assigns. A rule that reached further
+    would need dataflow to tell the trap apart from the sound case where the
+    block's only statement is the assignment itself — and a rule that silently
+    goes blind is worse than no rule.
+    """
+    bad: list[int] = []
+    for node in ast.walk(tree):
+        for field in ("body", "orelse", "finalbody"):
+            body = getattr(node, field, None)
+            if not isinstance(body, list):
+                continue
+            for i, stmt in enumerate(body):
+                if not _is_guard_with(stmt) or i + 1 >= len(body):
+                    continue
+                nxt = body[i + 1]
+                if not isinstance(nxt, ast.If):
+                    continue
+                tested = {n.id for n in ast.walk(nxt.test) if isinstance(n, ast.Name)}
+                if not tested & _names_assigned_in(stmt.body):
+                    continue  # an unrelated `if` — not a test of this step
+                test = nxt.test
+                if isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not):
+                    test = test.operand
+                if not isinstance(test, ast.Name):
+                    bad.append(nxt.lineno)
+                    continue
+                flag = test.id
+                before = body[i - 1] if i else None
+                if not _assigns_literal(before, flag, False):
+                    bad.append(nxt.lineno)
+                elif not _assigns_literal(stmt.body[-1], flag, True):
+                    bad.append(nxt.lineno)
+    return bad
+
+
+def test_a_guarded_step_is_tested_by_a_flag_and_never_by_what_it_assigns():
+    found = {
+        rel: lines
+        for rel, tree in _modules().items()
+        if rel.startswith(("assembly/", "adapters/")) and (lines := _flag_violations(tree))
+    }
+    assert found == {}, (
+        f"C-S7: a guarded step is tested by something other than a flag at {found}.\n\n"
+        "WHY: `guard()` swallows, so the statement after the block has to ask\n"
+        "whether the block finished. A variable the block ASSIGNS is already\n"
+        "bound when a later statement in the block is what raised, so the test is\n"
+        "dead code and the failure ships looking like a success. Write:\n\n"
+        "    ok = False\n"
+        "    with self.guard(...):\n"
+        "        ...\n"
+        "        ok = True\n"
+        "    if not ok:\n"
+    )
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        # objection 8's exact bug, and the one that shipped in a design review
+        "def f(self):\n"
+        "    activation = None\n"
+        "    with self.guard('a'):\n"
+        "        activation = unit.activate()\n"
+        "        activation.__enter__()\n"
+        "    if activation is None:\n"
+        "        degrade()\n",
+        # the same trap wearing a truthiness test
+        "def f(self):\n"
+        "    scope = None\n"
+        "    with self.guard('a'):\n"
+        "        scope = Scope(unit, self)\n"
+        "        describe(scope)\n"
+        "    if not scope:\n"
+        "        degrade()\n",
+        # a flag, but never initialised to False before the block
+        "def f(self):\n"
+        "    with self.guard('a'):\n"
+        "        work()\n"
+        "        ok = True\n"
+        "    if not ok:\n"
+        "        degrade()\n",
+        # a flag set True too EARLY, so a later failure still reads as success
+        "def f(self):\n"
+        "    ok = False\n"
+        "    with self.guard('a'):\n"
+        "        ok = True\n"
+        "        work()\n"
+        "    if not ok:\n"
+        "        degrade()\n",
+        # the module-level `guard(...)` spelling, not only `self.guard(...)`
+        "def f():\n"
+        "    unit = None\n"
+        "    with guard('a'):\n"
+        "        unit = open()\n"
+        "        bind(unit)\n"
+        "    if unit is not None:\n"
+        "        use(unit)\n",
+    ],
+)
+def test_c_s7_sees_a_dead_test_however_it_is_written(source):
+    assert _flag_violations(ast.parse(source)), f"C-S7 went blind on:\n{source}"
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        # the sanctioned shape
+        "def f(self):\n"
+        "    ok = False\n"
+        "    with self.guard('a'):\n"
+        "        work()\n"
+        "        ok = True\n"
+        "    if not ok:\n"
+        "        degrade()\n",
+        # an `if` that has nothing to do with the guarded block
+        "def f(self):\n"
+        "    with self.guard('a'):\n"
+        "        work()\n"
+        "    if self.debug:\n"
+        "        report()\n",
+        # a `with` that is not a guard at all
+        "def f(self):\n"
+        "    unit = None\n"
+        "    with self._lock:\n"
+        "        unit = open()\n"
+        "    if unit is None:\n"
+        "        return\n",
+    ],
+)
+def test_c_s7_does_not_flag_a_step_that_is_tested_correctly(source):
+    assert _flag_violations(ast.parse(source)) == [], f"C-S7 false-positived on:\n{source}"
+
+
+# --------------------------------------------------------------------------
 # the degraded draft answers everything the real one does
 # --------------------------------------------------------------------------
 

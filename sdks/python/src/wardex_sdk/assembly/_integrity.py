@@ -337,13 +337,15 @@ class Limitation(Enum):
     a subtree missing because an adapter threw looks exactly like a subtree that
     never ran.
 
-    Declared; no emitter until the adapter surface reports its own failures.
-    When it arrives it belongs to ``adapters/_context.py`` alone, and it is BEST
-    EFFORT by contract there: the span that would carry it is sometimes the very
-    one that could not be built, so it lands on the enclosing unit instead — and
-    where there is no enclosing unit it cannot land at all. What always survives
-    is the line the same failure prints to stderr, which touches nothing that
-    can itself be broken.
+    Emitted from ``adapters/_context.py`` alone: on a unit whose open or
+    description failed, on one whose activation failed, and on the ENCLOSING
+    unit when the span itself will not ship. BEST EFFORT by contract, and the
+    contract is what matters here — the span that would carry it is sometimes
+    the very one that could not be built, so it lands on the enclosing unit
+    instead, and where there is no enclosing unit it cannot land at all. A
+    registry fault wide enough to reach the enclosing unit takes the marker with
+    it. What always survives is the line the same failure prints to stderr,
+    which touches nothing that can itself be broken.
 
     Deliberately not ``CONTEXT_PROPAGATION_DEGRADED``, which is declared as a
     property of the RUNTIME — work whose carrier legitimately could not inherit

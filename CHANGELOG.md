@@ -6,6 +6,15 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Changed
+- **`AdapterContext.enter()`, `open_run()` and `rejoin()` take a `describe=`
+  callable, and that is where an adapter's own code belongs.** It runs inside
+  the same failure boundary as the open, before the host's block, so opening a
+  span and describing it succeed or fail together. Described in the `with` body
+  instead, a framework attribute that moved between releases ships a span
+  reading `status=OK` with full input and output, a real duration, and an
+  arbitrary suffix of its markers silently gone — indistinguishable downstream
+  from a complete observation. `RunHandle` is now a `Scope`, which deletes four
+  members it had been carrying in duplicate.
 - **An `execute_tool` span from the Agent SDK adapter no longer publishes a
   `correlation`.** It used to carry `confidence` 1.0 (hook path) or 0.7
   (stream-only) with no `parent_source` beside it — which encodes on the wire as
@@ -19,6 +28,29 @@ All notable changes to this project are documented here. The format follows
   own home as the tool's `call_id`.
 
 ### Fixed
+- **A bug in wardex can no longer break the application it is watching.** The
+  adapter surface put the host's own call — a tool handler, a graph node, an
+  LLM request — inside a `with` block whose open, activation and close were all
+  unguarded, so a defect in wardex's own work would delete that call rather
+  than a span. Every step is contained now: the body always runs, the scope it
+  receives is total (a `degraded` one answers every verb instead of being
+  `None`), and the host's own exception reaches its caller as the SAME OBJECT,
+  including `KeyboardInterrupt` and `CancelledError` — wardex must not become
+  the library in the process that eats a real Ctrl-C. A failure in wardex's
+  teardown can no longer replace the failure the host was in the middle of
+  reporting, which is the shape that made a wardex bug read as a host bug in
+  the host's own logs.
+- **A degraded run is now distinguishable from wardex never having been
+  installed.** Every containment above writes one line to stderr naming the
+  CONSEQUENCE — "this run will produce NO agent span, and under
+  capture_mode=AGENT no HTTP or tool traffic inside it will be captured either"
+  — bounded to one line per site per process, however many times the site
+  trips. This is the same idiom the SDK already used when an adapter fails to
+  load. Where a span still ships it also carries `instrumentation_degraded`,
+  and that half is best effort by contract: it reaches for a holder through the
+  same registry that just failed. On the wire the marker is deliberately not
+  accompanied by a span attribute naming the site, because attributes append
+  without a cap while a marker is idempotent.
 - **One subtree wardex cannot close no longer costs every other one.** The
   teardown sweep closed every live root under a single failure boundary, so a
   fault anywhere in one root's subtree abandoned the whole table — measured on

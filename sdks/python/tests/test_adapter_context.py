@@ -50,6 +50,8 @@ from wardex_sdk.assembly import (
     UnitRegistry,
     counters,
 )
+from wardex_sdk.assembly._builder import NULL_DRAFT
+from wardex_sdk.assembly._diag import reset_reports_for_test
 from wardex_sdk.assembly._units import _ambient_unit
 from wardex_sdk.context import activate_span
 
@@ -68,15 +70,36 @@ def _clean_scope():
     reset_for_test()
     token = _ambient_unit.set(None)
     counters.reset()
+    # `_REPORTED` is process-global, so without this the ORDER of tests decides
+    # what a later one sees on stderr — a one-line-per-key channel is silent for
+    # every test after the first that trips the same site.
+    reset_reports_for_test()
     yield
     _ambient_unit.reset(token)
     reset_for_test()
     counters.reset()
+    reset_reports_for_test()
 
 
 def context(name: str = "test", **kw) -> tuple[AdapterContext, RecordingSink]:
     sink = kw.pop("sink", RecordingSink())
     return AdapterContext(name, units=UnitRegistry(sink=sink), limits={}, **kw), sink
+
+
+def broken(where: str, name: str = "probe", **kw) -> tuple[AdapterContext, RecordingSink]:
+    """A context whose registry raises at exactly one method.
+
+    SUBCLASSED, not monkeypatched on the instance: `UnitRegistry` uses
+    `__slots__`, so `reg.open = ...` is `AttributeError: read-only`. That
+    constraint is why every fault in this file arrives this way.
+    """
+    sink = kw.pop("sink", RecordingSink())
+
+    def blow(self, *a, **k):
+        raise RuntimeError(f"wardex is broken at {where}")
+
+    cls = type("Broken", (UnitRegistry,), {"__slots__": (), where: blow})
+    return AdapterContext(name, units=cls(sink=sink), limits={}, **kw), sink
 
 
 def _agent(handle) -> None:
@@ -506,3 +529,619 @@ def test_a_run_handle_pins_onto_the_carrier_that_asked():
 
     assert run.pin(driver=object()) is False
     run.close()
+
+
+# ==========================================================================
+# A wardex bug costs a span. It never costs the host.
+# ==========================================================================
+#
+# Every test below installs ONE fault in wardex's own machinery and asks three
+# questions of the result: did the host's code still run, did the host get its
+# own value or its own exception back, and is what wardex shipped honest about
+# what it lost. The `with` body stands for the host's call, which is where a
+# framework adapter has to put it — a tool handler, a graph node, an LLM
+# request — so a guard that swallowed an exception there would turn a failing
+# call into a successful one on the wire.
+
+
+def test_a_bug_deciding_the_parent_edge_still_runs_the_hosts_code_and_returns_its_value():
+    """The parentage decision is wardex's most opinionated code and its most
+    likely to break. `_evidence` asks the registry two questions, and both are
+    reached before the host's body has run — so an unguarded one means a wardex
+    bug about tree SHAPE deletes a tool call.
+    """
+    for fault in ("becomes_trace_root", "current"):
+        ctx, sink = broken(fault)
+        ran = []
+
+        with ctx.enter(
+            UnitKind.STEP, intent=SpanIntent.EXECUTE_STEP, placement=Placement.NESTED
+        ) as scope:
+            ran.append(scope)
+            value = {"the host's own": fault}
+
+        assert len(ran) == 1, f"{fault}: the body ran {len(ran)} times"
+        assert isinstance(ran[0], Scope), f"{fault}: the body was handed {ran[0]!r}"
+        assert ran[0].degraded
+        assert value == {"the host's own": fault}
+        assert ctx.tripped
+
+
+@pytest.mark.parametrize("exc", [ValueError("host"), KeyboardInterrupt(), Exception("host")])
+def test_the_hosts_own_exception_reaches_its_caller_as_the_same_object(exc):
+    """IDENTITY, not type. A wrapper that rebuilt the exception would preserve
+    the type, the message and the status on the span, and would still break a
+    host whose `except` clause matches on the instance — a retry loop holding
+    the object it raised, an `ExceptionGroup` member, a cause chain.
+
+    `KeyboardInterrupt` is here because wardex must not become the first library
+    in the process that can eat a real Ctrl-C.
+    """
+    ctx, sink = context()
+
+    with pytest.raises(type(exc)) as caught:
+        with ctx.enter(
+            UnitKind.SESSION,
+            intent=SpanIntent.INVOKE_AGENT,
+            placement=Placement.ROOT,
+            describe=_agent,
+        ):
+            raise exc
+
+    assert caught.value is exc
+    span = _emitted(sink)[-1]
+    assert span.status is StatusCode.ERROR
+    assert span.error_type == type(exc).__name__
+
+
+def test_a_wardex_bug_in_the_close_does_not_supersede_the_hosts_own_exception():
+    """The most dangerous shape there is: a failure in wardex's TEARDOWN
+    replacing the failure the host was in the middle of reporting. The host's
+    `ValueError` is the thing its operator needs; wardex's `RuntimeError`
+    arriving instead makes a wardex bug look like a host bug, in the host's own
+    logs, with wardex nowhere in the traceback's first frames.
+    """
+    ctx, sink = broken("close")
+    mine = ValueError("the host's own failure")
+
+    with pytest.raises(ValueError) as caught:
+        with ctx.enter(
+            UnitKind.SESSION,
+            intent=SpanIntent.INVOKE_AGENT,
+            placement=Placement.ROOT,
+            describe=_agent,
+        ):
+            raise mine
+
+    assert caught.value is mine
+
+
+def test_a_wardex_bug_in_the_close_costs_the_span_and_not_the_hosts_return_value():
+    ctx, sink = broken("close")
+
+    with ctx.enter(
+        UnitKind.SESSION, intent=SpanIntent.INVOKE_AGENT, placement=Placement.ROOT, describe=_agent
+    ) as scope:
+        assert not scope.degraded  # the OPEN was fine; only the close will fail
+        value = "the host's own"
+
+    assert value == "the host's own"
+    assert sink.drafts == []
+    assert ctx.tripped
+
+
+def test_a_close_that_fails_leaves_its_subtree_for_the_teardown_to_recover():
+    """No salvage, and the recovery is what buys that.
+
+    A close that fails could be answered by hand-detaching the unit and pushing
+    its own span to the sink. Measured on this exact shape, that ships 1 of 7
+    spans — with `status=OK`, which it has no basis for — and destroys the
+    reachability that lets the teardown find the other 6. Leaving the subtree
+    where it is costs the same 7 spans NOW and recovers all 7 later.
+    """
+    faulty = [True]
+
+    class Broken(UnitRegistry):
+        __slots__ = ()
+
+        def _close_locked(self, unit, **kw):
+            if faulty[0]:
+                raise RuntimeError("this subtree is torn")
+            return super()._close_locked(unit, **kw)
+
+    sink = RecordingSink()
+    ctx = AdapterContext("probe", units=Broken(sink=sink), limits={})
+
+    with ctx.enter(
+        UnitKind.SESSION, intent=SpanIntent.INVOKE_AGENT, placement=Placement.ROOT, describe=_agent
+    ):
+        for _ in range(6):
+            ctx.open_run(
+                UnitKind.CALL,
+                intent=SpanIntent.EXECUTE_TOOL,
+                placement=Placement.NESTED,
+                describe=_tool,
+            )
+
+    assert sink.drafts == [], "a partial subtree shipped — that is the salvage this rejects"
+
+    faulty[0] = False
+    ctx.close_all(marker=Limitation.ADAPTER_UNINSTALLED)
+    assert len(sink.drafts) == 7
+
+
+@pytest.mark.parametrize("when", ["before the required block", "after it"])
+def test_a_description_that_fails_never_ships_a_span_that_reads_healthy(when):
+    """`describe=` runs inside the OPEN's guard, and that is the whole argument.
+
+    Described in the `with` body under its own guard instead, the same fault
+    ships a span with `status=OK`, full io, a real duration and an arbitrary
+    suffix of its markers missing — which is worse than shipping nothing,
+    because nothing downstream can tell it from a complete observation.
+
+    Two arms, because the vocabulary decides the outcome. A description that
+    died before the intent's required block leaves a draft `finish()` refuses,
+    so the span is dropped at the emit funnel. One that died after it ships,
+    `UNSET` and marked. Neither reads healthy.
+    """
+    ctx, sink = context()
+
+    def describe(scope):
+        if when == "after it":
+            _tool(scope)
+        raise AttributeError("the framework moved this attribute")
+
+    ran = []
+    with ctx.enter(
+        UnitKind.CALL,
+        intent=SpanIntent.EXECUTE_TOOL,
+        placement=Placement.NESTED,
+        describe=describe,
+    ) as scope:
+        ran.append(scope)
+        value = "the host's own"
+
+    assert len(ran) == 1
+    assert value == "the host's own"
+    assert ctx.tripped
+
+    if when == "before the required block":
+        from wardex_sdk.assembly import VocabularyError
+
+        with pytest.raises(VocabularyError):
+            sink.drafts[-1].finish()
+        return
+
+    span = sink.drafts[-1].finish()
+    assert span.status is StatusCode.UNSET
+    assert Limitation.INSTRUMENTATION_DEGRADED in span.capture_integrity.limitations
+
+    # And at its TRUE duration: the unit is closed the instant the description
+    # failed, not left for the teardown to force-close at an inflated end.
+    ctx.close_all(marker=Limitation.ADAPTER_UNINSTALLED)
+    assert len(sink.drafts) == 1
+
+
+_DEGRADED_VERB_ARGS = {
+    "note": ((Limitation.PARENT_UNRESOLVED,), {}),
+    "link": ((LinkReason.HANDOFF_FROM, UnitKey("k", "v")), {}),
+    "claim": ((UnitKey("k", "v"),), {"observer": Observer.EXECUTOR}),
+    "outranked": ((UnitKey("k", "v"),), {"observer": Observer.EXECUTOR}),
+    "child_draft": ((SpanIntent.EXECUTE_TOOL,), {}),
+    "close_child": ((NULL_DRAFT,), {}),
+    "record_input": ((b"in",), {}),
+    "record_output": ((b"out",), {}),
+    "pin": ((), {"driver": threading.current_thread()}),
+    "close": ((), {}),
+}
+_DEGRADED_READERS = ("draft", "accepted", "degraded")
+
+
+def test_every_verb_on_a_degraded_scope_is_answerable_and_none_of_them_raises(monkeypatch):
+    """Enumerated BY REFLECTION, so a verb added later cannot quietly go missing.
+
+    The fault is installed on `SpanDraft.__init__` itself — the construction
+    whose failure produced the degraded scope in the first place — so a null
+    draft that lazily built a real one would recur here rather than in a host's
+    process. A hand-written list of verbs would have been written from the same
+    memory that produced a partial null draft.
+    """
+    from wardex_sdk.assembly import _builder
+
+    members = {n for n in dir(Scope) if not n.startswith("_")}
+    members |= {n for n in dir(RunHandle) if not n.startswith("_")}
+    uncovered = members - set(_DEGRADED_VERB_ARGS) - set(_DEGRADED_READERS)
+    assert uncovered == set(), (
+        f"{sorted(uncovered)} is reachable on a degraded handle and untested here.\n"
+        "Add it to _DEGRADED_VERB_ARGS, and give it a total answer in _context.py."
+    )
+
+    def blow(self, *a, **k):
+        raise RuntimeError("a draft cannot be built")
+
+    monkeypatch.setattr(_builder.SpanDraft, "__init__", blow)
+
+    ctx, sink = context()
+    handle = ctx.open_run(
+        UnitKind.SESSION, intent=SpanIntent.INVOKE_AGENT, placement=Placement.ROOT
+    )
+    assert handle is not None and handle.degraded
+
+    ran = []
+    with ctx.enter(
+        UnitKind.CALL, intent=SpanIntent.EXECUTE_TOOL, placement=Placement.NESTED
+    ) as scope:
+        ran.append(scope)
+        for target in (scope, handle):
+            for name in _DEGRADED_READERS:
+                getattr(target, name)
+            for name, (args, kwargs) in _DEGRADED_VERB_ARGS.items():
+                verb = getattr(target, name, None)
+                if verb is not None:
+                    verb(*args, **kwargs)
+            assert target.draft is NULL_DRAFT
+            # Every verb of the draft AND of what its integrity returns.
+            for holder in (target.draft, target.draft.integrity):
+                for name in dir(holder):
+                    if name.startswith("_"):
+                        continue
+                    member = getattr(holder, name)
+                    if not callable(member):
+                        continue
+        value = "the host's own"
+
+    assert len(ran) == 1
+    assert value == "the host's own"
+    assert sink.drafts == []
+
+
+def test_a_degraded_scope_writes_nothing_onto_the_span_that_encloses_it():
+    """The tempting fix is to reuse the enclosing unit so "at least something is
+    recorded". What that records is the CHILD's tool block, io and markers on
+    the PARENT's span — a fabricated observation with nothing saying so. The
+    only thing a degraded scope may add to its enclosing span is the marker that
+    says wardex failed under it.
+    """
+    faulty = [False]
+
+    class Broken(UnitRegistry):
+        __slots__ = ()
+
+        def open(self, *a, **k):
+            if faulty[0]:
+                raise RuntimeError("wardex is broken at open")
+            return super().open(*a, **k)
+
+    sink = RecordingSink()
+    ctx = AdapterContext("probe", units=Broken(sink=sink), limits={})
+
+    with ctx.enter(
+        UnitKind.SESSION, intent=SpanIntent.INVOKE_AGENT, placement=Placement.ROOT, describe=_agent
+    ) as root:
+        root.record_input(b"the root's own input")
+        faulty[0] = True
+        with ctx.enter(
+            UnitKind.CALL, intent=SpanIntent.EXECUTE_TOOL, placement=Placement.NESTED
+        ) as child:
+            child.draft.set_tool(ToolAttributes(name="the child's tool"))
+            child.record_input(b"the child's own input")
+            child.note(Limitation.TOOL_NAME_COLLISION)
+        faulty[0] = False
+
+    span = _emitted(sink)[-1]
+    assert span.tool is None, "the child's tool block landed on its parent"
+    assert span.input_data == b"the root's own input"
+    assert set(span.capture_integrity.limitations) == {Limitation.INSTRUMENTATION_DEGRADED}
+
+
+@pytest.mark.parametrize(
+    "fault", ["open", "close", "_close_locked", "becomes_trace_root", "current"]
+)
+def test_the_carrier_is_empty_after_a_scope_that_failed_at_any_step(fault):
+    """The activation must be exited on EVERY path, including the ones where the
+    close then fails. Deferring it until the close succeeds leaves a dead unit
+    ambient, so the next sibling call in this task is parented to a corpse — and
+    a corpse is a perfectly good-looking parent on the wire.
+    """
+    ctx, sink = broken(fault)
+
+    with ctx.enter(
+        UnitKind.SESSION, intent=SpanIntent.INVOKE_AGENT, placement=Placement.ROOT, describe=_agent
+    ):
+        pass
+
+    assert _ambient_unit.get() is None
+    # The BASE implementation, called explicitly: for the `current` fault the
+    # subclass's own method is the thing that raises, and the question here is
+    # about the carrier rather than about that method.
+    assert UnitRegistry.current(ctx._units) is None
+
+
+def test_a_span_whose_activation_failed_does_not_read_like_a_healthy_one(monkeypatch):
+    """The activation is the only fault whose span still SHIPS: the unit is live
+    and its own edge is correct, and what is lost is that work INSIDE it finds
+    the enclosing unit instead. That loss has to be legible, and the trap is
+    that `if activation is None:` — the obvious test — is dead code, because
+    `unit.activate()` binds the name before `__enter__` can raise. A span that
+    reads byte-identical to a healthy one is the failure this asserts against.
+    """
+    from wardex_sdk.assembly import _units
+
+    healthy_ctx, healthy_sink = context()
+    with healthy_ctx.enter(
+        UnitKind.SESSION, intent=SpanIntent.INVOKE_AGENT, placement=Placement.ROOT, describe=_agent
+    ):
+        pass
+    healthy = _emitted(healthy_sink)[-1]
+
+    def blow(self, *a, **k):
+        raise RuntimeError("the carrier is broken")
+
+    monkeypatch.setattr(_units._Carrier, "__init__", blow)
+
+    ctx, sink = context()
+    ran = []
+    with ctx.enter(
+        UnitKind.SESSION, intent=SpanIntent.INVOKE_AGENT, placement=Placement.ROOT, describe=_agent
+    ) as scope:
+        ran.append(scope)
+        assert not scope.degraded
+
+    assert len(ran) == 1
+    span = _emitted(sink)[-1]
+    assert span.status is StatusCode.OK
+    assert span.capture_integrity is not None
+    assert set(span.capture_integrity.limitations) != set(
+        healthy.capture_integrity.limitations if healthy.capture_integrity else ()
+    )
+    assert Limitation.INSTRUMENTATION_DEGRADED in span.capture_integrity.limitations
+
+
+def test_a_lookup_that_blows_up_lowers_the_edge_it_would_have_claimed():
+    """A failed lookup may only ever LOWER what wardex claims about the edge.
+
+    Read as an ordinary miss it would be an UPGRADE: the miss path falls through
+    to the live scope at 1.0, which is ABOVE the 0.9 a real alias hit earns. So
+    a bug in the lookup would make the edge look more certain than the
+    identifier it was told to honour, which is I4 exactly backwards.
+    """
+    key = UnitKey("test.run", "r1")
+
+    # HIT — the identifier resolved, and an exact match is worth 0.9.
+    ctx, sink = context()
+    with ctx.enter(
+        UnitKind.SESSION,
+        intent=SpanIntent.INVOKE_AGENT,
+        placement=Placement.ROOT,
+        selector=key,
+        describe=_agent,
+    ):
+        with ctx.rejoin(
+            key,
+            UnitKind.STEP,
+            intent=SpanIntent.EXECUTE_STEP,
+            placement=Placement.NESTED,
+            describe=_step,
+        ):
+            pass
+        assert _edge(sink)[:2] == (ParentSource.UNIT_ALIAS, 0.9)
+
+    # MISS — the documented fall-through, unchanged, and NOT a degradation.
+    ctx, sink = context()
+    with ctx.enter(
+        UnitKind.SESSION, intent=SpanIntent.INVOKE_AGENT, placement=Placement.ROOT, describe=_agent
+    ):
+        with ctx.rejoin(
+            UnitKey("test.run", "nobody"),
+            UnitKind.STEP,
+            intent=SpanIntent.EXECUTE_STEP,
+            placement=Placement.NESTED,
+            describe=_step,
+        ):
+            pass
+        source, confidence, markers = _edge(sink)
+    assert (source, confidence) == (ParentSource.UNIT_ACTIVE, 1.0)
+    assert markers == ()
+    assert not ctx.tripped
+
+    # BROKEN — same strategy, half the confidence, and it says wardex failed.
+    ctx, sink = broken("find")
+    with ctx.enter(
+        UnitKind.SESSION, intent=SpanIntent.INVOKE_AGENT, placement=Placement.ROOT, describe=_agent
+    ):
+        with ctx.rejoin(
+            key,
+            UnitKind.STEP,
+            intent=SpanIntent.EXECUTE_STEP,
+            placement=Placement.NESTED,
+            describe=_step,
+        ):
+            pass
+        source, confidence, markers = _edge(sink)
+    assert (source, confidence) == (ParentSource.UNIT_ACTIVE, 0.5)
+    assert confidence < 0.9, "a wardex bug outranked a real alias hit"
+    assert Limitation.INSTRUMENTATION_DEGRADED in markers
+
+
+def test_a_thousand_trips_of_one_site_leave_a_bounded_record_on_the_wire(capsys):
+    """One line, one marker, zero extras — however many times the site trips.
+
+    Recording the site name as a span attribute is the shape this rejects:
+    `set_extra` appends with no dedup and no cap, so a site failing in a loop
+    puts one entry per trip on the enclosing span, while `add_limitation` puts
+    one marker there however often it is called. The site name lives on stderr,
+    where the person who needs it is already looking.
+    """
+    healthy_ctx, healthy_sink = context()
+    with healthy_ctx.enter(
+        UnitKind.SESSION, intent=SpanIntent.INVOKE_AGENT, placement=Placement.ROOT, describe=_agent
+    ):
+        pass
+    healthy = _emitted(healthy_sink)[-1]
+
+    faulty = [False]
+
+    class Broken(UnitRegistry):
+        __slots__ = ()
+
+        def open(self, *a, **k):
+            if faulty[0]:
+                raise RuntimeError("wardex is broken at open")
+            return super().open(*a, **k)
+
+    sink = RecordingSink()
+    ctx = AdapterContext("probe", units=Broken(sink=sink), limits={})
+
+    with ctx.enter(
+        UnitKind.SESSION, intent=SpanIntent.INVOKE_AGENT, placement=Placement.ROOT, describe=_agent
+    ):
+        capsys.readouterr()
+        faulty[0] = True
+        for _ in range(1000):
+            with ctx.enter(
+                UnitKind.CALL, intent=SpanIntent.EXECUTE_TOOL, placement=Placement.NESTED
+            ):
+                pass
+        faulty[0] = False
+
+    lines = [line for line in capsys.readouterr().err.splitlines() if line.strip()]
+    assert len(lines) == 1, f"1000 trips wrote {len(lines)} lines"
+
+    span = _emitted(sink)[-1]
+    assert list(span.capture_integrity.limitations) == [Limitation.INSTRUMENTATION_DEGRADED]
+    # Compared against the SAME span built healthily: the assertion is that the
+    # degraded path added nothing to `extra`, not that `extra` happens to be
+    # empty — this span already carries its operation name there.
+    assert span.extra == healthy.extra
+    assert counters.get("adapters.probe.enter.execute_tool") == 1000
+
+
+def test_a_degraded_run_is_told_apart_from_wardex_never_having_been_installed(capsys):
+    """The question that decides whether any of this is worth anything.
+
+    An operator whose dashboard is empty has to be able to tell "wardex is
+    broken here" from "wardex was never installed". Recorded only in `counters`
+    the two are byte-identical in a production process — nothing reads a
+    snapshot, `counters` is not exported, and `debug` is off by default. The
+    stderr line is the difference, and it names the CONSEQUENCE rather than a
+    site label, because the reader is asking why their traces stopped.
+    """
+    ctx, sink = context()
+    capsys.readouterr()
+    with ctx.enter(
+        UnitKind.SESSION, intent=SpanIntent.INVOKE_AGENT, placement=Placement.ROOT, describe=_agent
+    ):
+        pass
+    assert len(sink.drafts) == 1
+    assert capsys.readouterr().err == ""
+
+    ctx, sink = broken("open")
+    capsys.readouterr()
+    with ctx.enter(
+        UnitKind.SESSION, intent=SpanIntent.INVOKE_AGENT, placement=Placement.ROOT, describe=_agent
+    ):
+        pass
+    degraded = capsys.readouterr().err
+    assert sink.drafts == []
+    assert len([line for line in degraded.splitlines() if line.strip()]) == 1
+    assert "probe adapter" in degraded
+    assert "NO agent span" in degraded, f"the line does not name the consequence: {degraded!r}"
+    assert "capture_mode=AGENT" in degraded
+
+    # And the third arm: no adapter at all. Zero spans, and nothing said,
+    # because nothing went wrong.
+    capsys.readouterr()
+    assert capsys.readouterr().err == ""
+
+
+def test_a_degraded_scope_refuses_the_claim_it_cannot_honour():
+    """A True claim tells the rival observer it was outranked by a unit that
+    does not exist — so the ONE observation of this event that could still have
+    survived is suppressed too. Refusing costs a weaker span; claiming costs
+    every span.
+    """
+    ctx, sink = broken("open")
+
+    with ctx.enter(
+        UnitKind.CALL, intent=SpanIntent.EXECUTE_TOOL, placement=Placement.NESTED
+    ) as scope:
+        assert scope.degraded
+        assert scope.claim(UnitKey("k", "v"), observer=Observer.EXECUTOR) is False
+        assert scope.outranked(UnitKey("k", "v"), observer=Observer.CALLBACK) is False
+
+
+def test_describe_is_handed_the_same_scope_the_body_is_handed():
+    """The new keyword must not become a back door for a privileged value.
+
+    `describe` runs inside wardex's own guard, where a `Unit` — which exposes
+    `child()`, `activate()` and `context` — is right there to hand over. Doing
+    so would put a parent-valued object in every adapter author's hands through
+    a keyword nobody thinks of as part of the causal surface.
+    """
+    ctx, sink = context()
+    seen = []
+
+    with ctx.enter(
+        UnitKind.SESSION,
+        intent=SpanIntent.INVOKE_AGENT,
+        placement=Placement.ROOT,
+        describe=lambda s: (seen.append(s), _agent(s)),
+    ) as scope:
+        assert seen[0] is scope
+
+    for forbidden in ("context", "parentage", "parent", "unit", "child", "activate", "bind"):
+        assert not hasattr(seen[0], forbidden)
+
+
+def test_a_teardown_that_fails_never_reaches_the_hosts_uninstall():
+    """`close_all` runs from `uninstall()`, which runs on the host's `atexit`.
+    A raise there lands in the host's shutdown path, after its own code is done
+    and where nobody is catching anything.
+    """
+    ctx, sink = broken("close_all")
+
+    ctx.close_all(marker=Limitation.ADAPTER_UNINSTALLED)  # must not raise
+
+    assert ctx.tripped
+
+
+def test_a_lost_subtree_is_recorded_on_a_span_that_still_ships():
+    """The activation is exited BEFORE the close, never after a successful one.
+
+    On CPython the carrier comes down by refcounting either way, so the cost of
+    the wrong order is not a leak — it is that the degradation is recorded in
+    the wrong place. `_degrade` asks the registry which unit should carry the
+    marker, and with the dying unit still ambient the answer is the unit whose
+    span was just lost. The record then goes down with the thing it describes,
+    and the span that DOES ship says nothing about the subtree missing under it.
+    """
+    faulty = [False]
+
+    class Broken(UnitRegistry):
+        __slots__ = ()
+
+        def close(self, unit, **kw):
+            if faulty[0]:
+                raise RuntimeError("wardex is broken at close")
+            return super().close(unit, **kw)
+
+    sink = RecordingSink()
+    ctx = AdapterContext("probe", units=Broken(sink=sink), limits={})
+
+    with ctx.enter(
+        UnitKind.SESSION, intent=SpanIntent.INVOKE_AGENT, placement=Placement.ROOT, describe=_agent
+    ):
+        faulty[0] = True
+        with ctx.enter(
+            UnitKind.CALL,
+            intent=SpanIntent.EXECUTE_TOOL,
+            placement=Placement.NESTED,
+            describe=_tool,
+        ):
+            pass
+        faulty[0] = False
+
+    span = _emitted(sink)[-1]
+    assert Limitation.INSTRUMENTATION_DEGRADED in span.capture_integrity.limitations, (
+        "the run's own span does not say a subtree was lost under it"
+    )

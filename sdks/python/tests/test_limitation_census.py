@@ -192,6 +192,15 @@ _MEMBER_SITES: dict[str, frozenset[str]] = {
     # make visible rather than comfortable.
     "ADAPTER_UNINSTALLED": frozenset({"adapters/_anthropic_agent_sdk.py"}),
     "UNIT_INTERRUPTED": frozenset({"_lifecycle.py"}),
+    # ONE site, and it is meant to stay one. This member says wardex's own
+    # instrumentation failed, and `adapters/_context.py` is the only place that
+    # knows it did — `_abandon` puts it on a unit whose open or description
+    # died, `_run` puts it on one whose activation died, and `_degrade` puts it
+    # on the enclosing unit when the span itself will not ship at all. A second
+    # site would mean some other module had started catching wardex's own
+    # failures, which is the thing the single sanctioned swallow exists to
+    # prevent. It was a declaration with no emitter for exactly one commit.
+    "INSTRUMENTATION_DEGRADED": frozenset({"adapters/_context.py"}),
 }
 """Every place a `Limitation` MEMBER (rather than a free string) reaches a
 marker slot, by site — the other half of the census, and the half that grew.
@@ -412,6 +421,14 @@ _EMITTED_MEMBERS: frozenset[str] = frozenset(
         # exist now exists and says why it is short.
         "ADAPTER_UNINSTALLED",
         "UNIT_INTERRUPTED",
+        # The ninth, and the only member declared and emitted one commit apart —
+        # deliberately, because the commit that declared it said so in its own
+        # docstring rather than leaving the gap to be discovered here. Its
+        # emitter is `adapters/_context.py`, which is the only module that
+        # learns wardex's own work failed: a unit whose open or description
+        # died, one whose activation died, and the enclosing unit when the span
+        # itself will not ship. The one member whose subject is wardex.
+        "INSTRUMENTATION_DEGRADED",
     }
 )
 """Which MEMBERS have an emit site today, derived independently below.
@@ -1814,3 +1831,54 @@ def test_retired_vocabulary_stays_retired(
     for ghost in _NOT_ADOPTED:
         assert ghost not in values, f"{ghost} was adopted without a decision"
         assert ghost not in emitted, f"{ghost} acquired an emitter — re-run the census"
+
+
+def test_a_wardex_bug_is_not_reported_as_a_shallow_tree() -> None:
+    """The one member whose subject is wardex, kept apart from its nearest neighbour.
+
+    `CONTEXT_PROPAGATION_DEGRADED` and `INSTRUMENTATION_DEGRADED` describe the
+    same SYMPTOM — a tree shallower or thinner than the run that produced it —
+    and opposite CAUSES. The first is declared as a property of the runtime, a
+    carrier that legitimately could not inherit the context; its knob is "expect
+    shallow trees on this seam". The second is a bug in wardex; its knob is
+    "file it". Reusing the first for the second files wardex's own defects under
+    the host's threading model, where nobody will ever look for them.
+
+    Reusing `CHILD_SPAN_UNCLOSED` or `ADAPTER_UNINSTALLED` is the other tempting
+    shortcut and is refused for a sharper reason: each claims a teardown that
+    did not happen, so a reader goes hunting for an unclosed child that does not
+    exist.
+    """
+    from wardex_sdk.adapters._context import AdapterContext
+    from wardex_sdk.assembly import EMPTY_AMBIENT, SpanIntent, UnitKey, UnitKind, UnitRegistry
+
+    assert Limitation.INSTRUMENTATION_DEGRADED is not Limitation.CONTEXT_PROPAGATION_DEGRADED
+
+    class _Sink:
+        def __init__(self) -> None:
+            self.drafts: list = []
+
+        def emit(self, draft, *, agent_semantic: bool) -> bool:
+            self.drafts.append(draft)
+            return True
+
+    class Broken(UnitRegistry):
+        __slots__ = ()
+
+        def open(self, *a, **k):
+            raise RuntimeError("wardex is broken at open")
+
+    sink = _Sink()
+    ctx = AdapterContext("probe", units=Broken(sink=sink), limits={})
+    healthy = UnitRegistry(sink=sink)
+    holder = healthy.open(
+        UnitKind.SESSION,
+        UnitKey("t", "s"),
+        ambient=EMPTY_AMBIENT,
+        intent=SpanIntent.INVOKE_AGENT,
+    )
+    ctx._degrade("enter.execute_tool", holder=holder, consequence="one span is missing")
+
+    markers = set(holder.draft.integrity.markers)
+    assert Limitation.INSTRUMENTATION_DEGRADED in markers
+    assert Limitation.CONTEXT_PROPAGATION_DEGRADED not in markers
