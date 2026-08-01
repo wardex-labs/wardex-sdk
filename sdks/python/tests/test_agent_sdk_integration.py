@@ -14,6 +14,7 @@ from wardex_sdk._client import Client
 from wardex_sdk._config import WardexConfig
 from wardex_sdk._enums import CaptureSource, StatusCode
 from wardex_sdk.adapters._anthropic_agent_sdk import AnthropicAgentSdkAdapter
+from wardex_sdk.adapters._registry import context_for
 from wardex_sdk.assembly import Limitation
 from wardex_sdk.transport._base import Transport
 
@@ -74,7 +75,7 @@ def test_transport_death_marks_session_aborted():
 
     client = FakeClient()
     adapter = AnthropicAgentSdkAdapter()
-    adapter.install(client)
+    adapter.install(client, context_for(adapter.name(), client))
     try:
 
         async def main():
@@ -95,7 +96,7 @@ def test_transport_death_marks_session_aborted():
 def test_parallel_sessions_do_not_cross():
     client = FakeClient()
     adapter = AnthropicAgentSdkAdapter()
-    adapter.install(client)
+    adapter.install(client, context_for(adapter.name(), client))
     try:
         init2 = dict(INIT_LINE, session_id="s-2")
         asst2 = {**ASSISTANT_LINE, "session_id": "s-2"}
@@ -150,7 +151,7 @@ def test_repeated_sdk_tool_registration_does_not_double_wrap():
     )
 
     adapter = AnthropicAgentSdkAdapter()
-    adapter.install(client)
+    adapter.install(client, context_for(adapter.name(), client))
     try:
         claude_agent_sdk.create_sdk_mcp_server("srv", tools=[tool_def])
         first_handler = tool_def.handler

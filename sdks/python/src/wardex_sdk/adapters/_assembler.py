@@ -83,11 +83,20 @@ _IN_SESSION = Evidence(ParentSource.UNIT_ACTIVE)
 # timing.
 #
 # NOT the whole adapter. The in-process `execute_tool` span that
-# `_anthropic_agent_sdk.py::_open_tool_call` opens brackets a handler wardex
-# wrapped in this process, so its duration is measured directly; attaching this
-# marker there would claim the timing is absent when it is the one timing the
-# adapter owns.
+# `_anthropic_agent_sdk.py::_run_tool` opens brackets a handler wardex wrapped
+# in this process, so its duration is measured directly; attaching this marker
+# there would claim the timing is absent when it is the one timing the adapter
+# owns.
 _BASE_LIMITATION = Limitation.TRANSPORT_TIMING_UNAVAILABLE_SUBPROCESS
+
+#: Whose runs these are. It must equal the adapter's `name()`, because that is
+#: what the `AdapterContext` is built with and therefore what `sole_live(...,
+#: owner=)` and `close_all(owner=)` filter on: a session opened here with a
+#: different owner — or none — is one this adapter's own tool wrapper cannot
+#: find, and `sole_live` treats an unowned unit as matching nothing rather than
+#: everything, precisely so a guess cannot cross a framework boundary.
+#: `test_agent_sdk_units.py` asserts the two spellings agree.
+_OWNER = "anthropic_agent_sdk"
 
 
 #: The rank the HOOK observer claims a tool call at. The in-process handler
@@ -272,8 +281,9 @@ class SessionAssembler:
                     # instead is one tier down and marks itself: on the hook path
                     # `_session_for_hook` falls from the scope to this adapter's
                     # own `_by_session_id` table and then to a counted sole-live
-                    # inference, and `_open_tool_call` falls to
-                    # `sole_live(SESSION)` at 0.5 with `UNIT_INFERRED_SOLE`.
+                    # inference, and the tool wrapper's declared
+                    # `Fallback.SOLE_LIVE_RUN` falls to the one live run of this
+                    # adapter's own, at 0.5 with `UNIT_INFERRED_SOLE`.
                     self._units.alias(
                         UnitKey("transport.id", str(key)),
                         UnitKey("claude.session_id", ev.session_id),
@@ -451,6 +461,7 @@ class SessionAssembler:
             ambient=latch_ambient(),
             intent=SpanIntent.INVOKE_AGENT,
             start_ns=now,
+            owner=_OWNER,
         )
         # The required block AT OPEN, not only at finalize. A unit the registry
         # evicts is emitted immediately, and a draft missing `agent` is one

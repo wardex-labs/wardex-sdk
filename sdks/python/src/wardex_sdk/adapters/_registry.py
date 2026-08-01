@@ -14,6 +14,38 @@ if TYPE_CHECKING:
     from .._client import Client
 
 
+def context_for(name: str, client: Client | None) -> AdapterContext:
+    """Build the surface an adapter is written against. THE one construction.
+
+    A module function rather than a method because an adapter installed outside
+    the registry — every test that drives one directly — must be able to reach
+    the same construction. Two constructions would be two registries, and
+    `owner` scoping answers questions about ONE table: with two, `sole_live` and
+    `close_all` cannot tell one adapter's units from another's inside either.
+    """
+    config = getattr(client, "config", None)
+    limits = config.limits if config is not None else CaptureLimits()
+    resolved = limits.resolved()
+    debug = bool(getattr(config, "debug", False))
+    return AdapterContext(
+        name,
+        # The bounds are passed HERE and not left to the registry's defaults.
+        # Once an adapter shares this registry, this is the only place a
+        # user's `max_units` can reach it — a registry built with defaults
+        # would ignore the setting in silence, which is the shape of bug
+        # that looks like nothing at all until a workload crosses a cap the
+        # user thought they had raised.
+        units=UnitRegistry(
+            sink=_ClientSink(client),
+            max_units=resolved["max_units"],
+            max_entries_per_unit=resolved["max_entries_per_unit"],
+            debug=debug,
+        ),
+        limits=resolved,
+        debug=debug,
+    )
+
+
 class AdapterRegistry:
     def __init__(self) -> None:
         self._installed: dict[str, AdapterInterface] = {}
@@ -44,7 +76,7 @@ class AdapterRegistry:
         name = adapter.name()
         if name in self._installed:
             return
-        ctx = self._context_for(name, client)
+        ctx = context_for(name, client)
         self._installed[name] = adapter
         self._contexts[name] = ctx
 
@@ -60,42 +92,6 @@ class AdapterRegistry:
         ctx.patches.restore_all()
         self._installed.pop(name, None)
         self._contexts.pop(name, None)
-
-    @staticmethod
-    def _context_for(name: str, client: Client | None) -> AdapterContext:
-        """Build the surface this adapter will eventually be written against.
-
-        Passed now and ignored by every adapter, so that the signature change
-        lands apart from the behaviour change — an adapter migrating onto it is
-        then a change to that adapter alone, not to the interface plus the
-        registry plus everyone else at once.
-
-        TRANSITIONAL: the registry it holds is its own, while each assembler
-        still constructs one of its own too. Nothing opens a unit in this one
-        yet, so the two cannot interact; the step that moves an adapter onto
-        `ctx` is the step that collapses them.
-        """
-        config = getattr(client, "config", None)
-        limits = config.limits if config is not None else CaptureLimits()
-        resolved = limits.resolved()
-        debug = bool(getattr(config, "debug", False))
-        return AdapterContext(
-            name,
-            # The bounds are passed HERE and not left to the registry's defaults.
-            # Once an adapter shares this registry, this is the only place a
-            # user's `max_units` can reach it — a registry built with defaults
-            # would ignore the setting in silence, which is the shape of bug
-            # that looks like nothing at all until a workload crosses a cap the
-            # user thought they had raised.
-            units=UnitRegistry(
-                sink=_ClientSink(client),
-                max_units=resolved["max_units"],
-                max_entries_per_unit=resolved["max_entries_per_unit"],
-                debug=debug,
-            ),
-            limits=resolved,
-            debug=debug,
-        )
 
     def uninstall_all(self) -> None:
         """Uninstall every adapter. Total: one failure cannot stop the rest.

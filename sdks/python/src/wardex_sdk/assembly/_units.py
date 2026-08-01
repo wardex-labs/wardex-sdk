@@ -415,6 +415,25 @@ class Unit:
     def is_live(self) -> bool:
         return self._live
 
+    def enclosing(self, kind: UnitKind) -> Unit | None:
+        """The nearest ancestor of `kind`, counting this unit itself.
+
+        Exists for arbitration, not for parentage — nothing here hands out an
+        edge. Claims live ON a unit, so two observers of one event have to claim
+        on the SAME unit or `claim()` arbitrates nothing: a hook that sees the
+        whole run holds the SESSION, while an in-process handler's own scope is
+        the CALL it is running inside. Walking up is what puts both claims in
+        one table.
+
+        The walk is the registry's rather than a caller's because `parent` is a
+        unit-valued attribute, and a caller that walks it is one edit away from
+        installing what it found.
+        """
+        unit: Unit | None = self
+        while unit is not None and unit.kind is not kind:
+            unit = unit.parent
+        return unit
+
     # -- parentage handout -----------------------------------------------
 
     def child(self, evidence: Evidence = _IN_UNIT) -> Parentage:

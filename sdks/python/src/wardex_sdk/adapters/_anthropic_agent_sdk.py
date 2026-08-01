@@ -27,30 +27,26 @@ import sys
 import threading
 from collections.abc import Mapping
 from dataclasses import replace
+from functools import partial
 from itertools import count
 from typing import TYPE_CHECKING, Any
 
-from .._enums import StatusCode, ToolExecutionType
+from .._enums import ToolExecutionType
 from .._types import ToolAttributes
 from ..assembly import (
-    AMBIENT,
-    EMPTY_AMBIENT,
-    Evidence,
     Limitation,
-    ParentSource,
     PatchSet,
     SpanIntent,
-    Unit,
     UnitKey,
     UnitKind,
-    UnitRegistry,
     counters,
     guard,
-    latch_ambient,
+    report_once,
 )
 from ._anthropic_names import McpToolCatalog, ServerHandle
 from ._assembler import SessionAssembler
 from ._base import AdapterInterface
+from ._context import AdapterContext, Fallback, Observer, Placement, Scope
 
 if TYPE_CHECKING:
     from .._client import Client
@@ -64,11 +60,6 @@ _WARDEX_HOOK_EVENTS = (
     "UserPromptSubmit",
     "Stop",
 )
-
-#: The rank the in-process handler wrapper claims a tool call at, against the
-#: hook observer's 0. Ownership belongs to the layer that wrapped the real
-#: execution (§8.4), and the hook fires FIRST, so first-come would invert it.
-_HANDLER_RANK = 10
 
 #: Distinguishes concurrent invocations of one tool in the registry's alias
 #: table. wardex-issued and monotonic on purpose: a framework identifier here
@@ -179,22 +170,6 @@ def _existing_handle(tools: Any) -> ServerHandle | None:
     return None
 
 
-class _ToolCall:
-    """A tool call in flight: the unit that owns its span, plus its input bytes.
-
-    The bytes are held rather than written at open because `SpanDraft.set_io`
-    records input, output and both `attempted` flags in ONE call — deliberately,
-    since they were two decisions in two places and disagreed. Writing input at
-    open and output at close would take the second write's empty input.
-    """
-
-    __slots__ = ("input_data", "unit")
-
-    def __init__(self, unit: Unit, input_data: bytes) -> None:
-        self.unit = unit
-        self.input_data = input_data
-
-
 def _tool_input(args: Any) -> bytes:
     try:
         return json.dumps(args).encode()
@@ -203,115 +178,40 @@ def _tool_input(args: Any) -> bytes:
         return b""
 
 
-def _enclosing_session(unit: Unit | None) -> Unit | None:
-    """The SESSION this unit sits under, walking the registry's own chain.
+def _describe_tool_call(
+    adapter: AnthropicAgentSdkAdapter,
+    handle: ServerHandle,
+    tool_name: str,
+    args: Any,
+    call: Scope,
+) -> None:
+    """Everything this adapter knows about a call, minus its parentage.
 
-    Claims live on a unit, so both observers of one tool call have to claim on
-    the SAME one or `claim()` arbitrates nothing. The hook path always holds the
-    session; a nested in-process tool's ambient unit is the enclosing CALL, so
-    the handler walks up rather than claiming on a unit the hook never sees.
+    Runs INSIDE `enter()`'s guard, before the host's handler, while the span can
+    still be abandoned. `call` is LAST so `functools.partial` binds the rest.
+
+    Every statement here reads the FRAMEWORK — `handle.token_resolved`,
+    `adapter._names`, the handler's own arguments — which is exactly the code
+    that breaks when an SDK moves an attribute between releases. That is why it
+    belongs in one guarded region with the open rather than in the `with` body:
+    a half-described tool span reading `status=OK` with full io and its markers
+    silently gone is worse than no span at all.
+
+    The three parentage tiers that used to live here are gone. `enter()` latches
+    the live scope internally and the registry decides the edge — including the
+    stale-pin case, which used to be marked by hand HERE at a site that had to
+    remember. What is left is what only this adapter can know.
     """
-    while unit is not None and unit.kind is not UnitKind.SESSION:
-        unit = unit.parent
-    return unit
-
-
-def _open_tool_call(
-    units: UnitRegistry, adapter: AnthropicAgentSdkAdapter, handle: ServerHandle, tool_name: str
-) -> Unit:
-    """Open the CALL unit whose span brackets this handler invocation.
-
-    Three tiers, each reporting its own certainty:
-
-      1. `units.current()` — the pin (or an enclosing tool's activation). The
-         session reached this handler through in-process context propagation, so
-         the edge is `unit_active` at confidence 1.0 with no framework id
-         anywhere in it. This is the tier the whole design exists to reach.
-      2. `sole_live(SESSION)` — the pin did not reach us and exactly one session
-         is live. A guess, so 0.5 and `UNIT_INFERRED_SOLE`. The alternative is
-         what the code this replaces did with an unattributable hook: drop it,
-         unmarked.
-      3. no session at all — a handler called outside any Agent SDK run (a unit
-         test, a host calling its own tool directly). The span still exists and
-         still attaches to the host's ambient wardex span if there is one;
-         `PARENT_UNRESOLVED` says so when there is not.
-
-    Whichever tier answers, the answer is marked when a STALE PIN is what sent
-    us past tier 1. `current()` refuses a pinned unit that has closed, but it
-    cannot take down the scope the same carrier installed — the session's own
-    context is still standing on this task — so the tier that runs next is
-    deciding this edge in the shadow of a finished run. Without the marker the
-    stale-pin case and the case where no pin ever existed produce byte-identical
-    spans, at every tier: tier 2 attaches to whichever session happens to be the
-    sole live one, at 0.5 with `UNIT_INFERRED_SOLE` and no hint that another
-    session's pin is the reason we are guessing. Staleness is a property of the
-    EDGE, and this is the span whose edge it decided (design §5.6 asks for a
-    hard `CORRELATION_CONFLICT` rather than an internal count, precisely because
-    a tree shape has to be falsifiable from the data).
-    """
-    holder = units.current()
-    stale_pin = holder is None and units.stale_pin_in_scope()
-    evidence = Evidence(ParentSource.UNIT_ACTIVE)
-    inferred = False
-    if holder is None:
-        holder = units.sole_live(UnitKind.SESSION)
-        if holder is not None:
-            evidence = Evidence(ParentSource.UNIT_SOLE)
-            inferred = True
-
-    session = _enclosing_session(holder)
-    if session is not None:
-        # Take the key at the handler's rank. The return value is deliberately
-        # NOT a gate: at this rank a refusal means another INVOCATION of the same
-        # tool is in flight (Claude issues tool calls in parallel), not that a
-        # rival observer owns the event — and standing down there would delete a
-        # real call's span. What the claim does is make the hook observer, which
-        # opened at rank 0 before this body ran, discard its own.
-        session.claim(handle.key_for(tool_name), rank=_HANDLER_RANK)
-
-    key = UnitKey("mcp.tool.call", f"{handle.effective_token}/{tool_name}#{next(_call_seq)}")
-    if holder is not None:
-        call = units.open(
-            UnitKind.CALL,
-            key,
-            ambient=EMPTY_AMBIENT,
-            parent_unit=holder,
-            evidence=evidence,
-            intent=SpanIntent.EXECUTE_TOOL,
-            subject=tool_name,
-        )
-        if inferred:
-            call.note(Limitation.UNIT_INFERRED_SOLE)
-    else:
-        ambient = latch_ambient()
-        if ambient.span_context is not None:
-            call = units.open(
-                UnitKind.CALL,
-                key,
-                ambient=ambient,
-                evidence=AMBIENT,
-                intent=SpanIntent.EXECUTE_TOOL,
-                subject=tool_name,
-            )
-        else:
-            call = units.open(
-                UnitKind.CALL,
-                key,
-                ambient=ambient,
-                evidence=Evidence(ParentSource.UNRESOLVED),
-                intent=SpanIntent.EXECUTE_TOOL,
-                subject=tool_name,
-            )
-            call.note(Limitation.PARENT_UNRESOLVED)
-
-    if stale_pin:
-        # Recorded here rather than on the pinned session's own span, which is
-        # not reachable: `Unit.note()` is a no-op once the unit is closed, and
-        # the sink materialized and shipped that span inside the very `close()`
-        # that made the pin stale. This span is the one the staleness actually
-        # cost something.
-        call.note(Limitation.CORRELATION_CONFLICT)
     call.draft.set_tool(ToolAttributes(name=tool_name, execution_type=ToolExecutionType.IN_PROCESS))
+    # Take the key at the handler's rank, ON THE RUN rather than on this call:
+    # the hook observer claims on the session, and two claims in two tables
+    # arbitrate nothing. The return value is deliberately NOT a gate — at this
+    # rank a refusal means another INVOCATION of the same tool is in flight
+    # (Claude issues tool calls in parallel), not that a rival observer owns the
+    # event, and standing down there would delete a real call's span. What the
+    # claim does is make the hook observer, which opened at rank 0 before this
+    # body ran, discard its own.
+    call.claim_run(handle.key_for(tool_name), observer=Observer.EXECUTOR)
     # The handler is handed `{name, arguments}` and nothing else — no
     # `tool_use_id` reaches it, verified in the SDK's own dispatch. Guessing one
     # by matching name+args against the stream in arrival order is precisely the
@@ -329,7 +229,11 @@ def _open_tool_call(
         # tools unprefixed, so the hook cannot tell which server ran. It stands
         # down; this span says why the other observation is missing.
         call.note(Limitation.TOOL_NAME_COLLISION)
-    return call
+    # The unit accumulates both halves and stamps `set_io` once at close, so the
+    # `attempted` flags follow from what was actually recorded: a handler that
+    # raised never reaches `record_output`, and the span says the output capture
+    # was not attempted rather than reporting an empty body as a captured one.
+    call.record_input(_tool_input(args))
 
 
 async def _run_tool(
@@ -337,52 +241,52 @@ async def _run_tool(
 ):
     """The wrapped handler body. The host's call and its exception are sacred.
 
-    `handler(args)` is never invoked inside `guard()`: the user's own exception
-    is the host's control flow and must reach the caller unchanged. Only wardex's
-    own work is guarded, and the guarded blocks bracket the call rather than
-    containing it.
+    `handler(args)` sits inside the `with`, and that is safe for one reason:
+    `ctx.enter()` contains its own failures. The body runs whether or not a span
+    was opened, the scope it yields answers every verb either way, and the
+    host's own exception passes through untouched — `enter()` re-raises it after
+    recording the status, and both the activation exit and the close in its
+    `finally` are guarded so a wardex bug there cannot supersede it.
+
+    Do NOT wrap this `with` in `adapter._guard(...)`. A guard around the whole
+    block would swallow the host's exception, which is the one thing that may
+    never happen: a failing tool would report success to its caller AND on the
+    wire.
+
+    `fallback=SOLE_LIVE_RUN` is the one guess this site declares, and it is
+    declared rather than computed. The pin normally reaches this handler through
+    the carrier, which is the tier the whole design exists to hit; when it does
+    not, one live run of this adapter's own is worth 0.5 with
+    `UNIT_INFERRED_SOLE` on it. The alternative is a tool call that becomes its
+    own trace root — the shattered-run shape `Placement` exists to prevent —
+    and a marked low-confidence edge beats unmarked data loss.
     """
-    units = adapter._unit_registry()
-    if units is None:
-        # No registry — the adapter was uninstalled while this wrapper survived
-        # in a reference the host still holds. Nothing to attach to, so the
-        # handler runs exactly as if wardex had never been here.
+    ctx = adapter._ctx
+    if ctx is None:
+        # Uninstalled while this wrapper survived in a reference the host still
+        # holds. Nothing to attach to, so the handler runs exactly as if wardex
+        # had never been here. The one branch this function keeps, and it is
+        # about the ADAPTER's lifetime rather than about a failure.
         return await handler(args)
 
-    call: _ToolCall | None = None
-    with adapter._guard("adapters.anthropic.tool_open"):
-        call = _ToolCall(_open_tool_call(units, adapter, handle, tool_name), _tool_input(args))
-    if call is None:
-        # The guard fired: wardex could not open a span. The host's tool still
-        # runs — an SDK bug is never allowed to become a missing tool call.
-        return await handler(args)
+    # Evaluated BEFORE `enter()` and therefore outside every guard, so it has to
+    # be total: `effective_token` is `self.token or self.name` and `next()` on a
+    # `count()` cannot fail. If that ever stops being true it moves into
+    # `describe` with a constant fallback.
+    key = UnitKey("mcp.tool.call", f"{handle.effective_token}/{tool_name}#{next(_call_seq)}")
 
-    # Inside the unit's activation, so anything the handler does in-process —
-    # a nested wardex span, an HTTP request the byte seam sees — attaches to
-    # THIS tool span and passes the `capture_mode=AGENT` gate, instead of being
-    # captured accurately underneath an orphan trace.
-    with call.unit.activate():
-        try:
-            result = await handler(args)
-        except BaseException as exc:
-            with adapter._guard("adapters.anthropic.tool_close"):
-                _close_tool_call(units, call, StatusCode.ERROR, type(exc).__name__, b"")
-            raise
-        with adapter._guard("adapters.anthropic.tool_close"):
-            _close_tool_call(units, call, StatusCode.OK, None, _tool_input(result))
+    with ctx.enter(
+        UnitKind.CALL,
+        intent=SpanIntent.EXECUTE_TOOL,
+        placement=Placement.NESTED,
+        subject=tool_name,
+        selector=key,
+        fallback=Fallback.SOLE_LIVE_RUN,
+        describe=partial(_describe_tool_call, adapter, handle, tool_name, args),
+    ) as call:
+        result = await handler(args)  # <- outside every guard, by construction
+        call.record_output(_tool_input(result))
     return result
-
-
-def _close_tool_call(
-    units: UnitRegistry, call: _ToolCall, status: StatusCode, error_type: str | None, output: bytes
-) -> None:
-    call.unit.draft.set_io(
-        input_data=call.input_data,
-        output_data=output,
-        input_attempted=True,
-        output_attempted=status is StatusCode.OK,
-    )
-    units.close(call.unit, status=status, error_type=error_type)
 
 
 def _read_tee(adapter: AnthropicAgentSdkAdapter, key: int, inner: Any):
@@ -427,6 +331,7 @@ class AnthropicAgentSdkAdapter(AdapterInterface):
         self._patches = PatchSet("adapters.anthropic_agent_sdk")
         self._installed = False
         self._assembler: SessionAssembler | None = None
+        self._ctx: AdapterContext | None = None
         self._debug = False
         # The shared tool-name space: the handler sees a bare name, the hook sees
         # the CLI's namespaced one, and `claim()` can only arbitrate if both land
@@ -442,10 +347,6 @@ class AnthropicAgentSdkAdapter(AdapterInterface):
     def _guard(self, where: str) -> guard:
         """The authorized swallow (I6). Always counts; logs under config.debug."""
         return guard(where, debug=self._debug)
-
-    def _unit_registry(self) -> UnitRegistry | None:
-        assembler = self._assembler
-        return assembler.units if assembler is not None else None
 
     # --- observation callbacks (delegate to the SessionAssembler) ---
 
@@ -478,11 +379,11 @@ class AnthropicAgentSdkAdapter(AdapterInterface):
     # --- install / uninstall ---
 
     def install(self, client: Client | None, ctx: object | None = None) -> None:
-        # `ctx` is used for ONE thing so far: its unit registry, handed to the
-        # assembler below so the two share one table. Nothing here opens through
-        # `ctx.enter`/`open_run` yet, so this file still decides its own
-        # parentage; moving the open sites onto that surface is what retires the
-        # tier ladders in `_open_tool_call` and `_session_for_hook`.
+        # `ctx` is used for two things now. Its unit registry goes to the
+        # assembler below so the two share one table, and the context itself is
+        # held for `_run_tool`, which opens the in-process tool span through
+        # `ctx.enter` — the first site in this adapter that does not decide its
+        # own parentage. `_session_for_hook` is the remaining ladder.
         if self._installed:
             return
         try:
@@ -605,6 +506,22 @@ class AnthropicAgentSdkAdapter(AdapterInterface):
             max_units=resolved["max_units"],
             max_entries_per_unit=resolved["max_entries_per_unit"],
         )
+        # Held for `_run_tool`. Narrowed here rather than trusted, because a
+        # wrapper that survives an uninstall reads it and must get None rather
+        # than a context whose registry is gone.
+        self._ctx = ctx if isinstance(ctx, AdapterContext) else None
+        if self._ctx is None:
+            # A caller that built this adapter by hand instead of going through
+            # `AdapterRegistry`. Everything driven by the transport still works;
+            # what silently does not is the in-process tool span, because it is
+            # the one thing that opens through the surface. Said out loud, since
+            # "my tool calls are missing" is otherwise unfalsifiable from here.
+            report_once(
+                "[wardex] anthropic_agent_sdk adapter: installed without an adapter "
+                "context, so in-process MCP tool calls will not get their own spans; "
+                "install through wardex.init() or pass adapters._registry.context_for(...)",
+                key="adapters.anthropic_agent_sdk.no_context",
+            )
         self._installed = True
 
     def close_units(self, *, marker: Limitation) -> None:
@@ -636,6 +553,11 @@ class AnthropicAgentSdkAdapter(AdapterInterface):
         # registry nothing will ever close again.
         assembler = self._assembler
         self._assembler = None
+        # Dropped in the same latch: a tool wrapper the host still holds a
+        # reference to reads `_ctx` to decide whether wardex is here, and a
+        # context left standing would open a unit in a registry this teardown is
+        # about to sweep — a span that is live in a table nothing will close.
+        self._ctx = None
         self._installed = False
         if assembler is not None:
             assembler.close_all_sessions(marker=Limitation.ADAPTER_UNINSTALLED)

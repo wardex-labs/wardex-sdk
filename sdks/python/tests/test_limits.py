@@ -933,7 +933,7 @@ def test_a_configured_bound_reaches_the_registry_the_adapter_actually_uses():
     stopped listening.
     """
     from wardex_sdk._config import WardexConfig
-    from wardex_sdk.adapters._registry import AdapterRegistry
+    from wardex_sdk.adapters._registry import context_for
 
     class _Client:
         config = WardexConfig(
@@ -943,7 +943,7 @@ def test_a_configured_bound_reaches_the_registry_the_adapter_actually_uses():
         def capture_span(self, span) -> None:
             pass
 
-    ctx = AdapterRegistry._context_for("probe", _Client())
+    ctx = context_for("probe", _Client())
 
     assert ctx._units._max_units == 7
     assert ctx._units._max_entries_per_unit == 3

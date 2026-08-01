@@ -91,6 +91,31 @@ class Placement(Enum):
     NESTED = "nested"  # always inside something this adapter already entered
 
 
+class Fallback(Enum):
+    """What a NESTED site may fall back to when the live scope did not reach it.
+
+    CLOSED, never inferred, and never a default — for the same reason
+    `Placement` is not: a heuristic that turns itself on is one nobody can find
+    later. Declaring it at the site is the adapter saying "this call is reached
+    through a carrier the framework may not have propagated to, and one live run
+    is a defensible guess there".
+
+    It is NOT a way to name a parent. The candidate comes from the registry's
+    own table, filtered to units this adapter owns, and only when there is
+    EXACTLY one — so no identifier, argument or adapter state can influence
+    which unit is picked. The edge it produces is `unit_sole` at 0.5 carrying
+    `UNIT_INFERRED_SOLE`, which is the vocabulary's word for "interpreted, not
+    read".
+
+    Reachable only where the site would otherwise become a trace root, which is
+    structural rather than a rule: a live scope or a host span always wins, so
+    the fallback can never displace something wardex actually read.
+    """
+
+    NONE = "none"  # orphan instead of guessing; the honest default
+    SOLE_LIVE_RUN = "sole_live_run"  # exactly one live SESSION this adapter owns
+
+
 class Observer(Enum):
     """Which observer of one event this is, when a framework offers two.
 
@@ -194,6 +219,26 @@ class Scope:
         if self._unit is None:
             return False
         return self._unit.claim(selector, rank=observer.value)
+
+    def claim_run(self, selector: UnitKey, *, observer: Observer) -> bool:
+        """`claim()`, but on the RUN this scope sits under rather than on it.
+
+        Two observers of one event have to claim on the SAME unit or `claim()`
+        arbitrates nothing — and they rarely stand in the same place. A
+        framework's own callback sees the whole run and holds the SESSION; an
+        in-process handler's scope is the CALL it is executing, which for a
+        nested tool is not even a direct child of the run. Claiming here would
+        put the two claims in two tables and let both observers emit.
+
+        No unit is exposed and none is installed: the walk happens inside the
+        registry and only its ANSWER — did this claim take — comes back.
+        """
+        if self._unit is None:
+            return False
+        run = self._unit.enclosing(UnitKind.SESSION)
+        if run is None:
+            return False
+        return run.claim(selector, rank=observer.value)
 
     def outranked(self, selector: UnitKey, *, observer: Observer) -> bool:
         """Has a HIGHER-ranked observer taken this selector since we claimed it?
@@ -361,6 +406,12 @@ _ORPHAN = Evidence(ParentSource.UNRESOLVED)
 #: make the edge look more certain than the id it was told to honour.
 _LOOKUP_BROKEN = Evidence(ParentSource.UNIT_ACTIVE, confidence=0.5)
 
+#: What `Fallback.SOLE_LIVE_RUN` claims. `resolve_parentage`'s marker table
+#: attaches `UNIT_INFERRED_SOLE` on its own, so there is no site here that could
+#: forget it — the source's DEFINITION is interpretation, and I4 makes that the
+#: table's job rather than the caller's.
+_SOLE = Evidence(ParentSource.UNIT_SOLE)
+
 
 class AdapterContext:
     """The SDK, as an adapter sees it.
@@ -481,6 +532,7 @@ class AdapterContext:
         start_ns: int | None,
         parent: Unit | None = None,
         evidence: Evidence | None = None,
+        fallback: Fallback = Fallback.NONE,
     ) -> Unit:
         holder = parent if parent is not None else self._units.current()
         # Latched ONCE and used for both the declaration and the open. Two reads
@@ -488,11 +540,32 @@ class AdapterContext:
         # point of the declaration is that it describes the ambient `open()`
         # actually receives.
         ambient = latch_ambient()
-        return self._units.open(
+        if evidence is None:
+            evidence = self._evidence(placement, ambient)
+        conflicted = False
+        if holder is None and evidence is _ORPHAN and fallback is Fallback.SOLE_LIVE_RUN:
+            # `evidence is _ORPHAN` is the whole gate, and it is structural: only
+            # a NESTED site with nothing live above it and no host span reaches
+            # this line, so the fallback can never displace something wardex
+            # actually read. `owner` keeps the question about THIS adapter's
+            # runs — "exactly one session is live" is otherwise a question about
+            # the process, and answering it across a framework boundary is the
+            # guess `sole_live` refuses to make.
+            sole = self._units.sole_live(UnitKind.SESSION, owner=self.name)
+            if sole is not None:
+                # Asked BEFORE the fallback takes a parent, because taking one
+                # is what stops `open()` from seeing the poisoned ambient for
+                # itself. Without this the two reasons a guess happened are
+                # byte-identical on the wire — "nothing was pinned" and "what
+                # was pinned had died" — and the second is a tool call sitting
+                # in a run it has nothing to do with.
+                conflicted = self._units.stale_pin_in_scope()
+                holder, evidence = sole, _SOLE
+        unit = self._units.open(
             kind,
             selector if selector is not None else UnitKey(f"adapters.{self.name}", ""),
             ambient=ambient,
-            evidence=evidence if evidence is not None else self._evidence(placement, ambient),
+            evidence=evidence,
             intent=intent,
             subject=subject,
             parent_unit=holder,
@@ -500,6 +573,9 @@ class AdapterContext:
             start_ns=start_ns,
             owner=self.name,
         )
+        if conflicted:
+            unit.note(Limitation.CORRELATION_CONFLICT)
+        return unit
 
     # -- containment -----------------------------------------------------
 
@@ -648,6 +724,7 @@ class AdapterContext:
         selector: UnitKey | None = None,
         aliases: Sequence[UnitKey] = (),
         start_ns: int | None = None,
+        fallback: Fallback = Fallback.NONE,
         describe: Callable[[Scope], None] | None = None,
     ) -> Iterator[Scope]:
         """Open a unit, make it the ambient parent, and close it on the way out.
@@ -683,6 +760,7 @@ class AdapterContext:
                 selector=selector,
                 aliases=aliases,
                 start_ns=start_ns,
+                fallback=fallback,
             )
             scope = Scope(unit, self)
             if describe is not None:
@@ -705,6 +783,7 @@ class AdapterContext:
         subject: str | None = None,
         selector: UnitKey | None = None,
         start_ns: int | None = None,
+        fallback: Fallback = Fallback.NONE,
         describe: Callable[[RunHandle], None] | None = None,
     ) -> RunHandle:
         """A unit that outlives this call. NOT installed; see `RunHandle.pin`.
@@ -724,6 +803,7 @@ class AdapterContext:
                 selector=selector,
                 aliases=(),
                 start_ns=start_ns,
+                fallback=fallback,
             )
             handle = RunHandle(unit, self)
             if describe is not None:
@@ -859,6 +939,7 @@ class AdapterContext:
 __all__ = [
     "AdapterContext",
     "Attachment",
+    "Fallback",
     "InstallOutcome",
     "Observer",
     "Placement",

@@ -6,6 +6,28 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Changed
+- **The Agent SDK adapter's in-process tool wrapper no longer decides its own
+  parentage.** It walked a three-tier ladder by hand — the live scope, then the
+  one live session, then nothing — and stamped the confidence and the markers at
+  the end of it, which is the shape every future adapter would have copied. It
+  opens through `AdapterContext.enter()` now, so the edge is decided in the one
+  place that decides edges, and the tier markers come from the table that owns
+  them: `adapters/` holds no site that can name `PARENT_UNRESOLVED` or
+  `UNIT_INFERRED_SOLE` on an edge it chose itself. The tree it produces is
+  unchanged, asserted row by row.
+- **A site may now DECLARE the one guess it is allowed to make**, with
+  `fallback=Fallback.SOLE_LIVE_RUN`. An in-process tool handler is reached
+  through a carrier the framework may not have propagated to, and orphaning
+  there turns one run into several traces — the failure `Placement` exists to
+  prevent, facing the other way. Declared rather than computed, for the same
+  reason placement is: a heuristic that turns itself on is one nobody can find
+  later. It is reachable only where the site would otherwise become a trace
+  root, so a live scope or a host span always wins; the candidate comes from the
+  registry filtered to that adapter's own runs, and only when there is exactly
+  one; and the edge it produces says `unit_sole` at 0.5 with
+  `UNIT_INFERRED_SOLE`. A guess made while a dead pin was standing also carries
+  `correlation_conflict`, because "nothing was pinned" and "what was pinned had
+  died" are not the same fact.
 - **`AdapterContext.enter()`, `open_run()` and `rejoin()` take a `describe=`
   callable, and that is where an adapter's own code belongs.** It runs inside
   the same failure boundary as the open, before the host's block, so opening a

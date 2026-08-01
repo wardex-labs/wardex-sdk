@@ -99,21 +99,21 @@ _MEMBER_SITES: dict[str, frozenset[str]] = {
     # the only place that CHOOSES a heuristic source in the first place. Two
     # sites for one fact is not duplication here: one is the mechanism, the
     # other is the decision.
-    # The adapter is the third site for both, and it is where they stop being
-    # theory: an in-process tool handler that the pin did not reach falls back to
-    # the sole live session (0.5 + `UNIT_INFERRED_SOLE`), and one called with no
-    # session and no ambient span at all starts a trace and says the parent it
-    # expected was not found.
+    # The Anthropic adapter was a third site for both and is NOT any more, and
+    # the removal is the point rather than tidying. It used to walk its own
+    # three-tier ladder — live scope, then sole live session, then nothing — and
+    # stamp these by hand at the end of it. Its tool wrapper now opens through
+    # `AdapterContext`, which declares the fallback and lets the table above
+    # attach the marker, so there is no site left in an adapter that could
+    # stamp one of these onto an edge it decided itself.
     "PARENT_UNRESOLVED": frozenset(
         {
-            "adapters/_anthropic_agent_sdk.py",
             "assembly/_parentage.py",
             "assembly/_units.py",
         }
     ),
     "UNIT_INFERRED_SOLE": frozenset(
         {
-            "adapters/_anthropic_agent_sdk.py",
             "assembly/_parentage.py",
             "assembly/_units.py",
         }
@@ -130,15 +130,18 @@ _MEMBER_SITES: dict[str, frozenset[str]] = {
     # one calling it, and `open()`/`resolve()` record the scope a CLOSED pin
     # left standing. All were declared vocabulary with no emitter until the unit
     # registry landed.
-    # The adapter is the fourth site and the one that reaches a span the
-    # registry cannot mark: when a stale pin sends `_open_tool_call` past
-    # `current()`, the tier that answers instead is deciding this edge in the
-    # shadow of a finished session, and the tool span says so — the pinned
-    # unit's own span was materialized and shipped inside the `close()` that
-    # made the pin stale, so it is not an editable place to record it.
+    # The adapter surface is the fourth site and the one that reaches a span the
+    # registry cannot mark for itself: a site declaring `Fallback.SOLE_LIVE_RUN`
+    # takes a parent_unit, which is exactly what stops `open()` from seeing the
+    # poisoned ambient — so the "we guessed because what was pinned had died"
+    # case would otherwise be byte-identical to "we guessed because nothing was
+    # pinned". It moved here out of the Anthropic adapter, which used to stamp it
+    # at the end of its own tier ladder. The pinned unit's own span was
+    # materialized and shipped inside the `close()` that made the pin stale, so
+    # it is not an editable place to record any of this.
     "CORRELATION_CONFLICT": frozenset(
         {
-            "adapters/_anthropic_agent_sdk.py",
+            "adapters/_context.py",
             "assembly/_units.py",
             # A second `system/init` naming a different run on a transport key
             # this table still holds live: two agent runs sharing one root.

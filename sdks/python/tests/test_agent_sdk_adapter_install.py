@@ -15,6 +15,7 @@ from wardex_sdk.adapters._anthropic_agent_sdk import (
     AnthropicAgentSdkAdapter,
     _prepare_options,
 )
+from wardex_sdk.adapters._registry import context_for
 from wardex_sdk.assembly import Limitation
 
 RESULT_LINE = {
@@ -140,7 +141,7 @@ def test_query_passthrough_with_fake_transport():
 
     client = RecordingClient()
     adapter = AnthropicAgentSdkAdapter()
-    adapter.install(client)
+    adapter.install(client, context_for(adapter.name(), client))
     try:
         received = []
 
@@ -181,7 +182,7 @@ def test_uninstall_emits_the_span_of_a_run_that_never_finished():
 
     client = RecordingClient()
     adapter = AnthropicAgentSdkAdapter()
-    adapter.install(client)
+    adapter.install(client, context_for(adapter.name(), client))
     try:
         adapter._assembler.on_outbound(
             1,
@@ -227,7 +228,7 @@ def test_a_read_still_in_flight_cannot_reopen_a_session_during_uninstall():
 
     client = RecordingClient()
     adapter = AnthropicAgentSdkAdapter()
-    adapter.install(client)
+    adapter.install(client, context_for(adapter.name(), client))
     assembler = adapter._assembler
     try:
         adapter._assembler.on_outbound(

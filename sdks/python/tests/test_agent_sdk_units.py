@@ -165,7 +165,16 @@ from test_agent_sdk_adapter_install import INIT_LINE, RESULT_LINE, FakeTransport
 from wardex_sdk import _hub
 from wardex_sdk._enums import StatusCode, ToolExecutionType
 from wardex_sdk.adapters._anthropic_agent_sdk import AnthropicAgentSdkAdapter
-from wardex_sdk.assembly import Limitation, ParentSource, UnitKind, counters
+from wardex_sdk.adapters._anthropic_names import ServerHandle
+from wardex_sdk.adapters._context import AdapterContext
+from wardex_sdk.adapters._registry import context_for
+from wardex_sdk.assembly import (
+    Limitation,
+    ParentSource,
+    UnitKind,
+    UnitRegistry,
+    counters,
+)
 
 
 class RecordingClient:
@@ -429,7 +438,7 @@ def test_a_tool_is_parented_by_the_task_that_dispatched_it_not_the_id_in_the_str
     """
     client = RecordingClient()
     adapter = AnthropicAgentSdkAdapter()
-    adapter.install(client)
+    adapter.install(client, context_for(adapter.name(), client))
     try:
         order = _two_live_sessions(sid_a="s-A", sid_b="s-B")
     finally:
@@ -472,7 +481,7 @@ def test_an_in_process_tool_span_is_a_child_of_the_session_at_full_confidence():
     """
     client = RecordingClient()
     adapter = AnthropicAgentSdkAdapter()
-    adapter.install(client)
+    adapter.install(client, context_for(adapter.name(), client))
     try:
         transport = _ReaderDispatchTransport(adapter, _tool())
         _run(adapter, transport)
@@ -531,7 +540,7 @@ def test_a_nested_in_process_tool_is_a_child_of_the_enclosing_call_not_the_sessi
     """
     client = RecordingClient()
     adapter = AnthropicAgentSdkAdapter()
-    adapter.install(client)
+    adapter.install(client, context_for(adapter.name(), client))
 
     outer_in_a, outer_in_b = anyio.Event(), anyio.Event()
     inner_in_a, inner_in_b = anyio.Event(), anyio.Event()
@@ -628,7 +637,7 @@ def test_the_tree_is_identical_when_every_framework_id_is_replaced():
     def shape(session_id, tool_use_id, server_key):
         client = RecordingClient()
         adapter = AnthropicAgentSdkAdapter()
-        adapter.install(client)
+        adapter.install(client, context_for(adapter.name(), client))
         try:
             transport = _ReaderDispatchTransport(
                 adapter, _tool(), session_id=session_id, tool_use_id=tool_use_id
@@ -669,7 +678,7 @@ def test_two_sessions_the_cli_gave_one_id_do_not_share_a_subtree():
     client = RecordingClient()
     _hub.set_client(client)
     adapter = AnthropicAgentSdkAdapter()
-    adapter.install(client)
+    adapter.install(client, context_for(adapter.name(), client))
     try:
         order = _two_live_sessions(sid_a="dup", sid_b="dup", host_labels=("host_A", "host_B"))
     finally:
@@ -707,7 +716,7 @@ def test_the_tool_span_hangs_under_the_hosts_own_span():
     client = RecordingClient()
     _hub.set_client(client)
     adapter = AnthropicAgentSdkAdapter()
-    adapter.install(client)
+    adapter.install(client, context_for(adapter.name(), client))
     try:
         transport = _ReaderDispatchTransport(adapter, _tool())
         with wardex_sdk.trace("caller") as outer:
@@ -735,7 +744,7 @@ def test_the_handler_body_runs_inside_the_tool_span_not_merely_beside_it():
     client = RecordingClient()
     _hub.set_client(client)
     adapter = AnthropicAgentSdkAdapter()
-    adapter.install(client)
+    adapter.install(client, context_for(adapter.name(), client))
 
     async def handler(args):
         with wardex_sdk.span("inner"):
@@ -796,7 +805,7 @@ def test_work_the_handler_offloads_to_a_thread_stays_inside_the_tool_span():
     client = RecordingClient()
     _hub.set_client(client)
     adapter = AnthropicAgentSdkAdapter()
-    adapter.install(client)
+    adapter.install(client, context_for(adapter.name(), client))
 
     nested = _tool("in_thread_tool")
     idents: dict[str, int] = {}
@@ -880,7 +889,7 @@ def test_a_callback_replayed_under_a_captured_context_lands_inside_the_call_that
     client = RecordingClient()
     _hub.set_client(client)
     adapter = AnthropicAgentSdkAdapter()
-    adapter.install(client)
+    adapter.install(client, context_for(adapter.name(), client))
 
     nested = _tool("replayed_tool")
     captured: list[contextvars.Context] = []
@@ -967,7 +976,7 @@ def test_work_issued_inside_a_call_keeps_that_call_after_the_task_moves_on():
     client = RecordingClient()
     _hub.set_client(client)
     adapter = AnthropicAgentSdkAdapter()
-    adapter.install(client)
+    adapter.install(client, context_for(adapter.name(), client))
 
     issued_tool = _tool("issued_tool")
     inner_open, answered = anyio.Event(), anyio.Event()
@@ -1067,7 +1076,7 @@ def test_a_reused_anyio_worker_thread_serves_each_call_its_own_context():
     client = RecordingClient()
     _hub.set_client(client)
     adapter = AnthropicAgentSdkAdapter()
-    adapter.install(client)
+    adapter.install(client, context_for(adapter.name(), client))
 
     idents: dict[str, int] = {}
     nested_1, nested_2 = _tool("in_worker_1"), _tool("in_worker_2")
@@ -1166,7 +1175,7 @@ def test_a_future_done_callback_lands_inside_the_call_that_registered_it():
     client = RecordingClient()
     _hub.set_client(client)
     adapter = AnthropicAgentSdkAdapter()
-    adapter.install(client)
+    adapter.install(client, context_for(adapter.name(), client))
 
     nested = _tool("callback_tool")
     registered, replayed, release = anyio.Event(), anyio.Event(), anyio.Event()
@@ -1274,7 +1283,7 @@ def test_the_pin_reads_the_returned_object_and_not_the_function():
 
     client = RecordingClient()
     adapter = AnthropicAgentSdkAdapter()
-    adapter.install(client)
+    adapter.install(client, context_for(adapter.name(), client))
     try:
         transport = _ReaderDispatchTransport(adapter, _tool())
         # This very transport has the shape the trap gets wrong: its
@@ -1302,7 +1311,7 @@ def test_the_dispatch_task_sees_the_session_unit_itself():
     """
     client = RecordingClient()
     adapter = AnthropicAgentSdkAdapter()
-    adapter.install(client)
+    adapter.install(client, context_for(adapter.name(), client))
     try:
         transport = _ReaderDispatchTransport(adapter, _tool())
         units = adapter._assembler.units
@@ -1351,7 +1360,7 @@ def test_the_reader_task_carries_the_sessions_span_and_not_only_its_unit():
     client = RecordingClient()
     _hub.set_client(client)
     adapter = AnthropicAgentSdkAdapter()
-    adapter.install(client)
+    adapter.install(client, context_for(adapter.name(), client))
     outside = []
     try:
         transport = _ReaderDispatchTransport(adapter, _tool())
@@ -1406,7 +1415,7 @@ def test_the_pin_does_not_leak_to_a_task_outside_the_reader():
     """
     client = RecordingClient()
     adapter = AnthropicAgentSdkAdapter()
-    adapter.install(client)
+    adapter.install(client, context_for(adapter.name(), client))
     seen = []
     try:
         transport = _ReaderDispatchTransport(adapter, _tool())
@@ -1457,7 +1466,7 @@ def test_a_task_the_reader_spawned_before_the_pin_never_joins_the_run():
     """
     client = RecordingClient()
     adapter = AnthropicAgentSdkAdapter()
-    adapter.install(client)
+    adapter.install(client, context_for(adapter.name(), client))
     units = adapter._assembler.units
 
     early_tool = _tool("early_tool")
@@ -1546,7 +1555,7 @@ def test_a_closed_session_stops_being_ambient_on_the_reader_task():
     counters.reset()
     client = RecordingClient()
     adapter = AnthropicAgentSdkAdapter()
-    adapter.install(client)
+    adapter.install(client, context_for(adapter.name(), client))
     try:
         units = adapter._assembler.units
         first = _ReaderDispatchTransport(adapter, _tool())
@@ -1623,7 +1632,7 @@ def test_the_hook_and_the_handler_do_not_both_open_a_span():
     """
     client = RecordingClient()
     adapter = AnthropicAgentSdkAdapter()
-    adapter.install(client)
+    adapter.install(client, context_for(adapter.name(), client))
     try:
         transport = _ReaderDispatchTransport(adapter, _tool(), hook_name="mcp__tools__greet")
         _run(adapter, transport)
@@ -1645,7 +1654,7 @@ def test_a_builtin_tool_still_gets_its_hook_driven_span():
     """
     client = RecordingClient()
     adapter = AnthropicAgentSdkAdapter()
-    adapter.install(client)
+    adapter.install(client, context_for(adapter.name(), client))
     try:
         transport = _ReaderDispatchTransport(adapter, _tool(), hook_name="Bash")
         _run(adapter, transport)
@@ -1669,7 +1678,7 @@ def test_two_concurrent_calls_to_one_tool_both_produce_a_span():
     """
     client = RecordingClient()
     adapter = AnthropicAgentSdkAdapter()
-    adapter.install(client)
+    adapter.install(client, context_for(adapter.name(), client))
 
     first_in, second_in = anyio.Event(), anyio.Event()
     order = []
@@ -1722,7 +1731,7 @@ def test_a_handler_with_no_unit_available_returns_the_hosts_result_untouched():
     """
     client = RecordingClient()
     adapter = AnthropicAgentSdkAdapter()
-    adapter.install(client)
+    adapter.install(client, context_for(adapter.name(), client))
     tool = _tool()
     claude_agent_sdk.create_sdk_mcp_server("srv", tools=[tool])
     wrapped = tool.handler  # the host's long-held reference
@@ -1754,7 +1763,7 @@ def test_a_handler_exception_propagates_and_still_closes_the_span():
     """
     client = RecordingClient()
     adapter = AnthropicAgentSdkAdapter()
-    adapter.install(client)
+    adapter.install(client, context_for(adapter.name(), client))
 
     async def handler(args):
         raise ValueError("tool blew up")
@@ -1780,7 +1789,7 @@ def test_a_handler_called_with_no_session_at_all_says_the_parent_is_missing():
     """
     client = RecordingClient()
     adapter = AnthropicAgentSdkAdapter()
-    adapter.install(client)
+    adapter.install(client, context_for(adapter.name(), client))
     try:
         tool = _tool()
         claude_agent_sdk.create_sdk_mcp_server("srv", tools=[tool])
@@ -1803,7 +1812,7 @@ def test_an_unresolved_server_token_marks_the_span_it_cannot_key():
     """
     client = RecordingClient()
     adapter = AnthropicAgentSdkAdapter()
-    adapter.install(client)
+    adapter.install(client, context_for(adapter.name(), client))
     try:
         tool = _tool()
         claude_agent_sdk.create_sdk_mcp_server("srv", tools=[tool])
@@ -1832,7 +1841,7 @@ def test_two_servers_exporting_one_bare_name_mark_the_span_the_hook_abandons(mon
     monkeypatch.setenv("CLAUDE_AGENT_SDK_MCP_NO_PREFIX", "1")
     client = RecordingClient()
     adapter = AnthropicAgentSdkAdapter()
-    adapter.install(client)
+    adapter.install(client, context_for(adapter.name(), client))
     try:
         alpha_search, beta_search = _tool(name="search"), _tool(name="search")
         alpha = claude_agent_sdk.create_sdk_mcp_server("alpha", tools=[alpha_search])
@@ -1855,3 +1864,132 @@ def test_two_servers_exporting_one_bare_name_mark_the_span_the_hook_abandons(mon
 
     span = _named(client.spans, "execute_tool search")
     assert Limitation.TOOL_NAME_COLLISION in span.capture_integrity.limitations
+
+
+def test_the_owner_this_assembler_stamps_is_the_adapters_own_name():
+    """Two spellings of one identity, and the whole of `owner` scoping rests on
+    them agreeing.
+
+    The assembler stamps `owner` on every session it opens; the tool wrapper
+    asks `sole_live(..., owner=ctx.name)` for one. `ctx.name` is
+    `adapter.name()`. If the two ever drift, the fallback finds nothing — and
+    the failure is not an error, it is every in-process tool call quietly
+    becoming its own trace root while the pin is what covers for it.
+    """
+    from wardex_sdk.adapters._assembler import _OWNER
+
+    assert _OWNER == AnthropicAgentSdkAdapter().name()
+
+    client = RecordingClient()
+    adapter = AnthropicAgentSdkAdapter()
+    adapter.install(client, context_for(adapter.name(), client))
+    try:
+        assert adapter._ctx is not None
+        assert adapter._ctx.name == _OWNER
+        # And one table, not two: the assembler's registry IS the context's, so
+        # `owner` is a filter over units the tool wrapper can actually see.
+        assert adapter._assembler.units is adapter._ctx._units
+    finally:
+        adapter.uninstall()
+
+
+def test_a_tool_wrapper_that_outlives_its_adapter_still_runs_the_hosts_tool():
+    """`uninstall()` drops the context in the same latch as the assembler, and a
+    wrapper the host still holds a reference to must read that. A context left
+    standing would open a unit in a registry the teardown has already swept —
+    a span live in a table nothing will ever close.
+    """
+    client = RecordingClient()
+    adapter = AnthropicAgentSdkAdapter()
+    adapter.install(client, context_for(adapter.name(), client))
+    handle = ServerHandle(name="srv")
+
+    async def handler(args):
+        return {"echoed": args}
+
+    from wardex_sdk.adapters._anthropic_agent_sdk import _run_tool
+
+    adapter.uninstall()
+    assert adapter._ctx is None
+
+    result = asyncio.run(_run_tool(adapter, handle, "greet", handler, {"a": 1}))
+    assert result == {"echoed": {"a": 1}}
+    assert [s for s in client.spans if s.name.startswith("execute_tool")] == []
+
+
+def test_a_framework_read_that_breaks_costs_the_tool_span_and_never_the_tool_call(monkeypatch):
+    """The whole argument for `describe=`, on the real adapter.
+
+    `_names.ambiguous_bare` is a framework read — the kind that breaks when an
+    SDK moves an attribute between releases — and the marker it would have
+    earned is genuinely earned here. Described inside `enter()`'s own guard, the
+    fault costs the WHOLE span, loudly. Described in the `with` body under a
+    guard of its own, the same fault ships `status=OK` with full input, full
+    output, a real duration and the earned marker simply gone: a span nothing
+    downstream can tell from a complete observation.
+
+    Either way the host's tool runs exactly once and returns its own value.
+    """
+    client = RecordingClient()
+    adapter = AnthropicAgentSdkAdapter()
+    adapter.install(client, context_for(adapter.name(), client))
+
+    def blow(self, name):
+        raise AttributeError("the catalog moved")
+
+    monkeypatch.setattr(type(adapter._names), "ambiguous_bare", blow)
+
+    try:
+        tool = _tool()
+        claude_agent_sdk.create_sdk_mcp_server("srv", tools=[tool])
+        result = anyio.run(tool.handler, {"name": "world"})
+    finally:
+        adapter.uninstall()
+
+    assert result == {"content": [{"type": "text", "text": "hi world"}]}
+    tools = [s for s in client.spans if s.name.startswith("execute_tool")]
+    for span in tools:
+        assert span.status is not StatusCode.OK, (
+            "a span whose description died reads exactly like a complete one"
+        )
+
+
+def test_a_tool_that_raises_reaches_its_caller_even_while_wardex_is_degraded():
+    """The adapter-level restatement of the module-level guarantee, because this
+    is the shape a third-party adapter author copies.
+
+    A guard around the whole `with` would swallow the host's own exception,
+    turning a failing tool into a silently successful one for its caller AND on
+    the wire. There is nothing left in the block that needs protecting, so there
+    is no reason to reach for one.
+    """
+
+    class Broken(UnitRegistry):
+        __slots__ = ()
+
+        def open(self, *a, **k):
+            raise RuntimeError("wardex is broken at open")
+
+    for registry_is_broken in (False, True):
+        client = RecordingClient()
+        adapter = AnthropicAgentSdkAdapter()
+        ctx = context_for(adapter.name(), client)
+        if registry_is_broken:
+            ctx = AdapterContext(
+                adapter.name(), units=Broken(sink=ctx._units._sink), limits=ctx.limits
+            )
+        adapter.install(client, ctx)
+        mine = ValueError("the host's own failure")
+
+        async def handler(args, exc=mine):
+            raise exc
+
+        try:
+            tool_def = _tool(handler=handler)
+            claude_agent_sdk.create_sdk_mcp_server("srv", tools=[tool_def])
+            with pytest.raises(ValueError) as caught:
+                anyio.run(tool_def.handler, {"name": "world"})
+        finally:
+            adapter.uninstall()
+
+        assert caught.value is mine, f"broken={registry_is_broken}: not the same object"

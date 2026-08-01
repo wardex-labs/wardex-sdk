@@ -33,6 +33,7 @@ from wardex_sdk._types import AgentAttributes, ToolAttributes
 from wardex_sdk.adapters._context import (
     AdapterContext,
     Attachment,
+    Fallback,
     InstallOutcome,
     Observer,
     Placement,
@@ -726,6 +727,7 @@ _DEGRADED_VERB_ARGS = {
     "note": ((Limitation.PARENT_UNRESOLVED,), {}),
     "link": ((LinkReason.HANDOFF_FROM, UnitKey("k", "v")), {}),
     "claim": ((UnitKey("k", "v"),), {"observer": Observer.EXECUTOR}),
+    "claim_run": ((UnitKey("k", "v"),), {"observer": Observer.EXECUTOR}),
     "outranked": ((UnitKey("k", "v"),), {"observer": Observer.EXECUTOR}),
     "child_draft": ((SpanIntent.EXECUTE_TOOL,), {}),
     "close_child": ((NULL_DRAFT,), {}),
@@ -1145,3 +1147,215 @@ def test_a_lost_subtree_is_recorded_on_a_span_that_still_ships():
     assert Limitation.INSTRUMENTATION_DEGRADED in span.capture_integrity.limitations, (
         "the run's own span does not say a subtree was lost under it"
     )
+
+
+# ==========================================================================
+# The one guess a site may declare
+# ==========================================================================
+
+
+def _session(ctx, value="s1"):
+    """A live SESSION owned by this adapter — what `sole_live(owner=)` looks for."""
+    from wardex_sdk._types import AgentAttributes as _AA
+
+    unit = ctx._units.open(
+        UnitKind.SESSION,
+        UnitKey("test.session", value),
+        ambient=EMPTY_AMBIENT,
+        intent=SpanIntent.INVOKE_AGENT,
+        owner=ctx.name,
+    )
+    unit.draft.set_agent(_AA(name="a", agent_type=AgentType.PRIMARY))
+    return unit
+
+
+def test_an_undeclared_fallback_orphans_instead_of_guessing():
+    """The default, and it has to be the honest one. A site that says nothing
+    gets `unresolved`/0.0 even with a run standing right there — a heuristic
+    that turns itself on is one nobody can find later.
+    """
+    ctx, sink = context()
+    _session(ctx)
+
+    with ctx.enter(
+        UnitKind.CALL, intent=SpanIntent.EXECUTE_TOOL, placement=Placement.NESTED, describe=_tool
+    ):
+        pass
+
+    source, confidence, markers = _edge(sink)
+    assert (source, confidence) == (ParentSource.UNRESOLVED, 0.0)
+    assert Limitation.PARENT_UNRESOLVED in markers
+
+
+def test_a_declared_fallback_takes_the_one_live_run_and_says_it_guessed():
+    """Half the confidence and a marker naming the interpretation. The
+    alternative is a tool call that becomes its own trace root — one run
+    reported as several, which is the shape nothing downstream can detect.
+    """
+    ctx, sink = context()
+    run = _session(ctx)
+
+    with ctx.enter(
+        UnitKind.CALL,
+        intent=SpanIntent.EXECUTE_TOOL,
+        placement=Placement.NESTED,
+        fallback=Fallback.SOLE_LIVE_RUN,
+        describe=_tool,
+    ):
+        pass
+
+    span = _emitted(sink)[-1]
+    assert span.parent_span_id == run.draft.context.span_id
+    assert (span.correlation.strategy, span.correlation.confidence) == (
+        ParentSource.UNIT_SOLE,
+        0.5,
+    )
+    assert Limitation.UNIT_INFERRED_SOLE in span.capture_integrity.limitations
+
+
+def test_a_second_live_run_makes_the_fallback_decline_rather_than_pick_one():
+    """`sole_live` means SOLE. Two runs and it answers nothing, because picking
+    one would be a coin flip presented on the wire as a 0.5 edge — and 0.5 says
+    "interpreted", not "one of two".
+    """
+    ctx, sink = context()
+    _session(ctx, "s1")
+    _session(ctx, "s2")
+
+    with ctx.enter(
+        UnitKind.CALL,
+        intent=SpanIntent.EXECUTE_TOOL,
+        placement=Placement.NESTED,
+        fallback=Fallback.SOLE_LIVE_RUN,
+        describe=_tool,
+    ):
+        pass
+
+    assert _edge(sink)[:2] == (ParentSource.UNRESOLVED, 0.0)
+
+
+def test_a_run_another_adapter_owns_is_not_a_candidate():
+    """ "Exactly one session is live" is a question about the PROCESS unless it
+    is scoped. Unscoped, an Anthropic tool call with only a LangGraph run beside
+    it would be handed that run and stamped 0.5 — a guess across a boundary
+    nobody stated.
+    """
+    ctx, sink = context()
+    other = ctx._units.open(
+        UnitKind.SESSION,
+        UnitKey("test.session", "theirs"),
+        ambient=EMPTY_AMBIENT,
+        intent=SpanIntent.INVOKE_AGENT,
+        owner="some_other_adapter",
+    )
+    assert other.owner == "some_other_adapter"
+
+    with ctx.enter(
+        UnitKind.CALL,
+        intent=SpanIntent.EXECUTE_TOOL,
+        placement=Placement.NESTED,
+        fallback=Fallback.SOLE_LIVE_RUN,
+        describe=_tool,
+    ):
+        pass
+
+    assert _edge(sink)[:2] == (ParentSource.UNRESOLVED, 0.0)
+
+
+@pytest.mark.parametrize("above", ["a live scope", "a host span"])
+def test_a_fallback_never_displaces_something_wardex_actually_read(above):
+    """Structural, not a rule: the fallback is reachable only where the site
+    would otherwise orphan, so a real read always wins and the declaration
+    cannot quietly downgrade an edge from 1.0 to 0.5.
+    """
+    ctx, sink = context()
+    _session(ctx, "the sole live one")
+
+    def nested():
+        with ctx.enter(
+            UnitKind.CALL,
+            intent=SpanIntent.EXECUTE_TOOL,
+            placement=Placement.NESTED,
+            fallback=Fallback.SOLE_LIVE_RUN,
+            describe=_tool,
+        ):
+            pass
+
+    if above == "a live scope":
+        with ctx.enter(
+            UnitKind.STEP,
+            intent=SpanIntent.EXECUTE_STEP,
+            placement=Placement.NESTED,
+            describe=_step,
+        ):
+            nested()
+        expected = ParentSource.UNIT_ACTIVE
+    else:
+        with activate_span(_a_context()):
+            nested()
+        expected = ParentSource.CONTEXTVAR
+
+    tool = next(d.finish() for d in sink.drafts if d.name.startswith("execute_tool"))
+    assert (tool.correlation.strategy, tool.correlation.confidence) == (expected, 1.0)
+    assert Limitation.UNIT_INFERRED_SOLE not in _edge_of(tool)[2]
+
+
+def test_a_guess_a_dead_pin_caused_says_which_kind_of_guess_it_was():
+    """The two reasons a fallback fires are not the same fact.
+
+    "Nothing was pinned" and "what was pinned had died" produce byte-identical
+    spans otherwise — and the second is a call filed inside a run it has nothing
+    to do with. `open()` marks the poisoned ambient itself, but taking a parent
+    is exactly what stops it from seeing one, so the fallback carries it.
+    """
+    ctx, sink = context()
+    dead = _session(ctx, "the one that died")
+    ctx._units.pin_driver(dead, owner_task=threading.current_thread())
+    ctx._units.close(dead)
+    _session(ctx, "an unrelated run")
+
+    with ctx.enter(
+        UnitKind.CALL,
+        intent=SpanIntent.EXECUTE_TOOL,
+        placement=Placement.NESTED,
+        fallback=Fallback.SOLE_LIVE_RUN,
+        describe=_tool,
+    ):
+        pass
+
+    source, confidence, markers = _edge(sink)
+    assert (source, confidence) == (ParentSource.UNIT_SOLE, 0.5)
+    assert Limitation.CORRELATION_CONFLICT in markers, (
+        "a guess caused by a dead pin reads the same as a guess caused by nothing"
+    )
+
+
+def test_a_claim_is_taken_on_the_run_and_not_on_the_scope_that_took_it():
+    """Two observers of one event have to claim on the SAME unit or `claim()`
+    arbitrates nothing — and they never stand in the same place. A framework's
+    own callback sees the whole run; an in-process handler's scope is the CALL
+    it is executing, which for a nested tool is not even a direct child.
+    """
+    ctx, sink = context()
+    run = _session(ctx)
+    selector = UnitKey("tool.call", "greet")
+
+    with ctx.enter(
+        UnitKind.CALL,
+        intent=SpanIntent.EXECUTE_TOOL,
+        placement=Placement.NESTED,
+        fallback=Fallback.SOLE_LIVE_RUN,
+    ) as outer:
+        with ctx.enter(
+            UnitKind.CALL, intent=SpanIntent.EXECUTE_TOOL, placement=Placement.NESTED
+        ) as inner:
+            # From a call nested TWO levels under the run, and it still lands
+            # on the run — a plain `claim()` would land on `inner`.
+            assert inner.claim_run(selector, observer=Observer.EXECUTOR) is True
+            assert inner.claim(selector, observer=Observer.EXECUTOR) is True
+            _tool(inner)
+        _tool(outer)
+
+    # The lower-ranked observer, arriving at the run where the hook stands.
+    assert run.claim(selector, rank=Observer.CALLBACK.value) is False
+    assert run.owner_rank(selector) == Observer.EXECUTOR.value

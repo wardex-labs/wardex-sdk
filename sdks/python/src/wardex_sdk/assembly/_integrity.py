@@ -121,11 +121,11 @@ class Limitation(Enum):
     PARENT_UNRESOLVED = "parent_unresolved"
     """A parent was expected and no scope, unit or header supplied one.
 
-    Three emit sites, and the first is the mechanism the other two restate.
+Two emit sites, and the first is the mechanism the second restates.
     ``assembly/_parentage.py``'s ``_MARKER`` table attaches it to every edge
     ``resolve_parentage`` builds for ``ParentSource.UNRESOLVED``, so no caller
     can name that source and omit the marker — I4 as a mechanism rather than as
-    caller discipline. The other two name the member at the slot where that
+    caller discipline. The second names the member at the slot where that
     source is CHOSEN, which is where a reader greps for it, and both are
     idempotent: ``Parentage.with_limitation`` and ``IntegrityBuilder.limitation``
     each no-op on a marker already present.
@@ -134,11 +134,12 @@ class Limitation(Enum):
       via ``Parentage.with_limitation``. No alias resolved to a unit, no live
       scope reached us and no single session was live, so the span roots its own
       trace and says the parent it expected was never found.
-    * ``adapters/_anthropic_agent_sdk.py::_open_tool_call`` — ``Unit.note`` on
-      the CALL unit, when no pin reached the handler, no single session was live
-      to fall back on, and the task carried no ambient wardex span either.
+    The in-process tool span reaches it through that same table now, because
+    ``adapters/_context.py`` declares the site's placement and the registry
+    decides. It used to be a third site here, stamping this by hand at the end
+    of a tier ladder the adapter walked itself.
 
-    The path that puts it on the most records is none of the three:
+    The path that puts it on the most records is neither:
     ``__init__.py``'s ``capture_state_snapshot`` passes
     ``ParentSource.UNRESOLVED`` for a snapshot taken outside any span and names
     no member itself, leaving the ``_MARKER`` table to do it.
@@ -147,20 +148,19 @@ class Limitation(Enum):
     UNIT_INFERRED_SOLE = "unit_inferred_sole"
     """Exactly one logical unit was live, so it was taken as the parent.
 
-    Three emit sites, the same shape as ``PARENT_UNRESOLVED`` above: the
-    ``_MARKER`` table in ``assembly/_parentage.py`` attaches it to every edge
-    built for ``ParentSource.UNIT_SOLE``, and the two tiers that CHOOSE that
-    source name it again at their own slot.
+    The same shape as ``PARENT_UNRESOLVED`` above: the ``_MARKER`` table in
+    ``assembly/_parentage.py`` attaches it to every edge built for
+    ``ParentSource.UNIT_SOLE``, and ``assembly/_units.py::UnitRegistry._edge``
+    names it again at ``resolve()``'s sole-live tier — no alias and no live
+    scope, but exactly one SESSION unit open, so it is taken as the parent.
 
-    * ``assembly/_units.py::UnitRegistry._edge`` — ``resolve()``'s sole-live
-      tier, via ``Parentage.with_limitation``. No alias and no live scope, but
-      exactly one SESSION unit is open, so it is taken as the parent at
-      confidence 0.5.
-    * ``adapters/_anthropic_agent_sdk.py::_open_tool_call`` — ``Unit.note`` on
-      the CALL unit, for the tier that answers when no pin reached the
-      in-process handler and exactly one session is live. What that replaces
-      dropped an unattributable handler outright, with no marker; a marked 0.5
-      edge beats unmarked data loss.
+    An ADAPTER reaches this by declaring ``Fallback.SOLE_LIVE_RUN`` at a site it
+    expects to be reached through a carrier the framework may not have
+    propagated to, and that declaration is the whole of what it may say: the
+    candidate comes from the registry's own table, filtered to that adapter's
+    own runs, and only when there is exactly one. What it replaces dropped an
+    unattributable call outright, with no marker; a marked 0.5 edge beats
+    unmarked data loss, and beats a call that becomes its own trace root.
     """
 
     CORRELATION_CONFLICT = "correlation_conflict"
@@ -180,11 +180,15 @@ class Limitation(Enum):
       REFUSE the scope a CLOSED pin left standing: the opened unit becomes a
       trace root, or the edge is rebuilt from the remaining tiers, instead of
       hanging later work off a finished unit at confidence 1.0.
-    * ``adapters/_anthropic_agent_sdk.py::_open_tool_call`` — the only emitter
-      outside the registry — marks the in-process tool span whose edge that same
-      stale pin decided. The pinned session's own span is not reachable: it was
-      materialized and shipped inside the very ``close()`` that made the pin
-      stale, and ``Unit.note()`` on a closed unit is a no-op.
+    * ``adapters/_context.py`` — the only emitter outside the registry — marks
+      the span whose edge a declared fallback decided while a dead pin was
+      standing. Taking a parent unit is precisely what stops ``open()`` from
+      seeing the poisoned ambient for itself, so without this the two reasons a
+      guess happened are byte-identical: "nothing was pinned" and "what was
+      pinned had died", the second being a call filed inside a run it has
+      nothing to do with. The pinned session's own span is not reachable either
+      way — it was materialized and shipped inside the very ``close()`` that
+      made the pin stale, and ``Unit.note()`` on a closed unit is a no-op.
     """
 
     # ------------------------------------------------------------------
@@ -387,7 +391,7 @@ class Limitation(Enum):
     """The framework ran the tool in-process and never exposed a tool-call id,
     so the tool span cannot be joined to the assistant message that requested it.
 
-    Emitted from ``adapters/_anthropic_agent_sdk.py::_open_tool_call``, on every
+    Emitted from ``adapters/_anthropic_agent_sdk.py::_describe_tool_call``, on every
     span an in-process SDK MCP tool produces. The handler is dispatched with
     ``{name, arguments}`` and nothing else, so the id genuinely does not reach
     it; the alternative — matching name and arguments against the stream in
@@ -415,7 +419,7 @@ class Limitation(Enum):
     CLI-visible name, so the name on this span cannot identify which server ran.
 
     Design §5.4's V3 correction. Both emitters are in
-    ``adapters/_anthropic_agent_sdk.py::_open_tool_call``, and both
+    ``adapters/_anthropic_agent_sdk.py::_describe_tool_call``, and both
     mean "the two observers of this call may not have met on one key":
 
       * the server's CLI token was never resolved (nothing in any options'
@@ -476,7 +480,7 @@ class Limitation(Enum):
 
     The adapter's FIFTH span class does not carry it, and must not. The
     in-process ``execute_tool`` span opened by
-    ``adapters/_anthropic_agent_sdk.py::_open_tool_call`` brackets a handler
+    ``adapters/_anthropic_agent_sdk.py::_run_tool`` brackets a handler
     wardex wrapped in *this* process, so its duration is measured directly
     rather than inferred from an IPC stream — attaching the marker there would
     claim the timing is absent when it is the one timing the adapter owns.
