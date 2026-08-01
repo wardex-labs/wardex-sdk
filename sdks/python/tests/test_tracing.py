@@ -1,3 +1,5 @@
+import pytest
+
 from wardex_sdk import _hub
 from wardex_sdk._client import Client
 from wardex_sdk._config import WardexConfig
@@ -88,3 +90,76 @@ def test_set_attribute_appears_in_console_output(capsys):
     out = capsys.readouterr().out
     assert "code.git.head_sha" in out
     assert "a1b2c3d" in out
+
+
+# ==========================================================================
+# A wardex bug inside `wardex.span()` costs the span, never the block
+# ==========================================================================
+
+
+def test_a_bug_opening_a_manual_span_still_runs_the_hosts_block(monkeypatch):
+    """`wardex.span()` is the SDK's published context manager, so its `with`
+    body is the host's own code. Latching the ambient scope, resolving the edge
+    and building the draft all run before that body — a defect in any of them
+    used to take the block with it.
+    """
+    import wardex_sdk._tracing as tracing
+    from wardex_sdk.assembly._diag import reset_reports_for_test
+
+    _setup()
+    reset_reports_for_test()
+    monkeypatch.setattr(
+        tracing, "resolve_parentage", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("broken"))
+    )
+
+    ran = []
+    with span("llm-call") as s:
+        ran.append(s)
+        s.input_data = b"the host wrote this"
+        s.set_status(StatusCode.OK)
+        value = "the host's own"
+
+    assert len(ran) == 1
+    assert value == "the host's own"
+    assert ran[0].input_data == b"the host wrote this"
+
+
+def test_a_bug_opening_a_manual_span_emits_nothing_and_says_why(capsys):
+    """No span, and one line saying so — the difference between wardex being
+    broken here and wardex never having been installed.
+    """
+    import wardex_sdk._tracing as tracing
+    from wardex_sdk.assembly._diag import reset_reports_for_test
+
+    t = _setup()
+    reset_reports_for_test()
+    real = tracing.resolve_parentage
+
+    def blow(*a, **k):
+        raise RuntimeError("broken")
+
+    tracing.resolve_parentage = blow
+    capsys.readouterr()
+    try:
+        with span("llm-call") as s:
+            s.set_status(StatusCode.OK)
+    finally:
+        tracing.resolve_parentage = real
+
+    err = capsys.readouterr().err
+    _hub.get_client().flush()
+    assert t.envelopes == []
+    assert len([line for line in err.splitlines() if line.strip()]) == 1
+    assert "will not be recorded" in err, err
+
+
+def test_the_hosts_exception_leaves_a_manual_span_as_the_same_object():
+    """Identity, and `BaseException` included: wardex may not become the library
+    in the process that eats a real Ctrl-C.
+    """
+    _setup()
+    for exc in (ValueError("host"), KeyboardInterrupt()):
+        with pytest.raises(type(exc)) as caught:
+            with span("llm-call"):
+                raise exc
+        assert caught.value is exc

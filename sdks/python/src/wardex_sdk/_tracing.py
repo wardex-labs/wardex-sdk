@@ -18,7 +18,16 @@ from ._types import (
     InternalSpan,
     ToolAttributes,
 )
-from .assembly import SpanDraft, guard, latch_ambient, resolve_parentage
+from .assembly import (
+    EMPTY_AMBIENT,
+    Evidence,
+    ParentSource,
+    SpanDraft,
+    guard,
+    latch_ambient,
+    report_once,
+    resolve_parentage,
+)
 from .context._contextvar import fork_active_span
 
 
@@ -209,48 +218,119 @@ class SpanBuilder:
         return self._draft.finish(self.end_time_ns or time.time_ns())
 
 
+#: The parentage a span that will never be emitted hangs off. Minted ONCE at
+#: import, through the sanctioned factory. Every degraded manual span shares it,
+#: which costs nothing: none of them reaches a sink, so the trace it names has
+#: no members. Each still gets its OWN draft — a shared one would accumulate
+#: every host's `set_attribute` for the life of the process.
+_NULL_PARENTAGE = resolve_parentage(EMPTY_AMBIENT, Evidence(ParentSource.UNRESOLVED))
+
+
 @contextmanager
 def _begin(
     name: str,
     kind: SpanKind,
     conversation: ConversationContext | None,
 ) -> Iterator[SpanBuilder]:
-    # A manual span is issued on the caller's own task, so the latch is here and
-    # the evidence is the default (`AMBIENT`): a parent means the ContextVar
-    # held one, a remote parent is re-labelled `header` by the core, and no
-    # parent at all means this span deliberately roots a new trace. Manual spans
-    # and adapter spans agree on all three because they ask the same function —
-    # and they also build the same object through the same constructor (I5).
-    parentage = resolve_parentage(latch_ambient())
-    draft = SpanDraft.manual(
-        parentage,
-        name=name,
-        kind=kind,
-        start_ns=time.time_ns(),
-        source=CaptureSource.MANUAL,
-    )
-    if conversation is not None:
-        draft.set_conversation(conversation)
+    """Never raises an Exception of wardex's own making; the body ALWAYS runs.
+
+    `wardex.span()` is the SDK's published context manager, so its `with` block
+    is the host's own code — and every step below was once outside a guard:
+    latching the ambient scope, resolving the edge, building the draft, forking
+    the carrier, and handing the finished span to the client. A defect in any of
+    them raised out of `with wardex.span(...)` and took the block with it.
+    """
+    draft = None
+    ok = False
+    with guard("tracing.manual_open", debug=_debug_enabled()):
+        # A manual span is issued on the caller's own task, so the latch is here
+        # and the evidence is the default (`AMBIENT`): a parent means the
+        # ContextVar held one, a remote parent is re-labelled `header` by the
+        # core, and no parent at all means this span deliberately roots a new
+        # trace. Manual spans and adapter spans agree on all three because they
+        # ask the same function — and they also build the same object through
+        # the same constructor (I5).
+        parentage = resolve_parentage(latch_ambient())
+        draft = SpanDraft.manual(
+            parentage,
+            name=name,
+            kind=kind,
+            start_ns=time.time_ns(),
+            source=CaptureSource.MANUAL,
+        )
+        if conversation is not None:
+            draft.set_conversation(conversation)
+        ok = True
+    if not ok:
+        # A builder the host can still drive, over a draft nothing will emit —
+        # and never the shared NULL_DRAFT, because `SpanBuilder` is a view onto
+        # a draft's own fields and a host that writes through it must not be
+        # writing into every other degraded span in the process. There is no
+        # `finally` below this yield: the span is already lost, and running the
+        # emit path on a draft with no trace would be inventing one.
+        report_once(
+            f"[wardex] wardex.span({name!r}): internal error opening the span; "
+            "this span and anything it would have parented will not be recorded "
+            "(re-run with debug=True for the traceback)",
+            key="wardex.span.manual_open",
+        )
+        yield SpanBuilder(
+            SpanDraft.manual(
+                _NULL_PARENTAGE, name=name, kind=kind, start_ns=0, source=CaptureSource.MANUAL
+            )
+        )
+        return
 
     builder = SpanBuilder(draft)
+    fork = None
+    forked = False
+    with guard("tracing.manual_fork", debug=_debug_enabled()):
+        fork = fork_active_span(draft.context)
+        fork.__enter__()
+        forked = True
+    if not forked:
+        # Half-entered at worst, so it must not be exited. This span still
+        # ships; what is lost is everything opened INSIDE the block, which finds
+        # whatever was standing before it instead.
+        fork = None
+        report_once(
+            "[wardex] wardex.span(): internal error installing the span as the "
+            "active parent; work inside this block will be attached one level "
+            "too high (re-run with debug=True for the traceback)",
+            key="wardex.span.manual_fork",
+        )
     try:
-        with fork_active_span(draft.context):
-            yield builder
+        yield builder
     finally:
+        if fork is not None:
+            with guard("tracing.manual_fork_exit", debug=_debug_enabled()):
+                fork.__exit__(None, None, None)
         finished = None
         # `finish()` validates, and a vocabulary breach must not reach the host
         # (I6) — a `with wardex.span(...)` block would otherwise raise on the
         # way out of code that has nothing to do with wardex.
         with guard("tracing.manual_span", debug=_debug_enabled()):
             finished = builder.finish()
-        client = _hub.get_client()
+        client = None
+        with guard("tracing.manual_client", debug=_debug_enabled()):
+            client = _hub.get_client()
         if client is not None and finished is not None:
-            client.capture_span(finished)
+            with guard("tracing.manual_emit", debug=_debug_enabled()):
+                client.capture_span(finished)
 
 
 def _debug_enabled() -> bool:
-    config = getattr(_hub.get_client(), "config", None)
-    return bool(getattr(config, "debug", False))
+    """Whether to log tracebacks. TOTAL, because every `guard()` below calls it.
+
+    `debug=` is evaluated when the guard is CONSTRUCTED, which is one expression
+    outside the block it is about to protect — so a client whose config read
+    raises would break the host from inside the one call meant to prevent that.
+    """
+    debug = False
+    with guard("tracing.debug_flag", debug=False):
+        config = getattr(_hub.get_client(), "config", None)
+        debug = bool(getattr(config, "debug", False))
+    return debug
 
 
 @contextmanager
@@ -266,15 +346,33 @@ def trace(
     reaches the span, so passing tags here changes nothing about what is exported.
     """
     conversation = ConversationContext(conversation_id=str(uuid.uuid4()))
-    scope = _hub.get_current_scope()
-    prev_conv = scope.conversation
-    scope.conversation = conversation
+    # Reading the scope and stamping the conversation onto it are wardex's own
+    # work, and they run BEFORE the host's block — so a failure here would take
+    # the block with it. A conversation that could not be installed costs the
+    # id on the spans inside; it does not cost the trace.
+    scope = None
+    installed = False
+    with guard("tracing.trace_scope", debug=_debug_enabled()):
+        scope = _hub.get_current_scope()
+        prev_conv = scope.conversation
+        scope.conversation = conversation
+        installed = True
+    if not installed:
+        scope = None
+        report_once(
+            "[wardex] wardex.trace(): internal error reading the active scope; "
+            "spans in this block will not carry a conversation id "
+            "(re-run with debug=True for the traceback)",
+            key="wardex.trace.scope",
+        )
     try:
         with _begin(name, SpanKind.INTERNAL, conversation) as builder:
             builder.operation = op
             yield builder
     finally:
-        scope.conversation = prev_conv
+        if scope is not None:
+            with guard("tracing.trace_scope_restore", debug=_debug_enabled()):
+                scope.conversation = prev_conv
 
 
 @contextmanager

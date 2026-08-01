@@ -28,6 +28,18 @@ All notable changes to this project are documented here. The format follows
   own home as the tool's `call_id`.
 
 ### Fixed
+- **`wardex.span()` and `wardex.trace()` no longer raise into the block they
+  wrap.** The SDK's own published context manager had the same hole as the
+  adapter surface and on a shorter path to a user: latching the active scope,
+  resolving the parent edge, building the draft, installing the span as the
+  active parent, reading the client and handing it the finished span all ran
+  outside any failure boundary, and any of them raised out of
+  `with wardex.span(...)` into code that has nothing to do with wardex. Each is
+  contained now, the block always runs, and the builder it receives is one the
+  host can still drive — over a draft nothing will emit, so a lost span costs a
+  span. A carrier that could not be installed costs only the attachment of work
+  inside the block, which is reported separately, because that span itself
+  still ships.
 - **A bug in wardex can no longer break the application it is watching.** The
   adapter surface put the host's own call — a tool handler, a graph node, an
   LLM request — inside a `with` block whose open, activation and close were all

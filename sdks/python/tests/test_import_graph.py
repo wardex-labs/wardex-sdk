@@ -1119,25 +1119,40 @@ def _names_assigned_in(body: list[ast.stmt]) -> set[str]:
     return out
 
 
-def _assigns_literal(stmt: ast.stmt | None, name: str, value: bool) -> bool:
+def _assigns_name(stmt: ast.stmt | None, name: str) -> bool:
     return (
         isinstance(stmt, ast.Assign)
         and len(stmt.targets) == 1
         and isinstance(stmt.targets[0], ast.Name)
         and stmt.targets[0].id == name
-        and isinstance(stmt.value, ast.Constant)
-        and stmt.value.value is value
+    )
+
+
+def _assigns_sentinel(stmt: ast.stmt | None, name: str) -> bool:
+    """`name = False` or `name = None` — a value the guarded block will replace."""
+    return (
+        _assigns_name(stmt, name)
+        and isinstance(stmt.value, ast.Constant)  # type: ignore[union-attr]
+        and stmt.value.value in (None, False)  # type: ignore[union-attr]
     )
 
 
 def _flag_violations(tree: ast.AST) -> list[int]:
-    """Line numbers where a guarded step is tested by something other than a flag.
+    """Line numbers where a guarded step is tested by a name a failure can leave set.
 
-    Scope is narrow on purpose: the `if` IMMEDIATELY following the `with`, in
-    the SAME body, testing a name the block assigns. A rule that reached further
-    would need dataflow to tell the trap apart from the sound case where the
-    block's only statement is the assignment itself — and a rule that silently
-    goes blind is worse than no rule.
+    Scope is the `if` IMMEDIATELY following the `with`, in the SAME body,
+    testing a name the block assigns. What makes a test sound is not its
+    SYNTAX — `if not ok:` and `if client is not None:` are equally fine — it is
+    WHERE the assignment sits:
+
+      * the name is set to a sentinel (`False` / `None`) immediately BEFORE the
+        block, so its pre-block value says "this did not happen"; and
+      * the block's LAST statement is the only one that assigns it, so no
+        failure inside the block can leave it holding anything else.
+
+    A name assigned by a non-final statement is the trap: it is already bound
+    when a later statement raises, so the test is dead and the failure ships
+    looking like a success.
     """
     bad: list[int] = []
     for node in ast.walk(tree):
@@ -1152,40 +1167,35 @@ def _flag_violations(tree: ast.AST) -> list[int]:
                 if not isinstance(nxt, ast.If):
                     continue
                 tested = {n.id for n in ast.walk(nxt.test) if isinstance(n, ast.Name)}
-                if not tested & _names_assigned_in(stmt.body):
-                    continue  # an unrelated `if` — not a test of this step
-                test = nxt.test
-                if isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not):
-                    test = test.operand
-                if not isinstance(test, ast.Name):
-                    bad.append(nxt.lineno)
-                    continue
-                flag = test.id
                 before = body[i - 1] if i else None
-                if not _assigns_literal(before, flag, False):
-                    bad.append(nxt.lineno)
-                elif not _assigns_literal(stmt.body[-1], flag, True):
-                    bad.append(nxt.lineno)
+                for name in sorted(tested & _names_assigned_in(stmt.body)):
+                    sound = (
+                        _assigns_sentinel(before, name)
+                        and _assigns_name(stmt.body[-1], name)
+                        and name not in _names_assigned_in(stmt.body[:-1])
+                    )
+                    if not sound:
+                        bad.append(nxt.lineno)
+                        break
     return bad
 
 
 def test_a_guarded_step_is_tested_by_a_flag_and_never_by_what_it_assigns():
-    found = {
-        rel: lines
-        for rel, tree in _modules().items()
-        if rel.startswith(("assembly/", "adapters/")) and (lines := _flag_violations(tree))
-    }
+    """Package-wide, and not a budget. There is no legitimate instance of this."""
+    found = {rel: lines for rel, tree in _modules().items() if (lines := _flag_violations(tree))}
     assert found == {}, (
-        f"C-S7: a guarded step is tested by something other than a flag at {found}.\n\n"
+        f"C-S7: a guarded step is tested by a name a failure can leave set, at {found}.\n\n"
         "WHY: `guard()` swallows, so the statement after the block has to ask\n"
-        "whether the block finished. A variable the block ASSIGNS is already\n"
-        "bound when a later statement in the block is what raised, so the test is\n"
-        "dead code and the failure ships looking like a success. Write:\n\n"
+        "whether the block finished. A name assigned by a non-final statement is\n"
+        "already bound when a later one raises, so the test is dead code and the\n"
+        "failure ships looking like a success. Write:\n\n"
         "    ok = False\n"
         "    with self.guard(...):\n"
         "        ...\n"
         "        ok = True\n"
-        "    if not ok:\n"
+        "    if not ok:\n\n"
+        "The `None` sentinel is equally fine when the block's LAST statement is\n"
+        "the only one that assigns the name."
     )
 
 
@@ -1248,6 +1258,24 @@ def test_c_s7_sees_a_dead_test_however_it_is_written(source):
         "        ok = True\n"
         "    if not ok:\n"
         "        degrade()\n",
+        # the `None` sentinel, which is the same protocol with a different value:
+        # the block's LAST statement is the only one that assigns the name, so a
+        # failure anywhere leaves it None. Three modules already use this shape.
+        "def f(self):\n"
+        "    span = None\n"
+        "    with guard('a'):\n"
+        "        span = build(pending, m)\n"
+        "    if span is not None:\n"
+        "        out.append(span)\n",
+        # and with other work before the assignment, which is still sound
+        "def f(self):\n"
+        "    snapshot = None\n"
+        "    with guard('a'):\n"
+        "        draft = build()\n"
+        "        draft.set_extras(attrs)\n"
+        "        snapshot = draft.finish(now)\n"
+        "    if snapshot is not None:\n"
+        "        client.capture_snapshot(snapshot)\n",
         # an `if` that has nothing to do with the guarded block
         "def f(self):\n"
         "    with self.guard('a'):\n"
