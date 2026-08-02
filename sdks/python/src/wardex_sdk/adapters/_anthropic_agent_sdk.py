@@ -28,7 +28,6 @@ import threading
 from collections.abc import Mapping
 from dataclasses import replace
 from functools import partial
-from itertools import count
 from typing import TYPE_CHECKING, Any
 
 from .._enums import ToolExecutionType
@@ -37,7 +36,6 @@ from ..assembly import (
     Limitation,
     PatchSet,
     SpanIntent,
-    UnitKey,
     UnitKind,
     counters,
     guard,
@@ -60,12 +58,6 @@ _WARDEX_HOOK_EVENTS = (
     "UserPromptSubmit",
     "Stop",
 )
-
-#: Distinguishes concurrent invocations of one tool in the registry's alias
-#: table. wardex-issued and monotonic on purpose: a framework identifier here
-#: would be exactly the thing this design refuses to build a tree out of, and
-#: the handler is not given one anyway.
-_call_seq = count()
 
 
 def _surface_ok(sdk: Any, subprocess_cli: Any) -> bool:
@@ -171,9 +163,22 @@ def _existing_handle(tools: Any) -> ServerHandle | None:
 
 
 def _tool_input(args: Any) -> bytes:
+    """Serialize a handler's arguments or its result. TOTAL, deliberately.
+
+    `Exception` and not `(TypeError, ValueError)`, which is what `json.dumps`
+    documents for an unserializable value. The input here is the HOST's own
+    object, and a container whose `items()` raises, a `__getattr__` that throws,
+    a lazy proxy over a closed session — none of those are `TypeError`. This is
+    called on the result INSIDE the `with` body, where nothing else is left to
+    contain a raise, so a narrower except is a place the host breaks over a span
+    attribute nobody would have missed.
+
+    Not a silent swallow: the counter is the record, and an empty body ships
+    with `response_body_captured=False` beside it.
+    """
     try:
         return json.dumps(args).encode()
-    except (TypeError, ValueError):
+    except Exception:  # noqa: BLE001 — the host's own object; see above
         counters.bump("adapters.anthropic.tool_input_unserializable")
         return b""
 
@@ -253,6 +258,16 @@ async def _run_tool(
     never happen: a failing tool would report success to its caller AND on the
     wire.
 
+    NOTHING IN THE HEADER CAN RAISE, and that is a property of its shape rather
+    than of the values it happens to hold today. Every expression there — the
+    `partial`, the arguments to it, the subject — runs BEFORE `__enter__`, so it
+    is outside every failure boundary wardex has: a framework attribute read
+    among them breaks the host as surely as one in the body would. This site
+    used to build its own selector out of `handle.effective_token`, an f-string
+    and a counter; the context mints an anonymous one now, and `test_import_
+    graph.py` refuses a header that is anything but names, enum members and a
+    `partial` of a name.
+
     `fallback=SOLE_LIVE_RUN` is the one guess this site declares, and it is
     declared rather than computed. The pin normally reaches this handler through
     the carrier, which is the tier the whole design exists to hit; when it does
@@ -269,18 +284,11 @@ async def _run_tool(
         # about the ADAPTER's lifetime rather than about a failure.
         return await handler(args)
 
-    # Evaluated BEFORE `enter()` and therefore outside every guard, so it has to
-    # be total: `effective_token` is `self.token or self.name` and `next()` on a
-    # `count()` cannot fail. If that ever stops being true it moves into
-    # `describe` with a constant fallback.
-    key = UnitKey("mcp.tool.call", f"{handle.effective_token}/{tool_name}#{next(_call_seq)}")
-
     with ctx.enter(
         UnitKind.CALL,
         intent=SpanIntent.EXECUTE_TOOL,
         placement=Placement.NESTED,
         subject=tool_name,
-        selector=key,
         fallback=Fallback.SOLE_LIVE_RUN,
         describe=partial(_describe_tool_call, adapter, handle, tool_name, args),
     ) as call:

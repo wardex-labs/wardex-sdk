@@ -51,6 +51,7 @@ import weakref
 from collections.abc import Callable, Iterator, Mapping, MutableMapping, Sequence
 from contextlib import contextmanager
 from enum import Enum
+from itertools import count
 from typing import Any
 
 from .._enums import StatusCode
@@ -421,7 +422,17 @@ class AdapterContext:
     capture-mode gate has one place to live rather than one per emit site.
     """
 
-    __slots__ = ("_slots", "_tripped", "_units", "debug", "limits", "name", "patches")
+    __slots__ = (
+        "_anon_ns",
+        "_anon_seq",
+        "_slots",
+        "_tripped",
+        "_units",
+        "debug",
+        "limits",
+        "name",
+        "patches",
+    )
 
     def __init__(
         self,
@@ -437,6 +448,16 @@ class AdapterContext:
         self.debug = debug
         self._units = units
         self._tripped = False
+        # The selector a site that names none gets. Built HERE, out of wardex's
+        # own counter, for two reasons. It is unique per call, where the shared
+        # empty key it replaces had every anonymous unit in the process rebinding
+        # one alias slot — `find()` on it answered "whichever was last", which is
+        # not an answer. And it costs the CALL SITE nothing to compute: an
+        # expression in a `with ctx.enter(...)` header runs before any failure
+        # boundary exists, so every one an adapter has to write there is a place
+        # a framework read can break the host.
+        self._anon_ns = f"adapters.{name}"
+        self._anon_seq = count()
         self._slots: MutableMapping[Any, dict[str, Any]] = weakref.WeakKeyDictionary()
 
     @property
@@ -564,7 +585,7 @@ class AdapterContext:
                 holder, evidence = sole, _SOLE
         unit = self._units.open(
             kind,
-            selector if selector is not None else UnitKey(f"adapters.{self.name}", ""),
+            selector if selector is not None else UnitKey(self._anon_ns, str(next(self._anon_seq))),
             ambient=ambient,
             evidence=evidence,
             intent=intent,

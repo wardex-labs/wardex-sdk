@@ -1072,6 +1072,192 @@ def test_sink_is_not_called_from_assembly_yet():
 
 
 # --------------------------------------------------------------------------
+# C-S6 — nothing that can raise lives outside the boundary
+# --------------------------------------------------------------------------
+#
+# `ctx.enter()` contains its own failures, which is what lets the host's own
+# call sit inside its `with` body. Two places in that statement are NOT
+# contained, and neither is obvious:
+#
+#   * the HEADER. Every argument is evaluated before `__enter__` runs, so a
+#     framework attribute read there — `handle.effective_token` on something the
+#     SDK moved between releases — breaks the host exactly as it would in the
+#     body, and no guard wardex can add will ever see it.
+#   * the BODY. Adapter glue belongs in `describe=`, which runs inside the open's
+#     own boundary; the same statement written here breaks the host and ships a
+#     fabricated ERROR span for a call that never ran.
+#
+# Both are shape rules because neither is a property anything else can check: a
+# call-graph rule cannot see an attribute read, and there is no runtime moment
+# at which "this expression was in a header" is observable.
+
+_ENTER_METHODS = frozenset({"enter", "rejoin", "open_run"})
+
+
+def _enter_calls(node: ast.stmt) -> list[ast.Call]:
+    """The `ctx.enter(...)`-family calls a `with` statement opens."""
+    if not isinstance(node, ast.With | ast.AsyncWith):
+        return []
+    out = []
+    for item in node.items:
+        call = item.context_expr
+        if (
+            isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Attribute)
+            and call.func.attr in _ENTER_METHODS
+        ):
+            out.append(call)
+    return out
+
+
+def _is_total_expr(node: ast.expr) -> bool:
+    """Can this expression be evaluated without running code that might raise?
+
+    A bare name, a literal, an enum member (`UnitKind.CALL` — an attribute on a
+    CAPITALIZED name, which is the only attribute read here that cannot be a
+    framework object), or `partial(<name>, <total>...)`.
+
+    An attribute read on a lowercase name is exactly the hazard and is refused
+    even when the object is wardex's own: the rule cannot tell `handle.tools`
+    from `handle.effective_token`, and a rule that had to would go blind the
+    first time somebody wrapped one in a property.
+    """
+    if isinstance(node, ast.Name | ast.Constant):
+        return True
+    if isinstance(node, ast.Attribute):
+        return isinstance(node.value, ast.Name) and node.value.id[:1].isupper()
+    if isinstance(node, ast.Call):
+        fn = node.func
+        name = fn.attr if isinstance(fn, ast.Attribute) else getattr(fn, "id", None)
+        if name != "partial":
+            return False
+        return all(_is_total_expr(a) for a in node.args) and not node.keywords
+    return False
+
+
+def _header_violations(tree: ast.AST) -> list[int]:
+    bad: list[int] = []
+    for node in ast.walk(tree):
+        for call in _enter_calls(node):
+            args = list(call.args) + [kw.value for kw in call.keywords]
+            if not all(_is_total_expr(a) for a in args):
+                bad.append(call.lineno)
+    return bad
+
+
+def _body_violations(tree: ast.AST) -> list[int]:
+    """Statements in a `with ctx.enter(...)` body that are neither the host's
+    call nor a method call on the yielded scope."""
+    bad: list[int] = []
+    for node in ast.walk(tree):
+        for _call in _enter_calls(node):
+            assert isinstance(node, ast.With | ast.AsyncWith)
+            yielded = {
+                item.optional_vars.id
+                for item in node.items
+                if isinstance(item.optional_vars, ast.Name)
+            }
+            for stmt in node.body:
+                if isinstance(stmt, ast.Return | ast.Pass):
+                    continue
+                if isinstance(stmt, ast.Assign | ast.AnnAssign | ast.Expr):
+                    value = stmt.value
+                    if value is None:
+                        continue
+                    if isinstance(value, ast.Await):
+                        continue  # the host's own call
+                    if (
+                        isinstance(value, ast.Call)
+                        and isinstance(value.func, ast.Attribute)
+                        and isinstance(value.func.value, ast.Name)
+                        and value.func.value.id in yielded
+                    ):
+                        continue  # a verb on the scope, which is total
+                    bad.append(stmt.lineno)
+                    continue
+                bad.append(stmt.lineno)
+            break
+    return bad
+
+
+def test_nothing_that_can_raise_lives_in_an_enter_header():
+    found = {rel: lines for rel, tree in _modules().items() if (lines := _header_violations(tree))}
+    assert found == {}, (
+        f"C-S6: a `ctx.enter(...)` header holds an expression that can raise, at {found}.\n\n"
+        "WHY: every argument is evaluated BEFORE `__enter__`, so it is outside\n"
+        "every failure boundary wardex has — a framework read there breaks the\n"
+        "host and no guard can ever see it. Names, literals, enum members and a\n"
+        "`partial` of a name are the whole vocabulary. If a site needs a computed\n"
+        "value, it belongs in `describe=`, which runs inside the open's boundary."
+    )
+
+
+def test_nothing_but_the_hosts_call_lives_in_an_enter_body():
+    found = {rel: lines for rel, tree in _modules().items() if (lines := _body_violations(tree))}
+    assert found == {}, (
+        f"C-S6: a `ctx.enter(...)` body holds adapter glue, at {found}.\n\n"
+        "WHY: the body is the one place the host's own call may live, and it is\n"
+        "unguarded on purpose — a guard there would swallow the host's exception\n"
+        "and report a failing call as a successful one. Anything else written\n"
+        "there breaks the host for a span attribute. Adapter glue goes in\n"
+        "`describe=`, which runs inside the same boundary as the open."
+    )
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        # the hazard the inversion created: a framework read in the header
+        "with ctx.enter(K, selector=UnitKey('a', handle.effective_token)) as call:\n    pass\n",
+        # an f-string, which is a call in disguise
+        "with ctx.enter(K, subject=f'{handle.token}/{name}') as call:\n    pass\n",
+        # a helper, however innocent it looks
+        "with ctx.enter(K, selector=_call_key(handle, name)) as call:\n    pass\n",
+        # a bare attribute read on an adapter-held object
+        "with ctx.enter(K, subject=handle.name) as call:\n    pass\n",
+        # `partial` of something that is itself computed
+        "with ctx.enter(K, describe=partial(f, adapter._names.catalog())) as call:\n    pass\n",
+    ],
+)
+def test_c_s6_sees_a_header_expression_that_can_raise(source):
+    assert _header_violations(ast.parse(source)), f"C-S6 went blind on:\n{source}"
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "with ctx.enter(UnitKind.CALL, intent=SpanIntent.EXECUTE_TOOL,\n"
+        "               subject=tool_name, fallback=Fallback.SOLE_LIVE_RUN,\n"
+        "               describe=partial(_describe, adapter, handle, tool_name, args)) as call:\n"
+        "    result = await handler(args)\n"
+        "    call.record_output(_tool_input(result))\n",
+    ],
+)
+def test_c_s6_accepts_the_shape_the_adapter_actually_writes(source):
+    tree = ast.parse(source)
+    assert _header_violations(tree) == []
+    assert _body_violations(tree) == []
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        # adapter glue in the body: breaks the host, and ships a fabricated
+        # ERROR span for a call that never ran
+        "with ctx.enter(K) as call:\n    call.draft.set_extra('k', adapter._names.token())\n"
+        "    result = await handler(args)\n",
+        # a bare attribute read, which a call-graph rule cannot see
+        "with ctx.enter(K) as call:\n    x = task.name\n    result = await handler(args)\n",
+        # a guard nested in the body — there is nothing left for it to protect,
+        # and reaching for one is how the host's exception gets swallowed
+        "with ctx.enter(K) as call:\n    with adapter._guard('x'):\n        pass\n",
+    ],
+)
+def test_c_s6_sees_a_body_that_is_not_only_the_hosts_call(source):
+    assert _body_violations(ast.parse(source)), f"C-S6 went blind on:\n{source}"
+
+
+# --------------------------------------------------------------------------
 # C-S7 — a guarded step is tested by a flag, never by what it assigns
 # --------------------------------------------------------------------------
 #

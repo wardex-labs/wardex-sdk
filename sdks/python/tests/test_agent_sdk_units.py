@@ -166,11 +166,12 @@ from wardex_sdk import _hub
 from wardex_sdk._enums import StatusCode, ToolExecutionType
 from wardex_sdk.adapters._anthropic_agent_sdk import AnthropicAgentSdkAdapter
 from wardex_sdk.adapters._anthropic_names import ServerHandle
-from wardex_sdk.adapters._context import AdapterContext
+from wardex_sdk.adapters._context import AdapterContext, Placement
 from wardex_sdk.adapters._registry import context_for
 from wardex_sdk.assembly import (
     Limitation,
     ParentSource,
+    SpanIntent,
     UnitKind,
     UnitRegistry,
     counters,
@@ -1993,3 +1994,75 @@ def test_a_tool_that_raises_reaches_its_caller_even_while_wardex_is_degraded():
             adapter.uninstall()
 
         assert caught.value is mine, f"broken={registry_is_broken}: not the same object"
+
+
+def test_a_result_wardex_cannot_serialize_still_reaches_the_hosts_caller():
+    """The last unguarded expression in the `with` body, and it runs on the
+    HOST's own return value.
+
+    `json.dumps` documents `TypeError` for an unserializable value, so that is
+    what the narrow except caught — but a container whose `items()` raises, a
+    `__getattr__` that throws, a lazy proxy over a closed session are none of
+    them `TypeError`. There is nothing left inside the body to contain a raise,
+    so the host would have lost its result over a span attribute nobody would
+    have missed.
+    """
+
+    class Hostile(dict):
+        def items(self):
+            raise RuntimeError("this object cannot be walked")
+
+    client = RecordingClient()
+    adapter = AnthropicAgentSdkAdapter()
+    adapter.install(client, context_for(adapter.name(), client))
+    mine = Hostile(a=1)
+
+    async def handler(args):
+        return mine
+
+    try:
+        tool_def = _tool(handler=handler)
+        claude_agent_sdk.create_sdk_mcp_server("srv", tools=[tool_def])
+        result = anyio.run(tool_def.handler, {"name": "world"})
+    finally:
+        adapter.uninstall()
+
+    assert result is mine
+    span = _named(client.spans, "execute_tool greet")
+    # The span still ships, and says the output capture was attempted and empty
+    # rather than claiming a body it never had.
+    assert span.output_data == b""
+    assert counters.get("adapters.anthropic.tool_input_unserializable") >= 1
+
+
+def test_two_concurrent_calls_get_their_own_slot_in_the_lookup_table():
+    """The selector this site no longer computes for itself.
+
+    A site that names none used to get one shared key — `adapters.<name>` with
+    an empty value — so every anonymous unit in the process rebound one alias
+    slot and `find()` on it answered "whichever was last", which is not an
+    answer. The context mints a unique one now, which is both a better key and
+    one the CALL SITE does not have to build in a header that runs before any
+    failure boundary exists.
+    """
+    client = RecordingClient()
+    adapter = AnthropicAgentSdkAdapter()
+    ctx = context_for(adapter.name(), client)
+    adapter.install(client, ctx)
+    try:
+        keys = []
+        for _ in range(3):
+            unit = ctx._open(
+                UnitKind.CALL,
+                intent=SpanIntent.EXECUTE_TOOL,
+                placement=Placement.NESTED,
+                subject="t",
+                selector=None,
+                aliases=(),
+                start_ns=None,
+            )
+            keys.append(unit.key)
+        assert len({k.value for k in keys}) == 3, keys
+        assert {k.namespace for k in keys} == {f"adapters.{adapter.name()}"}
+    finally:
+        adapter.uninstall()

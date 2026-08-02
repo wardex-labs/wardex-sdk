@@ -50,6 +50,29 @@ All notable changes to this project are documented here. The format follows
   own home as the tool's `call_id`.
 
 ### Fixed
+- **Nothing that can raise is left outside a failure boundary in the tool
+  wrapper.** Two places in a `with ctx.enter(...)` statement are not contained
+  and neither is obvious. Every argument in the HEADER is evaluated before the
+  block is entered, so a framework attribute read there breaks the host exactly
+  as one in the body would and no guard wardex can add will ever see it; the
+  BODY is unguarded on purpose, because a guard there would swallow the host's
+  own exception and report a failing tool call as a successful one.
+
+  The one header that existed built a selector out of a framework read, an
+  f-string and a counter. It is gone: a site that names no selector now gets a
+  unique one the context mints for itself — which is also a better key, since
+  the shared one it replaces had every anonymous unit in the process rebinding
+  a single alias slot. And `_tool_input`, which runs in the body on the HOST's
+  own return value, is total rather than catching what `json.dumps` documents:
+  a container whose `items()` raises is not a `TypeError`, and the host was
+  losing its result over a span attribute nobody would have missed.
+
+  Both are now shape rules rather than care taken. `test_import_graph.py`
+  refuses a header that is anything but names, literals, enum members and a
+  `partial` of a name, and a body that is anything but the host's own call and
+  verbs on the scope — because neither is a property any other check can see: a
+  call-graph rule cannot see an attribute read, and there is no runtime moment
+  at which "this expression was in a header" is observable.
 - **A run wardex failed to open no longer silences everything inside it.** Under
   `capture_mode=AGENT` — the default — traffic is captured when a local wardex
   span was ambient at the moment the work was issued. A run entry that could not
