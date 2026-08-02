@@ -7,3 +7,24 @@ lint:
 breaking:
   use:
     - FILE
+  # ONE-SHOT, and the follow-up PR that deletes this block is not optional.
+  #
+  # `CaptureIntegrity.limitations` (tag 8) and `CorrelationInfo.strategy`
+  # (tag 6) are being retired for typed replacements. Without this block
+  # `buf breaking` fails with exactly two FIELD_NO_DELETE lines — turning that
+  # red off by hand is the mechanical evidence that the break was intended
+  # rather than missed.
+  #
+  # It is free precisely once: no wardex envelope has ever left a user process
+  # (the only network egress is OTLP, which never reads these two fields), so
+  # there are zero deployed consumers. Anyone citing this block to justify a
+  # SECOND break must first re-measure that claim against the code of that day.
+  #
+  # The path is relative to the directory holding this file, not to the module
+  # root — `wardex/v1/span.proto` silently matches nothing.
+  #
+  # Leaving it in place would disable FIELD_NO_DELETE for all of span.proto
+  # forever, which is a far larger hole than the one it was opened for.
+  ignore_only:
+    FIELD_NO_DELETE:
+      - proto/wardex/v1/span.proto

@@ -1,7 +1,13 @@
 """Plaintext raw-socket interceptor — monkeypatches socket.socket.
 
-Tracks only HTTP via a method sniff-latch, hard-excludes link-local addresses,
-and emits LLM-only (+ allowlist). Reuses the existing _Http1Tracker/_WebSocketTracker.
+Tracks only HTTP via a method sniff-latch. What it captures is not this seam's
+decision: it contributes a `Prefilter` about the CONNECTION — link-local
+addresses (cloud metadata) are hard-excluded whatever the mode says, an
+explicit `intercept_hosts` match bypasses the mode — and everything else defers
+to the one shared policy in `assembly._policy`, the same rule the TLS seam
+answers to. Under the `agent` default that is LLM-semantic traffic plus
+anything issued inside a live local wardex span; under `all` it is everything.
+Reuses the existing _Http1Tracker/_WebSocketTracker.
 h2c and uvloop async are not supported.
 SSLSocket is a subclass of socket.socket but implements its own send/recv, so
 this patch does not double-capture TLS application data (regression-safe).
@@ -14,8 +20,9 @@ import socket
 from typing import TYPE_CHECKING, Any
 
 from .._enums import CaptureSource
+from ..assembly import Limitation, Prefilter
 from ._conn_timing import install_shared_timing, shared_timing_store, uninstall_shared_timing
-from ._seam import ByteSeamInterceptor, _ConnectionState, _has_core_semantics
+from ._seam import ByteSeamInterceptor, _ConnectionState
 from ._trackers import _Http1Tracker, _Http2Tracker
 
 if TYPE_CHECKING:
@@ -59,28 +66,29 @@ class RawSocketInterceptor(ByteSeamInterceptor):
             return
         self._client = client
         self._load_limits(client)
-        # base _patch uses the key f"{cls.__name__}.{meth}".
-        # socket.socket.__name__ == "socket" → keys become "socket.send", etc.
-        self._patch(socket.socket, "send", self._mk_send("send"))
-        self._patch(socket.socket, "sendall", self._mk_sendall())
-        self._patch(socket.socket, "recv", self._mk_recv("recv"))
-        self._patch(socket.socket, "recv_into", self._mk_recv_into())
+        self._patches = self._fresh_patchset()
+        # Each wrapper closes over the original it replaces, rather than looking
+        # it up per call in a dict the uninstall clears — that dict is how a
+        # wrapper another library still holds raised `KeyError` into the host
+        # after `uninstall()`.
+        sock = socket.socket
+        self._patches.patch(sock, "send", self._mk_send(sock.send))
+        self._patches.patch(sock, "sendall", self._mk_sendall(sock.sendall))
+        self._patches.patch(sock, "recv", self._mk_recv(sock.recv))
+        self._patches.patch(sock, "recv_into", self._mk_recv_into(sock.recv_into))
         install_shared_timing(self._limits["max_connections"])
         self._installed = True
 
     def uninstall(self) -> None:
         if not self._installed:
             return
-        for key, fn in self._orig.items():
-            _, meth = key.split(".", 1)
-            setattr(socket.socket, meth, fn)
-        self._orig.clear()
+        self._patches.restore_all()
         uninstall_shared_timing()
         from ._trackers import _WebSocketTracker
 
         for st in list(self._conns.values()):
             if isinstance(st.tracker, _WebSocketTracker):
-                for txn in st.tracker.flush("ws_no_close"):
+                for txn in st.tracker.flush(Limitation.WS_NO_CLOSE):
                     self._emit_ws(st, txn)
         self._conns.clear()
         self._installed = False
@@ -99,7 +107,7 @@ class RawSocketInterceptor(ByteSeamInterceptor):
 
     def _resolve_timing(
         self, obj: Any, st: _ConnectionState
-    ) -> tuple[float, float, bool, tuple[str, ...]]:
+    ) -> tuple[float, float, bool, tuple[Limitation, ...]]:
         if st.timing_consumed:
             return (0.0, 0.0, True, ())
         st.timing_consumed = True
@@ -109,7 +117,7 @@ class RawSocketInterceptor(ByteSeamInterceptor):
             popped = None
         if popped is not None:
             return (popped[0], 0.0, False, ())  # plaintext: no TLS handshake
-        return (0.0, 0.0, False, ("connect_timing_unavailable",))
+        return (0.0, 0.0, False, (Limitation.CONNECT_TIMING_UNAVAILABLE,))
 
     def _gate(self, st: _ConnectionState, data: bytes, phase: str) -> bool:
         """Sniff-latch: determine the protocol from the first request bytes; never re-decided.
@@ -133,20 +141,34 @@ class RawSocketInterceptor(ByteSeamInterceptor):
                 st.gate = "ignore"  # non-HTTP protocols such as Redis, Memcached, etc.
         return st.gate in ("http", "h2c")
 
-    def _should_capture(self, st: _ConnectionState, txn: Any, sem: Any) -> bool:
-        # Deliberate decision: an explicit `intercept_hosts` allowlist match bypasses
-        # the 4c `capture_mode` policy gate (which normally requires an active local
-        # span for non-LLM-semantic traffic — see _seam.py._emit_span). The user
-        # naming a plaintext host here is a stronger, more specific opt-in than the
-        # global capture_mode default; composing both gates would silently drop
-        # traffic the user explicitly asked to capture. This only applies to hosts
-        # the user listed by hand — it does not widen capture_mode=AGENT for anyone
-        # else.
+    def _transport_prefilter(self, st: _ConnectionState) -> Prefilter:
+        """What this seam knows about the PEER, and nothing beyond it.
+
+        Two opinions, both about the connection rather than the traffic on it:
+
+        DENY — link-local (cloud metadata endpoints). Never captured, whatever
+        the mode says, because the bodies carry instance credentials.
+
+        ALLOW — an explicit `intercept_hosts` match. The user naming a
+        plaintext host by hand is a stronger, more specific opt-in than the
+        global `capture_mode` default, so it stays a bypass rather than
+        composing; composing it would silently drop traffic the user asked for
+        by name. This only ever applies to hosts listed by hand.
+
+        Everything else DEFERs, and that is the change. This method used to be
+        `_should_capture`, overriding the base outright, which meant the
+        plaintext seam re-implemented the LLM-semantics clause (fine) and
+        silently dropped BOTH of the other two: `capture_mode=ALL` did nothing
+        here, and a plaintext request issued inside a live wardex span was
+        dropped while the identical request over TLS was captured. Deferring
+        gives the shared policy back both clauses without giving up either
+        opinion above.
+        """
         if _is_link_local(st.server_address):
-            return False
-        if sem is not None and _has_core_semantics(sem):
-            return True
-        return self._in_allow(st)  # the allowlist is populated in Task 4
+            return Prefilter.DENY
+        if self._in_allow(st):
+            return Prefilter.ALLOW
+        return Prefilter.DEFER
 
     def _in_allow(self, st: _ConnectionState) -> bool:
         if not self._allow:
@@ -156,13 +178,10 @@ class RawSocketInterceptor(ByteSeamInterceptor):
             or f"{st.server_address}:{st.server_port}" in self._allow
         )
 
-    # --- socket.socket wrappers (base_patch key = "socket.<meth>") ---
+    # --- socket.socket wrappers ---
 
-    def _mk_send(self, meth: str):  # noqa: ANN202
-        key = f"socket.{meth}"
-
+    def _mk_send(self, real: Any):  # noqa: ANN202
         def wrapper(this: Any, data: Any, *args: Any, **kwargs: Any) -> Any:
-            real = self._orig[key]
             ret = real(this, data, *args, **kwargs)
             try:
                 sent = bytes(data)[:ret] if isinstance(ret, int) else data
@@ -173,9 +192,8 @@ class RawSocketInterceptor(ByteSeamInterceptor):
 
         return wrapper
 
-    def _mk_sendall(self):  # noqa: ANN202
+    def _mk_sendall(self, real: Any):  # noqa: ANN202
         def wrapper(this: Any, data: Any, *args: Any, **kwargs: Any) -> Any:
-            real = self._orig["socket.sendall"]
             ret = real(this, data, *args, **kwargs)
             try:
                 self._on_request_bytes(this, bytes(data))
@@ -185,11 +203,8 @@ class RawSocketInterceptor(ByteSeamInterceptor):
 
         return wrapper
 
-    def _mk_recv(self, meth: str):  # noqa: ANN202
-        key = f"socket.{meth}"
-
+    def _mk_recv(self, real: Any):  # noqa: ANN202
         def wrapper(this: Any, *args: Any, **kwargs: Any) -> Any:
-            real = self._orig[key]
             ret = real(this, *args, **kwargs)
             try:
                 if isinstance(ret, (bytes, bytearray)) and ret:
@@ -200,9 +215,8 @@ class RawSocketInterceptor(ByteSeamInterceptor):
 
         return wrapper
 
-    def _mk_recv_into(self):  # noqa: ANN202
+    def _mk_recv_into(self, real: Any):  # noqa: ANN202
         def wrapper(this: Any, buffer: Any, *args: Any, **kwargs: Any) -> int:
-            real = self._orig["socket.recv_into"]
             n = real(this, buffer, *args, **kwargs)
             try:
                 if n:

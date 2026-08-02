@@ -62,6 +62,54 @@ pub struct Limits {
     /// Maximum entries in each per-session tracking map (open tools, streamed
     /// tool metadata, subagents).
     pub max_session_entries: usize,
+    /// Maximum concurrently tracked *root* logical units.
+    ///
+    /// Deliberately not a flat cap over units of every kind. Children are
+    /// bounded per-unit by `max_entries_per_unit`, and a flat ceiling at N
+    /// would make "evict the oldest" pick a long-lived session root nearly
+    /// every time, so one chatty session would evict *other* sessions' roots
+    /// almost immediately. Scoping it to roots is what makes N read as a
+    /// concurrency ceiling: N concurrent runs.
+    ///
+    /// It is not, however, the ONLY thing that evicts a root. A registry also
+    /// holds a derived ceiling over live units of every kind — the product of
+    /// this bound and `max_entries_per_unit` — and reaching that evicts roots
+    /// too. A run nested deeply enough inside itself can therefore still cost
+    /// another run its root. The scoping raises the price of that enormously;
+    /// it does not make it unreachable.
+    ///
+    /// Read by the logical-unit registry. Crossing it CLOSES the oldest root
+    /// so its span is emitted carrying `unit_evicted`: a ceiling that dropped
+    /// state silently would be a worse failure than an unenforced one.
+    pub max_units: usize,
+    /// Maximum entries in each per-unit table (child units, lookup aliases,
+    /// de-duplication keys, open span drafts). Generalizes
+    /// `max_session_entries` to units of every kind; same order, same
+    /// semantics. Host SDKs also reuse it for adapter-side bookkeeping of the
+    /// same order — in the Python SDK, the table of wrapped in-process MCP
+    /// servers — so lowering it shrinks more than the four tables named above.
+    ///
+    /// Only two of those four tables hold entries that OWN a span, and only
+    /// those two evictions reach the wire. Crossing the bound on child units or
+    /// on open span drafts force-closes the oldest entry and emits its span
+    /// with `child_span_unclosed`, for the same reason as `max_units`. Crossing
+    /// it on lookup aliases or de-duplication keys emits nothing — there is no
+    /// span to mark — and is recorded only in the host SDK's internal counters
+    /// (`assembly._units.alias_table_full`, `assembly._units.claim_table_full`,
+    /// `adapters.anthropic.server_table_full` in the Python SDK).
+    ///
+    /// What surfaces from a silent eviction is a consequence, and the alias one
+    /// is worth stating precisely because it can look like an IMPROVEMENT. An
+    /// alias edge is `unit_alias` at `0.9`; losing the alias does not simply
+    /// lower that. It sends the resolver back down its ladder, and if the task
+    /// carries an ambient span the ladder stops at `contextvar` — confidence
+    /// `1.0`, no marker — which for a sub-agent means its subtree silently
+    /// flattens into the enclosing session. Only when there is no ambient span
+    /// at all does it reach `unit_inferred_sole` (`0.5`) or `parent_unresolved`
+    /// (`0.0`). An evicted de-duplication key can let one logical call be
+    /// observed twice, and an evicted server handle degrades a hook's tool-name
+    /// lookup to the builtin key space, which can do the same.
+    pub max_entries_per_unit: usize,
     /// Bytes read before giving up on detecting JSON-RPC over a stdio stream.
     pub mcp_sniff_bytes: usize,
     /// Maximum spans buffered before the oldest are dropped.
@@ -99,6 +147,8 @@ impl Default for Limits {
             max_connections: 4096,
             max_sessions: 512,
             max_session_entries: 256,
+            max_units: 512,
+            max_entries_per_unit: 256,
             mcp_sniff_bytes: 8192,
             max_buffer_spans: 2048,
             max_buffer_bytes: 64 * 1024 * 1024,
@@ -126,6 +176,8 @@ mod tests {
         assert_eq!(l.max_connections, 4096);
         assert_eq!(l.max_sessions, 512);
         assert_eq!(l.max_session_entries, 256);
+        assert_eq!(l.max_units, 512);
+        assert_eq!(l.max_entries_per_unit, 256);
         assert_eq!(l.mcp_sniff_bytes, 8192);
         assert_eq!(l.max_buffer_spans, 2048);
         assert_eq!(l.max_buffer_bytes, 64 * 1024 * 1024);

@@ -5,8 +5,11 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING
 
+from ..assembly import Limitation
+
 if TYPE_CHECKING:
     from .._client import Client
+    from ._context import AdapterContext
 
 
 class AdapterInterface(ABC):
@@ -20,7 +23,25 @@ class AdapterInterface(ABC):
     def name(self) -> str: ...
 
     @abstractmethod
-    def install(self, client: Client | None) -> None: ...
+    def install(self, client: Client | None, ctx: AdapterContext | None = None) -> None:
+        """Patch the framework's surface.
+
+        `ctx` is the contract an adapter is moving onto — see
+        `adapters/_context.py`. It is optional while adapters migrate one at a
+        time; an adapter that ignores it keeps today's behaviour exactly.
+        """
+        ...
 
     @abstractmethod
     def uninstall(self) -> None: ...
+
+    def close_units(self, *, marker: Limitation) -> None:
+        """Close whatever spans are still open, but stay installed.
+
+        Concrete and not abstract, deliberately. This exists for the shutdown
+        signal path, which most adapters have nothing to answer for — an
+        adapter that holds no open span across calls is already correct doing
+        nothing. Making it abstract would break every out-of-tree adapter to
+        force them all to write the same empty body.
+        """
+        return None

@@ -1,7 +1,7 @@
 """OTLP/HTTP exporter — InternalEnvelope → OTLP protobuf → synchronous POST.
 
-Synchronous POST-on-flush. _send_batch is a batching-ready isolated unit (reused by
-the Slice C worker).
+Synchronous POST-on-flush: `export()` delegates to `_send_batch`, the single POST
+path that a manual `flush()` and the background batch worker both reach.
 Network errors are fail-silent (an observability SDK must never crash the app) + debug log.
 """
 

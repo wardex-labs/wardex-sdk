@@ -1,3 +1,4 @@
+from wardex_sdk.assembly import Limitation
 from wardex_sdk.interceptors._trackers import _WebSocketTracker
 
 
@@ -28,15 +29,18 @@ def test_close_emits_span_with_counts_and_sample():
     assert txn.ws_messages_received == 1
     assert b"hello" in txn.request_body
     assert txn.response_body == b"world"
-    assert "ws_no_close" not in txn.ws_markers
+    assert Limitation.WS_NO_CLOSE not in txn.ws_markers
 
 
 def test_flush_emits_with_no_close_marker():
     t = _WebSocketTracker(path="/x", deflate=True, parent=None, start_ns=1)
     t.on_request_bytes(_frame(True, 0x1, b"hi"))
-    out = t.flush("ws_no_close")
+    # `ws_markers` carries Limitation MEMBERS, not free strings:
+    # the tracker is where `ws_compressed` and `ws_parse_failed` were produced,
+    # and both are pre-rename spellings that SpanDraft.finish() would reject.
+    out = t.flush(Limitation.WS_NO_CLOSE)
     assert len(out) == 1
-    assert "ws_no_close" in out[0].ws_markers
-    assert "ws_compressed" in out[0].ws_markers  # deflate=True
+    assert Limitation.WS_NO_CLOSE in out[0].ws_markers
+    assert Limitation.PAYLOAD_COMPRESSED in out[0].ws_markers  # deflate=True
     # the second flush returns an empty list (no duplicate emission)
-    assert t.flush("ws_no_close") == []
+    assert t.flush(Limitation.WS_NO_CLOSE) == []

@@ -3,6 +3,7 @@ import pytest
 import wardex_sdk as wardex
 from wardex_sdk import _hub
 from wardex_sdk._enums import CaptureMode, SpanKind
+from wardex_sdk.assembly import Limitation
 
 
 @pytest.fixture(autouse=True)
@@ -97,7 +98,7 @@ def test_no_close_flushes_on_uninstall_with_marker():
 
     spans = _ws_spans()
     assert len(spans) == 1
-    assert "ws_no_close" in spans[0].capture_integrity.limitations
+    assert Limitation.WS_NO_CLOSE in spans[0].capture_integrity.limitations
 
 
 def test_deflate_negotiation_marks_compressed():
@@ -121,7 +122,10 @@ def test_deflate_negotiation_marks_compressed():
     interceptor._on_response_bytes(obj, _frame(True, 0x8, (1000).to_bytes(2, "big")))
     spans = _ws_spans()
     assert len(spans) == 1
-    assert "ws_compressed" in spans[0].capture_integrity.limitations
+    # Census merge (design §6.5.1): `ws_compressed` and `grpc_compressed` folded
+    # into PAYLOAD_COMPRESSED; TransportAttributes.protocol already carries
+    # which protocol it was.
+    assert Limitation.PAYLOAD_COMPRESSED in spans[0].capture_integrity.limitations
 
 
 def test_client_close_error_code_maps_error_status():
@@ -190,4 +194,4 @@ def test_close_flushes_ws_span_to_transport():
         if s.kind == SpanKind.CLIENT and (s.name or "").startswith("WS ")
     ]
     assert len(ws_spans) == 1
-    assert "ws_no_close" in ws_spans[0].capture_integrity.limitations
+    assert Limitation.WS_NO_CLOSE in ws_spans[0].capture_integrity.limitations

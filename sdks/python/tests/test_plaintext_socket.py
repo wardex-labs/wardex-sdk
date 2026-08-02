@@ -5,11 +5,18 @@ from __future__ import annotations
 import http.client
 import http.server
 import json
+import socket
 import threading
 
 import wardex_sdk as wardex
 from wardex_sdk import ConsoleTransport, _hub
 from wardex_sdk._enums import CaptureSource, SpanKind
+from wardex_sdk.interceptors._socket import RawSocketInterceptor
+
+# The four `socket.socket` methods this seam patches. All four are INHERITED
+# from the C base `_socket.socket` — `socket.socket` does not define them — and
+# that is what the restore assertions below turn on.
+_PATCHED = ("send", "sendall", "recv", "recv_into")
 
 _LLM_RESP = json.dumps(
     {
@@ -52,6 +59,49 @@ def _post(host: str, port: int, body: bytes, path: str = "/v1/chat/completions")
     conn.request("POST", path, body, {})
     conn.getresponse().read()
     conn.close()
+
+
+def test_uninstall_leaves_no_trace_on_socket_socket():
+    """The seam's restore, which nothing checked.
+
+    Deleting `self._patches.restore_all()` from `RawSocketInterceptor.uninstall`
+    left the whole suite green: wardex could leave `socket.socket.send`,
+    `sendall`, `recv` and `recv_into` patched for the life of the process, in a
+    class every network library in it reaches through, and no test noticed. The
+    ssl, connection-timing and Agent SDK seams all had an equivalent check;
+    this one did not.
+
+    The assertion is on the OWN-attribute namespace, not on identity, because
+    identity cannot see the second half of the bug. All four names are
+    inherited from `_socket.socket`, so a restore written as
+    `setattr(socket.socket, "send", original)` — which is what this seam did
+    before `PatchSet` — passes `socket.socket.send is original` while leaving a
+    permanent own-attribute shadow: `socket.socket` now carries a frozen copy
+    of whatever the C base held at install time, and any later change to the
+    base stops reaching it. Nothing is installed, and nothing is visible.
+    `"send" not in socket.socket.__dict__` is the only assertion that fails on
+    both the missing restore and the shadow.
+    """
+    for name in _PATCHED:
+        assert name not in socket.socket.__dict__, f"precondition: {name} is inherited"
+    inherited = {name: getattr(socket.socket, name) for name in _PATCHED}
+
+    itc = RawSocketInterceptor()
+    try:
+        itc.install(None)
+        for name in _PATCHED:
+            assert name in socket.socket.__dict__, f"precondition: {name} is patched"
+            assert getattr(socket.socket, name) is not inherited[name]
+    finally:
+        itc.uninstall()
+
+    for name in _PATCHED:
+        assert name not in socket.socket.__dict__, (
+            f"socket.socket.{name} is still an own attribute after uninstall — "
+            "wardex either never restored it, or restored it as a shadow over "
+            "the inherited method"
+        )
+        assert getattr(socket.socket, name) is inherited[name]
 
 
 def test_plaintext_llm_call_captured():

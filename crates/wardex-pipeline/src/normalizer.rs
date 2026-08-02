@@ -1,1 +1,1 @@
-//! Implemented in Phase 3.
+//! Placeholder — span normalization is not implemented in the core yet.

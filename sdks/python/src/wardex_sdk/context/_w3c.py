@@ -1,9 +1,21 @@
 """W3C Trace Context (traceparent) parse/format — pure functions, no SDK state.
 
-Level 1 (https://www.w3.org/TR/trace-context/): we emit version 00 with
-sampled=01 always (wardex does not head-sample; retention is decided later
-by the RetentionClassifier). Unknown versions are parsed leniently from the
+Level 1 (https://www.w3.org/TR/trace-context/): we emit version 00 and the
+context's own `trace_flags`. Unknown versions are parsed leniently from the
 known prefix; version ff and all-zero ids are rejected.
+
+The always-sampled invariant did not go away, it MOVED (design §4.1, V9). It
+used to live here as a hardcoded `-01`, which meant an upstream that told us
+`-00` was silently promoted to `-01` downstream. It now lives at the source:
+`assembly/_parentage.resolve_parentage()` stamps `trace_flags=1` on the branch
+that has no parent, because wardex does not head-sample — retention is decided
+later by the RetentionClassifier — so a trace wardex ORIGINATES is by definition
+sampled. Only once origination says 1 does a `0` arriving here unambiguously
+mean "an upstream told us -00", which is the one reading that makes honouring it
+correct. The two changes are inseparable: formatting `trace_flags` without
+stamping 1 at the source would emit `-00` for every wardex-rooted trace and
+silence every downstream OTel service on the default ParentBased(ALWAYS_ON)
+sampler.
 """
 
 from __future__ import annotations
@@ -38,4 +50,4 @@ def parse_traceparent(value: str) -> tuple[TraceId, SpanId, int] | None:
 
 
 def format_traceparent(ctx: SpanContext) -> str:
-    return f"00-{ctx.trace_id.hex()}-{ctx.span_id.hex()}-01"
+    return f"00-{ctx.trace_id.hex()}-{ctx.span_id.hex()}-{ctx.trace_flags & 0xFF:02x}"

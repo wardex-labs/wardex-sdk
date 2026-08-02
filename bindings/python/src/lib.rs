@@ -563,6 +563,11 @@ impl ClaudeStreamEvent {
         self.inner.stop_reason.clone()
     }
     #[getter]
+    fn tool_result_id(&self) -> Option<String> {
+        self.inner.tool_result_id.clone()
+    }
+
+    #[getter]
     fn parent_tool_use_id(&self) -> Option<String> {
         self.inner.parent_tool_use_id.clone()
     }

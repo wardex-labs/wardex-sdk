@@ -1,9 +1,10 @@
 """RFC 8785 JSON Canonicalization Scheme (JCS) + SHA-256.
 
-This normalization rule is the contract that the Phase 7 Rust codec must reproduce
-byte-for-byte. Limitation: ECMAScript Number→String exponential notation (very
-large/small values) is not implemented — only accurate for the practical decimal
-range (LLM parameters). Strengthen with a ryu-based approach in Phase 7 if needed.
+This normalization rule is the contract any reimplementation in the Rust core must
+reproduce byte-for-byte. Limitation: ECMAScript Number→String exponential notation
+(very large/small values) is not implemented — only accurate for the practical
+decimal range (LLM parameters). A ryu-based approach would close that gap if the
+extreme range ever reaches this function.
 """
 
 from __future__ import annotations

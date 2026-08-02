@@ -1,4 +1,4 @@
-//! Phase 0 smoke: verify build.rs generates the proto and prost round-trips it.
+//! Smoke test: verify build.rs generates the proto and prost round-trips it.
 
 use prost::Message;
 use wardex_codec::proto::wardex::v1::{Envelope, TransportAttributes};

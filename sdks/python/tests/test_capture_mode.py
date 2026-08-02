@@ -32,7 +32,7 @@ class _Seam(ByteSeamInterceptor):
     def name(self):
         return "test-seam"
 
-    def install(self, client):
+    def install(self, client, ctx=None):
         self._client = client
 
     def uninstall(self):
@@ -59,7 +59,7 @@ REMOTE = _ctx(remote=True)
 @pytest.fixture(autouse=True)
 def _llm_semantics_by_marker(monkeypatch):
     """sem=='LLM' stands for parsed core semantics; anything else is generic."""
-    monkeypatch.setattr(_seam, "_has_core_semantics", lambda sem: sem == "LLM")
+    monkeypatch.setattr(_seam, "has_core_semantics", lambda sem: sem == "LLM")
 
 
 @pytest.mark.parametrize(

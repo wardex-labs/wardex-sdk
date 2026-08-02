@@ -436,7 +436,8 @@ fn fill_openai_input(out: &mut LlmSemantics, messages: &[serde_json::Value]) {
     out.input_messages = build_input_messages(msgs);
 }
 
-/// OpenAI message content (string | array) → part list. Media is extended in Task 2.
+/// OpenAI message content (string | array) → part list. Handles the media blocks
+/// alongside text: `image_url`, `input_audio` and `file`.
 fn openai_content_to_parts(
     content: Option<&serde_json::Value>,
     out: &mut LlmSemantics,
@@ -1317,7 +1318,7 @@ mod tests {
         assert_eq!(s.max_tokens, Some(64));
         assert_eq!(s.choice_count, Some(2));
         assert_eq!(s.stop_sequences.as_deref(), Some(&["END".to_string()][..]));
-        // decompression is Task 3 — for now this is just a copy of the original
+        // this body is not compressed, so `decode_body` passes the original through
         assert_eq!(s.decoded_response.as_deref(), Some(OPENAI_CHAT));
     }
 
@@ -1843,7 +1844,7 @@ mod tests {
         assert_eq!(ov[0]["parts"][0], av[0]["parts"][0]);
     }
 
-    // --- Task 3: SSE tool_call delta accumulation ---
+    // --- SSE tool_call delta accumulation ---
 
     fn sse_bytes(lines: &[&str]) -> Vec<u8> {
         lines
@@ -1997,7 +1998,7 @@ mod tests {
         assert_eq!(v[1]["finish_reason"], "tool_call");
     }
 
-    // --- Task 4: Anthropic SSE tool_use reassembly ---
+    // --- Anthropic SSE tool_use reassembly ---
 
     #[test]
     fn anthropic_sse_reassembles_tool_use() {
@@ -2055,7 +2056,7 @@ mod tests {
         assert_eq!(parts[1]["content"], "answer");
     }
 
-    // --- Task 1: OpenAI input message parsing ---
+    // --- OpenAI input message parsing ---
 
     const OPENAI_REQ_MESSAGES: &[u8] = r#"{
         "model":"gpt-4o",
@@ -2177,7 +2178,7 @@ mod tests {
         assert!(!s.input_messages_has_unmapped);
     }
 
-    // --- Task 2: OpenAI input media parsing ---
+    // --- OpenAI input media parsing ---
 
     #[test]
     fn openai_image_url_data_uri_to_blob_part() {
@@ -2269,7 +2270,7 @@ mod tests {
         assert_eq!(p["file_id"], "file-abc");
     }
 
-    // --- Task 3: Anthropic input message parsing ---
+    // --- Anthropic input message parsing ---
 
     const ANTHROPIC_RESP_MIN: &[u8] =
         br#"{"id":"msg_1","model":"claude-3-5-sonnet","stop_reason":"end_turn","content":[]}"#;
@@ -2379,7 +2380,7 @@ mod tests {
         assert_eq!(p["uri"], "https://example.com/a.jpg");
     }
 
-    // --- Task 4: OpenAI output audio BlobPart ---
+    // --- OpenAI output audio BlobPart ---
 
     #[test]
     fn openai_output_audio_to_blob_part() {
@@ -2440,7 +2441,7 @@ mod tests {
         );
     }
 
-    // --- Task 5: Anthropic server_tool SSE reassembly ---
+    // --- Anthropic server_tool SSE reassembly ---
 
     // b"..." byte literals are ASCII-only → since this contains Korean text (weather), str::as_bytes() is used instead.
     const ANTHROPIC_SSE_SERVER_TOOL: &[u8] = concat!(

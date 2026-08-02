@@ -1,6 +1,7 @@
 //! Wardex pipeline — Normalizer, Sampler, PII regex.
 //!
-//! Phase 0 scaffold.
+//! Only `pii` carries an implementation; `normalizer` and `sampler` are named
+//! placeholders that reserve the module path.
 
 pub mod normalizer;
 pub mod pii;

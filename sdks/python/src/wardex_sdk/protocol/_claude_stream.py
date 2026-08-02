@@ -15,6 +15,9 @@ class AgentStreamEvent:
     message_id: str | None = None
     stop_reason: str | None = None
     parent_tool_use_id: str | None = None
+    #: Which CALL a `tool_result` answers, never which sub-agent produced the
+    #: line. One CLI line carries both and they are different questions.
+    tool_result_id: str | None = None
     subtype: str | None = None
     task_id: str | None = None
     task_status: str | None = None
@@ -43,6 +46,7 @@ def parse_line(data: bytes, outbound: bool) -> AgentStreamEvent | None:
         message_id=raw.message_id,
         stop_reason=raw.stop_reason,
         parent_tool_use_id=raw.parent_tool_use_id,
+        tool_result_id=raw.tool_result_id,
         subtype=raw.subtype,
         task_id=raw.task_id,
         task_status=raw.task_status,

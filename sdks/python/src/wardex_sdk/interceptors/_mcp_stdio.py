@@ -1,8 +1,8 @@
 """MCP stdio (JSON-RPC 2.0) interceptor — correlation core.
 
 Parses subprocess stdin (request) / stdout (response) bytes as JSON-RPC and correlates
-them by id to assemble CLIENT spans. Hooking (the anyio patch) lives in the interceptor
-class in the same file (Task 4).
+them by id to assemble CLIENT spans. Hooking (the anyio patch) lives in
+`McpStdioInterceptor`, further down this same file.
 """
 
 from __future__ import annotations
@@ -17,25 +17,32 @@ from typing import TYPE_CHECKING, Any
 
 import anyio._backends._asyncio as _aio_backend
 
-from .. import _hub, _wardex_native
+from .. import _wardex_native
 from .._enums import (
+    CaptureMode,
     CaptureSource,
     Direction,
     Protocol,
-    SpanKind,
     StatusCode,
+    ToolExecutionType,
 )
 from .._types import (
-    CaptureIntegrity,
-    CorrelationInfo,
     InternalSpan,
     McpMeta,
-    SpanContext,
-    SpanId,
     ToolAttributes,
-    TraceId,
     TransportAttributes,
     TransportTiming,
+)
+from ..assembly import (
+    Ambient,
+    PatchSet,
+    SpanDraft,
+    TransportLabel,
+    capture_mode_of,
+    guard,
+    latch_ambient,
+    resolve_observed,
+    should_capture,
 )
 from ..protocol import JsonRpcParser
 from ._base import InterceptorInterface
@@ -57,7 +64,7 @@ class _Pending:
     method: str
     params: bytes
     start_ns: int
-    parent: SpanContext | None
+    ambient: Ambient
 
 
 class _ProcState:
@@ -70,8 +77,24 @@ class _ProcState:
     # at install() time.
     SNIFF_LIMIT = _wardex_native.limits_defaults()["mcp_sniff_bytes"]
 
-    def __init__(self, sniff_limit: int | None = None, limits: object | None = None) -> None:
+    def __init__(
+        self,
+        sniff_limit: int | None = None,
+        limits: object | None = None,
+        mode: CaptureMode = CaptureMode.ALL,
+        debug: bool = False,
+    ) -> None:
         self._sniff_limit = sniff_limit if sniff_limit is not None else self.SNIFF_LIMIT
+        # The configured capture policy, resolved once at wrap time the way
+        # `_sniff_limit` and the native limits already are (config is frozen
+        # after init). `ALL` is the default for the same reason
+        # `assembly.capture_mode_of(None)` returns it: a state built without a
+        # client has no policy to apply, and an unconfigured wardex filters
+        # nothing.
+        self._mode = mode
+        # Only reaches `guard()`: a swallowed span-assembly failure is always
+        # counted, and under debug it is also logged with a traceback.
+        self._debug = debug
         self._req = JsonRpcParser(limits)
         self._resp = JsonRpcParser(limits)
         self._latch: dict[str, _Pending] = {}
@@ -91,12 +114,14 @@ class _ProcState:
             if m.kind in ("request", "response", "notification"):
                 self._msgs += 1
             if m.kind == "request" and m.id is not None:
-                parent = _hub.get_current_scope().active_span_context
+                # Latched on the stdin-write path — the task that ISSUED the
+                # request. The response arrives on the subprocess reader, whose
+                # scope says nothing about who asked (design §4.1).
                 self._latch[m.id] = _Pending(
                     method=m.method or "?",
                     params=m.params or b"",
                     start_ns=time.time_ns(),
-                    parent=parent,
+                    ambient=latch_ambient(),
                 )
             if len(self._latch) > 4096:  # leak-defense cap
                 self._latch.pop(next(iter(self._latch)))
@@ -109,7 +134,24 @@ class _ProcState:
             pending = self._latch.pop(m.id, None)
             if pending is None:
                 continue
-            out.append(_build_mcp_span(pending, m))
+            # The gate this path never had. `agent_semantic=True` is the claim
+            # the site makes about itself and it is the whole reason MCP stdio
+            # survives `capture_mode=AGENT`: a JSON-RPC tool call over a
+            # subprocess pipe is agent traffic or it is nothing. Stating it as
+            # an ARGUMENT rather than as the absence of a gate is the point —
+            # the answer now comes from the same predicate the byte seams ask,
+            # so a future mode cannot reach three sites and miss this one.
+            if not should_capture(
+                self._mode,
+                parent=pending.ambient.span_context,
+                agent_semantic=True,
+            ):
+                continue
+            span = None
+            with guard("interceptors.mcp_stdio.build_span", debug=self._debug):
+                span = _build_mcp_span(pending, m)
+            if span is not None:
+                out.append(span)
         return out
 
     def should_detach(self) -> bool:
@@ -119,26 +161,25 @@ class _ProcState:
 def _build_mcp_span(p: _Pending, resp: Any) -> InternalSpan:
     now = time.time_ns()
     method = p.method
-    if p.parent is not None:
-        trace_id = p.parent.trace_id
-        parent_span_id: SpanId | None = p.parent.span_id
-        correlation: CorrelationInfo | None = CorrelationInfo(
-            strategy="contextvar",
-            active_span_id_at_capture=p.parent.span_id,
-            confidence=1.0,
-        )
-    else:
-        trace_id = TraceId.generate()
-        parent_span_id = None
-        correlation = None
-
-    ctx = SpanContext(trace_id=trace_id, span_id=SpanId.generate())
+    # `resolve_observed`, not `resolve_parentage`: the gate above lets this
+    # traffic through on `agent_semantic=True` regardless, so a tool call
+    # issued inside a run wardex failed to open reaches this line with an
+    # empty ambient — and shipping it as a trace root would be one run
+    # arriving as several, indistinguishable from genuine ones.
+    parentage = resolve_observed(p.ambient)
     params_bytes = p.params
     result_bytes = resp.result if resp.result is not None else (resp.error or b"")
     input_data = params_bytes
     output_data = result_bytes
     tool: ToolAttributes | None = None
     status = StatusCode.ERROR if resp.error is not None else StatusCode.OK
+    # `SpanDraft.finish()` refuses `status=ERROR` without an `error_type`, and
+    # this span shipped exactly that pair until now — the same defect the
+    # adapter had. The JSON-RPC error object carries the answer
+    # (`{"code": -32601, ...}`), so the type is derived from it rather than
+    # invented; an unreadable error body degrades to the generic name instead of
+    # deleting the span.
+    error_type: str | None = _json_rpc_error_type(resp.error) if resp.error is not None else None
 
     if method == "tools/call":
         try:
@@ -146,7 +187,15 @@ def _build_mcp_span(p: _Pending, resp: Any) -> InternalSpan:
             if isinstance(params, dict):
                 name = params.get("name")
                 if name is not None:
-                    tool = ToolAttributes(name=str(name), call_id=resp.id)
+                    # IPC, not NETWORK. The default was a guess and it was
+                    # wrong: this tool ran behind a subprocess pipe, and design
+                    # §6.2 adds `IPC` precisely so the protocol detail stays an
+                    # attribute instead of becoming a parallel span vocabulary.
+                    tool = ToolAttributes(
+                        name=str(name),
+                        call_id=resp.id,
+                        execution_type=ToolExecutionType.IPC,
+                    )
                 args = params.get("arguments")
                 if args is not None:
                     input_data = json.dumps(args, ensure_ascii=False).encode("utf-8")
@@ -158,42 +207,65 @@ def _build_mcp_span(p: _Pending, resp: Any) -> InternalSpan:
                 if isinstance(result, dict):
                     if result.get("isError") is True:
                         status = StatusCode.ERROR
+                        error_type = "tool_error"
                     content = result.get("content")
                     if content is not None:
                         output_data = json.dumps(content, ensure_ascii=False).encode("utf-8")
             except Exception:  # noqa: BLE001
                 pass
 
-    timing = TransportTiming(ttfb_ms=max(0.0, (now - p.start_ns) / 1e6))
-    transport = TransportAttributes(
-        connection_id="",
-        protocol=Protocol.MCP_STDIO,
-        direction=Direction.OUTBOUND,
-        timing=timing,
-        request_size=len(params_bytes),
-        response_size=len(result_bytes),
-        mcp=McpMeta(rpc_method=method, rpc_id=resp.id),
+    # TRANSPORT mode: `MCP tools/call` reports the JSON-RPC method wardex
+    # observed on the pipe. Design §4.6's sketch names `EXECUTE_TOOL` here, but
+    # this seam sees every method — `initialize`, `ping`, `resources/read` — and
+    # calling a `ping` an `execute_tool` would be a vocabulary lie for the sake
+    # of a table row. The tool SEMANTICS are still attached when the method
+    # really is `tools/call`; promoting the span to the tool intent belongs with
+    # the work that routes this seam through `assembly.UnitRegistry`, which is
+    # what would also give the call its own parentage instead of the ambient.
+    draft = SpanDraft.transport(
+        parentage,
+        label=TransportLabel.MCP,
+        subject=method,
+        source=CaptureSource.STDIO,
+        start_ns=p.start_ns,
     )
-    integrity = CaptureIntegrity(
-        request_body_captured=True,
-        response_body_captured=True,
+    if tool is not None:
+        draft.set_tool(tool)
+    draft.set_transport(
+        TransportAttributes(
+            connection_id="",
+            protocol=Protocol.MCP_STDIO,
+            direction=Direction.OUTBOUND,
+            timing=TransportTiming(ttfb_ms=max(0.0, (now - p.start_ns) / 1e6)),
+            request_size=len(params_bytes),
+            response_size=len(result_bytes),
+            mcp=McpMeta(rpc_method=method, rpc_id=resp.id),
+        )
     )
-    return InternalSpan(
-        context=ctx,
-        parent_span_id=parent_span_id,
-        name=f"MCP {method}",
-        kind=SpanKind.CLIENT,
-        start_time_ns=p.start_ns,
-        end_time_ns=now,
-        status=status,
-        tool=tool,
-        transport=transport,
-        input_data=input_data,
-        output_data=output_data,
-        capture_sources=(CaptureSource.STDIO,),
-        capture_integrity=integrity,
-        correlation=correlation,
-    )
+    draft.set_status(status)
+    draft.set_error(error_type)
+    draft.set_io(input_data=input_data, output_data=output_data)
+    return draft.finish(now)
+
+
+def _json_rpc_error_type(error: bytes | None) -> str:
+    """`error.type` for a JSON-RPC failure, from the error object's own code.
+
+    JSON-RPC 2.0 fixes the meaning of the code, so `json_rpc_-32601` names the
+    failure precisely and groups the way a dashboard needs. Anything unparseable
+    falls back to the generic name: an `error.type` that is merely coarse is
+    still infinitely better than the `status=ERROR` with no type this span used
+    to ship.
+    """
+    if not error:
+        return "json_rpc_error"
+    parsed: Any = None
+    with guard("interceptors.mcp_stdio.error_type"):
+        parsed = json.loads(error)
+    code = parsed.get("code") if isinstance(parsed, dict) else None
+    if isinstance(code, int):
+        return f"json_rpc_{code}"
+    return "json_rpc_error"
 
 
 def _maybe_log_disabled(client: Client | None, state: _ProcState, pid: int | None) -> None:
@@ -227,11 +299,12 @@ class McpStdioInterceptor(InterceptorInterface):
     def __init__(self) -> None:
         self._client: Client | None = None
         self._installed = False
-        self._orig_backend_desc: Any = None  # original classmethod descriptor (for restoration)
-        self._orig_cse: Any = None  # original asyncio.create_subprocess_exec
+        self._patches = PatchSet("interceptors.mcp_stdio")
         self._asyncio_wrap_count: int = 0  # test-only counter: number of actual asyncio seam wraps
         self._sniff_limit: int = _ProcState.SNIFF_LIMIT
         self._native_limits: Any = None
+        self._mode: CaptureMode = CaptureMode.ALL
+        self._debug: bool = False
 
     def name(self) -> str:
         return "mcp_stdio"
@@ -246,8 +319,16 @@ class McpStdioInterceptor(InterceptorInterface):
         lim = config.limits if config is not None else CaptureLimits()
         self._sniff_limit = lim.resolved()["mcp_sniff_bytes"]
         self._native_limits = lim.to_native()
-        try:
-            self._orig_backend_desc = _aio_backend.AsyncIOBackend.__dict__["open_process"]
+        self._mode = capture_mode_of(client)
+        self._debug = bool(getattr(config, "debug", False))
+        self._patches = PatchSet("interceptors.mcp_stdio", debug=self._debug)
+
+        # `patch()` records `AsyncIOBackend.__dict__["open_process"]` — the raw
+        # classmethod DESCRIPTOR, not the bound callable `getattr` would hand
+        # back — so the restore puts the attribute's binding behaviour back
+        # exactly as it was. `orig_callable` is the bound form, which is what the
+        # wrapper has to call.
+        with guard("interceptors.mcp_stdio.install_anyio", debug=self._debug):
             orig_callable = _aio_backend.AsyncIOBackend.open_process  # bound classmethod
 
             async def wrapped(command: Any, **kwargs: Any) -> Any:
@@ -256,58 +337,43 @@ class McpStdioInterceptor(InterceptorInterface):
                     proc = await orig_callable(command, **kwargs)
                 finally:
                     _in_anyio_open.reset(token)
-                try:
+                with guard("interceptors.mcp_stdio.wrap_proc", debug=self._debug):
                     self._wrap_proc(proc)
-                except Exception:  # noqa: BLE001 — fail-silent
-                    pass
                 return proc
 
-            _aio_backend.AsyncIOBackend.open_process = staticmethod(wrapped)
-        except Exception:  # noqa: BLE001 — app stays healthy even if the patch fails
-            self._orig_backend_desc = None
+            self._patches.patch(_aio_backend.AsyncIOBackend, "open_process", staticmethod(wrapped))
 
         # auxiliary seam: capture the raw-asyncio (non-anyio) path
-        try:
-            self._orig_cse = asyncio.create_subprocess_exec
+        with guard("interceptors.mcp_stdio.install_asyncio", debug=self._debug):
+            orig_cse = asyncio.create_subprocess_exec
 
             async def wrapped_cse(*args: Any, **kwargs: Any) -> Any:
-                proc = await self._orig_cse(*args, **kwargs)
+                # Closed over, not read off `self` per call. The old form looked
+                # up `self._orig_cse`, which `uninstall()` set to None — so a
+                # wrapper another library still held raised `TypeError: NoneType
+                # is not callable` into the host after wardex was gone.
+                proc = await orig_cse(*args, **kwargs)
                 if (
                     not _in_anyio_open.get()
                 ):  # wrap if this wasn't called by anyio (i.e. raw asyncio)
-                    try:
+                    with guard("interceptors.mcp_stdio.wrap_asyncio_proc", debug=self._debug):
                         self._wrap_asyncio_proc(proc)
-                    except Exception:  # noqa: BLE001 — fail-silent
-                        pass
                 return proc
 
-            asyncio.create_subprocess_exec = wrapped_cse  # type: ignore[assignment]
-        except Exception:  # noqa: BLE001
-            self._orig_cse = None
+            self._patches.patch(asyncio, "create_subprocess_exec", wrapped_cse)
 
         self._installed = True
 
     def uninstall(self) -> None:
         if not self._installed:
             return
-        if self._orig_backend_desc is not None:
-            try:
-                _aio_backend.AsyncIOBackend.open_process = self._orig_backend_desc
-            except Exception:  # noqa: BLE001
-                pass
-            self._orig_backend_desc = None
-        if self._orig_cse is not None:
-            try:
-                asyncio.create_subprocess_exec = self._orig_cse  # type: ignore[assignment]
-            except Exception:  # noqa: BLE001
-                pass
-            self._orig_cse = None
+        self._patches.restore_all()
         self._installed = False
 
     def _wrap_proc(self, proc: Any) -> None:
         if getattr(proc, "stdin", None) is None or getattr(proc, "stdout", None) is None:
             return
-        state = _ProcState(self._sniff_limit, self._native_limits)
+        state = _ProcState(self._sniff_limit, self._native_limits, self._mode, self._debug)
         client = self._client
         pid = getattr(proc, "pid", None)
         stdin = proc.stdin
@@ -355,7 +421,7 @@ class McpStdioInterceptor(InterceptorInterface):
         self._asyncio_wrap_count += (
             1  # counted when a wrap actually occurs (for verifying the dual-seam guard)
         )
-        state = _ProcState(self._sniff_limit, self._native_limits)
+        state = _ProcState(self._sniff_limit, self._native_limits, self._mode, self._debug)
         client = self._client
         pid = getattr(proc, "pid", None)
         writer = proc.stdin

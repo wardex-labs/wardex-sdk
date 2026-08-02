@@ -11,6 +11,7 @@ from pathlib import Path
 import wardex_sdk as wardex
 from wardex_sdk import ConsoleTransport, _hub
 from wardex_sdk._enums import SpanKind
+from wardex_sdk.assembly import Limitation
 
 _FIXTURES = Path(__file__).parent / "fixtures"
 CERT = _FIXTURES / "cert.pem"
@@ -89,7 +90,13 @@ def test_text_response_emits_text_part_no_toolonly_marker():
         msgs = json.loads(dict(sp.extra)["gen_ai.output.messages"])
         assert msgs[0]["parts"][0]["type"] == "text"
         assert msgs[0]["parts"][0]["content"] == "hello"
-        assert "output_messages_tool_calls_only" not in sp.capture_integrity.limitations
+        # `output_messages_tool_calls_only` was retired when full-part mapping
+        # landed, so it has no `Limitation` member to name here. Compare against
+        # the member *values* — `"str" not in (Limitation...,)` is vacuously
+        # true and would pin nothing.
+        assert "output_messages_tool_calls_only" not in {
+            lim.value for lim in sp.capture_integrity.limitations
+        }
     finally:
         wardex.close()
         httpd.shutdown()
@@ -103,7 +110,7 @@ def test_unknown_block_sets_unmapped_marker():
         _post(url, b'{"model":"claude-3"}')
         sp = _spans()[0]
         assert "gen_ai.output.messages" in dict(sp.extra)
-        assert "output_messages_unmapped_part" in sp.capture_integrity.limitations
+        assert Limitation.OUTPUT_MESSAGES_UNMAPPED_PART in sp.capture_integrity.limitations
     finally:
         wardex.close()
         httpd.shutdown()

@@ -12,6 +12,7 @@ from pathlib import Path
 import wardex_sdk as wardex
 from wardex_sdk import ConsoleTransport, _hub
 from wardex_sdk._enums import SpanKind
+from wardex_sdk.assembly import Limitation
 
 _FIXTURES = Path(__file__).parent / "fixtures"
 CERT = _FIXTURES / "cert.pem"
@@ -164,7 +165,7 @@ def test_unknown_input_block_emits_marker():
         wardex.init(transport=ConsoleTransport(), intercept=True)
         _post(url, req_body)
         sp = _spans()[0]
-        assert "input_messages_unmapped_part" in sp.capture_integrity.limitations
+        assert Limitation.INPUT_MESSAGES_UNMAPPED_PART in sp.capture_integrity.limitations
     finally:
         wardex.close()
         httpd.shutdown()

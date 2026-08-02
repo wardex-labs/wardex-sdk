@@ -35,10 +35,17 @@ from ._tracing import agent, span, task, tool, trace, workflow
 from ._types import (
     GenAIAttributes,
     InputRef,
-    InternalStateSnapshot,
     ToolDefinitionSet,
 )
 from ._version import __version__
+from .assembly import (
+    Evidence,
+    ParentSource,
+    SnapshotDraft,
+    guard,
+    latch_ambient,
+    resolve_parentage,
+)
 from .context._asgi import WardexMiddleware
 from .context._contextvar import run_in_context
 from .context._propagate import (
@@ -191,26 +198,36 @@ def capture_state_snapshot(
     client = _hub.get_client()
     if client is None:
         return
-    scope = _hub.get_current_scope()
-    active = scope.active_span_context
-    if active is None:
-        return
-    norm_refs = tuple(
-        r if isinstance(r, InputRef) else InputRef(key=r[0], content_hash=r[1]) for r in input_refs
+    # A snapshot always EXPECTS a span to hang off — it describes the state of
+    # one. So the no-parent case is `unresolved` (I4), not `trace_root`: the two
+    # must stay distinguishable downstream, and until this call went through the
+    # core it was neither, because the snapshot was dropped where it stood.
+    ambient = latch_ambient()
+    parentage = resolve_parentage(
+        ambient,
+        Evidence(ParentSource.CONTEXTVAR)
+        if ambient.span_context is not None
+        else Evidence(ParentSource.UNRESOLVED),
     )
-    norm_attrs = tuple(attributes.items()) if attributes else ()
-    snapshot = InternalStateSnapshot(
-        trace_id=active.trace_id,
-        span_id=active.span_id,
-        timestamp_ns=time.time_ns(),
-        snapshot_type=snapshot_type,
-        turn_index=turn_index,
-        conversation_state=conversation_state,
-        tool_definitions=tool_definitions,
-        attributes=norm_attrs,
-        input_refs=norm_refs,
-    )
-    client.capture_snapshot(snapshot)
+    snapshot = None
+    # `finish()` validates, and I6 forbids a validation failure reaching the
+    # host: `capture_state_snapshot` is called from the user's own code.
+    with guard("capture_state_snapshot", debug=bool(client.config.debug)):
+        # `snapshot_type` stays a `str` in the signature (published API) and is
+        # coerced to `SnapshotType` inside the draft, where an unrecognized
+        # value degrades to UNSPECIFIED *with* Limitation.SNAPSHOT_TYPE_UNKNOWN
+        # instead of being silently flattened by `codec.rs`'s `map_snap`.
+        draft = SnapshotDraft(parentage, snapshot_type=snapshot_type, turn_index=turn_index)
+        draft.set_conversation_state(conversation_state)
+        draft.set_tool_definitions(tool_definitions)
+        for ref in input_refs:
+            draft.add_input_ref(
+                ref if isinstance(ref, InputRef) else InputRef(key=ref[0], content_hash=ref[1])
+            )
+        draft.set_extras(attributes)
+        snapshot = draft.finish(time.time_ns())
+    if snapshot is not None:
+        client.capture_snapshot(snapshot)
 
 
 def flush(timeout: float = 5.0) -> None:

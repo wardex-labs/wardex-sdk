@@ -69,6 +69,176 @@ enum CaptureSource {
   CAPTURE_SOURCE_SOCKET = 7;  // plaintext raw-socket seam (http/ws/h2c)
 }
 
+// --- Span vocabulary registry (design §6.2, §6.3, §6.6) ---
+//
+// proto is the single source of truth for the span vocabulary. wardex is a
+// multi-language SDK; leaving the vocabulary in each SDK's own enums means the
+// Node and Java adapters re-derive it from prose and drift, which is the same
+// failure `crates/wardex-limits` exists to prevent for resource bounds.
+//
+// The three enums below are DECLARED and, in this schema version, deliberately
+// UNREFERENCED by any message field except SpanLink.reason. `OperationName` and
+// `ToolExecutionType` already travel as `Span.extra` keys
+// (`gen_ai.operation.name`, `wardex.tool.execution_type`); adding a typed field
+// alongside would double-carry the same value and force a precedence rule
+// nobody has written. §6.6's purpose — stop other languages inventing the
+// vocabulary — is met in full by a registry enum with no field.
+//
+// Every value name carries its enum's prefix. proto3 file-level enum values
+// share the package namespace, so two unprefixed `UNSPECIFIED`s do not compile;
+// `buf.yaml`'s `lint: use: BASIC` does NOT include ENUM_VALUE_PREFIX and will
+// not warn. Value names and numbers are APPEND-ONLY: `buf breaking`'s FILE
+// category locks both (ENUM_VALUE_SAME_NAME, ENUM_VALUE_NO_DELETE).
+
+// The twelve span intents. CLOSED — a new operation costs a core PR, and a
+// protocol variant is an attribute, never an operation (an MCP tool call is
+// EXECUTE_TOOL with TOOL_EXECUTION_TYPE_IPC).
+enum OperationName {
+  OPERATION_NAME_UNSPECIFIED = 0;
+  OPERATION_NAME_CHAT = 1;
+  OPERATION_NAME_TEXT_COMPLETION = 2;
+  OPERATION_NAME_EMBEDDINGS = 3;
+  OPERATION_NAME_EXECUTE_TOOL = 4;
+  OPERATION_NAME_CREATE_AGENT = 5;
+  OPERATION_NAME_INVOKE_AGENT = 6;
+  OPERATION_NAME_INVOKE_WORKFLOW = 7;
+  OPERATION_NAME_GENERATE_CONTENT = 8;
+  OPERATION_NAME_RETRIEVAL = 9;
+  OPERATION_NAME_EXECUTE_STEP = 10;   // graph node / superstep / task
+  OPERATION_NAME_HANDOFF = 11;        // agent transition; a marker span, not a container
+  OPERATION_NAME_EVALUATE = 12;       // guardrail / judge / evaluator
+}
+
+// How a tool body actually ran. UNKNOWN is a legitimate value: wardex does not
+// observe how a CLI's built-in tool executes, and asserting NETWORK for it was
+// a guess that was simply wrong.
+enum ToolExecutionType {
+  TOOL_EXECUTION_TYPE_UNSPECIFIED = 0;
+  TOOL_EXECUTION_TYPE_NETWORK = 1;
+  TOOL_EXECUTION_TYPE_IN_PROCESS = 2;
+  TOOL_EXECUTION_TYPE_IPC = 3;        // subprocess pipe / MCP stdio
+  TOOL_EXECUTION_TYPE_UNKNOWN = 4;    // not observed — never guess
+}
+
+// Why one span points at another. A link is CAUSALITY; the parent edge is
+// CONTAINMENT. Rendering a 5-hop handoff chain as 5 levels of nesting makes
+// every duration in the flame graph a lie, so a handoff is a marker span plus
+// LINK_REASON_HANDOFF_FROM to a SIBLING.
+enum LinkReason {
+  LINK_REASON_UNSPECIFIED = 0;
+  LINK_REASON_TRIGGERED_BY = 1;   // a graph edge: the step that scheduled this one
+  LINK_REASON_HANDOFF_FROM = 2;
+  LINK_REASON_RESUMED_FROM = 3;   // checkpoint resume — a NEW trace, linked
+  LINK_REASON_RETRIED_FROM = 4;
+  LINK_REASON_CACHE_SOURCE = 5;
+}
+
+// Why a span is incomplete, or was assembled by interpretation rather than
+// observation. CLOSED and, as of the 2026-07-29 census, COMPLETE: every marker
+// string any wardex SDK can attach to a span has a value here. This is the
+// third and last tier of the "concept has no home in the vocabulary"
+// disposition — tier 1 is a namespaced `extra` key, tier 2 is a SpanEvent.
+//
+// A marker is how wardex says "this edge is a guess" or "this body is short"
+// WITHOUT lying about it in a typed field. That makes it a wire contract, not a
+// log line: dashboards render it and replay tooling gates on it. It is
+// deliberately NOT the same vocabulary as a parser's `disabled_reason` — those
+// say why a parser latched itself off for a whole connection, no span exists to
+// carry them, and they stay `&'static str` printed to stderr under
+// `init(debug=True)`. The two have different lifetimes and different consumers.
+enum Limitation {
+  LIMITATION_UNSPECIFIED = 0;
+
+  // -- Parentage: the edge exists but was not read from a live scope.
+  LIMITATION_PARENT_UNRESOLVED = 1;
+  LIMITATION_UNIT_INFERRED_SOLE = 2;
+  LIMITATION_CORRELATION_CONFLICT = 3;
+  LIMITATION_CONTEXT_PROPAGATION_DEGRADED = 4;
+  LIMITATION_CONTEXT_PROPAGATION_UNAVAILABLE = 5;
+
+  // -- Unit lifecycle.
+  LIMITATION_UNIT_EVICTED = 6;
+  LIMITATION_UNIT_INTERRUPTED = 7;
+  LIMITATION_CHILD_SPAN_UNCLOSED = 8;
+
+  // -- Instrumentation lifecycle.
+  LIMITATION_ADAPTER_UNINSTALLED = 9;
+  LIMITATION_PATCH_SUPERSEDED = 10;
+  LIMITATION_INSTRUMENTATION_DEGRADED = 38;
+
+  // -- Evidence quality.
+  LIMITATION_NO_WIRE_EVIDENCE = 11;
+  LIMITATION_POSSIBLE_DUPLICATE_CHAT = 12;
+  LIMITATION_STREAM_BUFFER_EXCEEDED = 13;
+  LIMITATION_TOOL_CALL_ID_UNAVAILABLE_IN_PROCESS = 14;
+  LIMITATION_SNAPSHOT_TYPE_UNKNOWN = 15;
+  LIMITATION_TOOL_NAME_COLLISION = 16;
+
+  // -- Transport timing.
+  LIMITATION_CONNECT_TIMING_UNAVAILABLE = 17;
+  LIMITATION_TTFT_UNAVAILABLE_H2 = 18;
+  LIMITATION_TTFT_IPC_APPROXIMATION = 19;
+  LIMITATION_TRANSPORT_TIMING_UNAVAILABLE_SUBPROCESS = 20;
+
+  // -- Caps reached. Each names a DIFFERENT tunable in `wardex-limits`, which
+  //    is why they are not merged: the user's next action differs per value.
+  LIMITATION_BODY_CAP_EXCEEDED = 21;
+  LIMITATION_GRPC_MESSAGE_TRUNCATED = 22;
+  LIMITATION_WS_PAYLOAD_TRUNCATED = 23;
+  LIMITATION_CONNECTION_EVICTED = 24;
+
+  // -- Parsing / interpretation.
+  LIMITATION_FRAME_PARSE_FAILED = 25;
+  LIMITATION_SEMANTIC_PARSE_FAILED = 26;
+  LIMITATION_PAYLOAD_COMPRESSED = 27;
+  LIMITATION_TOOL_ARGS_UNPARSED = 28;
+  LIMITATION_OUTPUT_MESSAGES_UNMAPPED_PART = 29;
+  LIMITATION_INPUT_MESSAGES_UNMAPPED_PART = 30;
+
+  // -- Streaming.
+  LIMITATION_REASSEMBLED_FROM_STREAM = 31;
+  LIMITATION_STREAM_USAGE_UNAVAILABLE = 32;
+  LIMITATION_SSE_UNKNOWN_PROVIDER = 33;
+
+  // -- Protocol-specific.
+  LIMITATION_GRPC_WEB_UNSUPPORTED = 34;
+  LIMITATION_GRPC_STATUS_UNAVAILABLE = 35;
+  LIMITATION_WS_NO_CLOSE = 36;
+
+  // -- Adapter session.
+  LIMITATION_SESSION_ABORTED = 37;
+
+  // A META value, not vocabulary — hence the separate number band. It means
+  // "the sending SDK held a marker this schema has no value for", and it always
+  // travels with the original string in `Span.extra["wardex.limitation.unmapped"]`.
+  // Dropping such a marker silently would be the exact failure the vocabulary
+  // exists to prevent: a span that looks complete because its incompleteness
+  // could not be spelled.
+  LIMITATION_VOCABULARY_UNMAPPED = 9001;
+}
+
+// How a span's parent edge was derived — and NOTHING else. CLOSED.
+//
+// "Which source observed the event" is a different question, already answered
+// by `Span.capture_sources`. Mixing the two into one string is what produced
+// the retired `adapter_hook` / `adapter_stream` values, where a reader could
+// not tell whether the edge came from a live scope or from a guess.
+//
+// A framework's own id (LangChain's `run_id`, an MCP `tool_use_id`) is never a
+// value here: it is a lookup KEY that selects a unit whose context wardex
+// itself produced. That is the difference between reconstructing a tree from
+// in-process propagation and inheriting one framework's callback graph.
+enum ParentSource {
+  PARENT_SOURCE_UNSPECIFIED = 0;
+  PARENT_SOURCE_CONTEXTVAR = 1;   // ambient scope, latched in-task by the initiator
+  PARENT_SOURCE_HEADER = 2;       // joined from a W3C traceparent (is_remote)
+  PARENT_SOURCE_UNIT_ACTIVE = 3;  // a Unit was ambient via activate()/pin
+  PARENT_SOURCE_UNIT_ALIAS = 4;   // a Unit resolved by an exact framework-id alias
+  PARENT_SOURCE_UNIT_SOLE = 5;    // exactly one live unit; heuristic, last resort
+  PARENT_SOURCE_TRACE_ROOT = 6;   // deliberately started a new trace
+  PARENT_SOURCE_UNRESOLVED = 7;   // a parent was expected and not found
+}
+
 enum RetentionClass {
   RETENTION_CLASS_UNSPECIFIED = 0;
   RETENTION_CLASS_SUMMARY_ONLY = 1;   // metadata/metrics only. replay not possible

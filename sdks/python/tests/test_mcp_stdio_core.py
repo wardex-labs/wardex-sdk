@@ -81,8 +81,8 @@ def test_no_detach_when_jsonrpc_seen():
 def test_proc_state_reports_disabled_reason_from_either_direction():
     """_ProcState.disabled_reason() must surface a latch on either the
     request or the response parser, mirroring _Http1Tracker's equivalent —
-    the JSON-RPC path must not keep the silent-failure mode that this slice
-    exists to remove."""
+    the JSON-RPC path must not keep the silent-failure mode where a parser
+    stops parsing and nothing anywhere says why."""
     from wardex_sdk import CaptureLimits
 
     limits = CaptureLimits(max_stream_buffer_bytes=64).to_native()

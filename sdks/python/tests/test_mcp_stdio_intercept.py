@@ -165,10 +165,10 @@ async def test_mcp_stream_buffer_limit_reaches_the_parser_through_the_intercepto
 @pytest.mark.asyncio
 async def test_disabled_reason_logged_once_per_mcp_stream(capsys):
     # A subprocess that never sends a newline-terminated JSON-RPC line — the
-    # stdio equivalent of the non-HTTP-over-TLS incident this slice guards
-    # against. No span is ever produced (nothing to carry the reason), so
-    # debug mode logs it instead — exactly once per stream, not once per read
-    # that keeps arriving after the parser has already latched off.
+    # stdio equivalent of non-HTTP traffic latching the TLS-side parser off
+    # (see test_ssl_interceptor.py). No span is ever produced (nothing to carry
+    # the reason), so debug mode logs it instead — exactly once per stream, not
+    # once per read that keeps arriving after the parser has already latched off.
     wardex.init(intercept=True, debug=True, limits=CaptureLimits(max_stream_buffer_bytes=64))
     proc = await anyio.open_process([sys.executable, "-c", _JUNK_LOOP])
     await _drain_stdout(proc)

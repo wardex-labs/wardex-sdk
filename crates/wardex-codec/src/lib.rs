@@ -1,6 +1,7 @@
 //! Wardex codec — Protobuf encoding + Zstd compression.
 //!
-//! Phase 0 scaffold: expose proto types only. Actual encode/compress functions land in Phase 7.
+//! `proto` re-exports the generated wire types; `encode_envelope`/`decode_envelope`
+//! are the round trip over them, and `otlp` maps an envelope onto OTLP.
 
 pub mod proto {
     pub mod wardex {
@@ -15,6 +16,7 @@ pub mod proto {
 }
 
 pub mod otlp;
+pub mod vocab;
 
 use prost::Message;
 use wardex_limits::Limits;
@@ -52,10 +54,26 @@ pub fn decode_envelope(data: &[u8]) -> Result<pb::Envelope, CodecError> {
     pb::Envelope::decode(&proto_bytes[..]).map_err(CodecError::Decode)
 }
 
+// Every enum mapping now lives in `vocab`, derived from the schema rather than
+// transcribed from it. The whole table used to sit here as a hand-written
+// `match` per enum; `Limitation` arriving with 37 members made that untenable,
+// and what replaced it removes the class of bug rather than one instance of it.
+//
+// These mappings live in this crate rather than in the PyO3 binding for one
+// practical reason: this crate owns the generated enums and `cargo test` can
+// build a harness for it, while `bindings/python` is `crate-type = ["cdylib"]`
+// with pyo3's `extension-module` and gets no test harness at all. A mapping
+// whose unknown-value branch is the entire point needs a test that reaches it.
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::proto::wardex::v1 as pb;
+    // Moved to `vocab` (schema-derived, no longer a hand table). The two tests
+    // below stay here unchanged: they pin the BEHAVIOUR the move had to
+    // preserve, so keeping them where they were is what makes the move
+    // reviewable.
+    use crate::vocab::link_reason_name;
 
     fn sample() -> pb::Envelope {
         pb::Envelope {
@@ -117,5 +135,40 @@ mod tests {
     #[test]
     fn decode_rejects_corrupt_input() {
         assert!(decode_envelope(b"not a zstd frame").is_err());
+    }
+
+    #[test]
+    fn link_reason_unset_and_unknown_are_not_the_same_string() {
+        // The whole point of the mapping. A reader must be able to tell "no
+        // reason was set" from "a reason this build does not know" — the second
+        // is what arrives from a newer SDK, and reading it as the first turns a
+        // handoff sibling back into a nested child (design §6.3).
+        assert_eq!(link_reason_name(0), "");
+        assert_eq!(link_reason_name(99), "link_reason_unrecognized_99");
+        assert_ne!(link_reason_name(99), link_reason_name(0));
+    }
+
+    #[test]
+    fn every_declared_link_reason_maps_to_its_wardex_string() {
+        assert_eq!(
+            link_reason_name(pb::LinkReason::TriggeredBy as i32),
+            "triggered_by"
+        );
+        assert_eq!(
+            link_reason_name(pb::LinkReason::HandoffFrom as i32),
+            "handoff_from"
+        );
+        assert_eq!(
+            link_reason_name(pb::LinkReason::ResumedFrom as i32),
+            "resumed_from"
+        );
+        assert_eq!(
+            link_reason_name(pb::LinkReason::RetriedFrom as i32),
+            "retried_from"
+        );
+        assert_eq!(
+            link_reason_name(pb::LinkReason::CacheSource as i32),
+            "cache_source"
+        );
     }
 }

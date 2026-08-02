@@ -10,10 +10,27 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # `buf breaking` resolves its baseline out of the local `.git`, and a
+          # depth-limited clone simply does not contain it — the step would then
+          # fail on every run, which is indistinguishable from a real break and
+          # gets muted. Full history rather than `fetch-depth: 2` because the
+          # baseline is the state the branch had BEFORE this push, which can be
+          # any number of commits back (see the `buf breaking` step).
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      # setup_only: install buf, run nothing. The action's own defaults enable
+      # lint/format/breaking ONLY on pull_request, and this repo's history is
+      # almost entirely direct pushes to main — so a schema break's most likely
+      # path was also the one path with no check on it. The defaults would also
+      # turn on `buf format --exit-code`, which the current tree does not pass
+      # (all five protos re-format); reformatting them is a separate commit, not
+      # this one. Explicit steps below, so what runs is visible here.
       - uses: bufbuild/buf-action@v1
+        with:
+          setup_only: true
       - name: cargo fmt --check
         run: cargo fmt --all --check
       - name: cargo clippy
@@ -24,6 +41,33 @@ jobs:
         run: cargo test -p wardex-pipeline --release --test pii_perf -- --ignored
       - name: buf lint
         run: buf lint
+      # `buf.yaml` has declared `breaking: use: [FILE]` all along with nothing
+      # running it. This is what makes an unintended `wardex.v1` change fail the
+      # build — and therefore what makes a deliberate one a decision, since
+      # landing it requires an explicit `ignore_only` entry in `buf.yaml` in the
+      # same commit, rather than an accident nobody notices.
+      #
+      # The baseline is the state the branch had BEFORE this event, NOT `HEAD~1`.
+      # `HEAD~1` is correct only when the event carries exactly one commit: for a
+      # push of A..B it compares B against A, so a break introduced in A is
+      # already present in the baseline and passes green (measured). `main` here
+      # advances almost entirely by fast-forward — 2 merge commits in 108 — so
+      # multi-commit pushes are the normal case, not the edge one, and that is
+      # exactly the path this step exists to cover.
+      #
+      # `github.event.before` is the pre-push tip; `pull_request.base.sha` is the
+      # base branch tip. GitHub sends an all-zero `before` for a branch's first
+      # push, which has no baseline to compare against.
+      - name: buf breaking (against the state before this push / PR)
+        env:
+          BUF_BREAKING_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          if [ -z "$BUF_BREAKING_BASE" ] || \
+             [ "$BUF_BREAKING_BASE" = "0000000000000000000000000000000000000000" ]; then
+            echo "no baseline for this event (first push of a branch); nothing to compare against"
+            exit 0
+          fi
+          buf breaking --against ".git#format=git,ref=$BUF_BREAKING_BASE"
 
   python:
     runs-on: ubuntu-latest

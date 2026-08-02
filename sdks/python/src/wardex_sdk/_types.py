@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 from typing import Protocol as TypingProtocol
 
 from ._enums import (
@@ -23,6 +24,22 @@ from ._enums import (
     ToolExecutionType,
     ToolType,
 )
+
+if TYPE_CHECKING:
+    # Vocabulary that this module ANNOTATES but does not own. Three fields below
+    # were free-form strings until the wire schema closed them; the members live
+    # where the vocabulary is defined and enforced, which is one layer up.
+    #
+    # The import is deliberately type-only, and not to dodge a lint. `assembly`
+    # sits ABOVE `_types` — `assembly/_parentage.py` imports from here — so a
+    # runtime import would be a real cycle and, worse, a lower layer reaching
+    # upward for a definition. The annotations still say exactly what the fields
+    # hold, and the enforcement lives where it can act: `SpanDraft.finish()`
+    # refuses a marker that is not a `Limitation`, and it is the only place an
+    # `InternalSpan` is constructed.
+    from .assembly._integrity import Limitation
+    from .assembly._parentage import ParentSource
+    from .assembly._vocab import LinkReason
 
 # --- Basic ID types (bytes wrapper) ---
 
@@ -204,7 +221,11 @@ class CaptureIntegrity:
     redacted: bool = False
     truncated: bool = False
     dropped_chunk_count: int = 0
-    limitations: tuple[str, ...] = ()  # free-form limitation notes (e.g. "tls_inner_only")
+    # CLOSED on the wire. This was `tuple[str, ...]`, and the example the old
+    # comment gave — "tls_inner_only" — had never actually been emitted by
+    # anything: a free-form field invented a marker to describe itself. On the
+    # wire it is `repeated Limitation limitation_codes`.
+    limitations: tuple[Limitation, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -218,7 +239,13 @@ class CorrelationInfo:
     attempt_id: str | None = None
     active_span_id_at_capture: SpanId | None = None
     confidence: float = 1.0  # 0.0~1.0
-    strategy: str | None = None  # contextvar|header|socket|timing|manual
+    # CLOSED on the wire, and narrowed to ONE question: how was the parent
+    # edge derived. The old comment listed `socket|timing|manual`, none of which
+    # were ever produced, next to `adapter_hook`/`adapter_stream`, which were —
+    # and those answered a different question ("which source observed this"),
+    # already carried by `InternalSpan.capture_sources`. On the wire it is
+    # `ParentSource parent_source`.
+    strategy: ParentSource | None = None
 
 
 # --- Span internal events/links ---
@@ -235,7 +262,11 @@ class InternalSpanEvent:
 class InternalSpanLink:
     trace_id: TraceId
     span_id: SpanId
-    reason: str | None = None
+    # CLOSED on the wire. A link is CAUSALITY where the parent edge is
+    # CONTAINMENT, and `handoff_from` is what tells a renderer to draw a sibling
+    # instead of nesting — so an unrecognized reason degrading to "no reason"
+    # silently rebuilds the flame graph the link exists to prevent.
+    reason: LinkReason | None = None
 
 
 # --- Core data types ---
@@ -448,10 +479,18 @@ class ParsedMessage:
     body: bytes = b""
     header_len: int = 0
     # True when the parser stored fewer body bytes than arrived. `limitations`
-    # says why (e.g. "body_cap_exceeded"); both travel to CaptureIntegrity so a
-    # capped body is visible to the user rather than silently short.
+    # says why; both travel to CaptureIntegrity so a capped body is visible to
+    # the user rather than silently short.
+    #
+    # The Rust parsers still produce `Vec<&'static str>`, and that is not debt:
+    # `wardex-protocol` is the lowest layer and depending on the generated proto
+    # types to name a marker would invert the crate graph for one string
+    # (`body_cap_exceeded` is the only marker Rust emits today). The strings are
+    # resolved to members once, at the boundary that builds this dataclass, and
+    # `tests/test_limitation_census.py` scans `crates/` on every run so a Rust
+    # marker with no member fails CI rather than reaching the seam.
     truncated: bool = False
-    limitations: tuple[str, ...] = ()
+    limitations: tuple[Limitation, ...] = ()
 
 
 # --- Callback protocols (concrete signatures instead of Callable) ---

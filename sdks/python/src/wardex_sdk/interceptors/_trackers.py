@@ -13,6 +13,7 @@ from typing import Any
 
 from .. import _hub, _wardex_native
 from .._types import SpanContext
+from ..assembly import Limitation
 from ..protocol import WsParser
 from ..protocol._http1 import Http1RequestParser, Http1ResponseParser
 from ..protocol._http2 import Http2Parser
@@ -38,11 +39,11 @@ def _header_get(headers: object, name: str) -> str | None:
     return None
 
 
-def _merge_markers(*groups: tuple[str, ...]) -> tuple[str, ...]:
+def _merge_markers(*groups: tuple[Limitation, ...]) -> tuple[Limitation, ...]:
     """Concatenate limitation markers, keeping first-seen order and dropping
     duplicates. A request and a response that both hit the body cap describe
     one limitation of the transaction, not two."""
-    out: list[str] = []
+    out: list[Limitation] = []
     for group in groups:
         for m in group:
             if m not in out:
@@ -76,9 +77,10 @@ class _Txn:
     ttfb_ms: float
     truncated: bool = False
     # Capture-limitation markers the protocol parser attached to this
-    # transaction (e.g. "body_cap_exceeded"), merged into the span's
-    # CaptureIntegrity.limitations by the seam.
-    limitations: tuple[str, ...] = ()
+    # transaction, merged into the span's CaptureIntegrity.limitations by the
+    # seam. Members, not strings: the parser's `&'static str` was resolved once
+    # at the PyO3 boundary (`protocol/_http1.py`).
+    limitations: tuple[Limitation, ...] = ()
     version: str = "1.1"
     ttft_ms: float = 0.0
     content_type: str | None = None
@@ -96,11 +98,11 @@ class _Txn:
     ws_messages_received: int = 0
     ws_bytes_sent: int = 0
     ws_bytes_received: int = 0
-    ws_markers: tuple[str, ...] = ()
+    ws_markers: tuple[Limitation, ...] = ()
 
 
 class _Http1Tracker:
-    """HTTP/1.1 — per-direction parser + single-slot latch (unchanged from Slice 1 behavior)."""
+    """HTTP/1.1 — per-direction parser + single-slot latch."""
 
     def __init__(self, limits: object | None = None) -> None:
         self._req = Http1RequestParser(limits)
@@ -109,7 +111,7 @@ class _Http1Tracker:
         self._path: str | None = None
         self._req_body: bytes = b""
         self._req_truncated: bool = False
-        self._req_limitations: tuple[str, ...] = ()
+        self._req_limitations: tuple[Limitation, ...] = ()
         self._req_start_ns: int = 0
         self._resp_first_ns: int = 0
         self._parent: SpanContext | None = None
@@ -225,7 +227,10 @@ class _Http2Tracker:
     def __init__(self, limits: object | None = None) -> None:
         self._conn = Http2Parser(limits)
         # stream_id -> (active span at request time, request start ns)
-        # TODO: evict stale entries for streams that closed without a response (Phase 3 close hook)
+        # TODO: evict stale entries for streams that closed without a response.
+        # `_mk` pops on every transaction, so the only leak is a stream that ends
+        # without one; closing it needs a connection-close hook the seam does not
+        # expose yet.
         self._latch: dict[int, tuple[SpanContext | None, int]] = {}
 
     def on_request_bytes(self, data: bytes) -> list[_Txn]:
@@ -266,10 +271,10 @@ class _Http2Tracker:
             parent=parent,
             start_ns=start,
             end_ns=now,
-            ttfb_ms=0.0,  # per-h2-stream first-byte not tracked (limitation, Phase 4)
+            ttfb_ms=0.0,  # per-h2-stream first-byte not tracked (limitation)
             truncated=t.truncated,
             version="2",
-            ttft_ms=0.0,  # per-h2-stream first-body-byte not tracked (limitation, Phase 4)
+            ttft_ms=0.0,  # per-h2-stream first-body-byte not tracked (limitation)
             content_type=getattr(t, "content_type", None),
             grpc_status=getattr(t, "grpc_status", None),
             grpc_message=getattr(t, "grpc_message", None),
@@ -361,20 +366,26 @@ class _WebSocketTracker:
             return [self._build_txn(())]
         return []
 
-    def flush(self, marker: str) -> list[_Txn]:
+    def flush(self, marker: Limitation) -> list[_Txn]:
         if self._emitted:
             return []
         return [self._build_txn((marker,))]
 
-    def _build_txn(self, extra_markers: tuple[str, ...]) -> _Txn:
+    def _build_txn(self, extra_markers: tuple[Limitation, ...]) -> _Txn:
         self._emitted = True
         markers = list(extra_markers)
         if self._in_trunc or self._out_trunc:
-            markers.append("ws_payload_truncated")
+            markers.append(Limitation.WS_PAYLOAD_TRUNCATED)
         if self._deflate:
-            markers.append("ws_compressed")
+            # Census merge (§6.5.1): `ws_compressed` folded into
+            # PAYLOAD_COMPRESSED. What is lost is which protocol it was, and
+            # `TransportAttributes.protocol` already carries that.
+            markers.append(Limitation.PAYLOAD_COMPRESSED)
         if self._sent.is_disabled() or self._recv.is_disabled():
-            markers.append("ws_parse_failed")
+            # Census merge: `ws_parse_failed` and `grpc_parse_failed` are one
+            # fact — the framing layer failed, so the transport fields on this
+            # span are partial or synthesized.
+            markers.append(Limitation.FRAME_PARSE_FAILED)
         now = time.time_ns()
         return _Txn(
             method="GET",

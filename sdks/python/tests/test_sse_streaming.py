@@ -7,6 +7,7 @@ import pytest
 import wardex_sdk as wardex
 from wardex_sdk import _hub
 from wardex_sdk._enums import SpanKind
+from wardex_sdk.assembly import Limitation
 
 
 @pytest.fixture(autouse=True)
@@ -46,8 +47,9 @@ def test_sse_stream_extracts_gen_ai_and_synthetic_body(sse_tls_server):
     assert b'"content":"Hi!"' in sp.output_data
     # markers
     lims = sp.capture_integrity.limitations
-    assert "reassembled_from_stream" in lims
-    assert "stream_usage_unavailable" in lims  # OpenAI's default stream has no usage
+    assert Limitation.REASSEMBLED_FROM_STREAM in lims
+    # OpenAI's default stream has no usage
+    assert Limitation.STREAM_USAGE_UNAVAILABLE in lims
 
 
 def test_sse_stream_measures_ttft(sse_tls_server):

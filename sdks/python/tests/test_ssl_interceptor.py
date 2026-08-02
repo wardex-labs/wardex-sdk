@@ -10,6 +10,7 @@ import pytest
 import wardex_sdk as wardex
 from wardex_sdk import _hub
 from wardex_sdk._enums import CaptureMode, SpanKind
+from wardex_sdk.assembly import Limitation
 from wardex_sdk.interceptors._base import InterceptorInterface
 from wardex_sdk.interceptors._registry import InterceptorRegistry
 from wardex_sdk.interceptors._ssl import SSLInterceptor
@@ -38,7 +39,7 @@ class _FakeInterceptor(InterceptorInterface):
     def name(self) -> str:
         return "fake"
 
-    def install(self, client) -> None:
+    def install(self, client, ctx=None) -> None:
         self.installs += 1
 
     def uninstall(self) -> None:
@@ -170,7 +171,10 @@ async def test_async_capture_populates_handshake(tls_server):
     assert sp.transport.timing.tls_handshake_ms > 0.0
     # On the anyio/httpx path, TCP connect can't be derived by subtraction → connect=0 + marker
     assert sp.transport.timing.tcp_connect_ms == 0.0
-    assert "async_connect_unavailable" in sp.capture_integrity.limitations
+    # Census merge (design §6.5.1): `async_connect_unavailable` folded into
+    # CONNECT_TIMING_UNAVAILABLE. Both said the same thing — tcp_connect_ms is
+    # unknown rather than zero — and differed only in provenance.
+    assert Limitation.CONNECT_TIMING_UNAVAILABLE in sp.capture_integrity.limitations
 
 
 def test_install_uninstall_restores_originals():
@@ -228,7 +232,7 @@ class _DebugRecordingClient:
 
 def test_disabled_reason_logged_once_per_connection_in_debug(capsys):
     # Pure non-HTTP traffic (Redis/Mongo/Kafka-over-TLS) no longer reaches the
-    # parser at all — the seam gate (this task) stops it first, before
+    # parser at all — the seam gate stops it first, before
     # anything is fed to the tracker. See
     # test_non_http_tls_traffic_produces_no_log below for that property.
     #
@@ -354,7 +358,7 @@ def test_latch_stays_http_once_open(fake_ssl_socket, bare_ssl_interceptor):
 def test_latch_stays_ignore_once_closed(fake_ssl_socket, bare_ssl_interceptor):
     """Once classified "ignore" (non-HTTP), later bytes that happen to look
     like an HTTP method must not re-arm the gate. This is the direction that
-    matters for the OOM path this task closes: a Redis/Mongo/Kafka-over-TLS
+    matters for the OOM path the latch closes: a Redis/Mongo/Kafka-over-TLS
     connection latched off must stay off for its whole life, or a coincidental
     later payload resembling a method line would let it start streaming into
     the parser again."""

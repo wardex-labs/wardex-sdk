@@ -15,6 +15,7 @@ from pathlib import Path
 import wardex_sdk as wardex
 from wardex_sdk import ConsoleTransport, _hub
 from wardex_sdk._enums import SpanKind
+from wardex_sdk.assembly import Limitation
 
 _FIXTURES = Path(__file__).parent / "fixtures"
 CERT = _FIXTURES / "cert.pem"
@@ -115,7 +116,7 @@ def test_tool_call_extracted_to_output_messages():
 
 
 def test_text_response_has_output_messages_with_text_part():
-    # After Task 1-3: text responses are also included in output_messages as a TextPart.
+    # A text-only response is still reported: it appears in output_messages as a TextPart.
     httpd, url = _server(_TEXT_RESP)
     try:
         wardex.init(transport=ConsoleTransport(), intercept=True)
@@ -150,8 +151,14 @@ _TOOL_CALLS_MISSING_RESP = json.dumps(
 def test_tool_calls_missing_emits_empty_parts_not_failed_marker():
     """finish_reason==tool_calls but there's no tool_calls array → build_output_messages
     assembles a finish_reason-only message, so sem.output_messages becomes Some.
-    As a result the else branch (tool_calls_parse_failed) never fires; instead,
-    output_messages with empty parts is included in extra."""
+    As a result the else branch never fires; instead, output_messages with empty
+    parts is included in extra.
+
+    The branch this pins was written up as `tool_calls_parse_failed`, a string the
+    closed vocabulary never adopted (see `_NOT_ADOPTED` in
+    test_limitation_census.py — it has zero emitters). The marker the else branch
+    actually adds is `Limitation.SEMANTIC_PARSE_FAILED`, so that is what the
+    absence assertion names."""
     httpd, url = _server(_TOOL_CALLS_MISSING_RESP)
     try:
         wardex.init(transport=ConsoleTransport(), intercept=True)
@@ -164,8 +171,8 @@ def test_tool_calls_missing_emits_empty_parts_not_failed_marker():
         assert "gen_ai.output.messages" in extra
         msgs = json.loads(extra["gen_ai.output.messages"])
         assert msgs[0]["parts"] == []
-        # tool_calls_parse_failed only fires when output_messages=None → so it doesn't fire here
-        assert "tool_calls_parse_failed" not in spans[0].capture_integrity.limitations
+        # the else branch only fires when output_messages=None → so it doesn't fire here
+        assert Limitation.SEMANTIC_PARSE_FAILED not in spans[0].capture_integrity.limitations
     finally:
         wardex.close()
         httpd.shutdown()
@@ -233,7 +240,7 @@ def test_sse_tool_calls_reassembled():
         msgs = json.loads(extra["gen_ai.output.messages"])
         assert msgs[0]["parts"][0]["name"] == "add"
         lims = spans[0].capture_integrity.limitations
-        assert "reassembled_from_stream" in lims
+        assert Limitation.REASSEMBLED_FROM_STREAM in lims
     finally:
         wardex.close()
         httpd.shutdown()

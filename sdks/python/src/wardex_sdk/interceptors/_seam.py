@@ -13,37 +13,75 @@ from abc import abstractmethod
 from typing import TYPE_CHECKING, Any
 
 from .._enums import (
-    CaptureMode,
     CaptureSource,
     Direction,
-    OperationName,
     Protocol,
-    ProviderName,
-    SpanKind,
     StatusCode,
 )
 from .._limits import CaptureLimits
 from .._types import (
-    CaptureIntegrity,
-    CorrelationInfo,
-    GenAIAttributes,
     HttpMeta,
-    InternalSpan,
-    SpanContext,
-    SpanId,
-    TraceId,
     TransportAttributes,
     TransportTiming,
 )
-from ..protocol import grpc_status_name, parse_grpc_frames, parse_llm_semantics
+from ..assembly import (
+    Ambient,
+    Limitation,
+    PatchSet,
+    Prefilter,
+    SpanDraft,
+    TransportLabel,
+    capture_mode_of,
+    guard,
+    in_degraded_run,
+    resolve_observed,
+    should_capture,
+)
+from ..protocol import parse_llm_semantics
+from ..semantics import (
+    build_gen_ai,
+    build_grpc_fields,
+    has_core_semantics,
+    identifies_llm_call,
+    ws_close_name,
+)
 from ._base import InterceptorInterface
 from ._trackers import _Txn, _WebSocketTracker
 
 if TYPE_CHECKING:
     from .._client import Client
 
-# Headers are parsed but intentionally not recorded on the span (secret protection);
-# PII masking is Phase 3.
+# Headers are parsed but intentionally not recorded on the span (secret protection).
+# Bodies are recorded, and their PII is masked later — in the Rust core, at encode
+# time (`codec.encode_otlp_traces` takes the mode and the disabled categories), not
+# here.
+
+
+def _http_error(txn: Any) -> bool:
+    """Did the peer answer with a 4xx/5xx? Absent status reads as success."""
+    return not 200 <= getattr(txn, "status", 200) < 400
+
+
+def _is_llm_traffic(txn: Any, sem: Any) -> bool:
+    """Is this an LLM call, for the capture policy and for the gen_ai block alike?
+
+    One predicate for both questions on purpose: a transaction the gate admits
+    as agent traffic and then leaves with `gen_ai=None` is worse than either
+    answer alone — captured volume with no identity on it.
+
+    The request-side half is admitted only for an HTTP ERROR, and that is the
+    narrow reading rather than the tidy one. Both provider gates in the Rust
+    parser are SUBSTRING matches on host and path, so an internal service at
+    `anthropic-proxy.corp/v1/messages` whose body happens to carry a `model`
+    field parses as an Anthropic chat call. On a 2xx that shape is genuinely
+    ambiguous — it may be an LLM endpoint wardex cannot read, or not an LLM
+    endpoint at all — and it is already dropped today, so admitting it would be
+    a behaviour change nobody asked for on traffic nobody identified. A 4xx/5xx
+    from a host and path that parse as a provider is not ambiguous in the same
+    way: the request was addressed to a chat endpoint with a model on it, and
+    the reply is the provider refusing. That is the call the fix is about.
+    """
+    return has_core_semantics(sem) or (_http_error(txn) and identifies_llm_call(sem))
 
 
 class _ConnectionState:
@@ -72,7 +110,7 @@ class ByteSeamInterceptor(InterceptorInterface):
     def __init__(self) -> None:
         self._client: Client | None = None
         self._conns: dict[int, _ConnectionState] = {}
-        self._orig: dict[str, Any] = {}
+        self._patches = PatchSet(f"interceptors.{self.name()}")
         self._installed = False
         # Defaults match the core's, so behavior is unchanged until _load_limits
         # resolves an actual config at install() time.
@@ -86,6 +124,18 @@ class ByteSeamInterceptor(InterceptorInterface):
         self._limits = lim.resolved()
         self._native_limits = lim.to_native()
 
+    def _fresh_patchset(self) -> PatchSet:
+        """This seam's PatchSet, wired to the client's debug setting.
+
+        Built at install() rather than in `__init__` because `config.debug` is
+        not known until a client arrives, and a restore that fails invisibly
+        under `debug=True` is exactly what `_diag` exists to prevent. The empty
+        set `__init__` makes is what keeps `uninstall()` safe before any
+        `install()`.
+        """
+        config = getattr(self._client, "config", None)
+        return PatchSet(f"interceptors.{self.name()}", debug=bool(getattr(config, "debug", False)))
+
     # --- Subclass hooks ---
 
     @abstractmethod
@@ -94,7 +144,18 @@ class ByteSeamInterceptor(InterceptorInterface):
     @abstractmethod
     def _resolve_timing(
         self, obj: Any, st: _ConnectionState
-    ) -> tuple[float, float, bool, tuple[str, ...]]: ...
+    ) -> tuple[float, float, bool, tuple[Limitation, ...]]: ...
+
+    def _guard(self, where: str) -> guard:
+        """The one authorized swallow, wired to this seam's debug setting.
+
+        Span assembly runs `SpanDraft.finish()`, which raises `VocabularyError`
+        on a vocabulary breach, and I6 forbids that reaching the host. It is
+        counted and — under `config.debug` — logged with a traceback, so the
+        span this deletes is at least findable.
+        """
+        config = getattr(self._client, "config", None)
+        return guard(where, debug=bool(getattr(config, "debug", False)))
 
     def _url_scheme(self, is_ws: bool) -> str:
         return "wss" if is_ws else "https"
@@ -102,35 +163,50 @@ class ByteSeamInterceptor(InterceptorInterface):
     def _gate(self, st: _ConnectionState, data: bytes, phase: str) -> bool:
         return True
 
-    def _should_capture(self, st: _ConnectionState, txn: Any, sem: Any) -> bool:
-        """Capture-policy gate (Phase 4c, design §5.1).
+    def _transport_prefilter(self, st: _ConnectionState) -> Prefilter:
+        """This seam's opinion about the connection itself, before the policy.
 
-        AGENT (default): LLM-semantic traffic always; anything else only when
-        the tracker latched a *local* wardex span as parent. Remote-only
-        context (a joined trace with no local span) does not open the gate —
-        service meshes attach traceparent to every request, and that must not
-        resurrect the firehose. Fails open: losing data is worse than noise.
+        `DEFER` is the base answer, and it is the honest one for a TLS seam: it
+        knows nothing about the peer that `assembly.should_capture` does not
+        already know better. A seam that DOES know something — the plaintext
+        socket seam, which must never read a link-local metadata endpoint and
+        must always honour `intercept_hosts` — overrides this, and only this.
+        Overriding `_should_capture` itself is what produced the two bugs
+        design §4.4 names.
+        """
+        return Prefilter.DEFER
+
+    def _should_capture(self, st: _ConnectionState, txn: Any, sem: Any) -> bool:
+        """Compose this seam's transport prefilter with the one shared policy.
+
+        The policy itself lives in `assembly._policy` and is asked here, at the
+        single point where both halves are known. Failing open around it is
+        this method's job rather than the policy's: `has_core_semantics` runs
+        parser output through host-supplied objects and can raise, while
+        `should_capture` cannot — so the swallow stays where the risk is.
         """
         try:
-            client = self._client
-            if client is None or client.config.capture_mode is CaptureMode.ALL:
+            pre = self._transport_prefilter(st)
+            if pre is Prefilter.DENY:
+                return False
+            if pre is Prefilter.ALLOW:
                 return True
-            if sem is not None and _has_core_semantics(sem):
-                return True
-            parent = getattr(txn, "parent", None)
-            return parent is not None and not getattr(parent, "is_remote", False)
+            return should_capture(
+                capture_mode_of(self._client),
+                parent=getattr(txn, "parent", None),
+                agent_semantic=sem is not None and _is_llm_traffic(txn, sem),
+                # "a span wardex FAILED to open is what should have been ambient
+                # here". Without it the gate reads an absent parent as "not
+                # agent work" and drops every request inside a run wardex broke
+                # at the top of — the one case where the absent parent is
+                # wardex's own doing rather than evidence about the traffic.
+                degraded=in_degraded_run(),
+            )
         except Exception:
-            return True
+            return True  # losing data is worse than noise (design §5.1)
 
     def _capture_source(self) -> CaptureSource:
         return CaptureSource.SSL
-
-    # --- Monkeypatch helpers ---
-
-    def _patch(self, cls: type, meth: str, wrapper: Any) -> None:
-        key = f"{cls.__name__}.{meth}"
-        self._orig[key] = getattr(cls, meth)
-        setattr(cls, meth, wrapper)
 
     # --- Connection state ---
 
@@ -144,7 +220,7 @@ class ByteSeamInterceptor(InterceptorInterface):
                 old_cid = next(iter(self._conns))
                 old_st = self._conns.pop(old_cid)
                 if isinstance(old_st.tracker, _WebSocketTracker):
-                    for txn in old_st.tracker.flush("ws_evicted"):
+                    for txn in old_st.tracker.flush(Limitation.CONNECTION_EVICTED):
                         self._emit_ws(old_st, txn)
             self._conns[cid] = st
         return st
@@ -212,112 +288,189 @@ class ByteSeamInterceptor(InterceptorInterface):
             else:
                 self._emit_span(obj, st, txn)
 
-    def _emit_span(self, obj: Any, st: _ConnectionState, txn: _Txn) -> None:
-        if self._client is None:
-            return
-        active = txn.parent
-        if active is not None:
-            trace_id = active.trace_id
-            parent_span_id: SpanId | None = active.span_id
-            correlation: CorrelationInfo | None = CorrelationInfo(
-                strategy="contextvar",
-                active_span_id_at_capture=active.span_id,
-                confidence=1.0,
-            )
-        else:
-            trace_id = TraceId.generate()
-            parent_span_id = None
-            correlation = None
+    def _parse_semantics(self, url_host: str, txn: _Txn) -> Any:
+        """LLM semantics for this transaction, or None. Pure — no seam state.
 
-        ctx = SpanContext(trace_id=trace_id, span_id=SpanId.generate())
+        Split out of `_emit_span` because the gate needs its answer: whether a
+        transaction is agent traffic is one of the policy's three inputs, so
+        the parse has to happen before the gate can run. It is safe there
+        precisely because it is pure — it reads bodies the tracker already
+        buffered and touches nothing on the connection.
+        """
+        try:
+            # The resolved limits must travel with the call: the semantic
+            # parser bounds decompression by max_decoded_bytes, and omitting
+            # them here would silently run on the core default.
+            return parse_llm_semantics(
+                url_host,
+                txn.path,
+                txn.request_body,
+                txn.response_body,
+                self._native_limits,
+            )
+        except Exception:
+            return None
+
+    def _emit_span(self, obj: Any, st: _ConnectionState, txn: _Txn) -> None:
+        client = self._client
+        if client is None:
+            return
+        span = None
+        with self._guard("interceptors.seam.emit_span"):
+            span = self._build_span(obj, st, txn)
+        if span is not None:
+            client.capture_span(span)
+
+    def _build_span(self, obj: Any, st: _ConnectionState, txn: _Txn) -> Any:
         url_host = getattr(obj, "server_hostname", None) or st.server_address
+
+        ct = txn.content_type or ""
+        # gRPC: skip LLM semantic extraction (protobuf isn't LLM JSON).
+        is_grpc = ct.startswith("application/grpc") and not ct.startswith("application/grpc-web")
+        sem: Any = None if is_grpc else self._parse_semantics(url_host, txn)
+
+        # ABOVE the gate on purpose, and it must stay there. `_resolve_timing`
+        # is DESTRUCTIVE — it sets `st.timing_consumed` and pops this
+        # connection's record out of the shared store (`_ssl.py`, `_socket.py`)
+        # — and the fact it encodes is "was this the FIRST transaction on this
+        # connection", which is what `connection_reused` means (span.proto:
+        # "whether the connection was reused via pooling"). Move it below the
+        # gate and "first" silently becomes "first CAPTURED", so on a keep-alive
+        # connection whose first request was dropped, the next request — one
+        # that reused an established socket and paid no connect or handshake —
+        # reports the previous request's `tcp_connect_ms` with
+        # `connection_reused=False`. Both are false, and a present span with a
+        # false measurement is worse than a connect cost nobody claims.
+        # Running it for a dropped transaction also keeps that connection's slot
+        # from sitting in the FIFO-capped store until eviction.
+        connect_ms, handshake_ms, reused, timing_markers = self._resolve_timing(obj, st)
+
+        if not self._should_capture(st, txn, sem):
+            return None
+
+        p = resolve_observed(_latched(txn))
         url = f"{self._url_scheme(False)}://{url_host}:{st.server_port}{txn.path}"
         transfer = max(0.0, (txn.end_ns - txn.start_ns) / 1e6 - txn.ttfb_ms)
 
-        connect_ms, handshake_ms, reused, limitations = self._resolve_timing(obj, st)
-
+        # TRANSPORT mode, not an intent (design §6.1 correction in `_vocab.py`):
+        # the seam knows a request happened and, on the branches below, what the
+        # body meant — but `HTTP POST /v1/messages` reports the observation, and
+        # §6.2's twelve intents hold no member for uninterpreted traffic.
+        draft = SpanDraft.transport(
+            p,
+            label=TransportLabel.HTTP,
+            subject=f"{txn.method} {txn.path}",
+            source=self._capture_source(),
+            start_ns=txn.start_ns,
+        )
+        for marker in timing_markers:
+            draft.add_limitation(marker)
         # Markers the protocol parser attached to the transaction (a body that
-        # hit its cap, say). CaptureIntegrity.limitations is where a user reads
-        # them, so a cap applied in Rust has to arrive here or it truncates
-        # invisibly.
-        limitations = limitations + tuple(
-            m for m in getattr(txn, "limitations", ()) if m not in limitations
-        )
+        # hit its cap, say). They arrive as MEMBERS: the string-to-member
+        # crossing happens once, at the PyO3 boundary in `protocol/_http1.py`,
+        # which is where the Rust `&'static str` actually enters Python.
+        #
+        # It used to happen here as well, and that was survivable only while the
+        # first conversion did not exist. Two `from_wire` calls in series is not
+        # idempotent — the second is handed a member, finds no string key, and
+        # returns None — so the marker would be dropped by the very code written
+        # to preserve it. One boundary, and it is the earliest one.
+        # A plain attribute access, not `getattr(txn, "limitations", ())`. The
+        # default could never fire — `_Txn.limitations` is a declared field —
+        # but it is the exact shape that fails silently if the field is ever
+        # renamed or a non-`_Txn` reaches here: every parser marker would
+        # vanish with no error and no counter. An AttributeError is the correct
+        # outcome for that, and it is what the surrounding `guard()` is for.
+        for marker in txn.limitations:
+            draft.add_limitation(marker)
 
-        # Default values for common span fields (HTTP path). If gRPC, _build_grpc_fields
-        # overrides them.
-        sem: Any = None
-        gen_ai = None
         output_data = txn.response_body
-        name = f"HTTP {txn.method} {txn.path}"
         status_code = StatusCode.OK if 200 <= txn.status < 400 else StatusCode.ERROR
-        error_type: str | None = None
-        extra: tuple[tuple[str, str | int | float | bool], ...] = (
-            ("network.protocol.version", txn.version),
-        )
+        # `finish()` refuses `status=ERROR` with no `error.type` and a refused
+        # span is a DELETED span, so this may not be left `None`: without it
+        # every 4xx/5xx on every byte seam — the rate limit, the auth failure,
+        # the provider outage, i.e. the highest-value spans this SDK captures —
+        # disappears into a counter. The value is the response status rendered
+        # as a string, which is what OTel's HTTP-client semconv prescribes when
+        # the instrumentation has no richer classification. That is exactly
+        # wardex's position here: the seam observed a 500, it did not observe
+        # why. Low cardinality, and a fact rather than a guess.
+        error_type: str | None = str(txn.status) if status_code is StatusCode.ERROR else None
+        draft.set_extra("network.protocol.version", txn.version)
 
-        ct = txn.content_type or ""
         if ct.startswith("application/grpc-web"):
             # grpc-web uses different framing and is unsupported — leave it as plain h2 but mark it.
-            limitations = limitations + ("grpc_web_unsupported",)
-
-        is_grpc = ct.startswith("application/grpc") and not ct.startswith("application/grpc-web")
+            draft.add_limitation(Limitation.GRPC_WEB_UNSUPPORTED)
 
         if is_grpc:
-            # gRPC: skip LLM semantic extraction (protobuf isn't LLM JSON), assemble gRPC fields.
-            name, status_code, error_type, extra, limitations = _build_grpc_fields(
-                txn, extra, limitations
+            # gRPC fields; `sem` is already None (see the parse above).
+            _name, status_code, error_type, grpc_extra, grpc_markers = build_grpc_fields(
+                txn, (), ()
             )
+            for key, value in grpc_extra:
+                draft.set_extra(key, value)
+            for marker in grpc_markers:
+                draft.add_limitation(marker)
+            # The helper falls back to plain h2 when the framing parse fails and
+            # says so with FRAME_PARSE_FAILED; the label follows the same
+            # decision, so the span's name and its marker cannot disagree.
+            if Limitation.FRAME_PARSE_FAILED not in grpc_markers:
+                draft.relabel(TransportLabel.GRPC, txn.path)
         else:
-            # --- LLM semantic extraction (body parser) ---
-            try:
-                # The resolved limits must travel with the call: the semantic
-                # parser bounds decompression by max_decoded_bytes, and
-                # omitting them here would silently run on the core default.
-                sem = parse_llm_semantics(
-                    url_host,
-                    txn.path,
-                    txn.request_body,
-                    txn.response_body,
-                    self._native_limits,
-                )
-            except Exception:
-                sem = None
+            # --- LLM semantics (parsed above the gate) ---
             if sem is not None:
                 if sem.decoded_response is not None:
                     output_data = bytes(sem.decoded_response)
                 streamed = bool(getattr(sem, "reassembled_from_stream", False))
-                if _has_core_semantics(sem):
-                    gen_ai = _build_gen_ai(sem)
-                    if streamed:
-                        limitations = limitations + ("reassembled_from_stream",)
+                # The same predicate the capture gate used. Asking a different
+                # question here is what produced a span the policy admitted as
+                # agent traffic and then shipped with `gen_ai=None`.
+                identified = _is_llm_traffic(txn, sem)
+                if identified:
+                    draft.set_gen_ai(build_gen_ai(sem))
+                if streamed:
+                    # Keyed on `streamed` rather than on the response having
+                    # yielded semantics: a reassembled stream is reassembled
+                    # whatever came back, and hanging these off the identity
+                    # test makes a known provider's usage-less stream stop
+                    # saying it was reassembled at all.
+                    if identified:
+                        draft.add_limitation(Limitation.REASSEMBLED_FROM_STREAM)
                         if sem.output_tokens is None:
-                            limitations = limitations + ("stream_usage_unavailable",)
+                            draft.add_limitation(Limitation.STREAM_USAGE_UNAVAILABLE)
                         if txn.version == "2":
-                            limitations = limitations + ("ttft_unavailable_h2",)
-                elif streamed:
-                    limitations = limitations + ("sse_unknown_provider",)
-                else:
+                            draft.add_limitation(Limitation.TTFT_UNAVAILABLE_H2)
+                    else:
+                        draft.add_limitation(Limitation.SSE_UNKNOWN_PROVIDER)
+                elif not has_core_semantics(sem) and status_code is StatusCode.OK:
+                    # Narrowed to a SUCCESSFUL response the parser could not
+                    # read. A 4xx/5xx body is an error envelope; the parse did
+                    # not fail, so claiming it did sent every rate limit and
+                    # every auth failure out under a marker that says "wardex
+                    # could not understand this" when the truth — already on the
+                    # span as `status=ERROR` and `error.type` — is that the
+                    # provider refused.
+                    #
                     # No need for semantic_parse_failed if tool_calls extraction succeeded.
                     if sem.output_messages is None:
-                        limitations = limitations + ("semantic_parse_failed",)
+                        draft.add_limitation(Limitation.SEMANTIC_PARSE_FAILED)
                 # Structured extraction of output.messages
                 om = sem.output_messages
                 if om is not None:
-                    extra = extra + (("gen_ai.output.messages", om),)
+                    draft.set_extra("gen_ai.output.messages", om)
                     if sem.tool_args_unparsed:
-                        limitations = limitations + ("tool_args_unparsed",)
+                        draft.add_limitation(Limitation.TOOL_ARGS_UNPARSED)
                     if sem.output_messages_has_unmapped:
-                        limitations = limitations + ("output_messages_unmapped_part",)
+                        draft.add_limitation(Limitation.OUTPUT_MESSAGES_UNMAPPED_PART)
                 # Structured extraction of input.messages / system_instructions
                 im = sem.input_messages
                 if im is not None:
-                    extra = extra + (("gen_ai.input.messages", im),)
+                    draft.set_extra("gen_ai.input.messages", im)
                     if sem.input_messages_has_unmapped:
-                        limitations = limitations + ("input_messages_unmapped_part",)
+                        draft.add_limitation(Limitation.INPUT_MESSAGES_UNMAPPED_PART)
                 si = sem.system_instructions
                 if si is not None:
-                    extra = extra + (("gen_ai.system_instructions", si),)
+                    draft.set_extra("gen_ai.system_instructions", si)
 
         timing = TransportTiming(
             tcp_connect_ms=connect_ms,
@@ -328,65 +481,44 @@ class ByteSeamInterceptor(InterceptorInterface):
         )
         # response_size is the wire (compressed) size, while output_data is the
         # decompressed body, so lengths may differ for gzip responses (intended behavior).
-        transport = TransportAttributes(
-            connection_id=str(id(obj)),
-            protocol=Protocol.HTTP,
-            direction=Direction.OUTBOUND,
-            timing=timing,
-            request_size=len(txn.request_body),
-            response_size=len(txn.response_body),
-            http=HttpMeta(method=txn.method, url=url, status_code=txn.status),
-            connection_reused=reused,
+        draft.set_transport(
+            TransportAttributes(
+                connection_id=str(id(obj)),
+                protocol=Protocol.HTTP,
+                direction=Direction.OUTBOUND,
+                timing=timing,
+                request_size=len(txn.request_body),
+                response_size=len(txn.response_body),
+                http=HttpMeta(method=txn.method, url=url, status_code=txn.status),
+                connection_reused=reused,
+            )
         )
-        integrity = CaptureIntegrity(
-            request_headers_captured=False,
-            request_body_captured=True,
-            response_headers_captured=False,
-            response_body_captured=True,
-            truncated=txn.truncated,
-            limitations=limitations,
-        )
-        if not self._should_capture(st, txn, sem):
-            return
-        span = InternalSpan(
-            context=ctx,
-            parent_span_id=parent_span_id,
-            name=name,
-            kind=SpanKind.CLIENT,
-            start_time_ns=txn.start_ns,
-            end_time_ns=txn.end_ns,
-            status=status_code,
-            error_type=error_type,
-            gen_ai=gen_ai,
-            transport=transport,
-            server_address=st.server_address,
-            server_port=st.server_port,
-            input_data=txn.request_body,
-            output_data=output_data,
-            capture_sources=(self._capture_source(),),
-            capture_integrity=integrity,
-            correlation=correlation,
-            extra=extra,
-        )
-        self._client.capture_span(span)
+        draft.set_server(st.server_address, st.server_port)
+        draft.set_status(status_code)
+        draft.set_error(error_type)
+        # "attempted and succeeded", not "non-empty": the seam read both bodies
+        # off the tracker, and a zero-length body is a captured zero-length body.
+        draft.set_io(input_data=txn.request_body, output_data=output_data)
+        draft.integrity.truncated(txn.truncated)
+        return draft.finish(txn.end_ns)
 
     def _emit_ws(self, st: _ConnectionState, txn: _Txn) -> None:
-        if self._client is None:
+        client = self._client
+        if client is None:
             return
-        active = txn.parent
-        if active is not None:
-            trace_id = active.trace_id
-            parent_span_id: SpanId | None = active.span_id
-            correlation: CorrelationInfo | None = CorrelationInfo(
-                strategy="contextvar",
-                active_span_id_at_capture=active.span_id,
-                confidence=1.0,
-            )
-        else:
-            trace_id = TraceId.generate()
-            parent_span_id = None
-            correlation = None
-        ctx = SpanContext(trace_id=trace_id, span_id=SpanId.generate())
+        span = None
+        with self._guard("interceptors.seam.emit_ws"):
+            span = self._build_ws_span(st, txn)
+        if span is not None:
+            client.capture_span(span)
+
+    def _build_ws_span(self, st: _ConnectionState, txn: _Txn) -> Any:
+        # `agent_semantic=False`: a WS session carries no parsed LLM semantics
+        # (`sem` is None on this path by construction), so it is captured only
+        # under ALL, an allowlisted host, or a live local span.
+        if not self._should_capture(st, txn, None):
+            return None
+        p = resolve_observed(_latched(txn))
 
         code = txn.ws_close_code
         # Status based on close code: 1000/1001/none = OK, otherwise = ERROR
@@ -395,20 +527,22 @@ class ByteSeamInterceptor(InterceptorInterface):
             error_type = None
         else:
             status_code = StatusCode.ERROR
-            error_type = _ws_close_name(code)
+            error_type = ws_close_name(code)
 
-        extra: tuple[tuple[str, str | int | float | bool], ...] = (
-            ("network.protocol.version", "websocket"),
-            ("ws.messages.sent", txn.ws_messages_sent),
-            ("ws.messages.received", txn.ws_messages_received),
-            ("ws.bytes.sent", txn.ws_bytes_sent),
-            ("ws.bytes.received", txn.ws_bytes_received),
+        draft = SpanDraft.transport(
+            p,
+            label=TransportLabel.WEBSOCKET,
+            subject=txn.path,
+            source=self._capture_source(),
+            start_ns=txn.start_ns,
         )
+        draft.set_extra("network.protocol.version", "websocket")
+        draft.set_extra("ws.messages.sent", txn.ws_messages_sent)
+        draft.set_extra("ws.messages.received", txn.ws_messages_received)
+        draft.set_extra("ws.bytes.sent", txn.ws_bytes_sent)
+        draft.set_extra("ws.bytes.received", txn.ws_bytes_received)
         if code is not None:
-            extra = extra + (("ws.close_code", code),)
-
-        if not self._should_capture(st, txn, None):
-            return
+            draft.set_extra("ws.close_code", code)
 
         timing = TransportTiming(
             tcp_connect_ms=0.0,
@@ -417,168 +551,50 @@ class ByteSeamInterceptor(InterceptorInterface):
             ttft_ms=0.0,
             transfer_ms=max(0.0, (txn.end_ns - txn.start_ns) / 1e6),
         )
-        transport = TransportAttributes(
-            connection_id=str(id(st)),
-            protocol=Protocol.HTTP,
-            direction=Direction.OUTBOUND,
-            timing=timing,
-            request_size=txn.ws_bytes_sent,
-            response_size=txn.ws_bytes_received,
-            http=HttpMeta(
-                method="GET",
-                url=f"{self._url_scheme(True)}://{st.server_address}:{st.server_port}{txn.path}",
-                status_code=101,
-            ),
-            connection_reused=False,
+        draft.set_transport(
+            TransportAttributes(
+                connection_id=str(id(st)),
+                protocol=Protocol.HTTP,
+                direction=Direction.OUTBOUND,
+                timing=timing,
+                request_size=txn.ws_bytes_sent,
+                response_size=txn.ws_bytes_received,
+                http=HttpMeta(
+                    method="GET",
+                    url=(
+                        f"{self._url_scheme(True)}://{st.server_address}:{st.server_port}{txn.path}"
+                    ),
+                    status_code=101,
+                ),
+                connection_reused=False,
+            )
         )
-        integrity = CaptureIntegrity(
-            request_headers_captured=False,
-            request_body_captured=True,
-            response_headers_captured=False,
-            response_body_captured=True,
-            truncated="ws_payload_truncated" in txn.ws_markers,
-            limitations=txn.ws_markers,
-        )
-        span = InternalSpan(
-            context=ctx,
-            parent_span_id=parent_span_id,
-            name=f"WS {txn.path}",
-            kind=SpanKind.CLIENT,
-            start_time_ns=txn.start_ns,
-            end_time_ns=txn.end_ns,
-            status=status_code,
-            error_type=error_type,
-            transport=transport,
-            server_address=st.server_address,
-            server_port=st.server_port,
-            input_data=txn.request_body,
-            output_data=txn.response_body,
-            capture_sources=(self._capture_source(),),
-            capture_integrity=integrity,
-            correlation=correlation,
-            extra=extra,
-        )
-        self._client.capture_span(span)
+        draft.set_server(st.server_address, st.server_port)
+        draft.set_status(status_code)
+        draft.set_error(error_type)
+        draft.set_io(input_data=txn.request_body, output_data=txn.response_body)
+        draft.integrity.truncated(Limitation.WS_PAYLOAD_TRUNCATED in txn.ws_markers)
+        for marker in txn.ws_markers:
+            draft.add_limitation(marker)
+        return draft.finish(txn.end_ns)
 
 
-_OPERATION_MAP = {"chat": OperationName.CHAT, "embeddings": OperationName.EMBEDDINGS}
-_PROVIDER_MAP = {"openai": ProviderName.OPENAI, "anthropic": ProviderName.ANTHROPIC}
+def _latched(txn: _Txn) -> Ambient:
+    """The scope as it was when this transaction's request was ISSUED.
 
+    Both emit paths run on the RESPONSE side, where the ambient context has
+    already moved on — so neither may call `latch_ambient()` itself. The tracker
+    did the latching at request time (`_trackers.py`, `self._parent`), and this
+    wraps what it captured in the shape `resolve_parentage` consumes.
 
-def _has_core_semantics(sem: Any) -> bool:
-    """True if at least one core semantic (model, tokens) is present."""
-    return (
-        sem.input_tokens is not None
-        or sem.output_tokens is not None
-        or sem.response_model is not None
-    )
-
-
-def _ws_close_name(code: int) -> str:
-    return {
-        1002: "protocol_error",
-        1003: "unsupported_data",
-        1007: "invalid_payload",
-        1008: "policy_violation",
-        1009: "message_too_big",
-        1010: "mandatory_extension",
-        1011: "internal_error",
-    }.get(code, f"close_{code}")
-
-
-def _build_grpc_fields(
-    txn: _Txn,
-    extra: tuple[tuple[str, str | int | float | bool], ...],
-    limitations: tuple[str, ...],
-) -> tuple[
-    str,
-    StatusCode,
-    str | None,
-    tuple[tuple[str, str | int | float | bool], ...],
-    tuple[str, ...],
-]:
-    """Assemble gRPC span fields → (name, status_code, error_type, extra, limitations).
-
-    On parse failure, falls back to plain h2 (HTTP) fields + grpc_parse_failed marker.
+    `conversation` and `tracestate` are None because the tracker latches neither
+    today; that is exactly the pre-existing behaviour (the seam never set
+    `InternalSpan.conversation`), and widening the latch to a full `Ambient`
+    belongs with the seam decomposition (design §3.3) — it is a change to what
+    the tracker captures at request time, not to how this function shapes what
+    it already captured.
     """
-    try:
-        req = parse_grpc_frames(txn.request_body)
-        resp = parse_grpc_frames(txn.response_body)
-    except Exception:
-        http_status = StatusCode.OK if 200 <= txn.status < 400 else StatusCode.ERROR
-        return (
-            f"HTTP {txn.method} {txn.path}",
-            http_status,
-            None,
-            extra,
-            limitations + ("grpc_parse_failed",),
-        )
-
-    name = f"gRPC {txn.path}"
-    code = txn.grpc_status
-    status_code = StatusCode.ERROR if code not in (0, None) else StatusCode.OK
-    error_type = grpc_status_name(code) if status_code is StatusCode.ERROR else None
-
-    # "/pkg.Svc/Method" → service="pkg.Svc", method="Method"
-    service, method = "", ""
-    trimmed = txn.path.lstrip("/")
-    if "/" in trimmed:
-        service, method = trimmed.rsplit("/", 1)
-    else:
-        method = trimmed
-
-    extra = extra + (
-        ("rpc.system", "grpc"),
-        ("rpc.service", service),
-        ("rpc.method", method),
-        ("rpc.grpc.request.message_count", len(req.messages)),
-        ("rpc.grpc.response.message_count", len(resp.messages)),
-    )
-    if code is not None:
-        extra = extra + (("rpc.grpc.status_code", code),)
-    # If grpc-message is present, include it on the span — useful for diagnosing errors
-    # (e.g. "NOT_FOUND: collection x missing")
-    if txn.grpc_message:
-        extra = extra + (("rpc.grpc.status_message", txn.grpc_message),)
-
-    if code is None:
-        limitations = limitations + ("grpc_status_unavailable",)
-    if any(m.compressed for m in req.messages) or any(m.compressed for m in resp.messages):
-        limitations = limitations + ("grpc_compressed",)
-    if req.truncated or resp.truncated:
-        limitations = limitations + ("grpc_message_truncated",)
-
-    return name, status_code, error_type, extra, limitations
-
-
-def _build_gen_ai(sem: Any) -> GenAIAttributes:
-    """Convert LlmSemantics → GenAIAttributes."""
-    stops = tuple(sem.stop_sequences) if sem.stop_sequences else None
-    finishes = tuple(sem.finish_reasons) if sem.finish_reasons else None
-    return GenAIAttributes(
-        operation=_OPERATION_MAP.get(sem.operation, sem.operation),
-        provider=_PROVIDER_MAP.get(sem.provider, sem.provider),
-        request_model=sem.request_model,
-        response_model=sem.response_model,
-        response_id=sem.response_id,
-        input_tokens=sem.input_tokens,
-        output_tokens=sem.output_tokens,
-        cache_read_input_tokens=sem.cache_read_input_tokens,
-        cache_creation_input_tokens=sem.cache_creation_input_tokens,
-        reasoning_output_tokens=sem.reasoning_output_tokens,
-        temperature=sem.temperature,
-        max_tokens=sem.max_tokens,
-        top_p=sem.top_p,
-        top_k=sem.top_k,
-        seed=sem.seed,
-        frequency_penalty=sem.frequency_penalty,
-        presence_penalty=sem.presence_penalty,
-        choice_count=sem.choice_count,
-        stop_sequences=stops,
-        stream=sem.stream,
-        finish_reasons=finishes,
-        output_type=sem.output_type,
-    )
+    return Ambient(span_context=txn.parent, conversation=None, tracestate=None)
 
 
 def _peer(obj: Any) -> tuple[str, int]:

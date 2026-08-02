@@ -1,4 +1,4 @@
-//! Phase 0: proto/wardex/v1/*.proto → OUT_DIR/wardex.v1.rs
+//! proto/wardex/v1/*.proto → OUT_DIR/wardex.v1.rs
 
 fn main() {
     let protoc = protoc_bin_vendored::protoc_bin_path()

@@ -5,7 +5,32 @@ from __future__ import annotations
 from .. import _wardex_native
 from .._enums import Protocol
 from .._types import ParsedMessage
+from ..assembly import Limitation, counters
 from ._base import ProtocolParserInterface
+
+
+def _resolve_markers(raw: object) -> tuple[Limitation, ...]:
+    """Rust marker strings -> `Limitation` members. THE boundary, and the only one.
+
+    The native parsers hand back `&'static str`, so this is where the closed
+    vocabulary is actually entered. A string with no member cannot be carried
+    forward — `CaptureIntegrity.limitations` holds members now — so the choice is
+    between dropping it in silence and saying so. It says so: the drop is
+    counted and, under `init(debug=True)`, logged.
+
+    It should be unreachable. `tests/test_limitation_census.py` reads every
+    marker literal in `crates/` on every test run and fails if one has no member
+    here, which makes drift a CI failure rather than a runtime surprise. This
+    branch is what keeps that guarantee honest if someone ever bypasses it.
+    """
+    out: list[Limitation] = []
+    for value in raw.limitations:  # type: ignore[attr-defined]
+        member = Limitation.from_wire(value)
+        if member is None:
+            counters.bump("protocol.limitation_unresolved")
+            continue
+        out.append(member)
+    return tuple(out)
 
 
 def _to_parsed(raw: object) -> ParsedMessage:
@@ -19,7 +44,7 @@ def _to_parsed(raw: object) -> ParsedMessage:
         body=raw.body,  # type: ignore[attr-defined]
         header_len=raw.header_len,  # type: ignore[attr-defined]
         truncated=raw.truncated,  # type: ignore[attr-defined]
-        limitations=tuple(raw.limitations),  # type: ignore[attr-defined]
+        limitations=_resolve_markers(raw),
     )
 
 

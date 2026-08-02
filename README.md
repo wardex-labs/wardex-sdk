@@ -38,6 +38,9 @@ wardex.close()  # optional — spans auto-flush every 5s, on buffer threshold, a
 - Zero-instrumentation capture of LLM HTTP calls (OpenAI, Anthropic) over
   `https`, cleartext `http`, and h2c
 - `gen_ai` semantics: model, tokens, parameters, finish reasons, input/output messages
+- Failed provider calls (429 rate limits, 401s, 5xx) are captured with the same
+  `gen_ai` identity and content as successful ones — only the response-side
+  fields are empty
 - Transport metrics (TCP/TLS timing, TTFT), gRPC (grpclib), WebSocket (`wss`), MCP stdio
 - Export to any OpenTelemetry backend via `OtlpHttpTransport`
 - Manual span decorators: `@workflow` / `@agent` / `@task` / `@tool` / `@span`
@@ -47,6 +50,9 @@ wardex.close()  # optional — spans auto-flush every 5s, on buffer threshold, a
   `pii_disabled_categories={PIICategory.IP_ADDRESS}` for per-category opt-out)
 - Background batching: automatic flush every 5s / on buffer threshold /
   at exit and on SIGINT/SIGTERM (chained; opt out with `flush_on_signals=False`)
+- Shutdown closes agent runs that are still in flight, so an interrupted run
+  still exports its span — marked `unit_interrupted` or `adapter_uninstalled`
+  — instead of vanishing along with its open tool calls
 - Framework adapter: Anthropic Agent SDK (`claude_agent_sdk`) — auto-detected,
   zero-instrumentation `invoke_agent`/`chat` spans with tool-call correlation
 
@@ -132,6 +138,18 @@ with wardex.continue_trace(dict(msg.headers())):
     ...  # process the message
 ```
 
+**Pass it a `traceparent` a caller actually sent you, and nothing else.**
+`continue_trace()` takes a string and takes it at its word — that is what makes
+it work over any channel, and it is also its one sharp edge. Any string of the
+right shape becomes a parent, so deriving one from something that is not a
+propagated trace context (a framework's `run_id`, a request id, a hash of a job
+name) manufactures a causal edge that never existed. Spans parented this way are
+recorded with `parent_source = header`, which is how they stay distinguishable
+from the in-process edges wardex derives itself; what wardex cannot tell you is
+whether the header was genuine, because both are just strings. Everywhere else,
+the parent comes from real context propagation and is never built from an
+identifier.
+
 `with wardex.continue_from_otel():` is a one-line alternative to
 `continue_trace()` for code that already runs under an active OpenTelemetry
 span — it adopts that span as the remote parent for the duration of the
@@ -158,6 +176,10 @@ traffic is only captured while it happens inside an active *local* wardex
 span (a `traceparent` received from an upstream caller doesn't count on its
 own — this keeps a service mesh stamping every request with a traceparent
 from reviving the pre-Phase-4 "capture everything" noise).
+
+A recognized provider's **failed** calls count as LLM-semantic traffic too, so
+a 429 or a 401 is captured under the default mode even outside a local span —
+the response status decides the span's `status`, never whether it exists.
 
 This means a bare, unwrapped call to an LLM provider wardex doesn't
 recognize (or a WS-based provider such as OpenAI Realtime, which carries no
@@ -198,6 +220,37 @@ Two exceptions are inert today, so setting them has no effect:
 `replay_buffer_size` (nothing reads it yet) and `zstd_level` (read only by the
 envelope encoder, which no live export path calls — the OTLP exporter neither
 takes limits nor compresses).
+
+`max_units` and `max_entries_per_unit` were on that list until the logical-unit
+registry landed and became their consumer. What crossing one of them looks like
+from your data depends on whether the evicted entry has a span of its own.
+
+**Evictions you can see in your traces.** A root unit evicted at `max_units`,
+and a child unit or an in-flight span evicted at `max_entries_per_unit`, are
+each closed and **exported**, marked `unit_evicted` or `child_span_unclosed`.
+Outgrowing one of these ceilings shows up as marked spans rather than as traces
+that quietly stop appearing.
+
+**Evictions you cannot.** `max_entries_per_unit` also bounds bookkeeping tables
+whose entries are not spans — the lookup aliases that map a framework's own
+identifiers onto units, the keys that de-duplicate two observers of one event,
+and the table of in-process MCP servers wardex has wrapped. Evicting from any of
+them exports nothing, because there is no span to mark. They are counted
+internally instead — `wardex_sdk.assembly.counters.snapshot()` reports them
+under `assembly._units.alias_table_full`, `assembly._units.claim_table_full` and
+`adapters.anthropic.server_table_full` — and what reaches your data is the
+consequence rather than the eviction. A dropped de-duplication key, or a dropped
+server handle, can let one tool call be reported twice.
+
+A dropped **alias** is the one to know about, because it does not look like a
+loss. That identifier stops resolving, so the parent is decided one rung further
+down: if the work carries an ambient wardex span, the span arrives at confidence
+**1.0 with no marker** — hanging off the enclosing session instead of the
+sub-agent it belonged to. A sub-agent's subtree flattens and nothing in the data
+says so. Only when there is no ambient span does it arrive marked
+`unit_inferred_sole` (0.5) or `parent_unresolved`.
+
+Raise `max_entries_per_unit` if you see any of these counters move.
 
 ## Roadmap
 

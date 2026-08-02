@@ -40,6 +40,13 @@ pub struct ClaudeStreamEvent {
     pub message_id: Option<String>,
     pub stop_reason: Option<String>,
     pub parent_tool_use_id: Option<String>,
+    /// Which CALL a `tool_result` answers. Distinct from `parent_tool_use_id`,
+    /// which says which SUB-AGENT produced the line, because one CLI line
+    /// carries both and folding them into one field answers the wrong question
+    /// exactly when a sub-agent runs a tool: the result was filed against the
+    /// `Task` call that spawned the agent, carrying the inner tool's output,
+    /// and the inner call got no result at all.
+    pub tool_result_id: Option<String>,
     pub content_json: Option<Vec<u8>>,
     pub tool_uses: Vec<ToolUse>,
     pub usage: Option<Usage>,
@@ -63,6 +70,7 @@ impl ClaudeStreamEvent {
             message_id: None,
             stop_reason: None,
             parent_tool_use_id: None,
+            tool_result_id: None,
             content_json: None,
             tool_uses: Vec::new(),
             usage: None,
@@ -166,19 +174,30 @@ pub fn parse_stream_line(line: &[u8], outbound: bool) -> Option<ClaudeStreamEven
             // Inbound user messages carry tool results back to the conversation.
             let mut e = ClaudeStreamEvent::new(EventKind::ToolResult);
             e.session_id = s(&v, "session_id");
-            e.parent_tool_use_id = s(&v, "parent_tool_use_id").or_else(|| {
-                v.get("message")
-                    .and_then(|m| m.get("content"))
-                    .and_then(Value::as_array)
-                    .and_then(|blocks| {
-                        blocks.iter().find_map(|b| {
-                            (b.get("type").and_then(Value::as_str) == Some("tool_result"))
-                                .then(|| s(b, "tool_use_id"))
-                                .flatten()
-                        })
-                    })
-            });
-            e.parent_tool_use_id.as_ref()?; // not a tool result -> not semantic here
+            e.parent_tool_use_id = s(&v, "parent_tool_use_id");
+            let block = v
+                .get("message")
+                .and_then(|m| m.get("content"))
+                .and_then(Value::as_array)
+                .and_then(|blocks| {
+                    blocks
+                        .iter()
+                        .find(|b| b.get("type").and_then(Value::as_str) == Some("tool_result"))
+                });
+            e.tool_result_id = block.and_then(|b| s(b, "tool_use_id"));
+            // The block says whether the call FAILED, and nothing read it. A
+            // reconstructed tool span was reported `ok` on the strength of the
+            // result having arrived at all -- so a failing tool and a succeeding
+            // one shipped the same status, which is the one field anyone filters
+            // an agent run by.
+            e.is_error = block
+                .and_then(|b| b.get("is_error"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            // The tool_result BLOCK is what makes this line semantic here. Keying
+            // the refusal on `parent_tool_use_id` also admitted a sub-agent's
+            // ordinary user message, which carries that field and no result.
+            e.tool_result_id.as_ref()?;
             e.content_json = v.get("message").and_then(raw);
             Some(e)
         }
@@ -243,7 +262,40 @@ mod tests {
     fn parses_tool_result() {
         let e = parse_stream_line(TOOL_RESULT, false).unwrap();
         assert_eq!(e.kind, EventKind::ToolResult);
+        assert_eq!(e.tool_result_id.as_deref(), Some("toolu_01"));
         assert_eq!(e.parent_tool_use_id.as_deref(), Some("toolu_01"));
+    }
+
+    /// A result produced INSIDE a sub-agent names the call it answers, not the
+    /// `Task` that spawned the agent. The CLI puts both on one line and they are
+    /// different questions; folding them cost the inner call its result and gave
+    /// the outer one bytes that were never its own.
+    #[test]
+    fn a_result_inside_a_subagent_names_the_call_it_answers() {
+        const NESTED: &[u8] = br#"{"type":"user","session_id":"s-1","parent_tool_use_id":"toolu_TASK","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_BASH","content":"out"}]}}"#;
+        let e = parse_stream_line(NESTED, false).unwrap();
+        assert_eq!(e.tool_result_id.as_deref(), Some("toolu_BASH"));
+        assert_eq!(e.parent_tool_use_id.as_deref(), Some("toolu_TASK"));
+    }
+
+    /// A tool that failed says so in its own result block.
+    #[test]
+    fn a_failed_tool_result_carries_its_failure() {
+        const FAILED: &[u8] = br#"{"type":"user","session_id":"s-1","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_01","content":"boom","is_error":true}]}}"#;
+        let e = parse_stream_line(FAILED, false).unwrap();
+        assert_eq!(e.tool_result_id.as_deref(), Some("toolu_01"));
+        assert!(e.is_error);
+        // and the ordinary one still does not
+        assert!(!parse_stream_line(TOOL_RESULT, false).unwrap().is_error);
+    }
+
+    /// A sub-agent's ordinary user message carries `parent_tool_use_id` and no
+    /// result block. Keying the refusal on that field admitted it as a tool
+    /// result whose content was the whole message.
+    #[test]
+    fn a_subagents_plain_message_is_not_a_tool_result() {
+        const PLAIN: &[u8] = br#"{"type":"user","session_id":"s-1","parent_tool_use_id":"toolu_TASK","message":{"role":"user","content":"carry on"}}"#;
+        assert!(parse_stream_line(PLAIN, false).is_none());
     }
 
     #[test]

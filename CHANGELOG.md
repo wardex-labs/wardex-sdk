@@ -5,6 +5,479 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+- **The Agent SDK adapter's in-process tool wrapper no longer decides its own
+  parentage.** It walked a three-tier ladder by hand — the live scope, then the
+  one live session, then nothing — and stamped the confidence and the markers at
+  the end of it, which is the shape every future adapter would have copied. It
+  opens through `AdapterContext.enter()` now, so the edge is decided in the one
+  place that decides edges, and the tier markers come from the table that owns
+  them: `adapters/` holds no site that can name `PARENT_UNRESOLVED` or
+  `UNIT_INFERRED_SOLE` on an edge it chose itself. The tree it produces is
+  unchanged, asserted row by row.
+- **A site may now DECLARE the one guess it is allowed to make**, with
+  `fallback=Fallback.SOLE_LIVE_RUN`. An in-process tool handler is reached
+  through a carrier the framework may not have propagated to, and orphaning
+  there turns one run into several traces — the failure `Placement` exists to
+  prevent, facing the other way. Declared rather than computed, for the same
+  reason placement is: a heuristic that turns itself on is one nobody can find
+  later. It is reachable only where the site would otherwise become a trace
+  root, so a live scope or a host span always wins; the candidate comes from the
+  registry filtered to that adapter's own runs, and only when there is exactly
+  one; and the edge it produces says `unit_sole` at 0.5 with
+  `UNIT_INFERRED_SOLE`. A guess made while a dead pin was standing also carries
+  `correlation_conflict`, because "nothing was pinned" and "what was pinned had
+  died" are not the same fact.
+- **`AdapterContext.enter()`, `open_run()` and `rejoin()` take a `describe=`
+  callable, and that is where an adapter's own code belongs.** It runs inside
+  the same failure boundary as the open, before the host's block, so opening a
+  span and describing it succeed or fail together. Described in the `with` body
+  instead, a framework attribute that moved between releases ships a span
+  reading `status=OK` with full input and output, a real duration, and an
+  arbitrary suffix of its markers silently gone — indistinguishable downstream
+  from a complete observation. `RunHandle` is now a `Scope`, which deletes four
+  members it had been carrying in duplicate.
+- **An `execute_tool` span from the Agent SDK adapter no longer publishes a
+  `correlation`.** It used to carry `confidence` 1.0 (hook path) or 0.7
+  (stream-only) with no `parent_source` beside it — which encodes on the wire as
+  `parent_source = UNSPECIFIED`, indistinguishable from a sender that never set
+  the field. The number was never about the parent edge either: it was the
+  observation channel wearing a certainty's clothes, so anyone filtering on low
+  confidence was selecting spans wardex had watched from a different vantage
+  point rather than spans whose place in the tree was a guess. The channel now
+  travels where it means something — a stream-reconstructed span carries
+  `stdio` in `capture_sources` — and the framework's `tool_use_id` keeps its
+  own home as the tool's `call_id`.
+
+### Fixed
+- **Nothing that can raise is left outside a failure boundary in the tool
+  wrapper.** Two places in a `with ctx.enter(...)` statement are not contained
+  and neither is obvious. Every argument in the HEADER is evaluated before the
+  block is entered, so a framework attribute read there breaks the host exactly
+  as one in the body would and no guard wardex can add will ever see it; the
+  BODY is unguarded on purpose, because a guard there would swallow the host's
+  own exception and report a failing tool call as a successful one.
+
+  The one header that existed built a selector out of a framework read, an
+  f-string and a counter. It is gone: a site that names no selector now gets a
+  unique one the context mints for itself — which is also a better key, since
+  the shared one it replaces had every anonymous unit in the process rebinding
+  a single alias slot. And `_tool_input`, which runs in the body on the HOST's
+  own return value, is total rather than catching what `json.dumps` documents:
+  a container whose `items()` raises is not a `TypeError`, and the host was
+  losing its result over a span attribute nobody would have missed.
+
+  Both are now shape rules rather than care taken. `test_import_graph.py`
+  refuses a header that is anything but names, literals, enum members and a
+  `partial` of a name, and a body that is anything but the host's own call and
+  verbs on the scope — because neither is a property any other check can see: a
+  call-graph rule cannot see an attribute read, and there is no runtime moment
+  at which "this expression was in a header" is observable.
+- **A run wardex failed to open no longer silences everything inside it.** Under
+  `capture_mode=AGENT` — the default — traffic is captured when a local wardex
+  span was ambient at the moment the work was issued. A run entry that could not
+  be opened leaves nothing ambient, so every HTTP request and every tool call in
+  the host's block was dropped at the byte seam with no counter and no marker:
+  one bug at the top turned into total silence underneath, and the run read as
+  one that never happened rather than one wardex could not follow. Measured
+  end-to-end through `wardex.span()` on the default mode: captured before the
+  block failed, dropped after.
+
+  The gate now takes "the missing parent is wardex's own doing" as a declared
+  input, set on the task for the duration of the block the host was given
+  anyway. What comes through is not passed off as ordinary: such a span resolves
+  as `unresolved` at confidence 0.0 carrying `parent_unresolved` and
+  `instrumentation_degraded`, never as a trace root — shipped as a root it would
+  be one run arriving as several, indistinguishable from genuine ones. An edge
+  wardex really did read is untouched, because the flag describes an ABSENT
+  parent and never a present one.
+- **A span built from an interpreted edge now carries the markers that edge
+  earned.** `SpanDraft` is built FROM a parentage but did not inherit its
+  markers, so a span could ship a confidence below 1.0 with an empty limitation
+  list — half of I4 missing, and the half a dashboard renders. Two of the six
+  parentage sites copied them across by hand and the rest did not; the draft's
+  own constructor does it now, so there is no site left that can forget.
+- **`wardex.span()` and `wardex.trace()` no longer raise into the block they
+  wrap.** The SDK's own published context manager had the same hole as the
+  adapter surface and on a shorter path to a user: latching the active scope,
+  resolving the parent edge, building the draft, installing the span as the
+  active parent, reading the client and handing it the finished span all ran
+  outside any failure boundary, and any of them raised out of
+  `with wardex.span(...)` into code that has nothing to do with wardex. Each is
+  contained now, the block always runs, and the builder it receives is one the
+  host can still drive — over a draft nothing will emit, so a lost span costs a
+  span. A carrier that could not be installed costs only the attachment of work
+  inside the block, which is reported separately, because that span itself
+  still ships.
+- **A bug in wardex can no longer break the application it is watching.** The
+  adapter surface put the host's own call — a tool handler, a graph node, an
+  LLM request — inside a `with` block whose open, activation and close were all
+  unguarded, so a defect in wardex's own work would delete that call rather
+  than a span. Every step is contained now: the body always runs, the scope it
+  receives is total (a `degraded` one answers every verb instead of being
+  `None`), and the host's own exception reaches its caller as the SAME OBJECT,
+  including `KeyboardInterrupt` and `CancelledError` — wardex must not become
+  the library in the process that eats a real Ctrl-C. A failure in wardex's
+  teardown can no longer replace the failure the host was in the middle of
+  reporting, which is the shape that made a wardex bug read as a host bug in
+  the host's own logs.
+- **A degraded run is now distinguishable from wardex never having been
+  installed.** Every containment above writes one line to stderr naming the
+  CONSEQUENCE — "this run will produce NO agent span, and under
+  capture_mode=AGENT no HTTP or tool traffic inside it will be captured either"
+  — bounded to one line per site per process, however many times the site
+  trips. This is the same idiom the SDK already used when an adapter fails to
+  load. Where a span still ships it also carries `instrumentation_degraded`,
+  and that half is best effort by contract: it reaches for a holder through the
+  same registry that just failed. On the wire the marker is deliberately not
+  accompanied by a span attribute naming the site, because attributes append
+  without a cap while a marker is idempotent.
+- **One span wardex cannot build no longer costs a whole subtree.** Closing a
+  subtree interleaved two different kinds of work: building spans, which reads
+  drafts and buffers and can fail, and unlinking units, which is dict and list
+  operations on wardex's own tables. So a fault partway through left the parent
+  already marked dead, some children already unlinked, every draft collected so
+  far dropped on the floor with the raise, and the rest of the subtree reachable
+  from no root of any registry. The two are separate phases now — collect every
+  span first, with its own failure boundary per span, then unlink, which cannot
+  fail — and the loss is what it should always have been: the one span whose
+  draft is broken.
+
+  Measured on three roots of four children with one broken draft, across the
+  four shapes this has had: one boundary around the whole sweep ships 0 of 15,
+  one per root ships 10 and wedges the failing root in the table forever, one
+  per root plus evicting it ships 10 and leaves 3 units unreachable, and
+  collect-then-unlink ships **14 of 15 with none unreachable**.
+
+  The same measurement found one more: the shutdown sweep stamped its marker on
+  a root's draft inside the close's own boundary, so a draft that could not take
+  the marker skipped the close entirely and the eviction dropped the root
+  without walking under it — twelve children left reachable from nothing. The
+  marker is its own step now, and a marker that cannot be recorded costs the
+  marker.
+- **A failure in the lookup table no longer leaks the unit it was indexing.**
+  A unit is registered before its aliases are bound, so a fault while binding
+  arrived after the unit was already live — and containing it at the caller
+  left that unit registered, reachable from nothing, and counting against the
+  bound on live units until it evicted a real session to make room for a
+  phantom, once per call. It is contained where the state is known instead, so
+  the fault costs the alias — the id lookup misses — and the span still ships.
+- Two agent runs sharing one trace now say so. One CLI subprocess emits
+  `system/init` once, so a second one naming a different run — on a transport
+  identity this adapter still holds live — means the earlier subprocess went
+  away without its close arriving and CPython handed its address to the next
+  object. Everything after it was filed under the earlier run's root with
+  nothing in the data to show it; the run's span now carries
+  `correlation_conflict` and the event is counted under
+  `adapters.assembler.session_key_recycled`. The sessions are not split apart:
+  the same symptom would follow from a CLI that legitimately re-initialises one
+  transport, and splitting a real run in two to fix a merge is the same mistake
+  facing the other way.
+- A tool call that **failed** no longer ships as a success when its span was
+  reconstructed from the CLI's stdout. `is_error` sits in the result block the
+  CLI already sends and nothing read it, so the *arrival* of a result was taken
+  for the *success* of the call — and status is the first field anyone filters
+  an agent run by.
+- **`OtlpHttpTransport` now exports what wardex knows about its own uncertainty.**
+  `correlation` and `capture_integrity` were encoded on the wardex envelope and
+  dropped entirely by the OTLP encoder — and OTLP is the only transport exported
+  from the package root, so on the documented path every "this parent edge is a
+  guess" and every "this body was truncated" reached nobody, indistinguishable
+  from a span that had nothing to report. They now travel as span attributes,
+  the same way a link's `reason` already does: `wardex.parent_source`,
+  `wardex.parent_confidence`, `wardex.correlation.{request_id,operation_id,attempt_id}`,
+  `wardex.limitations` (a string array), `wardex.capture.{request_headers,
+  request_body,response_headers,response_body}` and — only when they happened —
+  `wardex.capture.{truncated,redacted,dropped_chunks}`. A span with nothing to
+  report still carries none of them. List-valued attributes also decode
+  correctly now; `decode_otlp_traces` reported them as unset.
+- A tool a **sub-agent** ran now gets its own `execute_tool` span with its own
+  result. The Agent SDK writes one line for a tool result and puts two different
+  identifiers on it — `parent_tool_use_id` says which sub-agent produced the
+  line, the `tool_result` block's `tool_use_id` says which call the result
+  answers — and the parser folded both into one field. They are equal for a
+  main-agent tool and they diverge for every tool a sub-agent runs, so the
+  result was filed against the `Task` call that spawned the agent: `execute_tool
+  Task` shipped carrying the inner tool's output, the inner call shipped no
+  result at all, and nothing recorded either. A sub-agent's ordinary user
+  message is also no longer mistaken for a tool result — it carries
+  `parent_tool_use_id` and no result block, and refusing on that field admitted
+  it as a result whose content was the whole message.
+
+### Added
+- A 38th `Limitation`, `instrumentation_degraded`, declared in
+  `proto/wardex/v1/common.proto` and in `wardex_sdk.assembly.Limitation`. Every
+  other member of that vocabulary describes a limit of what could be
+  **observed** — the framework did not say, the protocol does not carry it, a
+  bound was reached. This one describes a limit of **wardex**, and it exists
+  because without it the two are indistinguishable downstream and the wrong one
+  gets blamed: a subtree missing because the SDK's own instrumentation failed
+  looks exactly like a subtree that never ran. Declared only; no span carries it
+  yet.
+- `OperationName` gains three members — `execute_step`, `handoff` and
+  `evaluate` — and `ToolExecutionType` gains two, `ipc` and `unknown`. All five
+  are also declared in `proto/wardex/v1/common.proto`, together with a new
+  `LinkReason` enum (`triggered_by`, `handoff_from`, `resumed_from`,
+  `retried_from`, `cache_source`). proto is the source of truth for the span
+  vocabulary in a multi-language SDK; the three enums are declared so the Node
+  and Java adapters generate them rather than re-deriving them from prose. Two
+  of the three intentionally fill no message field yet: `gen_ai.operation.name`
+  and `wardex.tool.execution_type` already travel as span attributes, and a
+  typed field alongside would carry the same value twice.
+- `Span.events` and `Span.links` are now encoded. Both fields have been
+  declared in `span.proto` since the first release and neither was ever
+  filled, so any events or links on a span — including a link's `reason` —
+  were dropped whole when the envelope was encoded. They now round-trip in
+  both directions, on the wardex envelope **and** on the OTLP export path
+  (a link's `reason` has no OTLP-native home, so it travels there as the
+  `wardex.link.reason` link attribute). This is additive: no span the SDK
+  builds today carries either, so nothing that used to be exported changes.
+- Two resource limits, `max_units` (512) and `max_entries_per_unit` (256), on
+  `CaptureLimits` and in `crates/wardex-limits`. `max_units` bounds
+  concurrently tracked *root* logical units; `max_entries_per_unit` bounds each
+  per-unit table (child units, lookup aliases, de-duplication keys, open span
+  drafts). Where the evicted entry has a span — a root unit, a child unit, an
+  in-flight span — crossing the bound **closes it and exports it**, marked
+  `unit_evicted` or `child_span_unclosed`, because a ceiling that dropped state
+  silently would be a worse failure than an unenforced one. The other two
+  tables hold no span, so evicting a lookup alias or a de-duplication key
+  exports nothing and is recorded only in the internal counters
+  `assembly._units.alias_table_full` and `assembly._units.claim_table_full`
+  (`wardex_sdk.assembly.counters.snapshot()`). `max_entries_per_unit` also
+  bounds the adapter's table of wrapped in-process MCP servers, counted under
+  `adapters.anthropic.server_table_full`, so lowering it shrinks that too.
+  Those evictions still change what you see. A dropped de-duplication key, or a
+  dropped server handle, can let one tool call be reported twice. A dropped
+  **alias** is subtler: that identifier stops resolving, the parent is decided
+  one rung further down, and if the work carries an ambient wardex span the
+  edge arrives at confidence **1.0 with no marker** — hanging off the enclosing
+  session rather than the sub-agent it belonged to, so a subtree flattens and
+  nothing in the data says so. Only with no ambient span does it ship
+  `unit_inferred_sole` (0.5) or `parent_unresolved`. Neither limit is a rename of
+  `max_sessions` / `max_session_entries`, which keep their present meaning
+  and their consumer: a per-session table and a cap over one flat table of
+  sessions are not the same quantity as a cap over units of four kinds sharing a
+  single entry point, and reusing the number would silently reinterpret what a
+  user set it to.
+- A logical-unit registry (`wardex_sdk.assembly.UnitRegistry`, `Unit`,
+  `UnitKey`, `UnitKind`). A *unit* is one logical piece of agent work — a
+  session, a sub-agent, a graph step, a call — and it is where an adapter gets a
+  parent from without ever computing one. A framework identifier can reach it
+  only as a `UnitKey`: a lookup alias that selects a unit whose span context
+  wardex produced from a real scope read. There is no API that turns an
+  identifier into a span context, so the causal tree stays a product of
+  in-process context propagation rather than of a framework's callback ids.
+  `resolve()` is most-specific-wins and records what it could not establish —
+  a cross-trace disagreement ships `correlation_conflict`, a sole-live-unit
+  guess ships confidence 0.5 with `unit_inferred_sole`, and an edge that could
+  not be established at all ships `parent_unresolved` rather than nothing.
+  The Agent SDK adapter is its first consumer: its session and each in-process
+  tool call are units, and every other span it emits is anchored to the
+  session unit's own context.
+- `SpanBuilder.set_error(error_type, message="")`, so a manual span that the
+  host marks as failed can name what failed. Marking a span
+  `set_status(StatusCode.ERROR)` without one is still valid and records
+  `error.type = "_OTHER"`, OpenTelemetry's own "no classification available".
+
+### Changed
+- **Wire schema break — `wardex.v1` (`CaptureIntegrity` and `CorrelationInfo`).**
+  `CaptureIntegrity.limitations` (field 8, `repeated string`) and
+  `CorrelationInfo.strategy` (field 6, `string`) are gone. Both tags are
+  `reserved`; the replacements are `repeated Limitation limitation_codes = 9`
+  and `ParentSource parent_source = 7`, two enums now declared in
+  `common.proto` — 37 values and 7 respectively. There is no compatibility
+  shim and no dual-write window.
+
+  This is free exactly once and this is that once: no wardex envelope has ever
+  left a user process. The default transport is a no-op, `endpoint` defaults to
+  `None`, and the only network egress — OTLP — never read either field. Zero
+  bytes are deployed and there are zero consumers, so the "break" renames
+  something nobody has. The tags are not reused, because both reuse directions
+  are unsafe: `repeated string` → packed enum shares wire type 2 and would
+  decode old bytes as one enum value per ASCII byte with no error, and a scalar
+  `string` → enum is a hard `DecodeError` that fails the whole envelope, so one
+  stale span would kill an entire batch.
+
+  On the Python side the same three fields are typed:
+  `CaptureIntegrity.limitations` is `tuple[Limitation, ...]`,
+  `CorrelationInfo.strategy` is `ParentSource | None`, and
+  `InternalSpanLink.reason` is `LinkReason | None`. If you read
+  `span.capture_integrity.limitations`, you now get members rather than strings
+  — compare against `Limitation.BODY_CAP_EXCEEDED`, not `"body_cap_exceeded"`.
+  This also removes a silent failure mode: a filter written against a
+  misspelled marker string used to match nothing and report zero, which reads
+  identically to "this never happened".
+- The Agent SDK adapter's tool spans no longer report
+  `strategy = "adapter_hook"` / `"adapter_stream"`. Those values answered
+  "which source observed this event" — already carried by `capture_sources` —
+  while sitting in the field that means "how was this span's parent derived".
+  The tool span **assembled from hook and stream events** now reports no
+  parentage claim at all, keeping what is actually known: the framework's
+  `tool_use_id` as `request_id`, and the trust gap between the two paths as
+  `confidence` (1.0 from a hook, 0.7 from stream content alone). Which
+  sub-agent such a span belongs to is still a heuristic, so it publishes no
+  `parent_source`. The **in-process** tool span — the one wardex's own handler
+  wrapper opens for a `create_sdk_mcp_server` tool — is the exception and does
+  publish its edge, because the unit registry resolved that edge from a real
+  scope read: `parent_source = unit_active` at confidence 1.0 with no
+  `request_id`. When the session did not reach the handler it falls through
+  three further tiers, and only two of them leave a marker: the sole live
+  session (`unit_sole`, 0.5, marked `unit_inferred_sole`); failing that the
+  ambient wardex span, if the task carries one (`contextvar`, 1.0, **no
+  marker** — the tool hangs off whatever span enclosed it rather than off a
+  session); and finally `unresolved` (0.0, marked `parent_unresolved`).
+- Enum values are now mapped to the wire by deriving the proto value name from
+  the schema rather than by hand-written tables in the PyO3 binding. Twelve
+  such tables are gone. They were a second declaration of a list the `.proto`
+  already owns, with nothing making the compiler compare them, so a value added
+  to one and forgotten in the other would have flattened silently to
+  `UNSPECIFIED` on the wire.
+- A tool span from the Agent SDK adapter now reports
+  `wardex.tool.execution_type = "unknown"` instead of `"network"`, and an MCP
+  stdio tool span reports `"ipc"`. Both used to say `network`, which was
+  simply false: wardex does not observe how a CLI's built-in tool (Bash, Read)
+  executes, and an MCP call runs over a subprocess pipe. If you filter or group
+  on that attribute, the adapter's tool spans move out of the `network` bucket.
+- Four limitation markers changed name, and three more were merged away.
+  `ws_evicted` → `connection_evicted`, `grpc_compressed` and `ws_compressed` →
+  `payload_compressed`, `grpc_parse_failed` and `ws_parse_failed` →
+  `frame_parse_failed`, `tool_span_unclosed` → `child_span_unclosed`, and
+  `async_connect_unavailable` → `connect_timing_unavailable`. The merged pairs
+  reported one fact under two names — which protocol it was is already carried
+  by `TransportAttributes.protocol` — and the markers a user would ACT on
+  differently all stayed separate: `connection_evicted` points at
+  `max_connections`, while `unit_evicted` points at a *unit* bound — `max_units`
+  in the registry, or `max_sessions` in the Agent SDK adapter's own session
+  table. (`unit_evicted` also rides the **new** root that continues a run whose
+  predecessor was evicted, which is what separates "this run was truncated and
+  resumes here" from "a second root appeared from nowhere".)
+  `capture_integrity.limitations` is now a closed vocabulary end to end: an
+  emitter cannot invent a marker string, and a dashboard filtering on the old
+  spellings needs updating.
+- A span with `status=ERROR` now always carries `error.type`. Two spans shipped
+  the pair `is_error=true` with no type: an MCP stdio call that returned a
+  JSON-RPC error (now `json_rpc_<code>`, or `tool_error` for a tool result
+  flagged `isError`) and a failed Agent SDK tool span (now `tool_error`, or
+  `tool_unclosed` when the session ended with the tool still open). An aborted
+  agent session's root span reports `session_error` or `agent_error`. An HTTP
+  span with a 4xx or 5xx response now carries the status rendered as a string
+  (`"429"`, `"500"`), which is what OpenTelemetry's HTTP-client conventions
+  prescribe when the instrumentation observed the failure but not its cause;
+  the byte seam is exactly in that position. A manual span the host marked
+  ERROR without naming a type carries `"_OTHER"`.
+- `capture_integrity.request_body_captured` / `response_body_captured` now mean
+  "capture was attempted and succeeded", not "the payload is non-empty". A tool
+  invoked with `{}` used to be reported as a capture FAILURE on the field the
+  dashboard uses to judge whether a replay is trustworthy.
+- Manual spans (`wardex.span`/`trace` and the decorators) now carry
+  `capture_sources=("manual",)`. They previously carried an empty tuple, which
+  made an `execute_tool` span from the decorator structurally different from
+  one the adapter produced.
+- An Agent SDK session that has not reported a `session_id` now gets a
+  wardex-issued `gen_ai.conversation.id` instead of the empty string. An empty
+  conversation id collides across every session in any store that keys on it.
+  `session_id` itself is now absent rather than `""` when the CLI has not sent
+  one.
+- `wardex.capture_state_snapshot(snapshot_type=...)` now validates its
+  argument. The signature still takes a `str`, and the three known values are
+  unchanged; anything else is recorded as `SNAPSHOT_TYPE_UNSPECIFIED` **and**
+  marked `snapshot_type_unknown` in `wardex.limitations`. Previously an
+  unrecognized value was flattened to `UNSPECIFIED` inside the codec with
+  nothing recorded anywhere.
+- An inbound sampling decision is now honoured instead of being overridden.
+  wardex used to emit `traceparent` with the sampled flag hardcoded to `01`,
+  so a request that arrived with `-00` left with `-01` and every downstream
+  service recorded a trace its own upstream had declined to sample. Received
+  flags now propagate unchanged, and only traces wardex itself originates
+  assert `01` — which is still every trace where wardex is the entry point,
+  because wardex does not head-sample (retention is decided later by the
+  RetentionClassifier). If you relied on the old promotion to force sampling
+  downstream, set the flag upstream instead.
+- More spans now carry `correlation`, including the ones that start a new
+  trace. Manual spans (`wardex.span`/`trace` and the decorators), the Agent
+  SDK adapter's session-root `invoke_agent` span, and any interceptor span
+  with no ambient parent previously reported `correlation=None`, which read
+  as "a parent was expected and lost" and was indistinguishable from a
+  deliberate trace root. The only new `strategy` values are `"trace_root"`,
+  when a span starts its own trace, and `"header"`, when the parent was
+  joined from a W3C `traceparent`; a joined parent used to be reported as
+  `contextvar`. The adapter's `chat` and subagent spans still report no
+  `correlation` — their parent is chosen by a lookup that can silently fall
+  back to the session root, and a `confidence` those edges have not earned
+  would be worse than none.
+- `wardex.capture_state_snapshot()` called with no active span now emits the
+  snapshot instead of discarding it. The snapshot carries
+  `wardex.limitations="parent_unresolved"` in its attributes and the all-zero
+  `span_id` (OTel's invalid-span id), because no span existed to name.
+  Previously the call returned silently and the data was lost with no counter,
+  log or marker. `wardex.limitations` is now the SDK's key on this record: a
+  value passed in `attributes=` under that key is dropped rather than emitted
+  alongside it.
+- Emitted spans now carry the trace's `trace_flags` on their span context
+  rather than a hardcoded `0`. This is not visible on the wire yet: the OTLP
+  span message has no flags field today.
+- The plaintext (non-TLS) seam now obeys `capture_mode`, which it previously
+  ignored. Two consequences, both of which mean MORE spans on that seam.
+  `capture_mode=CaptureMode.ALL` now captures plaintext HTTP; it used to mean
+  "everything except plaintext HTTP", so a user who asked for everything
+  silently did not get it. And plaintext traffic issued inside a live wardex
+  span (a `wardex.span()`, an adapter's `execute_tool` span) is now captured
+  the way the identical request over TLS always was — the two seams used to
+  disagree about the same bytes. Link-local addresses are still never
+  captured, and an `intercept_hosts` allowlist match still bypasses the mode
+  entirely. If the extra plaintext spans are unwanted, the lever is the same
+  one it always was: leave `capture_mode` at its `AGENT` default and do not
+  wrap the calls in a wardex span.
+- A `capture_mode` the SDK cannot read now falls back to the `agent` default
+  instead of to `all`. The field is typed `CaptureMode` and is not validated,
+  so a value like the string `"agent"` is accepted in silence; it previously
+  fell through to the `agent` policy by accident, and only "wardex is not
+  configured at all" ever meant "filter nothing". That is now what the code
+  says. Nothing changes for a `capture_mode` set to a `CaptureMode` member.
+
+### Fixed
+- A call the provider **refused** — a 429 rate limit, a 401, a 5xx — lost the
+  identity its own request had already established. `gen_ai.provider.name`,
+  `gen_ai.operation.name`, `gen_ai.request.model` and the request parameters
+  were all dropped, and the span was marked `semantic_parse_failed`, which was
+  false: the body parsed correctly and was an error envelope. Worse, the same
+  predicate fed the capture policy, so under the default `capture_mode="agent"`
+  a rate-limited call outside a wardex span produced **no span at all** — the
+  call an operator goes looking for was the one guaranteed to be missing.
+  The two questions are now separate: whether the RESPONSE yielded gen_ai truth
+  (tokens, a response model) and whether the REQUEST identified an LLM call
+  (provider, operation, model). A refusal answers the second, so it is now
+  captured and carries the same gen_ai block and the same
+  `gen_ai.input.messages` a successful call carries — **a behaviour change**:
+  the response status used to decide, silently, both whether a span existed and
+  what it could hold, and one prompt was therefore exported on success and
+  dropped on failure. Response-side fields stay empty, including
+  `gen_ai.output.type`, which the parser sets unconditionally and which would
+  otherwise claim the call produced text. `semantic_parse_failed` now means
+  what it says: a SUCCESSFUL response wardex could not read.
+  Two limits on the fix, both deliberate. Only a 4xx/5xx is admitted this way —
+  the provider gates in the parser are substring matches on host and path, so a
+  200 from an internal service at an `anthropic`-ish host is genuinely
+  ambiguous and stays dropped exactly as before. And a proxied or self-hosted
+  endpoint is still invisible: the parser classifies on the response body, and
+  an error envelope carries none of the markers it recognizes.
+- An agent run still in flight when the process stopped exported **nothing**.
+  A session's root span is created by its close, so a run that never reached
+  one left no span at all — not a truncated one, not a marked one, and no
+  counter moved. An interrupted run and a run that never started produced
+  identical data, which is the shape of loss nothing can find later. Shutdown
+  now finalizes live sessions: their still-open tool calls and unstopped
+  sub-agents are emitted first, then the root, carrying `adapter_uninstalled`
+  or `unit_interrupted` depending on how the process ended. This affects
+  Ctrl-C, `SIGTERM` (what `docker stop` and a kubelet send), an explicit
+  `wardex.close()`, and a second `wardex.init()` — a re-init flushes the
+  previous client's live runs into that client rather than abandoning them.
+  Under `SIGTERM` the units are closed inside the signal handler, before the
+  flush, because there the process ends in the handler and `atexit` never
+  runs. That only happens when the signal was left at its default
+  disposition: an app that installed its own handler may well keep running,
+  and ending its live sessions would be a worse lie than a missing span.
+
 ## [0.2.0b1] - 2026-07-28
 
 ### Breaking
@@ -49,6 +522,55 @@ All notable changes to this project are documented here. The format follows
   memory independently of span count.
 
 ### Fixed
+- **An in-process MCP tool's span is now part of the agent's trace.** A tool
+  registered with `create_sdk_mcp_server` used to be connected to nothing: the
+  handler wrapper opened a span with no ambient parent, so it started a trace of
+  its own, invisible from the session — and every HTTP request the tool made
+  in-process was captured accurately *into that orphan trace*. What you saw
+  alongside that orphan depended on one environment variable, and both outcomes
+  were wrong:
+
+  * **Default (the CLI prefixes SDK tool names).** You got the call **twice**.
+    The suppression meant to prevent that never fired, because the skip list
+    held the tool's bare name (`greet`, all the wrapper knows) and was compared
+    against the name the CLI reports (`mcp__tools__greet`). So the hook-driven
+    span appeared in the session tree *and* the orphan span appeared outside it.
+  * **With `CLAUDE_AGENT_SDK_MCP_NO_PREFIX` set**, the CLI reports the bare
+    name, the skip list matched, and the suppression did fire — so the tool node
+    was **missing from the session tree** entirely and the orphan was the only
+    record of the call.
+
+  The tool span is now a child of the session's `invoke_agent` span at
+  confidence 1.0, and the session's own span is what the tool body runs inside —
+  so in-process HTTP attaches to the tool rather than to an orphan root. The
+  edge carries no framework identifier at all: the session is pinned onto the
+  task that drives the SDK's transport read loop, and the handler inherits it by
+  ordinary ContextVar copying, because the SDK dispatches `tools/call` from that
+  loop. `session_id` is still recorded — as a lookup alias and a correlation
+  hint, never as a source of parentage.
+
+  Two observers of one call are now arbitrated on a normalized key rather than
+  on a raw name, so the double emit is not expressible: the handler wrapper owns
+  the call because it wrapped the execution, and the hook observer stands down.
+  Where the two names genuinely cannot be reconciled — an unresolved server
+  token, or `CLAUDE_AGENT_SDK_MCP_NO_PREFIX` with two servers exporting the same
+  bare name — the span says so with `tool_name_collision` instead of guessing.
+  In-process tool spans also carry `tool_call_id_unavailable_in_process`: the
+  handler is dispatched with `{name, arguments}` and no id, and matching one by
+  name and arguments against the stream would be exactly the framework-id
+  heuristic this design removes.
+- An Agent SDK tool handler is restored to the host's own function on
+  `uninstall()`. The wrapper was written directly onto the `SdkMcpTool` instance
+  and was never recorded, so it survived uninstall and re-install for the life
+  of the process.
+- An Agent SDK session evicted at `max_sessions` now emits its root span marked
+  `unit_evicted`. It used to be dropped along with its whole subtree, with no
+  marker, no counter and no log — a workload above the cap simply stopped
+  producing traces.
+- Every swallowed failure in the Agent SDK adapter is now counted and, under
+  `init(debug=True)`, logged with its traceback. Twelve `except Exception: pass`
+  handlers around the transport tee, the patched entry points and the tool
+  wrapper made an SDK bug indistinguishable from wardex not being installed.
 - Non-HTTP traffic over TLS (a Redis, Mongo, or Kafka client sharing the
   process) accumulated in the HTTP/1 parser for the life of the connection —
   an unbounded-memory-growth path. The TLS seam now classifies connections
