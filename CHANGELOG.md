@@ -109,15 +109,29 @@ All notable changes to this project are documented here. The format follows
   same registry that just failed. On the wire the marker is deliberately not
   accompanied by a span attribute naming the site, because attributes append
   without a cap while a marker is idempotent.
-- **One subtree wardex cannot close no longer costs every other one.** The
-  teardown sweep closed every live root under a single failure boundary, so a
-  fault anywhere in one root's subtree abandoned the whole table — measured on
-  three roots of four children each, with one fault: zero of fifteen spans
-  reached the sink. The boundary is now per root, and a root that could not be
-  closed is dropped from the table rather than left in it, because leaving it
-  meant every later sweep walked back into the same fault and the table never
-  emptied. Ten of fifteen ship. The five that do not, and the two units left
-  permanently unreachable, are a real loss and are recorded as one.
+- **One span wardex cannot build no longer costs a whole subtree.** Closing a
+  subtree interleaved two different kinds of work: building spans, which reads
+  drafts and buffers and can fail, and unlinking units, which is dict and list
+  operations on wardex's own tables. So a fault partway through left the parent
+  already marked dead, some children already unlinked, every draft collected so
+  far dropped on the floor with the raise, and the rest of the subtree reachable
+  from no root of any registry. The two are separate phases now — collect every
+  span first, with its own failure boundary per span, then unlink, which cannot
+  fail — and the loss is what it should always have been: the one span whose
+  draft is broken.
+
+  Measured on three roots of four children with one broken draft, across the
+  four shapes this has had: one boundary around the whole sweep ships 0 of 15,
+  one per root ships 10 and wedges the failing root in the table forever, one
+  per root plus evicting it ships 10 and leaves 3 units unreachable, and
+  collect-then-unlink ships **14 of 15 with none unreachable**.
+
+  The same measurement found one more: the shutdown sweep stamped its marker on
+  a root's draft inside the close's own boundary, so a draft that could not take
+  the marker skipped the close entirely and the eviction dropped the root
+  without walking under it — twelve children left reachable from nothing. The
+  marker is its own step now, and a marker that cannot be recorded costs the
+  marker.
 - **A failure in the lookup table no longer leaks the unit it was indexing.**
   A unit is registered before its aliases are bound, so a fault while binding
   arrived after the unit was already live — and containing it at the caller

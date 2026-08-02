@@ -1432,7 +1432,16 @@ class UnitRegistry:
                 # a fix — see `_close_locked` for what a real one would take.
                 closed = False
                 with guard("assembly._units.close_all_root", debug=self._debug):
-                    root.note(reason)
+                    # The marker is its OWN step, and the nesting is not
+                    # decoration. `note()` writes to the root's draft, so a draft
+                    # this sweep cannot touch would take the close with it —
+                    # measured: three roots of four children, every draft broken,
+                    # and the twelve children are left in `_live_units` reachable
+                    # from no root, because the eviction below drops the root
+                    # without walking under it. A marker that cannot be recorded
+                    # costs the marker.
+                    with guard("assembly._units.close_all_note", debug=self._debug):
+                        root.note(reason)
                     pending += self._close_locked(
                         root, status=StatusCode.UNSET, error_type=None, end_ns=end
                     )
@@ -1475,31 +1484,114 @@ class UnitRegistry:
         turn totals onto the draft, hands it here, and gets nothing emitted.
         The counter is the difference between a class of bug that is invisible
         and one that shows up in a counter snapshot.
+
+        TWO PHASES, and the split is the whole reason one broken draft no longer
+        costs a subtree. Building a span reads drafts, buffers and framework
+        values; unlinking a unit is dict and list operations on wardex's own
+        containers. Interleaved — which is what this was — a fault while
+        building the third span of a six-child subtree left the parent already
+        marked dead, some children already unlinked, the drafts collected so far
+        dropped on the floor with the raise, and the rest of the subtree
+        reachable from no root of any registry. Measured on three roots of four
+        children with one fault: five spans gone and two units permanently
+        unreachable.
+
+        So COLLECT first (`_collect_locked`, guarded per unit) and DETACH after
+        (`_detach_locked`, which cannot fail). A draft that cannot be built costs
+        its own span and nothing else — not its siblings', not its parent's, and
+        not the tables' consistency.
         """
         if not unit.is_live:
             counters.bump("assembly._units.close_after_close")
             return []
-        unit._live = False
         pending: list[SpanDraft] = []
+        doomed: list[Unit] = []
+        self._collect_locked(
+            unit,
+            status=status,
+            error_type=error_type,
+            end_ns=end_ns,
+            pending=pending,
+            doomed=doomed,
+        )
+        for dead in doomed:
+            self._detach_locked(dead)
+        return pending
+
+    def _collect_locked(
+        self,
+        unit: Unit,
+        *,
+        status: StatusCode,
+        error_type: str | None,
+        end_ns: int,
+        pending: list[SpanDraft],
+        doomed: list[Unit],
+    ) -> None:
+        """PHASE ONE: build every span this subtree owes, mutating no table.
+
+        Guarded PER UNIT and per open draft, which is the point rather than
+        belt-and-braces: the alternative is one boundary around the whole walk,
+        and one boundary means one broken draft anywhere costs every span in the
+        subtree. Here it costs exactly its own.
+
+        `doomed` is appended to BEFORE the recursion, so it comes back
+        parent-first — which is the order `_detach_locked` wants, since a parent
+        that has already cleared its child table makes every later child's
+        unlink a no-op instead of a second search.
+
+        Nothing here touches `_roots`, `_live_units`, `_by_alias` or `_live`. A
+        fault therefore leaves the subtree exactly as it was found: still
+        reachable, still closable, and the drafts already built are re-buildable
+        because `_finalize_locked` only stamps and `note()` is idempotent.
+        """
+        doomed.append(unit)
 
         for child in list(unit._children):
-            child.note(Limitation.CHILD_SPAN_UNCLOSED)
-            pending += self._close_locked(
-                child, status=StatusCode.UNSET, error_type=None, end_ns=end_ns
+            if not child.is_live:
+                counters.bump("assembly._units.close_after_close")
+                continue
+            with guard("assembly._units.close_note_child", debug=self._debug):
+                child.note(Limitation.CHILD_SPAN_UNCLOSED)
+            self._collect_locked(
+                child,
+                status=StatusCode.UNSET,
+                error_type=None,
+                end_ns=end_ns,
+                pending=pending,
+                doomed=doomed,
             )
-        unit._children.clear()
 
         for entry in list(unit._open.values()):
-            # The loser of an arbitration stays lost. A teardown that emitted it
-            # would produce the double emit the arbitration exists to prevent,
-            # in the one case `claim()` names as safe: the loser that never asks
-            # again because the session was aborted between the two observers.
-            if unit._superseded_locked(entry):
-                counters.bump("assembly._units.claim_superseded")
-                continue
-            pending.append(_force_close(entry.draft, Limitation.CHILD_SPAN_UNCLOSED, end_ns))
-        unit._open.clear()
+            with guard("assembly._units.close_open_span", debug=self._debug):
+                # The loser of an arbitration stays lost. A teardown that emitted
+                # it would produce the double emit the arbitration exists to
+                # prevent, in the one case `claim()` names as safe: the loser
+                # that never asks again because the session was aborted between
+                # the two observers.
+                if unit._superseded_locked(entry):
+                    counters.bump("assembly._units.claim_superseded")
+                    continue
+                pending.append(_force_close(entry.draft, Limitation.CHILD_SPAN_UNCLOSED, end_ns))
 
+        with guard("assembly._units.close_finalize", debug=self._debug):
+            pending.append(
+                unit._finalize_locked(status=status, error_type=error_type, end_ns=end_ns)
+            )
+
+    def _detach_locked(self, unit: Unit) -> None:
+        """PHASE TWO: unlink one unit from every table. Cannot fail.
+
+        Dict and list operations on wardex's own containers, and nothing else —
+        no draft is read, no span is built, no host value is touched. That is
+        not a claim about care taken here; it is the property the phase split
+        exists to create, and it is why this half needs no guard and no partial
+        recovery. Whatever phase one managed to build ships; whatever it did not
+        is one span, and the tables end consistent either way.
+        """
+        unit._live = False
+        unit._children.clear()
+        unit._open.clear()
         self._roots.pop(unit, None)
         self._live_units.pop(unit, None)
         if unit.parent is not None:
@@ -1508,9 +1600,6 @@ class UnitRegistry:
             if self._by_alias.get(key) is unit:
                 del self._by_alias[key]
         unit._alias_keys.clear()
-
-        pending.append(unit._finalize_locked(status=status, error_type=error_type, end_ns=end_ns))
-        return pending
 
     # -- plumbing --------------------------------------------------------
 

@@ -38,6 +38,7 @@ from wardex_sdk.assembly import (
     Limitation,
     ParentSource,
     SpanIntent,
+    Unit,
     UnitKey,
     UnitKind,
     UnitRegistry,
@@ -1473,20 +1474,80 @@ def test_a_fault_binding_an_alias_costs_the_alias_and_not_the_unit():
     assert len(reg._roots) == 0
 
 
-def test_one_root_that_cannot_be_closed_costs_only_its_own_subtree():
-    """3 roots x 4 children = 15 spans owed, one fault in one child of root #0.
+def _fifteen_owed(reg) -> list:
+    """3 roots x 4 children. Fifteen spans, three subtrees, one shared table."""
+    roots = [open_session(reg, f"root{i}", subject=f"root{i}") for i in range(3)]
+    for i, root in enumerate(roots):
+        for j in range(4):
+            open_subagent(reg, root, f"a{i}{j}")
+    return roots
 
-    Three shapes were measured. A guard around the whole sweep emits 0 of 15 —
-    one torn subtree costs every root in the table. Per-root emits 10 of 15 but
-    leaves root #0 standing, so every later sweep walks back into the same fault
-    and the table never empties. Per-root plus eviction emits 10 and leaves
-    `_roots` empty.
 
-    The docstring records the loss honestly: 5 spans are gone and 2 units are
-    permanently unreachable. This is the best of three measured shapes, not a
-    fix. A real fix makes `_close_locked` two-phase — collect the subtree's
-    drafts without mutating, then mutate — which is surgery on a delicate
-    function plus a rule every future editor has to preserve.
+def test_one_span_that_cannot_be_built_costs_only_that_span():
+    """15 owed, ONE child whose span cannot be built. Fourteen ship.
+
+    Four shapes have been measured on exactly this fixture, and the numbers are
+    the argument:
+
+      one boundary around the whole sweep        0 of 15
+      one per root                              10 of 15, root #0 wedged forever
+      one per root, plus evicting the poisoned  10 of 15
+      collect-then-detach, one boundary per span 14 of 15   <- this
+
+    The first three all lose a SUBTREE for one bad draft, because building spans
+    and unlinking units were interleaved: a fault partway left the parent marked
+    dead, some children unlinked, and the drafts already built dropped on the
+    floor with the raise. Splitting the phases makes the loss what it should
+    always have been — the one span whose draft is broken.
+    """
+    victim: list = []
+
+    class BrokenDraft(UnitRegistry):
+        __slots__ = ()
+
+    real = Unit._finalize_locked
+
+    def blow(self, **kw):
+        if victim and self is victim[0]:
+            raise RuntimeError("this draft cannot be stamped")
+        return real(self, **kw)
+
+    sink = RecordingSink()
+    reg = BrokenDraft(sink=sink)
+    roots = _fifteen_owed(reg)
+    victim.append(next(iter(roots[0]._children)))
+
+    Unit._finalize_locked = blow
+    try:
+        reg.close_all(reason=Limitation.ADAPTER_UNINSTALLED)
+    finally:
+        Unit._finalize_locked = real
+
+    assert len(sink.drafts) == 14
+    names = {d.name for d in sink.drafts}
+    # Its PARENT ships, its siblings ship, the other two roots ship. Under the
+    # interleaved shape the parent was the first thing lost.
+    assert "invoke_agent root0" in names
+    assert "invoke_agent root1" in names
+    assert "invoke_agent root2" in names
+    assert counters.get("assembly._units.close_finalize") == 1
+
+    # And the tables end consistent: nothing left standing, nothing unreachable.
+    assert len(reg._roots) == 0
+    assert len(reg._live_units) == 0
+    reg.close_all(reason=Limitation.ADAPTER_UNINSTALLED)
+    assert len(sink.drafts) == 14
+
+
+def test_a_subtree_the_sweep_cannot_close_at_all_still_costs_only_itself():
+    """The backstop under the backstop.
+
+    `_close_locked` is now two phases, neither of which can take a subtree down
+    — but `close_all` keeps its per-root boundary anyway, because "this function
+    cannot fail" is a property of today's code and not of the next edit. Faulted
+    wholesale, one root's failure still costs one root: the other two sweep
+    normally, and the one that could not be closed is dropped from the table
+    rather than left in it for every later sweep to re-trip on.
     """
     victim: list = []
 
@@ -1500,23 +1561,17 @@ def test_one_root_that_cannot_be_closed_costs_only_its_own_subtree():
 
     sink = RecordingSink()
     reg = Broken(sink=sink)
-
-    roots = [open_session(reg, f"root{i}", subject=f"root{i}") for i in range(3)]
-    for i, root in enumerate(roots):
-        for j in range(4):
-            open_subagent(reg, root, f"a{i}{j}")
-    victim.append(roots[0]._children and next(iter(roots[0]._children)))
+    roots = _fifteen_owed(reg)
+    victim.append(roots[0])
 
     reg.close_all(reason=Limitation.ADAPTER_UNINSTALLED)
 
-    # Ten of fifteen. The two other roots are untouched by root #0's fault.
     assert len(sink.drafts) == 10
     names = {d.name for d in sink.drafts}
     assert "invoke_agent root1" in names
     assert "invoke_agent root2" in names
     assert "invoke_agent root0" not in names
 
-    # And the poisoned root is GONE from the table rather than wedged in it.
     assert len(reg._roots) == 0
     assert counters.get("assembly._units.close_all_root") == 1
 
@@ -1524,3 +1579,42 @@ def test_one_root_that_cannot_be_closed_costs_only_its_own_subtree():
     reg.close_all(reason=Limitation.ADAPTER_UNINSTALLED)
     assert len(sink.drafts) == 10
     assert counters.get("assembly._units.close_all_root") == 1
+
+
+def test_the_unlink_phase_does_not_depend_on_any_draft():
+    """Phase two claims it cannot fail, and the claim rests entirely on it
+    touching nothing but wardex's own dicts and lists.
+
+    Asserted by breaking EVERY draft in the subtree rather than by reading the
+    code: no span can be built and no marker can be recorded, so nothing ships —
+    and the tables still end empty and consistent, which is the half that keeps
+    a registry usable after a bad teardown instead of leaving it holding fifteen
+    units nothing can reach.
+
+    Written this way it found one: `close_all` stamped its shutdown marker on
+    the root INSIDE the per-root boundary and before the close, so a draft that
+    could not take the marker skipped the close entirely and the eviction
+    dropped the root without walking under it. Twelve children, reachable from
+    no root of any registry. The marker is its own step now.
+    """
+    sink = RecordingSink()
+    reg = registry(sink=sink)
+    _fifteen_owed(reg)
+
+    real_finalize, real_note = Unit._finalize_locked, Unit.note
+
+    def blow(self, *a, **kw):
+        raise RuntimeError("every draft in this subtree is broken")
+
+    Unit._finalize_locked, Unit.note = blow, blow
+    try:
+        reg.close_all(reason=Limitation.ADAPTER_UNINSTALLED)
+    finally:
+        Unit._finalize_locked, Unit.note = real_finalize, real_note
+
+    assert sink.drafts == [], "a span was built on a path that must not build one"
+    assert len(reg._roots) == 0
+    assert len(reg._live_units) == 0
+    assert len(reg._by_alias) == 0
+    assert counters.get("assembly._units.close_finalize") == 15
+    assert counters.get("assembly._units.close_all_note") == 3
