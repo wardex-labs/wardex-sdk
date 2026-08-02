@@ -1583,7 +1583,14 @@ def test_a_closed_session_stops_being_ambient_on_the_reader_task():
             if called:
                 return
             called.append(None)
-            await asyncio.create_task(late_handler({"name": "late"}), context=reader_context[0])
+            # `create_task(context=...)` is 3.11+, and this package supports
+            # 3.10. Creating the task INSIDE the captured context reaches the
+            # same place on every version: `Task.__init__` copies whatever
+            # context is current at construction, and under `Context.run` that
+            # is the reader's. The task gets a copy rather than the Context
+            # object itself, which is what a real descendant task gets anyway —
+            # and this test only reads the pin.
+            await reader_context[0].run(asyncio.create_task, late_handler({"name": "late"}))
 
         _run(adapter, second, before_close=_call_from_the_finished_readers_context)
     finally:
