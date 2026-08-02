@@ -1590,6 +1590,38 @@ def test_unresolvable_marker_slots_are_exactly_the_recorded_ones(
     )
 
 
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        ('def add_limitation(self, *, marker="baked_kwonly"): ...', "baked_kwonly"),
+        ('def note(self, a, b, marker="baked_positional"): ...', "baked_positional"),
+    ],
+    ids=("kwonly", "positional"),
+)
+def test_a_marker_written_into_a_parameter_default_is_censused(source, expected):
+    """Read the defaults directly, on source this test owns.
+
+    `test_unresolvable_marker_slots_are_exactly_the_recorded_ones` does go red
+    when `_collect_defs` stops reading defaults — but only because reading them
+    surfaced one hole, `_emit_tool`'s `markers=()` at `adapters/_assembler.py`.
+    That makes the coverage a side effect of an unrelated production signature:
+    the day someone gives `_emit_tool` a required `markers`, the recorded hole
+    is removed along with it and nothing is left watching defaults at all. A
+    guard that stops biting when unrelated code changes is the thing this file
+    was audited for, so the behaviour gets a test that owns its own input.
+
+    The positional case is the alignment too. `ast.arguments.defaults` covers
+    the LAST N parameters, so pairing it from the left hands `"..."` to `a` and
+    `marker` nothing — the marker is silently dropped, which is worse than not
+    reading defaults at all because the scan still reports itself complete.
+    """
+    census = _PythonCensus({"synthetic.py": ast.parse(source)})
+    assert expected in census.markers, (
+        "a marker string written as a parameter's default reaches a span every "
+        "time the funnel is called bare, and no call-site scan can ever see it"
+    )
+
+
 def test_scanner_is_not_blind(py_census: _PythonCensus, rust_census: _RustCensus) -> None:
     """The vacuous-pass trap: a scanner that finds nothing passes everything.
 
