@@ -477,6 +477,53 @@ All notable changes to this project are documented here. The format follows
   runs. That only happens when the signal was left at its default
   disposition: an app that installed its own handler may well keep running,
   and ending its live sessions would be a worse lie than a missing span.
+- **The SDK never fully uninstalled, and uninstalling destroyed other
+  libraries' patches.** Six hand-rolled patch mechanisms each restored with an
+  unconditional `setattr`, which is two bugs and both were live.
+  `socket.socket.send/sendall/recv/recv_into` are INHERITED from the base
+  socket type, so restoring them by assignment put nothing back — it welded a
+  copy of the base's C method into `socket.socket.__dict__` permanently, where
+  nothing had one before. No test caught it because the frozen copy IS the
+  right object: every identity check passed while the host's process stayed
+  mutated after `wardex.close()`. Restore now uses `delattr` where the target
+  had no own attribute. And restoring without checking what is actually
+  installed overwrote whatever patched the same attribute AFTER wardex did —
+  on `httpx.Client.send`, `requests.Session.send` and
+  `aiohttp.ClientSession._request`, which is exactly what OpenTelemetry's HTTPX
+  instrumentor patches, on a path that runs on every re-init and every
+  `close()`. Restore is identity-checked now: an attribute that is no longer
+  wardex's wrapper is left alone, counted, and reported as `patch_superseded`
+  — until now a declared marker with no emitter.
+
+  `wardex_sdk.assembly.PatchSet` is the one mechanism the six become. Class,
+  module and instance targets; LIFO restore; each restore individually guarded
+  so one failure cannot abandon the rest; weakly held instances; an `RLock`,
+  because teardown can re-enter through the signal handler this SDK installs.
+  It cannot raise into the host: `patch()` returns `False` rather than
+  propagating on a target that refuses `setattr`, and it refuses a data
+  descriptor outright rather than writing through a host's property setter and
+  then blaming a third party for the corruption at restore.
+- **Installing an adapter is now as total as uninstalling one.** Four
+  lifecycle failures of one kind — the loop that sets things up and the loop
+  that tears them down did not agree about a misbehaving component. `install()`
+  was unguarded, so an adapter raising out of it took `wardex.init()` with it:
+  a crash at startup from the one component whose entire promise is never to
+  alter the application. An adapter was filed only on SUCCESS, so an
+  `install()` that raised halfway had already patched part of a framework's
+  surface while the registry held no record — those wrappers stayed in the
+  host's classes for the life of the process with nothing able to remove them;
+  it is recorded first now and a failed install is rolled back immediately.
+  Teardown was FIFO, so two adapters patching one attribute ended with the
+  later undo restoring the EARLIER adapter's wrapper as though it were the
+  host's original; newest-first now, matching the order `PatchSet` restores in.
+  And a `BaseException` cut the sweep short: `guard()` re-raises
+  `KeyboardInterrupt` and `CancelledError` deliberately, but re-raising in
+  place abandoned every adapter behind the interrupted one — patches left in
+  the host's classes and open spans never emitted, from `atexit`, where nothing
+  reports why. It is captured, the sweep finishes, and it is re-raised
+  afterwards. `InterceptorRegistry.uninstall_all()` and its adapter twin also
+  iterated unguarded, so one raising `uninstall()` skipped `client.close()` and
+  lost every buffered span.
 
 ## [0.2.0b1] - 2026-07-28
 
