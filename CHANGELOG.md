@@ -5,6 +5,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.3.0b1] - 2026-08-03
+
 ### Changed
 - **The Agent SDK adapter's in-process tool wrapper no longer decides its own
   parentage.** It walked a three-tier ladder by hand — the live scope, then the
