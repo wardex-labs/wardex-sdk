@@ -5,6 +5,232 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+- **`Transport.export` takes a keyword-only `timeout`, and what it returns now
+  decides what happens to the batch.** The signature is
+  `export(self, envelope, *, timeout: float | None = None) -> object | None`,
+  and `Transport` is exported from the package root, so every third-party
+  implementation is affected. An existing `export(self, envelope)` keeps
+  working — the client reads each transport's signature, per transport instance
+  and again whenever the transport is swapped at runtime, and withholds the
+  keyword from one that cannot take it, because calling such a transport with
+  `timeout=` raises `TypeError` inside the drain's fail-closed handler and
+  would trade a stall for total data loss. It keeps *stalling*, though: the
+  client can bound how long it waits, only the transport can bound its own I/O,
+  so a deadline that stops at the drain leaves the process blocked inside the
+  transport for its full configured timeout. To honour it, take the keyword and
+  NARROW with it, never widen —
+  `effective = self._timeout if timeout is None else min(self._timeout, timeout)`
+  — because a caller asking for 99s must not get more than the transport was
+  configured for. The value is `None` when the caller imposed no deadline, and
+  otherwise a non-negative number that may be `0.0`.
+
+  The return value is the other half, and it is an OBSERVATION the client acts
+  on rather than something it can work out from outside. Return `UNDELIVERED`
+  (`from wardex_sdk.transport import UNDELIVERED`) to say: this envelope was
+  not put on the wire, nothing about it was consumed, and an identical attempt
+  later with a fresh budget could succeed. A `flush()` then keeps the spans and
+  re-sends them; a `close()` counts them and reports them. Anything else — most
+  of all `None`, which is what every transport written before this returns —
+  means "taken", and that default is the safe direction rather than a shrug:
+  delivering unconditionally is a legal transport, and a client inferring "not
+  delivered" from the outside announces losses that never happened. Do NOT
+  return it for a POST that failed partway or a batch that could not be encoded
+  at all. Those are attempts of unknown outcome, so handing them back would
+  duplicate a batch the backend may already hold, or pin an unencodable one in
+  the buffer forever. `ConsoleTransport`, `NoOpTransport` and
+  `OtlpHttpTransport` are updated; only the last has bounded I/O to narrow or
+  any reason to decline.
+- **`wardex.flush(timeout)` and `wardex.close(timeout)` are wall-clock bounds
+  on the whole drain, not on one step of it.** The drain held its lock across
+  `before_send`, `transport.export` and both `transport.flush` calls, so a
+  flush arriving while another drain was inside a synchronous POST waited out
+  that POST in full before starting its own, and the argument bounded only its
+  own half. The signal handler's `flush(2.0)` — the one whose comment says
+  never delay shutdown — measured 10 + 10 + 2 on a stalled backend, so SIGTERM
+  hung for twenty-two seconds. One monotonic deadline now covers the wait for
+  the export slot, the POST, and the transport flush after it. Exports are
+  still serialized, because that is the guarantee third-party transports were
+  written against; only *waiting* for one is bounded.
+
+  A drain that cannot get the export slot inside its budget declines and
+  returns having taken nothing, so `flush(0.0)` ships nothing where it used to
+  block until the slot came free — the spans are untouched in the buffer and
+  the next drain ships them. And the deadline now reaches the transport, which
+  is where the next paragraph lives.
+
+  **The two defaults disagree, and this release is the first time that matters.**
+  `wardex.flush()` defaults to `timeout=5.0`; `OtlpHttpTransport` defaults to
+  `timeout=10.0`. Until now the transport's 10s stood alone, and now the
+  smaller of the two wins: a default manual `wardex.flush()` caps the POST at
+  what is left of 5 seconds where before it got 10. A backend that reliably
+  answers in 7 seconds therefore **loses those envelopes** — the request times
+  out at the 5s mark, and a POST that was *attempted* is deliberately never
+  re-queued, since the backend may already hold it, so the batch is dropped
+  rather than kept for the next drain. `wardex.close()` carries the same
+  default and the same effect, and there it is final. Pass an explicit
+  `wardex.flush(10.0)`, or construct `OtlpHttpTransport(timeout=...)` at or
+  below 5, to make the two agree. Unattended export is not affected: the
+  periodic worker passes no deadline at all, so background batches still get
+  the transport's full configured timeout — clamping the one path that ships
+  data with nobody watching would turn slow-but-working exports into lost ones.
+- **`close(timeout)` now abandons a tail it cannot ship inside its budget, and
+  says so on stderr whether or not `debug` is set.** Bounding the drain bounded
+  `close()` too, and a declined drain is free everywhere except the last one:
+  `close()` sets `_closed`, stops the worker and then closes the transport, so
+  spans its final drain declined to take are unreachable forever — with the
+  process still running, because `init()` closes the previous client on every
+  re-init and `wardex.close(timeout)` is public API. Measured: with the worker
+  inside a 30s POST, `close(0.5)` returned in 1.0s having shipped nothing but
+  the in-flight envelope and left two buffered spans resident, never to ship;
+  unbounded they shipped, after 30s. `close()` keeps its bound — a shutdown
+  that cannot be bounded is the failure this started from — but its final drain
+  now empties the buffer, counts what it could not ship, and writes one line:
+
+      [wardex] close() could not ship 2 buffered span(s): <why> They are out of
+      the buffer and nothing will retry them. Give wardex.close(timeout=...) a
+      larger budget to keep them.
+
+  `<why>` names which of the two exits was taken: an export was already in
+  flight and did not finish inside the budget, so the final drain never ran; or
+  the transport was handed what was left of the budget and reported back that
+  it did not send. The line is deliberately NOT gated on `config.debug`, which
+  defaults to False — a report that prints only in the configuration nobody
+  runs is worse than none at all here, because the spans are no longer resident
+  in the buffer where an operator could at least find them. It is bounded to
+  one line per site per process, the same idiom used everywhere else wardex
+  will not ship what you expected. The count is kept apart from the buffer-full
+  drop counter that `_drain` prints as `dropped N spans (buffer full)`:
+  `flush()` does not check `_closed`, so a flush after `close()` was enough to
+  have a shutdown loss described as an overflow. Note that `close(timeout)`
+  remains a per-STEP budget — the worker join, the final drain and the
+  transport close can each spend it, so the worst case is roughly 3x. Steps 2
+  and 3 wait on the same in-flight POST, and charging the final drain for what
+  the join already spent would abandon tails `close()` can still deliver.
+- **An unusable `timeout` is coerced rather than raised on.** `flush()` and
+  `close()` take that argument straight from application code, and an
+  observability SDK may not raise back into that code, not even on nonsense.
+  NaN and anything that is not a number fall back to the 5.0 default; a
+  negative value means "do not wait" and floors at 0.0; everything else clamps
+  to `threading.TIMEOUT_MAX`. An unusable value is *ignored* rather than
+  rejected because rejecting means raising, and refusing a shutdown flush over
+  a bad argument loses more than flushing it on the default does. NaN has to be
+  tested for by name, since no clamp normalizes it — `max(nan, 0.0)` and
+  `min(nan, TIMEOUT_MAX)` are both NaN — and without that, `flush(float("nan"))`
+  reaches `RLock.acquire(timeout=nan)` as a `ValueError` and `flush("x")`
+  reaches the deadline arithmetic as a `TypeError`, both outside every handler
+  in the drain. What a third-party transport is handed is likewise always a
+  non-negative float, never a negative remaining budget.
+
+### Fixed
+- **A wheel whose native extension will not load no longer stops the host from
+  booting.** `wardex_sdk/__init__.py` opened with a bare
+  `from . import _wardex_native`, and two more modules on that same import path
+  did the same, so an extension that would not load did not disable wardex — it
+  raised out of the host's own `import wardex_sdk` and the application never
+  started. A wheel built for the wrong ABI, a `.so` a container build stripped
+  out of the image, an sdist installed on a machine with no toolchain: any of
+  them turned an observability dependency into a process that will not boot. An
+  observability SDK may never be the reason a host fails to start. Both failure
+  shapes are covered, because they raise different classes: a `.so` that was
+  never installed raises `ModuleNotFoundError`, one that is present and
+  unloadable raises the base `ImportError` out of `dlopen`.
+
+  The extension is imported once now and every module reads that one answer.
+  Three places answer differently when it is False. `init()` writes one line to
+  stderr — `[wardex] native extension unavailable, wardex is disabled: nothing
+  will be captured or exported (...)` — and returns before a client,
+  interceptor, adapter, propagation patch or atexit hook exists, which is what
+  makes this complete rather than partial: every remaining module that touches
+  the core is then unreachable by construction. `close()` returns before it
+  would import `interceptors/`, which still reaches the extension at import
+  time and would otherwise kill the process on the way OUT of a `finally` or an
+  atexit hook instead of on the way in. And `CaptureLimits.resolved()` /
+  `.to_native()` raise a `RuntimeError` naming the wheel instead of an
+  `AttributeError` on `None` — the core owns the limit table, so a Python-side
+  fallback would be a second declaration site that drifts. The config is still
+  built first, so a caller's bad keyword raises the same `TypeError` it always
+  did; degraded mode must not turn a programming error into a shrug.
+
+  Where the line falls is now written down instead of inferred. With the
+  extension unimportable, `import wardex_sdk` and every symbol on its `__all__`
+  work, and `wardex_sdk.transport`, `.context`, `.assembly`, `.adapters` and
+  `.pipeline` import; `wardex_sdk.protocol`, `.semantics`, `.interceptors`,
+  `transport._codec` and three `adapters/` modules still raise `ImportError`.
+  That stays a boundary rather than a gap: each of those is reachable only
+  through `init()`, which returns before importing any of them, so degrading
+  them would change nothing a host can observe. The stderr line is not
+  optional — a wardex that silently captures nothing looks exactly like a
+  backend that is up and receiving no traffic, so nobody goes looking, and that
+  is the worse of the two failures rather than the milder one.
+- **`OtlpHttpTransport` no longer discards every batch in silence when the
+  extension is missing.** It is a published symbol, so a host can construct it
+  and call `export()` by hand without ever reaching `init()` and the one line
+  printed there. Encoding is impossible either way, so those spans were lost
+  with nothing said. It now reports once per process, naming the underlying
+  import error, and it reports that BEFORE the debug-gated "deadline exhausted"
+  skip which used to be checked first: a degraded process whose budget had also
+  run out got the gated diagnosis and never the actionable one. The report is
+  bounded to one line rather than written per export, which is what makes an
+  unconditional message affordable on a path a host may drive in a loop. It is
+  deliberately not an `UNDELIVERED` decline — that word promises a later
+  attempt could succeed, and no attempt in this process ever can, so saying it
+  would hand the same unencodable batch back to the buffer forever.
+- **One interceptor's `install()` no longer takes `wardex.init(intercept=True)`
+  down, and a rolled-back install now really removes its patches.**
+  `InterceptorRegistry.uninstall_all` has always been total and `install` was
+  not, so an interceptor raising out of `install()` propagated straight out of
+  `wardex.init()`: a host that added observability got a crash at startup from
+  the one component whose whole promise is never to alter the application.
+  These seams patch the stdlib and third-party internals — `ssl.SSLSocket.recv`,
+  `anyio._backends._asyncio.AsyncIOBackend.open_process` — so a version bump in
+  a package the user never chose is an ordinary way for that to happen.
+
+  Containing the raise is only the first of three. The interceptor is recorded
+  BEFORE `install()` is called, because an install that raises halfway has
+  already patched part of a surface, and one the registry never recorded is one
+  nothing can ever reach: those wrappers stayed in front of the host's sockets
+  for the life of the process. And the undo has to undo — all three
+  interceptors this SDK ships set `self._installed = True` as the LAST
+  statement of `install()` while opening `uninstall()` with
+  `if not self._installed: return`, so the rollback called an undo that
+  declined every time. `uninstall()` is total now: `PatchSet.restore_all()` is
+  idempotent and empty before the first patch, `_conns` is empty until a byte
+  flows, and the refcounted shared connection-timing probe is tracked by its
+  own flag so a rolled-back seam cannot release a reference it never took and
+  rip `socket.connect` out from under the seam that is still live. The registry
+  also drops the name BEFORE rolling back, so a `KeyboardInterrupt` out of
+  `uninstall()` — re-raised by design, because it is the host's control flow —
+  can no longer leave behind a name every later `install()` skips. A seam that
+  fails is one line on stderr under `init(debug=True)` rather than a counter
+  with no reader.
+- **anyio is no longer a hard requirement of `init(intercept=True)`.**
+  `_mcp_stdio` imported `anyio._backends._asyncio` at module top level — a
+  third-party PRIVATE API, from a wheel that declares no runtime dependencies —
+  and `init(intercept=True)` imports that module, so on a machine without anyio
+  the `ImportError` arrived before any registry could guard it. The import
+  degrades to `None` now and only the anyio seam declines, saying so once on
+  stderr and naming what still works: `[wardex] mcp_stdio interceptor: anyio is
+  not importable, so MCP traffic over anyio subprocesses will not be captured;
+  the raw asyncio.create_subprocess_exec path is still intercepted`. An
+  environment without anyio therefore loses only the transport it does not
+  have, and a reader is not left thinking MCP capture is off altogether. The
+  decline is an explicit branch rather than an `AttributeError` swallowed by a
+  guard, because reporting an absent optional package as an internal failure in
+  a counter nobody reads is the same as saying nothing.
+
+### Added
+- `UNDELIVERED`, exported from `wardex_sdk.transport`. It is the sentinel a
+  `Transport` returns to say it did not send a batch; the contract it carries
+  is in the `Transport` entry above. Published there and not at the package
+  root on purpose: it is part of the `Transport` contract, so a third-party
+  transport that wants to report a decline must be able to import it by a
+  public name, but it is inert — a sentinel with nothing to call and no reach
+  into the core — so it does not belong on the surface everyone else reads.
+- The counter `interceptors.mcp_stdio.anyio_unavailable`
+  (`wardex_sdk.assembly.counters.snapshot()`), bumped once at import time when
+  the optional anyio backend cannot be imported.
+
 ## [0.3.0b1] - 2026-08-03
 
 ### Changed
