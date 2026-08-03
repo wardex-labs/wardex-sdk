@@ -134,3 +134,52 @@ def test_fail_silent_on_connection_error():
     # port nobody is listening on → connection refused. Fails if an exception leaks.
     t = OtlpHttpTransport(endpoint="http://127.0.0.1:1/v1/traces", timeout=0.5)
     t.export(_envelope_with_span())  # must return without raising
+
+
+def test_export_deadline_narrows_the_configured_timeout_but_never_widens_it(monkeypatch):
+    """The drain's remaining budget must reach urlopen, or the deadline stops at
+    the drain and the process still hangs inside the POST for the full
+    configured timeout — the SIGTERM stall. A caller asking for more than the
+    transport was configured for gets the configured value: narrowing only."""
+    import urllib.request
+
+    seen: list[float | None] = []
+
+    class _Resp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def fake_urlopen(req, timeout=None):
+        seen.append(timeout)
+        return _Resp()
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    t = OtlpHttpTransport(endpoint="http://127.0.0.1:1/v1/traces", timeout=10.0)
+    t.export(_envelope_with_span(), timeout=0.5)
+    t.export(_envelope_with_span(), timeout=99.0)
+    t.export(_envelope_with_span())
+    assert seen == [0.5, 10.0, 10.0]
+
+
+def test_export_with_an_exhausted_deadline_skips_the_post(monkeypatch):
+    """urlopen(timeout=0) is a non-blocking socket, not "give up now". With no
+    budget left the envelope is lost either way; skipping keeps it from raising
+    on a connection that was never going to complete."""
+    import urllib.request
+
+    attempts: list[float | None] = []
+
+    def fake_urlopen(req, timeout=None):
+        # Record, never raise: _send_batch's POST is wrapped in a fail-silent
+        # handler, so an exception raised here would be swallowed and the
+        # assertion would pass whether or not the guard exists.
+        attempts.append(timeout)
+        raise OSError("would block")
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    t = OtlpHttpTransport(endpoint="http://127.0.0.1:1/v1/traces", timeout=10.0)
+    t.export(_envelope_with_span(), timeout=0.0)  # must return without raising
+    assert attempts == [], "POST attempted with no budget left"

@@ -5,5 +5,5 @@ from ._base import Transport
 
 
 class NoOpTransport(Transport):
-    def export(self, envelope: InternalEnvelope) -> None:
+    def export(self, envelope: InternalEnvelope, *, timeout: float | None = None) -> None:
         return None

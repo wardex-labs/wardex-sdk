@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import inspect
 import platform
 import sys
 import threading
 import time
 import uuid
 from collections import deque
+from collections.abc import Callable
 
 from ._config import WardexConfig
 from ._types import (
@@ -37,6 +39,42 @@ _SPAN_OVERHEAD_BYTES = 512
 
 def _span_size(span: InternalSpan) -> int:
     return _SPAN_OVERHEAD_BYTES + len(span.input_data or b"") + len(span.output_data or b"")
+
+
+# Handed to Transport.flush() on the periodic path, which carries no deadline of
+# its own. Transport.flush() is a no-op for every transport we ship, so this is
+# only ever consumed by third-party transports that buffer.
+_UNBOUNDED_TRANSPORT_FLUSH_TIMEOUT = 5.0
+
+
+def _accepts_timeout(fn: Callable[..., object]) -> bool:
+    """Whether `fn` can be called with a `timeout=` keyword.
+
+    `Transport.export` gained an optional `timeout` so a bounded flush can bound
+    the POST it is waiting on, but `Transport` is exported from the package root
+    and subclasses written against the previous two-argument `export(envelope)`
+    are already in the wild. Calling one of those with `timeout=` raises
+    TypeError inside `_drain`'s fail-closed handler, which would silently drop
+    every envelope for that transport -- a stall traded for total data loss.
+    So probe, once per transport instance, instead of assuming.
+
+    An unreadable signature (C callables, exotic wrappers) reads as "cannot take
+    it". That is the safe direction: the cost of withholding the deadline is a
+    slower export, the cost of a wrong guess is the dropped envelope above.
+    """
+    try:
+        parameters = inspect.signature(fn).parameters
+    except (ValueError, TypeError):
+        return False
+    for param in parameters.values():
+        if param.kind is inspect.Parameter.VAR_KEYWORD:
+            return True
+        if param.name == "timeout" and param.kind in (
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.KEYWORD_ONLY,
+        ):
+            return True
+    return False
 
 
 class _SpanBuffer:
@@ -87,7 +125,11 @@ class Client:
         self._config = config
         self._transport = transport
         self._sdk_info = build_sdk_info()
-        # Lock order is always drain lock → buffer lock (one-way; no deadlock).
+        # Lock order is always export lock → buffer lock (one-way; no deadlock).
+        # Nothing ever takes the export lock while holding the buffer lock:
+        # _drain() acquires the export lock strictly before it opens the buffer
+        # lock block, capture_span() calls _worker.wake() outside its block, and
+        # _SpanBuffer takes no lock at all.
         # The buffer lock only ever guards an append or a swap — never I/O,
         # encoding, or callbacks (design §5).
         # Both locks are reentrant: the same-thread signal handler may call
@@ -100,18 +142,42 @@ class Client:
         # Cross-thread serialization (the invariant these locks exist for) is
         # unchanged: RLock still blocks other threads until fully released.
         self._buffer_lock = threading.RLock()
-        self._drain_lock = threading.RLock()
+        # Named for the guarantee it carries, not for the method that takes it:
+        # transport.export()/flush() are never entered by two threads at once,
+        # which is the only reason a third-party Transport may hold per-instance
+        # mutable state without a lock of its own. It also makes swap order
+        # equal export order.
+        self._export_lock = threading.RLock()
+        # Memo for the export-signature probe, keyed by transport identity
+        # because `_transport` is reassignable and is in fact reassigned after
+        # construction (tests, and anyone swapping an exporter at runtime).
+        # A probe cached once at construction would answer for the transport
+        # that is gone and hand `timeout=` to one that cannot take it.
+        self._probed_transport: Transport = transport
+        self._export_takes_timeout = _accepts_timeout(transport.export)
         self._buffer = _SpanBuffer()
         self._snapshots: deque[InternalStateSnapshot] = deque()
         self._dropped = 0
         self._closed = False
+        # Deliberately NOT reentrant, and safe only because the signal handler
+        # calls flush() and never close(): a signal landing between the three
+        # statements this guards would self-deadlock permanently on re-entry.
+        # Anything that routes close() onto the signal path must make this an
+        # RLock first.
         self._close_lock = threading.Lock()
         limits = config.limits.resolved()
         self._max_buffer_spans = limits["max_buffer_spans"]
         self._max_buffer_bytes = limits["max_buffer_bytes"]
         self._flush_threshold = max(1, self._max_buffer_spans // 4)
+        # None, not a number: the periodic drain is a background daemon that
+        # nobody waits on, so it has no deadline to impose. Handing it one would
+        # clamp the transport's own configured timeout on the *only* path that
+        # ships data without anyone asking -- an OtlpHttpTransport(timeout=10.0)
+        # would start abandoning POSTs at 5s and lose those envelopes outright.
+        # A deadline exists only where a caller named one: flush(t), close(t),
+        # and above all the signal handler's flush(2.0).
         self._worker = BatchWorker(
-            lambda: self._drain(5.0), interval=config.flush_interval, debug=config.debug
+            lambda: self._drain(None), interval=config.flush_interval, debug=config.debug
         )
         self._worker.start()
 
@@ -234,28 +300,76 @@ class Client:
     def flush(self, timeout: float = 5.0) -> None:
         self._drain(timeout)
 
-    def _drain(self, timeout: float) -> None:
-        """Swap the buffer out under the lock, then assemble/export lock-free.
+    def _acquire_export_slot(self, timeout: float | None) -> bool:
+        """Take the export lock, waiting no longer than `timeout` for it.
 
-        Serialized by the drain lock so a manual flush() and the periodic
-        worker can never interleave envelopes. Errors from before_send or the
-        export path drop the envelope (fail-closed) and never propagate.
+        Returns False when the wait ran out, at which point the caller has taken
+        nothing and must simply return: the buffer is untouched, so there is no
+        envelope to put back and no window in which spans belong to nobody.
+
+        `timeout=None` waits indefinitely, which is what the periodic worker
+        wants -- blocking a background daemon costs nothing.
         """
-        with self._drain_lock:
+        if timeout is None:
+            self._export_lock.acquire()
+            return True
+        # A timed acquire rejects negatives (ValueError) and cannot represent
+        # inf (OverflowError: timestamp out of range). Either would raise out of
+        # flush() into the application, which an observability SDK may not do,
+        # so clamp into the range the primitive accepts rather than trusting the
+        # caller's number.
+        budget = min(max(timeout, 0.0), threading.TIMEOUT_MAX)
+        # A thread that already owns this RLock -- the signal handler re-entering
+        # through before_send or through transport.export -- is granted it
+        # immediately even at budget=0, so reentrancy never spuriously declines.
+        return self._export_lock.acquire(timeout=budget)
+
+    def _drain(self, timeout: float | None) -> None:
+        """Export everything buffered, within `timeout` seconds end to end.
+
+        `timeout` is a wall-clock bound on this whole call, not a per-step one.
+        It covers the wait for the export slot, the POST, and the transport
+        flush after it, all measured against a single monotonic deadline. This
+        is what makes the signal handler's flush(2.0) mean two seconds: before,
+        the drain lock was held across the synchronous POST, so a flush arriving
+        behind an in-flight export waited out that export's full transport
+        timeout, then spent its own, then flushed -- a "2s" bound that measured
+        22s on a stalled backend and delayed process exit by that much.
+
+        The export lock is still held across the POST, because serializing
+        transport.export() is the guarantee third-party transports were written
+        against. What changed is that waiting for it is now bounded: a drain
+        that cannot get the slot in time declines and returns. Nothing is lost
+        by declining -- the swap happens after the acquire, so a declined drain
+        never took the spans -- but on the signal path the process then dies and
+        the tail dies with it. That is the deliberate reading of
+        _SIGNAL_FLUSH_TIMEOUT's "never delay shutdown": a droppable tail is the
+        price of a bounded one.
+
+        Only the buffer lock is released early (marked below); the export lock
+        is held to the end of the method.
+
+        Errors from before_send or the export path drop the envelope
+        (fail-closed) and never propagate.
+        """
+        deadline = None if timeout is None else time.monotonic() + timeout
+        if not self._acquire_export_slot(timeout):
+            if self._config.debug:
+                print("[wardex] drain skipped (export in progress)", file=sys.stderr)
+            return
+        try:
             with self._buffer_lock:
                 buf, self._buffer = self._buffer, _SpanBuffer()
                 spans = buf.spans
                 snapshots, self._snapshots = self._snapshots, deque()
                 dropped, self._dropped = self._dropped, 0
-            # -- lock-free from here (buffer lock released; new captures flow) --
+            # -- buffer lock released here; new captures flow. The EXPORT lock
+            # is still held: assembly and I/O below are serialized against every
+            # other drain, which is what keeps swap order == wire order.
             if dropped and self._config.debug:
                 print(f"[wardex] dropped {dropped} spans (buffer full)", file=sys.stderr)
             if not spans and not snapshots:
-                try:
-                    self._transport.flush(timeout)
-                except Exception as exc:  # fail-silent: never crash the app or the exit path
-                    if self._config.debug:
-                        print(f"[wardex] transport flush failed ({exc})", file=sys.stderr)
+                self._flush_transport(deadline)
                 return
             header = EnvelopeHeader(
                 event_id=str(uuid.uuid4()),
@@ -274,22 +388,57 @@ class Client:
                     if maybe is None:
                         return
                     envelope = maybe
-                self._transport.export(envelope)
+                self._export(envelope, deadline)
             except Exception as exc:  # fail-closed: drop, never ship half-filtered data
                 if self._config.debug:
                     print(f"[wardex] envelope dropped ({exc})", file=sys.stderr)
                 return
-            try:
-                self._transport.flush(timeout)
-            except Exception as exc:  # fail-silent: never crash the app or the exit path
-                if self._config.debug:
-                    print(f"[wardex] transport flush failed ({exc})", file=sys.stderr)
+            self._flush_transport(deadline)
+        finally:
+            self._export_lock.release()
+
+    def _export(self, envelope: InternalEnvelope, deadline: float | None) -> None:
+        """Hand the envelope to the transport with whatever budget is left.
+
+        The client can bound how long it waits; only the transport can bound its
+        own I/O. A transport that ignores `timeout` still stalls the process for
+        as long as it likes -- this shrinks the blast radius to one drain, it
+        does not remove it.
+        """
+        transport = self._transport
+        if deadline is None:
+            transport.export(envelope)
+            return
+        if transport is not self._probed_transport:
+            self._probed_transport = transport
+            self._export_takes_timeout = _accepts_timeout(transport.export)
+        if not self._export_takes_timeout:
+            transport.export(envelope)
+            return
+        transport.export(envelope, timeout=max(0.0, deadline - time.monotonic()))
+
+    def _flush_transport(self, deadline: float | None) -> None:
+        remaining = (
+            _UNBOUNDED_TRANSPORT_FLUSH_TIMEOUT
+            if deadline is None
+            else max(0.0, deadline - time.monotonic())
+        )
+        try:
+            self._transport.flush(remaining)
+        except Exception as exc:  # fail-silent: never crash the app or the exit path
+            if self._config.debug:
+                print(f"[wardex] transport flush failed ({exc})", file=sys.stderr)
 
     def close(self, timeout: float = 5.0) -> None:
         with self._close_lock:
             if self._closed:
                 return
             self._closed = True  # 1. reject new captures
+        # `timeout` is a per-step budget, not a total for close(). Steps 2-4 can
+        # each spend it, so the worst case is roughly 3x -- but each step is now
+        # bounded, where step 3 previously had no bound at all: it inherited the
+        # rest of whatever POST the worker was still inside when step 2's join
+        # gave up on it.
         self._worker.stop(timeout)  # 2. worker exits without draining
         self._drain(timeout)  # 3. final drain, owned by the closing thread
         self._transport.close(timeout)  # 4.

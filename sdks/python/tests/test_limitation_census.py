@@ -905,8 +905,10 @@ _UNRESOLVED_PY: frozenset[tuple[str, str]] = frozenset(
         # public `Client.flush(timeout)`. The scanner keys helpers by bare name,
         # so the public one's argument lands here. Narrowing the key would drop
         # `ws_no_close`, which is the marker hardest to find in the first place.
+        # `_client.py` used to appear here for the same reason and no longer
+        # does: its transport.flush() argument is now a local derived from a
+        # deadline, which the scanner resolves.
         ("__init__.py", "Name:timeout"),
-        ("_client.py", "Name:timeout"),
         ("_types.py", "Tuple"),
         # `_build_tool(sess, tool, end_ns, failed, markers, error_type)` declares
         # a marker-ish parameter, so R4 registers it; R9 then makes it read-all

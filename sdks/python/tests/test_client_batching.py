@@ -260,3 +260,133 @@ def test_transport_flush_exception_does_not_propagate():
     c.capture_span(_span())
     c.flush()  # post-export branch must not raise
     c.close()
+
+
+def test_flush_deadline_is_not_extended_by_an_in_flight_export():
+    """flush(t) must return on its own deadline even when another thread is
+    already inside a slow export.
+
+    This is the signal handler's flush(2.0) (_lifecycle._SIGNAL_FLUSH_TIMEOUT).
+    Before the fix the drain lock was taken unconditionally, so this call waited
+    out the in-flight POST in full before starting its own — the "2s" shutdown
+    bound was really the transport timeout twice over, and SIGTERM hung for it.
+    """
+    in_export = threading.Event()
+    release = threading.Event()
+
+    class _Stuck(Transport):
+        def __init__(self):
+            self.envelopes = []
+            self.blocked_once = False
+
+        def export(self, envelope, *, timeout=None):
+            self.envelopes.append(envelope)
+            if not self.blocked_once:  # only the first export blocks, so the
+                self.blocked_once = True  # close() below can still finish
+                in_export.set()
+                release.wait(timeout=10.0)
+
+    t = _Stuck()
+    c = Client(WardexConfig(api_key="k", flush_interval=3600.0), t)
+    c._worker.stop()  # the slot holder must be a thread this test controls
+    try:
+        c.capture_span(_span(name="first"))
+        holder = threading.Thread(target=c.flush, args=(30.0,), daemon=True)
+        holder.start()
+        assert in_export.wait(timeout=5.0), "transport never entered export"
+
+        c.capture_span(_span(name="second"))
+        start = time.monotonic()
+        c.flush(0.2)  # must give up on its own deadline, not on the export's
+        elapsed = time.monotonic() - start
+    finally:
+        release.set()
+    holder.join(timeout=5.0)
+    assert not holder.is_alive()
+    assert elapsed < 2.0, f"flush(0.2) waited {elapsed:.2f}s behind an in-flight export"
+
+    # Declining costs nothing: the swap happens after the slot is taken, so a
+    # drain that gave up never held those spans.
+    c.close(5.0)
+    assert [s.name for e in t.envelopes for s in e.spans] == ["first", "second"]
+
+
+class _TimeoutRecording(Transport):
+    def __init__(self):
+        self.timeouts: list[float | None] = []
+
+    def export(self, envelope: InternalEnvelope, *, timeout: float | None = None) -> None:
+        self.timeouts.append(timeout)
+
+
+def test_flush_budget_reaches_the_transport():
+    """A bound on flush() is worthless if the transport never hears about it:
+    only the transport can bound its own I/O."""
+    t = _TimeoutRecording()
+    c = Client(WardexConfig(api_key="k", flush_interval=3600.0), t)
+    c._worker.stop()
+    c.capture_span(_span())
+    c.flush(2.0)
+    assert t.timeouts, "export was never called"
+    assert t.timeouts[0] is not None, "flush(2.0) handed the transport no deadline"
+    assert 0.0 < t.timeouts[0] <= 2.0
+    c.close()
+
+
+def test_periodic_drain_imposes_no_deadline_on_the_transport():
+    """The background worker has no deadline of its own — nobody waits on it.
+    Giving it one would clamp the transport's configured timeout on the one path
+    that ships data unattended, turning slow-but-working POSTs into lost ones."""
+    t = _TimeoutRecording()
+    c = Client(WardexConfig(api_key="k", flush_interval=0.05), t)
+    c.capture_span(_span())
+    assert _wait_for(lambda: bool(t.timeouts))
+    assert t.timeouts[0] is None
+    c.close()
+
+
+def test_transport_predating_the_timeout_parameter_still_exports(capsys):
+    """`Transport` is public API. A subclass written against the old
+    `export(self, envelope)` must keep working: calling it with timeout= would
+    raise TypeError into _drain's fail-closed handler, which drops the envelope
+    silently — a stall traded for total data loss."""
+
+    class _Legacy(Transport):
+        def __init__(self):
+            self.envelopes = []
+
+        def export(self, envelope):  # pre-timeout signature, on purpose
+            self.envelopes.append(envelope)
+
+    t = _Legacy()
+    c = Client(WardexConfig(api_key="k", flush_interval=3600.0, debug=True), t)
+    c._worker.stop()
+    c.capture_span(_span())
+    c.flush(2.0)
+    assert len(t.envelopes) == 1, "an old-signature transport stopped receiving envelopes"
+    assert "envelope dropped" not in capsys.readouterr().err
+    c.close()
+
+
+def test_transport_swapped_after_construction_is_re_probed(capsys):
+    """`_transport` is reassignable and is reassigned in practice. A signature
+    probe cached once at construction answers for the transport that is gone, so
+    it hands `timeout=` to a replacement that cannot take it and drops every
+    envelope through the fail-closed path."""
+    c = Client(WardexConfig(api_key="k", flush_interval=3600.0, debug=True), _TimeoutRecording())
+    c._worker.stop()
+
+    class _LegacyReplacement(Transport):
+        def __init__(self):
+            self.envelopes = []
+
+        def export(self, envelope):  # pre-timeout signature, on purpose
+            self.envelopes.append(envelope)
+
+    replacement = _LegacyReplacement()
+    c._transport = replacement
+    c.capture_span(_span())
+    c.flush(2.0)
+    assert len(replacement.envelopes) == 1, "the swapped-in transport received nothing"
+    assert "envelope dropped" not in capsys.readouterr().err
+    c.close()
