@@ -101,7 +101,7 @@ class OtlpHttpTransport(Transport):
 
         Public because the client reads it: a `flush()` with no argument follows
         the transport's own timeout rather than capping the POST at its own
-        default (see `_client._FollowTransportTimeout`). The client's read is
+        default (see `_client._UnnamedTimeout`). The client's read is
         guarded and falls back to 5.0, so a transport without this attribute is
         supported -- exposing it is how a transport says "wait for me this long",
         not a requirement of the `Transport` interface.

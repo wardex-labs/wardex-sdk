@@ -30,6 +30,15 @@ from ._enums import (
     ToolType,
 )
 from ._limits import CaptureLimits
+
+# NOT public, despite being reachable as `wardex_sdk.NATIVE_OK` /
+# `wardex_sdk.unavailable_reason`: imported for use by `init()` and `close()`
+# below, deliberately absent from `__all__`, and no more exported than the
+# assembly helpers imported the same way. Said here rather than left to be
+# guessed, because the pair looks like a supported feature probe and is not one:
+# the degraded mode it describes is ANNOUNCED, once, on stderr by `init()`, and
+# a host does not have to ask. Their home is `wardex_sdk._native`, private, and
+# they are free to change shape there.
 from ._native import NATIVE_OK, unavailable_reason
 from ._scope import UserInfo
 from ._tracing import agent, span, task, tool, trace, workflow

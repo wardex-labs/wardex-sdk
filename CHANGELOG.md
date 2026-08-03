@@ -112,14 +112,19 @@ All notable changes to this project are documented here. The format follows
   belongs to whoever chose the budget.
 
   A budget nobody chose is never reported. A bare `flush()` follows the
-  transport's own timeout and a bare `close()` spends wardex's own 5s default,
-  and both of those arrive at the transport a shade under the configured number
-  once the acquire and the encode are paid for — so "shorter than configured"
-  cannot be read as "the caller chose it", and is not. Third-party transports
-  can make the same distinction: the client passes a
-  `wardex_sdk.transport.CallerBudget` (a `float` subclass, so a transport that
-  has never heard of it sees exactly the number it always did) when and only
-  when the application named the number.
+  transport's own timeout, a bare `close()` spends wardex's own 5s default, and
+  the signal handler installed by `flush_on_signals` spends its own 2s bound;
+  all of those arrive at the transport a shade under the configured number once
+  the acquire and the encode are paid for — so "shorter than configured" cannot
+  be read as "the caller chose it", and is not. The signal handler matters most
+  of the three: it is on by default, 2s is under any transport configured for
+  more, and there is no knob for it, so "pass a larger timeout" would have been
+  advice about a number no host can pass. Third-party transports can make the
+  same distinction: the client passes a `wardex_sdk.transport.CallerBudget` (a
+  `float` subclass, so a transport that has never heard of it sees exactly the
+  number it always did) when and only when the application named the number.
+  A stalled backend at SIGTERM stays silent on this channel by design — the
+  failed POST is still logged under `debug`, by the transport that saw it.
 - **`close(timeout)` now abandons a tail it cannot ship inside its budget, and
   says so on stderr whether or not `debug` is set.** Bounding the drain bounded
   `close()` too, and a declined drain is free everywhere except the last one:
@@ -303,6 +308,18 @@ All notable changes to this project are documented here. The format follows
   transport that wants to report a decline must be able to import it by a
   public name, but it is inert — a sentinel with nothing to call and no reach
   into the core — so it does not belong on the surface everyone else reads.
+- `CallerBudget`, exported from `wardex_sdk.transport` alongside `UNDELIVERED`
+  and published for the same reason: it is part of the `Transport` contract, so
+  a third-party transport that wants to diagnose a cut-off export must be able
+  to import it by a public name. It is the `timeout` a `Transport` receives
+  when — and only when — the APPLICATION named the number, and it carries that
+  number as `.requested` so a report can quote what the caller would recognize
+  rather than the remainder left after the acquire and the encode. A plain
+  `float` means the budget is wardex's own (a bare `flush()` following the
+  transport's timeout, the shutdown default, the signal handler's short bound)
+  and must not be reported as anyone's fault. `CallerBudget` subclasses `float`,
+  so a transport that has never heard of it sees exactly the number it always
+  did, and the silent reading is the one a forgotten `isinstance` falls into.
 - `OtlpHttpTransport.timeout`, a read-only property carrying the per-export
   timeout the transport was constructed with. It is how a bare `wardex.flush()`
   learns how long the host is willing to wait; it is read defensively and is
