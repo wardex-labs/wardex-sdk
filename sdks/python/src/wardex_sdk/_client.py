@@ -52,13 +52,24 @@ _DEFAULT_TIMEOUT = 5.0
 
 
 class _UnnamedTimeout(float):
-    """The type of the `flush()`/`close()` defaults. A float on purpose.
+    """A budget WARDEX chose, not one a caller named. A float on purpose.
 
-    One class, two singletons, and the thing they have in common is the thing
-    that matters downstream: THE CALLER NAMED NO NUMBER. Everything wardex then
-    does with the budget -- how long it waits, and whether a cut-off export is
-    the caller's fault -- follows from that, and a boolean recomputed at each
+    One class, several singletons, and the thing they have in common is the
+    thing that matters downstream: THE CALLER NAMED NO NUMBER. Everything wardex
+    then does with the budget -- how long it waits, and whether a cut-off export
+    is the caller's fault -- follows from that, and a boolean recomputed at each
     layer would drift from it.
+
+    Membership of this class, not identity with any one singleton, is what the
+    blame question asks (`flush`, `close`). That is deliberate: the two public
+    defaults were the first two wardex-chosen budgets, not the only ones. The
+    signal handler's own short bound (`_lifecycle._SIGNAL_FLUSH_TIMEOUT`) is a
+    third, and it arrived as a bare `2.0` -- so `flush(timeout=2.0)` from inside
+    wardex was indistinguishable from `flush(2.0)` from the host, and the
+    cut-short report accused a host of a number it had no way to pass and no
+    knob to change. An identity check per default could not have caught that; a
+    check on the class does, and the rule it states is the invariant itself:
+    ANY number wardex picks for itself wears this type.
 
     `flush()` and `close()` are different operations and do not share a default.
     `flush()` means "send what you have, I will wait": it runs during normal
@@ -108,6 +119,24 @@ _FOLLOW_TRANSPORT_TIMEOUT = _UnnamedTimeout(_DEFAULT_TIMEOUT, "<the transport's 
 #: `close()` out of the cut-short report: wardex's shutdown default is not a
 #: budget anyone passed.
 _SHUTDOWN_TIMEOUT = _UnnamedTimeout(_DEFAULT_TIMEOUT, "<wardex's own shutdown default>")
+
+
+def _named_by_caller(timeout: float) -> bool:
+    """Did the APPLICATION choose this number, or did wardex choose it for them?
+
+    The single answer to that question, so the two public entry points and every
+    future internal caller of `flush()`/`close()` cannot answer it differently.
+
+    Asked of the TYPE rather than of a list of known sentinels. A per-default
+    identity check answers "is this the default of the function I am in", which
+    is a narrower question and the wrong one: `_lifecycle`'s signal handler calls
+    `flush(2.0)`, a number wardex picked and no host can pass or change, and
+    under identity checks that arrived here indistinguishable from a host's own
+    `flush(2.0)`. It then produced the exact false accusation this whole area
+    exists to prevent, on the one-line-per-process channel, burning the key the
+    genuine report needs. See `_UnnamedTimeout`.
+    """
+    return not isinstance(timeout, _UnnamedTimeout)
 
 
 def _configured_transport_timeout(transport: Transport) -> float:
@@ -494,7 +523,12 @@ class Client:
         if timeout is _FOLLOW_TRANSPORT_TIMEOUT:
             self._drain(_configured_transport_timeout(self._transport))
             return
-        self._drain(_sanitize_timeout(timeout), named_by_caller=True)
+        # How long to wait and whose number it is are two questions. This branch
+        # answers the first ("as long as you said") and `_named_by_caller` the
+        # second -- wardex calls its own flush() from the signal handler with a
+        # number of its own choosing, which is honoured as a bound exactly like a
+        # host's and must NOT be blamed on the host like one.
+        self._drain(_sanitize_timeout(timeout), named_by_caller=_named_by_caller(timeout))
 
     def _acquire_export_slot(self, budget: float | None) -> bool:
         """Take the export lock, waiting no longer than `budget` for it.
@@ -969,10 +1003,10 @@ class Client:
         # follow the transport. It is a reading of WHOSE number it is. A bare
         # close() spends wardex's own shutdown default, so an export that
         # default cuts short is not something a caller chose and must not be
-        # reported as one; `close(t)` is. Checked by identity for the same
-        # reason flush() checks by identity: a host that writes `close(5.0)`
-        # named a number.
-        named_by_caller = timeout is not _SHUTDOWN_TIMEOUT
+        # reported as one; `close(t)` is. A host that writes `close(5.0)` named
+        # a number, and gets the number's reading -- which is why the test is on
+        # the sentinel TYPE and not on the value.
+        named_by_caller = _named_by_caller(timeout)
         budget = _sanitize_timeout(timeout)
         with self._close_lock:
             if self._closed:

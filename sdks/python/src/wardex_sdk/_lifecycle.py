@@ -17,12 +17,34 @@ import signal
 import sys
 import threading
 
-from ._client import Client
+from ._client import Client, _UnnamedTimeout
 from ._config import WardexConfig
 from .assembly import Limitation
 
 _SIGNALS = (signal.SIGINT, signal.SIGTERM)
-_SIGNAL_FLUSH_TIMEOUT = 2.0  # short bound — never delay shutdown (design §4.3)
+
+#: Short bound — never delay shutdown (design §4.3).
+#:
+#: An `_UnnamedTimeout` and not a bare `2.0`, because the number is WARDEX'S and
+#: the difference is load-bearing downstream. `Client.flush` cannot see who
+#: called it; it reads whose number this is off the value. As a bare float this
+#: reached the transport as a budget "the caller passed", and a host that hit
+#: Ctrl-C against a slow backend was told on stderr that its own 2.0s budget had
+#: cut an export short and that it should "pass a larger timeout" -- an
+#: accusation about a number no host can pass, advising a knob that does not
+#: exist. Worse, that line is one per key per process, so it burned the key and
+#: silenced the report for a caller who later really did cut one short.
+#:
+#: It is still a real 2s bound; wearing this type changes nothing about how long
+#: the handler waits, only about whom a cut-off export is attributed to.
+#:
+#: And a stalled backend at SIGTERM stays SILENT on this channel, deliberately.
+#: The report exists to hand someone a number they can change, and here there is
+#: none: `flush_on_signals=False` plus a handler of the host's own is the only
+#: lever, which is a documentation matter and not a line printed while the
+#: process is being torn down. The fact is not hidden either -- the transport
+#: still logs the failed POST under `debug`, at the layer that observed it.
+_SIGNAL_FLUSH_TIMEOUT = _UnnamedTimeout(2.0, "<wardex's own signal-flush budget>")
 
 _current_client: Client | None = None
 _atexit_registered = False
