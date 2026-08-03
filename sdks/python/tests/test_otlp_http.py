@@ -19,6 +19,7 @@ from wardex_sdk._types import (
     TransportAttributes,
     TransportTiming,
 )
+from wardex_sdk.transport._base import UNDELIVERED
 from wardex_sdk.transport._otlp_http import OtlpHttpTransport
 
 
@@ -183,3 +184,104 @@ def test_export_with_an_exhausted_deadline_skips_the_post(monkeypatch):
     t = OtlpHttpTransport(endpoint="http://127.0.0.1:1/v1/traces", timeout=10.0)
     t.export(_envelope_with_span(), timeout=0.0)  # must return without raising
     assert attempts == [], "POST attempted with no budget left"
+
+
+def test_a_skipped_post_is_reported_back_to_the_caller_as_undelivered(monkeypatch):
+    """The one bit the client cannot work out for itself.
+
+    A drain hands over the envelope and then has to know whether it went. It
+    cannot look inside a transport, and every attempt to infer it from the
+    outside was wrong: the inference had to be made before the send, and host
+    code (`before_send`) runs in between and invalidates it. So the transport
+    says so, at the moment it knows — and a `flush()` that gets this answer
+    keeps its spans for the next drain instead of dropping them on the floor.
+
+    The value must be exactly `UNDELIVERED`; a falsy return would not do, since
+    `None` is what every transport written before this returns and those
+    transports deliver.
+    """
+    import urllib.request
+
+    monkeypatch.setattr(urllib.request, "urlopen", lambda *a, **k: None)
+    t = OtlpHttpTransport(endpoint="http://127.0.0.1:1/v1/traces", timeout=10.0)
+    assert t.export(_envelope_with_span(), timeout=0.0) is UNDELIVERED
+
+
+def test_a_post_that_was_attempted_is_never_reported_as_undelivered(monkeypatch):
+    """The control, and the reason `UNDELIVERED` is narrow: it promises the
+    envelope was not sent AND that an identical retry could succeed. A POST that
+    was made — even one that failed — may already be at the backend, so claiming
+    it here would hand the client a batch to send twice."""
+    import urllib.request
+
+    class _Resp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(urllib.request, "urlopen", lambda *a, **k: _Resp())
+    t = OtlpHttpTransport(endpoint="http://127.0.0.1:1/v1/traces", timeout=10.0)
+    assert t.export(_envelope_with_span(), timeout=5.0) is not UNDELIVERED
+    assert t.export(_envelope_no_spans()) is not UNDELIVERED, (
+        "an empty batch is nothing to deliver, not a decline the client should retry"
+    )
+
+    def _boom(*a, **k):
+        raise OSError("connection refused")
+
+    monkeypatch.setattr(urllib.request, "urlopen", _boom)
+    assert t.export(_envelope_with_span(), timeout=5.0) is not UNDELIVERED, (
+        "a failed POST was offered for retry; the backend may already hold it"
+    )
+
+
+def test_the_native_missing_line_does_not_repeat_per_export(monkeypatch, capsys):
+    """This is a per-call path: a host exporting in a loop got one line per
+    envelope, unbounded, from the one site in this area not already using
+    `report_once`. Unconditional is right — a silent exporter is the failure
+    nobody finds — and bounded to one line per process is what makes it
+    affordable."""
+    from wardex_sdk.assembly._diag import reset_reports_for_test
+    from wardex_sdk.transport import _otlp_http
+
+    reset_reports_for_test()
+    monkeypatch.setattr(_otlp_http, "NATIVE_OK", False)
+    monkeypatch.setattr(_otlp_http, "unavailable_reason", lambda: "ModuleNotFoundError: nope")
+    t = OtlpHttpTransport(endpoint="http://127.0.0.1:1/v1/traces")
+    capsys.readouterr()
+    for _ in range(5):
+        t.export(_envelope_with_span())
+    lines = [ln for ln in capsys.readouterr().err.splitlines() if "OTLP export skipped" in ln]
+    assert len(lines) == 1, f"five exports wrote {len(lines)} lines: {lines}"
+    assert "native extension unavailable" in lines[0], lines[0]
+    assert "ModuleNotFoundError" in lines[0], lines[0]
+    reset_reports_for_test()
+
+
+def test_a_degraded_transport_with_a_spent_deadline_still_names_the_missing_wheel(
+    monkeypatch, capsys
+):
+    """Order of the two guards, which used to hide the actionable one.
+
+    With the spent-budget skip checked first, a degraded process whose deadline
+    had also run out got the debug-gated "deadline exhausted" line and never the
+    unconditional "native extension unavailable" one. The deadline is a detail
+    of a send that could not have happened anyway; a wheel with no working core
+    is the finding, and it is the one that has to reach stderr.
+    """
+    from wardex_sdk.assembly._diag import reset_reports_for_test
+    from wardex_sdk.transport import _otlp_http
+
+    reset_reports_for_test()
+    monkeypatch.setattr(_otlp_http, "NATIVE_OK", False)
+    monkeypatch.setattr(_otlp_http, "unavailable_reason", lambda: "ModuleNotFoundError: nope")
+    t = OtlpHttpTransport(endpoint="http://127.0.0.1:1/v1/traces", debug=True)
+    capsys.readouterr()
+    t.export(_envelope_with_span(), timeout=0.0)  # both guards would fire
+    err = capsys.readouterr().err
+    assert "native extension unavailable" in err, (
+        f"the spent deadline suppressed the diagnosis worth acting on: {err!r}"
+    )
+    reset_reports_for_test()

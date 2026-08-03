@@ -15,7 +15,7 @@ from wardex_sdk._types import (
     TraceId,
 )
 from wardex_sdk.assembly._diag import reset_reports_for_test
-from wardex_sdk.transport._base import Transport
+from wardex_sdk.transport._base import UNDELIVERED, Transport
 
 
 def _wait_for(predicate, timeout=5.0):
@@ -495,8 +495,9 @@ def test_close_that_cannot_ship_the_tail_reports_it_under_the_DEFAULT_config(cap
         f"the line does not name the consequence; stderr was: {err!r}"
     )
     assert list(c._buffer.spans) == [], "unshippable spans left resident in a closed client"
-    assert c._dropped == 2, (
-        f"the abandoned tail was reported but not counted: _dropped={c._dropped}"
+    assert c._lost == 2, f"the abandoned tail was reported but not counted: _lost={c._lost}"
+    assert c._dropped == 0, (
+        f"a shutdown loss was counted as a buffer overflow: _dropped={c._dropped}"
     )
 
 
@@ -524,30 +525,41 @@ def test_close_reports_an_abandoned_tail_only_once_per_process(capsys):
 class _DeadlineHonouring(Transport):
     """A transport that respects the budget it is handed, as OtlpHttpTransport
     does: a non-positive `timeout` means there is no time to send, so it does
-    not. The recording transports elsewhere in this file ignore the deadline,
-    which is exactly why they could not see the defect below."""
+    not — and it SAYS so, by returning `UNDELIVERED`. The recording transports
+    elsewhere in this file neither honour the deadline nor say anything, which
+    is exactly why they could not see the defects below.
+
+    The return value is the whole mechanism. The client cannot see inside a
+    transport, so `UNDELIVERED` is the only way a skip here is distinguishable
+    from a delivery — and a client that instead guessed "spent budget, so it
+    must have skipped" was wrong about every transport that ignores the budget
+    and delivers anyway."""
 
     def __init__(self):
         self.timeouts: list[float | None] = []
         self.shipped: list[str] = []
 
-    def export(self, envelope: InternalEnvelope, *, timeout=None) -> None:
+    def export(self, envelope: InternalEnvelope, *, timeout=None) -> object | None:
         self.timeouts.append(timeout)
         if timeout is not None and timeout <= 0:
-            return
+            return UNDELIVERED
         self.shipped.extend(s.name for s in envelope.spans)
+        return None
 
 
 def test_close_with_a_spent_budget_reports_the_tail_it_cannot_send(capsys):
-    """The second exit `_abandon` never saw.
+    """The exit `_abandon` cannot see.
 
     Here the export slot IS free, so the final drain sails past the acquire and
     swaps the spans out — but the deadline is already gone, so the transport is
     handed 0.0 and skips. Same loss as the declined acquire, and it used to be
-    reached from the public API (`close(-1.0)` floors to 0.0) with `_dropped`
-    still 0 and stderr still empty. The transport here HONOURS the budget it is
-    handed, which the recording transports elsewhere in this file do not — that
-    is the only reason they could not see it.
+    reached from the public API (`close(-1.0)` floors to 0.0) with nothing
+    counted and stderr empty.
+
+    What close() reacts to is the transport's own verdict on this envelope, not
+    a reading of the clock taken before `before_send` ran: see
+    `test_a_before_send_that_outlives_close_s_budget_is_still_reported`, which
+    is the same loss with the clock check made useless.
     """
     reset_reports_for_test()
     t = _DeadlineHonouring()
@@ -561,14 +573,14 @@ def test_close_with_a_spent_budget_reports_the_tail_it_cannot_send(capsys):
     assert t.timeouts == [0.0], f"the transport was not handed a spent budget: {t.timeouts}"
     assert t.shipped == [], "a spent budget somehow reached the backend"
     assert list(c._buffer.spans) == [], "unshippable spans left resident in a closed client"
-    assert c._dropped == 1, f"the lost span was not counted: _dropped={c._dropped}"
+    assert c._lost == 1, f"the lost span was not counted: _lost={c._lost}"
     assert "could not ship 1 buffered span(s)" in err, (
         f"close(-1.0) lost the span without saying so; stderr was: {err!r}"
     )
 
 
 def test_close_with_budget_left_still_ships_through_a_deadline_honouring_transport(capsys):
-    """The control for the test above: the spent-budget shortcut must not have
+    """The control for the test above: reacting to a decline must not have
     turned every close() into an abandonment."""
     reset_reports_for_test()
     t = _DeadlineHonouring()
@@ -578,6 +590,7 @@ def test_close_with_budget_left_still_ships_through_a_deadline_honouring_transpo
     capsys.readouterr()
     c.close(5.0)
     assert t.shipped == ["only"], f"an ordinary close() shipped nothing: {t.timeouts}"
+    assert c._lost == 0
     assert c._dropped == 0
     assert capsys.readouterr().err == "", "an ordinary close() reported a loss"
 
@@ -595,8 +608,9 @@ class _LegacyIgnoringDeadline(Transport):
 def test_close_with_a_spent_budget_does_not_claim_a_loss_a_legacy_transport_avoids(capsys):
     """A transport that cannot take `timeout=` is handed the envelope with no
     bound at all, so a spent deadline does not stop it delivering. Reporting a
-    loss there would be a false alarm, and skipping the export to match the
-    report would *create* the loss the report describes."""
+    loss there would be a false alarm — and a false alarm is not free: it burns
+    the process-global `report_once` key, so the next REAL loss prints nothing.
+    """
     reset_reports_for_test()
     t = _LegacyIgnoringDeadline()
     c = Client(WardexConfig(api_key="k", flush_interval=3600.0), t)
@@ -605,8 +619,228 @@ def test_close_with_a_spent_budget_does_not_claim_a_loss_a_legacy_transport_avoi
     capsys.readouterr()
     c.close(-1.0)
     assert t.shipped == ["only"], "a legacy transport was denied an envelope it could ship"
-    assert c._dropped == 0, "a delivered span was counted as lost"
+    assert c._lost == 0, "a delivered span was counted as lost"
+    assert c._dropped == 0
     assert capsys.readouterr().err == "", "wardex reported a loss that did not happen"
+
+
+class _IgnoresTheDeadlineAndDelivers(Transport):
+    """Takes `timeout=`, ignores it entirely, always delivers. A legal
+    transport, and the one every attempt to PREDICT a loss got wrong."""
+
+    def __init__(self):
+        self.shipped: list[str] = []
+
+    def export(self, envelope: InternalEnvelope, *, timeout=None) -> None:
+        self.shipped.extend(s.name for s in envelope.spans)
+
+
+def test_a_transport_that_ignores_a_spent_deadline_is_never_treated_as_a_loss(capsys):
+    """Delivering unconditionally is legal, so it must cost nothing — on either
+    path. On close() a report would be a lie; on flush() putting the spans back
+    would be worse than a lie, because the next drain would ship them AGAIN and
+    the backend would see the same span twice."""
+    reset_reports_for_test()
+    t = _IgnoresTheDeadlineAndDelivers()
+    c = Client(WardexConfig(api_key="k", flush_interval=3600.0), t)
+    c._worker.stop()
+    c.capture_span(_span("a"))
+    capsys.readouterr()
+    c.flush(0.0)  # the whole budget is gone before the transport is reached
+    assert t.shipped == ["a"], "the envelope never reached a transport that would deliver it"
+    assert list(c._buffer.spans) == [], "a delivered batch was put back and will ship twice"
+    c.flush(5.0)
+    assert t.shipped == ["a"], "the delivered span was shipped a second time"
+    c.close(5.0)
+    assert c._lost == 0 and c._dropped == 0
+    assert capsys.readouterr().err == "", "wardex reported a loss that did not happen"
+
+
+def test_a_declined_flush_gives_the_spans_back_so_the_next_drain_ships_them(capsys):
+    """The contract `_drain`'s docstring states and `flush(0.0)` broke.
+
+    A non-final drain that does not ship costs nothing — that is why declining
+    is safe everywhere except close(). But the promise only ever held for the
+    declined *acquire*: an acquire that SUCCEEDED with no budget left took the
+    slot, swapped the spans out, handed the transport 0.0 and lost them, with
+    nothing counted and nothing said. main lost them the same way. The spans
+    belong back in the buffer, in order, for the next drain."""
+    reset_reports_for_test()
+    t = _DeadlineHonouring()
+    c = Client(WardexConfig(api_key="k", flush_interval=3600.0), t)
+    c._worker.stop()
+    c.capture_span(_span("a"))
+    c.capture_span(_span("b"))
+    capsys.readouterr()
+
+    c.flush(0.0)  # acquires the slot, then has nothing left to send with
+    assert t.shipped == [], "the transport claimed a delivery it declined"
+    assert [s.name for s in c._buffer.spans] == ["a", "b"], (
+        f"a declined flush lost the batch: {[s.name for s in c._buffer.spans]}"
+    )
+    assert c._lost == 0, "a recoverable flush was reported as a shutdown loss"
+    assert c._dropped == 0, "a returned batch was counted as a buffer overflow"
+    assert capsys.readouterr().err == "", "a recoverable flush reported a loss"
+
+    c.flush(5.0)
+    assert t.shipped == ["a", "b"], f"the next drain did not ship the returned batch: {t.shipped}"
+
+
+def test_a_returned_batch_goes_in_front_of_spans_captured_while_it_was_out():
+    """Ordering, which the export lock exists to preserve: the returned batch
+    predates everything captured since the swap, so it goes on the FRONT and
+    oldest-first. Appending it instead would put the tail on the wire ahead of
+    the head."""
+    t = _DeadlineHonouring()
+    c = Client(WardexConfig(api_key="k", flush_interval=3600.0), t)
+    c._worker.stop()
+    c.capture_span(_span("a"))
+    c.capture_span(_span("b"))
+    c.flush(0.0)  # declined; a and b come back
+    c.capture_span(_span("c"))
+    c.flush(5.0)
+    assert t.shipped == ["a", "b", "c"], f"capture order was not preserved: {t.shipped}"
+
+
+def test_a_returned_batch_yields_to_the_buffer_cap_instead_of_overflowing_it():
+    """A returned batch must not smuggle the buffer past `max_buffer_spans`:
+    the bound would then be one a bounded flush against a declining transport
+    could exceed at will. What does not fit is a buffer-full drop and is counted
+    as one — on `_dropped`, which is what that word means — never a silent
+    disappearance. Drop-oldest, as everywhere else, so the batch (which IS the
+    oldest) yields rather than evicting live spans.
+
+    The buffer refills WHILE the batch is out by the one deterministic route
+    there is: `before_send` is host code, it runs after the swap and before the
+    transport, and nothing stops it capturing. A background thread would race;
+    this does not."""
+    t = _DeadlineHonouring()
+    client_box = {}
+
+    def _captures_while_the_batch_is_out(envelope):
+        client_box["c"].capture_span(_span("c"))
+        client_box["c"].capture_span(_span("d"))
+        return envelope
+
+    c = Client(
+        WardexConfig(
+            api_key="k",
+            flush_interval=3600.0,
+            limits=CaptureLimits(max_buffer_spans=3),
+            before_send=_captures_while_the_batch_is_out,
+        ),
+        t,
+    )
+    client_box["c"] = c
+    c._worker.stop()
+    c.capture_span(_span("a"))
+    c.capture_span(_span("b"))
+
+    c.flush(0.0)  # declined; a and b come back to a buffer that now holds c, d
+    resident = [s.name for s in c._buffer.spans]
+    assert len(resident) <= 3, f"a returned batch pushed the buffer past its cap: {resident}"
+    assert resident == ["b", "c", "d"], (
+        f"the cap did not take the OLDEST of the returned batch: {resident}"
+    )
+    assert c._dropped == 1, f"the span that did not fit went uncounted: _dropped={c._dropped}"
+    assert c._lost == 0, "a buffer-full drop was labelled a shutdown loss"
+
+
+def test_a_before_send_that_outlives_close_s_budget_is_still_reported(capsys):
+    """The door a clock check taken before `before_send` could never see.
+
+    `before_send` is HOST code and runs INSIDE the deadline, after any check the
+    drain could have made and before the transport is reached. So a budget that
+    was healthy at the check is spent by the send: the transport is handed 0.0,
+    skips, and the tail is out of the buffer, off the wire, uncounted, with
+    stderr empty. Byte-for-byte the loss the previous two repairs each announced
+    they had closed.
+
+    Nothing about this test's timing is what makes it work — it works because
+    the drain stopped predicting and started asking.
+    """
+    reset_reports_for_test()
+
+    def _slow(envelope):
+        time.sleep(0.3)  # outlives the budget below, from inside it
+        return envelope
+
+    t = _DeadlineHonouring()
+    c = Client(
+        WardexConfig(api_key="k", flush_interval=3600.0, before_send=_slow),
+        t,
+    )
+    c._worker.stop()
+    c.capture_span(_span("only"))
+    capsys.readouterr()
+    c.close(0.1)  # ample at the acquire, spent by the time before_send returns
+    err = capsys.readouterr().err
+
+    assert t.timeouts == [0.0], f"the transport was not handed a spent budget: {t.timeouts}"
+    assert t.shipped == [], "a spent budget somehow reached the backend"
+    assert list(c._buffer.spans) == [], "unshippable spans left resident in a closed client"
+    assert c._lost == 1, f"the span before_send outlived was not counted: _lost={c._lost}"
+    assert "could not ship 1 buffered span(s)" in err, (
+        f"a before_send that outlived the budget lost the span in silence: {err!r}"
+    )
+
+
+def test_a_before_send_that_outlives_a_flush_budget_gives_the_spans_back(capsys):
+    """The same door on the non-final path, where the answer is different: the
+    spans are recoverable, so they go back rather than being announced as lost.
+    """
+    reset_reports_for_test()
+
+    def _slow(envelope):
+        time.sleep(0.3)
+        return envelope
+
+    t = _DeadlineHonouring()
+    c = Client(WardexConfig(api_key="k", flush_interval=3600.0, before_send=_slow), t)
+    c._worker.stop()
+    c.capture_span(_span("only"))
+    capsys.readouterr()
+    c.flush(0.1)
+    assert t.shipped == [], "the transport claimed a delivery it declined"
+    assert [s.name for s in c._buffer.spans] == ["only"], "a recoverable flush lost the span"
+    assert c._lost == 0 and c._dropped == 0
+    assert capsys.readouterr().err == "", "a recoverable flush reported a loss"
+
+
+class _HostileExportAttribute(Transport):
+    """`export` is a property that raises something `inspect.signature` does not
+    catch. `Transport` is public and `_transport` is reassignable at runtime, so
+    the client's every reach into it has to be inside a handler."""
+
+    export = property(lambda self: (_ for _ in ()).throw(RuntimeError("hostile export")))
+
+
+def test_a_hostile_transport_attribute_never_raises_into_close_or_flush():
+    """wardex may not raise into the host, and reading `.export` off a
+    caller-supplied `Transport` is host code: it can be a property, a
+    descriptor, or a `__getattr__`, and it can raise anything.
+
+    Every such reach is inside a handler now — the signature probe swallows it
+    and answers "cannot take timeout=", the call itself lands in `_drain`'s
+    fail-closed block. A probe performed from a SECOND site outside that block,
+    which is what deciding in advance whether a send would happen required,
+    turned `close(-1.0)` into a RuntimeError in the host's shutdown path.
+
+    Driven through `_transport` reassignment as well as construction, because
+    that is the route the memo in `Client.__init__` says makes this reachable in
+    a live process."""
+    c = Client(WardexConfig(api_key="k", flush_interval=3600.0), _Recording())
+    c._worker.stop()
+    c._transport = _HostileExportAttribute()  # swapped at runtime, as hosts do
+    c.capture_span(_span("only"))
+    c.flush(0.0)  # must not raise
+    c.flush(5.0)  # must not raise
+    c.close(-1.0)  # must not raise — the shape that used to escape
+
+    c2 = Client(WardexConfig(api_key="k", flush_interval=3600.0), _HostileExportAttribute())
+    c2._worker.stop()
+    c2.capture_span(_span("only"))
+    c2.close(5.0)  # must not raise on the ordinary budget, or at construction
 
 
 def test_hostile_flush_timeout_never_reaches_the_host():
