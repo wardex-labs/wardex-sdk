@@ -39,6 +39,58 @@ never happened and burn the one-line-per-process report budget doing it.
 """
 
 
+class CallerBudget(float):
+    """A `timeout` a CALLER named, as opposed to one wardex derived for them.
+
+    A transport receiving `timeout=2.0` cannot tell those two apart, and the
+    difference is the whole of whether a cut-off POST is news:
+
+      * `wardex.flush(2.0)` -- the caller named two seconds and did not wait
+        long enough to learn the outcome. Their number, their fix, worth a line.
+      * a bare `wardex.flush()` -- there is no caller number at all. wardex
+        derives one from the transport's own configured timeout, and by the time
+        the export runs it has already shrunk by the acquire and the encode, so
+        the transport sees something like 9.97 under a 10s configuration. That
+        is wardex telling the transport about its OWN timeout, and blaming the
+        caller for it is a false report.
+
+    That second case is a report the caller cannot act on, and because the
+    channel is one line per key per process, a false line BURNS the key: the
+    genuine cut-short report is silenced for the rest of the process. So the
+    fact travels with the number, and it travels in the direction that fails
+    safe.
+
+    THE DEFAULT IS SILENCE, which is what stops this drifting back. A plain
+    `float` -- what arithmetic produces, what a third-party client passes, what
+    any future code path that forgets about this class will hand over -- means
+    "wardex's own number, say nothing". Only an explicit `CallerBudget` speaks.
+    Re-introducing the bug therefore takes an affirmative wrap on the derived
+    path, not an omission on the caller's; and an omission on the caller's path
+    costs a diagnostic, never a false accusation.
+
+    `float` subclass rather than a second parameter because `Transport.export`
+    is PUBLIC: third-party transports written against `(envelope, *, timeout)`
+    must keep working, and they do -- to a transport that ignores this class,
+    a `CallerBudget` is simply the float it already expected.
+
+    `requested` is what the caller actually passed, kept alongside the (smaller)
+    remaining budget so a report can name the number the caller would recognize:
+    someone who wrote `flush(2.0)` should read "2.0s", not "1.97s".
+    """
+
+    __slots__ = ("requested",)
+
+    requested: float
+
+    def __new__(cls, remaining: float, requested: float) -> CallerBudget:
+        budget = super().__new__(cls, remaining)
+        budget.requested = float(requested)
+        return budget
+
+    def __repr__(self) -> str:
+        return f"CallerBudget({float(self)!r}, requested={self.requested!r})"
+
+
 class Transport(abc.ABC):
     # PII policy applied by the native encoders on wire paths (design §4.2).
     # Class-level defaults are secure-by-default: a transport used without
@@ -53,8 +105,15 @@ class Transport(abc.ABC):
 
     @abc.abstractmethod
     def export(self, envelope: InternalEnvelope, *, timeout: float | None = None) -> object | None:
-        """Ship one envelope. `timeout` is the caller's remaining budget, in
-        seconds, or None when the caller imposed no deadline.
+        """Ship one envelope. `timeout` is the remaining budget for this export,
+        in seconds, or None when no deadline was imposed at all.
+
+        Three values, not two: `None` means "no deadline"; a plain `float` means
+        "a budget wardex derived -- from your own configured timeout, or from
+        its shutdown default"; a `CallerBudget` means "a number the application
+        named". Only the last one is the caller's to answer for, and a transport
+        that diagnoses a cut-off POST must test for it rather than infer it from
+        the number being small. See `CallerBudget`.
 
         Keyword-only and defaulted on purpose: `Transport` is public, and
         subclasses written before this parameter existed still declare

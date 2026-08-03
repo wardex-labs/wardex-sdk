@@ -19,7 +19,7 @@ from ._types import (
 from ._version import __version__
 from ._worker import BatchWorker
 from .assembly import report_once
-from .transport._base import UNDELIVERED, Transport
+from .transport._base import UNDELIVERED, CallerBudget, Transport
 
 
 def build_sdk_info() -> SdkInfo:
@@ -51,14 +51,20 @@ _UNBOUNDED_TRANSPORT_FLUSH_TIMEOUT = 5.0
 _DEFAULT_TIMEOUT = 5.0
 
 
-class _FollowTransportTimeout(float):
-    """The type of `_FOLLOW_TRANSPORT_TIMEOUT`. A float on purpose.
+class _UnnamedTimeout(float):
+    """The type of the `flush()`/`close()` defaults. A float on purpose.
 
-    `flush()` and `close()` are different operations and no longer share a
-    default. `flush()` means "send what you have, I will wait": it runs during
-    normal operation, nobody is shutting down, and capping the POST at 5s under
-    an `OtlpHttpTransport(timeout=10.0)` silently overrode a number the host had
-    already chosen for exactly this. So the default follows the transport.
+    One class, two singletons, and the thing they have in common is the thing
+    that matters downstream: THE CALLER NAMED NO NUMBER. Everything wardex then
+    does with the budget -- how long it waits, and whether a cut-off export is
+    the caller's fault -- follows from that, and a boolean recomputed at each
+    layer would drift from it.
+
+    `flush()` and `close()` are different operations and do not share a default.
+    `flush()` means "send what you have, I will wait": it runs during normal
+    operation, nobody is shutting down, and capping the POST at 5s under an
+    `OtlpHttpTransport(timeout=10.0)` silently overrode a number the host had
+    already chosen for exactly this. So its default follows the transport.
     `close()` means "the process is going away, be quick" -- WAR-40 exists
     because that path was eating a Kubernetes termination grace period -- so it
     stays bounded at `_DEFAULT_TIMEOUT` and does NOT follow anything.
@@ -78,13 +84,28 @@ class _FollowTransportTimeout(float):
     missing the check degrades to yesterday's behaviour instead of a TypeError.
     """
 
-    __slots__ = ()
+    __slots__ = ("_label",)
+
+    _label: str
+
+    def __new__(cls, value: float, label: str) -> _UnnamedTimeout:
+        sentinel = super().__new__(cls, value)
+        sentinel._label = label
+        return sentinel
 
     def __repr__(self) -> str:
-        return "<the transport's own timeout>"
+        return self._label
 
 
-_FOLLOW_TRANSPORT_TIMEOUT = _FollowTransportTimeout(_DEFAULT_TIMEOUT)
+#: `flush()`'s default: no number was named, so follow the transport's own.
+_FOLLOW_TRANSPORT_TIMEOUT = _UnnamedTimeout(_DEFAULT_TIMEOUT, "<the transport's own timeout>")
+
+#: `close()`'s default: no number was named either, and the shutdown path picks
+#: its own 5s rather than following anything. A SEPARATE instance from the one
+#: above, because `flush()` tells the two defaults apart by identity -- and
+#: because "wardex's own shutdown default" is not a budget any caller passed,
+#: which is what keeps a bare `close()` out of the cut-short report.
+_SHUTDOWN_TIMEOUT = _UnnamedTimeout(_DEFAULT_TIMEOUT, "<wardex's own shutdown default>")
 
 
 def _configured_transport_timeout(transport: Transport) -> float:
@@ -453,12 +474,12 @@ class Client:
         """Export everything buffered and wait for it, up to `timeout` seconds.
 
         With no argument the budget is the transport's OWN configured timeout
-        (see `_FollowTransportTimeout`): a bare `flush()` is "send what you have,
-        I will wait", so it must not cap the POST below the number the host
-        configured the transport with. An explicit `flush(t)` is a real
-        wall-clock bound and is honoured as one -- that is WAR-40's win and it is
-        untouched. `close()` is the other operation and keeps the tight 5.0
-        default; it does not follow the transport.
+        (see `_UnnamedTimeout`): a bare `flush()` is "send what you have, I will
+        wait", so it must not cap the POST below the number the host configured
+        the transport with. An explicit `flush(t)` is a real wall-clock bound and
+        is honoured as one -- that is WAR-40's win and it is untouched.
+        `close()` is the other operation and keeps the tight 5.0 default; it does
+        not follow the transport.
         """
         # Public API: `timeout` is application input, so it is sanitized here and
         # _drain() may then assume a usable number. Note that None does NOT
@@ -471,7 +492,7 @@ class Client:
         if timeout is _FOLLOW_TRANSPORT_TIMEOUT:
             self._drain(_configured_transport_timeout(self._transport))
             return
-        self._drain(_sanitize_timeout(timeout))
+        self._drain(_sanitize_timeout(timeout), named_by_caller=True)
 
     def _acquire_export_slot(self, budget: float | None) -> bool:
         """Take the export lock, waiting no longer than `budget` for it.
@@ -499,13 +520,30 @@ class Client:
         # immediately even at budget=0, so reentrancy never spuriously declines.
         return self._export_lock.acquire(timeout=budget)
 
-    def _drain(self, timeout: float | None, *, final: bool = False) -> None:
+    def _drain(
+        self,
+        timeout: float | None,
+        *,
+        final: bool = False,
+        named_by_caller: bool = False,
+    ) -> None:
         """Export everything buffered, within `timeout` seconds end to end.
 
         `timeout` is None (the periodic worker only) or a value already through
         `_sanitize_timeout`; it is not re-validated here. `final=True` marks
         close()'s last drain -- the one after which nothing will ever drain this
         client again. See `_abandon` and `_undelivered`.
+
+        `named_by_caller` says whether `timeout` is a number the APPLICATION
+        passed to `flush()`/`close()` or one wardex derived for it (the
+        transport's configured timeout, the shutdown default, the worker's
+        None). It changes nothing about how long this drain waits; it is
+        forwarded to the transport, which cannot tell the two apart from the
+        number alone and needs to, because "your budget cut this off" is a
+        report only the first kind of caller can act on. Default False -- the
+        silent direction -- so a new call site that forgets it under-diagnoses
+        rather than blaming a host for wardex's own number. See
+        `transport._base.CallerBudget`.
 
         `timeout` is a wall-clock bound on this whole call, not a per-step one.
         It covers the wait for the export slot, the POST, and the transport
@@ -598,7 +636,7 @@ class Client:
                         # back here) nor reported.
                         return
                     envelope = maybe
-                shipped = self._export(envelope, deadline)
+                shipped = self._export(envelope, deadline, timeout if named_by_caller else None)
             except Exception as exc:  # fail-closed: drop, never ship half-filtered data
                 # Also not routed into `_undelivered`, deliberately. A raise
                 # means an attempt of unknown outcome -- the transport may have
@@ -614,7 +652,9 @@ class Client:
         finally:
             self._export_lock.release()
 
-    def _export(self, envelope: InternalEnvelope, deadline: float | None) -> bool:
+    def _export(
+        self, envelope: InternalEnvelope, deadline: float | None, named: float | None
+    ) -> bool:
         """Hand the envelope to the transport with whatever budget is left, and
         report back whether it went.
 
@@ -622,6 +662,17 @@ class Client:
         own I/O. A transport that ignores `timeout` still stalls the process for
         as long as it likes -- this shrinks the blast radius to one drain, it
         does not remove it.
+
+        `named` is the number the APPLICATION passed to `flush()`/`close()`, or
+        None when wardex derived the budget itself. It is the one fact the
+        transport cannot recover from what it receives: what arrives there is
+        `deadline - now`, which is always a little UNDER the transport's own
+        configured timeout even on a bare `flush()` that followed that very
+        timeout, so "smaller than configured" is not evidence of a caller. This
+        is the only site that turns it into the wire form -- one construction of
+        `CallerBudget`, on the one path where the caller really did choose the
+        number -- so there is nowhere else for the distinction to be re-derived
+        and got wrong.
 
         The return value is the single fact `_drain` acts on, and it is an
         OBSERVATION, not a forecast: False only when the transport itself
@@ -649,7 +700,8 @@ class Client:
         if not self._export_takes_timeout:
             return transport.export(envelope) is not UNDELIVERED
         remaining = max(0.0, deadline - time.monotonic())
-        return transport.export(envelope, timeout=remaining) is not UNDELIVERED
+        budget = remaining if named is None else CallerBudget(remaining, named)
+        return transport.export(envelope, timeout=budget) is not UNDELIVERED
 
     def _flush_transport(self, deadline: float | None) -> None:
         remaining = (
@@ -861,12 +913,17 @@ class Client:
         abandons a tail on every re-init still writes one line.
 
         Reachable only from a client that is closing or already closed, and
-        never from the signal path (see `_close_lock`). That matters because
-        `report_once` guards its dedup set with a plain Lock: a same-thread
-        handler landing inside that block and re-entering would hang. The
-        handler calls flush() on a live client, whose drain is neither `final`
-        nor refused by the buffer, so it never arrives here. Routing close()
-        onto the signal path means auditing that too, not just `_close_lock`.
+        never from the signal path (see `_close_lock`).
+
+        That used to be load-bearing for a second reason, and no longer is: the
+        old note here argued `report_once` was safe to call because a plain-Lock
+        dedup set could deadlock a re-entering signal handler, and no site the
+        handler reaches called it. That was an argument about the CALLERS, and it
+        expired the moment the flush-budget work put a `report_once` on the
+        transport's export path -- which the handler's `flush(2.0)` runs on the
+        interrupted thread. The lock is an RLock now, so the property belongs to
+        `report_once` itself and holds whoever calls it. Adding a `report_once`
+        somewhere new is no longer a decision that has to be audited from here.
         """
         if not lost:
             return
@@ -900,10 +957,20 @@ class Client:
             if self._config.debug:
                 print(f"[wardex] transport close failed ({exc})", file=sys.stderr)
 
-    def close(self, timeout: float = _DEFAULT_TIMEOUT) -> None:
+    def close(self, timeout: float = _SHUTDOWN_TIMEOUT) -> None:
         # Public API: sanitize before anything downstream is handed a value it
         # would raise on -- Thread.join() in step 2, the deadline arithmetic and
         # the timed acquire in step 3, a third-party Transport in step 4.
+        #
+        # The sentinel default is not a second reading of the NUMBER -- it is
+        # 5.0 either way, and unlike flush() this path deliberately does not
+        # follow the transport. It is a reading of WHOSE number it is. A bare
+        # close() spends wardex's own shutdown default, so an export that
+        # default cuts short is not something a caller chose and must not be
+        # reported as one; `close(t)` is. Checked by identity for the same
+        # reason flush() checks by identity: a host that writes `close(5.0)`
+        # named a number.
+        named_by_caller = timeout is not _SHUTDOWN_TIMEOUT
         budget = _sanitize_timeout(timeout)
         with self._close_lock:
             if self._closed:
@@ -918,5 +985,5 @@ class Client:
         # for what step 2 already spent would leave the final drain nothing and
         # abandon tails close() can currently still deliver.
         self._worker.stop(budget)  # 2. worker exits without draining
-        self._drain(budget, final=True)  # 3. final drain, owned by the closer
+        self._drain(budget, final=True, named_by_caller=named_by_caller)  # 3. final drain
         self._close_transport(budget)  # 4.

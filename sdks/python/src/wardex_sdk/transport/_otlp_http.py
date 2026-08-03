@@ -14,17 +14,22 @@ import urllib.request
 from .._native import NATIVE_OK, native, unavailable_reason
 from .._types import InternalEnvelope
 from ..assembly import report_once
-from ._base import UNDELIVERED, Transport
+from ._base import UNDELIVERED, CallerBudget, Transport
 
 
 def _cut_short_by_the_caller(
     exc: BaseException,
-    requested: float | None,
+    budget: float | None,
     configured: float,
     effective: float,
-) -> bool:
-    """Whether this failed POST was cut off by the CALLER's budget rather than
-    by the backend.
+) -> CallerBudget | None:
+    """The caller's budget, when it is what cut this failed POST short -- and
+    None when the backend, not the caller, is the story.
+
+    Returns the budget rather than a bool so the report can name the number the
+    caller would recognize (`flush(2.0)` reads "2.0s", not the 1.97s that was
+    left by the time the socket opened) without a second, unnarrowable
+    `isinstance` at the call site.
 
     Two different events end up in the same `except`, and only one of them is
     news:
@@ -39,27 +44,41 @@ def _cut_short_by_the_caller(
         enough to find out. That one is worth a line, because the outcome is
         genuinely UNKNOWN and the fix is the caller's to make.
 
-    So both halves have to hold: the effective deadline must have come from the
-    caller (strictly shorter than this transport's own -- equal means the
-    transport's configured timeout is what expired, which is the first case),
-    and the failure must actually be that deadline expiring rather than an
-    instant refusal that happened to arrive during a short budget.
+    Three halves, then, and the first one is the one that cannot be inferred
+    from the numbers:
+
+      * the budget must be a `CallerBudget` -- a number the APPLICATION named.
+        A small number is not evidence of that: a bare `flush()` derives its
+        budget from this transport's own configured timeout and then spends part
+        of it on the acquire and the encode, so the number arriving here is
+        always a little under `configured` even though no caller ever chose it.
+        Reading "shorter than configured" as "the caller chose it" reported a
+        down backend as the caller's fault on the default path, and since this
+        channel is one line per key per process, that false line silenced the
+        genuine report for the rest of the process. So the client SAYS which it
+        is (see `CallerBudget`) and this function does not guess.
+      * the effective deadline must be strictly shorter than this transport's
+        own: a `flush(99.0)` narrows to `configured`, and what expired then is
+        the transport's timeout, which is the first case above.
+      * the failure must actually be that deadline expiring, rather than an
+        instant refusal that happened to arrive during a short budget.
 
     `socket.timeout` has been an alias of `TimeoutError` since 3.10, and urllib
     reports a connect-phase timeout as `URLError(reason=TimeoutError(...))`, so
     those two shapes are the whole test. Anything unexpected -- including a
-    `reason` attribute that raises -- answers False, which is the direction that
+    `reason` attribute that raises -- answers None, which is the direction that
     stays silent rather than the one that burns the one-line-per-process budget
     on a guess.
     """
-    if requested is None or effective >= configured:
-        return False
+    if not isinstance(budget, CallerBudget) or effective >= configured:
+        return None
     try:
-        return isinstance(exc, TimeoutError) or isinstance(
+        expired = isinstance(exc, TimeoutError) or isinstance(
             getattr(exc, "reason", None), TimeoutError
         )
     except Exception:  # noqa: BLE001 — a probe with a safe answer, never a throw
-        return False
+        return None
+    return budget if expired else None
 
 
 class OtlpHttpTransport(Transport):
@@ -166,7 +185,8 @@ class OtlpHttpTransport(Transport):
         except Exception as exc:  # fail-silent: never crash the app
             if self._debug:
                 print(f"[wardex] OTLP export failed: {exc}", file=sys.stderr)
-            if _cut_short_by_the_caller(exc, timeout, self._timeout, effective):
+            cut_short_by = _cut_short_by_the_caller(exc, timeout, self._timeout, effective)
+            if cut_short_by is not None:
                 # Reported, NOT re-queued: the POST was open, so the backend may
                 # already hold this batch and a retry would duplicate it. What
                 # the caller loses here is not the spans, it is the KNOWLEDGE of
@@ -176,8 +196,9 @@ class OtlpHttpTransport(Transport):
                 # successful export.
                 report_once(
                     f"[wardex] an OTLP export was cut off after {time.monotonic() - started:.1f}s "
-                    f"by the {effective:.1f}s budget its caller passed to flush()/close(), "
-                    f"which is shorter than this transport's own {self._timeout:.1f}s timeout. "
+                    f"by the {cut_short_by.requested:.1f}s budget its caller passed to "
+                    f"flush()/close(), which is shorter than this transport's own "
+                    f"{self._timeout:.1f}s timeout. "
                     f"The POST had already been sent, so wardex cannot CONFIRM whether the "
                     f"backend received these {len(envelope.spans)} span(s); they are not "
                     f"resent, because the backend may hold them and a resend would duplicate "

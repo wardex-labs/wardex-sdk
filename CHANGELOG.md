@@ -110,6 +110,16 @@ All notable changes to this project are documented here. The format follows
   "your backend is down" and silence the real one later. The wording is
   deliberate — the outcome is unknown, not lost, and the fix (a larger timeout)
   belongs to whoever chose the budget.
+
+  A budget nobody chose is never reported. A bare `flush()` follows the
+  transport's own timeout and a bare `close()` spends wardex's own 5s default,
+  and both of those arrive at the transport a shade under the configured number
+  once the acquire and the encode are paid for — so "shorter than configured"
+  cannot be read as "the caller chose it", and is not. Third-party transports
+  can make the same distinction: the client passes a
+  `wardex_sdk.transport.CallerBudget` (a `float` subclass, so a transport that
+  has never heard of it sees exactly the number it always did) when and only
+  when the application named the number.
 - **`close(timeout)` now abandons a tail it cannot ship inside its budget, and
   says so on stderr whether or not `debug` is set.** Bounding the drain bounded
   `close()` too, and a declined drain is free everywhere except the last one:

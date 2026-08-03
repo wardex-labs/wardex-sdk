@@ -9,7 +9,7 @@ from contextlib import contextmanager
 from typing import Any
 
 from . import _hub
-from ._client import _DEFAULT_TIMEOUT, _FOLLOW_TRANSPORT_TIMEOUT, Client
+from ._client import _FOLLOW_TRANSPORT_TIMEOUT, _SHUTDOWN_TIMEOUT, Client
 from ._config import WardexConfig
 from ._enums import (
     AdapterName,
@@ -278,7 +278,7 @@ def flush(timeout: float = _FOLLOW_TRANSPORT_TIMEOUT) -> None:
         client.flush(timeout)
 
 
-def close(timeout: float = _DEFAULT_TIMEOUT) -> None:
+def close(timeout: float = _SHUTDOWN_TIMEOUT) -> None:
     """Uninstall everything, drain what is buffered, and close the transport.
 
     `timeout` bounds each shutdown step and defaults to 5 seconds. Unlike
@@ -286,6 +286,11 @@ def close(timeout: float = _DEFAULT_TIMEOUT) -> None:
     runs when the process is going away, and an unbounded one ate the whole
     termination grace period on the way out (WAR-40). Pass a larger budget when
     keeping the tail matters more than exiting promptly.
+
+    The default is a sentinel carrying that same 5.0, forwarded by identity, so
+    `Client.close` can tell "wardex picked 5 seconds" from "the host asked for
+    5 seconds". Only the second is a number anyone chose, and only the second
+    can be blamed for an export it cuts short.
     """
     if not NATIVE_OK:
         # `init()` returned before installing anything, so there is nothing to

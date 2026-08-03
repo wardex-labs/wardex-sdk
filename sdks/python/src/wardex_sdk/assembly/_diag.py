@@ -124,7 +124,21 @@ def _log_with_traceback(where: str, exc: BaseException) -> None:
 
 
 _REPORTED: set[str] = set()
-_REPORT_LOCK = threading.Lock()
+
+#: An RLock, for the reason `Counters` gives: a signal handler that runs wardex
+#: code (`_lifecycle.py` installs one) can land on a thread that is already
+#: inside `report_once`, and re-enter it. A plain Lock deadlocks the host there,
+#: on its own thread, forever.
+#:
+#: This is not theoretical and it is not old news. `_report_lost`'s docstring
+#: argued the site was safe because close() is off the signal path and the
+#: handler's flush() reached no `report_once` -- an argument about the CALLERS,
+#: which held only as long as nobody added one. The flush-budget work then added
+#: `report_once` to the transport's export path, which the handler's `flush(2.0)`
+#: runs on the interrupted thread, and the argument silently stopped holding. So
+#: the property is made local to the lock instead: it is safe because it is
+#: reentrant, whoever calls it.
+_REPORT_LOCK = threading.RLock()
 
 
 def report_once(message: str, *, key: str) -> None:
@@ -151,11 +165,21 @@ def report_once(message: str, *, key: str) -> None:
     Honest about its reach: stderr is the widest default-on channel this SDK
     has, not an infallible one — see `_log_with_traceback` for the four ways fd
     2 can be unwritable. It is strictly better than a table with no readers.
+
+    REENTRANT, and the bound survives reentrancy. The lock is an RLock (see
+    `_REPORT_LOCK`), so a signal handler that re-enters here on the same thread
+    proceeds instead of hanging — but that also means a signal can land BETWEEN
+    the two set operations below, and "test then add" would let both calls
+    conclude they were first and print the same key twice. Adding first and
+    reading the size back makes the claim from the single C-level `set.add`
+    itself: whichever call actually inserted the key sees the size change and
+    prints, the other sees it unchanged and returns, in either delivery order.
     """
     with _REPORT_LOCK:
-        if key in _REPORTED:
-            return
+        before = len(_REPORTED)
         _REPORTED.add(key)
+        if len(_REPORTED) == before:
+            return
     try:
         print(message, file=sys.stderr)
     except Exception:  # noqa: BLE001 — the reporting path may not become a throw
