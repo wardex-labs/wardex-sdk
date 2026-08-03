@@ -22,6 +22,16 @@ genuine argument bug on the HEALTHY path and report it as "the extension is
 missing" -- the one diagnosis that sends the reader in exactly the wrong
 direction.
 
+The guarantee, stated so nobody has to infer its edges: with the extension
+unimportable, `import wardex_sdk` and every symbol on its `__all__` work (as
+no-ops), and `wardex_sdk.transport`, `.context`, `.assembly`, `.adapters` and
+`.pipeline` import; `wardex_sdk.protocol`, `.semantics`, `.interceptors`,
+`transport._codec` and three `adapters/` modules still raise `ImportError`,
+because they reach the core at import time. That is a boundary and not a gap: each
+of them is reachable only through `init()`, which returns above, so degrading
+them would change nothing a host can observe while rewriting eager bindings on
+the parser hot path. `tests/test_native_absent.py` asserts both halves.
+
 `ImportError` and not `ModuleNotFoundError`: a `.so` that was never installed
 raises the subclass, but a `.so` that is present and unloadable -- the corrupt
 or wrong-ABI wheel, the case a user is far more likely to hit -- raises the
