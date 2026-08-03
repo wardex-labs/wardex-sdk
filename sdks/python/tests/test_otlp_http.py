@@ -19,7 +19,7 @@ from wardex_sdk._types import (
     TransportAttributes,
     TransportTiming,
 )
-from wardex_sdk.transport._base import UNDELIVERED
+from wardex_sdk.transport._base import UNDELIVERED, CallerBudget
 from wardex_sdk.transport._otlp_http import OtlpHttpTransport
 
 
@@ -300,6 +300,18 @@ def test_a_degraded_transport_with_a_spent_deadline_still_names_the_missing_whee
 # Over-firing is the failure mode these tests exist for: the report is bounded
 # to one line per process, so a line spent on an ordinary refusal silences the
 # real one later.
+#
+# These are unit tests of the transport's diagnosis and nothing more. The
+# host-facing claim -- which budgets a real `wardex.flush()`/`close()` actually
+# produces -- is pinned end to end in `test_cut_short_report.py`, and has to be:
+# an earlier version of this block passed plain floats here and concluded the
+# guard worked, when the client never produces a plain float on the path that
+# was firing. `CallerBudget` vs plain `float` below is not decoration, it is the
+# whole distinction under test.
+
+#: The budget a caller named, in the shape the client builds it: `flush(1.0)`
+#: reaching the transport with a hair under a second actually left.
+NAMED_1S = CallerBudget(0.99, 1.0)
 
 
 def _raising_urlopen(exc):
@@ -309,8 +321,13 @@ def _raising_urlopen(exc):
     return _urlopen
 
 
-def _export_and_read(monkeypatch, capsys, exc, *, configured=10.0, requested=1.0, debug=False):
-    """Run one failing POST and return whatever reached stderr."""
+def _export_and_read(monkeypatch, capsys, exc, *, configured=10.0, budget=NAMED_1S, debug=False):
+    """Run one failing POST and return whatever reached stderr.
+
+    `budget` is what the client would hand `export()`: a `CallerBudget` when the
+    application named a number, a plain float when wardex derived one, None when
+    there was no deadline at all.
+    """
     import urllib.request
 
     from wardex_sdk.assembly._diag import reset_reports_for_test
@@ -319,10 +336,10 @@ def _export_and_read(monkeypatch, capsys, exc, *, configured=10.0, requested=1.0
     monkeypatch.setattr(urllib.request, "urlopen", _raising_urlopen(exc))
     t = OtlpHttpTransport(endpoint="http://127.0.0.1:1/v1/traces", timeout=configured, debug=debug)
     capsys.readouterr()
-    if requested is None:
+    if budget is None:
         t.export(_envelope_with_span())
     else:
-        t.export(_envelope_with_span(), timeout=requested)
+        t.export(_envelope_with_span(), timeout=budget)
     err = capsys.readouterr().err
     reset_reports_for_test()
     return err
@@ -355,7 +372,10 @@ def test_the_report_says_delivery_is_unconfirmed_and_never_that_spans_were_lost(
     assert "cannot CONFIRM" in line, line
     assert "lost" not in line.lower(), f"the report claimed a loss it cannot know about: {line}"
     assert "1 span(s)" in line, line
-    assert "1.0s budget" in line, line
+    assert "1.0s budget" in line, (
+        f"the report named the remainder left at export time, not the 1.0 the caller "
+        f"would recognize: {line}"
+    )
     assert "10.0s timeout" in line, line
 
 
@@ -390,13 +410,43 @@ def test_an_ordinary_refusal_during_a_short_budget_is_not_reported(monkeypatch, 
 def test_a_timeout_at_the_transports_own_configured_limit_is_not_reported(monkeypatch, capsys):
     """The other half of "the caller cut it short": if the deadline that expired
     is the transport's OWN, the caller's budget is not the story and the backend
-    is. `effective >= configured` covers all three ways that happens -- no
-    budget at all, a budget equal to the configured timeout, and a budget larger
-    than it, which narrows to the configured one."""
-    for requested in (None, 10.0, 99.0):
-        err = _export_and_read(monkeypatch, capsys, TimeoutError("timed out"), requested=requested)
+    is. Both ways a caller reaches that -- naming exactly the configured timeout,
+    and naming a bigger number that narrows to it."""
+    for budget in (CallerBudget(10.0, 10.0), CallerBudget(99.0, 99.0)):
+        err = _export_and_read(monkeypatch, capsys, TimeoutError("timed out"), budget=budget)
         assert not _cut_short_lines(err), (
-            f"a timeout at the transport's own limit was blamed on flush({requested}): {err!r}"
+            f"a timeout at the transport's own limit was blamed on "
+            f"flush({budget.requested}): {err!r}"
+        )
+
+
+def test_a_budget_wardex_derived_is_never_reported_as_one_a_caller_passed(monkeypatch, capsys):
+    """The arm the client actually reaches, and the one the previous version of
+    this test could not see.
+
+    Every budget below is strictly shorter than the transport's configured 10s
+    and NONE of them was chosen by a caller: 9.97 is what a bare `flush()`
+    following that same 10s has left by the time the encode is done, and 5.0 is
+    wardex's own shutdown default under a transport configured for longer. The
+    old guard asked only "is it shorter than configured", so it answered yes to
+    both -- and produced a sentence that contradicted itself ("cut off by the
+    10.0s budget its caller passed ... shorter than this transport's own 10.0s
+    timeout") while burning the one line the real report needed.
+
+    A plain `float` is the silent default on purpose: arithmetic produces one,
+    a third-party client passes one, and any future path that forgets about
+    `CallerBudget` hands one over. Forgetting therefore costs a diagnostic, not
+    a false accusation.
+    """
+    for label, budget in {
+        "no deadline at all (the periodic worker)": None,
+        "a bare flush() following the transport's own 10s": 9.97,
+        "a bare close() spending wardex's own 5s default": 5.0,
+        "a spent budget": 0.0001,
+    }.items():
+        err = _export_and_read(monkeypatch, capsys, TimeoutError("timed out"), budget=budget)
+        assert not _cut_short_lines(err), (
+            f"{label}: a number wardex derived was reported as one a caller passed: {err!r}"
         )
 
 
@@ -413,7 +463,7 @@ def test_the_cut_short_report_is_bounded_to_one_line_per_process(monkeypatch, ca
     t = OtlpHttpTransport(endpoint="http://127.0.0.1:1/v1/traces", timeout=10.0)
     capsys.readouterr()
     for _ in range(5):
-        t.export(_envelope_with_span(), timeout=1.0)
+        t.export(_envelope_with_span(), timeout=NAMED_1S)
     lines = _cut_short_lines(capsys.readouterr().err)
     assert len(lines) == 1, f"five cut-short exports wrote {len(lines)} lines"
     reset_reports_for_test()
@@ -437,7 +487,7 @@ def test_a_delivered_export_under_a_short_budget_reports_nothing(monkeypatch, ca
     monkeypatch.setattr(urllib.request, "urlopen", lambda *a, **k: _Resp())
     t = OtlpHttpTransport(endpoint="http://127.0.0.1:1/v1/traces", timeout=10.0)
     capsys.readouterr()
-    t.export(_envelope_with_span(), timeout=1.0)
+    t.export(_envelope_with_span(), timeout=NAMED_1S)
     assert capsys.readouterr().err == "", "a successful export reported a delivery it made"
     reset_reports_for_test()
 
