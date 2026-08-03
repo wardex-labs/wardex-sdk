@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING, Any
 
 from .._enums import CaptureSource
 from ..assembly import Limitation, Prefilter
-from ._conn_timing import install_shared_timing, shared_timing_store, uninstall_shared_timing
+from ._conn_timing import shared_timing_store
 from ._seam import ByteSeamInterceptor, _ConnectionState
 from ._trackers import _Http1Tracker, _Http2Tracker
 
@@ -76,22 +76,10 @@ class RawSocketInterceptor(ByteSeamInterceptor):
         self._patches.patch(sock, "sendall", self._mk_sendall(sock.sendall))
         self._patches.patch(sock, "recv", self._mk_recv(sock.recv))
         self._patches.patch(sock, "recv_into", self._mk_recv_into(sock.recv_into))
-        install_shared_timing(self._limits["max_connections"])
+        self._acquire_timing()
         self._installed = True
 
-    def uninstall(self) -> None:
-        if not self._installed:
-            return
-        self._patches.restore_all()
-        uninstall_shared_timing()
-        from ._trackers import _WebSocketTracker
-
-        for st in list(self._conns.values()):
-            if isinstance(st.tracker, _WebSocketTracker):
-                for txn in st.tracker.flush(Limitation.WS_NO_CLOSE):
-                    self._emit_ws(st, txn)
-        self._conns.clear()
-        self._installed = False
+    # `uninstall` is the base's — see `ByteSeamInterceptor.uninstall`.
 
     # --- Subclass hooks ---
 

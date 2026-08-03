@@ -285,3 +285,68 @@ def test_init_intercept_survives_an_environment_without_anyio():
 
     assert proc.returncode == 0, f"init(intercept=True) failed without anyio:\n{proc.stderr}"
     assert "OK" in proc.stdout
+
+
+_BROKEN_ANYIO_PROBE = """
+import importlib.abc
+import importlib.machinery
+import sys
+
+
+class _Boom(importlib.abc.MetaPathFinder, importlib.abc.Loader):
+    "anyio is installed and its import RAISES — and not with an ImportError."
+
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == "anyio" or fullname.startswith("anyio."):
+            return importlib.machinery.ModuleSpec(fullname, self)
+        return None
+
+    def create_module(self, spec):
+        return None
+
+    def exec_module(self, module):
+        raise RuntimeError("anyio's own module body raised at import time")
+
+
+for name in [m for m in sys.modules if m == "anyio" or m.startswith("anyio.")]:
+    del sys.modules[name]
+sys.meta_path.insert(0, _Boom())
+
+import wardex_sdk as wardex
+from wardex_sdk.assembly import counters
+from wardex_sdk.interceptors import _mcp_stdio
+from wardex_sdk.interceptors._registry import get_registry
+
+assert _mcp_stdio._aio_backend is None, "the broken anyio was imported after all"
+assert counters.get("interceptors.mcp_stdio.anyio_unavailable") >= 1, "the failure was silent"
+
+wardex.init(intercept=True)
+assert get_registry().is_installed("mcp_stdio"), "mcp_stdio"
+print("OK")
+"""
+
+
+def test_init_intercept_survives_an_anyio_whose_import_raises():
+    """`except Exception` and not `except ImportError`, which is the breadth the
+    comment on that import claims and nothing used to check — narrowing it to
+    `ImportError` passed the whole suite, because the probe above simulates
+    absence with `sys.modules["anyio"] = None` and that is an ImportError.
+
+    Importing a third party runs code wardex does not own, at a moment when
+    wardex is a passenger in someone else's process: a broken C extension, a
+    package whose module body reads an environment variable that is not set, a
+    half-finished install. I6 does not exempt the ways that code can fail, and
+    the failure mode is the same one the absence case had — `wardex.init()`
+    raising at startup over a package the user never chose.
+    """
+    import subprocess
+
+    proc = subprocess.run(
+        [sys.executable, "-c", _BROKEN_ANYIO_PROBE],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+    assert proc.returncode == 0, f"init(intercept=True) failed on a broken anyio:\n{proc.stderr}"
+    assert "OK" in proc.stdout

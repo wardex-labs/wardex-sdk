@@ -14,10 +14,10 @@ import ssl
 from typing import TYPE_CHECKING, Any
 
 from ..assembly import Limitation
-from ._conn_timing import install_shared_timing, shared_timing_store, uninstall_shared_timing
+from ._conn_timing import shared_timing_store
 from ._seam import ByteSeamInterceptor, _ConnectionState
 from ._socket import _H2_PREFACE, _HTTP_METHODS
-from ._trackers import _Http1Tracker, _Http2Tracker, _WebSocketTracker
+from ._trackers import _Http1Tracker, _Http2Tracker
 
 if TYPE_CHECKING:
     from .._client import Client
@@ -49,20 +49,11 @@ class SSLInterceptor(ByteSeamInterceptor):
         self._patches.patch(sock, "recv_into", self._mk_recv_into(sock.recv_into))
         self._patches.patch(obj, "write", self._mk_send("write", obj.write))
         self._patches.patch(obj, "read", self._mk_read(obj.read))
-        install_shared_timing(self._limits["max_connections"])
+        self._acquire_timing()
         self._installed = True
 
-    def uninstall(self) -> None:
-        if not self._installed:
-            return
-        self._patches.restore_all()
-        uninstall_shared_timing()
-        for st in list(self._conns.values()):
-            if isinstance(st.tracker, _WebSocketTracker):
-                for txn in st.tracker.flush(Limitation.WS_NO_CLOSE):
-                    self._emit_ws(st, txn)
-        self._conns.clear()
-        self._installed = False
+    # `uninstall` is the base's: both seams undid the same three things, and the
+    # copy here is what let one of them keep a stale `if not self._installed`.
 
     # --- Subclass hook implementations (SSL-specific) ---
 

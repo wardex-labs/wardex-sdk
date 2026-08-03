@@ -19,8 +19,11 @@ class InterceptorRegistry:
         """Install one interceptor. A failure here costs its seam and nothing else.
 
         The same two defects `AdapterRegistry.install` closed, in the registry
-        next door, and deliberately the same shape: this asymmetry written twice
-        with two different remedies is how the two sides drift apart again.
+        next door, and the same shape wherever the two sides have the same
+        problem: this asymmetry written twice with two different remedies is how
+        they drift apart again. Where they now differ is the rollback, and the
+        last paragraph but two says why — an adapter's undo is its patches, a
+        seam's is its patches plus a refcount and a WebSocket flush.
 
         GUARDED, which it was not. `uninstall_all` has always been total and
         `install` was not, so an interceptor raising out of `install()` took
@@ -40,28 +43,55 @@ class InterceptorRegistry:
         object left able to remove them. Recording first is what lets the
         rollback below run at all.
 
-        The undo is best-effort and says so rather than pretending: each
-        interceptor owns its own `PatchSet`, so restoring it is that
-        interceptor's `uninstall()`'s job, and one that sets its installed flag
-        last will decline. The entry is dropped either way — a name left in the
-        table is one every later `install()` skips by name, turning one failed
-        install into a seam that is never attempted again.
+        The undo really undoes, which is the third thing and the one the first
+        two are worth nothing without. Each interceptor owns its own `PatchSet`,
+        so restoring is its `uninstall()`'s job — and all three of them used to
+        open with `if not self._installed: return` against a flag their
+        `install()` sets LAST, so the rollback called an undo that declined,
+        every time, for every interceptor in the product. They are now total:
+        each undoes whatever it got as far as, and is safe to call on a seam
+        that installed nothing (`_seam.ByteSeamInterceptor.uninstall`).
+
+        Routing the patches through a registry-owned `PatchSet` — the shape
+        `AdapterRegistry` uses, where `ctx.patches.restore_all()` runs
+        unconditionally — was the other candidate and it undoes strictly less
+        here. A seam's install is not only patches: it takes a refcounted
+        reference on the shared connection-timing probe and it holds live
+        WebSocket sessions whose spans are emitted at teardown. A registry that
+        restored the patches and nothing else would leave that refcount raised
+        forever, which is a `socket.connect` patch nothing can ever remove, and
+        `uninstall()` would still have to be total for the rest — so it buys a
+        second mechanism and keeps the bug.
+
+        POP FIRST, then roll back. The pop used to sit after the rollback, where
+        a `BaseException` out of `uninstall()` — `guard` re-raises those by
+        design, because a `KeyboardInterrupt` is the host's control flow — flew
+        past it and left the name in the table forever, and a name left in the
+        table is one every later `install()` skips by name. Nothing reads the
+        table during an `uninstall()`, so the earlier pop costs nothing; this is
+        the order `uninstall_all` already documents for the same reason.
         """
         name = interceptor.name()
         if name in self._installed:
             return
         self._installed[name] = interceptor
+        # `debug` is read here so a failed seam is one line on stderr under
+        # `init(debug=True)` rather than a counter with no reader — which
+        # `_diag.report_once` argues is the same as saying nothing. This is the
+        # failure the guards above exist for; it is the last one that should be
+        # undiagnosable.
+        debug = bool(getattr(getattr(client, "config", None), "debug", False))
 
         ok = False
-        with guard(f"interceptors.{name}.install"):
+        with guard(f"interceptors.{name}.install", debug=debug):
             interceptor.install(client)
             ok = True
         if ok:
             return
 
-        with guard(f"interceptors.{name}.install_rollback"):
-            interceptor.uninstall()
         self._installed.pop(name, None)
+        with guard(f"interceptors.{name}.install_rollback", debug=debug):
+            interceptor.uninstall()
 
     def uninstall_all(self) -> None:
         """Uninstall every interceptor. Total: one failure cannot stop the rest.

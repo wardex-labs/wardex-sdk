@@ -55,6 +55,8 @@ from ._base import InterceptorInterface
 # host took the host down at startup over a package the user never installed.
 # `except Exception` and not `except ImportError`: importing a third party runs
 # code wardex does not own, and I6 does not exempt the ways that code can fail.
+# Both halves are probed in a real interpreter — an absent anyio and an anyio
+# whose module body raises — because neither is visible to a monkeypatch.
 # Counted rather than silent (C-S4) — `install()` below turns it into one line
 # on stderr for a person, and the seam that needs it declines.
 try:
@@ -403,8 +405,15 @@ class McpStdioInterceptor(InterceptorInterface):
         self._installed = True
 
     def uninstall(self) -> None:
-        if not self._installed:
-            return
+        """Undo whatever was patched, however far `install()` got.
+
+        No `if not self._installed` gate, for `ByteSeamInterceptor.uninstall`'s
+        reason: the flag is set as the last statement of `install()`, so on the
+        one path where the undo matters — the registry rolling back an
+        `install()` that raised — it reads False and the gate declined to
+        restore anything. `restore_all()` is idempotent and empty before the
+        first `patch()`, so it answers the same question honestly.
+        """
         self._patches.restore_all()
         self._installed = False
 

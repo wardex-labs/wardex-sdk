@@ -173,7 +173,10 @@ _MEMBER_SITES: dict[str, frozenset[str]] = {
     # --- protocol-specific ---
     "GRPC_WEB_UNSUPPORTED": frozenset({"interceptors/_seam.py"}),
     "GRPC_STATUS_UNAVAILABLE": frozenset({"semantics/_grpc.py"}),
-    "WS_NO_CLOSE": frozenset({"interceptors/_socket.py", "interceptors/_ssl.py"}),
+    # One site, not two: both byte seams flushed their open WS sessions with the
+    # same six lines, and the copy is what let one of them keep a stale
+    # installed-flag gate on the uninstall the other had outgrown.
+    "WS_NO_CLOSE": frozenset({"interceptors/_seam.py"}),
     # --- unit / adapter lifecycle ---
     "CHILD_SPAN_UNCLOSED": frozenset({"adapters/_assembler.py", "assembly/_units.py"}),
     # Two emitters, one per bound that can evict a session: the registry closes

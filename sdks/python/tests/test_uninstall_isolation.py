@@ -402,16 +402,182 @@ def test_a_failed_interceptor_install_is_still_reachable_by_the_teardown_that_un
     """Filed BEFORE called, which is why the rollback can run at all.
 
     An `install()` that raises halfway has already patched part of a surface,
-    and an interceptor the registry never recorded is one nothing can reach —
-    those wrappers stayed in front of the host's sockets for the life of the
-    process.
+    and an interceptor the registry never recorded is one nothing can reach.
+
+    This double claims exactly one thing — that the registry CALLS the undo —
+    and the assertion says so. It used to end `"the half-installed interceptor
+    was never undone"`, which is a claim about the host's sockets that no double
+    can carry: this one restores nothing, because it patched nothing. Whether
+    the undo undoes is a question about the three interceptors the SDK ships,
+    and it is asked of them directly, below.
     """
     reg = InterceptorRegistry()
     interceptor = _InstallBoomInterceptor()
 
     reg.install(interceptor, client=None)
 
-    assert interceptor.uninstalls == 1, "the half-installed interceptor was never undone"
+    assert interceptor.uninstalls == 1, "the registry never reached the failed install's undo"
+
+
+def test_a_half_installed_ssl_seam_leaves_no_wrapper_on_the_hosts_sockets(monkeypatch):
+    """The half a test double cannot prove, asked of the interceptor we ship.
+
+    `SSLInterceptor.install` patches five methods across `ssl.SSLSocket` and
+    `ssl.SSLObject` and only then takes the shared timing reference — so a
+    failure there is an install that has already rewritten the host's TLS
+    classes. The registry's rollback called `uninstall()`, and `uninstall()`
+    opened with `if not self._installed: return` against a flag `install()` sets
+    as its LAST statement. It read False, returned, the registry dropped the
+    entry, and five wrappers stayed in front of every TLS socket in the process
+    with no object left able to remove them.
+
+    A version bump in the stdlib or in a package the user never chose is the
+    ordinary way this raises, which is why it is `install_shared_timing` that is
+    broken here rather than something invented.
+    """
+    import ssl
+
+    from wardex_sdk.interceptors import _seam
+    from wardex_sdk.interceptors._ssl import SSLInterceptor
+
+    pristine = {
+        (ssl.SSLSocket, name): ssl.SSLSocket.__dict__[name]
+        for name in ("send", "recv", "recv_into")
+    }
+    pristine.update(
+        {(ssl.SSLObject, name): ssl.SSLObject.__dict__[name] for name in ("write", "read")}
+    )
+
+    def boom(_cap=None):  # noqa: ANN001, ANN202
+        raise RuntimeError("the shared timing seam is broken in this environment")
+
+    monkeypatch.setattr(_seam, "install_shared_timing", boom)
+    reg = InterceptorRegistry()
+    interceptor = SSLInterceptor()
+
+    reg.install(interceptor, client=None)  # must not raise
+
+    try:
+        assert not reg.is_installed("ssl")
+        for (target, name), original in pristine.items():
+            assert target.__dict__[name] is original, (
+                f"{target.__name__}.{name} is still wardex's wrapper after a failed "
+                "install was rolled back — the seam is in front of the host's sockets "
+                "for the life of the process, and nothing can take it out"
+            )
+    finally:
+        # Not `uninstall()`: this must clean up even when the assertion above
+        # bites (and it must not depend on the code under test to do it), or a
+        # red here poisons every TLS test behind it in the same process.
+        interceptor._patches.restore_all()
+
+
+def test_a_rolled_back_seam_does_not_release_a_timing_reference_it_never_took(monkeypatch):
+    """Total is not the same as unconditional, and this is where they differ.
+
+    The shared connection-timing probe is REFCOUNTED — both byte seams take a
+    reference and it patches `socket.connect` once. An `uninstall()` made total
+    by simply dropping its installed-flag gate would release a reference the
+    failed `install()` never took: the count falls to zero underneath the seam
+    that is still live and healthy, `socket.connect` is restored out from under
+    it, and every span it emits from then on reports its connect time as
+    unavailable. So the release is keyed on the acquisition itself.
+    """
+    import socket
+
+    from wardex_sdk.interceptors import _conn_timing
+    from wardex_sdk.interceptors._socket import RawSocketInterceptor
+    from wardex_sdk.interceptors._ssl import SSLInterceptor
+
+    assert _conn_timing._shared_refcount == 0, (
+        "another test left the shared timing probe installed; this one proves nothing"
+    )
+    # `connect` and `send` are INHERITED from `_socket.socket`, so "is wardex's
+    # wrapper installed?" is exactly "does the class have an own attribute?" —
+    # a patched-and-restored attribute is `delattr`'d back to absent (PatchSet
+    # rule 2), never left as a shadow.
+    assert "connect" not in socket.socket.__dict__
+    assert "send" not in socket.socket.__dict__
+
+    reg = InterceptorRegistry()
+    live = SSLInterceptor()
+    reg.install(live, client=None)
+    assert "connect" in socket.socket.__dict__, (
+        "the live seam never installed the timing probe; there is no reference to lose"
+    )
+
+    def boom(self, _real):  # noqa: ANN001, ANN202
+        raise RuntimeError("this seam half-installed and then failed")
+
+    monkeypatch.setattr(RawSocketInterceptor, "_mk_sendall", boom)
+
+    try:
+        reg.install(RawSocketInterceptor(), client=None)  # must not raise
+
+        assert "connect" in socket.socket.__dict__, (
+            "the rolled-back seam released a timing reference it never took, so the "
+            "live seam lost the connect timing it is still installed for"
+        )
+        assert "send" not in socket.socket.__dict__, (
+            "the rolled-back seam left its own wrapper on socket.send"
+        )
+    finally:
+        reg.uninstall_all()
+        assert _conn_timing._shared_refcount == 0, "a timing reference outlived its seam"
+        assert "connect" not in socket.socket.__dict__
+
+
+def test_a_rollback_the_host_interrupts_still_drops_the_name_from_the_table():
+    """A `KeyboardInterrupt` out of the undo is the host's, and it is re-raised —
+    but it used to fly past the `pop` two lines below, leaving the failed seam's
+    name in the table forever. Every later `install()` then skips that seam by
+    name and says nothing: one interrupted teardown, and TLS is never observed
+    again for the life of the process.
+    """
+
+    class _InterruptedRollback(InterceptorInterface):
+        def name(self) -> str:
+            return "interrupted-rollback"
+
+        def install(self, client) -> None:  # noqa: ANN001
+            raise RuntimeError("half-patched, then failed")
+
+        def uninstall(self) -> None:
+            raise KeyboardInterrupt
+
+    reg = InterceptorRegistry()
+
+    with pytest.raises(KeyboardInterrupt):
+        reg.install(_InterruptedRollback(), client=None)
+
+    assert not reg.is_installed("interrupted-rollback"), (
+        "an interrupted rollback left the name registered, so every later install() "
+        "silently skips that seam"
+    )
+
+
+def test_a_failed_interceptor_install_is_reported_under_debug(capsys):
+    """`debug=True` is the user asking to be told, and this is the failure they
+    are most likely to be asking about. Without the flag wired through, a broken
+    seam is recorded in a counter that has no reader outside the test suite —
+    indistinguishable, from the outside, from wardex never having been installed.
+    """
+
+    class _Config:
+        debug = True
+
+    class _ClientLike:
+        config = _Config()
+
+    reg = InterceptorRegistry()
+
+    reg.install(_InstallBoomInterceptor(), client=_ClientLike())
+
+    err = capsys.readouterr().err
+    assert "interceptors.install-boom.install" in err, (
+        "a seam that failed to install printed nothing, with debug on"
+    )
+    assert "half-patched, then failed" in err, "the traceback of the failure was not reported"
 
 
 def test_an_interceptor_failing_to_install_does_not_cost_the_others_theirs():
