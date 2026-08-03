@@ -46,9 +46,76 @@ def _span_size(span: InternalSpan) -> int:
 # only ever consumed by third-party transports that buffer.
 _UNBOUNDED_TRANSPORT_FLUSH_TIMEOUT = 5.0
 
-# The default budget for flush() and close(), and the value an unusable argument
-# falls back to. Kept here so the signature default and the fallback cannot drift.
+# The default budget for close(), and the value an unusable argument falls back
+# to. Kept here so the signature default and the fallback cannot drift.
 _DEFAULT_TIMEOUT = 5.0
+
+
+class _FollowTransportTimeout(float):
+    """The type of `_FOLLOW_TRANSPORT_TIMEOUT`. A float on purpose.
+
+    `flush()` and `close()` are different operations and no longer share a
+    default. `flush()` means "send what you have, I will wait": it runs during
+    normal operation, nobody is shutting down, and capping the POST at 5s under
+    an `OtlpHttpTransport(timeout=10.0)` silently overrode a number the host had
+    already chosen for exactly this. So the default follows the transport.
+    `close()` means "the process is going away, be quick" -- WAR-40 exists
+    because that path was eating a Kubernetes termination grace period -- so it
+    stays bounded at `_DEFAULT_TIMEOUT` and does NOT follow anything.
+
+    Why a distinct sentinel rather than `None`: inside `_drain`, None already
+    means "unbounded", it is the periodic worker's contract, and the lock-order
+    note in `Client.__init__` depends on no other caller ever passing it (an
+    unbounded acquire from a caller holding the buffer lock hangs both threads).
+    Overloading None with a second meaning would put "ask the transport" one
+    forgotten branch away from "wait forever while holding a lock".
+
+    Why it subclasses `float` rather than being a bare object: it is the default
+    of a PUBLIC signature, so it leaks into `help()`, into a host that reads the
+    default off the function and passes it back, and into any future branch that
+    forgets to check for it. As a float carrying `_DEFAULT_TIMEOUT` it simply
+    behaves as the old default everywhere the identity check is not made, so
+    missing the check degrades to yesterday's behaviour instead of a TypeError.
+    """
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "<the transport's own timeout>"
+
+
+_FOLLOW_TRANSPORT_TIMEOUT = _FollowTransportTimeout(_DEFAULT_TIMEOUT)
+
+
+def _configured_transport_timeout(transport: Transport) -> float:
+    """How long `transport` was configured to spend on one export, or
+    `_DEFAULT_TIMEOUT` when that cannot be learned.
+
+    Reading an attribute off a caller-supplied `Transport` is a reach into HOST
+    code and is treated as one: `Transport` is public, so `timeout` may be
+    absent, a property that raises, or a `__getattr__` that returns something
+    that is not a number and raises on `float()`. Two defects in this area came
+    from a transport read that sat outside a handler, so the read, the
+    conversion and the validation are all inside this one try.
+
+    Every unusable answer falls back to `_DEFAULT_TIMEOUT` rather than being
+    rejected, for the reason `_sanitize_timeout` gives: rejecting means raising,
+    and wardex may not raise into the host over a flush. Non-positive is
+    unusable too -- a transport configured for "no time at all" would make the
+    no-argument `flush()` a guaranteed decline, which is not what the caller of
+    a bare `flush()` asked for.
+
+    `KeyboardInterrupt` and `CancelledError` are BaseExceptions and so pass
+    straight through `except Exception`, which is deliberate: a host tearing
+    this thread down is not a transport whose timeout we failed to read.
+    """
+    try:
+        configured = float(transport.timeout)  # type: ignore[attr-defined]
+    except Exception:  # noqa: BLE001 — a probe with a safe answer, never a throw
+        return _DEFAULT_TIMEOUT
+    if configured != configured or configured <= 0.0:  # NaN, 0, negative
+        return _DEFAULT_TIMEOUT
+    return min(configured, threading.TIMEOUT_MAX)
 
 
 def _sanitize_timeout(timeout: object) -> float:
@@ -382,12 +449,28 @@ class Client:
                     self._dropped += 1
             self._snapshots.append(snapshot)
 
-    def flush(self, timeout: float = _DEFAULT_TIMEOUT) -> None:
+    def flush(self, timeout: float = _FOLLOW_TRANSPORT_TIMEOUT) -> None:
+        """Export everything buffered and wait for it, up to `timeout` seconds.
+
+        With no argument the budget is the transport's OWN configured timeout
+        (see `_FollowTransportTimeout`): a bare `flush()` is "send what you have,
+        I will wait", so it must not cap the POST below the number the host
+        configured the transport with. An explicit `flush(t)` is a real
+        wall-clock bound and is honoured as one -- that is WAR-40's win and it is
+        untouched. `close()` is the other operation and keeps the tight 5.0
+        default; it does not follow the transport.
+        """
         # Public API: `timeout` is application input, so it is sanitized here and
         # _drain() may then assume a usable number. Note that None does NOT
         # survive this call -- inside _drain, None means "unbounded", which is
         # the periodic worker's contract and must not be reachable from a host
-        # that passed the wrong thing.
+        # that passed the wrong thing. The sentinel is checked by identity, so a
+        # host that passes the float 5.0 by hand still gets 5.0 and not the
+        # transport's timeout: it named a number, and naming one is the whole
+        # difference between the two readings.
+        if timeout is _FOLLOW_TRANSPORT_TIMEOUT:
+            self._drain(_configured_transport_timeout(self._transport))
+            return
         self._drain(_sanitize_timeout(timeout))
 
     def _acquire_export_slot(self, budget: float | None) -> bool:
@@ -630,6 +713,13 @@ class Client:
         Final: there is no next drain, so returning them would hide them in a
         client nobody will ever drain again. They are counted and reported.
 
+        And the case that is neither, which is why `_return_to_buffer` answers
+        rather than just acting: a NON-final drain against an ALREADY CLOSED
+        client. `flush()` after `close()` is one route to it and a drain still in
+        flight when `close()` runs is the other, and both end in the final
+        path's outcome, because "there is no next drain" is a fact about the
+        client, not about the flag this call was made with.
+
         `spans`/`snapshots` are what the drain swapped OUT, not whatever
         `before_send` turned them into. The next drain builds a fresh envelope
         and runs `before_send` over it again, which is the only reading that
@@ -646,14 +736,52 @@ class Client:
                 key="client.close.transport_declined",
             )
             return
-        self._return_to_buffer(spans, snapshots)
+        if self._return_to_buffer(spans, snapshots):
+            return
+        # The buffer would not take them because this client is closed. There is
+        # no next drain here either, so the non-final path ends where the final
+        # one does rather than parking spans in a client that can never ship
+        # them -- see `_return_to_buffer` for the two ways a live drain reaches
+        # a closed client.
+        self._report_lost(
+            len(spans) + len(snapshots),
+            why="the transport declined them and close() had already run, so the buffer "
+            "they would have gone back into will never be drained again.",
+            key="client.closed.declined_after_close",
+            fix="Flush before closing, or give wardex.close(timeout=...) a larger budget.",
+        )
 
     def _return_to_buffer(
         self,
         spans: deque[InternalSpan],
         snapshots: deque[InternalStateSnapshot],
-    ) -> None:
-        """Put a declined batch back where the next drain will find it.
+    ) -> bool:
+        """Put a declined batch back where the next drain will find it, and say
+        whether the buffer took it.
+
+        FALSE means the client is closed and the batch was NOT taken: after
+        close() no drain will ever run again, so returning spans here hides them
+        in a client that cannot ship them -- uncounted, unreported, `_spans`
+        still listing them as pending, which is the exact state `_abandon`'s
+        docstring says it exists to prevent. The caller reports them instead.
+
+        Two ways a live drain reaches a closed client, and the check is inside
+        the buffer lock because only one of them is sequential:
+
+          * `flush()` after `close()`. Nothing forbids it -- `flush` deliberately
+            does not test `_closed` -- and its drain is not `final`, so it
+            arrives right here.
+          * a race with no post-close flush at all: another thread is inside a
+            non-final drain when `close()` runs, `_abandon` empties the buffer,
+            and that drain then hands its batch back into the client `_abandon`
+            just finished emptying.
+
+        `close()` sets `_closed` (step 1) strictly before `_abandon` can empty
+        anything (step 3), so reading it under the same lock `_abandon` swaps
+        under is what makes the second case decidable: either this block runs
+        first and `_abandon` collects the returned batch, or `_abandon` ran first
+        and `_closed` is already True here. A check outside the lock would sit in
+        the window between the two.
 
         Ordering: this batch predates everything captured since the swap, so it
         goes on the FRONT, and it is walked newest-first so that the pushes land
@@ -681,6 +809,8 @@ class Client:
         """
         dropped = 0
         with self._buffer_lock:
+            if self._closed:
+                return False
             for span in reversed(spans):
                 size = _span_size(span)
                 buf = self._buffer
@@ -698,9 +828,18 @@ class Client:
                     continue
                 self._snapshots.appendleft(snapshot)
             self._dropped += dropped
+        return True
 
-    def _report_lost(self, lost: int, *, why: str, key: str) -> None:
-        """Count spans close() could not ship on `_lost`, and say so -- once.
+    def _report_lost(
+        self,
+        lost: int,
+        *,
+        why: str,
+        key: str,
+        fix: str = "Give wardex.close(timeout=...) a larger budget to keep them.",
+    ) -> None:
+        """Count spans a closed client could not ship on `_lost`, and say so
+        -- once.
 
         `_lost`, not `_dropped`: `_dropped` means "evicted because the buffer
         was full" everywhere else, and `_drain` prints it in exactly those
@@ -721,23 +860,45 @@ class Client:
         per process, however many times the site trips. A shutdown path that
         abandons a tail on every re-init still writes one line.
 
-        Reachable only from close(), which is deliberately not on the signal
-        path (see `_close_lock`). That matters because `report_once` guards its
-        dedup set with a plain Lock: a same-thread handler landing inside that
-        block and re-entering would hang. The handler calls flush(), whose drain
-        is not `final` and so never arrives here. Routing close() onto the signal
-        path means auditing that too, not just `_close_lock`.
+        Reachable only from a client that is closing or already closed, and
+        never from the signal path (see `_close_lock`). That matters because
+        `report_once` guards its dedup set with a plain Lock: a same-thread
+        handler landing inside that block and re-entering would hang. The
+        handler calls flush() on a live client, whose drain is neither `final`
+        nor refused by the buffer, so it never arrives here. Routing close()
+        onto the signal path means auditing that too, not just `_close_lock`.
         """
         if not lost:
             return
         with self._buffer_lock:
             self._lost += lost
         report_once(
-            f"[wardex] close() could not ship {lost} buffered span(s): {why} "
-            "They are out of the buffer and nothing will retry them. Give "
-            "wardex.close(timeout=...) a larger budget to keep them.",
+            f"[wardex] could not ship {lost} buffered span(s): {why} "
+            f"They are out of the buffer and nothing will retry them. {fix}",
             key=key,
         )
+
+    def _close_transport(self, budget: float) -> None:
+        """Close the transport, and keep whatever it raises out of the host's
+        shutdown path.
+
+        The last unguarded reach into a caller-supplied `Transport` on this
+        path. `Transport` is public: `close` can be a property that raises, a
+        `__getattr__`, or simply a socket teardown that throws, and step 4 called
+        it bare -- so a third-party transport turned `wardex.close()`, which
+        hosts call from `atexit` hooks and `finally` blocks, into a raise out of
+        their exit path. Fail-silent like `_flush_transport`, for the same reason
+        and with the same debug line.
+
+        `KeyboardInterrupt` and `CancelledError` are BaseExceptions and still
+        propagate: a host tearing the process down must not be swallowed by an
+        observability SDK's cleanup.
+        """
+        try:
+            self._transport.close(budget)
+        except Exception as exc:  # fail-silent: never crash the app or the exit path
+            if self._config.debug:
+                print(f"[wardex] transport close failed ({exc})", file=sys.stderr)
 
     def close(self, timeout: float = _DEFAULT_TIMEOUT) -> None:
         # Public API: sanitize before anything downstream is handed a value it
@@ -758,4 +919,4 @@ class Client:
         # abandon tails close() can currently still deliver.
         self._worker.stop(budget)  # 2. worker exits without draining
         self._drain(budget, final=True)  # 3. final drain, owned by the closer
-        self._transport.close(budget)  # 4.
+        self._close_transport(budget)  # 4.

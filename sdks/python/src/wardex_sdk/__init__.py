@@ -9,7 +9,7 @@ from contextlib import contextmanager
 from typing import Any
 
 from . import _hub
-from ._client import Client
+from ._client import _DEFAULT_TIMEOUT, _FOLLOW_TRANSPORT_TIMEOUT, Client
 from ._config import WardexConfig
 from ._enums import (
     AdapterName,
@@ -258,13 +258,35 @@ def capture_state_snapshot(
         client.capture_snapshot(snapshot)
 
 
-def flush(timeout: float = 5.0) -> None:
+def flush(timeout: float = _FOLLOW_TRANSPORT_TIMEOUT) -> None:
+    """Send everything buffered and wait for it.
+
+    With no argument the budget is the transport's own configured timeout -- a
+    bare `flush()` is "send what you have, I will wait", so it does not cap the
+    POST below what the transport was configured for (an
+    `OtlpHttpTransport(timeout=10.0)` gets its 10 seconds). Pass a number for a
+    real wall-clock bound: `flush(2.0)` returns within about two seconds
+    whatever the transport was configured for. `close()` is the other operation
+    and keeps its own tight default; see below.
+
+    The sentinel default is forwarded by identity, so `Client.flush` makes the
+    same distinction this signature does between "no argument" and an explicit
+    number that happens to equal the old default.
+    """
     client = _hub.get_client()
     if client is not None:
         client.flush(timeout)
 
 
-def close(timeout: float = 5.0) -> None:
+def close(timeout: float = _DEFAULT_TIMEOUT) -> None:
+    """Uninstall everything, drain what is buffered, and close the transport.
+
+    `timeout` bounds each shutdown step and defaults to 5 seconds. Unlike
+    `flush()` this default does NOT follow the transport, deliberately: close()
+    runs when the process is going away, and an unbounded one ate the whole
+    termination grace period on the way out (WAR-40). Pass a larger budget when
+    keeping the tail matters more than exiting promptly.
+    """
     if not NATIVE_OK:
         # `init()` returned before installing anything, so there is nothing to
         # uninstall and no client to drain. The return has to come before the

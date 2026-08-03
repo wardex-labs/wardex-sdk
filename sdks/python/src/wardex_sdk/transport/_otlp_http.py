@@ -8,12 +8,58 @@ Network errors are fail-silent (an observability SDK must never crash the app) +
 from __future__ import annotations
 
 import sys
+import time
 import urllib.request
 
 from .._native import NATIVE_OK, native, unavailable_reason
 from .._types import InternalEnvelope
 from ..assembly import report_once
 from ._base import UNDELIVERED, Transport
+
+
+def _cut_short_by_the_caller(
+    exc: BaseException,
+    requested: float | None,
+    configured: float,
+    effective: float,
+) -> bool:
+    """Whether this failed POST was cut off by the CALLER's budget rather than
+    by the backend.
+
+    Two different events end up in the same `except`, and only one of them is
+    news:
+
+      * a 500, a refused connection, a DNS failure, a POST that outlived the
+        timeout this transport was CONFIGURED with -- the backend, or the
+        network, misbehaving. Already fail-silent by design, with its own
+        debug line, and reporting it would be reporting "your backend is down"
+        once per process on a channel meant for something else.
+      * a POST that was still in flight when a budget the caller named ran out.
+        Nothing was wrong with the backend; the caller simply did not wait long
+        enough to find out. That one is worth a line, because the outcome is
+        genuinely UNKNOWN and the fix is the caller's to make.
+
+    So both halves have to hold: the effective deadline must have come from the
+    caller (strictly shorter than this transport's own -- equal means the
+    transport's configured timeout is what expired, which is the first case),
+    and the failure must actually be that deadline expiring rather than an
+    instant refusal that happened to arrive during a short budget.
+
+    `socket.timeout` has been an alias of `TimeoutError` since 3.10, and urllib
+    reports a connect-phase timeout as `URLError(reason=TimeoutError(...))`, so
+    those two shapes are the whole test. Anything unexpected -- including a
+    `reason` attribute that raises -- answers False, which is the direction that
+    stays silent rather than the one that burns the one-line-per-process budget
+    on a guess.
+    """
+    if requested is None or effective >= configured:
+        return False
+    try:
+        return isinstance(exc, TimeoutError) or isinstance(
+            getattr(exc, "reason", None), TimeoutError
+        )
+    except Exception:  # noqa: BLE001 — a probe with a safe answer, never a throw
+        return False
 
 
 class OtlpHttpTransport(Transport):
@@ -29,6 +75,19 @@ class OtlpHttpTransport(Transport):
         self._headers = dict(headers or {})
         self._timeout = timeout
         self._debug = debug
+
+    @property
+    def timeout(self) -> float:
+        """How long one export may take, as this transport was configured.
+
+        Public because the client reads it: a `flush()` with no argument follows
+        the transport's own timeout rather than capping the POST at its own
+        default (see `_client._FollowTransportTimeout`). The client's read is
+        guarded and falls back to 5.0, so a transport without this attribute is
+        supported -- exposing it is how a transport says "wait for me this long",
+        not a requirement of the `Transport` interface.
+        """
+        return self._timeout
 
     def export(self, envelope: InternalEnvelope, *, timeout: float | None = None) -> object | None:
         return self._send_batch(envelope, timeout)
@@ -99,6 +158,7 @@ class OtlpHttpTransport(Transport):
 
         from ..interceptors._exclusion import suppress_capture
 
+        started = time.monotonic()
         try:
             with suppress_capture():
                 with urllib.request.urlopen(req, timeout=effective):
@@ -106,6 +166,24 @@ class OtlpHttpTransport(Transport):
         except Exception as exc:  # fail-silent: never crash the app
             if self._debug:
                 print(f"[wardex] OTLP export failed: {exc}", file=sys.stderr)
+            if _cut_short_by_the_caller(exc, timeout, self._timeout, effective):
+                # Reported, NOT re-queued: the POST was open, so the backend may
+                # already hold this batch and a retry would duplicate it. What
+                # the caller loses here is not the spans, it is the KNOWLEDGE of
+                # whether they arrived -- and that is a fact about the budget the
+                # caller chose, which nothing else on this path will ever tell
+                # them. Off-debug this was silence indistinguishable from a
+                # successful export.
+                report_once(
+                    f"[wardex] an OTLP export was cut off after {time.monotonic() - started:.1f}s "
+                    f"by the {effective:.1f}s budget its caller passed to flush()/close(), "
+                    f"which is shorter than this transport's own {self._timeout:.1f}s timeout. "
+                    f"The POST had already been sent, so wardex cannot CONFIRM whether the "
+                    f"backend received these {len(envelope.spans)} span(s); they are not "
+                    f"resent, because the backend may hold them and a resend would duplicate "
+                    f"them. Pass a larger timeout to confirm delivery.",
+                    key="transport.otlp.caller_budget_cut_short",
+                )
         # No `UNDELIVERED` on the failure path either, and not an oversight: the
         # POST was attempted, so the backend may well hold this batch already.
         # Handing it back for a retry would duplicate it, and against a backend
