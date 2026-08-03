@@ -123,7 +123,10 @@ def _log_with_traceback(where: str, exc: BaseException) -> None:
         counters.bump(LOG_FAILED)
 
 
-_REPORTED: set[str] = set()
+#: Keys already reported. A dict rather than a set for the reason `report_once`
+#: gives: `dict.setdefault` decides "was I the one who inserted this" inside a
+#: SINGLE C call, and a set has no operation that does. The values are inert.
+_REPORTED: dict[str, object] = {}
 
 #: An RLock, for the reason `Counters` gives: a signal handler that runs wardex
 #: code (`_lifecycle.py` installs one) can land on a thread that is already
@@ -168,17 +171,24 @@ def report_once(message: str, *, key: str) -> None:
 
     REENTRANT, and the bound survives reentrancy. The lock is an RLock (see
     `_REPORT_LOCK`), so a signal handler that re-enters here on the same thread
-    proceeds instead of hanging — but that also means a signal can land BETWEEN
-    the two set operations below, and "test then add" would let both calls
-    conclude they were first and print the same key twice. Adding first and
-    reading the size back makes the claim from the single C-level `set.add`
-    itself: whichever call actually inserted the key sees the size change and
-    prints, the other sees it unchanged and returns, in either delivery order.
+    proceeds instead of hanging rather than deadlocking the host — but that
+    means the dedup decision is now made by two calls interleaved on ONE thread,
+    with the lock held by both, so the lock orders nothing between them. Any
+    read-then-write pair loses: with "test membership, then add", a signal
+    delivered after the outer call's test and before its add lets both conclude
+    they were first, and the same key prints twice — on a path where a host is
+    already being torn down and stderr is the only channel left. So is any pair
+    that compares a size across the mutation, for the same reason.
+
+    `setdefault` closes it because the test and the insert are one C call, and a
+    signal is only ever delivered BETWEEN bytecodes. Each call brings its own
+    `mine`, exactly one call's `mine` can end up in the table, and that is the
+    call that prints — in either delivery order, and whether the interruption
+    lands before the call, inside the arguments, or after the return.
     """
+    mine = object()
     with _REPORT_LOCK:
-        before = len(_REPORTED)
-        _REPORTED.add(key)
-        if len(_REPORTED) == before:
+        if _REPORTED.setdefault(key, mine) is not mine:
             return
     try:
         print(message, file=sys.stderr)

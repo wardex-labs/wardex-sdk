@@ -62,16 +62,9 @@ def test_the_lock_guarding_the_report_set_is_the_reentrant_kind():
     )
 
 
-def test_a_key_re_entered_mid_report_still_prints_exactly_one_line(capsys):
-    """Reentrancy must not cost the bound that makes an unconditional print
-    affordable.
-
-    "Test the membership, then add" would let a signal delivered between the two
-    statements conclude twice that it was first, and print the same key twice --
-    on the path where a host is already being torn down and stderr is the only
-    channel left. Adding first and reading the size back moves the claim into
-    the single `set.add`, so exactly one caller sees the change.
-    """
+def test_the_bound_holds_across_ordinary_repetition(capsys):
+    """The easy half: three calls, one key, one line. What makes an
+    unconditional print affordable on a per-export path."""
     reset_reports_for_test()
     capsys.readouterr()
     for _ in range(3):
@@ -79,6 +72,63 @@ def test_a_key_re_entered_mid_report_still_prints_exactly_one_line(capsys):
     lines = [ln for ln in capsys.readouterr().err.splitlines() if "bounded" in ln]
     assert len(lines) == 1, f"three calls with one key wrote {len(lines)} lines"
     reset_reports_for_test()
+
+
+class _InterruptedOnce(dict):
+    """The dedup table with a signal wired into it, delivered exactly once.
+
+    Making the lock reentrant removed the deadlock and put something else in its
+    place: the dedup decision is now made by two calls interleaved on ONE
+    thread, both holding the lock, so the lock orders nothing between them. A
+    read-then-write pair therefore lets both conclude they were first.
+
+    Reproducing that needs the interruption at the write, not at the read -- a
+    signal delivered before the outer call's membership test is harmless,
+    because the handler runs to completion and the outer test then sees the key.
+    So both mutating entry points are hooked and the trap is armed once:
+
+      * `setdefault`, which is how the bound is claimed when it is claimed in
+        one C call;
+      * `__setitem__`, which is where a read-then-write pair commits, and where
+        that shape is already past its own test and cannot see the handler's.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._armed = True
+
+    def _handler(self, key: str) -> None:
+        if not self._armed:
+            return
+        self._armed = False
+        report_once("[wardex] from the signal handler", key=key)
+
+    def setdefault(self, key, default=None):  # noqa: ANN001, ANN206
+        self._handler(key)
+        return super().setdefault(key, default)
+
+    def __setitem__(self, key, value) -> None:  # noqa: ANN001
+        self._handler(key)
+        super().__setitem__(key, value)
+
+
+def test_a_signal_delivered_at_the_dedup_write_still_costs_exactly_one_line(monkeypatch, capsys):
+    """One key, one line, even when a handler re-enters at the moment the first
+    call was committing it.
+
+    This is the bound under the conditions reentrancy created, and it is why the
+    decision has to be one `setdefault` rather than a membership test followed
+    by an insert. Both callers below want the same key; exactly one of them may
+    speak.
+    """
+    monkeypatch.setattr(_diag, "_REPORTED", _InterruptedOnce())
+    capsys.readouterr()
+    report_once("[wardex] from the interrupted thread", key="test.signal.window")
+    lines = [ln for ln in capsys.readouterr().err.splitlines() if "test" not in ln and ln.strip()]
+    assert len(lines) == 1, (
+        f"a signal delivered while the dedup key was being committed cost "
+        f"{len(lines)} lines for one key: {lines!r}"
+    )
 
 
 def test_a_reentrant_call_with_a_different_key_still_gets_its_own_line(capsys):
