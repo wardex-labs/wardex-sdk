@@ -285,3 +285,185 @@ def test_a_degraded_transport_with_a_spent_deadline_still_names_the_missing_whee
         f"the spent deadline suppressed the diagnosis worth acting on: {err!r}"
     )
     reset_reports_for_test()
+
+
+# -- an attempt the CALLER's budget cut short --------------------------------
+#
+# Two different events land in the same `except`, and only one of them is news.
+# A backend that is down, refusing, or simply slower than this transport was
+# configured for is already fail-silent by design with its own debug line.
+# A POST still in flight when a budget the CALLER named ran out is different:
+# nothing was wrong with the backend, the outcome is genuinely unknown, and the
+# fix belongs to whoever chose the budget. That one gets a line -- off-debug,
+# because off-debug is where the silence lives.
+#
+# Over-firing is the failure mode these tests exist for: the report is bounded
+# to one line per process, so a line spent on an ordinary refusal silences the
+# real one later.
+
+
+def _raising_urlopen(exc):
+    def _urlopen(req, timeout=None):
+        raise exc
+
+    return _urlopen
+
+
+def _export_and_read(monkeypatch, capsys, exc, *, configured=10.0, requested=1.0, debug=False):
+    """Run one failing POST and return whatever reached stderr."""
+    import urllib.request
+
+    from wardex_sdk.assembly._diag import reset_reports_for_test
+
+    reset_reports_for_test()
+    monkeypatch.setattr(urllib.request, "urlopen", _raising_urlopen(exc))
+    t = OtlpHttpTransport(endpoint="http://127.0.0.1:1/v1/traces", timeout=configured, debug=debug)
+    capsys.readouterr()
+    if requested is None:
+        t.export(_envelope_with_span())
+    else:
+        t.export(_envelope_with_span(), timeout=requested)
+    err = capsys.readouterr().err
+    reset_reports_for_test()
+    return err
+
+
+def _cut_short_lines(err: str) -> list[str]:
+    return [ln for ln in err.splitlines() if "cut off after" in ln]
+
+
+def test_a_post_the_callers_budget_cut_short_is_reported_off_debug(monkeypatch, capsys):
+    """The silence this closes: off-debug, a flush(1.0) against a transport
+    configured for 10s produced a POST that was cut mid-flight and stderr that
+    was byte-identical to a successful export. The spans are deliberately not
+    re-queued -- the backend may already hold them -- so the line is the only
+    thing the caller ever gets."""
+    err = _export_and_read(monkeypatch, capsys, TimeoutError("timed out"))
+    lines = _cut_short_lines(err)
+    assert len(lines) == 1, f"a cut-short export said nothing off-debug: {err!r}"
+
+
+def test_the_report_says_delivery_is_unconfirmed_and_never_that_spans_were_lost(
+    monkeypatch, capsys
+):
+    """Wording is the whole content here. The POST was SENT, so the backend may
+    well hold this batch; "lost" would send an operator hunting for data that
+    arrived, and it would be a claim wardex cannot make. What the caller lost is
+    the knowledge, and the fix -- a larger budget -- is theirs."""
+    err = _export_and_read(monkeypatch, capsys, TimeoutError("timed out"))
+    line = _cut_short_lines(err)[0]
+    assert "cannot CONFIRM" in line, line
+    assert "lost" not in line.lower(), f"the report claimed a loss it cannot know about: {line}"
+    assert "1 span(s)" in line, line
+    assert "1.0s budget" in line, line
+    assert "10.0s timeout" in line, line
+
+
+def test_a_connect_phase_timeout_wrapped_by_urllib_is_recognized(monkeypatch, capsys):
+    """urllib reports a timeout during connect as `URLError(reason=TimeoutError)`
+    rather than raising `TimeoutError` itself, so a check that only looked at
+    the exception's own type would miss the commonest shape of this event."""
+    import urllib.error
+
+    err = _export_and_read(monkeypatch, capsys, urllib.error.URLError(TimeoutError("timed out")))
+    assert _cut_short_lines(err), f"a wrapped connect timeout went unreported: {err!r}"
+
+
+def test_an_ordinary_refusal_during_a_short_budget_is_not_reported(monkeypatch, capsys):
+    """The over-firing case that bit before: a connection refused instantly
+    happens to arrive while a short budget is running, but the budget is not why
+    it failed. Reporting it would spend the one line per process on "your
+    backend is down" -- a different event, already fail-silent by design -- and
+    the next genuine cut-short export would then print nothing."""
+    import urllib.error
+
+    for exc in (
+        urllib.error.URLError(ConnectionRefusedError("refused")),
+        ConnectionResetError("reset"),
+        OSError("no route to host"),
+        urllib.error.HTTPError("http://x", 500, "boom", {}, None),
+    ):
+        err = _export_and_read(monkeypatch, capsys, exc)
+        assert not _cut_short_lines(err), f"{exc!r} was reported as a caller cut-off: {err!r}"
+
+
+def test_a_timeout_at_the_transports_own_configured_limit_is_not_reported(monkeypatch, capsys):
+    """The other half of "the caller cut it short": if the deadline that expired
+    is the transport's OWN, the caller's budget is not the story and the backend
+    is. `effective >= configured` covers all three ways that happens -- no
+    budget at all, a budget equal to the configured timeout, and a budget larger
+    than it, which narrows to the configured one."""
+    for requested in (None, 10.0, 99.0):
+        err = _export_and_read(monkeypatch, capsys, TimeoutError("timed out"), requested=requested)
+        assert not _cut_short_lines(err), (
+            f"a timeout at the transport's own limit was blamed on flush({requested}): {err!r}"
+        )
+
+
+def test_the_cut_short_report_is_bounded_to_one_line_per_process(monkeypatch, capsys):
+    """What makes an unconditional print affordable on a per-export path: a host
+    flushing in a loop against a slow backend writes one line, not one per
+    envelope."""
+    import urllib.request
+
+    from wardex_sdk.assembly._diag import reset_reports_for_test
+
+    reset_reports_for_test()
+    monkeypatch.setattr(urllib.request, "urlopen", _raising_urlopen(TimeoutError("timed out")))
+    t = OtlpHttpTransport(endpoint="http://127.0.0.1:1/v1/traces", timeout=10.0)
+    capsys.readouterr()
+    for _ in range(5):
+        t.export(_envelope_with_span(), timeout=1.0)
+    lines = _cut_short_lines(capsys.readouterr().err)
+    assert len(lines) == 1, f"five cut-short exports wrote {len(lines)} lines"
+    reset_reports_for_test()
+
+
+def test_a_delivered_export_under_a_short_budget_reports_nothing(monkeypatch, capsys):
+    """The control: the report is scoped to a FAILED attempt. A short budget the
+    backend answered inside of is an ordinary success."""
+    import urllib.request
+
+    from wardex_sdk.assembly._diag import reset_reports_for_test
+
+    class _Resp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    reset_reports_for_test()
+    monkeypatch.setattr(urllib.request, "urlopen", lambda *a, **k: _Resp())
+    t = OtlpHttpTransport(endpoint="http://127.0.0.1:1/v1/traces", timeout=10.0)
+    capsys.readouterr()
+    t.export(_envelope_with_span(), timeout=1.0)
+    assert capsys.readouterr().err == "", "a successful export reported a delivery it made"
+    reset_reports_for_test()
+
+
+def test_the_missing_wheel_is_named_off_debug_even_with_a_spent_deadline(monkeypatch, capsys):
+    """The off-debug half of the guard order, which is where it matters.
+
+    With the spent-budget skip checked first, a degraded process whose deadline
+    had also run out took the `debug`-gated "deadline exhausted" branch and
+    returned -- so with `debug=False`, the default, stderr stayed empty and a
+    wheel with no working core was indistinguishable from a backend that never
+    got any traffic. The native check has to come first, because it is
+    unconditional and it is the finding worth acting on; the deadline is a
+    detail of a send that could not have happened anyway.
+    """
+    from wardex_sdk.assembly._diag import reset_reports_for_test
+    from wardex_sdk.transport import _otlp_http
+
+    reset_reports_for_test()
+    monkeypatch.setattr(_otlp_http, "NATIVE_OK", False)
+    monkeypatch.setattr(_otlp_http, "unavailable_reason", lambda: "ModuleNotFoundError: nope")
+    t = OtlpHttpTransport(endpoint="http://127.0.0.1:1/v1/traces")  # debug=False, the default
+    capsys.readouterr()
+    t.export(_envelope_with_span(), timeout=0.0)  # both guards would fire
+    err = capsys.readouterr().err
+    assert "native extension unavailable" in err, (
+        f"a degraded process with a spent deadline said nothing at all: {err!r}"
+    )
+    reset_reports_for_test()
