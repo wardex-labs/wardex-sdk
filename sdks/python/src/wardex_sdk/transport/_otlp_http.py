@@ -10,7 +10,7 @@ from __future__ import annotations
 import sys
 import urllib.request
 
-from .. import _wardex_native
+from .._native import NATIVE_OK, native, unavailable_reason
 from .._types import InternalEnvelope
 from ._base import Transport
 
@@ -49,7 +49,23 @@ class OtlpHttpTransport(Transport):
             if self._debug:
                 print("[wardex] OTLP export skipped (deadline exhausted)", file=sys.stderr)
             return
-        data = _wardex_native.codec.encode_otlp_traces(
+        if not NATIVE_OK:
+            # This transport is a published symbol: a host can construct it and
+            # call `export()` by hand without ever reaching `init()`, which is
+            # the only other place the missing extension is announced. Encoding
+            # is impossible and the envelope is lost either way, so say so once
+            # per call rather than dropping spans in silence -- a silent
+            # exporter is indistinguishable from a backend that never got any
+            # traffic, and that is the failure nobody finds. Unconditional
+            # rather than debug-gated because in degraded mode `init()` returns
+            # before the batch worker exists, so nothing here repeats on a timer.
+            print(
+                f"[wardex] OTLP export skipped, native extension unavailable "
+                f"({unavailable_reason()})",
+                file=sys.stderr,
+            )
+            return
+        data = native.codec.encode_otlp_traces(
             envelope, self._pii_mode, list(self._pii_disabled)
         )  # encode=fail-loud
         headers = {"Content-Type": "application/x-protobuf", **self._headers}

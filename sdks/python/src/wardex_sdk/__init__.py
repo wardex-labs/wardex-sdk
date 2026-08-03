@@ -8,7 +8,7 @@ from collections.abc import Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from typing import Any
 
-from . import _hub, _wardex_native  # noqa: F401  (verifies native module loads)
+from . import _hub
 from ._client import Client
 from ._config import WardexConfig
 from ._enums import (
@@ -30,6 +30,7 @@ from ._enums import (
     ToolType,
 )
 from ._limits import CaptureLimits
+from ._native import NATIVE_OK, unavailable_reason
 from ._scope import UserInfo
 from ._tracing import agent, span, task, tool, trace, workflow
 from ._types import (
@@ -126,6 +127,26 @@ def init(
         intercept_hosts=tuple(intercept_hosts) if intercept_hosts else None,
         **config_kwargs,
     )
+    # The config is built FIRST so that a caller's bad keyword still raises the
+    # same TypeError it raises with a working wheel. Degraded mode must not turn
+    # a programming error into a shrug.
+    if not NATIVE_OK:
+        # Without the core there is nothing to capture WITH, and the failure is
+        # one nobody can fix from Python. Returning here is what makes degraded
+        # mode complete rather than half-applied: no client is built, so no
+        # interceptor, adapter, propagation patch, atexit hook or signal handler
+        # is ever installed, and every one of those modules -- each of which
+        # still reaches the extension -- stays unreachable by construction.
+        #
+        # The stderr line is not optional. Silently doing nothing is the other
+        # failure mode and it is the worse one: it looks exactly like a backend
+        # that is up and receiving no traffic, so nobody goes looking.
+        print(
+            f"[wardex] native extension unavailable, wardex is disabled: "
+            f"nothing will be captured or exported ({unavailable_reason()})",
+            file=sys.stderr,
+        )
+        return
     resolved_transport = transport or NoOpTransport()
     resolved_transport.set_pii_policy(
         config.pii_mode.value,
@@ -244,6 +265,15 @@ def flush(timeout: float = 5.0) -> None:
 
 
 def close(timeout: float = 5.0) -> None:
+    if not NATIVE_OK:
+        # `init()` returned before installing anything, so there is nothing to
+        # uninstall and no client to drain. The return has to come before the
+        # imports below rather than after them: `interceptors/` and `adapters/`
+        # still reach the extension at IMPORT time, so a `close()` in a host's
+        # shutdown path -- an atexit hook, a `finally`, a test teardown -- would
+        # raise ImportError out of a teardown that cannot handle it, and the
+        # process would die on the way out instead of on the way in.
+        return
     from .interceptors._registry import get_registry
 
     # Interceptor uninstall flushes (client.capture_span) any pending WS sessions.
