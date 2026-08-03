@@ -43,9 +43,13 @@ All notable changes to this project are documented here. The format follows
   the buffer forever. `ConsoleTransport`, `NoOpTransport` and
   `OtlpHttpTransport` are updated; only the last has bounded I/O to narrow or
   any reason to decline.
-- **`wardex.flush(timeout)` and `wardex.close(timeout)` are wall-clock bounds
-  on the whole drain, not on one step of it.** The drain held its lock across
-  `before_send`, `transport.export` and both `transport.flush` calls, so a
+- **`wardex.flush(timeout)` is a wall-clock bound on the whole drain, not on
+  one step of it — but `wardex.close(timeout)` bounds each of its three
+  shutdown steps separately, so the worst case there is roughly 3x.** Take
+  `close(5.0)` as "no step waits longer than 5 seconds", not as "returns within
+  5 seconds"; the reasoning, and why the steps deliberately do not share one
+  deadline, is at the end of the `close()` entry below. The drain held its lock
+  across `before_send`, `transport.export` and both `transport.flush` calls, so a
   flush arriving while another drain was inside a synchronous POST waited out
   that POST in full before starting its own, and the argument bounded only its
   own half. The signal handler's `flush(2.0)` — the one whose comment says
@@ -66,14 +70,10 @@ All notable changes to this project are documented here. The format follows
   configured timeout: a bare `flush()` means "send what you have, I will wait",
   so it must not cap the POST below a number the host already chose for exactly
   this. An `OtlpHttpTransport(timeout=10.0)` gets its 10 seconds, and a backend
-  that reliably answers in 7 is delivered to. It briefly was not: a 5.0 default
-  narrowed the configured timeout through `min()`, the request timed out at the
-  5s mark, and a POST that was *attempted* is deliberately never re-queued —
-  the backend may already hold it — so the batch was dropped rather than kept
-  for the next drain. An explicit `flush(t)` is still a real wall-clock bound
-  on the whole drain whatever the transport was configured for, and passing
-  `5.0` by hand is taken at its word: naming a number is the whole difference
-  between the two readings. `wardex.close()` keeps the tight 5s default and
+  that reliably answers in 7 is delivered to. An explicit `flush(t)` is still a
+  real wall-clock bound on the whole drain whatever the transport was
+  configured for, and passing `5.0` by hand is taken at its word: naming a
+  number is the whole difference between the two readings. `wardex.close()` keeps the tight 5s default and
   does NOT follow the transport — it runs when the process is going away, which
   is the stall this whole issue started from, and what it cannot ship it
   reports. Exposing `timeout` is how a transport says "wait for me this long",
