@@ -826,21 +826,33 @@ def test_a_hostile_transport_attribute_never_raises_into_close_or_flush():
     which is what deciding in advance whether a send would happen required,
     turned `close(-1.0)` into a RuntimeError in the host's shutdown path.
 
-    Driven through `_transport` reassignment as well as construction, because
-    that is the route the memo in `Client.__init__` says makes this reachable in
-    a live process."""
+    Driven through `_transport` reassignment, because that is the route the memo
+    in `Client.__init__` says makes this reachable in a live process.
+
+    A span is captured before EVERY call: a drain with an empty buffer returns
+    long before it touches the transport, so a version of this test that
+    captured once would exercise the escape only on the first call and pass over
+    a wide-open close()."""
     c = Client(WardexConfig(api_key="k", flush_interval=3600.0), _Recording())
     c._worker.stop()
     c._transport = _HostileExportAttribute()  # swapped at runtime, as hosts do
     c.capture_span(_span("only"))
     c.flush(0.0)  # must not raise
+    c.capture_span(_span("only"))
     c.flush(5.0)  # must not raise
-    c.close(-1.0)  # must not raise — the shape that used to escape
+    c.capture_span(_span("only"))
+    c.close(-1.0)  # must not raise — the spent-budget shape that used to escape
 
-    c2 = Client(WardexConfig(api_key="k", flush_interval=3600.0), _HostileExportAttribute())
-    c2._worker.stop()
-    c2.capture_span(_span("only"))
-    c2.close(5.0)  # must not raise on the ordinary budget, or at construction
+
+def test_a_hostile_transport_attribute_never_raises_out_of_the_constructor():
+    """The same reach, at the other site: `Client.__init__` probes the signature
+    of whatever transport `init()` was handed. An `export` that raises on
+    attribute access took `wardex.init()` down with it, which is the one thing an
+    observability SDK may never do."""
+    c = Client(WardexConfig(api_key="k", flush_interval=3600.0), _HostileExportAttribute())
+    c._worker.stop()
+    c.capture_span(_span("only"))
+    c.close(5.0)  # must not raise on the ordinary budget either
 
 
 def test_hostile_flush_timeout_never_reaches_the_host():
