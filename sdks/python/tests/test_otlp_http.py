@@ -310,8 +310,13 @@ def test_a_degraded_transport_with_a_spent_deadline_still_names_the_missing_whee
 # whole distinction under test.
 
 #: The budget a caller named, in the shape the client builds it: `flush(1.0)`
-#: reaching the transport with a hair under a second actually left.
-NAMED_1S = CallerBudget(0.99, 1.0)
+#: that spent most of its second before the socket opened -- a slow `before_send`
+#: over a large envelope will do it.
+#:
+#: The two numbers are far enough apart to ROUND APART at one decimal, which is
+#: load-bearing: the report has to name the 1.0 the caller would recognize, and
+#: with 0.99 here it read the same whichever number it printed.
+NAMED_1S = CallerBudget(0.6, 1.0)
 
 
 def _raising_urlopen(exc):
