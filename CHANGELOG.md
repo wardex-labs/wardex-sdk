@@ -59,21 +59,42 @@ All notable changes to this project are documented here. The format follows
   the next drain ships them. And the deadline now reaches the transport, which
   is where the next paragraph lives.
 
-  **The two defaults disagree, and this release is the first time that matters.**
-  `wardex.flush()` defaults to `timeout=5.0`; `OtlpHttpTransport` defaults to
-  `timeout=10.0`. Until now the transport's 10s stood alone, and now the
-  smaller of the two wins: a default manual `wardex.flush()` caps the POST at
-  what is left of 5 seconds where before it got 10. A backend that reliably
-  answers in 7 seconds therefore **loses those envelopes** — the request times
-  out at the 5s mark, and a POST that was *attempted* is deliberately never
-  re-queued, since the backend may already hold it, so the batch is dropped
-  rather than kept for the next drain. `wardex.close()` carries the same
-  default and the same effect, and there it is final. Pass an explicit
-  `wardex.flush(10.0)`, or construct `OtlpHttpTransport(timeout=...)` at or
-  below 5, to make the two agree. Unattended export is not affected: the
-  periodic worker passes no deadline at all, so background batches still get
-  the transport's full configured timeout — clamping the one path that ships
-  data with nobody watching would turn slow-but-working exports into lost ones.
+  **`flush()` and `close()` no longer share a default, and the difference is
+  deliberate.** `wardex.flush()` with no argument follows the TRANSPORT's own
+  configured timeout: a bare `flush()` means "send what you have, I will wait",
+  so it must not cap the POST below a number the host already chose for exactly
+  this. An `OtlpHttpTransport(timeout=10.0)` gets its 10 seconds, and a backend
+  that reliably answers in 7 is delivered to. It briefly was not: a 5.0 default
+  narrowed the configured timeout through `min()`, the request timed out at the
+  5s mark, and a POST that was *attempted* is deliberately never re-queued —
+  the backend may already hold it — so the batch was dropped rather than kept
+  for the next drain. An explicit `flush(t)` is still a real wall-clock bound
+  on the whole drain whatever the transport was configured for, and passing
+  `5.0` by hand is taken at its word: naming a number is the whole difference
+  between the two readings. `wardex.close()` keeps the tight 5s default and
+  does NOT follow the transport — it runs when the process is going away, which
+  is the stall this whole issue started from, and what it cannot ship it
+  reports. Exposing `timeout` is how a transport says "wait for me this long",
+  not a requirement of the interface: a transport without the attribute, or
+  with one that raises or is not a usable number, simply gets the 5s default,
+  and that read can never raise into the host. Unattended export is unaffected:
+  the periodic worker passes no deadline at all, so background batches still
+  get the transport's full configured timeout — clamping the one path that
+  ships data with nobody watching would turn slow-but-working exports into lost
+  ones.
+- **An export the caller's own budget cut short now says that delivery could
+  not be CONFIRMED.** `flush(1.0)` against a transport configured for 10s can
+  leave a POST in flight when the budget expires. The spans are not re-sent —
+  the request was already on the wire, so the backend may hold them and a
+  resend would duplicate them — and off-debug that was silence byte-identical
+  to a successful export. `OtlpHttpTransport` now writes one line per process
+  naming the budget, the transport's configured timeout and the span count. It
+  is scoped to exactly that event: an ordinary refusal, a reset, an HTTP error
+  and a timeout at the transport's OWN configured limit keep their existing
+  fail-silent handling, because reporting those would spend the one line on
+  "your backend is down" and silence the real one later. The wording is
+  deliberate — the outcome is unknown, not lost, and the fix (a larger timeout)
+  belongs to whoever chose the budget.
 - **`close(timeout)` now abandons a tail it cannot ship inside its budget, and
   says so on stderr whether or not `debug` is set.** Bounding the drain bounded
   `close()` too, and a declined drain is free everywhere except the last one:
@@ -218,6 +239,27 @@ All notable changes to this project are documented here. The format follows
   decline is an explicit branch rather than an `AttributeError` swallowed by a
   guard, because reporting an absent optional package as an internal failure in
   a counter nobody reads is the same as saying nothing.
+- **A third-party `Transport` whose `close()` raises no longer raises out of
+  `wardex.close()`.** `Transport` is public, so `close` can be a socket
+  teardown that throws, a property, or a `__getattr__` — and it was the last
+  reach into a caller-supplied transport still made outside a handler. Hosts
+  call `wardex.close()` from `atexit` hooks and `finally` blocks, so that turned
+  someone else's teardown bug into a raise out of the host's exit path. It is
+  fail-silent now, with the same debug line `transport.flush()` already had.
+  `KeyboardInterrupt` and `CancelledError` still propagate: a host tearing the
+  process down must not be swallowed by an observability SDK's cleanup.
+- **A drain that comes back to an already-closed client reports its batch
+  instead of re-seeding a buffer nobody will drain again.** A non-final drain
+  hands a declined batch back to the buffer, which is right on a live client
+  and wrong after `close()`: no drain will ever run again, so the spans sat
+  resident, uncounted and unreported, with `_spans` still listing them as
+  pending — the exact state the abandoned-tail report exists to prevent. Two
+  routes reach it and both are closed. `flush()` deliberately does not test
+  `_closed`, so a drain still in flight when `close()` runs — from another
+  thread, or from host code that closes wardex inside `before_send` — arrives
+  there with a batch. The decision is made inside the buffer lock, the same one
+  `close()` empties the buffer under, because a check outside it would sit in
+  the window between `_closed` being set and the buffer being emptied.
 
 ### Added
 - `UNDELIVERED`, exported from `wardex_sdk.transport`. It is the sentinel a
