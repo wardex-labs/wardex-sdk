@@ -101,10 +101,12 @@ class _UnnamedTimeout(float):
 _FOLLOW_TRANSPORT_TIMEOUT = _UnnamedTimeout(_DEFAULT_TIMEOUT, "<the transport's own timeout>")
 
 #: `close()`'s default: no number was named either, and the shutdown path picks
-#: its own 5s rather than following anything. A SEPARATE instance from the one
-#: above, because `flush()` tells the two defaults apart by identity -- and
-#: because "wardex's own shutdown default" is not a budget any caller passed,
-#: which is what keeps a bare `close()` out of the cut-short report.
+#: its own 5s rather than following anything. Its own instance so that each entry
+#: point's identity check answers about its OWN default and so that each `repr`
+#: can say what its default means -- the two are not required to be distinguishable
+#: from each other, only from a number a caller typed. That is what keeps a bare
+#: `close()` out of the cut-short report: wardex's shutdown default is not a
+#: budget anyone passed.
 _SHUTDOWN_TIMEOUT = _UnnamedTimeout(_DEFAULT_TIMEOUT, "<wardex's own shutdown default>")
 
 
