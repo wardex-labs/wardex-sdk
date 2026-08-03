@@ -3,7 +3,7 @@
 import threading
 import time
 
-from wardex_sdk._client import Client
+from wardex_sdk._client import _UNBOUNDED_TRANSPORT_FLUSH_TIMEOUT, Client
 from wardex_sdk._config import WardexConfig
 from wardex_sdk._enums import SpanKind
 from wardex_sdk._limits import CaptureLimits
@@ -314,9 +314,13 @@ def test_flush_deadline_is_not_extended_by_an_in_flight_export():
 class _TimeoutRecording(Transport):
     def __init__(self):
         self.timeouts: list[float | None] = []
+        self.flush_timeouts: list[float] = []
 
     def export(self, envelope: InternalEnvelope, *, timeout: float | None = None) -> None:
         self.timeouts.append(timeout)
+
+    def flush(self, timeout: float = 5.0) -> None:
+        self.flush_timeouts.append(timeout)
 
 
 def test_flush_budget_reaches_the_transport():
@@ -342,6 +346,15 @@ def test_periodic_drain_imposes_no_deadline_on_the_transport():
     c.capture_span(_span())
     assert _wait_for(lambda: bool(t.timeouts))
     assert t.timeouts[0] is None
+    # Transport.flush() has no None to express "no deadline", so the periodic
+    # path hands it the module's stated constant. Pinned because a buffering
+    # third-party transport is the only consumer and would otherwise silently
+    # get whatever number someone edited it to.
+    assert _wait_for(lambda: bool(t.flush_timeouts))
+    # The literal is pinned alongside the constant on purpose: it has to keep
+    # matching `Transport.flush`'s own default, so a buffering transport sees
+    # the same budget whether the client names one or not.
+    assert t.flush_timeouts[0] == _UNBOUNDED_TRANSPORT_FLUSH_TIMEOUT == 5.0
     c.close()
 
 
@@ -389,4 +402,187 @@ def test_transport_swapped_after_construction_is_re_probed(capsys):
     c.flush(2.0)
     assert len(replacement.envelopes) == 1, "the swapped-in transport received nothing"
     assert "envelope dropped" not in capsys.readouterr().err
+    c.close()
+
+
+class _BlockingExport(Transport):
+    """Holds the export slot until `release` is set. The first export blocks;
+    every later one returns at once, so a close() behind it can still finish."""
+
+    def __init__(self, in_export, release):
+        self.names: list[str] = []
+        self.first = True
+        self._in_export = in_export
+        self._release = release
+
+    def export(self, envelope: InternalEnvelope, *, timeout=None) -> None:
+        self.names.extend(s.name for s in envelope.spans)
+        if self.first:
+            self.first = False
+            self._in_export.set()
+            self._release.wait(timeout=10.0)
+
+
+def _client_stuck_in_export(in_export, release, **config):
+    """A client whose transport is blocked inside export() on a thread this test
+    owns, with two more spans buffered behind it. Returns (client, transport,
+    holder-thread)."""
+    t = _BlockingExport(in_export, release)
+    c = Client(WardexConfig(api_key="k", flush_interval=3600.0, **config), t)
+    c._worker.stop()  # the slot holder must be a thread the test controls
+    c.capture_span(_span(name="in-flight"))
+    holder = threading.Thread(target=c.flush, args=(30.0,), daemon=True)
+    holder.start()
+    assert in_export.wait(timeout=5.0), "transport never entered export"
+    c.capture_span(_span(name="tail-1"))
+    c.capture_span(_span(name="tail-2"))
+    return c, t, holder
+
+
+def test_close_ships_the_tail_behind_an_export_it_can_outwait():
+    """close() is an orderly shutdown, not the signal path: the process carries
+    on afterwards (install() closes the previous client on every re-init), so
+    its contract is to ship what is buffered within its own timeout. A POST that
+    finishes inside that budget must not cost the tail."""
+    in_export, release = threading.Event(), threading.Event()
+    c, t, holder = _client_stuck_in_export(in_export, release)
+    releaser = threading.Timer(0.3, release.set)
+    releaser.start()
+    try:
+        c.close(5.0)  # step 2 joins nothing, step 3 waits out the POST
+    finally:
+        release.set()
+        releaser.cancel()
+    holder.join(timeout=5.0)
+    assert not holder.is_alive()
+    assert t.names == ["in-flight", "tail-1", "tail-2"], "close() abandoned a tail it could ship"
+
+
+def test_close_that_cannot_ship_the_tail_reports_it_instead_of_hiding_it(capsys):
+    """A declined drain is free everywhere except here: after close() there is
+    no next drain, so the same decline is data loss. Bounding close() is the
+    point of WAR-40 and stands — losing the tail *silently* is not. The spans
+    must leave the buffer counted and reported, not sit in a closed client still
+    reporting themselves as pending."""
+    in_export, release = threading.Event(), threading.Event()
+    c, t, holder = _client_stuck_in_export(in_export, release, debug=True)
+    capsys.readouterr()  # discard anything logged during setup
+    start = time.monotonic()
+    try:
+        c.close(0.2)  # POST outlasts every step; the tail is genuinely unshippable
+        elapsed = time.monotonic() - start
+    finally:
+        release.set()
+    holder.join(timeout=5.0)
+    assert not holder.is_alive()
+
+    assert elapsed < 5.0, f"close(0.2) waited {elapsed:.2f}s behind an in-flight export"
+    assert t.names == ["in-flight"], "the blocked export somehow received the tail"
+    err = capsys.readouterr().err
+    assert "close abandoned 2 buffered spans" in err, (
+        f"close() dropped the tail without saying so; stderr was: {err!r}"
+    )
+    assert list(c._buffer.spans) == [], "unshippable spans left resident in a closed client"
+
+
+def test_hostile_flush_timeout_never_reaches_the_host():
+    """`flush(timeout)` is public API, so `timeout` is application input. Every
+    value a host can pass must be handled or ignored — never raised back at it.
+    float('nan') used to reach RLock.acquire() as a ValueError and a non-number
+    the deadline arithmetic as a TypeError, both outside every handler."""
+    t = _TimeoutRecording()
+    c = Client(WardexConfig(api_key="k", flush_interval=3600.0), t)
+    c._worker.stop()
+    for hostile in (float("nan"), float("-nan"), "x", None, object(), -1.0, float("inf")):
+        c.capture_span(_span())
+        c.flush(hostile)  # must not raise
+    assert len(t.timeouts) == 7, "a hostile timeout cost the envelope entirely"
+    assert all(v is not None and v == v and v >= 0.0 for v in t.timeouts), t.timeouts
+    c.close()
+
+
+def test_hostile_close_timeout_never_reaches_the_host():
+    """Same contract for close(): it also feeds Thread.join() and a third-party
+    Transport.close(), neither of which tolerates NaN or a str either."""
+    for hostile in (float("nan"), "x", None, object(), -1.0, float("inf")):
+        t = _TimeoutRecording()
+        c = Client(WardexConfig(api_key="k", flush_interval=3600.0), t)
+        c.capture_span(_span())
+        c.close(hostile)  # must not raise
+        assert len(t.timeouts) == 1, f"close({hostile!r}) shipped nothing"
+
+
+def test_exhausted_budget_never_reaches_the_transport_as_a_negative():
+    """`Transport` is public API and a third-party one will pass `timeout`
+    straight to a socket, where a negative is an error rather than "no wait".
+    The remaining budget can legitimately go negative — before_send is called
+    inside the deadline — so both floors have to hold."""
+
+    class _Recorder(Transport):
+        def __init__(self):
+            self.export_timeouts: list[float | None] = []
+            self.flush_timeouts: list[float] = []
+
+        def export(self, envelope: InternalEnvelope, *, timeout: float | None = None) -> None:
+            self.export_timeouts.append(timeout)
+
+        def flush(self, timeout: float = 5.0) -> None:
+            self.flush_timeouts.append(timeout)
+
+    def _slow_before_send(envelope):
+        time.sleep(0.05)  # outlives the 0.01s budget below
+        return envelope
+
+    t = _Recorder()
+    c = Client(WardexConfig(api_key="k", flush_interval=3600.0, before_send=_slow_before_send), t)
+    c._worker.stop()
+    c.capture_span(_span())
+    c.flush(0.01)
+    assert t.export_timeouts == [0.0], f"export got a negative budget: {t.export_timeouts}"
+    assert t.flush_timeouts == [0.0], f"flush got a negative budget: {t.flush_timeouts}"
+    c.close()
+
+
+def test_signal_flush_inside_the_buffer_lock_cannot_deadlock_the_worker():
+    """The one path that inverts the export-lock-then-buffer-lock order: a signal
+    landing inside capture_span's buffer-lock block runs flush() on that same
+    thread, so it reaches for the export lock while holding the buffer lock.
+    With the worker holding the export lock and blocked on the buffer lock, that
+    is a real AB-BA inversion — survivable only because the handler's acquire is
+    timed. An unbounded acquire hangs both threads forever, which is what the
+    lock-order comment in Client.__init__ has to keep saying out loud."""
+
+    class _Idle(Transport):
+        def export(self, envelope, *, timeout=None):
+            pass
+
+    c = Client(WardexConfig(api_key="k", flush_interval=3600.0), _Idle())
+    c._worker.stop()  # this test owns both threads
+    holding, release, finished = threading.Event(), threading.Event(), threading.Event()
+
+    def interrupted_capture():
+        with c._buffer_lock:  # the frame the signal interrupts
+            holding.set()
+            release.wait(timeout=5.0)
+            c.flush(0.3)  # the handler's bounded flush, buffer lock still held
+        finished.set()
+
+    def export_slot_taken():
+        if c._export_lock.acquire(blocking=False):
+            c._export_lock.release()
+            return False
+        return True
+
+    interrupted = threading.Thread(target=interrupted_capture, daemon=True)
+    interrupted.start()
+    assert holding.wait(timeout=5.0)
+
+    worker = threading.Thread(target=c.flush, args=(30.0,), daemon=True)
+    worker.start()  # takes the export lock, then blocks on the buffer lock
+    assert _wait_for(export_slot_taken), "the other thread never took the export slot"
+    release.set()
+
+    assert finished.wait(timeout=5.0), "the inverted lock order deadlocked both threads"
+    worker.join(timeout=5.0)
+    assert not worker.is_alive()
     c.close()

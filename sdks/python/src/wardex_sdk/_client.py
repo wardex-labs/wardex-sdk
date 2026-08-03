@@ -46,6 +46,44 @@ def _span_size(span: InternalSpan) -> int:
 # only ever consumed by third-party transports that buffer.
 _UNBOUNDED_TRANSPORT_FLUSH_TIMEOUT = 5.0
 
+# The default budget for flush() and close(), and the value an unusable argument
+# falls back to. Kept here so the signature default and the fallback cannot drift.
+_DEFAULT_TIMEOUT = 5.0
+
+
+def _sanitize_timeout(timeout: object) -> float:
+    """Coerce whatever the host passed into a number every downstream consumer
+    can accept: `time.monotonic() + budget`, `RLock.acquire(timeout=...)`,
+    `Thread.join(...)`, and a third-party `Transport`.
+
+    `flush()` and `close()` are public API and take this argument straight from
+    application code, so it is not trustworthy -- and an observability SDK may
+    not raise back into that code, not even on nonsense. Two values did:
+    `float("nan")` reached `RLock.acquire(timeout=nan)` as a ValueError, and any
+    non-number reached the deadline arithmetic as a TypeError. Both landed
+    outside every handler in `_drain`.
+
+    Clamping alone does not close this, which is why the previous
+    `min(max(timeout, 0.0), TIMEOUT_MAX)` did not: NaN compares false against
+    everything, so `max(nan, 0.0)` and `min(nan, TIMEOUT_MAX)` are both NaN. NaN
+    has to be tested for by name.
+
+    An unusable value is *ignored* -- it falls back to the default budget --
+    rather than rejected, because rejecting means raising, and refusing a
+    shutdown flush over a bad argument loses more than flushing it on the
+    default does. A negative value is not unusable: it means "do not wait", so
+    it floors at 0.0 instead.
+    """
+    try:
+        value = float(timeout)  # type: ignore[arg-type]
+    except Exception:
+        return _DEFAULT_TIMEOUT
+    if value != value:  # NaN, the one value no comparison can normalize
+        return _DEFAULT_TIMEOUT
+    if value < 0.0:
+        return 0.0
+    return min(value, threading.TIMEOUT_MAX)
+
 
 def _accepts_timeout(fn: Callable[..., object]) -> bool:
     """Whether `fn` can be called with a `timeout=` keyword.
@@ -125,11 +163,27 @@ class Client:
         self._config = config
         self._transport = transport
         self._sdk_info = build_sdk_info()
-        # Lock order is always export lock → buffer lock (one-way; no deadlock).
-        # Nothing ever takes the export lock while holding the buffer lock:
-        # _drain() acquires the export lock strictly before it opens the buffer
-        # lock block, capture_span() calls _worker.wake() outside its block, and
-        # _SpanBuffer takes no lock at all.
+        # Lock order is export lock → buffer lock. Every *ordinary* path obeys
+        # it: _drain() acquires the export lock strictly before it opens the
+        # buffer lock block, capture_span() calls _worker.wake() outside its
+        # block, and _SpanBuffer takes no lock at all.
+        #
+        # One path inverts it, and calling the order one-way is how the old
+        # unbounded acquire survived review: a signal landing inside
+        # capture_span's buffer-lock block runs flush() → _drain() →
+        # _acquire_export_slot() on that same thread, i.e. it reaches for the
+        # export lock while holding the buffer lock. If the worker already holds
+        # the export lock and is blocked on the buffer lock, that is a genuine
+        # AB-BA inversion. It is survivable for exactly one reason: the
+        # handler's acquire is *timed*, so it declines on its own deadline, the
+        # buffer lock is released on the way out, and the worker proceeds.
+        # Before the acquire was bounded the same pair hung both threads
+        # forever.
+        # The consequence to preserve: any caller that can be holding the buffer
+        # lock must pass a finite timeout. Only the periodic worker may pass
+        # None (see _acquire_export_slot), and it is the one caller that never
+        # holds the buffer lock when it takes the export lock.
+        #
         # The buffer lock only ever guards an append or a swap — never I/O,
         # encoding, or callbacks (design §5).
         # Both locks are reentrant: the same-thread signal handler may call
@@ -297,35 +351,47 @@ class Client:
                     self._dropped += 1
             self._snapshots.append(snapshot)
 
-    def flush(self, timeout: float = 5.0) -> None:
-        self._drain(timeout)
+    def flush(self, timeout: float = _DEFAULT_TIMEOUT) -> None:
+        # Public API: `timeout` is application input, so it is sanitized here and
+        # _drain() may then assume a usable number. Note that None does NOT
+        # survive this call -- inside _drain, None means "unbounded", which is
+        # the periodic worker's contract and must not be reachable from a host
+        # that passed the wrong thing.
+        self._drain(_sanitize_timeout(timeout))
 
-    def _acquire_export_slot(self, timeout: float | None) -> bool:
-        """Take the export lock, waiting no longer than `timeout` for it.
+    def _acquire_export_slot(self, budget: float | None) -> bool:
+        """Take the export lock, waiting no longer than `budget` for it.
 
         Returns False when the wait ran out, at which point the caller has taken
         nothing and must simply return: the buffer is untouched, so there is no
         envelope to put back and no window in which spans belong to nobody.
 
-        `timeout=None` waits indefinitely, which is what the periodic worker
-        wants -- blocking a background daemon costs nothing.
+        `budget` is either None or a value already through `_sanitize_timeout`
+        -- finite, non-negative and within `threading.TIMEOUT_MAX`, which is
+        exactly the range a timed acquire accepts. Nothing is re-clamped here,
+        on purpose: a second clamp would make the first one deletable with the
+        suite still green, which is how the raise-into-the-host bug got in.
+
+        `budget=None` waits indefinitely. Only the periodic worker may pass it:
+        blocking a background daemon costs nothing, and (see the lock-order note
+        in __init__) it is the one caller that can never be holding the buffer
+        lock at this point.
         """
-        if timeout is None:
+        if budget is None:
             self._export_lock.acquire()
             return True
-        # A timed acquire rejects negatives (ValueError) and cannot represent
-        # inf (OverflowError: timestamp out of range). Either would raise out of
-        # flush() into the application, which an observability SDK may not do,
-        # so clamp into the range the primitive accepts rather than trusting the
-        # caller's number.
-        budget = min(max(timeout, 0.0), threading.TIMEOUT_MAX)
         # A thread that already owns this RLock -- the signal handler re-entering
         # through before_send or through transport.export -- is granted it
         # immediately even at budget=0, so reentrancy never spuriously declines.
         return self._export_lock.acquire(timeout=budget)
 
-    def _drain(self, timeout: float | None) -> None:
+    def _drain(self, timeout: float | None, *, final: bool = False) -> None:
         """Export everything buffered, within `timeout` seconds end to end.
+
+        `timeout` is None (the periodic worker only) or a value already through
+        `_sanitize_timeout`; it is not re-validated here. `final=True` marks
+        close()'s last drain -- the one after which nothing will ever drain this
+        client again. See `_abandon`.
 
         `timeout` is a wall-clock bound on this whole call, not a per-step one.
         It covers the wait for the export slot, the POST, and the transport
@@ -339,12 +405,16 @@ class Client:
         The export lock is still held across the POST, because serializing
         transport.export() is the guarantee third-party transports were written
         against. What changed is that waiting for it is now bounded: a drain
-        that cannot get the slot in time declines and returns. Nothing is lost
-        by declining -- the swap happens after the acquire, so a declined drain
-        never took the spans -- but on the signal path the process then dies and
-        the tail dies with it. That is the deliberate reading of
+        that cannot get the slot in time declines and returns. On every path but
+        the last one, declining costs nothing: the swap happens after the
+        acquire, so a declined drain never took the spans, and the next drain
+        ships them. The signal path has no next drain either, but the process
+        then dies and the tail dies with it -- that is the deliberate reading of
         _SIGNAL_FLUSH_TIMEOUT's "never delay shutdown": a droppable tail is the
-        price of a bounded one.
+        price of a bounded one. close() is *not* that path -- the process
+        carries on, since install() closes the previous client on every re-init
+        and wardex.close(timeout) is public API -- so its final drain does not
+        get to lose the tail quietly; see `_abandon`.
 
         Only the buffer lock is released early (marked below); the export lock
         is held to the end of the method.
@@ -354,7 +424,9 @@ class Client:
         """
         deadline = None if timeout is None else time.monotonic() + timeout
         if not self._acquire_export_slot(timeout):
-            if self._config.debug:
+            if final:
+                self._abandon()
+            elif self._config.debug:
                 print("[wardex] drain skipped (export in progress)", file=sys.stderr)
             return
         try:
@@ -429,16 +501,48 @@ class Client:
             if self._config.debug:
                 print(f"[wardex] transport flush failed ({exc})", file=sys.stderr)
 
-    def close(self, timeout: float = 5.0) -> None:
+    def _abandon(self) -> None:
+        """Account for a tail close()'s final drain could not ship.
+
+        Everywhere else a declined drain is free, because a later drain picks
+        the spans up. After close() there is no later drain -- `_closed` is set,
+        the worker is stopped, and step 4 closes the transport -- so the
+        identical decline is data loss. Bounding close() was the point of WAR-40
+        and stands; losing the tail *quietly* was not, and does not.
+
+        So the spans come out of the buffer and are counted, rather than sitting
+        in a client that will never ship them while `_spans` still reports them
+        as pending. The count goes to stderr under debug: the same channel and
+        the same gate `_drain` already uses for spans dropped to a full buffer.
+        """
+        with self._buffer_lock:
+            buf, self._buffer = self._buffer, _SpanBuffer()
+            snapshots, self._snapshots = self._snapshots, deque()
+            lost = len(buf.spans) + len(snapshots)
+            self._dropped += lost
+        if lost and self._config.debug:
+            print(
+                f"[wardex] close abandoned {lost} buffered spans (export still in progress)",
+                file=sys.stderr,
+            )
+
+    def close(self, timeout: float = _DEFAULT_TIMEOUT) -> None:
+        # Public API: sanitize before anything downstream is handed a value it
+        # would raise on -- Thread.join() in step 2, the deadline arithmetic and
+        # the timed acquire in step 3, a third-party Transport in step 4.
+        budget = _sanitize_timeout(timeout)
         with self._close_lock:
             if self._closed:
                 return
             self._closed = True  # 1. reject new captures
-        # `timeout` is a per-step budget, not a total for close(). Steps 2-4 can
+        # `budget` is a per-step budget, not a total for close(). Steps 2-4 can
         # each spend it, so the worst case is roughly 3x -- but each step is now
         # bounded, where step 3 previously had no bound at all: it inherited the
         # rest of whatever POST the worker was still inside when step 2's join
-        # gave up on it.
-        self._worker.stop(timeout)  # 2. worker exits without draining
-        self._drain(timeout)  # 3. final drain, owned by the closing thread
-        self._transport.close(timeout)  # 4.
+        # gave up on it. Deliberately not one shared deadline: steps 2 and 3
+        # wait on the same event (the in-flight POST ending), so charging step 3
+        # for what step 2 already spent would leave the final drain nothing and
+        # abandon tails close() can currently still deliver.
+        self._worker.stop(budget)  # 2. worker exits without draining
+        self._drain(budget, final=True)  # 3. final drain, owned by the closer
+        self._transport.close(budget)  # 4.
