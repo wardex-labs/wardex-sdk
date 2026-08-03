@@ -14,6 +14,7 @@ from wardex_sdk._types import (
     SpanId,
     TraceId,
 )
+from wardex_sdk.assembly._diag import reset_reports_for_test
 from wardex_sdk.transport._base import Transport
 
 
@@ -458,14 +459,22 @@ def test_close_ships_the_tail_behind_an_export_it_can_outwait():
     assert t.names == ["in-flight", "tail-1", "tail-2"], "close() abandoned a tail it could ship"
 
 
-def test_close_that_cannot_ship_the_tail_reports_it_instead_of_hiding_it(capsys):
+def test_close_that_cannot_ship_the_tail_reports_it_under_the_DEFAULT_config(capsys):
     """A declined drain is free everywhere except here: after close() there is
     no next drain, so the same decline is data loss. Bounding close() is the
-    point of WAR-40 and stands — losing the tail *silently* is not. The spans
-    must leave the buffer counted and reported, not sit in a closed client still
-    reporting themselves as pending."""
+    point of WAR-40 and stands — losing the tail *silently* is not.
+
+    `debug` is deliberately left at its default (False), because that is where
+    the silence lives. The first repair of this defect printed its abandon line
+    under `config.debug`, which no production process sets, so off-debug the loss
+    stayed exactly as quiet as before — and worse, the spans were no longer in
+    the buffer where an operator could find them. A guard that only exercises
+    debug=True would have passed against that.
+    """
+    reset_reports_for_test()  # `report_once` is process-global
     in_export, release = threading.Event(), threading.Event()
-    c, t, holder = _client_stuck_in_export(in_export, release, debug=True)
+    c, t, holder = _client_stuck_in_export(in_export, release)
+    assert c.config.debug is False, "this guard is only meaningful off-debug"
     capsys.readouterr()  # discard anything logged during setup
     start = time.monotonic()
     try:
@@ -479,10 +488,125 @@ def test_close_that_cannot_ship_the_tail_reports_it_instead_of_hiding_it(capsys)
     assert elapsed < 5.0, f"close(0.2) waited {elapsed:.2f}s behind an in-flight export"
     assert t.names == ["in-flight"], "the blocked export somehow received the tail"
     err = capsys.readouterr().err
-    assert "close abandoned 2 buffered spans" in err, (
+    assert "could not ship 2 buffered span(s)" in err, (
         f"close() dropped the tail without saying so; stderr was: {err!r}"
     )
+    assert "nothing will retry them" in err, (
+        f"the line does not name the consequence; stderr was: {err!r}"
+    )
     assert list(c._buffer.spans) == [], "unshippable spans left resident in a closed client"
+    assert c._dropped == 2, (
+        f"the abandoned tail was reported but not counted: _dropped={c._dropped}"
+    )
+
+
+def test_close_reports_an_abandoned_tail_only_once_per_process(capsys):
+    """The bound that makes an ungated print affordable on a shutdown path:
+    `install()` closes the previous client on every re-init, so a process that
+    re-inits in a loop must not write a line per close."""
+    reset_reports_for_test()
+    lines = []
+    for _ in range(2):
+        in_export, release = threading.Event(), threading.Event()
+        c, _t, holder = _client_stuck_in_export(in_export, release)
+        capsys.readouterr()
+        try:
+            c.close(0.2)
+        finally:
+            release.set()
+        holder.join(timeout=5.0)
+        assert not holder.is_alive()
+        lines.append(capsys.readouterr().err)
+    assert "could not ship 2 buffered span(s)" in lines[0], lines[0]
+    assert lines[1] == "", f"the second close repeated the report: {lines[1]!r}"
+
+
+class _DeadlineHonouring(Transport):
+    """A transport that respects the budget it is handed, as OtlpHttpTransport
+    does: a non-positive `timeout` means there is no time to send, so it does
+    not. The recording transports elsewhere in this file ignore the deadline,
+    which is exactly why they could not see the defect below."""
+
+    def __init__(self):
+        self.timeouts: list[float | None] = []
+        self.shipped: list[str] = []
+
+    def export(self, envelope: InternalEnvelope, *, timeout=None) -> None:
+        self.timeouts.append(timeout)
+        if timeout is not None and timeout <= 0:
+            return
+        self.shipped.extend(s.name for s in envelope.spans)
+
+
+def test_close_with_a_spent_budget_reports_the_tail_it_cannot_send(capsys):
+    """The second exit `_abandon` never saw.
+
+    Here the export slot IS free, so the final drain sails past the acquire and
+    swaps the spans out — but the deadline is already gone, so the transport is
+    handed 0.0 and skips. Same loss as the declined acquire, and it used to be
+    reached from the public API (`close(-1.0)` floors to 0.0) with `_dropped`
+    still 0 and stderr still empty. The transport here HONOURS the budget it is
+    handed, which the recording transports elsewhere in this file do not — that
+    is the only reason they could not see it.
+    """
+    reset_reports_for_test()
+    t = _DeadlineHonouring()
+    c = Client(WardexConfig(api_key="k", flush_interval=3600.0), t)
+    c._worker.stop()
+    c.capture_span(_span("only"))
+    capsys.readouterr()
+    c.close(-1.0)  # public API; floors to a 0.0 budget, so it is spent on arrival
+    err = capsys.readouterr().err
+
+    assert t.timeouts == [0.0], f"the transport was not handed a spent budget: {t.timeouts}"
+    assert t.shipped == [], "a spent budget somehow reached the backend"
+    assert list(c._buffer.spans) == [], "unshippable spans left resident in a closed client"
+    assert c._dropped == 1, f"the lost span was not counted: _dropped={c._dropped}"
+    assert "could not ship 1 buffered span(s)" in err, (
+        f"close(-1.0) lost the span without saying so; stderr was: {err!r}"
+    )
+
+
+def test_close_with_budget_left_still_ships_through_a_deadline_honouring_transport(capsys):
+    """The control for the test above: the spent-budget shortcut must not have
+    turned every close() into an abandonment."""
+    reset_reports_for_test()
+    t = _DeadlineHonouring()
+    c = Client(WardexConfig(api_key="k", flush_interval=3600.0), t)
+    c._worker.stop()
+    c.capture_span(_span("only"))
+    capsys.readouterr()
+    c.close(5.0)
+    assert t.shipped == ["only"], f"an ordinary close() shipped nothing: {t.timeouts}"
+    assert c._dropped == 0
+    assert capsys.readouterr().err == "", "an ordinary close() reported a loss"
+
+
+class _LegacyIgnoringDeadline(Transport):
+    """Pre-`timeout=` signature — the shape `_accepts_timeout` exists for."""
+
+    def __init__(self):
+        self.shipped: list[str] = []
+
+    def export(self, envelope: InternalEnvelope) -> None:
+        self.shipped.extend(s.name for s in envelope.spans)
+
+
+def test_close_with_a_spent_budget_does_not_claim_a_loss_a_legacy_transport_avoids(capsys):
+    """A transport that cannot take `timeout=` is handed the envelope with no
+    bound at all, so a spent deadline does not stop it delivering. Reporting a
+    loss there would be a false alarm, and skipping the export to match the
+    report would *create* the loss the report describes."""
+    reset_reports_for_test()
+    t = _LegacyIgnoringDeadline()
+    c = Client(WardexConfig(api_key="k", flush_interval=3600.0), t)
+    c._worker.stop()
+    c.capture_span(_span("only"))
+    capsys.readouterr()
+    c.close(-1.0)
+    assert t.shipped == ["only"], "a legacy transport was denied an envelope it could ship"
+    assert c._dropped == 0, "a delivered span was counted as lost"
+    assert capsys.readouterr().err == "", "wardex reported a loss that did not happen"
 
 
 def test_hostile_flush_timeout_never_reaches_the_host():

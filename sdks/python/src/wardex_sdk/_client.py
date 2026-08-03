@@ -19,6 +19,7 @@ from ._types import (
 )
 from ._version import __version__
 from ._worker import BatchWorker
+from .assembly import report_once
 from .transport._base import Transport
 
 
@@ -414,7 +415,10 @@ class Client:
         price of a bounded one. close() is *not* that path -- the process
         carries on, since install() closes the previous client on every re-init
         and wardex.close(timeout) is public API -- so its final drain does not
-        get to lose the tail quietly; see `_abandon`.
+        get to lose the tail quietly. `final=True` therefore routes both ways a
+        tail can be lost here into `_report_lost`: the declined acquire
+        (`_abandon`) and the acquire that succeeds with nothing left to spend
+        (`_deadline_is_spent`).
 
         Only the buffer lock is released early (marked below); the export lock
         is held to the end of the method.
@@ -443,6 +447,23 @@ class Client:
             if not spans and not snapshots:
                 self._flush_transport(deadline)
                 return
+            if final and self._deadline_is_spent(deadline):
+                # The other exit `_abandon` cannot cover: the slot was free, so
+                # the spans are already swapped out of the buffer, but there is
+                # no budget left to send them with. The export below still runs
+                # -- this only ACCOUNTS for it. Returning here instead would be
+                # the tempting shape and the wrong one: a transport that takes
+                # `timeout=` and then ignores it would have delivered these
+                # spans, and short-circuiting would manufacture the very loss
+                # the line below announces. Reporting a loss that did not happen
+                # is a false alarm; causing one is data destruction.
+                self._report_lost(
+                    len(spans) + len(snapshots),
+                    why="close()'s timeout was already spent by the time the exporter came "
+                    "free, so the transport was handed a zero send budget -- which wardex's "
+                    "own OTLP transport reads as 'skip the POST'.",
+                    key="client.close.deadline_spent",
+                )
             header = EnvelopeHeader(
                 event_id=str(uuid.uuid4()),
                 api_key=self._config.api_key or "",
@@ -481,13 +502,23 @@ class Client:
         if deadline is None:
             transport.export(envelope)
             return
-        if transport is not self._probed_transport:
-            self._probed_transport = transport
-            self._export_takes_timeout = _accepts_timeout(transport.export)
-        if not self._export_takes_timeout:
+        if not self._takes_timeout(transport):
             transport.export(envelope)
             return
         transport.export(envelope, timeout=max(0.0, deadline - time.monotonic()))
+
+    def _takes_timeout(self, transport: Transport) -> bool:
+        """Whether `transport.export` can be handed a `timeout=`, re-probing
+        when the transport is not the one the memo answers for.
+
+        Two callers now: `_export`, which needs to know how to call it, and
+        `_deadline_is_spent`, which needs to know whether handing it a budget of
+        zero means the envelope is definitely not going anywhere.
+        """
+        if transport is not self._probed_transport:
+            self._probed_transport = transport
+            self._export_takes_timeout = _accepts_timeout(transport.export)
+        return self._export_takes_timeout
 
     def _flush_transport(self, deadline: float | None) -> None:
         remaining = (
@@ -502,7 +533,8 @@ class Client:
                 print(f"[wardex] transport flush failed ({exc})", file=sys.stderr)
 
     def _abandon(self) -> None:
-        """Account for a tail close()'s final drain could not ship.
+        """Take the tail close()'s final drain never got a slot for, and account
+        for it.
 
         Everywhere else a declined drain is free, because a later drain picks
         the spans up. After close() there is no later drain -- `_closed` is set,
@@ -510,21 +542,77 @@ class Client:
         identical decline is data loss. Bounding close() was the point of WAR-40
         and stands; losing the tail *quietly* was not, and does not.
 
-        So the spans come out of the buffer and are counted, rather than sitting
-        in a client that will never ship them while `_spans` still reports them
-        as pending. The count goes to stderr under debug: the same channel and
-        the same gate `_drain` already uses for spans dropped to a full buffer.
+        The spans therefore come out of the buffer and are counted, rather than
+        sitting in a client that will never ship them while `_spans` still
+        reports them as pending.
         """
         with self._buffer_lock:
             buf, self._buffer = self._buffer, _SpanBuffer()
             snapshots, self._snapshots = self._snapshots, deque()
             lost = len(buf.spans) + len(snapshots)
+        self._report_lost(
+            lost,
+            why="an export was already in flight and did not finish inside close()'s "
+            "timeout, so the final drain never ran.",
+            key="client.close.behind_an_export",
+        )
+
+    def _deadline_is_spent(self, deadline: float | None) -> bool:
+        """Whether there is provably no budget left to ship an envelope with.
+
+        The second way close() loses a tail, and the one `_abandon` cannot see:
+        the export slot IS free, so the drain proceeds past the acquire and
+        swaps the spans out of the buffer -- but the budget is already gone.
+        `_export` then hands the transport `0.0`, and the transport wardex ships
+        reads that as "no budget, skip the POST" (`transport/_otlp_http.py`).
+        The spans are then out of the buffer, off the wire, uncounted and
+        unmentioned. `close(-1.0)` reaches this straight from the public API,
+        because a negative budget floors at 0.0.
+
+        Claimed only for a transport that takes `timeout=`. One that does not
+        gets the envelope with no bound at all and delivers it or not on its own
+        schedule, so a spent deadline says nothing about its fate; announcing a
+        loss that did not happen is its own kind of lie.
+        """
+        if deadline is None:
+            return False
+        if deadline - time.monotonic() > 0.0:
+            return False
+        return self._takes_timeout(self._transport)
+
+    def _report_lost(self, lost: int, *, why: str, key: str) -> None:
+        """Count spans close() could not ship, and say so on stderr -- once.
+
+        Deliberately NOT gated on `config.debug`. That gate is what made the
+        first repair of this defect a no-op where it mattered: `debug` defaults
+        to False, so the line naming the loss printed in exactly the
+        configuration nobody runs, and the production shape was *more* deceptive
+        than before the repair -- the spans were no longer resident in the
+        buffer where an operator could at least find them.
+
+        `report_once` is the idiom this codebase already settled on for this
+        event class -- "wardex will not ship what you expected, and here is why"
+        -- and the reason an unconditional print is affordable: one line per site
+        per process, however many times the site trips. A shutdown path that
+        abandons a tail on every re-init still writes one line.
+
+        Reachable only from close(), which is deliberately not on the signal
+        path (see `_close_lock`). That matters because `report_once` guards its
+        dedup set with a plain Lock: a same-thread handler landing inside that
+        block and re-entering would hang. The handler calls flush(), whose drain
+        is not `final` and so never arrives here. Routing close() onto the signal
+        path means auditing that too, not just `_close_lock`.
+        """
+        if not lost:
+            return
+        with self._buffer_lock:
             self._dropped += lost
-        if lost and self._config.debug:
-            print(
-                f"[wardex] close abandoned {lost} buffered spans (export still in progress)",
-                file=sys.stderr,
-            )
+        report_once(
+            f"[wardex] close() could not ship {lost} buffered span(s): {why} "
+            "They are out of the buffer and nothing will retry them. Give "
+            "wardex.close(timeout=...) a larger budget to keep them.",
+            key=key,
+        )
 
     def close(self, timeout: float = _DEFAULT_TIMEOUT) -> None:
         # Public API: sanitize before anything downstream is handed a value it
