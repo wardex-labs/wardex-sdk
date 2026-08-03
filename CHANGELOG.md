@@ -177,6 +177,21 @@ All notable changes to this project are documented here. The format follows
   non-negative float, never a negative remaining budget.
 
 ### Fixed
+- **A signal arriving inside wardex's own one-line-per-process reporter could
+  deadlock the interrupted thread forever.** `report_once` held a plain
+  `threading.Lock` across "have I said this already" and "record that I have",
+  and the `SIGINT`/`SIGTERM` handler this SDK installs runs `flush()` **on the
+  interrupted thread**. A signal delivered inside any of those critical
+  sections — one of them is on the span-capture path — reached a handler that
+  called `report_once` again and blocked on a lock its own thread was already
+  holding. Not a slow shutdown: a permanent stop, in the handler, with the lock
+  still held, so every later report in the process would have hung behind it
+  too. The lock is an `RLock` now, and the "was I first" claim is made by a
+  single `dict.setdefault` rather than by reading membership and then writing —
+  a signal landing between those two steps made both callers print, which is
+  the bound this function exists to provide. This shipped in 0.3.0b1; reaching
+  it needed a signal delivered inside a window of a few instructions, which is
+  why nobody saw it.
 - **A wheel whose native extension will not load no longer stops the host from
   booting.** `wardex_sdk/__init__.py` opened with a bare
   `from . import _wardex_native`, and two more modules on that same import path

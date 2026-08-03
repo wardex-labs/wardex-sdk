@@ -278,9 +278,11 @@ def flush(timeout: float = _FOLLOW_TRANSPORT_TIMEOUT) -> None:
     whatever the transport was configured for. `close()` is the other operation
     and keeps its own tight default; see below.
 
-    The sentinel default is forwarded by identity, so `Client.flush` makes the
-    same distinction this signature does between "no argument" and an explicit
-    number that happens to equal the old default.
+    The sentinel default is forwarded as it stands, and `Client.flush` asks its
+    TYPE rather than comparing it to a known default: any budget wardex picked
+    for itself is an `_UnnamedTimeout`, so the distinction this signature draws
+    between "no argument" and an explicit number that happens to equal the old
+    default survives every layer it passes through.
     """
     client = _hub.get_client()
     if client is not None:
@@ -296,10 +298,13 @@ def close(timeout: float = _SHUTDOWN_TIMEOUT) -> None:
     termination grace period on the way out (WAR-40). Pass a larger budget when
     keeping the tail matters more than exiting promptly.
 
-    The default is a sentinel carrying that same 5.0, forwarded by identity, so
-    `Client.close` can tell "wardex picked 5 seconds" from "the host asked for
-    5 seconds". Only the second is a number anyone chose, and only the second
-    can be blamed for an export it cuts short.
+    The default is a sentinel carrying that same 5.0, and `Client.close` asks
+    its TYPE rather than comparing it to this one object, so it can tell "wardex
+    picked 5 seconds" from "the host asked for 5 seconds". Only the second is a
+    number anyone chose, and only the second can be blamed for an export it cuts
+    short. Asking the type is what closed the door an identity check left open:
+    the signal handler's own 2s budget is not this object either, and used to be
+    blamed on the host.
     """
     if not NATIVE_OK:
         # `init()` returned before installing anything, so there is nothing to
