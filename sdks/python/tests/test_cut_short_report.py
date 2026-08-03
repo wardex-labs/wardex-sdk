@@ -23,12 +23,14 @@ BURNS the key, and the genuine report never prints again.
 
 from __future__ import annotations
 
+import signal
 import socket
 import time
 
 import pytest
 
-from wardex_sdk._client import Client
+from wardex_sdk import _lifecycle
+from wardex_sdk._client import Client, _UnnamedTimeout
 from wardex_sdk._config import WardexConfig
 from wardex_sdk._enums import SpanKind
 from wardex_sdk._types import InternalSpan, SpanContext, SpanId, TraceId
@@ -170,6 +172,103 @@ def test_a_timeout_at_the_transports_own_configured_limit_stays_silent(black_hol
         f"the transport's own limit was blamed on flush(99.0): {err!r}"
     )
     assert elapsed >= SHORT * 0.8, f"the POST never reached the socket ({elapsed:.2f}s)"
+
+
+# -- wardex calling its own flush() is not a caller either --------------------
+
+
+@pytest.fixture
+def signal_handler_only(monkeypatch):
+    """`_lifecycle._handler` with everything but the flush taken out of the way.
+
+    Driven through the handler FUNCTION rather than through `Client.flush`,
+    because the defect is precisely that the client cannot see who called it:
+    the handler passed a bare `2.0` and, from inside `flush`, that is
+    byte-identical to a host writing `flush(2.0)`. A test that called `flush`
+    directly would have to name the number itself and would therefore be testing
+    the other case.
+
+    `_prev_handlers` empty means the handler chains to nothing -- no `os.kill`,
+    no re-raise -- so what runs is the flush and only the flush. `_close_units`
+    is None for the same reason.
+    """
+    monkeypatch.setattr(_lifecycle, "_prev_handlers", {})
+    monkeypatch.setattr(_lifecycle, "_close_units", None)
+
+    def deliver(client: Client) -> None:
+        monkeypatch.setattr(_lifecycle, "_current_client", client)
+        _lifecycle._handler(signal.SIGTERM, None)
+
+    return deliver
+
+
+def test_the_signal_handlers_own_budget_is_not_a_number_any_caller_passed():
+    """Stated directly, because the two tests below run against a real socket
+    and this is the property they depend on: the handler's 2s is wardex's, and
+    it says so in its type rather than leaving `flush` to guess from the value.
+    """
+    assert isinstance(_lifecycle._SIGNAL_FLUSH_TIMEOUT, _UnnamedTimeout), (
+        f"_SIGNAL_FLUSH_TIMEOUT is a plain {type(_lifecycle._SIGNAL_FLUSH_TIMEOUT).__name__}, "
+        f"so a flush from the signal handler is indistinguishable from a host's flush(2.0) "
+        f"and gets the host blamed for it"
+    )
+
+
+def test_a_signal_flush_against_a_dead_backend_does_not_blame_the_host(
+    black_hole, capsys, signal_handler_only
+):
+    """THE DEFECT, through the door the fix did not close first time.
+
+    The handler spends 2 seconds, and 2 is under any transport configured for
+    more -- which is the whole firing condition. So every host that Ctrl-Cs
+    against a slow backend was told that the budget IT passed had cut an export
+    short, and advised to "pass a larger timeout to confirm delivery". No host
+    passed anything: `_SIGNAL_FLUSH_TIMEOUT` is wardex's, and there is no knob
+    for it, so the advice is unactionable as well as false.
+    """
+    client = _client(black_hole, configured=6.0)
+    client.capture_span(_span())
+    capsys.readouterr()
+    elapsed = _timed(lambda: signal_handler_only(client))
+    err = capsys.readouterr().err
+    client.close(0.1)
+
+    assert not _cut_short_lines(err), (
+        f"the signal handler's own 2s budget was reported as the host's: {err!r}"
+    )
+    assert 1.0 <= elapsed <= 5.0, (
+        f"the signal flush did not spend its own 2s bound against the socket ({elapsed:.2f}s)"
+    )
+
+
+def test_a_signal_flush_does_not_burn_the_key_the_real_report_needs(
+    black_hole, capsys, signal_handler_only
+):
+    """The consequence that makes it a MAJOR rather than a wrong sentence.
+
+    One line per key per PROCESS. A host that Ctrl-Cs once and carries on --
+    SIGINT with a `KeyboardInterrupt` handler above us is exactly that -- spent
+    the key on a line about a number it never chose, and the genuine report was
+    silent for the rest of the process. Both halves here, in that order, with no
+    reset in between.
+    """
+    client = _client(black_hole, configured=6.0)
+    try:
+        client.capture_span(_span("first"))
+        capsys.readouterr()
+        signal_handler_only(client)
+        assert not _cut_short_lines(capsys.readouterr().err), "the signal flush reported"
+
+        client.capture_span(_span("second"))
+        client.flush(SHORT)  # named by the host: the report it can act on
+        lines = _cut_short_lines(capsys.readouterr().err)
+        assert len(lines) == 1, (
+            "the signal handler's flush burned the one-line-per-process key and "
+            f"silenced the real report: {lines!r}"
+        )
+        assert f"{SHORT:.1f}s budget" in lines[0], lines[0]
+    finally:
+        client.close(0.1)
 
 
 # -- the caller named a number: the report must fire, and name it ------------

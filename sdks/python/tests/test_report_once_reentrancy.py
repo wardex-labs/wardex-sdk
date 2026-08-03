@@ -15,12 +15,17 @@ sites safe was an argument about the CALLERS ("no site the handler reaches calls
 report_once"), which expired silently the moment a new site was added. So the
 property is pinned on the function instead of on its callers.
 
-Bounded, never blocking: the reentrant call runs on a worker thread and the
-assertion is a timed `Event.wait`, so a regression FAILS the suite in a second
-rather than hanging it. The worker holds a THROWAWAY lock of the same class as
-the module's, not the module's own -- under the regression that worker is stuck
-forever, and a stuck thread holding the real `_REPORT_LOCK` would hang every
-later `report_once` in the process, turning one failure into a dead suite.
+Bounded, never blocking, and that applies to EVERY test here that stages a
+re-entry -- not just the one that names the deadlock. A guard whose regression
+mode is a hang is worse than no guard: it is indistinguishable from a crashed
+runner, it produces no message, and the failure it was written to describe never
+gets described. So every such test runs the interrupted call on a worker thread
+and asserts with a timed `Event.wait`, and every one of them installs a THROWAWAY
+lock of the same class as the module's rather than using the module's own. Both
+halves are needed. The worker turns a permanent same-thread block into a two
+second timeout with a message; the throwaway keeps the thread that is stuck
+forever from holding the real `_REPORT_LOCK`, which would hang every later
+`report_once` in the process and turn one failure into a dead suite.
 """
 
 from __future__ import annotations
@@ -120,10 +125,33 @@ def test_a_signal_delivered_at_the_dedup_write_still_costs_exactly_one_line(monk
     decision has to be one `setdefault` rather than a membership test followed
     by an insert. Both callers below want the same key; exactly one of them may
     speak.
+
+    On a WORKER thread behind a timed wait, and against a throwaway lock, for
+    the reason the module docstring gives -- and this test needs both halves,
+    where the deadlock test above needs only the second. The re-entry it stages
+    is same-thread by construction: whatever lock is installed, a `report_once`
+    inside `setdefault` is the interrupted call's own thread asking for a lock
+    that call already holds. Under the regression this guard exists to catch
+    (`_REPORT_LOCK` back to a plain `Lock`) that is permanent, so run on the main
+    thread it hangs the whole pytest process rather than failing it -- a guard
+    indistinguishable from a crashed runner is worse than no guard. Here the
+    stuck thread is a daemon holding a lock nobody else will ever want, the main
+    thread gives up after two seconds, and CI gets a FAILURE with this message.
     """
+    monkeypatch.setattr(_diag, "_REPORT_LOCK", type(_diag._REPORT_LOCK)())
     monkeypatch.setattr(_diag, "_REPORTED", _InterruptedOnce())
     capsys.readouterr()
-    report_once("[wardex] from the interrupted thread", key="test.signal.window")
+    returned = threading.Event()
+
+    def interrupted_thread() -> None:
+        report_once("[wardex] from the interrupted thread", key="test.signal.window")
+        returned.set()
+
+    threading.Thread(target=interrupted_thread, daemon=True).start()
+    assert returned.wait(2.0), (
+        "report_once never returned from the re-entry staged at the dedup write: "
+        "the handler asked for a lock its own thread already held"
+    )
     lines = [ln for ln in capsys.readouterr().err.splitlines() if "test" not in ln and ln.strip()]
     assert len(lines) == 1, (
         f"a signal delivered while the dedup key was being committed cost "
