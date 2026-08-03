@@ -30,8 +30,10 @@ All notable changes to this project are documented here. The format follows
   (`from wardex_sdk.transport import UNDELIVERED`) to say: this envelope was
   not put on the wire, nothing about it was consumed, and an identical attempt
   later with a fresh budget could succeed. A `flush()` then keeps the spans and
-  re-sends them; a `close()` counts them and reports them. Anything else — most
-  of all `None`, which is what every transport written before this returns —
+  re-sends them; a `close()` counts them and reports them, and so does a
+  `flush()` on a client already closed, where there is no next drain either.
+  Anything else — most of all `None`, which is what every transport written
+  before this returns —
   means "taken", and that default is the safe direction rather than a shrug:
   delivering unconditionally is a legal transport, and a client inferring "not
   delivered" from the outside announces losses that never happened. Do NOT
@@ -82,6 +84,19 @@ All notable changes to this project are documented here. The format follows
   get the transport's full configured timeout — clamping the one path that
   ships data with nobody watching would turn slow-but-working exports into lost
   ones.
+
+  **What to change: if you relied on a bare `wardex.flush()` returning inside 5
+  seconds, pass the number — `wardex.flush(5.0)`.** With no argument it now
+  waits as long as the transport was configured to spend, which under the
+  default `OtlpHttpTransport(timeout=10.0)` is twice as long, and under a
+  transport configured for 60 is a minute. Only the no-argument call moved:
+  every call that already named a number behaves exactly as it did, and
+  `wardex.close()` is untouched. The signature default is a float carrying 5.0
+  whose `repr` is `<the transport's own timeout>`, so `help(wardex.flush)`
+  names the behaviour rather than a number that is no longer the whole truth,
+  a host that reads the default off the function and passes it straight back
+  gets the same reading (it is matched by identity, not by value), and anything
+  that only ever sees a number still sees 5.0.
 - **An export the caller's own budget cut short now says that delivery could
   not be CONFIRMED.** `flush(1.0)` against a transport configured for 10s can
   leave a POST in flight when the budget expires. The spans are not re-sent —
@@ -108,15 +123,18 @@ All notable changes to this project are documented here. The format follows
   that cannot be bounded is the failure this started from — but its final drain
   now empties the buffer, counts what it could not ship, and writes one line:
 
-      [wardex] close() could not ship 2 buffered span(s): <why> They are out of
-      the buffer and nothing will retry them. Give wardex.close(timeout=...) a
+      [wardex] could not ship 2 buffered span(s): <why> They are out of the
+      buffer and nothing will retry them. Give wardex.close(timeout=...) a
       larger budget to keep them.
 
-  `<why>` names which of the two exits was taken: an export was already in
-  flight and did not finish inside the budget, so the final drain never ran; or
-  the transport was handed what was left of the budget and reported back that
-  it did not send. The line is deliberately NOT gated on `config.debug`, which
-  defaults to False — a report that prints only in the configuration nobody
+  `<why>` names which exit was taken: an export was already in flight and did
+  not finish inside the budget, so the final drain never ran; or the transport
+  was handed what was left of the budget and reported back that it did not
+  send. A third reason, with its own closing advice, belongs to a drain that
+  comes back to a client `close()` already emptied — see *Fixed*, which is also
+  why the line no longer opens with the word `close()`. The line is
+  deliberately NOT gated on `config.debug`, which defaults to False — a report
+  that prints only in the configuration nobody
   runs is worse than none at all here, because the spans are no longer resident
   in the buffer where an operator could at least find them. It is bounded to
   one line per site per process, the same idiom used everywhere else wardex
@@ -255,11 +273,17 @@ All notable changes to this project are documented here. The format follows
   resident, uncounted and unreported, with `_spans` still listing them as
   pending — the exact state the abandoned-tail report exists to prevent. Two
   routes reach it and both are closed. `flush()` deliberately does not test
-  `_closed`, so a drain still in flight when `close()` runs — from another
-  thread, or from host code that closes wardex inside `before_send` — arrives
-  there with a batch. The decision is made inside the buffer lock, the same one
-  `close()` empties the buffer under, because a check outside it would sit in
-  the window between `_closed` being set and the buffer being emptied.
+  `_closed`, so a `flush()` after `close()` gets there in a single thread; and
+  a drain still in flight when `close()` runs — from another thread, or from
+  host code that closes wardex inside `before_send` — hands its batch back to
+  the buffer `close()` has just emptied. The decision is made inside the buffer
+  lock, the same one `close()` empties the buffer under, because a check
+  outside it would sit in the window between `_closed` being set and the buffer
+  being emptied. Those
+  spans are counted and reported like any other tail a closed client could not
+  ship, on the same one-line-per-process channel and off `debug`, and the line
+  carries the advice that fits this exit: *Flush before closing, or give
+  wardex.close(timeout=...) a larger budget.*
 
 ### Added
 - `UNDELIVERED`, exported from `wardex_sdk.transport`. It is the sentinel a
@@ -269,6 +293,12 @@ All notable changes to this project are documented here. The format follows
   transport that wants to report a decline must be able to import it by a
   public name, but it is inert — a sentinel with nothing to call and no reach
   into the core — so it does not belong on the surface everyone else reads.
+- `OtlpHttpTransport.timeout`, a read-only property carrying the per-export
+  timeout the transport was constructed with. It is how a bare `wardex.flush()`
+  learns how long the host is willing to wait; it is read defensively and is
+  not part of the `Transport` interface, so a transport that does not expose it
+  simply gets the 5s default. `ConsoleTransport` and `NoOpTransport` do not
+  expose one — neither performs bounded I/O worth waiting on.
 - The counter `interceptors.mcp_stdio.anyio_unavailable`
   (`wardex_sdk.assembly.counters.snapshot()`), bumped once at import time when
   the optional anyio backend cannot be imported.
