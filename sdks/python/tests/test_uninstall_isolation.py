@@ -365,6 +365,104 @@ def test_a_failed_install_is_still_reachable_by_the_teardown_that_undoes_it():
     assert adapter.uninstalls == 1, "the half-installed adapter was never undone"
 
 
+class _InstallBoomInterceptor(InterceptorInterface):
+    """Raises partway through `install()`, having already patched something."""
+
+    def __init__(self) -> None:
+        self.uninstalls = 0
+
+    def name(self) -> str:
+        return "install-boom"
+
+    def install(self, client) -> None:  # noqa: ANN001
+        raise RuntimeError("half-patched, then failed")
+
+    def uninstall(self) -> None:
+        self.uninstalls += 1
+
+
+def test_an_interceptor_that_raises_on_install_does_not_take_init_down_with_it():
+    """The adapter side's asymmetry, one registry over. Interceptors patch the
+    stdlib and third-party internals, so a version bump in a package the user
+    never chose is an ordinary way for `install()` to raise — and it crashed
+    `wardex.init()`.
+    """
+    reg = InterceptorRegistry()
+    counters.reset()
+
+    reg.install(_InstallBoomInterceptor(), client=None)  # must not raise
+
+    assert counters.get("interceptors.install-boom.install") == 1, "the failure left no trace"
+    assert not reg.is_installed("install-boom"), (
+        "a failed install stayed registered, so every later install() skips that seam by name"
+    )
+
+
+def test_a_failed_interceptor_install_is_still_reachable_by_the_teardown_that_undoes_it():
+    """Filed BEFORE called, which is why the rollback can run at all.
+
+    An `install()` that raises halfway has already patched part of a surface,
+    and an interceptor the registry never recorded is one nothing can reach —
+    those wrappers stayed in front of the host's sockets for the life of the
+    process.
+    """
+    reg = InterceptorRegistry()
+    interceptor = _InstallBoomInterceptor()
+
+    reg.install(interceptor, client=None)
+
+    assert interceptor.uninstalls == 1, "the half-installed interceptor was never undone"
+
+
+def test_an_interceptor_failing_to_install_does_not_cost_the_others_theirs():
+    reg = InterceptorRegistry()
+    later = _Counting()
+
+    reg.install(_InstallBoomInterceptor(), client=None)
+    reg.install(later, client=None)
+
+    assert reg.is_installed("counting"), "an interceptor behind a failed install was never reached"
+    reg.uninstall_all()
+    assert later.uninstalls == 1
+
+
+def test_a_broken_interceptor_does_not_take_the_whole_intercept_option_down():
+    """End to end, which is the altitude the failure was reported at: one
+    interceptor whose `install()` raises must not cost `init(intercept=True)`
+    the other two seams, and must not raise into the caller of `init()`.
+    """
+    import wardex_sdk as wardex
+    from wardex_sdk.interceptors import _ssl
+    from wardex_sdk.interceptors._registry import get_registry as interceptor_registry
+
+    class _BrokenSSL(InterceptorInterface):
+        def name(self) -> str:
+            return "ssl"
+
+        def install(self, client) -> None:  # noqa: ANN001
+            raise RuntimeError("ssl seam is broken in this environment")
+
+        def uninstall(self) -> None:
+            pass
+
+    interceptor_registry().uninstall_all()
+    original = _ssl.SSLInterceptor
+    _ssl.SSLInterceptor = _BrokenSSL
+    try:
+        wardex.init(intercept=True)  # must not raise
+
+        assert not interceptor_registry().is_installed("ssl")
+        assert interceptor_registry().is_installed("mcp_stdio"), (
+            "a failed seam stopped the ones queued behind it from installing"
+        )
+        assert interceptor_registry().is_installed("socket")
+    finally:
+        _ssl.SSLInterceptor = original
+        interceptor_registry().uninstall_all()
+        _lifecycle._current_client = None
+        _hub.reset_for_test()
+
+
 def test_a_later_adapter_is_torn_down_before_an_earlier_one():
     """LIFO, for `PatchSet`'s reason. Two adapters that patched one attribute
     leave the later one's wrapper in place; undoing the EARLIER first finds a

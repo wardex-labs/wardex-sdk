@@ -16,11 +16,52 @@ class InterceptorRegistry:
         self._installed: dict[str, InterceptorInterface] = {}
 
     def install(self, interceptor: InterceptorInterface, client: Client | None) -> None:
+        """Install one interceptor. A failure here costs its seam and nothing else.
+
+        The same two defects `AdapterRegistry.install` closed, in the registry
+        next door, and deliberately the same shape: this asymmetry written twice
+        with two different remedies is how the two sides drift apart again.
+
+        GUARDED, which it was not. `uninstall_all` has always been total and
+        `install` was not, so an interceptor raising out of `install()` took
+        `wardex.init()` down with it — a host that added observability got a
+        crash at startup from the one component whose whole promise is never to
+        alter the application. Here that is likelier than on the adapter side
+        and less often anybody's mistake: these seams patch attributes of the
+        stdlib and of third-party internals (`ssl.SSLSocket.recv`,
+        `anyio._backends._asyncio.AsyncIOBackend.open_process`), so a version
+        bump in a package the user never chose is an ordinary way for this to
+        raise.
+
+        FILED BEFORE CALLED, which is the other half. An `install()` that raises
+        halfway has already patched part of a surface, and an interceptor the
+        registry never recorded is one nothing can reach — those wrappers stayed
+        in front of the host's sockets for the life of the process, with no
+        object left able to remove them. Recording first is what lets the
+        rollback below run at all.
+
+        The undo is best-effort and says so rather than pretending: each
+        interceptor owns its own `PatchSet`, so restoring it is that
+        interceptor's `uninstall()`'s job, and one that sets its installed flag
+        last will decline. The entry is dropped either way — a name left in the
+        table is one every later `install()` skips by name, turning one failed
+        install into a seam that is never attempted again.
+        """
         name = interceptor.name()
         if name in self._installed:
             return
-        interceptor.install(client)
         self._installed[name] = interceptor
+
+        ok = False
+        with guard(f"interceptors.{name}.install"):
+            interceptor.install(client)
+            ok = True
+        if ok:
+            return
+
+        with guard(f"interceptors.{name}.install_rollback"):
+            interceptor.uninstall()
+        self._installed.pop(name, None)
 
     def uninstall_all(self) -> None:
         """Uninstall every interceptor. Total: one failure cannot stop the rest.
