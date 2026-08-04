@@ -462,7 +462,7 @@ def test_close_ships_the_tail_behind_an_export_it_can_outwait():
 def test_close_that_cannot_ship_the_tail_reports_it_under_the_DEFAULT_config(capsys):
     """A declined drain is free everywhere except here: after close() there is
     no next drain, so the same decline is data loss. Bounding close() is the
-    point of WAR-40 and stands — losing the tail *silently* is not.
+    point and stands — losing the tail *silently* is not.
 
     `debug` is deliberately left at its default (False), because that is where
     the silence lives. The first repair of this defect printed its abandon line

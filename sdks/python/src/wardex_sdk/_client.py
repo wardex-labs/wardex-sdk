@@ -86,7 +86,7 @@ class _UnnamedTimeout(float):
     operation, nobody is shutting down, and capping the POST at 5s under an
     `OtlpHttpTransport(timeout=10.0)` silently overrode a number the host had
     already chosen for exactly this. So its default follows the transport.
-    `close()` means "the process is going away, be quick" -- WAR-40 exists
+    `close()` means "the process is going away, be quick" -- this bound exists
     because that path was eating a Kubernetes termination grace period -- so it
     stays bounded at `_DEFAULT_TIMEOUT` and does NOT follow anything.
 
@@ -574,7 +574,7 @@ class Client:
         (see `_UnnamedTimeout`): a bare `flush()` is "send what you have, I will
         wait", so it must not cap the POST below the number the host configured
         the transport with. An explicit `flush(t)` is a real wall-clock bound and
-        is honoured as one -- that is WAR-40's win and it is untouched.
+        is honoured as one -- that is the bounded-drain win and it is untouched.
         `close()` is the other operation and keeps the tight 5.0 default; it does
         not follow the transport.
         """
@@ -832,8 +832,8 @@ class Client:
         Everywhere else a declined drain is free, because a later drain picks
         the spans up. After close() there is no later drain -- `_closed` is set,
         the worker is stopped, and step 4 closes the transport -- so the
-        identical decline is data loss. Bounding close() was the point of WAR-40
-        and stands; losing the tail *quietly* was not, and does not.
+        identical decline is data loss. Bounding close() was the point and
+        stands; losing the tail *quietly* was not, and does not.
 
         The spans therefore come out of the buffer and are counted, rather than
         sitting in a client that will never ship them while `_spans` still

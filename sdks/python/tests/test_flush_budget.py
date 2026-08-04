@@ -80,7 +80,7 @@ class _TimeoutRecording(Transport):
 class _SevenSecondBackend:
     """A stand-in for `urlopen` against a backend that answers in seven seconds.
 
-    The scenario WAR-40's default regressed, expressed as a predicate rather
+    The scenario the old 5s default regressed, expressed as a predicate rather
     than as a seven-second sleep: this backend replies iff the socket was given
     at least seven seconds to wait for it, and raises the same `TimeoutError`
     the real one would otherwise. Wall-clock sleeping would pin the property to
@@ -120,7 +120,7 @@ def test_a_bare_flush_delivers_to_a_backend_slower_than_the_old_default(monkeypa
     """The regression, stated as the scenario it broke.
 
     A transport configured for 10s and a backend that answers in 7 shipped
-    before WAR-40 and dropped after it: the 5s default flush budget narrowed the
+    before the drain was bounded and dropped after: the 5s default budget narrowed the
     POST through `min()`, the socket gave up at 5s, and an attempted POST is
     deliberately never re-queued -- so the spans were gone, silently. A bare
     `flush()` means "send what you have, I will wait", so it must not cap the
@@ -142,7 +142,7 @@ def test_a_bare_flush_delivers_to_a_backend_slower_than_the_old_default(monkeypa
 
 
 def test_an_explicit_flush_timeout_is_still_a_real_bound(monkeypatch):
-    """WAR-40's win, and the half of it that must survive: naming a number is
+    """The bounded-drain win, and the half of it that must survive: naming a number is
     naming a wall-clock bound, whatever the transport was configured for. If
     following the transport leaked into the explicit path, the signal handler's
     `flush(2.0)` would go back to waiting out the transport's 10s."""
@@ -178,8 +178,8 @@ def test_an_explicit_flush_of_the_old_default_is_taken_at_its_word(monkeypatch):
 
 def test_close_keeps_its_own_tight_default_and_does_not_follow_the_transport(monkeypatch):
     """close() is the other operation. It runs when the process is going away --
-    WAR-40 exists because an unbounded one ate a Kubernetes termination grace
-    period -- so its default stays 5s even under a transport configured for 10,
+    this bound exists because an unbounded one ate a Kubernetes termination
+    grace period -- so its default stays 5s even under a transport configured for 10,
     and what it cannot ship it reports."""
     backend = _patch_urlopen(monkeypatch)
     c = _client(OtlpHttpTransport(endpoint="http://127.0.0.1:1/v1/traces", timeout=10.0))

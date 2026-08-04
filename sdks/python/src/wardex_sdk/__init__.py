@@ -298,7 +298,7 @@ def close(timeout: float = _SHUTDOWN_TIMEOUT) -> None:
     `timeout` bounds each shutdown step and defaults to 5 seconds. Unlike
     `flush()` this default does NOT follow the transport, deliberately: close()
     runs when the process is going away, and an unbounded one ate the whole
-    termination grace period on the way out (WAR-40). Pass a larger budget when
+    termination grace period on the way out. Pass a larger budget when
     keeping the tail matters more than exiting promptly.
 
     The default is a sentinel carrying that same 5.0, and `Client.close` asks

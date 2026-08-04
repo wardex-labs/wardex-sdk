@@ -1,4 +1,4 @@
-"""Degraded mode: a wheel whose compiled extension will not load — WAR-41.
+"""Degraded mode: a wheel whose compiled extension will not load.
 
 `import wardex_sdk` used to be a bare `from . import _wardex_native`, so an
 extension that could not load raised out of the host's own import statement and
