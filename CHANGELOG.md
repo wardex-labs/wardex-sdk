@@ -5,6 +5,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.3.0b2] - 2026-08-05
+
 ### Changed
 - **`Transport.export` takes a keyword-only `timeout`, and what it returns now
   decides what happens to the batch.** The signature is
