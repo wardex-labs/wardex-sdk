@@ -278,11 +278,14 @@ def flush(timeout: float = _FOLLOW_TRANSPORT_TIMEOUT) -> None:
     whatever the transport was configured for. `close()` is the other operation
     and keeps its own tight default; see below.
 
-    The sentinel default is forwarded as it stands, and `Client.flush` asks its
-    TYPE rather than comparing it to a known default: any budget wardex picked
-    for itself is an `_UnnamedTimeout`, so the distinction this signature draws
-    between "no argument" and an explicit number that happens to equal the old
-    default survives every layer it passes through.
+    The sentinel default is forwarded as it stands, and every layer below asks
+    it what it IS rather than comparing it to a known object: any budget wardex
+    picked for itself is an `_UnnamedTimeout`, and the one that means "follow
+    the transport" says so in a field. So the distinction this signature draws
+    between "no argument" and an explicit number that happens to equal the
+    default survives every layer it passes through -- and survives being
+    copied, deepcopied or pickled on the way, which an identity check could not
+    have.
     """
     client = _hub.get_client()
     if client is not None:
@@ -304,7 +307,8 @@ def close(timeout: float = _SHUTDOWN_TIMEOUT) -> None:
     number anyone chose, and only the second can be blamed for an export it cuts
     short. Asking the type is what closed the door an identity check left open:
     the signal handler's own 2s budget is not this object either, and used to be
-    blamed on the host.
+    blamed on the host. Nothing on this path compares budgets by identity any
+    more, which is what lets the default be copied and still mean what it says.
     """
     if not NATIVE_OK:
         # `init()` returned before installing anything, so there is nothing to

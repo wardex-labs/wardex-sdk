@@ -99,12 +99,11 @@ class OtlpHttpTransport(Transport):
     def timeout(self) -> float:
         """How long one export may take, as this transport was configured.
 
-        Public because the client reads it: a `flush()` with no argument follows
-        the transport's own timeout rather than capping the POST at its own
-        default (see `_client._UnnamedTimeout`). The client's read is
-        guarded and falls back to 5.0, so a transport without this attribute is
-        supported -- exposing it is how a transport says "wait for me this long",
-        not a requirement of the `Transport` interface.
+        Overrides `Transport.timeout`, which declares the contract: a `flush()`
+        with no argument follows the transport's own timeout rather than capping
+        the POST at a default of its own (see `_client._UnnamedTimeout`). A
+        property rather than a plain attribute only because the value lives in
+        `_timeout` and is read-only after construction.
         """
         return self._timeout
 

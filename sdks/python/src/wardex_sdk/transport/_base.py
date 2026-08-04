@@ -4,6 +4,24 @@ import abc
 
 from .._types import InternalEnvelope
 
+DEFAULT_TIMEOUT = 5.0
+"""The one 5.0 in this SDK's timeout story, and the single place to change it.
+
+Every default budget on the export path is this number, and they were four
+separate literals across two modules until one of them needed to move and only
+some of them did. `_client._DEFAULT_TIMEOUT` is this constant, `Transport.flush`
+and `Transport.close` default to it, and `Client`'s bound for the periodic
+`transport.flush()` is it as well -- that last one because the number it wants
+IS `Transport.flush`'s own default, not a coincidence that happens to match.
+
+Deliberately NOT the default for a transport's own configured export timeout:
+`OtlpHttpTransport(timeout=10.0)` chose ten seconds for its own reasons, and
+sharing a constant between "how long one POST may take" and "how long a
+shutdown step may take" would tie two numbers that answer different questions.
+The tie is between the DEFAULTS, which is why `Transport.timeout` names this
+constant as a starting point a subclass is expected to override.
+"""
+
 
 class _Undelivered:
     """The type of `UNDELIVERED`. A singleton, so `is` is the whole test."""
@@ -87,6 +105,25 @@ class CallerBudget(float):
         budget.requested = float(requested)
         return budget
 
+    def __reduce__(self) -> tuple[type[CallerBudget], tuple[float, float]]:
+        """Survive `copy`, `deepcopy` and `pickle` as a `CallerBudget`.
+
+        `float.__reduce_ex__` reconstructs through `cls(value)` -- one argument,
+        because that is all a float needs -- and this subclass requires two, so
+        every one of the three raised `TypeError: __new__() missing 1 required
+        positional argument`. That matters here and not on an ordinary value
+        type: this object is handed to a THIRD-PARTY `Transport.export`, and a
+        transport that stores its arguments for a retry queue, hands them to a
+        `ProcessPoolExecutor`, or merely deepcopies its inputs for a log would
+        have raised out of wardex's own export path.
+
+        Rebuilding by type rather than by identity is the right shape for this
+        class: `CallerBudget` has no singletons, and both facts it carries --
+        the remaining budget and the number the caller actually named -- are in
+        the tuple, so a copy answers `isinstance` and reports the same number.
+        """
+        return (type(self), (float(self), self.requested))
+
     def __repr__(self) -> str:
         return f"CallerBudget({float(self)!r}, requested={self.requested!r})"
 
@@ -97,6 +134,35 @@ class Transport(abc.ABC):
     # init() still masks.
     _pii_mode: str = "mask"
     _pii_disabled: tuple[str, ...] = ()
+
+    timeout: float = DEFAULT_TIMEOUT
+    """How long this transport may spend on ONE export, in seconds.
+
+    Declared here because the client READS it: a `wardex.flush()` with no
+    argument means "send what you have, I will wait", so it takes its budget
+    from this attribute rather than capping the export at a default of its own.
+    An `OtlpHttpTransport(timeout=30.0)` therefore gets its thirty seconds out
+    of a bare `flush()`.
+
+    It was undeclared for a release, and read off the instance with a
+    `try/except`. Nothing crashed -- the read is still guarded, see
+    `_client._configured_transport_timeout` -- but with no declaration there was
+    no contract, and it failed quietly in both directions. A third-party
+    transport that happened to keep a `self.timeout` for its own bookkeeping
+    silently redefined how long a bare `flush()` waited; one that did not have
+    the attribute silently got 5 seconds instead of the thirty it was built for,
+    and nothing anywhere said why. Neither is a crash, which is exactly what
+    made them the kind of defect this SDK keeps finding late.
+
+    Overriding it is expected, and a plain instance attribute
+    (`self.timeout = ...` in `__init__`) or a property both work. The default is
+    `DEFAULT_TIMEOUT` so that a transport with nothing to say behaves as it did
+    before this attribute existed.
+
+    Non-binding on I/O: this is what the transport ADVERTISES, and the client
+    uses it to size its own wait. Actually bounding the socket is the
+    transport's job, in `export`, using the `timeout` it is passed there.
+    """
 
     def set_pii_policy(self, mode: str, disabled: tuple[str, ...]) -> None:
         """Install the PII policy resolved from WardexConfig (called by init)."""
@@ -133,8 +199,8 @@ class Transport(abc.ABC):
         is the safe default and not a shrug.
         """
 
-    def flush(self, timeout: float = 5.0) -> None:
+    def flush(self, timeout: float = DEFAULT_TIMEOUT) -> None:
         return None
 
-    def close(self, timeout: float = 5.0) -> None:
+    def close(self, timeout: float = DEFAULT_TIMEOUT) -> None:
         return None

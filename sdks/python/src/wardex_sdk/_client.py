@@ -19,7 +19,7 @@ from ._types import (
 from ._version import __version__
 from ._worker import BatchWorker
 from .assembly import report_once
-from .transport._base import UNDELIVERED, CallerBudget, Transport
+from .transport._base import DEFAULT_TIMEOUT, UNDELIVERED, CallerBudget, Transport
 
 
 def build_sdk_info() -> SdkInfo:
@@ -44,11 +44,21 @@ def _span_size(span: InternalSpan) -> int:
 # Handed to Transport.flush() on the periodic path, which carries no deadline of
 # its own. Transport.flush() is a no-op for every transport we ship, so this is
 # only ever consumed by third-party transports that buffer.
-_UNBOUNDED_TRANSPORT_FLUSH_TIMEOUT = 5.0
+#
+# `DEFAULT_TIMEOUT` and not a literal that happens to equal it: the number this
+# path wants IS `Transport.flush`'s own default, so passing it explicitly says
+# "the default, deliberately" instead of quietly agreeing with it until one of
+# the two moves.
+_UNBOUNDED_TRANSPORT_FLUSH_TIMEOUT = DEFAULT_TIMEOUT
 
 # The default budget for close(), and the value an unusable argument falls back
-# to. Kept here so the signature default and the fallback cannot drift.
-_DEFAULT_TIMEOUT = 5.0
+# to. An alias, not a second literal: this used to be its own `5.0` next to
+# three more in `transport/_base.py` and `transport/_console.py`, under a
+# comment claiming the signature default and the fallback could not drift --
+# true of the two uses in THIS module and false of the other three, which is
+# the worst kind of comment to leave standing. One definition now, in
+# `transport/_base.py`, where the `Transport` defaults that must match it live.
+_DEFAULT_TIMEOUT = DEFAULT_TIMEOUT
 
 
 class _UnnamedTimeout(float):
@@ -91,33 +101,87 @@ class _UnnamedTimeout(float):
     of a PUBLIC signature, so it leaks into `help()`, into a host that reads the
     default off the function and passes it back, and into any future branch that
     forgets to check for it. As a float carrying `_DEFAULT_TIMEOUT` it simply
-    behaves as the old default everywhere the identity check is not made, so
-    missing the check degrades to yesterday's behaviour instead of a TypeError.
+    behaves as the old default everywhere the type check is not made, so missing
+    the check degrades to yesterday's behaviour instead of a TypeError.
+
+    Being a float is not by itself enough to be safe in a host's hands, which is
+    what `__reduce__` is for: `float`'s own reconstructor calls `cls(value)`,
+    this class needs three arguments, and so a default that got copied,
+    deepcopied or pickled raised `TypeError` out of whatever host code did the
+    copying. See `__reduce__`.
     """
 
-    __slots__ = ("_label",)
+    __slots__ = ("_label", "follows_transport")
 
     _label: str
 
-    def __new__(cls, value: float, label: str) -> _UnnamedTimeout:
+    follows_transport: bool
+    """Whether this budget means "ask the transport how long it wants".
+
+    The second fact these objects carry, and it is a FACT ABOUT THE BUDGET, so
+    it travels with the budget rather than being recovered at the point of use.
+    It was recovered at the point of use -- `Client.flush` asked
+    `timeout is _FOLLOW_TRANSPORT_TIMEOUT` -- and that read the right answer
+    from the wrong question. "Is this object the one `flush`'s signature
+    happens to name" answers about ONE instance; "does this budget follow the
+    transport" answers about the whole class, which is what every other
+    consumer in this area already asks (see `_named_by_caller`).
+
+    Two things fell out of the identity form. A copy of the default -- and
+    these are the defaults of a PUBLIC signature, so a host that deepcopies a
+    config dict holding one has made a copy -- is not the same object, so it
+    quietly stopped following the transport and took 5 seconds instead. And any
+    future wardex-chosen budget that wants to follow the transport would have
+    had to be added to a growing identity check, with no signal at the class
+    that such a check exists; it would simply have got 5 seconds, silently, in
+    the direction that looks like it works.
+    """
+
+    def __new__(cls, value: float, label: str, follows_transport: bool = False) -> _UnnamedTimeout:
         sentinel = super().__new__(cls, value)
         sentinel._label = label
+        sentinel.follows_transport = bool(follows_transport)
         return sentinel
+
+    def __reduce__(self) -> tuple[type[_UnnamedTimeout], tuple[float, str, bool]]:
+        """Survive `copy`, `deepcopy` and `pickle` with both facts intact.
+
+        `float.__reduce_ex__` rebuilds through `cls(value)`, this subclass needs
+        three arguments, and so all three operations raised `TypeError:
+        __new__() missing 1 required positional argument: 'label'`. On an
+        internal value that would be a curiosity; these instances are the
+        DEFAULTS OF `wardex.flush` AND `wardex.close`, so they reach anywhere a
+        host puts them: a settings object that gets deepcopied, a partially
+        applied call, arguments handed to a `ProcessPoolExecutor`, or just
+        `inspect.signature(wardex.flush).parameters["timeout"].default` stored
+        and passed back. Raising `TypeError` out of any of those is wardex
+        raising into host code over a default it chose itself.
+
+        Both facts are in the tuple, which is what makes a copy usable rather
+        than merely constructible: the result is an `_UnnamedTimeout`, so it is
+        still not blamed for a cut-short export, and it still follows the
+        transport if the original did. Rebuilding by type is only safe because
+        nothing asks these objects for identity any more -- see
+        `follows_transport` for the check that used to, and what it cost.
+        """
+        return (type(self), (float(self), self._label, self.follows_transport))
 
     def __repr__(self) -> str:
         return self._label
 
 
 #: `flush()`'s default: no number was named, so follow the transport's own.
-_FOLLOW_TRANSPORT_TIMEOUT = _UnnamedTimeout(_DEFAULT_TIMEOUT, "<the transport's own timeout>")
+_FOLLOW_TRANSPORT_TIMEOUT = _UnnamedTimeout(
+    _DEFAULT_TIMEOUT, "<the transport's own timeout>", follows_transport=True
+)
 
 #: `close()`'s default: no number was named either, and the shutdown path picks
-#: its own 5s rather than following anything. Its own instance so that each entry
-#: point's identity check answers about its OWN default and so that each `repr`
-#: can say what its default means -- the two are not required to be distinguishable
-#: from each other, only from a number a caller typed. That is what keeps a bare
-#: `close()` out of the cut-short report: wardex's shutdown default is not a
-#: budget anyone passed.
+#: its own 5s rather than following anything -- so `follows_transport` is left
+#: False, which is what makes these two differ. Its own instance so that its
+#: `repr` can say what it means; the two are NOT required to be distinguishable
+#: by identity, and nothing distinguishes them that way any more. What keeps a
+#: bare `close()` out of the cut-short report is the type they share: wardex's
+#: shutdown default is not a budget anyone passed.
 _SHUTDOWN_TIMEOUT = _UnnamedTimeout(_DEFAULT_TIMEOUT, "<wardex's own shutdown default>")
 
 
@@ -143,12 +207,14 @@ def _configured_transport_timeout(transport: Transport) -> float:
     """How long `transport` was configured to spend on one export, or
     `_DEFAULT_TIMEOUT` when that cannot be learned.
 
-    Reading an attribute off a caller-supplied `Transport` is a reach into HOST
-    code and is treated as one: `Transport` is public, so `timeout` may be
-    absent, a property that raises, or a `__getattr__` that returns something
-    that is not a number and raises on `float()`. Two defects in this area came
-    from a transport read that sat outside a handler, so the read, the
-    conversion and the validation are all inside this one try.
+    `Transport.timeout` is a declared attribute with a default, so the common
+    case cannot fail -- but the read stays guarded, because a DECLARATION is not
+    a guarantee. `Transport` is public and subclassable: `timeout` may be a
+    property that raises, a `__getattr__` that returns something `float()`
+    rejects, or absent entirely on a duck-typed object that never inherited from
+    `Transport` at all. Two defects in this area came from a transport read that
+    sat outside a handler, so the read, the conversion and the validation are
+    all inside this one try.
 
     Every unusable answer falls back to `_DEFAULT_TIMEOUT` rather than being
     rejected, for the reason `_sanitize_timeout` gives: rejecting means raising,
@@ -516,11 +582,19 @@ class Client:
         # _drain() may then assume a usable number. Note that None does NOT
         # survive this call -- inside _drain, None means "unbounded", which is
         # the periodic worker's contract and must not be reachable from a host
-        # that passed the wrong thing. The sentinel is checked by identity, so a
-        # host that passes the float 5.0 by hand still gets 5.0 and not the
-        # transport's timeout: it named a number, and naming one is the whole
-        # difference between the two readings.
-        if timeout is _FOLLOW_TRANSPORT_TIMEOUT:
+        # that passed the wrong thing.
+        #
+        # The budget is asked what it IS, never whether it is one particular
+        # object: a plain float named by a host is not an `_UnnamedTimeout` no
+        # matter what it equals, so `flush(5.0)` by hand still means five
+        # seconds and not "follow the transport". Naming a number is the whole
+        # difference between the two readings, and it is a difference of type.
+        # This was `timeout is _FOLLOW_TRANSPORT_TIMEOUT`, which got the same
+        # answer for the same input and a worse one for every other: a copy of
+        # the default stopped following the transport, and so would any future
+        # wardex-chosen budget that meant to. See `_UnnamedTimeout.
+        # follows_transport`.
+        if isinstance(timeout, _UnnamedTimeout) and timeout.follows_transport:
             self._drain(_configured_transport_timeout(self._transport))
             return
         # How long to wait and whose number it is are two questions. This branch

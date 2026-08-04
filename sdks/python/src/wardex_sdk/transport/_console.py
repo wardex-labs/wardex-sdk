@@ -4,7 +4,7 @@ import sys
 from typing import TextIO
 
 from .._types import InternalEnvelope
-from ._base import Transport
+from ._base import DEFAULT_TIMEOUT, Transport
 
 
 class ConsoleTransport(Transport):
@@ -16,5 +16,5 @@ class ConsoleTransport(Transport):
         # The parameter exists only to keep signature parity with the base.
         self._stream.write(repr(envelope) + "\n")
 
-    def flush(self, timeout: float = 5.0) -> None:
+    def flush(self, timeout: float = DEFAULT_TIMEOUT) -> None:
         self._stream.flush()
