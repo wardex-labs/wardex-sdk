@@ -347,12 +347,20 @@ All notable changes to this project are documented here. The format follows
   and must not be reported as anyone's fault. `CallerBudget` subclasses `float`,
   so a transport that has never heard of it sees exactly the number it always
   did, and the silent reading is the one a forgotten `isinstance` falls into.
-- `OtlpHttpTransport.timeout`, a read-only property carrying the per-export
-  timeout the transport was constructed with. It is how a bare `wardex.flush()`
-  learns how long the host is willing to wait; it is read defensively and is
-  not part of the `Transport` interface, so a transport that does not expose it
-  simply gets the 5s default. `ConsoleTransport` and `NoOpTransport` do not
-  expose one — neither performs bounded I/O worth waiting on.
+- `Transport.timeout`, a declared attribute on the base class carrying the
+  per-export timeout a transport wants — `timeout: float = 5.0`, overridable
+  as a plain instance attribute or as a property. It is how a bare
+  `wardex.flush()` learns how long the host is willing to wait. Declared rather
+  than merely read: the client reads this attribute, and a third-party
+  transport needs to be able to SEE that, instead of discovering by accident
+  that keeping a `self.timeout` for its own bookkeeping changed how long a bare
+  `flush()` waits, or that not having one cost it the timeout it was built for.
+  Overriding stays optional — a transport that says nothing inherits the 5s
+  default, and one whose `timeout` raises or is not a usable number gets the
+  same 5s, because the read stays defensive and can never raise into the host.
+  `OtlpHttpTransport` overrides it with a read-only property carrying its
+  constructor argument; `ConsoleTransport` and `NoOpTransport` leave the
+  default, neither performing bounded I/O worth waiting on.
 - The counter `interceptors.mcp_stdio.anyio_unavailable`
   (`wardex_sdk.assembly.counters.snapshot()`), bumped once at import time when
   the optional anyio backend cannot be imported.
