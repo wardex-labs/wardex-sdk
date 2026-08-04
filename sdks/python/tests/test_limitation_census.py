@@ -173,7 +173,10 @@ _MEMBER_SITES: dict[str, frozenset[str]] = {
     # --- protocol-specific ---
     "GRPC_WEB_UNSUPPORTED": frozenset({"interceptors/_seam.py"}),
     "GRPC_STATUS_UNAVAILABLE": frozenset({"semantics/_grpc.py"}),
-    "WS_NO_CLOSE": frozenset({"interceptors/_socket.py", "interceptors/_ssl.py"}),
+    # One site, not two: both byte seams flushed their open WS sessions with the
+    # same six lines, and the copy is what let one of them keep a stale
+    # installed-flag gate on the uninstall the other had outgrown.
+    "WS_NO_CLOSE": frozenset({"interceptors/_seam.py"}),
     # --- unit / adapter lifecycle ---
     "CHILD_SPAN_UNCLOSED": frozenset({"adapters/_assembler.py", "assembly/_units.py"}),
     # Two emitters, one per bound that can evict a session: the registry closes
@@ -905,8 +908,10 @@ _UNRESOLVED_PY: frozenset[tuple[str, str]] = frozenset(
         # public `Client.flush(timeout)`. The scanner keys helpers by bare name,
         # so the public one's argument lands here. Narrowing the key would drop
         # `ws_no_close`, which is the marker hardest to find in the first place.
+        # `_client.py` used to appear here for the same reason and no longer
+        # does: its transport.flush() argument is now a local derived from a
+        # deadline, which the scanner resolves.
         ("__init__.py", "Name:timeout"),
-        ("_client.py", "Name:timeout"),
         ("_types.py", "Tuple"),
         # `_build_tool(sess, tool, end_ns, failed, markers, error_type)` declares
         # a marker-ish parameter, so R4 registers it; R9 then makes it read-all
@@ -1587,6 +1592,38 @@ def test_unresolvable_marker_slots_are_exactly_the_recorded_ones(
         f"  gone holes: {sorted(_UNRESOLVED_PY - py_census.unresolved)}\n"
         "A NEW hole is a marker-ish slot whose value the scanner cannot follow. "
         "Nothing else in this file will notice a marker hidden there."
+    )
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        ('def add_limitation(self, *, marker="baked_kwonly"): ...', "baked_kwonly"),
+        ('def note(self, a, b, marker="baked_positional"): ...', "baked_positional"),
+    ],
+    ids=("kwonly", "positional"),
+)
+def test_a_marker_written_into_a_parameter_default_is_censused(source, expected):
+    """Read the defaults directly, on source this test owns.
+
+    `test_unresolvable_marker_slots_are_exactly_the_recorded_ones` does go red
+    when `_collect_defs` stops reading defaults — but only because reading them
+    surfaced one hole, `_emit_tool`'s `markers=()` at `adapters/_assembler.py`.
+    That makes the coverage a side effect of an unrelated production signature:
+    the day someone gives `_emit_tool` a required `markers`, the recorded hole
+    is removed along with it and nothing is left watching defaults at all. A
+    guard that stops biting when unrelated code changes is the thing this file
+    was audited for, so the behaviour gets a test that owns its own input.
+
+    The positional case is the alignment too. `ast.arguments.defaults` covers
+    the LAST N parameters, so pairing it from the left hands `"..."` to `a` and
+    `marker` nothing — the marker is silently dropped, which is worse than not
+    reading defaults at all because the scan still reports itself complete.
+    """
+    census = _PythonCensus({"synthetic.py": ast.parse(source)})
+    assert expected in census.markers, (
+        "a marker string written as a parameter's default reaches a span every "
+        "time the funnel is called bare, and no call-site scan can ever see it"
     )
 
 

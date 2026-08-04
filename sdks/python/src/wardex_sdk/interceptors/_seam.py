@@ -46,6 +46,7 @@ from ..semantics import (
     ws_close_name,
 )
 from ._base import InterceptorInterface
+from ._conn_timing import install_shared_timing, uninstall_shared_timing
 from ._trackers import _Txn, _WebSocketTracker
 
 if TYPE_CHECKING:
@@ -112,6 +113,13 @@ class ByteSeamInterceptor(InterceptorInterface):
         self._conns: dict[int, _ConnectionState] = {}
         self._patches = PatchSet(f"interceptors.{self.name()}")
         self._installed = False
+        # Does THIS seam hold a reference on the shared timing probe? A second
+        # field rather than a reading of `_installed`, because `uninstall()` is
+        # now total: it runs after an `install()` that raised, where the two
+        # answers differ. Releasing a reference this seam never took decrements
+        # the shared refcount to zero underneath the OTHER seam and rips
+        # `socket.connect` back out from under a live installation.
+        self._timing_held = False
         # Defaults match the core's, so behavior is unchanged until _load_limits
         # resolves an actual config at install() time.
         self._limits: dict[str, int] = CaptureLimits().resolved()
@@ -135,6 +143,59 @@ class ByteSeamInterceptor(InterceptorInterface):
         """
         config = getattr(self._client, "config", None)
         return PatchSet(f"interceptors.{self.name()}", debug=bool(getattr(config, "debug", False)))
+
+    # --- Uninstall (shared: both seams undo exactly the same three things) ---
+
+    def uninstall(self) -> None:
+        """Undo whatever this seam installed, however far `install()` got.
+
+        TOTAL, which it was not. It used to open with `if not self._installed:
+        return` while every `install()` sets that flag as its LAST statement, so
+        the two never overlapped where it mattered: an `install()` that raised
+        halfway had already patched part of `ssl.SSLSocket` or `socket.socket`,
+        and the undo the registry then called declined to run. Those wrappers
+        stayed in front of the host's sockets for the life of the process — the
+        flag turned the rollback into a no-op for every interceptor this SDK
+        ships, which is a guard that reads as a fix and is not one.
+
+        The flag cannot answer "was anything patched?", because it is only ever
+        set once everything was. The things that CAN answer it are the pieces
+        themselves, and each is asked separately: `PatchSet.restore_all()` is
+        idempotent and empty until the first `patch()` lands, `_timing_held`
+        records the one acquisition that is refcounted elsewhere and so must not
+        be released twice or unearned, and `_conns` is empty until a byte flows.
+        Every step is a no-op on a seam that never installed, which is what
+        makes this safe to call unconditionally, twice, or on a fresh object.
+
+        The WebSocket flush stays: a live WS session holds a span that only
+        exists once the session ends, and dropping it at uninstall would be the
+        SDK losing data at teardown — the reason `uninstall_all` runs before
+        `client.close()` at all.
+        """
+        self._patches.restore_all()
+        self._release_timing()
+        for st in list(self._conns.values()):
+            if isinstance(st.tracker, _WebSocketTracker):
+                for txn in st.tracker.flush(Limitation.WS_NO_CLOSE):
+                    self._emit_ws(st, txn)
+        self._conns.clear()
+        self._installed = False
+
+    def _acquire_timing(self) -> None:
+        """Take this seam's reference on the shared connection-timing probe.
+
+        The flag is set AFTER the call, so a raising `install_shared_timing`
+        leaves nothing for `_release_timing` to give back.
+        """
+        install_shared_timing(self._limits["max_connections"])
+        self._timing_held = True
+
+    def _release_timing(self) -> None:
+        """Give back the reference this seam took, at most once, and only if taken."""
+        if not self._timing_held:
+            return
+        self._timing_held = False
+        uninstall_shared_timing()
 
     # --- Subclass hooks ---
 

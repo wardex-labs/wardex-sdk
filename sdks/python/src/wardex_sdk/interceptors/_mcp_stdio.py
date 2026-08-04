@@ -15,8 +15,6 @@ import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-import anyio._backends._asyncio as _aio_backend
-
 from .. import _wardex_native
 from .._enums import (
     CaptureMode,
@@ -39,13 +37,33 @@ from ..assembly import (
     SpanDraft,
     TransportLabel,
     capture_mode_of,
+    counters,
     guard,
     latch_ambient,
+    report_once,
     resolve_observed,
     should_capture,
 )
 from ..protocol import JsonRpcParser
 from ._base import InterceptorInterface
+
+# OPTIONAL, and it has to be: anyio is a third-party package, this wheel
+# declares no runtime dependencies, and `_backends._asyncio` is anyio's PRIVATE
+# layout on top of that. As a plain top-level import it made this module
+# unimportable in an environment without anyio, and `wardex.init(intercept=True)`
+# imports this module — so the interceptor whose promise is never to alter the
+# host took the host down at startup over a package the user never installed.
+# `except Exception` and not `except ImportError`: importing a third party runs
+# code wardex does not own, and I6 does not exempt the ways that code can fail.
+# Both halves are probed in a real interpreter — an absent anyio and an anyio
+# whose module body raises — because neither is visible to a monkeypatch.
+# Counted rather than silent (C-S4) — `install()` below turns it into one line
+# on stderr for a person, and the seam that needs it declines.
+try:
+    import anyio._backends._asyncio as _aio_backend
+except Exception:  # noqa: BLE001 — an absent optional backend is not a crash
+    _aio_backend = None  # type: ignore[assignment]
+    counters.bump("interceptors.mcp_stdio.anyio_unavailable")
 
 # Since anyio.open_process internally calls asyncio.create_subprocess_exec,
 # skip the asyncio auxiliary seam during anyio-path spawn to prevent double-wrapping.
@@ -323,25 +341,47 @@ class McpStdioInterceptor(InterceptorInterface):
         self._debug = bool(getattr(config, "debug", False))
         self._patches = PatchSet("interceptors.mcp_stdio", debug=self._debug)
 
-        # `patch()` records `AsyncIOBackend.__dict__["open_process"]` — the raw
-        # classmethod DESCRIPTOR, not the bound callable `getattr` would hand
-        # back — so the restore puts the attribute's binding behaviour back
-        # exactly as it was. `orig_callable` is the bound form, which is what the
-        # wrapper has to call.
-        with guard("interceptors.mcp_stdio.install_anyio", debug=self._debug):
-            orig_callable = _aio_backend.AsyncIOBackend.open_process  # bound classmethod
+        if _aio_backend is None:
+            # No anyio in this process means no anyio subprocess transport, so
+            # this seam has nothing to observe and skipping it loses nothing.
+            # Said out loud once, because "my MCP spans are missing" is
+            # otherwise unfalsifiable from outside wardex — and it names the
+            # part that still works, since the raw-asyncio seam below does not
+            # involve anyio at all and a user who reads "disabled" would stop
+            # looking for the spans it does produce.
+            #
+            # An explicit branch and not "let `guard()` catch the AttributeError
+            # on None": that spelling reports an absent optional package as a
+            # swallowed internal failure, in a counter with no reader, which is
+            # the same as saying nothing.
+            report_once(
+                "[wardex] mcp_stdio interceptor: anyio is not importable, so MCP "
+                "traffic over anyio subprocesses will not be captured; the raw "
+                "asyncio.create_subprocess_exec path is still intercepted",
+                key="interceptors.mcp_stdio.no_anyio",
+            )
+        else:
+            # `patch()` records `AsyncIOBackend.__dict__["open_process"]` — the raw
+            # classmethod DESCRIPTOR, not the bound callable `getattr` would hand
+            # back — so the restore puts the attribute's binding behaviour back
+            # exactly as it was. `orig_callable` is the bound form, which is what the
+            # wrapper has to call.
+            with guard("interceptors.mcp_stdio.install_anyio", debug=self._debug):
+                orig_callable = _aio_backend.AsyncIOBackend.open_process  # bound classmethod
 
-            async def wrapped(command: Any, **kwargs: Any) -> Any:
-                token = _in_anyio_open.set(True)
-                try:
-                    proc = await orig_callable(command, **kwargs)
-                finally:
-                    _in_anyio_open.reset(token)
-                with guard("interceptors.mcp_stdio.wrap_proc", debug=self._debug):
-                    self._wrap_proc(proc)
-                return proc
+                async def wrapped(command: Any, **kwargs: Any) -> Any:
+                    token = _in_anyio_open.set(True)
+                    try:
+                        proc = await orig_callable(command, **kwargs)
+                    finally:
+                        _in_anyio_open.reset(token)
+                    with guard("interceptors.mcp_stdio.wrap_proc", debug=self._debug):
+                        self._wrap_proc(proc)
+                    return proc
 
-            self._patches.patch(_aio_backend.AsyncIOBackend, "open_process", staticmethod(wrapped))
+                self._patches.patch(
+                    _aio_backend.AsyncIOBackend, "open_process", staticmethod(wrapped)
+                )
 
         # auxiliary seam: capture the raw-asyncio (non-anyio) path
         with guard("interceptors.mcp_stdio.install_asyncio", debug=self._debug):
@@ -365,8 +405,15 @@ class McpStdioInterceptor(InterceptorInterface):
         self._installed = True
 
     def uninstall(self) -> None:
-        if not self._installed:
-            return
+        """Undo whatever was patched, however far `install()` got.
+
+        No `if not self._installed` gate, for `ByteSeamInterceptor.uninstall`'s
+        reason: the flag is set as the last statement of `install()`, so on the
+        one path where the undo matters — the registry rolling back an
+        `install()` that raised — it reads False and the gate declined to
+        restore anything. `restore_all()` is idempotent and empty before the
+        first `patch()`, so it answers the same question honestly.
+        """
         self._patches.restore_all()
         self._installed = False
 

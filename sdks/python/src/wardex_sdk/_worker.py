@@ -18,6 +18,8 @@ import sys
 import threading
 from collections.abc import Callable
 
+from .transport._base import DEFAULT_TIMEOUT
+
 
 class BatchWorker:
     def __init__(
@@ -63,8 +65,16 @@ class BatchWorker:
                 print("[wardex] batch worker restarted (fork or thread death)", file=sys.stderr)
             self._spawn_locked()
 
-    def stop(self, timeout: float = 5.0) -> None:
-        """Signal the loop to exit and join. The final drain is the caller's job."""
+    def stop(self, timeout: float = DEFAULT_TIMEOUT) -> None:
+        """Signal the loop to exit and join. The final drain is the caller's job.
+
+        The shared default, not a literal that matched it: this is a shutdown
+        step like the two on `Transport`, and it was the fifth copy of that
+        number -- one this batch missed by counting, and the source scan in
+        `test_timeout_contract` found. `Client.close` always passes its own
+        budget, so the default is reached only by callers that have no deadline
+        of their own.
+        """
         self._stopped = True
         self._wake.set()
         with self._spawn_lock:  # serialize with an in-flight spawn (start/ensure_alive)

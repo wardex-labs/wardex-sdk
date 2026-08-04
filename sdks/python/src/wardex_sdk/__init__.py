@@ -8,8 +8,8 @@ from collections.abc import Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from typing import Any
 
-from . import _hub, _wardex_native  # noqa: F401  (verifies native module loads)
-from ._client import Client
+from . import _hub
+from ._client import _FOLLOW_TRANSPORT_TIMEOUT, _SHUTDOWN_TIMEOUT, Client
 from ._config import WardexConfig
 from ._enums import (
     AdapterName,
@@ -30,6 +30,16 @@ from ._enums import (
     ToolType,
 )
 from ._limits import CaptureLimits
+
+# NOT public, despite being reachable as `wardex_sdk.NATIVE_OK` /
+# `wardex_sdk.unavailable_reason`: imported for use by `init()` and `close()`
+# below, deliberately absent from `__all__`, and no more exported than the
+# assembly helpers imported the same way. Said here rather than left to be
+# guessed, because the pair looks like a supported feature probe and is not one:
+# the degraded mode it describes is ANNOUNCED, once, on stderr by `init()`, and
+# a host does not have to ask. Their home is `wardex_sdk._native`, private, and
+# they are free to change shape there.
+from ._native import NATIVE_OK, unavailable_reason
 from ._scope import UserInfo
 from ._tracing import agent, span, task, tool, trace, workflow
 from ._types import (
@@ -126,6 +136,26 @@ def init(
         intercept_hosts=tuple(intercept_hosts) if intercept_hosts else None,
         **config_kwargs,
     )
+    # The config is built FIRST so that a caller's bad keyword still raises the
+    # same TypeError it raises with a working wheel. Degraded mode must not turn
+    # a programming error into a shrug.
+    if not NATIVE_OK:
+        # Without the core there is nothing to capture WITH, and the failure is
+        # one nobody can fix from Python. Returning here is what makes degraded
+        # mode complete rather than half-applied: no client is built, so no
+        # interceptor, adapter, propagation patch, atexit hook or signal handler
+        # is ever installed, and every one of those modules -- each of which
+        # still reaches the extension -- stays unreachable by construction.
+        #
+        # The stderr line is not optional. Silently doing nothing is the other
+        # failure mode and it is the worse one: it looks exactly like a backend
+        # that is up and receiving no traffic, so nobody goes looking.
+        print(
+            f"[wardex] native extension unavailable, wardex is disabled: "
+            f"nothing will be captured or exported ({unavailable_reason()})",
+            file=sys.stderr,
+        )
+        return
     resolved_transport = transport or NoOpTransport()
     resolved_transport.set_pii_policy(
         config.pii_mode.value,
@@ -142,6 +172,13 @@ def init(
     _lifecycle.install(client, config)
     _hub.set_client(client)
     if config.intercept:
+        # No guard around these three calls, deliberately. `InterceptorRegistry.
+        # install` is total — it isolates the failure, rolls the half-install
+        # back and keeps going — so a second one here would catch nothing and
+        # would put the recovery in two places, which is how the two stop
+        # agreeing. What the registry cannot cover is the IMPORT above each
+        # call, so each interceptor module is responsible for staying importable
+        # without its optional third-party seam (see `_mcp_stdio` on anyio).
         from .interceptors._registry import get_registry
         from .interceptors._ssl import SSLInterceptor
 
@@ -230,13 +267,58 @@ def capture_state_snapshot(
         client.capture_snapshot(snapshot)
 
 
-def flush(timeout: float = 5.0) -> None:
+def flush(timeout: float = _FOLLOW_TRANSPORT_TIMEOUT) -> None:
+    """Send everything buffered and wait for it.
+
+    With no argument the budget is the transport's own configured timeout -- a
+    bare `flush()` is "send what you have, I will wait", so it does not cap the
+    POST below what the transport was configured for (an
+    `OtlpHttpTransport(timeout=10.0)` gets its 10 seconds). Pass a number for a
+    real wall-clock bound: `flush(2.0)` returns within about two seconds
+    whatever the transport was configured for. `close()` is the other operation
+    and keeps its own tight default; see below.
+
+    The sentinel default is forwarded as it stands, and every layer below asks
+    it what it IS rather than comparing it to a known object: any budget wardex
+    picked for itself is an `_UnnamedTimeout`, and the one that means "follow
+    the transport" says so in a field. So the distinction this signature draws
+    between "no argument" and an explicit number that happens to equal the
+    default survives every layer it passes through -- and survives being
+    copied, deepcopied or pickled on the way, which an identity check could not
+    have.
+    """
     client = _hub.get_client()
     if client is not None:
         client.flush(timeout)
 
 
-def close(timeout: float = 5.0) -> None:
+def close(timeout: float = _SHUTDOWN_TIMEOUT) -> None:
+    """Uninstall everything, drain what is buffered, and close the transport.
+
+    `timeout` bounds each shutdown step and defaults to 5 seconds. Unlike
+    `flush()` this default does NOT follow the transport, deliberately: close()
+    runs when the process is going away, and an unbounded one ate the whole
+    termination grace period on the way out (WAR-40). Pass a larger budget when
+    keeping the tail matters more than exiting promptly.
+
+    The default is a sentinel carrying that same 5.0, and `Client.close` asks
+    its TYPE rather than comparing it to this one object, so it can tell "wardex
+    picked 5 seconds" from "the host asked for 5 seconds". Only the second is a
+    number anyone chose, and only the second can be blamed for an export it cuts
+    short. Asking the type is what closed the door an identity check left open:
+    the signal handler's own 2s budget is not this object either, and used to be
+    blamed on the host. Nothing on this path compares budgets by identity any
+    more, which is what lets the default be copied and still mean what it says.
+    """
+    if not NATIVE_OK:
+        # `init()` returned before installing anything, so there is nothing to
+        # uninstall and no client to drain. The return has to come before the
+        # imports below rather than after them: `interceptors/` and `adapters/`
+        # still reach the extension at IMPORT time, so a `close()` in a host's
+        # shutdown path -- an atexit hook, a `finally`, a test teardown -- would
+        # raise ImportError out of a teardown that cannot handle it, and the
+        # process would die on the way out instead of on the way in.
+        return
     from .interceptors._registry import get_registry
 
     # Interceptor uninstall flushes (client.capture_span) any pending WS sessions.

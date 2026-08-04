@@ -11,7 +11,24 @@ from __future__ import annotations
 from dataclasses import dataclass, fields
 from typing import Any
 
-from . import _wardex_native
+from ._native import NATIVE_OK, native, unavailable_reason
+
+
+def _no_core() -> RuntimeError:
+    """The error both accessors raise when the extension could not be imported.
+
+    They cannot answer with a value. The core owns the limit table -- that is
+    the whole point of this module's docstring -- so a Python-side fallback
+    table would be a second declaration site and would drift, which is exactly
+    what `test_limits.py` and `assembly/_units.py` forbid. Raising something
+    that names the wheel is the only honest answer, and it is strictly better
+    than what this module did before degraded mode existed, which was to make
+    `import wardex_sdk` itself raise.
+    """
+    return RuntimeError(
+        f"wardex native extension unavailable, so resource limits cannot be "
+        f"resolved ({unavailable_reason()})"
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,12 +62,16 @@ class CaptureLimits:
 
     def to_native(self) -> Any:
         """Build the native Limits object, applying only the overrides set here."""
+        if not NATIVE_OK:
+            raise _no_core()
         kwargs = {f.name: getattr(self, f.name) for f in fields(self)}
-        return _wardex_native.Limits(**{k: v for k, v in kwargs.items() if v is not None})
+        return native.Limits(**{k: v for k, v in kwargs.items() if v is not None})
 
     def resolved(self) -> dict[str, int]:
         """Effective values (overrides merged onto core defaults) for host-side use."""
-        out = dict(_wardex_native.limits_defaults())
+        if not NATIVE_OK:
+            raise _no_core()
+        out = dict(native.limits_defaults())
         for f in fields(self):
             v = getattr(self, f.name)
             if v is not None:
