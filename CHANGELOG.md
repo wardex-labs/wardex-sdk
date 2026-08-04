@@ -76,10 +76,17 @@ All notable changes to this project are documented here. The format follows
   number is the whole difference between the two readings. `wardex.close()` keeps the tight 5s default and
   does NOT follow the transport — it runs when the process is going away, which
   is the stall this whole issue started from, and what it cannot ship it
-  reports. Exposing `timeout` is how a transport says "wait for me this long",
-  not a requirement of the interface: a transport without the attribute, or
-  with one that raises or is not a usable number, simply gets the 5s default,
-  and that read can never raise into the host. Unattended export is unaffected:
+  reports. **`Transport.timeout` is a declared attribute on the base class** —
+  `timeout: float = 5.0`, overridable as a plain attribute or as a property —
+  which is how a transport says "wait for me this long". Declared rather than
+  merely read, so a third-party transport can SEE that the client reads it
+  instead of discovering by accident that keeping a `self.timeout` for its own
+  bookkeeping changed how long a bare `flush()` waits, or that not having one
+  cost it the timeout it was built for. Overriding it stays optional: a
+  transport that says nothing inherits the 5s default, and one whose `timeout`
+  raises or is not a usable number gets the same 5s, because a declaration is
+  not a guarantee when the base class is public and subclassable and that read
+  can never raise into the host. Unattended export is unaffected:
   the periodic worker passes no deadline at all, so background batches still
   get the transport's full configured timeout — clamping the one path that
   ships data with nobody watching would turn slow-but-working exports into lost
@@ -95,8 +102,13 @@ All notable changes to this project are documented here. The format follows
   whose `repr` is `<the transport's own timeout>`, so `help(wardex.flush)`
   names the behaviour rather than a number that is no longer the whole truth,
   a host that reads the default off the function and passes it straight back
-  gets the same reading (it is matched by identity, not by value), and anything
-  that only ever sees a number still sees 5.0.
+  gets the same reading, and anything that only ever sees a number still sees
+  5.0. That reading is matched by TYPE, not by value and not by object
+  identity, so it also survives the default being copied, deepcopied or
+  pickled on the way — a settings object that carries it through a `deepcopy`
+  hands back something that still means "follow the transport", and both public
+  defaults survive those three operations rather than raising `TypeError` out
+  of whatever host code performed them.
 - **An export the caller's own budget cut short now says that delivery could
   not be CONFIRMED.** `flush(1.0)` against a transport configured for 10s can
   leave a POST in flight when the budget expires. The spans are not re-sent —

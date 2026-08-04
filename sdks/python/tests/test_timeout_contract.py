@@ -28,12 +28,15 @@ budget would satisfy section 1 and still be the bug.
 
 from __future__ import annotations
 
+import ast
 import copy
 import inspect
+import pathlib
 import pickle
 
 import pytest
 
+import wardex_sdk
 from wardex_sdk._client import (
     _DEFAULT_TIMEOUT,
     _FOLLOW_TRANSPORT_TIMEOUT,
@@ -53,7 +56,6 @@ from wardex_sdk._types import (
     TraceId,
 )
 from wardex_sdk.transport._base import DEFAULT_TIMEOUT, CallerBudget, Transport
-from wardex_sdk.transport._console import ConsoleTransport
 from wardex_sdk.transport._otlp_http import OtlpHttpTransport
 
 ROUND_TRIPS = [
@@ -317,21 +319,139 @@ def test_a_declaration_is_not_a_guarantee():
 
 
 def test_every_default_budget_is_the_same_object():
-    """Identity, not equality, and that is the whole point of the test.
+    """Identity, not equality, for the defaults that live in another module.
 
-    A re-introduced literal `5.0` in another module is a different object even
-    though it compares equal, so `is` catches the drift that `==` would sit
-    through. (If a future CPython interned float constants across modules this
-    would weaken to `==` -- it would stop catching a new literal, never start
-    failing on a correct one.)
+    A literal `5.0` written in `_client.py` is a different object from
+    `_base.DEFAULT_TIMEOUT` even though it compares equal, so `is` catches a
+    drift that `==` would sit through.
+
+    Deliberately NOT the whole of section 5, because `is` is blind exactly
+    where the drift is easiest: a literal re-introduced INSIDE `_base.py` --
+    which is where three of the original four lived -- shares that module's
+    constant pool with `DEFAULT_TIMEOUT` and is therefore the same object.
+    This assertion passed with `Transport.flush(timeout=5.0)` restored. The
+    next test is the one that fails on it, and this note is here so nobody
+    reads the `is` as the guard it is not.
     """
     assert _DEFAULT_TIMEOUT is DEFAULT_TIMEOUT
     assert _UNBOUNDED_TRANSPORT_FLUSH_TIMEOUT is DEFAULT_TIMEOUT
-    assert Transport.timeout is DEFAULT_TIMEOUT
 
-    for func in (Transport.flush, Transport.close, ConsoleTransport.flush):
-        default = inspect.signature(func).parameters["timeout"].default
-        assert default is DEFAULT_TIMEOUT, f"{func.__qualname__} grew its own literal"
+
+def _is_the_shared_number(node: ast.expr) -> bool:
+    """Is this expression the shared default written out as a number?"""
+    return (
+        isinstance(node, ast.Constant)
+        and isinstance(node.value, (int, float))
+        and not isinstance(node.value, bool)
+        and node.value == DEFAULT_TIMEOUT
+    )
+
+
+def _defaulted_parameters(func: ast.FunctionDef | ast.AsyncFunctionDef):
+    """Every (parameter, default) pair on `func`, keyword-only ones included."""
+    positional = func.args.posonlyargs + func.args.args
+    defaults = func.args.defaults
+    pairs = list(zip(positional[len(positional) - len(defaults) :], defaults, strict=True))
+    pairs += [
+        (arg, default)
+        for arg, default in zip(func.args.kwonlyargs, func.args.kw_defaults, strict=True)
+        if default is not None
+    ]
+    return pairs
+
+
+def _literal_default_budgets(tree: ast.AST, where: str) -> list[str]:
+    """Every place in `tree` that writes the shared default as a number instead
+    of naming `DEFAULT_TIMEOUT`.
+
+    Structural, over source, because that is the only form of this check that
+    can fail -- the `is` comparison above cannot see a literal reintroduced in
+    the module that defines the constant, which is where three of the original
+    four lived.
+
+    The rule is narrow on purpose: a numeric literal equal to `DEFAULT_TIMEOUT`,
+    used either as the default of a parameter called `timeout` or as a
+    module-level constant. `OtlpHttpTransport(timeout=10.0)` is untouched by it
+    -- ten seconds is that transport's own configured export budget, a
+    different question with a deliberately different answer, and tying the two
+    would be the opposite mistake.
+
+    One function, called by both the scan over the real tree and the test that
+    watches the scan fail. Not two copies of the predicate: a self-test written
+    against its own copy passes while the real one is broken, which is the
+    failure mode this whole batch keeps finding.
+    """
+    found: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            found += [
+                f"{where}:{default.lineno} {node.name}(timeout={default.value})"  # type: ignore[attr-defined]
+                for arg, default in _defaulted_parameters(node)
+                if arg.arg == "timeout" and _is_the_shared_number(default)
+            ]
+        elif isinstance(node, ast.Assign) and _is_the_shared_number(node.value):
+            names = [t.id for t in node.targets if isinstance(t, ast.Name)]
+            # The one definition, in the one module. Everything else must name it.
+            if not (names == ["DEFAULT_TIMEOUT"] and where.endswith("transport/_base.py")):
+                found.append(f"{where}:{node.value.lineno} {' = '.join(names)} = 5.0")
+    return found
+
+
+def test_the_shared_default_is_written_down_once():
+    """The guard that actually fails when a literal comes back.
+
+    Four of these existed across `_client.py`, `transport/_base.py` (twice) and
+    `transport/_console.py`, under a comment in `_client.py` asserting that the
+    signature default and the fallback could not drift -- true of that module's
+    own two uses and false of the other three, which is the worst kind of
+    comment to leave standing.
+    """
+    package = pathlib.Path(inspect.getfile(wardex_sdk)).parent
+    literals: list[str] = []
+    for path in sorted(package.rglob("*.py")):
+        where = path.relative_to(package.parent).as_posix()
+        literals += _literal_default_budgets(ast.parse(path.read_text(encoding="utf-8")), where)
+
+    assert literals == [], (
+        "default budgets written as a literal instead of naming DEFAULT_TIMEOUT: "
+        + ", ".join(literals)
+    )
+
+
+def test_the_scan_can_see_a_reintroduced_literal():
+    """The scan, watched failing, on source handed to it rather than on the tree.
+
+    A source-scanning guard is worth exactly what its predicate is worth, and
+    the first version of section 5 looked right and caught nothing. So the same
+    function the test above calls is run here over the shapes it must reject
+    and the shapes it must not.
+    """
+    source = (
+        "def flush(self, timeout: float = 5.0): ...\n"  # the reintroduced literal
+        "def export(self, *, timeout: float = 5.0): ...\n"  # keyword-only counts too
+        "SOMETHING = 5.0\n"  # a second constant is drift as well
+        "def configured(self, timeout: float = 10.0): ...\n"  # a transport's own budget
+        "GRACE = 2.0\n"  # some other number entirely
+        "def wait(self, seconds: float = 5.0): ...\n"  # 5.0, but not a timeout default
+    )
+
+    found = _literal_default_budgets(ast.parse(source), "fake.py")
+
+    assert [entry.split(" ", 1)[1] for entry in found] == [
+        "flush(timeout=5.0)",
+        "export(timeout=5.0)",
+        "SOMETHING = 5.0",
+    ]
+
+
+def test_the_scan_allows_the_one_definition():
+    """...and only in the module that owns it, so the constant cannot be
+    re-declared somewhere else and quietly become a second source.
+    """
+    source = "DEFAULT_TIMEOUT = 5.0\n"
+
+    assert _literal_default_budgets(ast.parse(source), "wardex_sdk/transport/_base.py") == []
+    assert _literal_default_budgets(ast.parse(source), "wardex_sdk/_client.py") != []
 
 
 def test_the_sentinels_carry_the_shared_default():
