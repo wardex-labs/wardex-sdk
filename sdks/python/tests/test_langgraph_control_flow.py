@@ -17,8 +17,10 @@ from __future__ import annotations
 
 import asyncio
 import gc
+import sys
 from typing import Annotated, TypedDict
 
+import pytest
 from langchain_core.messages import AIMessage
 from langchain_core.tools import tool
 from langgraph.checkpoint.memory import InMemorySaver
@@ -585,6 +587,20 @@ def test_an_interrupt_inside_a_tool_reads_as_control_flow_at_the_tool_and_its_no
     assert [(s.status, s.error_type) for s in shipped] == [(StatusCode.OK, None)]
 
 
+@pytest.mark.skipif(
+    sys.version_info < (3, 11),
+    reason=(
+        "LangGraph cannot run interrupt() inside an ASYNC node before 3.11, with or "
+        "without wardex: langgraph/config.py's get_config() has an explicit "
+        "`sys.version_info < (3, 11)` guard and then finds no "
+        "`var_child_runnable_config`, because Task context propagation is 3.11+. "
+        "Verified on a bare venv with no wardex installed — 3.10 raises "
+        "'Called get_config outside of a runnable context', 3.11 returns "
+        "'__interrupt__' — so skipping here declines to assert a behaviour the "
+        "FRAMEWORK does not have, rather than hiding one of ours. The sync twins "
+        "above run on every supported version and are what pin the classification."
+    ),
+)
 def test_an_interrupt_through_the_async_seams_is_control_flow_too():
     """The same classification, through `astream` and `arun_with_retry`.
 
