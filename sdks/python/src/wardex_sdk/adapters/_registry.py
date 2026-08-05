@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from functools import partial
 from typing import TYPE_CHECKING
 
 from .._limits import CaptureLimits
@@ -14,7 +15,21 @@ if TYPE_CHECKING:
     from .._client import Client
 
 
-def context_for(name: str, client: Client | None) -> AdapterContext:
+def _declared_control_flow(adapter: AdapterInterface) -> tuple[type[BaseException], ...]:
+    """`CONTROL_FLOW` as of NOW — the CLASS attribute, read per exception.
+
+    A function rather than a lambda at the call site so the indirection has a
+    name and one definition: the whole point is that no caller can hand
+    `AdapterContext` a tuple it copied before `install()` ran.
+    """
+    return type(adapter).CONTROL_FLOW
+
+
+def context_for(
+    name: str,
+    client: Client | None,
+    adapter: AdapterInterface | None = None,
+) -> AdapterContext:
     """Build the surface an adapter is written against. THE one construction.
 
     A module function rather than a method because an adapter installed outside
@@ -43,6 +58,12 @@ def context_for(name: str, client: Client | None) -> AdapterContext:
         ),
         limits=resolved,
         debug=debug,
+        # A READER over one classvar, not the adapter and not a tuple. `install`
+        # builds this context BEFORE it calls `adapter.install()`, and an adapter
+        # can only import its framework's error classes in there — so a tuple
+        # taken here would be `()` for the life of the process, and the whole
+        # mechanism would ship green and dead.
+        control_flow=None if adapter is None else partial(_declared_control_flow, adapter),
     )
 
 
@@ -76,7 +97,7 @@ class AdapterRegistry:
         name = adapter.name()
         if name in self._installed:
             return
-        ctx = context_for(name, client)
+        ctx = context_for(name, client, adapter)
         self._installed[name] = adapter
         self._contexts[name] = ctx
 

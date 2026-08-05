@@ -13,7 +13,7 @@ from typing import Any
 
 from .. import _hub, _wardex_native
 from .._types import SpanContext
-from ..assembly import Limitation
+from ..assembly import Limitation, parent_is_closed_unit
 from ..protocol import WsParser
 from ..protocol._http1 import Http1RequestParser, Http1ResponseParser
 from ..protocol._http2 import Http2Parser
@@ -75,6 +75,13 @@ class _Txn:
     start_ns: int
     end_ns: int
     ttfb_ms: float
+    #: Was `parent` latched off a unit that had ALREADY closed? Latched HERE,
+    #: beside the parent and on the task that ISSUED the request, because the
+    #: answer is a property of that instant: a request issued while the run was
+    #: live is a child of the run's span whether or not the run finishes before
+    #: the response arrives, and re-asking on the response side would orphan it.
+    #: See `assembly._units.parent_is_closed_unit`.
+    parent_closed: bool = False
     truncated: bool = False
     # Capture-limitation markers the protocol parser attached to this
     # transaction, merged into the span's CaptureIntegrity.limitations by the
@@ -115,6 +122,7 @@ class _Http1Tracker:
         self._req_start_ns: int = 0
         self._resp_first_ns: int = 0
         self._parent: SpanContext | None = None
+        self._parent_closed: bool = False
         self._resp_cum: int = 0
         self._resp_marks: list[tuple[int, int]] = []
         self._expect_ws: bool = False
@@ -124,6 +132,11 @@ class _Http1Tracker:
         if self._req_start_ns == 0:
             self._req_start_ns = time.time_ns()
             self._parent = _hub.get_current_scope().active_span_context
+            # Asked on THIS line, where the request is being issued, so that a
+            # context a finished unit left standing is refused before it can
+            # become a parent — or open the `capture_mode=AGENT` gate — for
+            # traffic that has nothing to do with that run.
+            self._parent_closed = parent_is_closed_unit(self._parent)
         for msg in self._req.feed(data):
             self._method = msg.method
             self._path = msg.url
@@ -156,6 +169,7 @@ class _Http1Tracker:
                         request_body=b"",
                         response_body=b"",
                         parent=self._parent,
+                        parent_closed=self._parent_closed,
                         start_ns=self._req_start_ns or now,
                         end_ns=now,
                         ttfb_ms=0.0,
@@ -194,6 +208,7 @@ class _Http1Tracker:
                     request_body=self._req_body,
                     response_body=msg.body,
                     parent=self._parent,
+                    parent_closed=self._parent_closed,
                     start_ns=self._req_start_ns or now,
                     end_ns=now,
                     ttfb_ms=ttfb,
@@ -211,6 +226,7 @@ class _Http1Tracker:
             self._req_start_ns = 0
             self._resp_first_ns = 0
             self._parent = None
+            self._parent_closed = False
             self._resp_cum = 0
             self._resp_marks = []
             self._expect_ws = False
@@ -226,18 +242,23 @@ class _Http2Tracker:
 
     def __init__(self, limits: object | None = None) -> None:
         self._conn = Http2Parser(limits)
-        # stream_id -> (active span at request time, request start ns)
+        # stream_id -> (active span at request time, whether that span's unit
+        # had already closed then, request start ns)
         # TODO: evict stale entries for streams that closed without a response.
         # `_mk` pops on every transaction, so the only leak is a stream that ends
         # without one; closing it needs a connection-close hook the seam does not
         # expose yet.
-        self._latch: dict[int, tuple[SpanContext | None, int]] = {}
+        self._latch: dict[int, tuple[SpanContext | None, bool, int]] = {}
 
     def on_request_bytes(self, data: bytes) -> list[_Txn]:
         opened, txns = self._conn.feed(True, data)
         now = time.time_ns()
+        parent = _hub.get_current_scope().active_span_context
+        # Asked ONCE per feed rather than once per stream: every stream this
+        # write opened was issued from this carrier at this instant.
+        parent_closed = parent_is_closed_unit(parent) if opened else False
         for sid in opened:
-            self._latch[sid] = (_hub.get_current_scope().active_span_context, now)
+            self._latch[sid] = (parent, parent_closed, now)
         # Always call _mk to pop the _latch entry (prevents leaks); status==0
         # (degenerate transaction) is excluded from the result
         out: list[_Txn] = []
@@ -261,7 +282,7 @@ class _Http2Tracker:
 
     def _mk(self, t: Any) -> _Txn:
         now = time.time_ns()
-        parent, start = self._latch.pop(t.stream_id, (None, now))
+        parent, parent_closed, start = self._latch.pop(t.stream_id, (None, False, now))
         return _Txn(
             method=t.method or "?",
             path=t.path or "/",
@@ -269,6 +290,7 @@ class _Http2Tracker:
             request_body=t.request_body,
             response_body=t.response_body,
             parent=parent,
+            parent_closed=parent_closed,
             start_ns=start,
             end_ns=now,
             ttfb_ms=0.0,  # per-h2-stream first-byte not tracked (limitation)
@@ -291,6 +313,7 @@ class _WebSocketTracker:
         deflate: bool,
         parent: SpanContext | None,
         start_ns: int,
+        parent_closed: bool = False,
         limits: object | None = None,
         sample_cap: int | None = None,
     ) -> None:
@@ -299,6 +322,10 @@ class _WebSocketTracker:
         self._path = path
         self._deflate = deflate
         self._parent = parent
+        # Inherited from the UPGRADE transaction rather than re-latched: a WS
+        # session's parent is the scope that issued the handshake, and so is the
+        # question of whether that scope's unit had already died.
+        self._parent_closed = parent_closed
         self._start_ns = start_ns
         # None means "use the core default" — resolved here (rather than hardcoded)
         # so this can never silently drift from crates/wardex-limits.
@@ -394,6 +421,7 @@ class _WebSocketTracker:
             request_body=bytes(self._sample_in),
             response_body=bytes(self._sample_out),
             parent=self._parent,
+            parent_closed=self._parent_closed,
             start_ns=self._start_ns,
             end_ns=now,
             ttfb_ms=0.0,

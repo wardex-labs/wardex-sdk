@@ -20,11 +20,16 @@ affect the shape of the tree.
 **Placement is mandatory, and that is the expensive lesson.** A run entry the
 adapter forgot to wrap does not fail loudly — every span underneath simply
 becomes its own trace root at confidence 1.0 with no marker, byte-identical to a
-legitimate run. Measured on real langgraph: one graph run reported as four
-separate traces, indistinguishable downstream from four genuine ones. Declaring
-at each site whether it may begin a trace turns that silence into
-`PARENT_UNRESOLVED` at confidence 0.0. The whole of the difference is one
-argument that cannot be defaulted.
+legitimate run. The rule, measured on real langgraph rather than counted on one
+graph: with no run entry wrapped, **`traces == captured outbound calls`**, run
+spans `== 0`, node spans `== 0`, tool spans `== 0`, and every edge is
+`trace_root`/1.0 with no marker — so a graph is reported as as many genuine
+traces as it happened to make calls, indistinguishable downstream from that many
+real ones. (An earlier version of this paragraph cited "four", which was one
+graph's call count and not a property of the framework.) Declaring at each site
+whether it may begin a trace turns that silence into `PARENT_UNRESOLVED` at
+confidence 0.0. The whole of the difference is one argument that cannot be
+defaulted.
 
 **Nothing here raises an Exception of wardex's own making.** The host's call
 lives inside `enter()`'s `with` body, so a bug in wardex's own work — deciding
@@ -160,11 +165,15 @@ class Scope:
     working before it may keep describing what it sees.
     """
 
-    __slots__ = ("_ctx", "_unit")
+    __slots__ = ("_ctx", "_failure", "_unit")
 
     def __init__(self, unit: Unit | None, ctx: AdapterContext) -> None:
         self._unit = unit
         self._ctx = ctx
+        #: A failure the HOST reported without raising, declared by the adapter
+        #: through `record_failure`. Read by `_run` on the way out, and only
+        #: when nothing was raised — see that method and `record_failure`.
+        self._failure: str | None = None
 
     @property
     def degraded(self) -> bool:
@@ -296,6 +305,30 @@ class Scope:
         if self._unit is not None:
             self._unit.record_output(data)
 
+    def record_failure(self, error_type: str) -> None:
+        """The host FAILED and did not raise. Say so, or the span reads `OK`.
+
+        Deriving a span's status from the exception that left the body is only
+        half a rule: a framework that converts a failure into a return value
+        makes the other half unreachable. LangGraph's default
+        `handle_tool_errors` does exactly that — the model calling a tool with
+        arguments that do not validate becomes a `ToolMessage(status="error")`
+        and never raises — so the single most common tool failure there is
+        would otherwise ship `status=OK` with the failure legible only to a
+        human reading `output_data`.
+
+        The declaration is WEAKER than an exception and `_run` treats it that
+        way: it is consulted only when nothing was raised. An exception is
+        stronger evidence, carries a real type, and must keep it — an adapter
+        must not be able to relabel a crash.
+
+        Total and silent on a degraded scope, exactly like `record_input`: an
+        adapter never has to ask whether wardex is working before it may keep
+        describing what it saw.
+        """
+        if self._unit is not None:
+            self._failure = error_type
+
 
 class RunHandle(Scope):
     """A long-lived unit that is NOT installed on the caller's carrier.
@@ -425,6 +458,7 @@ class AdapterContext:
     __slots__ = (
         "_anon_ns",
         "_anon_seq",
+        "_control_flow",
         "_slots",
         "_tripped",
         "_units",
@@ -441,6 +475,7 @@ class AdapterContext:
         units: UnitRegistry,
         limits: Mapping[str, int],
         debug: bool = False,
+        control_flow: Callable[[], tuple[type[BaseException], ...]] | None = None,
     ) -> None:
         self.name = name
         self.patches = PatchSet(f"adapters.{name}", debug=debug)
@@ -459,6 +494,13 @@ class AdapterContext:
         self._anon_ns = f"adapters.{name}"
         self._anon_seq = count()
         self._slots: MutableMapping[Any, dict[str, Any]] = weakref.WeakKeyDictionary()
+        # A READER, not a tuple. `AdapterRegistry.install` builds this context
+        # BEFORE it calls `adapter.install()`, and an adapter can only import its
+        # framework's error classes in there — so a tuple taken here is `()` for
+        # the life of the process. `_registry.context_for` is the only caller with
+        # an adapter to bind, and it binds a reader over the CLASS attribute;
+        # nothing here can hold a snapshot.
+        self._control_flow = control_flow
 
     @property
     def tripped(self) -> bool:
@@ -507,14 +549,38 @@ class AdapterContext:
             return
         unit.draft.add_link(found.context, reason)
 
+    def _is_control_flow(self, exc: BaseException) -> bool:
+        """Is this the host's control flow rather than the host's failure?
+
+        Read HERE, one statement before `_run` re-raises, and not latched at
+        construction: the registry builds the context before the adapter runs,
+        so the only value a constructor could copy is the empty default.
+
+        GUARDED, and the `isinstance` is inside the guard WITH the read. This
+        runs inside `except BaseException`, so an adapter that declared
+        something which is not a class of exceptions would otherwise have
+        wardex's own `TypeError` replace the host's exception — the one thing
+        this module forbids. A trip leaves `matched` False, i.e. today's
+        `ERROR`/type-name: a wardex failure may only ever LOWER what wardex
+        claims, and must never turn a failure into a success.
+        """
+        reader = self._control_flow
+        if reader is None:
+            return False
+        matched = False
+        with self.guard("control_flow_read"):
+            matched = isinstance(exc, reader())
+        return matched
+
     def confirm_active(self, site: str) -> None:
         """Report that a declared patch site actually fired.
 
         Per SITE, not per install. A framework can move ONE of its entry points
         and leave the rest working, which produces a tree that is wrong only in
         the shape the moved entry governed — measured on langgraph, a run entry
-        left unpatched shattered a graph into five traces while an install-level
-        self-check reported success.
+        left unpatched shatters a graph into one trace per captured outbound
+        call (the baseline rule this module's header states) while an
+        install-level self-check reports success.
         """
         self.count(f"active.{site}")
 
@@ -659,19 +725,35 @@ class AdapterContext:
         `finish()` refuses the draft and the emit funnel drops it, so the
         outcome is "no span" and never a clean-looking one.
         """
-        described = False
+        closed = False
         if unit is not None:
             with self.guard("enter_abandon"):
                 unit.note(Limitation.INSTRUMENTATION_DEGRADED)
                 self._units.close(unit, status=StatusCode.UNSET)
-                described = True
-        if described:
-            consequence = "one span is incomplete or missing"
-        elif placement is Placement.ROOT:
+                closed = True
+        # PLACEMENT FIRST, and this is a correction. The flag below says the
+        # unit was CLOSED, not that it was described — it is True on the
+        # ordinary way of getting here (a `describe` that raised after the unit
+        # opened), so testing it first made the ROOT branch unreachable and
+        # every run entry reported as "one span". A ROOT site is the one place
+        # the loss is not one span: the description died before the intent's
+        # required block, so `finish()` refuses the draft and NOTHING ships for
+        # the whole run.
+        if placement is Placement.ROOT:
+            # Measured rather than reasoned: 0 spans ship, and the body then
+            # runs inside `degraded_run()`. So traffic inside is still captured
+            # — that mechanism exists precisely so one failure here does not
+            # become total silence — but it arrives ORPHANED and marked instead
+            # of attached to a run. (The older wording claimed it would not be
+            # captured at all, which was true before `degraded_run` and is not
+            # now. An unreachable branch is also an unaudited one.)
             consequence = (
-                "this run will produce NO agent span, and under capture_mode=AGENT "
-                "no HTTP or tool traffic inside it will be captured either"
+                "this run will produce NO span of its own, and every request and "
+                "tool call inside it will arrive orphaned and marked rather than "
+                "attached to the run"
             )
+        elif closed:
+            consequence = "one span is incomplete or missing"
         else:
             consequence = "one span is missing from this run"
         self._degrade(where, holder=None, consequence=consequence)
@@ -707,9 +789,25 @@ class AdapterContext:
         try:
             yield scope
         except BaseException as exc:
-            status, error_type = StatusCode.ERROR, type(exc).__name__
+            # A framework that implements pausing, handing off or draining by
+            # RAISING is not failing, and a span that says otherwise reports
+            # every human-in-the-loop pause as a crashed run. The adapter names
+            # those classes once, as a classvar; this is the one place that
+            # reads it, so no causal path can be the one nobody remembered.
+            if self._is_control_flow(exc):
+                status, error_type = StatusCode.UNSET, None
+            else:
+                status, error_type = StatusCode.ERROR, type(exc).__name__
             raise
         finally:
+            if status is StatusCode.OK and scope._failure is not None:
+                # ONLY when nothing was raised. An exception is stronger
+                # evidence than a declaration and keeps its own type, so an
+                # adapter cannot relabel a crash — and control flow, which has
+                # already resolved to UNSET above, is not a failure to overwrite
+                # either. What this reaches is the one case neither can see: the
+                # host returned normally and told the adapter it had failed.
+                status, error_type = StatusCode.ERROR, scope._failure
             if activation is not None:
                 # BEFORE the close, on every path including the ones where the
                 # close then fails. Deferring it until the close succeeds leaves

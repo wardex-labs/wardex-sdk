@@ -291,6 +291,21 @@ def _constructs_ambient(rel: str, tree: ast.Module):
     return predicate
 
 
+def _resolves_observed_without_asking(rel: str, tree: ast.Module):
+    """A `resolve_observed(...)` call that does NOT declare `parent_closed`."""
+    bound = _local_names(tree, "resolve_observed")
+    modules = _module_aliases(rel, tree)
+
+    def predicate(node: ast.AST) -> bool:
+        return (
+            isinstance(node, ast.Call)
+            and _reaches_symbol(node.func, "resolve_observed", bound, modules)
+            and not any(kw.arg == "parent_closed" for kw in node.keywords)
+        )
+
+    return predicate
+
+
 def _reads_capture_mode(rel: str, tree: ast.Module):
     """Every way a module can reach `config.capture_mode`.
 
@@ -847,6 +862,42 @@ def test_ambient_is_latched_not_hand_built():
     )
 
 
+def test_the_observed_edge_is_told_whether_its_parent_died():
+    """design §10.3(b) — every OBSERVING site declares whether its parent had
+    already closed.
+
+    `resolve_observed` exists for sites that latch a parent they did not open
+    and cannot vet. One of the things they cannot vet is whether the unit behind
+    that parent is still running: a `close()` on another carrier leaves the
+    finished unit's span installed, and the seam reads it back as
+    `contextvar` / 1.0 / no marker into a span that has already shipped.
+
+    `_parentage` cannot ask for itself — `_units` imports it, not the other way
+    round — so the fact arrives as a declared argument, the same shape
+    `degraded` has. A defaulted argument is exactly the kind of mechanism that
+    goes quietly dead when a fourth call site is written, so the rule is
+    mechanical rather than a docstring: outside `assembly/`, there is no
+    `resolve_observed(...)` that has not been told.
+
+    Call `assembly.parent_is_closed_unit(parent)` on the task that ISSUES the
+    work and carry the answer to the emit path beside the parent itself.
+    """
+    everywhere = {
+        k: v
+        for k, v in _tally(_resolves_observed_without_asking).items()
+        if not k.startswith("assembly/")
+    }
+    assert everywhere == {}, (
+        f"resolve_observed is called without `parent_closed=` at {everywhere}.\n\n"
+        "WHY: an observed edge whose parent's unit had already closed adopts\n"
+        "unrelated later work into an ALREADY-SHIPPED span at confidence 1.0\n"
+        "with no marker — one trace where two belong, and the one shape no\n"
+        "consumer can detect downstream (design §10.3).\n"
+        "Latch assembly.parent_is_closed_unit(parent) on the task that ISSUES\n"
+        "the work, store it beside the parent, and declare it here."
+    )
+
+
 # --------------------------------------------------------------------------
 # design §4.4 / §5.1 — one capture gate (HARD RULES, never budgets)
 # --------------------------------------------------------------------------
@@ -918,6 +969,15 @@ _CS4_BUDGET = {
     # is how the stdlib spells "the carrier here is the thread".
     "adapters/_anthropic_agent_sdk.py": 2,
     "adapters/_assembler.py": 2,
+    # Two, and the same justification as the adapter above: both are ABSENCES
+    # rather than failures. `_import_pregel` asks "is langgraph installed" and
+    # `_import_toolnode` asks "is langgraph-prebuilt installed" — a separately
+    # versioned distribution that can be missing on its own — and an ImportError
+    # is the ANSWER to each, returned as `None` and branched on by `install()`.
+    # Neither can be a module-level import: that would make the decline path
+    # dead, surfacing the error on `adapters/__init__.py`'s stderr line instead
+    # of declining silently.
+    "adapters/_langgraph.py": 2,
     "interceptors/_conn_timing.py": 10,
     # 13 -> 7. The six that went are the ones the patch mechanism made
     # unnecessary: two `except Exception: self._orig_* = None` around install,
@@ -1145,6 +1205,38 @@ def _header_violations(tree: ast.AST) -> list[int]:
     return bad
 
 
+def _is_pass_through_aiter(stmt: ast.stmt) -> bool:
+    """`async for x in <call>: yield x` — the async twin of `yield from <call>`.
+
+    An async generator cannot delegate with `yield from` (it is a syntax error),
+    so this loop is the only way to hold a scope across a framework's async
+    iteration. The sync entry gets there through the `Return` branch below —
+    `return (yield from original(...))` — and the async entry had no legal
+    spelling at all; hoisting the `with` into a helper generator does not help,
+    because this rule is per-`With` node.
+
+    Admitted in EXACTLY this shape: one `AsyncFor` with no `orelse`, over a
+    CALL, one statement inside it, and that statement a bare `yield` of the loop
+    variable. Nothing can be COMPUTED in it, which is the whole of what the rule
+    is about — `yield _shape(chunk)` and a second statement in the loop both stay
+    flagged. The sync twin `out = original(...)` is deliberately NOT admitted: it
+    would open the body to arbitrary adapter glue.
+    """
+    if not isinstance(stmt, ast.AsyncFor) or stmt.orelse:
+        return False
+    if not isinstance(stmt.target, ast.Name) or not isinstance(stmt.iter, ast.Call):
+        return False
+    if len(stmt.body) != 1:
+        return False
+    inner = stmt.body[0]
+    return (
+        isinstance(inner, ast.Expr)
+        and isinstance(inner.value, ast.Yield)
+        and isinstance(inner.value.value, ast.Name)
+        and inner.value.value.id == stmt.target.id
+    )
+
+
 def _body_violations(tree: ast.AST) -> list[int]:
     """Statements in a `with ctx.enter(...)` body that are neither the host's
     call nor a method call on the yielded scope."""
@@ -1160,6 +1252,8 @@ def _body_violations(tree: ast.AST) -> list[int]:
             for stmt in node.body:
                 if isinstance(stmt, ast.Return | ast.Pass):
                     continue
+                if _is_pass_through_aiter(stmt):
+                    continue  # delegating the host's async iteration IS the host's work
                 if isinstance(stmt, ast.Assign | ast.AnnAssign | ast.Expr):
                     value = stmt.value
                     if value is None:
@@ -1200,7 +1294,11 @@ def test_nothing_but_the_hosts_call_lives_in_an_enter_body():
         "unguarded on purpose — a guard there would swallow the host's exception\n"
         "and report a failing call as a successful one. Anything else written\n"
         "there breaks the host for a span attribute. Adapter glue goes in\n"
-        "`describe=`, which runs inside the same boundary as the open."
+        "`describe=`, which runs inside the same boundary as the open.\n\n"
+        "DELEGATION COUNTS AS THE HOST'S CALL: `return (yield from original(...))`\n"
+        "and its async twin `async for x in original(...): yield x` are pumping the\n"
+        "host's own generator, which is the host's own work. The async form is\n"
+        "admitted in that exact shape only — see `_is_pass_through_aiter`."
     )
 
 
@@ -1231,6 +1329,16 @@ def test_c_s6_sees_a_header_expression_that_can_raise(source):
         "               describe=partial(_describe, adapter, handle, tool_name, args)) as call:\n"
         "    result = await handler(args)\n"
         "    call.record_output(_tool_input(result))\n",
+        # the SYNC run entry: delegating a generator through the `Return` branch
+        "with ctx.enter(UnitKind.SESSION, intent=SpanIntent.INVOKE_WORKFLOW,\n"
+        "               placement=Placement.ROOT, describe=partial(_d, a, s)) as run:\n"
+        "    return (yield from original(self, *args, **kwargs))\n",
+        # the ASYNC run entry: the only spelling an async generator has, since
+        # `yield from` is a syntax error in one. Case D.
+        "with ctx.enter(UnitKind.SESSION, intent=SpanIntent.INVOKE_WORKFLOW,\n"
+        "               placement=Placement.ROOT, describe=partial(_d, a, s)) as run:\n"
+        "    async for chunk in original(self, *args, **kwargs):\n"
+        "        yield chunk\n",
     ],
 )
 def test_c_s6_accepts_the_shape_the_adapter_actually_writes(source):
@@ -1251,6 +1359,23 @@ def test_c_s6_accepts_the_shape_the_adapter_actually_writes(source):
         # a guard nested in the body — there is nothing left for it to protect,
         # and reaching for one is how the host's exception gets swallowed
         "with ctx.enter(K) as call:\n    with adapter._guard('x'):\n        pass\n",
+        # --- near-misses of the async delegation shape. Each is one edit away
+        # --- from the admitted form, and each would reopen the body to glue.
+        # a COMPUTED yield: the loop is now a transform, not a pass-through
+        "with ctx.enter(K) as run:\n    async for chunk in original(self):\n"
+        "        yield _shape(chunk)\n",
+        # a second statement in the loop
+        "with ctx.enter(K) as run:\n    async for chunk in original(self):\n"
+        "        run.note(M)\n        yield chunk\n",
+        # iterating an ATTRIBUTE rather than a call — not a delegation
+        "with ctx.enter(K) as run:\n    async for chunk in self.stream:\n        yield chunk\n",
+        # the SYNC twin, deliberately not admitted: `yield from` is the sync form
+        "with ctx.enter(K) as run:\n    for chunk in original(self):\n        yield chunk\n",
+        # an `orelse` runs adapter code after the host's iteration
+        "with ctx.enter(K) as run:\n    async for chunk in original(self):\n        yield chunk\n"
+        "    else:\n        run.note(M)\n",
+        # yielding a DIFFERENT name — the loop variable is not what is passed on
+        "with ctx.enter(K) as run:\n    async for chunk in original(self):\n        yield other\n",
     ],
 )
 def test_c_s6_sees_a_body_that_is_not_only_the_hosts_call(source):

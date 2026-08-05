@@ -100,6 +100,7 @@ def should_capture(
     parent: SpanContext | None,
     agent_semantic: bool,
     degraded: bool = False,
+    parent_closed: bool = False,
 ) -> bool:
     """Design §5.1, whole: the SDK's only answer to "capture this?".
 
@@ -134,11 +135,30 @@ def should_capture(
     that rule was being applied backwards — against the user, on wardex's own
     fault. What comes through is not passed off as ordinary: see
     `resolve_observed`.
+
+    `parent_closed` is `assembly._units.parent_is_closed_unit(parent)` — "the
+    local span this was latched off belongs to a unit that had ALREADY CLOSED".
+    A DECLARED input for the same reason `degraded` is, plus a stronger one: the
+    fact is not knowable here at all. It has to be read on the task that ISSUED
+    the work, at the instant it was issued, and this function runs on the
+    response side of a seam that shares neither.
+
+    It exists because AGENT mode's whole premise is that a local ambient span
+    means "something in this process is doing agent work RIGHT NOW", and a
+    leftover activation fork breaks that premise without breaking the type: the
+    span is local, is not remote, and is finished. Measured on LangGraph, a
+    generator-scoped session whose fork outlived it kept the gate open for every
+    later request on that carrier — traffic the user's AGENT mode had asked to
+    drop, captured and then hung off an already-shipped span. Closing the gate
+    here loses nothing the mode wanted: it restores the answer the mode would
+    have given had the fork come down. Agent-semantic traffic is untouched — it
+    returns True two lines earlier, on a claim the site makes about the BYTES,
+    which a dead parent says nothing about.
     """
     if mode is CaptureMode.ALL:
         return True
     if agent_semantic:
         return True
-    if parent is not None and not parent.is_remote:
+    if parent is not None and not parent.is_remote and not parent_closed:
         return True
     return degraded

@@ -919,11 +919,13 @@ class UnitRegistry:
         most likely way an adapter silently breaks the tree. A unit that hangs
         off another unit passes `EMPTY_AMBIENT` and `parent_unit`.
 
-        A scope left behind by a STALE PIN is refused here for the same reason
-        `resolve()` refuses it: it is a finished unit's own context, so a unit
-        opened from it would be a fresh subtree hanging off a dead session at
-        confidence 1.0 with nothing on the wire to say so. The unit becomes a
-        trace root instead and carries `CORRELATION_CONFLICT`.
+        A scope left behind by a unit of this registry that has already CLOSED
+        — a leaked pin, or an `activate()` fork `close()` could not take down —
+        is refused here for the same reason `resolve()` refuses it: it is a
+        finished unit's own context, so a unit opened from it would be a fresh
+        subtree hanging off a dead session at confidence 1.0 with nothing on the
+        wire to say so. The unit becomes a trace root instead and carries
+        `CORRELATION_CONFLICT`.
         """
         now = start_ns if start_ns is not None else time.time_ns()
         if parent_unit is not None:
@@ -933,7 +935,7 @@ class UnitRegistry:
             conversation = parent_unit.conversation
             tracestate = parent_unit.tracestate
         elif self._poisoned(ambient):
-            counters.bump("assembly._units.stale_pin_ambient")
+            self._note_refused_ambient()
             parentage = resolve_parentage(EMPTY_AMBIENT, evidence).with_limitation(
                 Limitation.CORRELATION_CONFLICT
             )
@@ -1089,18 +1091,32 @@ class UnitRegistry:
         return entry.unit
 
     def stale_pin_in_scope(self) -> bool:
-        """Is the scope on this task the leftover of a pin whose unit has died?
+        """Is the scope on this task the leftover of a unit that has DIED?
 
-        `current()` refusing the dead unit is only half of the pin's safety, and
-        the other half is what makes the first half matter. A pin installs TWO
-        things (`_Carrier.__init__`): the ambient UNIT, which `current()` gates
-        on liveness, and the ambient SPAN CONTEXT in the scope, which nothing
-        can invalidate — `close()` runs on a different task, and a ContextVar
-        cannot be reset from one. So after the pinned unit closes, the very next
-        `latch_ambient()` still returns the DEAD unit's own span context, and an
-        edge built from it reads `contextvar` / 1.0 / no marker: the failure
-        `current()`'s docstring says it exists to prevent, arriving by the other
-        carrier.
+        `current()` refusing the dead unit is only half of an activation's
+        safety, and the other half is what makes the first half matter. A
+        carrier installs TWO things (`_Carrier.__init__`): the ambient UNIT,
+        which `current()` gates on liveness, and the ambient SPAN CONTEXT in the
+        scope, which nothing can invalidate — `close()` may run on a different
+        task, and a ContextVar cannot be reset from one. So after the unit
+        closes, the very next `latch_ambient()` still returns the DEAD unit's
+        own span context, and an edge built from it reads `contextvar` / 1.0 /
+        no marker: the failure `current()`'s docstring says it exists to
+        prevent, arriving by the other carrier.
+
+        PINNED OR NOT (design §10.3), and the widening is the whole of (a).
+        This gated on `entry.pinned` on the reading that only a pin installs a
+        fork nobody can take down. That was wrong about `activate()`, and
+        measurably so: a generator-scoped activation (LangGraph's
+        `Pregel.stream`) is entered on the carrier that pumps the first
+        `next()` and can only be undone when the generator is FINALIZED, on
+        whatever carrier finalizes it. A `close_units()` mid-stream, or a
+        finalization on a foreign carrier, strands exactly the same corpse — and
+        it was not merely uncounted, it was a CONFIDENT PARENT: an entire later
+        graph run adopted into an already-shipped span at 1.0 with no marker,
+        one trace where two belong. A pin is one way to strand a fork, not the
+        definition of one. `entry.pinned` survives below only to NAME a counter,
+        which is exactly the role it already plays in `current()`.
 
         This predicate is what lets `open()` and `resolve()` refuse that scope
         and SAY SO on the span whose parent edge it would have decided — design
@@ -1112,46 +1128,87 @@ class UnitRegistry:
         hook callback and every in-process tool handler runs on a descendant
         task, which is the mechanism the whole design rests on; the literal rule
         would stamp `CORRELATION_CONFLICT` on the product's own exhibit A.
-        """
-        return self._stale_pin_context() is not None
 
-    def _stale_pin_context(self) -> SpanContext | None:
-        """The span context a dead pin left standing in this task's scope.
+        The NAME is now narrower than the predicate. It is kept because its one
+        production caller (`AdapterContext._open`) and its test both spell it,
+        and renaming a public predicate is a second change that should not ride
+        on a blocking fix; what it means is `_closed_ambient_context`.
+        """
+        return self._closed_ambient_context() is not None
+
+    def _closed_ambient_context(self) -> SpanContext | None:
+        """The span context a CLOSED unit of THIS registry left in this scope.
 
         Ownership first, for the reason `current()` gives and one more. The
-        ambient carrier is process-wide and a unit is not, so a pin a previous
+        ambient carrier is process-wide and a unit is not, so a unit a previous
         `init()`'s registry installed and then closed reads here as THIS
         registry's corpse: `becomes_trace_root` would orphan a nested site and
         `open()` would stamp `CORRELATION_CONFLICT`, both charging a conflict to
-        a pin this registry never installed — and doing it while the scope in
-        front of us is a perfectly ordinary one.
+        an activation this registry never installed — and doing it while the
+        scope in front of us is a perfectly ordinary one.
+
+        The foreign COUNTER stays gated on `entry.pinned` even though the
+        refusal no longer is, and that is a decision rather than a leftover.
+        `stale_pin_foreign_registry` audits PIN DISCIPLINE — by its name and by
+        the test that reads it — while two adapters running side by side put
+        each other's perfectly healthy `activate()` on this carrier
+        continuously. Counting those would fire the pin audit on every `open()`
+        of an ordinary two-adapter process and bury the signal it exists to
+        carry; `current()`'s `ambient_foreign_registry` already counts the
+        general event.
         """
         entry = _ambient_unit.get()
-        if entry is None or not entry.pinned:
+        if entry is None:
             return None
         if entry.unit._registry is not self:
-            counters.bump("assembly._units.stale_pin_foreign_registry")
+            if entry.pinned:
+                counters.bump("assembly._units.stale_pin_foreign_registry")
             return None
         if entry.unit.is_live:
             return None
         return entry.unit.context
 
+    def _note_refused_ambient(self) -> None:
+        """Count a refused leftover, naming which primitive stranded it.
+
+        Two names for one refusal, because they are two bugs with two repairs —
+        the same axis, and the same split, `current()` already makes between
+        `pin_stale`/`pin_leaked` and `ambient_stale`. `stale_pin_ambient` says a
+        RESTRICTED pin outlived its unit: `pin_driver`'s contract was broken and
+        the fix is in which task the adapter pinned. `stale_activation_ambient`
+        says an `activate()` scope could not be unwound where it was installed —
+        a generator finalized on a foreign carrier, a `close_units()` that ran
+        inside one — and the fix is in the adapter's LIFETIME, not its pinning.
+        One number covering both leaves an operator with two hypotheses and no
+        way to separate them.
+        """
+        entry = _ambient_unit.get()
+        counters.bump(
+            "assembly._units.stale_pin_ambient"
+            if entry is not None and entry.pinned
+            else "assembly._units.stale_activation_ambient"
+        )
+
     def _poisoned(self, amb: Ambient) -> bool:
-        """Is `amb` the leftover fork of a pin whose unit has died?
+        """Is `amb` the leftover fork of a unit of THIS registry that has died?
 
         The identity check, not merely `stale_pin_in_scope()`, and the narrowing
-        is deliberate. A stale pin says the TASK is descended from a dead
-        driver; it does not say the scope still holds the dead unit's own span.
-        A host that opened its own span inside that task, or a handler inside an
+        is deliberate. A dead unit in scope says the TASK is descended from one;
+        it does not say the scope still holds the dead unit's own span. A host
+        that opened its own span inside that task, or a handler inside a nested
         `activate()`, put a real span on top of the leftover — refusing THAT
         would move live work out of the host's trace to escape a ghost that is
         no longer in front of us, which is a wrong tree of a different shape.
+        `test_a_real_span_over_a_stale_pin_is_still_a_parent` is the standing
+        promise, and the §10.3 widening deliberately does not touch it: what
+        changed is which leftovers count as leftovers, not the identity test
+        that keeps a real parent a parent.
 
-        What is refused is exactly the measured failure: the fork the pin
-        installed, still current after `close()` could not take it down, read
-        back as `contextvar` / 1.0 / no marker into a finished unit.
+        What is refused is exactly the measured failure: the fork `activate()`
+        or a pin installed, still current after `close()` could not take it
+        down, read back as `contextvar` / 1.0 / no marker into a finished unit.
         """
-        stale = self._stale_pin_context()
+        stale = self._closed_ambient_context()
         return stale is not None and amb.span_context is not None and amb.span_context == stale
 
     def becomes_trace_root(self, amb: Ambient) -> bool:
@@ -1218,8 +1275,8 @@ class UnitRegistry:
         therefore the more specific answer. Getting it backwards collapses every
         sub-agent into its session, silently and at confidence 1.0.
 
-        A scope left behind by a STALE PIN is refused before any of that. It is
-        the dead unit's own context, so every branch that consults `amb` would
+        A scope left behind by a CLOSED unit is refused before any of that. It
+        is the dead unit's own context, so every branch that consults `amb` would
         re-attach unrelated later work to a finished unit — at 1.0 with no
         marker on the widest branch. The edge is rebuilt from the remaining
         tiers (alias -> sole_live -> UNRESOLVED) and carries
@@ -1229,7 +1286,7 @@ class UnitRegistry:
         """
         amb = ambient if ambient is not None else latch_ambient()
         if self._poisoned(amb):
-            counters.bump("assembly._units.stale_pin_ambient")
+            self._note_refused_ambient()
             return self._edge(alias, EMPTY_AMBIENT).with_limitation(Limitation.CORRELATION_CONFLICT)
         return self._edge(alias, amb)
 
@@ -1646,6 +1703,51 @@ class UnitRegistry:
                 self._sink.emit(draft, agent_semantic=True)
 
 
+def parent_is_closed_unit(parent: SpanContext | None) -> bool:
+    """Was `parent` latched off a unit that had ALREADY CLOSED? — design §10.3(b).
+
+    The registry predicates above answer this for callers that hold a registry.
+    The byte seams and MCP stdio hold a `Client` and nothing else, and
+    `interceptors/` may not import `adapters/`, where the registries are built.
+    So the fact is exported as a function of the ambient CARRIER — the one thing
+    the two ends share — and travels to `should_capture` and `resolve_observed`
+    as a DECLARED input, which is the shape `degraded` already has and for the
+    same reason: `_parentage` is imported BY this module, so neither of those
+    two may ask the question for itself without a cycle.
+
+    NO REGISTRY, and that is sound rather than a shortcut. "The span I latched
+    has already shipped" is registry-independent: whoever opened the unit, its
+    span left the process when the unit closed, and hanging later work off it is
+    the same wrong tree either way. The ownership guard inside
+    `UnitRegistry._closed_ambient_context` exists to stop one registry CHARGING
+    a `CORRELATION_CONFLICT` to another registry's teardown; a seam charges
+    nothing to anyone. What matters is the guard that IS here: liveness is
+    tested first, so a LIVE unit from any registry — the ordinary state of a
+    two-adapter process — is never refused.
+
+    IDENTITY, not descent, for the reason `_poisoned` gives: a host span or a
+    nested activation standing on top of the leftover is a real parent, and
+    moving live work out of the host's trace to escape a ghost that is no longer
+    in front of us is a wrong tree of its own shape.
+
+    ASK THIS WHERE YOU LATCH, on the task that ISSUED the work, and store the
+    answer beside the parent. Asked on the response path it would be a different
+    carrier at a different instant, and it would refuse a request that was
+    legitimately issued INSIDE a run that has since finished — real data lost to
+    escape a corpse that was not in front of the request when it left. That is
+    the same mistake `latch_ambient`'s docstring names, one field over.
+    """
+    entry = _ambient_unit.get()
+    if entry is None or parent is None:
+        return False
+    if entry.unit.is_live:
+        return False
+    if parent != entry.unit.context:
+        return False
+    counters.bump("assembly._units.ambient_closed_at_issue")
+    return True
+
+
 __all__ = [
     "PinToken",
     "SpanSink",
@@ -1653,4 +1755,5 @@ __all__ = [
     "UnitKey",
     "UnitKind",
     "UnitRegistry",
+    "parent_is_closed_unit",
 ]

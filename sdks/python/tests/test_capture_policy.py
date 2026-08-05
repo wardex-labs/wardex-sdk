@@ -665,3 +665,264 @@ def test_the_edges_markers_reach_the_span_without_the_caller_copying_them():
         Limitation.PARENT_UNRESOLVED,
         Limitation.INSTRUMENTATION_DEGRADED,
     }
+
+
+# --------------------------------------------------------------------------
+# design §10.3(b) — a parent whose unit had already closed opens nothing
+# --------------------------------------------------------------------------
+
+
+@contextmanager
+def _stranded_session():
+    """A unit whose span has SHIPPED and whose `activate()` fork still stands.
+
+    Closed from another thread, so the ContextVar Token cannot be reset — the
+    `close_units()`-mid-stream / finalized-on-a-foreign-carrier shape. The
+    activation CM is held for the duration: `activate_span` is generator-backed,
+    so dropping the last reference runs its `finally` and takes the fork down,
+    which would silently turn every test below into the clean case.
+    """
+    import threading
+
+    from wardex_sdk._hub import reset_for_test
+    from wardex_sdk._types import AgentAttributes
+    from wardex_sdk.assembly import (
+        EMPTY_AMBIENT,
+        SpanIntent,
+        UnitKey,
+        UnitKind,
+        UnitRegistry,
+        counters,
+    )
+    from wardex_sdk.assembly._units import _ambient_unit
+
+    class _Sink:
+        def emit(self, draft: Any, *, agent_semantic: bool) -> bool:
+            return True
+
+    token = _ambient_unit.set(None)
+    counters.reset()
+    reg = UnitRegistry(sink=_Sink())
+    unit = reg.open(
+        UnitKind.SESSION,
+        UnitKey("test.session", "s1"),
+        ambient=EMPTY_AMBIENT,
+        intent=SpanIntent.INVOKE_AGENT,
+        subject="agent",
+    )
+    unit.draft.set_agent(AgentAttributes(name="agent", id="s1"))
+    cm = unit.activate()
+    cm.__enter__()
+    closer = threading.Thread(target=lambda: reg.close(unit))
+    closer.start()
+    closer.join()
+    try:
+        yield reg, unit
+    finally:
+        del cm
+        _ambient_unit.reset(token)
+        reset_for_test()
+        counters.reset()
+
+
+def test_the_gate_closes_on_a_local_parent_whose_unit_already_closed():
+    """AGENT's premise is that a local ambient span means agent work is in
+    flight RIGHT NOW. A leftover activation fork breaks that premise without
+    breaking the type — the span is local, is not remote, and is finished — so
+    every later request on that carrier walked the gate on the strength of a
+    span that was over. Closing it here loses nothing the mode wanted: it
+    restores the answer the mode would have given had the fork come down.
+    """
+    assert should_capture(CaptureMode.AGENT, parent=LOCAL, agent_semantic=False) is True
+    assert (
+        should_capture(CaptureMode.AGENT, parent=LOCAL, agent_semantic=False, parent_closed=True)
+        is False
+    )
+    # Every other row is untouched.
+    assert (
+        should_capture(CaptureMode.ALL, parent=LOCAL, agent_semantic=False, parent_closed=True)
+        is True
+    )
+    assert (
+        should_capture(
+            CaptureMode.AGENT, parent=LOCAL, agent_semantic=False, parent_closed=True, degraded=True
+        )
+        is True
+    )
+    assert (
+        should_capture(CaptureMode.AGENT, parent=None, agent_semantic=False, parent_closed=True)
+        is False
+    )
+
+
+def test_agent_semantic_traffic_survives_a_closed_parent():
+    """It loses a PARENT, not its reason to exist. `agent_semantic` is a claim
+    the site makes about the BYTES — a parsed LLM response, a JSON-RPC tool call
+    over a subprocess pipe — and a dead parent says nothing about those. The
+    span still ships; `resolve_observed` is what makes its edge honest.
+    """
+    for mode in (CaptureMode.AGENT, CaptureMode.ALL):
+        assert (
+            should_capture(mode, parent=LOCAL, agent_semantic=True, parent_closed=True) is True
+        ), mode
+
+
+def test_the_closed_parent_flag_is_a_declared_input_and_not_a_hidden_read():
+    """The twin of `test_the_flag_is_a_declared_input_and_not_a_hidden_read`.
+
+    `should_capture` stays a pure function of its arguments. Reading the
+    `_ambient_unit` carrier here would be worse than for `degraded`: the answer
+    is not even knowable on this side, because the gate runs on the response
+    path of a seam that shares neither the carrier nor the instant the work was
+    issued on.
+    """
+    import inspect
+    import pathlib
+
+    from wardex_sdk.assembly import _policy, _units
+
+    assert "parent_closed" in inspect.signature(should_capture).parameters
+
+    src = pathlib.Path(_policy.__file__).read_text()
+    body = src[src.index("def should_capture") :]
+    body = body[body.index('"""', body.index('"""') + 3) :]
+    assert "parent_is_closed_unit" not in body
+    assert "ContextVar" not in body
+    # And the fact itself lives with the units, because that is what it is about.
+    assert hasattr(_units, "parent_is_closed_unit")
+
+
+def test_an_observed_span_under_a_closed_parent_is_unresolved_not_a_child():
+    """A shipped span adopting later traffic at 1.0 with no marker is the one
+    shape no consumer can detect downstream. Refused, the edge is `UNRESOLVED`
+    and not `TRACE_ROOT`: a parent was EXPECTED here — one was latched — so
+    `PARENT_UNRESOLVED` is the literal truth. It is not
+    `INSTRUMENTATION_DEGRADED` either; nothing failed to open.
+    """
+    from wardex_sdk.assembly import Ambient, Limitation, ParentSource, resolve_observed
+
+    ambient = Ambient(span_context=LOCAL, conversation=None, tracestate=None)
+
+    kept = resolve_observed(ambient)
+    assert kept.parent_span_id == LOCAL.span_id
+    assert kept.limitations == ()
+
+    refused = resolve_observed(ambient, parent_closed=True)
+    assert refused.parent_span_id is None
+    assert refused.trace_id != LOCAL.trace_id
+    assert refused.correlation.strategy is ParentSource.UNRESOLVED
+    assert refused.correlation.confidence == 0.0
+    assert Limitation.PARENT_UNRESOLVED in refused.limitations
+    assert Limitation.INSTRUMENTATION_DEGRADED not in refused.limitations
+
+
+def test_the_seam_asks_about_unit_liveness_when_it_latches_not_when_it_emits():
+    """The timing is the whole correctness argument, driven through the REAL
+    `_Http1Tracker`.
+
+    A request issued at t1 inside a live session whose unit closes at t2, before
+    the reply lands, is a perfectly good child of that session's shipped span —
+    the codebase already says so (`open()`'s `parent_closed` branch). An
+    emit-time read would refuse it and invent a spurious second trace for work
+    that genuinely happened inside the run: real data lost to escape a corpse
+    that was not in front of the request when it left.
+    """
+    import threading
+
+    from wardex_sdk.interceptors._trackers import _Http1Tracker
+
+    with _stranded_session() as (reg, dead):
+        after = _Http1Tracker()
+        after.on_request_bytes(b"GET /after HTTP/1.1\r\nHost: h\r\n\r\n")
+        (txn,) = after.on_response_bytes(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+
+        assert txn.parent == dead.context, "the raw carrier still hands back the corpse"
+        assert txn.parent_closed is True
+        assert (
+            should_capture(
+                CaptureMode.AGENT,
+                parent=txn.parent,
+                agent_semantic=False,
+                parent_closed=txn.parent_closed,
+            )
+            is False
+        )
+
+    # And the in-flight half: latched while LIVE, answered after the close.
+    from wardex_sdk._hub import reset_for_test
+    from wardex_sdk._types import AgentAttributes
+    from wardex_sdk.assembly import (
+        EMPTY_AMBIENT,
+        SpanIntent,
+        UnitKey,
+        UnitKind,
+        UnitRegistry,
+    )
+    from wardex_sdk.assembly._units import _ambient_unit
+
+    class _Sink:
+        def emit(self, draft: Any, *, agent_semantic: bool) -> bool:
+            return True
+
+    token = _ambient_unit.set(None)
+    try:
+        reg = UnitRegistry(sink=_Sink())
+        unit = reg.open(
+            UnitKind.SESSION,
+            UnitKey("test.session", "s2"),
+            ambient=EMPTY_AMBIENT,
+            intent=SpanIntent.INVOKE_AGENT,
+            subject="agent",
+        )
+        unit.draft.set_agent(AgentAttributes(name="agent", id="s2"))
+        cm = unit.activate()
+        cm.__enter__()
+        inflight = _Http1Tracker()
+        inflight.on_request_bytes(b"GET /inflight HTTP/1.1\r\nHost: h\r\n\r\n")
+        closer = threading.Thread(target=lambda: reg.close(unit))
+        closer.start()
+        closer.join()
+        (txn,) = inflight.on_response_bytes(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+
+        assert txn.parent == unit.context
+        assert txn.parent_closed is False, "issued while live — it keeps its parent"
+        assert (
+            should_capture(
+                CaptureMode.AGENT,
+                parent=txn.parent,
+                agent_semantic=False,
+                parent_closed=txn.parent_closed,
+            )
+            is True
+        )
+        del cm
+    finally:
+        _ambient_unit.reset(token)
+        reset_for_test()
+
+
+def test_mcp_stdio_does_not_parent_a_tool_call_into_a_finished_run():
+    """The route that cannot fall back on the gate: it claims
+    `agent_semantic=True` unconditionally, so the gate is open by construction
+    and the EDGE is the only thing left to get right. The span still ships — it
+    just stops being a silent child of a session that had already ended.
+    """
+    from wardex_sdk.assembly import Limitation, ParentSource
+
+    with _stranded_session() as (reg, dead):
+        state = _ProcState(mode=CaptureMode.AGENT)
+        state.feed_request(
+            b'{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"t"}}\n'
+        )
+        (pending,) = list(state._latch.values())
+        assert pending.ambient.span_context == dead.context
+        assert pending.parent_closed is True
+
+        spans = state.feed_response(b'{"jsonrpc":"2.0","id":1,"result":{"content":[]}}\n')
+
+    assert len(spans) == 1, "agent_semantic=True keeps the span; only its PARENT changes"
+    span = spans[0]
+    assert span.parent_span_id is None
+    assert span.context.trace_id != dead.context.trace_id
+    assert span.correlation.strategy is ParentSource.UNRESOLVED
+    assert Limitation.PARENT_UNRESOLVED in span.capture_integrity.limitations

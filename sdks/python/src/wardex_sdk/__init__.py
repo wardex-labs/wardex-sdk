@@ -49,11 +49,13 @@ from ._types import (
 )
 from ._version import __version__
 from .assembly import (
+    EMPTY_AMBIENT,
     Evidence,
     ParentSource,
     SnapshotDraft,
     guard,
     latch_ambient,
+    parent_is_closed_unit,
     resolve_parentage,
 )
 from .context._asgi import WardexMiddleware
@@ -240,6 +242,21 @@ def capture_state_snapshot(
     # must stay distinguishable downstream, and until this call went through the
     # core it was neither, because the snapshot was dropped where it stood.
     ambient = latch_ambient()
+    if parent_is_closed_unit(ambient.span_context):
+        # A parent whose unit has already CLOSED is refused here for the same
+        # reason the byte seams refuse it (design §10.3): its span has shipped,
+        # and a snapshot hung off it describes the state of a run that had
+        # already ended. Collapsing to `EMPTY_AMBIENT` takes the conversation
+        # and the tracestate down with it, because those came off the dead
+        # unit's fork too.
+        #
+        # This does NOT call `resolve_observed`, and the difference is the
+        # no-parent answer rather than an oversight: that function returns a
+        # TRACE ROOT when nothing was latched, and a snapshot's whole invariant
+        # below is that a missing parent is `unresolved` (I4). A refused corpse
+        # therefore lands on the SAME branch as "no parent at all", which is the
+        # answer this call site already documents.
+        ambient = EMPTY_AMBIENT
     parentage = resolve_parentage(
         ambient,
         Evidence(ParentSource.CONTEXTVAR)
