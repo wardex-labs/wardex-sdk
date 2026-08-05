@@ -196,7 +196,9 @@ _MEMBER_SITES: dict[str, frozenset[str]] = {
     # Both members existed here as declarations with no emitter for as long as
     # `close_all` had no production caller — the state this table is designed to
     # make visible rather than comfortable.
-    "ADAPTER_UNINSTALLED": frozenset({"adapters/_anthropic_agent_sdk.py"}),
+    "ADAPTER_UNINSTALLED": frozenset(
+        {"adapters/_anthropic_agent_sdk.py", "adapters/_langgraph.py"}
+    ),
     "UNIT_INTERRUPTED": frozenset({"_lifecycle.py"}),
     # Two sites, and they are the two halves of one fact: where wardex failed,
     # and where the consequence lands. `adapters/_context.py` knows it failed —
@@ -967,12 +969,14 @@ _UNRESOLVED_PY: frozenset[tuple[str, str]] = frozenset(
         # pipes rather than a hiding place.
         ("assembly/_units.py", "Name:marker"),
         ("assembly/_units.py", "Name:reason"),
-        # The two forwards that carry a shutdown marker down to the assembler:
-        # `AnthropicAgentSdkAdapter.close_units` and `close_units_all`. Both are
-        # one-line passes with no value of their own. The members they carry are
-        # spelled as literals at the two sites that DECIDE them — the adapter's
-        # `uninstall` and the signal handler — and both are in `_MEMBER_SITES`.
+        # The three forwards that carry a shutdown marker down to an adapter:
+        # `AnthropicAgentSdkAdapter.close_units`, `LangGraphAdapter.close_units`
+        # and `close_units_all`. All three are one-line passes with no value of
+        # their own. The members they carry are spelled as literals at the sites
+        # that DECIDE them — each adapter's `uninstall` and the signal handler —
+        # and every one of those is in `_MEMBER_SITES`.
         ("adapters/_anthropic_agent_sdk.py", "Name:marker"),
+        ("adapters/_langgraph.py", "Name:marker"),
         ("adapters/_registry.py", "Name:marker"),
         # The adapter contract's own two forwards. `Name:marker` is the `marker`
         # parameter of `Scope.note` / `RunHandle.note` / `Attachment.note` and

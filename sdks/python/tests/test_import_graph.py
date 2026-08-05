@@ -969,6 +969,15 @@ _CS4_BUDGET = {
     # is how the stdlib spells "the carrier here is the thread".
     "adapters/_anthropic_agent_sdk.py": 2,
     "adapters/_assembler.py": 2,
+    # Two, and the same justification as the adapter above: both are ABSENCES
+    # rather than failures. `_import_pregel` asks "is langgraph installed" and
+    # `_import_toolnode` asks "is langgraph-prebuilt installed" — a separately
+    # versioned distribution that can be missing on its own — and an ImportError
+    # is the ANSWER to each, returned as `None` and branched on by `install()`.
+    # Neither can be a module-level import: that would make the decline path
+    # dead, surfacing the error on `adapters/__init__.py`'s stderr line instead
+    # of declining silently.
+    "adapters/_langgraph.py": 2,
     "interceptors/_conn_timing.py": 10,
     # 13 -> 7. The six that went are the ones the patch mechanism made
     # unnecessary: two `except Exception: self._orig_* = None` around install,

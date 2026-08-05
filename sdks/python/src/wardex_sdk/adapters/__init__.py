@@ -16,6 +16,7 @@ if TYPE_CHECKING:
 # AdapterName -> distribution package to probe for auto-detection
 _DETECT_PACKAGES: dict[AdapterName, str] = {
     AdapterName.ANTHROPIC_AGENT_SDK: "claude_agent_sdk",
+    AdapterName.LANGGRAPH: "langgraph",
 }
 
 
@@ -31,6 +32,10 @@ def _make_adapter(name: AdapterName):
         from ._anthropic_agent_sdk import AnthropicAgentSdkAdapter
 
         return AnthropicAgentSdkAdapter()
+    if name is AdapterName.LANGGRAPH:
+        from ._langgraph import LangGraphAdapter
+
+        return LangGraphAdapter()
     return None
 
 

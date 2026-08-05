@@ -61,6 +61,7 @@ What lives here, and the duplication each module exists to remove:
 not here yet. `__all__` grows as modules land and does not shrink.
 """
 
+from .._types import ToolAttributes
 from ._builder import NULL_DRAFT, IntegrityBuilder, SpanDraft
 from ._diag import Counters, counters, guard, report_once
 from ._integrity import Limitation
@@ -122,6 +123,7 @@ __all__ = [
     "SpanDraft",
     "SpanIntent",
     "SpanSink",
+    "ToolAttributes",
     "TransportLabel",
     "Unit",
     "UnitKey",

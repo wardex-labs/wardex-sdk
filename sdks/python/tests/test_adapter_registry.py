@@ -4,7 +4,7 @@ from unittest import mock
 
 from wardex_sdk._enums import AdapterName, AgentType, StatusCode
 from wardex_sdk._types import AgentAttributes
-from wardex_sdk.adapters import install_configured_adapters
+from wardex_sdk.adapters import _DETECT_PACKAGES, install_configured_adapters
 from wardex_sdk.adapters._base import AdapterInterface
 from wardex_sdk.adapters._context import Placement
 from wardex_sdk.adapters._registry import get_registry
@@ -66,7 +66,11 @@ def test_auto_detection_installs_when_package_present():
     ):
         make.return_value = _FakeAdapter()
         install_configured_adapters(None, _config(None))
-        make.assert_called_once_with(AdapterName.ANTHROPIC_AGENT_SDK)
+        # EVERY registered row, in order — not a single named one. `_detect_package`
+        # is patched True for all of them here, so an assertion naming one adapter
+        # fails unconditionally on the next registration rather than only where
+        # that framework happens to be installed. This spelling never goes stale.
+        assert make.call_args_list == [mock.call(name) for name in _DETECT_PACKAGES]
     get_registry().uninstall_all()
 
 
