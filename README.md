@@ -55,9 +55,23 @@ wardex.close()  # optional — spans auto-flush every 5s, on buffer threshold, a
   — instead of vanishing along with its open tool calls
 - Framework adapter: Anthropic Agent SDK (`claude_agent_sdk`) — auto-detected,
   zero-instrumentation `invoke_agent`/`chat` spans with tool-call correlation
+- Framework adapter: **LangGraph** (`langgraph>=1.2`) — auto-detected, no
+  callbacks and no `LangChainTracer`. One `invoke_workflow` span per graph run,
+  one `execute_step` span per node (all retries of a node inside ONE span), one
+  `execute_tool` span per tool call dispatched by a `ToolNode`, and every LLM
+  and HTTP call underneath parented by in-process context propagation rather
+  than by a framework `run_id`. Covers `invoke`/`stream`/`ainvoke`/`astream`/
+  `batch`/`abatch`, the functional API (`@entrypoint`/`@task`), subgraphs, and
+  agents built with either `langgraph.prebuilt.create_react_agent` or
+  `langchain.agents.create_agent`. `interrupt()` and `Command(goto=…,
+  graph=PARENT)` are recorded as control flow, not as failures.
 
 **Not yet (see Roadmap)**
-- Framework adapters for LangGraph and OpenAI Agents SDK
+- A LangChain adapter for plain LCEL chains (`prompt | model | parser`) and
+  tools invoked outside a graph — those produce no structural spans today, and
+  a LangChain-built *agent* is covered by the LangGraph adapter above because
+  `create_agent` compiles to a `Pregel` graph
+- Framework adapter for the OpenAI Agents SDK
 - Node/TS and Java SDKs
 
 **Notes**
@@ -257,8 +271,8 @@ Raise `max_entries_per_unit` if you see any of these counters move.
 1. ~~PII masking (pre-send safety)~~ — shipped
 2. ~~Batching & lifecycle (background worker, at-exit/periodic flush, concurrency)~~ — shipped
 3. ~~Distributed propagation (W3C)~~ — shipped
-4. Framework adapters — ~~Anthropic Agent SDK~~ shipped; LangGraph and OpenAI
-   Agents SDK next
+4. Framework adapters — ~~Anthropic Agent SDK~~ shipped; ~~LangGraph~~ shipped;
+   LangChain (non-graph runnables) and OpenAI Agents SDK next
 5. Node/TS and Java SDKs
 
 > PII masking caveats: `before_send` sees pre-masking data (masking runs inside

@@ -5,6 +5,163 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- **A LangGraph adapter, auto-detected whenever `langgraph>=1.2` is importable.**
+  A graph run now exports a tree instead of a scatter: one `invoke_workflow`
+  span per run, one `execute_step` span per node, one `execute_tool` span per
+  tool call a `ToolNode` dispatches, and every LLM or HTTP call underneath
+  parented to the node or tool that made it. Before this, a graph whose nodes
+  called a model produced **one trace per outbound call and no run, node or
+  tool span at all** — each of those calls indistinguishable downstream from a
+  genuine top-level request; and under the default `capture_mode=AGENT` a graph
+  whose tools do pure Python was entirely invisible.
+
+  The tree comes from **in-process context propagation, not from a framework
+  identifier**. LangGraph copies the Python context when it submits a task, so
+  a unit kept ambient over the run entry reaches every node body, every tool
+  body and every request either of them issues. The adapter contains no call to
+  `rejoin`, `attach`, `pin`, `open_run`, `claim` or `claim_run` — there is no
+  place where a `run_id` can affect the shape of the tree, and a test asserts
+  that over the module's own source. Every edge measures `unit_active`/1.0 or
+  `contextvar`/1.0 with no integrity marker, on sync and async entries, thread
+  and task fan-out, `Send` fan-out, subgraphs, and concurrent runs.
+
+  Covered: `invoke`, `stream`, `ainvoke`, `astream`, `astream_events`,
+  `astream_log`, `batch`, `abatch`, the functional API (`@entrypoint`/`@task`),
+  subgraphs (which correctly earn both an outer `execute_step` and an inner
+  `invoke_workflow`), and agents built with either
+  `langgraph.prebuilt.create_react_agent` or `langchain.agents.create_agent`.
+  Node retries land in ONE span rather than one per attempt, and so do
+  `wrap_tool_call` retries.
+
+- **An adapter can declare which of its framework's exceptions are CONTROL
+  FLOW.** `AdapterInterface.CONTROL_FLOW` is a per-adapter classvar that
+  `AdapterContext._run` consults on every causal path at the moment it
+  classifies an exception. LangGraph implements human-in-the-loop by *raising*:
+  before this, every `interrupt()` shipped `status=ERROR
+  error_type=GraphInterrupt` on a run the host saw succeed — at every nesting
+  level, so one suspension inside a tool produced three false failures. Those
+  spans now read `UNSET` with no error type, and the host's exception is
+  re-raised as the same object. `GraphBubbleUp` covers interrupts, drains and
+  parent commands with one name. An ordinary node failure is unaffected and
+  still reads `ERROR`/`RuntimeError`.
+
+- **`Scope.record_failure(error_type)` — an adapter can report a failure the
+  host did not raise.** Deriving a span's status from the exception that left
+  the body is only half a rule, because a framework that converts a failure
+  into a *return value* makes the other half unreachable. LangGraph's default
+  `handle_tool_errors` does exactly that: the model calling a tool with
+  arguments that do not validate becomes a `ToolMessage(status="error")` and
+  never raises — the most common tool failure there is, and it shipped
+  `status=OK`. Those spans now read `ERROR`/`tool_error`, while the node and
+  the run above them stay `OK`, because the graph really did complete. The
+  declaration is deliberately weaker than an exception and is consulted only
+  when nothing was raised, so a tool that genuinely crashed keeps its own
+  `RuntimeError` and an `interrupt()` stays `UNSET` — an adapter cannot
+  relabel a crash or a pause.
+
+- `ToolAttributes` is re-exported from `wardex_sdk.assembly`, which is how an
+  adapter is allowed to name it.
+
+### Fixed
+- **A span context left behind by a unit that has already CLOSED is no longer
+  accepted as a parent.** Every refusal predicate used to gate on
+  `entry.pinned`, so only a leaked *pin* was refused — while an `activate()`
+  fork that `close()` could not take down (a run closed from a different
+  carrier, a generator finalized on a foreign thread, `close_units()`
+  mid-stream) survived as a **confident parent at 1.0 with no marker** into a
+  span that had already shipped. Measured: an entire later, unrelated graph run
+  became a child of a finished one, its own children parented perfectly
+  underneath, so the single wrong edge read like wardex's best evidence.
+
+  Those sites now refuse the corpse and say so: a nested site becomes
+  `unresolved`/0.0 with `PARENT_UNRESOLVED` + `CORRELATION_CONFLICT`, a run
+  entry gets its own trace carrying `CORRELATION_CONFLICT`, and under
+  `capture_mode=AGENT` the gate closes rather than opening on a dead parent.
+  Two counters name which happened —
+  `assembly._units.stale_activation_ambient` (a leftover activation was
+  refused, split from the pin's counter because they are two different bugs
+  with two different repairs) and `assembly._units.ambient_closed_at_issue` (an
+  observing seam latched an already-shipped span).
+
+  The liveness question is asked **when the work is issued**, not when the span
+  is emitted, and that is the correctness argument rather than an optimisation:
+  a request issued inside a live run whose unit closes before the reply arrives
+  is a perfectly good child of that run, and asking on the response side would
+  invent a spurious trace for every streaming call that outlives its run.
+
+  A clean run is unaffected — no new counter fires, no edge changes, and the
+  no-false-positive case is asserted over every counter in this area.
+
+  **The two hand-written entry points ask the same question.** `wardex.span()`
+  and `capture_state_snapshot()` latch a parent they did not open and cannot
+  vet, which is exactly what makes them observing sites — so a manual span
+  opened after a run's unit had closed used to become a full-confidence child
+  of an already-emitted span, in that span's trace. The byte seam beside it got
+  this right and the published API did not. Both now refuse the corpse and land
+  on `unresolved`, each through the route its own no-parent case already
+  documents. A LIVE parent is untouched, which is the ordinary case and is
+  asserted as its own control.
+
+- **A `describe` that fails at a RUN ENTRY no longer reports a run-sized loss
+  as "one span".** The branch carrying the escalated message was tested after a
+  flag meaning *"the unit was closed"* — which is true on exactly the path that
+  reaches it — so it was unreachable, and every run entry reported the same
+  single-span wording. Measured: at a `ROOT` site the description dies before
+  the intent's required block, `finish()` refuses the draft, and **zero spans
+  ship for the whole run**. In a production process `counters` is not exported
+  and `debug` is off, so that one stderr line is the entire difference between
+  "wardex deleted a run" and "wardex was never installed".
+
+  The message is also corrected rather than merely made reachable: it claimed
+  traffic inside the run would not be captured either, which was true before
+  `degraded_run()` and is not now — that work is still captured, it arrives
+  orphaned and marked instead of attached. An unreachable branch is an
+  unaudited one.
+
+### Changed
+- `wardex.init()` now imports `langgraph.pregel` eagerly for anyone who merely
+  has langgraph in the environment — **measured at 310-319 ms** plus 22-24 ms
+  for `langgraph.prebuilt.tool_node`, loading 121 `langgraph` and 79
+  `langchain_core` modules. That is materially heavier than any other adapter's
+  detection, and it is recorded here rather than left to be discovered as a
+  startup regression. Opt out with `Config.adapters`.
+
+### Known limitations
+- **Under `intercept=False` a LangGraph tree has no LLM leaves.** Run, node and
+  tool spans are correct and every `chat` span is absent, because this adapter's
+  seams see a node task and never a model call — the LLM spans come from the
+  byte seam. Nothing in this release restores them.
+- A tool called directly from a hand-written node body produces no tool span:
+  the seam observes tool calls the *framework dispatched*, not every LangChain
+  tool that ran in the process.
+- A bare `threading.Thread` started inside a node or tool body loses the
+  context, and with it the parent. This is below the adapter and permanent.
+- `RemoteGraph` (LangGraph Platform) implements `PregelProtocol` without
+  subclassing `Pregel`, so it is silently uninstrumented.
+- A cache hit produces no node span — the seam is never entered, which is
+  honest, but a run's tree can legitimately omit nodes.
+- `interrupt_before` produces a run span with zero node spans, and nothing on
+  the wire distinguishes "paused before its first node" from "ran nothing".
+- Breaking early out of `app.stream(...)` reports the run as
+  `ERROR`/`GeneratorExit`; abandoning `astream_events` reports
+  `CancelledError` on the node span too. This is deliberate rather than
+  overlooked — an abandoned run genuinely did not complete, and suppressing it
+  would make it indistinguishable from a finished one — but it is not a
+  *typed* outcome yet.
+- **A node's retry attempts are collapsed into one span, and the attempt count
+  is not recoverable from it.** This is the right trade — a node that failed
+  twice and then succeeded is one node that worked, and the callback-based
+  products render it as three sibling runs with two false errors — but the
+  count is genuinely lost, because the retry loop lives inside the seam and
+  reaching it would mean substituting an object the framework owns.
+- An `interrupt()` inside a subgraph is seen at two levels (the inner node and
+  the subgraph-as-node task), so one pause produces two `UNSET` spans rather
+  than one.
+- A graph the user did not name is called `LangGraph`, which is LangGraph's own
+  default — so a parent and its subgraph can both ship `invoke_workflow
+  LangGraph`. Name your graphs if you nest them.
+
 ## [0.3.0b2] - 2026-08-05
 
 ### Changed
