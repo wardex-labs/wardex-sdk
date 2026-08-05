@@ -425,6 +425,7 @@ class AdapterContext:
     __slots__ = (
         "_anon_ns",
         "_anon_seq",
+        "_control_flow",
         "_slots",
         "_tripped",
         "_units",
@@ -441,6 +442,7 @@ class AdapterContext:
         units: UnitRegistry,
         limits: Mapping[str, int],
         debug: bool = False,
+        control_flow: Callable[[], tuple[type[BaseException], ...]] | None = None,
     ) -> None:
         self.name = name
         self.patches = PatchSet(f"adapters.{name}", debug=debug)
@@ -459,6 +461,13 @@ class AdapterContext:
         self._anon_ns = f"adapters.{name}"
         self._anon_seq = count()
         self._slots: MutableMapping[Any, dict[str, Any]] = weakref.WeakKeyDictionary()
+        # A READER, not a tuple. `AdapterRegistry.install` builds this context
+        # BEFORE it calls `adapter.install()`, and an adapter can only import its
+        # framework's error classes in there — so a tuple taken here is `()` for
+        # the life of the process. `_registry.context_for` is the only caller with
+        # an adapter to bind, and it binds a reader over the CLASS attribute;
+        # nothing here can hold a snapshot.
+        self._control_flow = control_flow
 
     @property
     def tripped(self) -> bool:
@@ -506,6 +515,29 @@ class AdapterContext:
             self.count("link_target_unresolved")
             return
         unit.draft.add_link(found.context, reason)
+
+    def _is_control_flow(self, exc: BaseException) -> bool:
+        """Is this the host's control flow rather than the host's failure?
+
+        Read HERE, one statement before `_run` re-raises, and not latched at
+        construction: the registry builds the context before the adapter runs,
+        so the only value a constructor could copy is the empty default.
+
+        GUARDED, and the `isinstance` is inside the guard WITH the read. This
+        runs inside `except BaseException`, so an adapter that declared
+        something which is not a class of exceptions would otherwise have
+        wardex's own `TypeError` replace the host's exception — the one thing
+        this module forbids. A trip leaves `matched` False, i.e. today's
+        `ERROR`/type-name: a wardex failure may only ever LOWER what wardex
+        claims, and must never turn a failure into a success.
+        """
+        reader = self._control_flow
+        if reader is None:
+            return False
+        matched = False
+        with self.guard("control_flow_read"):
+            matched = isinstance(exc, reader())
+        return matched
 
     def confirm_active(self, site: str) -> None:
         """Report that a declared patch site actually fired.
@@ -707,7 +739,15 @@ class AdapterContext:
         try:
             yield scope
         except BaseException as exc:
-            status, error_type = StatusCode.ERROR, type(exc).__name__
+            # A framework that implements pausing, handing off or draining by
+            # RAISING is not failing, and a span that says otherwise reports
+            # every human-in-the-loop pause as a crashed run. The adapter names
+            # those classes once, as a classvar; this is the one place that
+            # reads it, so no causal path can be the one nobody remembered.
+            if self._is_control_flow(exc):
+                status, error_type = StatusCode.UNSET, None
+            else:
+                status, error_type = StatusCode.ERROR, type(exc).__name__
             raise
         finally:
             if activation is not None:

@@ -19,6 +19,20 @@ class AdapterInterface(ABC):
     semantic spans; they must never alter the host application's behavior.
     """
 
+    #: Exceptions this framework uses as CONTROL FLOW rather than as failure.
+    #: A CLASSVAR, uniformly referenced: `_run` reads it through the context on
+    #: EVERY causal path rather than at each call site, which is the mistake the
+    #: design names — a per-path reference leaves the paths nobody remembered,
+    #: and it is why Sentry still marks a `GraphBubbleUp` that escaped
+    #: `Pregel.invoke` as an error.
+    #:
+    #: Declared here with an empty default so every adapter has one and the read
+    #: needs no `getattr` fallback. An adapter whose framework's error classes
+    #: can only be imported inside `install()` assigns
+    #: `type(self).CONTROL_FLOW = (...)` there — the read happens later, when an
+    #: exception is being classified, so install-time population suffices.
+    CONTROL_FLOW: tuple[type[BaseException], ...] = ()
+
     @abstractmethod
     def name(self) -> str: ...
 
