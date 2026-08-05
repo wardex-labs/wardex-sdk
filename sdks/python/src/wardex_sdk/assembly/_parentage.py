@@ -315,7 +315,9 @@ _degraded_run: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "wardex_degraded_run", default=False
 )
 
-#: What an edge is worth when the span above it was one wardex could not open.
+#: What an edge is worth when the span above it is one wardex cannot stand
+#: behind: one it FAILED to open, or one it opened and then CLOSED while an
+#: activation fork went on handing the finished span out (design §10.3).
 #: `UNRESOLVED`, so `_MARKER` attaches `PARENT_UNRESOLVED` on its own — a parent
 #: was expected here, and the expectation is exactly what makes this not a
 #: trace root.
@@ -360,8 +362,8 @@ def in_degraded_run() -> bool:
     return _degraded_run.get()
 
 
-def resolve_observed(ambient: Ambient) -> Parentage:
-    """`resolve_parentage` for an OBSERVED byte seam, which has one extra case.
+def resolve_observed(ambient: Ambient, *, parent_closed: bool = False) -> Parentage:
+    """`resolve_parentage` for an OBSERVED byte seam, which has two extra cases.
 
     A seam latches whatever the host's carrier held. With nothing there the edge
     is an honest TRACE ROOT: the host issued this request outside any agent
@@ -377,7 +379,29 @@ def resolve_observed(ambient: Ambient) -> Parentage:
     trace root the span is indistinguishable from a legitimate one and quietly
     inflates the trace count; shipped like this it is one row a consumer can
     filter, count, and file a bug about.
+
+    `parent_closed` is the second case and the same argument one step earlier:
+    the seam DID latch a local parent, and that parent's unit had ALREADY closed
+    — an activation fork the adapter could not take down (design §10.3). This
+    module cannot see a unit and must not learn to (`_units` imports this one),
+    so the caller latches the fact where it latches the parent
+    (`assembly._units.parent_is_closed_unit`) and declares it here, which is the
+    shape `degraded` already has.
+
+    Refused to `EMPTY_AMBIENT`, exactly as `UnitRegistry.open()` and
+    `UnitRegistry.resolve()` refuse the same carrier: the conversation and the
+    tracestate came off the dead unit's fork too, and keeping either would stamp
+    a finished run's identity on unrelated later work — the same adoption in a
+    different field. The edge is `UNRESOLVED` and NOT `TRACE_ROOT`, because a
+    parent was expected here — one was latched — so `PARENT_UNRESOLVED` is the
+    literal truth and `_MARKER` attaches it without this function naming a
+    marker it is not on the census for. It is not `INSTRUMENTATION_DEGRADED`
+    either: nothing failed to open. What it must NOT do is keep the parent — an
+    already-shipped span adopting later, unrelated traffic at confidence 1.0
+    with no marker is the one shape no consumer can detect downstream.
     """
+    if parent_closed:
+        return resolve_parentage(EMPTY_AMBIENT, _ORPHANED_BY_WARDEX)
     if ambient.span_context is None and in_degraded_run():
         return resolve_parentage(ambient, _ORPHANED_BY_WARDEX).with_limitation(
             Limitation.INSTRUMENTATION_DEGRADED

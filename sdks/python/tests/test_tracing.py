@@ -133,18 +133,23 @@ def test_a_bug_opening_a_manual_span_emits_nothing_and_says_why(capsys):
 
     t = _setup()
     reset_reports_for_test()
-    real = tracing.resolve_parentage
+    # `resolve_observed`, because that is what the open path calls: a manual
+    # span OBSERVES a parent it did not open, so it asks the same question the
+    # byte seams ask — including whether that parent's unit has already closed
+    # (design §10.3). Injecting into the symbol the path no longer calls would
+    # leave this test green while proving nothing.
+    real = tracing.resolve_observed
 
     def blow(*a, **k):
         raise RuntimeError("broken")
 
-    tracing.resolve_parentage = blow
+    tracing.resolve_observed = blow
     capsys.readouterr()
     try:
         with span("llm-call") as s:
             s.set_status(StatusCode.OK)
     finally:
-        tracing.resolve_parentage = real
+        tracing.resolve_observed = real
 
     err = capsys.readouterr().err
     _hub.get_client().flush()

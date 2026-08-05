@@ -81,7 +81,15 @@ from ._parentage import (
 from ._patchset import PatchSet
 from ._policy import Prefilter, capture_mode_of, should_capture
 from ._snapshot import SnapshotDraft
-from ._units import PinToken, SpanSink, Unit, UnitKey, UnitKind, UnitRegistry
+from ._units import (
+    PinToken,
+    SpanSink,
+    Unit,
+    UnitKey,
+    UnitKind,
+    UnitRegistry,
+    parent_is_closed_unit,
+)
 from ._vocab import (
     Block,
     LinkReason,
@@ -128,6 +136,7 @@ __all__ = [
     "in_degraded_run",
     "is_declared_extra_key",
     "latch_ambient",
+    "parent_is_closed_unit",
     "report_once",
     "resolve_observed",
     "resolve_parentage",

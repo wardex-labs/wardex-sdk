@@ -44,6 +44,7 @@ from wardex_sdk.assembly import (
     UnitRegistry,
     counters,
     latch_ambient,
+    parent_is_closed_unit,
 )
 from wardex_sdk.assembly._units import _ambient_unit
 from wardex_sdk.context import activate_span
@@ -1618,3 +1619,404 @@ def test_the_unlink_phase_does_not_depend_on_any_draft():
     assert len(reg._by_alias) == 0
     assert counters.get("assembly._units.close_finalize") == 15
     assert counters.get("assembly._units.close_all_note") == 3
+
+
+# ==========================================================================
+# design §10.3(a) — a CLOSED unit's leftover carrier, PINNED OR NOT
+# ==========================================================================
+
+
+def _stranded(reg: UnitRegistry, unit):
+    """A unit closed from ANOTHER carrier while its `activate()` is still entered.
+
+    The LangGraph shape without LangGraph. `Pregel.stream` installs the fork on
+    the carrier that pumps the first `next()`; the fork can only come down when
+    the generator is FINALIZED, on whatever carrier finalizes it. A
+    `close_units()` mid-stream, or a finalization on a foreign thread, closes
+    the unit from a task that cannot reset that Token — so the fork is left
+    standing, holding the context of a span that has already SHIPPED.
+
+    The activation CM is RETURNED and the caller must keep it alive.
+    `activate_span` is generator-backed, so dropping the last reference runs its
+    `finally` and takes the fork down — which is the clean case, not this one.
+    In production the reference is the suspended generator the framework holds.
+    """
+    cm = unit.activate()
+    cm.__enter__()
+    closer = threading.Thread(target=lambda: reg.close(unit))
+    closer.start()
+    closer.join()
+    return cm
+
+
+def test_a_closed_activations_fork_is_refused_exactly_like_a_dead_pins():
+    """`pinned` was never what made the leftover dangerous.
+
+    A pin and an `activate()` install the SAME two carriers through the same
+    `_Carrier.__init__`, branching only on which of them `close()` can normally
+    take down — and the failure is the case where NEITHER was taken down.
+    Gating every refusal on `entry.pinned` therefore passed one of two identical
+    corpses straight through: `contextvar` / 1.0 / no marker into a span that
+    had already been emitted, which is one trace where two belong and nothing on
+    the wire to find it by.
+    """
+    reg = registry()
+    unit = open_session(reg)
+    _fork = _stranded(reg, unit)
+
+    assert not unit.is_live
+    assert latch_ambient().span_context == unit.context, "the standing fork is the precondition"
+
+    assert reg.stale_pin_in_scope() is True
+    assert reg.becomes_trace_root(latch_ambient()) is True
+
+    p = reg.resolve(None)
+
+    assert p.parent_span_id is None
+    assert p.correlation.strategy is not ParentSource.CONTEXTVAR
+    assert p.correlation.confidence < 1.0
+    assert Limitation.CORRELATION_CONFLICT in p.limitations
+
+
+def test_a_stranded_activation_and_a_stranded_pin_are_counted_apart():
+    """Two bugs, two repairs, so two names — the same split `current()` already
+    makes between `pin_stale`/`pin_leaked` and `ambient_stale`.
+
+    `stale_pin_ambient` says `pin_driver`'s contract was broken and the fix is
+    in WHICH TASK the adapter pinned. `stale_activation_ambient` says a scope
+    could not be unwound where it was installed and the fix is in the adapter's
+    LIFETIME. One number for both leaves an operator two hypotheses and no way
+    to separate them.
+    """
+    reg = registry()
+    unit = open_session(reg)
+    _fork = _stranded(reg, unit)
+
+    reg.resolve(None)
+
+    assert counters.get("assembly._units.stale_activation_ambient") == 1
+    assert counters.get("assembly._units.stale_pin_ambient") == 0
+
+
+def test_a_unit_opened_over_a_dead_activation_is_a_root_that_says_so():
+    """The measured failure as a tree: an ENTIRE later run adopted by a
+    finished one. A run that starts after the previous one died is a NEW run,
+    not a subtree of the corpse the carrier is still holding.
+    """
+    reg = registry()
+    dead = open_session(reg, "dead")
+    _fork = _stranded(reg, dead)
+
+    later = open_session(reg, "next", ambient=latch_ambient())
+
+    assert later.parentage.parent_span_id is None
+    assert later.context.trace_id != dead.context.trace_id
+    assert Limitation.CORRELATION_CONFLICT in later.draft.integrity.markers
+
+
+def test_a_real_span_over_a_dead_activation_is_still_a_parent():
+    """The no-false-positive rule, restated for the branch the widening added.
+
+    The refusal is the leftover FORK, not the task. A host that opened its own
+    span inside that task put a real parent on top, and moving live work out of
+    the host's trace to escape a ghost that is no longer in front of us is a
+    wrong tree of its own shape. `_poisoned` stayed an IDENTITY test through
+    the widening, and this is why.
+    """
+    reg = registry()
+    unit = open_session(reg)
+    _fork = _stranded(reg, unit)
+    host = _a_context()
+
+    with activate_span(host):
+        p = reg.resolve(None)
+        assert reg.becomes_trace_root(latch_ambient()) is False
+
+    assert p.parent_span_id == host.span_id
+    assert p.correlation.strategy is ParentSource.CONTEXTVAR
+    assert Limitation.CORRELATION_CONFLICT not in p.limitations
+    assert counters.get("assembly._units.stale_activation_ambient") == 0
+    assert counters.get("assembly._units.stale_pin_ambient") == 0
+
+
+def test_a_clean_activation_leaves_nothing_to_refuse():
+    """THE constraint: the ordinary sequential shape must produce ZERO signals.
+
+    Opened, activated, exited, closed on ONE carrier — the fork comes down with
+    the `with`. A widening that refused on "this task once descended from a unit
+    that is now dead" would fire here, on the shape that is the product working
+    correctly, and a fix that marks healthy runs is worse than the bug.
+    """
+    reg = registry()
+    first = open_session(reg)
+    with first.activate():
+        pass
+    reg.close(first)
+
+    assert latch_ambient().span_context is None
+    assert reg.stale_pin_in_scope() is False
+
+    later = open_session(reg, "next", ambient=latch_ambient())
+
+    assert later.parentage.parent_span_id is None
+    assert later.parentage.limitations == ()
+    for name in (
+        "stale_pin_ambient",
+        "stale_activation_ambient",
+        "stale_pin_foreign_registry",
+        "ambient_stale",
+        "ambient_closed_at_issue",
+        "pin_stale",
+        "pin_leaked",
+    ):
+        assert counters.get(f"assembly._units.{name}") == 0, name
+
+
+def test_a_live_activation_from_another_registry_is_neither_refused_nor_counted():
+    """Two adapters in one process is the ORDINARY state, not an incident.
+
+    `_ambient_unit` is process-wide, so registry B sees registry A's perfectly
+    healthy `activate()` on every `open()`. Nothing may be refused — and the
+    foreign bump stays gated on `entry.pinned` precisely so that
+    `stale_pin_foreign_registry`, which audits PIN DISCIPLINE, does not start
+    firing once per open in a two-adapter process and bury the signal it exists
+    to carry.
+    """
+    reg_a = registry()
+    reg_b = registry()
+    live = open_session(reg_a, "theirs", owner="langgraph")
+
+    with live.activate():
+        assert reg_b.stale_pin_in_scope() is False
+        assert reg_b.becomes_trace_root(latch_ambient()) is False
+        mine = open_session(reg_b, "mine", ambient=latch_ambient(), owner="anthropic")
+
+    assert Limitation.CORRELATION_CONFLICT not in mine.draft.integrity.markers
+    assert counters.get("assembly._units.stale_pin_foreign_registry") == 0
+
+
+def test_another_registrys_dead_activation_is_not_this_registrys_conflict():
+    """Ownership still comes FIRST, for the non-pinned leftover too.
+
+    The twin of `test_another_registrys_dead_pin_is_not_this_registrys_conflict`
+    for the shape the widening added. The ambient carrier is process-wide and a
+    unit is not, so charging THIS registry's spans with a `CORRELATION_CONFLICT`
+    for a corpse it never installed reports a conflict nobody can act on — while
+    the scope in front of us is somebody else's problem.
+    """
+    old = registry()
+    dead = open_session(old, "old")
+    _fork = _stranded(old, dead)
+
+    fresh = registry()
+
+    assert fresh.stale_pin_in_scope() is False
+    assert fresh.becomes_trace_root(latch_ambient()) is False
+
+    unit = open_session(fresh, "new", ambient=latch_ambient())
+    assert Limitation.CORRELATION_CONFLICT not in unit.draft.integrity.markers
+
+
+def test_an_eviction_that_strands_its_own_activation_orphans_what_follows():
+    """A DELIBERATE consequence of the widening, pinned so it cannot go silent.
+
+    A root evicted by table pressure while its `activate()` is still entered is
+    closed and its span IS emitted (with `UNIT_EVICTED`) — so before §10.3 a
+    unit opened underneath was a correct child of a real span. It is now a
+    marked orphan instead.
+
+    The widening cannot distinguish the two: "the unit whose fork is in front of
+    me is over" is the whole predicate, and eviction is one of the ways a unit
+    gets over. Refusing is also the answer §10.3 asks for in the same words
+    ("an ambient span context whose unit THIS registry has CLOSED"), and the
+    evicted unit was ALREADY refused here when it happened to be pinned. The
+    cost is one `CORRELATION_CONFLICT` on a shape that is itself a bound being
+    exceeded; the alternative is a third liveness state read by one branch.
+    """
+    reg = registry(max_units=1)
+    evicted = open_session(reg, "A")
+    fork = evicted.activate()
+    fork.__enter__()
+    open_session(reg, "B")  # evicts A: closed, span emitted with UNIT_EVICTED
+
+    assert evicted.is_live is False
+    assert latch_ambient().span_context == evicted.context
+
+    after = open_session(reg, "C", ambient=latch_ambient())
+
+    assert after.parentage.parent_span_id != evicted.context.span_id
+    assert Limitation.CORRELATION_CONFLICT in after.draft.integrity.markers
+
+
+# ==========================================================================
+# design §10.3(b) — the same fact, for callers that hold no registry
+# ==========================================================================
+
+
+def test_a_closed_units_span_is_nameable_without_a_registry():
+    """`parent_is_closed_unit` is what the byte seams and MCP stdio can ask.
+
+    They hold a `Client` and nothing else, and `interceptors/` may not import
+    `adapters/`, where the registries are built. It takes no registry on
+    purpose: "the span I latched has already shipped" does not depend on who
+    opened the unit, and a seam charges no `CORRELATION_CONFLICT` to anyone —
+    the ownership guard exists to stop one registry blaming another's teardown,
+    which is a registry-path concern and stays on the registry path.
+    """
+    reg = registry()
+    unit = open_session(reg)
+    cm = unit.activate()
+    cm.__enter__()
+    try:
+        assert parent_is_closed_unit(unit.context) is False, "a LIVE unit is never refused"
+        assert counters.get("assembly._units.ambient_closed_at_issue") == 0
+
+        closer = threading.Thread(target=lambda: reg.close(unit))
+        closer.start()
+        closer.join()
+
+        assert parent_is_closed_unit(unit.context) is True
+        assert counters.get("assembly._units.ambient_closed_at_issue") == 1
+    finally:
+        del cm
+
+
+def test_a_real_span_over_a_dead_activation_is_not_a_closed_unit_either():
+    """The identity narrowing, for the registry-free predicate.
+
+    Same rule as `_poisoned`: a host span or a nested activation standing on top
+    of the leftover is a real parent, and a seam that refused it would move live
+    traffic out of the host's trace. And `None` claims nothing — a request
+    issued with no ambient at all is an honest trace root, not a corpse.
+    """
+    reg = registry()
+    unit = open_session(reg)
+    _fork = _stranded(reg, unit)
+    host = _a_context()
+
+    assert parent_is_closed_unit(host) is False
+    assert parent_is_closed_unit(None) is False
+    assert counters.get("assembly._units.ambient_closed_at_issue") == 0
+
+
+# --------------------------------------------------------------------------
+# design §10.3(b) — the two HAND-WRITTEN sites, not just the byte seams
+# --------------------------------------------------------------------------
+
+
+def test_a_manual_span_does_not_become_a_child_of_a_span_that_already_shipped():
+    """`wardex.span()` is issued on the same carriers an adapter runs on.
+
+    It latches a parent it did not open and cannot vet, which is the whole
+    definition of an OBSERVING site — so it asks the same question the byte
+    seams ask. Before it did, a hand-written span opened after a graph run's
+    unit had closed became a full-confidence child of an already-emitted span,
+    in that span's own trace, with nothing on the wire to say so. The byte seam
+    beside it got this right and the published API did not, which is the
+    inconsistency this closes.
+    """
+    from wardex_sdk import _hub, span
+
+    reg = registry()
+    unit = open_session(reg)
+    _fork = _stranded(reg, unit)
+    client = _RecordingClient()
+    _hub.set_client(client)
+    try:
+        with span("after-the-run"):
+            pass
+    finally:
+        _hub.reset_for_test()
+
+    emitted = [s for s in client.spans if s.name == "after-the-run"]
+    assert len(emitted) == 1, "the span must still SHIP — refusing a parent is not dropping work"
+    manual = emitted[0]
+    assert manual.parent_span_id != unit.context.span_id
+    assert manual.parent_span_id is None
+    assert manual.context.trace_id != unit.context.trace_id
+    assert manual.correlation.strategy is ParentSource.UNRESOLVED
+    assert manual.correlation.confidence == 0.0
+    assert counters.snapshot().get("assembly._units.ambient_closed_at_issue") == 1
+
+
+def test_a_state_snapshot_does_not_describe_the_state_of_a_run_that_ended():
+    """The same refusal, and the same `unresolved` — reached by its own route.
+
+    A snapshot's no-parent answer is ALREADY `unresolved` rather than a trace
+    root, because a snapshot describes the state of a span and one without a
+    span to describe has lost something. So a corpse collapses onto that branch
+    instead of through `resolve_observed`, whose no-parent answer is a root.
+    Same decision function, same outcome, one place each states its own
+    consequence.
+    """
+    from wardex_sdk import _hub, capture_state_snapshot
+
+    reg = registry()
+    unit = open_session(reg)
+    _fork = _stranded(reg, unit)
+    client = _RecordingClient()
+    _hub.set_client(client)
+    try:
+        capture_state_snapshot(snapshot_type="turn_start", conversation_state=b"{}")
+    finally:
+        _hub.reset_for_test()
+
+    assert len(client.snapshots) == 1
+    snap = client.snapshots[0]
+    # A snapshot carries the span it DESCRIBES, so "refused" means it no longer
+    # names the dead unit's span or sits in its trace.
+    assert snap.span_id != unit.context.span_id
+    assert snap.trace_id != unit.context.trace_id
+
+
+def test_a_LIVE_parent_is_still_the_parent_of_both_hand_written_sites():
+    """The control, and the one that would catch an over-eager refusal.
+
+    Neither site may refuse a unit that is simply still running — that is the
+    ordinary case and the whole product. Without this, a predicate that always
+    said "closed" would pass every assertion above.
+    """
+    from wardex_sdk import _hub, span
+
+    reg = registry()
+    unit = open_session(reg)
+    client = _RecordingClient()
+    _hub.set_client(client)
+    try:
+        with unit.activate():
+            with span("inside-the-run"):
+                pass
+    finally:
+        _hub.reset_for_test()
+
+    manual = [s for s in client.spans if s.name == "inside-the-run"][0]
+    assert manual.parent_span_id == unit.context.span_id
+    assert manual.context.trace_id == unit.context.trace_id
+    assert manual.correlation.confidence == 1.0
+    assert "ambient_closed_at_issue" not in str(counters.snapshot())
+
+
+class _Config:
+    debug = False
+
+
+class _RecordingClient:
+    """Enough client for the two published entry points above."""
+
+    config = _Config()
+
+    def __init__(self) -> None:
+        self.spans: list = []
+        self.snapshots: list = []
+
+    def capture_span(self, span) -> None:
+        self.spans.append(span)
+
+    def capture_snapshot(self, snapshot) -> None:
+        self.snapshots.append(snapshot)
+
+    def flush(self) -> None:
+        return None
+
+    def close(self) -> None:
+        return None

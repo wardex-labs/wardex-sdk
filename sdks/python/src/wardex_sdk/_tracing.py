@@ -26,7 +26,9 @@ from .assembly import (
     degraded_run,
     guard,
     latch_ambient,
+    parent_is_closed_unit,
     report_once,
+    resolve_observed,
     resolve_parentage,
 )
 from .context._contextvar import fork_active_span
@@ -251,7 +253,22 @@ def _begin(
         # trace. Manual spans and adapter spans agree on all three because they
         # ask the same function — and they also build the same object through
         # the same constructor (I5).
-        parentage = resolve_parentage(latch_ambient())
+        #
+        # `resolve_observed`, not `resolve_parentage`, and the reason is that
+        # this site OBSERVES a parent it did not open and cannot vet. Two things
+        # it cannot vet, both of which used to arrive here as a confident 1.0
+        # edge: a parent whose unit has already CLOSED — an activation fork the
+        # adapter could not take down, so a `wardex.span()` after the run ended
+        # became a child of an already-shipped span (design §10.3) — and a run
+        # wardex itself failed to open, where the missing parent is wardex's
+        # doing rather than the host's. The byte seams have asked this question
+        # since §10.3; a hand-written span is issued on the same carriers and
+        # inherits the same hazard, so it asks it too rather than having a
+        # second answer.
+        ambient = latch_ambient()
+        parentage = resolve_observed(
+            ambient, parent_closed=parent_is_closed_unit(ambient.span_context)
+        )
         draft = SpanDraft.manual(
             parentage,
             name=name,

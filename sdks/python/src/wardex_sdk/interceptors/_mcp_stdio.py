@@ -40,6 +40,7 @@ from ..assembly import (
     counters,
     guard,
     latch_ambient,
+    parent_is_closed_unit,
     report_once,
     resolve_observed,
     should_capture,
@@ -83,6 +84,10 @@ class _Pending:
     params: bytes
     start_ns: int
     ambient: Ambient
+    #: Was `ambient.span_context` latched off a unit that had ALREADY closed?
+    #: Latched with the ambient, on the task that issued the request; the
+    #: subprocess reader that answers the response cannot re-ask it.
+    parent_closed: bool = False
 
 
 class _ProcState:
@@ -135,11 +140,13 @@ class _ProcState:
                 # Latched on the stdin-write path — the task that ISSUED the
                 # request. The response arrives on the subprocess reader, whose
                 # scope says nothing about who asked (design §4.1).
+                ambient = latch_ambient()
                 self._latch[m.id] = _Pending(
                     method=m.method or "?",
                     params=m.params or b"",
                     start_ns=time.time_ns(),
-                    ambient=latch_ambient(),
+                    ambient=ambient,
+                    parent_closed=parent_is_closed_unit(ambient.span_context),
                 )
             if len(self._latch) > 4096:  # leak-defense cap
                 self._latch.pop(next(iter(self._latch)))
@@ -163,6 +170,11 @@ class _ProcState:
                 self._mode,
                 parent=pending.ambient.span_context,
                 agent_semantic=True,
+                # Inert while `agent_semantic=True` answers first, and passed
+                # anyway so the site's inputs stay the predicate's inputs: the
+                # day a mode reaches this gate by another clause, the fact is
+                # already here rather than one edit behind.
+                parent_closed=pending.parent_closed,
             ):
                 continue
             span = None
@@ -184,7 +196,7 @@ def _build_mcp_span(p: _Pending, resp: Any) -> InternalSpan:
     # issued inside a run wardex failed to open reaches this line with an
     # empty ambient — and shipping it as a trace root would be one run
     # arriving as several, indistinguishable from genuine ones.
-    parentage = resolve_observed(p.ambient)
+    parentage = resolve_observed(p.ambient, parent_closed=p.parent_closed)
     params_bytes = p.params
     result_bytes = resp.result if resp.result is not None else (resp.error or b"")
     input_data = params_bytes

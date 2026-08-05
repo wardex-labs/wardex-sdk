@@ -262,6 +262,12 @@ class ByteSeamInterceptor(InterceptorInterface):
                 # at the top of — the one case where the absent parent is
                 # wardex's own doing rather than evidence about the traffic.
                 degraded=in_degraded_run(),
+                # "the local span this was latched off had ALREADY closed".
+                # Read off the TRANSACTION, not off the carrier: the tracker
+                # asked at request time on the task that issued the bytes, and
+                # this method runs on the response side, where the answer would
+                # be about a different instant (see `_latched`).
+                parent_closed=getattr(txn, "parent_closed", False),
             )
         except Exception:
             return True  # losing data is worse than noise (design §5.1)
@@ -336,6 +342,7 @@ class ByteSeamInterceptor(InterceptorInterface):
                     path=txn.ws_upgrade_path or "/",
                     deflate=txn.ws_deflate,
                     parent=txn.parent,
+                    parent_closed=txn.parent_closed,
                     start_ns=txn.start_ns,
                     limits=self._native_limits,
                     sample_cap=self._limits["ws_sample_bytes"],
@@ -409,7 +416,7 @@ class ByteSeamInterceptor(InterceptorInterface):
         if not self._should_capture(st, txn, sem):
             return None
 
-        p = resolve_observed(_latched(txn))
+        p = resolve_observed(_latched(txn), parent_closed=txn.parent_closed)
         url = f"{self._url_scheme(False)}://{url_host}:{st.server_port}{txn.path}"
         transfer = max(0.0, (txn.end_ns - txn.start_ns) / 1e6 - txn.ttfb_ms)
 
@@ -579,7 +586,7 @@ class ByteSeamInterceptor(InterceptorInterface):
         # under ALL, an allowlisted host, or a live local span.
         if not self._should_capture(st, txn, None):
             return None
-        p = resolve_observed(_latched(txn))
+        p = resolve_observed(_latched(txn), parent_closed=txn.parent_closed)
 
         code = txn.ws_close_code
         # Status based on close code: 1000/1001/none = OK, otherwise = ERROR
@@ -647,6 +654,11 @@ def _latched(txn: _Txn) -> Ambient:
     already moved on — so neither may call `latch_ambient()` itself. The tracker
     did the latching at request time (`_trackers.py`, `self._parent`), and this
     wraps what it captured in the shape `resolve_parentage` consumes.
+
+    `parent_closed` travels BESIDE this rather than inside the `Ambient`, for
+    the same reason: it is a fact about the latch INSTANT, and an `Ambient` is
+    the shape `resolve_parentage` consumes, not a place to keep one seam's
+    bookkeeping. `_build_span` and `_build_ws_span` pass it explicitly.
 
     `conversation` and `tracestate` are None because the tracker latches neither
     today; that is exactly the pre-existing behaviour (the seam never set

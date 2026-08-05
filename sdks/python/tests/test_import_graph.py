@@ -291,6 +291,21 @@ def _constructs_ambient(rel: str, tree: ast.Module):
     return predicate
 
 
+def _resolves_observed_without_asking(rel: str, tree: ast.Module):
+    """A `resolve_observed(...)` call that does NOT declare `parent_closed`."""
+    bound = _local_names(tree, "resolve_observed")
+    modules = _module_aliases(rel, tree)
+
+    def predicate(node: ast.AST) -> bool:
+        return (
+            isinstance(node, ast.Call)
+            and _reaches_symbol(node.func, "resolve_observed", bound, modules)
+            and not any(kw.arg == "parent_closed" for kw in node.keywords)
+        )
+
+    return predicate
+
+
 def _reads_capture_mode(rel: str, tree: ast.Module):
     """Every way a module can reach `config.capture_mode`.
 
@@ -844,6 +859,42 @@ def test_ambient_is_latched_not_hand_built():
         "the only remaining way to hand resolve_parentage a parent the scope\n"
         "never held — a framework id dressed as a SpanContext (design I2).\n"
         "Call assembly.latch_ambient() on the task that ISSUES the work.",
+    )
+
+
+def test_the_observed_edge_is_told_whether_its_parent_died():
+    """design §10.3(b) — every OBSERVING site declares whether its parent had
+    already closed.
+
+    `resolve_observed` exists for sites that latch a parent they did not open
+    and cannot vet. One of the things they cannot vet is whether the unit behind
+    that parent is still running: a `close()` on another carrier leaves the
+    finished unit's span installed, and the seam reads it back as
+    `contextvar` / 1.0 / no marker into a span that has already shipped.
+
+    `_parentage` cannot ask for itself — `_units` imports it, not the other way
+    round — so the fact arrives as a declared argument, the same shape
+    `degraded` has. A defaulted argument is exactly the kind of mechanism that
+    goes quietly dead when a fourth call site is written, so the rule is
+    mechanical rather than a docstring: outside `assembly/`, there is no
+    `resolve_observed(...)` that has not been told.
+
+    Call `assembly.parent_is_closed_unit(parent)` on the task that ISSUES the
+    work and carry the answer to the emit path beside the parent itself.
+    """
+    everywhere = {
+        k: v
+        for k, v in _tally(_resolves_observed_without_asking).items()
+        if not k.startswith("assembly/")
+    }
+    assert everywhere == {}, (
+        f"resolve_observed is called without `parent_closed=` at {everywhere}.\n\n"
+        "WHY: an observed edge whose parent's unit had already closed adopts\n"
+        "unrelated later work into an ALREADY-SHIPPED span at confidence 1.0\n"
+        "with no marker — one trace where two belong, and the one shape no\n"
+        "consumer can detect downstream (design §10.3).\n"
+        "Latch assembly.parent_is_closed_unit(parent) on the task that ISSUES\n"
+        "the work, store it beside the parent, and declare it here."
     )
 
 
