@@ -43,6 +43,16 @@ dev = [
     "syrupy>=4",
     "ruff>=0.7",
     "claude-agent-sdk>=0.2,<0.3",
+    # Only 1.2.x is measured. The `invoke`->`stream` delegation direction and the
+    # `pregel._runner` seam are unverified on 1.0.x/1.1.x, and there is no runtime
+    # version check anywhere in this repo — the surface probe plus this pin IS the
+    # floor. See the LangGraph adapter design §7.1.
+    "langgraph>=1.2,<2",
+    "langchain-core>=0.3",
+    # `langchain` (not just langchain-core) because `langchain.agents.create_agent`
+    # is the non-deprecated successor to `create_react_agent`, and the tool seam's
+    # coverage of it is a measured claim rather than an assumed one.
+    "langchain>=1.0",
 ]
 
 [tool.pytest.ini_options]
