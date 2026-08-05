@@ -54,6 +54,7 @@ from wardex_sdk.assembly import (
 from wardex_sdk.assembly._builder import NULL_DRAFT
 from wardex_sdk.assembly._diag import reset_reports_for_test
 from wardex_sdk.assembly._units import _ambient_unit
+from wardex_sdk.assembly._vocab import VocabularyError
 from wardex_sdk.context import activate_span
 
 
@@ -733,6 +734,7 @@ _DEGRADED_VERB_ARGS = {
     "close_child": ((NULL_DRAFT,), {}),
     "record_input": ((b"in",), {}),
     "record_output": ((b"out",), {}),
+    "record_failure": (("tool_error",), {}),
     "pin": ((), {"driver": threading.current_thread()}),
     "close": ((), {}),
 }
@@ -1047,8 +1049,12 @@ def test_a_degraded_run_is_told_apart_from_wardex_never_having_been_installed(ca
     assert sink.drafts == []
     assert len([line for line in degraded.splitlines() if line.strip()]) == 1
     assert "probe adapter" in degraded
-    assert "NO agent span" in degraded, f"the line does not name the consequence: {degraded!r}"
-    assert "capture_mode=AGENT" in degraded
+    assert "NO span of its own" in degraded, f"the line does not name the consequence: {degraded!r}"
+    # It names what happens to the work INSIDE the run too, and the wording is
+    # measured rather than inherited: `degraded_run()` keeps that traffic being
+    # captured — the older line claimed it would not be — so what it costs is
+    # the attachment, not the capture.
+    assert "orphaned and marked" in degraded
 
     # And the third arm: no adapter at all. Zero spans, and nothing said,
     # because nothing went wrong.
@@ -1397,3 +1403,157 @@ def test_a_healthy_scope_leaves_the_carrier_alone():
         UnitKind.SESSION, intent=SpanIntent.INVOKE_AGENT, placement=Placement.ROOT, describe=_agent
     ):
         assert in_degraded_run() is False
+
+
+# --------------------------------------------------------------------------
+# a failure the host reported without raising
+# --------------------------------------------------------------------------
+
+
+def test_a_declared_failure_reaches_the_wire_when_nothing_was_raised():
+    """The half `_run`'s exception handler structurally cannot see.
+
+    A framework that converts a failure into a RETURN VALUE — LangGraph's
+    default `handle_tool_errors` is the case this was built for — leaves
+    nothing for an exception handler to classify, so the span shipped `OK` for
+    work the host itself had already called failed.
+    """
+    ctx, sink = context()
+
+    with ctx.enter(
+        UnitKind.CALL, intent=SpanIntent.EXECUTE_TOOL, placement=Placement.ROOT, describe=_tool
+    ) as scope:
+        scope.record_failure("tool_error")
+
+    span = _emitted(sink)[-1]
+    assert span.status is StatusCode.ERROR
+    assert span.error_type == "tool_error"
+
+
+def test_an_exception_outranks_a_declared_failure_and_keeps_its_own_type():
+    """A declaration may not relabel a crash.
+
+    An exception is stronger evidence and carries a real type. If a declaration
+    could overwrite it, an adapter reading a framework's error field would
+    replace `RuntimeError` with whatever string it happened to have — and the
+    one thing on a span a consumer trusts to be mechanical would become an
+    adapter's opinion.
+    """
+    ctx, sink = context()
+
+    with pytest.raises(RuntimeError, match="the host crashed"):
+        with ctx.enter(
+            UnitKind.CALL, intent=SpanIntent.EXECUTE_TOOL, placement=Placement.ROOT, describe=_tool
+        ) as scope:
+            scope.record_failure("tool_error")
+            raise RuntimeError("the host crashed")
+
+    span = _emitted(sink)[-1]
+    assert span.status is StatusCode.ERROR
+    assert span.error_type == "RuntimeError"
+
+
+def test_a_declared_failure_does_not_turn_control_flow_back_into_a_failure():
+    """Control flow resolves to UNSET before the declaration is consulted.
+
+    Both mechanisms exist to stop `type(exc).__name__` being the only source of
+    a status, and they push in opposite directions — so the one case where they
+    could collide is pinned rather than left to ordering.
+    """
+
+    from wardex_sdk.adapters._base import AdapterInterface
+    from wardex_sdk.adapters._registry import context_for
+
+    class Bubble(Exception):
+        pass
+
+    class Adapter(AdapterInterface):
+        CONTROL_FLOW = (Bubble,)
+
+        def name(self) -> str:
+            return "cf"
+
+        def install(self, client, ctx=None) -> None:
+            return None
+
+        def uninstall(self) -> None:
+            return None
+
+    sink = RecordingSink()
+    ctx = context_for("cf", None, Adapter())
+    ctx._units._sink = sink  # type: ignore[attr-defined]
+
+    with pytest.raises(Bubble):
+        with ctx.enter(
+            UnitKind.CALL, intent=SpanIntent.EXECUTE_TOOL, placement=Placement.ROOT, describe=_tool
+        ) as scope:
+            scope.record_failure("tool_error")
+            raise Bubble()
+
+    span = _emitted(sink)[-1]
+    assert span.status is StatusCode.UNSET
+    assert span.error_type is None
+
+
+def test_a_declared_failure_on_a_degraded_scope_is_silent():
+    """Total, exactly like `record_input`: an adapter never has to ask whether
+    wardex is working before it may keep describing what it saw."""
+    ctx, sink = broken("open")
+
+    with ctx.enter(
+        UnitKind.CALL, intent=SpanIntent.EXECUTE_TOOL, placement=Placement.ROOT, describe=_tool
+    ) as scope:
+        assert scope.degraded
+        scope.record_failure("tool_error")
+
+
+def test_a_root_site_whose_describe_dies_reports_the_WHOLE_RUN_not_one_span(capsys):
+    """The operator's only record must not understate a run-sized loss.
+
+    In production `counters` is not exported and `debug` is off, so this one
+    stderr line is the entire difference between "wardex deleted a run" and
+    "wardex was never installed". Measured here rather than asserted from the
+    code: the draft is refused by the vocabulary (the required block never
+    landed), so ZERO spans ship for the run — and the branch that says so was
+    unreachable, because the flag guarding it means "the unit was closed" and
+    is True on exactly this path.
+    """
+    ctx, sink = context()
+
+    def boom(scope):
+        raise RuntimeError("a framework read moved")
+
+    with ctx.enter(
+        UnitKind.SESSION, intent=SpanIntent.INVOKE_WORKFLOW, placement=Placement.ROOT, describe=boom
+    ) as scope:
+        assert scope.degraded
+
+    # ZERO spans for the run, and it is the VOCABULARY that refuses it: the
+    # description died before `INVOKE_WORKFLOW`'s required block, so there is
+    # nothing to ship rather than something incomplete.
+    assert len(sink.drafts) == 1
+    with pytest.raises(VocabularyError, match="workflow_name"):
+        sink.drafts[0].finish()
+
+    err = capsys.readouterr().err
+    assert "this run will produce NO span of its own" in err
+    assert "one span is incomplete or missing" not in err, (
+        "a run entry reporting a single-span loss is the understatement this fixes"
+    )
+
+
+def test_a_nested_site_whose_describe_dies_still_reports_one_span(capsys):
+    """The control. Reordering the branches must not escalate every site."""
+    ctx, sink = context()
+
+    def boom(scope):
+        raise RuntimeError("a framework read moved")
+
+    with ctx.enter(
+        UnitKind.STEP, intent=SpanIntent.EXECUTE_STEP, placement=Placement.NESTED, describe=boom
+    ):
+        pass
+
+    err = capsys.readouterr().err
+    assert "one span is incomplete or missing" in err
+    assert "NO span of its own" not in err
