@@ -5,6 +5,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.3.0b3] - 2026-08-06
+
 ### Added
 - **A LangGraph adapter, auto-detected whenever `langgraph>=1.2` is importable.**
   A graph run now exports a tree instead of a scatter: one `invoke_workflow`
