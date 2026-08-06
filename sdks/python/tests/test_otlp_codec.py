@@ -143,8 +143,78 @@ def test_encode_decode_roundtrip_core_fields():
     assert attrs["network.protocol.name"] == "http"
     assert attrs["http.request.method"] == "POST"
     assert attrs["http.response.status_code"] == 200
-    assert attrs["wardex.input_data"] == b"req-bytes"
-    assert attrs["wardex.output_data"] == b"resp-bytes"
+    # Raw I/O leaves as strings, never OTLP bytes_value: backends that
+    # re-serialize attributes to JSON (Arize Phoenix) drop the whole span on a
+    # bytes attribute — silently, with an HTTP 200 (WAR-77).
+    assert attrs["wardex.input_data"] == "req-bytes"
+    assert attrs["wardex.output_data"] == "resp-bytes"
+    assert "wardex.input_data.encoding" not in attrs
+    assert "wardex.output_data.encoding" not in attrs
+
+
+def test_non_utf8_payload_becomes_base64_with_encoding_marker():
+    """Binary payloads (gRPC frames, compressed bodies) can't ship verbatim in
+    a string attribute; they go base64 with a `.encoding` companion so a
+    consumer can tell encoded binary from text that merely looks like base64."""
+    import base64
+    from dataclasses import replace
+
+    binary = b"\x89PNG\xff\x00binary"
+    env = _envelope_with_span()
+    span = replace(env.spans[0], input_data=binary, output_data=b"plain text")
+    attrs = _first_span(InternalEnvelope(header=env.header, spans=(span,)))["attributes"]
+    assert attrs["wardex.input_data"] == base64.b64encode(binary).decode()
+    assert attrs["wardex.input_data.encoding"] == "base64"
+    assert attrs["wardex.output_data"] == "plain text"
+    assert "wardex.output_data.encoding" not in attrs
+
+
+def test_utf8_with_nul_is_binary_not_text():
+    """U+0000 is valid UTF-8, but Postgres-backed ingests (Phoenix-on-Postgres,
+    Langfuse) reject any string containing NUL — shipping it verbatim would
+    reintroduce the exact silent span loss WAR-77 exists to prevent. Zero-value
+    protobuf/gRPC payload bytes are the realistic producer."""
+    import base64
+    from dataclasses import replace
+
+    payload = b"name: alice\x00\x00\x00\x00"  # valid UTF-8, contains NUL
+    env = _envelope_with_span()
+    span = replace(env.spans[0], input_data=payload)
+    attrs = _first_span(InternalEnvelope(header=env.header, spans=(span,)))["attributes"]
+    assert attrs["wardex.input_data"] == base64.b64encode(payload).decode()
+    assert attrs["wardex.input_data.encoding"] == "base64"
+
+
+def test_user_extra_cannot_collide_with_or_spoof_the_encoding_companion():
+    """`<key>.encoding` is the debyte pass's namespace for keys it rewrote.
+    A user extra sitting on that key would either duplicate the companion
+    (duplicate OTLP keys — backend dedup order decides which wins) or claim an
+    encoding the verbatim branch never applied. Both get dropped; a user
+    `.encoding` suffix on a key that never carried bytes is left alone."""
+    from dataclasses import replace
+
+    env = _envelope_with_span()
+    span = replace(
+        env.spans[0],
+        input_data=b"\xff\xfebinary",  # -> base64: companion must win
+        output_data=b"plain text",  # -> verbatim: spoofed marker must vanish
+        extra=(
+            ("wardex.input_data.encoding", "gzip"),
+            ("wardex.output_data.encoding", "base64"),
+            ("myapp.blob.encoding", "hex"),  # not a rewritten key: untouched
+        ),
+    )
+    data = _wardex_native.codec.encode_otlp_traces(
+        InternalEnvelope(header=env.header, spans=(span,))
+    )
+    d = _wardex_native.codec.decode_otlp_traces(data)
+    span_out = d["resource_spans"][0]["scope_spans"][0]["spans"][0]
+    keys = [k for k in span_out["attributes"] if k.endswith(".encoding")]
+    attrs = span_out["attributes"]
+    assert attrs["wardex.input_data.encoding"] == "base64"
+    assert "wardex.output_data.encoding" not in attrs
+    assert attrs["myapp.blob.encoding"] == "hex"
+    assert sorted(keys) == ["myapp.blob.encoding", "wardex.input_data.encoding"]
 
 
 def test_gen_ai_flattened_to_attributes():
