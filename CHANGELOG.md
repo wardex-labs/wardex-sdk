@@ -5,6 +5,18 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.3.0b4] - 2026-08-06
+
+### Fixed
+
+- OTLP export no longer emits `bytes_value` attributes, which some backends
+  (Arize Phoenix) silently rejected — dropping every span that carried raw
+  request/response payloads (the LLM and tool spans) with an HTTP 200.
+  `wardex.input_data` / `wardex.output_data` now ship as strings: readable
+  UTF-8 text verbatim, binary payloads as base64 with a
+  `<key>.encoding = "base64"` companion attribute. PII masking still runs on
+  the raw bytes before the rewrite. The wardex envelope protocol is unchanged.
+
 ## [0.3.0b3] - 2026-08-06
 
 ### Added
