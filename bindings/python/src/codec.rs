@@ -9,6 +9,8 @@
 // (a pre-existing pyo3 0.22 issue; a function-level #[allow] can't cover macro-generated sibling items).
 #![allow(clippy::useless_conversion)]
 
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine as _;
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyBytes, PyDict, PyList};
 
@@ -975,6 +977,9 @@ fn wardex_any_to_otlp(v: &pb::AnyValue) -> otlp_pb::common::AnyValue {
         Some(WV::IntValue(i)) => Some(OV::IntValue(*i)),
         Some(WV::DoubleValue(d)) => Some(OV::DoubleValue(*d)),
         Some(WV::BoolValue(b)) => Some(OV::BoolValue(*b)),
+        // Bytes pass through here untouched: masking must still see the raw
+        // payload. `debyte_otlp` strips every bytes_value from the request
+        // after masking, right before serialization (WAR-77).
         Some(WV::BytesValue(b)) => Some(OV::BytesValue(b.clone())),
         _ => None,
     };
@@ -1177,7 +1182,9 @@ fn span_to_otlp(sp: &Bound<PyAny>) -> PyResult<otlp_pb::trace::Span> {
             ));
         }
     }
-    // raw I/O → wardex.input_data / wardex.output_data (omitted if empty)
+    // raw I/O → wardex.input_data / wardex.output_data (omitted if empty).
+    // Built as bytes so PII masking sees the raw payload; `debyte_otlp`
+    // converts to strings after masking, before serialization (WAR-77).
     let input: Vec<u8> = sp.getattr("input_data")?.extract()?;
     if !input.is_empty() {
         attrs.push(otlp_kv_bytes("wardex.input_data", input));
@@ -1506,10 +1513,121 @@ fn encode_otlp_traces(
     // keep running while the batch worker encodes (design §9).
     let bytes = py.allow_threads(|| -> PyResult<Vec<u8>> {
         pii_apply_otlp(&mut req, pii_mode, &pii_disabled)?;
+        // After masking, never before: the PII engine's byte-level patterns
+        // match inside raw payloads, and a payload already rewritten to
+        // base64 would hide them (WAR-77).
+        debyte_otlp(&mut req);
         otlp::encode_traces(&req)
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
     })?;
     Ok(PyBytes::new_bound(py, &bytes).unbind())
+}
+
+// --- WAR-77: no bytes_value ever leaves on the OTLP surface ---
+//
+// OTLP `bytes_value` is legal per spec, but backends that re-serialize
+// attributes to JSON can't represent it: Arize Phoenix (2026-08) drops the
+// entire span at ingest — HTTP 200, no error — and the spans lost are exactly
+// the LLM/tool ones that carry payloads. The wardex envelope keeps raw bytes;
+// this surface degrades to strings: valid UTF-8 verbatim, anything else base64
+// plus a `<key>.encoding = "base64"` companion so a consumer can tell encoded
+// binary from text that merely looks like base64.
+
+/// Strip every `bytes_value` from an OTLP export request, in place.
+fn debyte_otlp(req: &mut otlp_pb::trace_service::ExportTraceServiceRequest) {
+    for rs in &mut req.resource_spans {
+        if let Some(r) = rs.resource.as_mut() {
+            debyte_otlp_kvs(&mut r.attributes);
+        }
+        for ss in &mut rs.scope_spans {
+            if let Some(sc) = ss.scope.as_mut() {
+                debyte_otlp_kvs(&mut sc.attributes);
+            }
+            for sp in &mut ss.spans {
+                debyte_otlp_kvs(&mut sp.attributes);
+                for ev in &mut sp.events {
+                    debyte_otlp_kvs(&mut ev.attributes);
+                }
+                for link in &mut sp.links {
+                    debyte_otlp_kvs(&mut link.attributes);
+                }
+            }
+        }
+    }
+}
+
+fn debyte_otlp_kvs(kvs: &mut Vec<otlp_pb::common::KeyValue>) {
+    // (companion key, went_base64) for every attribute whose value WAS bytes.
+    let mut rewritten: Vec<(String, bool)> = Vec::new();
+    for kv in kvs.iter_mut() {
+        if let Some(v) = kv.value.as_mut() {
+            if let Some(went_base64) = debyte_otlp_any(v) {
+                rewritten.push((format!("{}.encoding", kv.key), went_base64));
+            }
+        }
+    }
+    if rewritten.is_empty() {
+        return;
+    }
+    // For a key this pass rewrote, `<key>.encoding` is this pass's namespace.
+    // A pre-existing attribute there (a user extra — kv_list passes any key
+    // through) would either duplicate the companion (duplicate keys are
+    // undefined in OTLP, backend dedup order decides which wins) or spoof an
+    // encoding the verbatim branch never applied, making consumers
+    // base64-decode text that shipped as-is. Drop it either way; user
+    // `.encoding` suffixes on keys that never carried bytes are untouched.
+    kvs.retain(|kv| !rewritten.iter().any(|(companion, _)| kv.key == *companion));
+    for (companion, went_base64) in rewritten {
+        if went_base64 {
+            kvs.push(otlp_kv_str(&companion, "base64"));
+        }
+    }
+}
+
+/// Text safe for every real backend, or None → base64. Strict UTF-8 alone is
+/// not enough: U+0000 is valid UTF-8, and Postgres-backed ingests reject any
+/// string containing NUL — the same silent span loss this pass exists to
+/// prevent, reintroduced for the NUL subset. Binary protobuf/gRPC payloads
+/// are full of NULs and are exactly what must route to base64, so any C0
+/// control byte other than \t \n \r means "not text".
+fn otlp_text(b: &[u8]) -> Option<&str> {
+    let s = std::str::from_utf8(b).ok()?;
+    if b.iter()
+        .any(|&c| c < 0x20 && c != b'\t' && c != b'\n' && c != b'\r')
+    {
+        return None;
+    }
+    Some(s)
+}
+
+/// `Some(went_base64)` when the value itself was a bytes_value — the caller
+/// owns the attribute list and manages the `<key>.encoding` companion; a
+/// bytes value nested in an ArrayValue has no key of its own, so there the
+/// result has no receiver and non-text elements go base64 unmarked.
+fn debyte_otlp_any(v: &mut otlp_pb::common::AnyValue) -> Option<bool> {
+    use otlp_pb::common::any_value::Value;
+    match v.value.as_mut() {
+        Some(Value::BytesValue(b)) => {
+            let raw = std::mem::take(b);
+            let (s, went_base64) = match otlp_text(&raw) {
+                Some(s) => (s.to_owned(), false),
+                None => (BASE64.encode(&raw), true),
+            };
+            v.value = Some(Value::StringValue(s));
+            Some(went_base64)
+        }
+        Some(Value::ArrayValue(arr)) => {
+            for item in &mut arr.values {
+                debyte_otlp_any(item);
+            }
+            None
+        }
+        Some(Value::KvlistValue(kvl)) => {
+            debyte_otlp_kvs(&mut kvl.values);
+            None
+        }
+        _ => None,
+    }
 }
 
 #[pyfunction]

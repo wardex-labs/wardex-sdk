@@ -31,6 +31,9 @@ protoc-bin-vendored   = "3"
 # Compression
 zstd          = "0.13"
 
+# Encoding
+base64        = "0.22"
+
 # Python FFI
 pyo3          = { version = "0.22", features = ["extension-module", "abi3-py310"] }
 
