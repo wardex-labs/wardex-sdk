@@ -145,7 +145,7 @@ def test_encode_decode_roundtrip_core_fields():
     assert attrs["http.response.status_code"] == 200
     # Raw I/O leaves as strings, never OTLP bytes_value: backends that
     # re-serialize attributes to JSON (Arize Phoenix) drop the whole span on a
-    # bytes attribute — silently, with an HTTP 200 (WAR-77).
+    # bytes attribute — silently, with an HTTP 200.
     assert attrs["wardex.input_data"] == "req-bytes"
     assert attrs["wardex.output_data"] == "resp-bytes"
     assert "wardex.input_data.encoding" not in attrs
@@ -172,7 +172,8 @@ def test_non_utf8_payload_becomes_base64_with_encoding_marker():
 def test_utf8_with_nul_is_binary_not_text():
     """U+0000 is valid UTF-8, but Postgres-backed ingests (Phoenix-on-Postgres,
     Langfuse) reject any string containing NUL — shipping it verbatim would
-    reintroduce the exact silent span loss WAR-77 exists to prevent. Zero-value
+    reintroduce the exact silent span loss the string surface exists to prevent.
+    Zero-value
     protobuf/gRPC payload bytes are the realistic producer."""
     import base64
     from dataclasses import replace
