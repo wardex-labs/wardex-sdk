@@ -114,7 +114,7 @@ class TestTransportPolicy:
         out = _wardex_native.codec.decode_otlp_traces(data)
         span = out["resource_spans"][0]["scope_spans"][0]["spans"][0]
         attrs = span["attributes"]
-        # String, not bytes: the OTLP surface never emits bytes_value (WAR-77),
+        # String, not bytes: the OTLP surface never emits bytes_value,
         # and masking runs first — on the raw bytes — so the mask still lands.
         assert "john.doe@acme.com" not in attrs["wardex.input_data"]
         assert "[EMAIL]" in attrs["wardex.input_data"]

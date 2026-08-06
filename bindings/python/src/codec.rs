@@ -979,7 +979,7 @@ fn wardex_any_to_otlp(v: &pb::AnyValue) -> otlp_pb::common::AnyValue {
         Some(WV::BoolValue(b)) => Some(OV::BoolValue(*b)),
         // Bytes pass through here untouched: masking must still see the raw
         // payload. `debyte_otlp` strips every bytes_value from the request
-        // after masking, right before serialization (WAR-77).
+        // after masking, right before serialization.
         Some(WV::BytesValue(b)) => Some(OV::BytesValue(b.clone())),
         _ => None,
     };
@@ -1184,7 +1184,7 @@ fn span_to_otlp(sp: &Bound<PyAny>) -> PyResult<otlp_pb::trace::Span> {
     }
     // raw I/O → wardex.input_data / wardex.output_data (omitted if empty).
     // Built as bytes so PII masking sees the raw payload; `debyte_otlp`
-    // converts to strings after masking, before serialization (WAR-77).
+    // converts to strings after masking, before serialization.
     let input: Vec<u8> = sp.getattr("input_data")?.extract()?;
     if !input.is_empty() {
         attrs.push(otlp_kv_bytes("wardex.input_data", input));
@@ -1515,7 +1515,7 @@ fn encode_otlp_traces(
         pii_apply_otlp(&mut req, pii_mode, &pii_disabled)?;
         // After masking, never before: the PII engine's byte-level patterns
         // match inside raw payloads, and a payload already rewritten to
-        // base64 would hide them (WAR-77).
+        // base64 would hide them.
         debyte_otlp(&mut req);
         otlp::encode_traces(&req)
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
@@ -1523,7 +1523,7 @@ fn encode_otlp_traces(
     Ok(PyBytes::new_bound(py, &bytes).unbind())
 }
 
-// --- WAR-77: no bytes_value ever leaves on the OTLP surface ---
+// --- No bytes_value ever leaves on the OTLP surface ---
 //
 // OTLP `bytes_value` is legal per spec, but backends that re-serialize
 // attributes to JSON can't represent it: Arize Phoenix (2026-08) drops the
