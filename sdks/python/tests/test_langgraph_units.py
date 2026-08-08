@@ -1,7 +1,13 @@
 """§9.2 — the merge gate. The one file that must fail on a collapsed causal tree.
 
-This stands in for a conformance suite, so it is deliberately two halves that
-fail independently.
+The SHARED half of this is a conformance suite now
+(`wardex_sdk.testing.conformance`, driven for this adapter by
+`test_langgraph_conformance.py`), and what stays here is what that suite does
+not reach: the async twin of every claim, the `submit`-hook negative control
+that separates a read from a guess, and the counter cross-checks that are
+specific to this adapter's four `confirm_active` sites.
+
+It is deliberately two halves that fail independently.
 
 The TIER half reads every edge's `(strategy, confidence, limitations)` off the
 shipped span. It catches a run entry nobody wrapped, a node seam patched on
