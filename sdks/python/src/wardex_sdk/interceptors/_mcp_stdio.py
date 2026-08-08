@@ -158,6 +158,15 @@ class _ProcState:
         out: list[InternalSpan] = []
         self._resp_bytes += len(data)
         for m in self._resp.feed(data):
+            # Counted BEFORE the correlation filter below, and that ordering is
+            # the whole point: `should_detach` now spends a budget both
+            # directions fill, so it has to read evidence from both directions
+            # too. A server whose requests wardex cannot see — a host writing
+            # stdin through `writelines`, a notification-only producer, a
+            # request-side parser that has latched disabled — would otherwise
+            # detach at 8 KB of perfectly good JSON-RPC.
+            if m.kind in ("request", "response", "notification"):
+                self._msgs += 1
             if m.kind != "response" or m.id is None:
                 continue
             pending = self._latch.pop(m.id, None)

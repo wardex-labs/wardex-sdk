@@ -141,6 +141,35 @@ def test_a_jsonrpc_stream_never_detaches_however_much_it_streams():
     assert st.should_detach() is False
 
 
+def test_a_stream_visible_only_on_stdout_never_detaches():
+    """Symmetric budget, symmetric evidence — and only one of the two was.
+
+    `should_detach` spends a budget both directions fill, so `_msgs == 0` has to
+    mean "nothing was parsed in EITHER direction". It did not: only
+    `feed_request` counted, so a subprocess whose JSON-RPC wardex can observe
+    only on stdout detached permanently at the sniff limit while the seam was
+    parsing valid messages the whole time. That shape is reachable — a host that
+    writes stdin through `StreamWriter.writelines` never reaches the raw-asyncio
+    seam's `write` tee, and a notification-only producer never sends a request
+    at all.
+    """
+    st = _ProcState()
+    frame = b'{"jsonrpc":"2.0","method":"notifications/progress","params":{}}\n'
+    while st._resp_bytes <= st.SNIFF_LIMIT:
+        st.feed_response(frame)
+
+    assert st._req_bytes == 0, "precondition: this side was never seen"
+    assert st.should_detach() is False
+
+
+def test_a_subprocess_that_only_streams_noise_still_detaches():
+    """The other half of the same claim: counting responses must not make the
+    trigger unreachable for the compiler or log follower it exists for."""
+    st = _ProcState()
+    st.feed_response(b"x" * (st.SNIFF_LIMIT + 1))
+    assert st.should_detach() is True
+
+
 def test_a_dead_server_does_not_strand_its_pending_requests():
     """An MCP server that dies leaves every in-flight request latched with a
     response that is never coming — one `Ambient`, and so one SpanContext, per
