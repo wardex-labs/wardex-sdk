@@ -49,7 +49,7 @@ class SSLInterceptor(ByteSeamInterceptor):
         self._patches.patch(sock, "recv_into", self._mk_recv_into(sock.recv_into))
         self._patches.patch(obj, "write", self._mk_send("write", obj.write))
         self._patches.patch(obj, "read", self._mk_read(obj.read))
-        self._acquire_timing()
+        self._acquire_probes()
         self._installed = True
 
     # `uninstall` is the base's: both seams undid the same three things, and the

@@ -236,6 +236,20 @@ class _Http1Tracker:
     def disabled_reason(self) -> str | None:
         return self._resp.disabled_reason() or self._req.disabled_reason()
 
+    def on_connection_close(self, marker: Limitation) -> list[_Txn]:
+        """The connection ended. Nothing here survives it.
+
+        A request whose response never arrived is not a transaction: there is no
+        status, no end, and no ttfb, and a span assembled from the half of it
+        that exists would assert things the seam never observed. So the accrued
+        buffers are released — promptly, rather than whenever the last reference
+        to this tracker happens to go — and the caller gets nothing to emit.
+        """
+        self._req_body = b""
+        self._resp_raw = b""
+        self._resp_marks = []
+        return []
+
 
 class _Http2Tracker:
     """HTTP/2 — native parser + per-stream_id latch (multiplexing correlation)."""
@@ -244,10 +258,13 @@ class _Http2Tracker:
         self._conn = Http2Parser(limits)
         # stream_id -> (active span at request time, whether that span's unit
         # had already closed then, request start ns)
-        # TODO: evict stale entries for streams that closed without a response.
-        # `_mk` pops on every transaction, so the only leak is a stream that ends
-        # without one; closing it needs a connection-close hook the seam does not
-        # expose yet.
+        #
+        # `_mk` pops on every transaction, so the entries that accumulate are
+        # the streams that end WITHOUT one: RST_STREAM, a GOAWAY that strands
+        # everything above `last_stream_id`, a server that stops mid-response.
+        # There is no per-stream close signal to act on — the parser reports
+        # transactions, not stream lifecycles — so the honest bound is the
+        # connection itself, and `on_connection_close` is where it is applied.
         self._latch: dict[int, tuple[SpanContext | None, bool, int]] = {}
 
     def on_request_bytes(self, data: bytes) -> list[_Txn]:
@@ -279,6 +296,22 @@ class _Http2Tracker:
             if t.status:
                 out.append(txn)
         return out
+
+    def on_connection_close(self, marker: Limitation) -> list[_Txn]:
+        """Release the per-stream latch — the eviction the entries were waiting for.
+
+        A latch entry is one `SpanContext` plus two scalars, so this is small
+        money per connection and unbounded money over a process: an h2 client
+        that resets a stream per cancelled request accumulates one entry per
+        cancellation for the life of the connection, and a keep-alive h2
+        connection to a model provider lives as long as the process does.
+
+        No transactions come back. A stream that never produced a response
+        produced no status either, and the seam has nothing to say about it that
+        would not be invented.
+        """
+        self._latch.clear()
+        return []
 
     def _mk(self, t: Any) -> _Txn:
         now = time.time_ns()
@@ -397,6 +430,14 @@ class _WebSocketTracker:
         if self._emitted:
             return []
         return [self._build_txn((marker,))]
+
+    #: The connection-close verb every tracker answers to. For a WS session it
+    #: IS `flush`, and an ALIAS rather than a delegating wrapper: this is the one
+    #: tracker with something to save at close — its span exists only once the
+    #: session ends — so the two names must never be able to drift apart.
+    #: Before the close hook, that span waited for `uninstall()` and was lost
+    #: whenever the process never reached one.
+    on_connection_close = flush
 
     def _build_txn(self, extra_markers: tuple[Limitation, ...]) -> _Txn:
         self._emitted = True
