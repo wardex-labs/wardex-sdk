@@ -92,6 +92,22 @@ Changelog is ready to roll:
 grep -q '## \[Unreleased\]' CHANGELOG.md   # release.py aborts without this header
 ```
 
+Rehearse the wheel gate if anything under it changed since the last release —
+the release workflow, the build or smoke matrix, the Rust core, or a dependency
+the wheel links against. `release-python.yml` also takes a `workflow_dispatch`,
+and `publish` requires a pushed tag, so a dispatched run builds and smokes all
+five wheels and stops short of PyPI whatever ref you aim it at:
+
+```bash
+gh workflow run release-python.yml --ref main
+gh run list --workflow=release-python.yml --limit=1 --json databaseId,status
+gh run watch <databaseId>   # all six smoke entries green
+```
+
+Skip it for a release that only touches Python or Rust source CI already
+covered. Run it when in doubt: the alternative place to discover that the
+Rosetta probe or the QEMU container broke is under a tag you cannot take back.
+
 ### 2. Version selection
 
 Read the current version:
@@ -216,6 +232,13 @@ curl -s -o /dev/null -w "%{http_code}" \
   https://pypi.org/pypi/wardex-sdk/<version>/json    # expect 200
 ```
 
+The run is three stages and the publish is last: `build wheels (...)` produces
+the five abi3 wheels, `smoke-test wheel (...)` installs and imports every one of
+them (six entries — each wheel on 3.12, plus linux x86_64 again on the 3.10
+floor, which is the only entry that can see an abi3 tag that stopped covering
+the floor), and `publish` uploads only if both stages are fully green. So a red
+smoke entry is a real platform result, not a known blind spot.
+
 If the run fails, go to Failure recovery.
 
 ## Failure recovery
@@ -224,13 +247,22 @@ Everything turns on one question: **did PyPI actually receive the version?** PyP
 burns a version name only when files are uploaded. So there are two worlds with
 opposite fixes.
 
-### The build failed → version is still free → re-tag the SAME version
+### The build or the smoke test failed → version is still free → re-tag the SAME version
 
-If a `build (...)` job failed, the `publish` job was skipped (`needs: [build]`
-unmet), so nothing uploaded and `<version>` is still available. This is the
-common case (the build guards the publish). A wheel build failing is almost
-always a *build/config* bug, not a test bug (tests already passed in CI) — fix it
-in the repo files (workflow YAML, Cargo/pyproject, source), commit, then re-tag:
+If a `build (...)` **or** a `smoke-test wheel (...)` job failed, the `publish`
+job was skipped (`needs: [build, smoke]` unmet), so nothing uploaded and
+`<version>` is still available. This is the common case: two gates guard the
+publish, and either one red leaves the version free. Check both before
+concluding anything — every `build (...)` green with one smoke entry red is
+this world, not the burned one below, and the smoke matrix is `fail-fast: false`
+precisely so the red entry names the platform.
+
+Either failure is almost always a *build/config* bug, not a test bug (tests
+already passed in CI): a build job says the wheel could not be produced, a smoke
+entry says it was produced but does not install or import on that platform. Fix
+it in the repo files (workflow YAML, Cargo/pyproject, source), commit, rehearse
+the fix with a dispatched run (see Preflight) since a re-tag is another
+irreversible push, then re-tag:
 
 ```bash
 git push origin :python-v<version>   # delete the remote tag
@@ -265,12 +297,6 @@ commit) — there's nothing to undo remotely.
 - **First-time PyPI/OIDC setup** (Trusted Publisher, org creation, project
   transfer) — one-time admin, already done. Assume it exists.
 - **js/java publish** — not wired up; say so rather than improvising.
-- **Widening the wheel smoke-test** — the release workflow already installs the
-  built wheel and imports it in a `smoke-test wheel` job, but only on
-  linux x86_64; the macOS, aarch64, and Windows wheels publish untested. Closing
-  that gap is a workflow change (matrix the smoke job), not this skill's job.
-  Mention it as a follow-up if a release surfaces a platform-specific install
-  bug.
 - **Publishing an sdist** — the workflow ships wheels only (abi3, five
   platforms). `pip install` on anything outside that set has no source fallback
   and fails. Adding one is a workflow change, not this skill's job.
