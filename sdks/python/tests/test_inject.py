@@ -243,8 +243,8 @@ def test_init_without_flag_does_not_patch():
 
 def test_exporter_post_not_injected():
     """The OTLP exporter's own POST must never carry traceparent (self-exclusion)."""
+    from wardex_sdk._suppress import suppress_capture
     from wardex_sdk.context._inject import _build_inject_headers
-    from wardex_sdk.interceptors._exclusion import suppress_capture
 
     _setup(propagate_trace=True)
     with trace("root"):

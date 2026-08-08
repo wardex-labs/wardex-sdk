@@ -106,16 +106,23 @@ _MEMBER_SITES: dict[str, frozenset[str]] = {
     # `AdapterContext`, which declares the fallback and lets the table above
     # attach the marker, so there is no site left in an adapter that could
     # stamp one of these onto an edge it decided itself.
+    # `testing/conformance.py` is a third site for both and attaches NEITHER: it
+    # is the conformance suite's `_EDGE_MARKERS`, the four members whose
+    # presence on any span of a healthy run means the parent edge is not what it
+    # looks like. It is named so the scanner can see it — see the note on
+    # ADAPTER_UNINSTALLED below.
     "PARENT_UNRESOLVED": frozenset(
         {
             "assembly/_parentage.py",
             "assembly/_units.py",
+            "testing/conformance.py",
         }
     ),
     "UNIT_INFERRED_SOLE": frozenset(
         {
             "assembly/_parentage.py",
             "assembly/_units.py",
+            "testing/conformance.py",
         }
     ),
     # The two §5.4 markers, both on the in-process tool span: the handler is
@@ -146,6 +153,8 @@ _MEMBER_SITES: dict[str, frozenset[str]] = {
             # A second `system/init` naming a different run on a transport key
             # this table still holds live: two agent runs sharing one root.
             "adapters/_assembler.py",
+            # `_EDGE_MARKERS` again — see PARENT_UNRESOLVED above.
+            "testing/conformance.py",
         }
     ),
     # --- transport timing ---
@@ -196,10 +205,23 @@ _MEMBER_SITES: dict[str, frozenset[str]] = {
     # Both members existed here as declarations with no emitter for as long as
     # `close_all` had no production caller — the state this table is designed to
     # make visible rather than comfortable.
+    #
+    # `testing/conformance.py` is the third site for both and is the one that
+    # ATTACHES NEITHER. This table records where a member is USED, and the
+    # conformance suite uses them as expectations: it drives each shutdown path
+    # and asserts that the run span which shipped says why it is short. Read as
+    # a list of emitters it would be wrong; read as what it is — every Python
+    # site that names a marker — a checker that names the two shutdown markers
+    # is exactly the site that must not be allowed to drift away from the
+    # teardowns above it.
     "ADAPTER_UNINSTALLED": frozenset(
-        {"adapters/_anthropic_agent_sdk.py", "adapters/_langgraph.py"}
+        {
+            "adapters/_anthropic_agent_sdk.py",
+            "adapters/_langgraph.py",
+            "testing/conformance.py",
+        }
     ),
-    "UNIT_INTERRUPTED": frozenset({"_lifecycle.py"}),
+    "UNIT_INTERRUPTED": frozenset({"_lifecycle.py", "testing/conformance.py"}),
     # Two sites, and they are the two halves of one fact: where wardex failed,
     # and where the consequence lands. `adapters/_context.py` knows it failed —
     # `_abandon` marks a unit whose open or description died, `_run` marks one
@@ -214,6 +236,8 @@ _MEMBER_SITES: dict[str, frozenset[str]] = {
         {
             "adapters/_context.py",
             "assembly/_parentage.py",
+            # `_EDGE_MARKERS` again — see PARENT_UNRESOLVED above.
+            "testing/conformance.py",
         }
     ),
 }
@@ -996,6 +1020,20 @@ _UNRESOLVED_PY: frozenset[tuple[str, str]] = frozenset(
         ("interceptors/_trackers.py", "Call:list"),
         ("interceptors/_trackers.py", "Call:tuple"),
         ("interceptors/_trackers.py", "Tuple"),
+        # The conformance suite READS markers off spans that have already
+        # shipped; it never builds a draft and never reaches a sink, so neither
+        # of these slots can put a value on a span. `harness.py`'s
+        # `Attribute:limitations` is `CaptureIntegrity.limitations` being copied
+        # into the `Node` view a check asserts on. `conformance.py`'s
+        # `Name:marker` is two slots of one shape: `_assert_shipped(live, root,
+        # marker)` asking whether the member the shutdown checks passed to
+        # `close_units_all` came back on the wire, and the loop over
+        # `_EDGE_MARKERS` asking whether any of the four members that would mean
+        # the parent edge is not what it looks like is present. Every member
+        # either slot can carry is spelled out as a literal in that same file,
+        # which is why it appears six times in `_MEMBER_SITES`.
+        ("testing/conformance.py", "Name:marker"),
+        ("testing/harness.py", "Attribute:limitations"),
         # `_resolve_markers(raw)` is where a Rust-produced marker STRING becomes
         # a member, and it is now the ONLY such crossing (it moved here
         # from the byte seam, which is why `interceptors/_seam.py::Name:member`

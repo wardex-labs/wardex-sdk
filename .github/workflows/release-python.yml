@@ -4,6 +4,12 @@ on:
   push:
     tags:
       - "python-v*"
+  # Build and smoke on demand. A tag push is irreversible, so every path below
+  # it — Rosetta, an Intel interpreter on an arm64 runner, the QEMU container,
+  # the Windows shell — has to be provable before the tag exists rather than
+  # discovered by it. `publish` requires this trigger to be absent, so a
+  # dispatch runs the whole gate and stops short of PyPI on any ref.
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -44,28 +50,111 @@ jobs:
           path: sdks/python/dist
 
   smoke:
-    name: smoke-test wheel (linux x86_64)
+    name: smoke-test wheel (${{ matrix.platform.target }} on ${{ matrix.platform.runner }}, py${{ matrix.platform.python }})
     needs: [build]
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.platform.runner }}
+    # QEMU emulation of an arm64 install is minutes, not seconds; cap it rather
+    # than let a hung emulator hold the publish gate open.
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # Covers the same axis as `build`: every wheel that job produces is
+        # installed and imported by at least one entry here. A wheel building
+        # is not a wheel installing — an abi3 tag, a missing bundled library or
+        # a bad cross-compile only show up at import time. If an entry ever
+        # becomes untestable it gets an `exclude` with a reason, never a silent
+        # deletion; there are none today.
+        #
+        # `how` selects the interpreter the wheel is loaded into:
+        #   native  — the runner's own architecture matches the wheel
+        #   rosetta — Intel interpreter on the Apple Silicon runner (the Intel
+        #             wheel is cross-compiled there, so nothing native can load it)
+        #   qemu    — arm64 container on the x86_64 Linux runner
+        #
+        # `python` is per-entry rather than a literal because the wheels are
+        # abi3-py310: which interpreter actually loaded them is the result, so
+        # it belongs in the job name and in one place per entry.
+        #
+        # The abi3 tag is also the one failure named above that a single
+        # interpreter cannot see, which is why the linux x86_64 wheel gets a
+        # second entry on 3.10 — the floor `requires-python` promises. A wheel
+        # tagged `cp312-cp312` (abi3 dropped) or `cp311-abi3` (pyo3's
+        # `abi3-py310` feature bumped without the manifest) installs and imports
+        # perfectly on 3.12 while being unavailable to every user on the floor;
+        # only a floor entry goes red. x86_64 Linux carries it because that
+        # runner has every version, and it is the cheapest of the six.
+        platform:
+          - { runner: ubuntu-latest,  target: x86_64,  how: native,  python: "3.12" }
+          - { runner: ubuntu-latest,  target: x86_64,  how: native,  python: "3.10" }
+          - { runner: ubuntu-latest,  target: aarch64, how: qemu,    python: "3.12" }
+          - { runner: macos-14,       target: x86_64,  how: rosetta, python: "3.12" }
+          - { runner: macos-14,       target: aarch64, how: native,  python: "3.12" }
+          - { runner: windows-latest, target: x64,     how: native,  python: "3.12" }
     steps:
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
       - uses: actions/download-artifact@v4
         with:
-          name: wheels-ubuntu-latest-x86_64
+          name: wheels-${{ matrix.platform.runner }}-${{ matrix.platform.target }}
           path: dist
+
+      # `arch -x86_64` on a universal system binary is the cheapest probe for
+      # "is Rosetta here"; the install is a no-op reboot-free download when it
+      # is not, and images have flipped on this before. `sudo` because
+      # `--install-rosetta` installs a system component and refuses to run as
+      # the unprivileged `runner` user — without it the fallback can only fail,
+      # and it fails in exactly the case it exists for.
+      - name: ensure Rosetta 2
+        if: matrix.platform.how == 'rosetta'
+        run: arch -x86_64 /usr/bin/true 2>/dev/null || sudo softwareupdate --install-rosetta --agree-to-license
+
+      - uses: actions/setup-python@v5
+        if: matrix.platform.how != 'qemu'
+        with:
+          python-version: ${{ matrix.platform.python }}
+          # Empty means "the runner's architecture" (setup-python falls back to
+          # os.arch()), so only the Rosetta entry asks for an Intel build.
+          architecture: ${{ matrix.platform.how == 'rosetta' && 'x64' || '' }}
+
       # Import the built wheel (--no-index so it can't silently fall back to PyPI)
       # to catch a broken native extension or missing files before we publish.
       - name: install and import the built wheel
+        if: matrix.platform.how != 'qemu'
+        shell: bash
         run: |
           python -m pip install --upgrade pip
           python -m pip install --pre --no-index --find-links dist wardex-sdk
           python -c "import wardex_sdk; print('smoke ok:', wardex_sdk.__version__)"
 
+      - uses: docker/setup-qemu-action@v3
+        if: matrix.platform.how == 'qemu'
+        with:
+          platforms: arm64
+
+      # Same three commands as above, run inside an arm64 container. Written to
+      # a file rather than passed to `bash -c` so the quoting survives two
+      # levels of shell.
+      - name: install and import the built wheel (arm64 container)
+        if: matrix.platform.how == 'qemu'
+        run: |
+          cat > smoke.sh <<'SH'
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install --pre --no-index --find-links /dist wardex-sdk
+          python -c "import wardex_sdk; print('smoke ok:', wardex_sdk.__version__)"
+          SH
+          docker run --rm --platform linux/arm64 \
+            -v "$PWD/dist:/dist:ro" -v "$PWD/smoke.sh:/smoke.sh:ro" \
+            python:${{ matrix.platform.python }}-slim bash /smoke.sh
+
   publish:
     name: publish to PyPI
     needs: [build, smoke]
+    # Only a *pushed* `python-v*` tag publishes. The trigger is half the guard
+    # because workflow_dispatch takes a tag ref too — the ref picker has a Tag
+    # tab, and `gh workflow run --ref python-v1.2.3` is the obvious way to
+    # re-run the gate after a flaky smoke entry. On the ref alone that rerun
+    # would walk into the one action nothing can undo.
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/python-v')
     runs-on: ubuntu-latest
     environment: pypi
     permissions:

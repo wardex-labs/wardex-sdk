@@ -174,7 +174,7 @@ class OtlpHttpTransport(Transport):
         headers = {"Content-Type": "application/x-protobuf", **self._headers}
         req = urllib.request.Request(self._endpoint, data=data, headers=headers, method="POST")
 
-        from ..interceptors._exclusion import suppress_capture
+        from .._suppress import suppress_capture
 
         started = time.monotonic()
         try:

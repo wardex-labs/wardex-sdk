@@ -5,6 +5,18 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **A reusable adapter conformance suite** under `wardex_sdk.testing`
+  (`conformance.py` + `harness.py`). It verifies the invariants every adapter
+  must hold — causal parent edges, placement compliance, install/uninstall
+  reversibility, unit closing — and detects full causal-tree collapse via
+  per-node id chains. Both shipped adapters (Anthropic Agent SDK, LangGraph)
+  now run on it.
+- `config.interceptors` is honored by `init()` instead of being silently
+  ignored. The default remains exactly the previous behavior; a name with no
+  implementation behind it now fails loudly at config-validation time.
+
 ### Changed
 
 - **LLM spans are named by what they did, not how they traveled.** A span
@@ -15,6 +27,15 @@ All notable changes to this project are documented here. The format follows
   Spans without LLM semantics keep the HTTP naming. Backend queries, filters
   or alerts that match on the old span names need updating. The wire format
   is unchanged.
+
+### Removed
+
+- **Breaking**: the `InterceptorName.GRPC`, `InterceptorName.WEBSOCKET` and
+  `InterceptorName.SSE` enum members. They named no interceptor — selecting
+  one installed nothing at all — because gRPC, WebSocket and SSE are
+  protocols the byte seams parse (see `Protocol`), not interceptors of their
+  own. Protocol capture is unchanged. Migration: delete any reference to
+  these members; nothing replaces them and nothing is lost.
 
 ## [0.3.0b4] - 2026-08-06
 

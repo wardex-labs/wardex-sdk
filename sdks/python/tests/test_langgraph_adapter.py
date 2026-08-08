@@ -26,13 +26,12 @@ from langchain_core.tools import tool
 from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.prebuilt import ToolNode
 
-from wardex_sdk._enums import AdapterName, StatusCode
+from wardex_sdk._enums import StatusCode
 from wardex_sdk._hub import reset_for_test
-from wardex_sdk.adapters import _DETECT_PACKAGES, _make_adapter
 from wardex_sdk.adapters._context import Placement
 from wardex_sdk.adapters._langgraph import LangGraphAdapter
 from wardex_sdk.adapters._registry import AdapterRegistry
-from wardex_sdk.assembly import Limitation, SpanIntent, UnitKind, counters
+from wardex_sdk.assembly import SpanIntent, UnitKind, counters
 from wardex_sdk.assembly._diag import reset_reports_for_test
 from wardex_sdk.assembly._units import _ambient_unit
 
@@ -312,22 +311,16 @@ def call(name: str, args: dict, call_id: str) -> dict:
 
 
 # --------------------------------------------------------------------------
-# registration
-# --------------------------------------------------------------------------
-
-
-def test_langgraph_is_registered_for_auto_detection():
-    assert _DETECT_PACKAGES[AdapterName.LANGGRAPH] == "langgraph"
-    assert isinstance(_make_adapter(AdapterName.LANGGRAPH), LangGraphAdapter)
-
-
-def test_the_adapter_names_itself_after_the_enum_member():
-    assert LangGraphAdapter().name() == AdapterName.LANGGRAPH.value
-
-
-# --------------------------------------------------------------------------
 # install / uninstall
 # --------------------------------------------------------------------------
+#
+# Registration, seam identity, install/uninstall idempotence and the two
+# shutdown paths are NOT here any more. They are shared invariants — every
+# adapter owes them and each was being proved twice, in two styles — so they
+# live in `wardex_sdk.testing.conformance` and this adapter answers them in
+# `test_langgraph_conformance.py`. What stays below is what is true of THIS
+# adapter and no other: a six-patch surface that declines in two independent
+# groups, and a probe with a specific idea of what it will patch.
 
 
 def _originals():
@@ -343,31 +336,6 @@ def _originals():
         (TN, "_run_one"): TN._run_one,
         (TN, "_arun_one"): TN._arun_one,
     }
-
-
-def test_six_patches_are_installed_and_restored_by_identity():
-    """C-19. Identity, not equality: `PatchSet` restores with a plain `setattr`,
-    and a restore that merely produced an equal object would leave wardex's
-    wrapper welded on for the life of the process."""
-    before = _originals()
-    live = Installed()
-    after_install = _originals()
-    assert sum(after_install[k] is not before[k] for k in before) == 6, (
-        "all six seams must actually be replaced; a seam still holding its "
-        "original is a patch that silently did nothing"
-    )
-    live.teardown()
-    assert _originals() == before
-
-
-def test_a_second_uninstall_is_a_no_op_and_emits_no_second_root():
-    live = Installed()
-    chain(live.ctx, 1, name="Once").invoke({"trail": []})
-    live.teardown()
-    before = len(live.spans)
-    live.registry.uninstall_all()
-    live.adapter.uninstall()
-    assert len(live.spans) == before
 
 
 def test_control_flow_is_populated_only_after_a_successful_install():
@@ -393,16 +361,6 @@ def test_installing_without_a_context_patches_nothing():
     adapter.install(None, None)
     assert _originals() == before
     assert adapter._installed is False
-
-
-def test_installing_twice_is_a_no_op():
-    live = Installed()
-    try:
-        after_first = _originals()
-        live.adapter.install(live.client, live.ctx)
-        assert _originals() == after_first
-    finally:
-        live.teardown()
 
 
 # --------------------------------------------------------------------------
@@ -831,39 +789,28 @@ def test_there_is_no_pregel_invoke_confirm_site(installed):
 
 
 # --------------------------------------------------------------------------
-# close_units / uninstall while the host is mid-run
+# uninstall while the host is mid-run
 # --------------------------------------------------------------------------
 
 
-def test_close_units_closes_the_run_and_leaves_the_adapter_installed(installed):
-    app = chain(installed.ctx, 3, name="Drained", leaves=False)
-    it = app.stream({"trail": []})
-    next(it)
-    installed.adapter.close_units(marker=Limitation.UNIT_INTERRUPTED)
-    shipped = runs(installed.spans)
-    assert len(shipped) == 1
-    integrity = shipped[0].capture_integrity
-    assert integrity is not None
-    assert Limitation.UNIT_INTERRUPTED in integrity.limitations
-    assert installed.adapter._installed is True
-    list(it)  # the host keeps pumping; this must not raise into it
+def test_uninstall_mid_stream_leaves_the_context_standing_for_the_straggler():
+    """`self._ctx` is NOT nulled, which is the half the shared suite cannot see.
 
-
-def test_uninstall_mid_stream_does_not_raise_into_the_host():
-    """`self._ctx` is NOT nulled. A `stream()` generator the host is still
-    pumping needs the ctx to finish its `with`; nulling it would turn a
-    straggler into an `AttributeError` inside the host's own generator."""
+    That the run span ships carrying `ADAPTER_UNINSTALLED` is a conformance
+    invariant and lives there. What is specific to this adapter is WHY the
+    generator the host is still pumping can finish at all: its `with` needs the
+    context to close, and an adapter that nulled it on teardown — which the
+    Agent SDK adapter does, correctly, because it holds a table instead — would
+    turn a straggler into an `AttributeError` inside the host's own generator.
+    """
     live = Installed()
     app = chain(live.ctx, 3, name="TornDown", leaves=False)
     it = app.stream({"trail": []})
     next(it)
     live.teardown()
-    list(it)  # must complete
-    shipped = runs(live.spans)
-    assert len(shipped) == 1
-    integrity = shipped[0].capture_integrity
-    assert integrity is not None
-    assert Limitation.ADAPTER_UNINSTALLED in integrity.limitations
+    assert live.adapter._ctx is not None
+    trail = list(it)  # must complete, and the host's own values must arrive
+    assert trail
 
 
 # --------------------------------------------------------------------------
