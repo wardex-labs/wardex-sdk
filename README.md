@@ -40,7 +40,7 @@ way.
 
 | Group | What it decides |
 |---|---|
-| `backend=BackendConfig(...)` | Where the data goes and whose project it is: `api_key`, `endpoint` |
+| `backend=BackendConfig(...)` | Whose project the data is: `api_key` (plus `endpoint`, inert today) |
 | `retention=RetentionPolicy(...)` | How long a captured payload is kept: `default`, `triggers` |
 | `pii=PIIPolicy(...)` | What leaves the process: `mode`, `disabled_categories` |
 | `batching=BatchingPolicy(...)` | When buffered spans are sent: `flush_interval`, `flush_on_signals` |
@@ -63,6 +63,10 @@ wardex.init(
 Everything that belongs to no group stays top-level: `debug`, `before_send`,
 `capture_mode`, `release`, `environment`, `tags`, `adapters`, and the
 interception trio `intercept` / `intercept_hosts` / `interceptors`.
+
+The address lives on the transport, not on `backend`: `BackendConfig.endpoint`
+is inert today, so `init()` without a `transport=` installs `NoOpTransport` and
+captures into nothing however that field is set.
 
 The flat spelling of a grouped setting (`api_key=...`, `flush_interval=...`)
 is refused with a `TypeError` naming its new home. There is no compatibility
