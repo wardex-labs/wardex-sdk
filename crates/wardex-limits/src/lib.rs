@@ -149,9 +149,18 @@ pub struct Limits {
     /// ordinary one. Raising this without raising that moves work onto the
     /// split path instead of onto the wire.
     pub max_otlp_attribute_bytes: usize,
-    /// Maximum size of ONE OTLP/HTTP request body, encoded AND compressed —
-    /// the number the receiver actually measures. A batch that does not fit is
-    /// split across several POSTs rather than sent whole and rejected.
+    /// Maximum size of ONE OTLP/HTTP request, measured on BOTH numbers a
+    /// receiver checks: the encoded, compressed body that goes on the wire and
+    /// the message it decompresses to. A batch over either is split across
+    /// several POSTs rather than sent whole and rejected.
+    ///
+    /// Both, because a receiver enforces both. gRPC refuses a frame over
+    /// `max_receive_message_length` and then refuses what it decompresses to
+    /// under the same number; the collector's HTTP receiver applies its body
+    /// limit to the decompressed stream, which is how it refuses a
+    /// decompression bomb. Checking only the compressed size would leave the
+    /// all-or-nothing rejection reachable exactly where compression helps most
+    /// — OTLP payload attributes are base64 text and gzip several-fold.
     ///
     /// The default is gRPC's own `max_receive_message_length`, which the
     /// OTLP/gRPC receiver inherits and collector HTTP deployments commonly

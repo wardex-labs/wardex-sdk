@@ -245,8 +245,10 @@ not arrive.
   the wire. A value over it is truncated and the span says so with an
   `otlp_attribute_truncated` marker in `wardex.limitations`.
 * `max_otlp_request_bytes` (4 MiB, gRPC's own receive ceiling) caps one
-  request. A batch that does not fit is split across several POSTs instead of
-  being sent whole and rejected. Raise it if your collector accepts more.
+  request, measured both as the compressed body that goes on the wire and as
+  the message it decompresses to — receivers check both. A batch over either is
+  split across several POSTs instead of being sent whole and rejected. Raise it
+  if your collector accepts more.
 
 Requests are gzipped by default. `OtlpHttpTransport(..., compress=False)` turns
 that off for a proxy or receiver that mishandles `Content-Encoding`.

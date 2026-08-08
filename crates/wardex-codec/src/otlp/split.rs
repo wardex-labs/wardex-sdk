@@ -35,16 +35,28 @@ pub struct Requests {
 /// Encode an export, splitting it into as many bodies as
 /// `limits.max_otlp_request_bytes` requires.
 ///
-/// The measurement is the FINAL body — encoded and, when `compress` is set,
-/// compressed — because that is the number the receiver measures. Estimating
-/// from the uncompressed size would split batches that would have fitted, and
-/// estimating from a compression ratio would occasionally not split one that
-/// does not.
+/// BOTH sizes are measured against the cap — the body as it goes on the wire
+/// and the message it decompresses to — because a receiver checks both. gRPC
+/// rejects a frame over `max_receive_message_length` and then rejects what it
+/// decompresses to for the same reason; the collector's HTTP receiver applies
+/// its body limit to the decompressed stream, which is how it refuses a
+/// decompression bomb. Measuring only the compressed body would leave the
+/// failure this module exists to prevent fully reachable in the case
+/// compression makes likely: OTLP payload attributes are base64 text and gzip
+/// several-fold, so a 40 MiB export that compresses under 4 MiB would go out
+/// whole and be rejected whole.
 ///
-/// The cost of that honesty is one encode per attempt, so the shape of the
-/// algorithm matters: the whole export is tried first and the common case is
-/// therefore ONE encode with no splitting at all. Only a batch that does not
-/// fit pays for halving, and the halves it pays for shrink geometrically.
+/// Never an ESTIMATE, in either direction: both numbers come from actually
+/// encoding and actually compressing, so nothing here can disagree with what
+/// the receiver measures.
+///
+/// The cost of that honesty is an encode per attempt, so the shape of the
+/// algorithm matters. Two things keep it near one pass: the whole export is
+/// tried first, so a batch that fits — nearly every batch — costs one encode
+/// and no split at all; and a node already over the cap UNCOMPRESSED is never
+/// compressed, because gzip cannot rescue a message whose decompressed size is
+/// the thing being rejected. Compression therefore runs only on bodies that
+/// will be sent, once each, whatever depth the split reached.
 pub fn encode_requests(
     req: otlp_pb::trace_service::ExportTraceServiceRequest,
     limits: Limits,
@@ -104,8 +116,8 @@ impl Template {
         }
     }
 
-    /// The spans back out of a request that did not fit, so a retry at half the
-    /// size costs no copy of the payloads.
+    /// The spans back out of a request that did not fit, so the smaller
+    /// requests it becomes cost no copy of the payloads.
     fn reclaim(
         req: otlp_pb::trace_service::ExportTraceServiceRequest,
     ) -> Vec<otlp_pb::trace::Span> {
@@ -128,11 +140,13 @@ fn emit(
         return Ok(());
     }
     let req = template.request(spans);
-    let body = finish(&req, compress)?;
-    if body.len() <= cap {
-        out.bodies.push(body);
-        return Ok(());
-    }
+    let over = match fit(&req, cap, compress)? {
+        Fit::Fits(body) => {
+            out.bodies.push(body);
+            return Ok(());
+        }
+        Fit::Over(size) => size,
+    };
     let mut spans = Template::reclaim(req);
     if spans.len() == 1 {
         let mut span = spans.pop().expect("length was just checked");
@@ -141,36 +155,70 @@ fn emit(
         // its timing and its semantics, and says on the span itself what was
         // removed.
         map::drop_payload_attributes(&mut span);
-        let body = finish(&template.request(vec![span]), compress)?;
-        if body.len() <= cap {
-            out.bodies.push(body);
-        } else {
+        match fit(&template.request(vec![span]), cap, compress)? {
+            Fit::Fits(body) => out.bodies.push(body),
             // A span whose METADATA alone will not fit — a pathological name or
             // an event list past the cap. Counted, so the caller can say one
             // span was lost rather than let a batch quietly arrive short.
-            out.dropped_spans += 1;
+            Fit::Over(_) => out.dropped_spans += 1,
         }
         return Ok(());
     }
-    // Halving rather than greedy packing by measured span size. Both produce
-    // requests under the cap; this one costs a logarithmic number of encodes in
-    // the depth it reaches and needs no per-span size model to keep in step
-    // with what the encoder actually writes.
-    let right = spans.split_off(spans.len() / 2);
-    emit(template, spans, cap, compress, out)?;
-    emit(template, right, cap, compress, out)
+    // Fan out in ONE step from the measurement already paid for, rather than
+    // bisecting. Halving looks cheaper and is not: every level re-encodes the
+    // same N bytes, so depth d costs d+1 full passes over the whole batch, and
+    // the depth is reachable — a full 64 MiB buffer against the 4 MiB default
+    // is five of them. Dividing the measured size by the cap lands on the right
+    // number of chunks immediately, and a chunk that is still over (because one
+    // span in it dominates) simply recurses on its own measurement.
+    //
+    // `cap.max(1)` guards the division alone: a cap of 0 is not reachable from
+    // the SDK's own validation, and the core must not panic for a limit a host
+    // constructed by hand.
+    let parts = over.div_ceil(cap.max(1)).clamp(2, spans.len());
+    let chunk = spans.len().div_ceil(parts);
+    let mut rest = spans;
+    while !rest.is_empty() {
+        let tail = rest.split_off(chunk.min(rest.len()));
+        emit(template, rest, cap, compress, out)?;
+        rest = tail;
+    }
+    Ok(())
 }
 
-fn finish(
+/// One request measured against the cap: the body to send, or how large the
+/// attempt turned out to be.
+enum Fit {
+    Fits(Vec<u8>),
+    Over(usize),
+}
+
+/// Encode, compress if asked, and answer whether a receiver would take it.
+///
+/// The uncompressed size is checked FIRST and the compression pass is skipped
+/// when it already fails, which is both halves of the point. A receiver
+/// enforces its ceiling on the decompressed message as well as on the body, so
+/// a batch that gzips under the cap from far above it is rejected anyway;
+/// and a node the split is about to discard must not have been compressed,
+/// because that pass over the whole batch is the expensive one.
+///
+/// Both buffers are owned here, so a node that does not fit frees them on the
+/// way out — the recursion holds the span tree, not a discarded encoding of it
+/// at every level.
+fn fit(
     req: &otlp_pb::trace_service::ExportTraceServiceRequest,
+    cap: usize,
     compress: bool,
-) -> Result<Vec<u8>, CodecError> {
+) -> Result<Fit, CodecError> {
     let bytes = super::encode_traces(req)?;
-    if compress {
-        gzip(&bytes)
-    } else {
-        Ok(bytes)
+    if bytes.len() > cap {
+        return Ok(Fit::Over(bytes.len()));
     }
+    let body = if compress { gzip(&bytes)? } else { bytes };
+    if body.len() > cap {
+        return Ok(Fit::Over(body.len()));
+    }
+    Ok(Fit::Fits(body))
 }
 
 #[cfg(test)]
@@ -295,6 +343,27 @@ mod tests {
     }
 
     #[test]
+    fn a_batch_many_times_the_cap_does_not_split_into_many_times_too_many() {
+        // The fan-out is derived from the measured size, so it has to land near
+        // the number of requests the batch actually needs. A splitter that
+        // over-shoots turns one export into a burst of POSTs, and one that
+        // under-shoots pays another full encode of the whole batch per level —
+        // which is the cost that made bisection the wrong shape here.
+        let spans: Vec<Span> = (1..=32).map(|i| payload_span(i, 4000)).collect();
+        let total = super::super::encode_traces(&request(spans.clone()))
+            .unwrap()
+            .len();
+        let cap = total / 8;
+        let out = encode_requests(request(spans), limits_with_request_cap(cap), false).unwrap();
+        assert!(
+            (8..=20).contains(&out.bodies.len()),
+            "8 requests' worth of spans became {}",
+            out.bodies.len()
+        );
+        assert_eq!(span_ids(&out, false), (1..=32).collect::<Vec<u8>>());
+    }
+
+    #[test]
     fn every_chunk_carries_the_resource_and_the_scope() {
         // A split body that lost them would arrive unattributed: the spans in
         // it would name no service and no instrumentation library.
@@ -311,25 +380,41 @@ mod tests {
     }
 
     #[test]
-    fn the_cap_is_measured_on_the_compressed_body() {
-        // Compression is what decides whether a batch fits, so measuring
-        // before it would split batches a receiver would have accepted.
+    fn the_cap_holds_on_the_body_and_on_what_it_decompresses_to() {
+        // A receiver checks both, so both are measured. Enforcing only the
+        // compressed size is the dangerous half: OTLP payload attributes are
+        // base64 text and gzip several-fold, so a batch far over a collector's
+        // decompressed ceiling fits under it compressed, goes out as one
+        // request, and is rejected WHOLE — every span in it lost, which is the
+        // outcome splitting exists to avoid.
         let spans: Vec<Span> = (1..=8).map(|i| payload_span(i, 4000)).collect();
-        let uncompressed = encode_requests(
-            request(spans.clone()),
-            limits_with_request_cap(8_000),
-            false,
-        )
-        .unwrap();
-        let compressed =
-            encode_requests(request(spans), limits_with_request_cap(8_000), true).unwrap();
+        let out = encode_requests(request(spans), limits_with_request_cap(8_000), true).unwrap();
+        assert_eq!(out.dropped_spans, 0);
+        assert_eq!(span_ids(&out, true), (1..=8).collect::<Vec<u8>>());
+        for body in &out.bodies {
+            assert!(body.len() <= 8_000, "body of {} bytes", body.len());
+            let raw = gunzip(body).unwrap();
+            assert!(raw.len() <= 8_000, "decompresses to {} bytes", raw.len());
+        }
+    }
+
+    #[test]
+    fn a_batch_that_only_fits_once_gzipped_is_still_split() {
+        // The regression the test above describes, as a single assertion: this
+        // payload is repetitive enough that gzip crushes the whole batch to
+        // well under the cap, so a splitter measuring only the compressed body
+        // would emit exactly one request.
+        let spans: Vec<Span> = (1..=8).map(|i| payload_span(i, 4000)).collect();
+        let whole = super::super::encode_traces(&request(spans.clone())).unwrap();
         assert!(
-            compressed.bodies.len() < uncompressed.bodies.len(),
-            "compressed into {} requests, uncompressed into {}",
-            compressed.bodies.len(),
-            uncompressed.bodies.len()
+            crate::gzip(&whole).unwrap().len() <= 8_000,
+            "not the case under test"
         );
-        assert_eq!(span_ids(&compressed, true), (1..=8).collect::<Vec<u8>>());
+        let out = encode_requests(request(spans), limits_with_request_cap(8_000), true).unwrap();
+        assert!(
+            out.bodies.len() > 1,
+            "an oversized batch went out as one request"
+        );
     }
 
     #[test]
@@ -338,7 +423,7 @@ mod tests {
         // off-by-one here is a request split for no reason or a request one
         // byte over the limit.
         let req = request(vec![payload_span(1, 500)]);
-        let exact = super::finish(&req, false).unwrap().len();
+        let exact = super::super::encode_traces(&req).unwrap().len();
         let at = encode_requests(
             request(vec![payload_span(1, 500)]),
             limits_with_request_cap(exact),
