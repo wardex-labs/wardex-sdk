@@ -23,12 +23,12 @@ import asyncio
 
 import anyio
 import pytest
-from wardex_sdk.testing import AdapterConformanceSuite, AdapterSubject, Stalled
 
 from test_agent_sdk_adapter_install import INIT_LINE
 from test_agent_sdk_units import _ReaderDispatchTransport, _run, _tool
 from wardex_sdk._enums import AdapterName
 from wardex_sdk.adapters._anthropic_agent_sdk import AnthropicAgentSdkAdapter
+from wardex_sdk.testing import AdapterConformanceSuite, AdapterSubject, Stalled
 
 
 def seams() -> dict[str, object]:

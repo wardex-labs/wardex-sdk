@@ -15,11 +15,11 @@ of those is a shared invariant, and none of them moved.
 from __future__ import annotations
 
 import pytest
-from wardex_sdk.testing import AdapterConformanceSuite, AdapterSubject, Stalled
 
 from test_langgraph_adapter import chain
 from wardex_sdk._enums import AdapterName
 from wardex_sdk.adapters._langgraph import LangGraphAdapter
+from wardex_sdk.testing import AdapterConformanceSuite, AdapterSubject, Stalled
 
 _N_NODES = 3
 
