@@ -198,7 +198,7 @@ _MEMBER_SITES: dict[str, frozenset[str]] = {
     # The two shutdown markers, and the split between them is which shutdown
     # actually happened rather than which code path ran. The adapter's
     # `uninstall()` names ADAPTER_UNINSTALLED, and it is what an ordinary exit
-    # reaches, because atexit tears the adapter down. `_lifecycle.py` names
+    # reaches, because atexit tears the adapter down. `_runtime.py` names
     # UNIT_INTERRUPTED from the signal handler, on the one disposition where
     # the process dies inside the handler and atexit provably never runs.
     #
@@ -221,7 +221,7 @@ _MEMBER_SITES: dict[str, frozenset[str]] = {
             "testing/conformance.py",
         }
     ),
-    "UNIT_INTERRUPTED": frozenset({"_lifecycle.py", "testing/conformance.py"}),
+    "UNIT_INTERRUPTED": frozenset({"_runtime.py", "testing/conformance.py"}),
     # Two sites, and they are the two halves of one fact: where wardex failed,
     # and where the consequence lands. `adapters/_context.py` knows it failed —
     # `_abandon` marks a unit whose open or description died, `_run` marks one

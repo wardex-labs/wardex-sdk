@@ -29,7 +29,7 @@ import time
 
 import pytest
 
-from wardex_sdk import _lifecycle
+from wardex_sdk import _runtime
 from wardex_sdk._client import Client, _UnnamedTimeout
 from wardex_sdk._config import WardexConfig
 from wardex_sdk._enums import SpanKind
@@ -179,7 +179,7 @@ def test_a_timeout_at_the_transports_own_configured_limit_stays_silent(black_hol
 
 @pytest.fixture
 def signal_handler_only(monkeypatch):
-    """`_lifecycle._handler` with everything but the flush taken out of the way.
+    """`_runtime._handler` with everything but the flush taken out of the way.
 
     Driven through the handler FUNCTION rather than through `Client.flush`,
     because the defect is precisely that the client cannot see who called it:
@@ -192,12 +192,13 @@ def signal_handler_only(monkeypatch):
     no re-raise -- so what runs is the flush and only the flush. `_close_units`
     is None for the same reason.
     """
-    monkeypatch.setattr(_lifecycle, "_prev_handlers", {})
-    monkeypatch.setattr(_lifecycle, "_close_units", None)
+    runtime = _runtime.runtime()
+    monkeypatch.setattr(runtime, "_prev_handlers", {})
+    monkeypatch.setattr(runtime, "_close_units", None)
 
     def deliver(client: Client) -> None:
-        monkeypatch.setattr(_lifecycle, "_current_client", client)
-        _lifecycle._handler(signal.SIGTERM, None)
+        monkeypatch.setattr(runtime, "_client", client)
+        _runtime._handler(signal.SIGTERM, None)
 
     return deliver
 
@@ -207,8 +208,8 @@ def test_the_signal_handlers_own_budget_is_not_a_number_any_caller_passed():
     and this is the property they depend on: the handler's 2s is wardex's, and
     it says so in its type rather than leaving `flush` to guess from the value.
     """
-    assert isinstance(_lifecycle._SIGNAL_FLUSH_TIMEOUT, _UnnamedTimeout), (
-        f"_SIGNAL_FLUSH_TIMEOUT is a plain {type(_lifecycle._SIGNAL_FLUSH_TIMEOUT).__name__}, "
+    assert isinstance(_runtime._SIGNAL_FLUSH_TIMEOUT, _UnnamedTimeout), (
+        f"_SIGNAL_FLUSH_TIMEOUT is a plain {type(_runtime._SIGNAL_FLUSH_TIMEOUT).__name__}, "
         f"so a flush from the signal handler is indistinguishable from a host's flush(2.0) "
         f"and gets the host blamed for it"
     )

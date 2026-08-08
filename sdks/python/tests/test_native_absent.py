@@ -16,9 +16,9 @@ drives all of `wardex_sdk.__all__` bar the enums and four inert values, and
 added to `__all__` without a step, so the checklist cannot fall behind the API.
 
 How far that reaches, exactly: every symbol on `wardex_sdk.__all__` works, and
-so does importing `wardex_sdk.transport`, `.context`, `.assembly`, `.adapters`
-and `.pipeline`; the internal modules that reach the core at import time --
-`wardex_sdk.protocol`, `.semantics`, `.interceptors`, `transport._codec` and
+so does importing `wardex_sdk.transport`, `.context`, `.assembly`, `.adapters`,
+`.interceptors` and `.pipeline`; the internal modules that reach the core at
+import time -- `wardex_sdk.protocol`, `.semantics`, `transport._codec` and
 three `adapters/` modules -- still raise `ImportError`, and each is reachable
 only through `init()`, which returns before importing any. Both halves are
 asserted (`DEGRADES` / `STILL_RAISES` in the child) so the line cannot move
@@ -281,6 +281,13 @@ DEGRADES = (
     "wardex_sdk.context",
     "wardex_sdk.assembly",
     "wardex_sdk.adapters",
+    # Moved up from STILL_RAISES when the package `__init__` stopped importing
+    # the TLS seam eagerly: every seam is built inside its factory now, so
+    # importing the package no longer drags `_ssl` -- and the core underneath
+    # it -- along. `Runtime` reaches this package from teardown paths that exist
+    # precisely to work when the extension does not, so the move is load-bearing
+    # rather than incidental.
+    "wardex_sdk.interceptors",
     "wardex_sdk.pipeline",
     "wardex_sdk._limits",
     "wardex_sdk._client",
@@ -289,7 +296,6 @@ DEGRADES = (
 STILL_RAISES = (
     "wardex_sdk.protocol",
     "wardex_sdk.semantics",
-    "wardex_sdk.interceptors",
     "wardex_sdk.transport._codec",
     "wardex_sdk.adapters._assembler",
     "wardex_sdk.adapters._anthropic_agent_sdk",

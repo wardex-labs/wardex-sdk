@@ -259,3 +259,22 @@ def uninstall_shared_timing() -> None:
     if _shared_refcount == 0 and _shared_probe is not None:
         _shared_probe.uninstall()
         _shared_store.clear()  # type: ignore[union-attr]
+
+
+def reset_shared_timing() -> None:
+    """Drop the probe, the store and the refcount outright. TEST-ONLY.
+
+    The refcount exists so that two byte seams can share one `socket.connect`
+    patch; it is NOT a way to force the probe out, because a seam that never
+    took a reference must never be able to release one (a rolled-back install
+    that decremented the count restored `socket.connect` out from under the
+    seam still using it). This is the other operation — the owner, `Runtime.
+    reset()`, saying that no seam is left to hold a reference — so it undoes the
+    patch regardless of the count instead of counting down to it.
+    """
+    global _shared_store, _shared_probe, _shared_refcount
+    if _shared_probe is not None:
+        _shared_probe.uninstall()
+    _shared_store = None
+    _shared_probe = None
+    _shared_refcount = 0

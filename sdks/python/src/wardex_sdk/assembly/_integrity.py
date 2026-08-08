@@ -245,7 +245,7 @@ Two emit sites, and the first is the mechanism the second restates.
     """The unit was torn down by cancellation or interpreter shutdown rather
     than by a normal end-of-run.
 
-    Emitted by ``_lifecycle.py``'s signal handler, and by that one alone. It is
+    Emitted by ``_runtime.py``'s signal handler, and by that one alone. It is
     reached only on the disposition where the app left the signal at its
     default: there the handler ends the process itself, so ``atexit`` never
     runs and the ordinary teardown never gets its turn. Under any other

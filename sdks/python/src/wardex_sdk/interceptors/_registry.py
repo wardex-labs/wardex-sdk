@@ -102,7 +102,7 @@ class InterceptorRegistry:
         pending WS session, a shared-timing teardown — abandoned every
         interceptor queued behind it, left `_installed` populated (so the next
         `install()` silently no-ops by name, forever), and propagated out of
-        `_lifecycle._teardown` before `client.close()`, losing every buffered
+        `Runtime._teardown` before `client.close()`, losing every buffered
         span. That runs from `atexit`, where the exception goes nowhere anyone
         reads.
 
@@ -121,8 +121,14 @@ class InterceptorRegistry:
         return name in self._installed
 
 
-_registry = InterceptorRegistry()
-
-
 def get_registry() -> InterceptorRegistry:
-    return _registry
+    """The process registry, which `Runtime` owns and builds on first use.
+
+    Not a module singleton of its own any more: a registry nobody owns is a
+    registry `reset_for_test()` cannot drain, which is how an interceptor
+    installed by one test stayed in front of the host's sockets for every test
+    behind it.
+    """
+    from .._runtime import runtime
+
+    return runtime().interceptors

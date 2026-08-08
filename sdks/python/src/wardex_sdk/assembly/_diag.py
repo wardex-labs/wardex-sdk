@@ -43,7 +43,7 @@ class Counters:
     forbids.
 
     Reentrancy: an RLock, because a guarded block can be interrupted by a signal
-    handler that runs wardex code (`_lifecycle.py` installs one) and re-enters
+    handler that runs wardex code (`_runtime.py` installs one) and re-enters
     `bump()` on the same thread. A plain Lock would deadlock the host there.
     The RLock buys deadlock-freedom and cross-thread serialization, and that is
     all it buys: `bump()` is a read-modify-write with a Python-level call in the
@@ -129,7 +129,7 @@ def _log_with_traceback(where: str, exc: BaseException) -> None:
 _REPORTED: dict[str, object] = {}
 
 #: An RLock, for the reason `Counters` gives: a signal handler that runs wardex
-#: code (`_lifecycle.py` installs one) can land on a thread that is already
+#: code (`_runtime.py` installs one) can land on a thread that is already
 #: inside `report_once`, and re-enter it. A plain Lock deadlocks the host there,
 #: on its own thread, forever.
 #:
