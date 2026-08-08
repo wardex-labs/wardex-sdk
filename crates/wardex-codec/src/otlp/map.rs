@@ -276,8 +276,40 @@ fn string_attr<'a>(extra: &'a [pb::KeyValue], key: &str) -> Option<&'a str> {
     })
 }
 
-/// The OTLP span name — `{gen_ai.operation.name} {gen_ai.request.model}` once a
-/// span carries LLM semantics, otherwise the name the caller gave it.
+/// Does this operation name a call TO A MODEL — the one shape whose semconv
+/// name is composed from a model id?
+///
+/// `gen_ai.operation.name` is not "this span is an LLM call": every span in the
+/// closed vocabulary carries it, so `execute_tool`, `invoke_agent` and the rest
+/// arrive here too. Their semconv subject is a tool or agent name, never a
+/// model, and the sender already composed it into the name.
+///
+/// Exhaustive on the generated enum on purpose: a thirteenth operation has to
+/// be classified here rather than inheriting whichever branch happened to be
+/// the fallthrough. An unrecognized string is not a model call — a build that
+/// does not know the operation cannot know how semconv names it.
+fn is_model_operation(operation: &str) -> bool {
+    use pb::OperationName as Op;
+    let code = vocab::operation_name_to_proto(operation);
+    match code.and_then(|n| Op::try_from(n).ok()) {
+        Some(Op::Chat | Op::TextCompletion | Op::Embeddings | Op::GenerateContent) => true,
+        Some(
+            Op::ExecuteTool
+            | Op::CreateAgent
+            | Op::InvokeAgent
+            | Op::InvokeWorkflow
+            | Op::Retrieval
+            | Op::ExecuteStep
+            | Op::Handoff
+            | Op::Evaluate
+            | Op::Unspecified,
+        )
+        | None => false,
+    }
+}
+
+/// The OTLP span name — `{gen_ai.operation.name} {model}` for a call to a
+/// model, otherwise the name the sender gave it.
 ///
 /// The name it replaces was the transport's: `HTTP POST /v1/chat/completions`,
 /// which is the SAME STRING for every model, every prompt and every provider
@@ -286,19 +318,35 @@ fn string_attr<'a>(extra: &'a [pb::KeyValue], key: &str) -> Option<&'a str> {
 /// bucket that answered no question anyone asks — while the two facts a reader
 /// actually groups by sat one level down in the attributes.
 ///
-/// The model half is dropped rather than defaulted when `gen_ai.request.model`
-/// is absent: `"chat"` says the model was not recorded, where `"chat unknown"`
-/// invents a model of that name and a backend would happily aggregate it.
+/// Two things this deliberately does NOT do, because each would trade one
+/// collapse for a wider one:
 ///
-/// A span with no `gen_ai.operation.name` keeps its own name, so this is a
-/// rename for LLM spans and a no-op for everything else.
+///   * It does not rename a span whose operation is not a model call. Those
+///     names already carry a subject the sender composed — `execute_tool Bash`,
+///     `invoke_agent researcher` — and rewriting them to the bare operation
+///     would put every tool call in a run into one bucket, which is the very
+///     failure this rename exists to remove.
+///   * It does not fall back to the bare operation when no model was recorded.
+///     `chat` is strictly less than the name that was already there, and
+///     `chat unknown` is worse still: it invents a model of that name and a
+///     backend aggregates it as one. An unnamed model leaves the name alone.
+///
+/// `gen_ai.response.model` is consulted when the request never recorded one.
+/// That is not inventing a model — the SDK observed it, one attribute away, and
+/// a span named for the model that answered beats one named for no model at
+/// all.
 fn span_name(sp: &pb::Span) -> String {
     let Some(operation) = string_attr(&sp.extra, "gen_ai.operation.name") else {
         return sp.name.clone();
     };
-    match string_attr(&sp.extra, "gen_ai.request.model") {
+    if !is_model_operation(operation) {
+        return sp.name.clone();
+    }
+    match string_attr(&sp.extra, "gen_ai.request.model")
+        .or_else(|| string_attr(&sp.extra, "gen_ai.response.model"))
+    {
         Some(model) => format!("{operation} {model}"),
-        None => operation.to_owned(),
+        None => sp.name.clone(),
     }
 }
 
@@ -598,21 +646,83 @@ mod tests {
     }
 
     #[test]
-    fn an_llm_span_with_no_model_is_named_for_the_operation_alone() {
-        // Not "chat unknown": that invents a model of that name and a backend
-        // aggregates it as one.
+    fn the_model_that_answered_names_the_span_when_the_request_recorded_none() {
+        // Not inventing a model: the SDK observed this one, one attribute away.
+        // An assembled turn is exactly this shape — the response model is known
+        // before the stream has reported what was requested.
+        let sp = gen_ai_span(&[
+            ("gen_ai.operation.name", "chat"),
+            ("gen_ai.response.model", "claude-sonnet-5"),
+        ]);
+        assert_eq!(span_name(&sp), "chat claude-sonnet-5");
+    }
+
+    #[test]
+    fn an_llm_span_with_no_model_at_all_keeps_the_name_it_was_given() {
+        // Not "embeddings" and not "embeddings unknown": the first is strictly
+        // less than the name already there, and the second invents a model of
+        // that name for a backend to aggregate.
         let sp = gen_ai_span(&[("gen_ai.operation.name", "embeddings")]);
-        assert_eq!(span_name(&sp), "embeddings");
+        assert_eq!(span_name(&sp), "HTTP POST /v1/chat/completions");
         let blank = gen_ai_span(&[
             ("gen_ai.operation.name", "embeddings"),
             ("gen_ai.request.model", ""),
         ]);
-        assert_eq!(span_name(&blank), "embeddings");
+        assert_eq!(span_name(&blank), "HTTP POST /v1/chat/completions");
     }
 
     #[test]
     fn a_span_without_llm_semantics_keeps_the_name_it_was_given() {
         let sp = gen_ai_span(&[("http.request.method", "POST")]);
+        assert_eq!(span_name(&sp), "HTTP POST /v1/chat/completions");
+    }
+
+    #[test]
+    fn a_non_model_operation_keeps_the_subject_the_sender_composed() {
+        // EVERY span in the closed vocabulary carries `gen_ai.operation.name`,
+        // not only the LLM ones, and none of these can carry a request model —
+        // `execute_tool` requires a tool block, `invoke_agent` an agent block.
+        // Reading the key as "this is an LLM call" and dropping to the bare
+        // operation would put every tool call in a run into one bucket, which
+        // is the collapse this rename exists to remove.
+        for (operation, subject) in [
+            ("execute_tool", "execute_tool Bash"),
+            ("invoke_agent", "invoke_agent researcher"),
+            ("execute_step", "execute_step summarize"),
+            ("invoke_workflow", "nightly reconciliation"),
+            ("retrieval", "retrieval kb-docs"),
+            ("handoff", "handoff reviewer"),
+            ("evaluate", "evaluate toxicity"),
+            ("create_agent", "create_agent planner"),
+        ] {
+            let sp = pb::Span {
+                name: subject.into(),
+                extra: vec![kv_wardex("gen_ai.operation.name", operation)],
+                ..Default::default()
+            };
+            assert_eq!(span_name(&sp), subject);
+        }
+    }
+
+    #[test]
+    fn a_tool_span_is_not_renamed_by_a_model_that_wandered_onto_it() {
+        // The gate is the OPERATION, not the presence of a model attribute: a
+        // tool span that picked up a model from a parsed payload is still a
+        // tool span, and `execute_tool gpt-4.1-mini` names the wrong thing.
+        let sp = pb::Span {
+            name: "execute_tool Bash".into(),
+            extra: vec![
+                kv_wardex("gen_ai.operation.name", "execute_tool"),
+                kv_wardex("gen_ai.request.model", "gpt-4.1-mini"),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(span_name(&sp), "execute_tool Bash");
+    }
+
+    #[test]
+    fn an_operation_this_build_does_not_know_is_not_treated_as_a_model_call() {
+        let sp = gen_ai_span(&[("gen_ai.operation.name", "banana")]);
         assert_eq!(span_name(&sp), "HTTP POST /v1/chat/completions");
     }
 

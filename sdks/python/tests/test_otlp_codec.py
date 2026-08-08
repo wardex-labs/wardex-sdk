@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from wardex_sdk import _wardex_native
 from wardex_sdk._enums import (
+    CaptureSource,
     Direction,
     OperationName,
     Protocol,
@@ -24,9 +25,17 @@ from wardex_sdk._types import (
     SdkInfo,
     SpanContext,
     SpanId,
+    ToolAttributes,
     TraceId,
     TransportAttributes,
     TransportTiming,
+)
+from wardex_sdk.assembly import (
+    AMBIENT,
+    Ambient,
+    SpanDraft,
+    SpanIntent,
+    resolve_parentage,
 )
 
 
@@ -244,21 +253,80 @@ def test_an_llm_span_is_named_for_its_operation_and_model():
     )
 
 
-def test_an_llm_span_with_no_request_model_is_named_for_the_operation_alone():
-    """Not `chat unknown`: that invents a model of that name, and a backend
-    aggregates it as one."""
+def test_the_model_that_answered_names_the_span_when_the_request_recorded_none():
+    """An assembled turn knows the response model before it knows the requested
+    one, and the SDK has it one attribute away — so a span named for the model
+    that answered beats one named for no model at all."""
+    env = InternalEnvelope(
+        header=_header(),
+        spans=(
+            _span(
+                gen_ai=GenAIAttributes(
+                    operation=OperationName.CHAT, response_model="claude-sonnet-5"
+                )
+            ),
+        ),
+    )
+    assert _first_span(env)["name"] == "chat claude-sonnet-5"
+
+
+def test_an_llm_span_with_no_model_at_all_keeps_its_own_name():
+    """Not `embeddings` and not `embeddings unknown`: the first is strictly less
+    than the name already there, the second invents a model of that name for a
+    backend to aggregate."""
     env = InternalEnvelope(
         header=_header(),
         spans=(_span(gen_ai=GenAIAttributes(operation=OperationName.EMBEDDINGS)),),
     )
-    assert _first_span(env)["name"] == "embeddings"
+    assert _first_span(env)["name"] == "HTTP POST /v1/chat"
 
 
 def test_a_span_without_llm_semantics_keeps_its_own_name():
-    """The negative control for the rename above: it is a rename for LLM spans
-    and a no-op for everything else, so a plain HTTP span still says what it
-    was."""
+    """The negative control for the rename above: it is a rename for calls to a
+    model and a no-op for everything else, so a plain HTTP span still says what
+    it was."""
     assert _first_span(_envelope_with_span())["name"] == "HTTP POST /v1/chat"
+
+
+def test_a_tool_span_the_builder_produced_keeps_its_subject():
+    """Built by `SpanDraft`, not by hand: EVERY vocabulary span carries
+    `gen_ai.operation.name`, so reading that key as "this is a call to a model"
+    renames the whole vocabulary. `execute_tool` requires a tool block and can
+    carry no request model, so the collapse would be total — every tool call in
+    every run in one bucket, which is the failure the rename exists to remove.
+    """
+    draft = SpanDraft(
+        resolve_parentage(Ambient(None, None, None), AMBIENT),
+        intent=SpanIntent.EXECUTE_TOOL,
+        subject="Bash",
+        source=CaptureSource.ADAPTER,
+        start_ns=1,
+    )
+    draft.set_tool(ToolAttributes(name="Bash"))
+    draft.set_status(StatusCode.OK)
+    span = draft.finish(end_ns=2)
+    assert span.name == "execute_tool Bash"
+    env = InternalEnvelope(header=_header(), spans=(span,))
+    assert _first_span(env)["name"] == "execute_tool Bash"
+
+
+def test_a_decorator_named_span_keeps_the_name_the_host_chose():
+    """`@wardex.tool(name="search_docs")` builds a MANUAL span with an operation
+    LABEL and no tool block, because the decorator's `tool=` argument is
+    optional. The name is the host's and it is a published API, so `search_docs`
+    has to survive the one transport exported from the package root."""
+    draft = SpanDraft.manual(
+        resolve_parentage(Ambient(None, None, None), AMBIENT),
+        name="search_docs",
+        kind=SpanKind.INTERNAL,
+        start_ns=1,
+    )
+    draft.set_operation_label(OperationName.EXECUTE_TOOL)
+    draft.set_status(StatusCode.OK)
+    span = draft.finish(end_ns=2)
+    env = InternalEnvelope(header=_header(), spans=(span,))
+    assert _first_span(env)["attributes"]["gen_ai.operation.name"] == "execute_tool"
+    assert _first_span(env)["name"] == "search_docs"
 
 
 def test_resource_service_name():
