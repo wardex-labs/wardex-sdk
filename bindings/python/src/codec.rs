@@ -1176,11 +1176,21 @@ fn encode_otlp_traces(
     // Marshalling walks Python objects — the only part that needs the GIL.
     // Traces only: state snapshots have no OTLP trace form, so walking them
     // here would spend the GIL on records the mapping drops.
+    //
+    // ONE marshaller feeds both export surfaces, which means this walk reads a
+    // few fields the trace mapping does not project. That is the price of the
+    // envelope being the only model either surface is built from: a narrower
+    // walk for traces would be a second marshaling path to keep in step, and
+    // the first time the two disagreed it would show up as a missing attribute
+    // on a user's wire rather than as a failing build.
     let proto = envelope_to_proto(envelope, false)?;
     // Mapping + masking + protobuf are pure Rust: release the GIL so app
     // threads keep running while the batch worker encodes (design §9).
     let bytes = py.allow_threads(move || -> PyResult<Vec<u8>> {
-        let mut req = otlp::map::envelope_to_traces(&proto, PRODUCER);
+        // `proto` is CONSUMED here, so the envelope's payloads move into the
+        // request instead of being copied beside it — one flush of a full batch
+        // holds one copy of every captured body, not two.
+        let mut req = otlp::map::envelope_to_traces(proto, PRODUCER);
         pii_apply_otlp(&mut req, pii_mode, &pii_disabled)?;
         // After masking, never before: the PII engine's byte-level patterns
         // match inside raw payloads, and a payload already rewritten to

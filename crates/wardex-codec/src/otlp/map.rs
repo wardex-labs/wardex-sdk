@@ -91,27 +91,32 @@ fn kv_strs(key: &str, vs: Vec<String>) -> otlp_pb::common::KeyValue {
 
 /// wardex `AnyValue` → OTLP `AnyValue`. The two schemas declare the same
 /// variants under different numbers, so this is a remap and not a conversion.
-fn any_value(v: &pb::AnyValue) -> otlp_pb::common::AnyValue {
+///
+/// By value throughout this module: the envelope is built for this mapping and
+/// dropped by it, so a borrow would buy nothing and cost a second copy of every
+/// captured payload — alive at the same time as the first, on the background
+/// export path, where `max_buffer_bytes` is sized against ONE.
+fn any_value(v: pb::AnyValue) -> otlp_pb::common::AnyValue {
     use otlp_pb::common::any_value::Value as Otlp;
     use pb::any_value::Value as Wardex;
-    let value = match &v.value {
-        Some(Wardex::StringValue(s)) => Some(Otlp::StringValue(s.clone())),
-        Some(Wardex::IntValue(i)) => Some(Otlp::IntValue(*i)),
-        Some(Wardex::DoubleValue(d)) => Some(Otlp::DoubleValue(*d)),
-        Some(Wardex::BoolValue(b)) => Some(Otlp::BoolValue(*b)),
+    let value = match v.value {
+        Some(Wardex::StringValue(s)) => Some(Otlp::StringValue(s)),
+        Some(Wardex::IntValue(i)) => Some(Otlp::IntValue(i)),
+        Some(Wardex::DoubleValue(d)) => Some(Otlp::DoubleValue(d)),
+        Some(Wardex::BoolValue(b)) => Some(Otlp::BoolValue(b)),
         // Bytes pass through here untouched: masking must still see the raw
         // payload. `strip_bytes_values` removes every bytes_value from the
         // request after masking, right before serialization.
-        Some(Wardex::BytesValue(b)) => Some(Otlp::BytesValue(b.clone())),
+        Some(Wardex::BytesValue(b)) => Some(Otlp::BytesValue(b)),
         _ => None,
     };
     otlp_pb::common::AnyValue { value }
 }
 
-fn key_value(kv: &pb::KeyValue) -> otlp_pb::common::KeyValue {
+fn key_value(kv: pb::KeyValue) -> otlp_pb::common::KeyValue {
     otlp_pb::common::KeyValue {
-        key: kv.key.clone(),
-        value: kv.value.as_ref().map(any_value),
+        key: kv.key,
+        value: kv.value.map(any_value),
     }
 }
 
@@ -233,11 +238,11 @@ fn uncertainty(sp: &pb::Span, attrs: &mut Vec<otlp_pb::common::KeyValue>) {
 /// the OTLP exporter would lose design §6.3's whole graph model with no
 /// counter, no `Limitation` marker and no failing test, indistinguishable from
 /// "this agent has no graph edges". That is the silent-loss shape I4 forbids.
-fn event(ev: &pb::SpanEvent) -> otlp_pb::trace::span::Event {
+fn event(ev: pb::SpanEvent) -> otlp_pb::trace::span::Event {
     otlp_pb::trace::span::Event {
         time_unix_nano: ev.time_unix_nano,
-        name: ev.name.clone(),
-        attributes: ev.attributes.iter().map(key_value).collect(),
+        name: ev.name,
+        attributes: ev.attributes.into_iter().map(key_value).collect(),
         ..Default::default()
     }
 }
@@ -248,16 +253,16 @@ fn event(ev: &pb::SpanEvent) -> otlp_pb::trace::span::Event {
 /// attributes and nothing else — so it travels as the `wardex.link.reason`
 /// attribute rather than being dropped, as the wardex value string so that it
 /// is readable without a copy of the enum.
-fn link(ln: &pb::SpanLink) -> otlp_pb::trace::span::Link {
-    let mut attributes: Vec<otlp_pb::common::KeyValue> =
-        ln.attributes.iter().map(key_value).collect();
+fn link(ln: pb::SpanLink) -> otlp_pb::trace::span::Link {
     let reason = vocab::link_reason_name(ln.reason);
+    let mut attributes: Vec<otlp_pb::common::KeyValue> =
+        ln.attributes.into_iter().map(key_value).collect();
     if !reason.is_empty() {
         attributes.push(kv_str("wardex.link.reason", &reason));
     }
     otlp_pb::trace::span::Link {
-        trace_id: ln.trace_id.clone(),
-        span_id: ln.span_id.clone(),
+        trace_id: ln.trace_id,
+        span_id: ln.span_id,
         attributes,
         ..Default::default()
     }
@@ -350,11 +355,19 @@ fn span_name(sp: &pb::Span) -> String {
     }
 }
 
-fn span(sp: &pb::Span) -> otlp_pb::trace::Span {
+fn span(mut sp: pb::Span) -> otlp_pb::trace::Span {
+    use std::mem::take;
+
+    // Read before anything is moved out: naming consults `extra`, and
+    // `uncertainty` wants the whole span.
+    let name = span_name(&sp);
+    let code = status_code(sp.status.as_ref().map(|s| s.code).unwrap_or_default());
+
     // gen_ai / agent / tool attributes were flattened into `extra` when the
     // envelope was marshalled, so both export surfaces carry one flattening and
     // cannot drift.
-    let mut attrs: Vec<otlp_pb::common::KeyValue> = sp.extra.iter().map(key_value).collect();
+    let mut attrs: Vec<otlp_pb::common::KeyValue> =
+        take(&mut sp.extra).into_iter().map(key_value).collect();
 
     // server.* — the empty string and port 0 are proto3 "unset", and neither is
     // a value a host could have meant.
@@ -377,39 +390,40 @@ fn span(sp: &pb::Span) -> otlp_pb::trace::Span {
     // Raw I/O → wardex.input_data / wardex.output_data (omitted if empty).
     // Built as bytes so PII masking sees the raw payload; `strip_bytes_values`
     // converts to strings after masking, before serialization.
-    if !sp.input_data.is_empty() {
-        attrs.push(kv_bytes("wardex.input_data", sp.input_data.clone()));
+    let input = take(&mut sp.input_data);
+    if !input.is_empty() {
+        attrs.push(kv_bytes("wardex.input_data", input));
     }
-    if !sp.output_data.is_empty() {
-        attrs.push(kv_bytes("wardex.output_data", sp.output_data.clone()));
+    let output = take(&mut sp.output_data);
+    if !output.is_empty() {
+        attrs.push(kv_bytes("wardex.output_data", output));
     }
-    uncertainty(sp, &mut attrs);
+    uncertainty(&sp, &mut attrs);
 
     // `error.type` takes priority over the status message: on a failure it is
     // the more specific of the two, and it is empty exactly when there is no
     // error type to report.
     let message = if sp.error_type.is_empty() {
         sp.status
-            .as_ref()
-            .map(|s| s.message.clone())
+            .as_mut()
+            .map(|s| take(&mut s.message))
             .unwrap_or_default()
     } else {
-        sp.error_type.clone()
+        take(&mut sp.error_type)
     };
-    let code = status_code(sp.status.as_ref().map(|s| s.code).unwrap_or_default());
 
     otlp_pb::trace::Span {
-        trace_id: sp.trace_id.clone(),
-        span_id: sp.span_id.clone(),
-        parent_span_id: sp.parent_span_id.clone(),
-        name: span_name(sp),
+        trace_id: take(&mut sp.trace_id),
+        span_id: take(&mut sp.span_id),
+        parent_span_id: take(&mut sp.parent_span_id),
+        name,
         kind: span_kind(sp.kind),
         start_time_unix_nano: sp.start_time_unix_nano,
         end_time_unix_nano: sp.end_time_unix_nano,
         status: Some(otlp_pb::trace::Status { code, message }),
         attributes: attrs,
-        events: sp.events.iter().map(event).collect(),
-        links: sp.links.iter().map(link).collect(),
+        events: take(&mut sp.events).into_iter().map(event).collect(),
+        links: take(&mut sp.links).into_iter().map(link).collect(),
         ..Default::default()
     }
 }
@@ -420,14 +434,21 @@ fn span(sp: &pb::Span) -> otlp_pb::trace::Span {
 /// than flattened into one. An envelope with no spans produces no
 /// `resource_spans`, so a caller can tell "nothing to send" from "a batch of
 /// empty spans" without decoding.
+///
+/// BY VALUE, so the envelope's payloads are moved into the request rather than
+/// copied beside it. The caller builds this envelope for this mapping and
+/// discards it, and the export path runs on the background batch worker inside
+/// the host's process: holding the envelope and the request alive together
+/// would make one flush of a full batch cost an extra copy of every captured
+/// request and response body, against a `max_buffer_bytes` backstop that
+/// accounts for one.
 pub fn envelope_to_traces(
-    env: &pb::Envelope,
+    mut env: pb::Envelope,
     producer: Producer<'_>,
 ) -> otlp_pb::trace_service::ExportTraceServiceRequest {
-    let spans: Vec<otlp_pb::trace::Span> = env
-        .items
-        .iter()
-        .filter_map(|item| match &item.payload {
+    let spans: Vec<otlp_pb::trace::Span> = std::mem::take(&mut env.items)
+        .into_iter()
+        .filter_map(|item| match item.payload {
             Some(pb::envelope_item::Payload::Span(sp)) => Some(span(sp)),
             _ => None,
         })
@@ -603,7 +624,7 @@ mod tests {
         }
     }
 
-    fn only_span(env: &pb::Envelope) -> otlp_pb::trace::Span {
+    fn only_span(env: pb::Envelope) -> otlp_pb::trace::Span {
         let req = envelope_to_traces(env, PRODUCER);
         req.resource_spans[0].scope_spans[0].spans[0].clone()
     }
@@ -734,7 +755,7 @@ mod tests {
             ("gen_ai.operation.name", "chat"),
             ("gen_ai.request.model", "gpt-4.1-mini"),
         ]));
-        let sp = only_span(&env);
+        let sp = only_span(env);
         assert_eq!(sp.name, "chat gpt-4.1-mini");
         assert_eq!(
             attr(&sp, "gen_ai.request.model"),
@@ -767,7 +788,7 @@ mod tests {
                 )),
             }],
         };
-        assert!(envelope_to_traces(&env, PRODUCER).resource_spans.is_empty());
+        assert!(envelope_to_traces(env, PRODUCER).resource_spans.is_empty());
     }
 
     #[test]
@@ -776,7 +797,7 @@ mod tests {
         // library that produced its spans.
         let mut env = envelope(pb::Span::default());
         env.header.as_mut().unwrap().sdk.as_mut().unwrap().name = "checkout-api".into();
-        let req = envelope_to_traces(&env, PRODUCER);
+        let req = envelope_to_traces(env, PRODUCER);
         let resource = req.resource_spans[0].resource.as_ref().unwrap();
         let service = resource
             .attributes
@@ -805,7 +826,7 @@ mod tests {
             }),
             ..Default::default()
         });
-        assert_eq!(only_span(&env).status.unwrap().message, "TimeoutError");
+        assert_eq!(only_span(env).status.unwrap().message, "TimeoutError");
     }
 
     #[test]
@@ -820,7 +841,7 @@ mod tests {
             }),
             ..Default::default()
         });
-        let sp = only_span(&env);
+        let sp = only_span(env);
         assert_eq!(
             attr(&sp, "wardex.parent_confidence"),
             Some(&otlp_pb::common::any_value::Value::DoubleValue(0.9))
@@ -837,7 +858,7 @@ mod tests {
     fn a_span_with_nothing_to_report_carries_no_uncertainty_attributes() {
         // Absence has to stay legible: a span that reports no limitation must
         // not be padded with keys that make it look examined and cleared.
-        let sp = only_span(&envelope(pb::Span::default()));
+        let sp = only_span(envelope(pb::Span::default()));
         assert!(attr(&sp, "wardex.limitations").is_none());
         assert!(attr(&sp, "wardex.parent_source").is_none());
         assert!(attr(&sp, "wardex.capture.truncated").is_none());
@@ -854,7 +875,7 @@ mod tests {
             }),
             ..Default::default()
         });
-        let sp = only_span(&env);
+        let sp = only_span(env);
         assert_eq!(
             attr(&sp, "wardex.limitations"),
             Some(&otlp_pb::common::any_value::Value::ArrayValue(
@@ -880,7 +901,7 @@ mod tests {
             output_data: b"plain text".to_vec(),
             ..Default::default()
         });
-        let mut req = envelope_to_traces(&env, PRODUCER);
+        let mut req = envelope_to_traces(env, PRODUCER);
         strip_bytes_values(&mut req);
         let sp = &req.resource_spans[0].scope_spans[0].spans[0];
         assert_eq!(
