@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING, Any
 from .._enums import CaptureSource
 from ..assembly import Limitation, Prefilter
 from ._conn_timing import shared_timing_store
-from ._seam import ByteSeamInterceptor, _ConnectionState
+from ._seam import ByteSeamInterceptor, _accepted_prefix, _ConnectionState
 from ._trackers import _Http1Tracker, _Http2Tracker
 
 if TYPE_CHECKING:
@@ -172,8 +172,12 @@ class RawSocketInterceptor(ByteSeamInterceptor):
         def wrapper(this: Any, data: Any, *args: Any, **kwargs: Any) -> Any:
             ret = real(this, data, *args, **kwargs)
             try:
-                sent = bytes(data)[:ret] if isinstance(ret, int) else data
-                self._on_request_bytes(this, bytes(sent))
+                # Above the copies — see `_ssl._mk_send`. This patch sits on
+                # `socket.socket`, so the buffers it would materialize belong to
+                # every plaintext client in the process, HTTP or not.
+                if self._capture_possible(this):
+                    sent = _accepted_prefix(data, ret) if isinstance(ret, int) else data
+                    self._on_request_bytes(this, bytes(sent))
             except Exception:
                 pass
             return ret
@@ -184,7 +188,8 @@ class RawSocketInterceptor(ByteSeamInterceptor):
         def wrapper(this: Any, data: Any, *args: Any, **kwargs: Any) -> Any:
             ret = real(this, data, *args, **kwargs)
             try:
-                self._on_request_bytes(this, bytes(data))
+                if self._capture_possible(this):
+                    self._on_request_bytes(this, bytes(data))
             except Exception:
                 pass
             return ret
@@ -195,7 +200,7 @@ class RawSocketInterceptor(ByteSeamInterceptor):
         def wrapper(this: Any, *args: Any, **kwargs: Any) -> Any:
             ret = real(this, *args, **kwargs)
             try:
-                if isinstance(ret, (bytes, bytearray)) and ret:
+                if self._capture_possible(this) and isinstance(ret, (bytes, bytearray)) and ret:
                     self._on_response_bytes(this, bytes(ret))
             except Exception:
                 pass
@@ -207,7 +212,7 @@ class RawSocketInterceptor(ByteSeamInterceptor):
         def wrapper(this: Any, buffer: Any, *args: Any, **kwargs: Any) -> int:
             n = real(this, buffer, *args, **kwargs)
             try:
-                if n:
+                if n and self._capture_possible(this):
                     self._on_response_bytes(this, bytes(buffer[:n]))
             except Exception:
                 pass

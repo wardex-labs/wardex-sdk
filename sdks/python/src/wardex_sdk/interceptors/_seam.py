@@ -19,6 +19,7 @@ from .._enums import (
     StatusCode,
 )
 from .._limits import CaptureLimits
+from .._suppress import is_suppressed
 from .._types import (
     HttpMeta,
     TransportAttributes,
@@ -56,6 +57,74 @@ if TYPE_CHECKING:
 # Bodies are recorded, and their PII is masked later — in the Rust core, at encode
 # time (`codec.encode_otlp_traces` takes the mode and the disabled categories), not
 # here.
+#
+# --- Where "do we capture this?" is asked, and why it is asked twice ---
+#
+# The question has two halves, split by WHEN each can be answered rather than by
+# what it means. Getting that split wrong is expensive in one direction and
+# WRONG in the other, so it is written down here.
+#
+# INVARIANT — settled for the life of the connection, so `_capture_possible`
+# answers them in the patch wrapper, before the send/recv buffer is copied and
+# before a single byte reaches a tracker:
+#
+#   * no client on this seam. Both emit paths already returned on a `None`
+#     client, so nothing behind one was ever going to become a span — but the
+#     bodies were still accumulated in a tracker that is kept for the life of
+#     the connection, which is memory held for an output that cannot exist.
+#   * the self-exclusion flag. The exporter's own POST, which must never be
+#     re-captured whatever else is true.
+#   * a connection the sniff-latch already classified "ignore". `_gate` is
+#     latched once, from the first bytes, and never re-decided — so a
+#     TLS-backed Redis, Postgres or Kafka connection is settled for its whole
+#     life, and every call on one was still materializing its buffer
+#     (`bytes(data)`, a real copy whenever the caller passes a memoryview or a
+#     bytearray, which is the shape the asyncio and httpx paths use) to
+#     re-derive a verdict that was reached on the first write.
+#
+# CONTEXT-DEPENDENT — an answer about ONE transaction, and only ever correct
+# for the instant it was asked, so they stay in `_should_capture` on the
+# response side: the shared policy's ambient-span clause and the LLM-semantic
+# claim `_parse_semantics` earns. An agent unit can ACTIVATE after a connection
+# was opened — a pooled keep-alive socket outlives any single run — so a
+# per-connection early-out on "no agent unit is ambient right now" would
+# silently drop every later request on that socket. That is data loss, and the
+# parse it would save is the one the gate needs.
+#
+# NOT here, deliberately: "the transport is a NoOpTransport". `init()` resolves
+# a missing `transport=` argument to exactly that, so it is the out-of-the-box
+# configuration rather than a statement that capture is off, and reading it as
+# one would turn `wardex.init(intercept=True)` into a silent no-op.
+
+
+def _accepted_prefix(data: Any, n: int) -> Any:
+    """The first `n` bytes of a send buffer, without materializing the rest.
+
+    `send`/`write` may report a SHORT write, and the caller then keeps the tail
+    and calls again with the whole remainder — asyncio's plaintext writer does
+    exactly that on 3.10/3.11 (`_write_ready` calls `send(self._buffer)` on one
+    bytearray and then `del self._buffer[:n]`). `bytes(data)[:n]` copies that
+    entire remainder before throwing away everything the kernel refused, so a
+    multi-megabyte body costs a copy per call: quadratic in body size, and on
+    the branch the gate deliberately leaves OPEN — a local plaintext model
+    server is HTTP, so it latches "http" and pays this on every partial write.
+
+    Returns something `bytes()` accepts rather than `bytes`, so that an exact
+    `bytes` argument written in full stays the same object and costs nothing at
+    all; the caller materializes once, immediately.
+
+    The three arms are an isinstance chain rather than a `try`, because a
+    handler here would be a silent swallow on a path that has a correct answer
+    without one: anything that is not one of the three buffer types the socket
+    API actually takes falls through to what this line used to be.
+    """
+    if isinstance(data, bytes):
+        return data[:n]
+    if isinstance(data, (bytearray, memoryview)):
+        # `.cast("B")` so `n` is read as bytes for an itemsize > 1 view too,
+        # which is what the caller's `n` counts.
+        return memoryview(data).cast("B")[:n]
+    return bytes(data)[:n]
 
 
 def _http_error(txn: Any) -> bool:
@@ -102,6 +171,22 @@ class _ConnectionState:
         # direction, as an unintended side effect of two unrelated concerns
         # sharing one field.
         self.disabled_logged = False
+
+    def latched_off(self) -> bool:
+        """Has the sniff-latch already ruled this connection out for good?
+
+        The early gate acts on this answer, so what matters is that it is
+        STABLE: each seam's `_gate` writes `gate` once, from the first bytes it
+        sees, and never revisits it (see the two `_gate` docstrings, and
+        `test_latch_stays_ignore_once_closed`). "ignore" is therefore a fact
+        about the connection rather than about the call that observed it, which
+        is what makes it safe to skip the buffer copy on every later call.
+
+        Asked as "is it ignore" rather than "is it one of the live protocols"
+        so that `None` — undetermined, the state of a connection whose first
+        bytes have not arrived — reads as "keep going", never as "drop".
+        """
+        return self.gate == "ignore"
 
 
 class ByteSeamInterceptor(InterceptorInterface):
@@ -224,6 +309,33 @@ class ByteSeamInterceptor(InterceptorInterface):
     def _gate(self, st: _ConnectionState, data: bytes, phase: str) -> bool:
         return True
 
+    def _capture_possible(self, obj: Any) -> bool:
+        """Can this seam capture ANYTHING on this connection, right now?
+
+        The early half of the split described at the top of this module. It
+        runs in front of every `send` and every `recv` of every socket in the
+        process, so it is three reads and no allocation — it has to cost less
+        than the buffer copy it exists to skip.
+
+        A conservative answer in one direction only: True means "nothing
+        invariant rules this out", not "this will be captured". Everything that
+        depends on the transaction — the policy's ambient-span clause, the
+        LLM-semantic claim — is still ahead, in `_should_capture`.
+
+        Asked again at the top of `_on_request_bytes`/`_on_response_bytes`
+        rather than trusted from the wrapper that already asked: those two are
+        the seam's real entry points, reached directly by every subclass and by
+        the tests, and a guard that lives only in the patch wrappers is not
+        there at all for half its callers. The repeat is a dict lookup and a
+        ContextVar read against work measured in kilobytes.
+        """
+        if self._client is None:
+            return False
+        if is_suppressed():
+            return False
+        st = self._conns.get(id(obj))
+        return st is None or not st.latched_off()
+
     def _transport_prefilter(self, st: _ConnectionState) -> Prefilter:
         """This seam's opinion about the connection itself, before the policy.
 
@@ -295,9 +407,7 @@ class ByteSeamInterceptor(InterceptorInterface):
     # --- Tracker delegation + span assembly ---
 
     def _on_request_bytes(self, obj: Any, data: bytes) -> None:
-        from ._exclusion import is_suppressed
-
-        if is_suppressed():
+        if not self._capture_possible(obj):
             return
         st = self._state(obj)
         if not self._gate(st, data, "request"):
@@ -312,9 +422,7 @@ class ByteSeamInterceptor(InterceptorInterface):
                 self._emit_span(obj, st, txn)
 
     def _on_response_bytes(self, obj: Any, data: bytes) -> None:
-        from ._exclusion import is_suppressed
-
-        if is_suppressed():
+        if not self._capture_possible(obj):
             return
         st = self._state(obj)
         if not self._gate(st, data, "response"):

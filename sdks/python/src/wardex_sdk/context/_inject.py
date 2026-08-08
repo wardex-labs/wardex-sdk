@@ -57,9 +57,9 @@ def _patchset() -> PatchSet:
 
 def _build_inject_headers(host: str) -> dict[str, str]:
     try:
-        from ..interceptors import _exclusion  # noqa: PLC0415
+        from .. import _suppress  # noqa: PLC0415
 
-        if _exclusion.is_suppressed():
+        if _suppress.is_suppressed():
             return {}
         client = _hub.get_client()
         if client is None:
