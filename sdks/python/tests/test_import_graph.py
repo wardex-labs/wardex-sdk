@@ -740,11 +740,19 @@ _FORBIDDEN_IN_ADAPTERS = frozenset(
 #
 # `wardex_sdk` itself is on the list: `import wardex_sdk` hands an adapter the
 # whole package object, and with it every private module by attribute.
+#
+# `_runtime` joined the list when the process state got one owner. `_hub` is on
+# it because `_hub.get_client()` is how an adapter would reach the `Client`, and
+# that function is now a one-line delegate to `runtime().client` — so the two
+# modules are equivalent for this rule's purpose and listing only one of them
+# would leave `from .._runtime import runtime` as an unguarded way to the same
+# object.
 _FORBIDDEN_MODULES_IN_ADAPTERS = frozenset(
     {
         _PKG,
         f"{_PKG}._types",
         f"{_PKG}._hub",
+        f"{_PKG}._runtime",
         f"{_PKG}._client",
         f"{_PKG}._tracing",
         f"{_PKG}._scope",
@@ -758,7 +766,12 @@ _FORBIDDEN_MODULES_IN_ADAPTERS = frozenset(
 _CS1_DEBT: dict[str, frozenset[str]] = {
     "adapters/__init__.py": frozenset({"Client", f"{_PKG}._client"}),
     "adapters/_base.py": frozenset({"Client", f"{_PKG}._client"}),
-    "adapters/_registry.py": frozenset({"Client", f"{_PKG}._client"}),
+    # `_runtime` is declared, not tolerated by omission: the registry reaches
+    # the runtime only to find its own owner (`runtime().adapters`), which is
+    # the one edge the ownership change requires and the only one in `adapters/`.
+    # Written down so the NEXT adapter module that reaches `_runtime` — and with
+    # it `runtime().client` — is an explicit decision instead of a silent one.
+    "adapters/_registry.py": frozenset({"Client", f"{_PKG}._client", f"{_PKG}._runtime"}),
     # The unit registry shrank this by one: `wardex_sdk._tracing` is gone, because the
     # in-process tool wrapper no longer opens a MANUAL span through the public
     # `trace()` API. It opens a CALL unit instead, so the tool span is a child of
