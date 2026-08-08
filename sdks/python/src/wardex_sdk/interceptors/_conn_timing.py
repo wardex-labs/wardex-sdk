@@ -140,13 +140,18 @@ class ConnTimingProbe:
         # exists — the plain socket the connect was measured on has already been
         # detached by then and is not the object anyone closes), and released
         # when that socket closes. The cap stays as the backstop.
-        install_shared_close_hook()
         self._patch(socket.socket, "connect", self._mk_connect)
         self._patch(ssl.SSLSocket, "do_handshake", self._mk_sync_handshake)
         for cls in _CONNECT_TARGETS:
             self._patch(cls, "create_connection", self._mk_create_connection)
         self._patch(ssl.SSLContext, "wrap_bio", self._mk_wrap_bio)
         self._patch(ssl.SSLObject, "do_handshake", self._mk_async_handshake)
+        # Taken LAST, immediately before the flag that authorizes the release.
+        # `uninstall()` is gated on `_installed`, so a reference acquired ahead
+        # of a patch that then raised would be a refcount this probe can never
+        # give back — wardex's wrapper left on `socket.close` for the life of
+        # the process, silently, after `wardex.close()`.
+        install_shared_close_hook()
         self._installed = True
 
     def uninstall(self) -> None:

@@ -253,9 +253,10 @@ class ByteSeamInterceptor(InterceptorInterface):
         The flag cannot answer "was anything patched?", because it is only ever
         set once everything was. The things that CAN answer it are the pieces
         themselves, and each is asked separately: `PatchSet.restore_all()` is
-        idempotent and empty until the first `patch()` lands, `_timing_held`
-        records the one acquisition that is refcounted elsewhere and so must not
-        be released twice or unearned, and `_conns` is empty until a byte flows.
+        idempotent and empty until the first `patch()` lands, `_timing_held` and
+        `_close_hook_held` record the two acquisitions that are refcounted
+        elsewhere and so must not be released twice or unearned, and `_conns` is
+        empty until a byte flows.
         Every step is a no-op on a seam that never installed, which is what
         makes this safe to call unconditionally, twice, or on a fresh object.
 
