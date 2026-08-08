@@ -44,7 +44,7 @@ jobs:
           path: sdks/python/dist
 
   smoke:
-    name: smoke-test wheel (${{ matrix.platform.target }} on ${{ matrix.platform.runner }})
+    name: smoke-test wheel (${{ matrix.platform.target }} on ${{ matrix.platform.runner }}, py${{ matrix.platform.python }})
     needs: [build]
     runs-on: ${{ matrix.platform.runner }}
     # QEMU emulation of an arm64 install is minutes, not seconds; cap it rather
@@ -65,12 +65,16 @@ jobs:
         #   rosetta — Intel interpreter on the Apple Silicon runner (the Intel
         #             wheel is cross-compiled there, so nothing native can load it)
         #   qemu    — arm64 container on the x86_64 Linux runner
+        #
+        # `python` is per-entry rather than a literal because the wheels are
+        # abi3-py310: which interpreter actually loaded them is the result, so
+        # it belongs in the job name and in one place per entry.
         platform:
-          - { runner: ubuntu-latest,  target: x86_64,  how: native }
-          - { runner: ubuntu-latest,  target: aarch64, how: qemu }
-          - { runner: macos-14,       target: x86_64,  how: rosetta }
-          - { runner: macos-14,       target: aarch64, how: native }
-          - { runner: windows-latest, target: x64,     how: native }
+          - { runner: ubuntu-latest,  target: x86_64,  how: native,  python: "3.12" }
+          - { runner: ubuntu-latest,  target: aarch64, how: qemu,    python: "3.12" }
+          - { runner: macos-14,       target: x86_64,  how: rosetta, python: "3.12" }
+          - { runner: macos-14,       target: aarch64, how: native,  python: "3.12" }
+          - { runner: windows-latest, target: x64,     how: native,  python: "3.12" }
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -79,15 +83,18 @@ jobs:
 
       # `arch -x86_64` on a universal system binary is the cheapest probe for
       # "is Rosetta here"; the install is a no-op reboot-free download when it
-      # is not, and images have flipped on this before.
+      # is not, and images have flipped on this before. `sudo` because
+      # `--install-rosetta` installs a system component and refuses to run as
+      # the unprivileged `runner` user — without it the fallback can only fail,
+      # and it fails in exactly the case it exists for.
       - name: ensure Rosetta 2
         if: matrix.platform.how == 'rosetta'
-        run: arch -x86_64 /usr/bin/true 2>/dev/null || softwareupdate --install-rosetta --agree-to-license
+        run: arch -x86_64 /usr/bin/true 2>/dev/null || sudo softwareupdate --install-rosetta --agree-to-license
 
       - uses: actions/setup-python@v5
         if: matrix.platform.how != 'qemu'
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.platform.python }}
           # Empty means "the runner's architecture" (setup-python falls back to
           # os.arch()), so only the Rosetta entry asks for an Intel build.
           architecture: ${{ matrix.platform.how == 'rosetta' && 'x64' || '' }}
@@ -121,7 +128,7 @@ jobs:
           SH
           docker run --rm --platform linux/arm64 \
             -v "$PWD/dist:/dist:ro" -v "$PWD/smoke.sh:/smoke.sh:ro" \
-            python:3.12-slim bash /smoke.sh
+            python:${{ matrix.platform.python }}-slim bash /smoke.sh
 
   publish:
     name: publish to PyPI
