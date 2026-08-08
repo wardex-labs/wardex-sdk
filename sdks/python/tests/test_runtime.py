@@ -249,12 +249,14 @@ def test_a_default_init_still_behaves_the_way_it_did_before_the_grouping():
 
 
 def test_the_atexit_teardown_drops_the_propagation_patches_too():
-    """The half `close()` did and the re-init/atexit path did not.
+    """The half `close()` did and the `atexit` path did not.
 
     Two hand-written teardowns, and the propagation patches appeared in one of
-    them — so a process that exited through `atexit` (or re-`init()`ed) left
-    `httpx.Client.send` wrapped by an SDK that had announced it was gone. One
-    implementation is what makes the two agree; this asserts they do.
+    them — so a process that exited through `atexit` left `httpx.Client.send`
+    wrapped by an SDK that had announced it was gone. (Re-`init()` was never in
+    that state: it dropped the previous patches itself, on its own line, which
+    is precisely the second copy of the rule that could stop agreeing with the
+    first.) One implementation is what makes them agree; this asserts they do.
     """
     import httpx
 
