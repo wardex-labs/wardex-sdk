@@ -44,24 +44,84 @@ jobs:
           path: sdks/python/dist
 
   smoke:
-    name: smoke-test wheel (linux x86_64)
+    name: smoke-test wheel (${{ matrix.platform.target }} on ${{ matrix.platform.runner }})
     needs: [build]
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.platform.runner }}
+    # QEMU emulation of an arm64 install is minutes, not seconds; cap it rather
+    # than let a hung emulator hold the publish gate open.
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # Deliberately the same axis as `build`: every wheel that job produces
+        # is installed and imported by exactly one entry here. A wheel building
+        # is not a wheel installing — an abi3 tag, a missing bundled library or
+        # a bad cross-compile only show up at import time. If an entry ever
+        # becomes untestable it gets an `exclude` with a reason, never a silent
+        # deletion; there are none today.
+        #
+        # `how` selects the interpreter the wheel is loaded into:
+        #   native  — the runner's own architecture matches the wheel
+        #   rosetta — Intel interpreter on the Apple Silicon runner (the Intel
+        #             wheel is cross-compiled there, so nothing native can load it)
+        #   qemu    — arm64 container on the x86_64 Linux runner
+        platform:
+          - { runner: ubuntu-latest,  target: x86_64,  how: native }
+          - { runner: ubuntu-latest,  target: aarch64, how: qemu }
+          - { runner: macos-14,       target: x86_64,  how: rosetta }
+          - { runner: macos-14,       target: aarch64, how: native }
+          - { runner: windows-latest, target: x64,     how: native }
     steps:
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
       - uses: actions/download-artifact@v4
         with:
-          name: wheels-ubuntu-latest-x86_64
+          name: wheels-${{ matrix.platform.runner }}-${{ matrix.platform.target }}
           path: dist
+
+      # `arch -x86_64` on a universal system binary is the cheapest probe for
+      # "is Rosetta here"; the install is a no-op reboot-free download when it
+      # is not, and images have flipped on this before.
+      - name: ensure Rosetta 2
+        if: matrix.platform.how == 'rosetta'
+        run: arch -x86_64 /usr/bin/true 2>/dev/null || softwareupdate --install-rosetta --agree-to-license
+
+      - uses: actions/setup-python@v5
+        if: matrix.platform.how != 'qemu'
+        with:
+          python-version: "3.12"
+          # Empty means "the runner's architecture" (setup-python falls back to
+          # os.arch()), so only the Rosetta entry asks for an Intel build.
+          architecture: ${{ matrix.platform.how == 'rosetta' && 'x64' || '' }}
+
       # Import the built wheel (--no-index so it can't silently fall back to PyPI)
       # to catch a broken native extension or missing files before we publish.
       - name: install and import the built wheel
+        if: matrix.platform.how != 'qemu'
+        shell: bash
         run: |
           python -m pip install --upgrade pip
           python -m pip install --pre --no-index --find-links dist wardex-sdk
           python -c "import wardex_sdk; print('smoke ok:', wardex_sdk.__version__)"
+
+      - uses: docker/setup-qemu-action@v3
+        if: matrix.platform.how == 'qemu'
+        with:
+          platforms: arm64
+
+      # Same three commands as above, run inside an arm64 container. Written to
+      # a file rather than passed to `bash -c` so the quoting survives two
+      # levels of shell.
+      - name: install and import the built wheel (arm64 container)
+        if: matrix.platform.how == 'qemu'
+        run: |
+          cat > smoke.sh <<'SH'
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install --pre --no-index --find-links /dist wardex-sdk
+          python -c "import wardex_sdk; print('smoke ok:', wardex_sdk.__version__)"
+          SH
+          docker run --rm --platform linux/arm64 \
+            -v "$PWD/dist:/dist:ro" -v "$PWD/smoke.sh:/smoke.sh:ro" \
+            python:3.12-slim bash /smoke.sh
 
   publish:
     name: publish to PyPI
