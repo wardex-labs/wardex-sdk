@@ -26,8 +26,24 @@ false green while every Rust test passes.
 
 ```bash
 cargo test --workspace                  # Rust
-uv run pytest sdks/python/tests -v      # Python
+uv run pytest sdks/python/tests -v      # Python (development interpreter)
+scripts/check-py310.sh                  # Python on the declared floor, 3.10
 ```
+
+Run `scripts/check-py310.sh` before pushing anything under `sdks/python`,
+source *or* tests — CI's 3.10 job imports both, so a fixture is as easy a place
+to strand the floor as the runtime is. `sdks/python/pyproject.toml` declares
+`requires-python >=3.10` while the development venv is the newest interpreter,
+so a 3.11+-only API (`asyncio.create_task(..., context=...)` is the one that
+actually happened) passes every local run and turns red only in CI's 3.10 job,
+after the push.
+The script builds its own `.venv-py310` from the `test` dependency group —
+which is where every dependency the suite imports is declared — and leaves
+`.venv`'s interpreter and dependency set alone. The native module is the one
+thing the two share: both venvs install the package editable off
+`sdks/python/src`, so the rebuild the floor check forces lands on the same
+`_wardex_native.abi3.so` the dev venv imports (harmless while the extension is
+abi3, which is why the wheel is). Extra arguments go through to pytest.
 
 ## Lint & format
 
