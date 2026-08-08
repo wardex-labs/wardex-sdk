@@ -97,6 +97,36 @@ if TYPE_CHECKING:
 # one would turn `wardex.init(intercept=True)` into a silent no-op.
 
 
+def _accepted_prefix(data: Any, n: int) -> Any:
+    """The first `n` bytes of a send buffer, without materializing the rest.
+
+    `send`/`write` may report a SHORT write, and the caller then keeps the tail
+    and calls again with the whole remainder — asyncio's plaintext writer does
+    exactly that on 3.10/3.11 (`_write_ready` calls `send(self._buffer)` on one
+    bytearray and then `del self._buffer[:n]`). `bytes(data)[:n]` copies that
+    entire remainder before throwing away everything the kernel refused, so a
+    multi-megabyte body costs a copy per call: quadratic in body size, and on
+    the branch the gate deliberately leaves OPEN — a local plaintext model
+    server is HTTP, so it latches "http" and pays this on every partial write.
+
+    Returns something `bytes()` accepts rather than `bytes`, so that an exact
+    `bytes` argument written in full stays the same object and costs nothing at
+    all; the caller materializes once, immediately.
+
+    The three arms are an isinstance chain rather than a `try`, because a
+    handler here would be a silent swallow on a path that has a correct answer
+    without one: anything that is not one of the three buffer types the socket
+    API actually takes falls through to what this line used to be.
+    """
+    if isinstance(data, bytes):
+        return data[:n]
+    if isinstance(data, (bytearray, memoryview)):
+        # `.cast("B")` so `n` is read as bytes for an itemsize > 1 view too,
+        # which is what the caller's `n` counts.
+        return memoryview(data).cast("B")[:n]
+    return bytes(data)[:n]
+
+
 def _http_error(txn: Any) -> bool:
     """Did the peer answer with a 4xx/5xx? Absent status reads as success."""
     return not 200 <= getattr(txn, "status", 200) < 400

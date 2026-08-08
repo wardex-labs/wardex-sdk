@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, Any
 
 from ..assembly import Limitation
 from ._conn_timing import shared_timing_store
-from ._seam import ByteSeamInterceptor, _ConnectionState
+from ._seam import ByteSeamInterceptor, _accepted_prefix, _ConnectionState
 from ._socket import _H2_PREFACE, _HTTP_METHODS
 from ._trackers import _Http1Tracker, _Http2Tracker
 
@@ -105,7 +105,7 @@ class SSLInterceptor(ByteSeamInterceptor):
         def wrapper(this: Any, data: Any, *args: Any, **kwargs: Any) -> Any:
             ret = real(this, data, *args, **kwargs)
             try:
-                # The gate comes FIRST, above the materialization. `bytes(data)`
+                # The gate comes FIRST, above the materialization. Materializing
                 # is free for an exact `bytes` argument and a full copy of the
                 # send buffer for anything else — a memoryview or bytearray,
                 # which is what the asyncio and httpx paths hand to `write`.
@@ -116,7 +116,7 @@ class SSLInterceptor(ByteSeamInterceptor):
                 if self._capture_possible(this):
                     sent = data
                     if meth in ("send", "write") and isinstance(ret, int):
-                        sent = bytes(data)[:ret]
+                        sent = _accepted_prefix(data, ret)
                     self._on_request_bytes(this, bytes(sent))
             except Exception:
                 pass

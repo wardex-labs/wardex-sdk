@@ -32,6 +32,7 @@ from wardex_sdk._suppress import suppress_capture
 from wardex_sdk._types import SpanContext, SpanId, TraceId
 from wardex_sdk.context._contextvar import fork_active_span
 from wardex_sdk.interceptors import _seam
+from wardex_sdk.interceptors._socket import RawSocketInterceptor
 from wardex_sdk.interceptors._ssl import SSLInterceptor
 from wardex_sdk.transport._noop import NoOpTransport
 
@@ -245,6 +246,89 @@ def test_a_latched_off_send_does_not_copy_the_buffer():
     later = _Payload(b"*2\r\n$3\r\nGET\r\n$1\r\nk\r\n")
     send(sock, later)
     assert later.copies == 0
+
+
+# ...and the copy that REMAINS, on the branch the gate deliberately leaves open.
+
+
+class _CountingBuffer(bytearray):
+    """A send buffer with a REAL buffer protocol that counts full materializations.
+
+    `_Payload` above only answers `__bytes__`, which is the one shape a socket
+    never sees; this one is what `send` is actually handed. `bytes(x)` prefers
+    `__bytes__` even when a buffer is available, so a wrapper that materializes
+    the whole buffer is counted here and one that takes a view of it is not.
+    """
+
+    def __init__(self, raw: bytes) -> None:
+        super().__init__(raw)
+        self.copies = 0
+
+    def __bytes__(self) -> bytes:
+        self.copies += 1
+        return bytes(memoryview(self))
+
+
+@pytest.mark.parametrize(
+    ("seam", "wrap"),
+    [
+        pytest.param(SSLInterceptor, lambda itc, real: itc._mk_send("send", real), id="tls"),
+        pytest.param(RawSocketInterceptor, lambda itc, real: itc._mk_send(real), id="plaintext"),
+    ],
+)
+def test_a_partial_write_does_not_materialize_the_buffer_it_did_not_send(seam, wrap):
+    """A short write must cost what was SENT, not what was offered.
+
+    `send` is allowed to accept only part of its buffer, and the caller then
+    calls again with the whole remainder — asyncio's plaintext writer hands
+    `send` one bytearray holding everything still outstanding and deletes the
+    accepted prefix afterwards. Materializing that and only then slicing it
+    (`bytes(data)[:ret]`) copies the full remainder once per call: quadratic in
+    body size, on traffic the gate is RIGHT to admit. A plaintext local model
+    server is HTTP, so it latches "http" and a large prompt POSTed to one is
+    exactly the shape that pays it — which is why both seams are driven here
+    and not only the TLS one the rest of this file uses.
+
+    Counted rather than timed, for the reason `_Payload` gives: the bytes that
+    reach the tracker are identical either way and only the allocation differs.
+    """
+    itc = seam()
+    itc._client = _RecordingClient(CaptureMode.ALL)
+    fed: list[bytes] = []
+
+    def record(obj: Any, data: bytes) -> None:
+        fed.append(data)
+
+    # Stubbed, so the gate is the only thing under test here and the seam needs
+    # no limits: nothing downstream of it parses.
+    itc._on_request_bytes = record  # type: ignore[method-assign]
+
+    def real(this: Any, data: Any, *args: Any, **kwargs: Any) -> int:
+        return len(_LLM_REQUEST)  # the kernel took the head and nothing more
+
+    buffer = _CountingBuffer(_LLM_REQUEST + b"body bytes the kernel refused")
+    wrap(itc, real)(_socket(), buffer)
+
+    assert fed == [_LLM_REQUEST], "the seam fed bytes the peer never received"
+    assert buffer.copies == 0, "the whole send buffer was copied to keep its accepted prefix"
+
+
+def test_the_prefix_helper_never_costs_more_than_the_copy_it_replaces():
+    """The two arguments that are not a partial write of a bytearray.
+
+    The saving above must not be bought from either end: a `bytes` argument
+    written in full was already free (`bytes(b) is b`, and `b[:len(b)] is b`)
+    and has to stay free, and an argument with no buffer to view at all must
+    still produce the right bytes rather than raise into the wrapper's bare
+    `except` and drop the capture.
+    """
+    whole = b"POST / HTTP/1.1\r\n\r\n"
+    assert _seam._accepted_prefix(whole, len(whole)) is whole
+    assert bytes(_seam._accepted_prefix(whole, 4)) == b"POST"
+
+    payload = _Payload(b"POST / HTTP/1.1\r\n\r\n")
+    assert bytes(_seam._accepted_prefix(payload, 4)) == b"POST"
+    assert payload.copies == 1
 
 
 # --- (c) what must NOT be latched onto the connection --------------------

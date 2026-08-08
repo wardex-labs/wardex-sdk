@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING, Any
 from .._enums import CaptureSource
 from ..assembly import Limitation, Prefilter
 from ._conn_timing import shared_timing_store
-from ._seam import ByteSeamInterceptor, _ConnectionState
+from ._seam import ByteSeamInterceptor, _accepted_prefix, _ConnectionState
 from ._trackers import _Http1Tracker, _Http2Tracker
 
 if TYPE_CHECKING:
@@ -176,7 +176,7 @@ class RawSocketInterceptor(ByteSeamInterceptor):
                 # `socket.socket`, so the buffers it would materialize belong to
                 # every plaintext client in the process, HTTP or not.
                 if self._capture_possible(this):
-                    sent = bytes(data)[:ret] if isinstance(ret, int) else data
+                    sent = _accepted_prefix(data, ret) if isinstance(ret, int) else data
                     self._on_request_bytes(this, bytes(sent))
             except Exception:
                 pass
