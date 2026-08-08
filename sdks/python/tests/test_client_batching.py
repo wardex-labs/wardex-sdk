@@ -299,7 +299,7 @@ def test_flush_deadline_is_not_extended_by_an_in_flight_export():
     """flush(t) must return on its own deadline even when another thread is
     already inside a slow export.
 
-    This is the signal handler's flush(2.0) (_lifecycle._SIGNAL_FLUSH_TIMEOUT).
+    This is the signal handler's flush(2.0) (_runtime._SIGNAL_FLUSH_TIMEOUT).
     Before the fix the drain lock was taken unconditionally, so this call waited
     out the in-flight POST in full before starting its own — the "2s" shutdown
     bound was really the transport timeout twice over, and SIGTERM hung for it.

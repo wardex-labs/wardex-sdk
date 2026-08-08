@@ -583,7 +583,7 @@ def test_the_layers_below_the_observers_do_not_import_one():
     being filed the same way.
 
     Scoped to the two packages rather than to every module outside
-    `interceptors/`, because `__init__.py` and `_lifecycle.py` are the
+    `interceptors/`, because `__init__.py` and `_runtime.py` are the
     composition root: installing an interceptor is what they are FOR, and a
     rule that forbade it would be a rule about the wrong thing.
     """
@@ -1001,7 +1001,7 @@ def test_the_capture_predicate_has_one_implementation_and_one_composition():
 # --------------------------------------------------------------------------
 
 # design §10.4 scopes C-S4 to adapters/ and interceptors/; assembly/ is held to
-# zero from day one. (`_lifecycle.py`, `context/_inject.py`, `context/_asgi.py`,
+# zero from day one. (`_runtime.py`, `context/_inject.py`, `context/_asgi.py`,
 # `context/_propagate.py` and `context/_wsgi.py` also swallow silently today and
 # are out of the rule's declared scope, so they are not counted below.)
 #
