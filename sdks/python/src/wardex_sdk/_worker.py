@@ -32,11 +32,23 @@ class BatchWorker:
         self._stopped = False
         self._thread: threading.Thread | None = None
         self._thread_for_pid: int | None = None
-        self._spawn_lock = threading.Lock()
+        # RLock, and the reason is not the signal handler this SDK usually
+        # documents. `capture_span` calls `ensure_alive()`, and a WebSocket span
+        # can now be shipped from a `weakref.finalize` callback (the byte seams'
+        # close hook) — which runs at an arbitrary allocation, on whatever
+        # thread dropped the last reference, INCLUDING a thread that is already
+        # inside `_spawn_locked` allocating the replacement thread. A plain Lock
+        # there is a permanent self-deadlock in the host's own code.
+        self._spawn_lock = threading.RLock()
+        # What the RLock cannot supply on its own: reentering would otherwise
+        # see a not-yet-started thread, spawn a SECOND one and leave the outer
+        # frame's thread orphaned. A spawn in progress is a spawn; whoever
+        # arrives during it has nothing to do.
+        self._spawning = False
 
     def start(self) -> None:
         with self._spawn_lock:
-            if self.is_alive():
+            if self.is_alive() or self._spawning:
                 return  # exactly one SDK thread — start() is idempotent
             self._spawn_locked()
 
@@ -59,7 +71,7 @@ class BatchWorker:
         if self._stopped or self.is_alive():
             return
         with self._spawn_lock:
-            if self._stopped or self.is_alive():
+            if self._stopped or self.is_alive() or self._spawning:
                 return  # another thread respawned it while we waited
             if self._debug:
                 print("[wardex] batch worker restarted (fork or thread death)", file=sys.stderr)
@@ -84,9 +96,14 @@ class BatchWorker:
             thread.join(timeout)
 
     def _spawn_locked(self) -> None:
-        self._thread = threading.Thread(target=self._run, daemon=True, name="wardex-batch-worker")
-        self._thread_for_pid = os.getpid()
-        self._thread.start()
+        self._spawning = True
+        try:
+            thread = threading.Thread(target=self._run, daemon=True, name="wardex-batch-worker")
+            self._thread = thread
+            self._thread_for_pid = os.getpid()
+            thread.start()
+        finally:
+            self._spawning = False
 
     def _run(self) -> None:
         while True:
