@@ -5,6 +5,17 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- **LLM spans are named by what they did, not how they traveled.** A span
+  with extracted LLM semantics now exports as
+  `{gen_ai.operation.name} {gen_ai.request.model}` (e.g. `chat gpt-4.1-mini`;
+  the operation alone when the model is absent), following the OpenTelemetry
+  gen_ai semantic conventions, instead of `HTTP POST /v1/chat/completions`.
+  Spans without LLM semantics keep the HTTP naming. Backend queries, filters
+  or alerts that match on the old span names need updating. The wire format
+  is unchanged.
+
 ## [0.3.0b4] - 2026-08-06
 
 ### Fixed
