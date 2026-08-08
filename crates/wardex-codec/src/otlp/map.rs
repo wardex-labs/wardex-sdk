@@ -263,6 +263,45 @@ fn link(ln: &pb::SpanLink) -> otlp_pb::trace::span::Link {
     }
 }
 
+/// The non-empty string an `extra` key carries, if it carries one.
+///
+/// Empty reads as absent on purpose: proto3 cannot tell `""` from unset, and a
+/// span named `"chat "` is worse than one named for the operation alone.
+fn string_attr<'a>(extra: &'a [pb::KeyValue], key: &str) -> Option<&'a str> {
+    extra.iter().find(|kv| kv.key == key).and_then(|kv| {
+        match kv.value.as_ref()?.value.as_ref()? {
+            pb::any_value::Value::StringValue(s) if !s.is_empty() => Some(s.as_str()),
+            _ => None,
+        }
+    })
+}
+
+/// The OTLP span name — `{gen_ai.operation.name} {gen_ai.request.model}` once a
+/// span carries LLM semantics, otherwise the name the caller gave it.
+///
+/// The name it replaces was the transport's: `HTTP POST /v1/chat/completions`,
+/// which is the SAME STRING for every model, every prompt and every provider
+/// behind one endpoint. Span name is the axis every backend groups by, so a
+/// latency or cost breakdown over an agent's LLM calls collapsed into a single
+/// bucket that answered no question anyone asks — while the two facts a reader
+/// actually groups by sat one level down in the attributes.
+///
+/// The model half is dropped rather than defaulted when `gen_ai.request.model`
+/// is absent: `"chat"` says the model was not recorded, where `"chat unknown"`
+/// invents a model of that name and a backend would happily aggregate it.
+///
+/// A span with no `gen_ai.operation.name` keeps its own name, so this is a
+/// rename for LLM spans and a no-op for everything else.
+fn span_name(sp: &pb::Span) -> String {
+    let Some(operation) = string_attr(&sp.extra, "gen_ai.operation.name") else {
+        return sp.name.clone();
+    };
+    match string_attr(&sp.extra, "gen_ai.request.model") {
+        Some(model) => format!("{operation} {model}"),
+        None => operation.to_owned(),
+    }
+}
+
 fn span(sp: &pb::Span) -> otlp_pb::trace::Span {
     // gen_ai / agent / tool attributes were flattened into `extra` when the
     // envelope was marshalled, so both export surfaces carry one flattening and
@@ -315,7 +354,7 @@ fn span(sp: &pb::Span) -> otlp_pb::trace::Span {
         trace_id: sp.trace_id.clone(),
         span_id: sp.span_id.clone(),
         parent_span_id: sp.parent_span_id.clone(),
-        name: sp.name.clone(),
+        name: span_name(sp),
         kind: span_kind(sp.kind),
         start_time_unix_nano: sp.start_time_unix_nano,
         end_time_unix_nano: sp.end_time_unix_nano,
@@ -530,6 +569,69 @@ mod tests {
             .find(|kv| kv.key == key)
             .and_then(|kv| kv.value.as_ref())
             .and_then(|v| v.value.as_ref())
+    }
+
+    fn gen_ai_span(attrs: &[(&str, &str)]) -> pb::Span {
+        pb::Span {
+            name: "HTTP POST /v1/chat/completions".into(),
+            extra: attrs.iter().map(|(k, v)| kv_wardex(k, v)).collect(),
+            ..Default::default()
+        }
+    }
+
+    fn kv_wardex(key: &str, v: &str) -> pb::KeyValue {
+        pb::KeyValue {
+            key: key.into(),
+            value: Some(pb::AnyValue {
+                value: Some(pb::any_value::Value::StringValue(v.into())),
+            }),
+        }
+    }
+
+    #[test]
+    fn an_llm_span_is_named_for_its_operation_and_model() {
+        let sp = gen_ai_span(&[
+            ("gen_ai.operation.name", "chat"),
+            ("gen_ai.request.model", "gpt-4.1-mini"),
+        ]);
+        assert_eq!(span_name(&sp), "chat gpt-4.1-mini");
+    }
+
+    #[test]
+    fn an_llm_span_with_no_model_is_named_for_the_operation_alone() {
+        // Not "chat unknown": that invents a model of that name and a backend
+        // aggregates it as one.
+        let sp = gen_ai_span(&[("gen_ai.operation.name", "embeddings")]);
+        assert_eq!(span_name(&sp), "embeddings");
+        let blank = gen_ai_span(&[
+            ("gen_ai.operation.name", "embeddings"),
+            ("gen_ai.request.model", ""),
+        ]);
+        assert_eq!(span_name(&blank), "embeddings");
+    }
+
+    #[test]
+    fn a_span_without_llm_semantics_keeps_the_name_it_was_given() {
+        let sp = gen_ai_span(&[("http.request.method", "POST")]);
+        assert_eq!(span_name(&sp), "HTTP POST /v1/chat/completions");
+    }
+
+    #[test]
+    fn the_name_is_the_only_thing_the_rename_touches() {
+        // Attributes stay where a consumer expects them: the model reached the
+        // name by being READ, not by being moved.
+        let env = envelope(gen_ai_span(&[
+            ("gen_ai.operation.name", "chat"),
+            ("gen_ai.request.model", "gpt-4.1-mini"),
+        ]));
+        let sp = only_span(&env);
+        assert_eq!(sp.name, "chat gpt-4.1-mini");
+        assert_eq!(
+            attr(&sp, "gen_ai.request.model"),
+            Some(&otlp_pb::common::any_value::Value::StringValue(
+                "gpt-4.1-mini".into()
+            ))
+        );
     }
 
     #[test]

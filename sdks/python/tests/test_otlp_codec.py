@@ -229,6 +229,38 @@ def test_gen_ai_flattened_to_attributes():
     assert attrs["gen_ai.response.finish_reasons"] == "stop"
 
 
+def test_an_llm_span_is_named_for_its_operation_and_model():
+    """gen_ai semconv names an LLM span `{operation} {model}`.
+
+    The transport name it replaces — `HTTP POST /v1/chat` — is the same string
+    for every model, prompt and provider behind one endpoint, and span name is
+    the axis every backend groups by. A latency or cost breakdown over an
+    agent's LLM calls collapsed into a single bucket that answers no question
+    anyone asks, while the two facts a reader groups by sat one level down in
+    the attributes.
+    """
+    assert _first_span(_envelope_with_gen_ai(model="gpt-4o", input_tokens=10))["name"] == (
+        "chat gpt-4o"
+    )
+
+
+def test_an_llm_span_with_no_request_model_is_named_for_the_operation_alone():
+    """Not `chat unknown`: that invents a model of that name, and a backend
+    aggregates it as one."""
+    env = InternalEnvelope(
+        header=_header(),
+        spans=(_span(gen_ai=GenAIAttributes(operation=OperationName.EMBEDDINGS)),),
+    )
+    assert _first_span(env)["name"] == "embeddings"
+
+
+def test_a_span_without_llm_semantics_keeps_its_own_name():
+    """The negative control for the rename above: it is a rename for LLM spans
+    and a no-op for everything else, so a plain HTTP span still says what it
+    was."""
+    assert _first_span(_envelope_with_span())["name"] == "HTTP POST /v1/chat"
+
+
 def test_resource_service_name():
     env = _envelope_with_span()
     d = _wardex_native.codec.decode_otlp_traces(_wardex_native.codec.encode_otlp_traces(env))
