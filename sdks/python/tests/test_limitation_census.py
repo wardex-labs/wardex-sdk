@@ -1463,9 +1463,9 @@ def _members_with_an_emitter() -> set[str]:
     """
     by_value = {m.value: m for m in Limitation}
     strings = set(_CENSUS_PY) | set(_CENSUS_RUST) | set(_RUST_ENUM_EMITTERS)
-    return {(_ALIASES.get(s) or by_value[s]).name for s in strings if s in by_value or s in _ALIASES} | set(
-        _MEMBER_SITES
-    )
+    return {
+        (_ALIASES.get(s) or by_value[s]).name for s in strings if s in by_value or s in _ALIASES
+    } | set(_MEMBER_SITES)
 
 
 def test_every_member_carries_its_own_provenance() -> None:

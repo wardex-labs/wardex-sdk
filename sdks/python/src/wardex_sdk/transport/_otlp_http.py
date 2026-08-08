@@ -3,6 +3,12 @@
 Synchronous POST-on-flush: `export()` delegates to `_send_batch`, the single POST
 path that a manual `flush()` and the background batch worker both reach.
 Network errors are fail-silent (an observability SDK must never crash the app) + debug log.
+
+One envelope may become SEVERAL POSTs. An OTLP request is accepted or rejected
+whole, so a batch over the receiver's body limit does not arrive short -- it
+does not arrive. The core measures each encoded, compressed body against
+`max_otlp_request_bytes` and hands back as many as it took; this module posts
+them in order.
 """
 
 from __future__ import annotations
@@ -89,11 +95,35 @@ class OtlpHttpTransport(Transport):
         timeout: float = 10.0,
         *,
         debug: bool = False,
+        compress: bool = True,
     ) -> None:
         self._endpoint = endpoint
         self._headers = dict(headers or {})
         self._timeout = timeout
         self._debug = debug
+        self._compress = compress
+
+    @property
+    def compress(self) -> bool:
+        """Whether requests leave gzipped, i.e. carrying `Content-Encoding: gzip`.
+
+        On by default. The OTLP/HTTP specification names gzip as an encoding a
+        receiver accepts, and payload-carrying spans are highly compressible --
+        the base64 rewrite alone costs a third of every binary body back, which
+        gzip returns and more. The switch exists because "standard" is not
+        "universal": a proxy that strips or mishandles the header, or a receiver
+        deployed with decompression disabled, turns a working export into a 400
+        that no amount of retrying fixes, and a user who hits that needs an
+        answer that is not "patch the SDK".
+
+        Compressing is the CORE's job either way -- there is no Python fallback
+        here and should not be. Byte work belongs on the Rust side of the seam
+        (a gzip pass over a full batch on the GIL is exactly the stall this SDK
+        promises not to cause), and a second implementation would be a second
+        thing that can disagree with `max_otlp_request_bytes` about how large a
+        request turned out to be.
+        """
+        return self._compress
 
     @property
     def timeout(self) -> float:
@@ -168,42 +198,92 @@ class OtlpHttpTransport(Transport):
             if self._debug:
                 print("[wardex] OTLP export skipped (deadline exhausted)", file=sys.stderr)
             return UNDELIVERED
-        data = native.codec.encode_otlp_traces(
-            envelope, self._pii_mode, list(self._pii_disabled)
+        bodies, dropped = native.codec.encode_otlp_requests(
+            envelope,
+            self._pii_mode,
+            list(self._pii_disabled),
+            self._limits,
+            self._compress,
         )  # encode=fail-loud
-        headers = {"Content-Type": "application/x-protobuf", **self._headers}
-        req = urllib.request.Request(self._endpoint, data=data, headers=headers, method="POST")
+        if dropped and self._debug:
+            # A span so large it would not fit a request even with its payload
+            # removed. Debug-gated because the marker mechanism cannot reach it
+            # -- the span is not on the wire to carry one -- and because the
+            # fix is a knob (`max_otlp_request_bytes`) rather than something
+            # wardex can do differently.
+            print(
+                f"[wardex] {dropped} span(s) exceeded max_otlp_request_bytes alone "
+                f"and were not exported",
+                file=sys.stderr,
+            )
+        if not bodies:
+            # Every span in the batch was dropped by the guard above. Nothing to
+            # POST, and not `UNDELIVERED`: a later attempt would encode to the
+            # same nothing.
+            return None
+        headers = {"Content-Type": "application/x-protobuf"}
+        if self._compress:
+            headers["Content-Encoding"] = "gzip"
+        # Host headers last, as they always have been: a caller who sets one of
+        # these means it.
+        headers.update(self._headers)
 
         from .._suppress import suppress_capture
 
         started = time.monotonic()
-        try:
-            with suppress_capture():
-                with urllib.request.urlopen(req, timeout=effective):
-                    pass
-        except Exception as exc:  # fail-silent: never crash the app
-            if self._debug:
-                print(f"[wardex] OTLP export failed: {exc}", file=sys.stderr)
-            cut_short_by = _cut_short_by_the_caller(exc, timeout, self._timeout, effective)
-            if cut_short_by is not None:
-                # Reported, NOT re-queued: the POST was open, so the backend may
-                # already hold this batch and a retry would duplicate it. What
-                # the caller loses here is not the spans, it is the KNOWLEDGE of
-                # whether they arrived -- and that is a fact about the budget the
-                # caller chose, which nothing else on this path will ever tell
-                # them. Off-debug this was silence indistinguishable from a
-                # successful export.
-                report_once(
-                    f"[wardex] an OTLP export was cut off after {time.monotonic() - started:.1f}s "
-                    f"by the {cut_short_by.requested:.1f}s budget its caller passed to "
-                    f"flush()/close(), which is shorter than this transport's own "
-                    f"{self._timeout:.1f}s timeout. "
-                    f"The POST had already been sent, so wardex cannot CONFIRM whether the "
-                    f"backend received these {len(envelope.spans)} span(s); they are not "
-                    f"resent, because the backend may hold them and a resend would duplicate "
-                    f"them. Pass a larger timeout to confirm delivery.",
-                    key="transport.otlp.caller_budget_cut_short",
-                )
+        deadline = started + effective
+        for index, body in enumerate(bodies):
+            # The first request gets the budget whole -- deducting elapsed time
+            # from a budget nothing has spent yet is arithmetic for its own
+            # sake, and in the single-request case, which is nearly every case,
+            # it is the only budget there is. Later requests share what the
+            # earlier ones left, so an oversized batch cannot multiply the
+            # deadline the caller set by the number of chunks it happened to
+            # split into.
+            remaining = effective if index == 0 else deadline - time.monotonic()
+            if remaining <= 0:
+                if self._debug:
+                    print(
+                        f"[wardex] OTLP export stopped after {index} of {len(bodies)} "
+                        f"requests (deadline exhausted)",
+                        file=sys.stderr,
+                    )
+                break
+            req = urllib.request.Request(self._endpoint, data=body, headers=headers, method="POST")
+            try:
+                with suppress_capture():
+                    with urllib.request.urlopen(req, timeout=remaining):
+                        pass
+            except Exception as exc:  # fail-silent: never crash the app
+                if self._debug:
+                    print(f"[wardex] OTLP export failed: {exc}", file=sys.stderr)
+                cut_short_by = _cut_short_by_the_caller(exc, timeout, self._timeout, effective)
+                if cut_short_by is not None:
+                    # Reported, NOT re-queued: the POST was open, so the backend
+                    # may already hold this batch and a retry would duplicate
+                    # it. What the caller loses here is not the spans, it is the
+                    # KNOWLEDGE of whether they arrived -- and that is a fact
+                    # about the budget the caller chose, which nothing else on
+                    # this path will ever tell them. Off-debug this was silence
+                    # indistinguishable from a successful export.
+                    report_once(
+                        f"[wardex] an OTLP export was cut off after "
+                        f"{time.monotonic() - started:.1f}s by the "
+                        f"{cut_short_by.requested:.1f}s budget its caller passed to "
+                        f"flush()/close(), which is shorter than this transport's own "
+                        f"{self._timeout:.1f}s timeout. "
+                        f"The POST had already been sent, so wardex cannot CONFIRM whether "
+                        f"the backend received these {len(envelope.spans)} span(s); they are "
+                        f"not resent, because the backend may hold them and a resend would "
+                        f"duplicate them. Pass a larger timeout to confirm delivery.",
+                        key="transport.otlp.caller_budget_cut_short",
+                    )
+                # Stop rather than work through the rest of the batch. A
+                # backend that refused one request refuses the next, and trying
+                # anyway spends the caller's whole budget one timeout at a time
+                # -- the stall this transport's deadline exists to prevent,
+                # multiplied by the number of chunks.
+                break
         # No `UNDELIVERED` on the failure path either, and not an oversight: the
         # POST was attempted, so the backend may well hold this batch already.
         # Handing it back for a retry would duplicate it, and against a backend

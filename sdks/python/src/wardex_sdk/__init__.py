@@ -163,6 +163,11 @@ def init(
         config.pii_mode.value,
         tuple(sorted(c.value for c in config.pii_disabled_categories)),
     )
+    # The transport encodes, so the encoder's ceilings are its business too --
+    # `max_otlp_attribute_bytes` and `max_otlp_request_bytes` are configured
+    # here and enforced there, and a transport that never received them would
+    # advertise both knobs and honour neither.
+    resolved_transport.set_limits(config.limits.to_native())
     if config.pii_mode.value == "off" and config.pii_disabled_categories and config.debug:
         print(
             "[wardex] pii_disabled_categories has no effect when pii_mode=OFF",

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import gzip
+import os
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -82,15 +84,18 @@ def _envelope_no_spans() -> InternalEnvelope:
 
 class _Handler(BaseHTTPRequestHandler):
     received: dict = {}
+    requests: list = []
 
     def do_POST(self):  # noqa: N802 (BaseHTTPRequestHandler convention)
         n = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(n)
         _Handler.received = {
             "content_type": self.headers.get("Content-Type"),
+            "content_encoding": self.headers.get("Content-Encoding"),
             "auth": self.headers.get("Authorization"),
             "body": body,
         }
+        _Handler.requests.append(_Handler.received)
         self.send_response(200)
         self.end_headers()
 
@@ -99,13 +104,37 @@ class _Handler(BaseHTTPRequestHandler):
 
 
 def _serve() -> HTTPServer:
+    _Handler.received = {}
+    _Handler.requests = []
     srv = HTTPServer(("127.0.0.1", 0), _Handler)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     return srv
 
 
+def _decode(request: dict) -> dict:
+    """What a RECEIVER makes of one recorded request.
+
+    `Content-Encoding` is honoured with the standard library's gzip rather than
+    with the core's own `gunzip`, deliberately: a decompressor written by the
+    same code that compressed would agree with itself about a frame no other
+    reader accepts, and what has to hold is that a collector can read it.
+    """
+    body = request["body"]
+    if request["content_encoding"] == "gzip":
+        body = gzip.decompress(body)
+    return _wardex_native.codec.decode_otlp_traces(body)
+
+
+def _span_names(request: dict) -> list[str]:
+    return [
+        sp["name"]
+        for rs in _decode(request)["resource_spans"]
+        for ss in rs["scope_spans"]
+        for sp in ss["spans"]
+    ]
+
+
 def test_post_sends_otlp_protobuf():
-    _Handler.received = {}
     srv = _serve()
     port = srv.server_address[1]
     t = OtlpHttpTransport(
@@ -117,18 +146,108 @@ def test_post_sends_otlp_protobuf():
 
     assert _Handler.received["content_type"] == "application/x-protobuf"
     assert _Handler.received["auth"] == "Basic zzz"
+    # gzip by default, and the header has to say so: a compressed body under a
+    # header that does not declare it is a 400 from every receiver, which is
+    # the one failure mode compression can introduce.
+    assert _Handler.received["content_encoding"] == "gzip"
+    assert _Handler.received["body"][:2] == b"\x1f\x8b"
+    d = _decode(_Handler.received)
+    assert d["resource_spans"][0]["scope_spans"][0]["spans"][0]["name"] == "HTTP POST /v1/chat"
+
+
+def test_compression_can_be_turned_off_and_the_header_goes_with_it():
+    """`Content-Encoding: gzip` on an uncompressed body is worse than no
+    compression at all, so the switch has to move both together."""
+    srv = _serve()
+    port = srv.server_address[1]
+    t = OtlpHttpTransport(endpoint=f"http://127.0.0.1:{port}/v1/traces", compress=False)
+    assert t.compress is False
+    t.export(_envelope_with_span())
+    srv.shutdown()
+
+    assert _Handler.received["content_encoding"] is None
+    assert _Handler.received["body"][:2] != b"\x1f\x8b"
+    # Reads without any decompression step at all.
     d = _wardex_native.codec.decode_otlp_traces(_Handler.received["body"])
     assert d["resource_spans"][0]["scope_spans"][0]["spans"][0]["name"] == "HTTP POST /v1/chat"
+
+
+def test_an_oversized_batch_becomes_several_posts_and_loses_nothing():
+    """The failure this exists to prevent is not a truncated span, it is a
+    rejected REQUEST: over the receiver's body limit nothing in the batch is
+    stored, so the small spans die with the large ones.
+
+    Random payloads, because gzip would otherwise collapse repetition and the
+    batch would fit after all — a test that passes for the wrong reason.
+    """
+    srv = _serve()
+    port = srv.server_address[1]
+    spans = tuple(
+        _span(
+            name=f"chat model-{i}",
+            context=SpanContext(trace_id=TraceId(b"\x01" * 16), span_id=SpanId(bytes([i]) * 8)),
+            input_data=os.urandom(4096),
+        )
+        for i in range(1, 7)
+    )
+    t = OtlpHttpTransport(endpoint=f"http://127.0.0.1:{port}/v1/traces")
+    t.set_limits(_wardex_native.Limits(max_otlp_request_bytes=12_000))
+    t.export(InternalEnvelope(header=_header(), spans=spans))
+    srv.shutdown()
+
+    assert len(_Handler.requests) > 1, "an oversized batch went out as one request"
+    for request in _Handler.requests:
+        assert len(request["body"]) <= 12_000
+    delivered = [name for request in _Handler.requests for name in _span_names(request)]
+    assert delivered == [f"chat model-{i}" for i in range(1, 7)]
+
+
+def test_a_batch_that_fits_is_still_a_single_post():
+    """The split is exceptional and must stay that way: an export that fits
+    pays for one request, one encode and one round trip."""
+    srv = _serve()
+    port = srv.server_address[1]
+    t = OtlpHttpTransport(endpoint=f"http://127.0.0.1:{port}/v1/traces")
+    t.export(_envelope_with_span())
+    srv.shutdown()
+    assert len(_Handler.requests) == 1
+
+
+def test_a_span_too_large_even_alone_is_dropped_without_taking_the_batch():
+    """One span that cannot fit must cost one span.
+
+    Its name is what is oversized, so there is no payload to drop and the guard
+    has nothing left to try — the case where the marker mechanism cannot help,
+    because the span never reaches the wire to carry one.
+    """
+    srv = _serve()
+    port = srv.server_address[1]
+    spans = (
+        _span(
+            name="x" * 4000,
+            context=SpanContext(trace_id=TraceId(b"\x01" * 16), span_id=SpanId(b"\x0a" * 8)),
+        ),
+        _span(
+            name="chat gpt-4o",
+            context=SpanContext(trace_id=TraceId(b"\x01" * 16), span_id=SpanId(b"\x0b" * 8)),
+        ),
+    )
+    t = OtlpHttpTransport(endpoint=f"http://127.0.0.1:{port}/v1/traces", compress=False)
+    t.set_limits(_wardex_native.Limits(max_otlp_request_bytes=600))
+    t.export(InternalEnvelope(header=_header(), spans=spans))
+    srv.shutdown()
+
+    delivered = [name for request in _Handler.requests for name in _span_names(request)]
+    assert delivered == ["chat gpt-4o"]
 
 
 def test_empty_batch_no_post():
     srv = _serve()
     port = srv.server_address[1]
-    _Handler.received = {}
     t = OtlpHttpTransport(endpoint=f"http://127.0.0.1:{port}/v1/traces")
     t.export(_envelope_no_spans())
     srv.shutdown()
-    assert _Handler.received == {}  # no POST occurred
+    assert _Handler.requests == []  # no POST occurred
 
 
 def test_fail_silent_on_connection_error():
