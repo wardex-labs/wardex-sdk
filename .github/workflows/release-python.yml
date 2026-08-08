@@ -4,6 +4,12 @@ on:
   push:
     tags:
       - "python-v*"
+  # Build and smoke on demand from any branch. A tag push is irreversible, so
+  # every path below it — Rosetta, an Intel interpreter on an arm64 runner, the
+  # QEMU container, the Windows shell — has to be provable before the tag
+  # exists rather than discovered by it. `publish` is gated on the ref instead
+  # of the trigger, so a dispatch runs the whole gate and stops short of PyPI.
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -53,8 +59,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Deliberately the same axis as `build`: every wheel that job produces
-        # is installed and imported by exactly one entry here. A wheel building
+        # Covers the same axis as `build`: every wheel that job produces is
+        # installed and imported by at least one entry here. A wheel building
         # is not a wheel installing — an abi3 tag, a missing bundled library or
         # a bad cross-compile only show up at import time. If an entry ever
         # becomes untestable it gets an `exclude` with a reason, never a silent
@@ -69,8 +75,18 @@ jobs:
         # `python` is per-entry rather than a literal because the wheels are
         # abi3-py310: which interpreter actually loaded them is the result, so
         # it belongs in the job name and in one place per entry.
+        #
+        # The abi3 tag is also the one failure named above that a single
+        # interpreter cannot see, which is why the linux x86_64 wheel gets a
+        # second entry on 3.10 — the floor `requires-python` promises. A wheel
+        # tagged `cp312-cp312` (abi3 dropped) or `cp311-abi3` (pyo3's
+        # `abi3-py310` feature bumped without the manifest) installs and imports
+        # perfectly on 3.12 while being unavailable to every user on the floor;
+        # only a floor entry goes red. x86_64 Linux carries it because that
+        # runner has every version, and it is the cheapest of the six.
         platform:
           - { runner: ubuntu-latest,  target: x86_64,  how: native,  python: "3.12" }
+          - { runner: ubuntu-latest,  target: x86_64,  how: native,  python: "3.10" }
           - { runner: ubuntu-latest,  target: aarch64, how: qemu,    python: "3.12" }
           - { runner: macos-14,       target: x86_64,  how: rosetta, python: "3.12" }
           - { runner: macos-14,       target: aarch64, how: native,  python: "3.12" }
@@ -133,6 +149,9 @@ jobs:
   publish:
     name: publish to PyPI
     needs: [build, smoke]
+    # Only a `python-v*` tag publishes. A workflow_dispatch run reaches this job
+    # with `github.ref` on a branch and skips it.
+    if: startsWith(github.ref, 'refs/tags/python-v')
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
