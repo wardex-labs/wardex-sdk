@@ -41,11 +41,24 @@ class AdapterName(Enum):
 
 
 class InterceptorName(Enum):
+    """The interceptors that EXIST, each named by what it calls itself.
+
+    The value is `interceptor.name()` verbatim, so a member and its unit cannot
+    drift apart under a rename; `interceptors._INTERCEPTORS` is the table that
+    makes it so, and a member with no row there fails a test rather than
+    installing nothing.
+
+    `GRPC`, `WEBSOCKET` and `SSE` were members and are not any more. They named
+    no unit: gRPC, WebSocket and SSE are PROTOCOLS the byte seams parse — see
+    `Protocol`, which is their real home — and never interceptors of their own.
+    Selecting one would have installed nothing at all, which is why they are
+    removed rather than rejected: a name that cannot be spelled needs no
+    validation.
+    """
+
     SSL = "ssl"
     MCP_STDIO = "mcp_stdio"
-    GRPC = "grpc"
-    WEBSOCKET = "websocket"
-    SSE = "sse"
+    SOCKET = "socket"
 
 
 class StatusCode(Enum):

@@ -92,6 +92,18 @@ class WardexConfig:
                     raise ValueError(
                         f"propagate_targets entries must be non-empty glob strings, got {pattern!r}"
                     )
+        if self.interceptors is not None:
+            # Refused HERE, where the mistake was made, rather than skipped at
+            # install time. `install_configured_interceptors` walks its own
+            # table and keeps what was asked for, so a value it does not
+            # recognize — `interceptors=("ssl",)`, the string, is the one a user
+            # actually writes — matches nothing and installs nothing, in
+            # silence, which is indistinguishable from `intercept=False`.
+            for name in self.interceptors:
+                if not isinstance(name, InterceptorName):
+                    raise ValueError(
+                        f"interceptors entries must be InterceptorName members, got {name!r}"
+                    )
 
     @property
     def effective_retention(self) -> RetentionClass:
