@@ -1150,11 +1150,14 @@ _RUST_STR = re.compile(r'"((?:[^"\\]|\\.)*)"')
 _RUST_VEC_DECLARATIONS: dict[str, str] = {
     "crates/wardex-protocol/src/http1.rs": "ParsedHttp.limitations — the marker vector itself",
     "bindings/python/src/lib.rs": "the PyO3 getter that hands it to protocol/_http1.py",
-    "bindings/python/src/codec.rs": (
-        "integrity_to_otlp — a PROJECTION of a span's markers onto an OTLP "
-        "attribute, not a place any marker is minted. Recorded rather than "
-        "renamed out of the scan: limitation strings really do flow through it "
-        "on their way to the wire, which is what this table is for."
+    "crates/wardex-codec/src/otlp/map.rs": (
+        "the OTLP projection of a span's markers onto an attribute, not a place "
+        "any marker is minted. It moved out of the PyO3 binding when the OTLP "
+        "semantic mapping did, and it reads NUMBERS off the wire schema now "
+        "rather than stringifying a Python enum — so the scan has no literal to "
+        "find here either way. Recorded rather than renamed out of the scan: "
+        "limitation strings really do flow through it on their way to the wire, "
+        "which is what this table is for."
     ),
 }
 """Every declaration of a `Vec<&str>` in `crates/` and `bindings/`, by file.

@@ -1,5 +1,13 @@
-//! OTLP protobuf encoding — turns the InternalEnvelope mapping result
+//! OTLP protobuf encoding — turns the mapping result
 //! (ExportTraceServiceRequest) into wire bytes. OTLP/HTTP protobuf is uncompressed by default (no zstd).
+//!
+//! [`map`] is the other half: it decides what an OTLP span MEANS (its name,
+//! its attribute keys, the resource and scope around it). The two are split
+//! because only one of them can be got wrong quietly — a serializer that
+//! disagrees with the schema does not compile, while a mapping that disagrees
+//! with semconv ships and looks fine.
+
+pub mod map;
 
 use crate::CodecError;
 use prost::Message;
