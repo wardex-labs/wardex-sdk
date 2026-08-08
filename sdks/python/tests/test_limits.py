@@ -19,7 +19,9 @@ def test_limits_defaults_returns_every_field():
     assert d["zstd_level"] == 3
     assert d["max_units"] == 512
     assert d["max_entries_per_unit"] == 256
-    assert len(d) == 18
+    assert d["max_otlp_attribute_bytes"] == 1024 * 1024
+    assert d["max_otlp_request_bytes"] == 4 * 1024 * 1024
+    assert len(d) == 20
 
 
 def test_limits_construction_defaults_unspecified_fields():

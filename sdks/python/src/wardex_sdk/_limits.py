@@ -53,6 +53,8 @@ class CaptureLimits:
     max_buffer_bytes: int | None = None
     replay_buffer_size: int | None = None
     zstd_level: int | None = None
+    max_otlp_attribute_bytes: int | None = None
+    max_otlp_request_bytes: int | None = None
 
     def __post_init__(self) -> None:
         for f in fields(self):
