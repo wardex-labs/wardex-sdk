@@ -5,6 +5,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.3.0b5] - 2026-08-09
+
 ### Added
 
 - **A reusable adapter conformance suite** under `wardex_sdk.testing`
@@ -27,6 +29,14 @@ All notable changes to this project are documented here. The format follows
   Spans without LLM semantics keep the HTTP naming. Backend queries, filters
   or alerts that match on the old span names need updating. The wire format
   is unchanged.
+- **Traffic wardex will not capture no longer pays for capture.** The byte
+  seams now evaluate connection-invariant conditions — no client installed,
+  the SDK's own exporter traffic, a connection the first-bytes sniff already
+  ruled out — before any send/recv buffer is copied or accumulated and
+  before any response body is decompressed or parsed. A TLS connection to a
+  non-LLM backend (Redis, Postgres, an internal API) previously paid a
+  buffer copy on every send for the life of the connection; it now pays a
+  dictionary lookup. Behavior for captured traffic is unchanged.
 
 ### Removed
 
