@@ -447,7 +447,7 @@ class Client:
         # A deadline exists only where a caller named one: flush(t), close(t),
         # and above all the signal handler's flush(2.0).
         self._worker = BatchWorker(
-            lambda: self._drain(None), interval=config.flush_interval, debug=config.debug
+            lambda: self._drain(None), interval=config.batching.flush_interval, debug=config.debug
         )
         self._worker.start()
 
@@ -728,7 +728,7 @@ class Client:
                 return
             header = EnvelopeHeader(
                 event_id=str(uuid.uuid4()),
-                api_key=self._config.api_key or "",
+                api_key=self._config.backend.api_key or "",
                 sdk=self._sdk_info,
                 sent_at_ns=time.time_ns(),
             )

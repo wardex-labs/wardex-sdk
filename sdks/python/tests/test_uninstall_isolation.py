@@ -27,7 +27,7 @@ import requests
 
 from wardex_sdk import _hub, _runtime
 from wardex_sdk._client import Client
-from wardex_sdk._config import WardexConfig
+from wardex_sdk._config import BackendConfig, BatchingPolicy, WardexConfig
 from wardex_sdk._enums import SpanKind
 from wardex_sdk._types import InternalEnvelope, InternalSpan, SpanContext, SpanId, TraceId
 from wardex_sdk.adapters._base import AdapterInterface
@@ -294,7 +294,12 @@ def test_teardown_still_closes_the_client_when_an_uninstall_raises():
     from wardex_sdk.interceptors._registry import get_registry as interceptor_registry
 
     transport = _Recording()
-    client = Client(WardexConfig(api_key="k", flush_interval=3600.0), transport)
+    client = Client(
+        WardexConfig(
+            backend=BackendConfig(api_key="k"), batching=BatchingPolicy(flush_interval=3600.0)
+        ),
+        transport,
+    )
     adapter = _CountingAdapter()
     try:
         interceptor_registry().install(_Boom(), client)

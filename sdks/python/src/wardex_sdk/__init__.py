@@ -10,7 +10,14 @@ from typing import Any
 
 from . import _hub, _runtime
 from ._client import _FOLLOW_TRANSPORT_TIMEOUT, _SHUTDOWN_TIMEOUT, Client
-from ._config import WardexConfig
+from ._config import (
+    BackendConfig,
+    BatchingPolicy,
+    PIIPolicy,
+    PropagationPolicy,
+    RetentionPolicy,
+    WardexConfig,
+)
 from ._enums import (
     AdapterName,
     CaptureMode,
@@ -95,7 +102,13 @@ __all__ = [
     "get_trace_headers",
     "WardexMiddleware",
     "WardexWSGIMiddleware",
+    # Config groups — every one of them is passed to `init()` by name
+    "BackendConfig",
+    "BatchingPolicy",
     "CaptureLimits",
+    "PIIPolicy",
+    "PropagationPolicy",
+    "RetentionPolicy",
     # Enums — importable directly from user code
     "AdapterName",
     "CaptureMode",
@@ -160,12 +173,12 @@ def init(
         return
     resolved_transport = transport or NoOpTransport()
     resolved_transport.set_pii_policy(
-        config.pii_mode.value,
-        tuple(sorted(c.value for c in config.pii_disabled_categories)),
+        config.pii.mode.value,
+        tuple(sorted(c.value for c in config.pii.disabled_categories)),
     )
-    if config.pii_mode.value == "off" and config.pii_disabled_categories and config.debug:
+    if config.pii.mode.value == "off" and config.pii.disabled_categories and config.debug:
         print(
-            "[wardex] pii_disabled_categories has no effect when pii_mode=OFF",
+            "[wardex] pii disabled_categories has no effect when pii mode is OFF",
             file=sys.stderr,
         )
     client = Client(config, resolved_transport)

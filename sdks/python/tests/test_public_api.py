@@ -1,5 +1,6 @@
 import wardex_sdk
 from wardex_sdk import _hub
+from wardex_sdk._config import BackendConfig
 from wardex_sdk._types import ToolDefinitionSet
 
 
@@ -8,7 +9,7 @@ def setup_function():
 
 
 def test_init_console_and_trace_flush(capsys):
-    wardex_sdk.init(transport=wardex_sdk.ConsoleTransport(), api_key="k")
+    wardex_sdk.init(transport=wardex_sdk.ConsoleTransport(), backend=BackendConfig(api_key="k"))
     with wardex_sdk.trace("s"):
         with wardex_sdk.span("inner") as sp:
             sp.input_data = b"hi"
@@ -18,7 +19,7 @@ def test_init_console_and_trace_flush(capsys):
 
 
 def test_capture_state_snapshot_recorded():
-    wardex_sdk.init(api_key="k")
+    wardex_sdk.init(backend=BackendConfig(api_key="k"))
     with wardex_sdk.trace("s"):
         wardex_sdk.capture_state_snapshot(
             turn_index=0,
@@ -55,7 +56,7 @@ def test_capture_limits_is_public():
 
 
 def test_capture_state_snapshot_with_input_refs():
-    wardex_sdk.init(api_key="k")
+    wardex_sdk.init(backend=BackendConfig(api_key="k"))
     with wardex_sdk.trace("s"):
         wardex_sdk.capture_state_snapshot(
             turn_index=1,

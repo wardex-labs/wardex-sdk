@@ -10,7 +10,7 @@ import pytest
 import wardex_sdk as wardex
 from wardex_sdk import _hub, _runtime
 from wardex_sdk._client import Client
-from wardex_sdk._config import WardexConfig
+from wardex_sdk._config import BackendConfig, BatchingPolicy, WardexConfig
 from wardex_sdk._enums import SpanKind
 from wardex_sdk._types import InternalEnvelope, InternalSpan, SpanContext, SpanId, TraceId
 from wardex_sdk.adapters._base import AdapterInterface
@@ -39,7 +39,9 @@ def _span():
 
 
 def _client(transport=None, **cfg):
-    return Client(WardexConfig(api_key="k", **cfg), transport or _Recording())
+    return Client(
+        WardexConfig(backend=BackendConfig(api_key="k"), **cfg), transport or _Recording()
+    )
 
 
 _SIGNALS = (signal.SIGINT, signal.SIGTERM)
@@ -108,10 +110,10 @@ def clean_lifecycle(real_signal_table):
 
 def test_install_closes_previous_client_and_flushes_it():
     t1 = _Recording()
-    first = _client(t1, flush_interval=3600.0)
+    first = _client(t1, batching=BatchingPolicy(flush_interval=3600.0))
     _runtime.runtime().install(first, first.config)
     first.capture_span(_span())
-    second = _client(flush_interval=3600.0)
+    second = _client(batching=BatchingPolicy(flush_interval=3600.0))
     _runtime.runtime().install(second, second.config)
     assert first._closed
     assert not first._worker.is_alive()
@@ -136,7 +138,7 @@ def test_signal_handler_flushes_then_chains_to_callable_prev():
     old = signal.signal(signal.SIGINT, prev)
     try:
         t = _Recording()
-        c = _client(t, flush_interval=3600.0)
+        c = _client(t, batching=BatchingPolicy(flush_interval=3600.0))
         _runtime.runtime().install(c, c.config)
         c.capture_span(_span())
         _runtime._handler(signal.SIGINT, None)  # invoke directly — no real signal
@@ -149,7 +151,7 @@ def test_signal_handler_flushes_then_chains_to_callable_prev():
 def test_signal_handler_reraises_default_action(monkeypatch):
     kills = []
     monkeypatch.setattr(_runtime.os, "kill", lambda pid, s: kills.append((pid, s)))
-    c = _client(flush_interval=3600.0)
+    c = _client(batching=BatchingPolicy(flush_interval=3600.0))
     _runtime.runtime().install(c, c.config)
     _runtime.runtime()._prev_handlers[signal.SIGTERM] = signal.SIG_DFL
     _runtime._handler(signal.SIGTERM, None)
@@ -160,7 +162,7 @@ def test_signal_handler_reraises_default_action(monkeypatch):
 def test_signal_handler_respects_sig_ign(monkeypatch):
     kills = []
     monkeypatch.setattr(_runtime.os, "kill", lambda pid, s: kills.append((pid, s)))
-    c = _client(flush_interval=3600.0)
+    c = _client(batching=BatchingPolicy(flush_interval=3600.0))
     _runtime.runtime().install(c, c.config)
     _runtime.runtime()._prev_handlers[signal.SIGTERM] = signal.SIG_IGN
     _runtime._handler(signal.SIGTERM, None)  # must neither kill nor raise
@@ -169,7 +171,7 @@ def test_signal_handler_respects_sig_ign(monkeypatch):
 
 def test_flush_on_signals_false_leaves_signal_table_untouched():
     before = signal.getsignal(signal.SIGINT)
-    c = _client(flush_on_signals=False)
+    c = _client(batching=BatchingPolicy(flush_on_signals=False))
     _runtime.runtime().install(c, c.config)
     assert signal.getsignal(signal.SIGINT) is before
 
@@ -237,10 +239,18 @@ def test_signal_handler_chains_even_if_flush_raises(monkeypatch):
 
 def test_init_twice_closes_previous_client():
     t1 = _Recording()
-    wardex.init(transport=t1, api_key="k", flush_interval=3600.0)
+    wardex.init(
+        transport=t1,
+        backend=BackendConfig(api_key="k"),
+        batching=BatchingPolicy(flush_interval=3600.0),
+    )
     first = _hub.get_client()
     first.capture_span(_span())
-    wardex.init(transport=_Recording(), api_key="k", flush_interval=3600.0)
+    wardex.init(
+        transport=_Recording(),
+        backend=BackendConfig(api_key="k"),
+        batching=BatchingPolicy(flush_interval=3600.0),
+    )
     assert first._closed
     assert sum(len(e.spans) for e in t1.envelopes) == 1
 
@@ -279,12 +289,12 @@ def test_reinit_uninstalls_interceptors_before_closing_previous_client():
     registry = get_registry()
     try:
         t1 = _Recording()
-        first = _client(t1, flush_interval=3600.0)
+        first = _client(t1, batching=BatchingPolicy(flush_interval=3600.0))
         _runtime.runtime().install(first, first.config)
         fake = _FakeInterceptor()
         registry.install(fake, first)
 
-        second = _client(flush_interval=3600.0)
+        second = _client(batching=BatchingPolicy(flush_interval=3600.0))
         _runtime.runtime().install(second, second.config)  # re-init path
 
         assert not registry.is_installed("fake-lifecycle")  # uninstall_all ran
@@ -320,12 +330,12 @@ def test_reinit_uninstalls_adapters_before_closing_previous_client():
 
     registry = get_registry()
     try:
-        first = _client(flush_interval=3600.0)
+        first = _client(batching=BatchingPolicy(flush_interval=3600.0))
         _runtime.runtime().install(first, first.config)
         fake = _FakeAdapter()
         registry.install(fake, first)
 
-        second = _client(flush_interval=3600.0)
+        second = _client(batching=BatchingPolicy(flush_interval=3600.0))
         _runtime.runtime().install(second, second.config)  # re-init path
 
         assert fake.uninstalled == 1
@@ -433,7 +443,7 @@ def test_teardown_closes_units_while_the_client_can_still_send_them(unit_adapter
     this whole path exists to stop, arriving by a longer route.
     """
     transport = _Recording()
-    client = _client(transport, flush_interval=3600.0)
+    client = _client(transport, batching=BatchingPolicy(flush_interval=3600.0))
     _runtime.runtime().install(client, client.config)
     unit_adapter(client)
 
@@ -452,7 +462,7 @@ def test_the_signal_handler_closes_live_units_when_the_process_is_about_to_die(u
     gets.
     """
     transport = _Recording()
-    client = _client(transport, flush_interval=3600.0)
+    client = _client(transport, batching=BatchingPolicy(flush_interval=3600.0))
     _runtime.runtime().install(client, client.config)
     adapter = unit_adapter(client)
 
@@ -477,7 +487,7 @@ def test_the_signal_handler_leaves_units_open_when_the_app_carries_on(unit_adapt
     it goes on producing spans that now have no parent.
     """
     transport = _Recording()
-    client = _client(transport, flush_interval=3600.0)
+    client = _client(transport, batching=BatchingPolicy(flush_interval=3600.0))
     _runtime.runtime().install(client, client.config)
     adapter = unit_adapter(client)
 
@@ -496,7 +506,7 @@ def test_an_adapter_whose_close_units_raises_cannot_take_the_flush_with_it(unit_
     units — one adapter's failure costing every other adapter's spans.
     """
     transport = _Recording()
-    client = _client(transport, flush_interval=3600.0)
+    client = _client(transport, batching=BatchingPolicy(flush_interval=3600.0))
     _runtime.runtime().install(client, client.config)
     adapter = unit_adapter(client)
 

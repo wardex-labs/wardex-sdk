@@ -26,7 +26,7 @@ import pytest
 from conftest import _FakeSSLSocket
 from wardex_sdk import _hub
 from wardex_sdk._client import Client
-from wardex_sdk._config import WardexConfig
+from wardex_sdk._config import BackendConfig, WardexConfig
 from wardex_sdk._enums import CaptureMode
 from wardex_sdk._suppress import suppress_capture
 from wardex_sdk._types import SpanContext, SpanId, TraceId
@@ -77,7 +77,7 @@ _REDIS_WRITE = b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n"
 
 class _RecordingClient:
     def __init__(self, mode: CaptureMode = CaptureMode.AGENT) -> None:
-        self.config = WardexConfig(api_key="k", capture_mode=mode)
+        self.config = WardexConfig(capture_mode=mode, backend=BackendConfig(api_key="k"))
         self.spans: list[Any] = []
 
     def capture_span(self, span: Any) -> None:
@@ -381,7 +381,10 @@ def test_a_noop_transport_is_not_treated_as_capture_being_off(parse_spy):
     If a "the sink is a black hole" early-out is ever wanted, it needs to be
     something the host ASKED for, not something it got by omission.
     """
-    client = Client(WardexConfig(api_key="k", capture_mode=CaptureMode.ALL), NoOpTransport())
+    client = Client(
+        WardexConfig(capture_mode=CaptureMode.ALL, backend=BackendConfig(api_key="k")),
+        NoOpTransport(),
+    )
     _hub.set_client(client)  # conftest's autouse fixture joins its worker thread
     itc = _seam_for(client)
     sock = _socket()

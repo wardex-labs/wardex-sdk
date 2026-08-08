@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 
+from wardex_sdk._config import PIIPolicy
 from wardex_sdk._enums import SpanKind, StatusCode
 from wardex_sdk._types import (
     EnvelopeHeader,
@@ -100,8 +101,9 @@ class TestTransportPolicy:
         t = NoOpTransport()
         wardex_sdk.init(
             transport=t,
-            pii_mode=PIIMode.MASK,
-            pii_disabled_categories=frozenset({PIICategory.IP_ADDRESS}),
+            pii=PIIPolicy(
+                mode=PIIMode.MASK, disabled_categories=frozenset({PIICategory.IP_ADDRESS})
+            ),
         )
         assert t._pii_mode == "mask"
         assert t._pii_disabled == ("ip_address",)

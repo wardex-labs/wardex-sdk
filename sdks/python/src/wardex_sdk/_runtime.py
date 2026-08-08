@@ -83,7 +83,8 @@ _SIGNALS = (signal.SIGINT, signal.SIGTERM)
 #:
 #: And a stalled backend at SIGTERM stays SILENT on this channel, deliberately.
 #: The report exists to hand someone a number they can change, and here there is
-#: none: `flush_on_signals=False` plus a handler of the host's own is the only
+#: none: `batching=BatchingPolicy(flush_on_signals=False)` plus a handler of the
+#: host's own is the only
 #: lever, which is a documentation matter and not a line printed while the
 #: process is being torn down. The fact is not hidden either -- the transport
 #: still logs the failed POST under `debug`, at the layer that observed it.
@@ -191,7 +192,7 @@ class Runtime:
             if not self._atexit_registered:
                 atexit.register(self._at_exit)
                 self._atexit_registered = True
-            if config.flush_on_signals:
+            if config.batching.flush_on_signals:
                 self._install_signal_handlers(debug=config.debug)
             else:
                 self._uninstall_signal_handlers()
@@ -210,7 +211,7 @@ class Runtime:
             # run's propagation patches still in place and no previous CLIENT to
             # have carried them out, so the drop is unconditional.
             uninstall_propagation()
-            if config.propagate_trace:
+            if config.propagation.enabled:
                 install_propagation()
 
     # -- uninstall ----------------------------------------------------------

@@ -31,7 +31,7 @@ import pytest
 
 from wardex_sdk import _runtime
 from wardex_sdk._client import Client, _UnnamedTimeout
-from wardex_sdk._config import WardexConfig
+from wardex_sdk._config import BackendConfig, BatchingPolicy, WardexConfig
 from wardex_sdk._enums import SpanKind
 from wardex_sdk._types import InternalSpan, SpanContext, SpanId, TraceId
 from wardex_sdk.assembly._diag import reset_reports_for_test
@@ -84,7 +84,12 @@ def _span(name="s"):
 def _client(endpoint: str, *, configured: float) -> Client:
     """A client whose only drains are the ones the test asks for."""
     transport = OtlpHttpTransport(endpoint=endpoint, timeout=configured)
-    client = Client(WardexConfig(api_key="k", flush_interval=3600.0), transport)
+    client = Client(
+        WardexConfig(
+            backend=BackendConfig(api_key="k"), batching=BatchingPolicy(flush_interval=3600.0)
+        ),
+        transport,
+    )
     client._worker.stop()
     return client
 

@@ -9,7 +9,7 @@ import pytest
 import wardex_sdk
 from wardex_sdk import _hub
 from wardex_sdk._client import Client
-from wardex_sdk._config import WardexConfig
+from wardex_sdk._config import BackendConfig, PropagationPolicy, WardexConfig
 from wardex_sdk._tracing import span, trace
 from wardex_sdk._types import InternalEnvelope
 from wardex_sdk.context._inject import install_propagation, uninstall_propagation
@@ -26,7 +26,7 @@ class _Recording(Transport):
 
 def _setup(**cfg):
     _hub.reset_for_test()
-    _hub.set_client(Client(WardexConfig(api_key="k", **cfg), _Recording()))
+    _hub.set_client(Client(WardexConfig(backend=BackendConfig(api_key="k"), **cfg), _Recording()))
 
 
 @pytest.fixture(autouse=True)
@@ -48,7 +48,7 @@ def _capture_request(**client_kwargs) -> httpx.Request:
 
 
 def test_injects_traceparent_inside_span():
-    _setup(propagate_trace=True)
+    _setup(propagation=PropagationPolicy(enabled=True))
     install_propagation()
     with trace("root") as root:
         req = _capture_request()
@@ -56,14 +56,14 @@ def test_injects_traceparent_inside_span():
 
 
 def test_no_injection_outside_any_context():
-    _setup(propagate_trace=True)
+    _setup(propagation=PropagationPolicy(enabled=True))
     install_propagation()
     req = _capture_request()
     assert "traceparent" not in req.headers
 
 
 def test_no_injection_when_flag_off():
-    _setup(propagate_trace=False)
+    _setup(propagation=PropagationPolicy(enabled=False))
     install_propagation()  # wiring guards on the flag too, but the header path must also guard
     with trace("root"):
         req = _capture_request()
@@ -71,7 +71,7 @@ def test_no_injection_when_flag_off():
 
 
 def test_user_header_never_overwritten():
-    _setup(propagate_trace=True)
+    _setup(propagation=PropagationPolicy(enabled=True))
     install_propagation()
     seen = {}
 
@@ -86,7 +86,7 @@ def test_user_header_never_overwritten():
 
 
 def test_targets_allowlist():
-    _setup(propagate_trace=True, propagate_targets=("*.mycorp.com",))
+    _setup(propagation=PropagationPolicy(enabled=True, targets=("*.mycorp.com",)))
     install_propagation()
     seen = {}
 
@@ -105,7 +105,7 @@ def test_targets_allowlist():
 def test_async_client_injects():
     import asyncio
 
-    _setup(propagate_trace=True)
+    _setup(propagation=PropagationPolicy(enabled=True))
     install_propagation()
     seen = {}
 
@@ -123,7 +123,7 @@ def test_async_client_injects():
 
 
 def test_install_uninstall_idempotent():
-    _setup(propagate_trace=True)
+    _setup(propagation=PropagationPolicy(enabled=True))
     orig = httpx.Client.send
     install_propagation()
     install_propagation()
@@ -162,7 +162,7 @@ def echo_server():
 def test_requests_injects(echo_server):
     import requests
 
-    _setup(propagate_trace=True)
+    _setup(propagation=PropagationPolicy(enabled=True))
     install_propagation()
     with trace("root") as root:
         requests.get(f"{echo_server}/x", timeout=5)
@@ -174,7 +174,7 @@ def test_aiohttp_injects(echo_server):
 
     import aiohttp
 
-    _setup(propagate_trace=True)
+    _setup(propagation=PropagationPolicy(enabled=True))
     install_propagation()
 
     async def main():
@@ -193,7 +193,7 @@ def test_aiohttp_preserves_duplicate_headers(echo_server):
 
     import aiohttp
 
-    _setup(propagate_trace=True)
+    _setup(propagation=PropagationPolicy(enabled=True))
     install_propagation()
 
     async def main():
@@ -212,7 +212,7 @@ def test_tracestate_forwarded_verbatim(echo_server):
     import requests
 
     tp = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
-    _setup(propagate_trace=True)
+    _setup(propagation=PropagationPolicy(enabled=True))
     install_propagation()
     with wardex_sdk.continue_trace({"traceparent": tp, "tracestate": "dd=s:1"}):
         with trace("root"):
@@ -225,7 +225,7 @@ def test_init_wires_propagation_and_close_unwires():
 
     _hub.reset_for_test()
     orig = httpx.Client.send
-    wardex_sdk.init(propagate_trace=True)
+    wardex_sdk.init(propagation=PropagationPolicy(enabled=True))
     assert httpx.Client.send is not orig
     wardex_sdk.close()
     assert httpx.Client.send is orig
@@ -246,7 +246,7 @@ def test_exporter_post_not_injected():
     from wardex_sdk._suppress import suppress_capture
     from wardex_sdk.context._inject import _build_inject_headers
 
-    _setup(propagate_trace=True)
+    _setup(propagation=PropagationPolicy(enabled=True))
     with trace("root"):
         assert _build_inject_headers("collector.mycorp.com") != {}
         with suppress_capture():
@@ -260,7 +260,7 @@ def test_end_to_end_chain_one_trace():
 
     TP = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
     inbound_tid = TP.split("-")[1]
-    _setup(propagate_trace=True)
+    _setup(propagation=PropagationPolicy(enabled=True))
     install_propagation()
     injected: list[str] = []
 

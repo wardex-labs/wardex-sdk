@@ -89,7 +89,7 @@ def install_configured_interceptors(client: Client | None, config: WardexConfig)
     """
     if not config.intercept:
         if config.interceptors is not None and config.debug:
-            # The same shape as `init()`'s pii_disabled_categories line, and for
+            # The same shape as `init()`'s pii disabled-categories line, and for
             # the same reason: a refinement of a switch that is off is not an
             # error, but silence about it is how a user concludes the selection
             # was honoured.

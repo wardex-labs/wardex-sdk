@@ -23,7 +23,7 @@ from typing import Any
 import pytest
 
 from wardex_sdk import _hub
-from wardex_sdk._config import WardexConfig
+from wardex_sdk._config import BackendConfig, WardexConfig
 from wardex_sdk._enums import CaptureMode
 from wardex_sdk._types import SpanContext, SpanId, TraceId
 from wardex_sdk.assembly import Prefilter, capture_mode_of, should_capture
@@ -52,7 +52,7 @@ MODES = list(CaptureMode)
 
 class _FakeClient:
     def __init__(self, mode: CaptureMode) -> None:
-        self.config = WardexConfig(api_key="k", capture_mode=mode)
+        self.config = WardexConfig(capture_mode=mode, backend=BackendConfig(api_key="k"))
         self.spans: list[Any] = []
 
     def capture_span(self, span: Any) -> None:

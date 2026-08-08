@@ -46,7 +46,7 @@ from wardex_sdk._client import (
     _configured_transport_timeout,
     _UnnamedTimeout,
 )
-from wardex_sdk._config import WardexConfig
+from wardex_sdk._config import BackendConfig, BatchingPolicy, WardexConfig
 from wardex_sdk._enums import SpanKind
 from wardex_sdk._types import (
     InternalEnvelope,
@@ -89,7 +89,12 @@ class _Recording(Transport):
 
 
 def _client(transport):
-    c = Client(WardexConfig(api_key="k", flush_interval=3600.0), transport)
+    c = Client(
+        WardexConfig(
+            backend=BackendConfig(api_key="k"), batching=BatchingPolicy(flush_interval=3600.0)
+        ),
+        transport,
+    )
     c._worker.stop()
     return c
 

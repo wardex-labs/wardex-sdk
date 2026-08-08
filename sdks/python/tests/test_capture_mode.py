@@ -6,7 +6,7 @@ import pytest
 
 from wardex_sdk import _hub
 from wardex_sdk._client import Client
-from wardex_sdk._config import WardexConfig
+from wardex_sdk._config import BackendConfig, WardexConfig
 from wardex_sdk._enums import CaptureMode
 from wardex_sdk._types import InternalEnvelope, SpanContext, SpanId, TraceId
 from wardex_sdk.interceptors import _seam
@@ -41,7 +41,9 @@ class _Seam(ByteSeamInterceptor):
 
 def _seam_with(mode: CaptureMode) -> _Seam:
     _hub.reset_for_test()
-    client = Client(WardexConfig(api_key="k", capture_mode=mode), _Recording())
+    client = Client(
+        WardexConfig(capture_mode=mode, backend=BackendConfig(api_key="k")), _Recording()
+    )
     _hub.set_client(client)
     s = _Seam()
     s._client = client

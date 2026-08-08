@@ -19,7 +19,7 @@ import pytest
 import wardex_sdk as wardex
 from wardex_sdk import _hub, _runtime
 from wardex_sdk._client import Client
-from wardex_sdk._config import WardexConfig
+from wardex_sdk._config import BackendConfig, BatchingPolicy, PropagationPolicy, WardexConfig
 from wardex_sdk._enums import SpanKind
 from wardex_sdk._types import InternalEnvelope, InternalSpan, SpanContext, SpanId, TraceId
 from wardex_sdk.adapters._base import AdapterInterface
@@ -49,7 +49,9 @@ def _span() -> InternalSpan:
 
 
 def _client(transport: Transport | None = None, **cfg: object) -> Client:
-    return Client(WardexConfig(api_key="k", **cfg), transport or _Recording())
+    return Client(
+        WardexConfig(backend=BackendConfig(api_key="k"), **cfg), transport or _Recording()
+    )
 
 
 def _ssl_seam():
@@ -112,7 +114,7 @@ def test_reset_for_test_empties_every_state_the_runtime_owns():
     from wardex_sdk.interceptors._registry import get_registry as interceptor_registry
 
     runtime = _runtime.runtime()
-    client = _client(flush_interval=3600.0)
+    client = _client(batching=BatchingPolicy(flush_interval=3600.0))
     adapter = _FakeAdapter()
 
     runtime.install(client, client.config)
@@ -151,7 +153,7 @@ def test_the_hub_and_the_runtime_read_one_client_slot():
     cleared one, and the atexit path read the other — so a test that reset the
     hub left `atexit` holding a client the SDK had already forgotten.
     """
-    client = _client(flush_interval=3600.0)
+    client = _client(batching=BatchingPolicy(flush_interval=3600.0))
     _runtime.runtime().install(client, client.config)
     try:
         assert _hub.get_client() is client
@@ -203,7 +205,11 @@ def test_init_then_close_puts_every_patched_attribute_back():
     """
     before = _process_seams()
 
-    wardex.init(intercept=True, propagate_trace=True, api_key="k")
+    wardex.init(
+        intercept=True,
+        backend=BackendConfig(api_key="k"),
+        propagation=PropagationPolicy(enabled=True),
+    )
     during = _process_seams()
     assert any(during[name] is not before[name] for name in before), (
         "init() patched nothing, so putting it back proves nothing"
@@ -227,7 +233,7 @@ def test_the_atexit_teardown_drops_the_propagation_patches_too():
     import httpx
 
     original = httpx.Client.send
-    wardex.init(propagate_trace=True, api_key="k")
+    wardex.init(backend=BackendConfig(api_key="k"), propagation=PropagationPolicy(enabled=True))
     assert httpx.Client.send is not original, "propagation never installed"
 
     _runtime.runtime()._at_exit()
@@ -242,7 +248,11 @@ def test_the_atexit_teardown_drops_the_propagation_patches_too():
 
 def test_close_twice_is_a_no_op():
     transport = _Recording()
-    wardex.init(transport=transport, api_key="k", flush_interval=3600.0)
+    wardex.init(
+        transport=transport,
+        backend=BackendConfig(api_key="k"),
+        batching=BatchingPolicy(flush_interval=3600.0),
+    )
     client = _hub.get_client()
     client.capture_span(_span())
 
@@ -258,7 +268,11 @@ def test_close_twice_is_a_no_op():
 def test_close_after_a_teardown_is_a_no_op():
     """`atexit` and `wardex.close()` reach the same implementation, in either order."""
     transport = _Recording()
-    wardex.init(transport=transport, api_key="k", flush_interval=3600.0)
+    wardex.init(
+        transport=transport,
+        backend=BackendConfig(api_key="k"),
+        batching=BatchingPolicy(flush_interval=3600.0),
+    )
     client = _hub.get_client()
     client.capture_span(_span())
 
@@ -270,7 +284,7 @@ def test_close_after_a_teardown_is_a_no_op():
 
 
 def test_reset_twice_is_a_no_op():
-    wardex.init(api_key="k")
+    wardex.init(backend=BackendConfig(api_key="k"))
     _hub.reset_for_test()
     _hub.reset_for_test()  # must not raise on an already-empty runtime
     assert _runtime.runtime().client is None
@@ -305,7 +319,7 @@ def test_the_signal_handler_does_not_wait_for_a_shutdown_on_another_thread():
     """
     runtime = _runtime.runtime()
     transport = _Recording()
-    client = _client(transport, flush_interval=3600.0)
+    client = _client(transport, batching=BatchingPolicy(flush_interval=3600.0))
     runtime.install(client, client.config)
     client.capture_span(_span())
 
@@ -351,7 +365,7 @@ def test_a_signal_landing_inside_a_teardown_still_reaches_the_apps_handler():
     short of SIGKILL.
     """
     runtime = _runtime.runtime()
-    client = _client(flush_interval=3600.0)
+    client = _client(batching=BatchingPolicy(flush_interval=3600.0))
     runtime.install(client, client.config)
 
     seen: list[int] = []
@@ -371,7 +385,7 @@ def test_the_handler_closes_live_units_through_the_runtimes_own_registry():
     reference to a registry entry the next test knows nothing about.
     """
     runtime = _runtime.runtime()
-    client = _client(flush_interval=3600.0)
+    client = _client(batching=BatchingPolicy(flush_interval=3600.0))
     runtime.install(client, client.config)
 
     assert runtime._close_units is not None
@@ -384,7 +398,7 @@ def test_the_handler_closes_live_units_through_the_runtimes_own_registry():
 def test_close_units_all_is_what_the_handler_reaches_on_the_dying_disposition():
     """The marker the census pins to this module, driven end to end."""
     runtime = _runtime.runtime()
-    client = _client(flush_interval=3600.0)
+    client = _client(batching=BatchingPolicy(flush_interval=3600.0))
     runtime.install(client, client.config)
 
     marks: list[Limitation] = []

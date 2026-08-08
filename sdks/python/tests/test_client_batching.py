@@ -4,7 +4,7 @@ import threading
 import time
 
 from wardex_sdk._client import _UNBOUNDED_TRANSPORT_FLUSH_TIMEOUT, Client
-from wardex_sdk._config import WardexConfig
+from wardex_sdk._config import BackendConfig, BatchingPolicy, WardexConfig
 from wardex_sdk._enums import SpanKind
 from wardex_sdk._limits import CaptureLimits
 from wardex_sdk._types import (
@@ -51,7 +51,12 @@ def test_concurrent_capture_and_drain_loses_nothing():
     """The core regression guard for the background flusher (spec §11): no loss,
     no dup."""
     t = _Recording()
-    c = Client(WardexConfig(api_key="k", limits=CaptureLimits(max_buffer_spans=100_000)), t)
+    c = Client(
+        WardexConfig(
+            limits=CaptureLimits(max_buffer_spans=100_000), backend=BackendConfig(api_key="k")
+        ),
+        t,
+    )
     n_threads, m_spans = 8, 500
     stop_draining = threading.Event()
 
@@ -80,7 +85,10 @@ def test_concurrent_capture_and_drain_loses_nothing():
 
 def test_backpressure_drops_oldest_keeps_newest():
     t = _Recording()
-    c = Client(WardexConfig(api_key="k", limits=CaptureLimits(max_buffer_spans=10)), t)
+    c = Client(
+        WardexConfig(limits=CaptureLimits(max_buffer_spans=10), backend=BackendConfig(api_key="k")),
+        t,
+    )
     # This test predates the background worker and asserts on the
     # *manual* flush()'s view of a single overflow burst. With max_buffer_spans=10
     # the wake threshold is max(1, 10 // 4) = 2, so the live worker can (and, on
@@ -101,7 +109,12 @@ def test_backpressure_drops_oldest_keeps_newest():
 
 def test_dropped_count_reported_once_in_debug(capsys):
     t = _Recording()
-    c = Client(WardexConfig(api_key="k", limits=CaptureLimits(max_buffer_spans=2), debug=True), t)
+    c = Client(
+        WardexConfig(
+            limits=CaptureLimits(max_buffer_spans=2), debug=True, backend=BackendConfig(api_key="k")
+        ),
+        t,
+    )
     # max_buffer_spans=2 gives a wake threshold of max(1, 2 // 4) = 1, so the
     # live worker would race this tight burst and drain early,
     # splitting the "dropped 3" report. Stop it so only the explicit flush()
@@ -122,7 +135,7 @@ def test_before_send_exception_drops_envelope_and_does_not_propagate():
         raise RuntimeError("boom")
 
     t = _Recording()
-    c = Client(WardexConfig(api_key="k", before_send=boom), t)
+    c = Client(WardexConfig(before_send=boom, backend=BackendConfig(api_key="k")), t)
     c.capture_span(_span())
     c.flush()  # must not raise (fail-closed: drop, spec §10)
     assert t.envelopes == []
@@ -134,7 +147,7 @@ def test_export_exception_drops_envelope_and_does_not_propagate():
         def export(self, envelope):
             raise ValueError("encode failed")
 
-    c = Client(WardexConfig(api_key="k"), _Exploding())
+    c = Client(WardexConfig(backend=BackendConfig(api_key="k")), _Exploding())
     c.capture_span(_span())
     c.flush()  # must not raise
     c.close()
@@ -155,7 +168,7 @@ def test_capture_during_export_goes_to_fresh_buffer():
             release.wait(timeout=5.0)
 
     t = _Blocking()
-    c = Client(WardexConfig(api_key="k"), t)
+    c = Client(WardexConfig(backend=BackendConfig(api_key="k")), t)
     c.capture_span(_span(name="first"))
     flusher = threading.Thread(target=c.flush)
     flusher.start()
@@ -171,7 +184,12 @@ def test_capture_during_export_goes_to_fresh_buffer():
 def test_auto_flush_without_manual_flush():
     """The reason the background flusher exists: data leaves with no flush() call."""
     t = _Recording()
-    c = Client(WardexConfig(api_key="k", flush_interval=0.05), t)
+    c = Client(
+        WardexConfig(
+            backend=BackendConfig(api_key="k"), batching=BatchingPolicy(flush_interval=0.05)
+        ),
+        t,
+    )
     c.capture_span(_span())
     assert _wait_for(lambda: sum(len(e.spans) for e in t.envelopes) >= 1)
     c.close()
@@ -181,7 +199,11 @@ def test_threshold_wakes_worker_before_interval():
     t = _Recording()
     # max_buffer_spans=8 → threshold max(1, 8//4)=2; interval too long to fire
     c = Client(
-        WardexConfig(api_key="k", flush_interval=3600.0, limits=CaptureLimits(max_buffer_spans=8)),
+        WardexConfig(
+            limits=CaptureLimits(max_buffer_spans=8),
+            backend=BackendConfig(api_key="k"),
+            batching=BatchingPolicy(flush_interval=3600.0),
+        ),
         t,
     )
     c.capture_span(_span())
@@ -192,7 +214,12 @@ def test_threshold_wakes_worker_before_interval():
 
 def test_close_stops_worker_and_drains_remainder():
     t = _Recording()
-    c = Client(WardexConfig(api_key="k", flush_interval=3600.0), t)
+    c = Client(
+        WardexConfig(
+            backend=BackendConfig(api_key="k"), batching=BatchingPolicy(flush_interval=3600.0)
+        ),
+        t,
+    )
     c.capture_span(_span())
     c.close()
     assert not c._worker.is_alive()
@@ -203,7 +230,7 @@ def test_close_stops_worker_and_drains_remainder():
 
 def test_capture_after_close_is_rejected():
     t = _Recording()
-    c = Client(WardexConfig(api_key="k"), t)
+    c = Client(WardexConfig(backend=BackendConfig(api_key="k")), t)
     c.close()
     c.capture_span(_span())
     c.flush()
@@ -219,7 +246,7 @@ def test_reentrant_flush_from_before_send_does_not_deadlock():
         holder["client"].flush()  # same-thread nested drain (empty buffer) — must not hang
         return envelope
 
-    c = Client(WardexConfig(api_key="k", before_send=reenter), t)
+    c = Client(WardexConfig(before_send=reenter, backend=BackendConfig(api_key="k")), t)
     holder["client"] = c
     c.capture_span(_span())
     # daemon: on a regression this thread hangs forever; it must not block process exit
@@ -234,7 +261,12 @@ def test_reentrant_flush_from_before_send_does_not_deadlock():
 def test_signal_flush_while_buffer_lock_held_does_not_deadlock():
     """A signal handler may call flush() on a thread that holds _buffer_lock."""
     t = _Recording()
-    c = Client(WardexConfig(api_key="k", flush_interval=3600.0), t)
+    c = Client(
+        WardexConfig(
+            backend=BackendConfig(api_key="k"), batching=BatchingPolicy(flush_interval=3600.0)
+        ),
+        t,
+    )
     done = threading.Event()
 
     def simulate_signal_during_append():
@@ -256,7 +288,7 @@ def test_transport_flush_exception_does_not_propagate():
         def flush(self, timeout: float = 5.0) -> None:
             raise ValueError("stream closed")
 
-    c = Client(WardexConfig(api_key="k"), _FlushExploding())
+    c = Client(WardexConfig(backend=BackendConfig(api_key="k")), _FlushExploding())
     c.flush()  # empty-buffer branch must not raise
     c.capture_span(_span())
     c.flush()  # post-export branch must not raise
@@ -288,7 +320,12 @@ def test_flush_deadline_is_not_extended_by_an_in_flight_export():
                 release.wait(timeout=10.0)
 
     t = _Stuck()
-    c = Client(WardexConfig(api_key="k", flush_interval=3600.0), t)
+    c = Client(
+        WardexConfig(
+            backend=BackendConfig(api_key="k"), batching=BatchingPolicy(flush_interval=3600.0)
+        ),
+        t,
+    )
     c._worker.stop()  # the slot holder must be a thread this test controls
     try:
         c.capture_span(_span(name="first"))
@@ -328,7 +365,12 @@ def test_flush_budget_reaches_the_transport():
     """A bound on flush() is worthless if the transport never hears about it:
     only the transport can bound its own I/O."""
     t = _TimeoutRecording()
-    c = Client(WardexConfig(api_key="k", flush_interval=3600.0), t)
+    c = Client(
+        WardexConfig(
+            backend=BackendConfig(api_key="k"), batching=BatchingPolicy(flush_interval=3600.0)
+        ),
+        t,
+    )
     c._worker.stop()
     c.capture_span(_span())
     c.flush(2.0)
@@ -343,7 +385,12 @@ def test_periodic_drain_imposes_no_deadline_on_the_transport():
     Giving it one would clamp the transport's configured timeout on the one path
     that ships data unattended, turning slow-but-working POSTs into lost ones."""
     t = _TimeoutRecording()
-    c = Client(WardexConfig(api_key="k", flush_interval=0.05), t)
+    c = Client(
+        WardexConfig(
+            backend=BackendConfig(api_key="k"), batching=BatchingPolicy(flush_interval=0.05)
+        ),
+        t,
+    )
     c.capture_span(_span())
     assert _wait_for(lambda: bool(t.timeouts))
     assert t.timeouts[0] is None
@@ -373,7 +420,14 @@ def test_transport_predating_the_timeout_parameter_still_exports(capsys):
             self.envelopes.append(envelope)
 
     t = _Legacy()
-    c = Client(WardexConfig(api_key="k", flush_interval=3600.0, debug=True), t)
+    c = Client(
+        WardexConfig(
+            debug=True,
+            backend=BackendConfig(api_key="k"),
+            batching=BatchingPolicy(flush_interval=3600.0),
+        ),
+        t,
+    )
     c._worker.stop()
     c.capture_span(_span())
     c.flush(2.0)
@@ -387,7 +441,14 @@ def test_transport_swapped_after_construction_is_re_probed(capsys):
     probe cached once at construction answers for the transport that is gone, so
     it hands `timeout=` to a replacement that cannot take it and drops every
     envelope through the fail-closed path."""
-    c = Client(WardexConfig(api_key="k", flush_interval=3600.0, debug=True), _TimeoutRecording())
+    c = Client(
+        WardexConfig(
+            debug=True,
+            backend=BackendConfig(api_key="k"),
+            batching=BatchingPolicy(flush_interval=3600.0),
+        ),
+        _TimeoutRecording(),
+    )
     c._worker.stop()
 
     class _LegacyReplacement(Transport):
@@ -429,7 +490,14 @@ def _client_stuck_in_export(in_export, release, **config):
     owns, with two more spans buffered behind it. Returns (client, transport,
     holder-thread)."""
     t = _BlockingExport(in_export, release)
-    c = Client(WardexConfig(api_key="k", flush_interval=3600.0, **config), t)
+    c = Client(
+        WardexConfig(
+            **config,
+            backend=BackendConfig(api_key="k"),
+            batching=BatchingPolicy(flush_interval=3600.0),
+        ),
+        t,
+    )
     c._worker.stop()  # the slot holder must be a thread the test controls
     c.capture_span(_span(name="in-flight"))
     holder = threading.Thread(target=c.flush, args=(30.0,), daemon=True)
@@ -563,7 +631,12 @@ def test_close_with_a_spent_budget_reports_the_tail_it_cannot_send(capsys):
     """
     reset_reports_for_test()
     t = _DeadlineHonouring()
-    c = Client(WardexConfig(api_key="k", flush_interval=3600.0), t)
+    c = Client(
+        WardexConfig(
+            backend=BackendConfig(api_key="k"), batching=BatchingPolicy(flush_interval=3600.0)
+        ),
+        t,
+    )
     c._worker.stop()
     c.capture_span(_span("only"))
     capsys.readouterr()
@@ -584,7 +657,12 @@ def test_close_with_budget_left_still_ships_through_a_deadline_honouring_transpo
     turned every close() into an abandonment."""
     reset_reports_for_test()
     t = _DeadlineHonouring()
-    c = Client(WardexConfig(api_key="k", flush_interval=3600.0), t)
+    c = Client(
+        WardexConfig(
+            backend=BackendConfig(api_key="k"), batching=BatchingPolicy(flush_interval=3600.0)
+        ),
+        t,
+    )
     c._worker.stop()
     c.capture_span(_span("only"))
     capsys.readouterr()
@@ -613,7 +691,12 @@ def test_close_with_a_spent_budget_does_not_claim_a_loss_a_legacy_transport_avoi
     """
     reset_reports_for_test()
     t = _LegacyIgnoringDeadline()
-    c = Client(WardexConfig(api_key="k", flush_interval=3600.0), t)
+    c = Client(
+        WardexConfig(
+            backend=BackendConfig(api_key="k"), batching=BatchingPolicy(flush_interval=3600.0)
+        ),
+        t,
+    )
     c._worker.stop()
     c.capture_span(_span("only"))
     capsys.readouterr()
@@ -642,7 +725,12 @@ def test_a_transport_that_ignores_a_spent_deadline_is_never_treated_as_a_loss(ca
     the backend would see the same span twice."""
     reset_reports_for_test()
     t = _IgnoresTheDeadlineAndDelivers()
-    c = Client(WardexConfig(api_key="k", flush_interval=3600.0), t)
+    c = Client(
+        WardexConfig(
+            backend=BackendConfig(api_key="k"), batching=BatchingPolicy(flush_interval=3600.0)
+        ),
+        t,
+    )
     c._worker.stop()
     c.capture_span(_span("a"))
     capsys.readouterr()
@@ -667,7 +755,12 @@ def test_a_declined_flush_gives_the_spans_back_so_the_next_drain_ships_them(caps
     belong back in the buffer, in order, for the next drain."""
     reset_reports_for_test()
     t = _DeadlineHonouring()
-    c = Client(WardexConfig(api_key="k", flush_interval=3600.0), t)
+    c = Client(
+        WardexConfig(
+            backend=BackendConfig(api_key="k"), batching=BatchingPolicy(flush_interval=3600.0)
+        ),
+        t,
+    )
     c._worker.stop()
     c.capture_span(_span("a"))
     c.capture_span(_span("b"))
@@ -692,7 +785,12 @@ def test_a_returned_batch_goes_in_front_of_spans_captured_while_it_was_out():
     oldest-first. Appending it instead would put the tail on the wire ahead of
     the head."""
     t = _DeadlineHonouring()
-    c = Client(WardexConfig(api_key="k", flush_interval=3600.0), t)
+    c = Client(
+        WardexConfig(
+            backend=BackendConfig(api_key="k"), batching=BatchingPolicy(flush_interval=3600.0)
+        ),
+        t,
+    )
     c._worker.stop()
     c.capture_span(_span("a"))
     c.capture_span(_span("b"))
@@ -724,10 +822,10 @@ def test_a_returned_batch_yields_to_the_buffer_cap_instead_of_overflowing_it():
 
     c = Client(
         WardexConfig(
-            api_key="k",
-            flush_interval=3600.0,
             limits=CaptureLimits(max_buffer_spans=3),
             before_send=_captures_while_the_batch_is_out,
+            backend=BackendConfig(api_key="k"),
+            batching=BatchingPolicy(flush_interval=3600.0),
         ),
         t,
     )
@@ -767,7 +865,11 @@ def test_a_before_send_that_outlives_close_s_budget_is_still_reported(capsys):
 
     t = _DeadlineHonouring()
     c = Client(
-        WardexConfig(api_key="k", flush_interval=3600.0, before_send=_slow),
+        WardexConfig(
+            before_send=_slow,
+            backend=BackendConfig(api_key="k"),
+            batching=BatchingPolicy(flush_interval=3600.0),
+        ),
         t,
     )
     c._worker.stop()
@@ -796,7 +898,14 @@ def test_a_before_send_that_outlives_a_flush_budget_gives_the_spans_back(capsys)
         return envelope
 
     t = _DeadlineHonouring()
-    c = Client(WardexConfig(api_key="k", flush_interval=3600.0, before_send=_slow), t)
+    c = Client(
+        WardexConfig(
+            before_send=_slow,
+            backend=BackendConfig(api_key="k"),
+            batching=BatchingPolicy(flush_interval=3600.0),
+        ),
+        t,
+    )
     c._worker.stop()
     c.capture_span(_span("only"))
     capsys.readouterr()
@@ -833,7 +942,12 @@ def test_a_hostile_transport_attribute_never_raises_into_close_or_flush():
     long before it touches the transport, so a version of this test that
     captured once would exercise the escape only on the first call and pass over
     a wide-open close()."""
-    c = Client(WardexConfig(api_key="k", flush_interval=3600.0), _Recording())
+    c = Client(
+        WardexConfig(
+            backend=BackendConfig(api_key="k"), batching=BatchingPolicy(flush_interval=3600.0)
+        ),
+        _Recording(),
+    )
     c._worker.stop()
     c._transport = _HostileExportAttribute()  # swapped at runtime, as hosts do
     c.capture_span(_span("only"))
@@ -849,7 +963,12 @@ def test_a_hostile_transport_attribute_never_raises_out_of_the_constructor():
     of whatever transport `init()` was handed. An `export` that raises on
     attribute access took `wardex.init()` down with it, which is the one thing an
     observability SDK may never do."""
-    c = Client(WardexConfig(api_key="k", flush_interval=3600.0), _HostileExportAttribute())
+    c = Client(
+        WardexConfig(
+            backend=BackendConfig(api_key="k"), batching=BatchingPolicy(flush_interval=3600.0)
+        ),
+        _HostileExportAttribute(),
+    )
     c._worker.stop()
     c.capture_span(_span("only"))
     c.close(5.0)  # must not raise on the ordinary budget either
@@ -861,7 +980,12 @@ def test_hostile_flush_timeout_never_reaches_the_host():
     float('nan') used to reach RLock.acquire() as a ValueError and a non-number
     the deadline arithmetic as a TypeError, both outside every handler."""
     t = _TimeoutRecording()
-    c = Client(WardexConfig(api_key="k", flush_interval=3600.0), t)
+    c = Client(
+        WardexConfig(
+            backend=BackendConfig(api_key="k"), batching=BatchingPolicy(flush_interval=3600.0)
+        ),
+        t,
+    )
     c._worker.stop()
     for hostile in (float("nan"), float("-nan"), "x", None, object(), -1.0, float("inf")):
         c.capture_span(_span())
@@ -876,7 +1000,12 @@ def test_hostile_close_timeout_never_reaches_the_host():
     Transport.close(), neither of which tolerates NaN or a str either."""
     for hostile in (float("nan"), "x", None, object(), -1.0, float("inf")):
         t = _TimeoutRecording()
-        c = Client(WardexConfig(api_key="k", flush_interval=3600.0), t)
+        c = Client(
+            WardexConfig(
+                backend=BackendConfig(api_key="k"), batching=BatchingPolicy(flush_interval=3600.0)
+            ),
+            t,
+        )
         c.capture_span(_span())
         c.close(hostile)  # must not raise
         assert len(t.timeouts) == 1, f"close({hostile!r}) shipped nothing"
@@ -904,7 +1033,14 @@ def test_exhausted_budget_never_reaches_the_transport_as_a_negative():
         return envelope
 
     t = _Recorder()
-    c = Client(WardexConfig(api_key="k", flush_interval=3600.0, before_send=_slow_before_send), t)
+    c = Client(
+        WardexConfig(
+            before_send=_slow_before_send,
+            backend=BackendConfig(api_key="k"),
+            batching=BatchingPolicy(flush_interval=3600.0),
+        ),
+        t,
+    )
     c._worker.stop()
     c.capture_span(_span())
     c.flush(0.01)
@@ -926,7 +1062,12 @@ def test_signal_flush_inside_the_buffer_lock_cannot_deadlock_the_worker():
         def export(self, envelope, *, timeout=None):
             pass
 
-    c = Client(WardexConfig(api_key="k", flush_interval=3600.0), _Idle())
+    c = Client(
+        WardexConfig(
+            backend=BackendConfig(api_key="k"), batching=BatchingPolicy(flush_interval=3600.0)
+        ),
+        _Idle(),
+    )
     c._worker.stop()  # this test owns both threads
     holding, release, finished = threading.Event(), threading.Event(), threading.Event()
 

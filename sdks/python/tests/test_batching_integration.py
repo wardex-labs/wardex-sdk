@@ -11,7 +11,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 import pytest
 
 from wardex_sdk._client import Client
-from wardex_sdk._config import WardexConfig
+from wardex_sdk._config import BackendConfig, BatchingPolicy, WardexConfig
 from wardex_sdk._enums import SpanKind, StatusCode
 from wardex_sdk._limits import CaptureLimits
 from wardex_sdk._types import InternalEnvelope, InternalSpan, SpanContext, SpanId, TraceId
@@ -67,7 +67,12 @@ def test_periodic_flush_posts_encoded_batch_without_manual_flush():
     threading.Thread(target=server.serve_forever, daemon=True).start()
     try:
         t = OtlpHttpTransport(f"http://127.0.0.1:{server.server_port}/v1/traces")
-        c = Client(WardexConfig(api_key="k", flush_interval=0.05), t)
+        c = Client(
+            WardexConfig(
+                backend=BackendConfig(api_key="k"), batching=BatchingPolicy(flush_interval=0.05)
+            ),
+            t,
+        )
         c.capture_span(_span())
         assert _wait_for(lambda: len(server.received) >= 1)
         c.close()
@@ -92,8 +97,9 @@ def mark(envelope):
     return None  # drop after recording — no network needed
 
 # interval 3600 + threshold 512: only the signal handler can flush this span
-wardex.init(transport=NoOpTransport(), api_key="k",
-            flush_interval=3600.0, before_send=mark)
+wardex.init(transport=NoOpTransport(), before_send=mark,
+            backend=wardex.BackendConfig(api_key="k"),
+            batching=wardex.BatchingPolicy(flush_interval=3600.0))
 _hub.get_client().capture_span(InternalSpan(
     context=SpanContext(TraceId.generate(), SpanId.generate()),
     parent_span_id=None, name="s", kind=SpanKind.INTERNAL,
@@ -130,7 +136,11 @@ def test_fork_child_respawns_worker_and_flushes():
     t = _Recording()
     # interval 3600: parent worker sits idle in wait() holding no locks → fork-safe
     c = Client(
-        WardexConfig(api_key="k", flush_interval=3600.0, limits=CaptureLimits(max_buffer_spans=8)),
+        WardexConfig(
+            limits=CaptureLimits(max_buffer_spans=8),
+            backend=BackendConfig(api_key="k"),
+            batching=BatchingPolicy(flush_interval=3600.0),
+        ),
         t,
     )
     pid = os.fork()
