@@ -748,6 +748,15 @@ fn cap_any(v: &mut otlp_pb::common::AnyValue, cap: usize) -> bool {
             true
         }
         Some(Value::BytesValue(b)) => {
+            // At or under three quarters of the bound even the base64 form
+            // fits, so the answer is known without asking which form it takes.
+            // Worth an early return rather than tidiness: `as_text` scans the
+            // whole payload, `strip_bytes_values` will scan it again a moment
+            // later, and skipping this one keeps the cap free for every payload
+            // that was never near the bound — which is all of them, normally.
+            if b.len() <= cap / 4 * 3 {
+                return false;
+            }
             // Measured as it will LEAVE, not as it sits here: `as_text` is the
             // same test `strip_bytes_values` will apply, so this is that pass's
             // own arithmetic asked one step early.
@@ -1218,6 +1227,36 @@ mod tests {
         assert!(s.len() <= 100);
         assert_eq!(s.len() % 3, 0, "cut between the bytes of a character");
         assert_eq!(markers(&sp), vec!["otlp_attribute_truncated"]);
+    }
+
+    #[test]
+    fn the_cheap_early_return_agrees_with_the_measurement_it_skips() {
+        // The early return answers "fits either way" by arithmetic instead of
+        // by measuring, so it has to be exactly right at its own edge: one byte
+        // too generous and an oversized payload ships unmarked.
+        for cap in [16usize, 17, 18, 19, 100, 1000] {
+            let edge = cap / 4 * 3;
+            for raw in [edge, edge + 1] {
+                let env = envelope(pb::Span {
+                    // Not text: the base64 branch is the one the arithmetic is
+                    // about, and the one with room to be wrong.
+                    input_data: (0..raw).map(|i| 0x80 | (i % 64) as u8).collect(),
+                    ..Default::default()
+                });
+                let sp = capped(env, limits_with_attribute_cap(cap));
+                let Some(otlp_pb::common::any_value::Value::StringValue(s)) =
+                    attr(&sp, "wardex.input_data")
+                else {
+                    panic!("payload attribute missing");
+                };
+                assert!(s.len() <= cap, "cap {cap}, raw {raw}: {} bytes", s.len());
+                assert_eq!(
+                    markers(&sp).is_empty(),
+                    raw <= edge,
+                    "cap {cap}, raw {raw}: marker disagrees with whether it was cut"
+                );
+            }
+        }
     }
 
     #[test]
