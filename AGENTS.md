@@ -81,7 +81,7 @@ Interceptors ─┘   (+ Protocol parsers in Rust)
 Context (ContextVar) cross-cuts Adapters · Interceptors · Client
 ```
 
-- **Byte-exact / hot-path / heavy** work (protobuf, zstd, protocol parsing)
+- **Byte-exact / hot-path / heavy** work (protobuf, zstd, gzip, protocol parsing)
   lives in the Rust core (`crates/`). Python stays a thin layer.
 - The core is **domain-agnostic**: it never knows the target agent's domain.
 
@@ -90,7 +90,7 @@ Context (ContextVar) cross-cuts Adapters · Interceptors · Client
 | Path | Purpose |
 |---|---|
 | `crates/wardex-protocol` | HTTP/1·HTTP/2·gRPC·WS·JSON-RPC·SSE parsers |
-| `crates/wardex-codec` | Protobuf encode + Zstd compress (build.rs generates proto) |
+| `crates/wardex-codec` | Protobuf encode + Zstd/gzip compress (build.rs generates proto) |
 | `crates/wardex-core` | Facade rlib re-exporting the core crates |
 | `bindings/python` | PyO3 source (built into the wheel by maturin) |
 | `sdks/python` | The `wardex-sdk` wheel (Python + native) |
