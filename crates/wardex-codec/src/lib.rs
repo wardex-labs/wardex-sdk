@@ -1,7 +1,13 @@
-//! Wardex codec — Protobuf encoding + Zstd compression.
+//! Wardex codec — Protobuf encoding + compression.
 //!
 //! `proto` re-exports the generated wire types; `encode_envelope`/`decode_envelope`
 //! are the round trip over them, and `otlp` maps an envelope onto OTLP.
+//!
+//! TWO compressors, and which one applies is decided by the wire, not by
+//! preference. The wardex envelope travels zstd because both ends are ours.
+//! OTLP travels gzip because the OTLP/HTTP specification names gzip as the
+//! encoding a receiver must accept, and a collector handed
+//! `Content-Encoding: zstd` answers 415 — a whole batch lost to a header.
 
 pub mod proto {
     pub mod wardex {
@@ -52,6 +58,46 @@ pub fn encode_envelope(env: &pb::Envelope, limits: Limits) -> Result<Vec<u8>, Co
 pub fn decode_envelope(data: &[u8]) -> Result<pb::Envelope, CodecError> {
     let proto_bytes = zstd::stream::decode_all(data).map_err(CodecError::Decompress)?;
     pb::Envelope::decode(&proto_bytes[..]).map_err(CodecError::Decode)
+}
+
+/// The deflate level every OTLP request is compressed at.
+///
+/// Deliberately not a `Limits` field, unlike `zstd_level`. That knob exists
+/// because nothing else in the SDK can trade the envelope's CPU against its
+/// bytes; here the trade is already owned by `max_otlp_request_bytes`, which
+/// decides what "small enough" means and splits the batch when compression
+/// cannot get there. Level 6 is flate2's default and the level the OTLP
+/// ecosystem's own exporters use for this wire, so a request wardex compresses
+/// costs a receiver what every other exporter's does.
+const GZIP_LEVEL: u32 = 6;
+
+/// Raw bytes → gzip stream (RFC 1952), the encoding OTLP/HTTP receivers accept.
+///
+/// Separate from the zstd pair above rather than a mode of it: they serve
+/// different wires and only one of them is negotiable. This one's output has to
+/// match a `Content-Encoding: gzip` header exactly, so it emits a gzip frame —
+/// not a bare deflate stream, which is a different encoding token and is
+/// rejected under this one.
+pub fn gzip(data: &[u8]) -> Result<Vec<u8>, CodecError> {
+    use flate2::write::GzEncoder;
+    use std::io::Write as _;
+
+    let mut encoder = GzEncoder::new(Vec::new(), flate2::Compression::new(GZIP_LEVEL));
+    encoder.write_all(data).map_err(CodecError::Compress)?;
+    encoder.finish().map_err(CodecError::Compress)
+}
+
+/// gzip stream → raw bytes. The receiver's half of [`gzip`], for tests and for
+/// any host that wants to read back what it sent.
+pub fn gunzip(data: &[u8]) -> Result<Vec<u8>, CodecError> {
+    use flate2::read::GzDecoder;
+    use std::io::Read as _;
+
+    let mut out = Vec::new();
+    GzDecoder::new(data)
+        .read_to_end(&mut out)
+        .map_err(CodecError::Decompress)?;
+    Ok(out)
 }
 
 // Every enum mapping now lives in `vocab`, derived from the schema rather than
@@ -135,6 +181,36 @@ mod tests {
     #[test]
     fn decode_rejects_corrupt_input() {
         assert!(decode_envelope(b"not a zstd frame").is_err());
+    }
+
+    #[test]
+    fn gzip_round_trips() {
+        let payload = b"POST /v1/traces".repeat(500);
+        let compressed = gzip(&payload).unwrap();
+        assert!(compressed.len() < payload.len());
+        assert_eq!(gunzip(&compressed).unwrap(), payload);
+    }
+
+    #[test]
+    fn gzip_emits_a_gzip_frame_not_a_bare_deflate_stream() {
+        // The magic a receiver checks before it will honour
+        // `Content-Encoding: gzip`. A bare deflate stream decompresses fine
+        // with the wrong decoder and is rejected by the right one, so the
+        // frame header is the assertion, not the round trip above.
+        let compressed = gzip(b"x").unwrap();
+        assert_eq!(&compressed[..2], &[0x1f, 0x8b]);
+    }
+
+    #[test]
+    fn gzip_round_trips_the_empty_input() {
+        // An empty OTLP request is legal (zero resource_spans), and an encoder
+        // that only flushes on write would emit nothing at all for it.
+        assert_eq!(gunzip(&gzip(b"").unwrap()).unwrap(), b"");
+    }
+
+    #[test]
+    fn gunzip_rejects_input_that_is_not_gzip() {
+        assert!(gunzip(b"not a gzip frame").is_err());
     }
 
     #[test]
