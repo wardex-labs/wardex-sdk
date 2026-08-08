@@ -158,6 +158,24 @@ def test_from_env_backend_override_wins(monkeypatch):
     assert c.backend.api_key == "explicit"
 
 
+def test_from_env_merges_the_backend_group_field_by_field(monkeypatch):
+    """A partial `backend=` overrides one field; the sibling still comes from env.
+
+    Grouping made the whole-group override the NORMAL spelling — there is no
+    `from_env(endpoint=...)` any more — so resolving the group all-or-nothing
+    would make `WARDEX_API_KEY` vanish for anyone who set only the endpoint, and
+    an envelope header carrying an empty project key is exactly the silent
+    ignore this config change exists to remove.
+    """
+    monkeypatch.setenv("WARDEX_API_KEY", "from-env")
+    monkeypatch.setenv("WARDEX_ENDPOINT", "https://from-env.example")
+
+    c = WardexConfig.from_env(backend=BackendConfig(endpoint="https://explicit.example"))
+
+    assert c.backend.endpoint == "https://explicit.example"
+    assert c.backend.api_key == "from-env"
+
+
 def test_from_env_refuses_a_moved_name_like_the_constructor_does():
     """It forwards its overrides whole, so the guard covers this path too.
 

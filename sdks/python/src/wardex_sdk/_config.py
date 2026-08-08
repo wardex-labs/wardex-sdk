@@ -99,8 +99,15 @@ class BackendConfig:
     """Identifies the project on every envelope header."""
 
     endpoint: str | None = None
-    """Where to send. A `Transport` built by hand carries its own address; this
-    is the one `init()` uses when it builds the default."""
+    """Where to send — INERT TODAY, and read by nothing in the SDK.
+
+    A `Transport` carries its own address (`OtlpHttpTransport(endpoint=...)`),
+    and `init()` without one installs `NoOpTransport`; it does not build an
+    exporter out of this field. Setting it and omitting `transport=` therefore
+    captures everything and discards it in silence — which is why the emptiness
+    is recorded on the field rather than left for a user to discover from the
+    absence of traffic. Stated here, and in the README's group table, until a
+    default transport reads it."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -282,13 +289,22 @@ class WardexConfig:
         four names and drop every other override on the floor — a config builder
         that silently ignores half of what it is handed is the shape of bug this
         whole change is about.
+
+        A GROUP IS NOT AN ALL-OR-NOTHING OVERRIDE. Every variable above is
+        resolved PER FIELD, `backend`'s two included: a caller who sets only
+        `backend=BackendConfig(endpoint=...)` still gets `WARDEX_API_KEY`. The
+        alternative — skipping both env reads as soon as a `backend=` arrives —
+        is the same silent ignore one level down, and grouping made it the
+        normal spelling rather than an edge case, because overriding one backend
+        value now means constructing the whole group. `None` is the absence of a
+        value here, exactly as it was when these were flat fields.
         """
         resolved: dict[str, object] = dict(overrides)
-        if "backend" not in resolved:
-            resolved["backend"] = BackendConfig(
-                api_key=os.environ.get("WARDEX_API_KEY"),
-                endpoint=os.environ.get("WARDEX_ENDPOINT"),
-            )
+        given: BackendConfig = resolved.get("backend") or BackendConfig()  # type: ignore[assignment]
+        resolved["backend"] = BackendConfig(
+            api_key=given.api_key or os.environ.get("WARDEX_API_KEY"),
+            endpoint=given.endpoint or os.environ.get("WARDEX_ENDPOINT"),
+        )
         if resolved.get("environment") is None:
             resolved["environment"] = os.environ.get("WARDEX_ENVIRONMENT")
         resolved["debug"] = (
