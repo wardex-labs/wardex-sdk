@@ -222,6 +222,32 @@ def test_init_then_close_puts_every_patched_attribute_back():
         assert after[name] is original, f"{name} was not restored to the host's own object"
 
 
+def test_a_default_init_still_behaves_the_way_it_did_before_the_grouping():
+    """Defaults END TO END, not only on the dataclass.
+
+    Every per-field default assertion in `test_config.py` would still pass if a
+    READ site were left pointing at a field that moved: the config object would
+    be right and the runtime would ignore it. This is the other end of each
+    default — the flush interval the worker was actually built with, the signal
+    handlers `flush_on_signals=True` installs, and the outbound traffic a
+    default init must not touch.
+    """
+    import httpx
+
+    untouched = httpx.Client.send
+
+    wardex.init(transport=_Recording())
+    client = _hub.get_client()
+    try:
+        assert client._worker._interval == 5.0, "batching.flush_interval"
+        assert _runtime.runtime()._signals_installed, "batching.flush_on_signals"
+        assert httpx.Client.send is untouched, "propagation.enabled must default to off"
+        assert client.config.pii.mode.value == "mask", "pii.mode"
+        assert client.config.effective_retention.value == "summary_only", "retention.default"
+    finally:
+        wardex.close()
+
+
 def test_the_atexit_teardown_drops_the_propagation_patches_too():
     """The half `close()` did and the re-init/atexit path did not.
 
