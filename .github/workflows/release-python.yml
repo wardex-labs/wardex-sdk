@@ -118,12 +118,28 @@ jobs:
       # Import the built wheel (--no-index so it can't silently fall back to PyPI)
       # to catch a broken native extension or missing files before we publish.
       - name: install and import the built wheel
-        if: matrix.platform.how != 'qemu'
+        if: matrix.platform.how == 'native'
         shell: bash
         run: |
           python -m pip install --upgrade pip
           python -m pip install --pre --no-index --find-links dist wardex-sdk
           python -c "import wardex_sdk; print('smoke ok:', wardex_sdk.__version__)"
+
+      # Selecting the x64 interpreter is not enough on the arm64 runner: a bare
+      # `python` has resolved to the system framework build (native arm64), and
+      # an arm64 pip rejects the Intel wheel outright ("versions: none"). So
+      # call the interpreter setup-python reports, force it through Rosetta
+      # with `arch -x86_64`, and assert the architecture before trusting any
+      # green that follows.
+      - name: install and import the built wheel (Rosetta)
+        if: matrix.platform.how == 'rosetta'
+        shell: bash
+        run: |
+          py="$pythonLocation/bin/python"
+          arch -x86_64 "$py" -c 'import platform; m = platform.machine(); assert m == "x86_64", m'
+          arch -x86_64 "$py" -m pip install --upgrade pip
+          arch -x86_64 "$py" -m pip install --pre --no-index --find-links dist wardex-sdk
+          arch -x86_64 "$py" -c "import wardex_sdk; print('smoke ok:', wardex_sdk.__version__)"
 
       - uses: docker/setup-qemu-action@v3
         if: matrix.platform.how == 'qemu'
