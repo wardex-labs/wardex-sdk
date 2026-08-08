@@ -17,9 +17,32 @@ if TYPE_CHECKING:
 __all__ = [
     "InterceptorInterface",
     "InterceptorRegistry",
+    "SSLInterceptor",
     "get_registry",
     "install_configured_interceptors",
 ]
+
+
+def __getattr__(name: str) -> object:
+    """Resolve `SSLInterceptor` on first ATTRIBUTE access, not on import.
+
+    The name has been on this package's `__all__` since the seam existed, and
+    this package has no leading underscore, so `from wardex_sdk.interceptors
+    import SSLInterceptor` is a spelling a pinned caller may already have.
+    Deleting the eager `from ._ssl import SSLInterceptor` fixed two real
+    problems (see the builder below) but took the public name with it, and a
+    refactor is not the place to break an import.
+
+    PEP 562 keeps both: nothing imports `_ssl` until something asks for the
+    class by name, so the package still imports with the native extension
+    absent, and the class is still resolved through the MODULE — the isolation
+    suite's substitution is not frozen at package-import time.
+    """
+    if name == "SSLInterceptor":
+        from ._ssl import SSLInterceptor
+
+        return SSLInterceptor
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 # Every builder below imports INSIDE the call, and none of it is a style choice.
