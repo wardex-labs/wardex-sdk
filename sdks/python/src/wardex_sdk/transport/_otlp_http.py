@@ -6,9 +6,10 @@ Network errors are fail-silent (an observability SDK must never crash the app) +
 
 One envelope may become SEVERAL POSTs. An OTLP request is accepted or rejected
 whole, so a batch over the receiver's body limit does not arrive short -- it
-does not arrive. The core measures each encoded, compressed body against
-`max_otlp_request_bytes` and hands back as many as it took; this module posts
-them in order.
+does not arrive. The core measures each request against `max_otlp_request_bytes`
+-- both as the compressed body and as what it decompresses to, since a receiver
+checks both -- and hands back as many bodies as it took; this module posts them
+in order, under ONE shared deadline.
 """
 
 from __future__ import annotations
@@ -198,6 +199,15 @@ class OtlpHttpTransport(Transport):
             if self._debug:
                 print("[wardex] OTLP export skipped (deadline exhausted)", file=sys.stderr)
             return UNDELIVERED
+        # The clock starts BEFORE the encode, not after it. `timeout` is a
+        # wall-clock bound on this whole call -- that is what `_client._drain`
+        # promises and what a SIGTERM handler's `flush(2.0)` relies on -- and
+        # the encode is not free: it serializes and compresses the batch, and a
+        # batch over the request cap is measured, split and measured again.
+        # Starting the clock after it would make the budget "the encode, PLUS
+        # the time you asked for".
+        started = time.monotonic()
+        deadline = started + effective
         bodies, dropped = native.codec.encode_otlp_requests(
             envelope,
             self._pii_mode,
@@ -205,16 +215,21 @@ class OtlpHttpTransport(Transport):
             self._limits,
             self._compress,
         )  # encode=fail-loud
-        if dropped and self._debug:
+        if dropped:
             # A span so large it would not fit a request even with its payload
-            # removed. Debug-gated because the marker mechanism cannot reach it
-            # -- the span is not on the wire to carry one -- and because the
-            # fix is a knob (`max_otlp_request_bytes`) rather than something
-            # wardex can do differently.
-            print(
-                f"[wardex] {dropped} span(s) exceeded max_otlp_request_bytes alone "
-                f"and were not exported",
-                file=sys.stderr,
+            # removed. `report_once` rather than a debug print, and for the
+            # reason the native-unavailable branch above gives: the marker
+            # mechanism cannot reach this loss -- the span is not on the wire to
+            # carry one -- so off-debug it would be byte-identical to those
+            # spans never having been captured. Bounded to one line per process,
+            # which is what makes it affordable on a per-call path, and keyed
+            # apart from the budget reports below so "one span is too big for
+            # your collector" stays separately actionable.
+            report_once(
+                f"[wardex] {dropped} span(s) exceeded max_otlp_request_bytes even with "
+                f"their payload removed and were not exported. Raise "
+                f"max_otlp_request_bytes if your collector accepts more.",
+                key="transport.otlp.span_over_request_cap",
             )
         if not bodies:
             # Every span in the batch was dropped by the guard above. Nothing to
@@ -222,32 +237,70 @@ class OtlpHttpTransport(Transport):
             # same nothing.
             return None
         headers = {"Content-Type": "application/x-protobuf"}
-        if self._compress:
-            headers["Content-Encoding"] = "gzip"
-        # Host headers last, as they always have been: a caller who sets one of
+        # Host headers next, as they always have been: a caller who sets one of
         # these means it.
         headers.update(self._headers)
+        # `Content-Encoding` is the exception, and it is not a routing header a
+        # host owns: it describes the BYTES in `data`, which only this transport
+        # knows how it produced. Letting a host header win here ships a gzip
+        # frame declared as something else -- a 400 from every conforming
+        # receiver, which no retry fixes, and the exact failure the `compress`
+        # switch exists to avoid. `compress=False` is how a caller turns gzip
+        # off; the header is not a second, contradictory way to do it.
+        #
+        # Matched case-insensitively because that is how the header is: urllib
+        # normalizes `content-encoding` and `Content-Encoding` onto one key, so
+        # a host spelling would silently win the merge above.
+        for name in [k for k in headers if k.lower() == "content-encoding"]:
+            if self._debug:
+                print(
+                    f"[wardex] ignoring host header {name}={headers[name]!r}: the OTLP "
+                    f"transport owns Content-Encoding (use compress=False to send "
+                    f"uncompressed)",
+                    file=sys.stderr,
+                )
+            del headers[name]
+        if self._compress:
+            headers["Content-Encoding"] = "gzip"
 
         from .._suppress import suppress_capture
 
-        started = time.monotonic()
-        deadline = started + effective
         for index, body in enumerate(bodies):
-            # The first request gets the budget whole -- deducting elapsed time
-            # from a budget nothing has spent yet is arithmetic for its own
-            # sake, and in the single-request case, which is nearly every case,
-            # it is the only budget there is. Later requests share what the
-            # earlier ones left, so an oversized batch cannot multiply the
-            # deadline the caller set by the number of chunks it happened to
-            # split into.
-            remaining = effective if index == 0 else deadline - time.monotonic()
+            # Every request reads the same deadline, including the first: what
+            # the caller bounded is the call, and by here the encode has already
+            # spent part of it. Later requests therefore share what the earlier
+            # ones left, so an oversized batch cannot multiply the deadline the
+            # caller set by the number of chunks it happened to split into.
+            remaining = deadline - time.monotonic()
             if remaining <= 0:
-                if self._debug:
-                    print(
-                        f"[wardex] OTLP export stopped after {index} of {len(bodies)} "
-                        f"requests (deadline exhausted)",
-                        file=sys.stderr,
-                    )
+                if index == 0:
+                    # Nothing went on the wire, so this is a decline rather than
+                    # a loss: `UNDELIVERED` lets a non-final drain keep the spans
+                    # for a drain with budget, and lets a final one account for
+                    # them instead of guessing. Same answer as the spent-budget
+                    # guard above, reached by the encode having eaten the budget
+                    # rather than the caller having arrived with none.
+                    if self._debug:
+                        print(
+                            "[wardex] OTLP export skipped (deadline spent encoding)",
+                            file=sys.stderr,
+                        )
+                    return UNDELIVERED
+                # Past the first request the spans are already half-delivered,
+                # so the rest cannot be handed back -- `UNDELIVERED` promises a
+                # retry could not duplicate anything, and here it would. What is
+                # left is to say so. Unconditional and bounded, like the reports
+                # around it: off-debug this was a trace arriving with holes in
+                # the middle and nothing on any channel about it.
+                report_once(
+                    f"[wardex] an OTLP export ran out of budget after {index} of "
+                    f"{len(bodies)} requests; the spans in the remaining request(s) were "
+                    f"not sent. This batch was split because it exceeded "
+                    f"max_otlp_request_bytes, and the split shares ONE export timeout. "
+                    f"Pass a larger flush()/close() timeout, or lower "
+                    f"max_buffer_spans so a batch is smaller.",
+                    key="transport.otlp.split_export_out_of_budget",
+                )
                 break
             req = urllib.request.Request(self._endpoint, data=body, headers=headers, method="POST")
             try:
@@ -277,6 +330,24 @@ class OtlpHttpTransport(Transport):
                         f"not resent, because the backend may hold them and a resend would "
                         f"duplicate them. Pass a larger timeout to confirm delivery.",
                         key="transport.otlp.caller_budget_cut_short",
+                    )
+                if index:
+                    # A PARTIAL export, which is new with splitting and is not
+                    # the same event as "the backend is down". Earlier requests
+                    # of this batch were accepted, so what the backend now holds
+                    # is a trace with a hole in the middle -- and a hole reads as
+                    # "this call never happened", which is a worse answer than a
+                    # missing trace. Reported off-debug, once per process,
+                    # because nothing else on any channel says it; a failure on
+                    # the FIRST request is left to the debug line above, since
+                    # that one is the ordinary "your backend refused us" with no
+                    # partial state to explain.
+                    report_once(
+                        f"[wardex] an OTLP export was abandoned after {index} of "
+                        f"{len(bodies)} requests failed to complete; the spans in the "
+                        f"remaining request(s) were not sent, so the trace(s) in this "
+                        f"batch may arrive incomplete.",
+                        key="transport.otlp.split_export_abandoned",
                     )
                 # Stop rather than work through the rest of the batch. A
                 # backend that refused one request refuses the next, and trying
