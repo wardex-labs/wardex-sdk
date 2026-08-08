@@ -136,6 +136,21 @@ one, which costs a docstring that over-explains; not a marker that reaches a
 span with nothing recording it, which is the failure this file exists for.
 """
 
+_META_VALUES: frozenset[str] = frozenset({"vocabulary_unmapped"})
+"""Values that live in the schema's `Limitation` enum but not in the vocabulary.
+
+Exactly one today, and it earns the exception rather than being tidied away: it
+is a statement ABOUT the vocabulary — "this marker was not one of the words" —
+so it is attached to spans like any other value and yet has no Python member to
+name, which is what would make every join in this file trip over it.
+
+Listed BY NAME rather than inferred from "no member has this value", because
+the two look the same and mean opposite things: a value with no member is
+either this deliberate case or a typo in one of the frozen tables above, and
+only the second one must fail loudly. `test_the_meta_values_have_no_member`
+keeps the list from quietly absorbing the first kind.
+"""
+
 _MEMBER_SITES: dict[str, frozenset[str]] = {
     # --- assembly/ itself ---
     # `_parentage.py` attaches these two from its `_MARKER` table, which fires
@@ -1456,16 +1471,23 @@ def _members_with_an_emitter() -> set[str]:
     free string to a member does not change the answer — which member has an
     emitter is invariant under a rewiring, and a bare count is not.
 
-    `_RUST_ENUM_EMITTERS` joins on VALUE like the string tables do, and is
-    filtered through `by_value` for the same reason `_CENSUS_RUST_ENUM` needs
-    filtering at all: the meta value `vocabulary_unmapped` is not vocabulary and
-    has no member to name.
+    `_RUST_ENUM_EMITTERS` joins on VALUE like the string tables do, and brings
+    one thing the string tables cannot: it is drawn from `_CENSUS_RUST_ENUM`,
+    which legitimately contains `vocabulary_unmapped` — a META value that IS
+    attached to spans (`bindings/python/src/codec.rs`) and has no member to
+    name, because it is a statement about the vocabulary rather than a word in
+    it. So the meta values are subtracted BY NAME.
+
+    By name, and not by "whatever `by_value` has no key for", which is the
+    difference between a filter and a hole: every other string here is a member
+    value by construction, so `by_value[s]` raising is the guard that catches a
+    typo recorded in one of the frozen tables. A blanket `if s in by_value`
+    would turn that raise into a silent skip and let the census sign off on
+    full provenance for a value no member has.
     """
     by_value = {m.value: m for m in Limitation}
-    strings = set(_CENSUS_PY) | set(_CENSUS_RUST) | set(_RUST_ENUM_EMITTERS)
-    return {
-        (_ALIASES.get(s) or by_value[s]).name for s in strings if s in by_value or s in _ALIASES
-    } | set(_MEMBER_SITES)
+    strings = (set(_CENSUS_PY) | set(_CENSUS_RUST) | set(_RUST_ENUM_EMITTERS)) - _META_VALUES
+    return {(_ALIASES.get(s) or by_value[s]).name for s in strings} | set(_MEMBER_SITES)
 
 
 def test_every_member_carries_its_own_provenance() -> None:
@@ -1596,6 +1618,25 @@ def test_rust_enum_reference_census_matches_source(rust_census: _RustCensus) -> 
         "attaches the marker to a span rather than asserting something about "
         "it, add the value to _RUST_ENUM_EMITTERS too."
     )
+
+
+def test_the_meta_values_have_no_member() -> None:
+    """`_META_VALUES` is subtracted from a join whose remaining elements are
+    then looked up with `by_value[s]`, so it is the one list here that can turn
+    a loud failure into a silent skip.
+
+    Two halves, and the second is the one that matters: a name in here that DOES
+    have a member would hide that member's emitter from the provenance test, and
+    a name Rust never mentions is a subtraction from a set it was never in.
+
+    Corroborated against the SCAN rather than against the schema, like
+    `test_every_rust_enum_emitter_is_seen_by_the_scanner` and for the same
+    reason this whole file reads source text: importing the extension to check
+    it would make a stale wheel able to answer.
+    """
+    values = {m.value for m in Limitation}
+    assert not (_META_VALUES & values), "a real member value is being filtered out as meta"
+    assert _META_VALUES <= set(_CENSUS_RUST_ENUM), "a name here is referenced from nowhere"
 
 
 def test_every_rust_enum_emitter_is_seen_by_the_scanner() -> None:
