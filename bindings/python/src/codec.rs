@@ -2,6 +2,13 @@
 //!
 //! Option 1 (Rust getattr traversal): walks the Python object directly to populate the proto struct.
 //! Lossless round-trip including the transport tree, capture_integrity, correlation, and state_snapshots.
+//!
+//! Marshaling is all this file does. What an exported span MEANS — its OTLP
+//! name, the `gen_ai.*`/`http.*`/`wardex.*` keys, the resource and scope around
+//! it — lives in `wardex_core::codec::otlp::map`, over the wire schema rather
+//! than over Python objects, because a Node or Java binding needs the same
+//! decisions and re-deriving them from prose is how two SDKs end up shaping the
+//! same trace two ways.
 
 // In the trampoline code generated when the pyo3 #[pyfunction] macro wraps a function
 // returning `PyResult<T>`, clippy mistakes the `?`'s `From<PyErr> for PyErr` (identity)
@@ -9,8 +16,6 @@
 // (a pre-existing pyo3 0.22 issue; a function-level #[allow] can't cover macro-generated sibling items).
 #![allow(clippy::useless_conversion)]
 
-use base64::engine::general_purpose::STANDARD as BASE64;
-use base64::Engine as _;
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyBytes, PyDict, PyList};
 
@@ -719,7 +724,13 @@ fn header_to_proto(h: &Bound<PyAny>) -> PyResult<pb::EnvelopeHeader> {
     })
 }
 
-fn envelope_to_proto(env: &Bound<PyAny>) -> PyResult<pb::Envelope> {
+/// `InternalEnvelope`(Python) → `pb::Envelope`.
+///
+/// `state_snapshots` is a parameter because the OTLP surface is traces-only:
+/// marshaling snapshots the mapping then drops would spend the walk on data
+/// that cannot reach that wire, and would let a malformed snapshot fail an
+/// export whose spans were fine.
+fn envelope_to_proto(env: &Bound<PyAny>, state_snapshots: bool) -> PyResult<pb::Envelope> {
     let mut items = Vec::new();
     for sp in env.getattr("spans")?.iter()? {
         items.push(pb::EnvelopeItem {
@@ -730,16 +741,18 @@ fn envelope_to_proto(env: &Bound<PyAny>) -> PyResult<pb::Envelope> {
             payload: Some(pb::envelope_item::Payload::Span(span_to_proto(&sp?)?)),
         });
     }
-    for s in env.getattr("state_snapshots")?.iter()? {
-        items.push(pb::EnvelopeItem {
-            header: Some(pb::EnvelopeItemHeader {
-                r#type: "state_snapshot".into(),
-                length: 0,
-            }),
-            payload: Some(pb::envelope_item::Payload::StateSnapshot(state_to_proto(
-                &s?,
-            )?)),
-        });
+    if state_snapshots {
+        for s in env.getattr("state_snapshots")?.iter()? {
+            items.push(pb::EnvelopeItem {
+                header: Some(pb::EnvelopeItemHeader {
+                    r#type: "state_snapshot".into(),
+                    length: 0,
+                }),
+                payload: Some(pb::envelope_item::Payload::StateSnapshot(state_to_proto(
+                    &s?,
+                )?)),
+            });
+        }
     }
     Ok(pb::Envelope {
         header: Some(header_to_proto(&env.getattr("header")?)?),
@@ -945,364 +958,6 @@ fn envelope_to_dict(py: Python<'_>, env: &pb::Envelope) -> PyResult<PyObject> {
     Ok(d.into_py(py))
 }
 
-// --- OTLP mapping (traces-only; ExportTraceServiceRequest) ---
-
-// OTLP enum values (different from wardex values): SpanKind CLIENT=3, StatusCode OK=1/ERROR=2.
-fn map_span_kind_otlp(s: &str) -> i32 {
-    use otlp_pb::trace::span::SpanKind;
-    (match s {
-        "internal" => SpanKind::Internal,
-        "client" => SpanKind::Client,
-        "server" => SpanKind::Server,
-        "producer" => SpanKind::Producer,
-        "consumer" => SpanKind::Consumer,
-        _ => SpanKind::Unspecified,
-    }) as i32
-}
-fn map_status_code_otlp(s: &str) -> i32 {
-    use otlp_pb::trace::status::StatusCode;
-    (match s {
-        "ok" => StatusCode::Ok,
-        "error" => StatusCode::Error,
-        _ => StatusCode::Unset,
-    }) as i32
-}
-
-/// wardex AnyValue → OTLP AnyValue (variant remapping; avoids large-scale logic duplication).
-fn wardex_any_to_otlp(v: &pb::AnyValue) -> otlp_pb::common::AnyValue {
-    use otlp_pb::common::any_value::Value as OV;
-    use pb::any_value::Value as WV;
-    let value = match &v.value {
-        Some(WV::StringValue(s)) => Some(OV::StringValue(s.clone())),
-        Some(WV::IntValue(i)) => Some(OV::IntValue(*i)),
-        Some(WV::DoubleValue(d)) => Some(OV::DoubleValue(*d)),
-        Some(WV::BoolValue(b)) => Some(OV::BoolValue(*b)),
-        // Bytes pass through here untouched: masking must still see the raw
-        // payload. `debyte_otlp` strips every bytes_value from the request
-        // after masking, right before serialization.
-        Some(WV::BytesValue(b)) => Some(OV::BytesValue(b.clone())),
-        _ => None,
-    };
-    otlp_pb::common::AnyValue { value }
-}
-/// wardex KeyValue → OTLP KeyValue.
-fn wardex_kv_to_otlp(kv: &pb::KeyValue) -> otlp_pb::common::KeyValue {
-    otlp_pb::common::KeyValue {
-        key: kv.key.clone(),
-        value: kv.value.as_ref().map(wardex_any_to_otlp),
-    }
-}
-
-// Small builders for native OTLP KeyValue.
-fn otlp_kv_str(key: &str, v: &str) -> otlp_pb::common::KeyValue {
-    otlp_pb::common::KeyValue {
-        key: key.into(),
-        value: Some(otlp_pb::common::AnyValue {
-            value: Some(otlp_pb::common::any_value::Value::StringValue(v.into())),
-        }),
-    }
-}
-fn otlp_kv_int(key: &str, v: i64) -> otlp_pb::common::KeyValue {
-    otlp_pb::common::KeyValue {
-        key: key.into(),
-        value: Some(otlp_pb::common::AnyValue {
-            value: Some(otlp_pb::common::any_value::Value::IntValue(v)),
-        }),
-    }
-}
-fn otlp_kv_bytes(key: &str, v: Vec<u8>) -> otlp_pb::common::KeyValue {
-    otlp_pb::common::KeyValue {
-        key: key.into(),
-        value: Some(otlp_pb::common::AnyValue {
-            value: Some(otlp_pb::common::any_value::Value::BytesValue(v)),
-        }),
-    }
-}
-fn otlp_kv_bool(key: &str, v: bool) -> otlp_pb::common::KeyValue {
-    otlp_pb::common::KeyValue {
-        key: key.into(),
-        value: Some(otlp_pb::common::AnyValue {
-            value: Some(otlp_pb::common::any_value::Value::BoolValue(v)),
-        }),
-    }
-}
-fn otlp_kv_f64(key: &str, v: f64) -> otlp_pb::common::KeyValue {
-    otlp_pb::common::KeyValue {
-        key: key.into(),
-        value: Some(otlp_pb::common::AnyValue {
-            value: Some(otlp_pb::common::any_value::Value::DoubleValue(v)),
-        }),
-    }
-}
-fn otlp_kv_strs(key: &str, vs: Vec<String>) -> otlp_pb::common::KeyValue {
-    otlp_pb::common::KeyValue {
-        key: key.into(),
-        value: Some(otlp_pb::common::AnyValue {
-            value: Some(otlp_pb::common::any_value::Value::ArrayValue(
-                otlp_pb::common::ArrayValue {
-                    values: vs
-                        .into_iter()
-                        .map(|v| otlp_pb::common::AnyValue {
-                            value: Some(otlp_pb::common::any_value::Value::StringValue(v)),
-                        })
-                        .collect(),
-                },
-            )),
-        }),
-    }
-}
-
-/// `CorrelationInfo` and `CaptureIntegrity` -> OTLP span attributes.
-///
-/// OTLP has no native home for either, so they travel under `wardex.*` the same
-/// way a link's `reason` does. Leaving them out is not a smaller version of the
-/// same export -- it is the one that cannot be audited. Every marker this SDK
-/// spends its design on says what it could NOT establish, and `OtlpHttpTransport`
-/// is the only transport exported from the package root: a user on the
-/// documented path was receiving spans stripped of every "this edge is a guess"
-/// and every "this body was truncated", with nothing to distinguish them from
-/// spans that had nothing to report. `events_to_otlp` names this exact failure
-/// for a different field one screen below.
-fn integrity_to_otlp(
-    sp: &Bound<PyAny>,
-    attrs: &mut Vec<otlp_pb::common::KeyValue>,
-) -> PyResult<()> {
-    if let Some(c) = opt(sp, "correlation")? {
-        if let Some(src) = opt(&c, "strategy")? {
-            attrs.push(otlp_kv_str("wardex.parent_source", &enum_str(&src)?));
-        }
-        attrs.push(otlp_kv_f64(
-            "wardex.parent_confidence",
-            c.getattr("confidence")?.extract()?,
-        ));
-        // The identifier that was CONSULTED to pick a parent. Present only when
-        // one was, so a non-null value is actionable rather than decorative.
-        for (field, key) in [
-            ("request_id", "wardex.correlation.request_id"),
-            ("operation_id", "wardex.correlation.operation_id"),
-            ("attempt_id", "wardex.correlation.attempt_id"),
-        ] {
-            if let Some(v) = opt(&c, field)? {
-                attrs.push(otlp_kv_str(key, &v.extract::<String>()?));
-            }
-        }
-    }
-    if let Some(i) = opt(sp, "capture_integrity")? {
-        let mut markers: Vec<String> = Vec::new();
-        for m in i.getattr("limitations")?.iter()? {
-            markers.push(enum_str(&m?)?);
-        }
-        if !markers.is_empty() {
-            attrs.push(otlp_kv_strs("wardex.limitations", markers));
-        }
-        for (field, key) in [
-            ("request_headers_captured", "wardex.capture.request_headers"),
-            ("request_body_captured", "wardex.capture.request_body"),
-            (
-                "response_headers_captured",
-                "wardex.capture.response_headers",
-            ),
-            ("response_body_captured", "wardex.capture.response_body"),
-        ] {
-            attrs.push(otlp_kv_bool(key, i.getattr(field)?.extract()?));
-        }
-        // Emitted only when true / non-zero: unlike the four above, whose FALSE
-        // is the informative reading, these describe an event that either
-        // happened or did not.
-        if i.getattr("truncated")?.extract()? {
-            attrs.push(otlp_kv_bool("wardex.capture.truncated", true));
-        }
-        if i.getattr("redacted")?.extract()? {
-            attrs.push(otlp_kv_bool("wardex.capture.redacted", true));
-        }
-        let dropped: i64 = i.getattr("dropped_chunk_count")?.extract()?;
-        if dropped > 0 {
-            attrs.push(otlp_kv_int("wardex.capture.dropped_chunks", dropped));
-        }
-    }
-    Ok(())
-}
-
-/// InternalSpan(Python) → OTLP Span. Mirrors `span_to_proto` + OTLP enum/types.
-fn span_to_otlp(sp: &Bound<PyAny>) -> PyResult<otlp_pb::trace::Span> {
-    let ctx = sp.getattr("context")?;
-    let mut span = otlp_pb::trace::Span {
-        trace_id: id_bytes(&ctx.getattr("trace_id")?)?,
-        span_id: id_bytes(&ctx.getattr("span_id")?)?,
-        name: sp.getattr("name")?.extract()?,
-        kind: map_span_kind_otlp(&enum_str(&sp.getattr("kind")?)?),
-        start_time_unix_nano: sp.getattr("start_time_ns")?.extract()?,
-        end_time_unix_nano: sp.getattr("end_time_ns")?.extract()?,
-        ..Default::default()
-    };
-    if let Some(pid) = opt(sp, "parent_span_id")? {
-        span.parent_span_id = id_bytes(&pid)?;
-    }
-    // status: code + message (error_type takes priority, falls back to status_message)
-    let code = map_status_code_otlp(&enum_str(&sp.getattr("status")?)?);
-    let message: String = match opt(sp, "error_type")? {
-        Some(v) => v.extract()?,
-        None => sp.getattr("status_message")?.extract()?,
-    };
-    span.status = Some(otlp_pb::trace::Status { code, message });
-
-    // attributes: extra passthrough + gen_ai flattening (reuses wardex KV) → OTLP conversion
-    let mut wkv: Vec<pb::KeyValue> = Vec::new();
-    kv_list(&sp.getattr("extra")?, &mut wkv)?;
-    if let Some(g) = opt(sp, "gen_ai")? {
-        flatten_gen_ai(&g, &mut wkv)?;
-    }
-    if let Some(a) = opt(sp, "agent")? {
-        flatten_agent(&a, &mut wkv)?;
-    }
-    if let Some(t) = opt(sp, "tool")? {
-        flatten_tool(&t, &mut wkv)?;
-    }
-    let mut attrs: Vec<otlp_pb::common::KeyValue> = wkv.iter().map(wardex_kv_to_otlp).collect();
-
-    // server.* (span-level)
-    if let Some(v) = opt(sp, "server_address")? {
-        attrs.push(otlp_kv_str("server.address", &v.extract::<String>()?));
-    }
-    if let Some(v) = opt(sp, "server_port")? {
-        attrs.push(otlp_kv_int("server.port", v.extract()?));
-    }
-    // transport-derived: network.protocol.name + http.request.method/http.response.status_code
-    if let Some(t) = opt(sp, "transport")? {
-        let proto = enum_str(&t.getattr("protocol")?)?;
-        attrs.push(otlp_kv_str("network.protocol.name", &proto));
-        if let Some(h) = opt(&t, "http")? {
-            attrs.push(otlp_kv_str(
-                "http.request.method",
-                &h.getattr("method")?.extract::<String>()?,
-            ));
-            attrs.push(otlp_kv_int(
-                "http.response.status_code",
-                h.getattr("status_code")?.extract()?,
-            ));
-        }
-    }
-    // raw I/O → wardex.input_data / wardex.output_data (omitted if empty).
-    // Built as bytes so PII masking sees the raw payload; `debyte_otlp`
-    // converts to strings after masking, before serialization.
-    let input: Vec<u8> = sp.getattr("input_data")?.extract()?;
-    if !input.is_empty() {
-        attrs.push(otlp_kv_bytes("wardex.input_data", input));
-    }
-    let output: Vec<u8> = sp.getattr("output_data")?.extract()?;
-    if !output.is_empty() {
-        attrs.push(otlp_kv_bytes("wardex.output_data", output));
-    }
-    integrity_to_otlp(sp, &mut attrs)?;
-    span.attributes = attrs;
-    events_to_otlp(sp, &mut span.events)?;
-    links_to_otlp(sp, &mut span.links)?;
-    Ok(span)
-}
-
-/// `InternalSpan.events` -> OTLP `Span.events` (tag 11).
-///
-/// The envelope encoder is not enough on its own. OTLP is the surface that
-/// actually leaves the process today (`transport/_otlp_http.py`), so filling
-/// `Span.events`/`Span.links` on the wardex envelope and not here would leave
-/// the two encoders disagreeing about the same span — and a user configured for
-/// the OTLP exporter would lose §6.3's whole graph model with no counter, no
-/// `Limitation` marker and no failing test, indistinguishable from "this agent
-/// has no graph edges". That is the silent-loss shape I4 forbids.
-fn events_to_otlp(sp: &Bound<PyAny>, out: &mut Vec<otlp_pb::trace::span::Event>) -> PyResult<()> {
-    for ev in sp.getattr("events")?.iter()? {
-        let ev = ev?;
-        let mut wkv: Vec<pb::KeyValue> = Vec::new();
-        kv_list(&ev.getattr("attributes")?, &mut wkv)?;
-        out.push(otlp_pb::trace::span::Event {
-            time_unix_nano: ev.getattr("timestamp_ns")?.extract()?,
-            name: ev.getattr("name")?.extract()?,
-            attributes: wkv.iter().map(wardex_kv_to_otlp).collect(),
-            ..Default::default()
-        });
-    }
-    Ok(())
-}
-
-/// `InternalSpan.links` -> OTLP `Span.links` (tag 13).
-///
-/// `reason` has no OTLP-native home — `Link` carries `trace_state` and
-/// attributes and nothing else — so it travels as the `wardex.link.reason`
-/// attribute rather than being dropped. Emitting the wardex value string keeps
-/// it readable without a copy of the enum, which is the same argument §6.6
-/// makes for not shipping raw `i32`s.
-///
-/// `InternalSpanLink` carries no attributes of its own (`_types.py:235`), so
-/// `reason` is the only one there is to carry.
-fn links_to_otlp(sp: &Bound<PyAny>, out: &mut Vec<otlp_pb::trace::span::Link>) -> PyResult<()> {
-    for ln in sp.getattr("links")?.iter()? {
-        let ln = ln?;
-        let mut attributes: Vec<otlp_pb::common::KeyValue> = Vec::new();
-        if let Some(r) = opt(&ln, "reason")? {
-            let reason: String = if r.hasattr("value")? {
-                enum_str(&r)?
-            } else {
-                r.extract()?
-            };
-            if !reason.is_empty() {
-                attributes.push(otlp_kv_str("wardex.link.reason", &reason));
-            }
-        }
-        out.push(otlp_pb::trace::span::Link {
-            trace_id: id_bytes(&ln.getattr("trace_id")?)?,
-            span_id: id_bytes(&ln.getattr("span_id")?)?,
-            attributes,
-            ..Default::default()
-        });
-    }
-    Ok(())
-}
-
-/// InternalEnvelope → ExportTraceServiceRequest. state_snapshots are skipped (traces-only).
-/// If spans is empty, resource_spans is an empty vector.
-fn envelope_to_otlp(
-    env: &Bound<PyAny>,
-) -> PyResult<otlp_pb::trace_service::ExportTraceServiceRequest> {
-    let mut spans = Vec::new();
-    for sp in env.getattr("spans")?.iter()? {
-        spans.push(span_to_otlp(&sp?)?);
-    }
-    if spans.is_empty() {
-        return Ok(otlp_pb::trace_service::ExportTraceServiceRequest {
-            resource_spans: vec![],
-        });
-    }
-    let sdk = env.getattr("header")?.getattr("sdk")?;
-    let name: String = sdk.getattr("name")?.extract()?;
-    let version: String = sdk.getattr("version")?.extract()?;
-    let resource = otlp_pb::resource::Resource {
-        attributes: vec![
-            otlp_kv_str("service.name", &name),
-            otlp_kv_str("service.version", &version),
-            otlp_kv_str("telemetry.sdk.name", &name),
-            otlp_kv_str("telemetry.sdk.version", &version),
-            otlp_kv_str("telemetry.sdk.language", "python"),
-        ],
-        ..Default::default()
-    };
-    let scope = otlp_pb::common::InstrumentationScope {
-        name: "wardex.python".into(),
-        version,
-        ..Default::default()
-    };
-    Ok(otlp_pb::trace_service::ExportTraceServiceRequest {
-        resource_spans: vec![otlp_pb::trace::ResourceSpans {
-            resource: Some(resource),
-            scope_spans: vec![otlp_pb::trace::ScopeSpans {
-                scope: Some(scope),
-                spans,
-                ..Default::default()
-            }],
-            ..Default::default()
-        }],
-    })
-}
-
 // --- OTLP decode → dict (for tests/debugging) ---
 
 fn to_hex(bytes: &[u8]) -> String {
@@ -1481,7 +1136,7 @@ fn encode_envelope_py(
     // configured level be validated and then silently discarded.
     let limits = limits.map(|p| p.inner).unwrap_or_default();
     // Marshalling walks Python objects — the only part that needs the GIL.
-    let mut proto = envelope_to_proto(envelope)?;
+    let mut proto = envelope_to_proto(envelope, true)?;
     // Masking + protobuf + zstd are pure Rust: release the GIL so app threads
     // keep running while the batch worker encodes (design §9).
     let bytes = py.allow_threads(|| -> PyResult<Vec<u8>> {
@@ -1499,6 +1154,17 @@ fn decode_envelope_py(py: Python<'_>, data: &[u8]) -> PyResult<PyObject> {
     envelope_to_dict(py, &env)
 }
 
+/// Who the OTLP mapping should say produced the export.
+///
+/// The two strings the mapping cannot derive from an envelope, and the only
+/// Python-specific facts left on this surface — which is why they live in the
+/// Python binding rather than in the core. `scope_name` names the
+/// instrumentation library and stays put when a host renames its service.
+const PRODUCER: otlp::map::Producer<'static> = otlp::map::Producer {
+    language: "python",
+    scope_name: "wardex.python",
+};
+
 #[pyfunction]
 #[pyo3(signature = (envelope, pii_mode = "off", pii_disabled = Vec::new()))]
 fn encode_otlp_traces(
@@ -1508,126 +1174,22 @@ fn encode_otlp_traces(
     pii_disabled: Vec<String>,
 ) -> PyResult<Py<PyBytes>> {
     // Marshalling walks Python objects — the only part that needs the GIL.
-    let mut req = envelope_to_otlp(envelope)?;
-    // Masking + protobuf + zstd are pure Rust: release the GIL so app threads
-    // keep running while the batch worker encodes (design §9).
-    let bytes = py.allow_threads(|| -> PyResult<Vec<u8>> {
+    // Traces only: state snapshots have no OTLP trace form, so walking them
+    // here would spend the GIL on records the mapping drops.
+    let proto = envelope_to_proto(envelope, false)?;
+    // Mapping + masking + protobuf are pure Rust: release the GIL so app
+    // threads keep running while the batch worker encodes (design §9).
+    let bytes = py.allow_threads(move || -> PyResult<Vec<u8>> {
+        let mut req = otlp::map::envelope_to_traces(&proto, PRODUCER);
         pii_apply_otlp(&mut req, pii_mode, &pii_disabled)?;
         // After masking, never before: the PII engine's byte-level patterns
         // match inside raw payloads, and a payload already rewritten to
         // base64 would hide them.
-        debyte_otlp(&mut req);
+        otlp::map::strip_bytes_values(&mut req);
         otlp::encode_traces(&req)
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
     })?;
     Ok(PyBytes::new_bound(py, &bytes).unbind())
-}
-
-// --- No bytes_value ever leaves on the OTLP surface ---
-//
-// OTLP `bytes_value` is legal per spec, but backends that re-serialize
-// attributes to JSON can't represent it: Arize Phoenix (2026-08) drops the
-// entire span at ingest — HTTP 200, no error — and the spans lost are exactly
-// the LLM/tool ones that carry payloads. The wardex envelope keeps raw bytes;
-// this surface degrades to strings: valid UTF-8 verbatim, anything else base64
-// plus a `<key>.encoding = "base64"` companion so a consumer can tell encoded
-// binary from text that merely looks like base64.
-
-/// Strip every `bytes_value` from an OTLP export request, in place.
-fn debyte_otlp(req: &mut otlp_pb::trace_service::ExportTraceServiceRequest) {
-    for rs in &mut req.resource_spans {
-        if let Some(r) = rs.resource.as_mut() {
-            debyte_otlp_kvs(&mut r.attributes);
-        }
-        for ss in &mut rs.scope_spans {
-            if let Some(sc) = ss.scope.as_mut() {
-                debyte_otlp_kvs(&mut sc.attributes);
-            }
-            for sp in &mut ss.spans {
-                debyte_otlp_kvs(&mut sp.attributes);
-                for ev in &mut sp.events {
-                    debyte_otlp_kvs(&mut ev.attributes);
-                }
-                for link in &mut sp.links {
-                    debyte_otlp_kvs(&mut link.attributes);
-                }
-            }
-        }
-    }
-}
-
-fn debyte_otlp_kvs(kvs: &mut Vec<otlp_pb::common::KeyValue>) {
-    // (companion key, went_base64) for every attribute whose value WAS bytes.
-    let mut rewritten: Vec<(String, bool)> = Vec::new();
-    for kv in kvs.iter_mut() {
-        if let Some(v) = kv.value.as_mut() {
-            if let Some(went_base64) = debyte_otlp_any(v) {
-                rewritten.push((format!("{}.encoding", kv.key), went_base64));
-            }
-        }
-    }
-    if rewritten.is_empty() {
-        return;
-    }
-    // For a key this pass rewrote, `<key>.encoding` is this pass's namespace.
-    // A pre-existing attribute there (a user extra — kv_list passes any key
-    // through) would either duplicate the companion (duplicate keys are
-    // undefined in OTLP, backend dedup order decides which wins) or spoof an
-    // encoding the verbatim branch never applied, making consumers
-    // base64-decode text that shipped as-is. Drop it either way; user
-    // `.encoding` suffixes on keys that never carried bytes are untouched.
-    kvs.retain(|kv| !rewritten.iter().any(|(companion, _)| kv.key == *companion));
-    for (companion, went_base64) in rewritten {
-        if went_base64 {
-            kvs.push(otlp_kv_str(&companion, "base64"));
-        }
-    }
-}
-
-/// Text safe for every real backend, or None → base64. Strict UTF-8 alone is
-/// not enough: U+0000 is valid UTF-8, and Postgres-backed ingests reject any
-/// string containing NUL — the same silent span loss this pass exists to
-/// prevent, reintroduced for the NUL subset. Binary protobuf/gRPC payloads
-/// are full of NULs and are exactly what must route to base64, so any C0
-/// control byte other than \t \n \r means "not text".
-fn otlp_text(b: &[u8]) -> Option<&str> {
-    let s = std::str::from_utf8(b).ok()?;
-    if b.iter()
-        .any(|&c| c < 0x20 && c != b'\t' && c != b'\n' && c != b'\r')
-    {
-        return None;
-    }
-    Some(s)
-}
-
-/// `Some(went_base64)` when the value itself was a bytes_value — the caller
-/// owns the attribute list and manages the `<key>.encoding` companion; a
-/// bytes value nested in an ArrayValue has no key of its own, so there the
-/// result has no receiver and non-text elements go base64 unmarked.
-fn debyte_otlp_any(v: &mut otlp_pb::common::AnyValue) -> Option<bool> {
-    use otlp_pb::common::any_value::Value;
-    match v.value.as_mut() {
-        Some(Value::BytesValue(b)) => {
-            let raw = std::mem::take(b);
-            let (s, went_base64) = match otlp_text(&raw) {
-                Some(s) => (s.to_owned(), false),
-                None => (BASE64.encode(&raw), true),
-            };
-            v.value = Some(Value::StringValue(s));
-            Some(went_base64)
-        }
-        Some(Value::ArrayValue(arr)) => {
-            for item in &mut arr.values {
-                debyte_otlp_any(item);
-            }
-            None
-        }
-        Some(Value::KvlistValue(kvl)) => {
-            debyte_otlp_kvs(&mut kvl.values);
-            None
-        }
-        _ => None,
-    }
 }
 
 #[pyfunction]
