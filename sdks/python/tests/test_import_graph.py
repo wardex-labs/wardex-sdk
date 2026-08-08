@@ -556,6 +556,19 @@ def test_adapters_and_interceptors_do_not_import_each_other():
 
 _BELOW_THE_OBSERVERS = ("transport/", "context/")
 
+# Its own reason, not assembly's: _LAYERING_WHY argues from assembly/ being the
+# layer everything depends ON, and a transport/ violation printing that would
+# name a package the violation has nothing to do with.
+_BELOW_THE_OBSERVERS_WHY = (
+    "transport/ and context/ sit BELOW the observers. A span reaches the\n"
+    "transport after interceptors/ and adapters/ are done with it, and the\n"
+    "context layer cross-cuts them rather than depending on either, so an edge\n"
+    "upward turns the one-way arrow in design §3.1 into a cycle. It also files\n"
+    "the shared thing under the package whose behaviour it changes, which is\n"
+    "how the exporter's own self-exclusion guard — read by transport/ on every\n"
+    "outbound batch — ended up living inside interceptors/."
+)
+
 
 def test_the_layers_below_the_observers_do_not_import_one():
     """design §3.1's arrow, in the two places it used to point backwards.
@@ -586,7 +599,7 @@ def test_the_layers_below_the_observers_do_not_import_one():
         "a layer below the observers reached up into one:\n"
         + "\n".join(sorted(violations))
         + "\n\nWHY: "
-        + _LAYERING_WHY
+        + _BELOW_THE_OBSERVERS_WHY
         + "\n"
         "Anything transport/ or context/ genuinely shares with an observer is\n"
         "not an observer concern — put it at the package root, where both ends\n"
