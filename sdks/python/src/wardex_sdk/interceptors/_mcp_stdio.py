@@ -122,6 +122,9 @@ class _ProcState:
         self._resp = JsonRpcParser(limits)
         self._latch: dict[str, _Pending] = {}
         self._req_bytes = 0
+        # Counted for the same reason `_req_bytes` is, and its absence is the
+        # whole of the asymmetry `should_detach` describes.
+        self._resp_bytes = 0
         self._msgs = 0
         # Guards the once-per-stream debug log in McpStdioInterceptor — mirrors
         # the seam's st.gate-adjacent dedupe for the HTTP/1 path, but on a
@@ -153,6 +156,7 @@ class _ProcState:
 
     def feed_response(self, data: bytes) -> list[InternalSpan]:
         out: list[InternalSpan] = []
+        self._resp_bytes += len(data)
         for m in self._resp.feed(data):
             if m.kind != "response" or m.id is None:
                 continue
@@ -185,7 +189,46 @@ class _ProcState:
         return out
 
     def should_detach(self) -> bool:
-        return self._msgs == 0 and self._req_bytes > self._sniff_limit
+        """Is this subprocess not an MCP server after all?
+
+        SYMMETRIC in the two directions, and it was not. The trigger counted
+        stdin bytes only and was consulted only from the send wrapper, so a
+        subprocess that writes little and STREAMS a lot — a compiler, a log
+        follower, a media encoder, anything a host runs beside its MCP servers
+        — never detached at all: it paid the tee, the copy and a JSON-RPC parse
+        attempt on every read for as long as it lived. The hard buffer cap kept
+        that bounded; it never made it free.
+
+        `_msgs == 0` is the claim being made, and it is a strong one: not one
+        JSON-RPC request, response or notification has been parsed in EITHER
+        direction. Past the sniff budget, that is a subprocess this seam has
+        nothing to say about, and the honest thing is to get out of its way.
+        """
+        return self._msgs == 0 and (self._req_bytes + self._resp_bytes) > self._sniff_limit
+
+    def on_stream_end(self) -> int:
+        """The subprocess's stdout is finished; nothing will answer what is pending.
+
+        A server that dies — a crash, a `kill`, an argument it did not like —
+        leaves every in-flight request latched with a response that is never
+        coming. Each entry holds an `Ambient`, so this is a SpanContext per
+        stranded request kept alive by a correlation table nobody will read
+        again; the 4096-entry cap bounds that, it does not end it.
+
+        The stranded requests are dropped rather than shipped as error spans.
+        A span asserting "this tool call failed" is a claim about the CALL, and
+        what this seam observed is a pipe closing — it does not know whether the
+        server answered on a channel wardex does not read, whether the host
+        retried, or whether the request was even delivered. Counted, so the
+        event is not invisible.
+
+        Returns how many requests were stranded.
+        """
+        stranded = len(self._latch)
+        self._latch.clear()
+        if stranded:
+            counters.bump("interceptors.mcp_stdio.stranded_requests")
+        return stranded
 
 
 def _build_mcp_span(p: _Pending, resp: Any) -> InternalSpan:
@@ -296,6 +339,27 @@ def _json_rpc_error_type(error: bytes | None) -> str:
     if isinstance(code, int):
         return f"json_rpc_{code}"
     return "json_rpc_error"
+
+
+#: anyio's three ways of saying "there is nothing more on this stream".
+_STREAM_END = frozenset({"EndOfStream", "ClosedResourceError", "BrokenResourceError"})
+
+
+def _is_stream_end(exc: BaseException) -> bool:
+    """Does this exception mean the subprocess's stdout is finished?
+
+    Matched on the class NAME, not by importing `anyio.EndOfStream`. anyio is
+    optional here — the whole module is written so that a host without it keeps
+    the raw-asyncio seam — and an import at this depth would undo that for the
+    sake of an `isinstance`. The names are anyio's public exception surface, and
+    the failure mode of a wrong match is symmetric and small: an unrecognized
+    class leaves the latch to the existing 4096-entry cap, and a coincidental
+    one detaches a seam that had parsed nothing anyway.
+
+    A cancellation is not an end: `CancelledError` is a `BaseException`, so the
+    `except Exception` this serves never sees one.
+    """
+    return type(exc).__name__ in _STREAM_END
 
 
 def _maybe_log_disabled(client: Client | None, state: _ProcState, pid: int | None) -> None:
@@ -440,13 +504,17 @@ class McpStdioInterceptor(InterceptorInterface):
         _osend = stdin.send
         _orecv = stdout.receive
 
+        def detach() -> None:
+            """Both tees come off together — half a tee is a parser fed one side."""
+            stdin.send = _osend
+            stdout.receive = _orecv
+
         async def send(data: Any, *, _osend: Any = _osend, state: _ProcState = state) -> Any:
             try:
                 state.feed_request(bytes(data))
                 _maybe_log_disabled(client, state, pid)
                 if state.should_detach():
-                    stdin.send = _osend  # non-MCP subprocess -> remove the tee
-                    stdout.receive = _orecv
+                    detach()  # not an MCP server
             except Exception:  # noqa: BLE001 — fail-silent
                 pass
             return await _osend(data)
@@ -454,12 +522,32 @@ class McpStdioInterceptor(InterceptorInterface):
         async def receive(
             *args: Any, _orecv: Any = _orecv, state: _ProcState = state, **kwargs: Any
         ) -> Any:
-            data = await _orecv(*args, **kwargs)
+            try:
+                data = await _orecv(*args, **kwargs)
+            except Exception as exc:
+                # EOF is how a subprocess says it is gone, and on this seam it
+                # arrives as an exception rather than as a value. Nothing will
+                # answer what is still latched.
+                if _is_stream_end(exc):
+                    with guard("interceptors.mcp_stdio.stream_end", debug=self._debug):
+                        state.on_stream_end()
+                        detach()
+                raise
             try:
                 for span in state.feed_response(bytes(data)):
                     if client is not None:
                         client.capture_span(span)
                 _maybe_log_disabled(client, state, pid)
+                # Asked on THIS side too, which is the half that was missing: a
+                # subprocess that writes little to stdin and streams a lot back
+                # never reached the check in `send` at all.
+                if state.should_detach():
+                    detach()
+                elif not data:
+                    # A receive that returns empty rather than raising is the
+                    # other spelling of EOF, and some anyio backends use it.
+                    state.on_stream_end()
+                    detach()
             except Exception:  # noqa: BLE001 — fail-silent
                 pass
             return data
@@ -488,10 +576,16 @@ class McpStdioInterceptor(InterceptorInterface):
         _owrite = writer.write
         _oreadline = reader.readline
 
+        def detach() -> None:
+            writer.write = _owrite
+            reader.readline = _oreadline
+
         def write(data: Any, *, _owrite: Any = _owrite, state: _ProcState = state) -> Any:
             try:
                 state.feed_request(bytes(data))
                 _maybe_log_disabled(client, state, pid)
+                if state.should_detach():
+                    detach()
             except Exception:  # noqa: BLE001 — fail-silent
                 pass
             return _owrite(data)
@@ -503,6 +597,13 @@ class McpStdioInterceptor(InterceptorInterface):
                     if client is not None:
                         client.capture_span(span)
                 _maybe_log_disabled(client, state, pid)
+                if not data:
+                    # `readline` reports EOF by returning b"" — this seam's
+                    # spelling of "the server is gone".
+                    state.on_stream_end()
+                    detach()
+                elif state.should_detach():
+                    detach()
             except Exception:  # noqa: BLE001 — fail-silent
                 pass
             return data
