@@ -16,7 +16,12 @@ cd "$ROOT"
 # The 3.10 interpreter gets its own environment. Syncing 3.10 into `.venv`
 # would swap the development interpreter out from under the next `uv run`,
 # and the next `uv sync` would swap it back — a check nobody runs twice.
-export UV_PROJECT_ENVIRONMENT="${UV_PROJECT_ENVIRONMENT:-.venv-py310}"
+#
+# Assigned, not defaulted: `UV_PROJECT_ENVIRONMENT` is a general uv knob that
+# people export from a shell profile or direnv, so honouring an inherited value
+# would aim this sync at whatever venv they named — the one outcome the
+# paragraph above says cannot happen.
+export UV_PROJECT_ENVIRONMENT=.venv-py310
 
 # `--reinstall-package` rebuilds the native module from the current Rust
 # source; without it uv treats the installed wheel as current and the run

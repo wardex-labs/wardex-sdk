@@ -37,7 +37,11 @@ while the development venv is the newest interpreter, so a 3.11+-only API
 passes every local run and turns red only in CI's 3.10 job, after the push.
 The script builds its own `.venv-py310` from the `test` dependency group —
 which is where every dependency the suite imports is declared — and leaves
-`.venv` alone. Extra arguments go through to pytest.
+`.venv`'s interpreter and dependency set alone. The native module is the one
+thing the two share: both venvs install the package editable off
+`sdks/python/src`, so the rebuild the floor check forces lands on the same
+`_wardex_native.abi3.so` the dev venv imports (harmless while the extension is
+abi3, which is why the wheel is). Extra arguments go through to pytest.
 
 ## Lint & format
 
