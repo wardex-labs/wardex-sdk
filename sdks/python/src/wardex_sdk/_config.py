@@ -237,17 +237,16 @@ class WardexConfig:
         return object.__new__(cls)
 
     def __post_init__(self) -> None:
-        """Validate what no single group can see on its own.
+        """Validate the fields that belong to no group.
 
-        Each group validates its own fields where they are declared — that is
-        the point of having them — so what is left here is the cross-field
-        check, plus `interceptors`, which is refused HERE, where the mistake was
-        made, rather than skipped at install time.
-        `install_configured_interceptors` walks its own table and keeps what was
-        asked for, so a value it does not recognize — `interceptors=("ssl",)`,
-        the string, is the one a user actually writes — matches nothing and
-        installs nothing, in silence, which is indistinguishable from
-        `intercept=False`.
+        Each group validates its own where they are declared — that is half the
+        point of having them — so all that is left here is `interceptors`, and
+        it is refused HERE, where the mistake was made, rather than skipped at
+        install time. `install_configured_interceptors` walks its own table and
+        keeps what was asked for, so a value it does not recognize —
+        `interceptors=("ssl",)`, the string, is the one a user actually writes —
+        matches nothing and installs nothing, in silence, which is
+        indistinguishable from `intercept=False`.
         """
         if self.interceptors is not None:
             for name in self.interceptors:
