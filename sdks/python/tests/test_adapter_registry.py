@@ -2,9 +2,16 @@
 
 from unittest import mock
 
+import pytest
+
 from wardex_sdk._enums import AdapterName, AgentType, StatusCode
 from wardex_sdk._types import AgentAttributes
-from wardex_sdk.adapters import _DETECT_PACKAGES, install_configured_adapters
+from wardex_sdk.adapters import (
+    _ADAPTERS,
+    _DETECT_PACKAGES,
+    _make_adapter,
+    install_configured_adapters,
+)
 from wardex_sdk.adapters._base import AdapterInterface
 from wardex_sdk.adapters._context import Placement
 from wardex_sdk.adapters._registry import get_registry
@@ -37,6 +44,44 @@ class _BrokenInstallAdapter(AdapterInterface):
 
     def uninstall(self) -> None:
         pass
+
+
+# --- registration: one row, and it cannot be written half-way ---------------
+
+
+@pytest.mark.parametrize("name", list(_ADAPTERS), ids=lambda n: n.value)
+def test_every_registered_adapter_builds_and_names_itself_after_its_member(name):
+    """The single assertion that catches both halves of a split registration.
+
+    Parametrized over the TABLE rather than over named adapters: a row added
+    without a working `build` fails here on the day it lands, and a row deleted
+    takes its case with it. A test naming one adapter would have to be extended
+    by hand for the next one, which is the same maintenance-by-memory the table
+    replaced.
+    """
+    adapter = _make_adapter(name)
+
+    assert adapter is not None, "a registered row must build an adapter"
+    assert adapter.name() == name.value, (
+        "an adapter's own name is what the registry keys its install table on, "
+        "so a mismatch here means config-driven install and uninstall_all "
+        "disagree about which adapter is which"
+    )
+
+
+def test_detection_is_derived_from_the_registration_table():
+    """Not a second table. Asserted as a derivation, not as a literal mapping:
+    a literal here would drift from `_ADAPTERS` exactly as the two tables it
+    replaced drifted from each other."""
+    assert _DETECT_PACKAGES == {name: row.detect for name, row in _ADAPTERS.items()}
+
+
+def test_an_unregistered_member_is_answered_with_none_not_an_error():
+    """`AdapterName` names frameworks whose adapter does not exist yet, and
+    `install_configured_adapters` treats None as 'nothing to install'. A raise
+    here would turn `adapters=(AdapterName.LANGCHAIN,)` into a failed init()."""
+    assert AdapterName.LANGCHAIN not in _ADAPTERS
+    assert _make_adapter(AdapterName.LANGCHAIN) is None
 
 
 def test_registry_install_is_idempotent():

@@ -100,18 +100,21 @@ class FakeTransport(Transport):
         pass
 
 
-def test_install_uninstall_restores_surface():
+def test_installing_with_no_client_at_all_still_patches_and_unpatches():
+    """`install(None)` — the shape the registry uses for a client-less install.
+
+    Seam identity in both directions is a shared invariant and lives in
+    `test_agent_sdk_conformance.py`; what is asserted here is the ASSEMBLER's
+    own lifecycle, which is this adapter's alone. It is built by `install()`
+    and dropped by `uninstall()`, and every callback into the adapter gates on
+    it — so an assembler that outlived a teardown would let a read still in
+    flight open a fresh root in a table nothing will ever close again.
+    """
     adapter = AnthropicAgentSdkAdapter()
-    orig_query = claude_agent_sdk.query
-    orig_create_sdk_mcp_server = claude_agent_sdk.create_sdk_mcp_server
     assert adapter._assembler is None
     adapter.install(None)
-    assert claude_agent_sdk.query is not orig_query
-    assert claude_agent_sdk.create_sdk_mcp_server is not orig_create_sdk_mcp_server
     assert adapter._assembler is not None
     adapter.uninstall()
-    assert claude_agent_sdk.query is orig_query
-    assert claude_agent_sdk.create_sdk_mcp_server is orig_create_sdk_mcp_server
     assert adapter._assembler is None
 
 

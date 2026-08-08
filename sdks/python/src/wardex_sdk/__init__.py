@@ -173,26 +173,9 @@ def init(
 
     _lifecycle.install(client, config)
     _hub.set_client(client)
-    if config.intercept:
-        # No guard around these three calls, deliberately. `InterceptorRegistry.
-        # install` is total — it isolates the failure, rolls the half-install
-        # back and keeps going — so a second one here would catch nothing and
-        # would put the recovery in two places, which is how the two stop
-        # agreeing. What the registry cannot cover is the IMPORT above each
-        # call, so each interceptor module is responsible for staying importable
-        # without its optional third-party seam (see `_mcp_stdio` on anyio).
-        from .interceptors._registry import get_registry
-        from .interceptors._ssl import SSLInterceptor
+    from .interceptors import install_configured_interceptors
 
-        get_registry().install(SSLInterceptor(), client)
-
-        from .interceptors._mcp_stdio import McpStdioInterceptor
-
-        get_registry().install(McpStdioInterceptor(), client)
-
-        from .interceptors._socket import RawSocketInterceptor
-
-        get_registry().install(RawSocketInterceptor(list(config.intercept_hosts or ())), client)
+    install_configured_interceptors(client, config)
 
     from .adapters import install_configured_adapters
 

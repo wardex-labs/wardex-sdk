@@ -47,7 +47,32 @@ class WardexConfig:
     limits: CaptureLimits = field(default_factory=CaptureLimits)
 
     adapters: tuple[AdapterName, ...] | None = None
+
     interceptors: tuple[InterceptorName, ...] | None = None
+    """Which byte seams `intercept=True` installs. `None` means all of them.
+
+    `intercept` is the SWITCH and this is the refinement: with `intercept=False`
+    a selection installs nothing and says so under `debug`, because a refinement
+    of a switch that is off is not an error but silence about it is how a user
+    concludes it was honoured. `()` is a choice — install none — and `None` is
+    the absence of one; they may not collapse into each other, the same
+    distinction `adapters` already draws.
+
+    ORDER IS NOT A CALLER'S TO SET. `interceptors._INTERCEPTORS` is walked and
+    filtered by this tuple rather than the other way round, so a reordered
+    selection installs in the same order as an unordered one: SSL patches
+    `ssl.SSLSocket` and the raw socket seam patches `socket.socket` underneath
+    it, which is a fact about the stack rather than a preference.
+
+    EVERY MEMBER OF `InterceptorName` IS INSTALLABLE, which is why nothing here
+    can be selected and quietly do nothing. `GRPC`, `WEBSOCKET` and `SSE` were
+    members until selection went live and named no unit at all — they are
+    protocols the byte seams parse, and `Protocol` is their home — so they were
+    removed rather than left to be rejected: a name that cannot be spelled needs
+    no validation. What IS rejected, in `__post_init__`, is a value that is not
+    a member: `interceptors=("ssl",)` is the mistake a user actually makes, and
+    matched against nothing it would install nothing in silence.
+    """
 
     debug: bool = False
     before_send: BeforeSendCallback | None = None
@@ -91,6 +116,18 @@ class WardexConfig:
                 if not isinstance(pattern, str) or not pattern:
                     raise ValueError(
                         f"propagate_targets entries must be non-empty glob strings, got {pattern!r}"
+                    )
+        if self.interceptors is not None:
+            # Refused HERE, where the mistake was made, rather than skipped at
+            # install time. `install_configured_interceptors` walks its own
+            # table and keeps what was asked for, so a value it does not
+            # recognize — `interceptors=("ssl",)`, the string, is the one a user
+            # actually writes — matches nothing and installs nothing, in
+            # silence, which is indistinguishable from `intercept=False`.
+            for name in self.interceptors:
+                if not isinstance(name, InterceptorName):
+                    raise ValueError(
+                        f"interceptors entries must be InterceptorName members, got {name!r}"
                     )
 
     @property

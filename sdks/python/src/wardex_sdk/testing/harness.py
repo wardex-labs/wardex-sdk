@@ -1,0 +1,335 @@
+"""What a conformance run needs before it can assert anything.
+
+Three things live here and nothing else: the client double every adapter test
+already writes by hand, the install path a conformance run must use, and the
+READING of a shipped span. The assertions are next door in `conformance.py`,
+and the split is the same one the two adapter suites arrived at independently —
+the harness is the expensive part and every file needs it, while the claims are
+what a reader comes for.
+
+**Spans are read through `Node`, never asserted on directly.** A `Node` is one
+shipped span reduced to what a causal claim is made of: its name, its own id,
+its parent's id, its trace, and the provenance of the edge. That reduction is
+not tidying — it is what makes `collapse()` possible, and `collapse()` is what
+lets the suite prove, for every adapter wired into it, that its own tree check
+would catch a total collapse. A check nobody has watched fail is not a check.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
+from dataclasses import dataclass
+from typing import Any
+
+from .. import _hub
+from ..adapters._base import AdapterInterface
+from ..adapters._context import AdapterContext
+from ..adapters._registry import AdapterRegistry
+from ..assembly import Limitation, counters
+from ..assembly._diag import reset_reports_for_test
+from ..assembly._units import _ambient_unit
+
+
+class RecordingClient:
+    """A client double that keeps every span the registry emits.
+
+    `close()` exists because the hub's own teardown closes whatever client it
+    finds, and a subject is free to put this one there — a `wardex.span()`
+    opened inside a tool handler has to reach the same sink as the adapter.
+    """
+
+    config = None
+
+    def __init__(self) -> None:
+        self.spans: list[Any] = []
+
+    def capture_span(self, span: Any) -> None:
+        self.spans.append(span)
+
+    def close(self) -> None:
+        return None
+
+
+@dataclass
+class Live:
+    """An adapter, the context it was given, and the client it emits into.
+
+    `ctx` is the registry's own context object rather than anything read off
+    the adapter: an out-of-tree adapter is under no obligation to store one,
+    and a harness that reached for `adapter._ctx` would work for the two
+    adapters in this repository and for no others.
+
+    A `Live` with `ctx=None` and `registry=None` is the BARE shape — an adapter
+    that was never installed. A subject's workload is handed one of those to
+    prove the zero point, so every workload has to tolerate it by opening no
+    wardex spans of its own when `ctx` is None.
+    """
+
+    adapter: AdapterInterface
+    ctx: AdapterContext | None
+    client: RecordingClient
+    registry: AdapterRegistry | None
+
+    @property
+    def spans(self) -> list[Any]:
+        return self.client.spans
+
+    def teardown(self) -> None:
+        """Uninstall through the registry. Idempotent: the table is drained."""
+        if self.registry is not None:
+            self.registry.uninstall_all()
+
+
+@contextmanager
+def clean_state() -> Iterator[None]:
+    """Four process-global things, reset around the block.
+
+    All four decide what a later assertion sees, and every one of them has
+    burned an adapter suite already. The hub holds a scope a neighbouring test
+    left behind; `_ambient_unit` holds the fork of a run whose generator was
+    abandoned and never finalized; `counters` is cumulative; and `report_once`
+    remembers, so the ORDER tests run in decides whether a stderr assertion
+    sees its line.
+
+    Nesting is harmless — every reset is idempotent and the ambient token is
+    per-call — so `installed()` may own one and a caller may own another
+    around it.
+    """
+    _hub.reset_for_test()
+    token = _ambient_unit.set(None)
+    counters.reset()
+    reset_reports_for_test()
+    try:
+        yield
+    finally:
+        _ambient_unit.reset(token)
+        _hub.reset_for_test()
+        counters.reset()
+        reset_reports_for_test()
+
+
+@contextmanager
+def installed(
+    factory: Callable[[], AdapterInterface],
+    *,
+    client: RecordingClient | None = None,
+) -> Iterator[Live]:
+    """Install one adapter through the REAL `AdapterRegistry`.
+
+    Never by hand, and the reason is not tidiness: the registry builds the
+    context BEFORE it calls `install()`, and it is the registry that binds the
+    `CONTROL_FLOW` reader. An adapter handed a context somebody else built
+    passes control-flow assertions under a wiring that is dead in production.
+
+    A private registry per run, not `get_registry()`: the process-global one is
+    shared with whatever else the test session installed, and `sole_live` and
+    `close_all` answer questions about ONE table.
+    """
+    with clean_state():
+        registry = AdapterRegistry()
+        adapter = factory()
+        recording = client if client is not None else RecordingClient()
+        registry.install(adapter, recording)
+        live = Live(
+            adapter=adapter,
+            ctx=registry._contexts.get(adapter.name()),
+            client=recording,
+            registry=registry,
+        )
+        try:
+            yield live
+        finally:
+            live.teardown()
+
+
+def bare(subject_factory: Callable[[], AdapterInterface], client: RecordingClient) -> Live:
+    """An adapter that was never installed, pointed at an existing client.
+
+    The client is passed in rather than made here, and that is the whole value
+    of the shape: a freshly built `RecordingClient` is empty whatever the
+    adapter does, so an emptiness assertion on one reads as if it measured
+    something and cannot fail. Reusing the client that has already been PROVEN
+    to receive spans is what makes its later silence mean anything.
+    """
+    return Live(adapter=subject_factory(), ctx=None, client=client, registry=None)
+
+
+# -- reading the wire -------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Node:
+    """One shipped span, reduced to what a causal claim is made of.
+
+    `parent_id` holds the span's `parent_span_id` and is deliberately not
+    spelled that way: C-S3 forbids a `parent_span_id=` keyword outside
+    `assembly/`, because an edge written anywhere else is an edge nobody
+    resolved. Nothing here can BUILD a span — that is the whole reason the rule
+    can stay hard rather than acquiring an exception for a reader.
+    """
+
+    name: str
+    span_id: Any
+    parent_id: Any
+    trace_id: Any
+    strategy: Any
+    confidence: float | None
+    limitations: tuple[Limitation, ...]
+
+
+def read(spans: Sequence[Any]) -> tuple[Node, ...]:
+    """Every shipped span as a `Node`.
+
+    `capture_integrity` is None on a span with nothing to report, which is the
+    shape a healthy run mostly has, so it is normalized to `()` here and the
+    PRESENCE of a marker is asserted where it matters.
+    """
+    out = []
+    for span in spans:
+        integrity = span.capture_integrity
+        correlation = span.correlation
+        out.append(
+            Node(
+                name=span.name,
+                span_id=span.context.span_id,
+                parent_id=span.parent_span_id,
+                trace_id=span.context.trace_id,
+                strategy=correlation.strategy if correlation is not None else None,
+                confidence=correlation.confidence if correlation is not None else None,
+                limitations=tuple(integrity.limitations) if integrity is not None else (),
+            )
+        )
+    return tuple(out)
+
+
+def collapse(nodes: Sequence[Node], *, root: str) -> tuple[Node, ...]:
+    """The same tree with every edge flattened onto the root. THE negative control.
+
+    This is not a hypothetical shape. It is what an adapter produces when it
+    wraps a framework's PRODUCER instead of its consumer, or when a release
+    stops copying the context at task submit: every intermediate span still
+    exists, is still the root's child, still reads at full confidence, still
+    ships one trace and still counts correctly — and everything that was two
+    levels down is now one. Nothing but a per-node id chain can see it.
+
+    Deliberately a transform over the READ tree rather than a second workload:
+    it takes the run that actually happened and moves only the edges, so the
+    tier half is provably unchanged by construction and the failure the suite
+    demonstrates cannot be an artefact of a different run.
+    """
+    anchor = one(nodes, root)
+    return tuple(
+        node
+        if node.span_id == anchor.span_id
+        else Node(
+            name=node.name,
+            span_id=node.span_id,
+            parent_id=anchor.span_id,
+            trace_id=node.trace_id,
+            strategy=node.strategy,
+            confidence=node.confidence,
+            limitations=node.limitations,
+        )
+        for node in nodes
+    )
+
+
+def one(nodes: Sequence[Node], name: str) -> Node:
+    """The single node with this EXACT name.
+
+    Exact rather than a prefix test: `execute_step n1` is a prefix of
+    `execute_step n10`, so a prefix match silently pairs a child with the wrong
+    parent the first time a suite is pointed at a graph wide enough to matter.
+    """
+    found = [node for node in nodes if node.name == name]
+    assert len(found) == 1, (
+        f"expected exactly one span named {name!r}, got {len(found)}; "
+        f"shipped: {sorted(node.name for node in nodes)}"
+    )
+    return found[0]
+
+
+def parent_name(nodes: Sequence[Node], node: Node) -> str | None:
+    """The name of `node`'s parent, for a failure message a reader can act on."""
+    if node.parent_id is None:
+        return None
+    by_id = {n.span_id: n for n in nodes}
+    found = by_id.get(node.parent_id)
+    return found.name if found is not None else "<MISSING>"
+
+
+# -- the subject ------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Stalled:
+    """A run the host started and has not finished — the shutdown workload.
+
+    `resume` is the host carrying on afterwards, and calling it is half of what
+    the shutdown checks assert: wardex closing its own books mid-run may not
+    raise into a generator the host is still pumping.
+    """
+
+    root: str
+    resume: Callable[[], Any]
+
+
+@dataclass(frozen=True)
+class AdapterSubject:
+    """One adapter, described well enough for the suite to judge it.
+
+    THE bar this type exists to hold: wiring the next adapter in is this
+    object and nothing else. Every field is either a fact about the adapter or
+    a callable the adapter's own test file already had to write.
+
+    * `name` — what `AdapterInterface.name()` returns, which is also its
+      `AdapterName` member's value.
+    * `module` — the dotted module the adapter is implemented in. Read as
+      SOURCE for the placement rule, which is a property of a patch site and
+      therefore has no runtime moment at which it can be observed.
+    * `seams` — a snapshot of every framework attribute the adapter patches,
+      keyed by a label. Called before, during and after an install, and
+      compared BY IDENTITY: a restore that produced an equal object would leave
+      wardex's wrapper welded on for the life of the process.
+    * `workload` — drives the framework and returns whatever the host got. Must
+      tolerate a bare `Live` (`ctx is None`) by opening no wardex spans of its
+      own; that is the run that proves the zero point.
+    * `chains` — the tree the workload MUST produce, as paths of exact span
+      names from the root down. Not a count and not a set of edges: a path,
+      asserted by span id, because that is the only shape a collapse cannot
+      satisfy.
+    * `stall` — start a run and leave it open. The two shutdown checks drive
+      it.
+    * `detect_package` — the module whose presence auto-detects this adapter.
+    """
+
+    name: str
+    module: str
+    factory: Callable[[], AdapterInterface]
+    seams: Callable[[], Mapping[str, Any]]
+    workload: Callable[[Live], Any]
+    chains: tuple[tuple[str, ...], ...]
+    stall: Callable[[Live], Stalled]
+    detect_package: str
+
+    @property
+    def root(self) -> str:
+        """The name every declared chain hangs off."""
+        return self.chains[0][0]
+
+
+__all__ = [
+    "AdapterSubject",
+    "Live",
+    "Node",
+    "RecordingClient",
+    "Stalled",
+    "bare",
+    "clean_state",
+    "collapse",
+    "installed",
+    "one",
+    "parent_name",
+    "read",
+]
