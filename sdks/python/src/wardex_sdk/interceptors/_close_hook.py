@@ -104,6 +104,15 @@ class CloseRegistry:
     Nothing wardex observes is that shape — `socket.socket` and `ssl.SSLObject`
     both support weak references — and the alternative (holding the object) is
     the bug this exists to avoid.
+
+    NO LOCK, deliberately. `_fire` can run from a weakref callback, which lands
+    at an arbitrary allocation on whatever thread happened to drop the last
+    reference — including a thread already inside `on_close`. A plain `Lock`
+    there is a self-deadlock in the host's own code, and an `RLock` would only
+    hide it while ordering nothing. What is left is what the dict itself
+    guarantees: `pop`, `get` and insert are each single operations, and two
+    threads cannot register the same object because they cannot both have just
+    created it. `_seam._conns` is unlocked for the same reason.
     """
 
     __slots__ = ("_entries",)
