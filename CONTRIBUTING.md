@@ -18,7 +18,14 @@ cargo clippy --workspace --all-targets -- -D warnings
 uv run ruff check sdks/python
 uv run ruff format --check sdks/python
 buf lint
+scripts/check-py310.sh   # if you touched Python runtime code
 ```
+
+`scripts/check-py310.sh` runs the suite on CPython 3.10, the floor
+`sdks/python/pyproject.toml` declares. The development venv is a much newer
+interpreter, so a 3.11+-only API passes locally and turns red only in CI's 3.10
+job. The script builds its own `.venv-py310` and leaves your `.venv`
+interpreter alone.
 
 ## Conventions
 
