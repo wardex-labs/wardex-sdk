@@ -361,13 +361,25 @@ def test_latch_stays_ignore_once_closed(fake_ssl_socket, bare_ssl_interceptor):
     matters for the OOM path the latch closes: a Redis/Mongo/Kafka-over-TLS
     connection latched off must stay off for its whole life, or a coincidental
     later payload resembling a method line would let it start streaming into
-    the parser again."""
+    the parser again.
+
+    The re-arming attempt is made against `_gate` directly, not only through
+    `_on_request_bytes`. The early capture gate returns above the latch on a
+    connection already classified "ignore", so the entry point no longer
+    reaches `_gate` at all here — driving it end-to-end alone would re-read a
+    field nothing had touched and would stay green against a `_gate` that
+    re-decides on every call. `_ConnectionState.latched_off()` names this test
+    as the reason it may treat "ignore" as permanent, so the assertion has to
+    be at the level that answer comes from."""
     itc = bare_ssl_interceptor
     sock = fake_ssl_socket(alpn=None)
     itc._on_request_bytes(sock, b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n")
-    assert itc._conns[id(sock)].gate == "ignore"
+    st = itc._conns[id(sock)]
+    assert st.gate == "ignore"
+    assert itc._gate(st, b"GET / HTTP/1.1\r\n\r\n", "request") is False
+    assert st.gate == "ignore"
     itc._on_request_bytes(sock, b"GET / HTTP/1.1\r\n\r\n")
-    assert itc._conns[id(sock)].gate == "ignore"
+    assert st.gate == "ignore"
 
 
 def test_disabled_reason_not_logged_without_debug(capsys):
