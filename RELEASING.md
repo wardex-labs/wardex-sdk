@@ -15,9 +15,21 @@ also requires a `## [Unreleased]` header in `CHANGELOG.md` (it moves that sectio
 under the new version) and stops if the header is missing.
 
 The `release-python.yml` workflow (on `python-v*` tags) builds abi3 wheels
-(manylinux x86_64/aarch64, macOS x86_64/arm64, Windows) and publishes to PyPI
-via Trusted Publishing (OIDC) — no API token. (A source distribution is a
-follow-up; the beta ships wheels only.)
+(manylinux x86_64/aarch64, macOS x86_64/arm64, Windows), installs and imports
+each one, and publishes to PyPI via Trusted Publishing (OIDC) — no API token.
+(A source distribution is a follow-up; the beta ships wheels only.)
+
+The same workflow also runs on demand, which is how you prove the build and
+wheel-install steps *before* the tag exists:
+
+```bash
+gh workflow run release-python.yml --ref <branch>   # builds + installs every wheel
+```
+
+Publishing requires a pushed `python-v*` tag, so a manual run stops after the
+install step whatever ref you point it at. Use it whenever the workflow, the
+build matrix, or anything the wheel links against changed — those paths are
+otherwise first exercised by a tag push you cannot take back.
 
 Version scheme (PEP 440): `0.1.0b1` → `0.1.0b2` → `0.1.0rc1` → `0.1.0` → `0.1.1` / `0.2.0`.
 
@@ -30,11 +42,15 @@ skips pre-releases by default; testers need `pip install wardex-sdk --pre`
 
 - **A tag triggers the release, not a branch push.** Pushing `main` alone runs CI
   but does not publish; the `python-v*` tag is what starts `release-python.yml`.
-  Push the specific tag (`git push origin python-vX.Y.Z`), not `--tags`.
+  Push the specific tag (`git push origin python-vX.Y.Z`), not `--tags`. The
+  workflow can also be started by hand from any branch (see above) — that path
+  builds and installs the wheels but never publishes.
 - **A published version is immutable.** PyPI will not let you reuse or overwrite a
   version. If a release is broken, publish the next one (e.g. `0.1.0b3`).
 - **Publishing is all-or-nothing.** The publish job needs every platform wheel to
-  build; if any fails, nothing is published (no partial release).
+  build *and* every smoke entry to install and import it; if either stage has one
+  red job, nothing is published (no partial release) and the version is still
+  free to re-tag once the cause is fixed.
 - **CI and release are independent.** `ci.yml` runs on branch pushes/PRs;
   `release-python.yml` runs on `python-v*` tags. A CI failure does not block a
   tagged release, and vice versa.
