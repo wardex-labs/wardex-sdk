@@ -382,9 +382,9 @@ def _suppress_items(node: ast.AST) -> list[ast.Call]:
 
     Matched on the callee NAME, so both spellings the stdlib offers count
     (`contextlib.suppress(E)` and a bare `suppress(E)` after `from contextlib
-    import suppress`) and nothing else does. `interceptors/_exclusion.py`
-    exports a context manager called `suppress_capture`, which suppresses
-    CAPTURE rather than an exception and is not this.
+    import suppress`) and nothing else does. `_suppress.py` exports a context
+    manager called `suppress_capture`, which suppresses CAPTURE rather than an
+    exception and is not this.
     """
     if not isinstance(node, (ast.With, ast.AsyncWith)):
         return []
@@ -551,6 +551,46 @@ def test_adapters_and_interceptors_do_not_import_each_other():
         "edge between them is how one layer ends up owning the other's spans,\n"
         "which is exactly the double-instrumentation mess design §8 exists to\n"
         "prevent. Anything they need to share belongs in assembly/."
+    )
+
+
+_BELOW_THE_OBSERVERS = ("transport/", "context/")
+
+
+def test_the_layers_below_the_observers_do_not_import_one():
+    """design §3.1's arrow, in the two places it used to point backwards.
+
+    `transport/` and `context/` sit BELOW `interceptors/` and `adapters/` —
+    a span reaches the transport after the observers are done with it, and the
+    context layer cross-cuts them rather than depending on either. Both
+    nonetheless imported `interceptors._exclusion`, for the same reason: the
+    self-exclusion guard was filed under the package whose behaviour it changes
+    instead of the layer both of its ENDS live in. It is `_suppress.py` at the
+    package root now, and this is the rule that keeps the next shared flag from
+    being filed the same way.
+
+    Scoped to the two packages rather than to every module outside
+    `interceptors/`, because `__init__.py` and `_lifecycle.py` are the
+    composition root: installing an interceptor is what they are FOR, and a
+    rule that forbade it would be a rule about the wrong thing.
+    """
+    violations: list[str] = []
+    for rel, tree in _modules().items():
+        if not rel.startswith(_BELOW_THE_OBSERVERS):
+            continue
+        for target in sorted(_imported_modules(rel, tree)):
+            for observer in (f"{_PKG}.interceptors", f"{_PKG}.adapters"):
+                if target == observer or target.startswith(observer + "."):
+                    violations.append(f"  {rel} imports {target}")
+    assert not violations, (
+        "a layer below the observers reached up into one:\n"
+        + "\n".join(sorted(violations))
+        + "\n\nWHY: "
+        + _LAYERING_WHY
+        + "\n"
+        "Anything transport/ or context/ genuinely shares with an observer is\n"
+        "not an observer concern — put it at the package root, where both ends\n"
+        "of it live."
     )
 
 
@@ -1814,7 +1854,7 @@ def test_c_s4_sees_the_suppress_spelling_of_a_swallow(source):
 @pytest.mark.parametrize(
     "source",
     [
-        # wardex's own CM in `interceptors/_exclusion.py`. It suppresses CAPTURE
+        # wardex's own CM in `_suppress.py`. It suppresses CAPTURE
         # so the exporter's own HTTP call is not re-captured; it swallows no
         # exception, and reading it as one would put a false entry in the table.
         "def f():\n    with suppress_capture():\n        g()\n",

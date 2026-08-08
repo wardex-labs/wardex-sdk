@@ -295,7 +295,7 @@ class ByteSeamInterceptor(InterceptorInterface):
     # --- Tracker delegation + span assembly ---
 
     def _on_request_bytes(self, obj: Any, data: bytes) -> None:
-        from ._exclusion import is_suppressed
+        from .._suppress import is_suppressed
 
         if is_suppressed():
             return
@@ -312,7 +312,7 @@ class ByteSeamInterceptor(InterceptorInterface):
                 self._emit_span(obj, st, txn)
 
     def _on_response_bytes(self, obj: Any, data: bytes) -> None:
-        from ._exclusion import is_suppressed
+        from .._suppress import is_suppressed
 
         if is_suppressed():
             return
