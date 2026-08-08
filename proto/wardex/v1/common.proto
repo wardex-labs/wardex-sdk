@@ -186,6 +186,12 @@ enum Limitation {
   LIMITATION_GRPC_MESSAGE_TRUNCATED = 22;
   LIMITATION_WS_PAYLOAD_TRUNCATED = 23;
   LIMITATION_CONNECTION_EVICTED = 24;
+  //    Not a duplicate of BODY_CAP_EXCEEDED, by the same rule: that one names
+  //    `max_body_bytes`, a cap on what a parser KEEPS in raw bytes, and this
+  //    one names `max_otlp_attribute_bytes`, a cap on what one attribute may
+  //    COST on a wire that measures it after the base64 rewrite. A body inside
+  //    the first and outside the second is the ordinary case, not a corner.
+  LIMITATION_OTLP_ATTRIBUTE_TRUNCATED = 39;
 
   // -- Parsing / interpretation.
   LIMITATION_FRAME_PARSE_FAILED = 25;

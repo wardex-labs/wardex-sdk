@@ -487,12 +487,12 @@ Two emit sites, and the first is the mechanism the second restates.
     """
 
     # ------------------------------------------------------------------
-    # Caps reached (census). These stay four members because they are four
-    # different FACTS about the capture, each with a different replay
-    # consequence — not, as the first draft of this section claimed, because
-    # each names a different `crates/wardex-limits` knob. Two of them
+    # Caps reached (census + one added since). These stay separate members
+    # because they are separate FACTS about the capture, each with a different
+    # replay consequence — not, as the first draft of this section claimed,
+    # because each names a different `crates/wardex-limits` knob. Two of them
     # (BODY_CAP_EXCEEDED, GRPC_MESSAGE_TRUNCATED) are driven by the same
-    # `max_body_bytes`, and a fifth limit — `max_ws_frame_bytes` — surfaces
+    # `max_body_bytes`, and another limit — `max_ws_frame_bytes` — surfaces
     # under FRAME_PARSE_FAILED rather than here. Each docstring below names the
     # knob that was MEASURED to drive it, because these values are what a
     # dashboard turns into "raise this setting" advice — a knob named from
@@ -560,6 +560,27 @@ Two emit sites, and the first is the mechanism the second restates.
     tunables — ``max_connections`` here, ``max_units`` there — and a merged
     marker would send the user to the wrong knob. The rename drops the ``ws_``
     prefix because the connection table is not WebSocket-specific.
+    """
+
+    OTLP_ATTRIBUTE_TRUNCATED = "otlp_attribute_truncated"
+    """An attribute value hit ``max_otlp_attribute_bytes`` on the way out, so
+    what a backend shows for it is a prefix of what wardex captured.
+
+    Emitted from ``crates/wardex-codec/src/otlp/map.rs`` — ``cap_attribute_values``
+    for a value over the bound, and ``drop_payload_attributes`` for a span whose
+    encoded size alone exceeds ``max_otlp_request_bytes``, where the payload
+    goes entirely so the span itself can still be exported. Both attach it by
+    proto NUMBER rather than by a string literal, which is why
+    ``test_limitation_census.py`` scans Rust for ``Limitation::`` references as
+    well as for marker literals.
+
+    The one marker in this enum that describes the EXPORT rather than the
+    capture, and the reason it is not ``BODY_CAP_EXCEEDED``: that one names
+    ``max_body_bytes``, a bound on the raw bytes a parser keeps, while this
+    names a bound on what one attribute costs on a wire that measures it after
+    the base64 rewrite. A payload inside the first and outside the second is
+    the ordinary case rather than a corner, and merging the two would send a
+    user to raise a capture cap that was never the constraint.
     """
 
     # ------------------------------------------------------------------

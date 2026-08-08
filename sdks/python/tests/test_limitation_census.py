@@ -92,6 +92,50 @@ They are invisible to any Python-only scan, which is why the Rust half of this
 file exists.
 """
 
+_CENSUS_RUST_ENUM: dict[str, frozenset[str]] = {
+    "body_cap_exceeded": frozenset({"crates/wardex-codec/src/otlp/map.rs"}),
+    "otlp_attribute_truncated": frozenset({"crates/wardex-codec/src/otlp/map.rs"}),
+    "vocabulary_unmapped": frozenset(
+        {
+            "bindings/python/src/codec.rs",
+            "crates/wardex-codec/src/vocab.rs",
+        }
+    ),
+}
+"""Every reference to a `Limitation` value by its GENERATED RUST NAME, by file.
+
+The blind spot the table above cannot see. `_CENSUS_RUST` scans for marker
+STRINGS, which is the whole channel while every Rust marker is a
+`&'static str` — and it stopped being the whole channel when the OTLP surface
+started attaching markers by proto number. Writing the literal there would have
+been visible to the string scan and would also have been a second declaration
+of a vocabulary `common.proto` owns (§6.6), free to drift from it; reading the
+number keeps one declaration and costs this scanner instead.
+
+REFERENCES, not emit sites: the scan is textual, so a `#[cfg(test)]` module
+counts the same as production code, and two of the entries here are exactly
+that (`map.rs` asserting the projection, `vocab.rs` pinning the meta value's
+number). That is the right disposition for the property being defended — no
+member may be reachable from Rust invisibly — and `_RUST_ENUM_EMITTERS` below
+is the smaller, hand-declared set that actually reaches a span.
+
+`vocabulary_unmapped` is a META value and not a member of the Python enum at
+all; it appears here because the scan finds it, and `_members_with_an_emitter`
+filters it out rather than pretending it is vocabulary.
+"""
+
+_RUST_ENUM_EMITTERS: frozenset[str] = frozenset({"otlp_attribute_truncated"})
+"""Of the references above, the ones that ATTACH a marker to a span.
+
+Hand-declared, and the one place in this file that is. Telling a production
+attachment from a test assertion needs the Rust module tree, which no regex
+has; what the scanner can do — and what `test_every_rust_enum_emitter_is_seen`
+makes it do — is refuse an entry here that it did not find in the source at
+all. So the risk this leaves is a marker declared as an emitter that is not
+one, which costs a docstring that over-explains; not a marker that reaches a
+span with nothing recording it, which is the failure this file exists for.
+"""
+
 _MEMBER_SITES: dict[str, frozenset[str]] = {
     # --- assembly/ itself ---
     # `_parentage.py` attaches these two from its `_MARKER` table, which fires
@@ -468,6 +512,13 @@ _EMITTED_MEMBERS: frozenset[str] = frozenset(
         # died, one whose activation died, and the enclosing unit when the span
         # itself will not ship. The one member whose subject is wardex.
         "INSTRUMENTATION_DEGRADED",
+        # The tenth, and the first reached through neither of the two channels
+        # this file was built around: not a Python site naming a member and not
+        # a Rust marker string, but a proto NUMBER pushed onto the OTLP surface
+        # by `crates/wardex-codec/src/otlp/map.rs`. `_CENSUS_RUST_ENUM` is the
+        # scan that makes it visible; before it, this member could have reached
+        # a user's wire with nothing here recording that it existed.
+        "OTLP_ATTRIBUTE_TRUNCATED",
     }
 )
 """Which MEMBERS have an emit site today, derived independently below.
@@ -1120,12 +1171,35 @@ _RUST_OWNED_VEC_TYPE = r"Vec\s*<\s*String\s*>"
 #: A marker vector filled by stringifying members of the CLOSED Python enum.
 #: Readable, unlike an opaque constant: the vocabulary bounds it at the source.
 _RUST_FROM_CLOSED_ENUM = re.compile(r"\benum_str\s*\(")
+
+#: A `Limitation` value named through the generated Rust enum. Readable for the
+#: same reason the closed-enum case above is: the schema bounds it at the
+#: source, so the scan only has to say WHICH value and where.
+#:
+#: CamelCase only, deliberately. prost generates CamelCase variants, so an
+#: all-caps `Limitation::SOME_VALUE` is prose quoting the proto or the Python
+#: enum — it compiles nowhere and attaches nothing, and counting it would put
+#: a doc comment in the census as though it were a channel.
+_RUST_ENUM_REF = re.compile(r"\bLimitation::([A-Z][A-Za-z0-9]*)\b")
 _RUST_BINDING_DECL = re.compile(r"\b([A-Za-z_]\w*)\s*:\s*" + _RUST_VEC_TYPE)
 _RUST_FN_DECL = re.compile(r"\bfn\s+([A-Za-z_]\w*)\s*\([^)]*\)\s*->\s*" + _RUST_VEC_TYPE)
 _RUST_OWNED_BINDING_DECL = re.compile(r"\b([A-Za-z_]\w*)\s*:\s*" + _RUST_OWNED_VEC_TYPE)
 _RUST_OWNED_FN_DECL = re.compile(
     r"\bfn\s+([A-Za-z_]\w*)\s*\([^)]*\)\s*->\s*" + _RUST_OWNED_VEC_TYPE
 )
+
+
+def _wardex_value(variant: str) -> str:
+    """`OtlpAttributeTruncated` -> `otlp_attribute_truncated`.
+
+    prost derives the Rust variant from the proto value name by stripping the
+    enum's prefix and CamelCasing what is left, so undoing that is the whole
+    conversion — and `crates/wardex-codec/src/vocab.rs` derives the wardex value
+    from the same proto name by the same convention. Two derivations of one
+    naming rule, which is what lets this scanner name a marker the Rust code
+    never spells.
+    """
+    return re.sub(r"(?<!^)(?=[A-Z])", "_", variant).lower()
 
 
 def _rust_declared_names(text: str) -> set[str]:
@@ -1200,6 +1274,7 @@ def _rust_paths() -> tuple[list[pathlib.Path], list[pathlib.Path]]:
 class _RustCensus:
     def __init__(self) -> None:
         self.markers: dict[str, set[str]] = {}
+        self.enum_markers: dict[str, set[str]] = {}
         self.disabled_reasons: dict[str, set[str]] = {}
         self.declarations: dict[str, set[str]] = {}
         self.receivers: set[str] = set()
@@ -1208,6 +1283,12 @@ class _RustCensus:
         self.files = scanned
         self.excluded = frozenset(p.relative_to(_REPO).as_posix() for p in excluded)
         texts = {p.relative_to(_REPO).as_posix(): p.read_text(encoding="utf-8") for p in scanned}
+
+        # pass 0 — every value named through the generated enum, string or not
+        for rel, text in texts.items():
+            for match in _RUST_ENUM_REF.finditer(text):
+                value = _wardex_value(match.group(1))
+                self.enum_markers.setdefault(value, set()).add(rel)
 
         # pass 1 — where is a marker vector declared, and what is it called?
         for rel, text in texts.items():
@@ -1310,12 +1391,14 @@ _VOCABULARY: dict[str, str] = {
     "TOOL_NAME_COLLISION": "tool_name_collision",
     # --- the one member that describes wardex rather than the observation (1) ---
     "INSTRUMENTATION_DEGRADED": "instrumentation_degraded",
+    # --- added after the census, by the OTLP size guard (1) ---
+    "OTLP_ATTRIBUTE_TRUNCATED": "otlp_attribute_truncated",
 }
 
 
-def test_the_vocabulary_is_exactly_these_thirty_eight() -> None:
+def test_the_vocabulary_is_exactly_these_thirty_nine() -> None:
     """15 declared before the census + 21 from it + 1 from §5.4 + 1 for wardex
-    itself, name by name.
+    itself + 1 for the OTLP size guard, name by name.
 
     A count alone is not enough: a RENAME keeps the count and is the single most
     expensive mistake available here. These are proto enum values in
@@ -1372,10 +1455,17 @@ def _members_with_an_emitter() -> set[str]:
     Derived from the frozen tables rather than counted, so moving a site from a
     free string to a member does not change the answer — which member has an
     emitter is invariant under a rewiring, and a bare count is not.
+
+    `_RUST_ENUM_EMITTERS` joins on VALUE like the string tables do, and is
+    filtered through `by_value` for the same reason `_CENSUS_RUST_ENUM` needs
+    filtering at all: the meta value `vocabulary_unmapped` is not vocabulary and
+    has no member to name.
     """
     by_value = {m.value: m for m in Limitation}
-    strings = set(_CENSUS_PY) | set(_CENSUS_RUST)
-    return {(_ALIASES.get(s) or by_value[s]).name for s in strings} | set(_MEMBER_SITES)
+    strings = set(_CENSUS_PY) | set(_CENSUS_RUST) | set(_RUST_ENUM_EMITTERS)
+    return {(_ALIASES.get(s) or by_value[s]).name for s in strings if s in by_value or s in _ALIASES} | set(
+        _MEMBER_SITES
+    )
 
 
 def test_every_member_carries_its_own_provenance() -> None:
@@ -1489,6 +1579,56 @@ def test_rust_census_matches_source(rust_census: _RustCensus) -> None:
     """
     drift = _diff_sites(rust_census.markers, _CENSUS_RUST)
     assert not drift, f"Rust limitation census drifted: {drift}"
+
+
+def test_rust_enum_reference_census_matches_source(rust_census: _RustCensus) -> None:
+    """The other Rust channel: a value named through the generated enum.
+
+    The string scan above is blind to it by construction, and the OTLP surface
+    uses it — so without this a marker could reach a user's wire with nothing in
+    this file recording that it exists.
+    """
+    drift = _diff_sites(rust_census.enum_markers, _CENSUS_RUST_ENUM)
+    assert not drift, (
+        f"Rust `Limitation::` reference census drifted: {drift} "
+        "(value -> (sites gained, sites lost)).\n"
+        "A NEW value referenced from Rust: record it here, and if the site "
+        "attaches the marker to a span rather than asserting something about "
+        "it, add the value to _RUST_ENUM_EMITTERS too."
+    )
+
+
+def test_every_rust_enum_emitter_is_seen_by_the_scanner() -> None:
+    """`_RUST_ENUM_EMITTERS` is the one hand-declared set here, so the scanner
+    has to be able to corroborate every entry in it.
+
+    It cannot confirm that a reference ATTACHES a marker — that needs the module
+    tree. It can refuse a name it never found in the source, which is what stops
+    the set from drifting into a list of members someone meant to wire up.
+    """
+    assert _RUST_ENUM_EMITTERS <= set(_CENSUS_RUST_ENUM)
+
+
+@pytest.mark.parametrize(
+    ("variant", "expected"),
+    [
+        ("OtlpAttributeTruncated", "otlp_attribute_truncated"),
+        ("BodyCapExceeded", "body_cap_exceeded"),
+        ("TtftUnavailableH2", "ttft_unavailable_h2"),
+        ("SessionAborted", "session_aborted"),
+    ],
+)
+def test_a_generated_variant_resolves_to_its_wardex_value(variant, expected):
+    """The scanner names a marker the Rust code never spells, so the naming rule
+    it undoes has to be pinned on its own.
+
+    `TtftUnavailableH2` is the case that decides it: a digit is not a word
+    boundary, and a rule that treated it as one would produce
+    `ttft_unavailable_h_2`, silently invent a value no enum has, and report a
+    censused marker as a new one.
+    """
+    assert _wardex_value(variant) == expected
+    assert expected in {m.value for m in Limitation}
 
 
 def test_the_marker_vector_is_declared_only_where_recorded(rust_census: _RustCensus) -> None:

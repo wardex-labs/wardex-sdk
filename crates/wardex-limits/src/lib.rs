@@ -134,7 +134,7 @@ pub struct Limits {
     /// Maximum size of ONE attribute value on the OTLP surface, measured as it
     /// will appear on the wire — i.e. AFTER the base64 rewrite a binary payload
     /// goes through, not before it. A value over the bound is truncated and the
-    /// span carries `Limitation::OTLP_ATTRIBUTE_TRUNCATED`.
+    /// span says so with an `otlp_attribute_truncated` marker.
     ///
     /// It is not a second `max_body_bytes` and does not overlap it. That one
     /// caps what a parser KEEPS, in raw bytes, before anything is encoded; this
