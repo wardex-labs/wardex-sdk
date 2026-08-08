@@ -16,6 +16,7 @@ import pytest
 from hpack import Encoder
 
 from wardex_sdk._enums import CaptureMode
+from wardex_sdk._limits import CaptureLimits
 from wardex_sdk.assembly import Limitation, counters
 from wardex_sdk.interceptors import _close_hook, _seam
 from wardex_sdk.interceptors._close_hook import (
@@ -284,6 +285,25 @@ def test_an_h2_stream_that_never_answers_loses_its_latch_entry_at_close(
 
     assert tracker._latch == {}
     assert id(sock) not in itc._conns
+
+
+def test_the_h2_latch_is_capped_for_a_connection_that_never_closes():
+    """The path the close hook cannot reach, and the bound that covers it.
+
+    On the async TLS seam the carrier is an `ssl.SSLObject`: no `close()` to
+    patch, and asyncio's `SSLProtocol` pins it for the life of the transport, so
+    it is neither closed nor collected. A pooled h2 keep-alive to a model
+    provider is exactly that shape — and every stream it resets strands a latch
+    entry that `on_connection_close` will never be called to release. So the
+    latch carries its own cap, sourced from the same `max_streams` the Rust
+    parser bounds its own stream table with.
+    """
+    tracker = _Http2Tracker(CaptureLimits(max_streams=8).to_native())
+    for sid in range(1, 2 * 200, 2):
+        tracker.on_request_bytes(_h2_request(sid))  # opened, never answered
+
+    assert len(tracker._latch) == 8
+    assert max(tracker._latch) == 399, "the cap evicted the newest instead of the oldest"
 
 
 def test_a_state_rebuilt_on_a_live_socket_does_not_stack_retirement_hooks(
