@@ -105,10 +105,19 @@ class SSLInterceptor(ByteSeamInterceptor):
         def wrapper(this: Any, data: Any, *args: Any, **kwargs: Any) -> Any:
             ret = real(this, data, *args, **kwargs)
             try:
-                sent = data
-                if meth in ("send", "write") and isinstance(ret, int):
-                    sent = bytes(data)[:ret]
-                self._on_request_bytes(this, bytes(sent))
+                # The gate comes FIRST, above the materialization. `bytes(data)`
+                # is free for an exact `bytes` argument and a full copy of the
+                # send buffer for anything else — a memoryview or bytearray,
+                # which is what the asyncio and httpx paths hand to `write`.
+                # It ran on every send of every SSLSocket in the process,
+                # including the ones the sniff-latch had already ruled out, so
+                # a TLS-backed Redis or Postgres client paid it for the life of
+                # the connection for a verdict settled on its first write.
+                if self._capture_possible(this):
+                    sent = data
+                    if meth in ("send", "write") and isinstance(ret, int):
+                        sent = bytes(data)[:ret]
+                    self._on_request_bytes(this, bytes(sent))
             except Exception:
                 pass
             return ret
@@ -121,7 +130,8 @@ class SSLInterceptor(ByteSeamInterceptor):
         def wrapper(this: Any, *args: Any, **kwargs: Any) -> Any:
             ret = real(this, *args, **kwargs)
             try:
-                if isinstance(ret, (bytes, bytearray)) and ret:
+                # Ahead of `bytes(ret)`, for the reason `_mk_send` gives.
+                if self._capture_possible(this) and isinstance(ret, (bytes, bytearray)) and ret:
                     self._on_response_bytes(this, bytes(ret))
             except Exception:
                 pass
@@ -133,7 +143,7 @@ class SSLInterceptor(ByteSeamInterceptor):
         def wrapper(this: Any, buffer: Any, *args: Any, **kwargs: Any) -> int:
             n = real(this, buffer, *args, **kwargs)
             try:
-                if n:
+                if n and self._capture_possible(this):
                     self._on_response_bytes(this, bytes(buffer[:n]))
             except Exception:
                 pass
@@ -145,16 +155,17 @@ class SSLInterceptor(ByteSeamInterceptor):
         def wrapper(this: Any, *args: Any, **kwargs: Any) -> Any:
             ret = real(this, *args, **kwargs)
             try:
-                buffer = None
-                if len(args) >= 2:
-                    buffer = args[1]
-                elif "buffer" in kwargs:
-                    buffer = kwargs["buffer"]
-                if buffer is not None and isinstance(ret, int):
-                    if ret:
-                        self._on_response_bytes(this, bytes(buffer[:ret]))
-                elif isinstance(ret, (bytes, bytearray)) and ret:
-                    self._on_response_bytes(this, bytes(ret))
+                if self._capture_possible(this):
+                    buffer = None
+                    if len(args) >= 2:
+                        buffer = args[1]
+                    elif "buffer" in kwargs:
+                        buffer = kwargs["buffer"]
+                    if buffer is not None and isinstance(ret, int):
+                        if ret:
+                            self._on_response_bytes(this, bytes(buffer[:ret]))
+                    elif isinstance(ret, (bytes, bytearray)) and ret:
+                        self._on_response_bytes(this, bytes(ret))
             except Exception:
                 pass
             return ret
