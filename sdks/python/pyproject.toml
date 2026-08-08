@@ -37,11 +37,28 @@ module-name    = "wardex_sdk._wardex_native"
 features       = ["pyo3/extension-module"]
 
 [dependency-groups]
-dev = [
+# Everything `tests/` imports beyond the package itself, and nothing else. The
+# floor check (`scripts/check-py310.sh`) installs exactly this group into a
+# throwaway CPython 3.10, so a dependency missing here does not fail the run —
+# it silently shrinks what the run covers.
+test = [
     "pytest>=8",
     "pytest-asyncio>=0.24",
     "syrupy>=4",
-    "ruff>=0.7",
+    "aiohttp>=3.9",
+    # `anyio` and `hpack` arrive transitively (via httpx and h2 respectively),
+    # but the suite imports both by name — a transitive edge is not a
+    # declaration, and it breaks the day the intermediary drops it.
+    "anyio>=4",
+    "h2>=4.0",
+    "hpack>=4.0",
+    "httpx[http2]>=0.28.1",
+    "opentelemetry-api>=1.20",
+    "opentelemetry-sdk>=1.20",
+    "requests>=2.31",
+    # test_conn_timing_uvloop.py `importorskip`s uvloop: absent, the uvloop
+    # connect path is skipped rather than red.
+    "uvloop>=0.17",
     "claude-agent-sdk>=0.2,<0.3",
     # Only 1.2.x is measured. The `invoke`->`stream` delegation direction and the
     # `pregel._runner` seam are unverified on 1.0.x/1.1.x, and there is no runtime
@@ -53,6 +70,10 @@ dev = [
     # is the non-deprecated successor to `create_react_agent`, and the tool seam's
     # coverage of it is a measured claim rather than an assumed one.
     "langchain>=1.0",
+]
+dev = [
+    { include-group = "test" },
+    "ruff>=0.7",
 ]
 
 [tool.pytest.ini_options]

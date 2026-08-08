@@ -8,6 +8,8 @@ __pycache__/
 *.py[cod]
 *$py.class
 .venv/
+# scripts/check-py310.sh keeps the 3.10 floor environment beside `.venv`
+.venv-py310/
 .env
 *.egg-info/
 dist/

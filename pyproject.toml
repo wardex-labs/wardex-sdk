@@ -1,13 +1,7 @@
 [tool.uv.workspace]
 members = ["sdks/python"]
 
-[dependency-groups]
-dev = [
-    "aiohttp>=3.9",
-    "h2>=4.0",
-    "httpx[http2]>=0.28.1",
-    "opentelemetry-api>=1.20",
-    "opentelemetry-sdk>=1.20",
-    "requests>=2.31",
-    "uvloop>=0.17",
-]
+# No dependency groups here on purpose: everything the suite imports lives in
+# the `test` group of `sdks/python/pyproject.toml`, next to the tests that
+# import it, so one `--group test` installs a complete test environment. A
+# group split across two files is a group that cannot be named in one flag.
