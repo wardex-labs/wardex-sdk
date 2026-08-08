@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import gc
 import socket
+from functools import partial
 from types import SimpleNamespace
 
 import pytest
@@ -76,6 +77,43 @@ def test_every_hook_runs_even_when_one_of_them_raises():
     assert counters.get("interceptors.close_hook.fire") == 1, (
         "a swallowed hook failure left no evidence anywhere"
     )
+
+
+def test_registering_the_same_hook_twice_registers_it_once():
+    """Both callers repeat, and the list they append to has no bound.
+
+    `ssl.SSLSocket.do_handshake` runs in a retry loop on a non-blocking socket
+    (eventlet's `GreenSSLSocket` trampolines over exactly that) and again on
+    renegotiation, so `_conn_timing._release_at_close` re-registers per attempt.
+    The seam re-registers whenever its FIFO cap evicted a state whose socket is
+    still live. One `functools.partial` per repeat, held for the socket's whole
+    life, and `_fire` then runs N identical hooks inside the host's `close()`.
+    """
+    reg = CloseRegistry()
+    obj = _Weakrefable()
+    fired = []
+    for _ in range(50):
+        reg.on_close(obj, partial(fired.append, "x"))
+
+    assert len(reg._entries[id(obj)].hooks) == 1
+    reg.fire(obj)
+    assert fired == ["x"]
+
+
+def test_dedupe_does_not_merge_two_different_hooks_for_one_object():
+    """The seam and the timing probe both register on the same socket, and they
+    are not each other."""
+    reg = CloseRegistry()
+    obj = _Weakrefable()
+    fired = []
+    reg.on_close(obj, partial(fired.append, "state"))
+    reg.on_close(obj, partial(fired.append, "timing"))
+    reg.on_close(obj, lambda: fired.append("lambda"))
+    reg.on_close(obj, lambda: fired.append("another lambda"))
+
+    reg.fire(obj)
+
+    assert fired == ["state", "timing", "lambda", "another lambda"]
 
 
 def test_collecting_the_object_fires_the_hook_without_the_registry_holding_it():
@@ -246,6 +284,22 @@ def test_an_h2_stream_that_never_answers_loses_its_latch_entry_at_close(
 
     assert tracker._latch == {}
     assert id(sock) not in itc._conns
+
+
+def test_a_state_rebuilt_on_a_live_socket_does_not_stack_retirement_hooks(
+    fake_ssl_socket, bare_ssl_interceptor
+):
+    """The FIFO cap pops `_conns` but leaves the registry entry, so the next
+    byte on an evicted-but-live connection rebuilds the state and re-registers.
+    Without a dedupe that is one allocation per `recv`, held until the socket
+    finally closes."""
+    itc = bare_ssl_interceptor
+    sock = fake_ssl_socket(alpn=None)
+    for _ in range(10):
+        itc._state(sock)
+        itc._conns.pop(id(sock), None)  # what the cap does to a still-live entry
+
+    assert len(close_registry()._entries[id(sock)].hooks) == 1
 
 
 def test_the_connection_state_goes_when_the_socket_goes(fake_ssl_socket, bare_ssl_interceptor):

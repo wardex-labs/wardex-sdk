@@ -28,10 +28,10 @@ This module supplies the moment. `on_close(obj, hook)` registers a callback
 that fires exactly once, and it fires from two places rather than one because
 neither alone is enough:
 
-  CLOSE — `socket.socket.close()` is patched, so the hook runs while the object
-  is still intact and the memory is released promptly. This is the timely half,
-  and the only half that can act on a connection whose object the host keeps
-  alive in a pool.
+  CLOSE — `socket.socket.close`/`_real_close` are patched, so the hook runs
+  while the object is still intact and the memory is released promptly. This is
+  the timely half, and the only half that can act on a POOLED connection, whose
+  object the host holds for as long as the pool does.
 
   FINALIZE — a `weakref.finalize` backstop for everything that is dropped
   without `close()`: `ssl.SSLObject` has no close at all, an abandoned socket is
@@ -40,6 +40,12 @@ neither alone is enough:
   invokes weakref callbacks during deallocation, before the address can be
   handed to anything else, so there is no instant at which a live object shares
   an id with a registered-but-unfired hook.
+
+What neither half reaches is a POOLED `ssl.SSLObject` — the async TLS seam's
+carrier, which has no close to patch and which asyncio's `SSLProtocol` holds for
+the life of the transport, so it is neither closed nor collected. There is no
+end-of-connection signal for it, which is why nothing sized by a connection may
+depend on one alone: see the explicit cap beside `_Http2Tracker._latch`.
 
 Nothing here may hold a strong reference to the observed object — a registry
 that pins sockets would keep the host's file descriptors open, which is a
@@ -129,6 +135,13 @@ class CloseRegistry:
         it is released, so a hook that pops a fileno-keyed record must run while
         the fd still belongs to this object, and never afterwards from a
         finalizer that may be racing the next `connect()`.
+
+        Registering the SAME hook twice registers it once. Both callers repeat:
+        `ssl.SSLSocket.do_handshake` runs in a retry loop on a non-blocking
+        socket and again on renegotiation, and the seam re-creates a connection
+        state — and re-registers its retirement hook — every time the FIFO cap
+        evicted a still-live entry. Appending there is an unbounded list on a
+        long-lived socket, which is the shape this module exists to remove.
         """
         cid = id(obj)
         entry = self._entries.get(cid)
@@ -136,6 +149,10 @@ class CloseRegistry:
             entry = _Entry()
             entry.finalizer = _finalizer(self, obj, cid)
             self._entries[cid] = entry
+        key = _hook_identity(hook)
+        for existing, _ in entry.hooks:
+            if _hook_identity(existing) == key:
+                return
         entry.hooks.append((hook, on_finalize))
 
     def fire(self, obj: Any) -> None:
@@ -182,6 +199,22 @@ class CloseRegistry:
                 hook()
 
 
+def _hook_identity(hook: Callable[[], None]) -> Any:
+    """What makes two registrations the same registration.
+
+    Every hook the seams register is a `functools.partial` closing over an id or
+    a fileno, and `partial` defines no `__eq__` — two built from the same
+    function and the same argument are distinct objects that mean one thing. So
+    the pair is compared, not the wrapper. Anything else (a plain function, a
+    bound method, a lambda) answers for itself, which is the identity a caller
+    would expect.
+    """
+    func = getattr(hook, "func", None)
+    if func is None:
+        return hook
+    return (func, getattr(hook, "args", ()))
+
+
 def _supports_weakref(obj: Any) -> bool:
     """Can `obj` carry a weak reference at all?
 
@@ -220,12 +253,38 @@ def _finalizer(registry: CloseRegistry, obj: Any, cid: int) -> weakref.finalize 
 
 
 class CloseProbe:
-    """Turns `socket.socket.close()` into a registry event. Idempotent, fail-silent.
+    """Turns the end of a `socket.socket` into a registry event. Idempotent, fail-silent.
 
-    One patch, on `socket.socket`. `ssl.SSLSocket` inherits `close` (it overrides
-    `_real_close`, not `close`), so the TLS seam's objects arrive here too and a
-    second patch would double-fire. `ssl.SSLObject` is not a socket and has no
-    close of its own; it reaches the registry through the finalizer only.
+    TWO patches, both on `socket.socket`, because `close()` is not reliably the
+    end of anything:
+
+        def close(self):
+            self._closed = True
+            if self._io_refs <= 0:
+                self._real_close()
+
+    `http.client` depends on exactly that. When a response `will_close` — a
+    `Connection: close` header, HTTP/1.0, or a body with no length framing —
+    `getresponse()` calls `sock.close()` the moment the HEADERS are parsed
+    ("this effectively passes the connection to the response"), and the body
+    then arrives through the `makefile()` object that still holds the fd, which
+    is to say through the seams' own patched `recv_into`. Firing at that
+    `close()` retired the connection mid-response: the remaining body landed on
+    a freshly built state, a response with no request ahead of it latches
+    `gate = "ignore"`, and the span was never assembled.
+
+    So the fire happens where the fd actually goes. `_real_close` is the single
+    funnel that both the immediate close and the deferred one (`SocketIO.close`
+    -> `_decref_socketios`) reach, and that `ssl.SSLSocket._real_close` enters
+    through `super()`. The `close` patch stays as the timely path for the
+    ordinary case, and declines while `_io_refs` is outstanding. Both firing is
+    harmless: the registry pops an entry before running it, so the second is a
+    no-op.
+
+    `ssl.SSLSocket` inherits `close` and overrides `_real_close` with a
+    `super()` call, so the TLS seam's objects arrive through these same two
+    patches. `ssl.SSLObject` is not a socket and has neither method; it reaches
+    the registry through the finalizer only.
     """
 
     __slots__ = ("_installed", "_patches", "_registry")
@@ -239,6 +298,12 @@ class CloseProbe:
         if self._installed:
             return
         self._patches.patch(socket.socket, "close", self._mk_close(socket.socket.close))
+        # Private, so it is asked for rather than assumed. Without it the probe
+        # is still correct, only late: a `will_close` connection is then retired
+        # by the finalizer instead of when its fd is released.
+        real_close = getattr(socket.socket, "_real_close", None)
+        if real_close is not None:
+            self._patches.patch(socket.socket, "_real_close", self._mk_real_close(real_close))
         self._installed = True
 
     def uninstall(self) -> None:
@@ -251,9 +316,24 @@ class CloseProbe:
         registry = self._registry
 
         def wrapper(this: Any, *a: Any, **k: Any) -> Any:
-            # BEFORE the real close, so a hook may still read the object it is
-            # about to lose (its fileno, its peer). `fire` guards each hook
-            # itself, so nothing here can stop the host's close from happening.
+            # An outstanding `makefile()` reference means this call ends
+            # nothing — the body of a `will_close` response is still to come
+            # through it. `_real_close` fires when the last one goes.
+            if not getattr(this, "_io_refs", 0):
+                # BEFORE the real close, so a hook may still read what the
+                # object is about to lose (its fileno, its peer). `fire` guards
+                # each hook, so nothing here can stop the host's close.
+                registry.fire(this)
+            return orig(this, *a, **k)
+
+        return wrapper
+
+    def _mk_real_close(self, orig: Any):  # noqa: ANN202
+        registry = self._registry
+
+        def wrapper(this: Any, *a: Any, **k: Any) -> Any:
+            # Still ahead of the fd going back to the kernel, which is what the
+            # fileno-keyed hooks (`_conn_timing`) require of a close event.
             registry.fire(this)
             return orig(this, *a, **k)
 
