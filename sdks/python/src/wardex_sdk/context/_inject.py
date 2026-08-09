@@ -1,7 +1,7 @@
 """Opt-in W3C header injection into HTTP client libraries.
 
 The byte seam stays observe-only forever; this module is the single place
-wardex mutates user traffic, and only when propagate_trace=True. Everything
+wardex mutates user traffic, and only when propagation.enabled is True. Everything
 is fail-silent: a failed patch or header computation must never break the
 user's HTTP call. Patched libraries: httpx (sync+async), requests, aiohttp —
 each is a soft dependency (try-import).
@@ -65,9 +65,9 @@ def _build_inject_headers(host: str) -> dict[str, str]:
         if client is None:
             return {}
         cfg = client.config
-        if not cfg.propagate_trace:
+        if not cfg.propagation.enabled:
             return {}
-        targets = cfg.propagate_targets
+        targets = cfg.propagation.targets
         if targets is not None and not any(fnmatch.fnmatch(host, p) for p in targets):
             return {}
         return get_trace_headers()

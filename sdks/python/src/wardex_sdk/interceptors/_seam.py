@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import sys
 from abc import abstractmethod
+from functools import partial
 from typing import TYPE_CHECKING, Any
 
 from .._enums import (
@@ -47,6 +48,7 @@ from ..semantics import (
     ws_close_name,
 )
 from ._base import InterceptorInterface
+from ._close_hook import install_shared_close_hook, on_close, uninstall_shared_close_hook
 from ._conn_timing import install_shared_timing, uninstall_shared_timing
 from ._trackers import _Txn, _WebSocketTracker
 
@@ -205,6 +207,11 @@ class ByteSeamInterceptor(InterceptorInterface):
         # the shared refcount to zero underneath the OTHER seam and rips
         # `socket.connect` back out from under a live installation.
         self._timing_held = False
+        # The same bookkeeping for the shared close probe, and a SECOND flag for
+        # the same reason: the two probes are refcounted independently, so a
+        # single "did I acquire anything" answer would release one of them on
+        # behalf of a seam that only ever took the other.
+        self._close_hook_held = False
         # Defaults match the core's, so behavior is unchanged until _load_limits
         # resolves an actual config at install() time.
         self._limits: dict[str, int] = CaptureLimits().resolved()
@@ -246,25 +253,40 @@ class ByteSeamInterceptor(InterceptorInterface):
         The flag cannot answer "was anything patched?", because it is only ever
         set once everything was. The things that CAN answer it are the pieces
         themselves, and each is asked separately: `PatchSet.restore_all()` is
-        idempotent and empty until the first `patch()` lands, `_timing_held`
-        records the one acquisition that is refcounted elsewhere and so must not
-        be released twice or unearned, and `_conns` is empty until a byte flows.
+        idempotent and empty until the first `patch()` lands, `_timing_held` and
+        `_close_hook_held` record the two acquisitions that are refcounted
+        elsewhere and so must not be released twice or unearned, and `_conns` is
+        empty until a byte flows.
         Every step is a no-op on a seam that never installed, which is what
         makes this safe to call unconditionally, twice, or on a fresh object.
 
         The WebSocket flush stays: a live WS session holds a span that only
         exists once the session ends, and dropping it at uninstall would be the
         SDK losing data at teardown — the reason `uninstall_all` runs before
-        `client.close()` at all.
+        `client.close()` at all. It is `_retire`'s job now, because teardown and
+        a socket closing are the same question asked at two altitudes.
         """
         self._patches.restore_all()
-        self._release_timing()
+        self._release_probes()
         for st in list(self._conns.values()):
-            if isinstance(st.tracker, _WebSocketTracker):
-                for txn in st.tracker.flush(Limitation.WS_NO_CLOSE):
-                    self._emit_ws(st, txn)
+            self._retire(st, Limitation.WS_NO_CLOSE)
         self._conns.clear()
         self._installed = False
+
+    def _acquire_probes(self) -> None:
+        """Take this seam's references on the two shared, refcounted probes.
+
+        One call so that a seam cannot take the timing probe and forget the
+        close hook: without the second, this seam's per-connection state is
+        evicted only when the socket is COLLECTED, which a pooled connection
+        may never be while the process runs.
+        """
+        self._acquire_timing()
+        self._acquire_close_hook()
+
+    def _release_probes(self) -> None:
+        self._release_timing()
+        self._release_close_hook()
 
     def _acquire_timing(self) -> None:
         """Take this seam's reference on the shared connection-timing probe.
@@ -281,6 +303,17 @@ class ByteSeamInterceptor(InterceptorInterface):
             return
         self._timing_held = False
         uninstall_shared_timing()
+
+    def _acquire_close_hook(self) -> None:
+        """Take this seam's reference on the shared `socket.close` probe."""
+        install_shared_close_hook()
+        self._close_hook_held = True
+
+    def _release_close_hook(self) -> None:
+        if not self._close_hook_held:
+            return
+        self._close_hook_held = False
+        uninstall_shared_close_hook()
 
     # --- Subclass hooks ---
 
@@ -397,12 +430,47 @@ class ByteSeamInterceptor(InterceptorInterface):
             st = _ConnectionState(self._select_tracker(obj), addr, port)
             if len(self._conns) > self._limits["max_connections"]:
                 old_cid = next(iter(self._conns))
-                old_st = self._conns.pop(old_cid)
-                if isinstance(old_st.tracker, _WebSocketTracker):
-                    for txn in old_st.tracker.flush(Limitation.CONNECTION_EVICTED):
-                        self._emit_ws(old_st, txn)
+                self._retire(self._conns.pop(old_cid), Limitation.CONNECTION_EVICTED)
             self._conns[cid] = st
+            # The hook closes over the ID, never over `obj`: an eviction
+            # mechanism that referenced the socket would keep the host's file
+            # descriptor open for as long as this seam is installed, which is a
+            # worse bug than the one it fixes (see `_close_hook`).
+            on_close(obj, partial(self._connection_closed, cid))
         return st
+
+    def _connection_closed(self, cid: int) -> None:
+        """The connection behind `cid` is over: retire its state, keep its data.
+
+        The FIFO cap in `_state` was the only thing that ever removed an entry,
+        and it removes the wrong one — the oldest, which on a long-lived process
+        is the connection still streaming, while the entries of connections that
+        died an hour ago stay. Worse, the entry outliving its socket is what let
+        a recycled `id()` serve a new connection the dead one's tracker and its
+        latched "ignore" verdict.
+
+        Idempotent by construction: the registry fires a hook at most once, and
+        an already-evicted id pops nothing.
+        """
+        st = self._conns.pop(cid, None)
+        if st is not None:
+            self._retire(st, Limitation.WS_NO_CLOSE)
+
+    def _retire(self, st: _ConnectionState, marker: Limitation) -> None:
+        """The single place a connection's state stops existing.
+
+        Three callers — the close hook, the FIFO cap and `uninstall()` — and
+        they differ only in the marker they can honestly claim. The tracker
+        decides what survives its own end: a WebSocket session is a span that
+        exists ONLY at close, so it is emitted here rather than dropped, and
+        every other tracker answers with an empty list after releasing whatever
+        it was holding.
+
+        Runs inside `socket.close()` and inside garbage collection, so it must
+        stay short and must not raise; `_emit_ws` already carries the guard.
+        """
+        for txn in st.tracker.on_connection_close(marker):
+            self._emit_ws(st, txn)
 
     # --- Tracker delegation + span assembly ---
 

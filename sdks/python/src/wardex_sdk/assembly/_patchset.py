@@ -105,7 +105,7 @@ bug that outlives `uninstall()`:
      breaks LIFO (rule 4), welds a wrapper on, and reports it as a supersession
      by a third party that does not exist — while `len()` reads 0, the number
      that means "fully uninstalled". Re-entrant because teardown in this SDK can
-     re-enter through a signal handler (`_lifecycle.py` installs one).
+     re-enter through a signal handler (`_runtime.py` installs one).
 
 Nothing here imports anything above `assembly/` (`tests/test_import_graph.py`
 enforces that), so an interceptor, an adapter and a future second-language

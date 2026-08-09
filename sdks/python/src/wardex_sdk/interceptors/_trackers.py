@@ -39,6 +39,20 @@ def _header_get(headers: object, name: str) -> str | None:
     return None
 
 
+def _max_streams(limits: object | None) -> int:
+    """The per-connection stream bound, for tables sized by a stream.
+
+    Read off the resolved core limits rather than named again here: the Rust
+    parser already bounds its own `streams` map with this number, and the
+    correlation latch beside it holds at most one entry per stream that map
+    opened. Two names for one quantity is how they drift.
+    """
+    cap = getattr(limits, "max_streams", None)
+    if not isinstance(cap, int) or cap <= 0:
+        cap = _wardex_native.limits_defaults()["max_streams"]
+    return max(1, int(cap))
+
+
 def _merge_markers(*groups: tuple[Limitation, ...]) -> tuple[Limitation, ...]:
     """Concatenate limitation markers, keeping first-seen order and dropping
     duplicates. A request and a response that both hit the body cap describe
@@ -236,6 +250,20 @@ class _Http1Tracker:
     def disabled_reason(self) -> str | None:
         return self._resp.disabled_reason() or self._req.disabled_reason()
 
+    def on_connection_close(self, marker: Limitation) -> list[_Txn]:
+        """The connection ended. Nothing here survives it.
+
+        A request whose response never arrived is not a transaction: there is no
+        status, no end, and no ttfb, and a span assembled from the half of it
+        that exists would assert things the seam never observed. So the accrued
+        buffers are released — promptly, rather than whenever the last reference
+        to this tracker happens to go — and the caller gets nothing to emit.
+        """
+        self._req_body = b""
+        self._resp_raw = b""
+        self._resp_marks = []
+        return []
+
 
 class _Http2Tracker:
     """HTTP/2 — native parser + per-stream_id latch (multiplexing correlation)."""
@@ -244,11 +272,23 @@ class _Http2Tracker:
         self._conn = Http2Parser(limits)
         # stream_id -> (active span at request time, whether that span's unit
         # had already closed then, request start ns)
-        # TODO: evict stale entries for streams that closed without a response.
-        # `_mk` pops on every transaction, so the only leak is a stream that ends
-        # without one; closing it needs a connection-close hook the seam does not
-        # expose yet.
+        #
+        # `_mk` pops on every transaction, so the entries that accumulate are
+        # the streams that end WITHOUT one: RST_STREAM, a GOAWAY that strands
+        # everything above `last_stream_id`, a server that stops mid-response.
+        # There is no per-stream close signal to act on — the parser reports
+        # transactions, not stream lifecycles.
+        #
+        # So there are TWO bounds, because one of them cannot be reached
+        # everywhere. `on_connection_close` is the honest one and empties this
+        # table outright — but it is driven by the close hook, and the async TLS
+        # seam's carrier is an `ssl.SSLObject`: no `close()` to patch, and
+        # pinned by asyncio's `SSLProtocol` for the life of a pooled connection,
+        # so it is neither closed nor collected. That is exactly the h2
+        # keep-alive to a model provider this leak was found on. The FIFO cap
+        # below is what holds on that path.
         self._latch: dict[int, tuple[SpanContext | None, bool, int]] = {}
+        self._latch_cap = _max_streams(limits)
 
     def on_request_bytes(self, data: bytes) -> list[_Txn]:
         opened, txns = self._conn.feed(True, data)
@@ -259,6 +299,12 @@ class _Http2Tracker:
         parent_closed = parent_is_closed_unit(parent) if opened else False
         for sid in opened:
             self._latch[sid] = (parent, parent_closed, now)
+        # Drop-oldest, which for h2 is drop-lowest-stream-id: ids only ever
+        # increase, so the entry evicted is the one likeliest to be stranded
+        # already. Losing it costs that stream its parentage, never a span —
+        # `_mk` falls back to (None, False, now).
+        while len(self._latch) > self._latch_cap:
+            self._latch.pop(next(iter(self._latch)))
         # Always call _mk to pop the _latch entry (prevents leaks); status==0
         # (degenerate transaction) is excluded from the result
         out: list[_Txn] = []
@@ -279,6 +325,24 @@ class _Http2Tracker:
             if t.status:
                 out.append(txn)
         return out
+
+    def on_connection_close(self, marker: Limitation) -> list[_Txn]:
+        """Release the per-stream latch — the eviction the entries were waiting for.
+
+        A latch entry is one `SpanContext` plus two scalars, so this is small
+        money per connection and, without the cap in `__init__`, unbounded money
+        over a process: an h2 client that resets a stream per cancelled request
+        accumulates one entry per cancellation for the life of the connection,
+        and a keep-alive h2 connection to a model provider lives as long as the
+        process does. This is the release that costs nothing, where it is
+        reachable; the cap bounds the paths where it is not.
+
+        No transactions come back. A stream that never produced a response
+        produced no status either, and the seam has nothing to say about it that
+        would not be invented.
+        """
+        self._latch.clear()
+        return []
 
     def _mk(self, t: Any) -> _Txn:
         now = time.time_ns()
@@ -397,6 +461,14 @@ class _WebSocketTracker:
         if self._emitted:
             return []
         return [self._build_txn((marker,))]
+
+    #: The connection-close verb every tracker answers to. For a WS session it
+    #: IS `flush`, and an ALIAS rather than a delegating wrapper: this is the one
+    #: tracker with something to save at close — its span exists only once the
+    #: session ends — so the two names must never be able to drift apart.
+    #: Before the close hook, that span waited for `uninstall()` and was lost
+    #: whenever the process never reached one.
+    on_connection_close = flush
 
     def _build_txn(self, extra_markers: tuple[Limitation, ...]) -> _Txn:
         self._emitted = True

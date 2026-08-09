@@ -2,7 +2,7 @@ import asyncio
 
 from wardex_sdk import _hub
 from wardex_sdk._client import Client
-from wardex_sdk._config import WardexConfig
+from wardex_sdk._config import BackendConfig, WardexConfig
 from wardex_sdk._tracing import agent as agent_deco
 from wardex_sdk._tracing import task, tool, trace, workflow
 from wardex_sdk._types import AgentAttributes, InternalEnvelope, ToolAttributes
@@ -20,7 +20,7 @@ class _Recording(Transport):
 def _setup() -> _Recording:
     _hub.reset_for_test()
     t = _Recording()
-    _hub.set_client(Client(WardexConfig(api_key="k"), t))
+    _hub.set_client(Client(WardexConfig(backend=BackendConfig(api_key="k")), t))
     return t
 
 

@@ -30,7 +30,7 @@ from wardex_sdk._client import (
     Client,
     _configured_transport_timeout,
 )
-from wardex_sdk._config import WardexConfig
+from wardex_sdk._config import BackendConfig, BatchingPolicy, WardexConfig
 from wardex_sdk._enums import SpanKind
 from wardex_sdk._types import (
     InternalEnvelope,
@@ -57,7 +57,14 @@ def _span(name="s"):
 
 def _client(transport, **cfg):
     """A client whose only drains are the ones the test asks for."""
-    c = Client(WardexConfig(api_key="k", flush_interval=3600.0, **cfg), transport)
+    c = Client(
+        WardexConfig(
+            **cfg,
+            backend=BackendConfig(api_key="k"),
+            batching=BatchingPolicy(flush_interval=3600.0),
+        ),
+        transport,
+    )
     c._worker.stop()
     return c
 

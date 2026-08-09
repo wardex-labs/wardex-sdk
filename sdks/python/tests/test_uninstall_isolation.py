@@ -14,7 +14,7 @@ ABOVE — the loop over the components. `PatchSet.restore_all()` guards each
 restore so one failure cannot abandon the others; the registry loop that calls
 it used to undo that guarantee wholesale, by letting one raising `uninstall()`
 abandon every component behind it. Worse, both registries run inside
-`_lifecycle._teardown` immediately before `client.close()`, from `atexit` — so
+`Runtime._teardown` immediately before `client.close()`, from `atexit` — so
 the exception went nowhere anyone reads, and took every buffered span with it.
 """
 
@@ -25,9 +25,9 @@ import httpx
 import pytest
 import requests
 
-from wardex_sdk import _hub, _lifecycle
+from wardex_sdk import _hub, _runtime
 from wardex_sdk._client import Client
-from wardex_sdk._config import WardexConfig
+from wardex_sdk._config import BackendConfig, BatchingPolicy, WardexConfig
 from wardex_sdk._enums import SpanKind
 from wardex_sdk._types import InternalEnvelope, InternalSpan, SpanContext, SpanId, TraceId
 from wardex_sdk.adapters._base import AdapterInterface
@@ -294,14 +294,19 @@ def test_teardown_still_closes_the_client_when_an_uninstall_raises():
     from wardex_sdk.interceptors._registry import get_registry as interceptor_registry
 
     transport = _Recording()
-    client = Client(WardexConfig(api_key="k", flush_interval=3600.0), transport)
+    client = Client(
+        WardexConfig(
+            backend=BackendConfig(api_key="k"), batching=BatchingPolicy(flush_interval=3600.0)
+        ),
+        transport,
+    )
     adapter = _CountingAdapter()
     try:
         interceptor_registry().install(_Boom(), client)
         adapter_registry().install(adapter, client)
         client.capture_span(_span())
 
-        _lifecycle._teardown(client)  # must not raise
+        _runtime.runtime()._teardown(client)  # must not raise
 
         assert adapter.uninstalls == 1, "the adapter registry never ran"
         assert client._closed, "the client was never closed"
@@ -311,7 +316,6 @@ def test_teardown_still_closes_the_client_when_an_uninstall_raises():
     finally:
         interceptor_registry().uninstall_all()
         adapter_registry().uninstall_all()
-        _lifecycle._current_client = None
         _hub.reset_for_test()
 
 
@@ -475,22 +479,31 @@ def test_a_half_installed_ssl_seam_leaves_no_wrapper_on_the_hosts_sockets(monkey
 def test_a_rolled_back_seam_does_not_release_a_timing_reference_it_never_took(monkeypatch):
     """Total is not the same as unconditional, and this is where they differ.
 
-    The shared connection-timing probe is REFCOUNTED — both byte seams take a
-    reference and it patches `socket.connect` once. An `uninstall()` made total
-    by simply dropping its installed-flag gate would release a reference the
-    failed `install()` never took: the count falls to zero underneath the seam
-    that is still live and healthy, `socket.connect` is restored out from under
-    it, and every span it emits from then on reports its connect time as
-    unavailable. So the release is keyed on the acquisition itself.
+    Both shared probes are REFCOUNTED — the timing one patches `socket.connect`
+    and the close hook patches `socket.close`, each once, and both byte seams
+    take a reference on each. An `uninstall()` made total by simply dropping its
+    installed-flag gate would release a reference the failed `install()` never
+    took: the count falls to zero underneath the seam that is still live and
+    healthy, the patch is restored out from under it, and every span it emits
+    from then on reports its connect time as unavailable. So the release is
+    keyed on the acquisition itself.
+
+    Both counts are asserted, before and after, and the "before" is not
+    ceremony: a leaked reference leaves wardex's wrapper on a stdlib method for
+    the life of the process, and the only thing that ever notices is an
+    assertion like this one.
     """
     import socket
 
-    from wardex_sdk.interceptors import _conn_timing
+    from wardex_sdk.interceptors import _close_hook, _conn_timing
     from wardex_sdk.interceptors._socket import RawSocketInterceptor
     from wardex_sdk.interceptors._ssl import SSLInterceptor
 
     assert _conn_timing._shared_refcount == 0, (
         "another test left the shared timing probe installed; this one proves nothing"
+    )
+    assert _close_hook._refcount == 0, (
+        "another test left the shared close hook installed; this one proves nothing"
     )
     # `connect` and `send` are INHERITED from `_socket.socket`, so "is wardex's
     # wrapper installed?" is exactly "does the class have an own attribute?" —
@@ -498,6 +511,9 @@ def test_a_rolled_back_seam_does_not_release_a_timing_reference_it_never_took(mo
     # rule 2), never left as a shadow.
     assert "connect" not in socket.socket.__dict__
     assert "send" not in socket.socket.__dict__
+    # `close` is socket.py's OWN method, so absence is not the question there;
+    # identity is.
+    orig_close = socket.socket.close
 
     reg = InterceptorRegistry()
     live = SSLInterceptor()
@@ -524,7 +540,9 @@ def test_a_rolled_back_seam_does_not_release_a_timing_reference_it_never_took(mo
     finally:
         reg.uninstall_all()
         assert _conn_timing._shared_refcount == 0, "a timing reference outlived its seam"
+        assert _close_hook._refcount == 0, "a close-hook reference outlived its seam"
         assert "connect" not in socket.socket.__dict__
+        assert socket.socket.close is orig_close
 
 
 def test_a_rollback_the_host_interrupts_still_drops_the_name_from_the_table():
@@ -625,7 +643,6 @@ def test_a_broken_interceptor_does_not_take_the_whole_intercept_option_down():
     finally:
         _ssl.SSLInterceptor = original
         interceptor_registry().uninstall_all()
-        _lifecycle._current_client = None
         _hub.reset_for_test()
 
 

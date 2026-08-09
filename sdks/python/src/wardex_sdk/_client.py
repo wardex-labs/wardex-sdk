@@ -73,7 +73,7 @@ class _UnnamedTimeout(float):
     Membership of this class, not identity with any one singleton, is what the
     blame question asks (`flush`, `close`). That is deliberate: the two public
     defaults were the first two wardex-chosen budgets, not the only ones. The
-    signal handler's own short bound (`_lifecycle._SIGNAL_FLUSH_TIMEOUT`) is a
+    signal handler's own short bound (`_runtime._SIGNAL_FLUSH_TIMEOUT`) is a
     third, and it arrived as a bare `2.0` -- so `flush(timeout=2.0)` from inside
     wardex was indistinguishable from `flush(2.0)` from the host, and the
     cut-short report accused a host of a number it had no way to pass and no
@@ -193,7 +193,7 @@ def _named_by_caller(timeout: float) -> bool:
 
     Asked of the TYPE rather than of a list of known sentinels. A per-default
     identity check answers "is this the default of the function I am in", which
-    is a narrower question and the wrong one: `_lifecycle`'s signal handler calls
+    is a narrower question and the wrong one: `_runtime`'s signal handler calls
     `flush(2.0)`, a number wardex picked and no host can pass or change, and
     under identity checks that arrived here indistinguishable from a host's own
     `flush(2.0)`. It then produced the exact false accusation this whole area
@@ -401,6 +401,14 @@ class Client:
         # plain Lock would instead hang forever on that same-thread re-acquire.
         # Cross-thread serialization (the invariant these locks exist for) is
         # unchanged: RLock still blocks other threads until fully released.
+        # The signal handler is no longer the ONLY same-thread re-entry. The
+        # byte seams' socket close hook backstops itself with weakref
+        # finalizers, and a WebSocket span is assembled when its connection
+        # ends — so capture_span() can also be re-entered from a finalizer, at
+        # an arbitrary allocation, on whatever thread dropped the last
+        # reference. Same requirement, one more way to arrive at it: everything
+        # capture_span touches must be reentrant (see BatchWorker._spawn_lock,
+        # which had to become an RLock for exactly this).
         self._buffer_lock = threading.RLock()
         # Named for the guarantee it carries, not for the method that takes it:
         # transport.export()/flush() are never entered by two threads at once,
@@ -429,11 +437,12 @@ class Client:
         self._dropped = 0
         self._lost = 0
         self._closed = False
-        # Deliberately NOT reentrant, and safe only because the signal handler
-        # calls flush() and never close(): a signal landing between the three
-        # statements this guards would self-deadlock permanently on re-entry.
-        # Anything that routes close() onto the signal path must make this an
-        # RLock first.
+        # Deliberately NOT reentrant, and safe only because nothing that can
+        # re-enter this thread reaches close(): the signal handler calls
+        # flush(), and a seam's weakref finalizer reaches capture_span (see
+        # _buffer_lock). Either one landing between the three statements this
+        # guards would self-deadlock permanently on re-entry. Anything that
+        # routes close() onto either path must make this an RLock first.
         self._close_lock = threading.Lock()
         limits = config.limits.resolved()
         self._max_buffer_spans = limits["max_buffer_spans"]
@@ -447,7 +456,7 @@ class Client:
         # A deadline exists only where a caller named one: flush(t), close(t),
         # and above all the signal handler's flush(2.0).
         self._worker = BatchWorker(
-            lambda: self._drain(None), interval=config.flush_interval, debug=config.debug
+            lambda: self._drain(None), interval=config.batching.flush_interval, debug=config.debug
         )
         self._worker.start()
 
@@ -728,7 +737,7 @@ class Client:
                 return
             header = EnvelopeHeader(
                 event_id=str(uuid.uuid4()),
-                api_key=self._config.api_key or "",
+                api_key=self._config.backend.api_key or "",
                 sdk=self._sdk_info,
                 sent_at_ns=time.time_ns(),
             )

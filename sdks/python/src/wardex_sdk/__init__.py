@@ -8,9 +8,16 @@ from collections.abc import Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from typing import Any
 
-from . import _hub
+from . import _hub, _runtime
 from ._client import _FOLLOW_TRANSPORT_TIMEOUT, _SHUTDOWN_TIMEOUT, Client
-from ._config import WardexConfig
+from ._config import (
+    BackendConfig,
+    BatchingPolicy,
+    PIIPolicy,
+    PropagationPolicy,
+    RetentionPolicy,
+    WardexConfig,
+)
 from ._enums import (
     AdapterName,
     CaptureMode,
@@ -95,7 +102,13 @@ __all__ = [
     "get_trace_headers",
     "WardexMiddleware",
     "WardexWSGIMiddleware",
+    # Config groups — every one of them is passed to `init()` by name
+    "BackendConfig",
+    "BatchingPolicy",
     "CaptureLimits",
+    "PIIPolicy",
+    "PropagationPolicy",
+    "RetentionPolicy",
     # Enums — importable directly from user code
     "AdapterName",
     "CaptureMode",
@@ -158,39 +171,44 @@ def init(
             file=sys.stderr,
         )
         return
-    resolved_transport = transport or NoOpTransport()
+    # Transport resolution, in precedence order: an explicit `transport=`
+    # carries its own address and wins outright; otherwise a configured
+    # `backend.endpoint` builds the default OTLP/HTTP exporter; otherwise
+    # NoOpTransport. When both are given the endpoint loses, and under `debug`
+    # it says so — a config value that loses a precedence fight in silence is
+    # indistinguishable from one that was honoured.
+    if transport is not None:
+        resolved_transport = transport
+        if config.backend.endpoint and config.debug:
+            print(
+                "[wardex] backend endpoint ignored: transport= carries its own address",
+                file=sys.stderr,
+            )
+    elif config.backend.endpoint:
+        resolved_transport = OtlpHttpTransport(config.backend.endpoint, debug=config.debug)
+    else:
+        resolved_transport = NoOpTransport()
     resolved_transport.set_pii_policy(
-        config.pii_mode.value,
-        tuple(sorted(c.value for c in config.pii_disabled_categories)),
+        config.pii.mode.value,
+        tuple(sorted(c.value for c in config.pii.disabled_categories)),
     )
     # The transport encodes, so the encoder's ceilings are its business too --
     # `max_otlp_attribute_bytes` and `max_otlp_request_bytes` are configured
     # here and enforced there, and a transport that never received them would
     # advertise both knobs and honour neither.
     resolved_transport.set_limits(config.limits.to_native())
-    if config.pii_mode.value == "off" and config.pii_disabled_categories and config.debug:
+    if config.pii.mode.value == "off" and config.pii.disabled_categories and config.debug:
         print(
-            "[wardex] pii_disabled_categories has no effect when pii_mode=OFF",
+            "[wardex] pii disabled_categories has no effect when pii mode is OFF",
             file=sys.stderr,
         )
     client = Client(config, resolved_transport)
-    from . import _lifecycle
-
-    _lifecycle.install(client, config)
-    _hub.set_client(client)
-    from .interceptors import install_configured_interceptors
-
-    install_configured_interceptors(client, config)
-
-    from .adapters import install_configured_adapters
-
-    install_configured_adapters(client, config)
-
-    from .context._inject import install_propagation, uninstall_propagation
-
-    uninstall_propagation()  # re-init: drop patches from a previous init
-    if config.propagate_trace:
-        install_propagation()
+    # One call, because there is one install order and the `Runtime` owns it:
+    # the client slot, atexit, the signal handlers, the interceptor and adapter
+    # registries and the propagation patches, in the order `close()` undoes them
+    # in. Spelling the sequence out here is what let this function and the
+    # teardown paths drift apart about what "installed" means.
+    _runtime.runtime().install(client, config)
 
 
 def set_tag(key: str, value: str) -> None:
@@ -317,28 +335,16 @@ def close(timeout: float = _SHUTDOWN_TIMEOUT) -> None:
     """
     if not NATIVE_OK:
         # `init()` returned before installing anything, so there is nothing to
-        # uninstall and no client to drain. The return has to come before the
-        # imports below rather than after them: `interceptors/` and `adapters/`
-        # still reach the extension at IMPORT time, so a `close()` in a host's
-        # shutdown path -- an atexit hook, a `finally`, a test teardown -- would
-        # raise ImportError out of a teardown that cannot handle it, and the
-        # process would die on the way out instead of on the way in.
+        # uninstall and no client to drain. The return still comes first rather
+        # than being left to the runtime to discover: `adapters/` reaches the
+        # extension at IMPORT time, so a `close()` in a host's shutdown path --
+        # an atexit hook, a `finally`, a test teardown -- would raise ImportError
+        # out of a teardown that cannot handle it, and the process would die on
+        # the way out instead of on the way in.
         return
-    from .interceptors._registry import get_registry
-
-    # Interceptor uninstall flushes (client.capture_span) any pending WS sessions.
-    # This must run before client.close() sets _closed=True, or the WS-close span
-    # would be blocked and lost.
-    get_registry().uninstall_all()
-
-    from .adapters._registry import get_registry as _adapter_registry
-
-    _adapter_registry().uninstall_all()
-
-    from .context._inject import uninstall_propagation
-
-    uninstall_propagation()
-
-    client = _hub.get_client()
-    if client is not None:
-        client.close(timeout)
+    # The uninstall ORDER is the runtime's, not this function's. It used to be
+    # written out here and again in the re-init/atexit path, with the same
+    # order-sensitive reasoning copied onto both -- and the copies could not see
+    # each other's state, so `close()` dropped the propagation patches and the
+    # atexit path did not.
+    _runtime.runtime().teardown(timeout=timeout)

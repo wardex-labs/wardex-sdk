@@ -1,6 +1,6 @@
 """`report_once` may be re-entered on the thread that is already inside it.
 
-The hazard is a signal handler. `_lifecycle` installs one that calls
+The hazard is a signal handler. `_runtime` installs one that calls
 `client.flush(2.0)` on whatever thread the signal interrupts, and the flush
 budget work put a `report_once` on the transport's export path -- so a SIGTERM
 landing inside any of the SDK's `report_once` sites now reaches a handler that

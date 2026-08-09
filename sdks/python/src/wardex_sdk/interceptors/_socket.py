@@ -76,7 +76,7 @@ class RawSocketInterceptor(ByteSeamInterceptor):
         self._patches.patch(sock, "sendall", self._mk_sendall(sock.sendall))
         self._patches.patch(sock, "recv", self._mk_recv(sock.recv))
         self._patches.patch(sock, "recv_into", self._mk_recv_into(sock.recv_into))
-        self._acquire_timing()
+        self._acquire_probes()
         self._installed = True
 
     # `uninstall` is the base's — see `ByteSeamInterceptor.uninstall`.

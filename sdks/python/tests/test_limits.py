@@ -8,6 +8,7 @@ import tracemalloc
 import pytest
 
 from wardex_sdk import CaptureLimits, WardexConfig, _wardex_native
+from wardex_sdk._config import BackendConfig
 from wardex_sdk.assembly import Limitation
 
 
@@ -592,7 +593,12 @@ def _probe_max_connections() -> bool:
     def tracked(limits: CaptureLimits) -> int:
         itc = SSLInterceptor()
         itc._limits = limits.resolved()
-        for sock in [_FakeSock() for _ in range(4)]:
+        # Bound to a name, and it has to be: the seam evicts a connection's
+        # state when its socket DIES (interceptors/_close_hook.py), so a
+        # throwaway list comprehension would be collected the moment the loop
+        # ended and this would count zero live connections under every cap.
+        socks = [_FakeSock() for _ in range(4)]
+        for sock in socks:
             itc._state(sock)
         return len(itc._conns)
 
@@ -1027,7 +1033,8 @@ def test_a_configured_bound_reaches_the_registry_the_adapter_actually_uses():
 
     class _Client:
         config = WardexConfig(
-            api_key="k", limits=CaptureLimits(max_units=7, max_entries_per_unit=3)
+            limits=CaptureLimits(max_units=7, max_entries_per_unit=3),
+            backend=BackendConfig(api_key="k"),
         )
 
         def capture_span(self, span) -> None:

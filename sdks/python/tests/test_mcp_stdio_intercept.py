@@ -350,3 +350,87 @@ def test_init_intercept_survives_an_anyio_whose_import_raises():
 
     assert proc.returncode == 0, f"init(intercept=True) failed on a broken anyio:\n{proc.stderr}"
     assert "OK" in proc.stdout
+
+
+# writes nothing to stdout for a while, then streams junk that is never JSON-RPC
+_STDOUT_ONLY = (
+    "import sys, time\n"
+    "for _ in range(10):\n"
+    "    sys.stdout.write('x' * 40)\n"
+    "    sys.stdout.flush()\n"
+    "    time.sleep(0.01)\n"
+)
+
+# reads the request and dies without answering it — a crashing MCP server
+_DIES_WITHOUT_ANSWERING = "import sys\nsys.stdin.readline()\nsys.exit(1)\n"
+
+
+def _state_of(proc) -> object:
+    """The `_ProcState` the tee closed over.
+
+    Reached through the wrapper's keyword default because that is where it
+    lives: the state is a closure local by design (one per subprocess, owned by
+    nothing global), and the alternative — a registry of live states on the
+    interceptor — is the leak this batch is removing.
+    """
+    return proc.stdin.send.__kwdefaults__["state"]
+
+
+@pytest.mark.asyncio
+async def test_a_subprocess_that_only_streams_stdout_detaches():
+    """The response side of the detach trigger, end to end.
+
+    `_STDOUT_ONLY` writes ONE line to stdin and streams 400 bytes back. The
+    trigger used to count stdin only and was consulted only from the send
+    wrapper, so this subprocess paid the tee, the copy and a JSON-RPC parse
+    attempt on every read for as long as it lived.
+    """
+    wardex.init(intercept=True, limits=CaptureLimits(mcp_sniff_bytes=64))
+    proc = await anyio.open_process([sys.executable, "-c", _STDOUT_ONLY])
+    teed_send, teed_receive = proc.stdin.send, proc.stdout.receive
+
+    await _drain_stdout(proc)
+    await proc.wait()
+
+    assert proc.stdout.receive is not teed_receive, "the response-side tee is still installed"
+    assert proc.stdin.send is not teed_send, "both tees come off together, or neither does"
+
+
+@pytest.mark.asyncio
+async def test_a_server_that_dies_does_not_strand_its_pending_request():
+    wardex.init(intercept=True)
+    proc = await anyio.open_process([sys.executable, "-c", _DIES_WITHOUT_ANSWERING])
+    state = _state_of(proc)
+    await proc.stdin.send(
+        b'{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"t","arguments":{}}}\n'
+    )
+    assert len(state._latch) == 1, "precondition: the request is waiting for a response"
+
+    await _drain_stdout(proc)  # the server exits; stdout reaches EOF
+    await proc.wait()
+
+    assert state._latch == {}, "a dead server's pending requests were never released"
+
+
+@pytest.mark.asyncio
+async def test_a_raw_asyncio_server_that_dies_does_not_strand_its_pending_request():
+    wardex.init(intercept=True)
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-c",
+        _DIES_WITHOUT_ANSWERING,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+    )
+    state = proc.stdin.write.__kwdefaults__["state"]
+    proc.stdin.write(
+        b'{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"t","arguments":{}}}\n'
+    )
+    await proc.stdin.drain()
+    assert len(state._latch) == 1
+
+    while await proc.stdout.readline():  # read to EOF
+        pass
+    await proc.wait()
+
+    assert state._latch == {}

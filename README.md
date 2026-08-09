@@ -32,6 +32,48 @@ wardex.init(
 wardex.close()  # optional — spans auto-flush every 5s, on buffer threshold, and at exit
 ```
 
+## Configuration
+
+Settings are grouped by concern, and the group names are the same in every
+wardex SDK — a Node or Java service configured by the same team reads the same
+way.
+
+| Group | What it decides |
+|---|---|
+| `backend=BackendConfig(...)` | Where the data goes and whose it is: `endpoint`, `api_key` |
+| `retention=RetentionPolicy(...)` | How long a captured payload is kept: `default`, `triggers` |
+| `pii=PIIPolicy(...)` | What leaves the process: `mode`, `disabled_categories` |
+| `batching=BatchingPolicy(...)` | When buffered spans are sent: `flush_interval`, `flush_on_signals` |
+| `limits=CaptureLimits(...)` | How much is captured — see [Resource limits](#resource-limits) |
+| `propagation=PropagationPolicy(...)` | Whether wardex touches outbound traffic: `enabled`, `targets` |
+
+```python
+import wardex_sdk as wardex
+from wardex_sdk import BackendConfig, BatchingPolicy, OtlpHttpTransport, PIIPolicy, PIIMode
+
+wardex.init(
+    transport=OtlpHttpTransport(endpoint="https://<your-collector>/v1/traces"),
+    intercept=True,
+    backend=BackendConfig(api_key="..."),
+    batching=BatchingPolicy(flush_interval=2.0),
+    pii=PIIPolicy(mode=PIIMode.OFF),
+)
+```
+
+Everything that belongs to no group stays top-level: `debug`, `before_send`,
+`capture_mode`, `release`, `environment`, `tags`, `adapters`, and the
+interception trio `intercept` / `intercept_hosts` / `interceptors`.
+
+`BackendConfig(endpoint=...)` without a `transport=` builds the default
+OTLP/HTTP exporter against that address. An explicit `transport=` wins over the
+field — a transport carries its own address — and with neither, `init()`
+installs `NoOpTransport` and captures into nothing.
+
+The flat spelling of a grouped setting (`api_key=...`, `flush_interval=...`)
+is refused with a `TypeError` naming its new home. There is no compatibility
+shim: a config setting that is silently ignored is worse than one that stops
+the program on the line that set it.
+
 ## Status
 
 **Works today**
@@ -46,10 +88,12 @@ wardex.close()  # optional — spans auto-flush every 5s, on buffer threshold, a
 - Manual span decorators: `@workflow` / `@agent` / `@task` / `@tool` / `@span`
 - PII masking on by default: emails, phone numbers, credit cards (Luhn-verified),
   US SSNs, IP addresses, bank routing numbers, IBANs, and API-key/token secrets
-  are masked before anything leaves the process (`pii_mode=PIIMode.OFF` to disable,
-  `pii_disabled_categories={PIICategory.IP_ADDRESS}` for per-category opt-out)
+  are masked before anything leaves the process (`pii=PIIPolicy(mode=PIIMode.OFF)`
+  to disable, `pii=PIIPolicy(disabled_categories={PIICategory.IP_ADDRESS})` for
+  per-category opt-out)
 - Background batching: automatic flush every 5s / on buffer threshold /
-  at exit and on SIGINT/SIGTERM (chained; opt out with `flush_on_signals=False`)
+  at exit and on SIGINT/SIGTERM (chained; opt out with
+  `batching=BatchingPolicy(flush_on_signals=False)`)
 - Shutdown closes agent runs that are still in flight, so an interrupted run
   still exports its span — marked `unit_interrupted` or `adapter_uninstalled`
   — instead of vanishing along with its open tool calls
@@ -87,22 +131,26 @@ Trace context propagation is **opt-in** — a plain `wardex.init(...)` never
 touches your outbound requests or headers. Turn it on with:
 
 ```python
+from wardex_sdk import PropagationPolicy
+
 wardex.init(
     transport=OtlpHttpTransport(endpoint="https://<your-collector>/v1/traces"),
     intercept=True,
-    propagate_trace=True,  # inject W3C headers on outbound calls
-    propagate_targets=[
-        "api.internal.example.com",
-        "*.svc.cluster.local",
-    ],  # optional glob allowlist; default None = all hosts
+    propagation=PropagationPolicy(
+        enabled=True,  # inject W3C headers on outbound calls
+        targets=(
+            "api.internal.example.com",
+            "*.svc.cluster.local",
+        ),  # optional glob allowlist; default None = all hosts
+    ),
 )
 ```
 
-With `propagate_trace=True`, outbound calls made through httpx (sync + async),
+With `propagation=PropagationPolicy(enabled=True)`, outbound calls made through httpx (sync + async),
 requests, or aiohttp get a `traceparent` (and `tracestate`, if one was
 received) header attached automatically, as long as an active trace context
 exists and the request doesn't already carry a `traceparent`. **If
-`propagate_targets` is left unset, the trace ID is sent to every host you
+`propagation.targets` is left unset, the trace ID is sent to every host you
 call — including third-party LLM providers.** Set it to an allowlist of glob
 patterns to scope injection to your own services.
 

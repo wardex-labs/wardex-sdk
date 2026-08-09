@@ -22,7 +22,7 @@ import pytest
 
 import wardex_sdk
 from wardex_sdk import _hub
-from wardex_sdk._config import WardexConfig
+from wardex_sdk._config import BackendConfig, WardexConfig
 from wardex_sdk._enums import CaptureMode
 from wardex_sdk._tracing import span, trace
 from wardex_sdk._types import ToolDefinitionSet
@@ -38,7 +38,7 @@ UNSAMPLED = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-00"
 
 class _FakeClient:
     def __init__(self, mode: CaptureMode = CaptureMode.ALL) -> None:
-        self.config = WardexConfig(api_key="k", capture_mode=mode)
+        self.config = WardexConfig(capture_mode=mode, backend=BackendConfig(api_key="k"))
         self.spans: list = []
         self.snapshots: list = []
 

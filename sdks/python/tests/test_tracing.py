@@ -2,7 +2,7 @@ import pytest
 
 from wardex_sdk import _hub
 from wardex_sdk._client import Client
-from wardex_sdk._config import WardexConfig
+from wardex_sdk._config import BackendConfig, WardexConfig
 from wardex_sdk._enums import OperationName, ProviderName, SpanKind, StatusCode
 from wardex_sdk._tracing import span, trace
 from wardex_sdk._types import GenAIAttributes, InternalEnvelope
@@ -20,7 +20,7 @@ class _Recording(Transport):
 def _setup() -> _Recording:
     _hub.reset_for_test()
     t = _Recording()
-    _hub.set_client(Client(WardexConfig(api_key="k"), t))
+    _hub.set_client(Client(WardexConfig(backend=BackendConfig(api_key="k")), t))
     return t
 
 
@@ -81,7 +81,7 @@ def test_set_attribute_appears_in_console_output(capsys):
     from wardex_sdk import _hub
 
     _hub.reset_for_test()
-    wardex_sdk.init(transport=wardex_sdk.ConsoleTransport(), api_key="k")
+    wardex_sdk.init(transport=wardex_sdk.ConsoleTransport(), backend=BackendConfig(api_key="k"))
     with wardex_sdk.trace("s"):
         with wardex_sdk.span("inner") as sp:
             sp.set_attribute("code.git.head_sha", "a1b2c3d")
@@ -206,7 +206,10 @@ def test_a_bug_in_wardexs_own_span_does_not_silence_the_work_inside_it(monkeypat
 
     def kept(broken: bool) -> bool:
         _hub.reset_for_test()
-        client = Client(WardexConfig(api_key="k", capture_mode=CaptureMode.AGENT), _Recording())
+        client = Client(
+            WardexConfig(capture_mode=CaptureMode.AGENT, backend=BackendConfig(api_key="k")),
+            _Recording(),
+        )
         _hub.set_client(client)
         reset_reports_for_test()
         seam = Seam()

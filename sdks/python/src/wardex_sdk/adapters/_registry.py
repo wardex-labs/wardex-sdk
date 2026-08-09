@@ -118,7 +118,7 @@ class AdapterRegistry:
         """Uninstall every adapter. Total: one failure cannot stop the rest.
 
         Same rule as `InterceptorRegistry.uninstall_all`, and the same reason:
-        this loop runs inside `_lifecycle._teardown`, immediately before
+        this loop runs inside `Runtime._teardown`, immediately before
         `client.close()`. An adapter whose `uninstall()` raised took the close
         with it and every span still in the buffer, left `_installed`
         populated so the next `init()` silently no-ops for that adapter by
@@ -189,8 +189,14 @@ class AdapterRegistry:
         return name in self._installed
 
 
-_registry = AdapterRegistry()
-
-
 def get_registry() -> AdapterRegistry:
-    return _registry
+    """The process registry, which `Runtime` owns and builds on first use.
+
+    Not a module singleton of its own any more, for `InterceptorRegistry.
+    get_registry`'s reason: a registry nobody owns cannot be drained by the one
+    reset, so an adapter left installed by one test silently no-ops the next
+    `install()` of the same name.
+    """
+    from .._runtime import runtime
+
+    return runtime().adapters

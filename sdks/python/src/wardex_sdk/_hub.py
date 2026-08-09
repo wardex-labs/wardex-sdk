@@ -5,40 +5,38 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 
 from ._client import Client
+from ._runtime import runtime
 from ._scope import Scope, merge_scopes
 
 _global_scope: Scope = Scope()
 _current_scope: ContextVar[Scope | None] = ContextVar("wardex_current_scope", default=None)
 _isolation_scope: ContextVar[Scope | None] = ContextVar("wardex_isolation_scope", default=None)
-_client: Client | None = None
 
 
 def reset_for_test() -> None:
     """For test isolation — resets global state.
 
-    Closes any client left over from a prior test first: a Client always owns
-    a live background worker thread, so silently dropping the reference would
-    leak that thread for the rest of the test process instead of actually
-    resetting state. This mirrors the `init()` re-initialization semantics
-    (spec §2: re-init auto-closes the previous client) for this test-only
-    helper.
+    The scopes are this module's own; everything else the SDK installed belongs
+    to the `Runtime`, and `Runtime.reset()` is what undoes it — the client (and
+    with it the background worker thread a dropped reference would leak), the
+    interceptor and adapter registries, the chained signal handlers and the
+    shared connection-timing probe. Resetting through the owner rather than
+    naming the pieces here is the point: this helper used to reset the client
+    alone, so every other state a test installed leaked into the next one.
     """
-    global _global_scope, _client
-    if _client is not None:
-        _client.close()
+    global _global_scope
+    runtime().reset()
     _global_scope = Scope()
     _current_scope.set(None)
     _isolation_scope.set(None)
-    _client = None
 
 
 def set_client(client: Client | None) -> None:
-    global _client
-    _client = client
+    runtime().set_client(client)
 
 
 def get_client() -> Client | None:
-    return _client
+    return runtime().client
 
 
 def get_global_scope() -> Scope:

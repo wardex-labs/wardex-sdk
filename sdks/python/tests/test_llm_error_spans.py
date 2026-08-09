@@ -36,7 +36,7 @@ from types import SimpleNamespace
 import pytest
 
 from wardex_sdk import _hub
-from wardex_sdk._config import WardexConfig
+from wardex_sdk._config import BackendConfig, WardexConfig
 from wardex_sdk._enums import CaptureMode, OperationName, ProviderName, StatusCode
 from wardex_sdk.assembly import Limitation, counters
 from wardex_sdk.interceptors._seam import ByteSeamInterceptor
@@ -68,7 +68,7 @@ COMPLETION = json.dumps(
 
 class _Client:
     def __init__(self, mode: CaptureMode) -> None:
-        self.config = WardexConfig(api_key="k", capture_mode=mode)
+        self.config = WardexConfig(capture_mode=mode, backend=BackendConfig(api_key="k"))
         self.spans: list = []
 
     def capture_span(self, span) -> None:
