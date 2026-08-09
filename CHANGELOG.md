@@ -5,6 +5,160 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- `BackendConfig`, `RetentionPolicy`, `PIIPolicy`, `BatchingPolicy`, and
+  `PropagationPolicy` are exported from `wardex_sdk` and passed to `init()` by
+  name. The group names are shared across wardex SDKs, so a Node or Java
+  service configured by the same team reads the same way.
+- **`init()` without a `transport=` now builds the default OTLP/HTTP exporter
+  from `backend=BackendConfig(endpoint=...)`.** An explicit `transport=` still
+  wins — a `Transport` carries its own address — and under `debug` the losing
+  endpoint is announced on stderr. With neither, `init()` installs
+  `NoOpTransport` as before.
+- **`max_otlp_attribute_bytes` (default 1 MiB)** — caps one OTLP attribute
+  value as it appears **on the wire**, i.e. after binary payloads are rewritten
+  to base64. A value over the bound is truncated and the span says so with an
+  `otlp_attribute_truncated` marker in `wardex.limitations`. This is not a
+  second `max_body_bytes`: that one caps what a parser keeps in raw bytes
+  before encoding, this one caps what a value costs on a wire that measures it
+  afterwards.
+- **`max_otlp_request_bytes` (default 4 MiB)** — caps one OTLP/HTTP request,
+  measured both as the compressed body that goes on the wire and as the message
+  it decompresses to, because receivers check both. The default is gRPC's own
+  receive ceiling, which the OTLP/gRPC receiver inherits and collector HTTP
+  deployments commonly mirror. Raise it if your collector accepts more; a
+  backend that accepts more will simply never see a split.
+- **`OtlpHttpTransport(..., compress=False)`** — sends requests uncompressed,
+  for a proxy or receiver that mishandles `Content-Encoding`. The header moves
+  with the switch, so an uncompressed body is never declared as gzip.
+- **`Transport.set_limits()`** — receives the resolved limits from `init()`,
+  mirroring `set_pii_policy`. Relevant only if you have written a custom
+  transport that encodes; one that overrides neither keeps working unchanged
+  on the core defaults.
+- `interceptors.mcp_stdio.stranded_requests` — a diagnostic counter for MCP
+  stdio requests that were in flight when the server's stdout ended. A server
+  that dies without answering (a crash, a `kill`, an argument it did not like)
+  used to leave those requests latched forever; they are now released and
+  counted. They are deliberately not shipped as error spans: what the seam
+  observed is a pipe closing, not a call failing, and it cannot know whether
+  the server answered on a channel wardex does not read.
+- `wardex_sdk.interceptors` now imports without the native extension present,
+  so shutdown paths that run in degraded mode no longer risk an `ImportError`
+  on the way out.
+
+### Changed
+
+- **BREAKING:** twelve flat `WardexConfig` fields moved into five groups. There
+  is no compatibility shim — the old spelling raises a `TypeError` naming its
+  new home rather than being silently ignored:
+  - `api_key=`, `endpoint=` → `backend=BackendConfig(api_key=..., endpoint=...)`
+  - `default_retention=`, `retention_triggers=` → `retention=RetentionPolicy(default=..., triggers=...)`
+  - `pii_mode=`, `pii_disabled_categories=` → `pii=PIIPolicy(mode=..., disabled_categories=...)`
+  - `flush_interval=`, `flush_on_signals=` → `batching=BatchingPolicy(flush_interval=..., flush_on_signals=...)`
+  - `propagate_trace=`, `propagate_targets=` → `propagation=PropagationPolicy(enabled=..., targets=...)`
+
+  `intercept`, `intercept_hosts`, `interceptors`, `debug`, `before_send`,
+  `capture_mode`, `release`, `environment`, `tags` and `adapters` stay
+  top-level.
+- Each config group validates its own fields, so an invalid policy fails on the
+  line that constructed it instead of at `init()`.
+- **OTLP/HTTP requests are now gzipped by default** (`Content-Encoding: gzip`),
+  the encoding the OTLP/HTTP specification names. Payload-carrying spans are
+  highly compressible — gzip returns the third that the base64 rewrite costs,
+  and more. Compression happens in the Rust core, off the GIL. Use
+  `compress=False` to opt out.
+- **An export larger than `max_otlp_request_bytes` is now split across several
+  POSTs** instead of being sent as one request a receiver rejects whole. The
+  requests share **one** deadline: a batch that happened to split into several
+  chunks cannot multiply the timeout you passed to `flush()` or `close()`.
+- **The export timeout now covers encoding as well as the POST.** `timeout` was
+  always documented as a wall-clock bound on the whole call, but the clock
+  previously started after the encode — which, for a large batch that must be
+  serialized, compressed, split and re-measured, made the real budget "the
+  encode, plus the time you asked for". A tight budget fully spent by encoding
+  now returns undelivered rather than overrunning.
+- **`Content-Encoding` supplied through `headers=` is ignored** (with a
+  debug-mode notice). It describes bytes only the transport knows how it
+  produced, and letting it through shipped a real gzip frame declared as
+  something else — a 400 no retry fixes. Use `compress=False` to send
+  uncompressed.
+- Span losses that were previously visible only in debug mode are now reported
+  once per process on the default settings: a span too large to export even
+  with its payload removed, a split export that ran out of budget partway, and
+  a split export abandoned partway by a failed request.
+- Per-connection seam state and connection-timing slots are now tied to the
+  lifetime of their socket rather than to a size cap. The `max_connections` and
+  connection-timing limits still apply, but they now bound *live* connections
+  instead of accumulated dead ones, so a process that opens many short-lived
+  connections no longer pushes its active ones out of the tables.
+
+### Fixed
+
+- **A new connection could inherit a dead one's capture verdict and never be
+  captured.** Per-connection seam state was keyed by `id()` and destroyed only
+  by a size cap, so it outlived its socket — and CPython hands the same address
+  to the next object of that size. An HTTPS connection landing on the id of a
+  retired Redis one inherited `ignore` and produced no span at all. Connection
+  state is now released when the socket closes, so the address can never be
+  reused while stale state is still attached to it.
+- **Spurious `connect_timing_unavailable` on healthy connections.** Every
+  non-TLS socket in the process (a Redis client, a Postgres pool, a health
+  check) left an entry in the connection-timing table, and the size cap evicted
+  the *oldest* entry — the live TLS connection still streaming a response —
+  while long-dead sockets kept their slots. Timing is now released when its
+  socket closes, and the cap is only a backstop.
+- **Unbounded memory growth on long-lived HTTP/2 connections.** A stream that
+  ended without a response (RST_STREAM, GOAWAY, a server that stops) left a
+  correlation entry behind for the life of the connection, so a keep-alive h2
+  connection to a model provider accumulated one entry per cancelled request
+  for as long as the process ran. The table is now cleared at connection close
+  and additionally bounded by the existing `max_streams` limit, which covers
+  the pooled async-TLS path where no close signal is observable.
+- **WebSocket spans lost at shutdown.** A WebSocket span exists only once its
+  session ends, and it was previously emitted at `uninstall()` — so any process
+  that exited without reaching one lost it. It is now emitted when the
+  connection closes.
+- **A batch inside every configured capture limit could still be rejected whole
+  by an OTLP receiver, losing every span in it.** Because binary payloads are
+  encoded as base64 on the OTLP surface, what left was up to a third larger
+  than what was captured — a batch inside `max_buffer_bytes` (64 MiB) left as
+  ~85 MiB, a body inside `max_body_bytes` (32 MiB) left as ~43 MiB. An OTLP
+  request is accepted or rejected whole, so this was a total export failure at
+  the size boundary, not a partial one. Oversized values are now capped and
+  oversized batches split.
+- **Large exports were rejected even when compression brought the body under
+  the limit's face value.** Payload attributes are base64 text and gzip
+  several-fold, so an export could compress under the cap, pass the only check
+  there was, and still be refused by a receiver enforcing its limit on the
+  decompressed message. Both sizes are now checked.
+- Large exports are also meaningfully faster to encode: compression now runs
+  once per body that will actually be sent rather than once per level of the
+  split, and splitting picks its fan-out from a measurement already taken
+  instead of repeatedly halving and re-encoding the whole batch.
+- **Non-MCP subprocesses were instrumented for their whole life.** The stdio
+  seam's "this is not an MCP server" check counted only bytes written *to* the
+  subprocess and ran only on the write path, so a subprocess that writes little
+  and streams a lot back — a compiler, a log follower, a media encoder — never
+  detached, and paid a buffer copy and a JSON-RPC parse attempt on every read.
+  The check now counts both directions and runs on both paths.
+- **An MCP server observable only on stdout could stop being captured
+  mid-session.** The same check treated "no JSON-RPC seen" as a write-side
+  question, so valid messages parsed on the read side did not count as
+  evidence and the seam detached once the sniff budget was spent. Messages are
+  now counted in both directions.
+- `WardexConfig.from_env()` no longer discards overrides. It previously
+  honoured four field names and dropped everything else it was handed.
+- `WardexConfig.from_env()` no longer loses `WARDEX_API_KEY` when only part of
+  the backend group is overridden. Passing `backend=BackendConfig(endpoint=...)`
+  used to skip both backend environment reads, sending every envelope with an
+  empty project key. Environment values now resolve per field.
+- A normal process exit now removes the trace-propagation patches. `close()`
+  unpatched them but the at-exit path did not, so an exiting process could
+  leave `httpx.Client.send` wrapped after the SDK had shut down.
+- `from wardex_sdk.interceptors import SSLInterceptor` keeps working. The name
+  is resolved on first access instead of at package import.
+
 ## [0.3.0b5] - 2026-08-09
 
 ### Added
