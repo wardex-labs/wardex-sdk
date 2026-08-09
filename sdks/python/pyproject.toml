@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name            = "wardex-sdk"
-version         = "0.3.0b5"
+version         = "0.4.0b1"
 description     = "Open-source observability SDK for AI agents — zero-instrumentation capture, OpenTelemetry-native"
 readme          = "README.md"
 requires-python = ">=3.10"

@@ -5,6 +5,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.0b1] - 2026-08-09
+
 ### Added
 
 - `BackendConfig`, `RetentionPolicy`, `PIIPolicy`, `BatchingPolicy`, and
