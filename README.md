@@ -298,6 +298,18 @@ not arrive.
   split across several POSTs instead of being sent whole and rejected. Raise it
   if your collector accepts more.
 
+  A split is invisible in your traces, but that is the receiver's doing rather
+  than the SDK's: the POSTs carry the same trace id, and a receiver keys spans
+  by it, so what was one batch is stored and shown as one trace. Children
+  routinely arrive in earlier requests than the parent they name — spans leave
+  in completion order, so the root travels last — and a conforming receiver
+  resolves the edge when the parent lands. A span so large it would not fit a
+  request even with its payload removed is the one loss a split cannot absorb:
+  it is dropped, the rest of its batch still goes, and the SDK reports it once
+  on stderr. That loss cannot be marked in `wardex.limitations` the way a
+  truncation is, because the marker would have to ride on the very span that
+  never reaches the wire.
+
 Requests are gzipped by default. `OtlpHttpTransport(..., compress=False)` turns
 that off for a proxy or receiver that mishandles `Content-Encoding`.
 
