@@ -22,6 +22,7 @@ counted (`Limitation.PATCH_SUPERSEDED`).
 from __future__ import annotations
 
 import fnmatch
+import importlib
 import threading
 from collections.abc import Callable
 from typing import Any
@@ -42,7 +43,7 @@ depend on the restore bookkeeping. Cleared together with the set, so the two
 can never disagree about what is installed.
 """
 
-_install_lock = threading.Lock()
+_install_lock = threading.RLock()
 """Serializes install/uninstall, so the idempotence above is real.
 
 `"httpx" in _installed` and `_installed.add("httpx")` sit either side of three
@@ -58,8 +59,38 @@ would not reach that on its own. This lock is here because the guarantee
 belongs to the module that owns the state: `install_propagation()` is reachable
 directly, the runtime's lock is not this module's to rely on, and "safe as long
 as the only caller keeps holding a different lock" is not a property anyone can
-see from here. It is a leaf — nothing under it takes another SDK lock — so it
-adds no ordering to reason about.
+see from here.
+
+REENTRANT, like every other lock this SDK puts on its teardown path, and for
+the reason `_runtime` states there: a signal handler lands on the thread that
+already holds the lock, between any two bytecodes. wardex chains to the
+application's previous SIGINT/SIGTERM handler, so a host handler that calls
+`close()` — an ordinary shutdown handler — re-enters this module on the thread
+sitting inside `install_propagation()`, and a plain `Lock` turns that into a
+permanent hang at Ctrl-C. A finalizer running `close()` from a `__del__` is the
+same shape. Reentry is still not FREE with an RLock, only survivable, which is
+what `_install_generation` is for.
+
+Ordering, since it is not a leaf: `PatchSet.patch()` takes the patch set's own
+RLock beneath this one, and a refused patch bumps the diagnostics counters'
+RLock beneath that. The order is `Runtime._lock -> _install_lock ->
+PatchSet._lock / Counters._lock` and never the reverse. What keeps it acyclic
+is that `_patchset()` reaches the client through `Runtime.client`, the property
+that is deliberately read WITHOUT the runtime lock; giving that property a lock
+would close the cycle.
+"""
+
+_install_generation = 0
+"""Bumped by every uninstall, so an install can tell one ran underneath it.
+
+An RLock stops the deadlock and nothing else: a signal-driven
+`uninstall_propagation()` that lands between two `_install_*` calls acquires
+the lock the outer install holds, restores what is patched so far, and returns
+into an install that then goes on patching for a wardex that has already torn
+itself down. The generation makes that visible — the install reads it once,
+re-reads it after each library, and unwinds instead of finishing. Recoverable
+either way (the next `init()`/`close()` pair unwinds it), but "patched after
+teardown" is a state the host cannot see and should not have to.
 """
 
 
@@ -153,12 +184,19 @@ def _headers_to_add(host: str, has_header: Callable[[str], bool]) -> dict[str, s
     return headers
 
 
-def _install_httpx() -> None:
+def _optional(name: str) -> Any | None:
+    """Import a soft dependency, or None if the host does not have it.
+
+    Called from OUTSIDE `_install_lock` — see `install_propagation`.
+    """
     try:
-        import httpx  # noqa: PLC0415
+        return importlib.import_module(name)
     except ImportError:
-        return
-    if "httpx" in _installed:
+        return None
+
+
+def _install_httpx(httpx: Any | None) -> None:
+    if httpx is None or "httpx" in _installed:
         return
 
     orig_send = httpx.Client.send
@@ -190,12 +228,8 @@ def _install_httpx() -> None:
     _installed.add("httpx")
 
 
-def _install_requests() -> None:
-    try:
-        import requests  # noqa: PLC0415
-    except ImportError:
-        return
-    if "requests" in _installed:
+def _install_requests(requests: Any | None) -> None:
+    if requests is None or "requests" in _installed:
         return
     from urllib.parse import urlparse  # noqa: PLC0415
 
@@ -218,14 +252,12 @@ def _install_requests() -> None:
     _installed.add("requests")
 
 
-def _install_aiohttp() -> None:
-    try:
-        import aiohttp  # noqa: PLC0415
-        from multidict import CIMultiDict  # noqa: PLC0415
-        from yarl import URL  # noqa: PLC0415
-    except ImportError:
+def _install_aiohttp(aiohttp: Any | None, multidict: Any | None, yarl: Any | None) -> None:
+    if aiohttp is None or multidict is None or yarl is None or "aiohttp" in _installed:
         return
-    if "aiohttp" in _installed:
+    CIMultiDict = getattr(multidict, "CIMultiDict", None)
+    URL = getattr(yarl, "URL", None)
+    if CIMultiDict is None or URL is None:
         return
 
     orig_request = aiohttp.ClientSession._request
@@ -265,11 +297,42 @@ def install_propagation() -> None:
 
     Idempotent under concurrency too, not just under repetition — see
     `_install_lock`.
+
+    The soft dependencies are resolved BEFORE the lock is taken. An import runs
+    arbitrary third-party module-level code under CPython's import machinery,
+    and it touches nothing this lock protects, so holding the lock across it
+    only buys a way for `close()` — and the `atexit` hook behind it — to wait
+    out a cold aiohttp import, or to hang for good behind a thread wedged in a
+    slow import hook. Interpreter shutdown is not a good place to discover that.
     """
+    libraries = (
+        (_install_httpx, (_optional("httpx"),)),
+        (_install_requests, (_optional("requests"),)),
+        (_install_aiohttp, (_optional("aiohttp"), _optional("multidict"), _optional("yarl"))),
+    )
     with _install_lock:
-        _install_httpx()
-        _install_requests()
-        _install_aiohttp()
+        generation = _install_generation
+        for install, modules in libraries:
+            install(*modules)
+            if _install_generation != generation:
+                # An uninstall re-entered underneath us — a signal handler, or a
+                # finalizer, calling `close()` on this very thread. It has
+                # already restored everything it could see; what it could not
+                # see is the library we patched after it returned. Unwind that
+                # rather than leave the host patched by a wardex that has run
+                # its teardown, and do not carry on with the rest: the teardown
+                # was the later decision.
+                _restore_locked()
+                return
+
+
+def _restore_locked() -> None:
+    """Undo the patches and drop the bookkeeping. Caller holds `_install_lock`."""
+    global _patches
+    if _patches is not None:
+        _patches.restore_all()
+        _patches = None
+    _installed.clear()
 
 
 def uninstall_propagation() -> None:
@@ -285,9 +348,7 @@ def uninstall_propagation() -> None:
     its bookkeeping — which would leave `_installed` claiming a library that is
     no longer patched, and the next `install_propagation()` skipping it.
     """
-    global _patches
+    global _install_generation
     with _install_lock:
-        if _patches is not None:
-            _patches.restore_all()
-            _patches = None
-        _installed.clear()
+        _install_generation += 1
+        _restore_locked()

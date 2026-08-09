@@ -385,14 +385,14 @@ def test_install_is_serialized_across_threads(monkeypatch):
     release = threading.Event()
     real_install_requests = _inject._install_requests
 
-    def slow_install_requests():
+    def slow_install_requests(module):
         # Only the FIRST caller stalls. A stub that stalled every caller would
         # hold the second thread up by itself and report "serialized" whether
         # the lock existed or not.
         if not inside.is_set():
             inside.set()
             release.wait(timeout=5)
-        real_install_requests()
+        real_install_requests(module)
 
     monkeypatch.setattr(_inject, "_install_requests", slow_install_requests)
     first = threading.Thread(target=install_propagation)
@@ -410,6 +410,52 @@ def test_install_is_serialized_across_threads(monkeypatch):
     assert not first.is_alive() and not second.is_alive()
 
 
+def test_a_close_re_entering_an_install_neither_hangs_nor_outlives_itself(monkeypatch):
+    """A signal handler landing on the thread that is inside the install.
+
+    wardex chains to the application's previous SIGINT/SIGTERM handler, so an
+    ordinary shutdown handler that calls `close()` runs `uninstall_propagation`
+    on the thread already holding the install lock — the same-thread reentry
+    every other lock on this SDK's teardown path is an RLock for. With a plain
+    `Lock` this hangs the process at Ctrl-C, with no way out.
+
+    Re-entered from inside an `_install_*` step rather than by raising a real
+    signal: that is the same stack without asking the test runner for a SIGINT.
+    The lock is swapped for a fresh instance OF THE MODULE'S OWN TYPE so that a
+    regression fails this test instead of stranding the real lock and hanging
+    every test after it.
+
+    The second assertion is the half an RLock does not give on its own. The
+    reentrant teardown is the LATER decision, so the install underneath it must
+    unwind rather than carry on patching for a wardex that has already left.
+    """
+    from wardex_sdk.context import _inject
+
+    _setup(propagation=PropagationPolicy(enabled=True))
+    before = _patched_attributes()
+    monkeypatch.setattr(_inject, "_install_lock", type(_inject._install_lock)())
+    real_install_requests = _inject._install_requests
+
+    def closing_install_requests(module):
+        real_install_requests(module)
+        uninstall_propagation()  # the host's signal handler, on this thread
+
+    monkeypatch.setattr(_inject, "_install_requests", closing_install_requests)
+    done = threading.Event()
+
+    def run():
+        install_propagation()
+        done.set()
+
+    worker = threading.Thread(target=run, daemon=True)
+    worker.start()
+    assert done.wait(timeout=10), "install_propagation deadlocked on a re-entrant close"
+    worker.join(timeout=5)
+    assert not worker.is_alive()
+    assert _patched_attributes() == before
+    assert _inject._installed == set()
+
+
 def test_concurrent_installs_leave_exactly_one_layer():
     """Whatever the interleaving, ONE uninstall must put everything back."""
     _setup(propagation=PropagationPolicy(enabled=True))
@@ -420,11 +466,14 @@ def test_concurrent_installs_leave_exactly_one_layer():
         barrier.wait(timeout=5)
         install_propagation()
 
+    # A thread still running past its join is a patch installed after the
+    # assertions below — the leak this whole file is about, on the thread side.
     threads = [threading.Thread(target=racer) for _ in range(8)]
     for t in threads:
         t.start()
     for t in threads:
         t.join(timeout=5)
+        assert not t.is_alive(), "an installing thread never finished"
     assert all(v is not before[k] for k, v in _patched_attributes().items())
     uninstall_propagation()
     assert _patched_attributes() == before
@@ -437,6 +486,12 @@ def test_concurrent_init_does_not_stack_propagation_patches():
     exotic, and the runtime serializes them — but the property being asserted
     belongs to the injector, so it is asserted against the injector's
     attributes rather than against the runtime's lock.
+
+    Every join is checked, not just waited on. A straggler here is an `init()`
+    that installs its patches AFTER the `close()` below and after the autouse
+    teardown has uninstalled — three libraries left patched by a wardex the
+    module believes has gone, for the rest of the session, with the failure
+    surfacing in some unrelated test much later.
     """
     _hub.reset_for_test()
     before = _patched_attributes()
@@ -451,6 +506,7 @@ def test_concurrent_init_does_not_stack_propagation_patches():
         t.start()
     for t in threads:
         t.join(timeout=10)
+        assert not t.is_alive(), "an init() thread never finished"
     assert all(v is not before[k] for k, v in _patched_attributes().items())
     wardex_sdk.close()
     assert _patched_attributes() == before
@@ -528,6 +584,12 @@ def test_close_under_live_traffic_raises_nothing_into_the_host():
         stop.set()
         for t in threads:
             t.join(timeout=10)
+        stragglers = [t.name for t in threads if t.is_alive()]
+    # Checked, not merely waited on — and outside the `finally`, so a straggler
+    # reports itself rather than replacing whatever the body raised. A hammer
+    # still running would keep issuing requests and appending to `errors` after
+    # the next line has already read it.
+    assert stragglers == []
     assert errors == []
     assert _patched_attributes() == before
 
