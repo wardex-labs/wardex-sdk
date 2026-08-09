@@ -276,3 +276,15 @@ def test_propagate_targets_validated_at_init():
         backend=BackendConfig(api_key="k"),
         propagation=PropagationPolicy(targets=("*.mycorp.com", "api.internal")),
     )
+
+
+def test_propagate_targets_are_folded_once_at_construction():
+    """Hostnames are case-insensitive, so the allowlist is too — and it says so.
+
+    The fold has to happen somewhere; here it happens once, where the user can
+    read it back, rather than on every outbound request the matcher inspects.
+    """
+    assert PropagationPolicy(targets=("*.MyCorp.com", "API.internal")).targets == (
+        "*.mycorp.com",
+        "api.internal",
+    )

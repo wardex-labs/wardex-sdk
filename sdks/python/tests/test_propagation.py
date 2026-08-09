@@ -1,11 +1,13 @@
 """continue_trace / get_traceparent / get_trace_headers."""
 
+import threading
+
 import wardex_sdk
 from wardex_sdk import _hub
 from wardex_sdk._client import Client
 from wardex_sdk._config import BackendConfig, WardexConfig
 from wardex_sdk._tracing import span, trace
-from wardex_sdk._types import InternalEnvelope
+from wardex_sdk._types import InternalEnvelope, SpanContext, SpanId, TraceId
 from wardex_sdk.transport._base import Transport
 
 TP = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
@@ -96,6 +98,78 @@ def test_get_trace_headers_carries_tracestate_opaque():
             headers = wardex_sdk.get_trace_headers()
             assert headers["tracestate"] == TS
             assert headers["traceparent"].split("-")[1] == TP.split("-")[1]
+
+
+def test_both_readers_resolve_the_same_ambient_scope():
+    """`get_traceparent` and `get_trace_headers` answer about ONE scope.
+
+    They used to read different ones — the current scope for the span context,
+    the merged scope for the tracestate — and agreed only because nothing in
+    the SDK writes either field anywhere but the current scope. A host that
+    seeds an isolation scope by hand is outside that accident, and this is what
+    it used to look like: `get_trace_headers()` reporting a header pair that
+    `get_traceparent()` reported as absent.
+    """
+    _setup()
+    ctx = SpanContext(trace_id=TraceId.generate(), span_id=SpanId.generate(), trace_flags=1)
+    with wardex_sdk.isolation_scope() as iso:
+        iso.active_span_context = ctx
+        iso.tracestate = TS
+        headers = wardex_sdk.get_trace_headers()
+        assert wardex_sdk.get_traceparent() == headers["traceparent"]
+        assert headers["traceparent"].split("-")[1] == ctx.trace_id.hex()
+        assert headers["tracestate"] == TS
+
+
+def test_the_readers_survive_a_context_value_that_cannot_be_copied():
+    """`set_context()` takes host objects, so the readers must not copy them.
+
+    Both readers resolve the same ambient context, and the obvious way to do
+    that — materialize the merged scope — deep-copies every layer's `contexts`.
+    A host that had ever parked a lock, a socket or an open file there turned
+    `get_traceparent()`, the documented by-hand escape hatch for gRPC, Kafka
+    and Celery send paths, into a `TypeError` at the send site. The headers are
+    two immutable scalars; nothing in `contexts` is read to build them.
+    """
+    _setup()
+    _hub.get_global_scope().set_context("runtime", {"lock": threading.Lock()})
+    assert wardex_sdk.get_traceparent() is None
+    assert wardex_sdk.get_trace_headers() == {}
+    with trace("root") as root:
+        assert wardex_sdk.get_traceparent().split("-")[1] == root.context.trace_id.hex()
+        assert wardex_sdk.get_trace_headers()["traceparent"] == wardex_sdk.get_traceparent()
+
+
+def test_tracestate_never_rides_without_a_traceparent():
+    """Vendor state with no context to annotate is not a header we emit."""
+    _setup()
+    with wardex_sdk.isolation_scope() as iso:
+        iso.tracestate = TS
+        assert wardex_sdk.get_traceparent() is None
+        assert wardex_sdk.get_trace_headers() == {}
+
+
+def test_inbound_tracestate_with_control_characters_never_enters_the_scope():
+    """A CRLF payload is refused at the edge, not on the way back out.
+
+    An inbound tracestate is copied onto every unit under the request and
+    written back out on outbound calls, so the check belongs where the
+    untrusted value crosses in — otherwise the unvetted string is live in span
+    state for the whole request even if the injector later declines it.
+    """
+    _setup()
+    with wardex_sdk.continue_trace({"traceparent": TP, "tracestate": "dd=s:1\r\nx-injected: 1"}):
+        assert _hub.get_current_scope().tracestate is None
+        assert "tracestate" not in wardex_sdk.get_trace_headers()
+        # the traceparent itself is untouched — one bad header is not two
+        assert wardex_sdk.get_traceparent().split("-")[1] == TP.split("-")[1]
+
+
+def test_inbound_tracestate_is_capped_at_the_spec_ceiling():
+    _setup()
+    over = ",".join(f"v{i}=x" for i in range(40))
+    with wardex_sdk.continue_trace({"traceparent": TP, "tracestate": over}):
+        assert len(wardex_sdk.get_trace_headers()["tracestate"].split(",")) == 32
 
 
 def test_continue_from_otel_adopts_current_otel_span():

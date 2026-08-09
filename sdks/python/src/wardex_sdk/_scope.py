@@ -59,3 +59,36 @@ def merge_scopes(global_: Scope, isolation: Scope, current: Scope) -> Scope:
         if layer.tracestate is not None:
             merged.tracestate = layer.tracestate
     return merged
+
+
+def merged_trace_fields(
+    global_: Scope, isolation: Scope, current: Scope
+) -> tuple[SpanContext | None, str | None]:
+    """The two propagation fields `merge_scopes` would produce, and nothing else.
+
+    Same layers, same last-non-None-wins precedence, deliberately adjacent to
+    `merge_scopes` so that a change to the rule cannot be made in one of them
+    and missed in the other. That adjacency is the whole reason this is not a
+    hand-rolled walk somewhere in `context/`.
+
+    Separate from `merge_scopes` because the W3C header readers need exactly
+    these two immutable scalars, and the full merge cannot hand them over
+    cheaply OR safely. It `copy.deepcopy`s `contexts` once per layer, over
+    dicts the host application filled with objects of its own choosing: that is
+    unbounded work on the outbound path of every request through a patched HTTP
+    client, and it is host code. `deepcopy` raises on a value it cannot copy —
+    a lock, a socket, a file — and runs whatever `__deepcopy__`/`__reduce__` the
+    host defined, and it iterates the process-global scope's dicts, which
+    another thread's `set_tag`/`set_context` can be mutating. `get_traceparent`
+    is documented as the by-hand escape hatch for gRPC, Kafka and Celery send
+    paths; a host that once put a lock in `set_context()` must not discover it
+    there. Reading two scalars can do none of that.
+    """
+    active = global_.active_span_context
+    tracestate = global_.tracestate
+    for layer in (isolation, current):
+        if layer.active_span_context is not None:
+            active = layer.active_span_context
+        if layer.tracestate is not None:
+            tracestate = layer.tracestate
+    return active, tracestate

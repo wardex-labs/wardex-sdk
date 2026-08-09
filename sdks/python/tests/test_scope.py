@@ -1,4 +1,13 @@
-from wardex_sdk._scope import Scope, UserInfo, merge_scopes
+import threading
+
+import pytest
+
+from wardex_sdk._scope import Scope, UserInfo, merge_scopes, merged_trace_fields
+from wardex_sdk._types import SpanContext, SpanId, TraceId
+
+
+def _ctx() -> SpanContext:
+    return SpanContext(trace_id=TraceId.generate(), span_id=SpanId.generate(), trace_flags=1)
 
 
 def test_set_tag_and_clone_isolation():
@@ -29,3 +38,49 @@ def test_merge_user_current_wins():
     cur.set_user(UserInfo(id="c"))
     merged = merge_scopes(g, Scope(), cur)
     assert merged.user is not None and merged.user.id == "c"
+
+
+@pytest.mark.parametrize(
+    "seed",
+    [
+        ("global", "isolation", "current"),
+        ("global", "isolation", None),
+        ("global", None, None),
+        (None, "isolation", "current"),
+        (None, None, "current"),
+        (None, None, None),
+        ("global", None, "current"),
+    ],
+)
+def test_merged_trace_fields_agrees_with_the_full_merge(seed):
+    """The cheap read is only allowed to be cheap, not to be different.
+
+    `merged_trace_fields` restates `merge_scopes`' precedence for the two
+    fields the W3C header readers need, so the two are asked the same question
+    over every arrangement of which layers carry a value.
+    """
+    layers = []
+    for name in seed:
+        s = Scope()
+        if name is not None:
+            s.active_span_context = _ctx()
+            s.tracestate = f"{name}=1"
+        layers.append(s)
+    g, iso, cur = layers
+    merged = merge_scopes(g, iso, cur)
+    assert merged_trace_fields(g, iso, cur) == (merged.active_span_context, merged.tracestate)
+
+
+def test_merged_trace_fields_ignores_contexts_it_cannot_copy():
+    """The reason it exists: `merge_scopes` deep-copies, this must not.
+
+    `set_context()` takes arbitrary host objects, and `deepcopy` raises on the
+    ones that do not copy — a lock, a socket, an open file. The two propagation
+    fields are immutable scalars and are readable regardless.
+    """
+    g = Scope()
+    g.set_context("runtime", {"lock": threading.Lock()})
+    g.active_span_context = _ctx()
+    with pytest.raises(TypeError):
+        merge_scopes(g, Scope(), Scope())
+    assert merged_trace_fields(g, Scope(), Scope()) == (g.active_span_context, None)

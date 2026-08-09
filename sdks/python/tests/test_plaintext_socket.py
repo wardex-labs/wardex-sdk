@@ -11,6 +11,7 @@ import threading
 import wardex_sdk as wardex
 from wardex_sdk import ConsoleTransport, _hub
 from wardex_sdk._enums import CaptureSource, SpanKind
+from wardex_sdk.interceptors._seam import _ConnectionState
 from wardex_sdk.interceptors._socket import RawSocketInterceptor
 
 # The four `socket.socket` methods this seam patches. All four are INHERITED
@@ -187,6 +188,28 @@ def test_allowlist_host_only_matches():
         wardex.close()
         httpd.shutdown()
         httpd.server_close()
+
+
+def test_allowlist_matching_is_case_insensitive():
+    """`intercept_hosts` names hosts, and hostnames are case-insensitive.
+
+    Exercised at `_in_allow` rather than end-to-end because the loopback server
+    above is reached by IP, where there is no case to get wrong. The names do
+    differ on the path that matters: when `getpeername()` fails the seam falls
+    back to the connection's `server_hostname`, which is whatever string the
+    caller handed to connect.
+    """
+    seam = RawSocketInterceptor(intercept_hosts=["MyBox.local", "Other.Local:8443"])
+
+    def state(address: str, port: int) -> _ConnectionState:
+        return _ConnectionState(None, address, port)
+
+    assert seam._in_allow(state("mybox.local", 80)) is True
+    assert seam._in_allow(state("MYBOX.LOCAL", 80)) is True
+    assert seam._in_allow(state("other.local", 8443)) is True
+    assert seam._in_allow(state("other.local", 80)) is False  # port still counts
+    assert seam._in_allow(state("elsewhere.local", 80)) is False
+    assert RawSocketInterceptor()._in_allow(state("mybox.local", 80)) is False
 
 
 def test_plaintext_ws_requires_allowlist():

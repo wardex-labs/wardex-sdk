@@ -6,7 +6,8 @@ from contextvars import ContextVar
 
 from ._client import Client
 from ._runtime import runtime
-from ._scope import Scope, merge_scopes
+from ._scope import Scope, merge_scopes, merged_trace_fields
+from ._types import SpanContext
 
 _global_scope: Scope = Scope()
 _current_scope: ContextVar[Scope | None] = ContextVar("wardex_current_scope", default=None)
@@ -61,6 +62,11 @@ def get_current_scope() -> Scope:
 
 def get_merged_scope() -> Scope:
     return merge_scopes(get_global_scope(), get_isolation_scope(), get_current_scope())
+
+
+def get_merged_trace_fields() -> tuple[SpanContext | None, str | None]:
+    """The merged span context and tracestate, without materializing the merge."""
+    return merged_trace_fields(get_global_scope(), get_isolation_scope(), get_current_scope())
 
 
 @contextmanager

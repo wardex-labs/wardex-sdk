@@ -152,7 +152,13 @@ received) header attached automatically, as long as an active trace context
 exists and the request doesn't already carry a `traceparent`. **If
 `propagation.targets` is left unset, the trace ID is sent to every host you
 call — including third-party LLM providers.** Set it to an allowlist of glob
-patterns to scope injection to your own services.
+patterns to scope injection to your own services; patterns are matched
+case-insensitively, since hostnames are.
+
+wardex only ever *adds* a header you did not write. A `traceparent` you set
+yourself wins whether you set it per request or once as a session default, and
+in that case nothing is injected at all; a `tracestate` you set is left exactly
+as written rather than replaced or duplicated.
 
 ### Joining an inbound trace
 

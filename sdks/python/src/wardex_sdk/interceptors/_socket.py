@@ -56,7 +56,16 @@ class RawSocketInterceptor(ByteSeamInterceptor):
 
     def __init__(self, intercept_hosts: list[str] | None = None) -> None:
         super().__init__()
-        self._allow: set[str] = set(intercept_hosts or ())
+        # Case-folded on the way in, and matched case-folded below. What the
+        # allowlist is compared against is usually a peer IP, where case cannot
+        # differ — but `_peer()` falls back to the connection's
+        # `server_hostname` when `getpeername()` fails, and that string is
+        # whatever the caller passed to connect. A user who wrote `MyBox.local`
+        # in the config and a connection wardex names `mybox.local` are the same
+        # host; hostnames are case-insensitive and an exact-string set said
+        # otherwise. Folding once at construction keeps the per-connection check
+        # the single set lookup it has to be.
+        self._allow: set[str] = {h.lower() for h in intercept_hosts or ()}
 
     def name(self) -> str:
         return "socket"
@@ -161,10 +170,8 @@ class RawSocketInterceptor(ByteSeamInterceptor):
     def _in_allow(self, st: _ConnectionState) -> bool:
         if not self._allow:
             return False
-        return (
-            st.server_address in self._allow
-            or f"{st.server_address}:{st.server_port}" in self._allow
-        )
+        address = st.server_address.lower()
+        return address in self._allow or f"{address}:{st.server_port}" in self._allow
 
     # --- socket.socket wrappers ---
 
