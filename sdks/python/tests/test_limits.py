@@ -172,7 +172,7 @@ def test_python_side_fallback_defaults_match_core():
     from wardex_sdk.assembly import UnitRegistry
     from wardex_sdk.interceptors._conn_timing import ConnTimingStore
     from wardex_sdk.interceptors._mcp_stdio import _ProcState
-    from wardex_sdk.interceptors._trackers import _WebSocketTracker
+    from wardex_sdk.interceptors._trackers import _Http2Tracker, _WebSocketTracker
 
     core = _wardex_native.limits_defaults()
 
@@ -196,6 +196,14 @@ def test_python_side_fallback_defaults_match_core():
     assert tracker._sample_cap == core["ws_sample_bytes"]
 
     assert ConnTimingStore()._cap == core["max_connections"]
+
+    # The h2 correlation latch, whose bound is the one case in this list where
+    # the Python object REUSES a field the Rust parser also enforces rather than
+    # owning it. That is deliberate — the latch holds at most one entry per
+    # stream the parser's own `streams` map opened, so a second name for the
+    # same quantity is the only way the two could ever disagree — and it is
+    # exactly why the effective default has to be pinned to the core here.
+    assert _Http2Tracker()._latch_cap == core["max_streams"]
 
 
 # --- End-to-end plumbing + the OOM regression -------------------------------

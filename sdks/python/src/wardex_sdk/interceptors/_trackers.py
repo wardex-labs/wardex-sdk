@@ -96,6 +96,13 @@ class _Txn:
     #: the response arrives, and re-asking on the response side would orphan it.
     #: See `assembly._units.parent_is_closed_unit`.
     parent_closed: bool = False
+    #: Was the latched parent DISCARDED by the tracker's own bound before this
+    #: transaction arrived to claim it? Only `_Http2Tracker` can answer yes.
+    #: Distinct from `parent is None`, which is the ordinary "nothing was
+    #: ambient" and an honest trace root; this one says a parent was latched and
+    #: wardex threw it away, which is a defect the span has to carry rather than
+    #: a fact about the traffic. See `assembly._parentage.resolve_observed`.
+    parent_evicted: bool = False
     truncated: bool = False
     # Capture-limitation markers the protocol parser attached to this
     # transaction, merged into the span's CaptureIntegrity.limitations by the
@@ -289,6 +296,27 @@ class _Http2Tracker:
         # below is what holds on that path.
         self._latch: dict[int, tuple[SpanContext | None, bool, int]] = {}
         self._latch_cap = _max_streams(limits)
+        #: The highest stream id the cap has evicted, and the whole memory of
+        #: eviction this tracker keeps. One integer rather than a set of dropped
+        #: ids, because a set is the same unbounded table again under a
+        #: different name — and it is exact for the policy above: entries are
+        #: inserted in increasing id order and dropped lowest-first, so the ids
+        #: evicted are precisely the ones latched at or below this mark.
+        #:
+        #: What it buys is in `_mk`. An evicted entry that no transaction ever
+        #: claims cost nothing and is worth saying nothing about; one that a
+        #: LATE response then claims would otherwise ship as a clean trace root
+        #: at confidence 1.0, which is a span asserting the host issued this
+        #: request outside any agent work when wardex simply lost the parent.
+        #:
+        #: The one imprecision, stated rather than hidden: a transaction for a
+        #: stream this tracker never saw opened (capture that began
+        #: mid-connection) and whose id falls below the mark is reported as
+        #: evicted. Reaching that needs a connection that has already stranded
+        #: more than `_latch_cap` streams, and the claim it makes there —
+        #: wardex does not know this span's parent and is not calling it a root
+        #: — is still the true one.
+        self._latch_evicted_below = 0
 
     def on_request_bytes(self, data: bytes) -> list[_Txn]:
         opened, txns = self._conn.feed(True, data)
@@ -302,9 +330,11 @@ class _Http2Tracker:
         # Drop-oldest, which for h2 is drop-lowest-stream-id: ids only ever
         # increase, so the entry evicted is the one likeliest to be stranded
         # already. Losing it costs that stream its parentage, never a span —
-        # `_mk` falls back to (None, False, now).
+        # `_mk` falls back to (None, False, now) and says so on the span.
         while len(self._latch) > self._latch_cap:
-            self._latch.pop(next(iter(self._latch)))
+            evicted = next(iter(self._latch))
+            self._latch.pop(evicted)
+            self._latch_evicted_below = max(self._latch_evicted_below, evicted)
         # Always call _mk to pop the _latch entry (prevents leaks); status==0
         # (degenerate transaction) is excluded from the result
         out: list[_Txn] = []
@@ -346,7 +376,39 @@ class _Http2Tracker:
 
     def _mk(self, t: Any) -> _Txn:
         now = time.time_ns()
-        parent, parent_closed, start = self._latch.pop(t.stream_id, (None, False, now))
+        entry = self._latch.pop(t.stream_id, None)
+        if entry is None:
+            parent, parent_closed, start = None, False, now
+            # The DECISION the cap owes the span. An absent latch entry has two
+            # causes that look identical here and mean opposite things: nothing
+            # was ambient when the request went out (an honest trace root, and
+            # under `capture_mode=AGENT` the gate has usually dropped it long
+            # before this line), or a parent WAS latched and the cap discarded
+            # it. Shipping the second as the first is the one degradation a
+            # consumer cannot detect downstream — same edge, same confidence,
+            # no marker — so the bound reports itself, exactly as the unit
+            # registry's does when it closes a root at `max_units`.
+            #
+            # A separate `Limitation` member was the alternative and is refused:
+            # the vocabulary is closed on the wire, and what a user would read
+            # off a new one — "wardex dropped what belongs on this span" —
+            # `PARENT_UNRESOLVED` plus `INSTRUMENTATION_DEGRADED` already say,
+            # from the site that owns the edge. `resolve_observed` attaches
+            # them; this only reports the fact.
+            #
+            # It reports the EVICTION and not "a parent was lost", because the
+            # two are not separable from here: what the entry held went with it.
+            # That is also why the claim is never an over-reach on a stream that
+            # had no parent to lose — every entry carries the REQUEST START
+            # INSTANT as well, so `start` below is a fabrication on this path
+            # regardless, the span's duration is near-zero and its start is the
+            # response instant. Something that belongs on this span is missing
+            # in every case, which is the whole content of the marker; a second
+            # marker for the clock half would split one fact across two words.
+            parent_evicted = t.stream_id <= self._latch_evicted_below
+        else:
+            parent, parent_closed, start = entry
+            parent_evicted = False
         return _Txn(
             method=t.method or "?",
             path=t.path or "/",
@@ -355,6 +417,7 @@ class _Http2Tracker:
             response_body=t.response_body,
             parent=parent,
             parent_closed=parent_closed,
+            parent_evicted=parent_evicted,
             start_ns=start,
             end_ns=now,
             ttfb_ms=0.0,  # per-h2-stream first-byte not tracked (limitation)

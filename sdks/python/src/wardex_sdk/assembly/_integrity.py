@@ -143,6 +143,14 @@ Two emit sites, and the first is the mechanism the second restates.
     ``__init__.py``'s ``capture_state_snapshot`` passes
     ``ParentSource.UNRESOLVED`` for a snapshot taken outside any span and names
     no member itself, leaving the ``_MARKER`` table to do it.
+
+    A byte-seam span reaches it the same way, through
+    ``resolve_observed``'s ``_ORPHANED_BY_WARDEX`` evidence, in three cases: the
+    latched parent's unit had already closed, the request was issued inside a
+    span wardex failed to open, and the latched parent was discarded by the h2
+    stream latch's own cap. The last two arrive carrying
+    ``INSTRUMENTATION_DEGRADED`` as well, which is what separates "wardex lost
+    the parent" from "the parent was never there".
     """
 
     UNIT_INFERRED_SOLE = "unit_inferred_sole"
@@ -341,15 +349,25 @@ Two emit sites, and the first is the mechanism the second restates.
     a subtree missing because an adapter threw looks exactly like a subtree that
     never ran.
 
-    Emitted from ``adapters/_context.py`` alone: on a unit whose open or
-    description failed, on one whose activation failed, and on the ENCLOSING
-    unit when the span itself will not ship. BEST EFFORT by contract, and the
-    contract is what matters here — the span that would carry it is sometimes
-    the very one that could not be built, so it lands on the enclosing unit
-    instead, and where there is no enclosing unit it cannot land at all. A
-    registry fault wide enough to reach the enclosing unit takes the marker with
-    it. What always survives is the line the same failure prints to stderr,
-    which touches nothing that can itself be broken.
+    Emitted from ``adapters/_context.py``: on a unit whose open or description
+    failed, on one whose activation failed, and on the ENCLOSING unit when the
+    span itself will not ship. BEST EFFORT by contract, and the contract is what
+    matters here — the span that would carry it is sometimes the very one that
+    could not be built, so it lands on the enclosing unit instead, and where
+    there is no enclosing unit it cannot land at all. A registry fault wide
+    enough to reach the enclosing unit takes the marker with it. What always
+    survives is the line the same failure prints to stderr, which touches
+    nothing that can itself be broken.
+
+    And from ``assembly/_parentage.py::resolve_observed``, which is the same
+    sentence said about an EDGE rather than about a unit: a byte-seam span whose
+    parent wardex owed it and does not have. Two conditions reach that branch —
+    a request issued inside a ``degraded_run`` (a span wardex failed to open, so
+    nothing was ambient to latch) and one whose latched parent wardex itself
+    discarded to stay inside a bound (``interceptors/_trackers.py``, the h2
+    stream latch at ``max_streams``). It travels with ``PARENT_UNRESOLVED``,
+    which ``_MARKER`` attaches from the ``UNRESOLVED`` source; this one is what
+    stops the pair reading as "the host has an untraced caller".
 
     Deliberately not ``CONTEXT_PROPAGATION_DEGRADED``, which is declared as a
     property of the RUNTIME — work whose carrier legitimately could not inherit

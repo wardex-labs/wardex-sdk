@@ -280,6 +280,21 @@ def _h2_request(stream_id: int) -> bytes:
     return _frame(0x1, 0x4 | 0x1, stream_id, block)  # END_HEADERS | END_STREAM
 
 
+def _h2_open(enc: Encoder, stream_id: int) -> bytes:
+    """`_h2_request` off a caller-held encoder, for the tests that answer it later.
+
+    The flags are the same and have to be: the parser reports a stream as opened
+    when its REQUEST half ends, so a HEADERS frame without END_STREAM latches
+    nothing and there would be no entry for the cap to evict.
+    """
+    block = enc.encode([(b":method", b"POST"), (b":path", b"/v1/messages")])
+    return _frame(0x1, 0x4 | 0x1, stream_id, block)  # END_HEADERS | END_STREAM
+
+
+def _h2_answer(enc: Encoder, stream_id: int) -> bytes:
+    return _frame(0x1, 0x4 | 0x1, stream_id, enc.encode([(b":status", b"200")]))
+
+
 def test_an_h2_stream_that_never_answers_loses_its_latch_entry_at_close(
     fake_ssl_socket, bare_ssl_interceptor
 ):
@@ -318,6 +333,89 @@ def test_the_h2_latch_is_capped_for_a_connection_that_never_closes():
 
     assert len(tracker._latch) == 8
     assert max(tracker._latch) == 399, "the cap evicted the newest instead of the oldest"
+
+
+def test_a_stream_answered_after_its_latch_entry_was_dropped_says_so():
+    """The cap's decision, and what the span has to admit because of it.
+
+    An absent latch entry has two causes that are identical at the pop and mean
+    opposite things: nothing was ambient when the request went out (an honest
+    trace root), or the cap discarded what was. Only the tracker can tell them
+    apart, and only while it still remembers how far the eviction reached.
+    """
+    tracker = _Http2Tracker(CaptureLimits(max_streams=2).to_native())
+    client_enc, server_enc = Encoder(), Encoder()
+    for sid in (1, 3, 5):
+        tracker.on_request_bytes(_h2_open(client_enc, sid))
+    assert set(tracker._latch) == {3, 5}, "precondition: the cap dropped stream 1"
+
+    (kept,) = tracker.on_response_bytes(_h2_answer(server_enc, 5))
+    assert kept.parent_evicted is False, "a stream that kept its entry is not degraded"
+
+    (late,) = tracker.on_response_bytes(_h2_answer(server_enc, 1))
+    assert late.parent_evicted is True
+
+
+def test_an_unlatched_stream_above_the_eviction_mark_is_not_blamed_on_the_cap():
+    """The other half of the same decision, and the one that keeps the marker
+    worth reading: a stream whose entry the cap never touched must not be
+    reported as degraded just because it has no entry. Here nothing has been
+    evicted at all, so an answer for a stream this tracker never saw opened —
+    capture that began mid-connection — is an ordinary unparented transaction.
+    """
+    tracker = _Http2Tracker(CaptureLimits(max_streams=8).to_native())
+    (txn,) = tracker.on_response_bytes(_h2_answer(Encoder(), 7))
+    assert txn.parent_evicted is False
+
+
+def test_a_dropped_latch_entry_reaches_the_span_as_wardexs_own_fault():
+    """End to end, because the decision is only worth making if it ships.
+
+    Two things had to happen for it to. The edge is `UNRESOLVED` rather than a
+    trace root, so a consumer cannot mistake the span for one the host issued
+    outside any agent work — and it carries `INSTRUMENTATION_DEGRADED`, which is
+    what says the missing parent is wardex's doing rather than the traffic's.
+    The AGENT-mode gate had to let it through as well: it reads an absent parent
+    as "not agent work", so without the same signal the span would be dropped
+    before anything could explain itself, which is the silent failure the cap
+    would otherwise have introduced.
+    """
+    from conftest import _FakeSSLSocket
+    from wardex_sdk.assembly import ParentSource
+    from wardex_sdk.interceptors._ssl import SSLInterceptor
+
+    class _Client:
+        class _Config:
+            debug = False
+            # No `capture_mode`, so the policy resolves the declared default,
+            # AGENT — the mode this traffic has to survive.
+            limits = CaptureLimits(max_streams=2)
+
+        def __init__(self) -> None:
+            self.config = self._Config()
+            self.spans: list = []
+
+        def capture_span(self, span) -> None:
+            self.spans.append(span)
+
+    client = _Client()
+    itc = SSLInterceptor()
+    itc._client = client
+    itc._load_limits(client)
+
+    sock = _FakeSSLSocket("h2")
+    sock.server_hostname = "api.anthropic.com"
+    client_enc, server_enc = Encoder(), Encoder()
+    for sid in (1, 3, 5):
+        itc._on_request_bytes(sock, _h2_open(client_enc, sid))
+    itc._on_response_bytes(sock, _h2_answer(server_enc, 1))
+
+    assert len(client.spans) == 1, "the gate dropped the span the cap had degraded"
+    integrity = client.spans[0].capture_integrity
+    assert Limitation.PARENT_UNRESOLVED in integrity.limitations
+    assert Limitation.INSTRUMENTATION_DEGRADED in integrity.limitations
+    assert client.spans[0].correlation.strategy is ParentSource.UNRESOLVED
+    assert client.spans[0].parent_span_id is None
 
 
 def test_a_state_rebuilt_on_a_live_socket_does_not_stack_retirement_hooks(

@@ -362,8 +362,10 @@ def in_degraded_run() -> bool:
     return _degraded_run.get()
 
 
-def resolve_observed(ambient: Ambient, *, parent_closed: bool = False) -> Parentage:
-    """`resolve_parentage` for an OBSERVED byte seam, which has two extra cases.
+def resolve_observed(
+    ambient: Ambient, *, parent_closed: bool = False, parent_evicted: bool = False
+) -> Parentage:
+    """`resolve_parentage` for an OBSERVED byte seam, which has three extra cases.
 
     A seam latches whatever the host's carrier held. With nothing there the edge
     is an honest TRACE ROOT: the host issued this request outside any agent
@@ -399,10 +401,31 @@ def resolve_observed(ambient: Ambient, *, parent_closed: bool = False) -> Parent
     either: nothing failed to open. What it must NOT do is keep the parent — an
     already-shipped span adopting later, unrelated traffic at confidence 1.0
     with no marker is the one shape no consumer can detect downstream.
+
+    `parent_evicted` is the third and it is the FIRST case above, reached by a
+    different road: the seam latched a parent and then threw it away itself, to
+    stay inside a bound of its own (`interceptors/_trackers.py`, the h2 stream
+    latch). So it earns the same pair of markers as a failed open, for the same
+    reason — the parent existed, wardex lost it, and the alternative is a span
+    that ships as a legitimate trace root at confidence 1.0. It shares the
+    branch rather than adding one beside it because there is nothing to tell
+    apart downstream: "wardex dropped what belongs on this span" is the whole
+    content of both, and the knob a user reaches for is different only in that
+    one of them has a knob at all.
+
+    It is not an over-reach on a stream that had no parent to lose. The dropped
+    record held the request instant too, so the span's own start and duration
+    are invented on this path whether or not a parent was in it — the pair says
+    "wardex lost bookkeeping that belongs here", which is true in both cases,
+    and the alternative is a span that looks measured and rooted and is neither.
+
+    A caller that passes `parent_evicted=True` must NOT also hand over the
+    ambient it could not resolve — the eviction means there is none, and the
+    empty carrier is what the first case already refuses to embellish.
     """
     if parent_closed:
         return resolve_parentage(EMPTY_AMBIENT, _ORPHANED_BY_WARDEX)
-    if ambient.span_context is None and in_degraded_run():
+    if parent_evicted or (ambient.span_context is None and in_degraded_run()):
         return resolve_parentage(ambient, _ORPHANED_BY_WARDEX).with_limitation(
             Limitation.INSTRUMENTATION_DEGRADED
         )
