@@ -156,7 +156,19 @@ class McpToolCatalog:
         # From the CORE, never a Python literal — same rule as every other bound.
         resolved = CaptureLimits().resolved()
         self._max = max_entries if max_entries is not None else resolved["max_entries_per_unit"]
-        self._lock = threading.Lock()
+        # Reentrant, and for the reason `_diag._REPORT_LOCK` was made reentrant
+        # rather than argued safe: the alternative is a claim about which
+        # callers can arrive here, and such a claim holds only until the next
+        # caller is added. Today no finalizer-borne path reaches this table —
+        # the seams' close hooks end at `Client.capture_span` — but every block
+        # this lock guards ALLOCATES while holding it (`ServerHandle(name)`, a
+        # list append, a `sanitize()` result), and an allocation is exactly
+        # where CPython runs a weakref callback. So the one thing standing
+        # between this and a permanent self-deadlock in the host's own
+        # `create_sdk_mcp_server()` call is a call-graph fact nobody re-checks.
+        # Reentrancy makes the property local to the lock instead, and it costs
+        # nothing here: registration is per-server, not per-span.
+        self._lock = threading.RLock()
         self._handles: list[ServerHandle] = []
 
     def handle_for(self, name: str, existing: ServerHandle | None = None) -> ServerHandle:
