@@ -401,6 +401,14 @@ class Client:
         # plain Lock would instead hang forever on that same-thread re-acquire.
         # Cross-thread serialization (the invariant these locks exist for) is
         # unchanged: RLock still blocks other threads until fully released.
+        # The signal handler is no longer the ONLY same-thread re-entry. The
+        # byte seams' socket close hook backstops itself with weakref
+        # finalizers, and a WebSocket span is assembled when its connection
+        # ends — so capture_span() can also be re-entered from a finalizer, at
+        # an arbitrary allocation, on whatever thread dropped the last
+        # reference. Same requirement, one more way to arrive at it: everything
+        # capture_span touches must be reentrant (see BatchWorker._spawn_lock,
+        # which had to become an RLock for exactly this).
         self._buffer_lock = threading.RLock()
         # Named for the guarantee it carries, not for the method that takes it:
         # transport.export()/flush() are never entered by two threads at once,
@@ -429,11 +437,12 @@ class Client:
         self._dropped = 0
         self._lost = 0
         self._closed = False
-        # Deliberately NOT reentrant, and safe only because the signal handler
-        # calls flush() and never close(): a signal landing between the three
-        # statements this guards would self-deadlock permanently on re-entry.
-        # Anything that routes close() onto the signal path must make this an
-        # RLock first.
+        # Deliberately NOT reentrant, and safe only because nothing that can
+        # re-enter this thread reaches close(): the signal handler calls
+        # flush(), and a seam's weakref finalizer reaches capture_span (see
+        # _buffer_lock). Either one landing between the three statements this
+        # guards would self-deadlock permanently on re-entry. Anything that
+        # routes close() onto either path must make this an RLock first.
         self._close_lock = threading.Lock()
         limits = config.limits.resolved()
         self._max_buffer_spans = limits["max_buffer_spans"]

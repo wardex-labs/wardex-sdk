@@ -126,3 +126,57 @@ def test_start_twice_keeps_single_thread():
         assert sum(1 for t in threading.enumerate() if t.name == "wardex-batch-worker") == 1
     finally:
         w.stop()
+
+
+def test_a_respawn_reentered_mid_allocation_neither_deadlocks_nor_doubles(monkeypatch):
+    """The spawn lock has a second same-thread re-entry now, and it is not a signal.
+
+    `capture_span` calls `ensure_alive()`, and the byte seams' close hook
+    backstops itself with `weakref.finalize` — so a WebSocket span can be
+    shipped from a finalizer, which CPython runs at an ARBITRARY allocation on
+    whatever thread dropped the last reference. Including this thread, inside
+    `_spawn_locked`, while it is allocating the replacement worker.
+
+    Two ways for that to end badly and both are asserted: a plain `Lock` is a
+    permanent self-deadlock in the host's own code, and a bare `RLock` lets the
+    re-entering call spawn a SECOND worker and orphan the outer frame's.
+    """
+    spawned: list[threading.Thread] = []
+    reentered: list[bool] = []
+    w = BatchWorker(lambda: None, interval=3600.0)
+    w.start()
+    outer = w._thread
+    real_thread = threading.Thread
+
+    def hijacked(*args, **kwargs):
+        # Stands in for the finalizer: it lands at this allocation, on this
+        # thread, with `_spawn_lock` already held by the frame below.
+        if not reentered:
+            reentered.append(True)
+            w.ensure_alive()
+        t = real_thread(*args, **kwargs)
+        spawned.append(t)
+        return t
+
+    try:
+        w._thread_for_pid = -1  # what a fork looks like to ensure_alive
+        monkeypatch.setattr(threading, "Thread", hijacked)
+
+        finished = threading.Event()
+        caller = real_thread(target=lambda: (w.ensure_alive(), finished.set()), daemon=True)
+        caller.start()
+        assert finished.wait(10.0), "ensure_alive self-deadlocked on its own spawn lock"
+
+        assert reentered == [True], "precondition: the reentrant call never happened"
+        assert len(spawned) == 1, "the reentrant call spawned a worker of its own"
+        assert w._thread is spawned[0]
+    finally:
+        monkeypatch.undo()
+        # NOT `w.stop()`: it takes the same spawn lock, so a regression here
+        # would hang the suite instead of failing this test. The loop reads
+        # both of these without one.
+        w._stopped = True
+        w._wake.set()
+        outer.join(5.0)
+        for t in spawned:
+            t.join(5.0)
