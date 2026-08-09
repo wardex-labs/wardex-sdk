@@ -5,6 +5,141 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **An end-of-connection signal for pooled async TLS connections.** wardex now
+  patches asyncio's `SSLProtocol.connection_lost` in addition to
+  `socket.close`/`_real_close`, which is the only moment a pooled
+  `ssl.SSLObject` has: it has no `close()` to observe, and asyncio pins it to
+  the protocol for the transport's whole life, so per-connection capture state
+  for a keep-alive connection to a model provider used to be released only
+  whenever the garbage collector happened to reach it. This is best effort, not
+  a guarantee — an event loop that implements TLS itself rather than through
+  `asyncio.sslproto` (uvloop), and a protocol subclass that overrides
+  `connection_lost` without calling up, both fall back to the finalizer and the
+  per-connection caps, which is late but never wrong. Nothing new is held or
+  exported; the patch is installed and removed with the rest of the close hook.
+- Trace propagation now has a single documented header rule across every
+  patched HTTP client (httpx, requests, aiohttp): wardex only ever *adds* a
+  header you did not write, and never replaces or duplicates one.
+- Inbound `tracestate` headers are vetted at the edge where they arrive:
+  values outside printable US-ASCII are dropped, and lists longer than the 32
+  members the W3C specification allows are truncated from the right so the
+  most recent writers survive.
+- Documented what a split OTLP export looks like from your traces. When a
+  batch exceeds `max_otlp_request_bytes` it leaves as several POSTs, and the
+  README now states why that is still one trace on the other side: the
+  requests carry the same trace id and the receiver keys spans by it. Children
+  routinely arrive in earlier requests than the parent they name — spans leave
+  in completion order, so the root travels last — and a conforming receiver
+  resolves the edge when the parent lands.
+- Documented the one loss a split cannot absorb: a span too large to fit a
+  request even with its payload removed is dropped, the rest of its batch is
+  still sent, and the SDK says so on stderr — once per process, at the first
+  occurrence, with a count scoped to that batch. This loss cannot appear as a
+  `wardex.limitations` marker because the marker would have to ride on the
+  span that never reaches the wire.
+- An opt-in end-to-end check, `sdks/python/tests/e2e_split_export_phoenix.py`,
+  that exports a deliberately over-cap batch through a recording proxy to a
+  live OTLP receiver and asserts the reassembly at the receiver: every span
+  present, one trace id, parent edges intact across request boundaries, gzip
+  accepted as sent, and the oversized-span drop leaving the rest of its batch
+  untouched. It requires Docker and an explicit `WARDEX_E2E_PHOENIX` opt-in,
+  and its filename is outside pytest's collection patterns, so no suite or CI
+  job depends on it.
+
+### Changed
+
+- **The MCP tool catalogue's internal lock is now reentrant**, which makes
+  every lock in the SDK reentrant except one deliberate, documented holdout.
+  Since the socket close hook landed, SDK code can be re-entered from a
+  weakref finalizer, and CPython runs those wherever a reference count reaches
+  zero — on any thread, at a line your application did not write. A
+  non-reentrant lock on such a path is a permanent self-deadlock in the host,
+  so reentrancy is now the default rather than a per-caller argument. No API
+  or behaviour change; the lock is taken per MCP server registration and per
+  hook lookup, far below span rate.
+- **An HTTP/2 span whose parent wardex itself dropped now says so.** The
+  stream correlation latch is capped at `max_streams` so one long-lived h2
+  connection cannot accumulate an entry per cancelled stream. A response that
+  arrives after its entry was evicted used to ship as a clean trace root at
+  confidence 1.0 — indistinguishable from a request the host genuinely issued
+  outside any agent work. It now ships `UNRESOLVED` with both
+  `parent_unresolved` and `instrumentation_degraded` in `wardex.limitations`,
+  so the missing parent reads as wardex's own degradation rather than as a
+  fact about your traffic. The claim is bounded at both ends: a stream opened
+  before capture attached, or one the cap never reached, is not labelled.
+- **The default `AGENT` capture mode no longer drops those spans.** The gate
+  reads an absent parent as "not agent work", which would have made the marker
+  above unreachable on exactly the traffic that earned it — a silent drop
+  instead of a labelled one. A span degraded by an evicted latch entry now
+  passes the gate the same way one issued inside a span wardex failed to open
+  already did.
+- `propagation.targets` glob patterns are matched case-insensitively, since
+  hostnames are. Patterns are folded once when the config is built, so they
+  read back lowercased.
+- `intercept_hosts` entries are matched case-insensitively for the same
+  reason.
+- `get_traceparent()` and `get_trace_headers()` now resolve the same ambient
+  scope, so the two can no longer disagree about whether a trace context
+  exists. Both read the merged scope, which is the wider of the two
+  resolutions the pair used before — no header that was emitted previously
+  stops being emitted.
+- Both header readers now read only the two propagation fields instead of
+  materializing a merged scope. They no longer deep-copy the data you put in
+  `set_context()`, which makes them safe to call from a send path when a
+  context value holds something that cannot be copied, such as a lock or a
+  socket.
+
+### Fixed
+
+- **A forked child could stop draining forever.** If `os.fork()` happened
+  while another thread was in the middle of starting the background batch
+  worker, the child inherited an "a spawn is in progress" flag that nothing in
+  the child was left to clear — the frame that would have cleared it does not
+  survive the fork. Every later respawn attempt then declined, so the child
+  never restarted its worker: no periodic flush for the life of the process,
+  spans accumulating until the buffer cap evicted them, and nothing shipped
+  short of an explicit `close()`. The marker now records which process owns
+  the spawn, so an inherited value reads as "a spawn in the parent" and the
+  child respawns.
+- **`close()` no longer leaves a worker thread nobody can join.** A socket
+  finalizer landing inside the worker's thread allocation can reach `close()`
+  on that same thread; the shutdown would then complete, and the outer frame
+  would start a worker afterwards that no `join()` would ever see. A spawn
+  that discovers a shutdown has begun is now abandoned instead of started.
+- **Uninstalling the connection-close probe no longer risks disabling
+  connection timing for the rest of the process.** If a socket closed on
+  another thread at the moment the probe was being uninstalled, the teardown
+  raised `RuntimeError: dictionary changed size during iteration`. The error
+  was swallowed, but it left the probe marked installed on a process-wide
+  object, so a later `init()` believed it was already set up and connection
+  timing was silently never instrumented again. The teardown now walks a
+  snapshot.
+- **An MCP tool call could be reported twice.** The MCP tool catalogue walked
+  its handle list live while the same list could be trimmed by its own bounded
+  cap. A trim mid-walk skipped a handle, and a skipped handle is a server
+  whose token is never resolved — which is exactly how one call ends up
+  emitted twice. All three walks now iterate a snapshot.
+- A `traceparent` set as a session default on an `aiohttp.ClientSession` was
+  overwritten on every request through that session. A header you set yourself
+  now wins whether you set it per request or once on the session.
+- A caller-supplied `tracestate` was silently replaced by httpx and requests,
+  and sent twice by aiohttp. It is now left exactly as written by all three.
+- Two threads calling `init()` concurrently could stack the propagation
+  patches twice, leaving the host permanently patched after `close()`. Install
+  and uninstall are now serialized, and a `close()` that re-enters an install
+  from a signal handler on the same thread neither deadlocks nor leaves
+  patches behind.
+- A `traceparent` from a future version with an empty field — a trailing
+  hyphen, or a hole between fields — was accepted as well-formed. Such a
+  header is truncated rather than futuristic and is now rejected, restarting
+  the trace as the specification directs. Fields belonging to versions wardex
+  does not implement are still not inspected.
+- A non-latin-1 character in an inbound `tracestate` could raise
+  `UnicodeEncodeError` out of the host's own outbound request when the value
+  was forwarded. Header injection is fail-silent again in that case.
+
 ## [0.4.0b1] - 2026-08-09
 
 ### Added
