@@ -15,6 +15,12 @@ refuses to run without `WARDEX_E2E_PHOENIX` — CI must not depend on Docker.
     WARDEX_E2E_PHOENIX=http://127.0.0.1:6006 \
         uv run python sdks/python/tests/e2e_split_export_phoenix.py
 
+Being uncollected also puts this file outside the 3.10 floor check: that script
+runs pytest, so it never imports this module either, and ruff's `target-version`
+sees syntax but not API availability. A 3.11+-only call added here stays green
+in every automated gate and turns up only when a person runs the driver. After
+editing, re-run it once under `.venv-py310/bin/python`.
+
 Phoenix rather than a collector with a debug exporter because a collector only
 proves the requests were *parsed*. Phoenix stores spans and serves them back
 grouped by trace over `/v1/projects/default/spans`, which is the assertion this
@@ -51,14 +57,26 @@ REQUEST_CAP = 64 * 1024
 CHILDREN = 8
 FILLER_HEX_CHARS = 24_000
 
-# Random hex, not a repeated byte: gzip collapses repetition, and a filler that
-# compresses to nothing produces a batch that fits after all -- a check that
-# passes while testing the opposite of what it claims.
-_filler = lambda: secrets.token_hex(FILLER_HEX_CHARS // 2)  # noqa: E731
+
+def _filler() -> str:
+    """An attribute value large enough that a handful of spans cross the cap.
+
+    Random hex, not a repeated byte: gzip collapses repetition, and a filler
+    that compresses to nothing produces a batch that fits after all -- a check
+    that passes while testing the opposite of what it claims.
+    """
+    return secrets.token_hex(FILLER_HEX_CHARS // 2)
 
 
 class _Wire:
-    """What the proxy saw, and which export call produced it."""
+    """What the proxy saw, and which export call produced it.
+
+    Both lists are process-global and outlive a scenario, so every assertion
+    reads them through a mark taken at the top of the scenario. Without that a
+    check can be satisfied by somebody else's export -- true today only because
+    the first scenario happens to run first, and silently false the moment one
+    is added or reordered.
+    """
 
     def __init__(self) -> None:
         self.lock = threading.Lock()
@@ -73,24 +91,38 @@ class _Wire:
         with self.lock:
             return self.requests[mark:]
 
+    def export_count(self) -> int:
+        with self.lock:
+            return len(self.exports)
+
+    def exports_since(self, mark: int) -> list[dict]:
+        with self.lock:
+            return self.exports[mark:]
+
 
 WIRE = _Wire()
 
 
-def _carried(body: bytes, content_encoding: str | None) -> list[dict]:
-    """Which spans are in one request, read the way a receiver reads it.
+def _carried(body: bytes, content_encoding: str | None) -> tuple[int, list[dict]]:
+    """What one request decompresses to, and which spans a receiver finds there.
 
     Decompressed with the standard library rather than with the core's own
     `gunzip`: a decompressor written by the same code that compressed agrees
     with itself about frames no other reader accepts, and what has to hold here
     is that somebody else can read what went out.
+
+    The decompressed length comes back alongside the spans because the request
+    cap is defined on both numbers a receiver checks -- the body on the wire and
+    the message it expands to -- and the second is the binding one for base64
+    payload attributes. Asserting only the compressed side would pass with a lot
+    of slack exactly where the real bound is tight.
     """
     from wardex_sdk import _wardex_native
 
     if content_encoding == "gzip":
         body = gzip.decompress(body)
     decoded = _wardex_native.codec.decode_otlp_traces(body)
-    return [
+    return len(body), [
         {
             "name": span["name"],
             "span_id": span["span_id"],
@@ -129,16 +161,30 @@ def _proxy(upstream: str) -> ThreadingHTTPServer:
                 status, payload = exc.code, exc.read()
             except Exception as exc:  # noqa: BLE001 — a proxy must answer, not raise
                 status, payload = 599, str(exc).encode()
+            encoding = self.headers.get("Content-Encoding")
+            record = {
+                "content_encoding": encoding,
+                "content_type": self.headers.get("Content-Type"),
+                "bytes": len(body),
+                "receiver_status": status,
+                "decompressed_bytes": None,
+                "decode_error": None,
+                "spans": [],
+            }
+            # Decoded outside WIRE.lock, and inside a try. Outside the lock
+            # because a native decode is the slowest thing here and holding it
+            # serializes concurrent handlers for no reason. Inside a try because
+            # a raise would kill this thread before it answers, and the SDK
+            # would then sit in urlopen until the 60s transport timeout and
+            # report an export failure -- pointing whoever reads it at the
+            # receiver rather than at this driver. Recorded before the response
+            # so that `_Observed.export` never returns ahead of the record.
+            try:
+                record["decompressed_bytes"], record["spans"] = _carried(body, encoding)
+            except Exception as exc:  # noqa: BLE001 — a decode fault is evidence, not a crash
+                record["decode_error"] = repr(exc)
             with WIRE.lock:
-                WIRE.requests.append(
-                    {
-                        "content_encoding": self.headers.get("Content-Encoding"),
-                        "content_type": self.headers.get("Content-Type"),
-                        "bytes": len(body),
-                        "receiver_status": status,
-                        "spans": _carried(body, self.headers.get("Content-Encoding")),
-                    }
-                )
+                WIRE.requests.append(record)
             self.send_response(status)
             self.send_header("Content-Length", str(len(payload)))
             self.end_headers()
@@ -201,6 +247,7 @@ def _split_export_becomes_one_trace(phoenix: str, report: _Report) -> None:
 
     print("\nA batch over the request cap arrives as one trace")
     mark = WIRE.count()
+    export_mark = WIRE.export_count()
     run = secrets.token_hex(4)
     with wardex_sdk.trace(f"e2e-root-{run}") as root:
         trace_id = root.context.trace_id.hex()
@@ -211,11 +258,12 @@ def _split_export_becomes_one_trace(phoenix: str, report: _Report) -> None:
     wardex_sdk.flush(60.0)
 
     posts = WIRE.since(mark)
-    split = [e for e in WIRE.exports if e["requests"] > 1]
+    exports = WIRE.exports_since(export_mark)
+    split = [e for e in exports if e["requests"] > 1]
     report.check(
         bool(split),
         "one export() became several POSTs",
-        ", ".join(f"{e['spans']} spans -> {e['requests']} requests" for e in WIRE.exports),
+        ", ".join(f"{e['spans']} spans -> {e['requests']} requests" for e in exports),
     )
     report.check(
         all(p["content_encoding"] == "gzip" for p in posts),
@@ -223,9 +271,22 @@ def _split_export_becomes_one_trace(phoenix: str, report: _Report) -> None:
         {p["content_encoding"] for p in posts},
     )
     report.check(
+        all(p["decode_error"] is None for p in posts),
+        "every POST decoded as OTLP outside the SDK",
+        [p["decode_error"] for p in posts if p["decode_error"]],
+    )
+    report.check(
         all(p["bytes"] <= REQUEST_CAP for p in posts),
         f"every POST body stayed under the {REQUEST_CAP}-byte cap",
         [p["bytes"] for p in posts],
+    )
+    report.check(
+        all(
+            p["decompressed_bytes"] is not None and p["decompressed_bytes"] <= REQUEST_CAP
+            for p in posts
+        ),
+        "and so did what each one decompressed to, the tighter half of the cap",
+        [p["decompressed_bytes"] for p in posts],
     )
     report.check(
         bool(posts) and all(p["receiver_status"] == 200 for p in posts),
@@ -252,7 +313,8 @@ def _split_export_becomes_one_trace(phoenix: str, report: _Report) -> None:
     report.check(
         root_post is not None and orphaned_on_arrival > 0,
         "children arrived in earlier requests than the parent they name",
-        f"root in request {root_post} of {len(posts)}, "
+        f"root in request {root_post + 1 if root_post is not None else '?'} "
+        f"of {len(posts)}, "
         f"{orphaned_on_arrival} child(ren) arrived before it",
     )
 
@@ -291,10 +353,20 @@ def _one_oversized_span_costs_one_span(phoenix: str, report: _Report) -> None:
     it: a `wardex.limitations` marker rides on the span, and this span never
     reaches the wire to carry one. The bounded stderr line is the only channel
     it has, so it is part of the documented behavior and is asserted here.
+
+    The stderr assertion counts ONE line because `report_once` is bounded to one
+    line per key per process. That makes the count a statement about this
+    scenario only if no earlier scenario has already spent the key, which is
+    fragile in a file whose caps and filler sizes are meant to be tuned -- raise
+    the filler and the first scenario starts dropping too. So the ledger is
+    reset here rather than assumed empty.
     """
     import wardex_sdk
+    from wardex_sdk.assembly._diag import reset_reports_for_test
 
     print("\nA span too large even alone is dropped without taking the batch")
+    reset_reports_for_test()
+    mark = WIRE.count()
     run = secrets.token_hex(4)
     survivors = {f"e2e-small-{i}-{run}" for i in range(3)}
     oversized = f"e2e-oversized-{run}"
@@ -315,13 +387,22 @@ def _one_oversized_span_costs_one_span(phoenix: str, report: _Report) -> None:
         wardex_sdk.flush(60.0)
     diagnostics = captured.getvalue()
 
+    # Asked of the wire, not of the receiver. `_spans_at` returns the instant
+    # the spans that are SUPPOSED to survive are indexed, so "the receiver does
+    # not have the oversized one yet" is a statement about poll timing: had the
+    # SDK exported it after all, this would print PASS for a real loss of the
+    # drop guarantee. The proxy recorded every span that left the process, and
+    # that is the claim -- the SDK never put it on the wire.
+    on_the_wire = {span["name"] for post in WIRE.since(mark) for span in post["spans"]}
+    report.check(
+        oversized not in on_the_wire,
+        "the oversized span never left the process",
+        f"{len(on_the_wire)} span(s) on the wire",
+    )
+
     expected = survivors | {f"e2e-drop-root-{run}"}
     stored = _spans_at(phoenix, trace_id, len(expected))
     names = {s["name"] for s in stored}
-    report.check(
-        oversized not in names,
-        "the oversized span did not reach the receiver",
-    )
     report.check(
         names == expected,
         "every other span of the same batch did",
@@ -340,19 +421,40 @@ def _one_oversized_span_costs_one_span(phoenix: str, report: _Report) -> None:
 
 
 class _Tee:
-    """Keep the run watchable while still asserting on what was printed."""
+    """Keep the run watchable while still asserting on what was printed.
 
-    def __init__(self, *streams) -> None:
-        self._streams = streams
+    Installed as the process-wide `sys.stderr`, deliberately: the drop is
+    reported from the batch-worker thread as often as from this one, and a
+    thread-local redirect would miss it.
+
+    Everything but `write`/`flush` is delegated to the real stream. wardex's own
+    stderr paths are all `print(..., file=...)` and would be satisfied by those
+    two alone, but a partial file object standing in for `sys.stderr` for the
+    whole interpreter is a trap for anything else on the export path that probes
+    a stream the way real code does -- `fileno`, `isatty`, `encoding` -- and the
+    AttributeError would surface on a background thread inside a drain.
+    """
+
+    def __init__(self, real, *streams) -> None:
+        self._real = real
+        self._streams = (real, *streams)
+        self._lock = threading.Lock()
 
     def write(self, text: str) -> int:
-        for stream in self._streams:
-            stream.write(text)
+        # Locked because the reporting thread is not always this one, and a
+        # torn write would make the captured text unassertable.
+        with self._lock:
+            for stream in self._streams:
+                stream.write(text)
         return len(text)
 
     def flush(self) -> None:
-        for stream in self._streams:
-            stream.flush()
+        with self._lock:
+            for stream in self._streams:
+                stream.flush()
+
+    def __getattr__(self, name: str):
+        return getattr(self._real, name)
 
 
 def main() -> int:
@@ -373,7 +475,7 @@ def main() -> int:
         return 2
 
     import wardex_sdk
-    from wardex_sdk import CaptureLimits, OtlpHttpTransport
+    from wardex_sdk import BatchingPolicy, CaptureLimits, OtlpHttpTransport
 
     server = _proxy(phoenix)
     endpoint = f"http://127.0.0.1:{server.server_address[1]}/v1/traces"
@@ -399,13 +501,28 @@ def main() -> int:
     wardex_sdk.init(
         transport=_Observed(endpoint=endpoint, timeout=60.0),
         limits=CaptureLimits(max_otlp_request_bytes=REQUEST_CAP),
+        # The default 5s tick would be a second exporter running alongside this
+        # driver, and the hazard is batch COMPOSITION rather than lock safety: a
+        # tick landing between two `span()` blocks drains the batch in pieces,
+        # each small enough to fit ONE request, and "one export became several
+        # POSTs" then fails for a scheduler coincidence that reads exactly like
+        # an SDK regression. Pushed past the whole run so the explicit flush is
+        # the only export there is.
+        batching=BatchingPolicy(flush_interval=3600.0),
     )
     try:
         _split_export_becomes_one_trace(phoenix, report)
         _one_oversized_span_costs_one_span(phoenix, report)
     finally:
-        wardex_sdk.close()
-        server.shutdown()
+        try:
+            wardex_sdk.close()
+        finally:
+            # `shutdown` stops the accept loop but leaves the socket listening,
+            # so a late export -- the atexit hook re-entering a drain, or a
+            # close() that raised partway -- would connect and then wait out the
+            # full 60s transport timeout instead of failing at once.
+            server.shutdown()
+            server.server_close()
 
     print(f"\n{report.failures} failure(s)")
     return 1 if report.failures else 0
