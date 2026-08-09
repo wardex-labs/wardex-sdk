@@ -1165,14 +1165,51 @@ const PRODUCER: otlp::map::Producer<'static> = otlp::map::Producer {
     scope_name: "wardex.python",
 };
 
+/// Envelope → the OTLP request, with every policy this surface owes applied.
+///
+/// The order is the whole of it, and each step is placed against the next:
+///
+///   * masking runs on the raw payload, because the PII engine's patterns are
+///     byte-level and a rewritten payload hides them;
+///   * the size cap runs after masking, so a truncation can never cut a PII
+///     match in two and ship the surviving half, and before the bytes rewrite,
+///     so a cut lands on whole base64 quanta rather than mid-string;
+///   * the bytes rewrite runs last, because no real backend accepts
+///     `bytes_value` and this is the point of no return for the raw payload.
+///
+/// Shared by both entry points below so the two cannot drift into applying a
+/// different policy to the same envelope.
+fn otlp_request(
+    proto: pb::Envelope,
+    pii_mode: &str,
+    pii_disabled: &[String],
+    limits: wardex_limits::Limits,
+) -> PyResult<otlp_pb::trace_service::ExportTraceServiceRequest> {
+    // `proto` is CONSUMED here, so the envelope's payloads move into the
+    // request instead of being copied beside it — one flush of a full batch
+    // holds one copy of every captured body, not two.
+    let mut req = otlp::map::envelope_to_traces(proto, PRODUCER);
+    pii_apply_otlp(&mut req, pii_mode, pii_disabled)?;
+    otlp::map::cap_attribute_values(&mut req, limits);
+    otlp::map::strip_bytes_values(&mut req);
+    Ok(req)
+}
+
 #[pyfunction]
-#[pyo3(signature = (envelope, pii_mode = "off", pii_disabled = Vec::new()))]
+#[pyo3(signature = (envelope, pii_mode = "off", pii_disabled = Vec::new(), limits = None))]
 fn encode_otlp_traces(
     py: Python<'_>,
     envelope: &Bound<'_, PyAny>,
     pii_mode: &str,
     pii_disabled: Vec<String>,
+    limits: Option<PyLimits>,
 ) -> PyResult<Py<PyBytes>> {
+    // ONE request, uncompressed, whatever its size — the bare serialization of
+    // an envelope. `encode_otlp_requests` is what an EXPORT calls: this one
+    // answers "what does this envelope look like on the wire", which is a
+    // question with one answer, and a caller that needs a body a receiver will
+    // accept needs the other function's several.
+    //
     // Marshalling walks Python objects — the only part that needs the GIL.
     // Traces only: state snapshots have no OTLP trace form, so walking them
     // here would spend the GIL on records the mapping drops.
@@ -1184,22 +1221,51 @@ fn encode_otlp_traces(
     // the first time the two disagreed it would show up as a missing attribute
     // on a user's wire rather than as a failing build.
     let proto = envelope_to_proto(envelope, false)?;
+    let limits = limits.map(|p| p.inner).unwrap_or_default();
     // Mapping + masking + protobuf are pure Rust: release the GIL so app
     // threads keep running while the batch worker encodes (design §9).
     let bytes = py.allow_threads(move || -> PyResult<Vec<u8>> {
-        // `proto` is CONSUMED here, so the envelope's payloads move into the
-        // request instead of being copied beside it — one flush of a full batch
-        // holds one copy of every captured body, not two.
-        let mut req = otlp::map::envelope_to_traces(proto, PRODUCER);
-        pii_apply_otlp(&mut req, pii_mode, &pii_disabled)?;
-        // After masking, never before: the PII engine's byte-level patterns
-        // match inside raw payloads, and a payload already rewritten to
-        // base64 would hide them.
-        otlp::map::strip_bytes_values(&mut req);
+        let req = otlp_request(proto, pii_mode, &pii_disabled, limits)?;
         otlp::encode_traces(&req)
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
     })?;
     Ok(PyBytes::new_bound(py, &bytes).unbind())
+}
+
+/// Envelope → `(request bodies, spans dropped)` — the export path's encoder.
+///
+/// Several bodies rather than one because an OTLP request is rejected WHOLE: a
+/// batch over the receiver's limit loses every span in it, including the small
+/// ones. `max_otlp_request_bytes` decides where the boundary is and the core
+/// measures the FINAL body against it, compression included, because that is
+/// the number the receiver measures.
+///
+/// The second half of the return value is a count of spans that could not be
+/// made to fit even alone, after their payload was dropped. It exists because
+/// the core has no channel to a user: a loss reported nowhere is the silent
+/// kind, and the caller is the only one who can say it out loud.
+#[pyfunction]
+#[pyo3(signature = (envelope, pii_mode = "off", pii_disabled = Vec::new(), limits = None, compress = true))]
+fn encode_otlp_requests(
+    py: Python<'_>,
+    envelope: &Bound<'_, PyAny>,
+    pii_mode: &str,
+    pii_disabled: Vec<String>,
+    limits: Option<PyLimits>,
+    compress: bool,
+) -> PyResult<(Py<PyAny>, usize)> {
+    let proto = envelope_to_proto(envelope, false)?;
+    let limits = limits.map(|p| p.inner).unwrap_or_default();
+    let requests = py.allow_threads(move || -> PyResult<otlp::split::Requests> {
+        let req = otlp_request(proto, pii_mode, &pii_disabled, limits)?;
+        otlp::split::encode_requests(req, limits, compress)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    })?;
+    let bodies = PyList::empty_bound(py);
+    for body in &requests.bodies {
+        bodies.append(PyBytes::new_bound(py, body))?;
+    }
+    Ok((bodies.into_py(py), requests.dropped_spans))
 }
 
 #[pyfunction]
@@ -1312,6 +1378,7 @@ pub fn register(parent: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(encode_envelope_py, &m)?)?;
     m.add_function(wrap_pyfunction!(decode_envelope_py, &m)?)?;
     m.add_function(wrap_pyfunction!(encode_otlp_traces, &m)?)?;
+    m.add_function(wrap_pyfunction!(encode_otlp_requests, &m)?)?;
     m.add_function(wrap_pyfunction!(decode_otlp_traces, &m)?)?;
     m.add_function(wrap_pyfunction!(vocabulary_tables, &m)?)?;
     // Exposed in Python as codec.encode_envelope / codec.decode_envelope

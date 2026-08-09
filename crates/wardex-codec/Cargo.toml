@@ -12,6 +12,7 @@ prost       = { workspace = true }
 prost-types = { workspace = true }
 bytes       = { workspace = true }
 zstd        = { workspace = true }
+flate2      = { workspace = true }
 base64      = { workspace = true }
 wardex-limits = { workspace = true }
 

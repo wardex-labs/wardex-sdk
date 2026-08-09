@@ -280,8 +280,26 @@ wardex.init(
 
 Two exceptions are inert today, so setting them has no effect:
 `replay_buffer_size` (nothing reads it yet) and `zstd_level` (read only by the
-envelope encoder, which no live export path calls — the OTLP exporter neither
-takes limits nor compresses).
+envelope encoder, which no live export path calls — the OTLP exporter
+compresses with gzip, which is what OTLP receivers accept).
+
+**Two of the bounds are about the wire rather than about capture.** The OTLP
+surface encodes binary payloads as base64, so what leaves is up to a third
+larger than what was captured, and an OTLP request is accepted or rejected
+whole — a batch over the receiver's body limit does not arrive short, it does
+not arrive.
+
+* `max_otlp_attribute_bytes` (1 MiB) caps one attribute value as it appears on
+  the wire. A value over it is truncated and the span says so with an
+  `otlp_attribute_truncated` marker in `wardex.limitations`.
+* `max_otlp_request_bytes` (4 MiB, gRPC's own receive ceiling) caps one
+  request, measured both as the compressed body that goes on the wire and as
+  the message it decompresses to — receivers check both. A batch over either is
+  split across several POSTs instead of being sent whole and rejected. Raise it
+  if your collector accepts more.
+
+Requests are gzipped by default. `OtlpHttpTransport(..., compress=False)` turns
+that off for a proxy or receiver that mishandles `Content-Encoding`.
 
 `max_units` and `max_entries_per_unit` were on that list until the logical-unit
 registry landed and became their consumer. What crossing one of them looks like

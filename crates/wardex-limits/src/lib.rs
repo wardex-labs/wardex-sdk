@@ -125,12 +125,50 @@ pub struct Limits {
 
     // --- Enforced by the codec ---
     /// Zstd compression level. Read by `encode_envelope`, which nothing in the
-    /// live export path calls today: the OTLP exporter uses
-    /// `encode_otlp_traces`, which neither takes limits nor compresses. So the
-    /// wiring is real but the knob is currently unobservable to a user, and it
-    /// is documented as inert alongside `replay_buffer_size` until an envelope
+    /// live export path calls today: the OTLP exporter compresses with gzip,
+    /// because that is the encoding OTLP receivers accept. So the wiring is
+    /// real but the knob is currently unobservable to a user, and it is
+    /// documented as inert alongside `replay_buffer_size` until an envelope
     /// transport ships.
     pub zstd_level: i32,
+    /// Maximum size of ONE attribute value on the OTLP surface, measured as it
+    /// will appear on the wire — i.e. AFTER the base64 rewrite a binary payload
+    /// goes through, not before it. A value over the bound is truncated and the
+    /// span says so with an `otlp_attribute_truncated` marker.
+    ///
+    /// It is not a second `max_body_bytes` and does not overlap it. That one
+    /// caps what a parser KEEPS, in raw bytes, before anything is encoded; this
+    /// one caps what one attribute may COST on a wire whose receiver has its
+    /// own opinion about request size. The two differ by up to 4/3 for binary
+    /// payloads, which is exactly the gap that made a batch inside every raw
+    /// cap encode to something no collector would accept.
+    ///
+    /// Sized against `max_otlp_request_bytes`: two payload attributes at this
+    /// bound, plus semantics, still fit one request, so a single span alone
+    /// crossing the request cap is the pathological case rather than the
+    /// ordinary one. Raising this without raising that moves work onto the
+    /// split path instead of onto the wire.
+    pub max_otlp_attribute_bytes: usize,
+    /// Maximum size of ONE OTLP/HTTP request, measured on BOTH numbers a
+    /// receiver checks: the encoded, compressed body that goes on the wire and
+    /// the message it decompresses to. A batch over either is split across
+    /// several POSTs rather than sent whole and rejected.
+    ///
+    /// Both, because a receiver enforces both. gRPC refuses a frame over
+    /// `max_receive_message_length` and then refuses what it decompresses to
+    /// under the same number; the collector's HTTP receiver applies its body
+    /// limit to the decompressed stream, which is how it refuses a
+    /// decompression bomb. Checking only the compressed size would leave the
+    /// all-or-nothing rejection reachable exactly where compression helps most
+    /// — OTLP payload attributes are base64 text and gzip several-fold.
+    ///
+    /// The default is gRPC's own `max_receive_message_length`, which the
+    /// OTLP/gRPC receiver inherits and collector HTTP deployments commonly
+    /// mirror; a backend that accepts more will simply never see a split.
+    /// Rejection here is all-or-nothing at the request level, which is what
+    /// makes an unbounded body worse than a truncated one: the receiver drops
+    /// the whole batch, so every span in it disappears together.
+    pub max_otlp_request_bytes: usize,
 }
 
 impl Default for Limits {
@@ -154,6 +192,8 @@ impl Default for Limits {
             max_buffer_bytes: 64 * 1024 * 1024,
             replay_buffer_size: 100,
             zstd_level: 3,
+            max_otlp_attribute_bytes: 1024 * 1024,
+            max_otlp_request_bytes: 4 * 1024 * 1024,
         }
     }
 }
@@ -183,6 +223,17 @@ mod tests {
         assert_eq!(l.max_buffer_bytes, 64 * 1024 * 1024);
         assert_eq!(l.replay_buffer_size, 100);
         assert_eq!(l.zstd_level, 3);
+        assert_eq!(l.max_otlp_attribute_bytes, 1024 * 1024);
+        assert_eq!(l.max_otlp_request_bytes, 4 * 1024 * 1024);
+    }
+
+    /// The relationship the two OTLP bounds are sized against, asserted rather
+    /// than described: a span carrying both payload attributes at the attribute
+    /// ceiling must still fit one request, so splitting is about BATCHES.
+    #[test]
+    fn two_capped_payloads_fit_one_request() {
+        let l = Limits::default();
+        assert!(2 * l.max_otlp_attribute_bytes < l.max_otlp_request_bytes);
     }
 
     #[test]

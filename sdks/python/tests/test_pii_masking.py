@@ -185,12 +185,16 @@ class TestTransportPolicy:
 
         captured = {}
 
-        def fake_encode(envelope, pii_mode, pii_disabled):
+        def fake_encode(envelope, pii_mode, pii_disabled, limits, compress):
             captured["pii_mode"] = pii_mode
             captured["pii_disabled"] = pii_disabled
-            return b""  # empty body; the subsequent POST fails silently (endpoint is unreachable)
+            # One empty body; the subsequent POST fails silently (the endpoint
+            # is unreachable). Returning no bodies at all would let the
+            # transport return before it ever built a request, which is a
+            # different path from the one under test.
+            return ([b""], 0)
 
-        monkeypatch.setattr(_wardex_native.codec, "encode_otlp_traces", fake_encode)
+        monkeypatch.setattr(_wardex_native.codec, "encode_otlp_requests", fake_encode)
         t = OtlpHttpTransport(endpoint="http://localhost:1")
         t.set_pii_policy("mask", ("ip_address",))
         t._send_batch(_env(_span(input_data=PII_INPUT)))

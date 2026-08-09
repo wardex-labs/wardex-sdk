@@ -164,10 +164,31 @@ class Transport(abc.ABC):
     transport's job, in `export`, using the `timeout` it is passed there.
     """
 
+    _limits: object | None = None
+    """The resolved native `Limits`, or None for the core's own defaults.
+
+    Read by transports that encode: the OTLP exporter caps attribute values at
+    `max_otlp_attribute_bytes` and splits its POSTs at `max_otlp_request_bytes`,
+    and both of those are user-configurable. Class-level None keeps a transport
+    constructed by hand — without `init()` — working on the core defaults rather
+    than raising for a knob it was never given.
+    """
+
     def set_pii_policy(self, mode: str, disabled: tuple[str, ...]) -> None:
         """Install the PII policy resolved from WardexConfig (called by init)."""
         self._pii_mode = mode
         self._pii_disabled = disabled
+
+    def set_limits(self, limits: object | None) -> None:
+        """Install the resolved resource limits (called by init).
+
+        Separate from `set_pii_policy` because the two answer to different
+        config, and a transport that cares about one rarely cares about the
+        other. Same shape deliberately: a third-party transport that overrides
+        neither keeps working, and one that overrides this gets the same object
+        the native encoders take.
+        """
+        self._limits = limits
 
     @abc.abstractmethod
     def export(self, envelope: InternalEnvelope, *, timeout: float | None = None) -> object | None:

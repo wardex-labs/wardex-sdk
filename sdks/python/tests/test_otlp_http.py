@@ -2,8 +2,14 @@
 
 from __future__ import annotations
 
+import gzip
+import os
 import threading
+import time
+import types
 from http.server import BaseHTTPRequestHandler, HTTPServer
+
+import pytest
 
 from wardex_sdk import _wardex_native
 from wardex_sdk._enums import Direction, Protocol, SpanKind, StatusCode
@@ -82,15 +88,18 @@ def _envelope_no_spans() -> InternalEnvelope:
 
 class _Handler(BaseHTTPRequestHandler):
     received: dict = {}
+    requests: list = []
 
     def do_POST(self):  # noqa: N802 (BaseHTTPRequestHandler convention)
         n = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(n)
         _Handler.received = {
             "content_type": self.headers.get("Content-Type"),
+            "content_encoding": self.headers.get("Content-Encoding"),
             "auth": self.headers.get("Authorization"),
             "body": body,
         }
+        _Handler.requests.append(_Handler.received)
         self.send_response(200)
         self.end_headers()
 
@@ -99,13 +108,37 @@ class _Handler(BaseHTTPRequestHandler):
 
 
 def _serve() -> HTTPServer:
+    _Handler.received = {}
+    _Handler.requests = []
     srv = HTTPServer(("127.0.0.1", 0), _Handler)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     return srv
 
 
+def _decode(request: dict) -> dict:
+    """What a RECEIVER makes of one recorded request.
+
+    `Content-Encoding` is honoured with the standard library's gzip rather than
+    with the core's own `gunzip`, deliberately: a decompressor written by the
+    same code that compressed would agree with itself about a frame no other
+    reader accepts, and what has to hold is that a collector can read it.
+    """
+    body = request["body"]
+    if request["content_encoding"] == "gzip":
+        body = gzip.decompress(body)
+    return _wardex_native.codec.decode_otlp_traces(body)
+
+
+def _span_names(request: dict) -> list[str]:
+    return [
+        sp["name"]
+        for rs in _decode(request)["resource_spans"]
+        for ss in rs["scope_spans"]
+        for sp in ss["spans"]
+    ]
+
+
 def test_post_sends_otlp_protobuf():
-    _Handler.received = {}
     srv = _serve()
     port = srv.server_address[1]
     t = OtlpHttpTransport(
@@ -117,18 +150,297 @@ def test_post_sends_otlp_protobuf():
 
     assert _Handler.received["content_type"] == "application/x-protobuf"
     assert _Handler.received["auth"] == "Basic zzz"
+    # gzip by default, and the header has to say so: a compressed body under a
+    # header that does not declare it is a 400 from every receiver, which is
+    # the one failure mode compression can introduce.
+    assert _Handler.received["content_encoding"] == "gzip"
+    assert _Handler.received["body"][:2] == b"\x1f\x8b"
+    d = _decode(_Handler.received)
+    assert d["resource_spans"][0]["scope_spans"][0]["spans"][0]["name"] == "HTTP POST /v1/chat"
+
+
+def test_compression_can_be_turned_off_and_the_header_goes_with_it():
+    """`Content-Encoding: gzip` on an uncompressed body is worse than no
+    compression at all, so the switch has to move both together."""
+    srv = _serve()
+    port = srv.server_address[1]
+    t = OtlpHttpTransport(endpoint=f"http://127.0.0.1:{port}/v1/traces", compress=False)
+    assert t.compress is False
+    t.export(_envelope_with_span())
+    srv.shutdown()
+
+    assert _Handler.received["content_encoding"] is None
+    assert _Handler.received["body"][:2] != b"\x1f\x8b"
+    # Reads without any decompression step at all.
     d = _wardex_native.codec.decode_otlp_traces(_Handler.received["body"])
     assert d["resource_spans"][0]["scope_spans"][0]["spans"][0]["name"] == "HTTP POST /v1/chat"
+
+
+def test_an_oversized_batch_becomes_several_posts_and_loses_nothing():
+    """The failure this exists to prevent is not a truncated span, it is a
+    rejected REQUEST: over the receiver's body limit nothing in the batch is
+    stored, so the small spans die with the large ones.
+
+    Random payloads, because gzip would otherwise collapse repetition and the
+    batch would fit after all — a test that passes for the wrong reason.
+    """
+    srv = _serve()
+    port = srv.server_address[1]
+    spans = tuple(
+        _span(
+            name=f"chat model-{i}",
+            context=SpanContext(trace_id=TraceId(b"\x01" * 16), span_id=SpanId(bytes([i]) * 8)),
+            input_data=os.urandom(4096),
+        )
+        for i in range(1, 7)
+    )
+    t = OtlpHttpTransport(endpoint=f"http://127.0.0.1:{port}/v1/traces")
+    t.set_limits(_wardex_native.Limits(max_otlp_request_bytes=12_000))
+    t.export(InternalEnvelope(header=_header(), spans=spans))
+    srv.shutdown()
+
+    assert len(_Handler.requests) > 1, "an oversized batch went out as one request"
+    for request in _Handler.requests:
+        assert len(request["body"]) <= 12_000
+    delivered = [name for request in _Handler.requests for name in _span_names(request)]
+    assert delivered == [f"chat model-{i}" for i in range(1, 7)]
+
+
+def test_a_batch_that_fits_is_still_a_single_post():
+    """The split is exceptional and must stay that way: an export that fits
+    pays for one request, one encode and one round trip."""
+    srv = _serve()
+    port = srv.server_address[1]
+    t = OtlpHttpTransport(endpoint=f"http://127.0.0.1:{port}/v1/traces")
+    t.export(_envelope_with_span())
+    srv.shutdown()
+    assert len(_Handler.requests) == 1
+
+
+def test_a_span_too_large_even_alone_is_dropped_without_taking_the_batch():
+    """One span that cannot fit must cost one span.
+
+    Its name is what is oversized, so there is no payload to drop and the guard
+    has nothing left to try — the case where the marker mechanism cannot help,
+    because the span never reaches the wire to carry one.
+    """
+    srv = _serve()
+    port = srv.server_address[1]
+    spans = (
+        _span(
+            name="x" * 4000,
+            context=SpanContext(trace_id=TraceId(b"\x01" * 16), span_id=SpanId(b"\x0a" * 8)),
+        ),
+        _span(
+            name="chat gpt-4o",
+            context=SpanContext(trace_id=TraceId(b"\x01" * 16), span_id=SpanId(b"\x0b" * 8)),
+        ),
+    )
+    t = OtlpHttpTransport(endpoint=f"http://127.0.0.1:{port}/v1/traces", compress=False)
+    t.set_limits(_wardex_native.Limits(max_otlp_request_bytes=600))
+    t.export(InternalEnvelope(header=_header(), spans=spans))
+    srv.shutdown()
+
+    delivered = [name for request in _Handler.requests for name in _span_names(request)]
+    assert delivered == ["chat gpt-4o"]
+
+
+def test_a_span_dropped_by_the_request_cap_is_reported_off_debug(capsys):
+    """These spans never reach the wire, so they cannot carry a
+    `wardex.limitations` marker — this line is the only channel they have.
+
+    Debug-gated, it was byte-identical to those spans never having been
+    captured, on the default settings every production process runs.
+    """
+    from wardex_sdk.assembly._diag import reset_reports_for_test
+
+    reset_reports_for_test()
+    srv = _serve()
+    port = srv.server_address[1]
+    spans = (
+        _span(
+            name="x" * 4000,
+            context=SpanContext(trace_id=TraceId(b"\x01" * 16), span_id=SpanId(b"\x0a" * 8)),
+        ),
+    )
+    t = OtlpHttpTransport(endpoint=f"http://127.0.0.1:{port}/v1/traces", compress=False)
+    t.set_limits(_wardex_native.Limits(max_otlp_request_bytes=600))
+    capsys.readouterr()
+    t.export(InternalEnvelope(header=_header(), spans=spans))
+    t.export(InternalEnvelope(header=_header(), spans=spans))
+    srv.shutdown()
+    err = capsys.readouterr().err
+    reset_reports_for_test()
+
+    lines = [ln for ln in err.splitlines() if "max_otlp_request_bytes" in ln]
+    assert len(lines) == 1, f"expected exactly one bounded line, got {err!r}"
+    assert "1 span(s)" in lines[0]
+
+
+def test_a_split_export_abandoned_partway_says_so_off_debug(monkeypatch, capsys):
+    """Splitting introduced an outcome one POST per envelope did not have: the
+    backend keeps the first chunks and never receives the rest, so the trace
+    arrives with a hole in the middle — which reads as "this call never
+    happened" rather than as a missing trace.
+
+    A failure on the FIRST request is not this event and must stay quiet: that
+    is an ordinary down backend, and the channel is one line per process.
+    """
+    import urllib.request
+
+    from wardex_sdk.assembly._diag import reset_reports_for_test
+
+    class _Resp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    calls = {"n": 0}
+
+    def fake_urlopen(req, timeout=None):
+        calls["n"] += 1
+        if calls["n"] >= 2:
+            raise OSError("connection refused")
+        return _Resp()
+
+    reset_reports_for_test()
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    spans = tuple(
+        _span(
+            name=f"chat model-{i}",
+            context=SpanContext(trace_id=TraceId(b"\x01" * 16), span_id=SpanId(bytes([i]) * 8)),
+            input_data=os.urandom(4096),
+        )
+        for i in range(1, 7)
+    )
+    t = OtlpHttpTransport(endpoint="http://127.0.0.1:1/v1/traces")
+    t.set_limits(_wardex_native.Limits(max_otlp_request_bytes=12_000))
+    capsys.readouterr()
+    t.export(InternalEnvelope(header=_header(), spans=spans))
+    err = capsys.readouterr().err
+    reset_reports_for_test()
+
+    assert calls["n"] == 2, "the loop kept POSTing to a backend that just refused"
+    assert len([ln for ln in err.splitlines() if "abandoned after 1 of" in ln]) == 1, (
+        f"a partial export said nothing off-debug: {err!r}"
+    )
+
+
+def test_the_first_request_failing_is_not_reported_as_a_partial_export(monkeypatch, capsys):
+    """The control for the test above. Nothing was delivered, so there is no
+    hole to explain, and spending the one-line-per-process budget on "your
+    backend is down" silences the report that would have been news."""
+    import urllib.request
+
+    from wardex_sdk.assembly._diag import reset_reports_for_test
+
+    reset_reports_for_test()
+    monkeypatch.setattr(urllib.request, "urlopen", _raising_urlopen(OSError("refused")))
+    t = OtlpHttpTransport(endpoint="http://127.0.0.1:1/v1/traces")
+    capsys.readouterr()
+    t.export(_envelope_with_span())
+    err = capsys.readouterr().err
+    reset_reports_for_test()
+    assert "abandoned after" not in err, err
+
+
+def test_a_split_export_that_runs_out_of_budget_says_how_far_it_got(monkeypatch, capsys):
+    """One envelope, several POSTs, ONE deadline — so a batch large enough to
+    split can run out partway. The spans in the unsent chunks cannot be handed
+    back (the earlier chunks are already at the backend and a retry would
+    duplicate them), which leaves this line as their only channel."""
+    import urllib.request
+
+    from wardex_sdk.assembly._diag import reset_reports_for_test
+
+    class _Resp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    posted = {"n": 0}
+
+    def slow_urlopen(req, timeout=None):
+        # Long relative to the encode on purpose: the budget below has to land
+        # between two POSTs and three, and the slack in between is what keeps
+        # this from turning into a timing flake on a loaded machine.
+        posted["n"] += 1
+        time.sleep(0.2)
+        return _Resp()
+
+    reset_reports_for_test()
+    monkeypatch.setattr(urllib.request, "urlopen", slow_urlopen)
+    spans = tuple(
+        _span(
+            name=f"chat model-{i}",
+            context=SpanContext(trace_id=TraceId(b"\x01" * 16), span_id=SpanId(bytes([i]) * 8)),
+            input_data=os.urandom(4096),
+        )
+        for i in range(1, 7)
+    )
+    t = OtlpHttpTransport(endpoint="http://127.0.0.1:1/v1/traces", timeout=10.0)
+    t.set_limits(_wardex_native.Limits(max_otlp_request_bytes=12_000))
+    capsys.readouterr()
+    t.export(InternalEnvelope(header=_header(), spans=spans), timeout=0.35)
+    err = capsys.readouterr().err
+    reset_reports_for_test()
+
+    assert posted["n"] == 2, f"the shared deadline did not stop the batch: {posted['n']} POSTs"
+    lines = [ln for ln in err.splitlines() if "ran out of budget after 2 of 3" in ln]
+    assert len(lines) == 1, f"a truncated split export said nothing off-debug: {err!r}"
+
+
+def test_a_host_content_encoding_header_cannot_contradict_the_body():
+    """The body is gzipped by the core, so the header that describes it is this
+    transport's to set. A host value winning here ships a real gzip frame under
+    `identity` — a 400 from every conforming receiver, which no retry fixes and
+    which the `compress` switch exists to avoid.
+
+    Case-folded, because urllib normalizes header names onto one key and a
+    lowercase spelling would otherwise win the merge silently.
+    """
+    srv = _serve()
+    port = srv.server_address[1]
+    t = OtlpHttpTransport(
+        endpoint=f"http://127.0.0.1:{port}/v1/traces",
+        headers={"content-encoding": "identity", "Authorization": "Basic zzz"},
+    )
+    t.export(_envelope_with_span())
+    srv.shutdown()
+
+    assert _Handler.received["content_encoding"] == "gzip"
+    assert _Handler.received["body"][:2] == b"\x1f\x8b"
+    assert _Handler.received["auth"] == "Basic zzz", "an ordinary host header was dropped too"
+
+
+def test_compress_false_leaves_no_content_encoding_a_host_set():
+    """The other direction of the same rule: an uncompressed body must not go
+    out declaring an encoding, whoever asked for the header."""
+    srv = _serve()
+    port = srv.server_address[1]
+    t = OtlpHttpTransport(
+        endpoint=f"http://127.0.0.1:{port}/v1/traces",
+        headers={"Content-Encoding": "gzip"},
+        compress=False,
+    )
+    t.export(_envelope_with_span())
+    srv.shutdown()
+
+    assert _Handler.received["content_encoding"] is None
+    assert _Handler.received["body"][:2] != b"\x1f\x8b"
 
 
 def test_empty_batch_no_post():
     srv = _serve()
     port = srv.server_address[1]
-    _Handler.received = {}
     t = OtlpHttpTransport(endpoint=f"http://127.0.0.1:{port}/v1/traces")
     t.export(_envelope_no_spans())
     srv.shutdown()
-    assert _Handler.received == {}  # no POST occurred
+    assert _Handler.requests == []  # no POST occurred
 
 
 def test_fail_silent_on_connection_error():
@@ -141,7 +453,14 @@ def test_export_deadline_narrows_the_configured_timeout_but_never_widens_it(monk
     """The drain's remaining budget must reach urlopen, or the deadline stops at
     the drain and the process still hangs inside the POST for the full
     configured timeout — the SIGTERM stall. A caller asking for more than the
-    transport was configured for gets the configured value: narrowing only."""
+    transport was configured for gets the configured value: narrowing only.
+
+    Asserted as an upper bound rather than as equality because the budget covers
+    the ENCODE too: the clock starts before it, so what reaches urlopen is the
+    asked-for number less however long serializing this envelope took. Equality
+    here would be asserting that the encode is instantaneous, which is the
+    assumption that let a slow one add itself to the caller's deadline.
+    """
     import urllib.request
 
     seen: list[float | None] = []
@@ -162,7 +481,46 @@ def test_export_deadline_narrows_the_configured_timeout_but_never_widens_it(monk
     t.export(_envelope_with_span(), timeout=0.5)
     t.export(_envelope_with_span(), timeout=99.0)
     t.export(_envelope_with_span())
-    assert seen == [0.5, 10.0, 10.0]
+    assert len(seen) == 3
+    for got, asked in zip(seen, [0.5, 10.0, 10.0], strict=True):
+        assert 0 < got <= asked, f"POST got {got}s against an asked-for {asked}s"
+        assert got == pytest.approx(asked, abs=0.2)
+
+
+def test_the_encode_is_inside_the_budget_it_was_given(monkeypatch):
+    """`timeout` is a wall-clock bound on the whole call, and the encode is part
+    of the call — it serializes, compresses and, over the request cap, splits
+    and re-measures. A budget that started counting after it would be "the
+    encode, plus the time you asked for", which is what a SIGTERM handler's
+    `flush(2.0)` cannot afford.
+
+    A budget the encode fully spends is a DECLINE, not a loss: nothing went on
+    the wire, so the client may keep the spans for a drain with budget.
+    """
+    import urllib.request
+
+    from wardex_sdk.transport import _otlp_http
+
+    attempts: list[float | None] = []
+
+    def fake_urlopen(req, timeout=None):
+        attempts.append(timeout)
+        raise OSError("would block")
+
+    def slow_encode(*args, **kwargs):
+        out = _wardex_native.codec.encode_otlp_requests(*args, **kwargs)
+        time.sleep(0.05)
+        return out
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(
+        _otlp_http,
+        "native",
+        types.SimpleNamespace(codec=types.SimpleNamespace(encode_otlp_requests=slow_encode)),
+    )
+    t = OtlpHttpTransport(endpoint="http://127.0.0.1:1/v1/traces", timeout=10.0)
+    assert t.export(_envelope_with_span(), timeout=0.01) is UNDELIVERED
+    assert attempts == [], "the POST ran on a budget the encode had already spent"
 
 
 def test_export_with_an_exhausted_deadline_skips_the_post(monkeypatch):

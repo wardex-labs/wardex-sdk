@@ -20,7 +20,9 @@ def test_limits_defaults_returns_every_field():
     assert d["zstd_level"] == 3
     assert d["max_units"] == 512
     assert d["max_entries_per_unit"] == 256
-    assert len(d) == 18
+    assert d["max_otlp_attribute_bytes"] == 1024 * 1024
+    assert d["max_otlp_request_bytes"] == 4 * 1024 * 1024
+    assert len(d) == 20
 
 
 def test_limits_construction_defaults_unspecified_fields():
@@ -758,6 +760,91 @@ def _probe_max_buffer_bytes() -> bool:
     return _dropped_under(CaptureLimits(max_buffer_bytes=32 * 1024)) > 0
 
 
+def _otlp_envelope(payload: bytes):
+    """One span carrying `payload`, shaped the way the export path receives it."""
+    from wardex_sdk._enums import SpanKind, StatusCode
+    from wardex_sdk._types import (
+        EnvelopeHeader,
+        InternalEnvelope,
+        InternalSpan,
+        SdkInfo,
+        SpanContext,
+        SpanId,
+        TraceId,
+    )
+
+    return InternalEnvelope(
+        header=EnvelopeHeader(
+            event_id="evt",
+            api_key="k",
+            sdk=SdkInfo(
+                name="wardex.python",
+                version="0.1.0",
+                python_version="3.12",
+                os="mac",
+                arch="arm64",
+            ),
+            sent_at_ns=1,
+        ),
+        spans=(
+            InternalSpan(
+                context=SpanContext(trace_id=TraceId(b"\x01" * 16), span_id=SpanId(b"\x02" * 8)),
+                parent_span_id=None,
+                name="chat gpt-4o",
+                kind=SpanKind.CLIENT,
+                start_time_ns=1,
+                end_time_ns=2,
+                status=StatusCode.OK,
+                input_data=payload,
+            ),
+        ),
+    )
+
+
+def _otlp_attrs(env, limits):
+    d = _wardex_native.codec.decode_otlp_traces(
+        _wardex_native.codec.encode_otlp_traces(env, "off", [], limits)
+    )
+    return d["resource_spans"][0]["scope_spans"][0]["spans"][0]["attributes"]
+
+
+def _probe_max_otlp_attribute_bytes() -> bool:
+    """The override must shorten what actually leaves, and say that it did.
+
+    Measured on the encoded attribute rather than on the payload handed in:
+    the bound is about the wire, and the payload here is text so the two are
+    comparable without a base64 round trip.
+    """
+    env = _otlp_envelope(b"x" * 4096)
+    tight = _otlp_attrs(env, _native(max_otlp_attribute_bytes=64))
+    loose = _otlp_attrs(env, None)
+    return (
+        len(tight["wardex.input_data"]) == 64
+        and len(loose["wardex.input_data"]) == 4096
+        and Limitation.OTLP_ATTRIBUTE_TRUNCATED.value in tight["wardex.limitations"]
+        and "wardex.limitations" not in loose
+    )
+
+
+def _probe_max_otlp_request_bytes() -> bool:
+    """The override must change how many requests one envelope becomes.
+
+    Random bytes, so gzip cannot collapse the batch and make the split
+    unobservable — and uncompressed, so the count follows the payload rather
+    than the compressor's mood.
+    """
+    import os
+
+    env = _otlp_envelope(os.urandom(8192))
+    tight, _ = _wardex_native.codec.encode_otlp_requests(
+        env, "off", [], _native(max_otlp_request_bytes=4096), False
+    )
+    loose, _ = _wardex_native.codec.encode_otlp_requests(env, "off", [], None, False)
+    # One span, so it cannot be split: the guard drops its payload instead, and
+    # the observable difference is the body's size rather than the count.
+    return len(tight[0]) <= 4096 and len(loose[0]) > 4096
+
+
 def _dropped_under(limits: CaptureLimits) -> int:
     """Spans evicted by the buffer's caps while capturing 20 fixed-size spans.
 
@@ -814,13 +901,16 @@ _PROBES = {
     "mcp_sniff_bytes": _probe_mcp_sniff_bytes,
     "max_buffer_spans": _probe_max_buffer_spans,
     "max_buffer_bytes": _probe_max_buffer_bytes,
+    "max_otlp_attribute_bytes": _probe_max_otlp_attribute_bytes,
+    "max_otlp_request_bytes": _probe_max_otlp_request_bytes,
 }
 
 _NOT_ENFORCED = {
     "zstd_level": (
         "Wired but unobservable: encode_envelope reads it, and nothing in the "
-        "live export path calls encode_envelope -- the OTLP exporter uses "
-        "encode_otlp_traces, which neither takes limits nor compresses. A probe "
+        "live export path calls encode_envelope -- the OTLP exporter compresses "
+        "with gzip, at a level fixed in the codec because "
+        "max_otlp_request_bytes already owns the size question. A probe "
         "through the codec would pass while a user's override still changed no "
         "shipped byte, which is exactly the false green this table exists to "
         "prevent. Move it back to _PROBES when an envelope transport ships."

@@ -33,7 +33,7 @@ impl PyLimits {
         max_sessions=None, max_session_entries=None, max_units=None,
         max_entries_per_unit=None, mcp_sniff_bytes=None,
         max_buffer_spans=None, max_buffer_bytes=None, replay_buffer_size=None,
-        zstd_level=None
+        zstd_level=None, max_otlp_attribute_bytes=None, max_otlp_request_bytes=None
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -55,6 +55,8 @@ impl PyLimits {
         max_buffer_bytes: Option<usize>,
         replay_buffer_size: Option<usize>,
         zstd_level: Option<i32>,
+        max_otlp_attribute_bytes: Option<usize>,
+        max_otlp_request_bytes: Option<usize>,
     ) -> Self {
         let d = Limits::default();
         Self {
@@ -78,6 +80,9 @@ impl PyLimits {
                 max_buffer_bytes: max_buffer_bytes.unwrap_or(d.max_buffer_bytes),
                 replay_buffer_size: replay_buffer_size.unwrap_or(d.replay_buffer_size),
                 zstd_level: zstd_level.unwrap_or(d.zstd_level),
+                max_otlp_attribute_bytes: max_otlp_attribute_bytes
+                    .unwrap_or(d.max_otlp_attribute_bytes),
+                max_otlp_request_bytes: max_otlp_request_bytes.unwrap_or(d.max_otlp_request_bytes),
             },
         }
     }
@@ -154,6 +159,14 @@ impl PyLimits {
     fn zstd_level(&self) -> i32 {
         self.inner.zstd_level
     }
+    #[getter]
+    fn max_otlp_attribute_bytes(&self) -> usize {
+        self.inner.max_otlp_attribute_bytes
+    }
+    #[getter]
+    fn max_otlp_request_bytes(&self) -> usize {
+        self.inner.max_otlp_request_bytes
+    }
 }
 
 /// The core's default limits as a plain dict. The Python mirror asserts key
@@ -180,6 +193,8 @@ fn limits_defaults(py: Python<'_>) -> PyResult<Bound<'_, PyDict>> {
     out.set_item("max_buffer_bytes", d.max_buffer_bytes)?;
     out.set_item("replay_buffer_size", d.replay_buffer_size)?;
     out.set_item("zstd_level", d.zstd_level)?;
+    out.set_item("max_otlp_attribute_bytes", d.max_otlp_attribute_bytes)?;
+    out.set_item("max_otlp_request_bytes", d.max_otlp_request_bytes)?;
     Ok(out)
 }
 

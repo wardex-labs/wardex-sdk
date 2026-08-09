@@ -1,13 +1,20 @@
 //! OTLP protobuf encoding — turns the mapping result
-//! (ExportTraceServiceRequest) into wire bytes. OTLP/HTTP protobuf is uncompressed by default (no zstd).
+//! (ExportTraceServiceRequest) into wire bytes.
 //!
 //! [`map`] is the other half: it decides what an OTLP span MEANS (its name,
 //! its attribute keys, the resource and scope around it). The two are split
 //! because only one of them can be got wrong quietly — a serializer that
 //! disagrees with the schema does not compile, while a mapping that disagrees
 //! with semconv ships and looks fine.
+//!
+//! [`split`] is the third question, and the only one whose answer comes from
+//! the backend rather than from the spans: how many requests the result has to
+//! become, and whether each is compressed. [`encode_traces`] below is the bare
+//! serializer both of them build on — it takes no size and no encoding, so a
+//! caller that wants a request a receiver will accept goes through `split`.
 
 pub mod map;
+pub mod split;
 
 use crate::CodecError;
 use prost::Message;

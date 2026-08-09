@@ -29,6 +29,7 @@
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
+use wardex_limits::Limits;
 
 use super::otlp_pb;
 use crate::proto::wardex::v1 as pb;
@@ -157,6 +158,15 @@ fn widen(v: f32) -> f64 {
 
 // --- span ---
 
+/// The attribute every limitation marker rides on.
+///
+/// Named once because two different passes write it now: the mapping projects
+/// `CaptureIntegrity.limitation_codes` onto it, and the size passes at the
+/// bottom of this file append to whatever that produced. A second spelling here
+/// would put a span's markers in two attributes, one of which no dashboard
+/// reads.
+const LIMITATIONS_KEY: &str = "wardex.limitations";
+
 /// `CorrelationInfo` and `CaptureIntegrity` → OTLP span attributes.
 ///
 /// OTLP has no native home for either, so they travel under `wardex.*` the same
@@ -199,7 +209,7 @@ fn uncertainty(sp: &pb::Span, attrs: &mut Vec<otlp_pb::common::KeyValue>) {
             .map(|n| vocab::limitation_name(*n))
             .collect();
         if !markers.is_empty() {
-            attrs.push(kv_strs("wardex.limitations", markers));
+            attrs.push(kv_strs(LIMITATIONS_KEY, markers));
         }
         for (value, key) in [
             (i.request_headers_captured, "wardex.capture.request_headers"),
@@ -598,6 +608,208 @@ fn strip_any(v: &mut otlp_pb::common::AnyValue) -> Option<bool> {
     }
 }
 
+// --- Size caps at the OTLP surface ---
+//
+// Every cap the SDK enforced before this point measures a RAW size, taken
+// before anything is encoded: `max_body_bytes` on what a parser keeps,
+// `max_buffer_bytes` on what the client holds. None of them is the size a
+// receiver measures. The rewrite above turns a binary payload into base64, so a
+// span inside every raw cap can leave 4/3 larger than the largest number anyone
+// configured — and an OTLP receiver rejects a request whole, so crossing its
+// ceiling costs every span in the batch rather than the bytes that crossed it.
+//
+// So the last thing this surface does before serialization is measure itself in
+// the units the receiver uses, and say so on the span when it has to cut.
+
+/// Truncate every attribute value over `limits.max_otlp_attribute_bytes`,
+/// marking each span whose content was cut.
+///
+/// Runs AFTER masking and BEFORE [`strip_bytes_values`], and neither half of
+/// that is arbitrary. Before masking, a truncation could cut a PII match in two
+/// and ship the surviving half — the engine would never see the pattern whole.
+/// After the base64 rewrite, truncating would land mid-quantum and leave a
+/// string that no consumer can decode; cutting the raw bytes first means the
+/// rewrite encodes a shorter payload rather than a broken encoding of a longer
+/// one.
+///
+/// Resource and scope attributes are deliberately not capped: this SDK writes
+/// them itself, they are five short strings naming the service and the library,
+/// and there is no span to carry a marker if one were cut.
+pub fn cap_attribute_values(
+    req: &mut otlp_pb::trace_service::ExportTraceServiceRequest,
+    limits: Limits,
+) {
+    let cap = limits.max_otlp_attribute_bytes;
+    for rs in &mut req.resource_spans {
+        for ss in &mut rs.scope_spans {
+            for sp in &mut ss.spans {
+                let mut cut = cap_kvs(&mut sp.attributes, cap);
+                for ev in &mut sp.events {
+                    cut |= cap_kvs(&mut ev.attributes, cap);
+                }
+                for link in &mut sp.links {
+                    cut |= cap_kvs(&mut link.attributes, cap);
+                }
+                // After the walk, so the marker itself is never a candidate for
+                // truncation and an event's loss still reaches the span that
+                // owns it — an event has no `wardex.limitations` of its own.
+                if cut {
+                    mark_truncated(&mut sp.attributes);
+                }
+            }
+        }
+    }
+}
+
+/// Remove a span's captured payload and mark it — the last thing tried for a
+/// span whose encoded size ALONE exceeds the per-request cap.
+///
+/// The alternative at that point is dropping the span, and a span is worth more
+/// than its payload: its identity, its parent edge, its timing and its
+/// gen_ai semantics are what a trace is made of, and a hole in the tree is
+/// read as "this call never happened" rather than as "this call was large".
+pub fn drop_payload_attributes(sp: &mut otlp_pb::trace::Span) {
+    const PAYLOAD: [&str; 2] = ["wardex.input_data", "wardex.output_data"];
+    let before = sp.attributes.len();
+    sp.attributes.retain(|kv| {
+        // `<key>.encoding` is the companion `strip_bytes_values` writes; it
+        // describes a value that is no longer here, and left behind it would
+        // claim a base64 payload that a consumer cannot find.
+        let base = kv.key.strip_suffix(".encoding").unwrap_or(&kv.key);
+        !PAYLOAD.contains(&base)
+    });
+    if sp.attributes.len() != before {
+        mark_truncated(&mut sp.attributes);
+    }
+}
+
+fn mark_truncated(attrs: &mut Vec<otlp_pb::common::KeyValue>) {
+    // By NUMBER off the schema, never as a literal: the vocabulary is declared
+    // in `common.proto` and a string written here would be a second
+    // declaration of it, free to drift (design §6.6).
+    let name = vocab::limitation_name(pb::Limitation::OtlpAttributeTruncated as i32);
+    push_limitation(attrs, name);
+}
+
+/// Append a marker to a span's `wardex.limitations`, creating the attribute
+/// when the span had nothing to report. Idempotent — one truncated attribute
+/// and twenty say the same thing about the span.
+fn push_limitation(attrs: &mut Vec<otlp_pb::common::KeyValue>, name: String) {
+    use otlp_pb::common::any_value::Value;
+
+    let entry = otlp_pb::common::AnyValue {
+        value: Some(Value::StringValue(name.clone())),
+    };
+    if let Some(kv) = attrs.iter_mut().find(|kv| kv.key == LIMITATIONS_KEY) {
+        if let Some(Value::ArrayValue(arr)) = kv.value.as_mut().and_then(|v| v.value.as_mut()) {
+            if !arr.values.contains(&entry) {
+                arr.values.push(entry);
+            }
+        } else {
+            // The key exists holding something that is not an array — nothing
+            // this SDK produces, so a host `extra` that squatted on it.
+            // Overwrite rather than add a second `wardex.limitations`:
+            // duplicate keys are undefined in OTLP and which one a backend
+            // keeps is its own business, which would make the marker a
+            // coin flip.
+            kv.value = Some(otlp_pb::common::AnyValue {
+                value: Some(Value::ArrayValue(otlp_pb::common::ArrayValue {
+                    values: vec![entry],
+                })),
+            });
+        }
+        return;
+    }
+    attrs.push(kv_strs(LIMITATIONS_KEY, vec![name]));
+}
+
+fn cap_kvs(kvs: &mut [otlp_pb::common::KeyValue], cap: usize) -> bool {
+    let mut cut = false;
+    for kv in kvs.iter_mut() {
+        if let Some(v) = kv.value.as_mut() {
+            cut |= cap_any(v, cap);
+        }
+    }
+    cut
+}
+
+/// True when this value was cut. The bound is per VALUE, so an array is capped
+/// element by element rather than in total: the elements are separate facts,
+/// and a bound on their sum would silently delete whole entries from a list a
+/// consumer reads positionally.
+fn cap_any(v: &mut otlp_pb::common::AnyValue, cap: usize) -> bool {
+    use otlp_pb::common::any_value::Value;
+    match v.value.as_mut() {
+        Some(Value::StringValue(s)) => {
+            if s.len() <= cap {
+                return false;
+            }
+            s.truncate(floor_char_boundary(s.as_bytes(), cap));
+            true
+        }
+        Some(Value::BytesValue(b)) => {
+            // At or under three quarters of the bound even the base64 form
+            // fits, so the answer is known without asking which form it takes.
+            // Worth an early return rather than tidiness: `as_text` scans the
+            // whole payload, `strip_bytes_values` will scan it again a moment
+            // later, and skipping this one keeps the cap free for every payload
+            // that was never near the bound — which is all of them, normally.
+            if b.len() <= cap / 4 * 3 {
+                return false;
+            }
+            // Measured as it will LEAVE, not as it sits here: `as_text` is the
+            // same test `strip_bytes_values` will apply, so this is that pass's
+            // own arithmetic asked one step early.
+            let text = as_text(b).is_some();
+            let projected = if text { b.len() } else { base64_len(b.len()) };
+            if projected <= cap {
+                return false;
+            }
+            let keep = if text {
+                floor_char_boundary(b, cap)
+            } else {
+                // Whole base64 quanta only. Cutting the raw bytes to a multiple
+                // of three keeps the encoder from emitting a padded tail that
+                // pushes the string back over the bound.
+                cap / 4 * 3
+            };
+            b.truncate(keep);
+            true
+        }
+        Some(Value::ArrayValue(arr)) => {
+            let mut cut = false;
+            for item in &mut arr.values {
+                cut |= cap_any(item, cap);
+            }
+            cut
+        }
+        Some(Value::KvlistValue(kvl)) => cap_kvs(&mut kvl.values, cap),
+        _ => false,
+    }
+}
+
+/// Length of `n` bytes once base64-encoded with padding — what
+/// `strip_bytes_values` will put on the wire for a payload that is not text.
+fn base64_len(n: usize) -> usize {
+    4 * n.div_ceil(3)
+}
+
+/// The largest index at or below `i` that starts a UTF-8 character.
+///
+/// `str::floor_char_boundary` is still unstable, and the naive `truncate(cap)`
+/// it replaces panics on a multi-byte boundary — inside the export path, on the
+/// background worker, for a payload whose only crime was being long.
+fn floor_char_boundary(bytes: &[u8], i: usize) -> usize {
+    if i >= bytes.len() {
+        return bytes.len();
+    }
+    let mut i = i;
+    while i > 0 && (bytes[i] & 0xC0) == 0x80 {
+        i -= 1;
+    }
+    i
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -923,5 +1135,235 @@ mod tests {
             ))
         );
         assert!(attr(sp, "wardex.output_data.encoding").is_none());
+    }
+
+    // --- size caps ---
+
+    fn limits_with_attribute_cap(cap: usize) -> Limits {
+        Limits {
+            max_otlp_attribute_bytes: cap,
+            ..Limits::default()
+        }
+    }
+
+    fn markers(sp: &otlp_pb::trace::Span) -> Vec<String> {
+        match attr(sp, "wardex.limitations") {
+            Some(otlp_pb::common::any_value::Value::ArrayValue(a)) => a
+                .values
+                .iter()
+                .filter_map(|v| match v.value.as_ref() {
+                    Some(otlp_pb::common::any_value::Value::StringValue(s)) => Some(s.clone()),
+                    _ => None,
+                })
+                .collect(),
+            _ => vec![],
+        }
+    }
+
+    /// The whole pipeline in the order the binding runs it, so a test cannot
+    /// pass under an ordering the export path does not use.
+    fn capped(env: pb::Envelope, limits: Limits) -> otlp_pb::trace::Span {
+        let mut req = envelope_to_traces(env, PRODUCER);
+        cap_attribute_values(&mut req, limits);
+        strip_bytes_values(&mut req);
+        req.resource_spans[0].scope_spans[0].spans[0].clone()
+    }
+
+    #[test]
+    fn a_binary_payload_is_capped_by_what_base64_will_cost_not_by_its_raw_size() {
+        // 96 raw bytes is under a 100-byte bound and 128 base64 characters is
+        // not. Measuring the raw size here is the bug the whole pass exists to
+        // fix, so the payload is chosen to sit exactly in the gap.
+        let env = envelope(pb::Span {
+            input_data: vec![0u8; 96],
+            ..Default::default()
+        });
+        let sp = capped(env, limits_with_attribute_cap(100));
+        let Some(otlp_pb::common::any_value::Value::StringValue(s)) =
+            attr(&sp, "wardex.input_data")
+        else {
+            panic!("payload attribute missing");
+        };
+        assert!(s.len() <= 100, "{} characters on the wire", s.len());
+        assert_eq!(BASE64.decode(s).unwrap().len(), 100 / 4 * 3);
+        assert_eq!(markers(&sp), vec!["otlp_attribute_truncated"]);
+    }
+
+    #[test]
+    fn a_capped_binary_payload_is_still_decodable() {
+        // Truncating the base64 STRING instead of the bytes behind it lands
+        // mid-quantum and hands the consumer something that will not decode —
+        // a payload lost in a way that looks like corruption rather than like
+        // a cap.
+        for raw in [3000usize, 3001, 3002, 3003] {
+            let env = envelope(pb::Span {
+                input_data: (0..raw).map(|i| (i % 251) as u8).collect(),
+                ..Default::default()
+            });
+            let sp = capped(env, limits_with_attribute_cap(1000));
+            let Some(otlp_pb::common::any_value::Value::StringValue(s)) =
+                attr(&sp, "wardex.input_data")
+            else {
+                panic!("payload attribute missing");
+            };
+            assert!(BASE64.decode(s).is_ok(), "raw {raw} did not decode");
+        }
+    }
+
+    #[test]
+    fn a_text_payload_is_cut_on_a_character_boundary() {
+        // `String::truncate` panics mid-character, and this runs on the export
+        // worker inside the host's process.
+        let env = envelope(pb::Span {
+            output_data: "한글".repeat(200).into_bytes(),
+            ..Default::default()
+        });
+        let sp = capped(env, limits_with_attribute_cap(100));
+        let Some(otlp_pb::common::any_value::Value::StringValue(s)) =
+            attr(&sp, "wardex.output_data")
+        else {
+            panic!("payload attribute missing");
+        };
+        assert!(s.len() <= 100);
+        assert_eq!(s.len() % 3, 0, "cut between the bytes of a character");
+        assert_eq!(markers(&sp), vec!["otlp_attribute_truncated"]);
+    }
+
+    #[test]
+    fn the_cheap_early_return_agrees_with_the_measurement_it_skips() {
+        // The early return answers "fits either way" by arithmetic instead of
+        // by measuring, so it has to be exactly right at its own edge: one byte
+        // too generous and an oversized payload ships unmarked.
+        for cap in [16usize, 17, 18, 19, 100, 1000] {
+            let edge = cap / 4 * 3;
+            for raw in [edge, edge + 1] {
+                let env = envelope(pb::Span {
+                    // Not text: the base64 branch is the one the arithmetic is
+                    // about, and the one with room to be wrong.
+                    input_data: (0..raw).map(|i| 0x80 | (i % 64) as u8).collect(),
+                    ..Default::default()
+                });
+                let sp = capped(env, limits_with_attribute_cap(cap));
+                let Some(otlp_pb::common::any_value::Value::StringValue(s)) =
+                    attr(&sp, "wardex.input_data")
+                else {
+                    panic!("payload attribute missing");
+                };
+                assert!(s.len() <= cap, "cap {cap}, raw {raw}: {} bytes", s.len());
+                assert_eq!(
+                    markers(&sp).is_empty(),
+                    raw <= edge,
+                    "cap {cap}, raw {raw}: marker disagrees with whether it was cut"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_payload_inside_the_bound_is_untouched_and_unmarked() {
+        // Absence has to stay legible: a span padded with a truncation marker
+        // it did not earn is indistinguishable from one that lost data.
+        let env = envelope(pb::Span {
+            output_data: b"plain text".to_vec(),
+            ..Default::default()
+        });
+        let sp = capped(env, limits_with_attribute_cap(100));
+        assert_eq!(
+            attr(&sp, "wardex.output_data"),
+            Some(&otlp_pb::common::any_value::Value::StringValue(
+                "plain text".into()
+            ))
+        );
+        assert!(attr(&sp, "wardex.limitations").is_none());
+    }
+
+    #[test]
+    fn the_cap_reaches_event_attributes_and_marks_the_span_that_owns_them() {
+        // An event has no `wardex.limitations` of its own, so a loss inside one
+        // is reported on the span or not at all.
+        let mut span = pb::Span::default();
+        span.events.push(pb::SpanEvent {
+            name: "gen_ai.content.prompt".into(),
+            attributes: vec![pb::KeyValue {
+                key: "content".into(),
+                value: Some(pb::AnyValue {
+                    value: Some(pb::any_value::Value::StringValue("x".repeat(5000))),
+                }),
+            }],
+            ..Default::default()
+        });
+        let sp = capped(envelope(span), limits_with_attribute_cap(100));
+        assert_eq!(
+            sp.events[0].attributes[0].value.as_ref().unwrap().value,
+            Some(otlp_pb::common::any_value::Value::StringValue(
+                "x".repeat(100)
+            ))
+        );
+        assert_eq!(markers(&sp), vec!["otlp_attribute_truncated"]);
+    }
+
+    #[test]
+    fn a_truncation_marker_joins_the_markers_the_span_already_carried() {
+        // The existing mechanism, not a parallel one: a span that was already
+        // reporting a limitation must end up with both, in one attribute.
+        let env = envelope(pb::Span {
+            input_data: vec![0u8; 4096],
+            capture_integrity: Some(pb::CaptureIntegrity {
+                limitation_codes: vec![pb::Limitation::BodyCapExceeded as i32],
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let sp = capped(env, limits_with_attribute_cap(100));
+        assert_eq!(
+            markers(&sp),
+            vec!["body_cap_exceeded", "otlp_attribute_truncated"]
+        );
+    }
+
+    #[test]
+    fn two_truncated_attributes_report_one_marker() {
+        let env = envelope(pb::Span {
+            input_data: vec![0u8; 4096],
+            output_data: vec![1u8; 4096],
+            ..Default::default()
+        });
+        let sp = capped(env, limits_with_attribute_cap(100));
+        assert_eq!(markers(&sp), vec!["otlp_attribute_truncated"]);
+    }
+
+    #[test]
+    fn dropping_the_payload_takes_its_encoding_companion_with_it() {
+        // A `.encoding = base64` left behind describes a value that is no
+        // longer there, and tells a consumer to decode an attribute it cannot
+        // find.
+        let env = envelope(pb::Span {
+            input_data: b"\x89PNG\xff\x00binary".to_vec(),
+            extra: vec![kv_wardex("gen_ai.request.model", "gpt-4.1-mini")],
+            ..Default::default()
+        });
+        let mut req = envelope_to_traces(env, PRODUCER);
+        strip_bytes_values(&mut req);
+        let sp = &mut req.resource_spans[0].scope_spans[0].spans[0];
+        drop_payload_attributes(sp);
+        assert!(attr(sp, "wardex.input_data").is_none());
+        assert!(attr(sp, "wardex.input_data.encoding").is_none());
+        // The semantics survive: the span keeps its place in the trace and
+        // still says which model it called.
+        assert_eq!(
+            attr(sp, "gen_ai.request.model"),
+            Some(&otlp_pb::common::any_value::Value::StringValue(
+                "gpt-4.1-mini".into()
+            ))
+        );
+        assert_eq!(markers(sp), vec!["otlp_attribute_truncated"]);
+    }
+
+    #[test]
+    fn dropping_a_payload_that_was_never_there_marks_nothing() {
+        let mut req = envelope_to_traces(envelope(pb::Span::default()), PRODUCER);
+        let sp = &mut req.resource_spans[0].scope_spans[0].spans[0];
+        drop_payload_attributes(sp);
+        assert!(attr(sp, "wardex.limitations").is_none());
     }
 }
