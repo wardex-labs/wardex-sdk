@@ -178,6 +178,47 @@ def test_forget_drops_the_hooks_without_running_them():
     assert fired == []
 
 
+class _DetachThatFires:
+    """A finalizer stand-in whose `detach()` reaches back into the registry.
+
+    The real thing has two routes to the same place and neither is easy to time:
+    `weakref.finalize.detach` is ordinary Python and allocates, so a cyclic
+    collection can start inside it, and any socket in the process closing on
+    another thread reaches `_fire` regardless. Modelling the re-entry directly
+    keeps the test deterministic instead of racing a collector for it.
+    """
+
+    def __init__(self, on_detach) -> None:
+        self._on_detach = on_detach
+
+    def detach(self) -> None:
+        self._on_detach()
+
+
+def test_clear_survives_an_entry_disappearing_while_it_walks_the_table():
+    """`clear()` is the one method that holds the table open across a re-entry.
+
+    Popping from a dict that is being iterated raises `RuntimeError`, and this
+    one would raise it out of `uninstall_shared_close_hook` — after the probes
+    above have restored their patches and before they clear their `_installed`
+    flags. That exception is counted and swallowed, the flag survives on a
+    module singleton, and the next `init()` finds an already-installed probe:
+    connection timing silently never instrumented again for the life of the
+    process.
+    """
+    reg = CloseRegistry()
+    victims = [_Weakrefable() for _ in range(4)]
+    for obj in victims:
+        reg.on_close(obj, lambda: None)
+
+    entry = reg._entries[id(victims[0])]
+    entry.finalizer = _DetachThatFires(lambda: reg.fire(victims[-1]))
+
+    reg.clear()
+
+    assert reg.tracked() == 0
+
+
 def test_an_object_that_refuses_a_weak_reference_is_not_a_swallowed_failure():
     """An absence is an answer, not a wardex bug.
 
