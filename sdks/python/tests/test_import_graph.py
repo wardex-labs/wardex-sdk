@@ -306,6 +306,21 @@ def _resolves_observed_without_asking(rel: str, tree: ast.Module):
     return predicate
 
 
+def _resolves_observed_without_declaring_eviction(rel: str, tree: ast.Module):
+    """A `resolve_observed(...)` call that does NOT declare `parent_evicted`."""
+    bound = _local_names(tree, "resolve_observed")
+    modules = _module_aliases(rel, tree)
+
+    def predicate(node: ast.AST) -> bool:
+        return (
+            isinstance(node, ast.Call)
+            and _reaches_symbol(node.func, "resolve_observed", bound, modules)
+            and not any(kw.arg == "parent_evicted" for kw in node.keywords)
+        )
+
+    return predicate
+
+
 def _reads_capture_mode(rel: str, tree: ast.Module):
     """Every way a module can reach `config.capture_mode`.
 
@@ -961,6 +976,51 @@ def test_the_observed_edge_is_told_whether_its_parent_died():
         "consumer can detect downstream (design §10.3).\n"
         "Latch assembly.parent_is_closed_unit(parent) on the task that ISSUES\n"
         "the work, store it beside the parent, and declare it here."
+    )
+
+
+# `parent_evicted` is the second defaulted argument on the same function with
+# the same failure mode — omit it and the mis-rooted span the argument exists to
+# prevent ships silently — so it needs the same mechanical protection. The rule
+# cannot be the blanket one above, because three sites legitimately omit it, so
+# it is an exact set instead: a NEW omitting call site changes this dict and
+# turns red, which is the moment the author has to decide rather than default.
+#
+# Each entry is a site that cannot see an evicted latch, and the reasons differ:
+#   * `_tracing.py` — a HAND-WRITTEN span. It latches the live scope itself at
+#     the instant it is called; there is no per-connection table between the
+#     latch and the resolve, so nothing can have evicted anything.
+#   * `interceptors/_mcp_stdio.py` — a subprocess pipe. Its pending table is
+#     keyed by JSON-RPC id and capped separately, and a dropped pending entry
+#     produces no span at all rather than an unparented one.
+#   * `interceptors/_seam.py` — `_build_ws_span`. A WS session inherits its
+#     parent from the upgrade transaction, and no cap sits between the two.
+# The h2 emit path (`_build_span`, same file) is the one that CAN, which is why
+# `interceptors/_seam.py` appears here with a count of 1 and not 2.
+_OBSERVED_WITHOUT_EVICTION = {
+    "_tracing.py": 1,
+    "interceptors/_mcp_stdio.py": 1,
+    "interceptors/_seam.py": 1,
+}
+
+
+def test_an_emit_path_that_can_lose_a_latch_entry_declares_it():
+    everywhere = {
+        k: v
+        for k, v in _tally(_resolves_observed_without_declaring_eviction).items()
+        if not k.startswith("assembly/")
+    }
+    assert everywhere == _OBSERVED_WITHOUT_EVICTION, (
+        f"resolve_observed is called without `parent_evicted=` at {everywhere},\n"
+        f"expected exactly {_OBSERVED_WITHOUT_EVICTION}.\n\n"
+        "WHY: a seam that latches a parent into a CAPPED per-connection table\n"
+        "can lose it to its own bound before the response claims it. Omitting\n"
+        "the argument ships that span as an honest trace root at confidence\n"
+        "1.0 — wardex's own defect presented as a fact about the traffic, and\n"
+        "under the default capture mode the gate drops it before anything can\n"
+        "say otherwise (interceptors/_trackers.py, the h2 stream latch).\n"
+        "If your site has no such table, add it above WITH THE REASON. If it\n"
+        "has one, carry the eviction beside the parent and declare it here."
     )
 
 

@@ -610,7 +610,7 @@ class ByteSeamInterceptor(InterceptorInterface):
         p = resolve_observed(
             _latched(txn),
             parent_closed=txn.parent_closed,
-            parent_evicted=getattr(txn, "parent_evicted", False),
+            parent_evicted=txn.parent_evicted,
         )
         url = f"{self._url_scheme(False)}://{url_host}:{st.server_port}{txn.path}"
         transfer = max(0.0, (txn.end_ns - txn.start_ns) / 1e6 - txn.ttfb_ms)

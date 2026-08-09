@@ -407,11 +407,11 @@ def resolve_observed(
     stay inside a bound of its own (`interceptors/_trackers.py`, the h2 stream
     latch). So it earns the same pair of markers as a failed open, for the same
     reason — the parent existed, wardex lost it, and the alternative is a span
-    that ships as a legitimate trace root at confidence 1.0. It shares the
-    branch rather than adding one beside it because there is nothing to tell
-    apart downstream: "wardex dropped what belongs on this span" is the whole
-    content of both, and the knob a user reaches for is different only in that
-    one of them has a knob at all.
+    that ships as a legitimate trace root at confidence 1.0. It reaches the same
+    pair of markers because there is nothing to tell apart downstream: "wardex
+    dropped what belongs on this span" is the whole content of both, and the
+    knob a user reaches for is different only in that one of them has a knob at
+    all.
 
     It is not an over-reach on a stream that had no parent to lose. The dropped
     record held the request instant too, so the span's own start and duration
@@ -419,13 +419,23 @@ def resolve_observed(
     "wardex lost bookkeeping that belongs here", which is true in both cases,
     and the alternative is a span that looks measured and rooted and is neither.
 
-    A caller that passes `parent_evicted=True` must NOT also hand over the
-    ambient it could not resolve — the eviction means there is none, and the
-    empty carrier is what the first case already refuses to embellish.
+    Refused to `EMPTY_AMBIENT` for the same reason `parent_closed` is, and in
+    code rather than as a rule for callers: the eviction IS the statement that
+    nothing usable was resolved, so an ambient arriving beside it can only be
+    one the caller could not vet. Left to flow through, a non-empty one takes
+    `resolve_parentage`'s JOIN branch and ships `joined=True` with a parent
+    while `strategy=UNRESOLVED` claims there is none — a span simultaneously
+    adopting and disowning, which is the exact undetectable shape this whole
+    module exists to prevent. Nothing is lost by the substitution: the byte
+    seam's carrier on this path holds no conversation and no tracestate either.
     """
     if parent_closed:
         return resolve_parentage(EMPTY_AMBIENT, _ORPHANED_BY_WARDEX)
-    if parent_evicted or (ambient.span_context is None and in_degraded_run()):
+    if parent_evicted:
+        return resolve_parentage(EMPTY_AMBIENT, _ORPHANED_BY_WARDEX).with_limitation(
+            Limitation.INSTRUMENTATION_DEGRADED
+        )
+    if ambient.span_context is None and in_degraded_run():
         return resolve_parentage(ambient, _ORPHANED_BY_WARDEX).with_limitation(
             Limitation.INSTRUMENTATION_DEGRADED
         )
