@@ -9,18 +9,23 @@ a comment saying so.
 The close hook added a second route with none of the first one's limits. It
 backstops itself with `weakref.finalize`, a WebSocket span exists only once its
 connection ends, and `_seam._retire` therefore emits one from inside a weakref
-callback — which CPython runs at an arbitrary ALLOCATION, on whatever thread
-dropped the last reference, and on ANY thread rather than only the main one.
-So `Client.capture_span` (and through it `BatchWorker.ensure_alive`, which may
-now start a thread from a finalizer) is reachable from the middle of any wardex
-frame that allocates while holding a lock.
+callback. CPython runs such a callback out of the referent's DEALLOCATION, so it
+lands wherever a reference count reaches zero — an attribute store, a `del`, a
+container eviction, a frame exit, a cascade out of a dying container — and
+additionally at any allocation, because that is what starts a cyclic collection.
+On whatever thread dropped that reference, which need not be the main one. So
+`Client.capture_span` (and through it `BatchWorker.ensure_alive`, which may now
+start a thread from a finalizer) is reachable from the middle of any wardex
+frame that holds a lock while releasing a reference or allocating — which is
+nearly all of them, and is why the default here has to be a reentrant lock.
 
 The analysis said this was already safe, because the locks on that path were
 made reentrant for the signal handler. This file is the part that was missing:
-the claim exercised rather than argued. Each test drops the last reference to a
-registered object at a chosen moment, which fires the finalizer synchronously on
-the current thread — no `gc.collect()`, no sleeping, no race — and asserts that
-the re-entry both completed and kept its data.
+the claim exercised rather than argued. Each test takes the refcount route
+rather than the cyclic one — it drops the last reference to a registered object
+at a moment it chose, which runs the callback synchronously on the current
+thread, with no `gc.collect()`, no sleeping and no race — and asserts that the
+re-entry both completed and kept its data.
 
 A deadlock cannot be caught with `pytest.raises`, and a self-deadlocked thread
 cannot be interrupted from outside. So every scenario runs on a throwaway daemon
@@ -32,9 +37,11 @@ from __future__ import annotations
 
 import ast
 import inspect
+import os
 import pathlib
 import threading
 import types
+from collections import Counter
 
 import pytest
 
@@ -215,19 +222,29 @@ def test_a_finalizer_captures_a_span_while_the_close_lock_is_held():
 
     Its justification is a claim about REACH — nothing that can re-enter this
     thread arrives at `close()` — and a claim about reach is only as good as the
-    call graph on the day it was written. This pins the half that is testable:
-    the finalizer path, entered while the close lock is held, completes. If some
-    future hook routes `close()` onto the finalizer or signal path, that comment
-    stops holding and the lock has to become an RLock; this test does not catch
-    that day by itself, so `test_only_one_lock_in_the_sdk_is_non_reentrant`
-    below makes the holdout impossible to add a second one of by accident.
+    call graph on the day it was written. This is the canary for the day it
+    stops holding: `capture_span` takes `_buffer_lock` and never `_close_lock`,
+    so today the re-entry completes whatever the holdout's lock type is, and the
+    test passes. A refactor that routes any part of the capture path through
+    `_close_lock` turns it into a self-deadlock the probe reports as a timeout.
+    Which is why the assertions below pin that the re-entry really happened
+    inside the window: a test that quietly stopped exercising it would keep
+    passing and guard nothing.
+
+    The other half — a SECOND plain Lock arriving somewhere else — is
+    `test_only_one_lock_in_the_sdk_is_non_reentrant` below.
     """
     client = _client()
     registry = CloseRegistry()
-    captured: list[str] = []
+    observed: dict[str, object] = {}
 
     def hook() -> None:
-        captured.append("fired")
+        # `locked()` and not `_is_owned()`: a plain Lock has no owner to ask.
+        # Paired with the thread identity below it is the same observation the
+        # buffer-lock test makes — that the re-entry really did happen inside
+        # the window this test names, rather than before it or elsewhere.
+        observed["lock_held"] = client._close_lock.locked()
+        observed["thread"] = threading.get_ident()
         client.capture_span(_span("from-finalizer"))
 
     def scenario() -> None:
@@ -235,13 +252,25 @@ def test_a_finalizer_captures_a_span_while_the_close_lock_is_held():
         registry.on_close(victim, hook)
         holder = [victim]
         del victim
+        observed["outer_thread"] = threading.get_ident()
         with client._close_lock:
             client.capture_span(_span("outer"))
             holder.clear()
 
     try:
         _on_a_probe_thread(scenario)
-        assert captured == ["fired"]
+
+        assert observed.get("lock_held") is True, (
+            "the finalizer did not run while the close lock was held, so this "
+            "test proved nothing about the holdout"
+        )
+        assert observed["thread"] == observed["outer_thread"], (
+            "the finalizer ran on another thread — that is ordinary contention, "
+            "not the same-thread re-entry this guards"
+        )
+        assert [s.name for s in client._spans] == ["outer", "from-finalizer"], (
+            "the re-entrant capture was swallowed while the close lock was held"
+        )
     finally:
         if not _abandoned_probe():
             client.close(1.0)
@@ -255,17 +284,17 @@ def test_a_finalizer_captures_a_span_while_the_close_lock_is_held():
 class _SpawnProbe:
     """A `threading.Thread` stand-in that fires a finalizer mid-spawn.
 
-    `_spawn_locked` has three statements between setting `_spawning` and
-    clearing it, and the re-entry sees different state at each. This probe fires
-    at whichever of the two windows that matter the caller asks for, because a
-    test that only ever hits one of them proves the flag for one of them:
+    `_spawn_locked` has several statements between marking the spawn in flight
+    and clearing it, and the re-entry sees different state at each. This probe
+    fires at whichever of the two windows that matter the caller asks for,
+    because a test that only ever hits one of them proves the marker for one:
 
       ALLOCATING — inside the `Thread(...)` call, before `self._thread` is
       assigned. The re-entry sees no thread at all, which is also what a fresh
       worker and a post-fork one look like.
 
       STARTING — after `self._thread` is assigned and before `start()` runs.
-      This is the window `_spawning` is really for: `is_alive()` is False
+      This is the window the marker is really for: `is_alive()` is False
       because the thread has not started, so every other signal available to
       `ensure_alive` says "respawn", and the flag is the only thing that says
       otherwise. Without it the re-entry spawns and publishes its own thread,
@@ -332,8 +361,8 @@ def test_ensure_alive_reentered_mid_spawn_starts_exactly_one_thread(
     the nested call sees a thread that is not alive yet, spawns its own, and the
     outer frame then overwrites `self._thread` with the one it was already
     building. Two SDK threads exist, one of them orphaned and unjoinable, and
-    `stop()` can only ever join the survivor. `_spawning` is what closes that,
-    and this is the test that fails without it.
+    `stop()` can only ever join the survivor. The in-flight marker is what
+    closes that, and this is the test that fails without it.
 
     Both windows, because they are not the same claim. In `allocating` the
     re-entry could also have been stopped by a `self._thread is None` check; in
@@ -372,10 +401,40 @@ def test_ensure_alive_reentered_mid_spawn_starts_exactly_one_thread(
             "thread is orphaned and stop() can never join it"
         )
         assert worker.is_alive()
-        assert worker._spawning is False, "the spawn flag outlived the spawn"
+        assert worker._spawning_pid is None, "the spawn marker outlived the spawn"
     finally:
         if not _abandoned_probe():
             worker.stop(1.0)
+
+
+@pytest.mark.parametrize("entry_point", ["start", "ensure_alive"])
+def test_a_spawn_marker_inherited_from_a_fork_still_lets_the_child_respawn(entry_point):
+    """The other half of the spawn guard: the marker, not the lock.
+
+    What suppresses the double spawn is a marker set before the thread is built
+    and cleared in a `finally` — and that `finally` lives on a frame that does
+    not survive `os.fork()`. Fork while any other thread is inside the spawn
+    (`Thread(...)` and `start()` allocate, so the window is the whole body) and
+    a plain boolean arrives in the child already set, with nothing left in the
+    child that could clear it. Every later `start()`/`ensure_alive()` then
+    declines forever: no periodic drain for the life of the process, spans
+    accumulating until the buffer cap evicts them, and no self-healing — which
+    is worse than the inherited-lock hazard it sits next to, because that one at
+    least resolves. Storing the owning PID is what makes the inherited value
+    read as "a spawn in the parent".
+    """
+    worker = BatchWorker(lambda: None, interval=3600.0)
+    worker._spawning_pid = os.getpid() - 1  # what a fork mid-spawn leaves behind
+
+    try:
+        getattr(worker, entry_point)()
+        assert worker.is_alive(), (
+            "the child inherited a spawn marker it can never clear and refused "
+            "to respawn its worker; nothing after a fork would ever be drained"
+        )
+        assert worker._spawning_pid is None
+    finally:
+        worker.stop(1.0)
 
 
 def test_a_span_emitted_during_the_worker_respawn_is_not_lost(monkeypatch):
@@ -421,14 +480,25 @@ def test_a_span_emitted_during_the_worker_respawn_is_not_lost(monkeypatch):
             client.close(1.0)
 
 
-def test_stop_during_a_spawn_leaves_no_unjoinable_thread(monkeypatch):
+@pytest.mark.parametrize("window", ["allocating", "starting"])
+def test_stop_during_a_spawn_leaves_no_unjoinable_thread(monkeypatch, window):
     """`stop()` takes the same lock, so the finalizer route reaches it too.
 
     A finalizer that lands mid-spawn and reaches `close()` — the runtime's
     atexit path is one call away from it — arrives at `stop()` on a thread that
-    already owns `_spawn_lock`. The RLock lets it through; what it must not do
-    is read a half-written `_thread`/`_thread_for_pid` pair and join something
-    the outer frame is about to replace.
+    already owns `_spawn_lock`. The RLock lets it through, and letting it
+    through is what creates the hazard the plain Lock used to hide behind a
+    hang: the nested `stop()` sets `_stopped`, finds nothing published to join,
+    and RETURNS. Whatever the outer frame does next happens after `stop()` has
+    already promised the caller there is no worker thread left.
+
+    Both windows, because the outer frame is at a different point in each:
+
+      ALLOCATING — nothing is published, so the spawn must be abandoned. A
+      thread started here is one `stop()` never saw and nothing can ever join.
+
+      STARTING — the thread object is already published, so `stop()` can find
+      it and a later one can join it. It still must not be left running.
     """
     worker = BatchWorker(lambda: None, interval=3600.0)
     seen: list[tuple[object, object]] = []
@@ -437,21 +507,26 @@ def test_stop_during_a_spawn_leaves_no_unjoinable_thread(monkeypatch):
         seen.append((worker._thread, worker._thread_for_pid))
         worker.stop(0.1)
 
-    factory = _SpawnProbe(stop_from_inside)
+    factory = _SpawnProbe(stop_from_inside, at=window)
     _patch_worker_threading(monkeypatch, factory)
 
     _on_a_probe_thread(worker.start)
 
-    assert seen == [(None, None)], (
-        "the nested stop() saw a thread the outer spawn had not finished "
-        "publishing; the assignment order in _spawn_locked changed"
-    )
     assert factory.calls == 1
-    # The nested stop() set `_stopped`, so the thread the outer frame went on to
-    # start exits on its first loop check rather than living to the next test.
     worker.stop(1.0)
-    assert worker._thread is not None
-    assert not worker._thread.is_alive() or worker._stopped
+    if window == "allocating":
+        assert seen == [(None, None)], (
+            "the nested stop() saw a thread the outer spawn had not finished "
+            "publishing; the assignment order in _spawn_locked changed"
+        )
+        assert worker._thread is None, (
+            "a worker thread was started after stop() had already returned reporting none to join"
+        )
+    else:
+        assert worker._thread is not None
+        assert not worker._thread.is_alive(), (
+            "the thread the outer frame started outlived the stop() that ran inside the spawn"
+        )
 
 
 # --------------------------------------------------------------------------
@@ -459,27 +534,87 @@ def test_stop_during_a_spawn_leaves_no_unjoinable_thread(monkeypatch):
 # --------------------------------------------------------------------------
 
 
-def _plain_lock_sites(tree: ast.AST, where: str) -> list[str]:
-    """Every `threading.Lock()` assignment in one module, as "file target".
+_LOCK_MODULES = frozenset({"threading", "_thread"})
+_LOCK_FACTORIES = frozenset({"Lock", "allocate_lock"})
 
-    Assignments only, deliberately. A lock that is not stored somewhere cannot
+
+def _lock_names(tree: ast.AST) -> tuple[set[str], set[str]]:
+    """What "a non-reentrant lock" is spelled as inside ONE module's namespace.
+
+    Read off that module's own imports rather than fixed, because a guard is
+    worth exactly what its predicate is worth: `import threading as t` and
+    `from threading import Lock as _Lock` are both plain locks written in a way
+    a hard-coded pattern does not see, and a predicate that matches nothing
+    passes forever.
+    """
+    modules = set(_LOCK_MODULES)
+    bare = set(_LOCK_FACTORIES)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name in _LOCK_MODULES and alias.asname:
+                    modules.add(alias.asname)
+        elif isinstance(node, ast.ImportFrom) and node.module in _LOCK_MODULES:
+            for alias in node.names:
+                if alias.name in _LOCK_FACTORIES and alias.asname:
+                    bare.add(alias.asname)
+    return modules, bare
+
+
+def _names_a_lock_factory(node: ast.expr, modules: set[str], bare: set[str]) -> bool:
+    if isinstance(node, ast.Attribute):
+        return (
+            node.attr in _LOCK_FACTORIES
+            and isinstance(node.value, ast.Name)
+            and node.value.id in modules
+        )
+    return isinstance(node, ast.Name) and node.id in bare
+
+
+def _builds_a_plain_lock(value: ast.expr, modules: set[str], bare: set[str]) -> bool:
+    if not isinstance(value, ast.Call):
+        return False
+    if _names_a_lock_factory(value.func, modules, bare):
+        return True
+    # `field(default_factory=threading.Lock)` never spells a call to Lock at all.
+    return any(
+        kw.arg == "default_factory" and _names_a_lock_factory(kw.value, modules, bare)
+        for kw in value.keywords
+    )
+
+
+def _plain_lock_sites(tree: ast.AST, where: str) -> list[str]:
+    """Every plain-lock assignment in one module, as "file target".
+
+    Assignments only, deliberately — annotated ones included, since that is a
+    spelling this repo uses freely. A lock that is not stored somewhere cannot
     be re-acquired by anybody, so it is not a re-entrancy question; every lock
     this SDK owns is a bound attribute or a module global.
+
+    What it still cannot see, so that the gap is a decision rather than a
+    surprise: a lock built inside a helper and returned, and one bound to a
+    local before being stored. Both put the construction and the storage in
+    different statements, which no single-statement predicate can join; the
+    SDK has neither today, and a reviewer meeting one has to reason by hand.
     """
+    modules, bare = _lock_names(tree)
     found: list[str] = []
     for node in ast.walk(tree):
-        if not isinstance(node, ast.Assign) or not isinstance(node.value, ast.Call):
+        if isinstance(node, ast.Assign):
+            targets, value = node.targets, node.value
+        elif isinstance(node, ast.AnnAssign):
+            targets, value = [node.target], node.value
+        else:
             continue
-        func = node.value.func
-        is_plain_lock = (
-            isinstance(func, ast.Attribute)
-            and func.attr == "Lock"
-            and isinstance(func.value, ast.Name)
-            and func.value.id == "threading"
-        ) or (isinstance(func, ast.Name) and func.id == "Lock")
-        if not is_plain_lock:
+        if value is None:
+            continue  # a bare annotation builds nothing
+        # A tuple/list assignment holds its calls one level down, and pairing
+        # them back to individual targets is not worth it: naming the whole
+        # target is enough to find the line.
+        built = value.elts if isinstance(value, (ast.Tuple, ast.List)) else [value]
+        if not any(_builds_a_plain_lock(v, modules, bare) for v in built):
             continue
-        for target in node.targets:
+        for target in targets:
             found.append(f"{where} {ast.unparse(target)}")
     return found
 
@@ -489,10 +624,10 @@ def _plain_lock_sites(tree: ast.AST, where: str) -> list[str]:
 #: re-entering them is not merely a hang — it would let two frames each conclude
 #: they were the one closing. Its safety is an argument about which callers can
 #: reach it, written out at its declaration. Every other lock is an RLock
-#: because a weakref finalizer lands at an arbitrary allocation and a plain Lock
-#: there is a permanent self-deadlock in the HOST's code, at a line the host did
-#: not write.
-_DOCUMENTED_HOLDOUTS = {"wardex_sdk/_client.py self._close_lock"}
+#: because a weakref finalizer lands wherever a reference count reaches zero,
+#: and a plain Lock there is a permanent self-deadlock in the HOST's code, at a
+#: line the host did not write.
+_DOCUMENTED_HOLDOUTS = frozenset({"wardex_sdk/_client.py self._close_lock"})
 
 
 def test_only_one_lock_in_the_sdk_is_non_reentrant():
@@ -505,21 +640,25 @@ def test_only_one_lock_in_the_sdk_is_non_reentrant():
     argument's second half — the first half belongs at the declaration.
     """
     package = pathlib.Path(inspect.getfile(wardex_sdk)).parent
-    sites: list[str] = []
+    # Counted, not a set: two plain locks in one module bound to the same
+    # attribute name produce the same key, and a set would let the second hide
+    # behind the documented one. Each holdout entry accounts for exactly one
+    # site, so a duplicate survives the subtraction and is reported.
+    sites: Counter[str] = Counter()
     for path in sorted(package.rglob("*.py")):
         where = path.relative_to(package.parent).as_posix()
-        sites += _plain_lock_sites(ast.parse(path.read_text(encoding="utf-8")), where)
+        sites.update(_plain_lock_sites(ast.parse(path.read_text(encoding="utf-8")), where))
 
-    unexpected = sorted(set(sites) - _DOCUMENTED_HOLDOUTS)
+    unexpected = sorted((sites - Counter(_DOCUMENTED_HOLDOUTS)).elements())
     assert unexpected == [], (
         "non-reentrant locks added without a finalizer-reachability argument: "
         + ", ".join(unexpected)
-        + " — a weakref finalizer runs at an arbitrary allocation on any thread, "
-        "so a plain Lock deadlocks the host unless nothing on that path can "
-        "reach it. Say why at the declaration, then list it in "
+        + " — a weakref finalizer runs wherever a reference count reaches zero, "
+        "on any thread, so a plain Lock deadlocks the host unless nothing on "
+        "that path can reach it. Say why at the declaration, then list it in "
         "_DOCUMENTED_HOLDOUTS."
     )
-    assert sorted(set(sites)) == sorted(_DOCUMENTED_HOLDOUTS), (
+    assert sorted(Counter(_DOCUMENTED_HOLDOUTS) - sites) == [], (
         "a documented holdout no longer exists in the source; drop its entry "
         "rather than leaving the list describing code that is gone"
     )
@@ -529,14 +668,28 @@ def test_the_lock_scan_can_see_a_reintroduced_plain_lock():
     """The scan, watched failing, on source handed to it rather than on the tree.
 
     A source-scanning guard is worth exactly what its predicate is worth, and a
-    predicate that matches nothing passes forever.
+    predicate that matches nothing passes forever. So every spelling the scan
+    claims to cover is fed to it here, including the ones a contributor is more
+    likely to reach for than the plain `self._x = threading.Lock()` — this repo
+    annotates attribute assignments freely, and an unseen annotation is a plain
+    Lock reintroduced with the guard still green.
     """
     source = (
+        "import threading as t\n"
+        "from threading import Lock as _L\n"
+        "from _thread import allocate_lock as _alloc\n"
         "self._a = threading.Lock()\n"  # the shape the sweep is about
         "_B = threading.Lock()\n"  # a module global counts too
         "self._c = Lock()\n"  # `from threading import Lock`
-        "self._d = threading.RLock()\n"  # already reentrant
-        "self._e = threading.Event()\n"  # not a lock at all
+        "self._d: threading.Lock = threading.Lock()\n"  # annotated: an AnnAssign
+        "self._e = t.Lock()\n"  # aliased module
+        "self._f = _L()\n"  # aliased factory
+        "self._g = _alloc()\n"  # the low-level allocator underneath Lock
+        "_H = field(default_factory=threading.Lock)\n"  # never spelled as a call
+        "i, j = threading.Lock(), threading.RLock()\n"  # one lock inside a tuple
+        "self._k: threading.Lock\n"  # an annotation alone builds nothing
+        "self._l = threading.RLock()\n"  # already reentrant
+        "self._m = threading.Event()\n"  # not a lock at all
         "with threading.Lock():\n    pass\n"  # unstored: nobody can re-acquire it
     )
 
@@ -544,4 +697,10 @@ def test_the_lock_scan_can_see_a_reintroduced_plain_lock():
         "fake.py self._a",
         "fake.py _B",
         "fake.py self._c",
+        "fake.py self._d",
+        "fake.py self._e",
+        "fake.py self._f",
+        "fake.py self._g",
+        "fake.py _H",
+        "fake.py (i, j)",
     ]

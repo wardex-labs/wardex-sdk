@@ -35,20 +35,24 @@ class BatchWorker:
         # RLock, and the reason is not the signal handler this SDK usually
         # documents. `capture_span` calls `ensure_alive()`, and a WebSocket span
         # can now be shipped from a `weakref.finalize` callback (the byte seams'
-        # close hook) — which runs at an arbitrary allocation, on whatever
-        # thread dropped the last reference, INCLUDING a thread that is already
-        # inside `_spawn_locked` allocating the replacement thread. A plain Lock
-        # there is a permanent self-deadlock in the host's own code.
+        # close hook) — which CPython runs out of its referent's deallocation,
+        # so wherever a reference count reaches zero and on whatever thread
+        # dropped it, INCLUDING a thread that is already inside `_spawn_locked`.
+        # The `Thread(...)` construction there is one such site twice over: it
+        # allocates, so a cyclic collection can start in it, and it drops the
+        # previous thread object when `self._thread` is overwritten. A plain
+        # Lock there is a permanent self-deadlock in the host's own code.
         self._spawn_lock = threading.RLock()
         # What the RLock cannot supply on its own: reentering would otherwise
         # see a not-yet-started thread, spawn a SECOND one and leave the outer
         # frame's thread orphaned. A spawn in progress is a spawn; whoever
-        # arrives during it has nothing to do.
-        self._spawning = False
+        # arrives during it has nothing to do. Stored as the PID that owns the
+        # spawn rather than as a bool — see `_spawn_in_flight`.
+        self._spawning_pid: int | None = None
 
     def start(self) -> None:
         with self._spawn_lock:
-            if self.is_alive() or self._spawning:
+            if self.is_alive() or self._spawn_in_flight():
                 return  # exactly one SDK thread — start() is idempotent
             self._spawn_locked()
 
@@ -63,6 +67,25 @@ class BatchWorker:
             and self._thread.is_alive()
         )
 
+    def _spawn_in_flight(self) -> bool:
+        """Is a spawn in progress IN THIS process?
+
+        A PID rather than a bool, and the two differ only after a fork.
+        `_spawn_locked` clears the marker in a `finally`, and that frame does
+        not exist in the child: fork while another thread is anywhere inside the
+        spawn — `Thread(...)` and `start()` allocate heavily, so the window is
+        the whole body, not a gap between two statements — and a boolean arrives
+        in the child already set with nothing left to clear it. Both `start()`
+        and `ensure_alive()` would then decline forever, so the child would
+        never respawn its worker and would never recover: no periodic drain for
+        the process lifetime, spans accumulating until the buffer cap evicts
+        them, and nothing shipped short of an explicit `close()`. Comparing PIDs
+        makes an inherited value mean "a spawn in the parent", which is not one
+        here. Only ever asked on the locked slow path, so the extra `getpid()`
+        never lands on a capture.
+        """
+        return self._spawning_pid == os.getpid()
+
     def ensure_alive(self) -> None:
         """Respawn the thread if it died or belongs to a pre-fork parent.
 
@@ -71,7 +94,7 @@ class BatchWorker:
         if self._stopped or self.is_alive():
             return
         with self._spawn_lock:
-            if self._stopped or self.is_alive() or self._spawning:
+            if self._stopped or self.is_alive() or self._spawn_in_flight():
                 return  # another thread respawned it while we waited
             if self._debug:
                 print("[wardex] batch worker restarted (fork or thread death)", file=sys.stderr)
@@ -96,14 +119,29 @@ class BatchWorker:
             thread.join(timeout)
 
     def _spawn_locked(self) -> None:
-        self._spawning = True
+        if self._stopped:
+            return
+        self._spawning_pid = os.getpid()
         try:
             thread = threading.Thread(target=self._run, daemon=True, name="wardex-batch-worker")
+            # `_stopped` again, and this is the check that earns its place. The
+            # RLock made a sequence reachable that a plain Lock used to deadlock
+            # on: a finalizer landing in the allocation above and reaching
+            # `stop()` on this thread now gets through — `stop()` sets
+            # `_stopped`, re-enters this lock, reads a `_thread`/`_thread_for_pid`
+            # pair this frame has not published yet, finds nothing to join and
+            # returns. Starting the thread afterwards would mean `stop()` had
+            # returned while a worker was about to begin, with nothing left that
+            # could ever join it, and `Client.close()` inherits that contract.
+            # Dropping the unstarted thread instead costs one wasted allocation
+            # on a path that is already shutting down.
+            if self._stopped:
+                return
             self._thread = thread
             self._thread_for_pid = os.getpid()
             thread.start()
         finally:
-            self._spawning = False
+            self._spawning_pid = None
 
     def _run(self) -> None:
         while True:
