@@ -41,11 +41,25 @@ neither alone is enough:
   handed to anything else, so there is no instant at which a live object shares
   an id with a registered-but-unfired hook.
 
-What neither half reaches is a POOLED `ssl.SSLObject` — the async TLS seam's
-carrier, which has no close to patch and which asyncio's `SSLProtocol` holds for
-the life of the transport, so it is neither closed nor collected. There is no
-end-of-connection signal for it, which is why nothing sized by a connection may
-depend on one alone: see the explicit cap beside `_Http2Tracker._latch`.
+  CONNECTION LOST — `asyncio.sslproto.SSLProtocol.connection_lost` is patched,
+  which is the only end-of-connection signal a POOLED `ssl.SSLObject` has. The
+  async TLS seam's carrier has no `close()` for the first half to patch, and
+  asyncio pins it to the protocol for the transport's whole life, so the second
+  half does not run either until the pool itself is dropped: per-connection
+  state for a keep-alive connection to a model provider was held for as long as
+  the pool held the connection. That is where the original leak was found.
+  The protocol object, however, IS told — this is the call that ends its
+  transport — and it is holding the `SSLObject`, so the moment exists after all
+  and only needed to be read off a private attribute one layer up.
+
+That third patch is a best-effort improvement over GC timing, never a guarantee,
+and it is the reason nothing sized by a connection may depend on any single
+signal. It is absent under an event loop that implements TLS itself rather than
+through `asyncio.sslproto` (uvloop is the one every user has), and under a
+protocol subclass that overrides `connection_lost` without calling up. Both
+degrade to the finalizer, which is late but correct — and behind both stands the
+one bound that needs no signal at all: the explicit cap beside
+`_Http2Tracker._latch`.
 
 Nothing here may hold a strong reference to the observed object — a registry
 that pins sockets would keep the host's file descriptors open, which is a
@@ -86,6 +100,9 @@ _FIRE = guard("interceptors.close_hook.fire")
 #: be able to fail; if it does, that is a wardex failure and belongs in a
 #: counter. An object that simply refuses one is not — see `_supports_weakref`.
 _REGISTER = guard("interceptors.close_hook.register")
+#: Importing a stdlib module should not be able to fail either — see
+#: `_ssl_protocol_class`, which is the one place this is entered.
+_IMPORT_SSLPROTO = guard("interceptors.close_hook.sslproto_import")
 
 
 class _Entry:
@@ -252,6 +269,48 @@ def _finalizer(registry: CloseRegistry, obj: Any, cid: int) -> weakref.finalize 
     return fin
 
 
+def _ssl_protocol_class() -> Any:
+    """`asyncio.sslproto.SSLProtocol`, or None where there is no such thing.
+
+    Imported at first install rather than at module scope: `_close_hook` is
+    reached by the plaintext seam and by the timing probe too, and neither has
+    any reason to pull asyncio's TLS machinery — and `ssl` behind it — into a
+    process that never awaits anything.
+
+    Guarded, and counted rather than swallowed, because unlike anyio this is not
+    an optional dependency: `asyncio.sslproto` is stdlib, so a failure to import
+    it is a fact about this runtime that a maintainer wants to see. Absent, the
+    async TLS path keeps the finalizer and the per-connection caps and loses
+    only promptness — degraded, never wrong.
+    """
+    sslproto: Any = None
+    with _IMPORT_SSLPROTO:
+        from asyncio import sslproto as _sslproto
+
+        sslproto = _sslproto
+    return getattr(sslproto, "SSLProtocol", None)
+
+
+def _sslobj_of(protocol: Any) -> Any:
+    """The `ssl.SSLObject` an `SSLProtocol` is driving, or None.
+
+    Two spellings for one attribute, and both are private. Since the 3.11
+    rewrite the protocol wraps the BIO itself and holds `_sslobj`; before it,
+    the object lived one layer down in the `_SSLPipe` the protocol drove, which
+    exposes it as `ssl_object`. Neither is guaranteed by anything, so both are
+    read with a default and a miss costs the timely half only — the finalizer
+    and the per-connection caps are still underneath.
+
+    None is also the ordinary answer for a connection that died during the
+    handshake: there is no `SSLObject` yet, and nothing registered a hook
+    against one.
+    """
+    sslobj = getattr(protocol, "_sslobj", None)
+    if sslobj is not None:
+        return sslobj
+    return getattr(getattr(protocol, "_sslpipe", None), "ssl_object", None)
+
+
 class CloseProbe:
     """Turns the end of a `socket.socket` into a registry event. Idempotent, fail-silent.
 
@@ -283,8 +342,23 @@ class CloseProbe:
 
     `ssl.SSLSocket` inherits `close` and overrides `_real_close` with a
     `super()` call, so the TLS seam's objects arrive through these same two
-    patches. `ssl.SSLObject` is not a socket and has neither method; it reaches
-    the registry through the finalizer only.
+    patches. `ssl.SSLObject` is not a socket and has neither, which is what the
+    THIRD patch is for.
+
+    `asyncio.sslproto.SSLProtocol.connection_lost` is that third, and it is a
+    patch on somebody else's private class — asked for with `getattr` and
+    skipped when absent, exactly as `_real_close` is. It earns the exception
+    because the alternative is not "late", it is "never": an `SSLObject` in a
+    connection pool is closed by nobody and collected by nobody, so this is the
+    only moment at which its per-connection state can be released while the
+    process still cares. The protocol is told its transport ended and is
+    holding the object the seam keyed everything by; nothing else in the
+    interpreter knows both facts at once.
+
+    The `SSLObject` is read BEFORE the original runs, because 3.10 clears the
+    `_SSLPipe` that holds it on the way out. Two attribute paths for the same
+    thing: `SSLProtocol._sslobj` since the 3.11 rewrite, and the pipe's
+    `ssl_object` before it.
     """
 
     __slots__ = ("_installed", "_patches", "_registry")
@@ -304,6 +378,10 @@ class CloseProbe:
         real_close = getattr(socket.socket, "_real_close", None)
         if real_close is not None:
             self._patches.patch(socket.socket, "_real_close", self._mk_real_close(real_close))
+        proto = _ssl_protocol_class()
+        lost = getattr(proto, "connection_lost", None)
+        if lost is not None:
+            self._patches.patch(proto, "connection_lost", self._mk_connection_lost(lost))
         self._installed = True
 
     def uninstall(self) -> None:
@@ -335,6 +413,20 @@ class CloseProbe:
             # Still ahead of the fd going back to the kernel, which is what the
             # fileno-keyed hooks (`_conn_timing`) require of a close event.
             registry.fire(this)
+            return orig(this, *a, **k)
+
+        return wrapper
+
+    def _mk_connection_lost(self, orig: Any):  # noqa: ANN202
+        registry = self._registry
+
+        def wrapper(this: Any, *a: Any, **k: Any) -> Any:
+            # Ahead of the original for two reasons: the same one `_mk_close`
+            # gives, and because 3.10's `connection_lost` drops the `_SSLPipe`
+            # that owns the object we are looking for.
+            sslobj = _sslobj_of(this)
+            if sslobj is not None:
+                registry.fire(sslobj)
             return orig(this, *a, **k)
 
         return wrapper

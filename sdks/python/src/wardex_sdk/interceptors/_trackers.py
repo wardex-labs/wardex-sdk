@@ -286,14 +286,20 @@ class _Http2Tracker:
         # There is no per-stream close signal to act on — the parser reports
         # transactions, not stream lifecycles.
         #
-        # So there are TWO bounds, because one of them cannot be reached
+        # So there are TWO bounds, because the first one is not reachable
         # everywhere. `on_connection_close` is the honest one and empties this
         # table outright — but it is driven by the close hook, and the async TLS
         # seam's carrier is an `ssl.SSLObject`: no `close()` to patch, and
         # pinned by asyncio's `SSLProtocol` for the life of a pooled connection,
         # so it is neither closed nor collected. That is exactly the h2
-        # keep-alive to a model provider this leak was found on. The FIFO cap
-        # below is what holds on that path.
+        # keep-alive to a model provider this leak was found on.
+        #
+        # The close hook now reaches that carrier too, through the protocol's
+        # `connection_lost` — but only where asyncio's own TLS implementation is
+        # the one running (not uvloop's) and only when the pool actually drops
+        # the connection, which for a keep-alive to a model provider may be
+        # never. A cap that needs no signal at all is what makes the bound
+        # unconditional, and that is the FIFO cap below.
         self._latch: dict[int, tuple[SpanContext | None, bool, int]] = {}
         self._latch_cap = _max_streams(limits)
         #: The highest stream id the cap has evicted, and the whole memory of

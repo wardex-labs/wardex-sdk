@@ -261,6 +261,104 @@ def test_detach_is_not_a_close():
 
 
 # --------------------------------------------------------------------------
+# the third patch: the pooled ssl.SSLObject, which is closed by nobody
+# --------------------------------------------------------------------------
+
+
+def test_the_asyncio_tls_protocol_still_has_the_shape_the_probe_reads():
+    """The canary for a patch on somebody else's private class.
+
+    Two names have to hold for the pooled-`SSLObject` path to work at all, and
+    both are asyncio internals: the protocol class, and the attribute on it that
+    holds the `ssl.SSLObject`. `install()` asks for each with `getattr` and
+    degrades silently — which is right for users and wrong for maintainers, so
+    this is where a renamed internal turns red, rather than in a memory profile
+    six months later.
+    """
+    from asyncio import sslproto
+
+    assert hasattr(sslproto, "SSLProtocol")
+    assert hasattr(sslproto.SSLProtocol, "connection_lost")
+    # One of the two spellings `_sslobj_of` reads must exist as a class-level
+    # declaration: `_sslobj` since the 3.11 rewrite, `_sslpipe` before it.
+    fields = set(getattr(sslproto.SSLProtocol, "__slots__", ())) | set(
+        sslproto.SSLProtocol.__init__.__code__.co_names
+    )
+    assert {"_sslobj", "_sslpipe"} & fields, (
+        "asyncio.sslproto no longer names the SSLObject where the close probe "
+        "looks for it: a pooled async TLS connection is now retired by the GC "
+        "finalizer only — find the new spelling and teach `_sslobj_of` about it"
+    )
+
+
+def test_installing_and_uninstalling_leaves_the_asyncio_protocol_untouched():
+    from asyncio import sslproto
+
+    orig = sslproto.SSLProtocol.connection_lost
+    install_shared_close_hook()
+    try:
+        assert sslproto.SSLProtocol.connection_lost is not orig
+    finally:
+        uninstall_shared_close_hook()
+    assert sslproto.SSLProtocol.connection_lost is orig
+
+
+def test_a_pooled_ssl_object_is_retired_when_its_transport_ends(tls_server):
+    """The leak the close hook could not close, closed.
+
+    An `ssl.SSLObject` on the async TLS path has no `close()` to patch, and
+    asyncio's `SSLProtocol` pins it for the transport's whole life — so for a
+    connection a pool holds, neither half of this module ever ran and the seam's
+    per-connection state stayed resident. `connection_lost` is the moment that
+    was missing.
+
+    `on_finalize=False` is what makes this a test of that patch and not of the
+    GC: the hook is barred from the finalizer, the object is kept alive across
+    the assertion, and the only thing left that can have fired it is the
+    protocol being told its transport ended.
+    """
+    import asyncio
+    import ssl as _ssl
+    from urllib.parse import urlsplit
+
+    from conftest import CERT
+
+    parts = urlsplit(tls_server)
+    ctx = _ssl.create_default_context(cafile=str(CERT))
+    fired = []
+
+    async def drive():
+        reader, writer = await asyncio.open_connection(parts.hostname, parts.port, ssl=ctx)
+        sslobj = writer.get_extra_info("ssl_object")
+        assert isinstance(sslobj, _ssl.SSLObject), "asyncio no longer exposes the SSLObject"
+        close_registry().on_close(sslobj, lambda: fired.append("retired"), on_finalize=False)
+
+        writer.write(
+            b"POST /v1/ping HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        )
+        await writer.drain()
+        # Drained to EOF, not to the first chunk: leaving application data in
+        # the incoming BIO makes the TLS shutdown below raise inside asyncio,
+        # which would fail this test for a reason that has nothing to do with
+        # what it is testing.
+        assert b"200" in await reader.read()
+        assert fired == [], "the connection is still open and still pooled"
+
+        writer.close()
+        await writer.wait_closed()
+        return sslobj
+
+    install_shared_close_hook()
+    try:
+        held = asyncio.run(drive())
+    finally:
+        uninstall_shared_close_hook()
+
+    assert fired == ["retired"]
+    assert held is not None  # still referenced here, so the finalizer cannot be what ran
+
+
+# --------------------------------------------------------------------------
 # what the hook retires: the seam's per-connection state
 # --------------------------------------------------------------------------
 
@@ -317,15 +415,16 @@ def test_an_h2_stream_that_never_answers_loses_its_latch_entry_at_close(
 
 
 def test_the_h2_latch_is_capped_for_a_connection_that_never_closes():
-    """The path the close hook cannot reach, and the bound that covers it.
+    """The bound that needs no end-of-connection signal at all.
 
     On the async TLS seam the carrier is an `ssl.SSLObject`: no `close()` to
     patch, and asyncio's `SSLProtocol` pins it for the life of the transport, so
-    it is neither closed nor collected. A pooled h2 keep-alive to a model
-    provider is exactly that shape — and every stream it resets strands a latch
-    entry that `on_connection_close` will never be called to release. So the
-    latch carries its own cap, sourced from the same `max_streams` the Rust
-    parser bounds its own stream table with.
+    it is neither closed nor collected. The `connection_lost` patch above
+    reaches that carrier where asyncio's own TLS implementation is in play — but
+    a keep-alive h2 connection to a model provider may simply never end, and
+    every stream it resets strands a latch entry in the meantime. So the latch
+    carries its own cap, sourced from the same `max_streams` the Rust parser
+    bounds its own stream table with.
     """
     tracker = _Http2Tracker(CaptureLimits(max_streams=8).to_native())
     for sid in range(1, 2 * 200, 2):
