@@ -1459,6 +1459,14 @@ class UnitRegistry:
         emit from state no reader was ever supposed to see. Declining costs a
         teardown that was already racing a dying process; proceeding costs
         correctness at the one moment nothing can be re-run.
+
+        The signal handler is no longer the only shape of that. A weakref
+        finalizer — the seams' close hook backstop — lands at an arbitrary
+        ALLOCATION and on whatever thread dropped the last reference, so the
+        same half-finished mutation is now reachable off the main thread too.
+        Nothing routes a finalizer here today, and this guard does not depend on
+        that: it asks the lock who owns it, which is true of every re-entry
+        route there is or will be.
         """
         # `_is_owned()` and not `acquire(blocking=False)`: on an `RLock` the
         # non-blocking acquire SUCCEEDS for the thread that already owns it, so

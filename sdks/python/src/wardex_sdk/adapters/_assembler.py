@@ -973,6 +973,8 @@ class SessionAssembler:
         Declines when this thread already holds the lock, for the reason
         `UnitRegistry.close_all` gives — this is reachable from a signal
         handler, and a handler lands wherever the interpreter happened to be.
+        A weakref finalizer is the same hazard with the main-thread restriction
+        removed; the guard covers both because it asks the lock, not the caller.
         """
         if self._lock._is_owned():
             counters.bump("adapters.assembler.close_all_sessions_reentrant")
