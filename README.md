@@ -305,10 +305,11 @@ not arrive.
   in completion order, so the root travels last — and a conforming receiver
   resolves the edge when the parent lands. A span so large it would not fit a
   request even with its payload removed is the one loss a split cannot absorb:
-  it is dropped, the rest of its batch still goes, and the SDK reports it once
-  on stderr. That loss cannot be marked in `wardex.limitations` the way a
-  truncation is, because the marker would have to ride on the very span that
-  never reaches the wire.
+  it is dropped, the rest of its batch still goes, and the SDK says so on
+  stderr — once per process, at the first occurrence, with a count that covers
+  that batch and is not a running total. That loss cannot be marked in
+  `wardex.limitations` the way a truncation is, because the marker would have to
+  ride on the very span that never reaches the wire.
 
 Requests are gzipped by default. `OtlpHttpTransport(..., compress=False)` turns
 that off for a proxy or receiver that mishandles `Content-Encoding`.
