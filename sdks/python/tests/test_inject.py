@@ -321,6 +321,12 @@ def test_a_callers_tracestate_is_neither_replaced_nor_duplicated(library, echo_s
     — one request with two tracestate headers, a shape the spec defines no
     reading for. Now all three add the traceparent the caller is missing and
     leave the caller's tracestate exactly as it was written.
+
+    Adding the traceparent — rather than declining the whole injection the way
+    a caller-set traceparent does — is the deliberate half. A tracestate with
+    no traceparent is a header no conformant receiver can act on, so declining
+    would break the trace link to protect something already inert. The rule and
+    its reasoning are in `_headers_to_add`.
     """
     tp = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
     _setup(propagation=PropagationPolicy(enabled=True))

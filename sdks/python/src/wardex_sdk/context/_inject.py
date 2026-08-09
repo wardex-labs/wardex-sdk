@@ -165,16 +165,34 @@ def _headers_to_add(host: str, has_header: Callable[[str], bool]) -> dict[str, s
     writes a per-request header that outranks the host's session default,
     silently rewriting the trace context of every call on that session.
 
-    `traceparent` gates the whole injection. A caller who set one owns the
-    trace context for this request, and pairing their traceparent with our
-    tracestate would attribute vendor state to a trace that never carried it.
+    `traceparent` gates the whole injection, and `tracestate` does not. The two
+    are not symmetric, and the asymmetry is the decision here rather than an
+    oversight, because the headers are not symmetric: `traceparent` NAMES the
+    trace and `tracestate` only annotates whatever trace is named. A caller who
+    set a traceparent owns the context of this request, so we add nothing —
+    pairing their traceparent with our tracestate would attribute our vendor
+    state to a trace that never carried it.
 
-    `tracestate` set WITHOUT a traceparent is likewise left alone, and this is
-    where the three libraries used to disagree: httpx and requests assigned
-    into a case-insensitive mapping and replaced the caller's value, while
-    aiohttp `extend`ed a CIMultiDict and put both on the wire — one request,
-    two `tracestate` headers, which is not a shape the W3C spec defines a
-    reading for. Dropping ours keeps the rule above intact in all three.
+    A caller who set only a `tracestate` has not established a context at all:
+    the spec gives a receiver no way to act on vendor state with no traceparent
+    beside it, so the header they wrote is one every conformant hop ignores.
+    Declining our traceparent as well would break the trace link on that
+    request — losing propagation, the failure direction this SDK does not take
+    — to protect a header that was already inert. So we add the traceparent and
+    leave their bytes exactly as written.
+
+    That does put wardex's traceparent on the wire next to a tracestate wardex
+    did not write, which is the mirror of the mis-attribution above and is
+    accepted knowingly: their tracestate was unattributed before we touched the
+    request, the alternatives are to destroy host bytes (replace it) or to drop
+    the trace (suppress everything), and of the three this is the only one that
+    neither loses the host's data nor loses the trace.
+
+    Dropping OUR tracestate in that case is also where the three libraries used
+    to disagree: httpx and requests assigned into a case-insensitive mapping
+    and replaced the caller's value, while aiohttp `extend`ed a CIMultiDict and
+    put both on the wire — one request, two `tracestate` headers, which is not
+    a shape the W3C spec defines a reading for.
     """
     if has_header("traceparent"):
         return {}
