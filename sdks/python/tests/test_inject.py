@@ -263,6 +263,27 @@ def test_tracestate_forwarded_verbatim(library, echo_server):
 
 
 @pytest.mark.parametrize("library", LIBRARIES)
+def test_a_non_ascii_inbound_tracestate_never_reaches_the_wire(library, echo_server):
+    """A byte a remote peer chose must not raise into the host's own call.
+
+    The inbound tracestate is re-emitted outbound, and `http.client` encodes
+    header values as latin-1 — so a character above it came back as
+    `UnicodeEncodeError` from `putheader`, outside the injector's guard and
+    straight into the caller. Fail-silence is this module's whole contract, and
+    a remote peer must not be able to spend it. Driven over a real socket
+    rather than a mock transport, because the encode is what is on trial.
+    """
+    tp = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+    _setup(propagation=PropagationPolicy(enabled=True))
+    install_propagation()
+    with wardex_sdk.continue_trace({"traceparent": tp, "tracestate": "ja=安全"}):
+        with trace("root"):
+            _get(library, f"{echo_server}/x")
+    assert _sent("tracestate") == []  # dropped at the edge, not forwarded
+    assert len(_sent("traceparent")) == 1  # one bad header is not two
+
+
+@pytest.mark.parametrize("library", LIBRARIES)
 def test_a_session_default_traceparent_wins_over_injection(library, echo_server):
     """A header the host set on the SESSION is a header the host set.
 

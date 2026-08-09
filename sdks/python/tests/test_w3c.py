@@ -88,6 +88,23 @@ def test_sanitize_tracestate_drops_a_value_carrying_control_characters():
     assert sanitize_tracestate("dd=s:1\x7f") is None
 
 
+def test_sanitize_tracestate_drops_everything_above_printable_ascii():
+    """The spec's grammar is 0x20-0x7E, and the range above it breaks the host.
+
+    `http.client` encodes header values as latin-1, so a non-latin-1 character
+    forwarded on the next outbound call raises `UnicodeEncodeError` out of
+    `putheader` — past the injector's guard, into the caller, breaking the
+    fail-silent contract with a byte a remote peer chose. An inbound server
+    that decodes headers as UTF-8 (aiohttp's does) is all it takes to deliver
+    one. C1 controls are the same screen: 0x85 is a line break to some parsers
+    and was accepted verbatim by a check that stopped at 0x7F.
+    """
+    assert sanitize_tracestate("ja=安全") is None  # outside latin-1 entirely
+    assert sanitize_tracestate("dd=s:1\x85foo=bar") is None  # C1 NEL
+    assert sanitize_tracestate("dd=s:1é") is None  # latin-1, still not ASCII
+    assert sanitize_tracestate("congo=t61rcWkgMzE,rojo=00f067aa0ba902b7") is not None
+
+
 def test_sanitize_tracestate_truncates_to_the_spec_ceiling_from_the_right():
     """32 list-members, and the ones kept are the most recent writers.
 

@@ -1,4 +1,10 @@
-"""W3C Trace Context (traceparent) parse/format — pure functions, no SDK state.
+"""W3C Trace Context parse/format, and inbound `tracestate` vetting — pure
+functions, no SDK state.
+
+Two responsibilities, named separately because they are different jobs:
+`parse_traceparent`/`format_traceparent` read and write a header this SDK
+understands, while `sanitize_tracestate` refuses an untrusted one it only ever
+carries. The second is here because both are the wire grammar in one place.
 
 Level 1 (https://www.w3.org/TR/trace-context/): we emit version 00 and the
 context's own `trace_flags`. Unknown versions are parsed leniently from the
@@ -30,6 +36,14 @@ _FIELD_RE = re.compile(
 )
 
 #: The most list-members a `tracestate` may carry (spec §3.3.1).
+#:
+#: Declared here rather than in `wardex-limits` with the SDK's other ceilings,
+#: and deliberately: those are wardex's own resource bounds, tunable because
+#: wardex chose them, and read off the core crate so one number serves every
+#: language SDK. This one is not ours to choose — it is the number the W3C
+#: specification states, the same in every SDK because the spec is, and moving
+#: it into a tunable would invite someone to raise it and emit a header no
+#: conformant receiver accepts.
 _MAX_TRACESTATE_MEMBERS = 32
 
 
@@ -73,11 +87,18 @@ def sanitize_tracestate(value: str | None) -> str | None:
 
     Two rejections, and neither is a matter of taste:
 
-    A control character (CR, LF, NUL, anything below 0x20, or DEL) cannot
-    appear in a header value at all, and this value is one we later WRITE. An
-    inbound `tracestate` carrying CRLF is a request-splitting payload aimed at
-    whatever service the host calls next, forwarded by us, in a header the host
-    never wrote. There is no partial-credit reading of such a value, so the
+    Anything outside printable US-ASCII (0x20-0x7E) — which is the spec's own
+    grammar for a tracestate, key and value alike — is refused, and this value
+    is one we later WRITE. Below the range, an inbound `tracestate` carrying
+    CRLF is a request-splitting payload aimed at whatever service the host
+    calls next, forwarded by us, in a header the host never wrote. Above it,
+    the damage is to the host rather than by it: `http.client` encodes header
+    values as latin-1, so a non-latin-1 character re-emitted on the next
+    outbound call raises `UnicodeEncodeError` out of `putheader`, past the
+    injector's guard, into the caller — this module's fail-silent contract
+    broken by a byte a remote peer chose. Both are remote-triggerable the
+    moment an inbound framework decodes headers as UTF-8, which aiohttp's
+    server does. There is no partial-credit reading of such a value, so the
     whole header is dropped rather than trimmed to its "safe" prefix — a
     truncated vendor state is not the vendor's state.
 
@@ -96,7 +117,7 @@ def sanitize_tracestate(value: str | None) -> str | None:
     trimmed = value.strip()
     if not trimmed:
         return None
-    if any(ch < "\x20" or ch == "\x7f" for ch in trimmed):
+    if any(not ("\x20" <= ch <= "\x7e") for ch in trimmed):
         return None
     members = trimmed.split(",")
     if len(members) > _MAX_TRACESTATE_MEMBERS:
