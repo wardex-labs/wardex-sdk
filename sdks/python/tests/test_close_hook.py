@@ -214,6 +214,20 @@ def test_closing_a_real_socket_fires_its_hooks():
         uninstall_shared_close_hook()
 
 
+def test_the_deferred_close_fast_path_still_exists_on_this_interpreter():
+    """`socket.socket._real_close` is private, and the probe treats it that way:
+    `install()` asks with `getattr` and degrades to the finalizer when the name
+    is gone — correct, only late. Users must get that degradation silently;
+    MAINTAINERS must not. This is the canary that turns red on the first
+    interpreter to rename the fast path, so the new spelling is found in CI
+    rather than deduced from `will_close` spans quietly arriving late."""
+    assert hasattr(socket.socket, "_real_close"), (
+        "this interpreter dropped socket.socket._real_close: the close probe now "
+        "retires deferred-close connections via the GC finalizer only — find the "
+        "renamed hook and teach install() about it"
+    )
+
+
 def test_the_probe_is_refcounted_and_leaves_no_trace():
     orig = socket.socket.close
     install_shared_close_hook()
