@@ -1461,9 +1461,11 @@ class UnitRegistry:
         correctness at the one moment nothing can be re-run.
 
         The signal handler is no longer the only shape of that. A weakref
-        finalizer — the seams' close hook backstop — lands at an arbitrary
-        ALLOCATION and on whatever thread dropped the last reference, so the
-        same half-finished mutation is now reachable off the main thread too.
+        finalizer — the seams' close hook backstop — runs out of its referent's
+        DEALLOCATION, so it lands wherever a reference count reaches zero (and
+        at any allocation, through a cyclic collection) and on whatever thread
+        dropped that reference: the same half-finished mutation is now reachable
+        off the main thread too.
         Nothing routes a finalizer here today, and this guard does not depend on
         that: it asks the lock who owns it, which is true of every re-entry
         route there is or will be.
