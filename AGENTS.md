@@ -45,6 +45,26 @@ thing the two share: both venvs install the package editable off
 `_wardex_native.abi3.so` the dev venv imports (harmless while the extension is
 abi3, which is why the wheel is). Extra arguments go through to pytest.
 
+### Checks no gate runs
+
+`sdks/python/tests/e2e_split_export_phoenix.py` asserts that an OTLP export
+split across several POSTs reassembles into ONE trace at a live receiver. That
+property is the receiver's to keep rather than the SDK's, so no in-process test
+can reach it — and needing Docker is why neither pytest nor CI may. Its
+filename deliberately misses pytest's `python_files`, so nothing collects it and
+nothing runs it unless a person does:
+
+```bash
+docker run -d --name wardex-e2e-phoenix -p 6006:6006 arizephoenix/phoenix:latest
+WARDEX_E2E_PHOENIX=http://127.0.0.1:6006 \
+    uv run python sdks/python/tests/e2e_split_export_phoenix.py
+```
+
+Run it when you touch the request-splitting encoder, the OTLP transport, or the
+caps in `CaptureLimits`. Being uncollected also excludes it from the 3.10 floor
+check, which runs pytest — so after editing it, run it once more under
+`.venv-py310/bin/python`. Nothing else will catch a 3.11+-only call in there.
+
 ## Lint & format
 
 ```bash
