@@ -279,21 +279,38 @@ def test_the_asyncio_tls_protocol_still_has_the_shape_the_probe_reads():
 
     assert hasattr(sslproto, "SSLProtocol")
     assert hasattr(sslproto.SSLProtocol, "connection_lost")
-    # One of the two spellings `_sslobj_of` reads must exist as a class-level
-    # declaration: `_sslobj` since the 3.11 rewrite, `_sslpipe` before it.
-    fields = set(getattr(sslproto.SSLProtocol, "__slots__", ())) | set(
-        sslproto.SSLProtocol.__init__.__code__.co_names
-    )
+    # One of the two spellings `_sslobj_of` reads must be assigned by the
+    # constructor: `_sslobj` since the 3.11 rewrite, `_sslpipe` before it. Read
+    # off `__init__`'s names and nothing else — `SSLProtocol` declares no
+    # `__slots__` of its own on any supported version, so a `getattr` for one
+    # resolves through the MRO to the empty tuple `asyncio.protocols` carries
+    # and would contribute a term that can never fail.
+    fields = set(sslproto.SSLProtocol.__init__.__code__.co_names)
     assert {"_sslobj", "_sslpipe"} & fields, (
         "asyncio.sslproto no longer names the SSLObject where the close probe "
         "looks for it: a pooled async TLS connection is now retired by the GC "
         "finalizer only — find the new spelling and teach `_sslobj_of` about it"
     )
+    # The 3.10 branch reads THROUGH the pipe, so the attribute on the pipe is
+    # the second half of that spelling and needs its own canary: renaming it
+    # leaves the assertion above green while the hook degrades to the finalizer,
+    # which is the silent failure this test exists to prevent.
+    pipe = getattr(sslproto, "_SSLPipe", None)
+    if pipe is not None:
+        assert hasattr(pipe, "ssl_object"), (
+            "asyncio.sslproto._SSLPipe no longer exposes `ssl_object`: the "
+            "pre-3.11 branch of `_sslobj_of` now always returns None"
+        )
 
 
 def test_installing_and_uninstalling_leaves_the_asyncio_protocol_untouched():
     from asyncio import sslproto
 
+    # Stated, because without it a refcount leaked by an earlier test in the
+    # session makes `install()` a no-op and the first assertion below fails
+    # pointing at asyncio — naming a renamed internal for what is actually
+    # somebody else's `init()` without a `close()`.
+    assert _close_hook._refcount == 0, "the shared close hook was left installed by an earlier test"
     orig = sslproto.SSLProtocol.connection_lost
     install_shared_close_hook()
     try:
@@ -301,6 +318,37 @@ def test_installing_and_uninstalling_leaves_the_asyncio_protocol_untouched():
     finally:
         uninstall_shared_close_hook()
     assert sslproto.SSLProtocol.connection_lost is orig
+
+
+def test_a_protocol_that_refuses_the_private_read_still_reaches_asyncios_own_handler():
+    """The failure mode worth guarding is a HANG, not a traceback.
+
+    `_sslobj_of` reads two private attributes off a class third parties
+    subclass, and it runs BEFORE the original. An exception escaping it would
+    stop asyncio ever scheduling the app protocol's `connection_lost`, so the
+    host's `wait_closed()` waits on a future nothing will complete — the process
+    stops instead of erroring. Here the read raises something `getattr`'s
+    default does not absorb, and the original still runs.
+    """
+    ran = []
+
+    class Hostile:
+        """An `SSLProtocol` subclass's worst case, without asyncio's own state:
+        `_sslobj` shadowed by a property that raises something `getattr`'s
+        default does not absorb."""
+
+        @property
+        def _sslobj(self):  # noqa: ANN202
+            raise RuntimeError("this protocol does not answer that")
+
+    probe = _close_hook.CloseProbe(CloseRegistry())
+    wrapped = probe._mk_connection_lost(lambda this, exc: ran.append(exc))
+
+    assert wrapped(Hostile(), None) is None
+    assert ran == [None], "asyncio's own connection_lost never ran: the host would hang here"
+    assert counters.get("interceptors.close_hook.connection_lost") == 1, (
+        "the refused read was not counted, so either it did not raise or it escaped the guard"
+    )
 
 
 def test_a_pooled_ssl_object_is_retired_when_its_transport_ends(tls_server):
@@ -465,6 +513,56 @@ def test_an_unlatched_stream_above_the_eviction_mark_is_not_blamed_on_the_cap():
     tracker = _Http2Tracker(CaptureLimits(max_streams=8).to_native())
     (txn,) = tracker.on_response_bytes(_h2_answer(Encoder(), 7))
     assert txn.parent_evicted is False
+
+
+def test_a_stream_opened_before_capture_attached_is_not_blamed_on_the_cap():
+    """The floor, and why the mark alone is not enough.
+
+    Capture can attach part way through a live h2 connection: the streams the
+    host opened before the seam was watching were never latched, so their ids
+    sit BELOW everything this tracker put in the table, and once the cap has run
+    the eviction mark reaches right over them. Blaming the cap there is not a
+    harmless over-label — `parent_evicted` also opens the AGENT-mode gate, so it
+    exports the request and response bodies of traffic the configured mode had
+    filtered out.
+    """
+    tracker = _Http2Tracker(CaptureLimits(max_streams=2).to_native())
+    client_enc, server_enc = Encoder(), Encoder()
+    # This tracker's first sight of the connection is stream 101; 1 through 99
+    # happened before it existed.
+    for sid in (101, 103, 105):
+        tracker.on_request_bytes(_h2_open(client_enc, sid))
+    assert tracker._latch_evicted_below == 101, "precondition: the cap dropped stream 101"
+
+    (before,) = tracker.on_response_bytes(_h2_answer(server_enc, 7))
+    assert before.parent_evicted is False, "a stream this tracker never latched is not its loss"
+
+    (evicted,) = tracker.on_response_bytes(_h2_answer(server_enc, 101))
+    assert evicted.parent_evicted is True
+
+
+def test_closing_the_connection_forgets_the_eviction_mark_too():
+    """`on_connection_close` says nothing survives it, and nothing may.
+
+    No caller reuses a tracker across a close today — the seam discards the
+    connection state and the tracker inside it — but h2 stream ids restart at 1
+    on the next connection, so a mark or a floor carried over would name a
+    different set of streams and report every unlatched one on the new
+    connection as a parent wardex lost.
+    """
+    tracker = _Http2Tracker(CaptureLimits(max_streams=2).to_native())
+    enc = Encoder()
+    for sid in (1, 3, 5):
+        tracker.on_request_bytes(_h2_open(enc, sid))
+    assert tracker._latch_evicted_below and tracker._latch_first
+
+    assert tracker.on_connection_close(Limitation.CONNECTION_EVICTED) == []
+    assert tracker._latch == {}
+    assert tracker._latch_evicted_below == 0
+    assert tracker._latch_first == 0
+
+    (fresh,) = tracker.on_response_bytes(_h2_answer(Encoder(), 1))
+    assert fresh.parent_evicted is False
 
 
 def test_a_dropped_latch_entry_reaches_the_span_as_wardexs_own_fault():
