@@ -25,8 +25,8 @@ instead was guess:
     measured perfectly well.
 
 This module supplies the moment. `on_close(obj, hook)` registers a callback
-that fires exactly once, and it fires from two places rather than one because
-neither alone is enough:
+that fires exactly once, and it fires from three places rather than one because
+no one of them is enough:
 
   CLOSE — `socket.socket.close`/`_real_close` are patched, so the hook runs
   while the object is still intact and the memory is released promptly. This is
@@ -103,6 +103,14 @@ _REGISTER = guard("interceptors.close_hook.register")
 #: Importing a stdlib module should not be able to fail either — see
 #: `_ssl_protocol_class`, which is the one place this is entered.
 _IMPORT_SSLPROTO = guard("interceptors.close_hook.sslproto_import")
+#: The `SSLProtocol.connection_lost` wrapper, whose failure mode is worse than
+#: an error: the read runs BEFORE the original, so an exception escaping it
+#: stops asyncio ever scheduling the app protocol's `connection_lost` and the
+#: host's `wait_closed()` never returns. A hung coroutine, not a traceback. The
+#: attributes are private and belong to a class a third party may subclass with
+#: a `__getattr__` or a property of its own, so the read is somebody else's code
+#: and is treated as such.
+_CONNECTION_LOST = guard("interceptors.close_hook.connection_lost")
 
 
 class _Entry:
@@ -272,10 +280,13 @@ def _finalizer(registry: CloseRegistry, obj: Any, cid: int) -> weakref.finalize 
 def _ssl_protocol_class() -> Any:
     """`asyncio.sslproto.SSLProtocol`, or None where there is no such thing.
 
-    Imported at first install rather than at module scope: `_close_hook` is
-    reached by the plaintext seam and by the timing probe too, and neither has
-    any reason to pull asyncio's TLS machinery — and `ssl` behind it — into a
-    process that never awaits anything.
+    The import sits here rather than at module scope only to keep the failure
+    LOCAL — inside the guard below, at the one moment the class is wanted. It
+    buys nothing at import time and the docstring should not pretend otherwise:
+    `import wardex_sdk` already leaves `asyncio.sslproto` and `ssl` in
+    `sys.modules` by way of `asyncio.base_events`, and `install()` asks for the
+    class unconditionally anyway — the plaintext seam and the timing probe both
+    reach it through `_acquire_close_hook`.
 
     Guarded, and counted rather than swallowed, because unlike anyio this is not
     an optional dependency: `asyncio.sslproto` is stdlib, so a failure to import
@@ -312,10 +323,10 @@ def _sslobj_of(protocol: Any) -> Any:
 
 
 class CloseProbe:
-    """Turns the end of a `socket.socket` into a registry event. Idempotent, fail-silent.
+    """Turns the end of a connection into a registry event. Idempotent, fail-silent.
 
-    TWO patches, both on `socket.socket`, because `close()` is not reliably the
-    end of anything:
+    THREE patches. Two of them are on `socket.socket`, because `close()` is not
+    reliably the end of anything:
 
         def close(self):
             self._closed = True
@@ -424,9 +435,15 @@ class CloseProbe:
             # Ahead of the original for two reasons: the same one `_mk_close`
             # gives, and because 3.10's `connection_lost` drops the `_SSLPipe`
             # that owns the object we are looking for.
-            sslobj = _sslobj_of(this)
-            if sslobj is not None:
-                registry.fire(sslobj)
+            #
+            # Guarded because being ahead of the original is what makes a raise
+            # here expensive: asyncio would never reach the `call_soon` that
+            # tells the app protocol its transport ended, so the host waits on a
+            # future nothing will complete. See `_CONNECTION_LOST`.
+            with _CONNECTION_LOST:
+                sslobj = _sslobj_of(this)
+                if sslobj is not None:
+                    registry.fire(sslobj)
             return orig(this, *a, **k)
 
         return wrapper
