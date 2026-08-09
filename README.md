@@ -40,7 +40,7 @@ way.
 
 | Group | What it decides |
 |---|---|
-| `backend=BackendConfig(...)` | Whose project the data is: `api_key` (plus `endpoint`, inert today) |
+| `backend=BackendConfig(...)` | Where the data goes and whose it is: `endpoint`, `api_key` |
 | `retention=RetentionPolicy(...)` | How long a captured payload is kept: `default`, `triggers` |
 | `pii=PIIPolicy(...)` | What leaves the process: `mode`, `disabled_categories` |
 | `batching=BatchingPolicy(...)` | When buffered spans are sent: `flush_interval`, `flush_on_signals` |
@@ -64,9 +64,10 @@ Everything that belongs to no group stays top-level: `debug`, `before_send`,
 `capture_mode`, `release`, `environment`, `tags`, `adapters`, and the
 interception trio `intercept` / `intercept_hosts` / `interceptors`.
 
-The address lives on the transport, not on `backend`: `BackendConfig.endpoint`
-is inert today, so `init()` without a `transport=` installs `NoOpTransport` and
-captures into nothing however that field is set.
+`BackendConfig(endpoint=...)` without a `transport=` builds the default
+OTLP/HTTP exporter against that address. An explicit `transport=` wins over the
+field — a transport carries its own address — and with neither, `init()`
+installs `NoOpTransport` and captures into nothing.
 
 The flat spelling of a grouped setting (`api_key=...`, `flush_interval=...`)
 is refused with a `TypeError` naming its new home. There is no compatibility

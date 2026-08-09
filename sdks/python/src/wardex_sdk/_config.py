@@ -99,15 +99,13 @@ class BackendConfig:
     """Identifies the project on every envelope header."""
 
     endpoint: str | None = None
-    """Where to send — INERT TODAY, and read by nothing in the SDK.
+    """Where to send. `init()` without a `transport=` builds the default
+    OTLP/HTTP exporter against this address; with neither, it installs
+    `NoOpTransport` and captures into nothing.
 
-    A `Transport` carries its own address (`OtlpHttpTransport(endpoint=...)`),
-    and `init()` without one installs `NoOpTransport`; it does not build an
-    exporter out of this field. Setting it and omitting `transport=` therefore
-    captures everything and discards it in silence — which is why the emptiness
-    is recorded on the field rather than left for a user to discover from the
-    absence of traffic. Stated here, and in the README's group table, until a
-    default transport reads it."""
+    An explicit `transport=` wins over this field — a `Transport` carries its
+    own address (`OtlpHttpTransport(endpoint=...)`), and under `debug` the
+    losing endpoint is announced on stderr rather than ignored in silence."""
 
 
 @dataclass(frozen=True, slots=True)

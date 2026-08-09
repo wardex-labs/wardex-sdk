@@ -270,6 +270,61 @@ def test_the_atexit_teardown_drops_the_propagation_patches_too():
 
 
 # --------------------------------------------------------------------------
+# transport resolution
+# --------------------------------------------------------------------------
+
+
+def test_a_backend_endpoint_builds_the_default_otlp_transport():
+    """`backend.endpoint` alone must reach the wire, not sit inert on the config.
+
+    The field's failure mode is the one the group docstrings keep circling:
+    a user sets the address, omits `transport=`, and everything captured is
+    discarded by a `NoOpTransport` in silence. So the default exporter must be
+    built FROM the field, against exactly the address it names.
+    """
+    from wardex_sdk.transport import OtlpHttpTransport
+
+    wardex.init(backend=BackendConfig(endpoint="http://collector.invalid/v1/traces"))
+    client = _hub.get_client()
+    try:
+        assert isinstance(client._transport, OtlpHttpTransport)
+        assert client._transport._endpoint == "http://collector.invalid/v1/traces"
+    finally:
+        # Nothing was captured, so the drain on close has no batch to POST —
+        # the endpoint above is never contacted.
+        wardex.close()
+
+
+def test_an_explicit_transport_wins_over_the_endpoint_and_debug_says_so(capsys):
+    """A `Transport` carries its own address, so `transport=` beats the field —
+    and the losing endpoint is announced under `debug`, because a config value
+    that loses a precedence fight in silence looks exactly like one that won."""
+    transport = _Recording()
+    wardex.init(
+        transport=transport,
+        backend=BackendConfig(endpoint="http://collector.invalid/v1/traces"),
+        debug=True,
+    )
+    client = _hub.get_client()
+    try:
+        assert client._transport is transport
+        assert "endpoint ignored" in capsys.readouterr().err
+    finally:
+        wardex.close()
+
+
+def test_no_transport_and_no_endpoint_still_installs_the_noop_default():
+    from wardex_sdk.transport._noop import NoOpTransport
+
+    wardex.init(backend=BackendConfig(api_key="k"))
+    client = _hub.get_client()
+    try:
+        assert isinstance(client._transport, NoOpTransport)
+    finally:
+        wardex.close()
+
+
+# --------------------------------------------------------------------------
 # idempotence
 # --------------------------------------------------------------------------
 

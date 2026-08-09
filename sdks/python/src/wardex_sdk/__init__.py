@@ -171,7 +171,23 @@ def init(
             file=sys.stderr,
         )
         return
-    resolved_transport = transport or NoOpTransport()
+    # Transport resolution, in precedence order: an explicit `transport=`
+    # carries its own address and wins outright; otherwise a configured
+    # `backend.endpoint` builds the default OTLP/HTTP exporter; otherwise
+    # NoOpTransport. When both are given the endpoint loses, and under `debug`
+    # it says so — a config value that loses a precedence fight in silence is
+    # indistinguishable from one that was honoured.
+    if transport is not None:
+        resolved_transport = transport
+        if config.backend.endpoint and config.debug:
+            print(
+                "[wardex] backend endpoint ignored: transport= carries its own address",
+                file=sys.stderr,
+            )
+    elif config.backend.endpoint:
+        resolved_transport = OtlpHttpTransport(config.backend.endpoint, debug=config.debug)
+    else:
+        resolved_transport = NoOpTransport()
     resolved_transport.set_pii_policy(
         config.pii.mode.value,
         tuple(sorted(c.value for c in config.pii.disabled_categories)),
