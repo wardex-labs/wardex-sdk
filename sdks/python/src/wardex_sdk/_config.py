@@ -163,8 +163,14 @@ class PropagationPolicy:
 
     enabled: bool = False
     targets: tuple[str, ...] | None = None
-    """Glob patterns matched against the outbound host. `None` means every host
-    the patched clients reach."""
+    """Glob patterns matched CASE-INSENSITIVELY against the outbound host.
+    `None` means every host the patched clients reach.
+
+    Hostnames are case-insensitive, so both sides of the match are folded and
+    `*.MyCorp.com` admits `api.mycorp.com`. The patterns are folded here, once,
+    which is also why they read back lowercased — that is the answer to "did
+    the capitals I typed do anything".
+    """
 
     def __post_init__(self) -> None:
         if self.targets is None:
@@ -174,6 +180,12 @@ class PropagationPolicy:
                 raise ValueError(
                     f"propagation targets must be non-empty glob strings, got {pattern!r}"
                 )
+        # Folded at construction and not per request. The config is built once
+        # and consulted on every outbound call the allowlist admits, so the
+        # side of the comparison that cannot change belongs here; the injector
+        # is then left folding only the host. It also puts the case rule where
+        # a user can see it, instead of in a private matcher nobody reads.
+        object.__setattr__(self, "targets", tuple(pattern.lower() for pattern in self.targets))
 
 
 @dataclass(frozen=True, slots=True)
@@ -218,7 +230,19 @@ class WardexConfig:
     debug: bool = False
     before_send: BeforeSendCallback | None = None
     intercept: bool = False
+
     intercept_hosts: tuple[str, ...] | None = None
+    """Plaintext peers — `host` or `host:port` — captured whatever the capture
+    mode says. Matched CASE-INSENSITIVELY. `None` leaves every connection to
+    the shared policy.
+
+    Naming a host by hand is a more specific opt-in than a global mode, so it
+    bypasses rather than composes (`interceptors._socket`). Exact names and not
+    globs, unlike `propagation.targets`: that one scopes a header wardex
+    WRITES, where a user has to be able to name a whole domain, while this one
+    widens what wardex READS off the wire — the direction in which a pattern
+    that matched more than its author meant is expensive.
+    """
 
     capture_mode: CaptureMode = CaptureMode.AGENT
 

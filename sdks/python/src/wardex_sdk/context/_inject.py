@@ -111,7 +111,7 @@ def _patchset() -> PatchSet:
 def _matches_target(host: str, patterns: tuple[str, ...]) -> bool:
     """Glob-match an outbound host against the configured target patterns.
 
-    `fnmatchcase` against both sides lowercased, rather than plain `fnmatch`.
+    `fnmatchcase` against a lowercased host, rather than plain `fnmatch`.
     Hostnames are case-insensitive, so `API.MyCorp.com` has to match
     `*.mycorp.com` — and `fnmatch` gets that wrong in two directions at once:
     it defers to `os.path.normcase`, which folds case on Windows and does
@@ -120,12 +120,13 @@ def _matches_target(host: str, patterns: tuple[str, ...]) -> bool:
     consistently applied, because it turns a propagation gap into something
     only one developer's machine can reproduce.
 
-    Only the host is folded. The pattern is folded too rather than documented
-    as "write it lowercase", since a user who typed `*.MyCorp.com` in a config
-    file meant the same set of hosts.
+    Only the host is folded HERE. The patterns are folded too — a user who
+    typed `*.MyCorp.com` meant the same set of hosts — but by
+    `PropagationPolicy.__post_init__`, once, because the config is built once
+    and this runs on every outbound call the allowlist admits.
     """
     lowered = host.lower()
-    return any(fnmatch.fnmatchcase(lowered, pattern.lower()) for pattern in patterns)
+    return any(fnmatch.fnmatchcase(lowered, pattern) for pattern in patterns)
 
 
 def _build_inject_headers(host: str) -> dict[str, str]:

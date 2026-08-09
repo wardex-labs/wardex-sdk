@@ -65,7 +65,7 @@ class RawSocketInterceptor(ByteSeamInterceptor):
         # host; hostnames are case-insensitive and an exact-string set said
         # otherwise. Folding once at construction keeps the per-connection check
         # the single set lookup it has to be.
-        self._allow: set[str] = {str(h).lower() for h in intercept_hosts or ()}
+        self._allow: set[str] = {h.lower() for h in intercept_hosts or ()}
 
     def name(self) -> str:
         return "socket"
@@ -170,7 +170,7 @@ class RawSocketInterceptor(ByteSeamInterceptor):
     def _in_allow(self, st: _ConnectionState) -> bool:
         if not self._allow:
             return False
-        address = str(st.server_address).lower()
+        address = st.server_address.lower()
         return address in self._allow or f"{address}:{st.server_port}" in self._allow
 
     # --- socket.socket wrappers ---
