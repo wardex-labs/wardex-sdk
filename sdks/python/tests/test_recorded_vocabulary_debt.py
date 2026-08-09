@@ -19,7 +19,7 @@ import json
 import pytest
 
 from wardex_sdk import _hub
-from wardex_sdk._config import WardexConfig
+from wardex_sdk._config import BackendConfig, WardexConfig
 from wardex_sdk._enums import CaptureMode, SpanKind, StatusCode
 from wardex_sdk._tracing import span as manual_span
 from wardex_sdk._types import (
@@ -38,7 +38,9 @@ from wardex_sdk.transport import _codec
 
 class _FakeClient:
     def __init__(self) -> None:
-        self.config = WardexConfig(api_key="k", capture_mode=CaptureMode.ALL, debug=True)
+        self.config = WardexConfig(
+            capture_mode=CaptureMode.ALL, debug=True, backend=BackendConfig(api_key="k")
+        )
         self.spans: list = []
         self.snapshots: list = []
 

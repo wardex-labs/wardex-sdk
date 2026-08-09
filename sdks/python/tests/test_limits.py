@@ -8,6 +8,7 @@ import tracemalloc
 import pytest
 
 from wardex_sdk import CaptureLimits, WardexConfig, _wardex_native
+from wardex_sdk._config import BackendConfig
 from wardex_sdk.assembly import Limitation
 
 
@@ -942,7 +943,8 @@ def test_a_configured_bound_reaches_the_registry_the_adapter_actually_uses():
 
     class _Client:
         config = WardexConfig(
-            api_key="k", limits=CaptureLimits(max_units=7, max_entries_per_unit=3)
+            limits=CaptureLimits(max_units=7, max_entries_per_unit=3),
+            backend=BackendConfig(api_key="k"),
         )
 
         def capture_span(self, span) -> None:

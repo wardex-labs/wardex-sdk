@@ -16,9 +16,9 @@ drives all of `wardex_sdk.__all__` bar the enums and four inert values, and
 added to `__all__` without a step, so the checklist cannot fall behind the API.
 
 How far that reaches, exactly: every symbol on `wardex_sdk.__all__` works, and
-so does importing `wardex_sdk.transport`, `.context`, `.assembly`, `.adapters`
-and `.pipeline`; the internal modules that reach the core at import time --
-`wardex_sdk.protocol`, `.semantics`, `.interceptors`, `transport._codec` and
+so does importing `wardex_sdk.transport`, `.context`, `.assembly`, `.adapters`,
+`.interceptors` and `.pipeline`; the internal modules that reach the core at
+import time -- `wardex_sdk.protocol`, `.semantics`, `transport._codec` and
 three `adapters/` modules -- still raise `ImportError`, and each is reachable
 only through `init()`, which returns before importing any. Both halves are
 asserted (`DEGRADES` / `STILL_RAISES` in the child) so the line cannot move
@@ -59,6 +59,7 @@ import pytest
 _STEPS = (
     "import",
     "limits_ctor",
+    "config_groups_ctor",
     "limits_resolved_raises",
     "limits_to_native_raises",
     "config_kwarg_still_validated",
@@ -182,13 +183,44 @@ def _limits_to_native_raises():
     raise AssertionError("to_native() built a native Limits without a core")
 
 
+def _config_groups_ctor():
+    """Every config group builds, and a config built from them does too.
+
+    None of them reaches the core, and that is the point: `init()` builds the
+    WHOLE config before it looks at `NATIVE_OK`, so a group that needed the
+    extension would turn "wardex is disabled" into an ImportError raised out of
+    the host's startup — the one failure this package's degraded mode exists to
+    prevent. Driven rather than declared inert for `CaptureLimits`'s reason: a
+    group is a constructor with validation in it, so it has code that can fail.
+    """
+    wardex_sdk.WardexConfig(
+        backend=wardex_sdk.BackendConfig(api_key="k", endpoint="http://127.0.0.1:1"),
+        retention=wardex_sdk.RetentionPolicy(),
+        pii=wardex_sdk.PIIPolicy(),
+        batching=wardex_sdk.BatchingPolicy(flush_interval=1.0),
+        limits=CaptureLimits(),
+        propagation=wardex_sdk.PropagationPolicy(enabled=True, targets=("*.example",)),
+    )
+
+
 def _config_kwarg_still_validated():
     # Degraded mode must not turn a caller's programming error into a shrug.
     try:
         wardex_sdk.init(no_such_option=1)
     except TypeError:
+        pass
+    else:
+        raise AssertionError("init() accepted an unknown keyword")
+    # And a field that moved into a config group is the same programming error
+    # wearing a familiar name, so it must reach the same answer here. `init()`
+    # builds the config BEFORE it checks the core, which is what makes that
+    # true; a degraded mode that returned first would take a keyword nobody
+    # supports and do nothing about it.
+    try:
+        wardex_sdk.init(api_key="k")
+    except TypeError:
         return
-    raise AssertionError("init() accepted an unknown keyword")
+    raise AssertionError("init() accepted a field that moved into a config group")
 
 
 def _isolation_scope():
@@ -281,6 +313,13 @@ DEGRADES = (
     "wardex_sdk.context",
     "wardex_sdk.assembly",
     "wardex_sdk.adapters",
+    # Moved up from STILL_RAISES when the package `__init__` stopped importing
+    # the TLS seam eagerly: every seam is built inside its factory now, so
+    # importing the package no longer drags `_ssl` -- and the core underneath
+    # it -- along. `Runtime` reaches this package from teardown paths that exist
+    # precisely to work when the extension does not, so the move is load-bearing
+    # rather than incidental.
+    "wardex_sdk.interceptors",
     "wardex_sdk.pipeline",
     "wardex_sdk._limits",
     "wardex_sdk._client",
@@ -289,7 +328,6 @@ DEGRADES = (
 STILL_RAISES = (
     "wardex_sdk.protocol",
     "wardex_sdk.semantics",
-    "wardex_sdk.interceptors",
     "wardex_sdk.transport._codec",
     "wardex_sdk.adapters._assembler",
     "wardex_sdk.adapters._anthropic_agent_sdk",
@@ -317,10 +355,11 @@ def _submodules_that_still_raise():
 
 STEPS = [
     ("limits_ctor", lambda: CaptureLimits(max_headers=4)),
+    ("config_groups_ctor", _config_groups_ctor),
     ("limits_resolved_raises", _limits_resolved_raises),
     ("limits_to_native_raises", _limits_to_native_raises),
     ("config_kwarg_still_validated", _config_kwarg_still_validated),
-    ("init", lambda: wardex_sdk.init(api_key="k")),
+    ("init", lambda: wardex_sdk.init(backend=wardex_sdk.BackendConfig(api_key="k"))),
     ("trace", lambda: wardex_sdk.trace("t").__enter__()),
     ("span", lambda: wardex_sdk.span("s").__enter__()),
     ("tool", lambda: wardex_sdk.tool(name="t")(lambda: 7)()),
@@ -489,6 +528,11 @@ _DRIVEN = frozenset(
         "WardexMiddleware",
         "WardexWSGIMiddleware",
         "CaptureLimits",
+        "BackendConfig",
+        "BatchingPolicy",
+        "PIIPolicy",
+        "PropagationPolicy",
+        "RetentionPolicy",
         "UserInfo",
         "NoOpTransport",
         "ConsoleTransport",

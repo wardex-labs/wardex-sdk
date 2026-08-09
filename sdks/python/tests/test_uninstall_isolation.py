@@ -14,7 +14,7 @@ ABOVE — the loop over the components. `PatchSet.restore_all()` guards each
 restore so one failure cannot abandon the others; the registry loop that calls
 it used to undo that guarantee wholesale, by letting one raising `uninstall()`
 abandon every component behind it. Worse, both registries run inside
-`_lifecycle._teardown` immediately before `client.close()`, from `atexit` — so
+`Runtime._teardown` immediately before `client.close()`, from `atexit` — so
 the exception went nowhere anyone reads, and took every buffered span with it.
 """
 
@@ -25,9 +25,9 @@ import httpx
 import pytest
 import requests
 
-from wardex_sdk import _hub, _lifecycle
+from wardex_sdk import _hub, _runtime
 from wardex_sdk._client import Client
-from wardex_sdk._config import WardexConfig
+from wardex_sdk._config import BackendConfig, BatchingPolicy, WardexConfig
 from wardex_sdk._enums import SpanKind
 from wardex_sdk._types import InternalEnvelope, InternalSpan, SpanContext, SpanId, TraceId
 from wardex_sdk.adapters._base import AdapterInterface
@@ -294,14 +294,19 @@ def test_teardown_still_closes_the_client_when_an_uninstall_raises():
     from wardex_sdk.interceptors._registry import get_registry as interceptor_registry
 
     transport = _Recording()
-    client = Client(WardexConfig(api_key="k", flush_interval=3600.0), transport)
+    client = Client(
+        WardexConfig(
+            backend=BackendConfig(api_key="k"), batching=BatchingPolicy(flush_interval=3600.0)
+        ),
+        transport,
+    )
     adapter = _CountingAdapter()
     try:
         interceptor_registry().install(_Boom(), client)
         adapter_registry().install(adapter, client)
         client.capture_span(_span())
 
-        _lifecycle._teardown(client)  # must not raise
+        _runtime.runtime()._teardown(client)  # must not raise
 
         assert adapter.uninstalls == 1, "the adapter registry never ran"
         assert client._closed, "the client was never closed"
@@ -311,7 +316,6 @@ def test_teardown_still_closes_the_client_when_an_uninstall_raises():
     finally:
         interceptor_registry().uninstall_all()
         adapter_registry().uninstall_all()
-        _lifecycle._current_client = None
         _hub.reset_for_test()
 
 
@@ -639,7 +643,6 @@ def test_a_broken_interceptor_does_not_take_the_whole_intercept_option_down():
     finally:
         _ssl.SSLInterceptor = original
         interceptor_registry().uninstall_all()
-        _lifecycle._current_client = None
         _hub.reset_for_test()
 
 

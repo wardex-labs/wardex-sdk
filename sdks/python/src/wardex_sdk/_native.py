@@ -24,10 +24,13 @@ direction.
 
 The guarantee, stated so nobody has to infer its edges: with the extension
 unimportable, `import wardex_sdk` and every symbol on its `__all__` work (as
-no-ops), and `wardex_sdk.transport`, `.context`, `.assembly`, `.adapters` and
-`.pipeline` import; `wardex_sdk.protocol`, `.semantics`, `.interceptors`,
+no-ops), and `wardex_sdk.transport`, `.context`, `.assembly`, `.adapters`,
+`.interceptors` and `.pipeline` import; `wardex_sdk.protocol`, `.semantics`,
 `transport._codec` and three `adapters/` modules still raise `ImportError`,
-because they reach the core at import time. That is a boundary and not a gap: each
+because they reach the core at import time. `.interceptors` moved across that
+line when its package `__init__` stopped importing the TLS seam eagerly: every
+seam is built inside its factory now, so importing the package no longer drags
+`_ssl` -- and the core underneath it -- along. That is a boundary and not a gap: each
 of them is reachable only through `init()`, which returns above, so degrading
 them would change nothing a host can observe while rewriting eager bindings on
 the parser hot path. `tests/test_native_absent.py` asserts both halves.

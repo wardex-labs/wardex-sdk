@@ -11,7 +11,7 @@ from test_agent_sdk_adapter_install import (
 )
 from wardex_sdk import _hub
 from wardex_sdk._client import Client
-from wardex_sdk._config import WardexConfig
+from wardex_sdk._config import BackendConfig, WardexConfig
 from wardex_sdk._enums import CaptureSource, StatusCode
 from wardex_sdk.adapters._anthropic_agent_sdk import AnthropicAgentSdkAdapter
 from wardex_sdk.adapters._registry import context_for
@@ -140,7 +140,7 @@ def test_repeated_sdk_tool_registration_does_not_double_wrap():
     """
     _hub.reset_for_test()
     t = _Recording()
-    client = Client(WardexConfig(api_key="k"), t)
+    client = Client(WardexConfig(backend=BackendConfig(api_key="k")), t)
     _hub.set_client(client)
 
     async def handler(args):

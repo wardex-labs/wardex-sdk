@@ -9,7 +9,6 @@ from typing import TYPE_CHECKING
 from .._enums import InterceptorName
 from ._base import InterceptorInterface
 from ._registry import InterceptorRegistry, get_registry
-from ._ssl import SSLInterceptor
 
 if TYPE_CHECKING:
     from .._client import Client
@@ -24,24 +23,48 @@ __all__ = [
 ]
 
 
+def __getattr__(name: str) -> object:
+    """Resolve `SSLInterceptor` on first ATTRIBUTE access, not on import.
+
+    The name has been on this package's `__all__` since the seam existed, and
+    this package has no leading underscore, so `from wardex_sdk.interceptors
+    import SSLInterceptor` is a spelling a pinned caller may already have.
+    Deleting the eager `from ._ssl import SSLInterceptor` fixed two real
+    problems (see the builder below) but took the public name with it, and a
+    refactor is not the place to break an import.
+
+    PEP 562 keeps both: nothing imports `_ssl` until something asks for the
+    class by name, so the package still imports with the native extension
+    absent, and the class is still resolved through the MODULE — the isolation
+    suite's substitution is not frozen at package-import time.
+    """
+    if name == "SSLInterceptor":
+        from ._ssl import SSLInterceptor
+
+        return SSLInterceptor
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+# Every builder below imports INSIDE the call, and none of it is a style choice.
+#
+# `_ssl` was the one exception and it was the wrong one twice over. Imported at
+# module level, `ssl.SSLInterceptor` would be resolved when this PACKAGE was
+# first imported rather than when the seam is built — so the substitution the
+# isolation suite performs (swapping in a seam whose `install()` raises, to
+# prove one broken seam does not cost the other two) would silently install the
+# real one and measure nothing. And importing it here dragged the whole TLS seam
+# — with the native extension underneath it — into every import of this package,
+# including the ones `Runtime` makes from teardown paths that exist precisely to
+# work when that extension does not.
+#
+# `_mcp_stdio` needs anyio, so a module-level import would make the package
+# unimportable on a host that has none.
 def _ssl_interceptor(config: WardexConfig) -> InterceptorInterface:
-    # Reached through the MODULE and not through this package's own re-export
-    # above, so the class is resolved when the seam is built rather than when
-    # this package was first imported. `init()` used to import inside its own
-    # body and therefore had that property for free; taking the name bound at
-    # line 12 instead would freeze `_ssl.SSLInterceptor` as it stood at import
-    # time, and the substitution the isolation suite performs — swapping in a
-    # seam whose `install()` raises, to prove one broken seam does not cost the
-    # other two — would silently install the real one and measure nothing.
     from . import _ssl
 
     return _ssl.SSLInterceptor()
 
 
-# The two builders below import INSIDE the call, and that is not a style choice:
-# `_mcp_stdio` needs anyio, so a module-level import here would make the whole
-# package unimportable on a host that has none — and `close()` imports this
-# package unconditionally, from teardown paths that cannot handle an ImportError.
 def _mcp_stdio_interceptor(config: WardexConfig) -> InterceptorInterface:
     from ._mcp_stdio import McpStdioInterceptor
 
@@ -89,7 +112,7 @@ def install_configured_interceptors(client: Client | None, config: WardexConfig)
     """
     if not config.intercept:
         if config.interceptors is not None and config.debug:
-            # The same shape as `init()`'s pii_disabled_categories line, and for
+            # The same shape as `init()`'s pii disabled-categories line, and for
             # the same reason: a refinement of a switch that is off is not an
             # error, but silence about it is how a user concludes the selection
             # was honoured.
