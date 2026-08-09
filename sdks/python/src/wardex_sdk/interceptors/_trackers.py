@@ -315,14 +315,21 @@ class _Http2Tracker:
         #: at confidence 1.0, which is a span asserting the host issued this
         #: request outside any agent work when wardex simply lost the parent.
         #:
-        #: The one imprecision, stated rather than hidden: a transaction for a
-        #: stream this tracker never saw opened (capture that began
-        #: mid-connection) and whose id falls below the mark is reported as
-        #: evicted. Reaching that needs a connection that has already stranded
-        #: more than `_latch_cap` streams, and the claim it makes there —
-        #: wardex does not know this span's parent and is not calling it a root
-        #: — is still the true one.
+        #: Reset by `on_connection_close` along with the latch itself: stream
+        #: ids restart at 1 on a new connection, so a mark carried across one
+        #: would name a different set of streams than the ones it was taken on.
         self._latch_evicted_below = 0
+        #: The LOWEST stream id this tracker ever latched, and the floor that
+        #: keeps the mark above from over-claiming. Capture can attach
+        #: mid-connection: a response for a stream opened before the seam was
+        #: watching has no latch entry either, and its id is strictly below
+        #: anything this tracker put in the table. Without the floor such a
+        #: stream reads as evicted once the cap has run — a span blaming wardex
+        #: for a parent wardex was never in a position to hold, and, since
+        #: `parent_evicted` also opens the AGENT-mode gate, a span whose bodies
+        #: ship under a mode that had filtered it out. Zero means "nothing
+        #: latched yet", which fails the test for every real stream id.
+        self._latch_first = 0
 
     def on_request_bytes(self, data: bytes) -> list[_Txn]:
         opened, txns = self._conn.feed(True, data)
@@ -333,6 +340,8 @@ class _Http2Tracker:
         parent_closed = parent_is_closed_unit(parent) if opened else False
         for sid in opened:
             self._latch[sid] = (parent, parent_closed, now)
+        if opened and self._latch_first == 0:
+            self._latch_first = min(opened)
         # Drop-oldest, which for h2 is drop-lowest-stream-id: ids only ever
         # increase, so the entry evicted is the one likeliest to be stranded
         # already. Losing it costs that stream its parentage, never a span —
@@ -376,8 +385,18 @@ class _Http2Tracker:
         No transactions come back. A stream that never produced a response
         produced no status either, and the seam has nothing to say about it that
         would not be invented.
+
+        The eviction bookkeeping goes with the entries, and it has to: h2 stream
+        ids restart at 1 on the next connection, so a mark or a floor taken on
+        the last one names a different set of streams here. No caller reuses a
+        tracker across a close today — every `_retire` in `_seam.py` discards
+        the `_ConnectionState` and the tracker inside it — but nothing declares
+        that, and the cost of a stale mark is every unlatched stream on the new
+        connection reporting a parent wardex never lost.
         """
         self._latch.clear()
+        self._latch_evicted_below = 0
+        self._latch_first = 0
         return []
 
     def _mk(self, t: Any) -> _Txn:
@@ -411,7 +430,14 @@ class _Http2Tracker:
             # response instant. Something that belongs on this span is missing
             # in every case, which is the whole content of the marker; a second
             # marker for the clock half would split one fact across two words.
-            parent_evicted = t.stream_id <= self._latch_evicted_below
+            #
+            # Bounded at BOTH ends, and the floor is not decoration: the mark
+            # alone would also claim a stream opened before capture attached,
+            # whose id is below everything this tracker latched. That claim is
+            # not merely imprecise — `parent_evicted` feeds the capture gate as
+            # well as the marker, so a false one exports request and response
+            # bodies under a mode that had filtered the span out.
+            parent_evicted = self._latch_first <= t.stream_id <= self._latch_evicted_below
         else:
             parent, parent_closed, start = entry
             parent_evicted = False
