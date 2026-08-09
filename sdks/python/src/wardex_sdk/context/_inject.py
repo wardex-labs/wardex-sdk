@@ -22,6 +22,7 @@ counted (`Limitation.PATCH_SUPERSEDED`).
 from __future__ import annotations
 
 import fnmatch
+from collections.abc import Callable
 from typing import Any
 
 from .. import _hub
@@ -55,6 +56,26 @@ def _patchset() -> PatchSet:
     return _patches
 
 
+def _matches_target(host: str, patterns: tuple[str, ...]) -> bool:
+    """Glob-match an outbound host against the configured target patterns.
+
+    `fnmatchcase` against both sides lowercased, rather than plain `fnmatch`.
+    Hostnames are case-insensitive, so `API.MyCorp.com` has to match
+    `*.mycorp.com` — and `fnmatch` gets that wrong in two directions at once:
+    it defers to `os.path.normcase`, which folds case on Windows and does
+    nothing on Linux or macOS. An allowlist that admits a host on one operating
+    system and refuses the same host on another is worse than either answer
+    consistently applied, because it turns a propagation gap into something
+    only one developer's machine can reproduce.
+
+    Only the host is folded. The pattern is folded too rather than documented
+    as "write it lowercase", since a user who typed `*.MyCorp.com` in a config
+    file meant the same set of hosts.
+    """
+    lowered = host.lower()
+    return any(fnmatch.fnmatchcase(lowered, pattern.lower()) for pattern in patterns)
+
+
 def _build_inject_headers(host: str) -> dict[str, str]:
     try:
         from .. import _suppress  # noqa: PLC0415
@@ -68,11 +89,47 @@ def _build_inject_headers(host: str) -> dict[str, str]:
         if not cfg.propagation.enabled:
             return {}
         targets = cfg.propagation.targets
-        if targets is not None and not any(fnmatch.fnmatch(host, p) for p in targets):
+        if targets is not None and not _matches_target(host, targets):
             return {}
         return get_trace_headers()
     except Exception:
         return {}
+
+
+def _headers_to_add(host: str, has_header: Callable[[str], bool]) -> dict[str, str]:
+    """The headers wardex may add to one outbound request — the whole rule.
+
+    ONE rule for all three patched libraries: wardex only ever ADDS a header
+    the caller has not already set. It never replaces one, and never appends a
+    second copy of one. This is the same principle the byte seam is built on,
+    applied to the one place wardex is allowed to write: whatever the host
+    application put on the wire is what goes on the wire.
+
+    `has_header` is the library's own case-insensitive membership test, and it
+    has to see EVERY layer that will actually be sent. aiohttp merges a
+    session's default headers with the per-request ones long after the patch
+    runs, so a predicate that looks only at the per-request mapping answers
+    "absent" for a `traceparent` the session already carries — and wardex then
+    writes a per-request header that outranks the host's session default,
+    silently rewriting the trace context of every call on that session.
+
+    `traceparent` gates the whole injection. A caller who set one owns the
+    trace context for this request, and pairing their traceparent with our
+    tracestate would attribute vendor state to a trace that never carried it.
+
+    `tracestate` set WITHOUT a traceparent is likewise left alone, and this is
+    where the three libraries used to disagree: httpx and requests assigned
+    into a case-insensitive mapping and replaced the caller's value, while
+    aiohttp `extend`ed a CIMultiDict and put both on the wire — one request,
+    two `tracestate` headers, which is not a shape the W3C spec defines a
+    reading for. Dropping ours keeps the rule above intact in all three.
+    """
+    if has_header("traceparent"):
+        return {}
+    headers = _build_inject_headers(host)
+    if headers and has_header("tracestate"):
+        headers.pop("tracestate", None)
+    return headers
 
 
 def _install_httpx() -> None:
@@ -88,10 +145,13 @@ def _install_httpx() -> None:
 
     def _apply(request: Any) -> None:
         try:
-            if "traceparent" in request.headers:
-                return
-            for k, v in _build_inject_headers(request.url.host or "").items():
-                request.headers[k] = v
+            # `httpx.Headers` is case-insensitive, and by the time `send` runs
+            # the Client has already merged its own default headers into the
+            # Request — so this one mapping is every layer that will be sent.
+            headers = request.headers
+            add = _headers_to_add(request.url.host or "", headers.__contains__)
+            for k, v in add.items():
+                headers[k] = v
         except Exception:
             pass
 
@@ -122,10 +182,13 @@ def _install_requests() -> None:
 
     def send(self: Any, request: Any, **kwargs: Any) -> Any:
         try:
-            if "traceparent" not in request.headers:
-                host = urlparse(request.url).hostname or ""
-                for k, v in _build_inject_headers(host).items():
-                    request.headers[k] = v
+            # A PreparedRequest: `Session.prepare_request` has already folded
+            # the session's headers into this CaseInsensitiveDict, so like
+            # httpx there is a single layer to consult here.
+            headers = request.headers
+            host = urlparse(request.url).hostname or ""
+            for k, v in _headers_to_add(host, headers.__contains__).items():
+                headers[k] = v
         except Exception:
             pass
         return orig_send(self, request, **kwargs)
@@ -152,11 +215,22 @@ def _install_aiohttp() -> None:
             # CIMultiDict accepts mappings and iterables of pairs while
             # preserving duplicate keys (both are valid aiohttp LooseHeaders).
             merged = CIMultiDict(kwargs.get("headers") or {})
-            if "traceparent" not in merged:  # CIMultiDict lookup is case-insensitive
-                inject = _build_inject_headers(host)
-                if inject:
-                    merged.extend(inject)
-                    kwargs["headers"] = merged
+            # aiohttp is the one library of the three that has NOT merged its
+            # session defaults yet: `_prepare_headers` does that after this
+            # call, and a per-request header wins there. So the session's own
+            # headers are the second layer this predicate has to see — without
+            # them, a host that set `traceparent` once on the ClientSession had
+            # it overwritten on every single request. Both lookups are
+            # case-insensitive (CIMultiDict).
+            defaults = getattr(self, "headers", None)
+
+            def _has(name: str) -> bool:
+                return name in merged or (defaults is not None and name in defaults)
+
+            inject = _headers_to_add(host, _has)
+            if inject:
+                merged.extend(inject)
+                kwargs["headers"] = merged
         except Exception:
             pass
         return await orig_request(self, method, str_or_url, **kwargs)

@@ -12,7 +12,11 @@ from wardex_sdk._client import Client
 from wardex_sdk._config import BackendConfig, PropagationPolicy, WardexConfig
 from wardex_sdk._tracing import span, trace
 from wardex_sdk._types import InternalEnvelope
-from wardex_sdk.context._inject import install_propagation, uninstall_propagation
+from wardex_sdk.context._inject import (
+    _build_inject_headers,
+    install_propagation,
+    uninstall_propagation,
+)
 from wardex_sdk.transport._base import Transport
 
 
@@ -102,6 +106,23 @@ def test_targets_allowlist():
     assert seen["api.openai.com"] is False
 
 
+def test_targets_match_case_insensitively():
+    """Hostnames are case-insensitive; `fnmatch` is case-insensitive on Windows.
+
+    Both halves of that sentence are the bug. Plain `fnmatch` defers to
+    `os.path.normcase`, so the same allowlist admitted `API.MyCorp.com` on one
+    developer's machine and refused it on the next — a propagation gap only one
+    operating system can reproduce. Asserted at `_build_inject_headers` rather
+    than through a client because httpx lowercases the host during URL
+    normalization and would hide the host side of the fold entirely.
+    """
+    _setup(propagation=PropagationPolicy(enabled=True, targets=("*.MyCorp.com",)))
+    with trace("root"):
+        assert _build_inject_headers("api.mycorp.com") != {}  # pattern folded
+        assert _build_inject_headers("API.MyCorp.COM") != {}  # host folded
+        assert _build_inject_headers("api.othercorp.com") == {}  # still an allowlist
+
+
 def test_async_client_injects():
     import asyncio
 
@@ -133,12 +154,20 @@ def test_install_uninstall_idempotent():
 
 
 class _HeaderEcho(http.server.BaseHTTPRequestHandler):
-    seen: list[dict] = []
-    multi: list = []  # repeated x-multi values; dict(self.headers) collapses duplicates
+    """Records every header of every request, duplicates included.
+
+    One recorder and not two: the previous pair kept `dict(self.headers)`
+    alongside a separate `get_all("x-multi")` list, so the only header whose
+    repetitions were visible was the one a test had thought to name in advance.
+    Duplicate suppression is precisely what the injection rules below are
+    about, so the raw pair list is what gets stored and `_sent()` answers both
+    questions off it.
+    """
+
+    raw: list[list[tuple[str, str]]] = []
 
     def do_GET(self):
-        _HeaderEcho.seen.append(dict(self.headers))
-        _HeaderEcho.multi.append(self.headers.get_all("x-multi"))
+        _HeaderEcho.raw.append(list(self.headers.items()))
         self.send_response(200)
         self.send_header("Content-Length", "2")
         self.end_headers()
@@ -148,44 +177,138 @@ class _HeaderEcho(http.server.BaseHTTPRequestHandler):
         pass
 
 
+def _sent(name: str) -> list[str]:
+    """Every value of `name` on the last request received, in wire order."""
+    lowered = name.lower()
+    return [v for k, v in _HeaderEcho.raw[-1] if k.lower() == lowered]
+
+
 @pytest.fixture()
 def echo_server():
-    _HeaderEcho.seen = []
-    _HeaderEcho.multi = []
+    """A loopback echo server that is fully gone when the test is.
+
+    `shutdown()` alone stops the accept loop and leaves both the listening
+    socket and the serving thread behind. Per test that is one descriptor and
+    one thread, and the first symptom is never a failure here — it is an
+    unrelated file, later in the session, that cannot open a socket. So the
+    teardown is the full three: stop the loop, join the thread that ran it,
+    then close the socket, and in a `finally` so a failing test tears down as
+    completely as a passing one.
+    """
+    _HeaderEcho.raw = []
     srv = http.server.HTTPServer(("127.0.0.1", 0), _HeaderEcho)
-    th = threading.Thread(target=srv.serve_forever, daemon=True)
+    th = threading.Thread(target=srv.serve_forever, name="wardex-test-echo", daemon=True)
     th.start()
-    yield f"http://127.0.0.1:{srv.server_port}"
-    srv.shutdown()
+    try:
+        yield f"http://127.0.0.1:{srv.server_port}"
+    finally:
+        srv.shutdown()
+        th.join(timeout=5)
+        srv.server_close()
+        _HeaderEcho.raw = []
 
 
-def test_requests_injects(echo_server):
-    import requests
+#: The three patched libraries, driven through one signature so that every rule
+#: below is asserted against all of them. The rules ARE the same rule — see
+#: `_inject._headers_to_add` — and a per-library test that only exists for one
+#: library is how they came to differ in the first place.
+LIBRARIES = ("httpx", "requests", "aiohttp")
 
+
+def _get(library: str, url: str, *, headers=None, session_headers=None) -> None:
+    """One GET through `library`, with optional per-request and session headers."""
+    if library == "httpx":
+        with httpx.Client(headers=session_headers, timeout=5) as c:
+            c.get(url, headers=headers)
+    elif library == "requests":
+        import requests
+
+        with requests.Session() as s:
+            if session_headers:
+                s.headers.update(session_headers)
+            s.get(url, headers=headers, timeout=5)
+    else:
+        import asyncio
+
+        import aiohttp
+
+        async def main():
+            async with aiohttp.ClientSession(headers=session_headers) as s:
+                async with s.get(url, headers=headers) as resp:
+                    await resp.read()
+
+        asyncio.run(main())
+
+
+@pytest.mark.parametrize("library", LIBRARIES)
+def test_injects_on_every_patched_library(library, echo_server):
     _setup(propagation=PropagationPolicy(enabled=True))
     install_propagation()
     with trace("root") as root:
-        requests.get(f"{echo_server}/x", timeout=5)
-    assert _HeaderEcho.seen[-1].get("traceparent", "").split("-")[1] == root.context.trace_id.hex()
+        _get(library, f"{echo_server}/x")
+    assert _sent("traceparent") == [
+        f"00-{root.context.trace_id.hex()}-{root.context.span_id.hex()}-01"
+    ]
 
 
-def test_aiohttp_injects(echo_server):
-    import asyncio
-
-    import aiohttp
-
+@pytest.mark.parametrize("library", LIBRARIES)
+def test_tracestate_forwarded_verbatim(library, echo_server):
+    tp = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
     _setup(propagation=PropagationPolicy(enabled=True))
     install_propagation()
+    with wardex_sdk.continue_trace({"traceparent": tp, "tracestate": "dd=s:1"}):
+        with trace("root"):
+            _get(library, f"{echo_server}/x")
+    assert _sent("tracestate") == ["dd=s:1"]
 
-    async def main():
-        with trace("root") as root:
-            async with aiohttp.ClientSession() as s:
-                async with s.get(f"{echo_server}/x") as resp:
-                    await resp.read()
-            return root.context.trace_id.hex()
 
-    tid = asyncio.run(main())
-    assert _HeaderEcho.seen[-1].get("traceparent", "").split("-")[1] == tid
+@pytest.mark.parametrize("library", LIBRARIES)
+def test_a_session_default_traceparent_wins_over_injection(library, echo_server):
+    """A header the host set on the SESSION is a header the host set.
+
+    aiohttp is why this is parametrized. It merges session defaults with
+    per-request headers AFTER the patch runs, and a per-request header wins
+    there — so a predicate that consulted only the per-request mapping saw no
+    traceparent, wrote one, and outranked the default the host had set once for
+    every call on that session. httpx and requests merge before the patch and
+    were always safe; nothing about that is visible from inside the injector,
+    which is why all three are asked the same question here.
+    """
+    _setup(propagation=PropagationPolicy(enabled=True))
+    install_propagation()
+    with trace("root"):
+        _get(library, f"{echo_server}/x", session_headers={"traceparent": "session-default"})
+    assert _sent("traceparent") == ["session-default"]
+
+
+@pytest.mark.parametrize("library", LIBRARIES)
+def test_a_per_request_traceparent_wins_over_injection(library, echo_server):
+    _setup(propagation=PropagationPolicy(enabled=True))
+    install_propagation()
+    with trace("root"):
+        _get(library, f"{echo_server}/x", headers={"traceparent": "request-set"})
+    assert _sent("traceparent") == ["request-set"]
+
+
+@pytest.mark.parametrize("library", LIBRARIES)
+def test_a_callers_tracestate_is_neither_replaced_nor_duplicated(library, echo_server):
+    """The one rule, where the three libraries used to give three answers.
+
+    A caller with a `tracestate` and no `traceparent` used to get: httpx and
+    requests silently REPLACING the value (assignment into a case-insensitive
+    mapping), and aiohttp sending BOTH on the wire (`extend` on a CIMultiDict)
+    — one request with two tracestate headers, a shape the spec defines no
+    reading for. Now all three add the traceparent the caller is missing and
+    leave the caller's tracestate exactly as it was written.
+    """
+    tp = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+    _setup(propagation=PropagationPolicy(enabled=True))
+    install_propagation()
+    with wardex_sdk.continue_trace({"traceparent": tp, "tracestate": "wardex=ours"}):
+        with trace("root"):
+            _get(library, f"{echo_server}/x", headers={"tracestate": "caller=theirs"})
+    assert _sent("tracestate") == ["caller=theirs"]
+    assert len(_sent("traceparent")) == 1
 
 
 def test_aiohttp_preserves_duplicate_headers(echo_server):
@@ -204,20 +327,8 @@ def test_aiohttp_preserves_duplicate_headers(echo_server):
                     await resp.read()
 
     asyncio.run(main())
-    assert _HeaderEcho.multi[-1] == ["a", "b"]
-    assert "traceparent" in _HeaderEcho.seen[-1]
-
-
-def test_tracestate_forwarded_verbatim(echo_server):
-    import requests
-
-    tp = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
-    _setup(propagation=PropagationPolicy(enabled=True))
-    install_propagation()
-    with wardex_sdk.continue_trace({"traceparent": tp, "tracestate": "dd=s:1"}):
-        with trace("root"):
-            requests.get(f"{echo_server}/x", timeout=5)
-    assert _HeaderEcho.seen[-1].get("tracestate") == "dd=s:1"
+    assert _sent("x-multi") == ["a", "b"]
+    assert len(_sent("traceparent")) == 1
 
 
 def test_init_wires_propagation_and_close_unwires():
