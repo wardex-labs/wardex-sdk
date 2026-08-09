@@ -12,7 +12,6 @@ from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 
 from .. import _hub
-from .._scope import Scope
 from .._types import SpanContext
 from ._w3c import format_traceparent, parse_traceparent, sanitize_tracestate
 
@@ -51,26 +50,11 @@ def continue_trace(headers: Mapping[str, str]) -> Iterator[None]:
         yield
 
 
-def _emit_headers(scope: Scope) -> dict[str, str]:
-    """The W3C headers one scope describes. The only place the pair is built.
+def _emit_headers() -> dict[str, str]:
+    """The W3C headers the ambient context describes. The pair is built here.
 
-    `tracestate` rides only where a `traceparent` goes: the spec gives no
-    reading for vendor state without the context it annotates, and a receiver
-    that gets one alone either drops it or attributes it to a trace of its own.
-    """
-    active = scope.active_span_context
-    if active is None:
-        return {}
-    headers = {"traceparent": format_traceparent(active)}
-    if scope.tracestate:
-        headers["tracestate"] = scope.tracestate
-    return headers
-
-
-def _ambient_scope() -> Scope:
-    """The one scope both public readers resolve. Resolved ONCE per call.
-
-    The two used to disagree: `get_traceparent` read the span context off the
+    ONE resolution for both public readers, and it is `_hub`'s merged one. The
+    two used to disagree: `get_traceparent` read the span context off the
     CURRENT scope while `get_trace_headers` read the tracestate off the MERGED
     one. Nothing writes either field to the global scope today, so the two
     agreed by accident rather than by construction — the first host to seed a
@@ -86,23 +70,32 @@ def _ambient_scope() -> Scope:
     host is relying on, and losing propagation data is the failure direction
     this SDK does not take.
 
-    Resolved ONCE per call, and the cost is worth naming because it is not
-    free: `get_merged_scope` clones and deep-copies. `get_trace_headers` — the
-    one on the outbound path of every patched HTTP request — used to pay for a
-    merge plus a current-scope read and now pays for exactly one merge, so the
-    hot path got cheaper. `get_traceparent` pays a merge it did not pay before.
-    That is the price of the two agreeing, and it is charged to the reader that
-    is called by hand rather than to the one called per request.
+    Two fields and not a whole merged Scope: `merged_trace_fields` applies the
+    same precedence without `merge_scopes`' per-layer `deepcopy` of `contexts`.
+    That copy is why this is not simply `_hub.get_merged_scope()` — it costs
+    unboundedly much on the request path, it can RAISE on a host context value
+    that does not copy, and neither reader here looks at tags, user, contexts
+    or conversation.
+
+    `tracestate` rides only where a `traceparent` goes: the spec gives no
+    reading for vendor state without the context it annotates, and a receiver
+    that gets one alone either drops it or attributes it to a trace of its own.
     """
-    return _hub.get_merged_scope()
+    active, tracestate = _hub.get_merged_trace_fields()
+    if active is None:
+        return {}
+    headers = {"traceparent": format_traceparent(active)}
+    if tracestate:
+        headers["tracestate"] = tracestate
+    return headers
 
 
 def get_traceparent() -> str | None:
-    return _emit_headers(_ambient_scope()).get("traceparent")
+    return _emit_headers().get("traceparent")
 
 
 def get_trace_headers() -> dict[str, str]:
-    return _emit_headers(_ambient_scope())
+    return _emit_headers()
 
 
 @contextmanager

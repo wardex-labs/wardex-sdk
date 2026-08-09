@@ -1,5 +1,7 @@
 """continue_trace / get_traceparent / get_trace_headers."""
 
+import threading
+
 import wardex_sdk
 from wardex_sdk import _hub
 from wardex_sdk._client import Client
@@ -117,6 +119,25 @@ def test_both_readers_resolve_the_same_ambient_scope():
         assert wardex_sdk.get_traceparent() == headers["traceparent"]
         assert headers["traceparent"].split("-")[1] == ctx.trace_id.hex()
         assert headers["tracestate"] == TS
+
+
+def test_the_readers_survive_a_context_value_that_cannot_be_copied():
+    """`set_context()` takes host objects, so the readers must not copy them.
+
+    Both readers resolve the same ambient context, and the obvious way to do
+    that — materialize the merged scope — deep-copies every layer's `contexts`.
+    A host that had ever parked a lock, a socket or an open file there turned
+    `get_traceparent()`, the documented by-hand escape hatch for gRPC, Kafka
+    and Celery send paths, into a `TypeError` at the send site. The headers are
+    two immutable scalars; nothing in `contexts` is read to build them.
+    """
+    _setup()
+    _hub.get_global_scope().set_context("runtime", {"lock": threading.Lock()})
+    assert wardex_sdk.get_traceparent() is None
+    assert wardex_sdk.get_trace_headers() == {}
+    with trace("root") as root:
+        assert wardex_sdk.get_traceparent().split("-")[1] == root.context.trace_id.hex()
+        assert wardex_sdk.get_trace_headers()["traceparent"] == wardex_sdk.get_traceparent()
 
 
 def test_tracestate_never_rides_without_a_traceparent():
