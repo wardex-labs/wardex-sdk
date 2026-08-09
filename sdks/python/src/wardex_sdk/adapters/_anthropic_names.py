@@ -156,7 +156,30 @@ class McpToolCatalog:
         # From the CORE, never a Python literal — same rule as every other bound.
         resolved = CaptureLimits().resolved()
         self._max = max_entries if max_entries is not None else resolved["max_entries_per_unit"]
-        self._lock = threading.Lock()
+        # Reentrant, and for the reason `_diag._REPORT_LOCK` was made reentrant
+        # rather than argued safe: the alternative is a claim about which
+        # callers can arrive here, and such a claim holds only until the next
+        # caller is added. Today no finalizer-borne path reaches this table —
+        # the seams' close hooks end at `Client.capture_span` — but a weakref
+        # callback lands wherever a reference count reaches zero (and at any
+        # allocation, via a cyclic collection), and every block this lock guards
+        # offers both: `ServerHandle(name)`, a list append and a `sanitize()`
+        # result allocate, and `self._handles.pop(0)` drops the last reference
+        # to a handle. So the one thing standing between this and a permanent
+        # self-deadlock in the host's own `create_sdk_mcp_server()` call would
+        # be a call-graph fact nobody re-checks. The lock is taken per
+        # registration and per hook lookup — both far below span rate — so
+        # making the property local to the lock costs nothing worth counting.
+        #
+        # Reentrancy alone is not the whole guarantee, because a reentrant lock
+        # turns a hang into concurrent mutation. Every guarded block here must
+        # therefore tolerate a nested `handle_for`, whose FIFO cap can pop from
+        # `_handles` and append to it. The three that walk the list do so over a
+        # snapshot for exactly that reason: walking the live list by index would
+        # silently skip a handle after a pop, and a skipped handle is a server
+        # whose token is never resolved — which the module docstring explains is
+        # how one call gets emitted twice.
+        self._lock = threading.RLock()
         self._handles: list[ServerHandle] = []
 
     def handle_for(self, name: str, existing: ServerHandle | None = None) -> ServerHandle:
@@ -194,7 +217,7 @@ class McpToolCatalog:
                 instance = config.get("instance") if isinstance(config, Mapping) else None
                 if instance is None:
                     continue
-                for handle in self._handles:
+                for handle in list(self._handles):
                     if handle.instance is instance:
                         handle.token = sanitize(str(key))
 
@@ -274,7 +297,7 @@ class McpToolCatalog:
         """
         with self._lock:
             out: set[UnitKey] = set()
-            for handle in self._handles:
+            for handle in list(self._handles):
                 token = handle.effective_token
                 head = token + "__"
                 if not body.startswith(head):
@@ -292,4 +315,4 @@ class McpToolCatalog:
         `key_for_hook` returns None for.
         """
         with self._lock:
-            return {h.effective_token for h in self._handles if tool_name in h.tools}
+            return {h.effective_token for h in list(self._handles) if tool_name in h.tools}

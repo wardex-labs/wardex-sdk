@@ -37,8 +37,15 @@ default action, or "ignore") happens exactly as before, after our flush.
 THE LOCK IS REENTRANT, and not out of habit. `install()` holds it and then
 calls `_teardown()` and `_install_signal_handlers()`, which take it again on
 the same thread; a plain `Lock` would deadlock the SDK's own `init()`. A
-signal handler is the other re-entrant path — it can land on the thread that
-already holds the lock, between any two bytecodes.
+signal handler is the second re-entrant path — it can land on the thread that
+already holds the lock, between any two bytecodes. A weakref finalizer is the
+third: the byte seams' close hook registers one per connection, and CPython runs
+such a callback out of the referent's DEALLOCATION — so SDK code can now
+re-enter wherever a reference count reaches zero (and at any allocation, via a
+cyclic collection), on ANY thread rather than only the main one. Neither of
+those two reaches this lock today. The self-recursion does, and it is what makes
+the reentrancy a property of the lock rather than a standing claim about who
+calls it.
 
 THE CLIENT IS READ WITHOUT THE LOCK, deliberately. `get_client()` sits on the
 capture hot path and on the teardown path, and a reader that can block behind

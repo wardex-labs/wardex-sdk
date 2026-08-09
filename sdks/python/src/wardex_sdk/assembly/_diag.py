@@ -46,7 +46,8 @@ class Counters:
     thread and re-enter `bump()`. Two ways in, not one: a signal handler that
     runs wardex code (`_runtime.py` installs one), and a `weakref.finalize`
     callback, which the byte seams' close hook uses as its backstop and which
-    lands at an arbitrary allocation. A plain Lock would deadlock the host on
+    lands wherever a reference count reaches zero — plus, through a cyclic
+    collection, at any allocation. A plain Lock would deadlock the host on
     either.
     The RLock buys deadlock-freedom and cross-thread serialization, and that is
     all it buys: `bump()` is a read-modify-write with a Python-level call in the

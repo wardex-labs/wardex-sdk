@@ -404,11 +404,17 @@ class Client:
         # The signal handler is no longer the ONLY same-thread re-entry. The
         # byte seams' socket close hook backstops itself with weakref
         # finalizers, and a WebSocket span is assembled when its connection
-        # ends — so capture_span() can also be re-entered from a finalizer, at
-        # an arbitrary allocation, on whatever thread dropped the last
-        # reference. Same requirement, one more way to arrive at it: everything
-        # capture_span touches must be reentrant (see BatchWorker._spawn_lock,
-        # which had to become an RLock for exactly this).
+        # ends — so capture_span() can also be re-entered from a finalizer.
+        # WHERE such a callback lands is the rule the rest of this file's lock
+        # arguments are measured against: CPython runs it from the referent's
+        # DEALLOCATION, so anywhere a reference count can reach zero — an
+        # attribute store, a `del`, a container eviction, a frame exit, a
+        # cascade out of a dying container — and additionally at any allocation,
+        # because that is what starts a cyclic collection. On whatever thread
+        # dropped that last reference, which need not be the main one. Same
+        # requirement, one more way to arrive at it: everything capture_span
+        # touches must be reentrant (see BatchWorker._spawn_lock, which had to
+        # become an RLock for exactly this).
         self._buffer_lock = threading.RLock()
         # Named for the guarantee it carries, not for the method that takes it:
         # transport.export()/flush() are never entered by two threads at once,
@@ -437,12 +443,38 @@ class Client:
         self._dropped = 0
         self._lost = 0
         self._closed = False
-        # Deliberately NOT reentrant, and safe only because nothing that can
-        # re-enter this thread reaches close(): the signal handler calls
-        # flush(), and a seam's weakref finalizer reaches capture_span (see
-        # _buffer_lock). Either one landing between the three statements this
-        # guards would self-deadlock permanently on re-entry. Anything that
-        # routes close() onto either path must make this an RLock first.
+        # The SDK's one non-reentrant lock, and the only one -- a source scan in
+        # `test_finalizer_reentrancy` enumerates plain `Lock()` sites and fails
+        # on any second one, so this exception cannot be quietly copied.
+        #
+        # It stays a plain Lock because reentrancy would not FIX the hazard
+        # here, only trade it. What this guards is a check-and-set: a frame that
+        # reads `_closed` False and then sets it True is claiming the right to
+        # run steps 2-4 below, which are outside the lock. An RLock would let a
+        # re-entering frame walk into the two-statement window between the read
+        # and the store, make the same claim, and run a whole nested teardown
+        # while the outer one is still going -- a double stop/drain/close
+        # instead of a hang. The repair, if this ever becomes reachable, is to
+        # make the claim itself one-shot, not to swap the lock type.
+        #
+        # And it is not reachable today, by either of the re-entry routes this
+        # SDK has. The signal handler calls `flush()` and `close_units_all()`,
+        # never `close()`. A seam's weakref finalizer reaches `capture_span`
+        # (see `_buffer_lock` for where such a callback can land), and the
+        # window this guards satisfies both halves of that rule: it drops no
+        # strong reference at all -- the only decref is of `True`/`False`, which
+        # are immortal and cannot be deallocated, and the store overwrites an
+        # attribute that already exists -- and it allocates nothing, so no
+        # cyclic collection can start in it either. Anything that routes
+        # `close()` onto either path has to restructure this, and the scan is
+        # what makes sure the next plain Lock gets the same argument written
+        # down.
+        #
+        # Re-derive it from the rule, never from the shorthand. "Does this block
+        # allocate?" is the wrong question and would clear a shape this SDK is
+        # full of: a bounded table evicting its oldest entry while holding its
+        # own lock deallocates whatever that entry was the last reference to,
+        # which is precisely a finalizer landing site.
         self._close_lock = threading.Lock()
         limits = config.limits.resolved()
         self._max_buffer_spans = limits["max_buffer_spans"]

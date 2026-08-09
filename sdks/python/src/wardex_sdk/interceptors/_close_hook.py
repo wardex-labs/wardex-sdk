@@ -112,13 +112,19 @@ class CloseRegistry:
     the bug this exists to avoid.
 
     NO LOCK, deliberately. `_fire` can run from a weakref callback, which lands
-    at an arbitrary allocation on whatever thread happened to drop the last
-    reference — including a thread already inside `on_close`. A plain `Lock`
-    there is a self-deadlock in the host's own code, and an `RLock` would only
+    wherever a reference count reaches zero — an attribute store, a `del`, a
+    container eviction, a frame exit, or a cyclic collection at an allocation —
+    on whatever thread happened to drop that reference, and so including a
+    thread already inside `on_close`. A plain `Lock` there is a self-deadlock in
+    the host's own code, and an `RLock` would only
     hide it while ordering nothing. What is left is what the dict itself
     guarantees: `pop`, `get` and insert are each single operations, and two
     threads cannot register the same object because they cannot both have just
     created it. `_seam._conns` is unlocked for the same reason.
+
+    The price is that no method here may hold the table open across a step that
+    can re-enter. `clear()` is the one that walks it, so it walks a snapshot:
+    see the note there.
     """
 
     __slots__ = ("_entries",)
@@ -166,8 +172,21 @@ class CloseRegistry:
             entry.finalizer.detach()
 
     def clear(self) -> None:
-        """Drop every registration without running anything (uninstall path)."""
-        for entry in self._entries.values():
+        """Drop every registration without running anything (uninstall path).
+
+        A SNAPSHOT, not `self._entries.values()`. This is the one method that
+        holds the table open across something that can re-enter: `finalize.detach`
+        is ordinary Python and allocates, and any socket in the process closing
+        on another thread reaches `_fire`, which pops. Either mutates the dict
+        mid-walk and `clear()` raises `RuntimeError: dictionary changed size
+        during iteration` — out of `uninstall_shared_close_hook`, which the
+        registries above it call after they have already restored their patches
+        but before they clear their `_installed` flags. The exception is counted
+        and swallowed, the flag stays True on a module singleton, and the next
+        `init()` finds an already-installed probe: connection timing is silently
+        never instrumented again for the life of the process.
+        """
+        for entry in list(self._entries.values()):
             if entry.finalizer is not None:
                 entry.finalizer.detach()
         self._entries.clear()
