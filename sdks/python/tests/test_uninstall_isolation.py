@@ -479,22 +479,31 @@ def test_a_half_installed_ssl_seam_leaves_no_wrapper_on_the_hosts_sockets(monkey
 def test_a_rolled_back_seam_does_not_release_a_timing_reference_it_never_took(monkeypatch):
     """Total is not the same as unconditional, and this is where they differ.
 
-    The shared connection-timing probe is REFCOUNTED — both byte seams take a
-    reference and it patches `socket.connect` once. An `uninstall()` made total
-    by simply dropping its installed-flag gate would release a reference the
-    failed `install()` never took: the count falls to zero underneath the seam
-    that is still live and healthy, `socket.connect` is restored out from under
-    it, and every span it emits from then on reports its connect time as
-    unavailable. So the release is keyed on the acquisition itself.
+    Both shared probes are REFCOUNTED — the timing one patches `socket.connect`
+    and the close hook patches `socket.close`, each once, and both byte seams
+    take a reference on each. An `uninstall()` made total by simply dropping its
+    installed-flag gate would release a reference the failed `install()` never
+    took: the count falls to zero underneath the seam that is still live and
+    healthy, the patch is restored out from under it, and every span it emits
+    from then on reports its connect time as unavailable. So the release is
+    keyed on the acquisition itself.
+
+    Both counts are asserted, before and after, and the "before" is not
+    ceremony: a leaked reference leaves wardex's wrapper on a stdlib method for
+    the life of the process, and the only thing that ever notices is an
+    assertion like this one.
     """
     import socket
 
-    from wardex_sdk.interceptors import _conn_timing
+    from wardex_sdk.interceptors import _close_hook, _conn_timing
     from wardex_sdk.interceptors._socket import RawSocketInterceptor
     from wardex_sdk.interceptors._ssl import SSLInterceptor
 
     assert _conn_timing._shared_refcount == 0, (
         "another test left the shared timing probe installed; this one proves nothing"
+    )
+    assert _close_hook._refcount == 0, (
+        "another test left the shared close hook installed; this one proves nothing"
     )
     # `connect` and `send` are INHERITED from `_socket.socket`, so "is wardex's
     # wrapper installed?" is exactly "does the class have an own attribute?" —
@@ -502,6 +511,9 @@ def test_a_rolled_back_seam_does_not_release_a_timing_reference_it_never_took(mo
     # rule 2), never left as a shadow.
     assert "connect" not in socket.socket.__dict__
     assert "send" not in socket.socket.__dict__
+    # `close` is socket.py's OWN method, so absence is not the question there;
+    # identity is.
+    orig_close = socket.socket.close
 
     reg = InterceptorRegistry()
     live = SSLInterceptor()
@@ -528,7 +540,9 @@ def test_a_rolled_back_seam_does_not_release_a_timing_reference_it_never_took(mo
     finally:
         reg.uninstall_all()
         assert _conn_timing._shared_refcount == 0, "a timing reference outlived its seam"
+        assert _close_hook._refcount == 0, "a close-hook reference outlived its seam"
         assert "connect" not in socket.socket.__dict__
+        assert socket.socket.close is orig_close
 
 
 def test_a_rollback_the_host_interrupts_still_drops_the_name_from_the_table():

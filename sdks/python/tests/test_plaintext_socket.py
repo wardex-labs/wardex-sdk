@@ -202,3 +202,101 @@ def test_plaintext_ws_requires_allowlist():
         wardex.close()
         httpd.shutdown()
         httpd.server_close()
+
+
+# --- `Connection: close` — the socket that closes before its body arrives ---
+
+_WILL_CLOSE_RESP = json.dumps(
+    {
+        "id": "c1",
+        "model": "gpt-4o",
+        "choices": [
+            {"finish_reason": "stop", "message": {"role": "assistant", "content": "x" * 100_000}}
+        ],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+    }
+).encode()
+
+
+def _will_close_server(payload: bytes):
+    """A one-shot HTTP/1.1 server that answers with `Connection: close`.
+
+    Hand-rolled rather than `http.server`, because `BaseHTTPRequestHandler`
+    will not emit that header while it is speaking HTTP/1.1 keep-alive, and the
+    header is the entire point of the fixture.
+    """
+    srv = socket.socket()
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    host, port = srv.getsockname()[:2]
+
+    def serve() -> None:
+        conn, _ = srv.accept()
+        with conn:
+            buf = b""
+            while b"\r\n\r\n" not in buf:
+                chunk = conn.recv(65536)
+                if not chunk:
+                    return
+                buf += chunk
+            head, _, body = buf.partition(b"\r\n\r\n")
+            want = 0
+            for line in head.split(b"\r\n"):
+                if line.lower().startswith(b"content-length:"):
+                    want = int(line.split(b":", 1)[1])
+            while len(body) < want:
+                body += conn.recv(65536)
+            conn.sendall(
+                b"HTTP/1.1 200 OK\r\n"
+                b"Content-Type: application/json\r\n"
+                b"Connection: close\r\n"
+                b"Content-Length: " + str(len(payload)).encode() + b"\r\n\r\n" + payload
+            )
+        srv.close()
+
+    threading.Thread(target=serve, daemon=True).start()
+    return host, port
+
+
+def test_a_connection_close_response_is_captured_after_the_socket_was_closed():
+    """`socket.close()` is not the end of the connection, and the seam must agree.
+
+    `http.client.getresponse()` hands the connection to the response when the
+    response `will_close` — a `Connection: close` header, HTTP/1.0, or a body
+    with no length framing — and calls `sock.close()` as soon as the HEADERS
+    are parsed. That call does not release anything: `socket.close()` only
+    reaches `_real_close()` once `_io_refs` runs out, and the `makefile()`
+    object holding the body still owns a reference. The rest of the body then
+    arrives through the seam's own patched `recv_into`, AFTER the close.
+
+    A close hook that fires there retires the connection mid-response: the
+    remaining bytes build a fresh state, a response with no request ahead of it
+    latches `gate = "ignore"`, and the span is never assembled. Silently — no
+    counter, no limitation marker, just a missing span for every `will_close`
+    response whose body outgrows one buffered read.
+    """
+    host, port = _will_close_server(_WILL_CLOSE_RESP)
+    try:
+        wardex.init(transport=ConsoleTransport(), intercept=True)
+        conn = http.client.HTTPConnection(host, port)
+        conn.request(
+            "POST",
+            "/v1/chat/completions",
+            b'{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}',
+            {},
+        )
+        resp = conn.getresponse()
+        assert resp.will_close, "precondition: http.client did not hand over the connection"
+        received = resp.read()
+        conn.close()
+
+        assert len(received) == len(_WILL_CLOSE_RESP), (
+            "precondition: the body must outgrow one buffered read, so that part of "
+            "it arrives after http.client already called sock.close()"
+        )
+        spans = _client_spans()
+        assert len(spans) == 1, "the connection was retired while its body was still arriving"
+        assert spans[0].gen_ai is not None
+    finally:
+        wardex.close()

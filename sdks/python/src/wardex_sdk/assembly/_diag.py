@@ -42,9 +42,12 @@ class Counters:
     because a Python literal here is exactly the drift `test_limits.py`
     forbids.
 
-    Reentrancy: an RLock, because a guarded block can be interrupted by a signal
-    handler that runs wardex code (`_runtime.py` installs one) and re-enters
-    `bump()` on the same thread. A plain Lock would deadlock the host there.
+    Reentrancy: an RLock, because a guarded block can be interrupted on the same
+    thread and re-enter `bump()`. Two ways in, not one: a signal handler that
+    runs wardex code (`_runtime.py` installs one), and a `weakref.finalize`
+    callback, which the byte seams' close hook uses as its backstop and which
+    lands at an arbitrary allocation. A plain Lock would deadlock the host on
+    either.
     The RLock buys deadlock-freedom and cross-thread serialization, and that is
     all it buys: `bump()` is a read-modify-write with a Python-level call in the
     middle, so a signal delivered between the read and the store still loses one

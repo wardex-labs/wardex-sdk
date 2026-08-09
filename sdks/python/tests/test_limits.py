@@ -591,7 +591,12 @@ def _probe_max_connections() -> bool:
     def tracked(limits: CaptureLimits) -> int:
         itc = SSLInterceptor()
         itc._limits = limits.resolved()
-        for sock in [_FakeSock() for _ in range(4)]:
+        # Bound to a name, and it has to be: the seam evicts a connection's
+        # state when its socket DIES (interceptors/_close_hook.py), so a
+        # throwaway list comprehension would be collected the moment the loop
+        # ended and this would count zero live connections under every cap.
+        socks = [_FakeSock() for _ in range(4)]
+        for sock in socks:
             itc._state(sock)
         return len(itc._conns)
 

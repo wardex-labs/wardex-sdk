@@ -15,10 +15,12 @@ import socket
 import ssl
 import time
 from contextvars import ContextVar
+from functools import partial
 from typing import Any
 
 from .. import _wardex_native
 from ..assembly import PatchSet
+from ._close_hook import install_shared_close_hook, on_close, uninstall_shared_close_hook
 
 # ContextVar that carries the timing record the async probe stamps onto the SSLObject
 _establishing: ContextVar[_TimingRecord | None] = ContextVar("_wardex_establishing", default=None)
@@ -62,8 +64,14 @@ class _TimingRecord:
 class ConnTimingStore:
     """Sync-path-only handoff buffer: fileno → (connect_ms, handshake_ms).
 
-    When the cap is exceeded, the oldest entry is evicted first, in insertion
-    order (FIFO).
+    A slot is released when the transaction that needed it is emitted (`pop`)
+    or when its socket closes (`discard`, wired by the close hook in
+    `ConnTimingProbe`). The FIFO cap is the BACKSTOP for whatever neither of
+    those reaches, and it is a poor one on its own: it evicts the OLDEST entry,
+    which on a busy process is the live TLS connection still streaming a
+    response, while the socket that connected once and died an hour ago keeps
+    its slot. That is where the spurious `connect_timing_unavailable` came from,
+    and close-driven release is what keeps the cap from being reached at all.
     """
 
     def __init__(self, cap: int | None = None) -> None:
@@ -94,6 +102,16 @@ class ConnTimingStore:
             return None
         return (slot[0], slot[1])
 
+    def discard(self, fileno: int) -> None:
+        """Release a slot nobody will consume — the socket that owned it is gone.
+
+        Separate from `pop` because the two are different events with the same
+        mechanics: `pop` is "a span consumed this measurement", `discard` is
+        "there will never be a span". Reading the difference off a discarded
+        return value would make the close hook look like a consumer.
+        """
+        self._by_fileno.pop(fileno, None)
+
     def clear(self) -> None:
         self._by_fileno.clear()
 
@@ -109,24 +127,38 @@ class ConnTimingProbe:
     def install(self) -> None:
         if self._installed:
             return
-        # socket.connect is patched globally, so non-TLS sockets also leave an entry
-        # in the store. That entry is only popped when a TLS span is emitted, so until
-        # then it can only be evicted via the FIFO cap.
-        # In rare cases (>cap connects during a streaming response), a TLS entry may
-        # be evicted early, causing a spurious connect_timing_unavailable (fail-safe).
-        # Follow-up: bind at TLS-wrap time, or tune the cap.
+        # `socket.connect` is patched globally, so every non-TLS socket in the
+        # process leaves an entry here too — a Redis client, a Postgres pool, a
+        # health check. Nothing pops those (only an emitted span does), so they
+        # used to sit in a FIFO-capped table until they pushed a LIVE TLS entry
+        # out of it and that connection reported `connect_timing_unavailable`
+        # for a measurement wardex had taken correctly.
+        #
+        # The close hook is the answer the cap was standing in for: a slot is
+        # bound to its socket at `connect` and again at TLS-wrap time (the sync
+        # handshake, where the SSLSocket that will ASK for the measurement first
+        # exists — the plain socket the connect was measured on has already been
+        # detached by then and is not the object anyone closes), and released
+        # when that socket closes. The cap stays as the backstop.
         self._patch(socket.socket, "connect", self._mk_connect)
         self._patch(ssl.SSLSocket, "do_handshake", self._mk_sync_handshake)
         for cls in _CONNECT_TARGETS:
             self._patch(cls, "create_connection", self._mk_create_connection)
         self._patch(ssl.SSLContext, "wrap_bio", self._mk_wrap_bio)
         self._patch(ssl.SSLObject, "do_handshake", self._mk_async_handshake)
+        # Taken LAST, immediately before the flag that authorizes the release.
+        # `uninstall()` is gated on `_installed`, so a reference acquired ahead
+        # of a patch that then raised would be a refcount this probe can never
+        # give back — wardex's wrapper left on `socket.close` for the life of
+        # the process, silently, after `wardex.close()`.
+        install_shared_close_hook()
         self._installed = True
 
     def uninstall(self) -> None:
         if not self._installed:
             return
         self._patches.restore_all()
+        uninstall_shared_close_hook()
         self._installed = False
 
     def _patch(self, cls: type, attr: str, make_wrapper: Any) -> None:
@@ -142,7 +174,9 @@ class ConnTimingProbe:
             finally:
                 try:
                     ms = (time.perf_counter() - t0) * 1000.0
-                    store.set_connect(this.fileno(), ms)
+                    fileno = this.fileno()
+                    store.set_connect(fileno, ms)
+                    _release_at_close(store, this, fileno)
                 except Exception:
                     pass
 
@@ -158,7 +192,12 @@ class ConnTimingProbe:
             finally:
                 try:
                     ms = (time.perf_counter() - t0) * 1000.0
-                    store.set_handshake(this.fileno(), ms)
+                    fileno = this.fileno()
+                    store.set_handshake(fileno, ms)
+                    # The connect was measured on the plain socket, which
+                    # `wrap_socket` has already detached; THIS object is the one
+                    # the host will close, so the slot is bound to it as well.
+                    _release_at_close(store, this, fileno)
                 except Exception:
                     pass
 
@@ -225,6 +264,23 @@ class ConnTimingProbe:
                         pass
 
         return wrapper
+
+
+def _release_at_close(store: ConnTimingStore, obj: Any, fileno: int) -> None:
+    """Give this connection's slot back when its socket is closed.
+
+    `on_finalize=False`, and this is the reason that flag exists. The key is a
+    FILE DESCRIPTOR, which the kernel reissues the instant it is released — and
+    a finalizer runs AFTER the object's deallocator has already closed the fd,
+    so a hook that popped by fileno from there could be racing another thread's
+    `connect()` and would delete that connection's measurement instead of its
+    own. An explicit `close()` has no such window: the hook runs before the real
+    close, while the fd is still this socket's.
+
+    A slot nobody releases is not lost data, only a slot; the FIFO cap still
+    collects it eventually.
+    """
+    on_close(obj, partial(store.discard, fileno), on_finalize=False)
 
 
 # --- Module singleton: shared by the SSL and plaintext seams without double-patching

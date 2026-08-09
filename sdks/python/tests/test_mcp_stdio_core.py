@@ -105,3 +105,80 @@ def test_proc_state_constructor_default_uses_core_limits():
     st = _ProcState()
     st.feed_request(b"x" * 200)
     assert st.disabled_reason() is None
+
+
+def test_should_detach_after_non_jsonrpc_bytes_on_the_response_side():
+    """The asymmetry the trigger used to have.
+
+    A subprocess that writes little to stdin and streams a lot back — a
+    compiler, a log follower, a media encoder — counted zero bytes towards the
+    sniff budget, so it never detached and paid the tee for its whole life.
+    """
+    st = _ProcState()
+    st.feed_response(b"x" * (st.SNIFF_LIMIT + 1) + b"\n")  # not JSON-RPC, exceeds the limit
+    assert st.should_detach() is True
+
+
+def test_the_two_directions_share_one_sniff_budget():
+    """Neither side alone passes the budget; together they do. A per-direction
+    budget would let a subprocess split its output across both and stay
+    attached forever."""
+    st = _ProcState()
+    half = b"x" * (st.SNIFF_LIMIT // 2 + 1)
+    st.feed_request(half)
+    assert st.should_detach() is False
+    st.feed_response(half)
+    assert st.should_detach() is True
+
+
+def test_a_jsonrpc_stream_never_detaches_however_much_it_streams():
+    """The trigger must stay keyed on "nothing was ever parsed": a real MCP
+    server that streams megabytes of tool output is exactly what this seam is
+    for."""
+    st = _ProcState()
+    st.feed_request(b'{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{}}\n')
+    st.feed_response(b"x" * (st.SNIFF_LIMIT + 1))
+    assert st.should_detach() is False
+
+
+def test_a_stream_visible_only_on_stdout_never_detaches():
+    """Symmetric budget, symmetric evidence — and only one of the two was.
+
+    `should_detach` spends a budget both directions fill, so `_msgs == 0` has to
+    mean "nothing was parsed in EITHER direction". It did not: only
+    `feed_request` counted, so a subprocess whose JSON-RPC wardex can observe
+    only on stdout detached permanently at the sniff limit while the seam was
+    parsing valid messages the whole time. That shape is reachable — a host that
+    writes stdin through `StreamWriter.writelines` never reaches the raw-asyncio
+    seam's `write` tee, and a notification-only producer never sends a request
+    at all.
+    """
+    st = _ProcState()
+    frame = b'{"jsonrpc":"2.0","method":"notifications/progress","params":{}}\n'
+    while st._resp_bytes <= st.SNIFF_LIMIT:
+        st.feed_response(frame)
+
+    assert st._req_bytes == 0, "precondition: this side was never seen"
+    assert st.should_detach() is False
+
+
+def test_a_subprocess_that_only_streams_noise_still_detaches():
+    """The other half of the same claim: counting responses must not make the
+    trigger unreachable for the compiler or log follower it exists for."""
+    st = _ProcState()
+    st.feed_response(b"x" * (st.SNIFF_LIMIT + 1))
+    assert st.should_detach() is True
+
+
+def test_a_dead_server_does_not_strand_its_pending_requests():
+    """An MCP server that dies leaves every in-flight request latched with a
+    response that is never coming — one `Ambient`, and so one SpanContext, per
+    stranded request, held by a correlation table nobody will read again."""
+    st = _ProcState()
+    st.feed_request(b'{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{}}\n')
+    st.feed_request(b'{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{}}\n')
+    assert len(st._latch) == 2
+
+    assert st.on_stream_end() == 2
+    assert st._latch == {}
+    assert st.on_stream_end() == 0  # idempotent: EOF can be observed more than once
