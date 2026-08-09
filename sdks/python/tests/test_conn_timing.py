@@ -3,6 +3,7 @@ from pathlib import Path
 
 import httpx
 
+from wardex_sdk.assembly import PatchSet
 from wardex_sdk.interceptors._conn_timing import ConnTimingProbe, ConnTimingStore
 
 
@@ -55,9 +56,21 @@ def test_probe_install_uninstall_restores_originals():
 def test_probe_sync_records_connect_and_handshake(tls_server):
     store = ConnTimingStore()
     probe = ConnTimingProbe(store)
+    # Captured BEFORE anything is installed, so the assertion at the bottom
+    # compares against the interpreter's own method rather than against
+    # whatever this test left behind.
+    pristine_hs = ssl.SSLSocket.do_handshake
     probe.install()
     captured = {}
     pair = None
+    # The spy goes on through a PatchSet of its own, layered over the probe's
+    # patch. A raw `ssl.SSLSocket.do_handshake = spy` here is not a shortcut,
+    # it is a leak for the whole pytest process: `PatchSet` restores an
+    # attribute only while it still holds the exact wrapper that set installed,
+    # so `probe.uninstall()` correctly declines to clobber the spy (it counts
+    # the supersession and leaves the other "library" alone) and every later
+    # test in the session then runs its TLS handshakes through this closure.
+    spy_patches = PatchSet("tests.conn_timing.spy")
     try:
         # intercept the fileno at do_handshake time to verify the measured value
 
@@ -70,8 +83,7 @@ def test_probe_sync_records_connect_and_handshake(tls_server):
                 pass
             return real_hs(self, *a, **k)
 
-        # layer a spy on top of what the probe already patched, to observe only the fileno
-        ssl.SSLSocket.do_handshake = spy
+        spy_patches.patch(ssl.SSLSocket, "do_handshake", spy)
         # Read while the connection is still OPEN. Closing it releases the slot
         # now (interceptors/_close_hook.py), which is the whole point of the
         # close hook: the store holds live connections, not dead ones. The
@@ -83,12 +95,25 @@ def test_probe_sync_records_connect_and_handshake(tls_server):
             assert fn is not None
             pair = store.pop(fn)
     finally:
+        # Innermost first, which across two sets is this order and not the other:
+        # restoring the probe while the spy is still on top is exactly the
+        # supersession that stranded the spy.
+        spy_patches.restore_all()
         probe.uninstall()
 
     assert pair is not None
     connect_ms, handshake_ms = pair
     assert connect_ms >= 0.0
     assert handshake_ms > 0.0  # TLS handshake takes a measurable amount of time
+
+    # The regression guard, and it is two assertions because either one alone
+    # can be satisfied by the bug. `superseded` says the spy came off cleanly
+    # rather than being left in place; the identity check says the class is back
+    # to what the interpreter shipped rather than to some other wrapper.
+    assert spy_patches.superseded == 0, "the spy was patched over and stayed installed"
+    assert ssl.SSLSocket.do_handshake is pristine_hs, (
+        "this test leaked a patch on ssl.SSLSocket into the rest of the session"
+    )
 
 
 def test_store_discard_releases_a_slot_nobody_will_consume():
