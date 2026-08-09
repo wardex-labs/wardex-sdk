@@ -437,12 +437,28 @@ class Client:
         self._dropped = 0
         self._lost = 0
         self._closed = False
-        # Deliberately NOT reentrant, and safe only because nothing that can
-        # re-enter this thread reaches close(): the signal handler calls
-        # flush(), and a seam's weakref finalizer reaches capture_span (see
-        # _buffer_lock). Either one landing between the three statements this
-        # guards would self-deadlock permanently on re-entry. Anything that
-        # routes close() onto either path must make this an RLock first.
+        # The SDK's one non-reentrant lock, and the only one -- a source scan in
+        # `test_finalizer_reentrancy` enumerates plain `Lock()` sites and fails
+        # on any second one, so this exception cannot be quietly copied.
+        #
+        # It stays a plain Lock because reentrancy would not FIX the hazard
+        # here, only trade it. What this guards is a check-and-set: a frame that
+        # reads `_closed` False and then sets it True is claiming the right to
+        # run steps 2-4 below, which are outside the lock. An RLock would let a
+        # re-entering frame walk into the two-statement window between the read
+        # and the store, make the same claim, and run a whole nested teardown
+        # while the outer one is still going -- a double stop/drain/close
+        # instead of a hang. The repair, if this ever becomes reachable, is to
+        # make the claim itself one-shot, not to swap the lock type.
+        #
+        # And it is not reachable today, by both of the re-entry routes this SDK
+        # has. The signal handler calls `flush()` and `close_units_all()`, never
+        # `close()`. A seam's weakref finalizer reaches `capture_span` (see
+        # `_buffer_lock`), and a finalizer lands only at an ALLOCATION -- while
+        # the window above is an attribute read and an attribute store on an
+        # existing object, which allocate nothing. Anything that routes `close()`
+        # onto either path has to restructure this, and the scan is what makes
+        # sure the next plain Lock gets the same argument written down.
         self._close_lock = threading.Lock()
         limits = config.limits.resolved()
         self._max_buffer_spans = limits["max_buffer_spans"]
