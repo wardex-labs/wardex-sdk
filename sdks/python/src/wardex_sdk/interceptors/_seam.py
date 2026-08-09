@@ -406,7 +406,16 @@ class ByteSeamInterceptor(InterceptorInterface):
                 # agent work" and drops every request inside a run wardex broke
                 # at the top of — the one case where the absent parent is
                 # wardex's own doing rather than evidence about the traffic.
-                degraded=in_degraded_run(),
+                #
+                # An evicted h2 latch entry is the same fact arriving from the
+                # other direction: a parent WAS ambient when the request went
+                # out — the tracker latched it — and wardex discarded the record
+                # to stay inside its own bound. Leaving it out would make the
+                # marker `resolve_observed` attaches unreachable under the
+                # default mode: the gate would drop the span before anything
+                # could say why its parent is missing, which is the silent
+                # failure the bound was capped to avoid.
+                degraded=in_degraded_run() or getattr(txn, "parent_evicted", False),
                 # "the local span this was latched off had ALREADY closed".
                 # Read off the TRANSACTION, not off the carrier: the tracker
                 # asked at request time on the task that issued the bytes, and
@@ -592,7 +601,17 @@ class ByteSeamInterceptor(InterceptorInterface):
         if not self._should_capture(st, txn, sem):
             return None
 
-        p = resolve_observed(_latched(txn), parent_closed=txn.parent_closed)
+        # `parent_evicted` is read off the transaction for the same reason
+        # `parent_closed` is: the tracker knows, on the request side, whether a
+        # parent was latched for this stream and thrown away again by its own
+        # bound, and nothing on the response side can reconstruct that. The WS
+        # branch below does not pass it — a session's parent is inherited from
+        # the upgrade transaction and no cap sits between the two.
+        p = resolve_observed(
+            _latched(txn),
+            parent_closed=txn.parent_closed,
+            parent_evicted=txn.parent_evicted,
+        )
         url = f"{self._url_scheme(False)}://{url_host}:{st.server_port}{txn.path}"
         transfer = max(0.0, (txn.end_ns - txn.start_ns) / 1e6 - txn.ttfb_ms)
 

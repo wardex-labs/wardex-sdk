@@ -96,6 +96,13 @@ class _Txn:
     #: the response arrives, and re-asking on the response side would orphan it.
     #: See `assembly._units.parent_is_closed_unit`.
     parent_closed: bool = False
+    #: Was the latched parent DISCARDED by the tracker's own bound before this
+    #: transaction arrived to claim it? Only `_Http2Tracker` can answer yes.
+    #: Distinct from `parent is None`, which is the ordinary "nothing was
+    #: ambient" and an honest trace root; this one says a parent was latched and
+    #: wardex threw it away, which is a defect the span has to carry rather than
+    #: a fact about the traffic. See `assembly._parentage.resolve_observed`.
+    parent_evicted: bool = False
     truncated: bool = False
     # Capture-limitation markers the protocol parser attached to this
     # transaction, merged into the span's CaptureIntegrity.limitations by the
@@ -279,16 +286,50 @@ class _Http2Tracker:
         # There is no per-stream close signal to act on — the parser reports
         # transactions, not stream lifecycles.
         #
-        # So there are TWO bounds, because one of them cannot be reached
+        # So there are TWO bounds, because the first one is not reachable
         # everywhere. `on_connection_close` is the honest one and empties this
         # table outright — but it is driven by the close hook, and the async TLS
         # seam's carrier is an `ssl.SSLObject`: no `close()` to patch, and
         # pinned by asyncio's `SSLProtocol` for the life of a pooled connection,
         # so it is neither closed nor collected. That is exactly the h2
-        # keep-alive to a model provider this leak was found on. The FIFO cap
-        # below is what holds on that path.
+        # keep-alive to a model provider this leak was found on.
+        #
+        # The close hook now reaches that carrier too, through the protocol's
+        # `connection_lost` — but only where asyncio's own TLS implementation is
+        # the one running (not uvloop's) and only when the pool actually drops
+        # the connection, which for a keep-alive to a model provider may be
+        # never. A cap that needs no signal at all is what makes the bound
+        # unconditional, and that is the FIFO cap below.
         self._latch: dict[int, tuple[SpanContext | None, bool, int]] = {}
         self._latch_cap = _max_streams(limits)
+        #: The highest stream id the cap has evicted, and the whole memory of
+        #: eviction this tracker keeps. One integer rather than a set of dropped
+        #: ids, because a set is the same unbounded table again under a
+        #: different name — and it is exact for the policy above: entries are
+        #: inserted in increasing id order and dropped lowest-first, so the ids
+        #: evicted are precisely the ones latched at or below this mark.
+        #:
+        #: What it buys is in `_mk`. An evicted entry that no transaction ever
+        #: claims cost nothing and is worth saying nothing about; one that a
+        #: LATE response then claims would otherwise ship as a clean trace root
+        #: at confidence 1.0, which is a span asserting the host issued this
+        #: request outside any agent work when wardex simply lost the parent.
+        #:
+        #: Reset by `on_connection_close` along with the latch itself: stream
+        #: ids restart at 1 on a new connection, so a mark carried across one
+        #: would name a different set of streams than the ones it was taken on.
+        self._latch_evicted_below = 0
+        #: The LOWEST stream id this tracker ever latched, and the floor that
+        #: keeps the mark above from over-claiming. Capture can attach
+        #: mid-connection: a response for a stream opened before the seam was
+        #: watching has no latch entry either, and its id is strictly below
+        #: anything this tracker put in the table. Without the floor such a
+        #: stream reads as evicted once the cap has run — a span blaming wardex
+        #: for a parent wardex was never in a position to hold, and, since
+        #: `parent_evicted` also opens the AGENT-mode gate, a span whose bodies
+        #: ship under a mode that had filtered it out. Zero means "nothing
+        #: latched yet", which fails the test for every real stream id.
+        self._latch_first = 0
 
     def on_request_bytes(self, data: bytes) -> list[_Txn]:
         opened, txns = self._conn.feed(True, data)
@@ -299,12 +340,16 @@ class _Http2Tracker:
         parent_closed = parent_is_closed_unit(parent) if opened else False
         for sid in opened:
             self._latch[sid] = (parent, parent_closed, now)
+        if opened and self._latch_first == 0:
+            self._latch_first = min(opened)
         # Drop-oldest, which for h2 is drop-lowest-stream-id: ids only ever
         # increase, so the entry evicted is the one likeliest to be stranded
         # already. Losing it costs that stream its parentage, never a span —
-        # `_mk` falls back to (None, False, now).
+        # `_mk` falls back to (None, False, now) and says so on the span.
         while len(self._latch) > self._latch_cap:
-            self._latch.pop(next(iter(self._latch)))
+            evicted = next(iter(self._latch))
+            self._latch.pop(evicted)
+            self._latch_evicted_below = max(self._latch_evicted_below, evicted)
         # Always call _mk to pop the _latch entry (prevents leaks); status==0
         # (degenerate transaction) is excluded from the result
         out: list[_Txn] = []
@@ -340,13 +385,62 @@ class _Http2Tracker:
         No transactions come back. A stream that never produced a response
         produced no status either, and the seam has nothing to say about it that
         would not be invented.
+
+        The eviction bookkeeping goes with the entries, and it has to: h2 stream
+        ids restart at 1 on the next connection, so a mark or a floor taken on
+        the last one names a different set of streams here. No caller reuses a
+        tracker across a close today — every `_retire` in `_seam.py` discards
+        the `_ConnectionState` and the tracker inside it — but nothing declares
+        that, and the cost of a stale mark is every unlatched stream on the new
+        connection reporting a parent wardex never lost.
         """
         self._latch.clear()
+        self._latch_evicted_below = 0
+        self._latch_first = 0
         return []
 
     def _mk(self, t: Any) -> _Txn:
         now = time.time_ns()
-        parent, parent_closed, start = self._latch.pop(t.stream_id, (None, False, now))
+        entry = self._latch.pop(t.stream_id, None)
+        if entry is None:
+            parent, parent_closed, start = None, False, now
+            # The DECISION the cap owes the span. An absent latch entry has two
+            # causes that look identical here and mean opposite things: nothing
+            # was ambient when the request went out (an honest trace root, and
+            # under `capture_mode=AGENT` the gate has usually dropped it long
+            # before this line), or a parent WAS latched and the cap discarded
+            # it. Shipping the second as the first is the one degradation a
+            # consumer cannot detect downstream — same edge, same confidence,
+            # no marker — so the bound reports itself, exactly as the unit
+            # registry's does when it closes a root at `max_units`.
+            #
+            # A separate `Limitation` member was the alternative and is refused:
+            # the vocabulary is closed on the wire, and what a user would read
+            # off a new one — "wardex dropped what belongs on this span" —
+            # `PARENT_UNRESOLVED` plus `INSTRUMENTATION_DEGRADED` already say,
+            # from the site that owns the edge. `resolve_observed` attaches
+            # them; this only reports the fact.
+            #
+            # It reports the EVICTION and not "a parent was lost", because the
+            # two are not separable from here: what the entry held went with it.
+            # That is also why the claim is never an over-reach on a stream that
+            # had no parent to lose — every entry carries the REQUEST START
+            # INSTANT as well, so `start` below is a fabrication on this path
+            # regardless, the span's duration is near-zero and its start is the
+            # response instant. Something that belongs on this span is missing
+            # in every case, which is the whole content of the marker; a second
+            # marker for the clock half would split one fact across two words.
+            #
+            # Bounded at BOTH ends, and the floor is not decoration: the mark
+            # alone would also claim a stream opened before capture attached,
+            # whose id is below everything this tracker latched. That claim is
+            # not merely imprecise — `parent_evicted` feeds the capture gate as
+            # well as the marker, so a false one exports request and response
+            # bodies under a mode that had filtered the span out.
+            parent_evicted = self._latch_first <= t.stream_id <= self._latch_evicted_below
+        else:
+            parent, parent_closed, start = entry
+            parent_evicted = False
         return _Txn(
             method=t.method or "?",
             path=t.path or "/",
@@ -355,6 +449,7 @@ class _Http2Tracker:
             response_body=t.response_body,
             parent=parent,
             parent_closed=parent_closed,
+            parent_evicted=parent_evicted,
             start_ns=start,
             end_ns=now,
             ttfb_ms=0.0,  # per-h2-stream first-byte not tracked (limitation)

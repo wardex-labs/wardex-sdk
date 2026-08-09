@@ -302,6 +302,152 @@ def test_detach_is_not_a_close():
 
 
 # --------------------------------------------------------------------------
+# the third patch: the pooled ssl.SSLObject, which is closed by nobody
+# --------------------------------------------------------------------------
+
+
+def test_the_asyncio_tls_protocol_still_has_the_shape_the_probe_reads():
+    """The canary for a patch on somebody else's private class.
+
+    Two names have to hold for the pooled-`SSLObject` path to work at all, and
+    both are asyncio internals: the protocol class, and the attribute on it that
+    holds the `ssl.SSLObject`. `install()` asks for each with `getattr` and
+    degrades silently — which is right for users and wrong for maintainers, so
+    this is where a renamed internal turns red, rather than in a memory profile
+    six months later.
+    """
+    from asyncio import sslproto
+
+    assert hasattr(sslproto, "SSLProtocol")
+    assert hasattr(sslproto.SSLProtocol, "connection_lost")
+    # One of the two spellings `_sslobj_of` reads must be assigned by the
+    # constructor: `_sslobj` since the 3.11 rewrite, `_sslpipe` before it. Read
+    # off `__init__`'s names and nothing else — `SSLProtocol` declares no
+    # `__slots__` of its own on any supported version, so a `getattr` for one
+    # resolves through the MRO to the empty tuple `asyncio.protocols` carries
+    # and would contribute a term that can never fail.
+    fields = set(sslproto.SSLProtocol.__init__.__code__.co_names)
+    assert {"_sslobj", "_sslpipe"} & fields, (
+        "asyncio.sslproto no longer names the SSLObject where the close probe "
+        "looks for it: a pooled async TLS connection is now retired by the GC "
+        "finalizer only — find the new spelling and teach `_sslobj_of` about it"
+    )
+    # The 3.10 branch reads THROUGH the pipe, so the attribute on the pipe is
+    # the second half of that spelling and needs its own canary: renaming it
+    # leaves the assertion above green while the hook degrades to the finalizer,
+    # which is the silent failure this test exists to prevent.
+    pipe = getattr(sslproto, "_SSLPipe", None)
+    if pipe is not None:
+        assert hasattr(pipe, "ssl_object"), (
+            "asyncio.sslproto._SSLPipe no longer exposes `ssl_object`: the "
+            "pre-3.11 branch of `_sslobj_of` now always returns None"
+        )
+
+
+def test_installing_and_uninstalling_leaves_the_asyncio_protocol_untouched():
+    from asyncio import sslproto
+
+    # Stated, because without it a refcount leaked by an earlier test in the
+    # session makes `install()` a no-op and the first assertion below fails
+    # pointing at asyncio — naming a renamed internal for what is actually
+    # somebody else's `init()` without a `close()`.
+    assert _close_hook._refcount == 0, "the shared close hook was left installed by an earlier test"
+    orig = sslproto.SSLProtocol.connection_lost
+    install_shared_close_hook()
+    try:
+        assert sslproto.SSLProtocol.connection_lost is not orig
+    finally:
+        uninstall_shared_close_hook()
+    assert sslproto.SSLProtocol.connection_lost is orig
+
+
+def test_a_protocol_that_refuses_the_private_read_still_reaches_asyncios_own_handler():
+    """The failure mode worth guarding is a HANG, not a traceback.
+
+    `_sslobj_of` reads two private attributes off a class third parties
+    subclass, and it runs BEFORE the original. An exception escaping it would
+    stop asyncio ever scheduling the app protocol's `connection_lost`, so the
+    host's `wait_closed()` waits on a future nothing will complete — the process
+    stops instead of erroring. Here the read raises something `getattr`'s
+    default does not absorb, and the original still runs.
+    """
+    ran = []
+
+    class Hostile:
+        """An `SSLProtocol` subclass's worst case, without asyncio's own state:
+        `_sslobj` shadowed by a property that raises something `getattr`'s
+        default does not absorb."""
+
+        @property
+        def _sslobj(self):  # noqa: ANN202
+            raise RuntimeError("this protocol does not answer that")
+
+    probe = _close_hook.CloseProbe(CloseRegistry())
+    wrapped = probe._mk_connection_lost(lambda this, exc: ran.append(exc))
+
+    assert wrapped(Hostile(), None) is None
+    assert ran == [None], "asyncio's own connection_lost never ran: the host would hang here"
+    assert counters.get("interceptors.close_hook.connection_lost") == 1, (
+        "the refused read was not counted, so either it did not raise or it escaped the guard"
+    )
+
+
+def test_a_pooled_ssl_object_is_retired_when_its_transport_ends(tls_server):
+    """The leak the close hook could not close, closed.
+
+    An `ssl.SSLObject` on the async TLS path has no `close()` to patch, and
+    asyncio's `SSLProtocol` pins it for the transport's whole life — so for a
+    connection a pool holds, neither half of this module ever ran and the seam's
+    per-connection state stayed resident. `connection_lost` is the moment that
+    was missing.
+
+    `on_finalize=False` is what makes this a test of that patch and not of the
+    GC: the hook is barred from the finalizer, the object is kept alive across
+    the assertion, and the only thing left that can have fired it is the
+    protocol being told its transport ended.
+    """
+    import asyncio
+    import ssl as _ssl
+    from urllib.parse import urlsplit
+
+    from conftest import CERT
+
+    parts = urlsplit(tls_server)
+    ctx = _ssl.create_default_context(cafile=str(CERT))
+    fired = []
+
+    async def drive():
+        reader, writer = await asyncio.open_connection(parts.hostname, parts.port, ssl=ctx)
+        sslobj = writer.get_extra_info("ssl_object")
+        assert isinstance(sslobj, _ssl.SSLObject), "asyncio no longer exposes the SSLObject"
+        close_registry().on_close(sslobj, lambda: fired.append("retired"), on_finalize=False)
+
+        writer.write(
+            b"POST /v1/ping HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        )
+        await writer.drain()
+        # Drained to EOF, not to the first chunk: leaving application data in
+        # the incoming BIO makes the TLS shutdown below raise inside asyncio,
+        # which would fail this test for a reason that has nothing to do with
+        # what it is testing.
+        assert b"200" in await reader.read()
+        assert fired == [], "the connection is still open and still pooled"
+
+        writer.close()
+        await writer.wait_closed()
+        return sslobj
+
+    install_shared_close_hook()
+    try:
+        held = asyncio.run(drive())
+    finally:
+        uninstall_shared_close_hook()
+
+    assert fired == ["retired"]
+    assert held is not None  # still referenced here, so the finalizer cannot be what ran
+
+
+# --------------------------------------------------------------------------
 # what the hook retires: the seam's per-connection state
 # --------------------------------------------------------------------------
 
@@ -319,6 +465,21 @@ def _h2_request(stream_id: int) -> bytes:
     """One HEADERS frame that opens `stream_id` and ends it — no response follows."""
     block = Encoder().encode([(b":method", b"POST"), (b":path", b"/v1/messages")])
     return _frame(0x1, 0x4 | 0x1, stream_id, block)  # END_HEADERS | END_STREAM
+
+
+def _h2_open(enc: Encoder, stream_id: int) -> bytes:
+    """`_h2_request` off a caller-held encoder, for the tests that answer it later.
+
+    The flags are the same and have to be: the parser reports a stream as opened
+    when its REQUEST half ends, so a HEADERS frame without END_STREAM latches
+    nothing and there would be no entry for the cap to evict.
+    """
+    block = enc.encode([(b":method", b"POST"), (b":path", b"/v1/messages")])
+    return _frame(0x1, 0x4 | 0x1, stream_id, block)  # END_HEADERS | END_STREAM
+
+
+def _h2_answer(enc: Encoder, stream_id: int) -> bytes:
+    return _frame(0x1, 0x4 | 0x1, stream_id, enc.encode([(b":status", b"200")]))
 
 
 def test_an_h2_stream_that_never_answers_loses_its_latch_entry_at_close(
@@ -343,15 +504,16 @@ def test_an_h2_stream_that_never_answers_loses_its_latch_entry_at_close(
 
 
 def test_the_h2_latch_is_capped_for_a_connection_that_never_closes():
-    """The path the close hook cannot reach, and the bound that covers it.
+    """The bound that needs no end-of-connection signal at all.
 
     On the async TLS seam the carrier is an `ssl.SSLObject`: no `close()` to
     patch, and asyncio's `SSLProtocol` pins it for the life of the transport, so
-    it is neither closed nor collected. A pooled h2 keep-alive to a model
-    provider is exactly that shape — and every stream it resets strands a latch
-    entry that `on_connection_close` will never be called to release. So the
-    latch carries its own cap, sourced from the same `max_streams` the Rust
-    parser bounds its own stream table with.
+    it is neither closed nor collected. The `connection_lost` patch above
+    reaches that carrier where asyncio's own TLS implementation is in play — but
+    a keep-alive h2 connection to a model provider may simply never end, and
+    every stream it resets strands a latch entry in the meantime. So the latch
+    carries its own cap, sourced from the same `max_streams` the Rust parser
+    bounds its own stream table with.
     """
     tracker = _Http2Tracker(CaptureLimits(max_streams=8).to_native())
     for sid in range(1, 2 * 200, 2):
@@ -359,6 +521,139 @@ def test_the_h2_latch_is_capped_for_a_connection_that_never_closes():
 
     assert len(tracker._latch) == 8
     assert max(tracker._latch) == 399, "the cap evicted the newest instead of the oldest"
+
+
+def test_a_stream_answered_after_its_latch_entry_was_dropped_says_so():
+    """The cap's decision, and what the span has to admit because of it.
+
+    An absent latch entry has two causes that are identical at the pop and mean
+    opposite things: nothing was ambient when the request went out (an honest
+    trace root), or the cap discarded what was. Only the tracker can tell them
+    apart, and only while it still remembers how far the eviction reached.
+    """
+    tracker = _Http2Tracker(CaptureLimits(max_streams=2).to_native())
+    client_enc, server_enc = Encoder(), Encoder()
+    for sid in (1, 3, 5):
+        tracker.on_request_bytes(_h2_open(client_enc, sid))
+    assert set(tracker._latch) == {3, 5}, "precondition: the cap dropped stream 1"
+
+    (kept,) = tracker.on_response_bytes(_h2_answer(server_enc, 5))
+    assert kept.parent_evicted is False, "a stream that kept its entry is not degraded"
+
+    (late,) = tracker.on_response_bytes(_h2_answer(server_enc, 1))
+    assert late.parent_evicted is True
+
+
+def test_an_unlatched_stream_above_the_eviction_mark_is_not_blamed_on_the_cap():
+    """The other half of the same decision, and the one that keeps the marker
+    worth reading: a stream whose entry the cap never touched must not be
+    reported as degraded just because it has no entry. Here nothing has been
+    evicted at all, so an answer for a stream this tracker never saw opened —
+    capture that began mid-connection — is an ordinary unparented transaction.
+    """
+    tracker = _Http2Tracker(CaptureLimits(max_streams=8).to_native())
+    (txn,) = tracker.on_response_bytes(_h2_answer(Encoder(), 7))
+    assert txn.parent_evicted is False
+
+
+def test_a_stream_opened_before_capture_attached_is_not_blamed_on_the_cap():
+    """The floor, and why the mark alone is not enough.
+
+    Capture can attach part way through a live h2 connection: the streams the
+    host opened before the seam was watching were never latched, so their ids
+    sit BELOW everything this tracker put in the table, and once the cap has run
+    the eviction mark reaches right over them. Blaming the cap there is not a
+    harmless over-label — `parent_evicted` also opens the AGENT-mode gate, so it
+    exports the request and response bodies of traffic the configured mode had
+    filtered out.
+    """
+    tracker = _Http2Tracker(CaptureLimits(max_streams=2).to_native())
+    client_enc, server_enc = Encoder(), Encoder()
+    # This tracker's first sight of the connection is stream 101; 1 through 99
+    # happened before it existed.
+    for sid in (101, 103, 105):
+        tracker.on_request_bytes(_h2_open(client_enc, sid))
+    assert tracker._latch_evicted_below == 101, "precondition: the cap dropped stream 101"
+
+    (before,) = tracker.on_response_bytes(_h2_answer(server_enc, 7))
+    assert before.parent_evicted is False, "a stream this tracker never latched is not its loss"
+
+    (evicted,) = tracker.on_response_bytes(_h2_answer(server_enc, 101))
+    assert evicted.parent_evicted is True
+
+
+def test_closing_the_connection_forgets_the_eviction_mark_too():
+    """`on_connection_close` says nothing survives it, and nothing may.
+
+    No caller reuses a tracker across a close today — the seam discards the
+    connection state and the tracker inside it — but h2 stream ids restart at 1
+    on the next connection, so a mark or a floor carried over would name a
+    different set of streams and report every unlatched one on the new
+    connection as a parent wardex lost.
+    """
+    tracker = _Http2Tracker(CaptureLimits(max_streams=2).to_native())
+    enc = Encoder()
+    for sid in (1, 3, 5):
+        tracker.on_request_bytes(_h2_open(enc, sid))
+    assert tracker._latch_evicted_below and tracker._latch_first
+
+    assert tracker.on_connection_close(Limitation.CONNECTION_EVICTED) == []
+    assert tracker._latch == {}
+    assert tracker._latch_evicted_below == 0
+    assert tracker._latch_first == 0
+
+    (fresh,) = tracker.on_response_bytes(_h2_answer(Encoder(), 1))
+    assert fresh.parent_evicted is False
+
+
+def test_a_dropped_latch_entry_reaches_the_span_as_wardexs_own_fault():
+    """End to end, because the decision is only worth making if it ships.
+
+    Two things had to happen for it to. The edge is `UNRESOLVED` rather than a
+    trace root, so a consumer cannot mistake the span for one the host issued
+    outside any agent work — and it carries `INSTRUMENTATION_DEGRADED`, which is
+    what says the missing parent is wardex's doing rather than the traffic's.
+    The AGENT-mode gate had to let it through as well: it reads an absent parent
+    as "not agent work", so without the same signal the span would be dropped
+    before anything could explain itself, which is the silent failure the cap
+    would otherwise have introduced.
+    """
+    from conftest import _FakeSSLSocket
+    from wardex_sdk.assembly import ParentSource
+    from wardex_sdk.interceptors._ssl import SSLInterceptor
+
+    class _Client:
+        class _Config:
+            debug = False
+            # No `capture_mode`, so the policy resolves the declared default,
+            # AGENT — the mode this traffic has to survive.
+            limits = CaptureLimits(max_streams=2)
+
+        def __init__(self) -> None:
+            self.config = self._Config()
+            self.spans: list = []
+
+        def capture_span(self, span) -> None:
+            self.spans.append(span)
+
+    client = _Client()
+    itc = SSLInterceptor()
+    itc._client = client
+    itc._load_limits(client)
+
+    sock = _FakeSSLSocket("h2")
+    sock.server_hostname = "api.anthropic.com"
+    client_enc, server_enc = Encoder(), Encoder()
+    for sid in (1, 3, 5):
+        itc._on_request_bytes(sock, _h2_open(client_enc, sid))
+    itc._on_response_bytes(sock, _h2_answer(server_enc, 1))
+
+    assert len(client.spans) == 1, "the gate dropped the span the cap had degraded"
+    integrity = client.spans[0].capture_integrity
+    assert Limitation.PARENT_UNRESOLVED in integrity.limitations
+    assert Limitation.INSTRUMENTATION_DEGRADED in integrity.limitations
+    assert client.spans[0].correlation.strategy is ParentSource.UNRESOLVED
+    assert client.spans[0].parent_span_id is None
 
 
 def test_a_state_rebuilt_on_a_live_socket_does_not_stack_retirement_hooks(

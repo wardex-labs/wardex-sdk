@@ -816,6 +816,57 @@ def test_an_observed_span_under_a_closed_parent_is_unresolved_not_a_child():
     assert Limitation.INSTRUMENTATION_DEGRADED not in refused.limitations
 
 
+def test_an_observed_span_whose_parent_wardex_evicted_says_whose_fault_it_is():
+    """The sibling of the row above, one argument along.
+
+    `parent_evicted` is the byte seam's own bound admitting it dropped a latched
+    parent (`interceptors/_trackers.py`, the h2 stream latch at `max_streams`).
+    Shipped as a trace root that span is indistinguishable from one the host
+    genuinely issued outside any agent work, so it takes `PARENT_UNRESOLVED` for
+    the missing parent and `INSTRUMENTATION_DEGRADED` for whose doing that was —
+    which is what separates it from the `parent_closed` row above.
+
+    The ambient is refused in CODE and not by asking callers nicely: a non-empty
+    one flowing through would take `resolve_parentage`'s join branch and ship a
+    span that both adopts a parent and declares it has none.
+    """
+    from wardex_sdk.assembly import (
+        EMPTY_AMBIENT,
+        Ambient,
+        Limitation,
+        ParentSource,
+        resolve_observed,
+    )
+
+    evicted = resolve_observed(EMPTY_AMBIENT, parent_evicted=True)
+    assert evicted.parent_span_id is None
+    assert evicted.correlation.strategy is ParentSource.UNRESOLVED
+    assert evicted.correlation.confidence == 0.0
+    assert Limitation.PARENT_UNRESOLVED in evicted.limitations
+    assert Limitation.INSTRUMENTATION_DEGRADED in evicted.limitations
+
+    stray = resolve_observed(
+        Ambient(span_context=LOCAL, conversation=None, tracestate=None), parent_evicted=True
+    )
+    assert stray.parent_span_id is None, "an evicted edge must never adopt the ambient beside it"
+    assert stray.correlation.strategy is ParentSource.UNRESOLVED
+
+
+def test_an_evicted_parent_opens_the_agent_gate_the_way_a_degraded_run_does():
+    """Both producers of `degraded` reach the same clause, and they must.
+
+    The gate reads an absent parent as "not agent work". Under the declared
+    default that drops the span before anything can say why the parent is
+    missing — so the marker the row above attaches would be unreachable on
+    exactly the traffic that earned it, and the bound would have introduced a
+    silent drop instead of a labelled one.
+    """
+    assert should_capture(CaptureMode.AGENT, parent=None, agent_semantic=False) is False
+    assert (
+        should_capture(CaptureMode.AGENT, parent=None, agent_semantic=False, degraded=True) is True
+    )
+
+
 def test_the_seam_asks_about_unit_liveness_when_it_latches_not_when_it_emits():
     """The timing is the whole correctness argument, driven through the REAL
     `_Http1Tracker`.

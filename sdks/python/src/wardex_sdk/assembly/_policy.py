@@ -120,11 +120,15 @@ def should_capture(
     therefore a statement a site makes about itself, and it is reviewable
     precisely because it is written at the call.
 
-    `degraded` is `assembly._parentage.in_degraded_run()` — "a span wardex
-    FAILED to open is what should have been ambient here". It is a DECLARED
-    input rather than a `ContextVar` read hidden inside this function, so the
-    policy stays what its docstring says it is: a pure function of its
-    arguments, testable by them, unable to raise on them.
+    `degraded` is "wardex is the reason no parent reached this call". Two
+    producers say it, and they are one fact seen at two moments:
+    `assembly._parentage.in_degraded_run()` — a span wardex FAILED to open is
+    what should have been ambient here — and the byte seam's
+    `_Txn.parent_evicted`, where a parent WAS latched and wardex's own
+    per-connection bound dropped the record before the response claimed it. It
+    is a DECLARED input rather than a `ContextVar` read hidden inside this
+    function, so the policy stays what its docstring says it is: a pure function
+    of its arguments, testable by them, unable to raise on them.
 
     What it buys is the difference between an agent run wardex could not follow
     and one that never happened. The gate's whole premise is that an absent
