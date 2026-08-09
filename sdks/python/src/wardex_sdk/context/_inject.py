@@ -22,6 +22,7 @@ counted (`Limitation.PATCH_SUPERSEDED`).
 from __future__ import annotations
 
 import fnmatch
+import threading
 from collections.abc import Callable
 from typing import Any
 
@@ -39,6 +40,26 @@ Separate from `_patches` because a PatchSet does not (and should not) answer
 "is this attribute already yours"; asking it would make the install path
 depend on the restore bookkeeping. Cleared together with the set, so the two
 can never disagree about what is installed.
+"""
+
+_install_lock = threading.Lock()
+"""Serializes install/uninstall, so the idempotence above is real.
+
+`"httpx" in _installed` and `_installed.add("httpx")` sit either side of three
+attribute swaps, and two threads that arrive between them both read False and
+both patch. The second one captures the FIRST one's wrapper as its `orig_send`
+and the PatchSet records a restore target that is already wardex's own code —
+so the stack is two deep, every outbound request runs the injection twice, and
+`uninstall_propagation()` peels off one layer and leaves the host permanently
+patched by a wardex that believes it has left.
+
+The process-wide `init()` path is serialized a level up by the runtime lock and
+would not reach that on its own. This lock is here because the guarantee
+belongs to the module that owns the state: `install_propagation()` is reachable
+directly, the runtime's lock is not this module's to rely on, and "safe as long
+as the only caller keeps holding a different lock" is not a property anyone can
+see from here. It is a leaf — nothing under it takes another SDK lock — so it
+adds no ordering to reason about.
 """
 
 
@@ -240,10 +261,15 @@ def _install_aiohttp() -> None:
 
 
 def install_propagation() -> None:
-    """Patch every importable client library. Idempotent, per library."""
-    _install_httpx()
-    _install_requests()
-    _install_aiohttp()
+    """Patch every importable client library. Idempotent, per library.
+
+    Idempotent under concurrency too, not just under repetition — see
+    `_install_lock`.
+    """
+    with _install_lock:
+        _install_httpx()
+        _install_requests()
+        _install_aiohttp()
 
 
 def uninstall_propagation() -> None:
@@ -253,9 +279,15 @@ def uninstall_propagation() -> None:
     since, and guards each restore individually — `PatchSet.restore_all()`.
     The set is dropped rather than reused so the next `install_propagation()`
     picks up the current client's `debug` setting.
+
+    Under the same lock as the install, so a `close()` racing an `init()` on
+    another thread cannot restore the attributes between the install's swap and
+    its bookkeeping — which would leave `_installed` claiming a library that is
+    no longer patched, and the next `install_propagation()` skipping it.
     """
     global _patches
-    if _patches is not None:
-        _patches.restore_all()
-        _patches = None
-    _installed.clear()
+    with _install_lock:
+        if _patches is not None:
+            _patches.restore_all()
+            _patches = None
+        _installed.clear()

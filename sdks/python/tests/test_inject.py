@@ -352,6 +352,186 @@ def test_init_without_flag_does_not_patch():
     wardex_sdk.close()
 
 
+def _patched_attributes() -> dict[str, object]:
+    """The four attributes this module patches, as they stand right now."""
+    import aiohttp
+    import requests
+
+    return {
+        "httpx.Client.send": httpx.Client.send,
+        "httpx.AsyncClient.send": httpx.AsyncClient.send,
+        "requests.Session.send": requests.Session.send,
+        "aiohttp.ClientSession._request": aiohttp.ClientSession._request,
+    }
+
+
+def test_install_is_serialized_across_threads(monkeypatch):
+    """The per-library idempotence check is only real under a lock.
+
+    `"httpx" in _installed` and `_installed.add("httpx")` sit either side of
+    three attribute swaps. Two threads that arrive between them both read
+    False and both patch, and the second captures the FIRST one's wrapper as
+    its original — a two-deep stack that one `uninstall_propagation()` cannot
+    unwind, leaving the host patched by a wardex that believes it has left.
+
+    Asserted by holding the install open from inside and watching a second
+    thread block, rather than by racing and hoping: a timing test that passes
+    when the bug is present is not a test.
+    """
+    from wardex_sdk.context import _inject
+
+    _setup(propagation=PropagationPolicy(enabled=True))
+    inside = threading.Event()
+    release = threading.Event()
+    real_install_requests = _inject._install_requests
+
+    def slow_install_requests():
+        # Only the FIRST caller stalls. A stub that stalled every caller would
+        # hold the second thread up by itself and report "serialized" whether
+        # the lock existed or not.
+        if not inside.is_set():
+            inside.set()
+            release.wait(timeout=5)
+        real_install_requests()
+
+    monkeypatch.setattr(_inject, "_install_requests", slow_install_requests)
+    first = threading.Thread(target=install_propagation)
+    second = threading.Thread(target=install_propagation)
+    try:
+        first.start()
+        assert inside.wait(timeout=5)
+        second.start()
+        second.join(timeout=0.5)
+        assert second.is_alive(), "a second install ran while the first held the lock"
+    finally:
+        release.set()
+        first.join(timeout=5)
+        second.join(timeout=5)
+    assert not first.is_alive() and not second.is_alive()
+
+
+def test_concurrent_installs_leave_exactly_one_layer():
+    """Whatever the interleaving, ONE uninstall must put everything back."""
+    _setup(propagation=PropagationPolicy(enabled=True))
+    before = _patched_attributes()
+    barrier = threading.Barrier(8)
+
+    def racer():
+        barrier.wait(timeout=5)
+        install_propagation()
+
+    threads = [threading.Thread(target=racer) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=5)
+    assert all(v is not before[k] for k, v in _patched_attributes().items())
+    uninstall_propagation()
+    assert _patched_attributes() == before
+
+
+def test_concurrent_init_does_not_stack_propagation_patches():
+    """The same guarantee through the public door, where hosts actually race.
+
+    Two frameworks each calling `init()` on their own startup thread is not
+    exotic, and the runtime serializes them — but the property being asserted
+    belongs to the injector, so it is asserted against the injector's
+    attributes rather than against the runtime's lock.
+    """
+    _hub.reset_for_test()
+    before = _patched_attributes()
+    barrier = threading.Barrier(4)
+
+    def racer():
+        barrier.wait(timeout=5)
+        wardex_sdk.init(propagation=PropagationPolicy(enabled=True))
+
+    threads = [threading.Thread(target=racer) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+    assert all(v is not before[k] for k, v in _patched_attributes().items())
+    wardex_sdk.close()
+    assert _patched_attributes() == before
+
+
+def test_a_request_in_flight_while_the_sdk_closes_neither_crashes_nor_leaks():
+    """The drop cell: traffic is live at the instant wardex is torn down.
+
+    `close()` runs from inside the transport, so the patch is removed while a
+    request that already went through it is still on the way out. Two things
+    have to hold: the host's call completes normally, and nothing of wardex is
+    left in the call path afterwards.
+    """
+    _hub.reset_for_test()
+    before = _patched_attributes()
+    wardex_sdk.init(propagation=PropagationPolicy(enabled=True))
+    seen: list[str | None] = []
+
+    def closing_handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.headers.get("traceparent"))
+        wardex_sdk.close()  # the host tears wardex down mid-request
+        return httpx.Response(200)
+
+    with trace("root"):
+        with httpx.Client(transport=httpx.MockTransport(closing_handler)) as c:
+            response = c.get("https://api.mycorp.com/x")
+
+    assert response.status_code == 200
+    assert seen[0] is not None  # injected before the teardown reached it
+    assert _patched_attributes() == before  # and no patch outlived it
+
+    # and the very next request is plain traffic, not a half-removed patch
+    def plain_handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.headers.get("traceparent"))
+        return httpx.Response(200)
+
+    with httpx.Client(transport=httpx.MockTransport(plain_handler)) as c:
+        c.get("https://api.mycorp.com/x")
+    assert seen[1] is None
+
+
+def test_close_under_live_traffic_raises_nothing_into_the_host():
+    """The same cell with real concurrency: four threads issuing while we close.
+
+    Fail-silence is the whole contract of this module — a failed patch or
+    header computation must never break the user's HTTP call — and teardown is
+    where it is hardest to keep, because the client, the config and the patch
+    all disappear underneath a request that is already running.
+    """
+    _hub.reset_for_test()
+    before = _patched_attributes()
+    wardex_sdk.init(propagation=PropagationPolicy(enabled=True))
+    errors: list[BaseException] = []
+    stop = threading.Event()
+    started = threading.Barrier(5)
+
+    def hammer():
+        try:
+            transport = httpx.MockTransport(lambda request: httpx.Response(200))
+            with httpx.Client(transport=transport) as c:
+                started.wait(timeout=5)
+                while not stop.is_set():
+                    with trace("root"):
+                        c.get("https://api.mycorp.com/x")
+        except BaseException as exc:  # noqa: BLE001 — the assertion is "none of these"
+            errors.append(exc)
+
+    threads = [threading.Thread(target=hammer) for _ in range(4)]
+    for t in threads:
+        t.start()
+    try:
+        started.wait(timeout=5)
+        wardex_sdk.close()
+    finally:
+        stop.set()
+        for t in threads:
+            t.join(timeout=10)
+    assert errors == []
+    assert _patched_attributes() == before
+
+
 def test_exporter_post_not_injected():
     """The OTLP exporter's own POST must never carry traceparent (self-exclusion)."""
     from wardex_sdk._suppress import suppress_capture
