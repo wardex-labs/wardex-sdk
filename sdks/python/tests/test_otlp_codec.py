@@ -152,6 +152,7 @@ def test_encode_decode_roundtrip_core_fields():
     assert attrs["network.protocol.name"] == "http"
     assert attrs["http.request.method"] == "POST"
     assert attrs["http.response.status_code"] == 200
+    assert attrs["url.full"] == "https://api.openai.com/v1/chat"
     # Raw I/O leaves as strings, never OTLP bytes_value: backends that
     # re-serialize attributes to JSON (Arize Phoenix) drop the whole span on a
     # bytes attribute — silently, with an HTTP 200.
@@ -233,7 +234,54 @@ def test_gen_ai_flattened_to_attributes():
     assert attrs["gen_ai.usage.output_tokens"] == 5
     assert attrs["gen_ai.request.temperature"] == 0.7
     assert attrs["gen_ai.operation.name"] == "chat"
-    assert attrs["gen_ai.response.finish_reasons"] == "stop"
+    # semconv declares the list-valued keys as arrays; the CSV join this
+    # replaces destroyed element boundaries on any value with a comma.
+    assert attrs["gen_ai.response.finish_reasons"] == ["stop"]
+
+
+def test_cache_and_reasoning_tokens_ship_under_the_semconv_dot_spellings():
+    """The dataclass fields keep their snake_case names; only the wire key
+    moved to semconv's dot spellings (defined since semconv 1.40.0)."""
+    env = Envelope(
+        header=_header(),
+        spans=(
+            _span(
+                gen_ai=GenAIAttributes(
+                    operation=OperationName.CHAT,
+                    cache_read_input_tokens=3,
+                    cache_creation_input_tokens=2,
+                    reasoning_output_tokens=7,
+                ),
+            ),
+        ),
+    )
+    attrs = _first_span(env)["attributes"]
+    assert attrs["gen_ai.usage.cache_read.input_tokens"] == 3
+    assert attrs["gen_ai.usage.cache_creation.input_tokens"] == 2
+    assert attrs["gen_ai.usage.reasoning.output_tokens"] == 7
+    # The old underscore spellings are gone, not doubled.
+    assert "gen_ai.usage.cache_read_input_tokens" not in attrs
+    assert "gen_ai.usage.cache_creation_input_tokens" not in attrs
+    assert "gen_ai.usage.reasoning_output_tokens" not in attrs
+
+
+def test_stop_sequences_and_encoding_formats_are_arrays_on_the_wire():
+    env = Envelope(
+        header=_header(),
+        spans=(
+            _span(
+                gen_ai=GenAIAttributes(
+                    operation=OperationName.EMBEDDINGS,
+                    stop_sequences=("a,b", "c"),
+                    encoding_formats=("float", "base64"),
+                ),
+            ),
+        ),
+    )
+    attrs = _first_span(env)["attributes"]
+    # "a,b" survives as ONE element — the case CSV could not carry.
+    assert attrs["gen_ai.request.stop_sequences"] == ["a,b", "c"]
+    assert attrs["gen_ai.request.encoding_formats"] == ["float", "base64"]
 
 
 def test_an_llm_span_is_named_for_its_operation_and_model():
@@ -327,15 +375,46 @@ def test_a_decorator_named_span_keeps_the_name_the_host_chose():
     assert _first_span(env)["name"] == "search_docs"
 
 
-def test_resource_service_name():
-    env = _envelope_with_span()
+def test_resource_identity_comes_from_the_configured_resource():
+    """`service.name`/`service.version`/`deployment.environment.name` are the
+    APP's, read off `EnvelopeHeader.resource` — never off SdkInfo, which
+    describes the SDK doing the exporting."""
+    from wardex_sdk._types import ResourceInfo
+
+    env = Envelope(
+        header=EnvelopeHeader(
+            event_id="evt-1",
+            api_key="k",
+            sdk=_header().sdk,
+            sent_at_ns=42,
+            resource=ResourceInfo(
+                service_name="checkout-api", release="1.2.3", environment="staging"
+            ),
+        ),
+        spans=(_span(),),
+    )
     d = _wardex_native.codec.decode_otlp_traces(_wardex_native.codec.encode_otlp_traces(env))
     res_attrs = d["resource_spans"][0]["resource"]["attributes"]
-    assert res_attrs["service.name"] == "wardex.python"
-    assert res_attrs["service.version"] == "0.1.0"
-    assert res_attrs["telemetry.sdk.name"] == "wardex.python"
+    assert res_attrs["service.name"] == "checkout-api"
+    assert res_attrs["service.version"] == "1.2.3"
+    assert res_attrs["deployment.environment.name"] == "staging"
+    assert res_attrs["telemetry.sdk.name"] == "wardex"
     assert res_attrs["telemetry.sdk.version"] == "0.1.0"
     assert res_attrs["telemetry.sdk.language"] == "python"
+
+
+def test_an_unnamed_service_is_unknown_service_never_the_sdk_name():
+    """The blocker this slice fixes: every app exported as
+    `service.name = "wardex.python"`, making two services one service in every
+    backend. Unconfigured, the fallback is semconv's own shape, and the
+    unconfigured release/environment emit no key at all."""
+    env = _envelope_with_span()  # header carries no ResourceInfo
+    d = _wardex_native.codec.decode_otlp_traces(_wardex_native.codec.encode_otlp_traces(env))
+    res_attrs = d["resource_spans"][0]["resource"]["attributes"]
+    assert res_attrs["service.name"] == "unknown_service:python"
+    assert res_attrs["telemetry.sdk.name"] == "wardex"
+    assert "service.version" not in res_attrs
+    assert "deployment.environment.name" not in res_attrs
 
 
 def test_instrumentation_scope():
@@ -441,3 +520,129 @@ def test_a_span_with_nothing_to_report_carries_no_uncertainty_attributes():
     assert "wardex.limitations" not in attrs
     assert "wardex.capture.truncated" not in attrs
     assert "wardex.parent_source" not in attrs
+
+
+# ==========================================================================
+# OTel wire alignment — error.type, tool payload keys, SSE, url.full, SpanKind
+# ==========================================================================
+
+
+def test_error_type_is_an_attribute_and_the_status_message_survives():
+    """`error.type` is semconv's home for the exception class; it used to be
+    substituted INTO `Status.message`, destroying the one field a backend
+    renders as "what went wrong" to relabel it with a fact that now travels
+    beside it."""
+    env = Envelope(
+        header=_header(),
+        spans=(_span(status=StatusCode.ERROR, status_message="boom", error_type="TimeoutError"),),
+    )
+    span = _first_span(env)
+    assert span["status"]["message"] == "boom"
+    assert span["attributes"]["error.type"] == "TimeoutError"
+
+
+def test_a_span_without_an_error_type_carries_no_error_type_key():
+    env = Envelope(
+        header=_header(),
+        spans=(_span(status=StatusCode.ERROR, status_message="boom"),),
+    )
+    span = _first_span(env)
+    assert span["status"]["message"] == "boom"
+    assert "error.type" not in span["attributes"]
+
+
+def test_an_execute_tool_payload_ships_under_the_semconv_tool_keys():
+    """Same pipeline, same masking, same caps — only the key differs, and only
+    for `execute_tool`: that operation's payload has a semconv home
+    (`gen_ai.tool.call.arguments`/`result`)."""
+    env = Envelope(
+        header=_header(),
+        spans=(
+            _span(
+                gen_ai=GenAIAttributes(operation=OperationName.EXECUTE_TOOL),
+                tool=ToolAttributes(name="Bash"),
+                input_data=b'{"command":"ls"}',
+                output_data=b"README.md",
+            ),
+        ),
+    )
+    attrs = _first_span(env)["attributes"]
+    assert attrs["gen_ai.tool.call.arguments"] == '{"command":"ls"}'
+    assert attrs["gen_ai.tool.call.result"] == "README.md"
+    assert "wardex.input_data" not in attrs
+    assert "wardex.output_data" not in attrs
+
+
+def test_every_other_operation_keeps_the_wardex_payload_keys():
+    env = _envelope_with_gen_ai(model="gpt-4o", input_tokens=10)
+    span = replace_first_span_payload(env, input_data=b"prompt", output_data=b"answer")
+    attrs = _first_span(span)["attributes"]
+    assert attrs["wardex.input_data"] == "prompt"
+    assert attrs["wardex.output_data"] == "answer"
+    assert "gen_ai.tool.call.arguments" not in attrs
+
+
+def replace_first_span_payload(env: Envelope, **kw) -> Envelope:
+    from dataclasses import replace
+
+    return Envelope(header=env.header, spans=(replace(env.spans[0], **kw),))
+
+
+def test_an_sse_span_is_http_on_the_wire_and_sse_under_the_wardex_key():
+    """`network.protocol.name = "sse"` fails every backend's HTTP grouping —
+    SSE is a framing over HTTP. The observed protocol survives under
+    `wardex.transport.protocol`; every other protocol is unchanged."""
+    env = Envelope(
+        header=_header(),
+        spans=(_span(transport=TransportAttributes(protocol=Protocol.SSE)),),
+    )
+    attrs = _first_span(env)["attributes"]
+    assert attrs["network.protocol.name"] == "http"
+    assert attrs["wardex.transport.protocol"] == "sse"
+
+    env = Envelope(
+        header=_header(),
+        spans=(_span(transport=TransportAttributes(protocol=Protocol.GRPC)),),
+    )
+    attrs = _first_span(env)["attributes"]
+    assert attrs["network.protocol.name"] == "grpc"
+    assert "wardex.transport.protocol" not in attrs
+
+
+def test_url_full_is_query_stripped_and_absent_when_no_url_was_captured():
+    """Query strings are where credentials and PII ride (`?api_key=`); the
+    exported URL is for grouping, not replay, so everything from `?` (and `#`)
+    is dropped. No captured URL, no key."""
+
+    def _with_url(url: str) -> Envelope:
+        return Envelope(
+            header=_header(),
+            spans=(
+                _span(
+                    transport=TransportAttributes(
+                        protocol=Protocol.HTTP,
+                        http=HttpMeta(method="POST", url=url, status_code=200),
+                    ),
+                ),
+            ),
+        )
+
+    attrs = _first_span(_with_url("https://api.example.com/v1/chat?api_key=sk-x#frag"))[
+        "attributes"
+    ]
+    assert attrs["url.full"] == "https://api.example.com/v1/chat"
+    assert "sk-x" not in str(attrs)
+
+    attrs = _first_span(_with_url(""))["attributes"]
+    assert "url.full" not in attrs
+
+
+def test_producer_and_consumer_kinds_reach_the_otlp_wire():
+    """The SDK pitches Celery/Kafka propagation and could not express the kinds
+    those spans are. OTLP numbering: PRODUCER=4, CONSUMER=5."""
+    assert (
+        _first_span(Envelope(header=_header(), spans=(_span(kind=SpanKind.PRODUCER),)))["kind"] == 4
+    )
+    assert (
+        _first_span(Envelope(header=_header(), spans=(_span(kind=SpanKind.CONSUMER),)))["kind"] == 5
+    )

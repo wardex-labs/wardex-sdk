@@ -131,7 +131,9 @@ def test_gen_ai_flattened_into_extra():
     assert kv["gen_ai.request.max_tokens"] == 256
     assert kv["gen_ai.request.stream"] is True
     assert kv["gen_ai.operation.name"] == "chat"
-    assert kv["gen_ai.response.finish_reasons"] == "stop"  # tuple → CSV
+    # tuple → ArrayValue of strings (semconv array type; CSV was lossy on
+    # elements containing commas), decoded back as a list.
+    assert kv["gen_ai.response.finish_reasons"] == ["stop"]
 
 
 def test_encode_is_deterministic():

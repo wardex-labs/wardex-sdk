@@ -36,7 +36,8 @@ design document is a contract nobody edits when the code moves:
                                         each adapter's own options.
 
 What stays top-level is what belongs to no group or to the SDK as a whole:
-`debug`, `before_send_envelope`, `capture_mode`, `release`, `environment`, and the
+`debug`, `before_send_envelope`, `capture_mode`, `service_name`, `release`,
+`environment`, and the
 interception trio (`intercept`, `intercept_hosts`, `interceptors`).
 The trio stays flat deliberately — `intercept` is the switch, `interceptors`
 refines it and `intercept_hosts` scopes it, so filing one of the three under a
@@ -450,8 +451,20 @@ class WardexConfig:
 
     capture_mode: CaptureMode = CaptureMode.AGENT
 
+    service_name: str | None = None
+    """Maps to the OTLP resource's `service.name` — the app's identity in any
+    OTel backend, the axis every one of them groups by. Unset, `init()` reads
+    `WARDEX_SERVICE_NAME`; still unset, the wire falls back to semconv's
+    `unknown_service:python` (never the SDK's own name — the SDK travels in
+    `telemetry.sdk.*`)."""
+
     release: str | None = None
+    """Maps to the OTLP resource's `service.version`. Unset, `init()` reads
+    `WARDEX_RELEASE`; still unset, no key is emitted."""
+
     environment: str | None = None
+    """Maps to the OTLP resource's `deployment.environment.name`. Unset,
+    `init()` reads `WARDEX_ENVIRONMENT`; still unset, no key is emitted."""
 
     def __new__(cls, *args: object, **kwargs: object) -> WardexConfig:
         moved = [name for name in _MOVED if name in kwargs]
@@ -531,6 +544,7 @@ def _resolve_config(
     intercept: bool = True,
     intercept_hosts: Sequence[str] | None = None,
     capture_mode: CaptureMode = CaptureMode.AGENT,
+    service_name: str | None = None,
     release: str | None = None,
     environment: str | None = None,
     before_send_envelope: BeforeSendEnvelopeCallback | None = None,
@@ -575,6 +589,9 @@ def _resolve_config(
         intercept=intercept,
         intercept_hosts=tuple(intercept_hosts) if intercept_hosts is not None else None,
         capture_mode=capture_mode,
+        service_name=(
+            service_name if service_name is not None else os.environ.get("WARDEX_SERVICE_NAME")
+        ),
         release=release if release is not None else os.environ.get("WARDEX_RELEASE"),
         environment=(
             environment if environment is not None else os.environ.get("WARDEX_ENVIRONMENT")

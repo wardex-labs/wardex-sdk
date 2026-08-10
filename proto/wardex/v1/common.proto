@@ -11,6 +11,8 @@ enum SpanKind {
   SPAN_KIND_INTERNAL = 1;
   SPAN_KIND_CLIENT = 2;
   SPAN_KIND_SERVER = 3;
+  SPAN_KIND_PRODUCER = 4;
+  SPAN_KIND_CONSUMER = 5;
 }
 
 enum StatusCode {

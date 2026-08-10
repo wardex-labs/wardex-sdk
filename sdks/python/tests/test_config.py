@@ -198,25 +198,30 @@ def test_an_unknown_keyword_is_still_an_ordinary_type_error():
 def test_resolve_config_reads_the_environment(monkeypatch):
     monkeypatch.setenv("WARDEX_API_KEY", "sk-test")
     monkeypatch.setenv("WARDEX_ENDPOINT", "https://collector.example")
+    monkeypatch.setenv("WARDEX_SERVICE_NAME", "checkout-api")
     monkeypatch.setenv("WARDEX_ENVIRONMENT", "local")
     monkeypatch.setenv("WARDEX_RELEASE", "1.2.3")
     c = _resolve_config()
     assert c.backend.api_key == "sk-test"
     assert c.backend.endpoint == "https://collector.example"
+    assert c.service_name == "checkout-api"
     assert c.environment == "local"
     assert c.release == "1.2.3"
 
 
 def test_resolve_config_explicit_argument_wins(monkeypatch):
     monkeypatch.setenv("WARDEX_API_KEY", "from-env")
+    monkeypatch.setenv("WARDEX_SERVICE_NAME", "from-env")
     monkeypatch.setenv("WARDEX_ENVIRONMENT", "from-env")
     monkeypatch.setenv("WARDEX_RELEASE", "from-env")
     c = _resolve_config(
         backend=BackendConfig(api_key="explicit"),
+        service_name="explicit",
         environment="explicit",
         release="explicit",
     )
     assert c.backend.api_key == "explicit"
+    assert c.service_name == "explicit"
     assert c.environment == "explicit"
     assert c.release == "explicit"
 

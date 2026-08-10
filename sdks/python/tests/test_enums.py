@@ -26,3 +26,17 @@ def test_provider_name_is_open_enum_string():
 def test_operation_name_values():
     assert _enums.OperationName.CHAT.value == "chat"
     assert _enums.OperationName.INVOKE_WORKFLOW.value == "invoke_workflow"
+
+
+def test_span_kind_carries_all_five_otel_kinds():
+    """PRODUCER/CONSUMER included: the SDK pitches Celery/Kafka propagation and
+    could not express the kinds those spans are. The values are the proto enum's
+    (SPAN_KIND_* names, appended, never renumbered) and the codec maps them
+    mechanically off the schema."""
+    assert {m.value for m in _enums.SpanKind} == {
+        "internal",
+        "client",
+        "server",
+        "producer",
+        "consumer",
+    }
