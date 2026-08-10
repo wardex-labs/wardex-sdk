@@ -18,11 +18,11 @@ import json
 
 import pytest
 
+from wardex_sdk._adapters._assembler import SessionAssembler
+from wardex_sdk._assembly import counters
+from wardex_sdk._assembly._units import _ambient_unit
 from wardex_sdk._hub import reset_for_test
-from wardex_sdk.adapters._assembler import SessionAssembler
-from wardex_sdk.assembly import counters
-from wardex_sdk.assembly._units import _ambient_unit
-from wardex_sdk.protocol._claude_stream import parse_line
+from wardex_sdk._protocol._claude_stream import parse_line
 
 
 @pytest.fixture(autouse=True)

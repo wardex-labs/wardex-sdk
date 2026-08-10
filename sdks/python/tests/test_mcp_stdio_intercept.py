@@ -13,7 +13,7 @@ from wardex_sdk._enums import SpanKind, StatusCode
 def _reset():
     _hub.reset_for_test()
     yield
-    from wardex_sdk.interceptors._registry import get_registry
+    from wardex_sdk._interceptors._registry import get_registry
 
     get_registry().uninstall_all()
     _hub.reset_for_test()
@@ -95,7 +95,7 @@ async def test_anyio_spawn_does_not_double_wrap_via_asyncio_seam():
     """A process spawned via the anyio path must skip the asyncio auxiliary seam
     (no double-wrapping)."""
     wardex.init(intercept=True)
-    from wardex_sdk.interceptors._registry import get_registry
+    from wardex_sdk._interceptors._registry import get_registry
 
     interceptor = get_registry()._installed["mcp_stdio"]
     proc = await anyio.open_process([sys.executable, "-c", _ECHO])
@@ -195,10 +195,10 @@ async def test_without_anyio_the_interceptor_declines_that_seam_and_keeps_the_ot
     an environment without anyio is exactly one where a hand-rolled JSON-RPC
     subprocess client is what MCP traffic looks like.
     """
-    from wardex_sdk.assembly import counters
-    from wardex_sdk.assembly._diag import reset_reports_for_test
-    from wardex_sdk.interceptors import _mcp_stdio
-    from wardex_sdk.interceptors._registry import get_registry
+    from wardex_sdk._assembly import counters
+    from wardex_sdk._assembly._diag import reset_reports_for_test
+    from wardex_sdk._interceptors import _mcp_stdio
+    from wardex_sdk._interceptors._registry import get_registry
 
     backend = _mcp_stdio._aio_backend
     untouched = backend.AsyncIOBackend.__dict__["open_process"]
@@ -251,8 +251,8 @@ for name in [m for m in sys.modules if m == "anyio" or m.startswith("anyio.")]:
 sys.modules["anyio"] = None
 
 import wardex_sdk as wardex
-from wardex_sdk.interceptors import _mcp_stdio
-from wardex_sdk.interceptors._registry import get_registry
+from wardex_sdk._interceptors import _mcp_stdio
+from wardex_sdk._interceptors._registry import get_registry
 
 assert _mcp_stdio._aio_backend is None, "anyio was reachable after all; the probe proves nothing"
 
@@ -313,9 +313,9 @@ for name in [m for m in sys.modules if m == "anyio" or m.startswith("anyio.")]:
 sys.meta_path.insert(0, _Boom())
 
 import wardex_sdk as wardex
-from wardex_sdk.assembly import counters
-from wardex_sdk.interceptors import _mcp_stdio
-from wardex_sdk.interceptors._registry import get_registry
+from wardex_sdk._assembly import counters
+from wardex_sdk._interceptors import _mcp_stdio
+from wardex_sdk._interceptors._registry import get_registry
 
 assert _mcp_stdio._aio_backend is None, "the broken anyio was imported after all"
 assert counters.get("interceptors.mcp_stdio.anyio_unavailable") >= 1, "the failure was silent"

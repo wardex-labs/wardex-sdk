@@ -3,8 +3,8 @@ from pathlib import Path
 
 import httpx
 
-from wardex_sdk.assembly import PatchSet
-from wardex_sdk.interceptors._conn_timing import ConnTimingProbe, ConnTimingStore
+from wardex_sdk._assembly import PatchSet
+from wardex_sdk._interceptors._conn_timing import ConnTimingProbe, ConnTimingStore
 
 
 def test_store_set_and_pop_returns_pair_then_none():
@@ -85,7 +85,7 @@ def test_probe_sync_records_connect_and_handshake(tls_server):
 
         spy_patches.patch(ssl.SSLSocket, "do_handshake", spy)
         # Read while the connection is still OPEN. Closing it releases the slot
-        # now (interceptors/_close_hook.py), which is the whole point of the
+        # now (_interceptors/_close_hook.py), which is the whole point of the
         # close hook: the store holds live connections, not dead ones. The
         # measurement this test is about is taken at handshake time either way.
         with httpx.Client(verify=_verify_ctx()) as client:

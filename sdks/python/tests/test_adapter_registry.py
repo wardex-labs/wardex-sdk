@@ -4,18 +4,18 @@ from unittest import mock
 
 import pytest
 
-from wardex_sdk._enums import AdapterName, AgentType, StatusCode
-from wardex_sdk._types import AgentAttributes
-from wardex_sdk.adapters import (
+from wardex_sdk._adapters import (
     _ADAPTERS,
     _DETECT_PACKAGES,
     _make_adapter,
     install_configured_adapters,
 )
-from wardex_sdk.adapters._base import AdapterInterface
-from wardex_sdk.adapters._context import Placement
-from wardex_sdk.adapters._registry import get_registry
-from wardex_sdk.assembly import SpanIntent, UnitKind, counters
+from wardex_sdk._adapters._base import AdapterInterface
+from wardex_sdk._adapters._context import Placement
+from wardex_sdk._adapters._registry import get_registry
+from wardex_sdk._assembly import SpanIntent, UnitKind, counters
+from wardex_sdk._enums import AdapterName, AgentType, StatusCode
+from wardex_sdk._types import AgentAttributes
 
 
 class _FakeAdapter(AdapterInterface):
@@ -106,8 +106,8 @@ def _config(adapters):
 def test_auto_detection_installs_when_package_present():
     get_registry().uninstall_all()
     with (
-        mock.patch("wardex_sdk.adapters._detect_package", return_value=True),
-        mock.patch("wardex_sdk.adapters._make_adapter") as make,
+        mock.patch("wardex_sdk._adapters._detect_package", return_value=True),
+        mock.patch("wardex_sdk._adapters._make_adapter") as make,
     ):
         make.return_value = _FakeAdapter()
         install_configured_adapters(None, _config(None))
@@ -122,8 +122,8 @@ def test_auto_detection_installs_when_package_present():
 def test_auto_detection_skips_when_package_absent():
     get_registry().uninstall_all()
     with (
-        mock.patch("wardex_sdk.adapters._detect_package", return_value=False),
-        mock.patch("wardex_sdk.adapters._make_adapter") as make,
+        mock.patch("wardex_sdk._adapters._detect_package", return_value=False),
+        mock.patch("wardex_sdk._adapters._make_adapter") as make,
     ):
         install_configured_adapters(None, _config(None))
         make.assert_not_called()
@@ -132,8 +132,8 @@ def test_auto_detection_skips_when_package_absent():
 def test_empty_tuple_disables_all():
     get_registry().uninstall_all()
     with (
-        mock.patch("wardex_sdk.adapters._detect_package", return_value=True),
-        mock.patch("wardex_sdk.adapters._make_adapter") as make,
+        mock.patch("wardex_sdk._adapters._detect_package", return_value=True),
+        mock.patch("wardex_sdk._adapters._make_adapter") as make,
     ):
         install_configured_adapters(None, _config(()))
         make.assert_not_called()
@@ -142,8 +142,8 @@ def test_empty_tuple_disables_all():
 def test_explicit_tuple_installs_even_without_detection():
     get_registry().uninstall_all()
     with (
-        mock.patch("wardex_sdk.adapters._detect_package", return_value=False),
-        mock.patch("wardex_sdk.adapters._make_adapter") as make,
+        mock.patch("wardex_sdk._adapters._detect_package", return_value=False),
+        mock.patch("wardex_sdk._adapters._make_adapter") as make,
     ):
         make.return_value = _FakeAdapter()
         install_configured_adapters(None, _config((AdapterName.ANTHROPIC_AGENT_SDK,)))
@@ -158,8 +158,8 @@ def test_broken_adapter_install_does_not_break_init():
     install() before recording it — see AdapterRegistry.install)."""
     get_registry().uninstall_all()
     with (
-        mock.patch("wardex_sdk.adapters._detect_package", return_value=True),
-        mock.patch("wardex_sdk.adapters._make_adapter") as make,
+        mock.patch("wardex_sdk._adapters._detect_package", return_value=True),
+        mock.patch("wardex_sdk._adapters._make_adapter") as make,
     ):
         make.return_value = _BrokenInstallAdapter()
         install_configured_adapters(None, _config(None))  # must not raise
@@ -308,6 +308,6 @@ def test_an_adapter_that_declares_nothing_is_unaffected():
 
 def test_a_context_built_without_an_adapter_holds_no_reader():
     """`context_for`'s third parameter is optional, and 20+ tests rely on that."""
-    from wardex_sdk.adapters._registry import context_for
+    from wardex_sdk._adapters._registry import context_for
 
     assert context_for("no-adapter", None)._control_flow is None

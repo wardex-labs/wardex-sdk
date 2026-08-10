@@ -24,6 +24,7 @@ import threading
 import pytest
 
 from wardex_sdk import _hub
+from wardex_sdk._assembly._diag import reset_reports_for_test
 from wardex_sdk._client import (
     _DEFAULT_TIMEOUT,
     _FOLLOW_TRANSPORT_TIMEOUT,
@@ -39,7 +40,6 @@ from wardex_sdk._types import (
     SpanId,
     TraceId,
 )
-from wardex_sdk.assembly._diag import reset_reports_for_test
 from wardex_sdk.transport._base import UNDELIVERED, Transport
 from wardex_sdk.transport._otlp_http import OtlpHttpTransport
 

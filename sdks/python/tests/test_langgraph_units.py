@@ -54,7 +54,7 @@ from test_langgraph_adapter import (
     tools,
     traces,
 )
-from wardex_sdk.assembly import Limitation, ParentSource, counters
+from wardex_sdk._assembly import Limitation, ParentSource, counters
 
 #: What an edge wardex READ looks like on the wire. Spelled once: every place it
 #: appears below is asserting the same three-part fact, and a gate that spells it
@@ -372,7 +372,7 @@ def test_the_tier_half_alone_cannot_see_a_collapsed_tree(installed):  # noqa: F8
     """
     from langgraph.pregel import _retry, _runner
 
-    import wardex_sdk.adapters._langgraph as mod
+    import wardex_sdk._adapters._langgraph as mod
 
     def _empty(task, retry_policy, *a, **k):
         return None

@@ -362,7 +362,7 @@ def _one_oversized_span_costs_one_span(phoenix: str, report: _Report) -> None:
     reset here rather than assumed empty.
     """
     import wardex_sdk
-    from wardex_sdk.assembly._diag import reset_reports_for_test
+    from wardex_sdk._assembly._diag import reset_reports_for_test
 
     print("\nA span too large even alone is dropped without taking the batch")
     reset_reports_for_test()

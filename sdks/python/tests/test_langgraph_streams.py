@@ -73,7 +73,7 @@ from test_langgraph_adapter import (  # noqa: F401
     tools,
     traces,
 )
-from wardex_sdk.assembly import Limitation, ParentSource, counters, latch_ambient
+from wardex_sdk._assembly import Limitation, ParentSource, counters, latch_ambient
 
 #: TODAY'S edge for any site issued on a carrier whose run has already closed
 #: and shipped: a full-confidence child of a span that has ENDED, with nothing
@@ -731,7 +731,7 @@ def test_the_tool_seam_adds_one_span_per_call_and_chains_a_wire_call_to_the_run(
         live.teardown()
 
     with pytest.MonkeyPatch.context() as mp:
-        import wardex_sdk.adapters._langgraph as mod
+        import wardex_sdk._adapters._langgraph as mod
 
         mp.setattr(mod, "_tool_surface_ok", lambda *a: False)
         base = Installed()

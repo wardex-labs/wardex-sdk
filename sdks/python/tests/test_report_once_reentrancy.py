@@ -32,8 +32,8 @@ from __future__ import annotations
 
 import threading
 
-from wardex_sdk.assembly import _diag
-from wardex_sdk.assembly._diag import report_once, reset_reports_for_test
+from wardex_sdk._assembly import _diag
+from wardex_sdk._assembly._diag import report_once, reset_reports_for_test
 
 
 def test_report_once_can_be_re_entered_on_a_thread_that_already_holds_its_lock(monkeypatch):

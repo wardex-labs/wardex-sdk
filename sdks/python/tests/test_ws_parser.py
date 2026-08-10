@@ -1,4 +1,4 @@
-from wardex_sdk.protocol import WsParser
+from wardex_sdk._protocol import WsParser
 
 
 def _frame(fin: bool, opcode: int, payload: bytes, mask: bytes | None = None) -> bytes:

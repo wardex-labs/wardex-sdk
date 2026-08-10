@@ -23,21 +23,21 @@ from typing import Any
 import pytest
 
 from wardex_sdk import _hub
+from wardex_sdk._assembly import Prefilter, capture_mode_of, should_capture
 from wardex_sdk._config import BackendConfig, WardexConfig
 from wardex_sdk._enums import CaptureMode
-from wardex_sdk._types import SpanContext, SpanId, TraceId
-from wardex_sdk.assembly import Prefilter, capture_mode_of, should_capture
-from wardex_sdk.context._contextvar import fork_active_span
-from wardex_sdk.interceptors import _seam
-from wardex_sdk.interceptors._conn_timing import (
+from wardex_sdk._interceptors import _seam
+from wardex_sdk._interceptors._conn_timing import (
     install_shared_timing,
     shared_timing_store,
     uninstall_shared_timing,
 )
-from wardex_sdk.interceptors._mcp_stdio import _ProcState
-from wardex_sdk.interceptors._seam import ByteSeamInterceptor, _ConnectionState
-from wardex_sdk.interceptors._socket import RawSocketInterceptor
-from wardex_sdk.interceptors._trackers import _Txn
+from wardex_sdk._interceptors._mcp_stdio import _ProcState
+from wardex_sdk._interceptors._seam import ByteSeamInterceptor, _ConnectionState
+from wardex_sdk._interceptors._socket import RawSocketInterceptor
+from wardex_sdk._interceptors._trackers import _Txn
+from wardex_sdk._types import SpanContext, SpanId, TraceId
+from wardex_sdk.context._contextvar import fork_active_span
 
 
 def _ctx(*, remote: bool) -> SpanContext:
@@ -540,7 +540,7 @@ def test_the_flag_is_a_declared_input_and_not_a_hidden_read():
     import inspect
     import pathlib
 
-    from wardex_sdk.assembly import _parentage, _policy
+    from wardex_sdk._assembly import _parentage, _policy
 
     assert "degraded" in inspect.signature(should_capture).parameters
 
@@ -570,7 +570,7 @@ def test_the_flag_widens_nothing_a_healthy_run_would_have_been_denied():
 
 
 def test_the_flag_lasts_exactly_as_long_as_the_block_it_was_set_for():
-    from wardex_sdk.assembly import degraded_run, in_degraded_run
+    from wardex_sdk._assembly import degraded_run, in_degraded_run
 
     assert in_degraded_run() is False
     with degraded_run():
@@ -592,7 +592,7 @@ def test_a_span_that_survived_a_degraded_run_does_not_ship_as_a_trace_root():
     (`parent_unresolved`) and wardex is why it is missing
     (`instrumentation_degraded`).
     """
-    from wardex_sdk.assembly import (
+    from wardex_sdk._assembly import (
         EMPTY_AMBIENT,
         Limitation,
         ParentSource,
@@ -621,7 +621,7 @@ def test_a_real_parent_is_still_the_parent_inside_a_degraded_run():
     downgrading it would turn a wardex bug into a worse tree than the one it
     caused.
     """
-    from wardex_sdk.assembly import Ambient, ParentSource, degraded_run, resolve_observed
+    from wardex_sdk._assembly import Ambient, ParentSource, degraded_run, resolve_observed
 
     ambient = Ambient(span_context=LOCAL, conversation=None, tracestate=None)
     with degraded_run():
@@ -639,8 +639,7 @@ def test_the_edges_markers_reach_the_span_without_the_caller_copying_them():
     limitation list — half of I4 missing, and the half a dashboard renders.
     Two sites remembered; the rest did not.
     """
-    from wardex_sdk._enums import CaptureSource, SpanKind
-    from wardex_sdk.assembly import (
+    from wardex_sdk._assembly import (
         EMPTY_AMBIENT,
         Limitation,
         SpanDraft,
@@ -648,6 +647,7 @@ def test_the_edges_markers_reach_the_span_without_the_caller_copying_them():
         degraded_run,
         resolve_observed,
     )
+    from wardex_sdk._enums import CaptureSource, SpanKind
 
     with degraded_run():
         p = resolve_observed(EMPTY_AMBIENT)
@@ -684,9 +684,7 @@ def _stranded_session():
     """
     import threading
 
-    from wardex_sdk._hub import reset_for_test
-    from wardex_sdk._types import AgentAttributes
-    from wardex_sdk.assembly import (
+    from wardex_sdk._assembly import (
         EMPTY_AMBIENT,
         SpanIntent,
         UnitKey,
@@ -694,7 +692,9 @@ def _stranded_session():
         UnitRegistry,
         counters,
     )
-    from wardex_sdk.assembly._units import _ambient_unit
+    from wardex_sdk._assembly._units import _ambient_unit
+    from wardex_sdk._hub import reset_for_test
+    from wardex_sdk._types import AgentAttributes
 
     class _Sink:
         def emit(self, draft: Any, *, agent_semantic: bool) -> bool:
@@ -779,7 +779,7 @@ def test_the_closed_parent_flag_is_a_declared_input_and_not_a_hidden_read():
     import inspect
     import pathlib
 
-    from wardex_sdk.assembly import _policy, _units
+    from wardex_sdk._assembly import _policy, _units
 
     assert "parent_closed" in inspect.signature(should_capture).parameters
 
@@ -799,7 +799,7 @@ def test_an_observed_span_under_a_closed_parent_is_unresolved_not_a_child():
     `PARENT_UNRESOLVED` is the literal truth. It is not
     `INSTRUMENTATION_DEGRADED` either; nothing failed to open.
     """
-    from wardex_sdk.assembly import Ambient, Limitation, ParentSource, resolve_observed
+    from wardex_sdk._assembly import Ambient, Limitation, ParentSource, resolve_observed
 
     ambient = Ambient(span_context=LOCAL, conversation=None, tracestate=None)
 
@@ -820,7 +820,7 @@ def test_an_observed_span_whose_parent_wardex_evicted_says_whose_fault_it_is():
     """The sibling of the row above, one argument along.
 
     `parent_evicted` is the byte seam's own bound admitting it dropped a latched
-    parent (`interceptors/_trackers.py`, the h2 stream latch at `max_streams`).
+    parent (`_interceptors/_trackers.py`, the h2 stream latch at `max_streams`).
     Shipped as a trace root that span is indistinguishable from one the host
     genuinely issued outside any agent work, so it takes `PARENT_UNRESOLVED` for
     the missing parent and `INSTRUMENTATION_DEGRADED` for whose doing that was —
@@ -830,7 +830,7 @@ def test_an_observed_span_whose_parent_wardex_evicted_says_whose_fault_it_is():
     one flowing through would take `resolve_parentage`'s join branch and ship a
     span that both adopts a parent and declares it has none.
     """
-    from wardex_sdk.assembly import (
+    from wardex_sdk._assembly import (
         EMPTY_AMBIENT,
         Ambient,
         Limitation,
@@ -880,7 +880,7 @@ def test_the_seam_asks_about_unit_liveness_when_it_latches_not_when_it_emits():
     """
     import threading
 
-    from wardex_sdk.interceptors._trackers import _Http1Tracker
+    from wardex_sdk._interceptors._trackers import _Http1Tracker
 
     with _stranded_session() as (reg, dead):
         after = _Http1Tracker()
@@ -900,16 +900,16 @@ def test_the_seam_asks_about_unit_liveness_when_it_latches_not_when_it_emits():
         )
 
     # And the in-flight half: latched while LIVE, answered after the close.
-    from wardex_sdk._hub import reset_for_test
-    from wardex_sdk._types import AgentAttributes
-    from wardex_sdk.assembly import (
+    from wardex_sdk._assembly import (
         EMPTY_AMBIENT,
         SpanIntent,
         UnitKey,
         UnitKind,
         UnitRegistry,
     )
-    from wardex_sdk.assembly._units import _ambient_unit
+    from wardex_sdk._assembly._units import _ambient_unit
+    from wardex_sdk._hub import reset_for_test
+    from wardex_sdk._types import AgentAttributes
 
     class _Sink:
         def emit(self, draft: Any, *, agent_semantic: bool) -> bool:
@@ -958,7 +958,7 @@ def test_mcp_stdio_does_not_parent_a_tool_call_into_a_finished_run():
     and the EDGE is the only thing left to get right. The span still ships — it
     just stops being a silent child of a session that had already ended.
     """
-    from wardex_sdk.assembly import Limitation, ParentSource
+    from wardex_sdk._assembly import Limitation, ParentSource
 
     with _stranded_session() as (reg, dead):
         state = _ProcState(mode=CaptureMode.AGENT)

@@ -53,18 +53,18 @@ import importlib
 import inspect
 from collections.abc import Sequence
 
+from .._adapters import _DETECT_PACKAGES, _make_adapter
+from .._assembly import Limitation, ParentSource
 from .._enums import AdapterName
-from ..adapters import _DETECT_PACKAGES, _make_adapter
-from ..assembly import Limitation, ParentSource
 from .harness import (
     AdapterSubject,
-    Node,
-    bare,
-    collapse,
-    installed,
-    one,
-    parent_name,
-    read,
+    SpanNode,
+    collapse_onto_root,
+    exactly_one,
+    installed_adapter,
+    never_installed,
+    parent_name_of,
+    read_spans,
 )
 
 #: The methods an adapter's causal surface may open a span through. `rejoin` is
@@ -132,7 +132,7 @@ class AdapterConformanceSuite:
             intermediates need two different answers at once, which no
             process-global register can give.
           * ONE ROOT. Every chain hangs off the same span, or the declared tree
-            is two trees and the suite's own `collapse()` has no anchor.
+            is two trees and the suite's own `collapse_onto_root()` has no anchor.
         """
         subject = self._subject
         chains = subject.chains
@@ -196,7 +196,7 @@ class AdapterConformanceSuite:
         subject = self._subject
         before = dict(subject.seams())
         assert before, "a subject must declare the seams its adapter patches"
-        with installed(subject.factory) as live:
+        with installed_adapter(subject.factory) as live:
             during = dict(subject.seams())
             assert set(during) == set(before), "the seam snapshot changed shape"
             silent = [key for key in before if during[key] is before[key]]
@@ -234,7 +234,7 @@ class AdapterConformanceSuite:
         """
         subject = self._subject
         before = dict(subject.seams())
-        with installed(subject.factory) as live:
+        with installed_adapter(subject.factory) as live:
             subject.workload(live)
             assert live.spans, "this client really does receive spans"
             shipped = len(live.spans)
@@ -242,7 +242,7 @@ class AdapterConformanceSuite:
             live.teardown()
             self._assert_restored(before)
 
-            subject.workload(bare(subject.factory, live.client))
+            subject.workload(never_installed(subject.factory, live.client))
             assert len(live.spans) == shipped, (
                 "a restored seam emitted spans; either the uninstall did not restore "
                 "it, or a patch leaked out of an earlier install and this suite is "
@@ -292,12 +292,12 @@ class AdapterConformanceSuite:
         convincing as the tier half is on its own, which is not at all.
         """
         nodes = self._observe()
-        flattened = collapse(nodes, root=self._subject.root)
+        flattened = collapse_onto_root(nodes, root=self._subject.root)
         self._assert_tiers(flattened)  # every tier assertion still passes
 
         for chain in self._subject.chains:
-            leaf = one(flattened, chain[-1])
-            assert parent_name(flattened, leaf) == self._subject.root, (
+            leaf = exactly_one(flattened, chain[-1])
+            assert parent_name_of(flattened, leaf) == self._subject.root, (
                 "the collapse this check builds must actually be a collapse"
             )
         try:
@@ -310,13 +310,13 @@ class AdapterConformanceSuite:
             f"{self._subject.root!r} and the chains still held."
         )
 
-    def _observe(self) -> tuple[Node, ...]:
+    def _observe(self) -> tuple[SpanNode, ...]:
         subject = self._subject
-        with installed(subject.factory) as live:
+        with installed_adapter(subject.factory) as live:
             subject.workload(live)
-            return read(live.spans)
+            return read_spans(live.spans)
 
-    def _assert_tiers(self, nodes: Sequence[Node]) -> None:
+    def _assert_tiers(self, nodes: Sequence[SpanNode]) -> None:
         subject = self._subject
         declared = {name for chain in subject.chains for name in chain}
         assert sorted(node.name for node in nodes) == sorted(declared), (
@@ -349,13 +349,13 @@ class AdapterConformanceSuite:
                 "guessed, and nothing about them was lost"
             )
 
-    def _assert_chains(self, nodes: Sequence[Node]) -> None:
+    def _assert_chains(self, nodes: Sequence[SpanNode]) -> None:
         for chain in self._subject.chains:
             for parent, child in zip(chain, chain[1:], strict=False):
-                above = one(nodes, parent)
-                below = one(nodes, child)
+                above = exactly_one(nodes, parent)
+                below = exactly_one(nodes, child)
                 assert below.parent_id == above.span_id, (
-                    f"{child!r} is parented to {parent_name(nodes, below)!r}, not to {parent!r}"
+                    f"{child!r} is parented to {parent_name_of(nodes, below)!r}, not to {parent!r}"
                 )
 
     # -- placement -----------------------------------------------------------
@@ -407,7 +407,7 @@ class AdapterConformanceSuite:
         """
         subject = self._subject
         before = dict(subject.seams())
-        with installed(subject.factory) as live:
+        with installed_adapter(subject.factory) as live:
             stalled = subject.stall(live)
             registry = live.registry
             assert registry is not None
@@ -429,14 +429,14 @@ class AdapterConformanceSuite:
         without seeing an exception wardex invented.
         """
         subject = self._subject
-        with installed(subject.factory) as live:
+        with installed_adapter(subject.factory) as live:
             stalled = subject.stall(live)
             live.teardown()
             self._assert_shipped(live, stalled.root, Limitation.ADAPTER_UNINSTALLED)
             stalled.resume()
 
     def _assert_shipped(self, live, root: str, marker: Limitation) -> None:  # noqa: ANN001
-        shipped = [node for node in read(live.spans) if node.name == root]
+        shipped = [node for node in read_spans(live.spans) if node.name == root]
         assert len(shipped) == 1, (
             f"expected exactly one {root!r} to ship for an interrupted run, got {len(shipped)}"
         )

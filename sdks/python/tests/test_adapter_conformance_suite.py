@@ -20,10 +20,15 @@ from functools import partial
 
 import pytest
 
-from wardex_sdk.adapters._base import AdapterInterface
-from wardex_sdk.adapters._context import AdapterContext, Placement
-from wardex_sdk.assembly import Limitation, SpanIntent, ToolAttributes, UnitKind
-from wardex_sdk.testing import AdapterConformanceSuite, AdapterSubject, Stalled, installed
+from wardex_sdk._adapters._base import AdapterInterface
+from wardex_sdk._adapters._context import AdapterContext, Placement
+from wardex_sdk._assembly import Limitation, SpanIntent, ToolAttributes, UnitKind
+from wardex_sdk.testing import (
+    AdapterConformanceSuite,
+    AdapterSubject,
+    StalledRun,
+    installed_adapter,
+)
 from wardex_sdk.testing.conformance import _declares_placement
 
 _MODULE = __name__
@@ -250,10 +255,10 @@ def _workload(live):  # noqa: ANN001, ANN202
     return FakeFramework.run(_steps(live))
 
 
-def _stall(live) -> Stalled:  # noqa: ANN001
+def _stall(live) -> StalledRun:  # noqa: ANN001
     it = FakeFramework.stream(_steps(live))
     next(it)
-    return Stalled(root="invoke_workflow Stalled", resume=lambda: list(it))
+    return StalledRun(root="invoke_workflow Stalled", resume=lambda: list(it))
 
 
 def _subject(factory) -> AdapterSubject:  # noqa: ANN001
@@ -340,7 +345,7 @@ def test_the_collapse_is_a_real_one_and_not_an_absence(collapsed):
     """The broken adapter still emits every span, or the test above proves
     nothing: an adapter that emitted no step spans at all would also fail the id
     half, for a reason a reader would then attribute to the wrong defect."""
-    with installed(collapsed.factory) as live:
+    with installed_adapter(collapsed.factory) as live:
         collapsed.workload(live)
         names = sorted(span.name for span in live.spans)
     assert names == sorted({name for chain in collapsed.chains for name in chain})

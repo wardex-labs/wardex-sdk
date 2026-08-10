@@ -30,11 +30,11 @@ import time
 import pytest
 
 from wardex_sdk import _runtime
+from wardex_sdk._assembly._diag import reset_reports_for_test
 from wardex_sdk._client import Client, _UnnamedTimeout
 from wardex_sdk._config import BackendConfig, BatchingPolicy, WardexConfig
 from wardex_sdk._enums import SpanKind
 from wardex_sdk._types import InternalSpan, SpanContext, SpanId, TraceId
-from wardex_sdk.assembly._diag import reset_reports_for_test
 from wardex_sdk.transport._otlp_http import OtlpHttpTransport
 
 # Long enough that the socket really does block on it, short enough that a test

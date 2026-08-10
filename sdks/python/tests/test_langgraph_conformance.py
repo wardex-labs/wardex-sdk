@@ -17,9 +17,9 @@ from __future__ import annotations
 import pytest
 
 from test_langgraph_adapter import chain
+from wardex_sdk._adapters._langgraph import LangGraphAdapter
 from wardex_sdk._enums import AdapterName
-from wardex_sdk.adapters._langgraph import LangGraphAdapter
-from wardex_sdk.testing import AdapterConformanceSuite, AdapterSubject, Stalled
+from wardex_sdk.testing import AdapterConformanceSuite, AdapterSubject, StalledRun
 
 _N_NODES = 3
 
@@ -57,7 +57,7 @@ def workload(live):  # noqa: ANN001, ANN201
     return chain(live.ctx, _N_NODES, name="Conformance", leaves=leaves).invoke({"trail": []})
 
 
-def stall(live) -> Stalled:  # noqa: ANN001
+def stall(live) -> StalledRun:  # noqa: ANN001
     """A `stream()` the host has pumped once and not finished.
 
     The run's SESSION unit lives for as long as the host iterates, so this is
@@ -67,14 +67,14 @@ def stall(live) -> Stalled:  # noqa: ANN001
     """
     it = chain(live.ctx, _N_NODES, name="Stalled", leaves=False).stream({"trail": []})
     next(it)
-    return Stalled(root="invoke_workflow Stalled", resume=lambda: list(it))
+    return StalledRun(root="invoke_workflow Stalled", resume=lambda: list(it))
 
 
 @pytest.fixture
 def subject() -> AdapterSubject:
     return AdapterSubject(
         name=AdapterName.LANGGRAPH.value,
-        module="wardex_sdk.adapters._langgraph",
+        module="wardex_sdk._adapters._langgraph",
         factory=LangGraphAdapter,
         seams=seams,
         workload=workload,

@@ -1,4 +1,4 @@
-from wardex_sdk.interceptors._trackers import _ttft_from_marks
+from wardex_sdk._interceptors._trackers import _ttft_from_marks
 
 
 def test_ttft_picks_first_mark_past_header_boundary():

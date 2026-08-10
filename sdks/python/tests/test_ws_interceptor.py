@@ -2,15 +2,15 @@ import pytest
 
 import wardex_sdk as wardex
 from wardex_sdk import _hub
+from wardex_sdk._assembly import Limitation
 from wardex_sdk._enums import CaptureMode, SpanKind
-from wardex_sdk.assembly import Limitation
 
 
 @pytest.fixture(autouse=True)
 def _reset():
     _hub.reset_for_test()
     yield
-    from wardex_sdk.interceptors._registry import get_registry
+    from wardex_sdk._interceptors._registry import get_registry
 
     get_registry().uninstall_all()
     _hub.reset_for_test()
@@ -44,7 +44,7 @@ def test_ws_upgrade_to_close_emits_one_span():
     # needs an active local span to latch onto, which it deliberately has
     # none of — it targets WS frame/tracker capture, not the policy gate.
     wardex.init(intercept=True, capture_mode=CaptureMode.ALL)
-    from wardex_sdk.interceptors._registry import get_registry
+    from wardex_sdk._interceptors._registry import get_registry
 
     interceptor = get_registry()._installed["ssl"]  # type: ignore[attr-defined]
     obj = _FakeSSLObj("api.example")
@@ -79,7 +79,7 @@ def test_ws_upgrade_to_close_emits_one_span():
 def test_no_close_flushes_on_uninstall_with_marker():
     # capture_mode=ALL: see rationale in test_ws_upgrade_to_close_emits_one_span.
     wardex.init(intercept=True, capture_mode=CaptureMode.ALL)
-    from wardex_sdk.interceptors._registry import get_registry
+    from wardex_sdk._interceptors._registry import get_registry
 
     registry = get_registry()
     interceptor = registry._installed["ssl"]  # type: ignore[attr-defined]
@@ -104,7 +104,7 @@ def test_no_close_flushes_on_uninstall_with_marker():
 def test_deflate_negotiation_marks_compressed():
     # capture_mode=ALL: see rationale in test_ws_upgrade_to_close_emits_one_span.
     wardex.init(intercept=True, capture_mode=CaptureMode.ALL)
-    from wardex_sdk.interceptors._registry import get_registry
+    from wardex_sdk._interceptors._registry import get_registry
 
     registry = get_registry()
     interceptor = registry._installed["ssl"]  # type: ignore[attr-defined]
@@ -132,7 +132,7 @@ def test_client_close_error_code_maps_error_status():
     # capture_mode=ALL: see rationale in test_ws_upgrade_to_close_emits_one_span.
     wardex.init(intercept=True, capture_mode=CaptureMode.ALL)
     from wardex_sdk._enums import StatusCode
-    from wardex_sdk.interceptors._registry import get_registry
+    from wardex_sdk._interceptors._registry import get_registry
 
     interceptor = get_registry()._installed["ssl"]  # type: ignore[attr-defined]
     obj = _FakeSSLObj("api.example")
@@ -171,7 +171,7 @@ def test_close_flushes_ws_span_to_transport():
     wardex.init(intercept=True, capture_mode=CaptureMode.ALL)
     rec = _RecordingTransport()
     _hub.get_client()._transport = rec
-    from wardex_sdk.interceptors._registry import get_registry
+    from wardex_sdk._interceptors._registry import get_registry
 
     interceptor = get_registry()._installed["ssl"]  # type: ignore[attr-defined]
     obj = _FakeSSLObj("api.example")

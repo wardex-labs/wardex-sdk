@@ -5,7 +5,7 @@ judge. They exist because of the single most instructive failure in the prior
 art: an emitter helper was *extracted* into one place, and then a second
 constructor and eight streaming branches were left free to bypass it. An
 extraction that leaves the bypass reachable is not an extraction. So the rules
-below are the extraction — the docstrings in `assembly/` are only its
+below are the extraction — the docstrings in `_assembly/` are only its
 description.
 
 Two kinds of assertion live here, and the difference matters when one fails:
@@ -13,11 +13,11 @@ Two kinds of assertion live here, and the difference matters when one fails:
   HARD RULE — true today, must stay true forever. If you broke one, the fix is
   in your change, not here.
 
-  BUDGET — a ratchet over code that predates the `assembly/` package. Each file
+  BUDGET — a ratchet over code that predates the `_assembly/` package. Each file
   gets the count it has today; the test fails if a count goes UP or if a file
   not on the list acquires its first occurrence. These numbers may only be
   lowered. Each budget is driven to zero as the code it covers moves onto
-  `assembly/`, at which point the budget dict is deleted and the rule becomes
+  `_assembly/`, at which point the budget dict is deleted and the rule becomes
   hard. Adding a line to
   a budget to make your change pass is the one edit this file is not for.
 """
@@ -95,8 +95,8 @@ def _imported_modules(rel: str, tree: ast.Module) -> set[str]:
 
     Dynamic imports (`importlib.import_module("wardex_sdk.x")`, `__import__`)
     are resolved too when the argument is a string literal, and reported as
-    `<dynamic>` when it is not: `adapters/__init__.py` already imports
-    `importlib.util`, and design §3.2 gives `assembly/_patchset.py` the job of
+    `<dynamic>` when it is not: `_adapters/__init__.py` already imports
+    `importlib.util`, and design §3.2 gives `_assembly/_patchset.py` the job of
     reaching modules lazily, so this idiom is one edit away from being a hole in
     every rule below.
     """
@@ -192,8 +192,8 @@ def _module_aliases(rel: str, tree: ast.Module) -> set[str]:
 
     A rule that only understands `TraceId.generate()` is defeated by
     `_types.TraceId.generate()`, and `from .. import _hub, _wardex_native` is the
-    house form in this codebase (`adapters/_assembler.py:17`,
-    `interceptors/_mcp_stdio.py:20`, `interceptors/_trackers.py:14`) — so that
+    house form in this codebase (`_adapters/_assembler.py:17`,
+    `_interceptors/_mcp_stdio.py:20`, `_interceptors/_trackers.py:14`) — so that
     spelling is one token away from code already in the tree. The predicates
     below therefore accept a module-qualified receiver as well as a bare name.
 
@@ -327,7 +327,7 @@ def _reads_capture_mode(rel: str, tree: ast.Module):
     Two spellings, because the codebase already uses both: the attribute
     (`client.config.capture_mode`, which is how the seam used to read it)
     and the string (`getattr(config, "capture_mode", None)`, which is how
-    `assembly/_policy.py` reads it now, duck-typed). A rule that saw only the
+    `_assembly/_policy.py` reads it now, duck-typed). A rule that saw only the
     first would be one `getattr` away from meaning nothing.
 
     The DECLARATION is deliberately not a read: `_config.py`'s
@@ -367,7 +367,7 @@ def _calls_sink(rel: str, tree: ast.Module):
 
 # Calls that make a handler self-reporting. `guard` is the sanctioned swallow;
 # `bump` is its counter; the rest are the logging spellings already in the tree
-# (`interceptors/_seam.py` `parser_disable_log`, stdlib logging, debug prints).
+# (`_interceptors/_seam.py` `parser_disable_log`, stdlib logging, debug prints).
 _REPORTING_CALLS = frozenset(
     {
         "guard",
@@ -421,7 +421,7 @@ def _silent_swallow_node(node: ast.AST) -> bool:
     Deliberately not "the body is literally `pass`". Two things go wrong with the
     literal reading. It misses `except Exception: return None`, which is the same
     swallow with different punctuation and is already the shape of 13 handlers in
-    `adapters/`/`interceptors/`. Worse, it makes the C-S4 ratchet satisfiable by
+    `_adapters/`/`_interceptors/`. Worse, it makes the C-S4 ratchet satisfiable by
     laundering: rewriting `pass` as `return None` lowers the count, turns the
     budget green, and fixes nothing — which would defeat the conversion onto
     `guard()` this budget exists to drive.
@@ -442,7 +442,7 @@ def _silent_swallow_node(node: ast.AST) -> bool:
     runs on the success path and the exception unwinds straight out of it, so
     nothing written inside can say the swallow occurred. Every
     `contextlib.suppress` is therefore silent by construction, and the one
-    sanctioned occurrence in `assembly/` is recorded by name in
+    sanctioned occurrence in `_assembly/` is recorded by name in
     `_ASSEMBLY_SUPPRESS` rather than exempted by predicate.
     """
     if _suppress_items(node):
@@ -481,9 +481,9 @@ def _assert_within_budget(
         f"{rule} regressed.\n"
         + "\n".join(f"  {rel}: {n} occurrences, budget {b}" for rel, (n, b) in sorted(over.items()))
         + f"\n\nWHY: {why}\n"
-        "These budgets are a ratchet over code that predates wardex_sdk.assembly.\n"
+        "These budgets are a ratchet over code that predates wardex_sdk._assembly.\n"
         "They may only be LOWERED. If you need a new occurrence, you need the\n"
-        "assembly/ entry point instead — that is the whole point of the rule.\n"
+        "_assembly/ entry point instead — that is the whole point of the rule.\n"
         "See design §10.4."
     )
 
@@ -492,7 +492,7 @@ def _assert_within_budget(
 # design §3.1 — dependency direction (HARD RULES)
 # --------------------------------------------------------------------------
 
-# assembly/ sits above the leaf vocabulary and the scope layer and below
+# _assembly/ sits above the leaf vocabulary and the scope layer and below
 # everything that observes anything. This is a positive allowlist so that a new
 # module in the package forces an explicit decision instead of silently
 # widening the layer.
@@ -510,14 +510,14 @@ _ASSEMBLY_MAY_IMPORT = frozenset(
     }
 )
 
-# Whole subpackages assembly/ may reach into. Deliberately separate from the
+# Whole subpackages _assembly/ may reach into. Deliberately separate from the
 # exact list: `wardex_sdk` itself must NOT act as a prefix, or every module in
 # the SDK would be allowed and the rule would assert nothing.
 _ASSEMBLY_MAY_IMPORT_PACKAGES = (f"{_PKG}.context",)
 
 _LAYERING_WHY = (
-    "assembly/ is the layer everything else depends ON. If it may import an\n"
-    "observer (interceptors/, adapters/, protocol/, semantics/), the one-way\n"
+    "_assembly/ is the layer everything else depends ON. If it may import an\n"
+    "observer (_interceptors/, _adapters/, _protocol/, _semantics/), the one-way\n"
     "arrow in design §3.1 becomes a cycle, the 'adapters cannot reach\n"
     "InternalSpan' guarantee (I5) becomes reachable through assembly, and the\n"
     "package stops being a boundary anyone can reason about."
@@ -527,10 +527,10 @@ _LAYERING_WHY = (
 def test_assembly_imports_only_leaf_and_scope_layers():
     violations: list[str] = []
     for rel, tree in _modules().items():
-        if not rel.startswith("assembly/"):
+        if not rel.startswith("_assembly/"):
             continue
         for target in sorted(_imported_modules(rel, tree)):
-            if target.startswith(f"{_PKG}.assembly"):
+            if target.startswith(f"{_PKG}._assembly"):
                 continue
             if target in _ASSEMBLY_MAY_IMPORT:
                 continue
@@ -541,7 +541,7 @@ def test_assembly_imports_only_leaf_and_scope_layers():
                 continue
             violations.append(f"  {rel} imports {target}")
     assert not violations, (
-        "assembly/ reached above its layer:\n"
+        "_assembly/ reached above its layer:\n"
         + "\n".join(sorted(violations))
         + "\n\nWHY: "
         + _LAYERING_WHY
@@ -552,7 +552,7 @@ def test_assembly_imports_only_leaf_and_scope_layers():
 
 def test_adapters_and_interceptors_do_not_import_each_other():
     violations: list[str] = []
-    for a, b in (("adapters/", f"{_PKG}.interceptors"), ("interceptors/", f"{_PKG}.adapters")):
+    for a, b in (("_adapters/", f"{_PKG}._interceptors"), ("_interceptors/", f"{_PKG}._adapters")):
         for rel, tree in _modules().items():
             if not rel.startswith(a):
                 continue
@@ -560,35 +560,35 @@ def test_adapters_and_interceptors_do_not_import_each_other():
                 if target == b or target.startswith(b + "."):
                     violations.append(f"  {rel} imports {target}")
     assert not violations, (
-        "adapters/ and interceptors/ are siblings, not a stack:\n"
+        "_adapters/ and _interceptors/ are siblings, not a stack:\n"
         + "\n".join(sorted(violations))
         + "\n\nWHY: they are two independent observers of the same run. A direct\n"
         "edge between them is how one layer ends up owning the other's spans,\n"
         "which is exactly the double-instrumentation mess design §8 exists to\n"
-        "prevent. Anything they need to share belongs in assembly/."
+        "prevent. Anything they need to share belongs in _assembly/."
     )
 
 
 _BELOW_THE_OBSERVERS = ("transport/", "context/")
 
-# Its own reason, not assembly's: _LAYERING_WHY argues from assembly/ being the
+# Its own reason, not assembly's: _LAYERING_WHY argues from _assembly/ being the
 # layer everything depends ON, and a transport/ violation printing that would
 # name a package the violation has nothing to do with.
 _BELOW_THE_OBSERVERS_WHY = (
     "transport/ and context/ sit BELOW the observers. A span reaches the\n"
-    "transport after interceptors/ and adapters/ are done with it, and the\n"
+    "transport after _interceptors/ and _adapters/ are done with it, and the\n"
     "context layer cross-cuts them rather than depending on either, so an edge\n"
     "upward turns the one-way arrow in design §3.1 into a cycle. It also files\n"
     "the shared thing under the package whose behaviour it changes, which is\n"
     "how the exporter's own self-exclusion guard — read by transport/ on every\n"
-    "outbound batch — ended up living inside interceptors/."
+    "outbound batch — ended up living inside _interceptors/."
 )
 
 
 def test_the_layers_below_the_observers_do_not_import_one():
     """design §3.1's arrow, in the two places it used to point backwards.
 
-    `transport/` and `context/` sit BELOW `interceptors/` and `adapters/` —
+    `transport/` and `context/` sit BELOW `_interceptors/` and `_adapters/` —
     a span reaches the transport after the observers are done with it, and the
     context layer cross-cuts them rather than depending on either. Both
     nonetheless imported `interceptors._exclusion`, for the same reason: the
@@ -598,7 +598,7 @@ def test_the_layers_below_the_observers_do_not_import_one():
     being filed the same way.
 
     Scoped to the two packages rather than to every module outside
-    `interceptors/`, because `__init__.py` and `_runtime.py` are the
+    `_interceptors/`, because `__init__.py` and `_runtime.py` are the
     composition root: installing an interceptor is what they are FOR, and a
     rule that forbade it would be a rule about the wrong thing.
     """
@@ -607,7 +607,7 @@ def test_the_layers_below_the_observers_do_not_import_one():
         if not rel.startswith(_BELOW_THE_OBSERVERS):
             continue
         for target in sorted(_imported_modules(rel, tree)):
-            for observer in (f"{_PKG}.interceptors", f"{_PKG}.adapters"):
+            for observer in (f"{_PKG}._interceptors", f"{_PKG}._adapters"):
                 if target == observer or target.startswith(observer + "."):
                     violations.append(f"  {rel} imports {target}")
     assert not violations, (
@@ -622,7 +622,7 @@ def test_the_layers_below_the_observers_do_not_import_one():
     )
 
 
-# semantics/ answers "what does this parsed body mean in gen_ai terms". It reads
+# _semantics/ answers "what does this parsed body mean in gen_ai terms". It reads
 # the protocol layer and writes assembly's closed vocabularies, and that is the
 # whole of it. A positive allowlist for the same reason assembly has one: a new
 # module in the package must force a decision rather than silently widen the
@@ -634,15 +634,15 @@ _SEMANTICS_MAY_IMPORT = frozenset(
         f"{_PKG}._enums",
     }
 )
-_SEMANTICS_MAY_IMPORT_PACKAGES = (f"{_PKG}.assembly", f"{_PKG}.protocol")
+_SEMANTICS_MAY_IMPORT_PACKAGES = (f"{_PKG}._assembly", f"{_PKG}._protocol")
 
 
 def test_semantics_imports_neither_sibling_observer():
     """The rule the package's own docstring asserts, made checkable.
 
-    Before this existed, `semantics/__init__.py` claimed it "imports NEITHER
+    Before this existed, `_semantics/__init__.py` claimed it "imports NEITHER
     sibling" and nothing enforced it — the extraction was a sentence. Adding
-    `from ..interceptors._trackers import _Txn` to `semantics/_grpc.py` — the
+    `from .._interceptors._trackers import _Txn` to `_semantics/_grpc.py` — the
     single edit that destroys the reason the package exists — left every test in
     this file green.
 
@@ -653,15 +653,15 @@ def test_semantics_imports_neither_sibling_observer():
     """
     violations: list[str] = []
     for rel, tree in _modules().items():
-        if not rel.startswith("semantics/"):
+        if not rel.startswith("_semantics/"):
             continue
         for target in sorted(_imported_modules(rel, tree)):
-            if target.startswith(f"{_PKG}.semantics"):
+            if target.startswith(f"{_PKG}._semantics"):
                 continue
             if target in _SEMANTICS_MAY_IMPORT:
                 continue
             # `pkg + ":"` is the pseudo-target `_imported_modules` produces for a
-            # symbol re-exported by a PACKAGE (`from ..assembly import
+            # symbol re-exported by a PACKAGE (`from .._assembly import
             # Limitation`). Allowed here, and only here: that IS assembly's and
             # protocol's declared public surface, which is exactly what a layer
             # below is supposed to consume. The colon form stays opt-in per
@@ -675,11 +675,11 @@ def test_semantics_imports_neither_sibling_observer():
             violations.append(f"{rel} -> {target}")
 
     assert not violations, (
-        f"semantics/ reached outside its layer: {violations}\n\n"
-        "WHY: semantics/ exists so a SECOND byte seam — and eventually a second\n"
+        f"_semantics/ reached outside its layer: {violations}\n\n"
+        "WHY: _semantics/ exists so a SECOND byte seam — and eventually a second\n"
         "language SDK — can reuse the protocol-to-gen_ai mapping without\n"
         "dragging in the interceptor that happens to call it today. One import\n"
-        "of interceptors/ or adapters/ makes the package a private helper of\n"
+        "of _interceptors/ or _adapters/ makes the package a private helper of\n"
         "that caller again, and the extraction was for nothing."
     )
 
@@ -688,22 +688,22 @@ def test_semantics_internal_modules_stay_private():
     public = sorted(
         rel
         for rel in _modules()
-        if rel.startswith("semantics/")
+        if rel.startswith("_semantics/")
         and not rel.rsplit("/", 1)[-1].startswith("_")
-        and rel != "semantics/__init__.py"
+        and rel != "_semantics/__init__.py"
     )
-    assert not public, f"semantics/ modules must stay underscore-private: {public}"
+    assert not public, f"_semantics/ modules must stay underscore-private: {public}"
 
 
 def test_semantics_public_surface_is_declared_and_resolvable():
     """The move promoted four module-private names onto a public package.
 
-    `from wardex_sdk.semantics import build_grpc_fields` is now an import path a
+    `from wardex_sdk._semantics import build_grpc_fields` is now an import path a
     user can pin, on a package already published to PyPI. That surface gets the
     same two rules assembly's does, rather than being de-facto conforming and
     de-jure unenforced.
     """
-    import wardex_sdk.semantics as semantics
+    import wardex_sdk._semantics as semantics
 
     assert semantics.__all__, "semantics must declare __all__ — it is the stable surface"
     assert list(semantics.__all__) == sorted(semantics.__all__), "keep __all__ sorted"
@@ -715,21 +715,21 @@ def test_assembly_internal_modules_stay_private():
     public = sorted(
         rel
         for rel in _modules()
-        if rel.startswith("assembly/")
+        if rel.startswith("_assembly/")
         and not rel.rsplit("/", 1)[-1].startswith("_")
-        and rel != "assembly/__init__.py"
+        and rel != "_assembly/__init__.py"
     )
     assert not public, (
-        f"assembly/ modules must stay underscore-private: {public}\n\n"
+        f"_assembly/ modules must stay underscore-private: {public}\n\n"
         "WHY: assembly.__all__ is a semver-stable boundary (design §3.1). A\n"
-        "module without a leading underscore invites `from wardex_sdk.assembly\n"
+        "module without a leading underscore invites `from wardex_sdk._assembly\n"
         "import somemodule`, which freezes an internal layout we intend to keep\n"
         "moving as more of the SDK routes through this package."
     )
 
 
 def test_assembly_public_surface_is_declared_and_resolvable():
-    import wardex_sdk.assembly as assembly
+    import wardex_sdk._assembly as assembly
 
     assert assembly.__all__, "assembly must declare __all__ — it is the stable surface"
     assert list(assembly.__all__) == sorted(assembly.__all__), "keep __all__ sorted"
@@ -738,7 +738,7 @@ def test_assembly_public_surface_is_declared_and_resolvable():
 
 
 # --------------------------------------------------------------------------
-# C-S1 — adapters/ cannot name the span machinery
+# C-S1 — _adapters/ cannot name the span machinery
 # --------------------------------------------------------------------------
 
 _FORBIDDEN_IN_ADAPTERS = frozenset(
@@ -749,8 +749,8 @@ _FORBIDDEN_IN_ADAPTERS = frozenset(
 # weight. A symbol-name check is defeated by one line — `from .. import _types`
 # binds no forbidden NAME, and `_types` is where InternalSpan, SpanContext,
 # TraceId and SpanId all live, one attribute access away. That spelling is the
-# house form here (`adapters/_assembler.py:17`, `interceptors/_mcp_stdio.py:20`,
-# `interceptors/_trackers.py:14`), so it is not a contrived bypass. `_hub` was
+# house form here (`_adapters/_assembler.py:17`, `_interceptors/_mcp_stdio.py:20`,
+# `_interceptors/_trackers.py:14`), so it is not a contrived bypass. `_hub` was
 # caught before only by the accident of being spelled like a symbol.
 #
 # `wardex_sdk` itself is on the list: `import wardex_sdk` hands an adapter the
@@ -776,17 +776,17 @@ _FORBIDDEN_MODULES_IN_ADAPTERS = frozenset(
 
 # Pre-assembly debt. Each entry is the set of forbidden names and module targets
 # that file still reaches today; the sets may only SHRINK. The adapter rewrite
-# empties it, when the Anthropic adapter moves onto AdapterContext + assembly/
+# empties it, when the Anthropic adapter moves onto AdapterContext + _assembly/
 # and this dict is deleted along with the budget machinery.
 _CS1_DEBT: dict[str, frozenset[str]] = {
-    "adapters/__init__.py": frozenset({"Client", f"{_PKG}._client"}),
-    "adapters/_base.py": frozenset({"Client", f"{_PKG}._client"}),
+    "_adapters/__init__.py": frozenset({"Client", f"{_PKG}._client"}),
+    "_adapters/_base.py": frozenset({"Client", f"{_PKG}._client"}),
     # `_runtime` is declared, not tolerated by omission: the registry reaches
     # the runtime only to find its own owner (`runtime().adapters`), which is
-    # the one edge the ownership change requires and the only one in `adapters/`.
+    # the one edge the ownership change requires and the only one in `_adapters/`.
     # Written down so the NEXT adapter module that reaches `_runtime` — and with
     # it `runtime().client` — is an explicit decision instead of a silent one.
-    "adapters/_registry.py": frozenset({"Client", f"{_PKG}._client", f"{_PKG}._runtime"}),
+    "_adapters/_registry.py": frozenset({"Client", f"{_PKG}._client", f"{_PKG}._runtime"}),
     # The unit registry shrank this by one: `wardex_sdk._tracing` is gone, because the
     # in-process tool wrapper no longer opens a MANUAL span through the public
     # `trace()` API. It opens a CALL unit instead, so the tool span is a child of
@@ -795,7 +795,7 @@ _CS1_DEBT: dict[str, frozenset[str]] = {
     # not from whatever the ambient scope happened to hold when `trace()` ran.
     # What is left is the `Client` type (an install() parameter annotation) and
     # `_types` for the typed blocks.
-    "adapters/_anthropic_agent_sdk.py": frozenset({"Client", f"{_PKG}._client", f"{_PKG}._types"}),
+    "_adapters/_anthropic_agent_sdk.py": frozenset({"Client", f"{_PKG}._client", f"{_PKG}._types"}),
     # Shrank by four when the assembler stopped minting ids and reading the
     # scope: `TraceId`, `SpanId`, `_hub` and `wardex_sdk._hub` are gone, because
     # `assembly.resolve_parentage()`/`child_of()` do both.
@@ -804,7 +804,7 @@ _CS1_DEBT: dict[str, frozenset[str]] = {
     # `assembly.SpanDraft` does both and `draft.context` IS the anchor. What is
     # left is the `wardex_sdk` package object (`_wardex_native` for the limits
     # defaults) and `_types` for the typed attribute blocks.
-    "adapters/_assembler.py": frozenset(
+    "_adapters/_assembler.py": frozenset(
         {
             _PKG,
             f"{_PKG}._types",
@@ -816,7 +816,7 @@ _CS1_DEBT: dict[str, frozenset[str]] = {
 def test_adapters_do_not_import_span_machinery():
     violations: list[str] = []
     for rel, tree in _modules().items():
-        if not rel.startswith("adapters/"):
+        if not rel.startswith("_adapters/"):
             continue
         used = _imported_names(tree) & _FORBIDDEN_IN_ADAPTERS
         used |= _imported_modules(rel, tree) & _FORBIDDEN_MODULES_IN_ADAPTERS
@@ -832,7 +832,7 @@ def test_adapters_do_not_import_span_machinery():
         "coming from in-process context propagation. Forbidding the IMPORT is\n"
         "stronger than auditing call sites: with the type absent from the\n"
         "module's namespace the bypass has no name to call (design I5, §10.4).\n"
-        "Adapters get parentage by asking wardex_sdk.assembly for it."
+        "Adapters get parentage by asking wardex_sdk._assembly for it."
     )
 
 
@@ -842,8 +842,8 @@ def test_adapters_do_not_import_span_machinery():
 
 # C-S2 has no budget any more. All six parentage sites route
 # through `assembly.resolve_parentage()`, which drove the five pre-existing
-# `TraceId.generate()` calls (`_tracing.py` 1, `adapters/_assembler.py` 1,
-# `interceptors/_mcp_stdio.py` 1, `interceptors/_seam.py` 2) to zero. Per this
+# `TraceId.generate()` calls (`_tracing.py` 1, `_adapters/_assembler.py` 1,
+# `_interceptors/_mcp_stdio.py` 1, `_interceptors/_seam.py` 2) to zero. Per this
 # file's header that is the moment the budget is DELETED and the rule becomes
 # hard: I1 is now literally true — one call site in the whole SDK — and the
 # assertion below says so directly instead of tolerating a count.
@@ -851,9 +851,9 @@ def test_adapters_do_not_import_span_machinery():
 # C-S3 has no budget any more either. All six emit sites route
 # through `assembly.SpanDraft`, which drove the four pre-existing
 # `InternalSpan(...)` construction sites (`_tracing.py` 1,
-# `adapters/_assembler.py` 4, `interceptors/_mcp_stdio.py` 1,
-# `interceptors/_seam.py` 2 — nine calls across four files) to zero, and took
-# every `parent_span_id=` keyword outside `assembly/` with them: a draft is
+# `_adapters/_assembler.py` 4, `_interceptors/_mcp_stdio.py` 1,
+# `_interceptors/_seam.py` 2 — nine calls across four files) to zero, and took
+# every `parent_span_id=` keyword outside `_assembly/` with them: a draft is
 # built FROM a `Parentage` and fills the field itself. Per this file's header
 # that is the moment the budget is DELETED and the rule becomes hard.
 
@@ -861,9 +861,9 @@ def test_adapters_do_not_import_span_machinery():
 def test_trace_id_is_generated_only_in_parentage():
     """C-S2, now a HARD RULE: exactly one TraceId.generate() in the whole SDK."""
     everywhere = _tally(_calls_traceid_generate)
-    assert everywhere == {"assembly/_parentage.py": 1}, (
+    assert everywhere == {"_assembly/_parentage.py": 1}, (
         f"C-S2: TraceId.generate() call sites are {everywhere}, expected exactly\n"
-        "{'assembly/_parentage.py': 1}.\n\n"
+        "{'_assembly/_parentage.py': 1}.\n\n"
         "WHY: a new trace id is the statement 'this work has no parent'. One\n"
         "call site is what makes that statement auditable — and it is why the\n"
         "'started a new trace' case can be told apart from the 'expected a\n"
@@ -879,9 +879,9 @@ def test_trace_id_is_generated_only_in_parentage():
 def test_internal_span_is_constructed_in_one_place():
     """C-S3, now a HARD RULE: exactly one InternalSpan(...) in the whole SDK."""
     everywhere = _tally(_constructs_internal_span)
-    assert everywhere == {"assembly/_builder.py": 1}, (
+    assert everywhere == {"_assembly/_builder.py": 1}, (
         f"C-S3: InternalSpan is constructed at {everywhere}, expected exactly\n"
-        "{'assembly/_builder.py': 1}.\n\n"
+        "{'_assembly/_builder.py': 1}.\n\n"
         "WHY: one constructor is what keeps every span carrying correlation,\n"
         "capture_sources and capture_integrity. The two execute_tool variants\n"
         "this SDK shipped differed precisely because they were built in two\n"
@@ -895,23 +895,23 @@ def test_internal_span_is_constructed_in_one_place():
 
 
 def test_parent_span_id_is_passed_only_from_assembly():
-    """C-S3, second half, also HARD: `parent_span_id=` is assembly/'s keyword.
+    """C-S3, second half, also HARD: `parent_span_id=` is _assembly/'s keyword.
 
-    Inside assembly/ it is unrestricted — that is where the edge is decided.
+    Inside _assembly/ it is unrestricted — that is where the edge is decided.
     """
     outside = {
-        k: v for k, v in _tally(_passes_parent_span_id).items() if not k.startswith("assembly/")
+        k: v for k, v in _tally(_passes_parent_span_id).items() if not k.startswith("_assembly/")
     }
     assert outside == {}, (
-        f"C-S3: parent_span_id= is passed outside assembly/ at {outside}.\n\n"
-        "WHY: a parent edge written outside assembly/ is an edge nobody\n"
+        f"C-S3: parent_span_id= is passed outside _assembly/ at {outside}.\n\n"
+        "WHY: a parent edge written outside _assembly/ is an edge nobody\n"
         "resolved: no Evidence, no confidence, no limitation marker when it was\n"
         "a guess (design I1, I4). Ask assembly.resolve_parentage() for a\n"
         "Parentage and hand it to SpanDraft, which fills the field itself."
     )
 
 
-# Hand-built `Ambient(...)` outside assembly/. Routing the six sites through
+# Hand-built `Ambient(...)` outside _assembly/. Routing the six sites through
 # `resolve_parentage()` opened this surface, and it needs the same ratchet as
 # the ones that routing closed: `latch_ambient()`
 # reads the scope, and a hand-built Ambient is the one way to feed
@@ -919,7 +919,7 @@ def test_parent_span_id_is_passed_only_from_assembly():
 # `Ambient(SpanContext(trace_id=TraceId(run_id[:16]), ...), ...)` is a framework
 # id becoming a parent, which is I2 exactly. C-S2 does not see it (no
 # `TraceId.generate()`), C-S3 does not see it (the `parent_span_id=` still comes
-# off the returned Parentage), and C-S1 covers only adapters/.
+# off the returned Parentage), and C-S1 covers only _adapters/.
 #
 # The one entry is legitimate and is why this is a budget rather than a hard
 # rule: `_seam._latched` wraps what `_trackers.py` latched at REQUEST time, and
@@ -927,15 +927,15 @@ def test_parent_span_id_is_passed_only_from_assembly():
 # would read the wrong scope. Widening that latch to a real Ambient belongs to
 # the seam decomposition (design §3.3), which empties this dict.
 _AMBIENT_BUDGET = {
-    "interceptors/_seam.py": 1,
+    "_interceptors/_seam.py": 1,
 }
 
 
 def test_ambient_is_latched_not_hand_built():
     _assert_within_budget(
-        {k: v for k, v in _tally(_constructs_ambient).items() if not k.startswith("assembly/")},
+        {k: v for k, v in _tally(_constructs_ambient).items() if not k.startswith("_assembly/")},
         _AMBIENT_BUDGET,
-        "C-S2 (Ambient constructed outside assembly/)",
+        "C-S2 (Ambient constructed outside _assembly/)",
         "an Ambient is a snapshot of the wardex scope. Building one by hand is\n"
         "the only remaining way to hand resolve_parentage a parent the scope\n"
         "never held — a framework id dressed as a SpanContext (design I2).\n"
@@ -957,7 +957,7 @@ def test_the_observed_edge_is_told_whether_its_parent_died():
     round — so the fact arrives as a declared argument, the same shape
     `degraded` has. A defaulted argument is exactly the kind of mechanism that
     goes quietly dead when a fourth call site is written, so the rule is
-    mechanical rather than a docstring: outside `assembly/`, there is no
+    mechanical rather than a docstring: outside `_assembly/`, there is no
     `resolve_observed(...)` that has not been told.
 
     Call `assembly.parent_is_closed_unit(parent)` on the task that ISSUES the
@@ -966,7 +966,7 @@ def test_the_observed_edge_is_told_whether_its_parent_died():
     everywhere = {
         k: v
         for k, v in _tally(_resolves_observed_without_asking).items()
-        if not k.startswith("assembly/")
+        if not k.startswith("_assembly/")
     }
     assert everywhere == {}, (
         f"resolve_observed is called without `parent_closed=` at {everywhere}.\n\n"
@@ -990,17 +990,17 @@ def test_the_observed_edge_is_told_whether_its_parent_died():
 #   * `_tracing.py` — a HAND-WRITTEN span. It latches the live scope itself at
 #     the instant it is called; there is no per-connection table between the
 #     latch and the resolve, so nothing can have evicted anything.
-#   * `interceptors/_mcp_stdio.py` — a subprocess pipe. Its pending table is
+#   * `_interceptors/_mcp_stdio.py` — a subprocess pipe. Its pending table is
 #     keyed by JSON-RPC id and capped separately, and a dropped pending entry
 #     produces no span at all rather than an unparented one.
-#   * `interceptors/_seam.py` — `_build_ws_span`. A WS session inherits its
+#   * `_interceptors/_seam.py` — `_build_ws_span`. A WS session inherits its
 #     parent from the upgrade transaction, and no cap sits between the two.
 # The h2 emit path (`_build_span`, same file) is the one that CAN, which is why
-# `interceptors/_seam.py` appears here with a count of 1 and not 2.
+# `_interceptors/_seam.py` appears here with a count of 1 and not 2.
 _OBSERVED_WITHOUT_EVICTION = {
     "_tracing.py": 1,
-    "interceptors/_mcp_stdio.py": 1,
-    "interceptors/_seam.py": 1,
+    "_interceptors/_mcp_stdio.py": 1,
+    "_interceptors/_seam.py": 1,
 }
 
 
@@ -1008,7 +1008,7 @@ def test_an_emit_path_that_can_lose_a_latch_entry_declares_it():
     everywhere = {
         k: v
         for k, v in _tally(_resolves_observed_without_declaring_eviction).items()
-        if not k.startswith("assembly/")
+        if not k.startswith("_assembly/")
     }
     assert everywhere == _OBSERVED_WITHOUT_EVICTION, (
         f"resolve_observed is called without `parent_evicted=` at {everywhere},\n"
@@ -1018,7 +1018,7 @@ def test_an_emit_path_that_can_lose_a_latch_entry_declares_it():
         "the argument ships that span as an honest trace root at confidence\n"
         "1.0 — wardex's own defect presented as a fact about the traffic, and\n"
         "under the default capture mode the gate drops it before anything can\n"
-        "say otherwise (interceptors/_trackers.py, the h2 stream latch).\n"
+        "say otherwise (_interceptors/_trackers.py, the h2 stream latch).\n"
         "If your site has no such table, add it above WITH THE REASON. If it\n"
         "has one, carry the eviction beside the parent and declare it here."
     )
@@ -1039,11 +1039,11 @@ def test_an_emit_path_that_can_lose_a_latch_entry_declares_it():
 def test_the_capture_mode_is_read_in_one_place():
     """The configured policy is consulted only by the module that owns it."""
     everywhere = _tally(_reads_capture_mode)
-    assert everywhere == {"assembly/_policy.py": 1}, (
+    assert everywhere == {"_assembly/_policy.py": 1}, (
         f"capture_mode is read at {everywhere}, expected exactly\n"
-        "{'assembly/_policy.py': 1}.\n\n"
+        "{'_assembly/_policy.py': 1}.\n\n"
         "WHY: a second reader is a second policy. That is not hypothetical —\n"
-        "`interceptors/_socket.py` overrode the gate without ever reading the\n"
+        "`_interceptors/_socket.py` overrode the gate without ever reading the\n"
         "mode, so `capture_mode=ALL` did nothing on the plaintext seam and a\n"
         "plaintext request inside a live wardex span was dropped while the same\n"
         "bytes over TLS were kept. Neither was decided by anyone; both are what\n"
@@ -1055,9 +1055,9 @@ def test_the_capture_mode_is_read_in_one_place():
 
 def test_the_capture_predicate_has_one_implementation_and_one_composition():
     everywhere = _tally(_defines_a_capture_predicate)
-    assert everywhere == {"assembly/_policy.py": 1, "interceptors/_seam.py": 1}, (
+    assert everywhere == {"_assembly/_policy.py": 1, "_interceptors/_seam.py": 1}, (
         f"capture predicates are defined at {everywhere}, expected exactly\n"
-        "{'assembly/_policy.py': 1, 'interceptors/_seam.py': 1}.\n\n"
+        "{'_assembly/_policy.py': 1, '_interceptors/_seam.py': 1}.\n\n"
         "WHY: those two are different jobs and the rule names both so that\n"
         "neither can quietly become the other. `assembly._policy.should_capture`\n"
         "IS the policy. `ByteSeamInterceptor._should_capture` composes it with\n"
@@ -1073,7 +1073,7 @@ def test_the_capture_predicate_has_one_implementation_and_one_composition():
 # C-S4 — swallow, but never in silence
 # --------------------------------------------------------------------------
 
-# design §10.4 scopes C-S4 to adapters/ and interceptors/; assembly/ is held to
+# design §10.4 scopes C-S4 to _adapters/ and _interceptors/; _assembly/ is held to
 # zero from day one. (`_runtime.py`, `context/_inject.py`, `context/_asgi.py`,
 # `context/_propagate.py` and `context/_wsgi.py` also swallow silently today and
 # are out of the rule's declared scope, so they are not counted below.)
@@ -1084,7 +1084,7 @@ def test_the_capture_predicate_has_one_implementation_and_one_composition():
 # the predicate stopped being blind. Reading it as licence to raise a number is
 # the misuse this file's header forbids — from here they only go down.
 _CS4_BUDGET = {
-    "adapters/__init__.py": 1,
+    "_adapters/__init__.py": 1,
     # 14 -> 2. Twelve of them were the `try/except Exception: pass`
     # pairs around every tee callback, every patched entry point and the tool
     # wrapper; they are `guard()` blocks now, so the same swallow is counted and
@@ -1093,18 +1093,18 @@ _CS4_BUDGET = {
     # `import claude_agent_sdk` (the package is not installed — the answer to the
     # question install() asks) and `asyncio.current_task()` outside a loop, which
     # is how the stdlib spells "the carrier here is the thread".
-    "adapters/_anthropic_agent_sdk.py": 2,
-    "adapters/_assembler.py": 2,
+    "_adapters/_anthropic_agent_sdk.py": 2,
+    "_adapters/_assembler.py": 2,
     # Two, and the same justification as the adapter above: both are ABSENCES
     # rather than failures. `_import_pregel` asks "is langgraph installed" and
     # `_import_toolnode` asks "is langgraph-prebuilt installed" — a separately
     # versioned distribution that can be missing on its own — and an ImportError
     # is the ANSWER to each, returned as `None` and branched on by `install()`.
     # Neither can be a module-level import: that would make the decline path
-    # dead, surfacing the error on `adapters/__init__.py`'s stderr line instead
+    # dead, surfacing the error on `_adapters/__init__.py`'s stderr line instead
     # of declining silently.
-    "adapters/_langgraph.py": 2,
-    "interceptors/_conn_timing.py": 10,
+    "_adapters/_langgraph.py": 2,
+    "_interceptors/_conn_timing.py": 10,
     # 13 -> 7. The six that went are the ones the patch mechanism made
     # unnecessary: two `except Exception: self._orig_* = None` around install,
     # two `except Exception: pass` around the uninstall `setattr`s (all four
@@ -1113,22 +1113,22 @@ _CS4_BUDGET = {
     # now `guard()` blocks. Lowered in the same commit rather than left stale:
     # `_assert_within_budget` only fails on `actual > budget`, so a number left
     # high is a free slot for a brand-new silent swallow that no test notices.
-    "interceptors/_mcp_stdio.py": 7,
+    "_interceptors/_mcp_stdio.py": 7,
     # 5 -> 4, and the line below is where the fifth went. Extracting
-    # `build_grpc_fields` into `semantics/` took its `except Exception:` with it.
+    # `build_grpc_fields` into `_semantics/` took its `except Exception:` with it.
     # Leaving this at 5 would have handed the seam a free slot for a BRAND NEW
     # silent swallow that no test would notice, because `_assert_within_budget`
     # only fails on `actual > budget` — a stale-high number passes in silence.
     # The pair of edits records a transfer; a lone decrement would be a discount
     # for work nobody did.
-    "interceptors/_seam.py": 4,
-    "interceptors/_socket.py": 6,
-    "interceptors/_ssl.py": 6,
-    "semantics/_grpc.py": 1,
+    "_interceptors/_seam.py": 4,
+    "_interceptors/_socket.py": 6,
+    "_interceptors/_ssl.py": 6,
+    "_semantics/_grpc.py": 1,
 }
 
 
-# C-S4's second spelling, and the only place `assembly/` is allowed one. A
+# C-S4's second spelling, and the only place `_assembly/` is allowed one. A
 # `contextlib.suppress` is a silent swallow wherever it appears — it cannot
 # report, for the reason `_silent_swallow_node` gives — so the ones that are
 # nonetheless CORRECT are listed here by name instead of being exempted by
@@ -1147,7 +1147,7 @@ _ASSEMBLY_SUPPRESS: dict[str, tuple[str, ...]] = {
     # the RuntimeError is the answer rather than a failure, and nothing is being
     # hidden from anyone. A counter here would fire on every synchronous
     # `activate()` and be noise, not evidence.
-    "assembly/_units.py": ("RuntimeError",),
+    "_assembly/_units.py": ("RuntimeError",),
 }
 
 
@@ -1175,9 +1175,9 @@ def _suppressed_exceptions(under: tuple[str, ...]) -> dict[str, tuple[str, ...]]
 
 
 def test_no_silent_swallow_in_assembly():
-    sanctioned = _suppressed_exceptions(under=("assembly/",))
+    sanctioned = _suppressed_exceptions(under=("_assembly/",))
     assert sanctioned == _ASSEMBLY_SUPPRESS, (
-        f"the `contextlib.suppress` blocks in assembly/ are {sanctioned},\n"
+        f"the `contextlib.suppress` blocks in _assembly/ are {sanctioned},\n"
         f"and the recorded set is {_ASSEMBLY_SUPPRESS}.\n\n"
         "WHY: `suppress` is the one silent-swallow spelling that can never\n"
         "report itself — its body runs on the SUCCESS path, so a counter written\n"
@@ -1187,10 +1187,10 @@ def test_no_silent_swallow_in_assembly():
         "here with the reason; if it is not, use assembly._diag.guard()."
     )
 
-    inside = _tally(_is_silent_swallow, under=("assembly/",))
+    inside = _tally(_is_silent_swallow, under=("_assembly/",))
     assert inside == {rel: len(v) for rel, v in _ASSEMBLY_SUPPRESS.items()}, (
-        f"C-S4: silent swallow inside assembly/ at {inside}.\n\n"
-        "WHY: assembly/ owns the ONE authorized swallow — assembly._diag.guard(),\n"
+        f"C-S4: silent swallow inside _assembly/ at {inside}.\n\n"
+        "WHY: _assembly/ owns the ONE authorized swallow — assembly._diag.guard(),\n"
         "which always counts and logs with a traceback under config.debug. A\n"
         "bare `except Exception: pass` in the module that defines the rule turns\n"
         "an SDK bug into 'wardex just doesn't capture this' with no evidence\n"
@@ -1201,15 +1201,15 @@ def test_no_silent_swallow_in_assembly():
 
 
 def test_silent_swallows_do_not_spread():
-    # `semantics/` joined the scope the moment the package existed. A rule whose
+    # `_semantics/` joined the scope the moment the package existed. A rule whose
     # scope is a list of directories goes blind the instant a refactor creates a
     # new one, and the failure is invisible: the suite gets GREENER, because the
     # tallied total drops by whatever moved out of scope. That is the same shape
     # as raising a budget, arrived at without anyone typing a number.
     _assert_within_budget(
-        _tally(_is_silent_swallow, under=("adapters/", "interceptors/", "semantics/")),
+        _tally(_is_silent_swallow, under=("_adapters/", "_interceptors/", "_semantics/")),
         _CS4_BUDGET,
-        "C-S4 (silent swallow in adapters/ or interceptors/)",
+        "C-S4 (silent swallow in _adapters/ or _interceptors/)",
         "wardex must not raise into the host, but a swallow that leaves no\n"
         "counter and no debug traceback is indistinguishable from wardex not\n"
         "being installed. Wrap the block in assembly._diag.guard(where=...)\n"
@@ -1222,27 +1222,31 @@ def test_silent_swallows_do_not_spread():
 # --------------------------------------------------------------------------
 
 _CS5_BUDGET = {
-    "__init__.py": 1,
+    # Was `__init__.py: 1` until `capture_state_snapshot`'s body moved WHOLE
+    # into `_snapshot_api.py` so the package root stops importing `_assembly`.
+    # A relocation, not a new occurrence — the total is unchanged, the same
+    # shape as `_adapters/_sink.py` below.
+    "_snapshot_api.py": 1,
     "_tracing.py": 1,
-    # 4 -> 3 + 1: the assembler's `_ClientSink` moved WHOLE into `adapters/_sink.py`.
+    # 4 -> 3 + 1: the assembler's `_ClientSink` moved WHOLE into `_adapters/_sink.py`.
     # A relocation, not a new occurrence — the total is unchanged and the
     # assembler's own budget ratchets down, which is the only direction this
     # table allows. The new entry is the last one that will need lowering: this
-    # rule's stated destination is `assembly/_emit.py`, and the sink standing
+    # rule's stated destination is `_assembly/_emit.py`, and the sink standing
     # alone in a module of its own is what lets it arrive there whole. When it
     # does, the entry does not shrink — it disappears.
-    "adapters/_assembler.py": 3,
-    "adapters/_sink.py": 1,
-    "interceptors/_mcp_stdio.py": 2,
-    "interceptors/_seam.py": 2,
+    "_adapters/_assembler.py": 3,
+    "_adapters/_sink.py": 1,
+    "_interceptors/_mcp_stdio.py": 2,
+    "_interceptors/_seam.py": 2,
 }
 
 
 def test_sink_is_not_called_from_assembly_yet():
-    inside = _tally(_calls_sink, under=("assembly/",))
+    inside = _tally(_calls_sink, under=("_assembly/",))
     assert inside == {}, (
-        f"C-S5: assembly/ calls the client sink at {inside}. When it does, it is\n"
-        "from assembly/_emit.py and nowhere else.\n\n"
+        f"C-S5: _assembly/ calls the client sink at {inside}. When it does, it is\n"
+        "from _assembly/_emit.py and nowhere else.\n\n"
         "WHY: one sink is where the capture-mode gate, the limitation markers\n"
         "and 'never hold a wardex lock while emitting' (I11) can be enforced\n"
         "once instead of per caller."
@@ -1250,7 +1254,7 @@ def test_sink_is_not_called_from_assembly_yet():
     _assert_within_budget(
         _tally(_calls_sink),
         _CS5_BUDGET,
-        "C-S5 (capture_span/capture_snapshot outside assembly/_emit.py)",
+        "C-S5 (capture_span/capture_snapshot outside _assembly/_emit.py)",
         "every direct sink call is a span that skipped the gate and the shared\n"
         "policy, and a place where capture_span can be reached while holding an\n"
         "SDK lock — the reentrancy hazard I11 names.",
@@ -1760,7 +1764,7 @@ def test_the_degraded_draft_answers_every_verb_the_real_one_does():
       * `manual` / `transport` — constructors, not verbs. Nothing holding a
         degraded draft calls them; they are how a real one is born.
     """
-    from wardex_sdk.assembly._builder import NULL_DRAFT, IntegrityBuilder, SpanDraft
+    from wardex_sdk._assembly._builder import NULL_DRAFT, IntegrityBuilder, SpanDraft
 
     null = _public_names(type(NULL_DRAFT))
     excluded = {"finish", "manual", "transport"}
@@ -1770,7 +1774,7 @@ def test_the_degraded_draft_answers_every_verb_the_real_one_does():
         f"NULL_DRAFT cannot answer {sorted(missing)}, which SpanDraft can. An\n"
         "adapter handed a degraded scope keeps describing it — that is the point\n"
         "of not making it branch — so every one of those calls has to land\n"
-        "somewhere that cannot fail. Add the no-op to assembly/_builder.py."
+        "somewhere that cannot fail. Add the no-op to _assembly/_builder.py."
     )
     # Asked of what `.integrity` RETURNS, not of the null draft's own class.
     # `_NullDraft` answers itself there, which is an implementation choice — the
@@ -1842,7 +1846,7 @@ def _bypass_source(header: str) -> str:
 @pytest.mark.parametrize("spelling", sorted(_BYPASS_SPELLINGS))
 def test_every_spelling_of_the_span_machinery_bypass_is_seen(spelling):
     """C-S2/C-S3: reaching the type counts, however the reach is written."""
-    rel = "adapters/_probe.py"
+    rel = "_adapters/_probe.py"
     tree = _parse(_bypass_source(_BYPASS_SPELLINGS[spelling]))
 
     traces = [n for n in ast.walk(tree) if _calls_traceid_generate(rel, tree)(n)]
@@ -1857,7 +1861,7 @@ def test_every_spelling_of_the_span_machinery_bypass_is_seen(spelling):
 )
 def test_c_s1_sees_a_module_import_not_only_a_symbol_import(spelling):
     """C-S1: `from .. import _types` is the bypass, and it names no symbol."""
-    rel = "adapters/_probe.py"
+    rel = "_adapters/_probe.py"
     tree = _parse(_bypass_source(_BYPASS_SPELLINGS[spelling]))
 
     named = _imported_names(tree) & _FORBIDDEN_IN_ADAPTERS
@@ -1958,14 +1962,14 @@ def test_c_s4_does_not_flag_a_with_that_swallows_nothing(source):
 @pytest.mark.parametrize(
     "call",
     [
-        'importlib.import_module("wardex_sdk.interceptors._seam")',
-        '__import__("wardex_sdk.adapters._assembler")',
+        'importlib.import_module("wardex_sdk._interceptors._seam")',
+        '__import__("wardex_sdk._adapters._assembler")',
     ],
 )
 def test_dynamic_imports_are_resolved_like_static_ones(call):
     tree = _parse(f"import importlib\n\n_m = {call}\n")
 
-    found = _imported_modules("assembly/_probe.py", tree)
+    found = _imported_modules("_assembly/_probe.py", tree)
 
     assert any(
         t.startswith(f"{_PKG}.") and "interceptors" in t or "adapters" in t for t in found
@@ -1975,14 +1979,14 @@ def test_dynamic_imports_are_resolved_like_static_ones(call):
 def test_a_non_literal_dynamic_import_is_reported_as_unauditable():
     tree = _parse('import importlib\n\n_m = importlib.import_module("wardex_sdk." + name)\n')
 
-    assert "<dynamic>" in _imported_modules("assembly/_probe.py", tree)
+    assert "<dynamic>" in _imported_modules("_assembly/_probe.py", tree)
 
 
 def test_a_re_exported_symbol_from_a_package_is_not_invisible():
-    """`from .. import trace` names no module, and `_tracing.py` is above assembly/."""
+    """`from .. import trace` names no module, and `_tracing.py` is above _assembly/."""
     tree = _parse("from .. import capture_state_snapshot, trace\n")
 
-    found = _imported_modules("assembly/_probe.py", tree)
+    found = _imported_modules("_assembly/_probe.py", tree)
 
     assert f"{_PKG}:trace" in found
     assert f"{_PKG}:capture_state_snapshot" in found

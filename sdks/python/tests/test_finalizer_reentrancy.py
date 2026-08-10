@@ -50,10 +50,10 @@ from wardex_sdk import _worker
 from wardex_sdk._client import Client
 from wardex_sdk._config import BackendConfig, BatchingPolicy, WardexConfig
 from wardex_sdk._enums import SpanKind
+from wardex_sdk._interceptors._close_hook import CloseRegistry, close_registry
 from wardex_sdk._limits import CaptureLimits
 from wardex_sdk._types import InternalEnvelope, InternalSpan, SpanContext, SpanId, TraceId
 from wardex_sdk._worker import BatchWorker
-from wardex_sdk.interceptors._close_hook import CloseRegistry, close_registry
 from wardex_sdk.transport._base import Transport
 
 PROBE_TIMEOUT = 5.0

@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from wardex_sdk.interceptors._seam import _ConnectionState
-from wardex_sdk.interceptors._socket import _H2_PREFACE, RawSocketInterceptor
-from wardex_sdk.interceptors._trackers import _Http1Tracker, _Http2Tracker
+from wardex_sdk._interceptors._seam import _ConnectionState
+from wardex_sdk._interceptors._socket import _H2_PREFACE, RawSocketInterceptor
+from wardex_sdk._interceptors._trackers import _Http1Tracker, _Http2Tracker
 
 
 def _st() -> _ConnectionState:

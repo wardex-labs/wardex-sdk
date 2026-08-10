@@ -20,7 +20,7 @@ def _no_core() -> RuntimeError:
     They cannot answer with a value. The core owns the limit table -- that is
     the whole point of this module's docstring -- so a Python-side fallback
     table would be a second declaration site and would drift, which is exactly
-    what `test_limits.py` and `assembly/_units.py` forbid. Raising something
+    what `test_limits.py` and `_assembly/_units.py` forbid. Raising something
     that names the wheel is the only honest answer, and it is strictly better
     than what this module did before degraded mode existed, which was to make
     `import wardex_sdk` itself raise.

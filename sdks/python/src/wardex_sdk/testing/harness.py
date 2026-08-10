@@ -7,10 +7,10 @@ and the split is the same one the two adapter suites arrived at independently �
 the harness is the expensive part and every file needs it, while the claims are
 what a reader comes for.
 
-**Spans are read through `Node`, never asserted on directly.** A `Node` is one
+**Spans are read through `SpanNode`, never asserted on directly.** A `SpanNode` is one
 shipped span reduced to what a causal claim is made of: its name, its own id,
 its parent's id, its trace, and the provenance of the edge. That reduction is
-not tidying — it is what makes `collapse()` possible, and `collapse()` is what
+not tidying — it is what makes `collapse_onto_root()` possible, and `collapse_onto_root()` is what
 lets the suite prove, for every adapter wired into it, that its own tree check
 would catch a total collapse. A check nobody has watched fail is not a check.
 """
@@ -23,12 +23,12 @@ from dataclasses import dataclass
 from typing import Any
 
 from .. import _hub
-from ..adapters._base import AdapterInterface
-from ..adapters._context import AdapterContext
-from ..adapters._registry import AdapterRegistry
-from ..assembly import Limitation, counters
-from ..assembly._diag import reset_reports_for_test
-from ..assembly._units import _ambient_unit
+from .._adapters._base import AdapterInterface
+from .._adapters._context import AdapterContext
+from .._adapters._registry import AdapterRegistry
+from .._assembly import Limitation, counters
+from .._assembly._diag import reset_reports_for_test
+from .._assembly._units import _ambient_unit
 
 
 class RecordingClient:
@@ -52,7 +52,7 @@ class RecordingClient:
 
 
 @dataclass
-class Live:
+class LiveAdapter:
     """An adapter, the context it was given, and the client it emits into.
 
     `ctx` is the registry's own context object rather than anything read off
@@ -60,7 +60,7 @@ class Live:
     and a harness that reached for `adapter._ctx` would work for the two
     adapters in this repository and for no others.
 
-    A `Live` with `ctx=None` and `registry=None` is the BARE shape — an adapter
+    A `LiveAdapter` with `ctx=None` and `registry=None` is the BARE shape — an adapter
     that was never installed. A subject's workload is handed one of those to
     prove the zero point, so every workload has to tolerate it by opening no
     wardex spans of its own when `ctx` is None.
@@ -93,7 +93,7 @@ def clean_state() -> Iterator[None]:
     sees its line.
 
     Nesting is harmless — every reset is idempotent and the ambient token is
-    per-call — so `installed()` may own one and a caller may own another
+    per-call — so `installed_adapter()` may own one and a caller may own another
     around it.
     """
     _hub.reset_for_test()
@@ -110,11 +110,11 @@ def clean_state() -> Iterator[None]:
 
 
 @contextmanager
-def installed(
+def installed_adapter(
     factory: Callable[[], AdapterInterface],
     *,
     client: RecordingClient | None = None,
-) -> Iterator[Live]:
+) -> Iterator[LiveAdapter]:
     """Install one adapter through the REAL `AdapterRegistry`.
 
     Never by hand, and the reason is not tidiness: the registry builds the
@@ -131,7 +131,7 @@ def installed(
         adapter = factory()
         recording = client if client is not None else RecordingClient()
         registry.install(adapter, recording)
-        live = Live(
+        live = LiveAdapter(
             adapter=adapter,
             ctx=registry._contexts.get(adapter.name()),
             client=recording,
@@ -143,7 +143,9 @@ def installed(
             live.teardown()
 
 
-def bare(subject_factory: Callable[[], AdapterInterface], client: RecordingClient) -> Live:
+def never_installed(
+    subject_factory: Callable[[], AdapterInterface], client: RecordingClient
+) -> LiveAdapter:
     """An adapter that was never installed, pointed at an existing client.
 
     The client is passed in rather than made here, and that is the whole value
@@ -152,19 +154,19 @@ def bare(subject_factory: Callable[[], AdapterInterface], client: RecordingClien
     something and cannot fail. Reusing the client that has already been PROVEN
     to receive spans is what makes its later silence mean anything.
     """
-    return Live(adapter=subject_factory(), ctx=None, client=client, registry=None)
+    return LiveAdapter(adapter=subject_factory(), ctx=None, client=client, registry=None)
 
 
 # -- reading the wire -------------------------------------------------------
 
 
 @dataclass(frozen=True)
-class Node:
+class SpanNode:
     """One shipped span, reduced to what a causal claim is made of.
 
     `parent_id` holds the span's `parent_span_id` and is deliberately not
     spelled that way: C-S3 forbids a `parent_span_id=` keyword outside
-    `assembly/`, because an edge written anywhere else is an edge nobody
+    `_assembly/`, because an edge written anywhere else is an edge nobody
     resolved. Nothing here can BUILD a span — that is the whole reason the rule
     can stay hard rather than acquiring an exception for a reader.
     """
@@ -178,8 +180,8 @@ class Node:
     limitations: tuple[Limitation, ...]
 
 
-def read(spans: Sequence[Any]) -> tuple[Node, ...]:
-    """Every shipped span as a `Node`.
+def read_spans(spans: Sequence[Any]) -> tuple[SpanNode, ...]:
+    """Every shipped span as a `SpanNode`.
 
     `capture_integrity` is None on a span with nothing to report, which is the
     shape a healthy run mostly has, so it is normalized to `()` here and the
@@ -190,7 +192,7 @@ def read(spans: Sequence[Any]) -> tuple[Node, ...]:
         integrity = span.capture_integrity
         correlation = span.correlation
         out.append(
-            Node(
+            SpanNode(
                 name=span.name,
                 span_id=span.context.span_id,
                 parent_id=span.parent_span_id,
@@ -203,7 +205,7 @@ def read(spans: Sequence[Any]) -> tuple[Node, ...]:
     return tuple(out)
 
 
-def collapse(nodes: Sequence[Node], *, root: str) -> tuple[Node, ...]:
+def collapse_onto_root(nodes: Sequence[SpanNode], *, root: str) -> tuple[SpanNode, ...]:
     """The same tree with every edge flattened onto the root. THE negative control.
 
     This is not a hypothetical shape. It is what an adapter produces when it
@@ -218,11 +220,11 @@ def collapse(nodes: Sequence[Node], *, root: str) -> tuple[Node, ...]:
     tier half is provably unchanged by construction and the failure the suite
     demonstrates cannot be an artefact of a different run.
     """
-    anchor = one(nodes, root)
+    anchor = exactly_one(nodes, root)
     return tuple(
         node
         if node.span_id == anchor.span_id
-        else Node(
+        else SpanNode(
             name=node.name,
             span_id=node.span_id,
             parent_id=anchor.span_id,
@@ -235,7 +237,7 @@ def collapse(nodes: Sequence[Node], *, root: str) -> tuple[Node, ...]:
     )
 
 
-def one(nodes: Sequence[Node], name: str) -> Node:
+def exactly_one(nodes: Sequence[SpanNode], name: str) -> SpanNode:
     """The single node with this EXACT name.
 
     Exact rather than a prefix test: `execute_step n1` is a prefix of
@@ -250,7 +252,7 @@ def one(nodes: Sequence[Node], name: str) -> Node:
     return found[0]
 
 
-def parent_name(nodes: Sequence[Node], node: Node) -> str | None:
+def parent_name_of(nodes: Sequence[SpanNode], node: SpanNode) -> str | None:
     """The name of `node`'s parent, for a failure message a reader can act on."""
     if node.parent_id is None:
         return None
@@ -263,7 +265,7 @@ def parent_name(nodes: Sequence[Node], node: Node) -> str | None:
 
 
 @dataclass(frozen=True)
-class Stalled:
+class StalledRun:
     """A run the host started and has not finished — the shutdown workload.
 
     `resume` is the host carrying on afterwards, and calling it is half of what
@@ -293,7 +295,7 @@ class AdapterSubject:
       compared BY IDENTITY: a restore that produced an equal object would leave
       wardex's wrapper welded on for the life of the process.
     * `workload` — drives the framework and returns whatever the host got. Must
-      tolerate a bare `Live` (`ctx is None`) by opening no wardex spans of its
+      tolerate a bare `LiveAdapter` (`ctx is None`) by opening no wardex spans of its
       own; that is the run that proves the zero point.
     * `chains` — the tree the workload MUST produce, as paths of exact span
       names from the root down. Not a count and not a set of edges: a path,
@@ -308,9 +310,9 @@ class AdapterSubject:
     module: str
     factory: Callable[[], AdapterInterface]
     seams: Callable[[], Mapping[str, Any]]
-    workload: Callable[[Live], Any]
+    workload: Callable[[LiveAdapter], Any]
     chains: tuple[tuple[str, ...], ...]
-    stall: Callable[[Live], Stalled]
+    stall: Callable[[LiveAdapter], StalledRun]
     detect_package: str
 
     @property
@@ -321,15 +323,15 @@ class AdapterSubject:
 
 __all__ = [
     "AdapterSubject",
-    "Live",
-    "Node",
+    "LiveAdapter",
     "RecordingClient",
-    "Stalled",
-    "bare",
+    "SpanNode",
+    "StalledRun",
     "clean_state",
-    "collapse",
-    "installed",
-    "one",
-    "parent_name",
-    "read",
+    "collapse_onto_root",
+    "exactly_one",
+    "installed_adapter",
+    "never_installed",
+    "parent_name_of",
+    "read_spans",
 ]

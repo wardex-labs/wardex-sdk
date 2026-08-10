@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import socket
 
-from wardex_sdk.interceptors import _conn_timing as ct
+from wardex_sdk._interceptors import _conn_timing as ct
 
 
 def test_shared_probe_refcount_idempotent():

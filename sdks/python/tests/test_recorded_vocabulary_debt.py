@@ -19,6 +19,7 @@ import json
 import pytest
 
 from wardex_sdk import _hub
+from wardex_sdk._adapters._assembler import SessionAssembler
 from wardex_sdk._config import BackendConfig, WardexConfig
 from wardex_sdk._enums import CaptureMode, SpanKind, StatusCode
 from wardex_sdk._tracing import span as manual_span
@@ -32,7 +33,6 @@ from wardex_sdk._types import (
     SpanId,
     TraceId,
 )
-from wardex_sdk.adapters._assembler import SessionAssembler
 from wardex_sdk.transport import _codec
 
 
@@ -108,7 +108,7 @@ def test_the_adapter_root_still_reports_the_model_as_the_agent_name(client):
     grouping `invoke_agent` spans by agent name renders `claude-sonnet-5` as an
     agent, and a session whose model changes mid-run renders as two agents.
 
-    Left as-is because the extraction that moved these sites onto `assembly/`
+    Left as-is because the extraction that moved these sites onto `_assembly/`
     deliberately kept every span FIELD identical, and this is a field a
     dashboard groups by: changing it silently re-partitions existing charts.
     It rides the adapter rewrite with the rest of the Anthropic

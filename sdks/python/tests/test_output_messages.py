@@ -10,8 +10,8 @@ from pathlib import Path
 
 import wardex_sdk as wardex
 from wardex_sdk import ConsoleTransport, _hub
+from wardex_sdk._assembly import Limitation
 from wardex_sdk._enums import SpanKind
-from wardex_sdk.assembly import Limitation
 
 _FIXTURES = Path(__file__).parent / "fixtures"
 CERT = _FIXTURES / "cert.pem"

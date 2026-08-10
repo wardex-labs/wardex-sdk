@@ -2,10 +2,10 @@
 
 from hpack import Encoder
 
+from wardex_sdk._assembly import Limitation
 from wardex_sdk._enums import StatusCode
-from wardex_sdk.assembly import Limitation
-from wardex_sdk.interceptors._trackers import _Txn
-from wardex_sdk.semantics import build_grpc_fields
+from wardex_sdk._interceptors._trackers import _Txn
+from wardex_sdk._semantics import build_grpc_fields
 
 
 def _msg(payload: bytes, compressed: int = 0) -> bytes:
@@ -91,7 +91,7 @@ def test_emit_span_builds_grpc_client_span():
     Passes a _Txn built by the tracker directly into build_grpc_fields without a socket,
     to confirm end-to-end field mapping (socket mocking is handled by test_ssl_interceptor).
     """
-    from wardex_sdk.interceptors._trackers import _Http2Tracker
+    from wardex_sdk._interceptors._trackers import _Http2Tracker
 
     tracker = _Http2Tracker()
     cenc, senc = Encoder(), Encoder()
@@ -147,7 +147,7 @@ def test_framing_failure_on_an_error_status_still_carries_an_error_type(monkeypa
     would have vanished entirely. The fallback is plain-h2 fields, so the type
     is the plain-h2 one: the status rendered as a string.
     """
-    import wardex_sdk.semantics._grpc as grpc_mod
+    import wardex_sdk._semantics._grpc as grpc_mod
 
     def _boom(_body):
         raise RuntimeError("unframeable")
@@ -165,7 +165,7 @@ def test_framing_failure_on_an_error_status_still_carries_an_error_type(monkeypa
 
 
 def test_framing_failure_on_a_2xx_status_has_no_error_type(monkeypatch):
-    import wardex_sdk.semantics._grpc as grpc_mod
+    import wardex_sdk._semantics._grpc as grpc_mod
 
     def _boom(_body):
         raise RuntimeError("unframeable")

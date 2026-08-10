@@ -63,13 +63,13 @@ import sys
 import threading
 from typing import TYPE_CHECKING, Any
 
+from ._assembly import Limitation
 from ._client import Client, _UnnamedTimeout
-from .assembly import Limitation
 
 if TYPE_CHECKING:
+    from ._adapters._registry import AdapterRegistry
     from ._config import WardexConfig
-    from .adapters._registry import AdapterRegistry
-    from .interceptors._registry import InterceptorRegistry
+    from ._interceptors._registry import InterceptorRegistry
 
 _SIGNALS = (signal.SIGINT, signal.SIGTERM)
 
@@ -160,7 +160,7 @@ class Runtime:
     #
     # Built on first use rather than at import, and reached through the runtime
     # rather than through a module global of their own. Both halves matter: the
-    # lazy build keeps `interceptors/` and `adapters/` — which reach the native
+    # lazy build keeps `_interceptors/` and `_adapters/` — which reach the native
     # extension at import time — off the paths that must work without it, and
     # single ownership is what lets `reset()` drain all of them.
 
@@ -168,7 +168,7 @@ class Runtime:
     def interceptors(self) -> InterceptorRegistry:
         with self._lock:
             if self._interceptors is None:
-                from .interceptors import _registry
+                from ._interceptors import _registry
 
                 self._interceptors = _registry.InterceptorRegistry()
             return self._interceptors
@@ -177,7 +177,7 @@ class Runtime:
     def adapters(self) -> AdapterRegistry:
         with self._lock:
             if self._adapters is None:
-                from .adapters import _registry
+                from ._adapters import _registry
 
                 self._adapters = _registry.AdapterRegistry()
             return self._adapters
@@ -204,11 +204,11 @@ class Runtime:
             else:
                 self._uninstall_signal_handlers()
 
-            from .interceptors import install_configured_interceptors
+            from ._interceptors import install_configured_interceptors
 
             install_configured_interceptors(client, config)
 
-            from .adapters import install_configured_adapters
+            from ._adapters import install_configured_adapters
 
             install_configured_adapters(client, config)
 
@@ -240,7 +240,7 @@ class Runtime:
 
         A registry that was never built is skipped rather than built to be
         drained: an empty registry uninstalls nothing, and constructing one here
-        would import `interceptors/` on a teardown path that may be running
+        would import `_interceptors/` on a teardown path that may be running
         precisely because the native extension is absent.
 
         `timeout=None` means "the client's own shutdown default", and it is
@@ -382,10 +382,10 @@ def _reset_shared_timing() -> None:
 
     Reached through `sys.modules` rather than by importing it, and the guard is
     exact rather than defensive: a module nobody has imported cannot be holding
-    a probe, and importing `interceptors/` from a reset path would reach the
+    a probe, and importing `_interceptors/` from a reset path would reach the
     native extension for a state that provably does not exist.
     """
-    module = sys.modules.get(f"{__package__}.interceptors._conn_timing")
+    module = sys.modules.get(f"{__package__}._interceptors._conn_timing")
     if module is not None:
         module.reset_shared_timing()
 

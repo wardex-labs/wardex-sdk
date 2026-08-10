@@ -16,10 +16,10 @@ drives all of `wardex_sdk.__all__` bar the enums and four inert values, and
 added to `__all__` without a step, so the checklist cannot fall behind the API.
 
 How far that reaches, exactly: every symbol on `wardex_sdk.__all__` works, and
-so does importing `wardex_sdk.transport`, `.context`, `.assembly`, `.adapters`,
-`.interceptors` and `.pipeline`; the internal modules that reach the core at
-import time -- `wardex_sdk.protocol`, `.semantics`, `transport._codec` and
-three `adapters/` modules -- still raise `ImportError`, and each is reachable
+so does importing `wardex_sdk.transport`, `.context`, `._assembly`,
+`._adapters` and `._interceptors`; the internal modules that reach the core at
+import time -- `wardex_sdk._protocol`, `._semantics`, `transport._codec` and
+three `_adapters/` modules -- still raise `ImportError`, and each is reachable
 only through `init()`, which returns before importing any. Both halves are
 asserted (`DEGRADES` / `STILL_RAISES` in the child) so the line cannot move
 without someone noticing.
@@ -36,7 +36,7 @@ module-level imports that would keep pointing at the pre-reload `InternalSpan`
 and `SpanKind`, so any later `isinstance` or enum-identity check would compare
 across two copies of the package; `conftest`'s autouse hub teardown would close
 the new module's client and leak the old one's batch-worker thread into
-`test_worker.py`'s thread counts; and `interceptors/_ssl.py`, `_socket.py` and
+`test_worker.py`'s thread counts; and `_interceptors/_ssl.py`, `_socket.py` and
 `context/_inject.py` monkeypatch `ssl.SSLSocket`, `socket.socket` and the
 stdlib HTTP clients, so a second `PatchSet` universe would restore them to the
 wrong originals. A green suite that leaked that state is a false green. The
@@ -192,8 +192,15 @@ def _config_groups_ctor():
     the host's startup — the one failure this package's degraded mode exists to
     prevent. Driven rather than declared inert for `CaptureLimits`'s reason: a
     group is a constructor with validation in it, so it has code that can fail.
+
+    `WardexConfig` comes from its private home: the class left the root
+    namespace with the rest of the non-`__all__` names, and `wardex_sdk.
+    _config` is on `DEGRADES` below, so reaching it here is itself part of
+    what this child proves.
     """
-    wardex_sdk.WardexConfig(
+    from wardex_sdk._config import WardexConfig
+
+    WardexConfig(
         backend=wardex_sdk.BackendConfig(api_key="k", endpoint="http://127.0.0.1:1"),
         retention=wardex_sdk.RetentionPolicy(),
         pii=wardex_sdk.PIIPolicy(),
@@ -288,11 +295,11 @@ def _wsgi_middleware():
 # Everything on the public `__all__` surface is a no-op that returns (the
 # checklist above), and the packages a host can plausibly import by hand still
 # import. The internal modules below do NOT: they bind core symbols at module
-# scope (`protocol/__init__` reads `_wardex_native.protocol` on line 3, and
-# `transport/_codec`, `adapters/_assembler` and `interceptors/_trackers` do
+# scope (`_protocol/__init__` reads `_wardex_native.protocol` on line 3, and
+# `transport/_codec`, `_adapters/_assembler` and `_interceptors/_trackers` do
 # `from .. import _wardex_native`), so importing them fails exactly the way
-# `import wardex_sdk` used to; `semantics`, `interceptors` and the last two
-# `adapters/` modules fail through them rather than on their own account. That
+# `import wardex_sdk` used to; `_semantics` and the last two
+# `_adapters/` modules fail through them rather than on their own account. That
 # is deliberate and not an oversight: every
 # one of them is reachable only THROUGH `init()`, which returns before any of
 # them is imported, so degrading them would buy a host nothing and would mean
@@ -304,34 +311,33 @@ def _wsgi_middleware():
 # update the guarantee sentence in `_native.py`; if a name in the first list
 # starts raising, a host-visible import just became a crash.
 #
-# `wardex_sdk.adapters` and `wardex_sdk.pipeline` are the two DEGRADES entries
-# the `import` step above does not already reach -- the rest are pulled in by
-# `import wardex_sdk` itself and are listed anyway, so the guarantee reads as
-# one list rather than as a rule plus a footnote.
+# `wardex_sdk._adapters` is the one DEGRADES entry the `import` step above
+# does not already reach -- the rest are pulled in by `import wardex_sdk`
+# itself and are listed anyway, so the guarantee reads as one list rather than
+# as a rule plus a footnote.
 DEGRADES = (
     "wardex_sdk.transport",
     "wardex_sdk.context",
-    "wardex_sdk.assembly",
-    "wardex_sdk.adapters",
+    "wardex_sdk._assembly",
+    "wardex_sdk._adapters",
     # Moved up from STILL_RAISES when the package `__init__` stopped importing
     # the TLS seam eagerly: every seam is built inside its factory now, so
     # importing the package no longer drags `_ssl` -- and the core underneath
     # it -- along. `Runtime` reaches this package from teardown paths that exist
     # precisely to work when the extension does not, so the move is load-bearing
     # rather than incidental.
-    "wardex_sdk.interceptors",
-    "wardex_sdk.pipeline",
+    "wardex_sdk._interceptors",
     "wardex_sdk._limits",
     "wardex_sdk._client",
     "wardex_sdk._config",
 )
 STILL_RAISES = (
-    "wardex_sdk.protocol",
-    "wardex_sdk.semantics",
+    "wardex_sdk._protocol",
+    "wardex_sdk._semantics",
     "wardex_sdk.transport._codec",
-    "wardex_sdk.adapters._assembler",
-    "wardex_sdk.adapters._anthropic_agent_sdk",
-    "wardex_sdk.adapters._session_state",
+    "wardex_sdk._adapters._assembler",
+    "wardex_sdk._adapters._anthropic_agent_sdk",
+    "wardex_sdk._adapters._session_state",
 )
 
 
@@ -561,8 +567,22 @@ def test_the_degraded_checklist_covers_the_whole_public_surface():
         and issubclass(getattr(wardex_sdk, n), enum.Enum)
     }
     # Nothing to call and no core reach: a version string, the transport ABC the
-    # three concrete transports above implement, and three plain dataclasses.
-    inert = {"__version__", "Transport", "GenAIAttributes", "InputRef", "ToolDefinitionSet"}
+    # three concrete transports above implement, and the plain dataclasses the
+    # tracing surface is typed with (attribute blocks, tool definitions, the
+    # scope object).
+    inert = {
+        "__version__",
+        "Transport",
+        "AgentAttributes",
+        "CallSite",
+        "ConversationContext",
+        "GenAIAttributes",
+        "InputRef",
+        "Scope",
+        "ToolAttributes",
+        "ToolDefinition",
+        "ToolDefinitionSet",
+    }
     uncovered = surface - _DRIVEN - enums - inert
     assert not uncovered, (
         f"these public names are not driven by the degraded-mode child: "

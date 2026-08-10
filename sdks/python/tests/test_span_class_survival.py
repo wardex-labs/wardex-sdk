@@ -35,15 +35,15 @@ import pytest
 
 import wardex_sdk
 from wardex_sdk import _hub
+from wardex_sdk._adapters._assembler import SessionAssembler
+from wardex_sdk._assembly import Limitation, ParentSource, counters
 from wardex_sdk._config import BackendConfig, WardexConfig
 from wardex_sdk._enums import CaptureMode, CaptureSource, SpanKind, StatusCode, ToolExecutionType
+from wardex_sdk._interceptors._mcp_stdio import _ProcState
+from wardex_sdk._interceptors._seam import ByteSeamInterceptor, _ConnectionState
+from wardex_sdk._interceptors._trackers import _Http1Tracker, _Http2Tracker, _WebSocketTracker
 from wardex_sdk._tracing import span as manual_span
 from wardex_sdk._tracing import trace
-from wardex_sdk.adapters._assembler import SessionAssembler
-from wardex_sdk.assembly import Limitation, ParentSource, counters
-from wardex_sdk.interceptors._mcp_stdio import _ProcState
-from wardex_sdk.interceptors._seam import ByteSeamInterceptor, _ConnectionState
-from wardex_sdk.interceptors._trackers import _Http1Tracker, _Http2Tracker, _WebSocketTracker
 
 # --------------------------------------------------------------------------
 # harness
@@ -823,7 +823,7 @@ def test_the_harness_would_notice_a_deleted_span(client, monkeypatch):
     in a bare `except Exception: pass`, the counter stops moving and this test
     is what says so.
     """
-    from wardex_sdk.assembly import SpanDraft, VocabularyError
+    from wardex_sdk._assembly import SpanDraft, VocabularyError
 
     def _boom(self, end_ns=None):
         raise VocabularyError("forced")

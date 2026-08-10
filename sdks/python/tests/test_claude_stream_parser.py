@@ -1,6 +1,6 @@
 """Python-facing tests for the native claude stream-json parser wrapper."""
 
-from wardex_sdk.protocol._claude_stream import parse_line
+from wardex_sdk._protocol._claude_stream import parse_line
 
 
 def test_assistant_turn_maps_fields():

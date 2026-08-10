@@ -8,6 +8,7 @@ import time
 import uuid
 from collections import deque
 
+from ._assembly import report_once
 from ._config import WardexConfig
 from ._types import (
     EnvelopeHeader,
@@ -18,7 +19,6 @@ from ._types import (
 )
 from ._version import __version__
 from ._worker import BatchWorker
-from .assembly import report_once
 from .transport._base import DEFAULT_TIMEOUT, UNDELIVERED, CallerBudget, Transport
 
 

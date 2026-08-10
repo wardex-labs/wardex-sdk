@@ -29,6 +29,8 @@ from pathlib import Path
 import pytest
 
 from wardex_sdk import _wardex_native
+from wardex_sdk._assembly import Limitation
+from wardex_sdk._assembly._parentage import ParentSource
 from wardex_sdk._enums import SpanKind, StatusCode
 from wardex_sdk._types import (
     CaptureIntegrity,
@@ -41,8 +43,6 @@ from wardex_sdk._types import (
     SpanId,
     TraceId,
 )
-from wardex_sdk.assembly import Limitation
-from wardex_sdk.assembly._parentage import ParentSource
 from wardex_sdk.transport import _codec
 
 _REPO = Path(__file__).resolve().parents[3]
@@ -270,7 +270,7 @@ def test_the_parentage_core_hands_out_members_not_strings() -> None:
     dataclass promised otherwise, and an assertion written in the member form
     would have failed where the old string form passed.
     """
-    from wardex_sdk.assembly import Ambient, resolve_parentage
+    from wardex_sdk._assembly import Ambient, resolve_parentage
 
     rooted = resolve_parentage(Ambient(None, None, None))
     assert rooted.correlation is not None
@@ -295,8 +295,8 @@ def test_every_link_the_builder_makes_carries_a_member() -> None:
     nesting, making every duration in the flame graph wrong, which is the whole
     reason the link carries a reason at all.
     """
+    from wardex_sdk._assembly import Ambient, LinkReason, SpanDraft, resolve_parentage
     from wardex_sdk._enums import SpanKind
-    from wardex_sdk.assembly import Ambient, LinkReason, SpanDraft, resolve_parentage
 
     draft = SpanDraft.manual(
         resolve_parentage(Ambient(None, None, None)),
@@ -319,8 +319,8 @@ def test_a_span_off_the_real_path_carries_members_in_all_three_fields() -> None:
     members in the same change that left `strategy` and `reason` as strings.
     Whatever is added next, this is the assertion that notices it did not.
     """
+    from wardex_sdk._assembly import Ambient, LinkReason, SpanDraft, resolve_parentage
     from wardex_sdk._enums import SpanKind
-    from wardex_sdk.assembly import Ambient, LinkReason, SpanDraft, resolve_parentage
 
     draft = SpanDraft.manual(
         resolve_parentage(Ambient(None, None, None)),

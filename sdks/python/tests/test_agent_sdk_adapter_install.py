@@ -11,12 +11,12 @@ import claude_agent_sdk
 from claude_agent_sdk import ClaudeAgentOptions, HookMatcher
 from claude_agent_sdk._internal.transport import Transport
 
-from wardex_sdk.adapters._anthropic_agent_sdk import (
+from wardex_sdk._adapters._anthropic_agent_sdk import (
     AnthropicAgentSdkAdapter,
     _prepare_options,
 )
-from wardex_sdk.adapters._registry import context_for
-from wardex_sdk.assembly import Limitation
+from wardex_sdk._adapters._registry import context_for
+from wardex_sdk._assembly import Limitation
 
 RESULT_LINE = {
     "type": "result",

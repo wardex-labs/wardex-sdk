@@ -28,12 +28,12 @@ from wardex_sdk import _hub
 from wardex_sdk._client import Client
 from wardex_sdk._config import BackendConfig, WardexConfig
 from wardex_sdk._enums import CaptureMode
+from wardex_sdk._interceptors import _seam
+from wardex_sdk._interceptors._socket import RawSocketInterceptor
+from wardex_sdk._interceptors._ssl import SSLInterceptor
 from wardex_sdk._suppress import suppress_capture
 from wardex_sdk._types import SpanContext, SpanId, TraceId
 from wardex_sdk.context._contextvar import fork_active_span
-from wardex_sdk.interceptors import _seam
-from wardex_sdk.interceptors._socket import RawSocketInterceptor
-from wardex_sdk.interceptors._ssl import SSLInterceptor
 from wardex_sdk.transport._noop import NoOpTransport
 
 

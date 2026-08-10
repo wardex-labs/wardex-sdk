@@ -1,4 +1,4 @@
-from wardex_sdk.protocol import grpc_status_name, parse_grpc_frames
+from wardex_sdk._protocol import grpc_status_name, parse_grpc_frames
 
 
 def _msg(payload: bytes, compressed: int = 0) -> bytes:

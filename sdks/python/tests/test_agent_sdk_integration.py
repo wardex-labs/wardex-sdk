@@ -10,12 +10,12 @@ from test_agent_sdk_adapter_install import (
     FakeTransport,
 )
 from wardex_sdk import _hub
+from wardex_sdk._adapters._anthropic_agent_sdk import AnthropicAgentSdkAdapter
+from wardex_sdk._adapters._registry import context_for
+from wardex_sdk._assembly import Limitation
 from wardex_sdk._client import Client
 from wardex_sdk._config import BackendConfig, WardexConfig
 from wardex_sdk._enums import CaptureSource, StatusCode
-from wardex_sdk.adapters._anthropic_agent_sdk import AnthropicAgentSdkAdapter
-from wardex_sdk.adapters._registry import context_for
-from wardex_sdk.assembly import Limitation
 from wardex_sdk.transport._base import Transport
 
 

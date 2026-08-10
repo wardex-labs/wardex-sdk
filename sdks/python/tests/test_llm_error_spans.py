@@ -36,11 +36,11 @@ from types import SimpleNamespace
 import pytest
 
 from wardex_sdk import _hub
+from wardex_sdk._assembly import Limitation, counters
 from wardex_sdk._config import BackendConfig, WardexConfig
 from wardex_sdk._enums import CaptureMode, OperationName, ProviderName, StatusCode
-from wardex_sdk.assembly import Limitation, counters
-from wardex_sdk.interceptors._seam import ByteSeamInterceptor
-from wardex_sdk.interceptors._trackers import _Http1Tracker
+from wardex_sdk._interceptors._seam import ByteSeamInterceptor
+from wardex_sdk._interceptors._trackers import _Http1Tracker
 
 PROMPT = "summarize the incident report"
 REQUEST = json.dumps(

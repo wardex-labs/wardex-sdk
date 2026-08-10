@@ -29,7 +29,7 @@ from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.prebuilt import ToolNode
 from langgraph.types import Command, Send, interrupt
 
-import wardex_sdk.adapters._langgraph as lg_mod
+import wardex_sdk._adapters._langgraph as lg_mod
 from test_langgraph_adapter import (  # noqa: F401 — `_clean_scope` is an autouse fixture
     Installed,
     _clean_scope,
@@ -47,9 +47,9 @@ from test_langgraph_adapter import (  # noqa: F401 — `_clean_scope` is an auto
     traces,
 )
 from test_langgraph_adapter import installed as _installed_fixture
+from wardex_sdk._assembly import Limitation
 from wardex_sdk._enums import StatusCode
 from wardex_sdk._limits import CaptureLimits
-from wardex_sdk.assembly import Limitation
 
 #: The harness's fixture, rebound so that a test may take `installed` as an
 #: argument. A parameter shadowing a bare `from … import installed` reads to the

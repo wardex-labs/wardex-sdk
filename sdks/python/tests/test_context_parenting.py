@@ -143,14 +143,14 @@ def test_bare_thread_does_not_inherit_context():
 
 
 def _ctx():
-    from wardex_sdk.assembly import EMPTY_AMBIENT, resolve_parentage
+    from wardex_sdk._assembly import EMPTY_AMBIENT, resolve_parentage
 
     return resolve_parentage(EMPTY_AMBIENT).child_context()
 
 
 def test_fork_active_span_is_activate_span():
     """A delegating wrapper would be a second entry point to grow a second
-    opinion in, which is the drift the assembly/ extraction exists to end."""
+    opinion in, which is the drift the _assembly/ extraction exists to end."""
     from wardex_sdk.context._contextvar import activate_span, fork_active_span
 
     assert fork_active_span is activate_span
@@ -158,7 +158,7 @@ def test_fork_active_span_is_activate_span():
 
 def test_activate_span_installs_and_restores_the_span_context():
     _setup()
-    from wardex_sdk.context import activate_span
+    from wardex_sdk.context._contextvar import activate_span
 
     ctx = _ctx()
     with activate_span(ctx):
@@ -169,7 +169,7 @@ def test_activate_span_installs_and_restores_the_span_context():
 def test_activate_span_installs_conversation_and_tracestate():
     _setup()
     from wardex_sdk._types import ConversationContext
-    from wardex_sdk.context import activate_span
+    from wardex_sdk.context._contextvar import activate_span
 
     conv = ConversationContext(conversation_id="c-1")
     with activate_span(_ctx(), conversation=conv, tracestate="a=1"):
@@ -185,7 +185,7 @@ def test_activate_span_omitting_a_field_keeps_the_inherited_one():
     it — which is exactly the loss the generalization was introduced to stop."""
     _setup()
     from wardex_sdk._types import ConversationContext
-    from wardex_sdk.context import activate_span
+    from wardex_sdk.context._contextvar import activate_span
 
     conv = ConversationContext(conversation_id="c-1")
     with activate_span(_ctx(), conversation=conv, tracestate="a=1"):

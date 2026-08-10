@@ -17,6 +17,17 @@ from __future__ import annotations
 import pytest
 
 from wardex_sdk import _wardex_native
+from wardex_sdk._assembly import (
+    AMBIENT,
+    Ambient,
+    LinkReason,
+    SpanDraft,
+    SpanIntent,
+    TransportLabel,
+    VocabularyError,
+    resolve_parentage,
+    vocabulary_name,
+)
 from wardex_sdk._enums import (
     CaptureSource,
     OperationName,
@@ -33,17 +44,6 @@ from wardex_sdk._types import (
     SpanId,
     ToolAttributes,
     TraceId,
-)
-from wardex_sdk.assembly import (
-    AMBIENT,
-    Ambient,
-    LinkReason,
-    SpanDraft,
-    SpanIntent,
-    TransportLabel,
-    VocabularyError,
-    resolve_parentage,
-    vocabulary_name,
 )
 
 
@@ -203,7 +203,7 @@ def test_a_draft_cannot_leave_its_parentages_trace():
 
 def test_a_string_limitation_is_rejected():
     """Typed setters make this normally unrepresentable; `finish()` re-checks
-    because the builder is reachable from duck-typed code in adapters/."""
+    because the builder is reachable from duck-typed code in _adapters/."""
     draft = _draft()
     draft.set_gen_ai(_gen_ai())
     draft.integrity.limitation("payload_compressed")  # type: ignore[arg-type]

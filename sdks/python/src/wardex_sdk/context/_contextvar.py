@@ -48,7 +48,7 @@ def _fork(
 
     Factored out rather than duplicated into `install_span` because a second
     copy of these five lines is a second place for that rule to drift, which is
-    the drift the whole `assembly/` extraction exists to end.
+    the drift the whole `_assembly/` extraction exists to end.
     """
     forked = prev.clone()
     forked.active_span_context = ctx
@@ -90,7 +90,7 @@ def restore_scope(prev: Scope) -> None:
     A plain `set()` rather than a Token reset, because `install_span` has no
     Token to reset — and because a `set()` from another task would land on THAT
     task's scope, silently. The caller checks task identity; see
-    `assembly/_units.py::_Carrier.remove`.
+    `_assembly/_units.py::_Carrier.remove`.
     """
     _hub._current_scope.set(prev)
 
@@ -107,7 +107,7 @@ def activate_span(
     Enter and exit MUST happen on the same task/thread: the ContextVar Token
     returned by `set()` may only be reset in the Context it was created in, and
     resetting it elsewhere raises `ValueError` — into the host, on a path the
-    host did not ask for. Every carrier in `assembly/_units.py` is built on this
+    host did not ask for. Every carrier in `_assembly/_units.py` is built on this
     rule rather than around it.
 
     `conversation` and `tracestate` are OVERRIDES, not assignments: `None`
@@ -125,7 +125,7 @@ def activate_span(
 #: The original name, kept because it is what `_tracing.py` and the tests call.
 #: A plain alias rather than a wrapper: a delegating `fork_active_span` would be
 #: a second entry point to grow a second opinion in, which is the drift the
-#: whole `assembly/` extraction exists to end.
+#: whole `_assembly/` extraction exists to end.
 fork_active_span = activate_span
 
 

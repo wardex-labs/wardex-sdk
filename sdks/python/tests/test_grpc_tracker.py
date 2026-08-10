@@ -1,6 +1,6 @@
 from hpack import Encoder
 
-from wardex_sdk.interceptors._trackers import _Http2Tracker
+from wardex_sdk._interceptors._trackers import _Http2Tracker
 
 
 def _frame(ftype: int, flags: int, stream_id: int, payload: bytes) -> bytes:

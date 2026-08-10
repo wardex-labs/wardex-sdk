@@ -26,16 +26,16 @@ import pytest
 import requests
 
 from wardex_sdk import _hub, _runtime
+from wardex_sdk._adapters._base import AdapterInterface
+from wardex_sdk._adapters._registry import AdapterRegistry
+from wardex_sdk._assembly import Limitation, counters
 from wardex_sdk._client import Client
 from wardex_sdk._config import BackendConfig, BatchingPolicy, WardexConfig
 from wardex_sdk._enums import SpanKind
+from wardex_sdk._interceptors._base import InterceptorInterface
+from wardex_sdk._interceptors._registry import InterceptorRegistry
 from wardex_sdk._types import InternalEnvelope, InternalSpan, SpanContext, SpanId, TraceId
-from wardex_sdk.adapters._base import AdapterInterface
-from wardex_sdk.adapters._registry import AdapterRegistry
-from wardex_sdk.assembly import Limitation, counters
 from wardex_sdk.context._inject import install_propagation, uninstall_propagation
-from wardex_sdk.interceptors._base import InterceptorInterface
-from wardex_sdk.interceptors._registry import InterceptorRegistry
 from wardex_sdk.transport._base import Transport
 
 _SUPERSEDED = f"context.inject.{Limitation.PATCH_SUPERSEDED.value}"
@@ -290,8 +290,8 @@ def test_teardown_still_closes_the_client_when_an_uninstall_raises():
     every span still in the buffer was lost at exit, silently, because nothing
     reads an exception raised from an atexit hook.
     """
-    from wardex_sdk.adapters._registry import get_registry as adapter_registry
-    from wardex_sdk.interceptors._registry import get_registry as interceptor_registry
+    from wardex_sdk._adapters._registry import get_registry as adapter_registry
+    from wardex_sdk._interceptors._registry import get_registry as interceptor_registry
 
     transport = _Recording()
     client = Client(
@@ -441,8 +441,8 @@ def test_a_half_installed_ssl_seam_leaves_no_wrapper_on_the_hosts_sockets(monkey
     """
     import ssl
 
-    from wardex_sdk.interceptors import _seam
-    from wardex_sdk.interceptors._ssl import SSLInterceptor
+    from wardex_sdk._interceptors import _seam
+    from wardex_sdk._interceptors._ssl import SSLInterceptor
 
     pristine = {
         (ssl.SSLSocket, name): ssl.SSLSocket.__dict__[name]
@@ -495,9 +495,9 @@ def test_a_rolled_back_seam_does_not_release_a_timing_reference_it_never_took(mo
     """
     import socket
 
-    from wardex_sdk.interceptors import _close_hook, _conn_timing
-    from wardex_sdk.interceptors._socket import RawSocketInterceptor
-    from wardex_sdk.interceptors._ssl import SSLInterceptor
+    from wardex_sdk._interceptors import _close_hook, _conn_timing
+    from wardex_sdk._interceptors._socket import RawSocketInterceptor
+    from wardex_sdk._interceptors._ssl import SSLInterceptor
 
     assert _conn_timing._shared_refcount == 0, (
         "another test left the shared timing probe installed; this one proves nothing"
@@ -616,8 +616,8 @@ def test_a_broken_interceptor_does_not_take_the_whole_intercept_option_down():
     the other two seams, and must not raise into the caller of `init()`.
     """
     import wardex_sdk as wardex
-    from wardex_sdk.interceptors import _ssl
-    from wardex_sdk.interceptors._registry import get_registry as interceptor_registry
+    from wardex_sdk._interceptors import _ssl
+    from wardex_sdk._interceptors._registry import get_registry as interceptor_registry
 
     class _BrokenSSL(InterceptorInterface):
         def name(self) -> str:

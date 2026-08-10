@@ -4,10 +4,10 @@ import json
 
 import pytest
 
+from wardex_sdk._adapters._anthropic_names import McpToolCatalog
+from wardex_sdk._adapters._assembler import SessionAssembler
+from wardex_sdk._assembly import Limitation, UnitKey, UnitKind, counters
 from wardex_sdk._enums import CaptureSource, StatusCode
-from wardex_sdk.adapters._anthropic_names import McpToolCatalog
-from wardex_sdk.adapters._assembler import SessionAssembler
-from wardex_sdk.assembly import Limitation, UnitKey, UnitKind, counters
 
 
 @pytest.fixture(autouse=True)
@@ -794,8 +794,8 @@ def test_teardown_also_closes_a_call_unit_no_session_owns():
     It is also the span most worth having: a tool call wardex could not attach
     to a run is already the anomalous one.
     """
+    from wardex_sdk._assembly import EMPTY_AMBIENT, SpanIntent
     from wardex_sdk._types import ToolAttributes
-    from wardex_sdk.assembly import EMPTY_AMBIENT, SpanIntent
 
     client = FakeClient()
     asm = _live_session(client)
