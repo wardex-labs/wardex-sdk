@@ -7,8 +7,9 @@ import threading
 import time
 import uuid
 from collections import deque
+from dataclasses import replace
 
-from ._assembly import report_once
+from ._assembly import guard, report_once
 from ._config import WardexConfig
 from ._types import (
     EnvelopeHeader,
@@ -542,10 +543,63 @@ class Client:
     def _buffered_bytes(self) -> int:
         return self._buffer.bytes
 
+    def _stamp_scope(self, span: InternalSpan) -> InternalSpan:
+        """Fold the ambient scope's tags and user into the span's `extra`.
+
+        This is the one place the scope stratum reaches the wire: every capture
+        path converges on `capture_span`, so stamping here is what makes
+        `set_tag`/`set_user` mean something on EXPORTED spans instead of being
+        write-only state. Read at capture time, from the calling context —
+        which is the context the span was produced on, so an
+        `isolation_scope()` block's tags reach exactly the spans captured
+        inside it.
+
+        Precedence: a key the span already carries wins over the scope (a
+        span-local `set_attribute` is more specific than ambient state), and
+        within the scope the usual Global → Isolation → Current layering
+        applies (`_scope.merged_tags_and_user`). The user maps to `user.id` /
+        `user.email` / `user.name` / `client.address` (from
+        `UserInfo.id/email/username/ip_address`), skipping `None` fields.
+        Snapshots are NOT stamped — spans only.
+
+        The whole read-and-merge is inside `guard()` (I6): scope state is
+        host-adjacent (another thread can be mutating the tag dict under us),
+        and a failure here may cost the stamping but never the span — the
+        caller buffers the original untouched.
+        """
+        stamped = span
+        with guard("client.scope_stamp", debug=self._config.debug):
+            # Deferred import: `_hub` imports this module for the `Client`
+            # type, so the edge cannot exist at import time in this direction.
+            from . import _hub  # noqa: PLC0415
+
+            tags, user = _hub.get_merged_tags_and_user()
+            if tags or user is not None:
+                taken = {key for key, _ in span.extra}
+                additions: list[tuple[str, str | int | float | bool]] = []
+                for key, value in tags.items():
+                    if key not in taken:
+                        additions.append((key, value))
+                        taken.add(key)
+                if user is not None:
+                    for key, value in (
+                        ("user.id", user.id),
+                        ("user.email", user.email),
+                        ("user.name", user.username),
+                        ("client.address", user.ip_address),
+                    ):
+                        if value is not None and key not in taken:
+                            additions.append((key, value))
+                            taken.add(key)
+                if additions:
+                    stamped = replace(span, extra=span.extra + tuple(additions))
+        return stamped
+
     def capture_span(self, span: InternalSpan) -> None:
         if self._closed:
             return
         self._worker.ensure_alive()  # fork/thread-death recovery (design §8)
+        span = self._stamp_scope(span)
         size = _span_size(span)
         with self._buffer_lock:
             # Drop-oldest on either bound: recent spans are worth more. The byte

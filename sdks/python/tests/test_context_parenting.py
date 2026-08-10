@@ -6,7 +6,7 @@ import threading
 from wardex_sdk import _hub
 from wardex_sdk._client import Client
 from wardex_sdk._config import BackendConfig, WardexConfig
-from wardex_sdk._tracing import span, trace
+from wardex_sdk._tracing import conversation, span
 from wardex_sdk._types import InternalEnvelope
 from wardex_sdk.transport._base import Transport
 
@@ -41,7 +41,7 @@ def test_gather_children_parent_to_enclosing_span():
             await asyncio.sleep(0.01)
 
     async def main():
-        with trace("root") as root:
+        with conversation("root") as root:
             await asyncio.gather(child(1), child(2), child(3))
             return root.context.span_id
 
@@ -66,7 +66,7 @@ def test_gather_interceptor_read_sees_own_span():
             seen[n] = active is not None and active.span_id == s.context.span_id
 
     async def main():
-        with trace("root"):
+        with conversation("root"):
             await asyncio.gather(child(1), child(2))
 
     asyncio.run(main())
@@ -76,7 +76,7 @@ def test_gather_interceptor_read_sees_own_span():
 def test_sequential_nesting_unchanged():
     """Regression: sequential nesting must keep the exact parent chain."""
     t = _setup()
-    with trace("root") as root:
+    with conversation("root") as root:
         with span("mid") as mid:
             with span("leaf") as leaf:
                 pass
@@ -91,7 +91,7 @@ def test_tags_set_before_span_survive_after():
     """Scope mutations made outside spans stay on the shared scope (fork is span-local)."""
     _setup()
     _hub.get_current_scope().set_tag("k", "v")
-    with trace("root"):
+    with conversation("root"):
         pass
     assert _hub.get_current_scope().tags["k"] == "v"
 
@@ -102,7 +102,7 @@ def test_run_in_context_carries_active_span_to_thread():
 
     import wardex_sdk
 
-    with trace("root") as root:
+    with conversation("root") as root:
 
         def work():
             active = _hub.get_current_scope().active_span_context
@@ -118,7 +118,7 @@ def test_bare_thread_does_not_inherit_context():
     """Documents the Python behavior the helper exists for."""
     _setup()
     results: dict[str, object] = {}
-    with trace("root"):
+    with conversation("root"):
 
         def work():
             active = _hub.get_current_scope().active_span_context

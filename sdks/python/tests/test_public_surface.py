@@ -55,13 +55,20 @@ def test_every_name_in_all_resolves():
 #: callable instead of widening this.
 _KNOWN_UNEXPORTED: dict[str, frozenset[str]] = {
     # `before_send=` is typed with the callback protocol; the protocol's
-    # public spelling lands with the hook's own rename in a later slice of
-    # this batch. Shrink-only: resolve it by exporting the (renamed) type,
+    # public spelling lands with the hook's own rename in the transport slice
+    # of this batch. Shrink-only: resolve it by exporting the (renamed) type,
     # never by widening this entry.
     "init": frozenset({"BeforeSendCallback"}),
-    # `Scope.span_context` is the span machinery, which stays unnameable from
-    # user code (I5); the scope surface is retargeted in a later slice.
+    # `Scope.active_span_context` is the span machinery, which stays
+    # unnameable from user code (I5). The scope retarget landed with the
+    # tracing slice; this parameter's public story is decided with the
+    # transport slice, where the envelope/read-model types get their home.
     "Scope": frozenset({"SpanContext"}),
+    # `Span.__init__` takes the internal draft — the object is YIELDED by the
+    # `span()`/`conversation()` CMs, never constructed by hosts, so the
+    # constructor parameter is plumbing rather than API. Resolved with the
+    # transport slice alongside the other read-model types.
+    "Span": frozenset({"SpanDraft"}),
 }
 
 

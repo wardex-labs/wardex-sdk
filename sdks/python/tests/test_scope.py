@@ -2,7 +2,13 @@ import threading
 
 import pytest
 
-from wardex_sdk._scope import Scope, UserInfo, merge_scopes, merged_trace_fields
+from wardex_sdk._scope import (
+    Scope,
+    UserInfo,
+    merge_scopes,
+    merged_tags_and_user,
+    merged_trace_fields,
+)
 from wardex_sdk._types import SpanContext, SpanId, TraceId
 
 
@@ -84,3 +90,48 @@ def test_merged_trace_fields_ignores_contexts_it_cannot_copy():
     with pytest.raises(TypeError):
         merge_scopes(g, Scope(), Scope())
     assert merged_trace_fields(g, Scope(), Scope()) == (g.active_span_context, None)
+
+
+@pytest.mark.parametrize(
+    "seed",
+    [
+        ("global", "isolation", "current"),
+        ("global", "isolation", None),
+        ("global", None, None),
+        (None, "isolation", "current"),
+        (None, None, "current"),
+        (None, None, None),
+        ("global", None, "current"),
+    ],
+)
+def test_merged_tags_and_user_agrees_with_the_full_merge(seed):
+    """Same rule as `merged_trace_fields`: the cheap read is only allowed to be
+    cheap, not to be different. Tags dict-merge with later layers overriding,
+    user is last-non-None — asked of both readers over every arrangement."""
+    layers = []
+    for name in seed:
+        s = Scope()
+        if name is not None:
+            s.set_tag("layer", name)
+            s.set_tag(f"only-{name}", "1")
+            s.set_user(UserInfo(id=name))
+        layers.append(s)
+    g, iso, cur = layers
+    merged = merge_scopes(g, iso, cur)
+    tags, user = merged_tags_and_user(g, iso, cur)
+    assert tags == merged.tags
+    assert user == merged.user
+
+
+def test_merged_tags_and_user_ignores_contexts_it_cannot_copy():
+    """It runs on every span capture, so it must not deepcopy host contexts —
+    the same reason `merged_trace_fields` exists."""
+    g = Scope()
+    g.set_context("runtime", {"lock": threading.Lock()})
+    g.set_tag("env", "prod")
+    g.set_user(UserInfo(id="u"))
+    with pytest.raises(TypeError):
+        merge_scopes(g, Scope(), Scope())
+    tags, user = merged_tags_and_user(g, Scope(), Scope())
+    assert tags == {"env": "prod"}
+    assert user == UserInfo(id="u")

@@ -54,7 +54,7 @@ from ._native import NATIVE_OK as _NATIVE_OK
 from ._native import unavailable_reason as _unavailable_reason
 from ._scope import Scope, UserInfo
 from ._snapshot_api import capture_state_snapshot
-from ._tracing import agent, span, task, tool, trace, workflow
+from ._tracing import Span, agent, conversation, span, step, tool, workflow
 from ._types import (
     AgentAttributes,
     CallSite,
@@ -89,15 +89,16 @@ from .transport._otlp_http import OtlpHttpTransport
 __all__ = [
     "__version__",
     "init",
-    "trace",
+    "conversation",
     "span",
     "workflow",
     "agent",
-    "task",
+    "step",
     "tool",
     "capture_state_snapshot",
     "set_tag",
     "set_user",
+    "set_context",
     "isolation_scope",
     "new_scope",
     "flush",
@@ -134,6 +135,7 @@ __all__ = [
     "ToolExecutionType",
     "ToolType",
     # Types
+    "Span",
     "UserInfo",
     "Scope",
     "AgentAttributes",
@@ -340,21 +342,54 @@ def init(
 
 
 def set_tag(key: str, value: str) -> None:
-    _hub.get_global_scope().set_tag(key, value)
+    """Set a tag on the ISOLATION scope; exported spans captured under it carry it.
+
+    The isolation scope, not the process-global one (Sentry 2.x semantics): a
+    tag set inside one request's `isolation_scope()` — one tenant, one job —
+    stays that unit's and cannot bleed onto every other thread's spans. A tag
+    set outside any `isolation_scope()` block lands on the ambient context's
+    own isolation scope and behaves like a process-wide tag in a simple script.
+    A span-local attribute with the same key wins over the scope tag.
+    """
+    _hub.get_isolation_scope().set_tag(key, value)
 
 
-def set_user(user: UserInfo) -> None:
-    _hub.get_global_scope().set_user(user)
+def set_user(user: UserInfo | None) -> None:
+    """Attach `user` to the ISOLATION scope; exported spans carry `user.*`.
+
+    `UserInfo.id/email/username` map to the `user.id`/`user.email`/`user.name`
+    span attributes and `ip_address` to `client.address`; `None` fields are
+    skipped. `set_user(None)` clears the user again. Same scope targeting as
+    `set_tag` — see its docstring.
+    """
+    _hub.get_isolation_scope().set_user(user)
+
+
+def set_context(key: str, value: dict[str, _Any]) -> None:
+    """Store a named context payload on the ISOLATION scope.
+
+    Same scope targeting as `set_tag`. Contexts hold arbitrary host objects and
+    are NOT stamped onto exported spans; they are readable back off the scope.
+    """
+    _hub.get_isolation_scope().set_context(key, value)
 
 
 @_contextmanager
-def isolation_scope() -> _Iterator[_Any]:
+def isolation_scope() -> _Iterator[Scope]:
+    """Fork the current isolation scope for the block, then restore it.
+
+    The new isolation scope is a CLONE of the current one — ambient context
+    (tags, user, contexts) is inherited, and mutations made inside the block
+    are isolated to it (Sentry 2.x fork semantics). The current scope is
+    replaced with a fresh one for the block's duration.
+    """
     with _hub.isolation_scope() as s:
         yield s
 
 
 @_contextmanager
-def new_scope() -> _Iterator[_Any]:
+def new_scope() -> _Iterator[Scope]:
+    """Fork the current scope for the block, then restore it."""
     with _hub.new_scope() as s:
         yield s
 

@@ -6,7 +6,7 @@ from contextvars import ContextVar
 
 from ._client import Client
 from ._runtime import runtime
-from ._scope import Scope, merge_scopes, merged_trace_fields
+from ._scope import Scope, UserInfo, merge_scopes, merged_tags_and_user, merged_trace_fields
 from ._types import SpanContext
 
 _global_scope: Scope = Scope()
@@ -69,6 +69,11 @@ def get_merged_trace_fields() -> tuple[SpanContext | None, str | None]:
     return merged_trace_fields(get_global_scope(), get_isolation_scope(), get_current_scope())
 
 
+def get_merged_tags_and_user() -> tuple[dict[str, str], UserInfo | None]:
+    """The merged tags and user, without materializing the merge."""
+    return merged_tags_and_user(get_global_scope(), get_isolation_scope(), get_current_scope())
+
+
 @contextmanager
 def new_scope() -> Iterator[Scope]:
     forked = get_current_scope().clone()
@@ -81,7 +86,14 @@ def new_scope() -> Iterator[Scope]:
 
 @contextmanager
 def isolation_scope() -> Iterator[Scope]:
-    new_iso = Scope()
+    """Fork the current isolation scope for the block (Sentry 2.x semantics).
+
+    A CLONE, not a blank scope: the ambient context — tags, user, contexts —
+    is inherited, and mutations made inside the block stay on the fork and are
+    discarded with it. The current scope is replaced with a fresh one for the
+    block, exactly as before.
+    """
+    new_iso = get_isolation_scope().clone()
     iso_token = _isolation_scope.set(new_iso)
     cur_token = _current_scope.set(Scope())
     try:

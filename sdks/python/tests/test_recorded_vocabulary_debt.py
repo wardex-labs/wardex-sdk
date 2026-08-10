@@ -64,14 +64,14 @@ def client() -> _FakeClient:
 
 # --------------------------------------------------------------------------
 # 1. `gen_ai.operation.name` is NOT closed on the manual path — retired when the
-#    published `SpanBuilder.operation` setter can stop accepting a bare `str`.
+#    published `Span.operation` setter can stop accepting a bare `str`.
 # --------------------------------------------------------------------------
 
 
 def test_a_manual_span_may_still_name_an_operation_outside_the_vocabulary(client):
     """§6.2 declares the operation axis CLOSED. On the manual path it is not.
 
-    `SpanBuilder.operation` is published API typed `OperationName | str | None`,
+    `Span.operation` is published API typed `OperationName | str | None`,
     and `SpanDraft.set_operation_label` takes whatever it is handed — so a host
     can put an arbitrary string on `gen_ai.operation.name` and give a dashboard
     grouping by that key unbounded cardinality on the one axis §6.2 says is

@@ -16,7 +16,7 @@ def test_init_console_and_trace_flush(capsys):
         backend=BackendConfig(api_key="k"),
         intercept=False,
     )
-    with wardex_sdk.trace("s"):
+    with wardex_sdk.conversation("s"):
         with wardex_sdk.span("inner") as sp:
             sp.input_data = b"hi"
     wardex_sdk.flush()
@@ -26,7 +26,7 @@ def test_init_console_and_trace_flush(capsys):
 
 def test_capture_state_snapshot_recorded():
     wardex_sdk.init(backend=BackendConfig(api_key="k"), intercept=False)
-    with wardex_sdk.trace("s"):
+    with wardex_sdk.conversation("s"):
         wardex_sdk.capture_state_snapshot(
             turn_index=0,
             conversation_state=b'{"messages":[]}',
@@ -38,11 +38,17 @@ def test_capture_state_snapshot_recorded():
 def test_public_exports_exist():
     for name in (
         "init",
-        "trace",
+        "conversation",
         "span",
+        "workflow",
+        "agent",
+        "step",
+        "tool",
+        "Span",
         "capture_state_snapshot",
         "set_tag",
         "set_user",
+        "set_context",
         "isolation_scope",
         "new_scope",
         "flush",
@@ -63,7 +69,7 @@ def test_limits_config_is_public():
 
 def test_capture_state_snapshot_with_input_refs():
     wardex_sdk.init(backend=BackendConfig(api_key="k"), intercept=False)
-    with wardex_sdk.trace("s"):
+    with wardex_sdk.conversation("s"):
         wardex_sdk.capture_state_snapshot(
             turn_index=1,
             conversation_state=b'{"messages":[]}',

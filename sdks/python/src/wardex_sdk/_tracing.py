@@ -6,7 +6,7 @@ import time
 import uuid
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from . import _hub
 from ._assembly import (
@@ -33,8 +33,15 @@ from ._types import (
 )
 from .context._contextvar import fork_active_span
 
+if TYPE_CHECKING:
+    # Type-only: these three name the span machinery, which stays out of this
+    # module's runtime namespace — the `noqa: ANN201` escape these properties
+    # used to wear existed to dodge exactly this import, and a TYPE_CHECKING
+    # import states the same fact without leaving the properties untyped.
+    from ._types import CorrelationInfo, SpanContext, SpanId
 
-class SpanBuilder:
+
+class Span:
     """The object `wardex.span()` yields — a published surface over a `SpanDraft`.
 
     Every attribute below is a view onto the draft, so the manual path and the
@@ -61,7 +68,7 @@ class SpanBuilder:
         self.end_time_ns = 0
 
     @property
-    def context(self):  # noqa: ANN201 — SpanContext; kept untyped to avoid the import
+    def context(self) -> SpanContext:
         return self._draft.context
 
     @property
@@ -77,7 +84,7 @@ class SpanBuilder:
     # settable attribute on a published object, and turning a working assignment
     # into an `AttributeError` inside a user's `with` block is a break wardex
     # gains nothing from — the draft still decides what a legal span is, in
-    # `finish()`, which is where the check belongs.
+    # `_finish()`, which is where the check belongs.
     #
     # `correlation` and `parent_span_id` are the two exceptions and they are
     # read-only on purpose: parentage is decided by `_assembly/_parentage.py`
@@ -125,11 +132,11 @@ class SpanBuilder:
         self._draft.set_conversation(value)
 
     @property
-    def correlation(self):  # noqa: ANN201 — CorrelationInfo | None
+    def correlation(self) -> CorrelationInfo | None:
         return self._draft._correlation
 
     @property
-    def parent_span_id(self):  # noqa: ANN201 — SpanId | None
+    def parent_span_id(self) -> SpanId | None:
         return self._draft._parentage.parent_span_id
 
     def set_status(self, code: StatusCode, message: str = "") -> None:
@@ -141,7 +148,7 @@ class SpanBuilder:
         Without this the published surface could express the state that makes a
         span illegal (`set_status(ERROR)`) and had no way to express the state
         that makes it legal — so the only span a host ever marks as failed was
-        the only span the host could not keep. `finish()` still supplies OTel's
+        the only span the host could not keep. `_finish()` still supplies OTel's
         `_OTHER` when a manual span is ERROR with no type, so forgetting this
         call degrades the span rather than deleting it.
         """
@@ -217,7 +224,10 @@ class SpanBuilder:
     def output_data(self, value: bytes) -> None:
         self._draft._output_data = value
 
-    def finish(self) -> InternalSpan:
+    def _finish(self) -> InternalSpan:
+        # Private on purpose: the context manager owns completion. A public
+        # `finish()` on a CM-yielded object was a second way to end the span,
+        # and the one the `with` block then ran again on the way out.
         return self._draft.finish(self.end_time_ns or time.time_ns())
 
 
@@ -234,7 +244,7 @@ def _begin(
     name: str,
     kind: SpanKind,
     conversation: ConversationContext | None,
-) -> Iterator[SpanBuilder]:
+) -> Iterator[Span]:
     """Never raises an Exception of wardex's own making; the body ALWAYS runs.
 
     `wardex.span()` is the SDK's published context manager, so its `with` block
@@ -281,7 +291,7 @@ def _begin(
         ok = True
     if not ok:
         # A builder the host can still drive, over a draft nothing will emit —
-        # and never the shared NULL_DRAFT, because `SpanBuilder` is a view onto
+        # and never the shared NULL_DRAFT, because `Span` is a view onto
         # a draft's own fields and a host that writes through it must not be
         # writing into every other degraded span in the process. There is no
         # `finally` below this yield: the span is already lost, and running the
@@ -298,14 +308,14 @@ def _begin(
         # work the span was opened to watch. The flag says the missing parent is
         # wardex's doing, and the gate and the seam's edge both read it.
         with degraded_run():
-            yield SpanBuilder(
+            yield Span(
                 SpanDraft.manual(
                     _NULL_PARENTAGE, name=name, kind=kind, start_ns=0, source=CaptureSource.MANUAL
                 )
             )
         return
 
-    builder = SpanBuilder(draft)
+    builder = Span(draft)
     fork = None
     forked = False
     with guard("tracing.manual_fork", debug=_debug_enabled()):
@@ -330,11 +340,11 @@ def _begin(
             with guard("tracing.manual_fork_exit", debug=_debug_enabled()):
                 fork.__exit__(None, None, None)
         finished = None
-        # `finish()` validates, and a vocabulary breach must not reach the host
+        # `_finish()` validates, and a vocabulary breach must not reach the host
         # (I6) — a `with wardex.span(...)` block would otherwise raise on the
         # way out of code that has nothing to do with wardex.
         with guard("tracing.manual_span", debug=_debug_enabled()):
-            finished = builder.finish()
+            finished = builder._finish()
         client = None
         with guard("tracing.manual_client", debug=_debug_enabled()):
             client = _hub.get_client()
@@ -357,26 +367,47 @@ def _debug_enabled() -> bool:
     return debug
 
 
-@contextmanager
-def trace(
-    name: str,
-    op: OperationName | None = None,
-    tags: tuple[tuple[str, str], ...] = (),
-) -> Iterator[SpanBuilder]:
-    """Opens a top-level trace session and yields a SpanBuilder.
+class _WithOnly:
+    """`with` support over the generator CM, and NOTHING else — no decorator.
 
-    ``op`` is applied to the builder immediately and serialized as ``gen_ai.operation.name``.
-    ``tags`` is accepted for public API stability and nothing reads it: no scope tag
-    reaches the span, so passing tags here changes nothing about what is exported.
+    `@contextmanager` returns a `ContextDecorator`, so `span("x")` used to be
+    callable — and `@span("x")` on an `async def` compiled, ran, and silently
+    closed the span before any awaited work started, because the decorator
+    protocol wraps the CALL, which for a coroutine function merely builds the
+    coroutine. This shape keeps the `with` protocol byte-for-byte (plain
+    delegation over the generator CM) and turns the decorator misuse into a
+    `TypeError` at decoration time, naming the decorators that do it right.
     """
-    conversation = ConversationContext(conversation_id=str(uuid.uuid4()))
+
+    __slots__ = ("_api", "_cm")
+
+    def __init__(self, api: str, cm: Any) -> None:
+        self._api = api
+        self._cm = cm
+
+    def __enter__(self) -> Span:
+        return self._cm.__enter__()
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> bool | None:
+        return self._cm.__exit__(exc_type, exc, tb)
+
+    def __call__(self, *args: Any, **kwargs: Any) -> None:
+        raise TypeError(
+            f"{self._api}() is a context manager; decorate with "
+            "@workflow/@agent/@step/@tool instead"
+        )
+
+
+@contextmanager
+def _conversation(name: str, *, id: str | None, op: OperationName | None) -> Iterator[Span]:
+    conversation = ConversationContext(conversation_id=id if id is not None else str(uuid.uuid4()))
     # Reading the scope and stamping the conversation onto it are wardex's own
     # work, and they run BEFORE the host's block — so a failure here would take
     # the block with it. A conversation that could not be installed costs the
     # id on the spans inside; it does not cost the trace.
     scope = None
     installed = False
-    with guard("tracing.trace_scope", debug=_debug_enabled()):
+    with guard("tracing.conversation_scope", debug=_debug_enabled()):
         scope = _hub.get_current_scope()
         prev_conv = scope.conversation
         scope.conversation = conversation
@@ -384,10 +415,10 @@ def trace(
     if not installed:
         scope = None
         report_once(
-            "[wardex] wardex.trace(): internal error reading the active scope; "
-            "spans in this block will not carry a conversation id "
+            "[wardex] wardex.conversation(): internal error reading the active "
+            "scope; spans in this block will not carry a conversation id "
             "(re-run with debug=True for the traceback)",
-            key="wardex.trace.scope",
+            key="wardex.conversation.scope",
         )
     try:
         with _begin(name, SpanKind.INTERNAL, conversation) as builder:
@@ -395,23 +426,52 @@ def trace(
             yield builder
     finally:
         if scope is not None:
-            with guard("tracing.trace_scope_restore", debug=_debug_enabled()):
+            with guard("tracing.conversation_scope_restore", debug=_debug_enabled()):
                 scope.conversation = prev_conv
 
 
+def conversation(
+    name: str, *, id: str | None = None, op: OperationName | None = None
+) -> Iterator[Span]:
+    """Open a conversation: every span inside carries `gen_ai.conversation.id`.
+
+    This is NOT a trace root, which is why it is not called "trace": the span
+    it opens joins the ambient trace as a child like any other, and no new
+    `trace_id` is minted here. What it opens is a CONVERSATION — the
+    `gen_ai.conversation.id` every span captured inside the block is stamped
+    with, which is how a backend groups the turns of one chat.
+
+    `id=None` mints a fresh uuid4. An explicit `id` is used verbatim: a
+    multi-turn chat app passes its own session id so that every turn joins ONE
+    conversation instead of each turn becoming its own.
+    """
+    return _WithOnly("conversation", _conversation(name, id=id, op=op))
+
+
 @contextmanager
+def _span(
+    name: str,
+    op: OperationName | None,
+    kind: SpanKind,
+    agent: AgentAttributes | None,
+    tool: ToolAttributes | None,
+) -> Iterator[Span]:
+    with _begin(name, kind, None) as builder:
+        builder.agent = agent
+        builder.tool = tool
+        builder.operation = op
+        yield builder
+
+
 def span(
     name: str,
     op: OperationName | None = None,
     kind: SpanKind = SpanKind.INTERNAL,
     agent: AgentAttributes | None = None,
     tool: ToolAttributes | None = None,
-) -> Iterator[SpanBuilder]:
-    with _begin(name, kind, None) as builder:
-        builder.agent = agent
-        builder.tool = tool
-        builder.operation = op
-        yield builder
+) -> Iterator[Span]:
+    """Open a hand-named span over the host's block and yield it as a `Span`."""
+    return _WithOnly("span", _span(name, op, kind, agent, tool))
 
 
 def _call_site(fn: Callable[..., Any]) -> CallSite:
@@ -425,22 +485,33 @@ def _call_site(fn: Callable[..., Any]) -> CallSite:
 
 
 def _decorate(
-    name: str,
+    fn: Callable[..., Any] | None,
     *,
+    name: str | None,
     op: OperationName | None,
     kind: SpanKind = SpanKind.INTERNAL,
     agent: AgentAttributes | None = None,
     tool: ToolAttributes | None = None,
-    workflow_name: str | None = None,
-) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    names_workflow: bool = False,
+) -> Callable[..., Any]:
+    """The one body behind the four decorators.
+
+    `fn` is non-None exactly when the decorator was applied BARE (`@wardex.tool`
+    over the function itself); with keywords, `fn` is None and the returned
+    `deco` is what wraps. `name=None` resolves to `fn.__name__` at decoration
+    time, so the two forms name spans identically.
+    """
+
     def deco(fn: Callable[..., Any]) -> Callable[..., Any]:
+        span_name = name if name is not None else fn.__name__
+        workflow_name = span_name if names_workflow else None
         cs = _call_site(fn)
 
         if inspect.iscoroutinefunction(fn):
 
             @functools.wraps(fn)
             async def awrapper(*args: Any, **kwargs: Any) -> Any:
-                with span(name, op=op, kind=kind, agent=agent, tool=tool) as s:
+                with span(span_name, op=op, kind=kind, agent=agent, tool=tool) as s:
                     s.call_site = cs
                     s.workflow_name = workflow_name
                     return await fn(*args, **kwargs)
@@ -449,31 +520,49 @@ def _decorate(
 
         @functools.wraps(fn)
         def wrapper(*args: Any, **kwargs: Any) -> Any:
-            with span(name, op=op, kind=kind, agent=agent, tool=tool) as s:
+            with span(span_name, op=op, kind=kind, agent=agent, tool=tool) as s:
                 s.call_site = cs
                 s.workflow_name = workflow_name
                 return fn(*args, **kwargs)
 
         return wrapper
 
+    if fn is not None:
+        return deco(fn)
     return deco
 
 
-def workflow(*, name: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
-    return _decorate(name, op=OperationName.INVOKE_WORKFLOW, workflow_name=name)
+def workflow(
+    fn: Callable[..., Any] | None = None, *, name: str | None = None
+) -> Callable[..., Any]:
+    return _decorate(fn, name=name, op=OperationName.INVOKE_WORKFLOW, names_workflow=True)
 
 
 def agent(
-    *, name: str, agent: AgentAttributes | None = None
-) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
-    return _decorate(name, op=OperationName.INVOKE_AGENT, agent=agent)
+    fn: Callable[..., Any] | None = None,
+    *,
+    name: str | None = None,
+    attributes: AgentAttributes | None = None,
+) -> Callable[..., Any]:
+    return _decorate(fn, name=name, op=OperationName.INVOKE_AGENT, agent=attributes)
 
 
 def tool(
-    *, name: str, tool: ToolAttributes | None = None
-) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
-    return _decorate(name, op=OperationName.EXECUTE_TOOL, tool=tool)
+    fn: Callable[..., Any] | None = None,
+    *,
+    name: str | None = None,
+    attributes: ToolAttributes | None = None,
+) -> Callable[..., Any]:
+    return _decorate(fn, name=name, op=OperationName.EXECUTE_TOOL, tool=attributes)
 
 
-def task(*, name: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
-    return _decorate(name, op=None)
+def step(fn: Callable[..., Any] | None = None, *, name: str | None = None) -> Callable[..., Any]:
+    """One step of a larger run — a graph node, a pipeline stage, a phase.
+
+    Maps to `OperationName.EXECUTE_STEP`, so its spans appear on
+    operation-keyed dashboards like every other decorator's (the old `task()`
+    mapped no operation, and its spans vanished from any view keyed on
+    `gen_ai.operation.name`). "step" also stays clear of the "task" asyncio,
+    Celery and LangGraph each already mean something else by.
+    """
+    return _decorate(fn, name=name, op=OperationName.EXECUTE_STEP)

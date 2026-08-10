@@ -388,7 +388,7 @@ def _two_live_sessions(*, sid_a, sid_b, host_labels=None):
             return
         import wardex_sdk
 
-        with wardex_sdk.trace(label):
+        with wardex_sdk.conversation(label):
             async for _ in claude_agent_sdk.query(prompt="x", options=options, transport=transport):
                 pass
 
@@ -720,7 +720,7 @@ def test_the_tool_span_hangs_under_the_hosts_own_span():
     adapter.install(client, context_for(adapter.name(), client))
     try:
         transport = _ReaderDispatchTransport(adapter, _tool())
-        with wardex_sdk.trace("caller") as outer:
+        with wardex_sdk.conversation("caller") as outer:
             _run(adapter, transport)
         outer_ctx = outer.context
     finally:

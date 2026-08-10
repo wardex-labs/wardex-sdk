@@ -24,6 +24,7 @@ from ._assembly import (
     parent_is_closed_unit,
     resolve_parentage,
 )
+from ._enums import SnapshotType
 from ._types import InputRef, ToolDefinitionSet
 
 __all__ = ["capture_state_snapshot"]
@@ -31,13 +32,22 @@ __all__ = ["capture_state_snapshot"]
 
 def capture_state_snapshot(
     *,
-    snapshot_type: str = "turn_start",
+    snapshot_type: SnapshotType | str = SnapshotType.TURN_START,
     turn_index: int = 0,
     conversation_state: bytes = b"",
     input_refs: Iterable[InputRef | tuple[str, str]] = (),
     attributes: Mapping[str, str | int | float | bool] | None = None,
     tool_definitions: ToolDefinitionSet | None = None,
 ) -> None:
+    """Record a point-in-time state snapshot against the ambient span.
+
+    `snapshot_type` takes the `SnapshotType` enum, and — as THE deliberate
+    exception to the enums-only rule every config field follows — a bare
+    string alongside it. Degradation-not-validation is this call's semantics:
+    an unrecognized string is not refused, it is recorded as UNSPECIFIED with
+    `Limitation.SNAPSHOT_TYPE_UNKNOWN`, because a snapshot with a fuzzy label
+    is worth more than a snapshot deleted over one.
+    """
     client = _hub.get_client()
     if client is None:
         return
@@ -71,9 +81,9 @@ def capture_state_snapshot(
     # `finish()` validates, and I6 forbids a validation failure reaching the
     # host: `capture_state_snapshot` is called from the user's own code.
     with guard("capture_state_snapshot", debug=bool(client.config.debug)):
-        # `snapshot_type` stays a `str` in the signature (published API) and is
-        # coerced to `SnapshotType` inside the draft, where an unrecognized
-        # value degrades to UNSPECIFIED *with* Limitation.SNAPSHOT_TYPE_UNKNOWN
+        # `snapshot_type` is coerced to `SnapshotType` inside the draft (enum
+        # and string alike), where an unrecognized value degrades to
+        # UNSPECIFIED *with* Limitation.SNAPSHOT_TYPE_UNKNOWN
         # instead of being silently flattened by `codec.rs`'s `map_snap`.
         draft = SnapshotDraft(parentage, snapshot_type=snapshot_type, turn_index=turn_index)
         draft.set_conversation_state(conversation_state)

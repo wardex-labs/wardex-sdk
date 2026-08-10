@@ -535,7 +535,7 @@ class SpanDraft:
     def set_extra(self, key: str, value: _Scalar) -> None:
         """Write a namespaced attribute. `finish()` rejects an undeclared key.
 
-        MANUAL spans are exempt: `SpanBuilder.set_attribute` is a published API
+        MANUAL spans are exempt: `Span.set_attribute` is a published API
         that has always taken any key, and rejecting one now would delete a
         user's span to enforce a namespace wardex has not yet given them a way
         to declare (§6.5 tier 1's `FRAMEWORK_EXTRAS` does not exist yet).
@@ -710,11 +710,11 @@ class SpanDraft:
     def _normalize_manual_error(self) -> None:
         """Keep a host-marked failure instead of deleting it.
 
-        `SpanBuilder.set_status(StatusCode.ERROR)` is published API and
+        `Span.set_status(StatusCode.ERROR)` is published API and
         `StatusCode.ERROR` is its only non-OK member, so the ordinary way a host
         reports a failed operation would otherwise hit `_check_status` and
         delete the record of exactly the operation the host most wanted
-        recorded. `SpanBuilder.set_error` exists so a type CAN be given; this is
+        recorded. `Span.set_error` exists so a type CAN be given; this is
         what happens when it was not. `_OTHER` is OTel semconv's own fallback —
         "the instrumentation has no classification for this" — which is a true
         statement about a span whose failure only the host observed.

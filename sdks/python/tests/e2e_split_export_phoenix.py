@@ -249,7 +249,7 @@ def _split_export_becomes_one_trace(phoenix: str, report: _Report) -> None:
     mark = WIRE.count()
     export_mark = WIRE.export_count()
     run = secrets.token_hex(4)
-    with wardex_sdk.trace(f"e2e-root-{run}") as root:
+    with wardex_sdk.conversation(f"e2e-root-{run}") as root:
         trace_id = root.context.trace_id.hex()
         root_span_id = root.context.span_id.hex()
         for index in range(CHILDREN):
@@ -373,7 +373,7 @@ def _one_oversized_span_costs_one_span(phoenix: str, report: _Report) -> None:
 
     captured = io.StringIO()
     with contextlib.redirect_stderr(_Tee(sys.stderr, captured)):
-        with wardex_sdk.trace(f"e2e-drop-root-{run}") as root:
+        with wardex_sdk.conversation(f"e2e-drop-root-{run}") as root:
             trace_id = root.context.trace_id.hex()
             for index in range(3):
                 with wardex_sdk.span(f"e2e-small-{index}-{run}"):

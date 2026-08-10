@@ -64,15 +64,16 @@ _STEPS = (
     "limits_to_native_raises",
     "config_kwarg_still_validated",
     "init",
-    "trace",
+    "conversation",
     "span",
     "tool",
     "workflow",
-    "task",
+    "step",
     "agent",
     "snapshot",
     "set_tag",
     "set_user",
+    "set_context",
     "isolation_scope",
     "traceparent",
     "trace_headers",
@@ -370,15 +371,16 @@ STEPS = [
     ("limits_to_native_raises", _limits_to_native_raises),
     ("config_kwarg_still_validated", _config_kwarg_still_validated),
     ("init", lambda: wardex_sdk.init(backend=wardex_sdk.BackendConfig(api_key="k"))),
-    ("trace", lambda: wardex_sdk.trace("t").__enter__()),
+    ("conversation", lambda: wardex_sdk.conversation("t").__enter__()),
     ("span", lambda: wardex_sdk.span("s").__enter__()),
     ("tool", lambda: wardex_sdk.tool(name="t")(lambda: 7)()),
     ("workflow", lambda: wardex_sdk.workflow(name="w")(lambda: 7)()),
-    ("task", lambda: wardex_sdk.task(name="k")(lambda: 7)()),
+    ("step", lambda: wardex_sdk.step(name="k")(lambda: 7)()),
     ("agent", lambda: wardex_sdk.agent(name="a")(lambda: 7)()),
     ("snapshot", lambda: wardex_sdk.capture_state_snapshot()),
     ("set_tag", lambda: wardex_sdk.set_tag("a", "b")),
     ("set_user", lambda: wardex_sdk.set_user(UserInfo(id="u"))),
+    ("set_context", lambda: wardex_sdk.set_context("k", {"v": 1})),
     ("isolation_scope", _isolation_scope),
     ("traceparent", lambda: wardex_sdk.get_traceparent()),
     ("trace_headers", lambda: wardex_sdk.get_trace_headers()),
@@ -517,15 +519,16 @@ def test_a_hand_driven_transport_says_why_it_dropped_the_batch(tmp_path, flavour
 _DRIVEN = frozenset(
     {
         "init",
-        "trace",
+        "conversation",
         "span",
         "workflow",
         "agent",
-        "task",
+        "step",
         "tool",
         "capture_state_snapshot",
         "set_tag",
         "set_user",
+        "set_context",
         "isolation_scope",
         "new_scope",
         "flush",
@@ -573,12 +576,14 @@ def test_the_degraded_checklist_covers_the_whole_public_surface():
     }
     # Nothing to call and no core reach: a version string, the transport ABC the
     # three concrete transports above implement, a warning category, and the
-    # plain dataclasses the tracing surface is typed with (attribute blocks,
-    # tool definitions, the scope object).
+    # plain types the tracing surface is typed with (attribute blocks, tool
+    # definitions, the scope object, and `Span` — the type the CMs yield, which
+    # the `conversation`/`span` steps above already drive).
     inert = {
         "__version__",
         "Transport",
         "AgentAttributes",
+        "Span",
         "CallSite",
         "ConversationContext",
         "GenAIAttributes",

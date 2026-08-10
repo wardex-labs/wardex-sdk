@@ -180,7 +180,7 @@ def test_an_undeclared_extra_key_is_rejected():
 
 
 def test_a_manual_span_may_carry_any_extra_key():
-    """`SpanBuilder.set_attribute` is published and has always taken any key.
+    """`Span.set_attribute` is published and has always taken any key.
 
     Rejecting one would delete the user's span to enforce a namespace wardex
     has not yet given them a way to declare (`FRAMEWORK_EXTRAS`, which no

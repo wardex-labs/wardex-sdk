@@ -42,8 +42,8 @@ from wardex_sdk._enums import CaptureMode, CaptureSource, SpanKind, StatusCode, 
 from wardex_sdk._interceptors._mcp_stdio import _ProcState
 from wardex_sdk._interceptors._seam import ByteSeamInterceptor, _ConnectionState
 from wardex_sdk._interceptors._trackers import _Http1Tracker, _Http2Tracker, _WebSocketTracker
+from wardex_sdk._tracing import conversation
 from wardex_sdk._tracing import span as manual_span
-from wardex_sdk._tracing import trace
 
 # --------------------------------------------------------------------------
 # harness
@@ -716,7 +716,7 @@ def test_adapter_abort_emits_root_and_forces_children_closed(client):
 
 
 def test_manual_span_survives_and_gains_the_forensic_fields(client):
-    with trace("session") as root:
+    with conversation("session") as root:
         with manual_span("inner"):
             pass
 
@@ -746,7 +746,7 @@ def test_manual_span_marked_error_by_the_host_survives(client):
 def test_manual_span_can_name_its_own_error_type(client):
     """The other half: the published surface must be able to express the state
     that keeps the span, not only the state that used to delete it."""
-    with trace("root") as s:
+    with conversation("root") as s:
         s.set_status(StatusCode.ERROR)
         s.set_error("payment_declined", "card expired")
 
@@ -801,7 +801,7 @@ def test_snapshot_survives_and_carries_its_orphan_marker(client):
 def test_snapshot_with_an_unknown_type_degrades_instead_of_disappearing(client):
     """`SnapshotType` is a closed vocabulary. An unrecognized value used to be
     flattened to UNSPECIFIED inside `codec.rs` with nothing recorded."""
-    with trace("session"):
+    with conversation("session"):
         wardex_sdk.capture_state_snapshot(snapshot_type="not_a_type")
 
     (snap,) = client.snapshots

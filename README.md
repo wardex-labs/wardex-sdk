@@ -85,7 +85,7 @@ the program on the line that set it.
   fields are empty
 - Transport metrics (TCP/TLS timing, TTFT), gRPC (grpclib), WebSocket (`wss`), MCP stdio
 - Export to any OpenTelemetry backend via `OtlpHttpTransport`
-- Manual span decorators: `@workflow` / `@agent` / `@task` / `@tool` / `@span`
+- Manual span decorators: `@workflow` / `@agent` / `@step` / `@tool`
 - PII masking on by default: emails, phone numbers, credit cards (Luhn-verified),
   US SSNs, IP addresses, bank routing numbers, IBANs, and API-key/token secrets
   are masked before anything leaves the process (`pii=PIIConfig(mode=PIIMode.OFF)`

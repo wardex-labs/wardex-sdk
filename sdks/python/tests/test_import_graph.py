@@ -789,10 +789,11 @@ _CS1_DEBT: dict[str, frozenset[str]] = {
     "_adapters/_registry.py": frozenset({"Client", f"{_PKG}._client", f"{_PKG}._runtime"}),
     # The unit registry shrank this by one: `wardex_sdk._tracing` is gone, because the
     # in-process tool wrapper no longer opens a MANUAL span through the public
-    # `trace()` API. It opens a CALL unit instead, so the tool span is a child of
+    # tracing API. It opens a CALL unit instead, so the tool span is a child of
     # the session by construction rather than a root that happened to be started
     # inside one — the parent edge now comes from the unit that owns the call,
-    # not from whatever the ambient scope happened to hold when `trace()` ran.
+    # not from whatever the ambient scope happened to hold when the manual span
+    # was opened.
     # What is left is the `Client` type (an install() parameter annotation) and
     # `_types` for the typed blocks.
     "_adapters/_anthropic_agent_sdk.py": frozenset({"Client", f"{_PKG}._client", f"{_PKG}._types"}),
@@ -1983,10 +1984,10 @@ def test_a_non_literal_dynamic_import_is_reported_as_unauditable():
 
 
 def test_a_re_exported_symbol_from_a_package_is_not_invisible():
-    """`from .. import trace` names no module, and `_tracing.py` is above _assembly/."""
-    tree = _parse("from .. import capture_state_snapshot, trace\n")
+    """`from .. import conversation` names no module, and `_tracing.py` is above _assembly/."""
+    tree = _parse("from .. import capture_state_snapshot, conversation\n")
 
     found = _imported_modules("_assembly/_probe.py", tree)
 
-    assert f"{_PKG}:trace" in found
+    assert f"{_PKG}:conversation" in found
     assert f"{_PKG}:capture_state_snapshot" in found
