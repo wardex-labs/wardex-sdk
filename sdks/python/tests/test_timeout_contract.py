@@ -9,10 +9,11 @@ check. Each one is watched here.
     `deepcopy` and `pickle` all raised `TypeError` -- on objects that are the
     DEFAULTS of `wardex.flush` and `wardex.close`, and on one that is handed to
     third-party transport code.
-  * `Transport.timeout` was read by the client and declared nowhere, so a
-    third-party transport had no way to learn that keeping a `self.timeout`
-    changed how long a bare `flush()` waits, nor that omitting it silently cost
-    it the timeout it was built for.
+  * the configured-timeout attribute was read by the client and declared
+    nowhere, so a third-party transport had no way to learn that keeping a
+    `self.timeout` changed how long a bare `flush()` waits, nor that omitting
+    it silently cost it the timeout it was built for. It is declared now, and
+    named `export_timeout` so no subclass picks it by accident.
   * the 5.0 that every default on this path shares was four separate literals
     in three modules, under a comment claiming they could not drift.
   * "does this budget follow the transport" was asked as `timeout is
@@ -49,7 +50,7 @@ from wardex_sdk._client import (
 from wardex_sdk._config import BackendConfig, BatchingConfig, WardexConfig
 from wardex_sdk._enums import SpanKind
 from wardex_sdk._types import (
-    InternalEnvelope,
+    Envelope,
     InternalSpan,
     SpanContext,
     SpanId,
@@ -80,10 +81,10 @@ class _Recording(Transport):
     """Records the budget it is handed, and advertises a configured timeout."""
 
     def __init__(self, timeout: float = 30.0):
-        self.timeout = timeout
+        self.export_timeout = timeout
         self.budgets: list[float | None] = []
 
-    def export(self, envelope: InternalEnvelope, *, timeout: float | None = None) -> object | None:
+    def export(self, envelope: Envelope, *, timeout: float | None = None) -> object | None:
         self.budgets.append(timeout)
         return None
 
@@ -331,20 +332,23 @@ def test_a_bare_public_close_reaches_the_configured_shutdown_budget():
     assert budgets == [1.25]
 
 
-# -- 4. `Transport.timeout` is a declared contract ---------------------------
+# -- 4. `Transport.export_timeout` is a declared contract ---------------------
 
 
-def test_transport_declares_timeout_with_a_default():
+def test_transport_declares_export_timeout_with_a_default():
     """Declared on the ABC, so a subclass author can SEE it.
 
     It was read by the client and declared nowhere. Nothing crashed either way,
     which is what let it stay wrong: a transport that happened to keep a
     `self.timeout` redefined how long a bare `flush()` waited, and one that did
     not have the attribute quietly got 5 seconds instead of what it was built
-    for. Neither said anything.
+    for. Neither said anything. The rename to `export_timeout` is the other
+    half of the same fix: `timeout` is a name every second transport keeps for
+    its own bookkeeping, so the reflectively-read contract attribute now has a
+    name no subclass picks by accident.
     """
-    assert Transport.timeout == DEFAULT_TIMEOUT
-    assert "timeout" in Transport.__annotations__
+    assert Transport.export_timeout == DEFAULT_TIMEOUT
+    assert "export_timeout" in Transport.__annotations__
 
 
 def test_a_transport_that_says_nothing_gets_the_default():
@@ -355,12 +359,27 @@ def test_a_transport_that_says_nothing_gets_the_default():
     assert _configured_transport_timeout(Quiet()) == DEFAULT_TIMEOUT
 
 
-def test_a_transport_that_overrides_timeout_is_believed():
+def test_a_transports_own_timeout_attribute_no_longer_redefines_the_contract():
+    """The collision that forced the rename, pinned so it cannot come back: a
+    subclass keeping a `self.timeout` for its own bookkeeping is IGNORED by
+    the reflective read, which only believes `export_timeout`."""
+
+    class OwnBookkeeping(Transport):
+        def __init__(self):
+            self.timeout = 12.0  # the subclass's own business
+
+        def export(self, envelope, *, timeout=None):
+            return None
+
+    assert _configured_transport_timeout(OwnBookkeeping()) == DEFAULT_TIMEOUT
+
+
+def test_a_transport_that_overrides_export_timeout_is_believed():
     assert _configured_transport_timeout(OtlpHttpTransport("http://x", timeout=30.0)) == 30.0
 
     class PlainAttribute(Transport):
         def __init__(self):
-            self.timeout = 12.0
+            self.export_timeout = 12.0
 
         def export(self, envelope, *, timeout=None):
             return None
@@ -373,32 +392,33 @@ def test_a_transport_that_overrides_timeout_is_believed():
 
 def test_a_declaration_is_not_a_guarantee():
     """The read stays guarded. `Transport` is public and subclassable, so
-    `timeout` can still be a property that raises or a value `float()` rejects
-    -- and a duck-typed transport need not inherit from `Transport` at all.
+    `export_timeout` can still be a property that raises or a value `float()`
+    rejects -- and a duck-typed transport need not inherit from `Transport` at
+    all.
     """
 
     class Raises(Transport):
         @property
-        def timeout(self):
+        def export_timeout(self):
             raise RuntimeError("host code, misbehaving")
 
         def export(self, envelope, *, timeout=None):
             return None
 
     class NotANumber(Transport):
-        timeout = "soon"  # type: ignore[assignment]
+        export_timeout = "soon"  # type: ignore[assignment]
 
         def export(self, envelope, *, timeout=None):
             return None
 
     class Nonsense(Transport):
-        timeout = float("nan")
+        export_timeout = float("nan")
 
         def export(self, envelope, *, timeout=None):
             return None
 
     class Unusable(Transport):
-        timeout = 0.0
+        export_timeout = 0.0
 
         def export(self, envelope, *, timeout=None):
             return None

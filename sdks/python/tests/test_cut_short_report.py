@@ -110,7 +110,7 @@ def _timed(fn) -> float:
 def test_a_bare_flush_against_a_dead_backend_blames_nobody(black_hole, capsys):
     """THE DEFECT. A bare `flush()` follows the transport's own configured
     timeout, so the budget arriving at the transport is that same number minus
-    the acquire, the swap, `before_send` and the encode -- always a little
+    the acquire, the swap, `before_send_envelope` and the encode -- always a little
     short of it, always, on the path every host takes by default.
 
     Reading "shorter than configured" as "the caller chose it" therefore fired

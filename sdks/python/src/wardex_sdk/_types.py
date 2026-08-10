@@ -459,11 +459,26 @@ class EnvelopeHeader:
 
 
 @dataclass(frozen=True, slots=True)
-class InternalEnvelope:
+class Envelope:
+    """One export batch — what `Transport.export` and `before_send_envelope` receive.
+
+    OPAQUE BY CONTRACT. For a third-party transport the GUARANTEED surface is
+    exactly two things: `span_count`, and `Transport.encode(envelope)`, which
+    turns the envelope into masked OTLP wire bytes. The field structure below
+    is the SDK's internal read model — `InternalSpan` and the rest of it stay
+    internal — and it is NOT contract: it may change in any release. Code that
+    reaches past the guaranteed surface is reading internals, not API.
+    """
+
     header: EnvelopeHeader
     spans: tuple[InternalSpan, ...] = ()
     state_snapshots: tuple[InternalStateSnapshot, ...] = ()
     client_report: ClientReport | None = None
+
+    @property
+    def span_count(self) -> int:
+        """How many spans this batch carries — the one guaranteed readable fact."""
+        return len(self.spans)
 
 
 # --- Protocol parser return types ---
@@ -496,9 +511,25 @@ class ParsedMessage:
 # --- Callback protocols (concrete signatures instead of Callable) ---
 
 
-class BeforeSendCallback(TypingProtocol):
-    def __call__(self, envelope: InternalEnvelope) -> InternalEnvelope | None:
-        """Returning None cancels the send."""
+class BeforeSendEnvelopeCallback(TypingProtocol):
+    """The shape of `init(before_send_envelope=...)`. THE FROZEN CONTRACT:
+
+    * SYNCHRONOUS, called with the whole batch as an `Envelope`.
+    * PRE-MASKING: the hook sees raw captured data — PII masking runs after
+      this hook, inside the transport encoder — so what the hook reads may
+      contain what the wire never will.
+    * Return the RECEIVED envelope object to send the batch. In v1 the only
+      legal non-None return is the received object, and the SDK may rely on
+      that identity; there is no transformer contract over an opaque type.
+    * Return None to drop the batch. Dropping is deliberate and silent.
+    * Raising drops the batch FAIL-CLOSED: one `[wardex]` stderr line per
+      process says so, and the traceback prints under `debug=True`.
+    * The hook may run MORE than once for a batch a transport declined — the
+      next drain rebuilds the envelope and runs the hook over it again.
+    """
+
+    def __call__(self, envelope: Envelope) -> Envelope | None:
+        """Return the received envelope to send, None to cancel the batch."""
         ...
 
 
@@ -509,4 +540,4 @@ class SpanEnrichCallback(TypingProtocol):
 
 
 class FlushCallback(TypingProtocol):
-    def __call__(self, envelope: InternalEnvelope) -> None: ...
+    def __call__(self, envelope: Envelope) -> None: ...

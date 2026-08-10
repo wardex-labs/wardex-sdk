@@ -14,9 +14,9 @@ import pytest
 from wardex_sdk import _wardex_native
 from wardex_sdk._enums import Direction, Protocol, SpanKind, StatusCode
 from wardex_sdk._types import (
+    Envelope,
     EnvelopeHeader,
     HttpMeta,
-    InternalEnvelope,
     InternalSpan,
     SdkInfo,
     SpanContext,
@@ -58,8 +58,8 @@ def _span(**kw) -> InternalSpan:
     return InternalSpan(**base)
 
 
-def _envelope_with_span() -> InternalEnvelope:
-    return InternalEnvelope(
+def _envelope_with_span() -> Envelope:
+    return Envelope(
         header=_header(),
         spans=(
             _span(
@@ -82,8 +82,8 @@ def _envelope_with_span() -> InternalEnvelope:
     )
 
 
-def _envelope_no_spans() -> InternalEnvelope:
-    return InternalEnvelope(header=_header())
+def _envelope_no_spans() -> Envelope:
+    return Envelope(header=_header())
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -195,8 +195,8 @@ def test_an_oversized_batch_becomes_several_posts_and_loses_nothing():
         for i in range(1, 7)
     )
     t = OtlpHttpTransport(endpoint=f"http://127.0.0.1:{port}/v1/traces")
-    t.set_limits(_wardex_native.Limits(max_otlp_request_bytes=12_000))
-    t.export(InternalEnvelope(header=_header(), spans=spans))
+    t._set_limits(_wardex_native.Limits(max_otlp_request_bytes=12_000))
+    t.export(Envelope(header=_header(), spans=spans))
     srv.shutdown()
 
     assert len(_Handler.requests) > 1, "an oversized batch went out as one request"
@@ -237,8 +237,8 @@ def test_a_span_too_large_even_alone_is_dropped_without_taking_the_batch():
         ),
     )
     t = OtlpHttpTransport(endpoint=f"http://127.0.0.1:{port}/v1/traces", compress=False)
-    t.set_limits(_wardex_native.Limits(max_otlp_request_bytes=600))
-    t.export(InternalEnvelope(header=_header(), spans=spans))
+    t._set_limits(_wardex_native.Limits(max_otlp_request_bytes=600))
+    t.export(Envelope(header=_header(), spans=spans))
     srv.shutdown()
 
     delivered = [name for request in _Handler.requests for name in _span_names(request)]
@@ -264,10 +264,10 @@ def test_a_span_dropped_by_the_request_cap_is_reported_off_debug(capsys):
         ),
     )
     t = OtlpHttpTransport(endpoint=f"http://127.0.0.1:{port}/v1/traces", compress=False)
-    t.set_limits(_wardex_native.Limits(max_otlp_request_bytes=600))
+    t._set_limits(_wardex_native.Limits(max_otlp_request_bytes=600))
     capsys.readouterr()
-    t.export(InternalEnvelope(header=_header(), spans=spans))
-    t.export(InternalEnvelope(header=_header(), spans=spans))
+    t.export(Envelope(header=_header(), spans=spans))
+    t.export(Envelope(header=_header(), spans=spans))
     srv.shutdown()
     err = capsys.readouterr().err
     reset_reports_for_test()
@@ -316,9 +316,9 @@ def test_a_split_export_abandoned_partway_says_so_off_debug(monkeypatch, capsys)
         for i in range(1, 7)
     )
     t = OtlpHttpTransport(endpoint="http://127.0.0.1:1/v1/traces")
-    t.set_limits(_wardex_native.Limits(max_otlp_request_bytes=12_000))
+    t._set_limits(_wardex_native.Limits(max_otlp_request_bytes=12_000))
     capsys.readouterr()
-    t.export(InternalEnvelope(header=_header(), spans=spans))
+    t.export(Envelope(header=_header(), spans=spans))
     err = capsys.readouterr().err
     reset_reports_for_test()
 
@@ -383,9 +383,9 @@ def test_a_split_export_that_runs_out_of_budget_says_how_far_it_got(monkeypatch,
         for i in range(1, 7)
     )
     t = OtlpHttpTransport(endpoint="http://127.0.0.1:1/v1/traces", timeout=10.0)
-    t.set_limits(_wardex_native.Limits(max_otlp_request_bytes=12_000))
+    t._set_limits(_wardex_native.Limits(max_otlp_request_bytes=12_000))
     capsys.readouterr()
-    t.export(InternalEnvelope(header=_header(), spans=spans), timeout=0.35)
+    t.export(Envelope(header=_header(), spans=spans), timeout=0.35)
     err = capsys.readouterr().err
     reset_reports_for_test()
 
@@ -499,7 +499,7 @@ def test_the_encode_is_inside_the_budget_it_was_given(monkeypatch):
     """
     import urllib.request
 
-    from wardex_sdk.transport import _otlp_http
+    from wardex_sdk.transport import _base
 
     attempts: list[float | None] = []
 
@@ -513,8 +513,10 @@ def test_the_encode_is_inside_the_budget_it_was_given(monkeypatch):
         return out
 
     monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    # `_base`, not `_otlp_http`: the encode moved into `Transport.encode()`,
+    # the sanctioned path, and that module is where `native` is resolved.
     monkeypatch.setattr(
-        _otlp_http,
+        _base,
         "native",
         types.SimpleNamespace(codec=types.SimpleNamespace(encode_otlp_requests=slow_encode)),
     )
@@ -550,7 +552,7 @@ def test_a_skipped_post_is_reported_back_to_the_caller_as_undelivered(monkeypatc
     A drain hands over the envelope and then has to know whether it went. It
     cannot look inside a transport, and every attempt to infer it from the
     outside was wrong: the inference had to be made before the send, and host
-    code (`before_send`) runs in between and invalidates it. So the transport
+    code (`before_send_envelope`) runs in between and invalidates it. So the transport
     says so, at the moment it knows — and a `flush()` that gets this answer
     keeps its spans for the next drain instead of dropping them on the floor.
 
@@ -668,7 +670,7 @@ def test_a_degraded_transport_with_a_spent_deadline_still_names_the_missing_whee
 # whole distinction under test.
 
 #: The budget a caller named, in the shape the client builds it: `flush(1.0)`
-#: that spent most of its second before the socket opened -- a slow `before_send`
+#: that spent most of its second before the socket opened -- a slow `before_send_envelope`
 #: over a large envelope will do it.
 #:
 #: The two numbers are far enough apart to ROUND APART at one decimal, which is

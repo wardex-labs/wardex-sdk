@@ -23,7 +23,7 @@ from wardex_sdk._assembly import Limitation
 from wardex_sdk._client import Client
 from wardex_sdk._config import BackendConfig, BatchingConfig, PropagationConfig, WardexConfig
 from wardex_sdk._enums import SpanKind
-from wardex_sdk._types import InternalEnvelope, InternalSpan, SpanContext, SpanId, TraceId
+from wardex_sdk._types import Envelope, InternalSpan, SpanContext, SpanId, TraceId
 from wardex_sdk.transport._base import Transport
 
 _SIGNALS = (signal.SIGINT, signal.SIGTERM)
@@ -31,9 +31,9 @@ _SIGNALS = (signal.SIGINT, signal.SIGTERM)
 
 class _Recording(Transport):
     def __init__(self) -> None:
-        self.envelopes: list[InternalEnvelope] = []
+        self.envelopes: list[Envelope] = []
 
-    def export(self, envelope: InternalEnvelope) -> None:
+    def export(self, envelope: Envelope) -> None:
         self.envelopes.append(envelope)
 
 

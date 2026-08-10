@@ -7,7 +7,7 @@ from wardex_sdk import _hub
 from wardex_sdk._client import Client
 from wardex_sdk._config import BackendConfig, WardexConfig
 from wardex_sdk._tracing import conversation, span
-from wardex_sdk._types import InternalEnvelope, SpanContext, SpanId, TraceId
+from wardex_sdk._types import Envelope, SpanContext, SpanId, TraceId
 from wardex_sdk.transport._base import Transport
 
 TP = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
@@ -16,9 +16,9 @@ TS = "vendor=opaque-value"
 
 class _Recording(Transport):
     def __init__(self):
-        self.envelopes: list[InternalEnvelope] = []
+        self.envelopes: list[Envelope] = []
 
-    def export(self, envelope: InternalEnvelope) -> None:
+    def export(self, envelope: Envelope) -> None:
         self.envelopes.append(envelope)
 
 

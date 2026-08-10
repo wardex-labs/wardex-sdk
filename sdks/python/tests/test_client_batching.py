@@ -9,7 +9,7 @@ from wardex_sdk._config import BackendConfig, BatchingConfig, WardexConfig
 from wardex_sdk._enums import SpanKind
 from wardex_sdk._limits import LimitsConfig
 from wardex_sdk._types import (
-    InternalEnvelope,
+    Envelope,
     InternalSpan,
     SpanContext,
     SpanId,
@@ -30,9 +30,9 @@ def _wait_for(predicate, timeout=5.0):
 
 class _Recording(Transport):
     def __init__(self):
-        self.envelopes: list[InternalEnvelope] = []
+        self.envelopes: list[Envelope] = []
 
-    def export(self, envelope: InternalEnvelope) -> None:
+    def export(self, envelope: Envelope) -> None:
         self.envelopes.append(envelope)
 
 
@@ -130,15 +130,101 @@ def test_dropped_count_reported_once_in_debug(capsys):
     c.close()
 
 
-def test_before_send_exception_drops_envelope_and_does_not_propagate():
+def test_before_send_envelope_exception_drops_envelope_and_does_not_propagate(capsys):
+    """The hook's raise is fail-closed AND said out loud, once.
+
+    Off-debug this used to be pure silence: a raising hook ate every batch and
+    stderr was byte-identical to a filter dropping them on purpose. The
+    contract line is bounded to one per process (`report_once`), so the second
+    raise below must add nothing.
+    """
+
     def boom(envelope):
         raise RuntimeError("boom")
 
+    reset_reports_for_test()
     t = _Recording()
-    c = Client(WardexConfig(before_send=boom, backend=BackendConfig(api_key="k")), t)
+    c = Client(WardexConfig(before_send_envelope=boom, backend=BackendConfig(api_key="k")), t)
+    c._worker.stop()
+    capsys.readouterr()
     c.capture_span(_span())
     c.flush()  # must not raise (fail-closed: drop, spec §10)
     assert t.envelopes == []
+    err = capsys.readouterr().err
+    lines = [ln for ln in err.splitlines() if "before_send_envelope raised" in ln]
+    assert lines == [
+        "[wardex] before_send_envelope raised; batch dropped "
+        "(re-run with debug=True for the traceback)"
+    ], f"expected the one contract line, got {err!r}"
+    assert "Traceback" not in err, "the traceback is debug-gated and debug is off"
+
+    c.capture_span(_span())
+    c.flush()  # second raise: still dropped, still silent (the key is spent)
+    assert t.envelopes == []
+    assert "before_send_envelope raised" not in capsys.readouterr().err
+    c.close()
+    reset_reports_for_test()
+
+
+def test_before_send_envelope_raise_prints_the_traceback_under_debug(capsys):
+    def boom(envelope):
+        raise RuntimeError("the hook's own bug")
+
+    reset_reports_for_test()
+    t = _Recording()
+    c = Client(
+        WardexConfig(before_send_envelope=boom, backend=BackendConfig(api_key="k"), debug=True),
+        t,
+    )
+    c._worker.stop()
+    capsys.readouterr()
+    c.capture_span(_span())
+    c.flush()
+    err = capsys.readouterr().err
+    assert "before_send_envelope raised; batch dropped" in err
+    assert "RuntimeError" in err and "the hook's own bug" in err, (
+        f"debug=True did not surface the hook's traceback: {err!r}"
+    )
+    c.close()
+    reset_reports_for_test()
+
+
+def test_before_send_envelope_returning_none_drops_the_batch_silently(capsys):
+    reset_reports_for_test()
+    t = _Recording()
+    c = Client(
+        WardexConfig(
+            before_send_envelope=lambda envelope: None, backend=BackendConfig(api_key="k")
+        ),
+        t,
+    )
+    c._worker.stop()
+    capsys.readouterr()
+    c.capture_span(_span())
+    c.flush()
+    assert t.envelopes == []
+    assert capsys.readouterr().err == "", "a deliberate drop is not an event to report"
+    c.close()
+    reset_reports_for_test()
+
+
+def test_before_send_envelope_identity_return_ships_the_batch():
+    """The v1 contract: the only legal non-None return is the RECEIVED object,
+    and returning it sends the batch untouched."""
+    seen: list[Envelope] = []
+
+    def keep(envelope):
+        seen.append(envelope)
+        return envelope
+
+    t = _Recording()
+    c = Client(WardexConfig(before_send_envelope=keep, backend=BackendConfig(api_key="k")), t)
+    c._worker.stop()
+    c.capture_span(_span("kept"))
+    c.flush()
+    assert len(seen) == 1 and len(t.envelopes) == 1
+    assert t.envelopes[0] is seen[0], "the SDK may rely on identity; it shipped the received object"
+    assert [s.name for s in t.envelopes[0].spans] == ["kept"]
     c.close()
 
 
@@ -237,7 +323,7 @@ def test_capture_after_close_is_rejected():
     assert sum(len(e.spans) for e in t.envelopes) == 0
 
 
-def test_reentrant_flush_from_before_send_does_not_deadlock():
+def test_reentrant_flush_from_before_send_envelope_does_not_deadlock():
     """The signal handler re-enters _drain on the same thread; RLock must allow it."""
     t = _Recording()
     holder = {}
@@ -246,7 +332,7 @@ def test_reentrant_flush_from_before_send_does_not_deadlock():
         holder["client"].flush()  # same-thread nested drain (empty buffer) — must not hang
         return envelope
 
-    c = Client(WardexConfig(before_send=reenter, backend=BackendConfig(api_key="k")), t)
+    c = Client(WardexConfig(before_send_envelope=reenter, backend=BackendConfig(api_key="k")), t)
     holder["client"] = c
     c.capture_span(_span())
     # daemon: on a regression this thread hangs forever; it must not block process exit
@@ -354,7 +440,7 @@ class _TimeoutRecording(Transport):
         self.timeouts: list[float | None] = []
         self.flush_timeouts: list[float] = []
 
-    def export(self, envelope: InternalEnvelope, *, timeout: float | None = None) -> None:
+    def export(self, envelope: Envelope, *, timeout: float | None = None) -> None:
         self.timeouts.append(timeout)
 
     def flush(self, timeout: float = 5.0) -> None:
@@ -477,7 +563,7 @@ class _BlockingExport(Transport):
         self._in_export = in_export
         self._release = release
 
-    def export(self, envelope: InternalEnvelope, *, timeout=None) -> None:
+    def export(self, envelope: Envelope, *, timeout=None) -> None:
         self.names.extend(s.name for s in envelope.spans)
         if self.first:
             self.first = False
@@ -607,7 +693,7 @@ class _DeadlineHonouring(Transport):
         self.timeouts: list[float | None] = []
         self.shipped: list[str] = []
 
-    def export(self, envelope: InternalEnvelope, *, timeout=None) -> object | None:
+    def export(self, envelope: Envelope, *, timeout=None) -> object | None:
         self.timeouts.append(timeout)
         if timeout is not None and timeout <= 0:
             return UNDELIVERED
@@ -625,8 +711,8 @@ def test_close_with_a_spent_budget_reports_the_tail_it_cannot_send(capsys):
     counted and stderr empty.
 
     What close() reacts to is the transport's own verdict on this envelope, not
-    a reading of the clock taken before `before_send` ran: see
-    `test_a_before_send_that_outlives_close_s_budget_is_still_reported`, which
+    a reading of the clock taken before `before_send_envelope` ran: see
+    `test_a_before_send_envelope_that_outlives_close_s_budget_is_still_reported`, which
     is the same loss with the clock check made useless.
     """
     reset_reports_for_test()
@@ -679,7 +765,7 @@ class _LegacyIgnoringDeadline(Transport):
     def __init__(self):
         self.shipped: list[str] = []
 
-    def export(self, envelope: InternalEnvelope) -> None:
+    def export(self, envelope: Envelope) -> None:
         self.shipped.extend(s.name for s in envelope.spans)
 
 
@@ -714,7 +800,7 @@ class _IgnoresTheDeadlineAndDelivers(Transport):
     def __init__(self):
         self.shipped: list[str] = []
 
-    def export(self, envelope: InternalEnvelope, *, timeout=None) -> None:
+    def export(self, envelope: Envelope, *, timeout=None) -> None:
         self.shipped.extend(s.name for s in envelope.spans)
 
 
@@ -809,7 +895,7 @@ def test_a_returned_batch_yields_to_the_buffer_cap_instead_of_overflowing_it():
     oldest) yields rather than evicting live spans.
 
     The buffer refills WHILE the batch is out by the one deterministic route
-    there is: `before_send` is host code, it runs after the swap and before the
+    there is: `before_send_envelope` is host code, it runs after the swap and before the
     transport, and nothing stops it capturing. A background thread would race;
     this does not."""
     t = _DeadlineHonouring()
@@ -823,7 +909,7 @@ def test_a_returned_batch_yields_to_the_buffer_cap_instead_of_overflowing_it():
     c = Client(
         WardexConfig(
             limits=LimitsConfig(max_buffer_spans=3),
-            before_send=_captures_while_the_batch_is_out,
+            before_send_envelope=_captures_while_the_batch_is_out,
             backend=BackendConfig(api_key="k"),
             batching=BatchingConfig(flush_interval=3600.0),
         ),
@@ -844,10 +930,10 @@ def test_a_returned_batch_yields_to_the_buffer_cap_instead_of_overflowing_it():
     assert c._lost == 0, "a buffer-full drop was labelled a shutdown loss"
 
 
-def test_a_before_send_that_outlives_close_s_budget_is_still_reported(capsys):
-    """The door a clock check taken before `before_send` could never see.
+def test_a_before_send_envelope_that_outlives_close_s_budget_is_still_reported(capsys):
+    """The door a clock check taken before `before_send_envelope` could never see.
 
-    `before_send` is HOST code and runs INSIDE the deadline, after any check the
+    `before_send_envelope` is HOST code and runs INSIDE the deadline, after any check the
     drain could have made and before the transport is reached. So a budget that
     was healthy at the check is spent by the send: the transport is handed 0.0,
     skips, and the tail is out of the buffer, off the wire, uncounted, with
@@ -866,7 +952,7 @@ def test_a_before_send_that_outlives_close_s_budget_is_still_reported(capsys):
     t = _DeadlineHonouring()
     c = Client(
         WardexConfig(
-            before_send=_slow,
+            before_send_envelope=_slow,
             backend=BackendConfig(api_key="k"),
             batching=BatchingConfig(flush_interval=3600.0),
         ),
@@ -875,19 +961,19 @@ def test_a_before_send_that_outlives_close_s_budget_is_still_reported(capsys):
     c._worker.stop()
     c.capture_span(_span("only"))
     capsys.readouterr()
-    c.close(0.1)  # ample at the acquire, spent by the time before_send returns
+    c.close(0.1)  # ample at the acquire, spent by the time before_send_envelope returns
     err = capsys.readouterr().err
 
     assert t.timeouts == [0.0], f"the transport was not handed a spent budget: {t.timeouts}"
     assert t.shipped == [], "a spent budget somehow reached the backend"
     assert list(c._buffer.spans) == [], "unshippable spans left resident in a closed client"
-    assert c._lost == 1, f"the span before_send outlived was not counted: _lost={c._lost}"
+    assert c._lost == 1, f"the span before_send_envelope outlived was not counted: _lost={c._lost}"
     assert "could not ship 1 buffered span(s)" in err, (
-        f"a before_send that outlived the budget lost the span in silence: {err!r}"
+        f"a before_send_envelope that outlived the budget lost the span in silence: {err!r}"
     )
 
 
-def test_a_before_send_that_outlives_a_flush_budget_gives_the_spans_back(capsys):
+def test_a_before_send_envelope_that_outlives_a_flush_budget_gives_the_spans_back(capsys):
     """The same door on the non-final path, where the answer is different: the
     spans are recoverable, so they go back rather than being announced as lost.
     """
@@ -900,7 +986,7 @@ def test_a_before_send_that_outlives_a_flush_budget_gives_the_spans_back(capsys)
     t = _DeadlineHonouring()
     c = Client(
         WardexConfig(
-            before_send=_slow,
+            before_send_envelope=_slow,
             backend=BackendConfig(api_key="k"),
             batching=BatchingConfig(flush_interval=3600.0),
         ),
@@ -1014,7 +1100,7 @@ def test_hostile_close_timeout_never_reaches_the_host():
 def test_exhausted_budget_never_reaches_the_transport_as_a_negative():
     """`Transport` is public API and a third-party one will pass `timeout`
     straight to a socket, where a negative is an error rather than "no wait".
-    The remaining budget can legitimately go negative — before_send is called
+    The remaining budget can legitimately go negative — before_send_envelope is called
     inside the deadline — so both floors have to hold."""
 
     class _Recorder(Transport):
@@ -1022,20 +1108,20 @@ def test_exhausted_budget_never_reaches_the_transport_as_a_negative():
             self.export_timeouts: list[float | None] = []
             self.flush_timeouts: list[float] = []
 
-        def export(self, envelope: InternalEnvelope, *, timeout: float | None = None) -> None:
+        def export(self, envelope: Envelope, *, timeout: float | None = None) -> None:
             self.export_timeouts.append(timeout)
 
         def flush(self, timeout: float = 5.0) -> None:
             self.flush_timeouts.append(timeout)
 
-    def _slow_before_send(envelope):
+    def _slow_before_send_envelope(envelope):
         time.sleep(0.05)  # outlives the 0.01s budget below
         return envelope
 
     t = _Recorder()
     c = Client(
         WardexConfig(
-            before_send=_slow_before_send,
+            before_send_envelope=_slow_before_send_envelope,
             backend=BackendConfig(api_key="k"),
             batching=BatchingConfig(flush_interval=3600.0),
         ),

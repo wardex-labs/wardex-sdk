@@ -43,7 +43,7 @@ from test_langgraph_adapter import (
 )
 from wardex_sdk._assembly import Limitation, ParentSource
 from wardex_sdk._enums import ToolExecutionType, ToolType
-from wardex_sdk._types import InternalEnvelope
+from wardex_sdk._types import Envelope
 from wardex_sdk.transport import _codec
 
 #: One tool call, spelled once. Every payload and block assertion below reads
@@ -666,7 +666,7 @@ def test_a_run_a_node_and_a_tool_span_survive_the_native_codec(installed):  # no
     node = next(s for s in steps(spans) if s.name == "execute_step tools")
     tool_span = tools(spans)[0]
 
-    envelope = InternalEnvelope(header=_header(), spans=(run, node, tool_span))
+    envelope = Envelope(header=_header(), spans=(run, node, tool_span))
     decoded = _codec.decode(_codec.encode(envelope))
     out = {item["span"]["name"]: item["span"] for item in decoded["items"]}
     assert set(out) == {"invoke_workflow HandBuilt", "execute_step tools", "execute_tool pure_add"}

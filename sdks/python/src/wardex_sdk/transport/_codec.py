@@ -1,6 +1,6 @@
 """Thin codec wrapper — delegates to the native codec submodule.
 
-encode: InternalEnvelope → proto+zstd bytes.
+encode: Envelope → proto+zstd bytes.
 decode: bytes → dict (round-trip verification/debugging). Python has no direct knowledge of proto.
 """
 
@@ -9,11 +9,11 @@ from __future__ import annotations
 from typing import Any
 
 from .. import _wardex_native
-from .._types import InternalEnvelope
+from .._types import Envelope
 
 
 def encode(
-    envelope: InternalEnvelope,
+    envelope: Envelope,
     pii_mode: str = "off",
     pii_disabled: tuple[str, ...] = (),
     limits: object | None = None,
@@ -26,9 +26,11 @@ def encode(
     `limits` is a native Limits object (LimitsConfig.to_native()); the codec
     reads `zstd_level` from it. None uses the core default.
 
-    SECURITY: any future wire transport MUST pass the policy explicitly (see
-    Transport.set_pii_policy) — this "off" default is for local round-trip
-    fidelity only, it must never be relied on for an export path."""
+    SECURITY: any future wire transport MUST pass the policy explicitly (the
+    transport's own stored policy, installed by `Transport._set_pii_policy`;
+    `Transport.encode()` is the sanctioned path that does so) — this "off"
+    default is for local round-trip fidelity only, it must never be relied on
+    for an export path."""
     return _wardex_native.codec.encode_envelope(envelope, pii_mode, list(pii_disabled), limits)
 
 

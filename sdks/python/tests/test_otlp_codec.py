@@ -1,6 +1,6 @@
 """OTLP/HTTP traces marshaling.
 
-InternalEnvelope -> encode_otlp_traces -> decode -> field preservation.
+Envelope -> encode_otlp_traces -> decode -> field preservation.
 """
 
 from __future__ import annotations
@@ -22,11 +22,11 @@ from wardex_sdk._enums import (
     StatusCode,
 )
 from wardex_sdk._types import (
+    Envelope,
     EnvelopeHeader,
     GenAIAttributes,
     HttpMeta,
     InputRef,
-    InternalEnvelope,
     InternalSpan,
     InternalStateSnapshot,
     SdkInfo,
@@ -68,8 +68,8 @@ def _span(**kw) -> InternalSpan:
     return InternalSpan(**base)
 
 
-def _envelope_with_span() -> InternalEnvelope:
-    return InternalEnvelope(
+def _envelope_with_span() -> Envelope:
+    return Envelope(
         header=_header(),
         spans=(
             _span(
@@ -92,8 +92,8 @@ def _envelope_with_span() -> InternalEnvelope:
     )
 
 
-def _envelope_with_gen_ai(model: str, input_tokens: int) -> InternalEnvelope:
-    return InternalEnvelope(
+def _envelope_with_gen_ai(model: str, input_tokens: int) -> Envelope:
+    return Envelope(
         header=_header(),
         spans=(
             _span(
@@ -110,11 +110,11 @@ def _envelope_with_gen_ai(model: str, input_tokens: int) -> InternalEnvelope:
     )
 
 
-def _envelope_no_spans() -> InternalEnvelope:
-    return InternalEnvelope(header=_header())
+def _envelope_no_spans() -> Envelope:
+    return Envelope(header=_header())
 
 
-def _envelope_with_snapshot_only() -> InternalEnvelope:
+def _envelope_with_snapshot_only() -> Envelope:
     snap = InternalStateSnapshot(
         trace_id=TraceId(b"\x03" * 16),
         span_id=SpanId(b"\x04" * 8),
@@ -124,10 +124,10 @@ def _envelope_with_snapshot_only() -> InternalEnvelope:
         conversation_state=b"history",
         input_refs=(InputRef(key="doc.md", content_hash="sha256:abc"),),
     )
-    return InternalEnvelope(header=_header(), state_snapshots=(snap,))
+    return Envelope(header=_header(), state_snapshots=(snap,))
 
 
-def _first_span(env: InternalEnvelope) -> dict:
+def _first_span(env: Envelope) -> dict:
     data = _wardex_native.codec.encode_otlp_traces(env)
     d = _wardex_native.codec.decode_otlp_traces(data)
     return d["resource_spans"][0]["scope_spans"][0]["spans"][0]
@@ -171,7 +171,7 @@ def test_non_utf8_payload_becomes_base64_with_encoding_marker():
     binary = b"\x89PNG\xff\x00binary"
     env = _envelope_with_span()
     span = replace(env.spans[0], input_data=binary, output_data=b"plain text")
-    attrs = _first_span(InternalEnvelope(header=env.header, spans=(span,)))["attributes"]
+    attrs = _first_span(Envelope(header=env.header, spans=(span,)))["attributes"]
     assert attrs["wardex.input_data"] == base64.b64encode(binary).decode()
     assert attrs["wardex.input_data.encoding"] == "base64"
     assert attrs["wardex.output_data"] == "plain text"
@@ -190,7 +190,7 @@ def test_utf8_with_nul_is_binary_not_text():
     payload = b"name: alice\x00\x00\x00\x00"  # valid UTF-8, contains NUL
     env = _envelope_with_span()
     span = replace(env.spans[0], input_data=payload)
-    attrs = _first_span(InternalEnvelope(header=env.header, spans=(span,)))["attributes"]
+    attrs = _first_span(Envelope(header=env.header, spans=(span,)))["attributes"]
     assert attrs["wardex.input_data"] == base64.b64encode(payload).decode()
     assert attrs["wardex.input_data.encoding"] == "base64"
 
@@ -214,9 +214,7 @@ def test_user_extra_cannot_collide_with_or_spoof_the_encoding_companion():
             ("myapp.blob.encoding", "hex"),  # not a rewritten key: untouched
         ),
     )
-    data = _wardex_native.codec.encode_otlp_traces(
-        InternalEnvelope(header=env.header, spans=(span,))
-    )
+    data = _wardex_native.codec.encode_otlp_traces(Envelope(header=env.header, spans=(span,)))
     d = _wardex_native.codec.decode_otlp_traces(data)
     span_out = d["resource_spans"][0]["scope_spans"][0]["spans"][0]
     keys = [k for k in span_out["attributes"] if k.endswith(".encoding")]
@@ -257,7 +255,7 @@ def test_the_model_that_answered_names_the_span_when_the_request_recorded_none()
     """An assembled turn knows the response model before it knows the requested
     one, and the SDK has it one attribute away — so a span named for the model
     that answered beats one named for no model at all."""
-    env = InternalEnvelope(
+    env = Envelope(
         header=_header(),
         spans=(
             _span(
@@ -274,7 +272,7 @@ def test_an_llm_span_with_no_model_at_all_keeps_its_own_name():
     """Not `embeddings` and not `embeddings unknown`: the first is strictly less
     than the name already there, the second invents a model of that name for a
     backend to aggregate."""
-    env = InternalEnvelope(
+    env = Envelope(
         header=_header(),
         spans=(_span(gen_ai=GenAIAttributes(operation=OperationName.EMBEDDINGS)),),
     )
@@ -306,7 +304,7 @@ def test_a_tool_span_the_builder_produced_keeps_its_subject():
     draft.set_status(StatusCode.OK)
     span = draft.finish(end_ns=2)
     assert span.name == "execute_tool Bash"
-    env = InternalEnvelope(header=_header(), spans=(span,))
+    env = Envelope(header=_header(), spans=(span,))
     assert _first_span(env)["name"] == "execute_tool Bash"
 
 
@@ -324,7 +322,7 @@ def test_a_decorator_named_span_keeps_the_name_the_host_chose():
     draft.set_operation_label(OperationName.EXECUTE_TOOL)
     draft.set_status(StatusCode.OK)
     span = draft.finish(end_ns=2)
-    env = InternalEnvelope(header=_header(), spans=(span,))
+    env = Envelope(header=_header(), spans=(span,))
     assert _first_span(env)["attributes"]["gen_ai.operation.name"] == "execute_tool"
     assert _first_span(env)["name"] == "search_docs"
 
@@ -372,12 +370,12 @@ def test_state_snapshot_skipped():
 # ==========================================================================
 
 
-def _envelope_with_uncertainty() -> InternalEnvelope:
+def _envelope_with_uncertainty() -> Envelope:
     from wardex_sdk._assembly import Limitation
     from wardex_sdk._assembly._parentage import ParentSource
     from wardex_sdk._types import CaptureIntegrity, CorrelationInfo
 
-    return InternalEnvelope(
+    return Envelope(
         header=_header(),
         spans=(
             _span(

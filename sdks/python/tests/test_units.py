@@ -1205,7 +1205,7 @@ def _lock_is_free(reg: UnitRegistry) -> bool:
 )
 def test_the_sink_is_never_called_while_the_registry_lock_is_held(drive):
     """I11. `Client.capture_span` can be re-entered from a same-thread signal
-    handler and can run the host's `before_send` on the calling thread; the
+    handler and can run the host's `before_send_envelope` on the calling thread; the
     assembler this replaces calls it holding its own RLock. Two re-entrant locks
     in a fixed order across an async callback and a signal path is a deadlock
     waiting for a schedule, and it is invisible to every other test here.

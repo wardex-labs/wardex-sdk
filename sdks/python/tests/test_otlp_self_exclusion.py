@@ -62,7 +62,7 @@ def test_otlp_transport_wraps_post_with_suppress_capture(monkeypatch):
     # Verify that _send_batch wraps the urlopen call with suppress_capture — replace
     # urlopen with a stub that checks is_suppressed() to confirm suppression is
     # actually active at POST time.
-    from wardex_sdk._types import EnvelopeHeader, InternalEnvelope, SdkInfo
+    from wardex_sdk._types import Envelope, EnvelopeHeader, SdkInfo
     from wardex_sdk.transport import _otlp_http
 
     observed: dict[str, Any] = {}
@@ -82,7 +82,7 @@ def test_otlp_transport_wraps_post_with_suppress_capture(monkeypatch):
     monkeypatch.setattr(_otlp_http.urllib.request, "urlopen", fake_urlopen)
 
     transport = _otlp_http.OtlpHttpTransport(endpoint="http://127.0.0.1:1/v1/traces")
-    envelope = InternalEnvelope(
+    envelope = Envelope(
         header=EnvelopeHeader(
             event_id="evt-1",
             api_key="k",
@@ -100,7 +100,7 @@ def test_otlp_transport_wraps_post_with_suppress_capture(monkeypatch):
     from wardex_sdk._enums import SpanKind, StatusCode
     from wardex_sdk._types import InternalSpan, SpanContext, SpanId, TraceId
 
-    envelope = InternalEnvelope(
+    envelope = Envelope(
         header=envelope.header,
         spans=(
             InternalSpan(

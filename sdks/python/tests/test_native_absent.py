@@ -254,8 +254,9 @@ class _NonEmptyEnvelope:
 def _transport_export():
     t = OtlpHttpTransport("http://127.0.0.1:1/v1/traces")
     # A published symbol a host can drive by hand without ever reaching init().
-    # It must decline, not raise, and it must not open a socket.
-    t.set_pii_policy("off", ())
+    # It must decline, not raise, and it must not open a socket. The private
+    # policy plumbing init() uses must also work without a core.
+    t._set_pii_policy(wardex_sdk.PIIConfig())
     t.export(_NonEmptyEnvelope())
 
 
@@ -583,9 +584,11 @@ def test_the_degraded_checklist_covers_the_whole_public_surface():
         "__version__",
         "Transport",
         "AgentAttributes",
+        "BeforeSendEnvelopeCallback",
         "Span",
         "CallSite",
         "ConversationContext",
+        "Envelope",
         "GenAIAttributes",
         "InputRef",
         "Scope",

@@ -5,15 +5,15 @@ from wardex_sdk._client import Client
 from wardex_sdk._config import BackendConfig, WardexConfig
 from wardex_sdk._enums import OperationName, ProviderName, SpanKind, StatusCode
 from wardex_sdk._tracing import conversation, span
-from wardex_sdk._types import GenAIAttributes, InternalEnvelope
+from wardex_sdk._types import Envelope, GenAIAttributes
 from wardex_sdk.transport._base import Transport
 
 
 class _Recording(Transport):
     def __init__(self):
-        self.envelopes: list[InternalEnvelope] = []
+        self.envelopes: list[Envelope] = []
 
-    def export(self, envelope: InternalEnvelope) -> None:
+    def export(self, envelope: Envelope) -> None:
         self.envelopes.append(envelope)
 
 

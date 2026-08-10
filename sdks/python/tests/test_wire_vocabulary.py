@@ -35,8 +35,8 @@ from wardex_sdk._enums import SpanKind, StatusCode
 from wardex_sdk._types import (
     CaptureIntegrity,
     CorrelationInfo,
+    Envelope,
     EnvelopeHeader,
-    InternalEnvelope,
     InternalSpan,
     SdkInfo,
     SpanContext,
@@ -148,7 +148,7 @@ def _roundtrip(span: InternalSpan) -> dict:
     The point of these tests is that the two enums survive protobuf, so
     asserting against a hand-built dict would test nothing.
     """
-    env = InternalEnvelope(
+    env = Envelope(
         header=EnvelopeHeader(
             event_id="evt-1",
             api_key="k",

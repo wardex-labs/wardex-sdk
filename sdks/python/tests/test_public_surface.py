@@ -48,26 +48,29 @@ def test_every_name_in_all_resolves():
 # --------------------------------------------------------------------------
 
 #: Parameter types a public callable still references without a public
-#: spelling. A RECORDED DEBT, not an allowance: each entry is a type whose
-#: public future is decided by a later slice of the same API batch, and the
-#: set may only shrink. A NEW entry means a callable was published whose
-#: signature a user cannot type out — export the type or unpublish the
-#: callable instead of widening this.
+#: spelling. Two kinds of entry, said apart because only one may persist: a
+#: RECORDED DEBT (a type whose public future is decided by a later slice —
+#: those entries may only shrink) and a RECORDED OPACITY (a constructor the
+#: contract itself declares internal — those entries are the record of that
+#: decision). A NEW debt entry means a callable was published whose signature
+#: a user cannot type out — export the type or unpublish the callable instead
+#: of widening this.
 _KNOWN_UNEXPORTED: dict[str, frozenset[str]] = {
-    # `before_send=` is typed with the callback protocol; the protocol's
-    # public spelling lands with the hook's own rename in the transport slice
-    # of this batch. Shrink-only: resolve it by exporting the (renamed) type,
-    # never by widening this entry.
-    "init": frozenset({"BeforeSendCallback"}),
-    # `Scope.active_span_context` is the span machinery, which stays
-    # unnameable from user code (I5). The scope retarget landed with the
-    # tracing slice; this parameter's public story is decided with the
-    # transport slice, where the envelope/read-model types get their home.
+    # OPACITY, decided with the transport slice: `Envelope` is exported but
+    # its docstring declares the guaranteed surface to be `span_count` and
+    # `Transport.encode()` alone — the constructor and its field types
+    # (`InternalSpan` and the rest of the read model) stay internal, and that
+    # is what keeps them changeable. Hosts never build an `Envelope`.
+    "Envelope": frozenset(
+        {"EnvelopeHeader", "InternalSpan", "InternalStateSnapshot", "ClientReport"}
+    ),
+    # OPACITY, same decision: `Scope.active_span_context` is the span
+    # machinery, which stays unnameable from user code (I5) — the transport
+    # slice resolved the read-model question by keeping it internal.
     "Scope": frozenset({"SpanContext"}),
-    # `Span.__init__` takes the internal draft — the object is YIELDED by the
-    # `span()`/`conversation()` CMs, never constructed by hosts, so the
-    # constructor parameter is plumbing rather than API. Resolved with the
-    # transport slice alongside the other read-model types.
+    # OPACITY: `Span.__init__` takes the internal draft — the object is
+    # YIELDED by the `span()`/`conversation()` CMs, never constructed by
+    # hosts, so the constructor parameter is plumbing rather than API.
     "Span": frozenset({"SpanDraft"}),
 }
 
