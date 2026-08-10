@@ -25,7 +25,7 @@ from wardex_sdk._interceptors._close_hook import (
     uninstall_shared_close_hook,
 )
 from wardex_sdk._interceptors._trackers import _Http2Tracker, _WebSocketTracker
-from wardex_sdk._limits import CaptureLimits
+from wardex_sdk._limits import LimitsConfig
 
 
 @pytest.fixture(autouse=True)
@@ -515,7 +515,7 @@ def test_the_h2_latch_is_capped_for_a_connection_that_never_closes():
     carries its own cap, sourced from the same `max_streams` the Rust parser
     bounds its own stream table with.
     """
-    tracker = _Http2Tracker(CaptureLimits(max_streams=8).to_native())
+    tracker = _Http2Tracker(LimitsConfig(max_streams=8).to_native())
     for sid in range(1, 2 * 200, 2):
         tracker.on_request_bytes(_h2_request(sid))  # opened, never answered
 
@@ -531,7 +531,7 @@ def test_a_stream_answered_after_its_latch_entry_was_dropped_says_so():
     trace root), or the cap discarded what was. Only the tracker can tell them
     apart, and only while it still remembers how far the eviction reached.
     """
-    tracker = _Http2Tracker(CaptureLimits(max_streams=2).to_native())
+    tracker = _Http2Tracker(LimitsConfig(max_streams=2).to_native())
     client_enc, server_enc = Encoder(), Encoder()
     for sid in (1, 3, 5):
         tracker.on_request_bytes(_h2_open(client_enc, sid))
@@ -551,7 +551,7 @@ def test_an_unlatched_stream_above_the_eviction_mark_is_not_blamed_on_the_cap():
     evicted at all, so an answer for a stream this tracker never saw opened —
     capture that began mid-connection — is an ordinary unparented transaction.
     """
-    tracker = _Http2Tracker(CaptureLimits(max_streams=8).to_native())
+    tracker = _Http2Tracker(LimitsConfig(max_streams=8).to_native())
     (txn,) = tracker.on_response_bytes(_h2_answer(Encoder(), 7))
     assert txn.parent_evicted is False
 
@@ -567,7 +567,7 @@ def test_a_stream_opened_before_capture_attached_is_not_blamed_on_the_cap():
     exports the request and response bodies of traffic the configured mode had
     filtered out.
     """
-    tracker = _Http2Tracker(CaptureLimits(max_streams=2).to_native())
+    tracker = _Http2Tracker(LimitsConfig(max_streams=2).to_native())
     client_enc, server_enc = Encoder(), Encoder()
     # This tracker's first sight of the connection is stream 101; 1 through 99
     # happened before it existed.
@@ -591,7 +591,7 @@ def test_closing_the_connection_forgets_the_eviction_mark_too():
     different set of streams and report every unlatched one on the new
     connection as a parent wardex lost.
     """
-    tracker = _Http2Tracker(CaptureLimits(max_streams=2).to_native())
+    tracker = _Http2Tracker(LimitsConfig(max_streams=2).to_native())
     enc = Encoder()
     for sid in (1, 3, 5):
         tracker.on_request_bytes(_h2_open(enc, sid))
@@ -627,7 +627,7 @@ def test_a_dropped_latch_entry_reaches_the_span_as_wardexs_own_fault():
             debug = False
             # No `capture_mode`, so the policy resolves the declared default,
             # AGENT — the mode this traffic has to survive.
-            limits = CaptureLimits(max_streams=2)
+            limits = LimitsConfig(max_streams=2)
 
         def __init__(self) -> None:
             self.config = self._Config()

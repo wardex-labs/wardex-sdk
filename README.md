@@ -41,27 +41,26 @@ way.
 | Group | What it decides |
 |---|---|
 | `backend=BackendConfig(...)` | Where the data goes and whose it is: `endpoint`, `api_key` |
-| `retention=RetentionPolicy(...)` | How long a captured payload is kept: `default`, `triggers` |
-| `pii=PIIPolicy(...)` | What leaves the process: `mode`, `disabled_categories` |
-| `batching=BatchingPolicy(...)` | When buffered spans are sent: `flush_interval`, `flush_on_signals` |
-| `limits=CaptureLimits(...)` | How much is captured — see [Resource limits](#resource-limits) |
-| `propagation=PropagationPolicy(...)` | Whether wardex touches outbound traffic: `enabled`, `targets` |
+| `pii=PIIConfig(...)` | What leaves the process: `mode`, `disabled_categories` |
+| `batching=BatchingConfig(...)` | When buffered spans are sent: `flush_interval`, `flush_on_signals`, `shutdown_timeout` |
+| `limits=LimitsConfig(...)` | How much is captured — see [Resource limits](#resource-limits) |
+| `propagation=PropagationConfig(...)` | Whether wardex touches outbound traffic: `enabled`, `targets` |
 
 ```python
 import wardex_sdk as wardex
-from wardex_sdk import BackendConfig, BatchingPolicy, OtlpHttpTransport, PIIPolicy, PIIMode
+from wardex_sdk import BackendConfig, BatchingConfig, OtlpHttpTransport, PIIConfig, PIIMode
 
 wardex.init(
     transport=OtlpHttpTransport(endpoint="https://<your-collector>/v1/traces"),
     intercept=True,
     backend=BackendConfig(api_key="..."),
-    batching=BatchingPolicy(flush_interval=2.0),
-    pii=PIIPolicy(mode=PIIMode.OFF),
+    batching=BatchingConfig(flush_interval=2.0),
+    pii=PIIConfig(mode=PIIMode.OFF),
 )
 ```
 
 Everything that belongs to no group stays top-level: `debug`, `before_send`,
-`capture_mode`, `release`, `environment`, `tags`, `adapters`, and the
+`capture_mode`, `release`, `environment`, `adapters`, and the
 interception trio `intercept` / `intercept_hosts` / `interceptors`.
 
 `BackendConfig(endpoint=...)` without a `transport=` builds the default
@@ -88,12 +87,12 @@ the program on the line that set it.
 - Manual span decorators: `@workflow` / `@agent` / `@task` / `@tool` / `@span`
 - PII masking on by default: emails, phone numbers, credit cards (Luhn-verified),
   US SSNs, IP addresses, bank routing numbers, IBANs, and API-key/token secrets
-  are masked before anything leaves the process (`pii=PIIPolicy(mode=PIIMode.OFF)`
-  to disable, `pii=PIIPolicy(disabled_categories={PIICategory.IP_ADDRESS})` for
+  are masked before anything leaves the process (`pii=PIIConfig(mode=PIIMode.OFF)`
+  to disable, `pii=PIIConfig(disabled_categories={PIICategory.IP_ADDRESS})` for
   per-category opt-out)
 - Background batching: automatic flush every 5s / on buffer threshold /
   at exit and on SIGINT/SIGTERM (chained; opt out with
-  `batching=BatchingPolicy(flush_on_signals=False)`)
+  `batching=BatchingConfig(flush_on_signals=False)`)
 - Shutdown closes agent runs that are still in flight, so an interrupted run
   still exports its span — marked `unit_interrupted` or `adapter_uninstalled`
   — instead of vanishing along with its open tool calls
@@ -131,12 +130,12 @@ Trace context propagation is **opt-in** — a plain `wardex.init(...)` never
 touches your outbound requests or headers. Turn it on with:
 
 ```python
-from wardex_sdk import PropagationPolicy
+from wardex_sdk import PropagationConfig
 
 wardex.init(
     transport=OtlpHttpTransport(endpoint="https://<your-collector>/v1/traces"),
     intercept=True,
-    propagation=PropagationPolicy(
+    propagation=PropagationConfig(
         enabled=True,  # inject W3C headers on outbound calls
         targets=(
             "api.internal.example.com",
@@ -146,7 +145,7 @@ wardex.init(
 )
 ```
 
-With `propagation=PropagationPolicy(enabled=True)`, outbound calls made through httpx (sync + async),
+With `propagation=PropagationConfig(enabled=True)`, outbound calls made through httpx (sync + async),
 requests, or aiohttp get a `traceparent` (and `tracestate`, if one was
 received) header attached automatically, as long as an active trace context
 exists and the request doesn't already carry a `traceparent`. **If
@@ -274,20 +273,15 @@ API itself accepts is never truncated by capture.
 
 ```python
 import wardex_sdk as wardex
-from wardex_sdk import CaptureLimits
+from wardex_sdk import LimitsConfig
 
 wardex.init(
-    limits=CaptureLimits(
+    limits=LimitsConfig(
         max_body_bytes=64 * 1024 * 1024,  # larger multimodal payloads
         max_buffer_bytes=16 * 1024 * 1024,  # tighter memory budget
     )
 )
 ```
-
-Two exceptions are inert today, so setting them has no effect:
-`replay_buffer_size` (nothing reads it yet) and `zstd_level` (read only by the
-envelope encoder, which no live export path calls — the OTLP exporter
-compresses with gzip, which is what OTLP receivers accept).
 
 **Two of the bounds are about the wire rather than about capture.** The OTLP
 surface encodes binary payloads as base64, so what leaves is up to a third

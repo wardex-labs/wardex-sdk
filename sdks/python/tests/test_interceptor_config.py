@@ -90,20 +90,34 @@ def test_the_table_decides_the_order_and_not_the_caller():
 
 
 def test_a_selection_without_intercept_installs_nothing():
-    """`intercept` is the switch; `interceptors` only refines it."""
-    install_configured_interceptors(None, WardexConfig(interceptors=(InterceptorName.SSL,)))
+    """`intercept` is the switch; `interceptors` only refines it.
+
+    `intercept=False` is explicit since the default flipped to True — the
+    premise under test is precisely "the switch is off".
+    """
+    install_configured_interceptors(
+        None, WardexConfig(intercept=False, interceptors=(InterceptorName.SSL,))
+    )
 
     assert _installed() == []
 
 
-def test_a_refinement_of_a_switch_that_is_off_is_announced_under_debug(capsys):
+def test_a_refinement_of_a_switch_that_is_off_is_announced():
     """Not an error, but silence about it is how a user concludes the selection
-    was honoured."""
-    install_configured_interceptors(
-        None, WardexConfig(debug=True, interceptors=(InterceptorName.SSL,))
-    )
+    was honoured. The announcement is `init()`'s — a `WardexConfigWarning`,
+    unconditional where it used to hide behind `debug` — and the install path
+    keeps only the behavior (nothing installs).
+    """
+    import wardex_sdk
+    from wardex_sdk import WardexConfigWarning, _hub
 
-    assert "no effect without intercept=True" in capsys.readouterr().err
+    _hub.reset_for_test()
+    try:
+        with pytest.warns(WardexConfigWarning, match="no effect without intercept=True"):
+            wardex_sdk.init(intercept=False, interceptors=(InterceptorName.SSL,))
+        assert _installed() == []
+    finally:
+        wardex_sdk.close()
 
 
 def test_a_bare_string_is_refused_where_the_mistake_was_made():

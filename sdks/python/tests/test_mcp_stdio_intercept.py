@@ -5,7 +5,7 @@ import anyio
 import pytest
 
 import wardex_sdk as wardex
-from wardex_sdk import CaptureLimits, _hub
+from wardex_sdk import LimitsConfig, _hub
 from wardex_sdk._enums import SpanKind, StatusCode
 
 
@@ -150,10 +150,10 @@ async def test_mcp_stream_buffer_limit_reaches_the_parser_through_the_intercepto
     more, producing no observable signal either way. A 64-byte override is
     the only thing that can make it trip the stream-buffer latch, so seeing
     the debug log fire is a genuinely discriminating proof that the override
-    travelled from CaptureLimits through the interceptor into the native
+    travelled from LimitsConfig through the interceptor into the native
     parser (not a value re-derived independently, e.g. re-reading config).
     """
-    wardex.init(intercept=True, debug=True, limits=CaptureLimits(max_stream_buffer_bytes=64))
+    wardex.init(intercept=True, debug=True, limits=LimitsConfig(max_stream_buffer_bytes=64))
     proc = await anyio.open_process([sys.executable, "-c", _JUNK_BURST])
     await _drain_stdout(proc)
     await proc.wait()
@@ -169,7 +169,7 @@ async def test_disabled_reason_logged_once_per_mcp_stream(capsys):
     # (see test_ssl_interceptor.py). No span is ever produced (nothing to carry
     # the reason), so debug mode logs it instead — exactly once per stream, not
     # once per read that keeps arriving after the parser has already latched off.
-    wardex.init(intercept=True, debug=True, limits=CaptureLimits(max_stream_buffer_bytes=64))
+    wardex.init(intercept=True, debug=True, limits=LimitsConfig(max_stream_buffer_bytes=64))
     proc = await anyio.open_process([sys.executable, "-c", _JUNK_LOOP])
     await _drain_stdout(proc)
     await proc.wait()
@@ -385,7 +385,7 @@ async def test_a_subprocess_that_only_streams_stdout_detaches():
     wrapper, so this subprocess paid the tee, the copy and a JSON-RPC parse
     attempt on every read for as long as it lived.
     """
-    wardex.init(intercept=True, limits=CaptureLimits(mcp_sniff_bytes=64))
+    wardex.init(intercept=True, limits=LimitsConfig(mcp_sniff_bytes=64))
     proc = await anyio.open_process([sys.executable, "-c", _STDOUT_ONLY])
     teed_send, teed_receive = proc.stdin.send, proc.stdout.receive
 

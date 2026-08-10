@@ -46,7 +46,7 @@ from wardex_sdk._client import (
     _configured_transport_timeout,
     _UnnamedTimeout,
 )
-from wardex_sdk._config import BackendConfig, BatchingPolicy, WardexConfig
+from wardex_sdk._config import BackendConfig, BatchingConfig, WardexConfig
 from wardex_sdk._enums import SpanKind
 from wardex_sdk._types import (
     InternalEnvelope,
@@ -91,7 +91,7 @@ class _Recording(Transport):
 def _client(transport):
     c = Client(
         WardexConfig(
-            backend=BackendConfig(api_key="k"), batching=BatchingPolicy(flush_interval=3600.0)
+            backend=BackendConfig(api_key="k"), batching=BatchingConfig(flush_interval=3600.0)
         ),
         transport,
     )
@@ -132,11 +132,13 @@ def test_unnamed_timeout_round_trips(op, round_trip, sentinel):
 
     assert type(copied) is _UnnamedTimeout
     assert float(copied) == float(sentinel)
-    # Both facts, not just the number: a copy that came back as a bare float,
-    # or as an `_UnnamedTimeout` that forgot `follows_transport`, reconstructs
-    # without raising and then means something else. That is section 2's job to
-    # catch at the boundary; it is cheaper to catch it here too.
+    # All the facts, not just the number: a copy that came back as a bare
+    # float, or as an `_UnnamedTimeout` that forgot `follows_transport` or
+    # `follows_shutdown_config`, reconstructs without raising and then means
+    # something else. That is section 2's job to catch at the boundary; it is
+    # cheaper to catch it here too.
     assert copied.follows_transport is sentinel.follows_transport
+    assert copied.follows_shutdown_config is sentinel.follows_shutdown_config
     assert repr(copied) == repr(sentinel)
 
 
@@ -242,6 +244,91 @@ def test_follows_transport_defaults_to_not_following():
     assert _UnnamedTimeout(1.0, "<x>").follows_transport is False
     assert _SHUTDOWN_TIMEOUT.follows_transport is False
     assert _FOLLOW_TRANSPORT_TIMEOUT.follows_transport is True
+
+
+def test_follows_shutdown_config_is_the_shutdown_sentinels_fact_alone():
+    """`close()`'s twin of `follows_transport`, with the same conservative
+    default: only the shutdown sentinel carries it, and a fresh budget that
+    forgets the keyword does not start following the config by accident."""
+    assert _SHUTDOWN_TIMEOUT.follows_shutdown_config is True
+    assert _FOLLOW_TRANSPORT_TIMEOUT.follows_shutdown_config is False
+    assert _UnnamedTimeout(1.0, "<x>").follows_shutdown_config is False
+
+
+# -- 3b. a bare close() follows batching.shutdown_timeout ---------------------
+
+
+def _closing_budgets(client: Client) -> list[float]:
+    """Record every budget `close()` hands the worker's stop — the first of
+    the three per-step spends, and the one cheapest to observe."""
+    budgets: list[float] = []
+    original_stop = client._worker.stop
+
+    def recording_stop(budget: float = DEFAULT_TIMEOUT) -> None:
+        budgets.append(budget)
+        original_stop(budget)
+
+    client._worker.stop = recording_stop  # type: ignore[method-assign]
+    return budgets
+
+
+def test_a_bare_close_follows_batching_shutdown_timeout():
+    """One number, one home: the budget a bare `close()` spends is the
+    config's `batching.shutdown_timeout`, resolved by `Client.close` itself —
+    so the atexit hook, re-init's teardown and `wardex.close()` all follow the
+    field without any of them restating a number."""
+    client = Client(
+        WardexConfig(
+            backend=BackendConfig(api_key="k"),
+            batching=BatchingConfig(flush_interval=3600.0, shutdown_timeout=1.25),
+        ),
+        _Recording(timeout=30.0),
+    )
+    budgets = _closing_budgets(client)
+
+    client.close()
+
+    assert budgets == [1.25]
+
+
+def test_an_explicit_close_budget_ignores_the_config():
+    """`close(t)` is a caller-owned budget; the config field only backs the
+    bare call."""
+    client = Client(
+        WardexConfig(
+            backend=BackendConfig(api_key="k"),
+            batching=BatchingConfig(flush_interval=3600.0, shutdown_timeout=1.25),
+        ),
+        _Recording(timeout=30.0),
+    )
+    budgets = _closing_budgets(client)
+
+    client.close(9.0)
+
+    assert budgets == [9.0]
+
+
+def test_a_bare_public_close_reaches_the_configured_shutdown_budget():
+    """The same fact through the public door: `wardex.close()` with no
+    argument expresses "follow the config" by passing nothing down, and the
+    client resolves its own field."""
+    from wardex_sdk import _hub
+
+    client = Client(
+        WardexConfig(
+            backend=BackendConfig(api_key="k"),
+            batching=BatchingConfig(flush_interval=3600.0, shutdown_timeout=1.25),
+        ),
+        _Recording(timeout=30.0),
+    )
+    budgets = _closing_budgets(client)
+    _hub.set_client(client)
+    try:
+        wardex_sdk.close()
+    finally:
+        _hub.set_client(None)
+
+    assert budgets == [1.25]
 
 
 # -- 4. `Transport.timeout` is a declared contract ---------------------------

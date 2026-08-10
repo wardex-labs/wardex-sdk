@@ -997,13 +997,12 @@ class _PythonCensus:
 _UNRESOLVED_PY: frozenset[tuple[str, str]] = frozenset(
     {
         # `flush` is two functions: `_WebSocketTracker.flush(marker)` and the
-        # public `Client.flush(timeout)`. The scanner keys helpers by bare name,
-        # so the public one's argument lands here. Narrowing the key would drop
-        # `ws_no_close`, which is the marker hardest to find in the first place.
-        # `_client.py` used to appear here for the same reason and no longer
-        # does: its transport.flush() argument is now a local derived from a
-        # deadline, which the scanner resolves.
-        ("__init__.py", "Name:timeout"),
+        # public `Client.flush(timeout)`. The scanner keys helpers by bare
+        # name, so a bare-Name argument to the public one lands here.
+        # `__init__.py` used to appear for exactly that and no longer does:
+        # the public `wardex.flush` now maps its None default to a sentinel in
+        # a conditional expression, which the scanner reads. `_client.py` left
+        # the list the same way (a local derived from a deadline).
         ("_types.py", "Tuple"),
         # `_build_tool(sess, tool, end_ns, failed, markers, error_type)` declares
         # a marker-ish parameter, so R4 registers it; R9 then makes it read-all

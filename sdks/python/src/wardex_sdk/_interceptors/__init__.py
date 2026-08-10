@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import sys
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
@@ -95,15 +94,12 @@ def install_configured_interceptors(client: Client | None, config: WardexConfig)
     third-party seam (see `_mcp_stdio` on anyio).
     """
     if not config.intercept:
-        if config.interceptors is not None and config.debug:
-            # The same shape as `init()`'s pii disabled-categories line, and for
-            # the same reason: a refinement of a switch that is off is not an
-            # error, but silence about it is how a user concludes the selection
-            # was honoured.
-            print(
-                "[wardex] interceptors=... has no effect without intercept=True",
-                file=sys.stderr,
-            )
+        # A selection under intercept=False installs nothing, and `init()` owns
+        # the announcement: it warns with a `WardexConfigWarning`,
+        # unconditionally, at the one place every configured install passes
+        # through. Announcing here as well would say the same thing twice on
+        # that path, and this function's own behavior — the switch wins over
+        # the refinement — is unchanged.
         return
     wanted = (
         tuple(_INTERCEPTORS)

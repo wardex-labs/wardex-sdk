@@ -90,7 +90,7 @@ _SIGNALS = (signal.SIGINT, signal.SIGTERM)
 #:
 #: And a stalled backend at SIGTERM stays SILENT on this channel, deliberately.
 #: The report exists to hand someone a number they can change, and here there is
-#: none: `batching=BatchingPolicy(flush_on_signals=False)` plus a handler of the
+#: none: `batching=BatchingConfig(flush_on_signals=False)` plus a handler of the
 #: host's own is the only
 #: lever, which is a documentation matter and not a line printed while the
 #: process is being torn down. The fact is not hidden either -- the transport
@@ -243,12 +243,14 @@ class Runtime:
         would import `_interceptors/` on a teardown path that may be running
         precisely because the native extension is absent.
 
-        `timeout=None` means "the client's own shutdown default", and it is
-        expressed by NOT passing one. Restating the number here would put the
-        same 5 seconds in two places, and `Client.close` distinguishes a budget
-        wardex picked from one a host named by the value's TYPE — a default
-        re-stated at this call site is indistinguishable from a host's, and gets
-        the host blamed for an export it never bounded.
+        `timeout=None` means "the client's own shutdown default" — which
+        `Client.close` resolves from its config's `batching.shutdown_timeout`
+        — and it is expressed by NOT passing one. Restating a number here
+        would put the same budget in two places, and `Client.close`
+        distinguishes a budget wardex picked from one a host named by the
+        value's TYPE — a default re-stated at this call site is
+        indistinguishable from a host's, and gets the host blamed for an
+        export it never bounded.
         """
         if self._interceptors is not None:
             self._interceptors.uninstall_all()

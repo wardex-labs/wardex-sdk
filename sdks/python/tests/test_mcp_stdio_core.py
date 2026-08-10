@@ -83,9 +83,9 @@ def test_proc_state_reports_disabled_reason_from_either_direction():
     request or the response parser, mirroring _Http1Tracker's equivalent —
     the JSON-RPC path must not keep the silent-failure mode where a parser
     stops parsing and nothing anywhere says why."""
-    from wardex_sdk import CaptureLimits
+    from wardex_sdk import LimitsConfig
 
-    limits = CaptureLimits(max_stream_buffer_bytes=64).to_native()
+    limits = LimitsConfig(max_stream_buffer_bytes=64).to_native()
 
     st_req = _ProcState(limits=limits)
     assert st_req.disabled_reason() is None

@@ -48,10 +48,10 @@ import pytest
 import wardex_sdk
 from wardex_sdk import _worker
 from wardex_sdk._client import Client
-from wardex_sdk._config import BackendConfig, BatchingPolicy, WardexConfig
+from wardex_sdk._config import BackendConfig, BatchingConfig, WardexConfig
 from wardex_sdk._enums import SpanKind
 from wardex_sdk._interceptors._close_hook import CloseRegistry, close_registry
-from wardex_sdk._limits import CaptureLimits
+from wardex_sdk._limits import LimitsConfig
 from wardex_sdk._types import InternalEnvelope, InternalSpan, SpanContext, SpanId, TraceId
 from wardex_sdk._worker import BatchWorker
 from wardex_sdk.transport._base import Transport
@@ -92,8 +92,8 @@ def _client() -> Client:
     """
     return Client(
         WardexConfig(
-            limits=CaptureLimits(max_buffer_spans=10_000),
-            batching=BatchingPolicy(flush_interval=3600.0),
+            limits=LimitsConfig(max_buffer_spans=10_000),
+            batching=BatchingConfig(flush_interval=3600.0),
             backend=BackendConfig(api_key="k"),
         ),
         _Recording(),

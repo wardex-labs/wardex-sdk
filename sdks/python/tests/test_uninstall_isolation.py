@@ -30,7 +30,7 @@ from wardex_sdk._adapters._base import AdapterInterface
 from wardex_sdk._adapters._registry import AdapterRegistry
 from wardex_sdk._assembly import Limitation, counters
 from wardex_sdk._client import Client
-from wardex_sdk._config import BackendConfig, BatchingPolicy, WardexConfig
+from wardex_sdk._config import BackendConfig, BatchingConfig, WardexConfig
 from wardex_sdk._enums import SpanKind
 from wardex_sdk._interceptors._base import InterceptorInterface
 from wardex_sdk._interceptors._registry import InterceptorRegistry
@@ -296,7 +296,7 @@ def test_teardown_still_closes_the_client_when_an_uninstall_raises():
     transport = _Recording()
     client = Client(
         WardexConfig(
-            backend=BackendConfig(api_key="k"), batching=BatchingPolicy(flush_interval=3600.0)
+            backend=BackendConfig(api_key="k"), batching=BatchingConfig(flush_interval=3600.0)
         ),
         transport,
     )

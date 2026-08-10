@@ -90,7 +90,7 @@ from enum import Enum
 from typing import Any, Protocol
 
 from .._enums import CaptureSource, StatusCode
-from .._limits import CaptureLimits
+from .._limits import LimitsConfig
 from .._scope import Scope
 from .._types import ConversationContext, SpanContext
 from ..context._contextvar import activate_span, install_span, restore_scope
@@ -841,7 +841,7 @@ class UnitRegistry:
     ) -> None:
         """`max_*` default from the CORE, never from a Python literal.
 
-        `CaptureLimits().resolved()` reads `_wardex_native.limits_defaults()`, so
+        `LimitsConfig().resolved()` reads `_wardex_native.limits_defaults()`, so
         a default cannot drift from `crates/wardex-limits` — a hardcoded 512 here
         would agree with the core today and silently disagree the moment someone
         changed it there. TWO tests forbid the literal, and each fails on the
@@ -859,7 +859,7 @@ class UnitRegistry:
         session plus 256 sub-agents plus 256 open calls would exhaust 512 on its
         own and "512 concurrent sessions" would quietly become "about one".
         """
-        resolved = CaptureLimits().resolved()
+        resolved = LimitsConfig().resolved()
         self._sink = sink
         self._debug = debug
         self._max_units = max_units if max_units is not None else resolved["max_units"]

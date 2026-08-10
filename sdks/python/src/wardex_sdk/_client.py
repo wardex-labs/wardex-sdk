@@ -111,9 +111,23 @@ class _UnnamedTimeout(float):
     copying. See `__reduce__`.
     """
 
-    __slots__ = ("_label", "follows_transport")
+    __slots__ = ("_label", "follows_shutdown_config", "follows_transport")
 
     _label: str
+
+    follows_shutdown_config: bool
+    """Whether this budget means "ask the config's `batching.shutdown_timeout`".
+
+    `close()`'s twin of `follows_transport`, and a fact about the budget for
+    the same reason: a bare `close()` names no number, and the number it
+    should spend belongs to the installed config (one number, one home), not
+    to this module's constant. `Client.close` resolves the flag against its
+    OWN config, so the atexit hook, re-init's teardown of the previous client
+    and a bare `wardex.close()` all follow the same field without any of them
+    restating it. The float value underneath stays `_DEFAULT_TIMEOUT`, so a
+    path that misses the flag degrades to the old fixed default instead of
+    misbehaving.
+    """
 
     follows_transport: bool
     """Whether this budget means "ask the transport how long it wants".
@@ -137,13 +151,20 @@ class _UnnamedTimeout(float):
     the direction that looks like it works.
     """
 
-    def __new__(cls, value: float, label: str, follows_transport: bool = False) -> _UnnamedTimeout:
+    def __new__(
+        cls,
+        value: float,
+        label: str,
+        follows_transport: bool = False,
+        follows_shutdown_config: bool = False,
+    ) -> _UnnamedTimeout:
         sentinel = super().__new__(cls, value)
         sentinel._label = label
         sentinel.follows_transport = bool(follows_transport)
+        sentinel.follows_shutdown_config = bool(follows_shutdown_config)
         return sentinel
 
-    def __reduce__(self) -> tuple[type[_UnnamedTimeout], tuple[float, str, bool]]:
+    def __reduce__(self) -> tuple[type[_UnnamedTimeout], tuple[float, str, bool, bool]]:
         """Survive `copy`, `deepcopy` and `pickle` with both facts intact.
 
         `float.__reduce_ex__` rebuilds through `cls(value)`, this subclass needs
@@ -157,14 +178,18 @@ class _UnnamedTimeout(float):
         and passed back. Raising `TypeError` out of any of those is wardex
         raising into host code over a default it chose itself.
 
-        Both facts are in the tuple, which is what makes a copy usable rather
-        than merely constructible: the result is an `_UnnamedTimeout`, so it is
-        still not blamed for a cut-short export, and it still follows the
-        transport if the original did. Rebuilding by type is only safe because
-        nothing asks these objects for identity any more -- see
-        `follows_transport` for the check that used to, and what it cost.
+        All the facts are in the tuple, which is what makes a copy usable
+        rather than merely constructible: the result is an `_UnnamedTimeout`,
+        so it is still not blamed for a cut-short export, and it still follows
+        the transport (or the shutdown config) if the original did. Rebuilding
+        by type is only safe because nothing asks these objects for identity
+        any more -- see `follows_transport` for the check that used to, and
+        what it cost.
         """
-        return (type(self), (float(self), self._label, self.follows_transport))
+        return (
+            type(self),
+            (float(self), self._label, self.follows_transport, self.follows_shutdown_config),
+        )
 
     def __repr__(self) -> str:
         return self._label
@@ -175,14 +200,18 @@ _FOLLOW_TRANSPORT_TIMEOUT = _UnnamedTimeout(
     _DEFAULT_TIMEOUT, "<the transport's own timeout>", follows_transport=True
 )
 
-#: `close()`'s default: no number was named either, and the shutdown path picks
-#: its own 5s rather than following anything -- so `follows_transport` is left
-#: False, which is what makes these two differ. Its own instance so that its
+#: `close()`'s default: no number was named either, and the shutdown path
+#: follows the config's `batching.shutdown_timeout` rather than the transport
+#: -- so `follows_transport` is left False and `follows_shutdown_config` is
+#: set, which is what makes these two differ. Its own instance so that its
 #: `repr` can say what it means; the two are NOT required to be distinguishable
 #: by identity, and nothing distinguishes them that way any more. What keeps a
 #: bare `close()` out of the cut-short report is the type they share: wardex's
-#: shutdown default is not a budget anyone passed.
-_SHUTDOWN_TIMEOUT = _UnnamedTimeout(_DEFAULT_TIMEOUT, "<wardex's own shutdown default>")
+#: shutdown default is not a budget anyone passed. The float value is the
+#: fixed fallback for any path that misses the flag.
+_SHUTDOWN_TIMEOUT = _UnnamedTimeout(
+    _DEFAULT_TIMEOUT, "<batching.shutdown_timeout>", follows_shutdown_config=True
+)
 
 
 def _named_by_caller(timeout: float) -> bool:
@@ -616,8 +645,9 @@ class Client:
         wait", so it must not cap the POST below the number the host configured
         the transport with. An explicit `flush(t)` is a real wall-clock bound and
         is honoured as one -- that is the bounded-drain win and it is untouched.
-        `close()` is the other operation and keeps the tight 5.0 default; it does
-        not follow the transport.
+        `close()` is the other operation and follows the config's
+        `batching.shutdown_timeout` (default 5.0); it does not follow the
+        transport.
         """
         # Public API: `timeout` is application input, so it is sanitized here and
         # _drain() may then assume a usable number. Note that None does NOT
@@ -1113,15 +1143,21 @@ class Client:
         # would raise on -- Thread.join() in step 2, the deadline arithmetic and
         # the timed acquire in step 3, a third-party Transport in step 4.
         #
-        # The sentinel default is not a second reading of the NUMBER -- it is
-        # 5.0 either way, and unlike flush() this path deliberately does not
-        # follow the transport. It is a reading of WHOSE number it is. A bare
-        # close() spends wardex's own shutdown default, so an export that
-        # default cuts short is not something a caller chose and must not be
-        # reported as one; `close(t)` is. A host that writes `close(5.0)` named
-        # a number, and gets the number's reading -- which is why the test is on
-        # the sentinel TYPE and not on the value.
+        # The sentinel default carries two readings and neither is a second
+        # copy of a NUMBER. The first is WHOSE number it is: a bare close()
+        # spends wardex's own shutdown default, so an export that default cuts
+        # short is not something a caller chose and must not be reported as
+        # one; `close(t)` is. A host that writes `close(5.0)` named a number,
+        # and gets the number's reading -- which is why the test is on the
+        # sentinel TYPE and not on the value. The second is WHERE the default
+        # lives: `follows_shutdown_config` resolves it from THIS client's
+        # `batching.shutdown_timeout`, the one home the atexit hook, re-init's
+        # teardown and a bare `wardex.close()` all reach it through -- none of
+        # them restates a budget, so none of them can be blamed for one.
+        # Unlike flush() this path deliberately does not follow the transport.
         named_by_caller = _named_by_caller(timeout)
+        if isinstance(timeout, _UnnamedTimeout) and timeout.follows_shutdown_config:
+            timeout = self._config.batching.shutdown_timeout
         budget = _sanitize_timeout(timeout)
         with self._close_lock:
             if self._closed:

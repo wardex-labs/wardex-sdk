@@ -49,7 +49,7 @@ from test_langgraph_adapter import (  # noqa: F401 — `_clean_scope` is an auto
 from test_langgraph_adapter import installed as _installed_fixture
 from wardex_sdk._assembly import Limitation
 from wardex_sdk._enums import StatusCode
-from wardex_sdk._limits import CaptureLimits
+from wardex_sdk._limits import LimitsConfig
 
 #: The harness's fixture, rebound so that a test may take `installed` as an
 #: argument. A parameter shadowing a bare `from … import installed` reads to the
@@ -176,7 +176,7 @@ def test_an_async_send_fanout_past_the_breadth_bound_evicts_the_oldest_children(
     precondition an assertion (`arrived == width`) instead of a hope.
     """
     width = 300
-    bound = CaptureLimits().resolved()["max_entries_per_unit"]
+    bound = LimitsConfig().resolved()["max_entries_per_unit"]
     assert bound == 256, "the arithmetic below is this limit's, not a literal"
     arrived = 0
     gate: asyncio.Event | None = None

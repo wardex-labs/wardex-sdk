@@ -475,7 +475,7 @@ def main() -> int:
         return 2
 
     import wardex_sdk
-    from wardex_sdk import BatchingPolicy, CaptureLimits, OtlpHttpTransport
+    from wardex_sdk import BatchingConfig, LimitsConfig, OtlpHttpTransport
 
     server = _proxy(phoenix)
     endpoint = f"http://127.0.0.1:{server.server_address[1]}/v1/traces"
@@ -500,7 +500,11 @@ def main() -> int:
     report = _Report()
     wardex_sdk.init(
         transport=_Observed(endpoint=endpoint, timeout=60.0),
-        limits=CaptureLimits(max_otlp_request_bytes=REQUEST_CAP),
+        # This check drives MANUAL spans at a live receiver; the byte seams
+        # (now on by default) would only add unrelated traffic to the batches
+        # whose composition is under test.
+        intercept=False,
+        limits=LimitsConfig(max_otlp_request_bytes=REQUEST_CAP),
         # The default 5s tick would be a second exporter running alongside this
         # driver, and the hazard is batch COMPOSITION rather than lock safety: a
         # tick landing between two `span()` blocks drains the batch in pieces,
@@ -508,7 +512,7 @@ def main() -> int:
         # POSTs" then fails for a scheduler coincidence that reads exactly like
         # an SDK regression. Pushed past the whole run so the explicit flush is
         # the only export there is.
-        batching=BatchingPolicy(flush_interval=3600.0),
+        batching=BatchingConfig(flush_interval=3600.0),
     )
     try:
         _split_export_becomes_one_trace(phoenix, report)

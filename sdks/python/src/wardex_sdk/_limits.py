@@ -4,6 +4,12 @@ This dataclass intentionally holds no values: every field defaults to None,
 meaning "use the core default". The core (crates/wardex-limits) owns both the
 schema and the values, so a limit can never disagree between two declaration
 sites. test_limits.py asserts both properties.
+
+The mirror is a strict SUBSET of the core's table, not a copy of it: the core
+keeps `replay_buffer_size` and `zstd_level` for its own encoder defaults, but
+neither is a knob anything in-process reads off this config, so neither is
+declared here — a field a user can set that changes nothing is the failure the
+probe table in test_limits.py exists to prevent.
 """
 
 from __future__ import annotations
@@ -31,8 +37,8 @@ def _no_core() -> RuntimeError:
     )
 
 
-@dataclass(frozen=True, slots=True)
-class CaptureLimits:
+@dataclass(frozen=True, slots=True, kw_only=True)
+class LimitsConfig:
     """Resource limit overrides. None means the core default is used."""
 
     max_headers: int | None = None
@@ -51,8 +57,6 @@ class CaptureLimits:
     mcp_sniff_bytes: int | None = None
     max_buffer_spans: int | None = None
     max_buffer_bytes: int | None = None
-    replay_buffer_size: int | None = None
-    zstd_level: int | None = None
     max_otlp_attribute_bytes: int | None = None
     max_otlp_request_bytes: int | None = None
 

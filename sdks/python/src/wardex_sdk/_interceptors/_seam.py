@@ -32,7 +32,7 @@ from .._enums import (
     Protocol,
     StatusCode,
 )
-from .._limits import CaptureLimits
+from .._limits import LimitsConfig
 from .._protocol import parse_llm_semantics
 from .._semantics import (
     build_gen_ai,
@@ -214,13 +214,13 @@ class ByteSeamInterceptor(InterceptorInterface):
         self._close_hook_held = False
         # Defaults match the core's, so behavior is unchanged until _load_limits
         # resolves an actual config at install() time.
-        self._limits: dict[str, int] = CaptureLimits().resolved()
+        self._limits: dict[str, int] = LimitsConfig().resolved()
         self._native_limits: Any = None
 
     def _load_limits(self, client: Client | None) -> None:
         """Cache resolved limits at install time; config is frozen after init."""
         config = getattr(client, "config", None)
-        lim = config.limits if config is not None else CaptureLimits()
+        lim = config.limits if config is not None else LimitsConfig()
         self._limits = lim.resolved()
         self._native_limits = lim.to_native()
 

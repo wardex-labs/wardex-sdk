@@ -11,9 +11,9 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 import pytest
 
 from wardex_sdk._client import Client
-from wardex_sdk._config import BackendConfig, BatchingPolicy, WardexConfig
+from wardex_sdk._config import BackendConfig, BatchingConfig, WardexConfig
 from wardex_sdk._enums import SpanKind, StatusCode
-from wardex_sdk._limits import CaptureLimits
+from wardex_sdk._limits import LimitsConfig
 from wardex_sdk._types import InternalEnvelope, InternalSpan, SpanContext, SpanId, TraceId
 from wardex_sdk.transport._base import Transport
 from wardex_sdk.transport._otlp_http import OtlpHttpTransport
@@ -69,7 +69,7 @@ def test_periodic_flush_posts_encoded_batch_without_manual_flush():
         t = OtlpHttpTransport(f"http://127.0.0.1:{server.server_port}/v1/traces")
         c = Client(
             WardexConfig(
-                backend=BackendConfig(api_key="k"), batching=BatchingPolicy(flush_interval=0.05)
+                backend=BackendConfig(api_key="k"), batching=BatchingConfig(flush_interval=0.05)
             ),
             t,
         )
@@ -97,9 +97,9 @@ def mark(envelope):
     return None  # drop after recording — no network needed
 
 # interval 3600 + threshold 512: only the signal handler can flush this span
-wardex.init(transport=NoOpTransport(), before_send=mark,
+wardex.init(transport=NoOpTransport(), before_send=mark, intercept=False,
             backend=wardex.BackendConfig(api_key="k"),
-            batching=wardex.BatchingPolicy(flush_interval=3600.0))
+            batching=wardex.BatchingConfig(flush_interval=3600.0))
 _hub.get_client().capture_span(InternalSpan(
     context=SpanContext(TraceId.generate(), SpanId.generate()),
     parent_span_id=None, name="s", kind=SpanKind.INTERNAL,
@@ -137,9 +137,9 @@ def test_fork_child_respawns_worker_and_flushes():
     # interval 3600: parent worker sits idle in wait() holding no locks → fork-safe
     c = Client(
         WardexConfig(
-            limits=CaptureLimits(max_buffer_spans=8),
+            limits=LimitsConfig(max_buffer_spans=8),
             backend=BackendConfig(api_key="k"),
-            batching=BatchingPolicy(flush_interval=3600.0),
+            batching=BatchingConfig(flush_interval=3600.0),
         ),
         t,
     )

@@ -7,7 +7,7 @@ import tracemalloc
 
 import pytest
 
-from wardex_sdk import CaptureLimits, _wardex_native
+from wardex_sdk import LimitsConfig, _wardex_native
 from wardex_sdk._assembly import Limitation
 from wardex_sdk._config import BackendConfig, WardexConfig
 
@@ -45,8 +45,19 @@ def test_parser_without_limits_uses_defaults():
 
 
 def test_mirror_field_set_matches_core():
+    """The mirror is the core's table minus the two fields with no consumer.
+
+    `replay_buffer_size` and `zstd_level` stay in the core — the encoder keeps
+    its own defaults — but neither is a knob anything reads off the config, so
+    neither is declared on the mirror: a field a user can set that changes
+    nothing is exactly what the probe table below exists to prevent. The
+    difference is asserted EXACTLY, so a new core field still forces a mirror
+    decision and a re-mirrored cut field is noticed.
+    """
     core = _wardex_native.limits_defaults()
-    assert set(CaptureLimits.__dataclass_fields__) == set(core)
+    mirrored = set(LimitsConfig.__dataclass_fields__)
+    assert mirrored <= set(core)
+    assert set(core) - mirrored == {"replay_buffer_size", "zstd_level"}
 
 
 def test_every_mirrored_field_is_readable_on_the_native_object():
@@ -61,7 +72,7 @@ def test_every_mirrored_field_is_readable_on_the_native_object():
     """
     core = _wardex_native.limits_defaults()
     native = _wardex_native.Limits()
-    for name in CaptureLimits.__dataclass_fields__:
+    for name in LimitsConfig.__dataclass_fields__:
         assert getattr(native, name) == core[name], (
             f"{name} is missing a #[getter] on the native Limits pyclass, or it "
             f"disagrees with limits_defaults()"
@@ -71,12 +82,12 @@ def test_every_mirrored_field_is_readable_on_the_native_object():
 def test_mirror_holds_no_values():
     # None means "use the core default". A mirror that carries its own values
     # is exactly the drift this design exists to prevent.
-    lim = CaptureLimits()
-    assert all(getattr(lim, f) is None for f in CaptureLimits.__dataclass_fields__)
+    lim = LimitsConfig()
+    assert all(getattr(lim, f) is None for f in LimitsConfig.__dataclass_fields__)
 
 
 def test_to_native_applies_overrides_only():
-    native = CaptureLimits(max_body_bytes=1024).to_native()
+    native = LimitsConfig(max_body_bytes=1024).to_native()
     assert native.max_body_bytes == 1024
     assert native.max_headers == 96
 
@@ -85,13 +96,13 @@ def test_config_rejects_non_positive_limit():
     import pytest
 
     with pytest.raises(ValueError, match="max_body_bytes"):
-        WardexConfig(limits=CaptureLimits(max_body_bytes=0))
+        WardexConfig(limits=LimitsConfig(max_body_bytes=0))
 
 
 def test_moved_fields_raise_helpful_error():
     import pytest
 
-    with pytest.raises(TypeError, match="limits=CaptureLimits"):
+    with pytest.raises(TypeError, match="limits=LimitsConfig"):
         WardexConfig(max_buffer_spans=100)
 
 
@@ -113,7 +124,7 @@ def test_body_cap_reaches_the_parser_end_to_end():
     import wardex_sdk
     from wardex_sdk import _hub
 
-    wardex_sdk.init(limits=CaptureLimits(max_headers=1))
+    wardex_sdk.init(intercept=False, limits=LimitsConfig(max_headers=1))
     try:
         from wardex_sdk._interceptors._trackers import _Http1Tracker
 
@@ -256,7 +267,7 @@ def test_max_buffer_bytes_reaches_the_client():
             output_data=payload,
         )
 
-    wardex_sdk.init(limits=CaptureLimits(max_buffer_bytes=32 * 1024))
+    wardex_sdk.init(intercept=False, limits=LimitsConfig(max_buffer_bytes=32 * 1024))
     try:
         client = _hub.get_client()
         assert client is not None
@@ -283,7 +294,7 @@ def test_max_connections_reaches_the_seam():
     from wardex_sdk import _hub
     from wardex_sdk._interceptors._ssl import SSLInterceptor
 
-    wardex_sdk.init(limits=CaptureLimits(max_connections=1))
+    wardex_sdk.init(intercept=False, limits=LimitsConfig(max_connections=1))
     try:
         client = _hub.get_client()
         assert client is not None
@@ -390,12 +401,13 @@ def test_non_http_tls_traffic_does_not_grow_memory(fake_ssl_socket, bare_ssl_int
 # _PROBES closes that. Each probe drives the real code path twice, once with an
 # override and once on the core defaults, and returns True only if the two
 # outcomes differ: a probe that would still pass with the limit ignored proves
-# nothing. _NOT_ENFORCED names the fields no honest probe can cover, each with
-# its reason -- including one, zstd_level, that a probe *could* exercise while
-# the user-visible behavior stayed fixed, because the component it reaches sits
-# off the live export path. The two tables must partition the mirror's field
-# set, so neither adding a limit nor quietly unwiring one can pass without this
-# file saying which it is.
+# nothing. _NOT_ENFORCED names any field no honest probe can cover, each with
+# its reason. It is EMPTY today, and that is the point: the two fields that
+# lived in it (zstd_level, replay_buffer_size) were cut from the mirror rather
+# than left as knobs that change nothing — each returns, with a probe, when its
+# consumer ships. The two tables must partition the mirror's field set, so
+# neither adding a limit nor quietly unwiring one can pass without this file
+# saying which it is.
 
 
 def _native(**kw: int):
@@ -472,7 +484,7 @@ class _StubClient:
     class _Config:
         debug = False
 
-        def __init__(self, limits: CaptureLimits) -> None:
+        def __init__(self, limits: LimitsConfig) -> None:
             from wardex_sdk._enums import CaptureMode
 
             self.limits = limits
@@ -480,7 +492,7 @@ class _StubClient:
             # would gate out anything without LLM semantics.
             self.capture_mode = CaptureMode.ALL
 
-    def __init__(self, limits: CaptureLimits) -> None:
+    def __init__(self, limits: LimitsConfig) -> None:
         self.config = self._Config(limits)
         self.spans: list = []
 
@@ -488,7 +500,7 @@ class _StubClient:
         self.spans.append(span)
 
 
-def _drive_seam(limits: CaptureLimits, request: bytes, response: bytes, host: str):
+def _drive_seam(limits: LimitsConfig, request: bytes, response: bytes, host: str):
     """Feed one HTTP/1 exchange through the real TLS byte seam, loading limits
     exactly as SSLInterceptor.install() does, and return the emitted span."""
     from conftest import _FakeSSLSocket
@@ -527,15 +539,15 @@ def _probe_max_decoded_bytes() -> bool:
     # The cap bites only on the decompression path, so the body is gzipped.
     request, response = _openai_exchange(gzip.compress(_OPENAI_RESP), "gzip")
 
-    def model(limits: CaptureLimits) -> str | None:
+    def model(limits: LimitsConfig) -> str | None:
         span = _drive_seam(limits, request, response, "api.openai.com")
         return span.gen_ai.response_model if span is not None and span.gen_ai else None
 
     # Under the tiny cap the body stays compressed and nothing can be read out
     # of it; under the default it decompresses and parses.
     return (
-        model(CaptureLimits(max_decoded_bytes=1)) is None
-        and model(CaptureLimits()) == "gpt-4o-mini-2024-07-18"
+        model(LimitsConfig(max_decoded_bytes=1)) is None
+        and model(LimitsConfig()) == "gpt-4o-mini-2024-07-18"
     )
 
 
@@ -598,7 +610,7 @@ def _probe_max_connections() -> bool:
         def getpeername(self) -> tuple[str, int]:
             return ("127.0.0.1", 443)
 
-    def tracked(limits: CaptureLimits) -> int:
+    def tracked(limits: LimitsConfig) -> int:
         itc = SSLInterceptor()
         itc._limits = limits.resolved()
         # Bound to a name, and it has to be: the seam evicts a connection's
@@ -612,7 +624,7 @@ def _probe_max_connections() -> bool:
 
     # Steady state is max_connections + 1: the eviction check runs before the
     # new entry is inserted.
-    return tracked(CaptureLimits(max_connections=1)) == 2 and tracked(CaptureLimits()) == 4
+    return tracked(LimitsConfig(max_connections=1)) == 2 and tracked(LimitsConfig()) == 4
 
 
 class _RecordingClient:
@@ -623,7 +635,7 @@ class _RecordingClient:
         self.spans.append(span)
 
 
-def _assembler(limits: CaptureLimits):
+def _assembler(limits: LimitsConfig):
     """Built exactly the way the Agent SDK adapter builds it at install time."""
     from wardex_sdk._adapters._assembler import SessionAssembler
 
@@ -646,8 +658,8 @@ class _DraftSink:
         return True
 
 
-def _unit_registry(limits: CaptureLimits, sink: _DraftSink):
-    """Built the way an adapter builds it: values routed through CaptureLimits.
+def _unit_registry(limits: LimitsConfig, sink: _DraftSink):
+    """Built the way an adapter builds it: values routed through LimitsConfig.
 
     The point of going through `resolved()` rather than passing an int straight
     in is that this probe then fails if the field stops being mirrored, not only
@@ -687,18 +699,18 @@ def _probe_max_units() -> bool:
     and that is exactly what the assembler this replaces does.
     """
 
-    def evicted(limits: CaptureLimits) -> list:
+    def evicted(limits: LimitsConfig) -> list:
         sink = _DraftSink()
         reg = _unit_registry(limits, sink)
         for i in range(2):
             _open_unit(reg, f"root-{i}")
         return sink.drafts
 
-    tight = evicted(CaptureLimits(max_units=1))
+    tight = evicted(LimitsConfig(max_units=1))
     return (
         len(tight) == 1
         and Limitation.UNIT_EVICTED in tight[0].integrity.markers
-        and evicted(CaptureLimits()) == []
+        and evicted(LimitsConfig()) == []
     )
 
 
@@ -710,7 +722,7 @@ def _probe_max_entries_per_unit() -> bool:
     completion event.
     """
 
-    def evicted(limits: CaptureLimits) -> list:
+    def evicted(limits: LimitsConfig) -> list:
         sink = _DraftSink()
         reg = _unit_registry(limits, sink)
         root = _open_unit(reg, "root")
@@ -718,34 +730,34 @@ def _probe_max_entries_per_unit() -> bool:
             _open_unit(reg, f"child-{i}", parent=root)
         return sink.drafts
 
-    tight = evicted(CaptureLimits(max_entries_per_unit=1))
+    tight = evicted(LimitsConfig(max_entries_per_unit=1))
     return (
         len(tight) == 1
         and Limitation.CHILD_SPAN_UNCLOSED in tight[0].integrity.markers
-        and evicted(CaptureLimits()) == []
+        and evicted(LimitsConfig()) == []
     )
 
 
 def _probe_max_sessions() -> bool:
-    def open_sessions(limits: CaptureLimits) -> int:
+    def open_sessions(limits: LimitsConfig) -> int:
         asm = _assembler(limits)
         for key in range(4):
             asm._ensure_session(key, 1)
         return asm.open_session_count()
 
-    return open_sessions(CaptureLimits(max_sessions=1)) == 1 and open_sessions(CaptureLimits()) == 4
+    return open_sessions(LimitsConfig(max_sessions=1)) == 1 and open_sessions(LimitsConfig()) == 4
 
 
 def _probe_max_session_entries() -> bool:
-    def open_tools(limits: CaptureLimits) -> int:
+    def open_tools(limits: LimitsConfig) -> int:
         asm = _assembler(limits)
         sess = asm._ensure_session(1, 1)
         for i in range(4):
             asm._open_tool(sess, {"tool_name": "t"}, f"id{i}", 1)
         return len(sess.open_tools)
 
-    tight = open_tools(CaptureLimits(max_session_entries=1))
-    return tight == 1 and open_tools(CaptureLimits()) == 4
+    tight = open_tools(LimitsConfig(max_session_entries=1))
+    return tight == 1 and open_tools(LimitsConfig()) == 4
 
 
 def _probe_mcp_sniff_bytes() -> bool:
@@ -761,11 +773,11 @@ def _probe_mcp_sniff_bytes() -> bool:
 
 
 def _probe_max_buffer_spans() -> bool:
-    return _dropped_under(CaptureLimits(max_buffer_spans=2)) > 0
+    return _dropped_under(LimitsConfig(max_buffer_spans=2)) > 0
 
 
 def _probe_max_buffer_bytes() -> bool:
-    return _dropped_under(CaptureLimits(max_buffer_bytes=32 * 1024)) > 0
+    return _dropped_under(LimitsConfig(max_buffer_bytes=32 * 1024)) > 0
 
 
 def _otlp_envelope(payload: bytes):
@@ -853,7 +865,7 @@ def _probe_max_otlp_request_bytes() -> bool:
     return len(tight[0]) <= 4096 and len(loose[0]) > 4096
 
 
-def _dropped_under(limits: CaptureLimits) -> int:
+def _dropped_under(limits: LimitsConfig) -> int:
     """Spans evicted by the buffer's caps while capturing 20 fixed-size spans.
 
     On the core defaults (2048 spans / 64 MiB) 20 small spans evict nothing, so
@@ -870,7 +882,7 @@ def _dropped_under(limits: CaptureLimits) -> int:
     from wardex_sdk._enums import SpanKind
     from wardex_sdk._types import InternalSpan, SpanContext, SpanId, TraceId
 
-    wardex_sdk.init(limits=limits)
+    wardex_sdk.init(intercept=False, limits=limits)
     try:
         client = _hub.get_client()
         assert client is not None
@@ -913,29 +925,17 @@ _PROBES = {
     "max_otlp_request_bytes": _probe_max_otlp_request_bytes,
 }
 
-_NOT_ENFORCED = {
-    "zstd_level": (
-        "Wired but unobservable: encode_envelope reads it, and nothing in the "
-        "live export path calls encode_envelope -- the OTLP exporter compresses "
-        "with gzip, at a level fixed in the codec because "
-        "max_otlp_request_bytes already owns the size question. A probe "
-        "through the codec would pass while a user's override still changed no "
-        "shipped byte, which is exactly the false green this table exists to "
-        "prevent. Move it back to _PROBES when an envelope transport ships."
-    ),
-    "replay_buffer_size": (
-        "Reserved: nothing in the SDK reads it, so setting it changes nothing. "
-        "Documented as inert in crates/wardex-limits and in the README's "
-        "resource-limits section rather than left for a user to discover. "
-        "Delete this entry and add a probe when a replay buffer lands."
-    ),
-}
+#: field -> why no probe can honestly cover it. Empty: every declared limit is
+#: observably enforced. An entry may only be added together with the field it
+#: names, and the bar for adding one is the two cut fields' story — an inert
+#: knob was cut from the mirror instead of documented as inert.
+_NOT_ENFORCED: dict[str, str] = {}
 
 
 def test_every_limit_is_either_probed_or_named_inert():
     """The mirror's field set must be exactly partitioned by the two tables.
 
-    A limit added to the core and mirrored into CaptureLimits without any
+    A limit added to the core and mirrored into LimitsConfig without any
     consumer would otherwise be advertised as configurable and silently do
     nothing -- which is how zstd_level and max_decoded_bytes shipped inert.
 
@@ -943,9 +943,9 @@ def test_every_limit_is_either_probed_or_named_inert():
     its own is wiring dropped between the config object and the component:
     most probes hand the value straight to the component under test rather
     than routing it through wardex.init(), so a limit could reach its
-    enforcement site here and still never leave CaptureLimits in production.
+    enforcement site here and still never leave LimitsConfig in production.
     """
-    fields = set(CaptureLimits.__dataclass_fields__)
+    fields = set(LimitsConfig.__dataclass_fields__)
     covered = set(_PROBES) | set(_NOT_ENFORCED)
     assert fields == covered, (
         f"unclassified limits: {sorted(fields - covered)}; "
@@ -983,7 +983,7 @@ def test_http1_body_cap_is_visible_to_the_user():
         + body
     )
 
-    span = _drive_seam(CaptureLimits(max_opaque_body_bytes=16), request, response, "files.example")
+    span = _drive_seam(LimitsConfig(max_opaque_body_bytes=16), request, response, "files.example")
     assert span is not None
     assert span.capture_integrity.truncated
     assert Limitation.BODY_CAP_EXCEEDED in span.capture_integrity.limitations
@@ -991,7 +991,7 @@ def test_http1_body_cap_is_visible_to_the_user():
 
     # The same exchange under the default cap is neither truncated nor marked,
     # so the assertions above are about the cap and not about this traffic.
-    span = _drive_seam(CaptureLimits(), request, response, "files.example")
+    span = _drive_seam(LimitsConfig(), request, response, "files.example")
     assert span is not None
     assert not span.capture_integrity.truncated
     assert Limitation.BODY_CAP_EXCEEDED not in span.capture_integrity.limitations
@@ -1014,7 +1014,7 @@ def test_http1_request_body_cap_is_visible_to_the_user():
         + body
     )
 
-    span = _drive_seam(CaptureLimits(max_opaque_body_bytes=16), request, response, "files.example")
+    span = _drive_seam(LimitsConfig(max_opaque_body_bytes=16), request, response, "files.example")
     assert span is not None
     assert span.capture_integrity.truncated
     # Both halves hit the cap; that is one limitation of the transaction.
@@ -1041,7 +1041,7 @@ def test_a_configured_bound_reaches_the_registry_the_adapter_actually_uses():
 
     class _Client:
         config = WardexConfig(
-            limits=CaptureLimits(max_units=7, max_entries_per_unit=3),
+            limits=LimitsConfig(max_units=7, max_entries_per_unit=3),
             backend=BackendConfig(api_key="k"),
         )
 
