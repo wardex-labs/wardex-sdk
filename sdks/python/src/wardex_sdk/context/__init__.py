@@ -6,7 +6,7 @@ scope plumbing (`activate_span`, `install_span`, ...) is internal vocabulary —
 from there directly.
 """
 
-from ._contextvar import run_in_context
+from ._contextvar import bind_context
 from ._propagate import (
     continue_from_otel,
     continue_trace,
@@ -19,5 +19,5 @@ __all__ = [
     "continue_trace",
     "get_trace_headers",
     "get_traceparent",
-    "run_in_context",
+    "bind_context",
 ]

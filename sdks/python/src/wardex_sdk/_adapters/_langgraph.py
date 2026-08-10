@@ -646,7 +646,7 @@ class LangGraphAdapter(AdapterInterface):
         pregel_mod, runner_mod, task_cls, start, errors = pregel
         if not _surface_ok(pregel_mod, runner_mod, task_cls):
             report_once(
-                "[wardex] langgraph adapter: surface unrecognized, adapter declined; "
+                "langgraph adapter: surface unrecognized, adapter declined; "
                 "run, node and tool spans will be absent",
                 key="adapters.langgraph.unsupported_surface",
             )
@@ -682,7 +682,7 @@ class LangGraphAdapter(AdapterInterface):
             return
         if not _tool_surface_ok(tool_cls):
             report_once(
-                "[wardex] langgraph adapter: tool surface unrecognized, tool spans declined; "
+                "langgraph adapter: tool surface unrecognized, tool spans declined; "
                 "run and node spans are unaffected",
                 key="adapters.langgraph.unsupported_tool_surface",
             )

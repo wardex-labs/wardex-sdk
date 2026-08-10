@@ -696,7 +696,7 @@ class AdapterContext:
         """
         self._tripped = True
         report_once(
-            f"[wardex] {self.name} adapter: internal error at {where}; {consequence} "
+            f"{self.name} adapter: internal error at {where}; {consequence} "
             f"(re-run with debug=True for the traceback)",
             key=f"{self.name}.{where}",
         )

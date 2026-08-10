@@ -14,10 +14,10 @@ No code runs at fork time, which sidesteps fork-safety traps entirely.
 from __future__ import annotations
 
 import os
-import sys
 import threading
 from collections.abc import Callable
 
+from ._assembly import diag_warning
 from .transport._base import DEFAULT_TIMEOUT
 
 
@@ -97,7 +97,7 @@ class BatchWorker:
             if self._stopped or self.is_alive() or self._spawn_in_flight():
                 return  # another thread respawned it while we waited
             if self._debug:
-                print("[wardex] batch worker restarted (fork or thread death)", file=sys.stderr)
+                diag_warning("batch worker restarted (fork or thread death)")
             self._spawn_locked()
 
     def stop(self, timeout: float = DEFAULT_TIMEOUT) -> None:
@@ -154,4 +154,4 @@ class BatchWorker:
             # Never die. BaseException (SystemExit etc.) is deliberately excluded.
             except Exception as exc:
                 if self._debug:
-                    print(f"[wardex] background flush failed: {exc}", file=sys.stderr)
+                    diag_warning(f"background flush failed: {exc}")

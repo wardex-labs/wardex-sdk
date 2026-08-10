@@ -63,7 +63,7 @@ not here yet. `__all__` grows as modules land and does not shrink.
 
 from .._types import ToolAttributes
 from ._builder import NULL_DRAFT, IntegrityBuilder, SpanDraft
-from ._diag import Counters, counters, guard, report_once
+from ._diag import Counters, counters, diag_info, diag_warning, guard, report_once
 from ._integrity import Limitation
 from ._parentage import (
     AMBIENT,
@@ -134,6 +134,8 @@ __all__ = [
     "child_of",
     "counters",
     "degraded_run",
+    "diag_info",
+    "diag_warning",
     "guard",
     "in_degraded_run",
     "is_declared_extra_key",

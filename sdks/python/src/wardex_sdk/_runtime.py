@@ -63,7 +63,7 @@ import sys
 import threading
 from typing import TYPE_CHECKING, Any
 
-from ._assembly import Limitation
+from ._assembly import Limitation, diag_info
 from ._client import Client, _UnnamedTimeout
 
 if TYPE_CHECKING:
@@ -347,10 +347,7 @@ class Runtime:
             self._close_units = self.adapters.close_units_all
             if threading.current_thread() is not threading.main_thread():
                 if debug:
-                    print(
-                        "[wardex] signal handlers skipped (init() not on main thread)",
-                        file=sys.stderr,
-                    )
+                    diag_info("signal handlers skipped (init() not on main thread)")
                 return
             try:
                 for signum in _SIGNALS:
@@ -363,7 +360,7 @@ class Runtime:
                         signal.signal(signum, prev)
                 self._prev_handlers.clear()
                 if debug:
-                    print(f"[wardex] signal handlers skipped ({exc})", file=sys.stderr)
+                    diag_info(f"signal handlers skipped ({exc})")
                 return
             self._signals_installed = True
 

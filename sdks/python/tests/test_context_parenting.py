@@ -96,7 +96,7 @@ def test_tags_set_before_span_survive_after():
     assert _hub.get_current_scope().tags["k"] == "v"
 
 
-def test_run_in_context_carries_active_span_to_thread():
+def test_bind_context_carries_active_span_to_thread():
     _setup()
     results: dict[str, object] = {}
 
@@ -108,7 +108,7 @@ def test_run_in_context_carries_active_span_to_thread():
             active = _hub.get_current_scope().active_span_context
             results["sid"] = active.span_id if active else None
 
-        th = threading.Thread(target=wardex_sdk.run_in_context(work))
+        th = threading.Thread(target=wardex_sdk.bind_context(work))
         th.start()
         th.join()
     assert results["sid"] == root.context.span_id

@@ -297,7 +297,7 @@ def _begin(
         # `finally` below this yield: the span is already lost, and running the
         # emit path on a draft with no trace would be inventing one.
         report_once(
-            f"[wardex] wardex.span({name!r}): internal error opening the span; "
+            f"wardex.span({name!r}): internal error opening the span; "
             "this span and anything it would have parented will not be recorded "
             "(re-run with debug=True for the traceback)",
             key="wardex.span.manual_open",
@@ -328,7 +328,7 @@ def _begin(
         # whatever was standing before it instead.
         fork = None
         report_once(
-            "[wardex] wardex.span(): internal error installing the span as the "
+            "wardex.span(): internal error installing the span as the "
             "active parent; work inside this block will be attached one level "
             "too high (re-run with debug=True for the traceback)",
             key="wardex.span.manual_fork",
@@ -415,7 +415,7 @@ def _conversation(name: str, *, id: str | None, op: OperationName | None) -> Ite
     if not installed:
         scope = None
         report_once(
-            "[wardex] wardex.conversation(): internal error reading the active "
+            "wardex.conversation(): internal error reading the active "
             "scope; spans in this block will not carry a conversation id "
             "(re-run with debug=True for the traceback)",
             key="wardex.conversation.scope",

@@ -476,7 +476,7 @@ class Unit:
     def bind(self, fn: Callable[..., Any]) -> Callable[..., Any]:
         """Wrap `fn` so each INVOCATION runs inside a fresh activation.
 
-        NOT `context.run_in_context`, and the difference is load-bearing rather
+        NOT `context.bind_context`, and the difference is load-bearing rather
         than stylistic: that helper replays ONE captured `contextvars.Context`,
         and entering the same Context twice concurrently raises
         `RuntimeError: cannot enter context ... is already entered`. For a

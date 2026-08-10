@@ -18,11 +18,10 @@ copies this file copies the path that applies PII masking and the limits.
 
 from __future__ import annotations
 
-import sys
 import time
 import urllib.request
 
-from .._assembly import report_once
+from .._assembly import diag_info, diag_warning, report_once
 from .._native import NATIVE_OK, unavailable_reason
 from .._types import Envelope
 from ._base import UNDELIVERED, CallerBudget, Transport, Undelivered
@@ -175,8 +174,7 @@ class OtlpHttpTransport(Transport):
             # rather than debug-gated for the reason above, and affordable
             # precisely because it is bounded to one line per process.
             report_once(
-                f"[wardex] OTLP export skipped, native extension unavailable "
-                f"({unavailable_reason()})",
+                f"OTLP export skipped, native extension unavailable ({unavailable_reason()})",
                 key="transport.otlp.native_unavailable",
             )
             # Deliberately NOT `UNDELIVERED`: that word promises a later attempt
@@ -202,7 +200,7 @@ class OtlpHttpTransport(Transport):
             # keep them for a drain with budget; a final one now knows it is
             # abandoning them instead of guessing.
             if self._debug:
-                print("[wardex] OTLP export skipped (deadline exhausted)", file=sys.stderr)
+                diag_info("OTLP export skipped (deadline exhausted)")
             return UNDELIVERED
         # The clock starts BEFORE the encode, not after it. `timeout` is a
         # wall-clock bound on this whole call -- that is what `_client._drain`
@@ -240,11 +238,10 @@ class OtlpHttpTransport(Transport):
         # a host spelling would silently win the merge above.
         for name in [k for k in headers if k.lower() == "content-encoding"]:
             if self._debug:
-                print(
-                    f"[wardex] ignoring host header {name}={headers[name]!r}: the OTLP "
+                diag_warning(
+                    f"ignoring host header {name}={headers[name]!r}: the OTLP "
                     f"transport owns Content-Encoding (use compress=False to send "
-                    f"uncompressed)",
-                    file=sys.stderr,
+                    f"uncompressed)"
                 )
             del headers[name]
         if self._compress:
@@ -268,10 +265,7 @@ class OtlpHttpTransport(Transport):
                     # guard above, reached by the encode having eaten the budget
                     # rather than the caller having arrived with none.
                     if self._debug:
-                        print(
-                            "[wardex] OTLP export skipped (deadline spent encoding)",
-                            file=sys.stderr,
-                        )
+                        diag_info("OTLP export skipped (deadline spent encoding)")
                     return UNDELIVERED
                 # Past the first request the spans are already half-delivered,
                 # so the rest cannot be handed back -- `UNDELIVERED` promises a
@@ -280,7 +274,7 @@ class OtlpHttpTransport(Transport):
                 # around it: off-debug this was a trace arriving with holes in
                 # the middle and nothing on any channel about it.
                 report_once(
-                    f"[wardex] an OTLP export ran out of budget after {index} of "
+                    f"an OTLP export ran out of budget after {index} of "
                     f"{len(bodies)} requests; the spans in the remaining request(s) were "
                     f"not sent. This batch was split because it exceeded "
                     f"max_otlp_request_bytes, and the split shares ONE export timeout. "
@@ -296,7 +290,7 @@ class OtlpHttpTransport(Transport):
                         pass
             except Exception as exc:  # fail-silent: never crash the app
                 if self._debug:
-                    print(f"[wardex] OTLP export failed: {exc}", file=sys.stderr)
+                    diag_warning(f"OTLP export failed: {exc}")
                 cut_short_by = _cut_short_by_the_caller(exc, timeout, self._timeout, effective)
                 if cut_short_by is not None:
                     # Reported, NOT re-queued: the POST was open, so the backend
@@ -307,7 +301,7 @@ class OtlpHttpTransport(Transport):
                     # this path will ever tell them. Off-debug this was silence
                     # indistinguishable from a successful export.
                     report_once(
-                        f"[wardex] an OTLP export was cut off after "
+                        f"an OTLP export was cut off after "
                         f"{time.monotonic() - started:.1f}s by the "
                         f"{cut_short_by.requested:.1f}s budget its caller passed to "
                         f"flush()/close(), which is shorter than this transport's own "
@@ -330,7 +324,7 @@ class OtlpHttpTransport(Transport):
                     # that one is the ordinary "your backend refused us" with no
                     # partial state to explain.
                     report_once(
-                        f"[wardex] an OTLP export was abandoned after {index} of "
+                        f"an OTLP export was abandoned after {index} of "
                         f"{len(bodies)} requests failed to complete; the spans in the "
                         f"remaining request(s) were not sent, so the trace(s) in this "
                         f"batch may arrive incomplete.",

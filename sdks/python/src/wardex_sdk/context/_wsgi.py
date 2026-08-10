@@ -13,7 +13,7 @@ from typing import Any
 from ._propagate import continue_trace
 
 
-class WardexWSGIMiddleware:
+class WardexWsgiMiddleware:
     def __init__(self, app: Any) -> None:
         self.app = app
 

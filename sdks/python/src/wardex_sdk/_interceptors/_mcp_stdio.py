@@ -10,7 +10,6 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import json
-import sys
 import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -23,6 +22,7 @@ from .._assembly import (
     TransportLabel,
     capture_mode_of,
     counters,
+    diag_warning,
     guard,
     latch_ambient,
     parent_is_closed_unit,
@@ -387,7 +387,7 @@ def _maybe_log_disabled(client: Client | None, state: _ProcState, pid: int | Non
         if reason is None:
             return
         state.disabled_logged = True
-        print(f"[wardex] json-rpc parser disabled (pid={pid}): {reason}", file=sys.stderr)
+        diag_warning(f"json-rpc parser disabled (pid={pid}): {reason}")
     except Exception:  # noqa: BLE001 — debug-only logging must never break capture
         pass
 
@@ -440,7 +440,7 @@ class McpStdioInterceptor(InterceptorInterface):
             # swallowed internal failure, in a counter with no reader, which is
             # the same as saying nothing.
             report_once(
-                "[wardex] mcp_stdio interceptor: anyio is not importable, so MCP "
+                "mcp_stdio interceptor: anyio is not importable, so MCP "
                 "traffic over anyio subprocesses will not be captured; the raw "
                 "asyncio.create_subprocess_exec path is still intercepted",
                 key="interceptors.mcp_stdio.no_anyio",
