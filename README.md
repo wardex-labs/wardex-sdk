@@ -45,6 +45,7 @@ way.
 | `batching=BatchingConfig(...)` | When buffered spans are sent: `flush_interval`, `flush_on_signals`, `shutdown_timeout` |
 | `limits=LimitsConfig(...)` | How much is captured — see [Resource limits](#resource-limits) |
 | `propagation=PropagationConfig(...)` | Whether wardex touches outbound traffic: `enabled`, `targets` |
+| `adapters=AdaptersConfig(...)` | Which framework adapters install (`enabled`; `None` auto-detects), and each adapter's own options (`anthropic_agent_sdk`) |
 
 ```python
 import wardex_sdk as wardex
@@ -60,7 +61,7 @@ wardex.init(
 ```
 
 Everything that belongs to no group stays top-level: `debug`, `before_send`,
-`capture_mode`, `release`, `environment`, `adapters`, and the
+`capture_mode`, `release`, `environment`, and the
 interception trio `intercept` / `intercept_hosts` / `interceptors`.
 
 `BackendConfig(endpoint=...)` without a `transport=` builds the default

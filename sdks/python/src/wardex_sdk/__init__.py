@@ -14,11 +14,14 @@ from . import _hub, _runtime
 from ._client import _FOLLOW_TRANSPORT_TIMEOUT
 from ._client import Client as _Client
 from ._config import (
+    AdaptersConfig,
+    AnthropicAgentSdkConfig,
     BackendConfig,
     BatchingConfig,
     PIIConfig,
     PropagationConfig,
     WardexConfigWarning,
+    _non_default_adapter_options,
 )
 from ._config import _resolve_config as _resolve_config_from_env
 from ._enums import (
@@ -107,6 +110,8 @@ __all__ = [
     "WardexMiddleware",
     "WardexWSGIMiddleware",
     # Config groups — every one of them is passed to `init()` by name
+    "AdaptersConfig",
+    "AnthropicAgentSdkConfig",
     "BackendConfig",
     "BatchingConfig",
     "LimitsConfig",
@@ -169,7 +174,7 @@ def init(
     batching: BatchingConfig | None = None,
     limits: LimitsConfig | None = None,
     propagation: PropagationConfig | None = None,
-    adapters: tuple[AdapterName, ...] | None = None,
+    adapters: AdaptersConfig | None = None,
     interceptors: tuple[InterceptorName, ...] | None = None,
     intercept: bool = True,
     intercept_hosts: _Sequence[str] | None = None,
@@ -280,6 +285,22 @@ def init(
             WardexConfigWarning,
             stacklevel=2,
         )
+    if config.adapters.enabled is not None:
+        # Adapter options set while the SAME config object's `enabled=`
+        # excludes the adapter: a contradiction the user wrote, announced
+        # unconditionally — the mirror of interceptors under intercept=False.
+        # Its twin — options set while the adapter is merely NOT DETECTED — is
+        # environment-dependent and legitimate in a config shared across
+        # services, so that one is a debug-only stderr line at install time
+        # (`_adapters/install_configured_adapters`), never a warning.
+        for name in _non_default_adapter_options(config.adapters):
+            if name not in config.adapters.enabled:
+                _warnings.warn(
+                    f"adapters.{name.value} options set but {name.value} is "
+                    "excluded by adapters.enabled",
+                    WardexConfigWarning,
+                    stacklevel=2,
+                )
     if config.debug:
         # One line, at install time, with the RESOLVED config — the env
         # fallbacks and canonicalized collections included. `api_key` is

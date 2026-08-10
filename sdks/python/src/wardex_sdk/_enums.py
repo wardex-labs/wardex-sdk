@@ -41,10 +41,21 @@ class PIICategory(Enum):
 
 
 class AdapterName(Enum):
+    """The adapters that SHIP, each named by what it calls itself.
+
+    A member exists iff its adapter ships — the same rule `InterceptorName`
+    records for `GRPC`/`WEBSOCKET`/`SSE`. `LANGCHAIN` and `OPENAI_AGENTS` were
+    members and are not any more: they named frameworks wardex intends to
+    support before their adapter existed, so selecting one installed nothing
+    at all, in silence. They were removed rather than answered with None — a
+    name that cannot be spelled needs no validation — and each returns as a
+    member when its adapter ships. The value is `adapter.name()` verbatim and
+    doubles as the per-adapter field name on `AdaptersConfig`: one identifier
+    per adapter, held to the registration table by a registry test.
+    """
+
     ANTHROPIC_AGENT_SDK = "anthropic_agent_sdk"
     LANGGRAPH = "langgraph"
-    LANGCHAIN = "langchain"
-    OPENAI_AGENTS = "openai_agents"
 
 
 class InterceptorName(Enum):

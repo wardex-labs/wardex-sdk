@@ -206,6 +206,10 @@ def _config_groups_ctor():
         batching=wardex_sdk.BatchingConfig(flush_interval=1.0),
         limits=LimitsConfig(),
         propagation=wardex_sdk.PropagationConfig(enabled=True, targets=("*.example",)),
+        adapters=wardex_sdk.AdaptersConfig(
+            enabled=(),
+            anthropic_agent_sdk=wardex_sdk.AnthropicAgentSdkConfig(otel_bridge_drain=0.1),
+        ),
     )
 
 
@@ -534,6 +538,8 @@ _DRIVEN = frozenset(
         "WardexMiddleware",
         "WardexWSGIMiddleware",
         "LimitsConfig",
+        "AdaptersConfig",
+        "AnthropicAgentSdkConfig",
         "BackendConfig",
         "BatchingConfig",
         "PIIConfig",

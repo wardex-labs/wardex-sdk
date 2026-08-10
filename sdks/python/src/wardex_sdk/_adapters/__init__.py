@@ -1,11 +1,13 @@
-"""L1 framework adapters — auto-detected at init(), opt-out via Config.adapters."""
+"""L1 framework adapters — auto-detected at init(), selected via `AdaptersConfig.enabled`."""
 
 from __future__ import annotations
 
 import importlib.util
 import sys
+from operator import attrgetter
 from typing import TYPE_CHECKING, NamedTuple
 
+from .._config import AdaptersConfig, _non_default_adapter_options
 from .._enums import AdapterName
 from ._registry import get_registry
 
@@ -18,10 +20,10 @@ if TYPE_CHECKING:
 
 
 class _Registration(NamedTuple):
-    """What this SDK knows about one adapter: how to FIND its framework, and
-    how to BUILD it.
+    """What this SDK knows about one adapter: how to FIND its framework, how to
+    BUILD it, and how to PICK its options.
 
-    ONE row, and that is the whole point. These two facts used to live in a
+    ONE row, and that is the whole point. These facts used to live in a
     detection table and an `if`-chain, and a registration split across two
     places can be written half-way in either direction: a name in the detection
     table with no branch auto-detects the framework and then installs nothing,
@@ -43,6 +45,15 @@ class _Registration(NamedTuple):
     place that should be the first hole in those rules.
     """
 
+    options: Callable[[AdaptersConfig], object] | None = None
+    """Picks this adapter's own options group off `AdaptersConfig`, keyed by
+    the canonical name — the per-adapter field name equals the `AdapterName`
+    value equals `adapter.name()`, so the accessor is an `attrgetter` on that
+    one identifier. `None` for an adapter that has no config class yet (a
+    per-adapter class is created with its first real option, never ahead of
+    it), and `AdapterContext.options` is `None` for it.
+    """
+
 
 def _anthropic_agent_sdk() -> AdapterInterface:
     from ._anthropic_agent_sdk import AnthropicAgentSdkAdapter
@@ -59,7 +70,9 @@ def _langgraph() -> AdapterInterface:
 #: Every adapter this SDK ships, in install order. Adding one is this row plus
 #: its module — nothing else in this file, and no branch anywhere.
 _ADAPTERS: dict[AdapterName, _Registration] = {
-    AdapterName.ANTHROPIC_AGENT_SDK: _Registration("claude_agent_sdk", _anthropic_agent_sdk),
+    AdapterName.ANTHROPIC_AGENT_SDK: _Registration(
+        "claude_agent_sdk", _anthropic_agent_sdk, attrgetter("anthropic_agent_sdk")
+    ),
     AdapterName.LANGGRAPH: _Registration("langgraph", _langgraph),
 }
 
@@ -77,22 +90,58 @@ def _detect_package(module_name: str) -> bool:
 
 
 def _make_adapter(name: AdapterName) -> AdapterInterface | None:
-    """The adapter for `name`, or None when this SDK ships none for it.
+    """The adapter for `name`. A member exists iff its adapter ships.
 
-    None is an ANSWER rather than a failure: `AdapterName` names frameworks
-    wardex intends to support before their adapter exists, so a user who asks
-    for one of those by name gets the same nothing a user whose framework is
-    absent gets, and `init()` carries on.
+    That doctrine (recorded on `AdapterName`, held by a registry test that
+    keeps the enum and this table equal) makes a miss here unreachable except
+    through drift between the two — kept as a `None` rather than a `KeyError`
+    because a drift that shipped anyway must not turn `init()` into a crash.
     """
     row = _ADAPTERS.get(name)
     return None if row is None else row.build()
 
 
+def _options_for(name: str, adapters: AdaptersConfig) -> object | None:
+    """The options group `adapters` carries for the adapter called `name`.
+
+    Selected via the REGISTRATION ROW, so how an adapter's options are found
+    lives on the same one row as how its framework is found and how it is
+    built. `None` when the row has no options accessor (no config class yet)
+    and for a name this SDK ships no adapter for — every test double.
+    """
+    for member, row in _ADAPTERS.items():
+        if member.value == name:
+            return None if row.options is None else row.options(adapters)
+    return None
+
+
 def install_configured_adapters(client: Client | None, config: WardexConfig) -> None:
-    if config.adapters is not None:
-        wanted = list(config.adapters)
+    """Install what `config.adapters.enabled` selects.
+
+    `None` auto-detects installed frameworks, `()` installs none, a tuple
+    installs exactly what it names — the same three answers the flat
+    `config.adapters` tuple gave before the group existed.
+    """
+    if config.adapters.enabled is not None:
+        wanted = list(config.adapters.enabled)
     else:
         wanted = [name for name, pkg in _DETECT_PACKAGES.items() if _detect_package(pkg)]
+        # Configured-but-not-installed has TWO announcement channels, split by
+        # who caused the absence. An adapter EXCLUDED BY `enabled=` while its
+        # options are set is a contradiction the user wrote into one config
+        # object, so `init()` announces it unconditionally with a
+        # `WardexConfigWarning` (the mirror of interceptors under
+        # intercept=False). An adapter merely NOT DETECTED — this branch — is
+        # environment-dependent and legitimate in a config shared across
+        # services, so it is one stderr line under debug only.
+        if config.debug:
+            for name in _non_default_adapter_options(config.adapters):
+                if name not in wanted:
+                    print(
+                        f"[wardex] {name.value} options set but the adapter is "
+                        "not installed (not detected)",
+                        file=sys.stderr,
+                    )
     for name in wanted:
         try:
             adapter = _make_adapter(name)

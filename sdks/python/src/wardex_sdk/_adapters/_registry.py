@@ -6,6 +6,7 @@ from functools import partial
 from typing import TYPE_CHECKING
 
 from .._assembly import Limitation, UnitRegistry, counters, guard
+from .._config import AdaptersConfig
 from .._limits import LimitsConfig
 from ._base import AdapterInterface
 from ._context import AdapterContext
@@ -42,6 +43,18 @@ def context_for(
     limits = config.limits if config is not None else LimitsConfig()
     resolved = limits.resolved()
     debug = bool(getattr(config, "debug", False))
+    # The adapter's own options group, picked off `AdaptersConfig` by the
+    # registration row. Imported lazily because the package's `__init__`
+    # imports THIS module at its top, before the registration table exists;
+    # by the time a context is built the package is whole. The isinstance
+    # guard keeps every test double that carries a fake config honest: a
+    # config whose `adapters` is not the real group has no options to give.
+    options = None
+    adapters_config = getattr(config, "adapters", None)
+    if isinstance(adapters_config, AdaptersConfig):
+        from . import _options_for
+
+        options = _options_for(name, adapters_config)
     return AdapterContext(
         name,
         # The bounds are passed HERE and not left to the registry's defaults.
@@ -58,6 +71,7 @@ def context_for(
         ),
         limits=resolved,
         debug=debug,
+        options=options,
         # A READER over one classvar, not the adapter and not a tuple. `install`
         # builds this context BEFORE it calls `adapter.install()`, and an adapter
         # can only import its framework's error classes in there — so a tuple

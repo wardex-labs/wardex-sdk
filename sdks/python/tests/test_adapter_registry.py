@@ -14,6 +14,7 @@ from wardex_sdk._adapters._base import AdapterInterface
 from wardex_sdk._adapters._context import Placement
 from wardex_sdk._adapters._registry import get_registry
 from wardex_sdk._assembly import SpanIntent, UnitKind, counters
+from wardex_sdk._config import AdaptersConfig, AnthropicAgentSdkConfig, WardexConfig
 from wardex_sdk._enums import AdapterName, AgentType, StatusCode
 from wardex_sdk._types import AgentAttributes
 
@@ -76,12 +77,33 @@ def test_detection_is_derived_from_the_registration_table():
     assert _DETECT_PACKAGES == {name: row.detect for name, row in _ADAPTERS.items()}
 
 
-def test_an_unregistered_member_is_answered_with_none_not_an_error():
-    """`AdapterName` names frameworks whose adapter does not exist yet, and
-    `install_configured_adapters` treats None as 'nothing to install'. A raise
-    here would turn `adapters=(AdapterName.LANGCHAIN,)` into a failed init()."""
-    assert AdapterName.LANGCHAIN not in _ADAPTERS
-    assert _make_adapter(AdapterName.LANGCHAIN) is None
+def test_a_member_exists_iff_its_adapter_ships():
+    """No selectable no-ops, extended from InterceptorName to AdapterName.
+
+    `LANGCHAIN` and `OPENAI_AGENTS` were members with no registration row —
+    names a user could select that installed nothing at all. They are not
+    rejected any more; they are UNSPELLABLE, which is the stronger property:
+    a name that cannot be written needs no validation, and each returns as a
+    member when its adapter ships. The set equality holds both directions —
+    a row without a member is an adapter nothing can select.
+    """
+    assert set(_ADAPTERS) == set(AdapterName)
+    assert not hasattr(AdapterName, "LANGCHAIN")
+    assert not hasattr(AdapterName, "OPENAI_AGENTS")
+
+
+def test_per_adapter_options_fields_name_the_adapter_they_configure():
+    """The one-identifier rule, closed end to end: every options field on
+    `AdaptersConfig` is an `AdapterName` value, and the adapter built for that
+    member calls itself exactly that — so the options accessor on the
+    registration row, keyed by the same name, can never pick up the wrong
+    adapter's options."""
+    import dataclasses
+
+    option_fields = {f.name for f in dataclasses.fields(AdaptersConfig) if f.name != "enabled"}
+    assert option_fields <= {name.value for name in AdapterName}
+    for field_name in option_fields:
+        assert _make_adapter(AdapterName(field_name)).name() == field_name
 
 
 def test_registry_install_is_idempotent():
@@ -97,9 +119,18 @@ def test_registry_install_is_idempotent():
     assert not reg.is_installed("fake")
 
 
-def _config(adapters):
+def _config(enabled, *, debug=False, **options):
+    """A config double whose `adapters` group is REAL.
+
+    The group is what `install_configured_adapters` reads (`.enabled` and the
+    per-adapter options), so a bare Mock attribute there would let the test
+    pass against any spelling of the read. `debug` defaults to False
+    explicitly because a Mock attribute is truthy, and the not-detected
+    announcement is debug-gated.
+    """
     cfg = mock.Mock()
-    cfg.adapters = adapters
+    cfg.adapters = AdaptersConfig(enabled=enabled, **options)
+    cfg.debug = debug
     return cfg
 
 
@@ -165,6 +196,129 @@ def test_broken_adapter_install_does_not_break_init():
         install_configured_adapters(None, _config(None))  # must not raise
         assert not get_registry().is_installed("broken-install")
     get_registry().uninstall_all()
+
+
+# --- AdapterContext.options: the one channel an adapter's config arrives on ---
+
+
+class _ConfiguredClient:
+    """A client double carrying a REAL WardexConfig, which is what
+    `context_for` reads the adapters group off."""
+
+    def __init__(self, config) -> None:
+        self.config = config
+        self.spans: list = []
+
+    def capture_span(self, span) -> None:
+        self.spans.append(span)
+
+    def close(self) -> None:
+        return None
+
+
+def test_each_installed_adapters_context_carries_its_own_options_and_only_its_own():
+    """The whole options pipeline, driven end to end through the REAL registry:
+    config group -> install_configured_adapters -> context_for -> registration
+    row -> AdapterContext.options. The anthropic adapter's context carries the
+    configured `AnthropicAgentSdkConfig`; langgraph has no config class yet, so
+    its context carries None — never a neighbour's options, never the whole
+    WardexConfig."""
+    reg = get_registry()
+    reg.uninstall_all()
+    options = AnthropicAgentSdkConfig(otel_bridge=True, otel_bridge_drain=0.5)
+    config = WardexConfig(
+        adapters=AdaptersConfig(
+            enabled=(AdapterName.ANTHROPIC_AGENT_SDK, AdapterName.LANGGRAPH),
+            anthropic_agent_sdk=options,
+        )
+    )
+    client = _ConfiguredClient(config)
+    try:
+        install_configured_adapters(client, config)
+        assert reg.is_installed("anthropic_agent_sdk")
+        assert reg.is_installed("langgraph")
+        assert reg._contexts["anthropic_agent_sdk"].options == options
+        assert reg._contexts["langgraph"].options is None
+    finally:
+        reg.uninstall_all()
+
+
+def test_a_context_built_without_a_client_config_carries_no_options():
+    """Every test double and every `context_for(name, None)` call: with no real
+    `AdaptersConfig` to read, `options` is None rather than an error."""
+    from wardex_sdk._adapters._registry import context_for
+
+    assert context_for("anthropic_agent_sdk", None).options is None
+
+
+# --- configured-but-not-installed: two announcements, two channels ---------
+#
+# The boundary: options set while the adapter is EXCLUDED BY `enabled=` is a
+# contradiction the user wrote into one config object, announced by init()
+# unconditionally as a WardexConfigWarning (the mirror of interceptors under
+# intercept=False). Options set while the adapter is merely NOT DETECTED is
+# environment-dependent — the same config is legitimate on a host that has the
+# framework and one that does not — so it is one stderr line under debug only,
+# at install time.
+
+
+def test_options_for_an_adapter_excluded_by_enabled_warn_unconditionally():
+    import wardex_sdk
+    from wardex_sdk import WardexConfigWarning, _hub
+
+    _hub.reset_for_test()
+    try:
+        with pytest.warns(WardexConfigWarning, match="excluded by adapters.enabled"):
+            wardex_sdk.init(
+                intercept=False,
+                adapters=AdaptersConfig(
+                    enabled=(),
+                    anthropic_agent_sdk=AnthropicAgentSdkConfig(otel_bridge=True),
+                ),
+            )
+    finally:
+        wardex_sdk.close()
+
+
+def test_default_options_under_an_excluding_enabled_are_not_a_contradiction():
+    """`enabled=()` with every option at its default is an ordinary opt-out —
+    there is nothing set to be ignored, so there is nothing to announce."""
+    import warnings
+
+    import wardex_sdk
+    from wardex_sdk import WardexConfigWarning, _hub
+
+    _hub.reset_for_test()
+    try:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            wardex_sdk.init(intercept=False, adapters=AdaptersConfig(enabled=()))
+        assert not [w for w in caught if issubclass(w.category, WardexConfigWarning)]
+    finally:
+        wardex_sdk.close()
+
+
+def test_options_for_an_undetected_adapter_are_a_debug_stderr_line_only(capsys):
+    get_registry().uninstall_all()
+    line = "anthropic_agent_sdk options set but the adapter is not installed (not detected)"
+    with mock.patch("wardex_sdk._adapters._detect_package", return_value=False):
+        # Not detected, options set, debug ON: the one stderr line.
+        install_configured_adapters(
+            None,
+            _config(
+                None, debug=True, anthropic_agent_sdk=AnthropicAgentSdkConfig(otel_bridge=True)
+            ),
+        )
+        assert line in capsys.readouterr().err
+        # Same absence, debug OFF: silence — a shared config must stay legal.
+        install_configured_adapters(
+            None,
+            _config(None, anthropic_agent_sdk=AnthropicAgentSdkConfig(otel_bridge=True)),
+        )
+        assert line not in capsys.readouterr().err
+        # Not detected but nothing set: nothing to announce, even under debug.
+        install_configured_adapters(None, _config(None, debug=True))
+        assert "options set" not in capsys.readouterr().err
 
 
 # --- CONTROL_FLOW: a framework's pause is not a failure -------------------
