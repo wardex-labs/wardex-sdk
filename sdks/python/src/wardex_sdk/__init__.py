@@ -57,20 +57,16 @@ from ._snapshot_api import capture_state_snapshot
 from ._tracing import Span, agent, conversation, span, step, tool, workflow
 from ._types import (
     AgentAttributes,
+    BeforeSendEnvelopeCallback,
     CallSite,
     ConversationContext,
+    Envelope,
     GenAIAttributes,
     InputRef,
     ToolAttributes,
     ToolDefinition,
     ToolDefinitionSet,
 )
-
-# Private on purpose: `before_send=`'s annotation needs the protocol, but the
-# callback type's public spelling is a later slice of this API batch (it is
-# renamed with the hook). The signature-walk test records the debt in
-# `_KNOWN_UNEXPORTED`.
-from ._types import BeforeSendCallback as _BeforeSendCallback
 from ._version import __version__
 from .context._asgi import WardexMiddleware
 from .context._contextvar import run_in_context
@@ -139,8 +135,10 @@ __all__ = [
     "UserInfo",
     "Scope",
     "AgentAttributes",
+    "BeforeSendEnvelopeCallback",
     "CallSite",
     "ConversationContext",
+    "Envelope",
     "GenAIAttributes",
     "InputRef",
     "ToolAttributes",
@@ -183,7 +181,7 @@ def init(
     capture_mode: CaptureMode = CaptureMode.AGENT,
     release: str | None = None,
     environment: str | None = None,
-    before_send: _BeforeSendCallback | None = None,
+    before_send_envelope: BeforeSendEnvelopeCallback | None = None,
     debug: bool = False,
 ) -> None:
     """Initialize wardex: resolve the config, build the client, install it.
@@ -239,7 +237,7 @@ def init(
         capture_mode=capture_mode,
         release=release,
         environment=environment,
-        before_send=before_send,
+        before_send_envelope=before_send_envelope,
         debug=debug,
     )
     # The config is built FIRST so that a caller's bad argument still raises
@@ -323,15 +321,14 @@ def init(
             "[wardex] no transport or backend.endpoint configured: capturing, exporting nothing",
             file=_sys.stderr,
         )
-    resolved_transport.set_pii_policy(
-        config.pii.mode.value,
-        tuple(sorted(c.value for c in config.pii.disabled_categories)),
-    )
+    # Plumbing, not subclass hooks: the private setters install what
+    # `Transport.encode()` — the sanctioned, masked path to wire bytes — reads.
+    resolved_transport._set_pii_policy(config.pii)
     # The transport encodes, so the encoder's ceilings are its business too --
     # `max_otlp_attribute_bytes` and `max_otlp_request_bytes` are configured
     # here and enforced there, and a transport that never received them would
     # advertise both knobs and honour neither.
-    resolved_transport.set_limits(config.limits.to_native())
+    resolved_transport._set_limits(config.limits.to_native())
     client = _Client(config, resolved_transport)
     # One call, because there is one install order and the `Runtime` owns it:
     # the client slot, atexit, the signal handlers, the interceptor and adapter

@@ -10,15 +10,15 @@ from wardex_sdk._config import BackendConfig, WardexConfig
 from wardex_sdk._enums import CaptureMode
 from wardex_sdk._interceptors import _seam
 from wardex_sdk._interceptors._seam import ByteSeamInterceptor
-from wardex_sdk._types import InternalEnvelope, SpanContext, SpanId, TraceId
+from wardex_sdk._types import Envelope, SpanContext, SpanId, TraceId
 from wardex_sdk.transport._base import Transport
 
 
 class _Recording(Transport):
     def __init__(self):
-        self.envelopes: list[InternalEnvelope] = []
+        self.envelopes: list[Envelope] = []
 
-    def export(self, envelope: InternalEnvelope) -> None:
+    def export(self, envelope: Envelope) -> None:
         self.envelopes.append(envelope)
 
 

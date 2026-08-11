@@ -24,8 +24,8 @@ from wardex_sdk._config import BackendConfig, WardexConfig
 from wardex_sdk._enums import CaptureMode, SpanKind, StatusCode
 from wardex_sdk._tracing import span as manual_span
 from wardex_sdk._types import (
+    Envelope,
     EnvelopeHeader,
-    InternalEnvelope,
     InternalSpan,
     InternalSpanLink,
     SdkInfo,
@@ -143,8 +143,8 @@ def test_the_adapter_root_still_reports_the_model_as_the_agent_name(client):
 # --------------------------------------------------------------------------
 
 
-def _envelope(span: InternalSpan) -> InternalEnvelope:
-    return InternalEnvelope(
+def _envelope(span: InternalSpan) -> Envelope:
+    return Envelope(
         header=EnvelopeHeader(
             event_id="evt-1",
             api_key="k",

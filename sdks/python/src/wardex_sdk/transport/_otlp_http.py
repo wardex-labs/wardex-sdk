@@ -1,4 +1,4 @@
-"""OTLP/HTTP exporter — InternalEnvelope → OTLP protobuf → synchronous POST.
+"""OTLP/HTTP exporter — Envelope → OTLP protobuf → synchronous POST.
 
 Synchronous POST-on-flush: `export()` delegates to `_send_batch`, the single POST
 path that a manual `flush()` and the background batch worker both reach.
@@ -10,6 +10,10 @@ does not arrive. The core measures each request against `max_otlp_request_bytes`
 -- both as the compressed body and as what it decompresses to, since a receiver
 checks both -- and hands back as many bodies as it took; this module posts them
 in order, under ONE shared deadline.
+
+The bytes come from `Transport.encode()`, the sanctioned path every transport
+shares: this module is deliberately written THROUGH it -- an implementer who
+copies this file copies the path that applies PII masking and the limits.
 """
 
 from __future__ import annotations
@@ -19,9 +23,9 @@ import time
 import urllib.request
 
 from .._assembly import report_once
-from .._native import NATIVE_OK, native, unavailable_reason
-from .._types import InternalEnvelope
-from ._base import UNDELIVERED, CallerBudget, Transport
+from .._native import NATIVE_OK, unavailable_reason
+from .._types import Envelope
+from ._base import UNDELIVERED, CallerBudget, Transport, Undelivered
 
 
 def _cut_short_by_the_caller(
@@ -127,23 +131,24 @@ class OtlpHttpTransport(Transport):
         return self._compress
 
     @property
-    def timeout(self) -> float:
+    def export_timeout(self) -> float:
         """How long one export may take, as this transport was configured.
 
-        Overrides `Transport.timeout`, which declares the contract: a `flush()`
-        with no argument follows the transport's own timeout rather than capping
-        the POST at a default of its own (see `_client._UnnamedTimeout`). A
-        property rather than a plain attribute only because the value lives in
-        `_timeout` and is read-only after construction.
+        Overrides `Transport.export_timeout`, which declares the contract: a
+        `flush()` with no argument follows the transport's own timeout rather
+        than capping the POST at a default of its own (see
+        `_client._UnnamedTimeout`). The constructor kwarg stays `timeout=` --
+        that is how a user configures ONE transport, while `export_timeout` is
+        the reflectively-read contract name. A property rather than a plain
+        attribute only because the value lives in `_timeout` and is read-only
+        after construction.
         """
         return self._timeout
 
-    def export(self, envelope: InternalEnvelope, *, timeout: float | None = None) -> object | None:
+    def export(self, envelope: Envelope, *, timeout: float | None = None) -> Undelivered | None:
         return self._send_batch(envelope, timeout)
 
-    def _send_batch(
-        self, envelope: InternalEnvelope, timeout: float | None = None
-    ) -> object | None:
+    def _send_batch(self, envelope: Envelope, timeout: float | None = None) -> Undelivered | None:
         # zero spans means an empty batch — skip the POST. Not a decline: there
         # is nothing here for a later attempt to deliver.
         if not envelope.spans:
@@ -208,33 +213,15 @@ class OtlpHttpTransport(Transport):
         # the time you asked for".
         started = time.monotonic()
         deadline = started + effective
-        bodies, dropped = native.codec.encode_otlp_requests(
-            envelope,
-            self._pii_mode,
-            list(self._pii_disabled),
-            self._limits,
-            self._compress,
-        )  # encode=fail-loud
-        if dropped:
-            # A span so large it would not fit a request even with its payload
-            # removed. `report_once` rather than a debug print, and for the
-            # reason the native-unavailable branch above gives: the marker
-            # mechanism cannot reach this loss -- the span is not on the wire to
-            # carry one -- so off-debug it would be byte-identical to those
-            # spans never having been captured. Bounded to one line per process,
-            # which is what makes it affordable on a per-call path, and keyed
-            # apart from the budget reports below so "one span is too big for
-            # your collector" stays separately actionable.
-            report_once(
-                f"[wardex] {dropped} span(s) exceeded max_otlp_request_bytes even with "
-                f"their payload removed and were not exported. Raise "
-                f"max_otlp_request_bytes if your collector accepts more.",
-                key="transport.otlp.span_over_request_cap",
-            )
+        # THE SANCTIONED PATH: `Transport.encode()` runs the native encoder
+        # with this transport's stored PII policy and limits, splits at
+        # `max_otlp_request_bytes`, and reports (once per process) any span too
+        # large to ship even bare. The `compress` constructor flag feeds it.
+        bodies = self.encode(envelope, compress=self._compress)
         if not bodies:
-            # Every span in the batch was dropped by the guard above. Nothing to
-            # POST, and not `UNDELIVERED`: a later attempt would encode to the
-            # same nothing.
+            # Every span in the batch was dropped by encode()'s over-cap guard.
+            # Nothing to POST, and not `UNDELIVERED`: a later attempt would
+            # encode to the same nothing.
             return None
         headers = {"Content-Type": "application/x-protobuf"}
         # Host headers next, as they always have been: a caller who sets one of

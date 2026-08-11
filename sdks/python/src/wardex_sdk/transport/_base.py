@@ -1,8 +1,14 @@
 from __future__ import annotations
 
 import abc
+from typing import TYPE_CHECKING
 
-from .._types import InternalEnvelope
+from .._assembly import report_once
+from .._native import NATIVE_OK, native, unavailable_reason
+from .._types import Envelope
+
+if TYPE_CHECKING:
+    from .._config import PIIConfig
 
 DEFAULT_TIMEOUT = 5.0
 """The one 5.0 in this SDK's timeout story, and the single place to change it.
@@ -18,13 +24,18 @@ Deliberately NOT the default for a transport's own configured export timeout:
 `OtlpHttpTransport(timeout=10.0)` chose ten seconds for its own reasons, and
 sharing a constant between "how long one POST may take" and "how long a
 shutdown step may take" would tie two numbers that answer different questions.
-The tie is between the DEFAULTS, which is why `Transport.timeout` names this
-constant as a starting point a subclass is expected to override.
+The tie is between the DEFAULTS, which is why `Transport.export_timeout` names
+this constant as a starting point a subclass is expected to override.
 """
 
 
-class _Undelivered:
-    """The type of `UNDELIVERED`. A singleton, so `is` is the whole test."""
+class Undelivered:
+    """The type of `UNDELIVERED`. A singleton, so `is` is the whole test.
+
+    Public so that `Transport.export`'s return annotation can be spelled by a
+    third-party implementer -- the VALUE to return is still the one
+    `UNDELIVERED` instance, never a fresh `Undelivered()`.
+    """
 
     __slots__ = ()
 
@@ -32,14 +43,14 @@ class _Undelivered:
         return "UNDELIVERED"
 
 
-UNDELIVERED = _Undelivered()
+UNDELIVERED = Undelivered()
 """What `Transport.export` returns to say "I did not send this one".
 
 The client cannot see inside a transport, and every attempt to work out from the
 outside whether a send would happen has been wrong: the check runs at a moment
-that is not the moment of the send, and the work in between (a `before_send`
-that outlives the budget, most of all) invalidates it. So the transport says so
-itself, at the one moment it knows.
+that is not the moment of the send, and the work in between (a
+`before_send_envelope` that outlives the budget, most of all) invalidates it. So
+the transport says so itself, at the one moment it knows.
 
 Precise meaning, because the client acts on it: *this envelope was not put on
 the wire, nothing about it was consumed, and an identical attempt later with a
@@ -59,6 +70,15 @@ never happened and burn the one-line-per-process report budget doing it.
 
 class CallerBudget(float):
     """A `timeout` a CALLER named, as opposed to one wardex derived for them.
+
+    PYTHON-ONLY, and deliberately EXCLUDED from the cross-language transport
+    SPI: this is a diagnostic refinement, not part of the contract Node or
+    Java inherit. A float subclass carrying a field cannot exist in every
+    language -- there is nothing to subclass in Node and nowhere for the field
+    to ride in Java -- so other SDKs receive a plain timeout and may not be
+    able to distinguish caller-named budgets from derived ones. A transport
+    ported across languages must therefore never REQUIRE this distinction;
+    here it sharpens one stderr diagnostic and nothing else.
 
     A transport receiving `timeout=2.0` cannot tell those two apart, and the
     difference is the whole of whether a cut-off POST is news:
@@ -129,13 +149,23 @@ class CallerBudget(float):
 
 
 class Transport(abc.ABC):
+    """The one advertised extension point: where finished envelopes go.
+
+    THE PII CONTRACT, stated here because a subclass is host code the SDK
+    cannot audit: export() receives PRE-masking data; if you serialize the
+    envelope yourself, you own PII masking -- encode() is the sanctioned,
+    masked path to bytes. The `Envelope` is opaque (its guaranteed surface is
+    `span_count` and `encode()`), so a transport that stays on the sanctioned
+    path gets the configured masking and limits without ever reading a field.
+    """
+
     # PII policy applied by the native encoders on wire paths (design §4.2).
     # Class-level defaults are secure-by-default: a transport used without
     # init() still masks.
     _pii_mode: str = "mask"
     _pii_disabled: tuple[str, ...] = ()
 
-    timeout: float = DEFAULT_TIMEOUT
+    export_timeout: float = DEFAULT_TIMEOUT
     """How long this transport may spend on ONE export, in seconds.
 
     Declared here because the client READS it: a `wardex.flush()` with no
@@ -144,20 +174,23 @@ class Transport(abc.ABC):
     An `OtlpHttpTransport(timeout=30.0)` therefore gets its thirty seconds out
     of a bare `flush()`.
 
-    It was undeclared for a release, and read off the instance with a
-    `try/except`. Nothing crashed -- the read is still guarded, see
-    `_client._configured_transport_timeout` -- but with no declaration there was
-    no contract, and it failed quietly in both directions. A third-party
-    transport that happened to keep a `self.timeout` for its own bookkeeping
-    silently redefined how long a bare `flush()` waited; one that did not have
-    the attribute silently got 5 seconds instead of the thirty it was built for,
-    and nothing anywhere said why. Neither is a crash, which is exactly what
-    made them the kind of defect this SDK keeps finding late.
+    NAMED `export_timeout` AND NOT `timeout`, because the collision already
+    happened once. This attribute is read reflectively off the instance, which
+    makes its name contract in the least visible way there is -- and under the
+    bare spelling a third-party transport that happened to keep a
+    `self.timeout` for its own bookkeeping silently redefined how long a bare
+    `flush()` waited, while one that did not have the attribute silently got 5
+    seconds instead of the thirty it was built for. Neither is a crash.
+    `timeout` is a name every second transport keeps for itself;
+    `export_timeout` is one nobody picks by accident. (It also spent a release
+    undeclared entirely and read with a `try/except` -- the read is still
+    guarded, see `_client._configured_transport_timeout`, because a
+    declaration is not a guarantee.)
 
     Overriding it is expected, and a plain instance attribute
-    (`self.timeout = ...` in `__init__`) or a property both work. The default is
-    `DEFAULT_TIMEOUT` so that a transport with nothing to say behaves as it did
-    before this attribute existed.
+    (`self.export_timeout = ...` in `__init__`) or a property both work. The
+    default is `DEFAULT_TIMEOUT` so that a transport with nothing to say
+    behaves as it did before this attribute existed.
 
     Non-binding on I/O: this is what the transport ADVERTISES, and the client
     uses it to size its own wait. Actually bounding the socket is the
@@ -167,33 +200,98 @@ class Transport(abc.ABC):
     _limits: object | None = None
     """The resolved native `Limits`, or None for the core's own defaults.
 
-    Read by transports that encode: the OTLP exporter caps attribute values at
-    `max_otlp_attribute_bytes` and splits its POSTs at `max_otlp_request_bytes`,
-    and both of those are user-configurable. Class-level None keeps a transport
-    constructed by hand — without `init()` — working on the core defaults rather
-    than raising for a knob it was never given.
+    Read by `encode()`: the OTLP encoder caps attribute values at
+    `max_otlp_attribute_bytes` and splits its request bodies at
+    `max_otlp_request_bytes`, and both of those are user-configurable.
+    Class-level None keeps a transport constructed by hand — without `init()` —
+    working on the core defaults rather than raising for a knob it was never
+    given.
     """
 
-    def set_pii_policy(self, mode: str, disabled: tuple[str, ...]) -> None:
-        """Install the PII policy resolved from WardexConfig (called by init)."""
-        self._pii_mode = mode
-        self._pii_disabled = disabled
+    def encode(self, envelope: Envelope, *, compress: bool = True) -> tuple[bytes, ...]:
+        """The sanctioned path from an envelope to wire bytes. DO NOT OVERRIDE.
 
-    def set_limits(self, limits: object | None) -> None:
-        """Install the resolved resource limits (called by init).
+        Returns one OTLP/HTTP request body per element — protobuf, gzipped
+        when `compress` is true — split at `max_otlp_request_bytes`. An OTLP
+        request is accepted or rejected whole, so a batch over the receiver's
+        body limit leaves as several bodies rather than arriving short: POST
+        every element, in order.
 
-        Separate from `set_pii_policy` because the two answer to different
-        config, and a transport that cares about one rarely cares about the
-        other. Same shape deliberately: a third-party transport that overrides
-        neither keeps working, and one that overrides this gets the same object
-        the native encoders take.
+        PII MASKING AND LIMITS ARE APPLIED HERE, because this method hands the
+        transport's stored policy — installed by `init()`, secure by default
+        without it — to the native encoder. That is why the method is final: a
+        transport that reaches wire bytes through `encode()` cannot ship
+        unmasked data by accident, and one that serializes the envelope itself
+        owns that risk (see the class docstring).
+
+        A span too large to fit a request even with its payload removed is
+        dropped and reported — one stderr line per process, on the first
+        occurrence, its count covering that batch — because it never reaches
+        the wire to carry a marker. The report lives here, concrete and
+        shared, so every transport that encodes gets it.
+        """
+        if not NATIVE_OK:
+            # Reachable from a hand-constructed transport that never went
+            # through init(), so name the missing wheel instead of raising
+            # AttributeError off a None module.
+            raise RuntimeError(
+                f"wardex native extension unavailable, so envelopes cannot be "
+                f"encoded ({unavailable_reason()})"
+            )
+        bodies, dropped = native.codec.encode_otlp_requests(
+            envelope,
+            self._pii_mode,
+            list(self._pii_disabled),
+            self._limits,
+            compress,
+        )  # encode=fail-loud
+        if dropped:
+            # A span so large it would not fit a request even with its payload
+            # removed. `report_once` rather than a debug print: the marker
+            # mechanism cannot reach this loss -- the span is not on the wire
+            # to carry one -- so off-debug it would be byte-identical to those
+            # spans never having been captured. Bounded to one line per
+            # process, which is what makes it affordable on a per-call path,
+            # and keyed apart from the budget reports so "one span is too big
+            # for your collector" stays separately actionable.
+            report_once(
+                f"[wardex] {dropped} span(s) exceeded max_otlp_request_bytes even with "
+                f"their payload removed and were not exported. Raise "
+                f"max_otlp_request_bytes if your collector accepts more.",
+                key="transport.otlp.span_over_request_cap",
+            )
+        return tuple(bodies)
+
+    def _set_pii_policy(self, policy: PIIConfig) -> None:
+        """Install the PII policy resolved from `WardexConfig`. Called by
+        `init()` — plumbing, not a subclass hook.
+
+        Stores the shape the native encoder takes (`encode()` is the reader),
+        so a transport constructed by hand keeps the secure class-level
+        defaults and one installed by `init()` carries exactly what was
+        configured.
+        """
+        self._pii_mode = policy.mode.value
+        self._pii_disabled = tuple(sorted(c.value for c in policy.disabled_categories))
+
+    def _set_limits(self, limits: object | None) -> None:
+        """Install the resolved resource limits. Called by `init()` — plumbing,
+        not a subclass hook.
+
+        Separate from `_set_pii_policy` because the two answer to different
+        config. The object stored is the same native `Limits` the encoders
+        take, and `encode()` is its reader.
         """
         self._limits = limits
 
     @abc.abstractmethod
-    def export(self, envelope: InternalEnvelope, *, timeout: float | None = None) -> object | None:
+    def export(self, envelope: Envelope, *, timeout: float | None = None) -> Undelivered | None:
         """Ship one envelope. `timeout` is the remaining budget for this export,
         in seconds, or None when no deadline was imposed at all.
+
+        `envelope` arrives PRE-masking (see the class docstring): masking runs
+        inside `encode()`, which is the sanctioned way to turn the envelope
+        into bytes.
 
         Three values, not two: `None` means "no deadline"; a plain `float` means
         "a budget wardex derived -- from your own configured timeout, or from

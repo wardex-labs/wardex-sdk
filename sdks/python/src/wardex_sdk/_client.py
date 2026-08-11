@@ -10,10 +10,16 @@ from collections import deque
 from dataclasses import replace
 
 from ._assembly import guard, report_once
+
+# The debug-gated traceback printer `guard()` itself uses: contained rendering
+# of a host exception (repr may raise, stderr may be gone) without a second
+# implementation of either containment. Reached into `_diag` the way
+# `testing/harness.py` already reaches `reset_reports_for_test`.
+from ._assembly._diag import _log_with_traceback
 from ._config import WardexConfig
 from ._types import (
+    Envelope,
     EnvelopeHeader,
-    InternalEnvelope,
     InternalSpan,
     InternalStateSnapshot,
     SdkInfo,
@@ -237,14 +243,14 @@ def _configured_transport_timeout(transport: Transport) -> float:
     """How long `transport` was configured to spend on one export, or
     `_DEFAULT_TIMEOUT` when that cannot be learned.
 
-    `Transport.timeout` is a declared attribute with a default, so the common
-    case cannot fail -- but the read stays guarded, because a DECLARATION is not
-    a guarantee. `Transport` is public and subclassable: `timeout` may be a
-    property that raises, a `__getattr__` that returns something `float()`
-    rejects, or absent entirely on a duck-typed object that never inherited from
-    `Transport` at all. Two defects in this area came from a transport read that
-    sat outside a handler, so the read, the conversion and the validation are
-    all inside this one try.
+    `Transport.export_timeout` is a declared attribute with a default, so the
+    common case cannot fail -- but the read stays guarded, because a
+    DECLARATION is not a guarantee. `Transport` is public and subclassable:
+    `export_timeout` may be a property that raises, a `__getattr__` that
+    returns something `float()` rejects, or absent entirely on a duck-typed
+    object that never inherited from `Transport` at all. Two defects in this
+    area came from a transport read that sat outside a handler, so the read,
+    the conversion and the validation are all inside this one try.
 
     Every unusable answer falls back to `_DEFAULT_TIMEOUT` rather than being
     rejected, for the reason `_sanitize_timeout` gives: rejecting means raising,
@@ -258,7 +264,7 @@ def _configured_transport_timeout(transport: Transport) -> float:
     this thread down is not a transport whose timeout we failed to read.
     """
     try:
-        configured = float(transport.timeout)  # type: ignore[attr-defined]
+        configured = float(transport.export_timeout)  # type: ignore[attr-defined]
     except Exception:  # noqa: BLE001 — a probe with a safe answer, never a throw
         return _DEFAULT_TIMEOUT
     if configured != configured or configured <= 0.0:  # NaN, 0, negative
@@ -751,7 +757,7 @@ class Client:
             self._export_lock.acquire()
             return True
         # A thread that already owns this RLock -- the signal handler re-entering
-        # through before_send or through transport.export -- is granted it
+        # through before_send_envelope or through transport.export -- is granted it
         # immediately even at budget=0, so reentrancy never spuriously declines.
         return self._export_lock.acquire(timeout=budget)
 
@@ -812,7 +818,7 @@ class Client:
         Nothing here tries to work out in ADVANCE whether the send will happen.
         Every version that did was wrong in the same way: the prediction was
         evaluated at a moment that was not the moment of the send, and the work
-        in between -- `before_send`, which is host code and can outlive any
+        in between -- `before_send_envelope`, which is host code and can outlive any
         budget -- invalidated it. There is no reason to guess about something
         the callee can simply be asked.
 
@@ -827,7 +833,7 @@ class Client:
         Only the buffer lock is released early (marked below); the export lock
         is held to the end of the method.
 
-        Errors from before_send or the export path drop the envelope
+        Errors from before_send_envelope or the export path drop the envelope
         (fail-closed) and never propagate.
         """
         deadline = None if timeout is None else time.monotonic() + timeout
@@ -857,14 +863,32 @@ class Client:
                 sdk=self._sdk_info,
                 sent_at_ns=time.time_ns(),
             )
-            envelope = InternalEnvelope(
+            envelope = Envelope(
                 header=header,
                 spans=tuple(spans),
                 state_snapshots=tuple(snapshots),
             )
             try:
-                if self._config.before_send is not None:
-                    maybe = self._config.before_send(envelope)
+                if self._config.before_send_envelope is not None:
+                    try:
+                        maybe = self._config.before_send_envelope(envelope)
+                    except Exception as exc:
+                        # HOST code raised, and the batch is dropped fail-closed
+                        # -- never ship half-filtered data. Said off-debug,
+                        # bounded to one line per process: the hook is the
+                        # host's own veto, so a raise that silently ate every
+                        # batch was byte-identical to a filter that dropped
+                        # them on purpose. The traceback is debug-gated because
+                        # it belongs to the host's code, not to wardex's
+                        # per-process announcement budget.
+                        report_once(
+                            "[wardex] before_send_envelope raised; batch dropped "
+                            "(re-run with debug=True for the traceback)",
+                            key="wardex.before_send_envelope",
+                        )
+                        if self._config.debug:
+                            _log_with_traceback("client.before_send_envelope", exc)
+                        return
                     if maybe is None:
                         # The host dropped it on purpose. Not a loss, so it is
                         # neither returned to the buffer (it would come straight
@@ -875,9 +899,10 @@ class Client:
             except Exception as exc:  # fail-closed: drop, never ship half-filtered data
                 # Also not routed into `_undelivered`, deliberately. A raise
                 # means an attempt of unknown outcome -- the transport may have
-                # sent half of it -- so re-queueing risks a duplicate, and a
-                # before_send that raises on this envelope will raise on it
-                # every time, which would pin the batch in the buffer forever.
+                # sent half of it -- so re-queueing risks a duplicate. (The
+                # hook's own raise is handled above, where it can be named; a
+                # raising hook would raise on this envelope every time, which
+                # would pin the batch in the buffer forever if re-queued.)
                 if self._config.debug:
                     print(f"[wardex] envelope dropped ({exc})", file=sys.stderr)
                 return
@@ -887,9 +912,7 @@ class Client:
         finally:
             self._export_lock.release()
 
-    def _export(
-        self, envelope: InternalEnvelope, deadline: float | None, named: float | None
-    ) -> bool:
+    def _export(self, envelope: Envelope, deadline: float | None, named: float | None) -> bool:
         """Hand the envelope to the transport with whatever budget is left, and
         report back whether it went.
 
@@ -1008,8 +1031,8 @@ class Client:
         client, not about the flag this call was made with.
 
         `spans`/`snapshots` are what the drain swapped OUT, not whatever
-        `before_send` turned them into. The next drain builds a fresh envelope
-        and runs `before_send` over it again, which is the only reading that
+        `before_send_envelope` turned them into. The next drain builds a fresh envelope
+        and runs `before_send_envelope` over it again, which is the only reading that
         stays correct when the host's filter is stateful about the envelopes it
         has already seen -- an envelope it rewrote was never sent, so it never
         happened.

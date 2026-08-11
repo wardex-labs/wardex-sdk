@@ -14,7 +14,7 @@ from wardex_sdk._client import Client
 from wardex_sdk._config import BackendConfig, BatchingConfig, WardexConfig
 from wardex_sdk._enums import SpanKind, StatusCode
 from wardex_sdk._limits import LimitsConfig
-from wardex_sdk._types import InternalEnvelope, InternalSpan, SpanContext, SpanId, TraceId
+from wardex_sdk._types import Envelope, InternalSpan, SpanContext, SpanId, TraceId
 from wardex_sdk.transport._base import Transport
 from wardex_sdk.transport._otlp_http import OtlpHttpTransport
 
@@ -31,9 +31,9 @@ def _wait_for(predicate, timeout=5.0):
 
 class _Recording(Transport):
     def __init__(self):
-        self.envelopes: list[InternalEnvelope] = []
+        self.envelopes: list[Envelope] = []
 
-    def export(self, envelope: InternalEnvelope) -> None:
+    def export(self, envelope: Envelope) -> None:
         self.envelopes.append(envelope)
 
 
@@ -97,7 +97,7 @@ def mark(envelope):
     return None  # drop after recording — no network needed
 
 # interval 3600 + threshold 512: only the signal handler can flush this span
-wardex.init(transport=NoOpTransport(), before_send=mark, intercept=False,
+wardex.init(transport=NoOpTransport(), before_send_envelope=mark, intercept=False,
             backend=wardex.BackendConfig(api_key="k"),
             batching=wardex.BatchingConfig(flush_interval=3600.0))
 _hub.get_client().capture_span(InternalSpan(

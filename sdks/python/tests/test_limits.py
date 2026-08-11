@@ -784,8 +784,8 @@ def _otlp_envelope(payload: bytes):
     """One span carrying `payload`, shaped the way the export path receives it."""
     from wardex_sdk._enums import SpanKind, StatusCode
     from wardex_sdk._types import (
+        Envelope,
         EnvelopeHeader,
-        InternalEnvelope,
         InternalSpan,
         SdkInfo,
         SpanContext,
@@ -793,7 +793,7 @@ def _otlp_envelope(payload: bytes):
         TraceId,
     )
 
-    return InternalEnvelope(
+    return Envelope(
         header=EnvelopeHeader(
             event_id="evt",
             api_key="k",

@@ -60,7 +60,7 @@ wardex.init(
 )
 ```
 
-Everything that belongs to no group stays top-level: `debug`, `before_send`,
+Everything that belongs to no group stays top-level: `debug`, `before_send_envelope`,
 `capture_mode`, `release`, `environment`, and the
 interception trio `intercept` / `intercept_hosts` / `interceptors`.
 
@@ -355,7 +355,7 @@ Raise `max_entries_per_unit` if you see any of these counters move.
    LangChain (non-graph runnables) and OpenAI Agents SDK next
 5. Node/TS and Java SDKs
 
-> PII masking caveats: `before_send` sees pre-masking data (masking runs inside
+> PII masking caveats: `before_send_envelope` sees pre-masking data (masking runs inside
 > the encoder), the Console transport prints raw (local debugging only), and
 > non-UTF-8 binary payloads pass through unmasked.
 

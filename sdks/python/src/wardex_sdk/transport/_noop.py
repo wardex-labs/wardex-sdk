@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from .._types import InternalEnvelope
+from .._types import Envelope
 from ._base import Transport
 
 
 class NoOpTransport(Transport):
-    def export(self, envelope: InternalEnvelope, *, timeout: float | None = None) -> None:
+    def export(self, envelope: Envelope, *, timeout: float | None = None) -> None:
         return None

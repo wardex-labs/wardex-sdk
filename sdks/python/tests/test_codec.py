@@ -1,4 +1,4 @@
-"""Codec round-trip — InternalEnvelope → encode → decode → field preservation."""
+"""Codec round-trip — Envelope → encode → decode → field preservation."""
 
 from __future__ import annotations
 
@@ -14,11 +14,11 @@ from wardex_sdk._types import (
     A2aMeta,
     CaptureIntegrity,
     CorrelationInfo,
+    Envelope,
     EnvelopeHeader,
     GenAIAttributes,
     HttpMeta,
     InputRef,
-    InternalEnvelope,
     InternalSpan,
     InternalStateSnapshot,
     SdkInfo,
@@ -58,8 +58,8 @@ def _span(**kw) -> InternalSpan:
     return InternalSpan(**base)
 
 
-def _env(span: InternalSpan) -> InternalEnvelope:
-    return InternalEnvelope(header=_header(), spans=(span,))
+def _env(span: InternalSpan) -> Envelope:
+    return Envelope(header=_header(), spans=(span,))
 
 
 def test_roundtrip_core_span_fields():
@@ -140,7 +140,7 @@ def test_encode_is_deterministic():
 
 
 def test_empty_envelope_roundtrips():
-    out = _codec.decode(_codec.encode(InternalEnvelope(header=_header())))
+    out = _codec.decode(_codec.encode(Envelope(header=_header())))
     assert out["items"] == []
 
 
@@ -212,7 +212,7 @@ def test_roundtrip_a2a_and_blob_refs_and_tool_definitions():
             set_hash="sha256:set",
         ),
     )
-    env = InternalEnvelope(header=_header(), spans=(_span(transport=tr),), state_snapshots=(snap,))
+    env = Envelope(header=_header(), spans=(_span(transport=tr),), state_snapshots=(snap,))
     out = _codec.decode(_codec.encode(env))
 
     t = out["items"][0]["span"]["transport"]
@@ -236,7 +236,7 @@ def test_roundtrip_state_snapshot():
         conversation_state=b"history",
         input_refs=(InputRef(key="doc.md", content_hash="sha256:abc"),),
     )
-    env = InternalEnvelope(header=_header(), state_snapshots=(snap,))
+    env = Envelope(header=_header(), state_snapshots=(snap,))
     out = _codec.decode(_codec.encode(env))
     ss = out["items"][0]["state_snapshot"]
     assert ss["trace_id"] == b"\x03" * 16

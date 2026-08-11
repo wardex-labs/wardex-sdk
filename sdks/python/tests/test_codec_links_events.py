@@ -27,8 +27,8 @@ import pytest
 from wardex_sdk._assembly import LinkReason
 from wardex_sdk._enums import SpanKind, StatusCode
 from wardex_sdk._types import (
+    Envelope,
     EnvelopeHeader,
-    InternalEnvelope,
     InternalSpan,
     InternalSpanEvent,
     InternalSpanLink,
@@ -43,8 +43,8 @@ _OTHER_TRACE = TraceId(b"\xaa" * 16)
 _OTHER_SPAN = SpanId(b"\xbb" * 8)
 
 
-def _envelope(span: InternalSpan) -> InternalEnvelope:
-    return InternalEnvelope(
+def _envelope(span: InternalSpan) -> Envelope:
+    return Envelope(
         header=EnvelopeHeader(
             event_id="evt-1",
             api_key="k",

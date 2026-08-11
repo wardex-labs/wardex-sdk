@@ -36,7 +36,7 @@ design document is a contract nobody edits when the code moves:
                                         each adapter's own options.
 
 What stays top-level is what belongs to no group or to the SDK as a whole:
-`debug`, `before_send`, `capture_mode`, `release`, `environment`, and the
+`debug`, `before_send_envelope`, `capture_mode`, `release`, `environment`, and the
 interception trio (`intercept`, `intercept_hosts`, `interceptors`).
 The trio stays flat deliberately — `intercept` is the switch, `interceptors`
 refines it and `intercept_hosts` scopes it, so filing one of the three under a
@@ -79,7 +79,7 @@ from ._enums import (
     PIIMode,
 )
 from ._limits import LimitsConfig
-from ._types import BeforeSendCallback
+from ._types import BeforeSendEnvelopeCallback
 
 
 class WardexConfigWarning(UserWarning):
@@ -110,6 +110,10 @@ _MOVED: dict[str, str] = {
     "flush_on_signals": "batching=BatchingConfig(flush_on_signals=...)",
     "propagate_trace": "propagation=PropagationConfig(enabled=...)",
     "propagate_targets": "propagation=PropagationConfig(targets=...)",
+    # Renamed rather than regrouped: the hook vetoes a whole BATCH, and a bare
+    # `before_send` would import a per-event mental model onto it. Refused like
+    # every other moved name — silence is the one outcome it may not have.
+    "before_send": "before_send_envelope=... (renamed: the hook receives one whole batch)",
 }
 
 #: Removed field -> why it is gone and what to do instead. Same mechanism as
@@ -423,7 +427,7 @@ class WardexConfig:
     """
 
     debug: bool = False
-    before_send: BeforeSendCallback | None = None
+    before_send_envelope: BeforeSendEnvelopeCallback | None = None
 
     intercept: bool = True
     """The interception switch, ON by default: `init()` is the consent, the
@@ -529,7 +533,7 @@ def _resolve_config(
     capture_mode: CaptureMode = CaptureMode.AGENT,
     release: str | None = None,
     environment: str | None = None,
-    before_send: BeforeSendCallback | None = None,
+    before_send_envelope: BeforeSendEnvelopeCallback | None = None,
     debug: bool = False,
 ) -> WardexConfig:
     """Fold the environment into `init()`'s arguments and build the config.
@@ -575,7 +579,7 @@ def _resolve_config(
         environment=(
             environment if environment is not None else os.environ.get("WARDEX_ENVIRONMENT")
         ),
-        before_send=before_send,
+        before_send_envelope=before_send_envelope,
         debug=bool(debug) or os.environ.get("WARDEX_DEBUG", "").lower() == "true",
     )
 

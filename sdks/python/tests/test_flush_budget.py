@@ -34,7 +34,7 @@ from wardex_sdk._client import (
 from wardex_sdk._config import BackendConfig, BatchingConfig, WardexConfig
 from wardex_sdk._enums import SpanKind
 from wardex_sdk._types import (
-    InternalEnvelope,
+    Envelope,
     InternalSpan,
     SpanContext,
     SpanId,
@@ -73,10 +73,10 @@ class _TimeoutRecording(Transport):
     """Records the budget it is handed, and says what it was configured for."""
 
     def __init__(self, timeout: float = 10.0):
-        self.timeout = timeout
+        self.export_timeout = timeout
         self.timeouts: list[float | None] = []
 
-    def export(self, envelope: InternalEnvelope, *, timeout: float | None = None) -> object | None:
+    def export(self, envelope: Envelope, *, timeout: float | None = None) -> object | None:
         self.timeouts.append(timeout)
         return None
 
@@ -297,22 +297,22 @@ def test_a_host_passing_none_gets_a_bounded_flush_not_an_unbounded_one():
         c.close(1.0)
 
 
-# -- 3. reading transport.timeout is a reach into host code ------------------
+# -- 3. reading transport.export_timeout is a reach into host code -----------
 
 
 class _NoTimeoutAttribute(Transport):
-    """A perfectly legal transport: `timeout` is not part of the interface."""
+    """A perfectly legal transport: `export_timeout` left undeclared."""
 
-    def export(self, envelope: InternalEnvelope, *, timeout: float | None = None) -> object | None:
+    def export(self, envelope: Envelope, *, timeout: float | None = None) -> object | None:
         return None
 
 
 def _hostile(value):
-    """A transport whose `timeout` is `value` -- or, for a callable, whatever it
-    raises on attribute access."""
+    """A transport whose `export_timeout` is `value` -- or, for a callable,
+    whatever it raises on attribute access."""
 
     class _Hostile(_NoTimeoutAttribute):
-        timeout = property(value) if callable(value) else value
+        export_timeout = property(value) if callable(value) else value
 
     return _Hostile()
 
@@ -322,8 +322,8 @@ def _raises(exc):
 
 
 def test_every_unusable_transport_timeout_falls_back_to_the_default():
-    """`Transport` is public, so `timeout` may be absent, a property that
-    raises, a `__getattr__` returning something `float()` chokes on, or a number
+    """`Transport` is public, so `export_timeout` may be absent, a property
+    that raises, a `__getattr__` returning something `float()` chokes on, or a number
     that is no use as a deadline. Rejecting means raising, and wardex may not
     raise into a host over a flush -- so every unusable answer is the 5s
     fallback, and the read, the conversion and the validation all sit inside the
@@ -444,7 +444,7 @@ class _Declines(_NoTimeoutAttribute):
     def __init__(self):
         self.taken: list[str] = []
 
-    def export(self, envelope: InternalEnvelope, *, timeout: float | None = None) -> object | None:
+    def export(self, envelope: Envelope, *, timeout: float | None = None) -> object | None:
         self.taken.extend(s.name for s in envelope.spans)
         return UNDELIVERED
 
@@ -456,7 +456,7 @@ class _BlocksThenDeclines(_Declines):
         self._release = release
         self.released = False
 
-    def export(self, envelope: InternalEnvelope, *, timeout: float | None = None) -> object | None:
+    def export(self, envelope: Envelope, *, timeout: float | None = None) -> object | None:
         self.taken.extend(s.name for s in envelope.spans)
         self._in_export.set()
         self.released = self._release.wait(timeout=5.0)
@@ -513,7 +513,7 @@ def test_a_flush_that_outlives_close_on_one_thread_reports_rather_than_re_seedin
     """The sequential shape of the same door, on a single thread and with no
     race to lose.
 
-    `before_send` is HOST code and runs INSIDE the drain, after the swap. A host
+    `before_send_envelope` is HOST code and runs INSIDE the drain, after the swap. A host
     that closes wardex from there -- or from anything the drain calls -- returns
     into a flush whose batch now belongs to a closed client, which is `flush()`
     after `close()` with the two calls interleaved rather than merely adjacent.
@@ -528,7 +528,7 @@ def test_a_flush_that_outlives_close_on_one_thread_reports_rather_than_re_seedin
         box["c"].close(0.0)  # the host shuts down from inside the drain
         return envelope
 
-    c = _client(t, before_send=_closes_wardex)
+    c = _client(t, before_send_envelope=_closes_wardex)
     box["c"] = c
     c.capture_span(_span("a"))
     capsys.readouterr()

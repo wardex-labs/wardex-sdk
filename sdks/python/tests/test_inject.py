@@ -11,7 +11,7 @@ from wardex_sdk import _hub
 from wardex_sdk._client import Client
 from wardex_sdk._config import BackendConfig, PropagationConfig, WardexConfig
 from wardex_sdk._tracing import conversation, span
-from wardex_sdk._types import InternalEnvelope
+from wardex_sdk._types import Envelope
 from wardex_sdk.context._inject import (
     _build_inject_headers,
     install_propagation,
@@ -22,9 +22,9 @@ from wardex_sdk.transport._base import Transport
 
 class _Recording(Transport):
     def __init__(self):
-        self.envelopes: list[InternalEnvelope] = []
+        self.envelopes: list[Envelope] = []
 
-    def export(self, envelope: InternalEnvelope) -> None:
+    def export(self, envelope: Envelope) -> None:
         self.envelopes.append(envelope)
 
 

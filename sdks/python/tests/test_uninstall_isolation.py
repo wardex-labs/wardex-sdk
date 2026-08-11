@@ -34,7 +34,7 @@ from wardex_sdk._config import BackendConfig, BatchingConfig, WardexConfig
 from wardex_sdk._enums import SpanKind
 from wardex_sdk._interceptors._base import InterceptorInterface
 from wardex_sdk._interceptors._registry import InterceptorRegistry
-from wardex_sdk._types import InternalEnvelope, InternalSpan, SpanContext, SpanId, TraceId
+from wardex_sdk._types import Envelope, InternalSpan, SpanContext, SpanId, TraceId
 from wardex_sdk.context._inject import install_propagation, uninstall_propagation
 from wardex_sdk.transport._base import Transport
 
@@ -43,9 +43,9 @@ _SUPERSEDED = f"context.inject.{Limitation.PATCH_SUPERSEDED.value}"
 
 class _Recording(Transport):
     def __init__(self) -> None:
-        self.envelopes: list[InternalEnvelope] = []
+        self.envelopes: list[Envelope] = []
 
-    def export(self, envelope: InternalEnvelope) -> None:
+    def export(self, envelope: Envelope) -> None:
         self.envelopes.append(envelope)
 
 

@@ -7,8 +7,8 @@ import pytest
 from wardex_sdk._config import PIIConfig
 from wardex_sdk._enums import SpanKind, StatusCode
 from wardex_sdk._types import (
+    Envelope,
     EnvelopeHeader,
-    InternalEnvelope,
     InternalSpan,
     SdkInfo,
     SpanContext,
@@ -45,8 +45,8 @@ def _span(**kw) -> InternalSpan:
     return InternalSpan(**base)
 
 
-def _env(span: InternalSpan) -> InternalEnvelope:
-    return InternalEnvelope(header=_header(), spans=(span,))
+def _env(span: InternalSpan) -> Envelope:
+    return Envelope(header=_header(), spans=(span,))
 
 
 class TestNativeContract:
@@ -182,6 +182,7 @@ class TestTransportPolicy:
 
     def test_send_batch_passes_policy_to_native(self, monkeypatch):
         from wardex_sdk import _wardex_native
+        from wardex_sdk._enums import PIICategory, PIIMode
         from wardex_sdk.transport._otlp_http import OtlpHttpTransport
 
         captured = {}
@@ -197,6 +198,8 @@ class TestTransportPolicy:
 
         monkeypatch.setattr(_wardex_native.codec, "encode_otlp_requests", fake_encode)
         t = OtlpHttpTransport(endpoint="http://localhost:1")
-        t.set_pii_policy("mask", ("ip_address",))
+        t._set_pii_policy(
+            PIIConfig(mode=PIIMode.MASK, disabled_categories={PIICategory.IP_ADDRESS})
+        )
         t._send_batch(_env(_span(input_data=PII_INPUT)))
         assert captured == {"pii_mode": "mask", "pii_disabled": ["ip_address"]}

@@ -1,7 +1,8 @@
 """What a conformance run needs before it can assert anything.
 
-Three things live here and nothing else: the client double every adapter test
-already writes by hand, the install path a conformance run must use, and the
+Four things live here and nothing else: the client double every adapter test
+already writes by hand, the transport double a HOST'S test suite installs
+through `wardex.init()`, the install path a conformance run must use, and the
 READING of a shipped span. The assertions are next door in `conformance.py`,
 and the split is the same one the two adapter suites arrived at independently —
 the harness is the expensive part and every file needs it, while the claims are
@@ -29,6 +30,8 @@ from .._adapters._registry import AdapterRegistry
 from .._assembly import Limitation, counters
 from .._assembly._diag import reset_reports_for_test
 from .._assembly._units import _ambient_unit
+from .._types import Envelope
+from ..transport._base import Transport
 
 
 class RecordingClient:
@@ -49,6 +52,33 @@ class RecordingClient:
 
     def close(self) -> None:
         return None
+
+
+class RecordingTransport(Transport):
+    """The user-facing test double: `wardex.init(transport=RecordingTransport())`.
+
+    Stores every envelope the SDK exports, never declines, and reads the
+    recorded spans back as `SpanNode`s — so a host's test suite asserts on
+    names and parentage through the same read shape the conformance suite
+    uses, instead of on the envelope's internal fields.
+
+    IT RECORDS PRE-MASKING, IN-PROCESS DATA. This is a test double, not an
+    export path: `export()` receives data before PII masking runs (masking
+    lives behind `Transport.encode()`, which this double never calls), so what
+    it holds is what was captured, not what a backend would have received.
+    """
+
+    def __init__(self) -> None:
+        self.envelopes: list[Envelope] = []
+
+    def export(self, envelope: Envelope, *, timeout: float | None = None) -> None:
+        self.envelopes.append(envelope)
+        return None
+
+    @property
+    def spans(self) -> tuple[SpanNode, ...]:
+        """Every recorded span, in export order, as the harness read shape."""
+        return read_spans([span for envelope in self.envelopes for span in envelope.spans])
 
 
 @dataclass
@@ -325,6 +355,7 @@ __all__ = [
     "AdapterSubject",
     "LiveAdapter",
     "RecordingClient",
+    "RecordingTransport",
     "SpanNode",
     "StalledRun",
     "clean_state",
