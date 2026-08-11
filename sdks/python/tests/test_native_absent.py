@@ -80,7 +80,7 @@ _STEPS = (
     "continue_trace",
     "continue_from_otel",
     "new_scope",
-    "run_in_context",
+    "bind_context",
     "asgi_middleware",
     "wsgi_middleware",
     "transport_ctor",
@@ -275,15 +275,15 @@ def _new_scope():
         pass
 
 
-def _run_in_context():
-    assert wardex_sdk.run_in_context(lambda: 7)() == 7
+def _bind_context():
+    assert wardex_sdk.bind_context(lambda: 7)() == 7
 
 
 def _asgi_middleware():
     async def app(scope, receive, send):
         return None
 
-    mw = wardex_sdk.WardexMiddleware(app)
+    mw = wardex_sdk.WardexAsgiMiddleware(app)
     scope = {"type": "http", "headers": [(b"traceparent", TRACEPARENT.encode())]}
     asyncio.run(mw(scope, None, None))
 
@@ -292,7 +292,7 @@ def _wsgi_middleware():
     def app(environ, start_response):
         return [b"ok"]
 
-    mw = wardex_sdk.WardexWSGIMiddleware(app)
+    mw = wardex_sdk.WardexWsgiMiddleware(app)
     assert mw({"HTTP_TRACEPARENT": TRACEPARENT}, lambda *a: None) == [b"ok"]
 
 
@@ -388,7 +388,7 @@ STEPS = [
     ("continue_trace", lambda: wardex_sdk.continue_trace({"traceparent": TRACEPARENT}).__enter__()),
     ("continue_from_otel", lambda: wardex_sdk.continue_from_otel().__enter__()),
     ("new_scope", _new_scope),
-    ("run_in_context", _run_in_context),
+    ("bind_context", _bind_context),
     ("asgi_middleware", _asgi_middleware),
     ("wsgi_middleware", _wsgi_middleware),
     ("transport_ctor", lambda: OtlpHttpTransport("http://127.0.0.1:1")),
@@ -534,13 +534,13 @@ _DRIVEN = frozenset(
         "new_scope",
         "flush",
         "close",
-        "run_in_context",
+        "bind_context",
         "continue_trace",
         "continue_from_otel",
         "get_traceparent",
         "get_trace_headers",
-        "WardexMiddleware",
-        "WardexWSGIMiddleware",
+        "WardexAsgiMiddleware",
+        "WardexWsgiMiddleware",
         "LimitsConfig",
         "AdaptersConfig",
         "AnthropicAgentSdkConfig",

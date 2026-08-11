@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import copy
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -35,10 +34,17 @@ class Scope:
         self.contexts[key] = value
 
     def clone(self) -> Scope:
+        # Per-context dict copies, never `deepcopy`: `set_context()` takes
+        # arbitrary host objects — a lock, a socket, an open file — and a fork
+        # (`isolation_scope()`, `new_scope()`) must not run host
+        # `__deepcopy__`/`__reduce__` or raise on a value that cannot be
+        # copied. Copying each context dict is what the public surface needs:
+        # `set_context()` replaces whole entries, so mutations on the fork
+        # stay on the fork; the values themselves stay shared with the host.
         return Scope(
             tags=dict(self.tags),
             user=self.user,
-            contexts=copy.deepcopy(self.contexts),
+            contexts={key: dict(value) for key, value in self.contexts.items()},
             active_span_context=self.active_span_context,
             conversation=self.conversation,
             tracestate=self.tracestate,
@@ -50,7 +56,7 @@ def merge_scopes(global_: Scope, isolation: Scope, current: Scope) -> Scope:
     merged = global_.clone()
     for layer in (isolation, current):
         merged.tags.update(layer.tags)
-        merged.contexts.update(copy.deepcopy(layer.contexts))
+        merged.contexts.update((key, dict(value)) for key, value in layer.contexts.items())
         if layer.user is not None:
             merged.user = layer.user
         if layer.active_span_context is not None:
@@ -74,16 +80,14 @@ def merged_trace_fields(
 
     Separate from `merge_scopes` because the W3C header readers need exactly
     these two immutable scalars, and the full merge cannot hand them over
-    cheaply OR safely. It `copy.deepcopy`s `contexts` once per layer, over
-    dicts the host application filled with objects of its own choosing: that is
-    unbounded work on the outbound path of every request through a patched HTTP
-    client, and it is host code. `deepcopy` raises on a value it cannot copy —
-    a lock, a socket, a file — and runs whatever `__deepcopy__`/`__reduce__` the
-    host defined, and it iterates the process-global scope's dicts, which
-    another thread's `set_tag`/`set_context` can be mutating. `get_traceparent`
-    is documented as the by-hand escape hatch for gRPC, Kafka and Celery send
-    paths; a host that once put a lock in `set_context()` must not discover it
-    there. Reading two scalars can do none of that.
+    cheaply. It copies every context dict once per layer — shallow copies, so
+    no host `__deepcopy__` runs and nothing raises on a lock (see
+    `Scope.clone`), but still per-key work over dicts the host application
+    filled, on the outbound path of every request through a patched HTTP
+    client, iterating the process-global scope's dicts, which another thread's
+    `set_tag`/`set_context` can be mutating. `get_traceparent` is documented
+    as the by-hand escape hatch for gRPC, Kafka and Celery send paths. Reading
+    two scalars does none of that.
     """
     active = global_.active_span_context
     tracestate = global_.tracestate
@@ -107,11 +111,10 @@ def merged_tags_and_user(
     above.
 
     Separate from `merge_scopes` for `merged_trace_fields`' reason: the full
-    merge `copy.deepcopy`s `contexts`, dicts the host filled with objects of
+    merge copies every context dict, dicts the host filled with objects of
     its own choosing, and this reader runs on the capture path of every span.
     Tags are `str -> str` and `UserInfo` is frozen, so copying the tag dict is
-    bounded and nothing here can run host code or raise on an uncopyable
-    context value.
+    bounded and nothing here touches the contexts at all.
     """
     tags = dict(global_.tags)
     user = global_.user

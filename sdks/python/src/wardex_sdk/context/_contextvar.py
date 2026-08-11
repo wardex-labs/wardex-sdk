@@ -129,13 +129,13 @@ def activate_span(
 fork_active_span = activate_span
 
 
-def run_in_context(fn: Callable[..., Any]) -> Callable[..., Any]:
+def bind_context(fn: Callable[..., Any]) -> Callable[..., Any]:
     """Wrap ``fn`` so it runs in a copy of the calling flow's context.
 
     Threads do not inherit contextvars automatically (asyncio tasks do).
     Capture happens at wrap time — wrap inside the span you want carried::
 
-        thread = threading.Thread(target=wardex.run_in_context(work))
+        thread = threading.Thread(target=wardex.bind_context(work))
 
     NOT the mechanism `Unit.bind()` uses, and the difference is load-bearing:
     this replays ONE captured `contextvars.Context`, and entering the same

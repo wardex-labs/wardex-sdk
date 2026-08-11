@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import importlib.util
-import sys
 from operator import attrgetter
 from typing import TYPE_CHECKING, NamedTuple
 
+from .._assembly import diag_info, diag_warning
 from .._config import AdaptersConfig, _non_default_adapter_options
 from .._enums import AdapterName
 from ._registry import get_registry
@@ -137,10 +137,8 @@ def install_configured_adapters(client: Client | None, config: WardexConfig) -> 
         if config.debug:
             for name in _non_default_adapter_options(config.adapters):
                 if name not in wanted:
-                    print(
-                        f"[wardex] {name.value} options set but the adapter is "
-                        "not installed (not detected)",
-                        file=sys.stderr,
+                    diag_info(
+                        f"{name.value} options set but the adapter is not installed (not detected)"
                     )
     for name in wanted:
         try:
@@ -148,5 +146,5 @@ def install_configured_adapters(client: Client | None, config: WardexConfig) -> 
             if adapter is not None:
                 get_registry().install(adapter, client)
         except Exception as exc:  # noqa: BLE001 — a broken adapter must not break init()
-            print(f"[wardex] adapter {name.value} failed to load ({exc})", file=sys.stderr)
+            diag_warning(f"adapter {name.value} failed to load ({exc})")
             continue

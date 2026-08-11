@@ -12,7 +12,7 @@ from typing import Any
 from ._propagate import continue_trace
 
 
-class WardexMiddleware:
+class WardexAsgiMiddleware:
     def __init__(self, app: Any) -> None:
         self.app = app
 

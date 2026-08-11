@@ -71,11 +71,10 @@ def _emit_headers() -> dict[str, str]:
     this SDK does not take.
 
     Two fields and not a whole merged Scope: `merged_trace_fields` applies the
-    same precedence without `merge_scopes`' per-layer `deepcopy` of `contexts`.
-    That copy is why this is not simply `_hub.get_merged_scope()` — it costs
-    unboundedly much on the request path, it can RAISE on a host context value
-    that does not copy, and neither reader here looks at tags, user, contexts
-    or conversation.
+    same precedence without `merge_scopes`' per-layer copy of every context
+    dict. That copy is why this is not simply `_hub.get_merged_scope()` — it
+    is per-key work over host-filled dicts on the request path, and neither
+    reader here looks at tags, user, contexts or conversation.
 
     `tracestate` rides only where a `traceparent` goes: the spec gives no
     reading for vendor state without the context it annotates, and a receiver

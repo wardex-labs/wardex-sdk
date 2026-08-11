@@ -5,6 +5,170 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+This release carries the one deliberate breaking window before the Node and
+Java SDKs inherit and freeze the public names. Everything under **BREAKING**
+below landed in it; there are no compatibility shims — every moved or removed
+spelling is refused with a `TypeError` naming its new home or saying why it is
+gone.
+
+### Changed (the breaking batch)
+
+- **BREAKING: internal packages are underscore-private.** `assembly`,
+  `protocol`, `semantics`, `adapters` and `interceptors` became `_assembly`,
+  `_protocol`, `_semantics`, `_adapters` and `_interceptors`; `pipeline` was
+  removed. The public import surface is `wardex_sdk` itself plus the three
+  subpackages with a user story — `transport`, `context`, `testing` — and
+  internal names that used to leak from the root (`Client`, `NATIVE_OK`,
+  stdlib modules) no longer resolve there.
+- **BREAKING: `init()` has an explicit keyword-only signature** — its
+  parameters are exactly `WardexConfig`'s fields plus `transport=`, and a
+  drift test holds the two together. `**config_kwargs` and
+  `WardexConfig.from_env()` are gone; environment resolution folded into
+  `init()` (explicit argument, then `WARDEX_*`, then the OTel fallbacks).
+- **BREAKING: `intercept=True` is the new default.** `init()` is the consent
+  and zero-instrumentation capture is the product; `intercept=False` is the
+  documented opt-out. Mutating outbound traffic (`propagation`) stays opt-in
+  and PII masking stays on.
+- **BREAKING: the config groups share one suffix.** `PIIPolicy`,
+  `BatchingPolicy`, `PropagationPolicy` and `CaptureLimits` are `PIIConfig`,
+  `BatchingConfig`, `PropagationConfig` and `LimitsConfig`. All config
+  dataclasses are keyword-only; collection fields accept any iterable and
+  canonicalize losslessly; enum-valued fields take enum members, not strings;
+  config round-trips as written.
+- **BREAKING: `adapters=` is a config group.** `AdaptersConfig(enabled=...,
+  anthropic_agent_sdk=AnthropicAgentSdkConfig(...))` replaces the bare
+  selection tuple (refused with the new spelling). Selection and per-adapter
+  options are separate fields, so configuring an option never disturbs
+  auto-detection.
+- **BREAKING: the tracing family was renamed for what it does.** `trace()` is
+  `conversation()` — it stamps `gen_ai.conversation.id` on everything inside
+  and joins the ambient trace, it never rooted one; it gains `id=` (an
+  explicit id is used verbatim, so a chat app's turns join one conversation)
+  and drops the dead `tags=`. `task()` is `step()`, mapped to `execute_step`
+  so its spans appear on operation-keyed dashboards. `SpanBuilder` is `Span`,
+  exported; the context manager owns completion. Decorators take
+  `attributes=` and support the bare form (`@wardex.tool`); context managers
+  take a positional name, decorators an optional keyword name. Using `span()`
+  or `conversation()` as a decorator raises a `TypeError` naming the
+  decorators.
+- **BREAKING: scope writes target the isolation scope.** `set_tag`/`set_user`
+  no longer write a process-global scope (cross-tenant bleed under
+  concurrency); `isolation_scope()` forks the current scope instead of
+  starting empty; `set_user(None)` clears; `set_context()` added. Scope tags
+  and user now actually land on exported spans (`user.*`,
+  `client.address`) — the whole stratum was write-only before.
+- **BREAKING: `before_send` is `before_send_envelope`** — the hook vetoes a
+  whole batch, not one event. Frozen contract: synchronous, sees PRE-masking
+  data, may run again for a declined batch; return the received envelope to
+  send or `None` to drop; raising drops the batch fail-closed with one
+  diagnostic line (traceback under `debug=True`).
+- **BREAKING: the transport SPI was reshaped around one sanctioned path.**
+  `InternalEnvelope` is `Envelope`, exported and opaque (the guaranteed
+  surface is `span_count` plus `Transport.encode()`); `Transport.timeout` is
+  `export_timeout` (a reflectively-read contract attribute needs a name no
+  subclass picks by accident); `set_pii_policy`/`set_limits` demoted to
+  private plumbing; `export()`'s return is annotated `Undelivered | None`.
+  `wardex_sdk.transport` is the complete implementer home, and the
+  export/flush/close threading contract (called from wardex's own worker
+  thread, may block up to budget) is recorded on the ABC as the
+  cross-language contract.
+- **BREAKING: `wardex_sdk.testing` names say what they are.** `Node` is
+  `SpanNode`, `read` is `read_spans`, `one` is `exactly_one`, `collapse` is
+  `collapse_onto_root`, `bare` is `never_installed`, `installed` is
+  `installed_adapter`, `parent_name` is `parent_name_of`, `Live` is
+  `LiveAdapter`, `Stalled` is `StalledRun`.
+- **BREAKING: wire spellings aligned to OTel semconv.** Cache and reasoning
+  token keys use the semconv dot spellings; `execute_tool` payloads ship as
+  `gen_ai.tool.call.arguments`/`gen_ai.tool.call.result`; SSE spans map
+  `network.protocol.name="http"` with `wardex.transport.protocol="sse"`;
+  `url.full` is emitted query-stripped. Backend queries that matched the old
+  keys need updating.
+- **BREAKING: spans export under YOUR service identity.** Every app used to
+  export as `service.name="wardex.python"`; now `service_name=` /
+  `WARDEX_SERVICE_NAME` maps to `service.name` (fallback
+  `unknown_service:python`), `release` to `service.version`, `environment` to
+  `deployment.environment.name`, and the SDK travels only in
+  `telemetry.sdk.*` (`telemetry.sdk.name="wardex"`).
+- **BREAKING: the middleware pair names its protocols.** `WardexMiddleware`
+  (which was the ASGI one, though nothing in the name said so) is
+  `WardexAsgiMiddleware`, and `WardexWSGIMiddleware` is `WardexWsgiMiddleware`
+  — a symmetric pair with title-cased acronyms.
+- **BREAKING: `run_in_context` is `bind_context`.** The function runs
+  nothing — it captures the current context at wrap time and returns a bound
+  callable for a thread to run later; the old verb promised execution.
+- **BREAKING: dead surface was cut.** The `retention=` group
+  (`RetentionPolicy`, `RetentionClass`, `CaptureTrigger`) — inert end to end,
+  reserved until a backend consumer exists; config `tags=` (no reader;
+  `set_tag()` is the tag mechanism and is now wired); `replay_buffer_size`
+  and `zstd_level` (inert knobs); `PIIMode.REDACT`/`HASH` (raised
+  `NotImplementedError` when selected); `AdapterName.LANGCHAIN`/
+  `OPENAI_AGENTS` (selecting one installed nothing); `SessionStatus`,
+  `Direction`, `Modality` and `Protocol` left `__all__` (internal
+  vocabulary). Each returns when its consumer ships.
+
+### Added (the breaking batch)
+
+- **`py.typed` ships in the wheel**, so the SDK's annotations reach downstream
+  type checkers.
+- **The frozen environment contract**: `WARDEX_API_KEY`, `WARDEX_ENDPOINT`
+  (else `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`, else
+  `OTEL_EXPORTER_OTLP_ENDPOINT`), `WARDEX_SERVICE_NAME`, `WARDEX_RELEASE`,
+  `WARDEX_ENVIRONMENT`, `WARDEX_DEBUG` (can only turn debug ON). A bare
+  `wardex.init()` with only `WARDEX_ENDPOINT` set is a working first run, and
+  an endpoint with no path gets `/v1/traces` appended at transport
+  construction — never written back into the config.
+- **`service_name=`**, the app's `service.name` (see the resource-identity
+  entry above).
+- **`WardexConfigWarning`** — a configuration that is legal but conflicts with
+  itself (an endpoint under an explicit `transport=`, PII exemptions under
+  `PIIMode.OFF`, an `interceptors=` selection under `intercept=False`, adapter
+  options under an `enabled=` that excludes the adapter) is announced as a
+  real, filterable warning instead of a debug-gated print.
+- **`backend.api_key` is wired**: the default OTLP/HTTP exporter sends it as
+  `Authorization: Bearer <key>`. It is excluded from every config `repr` —
+  string forms of config objects never contain secret material.
+- **`Transport.encode(envelope, *, compress=True) -> tuple[bytes, ...]`** —
+  the sanctioned, final path from an envelope to wire bodies: PII masking and
+  limits applied, one body per POST, split at `max_otlp_request_bytes`,
+  over-cap spans dropped and reported. `OtlpHttpTransport` is written through
+  it, so an implementer who copies it copies the masked path.
+- **`testing.RecordingTransport`** — the user-facing test double:
+  `init(transport=RecordingTransport())`, then assert on `transport.spans`
+  as `SpanNode`s.
+- **New exports** for every name a public signature mentions: `Span`, `Scope`,
+  `Envelope`, `WardexConfig`, `AdaptersConfig`, `AnthropicAgentSdkConfig`,
+  `AgentAttributes`, `ToolAttributes`, `ConversationContext`, `CallSite`,
+  `ToolDefinition`, `AgentType`, `ToolExecutionType`, `SnapshotType`,
+  `BeforeSendEnvelopeCallback`, and `Undelivered` in `wardex_sdk.transport`.
+- **`SpanKind.PRODUCER` and `SpanKind.CONSUMER`**, end to end (proto, enum,
+  OTLP mapping) — the kinds queue propagation (Celery, Kafka) needs.
+- **Diagnostics moved onto the stdlib logger `wardex_sdk`.** Zero-config
+  output is byte-identical to the old stderr prints (one line, `[wardex] `
+  prefix, resolved against the current `sys.stderr` at emit time), but the
+  channel is now routable and silenceable with standard `logging` tools: a
+  host handler receives the clean message without the prefix, nothing
+  propagates to the root logger, emission never raises into host code, and
+  wardex's own diagnostic traffic is excluded from its own capture. A
+  `wardex_sdk` logger configured before wardex imports is left untouched.
+- **`VERSIONING.md`** — version semantics from 1.0, what 0.x may break, the
+  deprecation mechanism, the cross-language contract, and append-only proto
+  evolution, recorded as policy and linked from the README.
+
+### Fixed (the breaking batch)
+
+- `propagation.targets` round-trips exactly as written: case-folding for the
+  match moved into the header injector (folded once at install), so the
+  config no longer reads back lowercased.
+- `intercept_hosts=()` no longer collapses into `None` — an empty allowlist
+  is a choice ("capture no extra plaintext hosts"), not the absence of one.
+- `error.type` is emitted as the span attribute semconv names for it, and the
+  status message stays the status message — the exception class used to be
+  substituted into `Status.message`, destroying the one field a backend
+  renders as "what went wrong".
+- `stop_sequences`, `finish_reasons` and `encoding_formats` ship as OTLP
+  arrays instead of comma-joined strings, so a backend reads a list, not a
+  CSV cell.
+
 ### Added
 
 - **An end-of-connection signal for pooled async TLS connections.** wardex now
@@ -76,8 +240,8 @@ All notable changes to this project are documented here. The format follows
   passes the gate the same way one issued inside a span wardex failed to open
   already did.
 - `propagation.targets` glob patterns are matched case-insensitively, since
-  hostnames are. Patterns are folded once when the config is built, so they
-  read back lowercased.
+  hostnames are. (Folding now happens in the injector, once at install — the
+  config reads back exactly as written; see the breaking batch above.)
 - `intercept_hosts` entries are matched case-insensitively for the same
   reason.
 - `get_traceparent()` and `get_trace_headers()` now resolve the same ambient
@@ -1522,7 +1686,7 @@ All notable changes to this project are documented here. The format follows
   `WardexMiddleware` (ASGI), `WardexWSGIMiddleware`, and opt-in outbound
   injection via `init(propagate_trace=True, propagate_targets=[...])`
   (httpx/requests/aiohttp).
-- `run_in_context()` helper for propagating trace context into threads.
+- `bind_context()` helper for propagating trace context into threads.
 
 ### Changed
 - **`capture_mode` defaults to `"agent"`**: LLM-semantic traffic is always

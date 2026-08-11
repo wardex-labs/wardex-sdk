@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import sys as _sys
 import warnings as _warnings
 from collections.abc import Iterator as _Iterator
 from collections.abc import Sequence as _Sequence
@@ -11,6 +10,8 @@ from typing import Any as _Any
 from urllib.parse import urlsplit as _urlsplit
 
 from . import _hub, _runtime
+from ._assembly import diag_info as _diag_info
+from ._assembly import diag_warning as _diag_warning
 from ._client import _FOLLOW_TRANSPORT_TIMEOUT
 from ._client import Client as _Client
 from ._config import (
@@ -68,15 +69,15 @@ from ._types import (
     ToolDefinitionSet,
 )
 from ._version import __version__
-from .context._asgi import WardexMiddleware
-from .context._contextvar import run_in_context
+from .context._asgi import WardexAsgiMiddleware
+from .context._contextvar import bind_context
 from .context._propagate import (
     continue_from_otel,
     continue_trace,
     get_trace_headers,
     get_traceparent,
 )
-from .context._wsgi import WardexWSGIMiddleware
+from .context._wsgi import WardexWsgiMiddleware
 from .transport._base import Transport
 from .transport._console import ConsoleTransport
 from .transport._noop import NoOpTransport
@@ -99,13 +100,13 @@ __all__ = [
     "new_scope",
     "flush",
     "close",
-    "run_in_context",
+    "bind_context",
     "continue_trace",
     "continue_from_otel",
     "get_traceparent",
     "get_trace_headers",
-    "WardexMiddleware",
-    "WardexWSGIMiddleware",
+    "WardexAsgiMiddleware",
+    "WardexWsgiMiddleware",
     # Config groups — every one of them is passed to `init()` by name
     "AdaptersConfig",
     "AnthropicAgentSdkConfig",
@@ -225,6 +226,14 @@ def init(
     `intercept=True` is the default: `init()` is the consent and
     zero-instrumentation capture is the product. Mutation of outbound traffic
     (`propagation`) stays opt-in; PII masking stays on.
+
+    EXCEPTIONS: this call — configuration time — raises `TypeError`/`ValueError`
+    on a bad argument like any Python constructor; every other public call is a
+    safe no-op before `init()` and never raises into host code afterwards.
+
+    DIAGNOSTICS go to the stdlib logger `wardex_sdk` (default: one-line stderr
+    messages prefixed `[wardex] `); configuration conflicts are
+    `warnings.warn(..., WardexConfigWarning)`.
     """
     config = _resolve_config_from_env(
         backend=backend,
@@ -254,13 +263,12 @@ def init(
         # is ever installed, and every one of those modules -- each of which
         # still reaches the extension -- stays unreachable by construction.
         #
-        # The stderr line is not optional. Silently doing nothing is the other
-        # failure mode and it is the worse one: it looks exactly like a backend
-        # that is up and receiving no traffic, so nobody goes looking.
-        print(
-            f"[wardex] native extension unavailable, wardex is disabled: "
-            f"nothing will be captured or exported ({_unavailable_reason()})",
-            file=_sys.stderr,
+        # The diagnostic line is not optional. Silently doing nothing is the
+        # other failure mode and it is the worse one: it looks exactly like a
+        # backend that is up and receiving no traffic, so nobody goes looking.
+        _diag_warning(
+            f"native extension unavailable, wardex is disabled: "
+            f"nothing will be captured or exported ({_unavailable_reason()})"
         )
         return
     # The three known conflict cases, announced UNCONDITIONALLY as warnings —
@@ -308,7 +316,7 @@ def init(
         # One line, at install time, with the RESOLVED config — the env
         # fallbacks and canonicalized collections included. `api_key` is
         # `repr=False`, so no credential can ride along.
-        print(f"[wardex] resolved config: {config!r}", file=_sys.stderr)
+        _diag_info(f"resolved config: {config!r}")
     if transport is not None:
         resolved_transport = transport
     elif config.backend.endpoint:
@@ -331,10 +339,7 @@ def init(
         # Unconditional, like the degraded-mode line and for the same reason: a
         # wardex that captures into nothing looks exactly like a backend that
         # is up and receiving no traffic, so nobody goes looking.
-        print(
-            "[wardex] no transport or backend.endpoint configured: capturing, exporting nothing",
-            file=_sys.stderr,
-        )
+        _diag_info("no transport or backend.endpoint configured: capturing, exporting nothing")
     # Plumbing, not subclass hooks: the private setters install what
     # `Transport.encode()` — the sanctioned, masked path to wire bytes — reads.
     resolved_transport._set_pii_policy(config.pii)

@@ -20,6 +20,7 @@ with the seam extraction.
 
 from __future__ import annotations
 
+import logging
 import sys
 import threading
 import traceback
@@ -27,6 +28,8 @@ from collections.abc import Callable
 from functools import wraps
 from types import TracebackType
 from typing import Any, TypeVar
+
+from .._suppress import suppress_capture
 
 _F = TypeVar("_F", bound=Callable[..., Any])
 
@@ -92,12 +95,135 @@ counters = Counters()
 LOG_FAILED = "assembly._diag.log_failed"
 
 
+# --- the diagnostic channel --------------------------------------------------
+
+logger = logging.getLogger("wardex_sdk")
+"""THE diagnostic channel: every line wardex says about itself goes through
+this stdlib logger, so a host can route or silence it with the tools it
+already has (`logging.getLogger("wardex_sdk")`). Warnings about the host's
+CONFIG are the one exception — they are `warnings.warn(...,
+WardexConfigWarning)`, because they belong to the line of code that set the
+value, not to a log stream.
+
+Zero-config behavior is unchanged: a default stderr handler is attached below,
+and what it prints is byte-identical to the `print(..., file=sys.stderr)`
+lines it replaced — the `[wardex] ` prefix lives in that handler's formatter,
+so a host's own handler receives the clean message without it.
+
+Severity is two-valued by convention: WARNING for losses and failures (spans
+dropped, an export that failed, a parser disabled), INFO for announcements (the
+NoOp transport, the resolved-config dump). Nothing is logged at DEBUG — lines
+that exist only under `config.debug` keep that gate at the call site and emit
+at the severity their content earns (a debug-gated loss is still a WARNING),
+so routing never changes WHAT is said, only where.
+"""
+
+_PREFIX = "[wardex] "
+
+
+class _StderrAtEmitTime(logging.StreamHandler):
+    """The default handler: today's stderr line, emitted through `logging`.
+
+    THE STREAM IS RESOLVED AT EMIT TIME, never stored. `logging.Handler.
+    __init__` is called instead of `StreamHandler.__init__` precisely so no
+    `self.stream` attribute pins the `sys.stderr` that existed at import: a
+    pytest `capsys`, a host's `contextlib.redirect_stderr`, and a daemon that
+    swaps fd 2 must all see the line land wherever stderr points NOW. (Same
+    shape as the stdlib's own `logging._StderrHandler`.)
+
+    `emit` swallows EVERYTHING and counts what it swallowed, because this
+    method runs inside host code paths and I6 forbids raising into them.
+    `StreamHandler.emit`'s own containment is not enough: its `handleError`
+    re-touches `sys.stderr` outside a broad handler, so an unwritable stderr —
+    a closed fd 2, `pythonw`, a capture teardown racing a background thread —
+    would raise out of the very path that exists to report failures. The
+    failure-to-report is recorded in `counters` under `LOG_FAILED`, wardex's
+    own lock and dict, no host code and no I/O.
+    """
+
+    def __init__(self) -> None:
+        logging.Handler.__init__(self)
+        self.setFormatter(logging.Formatter(_PREFIX + "%(message)s"))
+
+    @property
+    def stream(self) -> Any:
+        return sys.stderr
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            message = self.format(record)
+            stream = self.stream
+            stream.write(message + self.terminator)
+            stream.flush()
+        except Exception:  # noqa: BLE001 — the reporting path may not become a throw
+            counters.bump(LOG_FAILED)
+
+
+def _install_default_handler() -> None:
+    """Attach the stderr handler — UNLESS a host configured the logger first.
+
+    A `wardex_sdk` logger that already carries handlers belongs to the host:
+    whatever it routed diagnostics into wins, and wardex adds nothing (its
+    level and `propagate` are then also the host's business). Only the
+    zero-config logger gets the default handler, an INFO threshold (both
+    severities wardex uses pass; nothing is logged at DEBUG), and
+    `propagate = False` so the one line cannot print a second time through a
+    root logger the host configured with `logging.basicConfig()`.
+    """
+    if logger.handlers:
+        return
+    logger.addHandler(_StderrAtEmitTime())
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+
+
+_install_default_handler()
+
+
+def _emit(level: int, message: str) -> None:
+    """Hand `message` to the logger, and never raise doing it.
+
+    Two containments, both this function's job so no call site has to
+    remember. SELF-CAPTURE SUPPRESSION: a host is free to attach a handler
+    that POSTs log records over HTTP, and without the guard the byte seams
+    would capture wardex's own diagnostic's traffic — the exporter
+    self-exclusion (`_suppress`) covers the emission for the same reason it
+    covers the OTLP POST. FAIL-SAFETY: the default handler contains its own
+    failures, but a HOST handler's `emit` can raise anything, and logging
+    propagates that raise to the caller — which is wardex code inside the
+    host's call stack (I6). A swallowed emission is counted under
+    `LOG_FAILED`, like every other failure of the reporting path.
+    """
+    try:
+        with suppress_capture():
+            logger.log(level, message)
+    except Exception:  # noqa: BLE001 — the reporting path may not become a throw
+        counters.bump(LOG_FAILED)
+
+
+def diag_info(message: str) -> None:
+    """An announcement — wardex stating a mode, not reporting a loss.
+
+    `message` carries no `[wardex] ` prefix: the default handler's formatter
+    adds it, and a host's own handler gets the clean text.
+    """
+    _emit(logging.INFO, message)
+
+
+def diag_warning(message: str) -> None:
+    """A loss or a failure — something was dropped, skipped, or degraded.
+
+    Same prefix contract as `diag_info`.
+    """
+    _emit(logging.WARNING, message)
+
+
 def _log_with_traceback(where: str, exc: BaseException) -> None:
-    """Print `exc` with a traceback, and never fail while doing it.
+    """Log `exc` with a traceback, and never fail while doing it.
 
     The reporting path is the one place where "wardex does not throw into the
-    host" (I6) is easiest to violate by accident, because two of its three steps
-    run code wardex does not own:
+    host" (I6) is easiest to violate by accident, because two of its steps run
+    code wardex does not own:
 
       * `repr(exc)` / `str(exc)` are HOST code. Exceptions that format lazily
         from state that is already gone -- an ORM error touching a detached
@@ -109,22 +235,28 @@ def _log_with_traceback(where: str, exc: BaseException) -> None:
         `traceback.format_exception`, which routes `str()` through its own
         `_safe_string` and degrades to "<exception str() failed>".
 
-      * `sys.stderr` may be unwritable -- a daemonized worker that closed fd 2,
-        `pythonw`, a `redirect_stderr` target the host closed, a pytest capture
-        teardown racing a background thread, or `RuntimeError: reentrant call`
-        when a signal handler interrupts a write already in progress.
+      * the emission runs handlers -- the default one writes to a `sys.stderr`
+        that may be unwritable (a daemonized worker that closed fd 2,
+        `pythonw`, a `redirect_stderr` target the host closed, a pytest
+        capture teardown racing a background thread), and a host's own handler
+        can raise anything. `_StderrAtEmitTime.emit` and `_emit` contain both.
 
-    Both are contained here rather than at the call site, so that no future
-    caller of this function has to remember. The last-resort handler records
-    itself in `counters` -- wardex's own lock and dict, no host code and no I/O.
+    All of it is contained here or below, rather than at the call site, so that
+    no future caller of this function has to remember. Every reporting failure
+    records itself in `counters` -- wardex's own lock and dict, no host code
+    and no I/O.
     """
     try:
         cls = type(exc)
         head = f"{cls.__module__}.{cls.__qualname__}"
         text = "".join(traceback.format_exception(cls, exc, exc.__traceback__))
-        print(f"[wardex] swallowed in {where}: {head}\n{text}", file=sys.stderr, end="")
     except Exception:  # noqa: BLE001 — the reporting path may not become a throw
         counters.bump(LOG_FAILED)
+        return
+    # `text` ends with the traceback's own newline; the handler appends the
+    # terminator, so that one is trimmed to keep the emitted bytes identical
+    # to the `print(..., end="")` this line replaced.
+    _emit(logging.WARNING, f"swallowed in {where}: {head}\n{text}".removesuffix("\n"))
 
 
 #: Keys already reported. A dict rather than a set for the reason `report_once`
@@ -149,7 +281,7 @@ _REPORT_LOCK = threading.RLock()
 
 
 def report_once(message: str, *, key: str) -> None:
-    """Print `message` to stderr the FIRST time `key` is seen. Never fails.
+    """Emit `message` as a WARNING the FIRST time `key` is seen. Never fails.
 
     The channel a person actually reads. `counters` is not that channel and was
     never going to be: `Counters.snapshot/total/get/reset` has no caller under
@@ -157,21 +289,21 @@ def report_once(message: str, *, key: str) -> None:
     `WardexConfig().debug` is False by default — so a degradation recorded only
     there is, in a production process, byte-identical to wardex never having
     been installed. That is the failure this function exists to close, and it
-    costs one `print`.
+    costs one log line.
 
-    Not a new invention either. `_adapters/__init__.py` already prints when an
-    adapter fails to load, and `_anthropic_agent_sdk.py` already prints once
-    when the SDK's surface is not one it recognizes. Both are this same event
-    class — "wardex will not observe what you expected, and here is why" — and
-    both are unconditional. This is that idiom given a name and a dedup key.
+    Every caller is reporting a loss or a degradation — "wardex will not
+    observe or ship what you expected, and here is why" — which is why the
+    severity is WARNING and not a parameter. `message` carries no `[wardex] `
+    prefix; the default handler's formatter adds it (see `diag_warning`).
 
-    BOUNDED BY CONSTRUCTION, which is what makes an unconditional print
+    BOUNDED BY CONSTRUCTION, which is what makes an unconditional line
     acceptable on a per-call path: one line per key per process, so a site that
     fails a thousand times in a loop writes one line and not a thousand.
 
-    Honest about its reach: stderr is the widest default-on channel this SDK
-    has, not an infallible one — see `_log_with_traceback` for the four ways fd
-    2 can be unwritable. It is strictly better than a table with no readers.
+    Honest about its reach: the `wardex_sdk` logger's default stderr handler is
+    the widest default-on channel this SDK has, not an infallible one — see
+    `_log_with_traceback` for the four ways fd 2 can be unwritable. It is
+    strictly better than a table with no readers.
 
     REENTRANT, and the bound survives reentrancy. The lock is an RLock (see
     `_REPORT_LOCK`), so a signal handler that re-enters here on the same thread
@@ -194,10 +326,7 @@ def report_once(message: str, *, key: str) -> None:
     with _REPORT_LOCK:
         if _REPORTED.setdefault(key, mine) is not mine:
             return
-    try:
-        print(message, file=sys.stderr)
-    except Exception:  # noqa: BLE001 — the reporting path may not become a throw
-        counters.bump(LOG_FAILED)
+    _emit(logging.WARNING, message)
 
 
 def reset_reports_for_test() -> None:

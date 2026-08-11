@@ -23,7 +23,6 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
-import sys
 import threading
 from collections.abc import Mapping
 from dataclasses import replace
@@ -36,6 +35,7 @@ from .._assembly import (
     SpanIntent,
     UnitKind,
     counters,
+    diag_warning,
     guard,
     report_once,
 )
@@ -400,10 +400,7 @@ class AnthropicAgentSdkAdapter(AdapterInterface):
         except Exception:  # noqa: BLE001 — absence/breakage means: do nothing
             return
         if not _surface_ok(sdk, subprocess_cli):
-            print(
-                "[wardex] anthropic_agent_sdk adapter: unexpected SDK surface, skipping",
-                file=sys.stderr,
-            )
+            diag_warning("anthropic_agent_sdk adapter: unexpected SDK surface, skipping")
             return
         self._client = client
         self._debug = bool(getattr(getattr(client, "config", None), "debug", False))
@@ -525,7 +522,7 @@ class AnthropicAgentSdkAdapter(AdapterInterface):
             # the one thing that opens through the surface. Said out loud, since
             # "my tool calls are missing" is otherwise unfalsifiable from here.
             report_once(
-                "[wardex] anthropic_agent_sdk adapter: installed without an adapter "
+                "anthropic_agent_sdk adapter: installed without an adapter "
                 "context, so in-process MCP tool calls will not get their own spans; "
                 "install through wardex.init() or pass adapters._registry.context_for(...)",
                 key="adapters.anthropic_agent_sdk.no_context",

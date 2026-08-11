@@ -47,7 +47,7 @@ def test_asgi_joins_traceparent():
         active = _hub.get_current_scope().active_span_context
         seen["trace"] = active.trace_id.hex() if active else None
 
-    mw = wardex_sdk.WardexMiddleware(app)
+    mw = wardex_sdk.WardexAsgiMiddleware(app)
     asyncio.run(mw(_http_scope([(b"traceparent", TP.encode())]), _noop_receive, _noop_send))
     assert seen["trace"] == "4bf92f3577b34da6a3ce929d0e0e4736"
 
@@ -60,7 +60,7 @@ def test_asgi_requests_are_isolated():
         assert "leak" not in s.tags
         s.set_tag("leak", "1")
 
-    mw = wardex_sdk.WardexMiddleware(app)
+    mw = wardex_sdk.WardexAsgiMiddleware(app)
     asyncio.run(mw(_http_scope([]), _noop_receive, _noop_send))
     asyncio.run(mw(_http_scope([]), _noop_receive, _noop_send))  # would fail on leak
 
@@ -72,7 +72,7 @@ def test_asgi_passes_through_lifespan():
     async def app(scope, receive, send):
         called["type"] = scope["type"]
 
-    mw = wardex_sdk.WardexMiddleware(app)
+    mw = wardex_sdk.WardexAsgiMiddleware(app)
     asyncio.run(mw({"type": "lifespan"}, _noop_receive, _noop_send))
     assert called["type"] == "lifespan"
 
@@ -83,7 +83,7 @@ def test_asgi_app_exceptions_propagate():
     async def app(scope, receive, send):
         raise RuntimeError("app error")
 
-    mw = wardex_sdk.WardexMiddleware(app)
+    mw = wardex_sdk.WardexAsgiMiddleware(app)
     try:
         asyncio.run(mw(_http_scope([]), _noop_receive, _noop_send))
         raise AssertionError("should have raised")
@@ -101,7 +101,7 @@ def test_wsgi_joins_traceparent():
         start_response("200 OK", [])
         return [b"ok"]
 
-    mw = wardex_sdk.WardexWSGIMiddleware(app)
+    mw = wardex_sdk.WardexWsgiMiddleware(app)
     environ = {"REQUEST_METHOD": "GET", "HTTP_TRACEPARENT": TP}
     body = mw(environ, lambda status, headers: None)
     assert list(body) == [b"ok"]
@@ -116,6 +116,6 @@ def test_wsgi_no_header_starts_fresh():
         seen["active"] = _hub.get_current_scope().active_span_context
         return [b"ok"]
 
-    mw = wardex_sdk.WardexWSGIMiddleware(app)
+    mw = wardex_sdk.WardexWsgiMiddleware(app)
     mw({"REQUEST_METHOD": "GET"}, lambda s, h: None)
     assert seen["active"] is None

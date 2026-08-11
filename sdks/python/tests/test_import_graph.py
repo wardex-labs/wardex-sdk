@@ -382,6 +382,11 @@ _REPORTING_CALLS = frozenset(
         "error",
         "exception",
         "critical",
+        # _assembly._diag's own channel: the logger spellings above, behind the
+        # `wardex_sdk` logger and its fail-safe emission.
+        "diag_info",
+        "diag_warning",
+        "report_once",
     }
 )
 
@@ -507,6 +512,10 @@ _ASSEMBLY_MAY_IMPORT = frozenset(
         f"{_PKG}._scope",
         f"{_PKG}._hub",
         f"{_PKG}._client",
+        # A stdlib-only leaf at the package root, like `_hash`. `_diag`'s
+        # diagnostic channel enters it around every logger emission so a host
+        # log handler that POSTs cannot have its traffic captured by the seams.
+        f"{_PKG}._suppress",
     }
 )
 

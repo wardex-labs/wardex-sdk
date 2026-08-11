@@ -5,7 +5,7 @@ import inspect
 import time
 import uuid
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager
 from typing import TYPE_CHECKING, Any
 
 from . import _hub
@@ -297,7 +297,7 @@ def _begin(
         # `finally` below this yield: the span is already lost, and running the
         # emit path on a draft with no trace would be inventing one.
         report_once(
-            f"[wardex] wardex.span({name!r}): internal error opening the span; "
+            f"wardex.span({name!r}): internal error opening the span; "
             "this span and anything it would have parented will not be recorded "
             "(re-run with debug=True for the traceback)",
             key="wardex.span.manual_open",
@@ -328,7 +328,7 @@ def _begin(
         # whatever was standing before it instead.
         fork = None
         report_once(
-            "[wardex] wardex.span(): internal error installing the span as the "
+            "wardex.span(): internal error installing the span as the "
             "active parent; work inside this block will be attached one level "
             "too high (re-run with debug=True for the traceback)",
             key="wardex.span.manual_fork",
@@ -415,7 +415,7 @@ def _conversation(name: str, *, id: str | None, op: OperationName | None) -> Ite
     if not installed:
         scope = None
         report_once(
-            "[wardex] wardex.conversation(): internal error reading the active "
+            "wardex.conversation(): internal error reading the active "
             "scope; spans in this block will not carry a conversation id "
             "(re-run with debug=True for the traceback)",
             key="wardex.conversation.scope",
@@ -432,7 +432,7 @@ def _conversation(name: str, *, id: str | None, op: OperationName | None) -> Ite
 
 def conversation(
     name: str, *, id: str | None = None, op: OperationName | None = None
-) -> Iterator[Span]:
+) -> AbstractContextManager[Span]:
     """Open a conversation: every span inside carries `gen_ai.conversation.id`.
 
     This is NOT a trace root, which is why it is not called "trace": the span
@@ -469,7 +469,7 @@ def span(
     kind: SpanKind = SpanKind.INTERNAL,
     agent: AgentAttributes | None = None,
     tool: ToolAttributes | None = None,
-) -> Iterator[Span]:
+) -> AbstractContextManager[Span]:
     """Open a hand-named span over the host's block and yield it as a `Span`."""
     return _WithOnly("span", _span(name, op, kind, agent, tool))
 

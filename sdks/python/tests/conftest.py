@@ -16,6 +16,28 @@ KEY = _FIXTURES / "key.pem"
 
 
 @pytest.fixture(autouse=True)
+def _shield_tests_from_ambient_env(monkeypatch):
+    """`init()` reads `WARDEX_*` and the OTel endpoint spellings since the
+    slice-2 env fold — so a developer machine (or CI runner) that exports
+    `OTEL_EXPORTER_OTLP_ENDPOINT` for its own tooling would silently flip
+    tests that assert the no-endpoint NoOp default, or worse, point a real
+    `OtlpHttpTransport` at a live collector. Tests that WANT an env value set
+    it through `monkeypatch.setenv`, which overrides this teardown-safe
+    scrub."""
+    for name in (
+        "WARDEX_API_KEY",
+        "WARDEX_ENDPOINT",
+        "WARDEX_SERVICE_NAME",
+        "WARDEX_RELEASE",
+        "WARDEX_ENVIRONMENT",
+        "WARDEX_DEBUG",
+        "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+        "OTEL_EXPORTER_OTLP_ENDPOINT",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+
+@pytest.fixture(autouse=True)
 def _close_hub_client_after_test():
     """Join the background worker thread any test may have started.
 

@@ -9,7 +9,7 @@ import uuid
 from collections import deque
 from dataclasses import replace
 
-from ._assembly import guard, report_once
+from ._assembly import diag_info, diag_warning, guard, report_once
 
 # The debug-gated traceback printer `guard()` itself uses: contained rendering
 # of a host exception (repr may raise, stderr may be gone) without a second
@@ -851,7 +851,7 @@ class Client:
             if final:
                 self._abandon()
             elif self._config.debug:
-                print("[wardex] drain skipped (export in progress)", file=sys.stderr)
+                diag_info("drain skipped (export in progress)")
             return
         try:
             with self._buffer_lock:
@@ -863,7 +863,7 @@ class Client:
             # is still held: assembly and I/O below are serialized against every
             # other drain, which is what keeps swap order == wire order.
             if dropped and self._config.debug:
-                print(f"[wardex] dropped {dropped} spans (buffer full)", file=sys.stderr)
+                diag_warning(f"dropped {dropped} spans (buffer full)")
             if not spans and not snapshots:
                 self._flush_transport(deadline)
                 return
@@ -893,7 +893,7 @@ class Client:
                         # it belongs to the host's code, not to wardex's
                         # per-process announcement budget.
                         report_once(
-                            "[wardex] before_send_envelope raised; batch dropped "
+                            "before_send_envelope raised; batch dropped "
                             "(re-run with debug=True for the traceback)",
                             key="wardex.before_send_envelope",
                         )
@@ -915,7 +915,7 @@ class Client:
                 # raising hook would raise on this envelope every time, which
                 # would pin the batch in the buffer forever if re-queued.)
                 if self._config.debug:
-                    print(f"[wardex] envelope dropped ({exc})", file=sys.stderr)
+                    diag_warning(f"envelope dropped ({exc})")
                 return
             if not shipped:
                 self._undelivered(spans, snapshots, final=final)
@@ -982,7 +982,7 @@ class Client:
             self._transport.flush(remaining)
         except Exception as exc:  # fail-silent: never crash the app or the exit path
             if self._config.debug:
-                print(f"[wardex] transport flush failed ({exc})", file=sys.stderr)
+                diag_warning(f"transport flush failed ({exc})")
 
     def _abandon(self) -> None:
         """Take the tail close()'s final drain never got a slot for, and account
@@ -1199,7 +1199,7 @@ class Client:
         with self._buffer_lock:
             self._lost += lost
         report_once(
-            f"[wardex] could not ship {lost} buffered span(s): {why} "
+            f"could not ship {lost} buffered span(s): {why} "
             f"They are out of the buffer and nothing will retry them. {fix}",
             key=key,
         )
@@ -1224,7 +1224,7 @@ class Client:
             self._transport.close(budget)
         except Exception as exc:  # fail-silent: never crash the app or the exit path
             if self._config.debug:
-                print(f"[wardex] transport close failed ({exc})", file=sys.stderr)
+                diag_warning(f"transport close failed ({exc})")
 
     def close(self, timeout: float = _SHUTDOWN_TIMEOUT) -> None:
         # Public API: sanitize before anything downstream is handed a value it

@@ -200,15 +200,19 @@ class PIIConfig:
     the caller to conclude the exemption was honoured."""
 
     def __post_init__(self) -> None:
-        # Validate BEFORE canonicalizing: `frozenset("email")` is a frozenset
-        # of five characters, and the error a wrong element type produces after
-        # conversion names the converted shape instead of the mistake.
-        for category in self.disabled_categories:
+        # Materialize ONCE, then validate, then canonicalize: "any iterable"
+        # includes a generator, which the validation loop would otherwise
+        # exhaust — reading back as `frozenset()` with every exemption
+        # silently dropped. Validating before the `frozenset` call keeps the
+        # error naming the element as given (`frozenset("email")` would be
+        # five characters), which is why this is not a one-liner.
+        categories = tuple(self.disabled_categories)
+        for category in categories:
             if not isinstance(category, PIICategory):
                 raise ValueError(
                     f"pii disabled_categories entries must be PIICategory members, got {category!r}"
                 )
-        object.__setattr__(self, "disabled_categories", frozenset(self.disabled_categories))
+        object.__setattr__(self, "disabled_categories", frozenset(categories))
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -587,7 +591,11 @@ def _resolve_config(
         adapters=adapters if adapters is not None else AdaptersConfig(),
         interceptors=interceptors,
         intercept=intercept,
-        intercept_hosts=tuple(intercept_hosts) if intercept_hosts is not None else None,
+        # Passed through untouched: `WardexConfig.__post_init__` owns both the
+        # bare-string refusal and the tuple canonicalization. Tupling here
+        # would turn `intercept_hosts="localhost"` into its characters before
+        # the check can see the string.
+        intercept_hosts=intercept_hosts,
         capture_mode=capture_mode,
         service_name=(
             service_name if service_name is not None else os.environ.get("WARDEX_SERVICE_NAME")

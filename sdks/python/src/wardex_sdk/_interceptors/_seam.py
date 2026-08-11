@@ -8,7 +8,6 @@ plaintext (ws/http) seams inherit this and override only seam-specific behavior
 
 from __future__ import annotations
 
-import sys
 from abc import abstractmethod
 from functools import partial
 from typing import TYPE_CHECKING, Any
@@ -21,6 +20,7 @@ from .._assembly import (
     SpanDraft,
     TransportLabel,
     capture_mode_of,
+    diag_warning,
     guard,
     in_degraded_run,
     resolve_observed,
@@ -515,10 +515,7 @@ class ByteSeamInterceptor(InterceptorInterface):
                 reason = getattr(st.tracker, "disabled_reason", lambda: None)()
                 if reason is not None and not st.disabled_logged:
                     st.disabled_logged = True
-                    print(
-                        f"[wardex] parser disabled for {st.server_address}: {reason}",
-                        file=sys.stderr,
-                    )
+                    diag_warning(f"parser disabled for {st.server_address}: {reason}")
         except Exception:  # noqa: BLE001 — debug-only logging must never break capture
             pass
         for txn in txns:

@@ -487,7 +487,7 @@ def test_activate_carries_the_conversation_identity():
 
 
 def test_bind_enters_a_fresh_fork_per_invocation():
-    """`context.run_in_context` replays ONE captured Context and raises
+    """`context.bind_context` replays ONE captured Context and raises
     `RuntimeError: cannot enter context ... is already entered` when the same
     Context is entered twice concurrently — into USER CODE, for any framework
     callback invoked from two tasks. Recursion is the cheapest reproduction of

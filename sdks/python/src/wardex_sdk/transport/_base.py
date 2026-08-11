@@ -157,6 +157,16 @@ class Transport(abc.ABC):
     masked path to bytes. The `Envelope` is opaque (its guaranteed surface is
     `span_count` and `encode()`), so a transport that stays on the sanctioned
     path gets the configured masking and limits without ever reading a field.
+
+    THE ASYNC CONTRACT, and it is the cross-language one: `export`, `flush`
+    and `close` are invoked from wardex's OWN worker thread -- never from the
+    host's event loop or request threads -- and each may BLOCK up to its
+    budget; blocking I/O here stalls no host code. That behavioral contract is
+    what every wardex SDK keeps, each in its platform's idiom: Node binds
+    `export` as async (`Promise`) and its pipeline awaits it, Java stays
+    blocking on its exporter thread. `before_send_envelope` is SYNCHRONOUS in
+    Python. (`CallerBudget` below is a Python-only diagnostic refinement and
+    is excluded from this cross-language SPI -- see its docstring.)
     """
 
     # PII policy applied by the native encoders on wire paths (design §4.2).
@@ -255,7 +265,7 @@ class Transport(abc.ABC):
             # and keyed apart from the budget reports so "one span is too big
             # for your collector" stays separately actionable.
             report_once(
-                f"[wardex] {dropped} span(s) exceeded max_otlp_request_bytes even with "
+                f"{dropped} span(s) exceeded max_otlp_request_bytes even with "
                 f"their payload removed and were not exported. Raise "
                 f"max_otlp_request_bytes if your collector accepts more.",
                 key="transport.otlp.span_over_request_cap",

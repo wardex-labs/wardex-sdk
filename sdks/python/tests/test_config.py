@@ -307,6 +307,15 @@ class TestPiiConfig:
         with pytest.raises(ValueError, match="PIICategory"):
             PIIConfig(disabled_categories={"email"})  # type: ignore[arg-type]
 
+    def test_disabled_categories_accepts_a_generator(self):
+        """ "Any iterable" includes a one-shot one: the validation loop must
+        not exhaust it before canonicalization reads it, or every exemption
+        would silently collapse into `frozenset()`."""
+        gen = (c for c in (PIICategory.EMAIL, PIICategory.PHONE_NUMBER))
+        assert PIIConfig(disabled_categories=gen).disabled_categories == frozenset(
+            {PIICategory.EMAIL, PIICategory.PHONE_NUMBER}
+        )
+
     def test_category_values_match_ffi_contract(self):
         assert {c.value for c in PIICategory} == {
             "email",
@@ -422,6 +431,14 @@ def test_an_empty_selection_does_not_collapse_into_none():
 def test_intercept_hosts_refuses_a_bare_string():
     with pytest.raises(ValueError, match="bare string"):
         WardexConfig(intercept_hosts="db.internal")  # type: ignore[arg-type]
+
+
+def test_intercept_hosts_bare_string_is_refused_through_the_resolver_too():
+    """`init()` goes through `_resolve_config`, and an eager `tuple()` there
+    would split the string into characters BEFORE `WardexConfig` could refuse
+    it — the silent per-character hazard, on the SDK's only entry point."""
+    with pytest.raises(ValueError, match="bare string"):
+        _resolve_config(intercept_hosts="db.internal")  # type: ignore[arg-type]
 
 
 def test_interceptor_entries_are_validated_before_conversion():

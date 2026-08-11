@@ -1,3 +1,5 @@
+import threading
+
 from wardex_sdk import _hub
 from wardex_sdk._scope import Scope
 
@@ -47,3 +49,16 @@ def test_isolation_scope_mutations_do_not_leak_out():
         _hub.get_isolation_scope().set_tag("request", "r1")
     assert _hub.get_isolation_scope().tags.get("tenant") == "acme"
     assert _hub.get_isolation_scope().tags.get("request") is None
+
+
+def test_isolation_scope_tolerates_uncopyable_context_values():
+    """`set_context()` documents "arbitrary host objects", and the fork on
+    block entry clones the enclosing isolation scope — so a lock stored there
+    must ride through the clone instead of blowing up `with isolation_scope()`
+    with a pickling TypeError (I6: never raise into host code)."""
+    lock = threading.Lock()
+    _hub.get_isolation_scope().set_context("runtime", {"lock": lock})
+    with _hub.isolation_scope() as forked:
+        assert forked.contexts["runtime"]["lock"] is lock
+        forked.set_context("runtime", {"lock": "replaced"})
+    assert _hub.get_isolation_scope().contexts["runtime"]["lock"] is lock
