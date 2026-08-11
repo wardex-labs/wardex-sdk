@@ -22,6 +22,7 @@ from ._types import (
     EnvelopeHeader,
     InternalSpan,
     InternalStateSnapshot,
+    ResourceInfo,
     SdkInfo,
 )
 from ._version import __version__
@@ -405,6 +406,15 @@ class Client:
         self._config = config
         self._transport = transport
         self._sdk_info = build_sdk_info()
+        # The APP's identity, stamped on every envelope header. Distinct from
+        # `_sdk_info`, which describes the SDK itself and must never supply the
+        # app's `service.name`. Empty strings mean "not configured" — the
+        # fallback shaping (`unknown_service:python`) is the Rust encoder's.
+        self._resource_info = ResourceInfo(
+            service_name=config.service_name or "",
+            release=config.release or "",
+            environment=config.environment or "",
+        )
         # Lock order is export lock → buffer lock. Every *ordinary* path obeys
         # it: _drain() acquires the export lock strictly before it opens the
         # buffer lock block, capture_span() calls _worker.wake() outside its
@@ -862,6 +872,7 @@ class Client:
                 api_key=self._config.backend.api_key or "",
                 sdk=self._sdk_info,
                 sent_at_ns=time.time_ns(),
+                resource=self._resource_info,
             )
             envelope = Envelope(
                 header=header,

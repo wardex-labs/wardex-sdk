@@ -344,6 +344,69 @@ def test_an_explicit_endpoint_path_is_used_verbatim():
         wardex.close()
 
 
+def test_backend_api_key_authenticates_the_default_transport_on_the_wire():
+    """`backend.api_key` is WIRED: the default exporter sends it as
+    `Authorization: Bearer <key>` on every POST. Asserted on what actually
+    arrives at a receiver, not on a headers dict."""
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    seen: list[str | None] = []
+
+    class _Handler(BaseHTTPRequestHandler):
+        def do_POST(self):  # noqa: N802 — BaseHTTPRequestHandler's spelling
+            self.rfile.read(int(self.headers.get("Content-Length", 0)))
+            seen.append(self.headers.get("Authorization"))
+            self.send_response(200)
+            self.end_headers()
+
+        def log_message(self, *args):
+            pass
+
+    srv = HTTPServer(("127.0.0.1", 0), _Handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    endpoint = f"http://127.0.0.1:{srv.server_address[1]}/v1/traces"
+    wardex.init(intercept=False, backend=BackendConfig(endpoint=endpoint, api_key="wk-secret-123"))
+    try:
+        with wardex.span("authenticated"):
+            pass
+        wardex.flush(10.0)
+    finally:
+        wardex.close()
+        srv.shutdown()
+        srv.server_close()
+    assert seen == ["Bearer wk-secret-123"]
+
+
+def test_no_api_key_means_no_authorization_header():
+    wardex.init(
+        intercept=False, backend=BackendConfig(endpoint="http://collector.invalid/v1/traces")
+    )
+    client = _hub.get_client()
+    try:
+        assert "Authorization" not in client._transport._headers
+    finally:
+        wardex.close()
+
+
+def test_the_api_key_never_reaches_stderr(capsys):
+    """The credential rides only in the request header. `debug=True` prints the
+    resolved config (api_key is repr=False) and the transport's own debug lines
+    never echo an Authorization value."""
+    wardex.init(
+        intercept=False,
+        backend=BackendConfig(
+            endpoint="http://collector.invalid/v1/traces", api_key="wk-secret-123"
+        ),
+        debug=True,
+    )
+    client = _hub.get_client()
+    try:
+        assert client._transport._headers["Authorization"] == "Bearer wk-secret-123"
+        assert "wk-secret-123" not in capsys.readouterr().err
+    finally:
+        wardex.close()
+
+
 def test_an_explicit_transport_wins_over_the_endpoint_and_a_warning_says_so():
     """A `Transport` carries its own address, so `transport=` beats the field —
     and the losing endpoint is announced with a `WardexConfigWarning`,

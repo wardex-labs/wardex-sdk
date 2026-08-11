@@ -109,7 +109,17 @@ fn any_value(v: pb::AnyValue) -> otlp_pb::common::AnyValue {
         // payload. `strip_bytes_values` removes every bytes_value from the
         // request after masking, right before serialization.
         Some(Wardex::BytesValue(b)) => Some(Otlp::BytesValue(b)),
-        _ => None,
+        // Containers remap recursively. Dropping them was survivable while
+        // nothing put one in `extra`; the list-valued gen_ai keys
+        // (stop_sequences, finish_reasons, encoding_formats) ship as
+        // ArrayValue now, so a silent None here would delete exactly them.
+        Some(Wardex::ArrayValue(arr)) => Some(Otlp::ArrayValue(otlp_pb::common::ArrayValue {
+            values: arr.values.into_iter().map(any_value).collect(),
+        })),
+        Some(Wardex::KvlistValue(kvl)) => Some(Otlp::KvlistValue(otlp_pb::common::KeyValueList {
+            values: kvl.values.into_iter().map(key_value).collect(),
+        })),
+        None => None,
     };
     otlp_pb::common::AnyValue { value }
 }
@@ -133,6 +143,8 @@ fn span_kind(kind: i32) -> i32 {
         Ok(pb::SpanKind::Internal) => Otlp::Internal,
         Ok(pb::SpanKind::Client) => Otlp::Client,
         Ok(pb::SpanKind::Server) => Otlp::Server,
+        Ok(pb::SpanKind::Producer) => Otlp::Producer,
+        Ok(pb::SpanKind::Consumer) => Otlp::Consumer,
         Ok(pb::SpanKind::Unspecified) | Err(_) => Otlp::Unspecified,
     }) as i32
 }
@@ -278,6 +290,17 @@ fn link(ln: pb::SpanLink) -> otlp_pb::trace::span::Link {
     }
 }
 
+/// A captured URL up to (excluding) its query string and fragment.
+///
+/// Byte positions, not a URL parser: `?` and `#` are not legal in the parts
+/// that precede them, so the first occurrence of either is where the URL's
+/// stable identity ends — and a malformed URL is truncated at worst, never a
+/// panic on the export path.
+fn strip_query(url: &str) -> &str {
+    let end = url.find(['?', '#']).unwrap_or(url.len());
+    &url[..end]
+}
+
 /// The non-empty string an `extra` key carries, if it carries one.
 ///
 /// Empty reads as absent on purpose: proto3 cannot tell `""` from unset, and a
@@ -372,6 +395,17 @@ fn span(mut sp: pb::Span) -> otlp_pb::trace::Span {
     // `uncertainty` wants the whole span.
     let name = span_name(&sp);
     let code = status_code(sp.status.as_ref().map(|s| s.code).unwrap_or_default());
+    // A tool call's payload has a semconv home of its own; every other
+    // operation keeps the wardex.* keys. Decided off the operation the sender
+    // recorded — same pipeline, same masking, same caps, only the key differs
+    // — and the operation name is read off the schema, never restated here.
+    let execute_tool = vocab::operation_name_name(pb::OperationName::ExecuteTool as i32);
+    let (input_key, output_key) =
+        if string_attr(&sp.extra, "gen_ai.operation.name") == Some(execute_tool.as_str()) {
+            ("gen_ai.tool.call.arguments", "gen_ai.tool.call.result")
+        } else {
+            ("wardex.input_data", "wardex.output_data")
+        };
 
     // gen_ai / agent / tool attributes were flattened into `extra` when the
     // envelope was marshalled, so both export surfaces carry one flattening and
@@ -388,39 +422,56 @@ fn span(mut sp: pb::Span) -> otlp_pb::trace::Span {
         attrs.push(kv_int("server.port", sp.server_port as i64));
     }
     if let Some(t) = &sp.transport {
-        attrs.push(kv_str(
-            "network.protocol.name",
-            &vocab::protocol_name(t.protocol),
-        ));
+        let protocol = vocab::protocol_name(t.protocol);
+        if protocol == "sse" {
+            // SSE is not a network protocol, it is a framing over HTTP —
+            // `network.protocol.name = "sse"` fails every backend's HTTP
+            // grouping. The observed fact survives under a wardex key.
+            attrs.push(kv_str("network.protocol.name", "http"));
+            attrs.push(kv_str("wardex.transport.protocol", &protocol));
+        } else {
+            attrs.push(kv_str("network.protocol.name", &protocol));
+        }
         if let Some(h) = &t.http {
             attrs.push(kv_str("http.request.method", &h.method));
             attrs.push(kv_int("http.response.status_code", h.status_code as i64));
+            // QUERY-STRIPPED, deliberately: `url.full` is semconv's name for
+            // the whole URL, but query strings are where credentials and PII
+            // ride (`?api_key=`, `?token=`), and a captured URL is exported
+            // for grouping, not replay. Everything before `?` (and `#`).
+            // An empty captured URL emits nothing — there is no URL to strip.
+            let url = strip_query(&h.url);
+            if !url.is_empty() {
+                attrs.push(kv_str("url.full", url));
+            }
         }
     }
-    // Raw I/O → wardex.input_data / wardex.output_data (omitted if empty).
-    // Built as bytes so PII masking sees the raw payload; `strip_bytes_values`
-    // converts to strings after masking, before serialization.
+    // Raw I/O → payload attributes (omitted if empty). The key pair was chosen
+    // above from the operation. Built as bytes so PII masking sees the raw
+    // payload; `strip_bytes_values` converts to strings after masking, before
+    // serialization.
     let input = take(&mut sp.input_data);
     if !input.is_empty() {
-        attrs.push(kv_bytes("wardex.input_data", input));
+        attrs.push(kv_bytes(input_key, input));
     }
     let output = take(&mut sp.output_data);
     if !output.is_empty() {
-        attrs.push(kv_bytes("wardex.output_data", output));
+        attrs.push(kv_bytes(output_key, output));
     }
     uncertainty(&sp, &mut attrs);
 
-    // `error.type` takes priority over the status message: on a failure it is
-    // the more specific of the two, and it is empty exactly when there is no
-    // error type to report.
-    let message = if sp.error_type.is_empty() {
-        sp.status
-            .as_mut()
-            .map(|s| take(&mut s.message))
-            .unwrap_or_default()
-    } else {
-        take(&mut sp.error_type)
-    };
+    // `error.type` is a span attribute — semconv's home for it — and the
+    // status message stays the status message. It used to be SUBSTITUTED into
+    // `Status.message`, which destroyed the one field a backend renders as
+    // "what went wrong" to relabel it with a fact that now travels beside it.
+    if !sp.error_type.is_empty() {
+        attrs.push(kv_str("error.type", &sp.error_type));
+    }
+    let message = sp
+        .status
+        .as_mut()
+        .map(|s| take(&mut s.message))
+        .unwrap_or_default();
 
     otlp_pb::trace::Span {
         trace_id: take(&mut sp.trace_id),
@@ -469,18 +520,41 @@ pub fn envelope_to_traces(
         };
     }
     let sdk = env.header.as_ref().and_then(|h| h.sdk.as_ref());
-    let name = sdk.map(|s| s.name.as_str()).unwrap_or_default();
     let version = sdk.map(|s| s.version.as_str()).unwrap_or_default();
+    // Resource identity is the APPLICATION's, read off `EnvelopeHeader.
+    // resource`, never off SdkInfo: every app used to export as
+    // `service.name = "wardex.python"`, which made two services one service
+    // in any backend that groups by the resource — the axis they all group by.
+    // An unnamed service gets semconv's own fallback shape, never the SDK's
+    // name; `telemetry.sdk.name` is the constant `"wardex"` across languages
+    // (the language already travels in `telemetry.sdk.language`).
+    let resource = env.header.as_ref().and_then(|h| h.resource.as_ref());
+    let service_name = resource
+        .map(|r| r.service_name.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("unknown_service:{}", producer.language));
+    let mut resource_attrs = vec![
+        kv_str("service.name", &service_name),
+        kv_str("telemetry.sdk.name", "wardex"),
+        kv_str("telemetry.sdk.version", version),
+        kv_str("telemetry.sdk.language", producer.language),
+    ];
+    if let Some(r) = resource {
+        // Emitted iff configured: an empty `service.version = ""` is not a
+        // smaller answer than no key, it is a version named "" for a backend
+        // to group by.
+        if !r.release.is_empty() {
+            resource_attrs.push(kv_str("service.version", &r.release));
+        }
+        if !r.environment.is_empty() {
+            resource_attrs.push(kv_str("deployment.environment.name", &r.environment));
+        }
+    }
     otlp_pb::trace_service::ExportTraceServiceRequest {
         resource_spans: vec![otlp_pb::trace::ResourceSpans {
             resource: Some(otlp_pb::resource::Resource {
-                attributes: vec![
-                    kv_str("service.name", name),
-                    kv_str("service.version", version),
-                    kv_str("telemetry.sdk.name", name),
-                    kv_str("telemetry.sdk.version", version),
-                    kv_str("telemetry.sdk.language", producer.language),
-                ],
+                attributes: resource_attrs,
                 ..Default::default()
             }),
             scope_spans: vec![otlp_pb::trace::ScopeSpans {
@@ -669,7 +743,16 @@ pub fn cap_attribute_values(
 /// gen_ai semantics are what a trace is made of, and a hole in the tree is
 /// read as "this call never happened" rather than as "this call was large".
 pub fn drop_payload_attributes(sp: &mut otlp_pb::trace::Span) {
-    const PAYLOAD: [&str; 2] = ["wardex.input_data", "wardex.output_data"];
+    // Both key pairs a payload can land under: the wardex.* defaults and the
+    // semconv pair an `execute_tool` span uses. Whichever pair `span()` chose,
+    // this pass has to find it — a payload it cannot name is one it cannot
+    // drop, and the span dies whole instead.
+    const PAYLOAD: [&str; 4] = [
+        "wardex.input_data",
+        "wardex.output_data",
+        "gen_ai.tool.call.arguments",
+        "gen_ai.tool.call.result",
+    ];
     let before = sp.attributes.len();
     sp.attributes.retain(|kv| {
         // `<key>.encoding` is the companion `strip_bytes_values` writes; it
@@ -984,6 +1067,11 @@ mod tests {
         assert_eq!(span_kind(pb::SpanKind::Client as i32), 3);
         assert_eq!(span_kind(pb::SpanKind::Internal as i32), 1);
         assert_eq!(span_kind(pb::SpanKind::Server as i32), 2);
+        // PRODUCER/CONSUMER happen to share numbers with OTLP (both 4/5) —
+        // asserted anyway, because "happens to line up" is exactly the state
+        // a renumbering pass exists to stop anyone relying on.
+        assert_eq!(span_kind(pb::SpanKind::Producer as i32), 4);
+        assert_eq!(span_kind(pb::SpanKind::Consumer as i32), 5);
         assert_eq!(span_kind(404), 0);
         assert_eq!(status_code(pb::StatusCode::Error as i32), 2);
         assert_eq!(status_code(404), 0);
@@ -1003,33 +1091,95 @@ mod tests {
         assert!(envelope_to_traces(env, PRODUCER).resource_spans.is_empty());
     }
 
-    #[test]
-    fn the_scope_names_the_library_not_the_service() {
-        // A host that renames its service must not rename the instrumentation
-        // library that produced its spans.
-        let mut env = envelope(pb::Span::default());
-        env.header.as_mut().unwrap().sdk.as_mut().unwrap().name = "checkout-api".into();
-        let req = envelope_to_traces(env, PRODUCER);
-        let resource = req.resource_spans[0].resource.as_ref().unwrap();
-        let service = resource
+    fn resource_attr<'a>(
+        req: &'a otlp_pb::trace_service::ExportTraceServiceRequest,
+        key: &str,
+    ) -> Option<&'a otlp_pb::common::any_value::Value> {
+        req.resource_spans[0]
+            .resource
+            .as_ref()
+            .unwrap()
             .attributes
             .iter()
-            .find(|kv| kv.key == "service.name")
-            .unwrap();
+            .find(|kv| kv.key == key)
+            .and_then(|kv| kv.value.as_ref())
+            .and_then(|v| v.value.as_ref())
+    }
+
+    fn str_value(s: &str) -> otlp_pb::common::any_value::Value {
+        otlp_pb::common::any_value::Value::StringValue(s.into())
+    }
+
+    #[test]
+    fn the_service_is_named_by_the_resource_and_the_scope_by_the_library() {
+        // The app's identity comes off `EnvelopeHeader.resource`; SdkInfo may
+        // not supply it, and the instrumentation library's name moves for
+        // neither of them.
+        let mut env = envelope(pb::Span::default());
+        env.header.as_mut().unwrap().resource = Some(pb::ResourceInfo {
+            service_name: "checkout-api".into(),
+            release: "1.2.3".into(),
+            environment: "staging".into(),
+        });
+        let req = envelope_to_traces(env, PRODUCER);
         assert_eq!(
-            service.value,
-            Some(otlp_pb::common::AnyValue {
-                value: Some(otlp_pb::common::any_value::Value::StringValue(
-                    "checkout-api".into()
-                )),
-            })
+            resource_attr(&req, "service.name"),
+            Some(&str_value("checkout-api"))
+        );
+        assert_eq!(
+            resource_attr(&req, "service.version"),
+            Some(&str_value("1.2.3"))
+        );
+        assert_eq!(
+            resource_attr(&req, "deployment.environment.name"),
+            Some(&str_value("staging"))
         );
         let scope = req.resource_spans[0].scope_spans[0].scope.as_ref().unwrap();
         assert_eq!(scope.name, "wardex.python");
     }
 
     #[test]
-    fn error_type_wins_over_the_status_message() {
+    fn an_unnamed_service_exports_as_unknown_service_never_as_the_sdk() {
+        // The regression this slice exists to fix: every app exported as
+        // `service.name = "wardex.python"`, so two services were one service
+        // in any backend. The fallback is semconv's own shape, and SdkInfo's
+        // name may not leak into it.
+        let req = envelope_to_traces(envelope(pb::Span::default()), PRODUCER);
+        assert_eq!(
+            resource_attr(&req, "service.name"),
+            Some(&str_value("unknown_service:python"))
+        );
+        // Unconfigured release/environment emit NO key, not an empty one.
+        assert!(resource_attr(&req, "service.version").is_none());
+        assert!(resource_attr(&req, "deployment.environment.name").is_none());
+    }
+
+    #[test]
+    fn the_telemetry_sdk_is_wardex_in_every_language() {
+        // `telemetry.sdk.name` is the cross-language constant; the language
+        // travels in its own attribute and the version stays the SDK's.
+        let req = envelope_to_traces(envelope(pb::Span::default()), PRODUCER);
+        assert_eq!(
+            resource_attr(&req, "telemetry.sdk.name"),
+            Some(&str_value("wardex"))
+        );
+        assert_eq!(
+            resource_attr(&req, "telemetry.sdk.version"),
+            Some(&str_value("0.1.0"))
+        );
+        assert_eq!(
+            resource_attr(&req, "telemetry.sdk.language"),
+            Some(&str_value("python"))
+        );
+    }
+
+    #[test]
+    fn error_type_is_an_attribute_and_the_status_message_survives() {
+        // The inverse of the substitution this mapping used to make: semconv's
+        // home for the exception class is the `error.type` attribute, and
+        // `Status.message` is the one field a backend renders as "what went
+        // wrong" — overwriting it destroyed the message to relabel it with a
+        // fact that now travels beside it.
         let env = envelope(pb::Span {
             error_type: "TimeoutError".into(),
             status: Some(pb::Status {
@@ -1038,7 +1188,185 @@ mod tests {
             }),
             ..Default::default()
         });
-        assert_eq!(only_span(env).status.unwrap().message, "TimeoutError");
+        let sp = only_span(env);
+        assert_eq!(sp.status.as_ref().unwrap().message, "boom");
+        assert_eq!(attr(&sp, "error.type"), Some(&str_value("TimeoutError")));
+    }
+
+    #[test]
+    fn a_span_with_no_error_type_carries_no_error_type_key() {
+        let sp = only_span(envelope(pb::Span {
+            status: Some(pb::Status {
+                code: pb::StatusCode::Error as i32,
+                message: "boom".into(),
+            }),
+            ..Default::default()
+        }));
+        assert!(attr(&sp, "error.type").is_none());
+        assert_eq!(sp.status.unwrap().message, "boom");
+    }
+
+    #[test]
+    fn url_full_is_query_stripped_and_absent_when_nothing_was_captured() {
+        let with_query = |url: &str| {
+            envelope(pb::Span {
+                transport: Some(pb::TransportAttributes {
+                    protocol: pb::Protocol::Http as i32,
+                    http: Some(pb::HttpMeta {
+                        method: "POST".into(),
+                        url: url.into(),
+                        status_code: 200,
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+        };
+        let sp = only_span(with_query(
+            "https://api.example.com/v1/chat?api_key=sk-x#frag",
+        ));
+        assert_eq!(
+            attr(&sp, "url.full"),
+            Some(&str_value("https://api.example.com/v1/chat"))
+        );
+        // Fragment alone is stripped too.
+        let sp = only_span(with_query("https://api.example.com/v1/chat#sect"));
+        assert_eq!(
+            attr(&sp, "url.full"),
+            Some(&str_value("https://api.example.com/v1/chat"))
+        );
+        // An empty captured URL emits nothing at all.
+        let sp = only_span(with_query(""));
+        assert!(attr(&sp, "url.full").is_none());
+    }
+
+    #[test]
+    fn an_sse_span_is_http_on_the_wire_and_sse_under_the_wardex_key() {
+        // `network.protocol.name = "sse"` fails every backend's HTTP grouping;
+        // SSE is a framing over HTTP and the observed fact keeps a key of its
+        // own instead of being dropped.
+        let env = envelope(pb::Span {
+            transport: Some(pb::TransportAttributes {
+                protocol: pb::Protocol::Sse as i32,
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let sp = only_span(env);
+        assert_eq!(attr(&sp, "network.protocol.name"), Some(&str_value("http")));
+        assert_eq!(
+            attr(&sp, "wardex.transport.protocol"),
+            Some(&str_value("sse"))
+        );
+        // Every other protocol is unchanged and carries no wardex twin.
+        let env = envelope(pb::Span {
+            transport: Some(pb::TransportAttributes {
+                protocol: pb::Protocol::Grpc as i32,
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let sp = only_span(env);
+        assert_eq!(attr(&sp, "network.protocol.name"), Some(&str_value("grpc")));
+        assert!(attr(&sp, "wardex.transport.protocol").is_none());
+    }
+
+    #[test]
+    fn a_tool_calls_payload_ships_under_the_semconv_tool_keys() {
+        // Same pipeline, same masking, same caps — only the key differs, and
+        // only for `execute_tool`: that operation's payload has a semconv home
+        // (`gen_ai.tool.call.arguments`/`result`) and shipping it under
+        // `wardex.*` hid it from every backend that renders the tool view.
+        let env = envelope(pb::Span {
+            name: "execute_tool Bash".into(),
+            extra: vec![kv_wardex("gen_ai.operation.name", "execute_tool")],
+            input_data: b"{\"command\":\"ls\"}".to_vec(),
+            output_data: b"README.md".to_vec(),
+            ..Default::default()
+        });
+        let mut req = envelope_to_traces(env, PRODUCER);
+        strip_bytes_values(&mut req);
+        let sp = &req.resource_spans[0].scope_spans[0].spans[0];
+        assert_eq!(
+            attr(sp, "gen_ai.tool.call.arguments"),
+            Some(&str_value("{\"command\":\"ls\"}"))
+        );
+        assert_eq!(
+            attr(sp, "gen_ai.tool.call.result"),
+            Some(&str_value("README.md"))
+        );
+        assert!(attr(sp, "wardex.input_data").is_none());
+        assert!(attr(sp, "wardex.output_data").is_none());
+    }
+
+    #[test]
+    fn a_tool_payloads_companions_follow_the_key_it_landed_under() {
+        // The base64 companion and the payload drop both key off whichever
+        // pair the payload used — a companion under the OLD key would tell a
+        // consumer to decode an attribute that is not there.
+        let env = envelope(pb::Span {
+            extra: vec![kv_wardex("gen_ai.operation.name", "execute_tool")],
+            input_data: b"\x89PNG\xff\x00binary".to_vec(),
+            ..Default::default()
+        });
+        let mut req = envelope_to_traces(env, PRODUCER);
+        strip_bytes_values(&mut req);
+        let sp = &mut req.resource_spans[0].scope_spans[0].spans[0];
+        assert_eq!(
+            attr(sp, "gen_ai.tool.call.arguments.encoding"),
+            Some(&str_value("base64"))
+        );
+        drop_payload_attributes(sp);
+        assert!(attr(sp, "gen_ai.tool.call.arguments").is_none());
+        assert!(attr(sp, "gen_ai.tool.call.arguments.encoding").is_none());
+        assert_eq!(markers(sp), vec!["otlp_attribute_truncated"]);
+    }
+
+    #[test]
+    fn every_other_operation_keeps_the_wardex_payload_keys() {
+        let env = envelope(pb::Span {
+            extra: vec![kv_wardex("gen_ai.operation.name", "chat")],
+            input_data: b"prompt".to_vec(),
+            output_data: b"answer".to_vec(),
+            ..Default::default()
+        });
+        let mut req = envelope_to_traces(env, PRODUCER);
+        strip_bytes_values(&mut req);
+        let sp = &req.resource_spans[0].scope_spans[0].spans[0];
+        assert_eq!(attr(sp, "wardex.input_data"), Some(&str_value("prompt")));
+        assert_eq!(attr(sp, "wardex.output_data"), Some(&str_value("answer")));
+        assert!(attr(sp, "gen_ai.tool.call.arguments").is_none());
+    }
+
+    #[test]
+    fn an_array_valued_extra_survives_onto_the_otlp_wire() {
+        // The list-valued gen_ai keys (stop_sequences, finish_reasons,
+        // encoding_formats) arrive in `extra` as wardex ArrayValues now; a
+        // remap that dropped containers would delete exactly them.
+        let env = envelope(pb::Span {
+            extra: vec![pb::KeyValue {
+                key: "gen_ai.response.finish_reasons".into(),
+                value: Some(pb::AnyValue {
+                    value: Some(pb::any_value::Value::ArrayValue(pb::ArrayValue {
+                        values: vec![pb::AnyValue {
+                            value: Some(pb::any_value::Value::StringValue("stop".into())),
+                        }],
+                    })),
+                }),
+            }],
+            ..Default::default()
+        });
+        let sp = only_span(env);
+        assert_eq!(
+            attr(&sp, "gen_ai.response.finish_reasons"),
+            Some(&otlp_pb::common::any_value::Value::ArrayValue(
+                otlp_pb::common::ArrayValue {
+                    values: vec![otlp_pb::common::AnyValue {
+                        value: Some(str_value("stop")),
+                    }],
+                }
+            ))
+        );
     }
 
     #[test]

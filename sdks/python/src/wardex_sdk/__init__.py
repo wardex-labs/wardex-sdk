@@ -179,6 +179,7 @@ def init(
     intercept: bool = True,
     intercept_hosts: _Sequence[str] | None = None,
     capture_mode: CaptureMode = CaptureMode.AGENT,
+    service_name: str | None = None,
     release: str | None = None,
     environment: str | None = None,
     before_send_envelope: BeforeSendEnvelopeCallback | None = None,
@@ -198,6 +199,7 @@ def init(
         backend.endpoint     WARDEX_ENDPOINT, else
                              OTEL_EXPORTER_OTLP_TRACES_ENDPOINT, else
                              OTEL_EXPORTER_OTLP_ENDPOINT
+        service_name         WARDEX_SERVICE_NAME
         release              WARDEX_RELEASE
         environment          WARDEX_ENVIRONMENT
         debug                WARDEX_DEBUG=true (case-insensitive)
@@ -235,6 +237,7 @@ def init(
         intercept=intercept,
         intercept_hosts=intercept_hosts,
         capture_mode=capture_mode,
+        service_name=service_name,
         release=release,
         environment=environment,
         before_send_envelope=before_send_envelope,
@@ -309,8 +312,19 @@ def init(
     if transport is not None:
         resolved_transport = transport
     elif config.backend.endpoint:
+        # `backend.api_key` is WIRED here: the default exporter authenticates
+        # with it, so setting the key without hand-building a transport means
+        # something. The value rides only in the request header — never in any
+        # stderr line or repr (`api_key` is `repr=False` on the config, and the
+        # transport never echoes an Authorization value).
         resolved_transport = OtlpHttpTransport(
-            _traces_endpoint(config.backend.endpoint), debug=config.debug
+            _traces_endpoint(config.backend.endpoint),
+            headers=(
+                {"Authorization": f"Bearer {config.backend.api_key}"}
+                if config.backend.api_key
+                else None
+            ),
+            debug=config.debug,
         )
     else:
         resolved_transport = NoOpTransport()

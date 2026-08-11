@@ -89,6 +89,8 @@ class SpanKind(Enum):
     INTERNAL = "internal"
     CLIENT = "client"
     SERVER = "server"
+    PRODUCER = "producer"
+    CONSUMER = "consumer"
 
 
 class OperationName(Enum):

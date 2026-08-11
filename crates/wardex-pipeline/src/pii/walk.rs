@@ -133,8 +133,21 @@ fn mask_header(engine: &PiiEngine, h: &mut pb::EnvelopeHeader) {
         sent_at_unix_nano: _,
         session_status: _,
         retention_class: _,
+        resource,
     } = h;
     mask_string(engine, event_id);
+    if let Some(r) = resource {
+        // The app's identity strings are host-supplied free text, so they get
+        // the same treatment as SdkInfo's strings below.
+        let pb::ResourceInfo {
+            service_name,
+            release,
+            environment,
+        } = r;
+        mask_string(engine, service_name);
+        mask_string(engine, release);
+        mask_string(engine, environment);
+    }
     if let Some(s) = sdk {
         let pb::SdkInfo {
             name,

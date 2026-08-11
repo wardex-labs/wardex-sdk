@@ -20,6 +20,18 @@ message EnvelopeHeader {
   fixed64 sent_at_unix_nano = 4;
   SessionStatus session_status = 5;
   RetentionClass retention_class = 6;  // retention grade for this batch trace (v2)
+  ResourceInfo resource = 7;           // the host APPLICATION's identity (never the SDK's)
+}
+
+// The exporting APPLICATION's identity — what OTLP resource attributes are
+// built from. Deliberately separate from SdkInfo: SdkInfo describes the SDK
+// doing the exporting (telemetry.sdk.*, the instrumentation scope), while this
+// names the app whose spans these are. Empty fields mean "not configured";
+// the OTLP mapping owns the fallback shaping (unknown_service:<language>).
+message ResourceInfo {
+  string service_name = 1;  // -> service.name
+  string release = 2;       // -> service.version
+  string environment = 3;   // -> deployment.environment.name
 }
 
 message SdkInfo {
@@ -30,7 +42,7 @@ message SdkInfo {
   string arch = 5;
   repeated string adapters = 6;
   repeated string interceptors = 7;
-  string otel_semconv_version = 8;  // "1.36.0"
+  string otel_semconv_version = 8;  // single source: OTEL_SEMCONV_VERSION in the sending SDK
   string shell = 9;                 // "zsh", "bash" (static host metadata, v2 alignment #1)
 }
 

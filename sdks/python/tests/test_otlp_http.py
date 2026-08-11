@@ -417,6 +417,27 @@ def test_a_host_content_encoding_header_cannot_contradict_the_body():
     assert _Handler.received["auth"] == "Basic zzz", "an ordinary host header was dropped too"
 
 
+def test_no_diagnostic_path_ever_prints_an_authorization_value(capsys):
+    """The header-conflict stderr line reprs the losing header's VALUE — it
+    fires only for Content-Encoding, and this pins that an Authorization value
+    (case-insensitive) can never ride along, even under debug with every
+    diagnostic path exercised (conflict line, failed POST, deadline skip)."""
+    secret = "Bearer wk-secret-123"
+    t = OtlpHttpTransport(
+        # Port nobody listens on: the failed-POST debug line prints too.
+        endpoint="http://127.0.0.1:1/v1/traces",
+        headers={"content-encoding": "identity", "authorization": secret},
+        timeout=0.5,
+        debug=True,
+    )
+    t.export(_envelope_with_span())
+    t.export(_envelope_with_span(), timeout=0.0)  # the deadline-exhausted line
+    err = capsys.readouterr().err
+    assert "ignoring host header" in err, "the conflict line under audit never fired"
+    assert "wk-secret-123" not in err
+    assert secret not in err
+
+
 def test_compress_false_leaves_no_content_encoding_a_host_set():
     """The other direction of the same rule: an uncompressed body must not go
     out declaring an encoding, whoever asked for the header."""

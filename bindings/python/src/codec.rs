@@ -93,6 +93,26 @@ fn kv_bool(key: &str, v: bool) -> pb::KeyValue {
         }),
     }
 }
+/// A list of strings as ONE attribute holding an ArrayValue — the same shape
+/// `wardex.limitations` already ships in. The semconv list-valued keys
+/// (stop_sequences, finish_reasons, encoding_formats) are arrays on the wire;
+/// the CSV join this replaces destroyed the elements' boundaries the moment a
+/// value contained a comma.
+fn kv_strs(key: &str, vs: Vec<String>) -> pb::KeyValue {
+    pb::KeyValue {
+        key: key.into(),
+        value: Some(pb::AnyValue {
+            value: Some(pb::any_value::Value::ArrayValue(pb::ArrayValue {
+                values: vs
+                    .into_iter()
+                    .map(|v| pb::AnyValue {
+                        value: Some(pb::any_value::Value::StringValue(v)),
+                    })
+                    .collect(),
+            })),
+        }),
+    }
+}
 
 /// Python tuple[(key, scalar)] → Vec<KeyValue>.
 fn kv_list(extra: &Bound<PyAny>, out: &mut Vec<pb::KeyValue>) -> PyResult<()> {
@@ -197,21 +217,23 @@ fn flatten_gen_ai(g: &Bound<PyAny>, out: &mut Vec<pb::KeyValue>) -> PyResult<()>
             out.push(kv_str(key, v.extract()?));
         }
     }
-    // integer fields
+    // integer fields. The cache/reasoning keys are semconv's dot spellings —
+    // the Python dataclass fields keep their snake_case names; only the wire
+    // key differs.
     for (attr, key) in [
         ("input_tokens", "gen_ai.usage.input_tokens"),
         ("output_tokens", "gen_ai.usage.output_tokens"),
         (
             "cache_read_input_tokens",
-            "gen_ai.usage.cache_read_input_tokens",
+            "gen_ai.usage.cache_read.input_tokens",
         ),
         (
             "cache_creation_input_tokens",
-            "gen_ai.usage.cache_creation_input_tokens",
+            "gen_ai.usage.cache_creation.input_tokens",
         ),
         (
             "reasoning_output_tokens",
-            "gen_ai.usage.reasoning_output_tokens",
+            "gen_ai.usage.reasoning.output_tokens",
         ),
         ("max_tokens", "gen_ai.request.max_tokens"),
         ("seed", "gen_ai.request.seed"),
@@ -241,15 +263,15 @@ fn flatten_gen_ai(g: &Bound<PyAny>, out: &mut Vec<pb::KeyValue>) -> PyResult<()>
     if let Some(v) = opt(g, "stream")? {
         out.push(kv_bool("gen_ai.request.stream", v.extract()?));
     }
-    // tuple[str] → CSV
+    // tuple[str] → ArrayValue of strings (semconv declares these as arrays;
+    // the CSV join they used to get was lossy on any element with a comma).
     for (attr, key) in [
         ("stop_sequences", "gen_ai.request.stop_sequences"),
         ("finish_reasons", "gen_ai.response.finish_reasons"),
         ("encoding_formats", "gen_ai.request.encoding_formats"),
     ] {
         if let Some(v) = opt(g, attr)? {
-            let items: Vec<String> = v.extract()?;
-            out.push(kv_str(key, items.join(",")));
+            out.push(kv_strs(key, v.extract()?));
         }
     }
     // output_type: enum|str
@@ -705,7 +727,7 @@ fn links_to_proto(sp: &Bound<PyAny>, out: &mut Vec<pb::SpanLink>) -> PyResult<()
 
 fn header_to_proto(h: &Bound<PyAny>) -> PyResult<pb::EnvelopeHeader> {
     let sdk = h.getattr("sdk")?;
-    Ok(pb::EnvelopeHeader {
+    let mut header = pb::EnvelopeHeader {
         event_id: h.getattr("event_id")?.extract()?,
         api_key: h.getattr("api_key")?.extract()?,
         sent_at_unix_nano: h.getattr("sent_at_ns")?.extract()?,
@@ -721,7 +743,18 @@ fn header_to_proto(h: &Bound<PyAny>) -> PyResult<pb::EnvelopeHeader> {
             shell: sdk.getattr("shell")?.extract()?,
         }),
         ..Default::default()
-    })
+    };
+    // The APP's identity, distinct from `sdk` (which describes the SDK
+    // itself). Optional at this boundary: a hand-built header without it still
+    // encodes, and the OTLP mapping owns the unnamed-service fallback.
+    if let Some(r) = opt(h, "resource")? {
+        header.resource = Some(pb::ResourceInfo {
+            service_name: r.getattr("service_name")?.extract()?,
+            release: r.getattr("release")?.extract()?,
+            environment: r.getattr("environment")?.extract()?,
+        });
+    }
+    Ok(header)
 }
 
 /// `InternalEnvelope`(Python) → `pb::Envelope`.
@@ -770,6 +803,13 @@ fn any_to_py(py: Python<'_>, v: &pb::AnyValue) -> PyObject {
         Some(Value::DoubleValue(d)) => d.into_py(py),
         Some(Value::BoolValue(b)) => b.into_py(py),
         Some(Value::BytesValue(b)) => PyBytes::new_bound(py, b).into_py(py),
+        // The decode half of `kv_strs`: the list-valued gen_ai keys ship as
+        // ArrayValue now, and a reader handed `None` for a value the encoder
+        // wrote would report the key as unset (same reasoning as
+        // `otlp_any_to_py` below).
+        Some(Value::ArrayValue(a)) => {
+            PyList::new_bound(py, a.values.iter().map(|e| any_to_py(py, e))).into_py(py)
+        }
         _ => py.None(),
     }
 }
@@ -916,6 +956,13 @@ fn envelope_to_dict(py: Python<'_>, env: &pb::Envelope) -> PyResult<PyObject> {
             sdk.set_item("version", &s.version)?;
         }
         h.set_item("sdk", sdk)?;
+        if let Some(r) = &header.resource {
+            let rd = PyDict::new_bound(py);
+            rd.set_item("service_name", &r.service_name)?;
+            rd.set_item("release", &r.release)?;
+            rd.set_item("environment", &r.environment)?;
+            h.set_item("resource", rd)?;
+        }
     }
     d.set_item("header", h)?;
     let items = PyList::empty_bound(py);

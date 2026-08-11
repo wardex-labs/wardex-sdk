@@ -24,6 +24,7 @@ from ._enums import (
     ToolExecutionType,
     ToolType,
 )
+from ._version import OTEL_SEMCONV_VERSION
 
 if TYPE_CHECKING:
     # Vocabulary that this module ANNOTATES but does not own. Three fields below
@@ -430,6 +431,13 @@ class InternalStateSnapshot:
 
 @dataclass(frozen=True, slots=True)
 class SdkInfo:
+    """The SDK doing the exporting — never the app whose spans these are.
+
+    Feeds `telemetry.sdk.*` and the instrumentation scope on the OTLP surface.
+    The app's identity (`service.name` and friends) travels separately, on
+    `EnvelopeHeader.resource`, so a host renaming its service moves nothing
+    here."""
+
     name: str  # "wardex.python"
     version: str  # SDK version, from package metadata (e.g. "0.1.0b1")
     python_version: str
@@ -437,8 +445,22 @@ class SdkInfo:
     arch: str
     adapters: tuple[str, ...] = ()
     interceptors: tuple[str, ...] = ()
-    otel_semconv_version: str = "1.36.0"  # new — the OTel semconv version reconciled against
+    # The OTel semconv release reconciled against — defaulted from the ONE
+    # constant (`_version.OTEL_SEMCONV_VERSION`), never restated as a literal.
+    otel_semconv_version: str = OTEL_SEMCONV_VERSION
     shell: str = ""  # "zsh", "bash" (static host metadata, v2 consistency #1)
+
+
+@dataclass(frozen=True, slots=True)
+class ResourceInfo:
+    """The exporting APPLICATION's identity — what the OTLP resource is built
+    from. Empty string means "not configured"; the Rust mapping owns the
+    fallback shaping (`unknown_service:<language>`), so nothing here invents a
+    name."""
+
+    service_name: str = ""  # -> service.name
+    release: str = ""  # -> service.version
+    environment: str = ""  # -> deployment.environment.name
 
 
 @dataclass(frozen=True, slots=True)
@@ -456,6 +478,9 @@ class EnvelopeHeader:
     api_key: str
     sdk: SdkInfo
     sent_at_ns: int
+    # The app's identity (service_name/release/environment). Optional so a
+    # hand-built header still encodes; the client fills it from the config.
+    resource: ResourceInfo | None = None
 
 
 @dataclass(frozen=True, slots=True)
