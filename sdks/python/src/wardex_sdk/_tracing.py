@@ -5,7 +5,7 @@ import inspect
 import time
 import uuid
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager
 from typing import TYPE_CHECKING, Any
 
 from . import _hub
@@ -432,7 +432,7 @@ def _conversation(name: str, *, id: str | None, op: OperationName | None) -> Ite
 
 def conversation(
     name: str, *, id: str | None = None, op: OperationName | None = None
-) -> Iterator[Span]:
+) -> AbstractContextManager[Span]:
     """Open a conversation: every span inside carries `gen_ai.conversation.id`.
 
     This is NOT a trace root, which is why it is not called "trace": the span
@@ -469,7 +469,7 @@ def span(
     kind: SpanKind = SpanKind.INTERNAL,
     agent: AgentAttributes | None = None,
     tool: ToolAttributes | None = None,
-) -> Iterator[Span]:
+) -> AbstractContextManager[Span]:
     """Open a hand-named span over the host's block and yield it as a `Span`."""
     return _WithOnly("span", _span(name, op, kind, agent, tool))
 

@@ -151,6 +151,7 @@ keyword name.** That family rule is frozen across SDKs.
 
 ```python
 import wardex_sdk as wardex
+from wardex_sdk import ToolAttributes
 
 # A conversation: every span inside carries gen_ai.conversation.id.
 with wardex.conversation("support-chat", id=session_id):  # id=None mints a uuid4
@@ -161,15 +162,19 @@ with wardex.span("rank-results") as s:
     s.set_attribute("candidates", 42)
     ...
 
+
 # Decorators — bare or with keywords; name defaults to the function's name:
 @wardex.workflow
 def nightly_sync(): ...
 
+
 @wardex.agent(name="researcher")
 def run_agent(): ...
 
+
 @wardex.step
 def plan(): ...
+
 
 @wardex.tool(name="search", attributes=ToolAttributes(...))
 def search(query: str): ...
@@ -190,12 +195,12 @@ functions).
 Ambient data that rides on every span captured under it:
 
 ```python
-wardex.set_tag("tenant", "acme")                      # spans carry the tag
+wardex.set_tag("tenant", "acme")  # spans carry the tag
 wardex.set_user(wardex.UserInfo(id="u1", email=...))  # spans carry user.*
-wardex.set_user(None)                                 # clears the user
-wardex.set_context("job", {"attempt": 3})             # readable back; NOT exported
+wardex.set_user(None)  # clears the user
+wardex.set_context("job", {"attempt": 3})  # readable back; NOT exported
 
-with wardex.isolation_scope():   # fork: inherits current tags/user, mutations stay inside
+with wardex.isolation_scope():  # fork: inherits current tags/user, mutations stay inside
     wardex.set_tag("tenant", "other")  # this block only
     ...
 ```
@@ -383,8 +388,10 @@ Everything wardex says about itself goes through the stdlib logger
 **`wardex_sdk`**. Out of the box it carries one pre-attached stderr handler,
 so with zero configuration you see one-line messages prefixed `[wardex] ` —
 announcements (the NoOp-transport notice, the `debug=True` config dump) at
-INFO, losses and failures (dropped spans, a failed export, a disabled parser)
-at WARNING.
+INFO, losses and failures (a span dropped over the size cap, an export cut
+off at shutdown) at WARNING. Some finer-grained lines — a disabled parser, a
+buffer-full drop count — additionally sit behind `debug=True`; the gate
+changes whether they fire, never their severity.
 
 To route diagnostics into your own logging setup, replace the handler — the
 `[wardex] ` prefix lives in wardex's own handler, so yours receives clean
@@ -395,7 +402,7 @@ import logging
 
 logger = logging.getLogger("wardex_sdk")
 logger.handlers.clear()
-logger.addHandler(my_handler)          # or logging.NullHandler() to silence
+logger.addHandler(my_handler)  # or logging.NullHandler() to silence
 ```
 
 The logger does not propagate to the root logger, so nothing double-prints
@@ -440,11 +447,12 @@ both expecting both to apply.
 from wardex_sdk.transport import UNDELIVERED, Transport, Undelivered
 from wardex_sdk import Envelope
 
+
 class MyTransport(Transport):
     def export(self, envelope: Envelope, *, timeout: float | None = None) -> Undelivered | None:
-        for body in self.encode(envelope):   # masked, capped, split OTLP bodies
-            post(body)                       # one POST per body, in order
-        return None                          # or UNDELIVERED if nothing was sent
+        for body in self.encode(envelope):  # masked, capped, split OTLP bodies
+            post(body)  # one POST per body, in order
+        return None  # or UNDELIVERED if nothing was sent
 ```
 
 The contract, in brief — `wardex_sdk.transport` is the complete implementer

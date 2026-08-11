@@ -77,18 +77,24 @@ def test_merged_trace_fields_agrees_with_the_full_merge(seed):
     assert merged_trace_fields(g, iso, cur) == (merged.active_span_context, merged.tracestate)
 
 
-def test_merged_trace_fields_ignores_contexts_it_cannot_copy():
-    """The reason it exists: `merge_scopes` deep-copies, this must not.
-
-    `set_context()` takes arbitrary host objects, and `deepcopy` raises on the
-    ones that do not copy — a lock, a socket, an open file. The two propagation
-    fields are immutable scalars and are readable regardless.
+def test_merge_and_clone_tolerate_contexts_that_cannot_deepcopy():
+    """`set_context()` takes arbitrary host objects — a lock, a socket, an
+    open file. No scope operation may `deepcopy` them: a fork or a merge must
+    neither raise on an uncopyable value nor run host `__deepcopy__`. The
+    context dicts are copied (key-level isolation), the values stay shared.
     """
+    lock = threading.Lock()
     g = Scope()
-    g.set_context("runtime", {"lock": threading.Lock()})
+    g.set_context("runtime", {"lock": lock})
     g.active_span_context = _ctx()
-    with pytest.raises(TypeError):
-        merge_scopes(g, Scope(), Scope())
+
+    forked = g.clone()
+    assert forked.contexts["runtime"]["lock"] is lock
+    forked.set_context("runtime", {"lock": "replaced"})
+    assert g.contexts["runtime"]["lock"] is lock
+
+    merged = merge_scopes(g, Scope(), Scope())
+    assert merged.contexts["runtime"]["lock"] is lock
     assert merged_trace_fields(g, Scope(), Scope()) == (g.active_span_context, None)
 
 
@@ -123,15 +129,13 @@ def test_merged_tags_and_user_agrees_with_the_full_merge(seed):
     assert user == merged.user
 
 
-def test_merged_tags_and_user_ignores_contexts_it_cannot_copy():
-    """It runs on every span capture, so it must not deepcopy host contexts —
-    the same reason `merged_trace_fields` exists."""
+def test_merged_tags_and_user_never_touches_contexts():
+    """It runs on every span capture, so it must not copy host contexts at
+    all — the same cost reason `merged_trace_fields` exists."""
     g = Scope()
     g.set_context("runtime", {"lock": threading.Lock()})
     g.set_tag("env", "prod")
     g.set_user(UserInfo(id="u"))
-    with pytest.raises(TypeError):
-        merge_scopes(g, Scope(), Scope())
     tags, user = merged_tags_and_user(g, Scope(), Scope())
     assert tags == {"env": "prod"}
     assert user == UserInfo(id="u")

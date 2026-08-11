@@ -114,7 +114,8 @@ Severity is two-valued by convention: WARNING for losses and failures (spans
 dropped, an export that failed, a parser disabled), INFO for announcements (the
 NoOp transport, the resolved-config dump). Nothing is logged at DEBUG — lines
 that exist only under `config.debug` keep that gate at the call site and emit
-at INFO when they fire, so routing never changes WHAT is said, only where.
+at the severity their content earns (a debug-gated loss is still a WARNING),
+so routing never changes WHAT is said, only where.
 """
 
 _PREFIX = "[wardex] "
