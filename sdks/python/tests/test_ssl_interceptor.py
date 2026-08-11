@@ -9,18 +9,18 @@ import pytest
 
 import wardex_sdk as wardex
 from wardex_sdk import _hub
+from wardex_sdk._assembly import Limitation
 from wardex_sdk._enums import CaptureMode, SpanKind
-from wardex_sdk.assembly import Limitation
-from wardex_sdk.interceptors._base import InterceptorInterface
-from wardex_sdk.interceptors._registry import InterceptorRegistry
-from wardex_sdk.interceptors._ssl import SSLInterceptor
+from wardex_sdk._interceptors._base import InterceptorInterface
+from wardex_sdk._interceptors._registry import InterceptorRegistry
+from wardex_sdk._interceptors._ssl import SSLInterceptor
 
 
 @pytest.fixture(autouse=True)
 def _reset():
     _hub.reset_for_test()
     yield
-    from wardex_sdk.interceptors._registry import get_registry
+    from wardex_sdk._interceptors._registry import get_registry
 
     get_registry().uninstall_all()
     _hub.reset_for_test()
@@ -205,7 +205,7 @@ def test_install_uninstall_restores_originals():
     for (cls, meth), orig in originals.items():
         assert getattr(cls, meth) is not orig
 
-    from wardex_sdk.interceptors._registry import get_registry
+    from wardex_sdk._interceptors._registry import get_registry
 
     get_registry().uninstall_all()
     # everything is restored to the original

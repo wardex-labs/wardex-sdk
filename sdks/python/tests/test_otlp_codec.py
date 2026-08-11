@@ -6,6 +6,13 @@ InternalEnvelope -> encode_otlp_traces -> decode -> field preservation.
 from __future__ import annotations
 
 from wardex_sdk import _wardex_native
+from wardex_sdk._assembly import (
+    AMBIENT,
+    Ambient,
+    SpanDraft,
+    SpanIntent,
+    resolve_parentage,
+)
 from wardex_sdk._enums import (
     CaptureSource,
     Direction,
@@ -29,13 +36,6 @@ from wardex_sdk._types import (
     TraceId,
     TransportAttributes,
     TransportTiming,
-)
-from wardex_sdk.assembly import (
-    AMBIENT,
-    Ambient,
-    SpanDraft,
-    SpanIntent,
-    resolve_parentage,
 )
 
 
@@ -373,9 +373,9 @@ def test_state_snapshot_skipped():
 
 
 def _envelope_with_uncertainty() -> InternalEnvelope:
+    from wardex_sdk._assembly import Limitation
+    from wardex_sdk._assembly._parentage import ParentSource
     from wardex_sdk._types import CaptureIntegrity, CorrelationInfo
-    from wardex_sdk.assembly import Limitation
-    from wardex_sdk.assembly._parentage import ParentSource
 
     return InternalEnvelope(
         header=_header(),

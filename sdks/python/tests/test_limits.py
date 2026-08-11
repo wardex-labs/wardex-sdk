@@ -7,9 +7,9 @@ import tracemalloc
 
 import pytest
 
-from wardex_sdk import CaptureLimits, WardexConfig, _wardex_native
-from wardex_sdk._config import BackendConfig
-from wardex_sdk.assembly import Limitation
+from wardex_sdk import CaptureLimits, _wardex_native
+from wardex_sdk._assembly import Limitation
+from wardex_sdk._config import BackendConfig, WardexConfig
 
 
 def test_limits_defaults_returns_every_field():
@@ -115,7 +115,7 @@ def test_body_cap_reaches_the_parser_end_to_end():
 
     wardex_sdk.init(limits=CaptureLimits(max_headers=1))
     try:
-        from wardex_sdk.interceptors._trackers import _Http1Tracker
+        from wardex_sdk._interceptors._trackers import _Http1Tracker
 
         client = _hub.get_client()
         assert client is not None
@@ -148,7 +148,7 @@ def test_http1_tracker_reports_disabled_reason_from_either_direction():
     request or the response parser — whichever direction actually saw the
     non-HTTP traffic.
     """
-    from wardex_sdk.interceptors._trackers import _Http1Tracker
+    from wardex_sdk._interceptors._trackers import _Http1Tracker
 
     t = _Http1Tracker()
     assert t.disabled_reason() is None
@@ -168,11 +168,11 @@ def test_python_side_fallback_defaults_match_core():
     because it compares the *effective* default against the core, not against
     another Python literal.
     """
-    from wardex_sdk.adapters._assembler import SessionAssembler
-    from wardex_sdk.assembly import UnitRegistry
-    from wardex_sdk.interceptors._conn_timing import ConnTimingStore
-    from wardex_sdk.interceptors._mcp_stdio import _ProcState
-    from wardex_sdk.interceptors._trackers import _Http2Tracker, _WebSocketTracker
+    from wardex_sdk._adapters._assembler import SessionAssembler
+    from wardex_sdk._assembly import UnitRegistry
+    from wardex_sdk._interceptors._conn_timing import ConnTimingStore
+    from wardex_sdk._interceptors._mcp_stdio import _ProcState
+    from wardex_sdk._interceptors._trackers import _Http2Tracker, _WebSocketTracker
 
     core = _wardex_native.limits_defaults()
 
@@ -281,7 +281,7 @@ def test_max_connections_reaches_the_seam():
     """
     import wardex_sdk
     from wardex_sdk import _hub
-    from wardex_sdk.interceptors._ssl import SSLInterceptor
+    from wardex_sdk._interceptors._ssl import SSLInterceptor
 
     wardex_sdk.init(limits=CaptureLimits(max_connections=1))
     try:
@@ -492,7 +492,7 @@ def _drive_seam(limits: CaptureLimits, request: bytes, response: bytes, host: st
     """Feed one HTTP/1 exchange through the real TLS byte seam, loading limits
     exactly as SSLInterceptor.install() does, and return the emitted span."""
     from conftest import _FakeSSLSocket
-    from wardex_sdk.interceptors._ssl import SSLInterceptor
+    from wardex_sdk._interceptors._ssl import SSLInterceptor
 
     client = _StubClient(limits)
     itc = SSLInterceptor()
@@ -570,7 +570,7 @@ def _probe_max_streams() -> bool:
 
 
 def _probe_max_ws_frame_bytes() -> bool:
-    from wardex_sdk.protocol import WsParser
+    from wardex_sdk._protocol import WsParser
 
     frame = _ws_text_frame(b"x" * 300)
     tight, loose = WsParser(_native(max_ws_frame_bytes=8)), WsParser(None)
@@ -580,7 +580,7 @@ def _probe_max_ws_frame_bytes() -> bool:
 
 
 def _probe_ws_sample_bytes() -> bool:
-    from wardex_sdk.protocol import WsParser
+    from wardex_sdk._protocol import WsParser
 
     frame = _ws_text_frame(b"x" * 300)
     tight = WsParser(_native(ws_sample_bytes=8)).feed(frame)
@@ -589,7 +589,7 @@ def _probe_ws_sample_bytes() -> bool:
 
 
 def _probe_max_connections() -> bool:
-    from wardex_sdk.interceptors._ssl import SSLInterceptor
+    from wardex_sdk._interceptors._ssl import SSLInterceptor
 
     class _FakeSock:
         def selected_alpn_protocol(self) -> str | None:
@@ -602,7 +602,7 @@ def _probe_max_connections() -> bool:
         itc = SSLInterceptor()
         itc._limits = limits.resolved()
         # Bound to a name, and it has to be: the seam evicts a connection's
-        # state when its socket DIES (interceptors/_close_hook.py), so a
+        # state when its socket DIES (_interceptors/_close_hook.py), so a
         # throwaway list comprehension would be collected the moment the loop
         # ended and this would count zero live connections under every cap.
         socks = [_FakeSock() for _ in range(4)]
@@ -625,7 +625,7 @@ class _RecordingClient:
 
 def _assembler(limits: CaptureLimits):
     """Built exactly the way the Agent SDK adapter builds it at install time."""
-    from wardex_sdk.adapters._assembler import SessionAssembler
+    from wardex_sdk._adapters._assembler import SessionAssembler
 
     resolved = limits.resolved()
     return SessionAssembler(
@@ -653,7 +653,7 @@ def _unit_registry(limits: CaptureLimits, sink: _DraftSink):
     in is that this probe then fails if the field stops being mirrored, not only
     if the registry stops reading it.
     """
-    from wardex_sdk.assembly import UnitRegistry
+    from wardex_sdk._assembly import UnitRegistry
 
     resolved = limits.resolved()
     return UnitRegistry(
@@ -664,8 +664,8 @@ def _unit_registry(limits: CaptureLimits, sink: _DraftSink):
 
 
 def _open_unit(reg, key: str, parent=None):
+    from wardex_sdk._assembly import EMPTY_AMBIENT, SpanIntent, UnitKey, UnitKind
     from wardex_sdk._types import AgentAttributes
-    from wardex_sdk.assembly import EMPTY_AMBIENT, SpanIntent, UnitKey, UnitKind
 
     unit = reg.open(
         UnitKind.SESSION if parent is None else UnitKind.AGENT,
@@ -749,7 +749,7 @@ def _probe_max_session_entries() -> bool:
 
 
 def _probe_mcp_sniff_bytes() -> bool:
-    from wardex_sdk.interceptors._mcp_stdio import _ProcState
+    from wardex_sdk._interceptors._mcp_stdio import _ProcState
 
     def detaches(sniff_limit: int) -> bool:
         state = _ProcState(sniff_limit)
@@ -1036,8 +1036,8 @@ def test_a_configured_bound_reaches_the_registry_the_adapter_actually_uses():
     core defaults, which stayed true while the registry underneath it quietly
     stopped listening.
     """
+    from wardex_sdk._adapters._registry import context_for
     from wardex_sdk._config import WardexConfig
-    from wardex_sdk.adapters._registry import context_for
 
     class _Client:
         config = WardexConfig(

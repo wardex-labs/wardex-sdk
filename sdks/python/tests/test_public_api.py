@@ -69,34 +69,22 @@ def test_capture_state_snapshot_with_input_refs():
     wardex_sdk.close()
 
 
-def test_interceptors_still_exports_ssl_interceptor_lazily(monkeypatch):
-    """The public name survived the eager import going away, and stayed lazy.
+def test_the_interceptor_package_no_longer_re_exports_the_seams():
+    """The privatized package's surface is the composition root's entry point.
 
-    `wardex_sdk.interceptors` has no leading underscore and has carried this
-    name on its `__all__` since the seam existed, so dropping it would break a
-    pinned caller's import in a refactor. Both halves are asserted because the
-    reason the eager import went is that it dragged `_ssl` — and the native
-    extension under it — into every import of this package, including the
-    teardown paths that exist to work without one: the name resolves, and it
-    still is not in the module dict afterwards, so nothing was bound at import.
+    The lazy `SSLInterceptor` re-export existed to keep a PUBLIC spelling
+    (`from wardex_sdk.interceptors import SSLInterceptor`) alive without
+    dragging the TLS seam into every import of the package. The package is
+    `wardex_sdk._interceptors` now, so there is no public spelling left to
+    keep, and the class is reached through its defining module — which is what
+    the isolation suite's substitution needed from the lazy hook anyway. The
+    resolution is asserted, not just the `__all__` line: a PEP 562 hook left
+    behind would keep the old surface reachable while claiming it is gone.
     """
-    from wardex_sdk import interceptors
-    from wardex_sdk.interceptors import _ssl
+    from wardex_sdk import _interceptors
 
-    assert "SSLInterceptor" in interceptors.__all__
-    assert interceptors.SSLInterceptor is _ssl.SSLInterceptor
-    assert "SSLInterceptor" not in vars(interceptors)
-
-    # Resolved through the MODULE on every access, which is what the isolation
-    # suite's substitution needs: a name bound at import time would hand back
-    # the real seam and measure nothing.
-    sentinel = object()
-    monkeypatch.setattr(_ssl, "SSLInterceptor", sentinel)
-    assert interceptors.SSLInterceptor is sentinel
-
-
-def test_interceptors_rejects_an_unknown_attribute():
-    from wardex_sdk import interceptors
-
-    with pytest.raises(AttributeError, match="Nope"):
-        _ = interceptors.Nope
+    assert _interceptors.__all__ == ["install_configured_interceptors"]
+    with pytest.raises(AttributeError):
+        _ = _interceptors.SSLInterceptor
+    with pytest.raises(AttributeError):
+        _ = _interceptors.InterceptorRegistry

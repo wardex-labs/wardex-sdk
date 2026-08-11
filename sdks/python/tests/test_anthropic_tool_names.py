@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import pytest
 
-from wardex_sdk.adapters._anthropic_names import (
+from wardex_sdk._adapters._anthropic_names import (
     McpToolCatalog,
     builtin_tool_key,
     mcp_tool_key,
@@ -216,7 +216,7 @@ def test_two_wrapped_servers_that_both_explain_one_string_refuse_to_guess():
     span, so None arrives at the same place. Guessing would not be symmetric with
     it — the loser's handler would face a rival observer holding its own key.
     """
-    from wardex_sdk.assembly import counters
+    from wardex_sdk._assembly import counters
 
     catalog, _ = _catalog(("a", ("b__greet",)), ("a__b", ("greet",)))
     before = counters.get("adapters.anthropic.hook_tool_name_ambiguous")
@@ -261,7 +261,7 @@ def test_a_shared_bare_name_is_not_dropped_while_the_prefix_is_on(monkeypatch):
     prefixes there is no ambiguity to find, so there is nothing to stand down from
     and nothing to count.
     """
-    from wardex_sdk.assembly import counters
+    from wardex_sdk._assembly import counters
 
     monkeypatch.delenv("CLAUDE_AGENT_SDK_MCP_NO_PREFIX", raising=False)
     catalog, _ = _catalog(("alpha", ("Read",)), ("beta", ("Read",)))
@@ -352,7 +352,7 @@ def test_the_server_table_is_bounded_and_drops_the_oldest():
     span: the tool falls back to the builtin key space, where at worst one call
     is observed twice.
     """
-    from wardex_sdk.assembly import counters
+    from wardex_sdk._assembly import counters
 
     counters.reset()
     catalog = McpToolCatalog(max_entries=2)

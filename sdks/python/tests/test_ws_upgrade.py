@@ -1,4 +1,4 @@
-from wardex_sdk.interceptors._trackers import _Http1Tracker
+from wardex_sdk._interceptors._trackers import _Http1Tracker
 
 
 def test_detects_websocket_upgrade_with_leftover():

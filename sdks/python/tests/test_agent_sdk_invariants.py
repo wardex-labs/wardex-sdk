@@ -11,7 +11,7 @@ from test_agent_sdk_adapter_install import (
     RESULT_LINE,
     FakeTransport,
 )
-from wardex_sdk.adapters._anthropic_agent_sdk import AnthropicAgentSdkAdapter
+from wardex_sdk._adapters._anthropic_agent_sdk import AnthropicAgentSdkAdapter
 
 
 class FakeClient:
@@ -38,7 +38,7 @@ def test_parser_exception_does_not_break_user_stream():
     adapter.install(FakeClient())
     try:
         with mock.patch(
-            "wardex_sdk.adapters._assembler.parse_line",
+            "wardex_sdk._adapters._assembler.parse_line",
             side_effect=RuntimeError("boom"),
         ):
             received = _collect([INIT_LINE, ASSISTANT_LINE, RESULT_LINE])
@@ -51,7 +51,7 @@ def test_hook_callback_exception_returns_empty_output():
     adapter = AnthropicAgentSdkAdapter()
     adapter.install(FakeClient())
     try:
-        from wardex_sdk.adapters._anthropic_agent_sdk import _make_hook
+        from wardex_sdk._adapters._anthropic_agent_sdk import _make_hook
 
         hook = _make_hook(adapter, "PreToolUse")
         with mock.patch.object(adapter, "_on_hook", side_effect=RuntimeError("boom")):

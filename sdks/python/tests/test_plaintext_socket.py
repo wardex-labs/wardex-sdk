@@ -11,8 +11,8 @@ import threading
 import wardex_sdk as wardex
 from wardex_sdk import ConsoleTransport, _hub
 from wardex_sdk._enums import CaptureSource, SpanKind
-from wardex_sdk.interceptors._seam import _ConnectionState
-from wardex_sdk.interceptors._socket import RawSocketInterceptor
+from wardex_sdk._interceptors._seam import _ConnectionState
+from wardex_sdk._interceptors._socket import RawSocketInterceptor
 
 # The four `socket.socket` methods this seam patches. All four are INHERITED
 # from the C base `_socket.socket` — `socket.socket` does not define them — and

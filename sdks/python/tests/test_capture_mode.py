@@ -8,9 +8,9 @@ from wardex_sdk import _hub
 from wardex_sdk._client import Client
 from wardex_sdk._config import BackendConfig, WardexConfig
 from wardex_sdk._enums import CaptureMode
+from wardex_sdk._interceptors import _seam
+from wardex_sdk._interceptors._seam import ByteSeamInterceptor
 from wardex_sdk._types import InternalEnvelope, SpanContext, SpanId, TraceId
-from wardex_sdk.interceptors import _seam
-from wardex_sdk.interceptors._seam import ByteSeamInterceptor
 from wardex_sdk.transport._base import Transport
 
 

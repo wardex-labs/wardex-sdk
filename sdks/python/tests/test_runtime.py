@@ -18,12 +18,12 @@ import pytest
 
 import wardex_sdk as wardex
 from wardex_sdk import _hub, _runtime
+from wardex_sdk._adapters._base import AdapterInterface
+from wardex_sdk._assembly import Limitation
 from wardex_sdk._client import Client
 from wardex_sdk._config import BackendConfig, BatchingPolicy, PropagationPolicy, WardexConfig
 from wardex_sdk._enums import SpanKind
 from wardex_sdk._types import InternalEnvelope, InternalSpan, SpanContext, SpanId, TraceId
-from wardex_sdk.adapters._base import AdapterInterface
-from wardex_sdk.assembly import Limitation
 from wardex_sdk.transport._base import Transport
 
 _SIGNALS = (signal.SIGINT, signal.SIGTERM)
@@ -55,7 +55,7 @@ def _client(transport: Transport | None = None, **cfg: object) -> Client:
 
 
 def _ssl_seam():
-    from wardex_sdk.interceptors._ssl import SSLInterceptor
+    from wardex_sdk._interceptors._ssl import SSLInterceptor
 
     return SSLInterceptor()
 
@@ -109,9 +109,9 @@ def test_reset_for_test_empties_every_state_the_runtime_owns():
     "is it clean" helper, because the failure this replaces was precisely that
     four of the five had nobody asking.
     """
-    from wardex_sdk.adapters._registry import get_registry as adapter_registry
-    from wardex_sdk.interceptors import _conn_timing
-    from wardex_sdk.interceptors._registry import get_registry as interceptor_registry
+    from wardex_sdk._adapters._registry import get_registry as adapter_registry
+    from wardex_sdk._interceptors import _conn_timing
+    from wardex_sdk._interceptors._registry import get_registry as interceptor_registry
 
     runtime = _runtime.runtime()
     client = _client(batching=BatchingPolicy(flush_interval=3600.0))

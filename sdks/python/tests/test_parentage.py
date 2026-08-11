@@ -16,8 +16,7 @@ from uuid import uuid4
 import pytest
 
 from wardex_sdk import _hub
-from wardex_sdk._types import ConversationContext, SpanContext, SpanId, TraceId
-from wardex_sdk.assembly import (
+from wardex_sdk._assembly import (
     AMBIENT,
     EMPTY_AMBIENT,
     Ambient,
@@ -30,8 +29,9 @@ from wardex_sdk.assembly import (
     latch_ambient,
     resolve_parentage,
 )
-from wardex_sdk.assembly._diag import LOG_FAILED
-from wardex_sdk.assembly._parentage import _CONFIDENCE, _MARKER
+from wardex_sdk._assembly._diag import LOG_FAILED
+from wardex_sdk._assembly._parentage import _CONFIDENCE, _MARKER
+from wardex_sdk._types import ConversationContext, SpanContext, SpanId, TraceId
 
 
 def setup_function():

@@ -24,10 +24,10 @@ direction.
 
 The guarantee, stated so nobody has to infer its edges: with the extension
 unimportable, `import wardex_sdk` and every symbol on its `__all__` work (as
-no-ops), and `wardex_sdk.transport`, `.context`, `.assembly`, `.adapters`,
-`.interceptors` and `.pipeline` import; `wardex_sdk.protocol`, `.semantics`,
-`transport._codec` and three `adapters/` modules still raise `ImportError`,
-because they reach the core at import time. `.interceptors` moved across that
+no-ops), and `wardex_sdk.transport`, `.context`, `._assembly`, `._adapters`
+and `._interceptors` import; `wardex_sdk._protocol`, `._semantics`,
+`transport._codec` and three `_adapters/` modules still raise `ImportError`,
+because they reach the core at import time. `._interceptors` moved across that
 line when its package `__init__` stopped importing the TLS seam eagerly: every
 seam is built inside its factory now, so importing the package no longer drags
 `_ssl` -- and the core underneath it -- along. That is a boundary and not a gap: each

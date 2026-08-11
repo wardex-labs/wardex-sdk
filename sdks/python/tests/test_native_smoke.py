@@ -104,6 +104,6 @@ def test_jsonrpc_parser_request_and_response():
 
 
 def test_jsonrpc_parser_exposed_in_protocol_pkg():
-    from wardex_sdk.protocol import JsonRpcParser
+    from wardex_sdk._protocol import JsonRpcParser
 
     assert JsonRpcParser().feed(b"") == []

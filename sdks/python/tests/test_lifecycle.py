@@ -9,13 +9,13 @@ import pytest
 
 import wardex_sdk as wardex
 from wardex_sdk import _hub, _runtime
+from wardex_sdk._adapters._base import AdapterInterface
+from wardex_sdk._adapters._registry import get_registry as get_adapter_registry
+from wardex_sdk._assembly import Limitation
 from wardex_sdk._client import Client
 from wardex_sdk._config import BackendConfig, BatchingPolicy, WardexConfig
 from wardex_sdk._enums import SpanKind
 from wardex_sdk._types import InternalEnvelope, InternalSpan, SpanContext, SpanId, TraceId
-from wardex_sdk.adapters._base import AdapterInterface
-from wardex_sdk.adapters._registry import get_registry as get_adapter_registry
-from wardex_sdk.assembly import Limitation
 from wardex_sdk.transport._base import Transport
 
 
@@ -265,8 +265,8 @@ def test_reinit_uninstalls_interceptors_before_closing_previous_client():
     uninstall() flushes via capture_span (e.g. a pending WS session) is lost
     because the client already rejects captures (I3).
     """
-    from wardex_sdk.interceptors._base import InterceptorInterface
-    from wardex_sdk.interceptors._registry import get_registry
+    from wardex_sdk._interceptors._base import InterceptorInterface
+    from wardex_sdk._interceptors._registry import get_registry
 
     class _FakeInterceptor(InterceptorInterface):
         """Minimal interceptor matching the registry's expected interface."""
@@ -312,8 +312,8 @@ def test_reinit_uninstalls_adapters_before_closing_previous_client():
     the closed client, and since AdapterRegistry.install() is idempotent by
     name, the next init() silently no-ops for that adapter.
     """
-    from wardex_sdk.adapters._base import AdapterInterface
-    from wardex_sdk.adapters._registry import get_registry
+    from wardex_sdk._adapters._base import AdapterInterface
+    from wardex_sdk._adapters._registry import get_registry
 
     class _FakeAdapter(AdapterInterface):
         def __init__(self) -> None:
@@ -385,7 +385,7 @@ class _UnitAdapter(AdapterInterface):
     """An adapter holding one live session, on the real assembler."""
 
     def __init__(self, client):
-        from wardex_sdk.adapters._assembler import SessionAssembler
+        from wardex_sdk._adapters._assembler import SessionAssembler
 
         self._asm = SessionAssembler(client)
         self.close_units_calls: list = []

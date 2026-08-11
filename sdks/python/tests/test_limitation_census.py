@@ -1,6 +1,6 @@
 """Limitation vocabulary census — design §6.5.1, and the reason the enum is complete.
 
-`assembly/_integrity.Limitation` is a CLOSED vocabulary, and every span-emit
+`_assembly/_integrity.Limitation` is a CLOSED vocabulary, and every span-emit
 site runs under `SpanDraft.finish()`, which raises `VocabularyError` on a
 marker that is not a member of it — an exception `SpanSink.guard()` swallows.
 A marker string that exists in the emitters and not in the enum therefore does
@@ -53,7 +53,7 @@ import re
 
 import pytest
 
-from wardex_sdk.assembly import Limitation
+from wardex_sdk._assembly import Limitation
 
 _REPO = pathlib.Path(__file__).resolve().parents[3]
 _SRC = pathlib.Path(__file__).resolve().parents[1] / "src" / "wardex_sdk"
@@ -87,7 +87,7 @@ _CENSUS_RUST: dict[str, frozenset[str]] = {
 
 `crates/wardex-protocol` builds markers into `Vec<&'static str>`, they cross the
 PyO3 boundary in `bindings/python/src/lib.rs`, are read back in
-`protocol/_http1.py`, and are merged into the span's markers by the byte seam.
+`_protocol/_http1.py`, and are merged into the span's markers by the byte seam.
 They are invisible to any Python-only scan, which is why the Rust half of this
 file exists.
 """
@@ -152,7 +152,7 @@ keeps the list from quietly absorbing the first kind.
 """
 
 _MEMBER_SITES: dict[str, frozenset[str]] = {
-    # --- assembly/ itself ---
+    # --- _assembly/ itself ---
     # `_parentage.py` attaches these two from its `_MARKER` table, which fires
     # for the source; `_units.py` attaches them again from `resolve()`, which is
     # the only place that CHOOSES a heuristic source in the first place. Two
@@ -172,25 +172,25 @@ _MEMBER_SITES: dict[str, frozenset[str]] = {
     # ADAPTER_UNINSTALLED below.
     "PARENT_UNRESOLVED": frozenset(
         {
-            "assembly/_parentage.py",
-            "assembly/_units.py",
+            "_assembly/_parentage.py",
+            "_assembly/_units.py",
             "testing/conformance.py",
         }
     ),
     "UNIT_INFERRED_SOLE": frozenset(
         {
-            "assembly/_parentage.py",
-            "assembly/_units.py",
+            "_assembly/_parentage.py",
+            "_assembly/_units.py",
             "testing/conformance.py",
         }
     ),
     # The two §5.4 markers, both on the in-process tool span: the handler is
     # never told the tool_use_id, and the two observers' key spaces can be split
     # or ambiguous in two narrow, detectable configurations.
-    "TOOL_CALL_ID_UNAVAILABLE_IN_PROCESS": frozenset({"adapters/_anthropic_agent_sdk.py"}),
-    "TOOL_NAME_COLLISION": frozenset({"adapters/_anthropic_agent_sdk.py"}),
-    "SNAPSHOT_TYPE_UNKNOWN": frozenset({"assembly/_snapshot.py"}),
-    "PATCH_SUPERSEDED": frozenset({"assembly/_patchset.py"}),
+    "TOOL_CALL_ID_UNAVAILABLE_IN_PROCESS": frozenset({"_adapters/_anthropic_agent_sdk.py"}),
+    "TOOL_NAME_COLLISION": frozenset({"_adapters/_anthropic_agent_sdk.py"}),
+    "SNAPSHOT_TYPE_UNKNOWN": frozenset({"_assembly/_snapshot.py"}),
+    "PATCH_SUPERSEDED": frozenset({"_assembly/_patchset.py"}),
     # `resolve()` records an alias and a live context disagreeing about
     # the trace, `pin_driver()` records a pin declared for a task other than the
     # one calling it, and `open()`/`resolve()` record the scope a CLOSED pin
@@ -207,53 +207,53 @@ _MEMBER_SITES: dict[str, frozenset[str]] = {
     # it is not an editable place to record any of this.
     "CORRELATION_CONFLICT": frozenset(
         {
-            "adapters/_context.py",
-            "assembly/_units.py",
+            "_adapters/_context.py",
+            "_assembly/_units.py",
             # A second `system/init` naming a different run on a transport key
             # this table still holds live: two agent runs sharing one root.
-            "adapters/_assembler.py",
+            "_adapters/_assembler.py",
             # `_EDGE_MARKERS` again — see PARENT_UNRESOLVED above.
             "testing/conformance.py",
         }
     ),
     # --- transport timing ---
-    "CONNECT_TIMING_UNAVAILABLE": frozenset({"interceptors/_socket.py", "interceptors/_ssl.py"}),
-    "TTFT_UNAVAILABLE_H2": frozenset({"interceptors/_seam.py"}),
-    "TTFT_IPC_APPROXIMATION": frozenset({"adapters/_assembler.py"}),
-    "TRANSPORT_TIMING_UNAVAILABLE_SUBPROCESS": frozenset({"adapters/_assembler.py"}),
+    "CONNECT_TIMING_UNAVAILABLE": frozenset({"_interceptors/_socket.py", "_interceptors/_ssl.py"}),
+    "TTFT_UNAVAILABLE_H2": frozenset({"_interceptors/_seam.py"}),
+    "TTFT_IPC_APPROXIMATION": frozenset({"_adapters/_assembler.py"}),
+    "TRANSPORT_TIMING_UNAVAILABLE_SUBPROCESS": frozenset({"_adapters/_assembler.py"}),
     # --- caps ---
-    "GRPC_MESSAGE_TRUNCATED": frozenset({"semantics/_grpc.py"}),
-    "WS_PAYLOAD_TRUNCATED": frozenset({"interceptors/_seam.py", "interceptors/_trackers.py"}),
-    "CONNECTION_EVICTED": frozenset({"interceptors/_seam.py"}),
+    "GRPC_MESSAGE_TRUNCATED": frozenset({"_semantics/_grpc.py"}),
+    "WS_PAYLOAD_TRUNCATED": frozenset({"_interceptors/_seam.py", "_interceptors/_trackers.py"}),
+    "CONNECTION_EVICTED": frozenset({"_interceptors/_seam.py"}),
     # --- parsing / interpretation ---
     "FRAME_PARSE_FAILED": frozenset(
-        {"interceptors/_seam.py", "interceptors/_trackers.py", "semantics/_grpc.py"}
+        {"_interceptors/_seam.py", "_interceptors/_trackers.py", "_semantics/_grpc.py"}
     ),
-    "SEMANTIC_PARSE_FAILED": frozenset({"interceptors/_seam.py"}),
-    "PAYLOAD_COMPRESSED": frozenset({"interceptors/_trackers.py", "semantics/_grpc.py"}),
-    "TOOL_ARGS_UNPARSED": frozenset({"interceptors/_seam.py"}),
-    "OUTPUT_MESSAGES_UNMAPPED_PART": frozenset({"interceptors/_seam.py"}),
-    "INPUT_MESSAGES_UNMAPPED_PART": frozenset({"interceptors/_seam.py"}),
+    "SEMANTIC_PARSE_FAILED": frozenset({"_interceptors/_seam.py"}),
+    "PAYLOAD_COMPRESSED": frozenset({"_interceptors/_trackers.py", "_semantics/_grpc.py"}),
+    "TOOL_ARGS_UNPARSED": frozenset({"_interceptors/_seam.py"}),
+    "OUTPUT_MESSAGES_UNMAPPED_PART": frozenset({"_interceptors/_seam.py"}),
+    "INPUT_MESSAGES_UNMAPPED_PART": frozenset({"_interceptors/_seam.py"}),
     # --- streaming ---
-    "REASSEMBLED_FROM_STREAM": frozenset({"interceptors/_seam.py"}),
-    "STREAM_USAGE_UNAVAILABLE": frozenset({"interceptors/_seam.py"}),
-    "SSE_UNKNOWN_PROVIDER": frozenset({"interceptors/_seam.py"}),
+    "REASSEMBLED_FROM_STREAM": frozenset({"_interceptors/_seam.py"}),
+    "STREAM_USAGE_UNAVAILABLE": frozenset({"_interceptors/_seam.py"}),
+    "SSE_UNKNOWN_PROVIDER": frozenset({"_interceptors/_seam.py"}),
     # --- protocol-specific ---
-    "GRPC_WEB_UNSUPPORTED": frozenset({"interceptors/_seam.py"}),
-    "GRPC_STATUS_UNAVAILABLE": frozenset({"semantics/_grpc.py"}),
+    "GRPC_WEB_UNSUPPORTED": frozenset({"_interceptors/_seam.py"}),
+    "GRPC_STATUS_UNAVAILABLE": frozenset({"_semantics/_grpc.py"}),
     # One site, not two: both byte seams flushed their open WS sessions with the
     # same six lines, and the copy is what let one of them keep a stale
     # installed-flag gate on the uninstall the other had outgrown.
-    "WS_NO_CLOSE": frozenset({"interceptors/_seam.py"}),
+    "WS_NO_CLOSE": frozenset({"_interceptors/_seam.py"}),
     # --- unit / adapter lifecycle ---
-    "CHILD_SPAN_UNCLOSED": frozenset({"adapters/_assembler.py", "assembly/_units.py"}),
+    "CHILD_SPAN_UNCLOSED": frozenset({"_adapters/_assembler.py", "_assembly/_units.py"}),
     # Two emitters, one per bound that can evict a session: the registry closes
     # the oldest ROOT unit at `max_units`, and the
     # assembler closes the oldest SESSION at `max_sessions`. Both EMIT the root
     # span carrying this marker; the code they replace dropped the session and
     # its root with no marker and no test, which is the silent drop I10 forbids.
-    "UNIT_EVICTED": frozenset({"adapters/_assembler.py", "assembly/_units.py"}),
-    "SESSION_ABORTED": frozenset({"adapters/_assembler.py"}),
+    "UNIT_EVICTED": frozenset({"_adapters/_assembler.py", "_assembly/_units.py"}),
+    "SESSION_ABORTED": frozenset({"_adapters/_assembler.py"}),
     # The two shutdown markers, and the split between them is which shutdown
     # actually happened rather than which code path ran. The adapter's
     # `uninstall()` names ADAPTER_UNINSTALLED, and it is what an ordinary exit
@@ -275,17 +275,17 @@ _MEMBER_SITES: dict[str, frozenset[str]] = {
     # teardowns above it.
     "ADAPTER_UNINSTALLED": frozenset(
         {
-            "adapters/_anthropic_agent_sdk.py",
-            "adapters/_langgraph.py",
+            "_adapters/_anthropic_agent_sdk.py",
+            "_adapters/_langgraph.py",
             "testing/conformance.py",
         }
     ),
     "UNIT_INTERRUPTED": frozenset({"_runtime.py", "testing/conformance.py"}),
     # Two sites, and they are the two halves of one fact: where wardex failed,
-    # and where the consequence lands. `adapters/_context.py` knows it failed —
+    # and where the consequence lands. `_adapters/_context.py` knows it failed —
     # `_abandon` marks a unit whose open or description died, `_run` marks one
     # whose activation died, `_degrade` marks the enclosing unit when the span
-    # itself will not ship. `assembly/_parentage.py::resolve_observed` marks a
+    # itself will not ship. `_assembly/_parentage.py::resolve_observed` marks a
     # span BELOW such a failure: a byte seam's transaction that reached the wire
     # inside a block whose run entry never opened. Neither can see the other's
     # span — that is the point of the second site, not an oversight — because
@@ -293,8 +293,8 @@ _MEMBER_SITES: dict[str, frozenset[str]] = {
     # layers away with nothing in common but the task.
     "INSTRUMENTATION_DEGRADED": frozenset(
         {
-            "adapters/_context.py",
-            "assembly/_parentage.py",
+            "_adapters/_context.py",
+            "_assembly/_parentage.py",
             # `_EDGE_MARKERS` again — see PARENT_UNRESOLVED above.
             "testing/conformance.py",
         }
@@ -319,7 +319,7 @@ exceptions that are the census's merges landing:
     shared `_ssl.py` with it, so the file set is unchanged.
 
 Extracting the gRPC semantics moved four sites without changing a line of their
-logic: `build_grpc_fields` left `interceptors/_seam.py` for `semantics/_grpc.py`, so
+logic: `build_grpc_fields` left `_interceptors/_seam.py` for `_semantics/_grpc.py`, so
 `GRPC_MESSAGE_TRUNCATED`, `GRPC_STATUS_UNAVAILABLE` and `PAYLOAD_COMPRESSED`
 moved with it. `FRAME_PARSE_FAILED` GAINED that file rather than moving,
 because the seam still names the member — `if Limitation.FRAME_PARSE_FAILED not
@@ -337,8 +337,8 @@ adapter each name it at the tier that CHOSE `ParentSource.UNIT_SOLE` and
 
 `BODY_CAP_EXCEEDED` is absent for a different reason: it is produced in Rust and
 crosses the PyO3 boundary as a string, so `_CENSUS_RUST` is where it is
-recorded. `protocol/_http1.py` resolves it with `Limitation.from_wire` — the one
-string-to-member crossing left — and `interceptors/_seam.py` copies the
+recorded. `_protocol/_http1.py` resolves it with `Limitation.from_wire` — the one
+string-to-member crossing left — and `_interceptors/_seam.py` copies the
 resulting member onto the span. Neither spells a member out, so neither appears
 here, and correctly so.
 """
@@ -470,7 +470,7 @@ _EMITTED_MEMBERS: frozenset[str] = frozenset(
         # moving from "declared" to "emitted" — as opposed to rewiring a site,
         # which never changes it.
         "SNAPSHOT_TYPE_UNKNOWN",
-        # pre-census declared, whose emitter was BUILT by `assembly/_patchset.py`:
+        # pre-census declared, whose emitter was BUILT by `_assembly/_patchset.py`:
         # the SDK's one patch mechanism, whose identity-checked restore is the
         # first code able to observe that something else re-patched a symbol
         # wardex had patched. The second member to move from "declared" to
@@ -522,7 +522,7 @@ _EMITTED_MEMBERS: frozenset[str] = frozenset(
         # The ninth, and the only member declared and emitted one commit apart —
         # deliberately, because the commit that declared it said so in its own
         # docstring rather than leaving the gap to be discovered here. Its
-        # emitter is `adapters/_context.py`, which is the only module that
+        # emitter is `_adapters/_context.py`, which is the only module that
         # learns wardex's own work failed: a unit whose open or description
         # died, one whose activation died, and the enclosing unit when the span
         # itself will not ship. The one member whose subject is wardex.
@@ -1010,13 +1010,13 @@ _UNRESOLVED_PY: frozenset[tuple[str, str]] = frozenset(
         # because a marker container goes in. Its other arguments land here.
         # None of them can hold a marker string — they are a session, a tool
         # record, a timestamp, a bool and an `error.type`.
-        ("adapters/_assembler.py", "Name:end_ns"),
-        ("adapters/_assembler.py", "Name:error_type"),
-        ("adapters/_assembler.py", "Name:failed"),
-        ("adapters/_assembler.py", "Name:marker"),
-        ("adapters/_assembler.py", "Name:markers"),
-        ("adapters/_assembler.py", "Name:sess"),
-        ("adapters/_assembler.py", "Name:tool"),
+        ("_adapters/_assembler.py", "Name:end_ns"),
+        ("_adapters/_assembler.py", "Name:error_type"),
+        ("_adapters/_assembler.py", "Name:failed"),
+        ("_adapters/_assembler.py", "Name:marker"),
+        ("_adapters/_assembler.py", "Name:markers"),
+        ("_adapters/_assembler.py", "Name:sess"),
+        ("_adapters/_assembler.py", "Name:tool"),
         # `_emit_tool(..., markers: tuple[Limitation, ...] = ())` — the DEFAULT,
         # newly visible now that marker-ish parameters have theirs read. The
         # tuple is empty and so demonstrably holds no marker, but slots are
@@ -1025,7 +1025,7 @@ _UNRESOLVED_PY: frozenset[tuple[str, str]] = frozenset(
         # a member in it. Recorded rather than special-cased, which is the
         # conservative direction: a spurious hole is noise, a missing one is a
         # marker nothing in this file can see.
-        ("adapters/_assembler.py", "Tuple"),
+        ("_adapters/_assembler.py", "Tuple"),
         # every one below is a marker CONTAINER being passed along, or a
         # marker-typed PARAMETER being forwarded, not a marker.
         # `Name:inherited` is `SpanDraft.__init__` copying the `Limitation`
@@ -1034,18 +1034,18 @@ _UNRESOLVED_PY: frozenset[tuple[str, str]] = frozenset(
         # where it was decided. It moved here out of the unit registry, which
         # is where it used to live as a helper two of the six parentage sites
         # remembered to call.
-        ("assembly/_builder.py", "Attribute:markers"),
-        ("assembly/_builder.py", "Call:tuple"),
-        ("assembly/_builder.py", "List"),
-        ("assembly/_builder.py", "Name:inherited"),
-        ("assembly/_builder.py", "Name:marker"),
-        ("assembly/_parentage.py", "BinOp"),
-        ("assembly/_parentage.py", "Call:_markers_for"),
-        ("assembly/_parentage.py", "Name:marker"),
-        ("assembly/_parentage.py", "Tuple"),
-        ("assembly/_snapshot.py", "Call:list"),
-        ("assembly/_snapshot.py", "List"),
-        ("assembly/_snapshot.py", "Name:marker"),
+        ("_assembly/_builder.py", "Attribute:markers"),
+        ("_assembly/_builder.py", "Call:tuple"),
+        ("_assembly/_builder.py", "List"),
+        ("_assembly/_builder.py", "Name:inherited"),
+        ("_assembly/_builder.py", "Name:marker"),
+        ("_assembly/_parentage.py", "BinOp"),
+        ("_assembly/_parentage.py", "Call:_markers_for"),
+        ("_assembly/_parentage.py", "Name:marker"),
+        ("_assembly/_parentage.py", "Tuple"),
+        ("_assembly/_snapshot.py", "Call:list"),
+        ("_assembly/_snapshot.py", "List"),
+        ("_assembly/_snapshot.py", "Name:marker"),
         # Two forwards in the unit registry, neither of which can introduce a
         # value. `Name:marker` is `Unit.note`,
         # a one-line forward onto the unit's own draft. `Name:reason` is
@@ -1057,40 +1057,40 @@ _UNRESOLVED_PY: frozenset[tuple[str, str]] = frozenset(
         # `resolve()` stamps — are spelled out as literals at their slots and
         # appear in `_MEMBER_SITES`, which is what keeps this trio a set of
         # pipes rather than a hiding place.
-        ("assembly/_units.py", "Name:marker"),
-        ("assembly/_units.py", "Name:reason"),
+        ("_assembly/_units.py", "Name:marker"),
+        ("_assembly/_units.py", "Name:reason"),
         # The three forwards that carry a shutdown marker down to an adapter:
         # `AnthropicAgentSdkAdapter.close_units`, `LangGraphAdapter.close_units`
         # and `close_units_all`. All three are one-line passes with no value of
         # their own. The members they carry are spelled as literals at the sites
         # that DECIDE them — each adapter's `uninstall` and the signal handler —
         # and every one of those is in `_MEMBER_SITES`.
-        ("adapters/_anthropic_agent_sdk.py", "Name:marker"),
-        ("adapters/_langgraph.py", "Name:marker"),
-        ("adapters/_registry.py", "Name:marker"),
+        ("_adapters/_anthropic_agent_sdk.py", "Name:marker"),
+        ("_adapters/_langgraph.py", "Name:marker"),
+        ("_adapters/_registry.py", "Name:marker"),
         # The adapter contract's own two forwards. `Name:marker` is the `marker`
         # parameter of `Scope.note` / `RunHandle.note` / `Attachment.note` and
         # `AdapterContext.close_all`, each a one-line pass onto the registry.
         # `Attribute:name` is `owner=self.name` riding along in that same
         # `close_all` call — R9 makes every argument of a marker-taking callee
         # read-all, and an adapter's own name is not a marker.
-        ("adapters/_context.py", "Attribute:name"),
-        ("adapters/_context.py", "Name:marker"),
-        ("interceptors/_seam.py", "Name:marker"),
-        ("interceptors/_seam.py", "Tuple"),
-        ("interceptors/_socket.py", "Tuple"),
-        ("interceptors/_ssl.py", "Tuple"),
-        ("interceptors/_trackers.py", "Attribute:_req_limitations"),
-        ("interceptors/_trackers.py", "Attribute:limitations"),
-        ("interceptors/_trackers.py", "Call:_merge_markers"),
-        ("interceptors/_trackers.py", "Call:list"),
-        ("interceptors/_trackers.py", "Call:tuple"),
-        ("interceptors/_trackers.py", "Tuple"),
+        ("_adapters/_context.py", "Attribute:name"),
+        ("_adapters/_context.py", "Name:marker"),
+        ("_interceptors/_seam.py", "Name:marker"),
+        ("_interceptors/_seam.py", "Tuple"),
+        ("_interceptors/_socket.py", "Tuple"),
+        ("_interceptors/_ssl.py", "Tuple"),
+        ("_interceptors/_trackers.py", "Attribute:_req_limitations"),
+        ("_interceptors/_trackers.py", "Attribute:limitations"),
+        ("_interceptors/_trackers.py", "Call:_merge_markers"),
+        ("_interceptors/_trackers.py", "Call:list"),
+        ("_interceptors/_trackers.py", "Call:tuple"),
+        ("_interceptors/_trackers.py", "Tuple"),
         # The conformance suite READS markers off spans that have already
         # shipped; it never builds a draft and never reaches a sink, so neither
         # of these slots can put a value on a span. `harness.py`'s
         # `Attribute:limitations` is `CaptureIntegrity.limitations` being copied
-        # into the `Node` view a check asserts on. `conformance.py`'s
+        # into the `SpanNode` view a check asserts on. `conformance.py`'s
         # `Name:marker` is two slots of one shape: `_assert_shipped(live, root,
         # marker)` asking whether the member the shutdown checks passed to
         # `close_units_all` came back on the wire, and the loop over
@@ -1102,19 +1102,19 @@ _UNRESOLVED_PY: frozenset[tuple[str, str]] = frozenset(
         ("testing/harness.py", "Attribute:limitations"),
         # `_resolve_markers(raw)` is where a Rust-produced marker STRING becomes
         # a member, and it is now the ONLY such crossing (it moved here
-        # from the byte seam, which is why `interceptors/_seam.py::Name:member`
+        # from the byte seam, which is why `_interceptors/_seam.py::Name:member`
         # is no longer a hole). It cannot introduce a value: `from_wire` returns
         # a member or None, and the Rust half of this census bounds which
         # members it can return.
-        ("protocol/_http1.py", "Call:_resolve_markers"),
+        ("_protocol/_http1.py", "Call:_resolve_markers"),
         # `build_grpc_fields` returns its `limitations` accumulator, which is a
         # parameter rebound three times — R8 will not guess at a name bound more
         # than once, and R6 reads the tuple slot it lands in. The hole is the
         # container, not a value: every member that reaches it is spelled out at
         # the rebinding a few lines above and is censused there. This entry
-        # moved from `interceptors/_seam.py` when the function moved; the
+        # moved from `_interceptors/_seam.py` when the function moved; the
         # expression is byte-identical.
-        ("semantics/_grpc.py", "Name:limitations"),
+        ("_semantics/_grpc.py", "Name:limitations"),
     }
 )
 """Every marker-ish slot the scanner could NOT resolve to a value, frozen.
@@ -1238,7 +1238,7 @@ _RUST_STR = re.compile(r'"((?:[^"\\]|\\.)*)"')
 
 _RUST_VEC_DECLARATIONS: dict[str, str] = {
     "crates/wardex-protocol/src/http1.rs": "ParsedHttp.limitations — the marker vector itself",
-    "bindings/python/src/lib.rs": "the PyO3 getter that hands it to protocol/_http1.py",
+    "bindings/python/src/lib.rs": "the PyO3 getter that hands it to _protocol/_http1.py",
     "crates/wardex-codec/src/otlp/map.rs": (
         "the OTLP projection of a span's markers onto an attribute, not a place "
         "any marker is minted. It moved out of the PyO3 binding when the OTLP "
@@ -1445,7 +1445,7 @@ def _member_docs() -> dict[str, str]:
     for a member that documents nothing. Reading the source is the only way to
     tell "documented" from "inherited".
     """
-    source = _SRC / "assembly" / "_integrity.py"
+    source = _SRC / "_assembly" / "_integrity.py"
     tree = ast.parse(source.read_text(encoding="utf-8"), filename=str(source))
     cls = next(n for n in ast.walk(tree) if isinstance(n, ast.ClassDef) and n.name == "Limitation")
     docs: dict[str, str] = {}
@@ -1576,11 +1576,11 @@ def test_python_census_matches_source(py_census: _PythonCensus) -> None:
 def test_member_reference_sites_match_source(py_census: _PythonCensus) -> None:
     """The other half: where a `Limitation` member (not a string) is used.
 
-    It began as `assembly/_parentage.py`'s `_MARKER` table and nothing else —
+    It began as `_assembly/_parentage.py`'s `_MARKER` table and nothing else —
     the "vocabulary without an emitter" drift stated as a fact rather than as
     prose. It grew as `_CENSUS_PY` emptied, so it now reaches every
-    Python site that names a marker, across `assembly/`, `adapters/`,
-    `interceptors/` and `semantics/`.
+    Python site that names a marker, across `_assembly/`, `_adapters/`,
+    `_interceptors/` and `_semantics/`.
     """
     drift = _diff_sites(py_census.members, _MEMBER_SITES)
     assert not drift, (
@@ -1834,7 +1834,7 @@ def test_a_marker_written_into_a_parameter_default_is_censused(source, expected)
 
     `test_unresolvable_marker_slots_are_exactly_the_recorded_ones` does go red
     when `_collect_defs` stops reading defaults — but only because reading them
-    surfaced one hole, `_emit_tool`'s `markers=()` at `adapters/_assembler.py`.
+    surfaced one hole, `_emit_tool`'s `markers=()` at `_adapters/_assembler.py`.
     That makes the coverage a side effect of an unrelated production signature:
     the day someone gives `_emit_tool` a required `markers`, the recorded hole
     is removed along with it and nothing is left watching defaults at all. A
@@ -2125,8 +2125,8 @@ def test_a_wardex_bug_is_not_reported_as_a_shallow_tree() -> None:
     did not happen, so a reader goes hunting for an unclosed child that does not
     exist.
     """
-    from wardex_sdk.adapters._context import AdapterContext
-    from wardex_sdk.assembly import EMPTY_AMBIENT, SpanIntent, UnitKey, UnitKind, UnitRegistry
+    from wardex_sdk._adapters._context import AdapterContext
+    from wardex_sdk._assembly import EMPTY_AMBIENT, SpanIntent, UnitKey, UnitKind, UnitRegistry
 
     assert Limitation.INSTRUMENTATION_DEGRADED is not Limitation.CONTEXT_PROPAGATION_DEGRADED
 

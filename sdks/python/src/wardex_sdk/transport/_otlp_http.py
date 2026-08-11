@@ -18,9 +18,9 @@ import sys
 import time
 import urllib.request
 
+from .._assembly import report_once
 from .._native import NATIVE_OK, native, unavailable_reason
 from .._types import InternalEnvelope
-from ..assembly import report_once
 from ._base import UNDELIVERED, CallerBudget, Transport
 
 

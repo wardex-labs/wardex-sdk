@@ -163,12 +163,11 @@ from claude_agent_sdk._internal.transport.subprocess_cli import SubprocessCLITra
 
 from test_agent_sdk_adapter_install import INIT_LINE, RESULT_LINE, FakeTransport
 from wardex_sdk import _hub
-from wardex_sdk._enums import StatusCode, ToolExecutionType
-from wardex_sdk.adapters._anthropic_agent_sdk import AnthropicAgentSdkAdapter
-from wardex_sdk.adapters._anthropic_names import ServerHandle
-from wardex_sdk.adapters._context import AdapterContext, Placement
-from wardex_sdk.adapters._registry import context_for
-from wardex_sdk.assembly import (
+from wardex_sdk._adapters._anthropic_agent_sdk import AnthropicAgentSdkAdapter
+from wardex_sdk._adapters._anthropic_names import ServerHandle
+from wardex_sdk._adapters._context import AdapterContext, Placement
+from wardex_sdk._adapters._registry import context_for
+from wardex_sdk._assembly import (
     Limitation,
     ParentSource,
     SpanIntent,
@@ -176,6 +175,7 @@ from wardex_sdk.assembly import (
     UnitRegistry,
     counters,
 )
+from wardex_sdk._enums import StatusCode, ToolExecutionType
 
 
 class RecordingClient:
@@ -1884,7 +1884,7 @@ def test_the_owner_this_assembler_stamps_is_the_adapters_own_name():
     the failure is not an error, it is every in-process tool call quietly
     becoming its own trace root while the pin is what covers for it.
     """
-    from wardex_sdk.adapters._assembler import _OWNER
+    from wardex_sdk._adapters._assembler import _OWNER
 
     assert _OWNER == AnthropicAgentSdkAdapter().name()
 
@@ -1915,7 +1915,7 @@ def test_a_tool_wrapper_that_outlives_its_adapter_still_runs_the_hosts_tool():
     async def handler(args):
         return {"echoed": args}
 
-    from wardex_sdk.adapters._anthropic_agent_sdk import _run_tool
+    from wardex_sdk._adapters._anthropic_agent_sdk import _run_tool
 
     adapter.uninstall()
     assert adapter._ctx is None

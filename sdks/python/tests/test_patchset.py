@@ -27,7 +27,7 @@ from typing import Any
 
 import pytest
 
-from wardex_sdk.assembly import Limitation, PatchSet, counters
+from wardex_sdk._assembly import Limitation, PatchSet, counters
 
 
 class Base:
@@ -323,7 +323,7 @@ def test_an_own_method_is_restored_to_the_same_object():
 def test_a_classmethod_does_not_come_back_as_a_plain_function():
     """The descriptor, not what `getattr` unwraps it into.
 
-    `interceptors/_mcp_stdio.py` patches `AsyncIOBackend.open_process`, which is
+    `_interceptors/_mcp_stdio.py` patches `AsyncIOBackend.open_process`, which is
     a `classmethod`. A restore built from `getattr(cls, name)` writes back the
     underlying function, so the attribute silently stops binding the class and
     every later call is handed the wrong first argument.
@@ -511,7 +511,7 @@ def test_two_patches_on_one_attribute_are_undone_newest_first():
     and still in the call path.
 
     The justification this docstring used to carry was false and worth replacing
-    rather than deleting: `interceptors/_conn_timing` and `interceptors/_socket`
+    rather than deleting: `_interceptors/_conn_timing` and `_interceptors/_socket`
     do both reach `socket.socket`, but for DISJOINT attributes and out of
     separate PatchSets, so neither the order nor the set is shared and LIFO fixes
     nothing there. The rule belongs to the mechanism instead. `patch()` accepts
@@ -1035,12 +1035,12 @@ def test_a_getattr_hook_never_becomes_the_recorded_original():
 @pytest.mark.parametrize(
     "module",
     [
-        "wardex_sdk.interceptors._seam",
-        "wardex_sdk.interceptors._ssl",
-        "wardex_sdk.interceptors._socket",
-        "wardex_sdk.interceptors._conn_timing",
-        "wardex_sdk.interceptors._mcp_stdio",
-        "wardex_sdk.adapters._anthropic_agent_sdk",
+        "wardex_sdk._interceptors._seam",
+        "wardex_sdk._interceptors._ssl",
+        "wardex_sdk._interceptors._socket",
+        "wardex_sdk._interceptors._conn_timing",
+        "wardex_sdk._interceptors._mcp_stdio",
+        "wardex_sdk._adapters._anthropic_agent_sdk",
     ],
 )
 def test_no_patch_site_kept_its_own_dictionary_of_originals(module):

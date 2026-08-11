@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import pytest
 
+from wardex_sdk._assembly import LinkReason
 from wardex_sdk._enums import SpanKind, StatusCode
 from wardex_sdk._types import (
     EnvelopeHeader,
@@ -36,7 +37,6 @@ from wardex_sdk._types import (
     SpanId,
     TraceId,
 )
-from wardex_sdk.assembly import LinkReason
 from wardex_sdk.transport import _codec
 
 _OTHER_TRACE = TraceId(b"\xaa" * 16)

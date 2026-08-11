@@ -104,7 +104,7 @@ def test_a_bug_opening_a_manual_span_still_runs_the_hosts_block(monkeypatch):
     used to take the block with it.
     """
     import wardex_sdk._tracing as tracing
-    from wardex_sdk.assembly._diag import reset_reports_for_test
+    from wardex_sdk._assembly._diag import reset_reports_for_test
 
     _setup()
     reset_reports_for_test()
@@ -129,7 +129,7 @@ def test_a_bug_opening_a_manual_span_emits_nothing_and_says_why(capsys):
     broken here and wardex never having been installed.
     """
     import wardex_sdk._tracing as tracing
-    from wardex_sdk.assembly._diag import reset_reports_for_test
+    from wardex_sdk._assembly._diag import reset_reports_for_test
 
     t = _setup()
     reset_reports_for_test()
@@ -183,10 +183,10 @@ def test_a_bug_in_wardexs_own_span_does_not_silence_the_work_inside_it(monkeypat
     from types import SimpleNamespace
 
     import wardex_sdk._tracing as tracing
+    from wardex_sdk._assembly import latch_ambient
+    from wardex_sdk._assembly._diag import reset_reports_for_test
     from wardex_sdk._enums import CaptureMode
-    from wardex_sdk.assembly import latch_ambient
-    from wardex_sdk.assembly._diag import reset_reports_for_test
-    from wardex_sdk.interceptors._seam import ByteSeamInterceptor
+    from wardex_sdk._interceptors._seam import ByteSeamInterceptor
 
     class Seam(ByteSeamInterceptor):
         def _select_tracker(self, obj):

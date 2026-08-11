@@ -4,7 +4,7 @@ A ContextVar guard. The transport sets it while POSTing → the seam (ByteSeamIn
 
 It lives at the package root, beside `_hub` and `_scope`, because both ends of
 the guard sit BELOW the observers: `transport/` sets it and `context/` reads it,
-and while it lived under `interceptors/` those two were the only modules in the
+and while it lived under `_interceptors/` those two were the only modules in the
 SDK importing a layer above their own. The guard itself never had any
 interceptor-specific content — it is a flag and a context manager — so the
 inversion bought nothing and cost the one-way arrow in design §3.1.

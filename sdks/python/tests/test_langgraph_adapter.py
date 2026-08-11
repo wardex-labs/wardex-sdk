@@ -26,17 +26,17 @@ from langchain_core.tools import tool
 from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.prebuilt import ToolNode
 
+from wardex_sdk._adapters._context import Placement
+from wardex_sdk._adapters._langgraph import LangGraphAdapter
+from wardex_sdk._adapters._registry import AdapterRegistry
+from wardex_sdk._assembly import SpanIntent, UnitKind, counters
+from wardex_sdk._assembly._diag import reset_reports_for_test
+from wardex_sdk._assembly._units import _ambient_unit
 from wardex_sdk._enums import StatusCode
 from wardex_sdk._hub import reset_for_test
-from wardex_sdk.adapters._context import Placement
-from wardex_sdk.adapters._langgraph import LangGraphAdapter
-from wardex_sdk.adapters._registry import AdapterRegistry
-from wardex_sdk.assembly import SpanIntent, UnitKind, counters
-from wardex_sdk.assembly._diag import reset_reports_for_test
-from wardex_sdk.assembly._units import _ambient_unit
 
 _SRC = pathlib.Path(__file__).resolve().parents[1] / "src" / "wardex_sdk"
-_MODULE = _SRC / "adapters" / "_langgraph.py"
+_MODULE = _SRC / "_adapters" / "_langgraph.py"
 
 
 # --------------------------------------------------------------------------
@@ -195,7 +195,7 @@ class TrailState(TypedDict):
 
 
 def leaf_describe(scope) -> None:
-    from wardex_sdk.assembly import ToolAttributes
+    from wardex_sdk._assembly import ToolAttributes
 
     scope.draft.set_tool(ToolAttributes(name="leaf"))
 
@@ -203,7 +203,7 @@ def leaf_describe(scope) -> None:
 def leaf_span(ctx, subject: str) -> None:
     """A stand-in for a byte-seam span, opened inside a node or tool body.
 
-    §9.1 forbids an in-process HTTP server of any kind — `interceptors/_seam.py`
+    §9.1 forbids an in-process HTTP server of any kind — `_interceptors/_seam.py`
     keys its connection table on `id(obj)` and never removes an entry, so a
     recycled CPython address hands a live socket a dead socket's latched gate
     and requests vanish with no counter. A unit opened through `ctx.enter`
@@ -374,7 +374,7 @@ def test_the_real_surface_passes_both_probes():
     from langgraph.pregel import main as pregel_mod
     from langgraph.types import PregelExecutableTask
 
-    from wardex_sdk.adapters._langgraph import _surface_ok, _tool_surface_ok
+    from wardex_sdk._adapters._langgraph import _surface_ok, _tool_surface_ok
 
     assert _surface_ok(pregel_mod, _runner, PregelExecutableTask)
     assert _tool_surface_ok(TN)
@@ -388,7 +388,7 @@ def test_a_reordered_signature_fails_the_probe():
     from langgraph.pregel import main as pregel_mod
     from langgraph.types import PregelExecutableTask
 
-    from wardex_sdk.adapters._langgraph import _surface_ok
+    from wardex_sdk._adapters._langgraph import _surface_ok
 
     class Reordered:
         @staticmethod
@@ -403,7 +403,7 @@ def test_a_reordered_signature_fails_the_probe():
 def test_an_inherited_run_one_fails_the_tool_probe():
     """`in __dict__`, not `hasattr`: patching the class would otherwise shadow a
     base-class attribute the restore must not delete."""
-    from wardex_sdk.adapters._langgraph import _tool_surface_ok
+    from wardex_sdk._adapters._langgraph import _tool_surface_ok
 
     class Base:
         def _run_one(self, call, *a, **k): ...
@@ -418,7 +418,7 @@ def test_an_inherited_run_one_fails_the_tool_probe():
 
 def test_a_pydantic_shaped_class_fails_the_probe():
     """`PatchSet` restores with `setattr`, which a Pydantic model would defeat."""
-    from wardex_sdk.adapters._langgraph import _tool_surface_ok
+    from wardex_sdk._adapters._langgraph import _tool_surface_ok
 
     class BaseModel:
         pass
@@ -431,7 +431,7 @@ def test_a_pydantic_shaped_class_fails_the_probe():
 
 
 def test_an_unrecognized_surface_declines_loudly_and_patches_nothing(monkeypatch, capsys):
-    import wardex_sdk.adapters._langgraph as mod
+    import wardex_sdk._adapters._langgraph as mod
 
     before = _originals()
     monkeypatch.setattr(mod, "_surface_ok", lambda *a: False)
@@ -453,7 +453,7 @@ def test_a_partial_install_keeps_the_run_and_node_seams(monkeypatch, capsys):
     tool-without-node mode."""
     from langgraph.prebuilt.tool_node import ToolNode as TN
 
-    import wardex_sdk.adapters._langgraph as mod
+    import wardex_sdk._adapters._langgraph as mod
 
     monkeypatch.setattr(mod, "_tool_surface_ok", lambda *a: False)
     before_tool = (TN._run_one, TN._arun_one)
@@ -471,7 +471,7 @@ def test_a_partial_install_keeps_the_run_and_node_seams(monkeypatch, capsys):
 
 
 def test_an_absent_tool_distribution_declines_silently(monkeypatch, capsys):
-    import wardex_sdk.adapters._langgraph as mod
+    import wardex_sdk._adapters._langgraph as mod
 
     monkeypatch.setattr(mod, "_import_toolnode", lambda: None)
     live = Installed()
@@ -720,7 +720,7 @@ def test_an_unexpected_keyword_at_the_node_seam_reaches_the_host_untouched():
         patched = _runner.run_with_retry
         # the wrapper is what is installed; drive it with the extra keyword a
         # future release would add, standing the original up as a spy
-        import wardex_sdk.adapters._langgraph as mod
+        import wardex_sdk._adapters._langgraph as mod
 
         wrapper = mod._mk_run_with_retry(spy, live.adapter, "__start__")
         assert wrapper(FakeTask(), None, "positional", brand_new_kwarg=7) == "host-value"
@@ -734,7 +734,7 @@ def test_an_unexpected_keyword_at_the_node_seam_reaches_the_host_untouched():
 def test_a_wrapper_with_no_context_passes_straight_through():
     """The `if ctx is None` branch is reachable AFTER `uninstall()`, because the
     wrappers read `adapter._ctx` per call rather than latching it at install."""
-    import wardex_sdk.adapters._langgraph as mod
+    import wardex_sdk._adapters._langgraph as mod
 
     adapter = LangGraphAdapter()  # never installed: `_ctx` is None
     wrapper = mod._mk_run_with_retry(lambda task, rp, *a, **k: "host", adapter, "__start__")
@@ -841,7 +841,7 @@ def test_no_framework_identifier_can_shape_this_adapters_tree():
 
 
 def test_the_module_exports_a_sorted_resolvable_all():
-    import wardex_sdk.adapters._langgraph as mod
+    import wardex_sdk._adapters._langgraph as mod
 
     assert mod.__all__ == sorted(mod.__all__)
     assert mod.__all__
@@ -850,10 +850,10 @@ def test_the_module_exports_a_sorted_resolvable_all():
 
 
 def test_tool_attributes_is_reachable_without_naming_a_forbidden_module():
-    """`wardex_sdk._types` is C-S1-forbidden for `adapters/`, and this adapter
+    """`wardex_sdk._types` is C-S1-forbidden for `_adapters/`, and this adapter
     carries no debt entry — so the re-export is what makes the tool half legal
     to write at all."""
-    import wardex_sdk.assembly as assembly
+    import wardex_sdk._assembly as assembly
 
     assert "ToolAttributes" in assembly.__all__
     assert assembly.__all__ == sorted(assembly.__all__)

@@ -1,4 +1,4 @@
-"""`adapters/_context.py` — the surface a framework adapter is handed.
+"""`_adapters/_context.py` — the surface a framework adapter is handed.
 
 Two things are under test and they are not the same thing.
 
@@ -27,10 +27,7 @@ import threading
 
 import pytest
 
-from wardex_sdk._enums import AgentType, StatusCode
-from wardex_sdk._hub import reset_for_test
-from wardex_sdk._types import AgentAttributes, ToolAttributes
-from wardex_sdk.adapters._context import (
+from wardex_sdk._adapters._context import (
     AdapterContext,
     Attachment,
     Fallback,
@@ -40,7 +37,7 @@ from wardex_sdk.adapters._context import (
     RunHandle,
     Scope,
 )
-from wardex_sdk.assembly import (
+from wardex_sdk._assembly import (
     EMPTY_AMBIENT,
     Limitation,
     LinkReason,
@@ -51,11 +48,14 @@ from wardex_sdk.assembly import (
     UnitRegistry,
     counters,
 )
-from wardex_sdk.assembly._builder import NULL_DRAFT
-from wardex_sdk.assembly._diag import reset_reports_for_test
-from wardex_sdk.assembly._units import _ambient_unit
-from wardex_sdk.assembly._vocab import VocabularyError
-from wardex_sdk.context import activate_span
+from wardex_sdk._assembly._builder import NULL_DRAFT
+from wardex_sdk._assembly._diag import reset_reports_for_test
+from wardex_sdk._assembly._units import _ambient_unit
+from wardex_sdk._assembly._vocab import VocabularyError
+from wardex_sdk._enums import AgentType, StatusCode
+from wardex_sdk._hub import reset_for_test
+from wardex_sdk._types import AgentAttributes, ToolAttributes
+from wardex_sdk.context._contextvar import activate_span
 
 
 class RecordingSink:
@@ -708,7 +708,7 @@ def test_a_description_that_fails_never_ships_a_span_that_reads_healthy(when):
     assert ctx.tripped
 
     if when == "before the required block":
-        from wardex_sdk.assembly import VocabularyError
+        from wardex_sdk._assembly import VocabularyError
 
         with pytest.raises(VocabularyError):
             sink.drafts[-1].finish()
@@ -750,7 +750,7 @@ def test_every_verb_on_a_degraded_scope_is_answerable_and_none_of_them_raises(mo
     process. A hand-written list of verbs would have been written from the same
     memory that produced a partial null draft.
     """
-    from wardex_sdk.assembly import _builder
+    from wardex_sdk._assembly import _builder
 
     members = {n for n in dir(Scope) if not n.startswith("_")}
     members |= {n for n in dir(RunHandle) if not n.startswith("_")}
@@ -869,7 +869,7 @@ def test_a_span_whose_activation_failed_does_not_read_like_a_healthy_one(monkeyp
     `unit.activate()` binds the name before `__enter__` can raise. A span that
     reads byte-identical to a healthy one is the failure this asserts against.
     """
-    from wardex_sdk.assembly import _units
+    from wardex_sdk._assembly import _units
 
     healthy_ctx, healthy_sink = context()
     with healthy_ctx.enter(
@@ -1377,7 +1377,7 @@ def test_a_degraded_scope_says_so_on_the_carrier_the_capture_gate_reads():
     the seam shares nothing with this module except the TASK the host's code
     runs on, which is the carrier the whole tree is built from anyway.
     """
-    from wardex_sdk.assembly import in_degraded_run
+    from wardex_sdk._assembly import in_degraded_run
 
     ctx, sink = broken("open")
 
@@ -1395,7 +1395,7 @@ def test_a_healthy_scope_leaves_the_carrier_alone():
     healthy run never asks it. A flag set on a working scope would widen the
     capture gate for every host whose wardex is fine.
     """
-    from wardex_sdk.assembly import in_degraded_run
+    from wardex_sdk._assembly import in_degraded_run
 
     ctx, sink = context()
 
@@ -1461,8 +1461,8 @@ def test_a_declared_failure_does_not_turn_control_flow_back_into_a_failure():
     could collide is pinned rather than left to ordering.
     """
 
-    from wardex_sdk.adapters._base import AdapterInterface
-    from wardex_sdk.adapters._registry import context_for
+    from wardex_sdk._adapters._base import AdapterInterface
+    from wardex_sdk._adapters._registry import context_for
 
     class Bubble(Exception):
         pass

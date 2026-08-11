@@ -26,9 +26,9 @@ import pytest
 
 from test_agent_sdk_adapter_install import INIT_LINE
 from test_agent_sdk_units import _ReaderDispatchTransport, _run, _tool
+from wardex_sdk._adapters._anthropic_agent_sdk import AnthropicAgentSdkAdapter
 from wardex_sdk._enums import AdapterName
-from wardex_sdk.adapters._anthropic_agent_sdk import AnthropicAgentSdkAdapter
-from wardex_sdk.testing import AdapterConformanceSuite, AdapterSubject, Stalled
+from wardex_sdk.testing import AdapterConformanceSuite, AdapterSubject, StalledRun
 
 
 def seams() -> dict[str, object]:
@@ -100,7 +100,7 @@ def workload(live):  # noqa: ANN001, ANN201
     return _run(adapter, transport, tools=[outer_a, outer_b, inner_a, inner_b])
 
 
-def stall(live) -> Stalled:  # noqa: ANN001
+def stall(live) -> StalledRun:  # noqa: ANN001
     """A session the CLI announced and never finished.
 
     The real Ctrl-C shape: a user message opens the session, the init line
@@ -119,14 +119,14 @@ def stall(live) -> Stalled:  # noqa: ANN001
         ),
     )
     assembler.on_inbound(1, dict(INIT_LINE, session_id="s-stall"))
-    return Stalled(root="invoke_agent", resume=lambda: None)
+    return StalledRun(root="invoke_agent", resume=lambda: None)
 
 
 @pytest.fixture
 def subject() -> AdapterSubject:
     return AdapterSubject(
         name=AdapterName.ANTHROPIC_AGENT_SDK.value,
-        module="wardex_sdk.adapters._anthropic_agent_sdk",
+        module="wardex_sdk._adapters._anthropic_agent_sdk",
         factory=AnthropicAgentSdkAdapter,
         seams=seams,
         workload=workload,

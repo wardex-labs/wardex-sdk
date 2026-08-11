@@ -12,8 +12,8 @@ import pytest
 
 from wardex_sdk._config import WardexConfig
 from wardex_sdk._enums import InterceptorName
-from wardex_sdk.interceptors import _INTERCEPTORS, install_configured_interceptors
-from wardex_sdk.interceptors._registry import get_registry
+from wardex_sdk._interceptors import _INTERCEPTORS, install_configured_interceptors
+from wardex_sdk._interceptors._registry import get_registry
 
 
 @pytest.fixture(autouse=True)

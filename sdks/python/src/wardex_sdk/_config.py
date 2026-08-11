@@ -95,8 +95,13 @@ class BackendConfig:
     a config group where a Transport was expected.
     """
 
-    api_key: str | None = None
-    """Identifies the project on every envelope header."""
+    api_key: str | None = field(default=None, repr=False)
+    """Identifies the project on every envelope header.
+
+    `repr=False` because a config object's string form ends up in logs, crash
+    reports and debugger output, none of which is a place for a credential:
+    string forms of config objects never contain secret material.
+    """
 
     endpoint: str | None = None
     """Where to send. `init()` without a `transport=` builds the default
@@ -257,7 +262,8 @@ class WardexConfig:
                 "WardexConfig groups its fields by concern; these moved:\n"
                 + "\n".join(f"  {name} -> {_MOVED[name]}" for name in moved)
                 + "\nThe groups are backend, retention, pii, batching, limits and"
-                " propagation — see wardex_sdk._config for what each one owns."
+                " propagation — see the Configuration section of the README:"
+                " https://github.com/wardex-labs/wardex-sdk#configuration"
             )
         # object.__new__, not super().__new__: @dataclass(slots=True) rebuilds
         # the class to attach __slots__, which invalidates the zero-arg

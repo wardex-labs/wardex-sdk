@@ -1,5 +1,5 @@
 from wardex_sdk._enums import CaptureSource, Protocol, SpanKind, StatusCode
-from wardex_sdk.interceptors._mcp_stdio import _ProcState
+from wardex_sdk._interceptors._mcp_stdio import _ProcState
 
 
 def _drive(req: bytes, resp: bytes):

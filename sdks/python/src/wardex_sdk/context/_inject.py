@@ -28,7 +28,7 @@ from collections.abc import Callable
 from typing import Any
 
 from .. import _hub
-from ..assembly import PatchSet
+from .._assembly import PatchSet
 from ._propagate import get_trace_headers
 
 _patches: PatchSet | None = None

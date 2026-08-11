@@ -31,15 +31,15 @@ if TYPE_CHECKING:
     # where the vocabulary is defined and enforced, which is one layer up.
     #
     # The import is deliberately type-only, and not to dodge a lint. `assembly`
-    # sits ABOVE `_types` — `assembly/_parentage.py` imports from here — so a
+    # sits ABOVE `_types` — `_assembly/_parentage.py` imports from here — so a
     # runtime import would be a real cycle and, worse, a lower layer reaching
     # upward for a definition. The annotations still say exactly what the fields
     # hold, and the enforcement lives where it can act: `SpanDraft.finish()`
     # refuses a marker that is not a `Limitation`, and it is the only place an
     # `InternalSpan` is constructed.
-    from .assembly._integrity import Limitation
-    from .assembly._parentage import ParentSource
-    from .assembly._vocab import LinkReason
+    from ._assembly._integrity import Limitation
+    from ._assembly._parentage import ParentSource
+    from ._assembly._vocab import LinkReason
 
 # --- Basic ID types (bytes wrapper) ---
 

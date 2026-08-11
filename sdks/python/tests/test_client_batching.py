@@ -3,6 +3,7 @@
 import threading
 import time
 
+from wardex_sdk._assembly._diag import reset_reports_for_test
 from wardex_sdk._client import _UNBOUNDED_TRANSPORT_FLUSH_TIMEOUT, Client
 from wardex_sdk._config import BackendConfig, BatchingPolicy, WardexConfig
 from wardex_sdk._enums import SpanKind
@@ -14,7 +15,6 @@ from wardex_sdk._types import (
     SpanId,
     TraceId,
 )
-from wardex_sdk.assembly._diag import reset_reports_for_test
 from wardex_sdk.transport._base import UNDELIVERED, Transport
 
 

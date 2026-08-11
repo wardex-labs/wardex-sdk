@@ -288,3 +288,21 @@ def test_propagate_targets_are_folded_once_at_construction():
         "*.mycorp.com",
         "api.internal",
     )
+
+
+# --------------------------------------------------------------------------
+# secret hygiene
+# --------------------------------------------------------------------------
+
+
+def test_the_api_key_never_appears_in_a_repr():
+    """String forms of config objects never contain secret material.
+
+    A config's repr ends up in logs, crash reports and debugger output — none
+    of which is a place for a credential. `repr=False` on the field is the
+    mechanism; this asserts the OUTCOME on both the group and the whole
+    config, so a refactor that rebuilds either dataclass has to keep it.
+    """
+    secret = "wk-secret-123"
+    assert secret not in repr(BackendConfig(api_key=secret))
+    assert secret not in repr(WardexConfig(backend=BackendConfig(api_key=secret)))

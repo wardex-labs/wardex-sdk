@@ -1,4 +1,4 @@
-"""`assembly/_units.py` — the logical-unit registry (design §4.2, §5.2, §5.6).
+"""`_assembly/_units.py` — the logical-unit registry (design §4.2, §5.2, §5.6).
 
 What this file is defending, in one sentence per section:
 
@@ -28,10 +28,7 @@ import threading
 
 import pytest
 
-from wardex_sdk._enums import AgentType, CaptureSource, StatusCode
-from wardex_sdk._hub import reset_for_test
-from wardex_sdk._types import AgentAttributes, ToolAttributes
-from wardex_sdk.assembly import (
+from wardex_sdk._assembly import (
     EMPTY_AMBIENT,
     Ambient,
     Evidence,
@@ -46,8 +43,11 @@ from wardex_sdk.assembly import (
     latch_ambient,
     parent_is_closed_unit,
 )
-from wardex_sdk.assembly._units import _ambient_unit
-from wardex_sdk.context import activate_span
+from wardex_sdk._assembly._units import _ambient_unit
+from wardex_sdk._enums import AgentType, CaptureSource, StatusCode
+from wardex_sdk._hub import reset_for_test
+from wardex_sdk._types import AgentAttributes, ToolAttributes
+from wardex_sdk.context._contextvar import activate_span
 
 
 class RecordingSink:
@@ -1240,7 +1240,7 @@ def test_a_sink_that_raises_cannot_reach_the_host():
 
 def _a_context():
     """A span context that came from the parentage core, as a parent must."""
-    from wardex_sdk.assembly import resolve_parentage
+    from wardex_sdk._assembly import resolve_parentage
 
     return resolve_parentage(EMPTY_AMBIENT).child_context()
 
@@ -1856,8 +1856,8 @@ def test_an_eviction_that_strands_its_own_activation_orphans_what_follows():
 def test_a_closed_units_span_is_nameable_without_a_registry():
     """`parent_is_closed_unit` is what the byte seams and MCP stdio can ask.
 
-    They hold a `Client` and nothing else, and `interceptors/` may not import
-    `adapters/`, where the registries are built. It takes no registry on
+    They hold a `Client` and nothing else, and `_interceptors/` may not import
+    `_adapters/`, where the registries are built. It takes no registry on
     purpose: "the span I latched has already shipped" does not depend on who
     opened the unit, and a seam charges no `CORRELATION_CONFLICT` to anyone —
     the ownership guard exists to stop one registry blaming another's teardown,

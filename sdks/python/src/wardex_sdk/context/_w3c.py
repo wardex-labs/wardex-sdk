@@ -13,7 +13,7 @@ known prefix; version ff and all-zero ids are rejected.
 The always-sampled invariant did not go away, it MOVED (design §4.1, V9). It
 used to live here as a hardcoded `-01`, which meant an upstream that told us
 `-00` was silently promoted to `-01` downstream. It now lives at the source:
-`assembly/_parentage.resolve_parentage()` stamps `trace_flags=1` on the branch
+`_assembly/_parentage.resolve_parentage()` stamps `trace_flags=1` on the branch
 that has no parent, because wardex does not head-sample — retention is decided
 later by the RetentionClassifier — so a trace wardex ORIGINATES is by definition
 sampled. Only once origination says 1 does a `0` arriving here unambiguously

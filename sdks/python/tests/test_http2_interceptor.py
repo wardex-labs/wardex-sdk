@@ -20,7 +20,7 @@ def _verify_ctx():
 def _reset():
     _hub.reset_for_test()
     yield
-    from wardex_sdk.interceptors._registry import get_registry
+    from wardex_sdk._interceptors._registry import get_registry
 
     get_registry().uninstall_all()
     _hub.reset_for_test()

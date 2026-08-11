@@ -1,5 +1,5 @@
 from wardex_sdk._enums import Protocol
-from wardex_sdk.protocol._http1 import Http1RequestParser, Http1ResponseParser
+from wardex_sdk._protocol._http1 import Http1RequestParser, Http1ResponseParser
 
 
 def test_response_parser_maps_to_parsed_message():

@@ -41,9 +41,9 @@ from test_langgraph_adapter import (
     tool_graph,
     tools,
 )
+from wardex_sdk._assembly import Limitation, ParentSource
 from wardex_sdk._enums import ToolExecutionType, ToolType
 from wardex_sdk._types import InternalEnvelope
-from wardex_sdk.assembly import Limitation, ParentSource
 from wardex_sdk.transport import _codec
 
 #: One tool call, spelled once. Every payload and block assertion below reads
@@ -205,7 +205,7 @@ def test_a_describe_that_drops_the_step_name_deletes_the_span(installed, monkeyp
     its optional half, every other assertion in this file still passes, and the
     node layer of the tree is silently gone.
     """
-    import wardex_sdk.adapters._langgraph as mod
+    import wardex_sdk._adapters._langgraph as mod
 
     def _without_the_name(adapter, task_, step):
         step.draft.set_extra("wardex.framework", "langgraph")

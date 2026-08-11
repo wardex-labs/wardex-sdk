@@ -186,7 +186,7 @@ def bare_ssl_interceptor():
     "installed") to avoid colliding, in name and in implication, with
     test_install_uninstall_restores_originals, which exercises the real
     monkeypatch install/uninstall path in this same test file."""
-    from wardex_sdk.interceptors._ssl import SSLInterceptor
+    from wardex_sdk._interceptors._ssl import SSLInterceptor
 
     class _Config:
         debug = False

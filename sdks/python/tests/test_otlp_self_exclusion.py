@@ -4,9 +4,9 @@ from __future__ import annotations
 
 from typing import Any
 
+from wardex_sdk._interceptors._ssl import SSLInterceptor
 from wardex_sdk._suppress import is_suppressed, suppress_capture
 from wardex_sdk._types import InternalSpan
-from wardex_sdk.interceptors._ssl import SSLInterceptor
 
 
 def test_suppress_capture_toggles():

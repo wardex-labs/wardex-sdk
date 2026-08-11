@@ -35,6 +35,9 @@ manifest-path  = "../../bindings/python/Cargo.toml"
 python-source  = "src"
 module-name    = "wardex_sdk._wardex_native"
 features       = ["pyo3/extension-module"]
+# PEP 561: the wheel ships inline annotations, and type checkers ignore them
+# without this marker. Declared for both formats so an sdist build keeps it.
+include        = [{ path = "src/wardex_sdk/py.typed", format = ["sdist", "wheel"] }]
 
 [dependency-groups]
 # Everything `tests/` imports beyond the package itself, and nothing else. The

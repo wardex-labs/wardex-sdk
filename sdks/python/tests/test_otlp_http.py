@@ -252,7 +252,7 @@ def test_a_span_dropped_by_the_request_cap_is_reported_off_debug(capsys):
     Debug-gated, it was byte-identical to those spans never having been
     captured, on the default settings every production process runs.
     """
-    from wardex_sdk.assembly._diag import reset_reports_for_test
+    from wardex_sdk._assembly._diag import reset_reports_for_test
 
     reset_reports_for_test()
     srv = _serve()
@@ -288,7 +288,7 @@ def test_a_split_export_abandoned_partway_says_so_off_debug(monkeypatch, capsys)
     """
     import urllib.request
 
-    from wardex_sdk.assembly._diag import reset_reports_for_test
+    from wardex_sdk._assembly._diag import reset_reports_for_test
 
     class _Resp:
         def __enter__(self):
@@ -334,7 +334,7 @@ def test_the_first_request_failing_is_not_reported_as_a_partial_export(monkeypat
     backend is down" silences the report that would have been news."""
     import urllib.request
 
-    from wardex_sdk.assembly._diag import reset_reports_for_test
+    from wardex_sdk._assembly._diag import reset_reports_for_test
 
     reset_reports_for_test()
     monkeypatch.setattr(urllib.request, "urlopen", _raising_urlopen(OSError("refused")))
@@ -353,7 +353,7 @@ def test_a_split_export_that_runs_out_of_budget_says_how_far_it_got(monkeypatch,
     duplicate them), which leaves this line as their only channel."""
     import urllib.request
 
-    from wardex_sdk.assembly._diag import reset_reports_for_test
+    from wardex_sdk._assembly._diag import reset_reports_for_test
 
     class _Resp:
         def __enter__(self):
@@ -601,7 +601,7 @@ def test_the_native_missing_line_does_not_repeat_per_export(monkeypatch, capsys)
     `report_once`. Unconditional is right — a silent exporter is the failure
     nobody finds — and bounded to one line per process is what makes it
     affordable."""
-    from wardex_sdk.assembly._diag import reset_reports_for_test
+    from wardex_sdk._assembly._diag import reset_reports_for_test
     from wardex_sdk.transport import _otlp_http
 
     reset_reports_for_test()
@@ -629,7 +629,7 @@ def test_a_degraded_transport_with_a_spent_deadline_still_names_the_missing_whee
     of a send that could not have happened anyway; a wheel with no working core
     is the finding, and it is the one that has to reach stderr.
     """
-    from wardex_sdk.assembly._diag import reset_reports_for_test
+    from wardex_sdk._assembly._diag import reset_reports_for_test
     from wardex_sdk.transport import _otlp_http
 
     reset_reports_for_test()
@@ -693,7 +693,7 @@ def _export_and_read(monkeypatch, capsys, exc, *, configured=10.0, budget=NAMED_
     """
     import urllib.request
 
-    from wardex_sdk.assembly._diag import reset_reports_for_test
+    from wardex_sdk._assembly._diag import reset_reports_for_test
 
     reset_reports_for_test()
     monkeypatch.setattr(urllib.request, "urlopen", _raising_urlopen(exc))
@@ -819,7 +819,7 @@ def test_the_cut_short_report_is_bounded_to_one_line_per_process(monkeypatch, ca
     envelope."""
     import urllib.request
 
-    from wardex_sdk.assembly._diag import reset_reports_for_test
+    from wardex_sdk._assembly._diag import reset_reports_for_test
 
     reset_reports_for_test()
     monkeypatch.setattr(urllib.request, "urlopen", _raising_urlopen(TimeoutError("timed out")))
@@ -837,7 +837,7 @@ def test_a_delivered_export_under_a_short_budget_reports_nothing(monkeypatch, ca
     backend answered inside of is an ordinary success."""
     import urllib.request
 
-    from wardex_sdk.assembly._diag import reset_reports_for_test
+    from wardex_sdk._assembly._diag import reset_reports_for_test
 
     class _Resp:
         def __enter__(self):
@@ -866,7 +866,7 @@ def test_the_missing_wheel_is_named_off_debug_even_with_a_spent_deadline(monkeyp
     unconditional and it is the finding worth acting on; the deadline is a
     detail of a send that could not have happened anyway.
     """
-    from wardex_sdk.assembly._diag import reset_reports_for_test
+    from wardex_sdk._assembly._diag import reset_reports_for_test
     from wardex_sdk.transport import _otlp_http
 
     reset_reports_for_test()

@@ -9,16 +9,7 @@ from contextlib import contextmanager
 from typing import Any
 
 from . import _hub
-from ._enums import CaptureSource, OperationName, SpanKind, StatusCode
-from ._types import (
-    AgentAttributes,
-    CallSite,
-    ConversationContext,
-    GenAIAttributes,
-    InternalSpan,
-    ToolAttributes,
-)
-from .assembly import (
+from ._assembly import (
     EMPTY_AMBIENT,
     Evidence,
     ParentSource,
@@ -30,6 +21,15 @@ from .assembly import (
     report_once,
     resolve_observed,
     resolve_parentage,
+)
+from ._enums import CaptureSource, OperationName, SpanKind, StatusCode
+from ._types import (
+    AgentAttributes,
+    CallSite,
+    ConversationContext,
+    GenAIAttributes,
+    InternalSpan,
+    ToolAttributes,
 )
 from .context._contextvar import fork_active_span
 
@@ -80,7 +80,7 @@ class SpanBuilder:
     # `finish()`, which is where the check belongs.
     #
     # `correlation` and `parent_span_id` are the two exceptions and they are
-    # read-only on purpose: parentage is decided by `assembly/_parentage.py`
+    # read-only on purpose: parentage is decided by `_assembly/_parentage.py`
     # (I1) and a span whose parent the host overwrote after the fact would
     # contradict the trace it was already forked into.
 

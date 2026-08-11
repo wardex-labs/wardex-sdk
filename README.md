@@ -335,7 +335,7 @@ whose entries are not spans — the lookup aliases that map a framework's own
 identifiers onto units, the keys that de-duplicate two observers of one event,
 and the table of in-process MCP servers wardex has wrapped. Evicting from any of
 them exports nothing, because there is no span to mark. They are counted
-internally instead — `wardex_sdk.assembly.counters.snapshot()` reports them
+internally instead — `wardex_sdk._assembly.counters.snapshot()` reports them
 under `assembly._units.alias_table_full`, `assembly._units.claim_table_full` and
 `adapters.anthropic.server_table_full` — and what reaches your data is the
 consequence rather than the eviction. A dropped de-duplication key, or a dropped

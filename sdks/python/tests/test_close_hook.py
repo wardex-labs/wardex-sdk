@@ -15,17 +15,17 @@ from types import SimpleNamespace
 import pytest
 from hpack import Encoder
 
+from wardex_sdk._assembly import Limitation, counters
 from wardex_sdk._enums import CaptureMode
-from wardex_sdk._limits import CaptureLimits
-from wardex_sdk.assembly import Limitation, counters
-from wardex_sdk.interceptors import _close_hook, _seam
-from wardex_sdk.interceptors._close_hook import (
+from wardex_sdk._interceptors import _close_hook, _seam
+from wardex_sdk._interceptors._close_hook import (
     CloseRegistry,
     close_registry,
     install_shared_close_hook,
     uninstall_shared_close_hook,
 )
-from wardex_sdk.interceptors._trackers import _Http2Tracker, _WebSocketTracker
+from wardex_sdk._interceptors._trackers import _Http2Tracker, _WebSocketTracker
+from wardex_sdk._limits import CaptureLimits
 
 
 @pytest.fixture(autouse=True)
@@ -619,8 +619,8 @@ def test_a_dropped_latch_entry_reaches_the_span_as_wardexs_own_fault():
     would otherwise have introduced.
     """
     from conftest import _FakeSSLSocket
-    from wardex_sdk.assembly import ParentSource
-    from wardex_sdk.interceptors._ssl import SSLInterceptor
+    from wardex_sdk._assembly import ParentSource
+    from wardex_sdk._interceptors._ssl import SSLInterceptor
 
     class _Client:
         class _Config:

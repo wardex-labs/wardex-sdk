@@ -1,5 +1,5 @@
-from wardex_sdk.assembly import Limitation
-from wardex_sdk.interceptors._trackers import _WebSocketTracker
+from wardex_sdk._assembly import Limitation
+from wardex_sdk._interceptors._trackers import _WebSocketTracker
 
 
 def _frame(fin: bool, opcode: int, payload: bytes) -> bytes:
