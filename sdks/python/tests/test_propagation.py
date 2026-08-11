@@ -6,7 +6,7 @@ import wardex_sdk
 from wardex_sdk import _hub
 from wardex_sdk._client import Client
 from wardex_sdk._config import BackendConfig, WardexConfig
-from wardex_sdk._tracing import span, trace
+from wardex_sdk._tracing import conversation, span
 from wardex_sdk._types import InternalEnvelope, SpanContext, SpanId, TraceId
 from wardex_sdk.transport._base import Transport
 
@@ -78,14 +78,14 @@ def test_remote_parent_is_marked_remote():
         active = _hub.get_current_scope().active_span_context
         assert active is not None and active.is_remote is True
     # locally started spans are not remote
-    with trace("root") as root:
+    with conversation("root") as root:
         assert root.context.is_remote is False
 
 
 def test_get_traceparent_inside_and_outside_span():
     _setup()
     assert wardex_sdk.get_traceparent() is None
-    with trace("root") as root:
+    with conversation("root") as root:
         tp = wardex_sdk.get_traceparent()
         assert tp == f"00-{root.context.trace_id.hex()}-{root.context.span_id.hex()}-01"
 
@@ -135,7 +135,7 @@ def test_the_readers_survive_a_context_value_that_cannot_be_copied():
     _hub.get_global_scope().set_context("runtime", {"lock": threading.Lock()})
     assert wardex_sdk.get_traceparent() is None
     assert wardex_sdk.get_trace_headers() == {}
-    with trace("root") as root:
+    with conversation("root") as root:
         assert wardex_sdk.get_traceparent().split("-")[1] == root.context.trace_id.hex()
         assert wardex_sdk.get_trace_headers()["traceparent"] == wardex_sdk.get_traceparent()
 

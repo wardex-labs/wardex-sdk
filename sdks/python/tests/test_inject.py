@@ -10,7 +10,7 @@ import wardex_sdk
 from wardex_sdk import _hub
 from wardex_sdk._client import Client
 from wardex_sdk._config import BackendConfig, PropagationConfig, WardexConfig
-from wardex_sdk._tracing import span, trace
+from wardex_sdk._tracing import conversation, span
 from wardex_sdk._types import InternalEnvelope
 from wardex_sdk.context._inject import (
     _build_inject_headers,
@@ -54,7 +54,7 @@ def _capture_request(**client_kwargs) -> httpx.Request:
 def test_injects_traceparent_inside_span():
     _setup(propagation=PropagationConfig(enabled=True))
     install_propagation()
-    with trace("root") as root:
+    with conversation("root") as root:
         req = _capture_request()
     assert req.headers["traceparent"].split("-")[1] == root.context.trace_id.hex()
 
@@ -69,7 +69,7 @@ def test_no_injection_outside_any_context():
 def test_no_injection_when_flag_off():
     _setup(propagation=PropagationConfig(enabled=False))
     install_propagation()  # wiring guards on the flag too, but the header path must also guard
-    with trace("root"):
+    with conversation("root"):
         req = _capture_request()
     assert "traceparent" not in req.headers
 
@@ -83,7 +83,7 @@ def test_user_header_never_overwritten():
         seen["tp"] = request.headers["traceparent"]
         return httpx.Response(200)
 
-    with trace("root"):
+    with conversation("root"):
         with httpx.Client(transport=httpx.MockTransport(handler)) as c:
             c.get("https://api.mycorp.com/x", headers={"traceparent": "user-set"})
     assert seen["tp"] == "user-set"
@@ -98,7 +98,7 @@ def test_targets_allowlist():
         seen[request.url.host] = "traceparent" in request.headers
         return httpx.Response(200)
 
-    with trace("root"):
+    with conversation("root"):
         with httpx.Client(transport=httpx.MockTransport(handler)) as c:
             c.get("https://api.mycorp.com/x")
             c.get("https://api.openai.com/v1/chat")
@@ -120,7 +120,7 @@ def test_targets_match_case_insensitively():
     config so that `targets` round-trips as written (see the test below).
     """
     _setup(propagation=PropagationConfig(enabled=True, targets=("*.MyCorp.com",)))
-    with trace("root"):
+    with conversation("root"):
         assert _build_inject_headers("api.mycorp.com") != {}  # pattern folded
         assert _build_inject_headers("API.MyCorp.COM") != {}  # host folded
         assert _build_inject_headers("api.othercorp.com") == {}  # still an allowlist
@@ -137,7 +137,7 @@ def test_targets_round_trip_verbatim_and_still_match_folded():
     _setup(propagation=PropagationConfig(enabled=True, targets=("*.MyCorp.com",)))
     client = _hub.get_client()
     assert client.config.propagation.targets == ("*.MyCorp.com",)  # verbatim readback
-    with trace("root"):
+    with conversation("root"):
         assert _build_inject_headers("api.mycorp.com") != {}  # and it still matches
 
 
@@ -153,7 +153,7 @@ def test_async_client_injects():
         return httpx.Response(200)
 
     async def main():
-        with trace("root"):
+        with conversation("root"):
             async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as c:
                 await c.get("https://api.mycorp.com/x")
 
@@ -262,7 +262,7 @@ def _get(library: str, url: str, *, headers=None, session_headers=None) -> None:
 def test_injects_on_every_patched_library(library, echo_server):
     _setup(propagation=PropagationConfig(enabled=True))
     install_propagation()
-    with trace("root") as root:
+    with conversation("root") as root:
         _get(library, f"{echo_server}/x")
     assert _sent("traceparent") == [
         f"00-{root.context.trace_id.hex()}-{root.context.span_id.hex()}-01"
@@ -275,7 +275,7 @@ def test_tracestate_forwarded_verbatim(library, echo_server):
     _setup(propagation=PropagationConfig(enabled=True))
     install_propagation()
     with wardex_sdk.continue_trace({"traceparent": tp, "tracestate": "dd=s:1"}):
-        with trace("root"):
+        with conversation("root"):
             _get(library, f"{echo_server}/x")
     assert _sent("tracestate") == ["dd=s:1"]
 
@@ -295,7 +295,7 @@ def test_a_non_ascii_inbound_tracestate_never_reaches_the_wire(library, echo_ser
     _setup(propagation=PropagationConfig(enabled=True))
     install_propagation()
     with wardex_sdk.continue_trace({"traceparent": tp, "tracestate": "ja=安全"}):
-        with trace("root"):
+        with conversation("root"):
             _get(library, f"{echo_server}/x")
     assert _sent("tracestate") == []  # dropped at the edge, not forwarded
     assert len(_sent("traceparent")) == 1  # one bad header is not two
@@ -315,7 +315,7 @@ def test_a_session_default_traceparent_wins_over_injection(library, echo_server)
     """
     _setup(propagation=PropagationConfig(enabled=True))
     install_propagation()
-    with trace("root"):
+    with conversation("root"):
         _get(library, f"{echo_server}/x", session_headers={"traceparent": "session-default"})
     assert _sent("traceparent") == ["session-default"]
 
@@ -324,7 +324,7 @@ def test_a_session_default_traceparent_wins_over_injection(library, echo_server)
 def test_a_per_request_traceparent_wins_over_injection(library, echo_server):
     _setup(propagation=PropagationConfig(enabled=True))
     install_propagation()
-    with trace("root"):
+    with conversation("root"):
         _get(library, f"{echo_server}/x", headers={"traceparent": "request-set"})
     assert _sent("traceparent") == ["request-set"]
 
@@ -350,7 +350,7 @@ def test_a_callers_tracestate_is_neither_replaced_nor_duplicated(library, echo_s
     _setup(propagation=PropagationConfig(enabled=True))
     install_propagation()
     with wardex_sdk.continue_trace({"traceparent": tp, "tracestate": "wardex=ours"}):
-        with trace("root"):
+        with conversation("root"):
             _get(library, f"{echo_server}/x", headers={"tracestate": "caller=theirs"})
     assert _sent("tracestate") == ["caller=theirs"]
     assert len(_sent("traceparent")) == 1
@@ -365,7 +365,7 @@ def test_aiohttp_preserves_duplicate_headers(echo_server):
     install_propagation()
 
     async def main():
-        with trace("root"):
+        with conversation("root"):
             async with aiohttp.ClientSession() as s:
                 headers = [("x-multi", "a"), ("x-multi", "b")]
                 async with s.get(f"{echo_server}/x", headers=headers) as resp:
@@ -575,7 +575,7 @@ def test_a_request_in_flight_while_the_sdk_closes_neither_crashes_nor_leaks():
         wardex_sdk.close()  # the host tears wardex down mid-request
         return httpx.Response(200)
 
-    with trace("root"):
+    with conversation("root"):
         with httpx.Client(transport=httpx.MockTransport(closing_handler)) as c:
             response = c.get("https://api.mycorp.com/x")
 
@@ -614,7 +614,7 @@ def test_close_under_live_traffic_raises_nothing_into_the_host():
             with httpx.Client(transport=transport) as c:
                 started.wait(timeout=5)
                 while not stop.is_set():
-                    with trace("root"):
+                    with conversation("root"):
                         c.get("https://api.mycorp.com/x")
         except BaseException as exc:  # noqa: BLE001 — the assertion is "none of these"
             errors.append(exc)
@@ -645,7 +645,7 @@ def test_exporter_post_not_injected():
     from wardex_sdk.context._inject import _build_inject_headers
 
     _setup(propagation=PropagationConfig(enabled=True))
-    with trace("root"):
+    with conversation("root"):
         assert _build_inject_headers("collector.mycorp.com") != {}
         with suppress_capture():
             assert _build_inject_headers("collector.mycorp.com") == {}
@@ -673,7 +673,7 @@ def test_end_to_end_chain_one_trace():
 
     async def main():
         with wardex_sdk.continue_trace({"traceparent": TP}):
-            with trace("agent-turn"):
+            with conversation("agent-turn"):
                 await asyncio.gather(tool(1), tool(2))
 
     asyncio.run(main())

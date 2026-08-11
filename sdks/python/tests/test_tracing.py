@@ -4,7 +4,7 @@ from wardex_sdk import _hub
 from wardex_sdk._client import Client
 from wardex_sdk._config import BackendConfig, WardexConfig
 from wardex_sdk._enums import OperationName, ProviderName, SpanKind, StatusCode
-from wardex_sdk._tracing import span, trace
+from wardex_sdk._tracing import conversation, span
 from wardex_sdk._types import GenAIAttributes, InternalEnvelope
 from wardex_sdk.transport._base import Transport
 
@@ -26,7 +26,7 @@ def _setup() -> _Recording:
 
 def test_span_records_to_client_on_exit():
     t = _setup()
-    with trace("session"):
+    with conversation("session"):
         with span("llm-call", kind=SpanKind.CLIENT) as s:
             s.set_gen_ai(
                 GenAIAttributes(operation=OperationName.CHAT, provider=ProviderName.ANTHROPIC)
@@ -45,7 +45,7 @@ def test_span_records_to_client_on_exit():
 
 def test_child_span_has_parent_of_active():
     t = _setup()
-    with trace("session"):
+    with conversation("session"):
         with span("child"):
             pass
     _hub.get_client().flush()
@@ -55,9 +55,9 @@ def test_child_span_has_parent_of_active():
     assert spans["child"].context.trace_id.value == spans["session"].context.trace_id.value
 
 
-def test_trace_assigns_conversation_id():
+def test_conversation_assigns_conversation_id():
     t = _setup()
-    with trace("session"):
+    with conversation("session"):
         with span("inner"):
             pass
     _hub.get_client().flush()
@@ -65,11 +65,11 @@ def test_trace_assigns_conversation_id():
     assert inner.conversation is not None and inner.conversation.conversation_id
 
 
-def test_trace_op_surfaces_in_extra():
+def test_conversation_op_surfaces_in_extra():
     t = _setup()
     from wardex_sdk._enums import OperationName
 
-    with trace("session", op=OperationName.INVOKE_WORKFLOW):
+    with conversation("session", op=OperationName.INVOKE_WORKFLOW):
         pass
     _hub.get_client().flush()
     sess = next(sp for sp in t.envelopes[0].spans if sp.name == "session")
@@ -82,7 +82,7 @@ def test_set_attribute_appears_in_console_output(capsys):
 
     _hub.reset_for_test()
     wardex_sdk.init(transport=wardex_sdk.ConsoleTransport(), backend=BackendConfig(api_key="k"))
-    with wardex_sdk.trace("s"):
+    with wardex_sdk.conversation("s"):
         with wardex_sdk.span("inner") as sp:
             sp.set_attribute("code.git.head_sha", "a1b2c3d")
             sp.set_attribute("turn", 1)
@@ -227,3 +227,182 @@ def test_a_bug_in_wardexs_own_span_does_not_silence_the_work_inside_it(monkeypat
 
     assert kept(False) is True
     assert kept(True) is True, "a wardex bug at the top silenced everything under it"
+
+
+# ==========================================================================
+# conversation(): a conversation id, not a trace root
+# ==========================================================================
+
+
+def test_conversation_uses_an_explicit_id_verbatim():
+    """A multi-turn chat app passes its own session id so its turns share ONE
+    conversation; `id=None` mints a fresh uuid4 per block."""
+    t = _setup()
+    with conversation("turn-1", id="chat-777"):
+        with span("inner"):
+            pass
+    _hub.get_client().flush()
+    inner = next(sp for sp in t.envelopes[0].spans if sp.name == "inner")
+    assert inner.conversation is not None
+    assert inner.conversation.conversation_id == "chat-777"
+
+
+def test_conversation_joins_the_ambient_trace_as_a_child():
+    """The reason it is not called "trace": no new trace_id is minted here."""
+    t = _setup()
+    with span("outer") as outer:
+        with conversation("turn"):
+            pass
+    _hub.get_client().flush()
+    spans = {sp.name: sp for sp in t.envelopes[0].spans}
+    assert spans["turn"].context.trace_id.value == outer.context.trace_id.value
+    assert spans["turn"].parent_span_id is not None
+    assert spans["turn"].parent_span_id.value == outer.context.span_id.value
+
+
+# ==========================================================================
+# the CM objects are not decorators — the async footgun is closed
+# ==========================================================================
+
+
+@pytest.mark.parametrize("factory", [lambda: span("x"), lambda: conversation("x")])
+def test_the_cm_object_refuses_to_decorate(factory):
+    """`@contextmanager` objects are ContextDecorators, and `@span("x")` on an
+    `async def` silently closed the span before any awaited work ran. Calling
+    the CM object is refused, naming the decorators that do it right."""
+    _setup()
+    cm = factory()
+    with pytest.raises(TypeError, match="@workflow/@agent/@step/@tool"):
+        cm(lambda: None)
+
+
+# ==========================================================================
+# scope tags/user reach exported spans (the stratum used to be write-only)
+# ==========================================================================
+
+
+def test_set_tag_lands_on_exported_spans():
+    import wardex_sdk
+
+    t = _setup()
+    wardex_sdk.set_tag("tenant", "acme")
+    with span("llm-call"):
+        pass
+    _hub.get_client().flush()
+    sp = next(s for s in t.envelopes[0].spans if s.name == "llm-call")
+    assert ("tenant", "acme") in sp.extra
+
+
+def test_a_span_local_attribute_wins_over_the_scope_tag():
+    import wardex_sdk
+
+    t = _setup()
+    wardex_sdk.set_tag("tenant", "scope-says")
+    with span("llm-call") as s:
+        s.set_attribute("tenant", "span-says")
+    _hub.get_client().flush()
+    sp = next(s for s in t.envelopes[0].spans if s.name == "llm-call")
+    assert ("tenant", "span-says") in sp.extra
+    assert ("tenant", "scope-says") not in sp.extra
+
+
+def test_set_user_maps_to_user_attributes():
+    import wardex_sdk
+    from wardex_sdk import UserInfo
+
+    t = _setup()
+    wardex_sdk.set_user(
+        UserInfo(id="u-1", email="u@example.com", username="ada", ip_address="10.1.2.3")
+    )
+    with span("llm-call"):
+        pass
+    _hub.get_client().flush()
+    sp = next(s for s in t.envelopes[0].spans if s.name == "llm-call")
+    assert ("user.id", "u-1") in sp.extra
+    assert ("user.email", "u@example.com") in sp.extra
+    assert ("user.name", "ada") in sp.extra
+    assert ("client.address", "10.1.2.3") in sp.extra
+
+
+def test_set_user_skips_none_fields():
+    import wardex_sdk
+    from wardex_sdk import UserInfo
+
+    t = _setup()
+    wardex_sdk.set_user(UserInfo(id="u-1"))
+    with span("llm-call"):
+        pass
+    _hub.get_client().flush()
+    sp = next(s for s in t.envelopes[0].spans if s.name == "llm-call")
+    assert ("user.id", "u-1") in sp.extra
+    keys = {k for k, _ in sp.extra}
+    assert "user.email" not in keys
+    assert "user.name" not in keys
+    assert "client.address" not in keys
+
+
+def test_set_user_none_clears_the_user():
+    import wardex_sdk
+    from wardex_sdk import UserInfo
+
+    t = _setup()
+    wardex_sdk.set_user(UserInfo(id="u-1", email="u@example.com"))
+    wardex_sdk.set_user(None)
+    with span("llm-call"):
+        pass
+    _hub.get_client().flush()
+    sp = next(s for s in t.envelopes[0].spans if s.name == "llm-call")
+    keys = {k for k, _ in sp.extra}
+    assert not any(k.startswith("user.") for k in keys)
+    assert "client.address" not in keys
+
+
+def test_isolation_scope_tags_do_not_leak_to_spans_outside():
+    import wardex_sdk
+
+    t = _setup()
+    with wardex_sdk.isolation_scope():
+        wardex_sdk.set_tag("request", "r-1")
+        with span("inside"):
+            pass
+    with span("outside"):
+        pass
+    _hub.get_client().flush()
+    spans = {sp.name: sp for sp in t.envelopes[0].spans}
+    assert ("request", "r-1") in spans["inside"].extra
+    assert ("request", "r-1") not in spans["outside"].extra
+
+
+def test_a_current_scope_tag_overrides_the_isolation_scopes():
+    """The Global → Isolation → Current layering lands the overriding value."""
+    import wardex_sdk
+
+    t = _setup()
+    wardex_sdk.set_tag("env", "isolation-says")
+    with _hub.new_scope() as current:
+        current.set_tag("env", "current-says")
+        with span("llm-call"):
+            pass
+    _hub.get_client().flush()
+    sp = next(s for s in t.envelopes[0].spans if s.name == "llm-call")
+    assert ("env", "current-says") in sp.extra
+    assert ("env", "isolation-says") not in sp.extra
+
+
+def test_snapshots_are_not_stamped_with_scope_tags():
+    import wardex_sdk
+    from wardex_sdk._types import ToolDefinitionSet
+
+    t = _setup()
+    wardex_sdk.set_tag("tenant", "acme")
+    with conversation("s"):
+        wardex_sdk.capture_state_snapshot(
+            turn_index=0,
+            conversation_state=b"{}",
+            tool_definitions=ToolDefinitionSet(),
+        )
+    _hub.get_client().flush()
+    snapshots = t.envelopes[0].state_snapshots
+    assert snapshots, "the snapshot must still be captured"
+    for snap in snapshots:
+        assert ("tenant", "acme") not in (snap.attributes or ())

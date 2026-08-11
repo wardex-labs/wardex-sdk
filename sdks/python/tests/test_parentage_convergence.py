@@ -29,7 +29,7 @@ from wardex_sdk._enums import CaptureMode
 from wardex_sdk._interceptors._mcp_stdio import _ProcState
 from wardex_sdk._interceptors._seam import ByteSeamInterceptor, _ConnectionState
 from wardex_sdk._interceptors._trackers import _Txn
-from wardex_sdk._tracing import span, trace
+from wardex_sdk._tracing import conversation, span
 from wardex_sdk._types import ToolDefinitionSet
 
 SAMPLED = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
@@ -173,7 +173,7 @@ _SPAN_SITES = {
 def test_every_site_reports_a_local_parent_identically(site):
     client = _client()
 
-    with trace("root") as root:
+    with conversation("root") as root:
         emitted = _SPAN_SITES[site](client)
 
     assert emitted.context.trace_id == root.context.trace_id
@@ -242,7 +242,7 @@ def test_no_site_disagrees_about_the_shape_of_one_run():
     """The five sites in one process, one ambient span: one trace, one parent."""
     client = _client()
 
-    with trace("root") as root:
+    with conversation("root") as root:
         emitted = [driver(client) for _, driver in sorted(_SPAN_SITES.items())]
 
     assert {s.context.trace_id for s in emitted} == {root.context.trace_id}
@@ -306,7 +306,7 @@ def test_a_guessed_adapter_edge_makes_no_confidence_claim():
     """
     client = _client()
 
-    with trace("root"):
+    with conversation("root"):
         _assembler_with_an_unresolvable_stream_parent(client)
 
     chat = next(s for s in client.spans if s.name.startswith("chat "))
@@ -321,7 +321,7 @@ def test_only_the_adapter_root_publishes_a_resolved_correlation():
     """
     client = _client()
 
-    with trace("root"):
+    with conversation("root"):
         asm = _assembler_with_an_unresolvable_stream_parent(client)
         asm.on_hook("SubagentStart", {"session_id": "s-1", "agent_id": "a-1"}, None)
         asm.on_hook("SubagentStop", {"session_id": "s-1", "agent_id": "a-1"}, None)
@@ -349,7 +349,7 @@ def test_no_undeclared_strategy_value_reaches_the_wire():
     """
     client = _client()
 
-    with trace("root"):
+    with conversation("root"):
         asm = _assembler_with_an_unresolvable_stream_parent(client)
         asm.on_hook("SubagentStart", {"session_id": "s-1", "agent_id": "a-1"}, None)
         asm.on_hook("SubagentStop", {"session_id": "s-1", "agent_id": "a-1"}, None)
@@ -383,7 +383,7 @@ def test_snapshot_still_attaches_to_the_active_span():
     """The unchanged half: a snapshot names an EXISTING span, not a new child."""
     client = _client()
 
-    with trace("root") as root:
+    with conversation("root") as root:
         wardex_sdk.capture_state_snapshot(conversation_state=b"{}")
 
     (snapshot,) = client.snapshots
@@ -476,7 +476,7 @@ def test_manual_span_now_carries_correlation():
     """BEHAVIOUR CHANGE: manual spans had `correlation=None` on every path."""
     client = _client()
 
-    with trace("root") as root:
+    with conversation("root") as root:
         with span("inner"):
             pass
 
@@ -505,7 +505,7 @@ def test_manual_root_still_emits_a_sampled_traceparent():
     """
     _client()
 
-    with trace("root"):
+    with conversation("root"):
         assert wardex_sdk.get_traceparent().endswith("-01")
 
 

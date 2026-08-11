@@ -27,7 +27,8 @@ class Scope:
     def set_tag(self, key: str, value: str) -> None:
         self.tags[key] = value
 
-    def set_user(self, user: UserInfo) -> None:
+    def set_user(self, user: UserInfo | None) -> None:
+        """Attach `user` to this scope; `None` clears it again."""
         self.user = user
 
     def set_context(self, key: str, value: dict[str, Any]) -> None:
@@ -92,3 +93,30 @@ def merged_trace_fields(
         if layer.tracestate is not None:
             tracestate = layer.tracestate
     return active, tracestate
+
+
+def merged_tags_and_user(
+    global_: Scope, isolation: Scope, current: Scope
+) -> tuple[dict[str, str], UserInfo | None]:
+    """The tags and user `merge_scopes` would produce, and nothing else.
+
+    Same layers, same precedence — tags dict-merged Global → Isolation →
+    Current with later layers overriding keys, user last-non-None — and
+    deliberately adjacent to `merge_scopes` so the rule cannot be changed in
+    one of them and missed in the other, exactly like `merged_trace_fields`
+    above.
+
+    Separate from `merge_scopes` for `merged_trace_fields`' reason: the full
+    merge `copy.deepcopy`s `contexts`, dicts the host filled with objects of
+    its own choosing, and this reader runs on the capture path of every span.
+    Tags are `str -> str` and `UserInfo` is frozen, so copying the tag dict is
+    bounded and nothing here can run host code or raise on an uncopyable
+    context value.
+    """
+    tags = dict(global_.tags)
+    user = global_.user
+    for layer in (isolation, current):
+        tags.update(layer.tags)
+        if layer.user is not None:
+            user = layer.user
+    return tags, user

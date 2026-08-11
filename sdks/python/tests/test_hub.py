@@ -26,3 +26,24 @@ def test_isolation_scope_resets_current():
         assert _hub.get_current_scope().tags.get("outer") is None
         _hub.get_current_scope().set_tag("req", "r1")
     assert _hub.get_current_scope().tags.get("req") is None
+
+
+def test_isolation_scope_forks_the_enclosing_isolation_scope():
+    """Sentry 2.x semantics: ambient context inherited, mutations isolated.
+
+    The block used to start from a BLANK isolation scope, so a tag set on the
+    enclosing one — a tenant id, a user — vanished inside every
+    `isolation_scope()` block. A fork inherits it."""
+    _hub.get_isolation_scope().set_tag("tenant", "acme")
+    with _hub.isolation_scope() as forked:
+        assert forked.tags.get("tenant") == "acme"
+        assert _hub.get_isolation_scope() is forked
+
+
+def test_isolation_scope_mutations_do_not_leak_out():
+    _hub.get_isolation_scope().set_tag("tenant", "acme")
+    with _hub.isolation_scope():
+        _hub.get_isolation_scope().set_tag("tenant", "inner")
+        _hub.get_isolation_scope().set_tag("request", "r1")
+    assert _hub.get_isolation_scope().tags.get("tenant") == "acme"
+    assert _hub.get_isolation_scope().tags.get("request") is None

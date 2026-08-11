@@ -4,7 +4,7 @@ from wardex_sdk import _hub
 from wardex_sdk._client import Client
 from wardex_sdk._config import BackendConfig, WardexConfig
 from wardex_sdk._tracing import agent as agent_deco
-from wardex_sdk._tracing import task, tool, trace, workflow
+from wardex_sdk._tracing import conversation, step, tool, workflow
 from wardex_sdk._types import AgentAttributes, InternalEnvelope, ToolAttributes
 from wardex_sdk.transport._base import Transport
 
@@ -36,7 +36,7 @@ def test_workflow_decorator_sync():
     def run():
         return 42
 
-    with trace("s"):
+    with conversation("s"):
         assert run() == 42
     spans = _all_spans(t)
     sp = spans["research-graph"]
@@ -48,42 +48,110 @@ def test_workflow_decorator_sync():
 def test_tool_decorator_sets_attrs():
     t = _setup()
 
-    @tool(name="web_search", tool=ToolAttributes(name="web_search"))
+    @tool(name="web_search", attributes=ToolAttributes(name="web_search"))
     def search():
         return "ok"
 
-    with trace("s"):
+    with conversation("s"):
         search()
     sp = _all_spans(t)["web_search"]
     assert sp.tool is not None and sp.tool.name == "web_search"
     assert ("gen_ai.operation.name", "execute_tool") in sp.extra
 
 
-def test_task_decorator_is_sugar_only_no_op():
+def test_step_decorator_maps_execute_step():
+    """`@step` spans carry an operation like every other decorator's — the old
+    `task()` mapped none, and its spans vanished from any dashboard keyed on
+    `gen_ai.operation.name`. The span NAME stays the given name, exactly as
+    workflow/agent/tool names come out."""
     t = _setup()
 
-    @task(name="summarize")
+    @step(name="summarize")
     def do():
         return 1
 
-    with trace("s"):
+    with conversation("s"):
         do()
     sp = _all_spans(t)["summarize"]
-    assert sp.extra == ()
+    assert ("gen_ai.operation.name", "execute_step") in sp.extra
 
 
 def test_agent_decorator_async():
     t = _setup()
 
-    @agent_deco(name="researcher", agent=AgentAttributes(name="researcher"))
+    @agent_deco(name="researcher", attributes=AgentAttributes(name="researcher"))
     async def run_agent():
         return "done"
 
     async def main():
-        with trace("s"):
+        with conversation("s"):
             return await run_agent()
 
     assert asyncio.run(main()) == "done"
     sp = _all_spans(t)["researcher"]
     assert sp.agent is not None and sp.agent.name == "researcher"
     assert ("gen_ai.operation.name", "invoke_agent") in sp.extra
+
+
+# ==========================================================================
+# bare form: @wardex.tool with no parentheses, name defaults to fn.__name__
+# ==========================================================================
+
+
+def test_bare_decorators_default_the_name_to_the_function():
+    t = _setup()
+
+    @tool
+    def web_search():
+        return "ok"
+
+    @workflow
+    def research_graph():
+        return web_search()
+
+    @step
+    def summarize():
+        return 1
+
+    @agent_deco
+    def researcher():
+        return summarize()
+
+    with conversation("s"):
+        assert research_graph() == "ok"
+        assert researcher() == 1
+    spans = _all_spans(t)
+    assert ("gen_ai.operation.name", "execute_tool") in spans["web_search"].extra
+    assert ("gen_ai.operation.name", "invoke_workflow") in spans["research_graph"].extra
+    assert spans["research_graph"].workflow_name == "research_graph"
+    assert ("gen_ai.operation.name", "execute_step") in spans["summarize"].extra
+    assert ("gen_ai.operation.name", "invoke_agent") in spans["researcher"].extra
+
+
+def test_keyword_form_name_defaults_to_the_function_when_omitted():
+    t = _setup()
+
+    @tool(attributes=ToolAttributes(name="lookup"))
+    def lookup():
+        return "ok"
+
+    with conversation("s"):
+        lookup()
+    sp = _all_spans(t)["lookup"]
+    assert sp.tool is not None and sp.tool.name == "lookup"
+
+
+def test_bare_decorator_on_an_async_function():
+    t = _setup()
+
+    @tool
+    async def fetch():
+        return "ok"
+
+    async def main():
+        with conversation("s"):
+            return await fetch()
+
+    assert asyncio.run(main()) == "ok"
+    sp = _all_spans(t)["fetch"]
+    assert ("gen_ai.operation.name", "execute_tool") in sp.extra
