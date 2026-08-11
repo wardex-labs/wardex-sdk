@@ -11,7 +11,11 @@ def setup_function():
 
 
 def test_init_console_and_trace_flush(capsys):
-    wardex_sdk.init(transport=wardex_sdk.ConsoleTransport(), backend=BackendConfig(api_key="k"))
+    wardex_sdk.init(
+        transport=wardex_sdk.ConsoleTransport(),
+        backend=BackendConfig(api_key="k"),
+        intercept=False,
+    )
     with wardex_sdk.trace("s"):
         with wardex_sdk.span("inner") as sp:
             sp.input_data = b"hi"
@@ -21,7 +25,7 @@ def test_init_console_and_trace_flush(capsys):
 
 
 def test_capture_state_snapshot_recorded():
-    wardex_sdk.init(backend=BackendConfig(api_key="k"))
+    wardex_sdk.init(backend=BackendConfig(api_key="k"), intercept=False)
     with wardex_sdk.trace("s"):
         wardex_sdk.capture_state_snapshot(
             turn_index=0,
@@ -52,13 +56,13 @@ def test_public_exports_exist():
         assert hasattr(wardex_sdk, name), name
 
 
-def test_capture_limits_is_public():
-    assert "CaptureLimits" in wardex_sdk.__all__
-    assert wardex_sdk.CaptureLimits().max_body_bytes is None
+def test_limits_config_is_public():
+    assert "LimitsConfig" in wardex_sdk.__all__
+    assert wardex_sdk.LimitsConfig().max_body_bytes is None
 
 
 def test_capture_state_snapshot_with_input_refs():
-    wardex_sdk.init(backend=BackendConfig(api_key="k"))
+    wardex_sdk.init(backend=BackendConfig(api_key="k"), intercept=False)
     with wardex_sdk.trace("s"):
         wardex_sdk.capture_state_snapshot(
             turn_index=1,

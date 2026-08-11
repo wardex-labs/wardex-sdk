@@ -139,7 +139,7 @@ sys.meta_path.insert(0, Blocker())
 
 import wardex_sdk
 from wardex_sdk import (
-    CaptureLimits,
+    LimitsConfig,
     ConsoleTransport,
     NoOpTransport,
     OtlpHttpTransport,
@@ -155,7 +155,7 @@ print("STEP import")
 
 def _limits_resolved_raises():
     try:
-        CaptureLimits().resolved()
+        LimitsConfig().resolved()
     except RuntimeError as exc:
         # Named, not bare: the reader has to be sent to the wheel and not to
         # their own configuration.
@@ -174,7 +174,7 @@ def _limits_to_native_raises():
     sends the reader into wardex's internals instead of to their wheel.
     """
     try:
-        CaptureLimits(max_headers=4).to_native()
+        LimitsConfig(max_headers=4).to_native()
     except RuntimeError as exc:
         assert "native extension unavailable" in str(exc), exc
         return
@@ -190,7 +190,7 @@ def _config_groups_ctor():
     WHOLE config before it looks at `NATIVE_OK`, so a group that needed the
     extension would turn "wardex is disabled" into an ImportError raised out of
     the host's startup — the one failure this package's degraded mode exists to
-    prevent. Driven rather than declared inert for `CaptureLimits`'s reason: a
+    prevent. Driven rather than declared inert for `LimitsConfig`'s reason: a
     group is a constructor with validation in it, so it has code that can fail.
 
     `WardexConfig` comes from its private home: the class left the root
@@ -202,11 +202,10 @@ def _config_groups_ctor():
 
     WardexConfig(
         backend=wardex_sdk.BackendConfig(api_key="k", endpoint="http://127.0.0.1:1"),
-        retention=wardex_sdk.RetentionPolicy(),
-        pii=wardex_sdk.PIIPolicy(),
-        batching=wardex_sdk.BatchingPolicy(flush_interval=1.0),
-        limits=CaptureLimits(),
-        propagation=wardex_sdk.PropagationPolicy(enabled=True, targets=("*.example",)),
+        pii=wardex_sdk.PIIConfig(),
+        batching=wardex_sdk.BatchingConfig(flush_interval=1.0),
+        limits=LimitsConfig(),
+        propagation=wardex_sdk.PropagationConfig(enabled=True, targets=("*.example",)),
     )
 
 
@@ -220,9 +219,10 @@ def _config_kwarg_still_validated():
         raise AssertionError("init() accepted an unknown keyword")
     # And a field that moved into a config group is the same programming error
     # wearing a familiar name, so it must reach the same answer here. `init()`
-    # builds the config BEFORE it checks the core, which is what makes that
-    # true; a degraded mode that returned first would take a keyword nobody
-    # supports and do nothing about it.
+    # has an explicit keyword-only signature, so the refusal happens at
+    # argument binding — before the body could ever consult the core — and a
+    # degraded mode that swallowed it would take a keyword nobody supports and
+    # do nothing about it.
     try:
         wardex_sdk.init(api_key="k")
     except TypeError:
@@ -360,7 +360,7 @@ def _submodules_that_still_raise():
 
 
 STEPS = [
-    ("limits_ctor", lambda: CaptureLimits(max_headers=4)),
+    ("limits_ctor", lambda: LimitsConfig(max_headers=4)),
     ("config_groups_ctor", _config_groups_ctor),
     ("limits_resolved_raises", _limits_resolved_raises),
     ("limits_to_native_raises", _limits_to_native_raises),
@@ -509,7 +509,7 @@ def test_a_hand_driven_transport_says_why_it_dropped_the_batch(tmp_path, flavour
 # The `__all__` names the child actually drives, by the name they are exported
 # under. Kept next to the assertion below rather than derived from `_STEPS`,
 # because a step name and an export name are not the same thing on purpose
-# (`traceparent` drives `get_traceparent`, `limits_ctor` drives `CaptureLimits`).
+# (`traceparent` drives `get_traceparent`, `limits_ctor` drives `LimitsConfig`).
 _DRIVEN = frozenset(
     {
         "init",
@@ -533,12 +533,11 @@ _DRIVEN = frozenset(
         "get_trace_headers",
         "WardexMiddleware",
         "WardexWSGIMiddleware",
-        "CaptureLimits",
+        "LimitsConfig",
         "BackendConfig",
-        "BatchingPolicy",
-        "PIIPolicy",
-        "PropagationPolicy",
-        "RetentionPolicy",
+        "BatchingConfig",
+        "PIIConfig",
+        "PropagationConfig",
         "UserInfo",
         "NoOpTransport",
         "ConsoleTransport",
@@ -567,9 +566,9 @@ def test_the_degraded_checklist_covers_the_whole_public_surface():
         and issubclass(getattr(wardex_sdk, n), enum.Enum)
     }
     # Nothing to call and no core reach: a version string, the transport ABC the
-    # three concrete transports above implement, and the plain dataclasses the
-    # tracing surface is typed with (attribute blocks, tool definitions, the
-    # scope object).
+    # three concrete transports above implement, a warning category, and the
+    # plain dataclasses the tracing surface is typed with (attribute blocks,
+    # tool definitions, the scope object).
     inert = {
         "__version__",
         "Transport",
@@ -582,6 +581,7 @@ def test_the_degraded_checklist_covers_the_whole_public_surface():
         "ToolAttributes",
         "ToolDefinition",
         "ToolDefinitionSet",
+        "WardexConfigWarning",
     }
     uncovered = surface - _DRIVEN - enums - inert
     assert not uncovered, (

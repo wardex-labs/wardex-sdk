@@ -21,7 +21,7 @@ from wardex_sdk import _hub, _runtime
 from wardex_sdk._adapters._base import AdapterInterface
 from wardex_sdk._assembly import Limitation
 from wardex_sdk._client import Client
-from wardex_sdk._config import BackendConfig, BatchingPolicy, PropagationPolicy, WardexConfig
+from wardex_sdk._config import BackendConfig, BatchingConfig, PropagationConfig, WardexConfig
 from wardex_sdk._enums import SpanKind
 from wardex_sdk._types import InternalEnvelope, InternalSpan, SpanContext, SpanId, TraceId
 from wardex_sdk.transport._base import Transport
@@ -49,6 +49,11 @@ def _span() -> InternalSpan:
 
 
 def _client(transport: Transport | None = None, **cfg: object) -> Client:
+    # intercept=False: these are structural tests of the runtime's slots and
+    # ordering. `intercept` now defaults to True, and letting each install()
+    # here patch the real byte seams would make every assertion below about
+    # the seams' state instead of the runtime's.
+    cfg.setdefault("intercept", False)
     return Client(
         WardexConfig(backend=BackendConfig(api_key="k"), **cfg), transport or _Recording()
     )
@@ -114,7 +119,7 @@ def test_reset_for_test_empties_every_state_the_runtime_owns():
     from wardex_sdk._interceptors._registry import get_registry as interceptor_registry
 
     runtime = _runtime.runtime()
-    client = _client(batching=BatchingPolicy(flush_interval=3600.0))
+    client = _client(batching=BatchingConfig(flush_interval=3600.0))
     adapter = _FakeAdapter()
 
     runtime.install(client, client.config)
@@ -153,7 +158,7 @@ def test_the_hub_and_the_runtime_read_one_client_slot():
     cleared one, and the atexit path read the other — so a test that reset the
     hub left `atexit` holding a client the SDK had already forgotten.
     """
-    client = _client(batching=BatchingPolicy(flush_interval=3600.0))
+    client = _client(batching=BatchingConfig(flush_interval=3600.0))
     _runtime.runtime().install(client, client.config)
     try:
         assert _hub.get_client() is client
@@ -208,7 +213,7 @@ def test_init_then_close_puts_every_patched_attribute_back():
     wardex.init(
         intercept=True,
         backend=BackendConfig(api_key="k"),
-        propagation=PropagationPolicy(enabled=True),
+        propagation=PropagationConfig(enabled=True),
     )
     during = _process_seams()
     assert any(during[name] is not before[name] for name in before), (
@@ -222,17 +227,20 @@ def test_init_then_close_puts_every_patched_attribute_back():
         assert after[name] is original, f"{name} was not restored to the host's own object"
 
 
-def test_a_default_init_still_behaves_the_way_it_did_before_the_grouping():
+def test_a_default_init_behaves_as_documented_end_to_end():
     """Defaults END TO END, not only on the dataclass.
 
     Every per-field default assertion in `test_config.py` would still pass if a
     READ site were left pointing at a field that moved: the config object would
     be right and the runtime would ignore it. This is the other end of each
     default — the flush interval the worker was actually built with, the signal
-    handlers `flush_on_signals=True` installs, and the outbound traffic a
-    default init must not touch.
+    handlers `flush_on_signals=True` installs, the byte seams `intercept=True`
+    (the flipped default) installs, and the outbound traffic a default init
+    must still never MUTATE: capture is on by default, propagation is not.
     """
     import httpx
+
+    from wardex_sdk._interceptors._registry import get_registry as interceptor_registry
 
     untouched = httpx.Client.send
 
@@ -241,9 +249,13 @@ def test_a_default_init_still_behaves_the_way_it_did_before_the_grouping():
     try:
         assert client._worker._interval == 5.0, "batching.flush_interval"
         assert _runtime.runtime()._signals_installed, "batching.flush_on_signals"
+        assert client.config.intercept is True, "intercept defaults on"
+        assert interceptor_registry().is_installed("ssl"), (
+            "intercept=True is the default and init() is the consent — a "
+            "default init installs the byte seams"
+        )
         assert httpx.Client.send is untouched, "propagation.enabled must default to off"
         assert client.config.pii.mode.value == "mask", "pii.mode"
-        assert client.config.effective_retention.value == "summary_only", "retention.default"
     finally:
         wardex.close()
 
@@ -261,7 +273,11 @@ def test_the_atexit_teardown_drops_the_propagation_patches_too():
     import httpx
 
     original = httpx.Client.send
-    wardex.init(backend=BackendConfig(api_key="k"), propagation=PropagationPolicy(enabled=True))
+    wardex.init(
+        intercept=False,
+        backend=BackendConfig(api_key="k"),
+        propagation=PropagationConfig(enabled=True),
+    )
     assert httpx.Client.send is not original, "propagation never installed"
 
     _runtime.runtime()._at_exit()
@@ -284,7 +300,9 @@ def test_a_backend_endpoint_builds_the_default_otlp_transport():
     """
     from wardex_sdk.transport import OtlpHttpTransport
 
-    wardex.init(backend=BackendConfig(endpoint="http://collector.invalid/v1/traces"))
+    wardex.init(
+        intercept=False, backend=BackendConfig(endpoint="http://collector.invalid/v1/traces")
+    )
     client = _hub.get_client()
     try:
         assert isinstance(client._transport, OtlpHttpTransport)
@@ -295,31 +313,103 @@ def test_a_backend_endpoint_builds_the_default_otlp_transport():
         wardex.close()
 
 
-def test_an_explicit_transport_wins_over_the_endpoint_and_debug_says_so(capsys):
-    """A `Transport` carries its own address, so `transport=` beats the field —
-    and the losing endpoint is announced under `debug`, because a config value
-    that loses a precedence fight in silence looks exactly like one that won."""
-    transport = _Recording()
+def test_a_bare_collector_address_gets_the_traces_path_appended():
+    """THE ENDPOINT RULE: a URL whose path is empty or `/` is a collector base
+    address, so the default transport POSTs to `<base>/v1/traces`; the config
+    itself keeps the address exactly as written (round-trips as written)."""
+    from wardex_sdk.transport import OtlpHttpTransport
+
+    for configured in ("http://collector.invalid:4318", "http://collector.invalid:4318/"):
+        wardex.init(intercept=False, backend=BackendConfig(endpoint=configured))
+        client = _hub.get_client()
+        try:
+            assert isinstance(client._transport, OtlpHttpTransport)
+            assert client._transport._endpoint == "http://collector.invalid:4318/v1/traces"
+            assert client.config.backend.endpoint == configured, (
+                "the append is the transport builder's; the config must read back as written"
+            )
+        finally:
+            wardex.close()
+
+
+def test_an_explicit_endpoint_path_is_used_verbatim():
     wardex.init(
-        transport=transport,
-        backend=BackendConfig(endpoint="http://collector.invalid/v1/traces"),
-        debug=True,
+        intercept=False,
+        backend=BackendConfig(endpoint="http://collector.invalid:4318/custom/route"),
     )
     client = _hub.get_client()
     try:
-        assert client._transport is transport
-        assert "endpoint ignored" in capsys.readouterr().err
+        assert client._transport._endpoint == "http://collector.invalid:4318/custom/route"
     finally:
         wardex.close()
 
 
-def test_no_transport_and_no_endpoint_still_installs_the_noop_default():
+def test_an_explicit_transport_wins_over_the_endpoint_and_a_warning_says_so():
+    """A `Transport` carries its own address, so `transport=` beats the field —
+    and the losing endpoint is announced with a `WardexConfigWarning`,
+    unconditionally where it used to hide behind `debug`, because a config
+    value that loses a precedence fight in silence looks exactly like one that
+    won."""
+    transport = _Recording()
+    with pytest.warns(wardex.WardexConfigWarning, match="endpoint ignored"):
+        wardex.init(
+            transport=transport,
+            intercept=False,
+            backend=BackendConfig(endpoint="http://collector.invalid/v1/traces"),
+        )
+    client = _hub.get_client()
+    try:
+        assert client._transport is transport
+    finally:
+        wardex.close()
+
+
+def test_pii_exemptions_under_mode_off_are_announced():
+    """The second conflict case: categories exempted from a masking that is
+    off. Legal, but never to be confused with a setting that was honoured."""
+    from wardex_sdk import PIICategory, PIIConfig, PIIMode
+
+    with pytest.warns(wardex.WardexConfigWarning, match="no effect when pii mode is OFF"):
+        wardex.init(
+            intercept=False,
+            transport=_Recording(),
+            pii=PIIConfig(mode=PIIMode.OFF, disabled_categories={PIICategory.EMAIL}),
+        )
+    wardex.close()
+
+
+def test_no_transport_and_no_endpoint_still_installs_the_noop_default(capsys):
     from wardex_sdk.transport._noop import NoOpTransport
 
-    wardex.init(backend=BackendConfig(api_key="k"))
+    wardex.init(intercept=False, backend=BackendConfig(api_key="k"))
     client = _hub.get_client()
     try:
         assert isinstance(client._transport, NoOpTransport)
+        # Unconditional, not debug-gated: a wardex capturing into nothing looks
+        # exactly like a backend receiving no traffic, so it says so once.
+        assert (
+            "no transport or backend.endpoint configured: capturing, exporting nothing"
+            in capsys.readouterr().err
+        )
+    finally:
+        wardex.close()
+
+
+def test_debug_prints_the_resolved_config_once(capsys):
+    """`debug=True` prints the RESOLVED config at install time — the one the
+    client actually carries — and `api_key` is `repr=False`, so the line can
+    never leak a credential."""
+    wardex.init(
+        intercept=False,
+        transport=_Recording(),
+        backend=BackendConfig(api_key="wk-secret-123"),
+        debug=True,
+    )
+    try:
+        err = capsys.readouterr().err
+        assert err.count("[wardex] resolved config: ") == 1
+        assert "WardexConfig(" in err
+        assert "wk-secret-123" not in err
     finally:
         wardex.close()
 
@@ -333,8 +423,9 @@ def test_close_twice_is_a_no_op():
     transport = _Recording()
     wardex.init(
         transport=transport,
+        intercept=False,
         backend=BackendConfig(api_key="k"),
-        batching=BatchingPolicy(flush_interval=3600.0),
+        batching=BatchingConfig(flush_interval=3600.0),
     )
     client = _hub.get_client()
     client.capture_span(_span())
@@ -353,8 +444,9 @@ def test_close_after_a_teardown_is_a_no_op():
     transport = _Recording()
     wardex.init(
         transport=transport,
+        intercept=False,
         backend=BackendConfig(api_key="k"),
-        batching=BatchingPolicy(flush_interval=3600.0),
+        batching=BatchingConfig(flush_interval=3600.0),
     )
     client = _hub.get_client()
     client.capture_span(_span())
@@ -367,7 +459,7 @@ def test_close_after_a_teardown_is_a_no_op():
 
 
 def test_reset_twice_is_a_no_op():
-    wardex.init(backend=BackendConfig(api_key="k"))
+    wardex.init(intercept=False, backend=BackendConfig(api_key="k"))
     _hub.reset_for_test()
     _hub.reset_for_test()  # must not raise on an already-empty runtime
     assert _runtime.runtime().client is None
@@ -402,7 +494,7 @@ def test_the_signal_handler_does_not_wait_for_a_shutdown_on_another_thread():
     """
     runtime = _runtime.runtime()
     transport = _Recording()
-    client = _client(transport, batching=BatchingPolicy(flush_interval=3600.0))
+    client = _client(transport, batching=BatchingConfig(flush_interval=3600.0))
     runtime.install(client, client.config)
     client.capture_span(_span())
 
@@ -448,7 +540,7 @@ def test_a_signal_landing_inside_a_teardown_still_reaches_the_apps_handler():
     short of SIGKILL.
     """
     runtime = _runtime.runtime()
-    client = _client(batching=BatchingPolicy(flush_interval=3600.0))
+    client = _client(batching=BatchingConfig(flush_interval=3600.0))
     runtime.install(client, client.config)
 
     seen: list[int] = []
@@ -468,7 +560,7 @@ def test_the_handler_closes_live_units_through_the_runtimes_own_registry():
     reference to a registry entry the next test knows nothing about.
     """
     runtime = _runtime.runtime()
-    client = _client(batching=BatchingPolicy(flush_interval=3600.0))
+    client = _client(batching=BatchingConfig(flush_interval=3600.0))
     runtime.install(client, client.config)
 
     assert runtime._close_units is not None
@@ -481,7 +573,7 @@ def test_the_handler_closes_live_units_through_the_runtimes_own_registry():
 def test_close_units_all_is_what_the_handler_reaches_on_the_dying_disposition():
     """The marker the census pins to this module, driven end to end."""
     runtime = _runtime.runtime()
-    client = _client(batching=BatchingPolicy(flush_interval=3600.0))
+    client = _client(batching=BatchingConfig(flush_interval=3600.0))
     runtime.install(client, client.config)
 
     marks: list[Limitation] = []

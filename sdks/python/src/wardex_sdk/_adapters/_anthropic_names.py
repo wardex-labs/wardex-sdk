@@ -54,7 +54,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from .._assembly import UnitKey, counters
-from .._limits import CaptureLimits
+from .._limits import LimitsConfig
 
 _PREFIX = "mcp__"
 _UNSAFE = re.compile(r"[^a-zA-Z0-9_-]")
@@ -154,7 +154,7 @@ class McpToolCatalog:
 
     def __init__(self, max_entries: int | None = None) -> None:
         # From the CORE, never a Python literal — same rule as every other bound.
-        resolved = CaptureLimits().resolved()
+        resolved = LimitsConfig().resolved()
         self._max = max_entries if max_entries is not None else resolved["max_entries_per_unit"]
         # Reentrant, and for the reason `_diag._REPORT_LOCK` was made reentrant
         # rather than argued safe: the alternative is a claim about which

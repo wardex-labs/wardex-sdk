@@ -54,9 +54,11 @@ def test_every_name_in_all_resolves():
 #: signature a user cannot type out — export the type or unpublish the
 #: callable instead of widening this.
 _KNOWN_UNEXPORTED: dict[str, frozenset[str]] = {
-    # `triggers` is typed with the retention vocabulary; the retention group's
-    # shape (and whether the trigger enum survives at all) is a later slice.
-    "RetentionPolicy": frozenset({"CaptureTrigger"}),
+    # `before_send=` is typed with the callback protocol; the protocol's
+    # public spelling lands with the hook's own rename in a later slice of
+    # this batch. Shrink-only: resolve it by exporting the (renamed) type,
+    # never by widening this entry.
+    "init": frozenset({"BeforeSendCallback"}),
     # `Scope.span_context` is the span machinery, which stays unnameable from
     # user code (I5); the scope surface is retargeted in a later slice.
     "Scope": frozenset({"SpanContext"}),

@@ -3,7 +3,7 @@ import inspect
 from wardex_sdk._client import Client, build_sdk_info
 from wardex_sdk._config import BackendConfig, WardexConfig
 from wardex_sdk._enums import SpanKind
-from wardex_sdk._limits import CaptureLimits
+from wardex_sdk._limits import LimitsConfig
 from wardex_sdk._types import (
     InternalEnvelope,
     InternalSpan,
@@ -94,7 +94,7 @@ def test_span_buffer_respects_the_byte_budget():
     """Count-based capping alone cannot bound memory: 2048 large spans is gigabytes."""
     t = _Recording()
     cfg = WardexConfig(
-        limits=CaptureLimits(max_buffer_bytes=64 * 1024, max_buffer_spans=1000),
+        limits=LimitsConfig(max_buffer_bytes=64 * 1024, max_buffer_spans=1000),
         backend=BackendConfig(api_key="k"),
     )
     c = Client(cfg, t)
@@ -111,7 +111,7 @@ def test_span_buffer_respects_the_byte_budget():
 def test_byte_budget_leaves_small_spans_alone():
     t = _Recording()
     cfg = WardexConfig(
-        limits=CaptureLimits(max_buffer_bytes=64 * 1024), backend=BackendConfig(api_key="k")
+        limits=LimitsConfig(max_buffer_bytes=64 * 1024), backend=BackendConfig(api_key="k")
     )
     c = Client(cfg, t)
     try:
@@ -138,7 +138,7 @@ def test_byte_counter_survives_a_reentrant_drain_mid_eviction(monkeypatch):
 
     t = _Recording()
     cfg = WardexConfig(
-        limits=CaptureLimits(max_buffer_bytes=2000, max_buffer_spans=1000),
+        limits=LimitsConfig(max_buffer_bytes=2000, max_buffer_spans=1000),
         backend=BackendConfig(api_key="k"),
     )
     c = Client(cfg, t)
@@ -183,7 +183,7 @@ def test_byte_counter_survives_a_reentrant_drain_mid_append():
 
     t = _Recording()
     cfg = WardexConfig(
-        limits=CaptureLimits(max_buffer_bytes=5000), backend=BackendConfig(api_key="k")
+        limits=LimitsConfig(max_buffer_bytes=5000), backend=BackendConfig(api_key="k")
     )
     c = Client(cfg, t)
     try:
@@ -243,7 +243,7 @@ def test_trailing_append_is_never_lost_to_a_reentrant_drain():
 
     t = _Recording()
     cfg = WardexConfig(
-        limits=CaptureLimits(max_buffer_bytes=5000), backend=BackendConfig(api_key="k")
+        limits=LimitsConfig(max_buffer_bytes=5000), backend=BackendConfig(api_key="k")
     )
     c = Client(cfg, t)
     fired = {"done": False}
@@ -320,7 +320,7 @@ def test_eviction_subtraction_cannot_go_negative_across_a_reentrant_drain():
 
     t = _Recording()
     cfg = WardexConfig(
-        limits=CaptureLimits(max_buffer_bytes=2000, max_buffer_spans=1000),
+        limits=LimitsConfig(max_buffer_bytes=2000, max_buffer_spans=1000),
         backend=BackendConfig(api_key="k"),
     )
     c = Client(cfg, t)
@@ -390,7 +390,7 @@ def test_append_increment_cannot_overstate_across_a_reentrant_drain():
 
     t = _Recording()
     cfg = WardexConfig(
-        limits=CaptureLimits(max_buffer_bytes=5000), backend=BackendConfig(api_key="k")
+        limits=LimitsConfig(max_buffer_bytes=5000), backend=BackendConfig(api_key="k")
     )
     c = Client(cfg, t)
     fired = {"done": False}

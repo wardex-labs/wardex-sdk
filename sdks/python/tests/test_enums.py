@@ -1,10 +1,10 @@
 from wardex_sdk import _enums
 
 
-def test_retention_class_values():
-    assert _enums.RetentionClass.SUMMARY_ONLY.value == "summary_only"
-    assert _enums.RetentionClass.REPLAYABLE.value == "replayable"
-    assert _enums.RetentionClass.FORENSIC.value == "forensic"
+def test_pii_mode_has_only_implemented_members():
+    """REDACT and HASH were selectable names whose only behavior was to raise;
+    no selectable no-ops — each returns as a member when it ships."""
+    assert {m.value for m in _enums.PIIMode} == {"mask", "off"}
 
 
 def test_provider_name_is_open_enum_string():

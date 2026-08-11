@@ -496,10 +496,10 @@ class AnthropicAgentSdkAdapter(AdapterInterface):
 
             self._patches.patch(sdk, "create_sdk_mcp_server", create_sdk_mcp_server)
 
-        from .._limits import CaptureLimits
+        from .._limits import LimitsConfig
 
         config = getattr(client, "config", None)
-        lim = config.limits if config is not None else CaptureLimits()
+        lim = config.limits if config is not None else LimitsConfig()
         resolved = lim.resolved()
         self._assembler = SessionAssembler(
             client,

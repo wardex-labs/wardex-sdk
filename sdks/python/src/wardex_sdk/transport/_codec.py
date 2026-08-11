@@ -23,7 +23,7 @@ def encode(
     policy explicitly; the "off" default keeps this usable as a pure
     round-trip fidelity tool in tests.
 
-    `limits` is a native Limits object (CaptureLimits.to_native()); the codec
+    `limits` is a native Limits object (LimitsConfig.to_native()); the codec
     reads `zstd_level` from it. None uses the core default.
 
     SECURITY: any future wire transport MUST pass the policy explicitly (see

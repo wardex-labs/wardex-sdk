@@ -13,9 +13,16 @@ class CaptureMode(Enum):
 
 
 class PIIMode(Enum):
+    """No selectable no-ops: every member is implemented.
+
+    `REDACT` and `HASH` were members that raised `NotImplementedError` from
+    `PIIConfig.__post_init__` — a name a user could spell whose only behavior
+    was to refuse. They were removed rather than kept behind the raise: a mode
+    that cannot run needs no validation, and each returns as a member when its
+    implementation ships.
+    """
+
     MASK = "mask"
-    REDACT = "redact"
-    HASH = "hash"
     OFF = "off"
 
 
@@ -208,16 +215,7 @@ class CaptureSource(Enum):
     MANUAL = "manual"
 
 
-class RetentionClass(Enum):
-    SUMMARY_ONLY = "summary_only"
-    REPLAYABLE = "replayable"
-    FORENSIC = "forensic"
-
-
-class CaptureTrigger(Enum):
-    ERROR = "error"
-    HIGH_LATENCY = "high_latency"
-    HIGH_COST = "high_cost"
-    POLICY_VIOLATION = "policy_violation"
-    MANUAL_MARK = "manual_mark"
-    USER_REPORT = "user_report"
+# RetentionClass and CaptureTrigger were defined here until the retention
+# config group was cut: nothing in-process read either of them, and a config
+# field never ships before its consumer. Both return with the retention group
+# when its backend consumer exists.

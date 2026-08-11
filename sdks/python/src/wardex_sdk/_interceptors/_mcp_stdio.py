@@ -416,10 +416,10 @@ class McpStdioInterceptor(InterceptorInterface):
         if self._installed:
             return
         self._client = client
-        from .._limits import CaptureLimits
+        from .._limits import LimitsConfig
 
         config = getattr(client, "config", None)
-        lim = config.limits if config is not None else CaptureLimits()
+        lim = config.limits if config is not None else LimitsConfig()
         self._sniff_limit = lim.resolved()["mcp_sniff_bytes"]
         self._native_limits = lim.to_native()
         self._mode = capture_mode_of(client)

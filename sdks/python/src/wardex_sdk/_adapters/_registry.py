@@ -6,7 +6,7 @@ from functools import partial
 from typing import TYPE_CHECKING
 
 from .._assembly import Limitation, UnitRegistry, counters, guard
-from .._limits import CaptureLimits
+from .._limits import LimitsConfig
 from ._base import AdapterInterface
 from ._context import AdapterContext
 from ._sink import _ClientSink
@@ -39,7 +39,7 @@ def context_for(
     `close_all` cannot tell one adapter's units from another's inside either.
     """
     config = getattr(client, "config", None)
-    limits = config.limits if config is not None else CaptureLimits()
+    limits = config.limits if config is not None else LimitsConfig()
     resolved = limits.resolved()
     debug = bool(getattr(config, "debug", False))
     return AdapterContext(

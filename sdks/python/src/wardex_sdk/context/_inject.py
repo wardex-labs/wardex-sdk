@@ -22,6 +22,7 @@ counted (`Limitation.PATCH_SUPERSEDED`).
 from __future__ import annotations
 
 import fnmatch
+import functools
 import importlib
 import threading
 from collections.abc import Callable
@@ -108,10 +109,27 @@ def _patchset() -> PatchSet:
     return _patches
 
 
+@functools.lru_cache(maxsize=16)
+def _folded_patterns(patterns: tuple[str, ...]) -> tuple[str, ...]:
+    """The configured allowlist, case-folded once rather than per request.
+
+    The fold used to live in `PropagationConfig.__post_init__`, which put it
+    where a user could see it — and made the config LIE about itself: the
+    capitals they typed read back lowercased, the one value mutation the
+    round-trips-as-written rule forbids. So the config now keeps the patterns
+    exactly as written, and the matcher — the only consumer that needs both
+    sides of the comparison folded — folds them here. Cached on the tuple, so
+    one configured allowlist is folded once however many outbound calls it
+    admits; the config is immutable and a process holds a handful of configs
+    over its life, which is what the small bound is sized to.
+    """
+    return tuple(pattern.lower() for pattern in patterns)
+
+
 def _matches_target(host: str, patterns: tuple[str, ...]) -> bool:
     """Glob-match an outbound host against the configured target patterns.
 
-    `fnmatchcase` against a lowercased host, rather than plain `fnmatch`.
+    `fnmatchcase` against lowercased inputs, rather than plain `fnmatch`.
     Hostnames are case-insensitive, so `API.MyCorp.com` has to match
     `*.mycorp.com` — and `fnmatch` gets that wrong in two directions at once:
     it defers to `os.path.normcase`, which folds case on Windows and does
@@ -120,13 +138,12 @@ def _matches_target(host: str, patterns: tuple[str, ...]) -> bool:
     consistently applied, because it turns a propagation gap into something
     only one developer's machine can reproduce.
 
-    Only the host is folded HERE. The patterns are folded too — a user who
-    typed `*.MyCorp.com` meant the same set of hosts — but by
-    `PropagationPolicy.__post_init__`, once, because the config is built once
-    and this runs on every outbound call the allowlist admits.
+    BOTH sides are folded by the injector: the host here, on every call, and
+    the patterns in `_folded_patterns`, once per configured allowlist — the
+    config itself round-trips as written and never folds anything.
     """
     lowered = host.lower()
-    return any(fnmatch.fnmatchcase(lowered, pattern) for pattern in patterns)
+    return any(fnmatch.fnmatchcase(lowered, pattern) for pattern in _folded_patterns(patterns))
 
 
 def _build_inject_headers(host: str) -> dict[str, str]:

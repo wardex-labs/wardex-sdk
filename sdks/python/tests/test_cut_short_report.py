@@ -32,7 +32,7 @@ import pytest
 from wardex_sdk import _runtime
 from wardex_sdk._assembly._diag import reset_reports_for_test
 from wardex_sdk._client import Client, _UnnamedTimeout
-from wardex_sdk._config import BackendConfig, BatchingPolicy, WardexConfig
+from wardex_sdk._config import BackendConfig, BatchingConfig, WardexConfig
 from wardex_sdk._enums import SpanKind
 from wardex_sdk._types import InternalSpan, SpanContext, SpanId, TraceId
 from wardex_sdk.transport._otlp_http import OtlpHttpTransport
@@ -86,7 +86,7 @@ def _client(endpoint: str, *, configured: float) -> Client:
     transport = OtlpHttpTransport(endpoint=endpoint, timeout=configured)
     client = Client(
         WardexConfig(
-            backend=BackendConfig(api_key="k"), batching=BatchingPolicy(flush_interval=3600.0)
+            backend=BackendConfig(api_key="k"), batching=BatchingConfig(flush_interval=3600.0)
         ),
         transport,
     )
