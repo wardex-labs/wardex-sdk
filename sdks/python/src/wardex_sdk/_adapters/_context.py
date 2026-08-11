@@ -465,6 +465,7 @@ class AdapterContext:
         "debug",
         "limits",
         "name",
+        "options",
         "patches",
     )
 
@@ -476,11 +477,21 @@ class AdapterContext:
         limits: Mapping[str, int],
         debug: bool = False,
         control_flow: Callable[[], tuple[type[BaseException], ...]] | None = None,
+        options: Any = None,
     ) -> None:
         self.name = name
         self.patches = PatchSet(f"adapters.{name}", debug=debug)
         self.limits = limits
         self.debug = debug
+        #: This adapter's OWN options group off `AdaptersConfig` — the ONLY
+        #: channel through which an adapter sees its configuration. An adapter
+        #: never reads `WardexConfig`: the whole config would couple it to
+        #: every group's shape, and the per-adapter field is the one slice
+        #: that is its business. `None` for an adapter with no config class
+        #: yet, and for every context built without a real client config.
+        #: Which options object a name gets is the registration row's fact
+        #: (`_adapters.__init__._options_for`), never decided here.
+        self.options = options
         self._units = units
         self._tripped = False
         # The selector a site that names none gets. Built HERE, out of wardex's

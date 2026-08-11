@@ -7,6 +7,17 @@ def test_pii_mode_has_only_implemented_members():
     assert {m.value for m in _enums.PIIMode} == {"mask", "off"}
 
 
+def test_adapter_name_has_a_member_iff_its_adapter_ships():
+    """LANGCHAIN and OPENAI_AGENTS were phantom members — names a user could
+    select that installed nothing at all, because the registry ships two
+    adapters. Same doctrine as InterceptorName's GRPC/WEBSOCKET/SSE removals:
+    a name that cannot be spelled needs no validation, and each returns as a
+    member when its adapter ships."""
+    assert {m.value for m in _enums.AdapterName} == {"anthropic_agent_sdk", "langgraph"}
+    assert not hasattr(_enums.AdapterName, "LANGCHAIN")
+    assert not hasattr(_enums.AdapterName, "OPENAI_AGENTS")
+
+
 def test_provider_name_is_open_enum_string():
     assert _enums.ProviderName.ANTHROPIC.value == "anthropic"
     assert _enums.ProviderName.GCP_GEMINI.value == "gcp.gemini"

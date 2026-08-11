@@ -9,6 +9,8 @@ import wardex_sdk
 from wardex_sdk._config import (
     _MOVED,
     _REMOVED,
+    AdaptersConfig,
+    AnthropicAgentSdkConfig,
     BackendConfig,
     BatchingConfig,
     PIIConfig,
@@ -16,7 +18,7 @@ from wardex_sdk._config import (
     WardexConfig,
     _resolve_config,
 )
-from wardex_sdk._enums import InterceptorName, PIICategory, PIIMode
+from wardex_sdk._enums import AdapterName, InterceptorName, PIICategory, PIIMode
 from wardex_sdk._limits import LimitsConfig
 
 
@@ -50,6 +52,10 @@ def test_construction_is_keyword_only():
         PropagationConfig(True)  # type: ignore[misc]
     with pytest.raises(TypeError):
         LimitsConfig(4)  # type: ignore[misc]
+    with pytest.raises(TypeError):
+        AdaptersConfig((AdapterName.LANGGRAPH,))  # type: ignore[misc]
+    with pytest.raises(TypeError):
+        AnthropicAgentSdkConfig(True)  # type: ignore[misc]
 
 
 def test_every_group_round_trips_what_it_was_given():
@@ -66,6 +72,10 @@ def test_every_group_round_trips_what_it_was_given():
         batching=BatchingConfig(flush_interval=0.25, flush_on_signals=False, shutdown_timeout=9.0),
         limits=LimitsConfig(max_headers=4),
         propagation=PropagationConfig(enabled=True, targets=("*.mycorp.com",)),
+        adapters=AdaptersConfig(
+            enabled=(AdapterName.ANTHROPIC_AGENT_SDK,),
+            anthropic_agent_sdk=AnthropicAgentSdkConfig(otel_bridge=True, otel_bridge_drain=1.5),
+        ),
     )
 
     assert config.backend.api_key == "k"
@@ -78,6 +88,9 @@ def test_every_group_round_trips_what_it_was_given():
     assert config.limits.max_headers == 4
     assert config.propagation.enabled is True
     assert config.propagation.targets == ("*.mycorp.com",)
+    assert config.adapters.enabled == (AdapterName.ANTHROPIC_AGENT_SDK,)
+    assert config.adapters.anthropic_agent_sdk.otel_bridge is True
+    assert config.adapters.anthropic_agent_sdk.otel_bridge_drain == 1.5
 
 
 def test_a_default_config_matches_a_config_of_default_groups():
@@ -94,6 +107,7 @@ def test_a_default_config_matches_a_config_of_default_groups():
         batching=BatchingConfig(),
         limits=LimitsConfig(),
         propagation=PropagationConfig(),
+        adapters=AdaptersConfig(),
     )
 
 
@@ -392,17 +406,11 @@ def test_a_generator_is_an_iterable_too():
     assert cfg.interceptors == (InterceptorName.SSL,)
 
 
-def test_adapters_canonicalize_to_a_tuple():
-    from wardex_sdk._enums import AdapterName
-
-    assert WardexConfig(adapters=[AdapterName.LANGGRAPH]).adapters == (AdapterName.LANGGRAPH,)
-
-
 def test_an_empty_selection_does_not_collapse_into_none():
     """`()` is a choice — install none — and `None` is the absence of one."""
-    cfg = WardexConfig(interceptors=(), adapters=(), intercept_hosts=())
+    cfg = WardexConfig(interceptors=(), adapters=AdaptersConfig(enabled=()), intercept_hosts=())
     assert cfg.interceptors == ()
-    assert cfg.adapters == ()
+    assert cfg.adapters.enabled == ()
     assert cfg.intercept_hosts == ()
 
 
@@ -414,6 +422,69 @@ def test_intercept_hosts_refuses_a_bare_string():
 def test_interceptor_entries_are_validated_before_conversion():
     with pytest.raises(ValueError, match="InterceptorName"):
         WardexConfig(interceptors=("ssl",))  # type: ignore[arg-type]
+
+
+# --------------------------------------------------------------------------
+# the adapters group — selection and per-adapter options in one place
+# --------------------------------------------------------------------------
+
+
+class TestAdaptersConfig:
+    def test_the_default_group_selects_auto_detection_and_default_options(self):
+        cfg = WardexConfig()
+        assert cfg.adapters == AdaptersConfig()
+        assert cfg.adapters.enabled is None  # auto-detect, exactly the flat field's old None
+        assert cfg.adapters.anthropic_agent_sdk == AnthropicAgentSdkConfig()
+        assert cfg.adapters.anthropic_agent_sdk.otel_bridge is False
+        assert cfg.adapters.anthropic_agent_sdk.otel_bridge_drain == 0.2
+
+    def test_the_old_tuple_spelling_is_refused_with_the_new_one(self):
+        """Refuse, don't ignore: the keyword still exists, so `_MOVED` cannot
+        see the old shape — it is refused by TYPE, with the new spelling."""
+        with pytest.raises(TypeError, match=r"AdaptersConfig\(enabled=") as excinfo:
+            WardexConfig(adapters=(AdapterName.LANGGRAPH,))  # type: ignore[arg-type]
+        assert "adapters= now takes AdaptersConfig" in str(excinfo.value)
+        with pytest.raises(TypeError, match="AdaptersConfig"):
+            WardexConfig(adapters=[AdapterName.LANGGRAPH])  # type: ignore[arg-type]
+        with pytest.raises(TypeError, match="AdaptersConfig"):
+            WardexConfig(adapters=None)  # type: ignore[arg-type]
+
+    def test_enabled_accepts_any_iterable_and_reads_back_as_a_tuple(self):
+        assert AdaptersConfig(enabled=[AdapterName.LANGGRAPH]).enabled == (AdapterName.LANGGRAPH,)
+        assert AdaptersConfig(enabled=(n for n in (AdapterName.ANTHROPIC_AGENT_SDK,))).enabled == (
+            AdapterName.ANTHROPIC_AGENT_SDK,
+        )
+
+    def test_enabled_entries_are_validated_like_interceptors(self):
+        """`enabled=("langgraph",)` is the mistake a user actually makes, and
+        matched against nothing it would install nothing in silence."""
+        with pytest.raises(ValueError, match="AdapterName"):
+            AdaptersConfig(enabled=("langgraph",))  # type: ignore[arg-type]
+
+    def test_enabled_refuses_a_bare_string(self):
+        """A bare string IS an iterable, and its characters all fail the
+        member check — refused loudly rather than matched against nothing."""
+        with pytest.raises(ValueError, match="AdapterName"):
+            AdaptersConfig(enabled="langgraph")  # type: ignore[arg-type]
+
+    def test_configuring_an_option_never_touches_selection(self):
+        """The design the group exists for: options and selection are separate
+        fields, so setting one leaves auto-detection (`enabled=None`) alive."""
+        cfg = AdaptersConfig(anthropic_agent_sdk=AnthropicAgentSdkConfig(otel_bridge=True))
+        assert cfg.enabled is None
+
+    def test_otel_bridge_drain_must_be_a_nonnegative_number_of_seconds(self):
+        with pytest.raises(ValueError, match="otel_bridge_drain"):
+            AnthropicAgentSdkConfig(otel_bridge_drain=-0.1)
+        assert AnthropicAgentSdkConfig(otel_bridge_drain=0).otel_bridge_drain == 0
+
+    def test_per_adapter_fields_are_named_by_adapter_name_values(self):
+        """One identifier per adapter: the per-adapter field name equals the
+        `AdapterName` value (which a registry test holds equal to
+        `adapter.name()`). A field named anything else is options nothing can
+        ever pick up."""
+        option_fields = {f.name for f in dataclasses.fields(AdaptersConfig) if f.name != "enabled"}
+        assert option_fields <= {name.value for name in AdapterName}
 
 
 # --------------------------------------------------------------------------

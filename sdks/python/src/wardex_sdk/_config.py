@@ -32,13 +32,20 @@ design document is a contract nobody edits when the code moves:
                                         by injecting W3C trace headers, and
                                         into which hosts.
 
+    adapters=AdaptersConfig(...)        WHICH framework adapters install, and
+                                        each adapter's own options.
+
 What stays top-level is what belongs to no group or to the SDK as a whole:
-`debug`, `before_send`, `capture_mode`, `release`, `environment`, `adapters`,
-and the interception trio (`intercept`, `intercept_hosts`, `interceptors`).
+`debug`, `before_send`, `capture_mode`, `release`, `environment`, and the
+interception trio (`intercept`, `intercept_hosts`, `interceptors`).
 The trio stays flat deliberately — `intercept` is the switch, `interceptors`
 refines it and `intercept_hosts` scopes it, so filing one of the three under a
 group would split a single concern across two levels, which is the
-inconsistency grouping exists to remove.
+inconsistency grouping exists to remove. That is the GROUPING BOUNDARY RULE,
+and it decides both directions: a capture surface gets a group when its
+members carry option payloads — which is why `adapters` is a group, its
+per-adapter options being payloads no flat tuple can hold — while a bare
+switch/refinement/scope trio stays flat.
 
 CONFIG ROUND-TRIPS AS WRITTEN. Lossless bijective canonicalization is
 permitted — every collection field accepts any iterable and is canonicalized
@@ -62,7 +69,7 @@ from __future__ import annotations
 import os
 from collections.abc import Iterable, Sequence
 from collections.abc import Set as AbstractSet
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 
 from ._enums import (
     AdapterName,
@@ -267,6 +274,106 @@ class PropagationConfig:
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
+class AnthropicAgentSdkConfig:
+    """The Anthropic Agent SDK adapter's own options.
+
+    BOTH FIELDS ARE AHEAD OF THEIR CONSUMER, and that is stated rather than
+    hidden: the thing that reads them is the bridge implementation they were
+    designed for — the one that merges the Claude CLI's own OTel telemetry
+    into wardex's tree — and it has not landed. Until it does they gate
+    nothing, and the release that ships these fields must contain it: a config
+    field never ships before its consumer.
+    """
+
+    otel_bridge: bool = False
+    """The opt-in that will merge the Claude CLI's own OTel telemetry into
+    wardex's tree. `False` — the default — must reproduce today's tree
+    byte-for-byte: the bridge adds spans, never rearranges the ones wardex
+    already builds. Consumed by the bridge implementation this field was
+    designed for; until it lands the flag gates nothing."""
+
+    otel_bridge_drain: float = 0.2
+    """How long, in SECONDS (every duration field is), a session's end waits
+    for the CLI's final telemetry batch before the bridge stops listening.
+    Must be >= 0; `0` means no wait at all. Skipped on the atexit and signal
+    paths, whose budgets are the shutdown's to spend. Same consumer as
+    `otel_bridge`, and the same not-yet-landed caveat."""
+
+    def __post_init__(self) -> None:
+        if self.otel_bridge_drain < 0:
+            raise ValueError(
+                f"otel_bridge_drain must be >= 0 (seconds), got {self.otel_bridge_drain}"
+            )
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class AdaptersConfig:
+    """WHICH framework adapters install, and each adapter's own options.
+
+    SELECTION AND OPTIONS ARE SEPARATE FIELDS OF ONE GROUP, deliberately:
+    configuring an adapter's option never touches `enabled`, so auto-detection
+    survives — `AdaptersConfig(anthropic_agent_sdk=AnthropicAgentSdkConfig(
+    otel_bridge=True))` still leaves every other installed framework
+    auto-detected. The alternative shapes both collapse that: a per-adapter
+    top-level kwarg couples selection to spelling, and an instance list makes
+    naming an option a de-selection of everything unnamed.
+
+    ONE IDENTIFIER PER ADAPTER: the per-adapter field name equals the
+    `AdapterName` value equals `adapter.name()` — `anthropic_agent_sdk`, never
+    a second spelling — so selection, options and the registry's install table
+    key one adapter the same way.
+
+    A PER-ADAPTER CONFIG CLASS IS CREATED WITH ITS FIRST REAL OPTION, never
+    ahead of it — which is why `langgraph` has no field here. An empty options
+    class is a name a user can spell that configures nothing, the config-shaped
+    twin of a selectable no-op.
+    """
+
+    enabled: tuple[AdapterName, ...] | None = None
+    """WHICH adapters install — exactly the flat field's old semantics. `None`
+    means auto-detect installed frameworks; `()` means install none; a tuple
+    means exactly these. A choice and the absence of one, and they may not
+    collapse into each other. Accepts any iterable; reads back as a tuple.
+    Every entry must be an `AdapterName` member, refused here where the
+    mistake was made (the mirror of `interceptors`): a bare string matched
+    against nothing would install nothing, in silence."""
+
+    anthropic_agent_sdk: AnthropicAgentSdkConfig = field(default_factory=AnthropicAgentSdkConfig)
+    """The Anthropic Agent SDK adapter's options. Setting them selects
+    nothing and disturbs no auto-detection; see the class docstring."""
+
+    def __post_init__(self) -> None:
+        if self.enabled is None:
+            return
+        enabled = tuple(self.enabled)
+        for name in enabled:
+            if not isinstance(name, AdapterName):
+                raise ValueError(
+                    f"adapters enabled entries must be AdapterName members, got {name!r}"
+                )
+        object.__setattr__(self, "enabled", enabled)
+
+
+def _non_default_adapter_options(adapters: AdaptersConfig) -> tuple[AdapterName, ...]:
+    """The adapters whose options differ from a default-constructed group.
+
+    "Differs from default" IS dataclass equality against the default-constructed
+    instance — the frozen dataclasses exist to make value equality the one
+    definition of sameness, and a field-by-field diff here would be a second.
+    Consumed by the two configured-but-not-installed announcements: `init()`'s
+    unconditional `WardexConfigWarning` for an adapter the user's own `enabled=`
+    excludes, and `_adapters/`'s install-time debug line for one the
+    environment did not detect.
+    """
+    default = AdaptersConfig()
+    return tuple(
+        AdapterName(f.name)
+        for f in fields(AdaptersConfig)
+        if f.name != "enabled" and getattr(adapters, f.name) != getattr(default, f.name)
+    )
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
 class WardexConfig:
     """Wardex SDK configuration. An immutable, keyword-only dataclass.
 
@@ -281,10 +388,12 @@ class WardexConfig:
     limits: LimitsConfig = field(default_factory=LimitsConfig)
     propagation: PropagationConfig = field(default_factory=PropagationConfig)
 
-    adapters: Iterable[AdapterName] | None = None
-    """Which framework adapters to install. Accepts any iterable; reads back
-    as a tuple. `None` means auto-detect; `()` means none — a choice and the
-    absence of one, and they may not collapse into each other."""
+    adapters: AdaptersConfig = field(default_factory=AdaptersConfig)
+    """WHICH framework adapters install, and each adapter's own options. The
+    selection lives at `adapters.enabled` (same `None`/`()`/tuple semantics
+    the flat field had); the flat tuple spelling is refused in `__post_init__`
+    with the new one, because a tuple read as a group would be ignored in
+    silence — the one outcome a config change may not have."""
 
     interceptors: Iterable[InterceptorName] | None = None
     """Which byte seams `intercept=True` installs. Accepts any iterable; reads
@@ -349,8 +458,9 @@ class WardexConfig:
             raise TypeError(
                 "WardexConfig groups its fields by concern; these are not fields:\n"
                 + "\n".join(lines)
-                + "\nThe groups are backend, pii, batching, limits and"
-                " propagation — see the Configuration section of the README:"
+                + "\nThe groups are backend, pii, batching, limits,"
+                " propagation and adapters — see the Configuration section of"
+                " the README:"
                 " https://github.com/wardex-labs/wardex-sdk#configuration"
             )
         # object.__new__, not super().__new__: @dataclass(slots=True) rebuilds
@@ -374,7 +484,17 @@ class WardexConfig:
         not recognize — `interceptors=("ssl",)`, the string, is the one a user
         actually writes — matches nothing and installs nothing, in silence,
         which is indistinguishable from `intercept=False`.
+
+        `adapters` is the one RESHAPED field: it was the flat selection tuple
+        and is a group now, so the old spelling arrives through a keyword that
+        still exists and `_MOVED` cannot see it. It is refused here instead,
+        by type, with the new spelling in the message.
         """
+        if not isinstance(self.adapters, AdaptersConfig):
+            raise TypeError(
+                "adapters= now takes AdaptersConfig; the selection tuple moved: "
+                "adapters=(AdapterName.X,) -> adapters=AdaptersConfig(enabled=(AdapterName.X,))"
+            )
         if self.interceptors is not None:
             interceptors = tuple(self.interceptors)
             for name in interceptors:
@@ -383,8 +503,6 @@ class WardexConfig:
                         f"interceptors entries must be InterceptorName members, got {name!r}"
                     )
             object.__setattr__(self, "interceptors", interceptors)
-        if self.adapters is not None:
-            object.__setattr__(self, "adapters", tuple(self.adapters))
         if self.intercept_hosts is not None:
             # Same bare-string hazard as `PropagationConfig.targets`: a lone
             # host name would canonicalize into its characters and match no
@@ -404,7 +522,7 @@ def _resolve_config(
     batching: BatchingConfig | None = None,
     limits: LimitsConfig | None = None,
     propagation: PropagationConfig | None = None,
-    adapters: tuple[AdapterName, ...] | None = None,
+    adapters: AdaptersConfig | None = None,
     interceptors: tuple[InterceptorName, ...] | None = None,
     intercept: bool = True,
     intercept_hosts: Sequence[str] | None = None,
@@ -448,7 +566,7 @@ def _resolve_config(
         batching=batching if batching is not None else BatchingConfig(),
         limits=limits if limits is not None else LimitsConfig(),
         propagation=propagation if propagation is not None else PropagationConfig(),
-        adapters=adapters,
+        adapters=adapters if adapters is not None else AdaptersConfig(),
         interceptors=interceptors,
         intercept=intercept,
         intercept_hosts=tuple(intercept_hosts) if intercept_hosts is not None else None,
