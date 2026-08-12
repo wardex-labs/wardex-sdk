@@ -171,6 +171,22 @@ gone.
 
 ### Added
 
+- **`RemoteGraph` (LangGraph Platform) runs are now visible.** A standalone
+  `RemoteGraph.invoke`/`stream`/`ainvoke`/`astream` call used to cross zero
+  patched seams and ship nothing; it now ships one `invoke_workflow` span
+  carrying `wardex.langgraph.remote: "true"`, named after the remote graph,
+  with the platform HTTP request parented underneath it — which is also what
+  lets that request pass the default `capture_mode=AGENT` gate instead of
+  being dropped. `invoke`/`ainvoke` are covered through their own delegation
+  to `stream`/`astream`, the same shape as `Pregel`. The remote run's
+  internals execute in another process and remain invisible — the span records
+  the call, not the remote tree; `stream_events(version="v3")` uses the
+  platform threads API and ships no run span. When `langgraph_sdk` is absent
+  the seam declines silently; a moved `RemoteGraph` surface declines with one
+  diagnostic line and leaves local run, node and tool spans untouched. Cached
+  nodes stay documented-not-instrumented — a cache hit never reaches a seam
+  and the absence of a span for work that did not run is honest; the trade-off
+  is now stated in the adapter's module docstring.
 - **An end-of-connection signal for pooled async TLS connections.** wardex now
   patches asyncio's `SSLProtocol.connection_lost` in addition to
   `socket.close`/`_real_close`, which is the only moment a pooled
