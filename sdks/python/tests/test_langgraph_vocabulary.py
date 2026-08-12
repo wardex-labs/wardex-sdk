@@ -14,7 +14,7 @@ adapter exists to avoid.
 
 from __future__ import annotations
 
-from typing import Annotated, TypedDict
+from typing import Annotated, Any, TypedDict
 
 from langchain_core.messages import AIMessage, ToolMessage
 from langchain_core.tools import tool
@@ -494,14 +494,57 @@ def test_the_tool_call_id_limitation_is_absent_because_the_id_is_here(installed)
 
 
 def test_tool_input_is_the_repr_of_the_arguments(installed):  # noqa: F811
-    """The arguments are the one thing the framework hands over as a plain dict,
-    and a `repr` of them is bounded by what the model asked for. The asymmetry
-    with the output side is deliberate rather than an oversight: what
-    `_tool_payload` refuses is a `repr` of a FRAMEWORK OBJECT, whose size is set
-    by graph state nobody asked to record."""
+    """Repr-identical for exact-builtin shapes under `max_body_bytes`, which is
+    what a dict of model-JSON arguments always is. The old justification — "a
+    repr of them is bounded by what the model asked for" — is false in general:
+    `ToolNode` injects `InjectedState`/`Command` values into `call["args"]`
+    before `_run_one`, so the dict's size is set by graph state. `_shaped_args`
+    is what makes this assertion safe to keep: foreign objects ship as bare
+    type names and materialization is bounded at the source, while the healthy
+    shape asserted here stays byte-identical to `repr`."""
     span = _one_tool_span(installed, pure_add, _CALL)
     assert span.input_data == repr(_CALL["args"]).encode()
     assert span.input_data == b"{'a': 1, 'b': 2}"
+
+
+def test_a_command_argument_ships_as_its_type_name_not_graph_state(installed):  # noqa: F811
+    """The input-side twin of `test_a_command_carrying_graph_state_never_
+    materializes_it`: 200 KB of channel state inside `call["args"]` ships as
+    the 16-byte spelling `{'cmd': Command}` — the state was DECLINED, not cut,
+    so the span must not claim truncation either."""
+
+    @tool
+    def take_cmd(cmd: Any) -> str:
+        """Accept a command-shaped argument."""
+        return "took it"
+
+    span = _one_tool_span(
+        installed,
+        take_cmd,
+        call("take_cmd", {"cmd": Command(update={"blob": "x" * 200_000})}, "toolu_20"),
+    )
+    assert span.input_data == b"{'cmd': Command}"
+    assert len(span.input_data) < 100, f"{len(span.input_data)} bytes of channel state shipped"
+    assert span.capture_integrity is not None
+    assert span.capture_integrity.truncated is False, (
+        "nothing recorded was dropped — declined is not truncated"
+    )
+
+
+def test_an_over_budget_tool_input_ships_truncated_and_flagged(installed):  # noqa: F811
+    """End-to-end proof of the +1 handshake: the shaper returned 65 bytes,
+    `_append_capped` kept 64 and set the flag. The budget is lowered at the
+    registry's own attribute — the enforcement point `record_budget` reads —
+    so the shaper's budget and the storage cap share one source by
+    construction and cannot be lowered apart."""
+    installed.ctx._units._max_record_bytes = 64
+
+    over = {"a": "y" * 500}
+    span = _one_tool_span(installed, pure_add, call("pure_add", over, "toolu_21"))
+    assert len(span.input_data) == 64
+    assert span.input_data == repr(over).encode()[:64], "a prefix, not garbage"
+    assert span.capture_integrity is not None
+    assert span.capture_integrity.truncated is True
 
 
 def test_a_string_result_is_recorded_as_the_message_content(installed):  # noqa: F811

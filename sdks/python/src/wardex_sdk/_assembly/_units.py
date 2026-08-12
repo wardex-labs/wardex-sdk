@@ -889,6 +889,20 @@ class UnitRegistry:
         self._live_units: dict[Unit, None] = {}
         self._by_alias: dict[UnitKey, Unit] = {}
 
+    @property
+    def max_record_bytes(self) -> int:
+        """The byte ceiling `record_input`/`record_output` enforce.
+
+        The resolved core `max_body_bytes` (see `__init__`). Exposed so a
+        describe function that SHAPES a payload before recording can stop
+        materializing at exactly the boundary storage would cut — read at the
+        enforcement point, because the two budgets cannot disagree when they
+        are one read. Any other source CAN: `context_for` never passes
+        `max_body_bytes` into the registry, so a client override reaches
+        `AdapterContext.limits` without reaching this cap.
+        """
+        return self._max_record_bytes
+
     # -- lifecycle -------------------------------------------------------
 
     def open(

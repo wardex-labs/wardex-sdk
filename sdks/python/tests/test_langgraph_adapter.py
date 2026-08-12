@@ -27,7 +27,7 @@ from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.prebuilt import ToolNode
 
 from wardex_sdk._adapters._context import Placement
-from wardex_sdk._adapters._langgraph import LangGraphAdapter
+from wardex_sdk._adapters._langgraph import LangGraphAdapter, _shaped_args
 from wardex_sdk._adapters._registry import AdapterRegistry
 from wardex_sdk._assembly import SpanIntent, UnitKind, counters
 from wardex_sdk._assembly._diag import reset_reports_for_test
@@ -811,6 +811,100 @@ def test_uninstall_mid_stream_leaves_the_context_standing_for_the_straggler():
     assert live.adapter._ctx is not None
     trail = list(it)  # must complete, and the host's own values must arrive
     assert trail
+
+
+# --------------------------------------------------------------------------
+# _shaped_args — the tool-input shaping doctrine, as a pure function
+# --------------------------------------------------------------------------
+
+
+def test_shaped_args_matches_repr_for_primitive_shapes_under_budget():
+    """The repr-identity half of the contract: a payload built only of exact
+    builtin values that fits the budget ships byte-identical to `repr`. This is
+    what keeps `test_tool_input_is_the_repr_of_the_arguments` green — the
+    healthy population (model-JSON args) never notices the shaper exists."""
+    shapes = [
+        {"a": 1, "b": 2},
+        {"nested": {"k": [1, 2.5, None, True]}, "t": (1,), "e": {}, "l": [], "u": ()},
+        {"s": 'quote\'s "and" \n unicode é', "b": b"\x00raw"},
+        None,
+        [],
+    ]
+    for value in shapes:
+        assert _shaped_args(value, 1 << 20) == repr(value).encode("utf-8", "replace")
+
+
+def test_shaped_args_never_materializes_a_foreign_objects_repr():
+    """The input-side twin of the output rule "no `repr` among them".
+
+    Exact `type(v) is` checks, never `isinstance`: a subclass owns a
+    `__repr__` this function must not run, so an `IntEnum`, a `str` subclass
+    and a `dict` subclass all fall to the bare-type-name branch. A `set`
+    renders as its type name too — it is unordered, so any spelling of its
+    elements would be nondeterministic on the wire.
+    """
+
+    class Bomb:
+        def __repr__(self) -> str:
+            raise AssertionError("materialized")
+
+    # No raise IS the assertion: the repr was never called.
+    assert _shaped_args({"cmd": Bomb()}, 1 << 20) == b"{'cmd': Bomb}"
+
+    import enum
+
+    class Hue(enum.IntEnum):
+        RED = 1
+
+    class LoudStr(str):
+        def __repr__(self) -> str:
+            raise AssertionError("materialized")
+
+    class LoudDict(dict):
+        def __repr__(self) -> str:
+            raise AssertionError("materialized")
+
+    assert _shaped_args({"e": Hue.RED}, 1 << 20) == b"{'e': Hue}"
+    assert _shaped_args({"s": LoudStr("x")}, 1 << 20) == b"{'s': LoudStr}"
+    assert _shaped_args({"d": LoudDict(a=1)}, 1 << 20) == b"{'d': LoudDict}"
+    assert _shaped_args({"set": {1, 2}}, 1 << 20) == b"{'set': set}"
+
+
+def test_shaped_args_over_budget_returns_exactly_budget_plus_one_bytes():
+    """The +1 is the handshake that makes `_append_capped` set the truncated
+    flag: the storage cap flags only what it was handed MORE than, so a shaper
+    returning exactly-budget bytes would ship a cut payload that claims to be
+    complete."""
+    out = _shaped_args({"k": "x" * 10_000}, 64)
+    assert len(out) == 65
+    assert out.startswith(b"{'k': 'xxx")
+
+    # A payload that fits never overshoots.
+    small = {"k": "x" * 10}
+    assert _shaped_args(small, 64) == repr(small).encode()
+
+    # The cut is bytes-level and may land mid-codepoint — `_append_capped`'s
+    # own precedent — so a multi-byte payload still returns without raising.
+    multi = _shaped_args({"k": "é" * 10_000}, 64)
+    assert len(multi) == 65
+
+
+def test_shaped_args_survives_cycles_and_deep_nesting_without_recursion():
+    """Cycle parity with the builtins recursion marker, and the iterative-walk
+    claim: a nesting depth that can blow a fixed-recursion-limit interpreter's
+    stack under plain `repr` walks through here on a heap-allocated stack."""
+    d: dict = {}
+    d["self"] = d
+    assert _shaped_args(d, 1024) == repr(d).encode() == b"{'self': {...}}"
+
+    loop: list = []
+    loop.append(loop)
+    assert _shaped_args(loop, 1024) == repr(loop).encode() == b"[[...]]"
+
+    deep: list = []
+    for _ in range(5000):
+        deep = [deep]
+    assert _shaped_args(deep, 1 << 20) == b"[" * 5001 + b"]" * 5001
 
 
 # --------------------------------------------------------------------------
