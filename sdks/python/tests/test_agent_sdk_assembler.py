@@ -1115,3 +1115,40 @@ def test_an_outbound_line_into_a_subagents_thread_does_not_install_a_pending_pro
     assert chat.capture_integrity.request_body_captured is False
     assert "wardex.agent.prompt_source" not in {k for k, _ in chat.extra}
     assert tallies("adapters.assembler.prompt_overwritten") == 0
+
+
+def test_an_interrupted_tool_ships_tool_interrupted():
+    """`error.type` refinement from the verified PostToolUseFailure payload:
+    `is_interrupt: NotRequired[bool]` -> "tool_interrupted"; an absent key
+    keeps the "tool_error" fallback (wire-value change, pre-1.0)."""
+    client = FakeClient()
+    asm = SessionAssembler(client)
+    _outbound(asm, key=1)
+    asm.on_inbound(1, INIT)
+    asm.on_hook(
+        "PreToolUse", {"session_id": "s-1", "tool_name": "Bash", "tool_input": {}}, "toolu_09"
+    )
+    asm.on_hook(
+        "PostToolUseFailure",
+        {
+            "session_id": "s-1",
+            "tool_name": "Bash",
+            "error": "interrupted by user",
+            "is_interrupt": True,
+        },
+        "toolu_09",
+    )
+    asm.on_hook(
+        "PreToolUse", {"session_id": "s-1", "tool_name": "Bash", "tool_input": {}}, "toolu_10"
+    )
+    asm.on_hook(
+        "PostToolUseFailure",
+        {"session_id": "s-1", "tool_name": "Bash", "error": "boom"},
+        "toolu_10",
+    )
+
+    interrupted, plain = (s for s in client.spans if s.name == "execute_tool Bash")
+    assert interrupted.status is StatusCode.ERROR
+    assert interrupted.error_type == "tool_interrupted"
+    assert plain.status is StatusCode.ERROR
+    assert plain.error_type == "tool_error"

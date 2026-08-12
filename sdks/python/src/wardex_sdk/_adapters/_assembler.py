@@ -851,6 +851,16 @@ class SessionAssembler:
     ) -> None:
         if tool_use_id is None:
             return
+        error_type: str | None = None
+        if failed:
+            # The verified payload contract (claude-agent-sdk 0.2.x,
+            # `PostToolUseFailureHookInput`): `error: str`, `is_interrupt:
+            # NotRequired[bool]`. The interrupt flag is the low-cardinality
+            # half and ships as the type; the free-text `error` message is
+            # deliberately NOT shipped — `Status.message` has no bound in the
+            # core limits table and free text has no PII routing decision yet,
+            # so the message is a follow-up while the type is this change.
+            error_type = "tool_interrupted" if payload.get("is_interrupt") else "tool_error"
         tool = sess.open_tools.pop(tool_use_id, None)
         if tool is None:
             key = self._claim_key(sess, payload.get("tool_name") or "unknown")
@@ -879,7 +889,7 @@ class SessionAssembler:
                 tool.input_data = stream_input
         if "tool_response" in payload:
             tool.output_data = _safe_json_bytes(payload.get("tool_response"))
-        self._emit_tool(sess, tool, now, failed=failed)
+        self._emit_tool(sess, tool, now, failed=failed, error_type=error_type)
 
     def _emit_tool(
         self,
@@ -942,10 +952,10 @@ class SessionAssembler:
         draft.set_status(StatusCode.ERROR if failed else StatusCode.OK)
         if failed:
             # `finish()` refuses ERROR without a type, which turns the
-            # untyped-failure defect into a mechanism. The hook payload carries a richer reason
-            # (`PostToolUseFailureHookInput.error` / `is_interrupt`) that nothing
-            # reads yet, so this is a coarse-but-true type rather than an absent
-            # one.
+            # untyped-failure defect into a mechanism. The hook path refines
+            # the type from the failure payload's `is_interrupt` flag before
+            # it gets here (`_close_tool`); the stream result block carries no
+            # interrupt signal, so stream-only failures stay coarse-but-true.
             draft.set_error(error_type or "tool_error")
         if not tool.from_hook:
             # Reconstructed from the CLI's stdout rather than announced by a

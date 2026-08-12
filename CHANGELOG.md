@@ -296,6 +296,11 @@ gone.
   trip the CLI awaits at the end of every turn. `UserPromptSubmit` is now
   consumed (see per-turn prompt capture above), so every hook event the
   adapter injects has a consumer.
+- **Interrupted tool calls now ship `error.type="tool_interrupted"`** (a wire
+  value change, pre-1.0), read from the `PostToolUseFailure` payload's
+  `is_interrupt` flag; `"tool_error"` remains the fallback for every other
+  failure, including stream-only observations, whose result block carries no
+  interrupt signal.
 
 ### Fixed
 
