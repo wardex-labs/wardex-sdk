@@ -12,6 +12,7 @@ from claude_agent_sdk import ClaudeAgentOptions, HookMatcher
 from claude_agent_sdk._internal.transport import Transport
 
 from wardex_sdk._adapters._anthropic_agent_sdk import (
+    _WARDEX_HOOK_EVENTS,
     AnthropicAgentSdkAdapter,
     _prepare_options,
 )
@@ -130,8 +131,62 @@ def test_hook_merge_preserves_user_hooks():
     assert len(merged.hooks["PreToolUse"]) == 2
     # other wardex events exist
     assert "SubagentStart" in merged.hooks
+    assert "UserPromptSubmit" in merged.hooks
+    # ...and Stop is not among them: its payload carries nothing actionable,
+    # so injecting it would be a blocking round trip per turn for a no-op.
+    assert "Stop" not in merged.hooks
     # the original options object is untouched
     assert len(opts.hooks["PreToolUse"]) == 1
+
+
+def test_stop_is_not_injected_and_the_injected_set_is_pinned():
+    """Every injected hook event has a consumer in `SessionAssembler.on_hook`,
+    and each injection costs a blocking control-protocol round trip the CLI
+    awaits at the moment the event fires. Stop is deliberately absent: its
+    payload is `stop_hook_active` and nothing else — no timestamps — so there
+    is nothing it could correct that the same control channel has not already
+    delivered. This pin makes re-adding it a deliberate act that names what
+    the payload newly buys."""
+    assert set(_WARDEX_HOOK_EVENTS) == {
+        "PreToolUse",
+        "PostToolUse",
+        "PostToolUseFailure",
+        "SubagentStart",
+        "SubagentStop",
+        "UserPromptSubmit",
+    }
+
+
+def test_the_query_prompt_rides_the_first_chat_span():
+    """End to end through the real SDK write path: `query(prompt=...)` writes
+    the user message over stdin after initialize, the tee parses it into the
+    pending prompt, and the first main-thread chat span consumes it —
+    byte-exact, with its provenance published."""
+
+    class RecordingClient:
+        def __init__(self):
+            self.spans = []
+
+        def capture_span(self, span):
+            self.spans.append(span)
+
+    client = RecordingClient()
+    adapter = AnthropicAgentSdkAdapter()
+    adapter.install(client, context_for(adapter.name(), client))
+    try:
+
+        async def main():
+            fake = FakeTransport([INIT_LINE, ASSISTANT_LINE, RESULT_LINE])
+            async for _ in claude_agent_sdk.query(prompt="2+2?", transport=fake):
+                pass
+
+        anyio.run(main)
+        chat = next(s for s in client.spans if s.name.startswith("chat"))
+        assert b"2+2?" in chat.input_data
+        assert chat.capture_integrity.request_body_captured is True
+        assert ("wardex.agent.prompt_source", "stream") in chat.extra
+    finally:
+        adapter.uninstall()
 
 
 def test_query_passthrough_with_fake_transport():

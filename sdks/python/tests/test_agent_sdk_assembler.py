@@ -1,6 +1,7 @@
 """SessionAssembler unit tests — synthetic events, no SDK involved."""
 
 import json
+import time
 
 import pytest
 
@@ -69,6 +70,19 @@ DIVERGENT_ASSISTANT = {
                 "input": {"command": "ls -la /stream"},
             }
         ],
+    },
+}
+
+
+ASSISTANT_2 = {
+    "type": "assistant",
+    "session_id": "s-1",
+    "message": {
+        "id": "m2",
+        "model": "claude-sonnet-5",
+        "stop_reason": "end_turn",
+        "usage": {"input_tokens": 12, "output_tokens": 30},
+        "content": [{"type": "text", "text": "done"}],
     },
 }
 
@@ -850,3 +864,254 @@ def test_one_run_reporting_its_own_id_twice_is_not_a_conflict():
     markers = root.capture_integrity.limitations if root.capture_integrity else ()
     assert Limitation.CORRELATION_CONFLICT not in markers
     assert counters.get("adapters.assembler.session_key_recycled") == 0
+
+
+# ==========================================================================
+# Per-turn prompt capture — the stream is the content authority, the hook
+# (UserPromptSubmit) is the turn boundary and the degraded-content fallback
+# ==========================================================================
+
+
+def _chats(client):
+    return [s for s in client.spans if s.name.startswith("chat")]
+
+
+def _submit(asm, prompt, session="s-1"):
+    asm.on_hook("UserPromptSubmit", {"session_id": session, "prompt": prompt}, None)
+
+
+def test_each_turns_prompt_rides_its_own_chat_span(tallies):
+    """The defect this replaces: prompts for turns 2+ were parsed off the wire
+    and DISCARDED — only the first turn ever carried input_data. Now every
+    main-thread chat span ships its own user turn's prompt, byte-exact from
+    the stream, with the hook corroborating each boundary."""
+    client = FakeClient()
+    asm = SessionAssembler(client)
+    _outbound(asm, key=1, text="first question")
+    asm.on_inbound(1, INIT)
+    _submit(asm, "first question")
+    asm.on_inbound(1, ASSISTANT)
+    _outbound(asm, key=1, text="second question")
+    _submit(asm, "second question")
+    asm.on_inbound(1, ASSISTANT_2)
+    asm.on_inbound(1, RESULT)
+    asm.on_close(1, None)
+
+    chat1, chat2 = _chats(client)
+    assert b"first question" in chat1.input_data
+    assert b"second question" not in chat1.input_data
+    assert b"second question" in chat2.input_data
+    assert b"first question" not in chat2.input_data
+    assert chat1.capture_integrity.request_body_captured is True
+    assert chat2.capture_integrity.request_body_captured is True
+    assert ("wardex.agent.prompt_source", "stream") in chat1.extra
+    assert ("wardex.agent.prompt_source", "stream") in chat2.extra
+    # Turn numbering stays the per-assistant-message ordinal: uniqueness of
+    # (conversation_id, turn_index) is load-bearing for stores that key on it.
+    assert chat1.conversation.turn_index == 0
+    assert chat2.conversation.turn_index == 1
+    assert tallies("adapters.assembler.prompt_overwritten") == 0
+
+
+def test_an_agentic_loop_between_two_prompts_claims_no_prompt():
+    """An intermediate assistant turn of one agentic loop HAS no user prompt.
+    It ships `input_attempted=False` — an honest "there was nothing to
+    capture", not an empty capture reported as a successful one."""
+    client = FakeClient()
+    asm = SessionAssembler(client)
+    _outbound(asm, key=1, text="run the loop")
+    asm.on_inbound(1, INIT)
+    asm.on_inbound(1, ASSISTANT)  # stop_reason tool_use — the loop continues
+    asm.on_inbound(1, TOOL_RESULT)
+    asm.on_inbound(1, ASSISTANT_2)  # end_turn, still the same user turn
+    asm.on_inbound(1, RESULT)
+    asm.on_close(1, None)
+
+    chat1, chat2 = _chats(client)
+    assert chat1.capture_integrity.request_body_captured is True
+    assert b"run the loop" in chat1.input_data
+    assert chat2.input_data == b""
+    assert chat2.capture_integrity.request_body_captured is False
+    assert "wardex.agent.prompt_source" not in {k for k, _ in chat2.extra}
+
+
+def test_the_hook_prompt_stands_down_when_the_stream_saw_the_turn(tallies):
+    """The authority rule: the stream's byte-exact message-object JSON is the
+    content, and the hook that follows the write it caused only corroborates —
+    it must not replace those bytes with the CLI's re-decoded text."""
+    client = FakeClient()
+    asm = SessionAssembler(client)
+    _outbound(asm, key=1, text="go")
+    asm.on_inbound(1, INIT)
+    _submit(asm, "go")
+    asm.on_inbound(1, ASSISTANT)
+
+    (chat,) = _chats(client)
+    # The stream's shape (a message object), not the hook's bare text.
+    assert b'"role"' in chat.input_data
+    assert b"go" in chat.input_data
+    assert ("wardex.agent.prompt_source", "stream") in chat.extra
+    # Corroboration is not an overwrite.
+    assert tallies("adapters.assembler.prompt_overwritten") == 0
+
+
+def test_a_prompt_the_stream_missed_is_captured_from_the_hook_and_says_so():
+    """The degraded-content fallback: when no outbound write recorded the turn,
+    the hook's re-decoded text is captured — published as exactly the text
+    wardex saw (prompt_source "hook"), never dressed up as a message object
+    wardex never saw — and the hook arrival sets the turn boundary."""
+    client = FakeClient()
+    asm = SessionAssembler(client)
+    _outbound(asm, key=1, text="first")
+    asm.on_inbound(1, INIT)
+    asm.on_inbound(1, ASSISTANT)  # consumes turn 1's prompt
+    t_mark = time.time_ns()
+    _submit(asm, "second")  # turn 2's write never reached the tee
+    asm.on_inbound(1, ASSISTANT_2)
+
+    chat1, chat2 = _chats(client)
+    assert chat2.input_data == b"second"
+    assert chat2.capture_integrity.request_body_captured is True
+    assert ("wardex.agent.prompt_source", "hook") in chat2.extra
+    # The hook set the turn boundary — without the reset this span would
+    # inherit turn 1's start instant.
+    assert chat2.start_time_ns >= t_mark
+    # replace_correlation(None) discipline holds on the new path too: sub-root
+    # spans publish no confidence until the ingestion move earns the field.
+    assert chat2.correlation is None
+    assert chat1.correlation is None
+
+
+def test_a_second_stream_prompt_with_no_assistant_between_keeps_the_last_and_counts_the_loss(
+    tallies,
+):
+    """At most one prompt pends per session: a replacement is the bounded,
+    honest behavior — and the replaced prompt is a real loss, so it moves a
+    counter rather than vanishing."""
+    client = FakeClient()
+    asm = SessionAssembler(client)
+    _outbound(asm, key=1, text="first")
+    asm.on_inbound(1, INIT)
+    _outbound(asm, key=1, text="second")
+    asm.on_inbound(1, ASSISTANT)
+
+    (chat,) = _chats(client)
+    assert b"second" in chat.input_data
+    assert b"first" not in chat.input_data
+    assert chat.capture_integrity.request_body_captured is True
+    assert tallies("adapters.assembler.prompt_overwritten") == 1
+
+
+def test_a_second_hook_prompt_while_one_pends_reads_as_a_new_turn_not_a_duplicate(tallies):
+    """What the corroboration flag buys. The first submit after a stream write
+    IS that write's turn; a second submit while the same prompt still pends can
+    only be a NEW user turn whose write the stream missed — treating it as a
+    duplicate would silently drop a whole turn's prompt."""
+    client = FakeClient()
+    asm = SessionAssembler(client)
+    _outbound(asm, key=1, text="go")
+    asm.on_inbound(1, INIT)
+    _submit(asm, "go")  # corroborates the pending stream prompt
+    # ...turn 1 dies without an assistant message, and the user re-prompts
+    # through a write the stream did not record.
+    _submit(asm, "retry")
+    asm.on_inbound(1, ASSISTANT)
+
+    (chat,) = _chats(client)
+    assert chat.input_data == b"retry"
+    assert ("wardex.agent.prompt_source", "hook") in chat.extra
+    # Turn 1's prompt was seen and lost, and the loss is counted.
+    assert tallies("adapters.assembler.prompt_overwritten") == 1
+
+
+def test_a_subagent_chat_does_not_consume_the_users_pending_prompt():
+    """Consumption is gated on `parent_tool_use_id is None`: a
+    subagent-attributed chat's input is the subagent's task, not the user's
+    session prompt — it must leave the pending prompt for the next main-thread
+    turn."""
+    client = FakeClient()
+    asm = SessionAssembler(client)
+    _outbound(asm, key=1, text="go")
+    asm.on_inbound(1, INIT)
+    asm.on_hook(
+        "SubagentStart", {"session_id": "s-1", "agent_id": "a-1", "agent_type": "researcher"}, None
+    )
+    subagent_chat = {
+        "type": "assistant",
+        "session_id": "s-1",
+        "parent_tool_use_id": "a-1",
+        "message": {
+            "id": "m-sub",
+            "model": "claude-sonnet-5",
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 3, "output_tokens": 4},
+            "content": [{"type": "text", "text": "sub result"}],
+        },
+    }
+    asm.on_inbound(1, subagent_chat)  # BEFORE any main-thread assistant turn
+    asm.on_inbound(1, ASSISTANT_2)
+
+    sub_chat, main_chat = _chats(client)
+    assert sub_chat.input_data == b""
+    assert sub_chat.capture_integrity.request_body_captured is False
+    assert "wardex.agent.prompt_source" not in {k for k, _ in sub_chat.extra}
+    assert b"go" in main_chat.input_data
+    assert ("wardex.agent.prompt_source", "stream") in main_chat.extra
+
+
+def test_an_outbound_line_into_a_subagents_thread_does_not_overwrite_the_pending_prompt(tallies):
+    """The install gate is SYMMETRIC with consumption. `_build_chat` consumes
+    only when the chat's own `parent_tool_use_id` is None, so a host-written
+    user line carrying one — the streaming-input/fork shapes — must not
+    install either: it would overwrite the main-thread pending prompt, ride
+    the next main chat span, and count an overwrite for a turn that never
+    died."""
+    client = FakeClient()
+    asm = SessionAssembler(client)
+    _outbound(asm, key=1, text="main question")
+    asm.on_inbound(1, INIT)
+    asm.on_outbound(
+        1,
+        json.dumps(
+            {
+                "type": "user",
+                "session_id": "s-1",
+                "parent_tool_use_id": "toolu_T",
+                "message": {"role": "user", "content": "into the subagent"},
+            }
+        ),
+    )
+    asm.on_inbound(1, ASSISTANT_2)
+
+    (chat,) = _chats(client)
+    assert b"main question" in chat.input_data
+    assert b"into the subagent" not in chat.input_data
+    assert ("wardex.agent.prompt_source", "stream") in chat.extra
+    assert tallies("adapters.assembler.prompt_overwritten") == 0
+
+
+def test_an_outbound_line_into_a_subagents_thread_does_not_install_a_pending_prompt(tallies):
+    """The other half of the symmetry: with nothing pending, the
+    subagent-addressed line still installs nothing — the next main-thread chat
+    honestly claims no prompt rather than riding a sub-agent's bytes."""
+    client = FakeClient()
+    asm = SessionAssembler(client)
+    asm.on_outbound(
+        1,
+        json.dumps(
+            {
+                "type": "user",
+                "session_id": "s-1",
+                "parent_tool_use_id": "toolu_T",
+                "message": {"role": "user", "content": "into the subagent"},
+            }
+        ),
+    )
+    asm.on_inbound(1, INIT)
+    asm.on_inbound(1, ASSISTANT_2)
+
+    (chat,) = _chats(client)
+    assert chat.input_data == b""
+    assert chat.capture_integrity.request_body_captured is False
+    assert "wardex.agent.prompt_source" not in {k for k, _ in chat.extra}
+    assert tallies("adapters.assembler.prompt_overwritten") == 0
