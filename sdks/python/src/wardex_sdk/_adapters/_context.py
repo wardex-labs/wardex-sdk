@@ -658,7 +658,7 @@ class AdapterContext:
                 # byte-identical on the wire — "nothing was pinned" and "what
                 # was pinned had died" — and the second is a tool call sitting
                 # in a run it has nothing to do with.
-                conflicted = self._units.stale_pin_in_scope()
+                conflicted = self._units.closed_unit_in_scope()
                 holder, evidence = sole, _SOLE
         unit = self._units.open(
             kind,

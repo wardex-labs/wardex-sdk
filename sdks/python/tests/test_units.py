@@ -1420,7 +1420,7 @@ def test_another_registrys_dead_pin_is_not_this_registrys_conflict():
 
     fresh = registry()
 
-    assert fresh.stale_pin_in_scope() is False
+    assert fresh.closed_unit_in_scope() is False
     assert fresh.becomes_trace_root(latch_ambient()) is False
     # One per question asked, not one per foreign pin: both predicates above
     # consult it, and each refusal is a real refusal to record.
@@ -1667,7 +1667,7 @@ def test_a_closed_activations_fork_is_refused_exactly_like_a_dead_pins():
     assert not unit.is_live
     assert latch_ambient().span_context == unit.context, "the standing fork is the precondition"
 
-    assert reg.stale_pin_in_scope() is True
+    assert reg.closed_unit_in_scope() is True
     assert reg.becomes_trace_root(latch_ambient()) is True
 
     p = reg.resolve(None)
@@ -1754,7 +1754,7 @@ def test_a_clean_activation_leaves_nothing_to_refuse():
     reg.close(first)
 
     assert latch_ambient().span_context is None
-    assert reg.stale_pin_in_scope() is False
+    assert reg.closed_unit_in_scope() is False
 
     later = open_session(reg, "next", ambient=latch_ambient())
 
@@ -1787,7 +1787,7 @@ def test_a_live_activation_from_another_registry_is_neither_refused_nor_counted(
     live = open_session(reg_a, "theirs", owner="langgraph")
 
     with live.activate():
-        assert reg_b.stale_pin_in_scope() is False
+        assert reg_b.closed_unit_in_scope() is False
         assert reg_b.becomes_trace_root(latch_ambient()) is False
         mine = open_session(reg_b, "mine", ambient=latch_ambient(), owner="anthropic")
 
@@ -1810,7 +1810,7 @@ def test_another_registrys_dead_activation_is_not_this_registrys_conflict():
 
     fresh = registry()
 
-    assert fresh.stale_pin_in_scope() is False
+    assert fresh.closed_unit_in_scope() is False
     assert fresh.becomes_trace_root(latch_ambient()) is False
 
     unit = open_session(fresh, "new", ambient=latch_ambient())
