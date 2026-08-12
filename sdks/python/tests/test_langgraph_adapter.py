@@ -319,14 +319,15 @@ def call(name: str, args: dict, call_id: str) -> dict:
 # adapter owes them and each was being proved twice, in two styles — so they
 # live in `wardex_sdk.testing.conformance` and this adapter answers them in
 # `test_langgraph_conformance.py`. What stays below is what is true of THIS
-# adapter and no other: a six-patch surface that declines in two independent
-# groups, and a probe with a specific idea of what it will patch.
+# adapter and no other: an eight-patch surface that declines in three
+# independent groups, and a probe with a specific idea of what it will patch.
 
 
 def _originals():
     from langgraph.prebuilt.tool_node import ToolNode as TN
     from langgraph.pregel import _runner
     from langgraph.pregel import main as pregel_mod
+    from langgraph.pregel.remote import RemoteGraph
 
     return {
         (pregel_mod.Pregel, "stream"): pregel_mod.Pregel.stream,
@@ -335,6 +336,8 @@ def _originals():
         (_runner, "arun_with_retry"): _runner.arun_with_retry,
         (TN, "_run_one"): TN._run_one,
         (TN, "_arun_one"): TN._arun_one,
+        (RemoteGraph, "stream"): RemoteGraph.stream,
+        (RemoteGraph, "astream"): RemoteGraph.astream,
     }
 
 
@@ -368,16 +371,18 @@ def test_installing_without_a_context_patches_nothing():
 # --------------------------------------------------------------------------
 
 
-def test_the_real_surface_passes_both_probes():
+def test_the_real_surface_passes_every_probe():
     from langgraph.prebuilt.tool_node import ToolNode as TN
     from langgraph.pregel import _runner
     from langgraph.pregel import main as pregel_mod
+    from langgraph.pregel.remote import RemoteGraph
     from langgraph.types import PregelExecutableTask
 
-    from wardex_sdk._adapters._langgraph import _surface_ok, _tool_surface_ok
+    from wardex_sdk._adapters._langgraph import _remote_surface_ok, _surface_ok, _tool_surface_ok
 
     assert _surface_ok(pregel_mod, _runner, PregelExecutableTask)
     assert _tool_surface_ok(TN)
+    assert _remote_surface_ok(RemoteGraph)
 
 
 def test_a_reordered_signature_fails_the_probe():
@@ -428,6 +433,124 @@ def test_a_pydantic_shaped_class_fails_the_probe():
         async def _arun_one(self, call, *a, **k): ...
 
     assert not _tool_surface_ok(Modelled)
+
+
+def test_a_moved_remote_surface_fails_the_remote_probe():
+    """Each predicate of group 3 has a failure it exists to catch.
+
+    `stream` as a plain function is a wrapper that would close the run before
+    the platform produced a chunk; an INHERITED entry is a patch that would
+    shadow a base attribute the restore must not delete; reordered leading
+    names would hand `_configurable` the wrong argument as `config`; and a
+    Pydantic-shaped class defeats `PatchSet`'s `setattr` restore.
+    """
+    from wardex_sdk._adapters._langgraph import _remote_surface_ok
+
+    class GoodRemote:
+        def stream(self, input, config=None, **kw):
+            yield input
+
+        async def astream(self, input, config=None, **kw):
+            yield input
+
+    assert _remote_surface_ok(GoodRemote)
+
+    class NotAGenerator:
+        def stream(self, input, config=None, **kw):
+            return [input]
+
+        async def astream(self, input, config=None, **kw):
+            yield input
+
+    assert not _remote_surface_ok(NotAGenerator)
+
+    class Inherited(GoodRemote):
+        pass
+
+    assert not _remote_surface_ok(Inherited)
+
+    class Reordered:
+        def stream(self, config, input=None, **kw):
+            yield input
+
+        async def astream(self, config, input=None, **kw):
+            yield input
+
+    assert not _remote_surface_ok(Reordered)
+
+    class BaseModel:
+        pass
+
+    class Modelled(BaseModel):
+        def stream(self, input, config=None, **kw):
+            yield input
+
+        async def astream(self, input, config=None, **kw):
+            yield input
+
+    assert not _remote_surface_ok(Modelled)
+
+
+def test_an_absent_platform_client_declines_silently(monkeypatch, capsys):
+    """Absence is silent AND uncounted, mirroring the tool-seam pair.
+
+    A host without `langgraph_sdk` cannot construct a `RemoteGraph` either, so
+    nothing observable is missed — and the local seams must be untouched by
+    the decline.
+    """
+    from langgraph.pregel.remote import RemoteGraph
+
+    import wardex_sdk._adapters._langgraph as mod
+
+    before = (RemoteGraph.stream, RemoteGraph.astream)
+    monkeypatch.setattr(mod, "_import_remote", lambda: None)
+    live = Installed()
+    try:
+        assert (RemoteGraph.stream, RemoteGraph.astream) == before
+        assert "unsupported_remote_surface" not in str(adapter_counters())
+        assert capsys.readouterr().err == ""
+        chain(live.ctx, 1, name="LocalStill", leaves=False).invoke({"trail": []})
+        assert runs(live.spans), "the run seam must still be live"
+        assert steps(live.spans), "the node seam must still be live"
+    finally:
+        live.teardown()
+
+
+def test_an_unrecognized_remote_surface_declines_loudly_and_keeps_local_seams(monkeypatch, capsys):
+    """A moved remote surface costs remote visibility only, and says so once."""
+    from langgraph.pregel.remote import RemoteGraph
+
+    import wardex_sdk._adapters._langgraph as mod
+
+    before = (RemoteGraph.stream, RemoteGraph.astream)
+    monkeypatch.setattr(mod, "_remote_surface_ok", lambda *a: False)
+    live = Installed()
+    try:
+        assert (RemoteGraph.stream, RemoteGraph.astream) == before
+        assert adapter_counters()["adapters.langgraph.unsupported_remote_surface"] == 1
+        assert "RemoteGraph surface unrecognized" in capsys.readouterr().err
+        chain(live.ctx, 1, name="LocalKept", leaves=False).invoke({"trail": []})
+        assert runs(live.spans), "the run seam must still be live"
+        assert steps(live.spans), "the node seam must still be live"
+    finally:
+        live.teardown()
+
+
+def test_import_remote_answers_none_without_the_platform_client(monkeypatch):
+    """The gate declines without attempting the `langgraph.pregel.remote` import."""
+    import importlib.util
+
+    import wardex_sdk._adapters._langgraph as mod
+
+    real_find_spec = importlib.util.find_spec
+
+    def fake_find_spec(name, *args, **kwargs):
+        if name == "langgraph_sdk":
+            return None
+        return real_find_spec(name, *args, **kwargs)
+
+    monkeypatch.setattr(importlib.util, "find_spec", fake_find_spec)
+    assert mod._import_remote() is None
 
 
 def test_an_unrecognized_surface_declines_loudly_and_patches_nothing(monkeypatch, capsys):

@@ -1,6 +1,6 @@
 """The LangGraph adapter, run against the shared adapter conformance suite.
 
-Everything here is the SUBJECT — six seams, one workload, the tree that
+Everything here is the SUBJECT — eight seams, one workload, the tree that
 workload must produce, and a run left open mid-stream. The claims are in
 `wardex_sdk.testing.conformance` and are the same ones the Agent SDK adapter
 answers next door.
@@ -25,15 +25,20 @@ _N_NODES = 3
 
 
 def seams() -> dict[str, object]:
-    """The six attributes the adapter replaces, by their live values.
+    """The eight attributes the adapter replaces, by their live values.
 
     Read through the framework's own modules rather than off the adapter: what
     has to be restored is the FRAMEWORK's attribute, and asking the adapter what
     it patched would take its word for the very thing under test.
+
+    The `RemoteGraph` entries can be listed unconditionally because
+    `langgraph_sdk` is a REQUIRED dependency of langgraph in the pinned band,
+    the same way the `ToolNode` entries already assume `langgraph_prebuilt`.
     """
     from langgraph.prebuilt.tool_node import ToolNode
     from langgraph.pregel import _runner
     from langgraph.pregel import main as pregel_mod
+    from langgraph.pregel.remote import RemoteGraph
 
     return {
         "Pregel.stream": pregel_mod.Pregel.stream,
@@ -42,6 +47,8 @@ def seams() -> dict[str, object]:
         "_runner.arun_with_retry": _runner.arun_with_retry,
         "ToolNode._run_one": ToolNode._run_one,
         "ToolNode._arun_one": ToolNode._arun_one,
+        "RemoteGraph.stream": RemoteGraph.stream,
+        "RemoteGraph.astream": RemoteGraph.astream,
     }
 
 
