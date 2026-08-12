@@ -606,6 +606,9 @@ def test_a_retrying_node_is_ONE_span_at_status_ok():
     and then succeeded renders there as THREE sibling runs, two of them carrying
     `on_chain_error`, for one logical node that worked. Here it is one span, at
     `status=OK`, and the seam counter agrees with the span count.
+
+    The attempt count this collapse loses is a recorded decision — the pin
+    below carries the signal inventory.
     """
     from langgraph.types import RetryPolicy
 
@@ -658,6 +661,27 @@ def test_the_attempt_count_is_not_recoverable_from_the_span():
     not do for a span attribute. There is deliberately no `wardex.step.attempts`
     key today; this test fails the moment someone adds one, which is the point at
     which the trade-off should be re-argued rather than quietly reversed.
+
+    The investigation is CLOSED, not pending. Four per-attempt signals exist
+    in langgraph today, and each is rejected:
+
+    1. `Runtime.execution_info.node_attempt` — re-patched into the config on
+       every iteration of the retry loop (`langgraph/pregel/_retry.py`, sync
+       and async twins alike), so it is readable only from inside the node or
+       its config, never at the seam boundary this adapter wraps.
+    2. `CONFIG_KEY_TIMED_ATTEMPT_OBSERVER` — an internal langgraph-server
+       contract by its own docstring, and it fires only for ASYNC tasks
+       carrying a `TimeoutPolicy`; the sync path raises
+       `sync_timeout_unsupported` and never calls it.
+    3. The `langgraph.pregel._retry` logger — fires only on RETRIES, at INFO,
+       and a logging handler is process-global state coupled to a message
+       format.
+    4. `exc.add_note(...)` — py3.11+ and attached to FAILED attempts only, so
+       a node that succeeds on attempt 2 leaves no note on anything that
+       ships.
+
+    DECISION: documented limitation. Re-argue when langgraph exposes a public
+    per-attempt callback reachable from the `run_with_retry` seam.
     """
     from langgraph.types import RetryPolicy
 

@@ -326,6 +326,9 @@ def test_a_node_span_carries_exactly_seven_extra_entries(installed):  # noqa: F8
     `gen_ai` block, so the count is always one above what the adapter wrote — a
     fact worth pinning, because an author adding a key counts their own and gets
     an off-by-one that reads as the builder having changed under them.
+
+    `wardex.step.trigger` is final vocabulary for the scheduling edge, per the
+    same node-is-not-an-agent decision the adapter module's docstring records.
     """
     chain(installed.ctx, 1, name="Arity", leaves=False).invoke({"trail": []})
     extra = extra_of(steps(installed.spans)[0])
@@ -655,7 +658,12 @@ def test_command_goto_is_published_for_a_name_and_withheld_for_a_send(installed)
     string shapes ARE names. A `Send` carries a node name PLUS a payload, which
     is a second decision this slice does not make, so it is omitted rather than
     guessed — and the omission is asserted so that a later `str(goto)` cannot
-    slip a repr in under a key that promises a destination."""
+    slip a repr in under a key that promises a destination.
+
+    DECISION: this extra IS the handoff vocabulary. No `HANDOFF` span is
+    minted, because a node has no honest agent identity to put in the AGENT
+    block that intent requires — the adapter module's docstring records the
+    trigger for revisiting."""
 
     @tool
     def by_name(x: int) -> Command:

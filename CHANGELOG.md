@@ -254,6 +254,13 @@ gone.
   `set_context()`, which makes them safe to call from a send path when a
   context value holds something that cannot be copied, such as a lock or a
   socket.
+- **LangGraph tool-input recording is shaped and bounded at the source.**
+  `input_data` is byte-identical to the previous `repr` for plain builtin
+  argument shapes, but a framework object inside `call["args"]` (an injected
+  `Command`, a message list) now ships as its bare type name instead of a
+  full repr, and materialization is bounded by the resolved `max_body_bytes`
+  with the `truncated` flag set on overflow. Wire-visible only for
+  non-builtin argument values; pre-1.0.
 
 ### Fixed
 
@@ -303,6 +310,21 @@ gone.
 - A non-latin-1 character in an inbound `tracestate` could raise
   `UnicodeEncodeError` out of the host's own outbound request when the value
   was forwarded. Header injection is fail-silent again in that case.
+
+### Documentation
+
+- The LangGraph retry attempt count is a documented limitation: every
+  per-attempt signal langgraph exposes today is internal, corner-scoped, or
+  process-global. The signal inventory and the re-open trigger live on the
+  pinned test `test_the_attempt_count_is_not_recoverable_from_the_span`.
+- Abandoned LangGraph streams keep their exception-derived `ERROR` status —
+  the interpreter's own exception name, decided by who finalizes the
+  generator. No dedicated abandonment marker is minted until field data shows
+  a consumer needs one spelling.
+- A LangGraph node is not an agent: no `HANDOFF` span is fabricated for
+  `Command(goto=...)`. `wardex.langgraph.command_goto` and
+  `wardex.step.trigger` are the final vocabulary, and graph-edge causality
+  stays in extras and links between step spans.
 
 ## [0.4.0b1] - 2026-08-09
 

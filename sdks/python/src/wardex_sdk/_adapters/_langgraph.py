@@ -32,6 +32,19 @@ exception. `CONTROL_FLOW` is what stops those reading as failures, and it is
 populated in `install()` because the error classes cannot be imported before
 then; `_run` reads it through the context when it classifies an exception, so
 install-time population is soon enough.
+
+Decisions this adapter records rather than revisits: the retry attempt COUNT
+is a documented limitation — every per-attempt signal langgraph exposes today
+is internal, corner-scoped or process-global, and the inventory lives on
+`test_the_attempt_count_is_not_recoverable_from_the_span`. An ABANDONED
+stream ships ERROR with the interpreter's own exception name and no dedicated
+marker — the spelling is decided by who finalizes the generator (see the
+abandonment section of `test_langgraph_control_flow.py`). And a graph NODE is
+not an agent: no `HANDOFF` span and no `AgentAttributes` are fabricated for a
+`Command(goto=...)` — the vocabulary is `wardex.langgraph.command_goto` plus
+`wardex.step.trigger`, graph-edge causality stays in the data plane (extras,
+and links between step spans), revisited only for a framework that puts real
+agent identities in nodes.
 """
 
 from __future__ import annotations
@@ -409,6 +422,11 @@ def _command_goto(out: Any) -> str | None:
     `Command.goto` is typed `Send | Sequence[Send | str] | str`, and a `Send`
     carries a node name PLUS a payload — a second decision this slice does not
     make. A `Send` destination is therefore omitted rather than guessed.
+
+    DECISION: `goto` is an extra, never a `HANDOFF` marker span.
+    `SpanIntent.HANDOFF` requires the AGENT block (`_vocab.py`'s rule), and a
+    node name is not an honest `AgentAttributes.name` — publishing one would
+    be confidence the edge cannot back (I4).
     """
     goto = getattr(out, "goto", None)
     if isinstance(goto, str):
@@ -476,6 +494,13 @@ def _mk_stream(original: Callable[..., Iterator[Any]], adapter: Any) -> Callable
     into a `KeyError` and emits zero spans. The prologue is only ever allowed
     to compute a `subject`, because a `None` subject degrades to the bare
     operation name while a missing required key deletes the span.
+
+    The abandonment status is deliberate: a run the host walked away from
+    ships ERROR carrying the interpreter's own exception name
+    (`GeneratorExit` here). `GeneratorExit` is NOT classified as control
+    flow, because control flow ships UNSET and UNSET claims a run completed
+    cleanly. The two `finally` counters below are the operator's handle on
+    the abandons that never finalize or finalize elsewhere.
     """
 
     def wrapper(self: Any, *args: Any, **kwargs: Any) -> Any:
@@ -524,6 +549,11 @@ def _mk_astream(original: Callable[..., Any], adapter: Any) -> Callable[..., Any
     error — so `async for chunk in original(...): yield chunk` is the only way
     to hold a scope across the framework's own async iteration, and the body
     rule admits exactly that shape and nothing computed inside it.
+
+    Abandonment policy is `_mk_stream`'s, with one more spelling: the loop's
+    finalizer closes an abandoned async generator on its own task and the
+    wrapper reads `CancelledError`, while a host's own `aclose()` reads
+    `GeneratorExit`.
     """
 
     async def wrapper(self: Any, *args: Any, **kwargs: Any) -> Any:

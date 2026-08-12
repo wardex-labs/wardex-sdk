@@ -250,6 +250,15 @@ def test_the_same_width_run_synchronously_stays_clean():
 
 # --------------------------------------------------------------------------
 # abandonment: three entries, three different wire signals
+#
+# DECISION recorded — abandonment keeps the exception-derived shape:
+# status=ERROR carrying the interpreter's own exception name, decided by who
+# finalizes the generator. No STREAM_ABANDONED limitation is minted until
+# field data shows a consumer actually needs one spelling: the wire
+# vocabulary is closed and append-only, so an unneeded member is forever.
+# And GeneratorExit/CancelledError deliberately stay OUT of CONTROL_FLOW —
+# classifying them would ship UNSET, which claims a run completed cleanly
+# when the host walked away from it.
 # --------------------------------------------------------------------------
 
 
@@ -315,6 +324,11 @@ def test_closing_an_abandoned_astream_on_its_own_task_reads_generator_exit():
     abandoned async run" has two spellings, and which exception the run span
     carries is decided by WHO finalizes the generator, not by the adapter. A
     consumer alerting on `CancelledError` would miss this one entirely.
+
+    That two-spelling gap is the recorded decision (the section comment
+    above), not an oversight awaiting a marker — and the operator guidance it
+    implies: match abandonment on the `stream_finalized` counters plus ERROR
+    status, never on one exception spelling.
     """
 
     async def drive(live):
