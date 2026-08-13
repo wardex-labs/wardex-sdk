@@ -750,3 +750,42 @@ def test_an_interrupted_close_units_does_not_cost_the_other_adapters_theirs():
 
     assert closed == [Limitation.UNIT_INTERRUPTED]
     assert reg.is_installed("interrupted-close"), "close_units must not uninstall"
+
+
+def test_uninstall_closes_the_bridge_receiver_socket():
+    """The OTel bridge's receiver socket rides the SAME teardown everything
+    else does: after `uninstall()` the port refuses connections and the
+    receiver thread is gone. A socket that outlives its adapter is a resource
+    the host cannot see or free — the exact class of leak this file exists
+    to forbid."""
+    import socket
+    import threading
+    from types import SimpleNamespace
+
+    from wardex_sdk._adapters._anthropic_agent_sdk import AnthropicAgentSdkAdapter
+    from wardex_sdk._adapters._registry import context_for
+    from wardex_sdk._config import AdaptersConfig, AnthropicAgentSdkConfig
+    from wardex_sdk._limits import LimitsConfig
+
+    client = SimpleNamespace(
+        config=SimpleNamespace(
+            limits=LimitsConfig(),
+            debug=False,
+            adapters=AdaptersConfig(anthropic_agent_sdk=AnthropicAgentSdkConfig(otel_bridge=True)),
+        ),
+        capture_span=lambda span: None,
+    )
+    adapter = AnthropicAgentSdkAdapter()
+    adapter.install(client, context_for(adapter.name(), client))
+    try:
+        assert adapter._bridge is not None, "otel_bridge=True must build the receiver"
+        port = adapter._bridge.port
+        with socket.create_connection(("127.0.0.1", port), timeout=1):
+            pass  # live while installed
+    finally:
+        adapter.uninstall()
+
+    with pytest.raises(ConnectionRefusedError):
+        socket.create_connection(("127.0.0.1", port), timeout=1)
+    assert not any(t.name == "wardex-otel-bridge" and t.is_alive() for t in threading.enumerate())
+    adapter.uninstall()  # idempotent
