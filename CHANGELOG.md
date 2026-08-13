@@ -254,6 +254,19 @@ gone.
 
 ### Changed
 
+- **Wire-value change (pre-1.0): an orphan wardex's own eviction caused now
+  says so.** A span opened inside the leftover `activate()` scope of a unit
+  the registry itself evicted still becomes a marked trace root, but carries
+  `INSTRUMENTATION_DEGRADED` instead of `CORRELATION_CONFLICT`: the strand is
+  wardex's bound at work, and the repair is `max_units`, not the adapter's pin
+  or lifetime discipline. Strands left by ordinary closes keep
+  `CORRELATION_CONFLICT`. The refusal itself is unchanged — same predicate,
+  same trace-root edge; only the attribution moved, and it moved on every
+  reachable path: the registry's own `open()`/`resolve()` refusals and the
+  adapter surface's declared sole-live fallback all ask the registry for the
+  word (`UnitRegistry.refused_ambient_marker`). The refusal counters gain a
+  third name, `assembly._units.stale_ambient_evicted`, so an operator can
+  separate "raise the cap" from "fix the adapter".
 - **The MCP tool catalogue's internal lock is now reentrant**, which makes
   every lock in the SDK reentrant except one deliberate, documented holdout.
   Since the socket close hook landed, SDK code can be re-entered from a

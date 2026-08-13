@@ -196,18 +196,18 @@ _MEMBER_SITES: dict[str, frozenset[str]] = {
     # one calling it, and `open()`/`resolve()` record the scope a CLOSED pin
     # left standing. All were declared vocabulary with no emitter until the unit
     # registry landed.
-    # The adapter surface is the fourth site and the one that reaches a span the
-    # registry cannot mark for itself: a site declaring `Fallback.SOLE_LIVE_RUN`
-    # takes a parent_unit, which is exactly what stops `open()` from seeing the
-    # poisoned ambient — so the "we guessed because what was pinned had died"
-    # case would otherwise be byte-identical to "we guessed because nothing was
-    # pinned". It moved here out of the Anthropic adapter, which used to stamp it
-    # at the end of its own tier ladder. The pinned unit's own span was
-    # materialized and shipped inside the `close()` that made the pin stale, so
-    # it is not an editable place to record any of this.
+    # The refusal sites no longer spell the member at the slot: the WORD is
+    # chosen in `UnitRegistry.refused_ambient_marker` (this member for a pin or
+    # lifetime strand, INSTRUMENTATION_DEGRADED for one the registry's own
+    # eviction left), whose two literals sit in a marker-ish assignment this
+    # scanner reads — still `_assembly/_units.py`, so the file set holds. The
+    # adapter surface's `Fallback.SOLE_LIVE_RUN` path — a site declaring a
+    # fallback takes a parent_unit, which is exactly what stops `open()` from
+    # seeing the poisoned ambient — asks that same helper rather than spelling
+    # a member of its own, so `_adapters/_context.py` left this set: its call
+    # is the recorded `Call:refused_ambient_marker` hole in `_UNRESOLVED_PY`.
     "CORRELATION_CONFLICT": frozenset(
         {
-            "_adapters/_context.py",
             "_assembly/_units.py",
             # A second `system/init` naming a different run on a transport key
             # this table still holds live: two agent runs sharing one root.
@@ -300,6 +300,11 @@ _MEMBER_SITES: dict[str, frozenset[str]] = {
         {
             "_adapters/_context.py",
             "_assembly/_parentage.py",
+            # `refused_ambient_marker`: an evict-origin stranded scope is
+            # wardex's own bound at work, so the refusal says so instead of
+            # CORRELATION_CONFLICT — the repair is `max_units`, not the
+            # adapter's pin or lifetime discipline.
+            "_assembly/_units.py",
             # `_EDGE_MARKERS` again — see PARENT_UNRESOLVED above.
             "testing/conformance.py",
         }
@@ -499,8 +504,9 @@ _EMITTED_MEMBERS: frozenset[str] = frozenset(
         # disagreement is on the wire rather than in a counter": an alias and
         # the live context land in different traces, a pin is declared for a
         # task other than the caller, `open()`/`resolve()` refuse the scope a
-        # CLOSED pin left standing, and — the one site outside the registry —
-        # the adapter marks the tool span whose edge a stale pin decided.
+        # CLOSED pin left standing, and — the one emit path outside the
+        # registry — the adapter marks the tool span whose edge a stale pin
+        # decided, with the word `refused_ambient_marker` chooses for it.
         "UNIT_EVICTED",
         "CORRELATION_CONFLICT",
         # pre-census declared and §5.4's, whose emitters were BUILT in the
@@ -1055,17 +1061,23 @@ _UNRESOLVED_PY: frozenset[tuple[str, str]] = frozenset(
         ("_assembly/_snapshot.py", "Call:list"),
         ("_assembly/_snapshot.py", "List"),
         ("_assembly/_snapshot.py", "Name:marker"),
-        # Two forwards in the unit registry, neither of which can introduce a
+        # Three shapes in the unit registry, none of which can introduce a
         # value. `Name:marker` is `Unit.note`,
         # a one-line forward onto the unit's own draft. `Name:reason` is
         # `close_all(reason=...)`, whose member is the CALLER's (an adapter
         # uninstall passes `ADAPTER_UNINSTALLED`, a cancelled process passes
         # `UNIT_INTERRUPTED`) and therefore unreadable from here by
         # construction. The markers this module DECIDES — `UNIT_EVICTED`,
-        # `CHILD_SPAN_UNCLOSED`, `CORRELATION_CONFLICT` and the three that
+        # `UNIT_TABLE_FULL`, `CHILD_SPAN_UNCLOSED` and the three that
         # `resolve()` stamps — are spelled out as literals at their slots and
-        # appear in `_MEMBER_SITES`, which is what keeps this trio a set of
-        # pipes rather than a hiding place.
+        # appear in `_MEMBER_SITES`, which is what keeps this set one of
+        # pipes rather than a hiding place. `Call:refused_ambient_marker` is
+        # the refusal slot in `open()`/`resolve()`: the member is DECIDED in
+        # `refused_ambient_marker` (evict-origin strand vs pin/lifetime
+        # strand), whose two literals sit in marker-ish assignments the
+        # scanner reads and `_MEMBER_SITES` records — the call site is a
+        # recorded hole, not a hiding place.
+        ("_assembly/_units.py", "Call:refused_ambient_marker"),
         ("_assembly/_units.py", "Name:marker"),
         ("_assembly/_units.py", "Name:reason"),
         # The three forwards that carry a shutdown marker down to an adapter:
@@ -1083,7 +1095,12 @@ _UNRESOLVED_PY: frozenset[tuple[str, str]] = frozenset(
         # `Attribute:name` is `owner=self.name` riding along in that same
         # `close_all` call — R9 makes every argument of a marker-taking callee
         # read-all, and an adapter's own name is not a marker.
+        # `Call:refused_ambient_marker` is the SOLE_LIVE_RUN fallback asking
+        # the registry which word the stranded scope earns — the same slot the
+        # registry's own refusals use, recorded in `_assembly/_units.py` above;
+        # the two literals it can yield are censused where they are decided.
         ("_adapters/_context.py", "Attribute:name"),
+        ("_adapters/_context.py", "Call:refused_ambient_marker"),
         ("_adapters/_context.py", "Name:marker"),
         ("_interceptors/_seam.py", "Name:marker"),
         ("_interceptors/_seam.py", "Tuple"),

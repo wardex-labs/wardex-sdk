@@ -1334,6 +1334,47 @@ def test_a_guess_a_dead_pin_caused_says_which_kind_of_guess_it_was():
     assert Limitation.CORRELATION_CONFLICT in markers, (
         "a guess caused by a dead pin reads the same as a guess caused by nothing"
     )
+    assert Limitation.INSTRUMENTATION_DEGRADED not in markers, (
+        "an ordinary close is the adapter's strand to repair, not wardex's"
+    )
+
+
+def test_a_guess_an_eviction_caused_reads_as_wardexs_own_bound():
+    """The evict-origin twin of the dead-pin case above.
+
+    `max_units=1`: root A is evicted while its `activate()` fork is still
+    entered, so the fork stands holding A's already-shipped context; a NESTED
+    site then opens under sole-live B through the declared fallback. That
+    strand is wardex's own table at work, so the guess carries
+    `INSTRUMENTATION_DEGRADED` — the repair is `max_units` — not the
+    `CORRELATION_CONFLICT` that would send the reader hunting an adapter bug
+    that does not exist. The WORD comes from the registry
+    (`refused_ambient_marker`), the same one `open()` uses when it sees the
+    corpse itself — taking a parent unit is what stops it from seeing this
+    one, and this path must not fall out of step with the registry's.
+    """
+    sink = RecordingSink()
+    ctx = AdapterContext("test", units=UnitRegistry(sink=sink, max_units=1), limits={})
+    dead = _session(ctx, "A")
+    fork = dead.activate()
+    fork.__enter__()
+    _session(ctx, "B")  # evicts A: closed, emitted with UNIT_EVICTED, breadcrumbed
+
+    assert dead.is_live is False
+
+    with ctx.enter(
+        UnitKind.CALL,
+        intent=SpanIntent.EXECUTE_TOOL,
+        placement=Placement.NESTED,
+        fallback=Fallback.SOLE_LIVE_RUN,
+        describe=_tool,
+    ):
+        pass
+
+    source, confidence, markers = _edge(sink)
+    assert (source, confidence) == (ParentSource.UNIT_SOLE, 0.5)
+    assert Limitation.INSTRUMENTATION_DEGRADED in markers
+    assert Limitation.CORRELATION_CONFLICT not in markers
 
 
 def test_a_claim_is_taken_on_the_run_and_not_on_the_scope_that_took_it():

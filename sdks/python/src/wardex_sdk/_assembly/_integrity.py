@@ -193,16 +193,25 @@ Two emit sites, and the first is the mechanism the second restates.
     * ``UnitRegistry.open`` and ``UnitRegistry.resolve`` attach it when they
       REFUSE the scope a CLOSED pin left standing: the opened unit becomes a
       trace root, or the edge is rebuilt from the remaining tiers, instead of
-      hanging later work off a finished unit at confidence 1.0.
-    * ``_adapters/_context.py`` — the only emitter outside the registry — marks
-      the span whose edge a declared fallback decided while a dead pin was
-      standing. Taking a parent unit is precisely what stops ``open()`` from
-      seeing the poisoned ambient for itself, so without this the two reasons a
-      guess happened are byte-identical: "nothing was pinned" and "what was
-      pinned had died", the second being a call filed inside a run it has
-      nothing to do with. The pinned session's own span is not reachable either
-      way — it was materialized and shipped inside the very ``close()`` that
-      made the pin stale, and ``Unit.note()`` on a closed unit is a no-op.
+      hanging later work off a finished unit at confidence 1.0 — unless the
+      unit died by the registry's OWN eviction, in which case the refusal
+      carries ``INSTRUMENTATION_DEGRADED`` instead
+      (``UnitRegistry.refused_ambient_marker``): the two strands have
+      different repairs, and this member's is pin and lifetime discipline,
+      not a capacity knob.
+    * ``_adapters/_context.py`` — the one emit path outside the registry —
+      marks the span whose edge a declared fallback decided while a dead pin
+      was standing. Taking a parent unit is precisely what stops ``open()``
+      from seeing the poisoned ambient for itself, so without this the two
+      reasons a guess happened are byte-identical: "nothing was pinned" and
+      "what was pinned had died", the second being a call filed inside a run
+      it has nothing to do with. The pinned session's own span is not
+      reachable either way — it was materialized and shipped inside the very
+      ``close()`` that made the pin stale, and ``Unit.note()`` on a closed
+      unit is a no-op. The site spells no member of its own: it asks
+      ``refused_ambient_marker`` for the word, so an evict-origin strand says
+      ``INSTRUMENTATION_DEGRADED`` there exactly as it would had ``open()``
+      seen the corpse itself.
     """
 
     # ------------------------------------------------------------------
@@ -410,6 +419,18 @@ Two emit sites, and the first is the mechanism the second restates.
     stream latch at ``max_streams``). It travels with ``PARENT_UNRESOLVED``,
     which ``_MARKER`` attaches from the ``UNRESOLVED`` source; this one is what
     stops the pair reading as "the host has an untraced caller".
+
+    And from ``_assembly/_units.py``, for the refusal of an EVICT-ORIGIN
+    leftover scope: ``open()`` and ``resolve()`` refuse the standing fork of a
+    unit the registry itself evicted (``Unit._evicted``), and the refused span
+    carries this member rather than ``CORRELATION_CONFLICT`` — the strand is
+    wardex's own bound at work, so the repair is ``max_units``, not the
+    adapter's pinning or lifetime. The word is chosen in
+    ``UnitRegistry.refused_ambient_marker``, which the adapter surface's
+    declared fallback asks too, so the strand reads the same wherever the
+    refusal happens. The same sentence ``resolve_observed`` already says for a
+    byte-seam span whose latched parent wardex discarded to stay inside a
+    bound.
 
     Deliberately not ``CONTEXT_PROPAGATION_DEGRADED``, which is declared as a
     property of the RUNTIME — work whose carrier legitimately could not inherit
