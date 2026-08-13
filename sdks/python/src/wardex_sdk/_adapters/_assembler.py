@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import threading
 import time
+from dataclasses import replace
 from typing import Any
 
 from .. import _wardex_native
@@ -52,7 +53,15 @@ from .._types import (
     ToolAttributes,
 )
 from ._anthropic_names import McpToolCatalog
-from ._session_state import _OpenSubagent, _OpenTool, _Session
+from ._otel_merge import (
+    OTEL_EXTRA_PREFIX,
+    _ChatWindow,
+    _OtelSpan,
+    allowlisted_extras,
+    classify,
+    join_chats,
+)
+from ._session_state import _BridgeBinding, _OpenSubagent, _OpenTool, _PendingSpan, _Session
 from ._sink import _ClientSink
 
 # Every span this assembler emits below the session root hangs off a context the
@@ -154,9 +163,16 @@ class SessionAssembler:
         max_session_entries: int | None = None,
         max_units: int | None = None,
         max_entries_per_unit: int | None = None,
+        bridge: Any = None,
     ) -> None:
         self._client = client
         self._lock = threading.RLock()
+        # The OTel bridge receiver (`_otel_receiver._OtelBridgeReceiver`), or
+        # None — the default, which keeps every bridge branch below dead and
+        # the off path line-for-line today's code. A session additionally
+        # gates on its own `sess.bridge` binding, so even with a receiver
+        # here, a session the injection never reached behaves as today.
+        self._bridge = bridge
         self._by_key: dict[int, _Session] = {}
         self._by_session_id: dict[str, _Session] = {}
         # None means "use the core default" — resolved here (rather than hardcoded)
@@ -213,6 +229,19 @@ class SessionAssembler:
             sess = self._by_key.get(key)
         return sess.unit if sess is not None and sess.unit.is_live else None
 
+    def bridge_route(self, key: int) -> tuple[str | None, str | None] | None:
+        """`(trace_id_hex, session_id)` for a live bridge-bound session, else None.
+
+        The adapter's drain plan reads this before deciding whether to wait at
+        all: None — no session, no binding, or a dead unit — means the close
+        proceeds at full speed, which is the drain's own latency gate.
+        """
+        with self._lock:
+            sess = self._by_key.get(key)
+            if sess is None or sess.bridge is None or not sess.unit.is_live:
+                return None
+            return (sess.bridge.trace_id_hex, sess.session_id)
+
     def pin_reader(self, key: int, owner_task: object) -> bool:
         """Pin the session unit onto the task driving this transport's reader.
 
@@ -237,7 +266,7 @@ class SessionAssembler:
 
     # --- ingestion ---
 
-    def on_outbound(self, key: int, data: str) -> None:
+    def on_outbound(self, key: int, data: str, bridge: _BridgeBinding | None = None) -> None:
         """Host -> CLI write. A main-thread user message installs the pending prompt.
 
         The `parent_tool_use_id is None` gate is SYMMETRIC with consumption:
@@ -247,6 +276,12 @@ class SessionAssembler:
         into a sub-agent's thread — is not the next main-thread turn's prompt,
         so installing it here would overwrite a prompt the main thread has not
         consumed yet and charge the loss to a turn that never died.
+
+        `bridge` is the adapter's injection-correlation verdict for this
+        transport (the subprocess-env read-back), attached once, when the
+        session it names first exists. It rides the outbound WRITE because
+        that is the event that creates sessions — a binding cannot predate the
+        thing it binds.
         """
         ev = parse_line(data.encode(), outbound=True)
         if ev is None:
@@ -254,6 +289,8 @@ class SessionAssembler:
         now = time.time_ns()
         with self._lock:
             sess = self._ensure_session(key, now)
+            if bridge is not None and sess.bridge is None and self._bridge is not None:
+                sess.bridge = bridge
             sess.turn_start_ns = now
             sess.first_delta_ns = 0
             if ev.content_json and ev.parent_tool_use_id is None:
@@ -441,6 +478,12 @@ class SessionAssembler:
         config = getattr(self._client, "config", None)
         return guard(where, debug=bool(getattr(config, "debug", False)))
 
+    def _capture(self, span: Any) -> None:
+        """This class's ONE exit to the sink (C-S5): every finished span leaves
+        through here, so a new emit path extends a list of callers rather than
+        multiplying direct sink call sites."""
+        self._client.capture_span(span)
+
     def _live_session(self, key: int, now: int) -> _Session | None:
         """The session filed under `key`, but only while its unit is still alive.
 
@@ -484,7 +527,29 @@ class SessionAssembler:
         if sess.session_id:
             self._by_session_id.pop(sess.session_id, None)
         self._drain_children(sess, now)
+        # The retirement half of the pending buffer's conservation rule: the
+        # root already shipped, so there is no finalize-time merge left to
+        # wait for — every held draft goes out NOW, unmerged, deferred markers
+        # applied, and the receiver slot is unfiled so it cannot outlive the
+        # session that reserved it.
+        self._flush_pending(sess)
+        self._retire_bridge(sess)
         return None
+
+    def _retire_bridge(self, sess: _Session) -> None:
+        """Unfile the receiver slot of a session retired without a merge.
+
+        The retirement path runs mid-event with the lock held and a root that
+        shipped seconds ago — there is nothing safe to merge INTO, so the slot
+        is taken and dropped (counted). Its spans were the CLI's copy of work
+        whose wardex spans just flushed unmerged; keeping the slot would only
+        let it grow until the receiver's own bound evicted it.
+        """
+        if sess.bridge is None or self._bridge is None:
+            return
+        with self._guard("adapters.assembler.otel_bridge_retire"):
+            self._bridge.take(sess.bridge.trace_id_hex, sess.session_id)
+        counters.bump("adapters.assembler.otel_bridge_retired")
 
     def _resume(self, sess: _Session, previous: _Session) -> None:
         """Carry a retired session's identity onto the root that replaces it.
@@ -715,14 +780,32 @@ class SessionAssembler:
         return sub.draft.context if sub is not None else sess.unit.context
 
     def _emit_chat(self, sess: _Session, ev: AgentStreamEvent, now: int) -> None:
+        if sess.bridge is not None:
+            with self._guard("adapters.assembler.emit_chat"):
+                self._pend_chat(sess, ev, now)
+            sess.turn_index += 1
+            return
         span = None
         with self._guard("adapters.assembler.emit_chat"):
             span = self._build_chat(sess, ev, now)
         sess.turn_index += 1
         if span is not None:
-            self._client.capture_span(span)
+            self._capture(span)
 
-    def _build_chat(self, sess: _Session, ev: AgentStreamEvent, now: int) -> Any:
+    def _chat_draft(self, sess: _Session, ev: AgentStreamEvent, now: int) -> tuple:
+        """One chat span, minus its END and its TIMING markers.
+
+        Shared by the immediate path (`_build_chat`) and the bridge's pending
+        path (`_pend_chat`) so the two cannot drift: the bridge's off state
+        must reproduce today's span field for field. The timing markers are
+        the callers' to attach because the merge is what can change their
+        truth — the immediate path attaches them on the spot, the pending path
+        defers them until the merge has answered.
+
+        Returns `(draft, gen_ai, ttft, start_ns)`: the gen_ai block rides
+        along for the merge's ttft rewrite, the ttft for the marker decision,
+        and the start for the join window.
+        """
         p = child_of(self._resolve_subagent_anchor(sess, ev.parent_tool_use_id), _IN_SESSION)
         start_ns = sess.turn_start_ns or now
 
@@ -741,26 +824,22 @@ class SessionAssembler:
             source=CaptureSource.ADAPTER,
             start_ns=start_ns,
         )
-        draft.set_gen_ai(
-            GenAIAttributes(
-                operation=SpanIntent.CHAT.operation,
-                provider=ProviderName.ANTHROPIC,
-                request_model=sess.model,
-                response_model=ev.model,
-                response_id=ev.message_id,
-                input_tokens=ev.input_tokens,
-                output_tokens=ev.output_tokens,
-                cache_read_input_tokens=ev.cache_read_tokens,
-                cache_creation_input_tokens=ev.cache_creation_tokens,
-                finish_reasons=(ev.stop_reason,) if ev.stop_reason else None,
-                time_to_first_chunk_s=ttft,
-            )
+        gen_ai = GenAIAttributes(
+            operation=SpanIntent.CHAT.operation,
+            provider=ProviderName.ANTHROPIC,
+            request_model=sess.model,
+            response_model=ev.model,
+            response_id=ev.message_id,
+            input_tokens=ev.input_tokens,
+            output_tokens=ev.output_tokens,
+            cache_read_input_tokens=ev.cache_read_tokens,
+            cache_creation_input_tokens=ev.cache_creation_tokens,
+            finish_reasons=(ev.stop_reason,) if ev.stop_reason else None,
+            time_to_first_chunk_s=ttft,
         )
+        draft.set_gen_ai(gen_ai)
         draft.set_conversation(self._conversation(sess, turn_index=sess.turn_index))
         draft.set_status(StatusCode.OK)
-        draft.add_limitation(_BASE_LIMITATION)
-        if ttft is not None:
-            draft.add_limitation(Limitation.TTFT_IPC_APPROXIMATION)
 
         # Consumption is gated exactly the way installation is (`on_outbound`):
         # only a MAIN-THREAD assistant turn consumes the pending prompt. A
@@ -789,7 +868,59 @@ class SessionAssembler:
         # cannot back (I4). The ingestion move that turns that fallback into a
         # `UnitKey` is what earns this field.
         draft.replace_correlation(None)
+        return draft, gen_ai, ttft, start_ns
+
+    def _build_chat(self, sess: _Session, ev: AgentStreamEvent, now: int) -> Any:
+        draft, _gen_ai, ttft, _start_ns = self._chat_draft(sess, ev, now)
+        draft.add_limitation(_BASE_LIMITATION)
+        if ttft is not None:
+            draft.add_limitation(Limitation.TTFT_IPC_APPROXIMATION)
         return draft.finish(now)
+
+    def _pend_chat(self, sess: _Session, ev: AgentStreamEvent, now: int) -> None:
+        """Hold this turn's chat draft for the finalize-time merge.
+
+        The timing markers travel DEFERRED: the merge removes the whole
+        rationale for both when a `claude_code.llm_request` claims this turn
+        (CLI-measured interval + ttft), and an unmerged flush applies them
+        unchanged — so the bridge failing produces exactly today's span.
+        """
+        draft, gen_ai, ttft, start_ns = self._chat_draft(sess, ev, now)
+        draft.set_end_ns(now)
+        deferred = (
+            (_BASE_LIMITATION, Limitation.TTFT_IPC_APPROXIMATION)
+            if ttft is not None
+            else (_BASE_LIMITATION,)
+        )
+        self._pend(
+            sess,
+            _PendingSpan(
+                draft=draft,
+                kind="chat",
+                deferred_markers=deferred,
+                agent_id=self._chat_agent_id(sess, ev.parent_tool_use_id),
+                window=(start_ns, now),
+                gen_ai=gen_ai,
+            ),
+        )
+
+    def _chat_agent_id(self, sess: _Session, parent_tool_use_id: str | None) -> str | None:
+        """The subagent scope a chat is anchored to — the merge join's scope key.
+
+        Mirrors `_resolve_subagent_anchor`'s two matches; None is the main
+        thread. Kept separate rather than derived from the anchor because the
+        anchor silently falls back to the session root, and a fallback must
+        not masquerade as a main-thread scope claim in a JOIN — an unmatched
+        scope fails honestly (no merge), a wrong scope merges wrongly.
+        """
+        if not parent_tool_use_id:
+            return None
+        if parent_tool_use_id in sess.subagents:
+            return parent_tool_use_id
+        open_tool = sess.open_tools.get(parent_tool_use_id)
+        if open_tool is not None and open_tool.agent_id in sess.subagents:
+            return open_tool.agent_id
+        return None
 
     def _claim_key(self, sess: _Session, tool_name: str) -> UnitKey | None:
         """This hook observation's slot in the shared key space, or None.
@@ -909,11 +1040,45 @@ class SessionAssembler:
             # execution and once from the hook that only watched it.
             counters.bump("adapters.assembler.tool_claim_lost")
             return
+        if sess.bridge is not None:
+            with self._guard("adapters.assembler.emit_tool"):
+                self._pend_tool(sess, tool, end_ns, failed, markers, error_type)
+            return
         span = None
         with self._guard("adapters.assembler.emit_tool"):
             span = self._build_tool(sess, tool, end_ns, failed, markers, error_type)
         if span is not None:
-            self._client.capture_span(span)
+            self._capture(span)
+
+    def _pend_tool(
+        self,
+        sess: _Session,
+        tool: _OpenTool,
+        end_ns: int,
+        failed: bool,
+        markers: tuple[Limitation, ...],
+        error_type: str | None,
+    ) -> None:
+        """Hold a hook/stream tool draft for the finalize-time merge.
+
+        The SAME draft `_build_tool` would finish, timing marker included: a
+        merged tool span keeps its IPC times and its marker — the merge only
+        ADDS the CLI-measured duration as an extra plus the source, because a
+        rewritten time under a "timing unavailable" marker would lie and
+        removing the marker is the merged-LLM deliverable, not this one.
+        Deferral would buy nothing here, so nothing is deferred.
+        """
+        draft = self._tool_draft(sess, tool, failed, markers, error_type)
+        draft.set_end_ns(end_ns)
+        self._pend(
+            sess,
+            _PendingSpan(
+                draft=draft,
+                kind="tool",
+                tool_use_id=tool.tool_use_id,
+                agent_id=tool.agent_id,
+            ),
+        )
 
     def _build_tool(
         self,
@@ -924,6 +1089,16 @@ class SessionAssembler:
         markers: tuple[Limitation, ...],
         error_type: str | None,
     ) -> Any:
+        return self._tool_draft(sess, tool, failed, markers, error_type).finish(end_ns)
+
+    def _tool_draft(
+        self,
+        sess: _Session,
+        tool: _OpenTool,
+        failed: bool,
+        markers: tuple[Limitation, ...],
+        error_type: str | None,
+    ) -> SpanDraft:
         anchor = sess.unit.context
         if tool.agent_id is not None:
             sub = sess.subagents.get(tool.agent_id)
@@ -983,7 +1158,7 @@ class SessionAssembler:
         # on an anchor that may have come from a silent fallback, which is the
         # claim this module's header forbids by name.
         draft.replace_correlation(None)
-        return draft.finish(end_ns)
+        return draft
 
     def _on_stream_tool_result(self, sess: _Session, ev: AgentStreamEvent, now: int) -> None:
         # `tool_result_id`, never `parent_tool_use_id`. The two answer different
@@ -1041,12 +1216,262 @@ class SessionAssembler:
         entry = sess.subagents.pop(agent_id, None)
         if entry is None:
             return
+        if sess.bridge is not None:
+            # The subagent draft was built at SubagentStart with its timing
+            # marker already attached, and it keeps it merged or not: a
+            # `subagent.spawn` cross-check adds the source, never a time
+            # rewrite. Nothing to defer — held only so the merge can find it.
+            with self._guard("adapters.assembler.emit_subagent"):
+                entry.draft.set_status(StatusCode.OK)
+                entry.draft.set_end_ns(now)
+                self._pend(
+                    sess,
+                    _PendingSpan(draft=entry.draft, kind="subagent", agent_id=agent_id),
+                )
+            return
         span = None
         with self._guard("adapters.assembler.emit_subagent"):
             entry.draft.set_status(StatusCode.OK)
             span = entry.draft.finish(now)
         if span is not None:
-            self._client.capture_span(span)
+            self._capture(span)
+
+    # --- the bridge's pending buffer and finalize-time merge ---
+
+    def _pend(self, sess: _Session, rec: _PendingSpan) -> None:
+        """File a draft for the finalize-time merge, bounded by
+        `max_session_entries`: overflow emits the OLDEST immediately, unmerged,
+        deferred markers applied — the cap defers merging, never deletes (I10).
+        """
+        while len(sess.pending) >= self._max_session_entries:
+            oldest = sess.pending.pop(0)
+            counters.bump("adapters.assembler.otel_bridge_pending_overflow")
+            self._emit_pending(oldest)
+        sess.pending.append(rec)
+
+    def _emit_pending(self, rec: _PendingSpan) -> None:
+        """Finish and emit one held draft, exactly once (`claim_emit`).
+
+        An UNMERGED record gets its deferred markers here — the bridge never
+        answered, so the IPC-approximation facts stand exactly as they would
+        have on the immediate path.
+        """
+        if not rec.draft.claim_emit():
+            return
+        span = None
+        with self._guard("adapters.assembler.emit_pending"):
+            if not rec.merged:
+                for marker in rec.deferred_markers:
+                    rec.draft.add_limitation(marker)
+            span = rec.draft.finish()
+        if span is not None:
+            self._capture(span)
+
+    def _flush_pending(self, sess: _Session) -> None:
+        """Emit everything the session still holds pending, in pend order.
+
+        EVERY retirement path calls this — `_finalize`, `close_all_sessions`,
+        and the registry-eviction retirement in `_live_session` — because the
+        pending buffer is a delay, not an ownership transfer: a span that
+        entered it must leave it onto the wire (span conservation)."""
+        pending, sess.pending = sess.pending, []
+        for rec in pending:
+            self._emit_pending(rec)
+
+    def _merge_bridge(self, sess: _Session, now: int) -> None:
+        """Join the session's CLI telemetry into its pended drafts — finalize time.
+
+        Caller gates on `sess.bridge` and wraps this in a guard: the merge is
+        fail-open by construction, because the pending flush that follows
+        emits today's tree unchanged whenever this method did nothing.
+
+        Authority split (spec rule): time and skeleton are the CLI's — it
+        measured inside its own process; content and semantics stay the
+        stream's. Merged chat spans get the CLI interval and lose the timing
+        markers (the headline deliverable); merged tool spans keep IPC times
+        AND the marker, gaining the CLI-measured duration as an additive
+        extra — a rewritten time under a "timing unavailable" marker would
+        lie, and removing the marker there would exceed what the merge can
+        honestly claim. Fail-open verdicts land on the session ROOT:
+        `otel_bridge_no_data` only when the CONFIRMED injection produced
+        nothing, `otel_bridge_schema_unknown` when data arrived and
+        classified as nothing.
+        """
+        binding = sess.bridge
+        if binding is None or self._bridge is None:
+            return
+        slot = self._bridge.take(binding.trace_id_hex, sess.session_id)
+        root = sess.unit.draft
+        if slot is None or not slot.spans:
+            if slot is not None and slot.schema_failed:
+                root.add_limitation(Limitation.OTEL_BRIDGE_SCHEMA_UNKNOWN)
+            elif binding.confirmed:
+                root.add_limitation(Limitation.OTEL_BRIDGE_NO_DATA)
+            else:
+                # Injection was never read back from the subprocess env, so
+                # "the CLI sent nothing" is a claim this session cannot back
+                # (I4): a counter, not a marker.
+                counters.bump("adapters.assembler.otel_bridge_unconfirmed_no_data")
+            return
+        view = classify(slot.spans)
+        #: OTel span id -> the wardex context it merged into; increments walk
+        #: their CLI parent chain to the nearest entry, root otherwise.
+        anchors: dict[str, Any] = {}
+
+        # (1) interaction — cross-check only: the root's boundaries came from
+        # real transport events; what the CLI adds is that it saw the same
+        # session, plus its own version for the schema-drift record.
+        if view.interactions:
+            root.add_source(CaptureSource.OTEL_BRIDGE)
+            cli_version = slot.resource.get("service.version")
+            if isinstance(cli_version, str) and cli_version:
+                root.set_extra(OTEL_EXTRA_PREFIX + "cli_version", cli_version)
+            for span in view.interactions:
+                anchors[span.span_id] = sess.unit.context
+
+        # (2) tools (exact join) and subagents (cross-check), both keyed.
+        for rec in sess.pending:
+            if rec.kind == "tool" and rec.tool_use_id:
+                otel_tool = view.tools.pop(rec.tool_use_id, None)
+                if otel_tool is None:
+                    continue
+                rec.draft.add_source(CaptureSource.OTEL_BRIDGE)
+                duration_ms = otel_tool.duration_ms
+                if duration_ms is not None:
+                    rec.draft.set_extra(OTEL_EXTRA_PREFIX + "tool_duration_ms", duration_ms)
+                rec.merged = True
+                for span_id in otel_tool.span_ids:
+                    anchors[span_id] = rec.draft.context
+            elif rec.kind == "subagent" and rec.agent_id:
+                spawn = view.spawns.get(rec.agent_id)
+                if spawn is None:
+                    continue
+                rec.draft.add_source(CaptureSource.OTEL_BRIDGE)
+                rec.merged = True
+                anchors[spawn.span_id] = rec.draft.context
+
+        # (3) chats — the unique-time-window join, scoped by agent.
+        windows = [
+            _ChatWindow(key=i, start_ns=rec.window[0], end_ns=rec.window[1], agent_id=rec.agent_id)
+            for i, rec in enumerate(sess.pending)
+            if rec.kind == "chat" and rec.window is not None
+        ]
+        outcome = join_chats(windows, view.llm)
+        for key, llm in outcome.pairs:
+            if not (0 < llm.span.start_ns < llm.span.end_ns):
+                # No real interval means no time rewrite, and marker removal
+                # without one would be a lie — the record ships unmerged.
+                outcome.unjoined.append(llm)
+                continue
+            rec = sess.pending[key]
+            rec.draft.set_start_ns(llm.span.start_ns)
+            rec.draft.set_end_ns(llm.span.end_ns)
+            if llm.ttft_ms is not None and rec.gen_ai is not None:
+                rec.draft.set_gen_ai(
+                    replace(rec.gen_ai, time_to_first_chunk_s=llm.ttft_ms / 1000.0)
+                )
+            elif rec.gen_ai is not None and rec.gen_ai.time_to_first_chunk_s is not None:
+                # The CLI did not price the first chunk, so the stream's IPC
+                # approximation stays on the span — and so must its marker.
+                rec.draft.add_limitation(Limitation.TTFT_IPC_APPROXIMATION)
+            rec.draft.add_source(CaptureSource.OTEL_BRIDGE)
+            if llm.response_id:
+                # The Anthropic request id (`req_...`) — the idempotency key a
+                # backend can join on. RECORDED rather than used as the join
+                # key, because the stream side carries `msg_...` ids only.
+                rec.draft.set_extra(OTEL_EXTRA_PREFIX + "request_id", llm.response_id)
+            rec.merged = True
+            anchors[llm.span.span_id] = rec.draft.context
+
+        # (4) pure increments — CLI work wardex never had a span for.
+        for step_name, span in view.increments:
+            self._emit_increment(sess, span, step_name, view, anchors, conflicted=False)
+        # An llm_request the join could not place ships as a SIBLING step span
+        # rather than merging into anyone: an id/time fact and the tree
+        # disagree and nothing can arbitrate, which is CORRELATION_CONFLICT's
+        # exact sentence. Never a guessed parent.
+        for llm in outcome.unjoined:
+            self._emit_increment(sess, llm.span, "llm_request", view, anchors, conflicted=True)
+
+        # (5) fail-open verdicts on the root.
+        if view.recognized == 0 or slot.schema_failed:
+            root.add_limitation(Limitation.OTEL_BRIDGE_SCHEMA_UNKNOWN)
+
+    def _emit_increment(
+        self,
+        sess: _Session,
+        span: _OtelSpan,
+        step_name: str,
+        view: Any,
+        anchors: dict,
+        conflicted: bool,
+    ) -> None:
+        out = None
+        with self._guard("adapters.assembler.emit_increment"):
+            out = self._build_increment(sess, span, step_name, view, anchors, conflicted)
+        if out is not None:
+            self._capture(out)
+
+    def _build_increment(
+        self,
+        sess: _Session,
+        span: _OtelSpan,
+        step_name: str,
+        view: Any,
+        anchors: dict,
+        conflicted: bool,
+    ) -> Any:
+        """An EXECUTE_STEP span for CLI-internal work wardex could not see.
+
+        The one honest fit in the closed intent grammar: internal work, not an
+        agent, not a tool — EXECUTE_TOOL would double-count against the merged
+        tool span. Times are the CLI's own measurements, so NO transport-timing
+        marker; `capture_sources=(otel_bridge,)` ALONE, because no adapter-side
+        channel observed this work and claiming ADAPTER would put an
+        observation channel on the wire that never observed (the merged-span
+        pair is for merged spans). The parent is the nearest CLI ancestor that
+        merged into a wardex draft — the CLI's own parent chain, not a guess —
+        with the session root as the resting place.
+        """
+        anchor = sess.unit.context
+        seen: set[str] = set()
+        parent = span.parent_hex
+        while parent and parent not in seen:
+            seen.add(parent)
+            mapped = anchors.get(parent)
+            if mapped is not None:
+                anchor = mapped
+                break
+            ancestor = view.by_span_id.get(parent)
+            if ancestor is None:
+                break
+            parent = ancestor.parent_hex
+        p = child_of(anchor, _IN_SESSION)
+        draft = SpanDraft(
+            p,
+            intent=SpanIntent.EXECUTE_STEP,
+            subject=step_name,
+            source=CaptureSource.OTEL_BRIDGE,
+            start_ns=span.start_ns,
+        )
+        draft.set_extra("wardex.step.name", step_name)
+        draft.set_extra(OTEL_EXTRA_PREFIX + "span", span.name)
+        for key, value in allowlisted_extras(span.attrs):
+            draft.set_extra(key, value)
+        draft.set_conversation(self._conversation(sess))
+        if span.status_code == 2:
+            # OTel STATUS_CODE_ERROR — the CLI's own verdict about its own
+            # work; the low-cardinality type says whose failure it was.
+            draft.set_status(StatusCode.ERROR)
+            draft.set_error("cli_error")
+        elif span.status_code == 1:
+            draft.set_status(StatusCode.OK)
+        if conflicted:
+            draft.add_limitation(Limitation.CORRELATION_CONFLICT)
+        # Sub-root discipline unchanged (see `_IN_SESSION`): no correlation
+        # claim until the §3.4 ingestion move.
+        draft.replace_correlation(None)
+        return draft.finish(span.end_ns)
 
     def close_all_sessions(self, *, marker: Limitation) -> None:
         """Finalize every live session, then close whatever the registry still holds.
@@ -1083,7 +1508,17 @@ class SessionAssembler:
                 # finalized — it opens a fresh one or is dropped, and either
                 # way it does not resurrect a root that is on its way out.
                 sess.unit.note(marker)
+                # NEVER a drain, and not by discipline: no wait exists on this
+                # path at all — the drain lives only in the adapter's async
+                # transport-close patch, so atexit/signal/uninstall keep
+                # their flush budgets structurally. The merge itself is free
+                # and opportunistic: whatever the CLI already exported still
+                # lands on the spans it belongs to.
+                if sess.bridge is not None:
+                    with self._guard("adapters.assembler.otel_bridge_merge"):
+                        self._merge_bridge(sess, now)
                 self._drain_children(sess, now)
+                self._flush_pending(sess)
                 status, error_type = StatusCode.UNSET, None
                 with self._guard("adapters.assembler.close_all_sessions"):
                     status, error_type = self._stamp_root(sess, None)
@@ -1119,7 +1554,17 @@ class SessionAssembler:
             self._emit_subagent(sess, agent_id, now)
 
     def _finalize(self, sess: _Session, error: str | None, now: int) -> None:
+        # The merge runs FIRST, against the drafts pended so far; the drain
+        # below then pends whatever was still open (those flush unmerged —
+        # a tool that never got its close hook is a degraded record with or
+        # without the bridge), and the flush ships everything in pend order.
+        # By the time this runs, the adapter's async close patch has already
+        # drained (or decided not to): no waiting happens here.
+        if sess.bridge is not None:
+            with self._guard("adapters.assembler.otel_bridge_merge"):
+                self._merge_bridge(sess, now)
         self._drain_children(sess, now)
+        self._flush_pending(sess)
 
         # (3) Root invoke_agent span — the unit opened in `_ensure_session`,
         # whose context every span above is anchored to. Closing the UNIT rather

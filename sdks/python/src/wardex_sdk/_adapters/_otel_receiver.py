@@ -125,8 +125,11 @@ class _OtelBridgeReceiver:
         self._max_spans_per_session = max_spans_per_session
         self._max_sessions = max_sessions
         self.token = secrets.token_urlsafe(32)
-        #: One lock guards both tables and every slot's contents.
-        self._lock = threading.Lock()
+        #: One lock guards both tables and every slot's contents. RLock like
+        #: every other lock in the SDK (the finalizer-reentrancy sweep):
+        #: nothing here re-enters today, and non-reentrancy buys nothing
+        #: worth arguing an exception for.
+        self._lock = threading.RLock()
         self._by_trace: dict[str, _BridgeSlot] = {}
         self._by_session_id: dict[str, _BridgeSlot] = {}
 

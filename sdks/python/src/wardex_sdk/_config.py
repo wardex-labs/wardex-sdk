@@ -286,27 +286,37 @@ class PropagationConfig:
 class AnthropicAgentSdkConfig:
     """The Anthropic Agent SDK adapter's own options.
 
-    BOTH FIELDS ARE AHEAD OF THEIR CONSUMER, and that is stated rather than
-    hidden: the thing that reads them is the bridge implementation they were
-    designed for — the one that merges the Claude CLI's own OTel telemetry
-    into wardex's tree — and it has not landed. Until it does they gate
-    nothing, and the release that ships these fields must contain it: a config
-    field never ships before its consumer.
+    Both fields gate the OTel BRIDGE, which is landed and is their consumer:
+    `_adapters/_anthropic_agent_sdk.py` reads them off `ctx.options` at
+    install — the first real consumer of the per-adapter options channel.
+    This class shipped one release ahead of the bridge, with that stated here
+    as a promise ("the release that ships these fields must contain it");
+    this paragraph is that promise being discharged rather than deleted — a
+    config field never ships before its consumer, and these no longer do.
     """
 
     otel_bridge: bool = False
-    """The opt-in that will merge the Claude CLI's own OTel telemetry into
-    wardex's tree. `False` — the default — must reproduce today's tree
-    byte-for-byte: the bridge adds spans, never rearranges the ones wardex
-    already builds. Consumed by the bridge implementation this field was
-    designed for; until it lands the flag gates nothing."""
+    """Opt in to merging the Claude CLI's own OTel telemetry into wardex's
+    tree: the adapter points the CLI's exporter at an in-process loopback
+    receiver and joins what arrives into the session's spans at close —
+    merged LLM turns gain the CLI's own timing (and shed the
+    `transport_timing_unavailable_subprocess` marker), and CLI-internal work
+    (hooks, MCP RPCs, subprocesses, compaction) appears as new step spans.
+    `False` — the default — reproduces today's tree byte-for-byte. NEVER a
+    hijack: a user whose environment already carries `OTEL_*` or
+    `CLAUDE_CODE_ENABLE_TELEMETRY` keeps their own telemetry untouched and
+    the bridge stands down for that session, with one warning."""
 
     otel_bridge_drain: float = 0.2
     """How long, in SECONDS (every duration field is), a session's end waits
     for the CLI's final telemetry batch before the bridge stops listening.
-    Must be >= 0; `0` means no wait at all. Skipped on the atexit and signal
-    paths, whose budgets are the shutdown's to spend. Same consumer as
-    `otel_bridge`, and the same not-yet-landed caveat."""
+    Must be >= 0; `0` means no wait at all. Paid ONLY by sessions the bridge
+    actually fed — a session with no bridge data closes at full speed — and
+    only inside the transport's own async close; skipped structurally on the
+    atexit and signal paths, whose budgets are the shutdown's to spend. The
+    default is priced against the measured export cadence: the CLI's final
+    batch ordinarily arrives BEFORE the stream ends, so this is a tail
+    guard, not a wait every close incurs."""
 
     def __post_init__(self) -> None:
         if self.otel_bridge_drain < 0:
