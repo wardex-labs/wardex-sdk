@@ -527,7 +527,11 @@ diagnostic line (traceback under `debug=True`).
   `batch`/`abatch`, the functional API (`@entrypoint`/`@task`), subgraphs, and
   agents built with either `langgraph.prebuilt.create_react_agent` or
   `langchain.agents.create_agent`. `interrupt()` and `Command(goto=…,
-  graph=PARENT)` are recorded as control flow, not as failures.
+  graph=PARENT)` are recorded as control flow, not as failures. A
+  `RemoteGraph` (LangGraph Platform) call ships one `invoke_workflow` span
+  marked `wardex.langgraph.remote`, with the platform HTTP request underneath;
+  the remote run's internals execute out of process and are not captured. A
+  cached node ships no span — no work ran.
 
 **Not yet (see Roadmap)**
 - A LangChain adapter for plain LCEL chains (`prompt | model | parser`) and

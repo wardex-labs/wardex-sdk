@@ -12,7 +12,7 @@ That is why this module contains no call to `rejoin`, `attach`, `pin`,
 identifier can affect the shape of the tree, and a test asserts it over this
 file's own source.
 
-Six patch sites, in three pairs, each pair sync and async:
+Eight patch sites, in four pairs, each pair sync and async:
 
 * `Pregel.stream` / `Pregel.astream` — one graph run. `invoke`/`ainvoke`
   DELEGATE to these (`pregel/main.py:3913`, `:4013`), so patching the two
@@ -25,9 +25,28 @@ Six patch sites, in three pairs, each pair sync and async:
 * `ToolNode._run_one` / `_arun_one` — one tool call, with any `wrap_tool_call`
   retries inside it. One frame carries the name, the id, the arguments and the
   outcome, so a tool span needs no `run_id -> span` map and no eviction policy.
+* `RemoteGraph.stream` / `RemoteGraph.astream` — one LangGraph Platform run.
+  `RemoteGraph` implements `PregelProtocol` WITHOUT subclassing `Pregel` and
+  defines its own four entries, so the `Pregel` patches never see it; its
+  `invoke`/`ainvoke` drain `self.stream`/`self.astream` (`pregel/remote.py`),
+  so patching the two streaming entries again covers all four. The run's
+  internals execute in another process and are invisible — the span records
+  the CALL, carries `wardex.langgraph.remote: "true"`, and holds the unit
+  ambient so the platform HTTP request nests under it and passes the
+  `capture_mode=AGENT` gate.
+
+A CACHED NODE ships no `execute_step` span, deliberately. A `CachePolicy` hit
+never reaches the node seam: `match_cached_writes()` fills `task.writes` from
+the cache and `runner.tick`/`atick` receive only the tasks whose `writes` are
+empty (`pregel/main.py`; push tasks short-circuit the same way in
+`_runner._call`), so `run_with_retry` is never entered for a hit. No work ran,
+so no span is honest — and no marker either, because marking work that did not
+happen would take a loop-internal seam this adapter refuses. The cost, stated
+plainly: a run's tree can legitimately omit nodes, and nothing on the wire
+distinguishes "cached" from "not scheduled".
 
 The framework's own control flow — `interrupt()`, `Command(goto=…,
-graph=PARENT)`, a drained graph — arrives at all three seams as an ordinary
+graph=PARENT)`, a drained graph — arrives at all these seams as an ordinary
 exception. `CONTROL_FLOW` is what stops those reading as failures, and it is
 populated in `install()` because the error classes cannot be imported before
 then; `_run` reads it through the context when it classifies an exception, so
@@ -50,6 +69,7 @@ agent identities in nodes.
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import threading
 from collections.abc import Callable, Iterator
 from functools import partial
@@ -72,10 +92,13 @@ _FRAMEWORK = "langgraph"
 
 # -- surface probes ------------------------------------------------------
 #
-# Two groups, probed and declined independently, because `langgraph/prebuilt/*`
-# ships in a separately versioned distribution: `langgraph_prebuilt-1.1.0`
-# owns all eight of those files and `langgraph-1.2.10` owns none of them. The
-# run and node seams can install while the tool seam declines.
+# Three groups, probed and declined independently. Group 2 because
+# `langgraph/prebuilt/*` ships in a separately versioned distribution:
+# `langgraph_prebuilt-1.1.0` owns all eight of those files and
+# `langgraph-1.2.10` owns none of them. Group 3 because
+# `langgraph.pregel.remote` hard-imports the platform client (`langgraph_sdk`)
+# and is only worth touching on hosts that can construct a `RemoteGraph` at
+# all. The run and node seams can install while either other group declines.
 #
 # No version parsing anywhere. The attribute set IS the version floor, which is
 # the only spelling that stays true when a release moves a symbol without
@@ -116,6 +139,35 @@ def _tool_surface_ok(tool_cls: Any) -> bool:
         and list(signature(tool_cls._run_one).parameters)[:2] == ["self", "call"]
         and list(signature(tool_cls._arun_one).parameters)[:2] == ["self", "call"]
         and not any(c.__name__ == "BaseModel" for c in tool_cls.__mro__)
+    )
+
+
+def _remote_surface_ok(remote_cls: Any) -> bool:
+    """Group 3. Is this the `RemoteGraph` the remote run wrappers were written for?
+
+    `in __dict__` like the tool probe: `RemoteGraph` subclasses
+    `PregelProtocol`, and patching an INHERITED entry would shadow a base
+    attribute the restore must not delete. Generator-ness like group 1: the
+    wrappers are generator functions holding a scope over the host's
+    iteration. And the ordered `['self', 'input']` leading names pin the
+    `(input, config)` call shape `_configurable` reads `thread_id` from — a
+    reordered signature would hand it the wrong argument while set containment
+    reported the surface intact.
+
+    The delegation facts this seam rests on are the version floor:
+    `RemoteGraph.invoke` drains `self.stream` and `ainvoke` drains
+    `self.astream` (`pregel/remote.py`, verified on langgraph 1.2.x), so
+    patching the two streaming entries covers all four public entries without
+    double-opening a run.
+    """
+    return (
+        "stream" in remote_cls.__dict__
+        and "astream" in remote_cls.__dict__
+        and isgeneratorfunction(remote_cls.stream)
+        and isasyncgenfunction(remote_cls.astream)
+        and list(signature(remote_cls.stream).parameters)[:2] == ["self", "input"]
+        and list(signature(remote_cls.astream).parameters)[:2] == ["self", "input"]
+        and not any(c.__name__ == "BaseModel" for c in remote_cls.__mro__)
     )
 
 
@@ -195,6 +247,20 @@ def _describe_run(adapter: Any, graph: Any, args: Any, kwargs: Any, run: Scope) 
         thread_id = _configurable(args, kwargs).get("thread_id")
         if isinstance(thread_id, str | int):
             run.draft.set_extra("wardex.langgraph.thread_id", thread_id)
+
+
+def _describe_remote_run(adapter: Any, graph: Any, args: Any, kwargs: Any, run: Scope) -> None:
+    """`_describe_run` plus the one key that marks the run as remote.
+
+    The extra is a literal — no framework read, so no extra guard: it is on
+    the same footing as the `wardex.framework` key. And the shared
+    `_describe_run` needs no remote variant of its name fallback, because
+    `RemoteGraph.name` is set in `__init__` and defaults to the assistant id —
+    `_graph_name` is total here, and the LangGraph default-name fallback stays
+    honest for the one shape that could still reach it.
+    """
+    _describe_run(adapter, graph, args, kwargs, run)
+    run.draft.set_extra("wardex.langgraph.remote", "true")
 
 
 def _describe_node(adapter: Any, task: Any, step: Scope) -> None:
@@ -477,10 +543,19 @@ def _is_error(out: Any) -> bool:
     return getattr(out, "status", None) == "error"
 
 
-# -- the six wrappers ----------------------------------------------------
+# -- the eight wrappers ----------------------------------------------------
 
 
-def _mk_stream(original: Callable[..., Iterator[Any]], adapter: Any) -> Callable[..., Any]:
+def _mk_stream(
+    original: Callable[..., Iterator[Any]],
+    adapter: Any,
+    *,
+    site: str,
+    prologue: str,
+    describe_fn: Callable[..., None],
+    finalized: str,
+    off_carrier: str,
+) -> Callable[..., Any]:
     """A GENERATOR FUNCTION, so the scope's lifetime is the iteration's.
 
     A plain function returning `original(...)` would close the run before the
@@ -501,17 +576,20 @@ def _mk_stream(original: Callable[..., Iterator[Any]], adapter: Any) -> Callable
     flow, because control flow ships UNSET and UNSET claims a run completed
     cleanly. The two `finally` counters below are the operator's handle on
     the abandons that never finalize or finalize elsewhere.
+
+    Serves both the local (`Pregel`) and remote (`RemoteGraph`) run entry —
+    the labels are the only difference.
     """
 
     def wrapper(self: Any, *args: Any, **kwargs: Any) -> Any:
         ctx = adapter._ctx
         if ctx is None:
             return (yield from original(self, *args, **kwargs))
-        ctx.confirm_active("pregel.stream")
+        ctx.confirm_active(site)
         subject = None
-        with ctx.guard("stream_prologue"):
+        with ctx.guard(prologue):
             subject = _graph_name(self)
-        describe = partial(_describe_run, adapter, self, args, kwargs)
+        describe = partial(describe_fn, adapter, self, args, kwargs)
         carrier = threading.current_thread()
         try:
             with ctx.enter(
@@ -527,22 +605,32 @@ def _mk_stream(original: Callable[..., Iterator[Any]], adapter: Any) -> Callable
             # the FIRST `next()` and can only take it down when the generator is
             # FINALIZED, on the carrier that finalizes it. These two counters are
             # the only handle an operator has on the two shapes where that does
-            # not happen: `finalized` against `active.pregel.stream` counts
-            # streams the host never finished — whose scope is still standing —
-            # and the second counts the ones finalized somewhere else. A counter
-            # rather than a marker because a marker can only be attached to a
-            # span, and in the never-finalized shape the span never ships.
+            # not happen: `finalized` against the site's `active.*` counter
+            # counts streams the host never finished — whose scope is still
+            # standing — and the second counts the ones finalized somewhere
+            # else. A counter rather than a marker because a marker can only be
+            # attached to a span, and in the never-finalized shape the span
+            # never ships.
             #
             # Both live OUTSIDE the `enter` body, so C-S6's `Return` case is
             # untouched.
-            ctx.count("stream_finalized")
+            ctx.count(finalized)
             if carrier is not threading.current_thread():
-                ctx.count("stream_finalized_off_carrier")
+                ctx.count(off_carrier)
 
     return wrapper
 
 
-def _mk_astream(original: Callable[..., Any], adapter: Any) -> Callable[..., Any]:
+def _mk_astream(
+    original: Callable[..., Any],
+    adapter: Any,
+    *,
+    site: str,
+    prologue: str,
+    describe_fn: Callable[..., None],
+    finalized: str,
+    off_carrier: str,
+) -> Callable[..., Any]:
     """The async twin. Its `with` body is the one shape C-S6 admits for this.
 
     An async generator cannot delegate with `yield from` — that is a syntax
@@ -554,6 +642,9 @@ def _mk_astream(original: Callable[..., Any], adapter: Any) -> Callable[..., Any
     finalizer closes an abandoned async generator on its own task and the
     wrapper reads `CancelledError`, while a host's own `aclose()` reads
     `GeneratorExit`.
+
+    Serves both the local (`Pregel`) and remote (`RemoteGraph`) run entry —
+    the labels are the only difference.
     """
 
     async def wrapper(self: Any, *args: Any, **kwargs: Any) -> Any:
@@ -562,11 +653,11 @@ def _mk_astream(original: Callable[..., Any], adapter: Any) -> Callable[..., Any
             async for chunk in original(self, *args, **kwargs):
                 yield chunk
             return
-        ctx.confirm_active("pregel.astream")
+        ctx.confirm_active(site)
         subject = None
-        with ctx.guard("astream_prologue"):
+        with ctx.guard(prologue):
             subject = _graph_name(self)
-        describe = partial(_describe_run, adapter, self, args, kwargs)
+        describe = partial(describe_fn, adapter, self, args, kwargs)
         carrier = asyncio.current_task()
         try:
             with ctx.enter(
@@ -582,9 +673,9 @@ def _mk_astream(original: Callable[..., Any], adapter: Any) -> Callable[..., Any
             # An abandoned async generator is finalized by the LOOP, on its own
             # finalizer task, so this counter fires on the ORDINARY abandon
             # rather than on a corner case.
-            ctx.count("astream_finalized")
+            ctx.count(finalized)
             if carrier is not asyncio.current_task():
-                ctx.count("astream_finalized_off_carrier")
+                ctx.count(off_carrier)
 
     return wrapper
 
@@ -736,7 +827,7 @@ def _mk_arun_one(original: Callable[..., Any], adapter: Any) -> Callable[..., An
 
 
 class LangGraphAdapter(AdapterInterface):
-    """Six patches, no cross-call state, and therefore a five-line teardown.
+    """Eight patches, no cross-call state, and therefore a five-line teardown.
 
     Every unit is opened and closed by the `with` that owns it: no session
     table, no assembler, no per-graph bookkeeping. That is what lets
@@ -791,14 +882,39 @@ class LangGraphAdapter(AdapterInterface):
         type(self).CONTROL_FLOW = (errors.GraphBubbleUp,)
         patches = self._ctx.patches
         orig_stream = pregel_mod.Pregel.stream
-        patches.patch(pregel_mod.Pregel, "stream", _mk_stream(orig_stream, self))
+        patches.patch(
+            pregel_mod.Pregel,
+            "stream",
+            _mk_stream(
+                orig_stream,
+                self,
+                site="pregel.stream",
+                prologue="stream_prologue",
+                describe_fn=_describe_run,
+                finalized="stream_finalized",
+                off_carrier="stream_finalized_off_carrier",
+            ),
+        )
         orig_astream = pregel_mod.Pregel.astream
-        patches.patch(pregel_mod.Pregel, "astream", _mk_astream(orig_astream, self))
+        patches.patch(
+            pregel_mod.Pregel,
+            "astream",
+            _mk_astream(
+                orig_astream,
+                self,
+                site="pregel.astream",
+                prologue="astream_prologue",
+                describe_fn=_describe_run,
+                finalized="astream_finalized",
+                off_carrier="astream_finalized_off_carrier",
+            ),
+        )
         orig_run = runner_mod.run_with_retry
         patches.patch(runner_mod, "run_with_retry", _mk_run_with_retry(orig_run, self, start))
         orig_arun = runner_mod.arun_with_retry
         patches.patch(runner_mod, "arun_with_retry", _mk_arun_with_retry(orig_arun, self, start))
         self._install_tool_seam()
+        self._install_remote_seam()
         self._installed = True
 
     def _install_tool_seam(self) -> None:
@@ -826,12 +942,73 @@ class LangGraphAdapter(AdapterInterface):
         orig_aone = tool_cls._arun_one
         ctx.patches.patch(tool_cls, "_arun_one", _mk_arun_one(orig_aone, self))
 
+    def _install_remote_seam(self) -> None:
+        """Group 3 of the probe. Declines on its own without touching groups 1-2.
+
+        Local run, node and tool spans are correct without remote run spans;
+        the reverse is not true, so there is no remote-only mode to write. An
+        absent platform client declines SILENTLY — a host without
+        `langgraph_sdk` cannot construct a `RemoteGraph` either, so nothing
+        observable is missed — while a present-but-moved surface declines
+        loudly, because that host is one release away from silently losing
+        remote runs it really makes.
+        """
+        ctx = self._ctx
+        if ctx is None:
+            return
+        # C-S7-clean: `remote_cls` is bound before the guard and the guard's
+        # last statement is its only assignment. An absent `langgraph_sdk` is
+        # the `find_spec` answer inside `_import_remote` — silent and uncounted,
+        # like the absent tool distribution — while a remote module that fails
+        # to IMPORT is a real failure the guard counts.
+        remote_cls = None
+        with ctx.guard("import_remote"):
+            remote_cls = _import_remote()
+        if remote_cls is None:
+            return
+        if not _remote_surface_ok(remote_cls):
+            report_once(
+                "langgraph adapter: RemoteGraph surface unrecognized, remote run "
+                "spans declined; local run, node and tool spans are unaffected",
+                key="adapters.langgraph.unsupported_remote_surface",
+            )
+            ctx.count("unsupported_remote_surface")
+            return
+        orig_rstream = remote_cls.stream
+        ctx.patches.patch(
+            remote_cls,
+            "stream",
+            _mk_stream(
+                orig_rstream,
+                self,
+                site="remote.stream",
+                prologue="remote_stream_prologue",
+                describe_fn=_describe_remote_run,
+                finalized="remote_stream_finalized",
+                off_carrier="remote_stream_finalized_off_carrier",
+            ),
+        )
+        orig_rastream = remote_cls.astream
+        ctx.patches.patch(
+            remote_cls,
+            "astream",
+            _mk_astream(
+                orig_rastream,
+                self,
+                site="remote.astream",
+                prologue="remote_astream_prologue",
+                describe_fn=_describe_remote_run,
+                finalized="remote_astream_finalized",
+                off_carrier="remote_astream_finalized_off_carrier",
+            ),
+        )
+
     def uninstall(self) -> None:
         """`restore_all()` FIRST, then close what is open.
 
         The order is the reverse of the one an adapter holding a table needs,
         and it is deliberate: restoring first means no new unit can be opened
-        after the drain, which for a six-patch adapter whose seams the host is
+        after the drain, which for an eight-patch adapter whose seams the host is
         actively driving is the difference between a bounded teardown and an
         unbounded one. A generator still in flight then finds its unit already
         closed, and `enter`'s `finally` closes a dead unit — a counted no-op,
@@ -840,7 +1017,7 @@ class LangGraphAdapter(AdapterInterface):
         `self._ctx` is NOT nulled, and does not gate on `_installed`. A
         `stream()` generator the host is still pumping needs the ctx to finish
         its `with`; nulling it would turn a straggler into an `AttributeError`
-        inside the host's own generator. And with six patches a partial install
+        inside the host's own generator. And with eight patches a partial install
         is the expected failure rather than an exceptional one, so the
         registry's rollback must be able to call this unconditionally.
         """
@@ -889,6 +1066,30 @@ def _import_toolnode() -> Any | None:
     except Exception:  # noqa: BLE001 — an absent distribution is the answer, not a failure
         return None
     return ToolNode
+
+
+def _import_remote() -> Any | None:
+    """`RemoteGraph`, or `None` when the platform client is absent.
+
+    `langgraph.pregel.remote` hard-imports `langgraph_sdk` and `langsmith` at
+    module top. In the supported band both are REQUIRED dependencies of
+    langgraph and are already in `sys.modules` by the time this runs —
+    `install()`'s `pregel.main` import loads them transitively — so the import
+    below measured ~0 ms marginal. The `find_spec` gate is for hosts that
+    installed langgraph without its dependencies and for a future band that
+    drops one, and it answers without importing anything.
+
+    UNLIKE `_import_pregel`/`_import_toolnode` this holds no `try/except`: the
+    expected absence is the `find_spec` answer, which raises nothing, and a
+    remote module that FAILS to import is a failure rather than an absence —
+    it is owned by the `ctx.guard` at the call site, so it is counted and
+    debug-visible instead of joining the C-S4 swallow budget.
+    """
+    if importlib.util.find_spec("langgraph_sdk") is None:
+        return None
+    from langgraph.pregel.remote import RemoteGraph
+
+    return RemoteGraph
 
 
 __all__ = ["LangGraphAdapter"]
