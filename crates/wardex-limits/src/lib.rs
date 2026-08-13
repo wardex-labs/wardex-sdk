@@ -110,6 +110,16 @@ pub struct Limits {
     /// observed twice, and an evicted server handle degrades a hook's tool-name
     /// lookup to the builtin key space, which can do the same.
     pub max_entries_per_unit: usize,
+    /// Maximum entries in the unit registry's closed-unit link memory: the
+    /// alias-key -> span-context table kept AFTER a unit closes, so a later
+    /// span can carry a causal link (`triggered_by`, `resumed_from`) to work
+    /// that already finished. FIFO; eviction is counted host-side
+    /// (`assembly._units.link_memory_full` in the Python SDK) and gets no wire
+    /// marker, because the remembered span itself already shipped — what an
+    /// eviction can cost is a link on a FUTURE span, and there is no span yet
+    /// to say so on. Sized with `max_entries_per_unit`: one breadth-bounded
+    /// run's worth of remembered steps, or as many recently finished threads.
+    pub max_link_targets: usize,
     /// Bytes read before giving up on detecting JSON-RPC over a stdio stream.
     pub mcp_sniff_bytes: usize,
     /// Maximum spans buffered before the oldest are dropped.
@@ -187,6 +197,7 @@ impl Default for Limits {
             max_session_entries: 256,
             max_units: 512,
             max_entries_per_unit: 256,
+            max_link_targets: 256,
             mcp_sniff_bytes: 8192,
             max_buffer_spans: 2048,
             max_buffer_bytes: 64 * 1024 * 1024,
@@ -218,6 +229,7 @@ mod tests {
         assert_eq!(l.max_session_entries, 256);
         assert_eq!(l.max_units, 512);
         assert_eq!(l.max_entries_per_unit, 256);
+        assert_eq!(l.max_link_targets, 256);
         assert_eq!(l.mcp_sniff_bytes, 8192);
         assert_eq!(l.max_buffer_spans, 2048);
         assert_eq!(l.max_buffer_bytes, 64 * 1024 * 1024);

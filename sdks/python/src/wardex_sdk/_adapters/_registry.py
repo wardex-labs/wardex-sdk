@@ -67,6 +67,7 @@ def context_for(
             sink=_ClientSink(client),
             max_units=resolved["max_units"],
             max_entries_per_unit=resolved["max_entries_per_unit"],
+            max_link_targets=resolved["max_link_targets"],
             debug=debug,
         ),
         limits=resolved,

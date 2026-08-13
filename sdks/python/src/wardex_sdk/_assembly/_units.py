@@ -29,8 +29,10 @@ and a signal path. Reproducing that here would put it under every adapter.
 
 **Bounds (I10).** `max_units` bounds concurrently tracked ROOT units;
 `max_entries_per_unit` bounds each per-unit table (children, aliases, claim
-keys, open drafts). Both come from `crates/wardex-limits` and never from a
-Python literal.
+keys, open drafts); `max_link_targets` bounds the closed-unit link memory (the
+alias-key -> span-context table `resolve_link_target` consults for finished
+work, FIFO, evictions counted as `link_memory_full`). All come from
+`crates/wardex-limits` and never from a Python literal.
 
 Whether an eviction is VISIBLE ON THE WIRE is decided by one thing: does the
 evicted entry own a span? Five tables are bounded — the root table, and per
@@ -136,7 +138,10 @@ class UnitKey:
 
     The type exists to make the invariant visible at every call site: a
     `UnitKey` goes INTO `find`/`alias`/`claim` and comes back as a `Unit` or as
-    `None`. Nothing here turns one into a `SpanContext`.
+    `None`. One method turns one into a `SpanContext`, and only for a LINK:
+    `UnitRegistry.resolve_link_target` answers with a context that feeds
+    `SpanDraft.add_link` and nothing else — a link is causality, never
+    containment, so the answer cannot become a parent (I2's carve-out).
     """
 
     namespace: str
@@ -340,6 +345,7 @@ class Unit:
         "_output_recorded",
         "_output_truncated",
         "_registry",
+        "_remembered",
         "conversation",
         "key",
         "kind",
@@ -386,6 +392,13 @@ class Unit:
         self._evicted = False
         self._children: dict[Unit, None] = {}
         self._alias_keys: list[UnitKey] = []
+        #: Alias keys OPTED INTO the registry's closed-unit link memory
+        #: (`bind_alias(remember=True)`), mapped to the unit's own span context
+        #: as CAPTURED AT BIND TIME — so the detach phase that moves them into
+        #: the registry table stays pure dict work and never reads a draft.
+        #: Lazy: most units never remember anything. Always a subset of
+        #: `_alias_keys`, so the alias breadth bound governs it too.
+        self._remembered: dict[UnitKey, SpanContext] | None = None
         self._claims: dict[UnitKey, int] = {}
         self._open: dict[object, _OpenDraft] = {}
         self._input = bytearray()
@@ -760,7 +773,13 @@ class Unit:
         if len(self._alias_keys) < self._registry._max_entries_per_unit:
             return None
         counters.bump("assembly._units.alias_table_full")
-        return self._alias_keys.pop(0)
+        popped = self._alias_keys.pop(0)
+        # An alias lost to the breadth bound is lost from BOTH lookup paths: a
+        # key `find()` can no longer answer for must not resurface from the
+        # link memory at close, or the bound would govern live lookups only.
+        if self._remembered is not None:
+            self._remembered.pop(popped, None)
+        return popped
 
     def _finalize_locked(
         self,
@@ -828,9 +847,11 @@ class UnitRegistry:
     __slots__ = (
         "_by_alias",
         "_debug",
+        "_link_memory",
         "_live_units",
         "_lock",
         "_max_entries_per_unit",
+        "_max_link_targets",
         "_max_record_bytes",
         "_max_total_units",
         "_max_units",
@@ -844,6 +865,7 @@ class UnitRegistry:
         sink: SpanSink,
         max_units: int | None = None,
         max_entries_per_unit: int | None = None,
+        max_link_targets: int | None = None,
         debug: bool = False,
     ) -> None:
         """`max_*` default from the CORE, never from a Python literal.
@@ -875,6 +897,9 @@ class UnitRegistry:
             if max_entries_per_unit is not None
             else resolved["max_entries_per_unit"]
         )
+        self._max_link_targets = (
+            max_link_targets if max_link_targets is not None else resolved["max_link_targets"]
+        )
         # Bytes a unit may accumulate through record_input/record_output. Not a
         # knob of its own: the payload ceiling the rest of the SDK already
         # applies to a captured body is the honest ceiling for one assembled
@@ -895,6 +920,12 @@ class UnitRegistry:
         self._roots: dict[Unit, None] = {}
         self._live_units: dict[Unit, None] = {}
         self._by_alias: dict[UnitKey, Unit] = {}
+        #: The closed-unit link memory: remembered alias keys -> the span
+        #: context their unit owned when it closed. A plain dict, because
+        #: insertion order IS the FIFO this file evicts by (`next(iter(...))`),
+        #: matching every other bounded table here. Bounded by
+        #: `max_link_targets` at the insertion site in `_detach_locked`.
+        self._link_memory: dict[UnitKey, SpanContext] = {}
 
     @property
     def max_record_bytes(self) -> int:
@@ -1063,6 +1094,31 @@ class UnitRegistry:
                 return
             self._bind_alias_locked(alias, unit)
 
+    def bind_alias(self, unit: Unit, key: UnitKey, *, remember: bool = False) -> None:
+        """Point `key` at `unit` directly — the handed-a-unit twin of `alias()`.
+
+        `remember=True` additionally opts the key into the closed-unit link
+        memory: the unit's own span context is captured HERE, at bind time,
+        and `_detach_locked` moves it into `_link_memory` when the unit
+        closes — which is what keeps the detach phase's "cannot fail"
+        property intact, since the context to remember was read while the
+        unit was alive and under this same lock.
+
+        A dead unit is refused and counted (`alias_after_close`), exactly as
+        `note()` and `open_span()` refuse: its span has already shipped, so a
+        fresh alias could neither be found live nor be recorded at a close
+        that already happened.
+        """
+        with self._lock:
+            if not unit.is_live:
+                counters.bump("assembly._units.alias_after_close")
+                return
+            self._bind_alias_locked(key, unit)
+            if remember:
+                if unit._remembered is None:
+                    unit._remembered = {}
+                unit._remembered[key] = unit.context
+
     def find(self, alias: UnitKey) -> Unit | None:
         """Resolve a framework id to a live unit, or None.
 
@@ -1080,6 +1136,28 @@ class UnitRegistry:
                 del self._by_alias[alias]
                 return None
             return unit
+
+    def resolve_link_target(self, selector: UnitKey) -> SpanContext | None:
+        """A span context to LINK to — live alias first, then closed memory.
+
+        The ONE sanctioned `UnitKey` -> `SpanContext` conversion in the SDK,
+        and its answer feeds `SpanDraft.add_link` and nothing else: a link is
+        causality where the parent edge is containment (I2), so a context
+        that names a finished predecessor cannot become a parent through it.
+        `find()` deliberately stays live-only — every parentage path keeps
+        asking it, and a miss there still forces the caller down the honest
+        ladder rather than toward a shipped span.
+
+        The memory half answers only for a key's MOST RECENT holder:
+        `_bind_alias_locked` pops the entry whenever the key is (re)bound, so
+        a stale predecessor cannot resurface after an unremembered successor
+        closes, and a cycle re-executing one node name resolves latest-wins.
+        """
+        with self._lock:
+            unit = self._by_alias.get(selector)
+            if unit is not None and unit.is_live:
+                return unit.context
+            return self._link_memory.get(selector)
 
     def current(self) -> Unit | None:
         """The unit made ambient by `activate()` or a pin, if any.
@@ -1732,12 +1810,14 @@ class UnitRegistry:
     def _detach_locked(self, unit: Unit) -> None:
         """PHASE TWO: unlink one unit from every table. Cannot fail.
 
-        Dict and list operations on wardex's own containers, and nothing else —
-        no draft is read, no span is built, no host value is touched. That is
-        not a claim about care taken here; it is the property the phase split
-        exists to create, and it is why this half needs no guard and no partial
-        recovery. Whatever phase one managed to build ships; whatever it did not
-        is one span, and the tables end consistent either way.
+        Dict and list operations on wardex's own containers, plus counter
+        bumps, and nothing else — no draft is read, no span is built, no host
+        value is touched (the contexts moved into the link memory below were
+        captured at bind time for exactly this reason). That is not a claim
+        about care taken here; it is the property the phase split exists to
+        create, and it is why this half needs no guard and no partial
+        recovery. Whatever phase one managed to build ships; whatever it did
+        not is one span, and the tables end consistent either way.
         """
         unit._live = False
         unit._children.clear()
@@ -1746,6 +1826,22 @@ class UnitRegistry:
         self._live_units.pop(unit, None)
         if unit.parent is not None:
             unit.parent._children.pop(unit, None)
+        # Remembered aliases move into the closed-unit link memory BEFORE the
+        # alias purge, because the ownership test needs `_by_alias` intact: a
+        # key rebound to a LIVE unit since is that unit's to remember, not
+        # this corpse's. Pop-then-set refreshes insertion order, so the FIFO
+        # evicts by recency of CLOSE. The eviction is counted and not marked:
+        # the remembered span already shipped, and what an eviction costs is a
+        # link on a FUTURE span — there is no span yet to say so on (I10).
+        if unit._remembered:
+            for key, ctx in unit._remembered.items():
+                if self._by_alias.get(key) is unit:
+                    self._link_memory.pop(key, None)
+                    self._link_memory[key] = ctx
+                    while len(self._link_memory) > self._max_link_targets:
+                        del self._link_memory[next(iter(self._link_memory))]
+                        counters.bump("assembly._units.link_memory_full")
+        unit._remembered = None
         for key in unit._alias_keys:
             if self._by_alias.get(key) is unit:
                 del self._by_alias[key]
@@ -1763,6 +1859,11 @@ class UnitRegistry:
                 del self._by_alias[evicted]
             unit._alias_keys.append(key)
         self._by_alias[key] = unit
+        # Binding makes the LIVE unit the key's authority, so any closed
+        # memory for it is superseded now — kept, it would resurface the
+        # moment this holder closed unremembered, answering with a span two
+        # holders stale. One O(1) pop; this is `open()`'s hot path.
+        self._link_memory.pop(key, None)
 
     def _flush(self, pending: list[SpanDraft]) -> None:
         """Hand finished drafts to the sink. NEVER called holding `_lock`.

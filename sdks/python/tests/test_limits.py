@@ -22,7 +22,8 @@ def test_limits_defaults_returns_every_field():
     assert d["max_entries_per_unit"] == 256
     assert d["max_otlp_attribute_bytes"] == 1024 * 1024
     assert d["max_otlp_request_bytes"] == 4 * 1024 * 1024
-    assert len(d) == 20
+    assert d["max_link_targets"] == 256
+    assert len(d) == 21
 
 
 def test_limits_construction_defaults_unspecified_fields():
@@ -199,6 +200,7 @@ def test_python_side_fallback_defaults_match_core():
     assert reg._max_units == core["max_units"]
     assert reg._max_entries_per_unit == core["max_entries_per_unit"]
     assert reg._max_record_bytes == core["max_body_bytes"]
+    assert reg._max_link_targets == core["max_link_targets"]
 
     assert _ProcState.SNIFF_LIMIT == core["mcp_sniff_bytes"]
     assert _ProcState()._sniff_limit == core["mcp_sniff_bytes"]
@@ -329,6 +331,21 @@ def test_max_connections_reaches_the_seam():
         assert id(socks[3]) in itc._conns
     finally:
         wardex_sdk.close()
+
+
+def test_max_link_targets_reaches_the_registry_context_for_builds():
+    """A user's `LimitsConfig(max_link_targets=...)` must reach the registry
+    `context_for` constructs, not only `ctx.limits`. `context_for` passes each
+    unit bound explicitly because a registry built with defaults would ignore
+    the override in silence — its own comment names that failure — and this
+    bound is enforced nowhere else: `resolve_link_target` consults the one
+    table the constructed registry owns.
+    """
+    from wardex_sdk._adapters._registry import context_for
+
+    ctx = context_for("probe", _StubClient(LimitsConfig(max_link_targets=7)))
+    assert ctx.limits["max_link_targets"] == 7
+    assert ctx._units._max_link_targets == 7
 
 
 def test_non_http_tls_traffic_does_not_grow_memory(fake_ssl_socket, bare_ssl_interceptor):
@@ -672,6 +689,7 @@ def _unit_registry(limits: LimitsConfig, sink: _DraftSink):
         sink=sink,
         max_units=resolved["max_units"],
         max_entries_per_unit=resolved["max_entries_per_unit"],
+        max_link_targets=resolved["max_link_targets"],
     )
 
 
@@ -736,6 +754,31 @@ def _probe_max_entries_per_unit() -> bool:
         and Limitation.UNIT_TABLE_FULL in tight[0].integrity.markers
         and evicted(LimitsConfig()) == []
     )
+
+
+def _probe_max_link_targets() -> bool:
+    """Over the cap, the OLDEST remembered close falls out of the link memory.
+
+    Driven through the real path — bind with `remember=True`, close, resolve —
+    because the bound bites at `_detach_locked`'s insertion, not at bind time:
+    a probe that only counted table entries would keep passing if the eviction
+    moved somewhere resolution never consults.
+    """
+    from wardex_sdk._assembly import UnitKey
+
+    def remembered_survivors(limits: LimitsConfig) -> list[bool]:
+        sink = _DraftSink()
+        reg = _unit_registry(limits, sink)
+        for i in range(2):
+            unit = _open_unit(reg, f"u-{i}")
+            reg.bind_alias(unit, UnitKey("probe.link", str(i)), remember=True)
+            reg.close(unit)
+        return [
+            reg.resolve_link_target(UnitKey("probe.link", str(i))) is not None for i in range(2)
+        ]
+
+    tight = remembered_survivors(LimitsConfig(max_link_targets=1))
+    return tight == [False, True] and remembered_survivors(LimitsConfig()) == [True, True]
 
 
 def _probe_max_sessions() -> bool:
@@ -918,6 +961,7 @@ _PROBES = {
     "max_session_entries": _probe_max_session_entries,
     "max_units": _probe_max_units,
     "max_entries_per_unit": _probe_max_entries_per_unit,
+    "max_link_targets": _probe_max_link_targets,
     "mcp_sniff_bytes": _probe_mcp_sniff_bytes,
     "max_buffer_spans": _probe_max_buffer_spans,
     "max_buffer_bytes": _probe_max_buffer_bytes,
