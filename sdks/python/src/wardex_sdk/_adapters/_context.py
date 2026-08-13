@@ -523,6 +523,19 @@ class AdapterContext:
         """
         return self._tripped
 
+    @property
+    def record_budget(self) -> int:
+        """What `Unit.record_input`/`record_output` will KEEP, in bytes.
+
+        A shaper handing `record_*` more than this is truncated and flagged by
+        the storage cap itself; a shaper that stops early must hand back
+        `budget + 1` bytes whenever it cut anything, so the flag still fires —
+        the +1 handshake (see the LangGraph adapter's `_shaped_args`). Read off
+        the registry rather than `self.limits` because the registry's cap is
+        the one that is enforced; the two can disagree under a client override.
+        """
+        return self._units.max_record_bytes
+
     # -- housekeeping ----------------------------------------------------
 
     def guard(self, where: str) -> guard:
@@ -658,7 +671,7 @@ class AdapterContext:
                 # byte-identical on the wire — "nothing was pinned" and "what
                 # was pinned had died" — and the second is a tool call sitting
                 # in a run it has nothing to do with.
-                conflicted = self._units.stale_pin_in_scope()
+                conflicted = self._units.closed_unit_in_scope()
                 holder, evidence = sole, _SOLE
         unit = self._units.open(
             kind,

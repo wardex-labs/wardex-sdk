@@ -889,6 +889,20 @@ class UnitRegistry:
         self._live_units: dict[Unit, None] = {}
         self._by_alias: dict[UnitKey, Unit] = {}
 
+    @property
+    def max_record_bytes(self) -> int:
+        """The byte ceiling `record_input`/`record_output` enforce.
+
+        The resolved core `max_body_bytes` (see `__init__`). Exposed so a
+        describe function that SHAPES a payload before recording can stop
+        materializing at exactly the boundary storage would cut — read at the
+        enforcement point, because the two budgets cannot disagree when they
+        are one read. Any other source CAN: `context_for` never passes
+        `max_body_bytes` into the registry, so a client override reaches
+        `AdapterContext.limits` without reaching this cap.
+        """
+        return self._max_record_bytes
+
     # -- lifecycle -------------------------------------------------------
 
     def open(
@@ -1090,7 +1104,7 @@ class UnitRegistry:
             return None
         return entry.unit
 
-    def stale_pin_in_scope(self) -> bool:
+    def closed_unit_in_scope(self) -> bool:
         """Is the scope on this task the leftover of a unit that has DIED?
 
         `current()` refusing the dead unit is only half of an activation's
@@ -1129,10 +1143,13 @@ class UnitRegistry:
         task, which is the mechanism the whole design rests on; the literal rule
         would stamp `CORRELATION_CONFLICT` on the product's own exhibit A.
 
-        The NAME is now narrower than the predicate. It is kept because its one
-        production caller (`AdapterContext._open`) and its test both spell it,
-        and renaming a public predicate is a second change that should not ride
-        on a blocking fix; what it means is `_closed_ambient_context`.
+        The NAME is the question the predicate answers: a CLOSED unit of THIS
+        registry left its span context in this scope — whether a pin or an
+        `activate()` leftover stranded it. The counters underneath keep the
+        pin/activation split (`stale_pin_ambient` / `stale_activation_ambient`,
+        via `_note_refused_ambient`) because they name the REPAIR — which task
+        was pinned vs the adapter's lifetime — not the predicate. The
+        implementation is `_closed_ambient_context`.
         """
         return self._closed_ambient_context() is not None
 
@@ -1192,7 +1209,7 @@ class UnitRegistry:
     def _poisoned(self, amb: Ambient) -> bool:
         """Is `amb` the leftover fork of a unit of THIS registry that has died?
 
-        The identity check, not merely `stale_pin_in_scope()`, and the narrowing
+        The identity check, not merely `closed_unit_in_scope()`, and the narrowing
         is deliberate. A dead unit in scope says the TASK is descended from one;
         it does not say the scope still holds the dead unit's own span. A host
         that opened its own span inside that task, or a handler inside a nested
@@ -1219,8 +1236,9 @@ class UnitRegistry:
         the object that will answer it again inside `open()`, because asking it
         anywhere else in different words is precisely how the two drift.
 
-        They did. `AdapterContext._evidence` asked `stale_pin_in_scope()`, which
-        says this TASK descends from a dead driver, while `open()` refuses only
+        They did. `AdapterContext._evidence` asked `closed_unit_in_scope()`
+        (under its earlier, narrower stale-pin spelling), which says this TASK
+        descends from a dead driver, while `open()` refuses only
         the dead fork ITSELF. A host that opened its own span inside that task
         put a real parent on top of the leftover, so the two answers disagreed
         exactly there: the adapter surface orphaned live work at confidence 0.0

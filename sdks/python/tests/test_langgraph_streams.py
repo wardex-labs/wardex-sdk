@@ -21,7 +21,11 @@ lands is a one-line edit per assertion, and until then it RUNS.
 
 The fourth shape is the one that fix cannot help with, and its test says so: a
 retained iterator's unit is genuinely LIVE, so nothing dead exists to refuse
-and the counter gap is the only record there will ever be.
+and the counter gap is the only record there will ever be. That iterator —
+retained, never finalized, shipping nothing — is part of the recorded
+abandonment decision (the abandonment section of
+`test_langgraph_control_flow.py`); the `active.pregel.stream` vs
+`stream_finalized` gap stays the only record by decision, not omission.
 
 **The tool seam.** `ToolNode._run_one` is one tool CALL — below the fan-out and
 above `wrap_tool_call`'s retries. The two assertions that pin that choice are

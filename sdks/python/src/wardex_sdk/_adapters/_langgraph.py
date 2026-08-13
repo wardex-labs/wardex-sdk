@@ -32,6 +32,19 @@ exception. `CONTROL_FLOW` is what stops those reading as failures, and it is
 populated in `install()` because the error classes cannot be imported before
 then; `_run` reads it through the context when it classifies an exception, so
 install-time population is soon enough.
+
+Decisions this adapter records rather than revisits: the retry attempt COUNT
+is a documented limitation — every per-attempt signal langgraph exposes today
+is internal, corner-scoped or process-global, and the inventory lives on
+`test_the_attempt_count_is_not_recoverable_from_the_span`. An ABANDONED
+stream ships ERROR with the interpreter's own exception name and no dedicated
+marker — the spelling is decided by who finalizes the generator (see the
+abandonment section of `test_langgraph_control_flow.py`). And a graph NODE is
+not an agent: no `HANDOFF` span and no `AgentAttributes` are fabricated for a
+`Command(goto=...)` — the vocabulary is `wardex.langgraph.command_goto` plus
+`wardex.step.trigger`, graph-edge causality stays in the data plane (extras,
+and links between step spans), revisited only for a framework that puts real
+agent identities in nodes.
 """
 
 from __future__ import annotations
@@ -239,7 +252,7 @@ def _describe_tool(adapter: Any, node: Any, call: Any, tool: Scope) -> None:
     )
     tool.draft.set_extra("wardex.framework", _FRAMEWORK)
     with adapter._ctx.guard("describe_tool_input"):
-        tool.record_input(repr(call.get("args")).encode("utf-8", "replace"))
+        tool.record_input(_shaped_args(call.get("args"), adapter._ctx.record_budget))
 
 
 def _tool_description(node: Any, name: Any) -> str | None:
@@ -255,6 +268,109 @@ def _tool_description(node: Any, name: Any) -> str | None:
 
 def _tool_name(call: Any) -> str | None:
     return call["name"] if isinstance(call, dict) else None
+
+
+_CYCLE_MARK = {dict: b"{...}", list: b"[...]", tuple: b"(...)"}
+_EXHAUSTED = object()
+
+
+def _shaped_args(args: Any, budget: int) -> bytes:
+    """`repr(args)` rebuilt under `_tool_payload`'s rule, bounded at the source.
+
+    The rule, applied to the input side: wardex may materialize what it decided
+    to record and must never materialize what it declined. `call["args"]` is
+    usually the model's own small dict, but `ToolNode` injects `InjectedState`
+    and `Command` values into it before `_run_one`, so its size is set by graph
+    state — the exact hazard the output side was shaped to refuse. The
+    contract, in five parts:
+
+    1. Byte-identical to `repr(args).encode("utf-8", "replace")` whenever
+       `args` is built only of EXACT builtin str/bytes/int/float/bool/None/
+       dict/list/tuple values and the full spelling fits `budget`. Exact
+       `type(v) is` checks, never `isinstance`: an `IntEnum`, a `str`
+       subclass, langchain's `AddableDict` each own a `__repr__` this
+       function must not run.
+    2. Every other value is spelled as its bare type name (`Command`,
+       `AIMessage`) — the declined-object spelling `_tool_payload` uses —
+       and its `__repr__` is NEVER invoked.
+    3. Construction is O(budget): a str/bytes scalar longer than the budget
+       is sliced to the budget's length BEFORE its repr is taken, so the
+       transient fragment stays around 4 * budget + 2 bytes even for
+       escape-heavy text.
+    4. The walk is an explicit stack, never recursion, cycle-guarded by the
+       ids of currently-OPEN containers; a revisit spells the builtins
+       recursion marker for its container type (`{...}`, `[...]`, `(...)`).
+    5. The budget+1 handshake: a spelling that exceeds `budget` is returned
+       as exactly `budget + 1` bytes — MORE than the cap — so
+       `_append_capped` drops the overflow and `record_input` stamps the
+       span's `truncated` flag. Returning exactly-budget bytes would ship a
+       cut payload that claims to be complete. A spelling that fits is
+       returned whole and the flag stays unset.
+    """
+    frags: list[bytes] = []
+    size = 0
+    open_ids: set[int] = set()
+    # LIFO work stack: ("lit", fragment) is spelled bytes, ("val", v) a value
+    # still to spell, ("iter", [iterator, container, entries_spelled]) a
+    # container mid-walk. Entries are drawn one at a time, so a container
+    # costs what the budget lets it spell, never its own length.
+    stack: list[tuple[str, Any]] = [("val", args)]
+    while stack and size <= budget:
+        kind, item = stack.pop()
+        if kind == "lit":
+            frags.append(item)
+            size += len(item)
+        elif kind == "val":
+            t = type(item)
+            if t is dict or t is list or t is tuple:
+                if id(item) in open_ids:
+                    mark = _CYCLE_MARK[t]
+                    frags.append(mark)
+                    size += len(mark)
+                    continue
+                open_ids.add(id(item))
+                frags.append(b"{" if t is dict else b"[" if t is list else b"(")
+                size += 1
+                entries = iter(item.items()) if t is dict else iter(item)
+                stack.append(("iter", [entries, item, 0]))
+            else:
+                if t is str or t is bytes:
+                    frag = repr(item if len(item) <= budget else item[:budget])
+                elif t is int or t is float or t is bool or item is None:
+                    frag = repr(item)
+                else:
+                    frag = type(item).__name__
+                encoded = frag.encode("utf-8", "replace")
+                frags.append(encoded)
+                size += len(encoded)
+        else:  # "iter"
+            entries, container, spelled = item
+            entry = next(entries, _EXHAUSTED)
+            t = type(container)
+            if entry is _EXHAUSTED:
+                open_ids.discard(id(container))
+                if t is tuple:
+                    close = b",)" if spelled == 1 else b")"
+                else:
+                    close = b"}" if t is dict else b"]"
+                frags.append(close)
+                size += len(close)
+                continue
+            item[2] = spelled + 1
+            stack.append(("iter", item))
+            if t is dict:
+                key, value = entry
+                stack.append(("val", value))
+                stack.append(("lit", b": "))
+                stack.append(("val", key))
+            else:
+                stack.append(("val", entry))
+            if spelled:
+                stack.append(("lit", b", "))
+    joined = b"".join(frags)
+    if size > budget:
+        return joined[: budget + 1]
+    return joined
 
 
 # -- the tool outcome ----------------------------------------------------
@@ -306,6 +422,11 @@ def _command_goto(out: Any) -> str | None:
     `Command.goto` is typed `Send | Sequence[Send | str] | str`, and a `Send`
     carries a node name PLUS a payload — a second decision this slice does not
     make. A `Send` destination is therefore omitted rather than guessed.
+
+    DECISION: `goto` is an extra, never a `HANDOFF` marker span.
+    `SpanIntent.HANDOFF` requires the AGENT block (`_vocab.py`'s rule), and a
+    node name is not an honest `AgentAttributes.name` — publishing one would
+    be confidence the edge cannot back (I4).
     """
     goto = getattr(out, "goto", None)
     if isinstance(goto, str):
@@ -373,6 +494,13 @@ def _mk_stream(original: Callable[..., Iterator[Any]], adapter: Any) -> Callable
     into a `KeyError` and emits zero spans. The prologue is only ever allowed
     to compute a `subject`, because a `None` subject degrades to the bare
     operation name while a missing required key deletes the span.
+
+    The abandonment status is deliberate: a run the host walked away from
+    ships ERROR carrying the interpreter's own exception name
+    (`GeneratorExit` here). `GeneratorExit` is NOT classified as control
+    flow, because control flow ships UNSET and UNSET claims a run completed
+    cleanly. The two `finally` counters below are the operator's handle on
+    the abandons that never finalize or finalize elsewhere.
     """
 
     def wrapper(self: Any, *args: Any, **kwargs: Any) -> Any:
@@ -421,6 +549,11 @@ def _mk_astream(original: Callable[..., Any], adapter: Any) -> Callable[..., Any
     error — so `async for chunk in original(...): yield chunk` is the only way
     to hold a scope across the framework's own async iteration, and the body
     rule admits exactly that shape and nothing computed inside it.
+
+    Abandonment policy is `_mk_stream`'s, with one more spelling: the loop's
+    finalizer closes an abandoned async generator on its own task and the
+    wrapper reads `CancelledError`, while a host's own `aclose()` reads
+    `GeneratorExit`.
     """
 
     async def wrapper(self: Any, *args: Any, **kwargs: Any) -> Any:
