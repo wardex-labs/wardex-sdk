@@ -1350,12 +1350,26 @@ class SessionAssembler:
                 rec.merged = True
                 anchors[spawn.span_id] = rec.draft.context
 
-        # (3) chats — the unique-time-window join, scoped by agent.
-        windows = [
-            _ChatWindow(key=i, start_ns=rec.window[0], end_ns=rec.window[1], agent_id=rec.agent_id)
-            for i, rec in enumerate(sess.pending)
-            if rec.kind == "chat" and rec.window is not None
-        ]
+        # (3) chats — the unique-start-window join, scoped by agent. The
+        # windows are SEQUENCED per scope before matching: every chat of one
+        # agentic loop shares the same host write, so their recorded turn
+        # starts collide — and colliding windows made every multi-turn
+        # session degenerate to the ambiguity fallback (measured against a
+        # live CLI). The request that produced chat N cannot have started
+        # before chat N-1's message arrived, so N-1's arrival is N's floor.
+        windows = []
+        floor_by_scope: dict[str | None, int] = {}
+        for i, rec in enumerate(sess.pending):
+            if rec.kind != "chat" or rec.window is None:
+                continue
+            start_ns, end_ns = rec.window
+            floor = floor_by_scope.get(rec.agent_id)
+            if floor is not None and floor > start_ns:
+                start_ns = floor
+            floor_by_scope[rec.agent_id] = end_ns
+            windows.append(
+                _ChatWindow(key=i, start_ns=start_ns, end_ns=end_ns, agent_id=rec.agent_id)
+            )
         outcome = join_chats(windows, view.llm)
         for key, llm in outcome.pairs:
             if not (0 < llm.span.start_ns < llm.span.end_ns):

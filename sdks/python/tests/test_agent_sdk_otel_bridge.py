@@ -1111,3 +1111,63 @@ def test_an_evicted_bridge_sessions_pended_spans_still_ship(receiver):
     assert receiver.take(TRACE, None) is None
     asm.on_close(1, None)
     asm.on_close(2, None)
+
+
+def test_a_multi_turn_agentic_loop_joins_each_llm_request_uniquely(receiver):
+    """The live-CLI regression, pinned: chats of one agentic loop share ONE
+    host write, so their raw turn starts collide — sequencing each window
+    from the previous same-scope chat's arrival is what lets two real
+    llm_requests join two of three chats uniquely, with the duplicate-view
+    chat unmerged and NO conflict siblings."""
+    client = FakeClient()
+    asm = SessionAssembler(client, bridge=receiver)
+    receiver.reserve(TRACE)
+    _outbound(asm, 1, bridge=_binding())
+    asm.on_inbound(1, INIT)
+    asm.on_inbound(1, ASSISTANT)  # chat 1 (text/tool_use view of response 1)
+    asm.on_inbound(1, ASSISTANT_2)  # chat 2 — SAME turn, no host write between
+    asm.on_inbound(1, TOOL_RESULT)
+    asm.on_inbound(1, ASSISTANT_2)  # chat 3 — the post-tool response
+    asm.on_inbound(1, RESULT)
+
+    # The REAL recorded windows (their raw starts all collide on the one host
+    # write — the exact shape the live CLI produced). Each llm_request starts
+    # just before its own chat's arrival, as a real one does.
+    raw_windows = [rec.window for rec in asm._by_key[1].pending if rec.kind == "chat"]
+    assert len(raw_windows) == 3
+    assert raw_windows[0][0] == raw_windows[1][0] == raw_windows[2][0]  # collision
+    body = _otlp_build.request(
+        [
+            _otlp_build.span(
+                name="claude_code.llm_request",
+                trace_id=TRACE,
+                span_id="0a" * 8,
+                start_ns=raw_windows[0][1] - 1_000,  # strictly inside chat 1's window
+                end_ns=raw_windows[0][1],
+                attrs={"gen_ai.response.id": "req_1"},
+            ),
+            _otlp_build.span(
+                name="claude_code.llm_request",
+                trace_id=TRACE,
+                span_id="0b" * 8,
+                start_ns=raw_windows[2][1] - 1_000,  # strictly inside SEQUENCED chat 3
+                end_ns=raw_windows[2][1],
+                attrs={"gen_ai.response.id": "req_2"},
+            ),
+        ]
+    )
+    assert _post(receiver, body) == 200
+    asm.on_close(1, None)
+
+    chats = [s for s in client.spans if s.name.startswith("chat")]
+    assert len(chats) == 3
+    merged = [s for s in chats if "otel_bridge" in {m.value for m in s.capture_sources}]
+    request_ids = sorted(
+        dict(s.extra).get("wardex.anthropic_agent_sdk.otel.request_id") for s in merged
+    )
+    assert request_ids == ["req_1", "req_2"]
+    for s in merged:
+        assert _TIMING not in _limitations(s)
+    unmerged = [s for s in chats if s not in merged]
+    assert len(unmerged) == 1 and _TIMING in _limitations(unmerged[0])
+    assert not any(s.name == "execute_step llm_request" for s in client.spans)

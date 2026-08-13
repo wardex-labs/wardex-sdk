@@ -15,14 +15,21 @@ Join rules, and why each is shaped the way it is:
 * TOOL — exact join on ``tool_use_id`` (runtime-confirmed on both
   ``claude_code.tool`` and ``.tool.execution``; duplicated as
   ``gen_ai.tool.call.id``). Exact or nothing.
-* CHAT — unique-time-window within one agent scope. The spec's exact join on
+* CHAT — unique-time-window within one agent scope, anchored on the
+  ``llm_request``'s START instant. The spec's exact join on
   ``gen_ai.response.id`` has NO left-hand operand: the CLI's stream-json
   carries ``message.id`` (``msg_...``) only, and the OTel side carries the
   Anthropic ``request_id`` (``req_...``), so equality can never hold. A
-  window join merges an ``llm_request`` into a pended chat draft iff it is
-  the ONLY candidate in both directions; any ambiguity means NO merge for
-  any party — guessing a parent from a coin flip is the competitor failure
-  this SDK exists not to repeat.
+  chat's window is the interval in which the request that PRODUCED it can
+  have started — from the previous same-scope chat's arrival (the assembler
+  sequences the windows: chats of one agentic loop share one host write, so
+  their raw turn starts collide and full-interval overlap degenerated every
+  multi-turn session into ambiguity, measured live) to its own arrival. A
+  pair merges iff it is unique in BOTH directions — strict containment
+  first, the tolerance pass only over what strictness left, so host-arrival
+  lag is absorbed without letting a wide tolerance undo an exact fit. Any
+  remaining ambiguity means NO merge for any party — guessing a parent from
+  a coin flip is the competitor failure this SDK exists not to repeat.
 * everything with no wardex counterpart (``hook``, ``mcp.rpc``,
   ``bash.subprocess``, ``compaction``, ``tool.blocked_on_user``) is a pure
   increment: new EXECUTE_STEP spans, CLI-measured times, no timing marker.
@@ -41,11 +48,13 @@ from dataclasses import dataclass, field
 
 from .._assembly import counters
 
-#: Overlap tolerance between a chat draft's host-arrival window and the CLI's
-#: own [start, end]. The two clocks are one machine's unix-epoch nanoseconds,
-#: so this absorbs scheduling latency (host write time vs CLI request start),
-#: not clock skew. Tuned against live sessions; a window that fails to overlap
-#: fails HONESTLY (no merge, markers kept), never wrongly.
+#: The SECOND-pass tolerance around a chat's window when locating an
+#: `llm_request`'s START. The two clocks are one machine's unix-epoch
+#: nanoseconds, so this absorbs host-arrival lag (a busy host event loop
+#: reads a message late, shifting the window boundaries that message
+#: defines), not clock skew. The strict pass runs first, so this widens
+#: candidacy only for requests strictness could not place; a request that
+#: still fails, fails HONESTLY (no merge, markers kept), never wrongly.
 JOIN_EPS_NS = 1_000_000_000
 
 #: CLI span names with no wardex counterpart, mapped to their step name.
@@ -277,36 +286,62 @@ class _JoinOutcome:
     unjoined: list[_OtelLlm] = field(default_factory=list)
 
 
-def _overlaps(chat: _ChatWindow, llm: _OtelLlm, eps_ns: int) -> bool:
-    return llm.span.start_ns < chat.end_ns + eps_ns and llm.span.end_ns > chat.start_ns - eps_ns
+def _start_within(chat: _ChatWindow, llm: _OtelLlm, eps_ns: int) -> bool:
+    """Whether this request can have STARTED inside this chat's window.
+
+    The START and not the interval: an `llm_request` ENDS at the moment its
+    message is emitted, which is the very instant that opens the NEXT chat's
+    window — so any interval-overlap predicate makes every request brush its
+    successor's window and re-creates the ambiguity the sequencing removed.
+    A request's start has one home.
+    """
+    return chat.start_ns - eps_ns <= llm.span.start_ns <= chat.end_ns + eps_ns
+
+
+def _match(chats: list[_ChatWindow], llms: list[_OtelLlm], eps_ns: int) -> list:
+    by_chat: dict[int, list[_OtelLlm]] = {}
+    by_llm: dict[int, list[_ChatWindow]] = {}
+    for chat in chats:
+        for llm in llms:
+            if chat.agent_id == llm.agent_id and _start_within(chat, llm, eps_ns):
+                by_chat.setdefault(chat.key, []).append(llm)
+                by_llm.setdefault(id(llm), []).append(chat)
+    pairs = []
+    for chat in chats:
+        candidates = by_chat.get(chat.key, [])
+        if len(candidates) == 1 and len(by_llm[id(candidates[0])]) == 1:
+            pairs.append((chat.key, candidates[0]))
+    return pairs
 
 
 def join_chats(
     chats: list[_ChatWindow], llms: list[_OtelLlm], eps_ns: int = JOIN_EPS_NS
 ) -> _JoinOutcome:
-    """The unique-time-window join, scoped by agent.
+    """The unique-start-window join, scoped by agent, in two passes.
 
     A pair merges iff the llm is the chat's ONLY candidate AND the chat is
-    the llm's ONLY candidate. Two chats over one llm, or two llms over one
-    chat, unmatch every party involved: no merge is the only answer the
-    evidence backs (I4), and the drafts keep their timing markers honestly.
+    the llm's ONLY candidate. The strict pass (no tolerance) settles every
+    request whose start sits cleanly inside one window; the tolerance pass
+    runs only over what strictness left, so host-arrival lag is absorbed
+    without a wide tolerance manufacturing ambiguity for exact fits. Two
+    chats over one llm, or two llms over one chat, unmatch every party
+    involved: no merge is the only answer the evidence backs (I4), and the
+    drafts keep their timing markers honestly.
     """
-    by_chat: dict[int, list[_OtelLlm]] = {}
-    by_llm: dict[int, list[_ChatWindow]] = {}
-    for chat in chats:
-        for llm in llms:
-            if chat.agent_id == llm.agent_id and _overlaps(chat, llm, eps_ns):
-                by_chat.setdefault(chat.key, []).append(llm)
-                by_llm.setdefault(id(llm), []).append(chat)
     outcome = _JoinOutcome()
-    claimed: set[int] = set()
-    for chat in chats:
-        candidates = by_chat.get(chat.key, [])
-        if len(candidates) == 1 and len(by_llm[id(candidates[0])]) == 1:
-            outcome.pairs.append((chat.key, candidates[0]))
-            claimed.add(id(candidates[0]))
-    outcome.unjoined = [llm for llm in llms if id(llm) not in claimed]
-    if outcome.unjoined and by_llm:
+    remaining_chats = list(chats)
+    remaining_llms = list(llms)
+    for tolerance in (0, eps_ns):
+        pairs = _match(remaining_chats, remaining_llms, tolerance)
+        if not pairs:
+            continue
+        outcome.pairs.extend(pairs)
+        taken_chats = {key for key, _ in pairs}
+        taken_llms = {id(llm) for _, llm in pairs}
+        remaining_chats = [c for c in remaining_chats if c.key not in taken_chats]
+        remaining_llms = [llm for llm in remaining_llms if id(llm) not in taken_llms]
+    outcome.unjoined = remaining_llms
+    if outcome.unjoined:
         counters.bump("adapters.anthropic.otel_bridge.llm_join_ambiguous")
     return outcome
 
