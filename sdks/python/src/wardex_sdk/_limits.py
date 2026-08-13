@@ -59,6 +59,7 @@ class LimitsConfig:
     max_buffer_bytes: int | None = None
     max_otlp_attribute_bytes: int | None = None
     max_otlp_request_bytes: int | None = None
+    max_link_targets: int | None = None
 
     def __post_init__(self) -> None:
         for f in fields(self):

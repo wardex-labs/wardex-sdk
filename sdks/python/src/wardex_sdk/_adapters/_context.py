@@ -206,18 +206,42 @@ class Scope:
         if self._unit is not None:
             self._unit.note(marker)
 
-    def link(self, reason: LinkReason, target: UnitKey) -> None:
+    def link(self, reason: LinkReason, target: UnitKey, *, expected: bool = True) -> None:
         """Link to another unit BY SELECTOR — resolved here, never handed in.
 
         A link is not a parent, but it still carries a span context, and letting
         an adapter supply one would put a fabricable `SpanContext` back in its
         vocabulary. So the selector is resolved against units this registry
-        produced; a selector naming nothing live adds no link and is counted.
-        Linking to a run in ANOTHER PROCESS — a checkpoint resume — needs an
-        identity that outlives the registry, and nothing persists one today.
+        produced: live units first, then a BOUNDED memory of closed units'
+        contexts (`alias(remember=True)` is what opts a key in) — a finished
+        predecessor step or run is a nameable target, because its span already
+        shipped and a link is causality rather than containment. Linking to a
+        run in ANOTHER PROCESS — a cross-process checkpoint resume — still
+        needs an identity that outlives the registry, and nothing persists one.
+
+        A selector naming nothing adds no link and is COUNTED — unless the
+        adapter declares the claim conditional with `expected=False`: "IF this
+        ever ran here, link it". That miss is silent, because counting it
+        would fabricate a loss the adapter cannot attest — a fresh thread and
+        a cross-process resume are indistinguishable at the seam. The default
+        stays counted; `expected=False` is for the claims whose truth the
+        adapter genuinely cannot know.
         """
         if self._unit is not None:
-            self._ctx._link(self._unit, reason, target)
+            self._ctx._link(self._unit, reason, target, expected=expected)
+
+    def alias(self, key: UnitKey, *, remember: bool = False) -> None:
+        """Add a lookup alias to THIS scope's own unit.
+
+        The `enter(aliases=)` capability, reachable at describe time — which is
+        when a run-scoped alias VALUE can first be computed (`run_token`). With
+        `remember=True` the key also opts into the registry's closed-unit link
+        memory: after this unit closes, the key still resolves FOR LINKING
+        (`link()` on a later scope), and for nothing else. Total and silent on
+        a degraded scope, like every other verb here.
+        """
+        if self._unit is not None:
+            self._ctx._alias(self._unit, key, remember=remember)
 
     def claim(self, selector: UnitKey, *, observer: Observer) -> bool:
         """Take `selector` for this observer, if a higher rank has not.
@@ -250,6 +274,27 @@ class Scope:
         if run is None:
             return False
         return run.claim(selector, rank=observer.value)
+
+    def run_token(self) -> str | None:
+        """An opaque per-run STRING, for scoping alias VALUES to one run.
+
+        `claim_run`'s walk, answering with a token instead of a claim: the
+        nearest enclosing SESSION's own key, spelled as a string. Two scopes
+        under one run agree on it, scopes under different runs never do —
+        which is exactly what a per-node alias needs so that concurrent runs
+        of one graph cannot collide in the registry's alias table.
+
+        Deliberately a STRING and not a context, a parent or a unit: the
+        Scope surface's unsayables stay unsaid, and a token's only use is as
+        part of a `UnitKey` VALUE. `None` when degraded or when no SESSION
+        encloses this scope — a caller with no run has nothing to scope to.
+        """
+        if self._unit is None:
+            return None
+        run = self._unit.enclosing(UnitKind.SESSION)
+        if run is None:
+            return None
+        return f"{run.key.namespace}:{run.key.value}"
 
     def outranked(self, selector: UnitKey, *, observer: Observer) -> bool:
         """Has a HIGHER-ranked observer taken this selector since we claimed it?
@@ -559,19 +604,35 @@ class AdapterContext:
             self._slots[obj] = existing
         return existing
 
-    def _link(self, unit: Unit, reason: LinkReason, target: UnitKey) -> None:
-        """Resolve a selector to a unit and link to its span. Counted on a miss.
+    def _alias(self, unit: Unit, key: UnitKey, *, remember: bool) -> None:
+        self._units.bind_alias(unit, key, remember=remember)
 
-        Not a no-op that a caller could mistake for success: a link nobody can
-        see is exactly the silent hole this SDK spends its markers on, and the
-        counter is the only record available — a span cannot carry a link to a
-        span that does not exist.
+    def _link(
+        self, unit: Unit, reason: LinkReason, target: UnitKey, *, expected: bool = True
+    ) -> None:
+        """Resolve a selector to a span context and link to it.
+
+        Live units first, then the registry's bounded closed-unit memory
+        (`resolve_link_target`), so a finished predecessor is still a nameable
+        target. A miss on an EXPECTED claim is counted, never a silent no-op a
+        caller could mistake for success: a link nobody can see is exactly the
+        silent hole this SDK spends its markers on, and the counter is the
+        only record available — a span cannot carry a link to a span that
+        does not exist. An `expected=False` miss is silent; see `Scope.link`
+        for why counting it would itself be a fabrication.
+
+        A SELF-link is refused on the same terms as a miss: a span may never
+        link to itself, and the guard is what lets a resume site link FIRST
+        and alias itself after — if the alias were somehow consulted for the
+        very scope that bound it, the answer is refused here rather than
+        shipped as a causal edge from a span to itself.
         """
-        found = self._units.find(target)
-        if found is None:
-            self.count("link_target_unresolved")
+        ctx = self._units.resolve_link_target(target)
+        if ctx is None or ctx.span_id == unit.context.span_id:
+            if expected:
+                self.count("link_target_unresolved")
             return
-        unit.draft.add_link(found.context, reason)
+        unit.draft.add_link(ctx, reason)
 
     def _is_control_flow(self, exc: BaseException) -> bool:
         """Is this the host's control flow rather than the host's failure?

@@ -171,6 +171,40 @@ gone.
 
 ### Added
 
+- **Finished work is now a linkable target: the unit registry keeps a bounded
+  closed-unit link memory.** An alias opted in with `remember=True` keeps its
+  unit's span context after close, and link resolution consults live units
+  first, then that memory — so a causal link (`triggered_by`, `resumed_from`)
+  can point at a predecessor whose span already shipped, without keeping the
+  unit alive and without ever producing a parent edge (a link is causality,
+  not containment). The memory is FIFO-bounded by a new core limit,
+  `max_link_targets` (default 256, settable via
+  `LimitsConfig(max_link_targets=...)`); evictions are counted as
+  `assembly._units.link_memory_full` and get no wire marker, because the
+  remembered span already shipped — what an eviction can cost is a link on a
+  future span. A key answers only for its most recent holder, a breadth-
+  evicted alias is forgotten from both lookup paths, and `find()` stays
+  live-only. The adapter surface grows `Scope.alias()`, `Scope.run_token()`
+  (an opaque per-run string for scoping alias values) and
+  `Scope.link(expected=)` — the default keeps every unresolved link counted;
+  `expected=False` is for conditional claims whose miss the adapter cannot
+  attest as a loss.
+- **LangGraph graph edges ship as links where the edge can back it.** A step
+  fired by a `join:{a}+{b}:{end}` trigger — the one StateGraph trigger format
+  that names its sources — now carries one `TRIGGERED_BY` link per named
+  source span, and a run whose config carries a `thread_id` links
+  `RESUMED_FROM` to the previous run on the same thread in the same process
+  (a new trace, linked — never a fabricated parent across runs). The refusals
+  are documented and pinned rather than guessed around: ordinary
+  `branch:to:{self}` triggers name only the destination, so plain edges get
+  no link; `Send` fan-out copies are structurally ambiguous, so a joined
+  push-task source is counted as `link_target_unresolved`, never picked; and
+  cross-process resume stays out of scope — nothing persists an identity
+  across processes, so a first run on a thread claims nothing and counts
+  nothing. One honest side effect to know: a graph joining a CACHED source
+  node (its cache hit never crosses the node seam) reports the lost link in
+  `adapters.langgraph.link_target_unresolved` — that count is the link that
+  genuinely cannot be encoded, not a regression.
 - **`RemoteGraph` (LangGraph Platform) runs are now visible.** A standalone
   `RemoteGraph.invoke`/`stream`/`ainvoke`/`astream` call used to cross zero
   patched seams and ship nothing; it now ships one `invoke_workflow` span

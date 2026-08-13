@@ -136,6 +136,7 @@ def test_bounds_are_resolved_from_the_core_not_a_python_literal():
     reg = registry()
     assert reg._max_units == core["max_units"]
     assert reg._max_entries_per_unit == core["max_entries_per_unit"]
+    assert reg._max_link_targets == core["max_link_targets"]
 
 
 # ==========================================================================
@@ -871,6 +872,134 @@ def test_aliasing_an_unknown_key_is_a_counted_no_op():
     reg.alias(UnitKey("test.session", "ghost"), UnitKey("other", "x"))
     assert reg.find(UnitKey("other", "x")) is None
     assert counters.get("assembly._units.alias_unknown_key") == 1
+
+
+# ==========================================================================
+# the closed-unit link memory — resolve_link_target
+# ==========================================================================
+
+
+def test_a_remembered_alias_still_resolves_for_linking_after_close():
+    """`find()` stays live-only — parentage must never see a corpse — while the
+    LINK path can still name the finished predecessor, because a link is
+    causality rather than containment and the target's span already shipped.
+    """
+    sink = RecordingSink()
+    reg = registry(sink=sink)
+    unit = open_session(reg)
+    key = UnitKey("test.thread", "t-1")
+    reg.bind_alias(unit, key, remember=True)
+    reg.close(unit)
+
+    assert reg.find(key) is None
+    resolved = reg.resolve_link_target(key)
+    assert resolved is not None
+    assert resolved.trace_id == sink.drafts[-1].context.trace_id
+    assert resolved.span_id == sink.drafts[-1].context.span_id
+
+
+def test_an_unremembered_alias_leaves_no_link_memory():
+    """Memory is opt-in PER KEY, not a registry-wide recording of every alias
+    namespace: the open()-time key, an `aliases=` entry and a plain
+    `bind_alias` all vanish at close exactly as they always have.
+    """
+    reg = registry()
+    unit = open_session(reg, aliases=(UnitKey("extra", "at-open"),))
+    reg.bind_alias(unit, UnitKey("extra", "bound"))
+    reg.close(unit)
+
+    assert reg.resolve_link_target(UnitKey("test.session", "s1")) is None
+    assert reg.resolve_link_target(UnitKey("extra", "at-open")) is None
+    assert reg.resolve_link_target(UnitKey("extra", "bound")) is None
+
+
+def test_the_link_memory_is_fifo_bounded_and_counts_evictions():
+    """I10 accounting: the bound holds, and the eviction is a number rather
+    than a marker — the remembered span already shipped, so what the eviction
+    costs is a link on a FUTURE span, and there is no span yet to say so on.
+    """
+    reg = registry(max_link_targets=2)
+    for i in range(3):
+        unit = open_session(reg, f"s{i}")
+        reg.bind_alias(unit, UnitKey("mem", str(i)), remember=True)
+        reg.close(unit)
+
+    assert reg.resolve_link_target(UnitKey("mem", "0")) is None
+    assert reg.resolve_link_target(UnitKey("mem", "1")) is not None
+    assert reg.resolve_link_target(UnitKey("mem", "2")) is not None
+    assert counters.get("assembly._units.link_memory_full") == 1
+
+
+def test_a_live_unit_wins_over_memory_and_a_rebind_supersedes_it():
+    """The latest-holder rule, both halves. While B holds the key live, B is
+    the answer; and because BINDING popped A's memory entry, B closing
+    unremembered leaves nothing — a stale predecessor must not resurface once
+    a successor owned the key, or a cycle's second iteration would link to its
+    first.
+    """
+    reg = registry()
+    key = UnitKey("test.thread", "t-1")
+    a = open_session(reg, "a")
+    reg.bind_alias(a, key, remember=True)
+    reg.close(a)
+    assert reg.resolve_link_target(key) == a.context
+
+    b = open_session(reg, "b")
+    reg.bind_alias(b, key)
+    assert reg.resolve_link_target(key) == b.context
+
+    reg.close(b)
+    assert reg.resolve_link_target(key) is None
+
+
+def test_a_breadth_evicted_alias_is_forgotten_not_remembered():
+    """The alias breadth bound governs BOTH lookup paths: a key `find()` can no
+    longer answer for must not resurface from the link memory at close.
+    (`alias_table_full` already counts the loss.)
+    """
+    reg = registry(max_entries_per_unit=2)
+    unit = open_session(reg)  # its own key takes the first slot
+    for i in range(3):
+        reg.bind_alias(unit, UnitKey("mem", str(i)), remember=True)
+    reg.close(unit)
+
+    # Binding "2" evicted "0" — the oldest remembered key — from both paths.
+    assert reg.resolve_link_target(UnitKey("mem", "0")) is None
+    assert reg.resolve_link_target(UnitKey("mem", "1")) is not None
+    assert reg.resolve_link_target(UnitKey("mem", "2")) is not None
+
+
+def test_an_evicted_roots_remembered_alias_still_answers():
+    """Eviction goes through the same close path as any teardown, so the
+    memory records — and linking to an evicted-but-shipped span is honest
+    causality: the span is on the wire, marked with what ended it.
+    """
+    sink = RecordingSink()
+    reg = registry(sink=sink, max_units=1)
+    first = open_session(reg, "first")
+    key = UnitKey("test.thread", "t-1")
+    reg.bind_alias(first, key, remember=True)
+
+    open_session(reg, "second")  # evicts `first`; its span ships marked
+
+    assert Limitation.UNIT_EVICTED in first.draft.integrity.markers
+    assert reg.resolve_link_target(key) == first.context
+
+
+def test_bind_alias_on_a_closed_unit_is_refused_and_counted():
+    """The same honest refusal `note()` and `open_span()` give a corpse: its
+    span already shipped, so the alias could neither be found live nor be
+    recorded at a close that already happened.
+    """
+    reg = registry()
+    unit = open_session(reg)
+    reg.close(unit)
+    key = UnitKey("mem", "late")
+    reg.bind_alias(unit, key, remember=True)
+
+    assert reg.find(key) is None
+    assert reg.resolve_link_target(key) is None
+    assert counters.get("assembly._units.alias_after_close") == 1
 
 
 # ==========================================================================

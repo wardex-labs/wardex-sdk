@@ -33,7 +33,8 @@ impl PyLimits {
         max_sessions=None, max_session_entries=None, max_units=None,
         max_entries_per_unit=None, mcp_sniff_bytes=None,
         max_buffer_spans=None, max_buffer_bytes=None, replay_buffer_size=None,
-        zstd_level=None, max_otlp_attribute_bytes=None, max_otlp_request_bytes=None
+        zstd_level=None, max_otlp_attribute_bytes=None, max_otlp_request_bytes=None,
+        max_link_targets=None
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -57,6 +58,7 @@ impl PyLimits {
         zstd_level: Option<i32>,
         max_otlp_attribute_bytes: Option<usize>,
         max_otlp_request_bytes: Option<usize>,
+        max_link_targets: Option<usize>,
     ) -> Self {
         let d = Limits::default();
         Self {
@@ -83,6 +85,7 @@ impl PyLimits {
                 max_otlp_attribute_bytes: max_otlp_attribute_bytes
                     .unwrap_or(d.max_otlp_attribute_bytes),
                 max_otlp_request_bytes: max_otlp_request_bytes.unwrap_or(d.max_otlp_request_bytes),
+                max_link_targets: max_link_targets.unwrap_or(d.max_link_targets),
             },
         }
     }
@@ -167,6 +170,10 @@ impl PyLimits {
     fn max_otlp_request_bytes(&self) -> usize {
         self.inner.max_otlp_request_bytes
     }
+    #[getter]
+    fn max_link_targets(&self) -> usize {
+        self.inner.max_link_targets
+    }
 }
 
 /// The core's default limits as a plain dict. The Python mirror asserts key
@@ -195,6 +202,7 @@ fn limits_defaults(py: Python<'_>) -> PyResult<Bound<'_, PyDict>> {
     out.set_item("zstd_level", d.zstd_level)?;
     out.set_item("max_otlp_attribute_bytes", d.max_otlp_attribute_bytes)?;
     out.set_item("max_otlp_request_bytes", d.max_otlp_request_bytes)?;
+    out.set_item("max_link_targets", d.max_link_targets)?;
     Ok(out)
 }
 

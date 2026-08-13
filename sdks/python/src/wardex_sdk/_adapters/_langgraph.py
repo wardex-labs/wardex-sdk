@@ -45,6 +45,22 @@ happen would take a loop-internal seam this adapter refuses. The cost, stated
 plainly: a run's tree can legitimately omit nodes, and nothing on the wire
 distinguishes "cached" from "not scheduled".
 
+Graph-edge causality ships as LINKS, and only where the edge can back it. A
+`join:{a}+{b}:{end}` trigger names its sources and the barrier guarantees each
+of them wrote, so the joined step carries one `TRIGGERED_BY` link per named
+source — resolved through the registry's closed-unit link memory, since the
+sources' spans are finished by then (`_node_links`). A run whose config
+carries a `thread_id` links `RESUMED_FROM` to the previous run on the same
+thread and THEN aliases itself under it — link-before-alias, or live-first
+resolution would answer the run its own question (`_describe_run`). Three
+boundaries are honest refusals rather than gaps: a `branch:to:{self}` trigger
+names only the DESTINATION, so an ordinary edge's source is never guessed; a
+`Send` fan-out produces same-named siblings no selector could pick between, so
+push tasks never become link targets; and a cross-process resume needs an
+identity that outlives the process, which nothing persists — a first run on a
+thread and a cross-process resume are indistinguishable here, so neither is
+counted as a lost link.
+
 The framework's own control flow — `interrupt()`, `Command(goto=…,
 graph=PARENT)`, a drained graph — arrives at all these seams as an ordinary
 exception. `CONTROL_FLOW` is what stops those reading as failures, and it is
@@ -78,8 +94,10 @@ from typing import Any
 
 from .._assembly import (
     Limitation,
+    LinkReason,
     SpanIntent,
     ToolAttributes,
+    UnitKey,
     UnitKind,
     report_once,
 )
@@ -192,6 +210,16 @@ def _remote_surface_ok(remote_cls: Any) -> bool:
 #: one whose graph genuinely has the default name, and both are true.
 _DEFAULT_GRAPH_NAME = "LangGraph"
 
+#: Trigger-string formats are langgraph COMPILER internals, verified on the
+#: pinned band by executing compiled graphs rather than read from docs (see
+#: `_node_links` for the census): the push sentinel is
+#: `langgraph/_internal/_constants.py`'s `PUSH`, the join channel name is the
+#: f-string `graph/state.py`'s `attach_edge` builds for a multi-source edge.
+#: `'__start__'` is already spelled at the node seam, where `install()` reads
+#: it off `constants.START`.
+_PUSH_TRIGGER = "__pregel_push"
+_JOIN_PREFIX = "join:"
+
 
 def _graph_name(graph: Any) -> str:
     """The graph's name, or the framework's own default.
@@ -247,6 +275,22 @@ def _describe_run(adapter: Any, graph: Any, args: Any, kwargs: Any, run: Scope) 
         thread_id = _configurable(args, kwargs).get("thread_id")
         if isinstance(thread_id, str | int):
             run.draft.set_extra("wardex.langgraph.thread_id", thread_id)
+            key = UnitKey("langgraph.thread_id", str(thread_id))
+            # ORDER IS LOAD-BEARING: link FIRST, alias AFTER. Aliased first,
+            # live-first resolution would answer this very run — the self-link
+            # guard would refuse AND (being `expected=False`) stay silent, so
+            # a healthy resume would lose its link. Linked first, the selector
+            # resolves the PREDECESSOR: live if a same-thread run is still
+            # streaming (the alias is bound and thread-state continuity is
+            # real), else from the closed-unit memory. The alias then hands
+            # the thread to the NEXT run. `expected=False` because a first
+            # run on a thread and a cross-process resume are indistinguishable
+            # at this seam — counting every fresh thread would fabricate a
+            # loss the adapter cannot attest. Cross-process resume stays the
+            # documented boundary: nothing persists an identity across
+            # processes.
+            run.link(LinkReason.RESUMED_FROM, key, expected=False)
+            run.alias(key, remember=True)
 
 
 def _describe_remote_run(adapter: Any, graph: Any, args: Any, kwargs: Any, run: Scope) -> None:
@@ -268,6 +312,8 @@ def _describe_node(adapter: Any, task: Any, step: Scope) -> None:
     step.draft.set_extra("wardex.framework", _FRAMEWORK)
     with adapter._ctx.guard("describe_node_extras"):
         _node_extras(task, step)
+    with adapter._ctx.guard("describe_node_links"):
+        _node_links(task, step)
 
 
 def _node_extras(task: Any, step: Scope) -> None:
@@ -295,6 +341,61 @@ def _node_extras(task: Any, step: Scope) -> None:
     ns = meta.get("langgraph_checkpoint_ns")
     if ns:
         step.draft.set_extra("wardex.step.namespace", str(ns))
+
+
+def _node_links(task: Any, step: Scope) -> None:
+    """`TRIGGERED_BY` links, plus the per-node alias later steps link against.
+
+    The trigger census, verified on the pinned band by EXECUTING compiled
+    graphs (the formats are compiler internals — re-verify on a version bump):
+
+    * `'__start__'` — the entrypoint. Containment already says it; no link.
+    * `'branch:to:{self}'` — every ordinary StateGraph edge, static AND
+      conditional (and a `Command(goto=...)`). It names the DESTINATION and
+      the source is not recoverable from the string, so NO link: attributing
+      it would take graph-structure introspection (`node.writers` internals),
+      rejected as deeper framework coupling. That is the revisit trigger.
+    * `'__pregel_push'` — a `Send` / functional-API `@task`. No source in the
+      string, and push tasks never register a node alias either (below).
+    * `'join:{a}+{b}:{end}'` — the ONE linking format. The compiler names
+      every source and the barrier channel guarantees each of them wrote this
+      superstep, so every per-source link is individually backed; a miss (a
+      CACHED source that never crossed the seam, a memory eviction) is a
+      genuinely lost link and counts — `expected` stays True.
+    * a raw-Pregel channel name — channel name == node name is convention,
+      not contract, so linking on it would be confidence the edge cannot
+      back; it matches no format here and adds nothing.
+
+    Accepted residual: a node literally named `'a+b'` in a joined edge beside
+    real nodes `'a'` and `'b'` would mis-attribute two links, and a node name
+    containing `':'` mis-parses — the parse is refused unless the parsed end
+    equals the task's own name, so a format drift can only COST links (plus
+    counted misses), never invent one.
+
+    The alias is conditional on the task being a PULL task, and that is the
+    never-guess rule made structural: a `Send` fan-out produces N same-named
+    sibling copies that no selector could pick between, so none of them may
+    own the name. Pull-task re-execution across supersteps is sequential,
+    which makes the registry's latest-holder rule the correct cycle
+    semantics: each iteration links to the LATEST prior run of its source.
+    The alias value is run-scoped (`run_token`) so concurrent runs of one
+    graph cannot collide in the alias table.
+    """
+    token = step.run_token()
+    if token is None:
+        return
+    triggers = tuple(str(t) for t in (task.triggers or ()))
+    name = str(task.name)
+    for trigger in triggers:
+        if not trigger.startswith(_JOIN_PREFIX):
+            continue
+        sources, sep, end = trigger[len(_JOIN_PREFIX) :].rpartition(":")
+        if not sep or end != name:
+            continue  # a shape the census does not know: never guess
+        for source in sources.split("+"):
+            step.link(LinkReason.TRIGGERED_BY, UnitKey("langgraph.node", f"{token}/{source}"))
+    if _PUSH_TRIGGER not in triggers:
+        step.alias(UnitKey("langgraph.node", f"{token}/{name}"), remember=True)
 
 
 def _describe_tool(adapter: Any, node: Any, call: Any, tool: Scope) -> None:
