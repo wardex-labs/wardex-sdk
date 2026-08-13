@@ -1,9 +1,11 @@
 """Session assembler: correlates stream events and hook events into spans.
 
 Sources: the transport tee (raw JSON lines -> native parser) and SDK hooks.
-Rule (spec §6.2): hooks are the authority for lifecycle/attribution, the
-stream is the authority for content; joined on tool_use_id. All timestamps
-are host-arrival times (IPC level).
+Rule (spec §6.2): hooks are the authority for lifecycle/attribution — and for
+the user-turn boundary — while the stream is the authority for content; joined
+on tool_use_id. The hook's `UserPromptSubmit` prompt payload is the content
+FALLBACK for exactly the turn whose outbound write the stream did not record.
+All timestamps are host-arrival times (IPC level).
 
 Two things this module used to hold now live next door, and the split is by how
 long each one stays here. `_session_state.py` holds what the assembler
@@ -97,6 +99,19 @@ _BASE_LIMITATION = Limitation.TRANSPORT_TIMING_UNAVAILABLE_SUBPROCESS
 #: everything, precisely so a guess cannot cross a framework boundary.
 #: `test_agent_sdk_units.py` asserts the two spellings agree.
 _OWNER = "anthropic_agent_sdk"
+
+
+#: The two provenances a chat span's `input_data` can have, published as the
+#: `wardex.agent.prompt_source` extra on every chat span that carries a prompt.
+#: They double as the internal pending-source states on `_Session`. The two
+#: SHAPES differ on the wire, and the extra is what lets a consumer parse
+#: `input_data`: "stream" is the byte-exact message-object JSON slice from the
+#: transport tee (content authority); "hook" is the CLI's re-decoded prompt
+#: text from the `UserPromptSubmit` payload — the degraded fallback for a write
+#: the stream did not record, published as the text wardex actually saw rather
+#: than dressed up as a message object wardex never saw.
+_PROMPT_STREAM = "stream"
+_PROMPT_HOOK = "hook"
 
 
 #: The rank the HOOK observer claims a tool call at. The in-process handler
@@ -223,6 +238,16 @@ class SessionAssembler:
     # --- ingestion ---
 
     def on_outbound(self, key: int, data: str) -> None:
+        """Host -> CLI write. A main-thread user message installs the pending prompt.
+
+        The `parent_tool_use_id is None` gate is SYMMETRIC with consumption:
+        `_build_chat` consumes the pending prompt only for a chat whose own
+        `parent_tool_use_id` is None, i.e. a main-thread assistant turn. An
+        outbound user line that carries one — a host-written message addressed
+        into a sub-agent's thread — is not the next main-thread turn's prompt,
+        so installing it here would overwrite a prompt the main thread has not
+        consumed yet and charge the loss to a turn that never died.
+        """
         ev = parse_line(data.encode(), outbound=True)
         if ev is None:
             return
@@ -231,8 +256,14 @@ class SessionAssembler:
             sess = self._ensure_session(key, now)
             sess.turn_start_ns = now
             sess.first_delta_ns = 0
-            if ev.content_json and not sess.prompt:
-                sess.prompt = ev.content_json
+            if ev.content_json and ev.parent_tool_use_id is None:
+                if sess.pending_prompt_source is not None:
+                    # A prompt was seen and no chat span ever consumed it. It
+                    # is lost now, and the loss is counted rather than silent.
+                    counters.bump("adapters.assembler.prompt_overwritten")
+                sess.pending_prompt = ev.content_json
+                sess.pending_prompt_source = _PROMPT_STREAM
+                sess.pending_prompt_hook_seen = False
 
     def on_inbound(self, key: int, msg: dict) -> None:
         try:
@@ -359,6 +390,47 @@ class SessionAssembler:
                     sess.subagents[agent_id] = _OpenSubagent(draft=draft, agent_type=agent_type)
             elif event == "SubagentStop":
                 self._emit_subagent(sess, payload.get("agent_id"), now)
+            elif event == "UserPromptSubmit":
+                self._on_prompt_submit(sess, payload, now)
+
+    def _on_prompt_submit(self, sess: _Session, payload: dict, now: int) -> None:
+        """Consume a `UserPromptSubmit` hook: corroborate the stream, or fall back.
+
+        The stream stays the CONTENT authority. A pending stream prompt not yet
+        corroborated IS this prompt: the write that caused this hook passed
+        through the tee before the CLI could act on it, and the CLI blocks on
+        hook responses before inference, so the pending bytes and this payload
+        describe one user turn — content stays byte-exact from the stream, and
+        remembering the corroboration is what lets a SECOND submit while the
+        same prompt still pends read as a new user turn whose write the stream
+        missed, not as a duplicate of this one.
+
+        Every other state means this hook is the only observation of its turn:
+        no pending prompt (the stream missed the write), a pending hook prompt
+        (two prompts with no assistant turn between), or an already-corroborated
+        stream prompt (the previous turn died unconsumed AND this turn's write
+        was missed). Then the hook's re-decoded text is captured as the degraded
+        content fallback, and the hook arrival sets the turn boundary — and ONLY
+        then: when the stream saw the write, hook arrival is polluted by user
+        matchers that run before wardex's appended one, while the tee'd write is
+        causally earlier and unpolluted.
+
+        The fallback cannot create a session: a hook for a transport whose
+        writes never parsed is dropped (counted) by `_session_for_hook` before
+        this method runs, so it covers prompt-line misses within an observed
+        session only — it is not stream-independence.
+        """
+        if sess.pending_prompt_source == _PROMPT_STREAM and not sess.pending_prompt_hook_seen:
+            sess.pending_prompt_hook_seen = True
+            return
+        if sess.pending_prompt_source is not None:
+            counters.bump("adapters.assembler.prompt_overwritten")
+        prompt = payload.get("prompt")
+        sess.pending_prompt = prompt.encode() if isinstance(prompt, str) else b""
+        sess.pending_prompt_source = _PROMPT_HOOK
+        sess.pending_prompt_hook_seen = True
+        sess.turn_start_ns = now
+        sess.first_delta_ns = 0
 
     # --- emission helpers (all build via SpanDraft, emit via capture_span) ---
 
@@ -690,16 +762,27 @@ class SessionAssembler:
         if ttft is not None:
             draft.add_limitation(Limitation.TTFT_IPC_APPROXIMATION)
 
-        is_first_turn = sess.turn_index == 0
-        # `attempted`, not `bool(payload)`. Only the first turn carries the
-        # prompt on this path, because per-turn delta prompt accounting does not
-        # exist yet; saying so is different from reporting an empty capture as a
-        # failed one.
+        # Consumption is gated exactly the way installation is (`on_outbound`):
+        # only a MAIN-THREAD assistant turn consumes the pending prompt. A
+        # subagent-attributed chat's input is the subagent's task, not the
+        # user's session prompt, so it ships `input_attempted=False` and leaves
+        # the pending prompt for the next main-thread turn. `attempted`, not
+        # `bool(payload)`: an intermediate assistant turn of one agentic loop
+        # HAS no user prompt, and saying so is different from reporting an
+        # empty capture as a failed one.
+        consume = ev.parent_tool_use_id is None and sess.pending_prompt_source is not None
         draft.set_io(
-            input_data=sess.prompt if is_first_turn else b"",
+            input_data=sess.pending_prompt if consume else b"",
             output_data=ev.content_json or b"",
-            input_attempted=is_first_turn,
+            input_attempted=consume,
         )
+        if consume:
+            # Which channel the prompt bytes came from — the two shapes differ
+            # on the wire (see `_PROMPT_STREAM`/`_PROMPT_HOOK`).
+            draft.set_extra("wardex.agent.prompt_source", sess.pending_prompt_source)
+            sess.pending_prompt = b""
+            sess.pending_prompt_source = None
+            sess.pending_prompt_hook_seen = False
         # No correlation: the anchor above may be a fallback (see
         # `_resolve_subagent_anchor`), and the parentage's own record would
         # report it as `unit_active`/1.0 with no marker — a claim this span
@@ -768,6 +851,16 @@ class SessionAssembler:
     ) -> None:
         if tool_use_id is None:
             return
+        error_type: str | None = None
+        if failed:
+            # The verified payload contract (claude-agent-sdk 0.2.x,
+            # `PostToolUseFailureHookInput`): `error: str`, `is_interrupt:
+            # NotRequired[bool]`. The interrupt flag is the low-cardinality
+            # half and ships as the type; the free-text `error` message is
+            # deliberately NOT shipped — `Status.message` has no bound in the
+            # core limits table and free text has no PII routing decision yet,
+            # so the message is a follow-up while the type is this change.
+            error_type = "tool_interrupted" if payload.get("is_interrupt") else "tool_error"
         tool = sess.open_tools.pop(tool_use_id, None)
         if tool is None:
             key = self._claim_key(sess, payload.get("tool_name") or "unknown")
@@ -796,7 +889,7 @@ class SessionAssembler:
                 tool.input_data = stream_input
         if "tool_response" in payload:
             tool.output_data = _safe_json_bytes(payload.get("tool_response"))
-        self._emit_tool(sess, tool, now, failed=failed)
+        self._emit_tool(sess, tool, now, failed=failed, error_type=error_type)
 
     def _emit_tool(
         self,
@@ -859,10 +952,10 @@ class SessionAssembler:
         draft.set_status(StatusCode.ERROR if failed else StatusCode.OK)
         if failed:
             # `finish()` refuses ERROR without a type, which turns the
-            # untyped-failure defect into a mechanism. The hook payload carries a richer reason
-            # (`PostToolUseFailureHookInput.error` / `is_interrupt`) that nothing
-            # reads yet, so this is a coarse-but-true type rather than an absent
-            # one.
+            # untyped-failure defect into a mechanism. The hook path refines
+            # the type from the failure payload's `is_interrupt` flag before
+            # it gets here (`_close_tool`); the stream result block carries no
+            # interrupt signal, so stream-only failures stay coarse-but-true.
             draft.set_error(error_type or "tool_error")
         if not tool.from_hook:
             # Reconstructed from the CLI's stdout rather than announced by a

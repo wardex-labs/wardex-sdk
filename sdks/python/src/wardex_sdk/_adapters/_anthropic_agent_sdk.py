@@ -49,6 +49,19 @@ from ._context import AdapterContext, Fallback, Observer, Placement, Scope
 if TYPE_CHECKING:
     from .._client import Client
 
+# Every event injected here has a consumer in `SessionAssembler.on_hook`, and
+# that is a rule, not a coincidence: each injected hook costs a blocking
+# control-protocol round trip the CLI awaits at the exact moment the hook
+# fires, so an unconsumed event is latency paid for nothing.
+#
+# `Stop` is deliberately NOT injected. Its payload is `BaseHookInput` plus
+# `stop_hook_active` only (verified against claude-agent-sdk 0.2.x
+# `StopHookInput`) — no timestamps — so it cannot correct a chat span's end
+# (message arrival) or the root's end (transport close); and the failures it
+# could theoretically catch (a stale pending prompt, a stale turn start)
+# presuppose `UserPromptSubmit` was dropped on the same control channel that
+# delivered Stop. Revisit if the CLI ever puts timing or verdict data in the
+# Stop payload.
 _WARDEX_HOOK_EVENTS = (
     "PreToolUse",
     "PostToolUse",
@@ -56,7 +69,6 @@ _WARDEX_HOOK_EVENTS = (
     "SubagentStart",
     "SubagentStop",
     "UserPromptSubmit",
-    "Stop",
 )
 
 

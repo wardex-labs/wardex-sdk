@@ -227,6 +227,18 @@ gone.
   untouched. It requires Docker and an explicit `WARDEX_E2E_PHOENIX` opt-in,
   and its filename is outside pytest's collection patterns, so no suite or CI
   job depends on it.
+- **Agent SDK adapter: per-turn prompt capture.** Every main-thread chat span
+  now carries its own user turn's prompt (prompts for turns 2+ used to be
+  parsed off the wire and discarded), sourced byte-exactly from the stream
+  with the `UserPromptSubmit` hook as boundary corroboration and as the
+  degraded-content fallback for a write the stream did not record. The
+  provenance is published on the span as the `wardex.agent.prompt_source`
+  extra (`"stream"` = the outbound message-object JSON slice, `"hook"` = the
+  CLI's re-decoded prompt text), because the two shapes differ on the wire
+  and a consumer must know which one it is parsing. Assistant turns that had
+  no user prompt — the intermediate turns of an agentic loop, and
+  subagent-attributed chats — honestly ship `input_attempted=False` instead
+  of an empty capture.
 
 ### Changed
 
@@ -277,6 +289,18 @@ gone.
   full repr, and materialization is bounded by the resolved `max_body_bytes`
   with the `truncated` flag set on overflow. Wire-visible only for
   non-builtin argument values; pre-1.0.
+- **The Agent SDK adapter no longer injects the `Stop` hook.** Its payload
+  carries `stop_hook_active` and nothing else — no timestamps — so there was
+  nothing it could correct that the same control channel had not already
+  delivered, and each injected hook costs a blocking control-protocol round
+  trip the CLI awaits at the end of every turn. `UserPromptSubmit` is now
+  consumed (see per-turn prompt capture above), so every hook event the
+  adapter injects has a consumer.
+- **Interrupted tool calls now ship `error.type="tool_interrupted"`** (a wire
+  value change, pre-1.0), read from the `PostToolUseFailure` payload's
+  `is_interrupt` flag; `"tool_error"` remains the fallback for every other
+  failure, including stream-only observations, whose result block carries no
+  interrupt signal.
 
 ### Fixed
 

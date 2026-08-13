@@ -64,7 +64,22 @@ class _Session:
     model: str | None = None  # from init -> request_model
     turn_start_ns: int = 0
     first_delta_ns: int = 0
-    prompt: bytes = b""
+    #: The not-yet-consumed user prompt for the NEXT main-thread chat span. At
+    #: most one prompt pends per session — a new observation REPLACES it
+    #: (counted), never appends, so the slot is bounded by construction — and
+    #: it is consumed exactly once, by the first main-thread assistant turn.
+    #: All three `pending_prompt*` fields are cleared together at consumption
+    #: and destroyed with this record on close/evict/teardown.
+    pending_prompt: bytes = b""
+    #: Which channel recorded `pending_prompt`: "stream" (the byte-exact
+    #: outbound message-object JSON from the tee) or "hook" (the CLI's
+    #: re-decoded prompt text from `UserPromptSubmit`), or None. Doubles as the
+    #: consumed/unconsumed flag — None means nothing pends.
+    pending_prompt_source: str | None = None
+    #: The pending STREAM prompt has been corroborated by one `UserPromptSubmit`
+    #: hook. A second submit while the same prompt still pends then reads as a
+    #: NEW user turn whose write the stream missed, not as a duplicate.
+    pending_prompt_hook_seen: bool = False
     open_tools: dict[str, _OpenTool] = field(default_factory=dict)  # keyed by tool_use_id
     subagents: dict[str, _OpenSubagent] = field(default_factory=dict)  # keyed by agent_id
     turn_index: int = 0
