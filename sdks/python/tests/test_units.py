@@ -912,6 +912,9 @@ def test_eviction_over_max_units_closes_the_whole_oldest_subtree():
     assert second.is_live is True
     assert sink.drafts == [sub.draft, first.draft]
     assert Limitation.UNIT_EVICTED in first.draft.integrity.markers
+    # Descendants keep the teardown marker; only a bound-hit entry carries the
+    # table-full fact — the root crossed `max_units`, not the breadth knob, so
+    # nothing here says UNIT_TABLE_FULL.
     assert Limitation.CHILD_SPAN_UNCLOSED in sub.draft.integrity.markers
     assert reg.find(UnitKey("test.session", "first")) is None
 
@@ -942,7 +945,10 @@ def test_a_full_child_table_evicts_the_oldest_child_and_emits_it():
 
     assert first.is_live is False
     assert sink.drafts == [first.draft]
-    assert Limitation.CHILD_SPAN_UNCLOSED in first.draft.integrity.markers
+    # A swap, not an augment: the marker names the knob (`max_entries_per_unit`)
+    # rather than claiming a teardown that never happened.
+    assert Limitation.UNIT_TABLE_FULL in first.draft.integrity.markers
+    assert Limitation.CHILD_SPAN_UNCLOSED not in first.draft.integrity.markers
     assert counters.get("assembly._units.child_table_full") == 1
 
 
@@ -956,7 +962,49 @@ def test_a_full_open_span_table_evicts_the_oldest_draft_and_emits_it():
     root.open_span(SpanIntent.EXECUTE_TOOL, subject="b")
 
     assert sink.drafts == [first]
-    assert Limitation.CHILD_SPAN_UNCLOSED in first.integrity.markers
+    assert Limitation.UNIT_TABLE_FULL in first.integrity.markers
+
+
+def test_the_breadth_evicted_span_reaches_the_wire_shape():
+    """The `UNIT_EVICTED` twin, for the member this bound now names.
+
+    Not just "a draft was handed over": `finish()` has to accept the marker,
+    or the eviction would be the same silent drop with extra steps — a new
+    member that is a Python enum entry but not legal vocabulary is exactly
+    what this catches.
+    """
+    sink = RecordingSink()
+    reg = registry(sink=sink, max_entries_per_unit=1)
+    root = open_session(reg)
+    open_subagent(reg, root, "a1")
+    open_subagent(reg, root, "a2")
+
+    span = sink.spans()[0]
+    assert Limitation.UNIT_TABLE_FULL in span.capture_integrity.limitations
+    assert span.capture_sources == (CaptureSource.ADAPTER,)
+
+
+def test_an_evicted_childs_descendants_keep_the_teardown_marker():
+    """Only the entry that HIT the bound reports the table-full fact.
+
+    A descendant closed by the same walk truly was closed by someone else's
+    teardown — `CHILD_SPAN_UNCLOSED`'s exact sentence — and stamping the knob's
+    name on it would claim a bound it never crossed. The split also keeps the
+    root-eviction symmetry: `UNIT_EVICTED` on the root, teardown marker below.
+    """
+    sink = RecordingSink()
+    reg = registry(sink=sink, max_entries_per_unit=1)
+    root = open_session(reg)
+    c1 = open_subagent(reg, root, "c1")
+    g1 = open_subagent(reg, c1, "g1")
+
+    open_subagent(reg, root, "c2")  # evicts c1's whole subtree
+
+    assert c1.is_live is False and g1.is_live is False
+    assert Limitation.UNIT_TABLE_FULL in c1.draft.integrity.markers
+    assert Limitation.CHILD_SPAN_UNCLOSED not in c1.draft.integrity.markers
+    assert Limitation.CHILD_SPAN_UNCLOSED in g1.draft.integrity.markers
+    assert Limitation.UNIT_TABLE_FULL not in g1.draft.integrity.markers
 
 
 def test_deeply_nested_units_stay_bounded():

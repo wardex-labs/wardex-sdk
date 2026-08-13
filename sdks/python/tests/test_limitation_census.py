@@ -247,6 +247,11 @@ _MEMBER_SITES: dict[str, frozenset[str]] = {
     "WS_NO_CLOSE": frozenset({"_interceptors/_seam.py"}),
     # --- unit / adapter lifecycle ---
     "CHILD_SPAN_UNCLOSED": frozenset({"_adapters/_assembler.py", "_assembly/_units.py"}),
+    # The registry's own breadth bound: `UnitRegistry.open` (child table) and
+    # `Unit.open_span` (open-draft table). The assembler's `_open_tool`
+    # eviction deliberately keeps CHILD_SPAN_UNCLOSED — different knob
+    # (max_session_entries) — see the member's docstring.
+    "UNIT_TABLE_FULL": frozenset({"_assembly/_units.py"}),
     # Two emitters, one per bound that can evict a session: the registry closes
     # the oldest ROOT unit at `max_units`, and the
     # assembler closes the oldest SESSION at `max_sessions`. Both EMIT the root
@@ -534,6 +539,11 @@ _EMITTED_MEMBERS: frozenset[str] = frozenset(
         # scan that makes it visible; before it, this member could have reached
         # a user's wire with nothing here recording that it existed.
         "OTLP_ATTRIBUTE_TRUNCATED",
+        # The eleventh: minted WITH its two emit sites (the registry's two
+        # `max_entries_per_unit` eviction points), which both carried
+        # CHILD_SPAN_UNCLOSED before — a marker swap, not a new capability, so
+        # the emitted set gains a name without any site gaining a marker.
+        "UNIT_TABLE_FULL",
     }
 )
 """Which MEMBERS have an emit site today, derived independently below.
@@ -1407,12 +1417,15 @@ _VOCABULARY: dict[str, str] = {
     "INSTRUMENTATION_DEGRADED": "instrumentation_degraded",
     # --- added after the census, by the OTLP size guard (1) ---
     "OTLP_ATTRIBUTE_TRUNCATED": "otlp_attribute_truncated",
+    # --- added after the census, by the registry breadth bound (1) ---
+    "UNIT_TABLE_FULL": "unit_table_full",
 }
 
 
-def test_the_vocabulary_is_exactly_these_thirty_nine() -> None:
+def test_the_vocabulary_is_exactly_these_forty() -> None:
     """15 declared before the census + 21 from it + 1 from §5.4 + 1 for wardex
-    itself + 1 for the OTLP size guard, name by name.
+    itself + 1 for the OTLP size guard + 1 for the registry breadth bound,
+    name by name.
 
     A count alone is not enough: a RENAME keeps the count and is the single most
     expensive mistake available here. These are proto enum values in

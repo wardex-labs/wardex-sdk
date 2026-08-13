@@ -162,6 +162,14 @@ enum Limitation {
   LIMITATION_UNIT_EVICTED = 6;
   LIMITATION_UNIT_INTERRUPTED = 7;
   LIMITATION_CHILD_SPAN_UNCLOSED = 8;
+  //    Not UNIT_EVICTED, by the census rule (see the caps band below): that
+  //    one names `max_units` / `max_sessions` — whole roots crossing the
+  //    unit-count cap — while this one names `max_entries_per_unit`, one
+  //    per-unit table force-closing its OLDEST entry to admit a new one. And
+  //    not CHILD_SPAN_UNCLOSED, which reports someone else's teardown and
+  //    names no knob at all: the reader's next action differs, which is the
+  //    test that keeps members apart.
+  LIMITATION_UNIT_TABLE_FULL = 40;
 
   // -- Instrumentation lifecycle.
   LIMITATION_ADAPTER_UNINSTALLED = 9;

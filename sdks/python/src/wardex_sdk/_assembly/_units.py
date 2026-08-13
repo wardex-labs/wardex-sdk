@@ -36,9 +36,9 @@ Whether an eviction is VISIBLE ON THE WIRE is decided by one thing: does the
 evicted entry own a span? Five tables are bounded — the root table, and per
 unit the children, the aliases, the claim keys and the open drafts — and three
 of them hold entries that do. Crossing those three CLOSES the oldest entry and
-emits it: `UNIT_EVICTED` on a root evicted by `max_units`,
-`CHILD_SPAN_UNCLOSED` on a child unit or an open draft force-closed by someone
-else's bookkeeping. The one
+emits it: `UNIT_EVICTED` on a root evicted by `max_units`, `UNIT_TABLE_FULL`
+on a child unit or an open draft force-closed by the per-unit breadth bound,
+`CHILD_SPAN_UNCLOSED` on what a teardown closes. The one
 exception is an open draft that had already LOST a `claim()` arbitration: it is
 discarded rather than emitted (`claim_superseded`), because the bound is a
 reason to stop tracking a draft and never a reason to promote one the
@@ -587,7 +587,7 @@ class Unit:
                         counters.bump("assembly._units.claim_superseded")
                     else:
                         pending.append(
-                            _force_close(evicted[1].draft, Limitation.CHILD_SPAN_UNCLOSED, now)
+                            _force_close(evicted[1].draft, Limitation.UNIT_TABLE_FULL, now)
                         )
                 # Keyed by the DRAFT, never by `key`. Two observers of one
                 # logical event open with the same `key` by design — that is
@@ -625,7 +625,8 @@ class Unit:
         by its unit's teardown, by `close_all`, by the open-table eviction, or by
         an earlier `close_span`. Saying so by name here rather than leaving it to
         `_flush`'s latch: "the handler returned after its session ended" is the
-        ordinary shape of that race (it is what `CHILD_SPAN_UNCLOSED` exists
+        ordinary shape of that race (it is what `CHILD_SPAN_UNCLOSED` — and
+        `UNIT_TABLE_FULL`, for the eviction — exists
         for), and a counter that names it separates it from a genuine double
         emit inside the registry.
         """
@@ -992,7 +993,11 @@ class UnitRegistry:
             if parent_unit is not None and parent_unit.is_live and parent_unit._registry is self:
                 evicted = parent_unit._evict_oldest(parent_unit._children, "child")
                 if evicted is not None:
-                    evicted[0].note(Limitation.CHILD_SPAN_UNCLOSED)
+                    # Only the entry that HIT the bound carries the table-full
+                    # fact; its descendants, closed by the same walk below, keep
+                    # CHILD_SPAN_UNCLOSED — they truly were closed by their
+                    # parent's teardown, which is that member's exact sentence.
+                    evicted[0].note(Limitation.UNIT_TABLE_FULL)
                     pending += self._close_locked(
                         evicted[0], status=StatusCode.UNSET, error_type=None, end_ns=now
                     )
@@ -1719,7 +1724,8 @@ class UnitRegistry:
         The latch is taken under the lock and the sink is called outside it
         (I11): the window is one attribute test-and-set, never the emit.
         FIRST WRITER WINS, which keeps the force-closed record — `UNSET` plus
-        `CHILD_SPAN_UNCLOSED`, the honest one — and makes the loss countable.
+        the force-close marker (`CHILD_SPAN_UNCLOSED`, or `UNIT_TABLE_FULL` for
+        a breadth eviction), the honest one — and makes the loss countable.
         """
         for draft in pending:
             with self._lock:

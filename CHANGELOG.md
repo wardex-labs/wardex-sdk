@@ -187,6 +187,18 @@ gone.
   nodes stay documented-not-instrumented — a cache hit never reaches a seam
   and the absence of a span for work that did not run is honest; the trade-off
   is now stated in the adapter's module docstring.
+- **The breadth bound has its own vocabulary word: `unit_table_full`.** When a
+  per-unit table crosses `max_entries_per_unit`, the oldest child unit or open
+  draft is force-closed and emitted carrying `Limitation.UNIT_TABLE_FULL`
+  (`LIMITATION_UNIT_TABLE_FULL = 40` on the wire) instead of
+  `CHILD_SPAN_UNCLOSED`. The two facts demanded different next actions from
+  one marker: `CHILD_SPAN_UNCLOSED` reports a teardown — go look at what
+  closed the session — while a breadth eviction is a capacity knob doing its
+  job — raise `max_entries_per_unit` or accept the bound. On the canonical
+  300-wide async Send fan-out, the 44 evicted workers now name the knob.
+  `CHILD_SPAN_UNCLOSED` keeps every teardown site, and descendants of an
+  evicted child keep it too: only the entry that hit the bound has the
+  table-full fact to report.
 - **An end-of-connection signal for pooled async TLS connections.** wardex now
   patches asyncio's `SSLProtocol.connection_lost` in addition to
   `socket.close`/`_real_close`, which is the only moment a pooled

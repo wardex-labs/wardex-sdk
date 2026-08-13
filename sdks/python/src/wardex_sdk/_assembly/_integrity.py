@@ -15,7 +15,13 @@ moment they are declared (``buf`` ``ENUM_VALUE_SAME_NAME``), so a late
 correction costs a second deliberate schema break. Emitters must never invent a
 marker string inline.
 
-**37 members = 15 originally declared + 21 from the census + 1 from §5.4.**
+**The census closed at 37 members = 15 originally declared + 21 from it + 1
+from §5.4.** Three more landed since, each by its own deliberate core PR:
+``INSTRUMENTATION_DEGRADED`` (38, wardex's own failure),
+``OTLP_ATTRIBUTE_TRUNCATED`` (39, the OTLP export size guard) and
+``UNIT_TABLE_FULL`` (40, the registry's breadth bound).
+``tests/test_limitation_census.py`` is the live count; this paragraph is its
+history, not its source.
 The census read every assignment and append site that reaches
 ``CaptureIntegrity.limitations`` and found 25 distinct strings (24 Python, 1
 Rust). Four of those merged away — see the ``NOTE (census)`` comments on
@@ -273,14 +279,15 @@ Two emit sites, and the first is the mechanism the second restates.
     instead of by its own completion event, so its ``end_time_ns`` is the
     teardown instant and its status is synthesized.
 
-    Six emit sites across two modules, all of them the same rule: a bound or a
+    Four emit sites across two modules, all of them the same rule: a bound or a
     teardown CLOSES what it stops tracking, it never drops it.
 
-    In ``_assembly/_units.py`` — ``Unit.open_span`` and ``UnitRegistry.open``,
-    when a per-unit table (open drafts, children) hits
-    ``max_entries_per_unit``; and ``UnitRegistry._close_locked``, for both the
-    surviving children and the still-open drafts of a unit being closed. The one
-    thing evicted WITHOUT this marker is an arbitration loser, which is discarded
+    In ``_assembly/_units.py`` — ``UnitRegistry._close_locked``, for both the
+    surviving children and the still-open drafts of a unit being closed; a
+    per-unit table crossing ``max_entries_per_unit`` used to land here too and
+    now carries ``UNIT_TABLE_FULL``, because a bound and a teardown demand
+    different next actions from the reader. The one
+    thing evicted WITHOUT a marker is an arbitration loser, which is discarded
     exactly as ``close_span`` would discard it: a bound is a reason to stop
     tracking a draft, never a reason to promote one ``claim()`` already rejected.
 
@@ -299,6 +306,41 @@ Two emit sites, and the first is the mechanism the second restates.
     vocabulary without an emitter meeting an emitter without vocabulary — and
     without the census it would have frozen into the wire as two names for one
     fact.
+    """
+
+    UNIT_TABLE_FULL = "unit_table_full"
+    """A per-unit table crossed ``max_entries_per_unit`` and its OLDEST entry
+    was force-closed and emitted to admit the new one.
+
+    Points at that one knob, and naming it is the whole reason this member
+    exists (§6.5.1: if the user's next action differs, they are separate
+    members). ``UNIT_EVICTED`` names ``max_units`` / ``max_sessions`` — whole
+    roots crossing the unit-count cap. ``CHILD_SPAN_UNCLOSED`` names no knob
+    at all: it says someone else's TEARDOWN closed the span. Before this
+    member the breadth bound borrowed ``CHILD_SPAN_UNCLOSED``, so the
+    canonical wide fan-out (300 simultaneously-live Send workers over a
+    256-entry table) put a teardown marker on 44 healthy spans and sent the
+    reader hunting for a close that never happened instead of to the knob
+    that did it.
+
+    Two emit sites, both in ``_assembly/_units.py`` and both the registry's
+    own breadth bound: ``UnitRegistry.open`` closes the oldest CHILD unit of
+    a full ``_children`` table, and ``Unit.open_span`` force-closes the
+    oldest OPEN DRAFT of a full ``_open`` table (except an arbitration loser,
+    which stays discarded — a bound is never a reason to promote a draft
+    ``claim()`` already rejected). Only the entry that HIT the bound carries
+    this marker: its descendants, closed by the same walk, keep
+    ``CHILD_SPAN_UNCLOSED``, because they were closed by their parent's
+    teardown — which is that member's exact sentence — and the table-full
+    fact is not theirs to report.
+
+    Deliberately NOT attached to ``SessionAssembler._open_tool``'s eviction,
+    which is the same shape driven by a DIFFERENT knob
+    (``max_session_entries``). Widening this member to a second knob later is
+    an append — a docstring and a census row — while pointing a dashboard at
+    the wrong knob is the ws_evicted mistake the census rule exists to
+    prevent, so the assembler keeps ``CHILD_SPAN_UNCLOSED`` until its site is
+    decided on its own evidence.
     """
 
     # ------------------------------------------------------------------

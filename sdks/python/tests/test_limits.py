@@ -718,8 +718,8 @@ def _probe_max_entries_per_unit() -> bool:
     """Over the per-unit cap, the oldest CHILD is force-closed and emitted.
 
     Same rule as above, one level down: the child that made room leaves a span
-    saying it was ended by its parent's bookkeeping rather than by its own
-    completion event.
+    naming the knob that ended it (`UNIT_TABLE_FULL`), not a teardown that
+    never happened.
     """
 
     def evicted(limits: LimitsConfig) -> list:
@@ -733,7 +733,7 @@ def _probe_max_entries_per_unit() -> bool:
     tight = evicted(LimitsConfig(max_entries_per_unit=1))
     return (
         len(tight) == 1
-        and Limitation.CHILD_SPAN_UNCLOSED in tight[0].integrity.markers
+        and Limitation.UNIT_TABLE_FULL in tight[0].integrity.markers
         and evicted(LimitsConfig()) == []
     )
 
