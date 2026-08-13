@@ -465,6 +465,123 @@ def test_a_link_to_a_selector_that_names_nothing_is_counted_not_faked():
     assert counters.get("adapters.lg.link_target_unresolved") == 1
 
 
+def test_a_link_to_a_closed_but_remembered_selector_is_built_from_memory():
+    """The same-process half of a resume: the predecessor FINISHED, its unit
+    closed and every live lookup for it is gone — and the link is still built,
+    from the registry's bounded closed-unit memory rather than from a unit
+    kept alive. A new trace linked to the old one's span, never a parent edge
+    across the two.
+    """
+    ctx, sink = context("lg")
+    key = UnitKey("lg.thread_id", "t-1")
+
+    with ctx.enter(UnitKind.SESSION, intent=SpanIntent.INVOKE_AGENT, placement=Placement.ROOT) as a:
+        _agent(a)
+        a.alias(key, remember=True)
+
+    with ctx.enter(UnitKind.SESSION, intent=SpanIntent.INVOKE_AGENT, placement=Placement.ROOT) as b:
+        _agent(b)
+        b.link(LinkReason.RESUMED_FROM, key)
+
+    first, second = _emitted(sink)
+    (link,) = second.links
+    assert link.trace_id == first.context.trace_id
+    assert link.span_id == first.context.span_id
+    assert link.reason is LinkReason.RESUMED_FROM
+    assert counters.get("adapters.lg.link_target_unresolved") == 0
+
+
+def test_an_opportunistic_link_miss_is_silent_but_a_claimed_one_counts():
+    """`expected=False` never dilutes the counted-not-faked default: the same
+    unknown selector is silent while the claim is conditional ("IF this ever
+    ran here, link it") and counted the moment it is stated as fact.
+    """
+    ctx, sink = context("lg")
+    unknown = UnitKey("lg.thread_id", "never-opened")
+
+    with ctx.enter(UnitKind.SESSION, intent=SpanIntent.INVOKE_AGENT, placement=Placement.ROOT) as s:
+        _agent(s)
+        s.link(LinkReason.RESUMED_FROM, unknown, expected=False)
+        assert counters.get("adapters.lg.link_target_unresolved") == 0
+        s.link(LinkReason.RESUMED_FROM, unknown)
+
+    assert _emitted(sink)[-1].links == ()
+    assert counters.get("adapters.lg.link_target_unresolved") == 1
+
+
+def test_a_scope_can_never_link_to_its_own_span():
+    """The guard that backs a resume site's link-before-alias ordering: even
+    when a selector resolves to the very unit asking — here the scope aliased
+    itself before linking — no self-edge ships, and the refused claim is
+    counted like any other expected miss.
+    """
+    ctx, sink = context("lg")
+    key = UnitKey("lg.thread_id", "t-1")
+
+    with ctx.enter(UnitKind.SESSION, intent=SpanIntent.INVOKE_AGENT, placement=Placement.ROOT) as s:
+        _agent(s)
+        s.alias(key, remember=True)
+        s.link(LinkReason.RESUMED_FROM, key)
+
+    assert _emitted(sink)[-1].links == ()
+    assert counters.get("adapters.lg.link_target_unresolved") == 1
+
+
+def test_run_token_is_stable_within_a_run_and_distinct_across_runs():
+    """The token exists to make alias VALUES run-scoped, so its whole contract
+    is here: same run, same string (a SESSION's own token equals its steps' —
+    the enclosing walk counts self); different run, different string; no run
+    above, None.
+    """
+    ctx, sink = context("lg")
+
+    with ctx.enter(
+        UnitKind.SESSION, intent=SpanIntent.INVOKE_AGENT, placement=Placement.ROOT
+    ) as run:
+        _agent(run)
+        own = run.run_token()
+        with ctx.enter(
+            UnitKind.STEP,
+            intent=SpanIntent.EXECUTE_STEP,
+            placement=Placement.NESTED,
+            describe=_step,
+        ) as s1:
+            first = s1.run_token()
+        with ctx.enter(
+            UnitKind.STEP,
+            intent=SpanIntent.EXECUTE_STEP,
+            placement=Placement.NESTED,
+            describe=_step,
+        ) as s2:
+            second = s2.run_token()
+
+    assert first is not None
+    assert first == second == own
+
+    with ctx.enter(
+        UnitKind.SESSION, intent=SpanIntent.INVOKE_AGENT, placement=Placement.ROOT
+    ) as other:
+        _agent(other)
+        with ctx.enter(
+            UnitKind.STEP,
+            intent=SpanIntent.EXECUTE_STEP,
+            placement=Placement.NESTED,
+            describe=_step,
+        ) as s3:
+            third = s3.run_token()
+
+    assert third is not None
+    assert third != first
+
+    with ctx.enter(
+        UnitKind.CALL,
+        intent=SpanIntent.EXECUTE_TOOL,
+        placement=Placement.NESTED,
+        describe=_tool,
+    ) as lone:
+        assert lone.run_token() is None
+
+
 def test_a_slot_survives_an_address_being_reused():
     """`id(obj)` keying hands a new object the dead one's bookkeeping, because
     CPython reuses addresses. Identity keying cannot.
@@ -727,6 +844,8 @@ def test_a_description_that_fails_never_ships_a_span_that_reads_healthy(when):
 _DEGRADED_VERB_ARGS = {
     "note": ((Limitation.PARENT_UNRESOLVED,), {}),
     "link": ((LinkReason.HANDOFF_FROM, UnitKey("k", "v")), {}),
+    "alias": ((UnitKey("k", "v"),), {"remember": True}),
+    "run_token": ((), {}),
     "claim": ((UnitKey("k", "v"),), {"observer": Observer.EXECUTOR}),
     "claim_run": ((UnitKey("k", "v"),), {"observer": Observer.EXECUTOR}),
     "outranked": ((UnitKey("k", "v"),), {"observer": Observer.EXECUTOR}),
