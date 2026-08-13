@@ -1436,13 +1436,18 @@ _VOCABULARY: dict[str, str] = {
     "OTLP_ATTRIBUTE_TRUNCATED": "otlp_attribute_truncated",
     # --- added after the census, by the registry breadth bound (1) ---
     "UNIT_TABLE_FULL": "unit_table_full",
+    # --- added after the census, by the Agent SDK OTel bridge (2): its two
+    #     fail-open outcomes, kept apart because the reader's next action
+    #     differs (nothing arrived vs data arrived and meant nothing) ---
+    "OTEL_BRIDGE_NO_DATA": "otel_bridge_no_data",
+    "OTEL_BRIDGE_SCHEMA_UNKNOWN": "otel_bridge_schema_unknown",
 }
 
 
-def test_the_vocabulary_is_exactly_these_forty() -> None:
+def test_the_vocabulary_is_exactly_these_forty_two() -> None:
     """15 declared before the census + 21 from it + 1 from §5.4 + 1 for wardex
-    itself + 1 for the OTLP size guard + 1 for the registry breadth bound,
-    name by name.
+    itself + 1 for the OTLP size guard + 1 for the registry breadth bound
+    + 2 for the OTel bridge's fail-open pair, name by name.
 
     A count alone is not enough: a RENAME keeps the count and is the single most
     expensive mistake available here. These are proto enum values in

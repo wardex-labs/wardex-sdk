@@ -1383,13 +1383,14 @@ fn vocabulary_tables(py: Python<'_>) -> PyResult<PyObject> {
     }
     out.set_item("SnapshotType", snaps)?;
 
-    // The two closed vocabularies that live on the wire, exposed the OTHER way
-    // round — number → name, walking the schema rather than a list written
+    // The three closed vocabularies that live on the wire, exposed the OTHER
+    // way round — number → name, walking the schema rather than a list written
     // here. A table keyed by hand would only prove that this file agrees with
     // itself; walking the numbers lets a Python test compare the SCHEMA against
-    // `assembly._integrity.Limitation` and `assembly._parentage.ParentSource`
-    // member for member, in both directions, which is what makes a missing
-    // member a CI failure instead of a silently unnameable span.
+    // `assembly._integrity.Limitation`, `assembly._parentage.ParentSource` and
+    // `_enums.CaptureSource` member for member, in both directions, which is
+    // what makes a missing member a CI failure instead of a silently
+    // unnameable span.
     let limits_tbl = PyDict::new_bound(py);
     for n in 1..=200 {
         let name = vocab::limitation_name(n);
@@ -1407,6 +1408,20 @@ fn vocabulary_tables(py: Python<'_>) -> PyResult<PyObject> {
         }
     }
     out.set_item("ParentSource", sources)?;
+
+    // `CaptureSource` had no parity table until the bridge added a member to
+    // it: `Span.capture_sources` was already on the wire, so a spelling drift
+    // between `_enums.CaptureSource` and `CAPTURE_SOURCE_*` would have
+    // flattened a real observation channel to UNSPECIFIED with nothing to
+    // notice. Same schema walk as the two above.
+    let capture_sources = PyDict::new_bound(py);
+    for n in 1..=200 {
+        let name = vocab::capture_source_name(n);
+        if !name.contains("unrecognized") {
+            capture_sources.set_item(name, n)?;
+        }
+    }
+    out.set_item("CaptureSource", capture_sources)?;
 
     // The meta value, kept OUT of the vocabulary table above on purpose — a
     // consumer iterating "the vocabulary" must not find it there — but exposed
