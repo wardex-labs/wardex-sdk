@@ -1062,6 +1062,7 @@ fn otlp_traces_to_dict(
         let resd = PyDict::new_bound(py);
         if let Some(r) = &rs.resource {
             resd.set_item("attributes", otlp_attrs_to_py(py, &r.attributes)?)?;
+            resd.set_item("dropped_attributes_count", r.dropped_attributes_count)?;
         }
         rsd.set_item("resource", resd)?;
         let ss_list = PyList::empty_bound(py);
@@ -1071,6 +1072,12 @@ fn otlp_traces_to_dict(
             if let Some(sc) = &ss.scope {
                 scoped.set_item("name", &sc.name)?;
                 scoped.set_item("version", &sc.version)?;
+                // Scope attributes were omitted while the only consumers were
+                // round-trip tests; the bridge ingests foreign telemetry, so a
+                // projection that silently discards fields would discard data
+                // wardex never produced and cannot re-derive.
+                scoped.set_item("attributes", otlp_attrs_to_py(py, &sc.attributes)?)?;
+                scoped.set_item("dropped_attributes_count", sc.dropped_attributes_count)?;
             }
             ssd.set_item("scope", scoped)?;
             let spans_list = PyList::empty_bound(py);
@@ -1080,9 +1087,16 @@ fn otlp_traces_to_dict(
                 spd.set_item("trace_id", to_hex(&sp.trace_id))?;
                 spd.set_item("span_id", to_hex(&sp.span_id))?;
                 spd.set_item("parent_span_id", to_hex(&sp.parent_span_id))?;
+                spd.set_item("trace_state", &sp.trace_state)?;
                 spd.set_item("kind", sp.kind)?;
                 spd.set_item("start_time_unix_nano", sp.start_time_unix_nano)?;
                 spd.set_item("end_time_unix_nano", sp.end_time_unix_nano)?;
+                // The dropped counts are a sender's own confession that its
+                // record is partial; dropping the confession in the projection
+                // would make a partial record look whole.
+                spd.set_item("dropped_attributes_count", sp.dropped_attributes_count)?;
+                spd.set_item("dropped_events_count", sp.dropped_events_count)?;
+                spd.set_item("dropped_links_count", sp.dropped_links_count)?;
                 let status = PyDict::new_bound(py);
                 if let Some(s) = &sp.status {
                     status.set_item("code", s.code)?;

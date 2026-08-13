@@ -57,6 +57,8 @@ class LimitsConfig:
     mcp_sniff_bytes: int | None = None
     max_buffer_spans: int | None = None
     max_buffer_bytes: int | None = None
+    max_otel_bridge_body_bytes: int | None = None
+    max_otel_bridge_spans_per_session: int | None = None
     max_otlp_attribute_bytes: int | None = None
     max_otlp_request_bytes: int | None = None
     max_link_targets: int | None = None

@@ -23,7 +23,9 @@ def test_limits_defaults_returns_every_field():
     assert d["max_otlp_attribute_bytes"] == 1024 * 1024
     assert d["max_otlp_request_bytes"] == 4 * 1024 * 1024
     assert d["max_link_targets"] == 256
-    assert len(d) == 21
+    assert d["max_otel_bridge_body_bytes"] == 4 * 1024 * 1024
+    assert d["max_otel_bridge_spans_per_session"] == 2048
+    assert len(d) == 23
 
 
 def test_limits_construction_defaults_unspecified_fields():
@@ -815,6 +817,89 @@ def _probe_mcp_sniff_bytes() -> bool:
     return detaches(16) and not detaches(core)
 
 
+def _bridge_receiver(limits: LimitsConfig):
+    """Built exactly the way the Agent SDK adapter builds it at install time."""
+    from wardex_sdk._adapters._otel_receiver import _OtelBridgeReceiver
+
+    resolved = limits.resolved()
+    return _OtelBridgeReceiver(
+        max_body_bytes=resolved["max_otel_bridge_body_bytes"],
+        max_spans_per_session=resolved["max_otel_bridge_spans_per_session"],
+        max_sessions=resolved["max_sessions"],
+    )
+
+
+def _bridge_post(receiver, body: bytes) -> int:
+    import http.client
+
+    conn = http.client.HTTPConnection("127.0.0.1", receiver.port, timeout=5)
+    try:
+        conn.request(
+            "POST",
+            "/v1/traces",
+            body=body,
+            headers={"x-wardex-bridge": receiver.token},
+        )
+        return conn.getresponse().status
+    finally:
+        conn.close()
+
+
+def _probe_max_otel_bridge_body_bytes() -> bool:
+    """The override must change which POST the receiver refuses whole."""
+    import _otlp_build
+
+    body = _otlp_build.request(
+        [_otlp_build.span(name="claude_code.hook", trace_id="ab" * 16, span_id="cd" * 8, end_ns=2)]
+    )
+    assert len(body) > 64
+
+    def status_under(limits: LimitsConfig) -> int:
+        receiver = _bridge_receiver(limits)
+        try:
+            return _bridge_post(receiver, body)
+        finally:
+            receiver.close()
+
+    return (
+        status_under(LimitsConfig(max_otel_bridge_body_bytes=64)) == 413
+        and status_under(LimitsConfig()) == 200
+    )
+
+
+def _probe_max_otel_bridge_spans_per_session() -> bool:
+    """The override must change how many spans one session's slot retains."""
+    import _otlp_build
+
+    trace = "ee" * 16
+    body = _otlp_build.request(
+        [
+            _otlp_build.span(
+                name="claude_code.hook",
+                trace_id=trace,
+                span_id=f"{i:016x}",
+                start_ns=1,
+                end_ns=2,
+            )
+            for i in range(5)
+        ]
+    )
+
+    def kept_and_dropped(limits: LimitsConfig) -> tuple[int, int]:
+        receiver = _bridge_receiver(limits)
+        try:
+            receiver.reserve(trace)
+            assert _bridge_post(receiver, body) == 200
+            slot = receiver.take(trace, None)
+            assert slot is not None
+            return len(slot.spans), slot.dropped
+        finally:
+            receiver.close()
+
+    tight = kept_and_dropped(LimitsConfig(max_otel_bridge_spans_per_session=3))
+    return tight == (3, 2) and kept_and_dropped(LimitsConfig()) == (5, 0)
+
+
 def _probe_max_buffer_spans() -> bool:
     return _dropped_under(LimitsConfig(max_buffer_spans=2)) > 0
 
@@ -965,6 +1050,8 @@ _PROBES = {
     "mcp_sniff_bytes": _probe_mcp_sniff_bytes,
     "max_buffer_spans": _probe_max_buffer_spans,
     "max_buffer_bytes": _probe_max_buffer_bytes,
+    "max_otel_bridge_body_bytes": _probe_max_otel_bridge_body_bytes,
+    "max_otel_bridge_spans_per_session": _probe_max_otel_bridge_spans_per_session,
     "max_otlp_attribute_bytes": _probe_max_otlp_attribute_bytes,
     "max_otlp_request_bytes": _probe_max_otlp_request_bytes,
 }

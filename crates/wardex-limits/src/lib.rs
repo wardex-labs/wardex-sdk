@@ -132,6 +132,28 @@ pub struct Limits {
     /// of the published configuration surface, and callers are told it is
     /// inert wherever the knob is documented rather than left to discover it.
     pub replay_buffer_size: usize,
+    /// Maximum size of ONE OTLP/HTTP POST body the Agent SDK's loopback
+    /// bridge receiver accepts, checked against both numbers a receiver has
+    /// to check: the declared wire body and what a gzip body decompresses to
+    /// (the decompression-bomb bound). Over either → the request is rejected
+    /// whole with 413 and counted; the CLI's exporter retries or drops on its
+    /// own schedule, and wardex's tree is unchanged either way.
+    ///
+    /// Mirrors `max_otlp_request_bytes` because it bounds the same wire
+    /// quantity from the receiving side: one OTLP/HTTP request. The spike's
+    /// real sessions produced ~KB bodies (12 spans across 2 batches), so the
+    /// default is three orders of magnitude of headroom, not a ceiling a
+    /// workload is expected to meet.
+    pub max_otel_bridge_body_bytes: usize,
+    /// Decoded CLI spans retained per session while they await the bridge's
+    /// finalize-time merge. Over → the NEWEST arrivals are dropped and
+    /// counted; the wardex spans they would have merged into ship unmerged,
+    /// honestly keeping `transport_timing_unavailable_subprocess`.
+    ///
+    /// Matches `max_buffer_spans`' order of magnitude. The spike measured ~6
+    /// CLI spans per turn, so the default covers a session of roughly 300
+    /// turns before the cap does anything at all.
+    pub max_otel_bridge_spans_per_session: usize,
 
     // --- Enforced by the codec ---
     /// Zstd compression level. Read by `encode_envelope`, which nothing in the
@@ -202,6 +224,8 @@ impl Default for Limits {
             max_buffer_spans: 2048,
             max_buffer_bytes: 64 * 1024 * 1024,
             replay_buffer_size: 100,
+            max_otel_bridge_body_bytes: 4 * 1024 * 1024,
+            max_otel_bridge_spans_per_session: 2048,
             zstd_level: 3,
             max_otlp_attribute_bytes: 1024 * 1024,
             max_otlp_request_bytes: 4 * 1024 * 1024,
@@ -234,6 +258,8 @@ mod tests {
         assert_eq!(l.max_buffer_spans, 2048);
         assert_eq!(l.max_buffer_bytes, 64 * 1024 * 1024);
         assert_eq!(l.replay_buffer_size, 100);
+        assert_eq!(l.max_otel_bridge_body_bytes, 4 * 1024 * 1024);
+        assert_eq!(l.max_otel_bridge_spans_per_session, 2048);
         assert_eq!(l.zstd_level, 3);
         assert_eq!(l.max_otlp_attribute_bytes, 1024 * 1024);
         assert_eq!(l.max_otlp_request_bytes, 4 * 1024 * 1024);
