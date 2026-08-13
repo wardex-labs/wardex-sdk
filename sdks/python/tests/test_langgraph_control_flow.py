@@ -161,7 +161,8 @@ def test_an_async_send_fanout_past_the_breadth_bound_evicts_the_oldest_children(
     The eviction is not a bug — it is the bound doing its job — but it must be
     VISIBLE, because the alternative is a run whose first 44 workers are simply
     absent with nothing to say so. This asserts the three things a reader has:
-    `CHILD_SPAN_UNCLOSED` on the evicted spans, which still ship, the
+    `UNIT_TABLE_FULL` on the evicted spans, which still ship — the marker that
+    names `max_entries_per_unit` rather than claiming a teardown — the
     `child_table_full` counter that makes the loss countable in aggregate, and
     WHICH spans were evicted — the oldest, as a prefix of start time. A count
     alone passes on an eviction policy that dropped 44 arbitrary children.
@@ -199,8 +200,11 @@ def test_an_async_send_fanout_past_the_breadth_bound_evicts_the_oldest_children(
         asyncio.run(drive(send_fanout(width, node=worker, name="WideAsync")))
         assert arrived == width, "the premise: every sibling was live simultaneously"
         assert len(steps(live.spans)) == width + 1, "every step still ships"
-        assert len(marked(live.spans, Limitation.CHILD_SPAN_UNCLOSED)) == width - bound == 44
+        assert len(marked(live.spans, Limitation.UNIT_TABLE_FULL)) == width - bound == 44
         assert assembly_counters()["assembly._units.child_table_full"] == 44
+        # The swap: a bound is not a teardown, so the teardown marker is gone
+        # from the healthy fan-out entirely.
+        assert marked(live.spans, Limitation.CHILD_SPAN_UNCLOSED) == []
 
         # WHICH 44. Sorted by start time, the marked ones are a prefix — the
         # table evicts its oldest entry, so the spans that lose their link are
@@ -209,7 +213,7 @@ def test_an_async_send_fanout_past_the_breadth_bound_evicts_the_oldest_children(
             (s for s in steps(live.spans) if s.name == "execute_step worker"),
             key=lambda s: s.start_time_ns,
         )
-        flags = [Limitation.CHILD_SPAN_UNCLOSED in markers_of(s) for s in workers]
+        flags = [Limitation.UNIT_TABLE_FULL in markers_of(s) for s in workers]
         assert flags == [True] * 44 + [False] * (width - 44), (
             "the evicted children must be the OLDEST, not 44 arbitrary ones"
         )
@@ -237,6 +241,7 @@ def test_the_same_width_run_synchronously_stays_clean():
     try:
         send_fanout(300, node=lambda s: {"trail": ["w"]}, name="WideSync").invoke({"trail": []})
         assert len(steps(live.spans)) == 301
+        assert marked(live.spans, Limitation.UNIT_TABLE_FULL) == []
         assert marked(live.spans, Limitation.CHILD_SPAN_UNCLOSED) == []
         assert "assembly._units.child_table_full" not in assembly_counters()
         # By id, so that "301 clean spans" cannot be satisfied by 301 spans that

@@ -686,7 +686,13 @@ class AdapterContext:
             owner=self.name,
         )
         if conflicted:
-            unit.note(Limitation.CORRELATION_CONFLICT)
+            # The WORD is the registry's to choose, exactly as it chooses it for
+            # the refusal `open()` performs itself: a strand left by the
+            # registry's own eviction reads as wardex's bound at work
+            # (`INSTRUMENTATION_DEGRADED`, repair: `max_units`), any other
+            # strand as a pin or lifetime bug (`CORRELATION_CONFLICT`).
+            # Spelling one member here would re-fuse what the registry split.
+            unit.note(self._units.refused_ambient_marker())
         return unit
 
     # -- containment -----------------------------------------------------

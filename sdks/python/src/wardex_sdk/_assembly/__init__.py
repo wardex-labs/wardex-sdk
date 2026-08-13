@@ -50,7 +50,8 @@ What lives here, and the duplication each module exists to remove:
   entry point for a caller that has an id to offer, which the Agent SDK adapter
   does not, since it carries the session in context and reaches the registry
   through `current()` / `sole_live()` / `Unit.child()` instead. And
-  `UNIT_EVICTED` / `CHILD_SPAN_UNCLOSED` are the emitters that put an evicted
+  `UNIT_EVICTED` / `UNIT_TABLE_FULL` / `CHILD_SPAN_UNCLOSED` are the emitters
+  that put an evicted
   entry's own span on the wire (I10) instead of dropping it unmarked. Only the
   three bounded tables whose entries OWN a span can be marked that way; evicting
   a lookup alias or a de-duplication key emits nothing, because there is no span

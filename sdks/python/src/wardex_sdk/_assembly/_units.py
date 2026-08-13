@@ -36,9 +36,9 @@ Whether an eviction is VISIBLE ON THE WIRE is decided by one thing: does the
 evicted entry own a span? Five tables are bounded — the root table, and per
 unit the children, the aliases, the claim keys and the open drafts — and three
 of them hold entries that do. Crossing those three CLOSES the oldest entry and
-emits it: `UNIT_EVICTED` on a root evicted by `max_units`,
-`CHILD_SPAN_UNCLOSED` on a child unit or an open draft force-closed by someone
-else's bookkeeping. The one
+emits it: `UNIT_EVICTED` on a root evicted by `max_units`, `UNIT_TABLE_FULL`
+on a child unit or an open draft force-closed by the per-unit breadth bound,
+`CHILD_SPAN_UNCLOSED` on what a teardown closes. The one
 exception is an open draft that had already LOST a `claim()` arbitration: it is
 discarded rather than emitted (`claim_superseded`), because the bound is a
 reason to stop tracking a draft and never a reason to promote one the
@@ -330,6 +330,7 @@ class Unit:
         "_children",
         "_claims",
         "_draft",
+        "_evicted",
         "_input",
         "_input_recorded",
         "_input_truncated",
@@ -378,6 +379,11 @@ class Unit:
         self.start_ns = start_ns
         self.parent = parent
         self._live = True
+        #: Set (under the lock, before the close) by the registry when a
+        #: CAPACITY BOUND — not a teardown — closes this unit. Read by
+        #: `refused_ambient_marker` to attribute a stranded fork to wardex's
+        #: own bound. A why-annotation, never a liveness tier.
+        self._evicted = False
         self._children: dict[Unit, None] = {}
         self._alias_keys: list[UnitKey] = []
         self._claims: dict[UnitKey, int] = {}
@@ -587,7 +593,7 @@ class Unit:
                         counters.bump("assembly._units.claim_superseded")
                     else:
                         pending.append(
-                            _force_close(evicted[1].draft, Limitation.CHILD_SPAN_UNCLOSED, now)
+                            _force_close(evicted[1].draft, Limitation.UNIT_TABLE_FULL, now)
                         )
                 # Keyed by the DRAFT, never by `key`. Two observers of one
                 # logical event open with the same `key` by design — that is
@@ -625,7 +631,8 @@ class Unit:
         by its unit's teardown, by `close_all`, by the open-table eviction, or by
         an earlier `close_span`. Saying so by name here rather than leaving it to
         `_flush`'s latch: "the handler returned after its session ended" is the
-        ordinary shape of that race (it is what `CHILD_SPAN_UNCLOSED` exists
+        ordinary shape of that race (it is what `CHILD_SPAN_UNCLOSED` — and
+        `UNIT_TABLE_FULL`, for the eviction — exists
         for), and a counter that names it separates it from a genuine double
         emit inside the registry.
         """
@@ -939,7 +946,9 @@ class UnitRegistry:
         finished unit's own context, so a unit opened from it would be a fresh
         subtree hanging off a dead session at confidence 1.0 with nothing on the
         wire to say so. The unit becomes a trace root instead and carries
-        `CORRELATION_CONFLICT`.
+        `CORRELATION_CONFLICT` — or `INSTRUMENTATION_DEGRADED` when the unit
+        died by the registry's OWN eviction (`refused_ambient_marker`): the two
+        strands have different repairs.
         """
         now = start_ns if start_ns is not None else time.time_ns()
         if parent_unit is not None:
@@ -951,7 +960,7 @@ class UnitRegistry:
         elif self._poisoned(ambient):
             self._note_refused_ambient()
             parentage = resolve_parentage(EMPTY_AMBIENT, evidence).with_limitation(
-                Limitation.CORRELATION_CONFLICT
+                self.refused_ambient_marker()
             )
             conversation = parentage.conversation
             tracestate = parentage.tracestate
@@ -992,7 +1001,16 @@ class UnitRegistry:
             if parent_unit is not None and parent_unit.is_live and parent_unit._registry is self:
                 evicted = parent_unit._evict_oldest(parent_unit._children, "child")
                 if evicted is not None:
-                    evicted[0].note(Limitation.CHILD_SPAN_UNCLOSED)
+                    # Only the entry that HIT the bound carries the table-full
+                    # fact; its descendants, closed by the same walk below, keep
+                    # CHILD_SPAN_UNCLOSED — they truly were closed by their
+                    # parent's teardown, which is that member's exact sentence.
+                    # The breadcrumb is written BEFORE the close, which is what
+                    # makes `refused_ambient_marker`'s lock-free read safe: a
+                    # fork that reads its unit as dead already reads it as
+                    # evicted when it was.
+                    evicted[0]._evicted = True
+                    evicted[0].note(Limitation.UNIT_TABLE_FULL)
                     pending += self._close_locked(
                         evicted[0], status=StatusCode.UNSET, error_type=None, end_ns=now
                     )
@@ -1135,8 +1153,9 @@ class UnitRegistry:
         This predicate is what lets `open()` and `resolve()` refuse that scope
         and SAY SO on the span whose parent edge it would have decided — design
         §5.6 asks for a hard `CORRELATION_CONFLICT` rather than an internal
-        count, because the consequence is a tree shape and a tree shape has to
-        be falsifiable from the data.
+        count (or `INSTRUMENTATION_DEGRADED` when the strand is wardex's own
+        eviction — `refused_ambient_marker`), because the consequence is a tree
+        shape and a tree shape has to be falsifiable from the data.
 
         LIVENESS, not §5.6's literal "any read from a different task id". Every
         hook callback and every in-process tool handler runs on a descendant
@@ -1144,12 +1163,13 @@ class UnitRegistry:
         would stamp `CORRELATION_CONFLICT` on the product's own exhibit A.
 
         The NAME is the question the predicate answers: a CLOSED unit of THIS
-        registry left its span context in this scope — whether a pin or an
-        `activate()` leftover stranded it. The counters underneath keep the
-        pin/activation split (`stale_pin_ambient` / `stale_activation_ambient`,
-        via `_note_refused_ambient`) because they name the REPAIR — which task
-        was pinned vs the adapter's lifetime — not the predicate. The
-        implementation is `_closed_ambient_context`.
+        registry left its span context in this scope — whether a pin, an
+        `activate()` leftover or the registry's own eviction stranded it. The
+        counters underneath keep the three-way split (`stale_pin_ambient` /
+        `stale_activation_ambient` / `stale_ambient_evicted`, via
+        `_note_refused_ambient`) because they name the REPAIR — which task
+        was pinned vs the adapter's lifetime vs `max_units` — not the
+        predicate. The implementation is `_closed_ambient_context`.
         """
         return self._closed_ambient_context() is not None
 
@@ -1188,23 +1208,63 @@ class UnitRegistry:
     def _note_refused_ambient(self) -> None:
         """Count a refused leftover, naming which primitive stranded it.
 
-        Two names for one refusal, because they are two bugs with two repairs —
-        the same axis, and the same split, `current()` already makes between
+        Three names for one refusal, because they are three repairs — the same
+        axis, and the same split, `current()` already makes between
         `pin_stale`/`pin_leaked` and `ambient_stale`. `stale_pin_ambient` says a
         RESTRICTED pin outlived its unit: `pin_driver`'s contract was broken and
         the fix is in which task the adapter pinned. `stale_activation_ambient`
         says an `activate()` scope could not be unwound where it was installed —
         a generator finalized on a foreign carrier, a `close_units()` that ran
         inside one — and the fix is in the adapter's LIFETIME, not its pinning.
-        One number covering both leaves an operator with two hypotheses and no
-        way to separate them.
+        `stale_ambient_evicted` says the registry's own bound stranded the
+        scope — nothing the adapter did was wrong, and the repair, if any, is
+        `max_units`. An evicted PIN lands there too: the pin's contract was not
+        broken, the table was full. One number covering all three leaves an
+        operator with three hypotheses and no way to separate them.
         """
         entry = _ambient_unit.get()
-        counters.bump(
-            "assembly._units.stale_pin_ambient"
-            if entry is not None and entry.pinned
-            else "assembly._units.stale_activation_ambient"
-        )
+        if entry is not None and entry.unit._evicted:
+            counters.bump("assembly._units.stale_ambient_evicted")
+        elif entry is not None and entry.pinned:
+            counters.bump("assembly._units.stale_pin_ambient")
+        else:
+            counters.bump("assembly._units.stale_activation_ambient")
+
+    def refused_ambient_marker(self) -> Limitation:
+        """The word the refusal carries: whose fault is the stranded scope?
+
+        Not a third liveness state — `_poisoned` and every resolution tier are
+        unchanged; this chooses only the MARKER after the refusal is already
+        decided. A fork stranded because the registry itself EVICTED its unit
+        (`Unit._evicted`) reads as wardex's own bound at work, so the refused
+        span carries `INSTRUMENTATION_DEGRADED`: the repair is `max_units`, not
+        the adapter's pin or lifetime discipline — `resolve_observed` already
+        says exactly this for a byte-seam span whose latched parent wardex
+        discarded to stay inside a bound (the h2 stream latch). Every other
+        strand keeps `CORRELATION_CONFLICT`: two answers to one parent
+        question, the disagreement on the wire.
+
+        PUBLIC because the registry is not the only caller with a refusal to
+        word: `AdapterContext._open`'s declared fallback takes a parent unit,
+        which is exactly what stops `open()` from seeing the poisoned ambient
+        for itself, so the adapter surface asks here rather than spelling a
+        marker it cannot choose correctly.
+
+        Read without the lock, like `_closed_ambient_context`: `_evicted` is
+        written under the lock BEFORE the unit is detached, so a fork that
+        reads as dead already reads as evicted when it was.
+        """
+        # Statement form, not a ternary: the census scanner reads the value of
+        # every assignment to a marker-ish name, and a single expression would
+        # put the CONDITION in the slot too — each branch here holds exactly
+        # the member it decides, which is what keeps this helper a recorded
+        # decision rather than a hiding place.
+        entry = _ambient_unit.get()
+        if entry is not None and entry.unit._evicted:
+            marker = Limitation.INSTRUMENTATION_DEGRADED
+        else:
+            marker = Limitation.CORRELATION_CONFLICT
+        return marker
 
     def _poisoned(self, amb: Ambient) -> bool:
         """Is `amb` the leftover fork of a unit of THIS registry that has died?
@@ -1300,12 +1360,13 @@ class UnitRegistry:
         tiers (alias -> sole_live -> UNRESOLVED) and carries
         `CORRELATION_CONFLICT`, which is the same mechanism this method already
         uses for a cross-trace disagreement: a wrong tree is invisible, a marked
-        conflict is a shippable bug report.
+        conflict is a shippable bug report. (An evict-origin strand carries
+        `INSTRUMENTATION_DEGRADED` instead — see `refused_ambient_marker`.)
         """
         amb = ambient if ambient is not None else latch_ambient()
         if self._poisoned(amb):
             self._note_refused_ambient()
-            return self._edge(alias, EMPTY_AMBIENT).with_limitation(Limitation.CORRELATION_CONFLICT)
+            return self._edge(alias, EMPTY_AMBIENT).with_limitation(self.refused_ambient_marker())
         return self._edge(alias, amb)
 
     def _edge(self, alias: UnitKey | None, amb: Ambient) -> Parentage:
@@ -1543,7 +1604,11 @@ class UnitRegistry:
         its root span outright — no marker, no test — so a user whose workload
         crossed the cap saw traces simply stop appearing (I10).
         """
+        # Breadcrumb BEFORE the close (write-before-close is what makes the
+        # lock-free read in `refused_ambient_marker` safe: any fork that reads
+        # this unit as dead already reads it as evicted when it was).
         oldest = next(iter(self._roots))
+        oldest._evicted = True
         oldest.note(Limitation.UNIT_EVICTED)
         return self._close_locked(oldest, status=StatusCode.UNSET, error_type=None, end_ns=end_ns)
 
@@ -1719,7 +1784,8 @@ class UnitRegistry:
         The latch is taken under the lock and the sink is called outside it
         (I11): the window is one attribute test-and-set, never the emit.
         FIRST WRITER WINS, which keeps the force-closed record — `UNSET` plus
-        `CHILD_SPAN_UNCLOSED`, the honest one — and makes the loss countable.
+        the force-close marker (`CHILD_SPAN_UNCLOSED`, or `UNIT_TABLE_FULL` for
+        a breadth eviction), the honest one — and makes the loss countable.
         """
         for draft in pending:
             with self._lock:

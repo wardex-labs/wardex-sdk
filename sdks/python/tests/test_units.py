@@ -912,6 +912,9 @@ def test_eviction_over_max_units_closes_the_whole_oldest_subtree():
     assert second.is_live is True
     assert sink.drafts == [sub.draft, first.draft]
     assert Limitation.UNIT_EVICTED in first.draft.integrity.markers
+    # Descendants keep the teardown marker; only a bound-hit entry carries the
+    # table-full fact — the root crossed `max_units`, not the breadth knob, so
+    # nothing here says UNIT_TABLE_FULL.
     assert Limitation.CHILD_SPAN_UNCLOSED in sub.draft.integrity.markers
     assert reg.find(UnitKey("test.session", "first")) is None
 
@@ -942,7 +945,10 @@ def test_a_full_child_table_evicts_the_oldest_child_and_emits_it():
 
     assert first.is_live is False
     assert sink.drafts == [first.draft]
-    assert Limitation.CHILD_SPAN_UNCLOSED in first.draft.integrity.markers
+    # A swap, not an augment: the marker names the knob (`max_entries_per_unit`)
+    # rather than claiming a teardown that never happened.
+    assert Limitation.UNIT_TABLE_FULL in first.draft.integrity.markers
+    assert Limitation.CHILD_SPAN_UNCLOSED not in first.draft.integrity.markers
     assert counters.get("assembly._units.child_table_full") == 1
 
 
@@ -956,7 +962,49 @@ def test_a_full_open_span_table_evicts_the_oldest_draft_and_emits_it():
     root.open_span(SpanIntent.EXECUTE_TOOL, subject="b")
 
     assert sink.drafts == [first]
-    assert Limitation.CHILD_SPAN_UNCLOSED in first.integrity.markers
+    assert Limitation.UNIT_TABLE_FULL in first.integrity.markers
+
+
+def test_the_breadth_evicted_span_reaches_the_wire_shape():
+    """The `UNIT_EVICTED` twin, for the member this bound now names.
+
+    Not just "a draft was handed over": `finish()` has to accept the marker,
+    or the eviction would be the same silent drop with extra steps — a new
+    member that is a Python enum entry but not legal vocabulary is exactly
+    what this catches.
+    """
+    sink = RecordingSink()
+    reg = registry(sink=sink, max_entries_per_unit=1)
+    root = open_session(reg)
+    open_subagent(reg, root, "a1")
+    open_subagent(reg, root, "a2")
+
+    span = sink.spans()[0]
+    assert Limitation.UNIT_TABLE_FULL in span.capture_integrity.limitations
+    assert span.capture_sources == (CaptureSource.ADAPTER,)
+
+
+def test_an_evicted_childs_descendants_keep_the_teardown_marker():
+    """Only the entry that HIT the bound reports the table-full fact.
+
+    A descendant closed by the same walk truly was closed by someone else's
+    teardown — `CHILD_SPAN_UNCLOSED`'s exact sentence — and stamping the knob's
+    name on it would claim a bound it never crossed. The split also keeps the
+    root-eviction symmetry: `UNIT_EVICTED` on the root, teardown marker below.
+    """
+    sink = RecordingSink()
+    reg = registry(sink=sink, max_entries_per_unit=1)
+    root = open_session(reg)
+    c1 = open_subagent(reg, root, "c1")
+    g1 = open_subagent(reg, c1, "g1")
+
+    open_subagent(reg, root, "c2")  # evicts c1's whole subtree
+
+    assert c1.is_live is False and g1.is_live is False
+    assert Limitation.UNIT_TABLE_FULL in c1.draft.integrity.markers
+    assert Limitation.CHILD_SPAN_UNCLOSED not in c1.draft.integrity.markers
+    assert Limitation.CHILD_SPAN_UNCLOSED in g1.draft.integrity.markers
+    assert Limitation.UNIT_TABLE_FULL not in g1.draft.integrity.markers
 
 
 def test_deeply_nested_units_stay_bounded():
@@ -1821,17 +1869,15 @@ def test_an_eviction_that_strands_its_own_activation_orphans_what_follows():
     """A DELIBERATE consequence of the widening, pinned so it cannot go silent.
 
     A root evicted by table pressure while its `activate()` is still entered is
-    closed and its span IS emitted (with `UNIT_EVICTED`) — so before §10.3 a
-    unit opened underneath was a correct child of a real span. It is now a
-    marked orphan instead.
-
-    The widening cannot distinguish the two: "the unit whose fork is in front of
-    me is over" is the whole predicate, and eviction is one of the ways a unit
-    gets over. Refusing is also the answer §10.3 asks for in the same words
-    ("an ambient span context whose unit THIS registry has CLOSED"), and the
-    evicted unit was ALREADY refused here when it happened to be pinned. The
-    cost is one `CORRELATION_CONFLICT` on a shape that is itself a bound being
-    exceeded; the alternative is a third liveness state read by one branch.
+    closed and emitted (with `UNIT_EVICTED`) — the fork stands, and what
+    follows is refused and becomes a marked orphan. NOT a third liveness
+    state: the refusal is the one every stranded fork gets. What the
+    breadcrumb (`Unit._evicted`) changes is the WORD: this strand is wardex's
+    own bound at work, so the orphan carries `INSTRUMENTATION_DEGRADED` — the
+    repair is `max_units` — where a pin or lifetime bug carries
+    `CORRELATION_CONFLICT` and sends the reader to the adapter. One marker for
+    both was this test's previous pin, and it filed a capacity decision under
+    adapter discipline.
     """
     reg = registry(max_units=1)
     evicted = open_session(reg, "A")
@@ -1845,7 +1891,81 @@ def test_an_eviction_that_strands_its_own_activation_orphans_what_follows():
     after = open_session(reg, "C", ambient=latch_ambient())
 
     assert after.parentage.parent_span_id != evicted.context.span_id
+    assert Limitation.INSTRUMENTATION_DEGRADED in after.draft.integrity.markers
+    assert Limitation.CORRELATION_CONFLICT not in after.draft.integrity.markers
+    assert counters.get("assembly._units.stale_ambient_evicted") == 1
+    assert counters.get("assembly._units.stale_activation_ambient") == 0
+
+
+def test_resolve_after_an_eviction_strand_reports_wardex_fault():
+    """Pins that BOTH refusal sites route through `refused_ambient_marker`.
+
+    `open()` is covered above; a `resolve()` over the same stranded fork must
+    say the same word, or the attribution would depend on which entry point
+    the adapter happened to use.
+    """
+    reg = registry(max_units=1)
+    evicted = open_session(reg, "A")
+    fork = evicted.activate()
+    fork.__enter__()
+    open_session(reg, "B")
+
+    assert evicted.is_live is False
+    assert latch_ambient().span_context == evicted.context
+
+    p = reg.resolve(None)
+
+    # The edge is rebuilt from the remaining tiers — here the sole-live
+    # session B — never from the corpse in the scope.
+    assert p.parent_span_id != evicted.context.span_id
+    assert Limitation.INSTRUMENTATION_DEGRADED in p.limitations
+    assert Limitation.CORRELATION_CONFLICT not in p.limitations
+    assert counters.get("assembly._units.stale_ambient_evicted") == 1
+
+
+def test_an_ordinary_close_leftover_still_reads_as_a_conflict():
+    """The negative control: the breadcrumb never fires on a teardown.
+
+    An `activate()` scope stranded by an ordinary `close()` keeps
+    `CORRELATION_CONFLICT` and the lifetime counter — the swap cannot dilute
+    that member's meaning, or every stranded fork would read as wardex's
+    fault and the adapter bug it points at would go unhunted.
+    """
+    reg = registry()
+    unit = open_session(reg, "A")
+    _fork = _stranded(reg, unit)
+
+    after = open_session(reg, "B", ambient=latch_ambient())
+
     assert Limitation.CORRELATION_CONFLICT in after.draft.integrity.markers
+    assert Limitation.INSTRUMENTATION_DEGRADED not in after.draft.integrity.markers
+    assert counters.get("assembly._units.stale_activation_ambient") == 1
+    assert counters.get("assembly._units.stale_ambient_evicted") == 0
+
+
+def test_a_child_eviction_that_strands_its_fork_is_wardex_fault_too():
+    """The breadcrumb covers BOTH capacity-bound close paths.
+
+    A CHILD unit evicted by the breadth bound (`max_entries_per_unit`) while
+    its `activate()` is entered strands exactly the same corpse as a root
+    evicted by `max_units` — without the second write site, this strand would
+    keep the misattributed `CORRELATION_CONFLICT` the swap exists to remove.
+    """
+    reg = registry(max_entries_per_unit=1)
+    root = open_session(reg)
+    c1 = open_subagent(reg, root, "c1")
+    fork = c1.activate()
+    fork.__enter__()
+    open_subagent(reg, root, "c2")  # evicts c1 through the child-table bound
+
+    assert c1.is_live is False
+    assert latch_ambient().span_context == c1.context
+
+    after = open_session(reg, "after", ambient=latch_ambient())
+
+    assert Limitation.INSTRUMENTATION_DEGRADED in after.draft.integrity.markers
+    assert Limitation.CORRELATION_CONFLICT not in after.draft.integrity.markers
+    assert counters.get("assembly._units.stale_ambient_evicted") == 1
 
 
 # ==========================================================================
