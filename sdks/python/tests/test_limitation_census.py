@@ -259,6 +259,15 @@ _MEMBER_SITES: dict[str, frozenset[str]] = {
     # its root with no marker and no test, which is the silent drop I10 forbids.
     "UNIT_EVICTED": frozenset({"_adapters/_assembler.py", "_assembly/_units.py"}),
     "SESSION_ABORTED": frozenset({"_adapters/_assembler.py"}),
+    # The OTel bridge's two fail-open verdicts, both attached to the session
+    # ROOT at finalize by `_merge_bridge`: NO_DATA when the read-back-confirmed
+    # injection produced zero spans, SCHEMA_UNKNOWN when data arrived and
+    # classified as nothing (or an undecodable POST was attributed to the sole
+    # live bridge session). One emitting file, by design — the receiver and
+    # the classifier report through counters and hand the marker decision to
+    # the one place that holds the root draft.
+    "OTEL_BRIDGE_NO_DATA": frozenset({"_adapters/_assembler.py"}),
+    "OTEL_BRIDGE_SCHEMA_UNKNOWN": frozenset({"_adapters/_assembler.py"}),
     # The two shutdown markers, and the split between them is which shutdown
     # actually happened rather than which code path ran. The adapter's
     # `uninstall()` names ADAPTER_UNINSTALLED, and it is what an ordinary exit
@@ -550,6 +559,12 @@ _EMITTED_MEMBERS: frozenset[str] = frozenset(
         # CHILD_SPAN_UNCLOSED before — a marker swap, not a new capability, so
         # the emitted set gains a name without any site gaining a marker.
         "UNIT_TABLE_FULL",
+        # The twelfth and thirteenth: the OTel bridge's fail-open pair, minted
+        # WITH their emitter (`_merge_bridge`, the finalize-time merge) in the
+        # same PR — the census rule that a new limitation cannot land as
+        # vocabulary-without-an-emitter, applied at authoring time.
+        "OTEL_BRIDGE_NO_DATA",
+        "OTEL_BRIDGE_SCHEMA_UNKNOWN",
     }
 )
 """Which MEMBERS have an emit site today, derived independently below.
@@ -1041,6 +1056,12 @@ _UNRESOLVED_PY: frozenset[tuple[str, str]] = frozenset(
         # conservative direction: a spurious hole is noise, a missing one is a
         # marker nothing in this file can see.
         ("_adapters/_assembler.py", "Tuple"),
+        # `_PendingSpan.deferred_markers: tuple[Limitation, ...] = ()` — the
+        # same shape as the `_emit_tool` default above, one file over: the
+        # dataclass field's empty-tuple default. The members that actually
+        # flow into the field are spelled at the pend sites in
+        # `_adapters/_assembler.py`, where `_MEMBER_SITES` records them.
+        ("_adapters/_session_state.py", "Tuple"),
         # every one below is a marker CONTAINER being passed along, or a
         # marker-typed PARAMETER being forwarded, not a marker.
         # `Name:inherited` is `SpanDraft.__init__` copying the `Limitation`
@@ -1436,13 +1457,18 @@ _VOCABULARY: dict[str, str] = {
     "OTLP_ATTRIBUTE_TRUNCATED": "otlp_attribute_truncated",
     # --- added after the census, by the registry breadth bound (1) ---
     "UNIT_TABLE_FULL": "unit_table_full",
+    # --- added after the census, by the Agent SDK OTel bridge (2): its two
+    #     fail-open outcomes, kept apart because the reader's next action
+    #     differs (nothing arrived vs data arrived and meant nothing) ---
+    "OTEL_BRIDGE_NO_DATA": "otel_bridge_no_data",
+    "OTEL_BRIDGE_SCHEMA_UNKNOWN": "otel_bridge_schema_unknown",
 }
 
 
-def test_the_vocabulary_is_exactly_these_forty() -> None:
+def test_the_vocabulary_is_exactly_these_forty_two() -> None:
     """15 declared before the census + 21 from it + 1 from §5.4 + 1 for wardex
-    itself + 1 for the OTLP size guard + 1 for the registry breadth bound,
-    name by name.
+    itself + 1 for the OTLP size guard + 1 for the registry breadth bound
+    + 2 for the OTel bridge's fail-open pair, name by name.
 
     A count alone is not enough: a RENAME keeps the count and is the single most
     expensive mistake available here. These are proto enum values in

@@ -468,6 +468,18 @@ class SpanDraft:
         """
         self._end_ns = end_ns
 
+    def set_start_ns(self, start_ns: int) -> None:
+        """Replace the start instant on a TWO-PHASE span — `set_end_ns`'s mirror.
+
+        For the one caller shaped like this: the OTel bridge holds an
+        assembler-built draft PENDING at session close and replaces its
+        IPC-approximated start with the instant the CLI measured inside its own
+        process. A CORRECTION, never the first value — construction still
+        requires `start_ns`, so a draft cannot exist without one — and
+        `finish()`'s precedence rules are untouched.
+        """
+        self._start_ns = start_ns
+
     def set_status(self, code: StatusCode, message: str = "") -> None:
         self._status = code
         self._status_message = message
@@ -838,6 +850,7 @@ class _NullDraft:
     def set_server(self, address: str | None, port: int | None) -> None: ...
     def set_io(self, **kw: Any) -> None: ...
     def set_end_ns(self, end_ns: int) -> None: ...
+    def set_start_ns(self, start_ns: int) -> None: ...
     def set_status(self, code: StatusCode, message: str = "") -> None: ...
     def set_error(self, error_type: str | None, message: str = "") -> None: ...
     def set_operation_label(self, operation: Any) -> None: ...

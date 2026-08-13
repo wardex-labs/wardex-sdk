@@ -205,6 +205,45 @@ gone.
   node (its cache hit never crosses the node seam) reports the lost link in
   `adapters.langgraph.link_target_unresolved` — that count is the link that
   genuinely cannot be encoded, not a regression.
+- **The Anthropic Agent SDK OTel bridge** — `AnthropicAgentSdkConfig`'s
+  `otel_bridge`/`otel_bridge_drain` now gate a real consumer, which is the
+  promise their docstring shipped with ("the release that ships these fields
+  must contain it") being kept. With `otel_bridge=True` the adapter points
+  the Claude CLI's own OpenTelemetry exporter at an in-process loopback
+  receiver (127.0.0.1, ephemeral port, secret token, hard body and span caps)
+  and merges what arrives into the session tree at close. Merged LLM turns
+  take the CLI's own request interval and time-to-first-token and **lose the
+  `transport_timing_unavailable_subprocess` marker** — the CLI measured that
+  timing inside its own process, so the limitation is genuinely gone; merged
+  tool spans keep their IPC times and marker and gain the CLI-measured
+  duration as `wardex.anthropic_agent_sdk.otel.tool_duration_ms`. CLI work
+  wardex could never see before — hooks, MCP RPCs, bash subprocesses, context
+  compaction — appears as `execute_step` spans with CLI-measured times,
+  sourced `otel_bridge`. Merged spans carry
+  `capture_sources=(adapter, otel_bridge)`; identity PII the CLI stamps on
+  every span (`user.*`, `organization.*`) is scrubbed at the receiver
+  boundary and the merge admits a NAMED attribute allowlist, never a prefix;
+  the CLI's `user_prompt` attribute is dropped (the byte-exact stream keeps
+  content authority). An ambiguous join never guesses a parent: the CLI span
+  ships as a sibling step span carrying `correlation_conflict`. Off — the
+  default — reproduces today's tree byte-for-byte; on-and-failed adds exactly
+  one root marker: `otel_bridge_no_data` (41) when a confirmed injection
+  produced nothing, `otel_bridge_schema_unknown` (42) when telemetry arrived
+  and classified as nothing (the CLI schema is beta). The wire vocabulary
+  grows accordingly: `CaptureSource` gains `otel_bridge` (8) — and its first
+  Python↔proto parity guard — and the limits table gains
+  `max_otel_bridge_body_bytes` / `max_otel_bridge_spans_per_session`. The
+  bridge NEVER hijacks: any user `OTEL_*`/`CLAUDE_CODE_ENABLE_TELEMETRY` key
+  disables injection for that session with one warning, and the drain runs
+  only inside the transport's own async close, only for sessions the bridge
+  actually fed — never on the atexit/signal/uninstall paths.
+- **`TRACEPARENT` alignment for user-run CLI telemetry.** When the user
+  already runs the Claude CLI's telemetry themselves and
+  `propagation.enabled=True`, the adapter injects the ambient wardex
+  `TRACEPARENT` (and `TRACESTATE` when present) into the subprocess env — and
+  nothing else — so the CLI's spans join the host's trace in the *user's*
+  backend instead of forming a second, disconnected trace. No ambient
+  context, or a `TRACEPARENT` the user set themselves, means no injection.
 - **`RemoteGraph` (LangGraph Platform) runs are now visible.** A standalone
   `RemoteGraph.invoke`/`stream`/`ainvoke`/`astream` call used to cross zero
   patched seams and ship nothing; it now ships one `invoke_workflow` span

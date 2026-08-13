@@ -16,10 +16,13 @@ correction costs a second deliberate schema break. Emitters must never invent a
 marker string inline.
 
 **The census closed at 37 members = 15 originally declared + 21 from it + 1
-from §5.4.** Three more landed since, each by its own deliberate core PR:
+from §5.4.** Five more landed since, each by its own deliberate core PR:
 ``INSTRUMENTATION_DEGRADED`` (38, wardex's own failure),
-``OTLP_ATTRIBUTE_TRUNCATED`` (39, the OTLP export size guard) and
-``UNIT_TABLE_FULL`` (40, the registry's breadth bound).
+``OTLP_ATTRIBUTE_TRUNCATED`` (39, the OTLP export size guard),
+``UNIT_TABLE_FULL`` (40, the registry's breadth bound), and the Agent SDK
+OTel bridge's fail-open pair ``OTEL_BRIDGE_NO_DATA`` (41, confirmed injection
+and nothing arrived) / ``OTEL_BRIDGE_SCHEMA_UNKNOWN`` (42, data arrived and
+classified as nothing).
 ``tests/test_limitation_census.py`` is the live count; this paragraph is its
 history, not its source.
 The census read every assignment and append site that reaches
@@ -804,6 +807,50 @@ Two emit sites, and the first is the mechanism the second restates.
     Emitted from ``_adapters/_assembler.py::SessionAssembler._stamp_root``, on
     all three of its terminal branches (result present but errored, no result
     and an error, no result and no error).
+    """
+
+    # ------------------------------------------------------------------
+    # Agent SDK OTel bridge, fail-open
+    # ------------------------------------------------------------------
+
+    OTEL_BRIDGE_NO_DATA = "otel_bridge_no_data"
+    """The bridge injected telemetry env into this session's CLI — the
+    subprocess-env read-back CONFIRMED the injection landed — and zero spans
+    were routed to the session before it finalized. The tree below this root
+    is exactly the bridge-off tree.
+
+    Emitted from ``_adapters/_assembler.py::SessionAssembler._merge_bridge``
+    at session finalize. A CONDITION marker that names no knob: the next
+    action lives outside wardex (check the CLI version, or a machine policy
+    that strips subprocess env or blocks loopback connections). Gated on the
+    read-back-CONFIRMED binding, never on "bridge configured": an injection
+    wardex cannot prove reached the subprocess env — a user transport, an SDK
+    surface change — must not be reported as the CLI staying silent (I4), so
+    unconfirmed sessions get the counter
+    ``adapters.assembler.otel_bridge_unconfirmed_no_data`` instead.
+
+    Not merged with ``OTEL_BRIDGE_SCHEMA_UNKNOWN``, by the census rule
+    (§6.5.1): the reader's next action differs. Here nothing ARRIVED —
+    a transport-level fact; there, data arrived and meant nothing to the
+    bridge — a schema-level fact whose fix is a report or an SDK upgrade.
+    """
+
+    OTEL_BRIDGE_SCHEMA_UNKNOWN = "otel_bridge_schema_unknown"
+    """Bridge telemetry arrived for this session and decoded to nothing the
+    bridge recognizes: classification produced zero known ``claude_code.*``
+    spans, or a POST under the bridge's token did not decode as OTLP at all.
+
+    Emitted from ``_adapters/_assembler.py::SessionAssembler._merge_bridge``
+    at finalize, on two routes: the session's routed spans classified to
+    nothing known, or the receiver counted an undecodable POST attributable
+    to the sole live bridge session (a counted inference — with several live
+    sessions only the counter ``adapters.anthropic.otel_bridge.undecodable``
+    speaks, because attributing a bodyless failure to one of N sessions would
+    be a guess). The CLI's telemetry is beta —
+    ``CLAUDE_CODE_ENHANCED_TELEMETRY_BETA`` disclaims stability by name — so
+    this is the reachable fail-open the design requires: the tree stays
+    exactly today's and the root says why the bridge added nothing. See
+    ``OTEL_BRIDGE_NO_DATA`` for why the two stay separate members.
     """
 
 

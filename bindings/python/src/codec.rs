@@ -1062,6 +1062,7 @@ fn otlp_traces_to_dict(
         let resd = PyDict::new_bound(py);
         if let Some(r) = &rs.resource {
             resd.set_item("attributes", otlp_attrs_to_py(py, &r.attributes)?)?;
+            resd.set_item("dropped_attributes_count", r.dropped_attributes_count)?;
         }
         rsd.set_item("resource", resd)?;
         let ss_list = PyList::empty_bound(py);
@@ -1071,6 +1072,12 @@ fn otlp_traces_to_dict(
             if let Some(sc) = &ss.scope {
                 scoped.set_item("name", &sc.name)?;
                 scoped.set_item("version", &sc.version)?;
+                // Scope attributes were omitted while the only consumers were
+                // round-trip tests; the bridge ingests foreign telemetry, so a
+                // projection that silently discards fields would discard data
+                // wardex never produced and cannot re-derive.
+                scoped.set_item("attributes", otlp_attrs_to_py(py, &sc.attributes)?)?;
+                scoped.set_item("dropped_attributes_count", sc.dropped_attributes_count)?;
             }
             ssd.set_item("scope", scoped)?;
             let spans_list = PyList::empty_bound(py);
@@ -1080,9 +1087,16 @@ fn otlp_traces_to_dict(
                 spd.set_item("trace_id", to_hex(&sp.trace_id))?;
                 spd.set_item("span_id", to_hex(&sp.span_id))?;
                 spd.set_item("parent_span_id", to_hex(&sp.parent_span_id))?;
+                spd.set_item("trace_state", &sp.trace_state)?;
                 spd.set_item("kind", sp.kind)?;
                 spd.set_item("start_time_unix_nano", sp.start_time_unix_nano)?;
                 spd.set_item("end_time_unix_nano", sp.end_time_unix_nano)?;
+                // The dropped counts are a sender's own confession that its
+                // record is partial; dropping the confession in the projection
+                // would make a partial record look whole.
+                spd.set_item("dropped_attributes_count", sp.dropped_attributes_count)?;
+                spd.set_item("dropped_events_count", sp.dropped_events_count)?;
+                spd.set_item("dropped_links_count", sp.dropped_links_count)?;
                 let status = PyDict::new_bound(py);
                 if let Some(s) = &sp.status {
                     status.set_item("code", s.code)?;
@@ -1383,13 +1397,14 @@ fn vocabulary_tables(py: Python<'_>) -> PyResult<PyObject> {
     }
     out.set_item("SnapshotType", snaps)?;
 
-    // The two closed vocabularies that live on the wire, exposed the OTHER way
-    // round — number → name, walking the schema rather than a list written
+    // The three closed vocabularies that live on the wire, exposed the OTHER
+    // way round — number → name, walking the schema rather than a list written
     // here. A table keyed by hand would only prove that this file agrees with
     // itself; walking the numbers lets a Python test compare the SCHEMA against
-    // `assembly._integrity.Limitation` and `assembly._parentage.ParentSource`
-    // member for member, in both directions, which is what makes a missing
-    // member a CI failure instead of a silently unnameable span.
+    // `assembly._integrity.Limitation`, `assembly._parentage.ParentSource` and
+    // `_enums.CaptureSource` member for member, in both directions, which is
+    // what makes a missing member a CI failure instead of a silently
+    // unnameable span.
     let limits_tbl = PyDict::new_bound(py);
     for n in 1..=200 {
         let name = vocab::limitation_name(n);
@@ -1407,6 +1422,20 @@ fn vocabulary_tables(py: Python<'_>) -> PyResult<PyObject> {
         }
     }
     out.set_item("ParentSource", sources)?;
+
+    // `CaptureSource` had no parity table until the bridge added a member to
+    // it: `Span.capture_sources` was already on the wire, so a spelling drift
+    // between `_enums.CaptureSource` and `CAPTURE_SOURCE_*` would have
+    // flattened a real observation channel to UNSPECIFIED with nothing to
+    // notice. Same schema walk as the two above.
+    let capture_sources = PyDict::new_bound(py);
+    for n in 1..=200 {
+        let name = vocab::capture_source_name(n);
+        if !name.contains("unrecognized") {
+            capture_sources.set_item(name, n)?;
+        }
+    }
+    out.set_item("CaptureSource", capture_sources)?;
 
     // The meta value, kept OUT of the vocabulary table above on purpose — a
     // consumer iterating "the vocabulary" must not find it there — but exposed

@@ -334,6 +334,24 @@ def test_every_python_enum_value_is_declared_in_proto(table, enum):
     )
 
 
+def test_capture_source_agrees_in_both_directions():
+    """`Span.capture_sources` is on the wire, so this vocabulary earns the same
+    two-directional guard as `Limitation`/`ParentSource` — it just never had
+    one until the bridge added `otel_bridge` as its 8th member. A member on one
+    side only is an observation channel that either cannot be sent or cannot be
+    read, and before this test that drift was invisible: `map_capture_source`
+    flattens an unknown value to UNSPECIFIED in silence.
+    """
+    declared = _tables()["CaptureSource"]
+    python_values = {m.value for m in CaptureSource}
+
+    assert set(declared) == python_values, (
+        f"  python only: {sorted(python_values - set(declared))}\n"
+        f"  proto only:  {sorted(set(declared) - python_values)}"
+    )
+    assert len(declared) == 8
+
+
 @pytest.mark.parametrize(
     "table", ["OperationName", "ToolExecutionType", "LinkReason", "SnapshotType"]
 )

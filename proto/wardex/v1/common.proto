@@ -69,6 +69,8 @@ enum CaptureSource {
   CAPTURE_SOURCE_WEBSOCKET = 5;
   CAPTURE_SOURCE_MANUAL = 6;
   CAPTURE_SOURCE_SOCKET = 7;  // plaintext raw-socket seam (http/ws/h2c)
+  // Merged from the Claude CLI's own OTel telemetry via the loopback bridge.
+  CAPTURE_SOURCE_OTEL_BRIDGE = 8;
 }
 
 // --- Span vocabulary registry (design §6.2, §6.3, §6.6) ---
@@ -223,6 +225,18 @@ enum Limitation {
 
   // -- Adapter session.
   LIMITATION_SESSION_ABORTED = 37;
+
+  // -- Agent SDK OTel bridge, fail-open. Both ride the session ROOT when the
+  //    bridge was on and added nothing; the tree itself stays exactly what it
+  //    would have been with the bridge off. Two members and not one, by the
+  //    census rule: the reader's next action differs. NO_DATA is
+  //    transport-level — telemetry env was confirmed injected into the CLI
+  //    subprocess and nothing ever arrived (check the CLI version, or a
+  //    machine policy that strips env / blocks loopback). SCHEMA_UNKNOWN is
+  //    content-level — data arrived and decoded to nothing the bridge
+  //    recognizes (the CLI's telemetry is beta; report it / upgrade the SDK).
+  LIMITATION_OTEL_BRIDGE_NO_DATA = 41;
+  LIMITATION_OTEL_BRIDGE_SCHEMA_UNKNOWN = 42;
 
   // A META value, not vocabulary — hence the separate number band. It means
   // "the sending SDK held a marker this schema has no value for", and it always

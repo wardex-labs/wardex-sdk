@@ -33,6 +33,7 @@ impl PyLimits {
         max_sessions=None, max_session_entries=None, max_units=None,
         max_entries_per_unit=None, mcp_sniff_bytes=None,
         max_buffer_spans=None, max_buffer_bytes=None, replay_buffer_size=None,
+        max_otel_bridge_body_bytes=None, max_otel_bridge_spans_per_session=None,
         zstd_level=None, max_otlp_attribute_bytes=None, max_otlp_request_bytes=None,
         max_link_targets=None
     ))]
@@ -55,6 +56,8 @@ impl PyLimits {
         max_buffer_spans: Option<usize>,
         max_buffer_bytes: Option<usize>,
         replay_buffer_size: Option<usize>,
+        max_otel_bridge_body_bytes: Option<usize>,
+        max_otel_bridge_spans_per_session: Option<usize>,
         zstd_level: Option<i32>,
         max_otlp_attribute_bytes: Option<usize>,
         max_otlp_request_bytes: Option<usize>,
@@ -81,6 +84,10 @@ impl PyLimits {
                 max_buffer_spans: max_buffer_spans.unwrap_or(d.max_buffer_spans),
                 max_buffer_bytes: max_buffer_bytes.unwrap_or(d.max_buffer_bytes),
                 replay_buffer_size: replay_buffer_size.unwrap_or(d.replay_buffer_size),
+                max_otel_bridge_body_bytes: max_otel_bridge_body_bytes
+                    .unwrap_or(d.max_otel_bridge_body_bytes),
+                max_otel_bridge_spans_per_session: max_otel_bridge_spans_per_session
+                    .unwrap_or(d.max_otel_bridge_spans_per_session),
                 zstd_level: zstd_level.unwrap_or(d.zstd_level),
                 max_otlp_attribute_bytes: max_otlp_attribute_bytes
                     .unwrap_or(d.max_otlp_attribute_bytes),
@@ -159,6 +166,14 @@ impl PyLimits {
         self.inner.replay_buffer_size
     }
     #[getter]
+    fn max_otel_bridge_body_bytes(&self) -> usize {
+        self.inner.max_otel_bridge_body_bytes
+    }
+    #[getter]
+    fn max_otel_bridge_spans_per_session(&self) -> usize {
+        self.inner.max_otel_bridge_spans_per_session
+    }
+    #[getter]
     fn zstd_level(&self) -> i32 {
         self.inner.zstd_level
     }
@@ -199,6 +214,11 @@ fn limits_defaults(py: Python<'_>) -> PyResult<Bound<'_, PyDict>> {
     out.set_item("max_buffer_spans", d.max_buffer_spans)?;
     out.set_item("max_buffer_bytes", d.max_buffer_bytes)?;
     out.set_item("replay_buffer_size", d.replay_buffer_size)?;
+    out.set_item("max_otel_bridge_body_bytes", d.max_otel_bridge_body_bytes)?;
+    out.set_item(
+        "max_otel_bridge_spans_per_session",
+        d.max_otel_bridge_spans_per_session,
+    )?;
     out.set_item("zstd_level", d.zstd_level)?;
     out.set_item("max_otlp_attribute_bytes", d.max_otlp_attribute_bytes)?;
     out.set_item("max_otlp_request_bytes", d.max_otlp_request_bytes)?;

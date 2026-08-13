@@ -226,6 +226,7 @@ class CaptureSource(Enum):
     GRPC = "grpc"
     WEBSOCKET = "websocket"
     MANUAL = "manual"
+    OTEL_BRIDGE = "otel_bridge"  # merged from the Claude CLI's own OTel telemetry
 
 
 # RetentionClass and CaptureTrigger were defined here until the retention

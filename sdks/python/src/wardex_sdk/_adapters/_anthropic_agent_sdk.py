@@ -16,6 +16,24 @@ handler dispatched from that loop inherits the session by ordinary ContextVar
 copying. No `session_id` is consulted to build a parent edge; the CLI's ids are
 recorded as hints and used as lookup aliases, which is the whole difference from
 reconstructing a tree out of framework callback identifiers.
+
+THE OTEL BRIDGE NEVER HIJACKS. With `otel_bridge=True` the adapter points the
+CLI's own OpenTelemetry exporter at an in-process loopback receiver — but only
+for a spawn whose environment carries NO user telemetry key (`OTEL_*` or
+`CLAUDE_CODE_ENABLE_TELEMETRY`, in `os.environ` or the user's `options.env`).
+A user who wired their own collector keeps it untouched, endpoint and all,
+and hears exactly one warning about the bridge standing down: redirecting
+their exporter would make spans silently vanish from their own dashboard.
+The check runs at SPAWN time — the only moment it can still change what the
+subprocess inherits — so a user exporting `OTEL_*` mid-session is out of
+scope by design. Slice 1 is the inverse case and injects strictly LESS: when
+the user already runs the CLI's telemetry themselves and `propagation.enabled`
+is True, only `TRACEPARENT`/`TRACESTATE` from the AMBIENT wardex context are
+added (no endpoint, no toggle — never-hijack holds by construction), so the
+CLI's spans join the host's trace in the USER'S backend. Ambient-only: with
+no ambient wardex context there is nothing to align with and nothing is
+injected; for `ClaudeSDKClient` the ambient read happens at construction
+time, which may differ from the context at first write.
 """
 
 from __future__ import annotations
@@ -23,7 +41,9 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import os
 import threading
+import time
 from collections.abc import Mapping
 from dataclasses import replace
 from functools import partial
@@ -39,12 +59,15 @@ from .._assembly import (
     guard,
     report_once,
 )
+from .._config import AnthropicAgentSdkConfig
 from .._enums import ToolExecutionType
 from .._types import ToolAttributes
+from ..context._propagate import get_trace_headers
 from ._anthropic_names import McpToolCatalog, ServerHandle
 from ._assembler import SessionAssembler
 from ._base import AdapterInterface
 from ._context import AdapterContext, Fallback, Observer, Placement, Scope
+from ._session_state import _BridgeBinding
 
 if TYPE_CHECKING:
     from .._client import Client
@@ -70,6 +93,101 @@ _WARDEX_HOOK_EVENTS = (
     "SubagentStop",
     "UserPromptSubmit",
 )
+
+#: The user-telemetry activation key. Its presence — anywhere the subprocess
+#: env is built from — is the never-hijack signal for slice 2 and the
+#: activation signal for slice 1 (see the module docstring).
+_TELEMETRY_ENABLE_KEY = "CLAUDE_CODE_ENABLE_TELEMETRY"
+
+#: The export cadence handed to the CLI, in milliseconds. A CADENCE, not a
+#: resource bound wardex enforces, hence a module constant rather than a
+#: limits-table entry. The spike measured the final batch arriving ~0.5s
+#: BEFORE `query()` returned at this interval — the measurement that priced
+#: `otel_bridge_drain`'s 0.2s default against it.
+_EXPORT_INTERVAL_MS = 1000
+
+#: Drain poll step and quiescence window, in seconds. Batches arrive in
+#: bursts, so a quiet window since the last arrival is the end-of-export
+#: signal that ends the drain before its deadline.
+_DRAIN_POLL_S = 0.02
+_DRAIN_QUIET_S = 0.1
+
+
+def _user_telemetry_key(*envs: Any) -> str | None:
+    """The first user-owned telemetry key found across `envs`, or None.
+
+    PRESENCE, not value: a user who set `CLAUDE_CODE_ENABLE_TELEMETRY=0` has
+    still expressed an opinion about this subprocess's telemetry, and the
+    bridge overriding it to 1 would be the hijack this check exists to refuse.
+    """
+    for env in envs:
+        if not env:
+            continue
+        for key in env:
+            if isinstance(key, str) and (key == _TELEMETRY_ENABLE_KEY or key.startswith("OTEL_")):
+                return key
+    return None
+
+
+def _bridge_env(options: Any, adapter: AnthropicAgentSdkAdapter) -> dict | None:
+    """The env this spawn gets, or None to leave the user's env untouched.
+
+    SLICE 2 (bridge receiver live, zero user telemetry keys): the full
+    exporter wiring plus a MINTED per-session TRACEPARENT. Minted, not
+    ambient, deliberately: the reservation is a pure ROUTING key — these
+    traces terminate at the loopback receiver and no user ever sees them —
+    and an ambient id would collide across concurrent sessions under one
+    host trace, breaking trace_id -> session routing.
+
+    SLICE 1 (user runs their OWN CLI telemetry, `propagation.enabled`): add
+    TRACEPARENT (+ TRACESTATE when the ambient context carries one) from the
+    AMBIENT wardex context, and nothing else. The two slices are mutually
+    exclusive by construction: a user telemetry key is exactly what disables
+    slice 2. No ambient context -> no injection (the CLI minting its own
+    trace is today's behavior); a TRACEPARENT the user set themselves wins.
+    """
+    user_env = getattr(options, "env", None) or {}
+    offending = _user_telemetry_key(os.environ, user_env)
+    bridge = adapter._bridge
+    if bridge is not None:
+        if offending is None:
+            trace_hex = os.urandom(16).hex()
+            span_hex = os.urandom(8).hex()
+            bridge.reserve(trace_hex)
+            bridge_env = {
+                "CLAUDE_CODE_ENABLE_TELEMETRY": "1",
+                "CLAUDE_CODE_ENHANCED_TELEMETRY_BETA": "1",
+                "OTEL_TRACES_EXPORTER": "otlp",
+                "OTEL_EXPORTER_OTLP_PROTOCOL": "http/protobuf",
+                "OTEL_EXPORTER_OTLP_ENDPOINT": bridge.endpoint,
+                "OTEL_EXPORTER_OTLP_HEADERS": f"x-wardex-bridge={bridge.token}",
+                "OTEL_TRACES_EXPORT_INTERVAL": str(_EXPORT_INTERVAL_MS),
+                # W3C version 00, sampled. Formatted by hand because the
+                # reservation is hex-of-urandom, never a wardex SpanContext —
+                # an adapter must not be able to mint one (C-S1).
+                "TRACEPARENT": f"00-{trace_hex}-{span_hex}-01",
+            }
+            return {**user_env, **bridge_env}
+        report_once(
+            f"anthropic_agent_sdk otel bridge: {offending} is set, so the bridge "
+            "injects nothing for this session — your own telemetry keeps its "
+            "endpoint (never-hijack)",
+            key="adapters.anthropic_agent_sdk.otel_bridge.no_hijack",
+        )
+    if (
+        adapter._propagation_enabled
+        and (_TELEMETRY_ENABLE_KEY in os.environ or _TELEMETRY_ENABLE_KEY in user_env)
+        and "TRACEPARENT" not in user_env
+    ):
+        headers = get_trace_headers()
+        traceparent = headers.get("traceparent")
+        if traceparent:
+            aligned: dict = {"TRACEPARENT": traceparent}
+            tracestate = headers.get("tracestate")
+            if tracestate and "TRACESTATE" not in user_env:
+                aligned["TRACESTATE"] = tracestate
+            return {**user_env, **aligned}
+    return None
 
 
 def _surface_ok(sdk: Any, subprocess_cli: Any) -> bool:
@@ -126,7 +244,16 @@ def _prepare_options(options: Any, adapter: AnthropicAgentSdkAdapter) -> Any:
     merged: dict[str, list[Any]] = {k: list(v) for k, v in (options.hooks or {}).items()}
     for event in _WARDEX_HOOK_EVENTS:
         merged.setdefault(event, []).append(sdk.HookMatcher(hooks=[_make_hook(adapter, event)]))
-    return replace(options, hooks=merged)
+    # The bridge's env fold (`_bridge_env`), under its own guard so a bridge
+    # failure costs the env injection alone and never the hook merge above.
+    # Copy-on-write is preserved: one `replace()` carries both fields, and the
+    # user's own env dict is never mutated.
+    env = None
+    with adapter._guard("adapters.anthropic.otel_bridge_inject"):
+        env = _bridge_env(options, adapter)
+    if env is None:
+        return replace(options, hooks=merged)
+    return replace(options, hooks=merged, env=env)
 
 
 def _server_instance(config: Any) -> Any:
@@ -358,6 +485,17 @@ class AnthropicAgentSdkAdapter(AdapterInterface):
         # on one key (design §5.4). Replaces `skip_tool_names`, which compared a
         # bare name against a namespaced one and therefore never matched.
         self._names = McpToolCatalog()
+        # The OTel bridge receiver — built in `install()` iff the adapter's
+        # own options say `otel_bridge=True` (the first real consumer of
+        # `ctx.options`). None keeps every bridge branch dead.
+        self._bridge: Any = None
+        # `otel_bridge_drain`, resolved from the same options. Consulted only
+        # when `_bridge` is set, so the zero here is never a wait of zero —
+        # it is "no bridge, no drain" spelled as a number.
+        self._drain_seconds = 0.0
+        # Snapshot of `config.propagation.enabled` (the debug-snapshot
+        # precedent): slice 1's gate, read once at install.
+        self._propagation_enabled = False
 
     def name(self) -> str:
         return "anthropic_agent_sdk"
@@ -370,9 +508,96 @@ class AnthropicAgentSdkAdapter(AdapterInterface):
 
     # --- observation callbacks (delegate to the SessionAssembler) ---
 
-    def _on_outbound(self, key: int, data: str) -> None:
+    def _on_outbound(self, key: int, data: str, transport: Any = None) -> None:
         if self._assembler is not None:
-            self._assembler.on_outbound(key, data)
+            binding = None
+            if self._bridge is not None and transport is not None:
+                binding = self._bridge_binding_for(transport)
+            self._assembler.on_outbound(key, data, bridge=binding)
+
+    def _bridge_binding_for(self, transport: Any) -> _BridgeBinding | None:
+        """The injection-correlation verdict for one transport's spawn.
+
+        Reads the env the SDK actually handed the subprocess, back off the
+        transport (`transport._options.env` — a private-attr read of
+        claude-agent-sdk internals, guarded, and version-drift-counted when it
+        stops working). Three outcomes, each earning a different claim:
+
+          * readable AND carrying our endpoint + TRACEPARENT — injection
+            CONFIRMED; the trace id is the primary route and the session may
+            later claim `otel_bridge_no_data` if nothing ever arrives.
+          * readable and NOT ours — this spawn got no injection (a user
+            transport with its own options, or never-hijack fired): no
+            binding, and the session behaves exactly as with the bridge off.
+          * unreadable — UNCONFIRMED binding: the session still pends and
+            merges whatever routes to it by `session.id` (the fallback key is
+            what keeps its CLI spans mergeable), but never claims NO_DATA —
+            wardex cannot assert an injection reached an env it never saw
+            (I4). Unless the entry-time never-hijack condition holds in
+            `os.environ`, in which case injection was refused and no binding
+            exists to be unconfirmed.
+        """
+        bridge = self._bridge
+        if bridge is None:
+            return None
+        env: Any = None
+        with self._guard("adapters.anthropic.otel_bridge_readback"):
+            options = getattr(transport, "_options", None)
+            if options is not None:
+                env = getattr(options, "env", None)
+        if isinstance(env, Mapping):
+            if env.get("OTEL_EXPORTER_OTLP_ENDPOINT") != bridge.endpoint:
+                return None
+            parts = str(env.get("TRACEPARENT") or "").split("-")
+            trace_hex = parts[1] if len(parts) == 4 and len(parts[1]) == 32 else None
+            return _BridgeBinding(trace_id_hex=trace_hex, confirmed=trace_hex is not None)
+        counters.bump("adapters.anthropic.otel_bridge.readback_failed")
+        if _user_telemetry_key(os.environ) is not None:
+            return None
+        return _BridgeBinding(trace_id_hex=None, confirmed=False)
+
+    def _drain_plan(self, key: int) -> tuple | None:
+        """`(trace_hex, session_id)` iff this is a bridge session with at least
+        one span ALREADY arrived (design §8 option b); None closes at full
+        speed — a session the bridge never fed pays not one poll."""
+        bridge, assembler = self._bridge, self._assembler
+        if bridge is None or assembler is None:
+            return None
+        route = assembler.bridge_route(key)
+        if route is None:
+            return None
+        if not bridge.has_data(route[0], route[1]):
+            return None
+        return route
+
+    async def _drain_bridge(self, key: int) -> None:
+        """Wait for the CLI's final export — bounded, async, and only when
+        there is something to wait FOR.
+
+        The drain's whole budget lives HERE, in the transport's own async
+        close, BEFORE the subprocess goes away (it must still be alive to
+        finish exporting) and before `_on_close` merges. It is structurally
+        absent from every sync teardown: `close_all_sessions` (atexit,
+        signal, uninstall) never waits, so the bridge cannot grow those
+        paths' flush budgets — the property `test_flush_budget.py` guards.
+        Exit early once nothing has arrived for `_DRAIN_QUIET_S`; give up at
+        `otel_bridge_drain` regardless.
+        """
+        plan = None
+        with self._guard("adapters.anthropic.otel_bridge_drain"):
+            plan = self._drain_plan(key)
+        if plan is None:
+            return
+        trace_hex, session_id = plan
+        deadline = time.monotonic() + self._drain_seconds
+        while time.monotonic() < deadline:
+            last = None
+            with self._guard("adapters.anthropic.otel_bridge_drain"):
+                bridge = self._bridge
+                last = bridge.last_arrival(trace_hex, session_id) if bridge else None
+            if last is not None and time.monotonic() - last >= _DRAIN_QUIET_S:
+                return
+            await asyncio.sleep(_DRAIN_POLL_S)
 
     def _on_inbound(self, key: int, msg: dict) -> None:
         if self._assembler is not None:
@@ -440,14 +665,25 @@ class AnthropicAgentSdkAdapter(AdapterInterface):
             # is what keeps `ClaudeSDKClient`'s `initialize` handshake — usually
             # sent from a `connect()` the host awaited OUTSIDE its span — from
             # deciding the run's parent.
+            #
+            # The transport rides along for the bridge's injection read-back
+            # (`_bridge_binding_for`): the write is the event that creates
+            # sessions, so it is also the moment a binding can attach.
             with adapter._guard("adapters.anthropic.outbound"):
-                adapter._on_outbound(id(self), data)
+                adapter._on_outbound(id(self), data, transport=self)
             return await orig_write(self, data)
 
         def read_messages(self):  # noqa: ANN001
             return _read_tee(adapter, id(self), orig_read(self))
 
         async def close(self):  # noqa: ANN001
+            # The drain, and ONLY here (plus the tee's close, the same seam
+            # for user transports): async, before `_on_close` merges and
+            # before the subprocess is closed, so the CLI is still alive to
+            # finish its export. The `_read_tee` ERROR path deliberately does
+            # not drain — the transport already failed, and the merge uses
+            # whatever arrived.
+            await adapter._drain_bridge(id(self))
             with adapter._guard("adapters.anthropic.transport_close"):
                 adapter._on_close(id(self), None)
             return await orig_close(self)
@@ -510,6 +746,35 @@ class AnthropicAgentSdkAdapter(AdapterInterface):
         config = getattr(client, "config", None)
         lim = config.limits if config is not None else LimitsConfig()
         resolved = lim.resolved()
+        # The adapter's own options — the first real `ctx.options` consumer.
+        # The isinstance narrowing keeps every duck-typed test double honest:
+        # anything but the real group means default options, bridge off.
+        opts = getattr(ctx, "options", None)
+        opts = opts if isinstance(opts, AnthropicAgentSdkConfig) else None
+        # Slice 1's gate, snapshotted at install (the `_debug` precedent).
+        self._propagation_enabled = bool(
+            getattr(getattr(config, "propagation", None), "enabled", False)
+        )
+        if opts is not None and opts.otel_bridge:
+            self._drain_seconds = opts.otel_bridge_drain
+            with self._guard("adapters.anthropic.otel_bridge_receiver"):
+                from ._otel_receiver import _OtelBridgeReceiver
+
+                self._bridge = _OtelBridgeReceiver(
+                    max_body_bytes=resolved["max_otel_bridge_body_bytes"],
+                    max_spans_per_session=resolved["max_otel_bridge_spans_per_session"],
+                    max_sessions=resolved["max_sessions"],
+                )
+            if self._bridge is None:
+                # Bind/start failed inside the guard: the adapter installs
+                # WITHOUT the bridge (fail-open), and the loss is announced
+                # because "otel_bridge=True changed nothing" is otherwise
+                # unfalsifiable from the outside.
+                report_once(
+                    "anthropic_agent_sdk otel bridge: the loopback receiver could "
+                    "not start, so the bridge is off for this process (fail-open)",
+                    key="adapters.anthropic_agent_sdk.otel_bridge.receiver_failed",
+                )
         self._assembler = SessionAssembler(
             client,
             # The context's registry, so the adapter and its assembler share ONE
@@ -522,6 +787,7 @@ class AnthropicAgentSdkAdapter(AdapterInterface):
             max_session_entries=resolved["max_session_entries"],
             max_units=resolved["max_units"],
             max_entries_per_unit=resolved["max_entries_per_unit"],
+            bridge=self._bridge,
         )
         # Held for `_run_tool`. Narrowed here rather than trusted, because a
         # wrapper that survives an uninstall reads it and must get None rather
@@ -575,9 +841,20 @@ class AnthropicAgentSdkAdapter(AdapterInterface):
         # context left standing would open a unit in a registry this teardown is
         # about to sweep — a span that is live in a table nothing will close.
         self._ctx = None
+        bridge = self._bridge
+        self._bridge = None
         self._installed = False
         if assembler is not None:
             assembler.close_all_sessions(marker=Limitation.ADAPTER_UNINSTALLED)
+        if bridge is not None:
+            # AFTER the session drain, whose opportunistic merge is the last
+            # legitimate reader of the receiver's slots; the socket teardown
+            # rides the same uninstall path everything else does
+            # (test_uninstall_isolation's scope). `close_units` — the signal
+            # path — deliberately leaves the receiver running: the adapter
+            # stays installed there.
+            with self._guard("adapters.anthropic.otel_bridge_receiver_close"):
+                bridge.close()
 
 
 class _TransportTee:
@@ -601,7 +878,7 @@ class _TransportTee:
 
     async def write(self, data):
         with self._adapter._guard("adapters.anthropic.outbound"):
-            self._adapter._on_outbound(id(self._inner), data)
+            self._adapter._on_outbound(id(self._inner), data, transport=self._inner)
         return await self._inner.write(data)
 
     def read_messages(self):
@@ -612,6 +889,9 @@ class _TransportTee:
         return _read_tee(self._adapter, id(self._inner), self._inner.read_messages())
 
     async def close(self):
+        # The same drain seam as the class patch: a user transport that
+        # spawned a CLI with our env still deserves the final batch.
+        await self._adapter._drain_bridge(id(self._inner))
         with self._adapter._guard("adapters.anthropic.transport_close"):
             self._adapter._on_close(id(self._inner), None)
         return await self._inner.close()

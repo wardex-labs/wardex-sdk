@@ -18,9 +18,54 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass, field
+from typing import Any
 
-from .._assembly import SpanDraft, Unit, UnitKey
+from .._assembly import Limitation, SpanDraft, Unit, UnitKey
 from .._protocol._claude_stream import AgentStreamEvent
+
+
+@dataclass
+class _BridgeBinding:
+    """This session's tie to the OTel bridge, created at injection-correlation.
+
+    EXISTENCE gates pending and the finalize-time merge; ``confirmed`` gates
+    the NO_DATA marker alone. The split is I4 at work: a binding exists the
+    moment the bridge was live for this session's spawn (its spans are worth
+    holding for), but "the CLI was told to send and sent nothing" may only be
+    claimed when the subprocess-env read-back CONFIRMED the injection landed.
+    A read-back failure leaves ``trace_id_hex`` None and ``confirmed`` False:
+    the session still merges whatever routes to it by ``session.id`` — the
+    fallback key is what keeps such a session's CLI spans mergeable — and
+    never earns the marker.
+    """
+
+    trace_id_hex: str | None
+    confirmed: bool
+
+
+@dataclass
+class _PendingSpan:
+    """An assembler-built draft held for the bridge's finalize-time merge.
+
+    The draft's end instant is stamped via ``set_end_ns`` at pend time, so an
+    unmerged flush emits exactly the span that would have shipped immediately
+    — plus ``deferred_markers``, the timing markers whose truth the merge is
+    what can change. Deferral replaces a limitation-REMOVAL API, which the
+    integrity builder deliberately does not grow: a marker, once attached, is
+    a fact; a deferred marker is a fact not yet decided.
+    """
+
+    draft: SpanDraft
+    kind: str  # "chat" | "tool" | "subagent"
+    deferred_markers: tuple[Limitation, ...] = ()
+    tool_use_id: str | None = None
+    agent_id: str | None = None
+    #: Chat only: (turn_start_ns, end_ns) — the join window.
+    window: tuple[int, int] | None = None
+    #: Chat only: the GenAIAttributes block, kept for the ttft rewrite.
+    #: Typed Any because `_types` is off-limits in `_adapters/` (C-S1).
+    gen_ai: Any = None
+    merged: bool = False
 
 
 @dataclass
@@ -92,3 +137,12 @@ class _Session:
     # ^ tool_use_id -> (name, input_json) observed on the stream
     result: AgentStreamEvent | None = None
     error: str | None = None
+    #: The OTel bridge tie, or None for a bridge-off session — and None is the
+    #: load-bearing default: every bridge branch in the assembler gates on it,
+    #: so a session without a binding walks today's code paths exactly.
+    bridge: _BridgeBinding | None = None
+    #: Drafts held for the finalize-time merge, in emission order. Bounded by
+    #: `max_session_entries` (overflow emits the OLDEST unmerged, immediately)
+    #: and flushed on EVERY retirement path — finalize, teardown, and the
+    #: registry-eviction retirement — so pending never deletes a span (I10).
+    pending: list[_PendingSpan] = field(default_factory=list)
