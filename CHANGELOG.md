@@ -5,6 +5,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.5.0b1] - 2026-08-16
+
 This release carries the one deliberate breaking window before the Node and
 Java SDKs inherit and freeze the public names. Everything under **BREAKING**
 below landed in it; there are no compatibility shims — every moved or removed
