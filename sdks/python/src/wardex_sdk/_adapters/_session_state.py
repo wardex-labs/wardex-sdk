@@ -66,6 +66,17 @@ class _PendingSpan:
     #: Typed Any because `_types` is off-limits in `_adapters/` (C-S1).
     gen_ai: Any = None
     merged: bool = False
+    #: Whether this record may be the tool join's target. False for the stub an
+    #: eviction ships: `_merge_bridge` joins by POPPING `tool_use_id`, and an
+    #: evicted call that later completes puts TWO records under one id with the
+    #: stub pended first — so the stub would take the CLI's duration and the
+    #: bridge source and become the anchor for the CLI's children, while the
+    #: half holding the output and the real interval fell through unmerged. The
+    #: CLI measured the WHOLE call, so its duration belongs on the half that
+    #: represents the whole call. Expressed as a qualification field rather than
+    #: by blanking `tool_use_id`: that field is the call's identity, and a
+    #: future consumer would read the blank as a fact.
+    mergeable: bool = True
 
 
 @dataclass

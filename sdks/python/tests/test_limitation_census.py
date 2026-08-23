@@ -1051,12 +1051,13 @@ _UNRESOLVED_PY: frozenset[tuple[str, str]] = frozenset(
         # a marker-ish parameter, so R4 registers it; R9 then makes it read-all
         # because a marker container goes in. Its other arguments land here.
         # None of them can hold a marker string — they are a session, a tool
-        # record, a timestamp, a `StatusCode` and an `error.type`. `Name:status`
-        # is where `Name:failed` used to sit: the bool became the field it was
-        # encoding, so the third outcome (UNSET, what a bound owes a call it
-        # stopped watching) is expressible.
+        # record, a timestamp, a `StatusCode`, an `error.type` and the bridge
+        # join-eligibility flag. `Name:status` is where `Name:failed` used to
+        # sit: the bool became the field it was encoding, so the third outcome
+        # (UNSET, what a bound owes a call it stopped watching) is expressible.
         ("_adapters/_assembler.py", "Name:end_ns"),
         ("_adapters/_assembler.py", "Name:error_type"),
+        ("_adapters/_assembler.py", "Name:mergeable"),
         ("_adapters/_assembler.py", "Name:status"),
         ("_adapters/_assembler.py", "Name:marker"),
         ("_adapters/_assembler.py", "Name:markers"),

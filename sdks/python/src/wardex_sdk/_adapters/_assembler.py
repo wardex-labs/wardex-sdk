@@ -1083,6 +1083,10 @@ class SessionAssembler:
                 now,
                 status=StatusCode.UNSET,
                 markers=(Limitation.SESSION_ENTRY_TABLE_FULL,),
+                # Not a join target: see `_PendingSpan.mergeable`. The CLI timed
+                # the whole call, and this half is only the window wardex
+                # watched.
+                mergeable=False,
             )
             # Under the SAME bound, so the memory of evictions cannot outgrow
             # what it remembers for. Overflowing it is itself counted: a
@@ -1199,6 +1203,7 @@ class SessionAssembler:
         status: StatusCode = StatusCode.OK,
         markers: tuple[Limitation, ...] = (),
         error_type: str | None = None,
+        mergeable: bool = True,
     ) -> None:
         """Emit (or pend) one tool span.
 
@@ -1220,7 +1225,7 @@ class SessionAssembler:
             return
         if sess.bridge is not None:
             with self._guard("adapters.assembler.emit_tool"):
-                self._pend_tool(sess, tool, end_ns, status, markers, error_type)
+                self._pend_tool(sess, tool, end_ns, status, markers, error_type, mergeable)
             return
         span = None
         with self._guard("adapters.assembler.emit_tool"):
@@ -1236,6 +1241,7 @@ class SessionAssembler:
         status: StatusCode,
         markers: tuple[Limitation, ...],
         error_type: str | None,
+        mergeable: bool,
     ) -> None:
         """Hold a hook/stream tool draft for the finalize-time merge.
 
@@ -1255,6 +1261,7 @@ class SessionAssembler:
                 kind="tool",
                 tool_use_id=tool.tool_use_id,
                 agent_id=tool.agent_id,
+                mergeable=mergeable,
             ),
         )
 
@@ -1581,7 +1588,11 @@ class SessionAssembler:
 
         # (2) tools (exact join) and subagents (cross-check), both keyed.
         for rec in sess.pending:
-            if rec.kind == "tool" and rec.tool_use_id:
+            # `and rec.mergeable`: the join POPS by `tool_use_id`, so the first
+            # record under an id wins it. An evicted call that later completes
+            # pends two, stub first, and the stub is the one half the CLI's
+            # measurement does not describe.
+            if rec.kind == "tool" and rec.tool_use_id and rec.mergeable:
                 otel_tool = view.tools.pop(rec.tool_use_id, None)
                 if otel_tool is None:
                     continue
