@@ -350,10 +350,6 @@ def test_max_link_targets_reaches_the_registry_context_for_builds():
     assert ctx._units._max_link_targets == 7
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="context_for never hands max_body_bytes to the registry it builds",
-)
 def test_max_body_bytes_reaches_the_registry_context_for_builds():
     """The same rule as `max_link_targets` above, for the bound that never had it.
 
@@ -372,10 +368,6 @@ def test_max_body_bytes_reaches_the_registry_context_for_builds():
     assert ctx._units._max_record_bytes == 4096
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="the registry's cap is the core default, so the budget derived from it is too",
-)
 def test_record_budget_equals_the_configured_body_cap():
     """The storage cap and the source-side budget are ONE read — of the user's value.
 

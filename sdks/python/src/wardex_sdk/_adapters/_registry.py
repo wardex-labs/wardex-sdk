@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING
 
 from .._assembly import Limitation, UnitRegistry, counters, guard
 from .._config import AdaptersConfig
-from .._limits import LimitsConfig
+from .._limits import LimitsConfig, LimitsConsumer, limits_kwargs
 from ._base import AdapterInterface
 from ._context import AdapterContext
 from ._sink import _ClientSink
@@ -63,12 +63,16 @@ def context_for(
         # would ignore the setting in silence, which is the shape of bug
         # that looks like nothing at all until a workload crosses a cap the
         # user thought they had raised.
+        #
+        # Through the PROJECTION, not by hand. Spelling the keywords here is
+        # how `max_body_bytes` came to be the one bound this call forgot: the
+        # list of what a registry takes lived at the call site, so it could be
+        # short and still look complete. `_LIMIT_DELIVERY` holds that list once
+        # and `tests/test_limits_wiring.py` holds it against the signature.
         units=UnitRegistry(
             sink=_ClientSink(client),
-            max_units=resolved["max_units"],
-            max_entries_per_unit=resolved["max_entries_per_unit"],
-            max_link_targets=resolved["max_link_targets"],
             debug=debug,
+            **limits_kwargs(LimitsConsumer.UNIT_REGISTRY, resolved),
         ),
         limits=resolved,
         debug=debug,

@@ -16,7 +16,6 @@ from __future__ import annotations
 
 from typing import Annotated, Any, TypedDict
 
-import pytest
 from langchain_core.messages import AIMessage, ToolMessage
 from langchain_core.tools import tool
 from langgraph.checkpoint.memory import InMemorySaver
@@ -589,10 +588,6 @@ def test_an_over_budget_tool_input_ships_truncated_and_flagged(installed):  # no
     assert span.capture_integrity.truncated is True
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="the registry the context builds keeps the core body cap, so the budget does too",
-)
 def test_shaped_args_uses_the_configured_budget():
     """The source side of the same bound: what the shaper MATERIALIZES.
 

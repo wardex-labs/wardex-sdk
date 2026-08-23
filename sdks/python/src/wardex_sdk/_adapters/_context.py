@@ -577,7 +577,10 @@ class AdapterContext:
         `budget + 1` bytes whenever it cut anything, so the flag still fires —
         the +1 handshake (see the LangGraph adapter's `_shaped_args`). Read off
         the registry rather than `self.limits` because the registry's cap is
-        the one that is enforced; the two can disagree under a client override.
+        the one that is ENFORCED: the two cannot disagree when they are one
+        read, and they did disagree for as long as they were two — the registry
+        resolved the core default while `self.limits` reported the host's, so
+        a lowered cap shaped nothing and bounded nothing.
         """
         return self._units.max_record_bytes
 
