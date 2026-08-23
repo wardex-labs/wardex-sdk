@@ -119,6 +119,31 @@ def stall(live) -> StalledRun:  # noqa: ANN001
         ),
     )
     assembler.on_inbound(1, dict(INIT_LINE, session_id="s-stall"))
+    # One assistant turn with BOTH cache tiers, before the stall: the usage
+    # stage for `check_usage_totals_are_inclusive` (usage_expected=True).
+    # It lives here and not in the workload because a chat span publishes no
+    # correlation claim by design, so it can never be part of the declared
+    # causal tree the workload feeds the tier assertions. Raw 1000 + 8000
+    # read + 2000 written must ship as the inclusive 11000.
+    assembler.on_inbound(
+        1,
+        {
+            "type": "assistant",
+            "session_id": "s-stall",
+            "message": {
+                "id": "msg_stall",
+                "model": "claude-sonnet-5",
+                "stop_reason": "end_turn",
+                "usage": {
+                    "input_tokens": 1000,
+                    "output_tokens": 500,
+                    "cache_read_input_tokens": 8000,
+                    "cache_creation_input_tokens": 2000,
+                },
+                "content": [{"type": "text", "text": "staged"}],
+            },
+        },
+    )
     return StalledRun(root="invoke_agent", resume=lambda: None)
 
 
@@ -136,6 +161,7 @@ def subject() -> AdapterSubject:
         ),
         stall=stall,
         detect_package="claude_agent_sdk",
+        usage_expected=True,
     )
 
 

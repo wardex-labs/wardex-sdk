@@ -235,6 +235,58 @@ def read_spans(spans: Sequence[Any]) -> tuple[SpanNode, ...]:
     return tuple(out)
 
 
+@dataclass(frozen=True)
+class UsageSnapshot:
+    """One span's usage surface — the gen_ai block AND anything imitating it.
+
+    Deliberately a second reader beside `SpanNode`, not a widening of it:
+    `SpanNode` is scoped to what a causal claim is made of, and every
+    existing check reads it. Usage is a different question with a different
+    consumer (the inclusive-totals conformance check), so it gets its own
+    shape.
+
+    `gen_ai_usage_extras` holds every TOP-LEVEL extra key starting with
+    ``gen_ai.usage.`` — a healthy span never has one: a backend's usage
+    extraction is a prefix rule over the flattened attributes, so an extras
+    copy of a usage fact is a second spelling of it, priced separately.
+    """
+
+    span_name: str
+    input_tokens: int | None
+    output_tokens: int | None
+    cache_read_input_tokens: int | None
+    cache_creation_input_tokens: int | None
+    reasoning_output_tokens: int | None
+    gen_ai_usage_extras: tuple[str, ...]
+
+
+def read_usage(spans: Sequence[Any]) -> tuple[UsageSnapshot, ...]:
+    """Every shipped span as a `UsageSnapshot` (`InternalSpan.gen_ai`/`.extra`)."""
+    out = []
+    for span in spans:
+        gen_ai = span.gen_ai
+        out.append(
+            UsageSnapshot(
+                span_name=span.name,
+                input_tokens=gen_ai.input_tokens if gen_ai is not None else None,
+                output_tokens=gen_ai.output_tokens if gen_ai is not None else None,
+                cache_read_input_tokens=(
+                    gen_ai.cache_read_input_tokens if gen_ai is not None else None
+                ),
+                cache_creation_input_tokens=(
+                    gen_ai.cache_creation_input_tokens if gen_ai is not None else None
+                ),
+                reasoning_output_tokens=(
+                    gen_ai.reasoning_output_tokens if gen_ai is not None else None
+                ),
+                gen_ai_usage_extras=tuple(
+                    sorted(key for key, _ in span.extra if key.startswith("gen_ai.usage."))
+                ),
+            )
+        )
+    return tuple(out)
+
+
 def collapse_onto_root(nodes: Sequence[SpanNode], *, root: str) -> tuple[SpanNode, ...]:
     """The same tree with every edge flattened onto the root. THE negative control.
 
@@ -334,6 +386,12 @@ class AdapterSubject:
     * `stall` — start a run and leave it open. The two shutdown checks drive
       it.
     * `detect_package` — the module whose presence auto-detects this adapter.
+    * `usage_expected` — whether the subject's runs (workload plus stalled
+      run) carry gen_ai usage with a cache tier. REQUIRED, no default, on
+      purpose: a default would let a new adapter silently opt out of the
+      inclusive-totals check, and a silent opt-out is the drift that check
+      exists to stop. Declaring `False` is asserted too — an adapter that
+      starts shipping usage without declaring its convention goes red.
     """
 
     name: str
@@ -344,6 +402,7 @@ class AdapterSubject:
     chains: tuple[tuple[str, ...], ...]
     stall: Callable[[LiveAdapter], StalledRun]
     detect_package: str
+    usage_expected: bool
 
     @property
     def root(self) -> str:
@@ -358,6 +417,7 @@ __all__ = [
     "RecordingTransport",
     "SpanNode",
     "StalledRun",
+    "UsageSnapshot",
     "clean_state",
     "collapse_onto_root",
     "exactly_one",
@@ -365,4 +425,5 @@ __all__ = [
     "never_installed",
     "parent_name_of",
     "read_spans",
+    "read_usage",
 ]

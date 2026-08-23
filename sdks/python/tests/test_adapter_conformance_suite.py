@@ -274,6 +274,7 @@ def _subject(factory) -> AdapterSubject:  # noqa: ANN001
         ),
         stall=_stall,
         detect_package="wardex_sdk",
+        usage_expected=False,
     )
 
 
@@ -298,6 +299,7 @@ _TREE_CHECKS = (
     "check_the_workload_ships_one_read_tree",
     "check_the_causal_chain_holds_by_span_id",
     "check_a_collapsed_tree_fails_this_suite",
+    "check_usage_totals_are_inclusive",
     "check_close_units_ships_the_open_run_and_stays_installed",
     "check_uninstall_ships_the_open_run_and_never_raises_into_the_host",
 )
