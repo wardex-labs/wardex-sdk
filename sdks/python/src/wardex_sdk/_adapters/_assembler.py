@@ -822,14 +822,14 @@ class SessionAssembler:
         the edge itself is `child_of`'s to build. Selecting which anchor is still
         this method's job, and it is still a heuristic — a `parent_tool_use_id`
         that resolves to nothing silently re-parents to the session root. What
-        reaches that fallback is narrower than it was: a sub-agent evicted by
-        `_max_session_entries` is recorded and then evicted, and the
-        `_EvictedSubagent` breadcrumb keeps its context, so only a hook that has
-        not landed yet — or a breadcrumb that itself fell out of the same bound
-        — gets the root. Making the session a unit and giving
-        in-process tool calls a real edge did NOT change the fallback,
-        deliberately:
-        rewriting this method is the ingestion move design §3.4 schedules
+        reaches that fallback is narrower than it used to be: a sub-agent over
+        `_max_session_entries` is now recorded and then evicted rather than never
+        recorded, and its `_EvictedSubagent` breadcrumb keeps the context, so the
+        root fallback is left with a hook that has not landed yet, or a
+        breadcrumb that itself fell out of the same bound. Making the session a
+        unit and giving in-process tool calls a real edge did NOT change the
+        fallback, deliberately: rewriting this method is the ingestion move
+        design §3.4 schedules
         separately — it stops choosing an anchor and produces a `UnitKey` for
         `UnitRegistry.resolve()`, which returns the evidence with the unit so the
         guess reports itself. Until then, no span this method feeds may claim a

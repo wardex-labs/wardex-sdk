@@ -617,26 +617,47 @@ not arrive.
 Requests are gzipped by default. `OtlpHttpTransport(..., compress=False)` turns
 that off for a proxy or receiver that mishandles `Content-Encoding`.
 
-`max_units` and `max_entries_per_unit` were on that list until the logical-unit
-registry landed and became their consumer. What crossing one of them looks like
-from your data depends on whether the evicted entry has a span of its own.
+`max_units`, `max_entries_per_unit` and `max_session_entries` were on that list
+until the logical-unit registry and the Agent SDK assembler became their
+consumers. What crossing one of them looks like from your data depends on
+whether the evicted entry has a span of its own.
 
-**Evictions you can see in your traces.** A root unit evicted at `max_units`,
-and a child unit or an in-flight span evicted at `max_entries_per_unit`, are
-each closed and **exported**, marked `unit_evicted` or `child_span_unclosed`.
-Outgrowing one of these ceilings shows up as marked spans rather than as traces
-that quietly stop appearing.
+**Evictions you can see in your traces.** A root unit evicted at `max_units`, a
+child unit or an in-flight span evicted at `max_entries_per_unit`, and an open
+tool call or a sub-agent evicted at `max_session_entries`, are each closed and
+**exported**, marked `unit_evicted`, `unit_table_full` or
+`session_entry_table_full`. Outgrowing one of these ceilings shows up as marked
+spans rather than as traces that quietly stop appearing. Each marker names the
+one knob that produced it, so the marker tells you which number to raise.
 
-**Evictions you cannot.** `max_entries_per_unit` also bounds bookkeeping tables
+A span evicted at `max_session_entries` carries status **unset** rather than
+`ok` or `error`: wardex stopped watching before the call's outcome, so `ok`
+would claim a success it never observed and `error` would report wardex's own
+full table as a failure of your agent.
+
+**One call, two observations.** If an evicted tool call later completes, its
+completion is reported as a *second* span with the same `gen_ai.tool.call.id`,
+also marked `session_entry_table_full`, and the two overlap: the `unset` one is
+`[start, evicted]` and holds the call's input, the other is `[start, end]` — the
+whole call — and holds its output. **When you aggregate tool latency, exclude
+the spans that carry `session_entry_table_full` AND status `unset`,** or you
+count that call twice.
+
+**Evictions you cannot.** The two per-table knobs also bound bookkeeping tables
 whose entries are not spans — the lookup aliases that map a framework's own
 identifiers onto units, the keys that de-duplicate two observers of one event,
-and the table of in-process MCP servers wardex has wrapped. Evicting from any of
-them exports nothing, because there is no span to mark. They are counted
-internally instead — `wardex_sdk._assembly.counters.snapshot()` reports them
-under `assembly._units.alias_table_full`, `assembly._units.claim_table_full` and
-`adapters.anthropic.server_table_full` — and what reaches your data is the
-consequence rather than the eviction. A dropped de-duplication key, or a dropped
-server handle, can let one tool call be reported twice.
+the table of
+in-process MCP servers wardex has wrapped, and the streamed tool metadata the
+assembler holds until a result arrives. Evicting from any of them exports
+nothing, because there is no span to mark. They are counted internally instead —
+`wardex_sdk._assembly.counters.snapshot()` reports them under
+`assembly._units.alias_table_full`, `assembly._units.claim_table_full`,
+`adapters.anthropic.server_table_full` and
+`adapters.assembler.stream_tool_meta_table_full` — and what reaches your data is
+the consequence rather than the eviction. A dropped de-duplication key, or a
+dropped server handle, can let one tool call be reported twice. A dropped
+streamed metadata entry costs a tool call its byte-exact input, and if no hook
+observed that call, its span entirely.
 
 A dropped **alias** is the one to know about, because it does not look like a
 loss. That identifier stops resolving, so the parent is decided one rung further
@@ -646,7 +667,19 @@ sub-agent it belonged to. A sub-agent's subtree flattens and nothing in the data
 says so. Only when there is no ambient span does it arrive marked
 `unit_inferred_sole` (0.5) or `parent_unresolved`.
 
-Raise `max_entries_per_unit` if you see any of these counters move.
+The evictions that DO reach your traces are counted as well, so you can see one
+coming before it is a shape in your data:
+`adapters.assembler.open_tool_table_full` and
+`adapters.assembler.subagent_table_full` for the two `max_session_entries` sites
+that emit, plus `adapters.assembler.tool_completion_after_evict` for the second
+half of a call the first one closed.
+
+Which number to raise depends on which counter moved.
+`assembly._units.*` and `adapters.anthropic.server_table_full` are
+`max_entries_per_unit`; every `adapters.assembler.*_table_full` is
+`max_session_entries`. The two are separate fields — the core limits table
+calls the first a generalization of the second, but raising it leaves the second
+exactly where it was.
 
 ## Versioning
 
