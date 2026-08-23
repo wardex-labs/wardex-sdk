@@ -5,6 +5,8 @@
 
 use serde_json::Value;
 
+use crate::usage::{InputConvention, TokenUsage};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EventKind {
     SessionInit,
@@ -21,14 +23,6 @@ pub struct ToolUse {
     pub id: String,
     pub name: String,
     pub input_json: Vec<u8>,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct Usage {
-    pub input_tokens: Option<i64>,
-    pub output_tokens: Option<i64>,
-    pub cache_read_input_tokens: Option<i64>,
-    pub cache_creation_input_tokens: Option<i64>,
 }
 
 /// Flat event struct: one shape for all kinds keeps the FFI surface trivial.
@@ -49,7 +43,9 @@ pub struct ClaudeStreamEvent {
     pub tool_result_id: Option<String>,
     pub content_json: Option<Vec<u8>>,
     pub tool_uses: Vec<ToolUse>,
-    pub usage: Option<Usage>,
+    /// Normalized (semconv-inclusive) — `parse_usage` names Anthropic's
+    /// convention, so `input_tokens()` already contains both cache tiers.
+    pub usage: Option<TokenUsage>,
     pub task_id: Option<String>,
     pub task_status: Option<String>,
     pub task_tool_use_id: Option<String>,
@@ -99,14 +95,19 @@ fn raw(v: &Value) -> Option<Vec<u8>> {
     serde_json::to_vec(v).ok()
 }
 
-fn parse_usage(m: &Value) -> Option<Usage> {
+fn parse_usage(m: &Value) -> Option<TokenUsage> {
     let u = m.get("usage")?;
-    Some(Usage {
-        input_tokens: i(u, "input_tokens"),
-        output_tokens: i(u, "output_tokens"),
-        cache_read_input_tokens: i(u, "cache_read_input_tokens"),
-        cache_creation_input_tokens: i(u, "cache_creation_input_tokens"),
-    })
+    // The CLI relays Anthropic's own usage object, cache tiers reported
+    // OUTSIDE `input_tokens` — the same `ExcludesCache` fact as the HTTP
+    // body parser, declared with the same type so neither path can drift.
+    Some(TokenUsage::new(
+        InputConvention::ExcludesCache,
+        i(u, "input_tokens"),
+        i(u, "output_tokens"),
+        i(u, "cache_read_input_tokens"),
+        i(u, "cache_creation_input_tokens"),
+        None,
+    ))
 }
 
 pub fn parse_stream_line(line: &[u8], outbound: bool) -> Option<ClaudeStreamEvent> {
@@ -249,9 +250,10 @@ mod tests {
         assert_eq!(e.message_id.as_deref(), Some("msg_01"));
         assert_eq!(e.stop_reason.as_deref(), Some("tool_use"));
         let u = e.usage.unwrap();
-        assert_eq!(u.input_tokens, Some(10));
-        assert_eq!(u.output_tokens, Some(25));
-        assert_eq!(u.cache_read_input_tokens, Some(3));
+        // Inclusive: raw 10 + cache_read 3 + cache_creation 0.
+        assert_eq!(u.input_tokens(), Some(13));
+        assert_eq!(u.output_tokens(), Some(25));
+        assert_eq!(u.cache_read_input_tokens(), Some(3));
         assert_eq!(e.tool_uses.len(), 1);
         assert_eq!(e.tool_uses[0].id, "toolu_01");
         assert_eq!(e.tool_uses[0].name, "Bash");

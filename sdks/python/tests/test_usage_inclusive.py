@@ -132,11 +132,6 @@ def _fresh_counters():
 # --------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="defect A: fill_anthropic ships the provider-raw (exclusive) input_tokens; "
-    "semconv and the Anthropic provider doc require input + cache_read + cache_creation",
-)
 def test_anthropic_input_tokens_include_cache_tiers():
     sem = _parse_anthropic()
     attrs = _wire_attrs(build_gen_ai(sem))
@@ -187,11 +182,6 @@ _STREAM_RESULT = {
 }
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="defect A on P3: the CLI stream-json parser ships Anthropic raw input_tokens "
-    "and never went through LlmSemantics, so the P1 fix alone cannot reach it",
-)
 def test_stream_json_input_tokens_include_cache_tiers():
     client = _FakeClient()
     asm = SessionAssembler(client)
@@ -211,3 +201,51 @@ def test_stream_json_input_tokens_include_cache_tiers():
     assert chat.gen_ai.cache_read_input_tokens == 8000
     assert chat.gen_ai.cache_creation_input_tokens == 2000
     assert chat.gen_ai.output_tokens == 500
+
+
+# --------------------------------------------------------------------------
+# over-correction guards: providers that already report inclusive totals
+# --------------------------------------------------------------------------
+
+_OPENAI_REQ = json.dumps(
+    {"model": "gpt-5", "messages": [{"role": "user", "content": "x"}]}
+).encode()
+_OPENAI_RESP = json.dumps(
+    {
+        "id": "chatcmpl-1",
+        "model": "gpt-5",
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": "y"}}],
+        "usage": {
+            "prompt_tokens": 11000,
+            "completion_tokens": 600,
+            "prompt_tokens_details": {"cached_tokens": 8000},
+            "completion_tokens_details": {"reasoning_tokens": 100},
+        },
+    }
+).encode()
+
+
+def _parse_openai():
+    return _wardex_native.protocol.parse_llm_semantics(
+        "api.openai.com", "/v1/chat/completions", _OPENAI_REQ, _OPENAI_RESP
+    )
+
+
+def test_openai_input_tokens_unchanged():
+    """OpenAI `prompt_tokens` already contains `cached_tokens`.
+
+    The one defense against over-correction: adding the cache tier again
+    would ship 19000 for an 11000-token prompt — the same class of billing
+    error the Anthropic fix removes, manufactured on the other axis.
+    """
+    sem = _parse_openai()
+    assert sem.input_tokens == 11000
+    assert sem.cache_read_input_tokens == 8000
+
+
+def test_reasoning_included_in_output_tokens():
+    """`completion_tokens` already contains the reasoning tokens (regression pin)."""
+    sem = _parse_openai()
+    assert sem.output_tokens == 600
+    assert sem.reasoning_output_tokens == 100
+    assert sem.output_tokens >= sem.reasoning_output_tokens
