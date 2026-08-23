@@ -497,8 +497,17 @@ diagnostic line (traceback under `debug=True`).
 
 **Works today**
 - Zero-instrumentation capture of LLM HTTP calls (OpenAI, Anthropic) over
-  `https`, cleartext `http`, and h2c
+  `https`, cleartext `http`, and h2c — Chat Completions, the **Responses API**
+  (the openai-agents SDK's default path, non-streaming and SSE), Embeddings,
+  and Anthropic Messages
 - `gen_ai` semantics: model, tokens, parameters, finish reasons, input/output messages
+- **Open usage capture**: every scalar leaf of the provider's `usage` object
+  rides the span as `wardex.usage.<provider path>`, spelling preserved — a new
+  billing counter (a cache-write tier, a web-search charge, a thinking tier)
+  appears in your data the day the provider ships it, without an SDK release.
+  Bounded by `max_extra_keys` (default 64; a real usage object has 10–20
+  leaves), and a crossed bound says so: marker `extra_keys_dropped` plus
+  `wardex.usage_leaves.dropped_count`
 - Failed provider calls (429 rate limits, 401s, 5xx) are captured with the same
   `gen_ai` identity and content as successful ones — only the response-side
   fields are empty
@@ -616,6 +625,18 @@ not arrive.
 
 Requests are gzipped by default. `OtlpHttpTransport(..., compress=False)` turns
 that off for a proxy or receiver that mishandles `Content-Encoding`.
+
+**`max_extra_keys` (64) bounds one open key family today: the provider-usage
+mirror.** `wardex.usage.*` is the one attribute family whose keys the provider
+names rather than wardex, so it is the one place a pathological body could mint
+unbounded keys. Lowering the knob prunes usage leaves only — every other
+attribute is untouched — and a span that lost leaves carries
+`extra_keys_dropped` with the count beside it as
+`wardex.usage_leaves.dropped_count`. The normalized `gen_ai.usage.*` totals are
+extracted separately and are never subject to this cap. (For scale: the mirror
+adds ~5–10 attributes to an LLM span, and the richest span the test corpus
+produces carries 47 attributes total against the OTel Collector's default
+`attribute_count_limit` of 128.)
 
 `max_units`, `max_entries_per_unit` and `max_session_entries` were on that list
 until the logical-unit registry and the Agent SDK assembler became their

@@ -7,6 +7,39 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- **The OpenAI Responses API was invisible — and streams were worse than
+  invisible.** The openai-agents SDK calls `POST /v1/responses` by default
+  (one `Runner.run` turn is one Responses call), and wardex had no row for
+  it: a non-streaming call yielded no semantics, so under the default
+  capture mode the span was DROPPED entirely. A streamed call went through
+  the Chat reassembler, which shipped a fabricated empty chat-completion
+  JSON as the span's `output_data` under a false `sse_unknown_provider`
+  marker. Both are gone: the Responses API parses on both paths (the
+  terminal event's snapshot is the streaming truth source; an in-stream
+  `error` event's payload is preserved rather than dropped), and the SSE
+  reassembler is now selected by the stream's own grammar, never defaulted
+  by host.
+- **`/v1/messages/count_tokens` and `/v1/messages/batches` are no longer
+  chat calls.** Substring path matching classified both as `/v1/messages`,
+  and every such span carried a false `semantic_parse_failed` — the parser
+  had not failed; the endpoint was never a chat call. Endpoint recognition
+  is a last-segment table now: gateway prefixes still match, sub-resources
+  no longer do (under the default capture mode such calls are dropped
+  outside a local span, which is the pre-existing posture for non-LLM
+  traffic).
+- **An embeddings span no longer claims text output.** `gen_ai.output.type`
+  was stamped `"text"` on every parse; an embeddings response is vectors,
+  and the attribute is now absent there. The embeddings REQUEST is parsed
+  too: `gen_ai.request.model` (so the span name no longer depends on the
+  response-model fallback), `gen_ai.request.encoding_formats`, and
+  `gen_ai.embeddings.dimension.count`.
+- **Anthropic `output_tokens_details.thinking_tokens` reaches
+  `gen_ai.usage.reasoning.output_tokens`.** It was silently discarded by
+  the closed usage struct. Streaming too: `message_delta.usage` now
+  deep-merges over `message_start.usage`, so the cache tiers,
+  `server_tool_use` and the thinking tier survive SSE reassembly instead
+  of being reduced to four hand-picked fields.
+
 - **Three resource limits never reached the component that enforces them.**
   `LimitsConfig` accepted all three and reported them back, so the loss was
   invisible from the outside — no exception, no counter, no marker.
@@ -61,6 +94,43 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- **OpenAI Responses API parsing** (non-streaming + SSE): `operation=chat`
+  with `openai.api.type=responses`, full request/response semantics —
+  `reasoning.effort` -> `gen_ai.request.reasoning.level`,
+  `previous_response_id` -> `gen_ai.request.previous_response.id`, `status`
+  -> `gen_ai.response.status`, service tiers under
+  `openai.request/response.service_tier`, and `output[]` mapped
+  item-by-item onto OTel message parts. A `function_call` part's id is the
+  `call_id` — the key the next turn's `function_call_output` quotes, so
+  tool calls correlate across turns. Streaming takes the terminal event's
+  complete snapshot over accumulated deltas; a stream that ends without
+  its terminal event is counted
+  (`interceptors.seam.stream_unterminated`), and background-mode creates
+  (`status=queued`, no usage) are captured as identified, tokenless spans
+  by design — their usage exists only on the not-yet-captured
+  `GET /v1/responses/{id}` path.
+- **The open usage mirror**: every scalar leaf of a provider `usage`
+  object rides the span as `wardex.usage.<dotted provider path>`, spelling
+  preserved (`wardex.usage.cache_creation.ephemeral_1h_input_tokens`,
+  `wardex.usage.server_tool_use.web_search_requests`,
+  `wardex.usage.input_tokens_details.cache_write_tokens`, string tiers
+  like `wardex.usage.service_tier` included). The normalized
+  `gen_ai.usage.*` fields are unchanged and cap-immune; the mirror is what
+  a cost pipeline reads without knowing wardex's mapping, and what keeps a
+  provider's NEW billing counter from being silently discarded by a typed
+  table that predates it.
+- **`max_extra_keys`** (core limits table, default 64): bounds the one
+  open key family above. Crossing it drops whole leaves and says so —
+  marker **`extra_keys_dropped`** (`wardex.v1.Limitation` 44, distinct
+  from `otlp_attribute_truncated`, which cuts VALUES on the export
+  surface) plus `wardex.usage_leaves.dropped_count` and the
+  `interceptors.seam.usage_leaves_dropped` counter, all three gated on an
+  identified LLM span.
+- Chat Completions: `openai.api.type=chat_completions`, request/response
+  `service_tier`, `system_fingerprint`, `reasoning_effort` ->
+  `gen_ai.request.reasoning.level`, and `response_format.type` ->
+  `gen_ai.output.type=json` for the JSON modes. Anthropic:
+  `output_config.effort` -> `gen_ai.request.reasoning.level`.
 - **`session_entry_table_full`** (`wardex.v1.Limitation` 43) — a per-session
   table crossed `max_session_entries` and its oldest entry was force-closed and
   emitted to admit a new one. Distinct from `unit_table_full` (40) even though
@@ -107,6 +177,32 @@ All notable changes to this project are documented here. The format follows
 
 ### Changed
 
+- **`gen_ai.response.finish_reasons` has ONE producer and one spelling per
+  fact.** Chat, Anthropic, Responses and the Agent SDK adapter all
+  normalize through the same total function into the closed set `stop |
+  length | tool_call | content_filter | error`; an UNKNOWN provider value
+  passes through in the provider's own spelling instead of being dropped.
+  Wire values change accordingly (pre-1.0):
+
+  | provider raw | was emitted | now |
+  |---|---|---|
+  | anthropic `end_turn` | `end_turn` | `stop` |
+  | anthropic `stop_sequence` | `stop_sequence` | `stop` |
+  | anthropic `max_tokens` | `max_tokens` | `length` |
+  | anthropic `tool_use` | `tool_use` | `tool_call` |
+  | anthropic `refusal` | `refusal` | `content_filter` |
+  | chat `tool_calls` / `function_call` | raw | `tool_call` |
+  | responses `max_output_tokens` (incomplete) | — | `length` |
+  | responses `failed` / `cancelled` / `error` event | — | `error` |
+
+  `gen_ai.output.messages[].finish_reason` follows the same function, and
+  an unmapped value is now passed through rather than omitted. The OTel
+  bridge's passthrough of an external SDK's own `finish_reasons` is
+  deliberately NOT normalized — that channel quotes someone else's claim.
+- A cross-provider body on another provider's API path (an
+  Anthropic-shaped response on `/v1/chat/completions` at an unknown host)
+  is no longer cross-parsed as a chat call; dispatch is by
+  (provider, API shape).
 - Delivery of a resolved limit to its consumer goes through one projection
   (`_limits._LIMIT_DELIVERY`), and five structural guards hold it: every
   consumer parameter is classified, every construction expands the
