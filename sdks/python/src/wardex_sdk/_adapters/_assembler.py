@@ -1731,7 +1731,7 @@ class SessionAssembler:
         )
         draft.set_extra("wardex.step.name", step_name)
         draft.set_extra(OTEL_EXTRA_PREFIX + "span", span.name)
-        for key, value in allowlisted_extras(span.attrs):
+        for key, value in allowlisted_extras(span.attrs, demote_gen_ai_usage=conflicted):
             draft.set_extra(key, value)
         draft.set_conversation(self._conversation(sess))
         if span.status_code == 2:

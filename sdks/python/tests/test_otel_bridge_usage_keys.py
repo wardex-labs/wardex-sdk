@@ -182,11 +182,6 @@ def _carries_gen_ai_usage(span) -> bool:  # noqa: ANN001
 # --------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="defect B: allowlisted_extras passes the CLI's gen_ai.usage.* underscore "
-    "spellings through as top-level attributes on the conflicted increment",
-)
 def test_bridge_never_emits_gen_ai_usage_on_a_conflicted_span(receiver):
     spans = _ambiguous_session(receiver)
     siblings = [s for s in spans if s.name == "execute_step llm_request"]
@@ -209,14 +204,10 @@ def test_bridge_never_emits_gen_ai_usage_on_a_conflicted_span(receiver):
 # --------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="defect D: on an ambiguous join the CHAT draft and the conflicted "
-    "increments all carry the same tokens, so one call is billed as several "
-    "GENERATIONs by any backend whose classifier keys on the model attribute",
-)
 def test_an_ambiguous_join_reports_usage_exactly_once(receiver):
     spans = _ambiguous_session(receiver)
     carriers = [s for s in spans if _carries_gen_ai_usage(s)]
     assert len(carriers) == 1, [s.name for s in carriers]
     assert carriers[0].name.startswith("chat")
+    # The demotion is observable, not silent: one bump per demoted span.
+    assert counters.get("adapters.anthropic.otel_bridge.usage_demoted_on_conflict") == 2

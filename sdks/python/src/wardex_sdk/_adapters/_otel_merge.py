@@ -40,6 +40,14 @@ Attribute copying is allowlist-based on NAMED keys — never a prefix rule.
 ``gen_ai.*`` is deliberately not admitted wholesale: the CLI's telemetry is
 beta, and a prefix rule is the hole a future content-carrying ``gen_ai.*``
 key would walk through (the receiver's identity denylist is the other half).
+The named keys split by MEANING: identity keys always cross under their own
+names, while the usage QUANTITIES cross under their own names only on a span
+that is the authoritative reporter of those quantities. On a conflicted
+``llm_request`` — where the same tokens are already riding the unmerged CHAT
+draft — the usage keys are demoted into the ``wardex.*`` extras namespace:
+kept verbatim (nothing is silently lost), but invisible to any backend's
+``gen_ai.usage.`` prefix collector, so one LLM call is never priced twice
+and the CLI's underscore spellings never become top-level wire attributes.
 """
 
 from __future__ import annotations
@@ -80,19 +88,32 @@ _ALLOWED_KEYS = frozenset(
     }
 )
 
-#: The NAMED gen_ai keys the merge admits, copied under their own names.
-#: A closed list, not a prefix rule — see the module docstring.
-_ALLOWED_GEN_AI_KEYS = frozenset(
+#: The NAMED gen_ai IDENTITY keys the merge admits, always copied under
+#: their own names. A closed list, not a prefix rule — see the module
+#: docstring. Saying WHICH call a span was is safe on every span; these keys
+#: are what makes a conflicted increment findable next to its CHAT twin.
+_GEN_AI_IDENTITY_KEYS = frozenset(
     {
         "gen_ai.response.id",
         "gen_ai.response.model",
         "gen_ai.request.model",
         "gen_ai.response.finish_reasons",
+        "gen_ai.tool.call.id",
+    }
+)
+
+#: The NAMED gen_ai QUANTITY keys. Same closed-list discipline, different
+#: fate: they keep their own names only when the span is the authoritative
+#: reporter of the tokens (``demote_gen_ai_usage=False``). Note the CLI's
+#: underscore cache spellings — semconv's dotted spellings are the
+#: ``GenAIAttributes`` encoder's, and these must NEVER reach the wire as
+#: top-level attributes (``test_otlp_codec.py`` pins the negative).
+_GEN_AI_USAGE_KEYS = frozenset(
+    {
         "gen_ai.usage.input_tokens",
         "gen_ai.usage.output_tokens",
         "gen_ai.usage.cache_read_input_tokens",
         "gen_ai.usage.cache_creation_input_tokens",
-        "gen_ai.tool.call.id",
     }
 )
 
@@ -346,23 +367,43 @@ def join_chats(
     return outcome
 
 
-def allowlisted_extras(attrs: dict) -> list[tuple[str, object]]:
+def allowlisted_extras(attrs: dict, *, demote_gen_ai_usage: bool) -> list[tuple[str, object]]:
     """The attribute pairs the merge may copy onto a wardex span.
 
-    Scalars only, keys from the two NAMED sets only: unknown keys — including
-    unknown ``gen_ai.*`` keys — are dropped and counted like everything else.
-    This is the structural PII guarantee on top of the receiver's identity
-    denylist: nothing rides through on the strength of its prefix.
+    Scalars only, keys from the three NAMED sets only: unknown keys —
+    including unknown ``gen_ai.*`` keys — are dropped and counted like
+    everything else. This is the structural PII guarantee on top of the
+    receiver's identity denylist: nothing rides through on the strength of
+    its prefix.
+
+    ``demote_gen_ai_usage`` is the caller declaring whether this span is the
+    AUTHORITATIVE reporter of its usage quantities. ``False`` (pure
+    increments — none of which carry usage today): quantity keys keep their
+    own names. ``True`` (a conflicted ``llm_request``, whose tokens already
+    ride the unmerged CHAT draft): quantity keys are demoted under
+    ``OTEL_EXTRA_PREFIX`` — value preserved, spelling preserved, quoted
+    rather than asserted, exactly the sentence CORRELATION_CONFLICT already
+    puts on the span. No Python touches the numbers: the inclusive-total
+    rule has ONE implementation and it is the Rust constructor.
     """
     out: list[tuple[str, object]] = []
+    demoted = False
     for key, value in attrs.items():
         if not _scalar(value):
             counters.bump("adapters.anthropic.otel_bridge.attr_dropped")
             continue
-        if key in _ALLOWED_GEN_AI_KEYS:
+        if key in _GEN_AI_IDENTITY_KEYS:
             out.append((key, value))
+        elif key in _GEN_AI_USAGE_KEYS:
+            if demote_gen_ai_usage:
+                out.append((OTEL_EXTRA_PREFIX + key, value))
+                demoted = True
+            else:
+                out.append((key, value))
         elif key in _ALLOWED_KEYS:
             out.append((OTEL_EXTRA_PREFIX + key, value))
         else:
             counters.bump("adapters.anthropic.otel_bridge.attr_dropped")
+    if demoted:
+        counters.bump("adapters.anthropic.otel_bridge.usage_demoted_on_conflict")
     return out
