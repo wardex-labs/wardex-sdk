@@ -681,6 +681,88 @@ def test_a_close_with_no_open_and_no_breadcrumb_is_counted(tallies):
     assert tallies("adapters.assembler.tool_close_without_open") == 1
 
 
+def _subagents(client):
+    return [s for s in client.spans if s.agent is not None and s.name.startswith("invoke_agent ")]
+
+
+def test_the_subagent_table_evicts_and_emits_instead_of_dropping(tallies):
+    """The worse half of the same bound: this one said nothing at all.
+
+    A full `subagents` table simply refused to open the new entry — no span, no
+    counter, and the sub-agent's whole subtree quietly re-parented onto the
+    session root. One site of a bound reporting the wrong thing while its
+    sibling reports nothing is the inconsistency the vocabulary census exists to
+    catch.
+    """
+    client = FakeClient()
+    asm = SessionAssembler(client, max_session_entries=1)
+    _outbound(asm, key=1)
+    asm.on_inbound(1, INIT)
+    for agent_id in ("a1", "a2"):
+        asm.on_hook("SubagentStart", {"session_id": "s-1", "agent_id": agent_id}, None)
+
+    evicted = _subagents(client)
+    assert len(evicted) == 1
+    assert evicted[0].agent.id == "a1"
+    assert _has(evicted[0], Limitation.SESSION_ENTRY_TABLE_FULL)
+    assert evicted[0].status is StatusCode.UNSET
+    assert tallies("adapters.assembler.subagent_table_full") == 1
+
+
+def test_an_evicted_subagents_children_keep_their_parent():
+    """The eviction must not change the SHAPE of the tree.
+
+    FIFO evicts the oldest, which is the longest-lived, which is the outermost
+    sub-agent — the one with the most still-open work beneath it. Its anchors
+    are resolved at EMIT time and all three lookups fall silently to the session
+    root, so without the breadcrumb this trades one silent drop for a whole
+    silently flattened subtree, and nothing in the data says so.
+    """
+    client = FakeClient()
+    asm = SessionAssembler(client, max_session_entries=2)
+    _outbound(asm, key=1)
+    asm.on_inbound(1, INIT)
+    asm.on_hook("SubagentStart", {"session_id": "s-1", "agent_id": "a1"}, None)
+    asm.on_hook(
+        "PreToolUse",
+        {"session_id": "s-1", "tool_name": "Bash", "tool_input": {}, "agent_id": "a1"},
+        "t1",
+    )
+    for agent_id in ("a2", "a3"):  # a3 evicts a1, whose tool is still open
+        asm.on_hook("SubagentStart", {"session_id": "s-1", "agent_id": agent_id}, None)
+    asm.on_hook(
+        "PostToolUse", {"session_id": "s-1", "tool_name": "Bash", "tool_response": "ok"}, "t1"
+    )
+    asm.on_close(1, None)  # ships the session root, so "not the root" is checkable
+
+    a1 = next(s for s in _subagents(client) if s.agent.id == "a1")
+    tool = _tools(client, "t1")[0]
+    assert tool.parent_span_id == a1.context.span_id
+    root = next(s for s in client.spans if s.name == "invoke_agent")
+    assert tool.parent_span_id != root.context.span_id
+
+
+def test_a_subagent_stop_after_an_eviction_is_counted_not_dropped(tallies):
+    """No completion half, and no silent return either.
+
+    A tool's completion half exists because the close carries OUTPUT bytes. A
+    `SubagentStop` carries nothing this SDK reads — the assembler takes the
+    `agent_id` off it and no more — so a second span would hold nothing. What is
+    lost is the true end instant, and the counter is where that is recorded.
+    """
+    client = FakeClient()
+    asm = SessionAssembler(client, max_session_entries=1)
+    _outbound(asm, key=1)
+    asm.on_inbound(1, INIT)
+    for agent_id in ("a1", "a2"):
+        asm.on_hook("SubagentStart", {"session_id": "s-1", "agent_id": agent_id}, None)
+    before = len(_subagents(client))
+    asm.on_hook("SubagentStop", {"session_id": "s-1", "agent_id": "a1"}, None)
+
+    assert len(_subagents(client)) == before
+    assert tallies("adapters.assembler.subagent_stop_after_evict") == 1
+
+
 def test_the_session_id_becomes_a_lookup_alias_for_the_units_own_context():
     """The CLI's `session_id` is registered as a lookup ALIAS (design §5.3-iii).
 

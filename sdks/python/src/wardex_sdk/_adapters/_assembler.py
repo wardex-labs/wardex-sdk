@@ -63,6 +63,7 @@ from ._otel_merge import (
 )
 from ._session_state import (
     _BridgeBinding,
+    _EvictedSubagent,
     _EvictedTool,
     _OpenSubagent,
     _OpenTool,
@@ -430,7 +431,35 @@ class SessionAssembler:
                 self._close_tool(sess, payload, tool_use_id, now, failed=event.endswith("Failure"))
             elif event == "SubagentStart":
                 agent_id = payload.get("agent_id")
-                if agent_id and len(sess.subagents) < self._max_session_entries:
+                if agent_id:
+                    evicted = self._room_for(sess.subagents, "subagent")
+                    if evicted is not None:
+                        # This table used to REFUSE the newest entry with no
+                        # span and no counter — the same bound as the open-tool
+                        # table saying nothing where its sibling said the wrong
+                        # thing. Evicting the oldest and emitting it is what the
+                        # bound owes an entry that owns a span.
+                        evicted_id, entry = evicted
+                        self._emit_subagent_entry(
+                            sess,
+                            entry,
+                            evicted_id,
+                            now,
+                            markers=(Limitation.SESSION_ENTRY_TABLE_FULL,),
+                            status=StatusCode.UNSET,
+                        )
+                        # And the ANCHOR outlives the span, because the three
+                        # lookups that resolve a sub-agent do so at EMIT time.
+                        # Without this, evicting the oldest — i.e. the
+                        # longest-lived, outermost one — would re-parent every
+                        # still-open tool and every later chat turn beneath it
+                        # onto the session root and say nothing: one silent drop
+                        # traded for a whole silently flattened subtree. A
+                        # context stays a valid parent after its span ships.
+                        self._room_for(sess.evicted_subagents, "evicted_subagent")
+                        sess.evicted_subagents[evicted_id] = _EvictedSubagent(
+                            context=entry.draft.context, agent_type=entry.agent_type
+                        )
                     agent_type = payload.get("agent_type") or "sub_agent"
                     draft = SpanDraft(
                         child_of(sess.unit.context, _IN_SESSION),
@@ -784,10 +813,14 @@ class SessionAssembler:
         Returns the ANCHOR (a context this session already holds), not a span id:
         the edge itself is `child_of`'s to build. Selecting which anchor is still
         this method's job, and it is still a heuristic — a `parent_tool_use_id`
-        that resolves to nothing (the hook has not landed yet, or the subagent
-        was never recorded because `_max_session_entries` was reached) silently
-        re-parents to the session root. Making the session a unit and giving
-        in-process tool calls a real edge did NOT change that, deliberately:
+        that resolves to nothing silently re-parents to the session root. What
+        reaches that fallback is narrower than it was: a sub-agent evicted by
+        `_max_session_entries` is recorded and then evicted, and the
+        `_EvictedSubagent` breadcrumb keeps its context, so only a hook that has
+        not landed yet — or a breadcrumb that itself fell out of the same bound
+        — gets the root. Making the session a unit and giving
+        in-process tool calls a real edge did NOT change the fallback,
+        deliberately:
         rewriting this method is the ingestion move design §3.4 schedules
         separately — it stops choosing an anchor and produces a `UnitKey` for
         `UnitRegistry.resolve()`, which returns the evidence with the unit so the
@@ -796,12 +829,17 @@ class SessionAssembler:
         """
         if not parent_tool_use_id:
             return sess.unit.context
-        sub = sess.subagents.get(parent_tool_use_id)
+        agent_id = parent_tool_use_id
+        sub = sess.subagents.get(agent_id)
         if sub is None:
             open_tool = sess.open_tools.get(parent_tool_use_id)
             if open_tool is not None and open_tool.agent_id is not None:
-                sub = sess.subagents.get(open_tool.agent_id)
-        return sub.draft.context if sub is not None else sess.unit.context
+                agent_id = open_tool.agent_id
+                sub = sess.subagents.get(agent_id)
+        if sub is not None:
+            return sub.draft.context
+        crumb = sess.evicted_subagents.get(agent_id)
+        return crumb.context if crumb is not None else sess.unit.context
 
     def _emit_chat(self, sess: _Session, ev: AgentStreamEvent, now: int) -> None:
         if sess.bridge is not None:
@@ -939,12 +977,24 @@ class SessionAssembler:
         """
         if not parent_tool_use_id:
             return None
-        if parent_tool_use_id in sess.subagents:
+        if self._known_subagent(sess, parent_tool_use_id):
             return parent_tool_use_id
         open_tool = sess.open_tools.get(parent_tool_use_id)
-        if open_tool is not None and open_tool.agent_id in sess.subagents:
+        if open_tool is not None and self._known_subagent(sess, open_tool.agent_id):
             return open_tool.agent_id
         return None
+
+    @staticmethod
+    def _known_subagent(sess: _Session, agent_id: str | None) -> bool:
+        """Live, or evicted-but-remembered. One question, three call sites.
+
+        An evicted sub-agent is still a real scope: its context is a valid
+        parent and its subtree keeps its shape, so a chat turn inside it is
+        still that turn's scope key and not the main thread.
+        """
+        return agent_id is not None and (
+            agent_id in sess.subagents or agent_id in sess.evicted_subagents
+        )
 
     def _claim_key(self, sess: _Session, tool_name: str) -> UnitKey | None:
         """This hook observation's slot in the shared key space, or None.
@@ -1224,6 +1274,12 @@ class SessionAssembler:
             sub = sess.subagents.get(tool.agent_id)
             if sub is not None:
                 anchor = sub.draft.context
+            else:
+                # The sub-agent's own span may have shipped already — its bound
+                # evicted it — and a shipped span's context is still a parent.
+                crumb = sess.evicted_subagents.get(tool.agent_id)
+                if crumb is not None:
+                    anchor = crumb.context
         p = child_of(anchor, _IN_SESSION)
 
         draft = SpanDraft(
@@ -1358,19 +1414,34 @@ class SessionAssembler:
             error_type="tool_error" if ev.is_error else None,
         )
 
-    def _emit_subagent(self, sess: _Session, agent_id: str | None, now: int) -> None:
-        if agent_id is None:
-            return
-        entry = sess.subagents.pop(agent_id, None)
-        if entry is None:
-            return
+    def _emit_subagent_entry(
+        self,
+        sess: _Session,
+        entry: _OpenSubagent,
+        agent_id: str,
+        now: int,
+        *,
+        markers: tuple[Limitation, ...] = (),
+        status: StatusCode = StatusCode.OK,
+    ) -> None:
+        """Finish `entry`'s draft and emit (or pend) it.
+
+        Takes the RECORD, the way `_emit_tool` does, so the eviction site — which
+        already holds the record `_room_for` handed back — has something to call.
+        The pop-by-id shape is `_emit_subagent` below; a site that popped first
+        and then called that one would emit nothing at all.
+
+        Markers land BEFORE the pend, so an unmerged flush still carries them.
+        """
         if sess.bridge is not None:
             # The subagent draft was built at SubagentStart with its timing
             # marker already attached, and it keeps it merged or not: a
             # `subagent.spawn` cross-check adds the source, never a time
             # rewrite. Nothing to defer — held only so the merge can find it.
             with self._guard("adapters.assembler.emit_subagent"):
-                entry.draft.set_status(StatusCode.OK)
+                entry.draft.set_status(status)
+                for marker in markers:
+                    entry.draft.add_limitation(marker)
                 entry.draft.set_end_ns(now)
                 self._pend(
                     sess,
@@ -1379,10 +1450,33 @@ class SessionAssembler:
             return
         span = None
         with self._guard("adapters.assembler.emit_subagent"):
-            entry.draft.set_status(StatusCode.OK)
+            entry.draft.set_status(status)
+            for marker in markers:
+                entry.draft.add_limitation(marker)
             span = entry.draft.finish(now)
         if span is not None:
             self._capture(span)
+
+    def _emit_subagent(self, sess: _Session, agent_id: str | None, now: int) -> None:
+        """Pop by id and delegate — the `SubagentStop` / `_drain_children` shape.
+
+        A miss is no longer a silent return. After an eviction the entry is gone
+        and this stop observation is the only source of the real end instant, so
+        it is counted. No completion half is built: unlike a tool, a
+        `SubagentStop` carries no bytes this SDK reads — the assembler takes one
+        field off that payload, the `agent_id` used to look the entry up — so
+        there is nothing for a second span to hold. The evicted half already
+        says `[start, evicted]` with the marker and UNSET; what is lost is the
+        true end instant, and the counter is where that loss is recorded.
+        """
+        if agent_id is None:
+            return
+        entry = sess.subagents.pop(agent_id, None)
+        if entry is None:
+            if agent_id in sess.evicted_subagents:
+                counters.bump("adapters.assembler.subagent_stop_after_evict")
+            return
+        self._emit_subagent_entry(sess, entry, agent_id, now)
 
     # --- the bridge's pending buffer and finalize-time merge ---
 
