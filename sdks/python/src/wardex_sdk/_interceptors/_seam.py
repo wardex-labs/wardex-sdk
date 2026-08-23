@@ -215,6 +215,14 @@ class ByteSeamInterceptor(InterceptorInterface):
         # Defaults match the core's, so behavior is unchanged until _load_limits
         # resolves an actual config at install() time.
         self._limits: dict[str, int] = LimitsConfig().resolved()
+        # The WS tracker's projected keywords, built ONCE per limits load rather
+        # than per upgrade: a tracker is constructed on every WebSocket
+        # handshake, and this is the one projection on a path whose rate is set
+        # by the host's traffic. Initialized HERE as well as in `_load_limits`
+        # because a seam driven without `install()` is a real shape in this
+        # suite, and an attribute missing there would raise inside the host's
+        # own socket call rather than anywhere a test looks.
+        self._ws_kwargs: dict[str, int] = limits_kwargs(LimitsConsumer.WS_TRACKER, self._limits)
         self._native_limits: Any = None
 
     def _load_limits(self, client: Client | None) -> None:
@@ -222,6 +230,7 @@ class ByteSeamInterceptor(InterceptorInterface):
         config = getattr(client, "config", None)
         lim = config.limits if config is not None else LimitsConfig()
         self._limits = lim.resolved()
+        self._ws_kwargs = limits_kwargs(LimitsConsumer.WS_TRACKER, self._limits)
         self._native_limits = lim.to_native()
 
     def _fresh_patchset(self) -> PatchSet:
@@ -527,7 +536,7 @@ class ByteSeamInterceptor(InterceptorInterface):
                     parent_closed=txn.parent_closed,
                     start_ns=txn.start_ns,
                     limits=self._native_limits,
-                    sample_cap=self._limits["ws_sample_bytes"],
+                    **self._ws_kwargs,
                 )
                 st.tracker = ws
                 if txn.ws_leftover:

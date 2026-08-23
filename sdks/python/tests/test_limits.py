@@ -717,17 +717,15 @@ def _unit_registry(limits: LimitsConfig, sink: _DraftSink):
 
     The point of going through `resolved()` rather than passing an int straight
     in is that this probe then fails if the field stops being mirrored, not only
-    if the registry stops reading it.
+    if the registry stops reading it. Through the PROJECTION for the same
+    reason: this helper claims to build the registry the way production does,
+    and production expands `limits_kwargs`, so a bound added to the row would
+    otherwise reach the real construction and not this one.
     """
     from wardex_sdk._assembly import UnitRegistry
+    from wardex_sdk._limits import LimitsConsumer, limits_kwargs
 
-    resolved = limits.resolved()
-    return UnitRegistry(
-        sink=sink,
-        max_units=resolved["max_units"],
-        max_entries_per_unit=resolved["max_entries_per_unit"],
-        max_link_targets=resolved["max_link_targets"],
-    )
+    return UnitRegistry(sink=sink, **limits_kwargs(LimitsConsumer.UNIT_REGISTRY, limits.resolved()))
 
 
 def _open_unit(reg, key: str, parent=None):
