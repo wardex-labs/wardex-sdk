@@ -61,7 +61,14 @@ from ._otel_merge import (
     classify,
     join_chats,
 )
-from ._session_state import _BridgeBinding, _OpenSubagent, _OpenTool, _PendingSpan, _Session
+from ._session_state import (
+    _BridgeBinding,
+    _EvictedTool,
+    _OpenSubagent,
+    _OpenTool,
+    _PendingSpan,
+    _Session,
+)
 from ._sink import _ClientSink
 
 # Every span this assembler emits below the session root hangs off a context the
@@ -1011,13 +1018,21 @@ class SessionAssembler:
             # happened — sending the reader to look for a close instead of to
             # `max_session_entries`. UNSET rather than OK for the same reason:
             # this span's outcome was never observed.
-            _oldest_id, oldest = evicted
+            oldest_id, oldest = evicted
             self._emit_tool(
                 sess,
                 oldest,
                 now,
                 status=StatusCode.UNSET,
                 markers=(Limitation.SESSION_ENTRY_TABLE_FULL,),
+            )
+            # Under the SAME bound, so the memory of evictions cannot outgrow
+            # what it remembers for. Overflowing it is itself counted: a
+            # completion arriving after that is a call this session can no
+            # longer recognize, and the counter is the only record of why.
+            self._room_for(sess.evicted_tools, "evicted_tool")
+            sess.evicted_tools[oldest_id] = _EvictedTool(
+                start_ns=oldest.start_ns, name=oldest.name, agent_id=oldest.agent_id
             )
         sess.open_tools[tool_use_id] = _OpenTool(
             tool_use_id=tool_use_id,
@@ -1045,20 +1060,52 @@ class SessionAssembler:
             # so the message is a follow-up while the type is this change.
             error_type = "tool_interrupted" if payload.get("is_interrupt") else "tool_error"
         tool = sess.open_tools.pop(tool_use_id, None)
+        after_evict = False
         if tool is None:
+            crumb = sess.evicted_tools.get(tool_use_id)
+            if crumb is not None and crumb.completed:
+                # The third observation of one call: hook and stream both
+                # closed it. Two spans is the documented overlap; a third would
+                # pollute the aggregates the overlap rule already asks readers
+                # to correct for, and what is lost is one duplicate copy of a
+                # response the other half already carries.
+                counters.bump("adapters.assembler.tool_completion_after_evict_duplicate")
+                sess.stream_tool_meta.pop(tool_use_id, None)
+                return
             key = self._claim_key(sess, payload.get("tool_name") or "unknown")
             if key is None:
                 # Unattributable name: the handler owns it. Drop the stream side
                 # too, or the tool would resurface through the stream-only path.
                 sess.stream_tool_meta.pop(tool_use_id, None)
                 return
+            if crumb is not None:
+                # The COMPLETION half of an eviction: same call id, same start
+                # instant, same parent, and the same marker reported from the
+                # other end. Without the breadcrumb this is a brand-new record
+                # starting `now`, i.e. a second tool call of zero duration under
+                # whatever parent the payload happened to name.
+                counters.bump("adapters.assembler.tool_completion_after_evict")
+                crumb.completed = True
+                after_evict = True
+            else:
+                # No open record and no breadcrumb: either the adapter was
+                # installed mid-session or the breadcrumb table itself
+                # overflowed. The span still ships, with `start_ns=now` and so a
+                # duration of zero, and the counter is what says why.
+                counters.bump("adapters.assembler.tool_close_without_open")
             tool = _OpenTool(
                 tool_use_id=tool_use_id,
-                name=payload.get("tool_name") or "unknown",
-                start_ns=now,
-                agent_id=payload.get("agent_id"),
+                name=crumb.name if crumb is not None else (payload.get("tool_name") or "unknown"),
+                start_ns=crumb.start_ns if crumb is not None else now,
+                agent_id=crumb.agent_id if crumb is not None else payload.get("agent_id"),
                 input_data=_safe_json_bytes(payload.get("tool_input", {})),
-                from_hook=False,
+                # TRUE, and it was wrong before the breadcrumb existed too.
+                # Reaching here means no `PreToolUse` was SEEN, not that no hook
+                # delivered this call — `from_hook` records who ANNOUNCED the
+                # call, and a `PostToolUse` is a hook. False put `stdio` in
+                # `capture_sources`, reporting a hook-observed call as
+                # reconstructed from the CLI's stdout.
+                from_hook=True,
                 claim_key=key,
             )
         meta = sess.stream_tool_meta.pop(tool_use_id, None)
@@ -1077,6 +1124,12 @@ class SessionAssembler:
             tool,
             now,
             status=StatusCode.ERROR if failed else StatusCode.OK,
+            # Spelled at the call site rather than carried in a local named
+            # `markers`: the vocabulary census reads any argument bound to a
+            # marker-ish NAME as evidence that its callee is a marker sink, and
+            # `_emit_tool` would then have every argument at every one of its
+            # call sites read as a marker — including the `error.type` strings.
+            markers=(Limitation.SESSION_ENTRY_TABLE_FULL,) if after_evict else (),
             error_type=error_type,
         )
 
@@ -1244,22 +1297,49 @@ class SessionAssembler:
             # PostToolUse hook is the authority that will close it.
             return
         meta = sess.stream_tool_meta.pop(tool_use_id, None)
-        if meta is None:
-            # Already handled via the hook path (both open_tools and
-            # stream_tool_meta are empty for this id) -> nothing to do.
+        # BEFORE the `meta is None` return and not after it. The state this
+        # whole change is about — a full session table — is exactly the state in
+        # which BOTH tables are full, so a completion whose metadata was refused
+        # and whose open record was evicted is the common case, not the corner.
+        # Looking the breadcrumb up after the early return would lose that
+        # completion entirely: no span, no marker, no counter.
+        crumb = sess.evicted_tools.get(tool_use_id)
+        if crumb is not None and crumb.completed:
+            counters.bump("adapters.assembler.tool_completion_after_evict_duplicate")
             return
-        name, input_json = meta
+        if meta is None and crumb is None:
+            # Already handled via the hook path (open_tools, stream_tool_meta
+            # and the breadcrumbs are all empty for this id) -> nothing to do.
+            return
+        name = (meta[0] if meta is not None else "") or (
+            crumb.name if crumb is not None else "unknown"
+        )
+        input_json = meta[1] if meta is not None else b""
         key = self._claim_key(sess, name)
         if key is None:
             # In-process tool the hook cannot attribute to one server: the
             # handler wrapper's span is authoritative, so the stream-only
             # fallback stands down too.
             return
+        after_evict = False
+        start_ns = sess.turn_start_ns or now
+        agent_id: str | None = None
+        if crumb is not None:
+            # The completion half again, from the stream side. `agent_id` comes
+            # off the breadcrumb rather than the `None` this path used to
+            # hardcode: without it the two halves of one call hang under two
+            # different parents, the evicted half under its sub-agent and the
+            # completion under the session root.
+            counters.bump("adapters.assembler.tool_completion_after_evict")
+            crumb.completed = True
+            after_evict = True
+            start_ns = crumb.start_ns
+            agent_id = crumb.agent_id
         tool = _OpenTool(
             tool_use_id=tool_use_id,
             name=name,
-            start_ns=sess.turn_start_ns or now,
-            agent_id=None,
+            start_ns=start_ns,
+            agent_id=agent_id,
             input_data=input_json,
             from_hook=False,
             output_data=ev.content_json or b"",
@@ -1274,6 +1354,7 @@ class SessionAssembler:
             tool,
             now,
             status=StatusCode.ERROR if ev.is_error else StatusCode.OK,
+            markers=(Limitation.SESSION_ENTRY_TABLE_FULL,) if after_evict else (),
             error_type="tool_error" if ev.is_error else None,
         )
 

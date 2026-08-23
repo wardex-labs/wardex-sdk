@@ -85,6 +85,60 @@ class _OpenTool:
 
 
 @dataclass
+class _EvictedTool:
+    """What an open-tool record leaves behind when the bound evicts it.
+
+    WAR-76's shape one layer up: the registry writes `Unit._evicted` so a later
+    refusal can name wardex's own bound instead of the host's lifecycle, and
+    this is the same breadcrumb for a later COMPLETION. Without it a
+    `PostToolUse` that arrives after its open record was evicted is
+    indistinguishable from a tool wardex never saw open — and the span built
+    for it claims a duration of zero and a parent it did not earn.
+
+    Three remembered fields and deliberately not a fourth. `start_ns`, `name`
+    and `agent_id` are what the completion CANNOT re-derive: the stream path
+    rebuilds the record with `agent_id=None` hardcoded and would hang the two
+    halves of one call under two different parents, and the stream metadata
+    that would have supplied the name may itself be gone. `claim_key` is
+    deliberately RE-DERIVED at completion time rather than remembered —
+    `_claim_key` re-runs the arbitration, which is the correct reading at that
+    instant. `input_data` is deliberately NOT remembered: it is the bytes, i.e.
+    the thing the bound exists to stop holding, and a breadcrumb that carried
+    them would leave the bound as a name with no memory behind it.
+
+    `completed` is the third-observation latch. A call can be closed by its
+    hook AND by the stream; the first builds the completion half and the second
+    is suppressed and counted, because a third span would pollute the very
+    aggregates the overlap rule already asks readers to correct for.
+    """
+
+    start_ns: int
+    name: str
+    agent_id: str | None
+    completed: bool = False
+
+
+@dataclass
+class _EvictedSubagent:
+    """The span CONTEXT an evicted sub-agent leaves behind, so its subtree keeps
+    its shape.
+
+    The three anchor lookups (`_tool_draft`, `_resolve_subagent_anchor`,
+    `_chat_agent_id`) resolve a sub-agent at EMIT time, not at open time, and
+    all three fall silently to the session root on a miss. Evicting a LIVE
+    sub-agent without this would re-parent every still-open tool and every later
+    chat turn of that sub-agent onto the root and say nothing — trading one
+    silent drop for a whole silently flattened subtree. A context stays a valid
+    parent after its span ships, so remembering it costs two fields and keeps
+    the tree literally identical to the un-evicted one.
+    """
+
+    #: SpanContext; typed Any because `_types` is off-limits in `_adapters/`.
+    context: Any
+    agent_type: str
+
+
+@dataclass
 class _OpenSubagent:
     """A subagent span opened at `SubagentStart` and finished at `SubagentStop`."""
 
@@ -127,6 +181,13 @@ class _Session:
     pending_prompt_hook_seen: bool = False
     open_tools: dict[str, _OpenTool] = field(default_factory=dict)  # keyed by tool_use_id
     subagents: dict[str, _OpenSubagent] = field(default_factory=dict)  # keyed by agent_id
+    #: What the two span-owning tables above leave behind when the bound evicts
+    #: an entry, under the SAME bound so the memory cannot outgrow what it
+    #: remembers for. Neither holds payload bytes: a call's input and output are
+    #: exactly what eviction is for, and a breadcrumb that kept them would make
+    #: the bound reclaim nothing. Both die with this record.
+    evicted_tools: dict[str, _EvictedTool] = field(default_factory=dict)  # keyed by tool_use_id
+    evicted_subagents: dict[str, _EvictedSubagent] = field(default_factory=dict)  # by agent_id
     turn_index: int = 0
     # Issued by wardex when the CLI has not (yet) reported a session id. §6.3:
     # `conversation_id` may not be the empty string — every span in one session

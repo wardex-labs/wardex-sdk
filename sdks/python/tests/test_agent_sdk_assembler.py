@@ -501,6 +501,186 @@ def test_the_evicted_tool_is_not_blamed_on_the_agent():
     assert evicted.error_type is None
 
 
+def _tool_result(tool_use_id, content="ok", parent=None):
+    return {
+        "type": "user",
+        "session_id": "s-1",
+        "parent_tool_use_id": parent or tool_use_id,
+        "message": {
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": tool_use_id, "content": content}],
+        },
+    }
+
+
+def _evict_one_tool(client=None, cap=1, agent_id=None):
+    """Open `cap + 1` tools so the FIRST is evicted, and hand back the assembler.
+
+    The shared arrangement of every completion-after-eviction test: what they
+    differ on is which channel delivers the completion afterwards.
+    """
+    client = client or FakeClient()
+    asm = SessionAssembler(client, max_session_entries=cap)
+    _outbound(asm, key=1)
+    asm.on_inbound(1, INIT)
+    for n in range(cap + 1):
+        payload = {"session_id": "s-1", "tool_name": "Bash", "tool_input": {"command": "ls"}}
+        if agent_id is not None:
+            payload["agent_id"] = agent_id
+        asm.on_hook("PreToolUse", payload, f"t{n}")
+    return client, asm
+
+
+def _tools(client, call_id):
+    return [s for s in client.spans if s.tool is not None and s.tool.call_id == call_id]
+
+
+def _has(span, marker):
+    return span.capture_integrity is not None and marker in span.capture_integrity.limitations
+
+
+def test_a_late_close_after_an_eviction_is_the_same_bound_twice(tallies):
+    """One call, two observations — not one call twice.
+
+    Before the breadcrumb, a `PostToolUse` whose open record had been evicted
+    built a brand-new record starting `now`: a second `execute_tool` of ZERO
+    duration, carrying no marker, hanging off whatever parent the payload named,
+    and tagged `stdio` as though it had been reconstructed from the CLI's
+    stdout. Four wrong facts about one call, and the p50 it dragged down was
+    the visible one.
+    """
+    client, asm = _evict_one_tool()
+    asm.on_hook(
+        "PostToolUse",
+        {"session_id": "s-1", "tool_name": "Bash", "tool_response": "late"},
+        "t0",
+    )
+
+    spans = _tools(client, "t0")
+    assert len(spans) == 2
+    evicted, completion = spans
+    assert evicted.status is StatusCode.UNSET
+    assert _has(evicted, Limitation.SESSION_ENTRY_TABLE_FULL)
+    assert _has(completion, Limitation.SESSION_ENTRY_TABLE_FULL)
+    assert b"late" in completion.output_data
+    # The real duration, and the same parent: both come off the breadcrumb.
+    assert completion.start_time_ns == evicted.start_time_ns
+    assert completion.end_time_ns > completion.start_time_ns
+    assert completion.parent_span_id == evicted.parent_span_id
+    # A `PostToolUse` IS a hook. Missing the OPEN hook does not make the close
+    # a reconstruction from stdout.
+    assert CaptureSource.STDIO not in completion.capture_sources
+    assert tallies("adapters.assembler.tool_completion_after_evict") == 1
+
+
+def test_a_stream_result_after_an_eviction_gets_the_same_treatment(tallies):
+    """The other completion channel. `stdio` is TRUE here — this one really is
+    rebuilt from the CLI's stdout — which is what makes its absence on the hook
+    path a statement rather than an accident."""
+    client, asm = _evict_one_tool()
+    asm.on_inbound(1, _tool_result("t0", "late"))
+
+    spans = _tools(client, "t0")
+    assert len(spans) == 2
+    evicted, completion = spans
+    assert _has(completion, Limitation.SESSION_ENTRY_TABLE_FULL)
+    assert b"late" in completion.output_data
+    assert completion.start_time_ns == evicted.start_time_ns
+    assert completion.parent_span_id == evicted.parent_span_id
+    assert CaptureSource.STDIO in completion.capture_sources
+    assert tallies("adapters.assembler.tool_completion_after_evict") == 1
+
+
+def test_both_halves_of_a_subagents_tool_keep_the_same_parent():
+    """The stream path hardcoded `agent_id=None`, so the completion half of a
+    sub-agent's tool call landed on the session root while the evicted half hung
+    under the sub-agent. One call, two parents, and a subtree that reports a
+    shape it never had."""
+    client = FakeClient()
+    asm = SessionAssembler(client, max_session_entries=2)
+    _outbound(asm, key=1)
+    asm.on_inbound(1, INIT)
+    asm.on_hook("SubagentStart", {"session_id": "s-1", "agent_id": "a1"}, None)
+    for n in range(3):
+        asm.on_hook(
+            "PreToolUse",
+            {"session_id": "s-1", "tool_name": "Bash", "tool_input": {}, "agent_id": "a1"},
+            f"t{n}",
+        )
+    asm.on_inbound(1, _tool_result("t0", "late"))
+    asm.on_hook("SubagentStop", {"session_id": "s-1", "agent_id": "a1"}, None)
+
+    spans = _tools(client, "t0")
+    assert len(spans) == 2
+    evicted, completion = spans
+    assert completion.parent_span_id == evicted.parent_span_id
+    sub = next(s for s in client.spans if s.agent is not None and s.agent.id == "a1")
+    assert completion.parent_span_id == sub.context.span_id
+
+
+def test_a_completion_survives_the_stream_metadata_being_gone_too(tallies):
+    """The lookup order, asserted where it bites.
+
+    A full session table is a state in which BOTH bounded tables are full, so
+    `stream_tool_meta` missing and `open_tools` evicted is the common case
+    rather than the corner. Reading the breadcrumb after the `meta is None`
+    early return would drop this completion entirely — no span, no marker, no
+    counter — precisely when the bound is doing the most work.
+    """
+    client, asm = _evict_one_tool()
+    # Nothing ever put `t0` into `stream_tool_meta`: no assistant turn announced
+    # it, which is exactly what a refused metadata entry looks like downstream.
+    asm.on_inbound(1, _tool_result("t0", "late"))
+
+    spans = _tools(client, "t0")
+    assert len(spans) == 2
+    completion = spans[1]
+    assert _has(completion, Limitation.SESSION_ENTRY_TABLE_FULL)
+    assert completion.name == "execute_tool Bash"  # the name came off the breadcrumb
+    assert tallies("adapters.assembler.tool_completion_after_evict") == 1
+
+
+def test_a_tool_completes_at_most_twice_after_an_eviction(tallies):
+    """Hook AND stream both close one call: the second completion is suppressed.
+
+    Two overlapping spans is a documented reading rule; a third would pollute
+    the aggregates that rule already asks readers to correct for. What is lost
+    is one duplicate copy of a response the surviving half already carries.
+    """
+    client, asm = _evict_one_tool()
+    asm.on_inbound(1, _tool_result("t0", "late"))
+    asm.on_hook(
+        "PostToolUse",
+        {"session_id": "s-1", "tool_name": "Bash", "tool_response": "late"},
+        "t0",
+    )
+
+    assert len(_tools(client, "t0")) == 2
+    assert tallies("adapters.assembler.tool_completion_after_evict") == 1
+    assert tallies("adapters.assembler.tool_completion_after_evict_duplicate") == 1
+
+
+def test_a_close_with_no_open_and_no_breadcrumb_is_counted(tallies):
+    """The residue: mid-session install, or a breadcrumb table that itself
+    overflowed. The span still ships — with a zero duration, which is the honest
+    consequence of not knowing when the call started — and the counter is the
+    only place that fact is recorded."""
+    client = FakeClient()
+    asm = SessionAssembler(client)
+    _outbound(asm, key=1)
+    asm.on_inbound(1, INIT)
+    asm.on_hook(
+        "PostToolUse",
+        {"session_id": "s-1", "tool_name": "Bash", "tool_response": "ok"},
+        "orphan",
+    )
+
+    span = _tools(client, "orphan")[0]
+    assert not _has(span, Limitation.SESSION_ENTRY_TABLE_FULL)
+    assert CaptureSource.STDIO not in span.capture_sources
+    assert tallies("adapters.assembler.tool_close_without_open") == 1
+
+
 def test_the_session_id_becomes_a_lookup_alias_for_the_units_own_context():
     """The CLI's `session_id` is registered as a lookup ALIAS (design §5.3-iii).
 
