@@ -1301,6 +1301,12 @@ _RUST_STR = re.compile(r'"((?:[^"\\]|\\.)*)"')
 
 _RUST_VEC_DECLARATIONS: dict[str, str] = {
     "crates/wardex-protocol/src/http1.rs": "ParsedHttp.limitations — the marker vector itself",
+    "crates/wardex-protocol/src/semantic/endpoint.rs": (
+        "path SEGMENTS (`/v1/responses` split on `/`) inside the last-segment "
+        "endpoint matcher — URL pieces, never limitation strings. No marker is "
+        "minted anywhere in endpoint recognition; a path that matches nothing "
+        "is parse_llm returning None."
+    ),
     "crates/wardex-protocol/src/semantic/usage.rs": (
         "a test-local Vec<&str> of usage-leaf PATHS (the determinism assertion "
         "sorts them) — dotted key names like `prompt_tokens_details.cached_tokens`, "

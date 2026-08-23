@@ -1,9 +1,11 @@
 //! LLM request/response body → semantic (gen_ai) extraction. framework-agnostic body parser.
-//! provider=host priority + body-shape fallback, operation=path. fail-safe (parse failure = partial/empty result).
+//! endpoint = the path's last segments (`endpoint::ENDPOINTS`); provider = host
+//! priority + body/SSE shape fallback. fail-safe (parse failure = partial/empty result).
 
 use std::io::Read;
 
 mod anthropic;
+pub mod endpoint;
 mod openai_chat;
 mod openai_embeddings;
 mod parts;
@@ -12,13 +14,14 @@ mod tests;
 pub mod usage;
 
 use anthropic::{fill_anthropic, reassemble_anthropic};
+use endpoint::{Api, Endpoint};
 use openai_chat::{fill_openai_chat, reassemble_openai};
 use openai_embeddings::fill_openai_embeddings;
 pub use parts::{normalize_finish_reason, FINISH_REASONS};
 use usage::UsageBounds;
 pub use usage::UsageLeaf;
 
-use crate::sse::{self, SseEvent};
+use crate::sse;
 use crate::usage::TokenUsage;
 use serde::Deserialize;
 use wardex_limits::Limits;
@@ -112,16 +115,6 @@ impl StringOrVec {
     }
 }
 
-fn operation_from_path(path: &str) -> Option<&'static str> {
-    if path.contains("/chat/completions") || path.contains("/messages") {
-        Some("chat")
-    } else if path.contains("/embeddings") {
-        Some("embeddings")
-    } else {
-        None
-    }
-}
-
 fn provider_from_host(host: &str) -> Option<&'static str> {
     if host.contains("openai") {
         Some("openai")
@@ -130,49 +123,6 @@ fn provider_from_host(host: &str) -> Option<&'static str> {
     } else {
         None
     }
-}
-
-/// Infers the provider from the response JSON shape (fallback when host doesn't match).
-fn provider_from_body(resp: &[u8]) -> Option<&'static str> {
-    let v: serde_json::Value = serde_json::from_slice(resp).ok()?;
-    let obj = v.as_object()?;
-    // anthropic: stop_reason or usage.input_tokens
-    if obj.contains_key("stop_reason")
-        || obj
-            .get("usage")
-            .and_then(|u| u.get("input_tokens"))
-            .is_some()
-    {
-        return Some("anthropic");
-    }
-    // openai: choices or usage.prompt_tokens or embeddings data+usage
-    if obj.contains_key("choices")
-        || obj
-            .get("usage")
-            .and_then(|u| u.get("prompt_tokens"))
-            .is_some()
-    {
-        return Some("openai");
-    }
-    None
-}
-
-/// Infers the provider from the SSE event shape.
-fn provider_from_sse(events: &[SseEvent]) -> Option<&'static str> {
-    for ev in events {
-        if ev.event.as_deref() == Some("message_start") {
-            return Some("anthropic");
-        }
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&ev.data) {
-            if v.get("type").and_then(|x| x.as_str()) == Some("message_start") {
-                return Some("anthropic");
-            }
-            if v.get("choices").is_some() {
-                return Some("openai");
-            }
-        }
-    }
-    None
 }
 
 /// If the body is SSE, reassemble it for semantic extraction. Otherwise None (falls through to the existing path).
@@ -187,37 +137,33 @@ fn try_parse_sse(
         return None;
     }
     let events = sse::parse(decoded);
-    let operation = operation_from_path(path).unwrap_or("chat");
-    let provider = provider_from_host(host).or_else(|| provider_from_sse(&events));
-    match provider {
-        Some("openai") => {
+    // The reassembler is selected by Api — path first, SSE grammar second.
+    // The old dispatch keyed on the HOST and defaulted to the Chat
+    // reassembler, which is exactly what fabricated an empty chat body out
+    // of a Responses stream on api.openai.com.
+    let matched = endpoint::from_path(path).or_else(|| endpoint::from_sse_shape(&events));
+    let _ = host; // provider is implied by the Api; the host adds nothing here
+    match matched.map(|e| e.api) {
+        Some(Api::OpenAiChatCompletions) => {
             let reassembled = reassemble_openai(&events);
-            let mut out = LlmSemantics {
-                provider: "openai".to_string(),
-                operation: operation.to_string(),
-                reassembled_from_stream: true,
-                stream_terminated: Some(reassembled.terminated),
-                decoded_response: Some(reassembled.body.clone()),
-                ..Default::default()
-            };
-            fill_openai_chat(&mut out, req, &reassembled.body, bounds);
+            let body = reassembled.body.clone();
+            let mut out = sse_semantics(matched.unwrap(), reassembled);
+            fill_openai_chat(&mut out, req, &body, bounds);
             Some(out)
         }
-        Some("anthropic") => {
+        Some(Api::AnthropicMessages) => {
             let reassembled = reassemble_anthropic(&events);
-            let mut out = LlmSemantics {
-                provider: "anthropic".to_string(),
-                operation: operation.to_string(),
-                reassembled_from_stream: true,
-                stream_terminated: Some(reassembled.terminated),
-                decoded_response: Some(reassembled.body.clone()),
-                ..Default::default()
-            };
-            fill_anthropic(&mut out, req, &reassembled.body, bounds);
+            let body = reassembled.body.clone();
+            let mut out = sse_semantics(matched.unwrap(), reassembled);
+            fill_anthropic(&mut out, req, &body, bounds);
             Some(out)
         }
+        // No reassembler understands this stream (a Responses stream until
+        // the Responses reassembler lands; embeddings never stream). The
+        // unidentified branch below is the honest fallback: raw payloads,
+        // and the seam marks `sse_unknown_provider` — whose meaning is
+        // exactly "no SSE reassembler recognized this stream".
         _ => {
-            // unidentified: concat the data payloads
             let raw = events
                 .iter()
                 .map(|e| e.data.as_str())
@@ -225,13 +171,27 @@ fn try_parse_sse(
                 .join("\n")
                 .into_bytes();
             Some(LlmSemantics {
-                operation: operation.to_string(),
+                operation: matched.map(|e| e.operation).unwrap_or("chat").to_string(),
                 output_type: Some("text".to_string()),
                 reassembled_from_stream: true,
                 decoded_response: Some(raw),
                 ..Default::default()
             })
         }
+    }
+}
+
+/// The shared SSE scaffold: provider/operation/api_type from the endpoint,
+/// the synthetic body, and the terminal verdict.
+fn sse_semantics(endpoint: Endpoint, reassembled: parts::Reassembled) -> LlmSemantics {
+    LlmSemantics {
+        provider: endpoint.api.provider().to_string(),
+        operation: endpoint.operation.to_string(),
+        api_type: endpoint.api_type,
+        reassembled_from_stream: true,
+        stream_terminated: Some(reassembled.terminated),
+        decoded_response: Some(reassembled.body),
+        ..Default::default()
     }
 }
 
@@ -272,19 +232,33 @@ pub fn parse_llm(
     if let Some(s) = try_parse_sse(host, path, req, &decoded, bounds) {
         return Some(s);
     }
-    let operation = operation_from_path(path)?;
-    let provider = provider_from_host(host).or_else(|| provider_from_body(&decoded))?;
+    // Non-streaming: the ENDPOINT is decided by the path alone (conservative
+    // — same reach as before, minus the substring false positives). The body
+    // shape decides only the PROVIDER, when the host names none.
+    let matched = endpoint::from_path(path)?;
+    let provider = provider_from_host(host).or_else(|| {
+        serde_json::from_slice::<serde_json::Value>(&decoded)
+            .ok()
+            .and_then(|v| endpoint::from_body_shape(&v))
+            .map(|e| e.api.provider())
+    })?;
     let mut out = LlmSemantics {
         provider: provider.to_string(),
-        operation: operation.to_string(),
+        operation: matched.operation.to_string(),
+        api_type: matched.api_type,
         decoded_response: Some(decoded.clone()),
         ..Default::default()
     };
-    match (provider, operation) {
-        ("openai", "chat") => fill_openai_chat(&mut out, req, &decoded, bounds),
-        ("openai", "embeddings") => fill_openai_embeddings(&mut out, req, &decoded, bounds),
-        ("anthropic", "chat") => fill_anthropic(&mut out, req, &decoded, bounds),
-        _ => {} // unsupported combination (e.g. anthropic embeddings) is left as empty semantics
+    match (provider, matched.api) {
+        ("openai", Api::OpenAiChatCompletions) => fill_openai_chat(&mut out, req, &decoded, bounds),
+        ("openai", Api::OpenAiEmbeddings) => {
+            fill_openai_embeddings(&mut out, req, &decoded, bounds)
+        }
+        ("anthropic", Api::AnthropicMessages) => fill_anthropic(&mut out, req, &decoded, bounds),
+        // A provider on another provider's API (and, until its parser lands,
+        // the Responses API) is left as empty semantics — same fail-safe
+        // posture as before.
+        _ => {}
     }
     Some(out)
 }

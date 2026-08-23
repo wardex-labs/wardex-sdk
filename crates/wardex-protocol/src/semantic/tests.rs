@@ -1543,3 +1543,42 @@ fn usage_leaves_are_capped_by_max_extra_keys() {
     assert_eq!(unlimited.usage_dropped_count, 0);
     assert_eq!(unlimited.usage_leaves.len(), 7);
 }
+
+/// T-R13 — the regression pin for the fabricated body: a Responses SSE
+/// stream on the OpenAI host must never come back as a chat-shaped JSON the
+/// Chat reassembler invented (empty content, null id/model). The dispatch
+/// goes by Api now, so the Chat reassembler cannot receive the stream.
+#[test]
+fn responses_sse_on_openai_host_never_yields_a_fabricated_chat_body() {
+    let sse = b"event: response.created\ndata: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"resp_1\",\"object\":\"response\",\"status\":\"in_progress\",\"model\":\"gpt-4.1\",\"output\":[]}}\n\n";
+    let s = parse_llm(
+        "api.openai.com",
+        "/v1/responses",
+        br#"{"model":"gpt-4.1","stream":true}"#,
+        sse,
+        Limits::default(),
+    )
+    .unwrap();
+    let body = String::from_utf8(s.decoded_response.unwrap()).unwrap();
+    assert!(
+        !body.contains("\"choices\""),
+        "a Responses stream must not be re-shaped as a chat completion: {body}"
+    );
+}
+
+/// The substring false positives, fixed: token counting and batch management
+/// under /v1/messages are NOT chat calls, and their spans must not carry a
+/// false `semantic_parse_failed`.
+#[test]
+fn count_tokens_and_batches_are_not_chat_calls() {
+    for path in ["/v1/messages/count_tokens", "/v1/messages/batches"] {
+        let s = parse_llm(
+            "api.anthropic.com",
+            path,
+            br#"{"model":"claude-sonnet-4-6","messages":[]}"#,
+            br#"{"input_tokens": 14}"#,
+            Limits::default(),
+        );
+        assert!(s.is_none(), "{path} parsed as an LLM call");
+    }
+}

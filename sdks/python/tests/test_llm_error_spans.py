@@ -259,13 +259,16 @@ def test_semantic_parse_failed_still_has_a_live_path():
     deciding to stop enforcing it.
 
     A 200 from an LLM host whose body yields no tokens, no response model and no
-    output messages is exactly what it is for.
+    output messages is exactly what it is for. The body below is nonsense ON
+    THE CHAT ENDPOINT ITSELF: the old example (`/v1/messages/batches`) stopped
+    reaching the parser when the endpoint table replaced substring matching —
+    that path was one of the false positives the table exists to remove.
     """
     span = _drive(
         mode=CaptureMode.ALL,
         status_line=b"200 OK",
-        body=json.dumps({"id": "b", "type": "message_batch"}).encode(),
-        path=b"/v1/messages/batches",
+        body=json.dumps({"id": "b", "type": "unexpected_shape"}).encode(),
+        path=b"/v1/messages",
         request=b"{}",
     )
 
