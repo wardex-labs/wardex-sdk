@@ -808,6 +808,13 @@ class Unit:
             )
             if self._input_truncated or self._output_truncated:
                 draft.integrity.truncated(True)
+                # The FACT is already on the wire (`CaptureIntegrity.truncated`
+                # is a span field), so this is not a silent loss being made
+                # visible — it is the AGGREGATE, which the span cannot answer.
+                # "I lowered max_body_bytes; how much am I cutting now?" is a
+                # question about a rate, and the cap only became configurable
+                # in the same change that added this counter.
+                counters.bump("assembly._units.record_truncated")
         draft.set_status(status)
         if error_type is not None:
             draft.set_error(error_type)
@@ -866,6 +873,7 @@ class UnitRegistry:
         max_units: int | None = None,
         max_entries_per_unit: int | None = None,
         max_link_targets: int | None = None,
+        max_body_bytes: int | None = None,
         debug: bool = False,
     ) -> None:
         """`max_*` default from the CORE, never from a Python literal.
@@ -903,8 +911,14 @@ class UnitRegistry:
         # Bytes a unit may accumulate through record_input/record_output. Not a
         # knob of its own: the payload ceiling the rest of the SDK already
         # applies to a captured body is the honest ceiling for one assembled
-        # from many fragments.
-        self._max_record_bytes = resolved["max_body_bytes"]
+        # from many fragments. The PARAMETER is spelled after the knob rather
+        # than after the attribute, because the two mean different things —
+        # `max_body_bytes` caps one body, `_max_record_bytes` caps a record
+        # accumulated from many — and the delivery table reads better when the
+        # keyword and the field it comes from are the same word.
+        self._max_record_bytes = (
+            max_body_bytes if max_body_bytes is not None else resolved["max_body_bytes"]
+        )
         # `max_units` bounds ROOTS, deliberately (a flat LRU would make "evict
         # the oldest unit" pick a long-lived session root nearly every time, so
         # one chatty session would evict OTHER sessions' roots). Children are
@@ -931,13 +945,15 @@ class UnitRegistry:
     def max_record_bytes(self) -> int:
         """The byte ceiling `record_input`/`record_output` enforce.
 
-        The resolved core `max_body_bytes` (see `__init__`). Exposed so a
-        describe function that SHAPES a payload before recording can stop
-        materializing at exactly the boundary storage would cut — read at the
-        enforcement point, because the two budgets cannot disagree when they
-        are one read. Any other source CAN: `context_for` never passes
-        `max_body_bytes` into the registry, so a client override reaches
-        `AdapterContext.limits` without reaching this cap.
+        The configured `max_body_bytes` (see `__init__`). Exposed so a describe
+        function that SHAPES a payload before recording can stop materializing
+        at exactly the boundary storage would cut — read at the enforcement
+        point, because the two budgets cannot disagree when they are one read.
+        Any other source can: reading `AdapterContext.limits` instead would put
+        a second source under the same name, and this property spent a release
+        being exactly that — the registry resolved the CORE default while
+        `ctx.limits` reported the host's, so the shaper and the cap agreed with
+        each other and both disagreed with the user.
         """
         return self._max_record_bytes
 

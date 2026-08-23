@@ -1329,10 +1329,6 @@ def test_recorded_io_is_bounded_and_says_when_it_truncated():
     assert span.capture_integrity.truncated is True
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="UnitRegistry has no max_body_bytes parameter, so the bound cannot be configured",
-)
 def test_lowered_body_cap_bounds_what_a_unit_retains():
     """The user-visible end of the body cap: what a unit KEEPS, and the tally.
 

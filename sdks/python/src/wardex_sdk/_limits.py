@@ -164,6 +164,7 @@ _LIMIT_DELIVERY: dict[LimitsConsumer, _Delivery] = {
             "max_units": "max_units",
             "max_entries_per_unit": "max_entries_per_unit",
             "max_link_targets": "max_link_targets",
+            "max_body_bytes": "max_body_bytes",
         },
         native=frozenset(),
         passthrough=frozenset({"sink", "debug"}),
