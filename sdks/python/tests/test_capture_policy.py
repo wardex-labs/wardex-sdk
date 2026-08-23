@@ -977,3 +977,18 @@ def test_mcp_stdio_does_not_parent_a_tool_call_into_a_finished_run():
     assert span.context.trace_id != dead.context.trace_id
     assert span.correlation.strategy is ParentSource.UNRESOLVED
     assert Limitation.PARENT_UNRESOLVED in span.capture_integrity.limitations
+
+
+def test_a_hand_built_double_survives_the_open_usage_path():
+    """T-P9 — the seam's new consumers (provider_extras, the drop gate,
+    embeddings_attrs) are driven inside the same fail-open block as
+    build_gen_ai, against doubles that answer None for everything. They must
+    yield nothing — never raise — or the swallow above them fails OPEN and
+    captures everything.
+    """
+    from wardex_sdk._semantics import embeddings_attrs, provider_extras
+
+    assert provider_extras(LLM) == []
+    assert provider_extras(GENERIC) == []
+    assert embeddings_attrs(LLM) is None
+    assert embeddings_attrs(GENERIC) is None
