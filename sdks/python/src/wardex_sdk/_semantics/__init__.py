@@ -45,6 +45,12 @@ else:
   them into a single predicate is how the refusal came to be treated as
   uninterpretable traffic.
 
+  `provider_extras` / `embeddings_attrs` / `USAGE_DROPPED_KEY` — the open
+  half of the gen_ai mapping: registry-namespaced provider scalars
+  (`openai.*`), the provider-usage mirror (`wardex.usage.*`, whose drop-count
+  key is exported so the seam and this module cannot drift on its spelling),
+  and the embeddings block.
+
   `build_grpc_fields` — the gRPC branch, the one with enough protocol logic to
   be worth testing on its own.
 
@@ -58,14 +64,24 @@ the lookup and none of the fallback, so the mapping is the export and the table
 is not.
 """
 
-from ._genai import build_gen_ai, has_core_semantics, identifies_llm_call
+from ._genai import (
+    USAGE_DROPPED_KEY,
+    build_gen_ai,
+    embeddings_attrs,
+    has_core_semantics,
+    identifies_llm_call,
+    provider_extras,
+)
 from ._grpc import build_grpc_fields
 from ._ws import ws_close_name
 
 __all__ = [
+    "USAGE_DROPPED_KEY",
     "build_gen_ai",
     "build_grpc_fields",
+    "embeddings_attrs",
     "has_core_semantics",
     "identifies_llm_call",
+    "provider_extras",
     "ws_close_name",
 ]

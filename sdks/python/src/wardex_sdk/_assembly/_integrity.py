@@ -720,6 +720,30 @@ Two emit sites, and the first is the mechanism the second restates.
     user to raise a capture cap that was never the constraint.
     """
 
+    EXTRA_KEYS_DROPPED = "extra_keys_dropped"
+    """An open dynamic key family crossed ``max_extra_keys`` and whole leaves
+    were dropped; how many rides beside the marker as
+    ``wardex.usage_leaves.dropped_count``.
+
+    Emitted from ``_interceptors/_seam.py``, off the native parser's
+    ``usage_dropped_count`` — today the bound has exactly one enforcement
+    site, the provider-usage mirror (``wardex.usage.*``): every scalar leaf
+    of the provider's usage object, spelling preserved, which is an OPEN
+    family because providers add billing counters faster than any typed
+    table follows (design §6.5 tier 1 is this exact case). Lowering the
+    knob prunes usage leaves only until draft-level enforcement lands.
+
+    Not ``OTLP_ATTRIBUTE_TRUNCATED`` (39), by the census rule: that one
+    names ``max_otlp_attribute_bytes`` and cuts VALUES on the export
+    surface; this one names ``max_extra_keys`` and drops whole KEYS at
+    capture. An integer usage leaf can never carry 39 at all (numeric
+    values are not truncatable), and a string leaf can carry both,
+    independently. The count also includes two structural sanity bounds on
+    the same family (path > 120 bytes, depth > 6) that no real provider
+    usage object approaches — so every drop a real workload sees is
+    ``max_extra_keys``'s, and the marker's knob is the user's next action.
+    """
+
     # ------------------------------------------------------------------
     # Parsing / interpretation (census)
     # ------------------------------------------------------------------

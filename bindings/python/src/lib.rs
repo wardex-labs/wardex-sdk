@@ -252,6 +252,53 @@ impl LlmSemantics {
     fn usage_overflowed(&self) -> bool {
         self.inner.usage.overflowed()
     }
+    /// semconv `openai.api.type` (`chat_completions` | `responses`); None
+    /// for other providers.
+    #[getter]
+    fn api_type(&self) -> Option<&'static str> {
+        self.inner.api_type
+    }
+    #[getter]
+    fn request_service_tier(&self) -> Option<String> {
+        self.inner.request_service_tier.clone()
+    }
+    #[getter]
+    fn response_service_tier(&self) -> Option<String> {
+        self.inner.response_service_tier.clone()
+    }
+    #[getter]
+    fn system_fingerprint(&self) -> Option<String> {
+        self.inner.system_fingerprint.clone()
+    }
+    /// `gen_ai.request.reasoning.level` — the exact string the caller sent.
+    #[getter]
+    fn reasoning_level(&self) -> Option<String> {
+        self.inner.reasoning_level.clone()
+    }
+    /// `gen_ai.request.previous_response.id` (Responses chaining).
+    #[getter]
+    fn previous_response_id(&self) -> Option<String> {
+        self.inner.previous_response_id.clone()
+    }
+    /// `gen_ai.response.status` (Responses only).
+    #[getter]
+    fn response_status(&self) -> Option<String> {
+        self.inner.response_status.clone()
+    }
+    #[getter]
+    fn encoding_formats(&self) -> Option<Vec<String>> {
+        self.inner.encoding_formats.clone()
+    }
+    #[getter]
+    fn embedding_dimensions(&self) -> Option<i64> {
+        self.inner.embedding_dimensions
+    }
+    /// SSE only (None otherwise): did the stream carry its provider's
+    /// terminal event. `Some(false)` feeds a diagnostics counter, no marker.
+    #[getter]
+    fn stream_terminated(&self) -> Option<bool> {
+        self.inner.stream_terminated
+    }
     /// The `wardex.usage.*` mirror: every scalar leaf of the provider's
     /// usage tree, provider spelling preserved, as (dotted path, value).
     #[getter]

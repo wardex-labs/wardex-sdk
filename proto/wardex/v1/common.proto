@@ -217,6 +217,17 @@ enum Limitation {
   //    COST on a wire that measures it after the base64 rewrite. A body inside
   //    the first and outside the second is the ordinary case, not a corner.
   LIMITATION_OTLP_ATTRIBUTE_TRUNCATED = 39;
+  //    Names `max_extra_keys`: an open dynamic key family (today exactly one —
+  //    the provider-usage mirror, `wardex.usage.*`) crossed the key-count
+  //    bound and whole leaves were dropped; the count rides beside it as
+  //    `wardex.usage_leaves.dropped_count`. Not OTLP_ATTRIBUTE_TRUNCATED,
+  //    which names `max_otlp_attribute_bytes` and cuts VALUES; this one
+  //    counts KEYS and drops whole leaves — an integer leaf is never subject
+  //    to 39 at all, and a string leaf can carry both independently. Its
+  //    count also includes two structural sanity bounds on the same family
+  //    (path > 120 bytes, depth > 6) which no real provider usage object
+  //    approaches — every drop a real workload sees names the knob.
+  LIMITATION_EXTRA_KEYS_DROPPED = 44;
 
   // -- Parsing / interpretation.
   LIMITATION_FRAME_PARSE_FAILED = 25;

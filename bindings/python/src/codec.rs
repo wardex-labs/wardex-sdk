@@ -212,6 +212,14 @@ fn flatten_gen_ai(g: &Bound<PyAny>, out: &mut Vec<pb::KeyValue>) -> PyResult<()>
         ("response_model", "gen_ai.response.model"),
         ("response_id", "gen_ai.response.id"),
         ("prompt_name", "gen_ai.prompt.name"),
+        // Pre-adopted from semconv-genai main (consumerless additive keys
+        // only — a rename before release costs one row here + one test row).
+        ("reasoning_level", "gen_ai.request.reasoning.level"),
+        (
+            "previous_response_id",
+            "gen_ai.request.previous_response.id",
+        ),
+        ("response_status", "gen_ai.response.status"),
     ] {
         if let Some(v) = opt(g, attr)? {
             out.push(kv_str(key, v.extract()?));
@@ -282,6 +290,14 @@ fn flatten_gen_ai(g: &Bound<PyAny>, out: &mut Vec<pb::KeyValue>) -> PyResult<()>
             v.extract()?
         };
         out.push(kv_str("gen_ai.output.type", s));
+    }
+    Ok(())
+}
+
+/// EmbeddingsAttributes → extra KeyValue. Only populated fields.
+fn flatten_embeddings(e: &Bound<PyAny>, out: &mut Vec<pb::KeyValue>) -> PyResult<()> {
+    if let Some(v) = opt(e, "dimension_count")? {
+        out.push(kv_int("gen_ai.embeddings.dimension.count", v.extract()?));
     }
     Ok(())
 }
@@ -640,6 +656,9 @@ fn span_to_proto(sp: &Bound<PyAny>) -> PyResult<pb::Span> {
     }
     if let Some(t) = opt(sp, "tool")? {
         flatten_tool(&t, &mut span.extra)?;
+    }
+    if let Some(e) = opt(sp, "embeddings")? {
+        flatten_embeddings(&e, &mut span.extra)?;
     }
     if let Some(t) = opt(sp, "transport")? {
         span.transport = Some(transport_to_proto(&t)?);
