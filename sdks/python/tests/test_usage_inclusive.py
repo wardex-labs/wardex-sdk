@@ -311,3 +311,59 @@ def test_stream_json_cache_without_input_tokens_bumps_the_counter():
     assert chat.gen_ai.cache_read_input_tokens == 8000
     assert counters.get("adapters.assembler.stream_usage_totals_unpaired") == 1
     assert counters.get("adapters.assembler.stream_usage_overflowed") == 0
+
+
+# --------------------------------------------------------------------------
+# G5 — the public-surface choke point counts what the type system cannot see
+# --------------------------------------------------------------------------
+
+
+def test_set_gen_ai_counts_a_non_inclusive_block():
+    """A hand-built exclusive block is counted AND shipped, never rejected.
+
+    `GenAIAttributes` is public API and `flatten_gen_ai` encodes whatever it
+    is given; the Rust constructor cannot reach a block a third-party adapter
+    built by hand. `SpanDraft.set_gen_ai` is the one choke point every span
+    passes, so the violation is tallied there — and the span still ships,
+    because breaking the host over a diagnostic is not this SDK's trade.
+    """
+    from wardex_sdk._assembly import AMBIENT, Ambient, SpanDraft, SpanIntent, resolve_parentage
+    from wardex_sdk._enums import CaptureSource, OperationName
+
+    draft = SpanDraft(
+        resolve_parentage(Ambient(None, None, None), AMBIENT),
+        intent=SpanIntent.CHAT,
+        subject="claude-sonnet-4-6",
+        source=CaptureSource.ADAPTER,
+        start_ns=1,
+    )
+    draft.set_gen_ai(
+        GenAIAttributes(
+            operation=OperationName.CHAT,
+            request_model="claude-sonnet-4-6",
+            input_tokens=1000,  # < 8000 + 2000: the pre-fix exclusive shape
+            cache_read_input_tokens=8000,
+            cache_creation_input_tokens=2000,
+        )
+    )
+    assert counters.get("assembly.builder.gen_ai_usage_not_inclusive") == 1
+    span = draft.finish(2)
+    assert span is not None and span.gen_ai.input_tokens == 1000  # shipped as given
+
+
+def test_set_gen_ai_does_not_count_an_inclusive_block():
+    """The negative: wardex's own normalized output never bumps the tally."""
+    sem = _parse_anthropic()
+    attrs = build_gen_ai(sem)
+    from wardex_sdk._assembly import AMBIENT, Ambient, SpanDraft, SpanIntent, resolve_parentage
+    from wardex_sdk._enums import CaptureSource
+
+    draft = SpanDraft(
+        resolve_parentage(Ambient(None, None, None), AMBIENT),
+        intent=SpanIntent.CHAT,
+        subject="claude-sonnet-4-6",
+        source=CaptureSource.ADAPTER,
+        start_ns=1,
+    )
+    draft.set_gen_ai(attrs)
+    assert counters.get("assembly.builder.gen_ai_usage_not_inclusive") == 0

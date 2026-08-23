@@ -52,6 +52,7 @@ from .._types import (
     ToolAttributes,
     TransportAttributes,
 )
+from ._diag import counters
 from ._integrity import Limitation
 from ._parentage import EMPTY_AMBIENT, Evidence, Parentage, ParentSource, resolve_parentage
 from ._vocab import (
@@ -207,6 +208,25 @@ class IntegrityBuilder:
             # only at the two ends.
             limitations=tuple(self._markers),
         )
+
+
+def _violates_inclusive_totals(attrs: GenAIAttributes) -> bool:
+    """Whether a gen_ai block breaks the inclusive-totals invariant.
+
+    `gen_ai.usage.input_tokens` must contain the cache tiers and
+    `gen_ai.usage.output_tokens` must contain the reasoning tokens
+    (`crates/wardex-protocol/src/usage.rs` is where wardex's own parsers
+    make that true). `None` totals are NOT violations — a withheld total is
+    the honest shape for an unpaired sub-counter and is tallied separately
+    as `usage_totals_unpaired`.
+    """
+    input_short = attrs.input_tokens is not None and attrs.input_tokens < (
+        (attrs.cache_read_input_tokens or 0) + (attrs.cache_creation_input_tokens or 0)
+    )
+    output_short = attrs.output_tokens is not None and attrs.output_tokens < (
+        attrs.reasoning_output_tokens or 0
+    )
+    return input_short or output_short
 
 
 class SpanDraft:
@@ -400,6 +420,14 @@ class SpanDraft:
     # -- typed setters ---------------------------------------------------
 
     def set_gen_ai(self, attrs: GenAIAttributes) -> None:
+        # The one choke point every gen_ai block passes — in-tree parsers and
+        # third-party adapters alike. It CHECKS, and only checks: the
+        # inclusive-total rule has exactly one implementation (the Rust
+        # `TokenUsage` constructor), so no normalization here; and refusing
+        # would break the host over a diagnostic, so no rejection either.
+        # A violation is counted — observation, not enforcement.
+        if _violates_inclusive_totals(attrs):
+            counters.bump("assembly.builder.gen_ai_usage_not_inclusive")
         self._gen_ai = attrs
 
     def set_agent(self, attrs: AgentAttributes) -> None:
