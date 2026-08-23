@@ -32,7 +32,7 @@ from .._enums import (
     Protocol,
     StatusCode,
 )
-from .._limits import LimitsConfig
+from .._limits import LimitsConfig, LimitsConsumer, limits_kwargs
 from .._protocol import parse_llm_semantics
 from .._semantics import (
     build_gen_ai,
@@ -294,7 +294,7 @@ class ByteSeamInterceptor(InterceptorInterface):
         The flag is set AFTER the call, so a raising `install_shared_timing`
         leaves nothing for `_release_timing` to give back.
         """
-        install_shared_timing(self._limits["max_connections"])
+        install_shared_timing(**limits_kwargs(LimitsConsumer.CONN_TIMING, self._limits))
         self._timing_held = True
 
     def _release_timing(self) -> None:

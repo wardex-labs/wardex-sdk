@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import socket
 
-import pytest
-
 from wardex_sdk._interceptors import _conn_timing as ct
 
 
@@ -26,10 +24,6 @@ def test_shared_store_is_singleton():
     assert ct.shared_timing_store() is ct.shared_timing_store()
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="the shared store honours `cap` only when it BUILDS the store, and close() leaves it",
-)
 def test_a_second_init_reapplies_max_connections():
     """A host that re-inits with a different bound gets the FIRST one, forever.
 
