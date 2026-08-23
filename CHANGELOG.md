@@ -5,6 +5,51 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- **Three resource limits never reached the component that enforces them.**
+  `LimitsConfig` accepted all three and reported them back, so the loss was
+  invisible from the outside — no exception, no counter, no marker.
+  - `max_body_bytes` did not reach the logical-unit registry, which resolved
+    the core default instead. A host that lowered the cap still let one unit
+    accumulate 32 MiB, and the adapter-side shaping budget derived from that
+    cap was 32 MiB too, so a large tool argument was built in full and cut
+    afterwards. Observable delta for a host that lowered it: recording 8 MiB
+    into a unit configured with `max_body_bytes=64 * 1024` now retains 64 KiB
+    where it retained 8192 KiB.
+  - `max_entries_per_unit` did not reach the table of wrapped in-process MCP
+    servers, which the core documents as one of the tables it sizes. The
+    catalog is built before the adapter has a client and resolved the process
+    default for itself.
+  - `max_connections` was applied to the shared connection-timing store only
+    on the FIRST `init()`. `close()` empties that store without dropping it,
+    so a host that re-initialised with a different value kept the original for
+    the life of the process — and what it saw was a spurious
+    `connect_timing_unavailable`, which names no knob.
+### Added
+
+- `assembly._units.record_truncated` counts units whose recorded payload was
+  cut by the body cap. The fact was already on each span
+  (`capture_integrity.truncated`); the counter answers the aggregate question
+  a cap that can now be lowered makes worth asking.
+
+### Changed
+
+- Delivery of a resolved limit to its consumer goes through one projection
+  (`_limits._LIMIT_DELIVERY`), and five structural guards hold it: every
+  consumer parameter is classified, every construction expands the
+  projection, the native limits object is never dropped at a parser call,
+  every field is observed at its enforcement site through two real `init()`
+  round trips, and resolving the process defaults is allowed only where a
+  declared row gives a reason.
+- The private `SessionAssembler` no longer takes `max_units` /
+  `max_entries_per_unit`; the registry owns its own bounds, and an assembler
+  that has to build one resolves them from its client's config. A caller that
+  supplies a client and omits `max_sessions` now gets the host's value rather
+  than the core default.
+- The private `McpToolCatalog` no longer takes `max_entries` in its
+  constructor; `apply_bound(max_entries=...)` is the single handle.
+
 ## [0.5.0b1] - 2026-08-16
 
 This release carries the one deliberate breaking window before the Node and

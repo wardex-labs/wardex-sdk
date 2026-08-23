@@ -26,6 +26,23 @@ pub struct Limits {
     /// Body cap for content types carrying extractable meaning (JSON, text,
     /// SSE, form-encoded, gRPC). Defaults above the Anthropic Messages API
     /// request ceiling so LLM traffic can never be truncated.
+    ///
+    /// Host SDKs also reuse it for the SECOND quantity of the same order: the
+    /// bytes one logical unit accumulates through its adapter-side record
+    /// calls (in the Python SDK, `UnitRegistry`'s per-unit input/output
+    /// buffers), and the shaping budget a describe function derives from that
+    /// so it stops materializing exactly where storage would cut. Crossing it
+    /// truncates the record and sets the span's `truncated` integrity flag.
+    ///
+    /// So this value bounds RESIDENT memory as well as one message, and the
+    /// span buffer's `max_buffer_bytes` is not a backstop for it — a unit is
+    /// live before its span exists. The worst case is roughly
+    /// `2 * max_body_bytes` per live unit, and the ceiling on live units is
+    /// the derived `max_units * max_entries_per_unit`, not `max_units`. Raise
+    /// it deliberately: a host that raises this raises the transient cost of
+    /// shaping a payload too, which in the Python SDK peaks near four times
+    /// this value for escape-heavy text and is paid synchronously on the
+    /// caller's own thread.
     pub max_body_bytes: usize,
     /// Body cap for every other content type. Opaque bytes yield no semantics,
     /// so a small sample is kept purely for diagnostics.
