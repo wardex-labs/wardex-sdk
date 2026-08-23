@@ -1,0 +1,18 @@
+{
+ "provider": "openai",
+ "operation": "chat",
+ "api_type": "responses",
+ "request_model": "gpt-4.1",
+ "response_model": "gpt-4.1-2025-04-14",
+ "response_id": "resp_sse3",
+ "input_tokens": null,
+ "output_tokens": null,
+ "finish_reasons": [
+  "error"
+ ],
+ "output_messages_present": true,
+ "response_status": "failed",
+ "stream_terminated": true,
+ "error_code": "server_error",
+ "usage_leaves": {}
+}

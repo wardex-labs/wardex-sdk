@@ -1,0 +1,13 @@
+{
+ "id": "resp_fx5",
+ "object": "response",
+ "status": "queued",
+ "model": "gpt-4.1-2025-04-14",
+ "output": [],
+ "usage": null,
+ "error": null,
+ "created_at": 1756000000,
+ "parallel_tool_calls": true,
+ "tool_choice": "auto",
+ "tools": []
+}

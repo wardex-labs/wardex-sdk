@@ -1,0 +1,23 @@
+{
+ "provider": "openai",
+ "operation": "chat",
+ "api_type": "responses",
+ "request_model": "gpt-4.1",
+ "response_model": "gpt-4.1-2025-04-14",
+ "response_id": "resp_fx4",
+ "input_tokens": 9,
+ "output_tokens": 16,
+ "finish_reasons": [
+  "length"
+ ],
+ "output_messages_present": true,
+ "response_status": "incomplete",
+ "usage_leaves": {
+  "input_tokens": 9,
+  "output_tokens": 16,
+  "input_tokens_details.cached_tokens": 0,
+  "output_tokens_details.reasoning_tokens": 0,
+  "total_tokens": 25,
+  "input_tokens_details.cache_write_tokens": 8
+ }
+}

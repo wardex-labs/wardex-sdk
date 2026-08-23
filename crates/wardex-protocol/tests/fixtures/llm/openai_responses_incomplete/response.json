@@ -1,0 +1,40 @@
+{
+ "id": "resp_fx4",
+ "object": "response",
+ "status": "incomplete",
+ "model": "gpt-4.1-2025-04-14",
+ "incomplete_details": {
+  "reason": "max_output_tokens"
+ },
+ "output": [
+  {
+   "id": "msg_fx4",
+   "type": "message",
+   "status": "incomplete",
+   "role": "assistant",
+   "content": [
+    {
+     "type": "output_text",
+     "text": "It was a dark",
+     "annotations": []
+    }
+   ]
+  }
+ ],
+ "usage": {
+  "input_tokens": 9,
+  "output_tokens": 16,
+  "input_tokens_details": {
+   "cached_tokens": 0,
+   "cache_write_tokens": 8
+  },
+  "output_tokens_details": {
+   "reasoning_tokens": 0
+  },
+  "total_tokens": 25
+ },
+ "created_at": 1756000000,
+ "parallel_tool_calls": true,
+ "tool_choice": "auto",
+ "tools": []
+}

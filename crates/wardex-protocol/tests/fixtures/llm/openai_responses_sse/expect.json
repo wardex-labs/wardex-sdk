@@ -1,0 +1,26 @@
+{
+ "provider": "openai",
+ "operation": "chat",
+ "api_type": "responses",
+ "request_model": "gpt-4.1",
+ "response_model": "gpt-4.1-2025-04-14",
+ "response_id": "resp_sse1",
+ "input_tokens": 9,
+ "output_tokens": 6,
+ "cache_read_input_tokens": 2,
+ "finish_reasons": [
+  "stop"
+ ],
+ "output_messages_present": true,
+ "response_status": "completed",
+ "stream_terminated": true,
+ "output_text": "Hello from the snapshot!",
+ "usage_leaves": {
+  "input_tokens": 9,
+  "output_tokens": 6,
+  "input_tokens_details.cached_tokens": 2,
+  "output_tokens_details.reasoning_tokens": 0,
+  "total_tokens": 15,
+  "input_tokens_details.cache_write_tokens": 8
+ }
+}

@@ -8,6 +8,7 @@ mod anthropic;
 pub mod endpoint;
 mod openai_chat;
 mod openai_embeddings;
+mod openai_responses;
 mod parts;
 #[cfg(test)]
 mod tests;
@@ -17,6 +18,7 @@ use anthropic::{fill_anthropic, reassemble_anthropic};
 use endpoint::{Api, Endpoint};
 use openai_chat::{fill_openai_chat, reassemble_openai};
 use openai_embeddings::fill_openai_embeddings;
+use openai_responses::{fill_openai_responses, reassemble_responses};
 pub use parts::{normalize_finish_reason, FINISH_REASONS};
 use usage::UsageBounds;
 pub use usage::UsageLeaf;
@@ -158,11 +160,18 @@ fn try_parse_sse(
             fill_anthropic(&mut out, req, &body, bounds);
             Some(out)
         }
-        // No reassembler understands this stream (a Responses stream until
-        // the Responses reassembler lands; embeddings never stream). The
-        // unidentified branch below is the honest fallback: raw payloads,
-        // and the seam marks `sse_unknown_provider` — whose meaning is
-        // exactly "no SSE reassembler recognized this stream".
+        Some(Api::OpenAiResponses) => {
+            let reassembled = reassemble_responses(&events);
+            let body = reassembled.body.clone();
+            let mut out = sse_semantics(matched.unwrap(), reassembled);
+            fill_openai_responses(&mut out, req, &body, bounds);
+            Some(out)
+        }
+        // No reassembler understands this stream (embeddings never stream;
+        // the rest is an unknown grammar). The unidentified branch below is
+        // the honest fallback: raw payloads, and the seam marks
+        // `sse_unknown_provider` — whose meaning is exactly "no SSE
+        // reassembler recognized this stream".
         _ => {
             let raw = events
                 .iter()
@@ -251,13 +260,13 @@ pub fn parse_llm(
     };
     match (provider, matched.api) {
         ("openai", Api::OpenAiChatCompletions) => fill_openai_chat(&mut out, req, &decoded, bounds),
+        ("openai", Api::OpenAiResponses) => fill_openai_responses(&mut out, req, &decoded, bounds),
         ("openai", Api::OpenAiEmbeddings) => {
             fill_openai_embeddings(&mut out, req, &decoded, bounds)
         }
         ("anthropic", Api::AnthropicMessages) => fill_anthropic(&mut out, req, &decoded, bounds),
-        // A provider on another provider's API (and, until its parser lands,
-        // the Responses API) is left as empty semantics — same fail-safe
-        // posture as before.
+        // A provider on another provider's API is left as empty semantics —
+        // same fail-safe posture as before.
         _ => {}
     }
     Some(out)
@@ -306,6 +315,41 @@ mod bench {
             ]
         }))
         .unwrap()
+    }
+
+    #[test]
+    #[ignore = "profiling probe"]
+    fn bench_profile_responses_2k_size_matched() {
+        // A Responses body size-matched to the chat 2k bench body, for the
+        // apples-to-apples +-20% comparison (the design-named benches differ
+        // in body size: 2k vs 3k).
+        let text = "The quick brown fox jumps over the lazy dog. ".repeat(37);
+        let req = serde_json::to_vec(&serde_json::json!({
+            "model": "gpt-4.1", "input": "Summarize the following.",
+            "instructions": "You are a helpful assistant."
+        }))
+        .unwrap();
+        let resp = serde_json::to_vec(&serde_json::json!({
+            "id": "resp_bench2", "object": "response", "status": "completed",
+            "model": "gpt-4.1-2025-04-14",
+            "output": [
+                {"id": "msg_1", "type": "message", "role": "assistant", "status": "completed",
+                 "content": [{"type": "output_text", "text": text, "annotations": []}]}
+            ],
+            "usage": {"input_tokens": 812, "output_tokens": 460,
+                      "input_tokens_details": {"cached_tokens": 512},
+                      "output_tokens_details": {"reasoning_tokens": 32},
+                      "total_tokens": 1272}
+        }))
+        .unwrap();
+        println!("size-matched responses body: {} bytes", resp.len());
+        bench(
+            "openai_responses_2k_size_matched",
+            "api.openai.com",
+            "/v1/responses",
+            &req,
+            &resp,
+        );
     }
 
     #[test]

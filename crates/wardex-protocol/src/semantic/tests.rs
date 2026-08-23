@@ -1296,6 +1296,14 @@ fn every_normalized_usage_path_is_extracted_from_its_fixture() {
         },
         Case {
             host: "api.openai.com",
+            path: "/v1/responses",
+            req: fixture!("openai_responses", "request.json"),
+            resp: fixture!("openai_responses", "response.json"),
+            table: super::openai_responses::NORMALIZED_USAGE_PATHS,
+            input_excludes_cache: false,
+        },
+        Case {
+            host: "api.openai.com",
             path: "/v1/embeddings",
             req: fixture!("openai_embeddings", "request.json"),
             resp: fixture!("openai_embeddings", "response.json"),
@@ -1581,4 +1589,242 @@ fn count_tokens_and_batches_are_not_chat_calls() {
         );
         assert!(s.is_none(), "{path} parsed as an LLM call");
     }
+}
+
+// --- OpenAI Responses API (fixture-backed; typed-model-validated) ----------
+
+fn parse_responses_fixture(req: &'static [u8], resp: &'static [u8]) -> LlmSemantics {
+    parse_llm(
+        "api.openai.com",
+        "/v1/responses",
+        req,
+        resp,
+        Limits::default(),
+    )
+    .expect("responses fixture parses")
+}
+
+/// T-R1 — the openai-agents default path, visible: a non-streaming
+/// /v1/responses call yields chat semantics with usage (it yielded None
+/// before this parser existed).
+#[test]
+fn responses_non_streaming_is_parsed_as_chat_with_usage() {
+    let s = parse_responses_fixture(
+        fixture!("openai_responses", "request.json"),
+        fixture!("openai_responses", "response.json"),
+    );
+    assert_eq!(s.provider, "openai");
+    assert_eq!(s.operation, "chat");
+    assert_eq!(s.api_type, Some("responses"));
+    assert_eq!(s.request_model.as_deref(), Some("gpt-4.1"));
+    assert_eq!(s.response_model.as_deref(), Some("gpt-4.1-2025-04-14"));
+    assert_eq!(s.response_id.as_deref(), Some("resp_fx1"));
+    assert_eq!(s.usage.input_tokens(), Some(52));
+    assert_eq!(s.usage.output_tokens(), Some(17));
+    assert_eq!(s.usage.cache_read_input_tokens(), Some(16));
+    assert_eq!(s.usage.reasoning_output_tokens(), Some(4));
+    assert_eq!(s.finish_reasons.as_deref(), Some(&["stop".to_string()][..]));
+    assert_eq!(s.response_status.as_deref(), Some("completed"));
+    assert_eq!(s.reasoning_level.as_deref(), Some("low"));
+    assert_eq!(s.request_service_tier.as_deref(), Some("auto"));
+    assert_eq!(s.response_service_tier.as_deref(), Some("default"));
+    assert_eq!(s.max_tokens, Some(256));
+    // The system prompt and the string input both landed:
+    assert!(s.system_instructions.is_some());
+    assert!(s.input_messages.unwrap().contains("Say hello."));
+    // The open mirror carries the leaf the CLOSED table era would have
+    // dropped: openai 3.3.1's typed usage REQUIRES cache_write_tokens.
+    assert!(s
+        .usage_leaves
+        .iter()
+        .any(|(p, _)| p == "input_tokens_details.cache_write_tokens"));
+}
+
+/// T-R2 — the correlation key: `call_id`, not the item id.
+#[test]
+fn responses_function_call_becomes_tool_call_part_with_call_id() {
+    let s = parse_responses_fixture(
+        fixture!("openai_responses_tools", "request.json"),
+        fixture!("openai_responses_tools", "response.json"),
+    );
+    let v: serde_json::Value = serde_json::from_str(&s.output_messages.unwrap()).unwrap();
+    let part = &v[0]["parts"][0];
+    assert_eq!(part["type"], "tool_call");
+    assert_eq!(part["id"], "call_weather_2");
+    assert_eq!(part["name"], "get_weather");
+    assert_eq!(part["arguments"]["city"], "Busan");
+    assert_eq!(
+        s.finish_reasons.as_deref(),
+        Some(&["tool_call".to_string()][..])
+    );
+    // The request half: agents-SDK history shape (captured off a live
+    // openai-agents run against a mock) — the prior call and its output.
+    let inputs: serde_json::Value = serde_json::from_str(&s.input_messages.unwrap()).unwrap();
+    let all = inputs.to_string();
+    assert!(all.contains("\"tool_call\""));
+    assert!(all.contains("\"tool_call_response\""));
+    assert!(all.contains("call_weather_1"));
+    assert_eq!(s.previous_response_id.as_deref(), Some("resp_fx_prev"));
+}
+
+/// T-R3 — reasoning items and status mapping.
+#[test]
+fn responses_reasoning_item_becomes_reasoning_part() {
+    let s = parse_responses_fixture(
+        fixture!("openai_responses_reasoning", "request.json"),
+        fixture!("openai_responses_reasoning", "response.json"),
+    );
+    let v: serde_json::Value = serde_json::from_str(&s.output_messages.unwrap()).unwrap();
+    assert_eq!(v[0]["parts"][0]["type"], "reasoning");
+    assert_eq!(
+        v[0]["parts"][0]["content"],
+        "First, consider.\nThen, conclude."
+    );
+    assert_eq!(v[0]["parts"][1]["type"], "text");
+    assert_eq!(s.usage.reasoning_output_tokens(), Some(64));
+    assert_eq!(s.reasoning_level.as_deref(), Some("high"));
+}
+
+#[test]
+fn responses_incomplete_maps_reason_to_length() {
+    let s = parse_responses_fixture(
+        fixture!("openai_responses_incomplete", "request.json"),
+        fixture!("openai_responses_incomplete", "response.json"),
+    );
+    assert_eq!(s.response_status.as_deref(), Some("incomplete"));
+    assert_eq!(
+        s.finish_reasons.as_deref(),
+        Some(&["length".to_string()][..])
+    );
+}
+
+#[test]
+fn responses_failed_maps_to_error() {
+    let resp = br#"{"id":"resp_f","object":"response","status":"failed","model":"gpt-4.1",
+        "error":{"code":"server_error","message":"boom"},"output":[]}"#;
+    let s = parse_llm(
+        "api.openai.com",
+        "/v1/responses",
+        br#"{"model":"gpt-4.1"}"#,
+        resp,
+        Limits::default(),
+    )
+    .unwrap();
+    assert_eq!(s.response_status.as_deref(), Some("failed"));
+    assert_eq!(
+        s.finish_reasons.as_deref(),
+        Some(&["error".to_string()][..])
+    );
+}
+
+/// T-R4 — the terminal snapshot is the truth source: the fixture's deltas
+/// and even its output_item.done deliberately DISAGREE with the snapshot,
+/// and the snapshot's values are the ones extracted.
+#[test]
+fn responses_sse_takes_completed_snapshot_not_deltas() {
+    let s = parse_responses_fixture(
+        fixture!("openai_responses_sse", "request.json"),
+        fixture!("openai_responses_sse", "stream.sse"),
+    );
+    assert!(s.reassembled_from_stream);
+    assert_eq!(s.stream_terminated, Some(true));
+    assert_eq!(s.usage.input_tokens(), Some(9));
+    assert_eq!(s.usage.output_tokens(), Some(6));
+    assert_eq!(s.usage.cache_read_input_tokens(), Some(2));
+    let body = String::from_utf8(s.decoded_response.clone().unwrap()).unwrap();
+    assert!(body.contains("Hello from the snapshot!"));
+    assert!(!body.contains("DELTAS"), "deltas must not win: {body}");
+    // and the decoded body is Response-shaped, not chat-shaped:
+    assert!(body.contains("\"output\""));
+    assert!(!body.contains("\"choices\""));
+    assert_eq!(s.response_status.as_deref(), Some("completed"));
+}
+
+/// T-R5 — no terminal event: items reconstructed (done whole, added+deltas
+/// merged, orphan deltas ignored), usage honestly absent, unterminated.
+#[test]
+fn responses_sse_without_terminal_falls_back_to_items_and_marks_unterminated() {
+    let s = parse_responses_fixture(
+        fixture!("openai_responses_sse_unterminated", "request.json"),
+        fixture!("openai_responses_sse_unterminated", "stream.sse"),
+    );
+    assert_eq!(s.stream_terminated, Some(false));
+    assert_eq!(s.usage.output_tokens(), None);
+    assert_eq!(s.response_status.as_deref(), Some("in_progress"));
+    let v: serde_json::Value = serde_json::from_str(&s.output_messages.unwrap()).unwrap();
+    let parts = v[0]["parts"].as_array().unwrap();
+    // done item came through whole; the added-only function call was
+    // restored from its argument deltas; the ghost item was ignored.
+    assert_eq!(parts[0]["type"], "text");
+    assert_eq!(parts[0]["content"], "Partial answer.");
+    assert_eq!(parts[1]["type"], "tool_call");
+    assert_eq!(parts[1]["id"], "call_sse2");
+    assert_eq!(parts[1]["arguments"]["city"], "Seoul");
+    assert_eq!(parts.len(), 2, "the orphan delta must not become a part");
+}
+
+/// T-R5b — the in-stream `error` event is the third terminal form: its
+/// payload (the only bytes naming the failure) is preserved into the
+/// synthetic body, and status/finish are the provider's own declaration.
+#[test]
+fn responses_sse_error_event_preserves_error_and_maps_status() {
+    let s = parse_responses_fixture(
+        fixture!("openai_responses_sse_error", "request.json"),
+        fixture!("openai_responses_sse_error", "stream.sse"),
+    );
+    assert_eq!(s.stream_terminated, Some(true));
+    assert_eq!(s.response_status.as_deref(), Some("failed"));
+    assert_eq!(
+        s.finish_reasons.as_deref(),
+        Some(&["error".to_string()][..])
+    );
+    assert_eq!(
+        s.usage.output_tokens(),
+        None,
+        "no usage arrived; none is invented"
+    );
+    let body: serde_json::Value =
+        serde_json::from_slice(&s.decoded_response.clone().unwrap()).unwrap();
+    assert_eq!(body["error"]["code"], "server_error");
+    assert_eq!(
+        body["error"]["message"],
+        "The model failed to generate a response."
+    );
+}
+
+/// T-R5c — background mode: the create answers 200/queued with usage null.
+/// A tokenless, finish-less, marker-less identified span is the DESIGN here
+/// (the usage lands only on the deferred fetch_response path), pinned so the
+/// shape is a decision rather than an accident.
+#[test]
+fn responses_background_queued_create_is_identified_but_tokenless() {
+    let s = parse_responses_fixture(
+        fixture!("openai_responses_background_queued", "request.json"),
+        fixture!("openai_responses_background_queued", "response.json"),
+    );
+    assert_eq!(s.response_model.as_deref(), Some("gpt-4.1-2025-04-14"));
+    assert_eq!(s.response_status.as_deref(), Some("queued"));
+    assert_eq!(s.usage.input_tokens(), None);
+    assert_eq!(s.usage.output_tokens(), None);
+    assert_eq!(s.finish_reasons, None);
+    assert!(s.usage_leaves.is_empty());
+    assert_eq!(s.usage_dropped_count, 0);
+}
+
+/// T-R12's parse-level half: a Responses body on localhost resolves through
+/// the ordered body-shape check, not to Anthropic (Responses bodies carry
+/// `usage.input_tokens` too).
+#[test]
+fn responses_body_on_localhost_is_not_mistaken_for_anthropic() {
+    let s = parse_llm(
+        "127.0.0.1",
+        "/v1/responses",
+        fixture!("openai_responses", "request.json"),
+        fixture!("openai_responses", "response.json"),
+        Limits::default(),
+    )
+    .unwrap();
+    assert_eq!(s.provider, "openai");
+    assert_eq!(s.api_type, Some("responses"));
+    assert_eq!(s.usage.input_tokens(), Some(52));
 }

@@ -1,0 +1,30 @@
+{
+ "provider": "openai",
+ "operation": "chat",
+ "api_type": "responses",
+ "request_model": "gpt-4.1",
+ "response_model": "gpt-4.1-2025-04-14",
+ "response_id": "resp_fx1",
+ "input_tokens": 52,
+ "output_tokens": 17,
+ "cache_read_input_tokens": 16,
+ "reasoning_output_tokens": 4,
+ "finish_reasons": [
+  "stop"
+ ],
+ "output_messages_present": true,
+ "response_status": "completed",
+ "reasoning_level": "low",
+ "extras": {
+  "openai.request.service_tier": "auto",
+  "openai.response.service_tier": "default"
+ },
+ "usage_leaves": {
+  "input_tokens": 52,
+  "output_tokens": 17,
+  "input_tokens_details.cached_tokens": 16,
+  "output_tokens_details.reasoning_tokens": 4,
+  "total_tokens": 69,
+  "input_tokens_details.cache_write_tokens": 8
+ }
+}
