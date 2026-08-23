@@ -355,7 +355,8 @@ def test_the_server_table_is_bounded_and_drops_the_oldest():
     from wardex_sdk._assembly import counters
 
     counters.reset()
-    catalog = McpToolCatalog(max_entries=2)
+    catalog = McpToolCatalog()
+    catalog.apply_bound(max_entries=2)
     for _ in range(4):
         catalog.handle_for("srv")
 
@@ -386,10 +387,6 @@ class _ClientWithLimits:
         self.spans.append(span)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="the catalog resolves its own bound from the core, so a configured one never lands",
-)
 def test_max_entries_per_unit_reaches_the_mcp_tool_catalog():
     """The core says this table is bound by `max_entries_per_unit`, and it was not.
 

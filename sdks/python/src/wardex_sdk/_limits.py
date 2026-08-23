@@ -181,7 +181,7 @@ _LIMIT_DELIVERY: dict[LimitsConsumer, _Delivery] = {
         passthrough=frozenset({"client", "units", "names", "bridge"}),
     ),
     LimitsConsumer.MCP_TOOL_CATALOG: _Delivery(
-        target="wardex_sdk._adapters._anthropic_names:McpToolCatalog",
+        target="wardex_sdk._adapters._anthropic_names:McpToolCatalog.apply_bound",
         delivers={"max_entries": "max_entries_per_unit"},
         native=frozenset(),
         passthrough=frozenset(),

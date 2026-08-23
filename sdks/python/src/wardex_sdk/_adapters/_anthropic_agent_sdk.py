@@ -716,6 +716,22 @@ class AnthropicAgentSdkAdapter(AdapterInterface):
 
         self._patches.patch(sdk.ClaudeSDKClient, "__init__", client_init)
 
+        from .._limits import LimitsConfig, LimitsConsumer, limits_kwargs
+
+        config = getattr(client, "config", None)
+        lim = config.limits if config is not None else LimitsConfig()
+        resolved = lim.resolved()
+        # The tool catalog is built in `__init__`, before there is a client, so
+        # this is where the host's bound reaches it. BEFORE the
+        # `create_sdk_mcp_server` patch below, and that ordering is the whole
+        # correctness argument for not trimming in `apply_bound`: the wrapper
+        # this adapter installs is the only thing that ever registers a handle,
+        # so while the patch is not yet in place the table cannot grow, and the
+        # new ceiling therefore applies to an empty table. Install the patch
+        # first and a host thread calling `create_sdk_mcp_server()` in between
+        # registers handles against the OLD ceiling.
+        self._names.apply_bound(**limits_kwargs(LimitsConsumer.MCP_TOOL_CATALOG, resolved))
+
         # (3) in-process custom tools: run each handler inside a CALL unit whose
         # span is a child of the session — which is what closes the broken tree.
         # The unit is also ACTIVE for the body, so any outbound HTTP the tool
@@ -739,13 +755,12 @@ class AnthropicAgentSdkAdapter(AdapterInterface):
                         handle.instance = _server_instance(config)
                 return config
 
+            # The bound above is already on the catalog when this lands, and
+            # that order is load-bearing (see `apply_bound`): this wrapper is
+            # the table's only writer, so binding first means the new ceiling
+            # applies to a table nothing can have filled yet.
             self._patches.patch(sdk, "create_sdk_mcp_server", create_sdk_mcp_server)
 
-        from .._limits import LimitsConfig
-
-        config = getattr(client, "config", None)
-        lim = config.limits if config is not None else LimitsConfig()
-        resolved = lim.resolved()
         # The adapter's own options — the first real `ctx.options` consumer.
         # The isinstance narrowing keeps every duck-typed test double honest:
         # anything but the real group means default options, bridge off.
