@@ -367,3 +367,48 @@ def test_the_bound_comes_from_the_core():
     from wardex_sdk import _wardex_native
 
     assert McpToolCatalog()._max == _wardex_native.limits_defaults()["max_entries_per_unit"]
+
+
+class _ClientWithLimits:
+    """The smallest client an adapter install reads: a config with limits."""
+
+    class _Config:
+        debug = False
+
+        def __init__(self, limits) -> None:
+            self.limits = limits
+
+    def __init__(self, limits) -> None:
+        self.config = self._Config(limits)
+        self.spans: list = []
+
+    def capture_span(self, span) -> None:
+        self.spans.append(span)
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="the catalog resolves its own bound from the core, so a configured one never lands",
+)
+def test_max_entries_per_unit_reaches_the_mcp_tool_catalog():
+    """The core says this table is bound by `max_entries_per_unit`, and it was not.
+
+    `crates/wardex-limits` names this exact table in that field's own
+    documentation, and the README repeats the promise to users. The catalog is
+    built in the adapter's `__init__`, before there is a client to read a
+    config off, so it resolved the CORE default and nothing ever revised it —
+    a host that lowered the bound to 8 kept accumulating handles to 256. What
+    overflow costs is a name lookup, and a lost name lookup is how one tool
+    call gets observed twice.
+    """
+    from wardex_sdk._adapters._anthropic_agent_sdk import AnthropicAgentSdkAdapter
+    from wardex_sdk._adapters._registry import context_for
+    from wardex_sdk._limits import LimitsConfig
+
+    client = _ClientWithLimits(LimitsConfig(max_entries_per_unit=8))
+    adapter = AnthropicAgentSdkAdapter()
+    adapter.install(client, context_for(adapter.name(), client))
+    try:
+        assert adapter._names._max == 8
+    finally:
+        adapter.uninstall()

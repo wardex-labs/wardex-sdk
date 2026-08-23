@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from typing import Annotated, Any, TypedDict
 
+import pytest
 from langchain_core.messages import AIMessage, ToolMessage
 from langchain_core.tools import tool
 from langgraph.checkpoint.memory import InMemorySaver
@@ -26,6 +27,8 @@ from langgraph.types import Command, Send, interrupt
 
 from test_codec import _header  # the established envelope helper; see test_codec_typed_blocks
 from test_langgraph_adapter import (
+    Installed,
+    RecordingClient,
     TrailState,
     _clean_scope,  # noqa: F401 — the autouse determinism fixture this module needs too
     adapter_counters,
@@ -41,8 +44,11 @@ from test_langgraph_adapter import (
     tool_graph,
     tools,
 )
+from wardex_sdk._adapters._langgraph import LangGraphAdapter
+from wardex_sdk._adapters._registry import AdapterRegistry
 from wardex_sdk._assembly import Limitation, ParentSource
 from wardex_sdk._enums import ToolExecutionType, ToolType
+from wardex_sdk._limits import LimitsConfig
 from wardex_sdk._types import Envelope
 from wardex_sdk.transport import _codec
 
@@ -129,6 +135,39 @@ def _one_tool_span(live, fn, call_dict, **kw):
     shipped = tools(live.spans)
     assert len(shipped) == 1, f"expected exactly one tool span, got {[s.name for s in shipped]}"
     return shipped[0]
+
+
+class _CappedClient(RecordingClient):
+    """A recording client that also carries a config, which the base one does not.
+
+    `context_for` reads `client.config.limits`, so a double with `config = None`
+    can only ever exercise the core defaults — which is precisely the state a
+    test about a CONFIGURED bound must not be in.
+    """
+
+    class _Config:
+        debug = False
+
+        def __init__(self, limits: LimitsConfig) -> None:
+            self.limits = limits
+
+    def __init__(self, limits: LimitsConfig) -> None:
+        super().__init__()
+        self.config = self._Config(limits)
+
+
+class _CappedInstalled(Installed):
+    """`Installed`, but through a client with a limits config. Same wiring."""
+
+    def __init__(self, limits: LimitsConfig) -> None:
+        self.client = _CappedClient(limits)
+        self.registry = AdapterRegistry()
+        self.adapter = LangGraphAdapter()
+        self.registry.install(self.adapter, self.client)
+
+
+def _capped_install(limits: LimitsConfig) -> _CappedInstalled:
+    return _CappedInstalled(limits)
 
 
 def _bytes(value) -> bytes:
@@ -546,6 +585,34 @@ def test_an_over_budget_tool_input_ships_truncated_and_flagged(installed):  # no
     span = _one_tool_span(installed, pure_add, call("pure_add", over, "toolu_21"))
     assert len(span.input_data) == 64
     assert span.input_data == repr(over).encode()[:64], "a prefix, not garbage"
+    assert span.capture_integrity is not None
+    assert span.capture_integrity.truncated is True
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="the registry the context builds keeps the core body cap, so the budget does too",
+)
+def test_shaped_args_uses_the_configured_budget():
+    """The source side of the same bound: what the shaper MATERIALIZES.
+
+    The test above lowers the cap at the registry attribute, which proves the
+    +1 handshake but says nothing about where the number came from. This one
+    configures the host the way a host does — `LimitsConfig(max_body_bytes=...)`
+    on the client — and drives a real tool call through a real `ToolNode`. The
+    protection this bound is bought for is the one a host that lowered it wants
+    most: a 200 KB argument must not be spelled out in full inside the host's
+    own tool-call thread just to be cut afterwards.
+    """
+    live = _capped_install(LimitsConfig(max_body_bytes=4096))
+    try:
+        big = {"a": "y" * 200_000}
+        span = _one_tool_span(live, pure_add, call("pure_add", big, "toolu_budget"))
+    finally:
+        live.teardown()
+
+    assert live.ctx.record_budget == 4096
+    assert len(span.input_data) == 4096
     assert span.capture_integrity is not None
     assert span.capture_integrity.truncated is True
 

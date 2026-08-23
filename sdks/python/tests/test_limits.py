@@ -350,6 +350,49 @@ def test_max_link_targets_reaches_the_registry_context_for_builds():
     assert ctx._units._max_link_targets == 7
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason="context_for never hands max_body_bytes to the registry it builds",
+)
+def test_max_body_bytes_reaches_the_registry_context_for_builds():
+    """The same rule as `max_link_targets` above, for the bound that never had it.
+
+    `UnitRegistry` resolves this cap from the CORE defaults instead of being
+    handed the configured one, and `context_for` has no parameter to hand it
+    through — so a host that LOWERED the cap still let a unit accumulate 32 MiB
+    of recorded payload, and a host that raised it got 32 MiB too. `ctx.limits`
+    reports the user's number the whole time, which is what makes the loss
+    undiagnosable from the outside: the config object and the enforcement point
+    disagree and only one of them is readable.
+    """
+    from wardex_sdk._adapters._registry import context_for
+
+    ctx = context_for("probe", _StubClient(LimitsConfig(max_body_bytes=4096)))
+    assert ctx.limits["max_body_bytes"] == 4096
+    assert ctx._units._max_record_bytes == 4096
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="the registry's cap is the core default, so the budget derived from it is too",
+)
+def test_record_budget_equals_the_configured_body_cap():
+    """The storage cap and the source-side budget are ONE read — of the user's value.
+
+    A shaper materializes up to `record_budget` and storage keeps up to
+    `_max_record_bytes`; the two cannot disagree with each other, because the
+    budget is read off the registry. Both could still disagree with what the
+    host configured, and both did. This states the whole equality, so a later
+    "simplification" that gives the budget its own source fails here rather
+    than in a host's memory profile.
+    """
+    from wardex_sdk._adapters._registry import context_for
+
+    ctx = context_for("probe", _StubClient(LimitsConfig(max_body_bytes=4096)))
+    assert ctx.record_budget == 4096
+    assert ctx.record_budget == ctx._units.max_record_bytes == ctx.limits["max_body_bytes"]
+
+
 def test_non_http_tls_traffic_does_not_grow_memory(fake_ssl_socket, bare_ssl_interceptor):
     """Regression for the production incident: the SDK patches ssl.SSLSocket
     globally, so a TLS-backed Redis/Mongo/Kafka client sharing the process
