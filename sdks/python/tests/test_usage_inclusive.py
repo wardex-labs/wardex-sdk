@@ -20,6 +20,7 @@ inclusive contract all along; these tests are the first thing that enforces it.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -367,3 +368,192 @@ def test_set_gen_ai_does_not_count_an_inclusive_block():
     )
     draft.set_gen_ai(attrs)
     assert counters.get("assembly.builder.gen_ai_usage_not_inclusive") == 0
+
+
+# --------------------------------------------------------------------------
+# L3 — golden vectors frozen from the Langfuse mapping oracle (CI-permanent)
+# --------------------------------------------------------------------------
+
+_GOLDEN_PATH = Path(__file__).parent / "fixtures" / "langfuse_mapping_golden.json"
+
+#: The `??` candidate chains and the pass-through exclusion list, mirrored
+#: from Langfuse's `extractGenericGenAiUsageDetails` (v4.16.0). The oracle
+#: (`scripts/langfuse-mapping-oracle/run.ts`) re-checks the original on every
+#: run; this mirror exists so CI can replay the frozen outputs with no
+#: network, no node and no docker.
+_LF_INPUT_CHAIN = ("prompt_tokens", "input_tokens", "prompt")
+_LF_OUTPUT_CHAIN = ("completion_tokens", "output_tokens", "completion")
+_LF_TOTAL_CHAIN = ("total_tokens", "total")
+_LF_CACHE_READ_CHAIN = (
+    "cache_read.input_tokens",
+    "cache_read_input_tokens",
+    "cache_read_tokens",
+    "details.cache_read_tokens",
+    "details.cache_read_input_tokens",
+    "prompt_details.cache_read",
+    "input_cached_tokens",
+)
+_LF_CACHE_CREATION_CHAIN = (
+    "cache_creation.input_tokens",
+    "cache_creation_input_tokens",
+    "cache_write_tokens",
+    "details.cache_write_tokens",
+    "details.cache_creation_input_tokens",
+    "prompt_details.cache_write",
+    "input_cache_creation",
+)
+_LF_REASONING_CHAIN = ("reasoning.output_tokens", "completion_details.reasoning")
+_LF_AUDIO_CHAIN = ("completion_details.audio",)
+
+#: claude-sonnet-4-6 Standard-tier unit prices (default-model-prices.json).
+_LF_UNIT_PRICE = {
+    "input": 3e-06,
+    "output": 1.5e-05,
+    "input_cached_tokens": 3e-07,
+    "input_cache_creation": 3.75e-06,
+}
+
+
+def _first(raw: dict, chain: tuple) -> int | None:
+    """`??` semantics: the first PRESENT candidate wins, zero included."""
+    for key in chain:
+        if key in raw:
+            return raw[key]
+    return None
+
+
+def _langfuse_generic_usage(attrs: dict) -> dict:
+    """`extractGenericGenAiUsageDetails`, in Python, over flattened attrs."""
+    raw = {}
+    for key, value in attrs.items():
+        if (key.startswith("gen_ai.usage.") and key != "gen_ai.usage.cost") or key.startswith(
+            "llm.token_count."
+        ):
+            stripped = key.replace("gen_ai.usage.", "").replace("llm.token_count.", "")
+            if isinstance(value, (int, float)):
+                raw[stripped] = value
+    if not raw:
+        return {}
+    input_tokens = _first(raw, _LF_INPUT_CHAIN)
+    output_tokens = _first(raw, _LF_OUTPUT_CHAIN)
+    total_tokens = _first(raw, _LF_TOTAL_CHAIN)
+    cache_read = _first(raw, _LF_CACHE_READ_CHAIN)
+    cache_creation = _first(raw, _LF_CACHE_CREATION_CHAIN)
+    reasoning = _first(raw, _LF_REASONING_CHAIN)
+    audio = _first(raw, _LF_AUDIO_CHAIN)
+
+    consumed = set(
+        _LF_INPUT_CHAIN
+        + _LF_OUTPUT_CHAIN
+        + _LF_TOTAL_CHAIN
+        + _LF_CACHE_READ_CHAIN
+        + _LF_CACHE_CREATION_CHAIN
+        + _LF_REASONING_CHAIN
+        + _LF_AUDIO_CHAIN
+    )
+    out = {
+        (key.replace("details.", "", 1) if key.startswith("details.") else key): value
+        for key, value in raw.items()
+        if key not in consumed
+    }
+    if input_tokens is not None:
+        out["input"] = max(input_tokens - (cache_read or 0) - (cache_creation or 0), 0)
+    if output_tokens is not None:
+        out["output"] = max(output_tokens - (reasoning or 0) - (audio or 0), 0)
+    if total_tokens is not None:
+        out["total"] = total_tokens
+    if cache_read is not None:
+        out["input_cached_tokens"] = cache_read
+    if cache_creation is not None:
+        out["input_cache_creation"] = cache_creation
+    if reasoning is not None:
+        out["output_reasoning_tokens"] = reasoning
+    if audio is not None:
+        out["output_audio_tokens"] = audio
+    return out
+
+
+def _langfuse_costs(usage: dict) -> tuple[dict, float]:
+    """`IngestionService.calculateUsageCosts`: priced buckets only, then total."""
+    cost = {
+        key: units * _LF_UNIT_PRICE[key] for key, units in usage.items() if key in _LF_UNIT_PRICE
+    }
+    total = sum(cost.values())
+    if cost:
+        cost["total"] = total
+    return cost, total
+
+
+def _golden() -> dict:
+    return json.loads(_GOLDEN_PATH.read_text())["results"]
+
+
+def test_langfuse_mapping_golden_normal():
+    """Encoder output -> Langfuse mapping == the frozen L2 result (vector A)."""
+    attrs = _wire_attrs(build_gen_ai(_parse_anthropic()))
+    usage = _langfuse_generic_usage(attrs)
+    cost, total = _langfuse_costs(usage)
+    frozen = _golden()["a_normal"]
+    assert usage == frozen["usageDetails"]
+    assert cost == pytest.approx(frozen["costDetails"])
+    assert total == pytest.approx(frozen["totalCost"])
+    assert total == pytest.approx(0.0204)
+
+
+def test_langfuse_mapping_golden_buggy_contrast():
+    """The pre-fix shape must keep reproducing the under-billing (vector B)."""
+    attrs = _wire_attrs(
+        GenAIAttributes(
+            operation="chat",
+            request_model="claude-sonnet-4-6",
+            response_model="claude-sonnet-4-6",
+            input_tokens=1000,  # exclusive — the defect being contrasted
+            output_tokens=500,
+            cache_read_input_tokens=8000,
+            cache_creation_input_tokens=2000,
+        )
+    )
+    usage = _langfuse_generic_usage(attrs)
+    cost, total = _langfuse_costs(usage)
+    frozen = _golden()["b_buggy"]
+    assert usage == frozen["usageDetails"]
+    assert usage["input"] == 0  # the collapsed input column
+    assert cost == pytest.approx(frozen["costDetails"])
+    assert total == pytest.approx(0.0174)  # -14.7%
+
+
+def test_langfuse_mapping_golden_reasoning():
+    """Vector D: the reasoning bucket exists and is the one unpriced key."""
+    attrs = _wire_attrs(
+        GenAIAttributes(
+            operation="chat",
+            request_model="claude-sonnet-4-6",
+            response_model="claude-sonnet-4-6",
+            input_tokens=1000,
+            output_tokens=500,
+            reasoning_output_tokens=200,
+        )
+    )
+    usage = _langfuse_generic_usage(attrs)
+    cost, _total = _langfuse_costs(usage)
+    frozen = _golden()["d_reasoning"]
+    assert usage == frozen["usageDetails"]
+    assert cost == pytest.approx(frozen["costDetails"])
+    uncovered = set(usage) - {"total"} - set(cost)
+    assert uncovered == {"output_reasoning_tokens"}  # the deferred ecosystem finding
+
+
+def test_langfuse_mapping_golden_conflicted_pair():
+    """Vector C: one session, one billed observation — and the demoted keys
+    are structurally invisible to the prefix collector."""
+    frozen = _golden()["c_pair"]
+    carriers = [e for e in frozen if e["usageDetails"]]
+    assert len(carriers) == 1 and carriers[0]["name"].startswith("chat")
+    assert sum(e["totalCost"] for e in frozen) == pytest.approx(0.0204)
+    # The mechanism, replayed on the mirror: a demoted copy maps to NOTHING.
+    demoted = {
+        "wardex.anthropic_agent_sdk.otel.gen_ai.usage.input_tokens": 1000,
+        "wardex.anthropic_agent_sdk.otel.gen_ai.usage.cache_read_input_tokens": 8000,
+        "gen_ai.request.model": "claude-sonnet-4-6",
+    }
+    assert _langfuse_generic_usage(demoted) == {}
