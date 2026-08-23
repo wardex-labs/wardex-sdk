@@ -827,15 +827,35 @@ def _probe_max_sessions() -> bool:
 
 
 def _probe_max_session_entries() -> bool:
-    def open_tools(limits: LimitsConfig) -> int:
+    """Over the per-session cap, the oldest OPEN TOOL is force-closed and emitted.
+
+    Modelled on `_probe_max_entries_per_unit`, and for the same reason: a probe
+    that counted table entries alone would keep passing if the eviction moved
+    somewhere the marker no longer rides — which is exactly how this site spent
+    its life reporting a teardown that never happened. The table size AND the
+    marker on the span the bound closed.
+    """
+
+    def open_tools(limits: LimitsConfig) -> tuple[int, list]:
         asm = _assembler(limits)
         sess = asm._ensure_session(1, 1)
         for i in range(4):
             asm._open_tool(sess, {"tool_name": "t"}, f"id{i}", 1)
-        return len(sess.open_tools)
+        return len(sess.open_tools), asm._client.spans
 
-    tight = open_tools(LimitsConfig(max_session_entries=1))
-    return tight == 1 and open_tools(LimitsConfig()) == 4
+    tight, evicted = open_tools(LimitsConfig(max_session_entries=1))
+    roomy, none_evicted = open_tools(LimitsConfig())
+    return (
+        tight == 1
+        and roomy == 4
+        and none_evicted == []
+        and len(evicted) == 3
+        and all(
+            s.capture_integrity is not None
+            and Limitation.SESSION_ENTRY_TABLE_FULL in s.capture_integrity.limitations
+            for s in evicted
+        )
+    )
 
 
 def _probe_mcp_sniff_bytes() -> bool:

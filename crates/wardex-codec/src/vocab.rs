@@ -9,8 +9,8 @@
 //! table is a SECOND declaration of a list the `.proto` already declares, and
 //! nothing makes the compiler compare the two — a member added to one and
 //! forgotten in the other compiles, ships, and silently flattens to
-//! `UNSPECIFIED` on the wire. At 42 members (`Limitation`) that is not a
-//! hypothetical.
+//! `UNSPECIFIED` on the wire. At the size `Limitation` has already reached
+//! that is not a hypothetical.
 //!
 //! prost generates `from_str_name` / `as_str_name` from the schema itself, so
 //! deriving the proto value name mechanically — `PREFIX` + `_` + the uppercased
@@ -196,13 +196,33 @@ mod tests {
         }
     }
 
-    /// The whole 42-member vocabulary, round-tripped by number. A member added
-    /// to the schema with a name that breaks the convention fails here rather
-    /// than flattening to UNSPECIFIED on a user's wire.
+    /// The whole vocabulary, round-tripped by number, with the band DERIVED
+    /// from the schema rather than restated here. A member added with a name
+    /// that breaks the convention fails here rather than flattening to
+    /// UNSPECIFIED on a user's wire.
+    ///
+    /// The `1..=N` literal this used to iterate — plus the count it asserted
+    /// and the two counts in the prose around it — was a second declaration of
+    /// the vocabulary's SIZE, in the one module whose entire purpose is that
+    /// the vocabulary is declared once. Every member added had to find those
+    /// sites by hand, which is the drift this file exists to prevent wearing
+    /// the clothes of a guard against it. prost's `try_from` already knows
+    /// which numbers the schema declares, and the META value opens the band
+    /// above the vocabulary, so both ends of the range come off the enum.
+    ///
+    /// The COUNT and the contiguity of that band stay pinned, once, where the
+    /// two sides are compared: `tests/test_wire_vocabulary.py`.
     #[test]
     fn every_limitation_round_trips() {
-        let mut seen = 0;
-        for n in 1..=42 {
+        let meta = pb::Limitation::VocabularyUnmapped as i32;
+        let declared: Vec<i32> = (1..meta)
+            .filter(|&n| pb::Limitation::try_from(n).is_ok())
+            .collect();
+        assert!(
+            !declared.is_empty(),
+            "the schema declares no Limitation below the meta band"
+        );
+        for n in declared {
             let value = limitation_name(n);
             assert!(!value.is_empty(), "no name for limitation {n}");
             assert!(
@@ -214,9 +234,7 @@ mod tests {
                 Some(n),
                 "round trip for {value}"
             );
-            seen += 1;
         }
-        assert_eq!(seen, 42);
     }
 
     #[test]
@@ -233,7 +251,9 @@ mod tests {
 
     /// `VOCABULARY_UNMAPPED` is a META value, not vocabulary. It must be
     /// reachable for decode (a newer SDK can send it) and must NOT sit inside
-    /// the 1..=42 band a consumer iterates as "the vocabulary".
+    /// the contiguous low band a consumer iterates as "the vocabulary" — which
+    /// is also what lets `every_limitation_round_trips` read that band's upper
+    /// end off this value instead of restating it.
     #[test]
     fn the_meta_value_is_outside_the_vocabulary_band() {
         assert_eq!(pb::Limitation::VocabularyUnmapped as i32, 9001);

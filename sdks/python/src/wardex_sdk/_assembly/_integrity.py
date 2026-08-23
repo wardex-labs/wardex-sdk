@@ -16,13 +16,15 @@ correction costs a second deliberate schema break. Emitters must never invent a
 marker string inline.
 
 **The census closed at 37 members = 15 originally declared + 21 from it + 1
-from §5.4.** Five more landed since, each by its own deliberate core PR:
+from §5.4.** Six more landed since, each by its own deliberate core PR:
 ``INSTRUMENTATION_DEGRADED`` (38, wardex's own failure),
 ``OTLP_ATTRIBUTE_TRUNCATED`` (39, the OTLP export size guard),
-``UNIT_TABLE_FULL`` (40, the registry's breadth bound), and the Agent SDK
+``UNIT_TABLE_FULL`` (40, the registry's breadth bound), the Agent SDK
 OTel bridge's fail-open pair ``OTEL_BRIDGE_NO_DATA`` (41, confirmed injection
 and nothing arrived) / ``OTEL_BRIDGE_SCHEMA_UNKNOWN`` (42, data arrived and
-classified as nothing).
+classified as nothing), and ``SESSION_ENTRY_TABLE_FULL`` (43, the adapter's
+per-session bound, which is the registry's breadth bound one layer out and a
+different FIELD).
 ``tests/test_limitation_census.py`` is the live count; this paragraph is its
 history, not its source.
 The census read every assignment and append site that reaches
@@ -291,7 +293,7 @@ Two emit sites, and the first is the mechanism the second restates.
     instead of by its own completion event, so its ``end_time_ns`` is the
     teardown instant and its status is synthesized.
 
-    Four emit sites across two modules, all of them the same rule: a bound or a
+    Three emit sites across two modules, all of them the same rule: a bound or a
     teardown CLOSES what it stops tracking, it never drops it.
 
     In ``_assembly/_units.py`` — ``UnitRegistry._close_locked``, for both the
@@ -303,13 +305,18 @@ Two emit sites, and the first is the mechanism the second restates.
     exactly as ``close_span`` would discard it: a bound is a reason to stop
     tracking a draft, never a reason to promote one ``claim()`` already rejected.
 
-    In ``_adapters/_assembler.py`` — ``SessionAssembler._open_tool``, when the
-    open-tool table hits ``max_session_entries``; and ``::_drain_children``, when
-    a session stops being driven with tools still open, which happens either
-    because the transport closed or because the registry evicted the session's
-    root out from under the assembler. Both go through
-    ``_emit_tool(markers=...)``. Before the census rewired the assembler's two
-    sites it was the free string ``"tool_span_unclosed"``.
+    In ``_adapters/_assembler.py`` — ``::_drain_children``, when a session stops
+    being driven with tools still open, which happens either because the
+    transport closed or because the registry evicted the session's root out from
+    under the assembler. It goes through ``_emit_tool(markers=...)``. Before the
+    census rewired the assembler's sites it was the free string
+    ``"tool_span_unclosed"``.
+
+    ``SessionAssembler._open_tool``'s eviction was a second assembler site and
+    is NOT one any more: a full ``open_tools`` table is a BOUND, and it names
+    ``max_session_entries`` through ``SESSION_ENTRY_TABLE_FULL`` (43). This
+    member kept it only until that site was decided on its own evidence, which
+    is what the paragraph in ``UNIT_TABLE_FULL`` used to ask for.
 
     NOTE (census): the four-way merge that loses nothing. ``tool_span_unclosed``
     folded into this already-declared member because the marker rides the tool span
@@ -346,13 +353,59 @@ Two emit sites, and the first is the mechanism the second restates.
     teardown — which is that member's exact sentence — and the table-full
     fact is not theirs to report.
 
-    Deliberately NOT attached to ``SessionAssembler._open_tool``'s eviction,
-    which is the same shape driven by a DIFFERENT knob
-    (``max_session_entries``). Widening this member to a second knob later is
-    an append — a docstring and a census row — while pointing a dashboard at
-    the wrong knob is the ws_evicted mistake the census rule exists to
-    prevent, so the assembler keeps ``CHILD_SPAN_UNCLOSED`` until its site is
-    decided on its own evidence.
+    Deliberately NOT widened to ``max_session_entries``: that bound has its own
+    member, ``SESSION_ENTRY_TABLE_FULL`` (43), decided on its own evidence as
+    this paragraph used to ask for. ``crates/wardex-limits`` calls this knob a
+    generalization of that one — same order, same semantics — and the decision
+    turned on the census's operative test rather than on semantics: they are
+    separate FIELDS, so a reader sent to the wrong one raises a number that
+    changes nothing about the marker they are looking at. If the two fields are
+    ever unified, 43 becomes an alias of this member.
+    """
+
+    SESSION_ENTRY_TABLE_FULL = "session_entry_table_full"
+    """A per-SESSION table crossed ``max_session_entries`` and its OLDEST entry
+    was force-closed and emitted to admit the new one.
+
+    Points at that one knob, and naming it is the whole reason this member
+    exists (§6.5.1: if the user's next action differs, they are separate
+    members). ``UNIT_TABLE_FULL`` names ``max_entries_per_unit`` — the unit
+    REGISTRY's per-unit tables — and although ``crates/wardex-limits`` calls
+    that knob a generalization of this one, they are separate FIELDS: raising
+    one leaves the other at its default, so a reader sent to the wrong one
+    turns a knob that changes nothing. ``UNIT_EVICTED`` names the two COUNT
+    caps (``max_units`` / ``max_sessions``); ``CHILD_SPAN_UNCLOSED`` names no
+    knob at all — it says someone else's TEARDOWN closed the span, which is
+    what these sites used to claim about a teardown that never happened.
+
+    Three emit sites, all in ``_adapters/_assembler.py`` and all one bound.
+    ``SessionAssembler._open_tool`` force-closes the oldest OPEN TOOL of a full
+    ``open_tools`` table; the ``SubagentStart`` branch of ``::on_hook`` does the
+    same for the oldest OPEN SUB-AGENT of a full ``subagents`` table (which
+    used to be dropped with no span at all, and whose span CONTEXT is kept in
+    an ``_EvictedSubagent`` breadcrumb so its children keep their parent); and
+    ``::_close_tool`` / ``::_on_stream_tool_result`` put it on the COMPLETION
+    half — the span built when a tool's own ``PostToolUse`` or stream
+    ``tool_result`` arrives after wardex had already evicted its open record.
+    That is the same bound reported from the other end, and the ``_EvictedTool``
+    breadcrumb is what lets the completion say so instead of shipping as a
+    second, zero-duration tool call under the wrong parent.
+
+    ONE CALL, TWO OBSERVATIONS. An evicted call that later completes ships two
+    spans with the same ``call_id``, both carrying this marker, and they
+    OVERLAP: the ``StatusCode.UNSET`` one is ``[start, evicted]`` — the window
+    wardex actually watched, holding the input bytes — and the other is
+    ``[start, end]``, the whole call, holding the output bytes. A latency
+    aggregate must exclude the spans that carry this marker AND ``UNSET`` or it
+    counts the call twice.
+
+    An evicted entry ships ``StatusCode.UNSET``: wardex stopped watching before
+    the outcome, so OK would claim a success it never observed and ERROR would
+    blame the agent for wardex's own full table.
+
+    The bounded tables that hold NO span keep counters instead — a refused
+    ``stream_tool_meta`` entry has no span to mark, exactly as an evicted alias
+    does not (``adapters.assembler.stream_tool_meta_table_full``).
     """
 
     # ------------------------------------------------------------------

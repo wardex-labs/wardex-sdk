@@ -76,8 +76,44 @@ pub struct Limits {
     pub max_connections: usize,
     /// Maximum concurrently tracked adapter sessions.
     pub max_sessions: usize,
-    /// Maximum entries in each per-session tracking map (open tools, streamed
-    /// tool metadata, subagents).
+    /// Maximum entries in each per-session tracking map an adapter keeps:
+    /// open tool calls, streamed tool metadata, sub-agents, and the OTel
+    /// bridge's pending buffer.
+    ///
+    /// Only two of those four hold entries that OWN a span, and only those two
+    /// evictions reach the wire. Crossing the bound on open tools or on
+    /// sub-agents force-closes the OLDEST entry and emits its span carrying
+    /// `session_entry_table_full`, for the same reason as `max_units`: a
+    /// ceiling that dropped state silently would be a worse failure than an
+    /// unenforced one. That span ships `UNSET`, not `OK` and not `ERROR` —
+    /// the bound stopped the observation before the outcome, so `OK` would
+    /// claim a success nobody watched and `ERROR` would report a full table of
+    /// wardex's own as a failure of the agent.
+    ///
+    /// ONE CALL, TWO OBSERVATIONS. An evicted tool call that later completes
+    /// ships a SECOND span with the same call id and the same marker: the
+    /// evicted half is `[start, evicted]` and holds the input, the completion
+    /// half is `[start, end]` and holds the output, and they overlap. A
+    /// latency aggregate must exclude the spans carrying this marker AND
+    /// `UNSET`, or it counts one call twice. Only the fields that make the
+    /// second half nameable are remembered across the eviction (start instant,
+    /// name, owning sub-agent, span context) — never the payload bytes, which
+    /// are the thing the bound exists to stop holding.
+    ///
+    /// The other two evict nothing to the wire. Streamed tool metadata is
+    /// consumed in ARRIVAL order, so a full table refuses the NEWEST entry
+    /// rather than the oldest — dropping the oldest would discard the one most
+    /// likely to be read next — and there is no span to mark either way. The
+    /// bridge's pending buffer emits its oldest held draft immediately and
+    /// unmerged, which loses an enrichment rather than an observation. Both
+    /// are recorded in the host SDK's internal counters
+    /// (`adapters.assembler.stream_tool_meta_table_full`,
+    /// `adapters.assembler.otel_bridge_pending_overflow` in the Python SDK),
+    /// alongside one counter per site for the two that do reach the wire.
+    ///
+    /// Not the same field as `max_entries_per_unit`, which generalizes this
+    /// bound to units of every kind. Raising that one leaves this one exactly
+    /// where it was, which is why the two evictions carry different markers.
     pub max_session_entries: usize,
     /// Maximum concurrently tracked *root* logical units.
     ///
@@ -109,7 +145,7 @@ pub struct Limits {
     /// Only two of those four tables hold entries that OWN a span, and only
     /// those two evictions reach the wire. Crossing the bound on child units or
     /// on open span drafts force-closes the oldest entry and emits its span
-    /// with `child_span_unclosed`, for the same reason as `max_units`. Crossing
+    /// with `unit_table_full`, for the same reason as `max_units`. Crossing
     /// it on lookup aliases or de-duplication keys emits nothing — there is no
     /// span to mark — and is recorded only in the host SDK's internal counters
     /// (`assembly._units.alias_table_full`, `assembly._units.claim_table_full`,

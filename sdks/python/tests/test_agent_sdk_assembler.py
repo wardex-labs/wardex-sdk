@@ -397,7 +397,16 @@ def test_a_claimed_tool_gets_no_hook_driven_span():
     assert asm.open_session_count() == 0
 
 
-def test_open_entry_cap():
+def test_open_entry_cap(tallies):
+    """300 opens over a 256-entry table: 44 evicted + 256 drained = 300.
+
+    The arithmetic is the point of the docstring — a reviewer reading the diff
+    sees one `== 300` become two numbers and must not read that as spans lost.
+    Every open tool still leaves exactly one span; what changed is that the 44
+    the BOUND closed and the 256 the TEARDOWN closed now say different things,
+    because the reader's next action differs: raise `max_session_entries`, or
+    find out why the session ended with tools open.
+    """
     client = FakeClient()
     asm = SessionAssembler(client)
     _outbound(asm, key=1)
@@ -410,14 +419,86 @@ def test_open_entry_cap():
         )
     asm.on_inbound(1, RESULT)
     asm.on_close(1, None)
-    # capped at 256 open entries: overflow force-closed with the unclosed marker
-    unclosed = [
-        s
-        for s in client.spans
-        if s.capture_integrity and Limitation.CHILD_SPAN_UNCLOSED in s.capture_integrity.limitations
+
+    def marked(marker):
+        return [
+            s
+            for s in client.spans
+            if s.capture_integrity and marker in s.capture_integrity.limitations
+        ]
+
+    evicted = marked(Limitation.SESSION_ENTRY_TABLE_FULL)
+    unclosed = marked(Limitation.CHILD_SPAN_UNCLOSED)
+    assert len(evicted) == 44
+    assert len(unclosed) == 256
+    assert len(evicted) + len(unclosed) == 300  # all eventually closed, none leaked
+    assert tallies("adapters.assembler.open_tool_table_full") == 44
+    # WHICH 44: the FIFO's witness. Ordered by start instant, the flag is a
+    # prefix — the oldest opens are the ones the bound closed.
+    tools = sorted(
+        (s for s in client.spans if s.name.startswith("execute_tool")),
+        key=lambda s: s.start_time_ns,
+    )
+    flags = [
+        s.capture_integrity is not None
+        and Limitation.SESSION_ENTRY_TABLE_FULL in s.capture_integrity.limitations
+        for s in tools
     ]
-    assert len(unclosed) == 300  # all eventually closed, none leaked
+    assert flags == [True] * 44 + [False] * 256
     assert asm.open_session_count() == 0
+
+
+def test_open_tool_eviction_names_the_session_entry_knob(tallies):
+    """The headline: a full `open_tools` table says which knob closed the span.
+
+    `child_span_unclosed` names no knob at all — it says a parent's teardown
+    closed the span, and no teardown happened here — so a reader chasing it
+    goes looking for a close that does not exist and concludes the agent
+    abandoned the tool. That is wardex blaming its own bound on the agent.
+    """
+    client = FakeClient()
+    asm = SessionAssembler(client, max_session_entries=1)
+    _outbound(asm, key=1)
+    asm.on_inbound(1, INIT)
+    for n in (1, 2):
+        asm.on_hook(
+            "PreToolUse",
+            {"session_id": "s-1", "tool_name": "Bash", "tool_input": {"command": "ls"}},
+            f"t{n}",
+        )
+
+    evicted = next(s for s in client.spans if s.name == "execute_tool Bash")
+    limits = evicted.capture_integrity.limitations
+    assert Limitation.SESSION_ENTRY_TABLE_FULL in limits
+    assert Limitation.CHILD_SPAN_UNCLOSED not in limits
+    assert evicted.status is StatusCode.UNSET
+    assert evicted.tool.call_id == "t1"
+    assert tallies("adapters.assembler.open_tool_table_full") == 1
+
+
+def test_the_evicted_tool_is_not_blamed_on_the_agent():
+    """UNSET and not ERROR, which is the other way to get this wrong.
+
+    ERROR would report wardex's own full table as a tool failure — status is
+    the first field anyone filters an agent run by — and `finish()` refuses an
+    ERROR with no type, so "fixing" the OK would arrive with a fabricated
+    `error.type` too. The bound stopped watching; it did not observe an outcome.
+    """
+    client = FakeClient()
+    asm = SessionAssembler(client, max_session_entries=1)
+    _outbound(asm, key=1)
+    asm.on_inbound(1, INIT)
+    for n in (1, 2):
+        asm.on_hook(
+            "PreToolUse",
+            {"session_id": "s-1", "tool_name": "Bash", "tool_input": {}},
+            f"t{n}",
+        )
+
+    evicted = next(s for s in client.spans if s.name == "execute_tool Bash")
+    assert evicted.status is StatusCode.UNSET
+    assert evicted.status is not StatusCode.ERROR
+    assert evicted.error_type is None
 
 
 def test_the_session_id_becomes_a_lookup_alias_for_the_units_own_context():

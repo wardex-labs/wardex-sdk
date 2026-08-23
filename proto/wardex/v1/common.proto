@@ -172,6 +172,19 @@ enum Limitation {
   //    names no knob at all: the reader's next action differs, which is the
   //    test that keeps members apart.
   LIMITATION_UNIT_TABLE_FULL = 40;
+  //    The same shape one layer out, and separate from 40 for the same reason
+  //    40 is separate from 8: this one names `max_session_entries`, the
+  //    adapter's per-SESSION tables (open tool calls, sub-agents, streamed
+  //    tool metadata, the OTel bridge's pending buffer), and raising
+  //    `max_entries_per_unit` leaves that bound exactly where it was.
+  //    `wardex-limits` calls the per-unit knob a generalization of this one —
+  //    same order, same semantics — but the census's operative test is not
+  //    whether two markers mean the same thing, it is whether the knob the
+  //    reader is sent to makes the marker go away, and these are separate
+  //    FIELDS. An evicted entry ships UNSET: wardex stopped watching before
+  //    the outcome, so OK would claim an unobserved success and ERROR would
+  //    blame the agent for wardex's own full table.
+  LIMITATION_SESSION_ENTRY_TABLE_FULL = 43;
 
   // -- Instrumentation lifecycle.
   LIMITATION_ADAPTER_UNINSTALLED = 9;

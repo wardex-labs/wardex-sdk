@@ -20,7 +20,7 @@ import json
 import threading
 import time
 from dataclasses import replace
-from typing import Any
+from typing import Any, TypeVar
 
 from .._assembly import (
     Evidence,
@@ -99,6 +99,10 @@ _IN_SESSION = Evidence(ParentSource.UNIT_ACTIVE)
 # there would claim the timing is absent when it is the one timing the adapter
 # owns.
 _BASE_LIMITATION = Limitation.TRANSPORT_TIMING_UNAVAILABLE_SUBPROCESS
+
+#: Value type of a per-session table, so `_room_for` hands the caller back the
+#: record it evicted rather than an `Any` the caller has to re-narrow.
+_TableValue = TypeVar("_TableValue")
 
 #: Whose runs these are. It must equal the adapter's `name()`, because that is
 #: what the `AdapterContext` is built with and therefore what `sole_live(...,
@@ -949,6 +953,42 @@ class SessionAssembler:
             counters.bump("adapters.assembler.tool_name_unattributable")
         return key
 
+    def _room_for(
+        self, table: dict[str, _TableValue], where: str
+    ) -> tuple[str, _TableValue] | None:
+        """FIFO room for one more entry in a per-session table. Caller holds `_lock`.
+
+        The assembler's half of `Unit._evict_oldest`, written to the same shape
+        on purpose: one bound, one policy, two containers with different
+        owners. Returns the evicted `(key, value)` so the CALLER decides what an
+        evicted entry owes the wire — a span (open tools, sub-agents) or a
+        breadcrumb (the two memories that outlive them).
+
+        Returns the pair rather than taking a callback so the non-evicting path,
+        which is every path until the table is full, allocates nothing: a
+        closure would be built on every insert to be discarded unused. That is
+        the same reason `Unit._evict_oldest` has this shape.
+        """
+        if len(table) < self._max_session_entries:
+            return None
+        oldest = next(iter(table))
+        value = table.pop(oldest)
+        counters.bump(f"adapters.assembler.{where}_table_full")
+        return oldest, value
+
+    def _has_room(self, table: dict[str, Any], where: str) -> bool:
+        """The refuse-the-newest half of the same bound, for a table whose
+        entries own NO span and whose consumers read it in ARRIVAL order.
+
+        Returns False and COUNTS the refusal — a bound that turns something away
+        in silence is the defect these two helpers exist to end, and a table
+        with no span to mark can still say so in a counter.
+        """
+        if len(table) < self._max_session_entries:
+            return True
+        counters.bump(f"adapters.assembler.{where}_table_full")
+        return False
+
     def _open_tool(self, sess: _Session, payload: dict, tool_use_id: str | None, now: int) -> None:
         if tool_use_id is None:
             return
@@ -964,21 +1004,20 @@ class SessionAssembler:
             # execution, so §8.4 gives it the span. Nothing is opened here, which
             # is also what keeps `_finalize` from force-closing a phantom.
             return
-        if len(sess.open_tools) >= self._max_session_entries:
-            # Evict the oldest open entry (FIFO via dict insertion order) so the
-            # session cannot accumulate unbounded open-tool state.
-            oldest_id, oldest = next(iter(sess.open_tools.items()))
-            del sess.open_tools[oldest_id]
+        evicted = self._room_for(sess.open_tools, "open_tool")
+        if evicted is not None:
+            # The bound names ITSELF. `CHILD_SPAN_UNCLOSED` used to ride here and
+            # says a parent's teardown closed the span — a teardown that never
+            # happened — sending the reader to look for a close instead of to
+            # `max_session_entries`. UNSET rather than OK for the same reason:
+            # this span's outcome was never observed.
+            _oldest_id, oldest = evicted
             self._emit_tool(
                 sess,
                 oldest,
                 now,
-                # Census rename (§6.5.1): `tool_span_unclosed` folded into the
-                # declared member `CHILD_SPAN_UNCLOSED`. Nothing is lost — the
-                # marker rides the tool span itself, where
-                # `gen_ai.operation.name=execute_tool` already says the child
-                # was a tool.
-                markers=(Limitation.CHILD_SPAN_UNCLOSED,),
+                status=StatusCode.UNSET,
+                markers=(Limitation.SESSION_ENTRY_TABLE_FULL,),
             )
         sess.open_tools[tool_use_id] = _OpenTool(
             tool_use_id=tool_use_id,
@@ -1033,17 +1072,32 @@ class SessionAssembler:
                 tool.input_data = stream_input
         if "tool_response" in payload:
             tool.output_data = _safe_json_bytes(payload.get("tool_response"))
-        self._emit_tool(sess, tool, now, failed=failed, error_type=error_type)
+        self._emit_tool(
+            sess,
+            tool,
+            now,
+            status=StatusCode.ERROR if failed else StatusCode.OK,
+            error_type=error_type,
+        )
 
     def _emit_tool(
         self,
         sess: _Session,
         tool: _OpenTool,
         end_ns: int,
-        failed: bool = False,
+        status: StatusCode = StatusCode.OK,
         markers: tuple[Limitation, ...] = (),
         error_type: str | None = None,
     ) -> None:
+        """Emit (or pend) one tool span.
+
+        `status` and not the `failed: bool` this used to take. A boolean encodes
+        the status and the error type at once and has no room for the third
+        outcome — UNSET, which is what a bound owes a call it stopped watching
+        before the result. Naming the parameter after the field it sets also
+        makes a missed call site a `TypeError` instead of a silently flipped
+        status.
+        """
         if tool.claim_key is not None and outranked(sess.unit, tool.claim_key, HOOK_RANK):
             # Re-checked HERE and not only at open, because the handler wrapper
             # claims the key while the tool body runs — i.e. AFTER `PreToolUse`
@@ -1055,11 +1109,11 @@ class SessionAssembler:
             return
         if sess.bridge is not None:
             with self._guard("adapters.assembler.emit_tool"):
-                self._pend_tool(sess, tool, end_ns, failed, markers, error_type)
+                self._pend_tool(sess, tool, end_ns, status, markers, error_type)
             return
         span = None
         with self._guard("adapters.assembler.emit_tool"):
-            span = self._build_tool(sess, tool, end_ns, failed, markers, error_type)
+            span = self._build_tool(sess, tool, end_ns, status, markers, error_type)
         if span is not None:
             self._capture(span)
 
@@ -1068,7 +1122,7 @@ class SessionAssembler:
         sess: _Session,
         tool: _OpenTool,
         end_ns: int,
-        failed: bool,
+        status: StatusCode,
         markers: tuple[Limitation, ...],
         error_type: str | None,
     ) -> None:
@@ -1081,7 +1135,7 @@ class SessionAssembler:
         removing the marker is the merged-LLM deliverable, not this one.
         Deferral would buy nothing here, so nothing is deferred.
         """
-        draft = self._tool_draft(sess, tool, failed, markers, error_type)
+        draft = self._tool_draft(sess, tool, status, markers, error_type)
         draft.set_end_ns(end_ns)
         self._pend(
             sess,
@@ -1098,17 +1152,17 @@ class SessionAssembler:
         sess: _Session,
         tool: _OpenTool,
         end_ns: int,
-        failed: bool,
+        status: StatusCode,
         markers: tuple[Limitation, ...],
         error_type: str | None,
     ) -> Any:
-        return self._tool_draft(sess, tool, failed, markers, error_type).finish(end_ns)
+        return self._tool_draft(sess, tool, status, markers, error_type).finish(end_ns)
 
     def _tool_draft(
         self,
         sess: _Session,
         tool: _OpenTool,
-        failed: bool,
+        status: StatusCode,
         markers: tuple[Limitation, ...],
         error_type: str | None,
     ) -> SpanDraft:
@@ -1137,8 +1191,8 @@ class SessionAssembler:
                 execution_type=ToolExecutionType.UNKNOWN,
             )
         )
-        draft.set_status(StatusCode.ERROR if failed else StatusCode.OK)
-        if failed:
+        draft.set_status(status)
+        if status is StatusCode.ERROR:
             # `finish()` refuses ERROR without a type, which turns the
             # untyped-failure defect into a mechanism. The hook path refines
             # the type from the failure payload's `is_interrupt` flag before
@@ -1219,7 +1273,7 @@ class SessionAssembler:
             sess,
             tool,
             now,
-            failed=ev.is_error,
+            status=StatusCode.ERROR if ev.is_error else StatusCode.OK,
             error_type="tool_error" if ev.is_error else None,
         )
 
@@ -1571,7 +1625,7 @@ class SessionAssembler:
                 sess,
                 tool,
                 now,
-                failed=True,
+                status=StatusCode.ERROR,
                 markers=(Limitation.CHILD_SPAN_UNCLOSED,),
                 error_type="tool_unclosed",
             )
