@@ -240,6 +240,18 @@ impl LlmSemantics {
     fn reasoning_output_tokens(&self) -> Option<i64> {
         self.inner.usage.reasoning_output_tokens()
     }
+    /// A usage sub-counter arrived without the total it belongs to, so the
+    /// normative total was withheld rather than invented. Python counts this
+    /// — the Rust side has no channel to the diagnostics registry.
+    #[getter]
+    fn usage_totals_unpaired(&self) -> bool {
+        self.inner.usage.totals_unpaired()
+    }
+    /// `checked_add` failed while normalizing; the input total was withheld.
+    #[getter]
+    fn usage_overflowed(&self) -> bool {
+        self.inner.usage.overflowed()
+    }
     #[getter]
     fn temperature(&self) -> Option<f64> {
         self.inner.temperature
@@ -628,6 +640,18 @@ impl ClaudeStreamEvent {
             .usage
             .as_ref()
             .and_then(|u| u.cache_creation_input_tokens())
+    }
+    /// See `LlmSemantics.usage_totals_unpaired` — same condition, P3 path.
+    #[getter]
+    fn usage_totals_unpaired(&self) -> bool {
+        self.inner
+            .usage
+            .as_ref()
+            .is_some_and(|u| u.totals_unpaired())
+    }
+    #[getter]
+    fn usage_overflowed(&self) -> bool {
+        self.inner.usage.as_ref().is_some_and(|u| u.overflowed())
     }
     #[getter]
     fn num_turns(&self) -> Option<i64> {

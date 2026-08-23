@@ -249,3 +249,65 @@ def test_reasoning_included_in_output_tokens():
     assert sem.output_tokens == 600
     assert sem.reasoning_output_tokens == 100
     assert sem.output_tokens >= sem.reasoning_output_tokens
+
+
+# --------------------------------------------------------------------------
+# normalization conditions cross the FFI as values, and Python counts them
+# --------------------------------------------------------------------------
+
+
+def test_cache_without_input_tokens_bumps_the_counter():
+    """A cache tier without its total: withheld, not invented — and counted.
+
+    This is the reachability proof for the deferred USAGE_TOTALS_UNPAIRED
+    limitation: the member is minted only once this counter is seen nonzero
+    in real sessions, and a counter no input can reach could never earn it.
+    """
+    resp = json.dumps(
+        {
+            "id": "msg_02",
+            "model": "claude-sonnet-4-6",
+            "stop_reason": "end_turn",
+            "content": [{"type": "text", "text": "hi"}],
+            "usage": {"output_tokens": 5, "cache_read_input_tokens": 8000},
+        }
+    ).encode()
+    sem = _parse_anthropic(resp)
+    assert sem.usage_totals_unpaired is True
+    gen_ai = build_gen_ai(sem)
+    assert gen_ai.input_tokens is None  # no fabricated total
+    assert gen_ai.cache_read_input_tokens == 8000
+    assert counters.get("semantics.build_gen_ai.usage_totals_unpaired") == 1
+    assert counters.get("semantics.build_gen_ai.usage_overflowed") == 0
+
+
+def test_stream_json_cache_without_input_tokens_bumps_the_counter():
+    """The same condition arrives on P3 and lands in the assembler's tally."""
+    line = {
+        "type": "assistant",
+        "session_id": "s-1",
+        "message": {
+            "id": "msg_03",
+            "model": "claude-sonnet-4-6",
+            "stop_reason": "end_turn",
+            "usage": {"output_tokens": 5, "cache_read_input_tokens": 8000},
+            "content": [{"type": "text", "text": "done"}],
+        },
+    }
+    client = _FakeClient()
+    asm = SessionAssembler(client)
+    asm.on_outbound(
+        1,
+        json.dumps(
+            {"type": "user", "session_id": "s-1", "message": {"role": "user", "content": "go"}}
+        ),
+    )
+    asm.on_inbound(1, _STREAM_INIT)
+    asm.on_inbound(1, line)
+    asm.on_inbound(1, _STREAM_RESULT)
+    asm.on_close(1, None)
+    chat = next(s for s in client.spans if s.name.startswith("chat"))
+    assert chat.gen_ai.input_tokens is None
+    assert chat.gen_ai.cache_read_input_tokens == 8000
+    assert counters.get("adapters.assembler.stream_usage_totals_unpaired") == 1
+    assert counters.get("adapters.assembler.stream_usage_overflowed") == 0
