@@ -1,34 +1,32 @@
 //! OpenAI Chat Completions: request/response fill and SSE reassembly.
 
 use super::parts::*;
+use super::usage::{flatten_usage, UsageBounds, UsageView};
 use super::{LlmSemantics, StringOrVec};
 use crate::sse::SseEvent;
 use crate::usage::{InputConvention, TokenUsage};
 use serde::Deserialize;
 
+// Normalization table: LlmSemantics usage field <- dotted path in the raw
+// usage Value. The extraction below reads THROUGH these constants, so the
+// table a test walks and the path the code reads are one string (U4).
+const P_INPUT: &str = "prompt_tokens";
+const P_OUTPUT: &str = "completion_tokens";
+const P_CACHE_READ: &str = "prompt_tokens_details.cached_tokens";
+const P_REASONING: &str = "completion_tokens_details.reasoning_tokens";
+// Read by the fixture test (`every_normalized_usage_path_is_extracted_
+// from_its_fixture`), not by the runtime path — the runtime reads the
+// P_* consts the table is built from, which makes the two one string.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) const NORMALIZED_USAGE_PATHS: &[(&str, &str)] = &[
+    ("input_tokens", P_INPUT),
+    ("output_tokens", P_OUTPUT),
+    ("cache_read_input_tokens", P_CACHE_READ),
+    ("reasoning_output_tokens", P_REASONING),
+];
+
 // --- OpenAI structs ---
 
-#[derive(Deserialize, Default)]
-pub(super) struct OAPromptDetails {
-    #[serde(default)]
-    pub(super) cached_tokens: Option<i64>,
-}
-#[derive(Deserialize, Default)]
-pub(super) struct OACompletionDetails {
-    #[serde(default)]
-    reasoning_tokens: Option<i64>,
-}
-#[derive(Deserialize, Default)]
-pub(super) struct OAUsage {
-    #[serde(default)]
-    pub(super) prompt_tokens: Option<i64>,
-    #[serde(default)]
-    pub(super) completion_tokens: Option<i64>,
-    #[serde(default)]
-    pub(super) prompt_tokens_details: Option<OAPromptDetails>,
-    #[serde(default)]
-    pub(super) completion_tokens_details: Option<OACompletionDetails>,
-}
 #[derive(Deserialize)]
 struct OAFunction {
     #[serde(default)]
@@ -71,7 +69,11 @@ struct OpenAIChatResponse {
     #[serde(default)]
     choices: Vec<OAChoice>,
     #[serde(default)]
-    usage: Option<OAUsage>,
+    usage: Option<serde_json::Value>,
+    #[serde(default)]
+    service_tier: Option<String>,
+    #[serde(default)]
+    system_fingerprint: Option<String>,
 }
 #[derive(Deserialize)]
 struct OpenAIChatRequest {
@@ -99,6 +101,12 @@ struct OpenAIChatRequest {
     stop: Option<StringOrVec>,
     #[serde(default)]
     messages: Option<Vec<serde_json::Value>>,
+    #[serde(default)]
+    service_tier: Option<String>,
+    #[serde(default)]
+    reasoning_effort: Option<String>,
+    #[serde(default)]
+    response_format: Option<serde_json::Value>,
 }
 
 /// OpenAI chat request messages[] → system_instructions + input.messages.
@@ -222,19 +230,31 @@ fn openai_content_to_parts(
     parts
 }
 
-pub(super) fn fill_openai_chat(out: &mut LlmSemantics, req: &[u8], resp: &[u8]) {
+pub(super) fn fill_openai_chat(
+    out: &mut LlmSemantics,
+    req: &[u8],
+    resp: &[u8],
+    bounds: UsageBounds,
+) {
+    out.api_type = Some("chat_completions");
+    // The pre-split dispatcher stamped `output_type="text"` on every parse;
+    // the request half below refines it from `response_format.type`.
+    out.output_type = Some("text".to_string());
     if let Ok(r) = serde_json::from_slice::<OpenAIChatResponse>(resp) {
         out.response_id = r.id;
         out.response_model = r.model;
         let mut fr: Vec<String> = Vec::new();
         let mut msgs: Vec<OutMsg> = Vec::new();
         for c in r.choices {
+            // One producer for both carriers: the normalized value goes into
+            // `finish_reasons` AND onto the message (unknown raw passes
+            // through as itself — total function, never a silent drop).
             let finish_reason = c
                 .finish_reason
                 .as_deref()
-                .and_then(|f| finish_reason_to_otel("openai", f));
-            if let Some(f) = c.finish_reason {
-                fr.push(f);
+                .map(|f| normalize_finish_reason("openai", f));
+            if let Some(f) = &finish_reason {
+                fr.push(f.clone());
             }
             let mut parts: Vec<serde_json::Value> = Vec::new();
             if let Some(msg) = c.message {
@@ -282,14 +302,24 @@ pub(super) fn fill_openai_chat(out: &mut LlmSemantics, req: &[u8], resp: &[u8]) 
         if let Some(u) = r.usage {
             // OpenAI `prompt_tokens` already contains `cached_tokens`, and
             // `completion_tokens` already contains the reasoning tokens.
+            let view = UsageView(&u);
             out.usage = TokenUsage::new(
                 InputConvention::Inclusive,
-                u.prompt_tokens,
-                u.completion_tokens,
-                u.prompt_tokens_details.and_then(|d| d.cached_tokens),
+                view.i64_at(P_INPUT),
+                view.i64_at(P_OUTPUT),
+                view.i64_at(P_CACHE_READ),
                 None,
-                u.completion_tokens_details.and_then(|d| d.reasoning_tokens),
+                view.i64_at(P_REASONING),
             );
+            let flat = flatten_usage(&u, bounds);
+            out.usage_leaves = flat.leaves;
+            out.usage_dropped_count = flat.dropped;
+        }
+        if let Some(v) = r.service_tier {
+            out.response_service_tier = Some(v);
+        }
+        if let Some(v) = r.system_fingerprint {
+            out.system_fingerprint = Some(v);
         }
     }
     if let Ok(q) = serde_json::from_slice::<OpenAIChatRequest>(req) {
@@ -303,16 +333,38 @@ pub(super) fn fill_openai_chat(out: &mut LlmSemantics, req: &[u8], resp: &[u8]) 
         out.choice_count = q.n;
         out.stream = q.stream;
         out.stop_sequences = q.stop.map(|s| s.into_vec());
+        if let Some(v) = q.service_tier {
+            out.request_service_tier = Some(v);
+        }
+        if let Some(v) = q.reasoning_effort {
+            out.reasoning_level = Some(v);
+        }
+        // `response_format.type`: json_schema/json_object -> "json", anything
+        // else (or absent) -> "text" — the same rule the Responses parser
+        // applies to `text.format.type`.
+        out.output_type = Some(output_type_from_format(q.response_format.as_ref()).to_string());
         if let Some(messages) = q.messages {
             fill_openai_input(out, &messages);
         }
     }
 }
 
+/// `response_format.type` / `text.format.type` -> `gen_ai.output.type`.
+pub(super) fn output_type_from_format(format: Option<&serde_json::Value>) -> &'static str {
+    let ty = format
+        .and_then(|f| f.get("type"))
+        .and_then(|t| t.as_str())
+        .unwrap_or("text");
+    match ty {
+        "json_schema" | "json_object" => "json",
+        _ => "text",
+    }
+}
+
 /// OpenAI chat stream chunks → synthetic non-streaming-shaped JSON.
 /// Accumulates tool_call deltas into a BTreeMap keyed by index, concatenating the arguments string,
 /// then emits them as the choices[0].message.tool_calls array → fill_openai_chat reuses it for extraction.
-pub(super) fn reassemble_openai(events: &[SseEvent]) -> Vec<u8> {
+pub(super) fn reassemble_openai(events: &[SseEvent]) -> Reassembled {
     use std::collections::BTreeMap;
     let mut id: Option<String> = None;
     let mut model: Option<String> = None;
@@ -321,8 +373,13 @@ pub(super) fn reassemble_openai(events: &[SseEvent]) -> Vec<u8> {
     let mut usage: Option<serde_json::Value> = None;
     // index -> (id, name, arguments(accumulated))
     let mut tool_calls: BTreeMap<i64, (Option<String>, Option<String>, String)> = BTreeMap::new();
+    // Terminal = `[DONE]` OR any chunk with a non-null finish_reason: an
+    // OpenAI-compatible gateway that omits `[DONE]` must not read as an
+    // unterminated stream when its last chunk said why it stopped.
+    let mut terminated = false;
     for ev in events {
         if ev.data.trim() == "[DONE]" {
+            terminated = true;
             continue;
         }
         let v: serde_json::Value = match serde_json::from_str(&ev.data) {
@@ -374,6 +431,7 @@ pub(super) fn reassemble_openai(events: &[SseEvent]) -> Vec<u8> {
             }
             if let Some(fr) = c0.get("finish_reason").and_then(|x| x.as_str()) {
                 finish = Some(fr.to_string());
+                terminated = true;
             }
         }
         if let Some(u) = v.get("usage") {
@@ -407,5 +465,8 @@ pub(super) fn reassemble_openai(events: &[SseEvent]) -> Vec<u8> {
     if let Some(u) = usage {
         obj["usage"] = u;
     }
-    serde_json::to_vec(&obj).unwrap_or_default()
+    Reassembled {
+        body: serde_json::to_vec(&obj).unwrap_or_default(),
+        terminated,
+    }
 }

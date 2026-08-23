@@ -9,10 +9,14 @@ mod openai_embeddings;
 mod parts;
 #[cfg(test)]
 mod tests;
+pub mod usage;
 
 use anthropic::{fill_anthropic, reassemble_anthropic};
 use openai_chat::{fill_openai_chat, reassemble_openai};
 use openai_embeddings::fill_openai_embeddings;
+pub use parts::{normalize_finish_reason, FINISH_REASONS};
+use usage::UsageBounds;
+pub use usage::UsageLeaf;
 
 use crate::sse::{self, SseEvent};
 use crate::usage::TokenUsage;
@@ -56,6 +60,39 @@ pub struct LlmSemantics {
     pub system_instructions: Option<String>,
     /// Whether input.messages had unrecognized blocks (GenericPart fallback) (for marker use).
     pub input_messages_has_unmapped: bool,
+    /// semconv `openai.api.type`: which OpenAI API shape this call used
+    /// (`chat_completions` | `responses`). None for other providers.
+    pub api_type: Option<&'static str>,
+    /// `openai.request.service_tier`, provider spelling (`auto` included — MAY).
+    pub request_service_tier: Option<String>,
+    /// `openai.response.service_tier`, as the response reported it.
+    pub response_service_tier: Option<String>,
+    /// `openai.response.system_fingerprint` (Chat Completions only).
+    pub system_fingerprint: Option<String>,
+    /// `gen_ai.request.reasoning.level`: the exact string the caller sent
+    /// (Responses `reasoning.effort`, Chat `reasoning_effort`, Anthropic
+    /// `output_config.effort`).
+    pub reasoning_level: Option<String>,
+    /// `gen_ai.request.previous_response.id` (Responses chaining).
+    pub previous_response_id: Option<String>,
+    /// `gen_ai.response.status` (Responses only: queued/in_progress/completed/
+    /// incomplete/failed/cancelled).
+    pub response_status: Option<String>,
+    /// `gen_ai.request.encoding_formats` (embeddings).
+    pub encoding_formats: Option<Vec<String>>,
+    /// `gen_ai.embeddings.dimension.count` (embeddings request `dimensions`).
+    pub embedding_dimensions: Option<i64>,
+    /// Every scalar leaf of the provider's usage tree, spelling preserved —
+    /// the `wardex.usage.*` mirror (see `semantic/usage.rs`). Bounded by
+    /// `max_extra_keys`; what the bound dropped is in `usage_dropped_count`.
+    pub usage_leaves: Vec<(String, UsageLeaf)>,
+    /// Leaves the bounds dropped from `usage_leaves` (cap + the two
+    /// structural sanity bounds — one counter, so leaves + dropped equals the
+    /// tree's scalar-leaf count).
+    pub usage_dropped_count: u32,
+    /// SSE only (None otherwise): whether the stream carried its provider's
+    /// terminal event. `Some(false)` feeds a diagnostics counter, not a marker.
+    pub stream_terminated: Option<bool>,
 }
 
 /// stop: allows both a string and an array of strings.
@@ -139,7 +176,13 @@ fn provider_from_sse(events: &[SseEvent]) -> Option<&'static str> {
 }
 
 /// If the body is SSE, reassemble it for semantic extraction. Otherwise None (falls through to the existing path).
-fn try_parse_sse(host: &str, path: &str, req: &[u8], decoded: &[u8]) -> Option<LlmSemantics> {
+fn try_parse_sse(
+    host: &str,
+    path: &str,
+    req: &[u8],
+    decoded: &[u8],
+    bounds: UsageBounds,
+) -> Option<LlmSemantics> {
     if !sse::looks_like_sse(decoded) {
         return None;
     }
@@ -148,29 +191,29 @@ fn try_parse_sse(host: &str, path: &str, req: &[u8], decoded: &[u8]) -> Option<L
     let provider = provider_from_host(host).or_else(|| provider_from_sse(&events));
     match provider {
         Some("openai") => {
-            let synthetic = reassemble_openai(&events);
+            let reassembled = reassemble_openai(&events);
             let mut out = LlmSemantics {
                 provider: "openai".to_string(),
                 operation: operation.to_string(),
-                output_type: Some("text".to_string()),
                 reassembled_from_stream: true,
-                decoded_response: Some(synthetic.clone()),
+                stream_terminated: Some(reassembled.terminated),
+                decoded_response: Some(reassembled.body.clone()),
                 ..Default::default()
             };
-            fill_openai_chat(&mut out, req, &synthetic);
+            fill_openai_chat(&mut out, req, &reassembled.body, bounds);
             Some(out)
         }
         Some("anthropic") => {
-            let synthetic = reassemble_anthropic(&events);
+            let reassembled = reassemble_anthropic(&events);
             let mut out = LlmSemantics {
                 provider: "anthropic".to_string(),
                 operation: operation.to_string(),
-                output_type: Some("text".to_string()),
                 reassembled_from_stream: true,
-                decoded_response: Some(synthetic.clone()),
+                stream_terminated: Some(reassembled.terminated),
+                decoded_response: Some(reassembled.body.clone()),
                 ..Default::default()
             };
-            fill_anthropic(&mut out, req, &synthetic);
+            fill_anthropic(&mut out, req, &reassembled.body, bounds);
             Some(out)
         }
         _ => {
@@ -225,7 +268,8 @@ pub fn parse_llm(
     limits: Limits,
 ) -> Option<LlmSemantics> {
     let decoded = decode_body(resp, limits);
-    if let Some(s) = try_parse_sse(host, path, req, &decoded) {
+    let bounds = UsageBounds::from_limits(&limits);
+    if let Some(s) = try_parse_sse(host, path, req, &decoded, bounds) {
         return Some(s);
     }
     let operation = operation_from_path(path)?;
@@ -233,14 +277,13 @@ pub fn parse_llm(
     let mut out = LlmSemantics {
         provider: provider.to_string(),
         operation: operation.to_string(),
-        output_type: Some("text".to_string()),
         decoded_response: Some(decoded.clone()),
         ..Default::default()
     };
     match (provider, operation) {
-        ("openai", "chat") => fill_openai_chat(&mut out, req, &decoded),
-        ("openai", "embeddings") => fill_openai_embeddings(&mut out, &decoded),
-        ("anthropic", "chat") => fill_anthropic(&mut out, req, &decoded),
+        ("openai", "chat") => fill_openai_chat(&mut out, req, &decoded, bounds),
+        ("openai", "embeddings") => fill_openai_embeddings(&mut out, req, &decoded, bounds),
+        ("anthropic", "chat") => fill_anthropic(&mut out, req, &decoded, bounds),
         _ => {} // unsupported combination (e.g. anthropic embeddings) is left as empty semantics
     }
     Some(out)

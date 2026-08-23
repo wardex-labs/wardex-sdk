@@ -25,9 +25,10 @@ def test_limits_defaults_returns_every_field():
     assert d["max_otlp_attribute_bytes"] == 1024 * 1024
     assert d["max_otlp_request_bytes"] == 4 * 1024 * 1024
     assert d["max_link_targets"] == 256
+    assert d["max_extra_keys"] == 64
     assert d["max_otel_bridge_body_bytes"] == 4 * 1024 * 1024
     assert d["max_otel_bridge_spans_per_session"] == 2048
-    assert len(d) == 23
+    assert len(d) == 24
 
 
 def test_limits_construction_defaults_unspecified_fields():
@@ -1087,6 +1088,30 @@ def _dropped_under(limits: LimitsConfig) -> int:
         wardex_sdk.close()
 
 
+def _probe_max_extra_keys() -> bool:
+    # The usage pass-through mirror is the one enforcement site: a 7-leaf
+    # usage tree under a cap of 3 must report drops, and under the default
+    # (64) must not — a probe that would pass with the bound ignored proves
+    # nothing.
+    response = (
+        b'{"model":"gpt-4o-mini","choices":[{"message":{"content":"x"},'
+        b'"finish_reason":"stop"}],"usage":{"prompt_tokens":6,"completion_tokens":7,'
+        b'"total_tokens":13,"a":1,"b":2,"c":3,"d":4}}'
+    )
+
+    def dropped(limits: LimitsConfig) -> int:
+        sem = _wardex_native.protocol.parse_llm_semantics(
+            "api.openai.com",
+            "/v1/chat/completions",
+            b'{"model":"gpt-4o-mini"}',
+            response,
+            limits.to_native(),
+        )
+        return sem.usage_dropped_count
+
+    return dropped(LimitsConfig(max_extra_keys=3)) == 4 and dropped(LimitsConfig()) == 0
+
+
 _PROBES = {
     "max_headers": _probe_max_headers,
     "max_body_bytes": _probe_max_body_bytes,
@@ -1103,6 +1128,7 @@ _PROBES = {
     "max_entries_per_unit": _probe_max_entries_per_unit,
     "max_link_targets": _probe_max_link_targets,
     "mcp_sniff_bytes": _probe_mcp_sniff_bytes,
+    "max_extra_keys": _probe_max_extra_keys,
     "max_buffer_spans": _probe_max_buffer_spans,
     "max_buffer_bytes": _probe_max_buffer_bytes,
     "max_otel_bridge_body_bytes": _probe_max_otel_bridge_body_bytes,

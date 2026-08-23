@@ -201,14 +201,36 @@ pub(super) fn server_tool_call_response_part(
     serde_json::Value::Object(m)
 }
 
-/// Per-provider finish_reason → OTel enum. Unmapped is None (field omitted).
-pub(super) fn finish_reason_to_otel(provider: &str, raw: &str) -> Option<String> {
+/// The closed set every KNOWN provider finish reason maps into. An UNKNOWN
+/// raw value passes through in the provider's own spelling instead of being
+/// dropped: a new finish reason the provider invents shows up under its own
+/// name rather than silently vanishing.
+pub const FINISH_REASONS: &[&str] = &["stop", "length", "tool_call", "content_filter", "error"];
+
+/// The ONE producer of `gen_ai.response.finish_reasons` and of
+/// `OutMsg.finish_reason`, total over its input. Three endpoints and the
+/// Agent SDK assembler (through the PyO3 export) all spell a stop through
+/// this function, so one fact cannot reach the wire in two spellings —
+/// `["tool_calls"]` from Chat next to `["tool_call"]` from Responses was the
+/// exact split this replaces, on the one attribute dashboards group by.
+pub fn normalize_finish_reason(provider: &str, raw: &str) -> String {
     let v = match (provider, raw) {
         (_, "stop") | ("anthropic", "end_turn") | ("anthropic", "stop_sequence") => "stop",
-        (_, "length") | ("anthropic", "max_tokens") => "length",
+        (_, "length") | ("anthropic", "max_tokens") | ("openai", "max_output_tokens") => "length",
         (_, "tool_calls") | (_, "function_call") | ("anthropic", "tool_use") => "tool_call",
         (_, "content_filter") | ("anthropic", "refusal") => "content_filter",
-        _ => return None,
+        ("openai", "failed") | ("openai", "cancelled") => "error",
+        _ => return raw.to_string(), // total: unknown passes through as itself
     };
-    Some(v.to_string())
+    v.to_string()
+}
+
+/// One reassembled SSE stream: the synthetic body plus whether the stream
+/// carried its provider's terminal event. `terminated == false` is the
+/// volume-evidence condition the seam counts
+/// (`interceptors.seam.stream_unterminated`) — no marker is minted for it
+/// until that counter shows real volume.
+pub(super) struct Reassembled {
+    pub(super) body: Vec<u8>,
+    pub(super) terminated: bool,
 }

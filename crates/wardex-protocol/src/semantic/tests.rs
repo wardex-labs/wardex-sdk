@@ -1,7 +1,7 @@
 //! The original `semantic.rs` test suite, moved whole in the module split
 //! (names and count unchanged). New modules test beside their own code.
 
-use super::parts::finish_reason_to_otel;
+use super::parts::{normalize_finish_reason, FINISH_REASONS};
 use super::*;
 
 const OPENAI_CHAT: &[u8] = br#"{
@@ -104,10 +104,9 @@ fn anthropic_messages_extracts_tokens() {
     assert_eq!(s.usage.input_tokens(), Some(16));
     assert_eq!(s.usage.output_tokens(), Some(3));
     assert_eq!(s.usage.cache_read_input_tokens(), Some(4));
-    assert_eq!(
-        s.finish_reasons.as_deref(),
-        Some(&["end_turn".to_string()][..])
-    );
+    // Normalized spelling (`end_turn` -> `stop`): one producer for every
+    // endpoint, so dashboards group one fact under one string.
+    assert_eq!(s.finish_reasons.as_deref(), Some(&["stop".to_string()][..]));
 }
 
 #[test]
@@ -307,10 +306,7 @@ fn anthropic_sse_stream_extracts_tokens_text_stop() {
     assert_eq!(s.response_model.as_deref(), Some("claude-opus-4-8"));
     assert_eq!(s.usage.input_tokens(), Some(9));
     assert_eq!(s.usage.output_tokens(), Some(5)); // message_delta provides the final output_tokens
-    assert_eq!(
-        s.finish_reasons.as_deref(),
-        Some(&["end_turn".to_string()][..])
-    );
+    assert_eq!(s.finish_reasons.as_deref(), Some(&["stop".to_string()][..]));
     let body = String::from_utf8(s.decoded_response.clone().unwrap()).unwrap();
     assert!(body.contains("\"text\":\"Hello\""));
 }
@@ -675,44 +671,44 @@ fn sse_text_plus_tool_call() {
 }
 
 #[test]
-fn finish_reason_maps_to_otel_enum() {
+fn finish_reason_normalization_is_total_and_closed_over_known_values() {
+    // (a) Every KNOWN provider raw value maps into the closed set — the full
+    // table, per provider, so a new endpoint cannot leak a provider spelling
+    // for a value this function already knows.
+    let known: &[(&str, &str, &str)] = &[
+        ("openai", "stop", "stop"),
+        ("openai", "length", "length"),
+        ("openai", "tool_calls", "tool_call"),
+        ("openai", "function_call", "tool_call"),
+        ("openai", "content_filter", "content_filter"),
+        // Responses: `incomplete_details.reason` and terminal statuses.
+        ("openai", "max_output_tokens", "length"),
+        ("openai", "failed", "error"),
+        ("openai", "cancelled", "error"),
+        ("anthropic", "end_turn", "stop"),
+        ("anthropic", "stop_sequence", "stop"),
+        ("anthropic", "max_tokens", "length"),
+        ("anthropic", "tool_use", "tool_call"),
+        ("anthropic", "refusal", "content_filter"),
+    ];
+    for (provider, raw, want) in known {
+        let got = normalize_finish_reason(provider, raw);
+        assert_eq!(&got, want, "({provider}, {raw})");
+        assert!(FINISH_REASONS.contains(&got.as_str()));
+    }
+    // (b) Total: an UNKNOWN raw value passes through in the provider's own
+    // spelling — a new finish reason surfaces under its own name instead of
+    // silently vanishing (the old mapper returned None and the field was
+    // omitted).
+    assert_eq!(normalize_finish_reason("openai", "banana"), "banana");
     assert_eq!(
-        finish_reason_to_otel("openai", "tool_calls").as_deref(),
-        Some("tool_call")
+        normalize_finish_reason("anthropic", "pause_turn"),
+        "pause_turn"
     );
-    assert_eq!(
-        finish_reason_to_otel("openai", "length").as_deref(),
-        Some("length")
-    );
-    assert_eq!(
-        finish_reason_to_otel("openai", "stop").as_deref(),
-        Some("stop")
-    );
-    assert_eq!(
-        finish_reason_to_otel("anthropic", "end_turn").as_deref(),
-        Some("stop")
-    );
-    assert_eq!(
-        finish_reason_to_otel("anthropic", "max_tokens").as_deref(),
-        Some("length")
-    );
-    assert_eq!(
-        finish_reason_to_otel("anthropic", "tool_use").as_deref(),
-        Some("tool_call")
-    );
-    assert_eq!(
-        finish_reason_to_otel("anthropic", "refusal").as_deref(),
-        Some("content_filter")
-    );
-    assert_eq!(finish_reason_to_otel("anthropic", "pause_turn"), None);
-    assert_eq!(
-        finish_reason_to_otel("openai", "content_filter").as_deref(),
-        Some("content_filter")
-    );
-    assert_eq!(
-        finish_reason_to_otel("openai", "function_call").as_deref(),
-        Some("tool_call")
-    );
+    // (c) Members of the closed set are fixed points.
+    for member in FINISH_REASONS {
+        assert_eq!(&normalize_finish_reason("openai", member), member);
+    }
 }
 
 #[test]
@@ -1248,4 +1244,302 @@ fn anthropic_sse_web_search_result_reassembled() {
         .find(|p| p["type"] == "server_tool_call_response")
         .expect("response part");
     assert_eq!(res["server_tool_call_response"][0]["title"], "T");
+}
+
+// --- the open usage model (fixture-backed) --------------------------------
+
+/// Loads one fixture file at compile time.
+macro_rules! fixture {
+    ($case:literal, $file:literal) => {
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/llm/",
+            $case,
+            "/",
+            $file
+        )) as &[u8]
+    };
+}
+
+/// T-R6 / U4 — every path in a provider's `NORMALIZED_USAGE_PATHS` table is
+/// really extracted from that provider's fixture, and the normalized getter
+/// agrees with the mirror leaf at the same path. For the one ExcludesCache
+/// provider the input getter equals leaf(input) + leaf(cache_read) +
+/// leaf(cache_creation) — the S-3 rescope: `gen_ai.usage.*` is the semconv
+/// norm (inclusive), `wardex.usage.*` is the provider's own text (raw).
+#[test]
+fn every_normalized_usage_path_is_extracted_from_its_fixture() {
+    struct Case {
+        host: &'static str,
+        path: &'static str,
+        req: &'static [u8],
+        resp: &'static [u8],
+        table: &'static [(&'static str, &'static str)],
+        input_excludes_cache: bool,
+    }
+    let cases = [
+        Case {
+            host: "api.openai.com",
+            path: "/v1/chat/completions",
+            req: fixture!("openai_chat", "request.json"),
+            resp: fixture!("openai_chat", "response.json"),
+            table: super::openai_chat::NORMALIZED_USAGE_PATHS,
+            input_excludes_cache: false,
+        },
+        Case {
+            host: "api.anthropic.com",
+            path: "/v1/messages",
+            req: fixture!("anthropic_messages", "request.json"),
+            resp: fixture!("anthropic_messages", "response.json"),
+            table: super::anthropic::NORMALIZED_USAGE_PATHS,
+            input_excludes_cache: true,
+        },
+        Case {
+            host: "api.openai.com",
+            path: "/v1/embeddings",
+            req: fixture!("openai_embeddings", "request.json"),
+            resp: fixture!("openai_embeddings", "response.json"),
+            table: super::openai_embeddings::NORMALIZED_USAGE_PATHS,
+            input_excludes_cache: false,
+        },
+    ];
+    for case in &cases {
+        let s = parse_llm(case.host, case.path, case.req, case.resp, Limits::default())
+            .expect("fixture parses");
+        let leaf = |path: &str| -> i64 {
+            match s.usage_leaves.iter().find(|(p, _)| p == path) {
+                Some((_, UsageLeaf::Int(v))) => *v,
+                other => panic!("{}: leaf {path} missing or non-int: {other:?}", case.path),
+            }
+        };
+        for (field, path) in case.table {
+            let mirrored = leaf(path);
+            let normalized = match *field {
+                "input_tokens" => s.usage.input_tokens(),
+                "output_tokens" => s.usage.output_tokens(),
+                "cache_read_input_tokens" => s.usage.cache_read_input_tokens(),
+                "cache_creation_input_tokens" => s.usage.cache_creation_input_tokens(),
+                "reasoning_output_tokens" => s.usage.reasoning_output_tokens(),
+                other => panic!("table names an unknown field {other}"),
+            }
+            .unwrap_or_else(|| panic!("{}: {field} not extracted", case.path));
+            if *field == "input_tokens" && case.input_excludes_cache {
+                let tiers = leaf("cache_read_input_tokens") + leaf("cache_creation_input_tokens");
+                assert_eq!(
+                    normalized,
+                    mirrored + tiers,
+                    "{}: inclusive input != raw leaf + cache tiers",
+                    case.path
+                );
+            } else {
+                assert_eq!(
+                    normalized, mirrored,
+                    "{}: {field} != leaf {path}",
+                    case.path
+                );
+            }
+        }
+    }
+}
+
+/// T-R8 — the three Anthropic additions, each red before this commit.
+#[test]
+fn anthropic_thinking_tokens_map_to_reasoning_output_tokens() {
+    let s = parse_llm(
+        "api.anthropic.com",
+        "/v1/messages",
+        fixture!("anthropic_messages", "request.json"),
+        fixture!("anthropic_messages", "response.json"),
+        Limits::default(),
+    )
+    .unwrap();
+    assert_eq!(s.usage.reasoning_output_tokens(), Some(120));
+}
+
+#[test]
+fn anthropic_sse_message_delta_usage_is_merged_deep() {
+    let s = parse_llm(
+        "api.anthropic.com",
+        "/v1/messages",
+        fixture!("anthropic_messages_sse", "request.json"),
+        fixture!("anthropic_messages_sse", "stream.sse"),
+        Limits::default(),
+    )
+    .unwrap();
+    let leaves: std::collections::BTreeMap<&str, &UsageLeaf> = s
+        .usage_leaves
+        .iter()
+        .map(|(p, v)| (p.as_str(), v))
+        .collect();
+    // From the start event, kept through the merge:
+    assert_eq!(
+        leaves.get("cache_creation.ephemeral_5m_input_tokens"),
+        Some(&&UsageLeaf::Int(2000))
+    );
+    // From the delta, overwriting the start's 0 (deep, key-wise):
+    assert_eq!(
+        leaves.get("cache_creation.ephemeral_1h_input_tokens"),
+        Some(&&UsageLeaf::Int(64))
+    );
+    // Only in the delta — a subtree the start never had:
+    assert_eq!(
+        leaves.get("server_tool_use.web_search_requests"),
+        Some(&&UsageLeaf::Int(2))
+    );
+    assert_eq!(s.usage.output_tokens(), Some(500));
+    assert_eq!(s.usage.input_tokens(), Some(11000), "inclusive total");
+    assert_eq!(s.stream_terminated, Some(true));
+}
+
+#[test]
+fn anthropic_output_config_effort_is_reasoning_level() {
+    let s = parse_llm(
+        "api.anthropic.com",
+        "/v1/messages",
+        fixture!("anthropic_messages", "request.json"),
+        fixture!("anthropic_messages", "response.json"),
+        Limits::default(),
+    )
+    .unwrap();
+    assert_eq!(s.reasoning_level.as_deref(), Some("medium"));
+}
+
+/// T-R9 — Chat Completions additions.
+#[test]
+fn openai_chat_service_tier_fingerprint_reasoning_effort_extracted() {
+    let s = parse_llm(
+        "api.openai.com",
+        "/v1/chat/completions",
+        fixture!("openai_chat", "request.json"),
+        fixture!("openai_chat", "response.json"),
+        Limits::default(),
+    )
+    .unwrap();
+    assert_eq!(s.api_type, Some("chat_completions"));
+    assert_eq!(s.request_service_tier.as_deref(), Some("auto"));
+    assert_eq!(s.response_service_tier.as_deref(), Some("default"));
+    assert_eq!(s.system_fingerprint.as_deref(), Some("fp_fx1"));
+    assert_eq!(s.reasoning_level.as_deref(), Some("low"));
+}
+
+#[test]
+fn chat_response_format_json_sets_output_type_json() {
+    let req =
+        br#"{"model":"m","response_format":{"type":"json_schema","json_schema":{"name":"x"}}}"#;
+    let resp = br#"{"model":"m","choices":[{"message":{"content":"{}"},"finish_reason":"stop"}]}"#;
+    let s = parse_llm(
+        "api.openai.com",
+        "/v1/chat/completions",
+        req,
+        resp,
+        Limits::default(),
+    )
+    .unwrap();
+    assert_eq!(s.output_type.as_deref(), Some("json"));
+    // and the default stays what it always was:
+    let s2 = parse_llm(
+        "api.openai.com",
+        "/v1/chat/completions",
+        br#"{"model":"m"}"#,
+        resp,
+        Limits::default(),
+    )
+    .unwrap();
+    assert_eq!(s2.output_type.as_deref(), Some("text"));
+}
+
+/// T-R10 — embeddings request semantics, red before this commit.
+#[test]
+fn embeddings_request_model_formats_dimensions_and_no_output_type() {
+    let s = parse_llm(
+        "api.openai.com",
+        "/v1/embeddings",
+        fixture!("openai_embeddings", "request.json"),
+        fixture!("openai_embeddings", "response.json"),
+        Limits::default(),
+    )
+    .unwrap();
+    assert_eq!(s.request_model.as_deref(), Some("text-embedding-3-small"));
+    assert_eq!(
+        s.encoding_formats.as_deref(),
+        Some(&["float".to_string()][..])
+    );
+    assert_eq!(s.embedding_dimensions, Some(256));
+    assert_eq!(
+        s.output_type, None,
+        "an embeddings response is vectors, not text"
+    );
+}
+
+/// T-R14 — terminal detection is about the provider's grammar, not `[DONE]`
+/// alone (compatible gateways omit it), and absence is reported, not guessed.
+#[test]
+fn chat_stream_without_done_but_with_finish_reason_is_terminated() {
+    let sse = b"data: {\"id\":\"c\",\"model\":\"m\",\"choices\":[{\"delta\":{\"content\":\"x\"},\"finish_reason\":null}]}\n\ndata: {\"id\":\"c\",\"model\":\"m\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n";
+    let s = parse_llm(
+        "api.openai.com",
+        "/v1/chat/completions",
+        br#"{"model":"m"}"#,
+        sse,
+        Limits::default(),
+    )
+    .unwrap();
+    assert_eq!(s.stream_terminated, Some(true));
+}
+
+#[test]
+fn anthropic_stream_without_message_stop_is_unterminated() {
+    let sse = b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m1\",\"model\":\"c\",\"usage\":{\"input_tokens\":9,\"output_tokens\":1}}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hi\"}}\n\n";
+    let s = parse_llm(
+        "api.anthropic.com",
+        "/v1/messages",
+        br#"{"model":"c"}"#,
+        sse,
+        Limits::default(),
+    )
+    .unwrap();
+    assert_eq!(s.stream_terminated, Some(false));
+    // non-SSE stays None — the field is about streams only
+    let plain = parse_llm(
+        "api.anthropic.com",
+        "/v1/messages",
+        br#"{"model":"c"}"#,
+        br#"{"model":"c","content":[{"type":"text","text":"x"}]}"#,
+        Limits::default(),
+    )
+    .unwrap();
+    assert_eq!(plain.stream_terminated, None);
+}
+
+/// G5 shape at the Rust boundary: the cap is the limit field, observed.
+#[test]
+fn usage_leaves_are_capped_by_max_extra_keys() {
+    let resp = br#"{"model":"m","choices":[{"message":{"content":"x"},"finish_reason":"stop"}],
+        "usage":{"a":1,"b":2,"c":3,"d":4,"e":5,"prompt_tokens":6,"completion_tokens":7}}"#;
+    let limited = parse_llm(
+        "api.openai.com",
+        "/v1/chat/completions",
+        br#"{"model":"m"}"#,
+        resp,
+        Limits {
+            max_extra_keys: 3,
+            ..Limits::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(limited.usage_leaves.len(), 3);
+    assert_eq!(limited.usage_dropped_count, 4);
+    // U2: the normalized fields are extracted separately and never capped.
+    assert_eq!(limited.usage.input_tokens(), Some(6));
+    assert_eq!(limited.usage.output_tokens(), Some(7));
+    let unlimited = parse_llm(
+        "api.openai.com",
+        "/v1/chat/completions",
+        br#"{"model":"m"}"#,
+        resp,
+        Limits::default(),
+    )
+    .unwrap();
+    assert_eq!(unlimited.usage_dropped_count, 0);
+    assert_eq!(unlimited.usage_leaves.len(), 7);
 }

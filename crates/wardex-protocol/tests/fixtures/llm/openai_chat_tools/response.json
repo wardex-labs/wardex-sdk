@@ -1,0 +1,29 @@
+{
+ "id": "chatcmpl-fx2",
+ "model": "gpt-4o-mini-2024-07-18",
+ "choices": [
+  {
+   "index": 0,
+   "finish_reason": "tool_calls",
+   "message": {
+    "role": "assistant",
+    "content": null,
+    "tool_calls": [
+     {
+      "id": "call_fx1",
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "arguments": "{\"city\": \"Seoul\"}"
+      }
+     }
+    ]
+   }
+  }
+ ],
+ "usage": {
+  "prompt_tokens": 52,
+  "completion_tokens": 17,
+  "total_tokens": 69
+ }
+}

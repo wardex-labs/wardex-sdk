@@ -252,6 +252,32 @@ impl LlmSemantics {
     fn usage_overflowed(&self) -> bool {
         self.inner.usage.overflowed()
     }
+    /// The `wardex.usage.*` mirror: every scalar leaf of the provider's
+    /// usage tree, provider spelling preserved, as (dotted path, value).
+    #[getter]
+    fn usage_leaves(&self, py: Python<'_>) -> Vec<(String, PyObject)> {
+        use wardex_core::protocol::semantic::UsageLeaf;
+        self.inner
+            .usage_leaves
+            .iter()
+            .map(|(path, leaf)| {
+                let value = match leaf {
+                    UsageLeaf::Int(v) => v.to_object(py),
+                    UsageLeaf::Float(v) => v.to_object(py),
+                    UsageLeaf::Bool(v) => v.to_object(py),
+                    UsageLeaf::Str(v) => v.to_object(py),
+                };
+                (path.clone(), value)
+            })
+            .collect()
+    }
+    /// Leaves the bounds dropped from the mirror (`max_extra_keys` plus the
+    /// two structural sanity bounds — one number, so the seam can attach the
+    /// marker, the count and the diagnostics bump from a single fact).
+    #[getter]
+    fn usage_dropped_count(&self) -> u32 {
+        self.inner.usage_dropped_count
+    }
     #[getter]
     fn temperature(&self) -> Option<f64> {
         self.inner.temperature
@@ -693,6 +719,14 @@ fn grpc_status_name(code: i32) -> &'static str {
     core_grpc_status_name(code)
 }
 
+/// The one finish-reason normalizer (total: unknown raw values pass through).
+/// Exported so the Agent SDK assembler spells a stop exactly the way the wire
+/// parsers do — one producer, one spelling per fact.
+#[pyfunction]
+fn normalize_finish_reason(provider: &str, raw: &str) -> String {
+    wardex_core::protocol::semantic::normalize_finish_reason(provider, raw)
+}
+
 #[pyfunction]
 #[pyo3(signature = (host, path, req, resp, limits=None))]
 fn parse_llm_semantics(
@@ -720,6 +754,7 @@ fn _wardex_native(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     protocol.add_class::<JsonRpcParser>()?;
     protocol.add_class::<JsonRpcMessage>()?;
     protocol.add_function(wrap_pyfunction!(parse_llm_semantics, &protocol)?)?;
+    protocol.add_function(wrap_pyfunction!(normalize_finish_reason, &protocol)?)?;
     protocol.add_class::<WsParser>()?;
     protocol.add_class::<WsFeedResult>()?;
     protocol.add_class::<WsFrame>()?;

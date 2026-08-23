@@ -1,24 +1,36 @@
 //! Anthropic Messages: request/response fill and SSE reassembly.
 
 use super::parts::*;
+use super::usage::{deep_merge, flatten_usage, UsageBounds, UsageView};
 use super::LlmSemantics;
 use crate::sse::SseEvent;
 use crate::usage::{InputConvention, TokenUsage};
 use serde::Deserialize;
 
+// Normalization table: LlmSemantics usage field <- dotted path in the raw
+// usage Value. The extraction below reads THROUGH these constants, so the
+// table a test walks and the path the code reads are one string (U4).
+// `input_tokens` is the EXCLUDES-CACHE raw value — the normalized getter is
+// leaf(input) + leaf(cache_read) + leaf(cache_creation), by `TokenUsage::new`.
+const P_INPUT: &str = "input_tokens";
+const P_OUTPUT: &str = "output_tokens";
+const P_CACHE_READ: &str = "cache_read_input_tokens";
+const P_CACHE_CREATION: &str = "cache_creation_input_tokens";
+const P_REASONING: &str = "output_tokens_details.thinking_tokens";
+// Read by the fixture test (`every_normalized_usage_path_is_extracted_
+// from_its_fixture`), not by the runtime path — the runtime reads the
+// P_* consts the table is built from, which makes the two one string.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) const NORMALIZED_USAGE_PATHS: &[(&str, &str)] = &[
+    ("input_tokens", P_INPUT),
+    ("output_tokens", P_OUTPUT),
+    ("cache_read_input_tokens", P_CACHE_READ),
+    ("cache_creation_input_tokens", P_CACHE_CREATION),
+    ("reasoning_output_tokens", P_REASONING),
+];
+
 // --- Anthropic structs ---
 
-#[derive(Deserialize, Default)]
-struct AnthUsage {
-    #[serde(default)]
-    input_tokens: Option<i64>,
-    #[serde(default)]
-    output_tokens: Option<i64>,
-    #[serde(default)]
-    cache_read_input_tokens: Option<i64>,
-    #[serde(default)]
-    cache_creation_input_tokens: Option<i64>,
-}
 #[derive(Deserialize)]
 struct AnthropicResponse {
     #[serde(default)]
@@ -28,7 +40,7 @@ struct AnthropicResponse {
     #[serde(default)]
     stop_reason: Option<String>,
     #[serde(default)]
-    usage: Option<AnthUsage>,
+    usage: Option<serde_json::Value>,
     #[serde(default)]
     content: Option<Vec<serde_json::Value>>,
 }
@@ -52,6 +64,8 @@ struct AnthropicRequest {
     system: Option<serde_json::Value>,
     #[serde(default)]
     messages: Option<Vec<serde_json::Value>>,
+    #[serde(default)]
+    output_config: Option<serde_json::Value>,
 }
 
 /// Anthropic request system + messages[] → system_instructions + input.messages.
@@ -161,29 +175,37 @@ fn anthropic_content_to_parts(
     parts
 }
 
-pub(super) fn fill_anthropic(out: &mut LlmSemantics, req: &[u8], resp: &[u8]) {
+pub(super) fn fill_anthropic(out: &mut LlmSemantics, req: &[u8], resp: &[u8], bounds: UsageBounds) {
+    // The pre-split dispatcher stamped `output_type="text"` on every parse.
+    out.output_type = Some("text".to_string());
     if let Ok(r) = serde_json::from_slice::<AnthropicResponse>(resp) {
         out.response_id = r.id;
         out.response_model = r.model;
+        // One producer for both carriers (`finish_reasons` and the message):
+        // the normalized spelling, with unknown raw values passing through.
         let finish_reason = r
             .stop_reason
             .as_deref()
-            .and_then(|sr| finish_reason_to_otel("anthropic", sr));
-        if let Some(sr) = r.stop_reason {
-            out.finish_reasons = Some(vec![sr]);
+            .map(|sr| normalize_finish_reason("anthropic", sr));
+        if let Some(f) = &finish_reason {
+            out.finish_reasons = Some(vec![f.clone()]);
         }
         if let Some(u) = r.usage {
             // Anthropic reports the cache tiers OUTSIDE `input_tokens`; the
             // semconv Anthropic provider doc requires the inclusive sum, and
             // `ExcludesCache` is that requirement made unskippable.
+            let view = UsageView(&u);
             out.usage = TokenUsage::new(
                 InputConvention::ExcludesCache,
-                u.input_tokens,
-                u.output_tokens,
-                u.cache_read_input_tokens,
-                u.cache_creation_input_tokens,
-                None,
+                view.i64_at(P_INPUT),
+                view.i64_at(P_OUTPUT),
+                view.i64_at(P_CACHE_READ),
+                view.i64_at(P_CACHE_CREATION),
+                view.i64_at(P_REASONING),
             );
+            let flat = flatten_usage(&u, bounds);
+            out.usage_leaves = flat.leaves;
+            out.usage_dropped_count = flat.dropped;
         }
         if out.output_messages.is_none() {
             let mut parts: Vec<serde_json::Value> = Vec::new();
@@ -255,6 +277,14 @@ pub(super) fn fill_anthropic(out: &mut LlmSemantics, req: &[u8], resp: &[u8]) {
         out.top_k = q.top_k;
         out.stream = q.stream;
         out.stop_sequences = q.stop_sequences;
+        if let Some(effort) = q
+            .output_config
+            .as_ref()
+            .and_then(|c| c.get("effort"))
+            .and_then(|e| e.as_str())
+        {
+            out.reasoning_level = Some(effort.to_string());
+        }
         if let Some(messages) = q.messages {
             fill_anthropic_input(out, q.system.as_ref(), &messages);
         } else if let Some(system) = q.system.as_ref() {
@@ -264,17 +294,20 @@ pub(super) fn fill_anthropic(out: &mut LlmSemantics, req: &[u8], resp: &[u8]) {
 }
 
 /// Anthropic messages stream events → synthetic non-streaming-shaped JSON.
-pub(super) fn reassemble_anthropic(events: &[SseEvent]) -> Vec<u8> {
+pub(super) fn reassemble_anthropic(events: &[SseEvent]) -> Reassembled {
     use std::collections::BTreeMap;
     let mut id: Option<String> = None;
     let mut model: Option<String> = None;
     let mut content = String::new();
     let mut thinking = String::new();
     let mut stop_reason: Option<String> = None;
-    let mut input_tokens: Option<i64> = None;
-    let mut output_tokens: Option<i64> = None;
-    let mut cache_read: Option<i64> = None;
-    let mut cache_creation: Option<i64> = None;
+    // The FULL usage tree, not four picked fields: `message_start.usage` is
+    // the base and every `message_delta.usage` deep-merges over it (Anthropic
+    // documents the delta values as cumulative), so the cache tiers,
+    // `server_tool_use` and `output_tokens_details` survive reassembly.
+    let mut usage_val: Option<serde_json::Value> = None;
+    // Terminal = `message_stop` OR a `message_delta` carrying a stop_reason.
+    let mut terminated = false;
     // index -> (id, name, partial_json accumulated)
     let mut tool_uses: BTreeMap<i64, (Option<String>, Option<String>, String)> = BTreeMap::new();
     // server_tool_use: same shape as tool_use (input_json_delta accumulated)
@@ -297,12 +330,9 @@ pub(super) fn reassemble_anthropic(events: &[SseEvent]) -> Vec<u8> {
                     id = m.get("id").and_then(|x| x.as_str()).map(str::to_string);
                     model = m.get("model").and_then(|x| x.as_str()).map(str::to_string);
                     if let Some(u) = m.get("usage") {
-                        input_tokens = u.get("input_tokens").and_then(|x| x.as_i64());
-                        output_tokens = u.get("output_tokens").and_then(|x| x.as_i64());
-                        cache_read = u.get("cache_read_input_tokens").and_then(|x| x.as_i64());
-                        cache_creation = u
-                            .get("cache_creation_input_tokens")
-                            .and_then(|x| x.as_i64());
+                        if !u.is_null() {
+                            usage_val = Some(u.clone());
+                        }
                     }
                 }
             }
@@ -371,27 +401,22 @@ pub(super) fn reassemble_anthropic(events: &[SseEvent]) -> Vec<u8> {
                     .and_then(|x| x.as_str())
                 {
                     stop_reason = Some(sr.to_string());
+                    terminated = true;
                 }
-                if let Some(ot) = v
-                    .get("usage")
-                    .and_then(|u| u.get("output_tokens"))
-                    .and_then(|x| x.as_i64())
-                {
-                    output_tokens = Some(ot);
+                if let Some(u) = v.get("usage") {
+                    if !u.is_null() {
+                        match usage_val.as_mut() {
+                            Some(base) => deep_merge(base, u),
+                            None => usage_val = Some(u.clone()),
+                        }
+                    }
                 }
+            }
+            Some("message_stop") => {
+                terminated = true;
             }
             _ => {}
         }
-    }
-    let mut usage = serde_json::json!({
-        "input_tokens": input_tokens,
-        "output_tokens": output_tokens,
-    });
-    if let Some(c) = cache_read {
-        usage["cache_read_input_tokens"] = c.into();
-    }
-    if let Some(c) = cache_creation {
-        usage["cache_creation_input_tokens"] = c.into();
     }
     // content array: thinking (if present) + text (if non-empty) + tool_use (index order)
     // The current API streams only 1 thinking block; multiple blocks are merged into one and the order is fixed as thinking→text→tool (may differ from the source order of the non-streaming path) — multi-block support is a follow-up.
@@ -432,12 +457,17 @@ pub(super) fn reassemble_anthropic(events: &[SseEvent]) -> Vec<u8> {
             "content": result["content"],
         }));
     }
-    let obj = serde_json::json!({
+    let mut obj = serde_json::json!({
         "id": id,
         "model": model,
         "stop_reason": stop_reason,
         "content": content_arr,
-        "usage": usage,
     });
-    serde_json::to_vec(&obj).unwrap_or_default()
+    if let Some(u) = usage_val {
+        obj["usage"] = u;
+    }
+    Reassembled {
+        body: serde_json::to_vec(&obj).unwrap_or_default(),
+        terminated,
+    }
 }

@@ -1301,6 +1301,12 @@ _RUST_STR = re.compile(r'"((?:[^"\\]|\\.)*)"')
 
 _RUST_VEC_DECLARATIONS: dict[str, str] = {
     "crates/wardex-protocol/src/http1.rs": "ParsedHttp.limitations — the marker vector itself",
+    "crates/wardex-protocol/src/semantic/usage.rs": (
+        "a test-local Vec<&str> of usage-leaf PATHS (the determinism assertion "
+        "sorts them) — dotted key names like `prompt_tokens_details.cached_tokens`, "
+        "never limitation strings. The usage mirror's markers are minted in "
+        "Python (`_interceptors/_seam.py`), off the FFI drop count, not here."
+    ),
     "bindings/python/src/lib.rs": "the PyO3 getter that hands it to _protocol/_http1.py",
     "crates/wardex-codec/src/otlp/map.rs": (
         "the OTLP projection of a span's markers onto an attribute, not a place "

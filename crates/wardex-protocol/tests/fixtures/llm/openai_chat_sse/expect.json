@@ -1,0 +1,21 @@
+{
+ "provider": "openai",
+ "operation": "chat",
+ "api_type": "chat_completions",
+ "request_model": "gpt-4o-mini",
+ "response_model": "gpt-4o-mini",
+ "response_id": "chatcmpl-fx3",
+ "input_tokens": 9,
+ "output_tokens": 3,
+ "finish_reasons": [
+  "stop"
+ ],
+ "output_messages_present": true,
+ "stream_terminated": true,
+ "usage_leaves": {
+  "prompt_tokens": 9,
+  "completion_tokens": 3,
+  "total_tokens": 12,
+  "prompt_tokens_details.cached_tokens": 0
+ }
+}

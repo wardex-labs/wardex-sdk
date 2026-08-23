@@ -876,6 +876,7 @@ _DELIVERY: dict[str, tuple[tuple[str, Any], ...]] = {
         ("mcp_tool_catalog", lambda s: _read(_read(s.adapter, "_names"), "_max")),
     ),
     "mcp_sniff_bytes": (("mcp_proc_state", lambda s: _read(_proc_state(s), "_sniff_limit")),),
+    "max_extra_keys": (("native", _nat("ssl_seam", "max_extra_keys")),),
     "max_buffer_spans": (("resolved_map", lambda s: _read(s.client, "_max_buffer_spans")),),
     "max_buffer_bytes": (("resolved_map", lambda s: _read(s.client, "_max_buffer_bytes")),),
     "max_otel_bridge_body_bytes": (
@@ -923,6 +924,7 @@ _ROUND_A = LimitsConfig(
     max_units=19,
     max_entries_per_unit=23,
     mcp_sniff_bytes=512,
+    max_extra_keys=3,
     max_buffer_spans=29,
     max_buffer_bytes=65536,
     max_otel_bridge_body_bytes=131072,
@@ -946,6 +948,7 @@ _ROUND_B = LimitsConfig(
     max_units=61,
     max_entries_per_unit=67,
     mcp_sniff_bytes=1024,
+    max_extra_keys=5,
     max_buffer_spans=71,
     max_buffer_bytes=131072,
     max_otel_bridge_body_bytes=262144,

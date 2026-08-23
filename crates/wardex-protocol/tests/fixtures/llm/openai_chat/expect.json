@@ -1,0 +1,33 @@
+{
+ "provider": "openai",
+ "operation": "chat",
+ "api_type": "chat_completions",
+ "request_model": "gpt-4o-mini",
+ "response_model": "gpt-4o-mini-2024-07-18",
+ "response_id": "chatcmpl-fx1",
+ "input_tokens": 19,
+ "output_tokens": 4,
+ "cache_read_input_tokens": 8,
+ "reasoning_output_tokens": 2,
+ "finish_reasons": [
+  "stop"
+ ],
+ "output_messages_present": true,
+ "extras": {
+  "openai.request.service_tier": "auto",
+  "openai.response.service_tier": "default",
+  "openai.response.system_fingerprint": "fp_fx1"
+ },
+ "reasoning_level": "low",
+ "usage_leaves": {
+  "prompt_tokens": 19,
+  "completion_tokens": 4,
+  "total_tokens": 23,
+  "prompt_tokens_details.cached_tokens": 8,
+  "prompt_tokens_details.audio_tokens": 0,
+  "completion_tokens_details.reasoning_tokens": 2,
+  "completion_tokens_details.audio_tokens": 0,
+  "completion_tokens_details.accepted_prediction_tokens": 0,
+  "completion_tokens_details.rejected_prediction_tokens": 0
+ }
+}

@@ -1,0 +1,25 @@
+{
+ "model": "gpt-4o-mini",
+ "messages": [
+  {
+   "role": "user",
+   "content": "What's the weather in Seoul?"
+  }
+ ],
+ "tools": [
+  {
+   "type": "function",
+   "function": {
+    "name": "get_weather",
+    "parameters": {
+     "type": "object",
+     "properties": {
+      "city": {
+       "type": "string"
+      }
+     }
+    }
+   }
+  }
+ ]
+}
