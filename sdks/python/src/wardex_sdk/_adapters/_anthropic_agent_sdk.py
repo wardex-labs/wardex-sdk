@@ -776,9 +776,7 @@ class AnthropicAgentSdkAdapter(AdapterInterface):
                 from ._otel_receiver import _OtelBridgeReceiver
 
                 self._bridge = _OtelBridgeReceiver(
-                    max_body_bytes=resolved["max_otel_bridge_body_bytes"],
-                    max_spans_per_session=resolved["max_otel_bridge_spans_per_session"],
-                    max_sessions=resolved["max_sessions"],
+                    **limits_kwargs(LimitsConsumer.OTEL_BRIDGE_RECEIVER, resolved)
                 )
             if self._bridge is None:
                 # Bind/start failed inside the guard: the adapter installs
@@ -798,11 +796,8 @@ class AnthropicAgentSdkAdapter(AdapterInterface):
             # adapter's, and a private table has nothing to pick them out of.
             units=getattr(ctx, "_units", None),
             names=self._names,
-            max_sessions=resolved["max_sessions"],
-            max_session_entries=resolved["max_session_entries"],
-            max_units=resolved["max_units"],
-            max_entries_per_unit=resolved["max_entries_per_unit"],
             bridge=self._bridge,
+            **limits_kwargs(LimitsConsumer.SESSION_ASSEMBLER, resolved),
         )
         # Held for `_run_tool`. Narrowed here rather than trusted, because a
         # wrapper that survives an uninstall reads it and must get None rather

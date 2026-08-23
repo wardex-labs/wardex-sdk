@@ -22,7 +22,6 @@ import time
 from dataclasses import replace
 from typing import Any
 
-from .. import _wardex_native
 from .._assembly import (
     Evidence,
     Limitation,
@@ -45,6 +44,7 @@ from .._enums import (
     StatusCode,
     ToolExecutionType,
 )
+from .._limits import LimitsConfig, LimitsConsumer, limits_kwargs
 from .._protocol._claude_stream import AgentStreamEvent, parse_line
 from .._types import (
     AgentAttributes,
@@ -161,8 +161,6 @@ class SessionAssembler:
         names: McpToolCatalog | None = None,
         max_sessions: int | None = None,
         max_session_entries: int | None = None,
-        max_units: int | None = None,
-        max_entries_per_unit: int | None = None,
         bridge: Any = None,
     ) -> None:
         self._client = client
@@ -175,14 +173,21 @@ class SessionAssembler:
         self._bridge = bridge
         self._by_key: dict[int, _Session] = {}
         self._by_session_id: dict[str, _Session] = {}
-        # None means "use the core default" — resolved here (rather than hardcoded)
-        # so this can never silently drift from crates/wardex-limits.
-        defaults = _wardex_native.limits_defaults()
-        self._max_sessions = max_sessions if max_sessions is not None else defaults["max_sessions"]
+        # Bounds for the tables this assembler may have to BUILD, resolved from
+        # the CLIENT's config and never from a bare `LimitsConfig()`. A caller
+        # that hands us no registry still configured one, and process defaults
+        # would silently replace the user's values — which is the exact half of
+        # this class that was already doing so. `client=None` still yields the
+        # core defaults, which is the honest answer for a caller with no config
+        # at all.
+        cfg = getattr(client, "config", None)
+        lim = cfg.limits if cfg is not None else LimitsConfig()
+        resolved = lim.resolved()
+        self._max_sessions = max_sessions if max_sessions is not None else resolved["max_sessions"]
         self._max_session_entries = (
             max_session_entries
             if max_session_entries is not None
-            else defaults["max_session_entries"]
+            else resolved["max_session_entries"]
         )
         # The unit registry is what makes a framework identifier a LOOKUP KEY and
         # nothing else: every parent this assembler hands out comes from a unit
@@ -197,22 +202,30 @@ class SessionAssembler:
         # `close_all(owner=...)` answer questions about one table, and two
         # tables give two adapters no way to be told apart inside either. Built
         # here only for a caller that has no context yet, which is every test
-        # that drives this class directly.
+        # that drives this class directly — and one production path: an adapter
+        # installed by hand, without going through `wardex.init()`. That path is
+        # documented and warned about, not unsupported, so the registry it gets
+        # owes the host every bound the host configured. It used to get two of
+        # the four, forwarded from the adapter, and there was no third place a
+        # bound could arrive from.
         self._units = (
             units
             if units is not None
             else UnitRegistry(
                 sink=_ClientSink(client),
-                max_units=max_units,
-                max_entries_per_unit=max_entries_per_unit,
-                debug=bool(getattr(getattr(client, "config", None), "debug", False)),
+                debug=bool(getattr(cfg, "debug", False)),
+                **limits_kwargs(LimitsConsumer.UNIT_REGISTRY, resolved),
             )
         )
         # The shared tool-name space (design §5.4). Empty when the adapter did not
         # supply one, which is the correct reading for an assembler with no
         # in-process servers registered: every hook name then resolves to its own
         # key and the hook observer owns every call.
-        self._names = names if names is not None else McpToolCatalog()
+        if names is not None:
+            self._names = names
+        else:
+            self._names = McpToolCatalog()
+            self._names.apply_bound(**limits_kwargs(LimitsConsumer.MCP_TOOL_CATALOG, resolved))
 
     @property
     def units(self) -> UnitRegistry:

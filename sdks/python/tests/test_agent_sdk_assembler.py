@@ -98,6 +98,20 @@ class FakeClient:
         self.spans.append(span)
 
 
+def _one_root_registry(client):
+    """A registry with room for exactly one root, handed in as a registry.
+
+    `SessionAssembler` has no `max_units` parameter: one bound, one owner, and
+    the owner of a registry's bounds is the registry. A test that wants a
+    narrow one builds a narrow one — which is also what production does, since
+    the adapter hands over the context's registry rather than describing it.
+    """
+    from wardex_sdk._adapters._sink import _ClientSink
+    from wardex_sdk._assembly import UnitRegistry
+
+    return UnitRegistry(sink=_ClientSink(client), max_units=1)
+
+
 @pytest.fixture
 def tallies():
     """Counter DELTAS for one test, without clearing the process-wide table.
@@ -548,7 +562,7 @@ def test_a_registry_evicted_session_is_retired_and_the_run_resumes_on_a_fresh_ro
     sitting in a different conversation bucket from its own chat children.
     """
     client = FakeClient()
-    asm = SessionAssembler(client, max_units=1)
+    asm = SessionAssembler(client, units=_one_root_registry(client))
     _outbound(asm, key=1)
     asm.on_inbound(1, INIT)
     retired = asm._by_key[1]
@@ -601,7 +615,7 @@ def test_a_retired_sessions_open_tool_is_still_emitted(tallies):
     is what keeps the fix from trading one silent drop for another.
     """
     client = FakeClient()
-    asm = SessionAssembler(client, max_units=1)
+    asm = SessionAssembler(client, units=_one_root_registry(client))
     _outbound(asm, key=1)
     asm.on_inbound(1, INIT)
     asm.on_hook(
@@ -638,7 +652,7 @@ def test_closing_a_retired_transport_does_not_restamp_the_span_it_already_shippe
     itself only in the registry's `close_after_close`.
     """
     client = FakeClient()
-    asm = SessionAssembler(client, max_units=1)
+    asm = SessionAssembler(client, units=_one_root_registry(client))
     _outbound(asm, key=1)
     asm.on_inbound(1, INIT)
     retired = asm._by_key[1]
@@ -1178,10 +1192,6 @@ class _ClientWithLimits(FakeClient):
         self.config = self._Config(limits)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="the assembler's fallback registry gets two of the four bounds, resolved elsewhere",
-)
 def test_a_hand_installed_adapter_still_honours_the_configured_bounds():
     """`install(client)` with no context is a SUPPORTED path, and it is bounded.
 

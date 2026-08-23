@@ -174,8 +174,6 @@ _LIMIT_DELIVERY: dict[LimitsConsumer, _Delivery] = {
         delivers={
             "max_sessions": "max_sessions",
             "max_session_entries": "max_session_entries",
-            "max_units": "max_units",
-            "max_entries_per_unit": "max_entries_per_unit",
         },
         native=frozenset(),
         passthrough=frozenset({"client", "units", "names", "bridge"}),
