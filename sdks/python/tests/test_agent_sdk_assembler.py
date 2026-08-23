@@ -763,6 +763,60 @@ def test_a_subagent_stop_after_an_eviction_is_counted_not_dropped(tallies):
     assert tallies("adapters.assembler.subagent_stop_after_evict") == 1
 
 
+def _assistant_with(*tool_uses, msg_id="m1"):
+    return {
+        "type": "assistant",
+        "session_id": "s-1",
+        "message": {
+            "id": msg_id,
+            "model": "claude-sonnet-5",
+            "stop_reason": "tool_use",
+            "usage": {"input_tokens": 10, "output_tokens": 25},
+            "content": [
+                {"type": "tool_use", "id": tu_id, "name": "Bash", "input": {"command": cmd}}
+                for tu_id, cmd in tool_uses
+            ],
+        },
+    }
+
+
+def test_the_stream_meta_bound_keeps_what_is_consumed_next_and_counts_the_drop(tallies):
+    """The third table under the same bound, and the only one with no span.
+
+    Nothing to mark, so the counter IS the record — a bound that turns
+    something away in silence is what this whole change is about. The DIRECTION
+    stays refuse-the-newest, against the symmetry argument: both consumers pop
+    by the id whose result arrived, and in a turn the results come back broadly
+    in announcement order, so the oldest entry is the one most likely to be read
+    next. Correctness beats policy symmetry, and there was no measurement
+    supporting the swap.
+
+    What the refusal costs is asserted here rather than described, because it
+    lands in two different places: a hook-closed call keeps its span and silently
+    carries the hook's re-serialized input instead of the byte-exact stream one,
+    while a stream-only call has no span at all.
+    """
+    client = FakeClient()
+    asm = SessionAssembler(client, max_session_entries=1)
+    _outbound(asm, key=1)
+    asm.on_inbound(1, INIT)
+    asm.on_inbound(1, _assistant_with(("keep", "ls -1"), ("dropped", "ls -2")))
+
+    assert tallies("adapters.assembler.stream_tool_meta_table_full") == 1
+    sess = asm._by_key[1]
+    assert list(sess.stream_tool_meta) == ["keep"]
+
+    # (i) the entry that survived still supplies byte-exact input
+    asm.on_inbound(1, _tool_result("keep", "ok"))
+    kept = _tools(client, "keep")
+    assert len(kept) == 1
+    assert b"ls -1" in kept[0].input_data
+
+    # (ii) the refused one, on the stream-only path, has no span to mark
+    asm.on_inbound(1, _tool_result("dropped", "ok"))
+    assert _tools(client, "dropped") == []
+
+
 def test_the_session_id_becomes_a_lookup_alias_for_the_units_own_context():
     """The CLI's `session_id` is registered as a lookup ALIAS (design §5.3-iii).
 

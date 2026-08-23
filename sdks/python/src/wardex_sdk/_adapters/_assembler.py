@@ -384,7 +384,15 @@ class SessionAssembler:
             elif ev.kind == "assistant_turn":
                 self._emit_chat(sess, ev, now)
                 for tu_id, tu_name, tu_input in ev.tool_uses:
-                    if len(sess.stream_tool_meta) < self._max_session_entries:
+                    # Refuse the NEWEST and keep the oldest, which is the
+                    # opposite of the two tables above and deliberate. Nothing
+                    # here owns a span, and both consumers
+                    # (`_close_tool`, `_on_stream_tool_result`) pop by the id
+                    # whose RESULT arrived — in a turn, results come back
+                    # broadly in the order the uses were announced, so the
+                    # oldest entry is the one most likely to be read next.
+                    # Evicting it would discard exactly that.
+                    if self._has_room(sess.stream_tool_meta, "stream_tool_meta"):
                         sess.stream_tool_meta[tu_id] = (tu_name, tu_input)
             elif ev.kind == "tool_result":
                 self._on_stream_tool_result(sess, ev, now)
