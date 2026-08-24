@@ -163,8 +163,11 @@ All notable changes to this project are documented here. The format follows
   unpinned, and false the day the CLI stamps usage on `compaction`. A
   conflicted span thus appears as a GENERATION with no usage and cost 0: the
   honest visual form of an unresolvable correlation, instead of a hidden
-  double bill. Watched by the `adapters.anthropic.otel_bridge.usage_demoted`
-  counter.
+  double bill. The guarantee is *billed once*, not *one GENERATION row*: a
+  backend may still render the conflicted increments as additional
+  GENERATION-typed rows next to the one priced span — token-less and
+  cost 0 by construction, not a regression. Watched by the
+  `adapters.anthropic.otel_bridge.usage_demoted` counter.
 - **BREAKING (`wardex_sdk.testing`): `AdapterSubject` requires
   `usage_expected: Literal["none", "totals", "cache_tiers"]`.** No default,
   deliberately: a default would let a new adapter silently opt out of the
