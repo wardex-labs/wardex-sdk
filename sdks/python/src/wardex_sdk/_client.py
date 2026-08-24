@@ -489,6 +489,11 @@ class Client:
         self._dropped = 0
         self._lost = 0
         self._closed = False
+        # Whether THIS process registered its multiprocessing tail-flush
+        # finalizer (see `_register_mp_tail_flush`). Reset by
+        # `_at_fork_reinit`, because the flag answers a per-process question
+        # and a grandchild is a new process.
+        self._mp_tail_flush_registered = False
         # The SDK's one non-reentrant lock, and the only one -- a source scan in
         # `test_finalizer_reentrancy` enumerates plain `Lock()` sites and fails
         # on any second one, so this exception cannot be quietly copied.
@@ -1297,9 +1302,70 @@ class Client:
         # documented holdout entry per site.
         self._close_lock = threading.Lock()
         self._worker._at_fork_reinit()
+        # Per-process, so a grandchild answers "not yet" and registers its own
+        # tail-flush finalizer (the inherited registration is the CHILD's).
+        self._mp_tail_flush_registered = False
         if self._closed:
             return
         self._buffer = _SpanBuffer()
         self._snapshots = deque()
         self._dropped = 0
         self._lost = 0
+
+    def _register_mp_tail_flush(self) -> None:
+        """Give a `multiprocessing` fork child an exit flush. Step 5 of the
+        child hook; a no-op everywhere else.
+
+        An mp (or billiard) fork child leaves through `os._exit` after
+        `BaseProcess._bootstrap` — atexit NEVER runs there, so a tail under
+        the flush threshold captured inside a short-lived worker vanished
+        with no marker and no counter (`maxtasksperchild=1` lost every span
+        of every task). What DOES run is `multiprocessing.util._exit_function`,
+        in `_bootstrap`'s finally, strictly before `os._exit` — so the tail
+        rides a `util.Finalize` registered against this client.
+
+        Gated on `"multiprocessing.util" in sys.modules` — a probe, never an
+        import: a process where mp is not loaded cannot be an mp child, and
+        the fork hook is the one place import-time side effects are least
+        affordable. A raw `os.fork()` + `os._exit()` child is out of reach by
+        construction (neither atexit nor mp's exit function exists there);
+        the README says so and prescribes `wardex.flush()` before exiting.
+
+        The bare `flush` is deliberate: "send what you have, on the
+        transport's own budget" is exactly the tail-flush contract, and the
+        budget question was settled where `_UnnamedTimeout` lives.
+
+        PLANTED THROUGH `register_after_fork`, not by calling `Finalize`
+        here, and the indirection is load-bearing (measured, not read off
+        the docs): an mp child runs this hook DURING `os.fork()`, and the
+        very next thing `BaseProcess._bootstrap` does is
+        `util._finalizer_registry.clear()` — a Finalize registered here is
+        wiped before the worker runs a line. What `_bootstrap` runs AFTER
+        that clear is `util._run_after_forkers()`, so an after-forker
+        registered here (this hook runs strictly before `_bootstrap`
+        continues) is the one registration that survives to arm the real
+        Finalize. In a raw `os.fork` child `_run_after_forkers` never runs
+        and never needs to: a raw child either exits through the interpreter
+        (atexit's teardown flushes) or through `os._exit` (out of reach by
+        construction — the README prescribes `wardex.flush()` there).
+        """
+        if self._closed or self._mp_tail_flush_registered:
+            return
+        util = sys.modules.get("multiprocessing.util")
+        if util is None:
+            return
+        util.register_after_fork(self, Client._arm_mp_tail_finalizer)
+        self._mp_tail_flush_registered = True
+
+    def _arm_mp_tail_finalizer(self) -> None:
+        """Arm the exit flush — runs inside `_bootstrap`'s after-forkers,
+        after the finalizer-registry clear that would have eaten it.
+
+        Positive exitpriority: run among the first finalizers, before mp
+        tears down its own machinery under us. Plain method, called as
+        `func(obj)` by `_run_after_forkers`.
+        """
+        util = sys.modules.get("multiprocessing.util")
+        if util is None or self._closed:
+            return
+        util.Finalize(self, self.flush, exitpriority=10)

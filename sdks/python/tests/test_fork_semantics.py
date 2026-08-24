@@ -713,6 +713,98 @@ def test_catalog_fork_reinit_drops_handles_and_replaces_the_lock():
     assert catalog._handles == []
 
 
+# --------------------------------------------------------------------------
+# §6.7 — the multiprocessing fork child's tail
+# --------------------------------------------------------------------------
+
+
+class _FileNamesTransport(RecordingTransport):
+    """Appends exported span names to a file — the ONE channel that survives
+    an `os._exit` child, which is exactly the process shape under test."""
+
+    def __init__(self, path: str) -> None:
+        super().__init__()
+        self.path = path
+
+    def export(self, envelope, *, timeout=None):  # noqa: ANN001
+        with open(self.path, "a", encoding="utf-8") as f:
+            for span in envelope.spans:
+                f.write(span.name + "\n")
+        return super().export(envelope, timeout=timeout)
+
+
+def _mp_capture_and_return() -> None:
+    """An mp worker's whole life: capture below every threshold, return.
+
+    Module-level so the fork context can run it; no flush on purpose — the
+    tail-flush finalizer is the thing under test.
+    """
+    from wardex_sdk import _hub
+
+    client = _hub.get_client()
+    client.capture_span(_span("mp-tail-span"))
+
+
+@fork_only
+def test_mp_fork_child_tail_is_flushed_without_explicit_flush(tmp_path):
+    """A `multiprocessing` fork child dies through `os._exit` — atexit NEVER
+    runs there, so a tail under the flush threshold used to vanish with no
+    marker and no counter (`maxtasksperchild=1` lost every span of every
+    task). `multiprocessing.util._exit_function` DOES run, and the child
+    hook's tail-flush `Finalize` rides it."""
+    import multiprocessing
+
+    if "fork" not in multiprocessing.get_all_start_methods():
+        pytest.skip("no fork start method on this platform")
+    ctx = multiprocessing.get_context("fork")
+    sink = str(tmp_path / "mp-tail.log")
+    wardex.init(transport=_FileNamesTransport(sink), intercept=False, batching=_IDLE)
+    try:
+        proc = ctx.Process(target=_mp_capture_and_return)
+        proc.start()
+        proc.join(20)
+        assert proc.exitcode == 0
+        with open(sink, encoding="utf-8") as f:
+            names = f.read().splitlines()
+        assert names == ["mp-tail-span"], (
+            f"exported {names!r} — the mp child's tail must ship exactly once, "
+            "via util.Finalize, with no explicit flush in the worker"
+        )
+    finally:
+        wardex.close()
+
+
+@fork_only
+def test_the_tail_finalizer_is_the_childs_only_and_probes_without_importing():
+    """Two boundaries of the registration: only a fork CHILD registers (the
+    parent has atexit and needs no finalizer), and the child registers via a
+    `sys.modules` PROBE, never an import — a process that has not loaded
+    multiprocessing cannot be an mp child, and the fork hook must not import
+    anything on its behalf."""
+    wardex.init(transport=RecordingTransport(), intercept=False, batching=_IDLE)
+    try:
+
+        def child():
+            import sys as child_sys
+
+            client = _hub.get_client()
+            return {
+                "registered": client._mp_tail_flush_registered,
+                "mp_loaded": "multiprocessing.util" in child_sys.modules,
+            }
+
+        code, payload = _run_in_child(child)
+        assert code == 0, payload
+        assert payload["registered"] is payload["mp_loaded"], (
+            "registered iff multiprocessing was already in play — the probe may never import it"
+        )
+        assert _hub.get_client()._mp_tail_flush_registered is False, (
+            "only a fork CHILD registers the tail finalizer; the parent has atexit"
+        )
+    finally:
+        wardex.close()
+
+
 @fork_only
 def test_transport_at_fork_child_hook_is_called_in_the_child():
     """The duck-typed extension point: wardex cannot rebuild a third-party

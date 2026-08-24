@@ -403,6 +403,13 @@ class Runtime:
                     at_fork_child = getattr(client._transport, "at_fork_child", None)
                     if at_fork_child is not None:
                         at_fork_child()
+            # step 5 — a multiprocessing fork child leaves through os._exit,
+            # where atexit never runs; its tail rides util.Finalize instead.
+            # Registered here (per child) because the registration answers a
+            # per-process question — a grandchild registers its own.
+            if client is not None:
+                with guard("client.tail_flush.fork_reinit_failed"):
+                    client._register_mp_tail_flush()
             # step 6 — after the resets, so this survives them.
             counters.bump("_runtime.fork_child_reinit")
         self._fork_reinit_us = int((time.perf_counter() - started) * 1e6)
