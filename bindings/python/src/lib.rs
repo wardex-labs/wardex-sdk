@@ -5,6 +5,7 @@ mod limits;
 
 use limits::PyLimits;
 use pyo3::prelude::*;
+use pyo3::pybacked::{PyBackedBytes, PyBackedStr};
 use pyo3::types::PyBytes;
 use pyo3::wrap_pyfunction;
 use wardex_core::protocol::claude_stream_json as ccs;
@@ -774,17 +775,33 @@ fn normalize_finish_reason(provider: &str, raw: &str) -> String {
     wardex_core::protocol::semantic::normalize_finish_reason(provider, raw)
 }
 
+/// The one whole-body parse on the capture path, and the one native call that
+/// releases the GIL (design: parse-off-loop §4.2). The per-chunk parsers
+/// (`Http1Parser.feed` and friends) deliberately do NOT: they are O(chunk) µs
+/// work under an `&mut self` borrow, where a GIL round-trip buys nothing.
+/// `parse_grpc_frames` stays `&[u8]` for the same reason — measured at µs even
+/// on pathological inputs, and `PyBackedBytes` would narrow its accepted types
+/// (`memoryview` callers exist) for no gain.
+///
+/// `PyBackedBytes`/`PyBackedStr` own a reference to the Python object, so the
+/// closure below touches no Python state while the GIL is released: `bytes` is
+/// immutable and the owned reference guarantees the buffer's lifetime. The
+/// parse is pure Rust (inflate + SSE + JSON + reassembly); the `LlmSemantics`
+/// pyclass wrapping happens after the GIL is re-acquired. No size threshold —
+/// release/re-acquire is µs, two orders under the smallest measured parse.
 #[pyfunction]
 #[pyo3(signature = (host, path, req, resp, limits=None))]
 fn parse_llm_semantics(
-    host: &str,
-    path: &str,
-    req: &[u8],
-    resp: &[u8],
+    py: Python<'_>,
+    host: PyBackedStr,
+    path: PyBackedStr,
+    req: PyBackedBytes,
+    resp: PyBackedBytes,
     limits: Option<PyLimits>,
 ) -> Option<LlmSemantics> {
     let l = limits.map(|p| p.inner).unwrap_or_default();
-    parse_llm(host, path, req, resp, l).map(|inner| LlmSemantics { inner })
+    let inner = py.allow_threads(move || parse_llm(&host, &path, &req, &resp, l));
+    inner.map(|inner| LlmSemantics { inner })
 }
 
 #[pymodule]
