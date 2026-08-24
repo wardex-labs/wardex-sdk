@@ -118,6 +118,31 @@ class BatchWorker:
         if thread is not None and pid == os.getpid() and thread.is_alive():
             thread.join(timeout)
 
+    def _at_fork_reinit(self) -> None:
+        """Fork-child reset: fresh lock and Event, no thread, nothing spawned.
+
+        Called from the client's own `_at_fork_reinit` on the
+        `os.register_at_fork(after_in_child=...)` path. REPLACEMENT, never
+        acquisition: the parent may have been inside `_spawn_locked` — which
+        holds `_spawn_lock` across a `Thread(...)` construction and a
+        `start()` — at the fork instant, so the inherited lock can be
+        permanently held by a thread that does not exist in the child.
+
+        The thread slots are nulled rather than left for `is_alive()`'s PID
+        check to age out, because the check is the BACKSTOP (uWSGI's C-level
+        fork runs `after_in_child` but a hypothetical embedding might not) and
+        this is the primary path. Respawn stays LAZY: no thread is started
+        here — a child that never captures (the fork+exec shell-out, the mp
+        worker that dies young) never pays for one, and `ensure_alive()` on
+        the first capture is the tested path that brings the worker back.
+        `_stopped` is inherited as-is: a closed parent's child stays closed.
+        """
+        self._spawn_lock = threading.RLock()
+        self._wake = threading.Event()
+        self._thread = None
+        self._thread_for_pid = None
+        self._spawning_pid = None
+
     def _spawn_locked(self) -> None:
         if self._stopped:
             return

@@ -343,9 +343,44 @@ def reset_reports_for_test() -> None:
     way tests already reach `assembly._units._ambient_unit`, and putting a
     "forget what you reported" verb on the public surface would let production
     code un-bound the bound above.
+
+    NOT the fork path's entry point. This function ACQUIRES the lock, which is
+    exactly what a fork child may never do with an inherited one — and a
+    production path calling a `_for_test` name would be API hygiene walking
+    backwards besides. The child calls `diag_reset_for_new_process()`.
     """
     with _REPORT_LOCK:
         _REPORTED.clear()
+
+
+def diag_reset_for_new_process() -> None:
+    """Fork-child entry point: REPLACE both diagnostic locks, then clear.
+
+    Runs as `Runtime.after_in_child` step 0, before anything else in the child
+    — including `guard()`, whose `__exit__` bumps `counters` and would wait
+    forever on a lock the fork copied in a held state. Another thread of the
+    parent can be between `bump()`'s bytecodes, or inside `report_once`'s
+    `setdefault`, at the exact fork instant; the child inherits that lock
+    locked, with no thread left to release it.
+
+    So nothing here acquires anything. The child is single-threaded at this
+    point (POSIX fork keeps only the calling thread), which is what makes a
+    bare `clear()` on the dicts safe: no other frame can be mid-mutation in
+    the child — the parent's mid-mutation frame did not come along. The
+    inherited counts and report-dedup keys are cleared because they are the
+    PARENT's diagnostics: a child that inherited "already reported" would
+    stay silent about its own first loss, and inherited tallies would charge
+    the child for failures it never had.
+
+    Deliberately not `counters.reset()` + `reset_reports_for_test()`: both
+    acquire, and the second is a test-only name a production fork path has no
+    business calling.
+    """
+    global _REPORT_LOCK
+    counters._lock = threading.RLock()
+    counters._counts.clear()
+    _REPORT_LOCK = threading.RLock()
+    _REPORTED.clear()
 
 
 class guard:  # noqa: N801 — a context manager reads as a verb at the call site

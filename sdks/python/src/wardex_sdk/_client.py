@@ -1262,3 +1262,44 @@ class Client:
         self._worker.stop(budget)  # 2. worker exits without draining
         self._drain(budget, final=True, named_by_caller=named_by_caller)  # 3. final drain
         self._close_transport(budget)  # 4.
+
+    def _at_fork_reinit(self) -> None:
+        """Fork-child reset — runs from `Runtime.after_in_child` step 2.
+
+        REPLACE, never acquire (I-fork-5): any of the three locks can arrive
+        in the child held by a parent thread that did not come along —
+        `_export_lock` held across a POST is the measured worst case — and a
+        child that touched one would hang in its own atexit. The child is
+        single-threaded here, so plain reassignment is race-free.
+
+        THE BUFFER IS DISCARDED, NOT DRAINED (I-fork-3): every span in it was
+        captured by the parent, the parent still owns it and will export it,
+        and a child that shipped its inherited copy is where the "one call,
+        N+1 exports" duplication came from. Discarding is also why there is no
+        marker here — nothing was lost, it merely ships from the process that
+        owns it. `_dropped`/`_lost` restart at zero for the same reason: they
+        are the new process's diagnostics, not the parent's.
+
+        A closed client replaces its locks and keeps `_closed` — the child of
+        a closed parent is closed, and rebuilding buffers for a client that
+        rejects captures would only hide spans nothing will ever drain.
+
+        The worker resets last, into the lazy-respawn posture `ensure_alive()`
+        already services on the next capture (design: deliberately NOT OTel's
+        eager thread — a fork+exec child must not pay for one).
+        """
+        self._buffer_lock = threading.RLock()
+        self._export_lock = threading.RLock()
+        # The second allocation site for the SDK's one non-reentrant lock, with
+        # the SAME argument the declaration in `__init__` writes out — nothing
+        # about which callers can reach it changed, only which process it lives
+        # in. `test_finalizer_reentrancy` counts both sites against one
+        # documented holdout entry per site.
+        self._close_lock = threading.Lock()
+        self._worker._at_fork_reinit()
+        if self._closed:
+            return
+        self._buffer = _SpanBuffer()
+        self._snapshots = deque()
+        self._dropped = 0
+        self._lost = 0

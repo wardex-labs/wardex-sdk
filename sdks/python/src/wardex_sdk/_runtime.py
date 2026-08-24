@@ -61,9 +61,11 @@ import os
 import signal
 import sys
 import threading
+import time
 from typing import TYPE_CHECKING, Any
 
-from ._assembly import Limitation, diag_info
+from ._assembly import Limitation, counters, diag_info, guard
+from ._assembly._diag import diag_reset_for_new_process
 from ._client import Client, _UnnamedTimeout
 
 if TYPE_CHECKING:
@@ -110,6 +112,19 @@ def _handler(signum: int, frame: object) -> None:
     runtime().handle_signal(signum, frame)
 
 
+def _after_in_child() -> None:
+    """What `os.register_at_fork(after_in_child=...)` holds — CPython runs it
+    in every forked child, after the fork, before `fork()` returns there.
+
+    A module function holding a STRONG route to the runtime, and deliberately
+    not OTel's `WeakMethod` shape: `_RUNTIME` is an immortal singleton this
+    module owns, so there is nothing for a weak reference to protect against,
+    and a weakly-held hook that silently went dead would be the duplicate-
+    export bug coming back with no line of code to find it by.
+    """
+    _RUNTIME.after_in_child()
+
+
 class Runtime:
     """Every process-global thing wardex owns, and the order it owns it in.
 
@@ -124,6 +139,8 @@ class Runtime:
         "_atexit_registered",
         "_client",
         "_close_units",
+        "_fork_hooks_registered",
+        "_fork_reinit_us",
         "_interceptors",
         "_lock",
         "_prev_handlers",
@@ -137,6 +154,11 @@ class Runtime:
         self._adapters: AdapterRegistry | None = None
         self._atexit_registered = False
         self._signals_installed = False
+        self._fork_hooks_registered = False
+        #: How long the last `after_in_child` took in THIS process, in µs.
+        #: Diagnostics only (the fork tests assert an upper bound on it);
+        #: 0 means "this process is not a fork child".
+        self._fork_reinit_us = 0
         #: signum → the disposition wardex chained over
         self._prev_handlers: dict[int, Any] = {}
         #: `AdapterRegistry.close_units_all`, bound at signal-install time.
@@ -199,6 +221,7 @@ class Runtime:
             if not self._atexit_registered:
                 atexit.register(self._at_exit)
                 self._atexit_registered = True
+            self._register_fork_hooks()
             if config.batching.flush_on_signals:
                 self._install_signal_handlers(debug=config.debug)
             else:
@@ -270,6 +293,90 @@ class Runtime:
         client = self._client
         if client is not None:
             self.teardown()
+
+    # -- fork ---------------------------------------------------------------
+
+    def _register_fork_hooks(self) -> None:
+        """Register the child-side fork hook. Once per process, ever.
+
+        `after_in_child` ONLY. No `before`, no `after_in_parent` — and that is
+        a closed decision, not an omission (I-fork-2): fork changes nothing in
+        the parent, so a `before` hook has nothing to protect, and one that
+        took SDK locks could deadlock the host's own `os.fork()` against the
+        existing buffer→spawn lock ordering (`capture_span` inside
+        `_buffer_lock` reaches `ensure_alive`'s blocking `_spawn_lock`; a
+        before hook acquiring spawn→buffer is that pair reversed). uWSGI's
+        C-level fork also runs ONLY the child hook, so anything hung off the
+        other two would silently not exist in the deployment this work
+        targets. The host's `os.fork()` never waits on wardex.
+
+        The registration is IRREVERSIBLE — `os.register_at_fork` has no
+        unregister — which is why `reset()` keeps `_fork_hooks_registered`:
+        clearing it would stack one more registration per init/reset cycle for
+        the life of the pytest process. The hook itself tolerates any state
+        (`after_in_child` skips empty slots), so staying registered is safe.
+
+        Caller holds the lock (`install()`).
+        """
+        if self._fork_hooks_registered or not hasattr(os, "register_at_fork"):
+            return
+        os.register_at_fork(after_in_child=_after_in_child)
+        self._fork_hooks_registered = True
+
+    def after_in_child(self) -> None:
+        """Child-side fork reset — the ONE piece of SDK code that runs at fork.
+
+        The child inherits every table, buffer, lock and thread *record* of
+        the parent, and none of the parent's threads. Everything process-global
+        is therefore either replaced or emptied here, under one rule per kind:
+
+        * locks are REPLACED, never acquired (I-fork-5) — any inherited lock
+          can be held by a thread that does not exist in this process;
+        * buffered/pending data is DISCARDED, never emitted (I-fork-3) — the
+          parent owns it and the parent exports it; a child that shipped its
+          copy is the N+1 duplication this hook removes;
+        * patches and install records are KEPT (I-fork-4) — the monkeypatches
+          crossed the fork in the memory image and are still in effect, and
+          re-installing over them would double-wrap the host.
+
+        STEP 0 RUNS BEFORE ANY `guard()`: `guard.__exit__` bumps `counters`,
+        so entering one while `Counters._lock` is still the parent's — copied
+        mid-`bump()`, say — would hang the child inside the very hook that
+        exists to remove inherited-lock hangs. Step 0 is reassignments and
+        `dict.clear()` only; none of it can raise.
+
+        Steps read the SLOTS directly, never the `interceptors`/`adapters`
+        properties: those take `self._lock` and BUILD a missing registry
+        (importing `_interceptors/` on the way), and `_teardown`'s rule holds
+        here too — a registry that was never built is skipped, not built to be
+        reset. A `None` client is skipped the same way, which also covers
+        fork-before-init and fork-after-close.
+
+        Failures are isolated per step (each `with guard(...)`) and counted
+        under `*.fork_reinit_failed`; CPython would only write the exception
+        as unraisable and carry on anyway, so the guard buys isolation and a
+        counter, not survival. Worst case the lazy-respawn PID check
+        (`BatchWorker.is_alive`) still self-heals the worker on the next
+        capture — that check stays, as the backstop for platforms where this
+        hook never ran at all.
+
+        `process.pid` needs nothing here: the drain stamps it live, so it is
+        correct in every process without any fork-time work.
+        """
+        started = time.perf_counter()
+        # step 0 — replace the locks the hook itself would otherwise step on.
+        self._lock = threading.RLock()
+        diag_reset_for_new_process()
+        with guard("_runtime.fork_reinit_failed"):
+            # step 1 — slots, directly.
+            client = self._client
+            # step 2 — client: locks, buffer, worker.
+            if client is not None:
+                with guard("client.fork_reinit_failed"):
+                    client._at_fork_reinit()
+            # step 6 — after the resets, so this survives them.
+            counters.bump("_runtime.fork_child_reinit")
+        self._fork_reinit_us = int((time.perf_counter() - started) * 1e6)
 
     def reset(self) -> None:
         """Undo everything and forget it. TEST-ONLY.
