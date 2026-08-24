@@ -99,9 +99,9 @@ class _OpenTool:
 class _EvictedTool:
     """What an open-tool record leaves behind when the bound evicts it.
 
-    WAR-76's shape one layer up: the registry writes `Unit._evicted` so a later
-    refusal can name wardex's own bound instead of the host's lifecycle, and
-    this is the same breadcrumb for a later COMPLETION. Without it a
+    The unit registry's shape one layer up: it writes `Unit._evicted` so a
+    later refusal can name wardex's own bound instead of the host's lifecycle,
+    and this is the same breadcrumb for a later COMPLETION. Without it a
     `PostToolUse` that arrives after its open record was evicted is
     indistinguishable from a tool wardex never saw open — and the span built
     for it claims a duration of zero and a parent it did not earn.
