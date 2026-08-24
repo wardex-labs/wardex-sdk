@@ -646,3 +646,125 @@ def test_producer_and_consumer_kinds_reach_the_otlp_wire():
     assert (
         _first_span(Envelope(header=_header(), spans=(_span(kind=SpanKind.CONSUMER),)))["kind"] == 5
     )
+
+
+# --- G2: GenAIAttributes -> wire, exhaustively --------------------------------
+
+#: Declared exceptions to "every field reaches the wire", with their MEASURED
+#: reason — a wrong reason here turns a discovery into permanent furniture.
+_UNFLATTENED = {
+    "system_instructions": (
+        "declared but never populated by any producer — the seam ships "
+        "LlmSemantics.system_instructions directly as the "
+        "gen_ai.system_instructions extra; disposition in follow-up"
+    ),
+    "tool_definitions_hash": (
+        "declared but never populated by any producer; disposition in follow-up"
+    ),
+}
+
+
+def test_every_gen_ai_field_reaches_the_wire():
+    """Build a GenAIAttributes with a distinct sentinel per field, encode it,
+    and require every sentinel to surface in the OTLP attributes. A field
+    added to the dataclass without a `codec.rs` table row otherwise ships
+    None forever with no failing test — the exact drift that made
+    system_instructions and tool_definitions_hash dead fields.
+    """
+    import dataclasses
+
+    sentinels: dict[str, object] = {}
+    kwargs: dict[str, object] = {}
+    for i, field in enumerate(dataclasses.fields(GenAIAttributes)):
+        name = field.name
+        if name in _UNFLATTENED:
+            continue
+        ann = str(field.type)
+        if name == "operation":
+            value = OperationName.CHAT
+            probe = "chat"
+        elif name == "provider":
+            value = probe = "sentinel-provider"
+        elif "tuple[str, ...]" in ann:
+            value = (f"sentinel-{i}",)
+            probe = [f"sentinel-{i}"]
+        elif "int" in ann and "float" not in ann:
+            value = probe = 1_000_000 + i
+        elif "float" in ann:
+            value = probe = float(f"0.{i + 1}")
+        elif "bool" in ann:
+            value = probe = True
+        else:
+            value = probe = f"sentinel-{i}"
+        kwargs[name] = value
+        sentinels[name] = probe
+
+    env = Envelope(header=_header(), spans=(_span(gen_ai=GenAIAttributes(**kwargs)),))
+    attrs = _first_span(env)["attributes"]
+    values = list(attrs.values())
+    missing = [name for name, probe in sentinels.items() if probe not in values]
+    assert not missing, (
+        f"GenAIAttributes fields that never reached the OTLP wire: {missing}.\n"
+        "Add the field to the flatten table in bindings/python/src/codec.rs, "
+        "or declare it in _UNFLATTENED with its measured reason."
+    )
+
+
+def test_reasoning_previous_response_and_status_ship_under_their_semconv_keys():
+    env = Envelope(
+        header=_header(),
+        spans=(
+            _span(
+                gen_ai=GenAIAttributes(
+                    operation=OperationName.CHAT,
+                    reasoning_level="high",
+                    previous_response_id="resp_prev",
+                    response_status="completed",
+                ),
+            ),
+        ),
+    )
+    attrs = _first_span(env)["attributes"]
+    assert attrs["gen_ai.request.reasoning.level"] == "high"
+    assert attrs["gen_ai.request.previous_response.id"] == "resp_prev"
+    assert attrs["gen_ai.response.status"] == "completed"
+
+
+def test_embeddings_dimension_count_reaches_the_wire():
+    from wardex_sdk._types import EmbeddingsAttributes
+
+    env = Envelope(
+        header=_header(),
+        spans=(
+            _span(
+                gen_ai=GenAIAttributes(operation=OperationName.EMBEDDINGS),
+                embeddings=EmbeddingsAttributes(dimension_count=256),
+            ),
+        ),
+    )
+    attrs = _first_span(env)["attributes"]
+    assert attrs["gen_ai.embeddings.dimension.count"] == 256
+
+
+def test_wardex_usage_mirror_ints_ride_as_int_values():
+    """T-C1 — the mirror's integers reach OTLP as IntValue attributes (the
+    type that makes them structurally unmaskable), through the ordinary
+    extra passthrough."""
+    env = Envelope(
+        header=_header(),
+        spans=(
+            _span(
+                extra=(
+                    ("wardex.usage.input_tokens", 52),
+                    ("wardex.usage.cache_creation.ephemeral_1h_input_tokens", 64),
+                    ("wardex.usage.service_tier", "standard"),
+                    ("wardex.usage_leaves.dropped_count", 3),
+                ),
+            ),
+        ),
+    )
+    attrs = _first_span(env)["attributes"]
+    assert attrs["wardex.usage.input_tokens"] == 52
+    assert attrs["wardex.usage.cache_creation.ephemeral_1h_input_tokens"] == 64
+    assert attrs["wardex.usage.service_tier"] == "standard"
+    assert attrs["wardex.usage_leaves.dropped_count"] == 3

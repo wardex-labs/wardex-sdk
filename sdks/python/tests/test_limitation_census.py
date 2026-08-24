@@ -257,6 +257,11 @@ _MEMBER_SITES: dict[str, frozenset[str]] = {
     # eviction, the sub-agent eviction, and the completion half that reports
     # the same eviction from the other end.
     "SESSION_ENTRY_TABLE_FULL": frozenset({"_adapters/_assembler.py"}),
+    # The dynamic-key bound: the seam attaches it off the native parser's
+    # usage_dropped_count — the marker, the wardex.usage_leaves.dropped_count
+    # extra and the diagnostics bump travel as one fact, gated on an
+    # identified span.
+    "EXTRA_KEYS_DROPPED": frozenset({"_interceptors/_seam.py"}),
     # Two emitters, one per bound that can evict a session: the registry closes
     # the oldest ROOT unit at `max_units`, and the
     # assembler closes the oldest SESSION at `max_sessions`. Both EMIT the root
@@ -577,6 +582,12 @@ _EMITTED_MEMBERS: frozenset[str] = frozenset(
         # eviction that used to drop its span entirely, and the completion half
         # that reports the same eviction from the other end.
         "SESSION_ENTRY_TABLE_FULL",
+        # The fifteenth: the dynamic-key bound, minted WITH its emitter (the
+        # byte seam's identified-span block) in the same PR — the same
+        # at-authoring-time application of the census rule as the bridge pair.
+        # The count it explains rides beside it as an extra, and the volume
+        # signal in the diagnostics counters.
+        "EXTRA_KEYS_DROPPED",
     }
 )
 """Which MEMBERS have an emit site today, derived independently below.
@@ -1301,6 +1312,18 @@ _RUST_STR = re.compile(r'"((?:[^"\\]|\\.)*)"')
 
 _RUST_VEC_DECLARATIONS: dict[str, str] = {
     "crates/wardex-protocol/src/http1.rs": "ParsedHttp.limitations — the marker vector itself",
+    "crates/wardex-protocol/src/semantic/endpoint.rs": (
+        "path SEGMENTS (`/v1/responses` split on `/`) inside the last-segment "
+        "endpoint matcher — URL pieces, never limitation strings. No marker is "
+        "minted anywhere in endpoint recognition; a path that matches nothing "
+        "is parse_llm returning None."
+    ),
+    "crates/wardex-protocol/src/semantic/usage.rs": (
+        "a test-local Vec<&str> of usage-leaf PATHS (the determinism assertion "
+        "sorts them) — dotted key names like `prompt_tokens_details.cached_tokens`, "
+        "never limitation strings. The usage mirror's markers are minted in "
+        "Python (`_interceptors/_seam.py`), off the FFI drop count, not here."
+    ),
     "bindings/python/src/lib.rs": "the PyO3 getter that hands it to _protocol/_http1.py",
     "crates/wardex-codec/src/otlp/map.rs": (
         "the OTLP projection of a span's markers onto an attribute, not a place "
@@ -1482,14 +1505,18 @@ _VOCABULARY: dict[str, str] = {
     #     differs (nothing arrived vs data arrived and meant nothing) ---
     "OTEL_BRIDGE_NO_DATA": "otel_bridge_no_data",
     "OTEL_BRIDGE_SCHEMA_UNKNOWN": "otel_bridge_schema_unknown",
+    # --- added after the census, by the dynamic-key bound (1): the
+    #     provider-usage mirror is an open key family, and its cap names its
+    #     own knob (max_extra_keys) — 39 cuts values, this drops keys ---
+    "EXTRA_KEYS_DROPPED": "extra_keys_dropped",
 }
 
 
-def test_the_vocabulary_is_exactly_these_forty_three() -> None:
+def test_the_vocabulary_is_exactly_these_forty_four() -> None:
     """15 declared before the census + 21 from it + 1 from §5.4 + 1 for wardex
     itself + 1 for the OTLP size guard + 1 for the registry breadth bound
     + 2 for the OTel bridge's fail-open pair + 1 for the adapter's per-session
-    bound, name by name.
+    bound + 1 for the dynamic-key bound, name by name.
 
     A count alone is not enough: a RENAME keeps the count and is the single most
     expensive mistake available here. These are proto enum values in

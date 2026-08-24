@@ -1,0 +1,8 @@
+{
+ "model": "gpt-5.4-mini",
+ "input": "Prove it.",
+ "reasoning": {
+  "effort": "high",
+  "summary": "auto"
+ }
+}

@@ -1,0 +1,51 @@
+{
+ "id": "resp_fx3",
+ "object": "response",
+ "status": "completed",
+ "model": "gpt-5.4-mini",
+ "output": [
+  {
+   "id": "rs_fx3",
+   "type": "reasoning",
+   "summary": [
+    {
+     "type": "summary_text",
+     "text": "First, consider."
+    },
+    {
+     "type": "summary_text",
+     "text": "Then, conclude."
+    }
+   ]
+  },
+  {
+   "id": "msg_fx3",
+   "type": "message",
+   "status": "completed",
+   "role": "assistant",
+   "content": [
+    {
+     "type": "output_text",
+     "text": "QED.",
+     "annotations": []
+    }
+   ]
+  }
+ ],
+ "usage": {
+  "input_tokens": 20,
+  "output_tokens": 90,
+  "input_tokens_details": {
+   "cached_tokens": 0,
+   "cache_write_tokens": 8
+  },
+  "output_tokens_details": {
+   "reasoning_tokens": 64
+  },
+  "total_tokens": 110
+ },
+ "created_at": 1756000000,
+ "parallel_tool_calls": true,
+ "tool_choice": "auto",
+ "tools": []
+}

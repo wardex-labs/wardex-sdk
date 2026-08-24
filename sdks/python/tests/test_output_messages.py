@@ -63,7 +63,7 @@ def _server(payload: bytes):
     return httpd, f"https://{host}:{port}"
 
 
-def _post(url: str, body: bytes) -> None:
+def _post(url: str, body: bytes, path: str = "/v1/chat/completions") -> None:
     import http.client
 
     host = url.split("://")[1]
@@ -71,8 +71,8 @@ def _post(url: str, body: bytes) -> None:
     ctx = ssl._create_unverified_context()
     conn = http.client.HTTPSConnection(h, int(p), context=ctx)
     # server_hostname=127.0.0.1 → provider_from_host None → body-shape fallback
-    # identifies the provider
-    conn.request("POST", "/v1/chat/completions", body, {})
+    # identifies the provider (the endpoint itself is the path's to name)
+    conn.request("POST", path, body, {})
     conn.getresponse().read()
     conn.close()
 
@@ -107,7 +107,10 @@ def test_unknown_block_sets_unmapped_marker():
     httpd, url = _server(_UNKNOWN_RESP)
     try:
         wardex.init(transport=ConsoleTransport(), intercept=True)
-        _post(url, b'{"model":"claude-3"}')
+        # An Anthropic-shaped exchange belongs on the Messages endpoint: the
+        # endpoint table dispatches by (provider, api), so an Anthropic body
+        # on the chat-completions path is no longer parsed as a chat call.
+        _post(url, b'{"model":"claude-3"}', path="/v1/messages")
         sp = _spans()[0]
         assert "gen_ai.output.messages" in dict(sp.extra)
         assert Limitation.OUTPUT_MESSAGES_UNMAPPED_PART in sp.capture_integrity.limitations

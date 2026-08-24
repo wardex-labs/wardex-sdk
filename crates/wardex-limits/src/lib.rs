@@ -175,6 +175,16 @@ pub struct Limits {
     pub max_link_targets: usize,
     /// Bytes read before giving up on detecting JSON-RPC over a stdio stream.
     pub mcp_sniff_bytes: usize,
+    /// Bound on dynamic extra keys from an open-ended key family (design §6.5
+    /// tier 1). Enforced today at exactly one site: the semantic parser's
+    /// usage pass-through family (`wardex.usage.*`) — the first open family
+    /// the core emits. It does NOT yet bound other extra keys: lowering it
+    /// prunes usage leaves only, and leaves every other extra untouched, until
+    /// draft-level enforcement lands (follow-up). Its drop count also includes
+    /// two structural sanity bounds on the same family (path > 120 bytes,
+    /// depth > 6) that no real provider usage object approaches. Sized for the
+    /// families that exist (a provider usage object has ~10-20 leaves).
+    pub max_extra_keys: usize,
     /// Maximum spans buffered before the oldest are dropped.
     pub max_buffer_spans: usize,
     /// Maximum approximate bytes buffered across pending spans. The final
@@ -274,6 +284,7 @@ impl Default for Limits {
             max_entries_per_unit: 256,
             max_link_targets: 256,
             mcp_sniff_bytes: 8192,
+            max_extra_keys: 64,
             max_buffer_spans: 2048,
             max_buffer_bytes: 64 * 1024 * 1024,
             replay_buffer_size: 100,
@@ -308,6 +319,7 @@ mod tests {
         assert_eq!(l.max_entries_per_unit, 256);
         assert_eq!(l.max_link_targets, 256);
         assert_eq!(l.mcp_sniff_bytes, 8192);
+        assert_eq!(l.max_extra_keys, 64);
         assert_eq!(l.max_buffer_spans, 2048);
         assert_eq!(l.max_buffer_bytes, 64 * 1024 * 1024);
         assert_eq!(l.replay_buffer_size, 100);

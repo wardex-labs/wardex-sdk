@@ -1,0 +1,26 @@
+{
+ "provider": "anthropic",
+ "operation": "chat",
+ "api_type": null,
+ "request_model": "claude-sonnet-4-6",
+ "response_model": "claude-sonnet-4-6",
+ "response_id": "msg_fx2",
+ "input_tokens": 11000,
+ "output_tokens": 500,
+ "cache_read_input_tokens": 8000,
+ "cache_creation_input_tokens": 2000,
+ "finish_reasons": [
+  "stop"
+ ],
+ "output_messages_present": true,
+ "stream_terminated": true,
+ "usage_leaves": {
+  "input_tokens": 1000,
+  "output_tokens": 500,
+  "cache_read_input_tokens": 8000,
+  "cache_creation_input_tokens": 2000,
+  "cache_creation.ephemeral_5m_input_tokens": 2000,
+  "cache_creation.ephemeral_1h_input_tokens": 64,
+  "server_tool_use.web_search_requests": 2
+ }
+}

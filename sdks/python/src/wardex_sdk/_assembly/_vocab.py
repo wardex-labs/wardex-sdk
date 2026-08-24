@@ -254,6 +254,7 @@ _VOCABULARY_PREFIXES = (GEN_AI_PREFIX, WARDEX_PREFIX)
 # structure.
 _REGISTRY_PREFIXES = (
     "network.",  # network.protocol.version
+    "openai.",  # semconv registry docs/registry/attributes/openai.md — api.type, *.service_tier
     "rpc.",  # rpc.system, rpc.service, rpc.method, rpc.grpc.*
     "ws.",  # ws.messages.*, ws.bytes.*, ws.close_code
     "http.",

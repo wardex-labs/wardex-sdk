@@ -66,6 +66,7 @@ class LimitsConfig:
     max_units: int | None = None
     max_entries_per_unit: int | None = None
     mcp_sniff_bytes: int | None = None
+    max_extra_keys: int | None = None
     max_buffer_spans: int | None = None
     max_buffer_bytes: int | None = None
     max_otel_bridge_body_bytes: int | None = None

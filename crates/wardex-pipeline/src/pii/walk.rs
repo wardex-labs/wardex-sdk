@@ -874,3 +874,118 @@ mod tests {
         assert!(otlp_attr(span, "wardex.redacted").is_none());
     }
 }
+
+#[cfg(test)]
+mod usage_pins {
+    //! Structural pins for the usage attributes: numeric usage values are
+    //! untouchable BY TYPE (the `mask_any`/`mask_otlp_any` match arms answer
+    //! `false` for Int/Double/Bool before any engine runs), and model-id
+    //! strings pass the pattern table unchanged. Pinned here because the
+    //! `wardex.usage.*` mirror multiplies the numeric attributes per span,
+    //! and a masking regression on them would corrupt billing math silently.
+    use super::*;
+    use crate::pii::PiiEngine;
+
+    fn kv_int(key: &str, v: i64) -> pb::KeyValue {
+        pb::KeyValue {
+            key: key.into(),
+            value: Some(pb::AnyValue {
+                value: Some(pb::any_value::Value::IntValue(v)),
+            }),
+        }
+    }
+
+    fn kv_double(key: &str, v: f64) -> pb::KeyValue {
+        pb::KeyValue {
+            key: key.into(),
+            value: Some(pb::AnyValue {
+                value: Some(pb::any_value::Value::DoubleValue(v)),
+            }),
+        }
+    }
+
+    fn kv_str(key: &str, v: &str) -> pb::KeyValue {
+        pb::KeyValue {
+            key: key.into(),
+            value: Some(pb::AnyValue {
+                value: Some(pb::any_value::Value::StringValue(v.into())),
+            }),
+        }
+    }
+
+    /// T-R11 — integer/double usage attributes are byte-identical after a
+    /// full masking walk, for both key families, structurally (no exemption
+    /// list involved — there is none to get wrong).
+    #[test]
+    fn integer_usage_attributes_are_untouched_by_masking() {
+        let engine = PiiEngine::new(&[]).unwrap();
+        let mut span = pb::Span {
+            extra: vec![
+                kv_int("gen_ai.usage.input_tokens", 4111111111111111),
+                kv_int(
+                    "wardex.usage.cache_creation.ephemeral_1h_input_tokens",
+                    1234,
+                ),
+                kv_double("wardex.usage.score", 4111.1111),
+            ],
+            ..Default::default()
+        };
+        let before = span.clone();
+        let mut env = pb::Envelope {
+            items: vec![pb::EnvelopeItem {
+                header: None,
+                payload: Some(pb::envelope_item::Payload::Span(span)),
+            }],
+            ..Default::default()
+        };
+        mask_envelope(&engine, &mut env);
+        span = match env.items.remove(0).payload {
+            Some(pb::envelope_item::Payload::Span(s)) => s,
+            other => panic!("expected span, got {other:?}"),
+        };
+        assert_eq!(span.extra, before.extra);
+    }
+
+    /// T-R11 — model ids and plain tier strings survive the shipped pattern
+    /// table. Deliberately NOT a key-based exemption: these go through the
+    /// engine like every other string and come out unchanged because no
+    /// pattern matches them.
+    #[test]
+    fn model_strings_that_look_like_model_ids_are_not_masked() {
+        let engine = PiiEngine::new(&[]).unwrap();
+        for value in [
+            "gpt-4o-2024-08-06",
+            "claude-opus-4-8",
+            "text-embedding-3-small",
+            "default",
+            "standard",
+            "flex",
+        ] {
+            let mut env = pb::Envelope {
+                items: vec![pb::EnvelopeItem {
+                    header: None,
+                    payload: Some(pb::envelope_item::Payload::Span(pb::Span {
+                        extra: vec![
+                            kv_str("gen_ai.response.model", value),
+                            kv_str("wardex.usage.service_tier", value),
+                        ],
+                        ..Default::default()
+                    })),
+                }],
+                ..Default::default()
+            };
+            mask_envelope(&engine, &mut env);
+            let span = match &env.items[0].payload {
+                Some(pb::envelope_item::Payload::Span(s)) => s,
+                other => panic!("expected span, got {other:?}"),
+            };
+            for kv in &span.extra {
+                let got = match kv.value.as_ref().unwrap().value.as_ref().unwrap() {
+                    pb::any_value::Value::StringValue(s) => s.as_str(),
+                    other => panic!("unexpected value {other:?}"),
+                };
+                assert_eq!(got, value, "{} was rewritten", kv.key);
+            }
+        }
+    }
+}

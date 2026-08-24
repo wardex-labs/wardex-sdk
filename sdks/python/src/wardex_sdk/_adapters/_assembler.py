@@ -45,6 +45,7 @@ from .._enums import (
     ToolExecutionType,
 )
 from .._limits import LimitsConfig, LimitsConsumer, limits_kwargs
+from .._protocol import normalize_finish_reason
 from .._protocol._claude_stream import AgentStreamEvent, parse_line
 from .._types import (
     AgentAttributes,
@@ -910,7 +911,11 @@ class SessionAssembler:
             output_tokens=ev.output_tokens,
             cache_read_input_tokens=ev.cache_read_tokens,
             cache_creation_input_tokens=ev.cache_creation_tokens,
-            finish_reasons=(ev.stop_reason,) if ev.stop_reason else None,
+            # The same normalizer the wire parsers use — the adapter span and
+            # the HTTP span for one call must not spell one stop two ways.
+            finish_reasons=(
+                (normalize_finish_reason("anthropic", ev.stop_reason),) if ev.stop_reason else None
+            ),
             time_to_first_chunk_s=ttft,
         )
         draft.set_gen_ai(gen_ai)

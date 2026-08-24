@@ -1,0 +1,44 @@
+{
+ "id": "resp_fx1",
+ "object": "response",
+ "created_at": 1756000000,
+ "status": "completed",
+ "model": "gpt-4.1-2025-04-14",
+ "service_tier": "default",
+ "output": [
+  {
+   "id": "msg_fx1",
+   "type": "message",
+   "status": "completed",
+   "role": "assistant",
+   "content": [
+    {
+     "type": "output_text",
+     "text": "Hello!",
+     "annotations": []
+    }
+   ]
+  }
+ ],
+ "parallel_tool_calls": true,
+ "tool_choice": "auto",
+ "tools": [],
+ "usage": {
+  "input_tokens": 52,
+  "output_tokens": 17,
+  "input_tokens_details": {
+   "cached_tokens": 16,
+   "cache_write_tokens": 8
+  },
+  "output_tokens_details": {
+   "reasoning_tokens": 4
+  },
+  "total_tokens": 69
+ },
+ "error": null,
+ "incomplete_details": null,
+ "instructions": null,
+ "metadata": {},
+ "temperature": 0.7,
+ "top_p": 1.0
+}

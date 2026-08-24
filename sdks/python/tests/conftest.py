@@ -227,6 +227,58 @@ def bare_ssl_interceptor():
 
 
 @pytest.fixture
+def responses_sse_tls_server():
+    """Streams the `openai_responses_sse` fixture (chunked text/event-stream):
+    created -> item added -> a delta that DISAGREES with the snapshot ->
+    item done -> response.completed carrying the full Response with usage."""
+    fixture = (
+        Path(__file__).resolve().parents[3]
+        / "crates"
+        / "wardex-protocol"
+        / "tests"
+        / "fixtures"
+        / "llm"
+        / "openai_responses_sse"
+        / "stream.sse"
+    ).read_bytes()
+
+    class _ResponsesSseHandler(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def do_POST(self) -> None:
+            _ = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            self.wfile.flush()
+            for chunk in fixture.split(b"\n\n"):
+                if not chunk.strip():
+                    continue
+                c = chunk + b"\n\n"
+                self.wfile.write(b"%x\r\n" % len(c) + c + b"\r\n")
+                self.wfile.flush()
+            self.wfile.write(b"0\r\n\r\n")
+            self.wfile.flush()
+
+        def log_message(self, *args: object) -> None:
+            pass
+
+    httpd = http.server.HTTPServer(("127.0.0.1", 0), _ResponsesSseHandler)
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(certfile=str(CERT), keyfile=str(KEY))
+    httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
+    host, port = httpd.socket.getsockname()[:2]
+    t = threading.Thread(target=httpd.serve_forever, daemon=True)
+    t.start()
+    try:
+        yield f"https://{host}:{port}"
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+@pytest.fixture
 def sse_tls_server():
     """Streams OpenAI-shaped SSE (text/event-stream) as chunked. Delays after
     headers so ttft can be measured."""

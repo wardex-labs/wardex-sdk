@@ -1,0 +1,21 @@
+{
+ "provider": "openai",
+ "operation": "embeddings",
+ "api_type": null,
+ "request_model": "text-embedding-3-small",
+ "response_model": "text-embedding-3-small",
+ "response_id": null,
+ "input_tokens": 2,
+ "output_tokens": null,
+ "finish_reasons": null,
+ "output_messages_present": false,
+ "encoding_formats": [
+  "float"
+ ],
+ "embedding_dimensions": 256,
+ "output_type": null,
+ "usage_leaves": {
+  "prompt_tokens": 2,
+  "total_tokens": 2
+ }
+}

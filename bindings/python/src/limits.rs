@@ -31,7 +31,7 @@ impl PyLimits {
         max_stream_buffer_bytes=None, max_decoded_bytes=None, max_streams=None,
         max_ws_frame_bytes=None, ws_sample_bytes=None, max_connections=None,
         max_sessions=None, max_session_entries=None, max_units=None,
-        max_entries_per_unit=None, mcp_sniff_bytes=None,
+        max_entries_per_unit=None, mcp_sniff_bytes=None, max_extra_keys=None,
         max_buffer_spans=None, max_buffer_bytes=None, replay_buffer_size=None,
         max_otel_bridge_body_bytes=None, max_otel_bridge_spans_per_session=None,
         zstd_level=None, max_otlp_attribute_bytes=None, max_otlp_request_bytes=None,
@@ -53,6 +53,7 @@ impl PyLimits {
         max_units: Option<usize>,
         max_entries_per_unit: Option<usize>,
         mcp_sniff_bytes: Option<usize>,
+        max_extra_keys: Option<usize>,
         max_buffer_spans: Option<usize>,
         max_buffer_bytes: Option<usize>,
         replay_buffer_size: Option<usize>,
@@ -81,6 +82,7 @@ impl PyLimits {
                 max_units: max_units.unwrap_or(d.max_units),
                 max_entries_per_unit: max_entries_per_unit.unwrap_or(d.max_entries_per_unit),
                 mcp_sniff_bytes: mcp_sniff_bytes.unwrap_or(d.mcp_sniff_bytes),
+                max_extra_keys: max_extra_keys.unwrap_or(d.max_extra_keys),
                 max_buffer_spans: max_buffer_spans.unwrap_or(d.max_buffer_spans),
                 max_buffer_bytes: max_buffer_bytes.unwrap_or(d.max_buffer_bytes),
                 replay_buffer_size: replay_buffer_size.unwrap_or(d.replay_buffer_size),
@@ -154,6 +156,10 @@ impl PyLimits {
         self.inner.mcp_sniff_bytes
     }
     #[getter]
+    fn max_extra_keys(&self) -> usize {
+        self.inner.max_extra_keys
+    }
+    #[getter]
     fn max_buffer_spans(&self) -> usize {
         self.inner.max_buffer_spans
     }
@@ -211,6 +217,7 @@ fn limits_defaults(py: Python<'_>) -> PyResult<Bound<'_, PyDict>> {
     out.set_item("max_units", d.max_units)?;
     out.set_item("max_entries_per_unit", d.max_entries_per_unit)?;
     out.set_item("mcp_sniff_bytes", d.mcp_sniff_bytes)?;
+    out.set_item("max_extra_keys", d.max_extra_keys)?;
     out.set_item("max_buffer_spans", d.max_buffer_spans)?;
     out.set_item("max_buffer_bytes", d.max_buffer_bytes)?;
     out.set_item("replay_buffer_size", d.replay_buffer_size)?;

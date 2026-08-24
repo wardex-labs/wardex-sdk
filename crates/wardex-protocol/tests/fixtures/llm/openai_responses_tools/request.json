@@ -1,0 +1,45 @@
+{
+ "model": "gpt-4.1",
+ "include": [],
+ "input": [
+  {
+   "content": "What's the weather in Seoul?",
+   "role": "user"
+  },
+  {
+   "arguments": "{\"city\": \"Seoul\"}",
+   "call_id": "call_weather_1",
+   "name": "get_weather",
+   "type": "function_call",
+   "id": "fc_prev1",
+   "status": "completed"
+  },
+  {
+   "call_id": "call_weather_1",
+   "output": "sunny in Seoul",
+   "type": "function_call_output"
+  }
+ ],
+ "instructions": "You help with weather.",
+ "previous_response_id": "resp_fx_prev",
+ "tools": [
+  {
+   "name": "get_weather",
+   "parameters": {
+    "properties": {
+     "city": {
+      "type": "string"
+     }
+    },
+    "required": [
+     "city"
+    ],
+    "type": "object",
+    "additionalProperties": false
+   },
+   "strict": true,
+   "type": "function",
+   "description": "Get the weather for a city."
+  }
+ ]
+}

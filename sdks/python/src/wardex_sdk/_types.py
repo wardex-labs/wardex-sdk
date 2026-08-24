@@ -119,6 +119,12 @@ class GenAIAttributes:
     finish_reasons: tuple[str, ...] | None = None  # new
     output_type: OutputType | str | None = None  # new (image/json/speech/text)
     time_to_first_chunk_s: float | None = None  # new (warning: OTel uses seconds)
+    response_status: str | None = None  # gen_ai.response.status (Responses API)
+
+    # Reasoning / response chaining (semconv-genai main, pre-adopted:
+    # consumerless additive keys only — see the codec table)
+    reasoning_level: str | None = None  # gen_ai.request.reasoning.level
+    previous_response_id: str | None = None  # gen_ai.request.previous_response.id
 
     # System / tool (separated)
     system_instructions: bytes = b""  # new (opt-in, PII, structured JSON bytes)

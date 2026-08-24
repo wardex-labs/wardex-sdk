@@ -1,0 +1,24 @@
+event: response.created
+data: {"type": "response.created", "sequence_number": 0, "response": {"id": "resp_sse2", "object": "response", "status": "in_progress", "model": "gpt-4.1-2025-04-14", "output": [], "usage": null, "created_at": 1756000000, "parallel_tool_calls": true, "tool_choice": "auto", "tools": []}}
+
+event: response.output_item.added
+data: {"type": "response.output_item.added", "output_index": 0, "item": {"id": "msg_sse2", "type": "message", "role": "assistant", "content": []}}
+
+event: response.output_text.delta
+data: {"type": "response.output_text.delta", "item_id": "msg_sse2", "output_index": 0, "content_index": 0, "delta": "Partial ans"}
+
+event: response.output_item.done
+data: {"type": "response.output_item.done", "output_index": 0, "item": {"id": "msg_sse2", "type": "message", "status": "completed", "role": "assistant", "content": [{"type": "output_text", "text": "Partial answer.", "annotations": []}]}}
+
+event: response.output_item.added
+data: {"type": "response.output_item.added", "output_index": 1, "item": {"id": "fc_sse2", "type": "function_call", "call_id": "call_sse2", "name": "get_weather", "arguments": ""}}
+
+event: response.function_call_arguments.delta
+data: {"type": "response.function_call_arguments.delta", "item_id": "fc_sse2", "output_index": 1, "delta": "{\"city\": \"Se"}
+
+event: response.function_call_arguments.delta
+data: {"type": "response.function_call_arguments.delta", "item_id": "fc_sse2", "output_index": 1, "delta": "oul\"}"}
+
+event: response.output_text.delta
+data: {"type": "response.output_text.delta", "item_id": "msg_ghost", "output_index": 7, "content_index": 0, "delta": "I do not exist"}
+
