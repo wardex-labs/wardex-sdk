@@ -1,7 +1,7 @@
 """What the OTel bridge may put on the wire when a chat join is ambiguous.
 
-Two defects live on the conflicted `llm_request` increment, and only there —
-it is the single span class in the SDK that can carry `gen_ai.usage.*` extras:
+Two defects were observed on the conflicted `llm_request` increment — today
+the single span class the CLI is known to stamp `gen_ai.usage.*` on:
 
 * **Spelling (B)** — the CLI reports the cache tiers under underscore
   spellings (`gen_ai.usage.cache_read_input_tokens`); passing them through
@@ -14,10 +14,14 @@ it is the single span class in the SDK that can carry `gen_ai.usage.*` extras:
   the model key alone (Langfuse's `ModelBased` priority-10 fallback) then
   prices ONE LLM call TWICE.
 
-The remedy under test: on a conflicted join the bridge demotes the CLI's
-usage keys into the `wardex.anthropic_agent_sdk.otel.*` namespace — kept,
-readable, but invisible to any `gen_ai.usage.` prefix collector — while the
-identity keys (model, response id) stay under their own names.
+The remedy under test: the bridge demotes the CLI's usage keys into the
+`wardex.anthropic_agent_sdk.otel.*` namespace — kept, readable, but invisible
+to any `gen_ai.usage.` prefix collector — while the identity keys (model,
+response id) stay under their own names. UNCONDITIONALLY: no increment is
+ever the authoritative reporter of tokens, and a demotion scoped to the
+conflicted join would rest on "pure increments carry no usage today", which
+nothing pins and which `claude_code.compaction` (an LLM summarization) could
+falsify any CLI release. The pure-increment case is pinned here too.
 """
 
 from __future__ import annotations
@@ -210,4 +214,57 @@ def test_an_ambiguous_join_reports_usage_exactly_once(receiver):
     assert len(carriers) == 1, [s.name for s in carriers]
     assert carriers[0].name.startswith("chat")
     # The demotion is observable, not silent: one bump per demoted span.
-    assert counters.get("adapters.anthropic.otel_bridge.usage_demoted_on_conflict") == 2
+    assert counters.get("adapters.anthropic.otel_bridge.usage_demoted") == 2
+
+
+# --------------------------------------------------------------------------
+# The demotion is unconditional: a PURE increment demotes too
+# --------------------------------------------------------------------------
+
+
+def test_a_pure_increment_demotes_gen_ai_usage_too(receiver):
+    """A non-conflicted step increment never ships top-level `gen_ai.usage.*`.
+
+    The day the CLI stamps usage on `claude_code.compaction` — an LLM
+    summarization — a conditional demotion would ship the underscore
+    spellings top-level, priced by any prefix collector next to whatever the
+    transport tee captured for the same call. This is the pin for that
+    branch: same demotion, same counter, no conflict required.
+    """
+    client = _FakeClient()
+    asm = SessionAssembler(client, bridge=receiver)
+    receiver.reserve(TRACE)
+    t0 = time.time_ns()
+    asm.on_outbound(
+        1,
+        json.dumps(
+            {"type": "user", "session_id": "s-1", "message": {"role": "user", "content": "go"}}
+        ),
+        bridge=_BridgeBinding(trace_id_hex=TRACE, confirmed=True),
+    )
+    asm.on_inbound(1, INIT)
+    asm.on_inbound(1, ASSISTANT)
+    asm.on_inbound(1, RESULT)
+    t1 = time.time_ns()
+    body = _otlp_build.request(
+        [
+            _otlp_build.span(
+                name="claude_code.compaction",
+                trace_id=TRACE,
+                span_id="b" * 16,
+                start_ns=t0,
+                end_ns=t1,
+                attrs=dict(CLI_USAGE_ATTRS),
+            )
+        ]
+    )
+    assert _post(receiver, body) == 200
+    asm.on_close(1, None)
+    steps = [s for s in client.spans if s.name == "execute_step compaction"]
+    assert len(steps) == 1
+    extras = dict(steps[0].extra)
+    leaked = sorted(k for k in extras if k.startswith("gen_ai.usage."))
+    assert leaked == [], f"top-level gen_ai usage extras on a pure increment: {leaked}"
+    assert extras[_DEMOTED_PREFIX + "gen_ai.usage.input_tokens"] == 1000
+    assert extras[_DEMOTED_PREFIX + "gen_ai.usage.cache_read_input_tokens"] == 8000
+    assert counters.get("adapters.anthropic.otel_bridge.usage_demoted") == 1

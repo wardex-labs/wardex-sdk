@@ -41,13 +41,15 @@ Attribute copying is allowlist-based on NAMED keys — never a prefix rule.
 beta, and a prefix rule is the hole a future content-carrying ``gen_ai.*``
 key would walk through (the receiver's identity denylist is the other half).
 The named keys split by MEANING: identity keys always cross under their own
-names, while the usage QUANTITIES cross under their own names only on a span
-that is the authoritative reporter of those quantities. On a conflicted
-``llm_request`` — where the same tokens are already riding the unmerged CHAT
-draft — the usage keys are demoted into the ``wardex.*`` extras namespace:
-kept verbatim (nothing is silently lost), but invisible to any backend's
-``gen_ai.usage.`` prefix collector, so one LLM call is never priced twice
-and the CLI's underscore spellings never become top-level wire attributes.
+names, while the usage QUANTITIES never do — every increment demotes them
+into the ``wardex.*`` extras namespace, because no increment is ever the
+authoritative reporter of tokens (wardex's own CHAT draft is). Demoted means
+kept verbatim (nothing is silently lost) but invisible to any backend's
+``gen_ai.usage.`` prefix collector, so one LLM call is never priced twice —
+the conflicted ``llm_request``, whose tokens already ride the unmerged CHAT
+draft, is where that bit — and the CLI's underscore spellings never become
+top-level wire attributes, unconditionally rather than only on the spans the
+CLI happens to stamp usage on today.
 """
 
 from __future__ import annotations
@@ -103,11 +105,11 @@ _GEN_AI_IDENTITY_KEYS = frozenset(
 )
 
 #: The NAMED gen_ai QUANTITY keys. Same closed-list discipline, different
-#: fate: they keep their own names only when the span is the authoritative
-#: reporter of the tokens (``demote_gen_ai_usage=False``). Note the CLI's
-#: underscore cache spellings — semconv's dotted spellings are the
-#: ``GenAIAttributes`` encoder's, and these must NEVER reach the wire as
-#: top-level attributes (``test_otlp_codec.py`` pins the negative).
+#: fate: they never keep their own names — ``allowlisted_extras`` demotes
+#: them unconditionally. Note the CLI's underscore cache spellings —
+#: semconv's dotted spellings are the ``GenAIAttributes`` encoder's, and
+#: these must NEVER reach the wire as top-level attributes
+#: (``test_otlp_codec.py`` pins the negative).
 _GEN_AI_USAGE_KEYS = frozenset(
     {
         "gen_ai.usage.input_tokens",
@@ -367,7 +369,7 @@ def join_chats(
     return outcome
 
 
-def allowlisted_extras(attrs: dict, *, demote_gen_ai_usage: bool) -> list[tuple[str, object]]:
+def allowlisted_extras(attrs: dict) -> list[tuple[str, object]]:
     """The attribute pairs the merge may copy onto a wardex span.
 
     Scalars only, keys from the three NAMED sets only: unknown keys —
@@ -376,15 +378,19 @@ def allowlisted_extras(attrs: dict, *, demote_gen_ai_usage: bool) -> list[tuple[
     receiver's identity denylist: nothing rides through on the strength of
     its prefix.
 
-    ``demote_gen_ai_usage`` is the caller declaring whether this span is the
-    AUTHORITATIVE reporter of its usage quantities. ``False`` (pure
-    increments — none of which carry usage today): quantity keys keep their
-    own names. ``True`` (a conflicted ``llm_request``, whose tokens already
-    ride the unmerged CHAT draft): quantity keys are demoted under
-    ``OTEL_EXTRA_PREFIX`` — value preserved, spelling preserved, quoted
-    rather than asserted, exactly the sentence CORRELATION_CONFLICT already
-    puts on the span. No Python touches the numbers: the inclusive-total
-    rule has ONE implementation and it is the Rust constructor.
+    The usage QUANTITY keys are demoted under ``OTEL_EXTRA_PREFIX``
+    unconditionally — value preserved, spelling preserved, quoted rather
+    than asserted. No increment is ever the authoritative reporter of its
+    tokens: wardex's own CHAT draft is, whether or not this particular join
+    conflicted. A caller flag used to scope the demotion to conflicted
+    ``llm_request``s, resting on "pure increments carry no usage today" —
+    an assumption nothing pinned, and ``claude_code.compaction`` IS an LLM
+    summarization the CLI could start stamping usage on. Unconditional
+    demotion makes the module docstring's two invariants (one LLM call
+    priced once; underscore spellings never top-level) structural instead
+    of schedule-dependent. No Python touches the numbers: the
+    inclusive-total rule has ONE implementation and it is the Rust
+    constructor.
     """
     out: list[tuple[str, object]] = []
     demoted = False
@@ -395,15 +401,12 @@ def allowlisted_extras(attrs: dict, *, demote_gen_ai_usage: bool) -> list[tuple[
         if key in _GEN_AI_IDENTITY_KEYS:
             out.append((key, value))
         elif key in _GEN_AI_USAGE_KEYS:
-            if demote_gen_ai_usage:
-                out.append((OTEL_EXTRA_PREFIX + key, value))
-                demoted = True
-            else:
-                out.append((key, value))
+            out.append((OTEL_EXTRA_PREFIX + key, value))
+            demoted = True
         elif key in _ALLOWED_KEYS:
             out.append((OTEL_EXTRA_PREFIX + key, value))
         else:
             counters.bump("adapters.anthropic.otel_bridge.attr_dropped")
     if demoted:
-        counters.bump("adapters.anthropic.otel_bridge.usage_demoted_on_conflict")
+        counters.bump("adapters.anthropic.otel_bridge.usage_demoted")
     return out
