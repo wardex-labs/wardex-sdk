@@ -21,7 +21,7 @@ from __future__ import annotations
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 from .. import _hub
 from .._adapters._base import AdapterInterface
@@ -386,12 +386,18 @@ class AdapterSubject:
     * `stall` — start a run and leave it open. The two shutdown checks drive
       it.
     * `detect_package` — the module whose presence auto-detects this adapter.
-    * `usage_expected` — whether the subject's runs (workload plus stalled
-      run) carry gen_ai usage with a cache tier. REQUIRED, no default, on
-      purpose: a default would let a new adapter silently opt out of the
-      inclusive-totals check, and a silent opt-out is the drift that check
-      exists to stop. Declaring `False` is asserted too — an adapter that
-      starts shipping usage without declaring its convention goes red.
+    * `usage_expected` — what gen_ai usage the subject's runs (workload plus
+      stalled run) carry: `"none"` (no span may carry usage), `"totals"`
+      (usage present, no cache tier — the shape of a provider path without
+      caching), or `"cache_tiers"` (usage present with a cache tier, so the
+      input half of the inclusivity check is non-vacuous). Three states
+      because two could not describe a real adapter that ships totals
+      without tiers — it would fail both branches and the suite would be
+      unpassable for it. REQUIRED, no default, on purpose: a default would
+      let a new adapter silently opt out of the inclusive-totals check, and
+      a silent opt-out is the drift that check exists to stop. Declaring
+      `"none"` is asserted too — an adapter that starts shipping usage
+      without declaring its convention goes red.
     """
 
     name: str
@@ -402,7 +408,7 @@ class AdapterSubject:
     chains: tuple[tuple[str, ...], ...]
     stall: Callable[[LiveAdapter], StalledRun]
     detect_package: str
-    usage_expected: bool
+    usage_expected: Literal["none", "totals", "cache_tiers"]
 
     @property
     def root(self) -> str:

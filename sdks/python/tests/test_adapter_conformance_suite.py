@@ -274,7 +274,7 @@ def _subject(factory) -> AdapterSubject:  # noqa: ANN001
         ),
         stall=_stall,
         detect_package="wardex_sdk",
-        usage_expected=False,
+        usage_expected="none",
     )
 
 

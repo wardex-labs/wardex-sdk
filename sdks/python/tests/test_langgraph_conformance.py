@@ -94,7 +94,7 @@ def subject() -> AdapterSubject:
         # LangGraph drives no LLM call in these runs; declaring False makes
         # the usage check assert the NEGATIVE — usage appearing here without
         # a declared convention goes red instead of unnoticed.
-        usage_expected=False,
+        usage_expected="none",
     )
 
 

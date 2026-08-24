@@ -120,7 +120,7 @@ def stall(live) -> StalledRun:  # noqa: ANN001
     )
     assembler.on_inbound(1, dict(INIT_LINE, session_id="s-stall"))
     # One assistant turn with BOTH cache tiers, before the stall: the usage
-    # stage for `check_usage_totals_are_inclusive` (usage_expected=True).
+    # stage for `check_usage_totals_are_inclusive` (usage_expected="cache_tiers").
     # It lives here and not in the workload because a chat span publishes no
     # correlation claim by design, so it can never be part of the declared
     # causal tree the workload feeds the tier assertions. Raw 1000 + 8000
@@ -161,7 +161,7 @@ def subject() -> AdapterSubject:
         ),
         stall=stall,
         detect_package="claude_agent_sdk",
-        usage_expected=True,
+        usage_expected="cache_tiers",
     )
 
 

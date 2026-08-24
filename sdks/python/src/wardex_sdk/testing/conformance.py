@@ -348,23 +348,43 @@ class AdapterConformanceSuite:
                 "spelling of one fact, and a backend prices both."
             )
 
-        # 2) Non-vacuity: declaration and observation must agree.
-        if self._subject.usage_expected:
-            assert any(
-                usage.cache_read_input_tokens or usage.cache_creation_input_tokens
-                for usage in carriers
-            ), (
-                "this subject declares usage_expected=True but no span carried a "
-                "cache tier, so the inclusivity assertions below proved nothing. "
-                "Give the workload (or the stalled run) a turn with cache tokens, "
-                "or declare usage_expected=False."
-            )
-        else:
+        # 2) Non-vacuity: declaration and observation must agree, in both
+        #    directions, for each of the three declarable states. The value is
+        #    validated first: a typo would otherwise silently read as one of
+        #    the branches below, which is the silent opt-out the field's
+        #    no-default rule exists to prevent.
+        expected = self._subject.usage_expected
+        assert expected in ("none", "totals", "cache_tiers"), (
+            f"usage_expected={expected!r} is not a declaration this suite "
+            'knows; declare "none", "totals" or "cache_tiers".'
+        )
+        if expected == "none":
             assert carriers == [], (
-                f"this subject declares usage_expected=False but "
+                f'this subject declares usage_expected="none" but '
                 f"{[usage.span_name for usage in carriers]} carried gen_ai usage — "
                 "an undeclared inclusivity convention."
             )
+        else:
+            assert carriers != [], (
+                f"this subject declares usage_expected={expected!r} but no span "
+                "carried gen_ai usage, so the inclusivity assertions below "
+                "proved nothing. Give the workload (or the stalled run) a "
+                'usage-carrying turn, or declare usage_expected="none".'
+            )
+            if expected == "cache_tiers":
+                # `is not None`, not truthiness: an honestly reported 0 —
+                # routine on a cold turn — is a present tier.
+                assert any(
+                    usage.cache_read_input_tokens is not None
+                    or usage.cache_creation_input_tokens is not None
+                    for usage in carriers
+                ), (
+                    'this subject declares usage_expected="cache_tiers" but no '
+                    "span carried a cache tier, so the input half of the "
+                    "inclusivity check below proved nothing. Give the workload "
+                    "(or the stalled run) a turn with cache tokens, or declare "
+                    'usage_expected="totals".'
+                )
 
         # 3) The invariant itself.
         for usage in carriers:
