@@ -771,6 +771,7 @@ fn header_to_proto(h: &Bound<PyAny>) -> PyResult<pb::EnvelopeHeader> {
             service_name: r.getattr("service_name")?.extract()?,
             release: r.getattr("release")?.extract()?,
             environment: r.getattr("environment")?.extract()?,
+            process_pid: r.getattr("process_pid")?.extract()?,
         });
     }
     Ok(header)
@@ -980,6 +981,7 @@ fn envelope_to_dict(py: Python<'_>, env: &pb::Envelope) -> PyResult<PyObject> {
             rd.set_item("service_name", &r.service_name)?;
             rd.set_item("release", &r.release)?;
             rd.set_item("environment", &r.environment)?;
+            rd.set_item("process_pid", r.process_pid)?;
             h.set_item("resource", rd)?;
         }
     }

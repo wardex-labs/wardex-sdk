@@ -169,6 +169,39 @@ def test_parent_exports_its_prefork_spans_exactly_once_and_child_only_its_own(
 
 
 @fork_only
+def test_child_envelope_resource_carries_child_pid(installed_recording):
+    """§6.2 — attribution: `process.pid` is stamped LIVE at drain time, so
+    the child's envelopes carry the child's pid and the parent's the
+    parent's. This is what lets a backend attribute any residual duplicate —
+    or a legitimate both-sides completion — to a process, and it is correct
+    even where no fork hook ever runs (OTel Python stamps once at
+    construction and exports children under the parent's pid; that gap is
+    closed here)."""
+    transport, client = installed_recording
+    client.capture_span(_span("parent-span"))
+
+    def child():
+        c = _hub.get_client()
+        c.capture_span(_span("child-span"))
+        c.flush()
+        return {
+            "pids": [e.header.resource.process_pid for e in transport.envelopes],
+            "child_pid": os.getpid(),
+        }
+
+    code, payload = _run_in_child(child)
+    assert code == 0, payload
+    assert payload["child_pid"] != os.getpid()
+    assert payload["pids"] == [payload["child_pid"]], (
+        "every envelope the child ships must wear the CHILD's pid"
+    )
+    client.flush()
+    assert [e.header.resource.process_pid for e in transport.envelopes] == [os.getpid()], (
+        "and the parent's wear the parent's — stamped per batch, never cached"
+    )
+
+
+@fork_only
 def test_child_reset_is_counted_and_bounded(installed_recording):
     """The reset announces itself in the child's diagnostics — and stays cheap.
 

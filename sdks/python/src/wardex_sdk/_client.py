@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+import os
 import platform
 import sys
 import threading
@@ -877,7 +878,16 @@ class Client:
                 api_key=self._config.backend.api_key or "",
                 sdk=self._sdk_info,
                 sent_at_ns=time.time_ns(),
-                resource=self._resource_info,
+                # The pid is stamped LIVE, per batch, never cached: it is then
+                # correct in every process — a fork child before its hook ran,
+                # a platform where no hook runs at all — because the process
+                # doing the drain is by definition the process the number
+                # names. One getpid() per batch, on the worker's periodic
+                # path, nowhere near a capture. This is what lets a backend
+                # attribute a span to parent or child (OTel Python stamps its
+                # resource once at construction, and a forked child exports
+                # under the parent's pid — a known gap, closed here).
+                resource=replace(self._resource_info, process_pid=os.getpid()),
             )
             envelope = Envelope(
                 header=header,
