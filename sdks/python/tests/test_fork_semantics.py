@@ -575,6 +575,174 @@ def test_installed_seam_reset_is_wired_through_the_fork_hook():
 
 
 # --------------------------------------------------------------------------
+# §6.6 — adapters: sessions dropped without emitting, bridge torn down safely
+# --------------------------------------------------------------------------
+
+
+def _bridged_init():
+    from wardex_sdk._config import AdaptersConfig, AnthropicAgentSdkConfig
+    from wardex_sdk._enums import AdapterName
+
+    wardex.init(
+        transport=RecordingTransport(),
+        intercept=False,
+        batching=_IDLE,
+        adapters=AdaptersConfig(
+            enabled=(AdapterName.ANTHROPIC_AGENT_SDK,),
+            anthropic_agent_sdk=AnthropicAgentSdkConfig(otel_bridge=True),
+        ),
+    )
+    from wardex_sdk._adapters._registry import get_registry
+
+    return get_registry()._installed["anthropic_agent_sdk"]
+
+
+@fork_only
+def test_child_of_bridged_parent_exits_cleanly():
+    """The pre-existing hang this teardown fixes: with `otel_bridge=True` in
+    the parent, the child's `wardex.close()` reached the receiver's
+    `close()`, whose `shutdown()` waits — unbounded — on an event only the
+    serve loop sets, and that loop's thread does not exist in a fork child.
+    The fork hook now severs both bridge references and closes the child's
+    fd without ever calling `shutdown()`."""
+    adapter = _bridged_init()
+    try:
+        assert adapter._bridge is not None, "the repro needs the parent's receiver live"
+
+        def child():
+            wardex.close()  # used to hang forever right here
+            return {"closed": True}
+
+        code, payload = _run_in_child(child, timeout=20.0)
+        assert code == 0, payload
+        assert payload == {"closed": True}
+        assert adapter._bridge is not None, "the parent's receiver is not the child's to touch"
+    finally:
+        wardex.close()
+
+
+@fork_only
+def test_child_of_bridged_parent_survives_the_atexit_path():
+    """The same hang, reached the way production reaches it: a child that
+    exits normally runs atexit → `Runtime.teardown` → adapter uninstall →
+    bridge close. Exercised via the runtime's own atexit callable."""
+    adapter = _bridged_init()
+    try:
+        assert adapter._bridge is not None
+
+        def child():
+            _runtime.runtime()._at_exit()  # exactly what the interpreter's exit runs
+            return {"exited": True}
+
+        code, payload = _run_in_child(child, timeout=20.0)
+        assert code == 0, payload
+        assert payload == {"exited": True}
+    finally:
+        wardex.close()
+
+
+def test_close_inherited_after_fork_never_calls_shutdown(monkeypatch):
+    """The one implementation of the child-safe teardown that stays wrong
+    quietly: `close()` reused in the child hangs, and nothing else would
+    catch a `shutdown()` sneaking back into the fork path."""
+    from wardex_sdk._adapters._otel_receiver import _OtelBridgeReceiver
+
+    r = _OtelBridgeReceiver(max_body_bytes=64 * 1024, max_spans_per_session=64, max_sessions=8)
+    r._server.shutdown()  # retire the serve loop the way a fork does: the child has none
+    calls: list[int] = []
+    monkeypatch.setattr(r._server, "shutdown", lambda: calls.append(1))
+    old_lock = r._lock
+    r.close_inherited_after_fork()
+    assert calls == [], "shutdown() waits on the serve loop a fork child does not have"
+    assert r._lock is not old_lock
+    assert r._by_trace == {} and r._by_session_id == {}
+    assert r._server.socket.fileno() == -1, "the child's reference to the bound fd is closed"
+    r.close_inherited_after_fork()  # idempotent: a second call must not raise on the closed fd
+
+
+def test_assembler_fork_reinit_forgets_sessions_without_emitting():
+    from wardex_sdk._adapters._assembler import SessionAssembler
+
+    class _FakeClient:
+        config = None
+
+        def __init__(self) -> None:
+            self.spans: list = []
+
+        def capture_span(self, span) -> None:  # noqa: ANN001
+            self.spans.append(span)
+
+    client = _FakeClient()
+    asm = SessionAssembler(client)
+    asm.on_outbound(
+        1,
+        json.dumps(
+            {"type": "user", "session_id": "s-1", "message": {"role": "user", "content": "go"}}
+        ),
+    )
+    asm.on_inbound(
+        1, {"type": "system", "subtype": "init", "session_id": "s-1", "model": "claude-sonnet-5"}
+    )
+    assert asm.open_session_count() == 1
+    units = asm._units
+    old_asm_lock, old_units_lock = asm._lock, units._lock
+
+    asm._at_fork_reinit()
+
+    assert asm.open_session_count() == 0
+    assert asm._by_session_id == {}
+    assert asm._bridge is None
+    assert asm._lock is not old_asm_lock
+    assert units._lock is not old_units_lock
+    assert units._roots == {} and units._live_units == {}
+    assert units._by_alias == {} and units._link_memory == {}
+    assert client.spans == [], (
+        "the inherited sessions belong to the parent — emitting them here IS "
+        "the duplication this reset removes (I-fork-3)"
+    )
+
+
+def test_catalog_fork_reinit_drops_handles_and_replaces_the_lock():
+    from wardex_sdk._adapters._anthropic_names import McpToolCatalog
+
+    catalog = McpToolCatalog()
+    catalog.handle_for("srv")
+    old_lock = catalog._lock
+    catalog._at_fork_reinit()
+    assert catalog._lock is not old_lock
+    assert catalog._handles == []
+
+
+@fork_only
+def test_transport_at_fork_child_hook_is_called_in_the_child():
+    """The duck-typed extension point: wardex cannot rebuild a third-party
+    transport's connection pool, so a transport that declares
+    `at_fork_child()` gets called in the child — and only there."""
+
+    class _ForkAwareTransport(RecordingTransport):
+        def __init__(self) -> None:
+            super().__init__()
+            self.fork_calls = 0
+
+        def at_fork_child(self) -> None:
+            self.fork_calls += 1
+
+    transport = _ForkAwareTransport()
+    wardex.init(transport=transport, intercept=False, batching=_IDLE)
+    try:
+
+        def child():
+            return {"calls": transport.fork_calls}
+
+        code, payload = _run_in_child(child)
+        assert code == 0, payload
+        assert payload == {"calls": 1}
+        assert transport.fork_calls == 0, "the hook is the CHILD's; the parent never runs it"
+    finally:
+        wardex.close()
+
+
+# --------------------------------------------------------------------------
 # §6.9 — registration lifecycle
 # --------------------------------------------------------------------------
 

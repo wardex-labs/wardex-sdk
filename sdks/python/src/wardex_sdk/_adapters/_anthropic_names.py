@@ -188,6 +188,19 @@ class McpToolCatalog:
         self._lock = threading.RLock()
         self._handles: list[ServerHandle] = []
 
+    def _at_fork_reinit(self) -> None:
+        """Fork-child reset: fresh lock, forget the parent's server handles.
+
+        A handle pairs a server registration with a token the PARENT's CLI
+        subprocess resolves; the child shares none of those subprocesses, so
+        an inherited handle could only ever mis-attribute a tool name. The
+        lock is replaced, never acquired (a fork can land inside a registered
+        `create_sdk_mcp_server` call holding it); the bound and the patch
+        state stay — installation is inherited and valid (I-fork-4).
+        """
+        self._lock = threading.RLock()
+        self._handles.clear()
+
     def apply_bound(self, *, max_entries: int) -> None:
         """Re-bind this table's ceiling to the host's configured value.
 

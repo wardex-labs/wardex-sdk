@@ -388,6 +388,21 @@ class Runtime:
                 _fork_reinit_module("_interceptors._conn_timing")
                 _fork_reinit_module("_interceptors._close_hook")
                 _fork_reinit_module("context._inject")
+            # step 4 — adapters: sessions/units dropped without emitting, the
+            # inherited bridge receiver torn down the child-safe way. Then the
+            # host's transport gets its say: wardex cannot reset a third-party
+            # transport's internals (a pooled requests.Session shares TCP
+            # sockets with the parent — that library's own fork problem), so
+            # the extension point is a duck-typed `at_fork_child()` the
+            # transport may implement; ours are stateless and don't.
+            with guard("adapters.fork_reinit_failed"):
+                if self._adapters is not None:
+                    self._adapters._at_fork_reinit()
+            if client is not None:
+                with guard("transport.fork_reinit_failed"):
+                    at_fork_child = getattr(client._transport, "at_fork_child", None)
+                    if at_fork_child is not None:
+                        at_fork_child()
             # step 6 — after the resets, so this survives them.
             counters.bump("_runtime.fork_child_reinit")
         self._fork_reinit_us = int((time.perf_counter() - started) * 1e6)

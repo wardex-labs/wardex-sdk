@@ -957,6 +957,32 @@ class UnitRegistry:
         """
         return self._max_record_bytes
 
+    def _at_fork_reinit(self) -> None:
+        """Fork-child reset: drop every inherited unit WITHOUT emitting.
+
+        The one deliberate exception to the emit-once funnel below (I-fork-3):
+        every live unit in these tables was opened by the PARENT, whose copy
+        is intact and whose automatic paths (close_all, eviction, link memory)
+        will emit it. A child that force-closed its inherited copies would
+        re-create the duplicate export this reset exists to remove — so the
+        four tables are simply forgotten. Units the HOST still holds handles
+        to are untouched (their `_open` tables live on the unit objects), and
+        if the host closes one in the child, the child's copy ships under the
+        child's pid: two processes each finishing their own copy, which the
+        backend attributes by `process.pid`. Automatic paths meeting such an
+        orphan are already covered — `close_span`'s untracked-draft counter,
+        `PARENT_UNRESOLVED` on a lost link.
+
+        The lock is REPLACED, never acquired: a fork can land while a parent
+        thread holds it mid-walk, and this registry sits on the child's own
+        teardown path.
+        """
+        self._lock = threading.RLock()
+        self._roots.clear()
+        self._live_units.clear()
+        self._by_alias.clear()
+        self._link_memory.clear()
+
     # -- lifecycle -------------------------------------------------------
 
     def open(
@@ -1893,7 +1919,10 @@ class UnitRegistry:
         `close_span`, `_close_locked`, `close_all`, `_evict_root_locked`,
         `open_span`'s eviction, and any path added after them — so latching the
         draft HERE covers every one of them by construction instead of asking
-        each caller to remember. `unit._open` was doing that
+        each caller to remember. And the fork reset (`_at_fork_reinit`) is the
+        ONE path that drops units WITHOUT emitting — the deliberate exception,
+        not a leak: the parent owns and emits them (I-fork-3), so a child-side
+        emit here would be the duplicate, not the fix. `unit._open` was doing that
         job by accident and enforced only half of it: a draft removed by a
         force-close is no longer findable, and `close_span` read "not in the
         table" as "nothing to arbitrate, emit" rather than "already gone".
