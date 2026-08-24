@@ -144,26 +144,32 @@ fn try_parse_sse(
     // reassembler, which is exactly what fabricated an empty chat body out
     // of a Responses stream on api.openai.com.
     let matched = endpoint::from_path(path).or_else(|| endpoint::from_sse_shape(&events));
-    let _ = host; // provider is implied by the Api; the host adds nothing here
+    // ... and the HOST names the provider LABEL when it can: an Anthropic
+    // host serving its OpenAI-compat Chat endpoint is still Anthropic. The
+    // Api's implied provider is the fallback for a host that names none —
+    // a gateway serving a provider-shaped API. Same split as the
+    // non-streaming dispatch below: shape picks the parser, host picks the
+    // label, so the two halves of one endpoint cannot disagree.
+    let provider = provider_from_host(host);
     match matched.map(|e| e.api) {
         Some(Api::OpenAiChatCompletions) => {
             let reassembled = reassemble_openai(&events);
             let body = reassembled.body.clone();
-            let mut out = sse_semantics(matched.unwrap(), reassembled);
+            let mut out = sse_semantics(matched.unwrap(), provider, reassembled);
             fill_openai_chat(&mut out, req, &body, bounds);
             Some(out)
         }
         Some(Api::AnthropicMessages) => {
             let reassembled = reassemble_anthropic(&events);
             let body = reassembled.body.clone();
-            let mut out = sse_semantics(matched.unwrap(), reassembled);
+            let mut out = sse_semantics(matched.unwrap(), provider, reassembled);
             fill_anthropic(&mut out, req, &body, bounds);
             Some(out)
         }
         Some(Api::OpenAiResponses) => {
             let reassembled = reassemble_responses(&events);
             let body = reassembled.body.clone();
-            let mut out = sse_semantics(matched.unwrap(), reassembled);
+            let mut out = sse_semantics(matched.unwrap(), provider, reassembled);
             fill_openai_responses(&mut out, req, &body, bounds);
             Some(out)
         }
@@ -190,11 +196,18 @@ fn try_parse_sse(
     }
 }
 
-/// The shared SSE scaffold: provider/operation/api_type from the endpoint,
-/// the synthetic body, and the terminal verdict.
-fn sse_semantics(endpoint: Endpoint, reassembled: parts::Reassembled) -> LlmSemantics {
+/// The shared SSE scaffold: operation/api_type from the endpoint, the
+/// provider label from the host when it names one (the endpoint's implied
+/// provider otherwise), the synthetic body, and the terminal verdict.
+fn sse_semantics(
+    endpoint: Endpoint,
+    provider: Option<&'static str>,
+    reassembled: parts::Reassembled,
+) -> LlmSemantics {
     LlmSemantics {
-        provider: endpoint.api.provider().to_string(),
+        provider: provider
+            .unwrap_or_else(|| endpoint.api.provider())
+            .to_string(),
         operation: endpoint.operation.to_string(),
         api_type: endpoint.api_type,
         reassembled_from_stream: true,
@@ -258,16 +271,23 @@ pub fn parse_llm(
         decoded_response: Some(decoded.clone()),
         ..Default::default()
     };
-    match (provider, matched.api) {
-        ("openai", Api::OpenAiChatCompletions) => fill_openai_chat(&mut out, req, &decoded, bounds),
-        ("openai", Api::OpenAiResponses) => fill_openai_responses(&mut out, req, &decoded, bounds),
-        ("openai", Api::OpenAiEmbeddings) => {
-            fill_openai_embeddings(&mut out, req, &decoded, bounds)
-        }
-        ("anthropic", Api::AnthropicMessages) => fill_anthropic(&mut out, req, &decoded, bounds),
-        // A provider on another provider's API is left as empty semantics —
-        // same fail-safe posture as before.
-        _ => {}
+    // The API SHAPE picks the parser; the host (or, failing that, the body
+    // shape) picked only the provider LABEL above. Requiring the two to
+    // AGREE dropped real traffic: Anthropic's documented OpenAI-compat
+    // endpoint (`api.anthropic.com/v1/chat/completions`) is an
+    // anthropic-named host speaking the Chat shape, and a `(provider, api)`
+    // match left it as empty semantics — no gen_ai, no marker, and under
+    // AGENT mode no span at all — while the SSE half of the same endpoint
+    // kept capturing. A genuinely cross-shaped BODY on the path now parses
+    // with the shape's parser: overlapping fields (a top-level `model`,
+    // usage) still extract, and a 200 body the parser cannot read at all
+    // ships under the honest `semantic_parse_failed` — either way the call
+    // is captured instead of vanishing.
+    match matched.api {
+        Api::OpenAiChatCompletions => fill_openai_chat(&mut out, req, &decoded, bounds),
+        Api::OpenAiResponses => fill_openai_responses(&mut out, req, &decoded, bounds),
+        Api::OpenAiEmbeddings => fill_openai_embeddings(&mut out, req, &decoded, bounds),
+        Api::AnthropicMessages => fill_anthropic(&mut out, req, &decoded, bounds),
     }
     Some(out)
 }

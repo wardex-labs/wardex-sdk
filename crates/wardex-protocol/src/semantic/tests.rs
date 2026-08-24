@@ -1699,6 +1699,72 @@ fn responses_incomplete_maps_reason_to_length() {
 }
 
 #[test]
+fn responses_http_error_envelope_claims_nothing_about_the_response_half() {
+    // The bare error envelope every 4xx/5xx carries is NOT a Response
+    // object: no status, no finish reason, no output message may be derived
+    // from it. Same contract `test_llm_error_spans.py` pins for the sibling
+    // `/v1/messages` endpoint; the request identity still comes through.
+    let resp = br#"{"error":{"type":"rate_limit_exceeded","message":"slow down"}}"#;
+    let s = parse_llm(
+        "api.openai.com",
+        "/v1/responses",
+        br#"{"model":"gpt-4.1"}"#,
+        resp,
+        Limits::default(),
+    )
+    .unwrap();
+    assert_eq!(s.request_model.as_deref(), Some("gpt-4.1"));
+    assert_eq!(s.response_status, None);
+    assert_eq!(s.finish_reasons, None);
+    assert_eq!(s.output_messages, None);
+}
+
+/// Anthropic's documented OpenAI-SDK compatibility endpoint: an
+/// anthropic-named HOST serving the Chat Completions SHAPE. The API shape
+/// picks the parser and the host picks the provider label — requiring the
+/// two to agree dropped this endpoint's non-streaming capture entirely
+/// (empty semantics, so no span under AGENT mode) while the SSE half kept
+/// capturing it. Both forms are pinned so the pair cannot drift apart.
+#[test]
+fn anthropic_openai_compat_endpoint_parses_chat_with_the_host_label() {
+    let req = br#"{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":"hi"}]}"#;
+    let resp = br#"{"id":"chatcmpl-compat","object":"chat.completion","model":"claude-sonnet-4-6","choices":[{"index":0,"message":{"role":"assistant","content":"hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":2}}"#;
+    let s = parse_llm(
+        "api.anthropic.com",
+        "/v1/chat/completions",
+        req,
+        resp,
+        Limits::default(),
+    )
+    .unwrap();
+    assert_eq!(s.provider, "anthropic");
+    assert_eq!(s.request_model.as_deref(), Some("claude-sonnet-4-6"));
+    assert_eq!(s.response_id.as_deref(), Some("chatcmpl-compat"));
+    assert_eq!(s.usage.input_tokens(), Some(3));
+    assert_eq!(s.usage.output_tokens(), Some(2));
+    assert_eq!(s.finish_reasons.as_deref(), Some(&["stop".to_string()][..]));
+}
+
+#[test]
+fn anthropic_openai_compat_endpoint_sse_keeps_the_host_label() {
+    let s = parse_llm(
+        "api.anthropic.com",
+        "/v1/chat/completions",
+        b"{}",
+        OPENAI_SSE,
+        Limits::default(),
+    )
+    .unwrap();
+    assert!(s.reassembled_from_stream);
+    assert_eq!(
+        s.provider, "anthropic",
+        "the host names the provider; the Api names the parser"
+    );
+    assert_eq!(s.response_id.as_deref(), Some("chatcmpl-s"));
+    assert_eq!(s.finish_reasons.as_deref(), Some(&["stop".to_string()][..]));
+}
+
+#[test]
 fn responses_failed_maps_to_error() {
     let resp = br#"{"id":"resp_f","object":"response","status":"failed","model":"gpt-4.1",
         "error":{"code":"server_error","message":"boom"},"output":[]}"#;
