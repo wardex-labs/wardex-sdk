@@ -203,6 +203,13 @@ enum Limitation {
   //    mechanism-specific members (SSE/WS/GRPC/H2), fork IS the mechanism,
   //    and an SDK for a language without fork simply never emits it.
   LIMITATION_TRACKING_RESET_AT_FORK = 45;
+  //    Not PARSE_BACKLOG_FULL, by the census rule: same unparsed shipment, but
+  //    the knob is a shutdown budget, not a capacity cap — `close(timeout)` /
+  //    `batching.shutdown_timeout`, or wardex's own 2 s signal-flush budget.
+  //    The process was ending and the budget ran out before this transaction's
+  //    parse; it shipped unparsed rather than not at all. Same body-withholding
+  //    rule as PARSE_BACKLOG_FULL.
+  LIMITATION_PARSE_SKIPPED_AT_SHUTDOWN = 47;
 
   // -- Evidence quality.
   LIMITATION_NO_WIRE_EVIDENCE = 11;
@@ -241,6 +248,20 @@ enum Limitation {
   //    (path > 120 bytes, depth > 6) which no real provider usage object
   //    approaches — every drop a real workload sees names the knob.
   LIMITATION_EXTRA_KEYS_DROPPED = 44;
+  //    Not BODY_CAP_EXCEEDED, by the same rule: that one caps what one body
+  //    KEEPS in raw bytes (`max_body_bytes`); this one caps how many captured-
+  //    but-unparsed transactions may WAIT for the deferred LLM-semantic parse
+  //    (`max_parse_backlog` / `max_parse_backlog_bytes`). And not
+  //    CONNECTION_EVICTED: same eviction shape, different table — that one
+  //    drops connection STATE before a transaction exists; this one ships a
+  //    finished transaction unparsed, so the oldest waiter is never silently
+  //    dropped. The span is otherwise real: transport, timing and status are
+  //    all measured (gRPC framing never defers, so gRPC label/status are never
+  //    lost). Raw bodies ride along EXCEPT when wardex's own degradation is
+  //    the only thing that admitted the span past the capture gate — then the
+  //    payload is withheld: a body the user's mode excluded must not leave the
+  //    process because wardex was overloaded.
+  LIMITATION_PARSE_BACKLOG_FULL = 46;
 
   // -- Parsing / interpretation.
   LIMITATION_FRAME_PARSE_FAILED = 25;

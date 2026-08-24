@@ -1526,15 +1526,23 @@ _VOCABULARY: dict[str, str] = {
     #     knob — kept apart from CONNECTION_EVICTED because no limits field
     #     can make it go away ---
     "TRACKING_RESET_AT_FORK": "tracking_reset_at_fork",
+    # --- added after the census, by the deferred-parse queue (2): the same
+    #     unparsed shipment under two different knobs — the backlog's capacity
+    #     bound (max_parse_backlog / max_parse_backlog_bytes) and the shutdown
+    #     budget (close(timeout) / batching.shutdown_timeout / the 2 s
+    #     signal-flush) — kept apart by the census rule: the reader's next
+    #     action differs per knob ---
+    "PARSE_BACKLOG_FULL": "parse_backlog_full",
+    "PARSE_SKIPPED_AT_SHUTDOWN": "parse_skipped_at_shutdown",
 }
 
 
-def test_the_vocabulary_is_exactly_these_forty_five() -> None:
+def test_the_vocabulary_is_exactly_these_forty_seven() -> None:
     """15 declared before the census + 21 from it + 1 from §5.4 + 1 for wardex
     itself + 1 for the OTLP size guard + 1 for the registry breadth bound
     + 2 for the OTel bridge's fail-open pair + 1 for the adapter's per-session
-    bound + 1 for the dynamic-key bound + 1 for the fork tracking reset,
-    name by name.
+    bound + 1 for the dynamic-key bound + 1 for the fork tracking reset
+    + 2 for the deferred-parse queue's unparsed shipments, name by name.
 
     A count alone is not enough: a RENAME keeps the count and is the single most
     expensive mistake available here. These are proto enum values in
