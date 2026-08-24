@@ -326,7 +326,11 @@ def bench_loop_drift(rounds: int, concurrency: int) -> None:
                     wardex.close()
                 attr_p99 = max(0.0, on["p99"] - off["p99"])
                 attr_max = max(0.0, on["max"] - off["max"])
-                max_by_size[(variant, size)] = on["max"]
+                # The gate is defined on the ATTRIBUTED stall (on - off): the
+                # off-baseline itself grows with body size, so storing the on
+                # absolute here measured the machine plus wardex and the
+                # spread line neither passed nor failed the stated target.
+                max_by_size[(variant, size)] = attr_max
                 print(
                     f"{variant:<10} {size // 1024:>6}K "
                     f"{1000 * off['p99']:>8.3f} {1000 * on['p99']:>8.3f} "
@@ -352,7 +356,8 @@ def bench_loop_drift(rounds: int, concurrency: int) -> None:
         big = max_by_size.get((variant, 4 * 1024 * 1024))
         if small is not None and big is not None:
             print(
-                f"   {variant}: max-drift spread 256K->4M = {1000 * abs(big - small):.3f} ms "
+                f"   {variant}: ATTRIBUTED max-drift spread 256K->4M = "
+                f"{1000 * abs(big - small):.3f} ms "
                 "(size-independence target <= 0.5 ms)"
             )
 
