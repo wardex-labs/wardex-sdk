@@ -262,6 +262,12 @@ _MEMBER_SITES: dict[str, frozenset[str]] = {
     # extra and the diagnostics bump travel as one fact, gated on an
     # identified span.
     "EXTRA_KEYS_DROPPED": frozenset({"_interceptors/_seam.py"}),
+    # The fork child's per-connection tracking reset: one helper
+    # (`_stamp_fork_reset`) serving both build paths, stamping the FIRST span
+    # assembled on a connection that crossed the fork. The one member that
+    # names a process event and no knob — see its docstring for why it is not
+    # CONNECTION_EVICTED.
+    "TRACKING_RESET_AT_FORK": frozenset({"_interceptors/_seam.py"}),
     # Two emitters, one per bound that can evict a session: the registry closes
     # the oldest ROOT unit at `max_units`, and the
     # assembler closes the oldest SESSION at `max_sessions`. Both EMIT the root
@@ -588,6 +594,12 @@ _EMITTED_MEMBERS: frozenset[str] = frozenset(
         # The count it explains rides beside it as an extra, and the volume
         # signal in the diagnostics counters.
         "EXTRA_KEYS_DROPPED",
+        # The sixteenth: the fork child's tracking reset, minted WITH its
+        # emitter (the seam's `_stamp_fork_reset`, fed by the fork latch) in
+        # the same PR. Every other path that drops a live connection state
+        # leaves a marker; landing the member with its emitter is what kept
+        # the fork path from becoming the one silent exception.
+        "TRACKING_RESET_AT_FORK",
     }
 )
 """Which MEMBERS have an emit site today, derived independently below.
@@ -1509,14 +1521,20 @@ _VOCABULARY: dict[str, str] = {
     #     provider-usage mirror is an open key family, and its cap names its
     #     own knob (max_extra_keys) — 39 cuts values, this drops keys ---
     "EXTRA_KEYS_DROPPED": "extra_keys_dropped",
+    # --- added after the census, by the fork child's tracking reset (1):
+    #     the one member that names a process event (`os.fork()`) and no
+    #     knob — kept apart from CONNECTION_EVICTED because no limits field
+    #     can make it go away ---
+    "TRACKING_RESET_AT_FORK": "tracking_reset_at_fork",
 }
 
 
-def test_the_vocabulary_is_exactly_these_forty_four() -> None:
+def test_the_vocabulary_is_exactly_these_forty_five() -> None:
     """15 declared before the census + 21 from it + 1 from §5.4 + 1 for wardex
     itself + 1 for the OTLP size guard + 1 for the registry breadth bound
     + 2 for the OTel bridge's fail-open pair + 1 for the adapter's per-session
-    bound + 1 for the dynamic-key bound, name by name.
+    bound + 1 for the dynamic-key bound + 1 for the fork tracking reset,
+    name by name.
 
     A count alone is not enough: a RENAME keeps the count and is the single most
     expensive mistake available here. These are proto enum values in

@@ -374,11 +374,19 @@ class Runtime:
             if client is not None:
                 with guard("client.fork_reinit_failed"):
                     client._at_fork_reinit()
-            # step 3 (module half) — the propagation module's own lock. Its
-            # patches stay; only the lock (and its PatchSet's) is refreshed.
-            # `uninstall_propagation()` is unconditionally on the child's
-            # teardown path, so this lock inherited held would hang atexit.
+            # step 3 — interceptors: per-connection tracking through the
+            # registry (patches stay installed), then the shared module
+            # singletons — the timing store's parent filenos, the close
+            # registry's parent object ids, and the propagation module's own
+            # lock (`uninstall_propagation()` is unconditionally on the
+            # child's teardown path, so that lock inherited held would hang
+            # atexit). All three module holders are reached through
+            # `sys.modules`: never imported means nothing to reset.
             with guard("interceptors.fork_reinit_failed"):
+                if self._interceptors is not None:
+                    self._interceptors._at_fork_reinit()
+                _fork_reinit_module("_interceptors._conn_timing")
+                _fork_reinit_module("_interceptors._close_hook")
                 _fork_reinit_module("context._inject")
             # step 6 — after the resets, so this survives them.
             counters.bump("_runtime.fork_child_reinit")

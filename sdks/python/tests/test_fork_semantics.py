@@ -433,6 +433,148 @@ def test_inject_fork_reinit_replaces_the_lock_and_keeps_the_install_record():
 
 
 # --------------------------------------------------------------------------
+# §6.4 — the connection latch and the TRACKING_RESET_AT_FORK marker
+# --------------------------------------------------------------------------
+
+_HTTP_REQ = b"POST /v1/messages HTTP/1.1\r\nHost: api.anthropic.com\r\nContent-Length: 0\r\n\r\n"
+_HTTP_RESP = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}"
+
+
+def _bare_seam():
+    """An SSL seam driven directly (no monkeypatch), recording into a client
+    whose mode admits plain transport spans."""
+    from wardex_sdk._enums import CaptureMode
+    from wardex_sdk._interceptors._ssl import SSLInterceptor
+
+    class _SeamClient:
+        def __init__(self) -> None:
+            self.config = WardexConfig(
+                capture_mode=CaptureMode.ALL, backend=BackendConfig(api_key="k")
+            )
+            self.spans: list = []
+
+        def capture_span(self, span) -> None:  # noqa: ANN001
+            self.spans.append(span)
+
+    seam = SSLInterceptor()
+    seam._client = _SeamClient()
+    return seam
+
+
+class _FakeTlsSocket:
+    def __init__(self) -> None:
+        self._alpn = "http/1.1"
+
+    def selected_alpn_protocol(self) -> str:
+        return self._alpn
+
+    def getpeername(self) -> tuple[str, int]:
+        return ("127.0.0.1", 443)
+
+    def fileno(self) -> int:
+        return -1
+
+
+def _drive_txn(seam, sock) -> None:  # noqa: ANN001
+    seam._on_request_bytes(sock, _HTTP_REQ)
+    seam._on_response_bytes(sock, _HTTP_RESP)
+
+
+def test_child_connection_tracking_is_its_own():
+    """A NEW connection opened after the fork reset captures with its own
+    tracker and carries no fork marker — the reset is about inherited state,
+    not about the child's fresh traffic."""
+    from wardex_sdk._assembly import Limitation
+
+    seam = _bare_seam()
+    inherited = _FakeTlsSocket()
+    _drive_txn(seam, inherited)  # the parent's tracking, about to be inherited
+    assert id(inherited) in seam._conns
+
+    seam._at_fork_reinit()
+    assert seam._conns == {}, "the child must not trust the parent's per-connection state"
+
+    fresh = _FakeTlsSocket()
+    _drive_txn(seam, fresh)
+    spans = seam._client.spans
+    assert [s.name for s in spans][-1] == "HTTP POST /v1/messages"
+    assert Limitation.TRACKING_RESET_AT_FORK not in spans[-1].capture_integrity.limitations, (
+        "a connection born in the child never crossed the fork"
+    )
+
+
+def test_inherited_socket_first_span_carries_the_fork_marker():
+    """The host keeps using a pre-fork socket: its tracker restarted
+    mid-stream, and exactly ONE span says so — every other path that drops a
+    live connection state leaves a marker, and the fork path may not be the
+    silent exception."""
+    from wardex_sdk._assembly import Limitation, counters
+
+    seam = _bare_seam()
+    sock = _FakeTlsSocket()
+    _drive_txn(seam, sock)  # tracked in the parent
+    before = counters.get("interceptors.seam.tracking_reset_at_fork")
+
+    seam._at_fork_reinit()
+    _drive_txn(seam, sock)  # the child keeps using the inherited socket
+    _drive_txn(seam, sock)  # and again — the marker must not repeat
+
+    spans = seam._client.spans[1:]  # [0] is the parent's own capture
+    assert len(spans) == 2
+    assert Limitation.TRACKING_RESET_AT_FORK in spans[0].capture_integrity.limitations, (
+        "the first span on a fork-crossing connection must say its tracking restarted"
+    )
+    assert Limitation.TRACKING_RESET_AT_FORK not in spans[1].capture_integrity.limitations, (
+        "the marker is the reset event's, and the reset happened once"
+    )
+    assert counters.get("interceptors.seam.tracking_reset_at_fork") == before + 1
+
+
+def test_fork_latch_is_bounded_by_max_connections():
+    """The latch cannot outgrow the table it snapshots: at most
+    `max_connections` ids survive, newest first — the same drop-oldest
+    posture as the table's own cap."""
+    seam = _bare_seam()
+    socks = [_FakeTlsSocket() for _ in range(6)]
+    for sock in socks:
+        seam._on_request_bytes(sock, _HTTP_REQ)
+    seam._limits = {**seam._limits, "max_connections": 4}
+    seam._at_fork_reinit()
+    assert seam._reset_at_fork_ids == {id(s) for s in socks[-4:]}, (
+        "keep the newest cap-many ids; anything older was the table's own next eviction"
+    )
+
+
+@fork_only
+def test_installed_seam_reset_is_wired_through_the_fork_hook():
+    """The hook actually REACHES an installed seam: the child finds the
+    connection table empty and the fork latch holding the inherited id.
+    (The graph-walk guard generalizes this to every holder; this is the
+    seam-specific behavior pinned end to end through a real fork.)"""
+    wardex.init(transport=RecordingTransport(), intercept=True, batching=_IDLE)
+    try:
+        from wardex_sdk._interceptors._registry import get_registry
+
+        seam = get_registry()._installed["ssl"]
+        sock = _FakeTlsSocket()
+        seam._on_request_bytes(sock, _HTTP_REQ)
+        assert id(sock) in seam._conns
+
+        def child():
+            return {
+                "conns": len(seam._conns),
+                "latched": id(sock) in seam._reset_at_fork_ids,
+            }
+
+        code, payload = _run_in_child(child)
+        assert code == 0, payload
+        assert payload == {"conns": 0, "latched": True}
+        assert id(sock) in seam._conns, "the PARENT's tracking is untouched by the child's reset"
+    finally:
+        wardex.close()
+
+
+# --------------------------------------------------------------------------
 # §6.9 — registration lifecycle
 # --------------------------------------------------------------------------
 

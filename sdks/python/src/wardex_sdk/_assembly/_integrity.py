@@ -24,7 +24,10 @@ OTel bridge's fail-open pair ``OTEL_BRIDGE_NO_DATA`` (41, confirmed injection
 and nothing arrived) / ``OTEL_BRIDGE_SCHEMA_UNKNOWN`` (42, data arrived and
 classified as nothing), and ``SESSION_ENTRY_TABLE_FULL`` (43, the adapter's
 per-session bound, which is the registry's breadth bound one layer out and a
-different FIELD).
+different FIELD). Two more since that paragraph was last true:
+``EXTRA_KEYS_DROPPED`` (44, the dynamic-key bound on the provider-usage
+mirror) and ``TRACKING_RESET_AT_FORK`` (45, the fork child's per-connection
+tracking reset — the one member that names a process event and no knob).
 ``tests/test_limitation_census.py`` is the live count; this paragraph is its
 history, not its source.
 The census read every assignment and append site that reaches
@@ -492,6 +495,44 @@ Two emit sites, and the first is the mechanism the second restates.
     property of the RUNTIME — work whose carrier legitimately could not inherit
     the context. Reusing it here would file a wardex bug under "the host's
     threading model", which is the attribution this member exists to correct.
+    """
+
+    TRACKING_RESET_AT_FORK = "tracking_reset_at_fork"
+    """The connection this span rode crossed an ``os.fork()``: the child reset
+    its per-connection tracking state, so parsing may have started mid-stream
+    and the timing/stream fields' origin is younger than the connection.
+
+    Emitted from ``_interceptors/_seam.py``. At fork the child's reset latches
+    the ids of every connection the seam was tracking and clears the table
+    (an inherited entry would otherwise hand a recycled ``id()`` a dead
+    connection's tracker and its latched gate — the cross-process edition of
+    the close-hook bug). When the host keeps using an INHERITED socket, the
+    seam builds it a fresh state, finds its id in the latch, and the FIRST
+    span assembled on it carries this marker, exactly once — the honest label
+    for a body parsed from its middle and a ``connection_reused``/TTFB story
+    whose epoch is the fork, not the connect. A brand-new connection opened in
+    the child matches nothing and carries nothing.
+
+    Not ``CONNECTION_EVICTED`` (24), by the census rule the caps band states:
+    the reader's next action differs, because the KNOB differs. That member
+    names ``limits.max_connections`` — raise it and the marker goes away —
+    while this one names no knob at all: it reports a process event, and no
+    limits field can prevent a host from forking. Merging them would send the
+    reader to turn a knob that cannot help.
+
+    Best-effort by one bounded false positive: the latch keys on ``id()``, so
+    an inherited socket that is garbage-collected before the child touches it
+    can donate its id to a NEW connection, which then wears the marker on one
+    span. That is the pre-existing id-reuse class, bounded to one span per
+    latched id, and accepted — the alternative (holding the socket objects)
+    would pin the parent's file descriptors open for the child's lifetime.
+
+    The DISCARDED side of the fork reset — the parent-owned buffer, sessions
+    and units the child drops without emitting — carries no marker anywhere,
+    deliberately: nothing was lost, it ships from the process that owns it.
+    The fork event itself is a process fact, not a span fact, and lives in the
+    ``_runtime.fork_child_reinit`` diagnostic counter (the ``disabled_reason``
+    disposition).
     """
 
     # ------------------------------------------------------------------

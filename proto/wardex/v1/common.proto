@@ -190,6 +190,19 @@ enum Limitation {
   LIMITATION_ADAPTER_UNINSTALLED = 9;
   LIMITATION_PATCH_SUPERSEDED = 10;
   LIMITATION_INSTRUMENTATION_DEGRADED = 38;
+  //    The connection this span rode crossed an `os.fork()`: the child reset
+  //    its per-connection tracking, so parsing may have begun mid-stream and
+  //    the timing/stream fields' origin is younger than the connection.
+  //    Attached once, to the FIRST span assembled on such a connection in the
+  //    child. NOT `CONNECTION_EVICTED` (24), by the census rule: that member
+  //    names `max_connections` — raise it and the marker goes away — while
+  //    this one names NO knob at all: it reports a process event, and no
+  //    limits field can prevent it. Merging them would send the reader to
+  //    turn a knob that cannot help. Deliberately fork-specific rather than a
+  //    language-neutral "process split": the vocabulary already carries
+  //    mechanism-specific members (SSE/WS/GRPC/H2), fork IS the mechanism,
+  //    and an SDK for a language without fork simply never emits it.
+  LIMITATION_TRACKING_RESET_AT_FORK = 45;
 
   // -- Evidence quality.
   LIMITATION_NO_WIRE_EVIDENCE = 11;
