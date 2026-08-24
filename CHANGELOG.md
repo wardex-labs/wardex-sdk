@@ -5,7 +5,76 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **The LLM-semantic parse runs off the caller's thread.** A completed
+  transaction is now SEALED on the thread that carried its bytes (timing,
+  prefilter, context snapshot — microseconds) and finished on a dedicated
+  `wardex-finalize-worker` thread, where `parse_llm_semantics` also releases
+  the GIL. On an asyncio host this removes the one place capture stalled the
+  event loop: a large streamed completion's parse (~5 ms/MB, measured) no
+  longer runs inside the host's socket read. gRPC and WebSocket spans still
+  assemble inline — measured at microseconds, there is nothing to defer.
+- **New limits `max_parse_backlog` (2048) and `max_parse_backlog_bytes`
+  (64 MiB).** The deferred-parse queue's two bounds — jobs and resident raw
+  bytes. Over either, the OLDEST waiter ships unparsed rather than silently
+  dropping; a single body larger than the byte bound never enters the queue
+  at all, so the bound is literal.
+- **New limitation markers `parse_backlog_full` (vocabulary 46) and
+  `parse_skipped_at_shutdown` (47).** The same unparsed shipment under two
+  different knobs: a capacity cap (raise `max_parse_backlog*`) and a
+  shutdown budget (raise `close(timeout)` / `batching.shutdown_timeout`, or
+  `flush()` before exiting — including wardex's own 2 s signal-flush).
+  Transport, timing and status are all measured on such spans; `gen_ai` is
+  absent because the parser never ran. When wardex's own degradation is the
+  ONLY reason such a span passed the capture gate, its request/response
+  payloads are withheld: a body the configured mode excluded must not leave
+  the process because wardex was overloaded.
+- **`Client.capture_deferred(job)` — the deferred-finalization door.** Part
+  of the client duck type now, which is a SURFACE change for hand-written
+  client doubles: a double needs the method. One-line migration for
+  synchronous semantics: `def capture_deferred(self, job):
+  self.capture_span(job.ctx.run(job.run))`. The
+  `wardex_sdk.testing.RecordingClient` double runs a real (worker-less)
+  queue instead: jobs stay pending until its new `settle()` finishes them
+  on the calling thread, mirroring the real client's "visible after flush".
+
+### Changed
+
+- **`flush()`, `close()` and the signal flush finish pending parses before
+  exporting, each phase on its own budget.** A bare `flush()` drains the
+  backlog on the transport's own number and still hands the POST that same
+  number, unmodified. An explicit `flush(t)` spends at most `t/2` parsing
+  and reserves at least `t/2` for the export. The signal path and `close()`
+  drain in fallback mode — every pending job leaves, parsed if the budget
+  allowed and marked `parse_skipped_at_shutdown` if not — and `close()`'s
+  worst case grows to roughly 4x its per-step budget (was 3x). A deferred
+  parse that outlives `close()`'s final drain is counted and reported as a
+  loss, never silently parked.
+- **Span emission order is not arrival order.** It never was a contract —
+  trees connect by ids, and receivers already handle children arriving
+  before parents — but the deferred parse makes reordering routine. "After
+  `flush()` returns, everything is visible" is the contract, and it holds.
+- **Fork: pending parse jobs are discarded in the child.** Same rule as the
+  inherited span buffer — the parent sealed them, owns them and exports
+  them — so one transaction can never ship from two processes. The
+  fork-inherited in-flight count is PID-owned, so a child forked mid-parse
+  never burns its flush/close budget waiting on the parent's parse.
+
 ### Fixed
+
+- **A raising LLM-semantic parser no longer deletes the span.** The parse
+  exception used to be swallowed uncounted (`sem=None`), and under the
+  default AGENT mode with no ambient parent the whole span was then gated
+  away — deleted data behind a zero counter. The parse now runs under its
+  own guard: counted, logged under `debug=True`, and the span ships marked
+  `instrumentation_degraded` (not `semantic_parse_failed` — the parser
+  never returned an answer).
+- **README's "Capture itself never blocks your coroutines" is now true.**
+  Buffering and export always ran on wardex's threads; the parse did not.
+  Measured before the change: one 8 MB SSE completion stalled the event
+  loop ~26 ms on this machine (and scales with body size); after: the
+  stall is gone and independent of body size.
 
 - **Forked children no longer re-export the parent's pre-fork buffer.** In a
   prefork deployment (gunicorn/uWSGI/celery `--preload`), every worker

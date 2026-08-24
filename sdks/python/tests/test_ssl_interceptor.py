@@ -28,6 +28,7 @@ def _reset():
 
 def _captured_spans():
     client = _hub.get_client()
+    client._settle()  # finalization runs on the worker; settle before reading
     return list(client._spans)  # test-only internal access
 
 
