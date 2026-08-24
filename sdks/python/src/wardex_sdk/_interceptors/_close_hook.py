@@ -497,11 +497,15 @@ def _at_fork_reinit() -> None:
 
     The patch and `_refcount` stay (I-fork-4): the seams that hold the
     references are still installed in the child, and their post-fork
-    connections re-register through `on_close` exactly as new ones do. No
-    lock to replace — `CloseRegistry` is deliberately unlocked (see its
-    docstring). Reached by `Runtime.after_in_child` through `sys.modules`.
+    connections re-register through `on_close` exactly as new ones do.
+    `CloseRegistry` is deliberately unlocked (see its docstring), but the
+    probe's `PatchSet` is not, and the child's teardown reaches its
+    `restore_all()` through `uninstall_shared_close_hook()` — so its lock is
+    replaced here (P/Q/R row Q), never acquired. Reached by
+    `Runtime.after_in_child` through `sys.modules`.
     """
     _registry.clear()
+    _probe._patches._at_fork_reinit()
 
 
 def install_shared_close_hook() -> None:

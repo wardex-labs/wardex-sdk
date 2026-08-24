@@ -221,6 +221,15 @@ class AdapterRegistry:
                 continue
             with guard(f"adapters.{name}.fork_reinit_failed"):
                 reinit()
+        # Every installed adapter's context owns a PatchSet whose lock the
+        # child's teardown WILL take (`AdapterRegistry.uninstall` ->
+        # `ctx.patches.restore_all()`), whether or not the adapter itself
+        # declared a reset — LangGraph patches exclusively through its
+        # context and declares none. Row Q therefore lives here, on the
+        # OWNER of the contexts, not on each adapter's goodwill.
+        for name, ctx in list(self._contexts.items()):
+            with guard(f"adapters.{name}.fork_reinit_failed"):
+                ctx._at_fork_reinit()
 
     def is_installed(self, name: str) -> bool:
         return name in self._installed

@@ -266,14 +266,19 @@ class SessionAssembler:
         without one (`close_inherited_after_fork` is the safe half, and the
         ADAPTER calls it; this reset only makes the object unreachable).
 
-        The lock is REPLACED, never acquired; the unit registry resets
-        through its own `_at_fork_reinit`, same rules.
+        The lock is REPLACED, never acquired; the unit registry and the
+        tool catalog reset through their own `_at_fork_reinit`, same rules.
+        The catalog reset is idempotent on the adapter-install path (where
+        `_names` IS the adapter's catalog and the adapter resets it too) and
+        is the only reset the self-built catalog of a directly-constructed
+        assembler ever gets.
         """
         self._lock = threading.RLock()
         self._by_key.clear()
         self._by_session_id.clear()
         self._bridge = None
         self._units._at_fork_reinit()
+        self._names._at_fork_reinit()
 
     def unit_for(self, key: int) -> Unit | None:
         """The live session unit for a transport key, if there is one."""

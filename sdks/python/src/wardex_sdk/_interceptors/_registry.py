@@ -123,12 +123,13 @@ class InterceptorRegistry:
         The registry stays populated and every patch stays installed
         (I-fork-4): the child is still instrumented, it just must not trust
         per-connection state built for the parent's sockets. A seam that
-        declares no `_at_fork_reinit` holds no per-process mutable state to
-        reset (MCP stdio: its state rides in per-stream closures the fork
-        either carries validly or never touches — `_FORK_EXEMPT`), so the
-        absence of the method is a statement, not an oversight, and the
-        coverage guard in `tests/test_fork_reinit_coverage.py` is what keeps
-        that statement honest for every FUTURE holder.
+        declares no `_at_fork_reinit` is stating it holds no per-process
+        mutable state to reset — not even a PatchSet, whose lock row Q makes
+        every holder replace (MCP stdio declares one for exactly that lock;
+        its per-stream state rides closures the fork either carries validly
+        or never touches — `_FORK_EXEMPT`). The coverage guard in
+        `tests/test_fork_reinit_coverage.py` is what keeps that statement
+        honest for every FUTURE holder.
 
         Per-seam `guard()` so one failing reset cannot abandon the rest — the
         same totality rule as `uninstall_all`, on the same kind of path.
