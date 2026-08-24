@@ -352,6 +352,72 @@ def test_set_gen_ai_counts_a_non_inclusive_block():
     assert span is not None and span.gen_ai.input_tokens == 1000  # shipped as given
 
 
+def test_gen_ai_property_assignment_counts_a_non_inclusive_block():
+    """`Span.gen_ai = ...` passes the same G5 choke point as `set_gen_ai`.
+
+    `Span` is public and the property is the idiomatic spelling (`agent` and
+    `tool` share the shape), so before this was pinned, an assignment shipped
+    an exclusive block with the counter at 0 — the exact bypass the census
+    test's docstring names as "not an extraction".
+    """
+    from wardex_sdk._assembly import AMBIENT, Ambient, SpanDraft, SpanIntent, resolve_parentage
+    from wardex_sdk._enums import CaptureSource, OperationName
+    from wardex_sdk._tracing import Span
+
+    draft = SpanDraft(
+        resolve_parentage(Ambient(None, None, None), AMBIENT),
+        intent=SpanIntent.CHAT,
+        subject="claude-sonnet-4-6",
+        source=CaptureSource.ADAPTER,
+        start_ns=1,
+    )
+    span = Span(draft)
+    span.gen_ai = GenAIAttributes(
+        operation=OperationName.CHAT,
+        request_model="claude-sonnet-4-6",
+        input_tokens=1000,  # < 8000 + 2000: the pre-fix exclusive shape
+        cache_read_input_tokens=8000,
+        cache_creation_input_tokens=2000,
+    )
+    assert counters.get("assembly.builder.gen_ai_usage_not_inclusive") == 1
+    # Clearing stays legal, uncounted, and readable back.
+    span.gen_ai = None
+    assert span.gen_ai is None
+    assert counters.get("assembly.builder.gen_ai_usage_not_inclusive") == 1
+
+
+def test_set_gen_ai_tolerates_non_numeric_counts():
+    """A block carrying a string where a count belongs must not raise.
+
+    `GenAIAttributes` is a plain public dataclass with no runtime validation,
+    and `set_gen_ai` runs inside the host's own `with wardex.span(...)` block,
+    outside every guard — a `TypeError` out of the inclusivity comparison
+    would be wardex breaking the host over a diagnostic. Unknown types are
+    not violations: the tally stays at 0 and the block ships as given.
+    """
+    from wardex_sdk._assembly import AMBIENT, Ambient, SpanDraft, SpanIntent, resolve_parentage
+    from wardex_sdk._enums import CaptureSource, OperationName
+
+    draft = SpanDraft(
+        resolve_parentage(Ambient(None, None, None), AMBIENT),
+        intent=SpanIntent.CHAT,
+        subject="claude-sonnet-4-6",
+        source=CaptureSource.ADAPTER,
+        start_ns=1,
+    )
+    draft.set_gen_ai(
+        GenAIAttributes(
+            operation=OperationName.CHAT,
+            request_model="claude-sonnet-4-6",
+            input_tokens="1000",  # a JSON-borne string, not a count
+            cache_read_input_tokens=8000,
+        )
+    )
+    assert counters.get("assembly.builder.gen_ai_usage_not_inclusive") == 0
+    span = draft.finish(2)
+    assert span is not None and span.gen_ai.input_tokens == "1000"  # shipped as given
+
+
 def test_set_gen_ai_does_not_count_an_inclusive_block():
     """The negative: wardex's own normalized output never bumps the tally."""
     sem = _parse_anthropic()

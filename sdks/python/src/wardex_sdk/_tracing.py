@@ -166,7 +166,15 @@ class Span:
 
     @gen_ai.setter
     def gen_ai(self, value: GenAIAttributes | None) -> None:
-        self._draft._gen_ai = value
+        # Through the draft's choke point, the way `status`/`conversation`/
+        # `name` already route. The property is the idiomatic spelling of
+        # `set_gen_ai` on this published surface, so a raw `_gen_ai` write
+        # here would be the one door a hand-built block could ship through
+        # without the G5 inclusive-totals tally seeing it.
+        if value is None:
+            self._draft._gen_ai = None
+        else:
+            self._draft.set_gen_ai(value)
 
     @property
     def agent(self) -> AgentAttributes | None:

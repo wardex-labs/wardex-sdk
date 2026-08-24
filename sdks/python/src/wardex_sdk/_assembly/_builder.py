@@ -210,6 +210,22 @@ class IntegrityBuilder:
         )
 
 
+def _count(value: object) -> int | float | None:
+    """The value as a token count, or None for anything that is not one.
+
+    `GenAIAttributes` is a plain public dataclass with no runtime validation,
+    so a third-party block can carry a string where a count belongs — and this
+    predicate runs inside `Span.set_gen_ai`, in the middle of the host's own
+    code, outside every `guard()`. Comparing an unvetted value would raise
+    `TypeError` into the host over a diagnostic, the exact trade the caller's
+    comment forbids. `bool` is excluded because it IS an `int` and would count
+    as 1.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return value
+
+
 def _violates_inclusive_totals(attrs: GenAIAttributes) -> bool:
     """Whether a gen_ai block breaks the inclusive-totals invariant.
 
@@ -218,13 +234,19 @@ def _violates_inclusive_totals(attrs: GenAIAttributes) -> bool:
     (`crates/wardex-protocol/src/usage.rs` is where wardex's own parsers
     make that true). `None` totals are NOT violations — a withheld total is
     the honest shape for an unpaired sub-counter and is tallied separately
-    as `usage_totals_unpaired`.
+    as `usage_totals_unpaired`. Non-numeric values are not violations
+    either: this predicate must be total over whatever a host hands the
+    public dataclass, because raising here would break the host (see
+    `_count`).
     """
-    input_short = attrs.input_tokens is not None and attrs.input_tokens < (
-        (attrs.cache_read_input_tokens or 0) + (attrs.cache_creation_input_tokens or 0)
+    input_total = _count(attrs.input_tokens)
+    input_short = input_total is not None and input_total < (
+        (_count(attrs.cache_read_input_tokens) or 0)
+        + (_count(attrs.cache_creation_input_tokens) or 0)
     )
-    output_short = attrs.output_tokens is not None and attrs.output_tokens < (
-        attrs.reasoning_output_tokens or 0
+    output_total = _count(attrs.output_tokens)
+    output_short = output_total is not None and output_total < (
+        _count(attrs.reasoning_output_tokens) or 0
     )
     return input_short or output_short
 
