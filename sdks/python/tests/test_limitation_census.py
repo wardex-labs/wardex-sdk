@@ -333,6 +333,13 @@ _MEMBER_SITES: dict[str, frozenset[str]] = {
         {
             "_adapters/_context.py",
             "_assembly/_parentage.py",
+            # The client's spawn-failure downgrade: `capture_deferred` could
+            # not bring the finalize worker up (ulimit's "can't start new
+            # thread" is the measured shape), so the job is finalized inline,
+            # parse-less, carrying wardex's own-failure member — the same
+            # sentence `_adapters/_context.py` says about a unit whose open
+            # died.
+            "_client.py",
             # `refused_ambient_marker`: an evict-origin stranded scope is
             # wardex's own bound at work, so the refusal says so instead of
             # CORRELATION_CONFLICT — the repair is `max_units`, not the

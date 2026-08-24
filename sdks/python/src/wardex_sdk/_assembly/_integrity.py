@@ -495,6 +495,12 @@ Two emit sites, and the first is the mechanism the second restates.
     byte-seam span whose latched parent wardex discarded to stay inside a
     bound.
 
+    And from ``_client.py``, on the deferred-parse path's spawn failure:
+    ``capture_deferred`` could not bring the finalize worker up (a host at
+    its thread ulimit is the measured shape), so the job is finalized
+    inline, parse-less, carrying this member — wardex's own failure, and
+    the span still ships rather than silently losing captured bodies.
+
     Deliberately not ``CONTEXT_PROPAGATION_DEGRADED``, which is declared as a
     property of the RUNTIME — work whose carrier legitimately could not inherit
     the context. Reusing it here would file a wardex bug under "the host's

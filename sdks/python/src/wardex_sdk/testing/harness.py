@@ -18,6 +18,7 @@ would catch a total collapse. A check nobody has watched fail is not a check.
 
 from __future__ import annotations
 
+import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -30,8 +31,10 @@ from .._adapters._registry import AdapterRegistry
 from .._assembly import Limitation, counters
 from .._assembly._diag import reset_reports_for_test
 from .._assembly._units import _ambient_unit
+from .._finalize import FinalizeQueue, Leftover
+from .._limits import LimitsConfig, LimitsConsumer, limits_kwargs
 from .._types import Envelope
-from ..transport._base import Transport
+from ..transport._base import DEFAULT_TIMEOUT, Transport
 
 
 class RecordingClient:
@@ -40,15 +43,43 @@ class RecordingClient:
     `close()` exists because the hub's own teardown closes whatever client it
     finds, and a subject is free to put this one there — a `wardex.span()`
     opened inside a tool handler has to reach the same sink as the adapter.
+
+    `capture_deferred` is backed by a REAL `FinalizeQueue`, deliberately: an
+    inline "run it now" double would mean the public conformance surface
+    never exercises the deferred path at all — not the context propagation,
+    not the eviction bounds, not the drain. The queue's worker thread is
+    never spawned (`ensure_alive` is never called), which keeps the double
+    deterministic and single-threaded: a submitted job sits pending until
+    `settle()` finishes it on the calling thread, exactly the visibility
+    rule the real client has ("visible after flush", here "after settle").
+    A double of your own needs the same method; to keep old synchronous
+    semantics, implement it as `self.capture_span(job.ctx.run(job.run))`.
     """
 
     config = None
 
-    def __init__(self) -> None:
+    def __init__(self, *, limits: LimitsConfig | None = None) -> None:
         self.spans: list[Any] = []
+        resolved = (limits if limits is not None else LimitsConfig()).resolved()
+        self._finalize = FinalizeQueue(
+            admit=self._admit,
+            debug=False,
+            **limits_kwargs(LimitsConsumer.FINALIZE_QUEUE, resolved),
+        )
+
+    def _admit(self, span: Any, *, scope: Any = None) -> None:
+        self.spans.append(span)
 
     def capture_span(self, span: Any) -> None:
         self.spans.append(span)
+
+    def capture_deferred(self, job: Any) -> None:
+        self._finalize.submit(job, _hub.get_merged_tags_and_user())
+
+    def settle(self, timeout: float = DEFAULT_TIMEOUT) -> None:
+        """Finish every pending deferred job, on this thread. The double's
+        `flush()`: assertions about deferred spans go after it."""
+        self._finalize.drain_all(time.monotonic() + timeout, leftover=Leftover.KEEP)
 
     def close(self) -> None:
         return None
@@ -103,6 +134,13 @@ class LiveAdapter:
 
     @property
     def spans(self) -> list[Any]:
+        # Settle first, so a subject that defers finalization (none of the
+        # in-tree adapters do; the byte seams — and any future deferring
+        # producer — are the shape this covers) is read AFTER its pending
+        # work, the same "visible after flush" rule the real client has.
+        settle = getattr(self.client, "settle", None)
+        if settle is not None:
+            settle()
         return self.client.spans
 
     def teardown(self) -> None:
