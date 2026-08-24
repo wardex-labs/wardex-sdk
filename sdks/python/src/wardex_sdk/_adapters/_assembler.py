@@ -894,6 +894,12 @@ class SessionAssembler:
             source=CaptureSource.ADAPTER,
             start_ns=start_ns,
         )
+        # Same FFI-value pattern as `build_gen_ai`: the native parser reports
+        # the condition, the layer that owns `counters` tallies it.
+        if ev.usage_totals_unpaired:
+            counters.bump("adapters.assembler.stream_usage_totals_unpaired")
+        if ev.usage_overflowed:
+            counters.bump("adapters.assembler.stream_usage_overflowed")
         gen_ai = GenAIAttributes(
             operation=SpanIntent.CHAT.operation,
             provider=ProviderName.ANTHROPIC,

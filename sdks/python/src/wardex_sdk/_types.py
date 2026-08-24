@@ -89,7 +89,13 @@ class GenAIAttributes:
     response_model: str | None = None  # gen_ai.response.model
     response_id: str | None = None  # gen_ai.response.id (new)
 
-    # Tokens (cache/reasoning are included in input/output_tokens — OTel convention)
+    # Tokens. INVARIANT, not convention: input_tokens includes the cache
+    # tiers and output_tokens includes reasoning (semconv-inclusive).
+    # `crates/wardex-protocol/src/usage.rs` makes it true for everything
+    # wardex parses, and `SpanDraft.set_gen_ai` counts violations
+    # (`assembly.builder.gen_ai_usage_not_inclusive`) for blocks built by
+    # hand. This dataclass stays validation-free by layering: it sits below
+    # `_assembly`, which owns the counters.
     input_tokens: int | None = None
     output_tokens: int | None = None
     cache_read_input_tokens: int | None = None

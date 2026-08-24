@@ -1,0 +1,96 @@
+{
+  "_provenance": {
+    "source": "scripts/langfuse-mapping-oracle/run.ts (L2), langfuse v4.16.0, OtelIngestionProcessor.processToIngestionEvents + IngestionService.calculateUsageCosts over default-model-prices.json",
+    "generated_by": "make_vectors.py vectors fed through the oracle; DO NOT EDIT BY HAND \u2014 re-run the oracle and freeze its results file",
+    "model": "claude-sonnet-4-6",
+    "claims_passed": 18,
+    "claims_total": 18
+  },
+  "results": {
+    "a_normal": {
+      "type": "generation-create",
+      "usageDetails": {
+        "input": 1000,
+        "output": 500,
+        "input_cached_tokens": 8000,
+        "input_cache_creation": 2000
+      },
+      "costDetails": {
+        "input": 0.003,
+        "output": 0.0075,
+        "input_cached_tokens": 0.0024,
+        "input_cache_creation": 0.0075,
+        "total": 0.020399999999999998
+      },
+      "totalCost": 0.020399999999999998
+    },
+    "b_buggy": {
+      "type": "generation-create",
+      "usageDetails": {
+        "input": 0,
+        "output": 500,
+        "input_cached_tokens": 8000,
+        "input_cache_creation": 2000
+      },
+      "costDetails": {
+        "input": 0,
+        "output": 0.0075,
+        "input_cached_tokens": 0.0024,
+        "input_cache_creation": 0.0075,
+        "total": 0.0174
+      },
+      "totalCost": 0.0174
+    },
+    "c_pair": [
+      {
+        "type": "generation-create",
+        "name": "execute_step llm_request",
+        "model": "claude-sonnet-4-6",
+        "usageDetails": {},
+        "costDetails": {},
+        "totalCost": 0
+      },
+      {
+        "type": "generation-create",
+        "name": "execute_step llm_request",
+        "model": "claude-sonnet-4-6",
+        "usageDetails": {},
+        "costDetails": {},
+        "totalCost": 0
+      },
+      {
+        "type": "generation-create",
+        "name": "chat claude-sonnet-4-6",
+        "model": "claude-sonnet-4-6",
+        "usageDetails": {
+          "input": 1000,
+          "output": 500,
+          "input_cached_tokens": 8000,
+          "input_cache_creation": 2000
+        },
+        "costDetails": {
+          "input": 0.003,
+          "output": 0.0075,
+          "input_cached_tokens": 0.0024,
+          "input_cache_creation": 0.0075,
+          "total": 0.020399999999999998
+        },
+        "totalCost": 0.020399999999999998
+      }
+    ],
+    "d_reasoning": {
+      "type": "generation-create",
+      "usageDetails": {
+        "input": 1000,
+        "output": 300,
+        "output_reasoning_tokens": 200
+      },
+      "costDetails": {
+        "input": 0.003,
+        "output": 0.0045,
+        "total": 0.0075
+      },
+      "totalCost": 0.0075
+    }
+  }
+}

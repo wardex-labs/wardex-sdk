@@ -12,7 +12,10 @@ pub mod http2;
 pub mod json_rpc;
 pub mod semantic;
 pub mod sse;
+pub mod usage;
 pub mod websocket;
+
+pub use usage::{InputConvention, TokenUsage};
 
 #[cfg(test)]
 mod tests {

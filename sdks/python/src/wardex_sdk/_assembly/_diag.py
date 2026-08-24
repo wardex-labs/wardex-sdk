@@ -35,7 +35,14 @@ _F = TypeVar("_F", bound=Callable[..., Any])
 
 
 class Counters:
-    """Swallowed-failure tallies, keyed by call site.
+    """Diagnostic tallies, keyed by call site.
+
+    Two kinds share the table: swallowed failures (a guarded block that
+    raised) and observed CONDITIONS a span cannot carry as a marker —
+    `llm_join_ambiguous`, `attr_dropped`, `otel_bridge_pending_overflow`,
+    the usage-normalization flags. The docstring used to claim the first
+    kind only, while the second was already in the table; the scope
+    statement caught up with the practice rather than the reverse.
 
     `where` is a stable, low-cardinality label naming the site — not a message.
     "adapters.anthropic.on_hook", not f"failed to parse {payload}". The table is

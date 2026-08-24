@@ -40,6 +40,16 @@ Attribute copying is allowlist-based on NAMED keys — never a prefix rule.
 ``gen_ai.*`` is deliberately not admitted wholesale: the CLI's telemetry is
 beta, and a prefix rule is the hole a future content-carrying ``gen_ai.*``
 key would walk through (the receiver's identity denylist is the other half).
+The named keys split by MEANING: identity keys always cross under their own
+names, while the usage QUANTITIES never do — every increment demotes them
+into the ``wardex.*`` extras namespace, because no increment is ever the
+authoritative reporter of tokens (wardex's own CHAT draft is). Demoted means
+kept verbatim (nothing is silently lost) but invisible to any backend's
+``gen_ai.usage.`` prefix collector, so one LLM call is never priced twice —
+the conflicted ``llm_request``, whose tokens already ride the unmerged CHAT
+draft, is where that bit — and the CLI's underscore spellings never become
+top-level wire attributes, unconditionally rather than only on the spans the
+CLI happens to stamp usage on today.
 """
 
 from __future__ import annotations
@@ -80,19 +90,32 @@ _ALLOWED_KEYS = frozenset(
     }
 )
 
-#: The NAMED gen_ai keys the merge admits, copied under their own names.
-#: A closed list, not a prefix rule — see the module docstring.
-_ALLOWED_GEN_AI_KEYS = frozenset(
+#: The NAMED gen_ai IDENTITY keys the merge admits, always copied under
+#: their own names. A closed list, not a prefix rule — see the module
+#: docstring. Saying WHICH call a span was is safe on every span; these keys
+#: are what makes a conflicted increment findable next to its CHAT twin.
+_GEN_AI_IDENTITY_KEYS = frozenset(
     {
         "gen_ai.response.id",
         "gen_ai.response.model",
         "gen_ai.request.model",
         "gen_ai.response.finish_reasons",
+        "gen_ai.tool.call.id",
+    }
+)
+
+#: The NAMED gen_ai QUANTITY keys. Same closed-list discipline, different
+#: fate: they never keep their own names — ``allowlisted_extras`` demotes
+#: them unconditionally. Note the CLI's underscore cache spellings —
+#: semconv's dotted spellings are the ``GenAIAttributes`` encoder's, and
+#: these must NEVER reach the wire as top-level attributes
+#: (``test_otlp_codec.py`` pins the negative).
+_GEN_AI_USAGE_KEYS = frozenset(
+    {
         "gen_ai.usage.input_tokens",
         "gen_ai.usage.output_tokens",
         "gen_ai.usage.cache_read_input_tokens",
         "gen_ai.usage.cache_creation_input_tokens",
-        "gen_ai.tool.call.id",
     }
 )
 
@@ -349,20 +372,41 @@ def join_chats(
 def allowlisted_extras(attrs: dict) -> list[tuple[str, object]]:
     """The attribute pairs the merge may copy onto a wardex span.
 
-    Scalars only, keys from the two NAMED sets only: unknown keys — including
-    unknown ``gen_ai.*`` keys — are dropped and counted like everything else.
-    This is the structural PII guarantee on top of the receiver's identity
-    denylist: nothing rides through on the strength of its prefix.
+    Scalars only, keys from the three NAMED sets only: unknown keys —
+    including unknown ``gen_ai.*`` keys — are dropped and counted like
+    everything else. This is the structural PII guarantee on top of the
+    receiver's identity denylist: nothing rides through on the strength of
+    its prefix.
+
+    The usage QUANTITY keys are demoted under ``OTEL_EXTRA_PREFIX``
+    unconditionally — value preserved, spelling preserved, quoted rather
+    than asserted. No increment is ever the authoritative reporter of its
+    tokens: wardex's own CHAT draft is, whether or not this particular join
+    conflicted. A caller flag used to scope the demotion to conflicted
+    ``llm_request``s, resting on "pure increments carry no usage today" —
+    an assumption nothing pinned, and ``claude_code.compaction`` IS an LLM
+    summarization the CLI could start stamping usage on. Unconditional
+    demotion makes the module docstring's two invariants (one LLM call
+    priced once; underscore spellings never top-level) structural instead
+    of schedule-dependent. No Python touches the numbers: the
+    inclusive-total rule has ONE implementation and it is the Rust
+    constructor.
     """
     out: list[tuple[str, object]] = []
+    demoted = False
     for key, value in attrs.items():
         if not _scalar(value):
             counters.bump("adapters.anthropic.otel_bridge.attr_dropped")
             continue
-        if key in _ALLOWED_GEN_AI_KEYS:
+        if key in _GEN_AI_IDENTITY_KEYS:
             out.append((key, value))
+        elif key in _GEN_AI_USAGE_KEYS:
+            out.append((OTEL_EXTRA_PREFIX + key, value))
+            demoted = True
         elif key in _ALLOWED_KEYS:
             out.append((OTEL_EXTRA_PREFIX + key, value))
         else:
             counters.bump("adapters.anthropic.otel_bridge.attr_dropped")
+    if demoted:
+        counters.bump("adapters.anthropic.otel_bridge.usage_demoted")
     return out

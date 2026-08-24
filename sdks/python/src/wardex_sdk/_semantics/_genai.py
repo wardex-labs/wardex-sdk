@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from .._assembly import counters
 from .._enums import OperationName, ProviderName
 from .._types import GenAIAttributes
 
@@ -51,6 +52,16 @@ def identifies_llm_call(sem: Any) -> bool:
 
 def build_gen_ai(sem: Any) -> GenAIAttributes:
     """Convert LlmSemantics → GenAIAttributes."""
+    # Normalization conditions cross the FFI as VALUES (there is no
+    # Rust->Python counter channel) and are tallied here, where the
+    # diagnostics registry lives. `getattr` for the same reason as
+    # `identifies_llm_call`: hand-built doubles drive this function inside
+    # the seam's fail-open try, and the native getters are pinned by their
+    # own tests, so a default cannot mask a missing binding.
+    if getattr(sem, "usage_totals_unpaired", False):
+        counters.bump("semantics.build_gen_ai.usage_totals_unpaired")
+    if getattr(sem, "usage_overflowed", False):
+        counters.bump("semantics.build_gen_ai.usage_overflowed")
     stops = tuple(sem.stop_sequences) if sem.stop_sequences else None
     finishes = tuple(sem.finish_reasons) if sem.finish_reasons else None
     return GenAIAttributes(

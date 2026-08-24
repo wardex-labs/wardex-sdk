@@ -218,25 +218,39 @@ impl LlmSemantics {
     fn response_id(&self) -> Option<String> {
         self.inner.response_id.clone()
     }
+    /// Semconv-inclusive input total (cache tiers included), whatever the
+    /// provider's own counting convention was.
     #[getter]
     fn input_tokens(&self) -> Option<i64> {
-        self.inner.input_tokens
+        self.inner.usage.input_tokens()
     }
     #[getter]
     fn output_tokens(&self) -> Option<i64> {
-        self.inner.output_tokens
+        self.inner.usage.output_tokens()
     }
     #[getter]
     fn cache_read_input_tokens(&self) -> Option<i64> {
-        self.inner.cache_read_input_tokens
+        self.inner.usage.cache_read_input_tokens()
     }
     #[getter]
     fn cache_creation_input_tokens(&self) -> Option<i64> {
-        self.inner.cache_creation_input_tokens
+        self.inner.usage.cache_creation_input_tokens()
     }
     #[getter]
     fn reasoning_output_tokens(&self) -> Option<i64> {
-        self.inner.reasoning_output_tokens
+        self.inner.usage.reasoning_output_tokens()
+    }
+    /// A usage sub-counter arrived without the total it belongs to, so the
+    /// normative total was withheld rather than invented. Python counts this
+    /// — the Rust side has no channel to the diagnostics registry.
+    #[getter]
+    fn usage_totals_unpaired(&self) -> bool {
+        self.inner.usage.totals_unpaired()
+    }
+    /// `checked_add` failed while normalizing; the input total was withheld.
+    #[getter]
+    fn usage_overflowed(&self) -> bool {
+        self.inner.usage.overflowed()
     }
     #[getter]
     fn temperature(&self) -> Option<f64> {
@@ -602,27 +616,42 @@ impl ClaudeStreamEvent {
             .map(|t| (t.id.clone(), t.name.clone(), t.input_json.clone()))
             .collect()
     }
+    /// Semconv-inclusive input total. NOT the CLI's raw number: Anthropic
+    /// reports the cache tiers outside `input_tokens`, and this getter is
+    /// downstream of the normalization that adds them back in.
     #[getter]
     fn input_tokens(&self) -> Option<i64> {
-        self.inner.usage.as_ref().and_then(|u| u.input_tokens)
+        self.inner.usage.as_ref().and_then(|u| u.input_tokens())
     }
     #[getter]
     fn output_tokens(&self) -> Option<i64> {
-        self.inner.usage.as_ref().and_then(|u| u.output_tokens)
+        self.inner.usage.as_ref().and_then(|u| u.output_tokens())
     }
     #[getter]
     fn cache_read_tokens(&self) -> Option<i64> {
         self.inner
             .usage
             .as_ref()
-            .and_then(|u| u.cache_read_input_tokens)
+            .and_then(|u| u.cache_read_input_tokens())
     }
     #[getter]
     fn cache_creation_tokens(&self) -> Option<i64> {
         self.inner
             .usage
             .as_ref()
-            .and_then(|u| u.cache_creation_input_tokens)
+            .and_then(|u| u.cache_creation_input_tokens())
+    }
+    /// See `LlmSemantics.usage_totals_unpaired` — same condition, P3 path.
+    #[getter]
+    fn usage_totals_unpaired(&self) -> bool {
+        self.inner
+            .usage
+            .as_ref()
+            .is_some_and(|u| u.totals_unpaired())
+    }
+    #[getter]
+    fn usage_overflowed(&self) -> bool {
+        self.inner.usage.as_ref().is_some_and(|u| u.overflowed())
     }
     #[getter]
     fn num_turns(&self) -> Option<i64> {

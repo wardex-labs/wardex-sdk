@@ -24,6 +24,7 @@ from .harness import (
     RecordingTransport,
     SpanNode,
     StalledRun,
+    UsageSnapshot,
     clean_state,
     collapse_onto_root,
     exactly_one,
@@ -31,6 +32,7 @@ from .harness import (
     never_installed,
     parent_name_of,
     read_spans,
+    read_usage,
 )
 
 __all__ = [
@@ -41,6 +43,7 @@ __all__ = [
     "RecordingTransport",
     "SpanNode",
     "StalledRun",
+    "UsageSnapshot",
     "clean_state",
     "collapse_onto_root",
     "exactly_one",
@@ -48,4 +51,5 @@ __all__ = [
     "never_installed",
     "parent_name_of",
     "read_spans",
+    "read_usage",
 ]

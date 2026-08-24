@@ -4,6 +4,7 @@
 use std::io::Read;
 
 use crate::sse::{self, SseEvent};
+use crate::usage::{InputConvention, TokenUsage};
 use serde::Deserialize;
 use wardex_limits::Limits;
 
@@ -15,11 +16,9 @@ pub struct LlmSemantics {
     pub request_model: Option<String>,
     pub response_model: Option<String>,
     pub response_id: Option<String>,
-    pub input_tokens: Option<i64>,
-    pub output_tokens: Option<i64>,
-    pub cache_read_input_tokens: Option<i64>,
-    pub cache_creation_input_tokens: Option<i64>,
-    pub reasoning_output_tokens: Option<i64>,
+    /// Always semconv-inclusive — the parser that filled it named its
+    /// provider's `InputConvention`, and `TokenUsage::new` did the arithmetic.
+    pub usage: TokenUsage,
     pub temperature: Option<f64>,
     pub top_p: Option<f64>,
     pub top_k: Option<f64>,
@@ -558,11 +557,16 @@ fn fill_openai_chat(out: &mut LlmSemantics, req: &[u8], resp: &[u8]) {
             out.output_messages = build_output_messages(msgs);
         }
         if let Some(u) = r.usage {
-            out.input_tokens = u.prompt_tokens;
-            out.output_tokens = u.completion_tokens;
-            out.cache_read_input_tokens = u.prompt_tokens_details.and_then(|d| d.cached_tokens);
-            out.reasoning_output_tokens =
-                u.completion_tokens_details.and_then(|d| d.reasoning_tokens);
+            // OpenAI `prompt_tokens` already contains `cached_tokens`, and
+            // `completion_tokens` already contains the reasoning tokens.
+            out.usage = TokenUsage::new(
+                InputConvention::Inclusive,
+                u.prompt_tokens,
+                u.completion_tokens,
+                u.prompt_tokens_details.and_then(|d| d.cached_tokens),
+                None,
+                u.completion_tokens_details.and_then(|d| d.reasoning_tokens),
+            );
         }
     }
     if let Ok(q) = serde_json::from_slice::<OpenAIChatRequest>(req) {
@@ -759,10 +763,17 @@ fn fill_anthropic(out: &mut LlmSemantics, req: &[u8], resp: &[u8]) {
             out.finish_reasons = Some(vec![sr]);
         }
         if let Some(u) = r.usage {
-            out.input_tokens = u.input_tokens;
-            out.output_tokens = u.output_tokens;
-            out.cache_read_input_tokens = u.cache_read_input_tokens;
-            out.cache_creation_input_tokens = u.cache_creation_input_tokens;
+            // Anthropic reports the cache tiers OUTSIDE `input_tokens`; the
+            // semconv Anthropic provider doc requires the inclusive sum, and
+            // `ExcludesCache` is that requirement made unskippable.
+            out.usage = TokenUsage::new(
+                InputConvention::ExcludesCache,
+                u.input_tokens,
+                u.output_tokens,
+                u.cache_read_input_tokens,
+                u.cache_creation_input_tokens,
+                None,
+            );
         }
         if out.output_messages.is_none() {
             let mut parts: Vec<serde_json::Value> = Vec::new();
@@ -846,7 +857,14 @@ fn fill_openai_embeddings(out: &mut LlmSemantics, resp: &[u8]) {
     if let Ok(r) = serde_json::from_slice::<OpenAIEmbeddingsResponse>(resp) {
         out.response_model = r.model;
         if let Some(u) = r.usage {
-            out.input_tokens = u.prompt_tokens;
+            out.usage = TokenUsage::new(
+                InputConvention::Inclusive,
+                u.prompt_tokens,
+                None,
+                None,
+                None,
+                None,
+            );
         }
     }
 }
@@ -1308,9 +1326,9 @@ mod tests {
         assert_eq!(s.operation, "chat");
         assert_eq!(s.response_model.as_deref(), Some("gpt-4o-mini-2024-07-18"));
         assert_eq!(s.response_id.as_deref(), Some("chatcmpl-abc"));
-        assert_eq!(s.input_tokens, Some(12));
-        assert_eq!(s.output_tokens, Some(3));
-        assert_eq!(s.reasoning_output_tokens, Some(1));
+        assert_eq!(s.usage.input_tokens(), Some(12));
+        assert_eq!(s.usage.output_tokens(), Some(3));
+        assert_eq!(s.usage.reasoning_output_tokens(), Some(1));
         assert_eq!(s.finish_reasons.as_deref(), Some(&["stop".to_string()][..]));
         // request params
         assert_eq!(s.request_model.as_deref(), Some("gpt-4o-mini"));
@@ -1381,9 +1399,11 @@ mod tests {
         assert_eq!(s.provider, "anthropic");
         assert_eq!(s.operation, "chat");
         assert_eq!(s.response_model.as_deref(), Some("claude-opus-4-8"));
-        assert_eq!(s.input_tokens, Some(12));
-        assert_eq!(s.output_tokens, Some(3));
-        assert_eq!(s.cache_read_input_tokens, Some(4));
+        // Inclusive total: raw 12 + cache_read 4. That this asserted 12 —
+        // and passed — was the defect's evidence (R2).
+        assert_eq!(s.usage.input_tokens(), Some(16));
+        assert_eq!(s.usage.output_tokens(), Some(3));
+        assert_eq!(s.usage.cache_read_input_tokens(), Some(4));
         assert_eq!(
             s.finish_reasons.as_deref(),
             Some(&["end_turn".to_string()][..])
@@ -1401,8 +1421,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(s.operation, "embeddings");
-        assert_eq!(s.input_tokens, Some(8));
-        assert_eq!(s.output_tokens, None);
+        assert_eq!(s.usage.input_tokens(), Some(8));
+        assert_eq!(s.usage.output_tokens(), None);
     }
 
     #[test]
@@ -1417,7 +1437,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(oa.provider, "openai");
-        assert_eq!(oa.input_tokens, Some(12));
+        assert_eq!(oa.usage.input_tokens(), Some(12));
         let an = parse_llm(
             "127.0.0.1",
             "/v1/messages",
@@ -1427,7 +1447,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(an.provider, "anthropic");
-        assert_eq!(an.input_tokens, Some(12));
+        // ANTHROPIC_MSG reports raw 12 + cache_read 4 — inclusive total 16.
+        assert_eq!(an.usage.input_tokens(), Some(16));
     }
 
     #[test]
@@ -1460,7 +1481,7 @@ mod tests {
             Limits::default(),
         )
         .unwrap();
-        assert_eq!(s.input_tokens, Some(12)); // parsed after decompression
+        assert_eq!(s.usage.input_tokens(), Some(12)); // parsed after decompression
         assert_eq!(s.decoded_response.as_deref(), Some(OPENAI_CHAT)); // decoded body stored
     }
 
@@ -1504,9 +1525,10 @@ mod tests {
             Limits::default(),
         )
         .unwrap();
-        assert_eq!(s.cache_creation_input_tokens, Some(7));
-        assert_eq!(s.input_tokens, Some(5));
-        assert_eq!(s.output_tokens, Some(2));
+        assert_eq!(s.usage.cache_creation_input_tokens(), Some(7));
+        // Inclusive total: raw 5 + cache_creation 7 (R2).
+        assert_eq!(s.usage.input_tokens(), Some(12));
+        assert_eq!(s.usage.output_tokens(), Some(2));
     }
 
     #[test]
@@ -1549,7 +1571,7 @@ mod tests {
         assert_eq!(s.response_model.as_deref(), Some("gpt-4o-mini"));
         assert_eq!(s.response_id.as_deref(), Some("chatcmpl-s"));
         assert_eq!(s.finish_reasons.as_deref(), Some(&["stop".to_string()][..]));
-        assert_eq!(s.output_tokens, None); // no usage
+        assert_eq!(s.usage.output_tokens(), None); // no usage
         let body = String::from_utf8(s.decoded_response.clone().unwrap()).unwrap();
         assert!(body.contains("\"content\":\"Hi!\"")); // text reassembled into the synthetic JSON
     }
@@ -1565,8 +1587,8 @@ mod tests {
             Limits::default(),
         )
         .unwrap();
-        assert_eq!(s.input_tokens, Some(11));
-        assert_eq!(s.output_tokens, Some(2));
+        assert_eq!(s.usage.input_tokens(), Some(11));
+        assert_eq!(s.usage.output_tokens(), Some(2));
     }
 
     #[test]
@@ -1583,14 +1605,41 @@ mod tests {
         assert_eq!(s.provider, "anthropic");
         assert!(s.reassembled_from_stream);
         assert_eq!(s.response_model.as_deref(), Some("claude-opus-4-8"));
-        assert_eq!(s.input_tokens, Some(9));
-        assert_eq!(s.output_tokens, Some(5)); // message_delta provides the final output_tokens
+        assert_eq!(s.usage.input_tokens(), Some(9));
+        assert_eq!(s.usage.output_tokens(), Some(5)); // message_delta provides the final output_tokens
         assert_eq!(
             s.finish_reasons.as_deref(),
             Some(&["end_turn".to_string()][..])
         );
         let body = String::from_utf8(s.decoded_response.clone().unwrap()).unwrap();
         assert!(body.contains("\"text\":\"Hello\""));
+    }
+
+    /// P2 double-add guard: `reassemble_anthropic` keeps the RAW usage in its
+    /// synthetic JSON and `fill_anthropic` does the one and only inclusive
+    /// sum. If the reassembler ever pre-adds the cache tiers, this total
+    /// doubles and the test names the reason.
+    #[test]
+    fn test_reassembled_stream_is_not_double_added() {
+        let sse = b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_s\",\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":1000,\"output_tokens\":1,\"cache_read_input_tokens\":8000,\"cache_creation_input_tokens\":2000}}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"Hi\"}}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":500}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+        let s = parse_llm(
+            "api.anthropic.com",
+            "/v1/messages",
+            b"{}",
+            sse,
+            Limits::default(),
+        )
+        .unwrap();
+        assert!(s.reassembled_from_stream);
+        // Exactly once: 1000 + 8000 + 2000, not 11000 + 10000.
+        assert_eq!(s.usage.input_tokens(), Some(11000));
+        assert_eq!(s.usage.cache_read_input_tokens(), Some(8000));
+        assert_eq!(s.usage.cache_creation_input_tokens(), Some(2000));
+        assert_eq!(s.usage.output_tokens(), Some(500));
+        // The synthetic body still carries Anthropic's RAW value — the wire
+        // truth is preserved and the sum happens in exactly one place.
+        let body = String::from_utf8(s.decoded_response.clone().unwrap()).unwrap();
+        assert!(body.contains("\"input_tokens\":1000"));
     }
 
     #[test]
@@ -1616,7 +1665,7 @@ mod tests {
         )
         .unwrap();
         assert!(!s.reassembled_from_stream);
-        assert_eq!(s.input_tokens, Some(12));
+        assert_eq!(s.usage.input_tokens(), Some(12));
     }
 
     #[test]

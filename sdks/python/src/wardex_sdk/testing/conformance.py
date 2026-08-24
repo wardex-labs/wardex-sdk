@@ -59,12 +59,14 @@ from .._enums import AdapterName
 from .harness import (
     AdapterSubject,
     SpanNode,
+    UsageSnapshot,
     collapse_onto_root,
     exactly_one,
     installed_adapter,
     never_installed,
     parent_name_of,
     read_spans,
+    read_usage,
 )
 
 #: The methods an adapter's causal surface may open a span through. `rejoin` is
@@ -101,6 +103,7 @@ class AdapterConformanceSuite:
         "check_the_causal_chain_holds_by_span_id",
         "check_a_collapsed_tree_fails_this_suite",
         "check_every_span_site_declares_its_placement",
+        "check_usage_totals_are_inclusive",
         "check_close_units_ships_the_open_run_and_stays_installed",
         "check_uninstall_ships_the_open_run_and_never_raises_into_the_host",
     )
@@ -316,6 +319,111 @@ class AdapterConformanceSuite:
             subject.workload(live)
             return read_spans(live.spans)
 
+    # -- usage ---------------------------------------------------------------
+
+    def check_usage_totals_are_inclusive(self) -> None:
+        """Usage totals include their sub-counters, and only the gen_ai block
+        carries them.
+
+        Scoped by what a span CARRIES, not by intent: the spans defect B/D
+        lived on are EXECUTE_STEP increments, not CHATs, so an intent scope
+        would look exactly past the hole this check closes.
+
+        The subject's `usage_expected` declaration is compared against the
+        observation in BOTH directions, so the inclusivity assertions can
+        never green on an empty set: expected-and-absent fails (the workload
+        proved nothing), unexpected-and-present fails (usage shipped with no
+        declared convention).
+        """
+        usages = read_usage(self._observe_spans())
+        carriers = [usage for usage in usages if _carries_usage(usage)]
+
+        # 1) No adapter leaks gen_ai usage into top-level extras — the
+        #    conformance form of the bridge's spelling/double-billing defects.
+        for usage in usages:
+            assert usage.gen_ai_usage_extras == (), (
+                f"{usage.span_name!r} carries {usage.gen_ai_usage_extras} as top-level "
+                "extras. gen_ai usage belongs in the gen_ai block, where its "
+                "inclusivity convention is declared; an extras copy is a second "
+                "spelling of one fact, and a backend prices both."
+            )
+
+        # 2) Non-vacuity: declaration and observation must agree, in both
+        #    directions, for each of the three declarable states. The value is
+        #    validated first: a typo would otherwise silently read as one of
+        #    the branches below, which is the silent opt-out the field's
+        #    no-default rule exists to prevent.
+        expected = self._subject.usage_expected
+        assert expected in ("none", "totals", "cache_tiers"), (
+            f"usage_expected={expected!r} is not a declaration this suite "
+            'knows; declare "none", "totals" or "cache_tiers".'
+        )
+        if expected == "none":
+            assert carriers == [], (
+                f'this subject declares usage_expected="none" but '
+                f"{[usage.span_name for usage in carriers]} carried gen_ai usage — "
+                "an undeclared inclusivity convention."
+            )
+        else:
+            assert carriers != [], (
+                f"this subject declares usage_expected={expected!r} but no span "
+                "carried gen_ai usage, so the inclusivity assertions below "
+                "proved nothing. Give the workload (or the stalled run) a "
+                'usage-carrying turn, or declare usage_expected="none".'
+            )
+            if expected == "cache_tiers":
+                # `is not None`, not truthiness: an honestly reported 0 —
+                # routine on a cold turn — is a present tier.
+                assert any(
+                    usage.cache_read_input_tokens is not None
+                    or usage.cache_creation_input_tokens is not None
+                    for usage in carriers
+                ), (
+                    'this subject declares usage_expected="cache_tiers" but no '
+                    "span carried a cache tier, so the input half of the "
+                    "inclusivity check below proved nothing. Give the workload "
+                    "(or the stalled run) a turn with cache tokens, or declare "
+                    'usage_expected="totals".'
+                )
+
+        # 3) The invariant itself.
+        for usage in carriers:
+            if usage.input_tokens is not None:
+                tiers = (usage.cache_read_input_tokens or 0) + (
+                    usage.cache_creation_input_tokens or 0
+                )
+                assert usage.input_tokens >= tiers, (
+                    f"{usage.span_name!r}: input_tokens={usage.input_tokens} is below "
+                    f"its own cache tiers ({tiers}) — a provider-raw exclusive value "
+                    "shipped under the semconv-inclusive key"
+                )
+            if usage.output_tokens is not None:
+                assert usage.output_tokens >= (usage.reasoning_output_tokens or 0), (
+                    f"{usage.span_name!r}: output_tokens={usage.output_tokens} is below "
+                    f"reasoning_output_tokens={usage.reasoning_output_tokens}"
+                )
+
+    def _observe_spans(self) -> list:
+        """Raw shipped spans (`InternalSpan`), not `SpanNode`s.
+
+        `read_spans` is bypassed ON PURPOSE: usage is not part of what a
+        causal claim is made of, and widening `SpanNode` for one check would
+        widen what every existing check reads.
+
+        The observation is the workload AND the stalled run (shipped by the
+        teardown): a usage-carrying `chat` span publishes no correlation
+        claim by design, so it can never appear in the declared causal tree
+        the workload feeds `_assert_tiers` — the stalled run is where a
+        subject stages its usage-carrying turn.
+        """
+        subject = self._subject
+        with installed_adapter(subject.factory) as live:
+            subject.workload(live)
+            stalled = subject.stall(live)
+            live.teardown()
+            stalled.resume()
+            return list(live.spans)
+
     def _assert_tiers(self, nodes: Sequence[SpanNode]) -> None:
         subject = self._subject
         declared = {name for chain in subject.chains for name in chain}
@@ -444,6 +552,18 @@ class AdapterConformanceSuite:
             f"{root!r} shipped without {marker}, so nothing downstream can tell it "
             f"from a run that ended normally; it carries {list(shipped[0].limitations)}"
         )
+
+
+def _carries_usage(usage: UsageSnapshot) -> bool:
+    """Whether a span reports usage anywhere a backend would read it."""
+    return (
+        usage.input_tokens is not None
+        or usage.output_tokens is not None
+        or usage.cache_read_input_tokens is not None
+        or usage.cache_creation_input_tokens is not None
+        or usage.reasoning_output_tokens is not None
+        or usage.gen_ai_usage_extras != ()
+    )
 
 
 def _declares_placement(site: ast.Call) -> bool:

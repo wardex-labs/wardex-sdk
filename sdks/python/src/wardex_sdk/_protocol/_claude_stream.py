@@ -24,10 +24,15 @@ class AgentStreamEvent:
     task_tool_use_id: str | None = None
     content_json: bytes | None = None
     tool_uses: tuple[tuple[str, str, bytes], ...] = ()
+    #: Semconv-inclusive (cache tiers added back in by the native parser).
     input_tokens: int | None = None
     output_tokens: int | None = None
     cache_read_tokens: int | None = None
     cache_creation_tokens: int | None = None
+    #: A usage sub-counter arrived without its total; the total is None, not
+    #: invented — the assembler counts the condition.
+    usage_totals_unpaired: bool = False
+    usage_overflowed: bool = False
     num_turns: int | None = None
     total_cost_usd: float | None = None
     duration_ms: int | None = None
@@ -57,6 +62,8 @@ def parse_line(data: bytes, outbound: bool) -> AgentStreamEvent | None:
         output_tokens=raw.output_tokens,
         cache_read_tokens=raw.cache_read_tokens,
         cache_creation_tokens=raw.cache_creation_tokens,
+        usage_totals_unpaired=raw.usage_totals_unpaired,
+        usage_overflowed=raw.usage_overflowed,
         num_turns=raw.num_turns,
         total_cost_usd=raw.total_cost_usd,
         duration_ms=raw.duration_ms,
