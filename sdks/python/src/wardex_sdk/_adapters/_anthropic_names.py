@@ -199,14 +199,19 @@ class McpToolCatalog:
 
         No trim, deliberately. The only writer of `_handles` is `handle_for`,
         whose only production caller is the `create_sdk_mcp_server` wrapper the
-        adapter installs — and `install()` is single-shot, reachable a second
-        time only through `uninstall()`, whose last statement clears this
-        table. So this method is only ever called on an EMPTY one. Even if that
-        stopped holding, `handle_for`'s own `while len(self._handles) >=
-        self._max` loop converges on the next registration; trimming here would
-        only move the same eviction earlier, under a counter whose published
-        meaning (the README's "Resource limits" section) is overflow, not
-        re-binding.
+        adapter installs. `install()` is single-shot, reachable a second time
+        only through `uninstall()`, which runs `restore_all()` before it clears
+        this table — so in the ordinary cycle this method sees an EMPTY table.
+        Not on every path, though: a host that bound the wrapper directly
+        (`from claude_agent_sdk import create_sdk_mcp_server` after
+        `wardex.init()`) keeps that binding across `restore_all()`, and the
+        wrapper carries no installed-gate, so a call between the uninstall and
+        the next install registers handles into a table this method then finds
+        non-empty. The no-trim decision therefore rests on `handle_for` itself:
+        its `while len(self._handles) >= self._max` loop converges on the next
+        registration, under a counter whose published meaning (the README's
+        "Resource limits" section) is overflow — which an over-full table is.
+        Trimming here would only move the same eviction earlier.
         """
         with self._lock:
             self._max = max_entries

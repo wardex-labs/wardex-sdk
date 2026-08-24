@@ -723,13 +723,14 @@ class AnthropicAgentSdkAdapter(AdapterInterface):
         resolved = lim.resolved()
         # The tool catalog is built in `__init__`, before there is a client, so
         # this is where the host's bound reaches it. BEFORE the
-        # `create_sdk_mcp_server` patch below, and that ordering is the whole
-        # correctness argument for not trimming in `apply_bound`: the wrapper
-        # this adapter installs is the only thing that ever registers a handle,
-        # so while the patch is not yet in place the table cannot grow, and the
-        # new ceiling therefore applies to an empty table. Install the patch
-        # first and a host thread calling `create_sdk_mcp_server()` in between
-        # registers handles against the OLD ceiling.
+        # `create_sdk_mcp_server` patch below: install the patch first and a
+        # host thread calling `create_sdk_mcp_server()` in between registers
+        # handles against the OLD ceiling. On a FIRST install this ordering
+        # also means the new ceiling lands on a table nothing has written yet;
+        # on a re-install it cannot promise that — a wrapper the host bound
+        # directly survives `restore_all()` and may have registered handles
+        # since the uninstall. `apply_bound` documents why a non-empty table is
+        # safe without a trim.
         self._names.apply_bound(**limits_kwargs(LimitsConsumer.MCP_TOOL_CATALOG, resolved))
 
         # (3) in-process custom tools: run each handler inside a CALL unit whose
@@ -757,8 +758,8 @@ class AnthropicAgentSdkAdapter(AdapterInterface):
 
             # The bound above is already on the catalog when this lands, and
             # that order is load-bearing (see `apply_bound`): this wrapper is
-            # the table's only writer, so binding first means the new ceiling
-            # applies to a table nothing can have filled yet.
+            # the table's only writer, so binding first means no registration
+            # this install enables can land against a stale ceiling.
             self._patches.patch(sdk, "create_sdk_mcp_server", create_sdk_mcp_server)
 
         # The adapter's own options — the first real `ctx.options` consumer.
