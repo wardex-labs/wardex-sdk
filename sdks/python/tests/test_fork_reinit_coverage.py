@@ -103,6 +103,13 @@ _FORK_EXEMPT: dict[tuple[str, str], str] = {
     # -- signal dispositions cross the fork with the signal table itself; the
     #    child's handlers are as installed as the parent's (design §3.8).
     ("_runtime.py", "_prev_handlers"): "signal dispositions survive fork by design (§3.8)",
+    # -- the owner-typed scan counts a lock at its allocation site AND at the
+    #    site holding the instance; this is the one same-module double count.
+    ("_runtime.py", "_RUNTIME"): (
+        "the singleton whose own after_in_child replaces the lock this site "
+        "would otherwise strand; the allocation site inside Runtime is the "
+        "covered one, and this name is the object that owns the reset"
+    ),
 }
 
 
@@ -122,6 +129,48 @@ def _is_lock_call(value: ast.expr) -> bool:
     return isinstance(func, ast.Name) and func.id in _LOCK_FACTORIES
 
 
+def _lock_owning_classes(trees: list[ast.Module]) -> frozenset[str]:
+    """Every src class whose `__init__` allocates a threading primitive.
+
+    Computed from the same AST pass, not hand-kept: `PatchSet` is the case
+    that motivated this (`self._patches = PatchSet(...)` matched neither a
+    lock literal nor an empty container, so four unwired PatchSet holders
+    passed the declaration scan while their locks crossed the fork), and a
+    list would rot the day the next lock-owning helper type lands. One
+    level deep on purpose: a class owning such a CLASS shows up because its
+    own `__init__` contains the owner call, which `_holder_sites` records
+    as a lock site inside that class's module.
+    """
+    owners: set[str] = set()
+    for tree in trees:
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ClassDef):
+                continue
+            inits = [
+                n for n in node.body if isinstance(n, ast.FunctionDef) and n.name == "__init__"
+            ]
+            for init in inits:
+                for sub in ast.walk(init):
+                    value = getattr(sub, "value", None)
+                    if (
+                        isinstance(sub, (ast.Assign, ast.AnnAssign))
+                        and value is not None
+                        and _is_lock_call(value)
+                    ):
+                        owners.add(node.name)
+    return frozenset(owners)
+
+
+def _is_lock_owner_call(value: ast.expr, owners: frozenset[str]) -> bool:
+    """A constructor call of a type whose instances own a threading lock."""
+    if not isinstance(value, ast.Call):
+        return False
+    func = value.func
+    if isinstance(func, ast.Attribute):
+        return func.attr in owners
+    return isinstance(func, ast.Name) and func.id in owners
+
+
 def _is_empty_container(value: ast.expr) -> bool:
     if isinstance(value, ast.Dict) and not value.keys:
         return True
@@ -136,12 +185,14 @@ def _is_empty_container(value: ast.expr) -> bool:
     )
 
 
-def _holder_sites(tree: ast.Module) -> list[tuple[str, str]]:
+def _holder_sites(tree: ast.Module, owners: frozenset[str] = frozenset()) -> list[tuple[str, str]]:
     """Every (attr, kind) holder allocation in one module.
 
     Attribute targets (`self.x = ...`, `obj.x = ...`) and module-global
     names; bare locals are frames, not process state. `kind` is "lock" or
-    "table".
+    "table". A constructor call of a lock-owning SDK type (`owners`) is a
+    lock site too — the lock exists just as surely when `PatchSet()`
+    allocates it as when `threading.RLock()` does.
     """
     sites: list[tuple[str, str]] = []
 
@@ -159,7 +210,7 @@ def _holder_sites(tree: ast.Module) -> list[tuple[str, str]]:
         def _record(self, targets: list[ast.expr], value: ast.expr | None) -> None:
             if value is None:
                 return
-            if _is_lock_call(value):
+            if _is_lock_call(value) or _is_lock_owner_call(value, owners):
                 kind = "lock"
             elif _is_empty_container(value):
                 kind = "table"
@@ -243,12 +294,18 @@ def _reset_mentioned_names(tree: ast.Module) -> set[str]:
 def _scan(src: pathlib.Path) -> list[str]:
     """Every holder site not covered by a reset path or an exemption."""
     violations: list[str] = []
+    parsed: list[tuple[str, ast.Module]] = []
     for path in sorted(src.rglob("*.py")):
         rel = path.relative_to(src).as_posix()
         if rel.startswith("testing/"):
             continue  # test doubles hold a test's state, not the SDK's
-        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-        sites = _holder_sites(tree)
+        parsed.append((rel, ast.parse(path.read_text(encoding="utf-8"), filename=str(path))))
+    # Owners are computed over the whole root FIRST: the class that owns the
+    # lock (`PatchSet`) and the module that instantiates it are usually not
+    # the same file.
+    owners = _lock_owning_classes([tree for _, tree in parsed])
+    for rel, tree in parsed:
+        sites = _holder_sites(tree, owners)
         if not sites:
             continue
         covered = _reset_mentioned_names(tree)
@@ -310,6 +367,40 @@ def test_the_scan_can_see_an_unwired_lock(tmp_path):
     ], flagged
 
 
+def test_the_scan_can_see_an_unwired_indirectly_owned_lock(tmp_path):
+    """The row-Q regression shape: `self._patches = PatchSet(...)` is a lock
+    allocation as surely as `threading.RLock()` is, but it matched neither
+    scanner predicate — which is how four unwired PatchSet holders shipped.
+    Plant one unwired and one wired indirect holder (owner class defined in
+    a DIFFERENT module, as in the real tree) and watch exactly the unwired
+    one get flagged."""
+    fake = tmp_path / "src"
+    fake.mkdir()
+    (fake / "patchset.py").write_text(
+        "import threading\n"
+        "class FakePatchSet:\n"
+        "    def __init__(self, owner):\n"
+        "        self._lock = threading.RLock()\n"
+        "    def _at_fork_reinit(self):\n"
+        "        self._lock = threading.RLock()\n",
+        encoding="utf-8",
+    )
+    (fake / "holders.py").write_text(
+        "from patchset import FakePatchSet\n"
+        "class Unwired:\n"
+        "    def __init__(self):\n"
+        "        self._patches = FakePatchSet('unwired')\n"
+        "class Wired:\n"
+        "    def __init__(self):\n"
+        "        self._pset = FakePatchSet('wired')\n"
+        "    def _at_fork_reinit(self):\n"
+        "        self._pset._at_fork_reinit()\n",
+        encoding="utf-8",
+    )
+    flagged = _scan(fake)
+    assert flagged == ["holders.py: _patches (lock)"], flagged
+
+
 def test_a_module_with_no_reset_path_at_all_is_flagged(tmp_path):
     """The exact shape a NEW subsystem lands in: state, no reset function.
     The scan may not read 'no reset path' as 'nothing to check'."""
@@ -327,12 +418,15 @@ def test_every_exemption_still_names_a_real_site():
     """An exemption for code that is gone is a hole the next holder of the
     same name walks through unexamined."""
     live: set[tuple[str, str]] = set()
+    parsed: list[tuple[str, ast.Module]] = []
     for path in sorted(_SRC.rglob("*.py")):
         rel = path.relative_to(_SRC).as_posix()
         if rel.startswith("testing/"):
             continue
-        tree = ast.parse(path.read_text(encoding="utf-8"))
-        for attr, _kind in _holder_sites(tree):
+        parsed.append((rel, ast.parse(path.read_text(encoding="utf-8"))))
+    owners = _lock_owning_classes([tree for _, tree in parsed])
+    for rel, tree in parsed:
+        for attr, _kind in _holder_sites(tree, owners):
             live.add((rel, attr))
     stale = sorted(k for k in _FORK_EXEMPT if k not in live)
     assert stale == [], f"exemptions for sites that no longer exist: {stale}"
