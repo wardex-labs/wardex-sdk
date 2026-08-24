@@ -7,6 +7,63 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- **Forked children no longer re-export the parent's pre-fork buffer.** In a
+  prefork deployment (gunicorn/uWSGI/celery `--preload`), every worker
+  inherited the master's buffered spans and its lazily-respawned batch
+  worker shipped them again — N+1 copies of each span, read downstream as a
+  token spike the application never had. The SDK now registers an
+  `os.register_at_fork` child hook (the child hook ONLY: the host's
+  `os.fork()` never waits on wardex) that discards the inherited buffer —
+  the parent owns and exports it, so each span ships exactly once — and
+  replaces every SDK lock instead of acquiring any, so a fork landing
+  mid-export, mid-teardown or mid-report leaves nothing the child could
+  hang on. Sessions, units, tool catalogs and per-connection tracking reset
+  the same way, without emitting; monkeypatches and install records are
+  kept (they crossed the fork and still work). The README's "duplicates
+  are possible" limitation is deleted, not documented around.
+- **A child of an OTel-bridged parent no longer hangs on exit.** With
+  `otel_bridge=True` in the parent, the child's ordinary exit (atexit →
+  teardown → bridge close) waited forever on a `socketserver.shutdown()`
+  event only the serve loop's thread — which does not survive a fork — can
+  set. The fork hook severs both bridge references and closes the child's
+  copy of the bound fd via the new child-safe teardown (`server_close()`
+  only), which also ends the fd sharing that scattered the CLI's OTLP
+  POSTs randomly between parent and child.
+- **A `multiprocessing` fork child's tail is no longer silently lost.** Such
+  a child exits through `os._exit` — atexit never runs — so spans below the
+  flush threshold vanished with no marker and no counter
+  (`maxtasksperchild=1` lost every span of every task). The child hook now
+  plants a `multiprocessing.util.Finalize` flush, which runs in
+  `BaseProcess._bootstrap`'s finally, strictly before `os._exit`. A
+  hand-rolled `os.fork()` + `os._exit()` child remains out of reach by
+  construction; the README prescribes `wardex.flush()` there.
+
+### Added
+
+- **`process.pid` on every envelope, stamped live at drain time.**
+  `ResourceInfo` gains `process_pid` (proto field 4, additive), mapped to
+  the OTLP resource attribute `process.pid` when stamped. Live per batch —
+  never cached — so it is correct in every process by construction,
+  including a fork child before its hook ran and platforms where no hook
+  runs; a parent and its forked children are distinguishable at the
+  backend. (OTel Python stamps its resource pid once at construction, so a
+  forked child exports under the parent's pid — that gap is closed here.)
+- **New limitation marker `tracking_reset_at_fork` (vocabulary 45).** The
+  first span assembled on a connection that crossed an `os.fork()` says its
+  tracking state was reset — parsing may have begun mid-stream, and the
+  timing/stream fields' origin is younger than the connection. Once per
+  connection, and deliberately NOT `connection_evicted`: that marker names
+  the `max_connections` knob, while this one names a process event no
+  limits field can prevent. The discarded parent-owned buffer carries no
+  marker anywhere — nothing was lost; it ships from the process that owns
+  it.
+- **Transports may declare `at_fork_child()`.** A duck-typed extension
+  point the fork hook calls in the child under the SDK's guard: wardex
+  cannot rebuild a third-party transport's connection pool (a pooled
+  `requests.Session` shares live TCP sockets with the parent after a fork),
+  and only the transport knows how. The built-in transports hold no
+  per-request state and do not implement it.
+
 - **The OpenAI Responses API was invisible — and streams were worse than
   invisible.** The openai-agents SDK calls `POST /v1/responses` by default
   (one `Runner.run` turn is one Responses call), and wardex had no row for

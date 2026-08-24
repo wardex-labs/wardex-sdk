@@ -5,10 +5,17 @@ interval elapsed, wake() (buffer size threshold), or stop(). The loop survives
 drain exceptions — an observability SDK must never crash the app, and the
 worker must never die (design §10).
 
-Fork recovery (design §8, Sentry-style PID check): start() records the PID the
-thread was created in; ensure_alive() lazily respawns the thread when the
-recorded PID no longer matches (we are in a forked child) or the thread died.
-No code runs at fork time, which sidesteps fork-safety traps entirely.
+Fork posture, two layers. The PRIMARY path is the SDK's
+`os.register_at_fork(after_in_child=...)` hook: it calls `_at_fork_reinit()`
+in the child, which replaces this worker's lock and Event (an inherited lock
+can arrive held by a thread that did not cross the fork) and nulls the thread
+slots. Respawn stays LAZY — no thread is started at fork time, so a child
+that never captures (the fork+exec shell-out, the short-lived mp worker)
+never pays for one; the next capture's `ensure_alive()` brings it back. The
+BACKSTOP is the PID check: `start()` records the PID the thread was created
+in, and `ensure_alive()` respawns when it no longer matches or the thread
+died — which self-heals even where the hook never ran (uWSGI runs only the
+child hook; a hypothetical embedding might run none).
 """
 
 from __future__ import annotations
