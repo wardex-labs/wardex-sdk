@@ -359,7 +359,7 @@ def _calls_sink(rel: str, tree: ast.Module):
         return (
             isinstance(node, ast.Call)
             and isinstance(node.func, ast.Attribute)
-            and node.func.attr in ("capture_span", "capture_snapshot")
+            and node.func.attr in ("capture_span", "capture_snapshot", "capture_deferred")
         )
 
     return predicate
@@ -1253,7 +1253,14 @@ _CS5_BUDGET = {
     "_adapters/_assembler.py": 3,
     "_adapters/_sink.py": 1,
     "_interceptors/_mcp_stdio.py": 2,
-    "_interceptors/_seam.py": 2,
+    # 2 -> 3: `capture_deferred` is a THIRD door into the client sink — a
+    # new door, not a discount. It carries the same reentrancy stakes the
+    # rule text names (a span can skip the gate and the shared policy, and
+    # the call can be reached holding an SDK lock), and design §4.11 already
+    # promises more producers (MCP stdio, _otel_merge, an AdapterContext
+    # wrapper) — each of which must land HERE, as a counted budget change,
+    # not silently.
+    "_interceptors/_seam.py": 3,
 }
 
 
