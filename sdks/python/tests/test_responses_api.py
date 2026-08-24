@@ -232,6 +232,16 @@ def test_responses_error_response_is_a_chat_span_with_request_identity(fake_ssl_
     assert sp.error_type == "429"
     assert sp.gen_ai is not None
     assert sp.gen_ai.request_model == "gpt-4.1"
+    # The refused span claims NOTHING about the response half — the same
+    # contract the Anthropic pin makes in test_llm_error_spans.py. A bare
+    # error envelope deserializes as a field-defaulted Response, and before
+    # this was pinned the parser fabricated `status=failed`,
+    # `finish_reasons=["error"]` and an empty assistant output message out
+    # of a body that contains none of them.
+    extras = dict(sp.extra)
+    assert "gen_ai.output.messages" not in extras
+    assert sp.gen_ai.response_status is None
+    assert sp.gen_ai.finish_reasons is None
 
 
 def test_count_tokens_is_not_a_chat_call():

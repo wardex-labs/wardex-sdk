@@ -110,6 +110,18 @@ pub(super) fn fill_openai_responses(
     bounds: UsageBounds,
 ) {
     if let Ok(r) = serde_json::from_slice::<ResponsesResponse>(resp) {
+        // A Response object, or a bare error envelope? Every field here is
+        // `#[serde(default)]`, so the plain HTTP-error body `{"error":{...}}`
+        // — what every 4xx/5xx from `/v1/responses` carries — deserializes
+        // too, with no id, no status and no output. A response half derived
+        // from it would be fabricated: `status="failed"`,
+        // `finish_reasons=["error"]` and an empty assistant output message
+        // the provider never sent. The sibling endpoints ship an HTTP error
+        // with the response half EMPTY (`test_llm_error_spans` pins it), and
+        // this endpoint does the same. The SSE synthetic body and every real
+        // terminal snapshot DO carry id/status/output, so the in-stream
+        // `error` event still maps to `failed` below.
+        let is_response_object = r.id.is_some() || r.status.is_some() || !r.output.is_empty();
         out.response_id = r.id;
         out.response_model = r.model;
         if let Some(v) = r.service_tier {
@@ -141,38 +153,42 @@ pub(super) fn fill_openai_responses(
         }
         // status -> finish_reasons, all through the one normalizer. An
         // `error` object is the provider's own failure declaration and wins
-        // over whatever raw status the (possibly synthetic) body carried.
-        let finish: Option<String> = if r.error.is_some() {
-            out.response_status = Some("failed".to_string());
-            Some(normalize_finish_reason("openai", "failed"))
-        } else {
-            out.response_status = r.status.clone();
-            match r.status.as_deref() {
-                Some("completed") => Some(if has_client_tool_call {
-                    normalize_finish_reason("openai", "tool_calls")
-                } else {
-                    normalize_finish_reason("openai", "stop")
-                }),
-                Some("incomplete") => r
-                    .incomplete_details
-                    .as_ref()
-                    .and_then(|d| d.get("reason"))
-                    .and_then(|x| x.as_str())
-                    .map(|reason| normalize_finish_reason("openai", reason)),
-                Some("failed") | Some("cancelled") => {
-                    Some(normalize_finish_reason("openai", "failed"))
+        // over whatever raw status the (possibly synthetic) body carried —
+        // but only on a body that IS a Response object (see above): a bare
+        // error envelope gets no response half at all.
+        if is_response_object {
+            let finish: Option<String> = if r.error.is_some() {
+                out.response_status = Some("failed".to_string());
+                Some(normalize_finish_reason("openai", "failed"))
+            } else {
+                out.response_status = r.status.clone();
+                match r.status.as_deref() {
+                    Some("completed") => Some(if has_client_tool_call {
+                        normalize_finish_reason("openai", "tool_calls")
+                    } else {
+                        normalize_finish_reason("openai", "stop")
+                    }),
+                    Some("incomplete") => r
+                        .incomplete_details
+                        .as_ref()
+                        .and_then(|d| d.get("reason"))
+                        .and_then(|x| x.as_str())
+                        .map(|reason| normalize_finish_reason("openai", reason)),
+                    Some("failed") | Some("cancelled") => {
+                        Some(normalize_finish_reason("openai", "failed"))
+                    }
+                    _ => None, // queued | in_progress | absent: not finished
                 }
-                _ => None, // queued | in_progress | absent: not finished
+            };
+            if let Some(f) = &finish {
+                out.finish_reasons = Some(vec![f.clone()]);
             }
-        };
-        if let Some(f) = &finish {
-            out.finish_reasons = Some(vec![f.clone()]);
-        }
-        if out.output_messages.is_none() {
-            out.output_messages = build_output_messages(vec![OutMsg {
-                parts,
-                finish_reason: finish,
-            }]);
+            if out.output_messages.is_none() {
+                out.output_messages = build_output_messages(vec![OutMsg {
+                    parts,
+                    finish_reason: finish,
+                }]);
+            }
         }
     }
     if let Ok(q) = serde_json::from_slice::<ResponsesRequest>(req) {
