@@ -550,6 +550,13 @@ pub fn envelope_to_traces(
         if !r.environment.is_empty() {
             resource_attrs.push(kv_str("deployment.environment.name", &r.environment));
         }
+        // Same rule for the process identity: 0 is proto3's "not stamped",
+        // and `process.pid = 0` would be a claim (the scheduler) rather than
+        // an absence. The SDK stamps this live at drain time, so a fork
+        // parent and its children arrive distinguishable.
+        if r.process_pid > 0 {
+            resource_attrs.push(kv_int("process.pid", r.process_pid as i64));
+        }
     }
     otlp_pb::trace_service::ExportTraceServiceRequest {
         resource_spans: vec![otlp_pb::trace::ResourceSpans {
@@ -1120,6 +1127,7 @@ mod tests {
             service_name: "checkout-api".into(),
             release: "1.2.3".into(),
             environment: "staging".into(),
+            ..Default::default()
         });
         let req = envelope_to_traces(env, PRODUCER);
         assert_eq!(
@@ -1152,6 +1160,33 @@ mod tests {
         // Unconfigured release/environment emit NO key, not an empty one.
         assert!(resource_attr(&req, "service.version").is_none());
         assert!(resource_attr(&req, "deployment.environment.name").is_none());
+    }
+
+    #[test]
+    fn a_stamped_pid_is_the_process_attribute_and_an_unstamped_one_is_no_key() {
+        // `process.pid` is the one per-process resource attribute: the SDK
+        // stamps it live at drain time, which is what lets a backend tell a
+        // fork parent's spans from a child's. 0 is proto3's "not stamped" and
+        // emits NO key — `process.pid = 0` would claim the scheduler.
+        let mut env = envelope(pb::Span::default());
+        env.header.as_mut().unwrap().resource = Some(pb::ResourceInfo {
+            service_name: "checkout-api".into(),
+            process_pid: 4242,
+            ..Default::default()
+        });
+        let req = envelope_to_traces(env, PRODUCER);
+        assert_eq!(
+            resource_attr(&req, "process.pid"),
+            Some(&otlp_pb::common::any_value::Value::IntValue(4242))
+        );
+
+        let mut unstamped = envelope(pb::Span::default());
+        unstamped.header.as_mut().unwrap().resource = Some(pb::ResourceInfo {
+            service_name: "checkout-api".into(),
+            ..Default::default()
+        });
+        let req = envelope_to_traces(unstamped, PRODUCER);
+        assert!(resource_attr(&req, "process.pid").is_none());
     }
 
     #[test]

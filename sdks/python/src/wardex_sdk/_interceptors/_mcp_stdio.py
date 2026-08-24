@@ -420,6 +420,19 @@ class McpStdioInterceptor(InterceptorInterface):
     def name(self) -> str:
         return "mcp_stdio"
 
+    def _at_fork_reinit(self) -> None:
+        """Fork-child reset: replace the PatchSet's lock, and nothing else.
+
+        The per-stream state (`_ProcState._latch`) rides closures the fork
+        either carries validly or never touches — that half really does need
+        no reset (`_FORK_EXEMPT` records why). The `PatchSet` is different:
+        its lock is held across whole `patch()`/`restore_all()` walks, and
+        the child's teardown unconditionally reaches `restore_all()` through
+        `uninstall_all()`, so an inherited-held lock would hang the child
+        there (P/Q/R row Q). Replacement, never acquisition.
+        """
+        self._patches._at_fork_reinit()
+
     def install(self, client: Client | None) -> None:
         if self._installed:
             return

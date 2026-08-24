@@ -32,6 +32,12 @@ message ResourceInfo {
   string service_name = 1;  // -> service.name
   string release = 2;       // -> service.version
   string environment = 3;   // -> deployment.environment.name
+  // -> process.pid. The one per-PROCESS field here (the rest are per-app):
+  // stamped live at drain time by the exporting process, so a fork parent
+  // and its children are distinguishable at the backend — the attribution a
+  // duplicate-or-legitimate judgement needs. 0 means "not stamped" and emits
+  // no attribute; pid_max fits int32 on every supported platform.
+  int32 process_pid = 4;
 }
 
 message SdkInfo {

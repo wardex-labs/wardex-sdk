@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+import os
 import platform
 import sys
 import threading
@@ -489,6 +490,11 @@ class Client:
         self._dropped = 0
         self._lost = 0
         self._closed = False
+        # Whether THIS process registered its multiprocessing tail-flush
+        # finalizer (see `_register_mp_tail_flush`). Reset by
+        # `_at_fork_reinit`, because the flag answers a per-process question
+        # and a grandchild is a new process.
+        self._mp_tail_flush_registered = False
         # The SDK's one non-reentrant lock, and the only one -- a source scan in
         # `test_finalizer_reentrancy` enumerates plain `Lock()` sites and fails
         # on any second one, so this exception cannot be quietly copied.
@@ -872,7 +878,16 @@ class Client:
                 api_key=self._config.backend.api_key or "",
                 sdk=self._sdk_info,
                 sent_at_ns=time.time_ns(),
-                resource=self._resource_info,
+                # The pid is stamped LIVE, per batch, never cached: it is then
+                # correct in every process — a fork child before its hook ran,
+                # a platform where no hook runs at all — because the process
+                # doing the drain is by definition the process the number
+                # names. One getpid() per batch, on the worker's periodic
+                # path, nowhere near a capture. This is what lets a backend
+                # attribute a span to parent or child (OTel Python stamps its
+                # resource once at construction, and a forked child exports
+                # under the parent's pid — a known gap, closed here).
+                resource=replace(self._resource_info, process_pid=os.getpid()),
             )
             envelope = Envelope(
                 header=header,
@@ -1262,3 +1277,105 @@ class Client:
         self._worker.stop(budget)  # 2. worker exits without draining
         self._drain(budget, final=True, named_by_caller=named_by_caller)  # 3. final drain
         self._close_transport(budget)  # 4.
+
+    def _at_fork_reinit(self) -> None:
+        """Fork-child reset — runs from `Runtime.after_in_child` step 2.
+
+        REPLACE, never acquire (I-fork-5): any of the three locks can arrive
+        in the child held by a parent thread that did not come along —
+        `_export_lock` held across a POST is the measured worst case — and a
+        child that touched one would hang in its own atexit. The child is
+        single-threaded here, so plain reassignment is race-free.
+
+        THE BUFFER IS DISCARDED, NOT DRAINED (I-fork-3): every span in it was
+        captured by the parent, the parent still owns it and will export it,
+        and a child that shipped its inherited copy is where the "one call,
+        N+1 exports" duplication came from. Discarding is also why there is no
+        marker here — nothing was lost, it merely ships from the process that
+        owns it. `_dropped`/`_lost` restart at zero for the same reason: they
+        are the new process's diagnostics, not the parent's.
+
+        A closed client replaces its locks and keeps `_closed` — the child of
+        a closed parent is closed, and rebuilding buffers for a client that
+        rejects captures would only hide spans nothing will ever drain.
+
+        The worker resets last, into the lazy-respawn posture `ensure_alive()`
+        already services on the next capture (design: deliberately NOT OTel's
+        eager thread — a fork+exec child must not pay for one).
+        """
+        self._buffer_lock = threading.RLock()
+        self._export_lock = threading.RLock()
+        # The second allocation site for the SDK's one non-reentrant lock, with
+        # the SAME argument the declaration in `__init__` writes out — nothing
+        # about which callers can reach it changed, only which process it lives
+        # in. `test_finalizer_reentrancy` counts both sites against one
+        # documented holdout entry per site.
+        self._close_lock = threading.Lock()
+        self._worker._at_fork_reinit()
+        # Per-process, so a grandchild answers "not yet" and registers its own
+        # tail-flush finalizer (the inherited registration is the CHILD's).
+        self._mp_tail_flush_registered = False
+        if self._closed:
+            return
+        self._buffer = _SpanBuffer()
+        self._snapshots = deque()
+        self._dropped = 0
+        self._lost = 0
+
+    def _register_mp_tail_flush(self) -> None:
+        """Give a `multiprocessing` fork child an exit flush. Step 5 of the
+        child hook; a no-op everywhere else.
+
+        An mp (or billiard) fork child leaves through `os._exit` after
+        `BaseProcess._bootstrap` — atexit NEVER runs there, so a tail under
+        the flush threshold captured inside a short-lived worker vanished
+        with no marker and no counter (`maxtasksperchild=1` lost every span
+        of every task). What DOES run is `multiprocessing.util._exit_function`,
+        in `_bootstrap`'s finally, strictly before `os._exit` — so the tail
+        rides a `util.Finalize` registered against this client.
+
+        Gated on `"multiprocessing.util" in sys.modules` — a probe, never an
+        import: a process where mp is not loaded cannot be an mp child, and
+        the fork hook is the one place import-time side effects are least
+        affordable. A raw `os.fork()` + `os._exit()` child is out of reach by
+        construction (neither atexit nor mp's exit function exists there);
+        the README says so and prescribes `wardex.flush()` before exiting.
+
+        The bare `flush` is deliberate: "send what you have, on the
+        transport's own budget" is exactly the tail-flush contract, and the
+        budget question was settled where `_UnnamedTimeout` lives.
+
+        PLANTED THROUGH `register_after_fork`, not by calling `Finalize`
+        here, and the indirection is load-bearing (measured, not read off
+        the docs): an mp child runs this hook DURING `os.fork()`, and the
+        very next thing `BaseProcess._bootstrap` does is
+        `util._finalizer_registry.clear()` — a Finalize registered here is
+        wiped before the worker runs a line. What `_bootstrap` runs AFTER
+        that clear is `util._run_after_forkers()`, so an after-forker
+        registered here (this hook runs strictly before `_bootstrap`
+        continues) is the one registration that survives to arm the real
+        Finalize. In a raw `os.fork` child `_run_after_forkers` never runs
+        and never needs to: a raw child either exits through the interpreter
+        (atexit's teardown flushes) or through `os._exit` (out of reach by
+        construction — the README prescribes `wardex.flush()` there).
+        """
+        if self._closed or self._mp_tail_flush_registered:
+            return
+        util = sys.modules.get("multiprocessing.util")
+        if util is None:
+            return
+        util.register_after_fork(self, Client._arm_mp_tail_finalizer)
+        self._mp_tail_flush_registered = True
+
+    def _arm_mp_tail_finalizer(self) -> None:
+        """Arm the exit flush — runs inside `_bootstrap`'s after-forkers,
+        after the finalizer-registry clear that would have eaten it.
+
+        Positive exitpriority: run among the first finalizers, before mp
+        tears down its own machinery under us. Plain method, called as
+        `func(obj)` by `_run_after_forkers`.
+        """
+        util = sys.modules.get("multiprocessing.util")
+        if util is None or self._closed:
+            return
+        util.Finalize(self, self.flush, exitpriority=10)

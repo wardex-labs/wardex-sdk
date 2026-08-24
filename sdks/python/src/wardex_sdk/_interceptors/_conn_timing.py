@@ -351,6 +351,33 @@ def uninstall_shared_timing() -> None:
         _shared_store.clear()  # type: ignore[union-attr]
 
 
+def _at_fork_reinit() -> None:
+    """Fork-child reset: empty the fileno-keyed store; keep patch and refcount.
+
+    The store's keys are the PARENT's file descriptors: in the child the
+    kernel reissues them the moment anything closes, so an inherited slot
+    would donate the parent's connect/handshake milliseconds to whatever new
+    socket lands on the same fileno. The probe's patch and its refcount stay
+    — installation crossed the fork in the memory image and is still exactly
+    as installed (I-fork-4); `reset_shared_timing` is NOT reusable here, it
+    is the uninstall path and would rip `socket.connect` out from under the
+    still-installed seams.
+
+    The store itself is deliberately unlocked (single dict operations, same
+    argument as `CloseRegistry`) — but the probe's `PatchSet` is not: its
+    lock is held across whole `patch()`/`restore_all()` walks, and the
+    child's teardown runs `uninstall_shared_timing()` -> `restore_all()`, so
+    an inherited-held lock would hang the child there. Delegate the
+    replacement (P/Q/R row Q). Reached by `Runtime.after_in_child` through
+    `sys.modules`, so a process that never imported this module resets
+    nothing that provably does not exist.
+    """
+    if _shared_store is not None:
+        _shared_store.clear()
+    if _shared_probe is not None:
+        _shared_probe._patches._at_fork_reinit()
+
+
 def reset_shared_timing() -> None:
     """Drop the probe, the store and the refcount outright. TEST-ONLY.
 

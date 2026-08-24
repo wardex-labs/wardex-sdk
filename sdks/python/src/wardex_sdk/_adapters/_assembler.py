@@ -249,6 +249,37 @@ class SessionAssembler:
         with self._lock:
             return len(self._by_key)
 
+    def _at_fork_reinit(self) -> None:
+        """Fork-child reset: forget every inherited session WITHOUT emitting.
+
+        The sessions in these tables — their open tools, sub-agents, pending
+        chats, eviction breadcrumbs — were built by the PARENT, whose copies
+        are intact and will be finalized and exported there (I-fork-3). A
+        child that closed them would ship the duplicate this reset removes,
+        so the tables are simply forgotten; the CLI subprocesses behind them
+        belong to the parent's transports anyway.
+
+        `_bridge` is severed HERE as well as in the adapter, because both
+        references must die for no child code path (a session retire, an
+        uninstall) to reach the inherited receiver object — its serve thread
+        did not survive the fork, and half its teardown protocol hangs
+        without one (`close_inherited_after_fork` is the safe half, and the
+        ADAPTER calls it; this reset only makes the object unreachable).
+
+        The lock is REPLACED, never acquired; the unit registry and the
+        tool catalog reset through their own `_at_fork_reinit`, same rules.
+        The catalog reset is idempotent on the adapter-install path (where
+        `_names` IS the adapter's catalog and the adapter resets it too) and
+        is the only reset the self-built catalog of a directly-constructed
+        assembler ever gets.
+        """
+        self._lock = threading.RLock()
+        self._by_key.clear()
+        self._by_session_id.clear()
+        self._bridge = None
+        self._units._at_fork_reinit()
+        self._names._at_fork_reinit()
+
     def unit_for(self, key: int) -> Unit | None:
         """The live session unit for a transport key, if there is one."""
         with self._lock:

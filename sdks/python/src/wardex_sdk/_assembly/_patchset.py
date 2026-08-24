@@ -301,6 +301,24 @@ class PatchSet:
         self._refused = 0
         self._lock = threading.RLock()
 
+    def _at_fork_reinit(self) -> None:
+        """Fork-child reset: a fresh lock, and NOTHING else (I-fork-4/5).
+
+        The records stay — the monkeypatches they describe crossed the fork in
+        the memory image and are still in effect in the child, so the child's
+        eventual teardown needs exactly this list to restore them. What cannot
+        be trusted is the LOCK: `patch()`/`restore_all()` hold it across whole
+        walks, and a fork landing inside one leaves the child a lock held by a
+        thread that does not exist there — the child's own atexit would hang
+        in `restore_all`. Replacement, never acquisition: the child is
+        single-threaded while the fork hooks run.
+
+        Called by whichever component OWNS this set (a seam, an adapter,
+        `context._inject`) from its own fork reset — the set cannot know its
+        owners, and `Runtime.after_in_child` only talks to owners.
+        """
+        self._lock = threading.RLock()
+
     def __len__(self) -> int:
         """Records still awaiting restore.
 

@@ -551,11 +551,18 @@ diagnostic line (traceback under `debug=True`).
 - Node/TS and Java SDKs
 
 **Notes**
-- After `os.fork()` the worker respawns lazily in the child on first capture;
-  spans buffered before the fork may be sent by both processes (duplicates
-  are possible; a fork landing mid-export can also strand the child's
-  pre-fork buffer — re-init in the child for a clean slate). Under uWSGI
-  enable threads (`--enable-threads`).
+- After `os.fork()` the SDK reinitializes its per-process state in the child
+  via `os.register_at_fork`: the inherited span buffer is discarded (the
+  parent still owns and exports it, so each span ships exactly once), locks
+  and the batch worker are recreated, per-connection/per-session tracking
+  tables are reset (a span assembled on a connection that crossed the fork
+  carries the `tracking_reset_at_fork` marker), and every batch stamps the
+  live `process.pid`, so a parent and its forked children are distinguishable
+  at the backend. `multiprocessing` fork children flush their tail on exit; a
+  hand-rolled `os.fork()` + `os._exit()` child should call `wardex.flush()`
+  before exiting. `spawn`/`forkserver` start methods launch a fresh
+  interpreter and are unaffected. Under uWSGI enable threads
+  (`--enable-threads`).
 
 ## Resource limits
 

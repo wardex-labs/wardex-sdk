@@ -558,6 +558,21 @@ class AdapterContext:
         # nothing here can hold a snapshot.
         self._control_flow = control_flow
 
+    def _at_fork_reinit(self) -> None:
+        """Fork-child reset: replace the PatchSet's lock, and nothing else.
+
+        The context's other state is per-install bookkeeping the child keeps
+        (I-fork-4: the patches recorded here crossed the fork and still work,
+        and the child's teardown needs the records to restore them). The lock
+        is the one thing that cannot be trusted — `restore_all()` holds it
+        across the whole restore walk, and `AdapterRegistry.uninstall` takes
+        exactly that path in the child (P/Q/R row Q). Called by
+        `AdapterRegistry._at_fork_reinit`, the owner of every live context —
+        adapters like LangGraph patch exclusively through their context and
+        declare no reset of their own.
+        """
+        self.patches._at_fork_reinit()
+
     @property
     def tripped(self) -> bool:
         """Has wardex's own work failed at least once under this adapter?

@@ -143,6 +143,10 @@ fn mask_header(engine: &PiiEngine, h: &mut pb::EnvelopeHeader) {
             service_name,
             release,
             environment,
+            // WHITELIST: an OS-assigned integer, not host free text — there is
+            // nothing to mask, and rewriting it would destroy the per-process
+            // attribution (fork parent vs child) the field exists to carry.
+            process_pid: _,
         } = r;
         mask_string(engine, service_name);
         mask_string(engine, release);

@@ -55,6 +55,7 @@ from .._assembly import (
     SpanIntent,
     UnitKind,
     counters,
+    diag_info,
     diag_warning,
     guard,
     report_once,
@@ -829,6 +830,41 @@ class AnthropicAgentSdkAdapter(AdapterInterface):
         assembler = self._assembler
         if assembler is not None:
             assembler.close_all_sessions(marker=marker)
+
+    def _at_fork_reinit(self) -> None:
+        """Fork-child reset: sessions and units dropped, inherited bridge cut.
+
+        NOT `uninstall()`: the patches stay (I-fork-4 — the transport tee and
+        hook wrappers crossed the fork and still work, and the child may
+        start Claude sessions of its own), and nothing is emitted — the
+        parent owns every inherited session and will finalize it (I-fork-3).
+
+        The bridge is the delicate half. Its serve thread did not survive the
+        fork, its bound fd is SHARED with the parent (so the CLI's OTLP POSTs
+        would scatter between the two accept queues), and its normal
+        `close()` hangs without the serve loop — today's child-exit hang.
+        Both references are severed (adapter and assembler) so no later child
+        path can reach the object, then `close_inherited_after_fork()` closes
+        the child's fd without touching `shutdown()`. Torn down, not
+        re-armed: sessions the child then runs bridge-less say so with the
+        existing `OTEL_BRIDGE_NO_DATA`; re-arming is an independent
+        follow-up. The stderr line is debug-gated — in a prefork deployment
+        this runs once per worker, and 32 identical lines about a designed
+        state are noise (the diagnostic record is the counter).
+        """
+        self._patches._at_fork_reinit()
+        self._names._at_fork_reinit()
+        bridge = self._bridge
+        self._bridge = None
+        assembler = self._assembler
+        if assembler is not None:
+            assembler._at_fork_reinit()  # clears its tables and its own _bridge
+        if bridge is not None:
+            with self._guard("adapters.anthropic.otel_bridge_fork_teardown"):
+                bridge.close_inherited_after_fork()
+            counters.bump("adapters.anthropic.otel_bridge.fork_torn_down")
+            if self._debug:
+                diag_info("anthropic_agent_sdk otel bridge: inherited receiver closed after fork")
 
     def uninstall(self) -> None:
         if not self._installed:

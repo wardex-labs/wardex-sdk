@@ -169,6 +169,11 @@ class _ConnectionState:
         self.server_port = server_port
         self.timing_consumed = False
         self.gate: str | None = None  # None=undetermined, "http", "h2c", "h2", "ignore"
+        # This state was built for a socket that OUTLIVED an os.fork(): the
+        # tracker starts mid-stream, so the first span assembled from it
+        # carries `TRACKING_RESET_AT_FORK` (once — the stamp clears it). Set
+        # by `_state` from the seam's fork latch, never by the trackers.
+        self.reset_at_fork = False
         # Guards the once-per-connection debug log below. Deliberately a
         # separate field from `gate`: `gate` is owned by the plaintext seam's
         # protocol sniff-latch (_socket.py), which never re-evaluates once
@@ -202,6 +207,12 @@ class ByteSeamInterceptor(InterceptorInterface):
     def __init__(self) -> None:
         self._client: Client | None = None
         self._conns: dict[int, _ConnectionState] = {}
+        # ids of connections that were being tracked when an os.fork() reset
+        # this seam in the child — consumed one id at a time by `_state`, so
+        # the first span on an INHERITED socket can say its tracking restarted
+        # mid-stream (`TRACKING_RESET_AT_FORK`). Bounded by max_connections at
+        # the only site that fills it (`_at_fork_reinit`).
+        self._reset_at_fork_ids: set[int] = set()
         self._patches = PatchSet(f"interceptors.{self.name()}")
         self._installed = False
         # Does THIS seam hold a reference on the shared timing probe? A second
@@ -285,6 +296,44 @@ class ByteSeamInterceptor(InterceptorInterface):
             self._retire(st, Limitation.WS_NO_CLOSE)
         self._conns.clear()
         self._installed = False
+
+    def _at_fork_reinit(self) -> None:
+        """Fork-child reset: drop the inherited connection table, remember it.
+
+        NOT `uninstall()` in a smaller coat, and the differences are the
+        design: the patches stay installed (I-fork-4 — they crossed the fork
+        and still work), nothing is retired or emitted (`_retire` would EMIT
+        the inherited WS sessions, which the parent owns and will emit
+        itself — I-fork-3), and the probes keep their refcounts (the shared
+        singletons reset their own state through the runtime, not through the
+        seams). What goes is the per-connection state: an inherited entry
+        would hand a recycled `id()` a dead connection's tracker and latched
+        gate — the close-hook bug's cross-process edition — and an inherited
+        LIVE socket's tracker holds a parse position that is a lie in a child
+        that missed bytes.
+
+        The ids are LATCHED before the clear, capped at `max_connections`
+        newest-first (dict order is insertion order; anything beyond the cap
+        was oldest and is dropped — the same drop-oldest posture as the table
+        itself). `_state` consumes the latch: the first span assembled on a
+        connection whose id survives here says `TRACKING_RESET_AT_FORK`
+        instead of silently reporting mid-stream parses as clean ones — every
+        OTHER path that discards a live `_ConnectionState` leaves a marker
+        (`CONNECTION_EVICTED`, `WS_NO_CLOSE`), and the fork path may not be
+        the one silent exception.
+
+        Locks: this seam's table has none to replace (`_conns` is unlocked by
+        the same argument `CloseRegistry` documents); the PatchSet's lock is
+        the one inherited lock this seam owns, and it is replaced through the
+        set's own reset.
+        """
+        self._patches._at_fork_reinit()
+        ids = list(self._conns)
+        cap = self._limits["max_connections"]
+        if len(ids) > cap:
+            ids = ids[-cap:]
+        self._reset_at_fork_ids = set(ids)
+        self._conns.clear()
 
     def _acquire_probes(self) -> None:
         """Take this seam's references on the two shared, refcounted probes.
@@ -450,6 +499,14 @@ class ByteSeamInterceptor(InterceptorInterface):
         if st is None:
             addr, port = _peer(obj)
             st = _ConnectionState(self._select_tracker(obj), addr, port)
+            if cid in self._reset_at_fork_ids:
+                # This object was tracked when the fork reset the table, so it
+                # is (to the limit of id() identity) an INHERITED connection:
+                # the new tracker starts mid-stream. Consume the id — the
+                # marker is a fact about the reset, and the reset happened
+                # once.
+                self._reset_at_fork_ids.discard(cid)
+                st.reset_at_fork = True
             if len(self._conns) > self._limits["max_connections"]:
                 old_cid = next(iter(self._conns))
                 self._retire(self._conns.pop(old_cid), Limitation.CONNECTION_EVICTED)
@@ -574,6 +631,21 @@ class ByteSeamInterceptor(InterceptorInterface):
         except Exception:
             return None
 
+    def _stamp_fork_reset(self, st: _ConnectionState, draft: Any) -> None:
+        """Put `TRACKING_RESET_AT_FORK` on the FIRST span of a fork-crossing
+        connection, and only that one.
+
+        One helper for both build paths (HTTP and WS), because the fact is the
+        connection's, not the transaction kind's. The flag clears on the first
+        stamp: later spans on the same connection are parsed by a tracker that
+        saw their whole exchange, and a marker repeated forever would read as
+        a per-span defect rather than the one-time event it is.
+        """
+        if st.reset_at_fork:
+            st.reset_at_fork = False
+            draft.add_limitation(Limitation.TRACKING_RESET_AT_FORK)
+            counters.bump("interceptors.seam.tracking_reset_at_fork")
+
     def _emit_span(self, obj: Any, st: _ConnectionState, txn: _Txn) -> None:
         client = self._client
         if client is None:
@@ -636,6 +708,7 @@ class ByteSeamInterceptor(InterceptorInterface):
             source=self._capture_source(),
             start_ns=txn.start_ns,
         )
+        self._stamp_fork_reset(st, draft)
         for marker in timing_markers:
             draft.add_limitation(marker)
         # Markers the protocol parser attached to the transaction (a body that
@@ -830,6 +903,7 @@ class ByteSeamInterceptor(InterceptorInterface):
             source=self._capture_source(),
             start_ns=txn.start_ns,
         )
+        self._stamp_fork_reset(st, draft)
         draft.set_extra("network.protocol.version", "websocket")
         draft.set_extra("ws.messages.sent", txn.ws_messages_sent)
         draft.set_extra("ws.messages.received", txn.ws_messages_received)

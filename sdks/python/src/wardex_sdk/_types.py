@@ -468,11 +468,13 @@ class ResourceInfo:
     """The exporting APPLICATION's identity — what the OTLP resource is built
     from. Empty string means "not configured"; the Rust mapping owns the
     fallback shaping (`unknown_service:<language>`), so nothing here invents a
-    name."""
+    name. Plus the process identity of the exporting process, stamped live at
+    drain time — the one field here that is per-process, not per-app."""
 
     service_name: str = ""  # -> service.name
     release: str = ""  # -> service.version
     environment: str = ""  # -> deployment.environment.name
+    process_pid: int = 0  # -> process.pid; 0 = not stamped (drain stamps it live)
 
 
 @dataclass(frozen=True, slots=True)

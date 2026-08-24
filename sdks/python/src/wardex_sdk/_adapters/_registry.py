@@ -204,6 +204,33 @@ class AdapterRegistry:
         if deferred is not None:
             raise deferred
 
+    def _at_fork_reinit(self) -> None:
+        """Fork-child reset, delegated to every installed adapter.
+
+        `InterceptorRegistry._at_fork_reinit`'s twin, same rules: the
+        registry stays populated, every patch stays installed (I-fork-4),
+        only per-process mutable state resets, and an adapter that declares
+        no `_at_fork_reinit` is stating it holds none — a statement the
+        coverage guard in `tests/test_fork_reinit_coverage.py` verifies for
+        every holder, present and future. Per-adapter `guard()` so one
+        failing reset cannot abandon the rest.
+        """
+        for name, adapter in list(self._installed.items()):
+            reinit = getattr(adapter, "_at_fork_reinit", None)
+            if reinit is None:
+                continue
+            with guard(f"adapters.{name}.fork_reinit_failed"):
+                reinit()
+        # Every installed adapter's context owns a PatchSet whose lock the
+        # child's teardown WILL take (`AdapterRegistry.uninstall` ->
+        # `ctx.patches.restore_all()`), whether or not the adapter itself
+        # declared a reset — LangGraph patches exclusively through its
+        # context and declares none. Row Q therefore lives here, on the
+        # OWNER of the contexts, not on each adapter's goodwill.
+        for name, ctx in list(self._contexts.items()):
+            with guard(f"adapters.{name}.fork_reinit_failed"):
+                ctx._at_fork_reinit()
+
     def is_installed(self, name: str) -> bool:
         return name in self._installed
 

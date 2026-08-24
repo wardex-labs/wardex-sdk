@@ -5,10 +5,17 @@ interval elapsed, wake() (buffer size threshold), or stop(). The loop survives
 drain exceptions — an observability SDK must never crash the app, and the
 worker must never die (design §10).
 
-Fork recovery (design §8, Sentry-style PID check): start() records the PID the
-thread was created in; ensure_alive() lazily respawns the thread when the
-recorded PID no longer matches (we are in a forked child) or the thread died.
-No code runs at fork time, which sidesteps fork-safety traps entirely.
+Fork posture, two layers. The PRIMARY path is the SDK's
+`os.register_at_fork(after_in_child=...)` hook: it calls `_at_fork_reinit()`
+in the child, which replaces this worker's lock and Event (an inherited lock
+can arrive held by a thread that did not cross the fork) and nulls the thread
+slots. Respawn stays LAZY — no thread is started at fork time, so a child
+that never captures (the fork+exec shell-out, the short-lived mp worker)
+never pays for one; the next capture's `ensure_alive()` brings it back. The
+BACKSTOP is the PID check: `start()` records the PID the thread was created
+in, and `ensure_alive()` respawns when it no longer matches or the thread
+died — which self-heals even where the hook never ran (uWSGI runs only the
+child hook; a hypothetical embedding might run none).
 """
 
 from __future__ import annotations
@@ -117,6 +124,31 @@ class BatchWorker:
             pid = self._thread_for_pid
         if thread is not None and pid == os.getpid() and thread.is_alive():
             thread.join(timeout)
+
+    def _at_fork_reinit(self) -> None:
+        """Fork-child reset: fresh lock and Event, no thread, nothing spawned.
+
+        Called from the client's own `_at_fork_reinit` on the
+        `os.register_at_fork(after_in_child=...)` path. REPLACEMENT, never
+        acquisition: the parent may have been inside `_spawn_locked` — which
+        holds `_spawn_lock` across a `Thread(...)` construction and a
+        `start()` — at the fork instant, so the inherited lock can be
+        permanently held by a thread that does not exist in the child.
+
+        The thread slots are nulled rather than left for `is_alive()`'s PID
+        check to age out, because the check is the BACKSTOP (uWSGI's C-level
+        fork runs `after_in_child` but a hypothetical embedding might not) and
+        this is the primary path. Respawn stays LAZY: no thread is started
+        here — a child that never captures (the fork+exec shell-out, the mp
+        worker that dies young) never pays for one, and `ensure_alive()` on
+        the first capture is the tested path that brings the worker back.
+        `_stopped` is inherited as-is: a closed parent's child stays closed.
+        """
+        self._spawn_lock = threading.RLock()
+        self._wake = threading.Event()
+        self._thread = None
+        self._thread_for_pid = None
+        self._spawning_pid = None
 
     def _spawn_locked(self) -> None:
         if self._stopped:

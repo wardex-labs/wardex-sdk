@@ -167,6 +167,16 @@ class Transport(abc.ABC):
     blocking on its exporter thread. `before_send_envelope` is SYNCHRONOUS in
     Python. (`CallerBudget` below is a Python-only diagnostic refinement and
     is excluded from this cross-language SPI -- see its docstring.)
+
+    THE FORK EXTENSION POINT, optional: a transport may define
+    `at_fork_child()` (no arguments), and wardex's `os.register_at_fork`
+    child hook will call it -- under the SDK's guard, so a raise costs a
+    counter and nothing else. It exists because wardex resets its OWN state
+    at fork but cannot reset a transport's internals: an implementation
+    holding a pooled `requests.Session`/`httpx.Client` shares live TCP
+    sockets with the parent after a fork -- that library's classic fork
+    hazard -- and only the transport knows how to rebuild its pool. wardex's
+    built-in transports hold no per-request state and do not implement it.
     """
 
     # PII policy applied by the native encoders on wire paths (design §4.2).

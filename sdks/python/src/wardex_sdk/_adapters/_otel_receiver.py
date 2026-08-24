@@ -381,7 +381,45 @@ class _OtelBridgeReceiver:
             return slot.last_arrival if slot is not None else None
 
     def close(self) -> None:
-        """Stop serving and release the socket. Rides the adapter's uninstall."""
+        """Stop serving and release the socket. Rides the adapter's uninstall.
+
+        THE PARENT'S teardown only — never call this in a fork child. The
+        `shutdown()` here waits on an event that ONLY the `serve_forever`
+        loop sets, and that loop's thread does not exist in a forked child:
+        the wait is unbounded, so a child that reached this hung its own
+        interpreter exit (atexit → teardown → uninstall → here). A child
+        tears the inherited receiver down with `close_inherited_after_fork`.
+        """
         self._server.shutdown()
         self._server.server_close()
         self._thread.join(timeout=1.0)
+
+    def close_inherited_after_fork(self) -> None:
+        """Tear down an INHERITED receiver in a fork child, without hanging.
+
+        `server_close()` ONLY — it closes this process's reference to the
+        bound socket (the parent's own descriptor is separately counted and
+        unaffected), which ends the fd sharing that would otherwise scatter
+        the CLI's OTLP POSTs randomly between parent and child accept queues.
+        `shutdown()` is deliberately never called: it waits, unbounded, on an
+        event only the serve loop sets, and the serve thread did not cross
+        the fork — that wait is the child-exit hang this method exists to
+        remove. The thread is not joined either: `threading`'s own at-fork
+        hook already marked the inherited thread stopped, and there is no
+        reason to touch it. Handler threads are daemons and tracked nowhere.
+
+        The slot tables are the parent's spans and are dropped without
+        emitting (I-fork-3); the lock is replaced, never acquired. No
+        re-arm: a child session that wants the bridge again is a separate
+        capability, and until it exists the honest outcome is the session
+        root's existing `OTEL_BRIDGE_NO_DATA` marker.
+        """
+        # Idempotence by inspection rather than by swallowing: a second call
+        # finds the fd already closed (fileno() == -1) and skips the close —
+        # the goal state, not a failure. Anything server_close() itself raises
+        # is the caller's guard's to count (the adapter wraps this call).
+        if self._server.socket.fileno() != -1:
+            self._server.server_close()
+        self._lock = threading.RLock()
+        self._by_trace.clear()
+        self._by_session_id.clear()

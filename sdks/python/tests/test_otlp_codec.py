@@ -388,7 +388,10 @@ def test_resource_identity_comes_from_the_configured_resource():
             sdk=_header().sdk,
             sent_at_ns=42,
             resource=ResourceInfo(
-                service_name="checkout-api", release="1.2.3", environment="staging"
+                service_name="checkout-api",
+                release="1.2.3",
+                environment="staging",
+                process_pid=4242,
             ),
         ),
         spans=(_span(),),
@@ -398,6 +401,8 @@ def test_resource_identity_comes_from_the_configured_resource():
     assert res_attrs["service.name"] == "checkout-api"
     assert res_attrs["service.version"] == "1.2.3"
     assert res_attrs["deployment.environment.name"] == "staging"
+    # The one per-PROCESS resource attribute: an int, exactly as stamped.
+    assert res_attrs["process.pid"] == 4242
     assert res_attrs["telemetry.sdk.name"] == "wardex"
     assert res_attrs["telemetry.sdk.version"] == "0.1.0"
     assert res_attrs["telemetry.sdk.language"] == "python"
@@ -412,6 +417,9 @@ def test_an_unnamed_service_is_unknown_service_never_the_sdk_name():
     d = _wardex_native.codec.decode_otlp_traces(_wardex_native.codec.encode_otlp_traces(env))
     res_attrs = d["resource_spans"][0]["resource"]["attributes"]
     assert res_attrs["service.name"] == "unknown_service:python"
+    # An unstamped pid (proto3 zero) emits no key: `process.pid = 0` would
+    # claim the scheduler rather than say "not stamped".
+    assert "process.pid" not in res_attrs
     assert res_attrs["telemetry.sdk.name"] == "wardex"
     assert "service.version" not in res_attrs
     assert "deployment.environment.name" not in res_attrs

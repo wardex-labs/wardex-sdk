@@ -619,15 +619,23 @@ def _plain_lock_sites(tree: ast.AST, where: str) -> list[str]:
     return found
 
 
-#: The complete list of non-reentrant locks in the SDK, and it is one entry
-#: long. `Client._close_lock` guards three statements that set `_closed`, and
-#: re-entering them is not merely a hang — it would let two frames each conclude
-#: they were the one closing. Its safety is an argument about which callers can
-#: reach it, written out at its declaration. Every other lock is an RLock
-#: because a weakref finalizer lands wherever a reference count reaches zero,
-#: and a plain Lock there is a permanent self-deadlock in the HOST's code, at a
-#: line the host did not write.
-_DOCUMENTED_HOLDOUTS = frozenset({"wardex_sdk/_client.py self._close_lock"})
+#: The complete list of non-reentrant locks in the SDK, and it names one
+#: ATTRIBUTE at two allocation sites. `Client._close_lock` guards three
+#: statements that set `_closed`, and re-entering them is not merely a hang —
+#: it would let two frames each conclude they were the one closing. Its safety
+#: is an argument about which callers can reach it, written out at its
+#: declaration. Every other lock is an RLock because a weakref finalizer lands
+#: wherever a reference count reaches zero, and a plain Lock there is a
+#: permanent self-deadlock in the HOST's code, at a line the host did not
+#: write.
+#:
+#: A Counter rather than a set, because the scan counts sites and the same
+#: attribute now has exactly two: the construction in `__init__` and the
+#: REPLACEMENT in `_at_fork_reinit` — the fork child may not acquire an
+#: inherited lock, so the same object is built again for the new process, with
+#: the same reachability argument (nothing about the callers changed, only the
+#: process). A third site for this key, or any site for a new one, still fails.
+_DOCUMENTED_HOLDOUTS: Counter[str] = Counter({"wardex_sdk/_client.py self._close_lock": 2})
 
 
 def test_only_one_lock_in_the_sdk_is_non_reentrant():
@@ -642,8 +650,9 @@ def test_only_one_lock_in_the_sdk_is_non_reentrant():
     package = pathlib.Path(inspect.getfile(wardex_sdk)).parent
     # Counted, not a set: two plain locks in one module bound to the same
     # attribute name produce the same key, and a set would let the second hide
-    # behind the documented one. Each holdout entry accounts for exactly one
-    # site, so a duplicate survives the subtraction and is reported.
+    # behind the documented one. Each holdout COUNT accounts for exactly that
+    # many sites, so an extra duplicate survives the subtraction and is
+    # reported.
     sites: Counter[str] = Counter()
     for path in sorted(package.rglob("*.py")):
         where = path.relative_to(package.parent).as_posix()

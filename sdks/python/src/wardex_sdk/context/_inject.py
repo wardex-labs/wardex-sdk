@@ -109,6 +109,29 @@ def _patchset() -> PatchSet:
     return _patches
 
 
+def _at_fork_reinit() -> None:
+    """Fork-child reset: replace this module's lock, keep its patch record.
+
+    `uninstall_propagation()` is unconditionally on the child's teardown path
+    (`Runtime._teardown` calls it whether or not propagation was ever on), so
+    an `_install_lock` inherited in a held state — a fork landing inside an
+    install/uninstall walk — would hang the child's own atexit. Replaced,
+    never acquired: the child is single-threaded while the fork hooks run.
+
+    `_installed` and the `PatchSet` records are KEPT (I-fork-4): the header
+    patches crossed the fork in the memory image and still work in the child,
+    and the record is exactly what the child's teardown needs to take them
+    back out. Only the PatchSet's own lock is refreshed, for the same reason
+    as this module's. Reached by `Runtime.after_in_child` through
+    `sys.modules`, so a process that never imported propagation pays nothing
+    and resets nothing that provably does not exist.
+    """
+    global _install_lock
+    _install_lock = threading.RLock()
+    if _patches is not None:
+        _patches._at_fork_reinit()
+
+
 @functools.lru_cache(maxsize=16)
 def _folded_patterns(patterns: tuple[str, ...]) -> tuple[str, ...]:
     """The configured allowlist, case-folded once rather than per request.

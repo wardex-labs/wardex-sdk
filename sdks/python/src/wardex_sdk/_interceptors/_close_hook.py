@@ -484,6 +484,30 @@ def on_close(obj: Any, hook: Callable[[], None], *, on_finalize: bool = True) ->
     _registry.on_close(obj, hook, on_finalize=on_finalize)
 
 
+def _at_fork_reinit() -> None:
+    """Fork-child reset: forget the parent's registrations; keep the patch.
+
+    Every entry in the table pairs a parent object id with hooks that close
+    over PARENT tracking state — the seam tables the fork reset just cleared,
+    the timing store's parent filenos. Running one in the child would pop
+    from tables that no longer hold anything (harmless but wrong), and an
+    entry left behind would fire against a recycled id. `clear()` also
+    detaches the inherited `weakref.finalize` objects, which are as alive in
+    the child as the memory image made them.
+
+    The patch and `_refcount` stay (I-fork-4): the seams that hold the
+    references are still installed in the child, and their post-fork
+    connections re-register through `on_close` exactly as new ones do.
+    `CloseRegistry` is deliberately unlocked (see its docstring), but the
+    probe's `PatchSet` is not, and the child's teardown reaches its
+    `restore_all()` through `uninstall_shared_close_hook()` — so its lock is
+    replaced here (P/Q/R row Q), never acquired. Reached by
+    `Runtime.after_in_child` through `sys.modules`.
+    """
+    _registry.clear()
+    _probe._patches._at_fork_reinit()
+
+
 def install_shared_close_hook() -> None:
     global _refcount
     if _refcount == 0:

@@ -117,6 +117,30 @@ class InterceptorRegistry:
             with guard(f"interceptors.{name}.uninstall"):
                 interceptor.uninstall()
 
+    def _at_fork_reinit(self) -> None:
+        """Fork-child reset, delegated to every installed interceptor.
+
+        The registry stays populated and every patch stays installed
+        (I-fork-4): the child is still instrumented, it just must not trust
+        per-connection state built for the parent's sockets. A seam that
+        declares no `_at_fork_reinit` is stating it holds no per-process
+        mutable state to reset — not even a PatchSet, whose lock row Q makes
+        every holder replace (MCP stdio declares one for exactly that lock;
+        its per-stream state rides closures the fork either carries validly
+        or never touches — `_FORK_EXEMPT`). The coverage guard in
+        `tests/test_fork_reinit_coverage.py` is what keeps that statement
+        honest for every FUTURE holder.
+
+        Per-seam `guard()` so one failing reset cannot abandon the rest — the
+        same totality rule as `uninstall_all`, on the same kind of path.
+        """
+        for name, interceptor in list(self._installed.items()):
+            reinit = getattr(interceptor, "_at_fork_reinit", None)
+            if reinit is None:
+                continue
+            with guard(f"interceptors.{name}.fork_reinit_failed"):
+                reinit()
+
     def is_installed(self, name: str) -> bool:
         return name in self._installed
 
