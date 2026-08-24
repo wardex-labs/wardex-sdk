@@ -634,6 +634,32 @@ def test_fork_walk_reaches_every_holder():
                 status=StatusCode.OK,
             )
         )
+
+        # Stage a PENDING finalize entry (integration S-4). The traffic above
+        # never seals a transaction — request bytes only — so the parse
+        # backlog forks empty, and an empty table cannot distinguish "the
+        # Client -> FinalizeQueue fork wiring ran" from "it was deleted": the
+        # queue's own unit test drives _at_fork_reinit directly and proves
+        # nothing about the wiring. Submitted with the worker deliberately
+        # never spawned (ensure_alive is not called; submit's wake() on an
+        # unspawned worker is a no-op), so the entry deterministically
+        # survives to the fork instant; the child's populated-table walk
+        # below then turns a missing Client wiring into a red test. The
+        # parent's own close() drains the stub through the FALLBACK path.
+        class _StubDeferred:
+            size = 64
+            ctx = None
+
+            def run(self):  # noqa: ANN202 — DeferredSpan duck type
+                return None
+
+            def fallback(self, marker):  # noqa: ANN001, ANN202
+                return None
+
+        finalize = _hub.get_client()._finalize
+        finalize.submit(_StubDeferred(), ({}, None))
+        assert finalize.pending() > 0, "the S-4 staging must survive to the fork"
+
         assert seam._conns and assembler.open_session_count() == 1
 
         r, w = os.pipe()

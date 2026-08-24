@@ -24,10 +24,14 @@ OTel bridge's fail-open pair ``OTEL_BRIDGE_NO_DATA`` (41, confirmed injection
 and nothing arrived) / ``OTEL_BRIDGE_SCHEMA_UNKNOWN`` (42, data arrived and
 classified as nothing), and ``SESSION_ENTRY_TABLE_FULL`` (43, the adapter's
 per-session bound, which is the registry's breadth bound one layer out and a
-different FIELD). Two more since that paragraph was last true:
+different FIELD). Four more since that paragraph was last true:
 ``EXTRA_KEYS_DROPPED`` (44, the dynamic-key bound on the provider-usage
-mirror) and ``TRACKING_RESET_AT_FORK`` (45, the fork child's per-connection
-tracking reset — the one member that names a process event and no knob).
+mirror), ``TRACKING_RESET_AT_FORK`` (45, the fork child's per-connection
+tracking reset — the one member that names a process event and no knob), and
+the deferred-parse pair ``PARSE_BACKLOG_FULL`` (46, the backlog's capacity
+bound — a transaction shipped unparsed to admit a newer one) /
+``PARSE_SKIPPED_AT_SHUTDOWN`` (47, the shutdown budget ran out first — same
+unparsed shipment, different knob, so a different member by the census rule).
 ``tests/test_limitation_census.py`` is the live count; this paragraph is its
 history, not its source.
 The census read every assignment and append site that reaches
@@ -491,6 +495,20 @@ Two emit sites, and the first is the mechanism the second restates.
     byte-seam span whose latched parent wardex discarded to stay inside a
     bound.
 
+    And from ``_interceptors/_seam.py``, on the deferred finalization's
+    parse exception: ``_assemble`` runs ``parse_llm_semantics`` under the
+    ``interceptors.seam.parse`` guard, and a parser that RAISES (as opposed
+    to answering None — "not an LLM body") marks the span with this member
+    and ships it. Before the deferred split that raise was swallowed
+    uncounted, and under AGENT mode with no parent the span vanished
+    entirely — a zero counter over deleted data, the exact I6 shape.
+
+    And from ``_client.py``, on the deferred-parse path's spawn failure:
+    ``capture_deferred`` could not bring the finalize worker up (a host at
+    its thread ulimit is the measured shape), so the job is finalized
+    inline, parse-less, carrying this member — wardex's own failure, and
+    the span still ships rather than silently losing captured bodies.
+
     Deliberately not ``CONTEXT_PROPAGATION_DEGRADED``, which is declared as a
     property of the RUNTIME — work whose carrier legitimately could not inherit
     the context. Reusing it here would file a wardex bug under "the host's
@@ -740,6 +758,28 @@ Two emit sites, and the first is the mechanism the second restates.
     prefix because the connection table is not WebSocket-specific.
     """
 
+    PARSE_SKIPPED_AT_SHUTDOWN = "parse_skipped_at_shutdown"
+    """The process was ending and the shutdown budget ran out before this
+    transaction's deferred LLM-semantic parse: it shipped unparsed rather than
+    not at all — transport, timing and status are measured; ``gen_ai`` is
+    absent because the parser never ran.
+
+    Emitted from ``_finalize.py`` — the single site that names it, on the
+    fallback ``drain_all`` assembles for every job still pending when the
+    shutdown budget ends (``Leftover.FALLBACK``: close and the signal path,
+    where a kept job would die with the process).
+
+    The knob is a SHUTDOWN BUDGET, not a capacity cap — ``close(timeout)`` /
+    ``batching.shutdown_timeout``, or wardex's own 2 s signal-flush budget —
+    which is what keeps it apart from ``PARSE_BACKLOG_FULL`` (same unparsed
+    shipment, capacity knob) under the census rule: the reader's next action
+    differs. Not ``SEMANTIC_PARSE_FAILED`` (the parser ran and understood
+    nothing) and not ``INSTRUMENTATION_DEGRADED`` (the parser raised): here
+    the parser was never given the chance. Same body-withholding rule as
+    ``PARSE_BACKLOG_FULL``: when wardex's own degradation is the only thing
+    that admitted the span past the capture gate, the payload stays home.
+    """
+
     OTLP_ATTRIBUTE_TRUNCATED = "otlp_attribute_truncated"
     """An attribute value hit ``max_otlp_attribute_bytes`` on the way out, so
     what a backend shows for it is a prefix of what wardex captured.
@@ -783,6 +823,30 @@ Two emit sites, and the first is the mechanism the second restates.
     the same family (path > 120 bytes, depth > 6) that no real provider
     usage object approaches — so every drop a real workload sees is
     ``max_extra_keys``'s, and the marker's knob is the user's next action.
+    """
+
+    PARSE_BACKLOG_FULL = "parse_backlog_full"
+    """The deferred-parse queue was full, so the OLDEST captured-but-unparsed
+    transaction shipped without its LLM-semantic parse — transport, timing and
+    status are measured; ``gen_ai`` is absent because the parser never ran on
+    this body.
+
+    Emitted from ``_finalize.py`` — the single site that names it: on the
+    eviction fallback when the backlog crosses ``max_parse_backlog`` /
+    ``max_parse_backlog_bytes``, and on the clamp that keeps a single
+    over-bound body out of the queue entirely (so the byte bound stays
+    literal).
+
+    Not ``BODY_CAP_EXCEEDED``, by the caps-band rule: that one caps what one
+    body KEEPS in raw bytes; this one caps how many finished transactions may
+    WAIT for the deferred parse. And not ``CONNECTION_EVICTED``: same
+    eviction shape, different table — that one drops connection STATE before
+    a transaction exists, while this one ships a finished transaction
+    unparsed, never silently. Not ``SEMANTIC_PARSE_FAILED`` either: that
+    marker means the parser RAN and understood nothing, this one means it
+    never ran. Raw bodies ride along EXCEPT when wardex's own degradation is
+    the only reason the span passed the capture gate — a body the user's mode
+    excluded must not leave the process because wardex was overloaded.
     """
 
     # ------------------------------------------------------------------

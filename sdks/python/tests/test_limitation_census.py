@@ -268,6 +268,14 @@ _MEMBER_SITES: dict[str, frozenset[str]] = {
     # names a process event and no knob — see its docstring for why it is not
     # CONNECTION_EVICTED.
     "TRACKING_RESET_AT_FORK": frozenset({"_interceptors/_seam.py"}),
+    # The deferred-parse queue's two unparsed shipments, every site in one
+    # file: `submit` decides PARSE_BACKLOG_FULL (the eviction and the
+    # oversize clamp hand it to the fallback helper), and `drain_all`'s
+    # FALLBACK arm decides PARSE_SKIPPED_AT_SHUTDOWN. The seam's `_assemble`
+    # only ATTACHES whatever member the queue chose — the word is chosen
+    # here, which is what makes one file the whole provenance.
+    "PARSE_BACKLOG_FULL": frozenset({"_finalize.py"}),
+    "PARSE_SKIPPED_AT_SHUTDOWN": frozenset({"_finalize.py"}),
     # Two emitters, one per bound that can evict a session: the registry closes
     # the oldest ROOT unit at `max_units`, and the
     # assembler closes the oldest SESSION at `max_sessions`. Both EMIT the root
@@ -325,6 +333,19 @@ _MEMBER_SITES: dict[str, frozenset[str]] = {
         {
             "_adapters/_context.py",
             "_assembly/_parentage.py",
+            # The client's spawn-failure downgrade: `capture_deferred` could
+            # not bring the finalize worker up (ulimit's "can't start new
+            # thread" is the measured shape), so the job is finalized inline,
+            # parse-less, carrying wardex's own-failure member — the same
+            # sentence `_adapters/_context.py` says about a unit whose open
+            # died.
+            "_client.py",
+            # The worker's parse guard: `_assemble` marks a span whose
+            # LLM-semantic parse RAISED (counted under
+            # `interceptors.seam.parse`) — the parser never returned an
+            # answer, so SEMANTIC_PARSE_FAILED would be a lie and silence
+            # was the pre-deferred defect this member closes.
+            "_interceptors/_seam.py",
             # `refused_ambient_marker`: an evict-origin stranded scope is
             # wardex's own bound at work, so the refusal says so instead of
             # CORRELATION_CONFLICT — the repair is `max_units`, not the
@@ -600,6 +621,12 @@ _EMITTED_MEMBERS: frozenset[str] = frozenset(
         # leaves a marker; landing the member with its emitter is what kept
         # the fork path from becoming the one silent exception.
         "TRACKING_RESET_AT_FORK",
+        # The deferred-parse queue's pair: minted one commit ahead of the
+        # queue, emitted from `_finalize.py` since the queue landed — the
+        # eviction/oversize fallback (46) and the shutdown-budget fallback
+        # (47).
+        "PARSE_BACKLOG_FULL",
+        "PARSE_SKIPPED_AT_SHUTDOWN",
     }
 )
 """Which MEMBERS have an emit site today, derived independently below.
@@ -1164,6 +1191,25 @@ _UNRESOLVED_PY: frozenset[tuple[str, str]] = frozenset(
         ("_adapters/_context.py", "Name:marker"),
         ("_interceptors/_seam.py", "Name:marker"),
         ("_interceptors/_seam.py", "Tuple"),
+        # `_seal`'s `timing_markers=tuple(timing_markers)` — the sealed copy
+        # of `_resolve_timing`'s tuple (plus, on a fork-crossing connection,
+        # TRACKING_RESET_AT_FORK, spelled out two lines above where
+        # `_MEMBER_SITES` records it). A container being frozen, not a value.
+        ("_interceptors/_seam.py", "Call:tuple"),
+        # The finalize queue's fallback helper `_fallback_now(entry, marker)`
+        # declares a marker-ish parameter, so R4 registers it and R9 makes it
+        # read-all. `Name:marker` is that parameter forwarded one line down
+        # (the members it carries are spelled at the two decision sites in
+        # the same file — the submit-path calls and drain_all's FALLBACK
+        # assignment — and `_MEMBER_SITES` records them). The other three are
+        # its ENTRY argument: a fresh `_Entry` at the oversize clamp
+        # (`Call:_Entry`), the evicted entry (`Name:old`) and drain_all's
+        # popped entry (`Name:entry`) — containers of a job and a scope
+        # snapshot, with no marker value of their own.
+        ("_finalize.py", "Call:_Entry"),
+        ("_finalize.py", "Name:entry"),
+        ("_finalize.py", "Name:marker"),
+        ("_finalize.py", "Name:old"),
         ("_interceptors/_socket.py", "Tuple"),
         ("_interceptors/_ssl.py", "Tuple"),
         ("_interceptors/_trackers.py", "Attribute:_req_limitations"),
@@ -1526,15 +1572,23 @@ _VOCABULARY: dict[str, str] = {
     #     knob — kept apart from CONNECTION_EVICTED because no limits field
     #     can make it go away ---
     "TRACKING_RESET_AT_FORK": "tracking_reset_at_fork",
+    # --- added after the census, by the deferred-parse queue (2): the same
+    #     unparsed shipment under two different knobs — the backlog's capacity
+    #     bound (max_parse_backlog / max_parse_backlog_bytes) and the shutdown
+    #     budget (close(timeout) / batching.shutdown_timeout / the 2 s
+    #     signal-flush) — kept apart by the census rule: the reader's next
+    #     action differs per knob ---
+    "PARSE_BACKLOG_FULL": "parse_backlog_full",
+    "PARSE_SKIPPED_AT_SHUTDOWN": "parse_skipped_at_shutdown",
 }
 
 
-def test_the_vocabulary_is_exactly_these_forty_five() -> None:
+def test_the_vocabulary_is_exactly_these_forty_seven() -> None:
     """15 declared before the census + 21 from it + 1 from §5.4 + 1 for wardex
     itself + 1 for the OTLP size guard + 1 for the registry breadth bound
     + 2 for the OTel bridge's fail-open pair + 1 for the adapter's per-session
-    bound + 1 for the dynamic-key bound + 1 for the fork tracking reset,
-    name by name.
+    bound + 1 for the dynamic-key bound + 1 for the fork tracking reset
+    + 2 for the deferred-parse queue's unparsed shipments, name by name.
 
     A count alone is not enough: a RENAME keeps the count and is the single most
     expensive mistake available here. These are proto enum values in

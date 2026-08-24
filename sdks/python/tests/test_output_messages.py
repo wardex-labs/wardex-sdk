@@ -78,7 +78,9 @@ def _post(url: str, body: bytes, path: str = "/v1/chat/completions") -> None:
 
 
 def _spans():
-    return [s for s in _hub.get_client()._spans if s.kind == SpanKind.CLIENT]
+    client = _hub.get_client()
+    client._settle()  # finalization runs on the worker; settle before reading
+    return [s for s in client._spans if s.kind == SpanKind.CLIENT]
 
 
 def test_text_response_emits_text_part_no_toolonly_marker():

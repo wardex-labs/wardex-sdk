@@ -359,7 +359,7 @@ def _calls_sink(rel: str, tree: ast.Module):
         return (
             isinstance(node, ast.Call)
             and isinstance(node.func, ast.Attribute)
-            and node.func.attr in ("capture_span", "capture_snapshot")
+            and node.func.attr in ("capture_span", "capture_snapshot", "capture_deferred")
         )
 
     return predicate
@@ -1124,14 +1124,19 @@ _CS4_BUDGET = {
     # `_assert_within_budget` only fails on `actual > budget`, so a number left
     # high is a free slot for a brand-new silent swallow that no test notices.
     "_interceptors/_mcp_stdio.py": 7,
-    # 5 -> 4, and the line below is where the fifth went. Extracting
-    # `build_grpc_fields` into `_semantics/` took its `except Exception:` with it.
-    # Leaving this at 5 would have handed the seam a free slot for a BRAND NEW
-    # silent swallow that no test would notice, because `_assert_within_budget`
-    # only fails on `actual > budget` — a stale-high number passes in silence.
-    # The pair of edits records a transfer; a lone decrement would be a discount
-    # for work nobody did.
-    "_interceptors/_seam.py": 4,
+    # 5 -> 4 when extracting `build_grpc_fields` into `_semantics/` took its
+    # `except Exception:` with it; 4 -> 3 when the deferred-parse split
+    # replaced `_parse_semantics`'s uncounted `except: return None` with the
+    # parse guard (`interceptors.seam.parse`) — the swallow is now counted,
+    # marked on the span (INSTRUMENTATION_DEGRADED) and logged under debug,
+    # which is exactly the graduation this budget exists to force. Lowered in
+    # the same commit rather than left stale: `_assert_within_budget` only
+    # fails on `actual > budget`, so a number left high is a free slot for a
+    # brand-new silent swallow that no test notices. The three that remain:
+    # the composed gate's fail-open (design §5.1 — losing data is worse than
+    # noise), the debug-log containment in `_on_response_bytes`, and
+    # `_peer`'s address fallback.
+    "_interceptors/_seam.py": 3,
     "_interceptors/_socket.py": 6,
     "_interceptors/_ssl.py": 6,
     "_semantics/_grpc.py": 1,
@@ -1248,7 +1253,14 @@ _CS5_BUDGET = {
     "_adapters/_assembler.py": 3,
     "_adapters/_sink.py": 1,
     "_interceptors/_mcp_stdio.py": 2,
-    "_interceptors/_seam.py": 2,
+    # 2 -> 3: `capture_deferred` is a THIRD door into the client sink — a
+    # new door, not a discount. It carries the same reentrancy stakes the
+    # rule text names (a span can skip the gate and the shared policy, and
+    # the call can be reached holding an SDK lock), and design §4.11 already
+    # promises more producers (MCP stdio, _otel_merge, an AdapterContext
+    # wrapper) — each of which must land HERE, as a counted budget change,
+    # not silently.
+    "_interceptors/_seam.py": 3,
 }
 
 

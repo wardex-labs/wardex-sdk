@@ -131,6 +131,82 @@ def test_sigterm_flushes_and_preserves_exit_code(tmp_path):
     assert marker.read_text() == "1"  # our handler flushed the span first
 
 
+_SIGTERM_PENDING_CHILD = """
+import contextvars, sys, time
+import wardex_sdk as wardex
+from wardex_sdk import NoOpTransport
+from wardex_sdk import _hub
+from wardex_sdk._enums import SpanKind
+from wardex_sdk._types import InternalSpan, SpanContext, SpanId, TraceId
+
+marker = sys.argv[1]
+
+def mark(envelope):
+    with open(marker, "w") as f:
+        f.write(",".join(sorted(s.name for s in envelope.spans)))
+    return None
+
+wardex.init(transport=NoOpTransport(), before_send_envelope=mark, intercept=False,
+            backend=wardex.BackendConfig(api_key="k"),
+            batching=wardex.BatchingConfig(flush_interval=3600.0))
+client = _hub.get_client()
+client.capture_span(InternalSpan(
+    context=SpanContext(TraceId.generate(), SpanId.generate()),
+    parent_span_id=None, name="buffered", kind=SpanKind.INTERNAL,
+    start_time_ns=1, end_time_ns=2))
+
+def _span(name):
+    return InternalSpan(
+        context=SpanContext(TraceId.generate(), SpanId.generate()),
+        parent_span_id=None, name=name, kind=SpanKind.INTERNAL,
+        start_time_ns=1, end_time_ns=2)
+
+class SlowJob:
+    size = 64
+    def __init__(self):
+        self.ctx = contextvars.copy_context()
+    def run(self):
+        time.sleep(1.5)  # slower than the signal path's half-budget
+        return _span("pending-parsed")
+    def fallback(self, marker_member):
+        return _span("pending-fallback")
+
+client._finalize.stop(0.1)  # keep the job PENDING until the signal drains it
+client.capture_deferred(SlowJob())
+print("ready", flush=True)
+time.sleep(60)
+"""
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX signal semantics")
+def test_sigterm_ships_the_pending_parse_too(tmp_path):
+    """The signal path is a flush with no second chance: a deferred job still
+    pending when SIGTERM lands must leave — parsed inside the half-budget or
+    as a PARSE_SKIPPED_AT_SHUTDOWN fallback after it — and the spans that
+    were already buffered must leave WITH it (the export keeps its floor)."""
+    script = tmp_path / "child.py"
+    script.write_text(_SIGTERM_PENDING_CHILD)
+    marker = tmp_path / "flushed.txt"
+    proc = subprocess.Popen(
+        [sys.executable, str(script), str(marker)],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert proc.stdout.readline().strip() == "ready"
+        proc.send_signal(signal.SIGTERM)
+        rc = proc.wait(timeout=15)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+    assert rc == -signal.SIGTERM
+    names = marker.read_text().split(",")
+    assert "buffered" in names
+    assert "pending-parsed" in names or "pending-fallback" in names
+    assert len(names) == 2
+
+
 @pytest.mark.skipif(not hasattr(os, "fork"), reason="fork is POSIX-only")
 def test_fork_child_respawns_worker_and_flushes():
     t = _Recording()

@@ -1,10 +1,17 @@
-"""Design §5.1 capture-policy matrix, unit-tested at the _should_capture hook."""
+"""Design §5.1 capture-policy matrix, unit-tested at the seam's composed gate.
+
+The subject is the MODULE function `_seam._should_capture` — since the
+deferred-parse split the gate is a function of its inputs (prefilter, txn,
+sem, mode) rather than a seam method, so the matrix drives it with the same
+inputs `_seal` would have snapshotted.
+"""
 
 from types import SimpleNamespace
 
 import pytest
 
 from wardex_sdk import _hub
+from wardex_sdk._assembly import Prefilter, capture_mode_of
 from wardex_sdk._client import Client
 from wardex_sdk._config import BackendConfig, WardexConfig
 from wardex_sdk._enums import CaptureMode
@@ -50,6 +57,18 @@ def _seam_with(mode: CaptureMode) -> _Seam:
     return s
 
 
+def _asks(seam: _Seam, txn, sem) -> bool:
+    """The question the old method answered, asked of the module gate with
+    the seam's own inputs — prefilter and mode exactly as `_seal` snapshots
+    them."""
+    return _seam._should_capture(
+        seam._transport_prefilter(SimpleNamespace()),
+        txn,
+        sem,
+        mode=capture_mode_of(seam._client),
+    )
+
+
 def _ctx(remote: bool) -> SpanContext:
     return SpanContext(trace_id=TraceId.generate(), span_id=SpanId.generate(), is_remote=remote)
 
@@ -79,7 +98,7 @@ def _llm_semantics_by_marker(monkeypatch):
 def test_agent_mode_matrix(sem, parent, expected):
     seam = _seam_with(CaptureMode.AGENT)
     txn = SimpleNamespace(parent=parent)
-    assert seam._should_capture(SimpleNamespace(), txn, sem) is expected
+    assert _asks(seam, txn, sem) is expected
 
 
 @pytest.mark.parametrize(
@@ -89,7 +108,7 @@ def test_agent_mode_matrix(sem, parent, expected):
 def test_all_mode_captures_everything(sem, parent):
     seam = _seam_with(CaptureMode.ALL)
     txn = SimpleNamespace(parent=parent)
-    assert seam._should_capture(SimpleNamespace(), txn, sem) is True
+    assert _asks(seam, txn, sem) is True
 
 
 def test_gate_fails_open_on_internal_error():
@@ -100,9 +119,21 @@ def test_gate_fails_open_on_internal_error():
         def __eq__(self, other):
             raise RuntimeError("boom")
 
-    assert seam._should_capture(SimpleNamespace(), txn, Boom()) is True
+    assert _asks(seam, txn, Boom()) is True
 
 
 def test_no_client_captures():
     s = _Seam()
-    assert s._should_capture(SimpleNamespace(), SimpleNamespace(parent=None), None) is True
+    assert _asks(s, SimpleNamespace(parent=None), None) is True
+
+
+def test_the_gate_is_a_module_function_not_a_method():
+    """The re-introduction guard: a `_should_capture` METHOD is how the
+    plaintext seam's divergence happened the first time, and a method is
+    also state the deferred worker could not have — the gate must be a
+    function of the sealed inputs alone."""
+    assert not hasattr(ByteSeamInterceptor, "_should_capture")
+    assert not hasattr(ByteSeamInterceptor, "_build_span")
+    assert not hasattr(ByteSeamInterceptor, "_assemble")
+    assert not hasattr(ByteSeamInterceptor, "_parse_semantics")
+    assert Prefilter is not None

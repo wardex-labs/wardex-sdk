@@ -81,6 +81,9 @@ dev = [
 
 [tool.pytest.ini_options]
 asyncio_mode = "strict"
+markers = [
+    "leaves_pending: this test deliberately leaves deferred-parse jobs pending (opts out of the conftest pending check)",
+]
 
 [tool.ruff]
 line-length    = 100

@@ -454,7 +454,14 @@ class Runtime:
                 # that is not already caught.
                 close_units(marker=Limitation.UNIT_INTERRUPTED)
             try:
-                client.flush(timeout=_SIGNAL_FLUSH_TIMEOUT)
+                # The shutdown arm of flush, not the public one: the process
+                # dies in this handler (SIG_DFL is re-raised below), so
+                # pending deferred parses are drained in FALLBACK — parsed
+                # inside half the budget, shipped as PARSE_SKIPPED_AT_SHUTDOWN
+                # after — and the export keeps a floor of the other half. A
+                # plain flush() would KEEP the leftover, and a kept job here
+                # is a job the process takes down with it.
+                client._shutdown_flush(_SIGNAL_FLUSH_TIMEOUT)
             except Exception:
                 pass  # a failed flush must never block the chain to the app's handler
         if callable(prev):

@@ -362,8 +362,13 @@ executor so the event loop keeps breathing:
 await asyncio.get_running_loop().run_in_executor(None, wardex.flush)
 ```
 
-Capture itself never blocks your coroutines: spans are buffered and exported
-from wardex's own background worker thread. `asyncio` tasks inherit the trace
+Capture itself never blocks your coroutines: spans are buffered, **parsed**
+and exported from wardex's own worker threads. The expensive step — the
+LLM-semantic parse of a completed response — runs on a dedicated
+`wardex-finalize-worker` thread with the GIL released, so a large streamed
+completion finishing does not stall the event loop; `flush()` finishes any
+pending parses before it sends (which is also why calling it from async code
+belongs in an executor, as above). `asyncio` tasks inherit the trace
 context automatically; only hand-started threads need
 `wardex.bind_context()` (above).
 
@@ -552,9 +557,9 @@ diagnostic line (traceback under `debug=True`).
 
 **Notes**
 - After `os.fork()` the SDK reinitializes its per-process state in the child
-  via `os.register_at_fork`: the inherited span buffer is discarded (the
-  parent still owns and exports it, so each span ships exactly once), locks
-  and the batch worker are recreated, per-connection/per-session tracking
+  via `os.register_at_fork`: the inherited span buffer and any pending parse
+  jobs are discarded (the parent still owns and exports them, so each span
+  ships exactly once), locks and the worker threads are recreated, per-connection/per-session tracking
   tables are reset (a span assembled on a connection that crossed the fork
   carries the `tracking_reset_at_fork` marker), and every batch stamps the
   live `process.pid`, so a parent and its forked children are distinguishable
@@ -583,6 +588,15 @@ wardex.init(
     )
 )
 ```
+
+The deferred-parse queue has its own pair: `max_parse_backlog` (2048) and
+`max_parse_backlog_bytes` (64 MiB) bound how many completed-but-unparsed
+transactions may wait for the finalize worker. Over either bound, the OLDEST
+waiter ships immediately without its `gen_ai` block, carrying the
+`parse_backlog_full` marker — never silently — and a transaction still
+pending when a shutdown budget runs out ships the same way under
+`parse_skipped_at_shutdown`. Resident memory is therefore at most one
+backlog plus one span buffer.
 
 **`max_body_bytes` bounds two quantities, and only one of them is a message.**
 Besides capping a captured request or response body, it caps the bytes ONE

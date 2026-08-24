@@ -185,6 +185,20 @@ pub struct Limits {
     /// depth > 6) that no real provider usage object approaches. Sized for the
     /// families that exist (a provider usage object has ~10-20 leaves).
     pub max_extra_keys: usize,
+    /// Maximum transactions held by the deferred-parse queue — bodies the byte
+    /// seams have captured but whose LLM-semantic parse has not yet run on the
+    /// finalize worker. Over → the OLDEST pending transaction ships unparsed,
+    /// carrying `parse_backlog_full`; never silent. Sized like
+    /// `max_buffer_spans`.
+    pub max_parse_backlog: usize,
+    /// Raw request+response bytes the deferred-parse queue may hold at once; the
+    /// second bound on the same queue, so one 32 MiB body cannot hide behind a
+    /// count. Same eviction, same marker. A single transaction larger than this
+    /// bound never enters the queue at all — it ships unparsed inline with the
+    /// same marker — so the bound is literal, not "plus one oversize job".
+    /// Sized like `max_buffer_bytes`: resident memory is at most one backlog
+    /// plus one span buffer.
+    pub max_parse_backlog_bytes: usize,
     /// Maximum spans buffered before the oldest are dropped.
     pub max_buffer_spans: usize,
     /// Maximum approximate bytes buffered across pending spans. The final
@@ -285,6 +299,8 @@ impl Default for Limits {
             max_link_targets: 256,
             mcp_sniff_bytes: 8192,
             max_extra_keys: 64,
+            max_parse_backlog: 2048,
+            max_parse_backlog_bytes: 64 * 1024 * 1024,
             max_buffer_spans: 2048,
             max_buffer_bytes: 64 * 1024 * 1024,
             replay_buffer_size: 100,
@@ -320,6 +336,8 @@ mod tests {
         assert_eq!(l.max_link_targets, 256);
         assert_eq!(l.mcp_sniff_bytes, 8192);
         assert_eq!(l.max_extra_keys, 64);
+        assert_eq!(l.max_parse_backlog, 2048);
+        assert_eq!(l.max_parse_backlog_bytes, 64 * 1024 * 1024);
         assert_eq!(l.max_buffer_spans, 2048);
         assert_eq!(l.max_buffer_bytes, 64 * 1024 * 1024);
         assert_eq!(l.replay_buffer_size, 100);

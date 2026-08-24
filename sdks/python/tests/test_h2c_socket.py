@@ -44,7 +44,9 @@ def _reset():
 
 
 def _client_spans():
-    return [s for s in _hub.get_client()._spans if s.kind == SpanKind.CLIENT]
+    client = _hub.get_client()
+    client._settle()  # finalization runs on the worker; settle before reading
+    return [s for s in client._spans if s.kind == SpanKind.CLIENT]
 
 
 def _h2c_server(body: bytes):

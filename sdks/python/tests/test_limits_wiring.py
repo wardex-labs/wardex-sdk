@@ -877,6 +877,12 @@ _DELIVERY: dict[str, tuple[tuple[str, Any], ...]] = {
     ),
     "mcp_sniff_bytes": (("mcp_proc_state", lambda s: _read(_proc_state(s), "_sniff_limit")),),
     "max_extra_keys": (("native", _nat("ssl_seam", "max_extra_keys")),),
+    "max_parse_backlog": (
+        ("finalize_queue", lambda s: _read(_read(s.client, "_finalize"), "_max_jobs")),
+    ),
+    "max_parse_backlog_bytes": (
+        ("finalize_queue", lambda s: _read(_read(s.client, "_finalize"), "_max_bytes")),
+    ),
     "max_buffer_spans": (("resolved_map", lambda s: _read(s.client, "_max_buffer_spans")),),
     "max_buffer_bytes": (("resolved_map", lambda s: _read(s.client, "_max_buffer_bytes")),),
     "max_otel_bridge_body_bytes": (
@@ -925,6 +931,8 @@ _ROUND_A = LimitsConfig(
     max_entries_per_unit=23,
     mcp_sniff_bytes=512,
     max_extra_keys=3,
+    max_parse_backlog=83,
+    max_parse_backlog_bytes=2097152,
     max_buffer_spans=29,
     max_buffer_bytes=65536,
     max_otel_bridge_body_bytes=131072,
@@ -949,6 +957,8 @@ _ROUND_B = LimitsConfig(
     max_entries_per_unit=67,
     mcp_sniff_bytes=1024,
     max_extra_keys=5,
+    max_parse_backlog=89,
+    max_parse_backlog_bytes=4194304,
     max_buffer_spans=71,
     max_buffer_bytes=131072,
     max_otel_bridge_body_bytes=262144,

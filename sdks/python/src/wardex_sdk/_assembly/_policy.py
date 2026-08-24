@@ -120,13 +120,19 @@ def should_capture(
     therefore a statement a site makes about itself, and it is reviewable
     precisely because it is written at the call.
 
-    `degraded` is "wardex is the reason no parent reached this call". Two
-    producers say it, and they are one fact seen at two moments:
-    `assembly._parentage.in_degraded_run()` — a span wardex FAILED to open is
-    what should have been ambient here — and the byte seam's
+    `degraded` is "wardex is the reason one of this gate's INPUTS is
+    missing". Three producers say it, and they are one fact seen at three
+    moments: `assembly._parentage.in_degraded_run()` — a span wardex FAILED
+    to open is what should have been ambient here; the byte seam's
     `_Txn.parent_evicted`, where a parent WAS latched and wardex's own
-    per-connection bound dropped the record before the response claimed it. It
-    is a DECLARED input rather than a `ContextVar` read hidden inside this
+    per-connection bound dropped the record before the response claimed it;
+    and the seam's `unparsed` — a finalization whose LLM-semantic parse
+    wardex itself skipped (backlog eviction, shutdown budget, a raising
+    parser), so the `agent_semantic` claim cannot honestly be answered.
+    The premise "no semantic claim means not agent traffic" is exactly as
+    wrong for a parse wardex skipped as "no parent means not agent work" is
+    for a parent wardex lost — the same argument, one input over. It is a
+    DECLARED input rather than a `ContextVar` read hidden inside this
     function, so the policy stays what its docstring says it is: a pure function
     of its arguments, testable by them, unable to raise on them.
 

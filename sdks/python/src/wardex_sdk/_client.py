@@ -9,8 +9,9 @@ import time
 import uuid
 from collections import deque
 from dataclasses import replace
+from typing import Any
 
-from ._assembly import diag_info, diag_warning, guard, report_once
+from ._assembly import Limitation, counters, diag_info, diag_warning, guard, report_once
 
 # The debug-gated traceback printer `guard()` itself uses: contained rendering
 # of a host exception (repr may raise, stderr may be gone) without a second
@@ -18,6 +19,8 @@ from ._assembly import diag_info, diag_warning, guard, report_once
 # `testing/harness.py` already reaches `reset_reports_for_test`.
 from ._assembly._diag import _log_with_traceback
 from ._config import WardexConfig
+from ._finalize import FinalizeQueue, Leftover
+from ._limits import LimitsConsumer, limits_kwargs
 from ._types import (
     Envelope,
     EnvelopeHeader,
@@ -347,6 +350,13 @@ def _accepts_timeout(transport: Transport) -> bool:
     return False
 
 
+#: `_admit`'s "read the ambient scope now" sentinel. A distinct object and not
+#: `None`: an empty scope SNAPSHOT (`({}, None)`) is a real answer — "nothing
+#: was set when this span was captured" — and must not fall through to a
+#: re-read of whatever the admitting thread's scope holds by then.
+_AMBIENT: Any = object()
+
+
 class _SpanBuffer:
     """A span deque and its approximate byte total, folded into one object so
     _drain() can only ever replace the *whole* pair via a single attribute
@@ -490,6 +500,14 @@ class Client:
         self._dropped = 0
         self._lost = 0
         self._closed = False
+        # Raised by `close()` immediately before its FINAL drain: a deferred
+        # parse that completes after that drain would admit into a buffer
+        # nothing will ever empty, so `_admit` reports it as a loss instead
+        # (see `_admit`). BEFORE the drain, not after — a flag raised after
+        # leaves a window in which a just-finished in-flight job is stranded
+        # silently, and the conservative direction is a loss report for a
+        # span the drain may in fact have shipped, never a silent parking.
+        self._finalize_drained = False
         # Whether THIS process registered its multiprocessing tail-flush
         # finalizer (see `_register_mp_tail_flush`). Reset by
         # `_at_fork_reinit`, because the flag answers a per-process question
@@ -532,6 +550,15 @@ class Client:
         self._max_buffer_spans = limits["max_buffer_spans"]
         self._max_buffer_bytes = limits["max_buffer_bytes"]
         self._flush_threshold = max(1, self._max_buffer_spans // 4)
+        # The deferred-parse queue. Its worker thread is LAZY — nothing spawns
+        # until the first `capture_deferred` calls `ensure_alive()` — so a
+        # client that only ever captures ready spans pays one allocation here
+        # and nothing else.
+        self._finalize = FinalizeQueue(
+            admit=self._admit,
+            debug=config.debug,
+            **limits_kwargs(LimitsConsumer.FINALIZE_QUEUE, limits),
+        )
         # None, not a number: the periodic drain is a background daemon that
         # nobody waits on, so it has no deadline to impose. Handing it one would
         # clamp the transport's own configured timeout on the *only* path that
@@ -565,16 +592,30 @@ class Client:
     def _buffered_bytes(self) -> int:
         return self._buffer.bytes
 
-    def _stamp_scope(self, span: InternalSpan) -> InternalSpan:
+    def _stamp_scope(
+        self,
+        span: InternalSpan,
+        merged: tuple[dict[str, str], Any] | None = None,
+    ) -> InternalSpan:
         """Fold the ambient scope's tags and user into the span's `extra`.
 
         This is the one place the scope stratum reaches the wire: every capture
-        path converges on `capture_span`, so stamping here is what makes
+        path converges on `_admit`, so stamping here is what makes
         `set_tag`/`set_user` mean something on EXPORTED spans instead of being
         write-only state. Read at capture time, from the calling context —
         which is the context the span was produced on, so an
         `isolation_scope()` block's tags reach exactly the spans captured
         inside it.
+
+        `merged` is a `(tags, user)` SNAPSHOT taken earlier, on the thread
+        that produced the span — the deferred-parse path's stamp. It exists
+        because `Scope` is MUTABLE and `contextvars.copy_context()` preserves
+        bindings, not the contents of the object bound: a worker re-reading
+        the scope at finalize time would stamp "the dict as it is now" rather
+        than "the dict as it was at capture", and one queued request later
+        that is another tenant's user id on this tenant's span (design §3.7).
+        `None` means "read the ambient scope now", which is the synchronous
+        path and exactly what this method always did.
 
         Precedence: a key the span already carries wins over the scope (a
         span-local `set_attribute` is more specific than ambient state), and
@@ -591,11 +632,14 @@ class Client:
         """
         stamped = span
         with guard("client.scope_stamp", debug=self._config.debug):
-            # Deferred import: `_hub` imports this module for the `Client`
-            # type, so the edge cannot exist at import time in this direction.
-            from . import _hub  # noqa: PLC0415
+            if merged is None:
+                # Deferred import: `_hub` imports this module for the `Client`
+                # type, so the edge cannot exist at import time in this
+                # direction.
+                from . import _hub  # noqa: PLC0415
 
-            tags, user = _hub.get_merged_tags_and_user()
+                merged = _hub.get_merged_tags_and_user()
+            tags, user = merged
             if tags or user is not None:
                 taken = {key for key, _ in span.extra}
                 additions: list[tuple[str, str | int | float | bool]] = []
@@ -620,8 +664,88 @@ class Client:
     def capture_span(self, span: InternalSpan) -> None:
         if self._closed:
             return
+        self._admit(span)
+
+    def capture_deferred(self, job: Any) -> None:
+        """Hand one sealed `DeferredSpan` to the finalize queue.
+
+        A TOTAL function: no branch raises. The byte seam calls this inside
+        its own guard, but design §4.11 promises producers outside the seam,
+        so this method may not lean on a caller's guard for its containment.
+
+        Order matters and each step is doing one thing:
+
+        1. a closed client REFUSES, and counts the refusal — unlike
+           `capture_span`'s silent return, a sealed job represents bodies the
+           seam already captured, and dropping those uncounted is the silent
+           loss I6 forbids;
+        2. the mutable-Scope snapshot is taken HERE, on the submitting
+           thread, right now (§3.7): `set_user(B)` one request later must
+           not retag this request's span. Guarded, because the host may be
+           mutating the scope's dicts on another thread this very instant;
+        3. the worker spawn is guarded separately (`ulimit` can make
+           `Thread.start` raise), and a spawn failure DOWNGRADES rather than
+           drops: the job is finalized inline, parse-less, carrying
+           `INSTRUMENTATION_DEGRADED` — wardex's own failure, wardex's own
+           marker.
+        """
+        if self._closed:
+            counters.bump("client.finalize.rejected_closed")
+            return
+        scope: tuple[dict[str, str], Any] = ({}, None)
+        with guard("client.scope_stamp", debug=self._config.debug):
+            # Deferred import: `_hub` imports this module for the `Client`
+            # type, so the edge cannot exist at import time in this direction.
+            from . import _hub  # noqa: PLC0415
+
+            scope = _hub.get_merged_tags_and_user()
+        alive = False
+        with guard("client.finalize.spawn", debug=self._config.debug):
+            self._finalize.ensure_alive()
+            alive = True
+        if not alive:
+            with guard("client.finalize.fallback", debug=self._config.debug):
+
+                def assemble() -> Any:
+                    return job.fallback(Limitation.INSTRUMENTATION_DEGRADED)
+
+                span = job.ctx.run(assemble)
+                if span is not None:
+                    self._admit(span, scope=scope)
+            return
+        self._finalize.submit(job, scope)
+
+    def _admit(self, span: InternalSpan, *, scope: Any = _AMBIENT) -> None:
+        """Stamp `span` and put it in the buffer — every capture path's tail.
+
+        `capture_span` is the public synchronous door and keeps exactly one
+        job: the `_closed` check. This method deliberately does NOT repeat it,
+        because its other caller is the finalize queue, whose jobs must land
+        even while `close()` is mid-teardown — step 4 of `close()` finalizes
+        pending parses precisely so their spans reach the final drain.
+
+        `scope` is `_AMBIENT` (read the calling context's scope now — the
+        synchronous path, unchanged behaviour) or the `(tags, user)` snapshot
+        a `capture_deferred` took on the submitting thread. A sentinel and
+        not `None`, because an EMPTY snapshot is a real value: "there were no
+        tags at capture time" must not decay into "read whatever this worker
+        thread's scope holds now" (design §3.7).
+        """
+        if self._finalize_drained:
+            # A deferred parse finished after close()'s final drain: nothing
+            # will ever empty the buffer again, so parking the span there
+            # would be a silent loss wearing a resident disguise. Counted and
+            # said instead (I-F3). Not a race — a parse that outlives about
+            # twice the close budget opens this window deterministically.
+            self._report_lost(
+                1,
+                why="a deferred parse finished after close() had already drained the buffer.",
+                key="wardex.finalize.after_close",
+                fix="Raise batching.shutdown_timeout / close(timeout), or flush() before close().",
+            )
+            return
         self._worker.ensure_alive()  # fork/thread-death recovery (design §8)
-        span = self._stamp_scope(span)
+        span = self._stamp_scope(span) if scope is _AMBIENT else self._stamp_scope(span, scope)
         size = _span_size(span)
         with self._buffer_lock:
             # Drop-oldest on either bound: recent spans are worth more. The byte
@@ -741,15 +865,69 @@ class Client:
         # the default stopped following the transport, and so would any future
         # wardex-chosen budget that meant to. See `_UnnamedTimeout.
         # follows_transport`.
+        #
+        # Both branches finalize pending parses BEFORE exporting — "flush and
+        # it is all visible" is the user contract — and each phase spends ITS
+        # OWN budget (I-F11): a parse backlog must never eat the export's
+        # floor. On the bare branch the POST still receives the transport's
+        # own number, UNMODIFIED — the docstring above and
+        # `test_flush_budget.py` pin that contract, and subtracting parse
+        # time from it would break it in exactly the condition (a large
+        # backlog) this queue exists for. On the explicit branch the caller
+        # named one wall clock, so the parse phase may spend at most half and
+        # the export keeps `max(t/2, what is left)`.
         if isinstance(timeout, _UnnamedTimeout) and timeout.follows_transport:
-            self._drain(_configured_transport_timeout(self._transport))
+            t = _configured_transport_timeout(self._transport)
+            self._finalize.drain_all(time.monotonic() + t, leftover=Leftover.KEEP)
+            self._drain(t)
             return
         # How long to wait and whose number it is are two questions. This branch
         # answers the first ("as long as you said") and `_named_by_caller` the
         # second -- wardex calls its own flush() from the signal handler with a
         # number of its own choosing, which is honoured as a bound exactly like a
         # host's and must NOT be blamed on the host like one.
-        self._drain(_sanitize_timeout(timeout), named_by_caller=_named_by_caller(timeout))
+        budget = _sanitize_timeout(timeout)
+        start = time.monotonic()
+        self._finalize.drain_all(start + budget / 2, leftover=Leftover.KEEP)
+        # `requested` rides separately from the wall budget: the parse phase
+        # consumed real time out of the caller's t, but the number the caller
+        # NAMED — the one the cut-short report quotes back at them — is still
+        # exactly t, and quoting the shrunken remainder would accuse them of
+        # a number they never wrote.
+        self._drain(
+            max(budget / 2, budget - (time.monotonic() - start)),
+            named_by_caller=_named_by_caller(timeout),
+            requested=budget,
+        )
+
+    def _shutdown_flush(self, timeout: float) -> None:
+        """The signal handler's flush — a flush with no second chance.
+
+        `Runtime.handle_signal` re-raises the signal with SIG_DFL after this
+        returns, so the process is ENDING: `KEEP` would discard the pending
+        parses with it, which is why the parse phase runs in FALLBACK — every
+        job leaves, parsed if the half-budget allowed and as a
+        `PARSE_SKIPPED_AT_SHUTDOWN` fallback if not (fallbacks are µs each,
+        so the queue is always empty afterwards). The export keeps a floor of
+        half the budget (I-F11): on the throttled pod this design is for, a
+        parse drain that ate the whole 2 s would turn "the backlog's tail is
+        lost" into "nothing is exported at all" — including the spans that
+        were already buffered before the signal.
+        """
+        budget = _sanitize_timeout(timeout)
+        start = time.monotonic()
+        self._finalize.drain_all(start + budget / 2, leftover=Leftover.FALLBACK)
+        self._drain(
+            max(budget / 2, budget - (time.monotonic() - start)),
+            named_by_caller=False,
+        )
+
+    def _settle(self, timeout: float = DEFAULT_TIMEOUT) -> None:
+        """TEST-ONLY (`_spans`'s sibling): finalize pending parses, export
+        nothing. The deterministic replacement for the "HTTP call, then read
+        `client._spans`" synchronous-availability assumption the deferred
+        path removed."""
+        self._finalize.drain_all(time.monotonic() + timeout, leftover=Leftover.KEEP)
 
     def _acquire_export_slot(self, budget: float | None) -> bool:
         """Take the export lock, waiting no longer than `budget` for it.
@@ -783,6 +961,7 @@ class Client:
         *,
         final: bool = False,
         named_by_caller: bool = False,
+        requested: float | None = None,
     ) -> None:
         """Export everything buffered, within `timeout` seconds end to end.
 
@@ -921,7 +1100,14 @@ class Client:
                         # back here) nor reported.
                         return
                     envelope = maybe
-                shipped = self._export(envelope, deadline, timeout if named_by_caller else None)
+                # `requested` (when given) is the number the caller actually
+                # NAMED; `timeout` may be that number minus what the finalize
+                # phase already spent, and the cut-short report must quote the
+                # caller's own figure, never wardex's remainder.
+                named = (
+                    (requested if requested is not None else timeout) if named_by_caller else None
+                )
+                shipped = self._export(envelope, deadline, named)
             except Exception as exc:  # fail-closed: drop, never ship half-filtered data
                 # Also not routed into `_undelivered`, deliberately. A raise
                 # means an attempt of unknown outcome -- the transport may have
@@ -1266,17 +1452,32 @@ class Client:
             if self._closed:
                 return
             self._closed = True  # 1. reject new captures
-        # `budget` is a per-step budget, not a total for close(). Steps 2-4 can
-        # each spend it, so the worst case is roughly 3x -- but each step is now
-        # bounded, where step 3 previously had no bound at all: it inherited the
-        # rest of whatever POST the worker was still inside when step 2's join
-        # gave up on it. Deliberately not one shared deadline: steps 2 and 3
-        # wait on the same event (the in-flight POST ending), so charging step 3
-        # for what step 2 already spent would leave the final drain nothing and
+        # `budget` is a per-step budget, not a total for close(). The steps
+        # below can each spend it, so the worst case is roughly 4x — the two
+        # stops wait on the same events as the drains that follow them and do
+        # not add a full budget of their own, and the finalize drain is one
+        # budget. Each step is bounded, where the final drain previously had
+        # no bound at all: it inherited the rest of whatever POST the worker
+        # was still inside when the join gave up on it. Deliberately not one
+        # shared deadline: consecutive steps wait on the same event (the
+        # in-flight POST ending), so charging a later step for what an
+        # earlier one already spent would leave the final drain nothing and
         # abandon tails close() can currently still deliver.
-        self._worker.stop(budget)  # 2. worker exits without draining
-        self._drain(budget, final=True, named_by_caller=named_by_caller)  # 3. final drain
-        self._close_transport(budget)  # 4.
+        self._worker.stop(budget)  # 2. batch worker exits without draining
+        self._finalize.stop(budget)  # 3. finalize worker finishes its job, joins
+        # 4. every pending parse is finished — parsed while the budget lasts,
+        #    shipped as a PARSE_SKIPPED_AT_SHUTDOWN fallback after (FALLBACK
+        #    always leaves the queue empty; close has no later drain to KEEP
+        #    them for).
+        self._finalize.drain_all(time.monotonic() + budget, leftover=Leftover.FALLBACK)
+        # 4.5 raised BEFORE the final drain, not after: a flag raised after
+        #     leaves a window — final drain done, flag not yet up — in which
+        #     an in-flight job's late span sits in the buffer silently. Raised
+        #     before, that same span is (conservatively) reported as lost by
+        #     `_admit`; there is no silent branch either way.
+        self._finalize_drained = True
+        self._drain(budget, final=True, named_by_caller=named_by_caller)  # 5. final drain
+        self._close_transport(budget)  # 6.
 
     def _at_fork_reinit(self) -> None:
         """Fork-child reset — runs from `Runtime.after_in_child` step 2.
@@ -1312,6 +1513,11 @@ class Client:
         # documented holdout entry per site.
         self._close_lock = threading.Lock()
         self._worker._at_fork_reinit()
+        # The deferred-parse queue: lock/CV replaced, inherited jobs discarded
+        # WITHOUT emitting (I-fork-3 — the parent sealed them, owns them, and
+        # exports them; a child that finished its copy would ship the same
+        # transaction twice).
+        self._finalize._at_fork_reinit()
         # Per-process, so a grandchild answers "not yet" and registers its own
         # tail-flush finalizer (the inherited registration is the CHILD's).
         self._mp_tail_flush_registered = False

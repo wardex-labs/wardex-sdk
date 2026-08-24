@@ -94,7 +94,9 @@ def _post(url: str, body: bytes) -> None:
 
 
 def _client_spans():
-    return [s for s in _hub.get_client()._spans if s.kind == SpanKind.CLIENT]
+    client = _hub.get_client()
+    client._settle()  # finalization runs on the worker; settle before reading
+    return [s for s in client._spans if s.kind == SpanKind.CLIENT]
 
 
 def test_tool_call_extracted_to_output_messages():

@@ -67,6 +67,8 @@ class LimitsConfig:
     max_entries_per_unit: int | None = None
     mcp_sniff_bytes: int | None = None
     max_extra_keys: int | None = None
+    max_parse_backlog: int | None = None
+    max_parse_backlog_bytes: int | None = None
     max_buffer_spans: int | None = None
     max_buffer_bytes: int | None = None
     max_otel_bridge_body_bytes: int | None = None
@@ -118,6 +120,7 @@ class LimitsConsumer(Enum):
     WS_TRACKER = "ws_tracker"
     CONN_TIMING = "conn_timing"
     MCP_PROC_STATE = "mcp_proc_state"
+    FINALIZE_QUEUE = "finalize_queue"
 
 
 class _Delivery(NamedTuple):
@@ -212,6 +215,15 @@ _LIMIT_DELIVERY: dict[LimitsConsumer, _Delivery] = {
         delivers={"sniff_limit": "mcp_sniff_bytes"},
         native=frozenset({"limits"}),
         passthrough=frozenset({"mode", "debug"}),
+    ),
+    LimitsConsumer.FINALIZE_QUEUE: _Delivery(
+        target="wardex_sdk._finalize:FinalizeQueue",
+        delivers={
+            "max_jobs": "max_parse_backlog",
+            "max_bytes": "max_parse_backlog_bytes",
+        },
+        native=frozenset(),
+        passthrough=frozenset({"admit", "debug"}),
     ),
 }
 
