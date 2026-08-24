@@ -71,7 +71,9 @@ OPENAI_RESP = json.dumps(
 
 
 def _client_span():
-    return [s for s in _hub.get_client()._spans if s.kind == SpanKind.CLIENT][0]
+    client = _hub.get_client()
+    client._settle()  # finalization runs on the worker; settle before reading
+    return [s for s in client._spans if s.kind == SpanKind.CLIENT][0]
 
 
 def test_openai_chat_semantics_filled():

@@ -39,6 +39,8 @@ def test_uvloop_async_capture_populates_handshake(tls_server):
     code = uvloop.run(call())
     assert code == 200
 
-    sp = [s for s in _hub.get_client()._spans if s.kind == SpanKind.CLIENT][0]
+    client = _hub.get_client()
+    client._settle()  # finalization runs on the worker; settle before reading
+    sp = [s for s in client._spans if s.kind == SpanKind.CLIENT][0]
     assert sp.transport.connection_reused is False
     assert sp.transport.timing.tls_handshake_ms > 0.0
