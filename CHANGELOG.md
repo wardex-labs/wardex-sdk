@@ -147,25 +147,37 @@ All notable changes to this project are documented here. The format follows
   by test.
 - **`ClaudeStreamEvent.input_tokens` (native module) changed MEANING**, raw →
   inclusive, same correction as above; the field name and type are unchanged.
-- **The Agent SDK OTel bridge demotes CLI usage on a conflicted join.** A
-  `claude_code.llm_request` that could not be merged used to re-emit the
-  CLI's `gen_ai.usage.*` keys (in underscore spellings) as top-level
-  attributes next to a model key — so one LLM call could be priced as two
-  GENERATIONs by any backend that classifies on the model attribute, and one
-  SDK stated one fact in two spellings. The quantity keys now land under
+- **The Agent SDK OTel bridge never re-emits the CLI's `gen_ai.usage.*`
+  keys as top-level attributes.** A conflicted `claude_code.llm_request` —
+  one the join could not merge — used to re-emit them (in underscore
+  spellings) as top-level attributes next to a model key — so one LLM call
+  could be priced as two GENERATIONs by any backend that classifies on the
+  model attribute, and one SDK stated one fact in two spellings. The
+  quantity keys now land under
   `wardex.anthropic_agent_sdk.otel.gen_ai.usage.*` — value preserved, quoted
-  rather than asserted, consistent with the `correlation_conflict` marker the
-  span already carries — while the identity keys (models, response id) keep
-  their names. Such a span now appears as a GENERATION with no usage and cost
-  0: the honest visual form of an unresolvable correlation, instead of a
-  hidden double bill. Watched by the
-  `adapters.anthropic.otel_bridge.usage_demoted_on_conflict` counter.
+  rather than asserted — while the identity keys (models, response id) keep
+  their names. The demotion applies to EVERY increment the bridge emits, not
+  only the conflicted join that exposed it: no increment is ever the
+  authoritative reporter of tokens (wardex's own `chat` span is), and a
+  conditional demotion rested on "pure increments carry no usage today" —
+  unpinned, and false the day the CLI stamps usage on `compaction`. A
+  conflicted span thus appears as a GENERATION with no usage and cost 0: the
+  honest visual form of an unresolvable correlation, instead of a hidden
+  double bill. Watched by the `adapters.anthropic.otel_bridge.usage_demoted`
+  counter.
 - **BREAKING (`wardex_sdk.testing`): `AdapterSubject` requires
-  `usage_expected: bool`.** No default, deliberately: a default would let a
-  new adapter silently opt out of the new inclusive-usage conformance check,
-  and that silent opt-out is the exact drift the check exists to stop.
-  Declaring `False` is enforced too — an adapter that starts shipping usage
-  without declaring its convention fails the suite.
+  `usage_expected: Literal["none", "totals", "cache_tiers"]`.** No default,
+  deliberately: a default would let a new adapter silently opt out of the
+  new inclusive-usage conformance check, and that silent opt-out is the
+  exact drift the check exists to stop. Three states rather than a bool
+  because two cannot describe an adapter whose runs carry usage totals but
+  no cache tier (any OpenAI-path adapter, or an Anthropic workload that
+  never caches) — under a bool such a subject failed both branches and the
+  suite was unpassable for it. `"none"` is enforced too — an adapter that
+  starts shipping usage without declaring its convention fails the suite —
+  and `"cache_tiers"` requires a PRESENT tier (`is not None`, so an honestly
+  reported 0 on a cold turn counts) so the input half of the inclusivity
+  invariant stays non-vacuous.
 
 ### Known ecosystem findings (not wardex defects)
 
@@ -178,6 +190,14 @@ All notable changes to this project are documented here. The format follows
 - wardex ships no `gen_ai.usage.total_tokens` (the key does not exist in the
   semconv registry). Langfuse's `totalTokens` column therefore reads 0 while
   `promptTokens`, `completionTokens` and every cost figure are exact.
+- The "backends subtract the cache tiers back out" claim is live-verified
+  for Langfuse only (the mapping oracle ran against a live instance). The
+  Phoenix half rests on reading OpenInference/Phoenix cost-tracking source
+  and has NOT been confirmed against a live Phoenix ingest — including
+  whether Phoenix prices `gen_ai.usage.*` natively, without an OpenInference
+  processor in front. The open check is the oracle's Phoenix counterpart
+  (the Langfuse e2e driver pointed at a live Phoenix); until someone runs
+  it, treat Phoenix cost columns under wardex as unverified.
 
 
 ## [0.5.0b1] - 2026-08-16
