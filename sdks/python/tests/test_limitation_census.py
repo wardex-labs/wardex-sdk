@@ -248,10 +248,15 @@ _MEMBER_SITES: dict[str, frozenset[str]] = {
     # --- unit / adapter lifecycle ---
     "CHILD_SPAN_UNCLOSED": frozenset({"_adapters/_assembler.py", "_assembly/_units.py"}),
     # The registry's own breadth bound: `UnitRegistry.open` (child table) and
-    # `Unit.open_span` (open-draft table). The assembler's `_open_tool`
-    # eviction deliberately keeps CHILD_SPAN_UNCLOSED — different knob
-    # (max_session_entries) — see the member's docstring.
+    # `Unit.open_span` (open-draft table). The assembler's per-session tables
+    # are the same shape under a DIFFERENT knob (`max_session_entries`) and
+    # carry SESSION_ENTRY_TABLE_FULL below — see both members' docstrings for
+    # why a generalization in the core limits table is still a separate field.
     "UNIT_TABLE_FULL": frozenset({"_assembly/_units.py"}),
+    # The adapter's per-session bound, every site in one file: the open-tool
+    # eviction, the sub-agent eviction, and the completion half that reports
+    # the same eviction from the other end.
+    "SESSION_ENTRY_TABLE_FULL": frozenset({"_adapters/_assembler.py"}),
     # Two emitters, one per bound that can evict a session: the registry closes
     # the oldest ROOT unit at `max_units`, and the
     # assembler closes the oldest SESSION at `max_sessions`. Both EMIT the root
@@ -565,6 +570,13 @@ _EMITTED_MEMBERS: frozenset[str] = frozenset(
         # vocabulary-without-an-emitter, applied at authoring time.
         "OTEL_BRIDGE_NO_DATA",
         "OTEL_BRIDGE_SCHEMA_UNKNOWN",
+        # The fourteenth: the adapter's per-session bound, minted WITH its
+        # sites in the same PR for the same reason. Two of those sites are a
+        # marker swap the way UNIT_TABLE_FULL was (the open-tool eviction gave
+        # up CHILD_SPAN_UNCLOSED) and two are new capability — a sub-agent
+        # eviction that used to drop its span entirely, and the completion half
+        # that reports the same eviction from the other end.
+        "SESSION_ENTRY_TABLE_FULL",
     }
 )
 """Which MEMBERS have an emit site today, derived independently below.
@@ -1035,14 +1047,18 @@ _UNRESOLVED_PY: frozenset[tuple[str, str]] = frozenset(
         # a conditional expression, which the scanner reads. `_client.py` left
         # the list the same way (a local derived from a deadline).
         ("_types.py", "Tuple"),
-        # `_build_tool(sess, tool, end_ns, failed, markers, error_type)` declares
+        # `_build_tool(sess, tool, end_ns, status, markers, error_type)` declares
         # a marker-ish parameter, so R4 registers it; R9 then makes it read-all
         # because a marker container goes in. Its other arguments land here.
         # None of them can hold a marker string — they are a session, a tool
-        # record, a timestamp, a bool and an `error.type`.
+        # record, a timestamp, a `StatusCode`, an `error.type` and the bridge
+        # join-eligibility flag. `Name:status` is where `Name:failed` used to
+        # sit: the bool became the field it was encoding, so the third outcome
+        # (UNSET, what a bound owes a call it stopped watching) is expressible.
         ("_adapters/_assembler.py", "Name:end_ns"),
         ("_adapters/_assembler.py", "Name:error_type"),
-        ("_adapters/_assembler.py", "Name:failed"),
+        ("_adapters/_assembler.py", "Name:mergeable"),
+        ("_adapters/_assembler.py", "Name:status"),
         ("_adapters/_assembler.py", "Name:marker"),
         ("_adapters/_assembler.py", "Name:markers"),
         ("_adapters/_assembler.py", "Name:sess"),
@@ -1457,6 +1473,10 @@ _VOCABULARY: dict[str, str] = {
     "OTLP_ATTRIBUTE_TRUNCATED": "otlp_attribute_truncated",
     # --- added after the census, by the registry breadth bound (1) ---
     "UNIT_TABLE_FULL": "unit_table_full",
+    # --- added after the census, by the adapter's per-session bound (1): the
+    #     same shape one layer out, kept apart because raising the per-unit
+    #     knob leaves this one exactly where it was ---
+    "SESSION_ENTRY_TABLE_FULL": "session_entry_table_full",
     # --- added after the census, by the Agent SDK OTel bridge (2): its two
     #     fail-open outcomes, kept apart because the reader's next action
     #     differs (nothing arrived vs data arrived and meant nothing) ---
@@ -1465,10 +1485,11 @@ _VOCABULARY: dict[str, str] = {
 }
 
 
-def test_the_vocabulary_is_exactly_these_forty_two() -> None:
+def test_the_vocabulary_is_exactly_these_forty_three() -> None:
     """15 declared before the census + 21 from it + 1 from §5.4 + 1 for wardex
     itself + 1 for the OTLP size guard + 1 for the registry breadth bound
-    + 2 for the OTel bridge's fail-open pair, name by name.
+    + 2 for the OTel bridge's fail-open pair + 1 for the adapter's per-session
+    bound, name by name.
 
     A count alone is not enough: a RENAME keeps the count and is the single most
     expensive mistake available here. These are proto enum values in
@@ -2086,6 +2107,13 @@ def test_merges_lose_only_provenance() -> None:
         "grpc_message_truncated",  # max_body_bytes (application/grpc is "meaningful")
         # the 64 KiB content sample filled up. NOT max_ws_frame_bytes
         "ws_payload_truncated",  # ws_sample_bytes
+        # The two table bounds. `wardex-limits` calls the second a
+        # generalization of the first — same order, same semantics — and they
+        # still stay apart, because the rule is not whether two markers mean
+        # the same thing: it is whether raising the knob the reader was sent to
+        # makes the marker go away. These are separate FIELDS, so it does not.
+        "unit_table_full",  # max_entries_per_unit
+        "session_entry_table_full",  # max_session_entries
         "stream_buffer_exceeded",  # max_stream_buffer_bytes
         "unit_evicted",  # max_units
         "connection_evicted",  # max_connections

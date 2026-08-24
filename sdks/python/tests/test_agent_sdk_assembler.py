@@ -397,7 +397,16 @@ def test_a_claimed_tool_gets_no_hook_driven_span():
     assert asm.open_session_count() == 0
 
 
-def test_open_entry_cap():
+def test_open_entry_cap(tallies):
+    """300 opens over a 256-entry table: 44 evicted + 256 drained = 300.
+
+    The arithmetic is the point of the docstring — a reviewer reading the diff
+    sees one `== 300` become two numbers and must not read that as spans lost.
+    Every open tool still leaves exactly one span; what changed is that the 44
+    the BOUND closed and the 256 the TEARDOWN closed now say different things,
+    because the reader's next action differs: raise `max_session_entries`, or
+    find out why the session ended with tools open.
+    """
     client = FakeClient()
     asm = SessionAssembler(client)
     _outbound(asm, key=1)
@@ -410,14 +419,402 @@ def test_open_entry_cap():
         )
     asm.on_inbound(1, RESULT)
     asm.on_close(1, None)
-    # capped at 256 open entries: overflow force-closed with the unclosed marker
-    unclosed = [
-        s
-        for s in client.spans
-        if s.capture_integrity and Limitation.CHILD_SPAN_UNCLOSED in s.capture_integrity.limitations
+
+    def marked(marker):
+        return [
+            s
+            for s in client.spans
+            if s.capture_integrity and marker in s.capture_integrity.limitations
+        ]
+
+    evicted = marked(Limitation.SESSION_ENTRY_TABLE_FULL)
+    unclosed = marked(Limitation.CHILD_SPAN_UNCLOSED)
+    assert len(evicted) == 44
+    assert len(unclosed) == 256
+    assert len(evicted) + len(unclosed) == 300  # all eventually closed, none leaked
+    assert tallies("adapters.assembler.open_tool_table_full") == 44
+    # WHICH 44: the FIFO's witness. Ordered by start instant, the flag is a
+    # prefix — the oldest opens are the ones the bound closed.
+    tools = sorted(
+        (s for s in client.spans if s.name.startswith("execute_tool")),
+        key=lambda s: s.start_time_ns,
+    )
+    flags = [
+        s.capture_integrity is not None
+        and Limitation.SESSION_ENTRY_TABLE_FULL in s.capture_integrity.limitations
+        for s in tools
     ]
-    assert len(unclosed) == 300  # all eventually closed, none leaked
+    assert flags == [True] * 44 + [False] * 256
     assert asm.open_session_count() == 0
+
+
+def test_open_tool_eviction_names_the_session_entry_knob(tallies):
+    """The headline: a full `open_tools` table says which knob closed the span.
+
+    `child_span_unclosed` names no knob at all — it says a parent's teardown
+    closed the span, and no teardown happened here — so a reader chasing it
+    goes looking for a close that does not exist and concludes the agent
+    abandoned the tool. That is wardex blaming its own bound on the agent.
+    """
+    client = FakeClient()
+    asm = SessionAssembler(client, max_session_entries=1)
+    _outbound(asm, key=1)
+    asm.on_inbound(1, INIT)
+    for n in (1, 2):
+        asm.on_hook(
+            "PreToolUse",
+            {"session_id": "s-1", "tool_name": "Bash", "tool_input": {"command": "ls"}},
+            f"t{n}",
+        )
+
+    evicted = next(s for s in client.spans if s.name == "execute_tool Bash")
+    limits = evicted.capture_integrity.limitations
+    assert Limitation.SESSION_ENTRY_TABLE_FULL in limits
+    assert Limitation.CHILD_SPAN_UNCLOSED not in limits
+    assert evicted.status is StatusCode.UNSET
+    assert evicted.tool.call_id == "t1"
+    assert tallies("adapters.assembler.open_tool_table_full") == 1
+
+
+def test_the_evicted_tool_is_not_blamed_on_the_agent():
+    """UNSET and not ERROR, which is the other way to get this wrong.
+
+    ERROR would report wardex's own full table as a tool failure — status is
+    the first field anyone filters an agent run by — and `finish()` refuses an
+    ERROR with no type, so "fixing" the OK would arrive with a fabricated
+    `error.type` too. The bound stopped watching; it did not observe an outcome.
+    """
+    client = FakeClient()
+    asm = SessionAssembler(client, max_session_entries=1)
+    _outbound(asm, key=1)
+    asm.on_inbound(1, INIT)
+    for n in (1, 2):
+        asm.on_hook(
+            "PreToolUse",
+            {"session_id": "s-1", "tool_name": "Bash", "tool_input": {}},
+            f"t{n}",
+        )
+
+    evicted = next(s for s in client.spans if s.name == "execute_tool Bash")
+    assert evicted.status is StatusCode.UNSET
+    assert evicted.status is not StatusCode.ERROR
+    assert evicted.error_type is None
+
+
+def _tool_result(tool_use_id, content="ok", parent=None):
+    return {
+        "type": "user",
+        "session_id": "s-1",
+        "parent_tool_use_id": parent or tool_use_id,
+        "message": {
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": tool_use_id, "content": content}],
+        },
+    }
+
+
+def _evict_one_tool(client=None, cap=1, agent_id=None):
+    """Open `cap + 1` tools so the FIRST is evicted, and hand back the assembler.
+
+    The shared arrangement of every completion-after-eviction test: what they
+    differ on is which channel delivers the completion afterwards.
+    """
+    client = client or FakeClient()
+    asm = SessionAssembler(client, max_session_entries=cap)
+    _outbound(asm, key=1)
+    asm.on_inbound(1, INIT)
+    for n in range(cap + 1):
+        payload = {"session_id": "s-1", "tool_name": "Bash", "tool_input": {"command": "ls"}}
+        if agent_id is not None:
+            payload["agent_id"] = agent_id
+        asm.on_hook("PreToolUse", payload, f"t{n}")
+    return client, asm
+
+
+def _tools(client, call_id):
+    return [s for s in client.spans if s.tool is not None and s.tool.call_id == call_id]
+
+
+def _has(span, marker):
+    return span.capture_integrity is not None and marker in span.capture_integrity.limitations
+
+
+def test_a_late_close_after_an_eviction_is_the_same_bound_twice(tallies):
+    """One call, two observations — not one call twice.
+
+    Before the breadcrumb, a `PostToolUse` whose open record had been evicted
+    built a brand-new record starting `now`: a second `execute_tool` of ZERO
+    duration, carrying no marker, hanging off whatever parent the payload named,
+    and tagged `stdio` as though it had been reconstructed from the CLI's
+    stdout. Four wrong facts about one call, and the p50 it dragged down was
+    the visible one.
+    """
+    client, asm = _evict_one_tool()
+    asm.on_hook(
+        "PostToolUse",
+        {"session_id": "s-1", "tool_name": "Bash", "tool_response": "late"},
+        "t0",
+    )
+
+    spans = _tools(client, "t0")
+    assert len(spans) == 2
+    evicted, completion = spans
+    assert evicted.status is StatusCode.UNSET
+    assert _has(evicted, Limitation.SESSION_ENTRY_TABLE_FULL)
+    assert _has(completion, Limitation.SESSION_ENTRY_TABLE_FULL)
+    assert b"late" in completion.output_data
+    # The real duration, and the same parent: both come off the breadcrumb.
+    assert completion.start_time_ns == evicted.start_time_ns
+    assert completion.end_time_ns > completion.start_time_ns
+    assert completion.parent_span_id == evicted.parent_span_id
+    # A `PostToolUse` IS a hook. Missing the OPEN hook does not make the close
+    # a reconstruction from stdout.
+    assert CaptureSource.STDIO not in completion.capture_sources
+    assert tallies("adapters.assembler.tool_completion_after_evict") == 1
+
+
+def test_a_stream_result_after_an_eviction_gets_the_same_treatment(tallies):
+    """The other completion channel. `stdio` is TRUE here — this one really is
+    rebuilt from the CLI's stdout — which is what makes its absence on the hook
+    path a statement rather than an accident."""
+    client, asm = _evict_one_tool()
+    asm.on_inbound(1, _tool_result("t0", "late"))
+
+    spans = _tools(client, "t0")
+    assert len(spans) == 2
+    evicted, completion = spans
+    assert _has(completion, Limitation.SESSION_ENTRY_TABLE_FULL)
+    assert b"late" in completion.output_data
+    assert completion.start_time_ns == evicted.start_time_ns
+    assert completion.parent_span_id == evicted.parent_span_id
+    assert CaptureSource.STDIO in completion.capture_sources
+    assert tallies("adapters.assembler.tool_completion_after_evict") == 1
+
+
+def test_both_halves_of_a_subagents_tool_keep_the_same_parent():
+    """The stream path hardcoded `agent_id=None`, so the completion half of a
+    sub-agent's tool call landed on the session root while the evicted half hung
+    under the sub-agent. One call, two parents, and a subtree that reports a
+    shape it never had."""
+    client = FakeClient()
+    asm = SessionAssembler(client, max_session_entries=2)
+    _outbound(asm, key=1)
+    asm.on_inbound(1, INIT)
+    asm.on_hook("SubagentStart", {"session_id": "s-1", "agent_id": "a1"}, None)
+    for n in range(3):
+        asm.on_hook(
+            "PreToolUse",
+            {"session_id": "s-1", "tool_name": "Bash", "tool_input": {}, "agent_id": "a1"},
+            f"t{n}",
+        )
+    asm.on_inbound(1, _tool_result("t0", "late"))
+    asm.on_hook("SubagentStop", {"session_id": "s-1", "agent_id": "a1"}, None)
+
+    spans = _tools(client, "t0")
+    assert len(spans) == 2
+    evicted, completion = spans
+    assert completion.parent_span_id == evicted.parent_span_id
+    sub = next(s for s in client.spans if s.agent is not None and s.agent.id == "a1")
+    assert completion.parent_span_id == sub.context.span_id
+
+
+def test_a_completion_survives_the_stream_metadata_being_gone_too(tallies):
+    """The lookup order, asserted where it bites.
+
+    A full session table is a state in which BOTH bounded tables are full, so
+    `stream_tool_meta` missing and `open_tools` evicted is the common case
+    rather than the corner. Reading the breadcrumb after the `meta is None`
+    early return would drop this completion entirely — no span, no marker, no
+    counter — precisely when the bound is doing the most work.
+    """
+    client, asm = _evict_one_tool()
+    # Nothing ever put `t0` into `stream_tool_meta`: no assistant turn announced
+    # it, which is exactly what a refused metadata entry looks like downstream.
+    asm.on_inbound(1, _tool_result("t0", "late"))
+
+    spans = _tools(client, "t0")
+    assert len(spans) == 2
+    completion = spans[1]
+    assert _has(completion, Limitation.SESSION_ENTRY_TABLE_FULL)
+    assert completion.name == "execute_tool Bash"  # the name came off the breadcrumb
+    assert tallies("adapters.assembler.tool_completion_after_evict") == 1
+
+
+def test_a_tool_completes_at_most_twice_after_an_eviction(tallies):
+    """Hook AND stream both close one call: the second completion is suppressed.
+
+    Two overlapping spans is a documented reading rule; a third would pollute
+    the aggregates that rule already asks readers to correct for. What is lost
+    is one duplicate copy of a response the surviving half already carries.
+    """
+    client, asm = _evict_one_tool()
+    asm.on_inbound(1, _tool_result("t0", "late"))
+    asm.on_hook(
+        "PostToolUse",
+        {"session_id": "s-1", "tool_name": "Bash", "tool_response": "late"},
+        "t0",
+    )
+
+    assert len(_tools(client, "t0")) == 2
+    assert tallies("adapters.assembler.tool_completion_after_evict") == 1
+    assert tallies("adapters.assembler.tool_completion_after_evict_duplicate") == 1
+
+
+def test_a_close_with_no_open_and_no_breadcrumb_is_counted(tallies):
+    """The residue: mid-session install, or a breadcrumb table that itself
+    overflowed. The span still ships — with a zero duration, which is the honest
+    consequence of not knowing when the call started — and the counter is the
+    only place that fact is recorded."""
+    client = FakeClient()
+    asm = SessionAssembler(client)
+    _outbound(asm, key=1)
+    asm.on_inbound(1, INIT)
+    asm.on_hook(
+        "PostToolUse",
+        {"session_id": "s-1", "tool_name": "Bash", "tool_response": "ok"},
+        "orphan",
+    )
+
+    span = _tools(client, "orphan")[0]
+    assert not _has(span, Limitation.SESSION_ENTRY_TABLE_FULL)
+    assert CaptureSource.STDIO not in span.capture_sources
+    assert tallies("adapters.assembler.tool_close_without_open") == 1
+
+
+def _subagents(client):
+    return [s for s in client.spans if s.agent is not None and s.name.startswith("invoke_agent ")]
+
+
+def test_the_subagent_table_evicts_and_emits_instead_of_dropping(tallies):
+    """The worse half of the same bound: this one said nothing at all.
+
+    A full `subagents` table simply refused to open the new entry — no span, no
+    counter, and the sub-agent's whole subtree quietly re-parented onto the
+    session root. One site of a bound reporting the wrong thing while its
+    sibling reports nothing is the inconsistency the vocabulary census exists to
+    catch.
+    """
+    client = FakeClient()
+    asm = SessionAssembler(client, max_session_entries=1)
+    _outbound(asm, key=1)
+    asm.on_inbound(1, INIT)
+    for agent_id in ("a1", "a2"):
+        asm.on_hook("SubagentStart", {"session_id": "s-1", "agent_id": agent_id}, None)
+
+    evicted = _subagents(client)
+    assert len(evicted) == 1
+    assert evicted[0].agent.id == "a1"
+    assert _has(evicted[0], Limitation.SESSION_ENTRY_TABLE_FULL)
+    assert evicted[0].status is StatusCode.UNSET
+    assert tallies("adapters.assembler.subagent_table_full") == 1
+
+
+def test_an_evicted_subagents_children_keep_their_parent():
+    """The eviction must not change the SHAPE of the tree.
+
+    FIFO evicts the oldest, which is the longest-lived, which is the outermost
+    sub-agent — the one with the most still-open work beneath it. Its anchors
+    are resolved at EMIT time and all three lookups fall silently to the session
+    root, so without the breadcrumb this trades one silent drop for a whole
+    silently flattened subtree, and nothing in the data says so.
+    """
+    client = FakeClient()
+    asm = SessionAssembler(client, max_session_entries=2)
+    _outbound(asm, key=1)
+    asm.on_inbound(1, INIT)
+    asm.on_hook("SubagentStart", {"session_id": "s-1", "agent_id": "a1"}, None)
+    asm.on_hook(
+        "PreToolUse",
+        {"session_id": "s-1", "tool_name": "Bash", "tool_input": {}, "agent_id": "a1"},
+        "t1",
+    )
+    for agent_id in ("a2", "a3"):  # a3 evicts a1, whose tool is still open
+        asm.on_hook("SubagentStart", {"session_id": "s-1", "agent_id": agent_id}, None)
+    asm.on_hook(
+        "PostToolUse", {"session_id": "s-1", "tool_name": "Bash", "tool_response": "ok"}, "t1"
+    )
+    asm.on_close(1, None)  # ships the session root, so "not the root" is checkable
+
+    a1 = next(s for s in _subagents(client) if s.agent.id == "a1")
+    tool = _tools(client, "t1")[0]
+    assert tool.parent_span_id == a1.context.span_id
+    root = next(s for s in client.spans if s.name == "invoke_agent")
+    assert tool.parent_span_id != root.context.span_id
+
+
+def test_a_subagent_stop_after_an_eviction_is_counted_not_dropped(tallies):
+    """No completion half, and no silent return either.
+
+    A tool's completion half exists because the close carries OUTPUT bytes. A
+    `SubagentStop` carries nothing this SDK reads — the assembler takes the
+    `agent_id` off it and no more — so a second span would hold nothing. What is
+    lost is the true end instant, and the counter is where that is recorded.
+    """
+    client = FakeClient()
+    asm = SessionAssembler(client, max_session_entries=1)
+    _outbound(asm, key=1)
+    asm.on_inbound(1, INIT)
+    for agent_id in ("a1", "a2"):
+        asm.on_hook("SubagentStart", {"session_id": "s-1", "agent_id": agent_id}, None)
+    before = len(_subagents(client))
+    asm.on_hook("SubagentStop", {"session_id": "s-1", "agent_id": "a1"}, None)
+
+    assert len(_subagents(client)) == before
+    assert tallies("adapters.assembler.subagent_stop_after_evict") == 1
+
+
+def _assistant_with(*tool_uses, msg_id="m1"):
+    return {
+        "type": "assistant",
+        "session_id": "s-1",
+        "message": {
+            "id": msg_id,
+            "model": "claude-sonnet-5",
+            "stop_reason": "tool_use",
+            "usage": {"input_tokens": 10, "output_tokens": 25},
+            "content": [
+                {"type": "tool_use", "id": tu_id, "name": "Bash", "input": {"command": cmd}}
+                for tu_id, cmd in tool_uses
+            ],
+        },
+    }
+
+
+def test_the_stream_meta_bound_keeps_what_is_consumed_next_and_counts_the_drop(tallies):
+    """The third table under the same bound, and the only one with no span.
+
+    Nothing to mark, so the counter IS the record — a bound that turns
+    something away in silence is what this whole change is about. The DIRECTION
+    stays refuse-the-newest, against the symmetry argument: both consumers pop
+    by the id whose result arrived, and in a turn the results come back broadly
+    in announcement order, so the oldest entry is the one most likely to be read
+    next. Correctness beats policy symmetry, and there was no measurement
+    supporting the swap.
+
+    What the refusal costs is asserted here rather than described, because it
+    lands in two different places: a hook-closed call keeps its span and silently
+    carries the hook's re-serialized input instead of the byte-exact stream one,
+    while a stream-only call has no span at all.
+    """
+    client = FakeClient()
+    asm = SessionAssembler(client, max_session_entries=1)
+    _outbound(asm, key=1)
+    asm.on_inbound(1, INIT)
+    asm.on_inbound(1, _assistant_with(("keep", "ls -1"), ("dropped", "ls -2")))
+
+    assert tallies("adapters.assembler.stream_tool_meta_table_full") == 1
+    sess = asm._by_key[1]
+    assert list(sess.stream_tool_meta) == ["keep"]
+
+    # (i) the entry that survived still supplies byte-exact input
+    asm.on_inbound(1, _tool_result("keep", "ok"))
+    kept = _tools(client, "keep")
+    assert len(kept) == 1
+    assert b"ls -1" in kept[0].input_data
+
+    # (ii) the refused one, on the stream-only path, has no span to mark
+    asm.on_inbound(1, _tool_result("dropped", "ok"))
+    assert _tools(client, "dropped") == []
 
 
 def test_the_session_id_becomes_a_lookup_alias_for_the_units_own_context():

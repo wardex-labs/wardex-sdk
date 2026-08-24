@@ -26,8 +26,62 @@ All notable changes to this project are documented here. The format follows
     so a host that re-initialised with a different value kept the original for
     the life of the process — and what it saw was a spurious
     `connect_timing_unavailable`, which names no knob.
+- **A full per-session table blamed the agent, or said nothing at all.**
+  `max_session_entries` bounds four tables inside the Anthropic Agent SDK
+  assembler, and three of them reported crossing it wrongly.
+  - An evicted OPEN TOOL shipped `child_span_unclosed` with status `ok`. That
+    marker names no knob — it says a parent's teardown closed the span — so a
+    reader went looking for a close that never happened and concluded the agent
+    had abandoned the tool. It now ships `session_entry_table_full`, which
+    names `max_session_entries`, with status **UNSET**: the bound stopped the
+    observation before the outcome, so `ok` claimed a success nobody watched
+    and `error` would report wardex's own full table as a tool failure.
+  - An evicted SUB-AGENT was not opened at all — no span, no counter — and
+    every span beneath it silently re-parented onto the session root. It is now
+    evicted and emitted like a tool, and its span context is remembered so its
+    children keep the parent they had.
+  - A refused streamed-tool-metadata entry is counted. It owns no span, so
+    there is nothing to mark; the refusal direction is unchanged (that table is
+    consumed in arrival order, so the oldest entry is the one most likely to be
+    read next).
+- **A tool that completed after being evicted shipped as a second call.** Its
+  span started at the completion instant, so it had a duration of zero that
+  dragged tool-latency percentiles down; it carried no marker; on the stream
+  path it hung off the session root even when the call belonged to a
+  sub-agent; and it was tagged `stdio`, claiming a hook-delivered call had been
+  reconstructed from the CLI's stdout. The last of those was wrong
+  independently of any eviction — installing the adapter mid-session makes a
+  lone `PostToolUse` the normal case — and is fixed at the source.
+- **With the OTel bridge on, the CLI's tool duration landed on the wrong
+  half.** The merge joins by popping `tool_use_id`, and an evicted call that
+  completes puts two records under one id with the truncated half first, so it
+  took the CLI's measurement and became the anchor for the CLI's child spans.
+  The CLI times the whole call, so its number now goes to the half that
+  represents the whole call.
+
 ### Added
 
+- **`session_entry_table_full`** (`wardex.v1.Limitation` 43) — a per-session
+  table crossed `max_session_entries` and its oldest entry was force-closed and
+  emitted to admit a new one. Distinct from `unit_table_full` (40) even though
+  the core limits table calls the per-unit knob a generalization of this one:
+  they are separate FIELDS, so raising one leaves the other where it was, and a
+  reader sent to the wrong knob changes nothing about the marker they are
+  looking at.
+
+  **One call, two observations.** An evicted tool call that later completes now
+  ships **two** spans with the same `call_id`, both carrying this marker, and
+  they OVERLAP: the `UNSET` one is `[start, evicted]` — the window wardex
+  actually watched, holding the input bytes — and the other is `[start, end]`,
+  the whole call, holding the output bytes. **A latency aggregate must exclude
+  the spans carrying this marker AND `UNSET`, or it counts the call twice.**
+  What this replaces is a zero-duration phantom that polluted the same
+  aggregates with no way to exclude it.
+- Nine counters under `adapters.assembler.` for the bound's every site:
+  `open_tool_table_full`, `subagent_table_full`, `stream_tool_meta_table_full`,
+  `evicted_tool_table_full`, `evicted_subagent_table_full`,
+  `tool_completion_after_evict`, `tool_completion_after_evict_duplicate`,
+  `tool_close_without_open`, `subagent_stop_after_evict`.
 - `assembly._units.record_truncated` counts units whose recorded payload was
   cut by the body cap. The fact was already on each span
   (`capture_integrity.truncated`); the counter answers the aggregate question
@@ -49,6 +103,12 @@ All notable changes to this project are documented here. The format follows
   than the core default.
 - The private `McpToolCatalog` no longer takes `max_entries` in its
   constructor; `apply_bound(max_entries=...)` is the single handle.
+- `crates/wardex-limits` documents `max_session_entries` the way it already
+  documented its sibling: four containers rather than three, which eviction
+  reaches the wire and which is only counted, and the marker and counter names
+  for each. `max_entries_per_unit`'s own paragraph stops naming
+  `child_span_unclosed`, which it stopped emitting when `unit_table_full`
+  landed.
 
 ## [0.5.0b1] - 2026-08-16
 

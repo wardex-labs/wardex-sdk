@@ -20,7 +20,7 @@ import json
 import threading
 import time
 from dataclasses import replace
-from typing import Any
+from typing import Any, TypeVar
 
 from .._assembly import (
     Evidence,
@@ -61,7 +61,15 @@ from ._otel_merge import (
     classify,
     join_chats,
 )
-from ._session_state import _BridgeBinding, _OpenSubagent, _OpenTool, _PendingSpan, _Session
+from ._session_state import (
+    _BridgeBinding,
+    _EvictedSubagent,
+    _EvictedTool,
+    _OpenSubagent,
+    _OpenTool,
+    _PendingSpan,
+    _Session,
+)
 from ._sink import _ClientSink
 
 # Every span this assembler emits below the session root hangs off a context the
@@ -99,6 +107,10 @@ _IN_SESSION = Evidence(ParentSource.UNIT_ACTIVE)
 # there would claim the timing is absent when it is the one timing the adapter
 # owns.
 _BASE_LIMITATION = Limitation.TRANSPORT_TIMING_UNAVAILABLE_SUBPROCESS
+
+#: Value type of a per-session table, so `_room_for` hands the caller back the
+#: record it evicted rather than an `Any` the caller has to re-narrow.
+_TableValue = TypeVar("_TableValue")
 
 #: Whose runs these are. It must equal the adapter's `name()`, because that is
 #: what the `AdapterContext` is built with and therefore what `sole_live(...,
@@ -372,7 +384,15 @@ class SessionAssembler:
             elif ev.kind == "assistant_turn":
                 self._emit_chat(sess, ev, now)
                 for tu_id, tu_name, tu_input in ev.tool_uses:
-                    if len(sess.stream_tool_meta) < self._max_session_entries:
+                    # Refuse the NEWEST and keep the oldest, which is the
+                    # opposite of the two tables above and deliberate. Nothing
+                    # here owns a span, and both consumers
+                    # (`_close_tool`, `_on_stream_tool_result`) pop by the id
+                    # whose RESULT arrived — in a turn, results come back
+                    # broadly in the order the uses were announced, so the
+                    # oldest entry is the one most likely to be read next.
+                    # Evicting it would discard exactly that.
+                    if self._has_room(sess.stream_tool_meta, "stream_tool_meta"):
                         sess.stream_tool_meta[tu_id] = (tu_name, tu_input)
             elif ev.kind == "tool_result":
                 self._on_stream_tool_result(sess, ev, now)
@@ -419,7 +439,35 @@ class SessionAssembler:
                 self._close_tool(sess, payload, tool_use_id, now, failed=event.endswith("Failure"))
             elif event == "SubagentStart":
                 agent_id = payload.get("agent_id")
-                if agent_id and len(sess.subagents) < self._max_session_entries:
+                if agent_id:
+                    evicted = self._room_for(sess.subagents, "subagent")
+                    if evicted is not None:
+                        # This table used to REFUSE the newest entry with no
+                        # span and no counter — the same bound as the open-tool
+                        # table saying nothing where its sibling said the wrong
+                        # thing. Evicting the oldest and emitting it is what the
+                        # bound owes an entry that owns a span.
+                        evicted_id, entry = evicted
+                        self._emit_subagent_entry(
+                            sess,
+                            entry,
+                            evicted_id,
+                            now,
+                            markers=(Limitation.SESSION_ENTRY_TABLE_FULL,),
+                            status=StatusCode.UNSET,
+                        )
+                        # And the ANCHOR outlives the span, because the three
+                        # lookups that resolve a sub-agent do so at EMIT time.
+                        # Without this, evicting the oldest — i.e. the
+                        # longest-lived, outermost one — would re-parent every
+                        # still-open tool and every later chat turn beneath it
+                        # onto the session root and say nothing: one silent drop
+                        # traded for a whole silently flattened subtree. A
+                        # context stays a valid parent after its span ships.
+                        self._room_for(sess.evicted_subagents, "evicted_subagent")
+                        sess.evicted_subagents[evicted_id] = _EvictedSubagent(
+                            context=entry.draft.context, agent_type=entry.agent_type
+                        )
                     agent_type = payload.get("agent_type") or "sub_agent"
                     draft = SpanDraft(
                         child_of(sess.unit.context, _IN_SESSION),
@@ -773,11 +821,15 @@ class SessionAssembler:
         Returns the ANCHOR (a context this session already holds), not a span id:
         the edge itself is `child_of`'s to build. Selecting which anchor is still
         this method's job, and it is still a heuristic — a `parent_tool_use_id`
-        that resolves to nothing (the hook has not landed yet, or the subagent
-        was never recorded because `_max_session_entries` was reached) silently
-        re-parents to the session root. Making the session a unit and giving
-        in-process tool calls a real edge did NOT change that, deliberately:
-        rewriting this method is the ingestion move design §3.4 schedules
+        that resolves to nothing silently re-parents to the session root. What
+        reaches that fallback is narrower than it used to be: a sub-agent over
+        `_max_session_entries` is now recorded and then evicted rather than never
+        recorded, and its `_EvictedSubagent` breadcrumb keeps the context, so the
+        root fallback is left with a hook that has not landed yet, or a
+        breadcrumb that itself fell out of the same bound. Making the session a
+        unit and giving in-process tool calls a real edge did NOT change the
+        fallback, deliberately: rewriting this method is the ingestion move
+        design §3.4 schedules
         separately — it stops choosing an anchor and produces a `UnitKey` for
         `UnitRegistry.resolve()`, which returns the evidence with the unit so the
         guess reports itself. Until then, no span this method feeds may claim a
@@ -785,12 +837,17 @@ class SessionAssembler:
         """
         if not parent_tool_use_id:
             return sess.unit.context
-        sub = sess.subagents.get(parent_tool_use_id)
+        agent_id = parent_tool_use_id
+        sub = sess.subagents.get(agent_id)
         if sub is None:
             open_tool = sess.open_tools.get(parent_tool_use_id)
             if open_tool is not None and open_tool.agent_id is not None:
-                sub = sess.subagents.get(open_tool.agent_id)
-        return sub.draft.context if sub is not None else sess.unit.context
+                agent_id = open_tool.agent_id
+                sub = sess.subagents.get(agent_id)
+        if sub is not None:
+            return sub.draft.context
+        crumb = sess.evicted_subagents.get(agent_id)
+        return crumb.context if crumb is not None else sess.unit.context
 
     def _emit_chat(self, sess: _Session, ev: AgentStreamEvent, now: int) -> None:
         if sess.bridge is not None:
@@ -928,12 +985,24 @@ class SessionAssembler:
         """
         if not parent_tool_use_id:
             return None
-        if parent_tool_use_id in sess.subagents:
+        if self._known_subagent(sess, parent_tool_use_id):
             return parent_tool_use_id
         open_tool = sess.open_tools.get(parent_tool_use_id)
-        if open_tool is not None and open_tool.agent_id in sess.subagents:
+        if open_tool is not None and self._known_subagent(sess, open_tool.agent_id):
             return open_tool.agent_id
         return None
+
+    @staticmethod
+    def _known_subagent(sess: _Session, agent_id: str | None) -> bool:
+        """Live, or evicted-but-remembered. One question, three call sites.
+
+        An evicted sub-agent is still a real scope: its context is a valid
+        parent and its subtree keeps its shape, so a chat turn inside it is
+        still that turn's scope key and not the main thread.
+        """
+        return agent_id is not None and (
+            agent_id in sess.subagents or agent_id in sess.evicted_subagents
+        )
 
     def _claim_key(self, sess: _Session, tool_name: str) -> UnitKey | None:
         """This hook observation's slot in the shared key space, or None.
@@ -948,6 +1017,42 @@ class SessionAssembler:
         if key is None:
             counters.bump("adapters.assembler.tool_name_unattributable")
         return key
+
+    def _room_for(
+        self, table: dict[str, _TableValue], where: str
+    ) -> tuple[str, _TableValue] | None:
+        """FIFO room for one more entry in a per-session table. Caller holds `_lock`.
+
+        The assembler's half of `Unit._evict_oldest`, written to the same shape
+        on purpose: one bound, one policy, two containers with different
+        owners. Returns the evicted `(key, value)` so the CALLER decides what an
+        evicted entry owes the wire — a span (open tools, sub-agents) or a
+        breadcrumb (the two memories that outlive them).
+
+        Returns the pair rather than taking a callback so the non-evicting path,
+        which is every path until the table is full, allocates nothing: a
+        closure would be built on every insert to be discarded unused. That is
+        the same reason `Unit._evict_oldest` has this shape.
+        """
+        if len(table) < self._max_session_entries:
+            return None
+        oldest = next(iter(table))
+        value = table.pop(oldest)
+        counters.bump(f"adapters.assembler.{where}_table_full")
+        return oldest, value
+
+    def _has_room(self, table: dict[str, Any], where: str) -> bool:
+        """The refuse-the-newest half of the same bound, for a table whose
+        entries own NO span and whose consumers read it in ARRIVAL order.
+
+        Returns False and COUNTS the refusal — a bound that turns something away
+        in silence is the defect these two helpers exist to end, and a table
+        with no span to mark can still say so in a counter.
+        """
+        if len(table) < self._max_session_entries:
+            return True
+        counters.bump(f"adapters.assembler.{where}_table_full")
+        return False
 
     def _open_tool(self, sess: _Session, payload: dict, tool_use_id: str | None, now: int) -> None:
         if tool_use_id is None:
@@ -964,21 +1069,32 @@ class SessionAssembler:
             # execution, so §8.4 gives it the span. Nothing is opened here, which
             # is also what keeps `_finalize` from force-closing a phantom.
             return
-        if len(sess.open_tools) >= self._max_session_entries:
-            # Evict the oldest open entry (FIFO via dict insertion order) so the
-            # session cannot accumulate unbounded open-tool state.
-            oldest_id, oldest = next(iter(sess.open_tools.items()))
-            del sess.open_tools[oldest_id]
+        evicted = self._room_for(sess.open_tools, "open_tool")
+        if evicted is not None:
+            # The bound names ITSELF. `CHILD_SPAN_UNCLOSED` used to ride here and
+            # says a parent's teardown closed the span — a teardown that never
+            # happened — sending the reader to look for a close instead of to
+            # `max_session_entries`. UNSET rather than OK for the same reason:
+            # this span's outcome was never observed.
+            oldest_id, oldest = evicted
             self._emit_tool(
                 sess,
                 oldest,
                 now,
-                # Census rename (§6.5.1): `tool_span_unclosed` folded into the
-                # declared member `CHILD_SPAN_UNCLOSED`. Nothing is lost — the
-                # marker rides the tool span itself, where
-                # `gen_ai.operation.name=execute_tool` already says the child
-                # was a tool.
-                markers=(Limitation.CHILD_SPAN_UNCLOSED,),
+                status=StatusCode.UNSET,
+                markers=(Limitation.SESSION_ENTRY_TABLE_FULL,),
+                # Not a join target: see `_PendingSpan.mergeable`. The CLI timed
+                # the whole call, and this half is only the window wardex
+                # watched.
+                mergeable=False,
+            )
+            # Under the SAME bound, so the memory of evictions cannot outgrow
+            # what it remembers for. Overflowing it is itself counted: a
+            # completion arriving after that is a call this session can no
+            # longer recognize, and the counter is the only record of why.
+            self._room_for(sess.evicted_tools, "evicted_tool")
+            sess.evicted_tools[oldest_id] = _EvictedTool(
+                start_ns=oldest.start_ns, name=oldest.name, agent_id=oldest.agent_id
             )
         sess.open_tools[tool_use_id] = _OpenTool(
             tool_use_id=tool_use_id,
@@ -1006,20 +1122,52 @@ class SessionAssembler:
             # so the message is a follow-up while the type is this change.
             error_type = "tool_interrupted" if payload.get("is_interrupt") else "tool_error"
         tool = sess.open_tools.pop(tool_use_id, None)
+        after_evict = False
         if tool is None:
+            crumb = sess.evicted_tools.get(tool_use_id)
+            if crumb is not None and crumb.completed:
+                # The third observation of one call: hook and stream both
+                # closed it. Two spans is the documented overlap; a third would
+                # pollute the aggregates the overlap rule already asks readers
+                # to correct for, and what is lost is one duplicate copy of a
+                # response the other half already carries.
+                counters.bump("adapters.assembler.tool_completion_after_evict_duplicate")
+                sess.stream_tool_meta.pop(tool_use_id, None)
+                return
             key = self._claim_key(sess, payload.get("tool_name") or "unknown")
             if key is None:
                 # Unattributable name: the handler owns it. Drop the stream side
                 # too, or the tool would resurface through the stream-only path.
                 sess.stream_tool_meta.pop(tool_use_id, None)
                 return
+            if crumb is not None:
+                # The COMPLETION half of an eviction: same call id, same start
+                # instant, same parent, and the same marker reported from the
+                # other end. Without the breadcrumb this is a brand-new record
+                # starting `now`, i.e. a second tool call of zero duration under
+                # whatever parent the payload happened to name.
+                counters.bump("adapters.assembler.tool_completion_after_evict")
+                crumb.completed = True
+                after_evict = True
+            else:
+                # No open record and no breadcrumb: either the adapter was
+                # installed mid-session or the breadcrumb table itself
+                # overflowed. The span still ships, with `start_ns=now` and so a
+                # duration of zero, and the counter is what says why.
+                counters.bump("adapters.assembler.tool_close_without_open")
             tool = _OpenTool(
                 tool_use_id=tool_use_id,
-                name=payload.get("tool_name") or "unknown",
-                start_ns=now,
-                agent_id=payload.get("agent_id"),
+                name=crumb.name if crumb is not None else (payload.get("tool_name") or "unknown"),
+                start_ns=crumb.start_ns if crumb is not None else now,
+                agent_id=crumb.agent_id if crumb is not None else payload.get("agent_id"),
                 input_data=_safe_json_bytes(payload.get("tool_input", {})),
-                from_hook=False,
+                # TRUE, and it was wrong before the breadcrumb existed too.
+                # Reaching here means no `PreToolUse` was SEEN, not that no hook
+                # delivered this call — `from_hook` records who ANNOUNCED the
+                # call, and a `PostToolUse` is a hook. False put `stdio` in
+                # `capture_sources`, reporting a hook-observed call as
+                # reconstructed from the CLI's stdout.
+                from_hook=True,
                 claim_key=key,
             )
         meta = sess.stream_tool_meta.pop(tool_use_id, None)
@@ -1033,17 +1181,39 @@ class SessionAssembler:
                 tool.input_data = stream_input
         if "tool_response" in payload:
             tool.output_data = _safe_json_bytes(payload.get("tool_response"))
-        self._emit_tool(sess, tool, now, failed=failed, error_type=error_type)
+        self._emit_tool(
+            sess,
+            tool,
+            now,
+            status=StatusCode.ERROR if failed else StatusCode.OK,
+            # Spelled at the call site rather than carried in a local named
+            # `markers`: the vocabulary census reads any argument bound to a
+            # marker-ish NAME as evidence that its callee is a marker sink, and
+            # `_emit_tool` would then have every argument at every one of its
+            # call sites read as a marker — including the `error.type` strings.
+            markers=(Limitation.SESSION_ENTRY_TABLE_FULL,) if after_evict else (),
+            error_type=error_type,
+        )
 
     def _emit_tool(
         self,
         sess: _Session,
         tool: _OpenTool,
         end_ns: int,
-        failed: bool = False,
+        status: StatusCode = StatusCode.OK,
         markers: tuple[Limitation, ...] = (),
         error_type: str | None = None,
+        mergeable: bool = True,
     ) -> None:
+        """Emit (or pend) one tool span.
+
+        `status` and not the `failed: bool` this used to take. A boolean encodes
+        the status and the error type at once and has no room for the third
+        outcome — UNSET, which is what a bound owes a call it stopped watching
+        before the result. Naming the parameter after the field it sets also
+        makes a missed call site a `TypeError` instead of a silently flipped
+        status.
+        """
         if tool.claim_key is not None and outranked(sess.unit, tool.claim_key, HOOK_RANK):
             # Re-checked HERE and not only at open, because the handler wrapper
             # claims the key while the tool body runs — i.e. AFTER `PreToolUse`
@@ -1055,11 +1225,11 @@ class SessionAssembler:
             return
         if sess.bridge is not None:
             with self._guard("adapters.assembler.emit_tool"):
-                self._pend_tool(sess, tool, end_ns, failed, markers, error_type)
+                self._pend_tool(sess, tool, end_ns, status, markers, error_type, mergeable)
             return
         span = None
         with self._guard("adapters.assembler.emit_tool"):
-            span = self._build_tool(sess, tool, end_ns, failed, markers, error_type)
+            span = self._build_tool(sess, tool, end_ns, status, markers, error_type)
         if span is not None:
             self._capture(span)
 
@@ -1068,9 +1238,10 @@ class SessionAssembler:
         sess: _Session,
         tool: _OpenTool,
         end_ns: int,
-        failed: bool,
+        status: StatusCode,
         markers: tuple[Limitation, ...],
         error_type: str | None,
+        mergeable: bool,
     ) -> None:
         """Hold a hook/stream tool draft for the finalize-time merge.
 
@@ -1081,7 +1252,7 @@ class SessionAssembler:
         removing the marker is the merged-LLM deliverable, not this one.
         Deferral would buy nothing here, so nothing is deferred.
         """
-        draft = self._tool_draft(sess, tool, failed, markers, error_type)
+        draft = self._tool_draft(sess, tool, status, markers, error_type)
         draft.set_end_ns(end_ns)
         self._pend(
             sess,
@@ -1090,6 +1261,7 @@ class SessionAssembler:
                 kind="tool",
                 tool_use_id=tool.tool_use_id,
                 agent_id=tool.agent_id,
+                mergeable=mergeable,
             ),
         )
 
@@ -1098,17 +1270,17 @@ class SessionAssembler:
         sess: _Session,
         tool: _OpenTool,
         end_ns: int,
-        failed: bool,
+        status: StatusCode,
         markers: tuple[Limitation, ...],
         error_type: str | None,
     ) -> Any:
-        return self._tool_draft(sess, tool, failed, markers, error_type).finish(end_ns)
+        return self._tool_draft(sess, tool, status, markers, error_type).finish(end_ns)
 
     def _tool_draft(
         self,
         sess: _Session,
         tool: _OpenTool,
-        failed: bool,
+        status: StatusCode,
         markers: tuple[Limitation, ...],
         error_type: str | None,
     ) -> SpanDraft:
@@ -1117,6 +1289,12 @@ class SessionAssembler:
             sub = sess.subagents.get(tool.agent_id)
             if sub is not None:
                 anchor = sub.draft.context
+            else:
+                # The sub-agent's own span may have shipped already — its bound
+                # evicted it — and a shipped span's context is still a parent.
+                crumb = sess.evicted_subagents.get(tool.agent_id)
+                if crumb is not None:
+                    anchor = crumb.context
         p = child_of(anchor, _IN_SESSION)
 
         draft = SpanDraft(
@@ -1137,8 +1315,8 @@ class SessionAssembler:
                 execution_type=ToolExecutionType.UNKNOWN,
             )
         )
-        draft.set_status(StatusCode.ERROR if failed else StatusCode.OK)
-        if failed:
+        draft.set_status(status)
+        if status is StatusCode.ERROR:
             # `finish()` refuses ERROR without a type, which turns the
             # untyped-failure defect into a mechanism. The hook path refines
             # the type from the failure payload's `is_interrupt` flag before
@@ -1190,22 +1368,49 @@ class SessionAssembler:
             # PostToolUse hook is the authority that will close it.
             return
         meta = sess.stream_tool_meta.pop(tool_use_id, None)
-        if meta is None:
-            # Already handled via the hook path (both open_tools and
-            # stream_tool_meta are empty for this id) -> nothing to do.
+        # BEFORE the `meta is None` return and not after it. The state this
+        # whole change is about — a full session table — is exactly the state in
+        # which BOTH tables are full, so a completion whose metadata was refused
+        # and whose open record was evicted is the common case, not the corner.
+        # Looking the breadcrumb up after the early return would lose that
+        # completion entirely: no span, no marker, no counter.
+        crumb = sess.evicted_tools.get(tool_use_id)
+        if crumb is not None and crumb.completed:
+            counters.bump("adapters.assembler.tool_completion_after_evict_duplicate")
             return
-        name, input_json = meta
+        if meta is None and crumb is None:
+            # Already handled via the hook path (open_tools, stream_tool_meta
+            # and the breadcrumbs are all empty for this id) -> nothing to do.
+            return
+        name = (meta[0] if meta is not None else "") or (
+            crumb.name if crumb is not None else "unknown"
+        )
+        input_json = meta[1] if meta is not None else b""
         key = self._claim_key(sess, name)
         if key is None:
             # In-process tool the hook cannot attribute to one server: the
             # handler wrapper's span is authoritative, so the stream-only
             # fallback stands down too.
             return
+        after_evict = False
+        start_ns = sess.turn_start_ns or now
+        agent_id: str | None = None
+        if crumb is not None:
+            # The completion half again, from the stream side. `agent_id` comes
+            # off the breadcrumb rather than the `None` this path used to
+            # hardcode: without it the two halves of one call hang under two
+            # different parents, the evicted half under its sub-agent and the
+            # completion under the session root.
+            counters.bump("adapters.assembler.tool_completion_after_evict")
+            crumb.completed = True
+            after_evict = True
+            start_ns = crumb.start_ns
+            agent_id = crumb.agent_id
         tool = _OpenTool(
             tool_use_id=tool_use_id,
             name=name,
-            start_ns=sess.turn_start_ns or now,
-            agent_id=None,
+            start_ns=start_ns,
+            agent_id=agent_id,
             input_data=input_json,
             from_hook=False,
             output_data=ev.content_json or b"",
@@ -1219,23 +1424,39 @@ class SessionAssembler:
             sess,
             tool,
             now,
-            failed=ev.is_error,
+            status=StatusCode.ERROR if ev.is_error else StatusCode.OK,
+            markers=(Limitation.SESSION_ENTRY_TABLE_FULL,) if after_evict else (),
             error_type="tool_error" if ev.is_error else None,
         )
 
-    def _emit_subagent(self, sess: _Session, agent_id: str | None, now: int) -> None:
-        if agent_id is None:
-            return
-        entry = sess.subagents.pop(agent_id, None)
-        if entry is None:
-            return
+    def _emit_subagent_entry(
+        self,
+        sess: _Session,
+        entry: _OpenSubagent,
+        agent_id: str,
+        now: int,
+        *,
+        markers: tuple[Limitation, ...] = (),
+        status: StatusCode = StatusCode.OK,
+    ) -> None:
+        """Finish `entry`'s draft and emit (or pend) it.
+
+        Takes the RECORD, the way `_emit_tool` does, so the eviction site — which
+        already holds the record `_room_for` handed back — has something to call.
+        The pop-by-id shape is `_emit_subagent` below; a site that popped first
+        and then called that one would emit nothing at all.
+
+        Markers land BEFORE the pend, so an unmerged flush still carries them.
+        """
         if sess.bridge is not None:
             # The subagent draft was built at SubagentStart with its timing
             # marker already attached, and it keeps it merged or not: a
             # `subagent.spawn` cross-check adds the source, never a time
             # rewrite. Nothing to defer — held only so the merge can find it.
             with self._guard("adapters.assembler.emit_subagent"):
-                entry.draft.set_status(StatusCode.OK)
+                entry.draft.set_status(status)
+                for marker in markers:
+                    entry.draft.add_limitation(marker)
                 entry.draft.set_end_ns(now)
                 self._pend(
                     sess,
@@ -1244,10 +1465,33 @@ class SessionAssembler:
             return
         span = None
         with self._guard("adapters.assembler.emit_subagent"):
-            entry.draft.set_status(StatusCode.OK)
+            entry.draft.set_status(status)
+            for marker in markers:
+                entry.draft.add_limitation(marker)
             span = entry.draft.finish(now)
         if span is not None:
             self._capture(span)
+
+    def _emit_subagent(self, sess: _Session, agent_id: str | None, now: int) -> None:
+        """Pop by id and delegate — the `SubagentStop` / `_drain_children` shape.
+
+        A miss is no longer a silent return. After an eviction the entry is gone
+        and this stop observation is the only source of the real end instant, so
+        it is counted. No completion half is built: unlike a tool, a
+        `SubagentStop` carries no bytes this SDK reads — the assembler takes one
+        field off that payload, the `agent_id` used to look the entry up — so
+        there is nothing for a second span to hold. The evicted half already
+        says `[start, evicted]` with the marker and UNSET; what is lost is the
+        true end instant, and the counter is where that loss is recorded.
+        """
+        if agent_id is None:
+            return
+        entry = sess.subagents.pop(agent_id, None)
+        if entry is None:
+            if agent_id in sess.evicted_subagents:
+                counters.bump("adapters.assembler.subagent_stop_after_evict")
+            return
+        self._emit_subagent_entry(sess, entry, agent_id, now)
 
     # --- the bridge's pending buffer and finalize-time merge ---
 
@@ -1344,7 +1588,11 @@ class SessionAssembler:
 
         # (2) tools (exact join) and subagents (cross-check), both keyed.
         for rec in sess.pending:
-            if rec.kind == "tool" and rec.tool_use_id:
+            # `and rec.mergeable`: the join POPS by `tool_use_id`, so the first
+            # record under an id wins it. An evicted call that later completes
+            # pends two, stub first, and the stub is the one half the CLI's
+            # measurement does not describe.
+            if rec.kind == "tool" and rec.tool_use_id and rec.mergeable:
                 otel_tool = view.tools.pop(rec.tool_use_id, None)
                 if otel_tool is None:
                     continue
@@ -1571,7 +1819,7 @@ class SessionAssembler:
                 sess,
                 tool,
                 now,
-                failed=True,
+                status=StatusCode.ERROR,
                 markers=(Limitation.CHILD_SPAN_UNCLOSED,),
                 error_type="tool_unclosed",
             )

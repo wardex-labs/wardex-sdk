@@ -24,7 +24,7 @@ from wardex_sdk._adapters._otel_receiver import _OtelBridgeReceiver
 from wardex_sdk._adapters._session_state import _BridgeBinding
 from wardex_sdk._assembly import Limitation, counters
 from wardex_sdk._assembly._diag import reset_reports_for_test
-from wardex_sdk._enums import CaptureSource
+from wardex_sdk._enums import CaptureSource, StatusCode
 
 TRACE = "aa" * 16
 
@@ -424,6 +424,107 @@ def test_a_hand_built_otlp_post_merges_into_the_session_tree(receiver):
     # Pre-existing edges unchanged: the bridge adds, never re-parents.
     assert chat.parent_span_id == root.context.span_id
     assert tool.parent_span_id == root.context.span_id
+
+
+def _evicted_then_completed(asm, receiver, t0, t1, *, cap_fill=5):
+    """Open `cap_fill` tools over a 4-entry table so `t1` is evicted, then close
+    it — two pending records under one `tool_use_id` — and hand the CLI a tool
+    span for it."""
+    receiver.reserve(TRACE)
+    _outbound(asm, 1, bridge=_binding())
+    asm.on_inbound(1, INIT)
+    for n in range(1, cap_fill + 1):
+        asm.on_hook(
+            "PreToolUse",
+            {"session_id": "s-1", "tool_name": "Bash", "tool_input": {"command": "ls"}},
+            f"t{n}",
+        )
+    asm.on_hook(
+        "PostToolUse", {"session_id": "s-1", "tool_name": "Bash", "tool_response": "done"}, "t1"
+    )
+    return _otlp_build.request(
+        [
+            _otlp_build.span(
+                name="claude_code.interaction",
+                trace_id=TRACE,
+                span_id="01" * 8,
+                start_ns=t0,
+                end_ns=t1,
+                attrs={"session.id": "s-1"},
+            ),
+            _otlp_build.span(
+                name="claude_code.tool",
+                trace_id=TRACE,
+                span_id="03" * 8,
+                parent_span_id="01" * 8,
+                start_ns=t0,
+                end_ns=t0 + 7_000_000,
+                attrs={"tool_use_id": "t1", "tool_name": "Bash"},
+            ),
+            # A CLI child of the tool span, so "which half became the anchor"
+            # is observable rather than inferred.
+            _otlp_build.span(
+                name="claude_code.hook",
+                trace_id=TRACE,
+                span_id="04" * 8,
+                parent_span_id="03" * 8,
+                start_ns=t0 + 1_000_000,
+                end_ns=t0 + 6_000_000,
+            ),
+        ]
+    )
+
+
+def test_the_bridge_merges_the_completion_half_not_the_stub(receiver):
+    """The join pops by `tool_use_id`, and an eviction puts two records under one.
+
+    The stub is pended FIRST, so without a qualification field it wins the pop:
+    it would take the CLI's duration and the bridge source and become the anchor
+    for the CLI's children, while the half that holds the output and the real
+    interval fell through unmerged. The CLI measured the WHOLE call, so its
+    number belongs on the half that represents the whole call.
+    """
+    client = FakeClient()
+    asm = SessionAssembler(client, bridge=receiver, max_session_entries=4)
+    t0 = time.time_ns()
+    body = _evicted_then_completed(asm, receiver, t0, t0 + 20_000_000)
+    assert _post(receiver, body) == 200
+    asm.on_close(1, None)
+
+    halves = [s for s in client.spans if s.tool is not None and s.tool.call_id == "t1"]
+    assert len(halves) == 2
+    stub = next(s for s in halves if s.status is StatusCode.UNSET)
+    completion = next(s for s in halves if s is not stub)
+    for half in halves:
+        assert Limitation.SESSION_ENTRY_TABLE_FULL in _limitations(half)
+
+    key = "wardex.anthropic_agent_sdk.otel.tool_duration_ms"
+    assert dict(completion.extra)[key] == pytest.approx(7.0)
+    assert CaptureSource.OTEL_BRIDGE in completion.capture_sources
+    assert key not in dict(stub.extra)
+    assert CaptureSource.OTEL_BRIDGE not in stub.capture_sources
+
+    # ...and the CLI's own child hangs off the half that was merged.
+    child = _named(client.spans, "execute_step hook")
+    assert child.parent_span_id == completion.context.span_id
+    assert child.parent_span_id != stub.context.span_id
+
+
+def test_at_most_one_mergeable_tool_record_per_call_id(receiver):
+    """INV: within `sess.pending`, `tool_use_id` identifies at most one join
+    target. Asserted on runtime STATE rather than by reading the source, so a
+    duplicate arriving later for some other reason dies here first — the pop-key
+    join is structurally fragile to duplicates, and this is where that shows."""
+    client = FakeClient()
+    asm = SessionAssembler(client, bridge=receiver, max_session_entries=4)
+    t0 = time.time_ns()
+    _evicted_then_completed(asm, receiver, t0, t0 + 20_000_000)
+
+    pending = asm._by_key[1].pending
+    tool_ids = [r.tool_use_id for r in pending if r.kind == "tool" and r.tool_use_id]
+    assert tool_ids.count("t1") == 2, "the two halves must both be pending"
+    mergeable = [r.tool_use_id for r in pending if r.kind == "tool" and r.mergeable]
+    assert len(mergeable) == len(set(mergeable))
 
 
 def test_a_rejected_post_leaves_a_confirmed_session_with_the_no_data_marker(receiver):

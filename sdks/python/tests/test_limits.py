@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import ast
 import gzip
+import pathlib
 import tracemalloc
 
 import pytest
@@ -827,15 +829,35 @@ def _probe_max_sessions() -> bool:
 
 
 def _probe_max_session_entries() -> bool:
-    def open_tools(limits: LimitsConfig) -> int:
+    """Over the per-session cap, the oldest OPEN TOOL is force-closed and emitted.
+
+    Modelled on `_probe_max_entries_per_unit`, and for the same reason: a probe
+    that counted table entries alone would keep passing if the eviction moved
+    somewhere the marker no longer rides — which is exactly how this site spent
+    its life reporting a teardown that never happened. The table size AND the
+    marker on the span the bound closed.
+    """
+
+    def open_tools(limits: LimitsConfig) -> tuple[int, list]:
         asm = _assembler(limits)
         sess = asm._ensure_session(1, 1)
         for i in range(4):
             asm._open_tool(sess, {"tool_name": "t"}, f"id{i}", 1)
-        return len(sess.open_tools)
+        return len(sess.open_tools), asm._client.spans
 
-    tight = open_tools(LimitsConfig(max_session_entries=1))
-    return tight == 1 and open_tools(LimitsConfig()) == 4
+    tight, evicted = open_tools(LimitsConfig(max_session_entries=1))
+    roomy, none_evicted = open_tools(LimitsConfig())
+    return (
+        tight == 1
+        and roomy == 4
+        and none_evicted == []
+        and len(evicted) == 3
+        and all(
+            s.capture_integrity is not None
+            and Limitation.SESSION_ENTRY_TABLE_FULL in s.capture_integrity.limitations
+            for s in evicted
+        )
+    )
 
 
 def _probe_mcp_sniff_bytes() -> bool:
@@ -1217,3 +1239,190 @@ def test_a_configured_bound_reaches_the_registry_the_adapter_actually_uses():
     assert ctx._units._max_units == 7
     assert ctx._units._max_entries_per_unit == 3
     assert ctx.limits["max_units"] == 7
+
+
+# --- Structural guard: the session-entry bound has exactly one policy --------
+#
+# `max_session_entries` governs four per-session tables inside one class. The
+# defect this whole area is about is a bound that bites without saying so, and
+# the shape it takes is an inline `if len(table) < cap` at a fifth site written
+# later — which is exactly how three of the four sites came to disagree with
+# each other. These three guards make that shape fail the build instead.
+
+
+_ASSEMBLER = "_adapters/_assembler.py"
+_SESSION_STATE = "_adapters/_session_state.py"
+_SRC = pathlib.Path(__file__).resolve().parents[1] / "src" / "wardex_sdk"
+
+
+def _module(rel: str) -> ast.Module:
+    return ast.parse((_SRC / rel).read_text(encoding="utf-8"), filename=rel)
+
+
+def _functions(tree: ast.AST) -> list[ast.FunctionDef | ast.AsyncFunctionDef]:
+    return [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef | ast.AsyncFunctionDef)]
+
+
+def _calls_named(fn: ast.AST, names: set[str]) -> bool:
+    return any(
+        isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr in names
+        for n in ast.walk(fn)
+    )
+
+
+def test_max_session_entries_is_read_only_where_the_policy_lives():
+    """Four reading sites, and each one is a decision the design made.
+
+    `__init__` resolves the value; `_room_for` is the evict-the-oldest half of
+    the policy and `_has_room` the refuse-the-newest half; `_pend` is the one
+    deliberate exception — a LIST with no keys but position, whose overflow
+    already emits a whole span and counts it, so routing it through a
+    dict-shaped helper would need an invented key and buy no honesty.
+
+    A fifth name here means a table started enforcing the bound by hand. Route
+    it through `_room_for` if its entries own a span (then it owes the wire
+    `SESSION_ENTRY_TABLE_FULL`) or `_has_room` if they do not (then it owes a
+    counter).
+    """
+    owners = {
+        fn.name
+        for fn in _functions(_module(_ASSEMBLER))
+        for node in ast.walk(fn)
+        if isinstance(node, ast.Attribute) and node.attr == "_max_session_entries"
+    }
+    assert owners == {"__init__", "_room_for", "_has_room", "_pend"}
+
+
+def _session_dict_fields() -> set[str]:
+    """`_Session`'s dict-typed fields, read off the dataclass itself.
+
+    Derived and not listed: a fifth per-session table added to that class is a
+    name this set gains for free, which is what makes the guard below
+    impossible to satisfy by adding a line to an allowlist.
+    """
+    session = next(
+        n
+        for n in ast.walk(_module(_SESSION_STATE))
+        if isinstance(n, ast.ClassDef) and n.name == "_Session"
+    )
+    fields = set()
+    for stmt in session.body:
+        if not (isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name)):
+            continue
+        annotation = stmt.annotation
+        if isinstance(annotation, ast.Subscript):
+            annotation = annotation.value
+        if isinstance(annotation, ast.Name) and annotation.id == "dict":
+            fields.add(stmt.target.id)
+    return fields
+
+
+def test_every_bounded_session_table_goes_through_the_policy():
+    """Whoever INSERTS into a per-session map calls the bound in the same function.
+
+    The allowlist is `_Session`'s own field list, so a fifth table cannot be
+    exempted by adding its name somewhere: adding the field is what puts it
+    under the guard. That is the structural answer to "a configured bound that
+    never reaches its consumer", which is the bug class this area keeps
+    producing.
+    """
+    fields = _session_dict_fields()
+    assert len(fields) >= 5, f"the derivation went blind: {fields}"
+
+    offenders = {}
+    for fn in _functions(_module(_ASSEMBLER)):
+        inserted = {
+            target.value.attr
+            for node in ast.walk(fn)
+            if isinstance(node, ast.Assign)
+            for target in node.targets
+            if isinstance(target, ast.Subscript)
+            and isinstance(target.value, ast.Attribute)
+            and target.value.attr in fields
+        }
+        if inserted and not _calls_named(fn, {"_room_for", "_has_room"}):
+            offenders[fn.name] = sorted(inserted)
+    assert not offenders, (
+        f"per-session tables filled without the bound: {offenders}. "
+        "Call `self._room_for(table, where)` if the entries own a span — it "
+        "evicts the oldest and hands it back so the caller can emit it with "
+        "SESSION_ENTRY_TABLE_FULL — or `self._has_room(table, where)` if they "
+        "do not, which counts the refusal."
+    )
+
+
+#: `(function, the branch's test as written)` -> why that branch may return
+#: without counting. Every other `is None` early return in these three
+#: functions must bump a counter: they are the miss branches of the three
+#: completion paths, and a miss that returns in silence is the defect the
+#: session-entry work exists to remove.
+_SILENT_RETURNS_ALLOWED = {
+    ("_close_tool", "tool_use_id is None"): (
+        "the hook event names no call, so it is not this session's to count"
+    ),
+    ("_on_stream_tool_result", "tool_use_id is None"): (
+        "the stream line names no call — same fact, other channel"
+    ),
+    ("_emit_subagent", "agent_id is None"): (
+        "`_drain_children` passes ids straight from the table, so None here is "
+        "a caller with nothing to emit rather than an observation lost"
+    ),
+    ("_close_tool", "key is None"): (
+        "`_claim_key` already bumped `tool_name_unattributable`; the in-process "
+        "handler owns this call and its own span reports it"
+    ),
+    ("_on_stream_tool_result", "key is None"): ("same — `_claim_key` counted it one line above"),
+    ("_on_stream_tool_result", "meta is None and crumb is None"): (
+        "no metadata, no breadcrumb and no open record: the hook path already "
+        "emitted this call, so there is no observation here to lose"
+    ),
+}
+
+
+def test_no_miss_branch_returns_without_a_counter():
+    """The bug class itself: a branch that goes home without saying anything.
+
+    Scoped to the three functions that answer "the record I was told about is
+    not here" — the two tool-completion paths and the sub-agent stop — because
+    that is where an eviction becomes visible or invisible. Each `is None`
+    early return either bumps a counter or is listed above with the reason it
+    has nothing to count.
+    """
+    watched = {"_close_tool", "_on_stream_tool_result", "_emit_subagent"}
+    silent = []
+    for fn in _functions(_module(_ASSEMBLER)):
+        if fn.name not in watched:
+            continue
+        for node in ast.walk(fn):
+            if not isinstance(node, ast.If) or not _tests_is_none(node.test):
+                continue
+            if not _returns_bare(node.body):
+                continue
+            if _calls_named(ast.Module(body=node.body, type_ignores=[]), {"bump"}):
+                continue
+            silent.append((fn.name, ast.unparse(node.test)))
+
+    unexplained = [s for s in silent if s not in _SILENT_RETURNS_ALLOWED]
+    assert not unexplained, (
+        f"miss branches that return without a counter: {unexplained}. "
+        "Bump one under `adapters.assembler.`, or add the branch to "
+        "_SILENT_RETURNS_ALLOWED with the reason it has nothing to record."
+    )
+    stale = [s for s in _SILENT_RETURNS_ALLOWED if s not in silent]
+    assert not stale, f"_SILENT_RETURNS_ALLOWED describes branches that are gone: {stale}"
+
+
+def _tests_is_none(node: ast.expr) -> bool:
+    if isinstance(node, ast.BoolOp):
+        return all(_tests_is_none(v) for v in node.values)
+    return (
+        isinstance(node, ast.Compare)
+        and len(node.ops) == 1
+        and isinstance(node.ops[0], ast.Is)
+        and isinstance(node.comparators[0], ast.Constant)
+        and node.comparators[0].value is None
+    )
+
+
+def _returns_bare(body: list[ast.stmt]) -> bool:
+    return bool(body) and isinstance(body[-1], ast.Return) and body[-1].value is None
