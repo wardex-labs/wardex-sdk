@@ -26,7 +26,9 @@ def _verify_ctx() -> ssl.SSLContext:
 
 
 def _client_span():
-    spans = list(_hub.get_client()._spans)
+    client = _hub.get_client()
+    client._settle()  # finalization runs on the worker; settle before reading
+    spans = list(client._spans)
     return [s for s in spans if s.kind == SpanKind.CLIENT][0]
 
 

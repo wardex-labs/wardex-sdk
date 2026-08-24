@@ -340,6 +340,12 @@ _MEMBER_SITES: dict[str, frozenset[str]] = {
             # sentence `_adapters/_context.py` says about a unit whose open
             # died.
             "_client.py",
+            # The worker's parse guard: `_assemble` marks a span whose
+            # LLM-semantic parse RAISED (counted under
+            # `interceptors.seam.parse`) — the parser never returned an
+            # answer, so SEMANTIC_PARSE_FAILED would be a lie and silence
+            # was the pre-deferred defect this member closes.
+            "_interceptors/_seam.py",
             # `refused_ambient_marker`: an evict-origin stranded scope is
             # wardex's own bound at work, so the refusal says so instead of
             # CORRELATION_CONFLICT — the repair is `max_units`, not the
@@ -1185,6 +1191,11 @@ _UNRESOLVED_PY: frozenset[tuple[str, str]] = frozenset(
         ("_adapters/_context.py", "Name:marker"),
         ("_interceptors/_seam.py", "Name:marker"),
         ("_interceptors/_seam.py", "Tuple"),
+        # `_seal`'s `timing_markers=tuple(timing_markers)` — the sealed copy
+        # of `_resolve_timing`'s tuple (plus, on a fork-crossing connection,
+        # TRACKING_RESET_AT_FORK, spelled out two lines above where
+        # `_MEMBER_SITES` records it). A container being frozen, not a value.
+        ("_interceptors/_seam.py", "Call:tuple"),
         # The finalize queue's fallback helper `_fallback_now(entry, marker)`
         # declares a marker-ish parameter, so R4 registers it and R9 makes it
         # read-all. `Name:marker` is that parameter forwarded one line down

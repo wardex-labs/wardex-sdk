@@ -75,7 +75,9 @@ def _post(url: str, body: bytes, path: str = "/v1/responses") -> int:
 
 
 def _client_spans():
-    return [s for s in _hub.get_client()._spans if s.kind == SpanKind.CLIENT]
+    client = _hub.get_client()
+    client._settle()  # finalization runs on the worker; settle before reading
+    return [s for s in client._spans if s.kind == SpanKind.CLIENT]
 
 
 def test_responses_call_is_captured_under_default_agent_mode():
@@ -201,6 +203,12 @@ def test_responses_error_response_is_a_chat_span_with_request_identity(fake_ssl_
 
         def capture_span(self, span) -> None:
             self.spans.append(span)
+
+        def capture_deferred(self, job) -> None:
+            # Inline: unit doubles may finalize synchronously.
+            span = job.ctx.run(job.run)
+            if span is not None:
+                self.capture_span(span)
 
     client = _Client()
     itc = SSLInterceptor()

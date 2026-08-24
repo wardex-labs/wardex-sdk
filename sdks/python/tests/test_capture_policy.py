@@ -58,6 +58,14 @@ class _FakeClient:
     def capture_span(self, span: Any) -> None:
         self.spans.append(span)
 
+    def capture_deferred(self, job: Any) -> None:
+        """Inline: a unit double may finalize synchronously (the real queue
+        is the harness RecordingClient's job) — what this file tests is the
+        GATE, and the gate's answer must not depend on which thread asks."""
+        span = job.ctx.run(job.run)
+        if span is not None:
+            self.capture_span(span)
+
     def close(self, timeout: float = 5.0) -> None:
         """conftest's autouse fixture closes whatever the hub holds."""
 
@@ -118,9 +126,6 @@ class _TlsSeam(ByteSeamInterceptor):
         self.timing_calls += 1
         return 0.0, 0.0, False, ()
 
-    def _parse_semantics(self, url_host, txn):
-        return self.sem
-
     def name(self):
         return "test-tls-seam"
 
@@ -132,7 +137,10 @@ class _TlsSeam(ByteSeamInterceptor):
 
 
 class _PlaintextSeam(RawSocketInterceptor):
-    """The real plaintext seam, with only the body parser stubbed out.
+    """The real plaintext seam, with the body parser patched at the MODULE
+    symbol (`_seam.parse_llm_semantics`) rather than a method override: the
+    parse is a module function since the deferred split, so a method stub
+    would be dead code that silently tested nothing.
 
     `_transport_prefilter`, `_resolve_timing` and the allowlist are the
     shipping ones: the prefilter composition is exactly what is under test.
@@ -140,8 +148,17 @@ class _PlaintextSeam(RawSocketInterceptor):
 
     sem: Any = None
 
-    def _parse_semantics(self, url_host, txn):
-        return self.sem
+
+@contextmanager
+def _parsing_as(sem: Any):
+    """Route `_seam.parse_llm_semantics` to a fixed answer for the block —
+    the same seam the shipping subclasses use (none overrides the parse)."""
+    original = _seam.parse_llm_semantics
+    _seam.parse_llm_semantics = lambda *args, **kwargs: sem
+    try:
+        yield
+    finally:
+        _seam.parse_llm_semantics = original
 
 
 def _http_txn(parent: SpanContext | None, path: str = "/v1/chat/completions") -> _Txn:
@@ -190,8 +207,8 @@ def _obj(fileno: int = 4242) -> Any:
 def _drive_tls_http(mode: CaptureMode, parent: SpanContext | None, *, sem: Any) -> bool:
     seam = _TlsSeam()
     seam._client = _FakeClient(mode)
-    seam.sem = sem
-    seam._emit_span(_obj(), _state(), _http_txn(parent))
+    with _parsing_as(sem):
+        seam._emit_span(_obj(), _state(), _http_txn(parent))
     return bool(seam._client.spans)
 
 
@@ -205,8 +222,8 @@ def _drive_tls_ws(mode: CaptureMode, parent: SpanContext | None) -> bool:
 def _drive_plaintext_http(mode: CaptureMode, parent: SpanContext | None, *, sem: Any) -> bool:
     seam = _PlaintextSeam()
     seam._client = _FakeClient(mode)
-    seam.sem = sem
-    seam._emit_span(_obj(), _state(), _http_txn(parent))
+    with _parsing_as(sem):
+        seam._emit_span(_obj(), _state(), _http_txn(parent))
     return bool(seam._client.spans)
 
 
@@ -308,9 +325,10 @@ def test_link_local_is_denied_whatever_the_policy_would_have_said(mode, parent):
     """The cloud metadata endpoint carries instance credentials. No mode opens it."""
     seam = _PlaintextSeam(["169.254.169.254"])  # allowlisted AND link-local
     seam._client = _FakeClient(mode)
-    seam.sem = LLM  # and agent-semantic, which would otherwise pass every mode
 
-    seam._emit_span(_obj(), _state("169.254.169.254"), _http_txn(PARENTS[parent]))
+    # agent-semantic, which would otherwise pass every mode
+    with _parsing_as(LLM):
+        seam._emit_span(_obj(), _state("169.254.169.254"), _http_txn(PARENTS[parent]))
 
     assert seam._client.spans == []
 
@@ -325,7 +343,8 @@ def test_an_allowlisted_host_still_bypasses_the_mode(parent):
     seam = _PlaintextSeam(["10.0.0.5:8080"])
     seam._client = _FakeClient(CaptureMode.AGENT)
 
-    seam._emit_span(_obj(), _state("10.0.0.5", 8080), _http_txn(PARENTS[parent]))
+    with _parsing_as(GENERIC):
+        seam._emit_span(_obj(), _state("10.0.0.5", 8080), _http_txn(PARENTS[parent]))
 
     assert len(seam._client.spans) == 1
 
@@ -360,16 +379,16 @@ def test_the_gate_does_not_change_which_request_owns_the_connect_cost():
         seam._client = _FakeClient(CaptureMode.AGENT)
         st = _state()
 
-        seam.sem = GENERIC  # generic, no ambient span -> dropped
-        seam._emit_span(_obj(), st, _http_txn(None, path="/health"))
+        with _parsing_as(GENERIC):  # generic, no ambient span -> dropped
+            seam._emit_span(_obj(), st, _http_txn(None, path="/health"))
         assert seam._client.spans == []
         assert st.timing_consumed is True, (
             "a dropped transaction must still own its connection's timing record — "
             "otherwise the next captured span inherits a connect it never paid"
         )
 
-        seam.sem = LLM  # the real call, on the same connection
-        seam._emit_span(_obj(), st, _http_txn(None))
+        with _parsing_as(LLM):  # the real call, on the same connection
+            seam._emit_span(_obj(), st, _http_txn(None))
 
         (span,) = seam._client.spans
         assert span.transport.timing.tcp_connect_ms == 0.0
@@ -387,8 +406,8 @@ def test_the_first_captured_span_on_a_fresh_connection_still_gets_the_measuremen
         seam = _PlaintextSeam()
         seam._client = _FakeClient(CaptureMode.AGENT)
 
-        seam.sem = LLM
-        seam._emit_span(_obj(), _state(), _http_txn(None))
+        with _parsing_as(LLM):
+            seam._emit_span(_obj(), _state(), _http_txn(None))
 
         (span,) = seam._client.spans
         assert span.transport.timing.tcp_connect_ms == 12.5
@@ -412,8 +431,8 @@ def test_a_dropped_span_releases_its_slot_in_the_capped_timing_store():
         seam = _PlaintextSeam()
         seam._client = _FakeClient(CaptureMode.AGENT)
 
-        seam.sem = GENERIC  # dropped
-        seam._emit_span(_obj(), _state(), _http_txn(None, path="/health"))
+        with _parsing_as(GENERIC):  # dropped
+            seam._emit_span(_obj(), _state(), _http_txn(None, path="/health"))
 
         assert seam._client.spans == []
         assert store.pop(4242) is None, "a dropped transaction left its slot in the store"
@@ -426,7 +445,8 @@ def test_a_captured_span_still_consumes_it_exactly_once():
     seam = _TlsSeam()
     seam._client = _FakeClient(CaptureMode.ALL)
 
-    seam._emit_span(_obj(), _state(), _http_txn(None))
+    with _parsing_as(GENERIC):
+        seam._emit_span(_obj(), _state(), _http_txn(None))
 
     assert seam.timing_calls == 1
 

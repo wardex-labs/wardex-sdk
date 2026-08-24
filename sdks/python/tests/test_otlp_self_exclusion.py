@@ -25,6 +25,13 @@ class _RecordingClient:
     def capture_span(self, span: InternalSpan) -> None:
         self.spans.append(span)
 
+    def capture_deferred(self, job) -> None:
+        # Inline: unit doubles may finalize synchronously (design §5 — the
+        # real queue is the harness RecordingClient's job).
+        span = job.ctx.run(job.run)
+        if span is not None:
+            self.capture_span(span)
+
 
 _REQUEST = b"GET / HTTP/1.1\r\n\r\n"
 _RESPONSE = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"

@@ -45,6 +45,13 @@ class _FakeClient:
     def capture_span(self, span) -> None:
         self.spans.append(span)
 
+    def capture_deferred(self, job) -> None:
+        # Inline: unit doubles may finalize synchronously (design §5 — the
+        # real queue is the harness RecordingClient's job).
+        span = job.ctx.run(job.run)
+        if span is not None:
+            self.capture_span(span)
+
     def capture_snapshot(self, snapshot) -> None:
         self.snapshots.append(snapshot)
 

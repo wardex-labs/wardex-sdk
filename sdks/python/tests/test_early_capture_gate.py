@@ -83,6 +83,13 @@ class _RecordingClient:
     def capture_span(self, span: Any) -> None:
         self.spans.append(span)
 
+    def capture_deferred(self, job) -> None:
+        # Inline: unit doubles may finalize synchronously (design §5 — the
+        # real queue is the harness RecordingClient's job).
+        span = job.ctx.run(job.run)
+        if span is not None:
+            self.capture_span(span)
+
 
 def _seam_for(client: Any) -> SSLInterceptor:
     """A TLS seam wired to `client` but never `.install()`-ed — no monkeypatch.
@@ -391,6 +398,7 @@ def test_a_noop_transport_is_not_treated_as_capture_being_off(parse_spy):
 
     itc._on_request_bytes(sock, _LLM_REQUEST)
     itc._on_response_bytes(sock, _LLM_RESPONSE)
+    client._settle()  # the parse runs on the finalize worker; settle before reading
 
     assert parse_spy, "a NoOpTransport silently disabled capture"
 

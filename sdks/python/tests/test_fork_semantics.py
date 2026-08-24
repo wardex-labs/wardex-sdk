@@ -489,6 +489,12 @@ def _bare_seam():
         def capture_span(self, span) -> None:  # noqa: ANN001
             self.spans.append(span)
 
+        def capture_deferred(self, job) -> None:
+            # Inline: unit doubles may finalize synchronously.
+            span = job.ctx.run(job.run)
+            if span is not None:
+                self.capture_span(span)
+
     seam = SSLInterceptor()
     seam._client = _SeamClient()
     return seam

@@ -558,6 +558,12 @@ class _StubClient:
     def capture_span(self, span) -> None:
         self.spans.append(span)
 
+    def capture_deferred(self, job) -> None:
+        # Inline: unit doubles may finalize synchronously.
+        span = job.ctx.run(job.run)
+        if span is not None:
+            self.capture_span(span)
+
 
 def _drive_seam(limits: LimitsConfig, request: bytes, response: bytes, host: str):
     """Feed one HTTP/1 exchange through the real TLS byte seam, loading limits
@@ -692,6 +698,12 @@ class _RecordingClient:
 
     def capture_span(self, span: object) -> None:
         self.spans.append(span)
+
+    def capture_deferred(self, job: object) -> None:
+        # Inline: unit doubles may finalize synchronously.
+        span = job.ctx.run(job.run)
+        if span is not None:
+            self.capture_span(span)
 
 
 def _assembler(limits: LimitsConfig):

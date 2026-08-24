@@ -27,7 +27,9 @@ def _reset():
 
 
 def _client_spans():
-    return [s for s in _hub.get_client()._spans if s.kind == SpanKind.CLIENT]
+    client = _hub.get_client()
+    client._settle()  # finalization runs on the worker; settle before reading
+    return [s for s in client._spans if s.kind == SpanKind.CLIENT]
 
 
 def test_h2_call_is_captured(h2_server):
@@ -66,7 +68,9 @@ def test_h2_capture_nests_under_active_span(h2_server):
 
     run()
 
-    spans = _hub.get_client()._spans
+    client = _hub.get_client()
+    client._settle()  # finalization runs on the worker; settle before reading
+    spans = client._spans
     agent_spans = [s for s in spans if s.kind == SpanKind.INTERNAL]
     client_spans = [s for s in spans if s.kind == SpanKind.CLIENT]
     assert len(agent_spans) == 1

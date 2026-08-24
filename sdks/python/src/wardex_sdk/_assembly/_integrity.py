@@ -495,6 +495,14 @@ Two emit sites, and the first is the mechanism the second restates.
     byte-seam span whose latched parent wardex discarded to stay inside a
     bound.
 
+    And from ``_interceptors/_seam.py``, on the deferred finalization's
+    parse exception: ``_assemble`` runs ``parse_llm_semantics`` under the
+    ``interceptors.seam.parse`` guard, and a parser that RAISES (as opposed
+    to answering None — "not an LLM body") marks the span with this member
+    and ships it. Before the deferred split that raise was swallowed
+    uncounted, and under AGENT mode with no parent the span vanished
+    entirely — a zero counter over deleted data, the exact I6 shape.
+
     And from ``_client.py``, on the deferred-parse path's spawn failure:
     ``capture_deferred`` could not bring the finalize worker up (a host at
     its thread ulimit is the measured shape), so the job is finalized

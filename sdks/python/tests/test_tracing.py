@@ -223,7 +223,17 @@ def test_a_bug_in_wardexs_own_span_does_not_silence_the_work_inside_it(monkeypat
         with span("my agent turn"):
             # What a real socket write does: latch the carrier the host is on.
             txn = SimpleNamespace(parent=latch_ambient().span_context)
-            return seam._should_capture(SimpleNamespace(), txn, None)
+            # The gate is a module function since the deferred-parse split;
+            # ask it with the same inputs the seam would seal.
+            from wardex_sdk._assembly import capture_mode_of
+            from wardex_sdk._interceptors import _seam as seam_mod
+
+            return seam_mod._should_capture(
+                seam._transport_prefilter(SimpleNamespace()),
+                txn,
+                None,
+                mode=capture_mode_of(seam._client),
+            )
 
     assert kept(False) is True
     assert kept(True) is True, "a wardex bug at the top silenced everything under it"

@@ -52,7 +52,9 @@ def _server(payload: bytes):
 
 
 def _client_spans():
-    return [s for s in _hub.get_client()._spans if s.kind == SpanKind.CLIENT]
+    client = _hub.get_client()
+    client._settle()  # finalization runs on the worker; settle before reading
+    return [s for s in client._spans if s.kind == SpanKind.CLIENT]
 
 
 def _post(host: str, port: int, body: bytes, path: str = "/v1/chat/completions") -> None:

@@ -183,7 +183,11 @@ class FinalizeQueue:
         unconditionally, not debug-gated: overload loss is the one line an
         operator has to be able to see.
         """
-        size = int(getattr(job, "size", 0))
+        # Direct attribute access, not a defensive getattr: `DeferredSpan`
+        # DECLARES `size`, and a job without one is a producer bug the
+        # callers' guards surface — a silent 0 would let it bypass the byte
+        # bound entirely.
+        size = int(job.size)
         if size > self._max_bytes:
             counters.bump("client.finalize.backlog_evicted")
             self._report_backlog(1)
@@ -195,7 +199,7 @@ class FinalizeQueue:
                 len(self._entries) >= self._max_jobs or self._bytes + size > self._max_bytes
             ):
                 old = self._entries.popleft()
-                self._bytes -= int(getattr(old.job, "size", 0))
+                self._bytes -= int(old.job.size)
                 evicted.append(old)
             self._entries.append(_Entry(job, scope))
             self._bytes += size
@@ -251,7 +255,7 @@ class FinalizeQueue:
                 if self._stopping or not self._entries:
                     return
                 entry = self._entries.popleft()
-                self._bytes -= int(getattr(entry.job, "size", 0))
+                self._bytes -= int(entry.job.size)
                 self._in_flight += 1
                 self._in_flight_pid = os.getpid()
             try:
@@ -302,7 +306,7 @@ class FinalizeQueue:
                 if not self._entries:
                     break
                 entry = self._entries.popleft()
-                self._bytes -= int(getattr(entry.job, "size", 0))
+                self._bytes -= int(entry.job.size)
             self._run_one(entry)
             finished += 1
         if leftover is Leftover.FALLBACK:
@@ -311,7 +315,7 @@ class FinalizeQueue:
                     if not self._entries:
                         break
                     entry = self._entries.popleft()
-                    self._bytes -= int(getattr(entry.job, "size", 0))
+                    self._bytes -= int(entry.job.size)
                 counters.bump("client.finalize.shutdown_fallback")
                 marker = Limitation.PARSE_SKIPPED_AT_SHUTDOWN
                 self._fallback_now(entry, marker)

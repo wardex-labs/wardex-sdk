@@ -72,6 +72,12 @@ def _drive(
         def capture_span(self, span) -> None:
             self.spans.append(span)
 
+        def capture_deferred(self, job) -> None:
+            # Inline: unit doubles may finalize synchronously.
+            span = job.ctx.run(job.run)
+            if span is not None:
+                self.capture_span(span)
+
     client = _Client()
     itc = SSLInterceptor()
     itc._client = client

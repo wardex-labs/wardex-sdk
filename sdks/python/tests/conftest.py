@@ -38,6 +38,36 @@ def _shield_tests_from_ambient_env(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_job_left_pending(request):
+    """A test that leaves deferred-parse jobs pending has read its spans too
+    early — on a fast machine the worker often wins the race, so the bare
+    read is green locally and a flake in CI. This makes it a DETERMINISTIC
+    failure instead: settle (`client._settle()`) or flush before reading.
+
+    Runs BEFORE `_close_hub_client_after_test` (declared above it, so its
+    teardown runs first), because close() drains the queue and would hide
+    the evidence. Opt out with `@pytest.mark.leaves_pending` for a test
+    whose point is that jobs stay pending.
+    """
+    yield
+    if request.node.get_closest_marker("leaves_pending") is not None:
+        return
+    from wardex_sdk import _hub
+
+    client = _hub.get_client()
+    queue = getattr(client, "_finalize", None)
+    if queue is None:
+        return
+    pending = queue.pending()
+    assert pending == 0, (
+        f"{pending} deferred-parse job(s) still pending at test end: a span "
+        "was probably read before it could exist. Call client._settle() (or "
+        "wardex.flush()) before asserting, or mark the test "
+        "@pytest.mark.leaves_pending if pending jobs are the point."
+    )
+
+
+@pytest.fixture(autouse=True)
 def _close_hub_client_after_test():
     """Join the background worker thread any test may have started.
 
@@ -220,6 +250,14 @@ def bare_ssl_interceptor():
 
         def capture_span(self, span: object) -> None:
             self.spans.append(span)
+
+        def capture_deferred(self, job: object) -> None:
+            # Inline: unit doubles may finalize synchronously (the real
+            # queue is the harness RecordingClient's job) — these tests
+            # drive the seam directly and read `.spans` right after.
+            span = job.ctx.run(job.run)
+            if span is not None:
+                self.capture_span(span)
 
     itc = SSLInterceptor()
     itc._client = _RecordingClient()

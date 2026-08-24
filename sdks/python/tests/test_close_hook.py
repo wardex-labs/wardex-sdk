@@ -636,6 +636,12 @@ def test_a_dropped_latch_entry_reaches_the_span_as_wardexs_own_fault():
         def capture_span(self, span) -> None:
             self.spans.append(span)
 
+        def capture_deferred(self, job) -> None:
+            # Inline: unit doubles may finalize synchronously.
+            span = job.ctx.run(job.run)
+            if span is not None:
+                self.capture_span(span)
+
     client = _Client()
     itc = SSLInterceptor()
     itc._client = client
