@@ -716,6 +716,23 @@ class AnthropicAgentSdkAdapter(AdapterInterface):
 
         self._patches.patch(sdk.ClaudeSDKClient, "__init__", client_init)
 
+        from .._limits import LimitsConfig, LimitsConsumer, limits_kwargs
+
+        config = getattr(client, "config", None)
+        lim = config.limits if config is not None else LimitsConfig()
+        resolved = lim.resolved()
+        # The tool catalog is built in `__init__`, before there is a client, so
+        # this is where the host's bound reaches it. BEFORE the
+        # `create_sdk_mcp_server` patch below: install the patch first and a
+        # host thread calling `create_sdk_mcp_server()` in between registers
+        # handles against the OLD ceiling. On a FIRST install this ordering
+        # also means the new ceiling lands on a table nothing has written yet;
+        # on a re-install it cannot promise that — a wrapper the host bound
+        # directly survives `restore_all()` and may have registered handles
+        # since the uninstall. `apply_bound` documents why a non-empty table is
+        # safe without a trim.
+        self._names.apply_bound(**limits_kwargs(LimitsConsumer.MCP_TOOL_CATALOG, resolved))
+
         # (3) in-process custom tools: run each handler inside a CALL unit whose
         # span is a child of the session — which is what closes the broken tree.
         # The unit is also ACTIVE for the body, so any outbound HTTP the tool
@@ -739,13 +756,12 @@ class AnthropicAgentSdkAdapter(AdapterInterface):
                         handle.instance = _server_instance(config)
                 return config
 
+            # The bound above is already on the catalog when this lands, and
+            # that order is load-bearing (see `apply_bound`): this wrapper is
+            # the table's only writer, so binding first means no registration
+            # this install enables can land against a stale ceiling.
             self._patches.patch(sdk, "create_sdk_mcp_server", create_sdk_mcp_server)
 
-        from .._limits import LimitsConfig
-
-        config = getattr(client, "config", None)
-        lim = config.limits if config is not None else LimitsConfig()
-        resolved = lim.resolved()
         # The adapter's own options — the first real `ctx.options` consumer.
         # The isinstance narrowing keeps every duck-typed test double honest:
         # anything but the real group means default options, bridge off.
@@ -761,9 +777,7 @@ class AnthropicAgentSdkAdapter(AdapterInterface):
                 from ._otel_receiver import _OtelBridgeReceiver
 
                 self._bridge = _OtelBridgeReceiver(
-                    max_body_bytes=resolved["max_otel_bridge_body_bytes"],
-                    max_spans_per_session=resolved["max_otel_bridge_spans_per_session"],
-                    max_sessions=resolved["max_sessions"],
+                    **limits_kwargs(LimitsConsumer.OTEL_BRIDGE_RECEIVER, resolved)
                 )
             if self._bridge is None:
                 # Bind/start failed inside the guard: the adapter installs
@@ -783,11 +797,8 @@ class AnthropicAgentSdkAdapter(AdapterInterface):
             # adapter's, and a private table has nothing to pick them out of.
             units=getattr(ctx, "_units", None),
             names=self._names,
-            max_sessions=resolved["max_sessions"],
-            max_session_entries=resolved["max_session_entries"],
-            max_units=resolved["max_units"],
-            max_entries_per_unit=resolved["max_entries_per_unit"],
             bridge=self._bridge,
+            **limits_kwargs(LimitsConsumer.SESSION_ASSEMBLER, resolved),
         )
         # Held for `_run_tool`. Narrowed here rather than trusted, because a
         # wrapper that survives an uninstall reads it and must get None rather

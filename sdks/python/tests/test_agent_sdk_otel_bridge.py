@@ -1084,7 +1084,12 @@ def test_an_evicted_bridge_sessions_pended_spans_still_ship(receiver):
     second transport take the only slot — and every pended span still ships,
     unmerged, deferred markers applied."""
     client = FakeClient()
-    asm = SessionAssembler(client, bridge=receiver, max_units=1)
+    from wardex_sdk._adapters._sink import _ClientSink
+    from wardex_sdk._assembly import UnitRegistry
+
+    asm = SessionAssembler(
+        client, bridge=receiver, units=UnitRegistry(sink=_ClientSink(client), max_units=1)
+    )
     receiver.reserve(TRACE)
     _outbound(asm, 1, bridge=_binding())
     asm.on_inbound(1, INIT)

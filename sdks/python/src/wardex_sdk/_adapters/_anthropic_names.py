@@ -152,10 +152,16 @@ class McpToolCatalog:
 
     __slots__ = ("_handles", "_lock", "_max")
 
-    def __init__(self, max_entries: int | None = None) -> None:
-        # From the CORE, never a Python literal — same rule as every other bound.
+    def __init__(self) -> None:
+        # From the CORE, never a Python literal — same rule as every other
+        # bound. The core default is ALL this constructor resolves: the host's
+        # value arrives through `apply_bound`, which is the single handle. A
+        # second one here would let the delivery table point at `apply_bound`
+        # while a caller quietly configured the table some other way, which is
+        # the same "the guard says delivered, nobody delivers" illusion the
+        # delivery census exists to remove.
         resolved = LimitsConfig().resolved()
-        self._max = max_entries if max_entries is not None else resolved["max_entries_per_unit"]
+        self._max = resolved["max_entries_per_unit"]
         # Reentrant, and for the reason `_diag._REPORT_LOCK` was made reentrant
         # rather than argued safe: the alternative is a claim about which
         # callers can arrive here, and such a claim holds only until the next
@@ -181,6 +187,34 @@ class McpToolCatalog:
         # how one call gets emitted twice.
         self._lock = threading.RLock()
         self._handles: list[ServerHandle] = []
+
+    def apply_bound(self, *, max_entries: int) -> None:
+        """Re-bind this table's ceiling to the host's configured value.
+
+        Exists because the catalog is built in the adapter's `__init__`, before
+        the adapter has a client, so the bound cannot be a constructor
+        argument. The core documents this table as one of the things
+        `max_entries_per_unit` sizes, and until this method existed that
+        documentation was a promise nothing kept.
+
+        No trim, deliberately. The only writer of `_handles` is `handle_for`,
+        whose only production caller is the `create_sdk_mcp_server` wrapper the
+        adapter installs. `install()` is single-shot, reachable a second time
+        only through `uninstall()`, which runs `restore_all()` before it clears
+        this table — so in the ordinary cycle this method sees an EMPTY table.
+        Not on every path, though: a host that bound the wrapper directly
+        (`from claude_agent_sdk import create_sdk_mcp_server` after
+        `wardex.init()`) keeps that binding across `restore_all()`, and the
+        wrapper carries no installed-gate, so a call between the uninstall and
+        the next install registers handles into a table this method then finds
+        non-empty. The no-trim decision therefore rests on `handle_for` itself:
+        its `while len(self._handles) >= self._max` loop converges on the next
+        registration, under a counter whose published meaning (the README's
+        "Resource limits" section) is overflow — which an over-full table is.
+        Trimming here would only move the same eviction earlier.
+        """
+        with self._lock:
+            self._max = max_entries
 
     def handle_for(self, name: str, existing: ServerHandle | None = None) -> ServerHandle:
         """The handle for this registration — the previous one when there is one.

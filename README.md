@@ -568,6 +568,24 @@ wardex.init(
 )
 ```
 
+**`max_body_bytes` bounds two quantities, and only one of them is a message.**
+Besides capping a captured request or response body, it caps the bytes ONE
+logical unit accumulates from its adapter-side records — a tool call's input
+and output, an agent turn's payload — and the shaping budget an adapter derives
+from that cap so it stops building a representation exactly where storage would
+cut. Lowering it therefore lowers resident memory per live unit, which is the
+reason to lower it. Raising it raises that memory: the worst case is about
+`2 x max_body_bytes` per live unit, and the ceiling on live units is
+`max_units x max_entries_per_unit`, not `max_units` — `max_buffer_bytes` bounds
+the span buffer and does not cover a unit that is still open.
+
+Raising it also raises a TRANSIENT cost that is paid on your own thread. The
+LangGraph adapter shapes a tool call's arguments synchronously inside the tool
+call, and building that representation peaks near four times the cap for
+escape-heavy text: measured at 128 MiB peak / 65 ms for one 64 MiB string
+argument at the 32 MiB default, and 256 MiB / 135 ms at the 64 MiB setting
+suggested above. Raise it for payloads you want captured whole, not by reflex.
+
 **Two of the bounds are about the wire rather than about capture.** The OTLP
 surface encodes binary payloads as base64, so what leaves is up to a third
 larger than what was captured, and an OTLP request is accepted or rejected

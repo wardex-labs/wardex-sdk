@@ -350,6 +350,41 @@ def test_max_link_targets_reaches_the_registry_context_for_builds():
     assert ctx._units._max_link_targets == 7
 
 
+def test_max_body_bytes_reaches_the_registry_context_for_builds():
+    """The same rule as `max_link_targets` above, for the bound that never had it.
+
+    `UnitRegistry` resolves this cap from the CORE defaults instead of being
+    handed the configured one, and `context_for` has no parameter to hand it
+    through — so a host that LOWERED the cap still let a unit accumulate 32 MiB
+    of recorded payload, and a host that raised it got 32 MiB too. `ctx.limits`
+    reports the user's number the whole time, which is what makes the loss
+    undiagnosable from the outside: the config object and the enforcement point
+    disagree and only one of them is readable.
+    """
+    from wardex_sdk._adapters._registry import context_for
+
+    ctx = context_for("probe", _StubClient(LimitsConfig(max_body_bytes=4096)))
+    assert ctx.limits["max_body_bytes"] == 4096
+    assert ctx._units._max_record_bytes == 4096
+
+
+def test_record_budget_equals_the_configured_body_cap():
+    """The storage cap and the source-side budget are ONE read — of the user's value.
+
+    A shaper materializes up to `record_budget` and storage keeps up to
+    `_max_record_bytes`; the two cannot disagree with each other, because the
+    budget is read off the registry. Both could still disagree with what the
+    host configured, and both did. This states the whole equality, so a later
+    "simplification" that gives the budget its own source fails here rather
+    than in a host's memory profile.
+    """
+    from wardex_sdk._adapters._registry import context_for
+
+    ctx = context_for("probe", _StubClient(LimitsConfig(max_body_bytes=4096)))
+    assert ctx.record_budget == 4096
+    assert ctx.record_budget == ctx._units.max_record_bytes == ctx.limits["max_body_bytes"]
+
+
 def test_non_http_tls_traffic_does_not_grow_memory(fake_ssl_socket, bare_ssl_interceptor):
     """Regression for the production incident: the SDK patches ssl.SSLSocket
     globally, so a TLS-backed Redis/Mongo/Kafka client sharing the process
@@ -682,17 +717,15 @@ def _unit_registry(limits: LimitsConfig, sink: _DraftSink):
 
     The point of going through `resolved()` rather than passing an int straight
     in is that this probe then fails if the field stops being mirrored, not only
-    if the registry stops reading it.
+    if the registry stops reading it. Through the PROJECTION for the same
+    reason: this helper claims to build the registry the way production does,
+    and production expands `limits_kwargs`, so a bound added to the row would
+    otherwise reach the real construction and not this one.
     """
     from wardex_sdk._assembly import UnitRegistry
+    from wardex_sdk._limits import LimitsConsumer, limits_kwargs
 
-    resolved = limits.resolved()
-    return UnitRegistry(
-        sink=sink,
-        max_units=resolved["max_units"],
-        max_entries_per_unit=resolved["max_entries_per_unit"],
-        max_link_targets=resolved["max_link_targets"],
-    )
+    return UnitRegistry(sink=sink, **limits_kwargs(LimitsConsumer.UNIT_REGISTRY, limits.resolved()))
 
 
 def _open_unit(reg, key: str, parent=None):

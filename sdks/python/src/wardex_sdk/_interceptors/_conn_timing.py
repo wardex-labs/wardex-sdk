@@ -115,6 +115,30 @@ class ConnTimingStore:
     def clear(self) -> None:
         self._by_fileno.clear()
 
+    def set_cap(self, cap: int) -> None:
+        """Re-apply the configured bound. The store OUTLIVES the seams that share it.
+
+        `shared_timing_store` honours `cap` only on the branch that BUILDS the
+        singleton, and nothing on the public path ever tears that singleton
+        down: `uninstall_shared_timing` at refcount zero calls `clear()`, which
+        empties `_by_fileno` and leaves the module global in place, and
+        `reset_shared_timing()` — the one function that nulls it — is test-only,
+        with `Runtime.reset()` as its sole caller. `wardex.close()` runs the
+        teardown path, which touches neither. So `init(max_connections=A)`,
+        `close()`, `init(max_connections=B)` used to keep A for the life of the
+        process, and what a host saw was the spurious
+        `connect_timing_unavailable` this class's docstring is about — a marker
+        that points at no knob.
+
+        No trim. The only way to reach a CHANGED cap is a re-init, and the
+        refcount-zero uninstall on the way in already emptied the table; the
+        two seams inside ONE init share one config, so they call this with the
+        same number. Even if that stopped holding, `_slot`'s own `len(...) >=
+        self._cap` check converges on the next connection, while evicting here
+        would drop a LIVE connection's slot earlier than the FIFO would.
+        """
+        self._cap = cap
+
 
 class ConnTimingProbe:
     """Connection-layer monkeypatch — idempotent, fail-silent."""
@@ -291,10 +315,20 @@ _shared_refcount = 0
 
 
 def shared_timing_store(cap: int | None = None) -> ConnTimingStore:
+    """The process-wide store, built on first use and RE-BOUND on every later one.
+
+    `cap=None` means "whatever it already is" for a caller that only wants the
+    object (`_socket.py`, `_ssl.py`), and the core default when there is
+    nothing yet. A caller that HAS a number is an `install()` carrying a
+    host's config, and its number wins — this store survives `close()`, so
+    honouring the cap only at construction meant honouring only the first one.
+    """
     global _shared_store, _shared_probe
     if _shared_store is None:
         _shared_store = ConnTimingStore(cap)  # cap=None → ConnTimingStore resolves the core default
         _shared_probe = ConnTimingProbe(_shared_store)
+    elif cap is not None:
+        _shared_store.set_cap(cap)
     return _shared_store
 
 

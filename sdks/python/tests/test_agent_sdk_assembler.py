@@ -98,6 +98,20 @@ class FakeClient:
         self.spans.append(span)
 
 
+def _one_root_registry(client):
+    """A registry with room for exactly one root, handed in as a registry.
+
+    `SessionAssembler` has no `max_units` parameter: one bound, one owner, and
+    the owner of a registry's bounds is the registry. A test that wants a
+    narrow one builds a narrow one — which is also what production does, since
+    the adapter hands over the context's registry rather than describing it.
+    """
+    from wardex_sdk._adapters._sink import _ClientSink
+    from wardex_sdk._assembly import UnitRegistry
+
+    return UnitRegistry(sink=_ClientSink(client), max_units=1)
+
+
 @pytest.fixture
 def tallies():
     """Counter DELTAS for one test, without clearing the process-wide table.
@@ -548,7 +562,7 @@ def test_a_registry_evicted_session_is_retired_and_the_run_resumes_on_a_fresh_ro
     sitting in a different conversation bucket from its own chat children.
     """
     client = FakeClient()
-    asm = SessionAssembler(client, max_units=1)
+    asm = SessionAssembler(client, units=_one_root_registry(client))
     _outbound(asm, key=1)
     asm.on_inbound(1, INIT)
     retired = asm._by_key[1]
@@ -601,7 +615,7 @@ def test_a_retired_sessions_open_tool_is_still_emitted(tallies):
     is what keeps the fix from trading one silent drop for another.
     """
     client = FakeClient()
-    asm = SessionAssembler(client, max_units=1)
+    asm = SessionAssembler(client, units=_one_root_registry(client))
     _outbound(asm, key=1)
     asm.on_inbound(1, INIT)
     asm.on_hook(
@@ -638,7 +652,7 @@ def test_closing_a_retired_transport_does_not_restamp_the_span_it_already_shippe
     itself only in the registry's `close_after_close`.
     """
     client = FakeClient()
-    asm = SessionAssembler(client, max_units=1)
+    asm = SessionAssembler(client, units=_one_root_registry(client))
     _outbound(asm, key=1)
     asm.on_inbound(1, INIT)
     retired = asm._by_key[1]
@@ -1152,3 +1166,60 @@ def test_an_interrupted_tool_ships_tool_interrupted():
     assert interrupted.error_type == "tool_interrupted"
     assert plain.status is StatusCode.ERROR
     assert plain.error_type == "tool_error"
+
+
+# ==========================================================================
+# the bounds a hand-installed adapter still owes its host
+# ==========================================================================
+
+
+class _ClientWithLimits(FakeClient):
+    """`FakeClient` plus the one thing an install reads off a client: a config.
+
+    The doubles above carry none, which is the right shape for a test about
+    assembly and the wrong one for a test about bounds — a config-less client
+    can only ever exercise the core defaults.
+    """
+
+    class _Config:
+        debug = False
+
+        def __init__(self, limits) -> None:
+            self.limits = limits
+
+    def __init__(self, limits) -> None:
+        super().__init__()
+        self.config = self._Config(limits)
+
+
+def test_a_hand_installed_adapter_still_honours_the_configured_bounds():
+    """`install(client)` with no context is a SUPPORTED path, and it is bounded.
+
+    `ctx` defaults to None and the adapter says so out loud when it is missing
+    (a `report_once` about in-process tool spans), so an adapter installed by
+    hand is documented and warned, not unsupported — which means the registry
+    it builds for itself is a production table and owes the host the bounds the
+    host configured. Two of the four arrived; `max_link_targets` was never
+    passed at all and `max_body_bytes` had no parameter to arrive through.
+    """
+    from wardex_sdk._adapters._anthropic_agent_sdk import AnthropicAgentSdkAdapter
+    from wardex_sdk._limits import LimitsConfig
+
+    client = _ClientWithLimits(
+        LimitsConfig(
+            max_units=7,
+            max_entries_per_unit=3,
+            max_link_targets=5,
+            max_body_bytes=4096,
+        )
+    )
+    adapter = AnthropicAgentSdkAdapter()
+    adapter.install(client)
+    try:
+        units = adapter._assembler.units
+        assert units._max_units == 7
+        assert units._max_entries_per_unit == 3
+        assert units._max_link_targets == 5
+        assert units._max_record_bytes == 4096
+    finally:
+        adapter.uninstall()

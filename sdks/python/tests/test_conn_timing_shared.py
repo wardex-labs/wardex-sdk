@@ -22,3 +22,36 @@ def test_shared_probe_refcount_idempotent():
 
 def test_shared_store_is_singleton():
     assert ct.shared_timing_store() is ct.shared_timing_store()
+
+
+def test_a_second_init_reapplies_max_connections():
+    """A host that re-inits with a different bound gets the FIRST one, forever.
+
+    `shared_timing_store(cap)` reads `cap` only on the branch that constructs
+    the singleton, and nothing on the public path ever tears that singleton
+    down: `uninstall_shared_timing` at refcount zero calls `clear()`, which
+    empties the fileno table and leaves the module global in place, and
+    `reset_shared_timing()` — the one function that nulls it — is test-only,
+    reached solely from `Runtime.reset()`. `wardex.close()` runs the teardown
+    path, which touches neither. So a re-init keeps the old cap for the life of
+    the process, and what a host sees when the cap is too small is a spurious
+    `connect_timing_unavailable` that points at no knob at all.
+    """
+    import wardex_sdk
+    from wardex_sdk import LimitsConfig
+
+    ct.reset_shared_timing()
+    try:
+        wardex_sdk.init(intercept=True, limits=LimitsConfig(max_connections=64))
+        try:
+            assert ct.shared_timing_store()._cap == 64
+        finally:
+            wardex_sdk.close()
+
+        wardex_sdk.init(intercept=True, limits=LimitsConfig(max_connections=128))
+        try:
+            assert ct.shared_timing_store()._cap == 128
+        finally:
+            wardex_sdk.close()
+    finally:
+        ct.reset_shared_timing()

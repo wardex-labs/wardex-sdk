@@ -1329,6 +1329,31 @@ def test_recorded_io_is_bounded_and_says_when_it_truncated():
     assert span.capture_integrity.truncated is True
 
 
+def test_lowered_body_cap_bounds_what_a_unit_retains():
+    """The user-visible end of the body cap: what a unit KEEPS, and the tally.
+
+    Deliberately not a `tracemalloc` measurement. `_append_capped` copies
+    `data[:room]`, so the caller's own 8 MiB argument is alive for as long as
+    the assertion is, and a total taken here reads ~8 MiB whether the cap is
+    honoured or not. What the cap decides is the length of the bytes on the
+    span, and that is what is asserted — together with the flag that says
+    something was dropped and the counter that makes "how much am I losing
+    since I lowered it" answerable at all.
+    """
+    sink = RecordingSink()
+    reg = UnitRegistry(sink=sink, max_body_bytes=64 * 1024)
+    root = open_session(reg)
+    before = counters.get("assembly._units.record_truncated")
+    root.record_input(b"x" * (8 * 1024 * 1024))
+
+    reg.close(root)
+    span = sink.spans()[0]
+
+    assert len(span.input_data) == 64 * 1024
+    assert span.capture_integrity.truncated is True
+    assert counters.get("assembly._units.record_truncated") - before == 1
+
+
 def test_a_span_with_no_recorded_io_says_nothing_about_integrity():
     """`set_io` would report seven `False`s as "we tried everything and failed",
     which is a different claim from "there was nothing to say".

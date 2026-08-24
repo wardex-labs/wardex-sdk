@@ -38,6 +38,7 @@ from .._enums import (
     StatusCode,
     ToolExecutionType,
 )
+from .._limits import LimitsConfig, LimitsConsumer, limits_kwargs
 from .._protocol import JsonRpcParser
 from .._types import (
     InternalSpan,
@@ -404,7 +405,14 @@ class McpStdioInterceptor(InterceptorInterface):
         self._installed = False
         self._patches = PatchSet("interceptors.mcp_stdio")
         self._asyncio_wrap_count: int = 0  # test-only counter: number of actual asyncio seam wraps
-        self._sniff_limit: int = _ProcState.SNIFF_LIMIT
+        # The per-subprocess state's projected keywords, built ONCE per limits
+        # load rather than per subprocess. Initialized here as well as in
+        # `install()` for the same reason the seam next door does it: a wrapper
+        # reaching for a missing attribute would raise inside the host's own
+        # `open_process`, and this class has no `__slots__` to make that loud.
+        self._proc_limits: dict[str, int] = limits_kwargs(
+            LimitsConsumer.MCP_PROC_STATE, LimitsConfig().resolved()
+        )
         self._native_limits: Any = None
         self._mode: CaptureMode = CaptureMode.ALL
         self._debug: bool = False
@@ -416,11 +424,9 @@ class McpStdioInterceptor(InterceptorInterface):
         if self._installed:
             return
         self._client = client
-        from .._limits import LimitsConfig
-
         config = getattr(client, "config", None)
         lim = config.limits if config is not None else LimitsConfig()
-        self._sniff_limit = lim.resolved()["mcp_sniff_bytes"]
+        self._proc_limits = limits_kwargs(LimitsConsumer.MCP_PROC_STATE, lim.resolved())
         self._native_limits = lim.to_native()
         self._mode = capture_mode_of(client)
         self._debug = bool(getattr(config, "debug", False))
@@ -505,7 +511,12 @@ class McpStdioInterceptor(InterceptorInterface):
     def _wrap_proc(self, proc: Any) -> None:
         if getattr(proc, "stdin", None) is None or getattr(proc, "stdout", None) is None:
             return
-        state = _ProcState(self._sniff_limit, self._native_limits, self._mode, self._debug)
+        state = _ProcState(
+            **self._proc_limits,
+            limits=self._native_limits,
+            mode=self._mode,
+            debug=self._debug,
+        )
         client = self._client
         pid = getattr(proc, "pid", None)
         stdin = proc.stdin
@@ -577,7 +588,12 @@ class McpStdioInterceptor(InterceptorInterface):
         self._asyncio_wrap_count += (
             1  # counted when a wrap actually occurs (for verifying the dual-seam guard)
         )
-        state = _ProcState(self._sniff_limit, self._native_limits, self._mode, self._debug)
+        state = _ProcState(
+            **self._proc_limits,
+            limits=self._native_limits,
+            mode=self._mode,
+            debug=self._debug,
+        )
         client = self._client
         pid = getattr(proc, "pid", None)
         writer = proc.stdin
