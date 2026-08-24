@@ -374,6 +374,12 @@ class Runtime:
             if client is not None:
                 with guard("client.fork_reinit_failed"):
                     client._at_fork_reinit()
+            # step 3 (module half) — the propagation module's own lock. Its
+            # patches stay; only the lock (and its PatchSet's) is refreshed.
+            # `uninstall_propagation()` is unconditionally on the child's
+            # teardown path, so this lock inherited held would hang atexit.
+            with guard("interceptors.fork_reinit_failed"):
+                _fork_reinit_module("context._inject")
             # step 6 — after the resets, so this survives them.
             counters.bump("_runtime.fork_child_reinit")
         self._fork_reinit_us = int((time.perf_counter() - started) * 1e6)
@@ -494,6 +500,20 @@ def _reset_shared_timing() -> None:
     module = sys.modules.get(f"{__package__}._interceptors._conn_timing")
     if module is not None:
         module.reset_shared_timing()
+
+
+def _fork_reinit_module(name: str) -> None:
+    """Run one module-global holder's `_at_fork_reinit`, iff it was imported.
+
+    `_reset_shared_timing`'s rule, applied to the fork path: a module nobody
+    imported holds pristine, unheld locks and empty tables — there is nothing
+    to reset — and importing it from inside a fork hook would run arbitrary
+    import-time code (some of it reaching the native extension) at the one
+    moment the process should be doing reassignments and nothing else.
+    """
+    module = sys.modules.get(f"{__package__}.{name}")
+    if module is not None:
+        module._at_fork_reinit()
 
 
 _RUNTIME = Runtime()

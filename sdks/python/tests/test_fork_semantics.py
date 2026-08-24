@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time
 
 import pytest
@@ -195,6 +196,240 @@ def test_child_reset_is_counted_and_bounded(installed_recording):
         f"child-side fork reset took {payload['reinit_us']}µs — the one-time "
         "cost bound exists so a regression here fails a test, not a fork"
     )
+
+
+# --------------------------------------------------------------------------
+# §6.3 — a fork landing mid-export, and the host fork that never waits
+# --------------------------------------------------------------------------
+
+
+class _PidGatedTransport(RecordingTransport):
+    """Blocks `export()` in the OWNING process until released.
+
+    Pid-aware so a forked child sailing through its inherited copy does not
+    block on an Event only the parent's test body can set — the child's
+    exports record immediately, which is exactly the behavior under test.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.owner_pid = os.getpid()
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def export(self, envelope, *, timeout=None):  # noqa: ANN001
+        if os.getpid() == self.owner_pid:
+            self.entered.set()
+            assert self.release.wait(20), "the test forgot to release the export gate"
+        return super().export(envelope, timeout=timeout)
+
+
+@fork_only
+def test_no_deadlock_when_fork_lands_mid_flush():
+    """The child inherits `_export_lock` HELD by a thread that does not exist
+    there — before the reset, its first flush (or its atexit) waited on it
+    forever. And the batch mid-POST at fork time belongs to the parent: it
+    ships exactly once, from the parent, when the POST completes."""
+    transport = _PidGatedTransport()
+    wardex.init(transport=transport, intercept=False, batching=_IDLE)
+    try:
+        client = _hub.get_client()
+        client.capture_span(_span("stuck-behind-the-post"))
+        flusher = threading.Thread(target=client.flush, name="test-flusher")
+        flusher.start()
+        assert transport.entered.wait(10), "the export never started"
+
+        # The flusher owns _export_lock and sits mid-POST. Fork now.
+        def child():
+            c = _hub.get_client()
+            c.capture_span(_span("child-0"))
+            c.flush()  # hung on the inherited _export_lock before this work
+            return {"exported": _exported_names(transport)}
+
+        code, payload = _run_in_child(child)
+        transport.release.set()
+        flusher.join(10)
+        assert not flusher.is_alive(), "the parent's own flush must also finish"
+        assert code == 0, payload
+        assert payload["exported"] == ["child-0"], (
+            "the child ships its own capture and nothing of the parent's in-flight batch"
+        )
+        assert _exported_names(transport) == ["stuck-behind-the-post"], (
+            "the mid-POST batch ships exactly once, from the process that owns it"
+        )
+    finally:
+        wardex.close()
+
+
+@fork_only
+def test_fork_returns_promptly_whatever_locks_other_threads_hold():
+    """I-fork-2, as a timing assertion: no before/after_in_parent hook exists,
+    so `os.fork()` returns immediately even while one thread is mid-POST
+    holding `_export_lock` and another holds `_buffer_lock`. A reintroduced
+    before-hook that acquires either lock turns this into a hang — this test
+    is the tripwire that fails first."""
+    transport = _PidGatedTransport()
+    wardex.init(transport=transport, intercept=False, batching=_IDLE)
+    holder = flusher = None
+    release_buffer = threading.Event()
+    try:
+        client = _hub.get_client()
+        client.capture_span(_span("in-flight"))
+        flusher = threading.Thread(target=client.flush, name="test-flusher")
+        flusher.start()
+        assert transport.entered.wait(10)
+
+        buffer_held = threading.Event()
+
+        def hold_buffer():
+            with client._buffer_lock:
+                buffer_held.set()
+                release_buffer.wait(20)
+
+        holder = threading.Thread(target=hold_buffer, name="test-buffer-holder")
+        holder.start()
+        assert buffer_held.wait(10)
+
+        started = time.perf_counter()
+        pid = os.fork()
+        if pid == 0:
+            os._exit(0)  # the child's only job was to run the hook
+        elapsed = time.perf_counter() - started
+        _, status = os.waitpid(pid, 0)
+        assert os.waitstatus_to_exitcode(status) == 0
+        assert elapsed < 1.0, (
+            f"os.fork() took {elapsed:.3f}s while SDK locks were held — the host's "
+            "fork must never wait on wardex"
+        )
+    finally:
+        release_buffer.set()
+        transport.release.set()
+        if holder is not None:
+            holder.join(10)
+        if flusher is not None:
+            flusher.join(10)
+        wardex.close()
+
+
+@fork_only
+def test_fork_while_runtime_lock_is_held_does_not_hang_the_child():
+    """P row: `teardown()` holds `Runtime._lock` across the final drain — up
+    to and including the POST. A fork in that window used to hand the child a
+    lock nobody would ever release, and the child's own atexit (teardown →
+    `with self._lock`) hung the interpreter's exit. Step 0 replaces it."""
+    transport = RecordingTransport()
+    wardex.init(transport=transport, intercept=False, batching=_IDLE)
+    release = threading.Event()
+    holder = None
+    try:
+        runtime = _runtime.runtime()
+        held = threading.Event()
+
+        def hold_runtime_lock():
+            with runtime._lock:
+                held.set()
+                release.wait(20)
+
+        holder = threading.Thread(target=hold_runtime_lock, name="test-runtime-holder")
+        holder.start()
+        assert held.wait(10)
+
+        def child():
+            c = _hub.get_client()
+            c.capture_span(_span("child-teardown"))
+            _runtime.runtime().teardown(timeout=5)  # the atexit path, on demand
+            return {"exported": _exported_names(transport)}
+
+        code, payload = _run_in_child(child)
+        assert code == 0, payload
+        assert payload["exported"] == ["child-teardown"], (
+            "the child's teardown drains the child's own spans — nothing more, "
+            "and without hanging on the inherited Runtime lock"
+        )
+    finally:
+        release.set()
+        if holder is not None:
+            holder.join(10)
+        wardex.close()
+
+
+# --------------------------------------------------------------------------
+# §6.5 — a grandchild resets again
+# --------------------------------------------------------------------------
+
+
+@fork_only
+def test_grandchild_also_resets(installed_recording):
+    """`register_at_fork` registrations are inherited, so the hook runs afresh
+    in every generation: the grandchild discards what the child buffered,
+    exactly as the child discarded what the parent buffered."""
+    transport, client = installed_recording
+    client.capture_span(_span("parent-0"))
+
+    def child():
+        c = _hub.get_client()
+        c.capture_span(_span("child-0"))
+
+        def grandchild():
+            g = _hub.get_client()
+            g.capture_span(_span("grandchild-0"))
+            g.flush()
+            return {"exported": _exported_names(transport)}
+
+        gc_code, gc_payload = _run_in_child(grandchild)
+        c.flush()
+        return {
+            "grandchild_code": gc_code,
+            "grandchild": gc_payload,
+            "child_exported": _exported_names(transport),
+        }
+
+    code, payload = _run_in_child(child)
+    assert code == 0, payload
+    assert payload["grandchild_code"] == 0, payload["grandchild"]
+    assert payload["grandchild"]["exported"] == ["grandchild-0"]
+    assert payload["child_exported"] == ["child-0"]
+    client.flush()
+    assert _exported_names(transport) == ["parent-0"]
+
+
+# --------------------------------------------------------------------------
+# the fork-held lock inventory: PatchSet and context._inject
+# --------------------------------------------------------------------------
+
+
+def test_patchset_fork_reinit_replaces_the_lock_and_keeps_the_records():
+    from wardex_sdk._assembly import PatchSet
+
+    class Target:
+        def method(self) -> str:
+            return "original"
+
+    ps = PatchSet("test.fork")
+    assert ps.patch(Target, "method", lambda self: "wrapped")
+    old_lock = ps._lock
+    ps._at_fork_reinit()
+    assert ps._lock is not old_lock, "an inherited PatchSet lock may be held by a gone thread"
+    assert len(ps) == 1, "the records survive — the child's teardown restores THROUGH them"
+    ps.restore_all()
+    assert Target().method() == "original", "the kept record is what makes the restore real"
+
+
+def test_inject_fork_reinit_replaces_the_lock_and_keeps_the_install_record():
+    from wardex_sdk.context import _inject
+
+    old_lock = _inject._install_lock
+    _inject._installed.add("sentinel-lib")
+    try:
+        _inject._at_fork_reinit()
+        assert _inject._install_lock is not old_lock
+        assert "sentinel-lib" in _inject._installed, (
+            "the patch record is KEPT (I-fork-4): the patches crossed the fork "
+            "and still work; forgetting them would strand the child's teardown"
+        )
+    finally:
+        _inject._installed.discard("sentinel-lib")
+        assert _inject._install_lock is not old_lock
 
 
 # --------------------------------------------------------------------------
