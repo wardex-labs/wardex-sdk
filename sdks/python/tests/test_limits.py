@@ -28,7 +28,9 @@ def test_limits_defaults_returns_every_field():
     assert d["max_extra_keys"] == 64
     assert d["max_otel_bridge_body_bytes"] == 4 * 1024 * 1024
     assert d["max_otel_bridge_spans_per_session"] == 2048
-    assert len(d) == 24
+    assert d["max_parse_backlog"] == 2048
+    assert d["max_parse_backlog_bytes"] == 64 * 1024 * 1024
+    assert len(d) == 26
 
 
 def test_limits_construction_defaults_unspecified_fields():
@@ -1112,6 +1114,55 @@ def _probe_max_extra_keys() -> bool:
     return dropped(LimitsConfig(max_extra_keys=3)) == 4 and dropped(LimitsConfig()) == 0
 
 
+def _finalize_fallbacks(limits: LimitsConfig) -> int:
+    """Fallback assemblies the queue performs for 4 stub jobs of 64 bytes.
+
+    The queue is built the way `Client.__init__` builds it — through the
+    projection — and its worker is deliberately never spawned
+    (`ensure_alive` is not called), so every submit only queues or evicts:
+    what comes back is purely the bounds at work.
+    """
+    from wardex_sdk._finalize import FinalizeQueue
+    from wardex_sdk._limits import LimitsConsumer, limits_kwargs
+
+    admitted: list[object] = []
+
+    class _Job:
+        size = 64
+
+        def __init__(self) -> None:
+            import contextvars
+
+            self.ctx = contextvars.copy_context()
+
+        def run(self) -> object:
+            return None
+
+        def fallback(self, marker: object) -> object:
+            return ("fallback", marker)
+
+    queue = FinalizeQueue(
+        admit=lambda span, *, scope: admitted.append(span),
+        debug=False,
+        **limits_kwargs(LimitsConsumer.FINALIZE_QUEUE, limits.resolved()),
+    )
+    for _ in range(4):
+        queue.submit(_Job(), ({}, None))
+    return len(admitted)
+
+
+def _probe_max_parse_backlog() -> bool:
+    return _finalize_fallbacks(LimitsConfig(max_parse_backlog=2)) > 0 and (
+        _finalize_fallbacks(LimitsConfig()) == 0
+    )
+
+
+def _probe_max_parse_backlog_bytes() -> bool:
+    return _finalize_fallbacks(LimitsConfig(max_parse_backlog_bytes=128)) > 0 and (
+        _finalize_fallbacks(LimitsConfig()) == 0
+    )
+
+
 _PROBES = {
     "max_headers": _probe_max_headers,
     "max_body_bytes": _probe_max_body_bytes,
@@ -1129,6 +1180,8 @@ _PROBES = {
     "max_link_targets": _probe_max_link_targets,
     "mcp_sniff_bytes": _probe_mcp_sniff_bytes,
     "max_extra_keys": _probe_max_extra_keys,
+    "max_parse_backlog": _probe_max_parse_backlog,
+    "max_parse_backlog_bytes": _probe_max_parse_backlog_bytes,
     "max_buffer_spans": _probe_max_buffer_spans,
     "max_buffer_bytes": _probe_max_buffer_bytes,
     "max_otel_bridge_body_bytes": _probe_max_otel_bridge_body_bytes,

@@ -9,6 +9,7 @@ import time
 import uuid
 from collections import deque
 from dataclasses import replace
+from typing import Any
 
 from ._assembly import diag_info, diag_warning, guard, report_once
 
@@ -18,6 +19,8 @@ from ._assembly import diag_info, diag_warning, guard, report_once
 # `testing/harness.py` already reaches `reset_reports_for_test`.
 from ._assembly._diag import _log_with_traceback
 from ._config import WardexConfig
+from ._finalize import FinalizeQueue
+from ._limits import LimitsConsumer, limits_kwargs
 from ._types import (
     Envelope,
     EnvelopeHeader,
@@ -347,6 +350,13 @@ def _accepts_timeout(transport: Transport) -> bool:
     return False
 
 
+#: `_admit`'s "read the ambient scope now" sentinel. A distinct object and not
+#: `None`: an empty scope SNAPSHOT (`({}, None)`) is a real answer — "nothing
+#: was set when this span was captured" — and must not fall through to a
+#: re-read of whatever the admitting thread's scope holds by then.
+_AMBIENT: Any = object()
+
+
 class _SpanBuffer:
     """A span deque and its approximate byte total, folded into one object so
     _drain() can only ever replace the *whole* pair via a single attribute
@@ -532,6 +542,15 @@ class Client:
         self._max_buffer_spans = limits["max_buffer_spans"]
         self._max_buffer_bytes = limits["max_buffer_bytes"]
         self._flush_threshold = max(1, self._max_buffer_spans // 4)
+        # The deferred-parse queue. Its worker thread is LAZY — nothing spawns
+        # until the first `capture_deferred` calls `ensure_alive()` — so a
+        # client that only ever captures ready spans pays one allocation here
+        # and nothing else.
+        self._finalize = FinalizeQueue(
+            admit=self._admit,
+            debug=config.debug,
+            **limits_kwargs(LimitsConsumer.FINALIZE_QUEUE, limits),
+        )
         # None, not a number: the periodic drain is a background daemon that
         # nobody waits on, so it has no deadline to impose. Handing it one would
         # clamp the transport's own configured timeout on the *only* path that
@@ -565,16 +584,30 @@ class Client:
     def _buffered_bytes(self) -> int:
         return self._buffer.bytes
 
-    def _stamp_scope(self, span: InternalSpan) -> InternalSpan:
+    def _stamp_scope(
+        self,
+        span: InternalSpan,
+        merged: tuple[dict[str, str], Any] | None = None,
+    ) -> InternalSpan:
         """Fold the ambient scope's tags and user into the span's `extra`.
 
         This is the one place the scope stratum reaches the wire: every capture
-        path converges on `capture_span`, so stamping here is what makes
+        path converges on `_admit`, so stamping here is what makes
         `set_tag`/`set_user` mean something on EXPORTED spans instead of being
         write-only state. Read at capture time, from the calling context —
         which is the context the span was produced on, so an
         `isolation_scope()` block's tags reach exactly the spans captured
         inside it.
+
+        `merged` is a `(tags, user)` SNAPSHOT taken earlier, on the thread
+        that produced the span — the deferred-parse path's stamp. It exists
+        because `Scope` is MUTABLE and `contextvars.copy_context()` preserves
+        bindings, not the contents of the object bound: a worker re-reading
+        the scope at finalize time would stamp "the dict as it is now" rather
+        than "the dict as it was at capture", and one queued request later
+        that is another tenant's user id on this tenant's span (design §3.7).
+        `None` means "read the ambient scope now", which is the synchronous
+        path and exactly what this method always did.
 
         Precedence: a key the span already carries wins over the scope (a
         span-local `set_attribute` is more specific than ambient state), and
@@ -591,11 +624,14 @@ class Client:
         """
         stamped = span
         with guard("client.scope_stamp", debug=self._config.debug):
-            # Deferred import: `_hub` imports this module for the `Client`
-            # type, so the edge cannot exist at import time in this direction.
-            from . import _hub  # noqa: PLC0415
+            if merged is None:
+                # Deferred import: `_hub` imports this module for the `Client`
+                # type, so the edge cannot exist at import time in this
+                # direction.
+                from . import _hub  # noqa: PLC0415
 
-            tags, user = _hub.get_merged_tags_and_user()
+                merged = _hub.get_merged_tags_and_user()
+            tags, user = merged
             if tags or user is not None:
                 taken = {key for key, _ in span.extra}
                 additions: list[tuple[str, str | int | float | bool]] = []
@@ -620,8 +656,26 @@ class Client:
     def capture_span(self, span: InternalSpan) -> None:
         if self._closed:
             return
+        self._admit(span)
+
+    def _admit(self, span: InternalSpan, *, scope: Any = _AMBIENT) -> None:
+        """Stamp `span` and put it in the buffer — every capture path's tail.
+
+        `capture_span` is the public synchronous door and keeps exactly one
+        job: the `_closed` check. This method deliberately does NOT repeat it,
+        because its other caller is the finalize queue, whose jobs must land
+        even while `close()` is mid-teardown — step 4 of `close()` finalizes
+        pending parses precisely so their spans reach the final drain.
+
+        `scope` is `_AMBIENT` (read the calling context's scope now — the
+        synchronous path, unchanged behaviour) or the `(tags, user)` snapshot
+        a `capture_deferred` took on the submitting thread. A sentinel and
+        not `None`, because an EMPTY snapshot is a real value: "there were no
+        tags at capture time" must not decay into "read whatever this worker
+        thread's scope holds now" (design §3.7).
+        """
         self._worker.ensure_alive()  # fork/thread-death recovery (design §8)
-        span = self._stamp_scope(span)
+        span = self._stamp_scope(span) if scope is _AMBIENT else self._stamp_scope(span, scope)
         size = _span_size(span)
         with self._buffer_lock:
             # Drop-oldest on either bound: recent spans are worth more. The byte
@@ -1312,6 +1366,11 @@ class Client:
         # documented holdout entry per site.
         self._close_lock = threading.Lock()
         self._worker._at_fork_reinit()
+        # The deferred-parse queue: lock/CV replaced, inherited jobs discarded
+        # WITHOUT emitting (I-fork-3 — the parent sealed them, owns them, and
+        # exports them; a child that finished its copy would ship the same
+        # transaction twice).
+        self._finalize._at_fork_reinit()
         # Per-process, so a grandchild answers "not yet" and registers its own
         # tail-flush finalizer (the inherited registration is the CHILD's).
         self._mp_tail_flush_registered = False

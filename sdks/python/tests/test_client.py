@@ -239,7 +239,9 @@ def test_trailing_append_is_never_lost_to_a_reentrant_drain():
 
     import wardex_sdk._client as client_module
 
-    target_line = _find_line(client_module.Client.capture_span, "self._buffer.append(span, size)")
+    # The buffer body lives in `_admit` since the deferred-parse split:
+    # `capture_span` keeps only the `_closed` check and delegates.
+    target_line = _find_line(client_module.Client._admit, "self._buffer.append(span, size)")
 
     t = _Recording()
     cfg = WardexConfig(
@@ -251,7 +253,7 @@ def test_trailing_append_is_never_lost_to_a_reentrant_drain():
     def line_tracer(frame, event, arg):
         if (
             event == "line"
-            and frame.f_code is client_module.Client.capture_span.__code__
+            and frame.f_code is client_module.Client._admit.__code__
             and frame.f_lineno == target_line
             and not fired["done"]
         ):
@@ -262,7 +264,7 @@ def test_trailing_append_is_never_lost_to_a_reentrant_drain():
         return line_tracer
 
     def call_tracer(frame, event, arg):
-        if event == "call" and frame.f_code is client_module.Client.capture_span.__code__:
+        if event == "call" and frame.f_code is client_module.Client._admit.__code__:
             return line_tracer
         return call_tracer
 

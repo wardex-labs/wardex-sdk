@@ -1,9 +1,11 @@
 """Background batch worker — thread & timing only; knows nothing about spans.
 
-Owns the SDK's single daemon thread. It wakes on whichever comes first:
-interval elapsed, wake() (buffer size threshold), or stop(). The loop survives
-drain exceptions — an observability SDK must never crash the app, and the
-worker must never die (design §10).
+Owns one of the SDK's daemon threads: `wardex-batch-worker` (the client's
+periodic drain) and `wardex-finalize-worker` (the deferred-parse queue) are
+both instances of this class, plus the opt-in OTel bridge's receiver thread.
+It wakes on whichever comes first: interval elapsed, wake() (work-arrival
+threshold), or stop(). The loop survives drain exceptions — an observability
+SDK must never crash the app, and the worker must never die (design §10).
 
 Fork posture, two layers. The PRIMARY path is the SDK's
 `os.register_at_fork(after_in_child=...)` hook: it calls `_at_fork_reinit()`
@@ -30,11 +32,17 @@ from .transport._base import DEFAULT_TIMEOUT
 
 class BatchWorker:
     def __init__(
-        self, drain_fn: Callable[[], None], interval: float, *, debug: bool = False
+        self,
+        drain_fn: Callable[[], None],
+        interval: float,
+        *,
+        debug: bool = False,
+        name: str = "wardex-batch-worker",
     ) -> None:
         self._drain_fn = drain_fn
         self._interval = interval
         self._debug = debug
+        self._name = name
         self._wake = threading.Event()
         self._stopped = False
         self._thread: threading.Thread | None = None
@@ -104,7 +112,7 @@ class BatchWorker:
             if self._stopped or self.is_alive() or self._spawn_in_flight():
                 return  # another thread respawned it while we waited
             if self._debug:
-                diag_warning("batch worker restarted (fork or thread death)")
+                diag_warning(f"{self._name} restarted (fork or thread death)")
             self._spawn_locked()
 
     def stop(self, timeout: float = DEFAULT_TIMEOUT) -> None:
@@ -155,7 +163,7 @@ class BatchWorker:
             return
         self._spawning_pid = os.getpid()
         try:
-            thread = threading.Thread(target=self._run, daemon=True, name="wardex-batch-worker")
+            thread = threading.Thread(target=self._run, daemon=True, name=self._name)
             # `_stopped` again, and this is the check that earns its place. The
             # RLock made a sequence reachable that a plain Lock used to deadlock
             # on: a finalizer landing in the allocation above and reaching

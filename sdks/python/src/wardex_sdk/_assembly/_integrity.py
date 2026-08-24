@@ -750,10 +750,10 @@ Two emit sites, and the first is the mechanism the second restates.
     not at all — transport, timing and status are measured; ``gen_ai`` is
     absent because the parser never ran.
 
-    Declared ahead of its emitter: the deferred-parse queue
-    (``_finalize.py``) lands in the commit after this one and is the single
-    site that names it, on the fallback it assembles for every job still
-    pending when the budget ends.
+    Emitted from ``_finalize.py`` — the single site that names it, on the
+    fallback ``drain_all`` assembles for every job still pending when the
+    shutdown budget ends (``Leftover.FALLBACK``: close and the signal path,
+    where a kept job would die with the process).
 
     The knob is a SHUTDOWN BUDGET, not a capacity cap — ``close(timeout)`` /
     ``batching.shutdown_timeout``, or wardex's own 2 s signal-flush budget —
@@ -817,12 +817,11 @@ Two emit sites, and the first is the mechanism the second restates.
     status are measured; ``gen_ai`` is absent because the parser never ran on
     this body.
 
-    Declared ahead of its emitter: the deferred-parse queue
-    (``_finalize.py``) lands in the commit after this one and is the single
-    site that names it — on the eviction fallback when the backlog crosses
-    ``max_parse_backlog`` / ``max_parse_backlog_bytes``, and on the clamp
-    that keeps a single over-bound body out of the queue entirely (so the
-    byte bound stays literal).
+    Emitted from ``_finalize.py`` — the single site that names it: on the
+    eviction fallback when the backlog crosses ``max_parse_backlog`` /
+    ``max_parse_backlog_bytes``, and on the clamp that keeps a single
+    over-bound body out of the queue entirely (so the byte bound stays
+    literal).
 
     Not ``BODY_CAP_EXCEEDED``, by the caps-band rule: that one caps what one
     body KEEPS in raw bytes; this one caps how many finished transactions may

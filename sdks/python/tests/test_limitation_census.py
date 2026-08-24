@@ -268,6 +268,14 @@ _MEMBER_SITES: dict[str, frozenset[str]] = {
     # names a process event and no knob — see its docstring for why it is not
     # CONNECTION_EVICTED.
     "TRACKING_RESET_AT_FORK": frozenset({"_interceptors/_seam.py"}),
+    # The deferred-parse queue's two unparsed shipments, every site in one
+    # file: `submit` decides PARSE_BACKLOG_FULL (the eviction and the
+    # oversize clamp hand it to the fallback helper), and `drain_all`'s
+    # FALLBACK arm decides PARSE_SKIPPED_AT_SHUTDOWN. The seam's `_assemble`
+    # only ATTACHES whatever member the queue chose — the word is chosen
+    # here, which is what makes one file the whole provenance.
+    "PARSE_BACKLOG_FULL": frozenset({"_finalize.py"}),
+    "PARSE_SKIPPED_AT_SHUTDOWN": frozenset({"_finalize.py"}),
     # Two emitters, one per bound that can evict a session: the registry closes
     # the oldest ROOT unit at `max_units`, and the
     # assembler closes the oldest SESSION at `max_sessions`. Both EMIT the root
@@ -600,6 +608,12 @@ _EMITTED_MEMBERS: frozenset[str] = frozenset(
         # leaves a marker; landing the member with its emitter is what kept
         # the fork path from becoming the one silent exception.
         "TRACKING_RESET_AT_FORK",
+        # The deferred-parse queue's pair: minted one commit ahead of the
+        # queue, emitted from `_finalize.py` since the queue landed — the
+        # eviction/oversize fallback (46) and the shutdown-budget fallback
+        # (47).
+        "PARSE_BACKLOG_FULL",
+        "PARSE_SKIPPED_AT_SHUTDOWN",
     }
 )
 """Which MEMBERS have an emit site today, derived independently below.
@@ -1164,6 +1178,20 @@ _UNRESOLVED_PY: frozenset[tuple[str, str]] = frozenset(
         ("_adapters/_context.py", "Name:marker"),
         ("_interceptors/_seam.py", "Name:marker"),
         ("_interceptors/_seam.py", "Tuple"),
+        # The finalize queue's fallback helper `_fallback_now(entry, marker)`
+        # declares a marker-ish parameter, so R4 registers it and R9 makes it
+        # read-all. `Name:marker` is that parameter forwarded one line down
+        # (the members it carries are spelled at the two decision sites in
+        # the same file — the submit-path calls and drain_all's FALLBACK
+        # assignment — and `_MEMBER_SITES` records them). The other three are
+        # its ENTRY argument: a fresh `_Entry` at the oversize clamp
+        # (`Call:_Entry`), the evicted entry (`Name:old`) and drain_all's
+        # popped entry (`Name:entry`) — containers of a job and a scope
+        # snapshot, with no marker value of their own.
+        ("_finalize.py", "Call:_Entry"),
+        ("_finalize.py", "Name:entry"),
+        ("_finalize.py", "Name:marker"),
+        ("_finalize.py", "Name:old"),
         ("_interceptors/_socket.py", "Tuple"),
         ("_interceptors/_ssl.py", "Tuple"),
         ("_interceptors/_trackers.py", "Attribute:_req_limitations"),
