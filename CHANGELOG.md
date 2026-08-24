@@ -38,32 +38,6 @@ All notable changes to this project are documented here. The format follows
   hand-rolled `os.fork()` + `os._exit()` child remains out of reach by
   construction; the README prescribes `wardex.flush()` there.
 
-### Added
-
-- **`process.pid` on every envelope, stamped live at drain time.**
-  `ResourceInfo` gains `process_pid` (proto field 4, additive), mapped to
-  the OTLP resource attribute `process.pid` when stamped. Live per batch —
-  never cached — so it is correct in every process by construction,
-  including a fork child before its hook ran and platforms where no hook
-  runs; a parent and its forked children are distinguishable at the
-  backend. (OTel Python stamps its resource pid once at construction, so a
-  forked child exports under the parent's pid — that gap is closed here.)
-- **New limitation marker `tracking_reset_at_fork` (vocabulary 45).** The
-  first span assembled on a connection that crossed an `os.fork()` says its
-  tracking state was reset — parsing may have begun mid-stream, and the
-  timing/stream fields' origin is younger than the connection. Once per
-  connection, and deliberately NOT `connection_evicted`: that marker names
-  the `max_connections` knob, while this one names a process event no
-  limits field can prevent. The discarded parent-owned buffer carries no
-  marker anywhere — nothing was lost; it ships from the process that owns
-  it.
-- **Transports may declare `at_fork_child()`.** A duck-typed extension
-  point the fork hook calls in the child under the SDK's guard: wardex
-  cannot rebuild a third-party transport's connection pool (a pooled
-  `requests.Session` shares live TCP sockets with the parent after a fork),
-  and only the transport knows how. The built-in transports hold no
-  per-request state and do not implement it.
-
 - **The OpenAI Responses API was invisible — and streams were worse than
   invisible.** The openai-agents SDK calls `POST /v1/responses` by default
   (one `Runner.run` turn is one Responses call), and wardex had no row for
@@ -150,6 +124,30 @@ All notable changes to this project are documented here. The format follows
   represents the whole call.
 
 ### Added
+
+- **`process.pid` on every envelope, stamped live at drain time.**
+  `ResourceInfo` gains `process_pid` (proto field 4, additive), mapped to
+  the OTLP resource attribute `process.pid` when stamped. Live per batch —
+  never cached — so it is correct in every process by construction,
+  including a fork child before its hook ran and platforms where no hook
+  runs; a parent and its forked children are distinguishable at the
+  backend. (OTel Python stamps its resource pid once at construction, so a
+  forked child exports under the parent's pid — that gap is closed here.)
+- **New limitation marker `tracking_reset_at_fork` (vocabulary 45).** The
+  first span assembled on a connection that crossed an `os.fork()` says its
+  tracking state was reset — parsing may have begun mid-stream, and the
+  timing/stream fields' origin is younger than the connection. Once per
+  connection, and deliberately NOT `connection_evicted`: that marker names
+  the `max_connections` knob, while this one names a process event no
+  limits field can prevent. The discarded parent-owned buffer carries no
+  marker anywhere — nothing was lost; it ships from the process that owns
+  it.
+- **Transports may declare `at_fork_child()`.** A duck-typed extension
+  point the fork hook calls in the child under the SDK's guard: wardex
+  cannot rebuild a third-party transport's connection pool (a pooled
+  `requests.Session` shares live TCP sockets with the parent after a fork),
+  and only the transport knows how. The built-in transports hold no
+  per-request state and do not implement it.
 
 - **OpenAI Responses API parsing** (non-streaming + SSE): `operation=chat`
   with `openai.api.type=responses`, full request/response semantics —
