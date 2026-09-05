@@ -907,9 +907,18 @@ def _agent_end(adapter: OpenAIAgentsAdapter, run: dict[str, Any], span: Any) -> 
     stack = run.get("stack")
     if stack is not None and entry in stack:
         stack.remove(entry)
-    live = run.get("agents", {}).get(entry.get("name"))
-    if live and entry in live:
-        live.remove(entry)
+    agents = run.get("agents") or {}
+    name = entry.get("name")
+    live = agents.get(name)
+    if live is not None:
+        if entry in live:
+            live.remove(entry)
+        if not live:
+            # The key leaves with its last entry. The table is keyed by agent
+            # NAME and only the stack is bounded, so a trace that runs many
+            # differently named agents in sequence would otherwise keep one
+            # empty list per name until the trace ends.
+            del agents[name]
     entry["handle"] = None
 
 

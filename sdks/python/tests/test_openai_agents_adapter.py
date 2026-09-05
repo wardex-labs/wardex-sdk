@@ -697,6 +697,40 @@ def test_two_runs_inside_one_framework_trace_share_one_root(agents_env, scenario
     assert _extra(root)["wardex.openai_agents.agents"] == 2
 
 
+def test_agents_finished_under_one_trace_leave_no_name_keys_behind(agents_env, scenario):
+    """The run's per-name table (`run["agents"]`) gains a key per distinct
+    agent NAME. Only the stack is bounded by `_MAX_AGENT_STACK`; a key that
+    outlived its last entry would let the table grow by one empty list per
+    name for the life of the trace. Read while the trace is still open — its
+    end clears the whole slot, which would hide exactly this."""
+    from agents.tracing import trace
+
+    from wardex_sdk._adapters._registry import get_registry
+
+    scenario(_decide_single)
+    names = [f"agent_{i}" for i in range(6)]
+    seen: dict[str, Any] = {}
+
+    async def many() -> None:
+        with trace("outer") as t:
+            for name in names:
+                await Runner.run(Agent(name=name, instructions="x", model="gpt-4o-mini"), "hi")
+            run = get_registry()._contexts["openai_agents"].slot(t)
+            seen["agents"] = dict(run["agents"])
+            seen["stack"] = list(run["stack"])
+
+    _init()
+    try:
+        asyncio.run(many())
+        spans = _spans()
+    finally:
+        wardex.close()
+    assert seen["stack"] == []
+    assert seen["agents"] == {}, f"stale per-name keys: {sorted(seen['agents'])}"
+    root = _one(spans, "invoke_workflow outer")
+    assert _extra(root)["wardex.openai_agents.agents"] == len(names)
+
+
 def test_without_task_and_turn_spans_only_the_turn_attribute_disappears(agents_env, scenario):
     scenario(_decide_chain)
     _init()
