@@ -203,10 +203,14 @@ All notable changes to this project are documented here. The format follows
   wardex then shows only the LLM calls — with the two lines that enable
   tracing without sending anything to OpenAI. The framework's own upload to
   `api.openai.com/v1/traces/ingest` is left as the host configured it.
-  `wardex.init()` wall time on this branch, measured on a developer machine:
-  auto-detect 1.0–1.4 s (of which `import agents` alone is 0.75–0.8 s),
-  `adapters=AdaptersConfig(enabled=())` 21 ms; the baseline before the
-  adapter was auto-detect 518 ms, `enabled=()` 94 ms, `import agents` 817 ms.
+  `wardex.init()` wall time, measured on one developer machine with one
+  method (a fresh interpreter per run, seven runs, median) on this branch
+  and on the commit before the adapter: auto-detect 985 ms (979–1091)
+  against 431 ms (429–485) before, so auto-detecting this adapter costs
+  about 550 ms, almost all of it the framework's own import (`import
+  agents` alone: 745 ms, unchanged by wardex); with
+  `adapters=AdaptersConfig(enabled=())` 19 ms on both, so a host that names
+  its adapters pays nothing new.
 - **A WebSocket connection carrying LLM calls is no longer invisible.** With
   the openai-agents SDK's opt-in `use_responses_websocket=True` every run went
   over one `wss://…/v1/responses` connection and, under the default capture
