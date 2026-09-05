@@ -7,7 +7,9 @@ with tokens, the tool `call_id` restored into the next turn's input, and
 the export-time name `chat <model>` — on BOTH run shapes, against a
 loopback fake of the Responses API. Nothing here is the framework's own
 tracing: its default run-record upload to `/v1/traces/ingest` is pointed
-at the same fake in the last test and asserted EXCLUDED and counted.
+at the same fake in one test and asserted EXCLUDED and counted. A
+`conversation_id` run pins the one shape that differs: delta inputs, a
+`conversation` field on every request, and no Conversations-API call.
 
 Measured on openai-agents 0.22 only (see the pin in pyproject.toml). The
 fake server speaks HTTP/1.0 on purpose: the framework's process-wide pooled
@@ -288,4 +290,37 @@ def test_default_trace_upload_is_excluded_and_counted(agents_env, mode):
         assert counters.get("interceptors.seam.path_excluded") == 1
     finally:
         proc.shutdown(timeout=2)
+        wardex.close()
+
+
+def test_runner_run_with_conversation_id_sends_the_delta_and_no_join_key(agents_env):
+    """`Runner.run(conversation_id=…)` is still three `chat` spans, but each
+    request carries `conversation` and only the items the framework has not
+    sent yet — turn two is the tool result alone, turn three the handoff
+    result alone — so `gen_ai.input.messages` is that delta, and the id that
+    joins the turns is not a span attribute yet. The framework never calls
+    the Conversations API itself: every POST is `/v1/responses`."""
+    base, posts = agents_env
+    t = RecordingTransport()
+    wardex.init(transport=t)
+    try:
+        res = asyncio.run(Runner.run(_agents(), "hi", conversation_id="conv_1"))
+        assert res.final_output == "done"
+        assert [p for p, _ in posts] == ["/v1/responses"] * 3
+        assert [req["conversation"] for _, req in posts] == ["conv_1"] * 3
+        assert all("previous_response_id" not in req for _, req in posts)
+        spans = _client_spans()
+        assert len(spans) == 3
+        assert [s.gen_ai.operation for s in spans] == [OperationName.CHAT] * 3
+        assert [s.gen_ai.response_id for s in spans] == ["resp_1", "resp_2", "resp_3"]
+        inputs = [json.loads(dict(s.extra)["gen_ai.input.messages"]) for s in spans]
+        ids = [
+            [p["id"] for m in msgs for p in m["parts"] if p["type"] == "tool_call_response"]
+            for msgs in inputs
+        ]
+        assert ids == [[], ["call_1"], ["call_2"]]
+        assert [len(msgs) for msgs in inputs] == [1, 1, 1]
+        assert all("conv_1" not in json.dumps(dict(s.extra)) for s in spans)
+        assert counters.get("interceptors.seam.provider_state_dropped") == 0
+    finally:
         wardex.close()
