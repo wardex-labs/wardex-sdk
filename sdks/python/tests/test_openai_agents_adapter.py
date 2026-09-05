@@ -1205,6 +1205,43 @@ def test_runner_run_three_turns_are_one_tree(agents_env):
     print("\n" + _print_tree(spans))
 
 
+def test_a_host_conversation_wins_over_the_frameworks_group_id(agents_env):
+    """HOST WINS. A run inside `with wardex.conversation("chat", id=...)`
+    keeps the host's id as `gen_ai.conversation.id` on every adapter span —
+    one trace, one conversation — and the framework's `group_id` rides
+    along on the root as `wardex.openai_agents.group_id`, counted. Without
+    a host conversation the group id is the conversation, as before."""
+    transport = _init()
+    try:
+        with wardex.conversation("chat", id="host-1"):
+            assert _run(_agents(), run_config=_run_config()).final_output == "done"
+        spans = _spans()
+        assert counters.get("adapters.openai_agents.group_id_shadowed_by_host") == 1
+    finally:
+        wardex.close()
+    adapter_spans = [s for s in _adapter_spans(spans) if s.name != "chat"]
+    for s in adapter_spans:
+        assert s.conversation is not None and s.conversation.conversation_id == "host-1", s.name
+    root = _one(spans, _ROOT)
+    assert _extra(root)["wardex.openai_agents.group_id"] == "conv-123"
+    assert "wardex.openai_agents.group_id" not in _extra(_one(spans, "invoke_agent agent_a"))
+    attrs = _otlp_attributes(transport)
+    assert attrs[_ROOT]["gen_ai.conversation.id"] == "host-1"
+    assert attrs[_ROOT]["wardex.openai_agents.group_id"] == "conv-123"
+    assert attrs["execute_tool get_weather"]["gen_ai.conversation.id"] == "host-1"
+
+    _init()
+    try:
+        assert _run(_agents(), run_config=_run_config()).final_output == "done"
+        spans = _spans()
+        assert counters.get("adapters.openai_agents.group_id_shadowed_by_host") == 1  # unchanged
+    finally:
+        wardex.close()
+    root = _one(spans, _ROOT)
+    assert root.conversation.conversation_id == "conv-123"
+    assert "wardex.openai_agents.group_id" not in _extra(root)
+
+
 def test_run_sync_three_turns_are_one_tree(agents_env):
     _init()
     try:

@@ -122,6 +122,7 @@ from .._assembly import (
     UnitKind,
     counters,
     diag_info,
+    latch_ambient,
     report_once,
 )
 from .._enums import StatusCode, ToolExecutionType, ToolType
@@ -897,14 +898,30 @@ def _trace_start(adapter: OpenAIAgentsAdapter, trace: Any) -> None:
         return
     name = str(trace.name)
     group = trace.group_id
-    conversation = ConversationContext(conversation_id=str(group)) if group else None
     trace_id = str(trace.trace_id)
     driver = _driver()
+    # HOST WINS. A run opened inside the host's own `wardex.conversation(...)`
+    # keeps that id: one trace, one conversation, and the host's word is the
+    # one its backend already groups by. The framework's `group_id` then
+    # rides along on the root as its own attribute, counted, instead of
+    # replacing the ambient id on every span underneath. With nothing
+    # ambient the group id IS the conversation, handed to the registry at
+    # the open so children and the pinned carrier inherit it.
+    conversation = None
+    shadowed = None
+    if group:
+        if latch_ambient().conversation is not None:
+            shadowed = str(group)
+            ctx.count("group_id_shadowed_by_host")
+        else:
+            conversation = ConversationContext(conversation_id=str(group))
 
     def describe(h: RunHandle) -> None:
         h.draft.set_workflow_name(name)
         h.draft.set_extra("wardex.framework", _FRAMEWORK)
         h.draft.set_extra("wardex.openai_agents.trace_id", trace_id)
+        if shadowed is not None:
+            h.draft.set_extra("wardex.openai_agents.group_id", shadowed)
 
     h = ctx.open_run(
         UnitKind.SESSION,

@@ -452,6 +452,13 @@ def conversation(
     `id=None` mints a fresh uuid4. An explicit `id` is used verbatim: a
     multi-turn chat app passes its own session id so that every turn joins ONE
     conversation instead of each turn becoming its own.
+
+    THE HOST WINS over a framework's own conversation id. An adapter run that
+    opens inside this block — an OpenAI Agents `RunConfig(group_id=...)`, say
+    — keeps this id on every span it opens and records the framework's as a
+    separate attribute (`wardex.openai_agents.group_id`), so one trace never
+    carries two conversation ids. Outside the block, the framework's id is
+    the conversation.
     """
     return _WithOnly("conversation", _conversation(name, id=id, op=op))
 

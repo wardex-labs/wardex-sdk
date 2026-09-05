@@ -186,7 +186,10 @@ All notable changes to this project are documented here. The format follows
   `guardrail_tripwire` when tripped), and an `execute_step mcp.list_tools`
   carrying a hash and a count of the tool names, never the names.
   `RunConfig(group_id=…)` becomes `gen_ai.conversation.id` on every adapter
-  span. Every edge comes from in-process context propagation — the tool
+  span — unless the run is inside the host's own `wardex.conversation(...)`,
+  whose id then stays on every span (HOST WINS: one trace, one conversation)
+  while the group id rides along on the root as `wardex.openai_agents.group_id`.
+  Every edge comes from in-process context propagation — the tool
   spans of two parallel tool calls sit at confidence 1.0 — and the
   framework's own span ids are never consulted for the tree. The LLM call
   stays the wire's: the adapter emits no `chat` span and discards the

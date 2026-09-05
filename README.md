@@ -186,7 +186,11 @@ def search(query: str): ...
 
 `conversation()` is **not** a trace root: the span it opens joins the ambient
 trace as a child, and an explicit `id=` is used verbatim — a multi-turn chat
-app passes its own session id so every turn joins one conversation.
+app passes its own session id so every turn joins one conversation. It also
+**wins over a framework's own conversation id**: an adapter run opened inside
+the block (an OpenAI Agents `RunConfig(group_id=…)`, say) keeps your id on
+every span and carries the framework's as a separate attribute
+(`wardex.openai_agents.group_id`), so one trace never has two conversation ids.
 `workflow` / `agent` / `step` / `tool` map to the `gen_ai.operation.name`
 values `invoke_workflow` / `invoke_agent` / `execute_step` / `execute_tool`,
 so decorated spans appear on operation-keyed dashboards. `span()` and
@@ -634,7 +638,10 @@ diagnostic line (traceback under `debug=True`).
   call id recovered by a unique match against the response that requested it
   (labelled `wardex.openai_agents.tool_call_id_source`), one `evaluate` per
   guardrail, and `RunConfig(group_id=…)` as `gen_ai.conversation.id` on
-  every adapter span. The LLM calls stay the wire's `chat` spans, parented
+  every adapter span — unless the run sits inside the host's own
+  `wardex.conversation(...)`, in which case the host's id stays on every
+  span and the group id rides along on the root as
+  `wardex.openai_agents.group_id`. The LLM calls stay the wire's `chat` spans, parented
   under the agent by context; the adapter discards the framework's usage so
   nothing is billed twice. By default the framework's own upload to
   `api.openai.com/v1/traces/ingest` continues unchanged; wardex does not

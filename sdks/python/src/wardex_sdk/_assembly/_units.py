@@ -1006,7 +1006,10 @@ class UnitRegistry:
         this unit — a run's group id — and it replaces what the parent unit or
         the parentage would have handed down, so children and the carrier a
         pin installs inherit the framework's word rather than an issued one.
-        Absent, the inheritance rules below are unchanged.
+        Absent, the inheritance rules below are unchanged. PRECEDENCE is the
+        caller's to decide before it states one: the openai-agents adapter
+        yields to a host conversation already ambient (the host wins) and
+        states the group id only when nothing is.
 
         `owner` names the adapter this unit belongs to, for the day one
         process-wide registry serves several at once. Defaulting it to None
