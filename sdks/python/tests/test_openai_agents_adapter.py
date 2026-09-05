@@ -834,7 +834,7 @@ def _assert_three_turn_tree(spans: list[Any], *, streamed: bool) -> None:
         assert s.gen_ai is None
     for s in (root, agent_a, agent_b, tool, marker):
         assert s.capture_integrity is None or s.capture_integrity.limitations == ()
-    assert s.status is StatusCode.OK
+        assert s.status is StatusCode.OK
     assert _extra(root)["wardex.openai_agents.turns"] == 3
     assert _extra(root)["wardex.openai_agents.agents"] == 2
 
