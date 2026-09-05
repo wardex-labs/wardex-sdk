@@ -403,18 +403,66 @@ def test_a_host_processor_registered_before_init_survives(agents_env):
     assert _processors() is before
 
 
+class _AgentNameMoved:
+    """`AgentSpanData` whose `name` keyword moved."""
+
+    def __init__(self, agent_name: str) -> None:
+        self.agent_name = agent_name
+
+
+class _AgentToolsMoved:
+    """`AgentSpanData` with `name` intact but `tools`/`handoffs` renamed —
+    the attributes `_agent_end` reads, which a name-only probe never saw."""
+
+    def __init__(self, name: str, tool_names: list | None = None) -> None:
+        self.name = name
+        self.tool_names = tool_names
+
+
+class _FunctionMcpMoved:
+    """`FunctionSpanData` without `mcp_data`, which `_function_end` reads."""
+
+    def __init__(self, name: str, input: Any, output: Any) -> None:  # noqa: A002
+        self.name, self.input, self.output = name, input, output
+
+
+class _ResponseMoved:
+    """`ResponseSpanData` whose `response` keyword moved."""
+
+    def __init__(self, result: Any = None) -> None:
+        self.result = result
+
+
+class _TraceGroupMoved:
+    """`TraceImpl` without `group_id`, which `_trace_start` reads. The
+    abstract `Trace` never had the attribute — only the concrete class sets
+    it — so this is the class the probe has to construct."""
+
+    def __init__(self, name: str, trace_id: Any, metadata: Any, processor: Any) -> None:
+        self.name, self.trace_id = name, trace_id
+
+
+@pytest.mark.parametrize(
+    ("module", "symbol", "moved"),
+    [
+        ("agents.tracing", "AgentSpanData", _AgentNameMoved),
+        ("agents.tracing", "AgentSpanData", _AgentToolsMoved),
+        ("agents.tracing", "FunctionSpanData", _FunctionMcpMoved),
+        ("agents.tracing", "ResponseSpanData", _ResponseMoved),
+        ("agents.tracing.traces", "TraceImpl", _TraceGroupMoved),
+    ],
+    ids=["agent.name", "agent.tools", "function.mcp_data", "response.response", "trace.group_id"],
+)
 def test_an_unrecognized_surface_declines_loudly_and_registers_nothing(
-    agents_env, monkeypatch, wardex_log
+    agents_env, monkeypatch, wardex_log, module, symbol, moved
 ):
-    """A span-data class whose constructor keywords moved is a surface the
-    mapping cannot read; the adapter says so once and touches nothing."""
-    import agents.tracing as tracing
+    """A class whose constructor keywords moved is a surface the mapping
+    cannot read; the adapter says so once and touches nothing. Every
+    attribute a handler reads is on the list, so a rename declines here
+    instead of raising inside a callback mid-run."""
+    import importlib
 
-    class Moved:
-        def __init__(self, agent_name: str) -> None:
-            self.agent_name = agent_name
-
-    monkeypatch.setattr(tracing, "AgentSpanData", Moved)
+    monkeypatch.setattr(importlib.import_module(module), symbol, moved)
     before = _processors()
     with installed_adapter(OpenAIAgentsAdapter) as live:
         assert _processors() is before

@@ -165,6 +165,20 @@ _PROCESSOR_ABSTRACT = frozenset(
 )
 _SPAN_ATTRS = ("span_data", "error", "started_at", "span_id", "trace_id")
 _TRACE_ATTRS = ("name", "trace_id")
+#: What `_trace_start` reads off a trace, probed on the CONCRETE class: the
+#: abstract `Trace` never carried `group_id` — only `TraceImpl.__init__` sets
+#: it — so a class-level `hasattr` would decline the very release this was
+#: measured on. The constructor keywords other than `group_id` are the
+#: framework's required positionals; `processor` is stored privately and is
+#: not read back, which is why the read set is listed apart.
+_TRACE_IMPL_KWARGS: dict[str, Any] = {
+    "name": "probe",
+    "trace_id": "trace_probe",
+    "group_id": "g",
+    "metadata": None,
+    "processor": None,
+}
+_TRACE_IMPL_READS = ("name", "trace_id", "group_id")
 
 
 def _import_agents_tracing() -> Any | None:
@@ -225,12 +239,16 @@ def _shadow_path(dist: importlib.metadata.Distribution) -> tuple[str, str] | Non
     return str(found), str(expected)
 
 
-def _constructs(cls: Any, attrs: dict[str, Any]) -> bool:
-    """Does `cls(**attrs)` build and expose every one of `attrs` by name?
+def _constructs(cls: Any, attrs: dict[str, Any], reads: tuple[str, ...] | None = None) -> bool:
+    """Does `cls(**attrs)` build and expose every attribute in `reads` (by
+    default, every keyword in `attrs`) by name?
 
     The keyword names are checked against the SIGNATURE first, so a renamed
     keyword is an answer (False) rather than a `TypeError` the registry's
     guard would report as a wardex failure — no exception path is needed.
+    `reads` exists for a constructor that stores a keyword under another
+    name: the probe then passes the keyword and reads only what the handlers
+    read.
     """
     if not isinstance(cls, type):
         return False
@@ -238,7 +256,7 @@ def _constructs(cls: Any, attrs: dict[str, Any]) -> bool:
     if any(key not in accepted for key in attrs):
         return False
     made = cls(**attrs)
-    return all(hasattr(made, key) for key in attrs)
+    return all(hasattr(made, key) for key in (attrs if reads is None else reads))
 
 
 def _surface_ok(tracing: Any) -> bool:
@@ -248,6 +266,10 @@ def _surface_ok(tracing: Any) -> bool:
     data classes are CONSTRUCTED with the keyword names the handlers read,
     because a renamed keyword is a renamed attribute and `hasattr` on the
     class alone would pass a surface whose instances no longer carry it.
+    EVERY attribute a handler reads is in a shape below — `tools` and
+    `handoffs` (`_agent_end`), `mcp_data` (`_function_end`), `response`
+    (`_response_end`), `group_id` (`_trace_start`) included — so a rename
+    declines here, once, instead of raising inside a callback mid-run.
     """
     for name in ("TracingProcessor", "add_trace_processor", "set_trace_processors"):
         if not callable(getattr(tracing, name, None)):
@@ -263,13 +285,16 @@ def _surface_ok(tracing: Any) -> bool:
         return False
     if not all(hasattr(trace_cls, a) for a in _TRACE_ATTRS):
         return False
+    trace_impl = getattr(getattr(tracing, "traces", None), "TraceImpl", None)
+    if not _constructs(trace_impl, _TRACE_IMPL_KWARGS, _TRACE_IMPL_READS):
+        return False
     shapes = {
-        "AgentSpanData": {"name": "a"},
-        "FunctionSpanData": {"name": "f", "input": None, "output": None},
+        "AgentSpanData": {"name": "a", "tools": ["t"], "handoffs": ["h"]},
+        "FunctionSpanData": {"name": "f", "input": None, "output": None, "mcp_data": None},
         "HandoffSpanData": {"from_agent": "a", "to_agent": "b"},
         "GuardrailSpanData": {"name": "g", "triggered": False},
         "TurnSpanData": {"turn": 1, "agent_name": "a"},
-        "ResponseSpanData": {},
+        "ResponseSpanData": {"response": None},
     }
     return all(_constructs(getattr(tracing, cls, None), attrs) for cls, attrs in shapes.items())
 
