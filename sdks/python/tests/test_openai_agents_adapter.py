@@ -383,44 +383,96 @@ def _fake_agents_package(tmp_path, *, with_tracing: bool):  # noqa: ANN001, ANN2
     return marker
 
 
-def _forget_agents(monkeypatch) -> None:  # noqa: ANN001
-    for key in [k for k in sys.modules if k == "agents" or k.startswith("agents.")]:
-        monkeypatch.delitem(sys.modules, key)
+_DECLINE_SCRIPT = textwrap.dedent(
+    """
+    import importlib.metadata as md, json, logging, sys
+    mode = sys.argv[1]
+    if mode == "absent":
+        real = md.distribution
+        def absent(name):
+            if name == "openai-agents":
+                raise md.PackageNotFoundError(name)
+            return real(name)
+        md.distribution = absent
+    seen = []
+    class H(logging.Handler):
+        def emit(self, r):
+            seen.append([r.levelno, r.getMessage()])
+    logging.getLogger("wardex_sdk").addHandler(H(level=logging.DEBUG))
+    import wardex_sdk as wardex
+    from wardex_sdk import AdapterName, AdaptersConfig
+    from wardex_sdk._assembly import counters
+    from wardex_sdk.testing import RecordingTransport
+    kw = {} if mode == "shadowed_auto" else {
+        "adapters": AdaptersConfig(enabled=(AdapterName.OPENAI_AGENTS,))
+    }
+    wardex.init(transport=RecordingTransport(), **kw)
+    wardex.close()
+    print(json.dumps({
+        "agents_imported": "agents" in sys.modules,
+        "lines": seen,
+        "shadowed": counters.get("adapters.openai_agents.shadowed"),
+        "unsupported": counters.get("adapters.openai_agents.unsupported_surface"),
+    }))
+    """
+)
 
 
-def test_an_absent_distribution_declines_before_importing_anything(
-    tmp_path, monkeypatch, wardex_log
-):
+def _decline_in_a_fresh_process(tmp_path, mode: str) -> dict:  # noqa: ANN001
+    """The decline path is only real in a process that has NOT yet imported
+    the framework: this suite imported it at collection, so an in-process
+    check would judge a module body that already ran against the real
+    package. `PYTHONPATH` puts the local package ahead of the wheel the way a
+    project folder named `agents` would."""
+    proc = subprocess.run(
+        [sys.executable, "-c", _DECLINE_SCRIPT, mode],
+        env={**os.environ, "PYTHONPATH": str(tmp_path), "OPENAI_API_KEY": "sk-test"},
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stderr == "", proc.stderr
+    import json
+
+    return json.loads(proc.stdout.strip().splitlines()[-1])
+
+
+def test_an_absent_distribution_declines_before_importing_anything(tmp_path):
     """A local package called `agents` with no `openai-agents` distribution:
     the adapter never imports it, so its side effects never run, and nothing
     is logged — absence is an answer, not a failure."""
-    import importlib.metadata as md
-
     marker = _fake_agents_package(tmp_path, with_tracing=True)
-    monkeypatch.syspath_prepend(str(tmp_path))
-    _forget_agents(monkeypatch)
-
-    def absent(name: str):  # noqa: ANN202
-        raise md.PackageNotFoundError(name)
-
-    monkeypatch.setattr(md, "distribution", absent)
-    with installed_adapter(OpenAIAgentsAdapter) as live:
-        assert not live.adapter._installed
+    out = _decline_in_a_fresh_process(tmp_path, "absent")
     assert not marker.exists()
-    assert wardex_log.records == []
+    assert out["agents_imported"] is False
+    assert out["lines"] == []
+    assert out["shadowed"] == 0 and out["unsupported"] == 0
 
 
-def test_a_shadowed_module_declines_loudly(tmp_path, monkeypatch, wardex_log):
-    """The distribution IS installed but `import agents` answers a local
-    package: declined, with one line naming both paths."""
-    _fake_agents_package(tmp_path, with_tracing=True)
-    monkeypatch.syspath_prepend(str(tmp_path))
-    _forget_agents(monkeypatch)
-    with installed_adapter(OpenAIAgentsAdapter) as live:
-        assert not live.adapter._installed
-        assert counters.get("adapters.openai_agents.shadowed") == 1
-    warnings = wardex_log.lines(logging.WARNING)
-    assert len(warnings) == 1 and "resolved to" in warnings[0] and str(tmp_path) in warnings[0]
+@pytest.mark.parametrize(
+    ("with_tracing", "mode"),
+    [
+        (True, "shadowed"),
+        (False, "shadowed"),
+        (True, "shadowed_auto"),
+    ],
+)
+def test_a_shadowed_module_declines_loudly_without_importing_it(tmp_path, with_tracing, mode):
+    """The distribution IS installed but `import agents` would answer a local
+    package: declined with one line naming both paths, and the local package
+    is never imported — with or without a `tracing` submodule of its own, and
+    whether the adapter was named or auto-detected."""
+    marker = _fake_agents_package(tmp_path, with_tracing=with_tracing)
+    out = _decline_in_a_fresh_process(tmp_path, mode)
+    assert not marker.exists()
+    assert out["agents_imported"] is False
+    assert out["shadowed"] == 1 and out["unsupported"] == 0
+    warnings = [m for lvl, m in out["lines"] if lvl == logging.WARNING]
+    assert len(warnings) == 1
+    assert "resolved to" in warnings[0] and str(tmp_path) in warnings[0]
+    assert "failed to load" not in warnings[0]
 
 
 # --------------------------------------------------------------------------

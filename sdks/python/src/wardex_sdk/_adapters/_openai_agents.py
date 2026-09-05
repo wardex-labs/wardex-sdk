@@ -91,6 +91,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import importlib.metadata
+import importlib.util
 import os
 import threading
 from datetime import datetime
@@ -169,10 +170,14 @@ _TRACE_ATTRS = ("name", "trace_id")
 def _import_agents_tracing() -> Any | None:
     """`agents.tracing`, or `None` when the framework is absent — an ANSWER.
 
-    Imported here rather than at module import time so that the decline path
-    is reachable: `_make_adapter` imports this module inside its branch, so a
-    module-level framework import would surface an ImportError on
-    `_adapters/__init__.py`'s stderr line instead of declining silently.
+    The ONLY place this module imports the framework, and it runs inside
+    `install()` after the distribution and shadow probes — never at module
+    import time. That is what keeps the decline path real: the registry
+    imports this module on a host whose `agents` may be an unrelated local
+    package, and a module-level framework import would execute that
+    package's body (the host-behaviour change the decline exists to avoid)
+    or surface an ImportError on `_adapters/__init__.py`'s stderr line
+    instead of declining silently.
     """
     try:
         import agents.tracing as tracing
@@ -197,12 +202,23 @@ def _installed_distribution() -> importlib.metadata.Distribution | None:
         return None
 
 
-def _shadow_path(tracing: Any, dist: importlib.metadata.Distribution) -> tuple[str, str] | None:
-    """`(resolved module path, distribution path)` when the module that
-    answered `import agents` is NOT the installed distribution's, else None."""
-    import agents
+def _shadow_path(dist: importlib.metadata.Distribution) -> tuple[str, str] | None:
+    """`(resolved module path, distribution path)` when the package that
+    `import agents` WOULD answer is not the installed distribution's, else None.
 
-    found = Path(agents.__file__).parent.resolve()
+    Read from the import system's spec, so the answer costs no import: a
+    project-local `agents/` package (an app folder named `agents` is the
+    common shape) is named here, with both paths, BEFORE anything of it could
+    run — and a local package with no `tracing` submodule is reported the same
+    way rather than declined in silence by a failed `import agents.tracing`.
+    A module the import system cannot locate answers None and leaves the
+    import step to decline; a namespace package has no origin and does the same.
+    """
+    spec = importlib.util.find_spec(_MODULE)
+    origin = spec.origin if spec is not None else None
+    if not origin:
+        return None
+    found = Path(origin).parent.resolve()
     expected = Path(str(dist.locate_file(_MODULE))).resolve()
     if found == expected:
         return None
@@ -305,10 +321,13 @@ class OpenAIAgentsAdapter(AdapterInterface):
     def install(self, client: object | None = None, ctx: object | None = None) -> None:
         """Probe, then register. ORDER IS LOAD-BEARING and is spelled out.
 
-        The distribution is checked BEFORE anything is imported, so a host
-        without the framework pays no import and a host with a local package
-        called `agents` and no distribution is declined without running its
-        import side effects. `self._installed = True` stays the LAST line.
+        The distribution and the shadow check both run BEFORE anything is
+        imported — the first through `importlib.metadata`, the second through
+        the import system's spec — so a host without the framework pays no
+        import, and a host with a local package called `agents` (with or
+        without a distribution behind it) is declined without that package's
+        body ever running. Only then is `agents.tracing` imported and probed.
+        `self._installed = True` stays the LAST line.
         """
         if self._installed:
             return
@@ -319,10 +338,7 @@ class OpenAIAgentsAdapter(AdapterInterface):
         dist = _installed_distribution()
         if dist is None:
             return
-        tracing = _import_agents_tracing()
-        if tracing is None:
-            return
-        shadow = _shadow_path(tracing, dist)
+        shadow = _shadow_path(dist)
         if shadow is not None:
             report_once(
                 f"openai-agents adapter: the module 'agents' resolved to {shadow[0]}, which "
@@ -331,6 +347,9 @@ class OpenAIAgentsAdapter(AdapterInterface):
                 key="adapters.openai_agents.shadowed",
             )
             ctx.count("shadowed")
+            return
+        tracing = _import_agents_tracing()
+        if tracing is None:
             return
         if not _surface_ok(tracing):
             report_once(
@@ -501,22 +520,20 @@ def _mark_degraded(adapter: OpenAIAgentsAdapter, obj: Any) -> None:
 # -- the framework's hook ------------------------------------------------
 
 
-def _processor_base() -> type:
-    """`TracingProcessor` when the framework is importable, else a plain base.
-
-    The wardex processor is built in the adapter's constructor — before
-    `install()` has probed anything — so the base is resolved lazily and a
-    host without the framework still constructs the adapter (and declines).
-    The framework dispatches by duck typing, never by `isinstance`, so the
-    plain base is only ever the constructor's answer on a host that will
-    never register it.
-    """
-    tracing = _import_agents_tracing()
-    return tracing.TracingProcessor if tracing is not None else object
-
-
-class _WardexTracingProcessor(_processor_base()):  # type: ignore[misc]
+class _WardexTracingProcessor:
     """The six callbacks, each a total function of the adapter's state.
+
+    DELIBERATELY NOT a subclass of the framework's `TracingProcessor`. The
+    base would have to be imported at class-definition time — at module
+    import, before `install()` has probed anything — and that import ran a
+    host's unrelated local `agents` package on a host without the framework
+    (measured: a package whose `__init__` writes a file wrote it, and one
+    with an empty `tracing.py` raised `AttributeError` out of the module
+    import, so the shadowed report never fired). The framework dispatches
+    by attribute, never by `isinstance` (no such check exists in its
+    provider or processor modules), and `_surface_ok` holds the abstract
+    method set of the real base equal to the six names below, so a release
+    that adds a callback declines instead of registering a partial processor.
 
     Every callback's first line is the installed check: the framework may
     keep calling a processor that is being uninstalled on another thread,
