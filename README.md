@@ -82,7 +82,7 @@ from wardex_sdk import AdapterName, AdaptersConfig, AnthropicAgentSdkConfig
 wardex.init(
     ...,
     adapters=AdaptersConfig(
-        enabled=(AdapterName.LANGGRAPH,),  # None auto-detects; () installs none
+        enabled=(AdapterName.LANGGRAPH, AdapterName.OPENAI_AGENTS),  # None auto-detects; () installs none
         anthropic_agent_sdk=AnthropicAgentSdkConfig(...),  # per-adapter options
     ),
 )
@@ -620,25 +620,46 @@ diagnostic line (traceback under `debug=True`).
   marked `wardex.langgraph.remote`, with the platform HTTP request underneath;
   the remote run's internals execute out of process and are not captured. A
   cached node ships no span — no work ran.
+- Framework adapter: **OpenAI Agents SDK** (`openai-agents>=0.22,<0.23`) —
+  auto-detected, hooked through the framework's own `TracingProcessor`,
+  nothing internal patched. One `invoke_workflow` per `Runner.run` /
+  `run_sync` / `run_streamed`, one `invoke_agent` per agent, a
+  `handoff {from}→{to}` marker with the receiving agent as the sender's
+  sibling (not nested — `gen_ai.agent.parent_agent` and a `handoff_from`
+  link carry the causality), one `execute_tool` per function tool with the
+  call id recovered by a unique match against the response that requested it
+  (labelled `wardex.openai_agents.tool_call_id_source`), one `evaluate` per
+  guardrail, and `RunConfig(group_id=…)` as `gen_ai.conversation.id` on
+  every adapter span. The LLM calls stay the wire's `chat` spans, parented
+  under the agent by context; the adapter discards the framework's usage so
+  nothing is billed twice. By default the framework's own upload to
+  `api.openai.com/v1/traces/ingest` continues unchanged; wardex does not
+  replace it. For the structure without that upload, IN THIS ORDER:
+  `agents.set_trace_processors([])` and THEN `wardex.init()` (the reverse
+  order removes wardex's processor too). `RunConfig(workflow_name=…)` names
+  the root; the default is `Agent workflow`. Known limitations: the wire
+  `chat` spans carry no `gen_ai.agent.name` — filter by walking up the tree
+  to the `invoke_agent` span; a Responses-over-WebSocket run stays the
+  counted, marked connection (`ws_llm_semantics_unread`) with no structure
+  read from the frames; with the framework's tracing disabled wardex logs one
+  INFO line at install and shows only the LLM calls; a `max_turns` handled by
+  `error_handlers` still ships ERROR on the agent and the root (the
+  framework marks the span before consulting the handler); and with
+  `trace_include_sensitive_data=False` the tool span carries the
+  `tool_call_id_unavailable_in_process` marker rather than a call id.
 
 **Not yet (see Roadmap)**
 - A LangChain adapter for plain LCEL chains (`prompt | model | parser`) and
   tools invoked outside a graph — those produce no structural spans today, and
   a LangChain-built *agent* is covered by the LangGraph adapter above because
   `create_agent` compiles to a `Pregel` graph
-- Framework adapter for the OpenAI Agents SDK — its Responses calls (HTTP
-  and SSE) are already captured with no adapter, tool-call ids included; the
-  adapter adds `invoke_agent`/`handoff` spans, read from the framework's
-  Python objects. It does not read Responses events inside WebSocket
-  frames: that transport stays a counted, marked
-  connection (see `capture_mode`), by decision — under the adapter, a
-  WebSocket run's model, tokens and messages would come from those same
-  framework objects, never from the frames
 - The `conversation` id in the request is not yet surfaced as a span
-  attribute (no `gen_ai.conversation.id`). It is a plain field in the
-  Responses request body — measured, present in every POST of a
-  `Runner.run(conversation_id=…)` run — so no adapter is needed for it; it is
-  a wire-side follow-up
+  attribute on the wire `chat` spans (no `gen_ai.conversation.id` there). It
+  is a plain field in the Responses request body — measured, present in
+  every POST of a `Runner.run(conversation_id=…)` run — and the byte seam
+  latches only the span context at request time, so the adapter's
+  `group_id` does not reach the chat spans either; it is a wire-side
+  follow-up
 - Node/TS and Java SDKs
 
 **Notes**
@@ -822,7 +843,7 @@ runtime version probe.
 2. ~~Batching & lifecycle (background worker, at-exit/periodic flush, concurrency)~~ — shipped
 3. ~~Distributed propagation (W3C)~~ — shipped
 4. Framework adapters — ~~Anthropic Agent SDK~~ shipped; ~~LangGraph~~ shipped;
-   LangChain (non-graph runnables) and OpenAI Agents SDK next
+   ~~OpenAI Agents SDK~~ shipped; LangChain (non-graph runnables) next
 5. Node/TS and Java SDKs
 
 > PII masking caveats: `before_send_envelope` sees pre-masking data (masking runs inside
