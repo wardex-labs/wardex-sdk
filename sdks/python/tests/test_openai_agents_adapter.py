@@ -641,8 +641,8 @@ def test_an_editable_install_of_the_real_framework_is_not_a_shadow(
 # --------------------------------------------------------------------------
 
 
-def _fc(name: str, call_id: str, args: str = "{}") -> dict:
-    return {
+def _fc(name: str, call_id: str, args: str = "{}", *, namespace: str | None = None) -> dict:
+    item = {
         "type": "function_call",
         "id": f"fc_{call_id}",
         "call_id": call_id,
@@ -650,6 +650,9 @@ def _fc(name: str, call_id: str, args: str = "{}") -> dict:
         "arguments": args,
         "status": "completed",
     }
+    if namespace is not None:
+        item["namespace"] = namespace
+    return item
 
 
 _DONE = [
@@ -1483,6 +1486,44 @@ def test_a_tool_payload_is_the_frameworks_string_bounded_by_the_handshake():
     assert len(_tool_payload("é" * 10_000, 64)) == 65
     assert _tool_payload("x" * 64, 64) == b"x" * 64
     assert _tool_payload({"city": "Seoul"}, 64) == b"{'city': 'Seoul'}"
+
+
+def test_a_namespaced_tool_recovers_its_call_id(agents_env, scenario):
+    """`tool_namespace()` (public in 0.22) names the function span
+    `f"{namespace}.{name}"` while the response item keeps the bare `name`
+    plus a `namespace` field. The call-id match keys both sides by the
+    framework's own trace-name rule, so a namespaced tool joins its turn
+    instead of always shipping the marker."""
+    from agents import function_tool
+    from agents.tool import tool_namespace
+
+    @function_tool
+    def get_weather(city: str) -> str:
+        return f"sunny in {city}"
+
+    def decide(inp: object) -> list[dict]:
+        if _outputs_done(inp) == 0:
+            return [_fc("get_weather", "call_1", '{"city":"Seoul"}', namespace="ns")]
+        return _DONE
+
+    scenario(decide)
+    agent = Agent(
+        name="agent_a",
+        instructions="a",
+        tools=tool_namespace(name="ns", description="weather tools", tools=[get_weather]),
+        model="gpt-4o-mini",
+    )
+    _init()
+    try:
+        assert _run(agent).final_output == "done"
+        spans = _spans()
+        assert counters.get("adapters.openai_agents.tool_call_id_unmatched") == 0
+    finally:
+        wardex.close()
+    tool = _one(spans, "execute_tool ns.get_weather")
+    assert tool.tool.call_id == "call_1"
+    assert _extra(tool)["wardex.openai_agents.tool_call_id_source"] == "response_output_match"
+    assert Limitation.TOOL_CALL_ID_UNAVAILABLE_IN_PROCESS not in _edge(tool)[2]
 
 
 def test_two_identical_tool_calls_in_one_response_get_no_guessed_id(agents_env, scenario):

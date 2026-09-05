@@ -62,7 +62,9 @@ Seams, and the shape each forces:
   HTTP call inside the handler nests under it. The call id is recovered by
   an EXACT and UNIQUE `(name, arguments)` match against the response that
   requested it, labelled at the source; anything less than unique ships the
-  `tool_call_id_unavailable_in_process` marker instead of a guess.
+  `tool_call_id_unavailable_in_process` marker instead of a guess. `name`
+  is the framework's TRACE name — `namespace.name` under `tool_namespace()`
+  — spelled the same on both sides of the match.
 * `GuardrailSpanData` — `evaluate`. `score_label` is one of three:
   `pass` (the body returned, no tripwire), `tripwire` (ERROR
   `guardrail_tripwire`), or `not_rendered` — the body never returned a
@@ -1196,9 +1198,23 @@ def _response_end(adapter: OpenAIAgentsAdapter, run: dict[str, Any], span: Any) 
         for item in response.output or ():
             if getattr(item, "type", None) != "function_call":
                 continue
-            key = (str(item.name), str(item.arguments))
+            key = (_tool_trace_name(item), str(item.arguments))
             calls.setdefault(key, []).append(str(item.call_id))
     agent["calls"] = calls
+
+
+def _tool_trace_name(item: Any) -> str:
+    """The framework's own spelling of a tool call's span name
+    (`_tool_identity.tool_trace_name`): `namespace.name` for a call under
+    `tool_namespace()`, the bare `name` otherwise — and bare when the
+    namespace EQUALS the name, the reserved synthetic shape a deferred
+    top-level tool arrives in. `FunctionSpanData.name` is this string, so
+    the call-id match keys the response side the same way."""
+    name = str(item.name)
+    namespace = getattr(item, "namespace", None)
+    if isinstance(namespace, str) and namespace and namespace != name:
+        return f"{namespace}.{name}"
+    return name
 
 
 # -- tools ---------------------------------------------------------------------
