@@ -993,6 +993,46 @@ def test_parallel_tool_calls_keep_parent_confidence_at_one(agents_env, scenario)
     assert (weather.tool.call_id, clock.tool.call_id) == ("call_1", "call_2")
 
 
+def test_sensitive_data_off_leaves_the_marker_and_no_join_on_the_tool_span(agents_env):
+    """`RunConfig(trace_include_sensitive_data=False)`: the framework strips
+    the response and the tool arguments from its own spans, so the call id
+    cannot be matched and the response id is unavailable. The tool span ships
+    the marker and no `response_id` extra rather than a guess, the handoff
+    marker carries no join either, the wire span stays the only holder of
+    `gen_ai.response.id`, and the host's result is untouched."""
+    _init()
+    try:
+        cfg = RunConfig(trace_include_sensitive_data=False)
+        assert _run(_agents(), run_config=cfg).final_output == "done"
+        spans = _spans()
+        assert counters.get("adapters.openai_agents.response_id_unavailable") == 3
+        assert counters.get("adapters.openai_agents.tool_call_id_unmatched") == 1
+        assert counters.get("adapters.openai_agents.tool_call_id_ambiguous") == 0
+    finally:
+        wardex.close()
+    tool = _one(spans, "execute_tool get_weather")
+    marker = _one(spans, "handoff agent_a→agent_b")
+    assert tool.tool.call_id is None
+    assert Limitation.TOOL_CALL_ID_UNAVAILABLE_IN_PROCESS in _edge(tool)[2]
+    assert "wardex.openai_agents.tool_call_id_source" not in _extra(tool)
+    for s in (tool, marker):
+        assert "wardex.openai_agents.response_id" not in _extra(s)
+    assert tool.input_data == b"" and tool.output_data == b""
+    assert [
+        c.gen_ai.response_id for c in sorted(_chat_spans(spans), key=lambda c: c.start_time_ns)
+    ] == [
+        "resp_1",
+        "resp_2",
+        "resp_3",
+    ]
+    for name in (
+        _ROOT.replace("wf", "Agent workflow"),
+        "invoke_agent agent_a",
+        "invoke_agent agent_b",
+    ):
+        assert _one(spans, name).status is StatusCode.OK
+
+
 def test_a_tool_payload_is_the_frameworks_string_bounded_by_the_handshake():
     """A `str` is recorded as its own bytes; over the budget it comes back as
     exactly `budget + 1` bytes so the storage cap sets the truncated flag; a
