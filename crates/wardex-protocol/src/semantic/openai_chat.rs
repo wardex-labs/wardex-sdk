@@ -289,6 +289,7 @@ pub(super) fn fill_openai_chat(
                 }
             }
             msgs.push(OutMsg {
+                role: None,
                 parts,
                 finish_reason,
             });

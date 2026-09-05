@@ -1894,3 +1894,31 @@ fn responses_body_on_localhost_is_not_mistaken_for_anthropic() {
     assert_eq!(s.api_type, Some("responses"));
     assert_eq!(s.usage.input_tokens(), Some(52));
 }
+
+/// A Responses output `message` item that carries a role other than
+/// `assistant` (a compaction echoes the caller's own messages) keeps that
+/// role in `gen_ai.output.messages` instead of being folded into the
+/// assistant's message as words the model never said.
+#[test]
+fn user_role_output_items_keep_their_role() {
+    let resp = br#"{"id":"resp_r","object":"response","status":"completed","output":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]},{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hi"}]}]}"#;
+    let s = parse_responses_fixture(br#"{"model":"gpt-5.1","input":"x"}"#, resp);
+    let v: serde_json::Value = serde_json::from_str(&s.output_messages.unwrap()).unwrap();
+    let msgs = v.as_array().unwrap();
+    assert_eq!(msgs.len(), 2);
+    assert_eq!(msgs[0]["role"], "user");
+    assert_eq!(msgs[0]["parts"][0]["type"], "text");
+    assert_eq!(msgs[0]["parts"][0]["content"], "hello");
+    assert!(msgs[0].get("finish_reason").is_none());
+    assert_eq!(msgs[1]["role"], "assistant");
+    assert_eq!(msgs[1]["parts"][0]["content"], "hi");
+    assert_eq!(msgs[1]["finish_reason"], "stop");
+    for m in msgs.iter().filter(|m| m["role"] == "assistant") {
+        for part in m["parts"].as_array().unwrap() {
+            assert_ne!(
+                part["content"], "hello",
+                "user text leaked into the assistant"
+            );
+        }
+    }
+}
