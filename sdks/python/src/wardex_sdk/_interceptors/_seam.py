@@ -37,7 +37,7 @@ from .._enums import (
     StatusCode,
 )
 from .._limits import LimitsConfig, LimitsConsumer, limits_kwargs
-from .._protocol import parse_llm_semantics
+from .._protocol import classify_path, parse_llm_semantics
 from .._semantics import (
     USAGE_DROPPED_KEY,
     build_gen_ai,
@@ -601,8 +601,10 @@ class ByteSeamInterceptor(InterceptorInterface):
         a handful of attribute reads, and `copy_context()` (HAMT sharing,
         O(1)). The parse, the gate and the draft belong to the worker.
 
-        `None` means the prefilter DENIED the connection: cheaper than
-        today, because the parse this skips was unconditionally paid before.
+        `None` means the prefilter DENIED the connection, or the path is one
+        the endpoint table EXCLUDES (`classify_path`) — either way cheaper
+        than today, because the parse this skips was unconditionally paid
+        before.
 
         The fork latch is consumed here rather than at assembly: `st` must
         not travel with the job (I-F1), so the first transaction SEALED on a
@@ -610,13 +612,24 @@ class ByteSeamInterceptor(InterceptorInterface):
         timing markers. (Before the deferred split the stamp happened below
         the gate — first CAPTURED transaction; the seal is the earliest
         moment the fact can leave the connection state, and a gate-refused
-        first transaction now consumes the latch too.)
+        first transaction consumes the latch too; an EXCLUDED one does not —
+        it returns above the latch block — so the marker lands on the
+        connection's next sealed transaction.)
         """
         url_host = getattr(obj, "server_hostname", None) or st.server_address
         ct = txn.content_type or ""
         # gRPC: skip LLM semantic extraction (protobuf isn't LLM JSON).
         is_grpc = ct.startswith("application/grpc") and not ct.startswith("application/grpc-web")
         connect_ms, handshake_ms, reused, timing_markers = self._resolve_timing(obj, st)
+        if classify_path(txn.path) == "excluded":
+            # A telemetry upload (the OpenAI Agents SDK POSTs its whole run
+            # record to /v1/traces/ingest). Not wardex's to copy: skipped in
+            # every mode and above the allowlist, before any parse is queued
+            # or body retained — counted, not spanned. Does not consume the
+            # fork latch: the marker belongs on the first transaction that
+            # becomes a span.
+            counters.bump("interceptors.seam.path_excluded")
+            return None
         if st.reset_at_fork:
             st.reset_at_fork = False
             timing_markers = (*timing_markers, Limitation.TRACKING_RESET_AT_FORK)
