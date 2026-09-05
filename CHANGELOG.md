@@ -174,7 +174,12 @@ All notable changes to this project are documented here. The format follows
   when permessage-deflate was negotiated, which the `websockets` client
   requests by default — and no model, tokens or messages. A Responses-path
   connection to an unknown host with compressed payloads is only counted,
-  under `interceptors.seam.ws_llm_endpoint_unconfirmed`. Switch the framework
+  under `interceptors.seam.ws_llm_endpoint_unconfirmed`. Under `ALL`, under an
+  `intercept_hosts` entry, or inside a local span that unconfirmed connection
+  does ship, but as an ordinary WebSocket span — `WS /v1/responses`, status
+  OK, no `ws_llm_semantics_unread` marker (measured against a loopback
+  server: one span, markers `['payload_compressed']` only) — so the counter
+  is the only signal that unread LLM calls crossed it. Switch the framework
   to its default HTTP transport to get `gen_ai` spans.
 - **`POST /v1/responses/compact` is captured as the billable LLM call it is:**
   `chat` operation, request model, `usage` tokens, `openai.api.type=responses`.
@@ -470,12 +475,11 @@ All notable changes to this project are documented here. The format follows
 
 - **openai-agents `Runner.run(conversation_id=…)`** (measured on 0.22 in
   `tests/test_openai_agents_wire.py`): each turn is still a `chat` span, but
-  every request carries `conversation` and only the items the framework has
-  not sent yet — turn two is the tool result alone, turn three the handoff
-  result alone — so `gen_ai.input.messages` holds that delta, and the
-  `conversation` id that joins the turns is not yet a span attribute. The
-  framework never calls the Conversations API itself on this path: all three
-  POSTs are `/v1/responses`. The default `Runner.run` (no `conversation_id`,
+  the request carries only the items the framework has not sent yet — turn
+  two is the tool result alone, turn three the handoff result alone — so
+  `gen_ai.input.messages` holds that delta. The framework never calls the
+  Conversations API itself on this path: all three POSTs are `/v1/responses`.
+  The default `Runner.run` (no `conversation_id`,
   no `previous_response_id`) resends the full input every turn, so nothing
   is missing there; the join key across turns is the tool `call_id` echoed
   in the next input, which is restored.
@@ -499,6 +503,16 @@ All notable changes to this project are documented here. The format follows
   processor in front. The open check is the oracle's Phoenix counterpart
   (the Langfuse e2e driver pointed at a live Phoenix); until someone runs
   it, treat Phoenix cost columns under wardex as unverified.
+
+### Known limitations
+
+- **wardex does not yet surface the request's `conversation` id (no
+  `gen_ai.conversation.id`).** Under openai-agents
+  `Runner.run(conversation_id=…)` the field is on the wire in every request —
+  measured on 0.22 in `tests/test_openai_agents_wire.py`, all three POSTs
+  carry `conversation=conv_1` — so the id that joins the turns is there to be
+  read and wardex simply does not map it onto the span. Nothing about the
+  framework blocks it; it is a wire-side follow-up, not an ecosystem gap.
 
 
 ## [0.5.0b1] - 2026-08-16

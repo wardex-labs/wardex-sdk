@@ -365,7 +365,12 @@ is the provider's, or when the first message is a Responses `response.create`
 on an uncompressed connection; a Responses-path connection to an unknown host
 (localhost, a gateway) with compression — the `websockets` client's default —
 is only counted (`interceptors.seam.ws_llm_endpoint_unconfirmed`) and yields
-no span under the default mode.
+no span under the default mode. Under `ALL`, under an `intercept_hosts` entry,
+or inside a local span that same connection does ship — but as an ordinary
+WebSocket span, `WS /v1/responses` with status OK and no
+`ws_llm_semantics_unread` marker (measured against a loopback server: one
+span, markers `['payload_compressed']` only) — so the counter is the only
+signal that unread LLM calls crossed it.
 
 Plaintext hosts you've explicitly named via `intercept_hosts` are always
 captured regardless of `capture_mode` — a targeted allowlist entry is a
@@ -612,12 +617,17 @@ diagnostic line (traceback under `debug=True`).
   `create_agent` compiles to a `Pregel` graph
 - Framework adapter for the OpenAI Agents SDK — its Responses calls (HTTP
   and SSE) are already captured with no adapter, tool-call ids included; the
-  adapter adds `invoke_agent`/`handoff` spans and the `conversation` id,
-  read from the framework's Python objects. It does not read Responses
-  events inside WebSocket frames: that transport stays a counted, marked
+  adapter adds `invoke_agent`/`handoff` spans, read from the framework's
+  Python objects. It does not read Responses events inside WebSocket
+  frames: that transport stays a counted, marked
   connection (see `capture_mode`), by decision — under the adapter, a
   WebSocket run's model, tokens and messages would come from those same
   framework objects, never from the frames
+- The `conversation` id in the request is not yet surfaced as a span
+  attribute (no `gen_ai.conversation.id`). It is a plain field in the
+  Responses request body — measured, present in every POST of a
+  `Runner.run(conversation_id=…)` run — so no adapter is needed for it; it is
+  a wire-side follow-up
 - Node/TS and Java SDKs
 
 **Notes**
