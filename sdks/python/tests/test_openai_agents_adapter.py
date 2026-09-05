@@ -399,7 +399,11 @@ def test_an_absent_distribution_declines_before_importing_anything(
     marker = _fake_agents_package(tmp_path, with_tracing=True)
     monkeypatch.syspath_prepend(str(tmp_path))
     _forget_agents(monkeypatch)
-    monkeypatch.setattr(md, "packages_distributions", lambda: {})
+
+    def absent(name: str):  # noqa: ANN202
+        raise md.PackageNotFoundError(name)
+
+    monkeypatch.setattr(md, "distribution", absent)
     with installed_adapter(OpenAIAgentsAdapter) as live:
         assert not live.adapter._installed
     assert not marker.exists()

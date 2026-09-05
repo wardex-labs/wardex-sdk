@@ -182,14 +182,19 @@ def _import_agents_tracing() -> Any | None:
 
 
 def _installed_distribution() -> importlib.metadata.Distribution | None:
-    """The `openai-agents` distribution, found WITHOUT importing anything and
-    without an exception path: `packages_distributions` is built from the
-    installed metadata alone, so a host with a local `agents/` package and no
-    distribution answers `None` here and nothing of theirs is imported."""
-    owners = importlib.metadata.packages_distributions().get(_MODULE, ())
-    if _DISTRIBUTION not in owners:
+    """The `openai-agents` distribution, found WITHOUT importing anything: a
+    host with a local `agents/` package and no distribution answers `None`
+    here and nothing of theirs is imported.
+
+    The absence is an ANSWER, spelled as the stdlib spells it. The
+    exception-free `packages_distributions()` was tried first and answers
+    `None` for this very wheel on the 3.10 floor (it reads `top_level.txt`
+    only there), which would have declined the adapter on every 3.10 host.
+    """
+    try:
+        return importlib.metadata.distribution(_DISTRIBUTION)
+    except importlib.metadata.PackageNotFoundError:
         return None
-    return importlib.metadata.distribution(_DISTRIBUTION)
 
 
 def _shadow_path(tracing: Any, dist: importlib.metadata.Distribution) -> tuple[str, str] | None:
