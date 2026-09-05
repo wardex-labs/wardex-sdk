@@ -349,9 +349,10 @@ wardex.init(..., capture_mode=wardex.CaptureMode.ALL)
 **Responses over WebSocket (openai-agents `use_responses_websocket=True`).**
 This opt-in transport sends every call over one `wss://…/v1/responses`
 connection, and it is the one WebSocket case that ships under the default
-mode without a wrapper: once the first call crosses the connection wardex
-counts it (`interceptors.seam.ws_llm_semantics_unread`) and, when the
-connection closes, emits one `WS /v1/responses` span marked
+mode without a wrapper: once the first call crosses the connection it is
+an LLM connection, and when the connection closes wardex counts it
+(`interceptors.seam.ws_llm_semantics_unread`) and emits one
+`WS /v1/responses` span marked
 `ws_llm_semantics_unread` — LLM calls crossed it and wardex read none of
 them, because Responses events inside WebSocket frames are not parsed. The
 span carries `ws.messages.sent` (about one per call), byte counts and payload

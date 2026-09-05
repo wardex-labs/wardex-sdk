@@ -271,10 +271,37 @@ def test_loopback_responses_websocket_confirms_from_the_envelope():
 
 
 def test_loopback_responses_websocket_with_deflate_is_unconfirmed():
+    """The gate refuses the span under the default mode; the count happens
+    before the gate, so the refused connection is still counted."""
     _session("127.0.0.1", "/v1/responses", deflate=True, first=b'{"type": "response.create"}')
     assert _ws_spans() == []
     assert counters.get(_UNCONFIRMED) == 1
     assert counters.get(_UNREAD) == 0
+
+
+def test_ws_llm_counters_move_at_connection_close():
+    """Counted from the seam when the connection's one span is built, not
+    from the tracker on the first message: after the first client message
+    nothing has moved, after the close exactly one count has."""
+    wardex.init(intercept=True)
+    from wardex_sdk._interceptors._registry import get_registry
+
+    interceptor = get_registry()._installed["ssl"]  # type: ignore[attr-defined]
+    obj = _FakeSSLObj("api.openai.com")
+    interceptor._on_request_bytes(
+        obj,
+        b"GET /v1/responses HTTP/1.1\r\nHost: api.openai.com\r\n"
+        b"Upgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+    )
+    interceptor._on_response_bytes(
+        obj,
+        b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+    )
+    interceptor._on_request_bytes(obj, _frame(True, 0x1, b'{"type":"response.create"}'))
+    assert counters.get(_UNREAD) == 0
+    interceptor._on_response_bytes(obj, _frame(True, 0x8, (1000).to_bytes(2, "big")))
+    assert counters.get(_UNREAD) == 1
+    assert len(_ws_spans()) == 1
 
 
 def test_ordinary_messages_websocket_is_not_an_llm_call():

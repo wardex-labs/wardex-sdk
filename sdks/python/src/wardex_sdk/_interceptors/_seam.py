@@ -725,6 +725,16 @@ class ByteSeamInterceptor(InterceptorInterface):
             client.capture_span(span)
 
     def _build_ws_span(self, st: _ConnectionState, txn: _Txn) -> Any:
+        # The tracker's answer to the LLM-transport question, counted HERE
+        # and BEFORE the gate: every `interceptors.seam.*` bump lives in this
+        # module, and a span the mode refuses must still count — the counter
+        # is the only trace an unconfirmed connection leaves under the
+        # default mode. Once per connection, because this runs once per
+        # connection: the WS span is built at close.
+        if txn.ws_llm_call:
+            counters.bump("interceptors.seam.ws_llm_semantics_unread")
+        elif txn.ws_llm_unconfirmed:
+            counters.bump("interceptors.seam.ws_llm_endpoint_unconfirmed")
         # `sem=None`: a WS session carries no parsed LLM semantics (by
         # construction on this path), so it is captured under ALL, an
         # allowlisted host, a live local span, or — the one claim this path

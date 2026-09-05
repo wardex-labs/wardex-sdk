@@ -164,9 +164,9 @@ All notable changes to this project are documented here. The format follows
   is OpenAI's own (exactly `api.openai.com` or a subdomain of `openai.com`;
   `openai-mock.corp` is not) or the first client message is a Responses
   `response.create` —
-  wardex counts it under `interceptors.seam.ws_llm_semantics_unread`
-  immediately, and emits one `WS /v1/responses` span per connection **when
-  the connection closes** (marked `ws_no_close` if the connection ends
+  wardex counts it under `interceptors.seam.ws_llm_semantics_unread` and
+  emits one `WS /v1/responses` span per connection, both **when the
+  connection closes** (marked `ws_no_close` if the connection ends
   without a WebSocket close handshake — a server drop, a timeout, process
   exit — or wardex is uninstalled first), under the default mode, marked
   `ws_llm_semantics_unread`

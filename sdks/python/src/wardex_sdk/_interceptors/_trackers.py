@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .. import _hub, _wardex_native
-from .._assembly import Limitation, counters, parent_is_closed_unit
+from .._assembly import Limitation, parent_is_closed_unit
 from .._protocol import WsParser
 from .._protocol._http1 import Http1RequestParser, Http1ResponseParser
 from .._protocol._http2 import Http2Parser
@@ -140,8 +140,15 @@ class _Txn:
     #: Confirmed LLM calls crossed this WebSocket connection and wardex read
     #: none. A capture claim for the gate (`_should_capture`), so the marked
     #: span ships under the default mode instead of being gated out with
-    #: sem=None.
+    #: sem=None. The seam counts it (`interceptors.seam.ws_llm_semantics_unread`)
+    #: when it builds the connection's span.
     ws_llm_call: bool = False
+    #: The upgrade path was a WebSocket-capable LLM row on a host that is not
+    #: the provider's, and nothing corroborated an LLM call: no claim, but a
+    #: recognised path must not vanish uncounted. The seam counts it
+    #: (`interceptors.seam.ws_llm_endpoint_unconfirmed`) when it builds the
+    #: connection's span. Exclusive with `ws_llm_call`.
+    ws_llm_unconfirmed: bool = False
 
 
 class _Http1Tracker:
@@ -494,10 +501,13 @@ class _WebSocketTracker:
     ) -> None:
         # "known_provider" | "unknown_host" | None: the endpoint table's
         # answer about the upgrade path (`classify_ws_upgrade`), decided by
-        # the seam at the swap site. The tracker only confirms it.
+        # the seam at the swap site. The tracker only confirms it — once:
+        # `_decide_llm` nulls this, so "already decided" and "nothing to
+        # decide" are the same state and there is no second flag to keep in
+        # step with it.
         self._llm_upgrade = llm_upgrade
         self._llm_call = False
-        self._llm_decided = False
+        self._llm_unconfirmed = False
         self._sent = WsParser(limits)  # client -> server
         self._recv = WsParser(limits)  # server -> client
         self._path = path
@@ -537,9 +547,8 @@ class _WebSocketTracker:
             if f.opcode == "close":
                 self._closed = True
         self._sent_msgs += len(r.messages)
-        if not self._llm_decided:
+        if self._llm_upgrade is not None:
             if r.messages:
-                self._llm_decided = True
                 self._decide_llm(r.messages[0])
             elif self._sent.is_disabled():
                 # The parser died on the first client frame (oversize,
@@ -547,7 +556,6 @@ class _WebSocketTracker:
                 # the same, so decide now on nothing readable: a decision
                 # that waited for a message would be starved by the parse
                 # failure and the connection would vanish without a counter.
-                self._llm_decided = True
                 self._decide_llm(None)
         self._in_trunc = self._append_sample(self._sample_in, r.messages) or self._in_trunc
         return self._maybe_emit()
@@ -559,16 +567,17 @@ class _WebSocketTracker:
         # is None then). The path alone is a suffix match; it is corroborated
         # by the provider's own host or, when nothing hides the payload (no
         # permessage-deflate, a readable message), by the Responses envelope
-        # itself.
-        if self._llm_upgrade is None:
-            return
+        # itself. The tracker only records the answer on the `_Txn` it emits
+        # at close; the seam reads it there and counts — so the two counters
+        # move when the connection closes, not at this first message, and a
+        # span the capture gate then refuses is still counted.
         if self._llm_upgrade == "known_provider" or (
             first is not None and not self._deflate and _RESPONSES_CREATE.search(first) is not None
         ):
             self._llm_call = True
-            counters.bump("interceptors.seam.ws_llm_semantics_unread")
         else:
-            counters.bump("interceptors.seam.ws_llm_endpoint_unconfirmed")
+            self._llm_unconfirmed = True
+        self._llm_upgrade = None
 
     def on_response_bytes(self, data: bytes) -> list[_Txn]:
         r = self._recv.feed(data)
@@ -654,4 +663,5 @@ class _WebSocketTracker:
             ws_bytes_received=self._recv_bytes,
             ws_markers=tuple(markers),
             ws_llm_call=self._llm_call,
+            ws_llm_unconfirmed=self._llm_unconfirmed,
         )

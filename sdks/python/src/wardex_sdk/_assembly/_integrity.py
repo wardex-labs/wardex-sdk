@@ -1005,8 +1005,9 @@ Two emit sites, and the first is the mechanism the second restates.
     restores it.
 
     Emitted from ``_interceptors/_trackers.py::_WebSocketTracker._build_txn``,
-    confirmed on the first client message; the seam's gate reads the same fact
-    (``_Txn.ws_llm_call``) as a capture claim.
+    decided on the first client message and stamped at close; the seam's gate
+    reads the same fact (``_Txn.ws_llm_call``) as a capture claim, and
+    ``_seam.py::_build_ws_span`` counts it — at close, before the gate.
     """
 
     # ------------------------------------------------------------------

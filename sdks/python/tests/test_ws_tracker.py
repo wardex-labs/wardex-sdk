@@ -2,15 +2,8 @@ import json
 
 import pytest
 
-from wardex_sdk._assembly import Limitation, counters
+from wardex_sdk._assembly import Limitation
 from wardex_sdk._interceptors._trackers import _WebSocketTracker
-
-
-@pytest.fixture(autouse=True)
-def _fresh_counters():
-    counters.reset()
-    yield
-    counters.reset()
 
 
 def _frame(fin: bool, opcode: int, payload: bytes) -> bytes:
@@ -58,9 +51,11 @@ def test_flush_emits_with_no_close_marker():
 
 
 # --- the WebSocket LLM-transport question ---------------------------------
+#
+# The tracker only DECIDES; it reports the decision as `_Txn.ws_llm_call` /
+# `_Txn.ws_llm_unconfirmed` at close, and the seam counts from those
+# (test_ws_interceptor.py). No counter moves in here.
 
-_UNREAD = "interceptors.seam.ws_llm_semantics_unread"
-_UNCONFIRMED = "interceptors.seam.ws_llm_endpoint_unconfirmed"
 _CLOSE_1001 = _frame(True, 0x8, (1001).to_bytes(2, "big"))
 
 
@@ -73,22 +68,23 @@ def _tracker(llm_upgrade: str | None, *, deflate: bool) -> _WebSocketTracker:
 def test_known_provider_confirms_on_first_client_message():
     t = _tracker("known_provider", deflate=True)
     assert t._llm_call is False
-    assert counters.get(_UNREAD) == 0
     # any bytes: the provider host is the corroboration, so deflate is moot
     assert t.on_request_bytes(_frame(True, 0x1, b"\x8b\x00\x01")) == []
-    assert counters.get(_UNREAD) == 1
+    assert t._llm_call is True
+    # decided once: a second message cannot flip or re-make the decision
+    assert t.on_request_bytes(_frame(True, 0x1, b'{"op":"ping"}')) == []
     (txn,) = t.on_response_bytes(_CLOSE_1001)
     assert txn.ws_llm_call is True
+    assert txn.ws_llm_unconfirmed is False
     assert Limitation.WS_LLM_SEMANTICS_UNREAD in txn.ws_markers
 
 
 def test_unknown_host_confirms_from_the_responses_envelope():
     t = _tracker("unknown_host", deflate=False)
     t.on_request_bytes(_frame(True, 0x1, b'{"type": "response.create", "model": "gpt-4o-mini"}'))
-    assert counters.get(_UNREAD) == 1
-    assert counters.get(_UNCONFIRMED) == 0
     (txn,) = t.on_response_bytes(_CLOSE_1001)
     assert txn.ws_llm_call is True
+    assert txn.ws_llm_unconfirmed is False
     assert Limitation.WS_LLM_SEMANTICS_UNREAD in txn.ws_markers
 
 
@@ -112,10 +108,9 @@ def test_unknown_host_envelope_is_found_anywhere_in_the_first_message(first: byt
     t = _tracker("unknown_host", deflate=False)
     header = bytes([0x81, 126]) + len(first).to_bytes(2, "big")
     t.on_request_bytes(header + first)
-    assert counters.get(_UNREAD) == 1
-    assert counters.get(_UNCONFIRMED) == 0
     (txn,) = t.on_response_bytes(_CLOSE_1001)
     assert txn.ws_llm_call is True
+    assert txn.ws_llm_unconfirmed is False
 
 
 def test_unknown_host_with_deflate_stays_unconfirmed():
@@ -123,19 +118,19 @@ def test_unknown_host_with_deflate_stays_unconfirmed():
     t.on_request_bytes(_frame(True, 0x1, b'{"type": "response.create"}'))
     (txn,) = t.on_response_bytes(_CLOSE_1001)
     assert txn.ws_llm_call is False
+    assert txn.ws_llm_unconfirmed is True
     assert Limitation.WS_LLM_SEMANTICS_UNREAD not in txn.ws_markers
-    assert counters.get(_UNCONFIRMED) == 1
-    assert counters.get(_UNREAD) == 0
 
 
 def test_unknown_host_non_responses_message_stays_unconfirmed():
     t = _tracker("unknown_host", deflate=False)
     t.on_request_bytes(_frame(True, 0x1, b'{"op":"ping"}'))
+    # decided once: a later `response.create` does not reopen the question
+    t.on_request_bytes(_frame(True, 0x1, b'{"type":"response.create"}'))
     (txn,) = t.on_response_bytes(_CLOSE_1001)
     assert txn.ws_llm_call is False
+    assert txn.ws_llm_unconfirmed is True
     assert Limitation.WS_LLM_SEMANTICS_UNREAD not in txn.ws_markers
-    assert counters.get(_UNCONFIRMED) == 1
-    assert counters.get(_UNREAD) == 0
 
 
 #: A Text frame header claiming a 2 MiB payload — above the default
@@ -150,13 +145,13 @@ def test_known_provider_confirms_when_the_first_frame_kills_the_parser():
     parser could frame it."""
     t = _tracker("known_provider", deflate=False)
     assert t.on_request_bytes(_OVERSIZE_FIRST_FRAME) == []
-    assert counters.get(_UNREAD) == 1
+    assert t._llm_call is True
     # single-shot: the disabled parser keeps reporting disabled, and the
     # decision is not made again
     assert t.on_request_bytes(b"\x81\x02hi") == []
-    assert counters.get(_UNREAD) == 1
     (txn,) = t.on_response_bytes(_CLOSE_1001)
     assert txn.ws_llm_call is True
+    assert txn.ws_llm_unconfirmed is False
     assert Limitation.WS_LLM_SEMANTICS_UNREAD in txn.ws_markers
     assert Limitation.FRAME_PARSE_FAILED in txn.ws_markers
 
@@ -166,14 +161,12 @@ def test_unknown_host_is_unconfirmed_when_the_first_frame_kills_the_parser():
     but the connection is counted rather than vanishing."""
     t = _tracker("unknown_host", deflate=False)
     assert t.on_request_bytes(_OVERSIZE_FIRST_FRAME) == []
-    assert counters.get(_UNCONFIRMED) == 1
     assert t.on_request_bytes(b"\x81\x02hi") == []
-    assert counters.get(_UNCONFIRMED) == 1
     (txn,) = t.on_response_bytes(_CLOSE_1001)
     assert txn.ws_llm_call is False
+    assert txn.ws_llm_unconfirmed is True
     assert Limitation.WS_LLM_SEMANTICS_UNREAD not in txn.ws_markers
     assert Limitation.FRAME_PARSE_FAILED in txn.ws_markers
-    assert counters.get(_UNREAD) == 0
 
 
 def test_no_client_message_confirms_nothing():
@@ -181,9 +174,8 @@ def test_no_client_message_confirms_nothing():
     t = _tracker("known_provider", deflate=False)
     (txn,) = t.on_response_bytes(_CLOSE_1001)
     assert txn.ws_llm_call is False
+    assert txn.ws_llm_unconfirmed is False
     assert Limitation.WS_LLM_SEMANTICS_UNREAD not in txn.ws_markers
-    assert counters.get(_UNREAD) == 0
-    assert counters.get(_UNCONFIRMED) == 0
 
 
 def test_unrecognised_upgrade_claims_nothing():
@@ -191,6 +183,5 @@ def test_unrecognised_upgrade_claims_nothing():
     t.on_request_bytes(_frame(True, 0x1, b'{"type": "response.create"}'))
     (txn,) = t.on_response_bytes(_CLOSE_1001)
     assert txn.ws_llm_call is False
+    assert txn.ws_llm_unconfirmed is False
     assert Limitation.WS_LLM_SEMANTICS_UNREAD not in txn.ws_markers
-    assert counters.get(_UNREAD) == 0
-    assert counters.get(_UNCONFIRMED) == 0
