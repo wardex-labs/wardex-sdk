@@ -1962,3 +1962,27 @@ fn responses_compact_is_a_billable_llm_call() {
         assert_ne!(part.get("content"), Some(&serde_json::json!("hello")));
     }
 }
+
+/// `input_text` is a block the CALLER writes; it is accepted as text only
+/// under a non-assistant role. An `input_text` block inside an ASSISTANT
+/// item is off-schema and stays what an unknown block is: a generic part
+/// with the unmapped flag — never the model's own words.
+#[test]
+fn input_text_is_text_only_under_a_non_assistant_role() {
+    let resp = br#"{"id":"resp_r","object":"response","status":"completed","output":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]},{"type":"message","role":"assistant","content":[{"type":"input_text","text":"smuggled"}]}]}"#;
+    let s = parse_responses_fixture(br#"{"model":"gpt-5.1","input":"x"}"#, resp);
+    assert!(s.output_messages_has_unmapped);
+    let v: serde_json::Value = serde_json::from_str(&s.output_messages.unwrap()).unwrap();
+    let msgs = v.as_array().unwrap();
+    assert_eq!(msgs.len(), 2);
+    assert_eq!(msgs[0]["role"], "user");
+    assert_eq!(
+        msgs[0]["parts"],
+        serde_json::json!([{"type": "text", "content": "hello"}])
+    );
+    assert_eq!(msgs[1]["role"], "assistant");
+    assert_eq!(
+        msgs[1]["parts"],
+        serde_json::json!([{"type": "input_text"}])
+    );
+}

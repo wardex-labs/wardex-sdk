@@ -229,7 +229,10 @@ pub(super) fn fill_openai_responses(
 /// One output item -> OTel parts (design §4.4 table). Unknown types become a
 /// generic part AND set the unmapped flag — never silently skipped. A
 /// `message` item whose `role` is not `assistant` goes to `pre` as its own
-/// message rather than into the assistant's `parts`.
+/// message rather than into the assistant's `parts`; `input_text` is text
+/// only under such a role (a compaction echoes the caller's blocks), so an
+/// `input_text` block inside an assistant item — off-schema — stays an
+/// unmapped generic part rather than becoming the model's own words.
 fn output_item_parts(
     item: &serde_json::Value,
     ty: &str,
@@ -242,11 +245,18 @@ fn output_item_parts(
     match ty {
         "message" => {
             let role = str_of("role").unwrap_or("assistant");
+            let assistant = role == "assistant";
             let mut local: Vec<serde_json::Value> = Vec::new();
             if let Some(content) = item.get("content").and_then(|c| c.as_array()) {
                 for block in content {
                     match block.get("type").and_then(|x| x.as_str()).unwrap_or("") {
-                        "output_text" | "input_text" => {
+                        "output_text" => {
+                            let text = block.get("text").and_then(|x| x.as_str()).unwrap_or("");
+                            if !text.is_empty() {
+                                local.push(text_part(text.to_string()));
+                            }
+                        }
+                        "input_text" if !assistant => {
                             let text = block.get("text").and_then(|x| x.as_str()).unwrap_or("");
                             if !text.is_empty() {
                                 local.push(text_part(text.to_string()));
@@ -266,7 +276,7 @@ fn output_item_parts(
                     }
                 }
             }
-            if role == "assistant" {
+            if assistant {
                 parts.extend(local);
             } else {
                 pre.push(OutMsg {
