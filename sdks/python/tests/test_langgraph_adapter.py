@@ -1098,3 +1098,16 @@ def test_tool_attributes_is_reachable_without_naming_a_forbidden_module():
 
     assert "ToolAttributes" in assembly.__all__
     assert assembly.__all__ == sorted(assembly.__all__)
+
+
+def test_agent_conversation_and_evaluation_blocks_are_reachable_without_naming_a_forbidden_module():
+    """The three typed blocks an agent-structure adapter needs — `invoke_agent`
+    and `handoff` require the agent block, `evaluate` the evaluation block,
+    and `group_id` travels as a conversation — re-exported the same way
+    `ToolAttributes` is, for the same C-S1 reason."""
+    import wardex_sdk._assembly as assembly
+
+    for name in ("AgentAttributes", "ConversationContext", "EvaluationAttributes"):
+        assert name in assembly.__all__
+        assert getattr(assembly, name) is not None
+    assert assembly.__all__ == sorted(assembly.__all__)
