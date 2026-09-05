@@ -82,7 +82,11 @@ from wardex_sdk import AdapterName, AdaptersConfig, AnthropicAgentSdkConfig
 wardex.init(
     ...,
     adapters=AdaptersConfig(
-        enabled=(AdapterName.LANGGRAPH, AdapterName.OPENAI_AGENTS),  # None auto-detects; () installs none
+        enabled=(  # None auto-detects; () installs none
+            AdapterName.ANTHROPIC_AGENT_SDK,
+            AdapterName.LANGGRAPH,
+            AdapterName.OPENAI_AGENTS,
+        ),
         anthropic_agent_sdk=AnthropicAgentSdkConfig(...),  # per-adapter options
     ),
 )
