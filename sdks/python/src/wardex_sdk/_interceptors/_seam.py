@@ -556,9 +556,7 @@ class ByteSeamInterceptor(InterceptorInterface):
             pass
         for txn in txns:
             if getattr(txn, "ws_upgrade", False):
-                # Same host expression as `_seal`: the TLS name when there is
-                # one, else the peer address.
-                url_host = getattr(obj, "server_hostname", None) or st.server_address
+                url_host = _url_host(obj, st)
                 ws = _WebSocketTracker(
                     path=txn.ws_upgrade_path or "/",
                     deflate=txn.ws_deflate,
@@ -620,7 +618,7 @@ class ByteSeamInterceptor(InterceptorInterface):
         it returns above the latch block — so the marker lands on the
         connection's next sealed transaction.)
         """
-        url_host = getattr(obj, "server_hostname", None) or st.server_address
+        url_host = _url_host(obj, st)
         ct = txn.content_type or ""
         # gRPC: skip LLM semantic extraction (protobuf isn't LLM JSON).
         is_grpc = ct.startswith("application/grpc") and not ct.startswith("application/grpc-web")
@@ -1180,6 +1178,14 @@ def _latched(txn: _Txn) -> Ambient:
     it already captured.
     """
     return Ambient(span_context=txn.parent, conversation=None, tracestate=None)
+
+
+def _url_host(obj: Any, st: _ConnectionState) -> str:
+    """The host a URL on this connection names: the TLS server name when
+    there is one, else the peer address `_peer` recorded on `st`. One
+    expression for the WS swap site and `_seal`, so the WebSocket-transport
+    question and the HTTP span's URL are asked about the same host."""
+    return getattr(obj, "server_hostname", None) or st.server_address
 
 
 def _peer(obj: Any) -> tuple[str, int]:
