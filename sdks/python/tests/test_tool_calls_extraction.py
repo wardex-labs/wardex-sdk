@@ -13,9 +13,9 @@ import time as _time
 from pathlib import Path
 
 import wardex_sdk as wardex
-from wardex_sdk import ConsoleTransport, _hub
+from conftest import client_spans
+from wardex_sdk import ConsoleTransport
 from wardex_sdk._assembly import Limitation
-from wardex_sdk._enums import SpanKind
 
 _FIXTURES = Path(__file__).parent / "fixtures"
 CERT = _FIXTURES / "cert.pem"
@@ -93,18 +93,12 @@ def _post(url: str, body: bytes) -> None:
     conn.close()
 
 
-def _client_spans():
-    client = _hub.get_client()
-    client._settle()  # finalization runs on the worker; settle before reading
-    return [s for s in client._spans if s.kind == SpanKind.CLIENT]
-
-
 def test_tool_call_extracted_to_output_messages():
     httpd, url = _server(_TOOL_RESP)
     try:
         wardex.init(transport=ConsoleTransport(), intercept=True)
         _post(url, b'{"model":"gpt-4o-mini"}')
-        spans = _client_spans()
+        spans = client_spans()
         assert len(spans) == 1
         extra = dict(spans[0].extra)
         assert "gen_ai.output.messages" in extra
@@ -123,7 +117,7 @@ def test_text_response_has_output_messages_with_text_part():
     try:
         wardex.init(transport=ConsoleTransport(), intercept=True)
         _post(url, b'{"model":"gpt-4o-mini"}')
-        spans = _client_spans()
+        spans = client_spans()
         assert len(spans) == 1
         extra = dict(spans[0].extra)
         assert "gen_ai.output.messages" in extra
@@ -165,7 +159,7 @@ def test_tool_calls_missing_emits_empty_parts_not_failed_marker():
     try:
         wardex.init(transport=ConsoleTransport(), intercept=True)
         _post(url, b'{"model":"gpt-4o-mini"}')
-        spans = _client_spans()
+        spans = client_spans()
         assert len(spans) == 1
         extra = dict(spans[0].extra)
         # output_messages exists with empty parts (message is assembled even
@@ -235,7 +229,7 @@ def test_sse_tool_calls_reassembled():
     try:
         wardex.init(transport=ConsoleTransport(), intercept=True)
         _post(url, b'{"model":"gpt-4o-mini","stream":true}')
-        spans = _client_spans()
+        spans = client_spans()
         assert len(spans) == 1
         extra = dict(spans[0].extra)
         assert "gen_ai.output.messages" in extra

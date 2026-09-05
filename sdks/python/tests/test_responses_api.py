@@ -17,9 +17,9 @@ import ssl
 import threading
 
 import wardex_sdk as wardex
-from wardex_sdk import _hub
+from conftest import client_spans
 from wardex_sdk._assembly import Limitation
-from wardex_sdk._enums import CaptureMode, OperationName, SpanKind
+from wardex_sdk._enums import CaptureMode, OperationName
 from wardex_sdk.transport import ConsoleTransport
 
 _REPO = pathlib.Path(__file__).resolve().parents[3]
@@ -74,12 +74,6 @@ def _post(url: str, body: bytes, path: str = "/v1/responses") -> int:
     return resp.status
 
 
-def _client_spans():
-    client = _hub.get_client()
-    client._settle()  # finalization runs on the worker; settle before reading
-    return [s for s in client._spans if s.kind == SpanKind.CLIENT]
-
-
 def test_responses_call_is_captured_under_default_agent_mode():
     """T-P1 — the openai-agents default path exists on the wire now: no local
     span, default AGENT mode, one POST /v1/responses -> one CLIENT span with
@@ -90,7 +84,7 @@ def test_responses_call_is_captured_under_default_agent_mode():
     try:
         wardex.init(transport=ConsoleTransport(), intercept=True)
         _post(url, _fixture("openai_responses", "request.json"))
-        spans = _client_spans()
+        spans = client_spans()
         assert len(spans) == 1
         sp = spans[0]
         assert sp.gen_ai is not None
@@ -133,7 +127,7 @@ def test_responses_tool_call_correlates_across_two_turns():
         wardex.init(transport=ConsoleTransport(), intercept=True)
         _post(url, _fixture("openai_responses_tools", "request.json"))
         _post(url, turn2_request)
-        first, second = _client_spans()
+        first, second = client_spans()
 
         out = json.loads(dict(first.extra)["gen_ai.output.messages"])
         tool_calls = [p for m in out for p in m["parts"] if p["type"] == "tool_call"]
@@ -166,7 +160,7 @@ def test_responses_stream_ships_snapshot_usage_and_markers(responses_sse_tls_ser
             verify=ssl._create_unverified_context(),
         )
         assert resp.status_code == 200
-        sp = _client_spans()[0]
+        sp = client_spans()[0]
         markers = sp.capture_integrity.limitations
         assert Limitation.REASSEMBLED_FROM_STREAM in markers
         assert Limitation.STREAM_USAGE_UNAVAILABLE not in markers
@@ -261,7 +255,7 @@ def test_count_tokens_is_not_a_chat_call():
     try:
         wardex.init(transport=ConsoleTransport(), intercept=True, capture_mode=CaptureMode.ALL)
         _post(url, b'{"model":"claude-sonnet-4-6","messages":[]}', "/v1/messages/count_tokens")
-        sp = _client_spans()[0]
+        sp = client_spans()[0]
         assert sp.gen_ai is None
         assert Limitation.SEMANTIC_PARSE_FAILED not in sp.capture_integrity.limitations
     finally:

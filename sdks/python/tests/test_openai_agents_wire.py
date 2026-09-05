@@ -31,9 +31,9 @@ from agents.tracing import flush_traces, get_trace_provider, set_trace_processor
 from agents.tracing.processors import BackendSpanExporter, BatchTraceProcessor
 
 import wardex_sdk as wardex
-from wardex_sdk import _hub
+from conftest import client_spans
 from wardex_sdk._assembly import Limitation, counters
-from wardex_sdk._enums import CaptureMode, OperationName, SpanKind
+from wardex_sdk._enums import CaptureMode, OperationName
 from wardex_sdk.testing import RecordingTransport
 
 _USAGE = {
@@ -187,12 +187,6 @@ def _agents() -> Agent:
     )
 
 
-def _client_spans():
-    client = _hub.get_client()
-    client._settle()
-    return [s for s in client._spans if s.kind == SpanKind.CLIENT]
-
-
 def _check(spans, posts, *, streamed: bool) -> None:
     assert [p for p, _ in posts] == ["/v1/responses"] * 3
     for _, req in posts:
@@ -246,7 +240,7 @@ def test_runner_run_three_turns_are_three_llm_spans(agents_env):
         res = asyncio.run(Runner.run(_agents(), "hi"))
         assert res.final_output == "done"
         assert res.last_agent.name == "agent_b"
-        _check(_client_spans(), posts, streamed=False)
+        _check(client_spans(), posts, streamed=False)
         wardex.flush()
         assert _exported_names(t) == ["chat gpt-4o-mini"] * 3
     finally:
@@ -263,7 +257,7 @@ async def test_runner_run_streamed_three_turns_are_three_llm_spans(agents_env):
         async for _ in result.stream_events():
             pass
         assert result.final_output == "done"
-        _check(_client_spans(), posts, streamed=True)
+        _check(client_spans(), posts, streamed=True)
     finally:
         wardex.close()
 
@@ -284,7 +278,7 @@ def test_default_trace_upload_is_excluded_and_counted(agents_env, mode):
         ingest = [req for path, req in posts if path.endswith("/traces/ingest")]
         assert len(ingest) == 1
         assert {d.get("object") for d in ingest[0]["data"]} == {"trace", "trace.span"}
-        spans = _client_spans()
+        spans = client_spans()
         assert {s.name for s in spans} == {"HTTP POST /v1/responses"}
         assert len(spans) == 3
         assert counters.get("interceptors.seam.path_excluded") == 1
@@ -309,7 +303,7 @@ def test_runner_run_with_conversation_id_sends_the_delta_and_no_join_key(agents_
         assert [p for p, _ in posts] == ["/v1/responses"] * 3
         assert [req["conversation"] for _, req in posts] == ["conv_1"] * 3
         assert all("previous_response_id" not in req for _, req in posts)
-        spans = _client_spans()
+        spans = client_spans()
         assert len(spans) == 3
         assert [s.gen_ai.operation for s in spans] == [OperationName.CHAT] * 3
         assert [s.gen_ai.response_id for s in spans] == ["resp_1", "resp_2", "resp_3"]

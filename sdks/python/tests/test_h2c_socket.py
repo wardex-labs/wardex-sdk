@@ -18,8 +18,9 @@ import h2.events
 import pytest
 
 import wardex_sdk as wardex
+from conftest import client_spans
 from wardex_sdk import ConsoleTransport, _hub
-from wardex_sdk._enums import CaptureSource, SpanKind
+from wardex_sdk._enums import CaptureSource
 from wardex_sdk._interceptors._registry import get_registry
 
 _LLM_RESP = json.dumps(
@@ -41,12 +42,6 @@ def _reset():
 
     get_registry().uninstall_all()
     _hub.reset_for_test()
-
-
-def _client_spans():
-    client = _hub.get_client()
-    client._settle()  # finalization runs on the worker; settle before reading
-    return [s for s in client._spans if s.kind == SpanKind.CLIENT]
 
 
 def _h2c_server(body: bytes):
@@ -148,7 +143,7 @@ def test_h2c_llm_call_captured():
             "/v1/chat/completions",
             b'{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}',
         )
-        spans = _client_spans()
+        spans = client_spans()
         assert len(spans) == 1
         sp = spans[0]
         assert sp.transport.http.url.startswith("http://")  # plaintext h2c
@@ -168,7 +163,7 @@ def test_h2c_non_llm_dropped_without_allowlist():
         assert get_registry().is_installed("socket")
         _h2c_post(host, port, "/rpc", b'{"foo":"bar"}')
         # non-LLM + no allowlist → dropped (same emission path as gRPC-over-h2c)
-        assert _client_spans() == []
+        assert client_spans() == []
     finally:
         stop.set()
         srv.close()
@@ -183,7 +178,7 @@ def test_h2c_non_llm_captured_with_allowlist():
             intercept_hosts=[f"{host}:{port}"],
         )
         _h2c_post(host, port, "/rpc", b'{"foo":"bar"}')
-        spans = _client_spans()
+        spans = client_spans()
         assert len(spans) == 1  # allowlist also emits non-LLM h2c
         assert spans[0].transport.http.url.startswith("http://")
         assert ("network.protocol.version", "2") in spans[0].extra

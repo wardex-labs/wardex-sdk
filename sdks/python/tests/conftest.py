@@ -1,11 +1,15 @@
-"""Local self-signed TLS HTTP server fixture (zero external dependencies)."""
+"""Local self-signed TLS HTTP server fixture (zero external dependencies),
+and the handful of helpers the seam tests share: `client_spans`,
+`fresh_counters`, `llm_fixture`, `queued_server`."""
 
 from __future__ import annotations
 
+import contextlib
 import http.server
 import socket
 import ssl
 import threading
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -13,6 +17,87 @@ import pytest
 _FIXTURES = Path(__file__).parent / "fixtures"
 CERT = _FIXTURES / "cert.pem"
 KEY = _FIXTURES / "key.pem"
+
+#: The Rust parser's LLM fixtures (request/response/expect per case), which
+#: the Python wire tests replay through a loopback server.
+LLM_FIXTURES = (
+    Path(__file__).resolve().parents[3]
+    / "crates"
+    / "wardex-protocol"
+    / "tests"
+    / "fixtures"
+    / "llm"
+)
+
+
+def llm_fixture(case: str, name: str) -> bytes:
+    """One file of one Rust LLM fixture case, e.g. `("openai_responses", "response.json")`."""
+    return (LLM_FIXTURES / case / name).read_bytes()
+
+
+def client_spans() -> list:
+    """The CLIENT spans the hub's client holds — after `_settle()`, because
+    finalization runs on the worker and a bare read races it."""
+    from wardex_sdk import _hub
+    from wardex_sdk._enums import SpanKind
+
+    client = _hub.get_client()
+    client._settle()
+    return [s for s in client._spans if s.kind == SpanKind.CLIENT]
+
+
+@pytest.fixture
+def fresh_counters() -> Iterator[None]:
+    """`counters` is a process-global dict, so without this a bump from one
+    test is readable by the next — which is how an assertion passes on
+    evidence its own test never produced. Not autouse: a file whose
+    assertions are exact counts opts in with
+    `pytestmark = pytest.mark.usefixtures("fresh_counters")`."""
+    from wardex_sdk._assembly import counters
+
+    counters.reset()
+    yield
+    counters.reset()
+
+
+@contextlib.contextmanager
+def queued_server(
+    payloads: list[tuple[int, bytes]], *, tls: bool = False
+) -> Iterator[tuple[str, int]]:
+    """A loopback server answering one queued `(status, JSON body)` per
+    request, whatever the method or path; yields `(host, port)` and stops
+    the server on exit. `tls=True` wraps it in the self-signed cert above."""
+    queue = list(payloads)
+
+    class H(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def _answer(self) -> None:
+            _ = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+            status, payload = queue.pop(0)
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        do_GET = do_POST = do_DELETE = _answer
+
+        def log_message(self, *a: object) -> None:
+            pass
+
+    httpd = http.server.HTTPServer(("127.0.0.1", 0), H)
+    if tls:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(certfile=str(CERT), keyfile=str(KEY))
+        httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
+    host, port = httpd.socket.getsockname()[:2]
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    try:
+        yield host, port
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
 
 
 @pytest.fixture(autouse=True)

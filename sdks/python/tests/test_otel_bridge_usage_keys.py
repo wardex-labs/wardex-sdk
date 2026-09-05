@@ -90,11 +90,7 @@ class _FakeClient:
         self.spans.append(span)
 
 
-@pytest.fixture(autouse=True)
-def _fresh_counters():
-    counters.reset()
-    yield
-    counters.reset()
+pytestmark = pytest.mark.usefixtures("fresh_counters")
 
 
 @pytest.fixture(autouse=True)

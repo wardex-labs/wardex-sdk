@@ -7,12 +7,7 @@ from wardex_sdk._enums import CaptureMode, SpanKind
 from wardex_sdk._protocol import classify_ws_upgrade
 from wardex_sdk._types import StatusCode
 
-
-@pytest.fixture(autouse=True)
-def _fresh_counters():
-    counters.reset()
-    yield
-    counters.reset()
+pytestmark = pytest.mark.usefixtures("fresh_counters")
 
 
 @pytest.fixture(autouse=True)

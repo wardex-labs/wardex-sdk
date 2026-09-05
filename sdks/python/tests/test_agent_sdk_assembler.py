@@ -10,15 +10,7 @@ from wardex_sdk._adapters._assembler import SessionAssembler
 from wardex_sdk._assembly import Limitation, UnitKey, UnitKind, counters
 from wardex_sdk._enums import CaptureSource, StatusCode
 
-
-@pytest.fixture(autouse=True)
-def _fresh_counters():
-    """`counters` is a process-global dict, so without this a bump from one test
-    is readable by the next — which is how an assertion passes on evidence its
-    own test never produced."""
-    counters.reset()
-    yield
-    counters.reset()
+pytestmark = pytest.mark.usefixtures("fresh_counters")
 
 
 INIT = {"type": "system", "subtype": "init", "session_id": "s-1", "model": "claude-sonnet-5"}
