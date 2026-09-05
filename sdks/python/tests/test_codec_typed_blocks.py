@@ -195,3 +195,63 @@ def test_a_batch_with_one_unmarshallable_span_ships_the_other_spans():
     ]
     assert names == ["good-a", "good-b"]
     assert counters.get("transport.otlp.span_unmarshalled") == 1
+
+
+def test_every_block_the_vocabulary_declares_has_a_marshal_site():
+    """The check that would have caught the conversation and evaluation
+    blocks — and then the retrieval block — six months earlier: a `Block`
+    is a typed field the vocabulary can REQUIRE of an intent, so a member
+    with no marshal site is a span that passes `finish()` and leaves the
+    process without the very thing the intent exists for. One sample per
+    member, encoded and decoded, at least one wire key each; a member added
+    to `Block` without a row here fails on the set equality."""
+    from wardex_sdk._assembly import Block
+    from wardex_sdk._enums import OperationName
+    from wardex_sdk._types import EmbeddingsAttributes, GenAIAttributes, RetrievalAttributes
+
+    samples = {
+        Block.GEN_AI: (
+            {"gen_ai": GenAIAttributes(operation=OperationName.CHAT, request_model="m")},
+            lambda span, extra: extra["gen_ai.request.model"] == "m",
+        ),
+        Block.AGENT: (
+            {"agent": AgentAttributes(name="a")},
+            lambda span, extra: extra["gen_ai.agent.name"] == "a",
+        ),
+        Block.TOOL: (
+            {"tool": ToolAttributes(name="t")},
+            lambda span, extra: extra["gen_ai.tool.name"] == "t",
+        ),
+        Block.RETRIEVAL: (
+            {
+                "retrieval": RetrievalAttributes(
+                    data_source_id="ds-1", query_text="q", documents=b'[{"id":1}]'
+                )
+            },
+            lambda span, extra: (
+                extra["gen_ai.data_source.id"] == "ds-1"
+                and extra["gen_ai.retrieval.query.text"] == "q"
+                and extra["gen_ai.retrieval.documents"] == b'[{"id":1}]'
+            ),
+        ),
+        Block.EMBEDDINGS: (
+            {"embeddings": EmbeddingsAttributes(dimension_count=3)},
+            lambda span, extra: extra["gen_ai.embeddings.dimension.count"] == 3,
+        ),
+        Block.EVALUATION: (
+            {"evaluation": EvaluationAttributes(name="judge")},
+            lambda span, extra: extra["gen_ai.evaluation.name"] == "judge",
+        ),
+        Block.WORKFLOW_NAME: (
+            {"workflow_name": "wf"},
+            lambda span, extra: span["workflow_name"] == "wf",
+        ),
+    }
+    assert set(samples) == set(Block), "a Block member has no sample row here"
+    for block, (fields, holds) in samples.items():
+        out = _codec.decode(_codec.encode(_env(_span(**fields))))
+        span = out["items"][0]["span"]
+        assert holds(span, _extra_dict(span)), f"{block} reached the wire with no key"
+    # And an empty `documents` -- the dataclass default -- is not a fact.
+    out = _codec.decode(_codec.encode(_env(_span(retrieval=RetrievalAttributes()))))
+    assert "gen_ai.retrieval.documents" not in _extra_dict(out["items"][0]["span"])

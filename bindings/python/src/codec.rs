@@ -85,6 +85,14 @@ fn kv_double(key: &str, v: f64) -> pb::KeyValue {
         }),
     }
 }
+fn kv_bytes(key: &str, v: Vec<u8>) -> pb::KeyValue {
+    pb::KeyValue {
+        key: key.into(),
+        value: Some(pb::AnyValue {
+            value: Some(pb::any_value::Value::BytesValue(v)),
+        }),
+    }
+}
 fn kv_bool(key: &str, v: bool) -> pb::KeyValue {
     pb::KeyValue {
         key: key.into(),
@@ -298,6 +306,31 @@ fn flatten_gen_ai(g: &Bound<PyAny>, out: &mut Vec<pb::KeyValue>) -> PyResult<()>
 fn flatten_embeddings(e: &Bound<PyAny>, out: &mut Vec<pb::KeyValue>) -> PyResult<()> {
     if let Some(v) = opt(e, "dimension_count")? {
         out.push(kv_int("gen_ai.embeddings.dimension.count", v.extract()?));
+    }
+    Ok(())
+}
+
+/// RetrievalAttributes → extra KeyValue (semconv `gen_ai.retrieval.*` and
+/// `gen_ai.data_source.id`). Only populated fields; an empty `documents` is
+/// the dataclass default, not a fact. The third typed block that was
+/// declared, settable through `SpanDraft.set_retrieval`, required by the
+/// `RETRIEVAL` intent — and never marshalled, the same gap the conversation
+/// and evaluation blocks had. `documents` travels as bytes on the envelope
+/// surface and degrades to text on the OTLP one like every other payload.
+fn flatten_retrieval(r: &Bound<PyAny>, out: &mut Vec<pb::KeyValue>) -> PyResult<()> {
+    for (attr, key) in [
+        ("data_source_id", "gen_ai.data_source.id"),
+        ("query_text", "gen_ai.retrieval.query.text"),
+    ] {
+        if let Some(v) = opt(r, attr)? {
+            out.push(kv_str(key, v.str()?.to_string()));
+        }
+    }
+    if let Some(v) = opt(r, "documents")? {
+        let docs: Vec<u8> = v.extract()?;
+        if !docs.is_empty() {
+            out.push(kv_bytes("gen_ai.retrieval.documents", docs));
+        }
     }
     Ok(())
 }
@@ -739,6 +772,9 @@ fn span_to_proto(sp: &Bound<PyAny>) -> PyResult<pb::Span> {
     }
     if let Some(e) = opt(sp, "embeddings")? {
         flatten_embeddings(&e, &mut span.extra)?;
+    }
+    if let Some(r) = opt(sp, "retrieval")? {
+        flatten_retrieval(&r, &mut span.extra)?;
     }
     if let Some(c) = opt(sp, "conversation")? {
         flatten_conversation(&c, &mut span.extra)?;
