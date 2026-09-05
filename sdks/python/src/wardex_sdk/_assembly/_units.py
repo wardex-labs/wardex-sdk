@@ -998,8 +998,15 @@ class UnitRegistry:
         aliases: Sequence[UnitKey] = (),
         start_ns: int | None = None,
         owner: str | None = None,
+        conversation: ConversationContext | None = None,
     ) -> Unit:
         """Open a unit and the span it owns.
+
+        `conversation`, when given, is the identity the FRAMEWORK stated for
+        this unit — a run's group id — and it replaces what the parent unit or
+        the parentage would have handed down, so children and the carrier a
+        pin installs inherit the framework's word rather than an issued one.
+        Absent, the inheritance rules below are unchanged.
 
         `owner` names the adapter this unit belongs to, for the day one
         process-wide registry serves several at once. Defaulting it to None
@@ -1024,6 +1031,7 @@ class UnitRegistry:
         strands have different repairs.
         """
         now = start_ns if start_ns is not None else time.time_ns()
+        stated = conversation
         if parent_unit is not None:
             if evidence is AMBIENT:
                 evidence = _IN_UNIT
@@ -1041,6 +1049,8 @@ class UnitRegistry:
             parentage = resolve_parentage(ambient, evidence)
             conversation = parentage.conversation
             tracestate = parentage.tracestate
+        if stated is not None:
+            conversation = stated
 
         draft = SpanDraft(
             parentage,
@@ -1049,6 +1059,11 @@ class UnitRegistry:
             source=CaptureSource.ADAPTER,
             start_ns=now,
         )
+        if stated is not None:
+            # The draft copied the PARENTAGE's conversation at construction;
+            # the framework's stated one has to reach the unit's own span as
+            # well as its children.
+            draft.set_conversation(stated)
 
         unit = Unit(
             self,

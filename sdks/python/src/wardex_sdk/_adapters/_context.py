@@ -64,11 +64,13 @@ from .._assembly import (
     EMPTY_AMBIENT,
     NULL_DRAFT,
     Ambient,
+    ConversationContext,
     Evidence,
     Limitation,
     LinkReason,
     ParentSource,
     PatchSet,
+    PinToken,
     SpanDraft,
     SpanIntent,
     Unit,
@@ -389,7 +391,15 @@ class RunHandle(Scope):
     questions, and a degraded handle would have needed all four written twice.
     """
 
-    __slots__ = ()
+    __slots__ = ("_pin",)
+
+    def __init__(self, unit: Unit | None, ctx: AdapterContext) -> None:
+        super().__init__(unit, ctx)
+        #: The token of the pin THIS handle installed, kept so that `unpin()`
+        #: can take it down again. A handle holds at most one: a second `pin()`
+        #: replaces the token, and the earlier pin is then the registry's to
+        #: retire through staleness — the same rule a dropped token follows.
+        self._pin: PinToken | None = None
 
     def pin(self, *, driver: object) -> bool:
         """Make this run the ambient parent on the task that DRIVES a generator.
@@ -411,7 +421,34 @@ class RunHandle(Scope):
         """
         if self._unit is None:
             return False
-        return self._ctx._units.pin_driver(self._unit, owner_task=driver).installed
+        token = self._ctx._units.pin_driver(self._unit, owner_task=driver)
+        self._pin = token
+        return token.installed
+
+    def unpin(self) -> bool:
+        """Take the pin this handle installed back down, on the task it was put on.
+
+        The half `pin()` did not have, and the reason a callback-driven adapter
+        can hold a unit ambient for exactly the framework's own span lifetime:
+        a span-start callback pins, the matching span-end callback unpins, and
+        whatever was ambient before — the enclosing run's pin, or a host's own
+        span — is current again. Without it a closed unit's pin stays on the
+        task until staleness retires it, and the next sibling opened on that
+        task is refused the dead ambient and marked `CORRELATION_CONFLICT`.
+
+        Answers True when there was an installed pin to remove and False when
+        there was nothing to do — a refused pin, a degraded handle, or a second
+        call. A removal attempted from another task is COUNTED by the registry
+        rather than raised, so the answer is about what was asked, never a
+        promise about the carrier. `close()` does not call this: a unit may
+        legitimately close on one task while its pin lives on another.
+        """
+        token = self._pin
+        self._pin = None
+        if token is None or not token.installed:
+            return False
+        self._ctx._units.unpin(token)
+        return True
 
     def close(self, *, status: StatusCode = StatusCode.OK, error_type: str | None = None) -> None:
         if self._unit is None:
@@ -724,6 +761,7 @@ class AdapterContext:
         parent: Unit | None = None,
         evidence: Evidence | None = None,
         fallback: Fallback = Fallback.NONE,
+        conversation: ConversationContext | None = None,
     ) -> Unit:
         holder = parent if parent is not None else self._units.current()
         # Latched ONCE and used for both the declaration and the open. Two reads
@@ -763,6 +801,7 @@ class AdapterContext:
             aliases=aliases,
             start_ns=start_ns,
             owner=self.name,
+            conversation=conversation,
         )
         if conflicted:
             # The WORD is the registry's to choose, exactly as it chooses it for
@@ -1019,12 +1058,20 @@ class AdapterContext:
         selector: UnitKey | None = None,
         start_ns: int | None = None,
         fallback: Fallback = Fallback.NONE,
+        conversation: ConversationContext | None = None,
         describe: Callable[[RunHandle], None] | None = None,
     ) -> RunHandle:
         """A unit that outlives this call. NOT installed; see `RunHandle.pin`.
 
         NEVER None and NEVER raises; a handle whose open failed answers
         `degraded` and no-ops every verb.
+
+        `conversation` is the identity a framework RUN already carries — its
+        group id — handed in at the open so that every child unit and every
+        wire span issued under the run's pin inherits it, the way a session
+        the parentage issued one for would. Only this opener takes it: a run
+        is where a framework states a conversation, and a nested `enter()`
+        inherits its parent's.
         """
         unit = None
         handle = None
@@ -1039,6 +1086,7 @@ class AdapterContext:
                 aliases=(),
                 start_ns=start_ns,
                 fallback=fallback,
+                conversation=conversation,
             )
             handle = RunHandle(unit, self)
             if describe is not None:
