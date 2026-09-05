@@ -24,14 +24,16 @@ OTel bridge's fail-open pair ``OTEL_BRIDGE_NO_DATA`` (41, confirmed injection
 and nothing arrived) / ``OTEL_BRIDGE_SCHEMA_UNKNOWN`` (42, data arrived and
 classified as nothing), and ``SESSION_ENTRY_TABLE_FULL`` (43, the adapter's
 per-session bound, which is the registry's breadth bound one layer out and a
-different FIELD). Four more since that paragraph was last true:
+different FIELD). Five more since that paragraph was last true:
 ``EXTRA_KEYS_DROPPED`` (44, the dynamic-key bound on the provider-usage
 mirror), ``TRACKING_RESET_AT_FORK`` (45, the fork child's per-connection
 tracking reset — the one member that names a process event and no knob), and
 the deferred-parse pair ``PARSE_BACKLOG_FULL`` (46, the backlog's capacity
 bound — a transaction shipped unparsed to admit a newer one) /
 ``PARSE_SKIPPED_AT_SHUTDOWN`` (47, the shutdown budget ran out first — same
-unparsed shipment, different knob, so a different member by the census rule).
+unparsed shipment, different knob, so a different member by the census rule),
+and ``WS_LLM_SEMANTICS_UNREAD`` (48, LLM calls crossed a WebSocket connection
+wardex only counted — the transport, not a parser, is the gap).
 ``tests/test_limitation_census.py`` is the live count; this paragraph is its
 history, not its source.
 The census read every assignment and append site that reaches
@@ -971,11 +973,36 @@ Two emit sites, and the first is the mechanism the second restates.
     """The WebSocket span was emitted without ever seeing a CLOSE frame, so its
     close code and duration are not trustworthy.
 
-    Emitted from ``_interceptors/_ssl.py::SSLInterceptor.uninstall`` and
-    ``_interceptors/_socket.py::RawSocketInterceptor.uninstall``, both via
-    ``_WebSocketTracker.flush(marker)``. Both sites sit inside ``uninstall()``
-    today and so travel alongside ``ADAPTER_UNINSTALLED``; see that member for
-    why they stay two markers.
+    Emitted from ``_interceptors/_seam.py::ByteSeamInterceptor._retire``, via
+    ``_WebSocketTracker.flush(marker)``, reached from ``uninstall()`` and from
+    the shared socket-close hook (``_connection_closed``). The uninstall path
+    travels alongside ``ADAPTER_UNINSTALLED``; see that member for why they
+    stay two markers.
+    """
+
+    WS_LLM_SEMANTICS_UNREAD = "ws_llm_semantics_unread"
+    """A WebSocket connection carried LLM calls wardex read none of: the
+    upgrade path is a row the endpoint table marks WebSocket-capable (the
+    OpenAI Responses API, ``wss://…/v1/responses``, the openai-agents SDK's
+    opt-in transport), the host names that provider — or, on an unknown host,
+    the first client message is a Responses ``response.create`` — and at least
+    one client message crossed. Responses events inside WebSocket frames are
+    not parsed, by decision, so the span carries transport counts and payload
+    samples but no model, tokens or messages; ``ws.messages.sent``
+    approximates the calls. Reader's next action: the framework's HTTP
+    transport (openai-agents ``use_responses_websocket=False``, the default)
+    yields gen_ai spans. Names NO knob.
+
+    Not ``FRAME_PARSE_FAILED``: framing succeeded. Not
+    ``SEMANTIC_PARSE_FAILED``: no parser ran; none exists for this transport.
+    Not ``SSE_UNKNOWN_PROVIDER``: provider and endpoint are KNOWN; the
+    transport is the gap. Not ``PARSE_BACKLOG_FULL`` /
+    ``PARSE_SKIPPED_AT_SHUTDOWN``: those skip a parse for capacity and a knob
+    restores it.
+
+    Emitted from ``_interceptors/_trackers.py::_WebSocketTracker._build_txn``,
+    confirmed on the first client message; the seam's gate reads the same fact
+    (``_Txn.ws_llm_call``) as a capture claim.
     """
 
     # ------------------------------------------------------------------

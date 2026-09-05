@@ -115,10 +115,12 @@ def should_capture(
 
     `agent_semantic` is the caller's claim about the traffic, not a property
     this function can check: the byte seam earns it from a parsed LLM response,
-    MCP stdio has it by construction (a JSON-RPC tool call over a subprocess
-    pipe is agent traffic or it is nothing). Passing a constant `True` is
-    therefore a statement a site makes about itself, and it is reviewable
-    precisely because it is written at the call.
+    or from a WebSocket connection whose upgrade path the endpoint table marks
+    WebSocket-capable and whose first client message (or provider host)
+    corroborates an LLM call; MCP stdio has it by construction (a JSON-RPC
+    tool call over a subprocess pipe is agent traffic or it is nothing).
+    Passing a constant `True` is therefore a statement a site makes about
+    itself, and it is reviewable precisely because it is written at the call.
 
     `degraded` is "wardex is the reason one of this gate's INPUTS is
     missing". Three producers say it, and they are one fact seen at three

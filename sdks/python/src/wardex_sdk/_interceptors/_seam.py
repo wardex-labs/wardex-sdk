@@ -37,7 +37,7 @@ from .._enums import (
     StatusCode,
 )
 from .._limits import LimitsConfig, LimitsConsumer, limits_kwargs
-from .._protocol import classify_path, parse_llm_semantics
+from .._protocol import classify_path, classify_ws_upgrade, parse_llm_semantics
 from .._semantics import (
     USAGE_DROPPED_KEY,
     build_gen_ai,
@@ -556,6 +556,9 @@ class ByteSeamInterceptor(InterceptorInterface):
             pass
         for txn in txns:
             if getattr(txn, "ws_upgrade", False):
+                # Same host expression as `_seal`: the TLS name when there is
+                # one, else the peer address.
+                url_host = getattr(obj, "server_hostname", None) or st.server_address
                 ws = _WebSocketTracker(
                     path=txn.ws_upgrade_path or "/",
                     deflate=txn.ws_deflate,
@@ -563,6 +566,7 @@ class ByteSeamInterceptor(InterceptorInterface):
                     parent_closed=txn.parent_closed,
                     start_ns=txn.start_ns,
                     limits=self._native_limits,
+                    llm_upgrade=classify_ws_upgrade(url_host, txn.ws_upgrade_path or "/"),
                     **self._ws_kwargs,
                 )
                 st.tracker = ws
@@ -716,10 +720,12 @@ class ByteSeamInterceptor(InterceptorInterface):
 
     def _build_ws_span(self, st: _ConnectionState, txn: _Txn) -> Any:
         # `sem=None`: a WS session carries no parsed LLM semantics (by
-        # construction on this path), so it is captured only under ALL, an
-        # allowlisted host, or a live local span. Inline — WS never defers
-        # (§3.6) — but the DECISION is the same module `_gate` the deferred
-        # path uses, composed with the same fail-open prefilter.
+        # construction on this path), so it is captured under ALL, an
+        # allowlisted host, a live local span, or — the one claim this path
+        # can make — a connection that confirmed LLM calls crossed it
+        # (`ws_llm_call`). Inline — WS never defers (§3.6) — but the DECISION
+        # is the same module `_gate` the deferred path uses, composed with the
+        # same fail-open prefilter.
         if not _should_capture(
             self._prefilter_of(st), txn, None, mode=capture_mode_of(self._client)
         ):
@@ -866,6 +872,10 @@ def _should_capture(
     exactly as `degraded_run` cannot honestly answer `parent`. The policy's
     signature does not change; the widening is this caller's input.
 
+    A WS session that confirmed LLM calls crossed it claims `agent_semantic`
+    without a `sem`: the calls happened, wardex did not read them, and the
+    marked span is the only place that fact can ship.
+
     Failing OPEN around the composition stays this function's job rather
     than the policy's: `has_core_semantics` runs parser output through
     host-supplied objects and can raise, `should_capture` cannot — so the
@@ -880,7 +890,8 @@ def _should_capture(
         return should_capture(
             mode,
             parent=getattr(txn, "parent", None),
-            agent_semantic=sem is not None and _is_llm_traffic(txn, sem),
+            agent_semantic=(sem is not None and _is_llm_traffic(txn, sem))
+            or getattr(txn, "ws_llm_call", False),
             degraded=unparsed or in_degraded_run() or getattr(txn, "parent_evicted", False),
             parent_closed=getattr(txn, "parent_closed", False),
         )
