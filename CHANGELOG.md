@@ -16,7 +16,7 @@ All notable changes to this project are documented here. The format follows
   record. Any host, any path ending in `/v1/traces/ingest` is now skipped
   before the body is parsed or attached to a span — the bytes still pass
   through the per-connection buffer, capped by
-  `CaptureLimits.max_body_bytes`, and are discarded unparsed — and counted
+  `LimitsConfig.max_body_bytes`, and are discarded unparsed — and counted
   under `interceptors.seam.path_excluded`.
 - **A Responses output item that is not the model's is no longer exported as
   the assistant's.** `gen_ai.output.messages` keeps each output `message`

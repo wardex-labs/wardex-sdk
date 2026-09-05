@@ -377,7 +377,7 @@ on its way to a tracing backend, not agent activity, so wardex skips the
 request before parsing it or attaching it to a span, and counts the skip
 under `interceptors.seam.path_excluded`. To be precise about where that
 body goes: the bytes pass through wardex's per-connection buffer like any
-other request's (capped by `CaptureLimits.max_body_bytes`), and are then
+other request's (capped by `LimitsConfig.max_body_bytes`), and are then
 discarded — never parsed, never on a span, never exported. If your own
 service exposes that path, its requests are skipped by the same rule.
 Server-side conversation state
