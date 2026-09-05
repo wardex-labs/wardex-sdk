@@ -986,14 +986,17 @@ Two emit sites, and the first is the mechanism the second restates.
     OpenAI Responses API, ``wss://…/v1/responses``, the openai-agents SDK's
     opt-in transport), the host names that provider — or, on an unknown host,
     the first client message is a Responses ``response.create`` — and at least
-    one client message crossed. Responses events inside WebSocket frames are
-    not parsed, by decision, so the span carries transport counts and payload
-    samples but no model, tokens or messages; ``ws.messages.sent``
-    approximates the calls. Reader's next action: the framework's HTTP
-    transport (openai-agents ``use_responses_websocket=False``, the default)
-    yields gen_ai spans. Names NO knob.
+    one client message crossed (on the provider's host, client bytes the
+    framing parser could not read count as crossed, and ``FRAME_PARSE_FAILED``
+    rides along). Responses events inside WebSocket frames are not parsed,
+    by decision, so the span carries transport counts and payload samples but
+    no model, tokens or messages; ``ws.messages.sent`` approximates the
+    calls. Reader's next action: the framework's HTTP transport
+    (openai-agents ``use_responses_websocket=False``, the default) yields
+    gen_ai spans. Names NO knob.
 
-    Not ``FRAME_PARSE_FAILED``: framing succeeded. Not
+    Not ``FRAME_PARSE_FAILED``: that is the framing layer's own failure,
+    which this marker neither implies nor excludes. Not
     ``SEMANTIC_PARSE_FAILED``: no parser ran; none exists for this transport.
     Not ``SSE_UNKNOWN_PROVIDER``: provider and endpoint are KNOWN; the
     transport is the gap. Not ``PARSE_BACKLOG_FULL`` /

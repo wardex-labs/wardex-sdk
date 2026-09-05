@@ -110,6 +110,44 @@ def test_unknown_host_non_responses_message_stays_unconfirmed():
     assert counters.get(_UNREAD) == 0
 
 
+#: A Text frame header claiming a 2 MiB payload — above the default
+#: `max_ws_frame_bytes` — so the client-direction parser disables on its
+#: first frame and never yields a message.
+_OVERSIZE_FIRST_FRAME = bytes([0x81, 127]) + (2 * 1024 * 1024).to_bytes(8, "big")
+
+
+def test_known_provider_confirms_when_the_first_frame_kills_the_parser():
+    """The decision must not be starved by a parse failure: bytes crossed
+    the provider's connection, so the call happened whether or not the
+    parser could frame it."""
+    t = _tracker("known_provider", deflate=False)
+    assert t.on_request_bytes(_OVERSIZE_FIRST_FRAME) == []
+    assert counters.get(_UNREAD) == 1
+    # single-shot: the disabled parser keeps reporting disabled, and the
+    # decision is not made again
+    assert t.on_request_bytes(b"\x81\x02hi") == []
+    assert counters.get(_UNREAD) == 1
+    (txn,) = t.on_response_bytes(_CLOSE_1001)
+    assert txn.ws_llm_call is True
+    assert Limitation.WS_LLM_SEMANTICS_UNREAD in txn.ws_markers
+    assert Limitation.FRAME_PARSE_FAILED in txn.ws_markers
+
+
+def test_unknown_host_is_unconfirmed_when_the_first_frame_kills_the_parser():
+    """Nothing readable ever crossed, so the envelope cannot corroborate —
+    but the connection is counted rather than vanishing."""
+    t = _tracker("unknown_host", deflate=False)
+    assert t.on_request_bytes(_OVERSIZE_FIRST_FRAME) == []
+    assert counters.get(_UNCONFIRMED) == 1
+    assert t.on_request_bytes(b"\x81\x02hi") == []
+    assert counters.get(_UNCONFIRMED) == 1
+    (txn,) = t.on_response_bytes(_CLOSE_1001)
+    assert txn.ws_llm_call is False
+    assert Limitation.WS_LLM_SEMANTICS_UNREAD not in txn.ws_markers
+    assert Limitation.FRAME_PARSE_FAILED in txn.ws_markers
+    assert counters.get(_UNREAD) == 0
+
+
 def test_no_client_message_confirms_nothing():
     """A connection that never sent a client message carried no call."""
     t = _tracker("known_provider", deflate=False)

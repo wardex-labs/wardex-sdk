@@ -533,21 +533,35 @@ class _WebSocketTracker:
             if f.opcode == "close":
                 self._closed = True
         self._sent_msgs += len(r.messages)
-        if r.messages and not self._llm_decided:
-            self._llm_decided = True
-            self._decide_llm(r.messages[0])
+        if not self._llm_decided:
+            if r.messages:
+                self._llm_decided = True
+                self._decide_llm(r.messages[0])
+            elif self._sent.is_disabled():
+                # The parser died on the first client frame (oversize,
+                # desync) and will never yield a message. Bytes crossed all
+                # the same, so decide now on nothing readable: a decision
+                # that waited for a message would be starved by the parse
+                # failure and the connection would vanish without a counter.
+                self._llm_decided = True
+                self._decide_llm(None)
         self._in_trunc = self._append_sample(self._sample_in, r.messages) or self._in_trunc
         return self._maybe_emit()
 
-    def _decide_llm(self, first: bytes) -> None:
+    def _decide_llm(self, first: bytes | None) -> None:
         # Decided once, on the first client message — the moment "a call
-        # crossed" becomes true. The path alone is a suffix match; it is
-        # corroborated by the provider host or, when nothing hides the
-        # payload (no permessage-deflate), by the Responses envelope itself.
+        # crossed" becomes true — or, when the client-direction parser
+        # disables before yielding one, on the bytes that killed it (`first`
+        # is None then). The path alone is a suffix match; it is corroborated
+        # by the provider host or, when nothing hides the payload (no
+        # permessage-deflate, a readable message), by the Responses envelope
+        # itself.
         if self._llm_upgrade is None:
             return
         if self._llm_upgrade == "known_provider" or (
-            not self._deflate and _RESPONSES_CREATE.match(first[:64]) is not None
+            first is not None
+            and not self._deflate
+            and _RESPONSES_CREATE.match(first[:64]) is not None
         ):
             self._llm_call = True
             counters.bump("interceptors.seam.ws_llm_semantics_unread")
