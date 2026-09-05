@@ -27,7 +27,8 @@ from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.prebuilt import ToolNode
 
 from wardex_sdk._adapters._context import Placement
-from wardex_sdk._adapters._langgraph import LangGraphAdapter, _shaped_args
+from wardex_sdk._adapters._langgraph import LangGraphAdapter
+from wardex_sdk._adapters._payload import _shaped_args
 from wardex_sdk._adapters._registry import AdapterRegistry
 from wardex_sdk._assembly import SpanIntent, UnitKind, counters
 from wardex_sdk._assembly._diag import reset_reports_for_test

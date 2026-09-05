@@ -633,7 +633,7 @@ class AdapterContext:
         A shaper handing `record_*` more than this is truncated and flagged by
         the storage cap itself; a shaper that stops early must hand back
         `budget + 1` bytes whenever it cut anything, so the flag still fires —
-        the +1 handshake (see the LangGraph adapter's `_shaped_args`). Read off
+        the +1 handshake (see `_adapters/_payload.py`'s `_shaped_args`). Read off
         the registry rather than `self.limits` because the registry's cap is
         the one that is ENFORCED: the two cannot disagree when they are one
         read, and they did disagree for as long as they were two — the registry

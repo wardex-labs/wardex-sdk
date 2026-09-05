@@ -1534,14 +1534,14 @@ def test_a_tool_payload_is_the_frameworks_string_bounded_by_the_handshake():
     """A `str` is recorded as its own bytes; over the budget it comes back as
     exactly `budget + 1` bytes so the storage cap sets the truncated flag; a
     non-string keeps the LangGraph shaping (a dict's repr is a literal)."""
-    from wardex_sdk._adapters._openai_agents import _tool_payload
+    from wardex_sdk._adapters._openai_agents import _framework_payload
 
-    assert _tool_payload('{"city":"Seoul"}', 64) == b'{"city":"Seoul"}'
-    assert _tool_payload("sunny in Seoul", 64) == b"sunny in Seoul"
-    assert len(_tool_payload("x" * 10_000, 64)) == 65
-    assert len(_tool_payload("é" * 10_000, 64)) == 65
-    assert _tool_payload("x" * 64, 64) == b"x" * 64
-    assert _tool_payload({"city": "Seoul"}, 64) == b"{'city': 'Seoul'}"
+    assert _framework_payload('{"city":"Seoul"}', 64) == b'{"city":"Seoul"}'
+    assert _framework_payload("sunny in Seoul", 64) == b"sunny in Seoul"
+    assert len(_framework_payload("x" * 10_000, 64)) == 65
+    assert len(_framework_payload("é" * 10_000, 64)) == 65
+    assert _framework_payload("x" * 64, 64) == b"x" * 64
+    assert _framework_payload({"city": "Seoul"}, 64) == b"{'city': 'Seoul'}"
 
 
 def test_a_namespaced_tool_recovers_its_call_id(agents_env, scenario):

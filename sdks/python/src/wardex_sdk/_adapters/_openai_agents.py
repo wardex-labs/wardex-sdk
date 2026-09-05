@@ -131,7 +131,7 @@ from .._assembly import (
 from .._enums import StatusCode, ToolExecutionType, ToolType
 from ._base import AdapterInterface
 from ._context import AdapterContext, Placement, RunHandle
-from ._langgraph import _shaped_args
+from ._payload import _shaped_args
 
 _FRAMEWORK = "openai_agents"
 _DISTRIBUTION = "openai-agents"
@@ -1334,10 +1334,10 @@ def _function_end(adapter: OpenAIAgentsAdapter, run: dict[str, Any], span: Any) 
         ctx.count("tool_call_id_ambiguous" if len(ids) > 1 else "tool_call_id_unmatched")
     budget = ctx.record_budget
     if raw_input is not None:
-        h.record_input(_tool_payload(raw_input, budget))
+        h.record_input(_framework_payload(raw_input, budget))
     output = sd.output
     if output is not None:
-        h.record_output(_tool_payload(output, budget))
+        h.record_output(_framework_payload(output, budget))
     message = _error_message(span)
     if message is not None:
         error_type, _fatal = _classify_error(adapter, message)
@@ -1347,14 +1347,15 @@ def _function_end(adapter: OpenAIAgentsAdapter, run: dict[str, Any], span: Any) 
     _unpin(adapter, h)
 
 
-def _tool_payload(value: Any, budget: int) -> bytes:
+def _framework_payload(value: Any, budget: int) -> bytes:
     """A tool's arguments and result as the framework hands them, bounded.
 
     The framework's `FunctionSpanData.input` is the model's JSON STRING and
     its `output` is usually the handler's string, so they are recorded as
     their own bytes: a backend then shows `{"city":"Seoul"}`, not the
-    Python repr `'{"city":"Seoul"}'` that `_shaped_args` — written for
-    LangGraph's dict of arguments, where the repr layer is free — would add.
+    Python repr `'{"city":"Seoul"}'` that `_shaped_args` (`_payload.py`,
+    written for LangGraph's dict of arguments, where the repr layer is free)
+    would add.
     Same budget+1 handshake as that helper: a string that does not fit is
     returned as exactly `budget + 1` bytes so the storage cap flags the cut,
     and the slice is taken on the string BEFORE encoding so the cost stays
