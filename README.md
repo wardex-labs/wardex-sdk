@@ -381,9 +381,12 @@ stronger opt-in than the default policy.
 
 **One thing is never captured, in any mode and above any allowlist:
 telemetry uploads.** Any host, any path ending in `/v1/traces/ingest` — the
-OpenAI Agents SDK POSTs its whole run record there by default, and the rule
-is by path so a custom exporter endpoint is covered too. That body is yours
-on its way to a tracing backend, not agent activity, so wardex skips the
+OpenAI Agents SDK POSTs its whole run record there by default. The rule is
+by path: a custom exporter endpoint (`BackendSpanExporter(endpoint=…)`) that
+keeps the `/v1/traces/ingest` path is covered; one on another path is not —
+under `ALL`, under `intercept_hosts`, or inside a local span it ships as an
+ordinary HTTP span with the run record as its `input_data`. That body is
+yours on its way to a tracing backend, not agent activity, so wardex skips the
 request before parsing it or attaching it to a span, and counts the skip
 under `interceptors.seam.path_excluded`. To be precise about where that
 body goes: the bytes pass through wardex's per-connection buffer like any
