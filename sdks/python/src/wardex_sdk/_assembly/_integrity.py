@@ -984,8 +984,9 @@ Two emit sites, and the first is the mechanism the second restates.
     """A WebSocket connection carried LLM calls wardex read none of: the
     upgrade path is a row the endpoint table marks WebSocket-capable (the
     OpenAI Responses API, ``wss://…/v1/responses``, the openai-agents SDK's
-    opt-in transport), the host names that provider — or, on an unknown host,
-    the first client message is a Responses ``response.create`` — and at least
+    opt-in transport), the host is that provider's own (``api.openai.com`` or
+    a subdomain of ``openai.com``) — or, on any other host, the first client
+    message is a Responses ``response.create`` — and at least
     one client message crossed (on the provider's host, client bytes the
     framing parser could not read count as crossed, and ``FRAME_PARSE_FAILED``
     rides along). Responses events inside WebSocket frames are not parsed,

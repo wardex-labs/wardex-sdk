@@ -161,7 +161,9 @@ All notable changes to this project are documented here. The format follows
   over one `wss://…/v1/responses` connection and, under the default capture
   mode, produced no span and no counter. Now, once the first call crosses
   such a connection — the path is the Responses endpoint and either the host
-  is OpenAI's or the first client message is a Responses `response.create` —
+  is OpenAI's own (exactly `api.openai.com` or a subdomain of `openai.com`;
+  `openai-mock.corp` is not) or the first client message is a Responses
+  `response.create` —
   wardex counts it under `interceptors.seam.ws_llm_semantics_unread`
   immediately, and emits one `WS /v1/responses` span per connection **when
   the connection closes** (marked `ws_no_close` if the connection ends

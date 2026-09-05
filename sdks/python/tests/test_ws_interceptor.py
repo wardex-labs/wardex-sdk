@@ -4,6 +4,7 @@ import wardex_sdk as wardex
 from wardex_sdk import _hub
 from wardex_sdk._assembly import Limitation, counters
 from wardex_sdk._enums import CaptureMode, SpanKind
+from wardex_sdk._protocol import classify_ws_upgrade
 from wardex_sdk._types import StatusCode
 
 
@@ -283,6 +284,36 @@ def test_ordinary_messages_websocket_is_not_an_llm_call():
     assert _ws_spans() == []
     assert counters.get(_UNREAD) == 0
     assert counters.get(_UNCONFIRMED) == 0
+
+
+def test_substring_provider_host_is_not_the_provider():
+    """`openai-mock.corp` contains the provider's name and is not the
+    provider: a custom protocol on its `/v1/responses` must not ship under
+    the default mode with payload samples on the strength of its hostname.
+    Same refusal the HTTP path makes — a hostname is not semantics."""
+    _session("openai-mock.corp", "/v1/responses", deflate=False, first=b'{"op":"custom"}')
+    assert _ws_spans() == []
+    assert counters.get(_UNCONFIRMED) == 1
+    assert counters.get(_UNREAD) == 0
+
+
+@pytest.mark.parametrize(
+    ("host", "want"),
+    [
+        ("api.openai.com", "known_provider"),
+        ("eu.api.openai.com", "known_provider"),
+        ("API.OPENAI.COM", "known_provider"),
+        ("openai-mock.corp", "unknown_host"),
+        ("openai-shim.corp", "unknown_host"),
+        ("api.openai.com.evil.example", "unknown_host"),
+        ("127.0.0.1", "unknown_host"),
+    ],
+)
+def test_classify_ws_upgrade_host_rule(host: str, want: str):
+    """Mirrors the Rust table test in endpoint.rs: the provider's own
+    hosts are `api.<domain>` and subdomains of `<domain>`, nothing else."""
+    assert classify_ws_upgrade(host, "/v1/responses") == want
+    assert classify_ws_upgrade(host, "/v1/chat/completions") is None
 
 
 def test_realtime_websocket_is_still_dropped_under_agent_mode():

@@ -201,15 +201,38 @@ pub fn treatment(path: &str) -> Option<Treatment> {
 }
 
 /// The WebSocket-transport question's answer: the upgrade path is a
-/// WebSocket-capable LLM row, and the host either names that row's provider
-/// or does not.
+/// WebSocket-capable LLM row, and the host either IS that row's provider
+/// or is not.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WsUpgrade {
-    /// The host names the row's provider: the connection carries LLM calls.
+    /// The host is one of the provider's own (`is_official_host`): the
+    /// connection carries LLM calls.
     KnownProvider,
-    /// The host names no provider: the seam must corroborate from the first
-    /// client message before claiming anything.
+    /// Any other host — an IP, a gateway, a mock whose name merely contains
+    /// the provider's: the seam must corroborate from the first client
+    /// message before claiming anything.
     UnknownHost,
+}
+
+/// The provider's own API hosts: the apex API host or any subdomain of the
+/// provider's domain. Deliberately NOT the substring test the provider
+/// label uses (`provider_from_host`): a label is a hint on a span, but this
+/// answer makes a bare WebSocket ship under the default mode with payload
+/// samples, and `openai-mock.corp` speaking its own protocol on
+/// `/v1/responses` must not earn that on the strength of its hostname. The
+/// HTTP path refuses the same claim (the seam wants parsed semantics, not a
+/// hostname) and this keeps the two transports honest to the same degree.
+fn is_official_host(provider: &str, host: &str) -> bool {
+    let host = host.to_ascii_lowercase();
+    let domain = match provider {
+        "openai" => "openai.com",
+        "anthropic" => "anthropic.com",
+        _ => return false,
+    };
+    host == format!("api.{domain}")
+        || host
+            .strip_suffix(domain)
+            .is_some_and(|prefix| prefix.ends_with('.'))
 }
 
 /// None unless the upgrade path matches a `ws_transport` row (the one
@@ -219,7 +242,7 @@ pub fn ws_upgrade(host: &str, path: &str) -> Option<WsUpgrade> {
     if !e.ws_transport {
         return None;
     }
-    if super::provider_from_host(host) == Some(e.api.provider()) {
+    if is_official_host(e.api.provider(), host) {
         Some(WsUpgrade::KnownProvider)
     } else {
         Some(WsUpgrade::UnknownHost)
@@ -390,9 +413,26 @@ mod tests {
             Some(WsUpgrade::KnownProvider)
         );
         assert_eq!(
-            ws_upgrade("127.0.0.1", "/v1/responses"),
-            Some(WsUpgrade::UnknownHost)
+            ws_upgrade("eu.api.openai.com", "/v1/responses"),
+            Some(WsUpgrade::KnownProvider)
         );
+        // A host that merely CONTAINS the provider's name is not the
+        // provider: a mock or a shim speaking its own protocol on the
+        // Responses path must not ship under the default mode on the
+        // strength of its hostname.
+        for host in [
+            "127.0.0.1",
+            "openai-mock.corp",
+            "openai-shim.corp",
+            "api.openai.com.evil.example",
+            "notopenai.com",
+        ] {
+            assert_eq!(
+                ws_upgrade(host, "/v1/responses"),
+                Some(WsUpgrade::UnknownHost),
+                "{host}"
+            );
+        }
         for (host, path) in [
             ("api.openai.com", "/v1/chat/completions"),
             ("chat.example.com", "/messages"),

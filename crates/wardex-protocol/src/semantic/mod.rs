@@ -118,7 +118,7 @@ impl StringOrVec {
     }
 }
 
-pub(super) fn provider_from_host(host: &str) -> Option<&'static str> {
+fn provider_from_host(host: &str) -> Option<&'static str> {
     if host.contains("openai") {
         Some("openai")
     } else if host.contains("anthropic") {

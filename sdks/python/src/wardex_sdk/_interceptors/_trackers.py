@@ -553,7 +553,7 @@ class _WebSocketTracker:
         # crossed" becomes true — or, when the client-direction parser
         # disables before yielding one, on the bytes that killed it (`first`
         # is None then). The path alone is a suffix match; it is corroborated
-        # by the provider host or, when nothing hides the payload (no
+        # by the provider's own host or, when nothing hides the payload (no
         # permessage-deflate, a readable message), by the Responses envelope
         # itself.
         if self._llm_upgrade is None:

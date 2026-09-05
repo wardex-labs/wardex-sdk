@@ -361,11 +361,14 @@ to its default HTTP transport for `gen_ai` spans. A connection that ends
 without a WebSocket close handshake — a server drop, a timeout, process exit,
 or wardex uninstalled first — still yields the span, additionally marked
 `ws_no_close`. The connection counts as an LLM connection only when the host
-is the provider's, or when the first message is a Responses `response.create`
-on an uncompressed connection; a Responses-path connection to an unknown host
-(localhost, a gateway) with compression — the `websockets` client's default —
-is only counted (`interceptors.seam.ws_llm_endpoint_unconfirmed`) and yields
-no span under the default mode. Under `ALL`, under an `intercept_hosts` entry,
+is the provider's own — exactly `api.openai.com` or a subdomain of
+`openai.com`; a host that merely contains the name, such as
+`openai-mock.corp`, is not — or when the first message is a Responses
+`response.create` on an uncompressed connection; a Responses-path connection
+to any other host (localhost, a gateway, a mock) with compression — the
+`websockets` client's default — is only counted
+(`interceptors.seam.ws_llm_endpoint_unconfirmed`) and yields no span under
+the default mode. Under `ALL`, under an `intercept_hosts` entry,
 or inside a local span that same connection does ship — but as an ordinary
 WebSocket span, `WS /v1/responses` with status OK and no
 `ws_llm_semantics_unread` marker (measured against a loopback server: one
@@ -578,8 +581,9 @@ diagnostic line (traceback under `debug=True`).
   fields are empty
 - Transport metrics (TCP/TLS timing, TTFT), gRPC (grpclib), WebSocket (`wss`;
   a Responses-over-WebSocket connection is captured at close and marked
-  `ws_llm_semantics_unread` when the host is the provider's — on an unknown
-  host with compression it is only counted, see capture_mode), MCP stdio
+  `ws_llm_semantics_unread` when the host is `api.openai.com` or a subdomain
+  of `openai.com` — on any other host with compression it is only counted,
+  see capture_mode), MCP stdio
 - Export to any OpenTelemetry backend via `OtlpHttpTransport`
 - Manual span decorators: `@workflow` / `@agent` / `@step` / `@tool`
 - PII masking on by default: emails, phone numbers, credit cards (Luhn-verified),
