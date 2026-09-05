@@ -202,6 +202,23 @@ def _print_tree(spans: list[Any]) -> str:
     return "\n".join(lines)
 
 
+def _otlp_attributes(transport: RecordingTransport) -> dict[str, dict[str, Any]]:
+    """`{span name: attributes}` as a RECEIVER decodes them — the export path
+    end to end, not the in-process span. What a backend can filter on."""
+    from wardex_sdk import _wardex_native
+
+    out: dict[str, dict[str, Any]] = {}
+    for env in transport.envelopes:
+        decoded = _wardex_native.codec.decode_otlp_traces(
+            _wardex_native.codec.encode_otlp_traces(env)
+        )
+        for rs in decoded["resource_spans"]:
+            for ss in rs["scope_spans"]:
+                for sp in ss["spans"]:
+                    out[sp["name"]] = sp["attributes"]
+    return out
+
+
 def _processors() -> tuple[Any, ...]:
     return get_trace_provider()._multi_processor._processors
 
@@ -866,7 +883,7 @@ def _run_config() -> RunConfig:
 def test_runner_run_three_turns_are_one_tree(agents_env):
     """THE measured record: the tree the tracker's baseline said did not
     exist. Printed, so the text in the tracker is the text this test saw."""
-    _init()
+    transport = _init()
     try:
         assert _run(_agents(), run_config=_run_config()).final_output == "done"
         spans = _spans()
@@ -874,6 +891,15 @@ def test_runner_run_three_turns_are_one_tree(agents_env):
         _assert_counters_clean()
     finally:
         wardex.close()
+    # What a RECEIVER gets: the conversation id as the OTLP attribute the
+    # README promises, on every adapter span — measured absent before the
+    # codec marshalled the block, while the in-process span carried it.
+    attrs = _otlp_attributes(transport)
+    for name in (_ROOT, "invoke_agent agent_a", "invoke_agent agent_b", "handoff agent_a→agent_b"):
+        assert attrs[name]["gen_ai.conversation.id"] == "conv-123", name
+    assert attrs["execute_tool get_weather"]["gen_ai.conversation.id"] == "conv-123"
+    assert attrs["execute_tool get_weather"]["gen_ai.tool.call.arguments"] == '{"city":"Seoul"}'
+    assert attrs["execute_tool get_weather"]["gen_ai.tool.call.result"] == "sunny in Seoul"
     print("\n" + _print_tree(spans))
 
 
@@ -1109,7 +1135,7 @@ def test_an_input_guardrail_tripwire_fails_the_agent_and_the_run(agents_env, sce
 
     base, posts = agents_env
     scenario(_decide_single)
-    _init()
+    transport = _init()
     try:
         with pytest.raises(InputGuardrailTripwireTriggered):
             _run(_guarded(where="input"))
@@ -1118,6 +1144,11 @@ def test_an_input_guardrail_tripwire_fails_the_agent_and_the_run(agents_env, sce
         wardex.close()
     # sequential by default: the model call never happened
     _assert_tripwire(spans, name="block_input", posts=len(posts), made=0)
+    # and the verdict reaches a receiver under the semconv evaluation keys
+    evaluate = _otlp_attributes(transport)["evaluate block_input"]
+    assert evaluate["gen_ai.evaluation.name"] == "block_input"
+    assert evaluate["gen_ai.evaluation.score.label"] == "tripwire"
+    assert evaluate["wardex.evaluation.triggered"] is True
 
 
 def test_an_output_guardrail_tripwire_fails_the_agent_and_the_run(agents_env, scenario):

@@ -7,6 +7,19 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- **A conversation id and an evaluation verdict now reach the backend.**
+  `wardex.conversation(...)` promised `gen_ai.conversation.id` on every span
+  inside it, and an adapter's evaluation block (`gen_ai.evaluation.name`,
+  `.explanation`, `.score.value`, `.score.label`) was set on guardrail
+  spans — but neither block was marshalled at export: the span held them
+  in-process and the OTLP request left without them, measured by decoding
+  what the transport received. Both are flattened into attributes now, the
+  way the agent and tool blocks already were, so a backend can group a
+  chat's turns by `gen_ai.conversation.id` (`wardex.conversation.session_id`
+  and a non-zero `wardex.conversation.turn_index` ride along when set) and
+  filter guardrail spans by `gen_ai.evaluation.score.label`. The
+  openai-agents adapter's `RunConfig(group_id=…)` and `evaluate` spans
+  below depend on this.
 - **The openai-agents SDK's own trace upload no longer becomes a span.** By
   default the framework POSTs its whole run record — every prompt,
   completion, model and usage of the run — to `/v1/traces/ingest`. Under

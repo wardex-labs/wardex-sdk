@@ -346,6 +346,48 @@ fn flatten_tool(t: &Bound<PyAny>, out: &mut Vec<pb::KeyValue>) -> PyResult<()> {
     Ok(())
 }
 
+/// ConversationContext → extra KeyValue. The id always; the rest only when set.
+///
+/// This block was declared (`span.proto` field 23, `_types.py`'s
+/// `gen_ai.conversation.id` note, `wardex.conversation()`'s docstring) and
+/// never marshalled: neither the typed field nor an attribute left the
+/// process, so a conversation id was held in-process and dropped at export.
+/// Flattened like the agent and tool blocks, so both export surfaces carry
+/// one spelling.
+fn flatten_conversation(c: &Bound<PyAny>, out: &mut Vec<pb::KeyValue>) -> PyResult<()> {
+    out.push(kv_str(
+        "gen_ai.conversation.id",
+        c.getattr("conversation_id")?.extract()?,
+    ));
+    if let Some(v) = opt(c, "session_id")? {
+        out.push(kv_str("wardex.conversation.session_id", v.extract()?));
+    }
+    let turn: i64 = c.getattr("turn_index")?.extract()?;
+    if turn != 0 {
+        out.push(kv_int("wardex.conversation.turn_index", turn));
+    }
+    Ok(())
+}
+
+/// EvaluationAttributes → extra KeyValue (semconv `gen_ai.evaluation.*`).
+/// Only populated fields. Same omission as the conversation block above:
+/// declared, set by adapters, never marshalled.
+fn flatten_evaluation(e: &Bound<PyAny>, out: &mut Vec<pb::KeyValue>) -> PyResult<()> {
+    for (attr, key) in [
+        ("name", "gen_ai.evaluation.name"),
+        ("explanation", "gen_ai.evaluation.explanation"),
+        ("score_label", "gen_ai.evaluation.score.label"),
+    ] {
+        if let Some(v) = opt(e, attr)? {
+            out.push(kv_str(key, v.extract()?));
+        }
+    }
+    if let Some(v) = opt(e, "score_value")? {
+        out.push(kv_double("gen_ai.evaluation.score.value", v.extract()?));
+    }
+    Ok(())
+}
+
 // --- enum mapping (transport/state) ---
 
 fn map_protocol(s: &str) -> i32 {
@@ -659,6 +701,12 @@ fn span_to_proto(sp: &Bound<PyAny>) -> PyResult<pb::Span> {
     }
     if let Some(e) = opt(sp, "embeddings")? {
         flatten_embeddings(&e, &mut span.extra)?;
+    }
+    if let Some(c) = opt(sp, "conversation")? {
+        flatten_conversation(&c, &mut span.extra)?;
+    }
+    if let Some(e) = opt(sp, "evaluation")? {
+        flatten_evaluation(&e, &mut span.extra)?;
     }
     if let Some(t) = opt(sp, "transport")? {
         span.transport = Some(transport_to_proto(&t)?);
