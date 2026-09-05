@@ -811,6 +811,11 @@ def _assert_three_turn_tree(spans: list[Any], *, streamed: bool) -> None:
         agent_a.context.span_id,
         agent_b.context.span_id,
     ]
+    # the payload, as the framework handed it: the model's JSON string and
+    # the handler's string, NOT their Python repr
+    assert tool.input_data == b'{"city":"Seoul"}'
+    assert tool.output_data == b"sunny in Seoul"
+    assert tool.capture_integrity is None or not tool.capture_integrity.truncated
     # the joins
     assert tool.tool.call_id == "call_1"
     assert _extra(tool)["wardex.openai_agents.tool_call_id_source"] == "response_output_match"
@@ -960,6 +965,20 @@ def test_parallel_tool_calls_keep_parent_confidence_at_one(agents_env, scenario)
         assert s.parent_span_id == agent.context.span_id
         assert _extra(s)["wardex.openai_agents.tool_call_id_source"] == "response_output_match"
     assert (weather.tool.call_id, clock.tool.call_id) == ("call_1", "call_2")
+
+
+def test_a_tool_payload_is_the_frameworks_string_bounded_by_the_handshake():
+    """A `str` is recorded as its own bytes; over the budget it comes back as
+    exactly `budget + 1` bytes so the storage cap sets the truncated flag; a
+    non-string keeps the LangGraph shaping (a dict's repr is a literal)."""
+    from wardex_sdk._adapters._openai_agents import _tool_payload
+
+    assert _tool_payload('{"city":"Seoul"}', 64) == b'{"city":"Seoul"}'
+    assert _tool_payload("sunny in Seoul", 64) == b"sunny in Seoul"
+    assert len(_tool_payload("x" * 10_000, 64)) == 65
+    assert len(_tool_payload("é" * 10_000, 64)) == 65
+    assert _tool_payload("x" * 64, 64) == b"x" * 64
+    assert _tool_payload({"city": "Seoul"}, 64) == b"{'city': 'Seoul'}"
 
 
 def test_two_identical_tool_calls_in_one_response_get_no_guessed_id(agents_env, scenario):

@@ -1127,10 +1127,10 @@ def _function_end(adapter: OpenAIAgentsAdapter, run: dict[str, Any], span: Any) 
         ctx.count("tool_call_id_ambiguous" if len(ids) > 1 else "tool_call_id_unmatched")
     budget = ctx.record_budget
     if raw_input is not None:
-        h.record_input(_shaped_args(raw_input, budget))
+        h.record_input(_tool_payload(raw_input, budget))
     output = sd.output
     if output is not None:
-        h.record_output(_shaped_args(output, budget))
+        h.record_output(_tool_payload(output, budget))
     message = _error_message(span)
     if message is not None:
         error_type, _fatal = _classify_error(adapter, message)
@@ -1139,6 +1139,26 @@ def _function_end(adapter: OpenAIAgentsAdapter, run: dict[str, Any], span: Any) 
         h.close()
     _unpin(adapter, h)
     entry["handle"] = None
+
+
+def _tool_payload(value: Any, budget: int) -> bytes:
+    """A tool's arguments and result as the framework hands them, bounded.
+
+    The framework's `FunctionSpanData.input` is the model's JSON STRING and
+    its `output` is usually the handler's string, so they are recorded as
+    their own bytes: a backend then shows `{"city":"Seoul"}`, not the
+    Python repr `'{"city":"Seoul"}'` that `_shaped_args` — written for
+    LangGraph's dict of arguments, where the repr layer is free — would add.
+    Same budget+1 handshake as that helper: a string that does not fit is
+    returned as exactly `budget + 1` bytes so the storage cap flags the cut,
+    and the slice is taken on the string BEFORE encoding so the cost stays
+    O(budget). Anything that is not exactly a `str` (a handler returning a
+    dict, or a subclass with a `__repr__` of its own) keeps `_shaped_args`.
+    """
+    if type(value) is not str:
+        return _shaped_args(value, budget)
+    data = value[: budget + 1].encode("utf-8", "replace")
+    return data[: budget + 1] if len(data) > budget else data
 
 
 # -- guardrails ----------------------------------------------------------------
