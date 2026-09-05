@@ -333,6 +333,36 @@ def test_a_processor_removed_after_init_is_reported_once_at_uninstall(agents_env
     assert counters.get("adapters.openai_agents.processor_removed") == 1
 
 
+def test_a_processor_removed_in_a_later_init_cycle_is_still_reported(agents_env, wardex_log):
+    """`wardex.close()` leaves the process-global counters alone, so a second
+    `init` in the same process starts with `active.trace` already above zero
+    from the first cycle's runs. "No run was ever recorded" has to be judged
+    against the count at THIS install, not against zero: the host that
+    replaces the processor list after the second init has recorded nothing
+    since, and must hear so."""
+    from wardex_sdk._assembly._diag import reset_reports_for_test
+
+    # The notice's `report_once` key is process-global too, and the removal
+    # test above has already spent it by the time this one runs.
+    reset_reports_for_test()
+    _init()
+    try:
+        assert _run(_agents()).final_output == "done"
+    finally:
+        wardex.close()
+    assert counters.get("adapters.openai_agents.active.trace") == 1
+    _init()
+    try:
+        set_trace_processors([])
+        assert _run(_agents()).final_output == "done"
+        assert _adapter_spans(_spans()) == []
+    finally:
+        wardex.close()
+    assert wardex_log.lines(logging.WARNING).count(_PROCESSOR_REMOVED_NOTICE) == 1
+    assert counters.get("adapters.openai_agents.processor_removed") == 1
+    assert counters.get("adapters.openai_agents.processor_removed_after_runs") == 0
+
+
 # --------------------------------------------------------------------------
 # install / uninstall
 # --------------------------------------------------------------------------

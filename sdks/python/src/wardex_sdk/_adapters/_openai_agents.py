@@ -314,6 +314,12 @@ class OpenAIAgentsAdapter(AdapterInterface):
         self._before: tuple[Any, ...] | None = None
         self._mcp = False
         self._tracing: Any = None
+        #: `adapters.openai_agents.active.trace` as read at install. The
+        #: counter is process-global and `wardex.close()` does not reset it,
+        #: so "no run was ever recorded" is judged against THIS install's
+        #: starting value, not against zero — or a second init/close cycle in
+        #: one process would inherit the first cycle's runs and never report.
+        self._trace_baseline = 0
 
     def name(self) -> str:
         return _FRAMEWORK
@@ -377,6 +383,7 @@ class OpenAIAgentsAdapter(AdapterInterface):
                 key="adapters.openai_agents.processors_read_failed",
             )
             ctx.count("processors_read_failed")
+        self._trace_baseline = counters.get("adapters.openai_agents.active.trace")
         tracing.add_trace_processor(self._processor)
         self._installed = True
 
@@ -421,9 +428,12 @@ class OpenAIAgentsAdapter(AdapterInterface):
     def _check_processor_removed(self) -> None:
         """Say so, once, when a later `set_trace_processors` dropped ours.
 
-        Only when NO run was ever recorded: a processor removed after runs
-        is a change of mind rather than a silent blind spot, and is counted
-        under its own name instead of reported.
+        Only when NO run was recorded since this install: a processor removed
+        after runs is a change of mind rather than a silent blind spot, and is
+        counted under its own name instead of reported. "Since this install"
+        is measured against `_trace_baseline`, because the counter outlives
+        `wardex.close()` and a later init in the same process would otherwise
+        read the earlier cycle's runs as its own.
         """
         ctx = self._ctx
         if ctx is None:
@@ -431,7 +441,7 @@ class OpenAIAgentsAdapter(AdapterInterface):
         current = self._current_processors()
         if current is None or self._processor in current:
             return
-        if counters.get("adapters.openai_agents.active.trace") == 0:
+        if counters.get("adapters.openai_agents.active.trace") == self._trace_baseline:
             report_once(_PROCESSOR_REMOVED_NOTICE, key="adapters.openai_agents.processor_removed")
             ctx.count("processor_removed")
         else:
