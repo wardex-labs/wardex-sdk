@@ -16,7 +16,9 @@ use wardex_core::protocol::grpc::{
 use wardex_core::protocol::http1::{Http1Stream, ParsedHttp};
 use wardex_core::protocol::http2::{Http2Connection, Http2Transaction as CoreHttp2Txn};
 use wardex_core::protocol::json_rpc::{JsonRpcKind, JsonRpcMessage as CoreJsonRpc, JsonRpcStream};
-use wardex_core::protocol::semantic::{parse_llm, LlmSemantics as CoreLlmSemantics};
+use wardex_core::protocol::semantic::{
+    parse_llm, treatment, ws_upgrade, LlmSemantics as CoreLlmSemantics, Treatment, WsUpgrade,
+};
 use wardex_core::protocol::websocket::{
     WsFeedResult as CoreWsFeedResult, WsFrame as CoreWsFrame, WsParser as CoreWsParser,
 };
@@ -804,6 +806,27 @@ fn parse_llm_semantics(
     inner.map(|inner| LlmSemantics { inner })
 }
 
+/// "llm_call" | "provider_state" | "excluded" | None. Strings, not an enum
+/// class: three values, one consumer, and the seam only ever compares.
+#[pyfunction]
+fn classify_path(path: &str) -> Option<&'static str> {
+    treatment(path).map(|t| match t {
+        Treatment::LlmCall => "llm_call",
+        Treatment::ProviderState => "provider_state",
+        Treatment::Excluded => "excluded",
+    })
+}
+
+/// "known_provider" | "unknown_host" | None — the WS-transport question, see
+/// endpoint.rs.
+#[pyfunction]
+fn classify_ws_upgrade(host: &str, path: &str) -> Option<&'static str> {
+    ws_upgrade(host, path).map(|w| match w {
+        WsUpgrade::KnownProvider => "known_provider",
+        WsUpgrade::UnknownHost => "unknown_host",
+    })
+}
+
 #[pymodule]
 fn _wardex_native(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
@@ -818,6 +841,8 @@ fn _wardex_native(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     protocol.add_class::<JsonRpcParser>()?;
     protocol.add_class::<JsonRpcMessage>()?;
     protocol.add_function(wrap_pyfunction!(parse_llm_semantics, &protocol)?)?;
+    protocol.add_function(wrap_pyfunction!(classify_path, &protocol)?)?;
+    protocol.add_function(wrap_pyfunction!(classify_ws_upgrade, &protocol)?)?;
     protocol.add_function(wrap_pyfunction!(normalize_finish_reason, &protocol)?)?;
     protocol.add_class::<WsParser>()?;
     protocol.add_class::<WsFeedResult>()?;

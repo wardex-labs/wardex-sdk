@@ -15,6 +15,7 @@ mod tests;
 pub mod usage;
 
 use anthropic::{fill_anthropic, reassemble_anthropic};
+pub use endpoint::{treatment, ws_upgrade, Treatment, WsUpgrade};
 use endpoint::{Api, Endpoint};
 use openai_chat::{fill_openai_chat, reassemble_openai};
 use openai_embeddings::fill_openai_embeddings;
@@ -117,7 +118,7 @@ impl StringOrVec {
     }
 }
 
-fn provider_from_host(host: &str) -> Option<&'static str> {
+pub(super) fn provider_from_host(host: &str) -> Option<&'static str> {
     if host.contains("openai") {
         Some("openai")
     } else if host.contains("anthropic") {

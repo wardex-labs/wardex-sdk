@@ -1922,3 +1922,43 @@ fn user_role_output_items_keep_their_role() {
         }
     }
 }
+
+/// `POST /v1/responses/compact` is a billable LLM call: model + input in,
+/// usage + output items out. It has no assistant turn (no `status` on the
+/// wire), so finish_reasons/response_status stay empty; its echoed user
+/// message keeps its role and the compaction item ships as an unmapped
+/// generic part rather than as anything the model said.
+#[test]
+fn responses_compact_is_a_billable_llm_call() {
+    let s = parse_llm(
+        "api.openai.com",
+        "/v1/responses/compact",
+        fixture!("openai_responses_compact", "request.json"),
+        fixture!("openai_responses_compact", "response.json"),
+        Limits::default(),
+    )
+    .expect("compact fixture parses");
+    assert_eq!(s.operation, "chat");
+    assert_eq!(s.api_type, Some("responses"));
+    assert_eq!(s.request_model.as_deref(), Some("gpt-5.1"));
+    assert_eq!(s.response_id.as_deref(), Some("resp_cmp1"));
+    assert_eq!(s.usage.input_tokens(), Some(1200));
+    assert_eq!(s.usage.output_tokens(), Some(300));
+    assert!(s.finish_reasons.is_none());
+    assert!(s.response_status.is_none());
+    assert!(s.output_messages_has_unmapped);
+    let v: serde_json::Value = serde_json::from_str(&s.output_messages.unwrap()).unwrap();
+    let msgs = v.as_array().unwrap();
+    assert_eq!(msgs.len(), 2);
+    assert_eq!(msgs[0]["role"], "user");
+    assert_eq!(msgs[0]["parts"][0]["content"], "hello");
+    assert_eq!(msgs[1]["role"], "assistant");
+    assert_eq!(
+        msgs[1]["parts"],
+        serde_json::json!([{"type": "compaction"}]),
+        "the compaction item is the assistant's only part"
+    );
+    for part in msgs[1]["parts"].as_array().unwrap() {
+        assert_ne!(part.get("content"), Some(&serde_json::json!("hello")));
+    }
+}
