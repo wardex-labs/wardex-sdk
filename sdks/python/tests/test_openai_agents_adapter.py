@@ -988,6 +988,25 @@ def test_agents_finished_under_one_trace_leave_no_bookkeeping_behind(agents_env,
     assert _extra(root)["wardex.openai_agents.agents"] == len(names)
 
 
+def test_a_finished_run_leaves_every_slot_empty(agents_env, scenario):
+    """Per-span bookkeeping ends with the span and per-run bookkeeping with
+    the trace: whatever the framework still holds, no slot the adapter wrote
+    keeps a handle, an agent entry or a call table alive afterwards. An
+    END-only span (each LLM call's response span) never gets a slot at all."""
+    from wardex_sdk._adapters._registry import get_registry
+
+    scenario(_decide_chain)
+    _init()
+    try:
+        assert _run(_chain_agents()).final_output == "done"
+        _spans()
+        ctx = get_registry()._contexts["openai_agents"]
+        leftovers = {type(k).__name__: dict(v) for k, v in ctx._slots.items() if v}
+    finally:
+        wardex.close()
+    assert leftovers == {}, leftovers
+
+
 def test_without_task_and_turn_spans_only_the_turn_attribute_disappears(agents_env, scenario):
     scenario(_decide_chain)
     _init()

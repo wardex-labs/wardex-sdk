@@ -459,7 +459,6 @@ class OpenAIAgentsAdapter(AdapterInterface):
             return
         self._mcp = _mcp_surface_ok(tracing)
         self._tracing = tracing
-        type(self).CONTROL_FLOW = ()
         self._notice_if_tracing_disabled(tracing)
         provider = tracing.get_trace_provider()
         self._before = None
@@ -468,7 +467,6 @@ class OpenAIAgentsAdapter(AdapterInterface):
             self._before = tuple(provider._multi_processor._processors)
             read = True
         if not read:
-            self._before = None
             report_once(
                 "openai-agents adapter: could not read the framework's processor list; "
                 "uninstall will leave wardex's processor registered but inert",
@@ -698,21 +696,32 @@ class _WardexTracingProcessor:
 # outlive the objects the framework holds.
 
 
-def _trace_of(adapter: OpenAIAgentsAdapter, span: Any) -> Any | None:
-    """The trace `span` belongs to, remembered at its start or read from the
-    framework's current-trace carrier; None when neither answers."""
+def _current_trace(adapter: OpenAIAgentsAdapter, span: Any) -> Any | None:
+    """The trace `span` belongs to, read from the framework's current-trace
+    carrier; None when it does not answer for this span."""
     ctx = adapter._ctx
     if ctx is None:
         return None
-    remembered = ctx.slot(span).get("trace")
-    if remembered is not None:
-        return remembered
     tracing = adapter._tracing
     current = tracing.get_current_trace() if tracing is not None else None
     if current is None or current.trace_id != span.trace_id:
         ctx.count("trace_lookup_miss")
         return None
     return current
+
+
+def _trace_of(adapter: OpenAIAgentsAdapter, span: Any) -> Any | None:
+    """The trace `span` belongs to: remembered at its start when the kind has
+    one, else read from the carrier. A kind opened at END has no start to
+    remember at and gets NO slot entry here — `slot()` creates on read, and
+    an entry created for every LLM call and never cleared lived until the
+    framework dropped the span."""
+    ctx = adapter._ctx
+    if ctx is None:
+        return None
+    kind = type(span.span_data).__name__
+    remembered = None if kind in _END_ONLY else ctx.slot(span).get("trace")
+    return remembered if remembered is not None else _current_trace(adapter, span)
 
 
 def _run_state(adapter: OpenAIAgentsAdapter, trace: Any) -> dict[str, Any] | None:
@@ -732,7 +741,7 @@ def _span_start(adapter: OpenAIAgentsAdapter, span: Any) -> None:
         if kind not in _END_ONLY:
             adapter._ctx.count("span_kind_ignored")  # type: ignore[union-attr]
         return
-    trace = _trace_of(adapter, span)
+    trace = _current_trace(adapter, span)
     if trace is None:
         return
     run = _run_state(adapter, trace)
@@ -749,12 +758,15 @@ def _span_end(adapter: OpenAIAgentsAdapter, span: Any) -> None:
     if handler is None:
         return
     trace = _trace_of(adapter, span)
-    if trace is None:
-        return
-    run = _run_state(adapter, trace)
-    if run is None:
-        return
-    handler(adapter, run, span)
+    run = _run_state(adapter, trace) if trace is not None else None
+    if run is not None:
+        handler(adapter, run, span)
+    if kind not in _END_ONLY:
+        # The span's bookkeeping ends with the span. The slot is weakly keyed
+        # and would go when the framework drops the object, but the framework
+        # may hold a finished span for as long as it likes, and the entry
+        # holds a handle and the enclosing agent's entry with it.
+        adapter._ctx.slot(span).clear()  # type: ignore[union-attr]
 
 
 #: Kinds whose span is opened at END (the framework fills them late) and so
@@ -1065,7 +1077,6 @@ def _agent_end(adapter: OpenAIAgentsAdapter, run: dict[str, Any], span: Any) -> 
     # callback arriving elsewhere cannot corrupt the opening task's view.
     _CURRENT_AGENT.set(entry.get("outer"))
     _PENDING_HANDOFF.set(entry.get("handoff_out"))
-    entry["handle"] = None
 
 
 # -- handoffs ------------------------------------------------------------------
@@ -1283,9 +1294,8 @@ def _function_start(adapter: OpenAIAgentsAdapter, run: dict[str, Any], span: Any
     )
     entry = ctx.slot(span)
     entry["handle"] = h
-    entry["pinned"] = _pin(adapter, h, driver, name)
-    entry["kind"] = "tool"
     entry["name"] = name
+    _pin(adapter, h, driver, name)
     entry["calls"] = (agent.get("calls") if agent is not None else None) or {}
 
 
@@ -1335,7 +1345,6 @@ def _function_end(adapter: OpenAIAgentsAdapter, run: dict[str, Any], span: Any) 
     else:
         h.close()
     _unpin(adapter, h)
-    entry["handle"] = None
 
 
 def _tool_payload(value: Any, budget: int) -> bytes:
@@ -1383,9 +1392,8 @@ def _guardrail_start(adapter: OpenAIAgentsAdapter, run: dict[str, Any], span: An
     )
     entry = ctx.slot(span)
     entry["handle"] = h
-    entry["pinned"] = _pin(adapter, h, driver, name)
-    entry["kind"] = "guardrail"
     entry["name"] = name
+    _pin(adapter, h, driver, name)
 
 
 def _guardrail_end(adapter: OpenAIAgentsAdapter, run: dict[str, Any], span: Any) -> None:
@@ -1428,7 +1436,6 @@ def _guardrail_end(adapter: OpenAIAgentsAdapter, run: dict[str, Any], span: Any)
         ctx.count("guardrail_interrupted")
         h.close(status=StatusCode.UNSET)
     _unpin(adapter, h)
-    entry["handle"] = None
 
 
 # -- MCP list-tools --------------------------------------------------------------
