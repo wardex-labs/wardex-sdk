@@ -993,6 +993,89 @@ def test_parallel_tool_calls_keep_parent_confidence_at_one(agents_env, scenario)
     assert (weather.tool.call_id, clock.tool.call_id) == ("call_1", "call_2")
 
 
+def _decide_nested_tool_then_handoff(inp: object) -> list[dict]:
+    """agent_a calls `helper_tool` (an agent as a tool), then hands off to
+    agent_b; the inner helper run and agent_b both answer at once."""
+    items = inp if isinstance(inp, list) else []
+    if any(isinstance(x, dict) and x.get("content") == "INNER" for x in items):
+        return _DONE
+    made = _calls_made(inp)
+    if "helper_tool" not in made:
+        return [_fc("helper_tool", "call_1", '{"input":"INNER"}')]
+    if "transfer_to_agent_b" not in made:
+        return [_fc("transfer_to_agent_b", "call_h1")]
+    return _DONE
+
+
+def test_a_refused_agent_pin_marks_every_child_the_adapter_opens_under_it(
+    agents_env, scenario, monkeypatch, wardex_log
+):
+    """The registry refuses a pin whose declared owner is not the task it
+    observes and marks ONLY the refused unit. A framework release that started
+    `AgentSpanData` on a task other than the run's would then ship that
+    agent's tools, nested agents and handoff marker under the ambient unit of
+    the moment — the run root here — at 1.0 with nothing on them. So the
+    adapter keeps the refusal on the agent's slot and puts
+    `correlation_conflict` on each child it opens while that agent is current;
+    agent_b, whose pin is accepted, stays clean, and one WARNING line names
+    the agent. Only agent_a's start sees a foreign driver."""
+    from wardex_sdk._adapters import _openai_agents
+    from wardex_sdk._assembly._diag import reset_reports_for_test
+
+    reset_reports_for_test()
+    scenario(_decide_nested_tool_then_handoff)
+    real_start = _openai_agents._agent_start
+
+    def foreign_for_agent_a(adapter: Any, run: Any, span: Any) -> None:
+        if span.span_data.name != "agent_a":
+            real_start(adapter, run, span)
+            return
+        with monkeypatch.context() as m:
+            m.setattr(_openai_agents, "_driver", lambda: object())
+            real_start(adapter, run, span)
+
+    monkeypatch.setattr(_openai_agents, "_agent_start", foreign_for_agent_a)
+    helper = Agent(name="helper", instructions="inner", model="gpt-4o-mini")
+    agent_b = Agent(name="agent_b", instructions="b", model="gpt-4o-mini")
+    agent_a = Agent(
+        name="agent_a",
+        instructions="a",
+        tools=[helper.as_tool(tool_name="helper_tool", tool_description="helps")],
+        handoffs=[agent_b],
+        model="gpt-4o-mini",
+    )
+    _init()
+    try:
+        assert _run(agent_a).final_output == "done"
+        spans = _spans()
+        assert counters.get("adapters.openai_agents.pin_refused") == 1
+        assert counters.get("assembly._units.pin_foreign_task") == 1
+    finally:
+        wardex.close()
+    root = _one(spans, "invoke_workflow Agent workflow")
+    refused = _one(spans, "invoke_agent agent_a")
+    tool = _one(spans, "execute_tool helper_tool")
+    nested = _one(spans, "invoke_agent helper")
+    marker = _one(spans, "handoff agent_a→agent_b")
+    clean = _one(spans, "invoke_agent agent_b")
+    # The registry's half: the refused unit itself.
+    assert Limitation.CORRELATION_CONFLICT in _edge(refused)[2]
+    # The adapter's half: every child it opened while agent_a was current.
+    # The tool and the marker are misparented onto the root, because agent_a
+    # never became ambient; the nested agent hangs under the tool (its own
+    # task's pin held) but the subtree it sits in is the misparented one, so
+    # it says so too.
+    for s in (tool, nested, marker):
+        assert Limitation.CORRELATION_CONFLICT in _edge(s)[2], (s.name, _edge(s))
+    assert tool.parent_span_id == root.context.span_id
+    assert marker.parent_span_id == root.context.span_id
+    assert nested.parent_span_id == tool.context.span_id
+    assert _edge(clean) == (ParentSource.UNIT_ACTIVE, 1.0, ())
+    assert clean.parent_span_id == root.context.span_id
+    notices = [w for w in wardex_log.lines(logging.WARNING) if "carry correlation_conflict" in w]
+    assert len(notices) == 1 and "spans under agent_a carry" in notices[0], notices
+
+
 def test_sensitive_data_off_leaves_the_marker_and_no_join_on_the_tool_span(agents_env):
     """`RunConfig(trace_include_sensitive_data=False)`: the framework strips
     the response and the tool arguments from its own spans, so the call id

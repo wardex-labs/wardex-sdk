@@ -958,6 +958,13 @@ def _handoff_end(adapter: OpenAIAgentsAdapter, run: dict[str, Any], span: Any) -
         start_ns=start_ns,
         describe=describe,
     )
+    # The marker opens on the sender's task. When the sender's pin was refused
+    # it is not ambient there, so the marker hangs under whatever is (the
+    # session, or an earlier agent) at 1.0 — the same misparenting the tool
+    # and guardrail children get, and it carries the same marker.
+    stack = run.get("stack") or ()
+    if stack and not stack[-1]["pinned"]:
+        h.note(Limitation.CORRELATION_CONFLICT)
     if to is None:
         h.close(status=StatusCode.ERROR, error_type="handoff_error")
         ctx.count("handoff_unresolved")
