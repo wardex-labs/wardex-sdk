@@ -10,9 +10,15 @@ adapter registers one `TracingProcessor` and hands the framework its original
 tuple back on uninstall, and `tuple(t) is t` is what lets the suite's identity
 check hold on the way out. The model is an in-process fake implementing
 `agents.models.interface.Model`, so no HTTP happens and no wire span appears —
-the declared tree is the adapter's spans alone, which is also why
-`usage_expected` is `"none"`: the framework's usage is discarded by design and
-nothing else here could carry any.
+the declared tree is the adapter's spans alone.
+
+`usage_expected` is `"none"`, and the fake is built so that declaration is a
+two-way claim rather than a vacuous one: it opens the framework's own
+`response_span` around every answer and hands it a real `Response` whose
+`usage` is non-zero, the way the real model does, so `_response_end` runs
+under this suite with usage on offer. Usage on any adapter span here is the
+adapter reading what it promised to discard. The three-turn scenario in
+`test_openai_agents_adapter.py` asserts the same rule against the wire.
 
 The scenario tests that go BEYOND these invariants — the three-turn tree on
 the wire, parallel tools, the handoff chain, guardrails, MaxTurns, tracing
@@ -28,13 +34,21 @@ import pytest
 from agents import Agent, RunConfig, Runner, function_tool
 from agents.items import ModelResponse
 from agents.models.interface import Model
-from agents.tracing import TracingProcessor, get_trace_provider, set_trace_processors
+from agents.tracing import (
+    TracingProcessor,
+    get_trace_provider,
+    response_span,
+    set_trace_processors,
+)
 from agents.usage import Usage
 from openai.types.responses import (
+    Response,
     ResponseFunctionToolCall,
     ResponseOutputMessage,
     ResponseOutputText,
+    ResponseUsage,
 )
+from openai.types.responses.response_usage import InputTokensDetails, OutputTokensDetails
 
 from wardex_sdk._adapters._openai_agents import OpenAIAgentsAdapter
 from wardex_sdk._enums import AdapterName
@@ -57,10 +71,39 @@ def _message(text: str) -> ResponseOutputMessage:
     )
 
 
+def _response(response_id: str, output: list[Any]) -> Response:
+    """A real `Response` with usage on it — what the framework's response span
+    carries when the real model answers, so the adapter's discard is tested
+    against the object it would actually be handed."""
+    return Response(
+        id=response_id,
+        created_at=0.0,
+        model="fake",
+        object="response",
+        output=output,
+        parallel_tool_calls=False,
+        tool_choice="auto",
+        tools=[],
+        usage=ResponseUsage(
+            input_tokens=7,
+            input_tokens_details=InputTokensDetails(cached_tokens=0, cache_write_tokens=0),
+            output_tokens=3,
+            output_tokens_details=OutputTokensDetails(reasoning_tokens=0),
+            total_tokens=10,
+        ),
+    )
+
+
 class FakeModel(Model):
     """Hands off first when a handoff is offered, calls the first tool once,
     then answers `done`. Decided from the call ids already in the input, so it
-    is stateless across turns and honest about what the framework resent."""
+    is stateless across turns and honest about what the framework resent.
+
+    Every answer is wrapped in the framework's `response_span`, exactly as the
+    real model wraps its HTTP call, and the span is handed a `Response` with
+    usage — so the adapter's `_response_end` runs here and the usage it must
+    NOT read is on offer.
+    """
 
     def __init__(self) -> None:
         self.responses = 0
@@ -80,6 +123,16 @@ class FakeModel(Model):
         prompt: Any,
     ) -> ModelResponse:
         self.responses += 1
+        with response_span(disabled=tracing.is_disabled()) as span:
+            response = self._answer(input, tools, handoffs)
+            span.span_data.response = response
+        return ModelResponse(
+            output=list(response.output),
+            usage=Usage(requests=1, input_tokens=7, output_tokens=3, total_tokens=10),
+            response_id=response.id,
+        )
+
+    def _answer(self, input: Any, tools: Any, handoffs: Any) -> Response:  # noqa: A002
         items = input if isinstance(input, list) else []
         done = {
             x.get("call_id")
@@ -94,7 +147,7 @@ class FakeModel(Model):
             out = [_call(tool_names[0], '{"city":"Seoul"}', "call_1")]
         else:
             out = [_message("done")]
-        return ModelResponse(output=out, usage=Usage(), response_id=f"resp_{self.responses}")
+        return _response(f"resp_{self.responses}", out)
 
     def stream_response(self, *args: Any, **kwargs: Any) -> Any:
         raise NotImplementedError("the conformance workload never streams")
