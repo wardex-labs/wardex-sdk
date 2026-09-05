@@ -488,7 +488,7 @@ def _mark_degraded(adapter: OpenAIAgentsAdapter, obj: Any) -> None:
         return
     run = ctx.slot(trace)
     stack = run.get("stack") or ()
-    target = stack[-1] if stack else run.get("handle")
+    target = stack[-1].get("handle") if stack else run.get("handle")
     if target is not None:
         target.note(Limitation.INSTRUMENTATION_DEGRADED)
 

@@ -1193,3 +1193,355 @@ def test_every_span_kind_writes_a_fixed_set_of_extras(agents_env):
                 "wardex.framework",
                 "wardex.step.name",
             }
+
+
+# --------------------------------------------------------------------------
+# failure mapping
+# --------------------------------------------------------------------------
+
+
+def _decide_loop(inp: object) -> list[dict]:
+    """Always one more tool call: the shape that exceeds `max_turns`."""
+    n = _outputs_done(inp)
+    return [_fc("get_weather", f"call_{n + 1}", '{"city":"Seoul"}')]
+
+
+def _weather_agent(**tool_kwargs: Any) -> Agent:
+    from agents import function_tool
+
+    @function_tool(**tool_kwargs)
+    def get_weather(city: str) -> str:
+        if city == "boom":
+            raise RuntimeError("the tool failed")
+        return f"sunny in {city}"
+
+    return Agent(name="agent_a", instructions="a", tools=[get_weather], model="gpt-4o-mini")
+
+
+def test_max_turns_exceeded_fails_the_agent_and_the_root(agents_env, scenario):
+    from agents.exceptions import MaxTurnsExceeded
+
+    scenario(_decide_loop)
+    _init()
+    try:
+        with pytest.raises(MaxTurnsExceeded):
+            _run(_weather_agent(), max_turns=2)
+        spans = _spans()
+    finally:
+        wardex.close()
+    agent = _one(spans, "invoke_agent agent_a")
+    root = _one(spans, "invoke_workflow Agent workflow")
+    for s in (agent, root):
+        assert (s.status, s.error_type) == (StatusCode.ERROR, "max_turns_exceeded")
+    assert _extra(agent)["wardex.openai_agents.max_turns"] == 2
+    tools = [s for s in spans if s.name == "execute_tool get_weather"]
+    assert len(tools) == 2 and all(t.status is StatusCode.OK for t in tools)
+
+
+def test_a_handled_max_turns_still_reads_as_an_error(agents_env, scenario):
+    """DOCUMENTED LIMITATION: the framework marks the agent span before it
+    consults `error_handlers`, so a handled max_turns ships ERROR on the
+    agent and the root while the host gets its handler's output."""
+    scenario(_decide_loop)
+    _init()
+    try:
+        res = _run(
+            _weather_agent(), max_turns=2, error_handlers={"max_turns": lambda data: "handled"}
+        )
+        assert res.final_output == "handled"
+        spans = _spans()
+    finally:
+        wardex.close()
+    for name in ("invoke_agent agent_a", "invoke_workflow Agent workflow"):
+        s = _one(spans, name)
+        assert (s.status, s.error_type) == (StatusCode.ERROR, "max_turns_exceeded")
+
+
+def _decide_boom(inp: object) -> list[dict]:
+    if _outputs_done(inp) == 0:
+        return [_fc("get_weather", "call_1", '{"city":"boom"}')]
+    return _DONE
+
+
+def test_a_fatal_tool_failure_fails_the_agent_and_the_root(agents_env, scenario):
+    """`failure_error_function=None`: the framework re-raises as `UserError`,
+    marks the tool span, then the agent span with its generic error."""
+    from agents.exceptions import UserError
+
+    scenario(_decide_boom)
+    _init()
+    try:
+        with pytest.raises(UserError):
+            _run(_weather_agent(failure_error_function=None))
+        spans = _spans()
+    finally:
+        wardex.close()
+    tool = _one(spans, "execute_tool get_weather")
+    assert (tool.status, tool.error_type) == (StatusCode.ERROR, "tool_error")
+    for name in ("invoke_agent agent_a", "invoke_workflow Agent workflow"):
+        s = _one(spans, name)
+        assert (s.status, s.error_type) == (StatusCode.ERROR, "agent_run_error")
+
+
+def test_a_handled_tool_failure_stays_on_the_tool_span(agents_env, scenario):
+    """The default handler turns the exception into a tool output: the tool
+    span says `tool_error_handled`, and nothing above it is marked."""
+    scenario(_decide_boom)
+    _init()
+    try:
+        assert _run(_weather_agent()).final_output == "done"
+        spans = _spans()
+    finally:
+        wardex.close()
+    tool = _one(spans, "execute_tool get_weather")
+    assert (tool.status, tool.error_type) == (StatusCode.ERROR, "tool_error_handled")
+    assert _one(spans, "invoke_agent agent_a").status is StatusCode.OK
+    assert _one(spans, "invoke_workflow Agent workflow").status is StatusCode.OK
+
+
+# --------------------------------------------------------------------------
+# a wardex bug costs a span, never the host
+# --------------------------------------------------------------------------
+
+
+def _inject_open(monkeypatch) -> None:  # noqa: ANN001
+    from wardex_sdk._assembly import SpanIntent, UnitRegistry
+
+    original = UnitRegistry.open
+
+    def open_(self, kind, key, **kw):  # noqa: ANN001, ANN202
+        if kw.get("intent") is SpanIntent.EXECUTE_TOOL:
+            raise RuntimeError("injected: the registry cannot open")
+        return original(self, kind, key, **kw)
+
+    monkeypatch.setattr(UnitRegistry, "open", open_)
+
+
+def _inject_describe(monkeypatch) -> None:  # noqa: ANN001
+    from wardex_sdk._assembly import SpanDraft
+
+    def set_tool(self, attrs):  # noqa: ANN001, ANN202
+        raise RuntimeError("injected: describe dies")
+
+    monkeypatch.setattr(SpanDraft, "set_tool", set_tool)
+
+
+def _inject_close(monkeypatch) -> None:  # noqa: ANN001
+    from wardex_sdk._assembly import UnitKind, UnitRegistry
+
+    original = UnitRegistry.close
+
+    def close(self, unit, **kw):  # noqa: ANN001, ANN202
+        if unit.kind is UnitKind.CALL:
+            raise RuntimeError("injected: the close dies")
+        return original(self, unit, **kw)
+
+    monkeypatch.setattr(UnitRegistry, "close", close)
+
+
+def _inject_slot(monkeypatch) -> None:  # noqa: ANN001
+    from wardex_sdk._adapters._context import AdapterContext
+
+    original = AdapterContext.slot
+    tripped = []
+
+    def slot(self, obj):  # noqa: ANN001, ANN202
+        data = getattr(obj, "span_data", None)
+        if type(data).__name__ == "FunctionSpanData" and not tripped:
+            tripped.append(True)
+            raise RuntimeError("injected: the slot lookup dies")
+        return original(self, obj)
+
+    monkeypatch.setattr(AdapterContext, "slot", slot)
+
+
+@pytest.mark.parametrize("inject", [_inject_open, _inject_describe, _inject_close, _inject_slot])
+def test_a_wardex_fault_costs_a_span_and_never_reaches_the_host(
+    agents_env, monkeypatch, wardex_log, inject
+):
+    """Four faults in wardex's own machinery, one per test: the host still
+    gets `done`, the three LLM calls still ship, exactly one WARNING line
+    names the loss, and `instrumentation_degraded` lands on a span that
+    shipped — the live agent, or the run root."""
+    from wardex_sdk._assembly._diag import reset_reports_for_test
+
+    reset_reports_for_test()
+    inject(monkeypatch)
+    _init()
+    try:
+        assert _run(_agents()).final_output == "done"
+        spans = _spans()
+        assert len(_chat_spans(spans)) == 3
+    finally:
+        wardex.close()
+    warnings = wardex_log.lines(logging.WARNING)
+    assert len(warnings) == 1, warnings
+    assert "openai_agents" in warnings[0] or "openai-agents" in warnings[0]
+    degraded = [
+        s.name for s in _adapter_spans(spans) if Limitation.INSTRUMENTATION_DEGRADED in _edge(s)[2]
+    ]
+    assert degraded, [s.name for s in spans]
+    assert set(degraded) <= {
+        "invoke_agent agent_a",
+        "invoke_workflow Agent workflow",
+        "execute_tool get_weather",
+    }
+
+
+def test_shutdown_and_force_flush_during_a_run_leave_the_units_open(agents_env, scenario):
+    """The framework's `shutdown()` / `force_flush()` reach the processor
+    mid-run (an atexit, a host flush): counted, and nothing closes early."""
+    from agents import function_tool
+
+    provider = get_trace_provider()
+
+    @function_tool
+    def get_weather(city: str) -> str:
+        provider.shutdown()
+        provider.force_flush()
+        return "sunny"
+
+    def decide(inp: object) -> list[dict]:
+        if _outputs_done(inp) == 0:
+            return [_fc("get_weather", "call_1", '{"city":"Seoul"}')]
+        return _DONE
+
+    scenario(decide)
+    agent = Agent(name="agent_a", instructions="a", tools=[get_weather], model="gpt-4o-mini")
+    _init()
+    try:
+        assert _run(agent).final_output == "done"
+        spans = _spans()
+        assert counters.get("adapters.openai_agents.shutdown") == 1
+        assert counters.get("adapters.openai_agents.force_flush") == 1
+    finally:
+        wardex.close()
+    for name in (
+        "invoke_workflow Agent workflow",
+        "invoke_agent agent_a",
+        "execute_tool get_weather",
+    ):
+        s = _one(spans, name)
+        assert s.status is StatusCode.OK and _edge(s)[2] == ()
+
+
+def test_a_host_processor_registered_before_init_sees_the_run_beside_wardex(agents_env):
+    host = _HostProcessor()
+    set_trace_processors([host])
+    before = _processors()
+    _init()
+    try:
+        assert _processors()[0] is host and len(_processors()) == 2
+        assert _run(_agents()).final_output == "done"
+        spans = _spans()
+        assert len(_adapter_spans(spans)) == 5
+        assert len(_chat_spans(spans)) == 3
+    finally:
+        wardex.close()
+    assert _processors() is before
+
+
+# --------------------------------------------------------------------------
+# fork
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="fork is POSIX-only")
+@pytest.mark.filterwarnings(
+    "ignore:This process.*is multi-threaded, use of fork:DeprecationWarning"
+)
+def test_the_fork_child_starts_with_no_run_bookkeeping(agents_env, scenario):
+    """A run is parked inside a tool on a background thread; the MAIN thread
+    forks. The child holds none of the parent's run bookkeeping, a fresh run
+    there is one clean root, and the parent's run finishes as itself."""
+    import threading
+
+    from agents import function_tool
+
+    from test_fork_semantics import _run_in_child
+    from wardex_sdk._adapters._registry import get_registry
+
+    gate = threading.Event()
+    entered = threading.Event()
+
+    @function_tool
+    def get_weather(city: str) -> str:
+        entered.set()
+        gate.wait(20)
+        return "sunny"
+
+    def decide(inp: object) -> list[dict]:
+        if _outputs_done(inp) == 0:
+            return [_fc("get_weather", "call_1", '{"city":"Seoul"}')]
+        return _DONE
+
+    scenario(decide)
+    parent_agent = Agent(name="agent_a", instructions="a", tools=[get_weather], model="gpt-4o-mini")
+    result: dict[str, Any] = {}
+
+    def drive() -> None:
+        try:
+            result["out"] = Runner.run_sync(
+                parent_agent, "hi", run_config=RunConfig(workflow_name="Parent")
+            ).final_output
+        except BaseException as exc:  # noqa: BLE001 — reported to the test
+            result["exc"] = exc
+
+    _init()
+    try:
+        thread = threading.Thread(target=drive, daemon=True)
+        thread.start()
+        assert entered.wait(20)
+
+        def child() -> dict[str, Any]:
+            from agents.models import openai_provider
+            from httpx2 import _utils as httpx_utils
+
+            # A fresh httpx client, and no system-proxy lookup for it: on
+            # macOS `SCDynamicStoreCopyProxies` segfaults in a forked child
+            # (measured), which is the platform's fork rule and not wardex's.
+            openai_provider._http_client = None
+            httpx_utils.getproxies = dict
+            ctx = get_registry()._contexts["openai_agents"]
+            slots = len(ctx._slots)
+            starts_before = counters.get("adapters.openai_agents.active.trace")
+
+            @function_tool
+            def get_weather(city: str) -> str:  # the parent's copy waits on a gate it never sees
+                return "child"
+
+            child_agent = Agent(
+                name="agent_c", instructions="c", tools=[get_weather], model="gpt-4o-mini"
+            )
+            out = Runner.run_sync(
+                child_agent, "hi", run_config=RunConfig(workflow_name="Child")
+            ).final_output
+            spans = _adapter_spans(_spans())
+            roots = [
+                (s.name, [m.value for m in _edge(s)[2]]) for s in spans if s.parent_span_id is None
+            ]
+            return {
+                "slots": slots,
+                "out": out,
+                "roots": roots,
+                "starts": counters.get("adapters.openai_agents.active.trace") - starts_before,
+            }
+
+        code, payload = _run_in_child(child, timeout=60.0)
+        assert code == 0, payload
+        assert payload["slots"] == 0
+        assert payload["out"] == "done"
+        assert payload["roots"] == [["invoke_workflow Child", []]]
+        assert payload["starts"] == 1
+
+        gate.set()
+        thread.join(30)
+        assert result.get("out") == "done", result
+        spans = _spans()
+    finally:
+        gate.set()
+        wardex.close()
+    root = _one(spans, "invoke_workflow Parent")
+    assert root.status is StatusCode.OK and _edge(root) == (ParentSource.TRACE_ROOT, 1.0, ())
+    tool = _one(spans, "execute_tool get_weather")
+    assert tool.parent_span_id == _one(spans, "invoke_agent agent_a").context.span_id
