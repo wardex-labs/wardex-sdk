@@ -1294,6 +1294,26 @@ def test_max_turns_exceeded_fails_the_agent_and_the_root(agents_env, scenario):
     assert len(tools) == 2 and all(t.status is StatusCode.OK for t in tools)
 
 
+def test_an_unmapped_error_message_is_reported_once_and_never_printed(wardex_log):
+    """The framework's error message can be HOST content — an `on_approval`
+    rejection reason lands on the function span verbatim — so the report is
+    keyed on nothing of it: one WARNING for the whole process, the text
+    absent from the line, and the counter carrying the volume."""
+    from wardex_sdk._adapters._openai_agents import _classify_error
+
+    with installed_adapter(OpenAIAgentsAdapter) as live:
+        adapter = live.adapter
+        assert adapter._ctx is not None
+        first = _classify_error(adapter, "rejected: my SSN is 123-45-6789")
+        second = _classify_error(adapter, "rejected: card 4111 1111 1111 1111")
+        assert counters.get("adapters.openai_agents.error_message_unmapped") == 2
+    assert first == second == ("openai_agents_error", False)
+    warnings = wardex_log.lines(logging.WARNING)
+    assert len(warnings) == 1
+    assert "does not map" in warnings[0]
+    assert "SSN" not in warnings[0] and "4111" not in warnings[0]
+
+
 def test_a_handled_max_turns_still_reads_as_an_error(agents_env, scenario):
     """DOCUMENTED LIMITATION: the framework marks the agent span before it
     consults `error_handlers`, so a handled max_turns ships ERROR on the

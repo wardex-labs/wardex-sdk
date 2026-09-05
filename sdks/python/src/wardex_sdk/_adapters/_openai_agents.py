@@ -1263,10 +1263,18 @@ def _classify_error(adapter: OpenAIAgentsAdapter, message: str) -> tuple[str, bo
     ctx = adapter._ctx
     if ctx is not None:
         ctx.count("error_message_unmapped")
+    # ONE fixed key, and the message stays OFF the line. The framework sets a
+    # HOST-supplied string as a function span's error message (the reason an
+    # `on_approval` callback returns for a rejected tool call), so a key built
+    # from it would grow `report_once`'s process-global table by one entry per
+    # distinct reason — the bound the function exists to keep — and printing
+    # it would put host content on stderr outside the masking pipeline. The
+    # counter above carries the volume; the span carries the type.
     report_once(
-        f"openai-agents adapter: the framework reported an error this adapter does not "
-        f"map ({message!r}); the span carries error_type=openai_agents_error",
-        key=f"adapters.openai_agents.unmapped:{message}",
+        "openai-agents adapter: the framework reported an error message this adapter "
+        "does not map; the span carries error_type=openai_agents_error and the counter "
+        "adapters.openai_agents.error_message_unmapped counts every occurrence",
+        key="adapters.openai_agents.unmapped",
     )
     return ("openai_agents_error", False)
 
