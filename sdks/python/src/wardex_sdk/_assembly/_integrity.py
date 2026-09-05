@@ -595,6 +595,15 @@ Two emit sites, and the first is the mechanism the second restates.
     it; the alternative — matching name and arguments against the stream in
     arrival order — is the framework-identifier heuristic this design exists to
     remove, and it would be indistinguishable from a real join downstream.
+
+    Also emitted from ``_adapters/_openai_agents.py::_function_start``, where the
+    one recovery this marker's ABSENCE may mean is an EXACT and UNIQUE
+    ``(name, arguments)`` match against the response that requested the call —
+    not arrival order — labelled at the source with
+    ``wardex.openai_agents.tool_call_id_source``. Two identical requests in one
+    response, or a response the adapter never saw, ship the marker instead of a
+    guess. Re-examination: remove the matching when the framework's
+    ``FunctionSpanData`` carries the call id itself.
     """
 
     SNAPSHOT_TYPE_UNKNOWN = "snapshot_type_unknown"

@@ -79,6 +79,18 @@ class _Records(logging.Handler):
         return [r.getMessage() for r in self.records if r.levelno == level]
 
 
+@pytest.fixture(autouse=True)
+def _fresh_framework_http_client(monkeypatch):
+    """The framework shares ONE httpx client across providers for the life of
+    the process (`agents.models.openai_provider._http_client`), and a client
+    first used inside one event loop fails with a connection error from the
+    next — `run_sync` after `asyncio.run` in this file, measured. Reset per
+    test: the framework builds a fresh one on first use."""
+    from agents.models import openai_provider
+
+    monkeypatch.setattr(openai_provider, "_http_client", None)
+
+
 @pytest.fixture
 def wardex_log():
     logger = logging.getLogger("wardex_sdk")
@@ -705,3 +717,479 @@ def test_two_handoffs_in_one_response_mark_the_handoff_and_nothing_else(agents_e
     assert (marker.status, marker.error_type) == (StatusCode.ERROR, "multiple_handoffs_requested")
     assert _one(spans, "invoke_agent agent_b").status is StatusCode.OK
     assert _one(spans, "invoke_workflow Agent workflow").status is StatusCode.OK
+
+
+# --------------------------------------------------------------------------
+# the three-turn tree, on every run shape
+# --------------------------------------------------------------------------
+
+_ROOT = "invoke_workflow wf"
+
+
+def _assert_three_turn_tree(spans: list[Any], *, streamed: bool) -> None:
+    """The target tree: 8 spans, 1 trace, every edge read from the context,
+    chains asserted by span id, and the joins that make the tree navigable."""
+    assert len(spans) == 8
+    assert len({s.context.trace_id for s in spans}) == 1
+    root = _one(spans, _ROOT)
+    agent_a = _one(spans, "invoke_agent agent_a")
+    agent_b = _one(spans, "invoke_agent agent_b")
+    tool = _one(spans, "execute_tool get_weather")
+    marker = _one(spans, "handoff agent_a→agent_b")
+    chats = sorted(_chat_spans(spans), key=lambda s: s.gen_ai.response_id)
+    assert [c.gen_ai.response_id for c in chats] == ["resp_1", "resp_2", "resp_3"]
+    assert _edge(root) == (ParentSource.TRACE_ROOT, 1.0, ())
+    for s in (agent_a, agent_b, tool, marker):
+        assert _edge(s) == (ParentSource.UNIT_ACTIVE, 1.0, ())
+    for c in chats:
+        markers = _edge(c)[2]
+        assert _edge(c)[:2] == (ParentSource.CONTEXTVAR, 1.0)
+        assert (Limitation.REASSEMBLED_FROM_STREAM in markers) is streamed
+    # chains, BY ID
+    assert agent_a.parent_span_id == root.context.span_id
+    assert agent_b.parent_span_id == root.context.span_id
+    assert tool.parent_span_id == agent_a.context.span_id
+    assert marker.parent_span_id == agent_a.context.span_id
+    assert [c.parent_span_id for c in chats] == [
+        agent_a.context.span_id,
+        agent_a.context.span_id,
+        agent_b.context.span_id,
+    ]
+    # the joins
+    assert tool.tool.call_id == "call_1"
+    assert _extra(tool)["wardex.openai_agents.tool_call_id_source"] == "response_output_match"
+    assert _extra(tool)["wardex.openai_agents.response_id"] == chats[0].gen_ai.response_id
+    assert _extra(marker)["wardex.openai_agents.response_id"] == chats[1].gen_ai.response_id
+    assert agent_b.agent.parent_agent == "agent_a"
+    assert [(lk.reason, lk.span_id) for lk in agent_b.links] == [
+        (LinkReason.HANDOFF_FROM, marker.context.span_id)
+    ]
+    assert marker.agent.name == "agent_b" and marker.agent.parent_agent == "agent_a"
+    # the conversation, on every adapter span. NOT on the chat spans: the
+    # byte seam's tracker latches the span context alone at request time
+    # (`_interceptors/_seam.py::_latched`), a documented, pre-existing gap
+    # of the wire layer that the adapter cannot close from its side.
+    for s in _adapter_spans(spans):
+        assert s.conversation is not None and s.conversation.conversation_id == "conv-123"
+    for c in chats:
+        assert c.conversation is None
+    # no usage anywhere but the wire
+    for s in _adapter_spans(spans):
+        assert s.gen_ai is None
+    for s in (root, agent_a, agent_b, tool, marker):
+        assert s.capture_integrity is None or s.capture_integrity.limitations == ()
+    assert s.status is StatusCode.OK
+    assert _extra(root)["wardex.openai_agents.turns"] == 3
+    assert _extra(root)["wardex.openai_agents.agents"] == 2
+
+
+def _assert_counters_clean() -> None:
+    snap = counters.snapshot()
+    assert {k: v for k, v in snap.items() if k.startswith("assembly.")} == {}
+    active = {k: v for k, v in snap.items() if k.startswith("adapters.openai_agents.active.")}
+    assert active == {
+        "adapters.openai_agents.active.trace": 1,
+        "adapters.openai_agents.active.agent": 2,
+        "adapters.openai_agents.active.handoff": 1,
+        "adapters.openai_agents.active.tool": 1,
+    }
+    assert counters.get("adapters.openai_agents.pin_refused") == 0
+
+
+def _run_config() -> RunConfig:
+    """Fresh per run: a `RunConfig` owns its model provider, whose OpenAI
+    client keeps the base URL of the first server it saw."""
+    return RunConfig(workflow_name="wf", group_id="conv-123")
+
+
+def test_runner_run_three_turns_are_one_tree(agents_env):
+    """THE measured record: the tree the tracker's baseline said did not
+    exist. Printed, so the text in the tracker is the text this test saw."""
+    _init()
+    try:
+        assert _run(_agents(), run_config=_run_config()).final_output == "done"
+        spans = _spans()
+        _assert_three_turn_tree(spans, streamed=False)
+        _assert_counters_clean()
+    finally:
+        wardex.close()
+    print("\n" + _print_tree(spans))
+
+
+def test_run_sync_three_turns_are_one_tree(agents_env):
+    _init()
+    try:
+        assert Runner.run_sync(_agents(), "hi", run_config=_run_config()).final_output == "done"
+        spans = _spans()
+        _assert_three_turn_tree(spans, streamed=False)
+        _assert_counters_clean()
+    finally:
+        wardex.close()
+
+
+def test_run_streamed_three_turns_are_one_tree_after_the_drain(agents_env):
+    """The trace ends when the background loop task ends — after the host
+    drained `stream_events()` — so the spans are read after the drain."""
+
+    async def go() -> str:
+        result = Runner.run_streamed(_agents(), "hi", run_config=_run_config())
+        async for _ in result.stream_events():
+            pass
+        return result.final_output
+
+    _init()
+    try:
+        assert asyncio.run(go()) == "done"
+        spans = _spans()
+        _assert_three_turn_tree(spans, streamed=True)
+        _assert_counters_clean()
+    finally:
+        wardex.close()
+
+
+# --------------------------------------------------------------------------
+# tools
+# --------------------------------------------------------------------------
+
+
+def _decide_parallel(inp: object) -> list[dict]:
+    if _outputs_done(inp) == 0:
+        return [_fc("get_weather", "call_1", '{"city":"Seoul"}'), _fc("get_time", "call_2")]
+    return _DONE
+
+
+def _decide_twice_the_same(inp: object) -> list[dict]:
+    if _outputs_done(inp) == 0:
+        return [
+            _fc("get_weather", "call_1", '{"city":"Seoul"}'),
+            _fc("get_weather", "call_2", '{"city":"Seoul"}'),
+        ]
+    return _DONE
+
+
+def _two_tools() -> Agent:
+    from agents import function_tool
+
+    @function_tool
+    def get_weather(city: str) -> str:
+        return f"sunny in {city}"
+
+    @function_tool
+    def get_time() -> str:
+        return "12:00"
+
+    return Agent(
+        name="agent_a", instructions="a", tools=[get_weather, get_time], model="gpt-4o-mini"
+    )
+
+
+def test_parallel_tool_calls_keep_parent_confidence_at_one(agents_env, scenario):
+    """Two tools in one turn run in two tasks the framework created AFTER the
+    agent span started, so each inherits the agent's pin: both at
+    `unit_active` / 1.0 / no marker, with distinct call ids and the source
+    label, and not one refused pin."""
+    scenario(_decide_parallel)
+    _init()
+    try:
+        assert _run(_two_tools()).final_output == "done"
+        spans = _spans()
+        assert counters.get("adapters.openai_agents.pin_refused") == 0
+    finally:
+        wardex.close()
+    agent = _one(spans, "invoke_agent agent_a")
+    weather = _one(spans, "execute_tool get_weather")
+    clock = _one(spans, "execute_tool get_time")
+    for s in (weather, clock):
+        assert _edge(s) == (ParentSource.UNIT_ACTIVE, 1.0, ())
+        assert s.parent_span_id == agent.context.span_id
+        assert _extra(s)["wardex.openai_agents.tool_call_id_source"] == "response_output_match"
+    assert (weather.tool.call_id, clock.tool.call_id) == ("call_1", "call_2")
+
+
+def test_two_identical_tool_calls_in_one_response_get_no_guessed_id(agents_env, scenario):
+    scenario(_decide_twice_the_same)
+    _init()
+    try:
+        assert _run(_two_tools()).final_output == "done"
+        spans = _spans()
+        assert counters.get("adapters.openai_agents.tool_call_id_ambiguous") == 2
+    finally:
+        wardex.close()
+    tools = [s for s in spans if s.name == "execute_tool get_weather"]
+    assert len(tools) == 2
+    for s in tools:
+        assert s.tool.call_id is None
+        assert Limitation.TOOL_CALL_ID_UNAVAILABLE_IN_PROCESS in _edge(s)[2]
+        assert "wardex.openai_agents.tool_call_id_source" not in _extra(s)
+
+
+def test_an_http_call_inside_a_tool_handler_nests_under_the_tool_span(agents_env, scenario):
+    import httpx
+    from agents import function_tool
+
+    base, posts = agents_env
+    scenario(_decide_handoff_once)
+
+    @function_tool
+    def get_weather(city: str) -> str:
+        httpx.post(f"{base}/tool-side", json={"city": city})
+        return "sunny"
+
+    def decide(inp: object) -> list[dict]:
+        if _outputs_done(inp) == 0:
+            return [_fc("get_weather", "call_1", '{"city":"Seoul"}')]
+        return _DONE
+
+    scenario(decide)
+    agent = Agent(name="agent_a", instructions="a", tools=[get_weather], model="gpt-4o-mini")
+    _init()
+    try:
+        assert _run(agent).final_output == "done"
+        spans = _spans()
+    finally:
+        wardex.close()
+    tool = _one(spans, "execute_tool get_weather")
+    side = _one(spans, "HTTP POST /v1/tool-side")
+    assert side.parent_span_id == tool.context.span_id
+    assert _edge(side)[:2] == (ParentSource.CONTEXTVAR, 1.0)
+
+
+def test_an_agent_used_as_a_tool_nests_under_the_tool_span(agents_env, scenario):
+    """`agent.as_tool()` runs a nested `Runner.run` inside the tool task: the
+    inner `invoke_agent` is the tool span's child by context, and its failure
+    is the TOOL's (handled, non-fatal) — the outer agent and the root stay OK."""
+
+    def decide(inp: object) -> list[dict]:
+        items = inp if isinstance(inp, list) else []
+        if any(isinstance(x, dict) and x.get("content") == "INNER" for x in items):
+            return [_fc("no_such_tool", "call_x")]
+        if _outputs_done(inp) == 0:
+            return [_fc("helper_tool", "call_1", '{"input":"INNER"}')]
+        return _DONE
+
+    scenario(decide)
+    helper = Agent(name="helper", instructions="inner", model="gpt-4o-mini")
+    outer = Agent(
+        name="agent_a",
+        instructions="outer",
+        tools=[helper.as_tool(tool_name="helper_tool", tool_description="helps")],
+        model="gpt-4o-mini",
+    )
+    _init()
+    try:
+        assert _run(outer).final_output == "done"
+        spans = _spans()
+    finally:
+        wardex.close()
+    tool = _one(spans, "execute_tool helper_tool")
+    inner = _one(spans, "invoke_agent helper")
+    assert inner.parent_span_id == tool.context.span_id
+    assert _edge(inner) == (ParentSource.UNIT_ACTIVE, 1.0, ())
+    assert (tool.status, tool.error_type) == (StatusCode.ERROR, "tool_error_handled")
+    assert (inner.status, inner.error_type) == (StatusCode.ERROR, "model_behavior_error")
+    assert _one(spans, "invoke_agent agent_a").status is StatusCode.OK
+    assert _one(spans, "invoke_workflow Agent workflow").status is StatusCode.OK
+
+
+# --------------------------------------------------------------------------
+# guardrails
+# --------------------------------------------------------------------------
+
+
+def _guarded(*, where: str) -> Agent:
+    from agents import GuardrailFunctionOutput, input_guardrail, output_guardrail
+
+    @input_guardrail
+    async def block_input(ctx, agent, inp):  # noqa: ANN001, ANN202
+        return GuardrailFunctionOutput(output_info=None, tripwire_triggered=True)
+
+    @output_guardrail
+    async def block_output(ctx, agent, out):  # noqa: ANN001, ANN202
+        return GuardrailFunctionOutput(output_info=None, tripwire_triggered=True)
+
+    if where == "input":
+        return Agent(
+            name="agent_a", instructions="a", input_guardrails=[block_input], model="gpt-4o-mini"
+        )
+    return Agent(
+        name="agent_a", instructions="a", output_guardrails=[block_output], model="gpt-4o-mini"
+    )
+
+
+def _assert_tripwire(spans: list[Any], *, name: str, posts: int, made: int) -> None:
+    evaluate = _one(spans, f"evaluate {name}")
+    agent = _one(spans, "invoke_agent agent_a")
+    root = _one(spans, "invoke_workflow Agent workflow")
+    assert evaluate.parent_span_id == agent.context.span_id
+    assert _edge(evaluate) == (ParentSource.UNIT_ACTIVE, 1.0, ())
+    assert evaluate.evaluation.name == name and evaluate.evaluation.score_label == "tripwire"
+    assert _extra(evaluate)["wardex.evaluation.triggered"] is True
+    for s in (evaluate, agent, root):
+        assert (s.status, s.error_type) == (StatusCode.ERROR, "guardrail_tripwire")
+    assert len(_chat_spans(spans)) == posts == made
+
+
+def test_an_input_guardrail_tripwire_fails_the_agent_and_the_run(agents_env, scenario):
+    from agents.exceptions import InputGuardrailTripwireTriggered
+
+    base, posts = agents_env
+    scenario(_decide_single)
+    _init()
+    try:
+        with pytest.raises(InputGuardrailTripwireTriggered):
+            _run(_guarded(where="input"))
+        spans = _spans()
+    finally:
+        wardex.close()
+    # sequential by default: the model call never happened
+    _assert_tripwire(spans, name="block_input", posts=len(posts), made=0)
+
+
+def test_an_output_guardrail_tripwire_fails_the_agent_and_the_run(agents_env, scenario):
+    from agents.exceptions import OutputGuardrailTripwireTriggered
+
+    base, posts = agents_env
+    scenario(_decide_single)
+    _init()
+    try:
+        with pytest.raises(OutputGuardrailTripwireTriggered):
+            _run(_guarded(where="output"))
+        spans = _spans()
+    finally:
+        wardex.close()
+    _assert_tripwire(spans, name="block_output", posts=len(posts), made=1)
+
+
+def test_a_streamed_input_guardrail_tripwire_reaches_the_consumer(agents_env, scenario):
+    """The streamed loop runs input guardrails in parallel with the model
+    call, so the LLM call DID happen; the exception is raised from the
+    stream the host is draining."""
+    from agents.exceptions import InputGuardrailTripwireTriggered
+
+    base, posts = agents_env
+    scenario(_decide_single)
+
+    async def go() -> None:
+        result = Runner.run_streamed(_guarded(where="input"), "hi")
+        async for _ in result.stream_events():
+            pass
+
+    _init()
+    try:
+        with pytest.raises(InputGuardrailTripwireTriggered):
+            asyncio.run(go())
+        spans = _spans()
+    finally:
+        wardex.close()
+    _assert_tripwire(spans, name="block_input", posts=len(posts), made=1)
+
+
+# --------------------------------------------------------------------------
+# MCP list-tools
+# --------------------------------------------------------------------------
+
+
+def test_an_mcp_list_tools_span_carries_a_hash_and_never_a_name(agents_env, scenario):
+    from agents.mcp import MCPServer
+    from mcp.types import CallToolResult, Tool
+
+    class InProcess(MCPServer):
+        def __init__(self) -> None:
+            super().__init__()
+
+        @property
+        def name(self) -> str:
+            return "in-process"
+
+        async def connect(self) -> None:
+            return None
+
+        async def cleanup(self) -> None:
+            return None
+
+        async def list_tools(self, run_context=None, agent=None):  # noqa: ANN001, ANN202
+            return [Tool(name="secret_tool_name", inputSchema={"type": "object"})]
+
+        async def call_tool(self, tool_name, arguments, meta=None):  # noqa: ANN001, ANN202
+            return CallToolResult(content=[])
+
+        async def list_prompts(self):  # noqa: ANN202
+            raise NotImplementedError
+
+        async def get_prompt(self, name, arguments=None):  # noqa: ANN001, ANN202
+            raise NotImplementedError
+
+    scenario(_decide_single)
+    agent = Agent(name="agent_a", instructions="a", mcp_servers=[InProcess()], model="gpt-4o-mini")
+    _init()
+    try:
+        assert _run(agent).final_output == "done"
+        spans = _spans()
+        assert counters.get("adapters.openai_agents.active.mcp_list_tools") == 1
+    finally:
+        wardex.close()
+    step = _one(spans, "execute_step mcp.list_tools")
+    extra = _extra(step)
+    assert extra["wardex.step.name"] == "mcp.list_tools"
+    assert extra["wardex.openai_agents.mcp.server"] == "in-process"
+    assert extra["wardex.openai_agents.mcp.tools_count"] == 1
+    assert len(extra["wardex.openai_agents.mcp.tools_hash"]) == 16
+    for s in _adapter_spans(spans):
+        assert "secret_tool_name" not in repr(s.extra)
+        assert "secret_tool_name" not in s.name
+    # fired before the agent's first turn: the run root is its parent
+    assert step.parent_span_id == _one(spans, "invoke_workflow Agent workflow").context.span_id
+
+
+# --------------------------------------------------------------------------
+# extras: fixed arity per span kind
+# --------------------------------------------------------------------------
+
+
+def test_every_span_kind_writes_a_fixed_set_of_extras(agents_env):
+    """One more than the adapter wrote: the builder adds
+    `gen_ai.operation.name` itself. Every key is under a declared prefix or
+    is `wardex.framework` / `wardex.step.name` / `wardex.evaluation.*`."""
+    from wardex_sdk._adapters._openai_agents import FRAMEWORK_EXTRA_PREFIXES
+
+    _init()
+    try:
+        _run(_agents(), run_config=_run_config())
+        spans = _spans()
+    finally:
+        wardex.close()
+    expected = {
+        _ROOT: {
+            "wardex.framework",
+            "wardex.openai_agents.trace_id",
+            "wardex.openai_agents.turns",
+            "wardex.openai_agents.agents",
+        },
+        "invoke_agent agent_a": {
+            "wardex.framework",
+            "wardex.openai_agents.turns",
+            "wardex.openai_agents.tools_count",
+            "wardex.openai_agents.handoffs_count",
+            "wardex.openai_agents.last_response_id",
+        },
+        "handoff agent_a→agent_b": {
+            "wardex.framework",
+            "wardex.openai_agents.turn",
+            "wardex.openai_agents.response_id",
+        },
+        "execute_tool get_weather": {
+            "wardex.framework",
+            "wardex.openai_agents.turn",
+            "wardex.openai_agents.response_id",
+            "wardex.openai_agents.tool_call_id_source",
+        },
+    }
+    for name, keys in expected.items():
+        span = _one(spans, name)
+        assert set(_extra(span)) == keys | {"gen_ai.operation.name"}, name
+        assert len(span.extra) == len(keys) + 1, name
+        for key in keys:
+            assert key.startswith(FRAMEWORK_EXTRA_PREFIXES) or key in {
+                "wardex.framework",
+                "wardex.step.name",
+            }

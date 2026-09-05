@@ -187,7 +187,9 @@ _MEMBER_SITES: dict[str, frozenset[str]] = {
     # The two §5.4 markers, both on the in-process tool span: the handler is
     # never told the tool_use_id, and the two observers' key spaces can be split
     # or ambiguous in two narrow, detectable configurations.
-    "TOOL_CALL_ID_UNAVAILABLE_IN_PROCESS": frozenset({"_adapters/_anthropic_agent_sdk.py"}),
+    "TOOL_CALL_ID_UNAVAILABLE_IN_PROCESS": frozenset(
+        {"_adapters/_anthropic_agent_sdk.py", "_adapters/_openai_agents.py"}
+    ),
     "TOOL_NAME_COLLISION": frozenset({"_adapters/_anthropic_agent_sdk.py"}),
     "SNAPSHOT_TYPE_UNKNOWN": frozenset({"_assembly/_snapshot.py"}),
     "PATCH_SUPERSEDED": frozenset({"_assembly/_patchset.py"}),

@@ -89,6 +89,7 @@ then carries the marker and no join — the wire span is the only holder.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import importlib.metadata
 import os
 import threading
@@ -100,18 +101,21 @@ from typing import Any
 from .._assembly import (
     AgentAttributes,
     ConversationContext,
+    EvaluationAttributes,
     Limitation,
     LinkReason,
     SpanIntent,
+    ToolAttributes,
     UnitKey,
     UnitKind,
     counters,
     diag_info,
     report_once,
 )
-from .._enums import StatusCode
+from .._enums import StatusCode, ToolExecutionType, ToolType
 from ._base import AdapterInterface
 from ._context import AdapterContext, Placement, RunHandle
+from ._langgraph import _shaped_args
 
 _FRAMEWORK = "openai_agents"
 _DISTRIBUTION = "openai-agents"
@@ -639,6 +643,10 @@ def _start_handler(kind: str) -> Any | None:
         return _agent_start
     if kind == "TurnSpanData":
         return _turn_start
+    if kind == "FunctionSpanData":
+        return _function_start
+    if kind == "GuardrailSpanData":
+        return _guardrail_start
     return None
 
 
@@ -649,6 +657,14 @@ def _end_handler(kind: str) -> Any | None:
         return _turn_end
     if kind == "HandoffSpanData":
         return _handoff_end
+    if kind == "ResponseSpanData":
+        return _response_end
+    if kind == "FunctionSpanData":
+        return _function_end
+    if kind == "GuardrailSpanData":
+        return _guardrail_end
+    if kind == "MCPListToolsSpanData":
+        return _mcp_list_tools_end
     return None
 
 
@@ -967,6 +983,235 @@ def _turn_end(adapter: OpenAIAgentsAdapter, run: dict[str, Any], span: Any) -> N
     entry = live[-1]
     if entry.get("error") is None:
         entry["error"] = _classify_error(adapter, message)
+
+
+# -- the model call: no span, no usage -------------------------------------------
+
+
+def _response_end(adapter: OpenAIAgentsAdapter, run: dict[str, Any], span: Any) -> None:
+    """The wire owns the LLM call. What the framework's response span
+    contributes is the JOIN: the response id, and the function calls that
+    response requested, so the tool spans that follow can carry the call id
+    the wire span echoes in the next turn's input. `usage` is never read —
+    the same tokens are on the wire span, and two sources bill twice."""
+    ctx = adapter._ctx
+    if ctx is None:
+        return
+    sd = span.span_data
+    response = sd.response
+    calls: dict[tuple[str, str], list[str]] = {}
+    if response is None:
+        run["response_id"] = None
+        ctx.count("response_id_unavailable")
+    else:
+        rid = response.id
+        run["response_id"] = str(rid) if rid is not None else None
+        if rid is None:
+            ctx.count("response_id_unavailable")
+        for item in response.output or ():
+            if getattr(item, "type", None) != "function_call":
+                continue
+            key = (str(item.name), str(item.arguments))
+            calls.setdefault(key, []).append(str(item.call_id))
+    run["calls"] = calls
+
+
+# -- tools ---------------------------------------------------------------------
+
+
+def _function_start(adapter: OpenAIAgentsAdapter, run: dict[str, Any], span: Any) -> None:
+    """One `execute_tool`, pinned on the tool's OWN task — the framework runs
+    each tool call in a task of its own, created after the turn's response
+    arrived, so the pin lands where the handler's own HTTP calls will look.
+
+    The arguments are NOT on the span yet: the framework opens the span first
+    and stamps `input` on it afterwards, so the call id is recovered at the
+    END (`_function_end`). What is remembered here is the response that
+    requested this call — the run's current one — because a nested run
+    (agent-as-tool) may replace it before this span closes.
+    """
+    ctx = adapter._ctx
+    if ctx is None:
+        return
+    sd = span.span_data
+    name = str(sd.name)
+    turn = run.get("turn")
+    response_id = run.get("response_id")
+    driver = _driver()
+
+    def describe(h: RunHandle) -> None:
+        h.draft.set_tool(
+            ToolAttributes(
+                name=name, type=ToolType.FUNCTION, execution_type=ToolExecutionType.IN_PROCESS
+            )
+        )
+        h.draft.set_extra("wardex.framework", _FRAMEWORK)
+        if turn is not None:
+            h.draft.set_extra("wardex.openai_agents.turn", int(turn))
+        if response_id is not None:
+            h.draft.set_extra("wardex.openai_agents.response_id", str(response_id))
+
+    h = ctx.open_run(
+        UnitKind.CALL,
+        intent=SpanIntent.EXECUTE_TOOL,
+        placement=Placement.NESTED,
+        subject=name,
+        describe=describe,
+    )
+    stack = run.get("stack") or ()
+    if stack and not stack[-1]["pinned"]:
+        h.note(Limitation.CORRELATION_CONFLICT)
+    entry = ctx.slot(span)
+    entry["handle"] = h
+    entry["pinned"] = _pin(adapter, h, driver, name)
+    entry["kind"] = "tool"
+    entry["name"] = name
+    entry["calls"] = run.get("calls") or {}
+    ctx.confirm_active("tool")
+
+
+def _function_end(adapter: OpenAIAgentsAdapter, run: dict[str, Any], span: Any) -> None:
+    """The call id: an EXACT and UNIQUE `(name, arguments)` match against the
+    response that requested the call. One match is the id, labelled at the
+    source; two identical requests in one response are AMBIGUOUS and get the
+    marker rather than a guess; no match at all (sensitive data off, or a
+    tool the response did not request) gets the marker too.
+    """
+    ctx = adapter._ctx
+    if ctx is None:
+        return
+    entry = ctx.slot(span)
+    h = entry.get("handle")
+    if h is None:
+        ctx.count("tool_end_unmatched")
+        return
+    sd = span.span_data
+    name = str(entry.get("name"))
+    raw_input = sd.input
+    calls = entry.get("calls") or {}
+    ids = calls.get((name, str(raw_input)), []) if raw_input is not None else []
+    call_id = ids[0] if len(ids) == 1 else None
+    mcp = sd.mcp_data
+    execution = ToolExecutionType.IPC if isinstance(mcp, dict) else ToolExecutionType.IN_PROCESS
+    h.draft.set_tool(
+        ToolAttributes(name=name, call_id=call_id, type=ToolType.FUNCTION, execution_type=execution)
+    )
+    if isinstance(mcp, dict) and mcp.get("server") is not None:
+        h.draft.set_extra("wardex.openai_agents.mcp.server", str(mcp["server"]))
+    if call_id is not None:
+        h.draft.set_extra("wardex.openai_agents.tool_call_id_source", "response_output_match")
+    else:
+        h.note(Limitation.TOOL_CALL_ID_UNAVAILABLE_IN_PROCESS)
+        ctx.count("tool_call_id_ambiguous" if len(ids) > 1 else "tool_call_id_unmatched")
+    budget = ctx.record_budget
+    if raw_input is not None:
+        h.record_input(_shaped_args(raw_input, budget))
+    output = sd.output
+    if output is not None:
+        h.record_output(_shaped_args(output, budget))
+    message = _error_message(span)
+    if message is not None:
+        error_type, _fatal = _classify_error(adapter, message)
+        h.close(status=StatusCode.ERROR, error_type=error_type)
+    else:
+        h.close()
+    _unpin(adapter, h)
+    entry["handle"] = None
+
+
+# -- guardrails ----------------------------------------------------------------
+
+
+def _guardrail_start(adapter: OpenAIAgentsAdapter, run: dict[str, Any], span: Any) -> None:
+    ctx = adapter._ctx
+    if ctx is None:
+        return
+    sd = span.span_data
+    name = str(sd.name)
+    driver = _driver()
+
+    def describe(h: RunHandle) -> None:
+        h.draft.set_evaluation(EvaluationAttributes(name=name))
+        h.draft.set_extra("wardex.framework", _FRAMEWORK)
+
+    h = ctx.open_run(
+        UnitKind.CALL,
+        intent=SpanIntent.EVALUATE,
+        placement=Placement.NESTED,
+        subject=name,
+        describe=describe,
+    )
+    stack = run.get("stack") or ()
+    if stack and not stack[-1]["pinned"]:
+        h.note(Limitation.CORRELATION_CONFLICT)
+    entry = ctx.slot(span)
+    entry["handle"] = h
+    entry["pinned"] = _pin(adapter, h, driver, name)
+    entry["kind"] = "guardrail"
+    entry["name"] = name
+    ctx.confirm_active("guardrail")
+
+
+def _guardrail_end(adapter: OpenAIAgentsAdapter, run: dict[str, Any], span: Any) -> None:
+    ctx = adapter._ctx
+    if ctx is None:
+        return
+    entry = ctx.slot(span)
+    h = entry.get("handle")
+    if h is None:
+        ctx.count("guardrail_end_unmatched")
+        return
+    sd = span.span_data
+    triggered = bool(sd.triggered)
+    name = str(sd.name)
+    h.draft.set_evaluation(
+        EvaluationAttributes(name=name, score_label="tripwire" if triggered else "pass")
+    )
+    h.draft.set_extra("wardex.evaluation.triggered", triggered)
+    if triggered:
+        h.close(status=StatusCode.ERROR, error_type="guardrail_tripwire")
+    else:
+        h.close()
+    _unpin(adapter, h)
+    entry["handle"] = None
+
+
+# -- MCP list-tools --------------------------------------------------------------
+
+
+def _mcp_list_tools_end(adapter: OpenAIAgentsAdapter, run: dict[str, Any], span: Any) -> None:
+    """A step, at the framework's own instants, carrying a HASH and a count of
+    the tool names — never the names, which are the server's catalogue and
+    not this run's data."""
+    ctx = adapter._ctx
+    if ctx is None or not adapter._mcp:
+        return
+    sd = span.span_data
+    server = str(sd.server) if sd.server is not None else None
+    names = sorted(str(n) for n in (sd.result or ()))
+    digest = hashlib.sha256("\n".join(names).encode("utf-8")).hexdigest()[:16]
+    count = len(names)
+    start_ns = None
+    with ctx.guard("mcp_started_at"):
+        start_ns = _started_ns(span)
+
+    def describe(h: RunHandle) -> None:
+        h.draft.set_extra("wardex.step.name", "mcp.list_tools")
+        h.draft.set_extra("wardex.framework", _FRAMEWORK)
+        h.draft.set_extra("wardex.openai_agents.mcp.server", server if server is not None else "")
+        h.draft.set_extra("wardex.openai_agents.mcp.tools_hash", digest)
+        h.draft.set_extra("wardex.openai_agents.mcp.tools_count", count)
+
+    h = ctx.open_run(
+        UnitKind.STEP,
+        intent=SpanIntent.EXECUTE_STEP,
+        placement=Placement.NESTED,
+        subject="mcp.list_tools",
+        start_ns=start_ns,
+        describe=describe,
+    )
+    h.close()
+    ctx.confirm_active("mcp_list_tools")
 
 
 # -- failure mapping ---------------------------------------------------------------
