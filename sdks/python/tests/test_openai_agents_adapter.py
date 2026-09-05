@@ -339,7 +339,12 @@ def test_a_processor_removed_after_init_is_reported_once_at_uninstall(agents_env
 
 
 def test_install_is_idempotent_and_uninstall_restores_the_tuple_by_identity(agents_env):
+    """One host processor is seeded first: from an empty list `before` would
+    be CPython's empty-tuple singleton, which any fresh `tuple([])` also is,
+    and the `is` check at the end would pass a copy."""
+    set_trace_processors([_HostProcessor()])
     before = _processors()
+    assert before != ()
     with installed_adapter(OpenAIAgentsAdapter) as live:
         during = _processors()
         assert during is not before

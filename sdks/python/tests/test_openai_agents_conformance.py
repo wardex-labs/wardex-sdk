@@ -28,7 +28,7 @@ import pytest
 from agents import Agent, RunConfig, Runner, function_tool
 from agents.items import ModelResponse
 from agents.models.interface import Model
-from agents.tracing import get_trace_provider, set_trace_processors
+from agents.tracing import TracingProcessor, get_trace_provider, set_trace_processors
 from agents.usage import Usage
 from openai.types.responses import (
     ResponseFunctionToolCall,
@@ -105,14 +105,39 @@ def _agents(get_weather: Any) -> Agent:
     return Agent(name="agent_a", instructions="a", handoffs=[agent_b], model=FakeModel())
 
 
+class _HostProcessor(TracingProcessor):
+    """A processor the host registered before wardex: inert, and there so the
+    tuple the seam check compares by identity is never CPython's empty-tuple
+    singleton, which a fresh `tuple([])` would also be."""
+
+    def on_trace_start(self, trace: Any) -> None:
+        return None
+
+    def on_trace_end(self, trace: Any) -> None:
+        return None
+
+    def on_span_start(self, span: Any) -> None:
+        return None
+
+    def on_span_end(self, span: Any) -> None:
+        return None
+
+    def shutdown(self, timeout: float | None = None) -> None:
+        return None
+
+    def force_flush(self) -> None:
+        return None
+
+
 @pytest.fixture(autouse=True)
 def _wardex_only_processors():
     """The framework's default processor would POST the run record to the real
-    API. Every run here starts from an EMPTY processor list and the original
-    tuple is put back afterwards."""
+    API. Every run here starts from a list holding ONE inert host processor
+    (see `_HostProcessor` for why not none) and the original tuple is put
+    back afterwards."""
     provider = get_trace_provider()
     before = provider._multi_processor._processors
-    set_trace_processors([])
+    set_trace_processors([_HostProcessor()])
     yield
     provider.set_processors(before)
 
