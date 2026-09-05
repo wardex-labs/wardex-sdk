@@ -1314,6 +1314,62 @@ def test_a_refused_agent_pin_marks_every_child_the_adapter_opens_under_it(
     assert len(notices) == 1 and "spans under agent_a carry" in notices[0], notices
 
 
+def test_a_refused_agent_pin_marks_the_mcp_list_tools_step_under_it(
+    agents_env, scenario, monkeypatch
+):
+    """The fifth child site. A nested agent (agent-as-tool) with an MCP
+    server lists its tools while the OUTER agent is current, so with the
+    outer agent's pin refused the `execute_step mcp.list_tools` it opens
+    carries `correlation_conflict` like every other child — the one site
+    that used to forget the marker, and the reason all five now open through
+    one helper."""
+    from wardex_sdk._adapters import _openai_agents
+    from wardex_sdk._assembly._diag import reset_reports_for_test
+
+    reset_reports_for_test()
+
+    def decide(inp: object) -> list[dict]:
+        items = inp if isinstance(inp, list) else []
+        if any(isinstance(x, dict) and x.get("content") == "INNER" for x in items):
+            return _DONE
+        if "helper_tool" not in _calls_made(inp):
+            return [_fc("helper_tool", "call_1", '{"input":"INNER"}')]
+        return _DONE
+
+    scenario(decide)
+    real_start = _openai_agents._agent_start
+
+    def foreign_for_agent_a(adapter: Any, run: Any, span: Any) -> None:
+        if span.span_data.name != "agent_a":
+            real_start(adapter, run, span)
+            return
+        with monkeypatch.context() as m:
+            m.setattr(_openai_agents, "_driver", lambda: object())
+            real_start(adapter, run, span)
+
+    monkeypatch.setattr(_openai_agents, "_agent_start", foreign_for_agent_a)
+    helper = Agent(
+        name="helper", instructions="inner", mcp_servers=[_in_process_mcp()], model="gpt-4o-mini"
+    )
+    agent_a = Agent(
+        name="agent_a",
+        instructions="a",
+        tools=[helper.as_tool(tool_name="helper_tool", tool_description="helps")],
+        model="gpt-4o-mini",
+    )
+    _init()
+    try:
+        assert _run(agent_a).final_output == "done"
+        spans = _spans()
+        assert counters.get("adapters.openai_agents.pin_refused") == 1
+    finally:
+        wardex.close()
+    step = _one(spans, "execute_step mcp.list_tools")
+    assert Limitation.CORRELATION_CONFLICT in _edge(step)[2], _edge(step)
+    for name in ("execute_tool helper_tool", "invoke_agent helper"):
+        assert Limitation.CORRELATION_CONFLICT in _edge(_one(spans, name))[2], name
+
+
 def test_sensitive_data_off_leaves_the_marker_and_no_join_on_the_tool_span(agents_env):
     """`RunConfig(trace_include_sensitive_data=False)`: the framework strips
     the response and the tool arguments from its own spans, so the call id
@@ -1636,7 +1692,8 @@ def test_a_guardrail_whose_body_raises_is_an_error_not_a_pass(agents_env, scenar
 # --------------------------------------------------------------------------
 
 
-def test_an_mcp_list_tools_span_carries_a_hash_and_never_a_name(agents_env, scenario):
+def _in_process_mcp():  # noqa: ANN202
+    """An MCP server that lists ONE tool and never leaves the process."""
     from agents.mcp import MCPServer
     from mcp.types import CallToolResult, Tool
 
@@ -1666,8 +1723,14 @@ def test_an_mcp_list_tools_span_carries_a_hash_and_never_a_name(agents_env, scen
         async def get_prompt(self, name, arguments=None):  # noqa: ANN001, ANN202
             raise NotImplementedError
 
+    return InProcess()
+
+
+def test_an_mcp_list_tools_span_carries_a_hash_and_never_a_name(agents_env, scenario):
     scenario(_decide_single)
-    agent = Agent(name="agent_a", instructions="a", mcp_servers=[InProcess()], model="gpt-4o-mini")
+    agent = Agent(
+        name="agent_a", instructions="a", mcp_servers=[_in_process_mcp()], model="gpt-4o-mini"
+    )
     _init()
     try:
         assert _run(agent).final_output == "done"

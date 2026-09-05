@@ -779,14 +779,41 @@ def _pin(adapter: OpenAIAgentsAdapter, handle: RunHandle, driver: object, subjec
     return ok
 
 
-def _note_refused_pin(handle: RunHandle) -> None:
-    """The adapter's half of a refused agent pin: a child opened while that
-    agent is current hangs under whatever IS ambient — the session, or an
-    earlier agent — at 1.0, so the child says the edge is not what it looks
-    like. The registry marks only the refused unit itself."""
+def _open_child(
+    ctx: AdapterContext,
+    kind: UnitKind,
+    *,
+    intent: SpanIntent,
+    subject: str,
+    site: str,
+    describe: Any,
+    start_ns: int | None = None,
+) -> RunHandle:
+    """The ONE way a child unit opens under a run — agent, handoff marker,
+    tool, guardrail, MCP step alike — so that a sixth site cannot forget
+    what every child owes.
+
+    What every child owes is the adapter's half of a refused agent pin: a
+    child opened while that agent is current hangs under whatever IS
+    ambient — the session, or an earlier agent — at 1.0, so the child says
+    the edge is not what it looks like. The registry marks only the refused
+    unit itself. This used to be a four-line check copied at four of five
+    sites; the fifth (the MCP list-tools step) had none. `confirm_active`
+    is here for the same reason: a site that opens is a site that counts.
+    """
+    h = ctx.open_run(
+        kind,
+        intent=intent,
+        placement=Placement.NESTED,
+        subject=subject,
+        start_ns=start_ns,
+        describe=describe,
+    )
     current = _CURRENT_AGENT.get()
     if current is not None and not current.get("pinned", True):
-        handle.note(Limitation.CORRELATION_CONFLICT)
+        h.note(Limitation.CORRELATION_CONFLICT)
+    ctx.confirm_active(site)
+    return h
 
 
 def _unpin(adapter: OpenAIAgentsAdapter, handle: RunHandle) -> None:
@@ -916,14 +943,14 @@ def _agent_start(adapter: OpenAIAgentsAdapter, run: dict[str, Any], span: Any) -
         if key is not None:
             h.link(LinkReason.HANDOFF_FROM, key)
 
-    h = ctx.open_run(
+    h = _open_child(
+        ctx,
         UnitKind.AGENT,
         intent=SpanIntent.INVOKE_AGENT,
-        placement=Placement.NESTED,
         subject=name,
+        site="agent",
         describe=describe,
     )
-    _note_refused_pin(h)
     pinned = _pin(adapter, h, driver, name)
     entry = ctx.slot(span)
     entry["handle"] = h
@@ -939,7 +966,6 @@ def _agent_start(adapter: OpenAIAgentsAdapter, run: dict[str, Any], span: Any) -
     entry["handoff_out"] = None
     _CURRENT_AGENT.set(entry)
     run["agent_count"] = int(run.get("agent_count") or 0) + 1
-    ctx.confirm_active("agent")
 
 
 def _agent_end(adapter: OpenAIAgentsAdapter, run: dict[str, Any], span: Any) -> None:
@@ -1027,19 +1053,19 @@ def _handoff_end(adapter: OpenAIAgentsAdapter, run: dict[str, Any], span: Any) -
                 h.alias(key, remember=True)
                 key_holder.append(key)
 
-    h = ctx.open_run(
-        UnitKind.CALL,
-        intent=SpanIntent.HANDOFF,
-        placement=Placement.NESTED,
-        subject=subject,
-        start_ns=start_ns,
-        describe=describe,
-    )
     # The marker opens on the sender's task. When the sender's pin was refused
     # it is not ambient there, so the marker hangs under whatever is (the
     # session, or an earlier agent) at 1.0 — the same misparenting the tool
-    # and guardrail children get, and it carries the same marker.
-    _note_refused_pin(h)
+    # and guardrail children get, and `_open_child` gives it the same marker.
+    h = _open_child(
+        ctx,
+        UnitKind.CALL,
+        intent=SpanIntent.HANDOFF,
+        subject=subject,
+        site="handoff",
+        describe=describe,
+        start_ns=start_ns,
+    )
     if to is None:
         h.close(status=StatusCode.ERROR, error_type="handoff_error")
         ctx.count("handoff_unresolved")
@@ -1056,7 +1082,6 @@ def _handoff_end(adapter: OpenAIAgentsAdapter, run: dict[str, Any], span: Any) -
             sender["handoff_out"] = (frm, to, key_holder[0])
         elif key_holder:
             ctx.count("handoff_without_agent")
-    ctx.confirm_active("handoff")
 
 
 # -- turns -----------------------------------------------------------------------
@@ -1178,21 +1203,20 @@ def _function_start(adapter: OpenAIAgentsAdapter, run: dict[str, Any], span: Any
         if response_id is not None:
             h.draft.set_extra("wardex.openai_agents.response_id", str(response_id))
 
-    h = ctx.open_run(
+    h = _open_child(
+        ctx,
         UnitKind.CALL,
         intent=SpanIntent.EXECUTE_TOOL,
-        placement=Placement.NESTED,
         subject=name,
+        site="tool",
         describe=describe,
     )
-    _note_refused_pin(h)
     entry = ctx.slot(span)
     entry["handle"] = h
     entry["pinned"] = _pin(adapter, h, driver, name)
     entry["kind"] = "tool"
     entry["name"] = name
     entry["calls"] = (agent.get("calls") if agent is not None else None) or {}
-    ctx.confirm_active("tool")
 
 
 def _function_end(adapter: OpenAIAgentsAdapter, run: dict[str, Any], span: Any) -> None:
@@ -1279,20 +1303,19 @@ def _guardrail_start(adapter: OpenAIAgentsAdapter, run: dict[str, Any], span: An
         h.draft.set_evaluation(EvaluationAttributes(name=name))
         h.draft.set_extra("wardex.framework", _FRAMEWORK)
 
-    h = ctx.open_run(
+    h = _open_child(
+        ctx,
         UnitKind.CALL,
         intent=SpanIntent.EVALUATE,
-        placement=Placement.NESTED,
         subject=name,
+        site="guardrail",
         describe=describe,
     )
-    _note_refused_pin(h)
     entry = ctx.slot(span)
     entry["handle"] = h
     entry["pinned"] = _pin(adapter, h, driver, name)
     entry["kind"] = "guardrail"
     entry["name"] = name
-    ctx.confirm_active("guardrail")
 
 
 def _guardrail_end(adapter: OpenAIAgentsAdapter, run: dict[str, Any], span: Any) -> None:
@@ -1364,16 +1387,16 @@ def _mcp_list_tools_end(adapter: OpenAIAgentsAdapter, run: dict[str, Any], span:
         h.draft.set_extra("wardex.openai_agents.mcp.tools_hash", digest)
         h.draft.set_extra("wardex.openai_agents.mcp.tools_count", count)
 
-    h = ctx.open_run(
+    h = _open_child(
+        ctx,
         UnitKind.STEP,
         intent=SpanIntent.EXECUTE_STEP,
-        placement=Placement.NESTED,
         subject="mcp.list_tools",
-        start_ns=start_ns,
+        site="mcp_list_tools",
         describe=describe,
+        start_ns=start_ns,
     )
     h.close()
-    ctx.confirm_active("mcp_list_tools")
 
 
 # -- failure mapping ---------------------------------------------------------------
