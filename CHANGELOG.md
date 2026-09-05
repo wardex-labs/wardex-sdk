@@ -14,8 +14,10 @@ All notable changes to this project are documented here. The format follows
   `@wardex.workflow` span that request shipped as one extra
   `HTTP POST /v1/traces/ingest` span whose `input_data` was the entire
   record. Any host, any path ending in `/v1/traces/ingest` is now skipped
-  before a body is parsed or retained, and counted under
-  `interceptors.seam.path_excluded`.
+  before the body is parsed or attached to a span — the bytes still pass
+  through the per-connection buffer, capped by
+  `CaptureLimits.max_body_bytes`, and are discarded unparsed — and counted
+  under `interceptors.seam.path_excluded`.
 - **A Responses output item that is not the model's is no longer exported as
   the assistant's.** `gen_ai.output.messages` keeps each output `message`
   item's own `role`; a `POST /v1/responses/compact` result (the caller's
@@ -167,8 +169,10 @@ All notable changes to this project are documented here. The format follows
   is OpenAI's or the first client message is a Responses `response.create` —
   wardex counts it under `interceptors.seam.ws_llm_semantics_unread`
   immediately, and emits one `WS /v1/responses` span per connection **when
-  the connection closes** (marked `ws_no_close` if wardex is uninstalled
-  first), under the default mode, marked `ws_llm_semantics_unread`
+  the connection closes** (marked `ws_no_close` if the connection ends
+  without a WebSocket close handshake — a server drop, a timeout, process
+  exit — or wardex is uninstalled first), under the default mode, marked
+  `ws_llm_semantics_unread`
   (vocabulary 48): LLM calls crossed it and wardex read none of their
   meaning. The span carries `ws.messages.sent` (about one per call), byte
   counts and payload samples — compressed bytes, marked `payload_compressed`,
@@ -196,8 +200,9 @@ All notable changes to this project are documented here. The format follows
   final answer) on both `Runner.run` and `Runner.run_streamed` is pinned on
   the wire — three `chat` spans with tokens, the tool `call_id` restored into
   the next turn's input, the export-time name `chat <model>`, and the
-  framework's run-record upload excluded and counted. Only 0.22 is measured;
-  the pin says why.
+  framework's run-record upload excluded and counted; a `conversation_id`
+  run pins the delta-input shape above. Only 0.22 is measured; the pin says
+  why.
 - **The LLM-semantic parse runs off the caller's thread.** A completed
   transaction is now SEALED on the thread that carried its bytes (timing,
   prefilter, context snapshot — microseconds) and finished on a dedicated
@@ -463,13 +468,17 @@ All notable changes to this project are documented here. The format follows
 
 ### Known ecosystem findings (not wardex defects)
 
-- **openai-agents `Runner.run(conversation_id=…)`:** each turn is still a
-  `chat` span, but its `gen_ai.input.messages` holds only the delta the
-  framework sent and the `conversation` id that joins the turns is not yet a
-  span attribute. The default `Runner.run` (no `conversation_id`, no
-  `previous_response_id`) resends the full input every turn, so nothing is
-  missing there; the join key across turns is the tool `call_id` echoed in
-  the next input, which is restored.
+- **openai-agents `Runner.run(conversation_id=…)`** (measured on 0.22 in
+  `tests/test_openai_agents_wire.py`): each turn is still a `chat` span, but
+  every request carries `conversation` and only the items the framework has
+  not sent yet — turn two is the tool result alone, turn three the handoff
+  result alone — so `gen_ai.input.messages` holds that delta, and the
+  `conversation` id that joins the turns is not yet a span attribute. The
+  framework never calls the Conversations API itself on this path: all three
+  POSTs are `/v1/responses`. The default `Runner.run` (no `conversation_id`,
+  no `previous_response_id`) resends the full input every turn, so nothing
+  is missing there; the join key across turns is the tool `call_id` echoed
+  in the next input, which is restored.
 - **OpenAI Realtime (`wss://…/v1/realtime`) is still silently dropped outside
   a local span:** its path is not a WebSocket-capable row in the endpoint
   table, so the marker above does not apply to it.

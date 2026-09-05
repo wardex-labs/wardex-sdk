@@ -629,9 +629,11 @@ class ByteSeamInterceptor(InterceptorInterface):
             # A telemetry upload (the OpenAI Agents SDK POSTs its whole run
             # record to /v1/traces/ingest). Not wardex's to copy: skipped in
             # every mode and above the allowlist, before any parse is queued
-            # or body retained — counted, not spanned. Does not consume the
-            # fork latch: the marker belongs on the first transaction that
-            # becomes a span.
+            # or the body attached to a span — counted, not spanned. The
+            # tracker has already buffered the body (capped by max_body_bytes)
+            # by the time a `_Txn` exists; dropping the `_Txn` here is what
+            # discards it. Does not consume the fork latch: the marker belongs
+            # on the first transaction that becomes a span.
             counters.bump("interceptors.seam.path_excluded")
             return None
         if st.reset_at_fork:

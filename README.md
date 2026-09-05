@@ -344,8 +344,11 @@ and once the first call crosses that connection wardex counts it
 (`interceptors.seam.ws_llm_semantics_unread`) and, when the connection
 closes, emits one `WS /v1/responses` span under the default mode marked
 `ws_llm_semantics_unread` — LLM calls crossed it and wardex read none of
-them, because Responses events inside WebSocket frames are not parsed. The
-span carries `ws.messages.sent` (about one per call), byte counts and
+them, because Responses events inside WebSocket frames are not parsed. (A
+connection that ends without a WebSocket close handshake — a server drop, a
+timeout, process exit, or wardex uninstalled first — still yields the span,
+additionally marked `ws_no_close`.) The span carries `ws.messages.sent`
+(about one per call), byte counts and
 payload samples (compressed bytes, marked `payload_compressed`, when
 permessage-deflate was negotiated), no model or tokens; switch the framework
 to its default HTTP transport for `gen_ai` spans. The connection is treated
@@ -371,16 +374,22 @@ telemetry uploads.** Any host, any path ending in `/v1/traces/ingest` — the
 OpenAI Agents SDK POSTs its whole run record there by default, and the rule
 is by path so a custom exporter endpoint is covered too. That body is yours
 on its way to a tracing backend, not agent activity, so wardex skips the
-request before parsing or retaining anything and counts the skip under
-`interceptors.seam.path_excluded`. If your own service exposes that path,
-its requests are skipped by the same rule. Server-side conversation state
+request before parsing it or attaching it to a span, and counts the skip
+under `interceptors.seam.path_excluded`. To be precise about where that
+body goes: the bytes pass through wardex's per-connection buffer like any
+other request's (capped by `CaptureLimits.max_body_bytes`), and are then
+discarded — never parsed, never on a span, never exported. If your own
+service exposes that path, its requests are skipped by the same rule.
+Server-side conversation state
 (`…/v1/conversations/…`) is plain HTTP rather than an LLM call — no model,
 no usage — so it follows the non-LLM rule above: captured inside a local
 span, under `ALL` or under `intercept_hosts`, otherwise dropped and counted
-under `interceptors.seam.provider_state_dropped`. With
-`Runner.run(conversation_id=…)` each turn is still a `chat` span, but its
-input is the delta the framework sent and the `conversation` id that joins
-the turns is not yet surfaced as a span attribute.
+under `interceptors.seam.provider_state_dropped`. With the OpenAI Agents
+SDK's `Runner.run(conversation_id=…)` (measured on 0.22) each turn is still
+a `chat` span, but its input is only the items the framework had not sent
+yet — the second turn's input is the tool result alone — and the
+`conversation` id that joins the turns is not yet surfaced as a span
+attribute.
 
 ## asyncio
 
@@ -600,8 +609,12 @@ diagnostic line (traceback under `debug=True`).
   `create_agent` compiles to a `Pregel` graph
 - Framework adapter for the OpenAI Agents SDK — its Responses calls (HTTP
   and SSE) are already captured with no adapter, tool-call ids included; the
-  adapter adds `invoke_agent`/`handoff` spans, the `conversation` id, and the
-  WebSocket transport's semantics
+  adapter adds `invoke_agent`/`handoff` spans and the `conversation` id,
+  read from the framework's Python objects. It does not read Responses
+  events inside WebSocket frames: that transport stays a counted, marked
+  connection (see `capture_mode`), by decision — under the adapter, a
+  WebSocket run's model, tokens and messages would come from those same
+  framework objects, never from the frames
 - Node/TS and Java SDKs
 
 **Notes**
