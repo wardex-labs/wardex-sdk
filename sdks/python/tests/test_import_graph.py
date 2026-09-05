@@ -1105,6 +1105,10 @@ _CS4_BUDGET = {
     # is how the stdlib spells "the carrier here is the thread".
     "_adapters/_anthropic_agent_sdk.py": 2,
     "_adapters/_assembler.py": 2,
+    # One: `import agents.tracing` inside `_import_agents_tracing`, the absent
+    # framework being the answer install() asks for. The distribution probe
+    # before it is written without an exception path on purpose.
+    "_adapters/_openai_agents.py": 1,
     # Two, and the same justification as the adapter above: both are ABSENCES
     # rather than failures. `_import_pregel` asks "is langgraph installed" and
     # `_import_toolnode` asks "is langgraph-prebuilt installed" — a separately

@@ -67,6 +67,12 @@ def _langgraph() -> AdapterInterface:
     return LangGraphAdapter()
 
 
+def _openai_agents() -> AdapterInterface:
+    from ._openai_agents import OpenAIAgentsAdapter
+
+    return OpenAIAgentsAdapter()
+
+
 #: Every adapter this SDK ships, in install order. Adding one is this row plus
 #: its module — nothing else in this file, and no branch anywhere.
 _ADAPTERS: dict[AdapterName, _Registration] = {
@@ -74,6 +80,7 @@ _ADAPTERS: dict[AdapterName, _Registration] = {
         "claude_agent_sdk", _anthropic_agent_sdk, attrgetter("anthropic_agent_sdk")
     ),
     AdapterName.LANGGRAPH: _Registration("langgraph", _langgraph),
+    AdapterName.OPENAI_AGENTS: _Registration("agents", _openai_agents),
 }
 
 #: AdapterName -> distribution package to probe for auto-detection. DERIVED from

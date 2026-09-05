@@ -49,13 +49,15 @@ class AdapterName(Enum):
     support before their adapter existed, so selecting one installed nothing
     at all, in silence. They were removed rather than answered with None — a
     name that cannot be spelled needs no validation — and each returns as a
-    member when its adapter ships. The value is `adapter.name()` verbatim and
+    member when its adapter ships. `OPENAI_AGENTS` has returned; only
+    `LANGCHAIN` remains absent. The value is `adapter.name()` verbatim and
     doubles as the per-adapter field name on `AdaptersConfig`: one identifier
     per adapter, held to the registration table by a registry test.
     """
 
     ANTHROPIC_AGENT_SDK = "anthropic_agent_sdk"
     LANGGRAPH = "langgraph"
+    OPENAI_AGENTS = "openai_agents"
 
 
 class InterceptorName(Enum):

@@ -1,0 +1,645 @@
+"""Adapter for the OpenAI Agents SDK (PyPI: openai-agents, module `agents`).
+
+THE TREE COMES FROM THE CONTEXT, NOT FROM AN IDENTIFIER — and here the claim
+is carried by the framework's OFFICIAL hook rather than by a patch. The
+framework's `TracingProcessor` callbacks run synchronously on the task that
+opened the span, and every task the framework spawns — the first turn's
+model task, one task per parallel tool call, one per guardrail — is created
+with `asyncio.create_task` AFTER the enclosing agent span started, so it
+inherits whatever wardex made ambient on the opening task. A unit pinned at
+`on_span_start` and unpinned at `on_span_end` therefore reaches every child
+span, every tool body and every HTTP request underneath at confidence 1.0,
+and the framework's own `span_id`/`parent_id` are never consulted for the
+shape of the tree. A test asserts over this file's own source that the
+identifier-rejoining verbs appear nowhere in it.
+
+What the wire already shows, measured on openai-agents 0.22 with no adapter:
+a three-turn run (tool call, handoff, final answer) is three parentless
+`chat gpt-4o-mini` spans. No agent name, no handoff, no tool span. This
+adapter adds the STRUCTURE — one `invoke_workflow` per `Runner.run` /
+`run_sync` / `run_streamed`, one `invoke_agent` per agent, a `handoff`
+MARKER with the receiving agent as a SIBLING, one `execute_tool` per
+function tool with the tool call id recovered so the tool span joins the
+turn that requested it, and one `evaluate` per guardrail — while the wire
+keeps owning the LLM call: the framework's response span carries usage and
+the wire span carries usage, and the adapter DISCARDS the framework's copy
+rather than billing a token twice. The join between the two is evidence
+only: `gen_ai.response.id` on the wire span, `wardex.openai_agents.
+response_id` on the adapter's tool and handoff spans.
+
+Hook decision, recorded rather than revisited. The official processor is a
+public, stable surface and its parentage was measured; the internal run loop
+(`run_single_turn`, `execute_handoffs`) already moved once between releases
+and now exists as two copies — non-streamed and streamed — with subtly
+different span placement, so a patch there would break silently on the next
+move and would have to be written twice. Internal patching is therefore
+REJECTED; the re-examination condition is a release in which the official
+hook loses structural information the internals still carry. When the
+framework's tracing is disabled the hook is silent; the adapter says so ONCE
+at install, as an INFO line with the two-line recipe that enables tracing
+without sending anything to OpenAI, and offers no `force_tracing` option —
+replacing the host's processor list is a host-behaviour change this SDK's
+own rules forbid an adapter to make.
+
+Seams, and the shape each forces:
+
+* `on_trace_start` / `on_trace_end` — the run. `open_run` + `pin` on the
+  task that fired the callback; `unpin` + `close` at the end. A `group_id`
+  becomes `gen_ai.conversation.id` on every span underneath, handed to the
+  registry at the open so children and the pinned carrier inherit it.
+* `AgentSpanData` — one `invoke_agent`, pinned for the span's lifetime.
+  The receiver of a handoff opens AFTER the sender closed (the framework
+  finishes the sender's span before starting the receiver's), so it opens
+  under the run's pin and is the sender's sibling; it carries
+  `parent_agent` and a `HANDOFF_FROM` link to the marker.
+* `HandoffSpanData` — opened at END (the target is known only then), closed
+  at once, at the framework's own start instant. A marker, never a container.
+* `TurnSpanData` — no span. The turn number is an attribute on what the turn
+  contained, and a turn's error is folded onto the agent that ran it.
+* `ResponseSpanData` — no span, no usage. The response id and the function
+  calls it requested are remembered for the tool spans that follow.
+* `FunctionSpanData` — `execute_tool`, pinned on the tool's own task so an
+  HTTP call inside the handler nests under it. The call id is recovered by
+  an EXACT and UNIQUE `(name, arguments)` match against the response that
+  requested it, labelled at the source; anything less than unique ships the
+  `tool_call_id_unavailable_in_process` marker instead of a guess.
+* `GuardrailSpanData` — `evaluate`, `score_label` pass/tripwire, ERROR with
+  `guardrail_tripwire` when tripped.
+* `MCPListToolsSpanData` — `execute_step mcp.list_tools`, carrying a hash and
+  a count of the tool names and never the names.
+
+Failure mapping: the framework never marks its trace or task span. The
+agent, turn and response spans carry the error, so the run root's status is
+derived by this adapter: a TOP-LEVEL agent (one opened directly under the
+run) closing with a FATAL type makes the root ERROR with that type, first one
+wins; tool span errors never propagate by themselves; a nested agent's
+(agent-as-tool) error never reaches the root.
+
+Decisions this adapter records rather than revisits: no `execute_step` per
+turn (a turn is an attribute, and a per-turn span would nest what the
+framework runs flat); the framework's `TurnSpanData.usage`,
+`TaskSpanData.usage` and `ResponseSpanData.usage` are all discarded, not
+only the response span's; a handled `max_turns` (`error_handlers`) still
+ships ERROR on the agent and the root, because the framework marks the span
+before it consults the handler; and `trace_include_sensitive_data=False`
+leaves the response id unavailable on the framework side, so the tool span
+then carries the marker and no join — the wire span is the only holder.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import importlib.metadata
+import os
+import threading
+from inspect import signature
+from pathlib import Path
+from typing import Any
+
+from .._assembly import (
+    Limitation,
+    counters,
+    diag_info,
+    report_once,
+)
+from ._base import AdapterInterface
+from ._context import AdapterContext
+
+_FRAMEWORK = "openai_agents"
+_DISTRIBUTION = "openai-agents"
+_MODULE = "agents"
+_ENV_DISABLED = "OPENAI_AGENTS_DISABLE_TRACING"
+
+#: Every namespaced key this adapter writes falls under this prefix (design
+#: §6.5 tier 1). Declared here as documentation and held by a test over the
+#: module's source; the vocabulary layer accepts any `wardex.*` key today.
+FRAMEWORK_EXTRA_PREFIXES = ("wardex.openai_agents.",)
+
+#: Live `invoke_agent` handles a run may hold at once. Beyond it the unit is
+#: still opened — the span ships — but is not pushed onto the run's stack, so
+#: a pathological agent-as-tool recursion costs bookkeeping, never spans.
+_MAX_AGENT_STACK = 64
+
+_TRACING_DISABLED_NOTICE = (
+    "openai-agents tracing is disabled, so wardex will show only the LLM calls "
+    "its interceptor captures: no agent, handoff, tool or guardrail spans. To "
+    "get them without sending anything to OpenAI, put these two lines BEFORE "
+    "wardex.init(): agents.set_tracing_disabled(False); "
+    "agents.set_trace_processors([]). Calling set_trace_processors after "
+    "wardex.init() removes wardex's processor as well."
+)
+
+_PROCESSOR_REMOVED_NOTICE = (
+    "openai-agents adapter: wardex's trace processor was removed by a later "
+    "agents.set_trace_processors(...) call, so no agent, handoff, tool or "
+    "guardrail spans were recorded in this process. Call set_trace_processors "
+    "before wardex.init(), or use agents.add_trace_processor for your own "
+    "processor."
+)
+
+
+# -- surface probes ------------------------------------------------------
+#
+# Two groups, probed and declined independently. Group 1 is the processor
+# surface plus the six span-data classes the mapping reads; group 2 is the
+# MCP list-tools span, which lands in a separately evolving module and is
+# only worth reading when it constructs. No version parsing anywhere: the
+# attribute set IS the version floor, which is the only spelling that stays
+# true when a release moves a symbol without moving its number.
+
+_PROCESSOR_ABSTRACT = frozenset(
+    {"on_trace_start", "on_trace_end", "on_span_start", "on_span_end", "shutdown", "force_flush"}
+)
+_SPAN_ATTRS = ("span_data", "error", "started_at", "span_id", "trace_id")
+_TRACE_ATTRS = ("name", "trace_id")
+
+
+def _import_agents_tracing() -> Any | None:
+    """`agents.tracing`, or `None` when the framework is absent — an ANSWER.
+
+    Imported here rather than at module import time so that the decline path
+    is reachable: `_make_adapter` imports this module inside its branch, so a
+    module-level framework import would surface an ImportError on
+    `_adapters/__init__.py`'s stderr line instead of declining silently.
+    """
+    try:
+        import agents.tracing as tracing
+    except Exception:  # noqa: BLE001 — an absent framework is the answer, not a failure
+        return None
+    return tracing
+
+
+def _installed_distribution() -> importlib.metadata.Distribution | None:
+    """The `openai-agents` distribution, found WITHOUT importing anything and
+    without an exception path: `packages_distributions` is built from the
+    installed metadata alone, so a host with a local `agents/` package and no
+    distribution answers `None` here and nothing of theirs is imported."""
+    owners = importlib.metadata.packages_distributions().get(_MODULE, ())
+    if _DISTRIBUTION not in owners:
+        return None
+    return importlib.metadata.distribution(_DISTRIBUTION)
+
+
+def _shadow_path(tracing: Any, dist: importlib.metadata.Distribution) -> tuple[str, str] | None:
+    """`(resolved module path, distribution path)` when the module that
+    answered `import agents` is NOT the installed distribution's, else None."""
+    import agents
+
+    found = Path(agents.__file__).parent.resolve()
+    expected = Path(str(dist.locate_file(_MODULE))).resolve()
+    if found == expected:
+        return None
+    return str(found), str(expected)
+
+
+def _constructs(cls: Any, attrs: dict[str, Any]) -> bool:
+    """Does `cls(**attrs)` build and expose every one of `attrs` by name?
+
+    The keyword names are checked against the SIGNATURE first, so a renamed
+    keyword is an answer (False) rather than a `TypeError` the registry's
+    guard would report as a wardex failure — no exception path is needed.
+    """
+    if not isinstance(cls, type):
+        return False
+    accepted = signature(cls).parameters
+    if any(key not in accepted for key in attrs):
+        return False
+    made = cls(**attrs)
+    return all(hasattr(made, key) for key in attrs)
+
+
+def _surface_ok(tracing: Any) -> bool:
+    """Is this the processor and span-data surface the mapping was written for?
+
+    Every predicate below is measured True on the pinned release. The span
+    data classes are CONSTRUCTED with the keyword names the handlers read,
+    because a renamed keyword is a renamed attribute and `hasattr` on the
+    class alone would pass a surface whose instances no longer carry it.
+    """
+    for name in ("TracingProcessor", "add_trace_processor", "set_trace_processors"):
+        if not callable(getattr(tracing, name, None)):
+            return False
+    if not callable(getattr(tracing, "get_trace_provider", None)):
+        return False
+    processor = tracing.TracingProcessor
+    if frozenset(getattr(processor, "__abstractmethods__", ())) != _PROCESSOR_ABSTRACT:
+        return False
+    span_cls = getattr(tracing, "Span", None)
+    trace_cls = getattr(tracing, "Trace", None)
+    if not all(hasattr(span_cls, a) for a in _SPAN_ATTRS):
+        return False
+    if not all(hasattr(trace_cls, a) for a in _TRACE_ATTRS):
+        return False
+    shapes = {
+        "AgentSpanData": {"name": "a"},
+        "FunctionSpanData": {"name": "f", "input": None, "output": None},
+        "HandoffSpanData": {"from_agent": "a", "to_agent": "b"},
+        "GuardrailSpanData": {"name": "g", "triggered": False},
+        "TurnSpanData": {"turn": 1, "agent_name": "a"},
+        "ResponseSpanData": {},
+    }
+    return all(_constructs(getattr(tracing, cls, None), attrs) for cls, attrs in shapes.items())
+
+
+def _mcp_surface_ok(tracing: Any) -> bool:
+    """Group 2: the list-tools span, read only when it constructs as measured."""
+    cls = getattr(tracing, "MCPListToolsSpanData", None)
+    return _constructs(cls, {"server": "s", "result": ["t"]})
+
+
+def _driver() -> object:
+    """The task (or thread) a callback is running on — the pin's owner.
+
+    `_get_running_loop` answers `None` instead of raising outside a loop, so
+    this needs no exception path: a synchronous host is an ANSWER, not a
+    failure, and the thread is then the carrier the registry will observe.
+    """
+    loop = asyncio._get_running_loop()
+    task = asyncio.current_task(loop) if loop is not None else None
+    return task if task is not None else threading.current_thread()
+
+
+# -- the adapter ---------------------------------------------------------
+
+
+class OpenAIAgentsAdapter(AdapterInterface):
+    """Registers ONE `TracingProcessor` with the framework and reads its
+    callbacks. Holds no table of its own: per-run state lives in
+    `ctx.slot(trace)` and per-span state in `ctx.slot(span)`, keyed on the
+    framework's own objects by identity, released when the framework drops
+    them, and cleared by the context's fork reset.
+    """
+
+    CONTROL_FLOW: tuple[type[BaseException], ...] = ()
+
+    def __init__(self) -> None:
+        self._installed = False
+        self._ctx: AdapterContext | None = None
+        self._processor = _WardexTracingProcessor(self)
+        #: The framework's processor tuple BEFORE registration, kept by
+        #: identity so `uninstall` can hand the very same object back.
+        self._before: tuple[Any, ...] | None = None
+        self._mcp = False
+        self._tracing: Any = None
+
+    def name(self) -> str:
+        return _FRAMEWORK
+
+    def install(self, client: object | None = None, ctx: object | None = None) -> None:
+        """Probe, then register. ORDER IS LOAD-BEARING and is spelled out.
+
+        The distribution is checked BEFORE anything is imported, so a host
+        without the framework pays no import and a host with a local package
+        called `agents` and no distribution is declined without running its
+        import side effects. `self._installed = True` stays the LAST line.
+        """
+        if self._installed:
+            return
+        self._ctx = ctx if isinstance(ctx, AdapterContext) else None
+        if self._ctx is None:
+            return
+        ctx = self._ctx
+        dist = _installed_distribution()
+        if dist is None:
+            return
+        tracing = _import_agents_tracing()
+        if tracing is None:
+            return
+        shadow = _shadow_path(tracing, dist)
+        if shadow is not None:
+            report_once(
+                f"openai-agents adapter: the module 'agents' resolved to {shadow[0]}, which "
+                f"is not the installed openai-agents distribution ({shadow[1]}); the adapter "
+                "declined. Rename the local package or fix sys.path",
+                key="adapters.openai_agents.shadowed",
+            )
+            ctx.count("shadowed")
+            return
+        if not _surface_ok(tracing):
+            report_once(
+                "openai-agents adapter: surface unrecognized, adapter declined; agent, "
+                "handoff, tool and guardrail spans will be absent",
+                key="adapters.openai_agents.unsupported_surface",
+            )
+            ctx.count("unsupported_surface")
+            return
+        self._mcp = _mcp_surface_ok(tracing)
+        self._tracing = tracing
+        type(self).CONTROL_FLOW = ()
+        self._notice_if_tracing_disabled(tracing)
+        provider = tracing.get_trace_provider()
+        self._before = None
+        read = False
+        with ctx.guard("processors_read"):
+            self._before = tuple(provider._multi_processor._processors)
+            read = True
+        if not read:
+            self._before = None
+            report_once(
+                "openai-agents adapter: could not read the framework's processor list; "
+                "uninstall will leave wardex's processor registered but inert",
+                key="adapters.openai_agents.processors_read_failed",
+            )
+            ctx.count("processors_read_failed")
+        tracing.add_trace_processor(self._processor)
+        self._installed = True
+
+    def _notice_if_tracing_disabled(self, tracing: Any) -> None:
+        """One INFO line when the hook will be silent, following the
+        framework's own precedence: the manual switch wins over the
+        environment variable, and the environment variable is read the way
+        the framework reads it."""
+        ctx = self._ctx
+        if ctx is None:
+            return
+        manual = None
+        read = False
+        with ctx.guard("tracing_state"):
+            manual = tracing.get_trace_provider()._manual_disabled
+            read = True
+        if not read:
+            report_once(
+                "openai-agents adapter: could not read the framework's manual tracing "
+                "switch; the tracing notice below follows the environment variable only",
+                key="adapters.openai_agents.tracing_state_unknown",
+            )
+            ctx.count("tracing_state_unknown")
+        if manual is not None:
+            disabled = bool(manual)
+        else:
+            disabled = os.environ.get(_ENV_DISABLED, "false").lower() in ("true", "1")
+        if disabled:
+            diag_info(_TRACING_DISABLED_NOTICE)
+            ctx.count("tracing_disabled_at_install")
+
+    def _current_processors(self) -> tuple[Any, ...] | None:
+        """The framework's live processor tuple, or None when unreadable."""
+        ctx = self._ctx
+        if ctx is None or self._tracing is None:
+            return None
+        current = None
+        with ctx.guard("processors_read"):
+            current = tuple(self._tracing.get_trace_provider()._multi_processor._processors)
+        return current
+
+    def _check_processor_removed(self) -> None:
+        """Say so, once, when a later `set_trace_processors` dropped ours.
+
+        Only when NO run was ever recorded: a processor removed after runs
+        is a change of mind rather than a silent blind spot, and is counted
+        under its own name instead of reported.
+        """
+        ctx = self._ctx
+        if ctx is None:
+            return
+        current = self._current_processors()
+        if current is None or self._processor in current:
+            return
+        if counters.get("adapters.openai_agents.active.trace") == 0:
+            report_once(_PROCESSOR_REMOVED_NOTICE, key="adapters.openai_agents.processor_removed")
+            ctx.count("processor_removed")
+        else:
+            ctx.count("processor_removed_after_runs")
+
+    def uninstall(self) -> None:
+        """Hand the framework its ORIGINAL tuple back, then close what is open.
+
+        `set_trace_processors(self._before)` passes the very object read at
+        install, so the framework's attribute is restored BY IDENTITY — the
+        conformance suite's seam check compares with `is`. A host that added
+        a processor after wardex keeps it: only wardex's own is filtered out.
+        `self._ctx` is NOT nulled; a callback still in flight needs it.
+        """
+        if not self._installed:
+            return
+        self._check_processor_removed()
+        self._installed = False
+        ctx = self._ctx
+        tracing = self._tracing
+        current = self._current_processors()
+        if ctx is None or tracing is None:
+            return
+        if self._before is not None and current == self._before + (self._processor,):
+            tracing.set_trace_processors(self._before)
+        elif current is not None:
+            tracing.set_trace_processors([p for p in current if p is not self._processor])
+            ctx.count("processors_changed_under_us")
+        else:
+            report_once(
+                "openai-agents adapter: uninstall could not remove wardex's trace processor; "
+                "it stays registered but inert for the life of this process",
+                key="adapters.openai_agents.uninstall_processor_left_inert",
+            )
+            ctx.count("uninstall_processor_left_inert")
+        ctx.close_all(marker=Limitation.ADAPTER_UNINSTALLED)
+
+    def close_units(self, *, marker: Limitation) -> None:
+        """Overridden: this adapter holds a run's units open across callbacks."""
+        self._check_processor_removed()
+        if self._ctx is not None:
+            self._ctx.close_all(marker=marker)
+
+    # -- containment -----------------------------------------------------
+
+    def _contained(self, where: str, fn: Any, obj: Any) -> None:
+        """Run one callback body under the adapter's guard, and MARK a loss.
+
+        The guard counts and (under debug) logs; this adds the one line a
+        person reads and the marker a dashboard shows, on the live agent when
+        there is one and on the run root otherwise. A guard around a callback
+        with no report would be a span silently missing from a run.
+        """
+        ctx = self._ctx
+        if ctx is None:
+            return
+        ok = False
+        with ctx.guard(where):
+            fn(self, obj)
+            ok = True
+        if not ok:
+            report_once(
+                f"openai-agents adapter: internal error at {where}; one or more spans of "
+                "this run are missing or incomplete (re-run with debug=True for the traceback)",
+                key=f"adapters.openai_agents.{where}",
+            )
+            with ctx.guard("degraded_mark"):
+                _mark_degraded(self, obj)
+
+
+def _mark_degraded(adapter: OpenAIAgentsAdapter, obj: Any) -> None:
+    """Best effort: the live agent's handle, else the run's, if reachable."""
+    ctx = adapter._ctx
+    if ctx is None:
+        return
+    trace = obj if hasattr(obj, "group_id") else _trace_of(adapter, obj)
+    if trace is None:
+        return
+    run = ctx.slot(trace)
+    stack = run.get("stack") or ()
+    target = stack[-1] if stack else run.get("handle")
+    if target is not None:
+        target.note(Limitation.INSTRUMENTATION_DEGRADED)
+
+
+# -- the framework's hook ------------------------------------------------
+
+
+def _processor_base() -> type:
+    """`TracingProcessor` when the framework is importable, else a plain base.
+
+    The wardex processor is built in the adapter's constructor — before
+    `install()` has probed anything — so the base is resolved lazily and a
+    host without the framework still constructs the adapter (and declines).
+    The framework dispatches by duck typing, never by `isinstance`, so the
+    plain base is only ever the constructor's answer on a host that will
+    never register it.
+    """
+    tracing = _import_agents_tracing()
+    return tracing.TracingProcessor if tracing is not None else object
+
+
+class _WardexTracingProcessor(_processor_base()):  # type: ignore[misc]
+    """The six callbacks, each a total function of the adapter's state.
+
+    Every callback's first line is the installed check: the framework may
+    keep calling a processor that is being uninstalled on another thread,
+    and a callback that ran after `uninstall()` would open a unit nothing
+    will ever close. The body runs inside `_contained`, so nothing here can
+    reach the framework's own error path — which would log wardex's failure
+    under the host's logger as if the host had misconfigured tracing.
+    """
+
+    def __init__(self, adapter: OpenAIAgentsAdapter) -> None:
+        self._adapter = adapter
+
+    def on_trace_start(self, trace: Any) -> None:
+        adapter = self._adapter
+        if not adapter._installed or adapter._ctx is None:
+            return
+        adapter._contained("on_trace_start", _trace_start, trace)
+
+    def on_trace_end(self, trace: Any) -> None:
+        adapter = self._adapter
+        if not adapter._installed or adapter._ctx is None:
+            return
+        adapter._contained("on_trace_end", _trace_end, trace)
+
+    def on_span_start(self, span: Any) -> None:
+        adapter = self._adapter
+        if not adapter._installed or adapter._ctx is None:
+            return
+        adapter._contained("on_span_start", _span_start, span)
+
+    def on_span_end(self, span: Any) -> None:
+        adapter = self._adapter
+        if not adapter._installed or adapter._ctx is None:
+            return
+        adapter._contained("on_span_end", _span_end, span)
+
+    def shutdown(self, timeout: float | None = None) -> None:
+        """The framework's exit. Units stay open: the run's own end closes them."""
+        ctx = self._adapter._ctx
+        if ctx is not None:
+            ctx.count("shutdown")
+
+    def force_flush(self) -> None:
+        ctx = self._adapter._ctx
+        if ctx is not None:
+            ctx.count("force_flush")
+
+
+# -- per-run and per-span state --------------------------------------------
+#
+# A run's state is a dict in `ctx.slot(trace)`; a span's is a dict in
+# `ctx.slot(span)`. The trace object is found through the framework's OWN
+# notion of the current trace — the callback runs in a task that inherited
+# it — and the trace slot is then the one table every callback of the run
+# shares. Nothing here is keyed on a `trace_id` string, so nothing here can
+# outlive the objects the framework holds.
+
+
+def _trace_of(adapter: OpenAIAgentsAdapter, span: Any) -> Any | None:
+    """The trace `span` belongs to, remembered at its start or read from the
+    framework's current-trace carrier; None when neither answers."""
+    ctx = adapter._ctx
+    if ctx is None:
+        return None
+    remembered = ctx.slot(span).get("trace")
+    if remembered is not None:
+        return remembered
+    tracing = adapter._tracing
+    current = tracing.get_current_trace() if tracing is not None else None
+    if current is None or current.trace_id != span.trace_id:
+        ctx.count("trace_lookup_miss")
+        return None
+    return current
+
+
+def _run_state(adapter: OpenAIAgentsAdapter, trace: Any) -> dict[str, Any] | None:
+    """The run's slot, or None when this run was never opened (a processor
+    registered mid-run, or a root whose open failed)."""
+    ctx = adapter._ctx
+    if ctx is None:
+        return None
+    run = ctx.slot(trace)
+    return run if run.get("handle") is not None else None
+
+
+def _span_start(adapter: OpenAIAgentsAdapter, span: Any) -> None:
+    kind = type(span.span_data).__name__
+    handler = _start_handler(kind)
+    if handler is None:
+        if kind not in _END_ONLY:
+            adapter._ctx.count("span_kind_ignored")  # type: ignore[union-attr]
+        return
+    trace = _trace_of(adapter, span)
+    if trace is None:
+        return
+    run = _run_state(adapter, trace)
+    if run is None:
+        adapter._ctx.count("span_without_run")  # type: ignore[union-attr]
+        return
+    adapter._ctx.slot(span)["trace"] = trace  # type: ignore[union-attr]
+    handler(adapter, run, span)
+
+
+def _span_end(adapter: OpenAIAgentsAdapter, span: Any) -> None:
+    kind = type(span.span_data).__name__
+    handler = _end_handler(kind)
+    if handler is None:
+        return
+    trace = _trace_of(adapter, span)
+    if trace is None:
+        return
+    run = _run_state(adapter, trace)
+    if run is None:
+        return
+    handler(adapter, run, span)
+
+
+#: Kinds whose span is opened at END (the framework fills them late) and so
+#: must not be counted as ignored at start.
+_END_ONLY: frozenset[str] = frozenset(
+    {"HandoffSpanData", "ResponseSpanData", "MCPListToolsSpanData"}
+)
+
+
+def _start_handler(kind: str) -> Any | None:
+    """Span-data class name -> the start handler, an explicit chain rather than
+    a table so that one read of this function is the complete mapping."""
+    return None
+
+
+def _end_handler(kind: str) -> Any | None:
+    return None
+
+
+__all__ = ["FRAMEWORK_EXTRA_PREFIXES", "OpenAIAgentsAdapter"]
+
+
+def _trace_start(adapter: OpenAIAgentsAdapter, trace: Any) -> None:
+    return None
+
+
+def _trace_end(adapter: OpenAIAgentsAdapter, trace: Any) -> None:
+    return None

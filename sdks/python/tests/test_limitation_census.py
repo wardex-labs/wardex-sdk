@@ -318,6 +318,7 @@ _MEMBER_SITES: dict[str, frozenset[str]] = {
         {
             "_adapters/_anthropic_agent_sdk.py",
             "_adapters/_langgraph.py",
+            "_adapters/_openai_agents.py",
             "testing/conformance.py",
         }
     ),
@@ -356,6 +357,9 @@ _MEMBER_SITES: dict[str, frozenset[str]] = {
             "_assembly/_units.py",
             # `_EDGE_MARKERS` again — see PARENT_UNRESOLVED above.
             "testing/conformance.py",
+            # A callback body that failed under `_contained`: the live agent's
+            # span (else the run root's) says one of its spans is missing.
+            "_adapters/_openai_agents.py",
         }
     ),
 }
@@ -1184,6 +1188,8 @@ _UNRESOLVED_PY: frozenset[tuple[str, str]] = frozenset(
         # and every one of those is in `_MEMBER_SITES`.
         ("_adapters/_anthropic_agent_sdk.py", "Name:marker"),
         ("_adapters/_langgraph.py", "Name:marker"),
+        # `close_units(*, marker)` again, the openai-agents adapter's copy.
+        ("_adapters/_openai_agents.py", "Name:marker"),
         ("_adapters/_registry.py", "Name:marker"),
         # The adapter contract's own two forwards. `Name:marker` is the `marker`
         # parameter of `Scope.note` / `RunHandle.note` / `Attachment.note` and

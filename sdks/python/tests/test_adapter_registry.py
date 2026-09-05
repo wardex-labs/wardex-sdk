@@ -84,12 +84,11 @@ def test_a_member_exists_iff_its_adapter_ships():
     names a user could select that installed nothing at all. They are not
     rejected any more; they are UNSPELLABLE, which is the stronger property:
     a name that cannot be written needs no validation, and each returns as a
-    member when its adapter ships. The set equality holds both directions —
+    member when its adapter ships — `OPENAI_AGENTS` has. The set equality holds both directions —
     a row without a member is an adapter nothing can select.
     """
     assert set(_ADAPTERS) == set(AdapterName)
     assert not hasattr(AdapterName, "LANGCHAIN")
-    assert not hasattr(AdapterName, "OPENAI_AGENTS")
 
 
 def test_per_adapter_options_fields_name_the_adapter_they_configure():
