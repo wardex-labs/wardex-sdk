@@ -346,6 +346,22 @@ fn flatten_tool(t: &Bound<PyAny>, out: &mut Vec<pb::KeyValue>) -> PyResult<()> {
     Ok(())
 }
 
+/// The key that names a typed-block field whose VALUE the marshaller could
+/// not read as the type the block declares. The rest of the span ships; the
+/// field is omitted; this note says which one. Without it a
+/// `ConversationContext(conversation_id=uuid)` or an
+/// `EvaluationAttributes(score_value="0.9")` raised out of the encoder and
+/// the client dropped the ENTIRE batch, every good span with it, in silence.
+const UNMARSHALLED_FIELD_KEY: &str = "wardex.codec.unmarshalled";
+
+/// `float(v)`-tolerant read: an f64, or a string that parses as one.
+fn as_f64(v: &Bound<PyAny>) -> Option<f64> {
+    if let Ok(f) = v.extract::<f64>() {
+        return Some(f);
+    }
+    v.str().ok()?.to_str().ok()?.trim().parse::<f64>().ok()
+}
+
 /// ConversationContext → extra KeyValue. The id always; the rest only when set.
 ///
 /// This block was declared (`span.proto` field 23, `_types.py`'s
@@ -354,24 +370,40 @@ fn flatten_tool(t: &Bound<PyAny>, out: &mut Vec<pb::KeyValue>) -> PyResult<()> {
 /// process, so a conversation id was held in-process and dropped at export.
 /// Flattened like the agent and tool blocks, so both export surfaces carry
 /// one spelling.
+///
+/// The id is `str()`-ed rather than extracted: a host hands `uuid.uuid4()`
+/// or an integer session key here as naturally as a string, and the value's
+/// text is what a backend groups by either way. `turn_index` is the one
+/// field a host can plausibly set to `None`; that reads as absent.
 fn flatten_conversation(c: &Bound<PyAny>, out: &mut Vec<pb::KeyValue>) -> PyResult<()> {
     out.push(kv_str(
         "gen_ai.conversation.id",
-        c.getattr("conversation_id")?.extract()?,
+        c.getattr("conversation_id")?.str()?.to_string(),
     ));
     if let Some(v) = opt(c, "session_id")? {
-        out.push(kv_str("wardex.conversation.session_id", v.extract()?));
+        out.push(kv_str(
+            "wardex.conversation.session_id",
+            v.str()?.to_string(),
+        ));
     }
-    let turn: i64 = c.getattr("turn_index")?.extract()?;
-    if turn != 0 {
-        out.push(kv_int("wardex.conversation.turn_index", turn));
+    if let Some(v) = opt(c, "turn_index")? {
+        match v.extract::<i64>() {
+            Ok(turn) if turn != 0 => out.push(kv_int("wardex.conversation.turn_index", turn)),
+            Ok(_) => {}
+            Err(_) => out.push(kv_str(
+                UNMARSHALLED_FIELD_KEY,
+                "wardex.conversation.turn_index".into(),
+            )),
+        }
     }
     Ok(())
 }
 
 /// EvaluationAttributes → extra KeyValue (semconv `gen_ai.evaluation.*`).
-/// Only populated fields. Same omission as the conversation block above:
-/// declared, set by adapters, never marshalled.
+/// Only populated fields. This block had the same omission as the
+/// conversation block above — declared, set by adapters, never marshalled —
+/// until both were flattened together. `score_value` accepts what `float()`
+/// would; anything else is omitted and named under `UNMARSHALLED_FIELD_KEY`.
 fn flatten_evaluation(e: &Bound<PyAny>, out: &mut Vec<pb::KeyValue>) -> PyResult<()> {
     for (attr, key) in [
         ("name", "gen_ai.evaluation.name"),
@@ -379,11 +411,17 @@ fn flatten_evaluation(e: &Bound<PyAny>, out: &mut Vec<pb::KeyValue>) -> PyResult
         ("score_label", "gen_ai.evaluation.score.label"),
     ] {
         if let Some(v) = opt(e, attr)? {
-            out.push(kv_str(key, v.extract()?));
+            out.push(kv_str(key, v.str()?.to_string()));
         }
     }
     if let Some(v) = opt(e, "score_value")? {
-        out.push(kv_double("gen_ai.evaluation.score.value", v.extract()?));
+        match as_f64(&v) {
+            Some(f) => out.push(kv_double("gen_ai.evaluation.score.value", f)),
+            None => out.push(kv_str(
+                UNMARSHALLED_FIELD_KEY,
+                "gen_ai.evaluation.score.value".into(),
+            )),
+        }
     }
     Ok(())
 }
@@ -831,15 +869,43 @@ fn header_to_proto(h: &Bound<PyAny>) -> PyResult<pb::EnvelopeHeader> {
 /// marshaling snapshots the mapping then drops would spend the walk on data
 /// that cannot reach that wire, and would let a malformed snapshot fail an
 /// export whose spans were fine.
-fn envelope_to_proto(env: &Bound<PyAny>, state_snapshots: bool) -> PyResult<pb::Envelope> {
+/// Envelope → proto, plus the spans it could NOT marshal, when asked to go on.
+///
+/// `skip_unmarshallable` is the export path's setting. A span whose typed
+/// block holds a value of the wrong Python type fails `span_to_proto` for
+/// that one span; raising here made the client's drain drop the WHOLE batch
+/// (its `except` is fail-closed and silent off-debug), so one bad value
+/// deleted every good span around it. With the flag set the bad span is
+/// skipped and named — `"{span name}: {reason}"` — for the caller to count
+/// and report; the fidelity encoders keep raising, because a round-trip tool
+/// that hides a span is lying about what it round-tripped.
+fn envelope_to_proto(
+    env: &Bound<PyAny>,
+    state_snapshots: bool,
+    skip_unmarshallable: bool,
+) -> PyResult<(pb::Envelope, Vec<String>)> {
     let mut items = Vec::new();
+    let mut unmarshalled = Vec::new();
     for sp in env.getattr("spans")?.iter()? {
+        let sp = sp?;
+        let span = match span_to_proto(&sp) {
+            Ok(span) => span,
+            Err(e) if skip_unmarshallable => {
+                let name = sp
+                    .getattr("name")
+                    .and_then(|n| n.str().map(|s| s.to_string()))
+                    .unwrap_or_else(|_| "<unnamed>".into());
+                unmarshalled.push(format!("{name}: {e}"));
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
         items.push(pb::EnvelopeItem {
             header: Some(pb::EnvelopeItemHeader {
                 r#type: "span".into(),
                 length: 0,
             }),
-            payload: Some(pb::envelope_item::Payload::Span(span_to_proto(&sp?)?)),
+            payload: Some(pb::envelope_item::Payload::Span(span)),
         });
     }
     if state_snapshots {
@@ -855,10 +921,11 @@ fn envelope_to_proto(env: &Bound<PyAny>, state_snapshots: bool) -> PyResult<pb::
             });
         }
     }
-    Ok(pb::Envelope {
+    let envelope = pb::Envelope {
         header: Some(header_to_proto(&env.getattr("header")?)?),
         items,
-    })
+    };
+    Ok((envelope, unmarshalled))
 }
 
 // --- decode → dict ---
@@ -1266,7 +1333,7 @@ fn encode_envelope_py(
     // configured level be validated and then silently discarded.
     let limits = limits.map(|p| p.inner).unwrap_or_default();
     // Marshalling walks Python objects — the only part that needs the GIL.
-    let mut proto = envelope_to_proto(envelope, true)?;
+    let (mut proto, _) = envelope_to_proto(envelope, true, false)?;
     // Masking + protobuf + zstd are pure Rust: release the GIL so app threads
     // keep running while the batch worker encodes (design §9).
     let bytes = py.allow_threads(|| -> PyResult<Vec<u8>> {
@@ -1350,7 +1417,7 @@ fn encode_otlp_traces(
     // walk for traces would be a second marshaling path to keep in step, and
     // the first time the two disagreed it would show up as a missing attribute
     // on a user's wire rather than as a failing build.
-    let proto = envelope_to_proto(envelope, false)?;
+    let (proto, _) = envelope_to_proto(envelope, false, false)?;
     let limits = limits.map(|p| p.inner).unwrap_or_default();
     // Mapping + masking + protobuf are pure Rust: release the GIL so app
     // threads keep running while the batch worker encodes (design §9).
@@ -1370,10 +1437,13 @@ fn encode_otlp_traces(
 /// measures the FINAL body against it, compression included, because that is
 /// the number the receiver measures.
 ///
-/// The second half of the return value is a count of spans that could not be
-/// made to fit even alone, after their payload was dropped. It exists because
-/// the core has no channel to a user: a loss reported nowhere is the silent
-/// kind, and the caller is the only one who can say it out loud.
+/// The second element of the return value is a count of spans that could not
+/// be made to fit even alone, after their payload was dropped; the third names
+/// the spans that could not be MARSHALLED at all (a typed block holding a
+/// value of the wrong Python type), each as `"{name}: {reason}"`. Both exist
+/// because the core has no channel to a user: a loss reported nowhere is the
+/// silent kind, and the caller is the only one who can say it out loud. The
+/// third used to be a raise, and the raise cost the whole batch.
 #[pyfunction]
 #[pyo3(signature = (envelope, pii_mode = "off", pii_disabled = Vec::new(), limits = None, compress = true))]
 fn encode_otlp_requests(
@@ -1383,8 +1453,8 @@ fn encode_otlp_requests(
     pii_disabled: Vec<String>,
     limits: Option<PyLimits>,
     compress: bool,
-) -> PyResult<(Py<PyAny>, usize)> {
-    let proto = envelope_to_proto(envelope, false)?;
+) -> PyResult<(Py<PyAny>, usize, Vec<String>)> {
+    let (proto, unmarshalled) = envelope_to_proto(envelope, false, true)?;
     let limits = limits.map(|p| p.inner).unwrap_or_default();
     let requests = py.allow_threads(move || -> PyResult<otlp::split::Requests> {
         let req = otlp_request(proto, pii_mode, &pii_disabled, limits)?;
@@ -1395,7 +1465,7 @@ fn encode_otlp_requests(
     for body in &requests.bodies {
         bodies.append(PyBytes::new_bound(py, body))?;
     }
-    Ok((bodies.into_py(py), requests.dropped_spans))
+    Ok((bodies.into_py(py), requests.dropped_spans, unmarshalled))
 }
 
 #[pyfunction]

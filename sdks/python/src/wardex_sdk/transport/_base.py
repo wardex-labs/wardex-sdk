@@ -3,7 +3,7 @@ from __future__ import annotations
 import abc
 from typing import TYPE_CHECKING
 
-from .._assembly import report_once
+from .._assembly import counters, report_once
 from .._native import NATIVE_OK, native, unavailable_reason
 from .._types import Envelope
 
@@ -258,13 +258,28 @@ class Transport(abc.ABC):
                 f"wardex native extension unavailable, so envelopes cannot be "
                 f"encoded ({unavailable_reason()})"
             )
-        bodies, dropped = native.codec.encode_otlp_requests(
+        bodies, dropped, unmarshalled = native.codec.encode_otlp_requests(
             envelope,
             self._pii_mode,
             list(self._pii_disabled),
             self._limits,
             compress,
         )  # encode=fail-loud
+        if unmarshalled:
+            # A span the marshaller could not read -- a typed block holding a
+            # value of the wrong Python type. It used to raise out of the
+            # encoder, and the client's drain then dropped the WHOLE batch:
+            # every good span around it, silently off-debug. Now the one span
+            # is skipped, counted, and named once per process; the rest of
+            # the batch ships. The first reason is quoted because it is the
+            # encoder's own words about a wardex type, never host content.
+            for _ in unmarshalled:
+                counters.bump("transport.otlp.span_unmarshalled")
+            report_once(
+                f"{len(unmarshalled)} span(s) could not be marshalled for export and "
+                f"were dropped; the rest of the batch shipped. First: {unmarshalled[0]}",
+                key="transport.otlp.span_unmarshalled",
+            )
         if dropped:
             # A span so large it would not fit a request even with its payload
             # removed. `report_once` rather than a debug print: the marker

@@ -1054,10 +1054,10 @@ def _probe_max_otlp_request_bytes() -> bool:
     import os
 
     env = _otlp_envelope(os.urandom(8192))
-    tight, _ = _wardex_native.codec.encode_otlp_requests(
+    tight, _, _ = _wardex_native.codec.encode_otlp_requests(
         env, "off", [], _native(max_otlp_request_bytes=4096), False
     )
-    loose, _ = _wardex_native.codec.encode_otlp_requests(env, "off", [], None, False)
+    loose, _, _ = _wardex_native.codec.encode_otlp_requests(env, "off", [], None, False)
     # One span, so it cannot be split: the guard drops its payload instead, and
     # the observable difference is the body's size rather than the count.
     return len(tight[0]) <= 4096 and len(loose[0]) > 4096

@@ -194,7 +194,7 @@ class TestTransportPolicy:
             # is unreachable). Returning no bodies at all would let the
             # transport return before it ever built a request, which is a
             # different path from the one under test.
-            return ([b""], 0)
+            return ([b""], 0, [])
 
         monkeypatch.setattr(_wardex_native.codec, "encode_otlp_requests", fake_encode)
         t = OtlpHttpTransport(endpoint="http://localhost:1")
