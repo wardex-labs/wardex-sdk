@@ -337,33 +337,35 @@ a 429 or a 401 is captured under the default mode even outside a local span —
 the response status decides the span's `status`, never whether it exists.
 
 This means a bare, unwrapped call to an LLM provider wardex doesn't
-recognize can be silently dropped if it isn't inside a local span. One
-WebSocket case is different: the openai-agents SDK's opt-in
-`use_responses_websocket=True` sends every call over `wss://…/v1/responses`,
-and once the first call crosses that connection wardex counts it
-(`interceptors.seam.ws_llm_semantics_unread`) and, when the connection
-closes, emits one `WS /v1/responses` span under the default mode marked
-`ws_llm_semantics_unread` — LLM calls crossed it and wardex read none of
-them, because Responses events inside WebSocket frames are not parsed. (A
-connection that ends without a WebSocket close handshake — a server drop, a
-timeout, process exit, or wardex uninstalled first — still yields the span,
-additionally marked `ws_no_close`.) The span carries `ws.messages.sent`
-(about one per call), byte counts and
-payload samples (compressed bytes, marked `payload_compressed`, when
-permessage-deflate was negotiated), no model or tokens; switch the framework
-to its default HTTP transport for `gen_ai` spans. The connection is treated
-as an LLM connection only when the host is the provider's, or the first
-message is a Responses `response.create` on an uncompressed connection; a
-Responses-path connection to an unknown host with compression is only
-counted (`interceptors.seam.ws_llm_endpoint_unconfirmed`). A WebSocket
-provider whose path wardex does not recognize (OpenAI Realtime) is still
-dropped outside a local span. Wrap it with `@wardex.workflow` (or any of the
-span decorators), or set `capture_mode=wardex.CaptureMode.ALL` to restore
-capture-everything behavior:
+recognize — or a WebSocket provider whose path wardex doesn't recognize, such
+as OpenAI Realtime — can be silently dropped if it isn't inside a local span.
+Wrap that call with `@wardex.workflow` (or any of the span decorators), or set
+`capture_mode=wardex.CaptureMode.ALL` to restore capture-everything behavior:
 
 ```python
 wardex.init(..., capture_mode=wardex.CaptureMode.ALL)
 ```
+
+**Responses over WebSocket (openai-agents `use_responses_websocket=True`).**
+This opt-in transport sends every call over one `wss://…/v1/responses`
+connection, and it is the one WebSocket case that ships under the default
+mode without a wrapper: once the first call crosses the connection wardex
+counts it (`interceptors.seam.ws_llm_semantics_unread`) and, when the
+connection closes, emits one `WS /v1/responses` span marked
+`ws_llm_semantics_unread` — LLM calls crossed it and wardex read none of
+them, because Responses events inside WebSocket frames are not parsed. The
+span carries `ws.messages.sent` (about one per call), byte counts and payload
+samples (compressed bytes, marked `payload_compressed`, when
+permessage-deflate was negotiated), no model or tokens; switch the framework
+to its default HTTP transport for `gen_ai` spans. A connection that ends
+without a WebSocket close handshake — a server drop, a timeout, process exit,
+or wardex uninstalled first — still yields the span, additionally marked
+`ws_no_close`. The connection counts as an LLM connection only when the host
+is the provider's, or when the first message is a Responses `response.create`
+on an uncompressed connection; a Responses-path connection to an unknown host
+(localhost, a gateway) with compression — the `websockets` client's default —
+is only counted (`interceptors.seam.ws_llm_endpoint_unconfirmed`) and yields
+no span under the default mode.
 
 Plaintext hosts you've explicitly named via `intercept_hosts` are always
 captured regardless of `capture_mode` — a targeted allowlist entry is a
