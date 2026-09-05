@@ -573,7 +573,8 @@ diagnostic line (traceback under `debug=True`).
   fields are empty
 - Transport metrics (TCP/TLS timing, TTFT), gRPC (grpclib), WebSocket (`wss`;
   a Responses-over-WebSocket connection is captured at close and marked
-  `ws_llm_semantics_unread`, see capture_mode), MCP stdio
+  `ws_llm_semantics_unread` when the host is the provider's — on an unknown
+  host with compression it is only counted, see capture_mode), MCP stdio
 - Export to any OpenTelemetry backend via `OtlpHttpTransport`
 - Manual span decorators: `@workflow` / `@agent` / `@step` / `@tool`
 - PII masking on by default: emails, phone numbers, credit cards (Luhn-verified),
