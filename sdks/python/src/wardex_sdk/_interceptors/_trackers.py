@@ -77,9 +77,13 @@ def _is_ws_upgrade_request(headers: object) -> bool:
     )
 
 
-#: The first bytes of the one client message the Responses WebSocket
-#: transport sends per call. Matched only when nothing hides the payload.
-_RESPONSES_CREATE = re.compile(rb'^\s*\{\s*"type"\s*:\s*"response\.create"')
+#: The `type` of the one client message the Responses WebSocket transport
+#: sends per call, searched for anywhere in the first client message rather
+#: than matched as a prefix: key order (`sort_keys`), a BOM or leading
+#: whitespace must not decide the connection's fate. The search is bounded
+#: by the message, which the frame parser already caps. Consulted only when
+#: nothing hides the payload.
+_RESPONSES_CREATE = re.compile(rb'"type"\s*:\s*"response\.create"')
 
 
 @dataclass
@@ -559,9 +563,7 @@ class _WebSocketTracker:
         if self._llm_upgrade is None:
             return
         if self._llm_upgrade == "known_provider" or (
-            first is not None
-            and not self._deflate
-            and _RESPONSES_CREATE.match(first[:64]) is not None
+            first is not None and not self._deflate and _RESPONSES_CREATE.search(first) is not None
         ):
             self._llm_call = True
             counters.bump("interceptors.seam.ws_llm_semantics_unread")

@@ -363,8 +363,11 @@ or wardex uninstalled first — still yields the span, additionally marked
 `ws_no_close`. The connection counts as an LLM connection only when the host
 is the provider's own — exactly `api.openai.com` or a subdomain of
 `openai.com`; a host that merely contains the name, such as
-`openai-mock.corp`, is not — or when the first message is a Responses
-`response.create` on an uncompressed connection; a Responses-path connection
+`openai-mock.corp`, is not — or when the first client message carries a
+Responses `"type": "response.create"` (anywhere in that message, whatever
+the key order) on an uncompressed connection. The decision is made once,
+on that first client message, for the life of the connection. A
+Responses-path connection
 to any other host (localhost, a gateway, a mock) with compression — the
 `websockets` client's default — is only counted
 (`interceptors.seam.ws_llm_endpoint_unconfirmed`) and yields no span under

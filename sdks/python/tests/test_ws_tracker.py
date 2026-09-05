@@ -1,3 +1,5 @@
+import json
+
 import pytest
 
 from wardex_sdk._assembly import Limitation, counters
@@ -88,6 +90,32 @@ def test_unknown_host_confirms_from_the_responses_envelope():
     (txn,) = t.on_response_bytes(_CLOSE_1001)
     assert txn.ws_llm_call is True
     assert Limitation.WS_LLM_SEMANTICS_UNREAD in txn.ws_markers
+
+
+@pytest.mark.parametrize(
+    "first",
+    [
+        # `sort_keys=True` puts `model` before `type`
+        json.dumps({"type": "response.create", "model": "gpt-4o-mini"}, sort_keys=True).encode(),
+        # a UTF-8 BOM ahead of the envelope
+        b"\xef\xbb\xbf" + b'{"type":"response.create"}',
+        # the type key deep in a large envelope
+        b'{"input":"' + b"x" * 4000 + b'","type" : "response.create"}',
+    ],
+    ids=["sort_keys", "bom", "deep"],
+)
+def test_unknown_host_envelope_is_found_anywhere_in_the_first_message(first: bytes):
+    """The corroboration is a bounded search for the `response.create` type
+    over the whole first client message — the message is already capped by
+    the frame parser — not a prefix match that any other key order, a BOM
+    or leading noise would defeat for the life of the connection."""
+    t = _tracker("unknown_host", deflate=False)
+    header = bytes([0x81, 126]) + len(first).to_bytes(2, "big")
+    t.on_request_bytes(header + first)
+    assert counters.get(_UNREAD) == 1
+    assert counters.get(_UNCONFIRMED) == 0
+    (txn,) = t.on_response_bytes(_CLOSE_1001)
+    assert txn.ws_llm_call is True
 
 
 def test_unknown_host_with_deflate_stays_unconfirmed():
