@@ -264,6 +264,7 @@ pub(super) fn fill_anthropic(out: &mut LlmSemantics, req: &[u8], resp: &[u8], bo
                 }
             }
             out.output_messages = build_output_messages(vec![OutMsg {
+                role: None,
                 parts,
                 finish_reason,
             }]);

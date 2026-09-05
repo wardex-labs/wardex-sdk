@@ -202,7 +202,11 @@ _LIMIT_DELIVERY: dict[LimitsConsumer, _Delivery] = {
         target="wardex_sdk._interceptors._trackers:_WebSocketTracker",
         delivers={"sample_cap": "ws_sample_bytes"},
         native=frozenset({"limits"}),
-        passthrough=frozenset({"path", "deflate", "parent", "parent_closed", "start_ns"}),
+        # `llm_upgrade` is the endpoint table's answer about the upgrade
+        # path, not a bound: a decision the seam passes through.
+        passthrough=frozenset(
+            {"path", "deflate", "parent", "parent_closed", "start_ns", "llm_upgrade"}
+        ),
     ),
     LimitsConsumer.CONN_TIMING: _Delivery(
         target="wardex_sdk._interceptors._conn_timing:install_shared_timing",

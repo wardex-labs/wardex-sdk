@@ -9,8 +9,9 @@ import socket
 import threading
 
 import wardex_sdk as wardex
-from wardex_sdk import ConsoleTransport, _hub
-from wardex_sdk._enums import CaptureSource, SpanKind
+from conftest import client_spans
+from wardex_sdk import ConsoleTransport
+from wardex_sdk._enums import CaptureSource
 from wardex_sdk._interceptors._seam import _ConnectionState
 from wardex_sdk._interceptors._socket import RawSocketInterceptor
 
@@ -49,12 +50,6 @@ def _server(payload: bytes):
     host, port = httpd.socket.getsockname()[:2]
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     return httpd, host, port
-
-
-def _client_spans():
-    client = _hub.get_client()
-    client._settle()  # finalization runs on the worker; settle before reading
-    return [s for s in client._spans if s.kind == SpanKind.CLIENT]
 
 
 def _post(host: str, port: int, body: bytes, path: str = "/v1/chat/completions") -> None:
@@ -112,7 +107,7 @@ def test_plaintext_llm_call_captured():
     try:
         wardex.init(transport=ConsoleTransport(), intercept=True)
         _post(host, port, b'{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}')
-        spans = _client_spans()
+        spans = client_spans()
         assert len(spans) == 1
         assert spans[0].transport.http.url.startswith("http://")  # not https
         assert spans[0].gen_ai is not None  # LLM identified
@@ -129,7 +124,7 @@ def test_plaintext_non_llm_dropped():
     try:
         wardex.init(transport=ConsoleTransport(), intercept=True)
         _post(host, port, b'{"foo":"bar"}', path="/health")
-        assert _client_spans() == []  # non-LLM + no allowlist → dropped
+        assert client_spans() == []  # non-LLM + no allowlist → dropped
     finally:
         wardex.close()
         httpd.shutdown()
@@ -149,7 +144,7 @@ def test_non_http_bytes_not_captured():
         except Exception:
             pass
         s.close()
-        assert _client_spans() == []
+        assert client_spans() == []
     finally:
         wardex.close()
         httpd.shutdown()
@@ -166,7 +161,7 @@ def test_allowlist_non_llm_captured():
             intercept_hosts=[f"{host}:{port}"],
         )
         _post(host, port, b'{"foo":"bar"}', path="/health")
-        spans = _client_spans()
+        spans = client_spans()
         assert len(spans) == 1  # non-LLM emitted too via allowlist
         assert spans[0].transport.http.url.startswith("http://")
     finally:
@@ -185,7 +180,7 @@ def test_allowlist_host_only_matches():
             intercept_hosts=[host],
         )
         _post(host, port, b'{"foo":"bar"}', path="/health")
-        assert len(_client_spans()) == 1
+        assert len(client_spans()) == 1
     finally:
         wardex.close()
         httpd.shutdown()
@@ -222,7 +217,7 @@ def test_plaintext_ws_requires_allowlist():
         wardex.init(transport=ConsoleTransport(), intercept=True)  # no allowlist
         # a plain response without 101 doesn't trigger the ws tracker — same path as non-LLM drop
         _post(host, port, b'{"x":1}', path="/ws")
-        assert _client_spans() == []
+        assert client_spans() == []
     finally:
         wardex.close()
         httpd.shutdown()
@@ -320,7 +315,7 @@ def test_a_connection_close_response_is_captured_after_the_socket_was_closed():
             "precondition: the body must outgrow one buffered read, so that part of "
             "it arrives after http.client already called sock.close()"
         )
-        spans = _client_spans()
+        spans = client_spans()
         assert len(spans) == 1, "the connection was retired while its body was still arriving"
         assert spans[0].gen_ai is not None
     finally:

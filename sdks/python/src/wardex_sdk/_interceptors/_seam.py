@@ -37,7 +37,7 @@ from .._enums import (
     StatusCode,
 )
 from .._limits import LimitsConfig, LimitsConsumer, limits_kwargs
-from .._protocol import parse_llm_semantics
+from .._protocol import classify_path, classify_ws_upgrade, parse_llm_semantics
 from .._semantics import (
     USAGE_DROPPED_KEY,
     build_gen_ai,
@@ -556,6 +556,7 @@ class ByteSeamInterceptor(InterceptorInterface):
             pass
         for txn in txns:
             if getattr(txn, "ws_upgrade", False):
+                url_host = _url_host(obj, st)
                 ws = _WebSocketTracker(
                     path=txn.ws_upgrade_path or "/",
                     deflate=txn.ws_deflate,
@@ -563,6 +564,7 @@ class ByteSeamInterceptor(InterceptorInterface):
                     parent_closed=txn.parent_closed,
                     start_ns=txn.start_ns,
                     limits=self._native_limits,
+                    llm_upgrade=classify_ws_upgrade(url_host, txn.ws_upgrade_path or "/"),
                     **self._ws_kwargs,
                 )
                 st.tracker = ws
@@ -601,8 +603,10 @@ class ByteSeamInterceptor(InterceptorInterface):
         a handful of attribute reads, and `copy_context()` (HAMT sharing,
         O(1)). The parse, the gate and the draft belong to the worker.
 
-        `None` means the prefilter DENIED the connection: cheaper than
-        today, because the parse this skips was unconditionally paid before.
+        `None` means the prefilter DENIED the connection, or the path is one
+        the endpoint table EXCLUDES (`classify_path`) — either way cheaper
+        than today, because the parse this skips was unconditionally paid
+        before.
 
         The fork latch is consumed here rather than at assembly: `st` must
         not travel with the job (I-F1), so the first transaction SEALED on a
@@ -610,13 +614,29 @@ class ByteSeamInterceptor(InterceptorInterface):
         timing markers. (Before the deferred split the stamp happened below
         the gate — first CAPTURED transaction; the seal is the earliest
         moment the fact can leave the connection state, and a gate-refused
-        first transaction now consumes the latch too.)
+        first transaction consumes the latch too; an EXCLUDED one does not —
+        it returns above the latch block — so the marker lands on the
+        connection's next sealed transaction.)
         """
-        url_host = getattr(obj, "server_hostname", None) or st.server_address
+        url_host = _url_host(obj, st)
         ct = txn.content_type or ""
         # gRPC: skip LLM semantic extraction (protobuf isn't LLM JSON).
         is_grpc = ct.startswith("application/grpc") and not ct.startswith("application/grpc-web")
         connect_ms, handshake_ms, reused, timing_markers = self._resolve_timing(obj, st)
+        # Classified once here and carried on the job: `_assemble` reads the
+        # same answer for the provider-state count instead of asking again.
+        treatment = classify_path(txn.path)
+        if treatment == "excluded":
+            # A telemetry upload (the OpenAI Agents SDK POSTs its whole run
+            # record to /v1/traces/ingest). Not wardex's to copy: skipped in
+            # every mode and above the allowlist, before any parse is queued
+            # or the body attached to a span — counted, not spanned. The
+            # tracker has already buffered the body (capped by max_body_bytes)
+            # by the time a `_Txn` exists; dropping the `_Txn` here is what
+            # discards it. Does not consume the fork latch: the marker belongs
+            # on the first transaction that becomes a span.
+            counters.bump("interceptors.seam.path_excluded")
+            return None
         if st.reset_at_fork:
             st.reset_at_fork = False
             timing_markers = (*timing_markers, Limitation.TRACKING_RESET_AT_FORK)
@@ -634,6 +654,7 @@ class ByteSeamInterceptor(InterceptorInterface):
             server_address=st.server_address,
             server_port=st.server_port,
             is_grpc=is_grpc,
+            treatment=treatment,
             prefilter=pre,
             mode=capture_mode_of(client),
             connect_ms=connect_ms,
@@ -702,11 +723,23 @@ class ByteSeamInterceptor(InterceptorInterface):
             client.capture_span(span)
 
     def _build_ws_span(self, st: _ConnectionState, txn: _Txn) -> Any:
+        # The tracker's answer to the LLM-transport question, counted HERE
+        # and BEFORE the gate: every `interceptors.seam.*` bump lives in this
+        # module, and a span the mode refuses must still count — the counter
+        # is the only trace an unconfirmed connection leaves under the
+        # default mode. Once per connection, because this runs once per
+        # connection: the WS span is built at close.
+        if txn.ws_llm_call:
+            counters.bump("interceptors.seam.ws_llm_semantics_unread")
+        elif txn.ws_llm_unconfirmed:
+            counters.bump("interceptors.seam.ws_llm_endpoint_unconfirmed")
         # `sem=None`: a WS session carries no parsed LLM semantics (by
-        # construction on this path), so it is captured only under ALL, an
-        # allowlisted host, or a live local span. Inline — WS never defers
-        # (§3.6) — but the DECISION is the same module `_gate` the deferred
-        # path uses, composed with the same fail-open prefilter.
+        # construction on this path), so it is captured under ALL, an
+        # allowlisted host, a live local span, or — the one claim this path
+        # can make — a connection that confirmed LLM calls crossed it
+        # (`ws_llm_call`). Inline — WS never defers (§3.6) — but the DECISION
+        # is the same module `_gate` the deferred path uses, composed with the
+        # same fail-open prefilter.
         if not _should_capture(
             self._prefilter_of(st), txn, None, mode=capture_mode_of(self._client)
         ):
@@ -803,6 +836,9 @@ class _PendingTxn:
     server_address: str
     server_port: int
     is_grpc: bool
+    #: `classify_path(txn.path)`: "llm_call" | "provider_state" | None —
+    #: never "excluded", which returns before a job is sealed.
+    treatment: str | None
     prefilter: Prefilter
     mode: CaptureMode
     connect_ms: float
@@ -853,6 +889,10 @@ def _should_capture(
     exactly as `degraded_run` cannot honestly answer `parent`. The policy's
     signature does not change; the widening is this caller's input.
 
+    A WS session that confirmed LLM calls crossed it claims `agent_semantic`
+    without a `sem`: the calls happened, wardex did not read them, and the
+    marked span is the only place that fact can ship.
+
     Failing OPEN around the composition stays this function's job rather
     than the policy's: `has_core_semantics` runs parser output through
     host-supplied objects and can raise, `should_capture` cannot — so the
@@ -867,7 +907,8 @@ def _should_capture(
         return should_capture(
             mode,
             parent=getattr(txn, "parent", None),
-            agent_semantic=sem is not None and _is_llm_traffic(txn, sem),
+            agent_semantic=(sem is not None and _is_llm_traffic(txn, sem))
+            or getattr(txn, "ws_llm_call", False),
             degraded=unparsed or in_degraded_run() or getattr(txn, "parent_evicted", False),
             parent_closed=getattr(txn, "parent_closed", False),
         )
@@ -913,6 +954,13 @@ def _assemble(p: _PendingTxn, *, parse: bool, extra: tuple[Limitation, ...]) -> 
             parse_failed = True
     unparsed = ((not parse) or parse_failed) and not p.is_grpc
     if not _should_capture(p.prefilter, txn, sem, mode=p.mode, unparsed=unparsed):
+        if p.treatment == "provider_state":
+            # A Conversations-API-shaped path (provider-owned agent state, no
+            # model, no usage) the mode refused. Not an LLM call, so refusing
+            # is right — but a recognised provider path must never vanish
+            # uncounted. Generic refusals stay uncounted: they are every
+            # non-LLM request.
+            counters.bump("interceptors.seam.provider_state_dropped")
         return None
     withhold_bodies = unparsed and not _should_capture(
         p.prefilter, txn, sem, mode=p.mode, unparsed=False
@@ -1130,6 +1178,14 @@ def _latched(txn: _Txn) -> Ambient:
     it already captured.
     """
     return Ambient(span_context=txn.parent, conversation=None, tracestate=None)
+
+
+def _url_host(obj: Any, st: _ConnectionState) -> str:
+    """The host a URL on this connection names: the TLS server name when
+    there is one, else the peer address `_peer` recorded on `st`. One
+    expression for the WS swap site and `_seal`, so the WebSocket-transport
+    question and the HTTP span's URL are asked about the same host."""
+    return getattr(obj, "server_hostname", None) or st.server_address
 
 
 def _peer(obj: Any) -> tuple[str, int]:

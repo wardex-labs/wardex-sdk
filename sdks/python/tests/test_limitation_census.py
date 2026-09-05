@@ -245,6 +245,9 @@ _MEMBER_SITES: dict[str, frozenset[str]] = {
     # same six lines, and the copy is what let one of them keep a stale
     # installed-flag gate on the uninstall the other had outgrown.
     "WS_NO_CLOSE": frozenset({"_interceptors/_seam.py"}),
+    # The tracker names the member (confirmed on the first client message);
+    # the seam re-attaches `txn.ws_markers` by variable, not by site.
+    "WS_LLM_SEMANTICS_UNREAD": frozenset({"_interceptors/_trackers.py"}),
     # --- unit / adapter lifecycle ---
     "CHILD_SPAN_UNCLOSED": frozenset({"_adapters/_assembler.py", "_assembly/_units.py"}),
     # The registry's own breadth bound: `UnitRegistry.open` (child table) and
@@ -627,6 +630,12 @@ _EMITTED_MEMBERS: frozenset[str] = frozenset(
         # (47).
         "PARSE_BACKLOG_FULL",
         "PARSE_SKIPPED_AT_SHUTDOWN",
+        # The nineteenth: the WebSocket LLM-transport marker, minted WITH its
+        # emitter (the WS tracker's `_build_txn`, fed by the endpoint table's
+        # `classify_ws_upgrade` answer and the first client message). Before
+        # it, a Responses-over-WebSocket connection produced no span and no
+        # counter under the default mode.
+        "WS_LLM_SEMANTICS_UNREAD",
     }
 )
 """Which MEMBERS have an emit site today, derived independently below.
@@ -1580,15 +1589,21 @@ _VOCABULARY: dict[str, str] = {
     #     action differs per knob ---
     "PARSE_BACKLOG_FULL": "parse_backlog_full",
     "PARSE_SKIPPED_AT_SHUTDOWN": "parse_skipped_at_shutdown",
+    # --- added after the census, by the WebSocket LLM transport (1): LLM
+    #     calls crossed a connection wardex only counted — kept apart from
+    #     SEMANTIC_PARSE_FAILED (no parser ran) and from the deferred-parse
+    #     pair (no knob restores the parse; the transport is the gap) ---
+    "WS_LLM_SEMANTICS_UNREAD": "ws_llm_semantics_unread",
 }
 
 
-def test_the_vocabulary_is_exactly_these_forty_seven() -> None:
+def test_the_vocabulary_is_exactly_these_forty_eight() -> None:
     """15 declared before the census + 21 from it + 1 from §5.4 + 1 for wardex
     itself + 1 for the OTLP size guard + 1 for the registry breadth bound
     + 2 for the OTel bridge's fail-open pair + 1 for the adapter's per-session
     bound + 1 for the dynamic-key bound + 1 for the fork tracking reset
-    + 2 for the deferred-parse queue's unparsed shipments, name by name.
+    + 2 for the deferred-parse queue's unparsed shipments + 1 for the
+    WebSocket LLM-transport marker, name by name.
 
     A count alone is not enough: a RENAME keeps the count and is the single most
     expensive mistake available here. These are proto enum values in

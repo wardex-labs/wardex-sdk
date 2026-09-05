@@ -141,15 +141,19 @@ pub(super) fn fill_openai_responses(
             out.usage_leaves = flat.leaves;
             out.usage_dropped_count = flat.dropped;
         }
-        // Output items -> ONE OutMsg, item order preserved.
+        // Output items -> ONE assistant OutMsg, item order preserved. A
+        // `message` item carrying another role (a compaction echoes the
+        // caller's own messages) becomes its own OutMsg in `pre` instead:
+        // the model never said those words.
         let mut parts: Vec<serde_json::Value> = Vec::new();
+        let mut pre: Vec<OutMsg> = Vec::new();
         let mut has_client_tool_call = false;
         for item in &r.output {
             let ty = item.get("type").and_then(|x| x.as_str()).unwrap_or("");
             if CLIENT_TOOL_TYPES.contains(&ty) {
                 has_client_tool_call = true;
             }
-            output_item_parts(item, ty, out, &mut parts);
+            output_item_parts(item, ty, out, &mut parts, &mut pre);
         }
         // status -> finish_reasons, all through the one normalizer. An
         // `error` object is the provider's own failure declaration and wins
@@ -184,10 +188,16 @@ pub(super) fn fill_openai_responses(
                 out.finish_reasons = Some(vec![f.clone()]);
             }
             if out.output_messages.is_none() {
-                out.output_messages = build_output_messages(vec![OutMsg {
+                // Non-assistant messages first, in item order, then the one
+                // assistant message: on the only body that produces them
+                // (a compaction) the wire puts the echoed messages before
+                // the model's item.
+                pre.push(OutMsg {
+                    role: None,
                     parts,
                     finish_reason: finish,
-                }]);
+                });
+                out.output_messages = build_output_messages(pre);
             }
         }
     }
@@ -217,39 +227,63 @@ pub(super) fn fill_openai_responses(
 }
 
 /// One output item -> OTel parts (design §4.4 table). Unknown types become a
-/// generic part AND set the unmapped flag — never silently skipped.
+/// generic part AND set the unmapped flag — never silently skipped. A
+/// `message` item whose `role` is not `assistant` goes to `pre` as its own
+/// message rather than into the assistant's `parts`; `input_text` is text
+/// only under such a role (a compaction echoes the caller's blocks), so an
+/// `input_text` block inside an assistant item — off-schema — stays an
+/// unmapped generic part rather than becoming the model's own words.
 fn output_item_parts(
     item: &serde_json::Value,
     ty: &str,
     out: &mut LlmSemantics,
     parts: &mut Vec<serde_json::Value>,
+    pre: &mut Vec<OutMsg>,
 ) {
     let str_of = |field: &str| item.get(field).and_then(|x| x.as_str());
     let call_id = || str_of("call_id").map(str::to_string);
     match ty {
         "message" => {
+            let role = str_of("role").unwrap_or("assistant");
+            let assistant = role == "assistant";
+            let mut local: Vec<serde_json::Value> = Vec::new();
             if let Some(content) = item.get("content").and_then(|c| c.as_array()) {
                 for block in content {
                     match block.get("type").and_then(|x| x.as_str()).unwrap_or("") {
                         "output_text" => {
                             let text = block.get("text").and_then(|x| x.as_str()).unwrap_or("");
                             if !text.is_empty() {
-                                parts.push(text_part(text.to_string()));
+                                local.push(text_part(text.to_string()));
+                            }
+                        }
+                        "input_text" if !assistant => {
+                            let text = block.get("text").and_then(|x| x.as_str()).unwrap_or("");
+                            if !text.is_empty() {
+                                local.push(text_part(text.to_string()));
                             }
                         }
                         "refusal" => {
                             let refusal =
                                 block.get("refusal").and_then(|x| x.as_str()).unwrap_or("");
                             if !refusal.is_empty() {
-                                parts.push(text_part(refusal.to_string()));
+                                local.push(text_part(refusal.to_string()));
                             }
                         }
                         other => {
-                            parts.push(generic_part(other));
+                            local.push(generic_part(other));
                             out.output_messages_has_unmapped = true;
                         }
                     }
                 }
+            }
+            if assistant {
+                parts.extend(local);
+            } else {
+                pre.push(OutMsg {
+                    role: Some(role.to_string()),
+                    parts: local,
+                    finish_reason: None,
+                });
             }
         }
         "function_call" => {

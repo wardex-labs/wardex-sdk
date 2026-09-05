@@ -1,0 +1,22 @@
+{
+ "provider": "openai",
+ "operation": "chat",
+ "api_type": "responses",
+ "request_model": "gpt-5.1",
+ "response_model": null,
+ "response_id": "resp_cmp1",
+ "input_tokens": 1200,
+ "output_tokens": 300,
+ "cache_read_input_tokens": 0,
+ "reasoning_output_tokens": 0,
+ "finish_reasons": null,
+ "output_messages_present": true,
+ "response_status": null,
+ "usage_leaves": {
+  "input_tokens": 1200,
+  "input_tokens_details.cached_tokens": 0,
+  "output_tokens": 300,
+  "output_tokens_details.reasoning_tokens": 0,
+  "total_tokens": 1500
+ }
+}

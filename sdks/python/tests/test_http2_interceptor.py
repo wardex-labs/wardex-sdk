@@ -4,6 +4,7 @@ import httpx
 import pytest
 
 import wardex_sdk as wardex
+from conftest import client_spans
 from wardex_sdk import _hub
 from wardex_sdk._enums import CaptureMode, SpanKind
 
@@ -26,12 +27,6 @@ def _reset():
     _hub.reset_for_test()
 
 
-def _client_spans():
-    client = _hub.get_client()
-    client._settle()  # finalization runs on the worker; settle before reading
-    return [s for s in client._spans if s.kind == SpanKind.CLIENT]
-
-
 def test_h2_call_is_captured(h2_server):
     # capture_mode=ALL: this test targets HTTP/2 span assembly (method/status/
     # body/headers-stripped), not the AGENT-mode policy gate, and there is no
@@ -46,7 +41,7 @@ def test_h2_call_is_captured(h2_server):
     assert resp.status_code == 200
     assert resp.http_version == "HTTP/2"
 
-    spans = _client_spans()
+    spans = client_spans()
     assert len(spans) == 1
     sp = spans[0]
     assert sp.transport.http.method == "POST"

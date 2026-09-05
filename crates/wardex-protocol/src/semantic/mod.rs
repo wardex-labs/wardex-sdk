@@ -15,6 +15,7 @@ mod tests;
 pub mod usage;
 
 use anthropic::{fill_anthropic, reassemble_anthropic};
+pub use endpoint::{treatment, ws_upgrade, Treatment, WsUpgrade};
 use endpoint::{Api, Endpoint};
 use openai_chat::{fill_openai_chat, reassemble_openai};
 use openai_embeddings::fill_openai_embeddings;

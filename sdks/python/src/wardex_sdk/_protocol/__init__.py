@@ -7,6 +7,8 @@ from ._http2 import Http2Parser
 
 parse_llm_semantics = _native_protocol.parse_llm_semantics
 normalize_finish_reason = _native_protocol.normalize_finish_reason
+classify_path = _native_protocol.classify_path
+classify_ws_upgrade = _native_protocol.classify_ws_upgrade
 parse_grpc_frames = _native_protocol.parse_grpc_frames
 grpc_status_name = _native_protocol.grpc_status_name
 JsonRpcParser = _native_protocol.JsonRpcParser
@@ -19,6 +21,8 @@ __all__ = [
     "Http2Parser",
     "parse_llm_semantics",
     "normalize_finish_reason",
+    "classify_path",
+    "classify_ws_upgrade",
     "parse_grpc_frames",
     "grpc_status_name",
     "JsonRpcParser",

@@ -106,11 +106,7 @@ def _named(spans, name):
     return next(s for s in spans if s.name == name)
 
 
-@pytest.fixture(autouse=True)
-def _fresh_counters():
-    counters.reset()
-    yield
-    counters.reset()
+pytestmark = pytest.mark.usefixtures("fresh_counters")
 
 
 @pytest.fixture(autouse=True)

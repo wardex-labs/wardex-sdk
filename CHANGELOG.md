@@ -7,6 +7,17 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- **The openai-agents SDK's own trace upload no longer becomes a span.** By
+  default the framework POSTs its whole run record — every prompt,
+  completion, model and usage of the run — to `/v1/traces/ingest`. Under
+  `capture_mode=ALL`, an `intercept_hosts` allowlist, or inside a
+  `@wardex.workflow` span that request shipped as one extra
+  `HTTP POST /v1/traces/ingest` span whose `input_data` was the entire
+  record. Any host, any path ending in `/v1/traces/ingest` is now skipped
+  before the body is parsed or attached to a span — the bytes still pass
+  through the per-connection buffer, capped by
+  `LimitsConfig.max_body_bytes`, and are discarded unparsed — and counted
+  under `interceptors.seam.path_excluded`.
 - **A raising LLM-semantic parser no longer deletes the span.** The parse
   exception used to be swallowed uncounted (`sem=None`), and under the
   default AGENT mode with no ambient parent the whole span was then gated
@@ -145,6 +156,60 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- **A WebSocket connection carrying LLM calls is no longer invisible.** With
+  the openai-agents SDK's opt-in `use_responses_websocket=True` every run went
+  over one `wss://…/v1/responses` connection and, under the default capture
+  mode, produced no span and no counter. Now, once the first call crosses
+  such a connection — the path is the Responses endpoint and either the host
+  is OpenAI's own (exactly `api.openai.com` or a subdomain of `openai.com`;
+  `openai-mock.corp` is not) or the first client message is a Responses
+  `response.create` —
+  wardex counts it under `interceptors.seam.ws_llm_semantics_unread` and
+  emits one `WS /v1/responses` span per connection, both **when the
+  connection closes** (marked `ws_no_close` if the connection ends
+  without a WebSocket close handshake — a server drop, a timeout, process
+  exit — or wardex is uninstalled first), under the default mode, marked
+  `ws_llm_semantics_unread`
+  (vocabulary 48): LLM calls crossed it and wardex read none of their
+  meaning. The span carries `ws.messages.sent` (about one per call), byte
+  counts and payload samples — compressed bytes, marked `payload_compressed`,
+  when permessage-deflate was negotiated, which the `websockets` client
+  requests by default — and no model, tokens or messages. A Responses-path
+  connection to an unknown host with compressed payloads is only counted,
+  under `interceptors.seam.ws_llm_endpoint_unconfirmed`. Under `ALL`, under an
+  `intercept_hosts` entry, or inside a local span that unconfirmed connection
+  does ship, but as an ordinary WebSocket span — `WS /v1/responses`, status
+  OK, no `ws_llm_semantics_unread` marker (measured against a loopback
+  server: one span, markers `['payload_compressed']` only) — so the counter
+  is the only signal that unread LLM calls crossed it. Switch the framework
+  to its default HTTP transport to get `gen_ai` spans.
+- **`POST /v1/responses/compact` is captured as the billable LLM call it is:**
+  `chat` operation, request model, `usage` tokens, `openai.api.type=responses`.
+  It exports as `chat <model>`; `transport.http.url` ending in
+  `/v1/responses/compact` is what tells it from a chat. It has no assistant
+  turn, so `finish_reasons` and `response_status` stay empty and the
+  compaction item ships marked `output_messages_unmapped_part`. The result
+  body is the caller's own compacted messages plus that one `compaction`
+  item, and `gen_ai.output.messages` keeps each output item's own `role`, so
+  the echoed user messages stay `user` rather than becoming the model's
+  words. Ordinary Responses bodies, whose output is always the model's, are
+  unchanged.
+- **Conversations-API-shaped paths (`…/v1/conversations[/{id}[/items[/{item}]]]`)
+  are classified, and a drop is counted.** They are server-side agent state —
+  no model, no usage, no output — and were already plain HTTP (never parsed,
+  never a false `semantic_parse_failed`); that does not change. What changes:
+  under the default mode a call outside a local span was dropped silently,
+  and is now counted under `interceptors.seam.provider_state_dropped`; inside
+  a local span, under `ALL`, or under `intercept_hosts` it is captured as
+  before.
+- **Test dependency `openai-agents>=0.22,<0.23`** and
+  `tests/test_openai_agents_wire.py`: the 3-turn run (tool call → handoff →
+  final answer) on both `Runner.run` and `Runner.run_streamed` is pinned on
+  the wire — three `chat` spans with tokens, the tool `call_id` restored into
+  the next turn's input, the export-time name `chat <model>`, and the
+  framework's run-record upload excluded and counted; a `conversation_id`
+  run pins the delta-input shape above. Only 0.22 is measured; the pin says
+  why.
 - **The LLM-semantic parse runs off the caller's thread.** A completed
   transaction is now SEALED on the thread that carried its bytes (timing,
   prefilter, context snapshot — microseconds) and finished on a dedicated
@@ -284,6 +349,9 @@ All notable changes to this project are documented here. The format follows
 
 ### Changed
 
+- **`capture_mode=ALL` and `intercept_hosts` have their first exception:**
+  telemetry uploads (any host, path ending in `/v1/traces/ingest`) are never
+  captured. README's capture_mode section says so.
 - **`flush()`, `close()` and the signal flush finish pending parses before
   exporting, each phase on its own budget.** A bare `flush()` drains the
   backlog on the transport's own number and still hands the POST that same
@@ -407,6 +475,19 @@ All notable changes to this project are documented here. The format follows
 
 ### Known ecosystem findings (not wardex defects)
 
+- **openai-agents `Runner.run(conversation_id=…)`** (measured on 0.22 in
+  `tests/test_openai_agents_wire.py`): each turn is still a `chat` span, but
+  the request carries only the items the framework has not sent yet — turn
+  two is the tool result alone, turn three the handoff result alone — so
+  `gen_ai.input.messages` holds that delta. The framework never calls the
+  Conversations API itself on this path: all three POSTs are `/v1/responses`.
+  The default `Runner.run` (no `conversation_id`,
+  no `previous_response_id`) resends the full input every turn, so nothing
+  is missing there; the join key across turns is the tool `call_id` echoed
+  in the next input, which is restored.
+- **OpenAI Realtime (`wss://…/v1/realtime`) is still silently dropped outside
+  a local span:** its path is not a WebSocket-capable row in the endpoint
+  table, so the marker above does not apply to it.
 - Langfuse's shipped price table has no `output_reasoning_tokens` price for
   any Claude model (or `gpt-5.4-mini`/`gpt-5.4-nano`), so a reported
   reasoning tier is subtracted from priced output and lands unbilled. wardex
@@ -424,6 +505,16 @@ All notable changes to this project are documented here. The format follows
   processor in front. The open check is the oracle's Phoenix counterpart
   (the Langfuse e2e driver pointed at a live Phoenix); until someone runs
   it, treat Phoenix cost columns under wardex as unverified.
+
+### Known limitations
+
+- **wardex does not yet surface the request's `conversation` id (no
+  `gen_ai.conversation.id`).** Under openai-agents
+  `Runner.run(conversation_id=…)` the field is on the wire in every request —
+  measured on 0.22 in `tests/test_openai_agents_wire.py`, all three POSTs
+  carry `conversation=conv_1` — so the id that joins the turns is there to be
+  read and wardex simply does not map it onto the span. Nothing about the
+  framework blocks it; it is a wire-side follow-up, not an ecosystem gap.
 
 
 ## [0.5.0b1] - 2026-08-16

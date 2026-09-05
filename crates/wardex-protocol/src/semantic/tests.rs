@@ -1894,3 +1894,95 @@ fn responses_body_on_localhost_is_not_mistaken_for_anthropic() {
     assert_eq!(s.api_type, Some("responses"));
     assert_eq!(s.usage.input_tokens(), Some(52));
 }
+
+/// A Responses output `message` item that carries a role other than
+/// `assistant` (a compaction echoes the caller's own messages) keeps that
+/// role in `gen_ai.output.messages` instead of being folded into the
+/// assistant's message as words the model never said.
+#[test]
+fn user_role_output_items_keep_their_role() {
+    let resp = br#"{"id":"resp_r","object":"response","status":"completed","output":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]},{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hi"}]}]}"#;
+    let s = parse_responses_fixture(br#"{"model":"gpt-5.1","input":"x"}"#, resp);
+    let v: serde_json::Value = serde_json::from_str(&s.output_messages.unwrap()).unwrap();
+    let msgs = v.as_array().unwrap();
+    assert_eq!(msgs.len(), 2);
+    assert_eq!(msgs[0]["role"], "user");
+    assert_eq!(msgs[0]["parts"][0]["type"], "text");
+    assert_eq!(msgs[0]["parts"][0]["content"], "hello");
+    assert!(msgs[0].get("finish_reason").is_none());
+    assert_eq!(msgs[1]["role"], "assistant");
+    assert_eq!(msgs[1]["parts"][0]["content"], "hi");
+    assert_eq!(msgs[1]["finish_reason"], "stop");
+    for m in msgs.iter().filter(|m| m["role"] == "assistant") {
+        for part in m["parts"].as_array().unwrap() {
+            assert_ne!(
+                part["content"], "hello",
+                "user text leaked into the assistant"
+            );
+        }
+    }
+}
+
+/// `POST /v1/responses/compact` is a billable LLM call: model + input in,
+/// usage + output items out. It has no assistant turn (no `status` on the
+/// wire), so finish_reasons/response_status stay empty; its echoed user
+/// message keeps its role and the compaction item ships as an unmapped
+/// generic part rather than as anything the model said.
+#[test]
+fn responses_compact_is_a_billable_llm_call() {
+    let s = parse_llm(
+        "api.openai.com",
+        "/v1/responses/compact",
+        fixture!("openai_responses_compact", "request.json"),
+        fixture!("openai_responses_compact", "response.json"),
+        Limits::default(),
+    )
+    .expect("compact fixture parses");
+    assert_eq!(s.operation, "chat");
+    assert_eq!(s.api_type, Some("responses"));
+    assert_eq!(s.request_model.as_deref(), Some("gpt-5.1"));
+    assert_eq!(s.response_id.as_deref(), Some("resp_cmp1"));
+    assert_eq!(s.usage.input_tokens(), Some(1200));
+    assert_eq!(s.usage.output_tokens(), Some(300));
+    assert!(s.finish_reasons.is_none());
+    assert!(s.response_status.is_none());
+    assert!(s.output_messages_has_unmapped);
+    let v: serde_json::Value = serde_json::from_str(&s.output_messages.unwrap()).unwrap();
+    let msgs = v.as_array().unwrap();
+    assert_eq!(msgs.len(), 2);
+    assert_eq!(msgs[0]["role"], "user");
+    assert_eq!(msgs[0]["parts"][0]["content"], "hello");
+    assert_eq!(msgs[1]["role"], "assistant");
+    assert_eq!(
+        msgs[1]["parts"],
+        serde_json::json!([{"type": "compaction"}]),
+        "the compaction item is the assistant's only part"
+    );
+    for part in msgs[1]["parts"].as_array().unwrap() {
+        assert_ne!(part.get("content"), Some(&serde_json::json!("hello")));
+    }
+}
+
+/// `input_text` is a block the CALLER writes; it is accepted as text only
+/// under a non-assistant role. An `input_text` block inside an ASSISTANT
+/// item is off-schema and stays what an unknown block is: a generic part
+/// with the unmapped flag — never the model's own words.
+#[test]
+fn input_text_is_text_only_under_a_non_assistant_role() {
+    let resp = br#"{"id":"resp_r","object":"response","status":"completed","output":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]},{"type":"message","role":"assistant","content":[{"type":"input_text","text":"smuggled"}]}]}"#;
+    let s = parse_responses_fixture(br#"{"model":"gpt-5.1","input":"x"}"#, resp);
+    assert!(s.output_messages_has_unmapped);
+    let v: serde_json::Value = serde_json::from_str(&s.output_messages.unwrap()).unwrap();
+    let msgs = v.as_array().unwrap();
+    assert_eq!(msgs.len(), 2);
+    assert_eq!(msgs[0]["role"], "user");
+    assert_eq!(
+        msgs[0]["parts"],
+        serde_json::json!([{"type": "text", "content": "hello"}])
+    );
+    assert_eq!(msgs[1]["role"], "assistant");
+    assert_eq!(
+        msgs[1]["parts"],
+        serde_json::json!([{"type": "input_text"}])
+    );
+}

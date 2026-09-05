@@ -68,6 +68,12 @@ test = [
     # version check anywhere in this repo — the surface probe plus this pin IS the
     # floor. See the LangGraph adapter design §7.1.
     "langgraph>=1.2,<2",
+    # Only 0.22.x is measured (2026-09-05): the Responses request shape on
+    # Runner.run / Runner.run_streamed, the `transfer_to_<agent>` handoff tool
+    # name, the trace exporter's hardcoded `/v1/traces/ingest` endpoint and the
+    # `httpx2` client it rides are all internals with no runtime check in this
+    # repo — the wire test plus this pin IS the floor.
+    "openai-agents>=0.22,<0.23",
     "langchain-core>=0.3",
     # `langchain` (not just langchain-core) because `langchain.agents.create_agent`
     # is the non-deprecated successor to `create_react_agent`, and the tool seam's

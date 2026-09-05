@@ -6,6 +6,11 @@
 //! false `semantic_parse_failed` on every one), and the missing `/v1/responses`
 //! row sent Responses SSE through the Chat reassembler, which fabricated an
 //! empty chat body.
+//!
+//! Two wider questions live beside the LLM table: `treatment` classifies a
+//! provider path that is NOT an LLM call (provider-owned state to keep as
+//! plain HTTP, or a telemetry upload to exclude), and `ws_upgrade` says
+//! whether a WebSocket upgrade on an LLM path may carry LLM calls.
 
 /// Which provider API shape the transaction used. Not the same axis as the
 /// provider label: a gateway can serve an OpenAI-shaped API from any host.
@@ -35,60 +40,218 @@ pub struct Endpoint {
     pub operation: &'static str,
     /// semconv `openai.api.type`; None for non-OpenAI APIs.
     pub api_type: Option<&'static str>,
+    /// This API has a WebSocket transport on the same path; the seam may
+    /// treat a WS upgrade here as an LLM connection — only after
+    /// corroboration, see `ws_upgrade`.
+    pub ws_transport: bool,
+}
+
+/// One segment of a path pattern: a literal, or any single segment (a
+/// resource id). Both tables below are written in it and matched by the one
+/// `suffix_matches`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Seg {
+    Lit(&'static str),
+    Any,
+}
+
+use Seg::{Any, Lit};
+
+/// Does `pattern` match the LAST segments of `segments`?
+fn suffix_matches(segments: &[&str], pattern: &[Seg]) -> bool {
+    if segments.len() < pattern.len() {
+        return false;
+    }
+    let tail = &segments[segments.len() - pattern.len()..];
+    pattern.iter().zip(tail).all(|(seg, got)| match seg {
+        Lit(want) => want == got,
+        Any => true,
+    })
 }
 
 /// Matched against the path's LAST segments — query, fragment and trailing
 /// `/` stripped, then split on `/`. Gateway prefixes (`/openai/v1/...`,
 /// `/proxy/...`) pass through; sub-resources (`/v1/responses/{id}`,
 /// `/v1/messages/count_tokens`, `/v1/messages/batches`) do not match.
-const ENDPOINTS: &[(&[&str], Endpoint)] = &[
+const ENDPOINTS: &[(&[Seg], Endpoint)] = &[
     (
-        &["chat", "completions"],
+        &[Lit("chat"), Lit("completions")],
         Endpoint {
             api: Api::OpenAiChatCompletions,
             operation: "chat",
             api_type: Some("chat_completions"),
+            ws_transport: false,
         },
     ),
     (
-        &["responses"],
+        &[Lit("responses")],
         Endpoint {
             api: Api::OpenAiResponses,
             operation: "chat",
             api_type: Some("responses"),
+            ws_transport: true,
+        },
+    ),
+    // A compaction is billed: model + input in, usage + output items out.
+    // Same parser and label as /responses; a `CompactedResponse` carries no
+    // `status`, so finish_reasons/response_status stay empty, and its echoed
+    // user messages keep their role (parts.rs `OutMsg.role`) rather than
+    // becoming the model's words. Listed AFTER the /responses row so
+    // `lookup(Api::OpenAiResponses)` keeps answering with /responses.
+    (
+        &[Lit("responses"), Lit("compact")],
+        Endpoint {
+            api: Api::OpenAiResponses,
+            operation: "chat",
+            api_type: Some("responses"),
+            ws_transport: false,
         },
     ),
     (
-        &["embeddings"],
+        &[Lit("embeddings")],
         Endpoint {
             api: Api::OpenAiEmbeddings,
             operation: "embeddings",
             api_type: None,
+            ws_transport: false,
         },
     ),
     (
-        &["messages"],
+        &[Lit("messages")],
         Endpoint {
             api: Api::AnthropicMessages,
             operation: "chat",
             api_type: None,
+            ws_transport: false,
         },
     ),
 ];
+
+/// The path's segments: query, fragment and trailing `/` stripped, split on
+/// `/`, empties dropped.
+fn segments_of(path: &str) -> Vec<&str> {
+    let path = path.split(['?', '#']).next().unwrap_or("");
+    let path = path.trim_end_matches('/');
+    path.split('/').filter(|s| !s.is_empty()).collect()
+}
 
 /// The path-based decision. Conservative by design: a non-matching path is
 /// None, never a guess (body-shape capture on arbitrary paths is the
 /// compat-gateway follow-up, not this table's job).
 pub fn from_path(path: &str) -> Option<Endpoint> {
-    let path = path.split(['?', '#']).next().unwrap_or("");
-    let path = path.trim_end_matches('/');
-    let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-    for (suffix, endpoint) in ENDPOINTS {
-        if segments.len() >= suffix.len() && segments[segments.len() - suffix.len()..] == **suffix {
-            return Some(*endpoint);
-        }
+    endpoint_of(&segments_of(path))
+}
+
+/// `from_path` over already-split segments, so `treatment` splits once.
+fn endpoint_of(segments: &[&str]) -> Option<Endpoint> {
+    ENDPOINTS
+        .iter()
+        .find(|(suffix, _)| suffix_matches(segments, suffix))
+        .map(|(_, endpoint)| *endpoint)
+}
+
+/// What the seam does with a provider path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Treatment {
+    /// An LLM endpoint (`from_path` is Some): parsed for gen_ai semantics.
+    LlmCall,
+    /// Provider-owned agent state (the Conversations API family). Plain
+    /// HTTP: no model, no usage, no assistant output anywhere in the
+    /// family, so there is nothing an LLM span would carry. Follows the
+    /// non-LLM capture rule, and a refusal is counted.
+    ProviderState,
+    /// A telemetry upload (`/v1/traces/ingest`): the caller's own run
+    /// record on its way to a tracing backend. Telemetry ABOUT the agent,
+    /// not agent activity — never captured, in any mode, above any
+    /// allowlist; counted.
+    Excluded,
+}
+
+/// Anchored on `v1`: `/conversations` and `/traces` are shared API
+/// vocabulary, unlike the LLM rows' last segments. A gateway prefix still
+/// passes (suffix match); a root-level `/conversations` (Intercom, Front)
+/// does not.
+const NON_LLM_PATHS: &[(&[Seg], Treatment)] = &[
+    (&[Lit("v1"), Lit("conversations")], Treatment::ProviderState),
+    (
+        &[Lit("v1"), Lit("conversations"), Any],
+        Treatment::ProviderState,
+    ),
+    (
+        &[Lit("v1"), Lit("conversations"), Any, Lit("items")],
+        Treatment::ProviderState,
+    ),
+    (
+        &[Lit("v1"), Lit("conversations"), Any, Lit("items"), Any],
+        Treatment::ProviderState,
+    ),
+    (
+        &[Lit("v1"), Lit("traces"), Lit("ingest")],
+        Treatment::Excluded,
+    ),
+];
+
+/// The path classification: `LlmCall` when `from_path` matches, else the
+/// first `NON_LLM_PATHS` suffix match, else None (an unrecognised path —
+/// ordinary HTTP, no claim).
+pub fn treatment(path: &str) -> Option<Treatment> {
+    let segments = segments_of(path);
+    if endpoint_of(&segments).is_some() {
+        return Some(Treatment::LlmCall);
     }
-    None
+    NON_LLM_PATHS
+        .iter()
+        .find(|(pattern, _)| suffix_matches(&segments, pattern))
+        .map(|(_, treatment)| *treatment)
+}
+
+/// The WebSocket-transport question's answer: the upgrade path is a
+/// WebSocket-capable LLM row, and the host either IS that row's provider
+/// or is not.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WsUpgrade {
+    /// The host is one of the provider's own (`is_official_host`): the
+    /// connection carries LLM calls.
+    KnownProvider,
+    /// Any other host — an IP, a gateway, a mock whose name merely contains
+    /// the provider's: the seam must corroborate from the first client
+    /// message before claiming anything.
+    UnknownHost,
+}
+
+/// The provider's own API hosts: the apex API host or any subdomain of the
+/// provider's domain. Deliberately NOT the substring test the provider
+/// label uses (`provider_from_host`): a label is a hint on a span, but this
+/// answer makes a bare WebSocket ship under the default mode with payload
+/// samples, and `openai-mock.corp` speaking its own protocol on
+/// `/v1/responses` must not earn that on the strength of its hostname. The
+/// HTTP path refuses the same claim (the seam wants parsed semantics, not a
+/// hostname) and this keeps the two transports honest to the same degree.
+fn is_official_host(provider: &str, host: &str) -> bool {
+    let host = host.to_ascii_lowercase();
+    let domain = match provider {
+        "openai" => "openai.com",
+        "anthropic" => "anthropic.com",
+        _ => return false,
+    };
+    host == format!("api.{domain}")
+        || host
+            .strip_suffix(domain)
+            .is_some_and(|prefix| prefix.ends_with('.'))
+}
+
+/// None unless the upgrade path matches a `ws_transport` row (the one
+/// provider API with a WebSocket transport today is Responses).
+pub fn ws_upgrade(host: &str, path: &str) -> Option<WsUpgrade> {
+    let e = from_path(path)?;
+    if !e.ws_transport {
+        return None;
+    }
+    if is_official_host(e.api.provider(), host) {
+        Some(WsUpgrade::KnownProvider)
+    } else {
+        Some(WsUpgrade::UnknownHost)
+    }
 }
 
 /// The body-shape decision, for PROVIDER inference when the host says
@@ -98,8 +261,10 @@ pub fn from_path(path: &str) -> Option<Endpoint> {
 pub fn from_body_shape(body: &serde_json::Value) -> Option<Endpoint> {
     let obj = body.as_object()?;
     let is = |name: &str| obj.get("object").and_then(|o| o.as_str()) == Some(name);
-    // 1. Responses: object == "response", or an output array beside a status.
+    // 1. Responses: object == "response" (or a compaction's
+    //    "response.compaction"), or an output array beside a status.
     if is("response")
+        || is("response.compaction")
         || (obj.get("output").is_some_and(serde_json::Value::is_array)
             && obj.contains_key("status"))
     {
@@ -187,6 +352,7 @@ mod tests {
             ("/v1/responses", Api::OpenAiResponses),
             ("/openai/v1/responses?api-version=x", Api::OpenAiResponses),
             ("/v1/responses/", Api::OpenAiResponses),
+            ("/v1/responses/compact", Api::OpenAiResponses),
             ("/v1/chat/completions", Api::OpenAiChatCompletions),
             (
                 "/openai/deployments/d/chat/completions",
@@ -202,7 +368,6 @@ mod tests {
         let negative = [
             "/v1/responses/resp_1",
             "/v1/responses/resp_1/input_items",
-            "/v1/responses/compact",
             "/v1/messages/count_tokens",
             "/v1/messages/batches",
             "/v1/models",
@@ -211,6 +376,75 @@ mod tests {
         ];
         for path in negative {
             assert_eq!(from_path(path), None, "{path}");
+        }
+    }
+
+    /// The wider classification: LLM rows, the Conversations family
+    /// (provider state, anchored on `v1`), the telemetry upload (excluded),
+    /// and everything else None.
+    #[test]
+    fn non_llm_provider_paths_get_a_treatment() {
+        use Treatment::*;
+        let rows = [
+            ("/v1/responses", Some(LlmCall)),
+            ("/v1/responses/compact", Some(LlmCall)),
+            ("/v1/conversations", Some(ProviderState)),
+            ("/v1/conversations/conv_1", Some(ProviderState)),
+            (
+                "/v1/conversations/conv_1/items?limit=20",
+                Some(ProviderState),
+            ),
+            ("/v1/conversations/conv_1/items/msg_1", Some(ProviderState)),
+            ("/openai/v1/conversations/conv_1/items", Some(ProviderState)),
+            ("/v1/traces/ingest", Some(Excluded)),
+            ("/proxy/v1/traces/ingest", Some(Excluded)),
+            ("/conversations/conv_1", None),
+            ("/api/traces/ingest", None),
+            ("/v1/responses/resp_1", None),
+            ("/v1/models", None),
+            ("", None),
+        ];
+        for (path, want) in rows {
+            assert_eq!(treatment(path), want, "{path}");
+        }
+    }
+
+    /// Only a `ws_transport` row opens the WebSocket question, and the host
+    /// decides between a known provider and one still to corroborate.
+    #[test]
+    fn ws_upgrade_needs_a_ws_capable_row() {
+        assert_eq!(
+            ws_upgrade("api.openai.com", "/v1/responses"),
+            Some(WsUpgrade::KnownProvider)
+        );
+        assert_eq!(
+            ws_upgrade("eu.api.openai.com", "/v1/responses"),
+            Some(WsUpgrade::KnownProvider)
+        );
+        // A host that merely CONTAINS the provider's name is not the
+        // provider: a mock or a shim speaking its own protocol on the
+        // Responses path must not ship under the default mode on the
+        // strength of its hostname.
+        for host in [
+            "127.0.0.1",
+            "openai-mock.corp",
+            "openai-shim.corp",
+            "api.openai.com.evil.example",
+            "notopenai.com",
+        ] {
+            assert_eq!(
+                ws_upgrade(host, "/v1/responses"),
+                Some(WsUpgrade::UnknownHost),
+                "{host}"
+            );
+        }
+        for (host, path) in [
+            ("api.openai.com", "/v1/chat/completions"),
+            ("chat.example.com", "/messages"),
+            ("api.openai.com", "/v1/responses/compact"),
+            ("x", "/realtime"),
+        ] {
+            assert_eq!(ws_upgrade(host, path), None, "{host}{path}");
         }
     }
 
@@ -244,6 +478,14 @@ mod tests {
         let body = serde_json::json!({
             "output": [], "status": "completed",
             "usage": {"input_tokens": 5}
+        });
+        assert_eq!(
+            from_body_shape(&body).map(|e| e.api),
+            Some(Api::OpenAiResponses)
+        );
+        // a compaction has no status; its `object` spelling decides:
+        let body = serde_json::json!({
+            "object": "response.compaction", "output": [], "usage": {}
         });
         assert_eq!(
             from_body_shape(&body).map(|e| e.api),

@@ -130,6 +130,10 @@ pub(super) fn build_system_instructions(parts: Vec<serde_json::Value>) -> Option
 
 /// Intermediate representation of a single OutputMessage.
 pub(super) struct OutMsg {
+    /// None = assistant, the only role a completion can carry; Some on the
+    /// one API whose output may echo the caller's own messages — a Responses
+    /// compaction — so those are never exported as what the model said.
+    pub(super) role: Option<String>,
     pub(super) parts: Vec<serde_json::Value>,
     pub(super) finish_reason: Option<String>,
 }
@@ -141,7 +145,10 @@ pub(super) fn build_output_messages(msgs: Vec<OutMsg>) -> Option<String> {
         .filter(|m| !m.parts.is_empty() || m.finish_reason.is_some())
         .map(|m| {
             let mut obj = serde_json::Map::new();
-            obj.insert("role".to_string(), serde_json::Value::from("assistant"));
+            obj.insert(
+                "role".to_string(),
+                serde_json::Value::from(m.role.unwrap_or_else(|| "assistant".to_string())),
+            );
             obj.insert("parts".to_string(), serde_json::Value::Array(m.parts));
             if let Some(fr) = m.finish_reason {
                 obj.insert("finish_reason".to_string(), serde_json::Value::from(fr));

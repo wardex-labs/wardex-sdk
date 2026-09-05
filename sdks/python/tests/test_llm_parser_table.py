@@ -40,6 +40,7 @@ _CASES: dict[str, tuple[str, str]] = {
     "openai_responses_sse_unterminated": ("api.openai.com", "/v1/responses"),
     "openai_responses_sse_error": ("api.openai.com", "/v1/responses"),
     "openai_responses_background_queued": ("api.openai.com", "/v1/responses"),
+    "openai_responses_compact": ("api.openai.com", "/v1/responses/compact"),
     "openai_embeddings": ("api.openai.com", "/v1/embeddings"),
     "anthropic_messages": ("api.anthropic.com", "/v1/messages"),
     "anthropic_messages_sse": ("api.anthropic.com", "/v1/messages"),
