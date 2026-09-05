@@ -18,11 +18,6 @@ All notable changes to this project are documented here. The format follows
   through the per-connection buffer, capped by
   `LimitsConfig.max_body_bytes`, and are discarded unparsed — and counted
   under `interceptors.seam.path_excluded`.
-- **A Responses output item that is not the model's is no longer exported as
-  the assistant's.** `gen_ai.output.messages` keeps each output `message`
-  item's own `role`; a `POST /v1/responses/compact` result (the caller's
-  compacted messages plus one `compaction` item) therefore shows the user's
-  messages as `user`. Ordinary Responses bodies are unchanged.
 - **A raising LLM-semantic parser no longer deletes the span.** The parse
   exception used to be swallowed uncounted (`sem=None`), and under the
   default AGENT mode with no ambient parent the whole span was then gated
@@ -186,7 +181,12 @@ All notable changes to this project are documented here. The format follows
   It exports as `chat <model>`; `transport.http.url` ending in
   `/v1/responses/compact` is what tells it from a chat. It has no assistant
   turn, so `finish_reasons` and `response_status` stay empty and the
-  compaction item ships marked `output_messages_unmapped_part`.
+  compaction item ships marked `output_messages_unmapped_part`. The result
+  body is the caller's own compacted messages plus that one `compaction`
+  item, and `gen_ai.output.messages` keeps each output item's own `role`, so
+  the echoed user messages stay `user` rather than becoming the model's
+  words. Ordinary Responses bodies, whose output is always the model's, are
+  unchanged.
 - **Conversations-API-shaped paths (`…/v1/conversations[/{id}[/items[/{item}]]]`)
   are classified, and a drop is counted.** They are server-side agent state —
   no model, no usage, no output — and were already plain HTTP (never parsed,
