@@ -28,7 +28,7 @@ import textwrap
 from typing import Any
 
 import pytest
-from agents import Agent, Runner
+from agents import Agent, RunConfig, Runner
 from agents.tracing import (
     TracingProcessor,
     add_trace_processor,
@@ -45,7 +45,7 @@ from wardex_sdk._adapters._openai_agents import (
     _TRACING_DISABLED_NOTICE,
     OpenAIAgentsAdapter,
 )
-from wardex_sdk._assembly import Limitation, counters
+from wardex_sdk._assembly import Limitation, LinkReason, ParentSource, counters
 from wardex_sdk._config import AdaptersConfig
 from wardex_sdk._enums import AdapterName, SpanKind, StatusCode
 from wardex_sdk.testing import RecordingTransport, installed_adapter
@@ -405,3 +405,303 @@ def test_a_shadowed_module_declines_loudly(tmp_path, monkeypatch, wardex_log):
         assert counters.get("adapters.openai_agents.shadowed") == 1
     warnings = wardex_log.lines(logging.WARNING)
     assert len(warnings) == 1 and "resolved to" in warnings[0] and str(tmp_path) in warnings[0]
+
+
+# --------------------------------------------------------------------------
+# scenarios on the fake server
+# --------------------------------------------------------------------------
+
+
+def _fc(name: str, call_id: str, args: str = "{}") -> dict:
+    return {
+        "type": "function_call",
+        "id": f"fc_{call_id}",
+        "call_id": call_id,
+        "name": name,
+        "arguments": args,
+        "status": "completed",
+    }
+
+
+_DONE = [
+    {
+        "type": "message",
+        "id": "msg_1",
+        "role": "assistant",
+        "status": "completed",
+        "content": [{"type": "output_text", "text": "done", "annotations": []}],
+    }
+]
+
+
+def _calls_made(inp: object) -> list[str]:
+    items = inp if isinstance(inp, list) else []
+    calls = [x for x in items if isinstance(x, dict) and x.get("type") == "function_call"]
+    return [x.get("name") for x in calls]
+
+
+def _outputs_done(inp: object) -> int:
+    items = inp if isinstance(inp, list) else []
+    return sum(1 for x in items if isinstance(x, dict) and x.get("type") == "function_call_output")
+
+
+def _decide_chain(inp: object) -> list[dict]:
+    """agent_a -> agent_b -> agent_c -> done."""
+    made = _calls_made(inp)
+    if "transfer_to_agent_b" not in made:
+        return [_fc("transfer_to_agent_b", "call_h1")]
+    if "transfer_to_agent_c" not in made:
+        return [_fc("transfer_to_agent_c", "call_h2")]
+    return _DONE
+
+
+def _decide_single(inp: object) -> list[dict]:
+    return _DONE
+
+
+def _decide_two_handoffs(inp: object) -> list[dict]:
+    """Two handoffs requested in ONE response; the framework takes the first."""
+    if "transfer_to_agent_b" not in _calls_made(inp):
+        return [_fc("transfer_to_agent_b", "call_h1"), _fc("transfer_to_agent_c", "call_h2")]
+    return _DONE
+
+
+def _decide_handoff_once(inp: object) -> list[dict]:
+    if "transfer_to_agent_b" not in _calls_made(inp):
+        return [_fc("transfer_to_agent_b", "call_h1")]
+    return _DONE
+
+
+@pytest.fixture
+def scenario(monkeypatch):
+    """Swap the fake server's turn policy: the handler resolves `_decide` by
+    name at call time, so one monkeypatch retargets the whole server."""
+    import test_openai_agents_wire as wire
+
+    def use(fn) -> None:  # noqa: ANN001
+        monkeypatch.setattr(wire, "_decide", fn)
+
+    return use
+
+
+def _chain_agents() -> Agent:
+    agent_c = Agent(name="agent_c", instructions="c", model="gpt-4o-mini")
+    agent_b = Agent(name="agent_b", instructions="b", handoffs=[agent_c], model="gpt-4o-mini")
+    return Agent(name="agent_a", instructions="a", handoffs=[agent_b], model="gpt-4o-mini")
+
+
+def test_a_two_hop_handoff_chain_is_three_siblings_not_a_nest(agents_env, scenario):
+    """Contract §6.3(d): a handoff is a MARKER, the receiver a SIBLING. Three
+    `invoke_agent` spans all parented to the root by id; `parent_agent` names
+    the sender; each receiver links `HANDOFF_FROM` to the marker's span id."""
+    scenario(_decide_chain)
+    _init()
+    try:
+        res = _run(_chain_agents())
+        assert res.last_agent.name == "agent_c"
+        spans = _spans()
+    finally:
+        wardex.close()
+    root = _one(spans, "invoke_workflow Agent workflow")
+    agents = {n: _one(spans, f"invoke_agent {n}") for n in ("agent_a", "agent_b", "agent_c")}
+    for span in agents.values():
+        assert span.parent_span_id == root.context.span_id
+        assert _edge(span) == (ParentSource.UNIT_ACTIVE, 1.0, ())
+    assert [agents[n].agent.parent_agent for n in ("agent_a", "agent_b", "agent_c")] == [
+        None,
+        "agent_a",
+        "agent_b",
+    ]
+    ab = _one(spans, "handoff agent_a→agent_b")
+    bc = _one(spans, "handoff agent_b→agent_c")
+    assert ab.parent_span_id == agents["agent_a"].context.span_id
+    assert bc.parent_span_id == agents["agent_b"].context.span_id
+    assert ab.agent.name == "agent_b" and ab.agent.parent_agent == "agent_a"
+    assert [(lk.reason, lk.span_id) for lk in agents["agent_b"].links] == [
+        (LinkReason.HANDOFF_FROM, ab.context.span_id)
+    ]
+    assert [(lk.reason, lk.span_id) for lk in agents["agent_c"].links] == [
+        (LinkReason.HANDOFF_FROM, bc.context.span_id)
+    ]
+    assert len(_chat_spans(spans)) == 3
+    assert counters.get("adapters.openai_agents.link_target_unresolved") == 0
+
+
+def test_two_runs_on_one_task_are_two_clean_roots_and_unpin_is_why(
+    agents_env, scenario, monkeypatch
+):
+    """Pin at start, unpin at end: the second run on the same task opens on a
+    clean carrier. The NEGATIVE CONTROL turns `unpin` into a no-op and the
+    second root then carries `correlation_conflict` — the failure the verb
+    exists to make unnecessary."""
+    scenario(_decide_single)
+
+    async def two() -> None:
+        await Runner.run(Agent(name="agent_a", instructions="a", model="gpt-4o-mini"), "hi")
+        await Runner.run(Agent(name="agent_b", instructions="b", model="gpt-4o-mini"), "hi")
+
+    _init()
+    try:
+        asyncio.run(two())
+        spans = _spans()
+        assert counters.get("adapters.openai_agents.unpin") == counters.get(
+            "adapters.openai_agents.pin_ok"
+        )
+    finally:
+        wardex.close()
+    roots = [s for s in _adapter_spans(spans) if s.parent_span_id is None]
+    assert [s.name for s in roots] == ["invoke_workflow Agent workflow"] * 2
+    assert all(_edge(s) == (ParentSource.TRACE_ROOT, 1.0, ()) for s in roots)
+    assert len({s.context.trace_id for s in roots}) == 2
+
+    from wardex_sdk._adapters._context import RunHandle
+
+    monkeypatch.setattr(RunHandle, "unpin", lambda self: False)
+    _init()
+    try:
+        asyncio.run(two())
+        spans = _spans()
+    finally:
+        wardex.close()
+    roots = [s for s in _adapter_spans(spans) if s.parent_span_id is None]
+    assert len(roots) == 2
+    assert Limitation.CORRELATION_CONFLICT in _edge(roots[1])[2]
+
+
+def test_a_run_inside_a_host_span_hangs_off_it(agents_env, scenario):
+    scenario(_decide_single)
+    _init()
+    try:
+        with wardex.span("outer") as outer:
+            _run(Agent(name="agent_a", instructions="a", model="gpt-4o-mini"))
+        spans = _spans()
+    finally:
+        wardex.close()
+    root = _one(spans, "invoke_workflow Agent workflow")
+    assert root.parent_span_id == outer.context.span_id
+    assert _edge(root) == (ParentSource.CONTEXTVAR, 1.0, ())
+
+
+def test_two_runs_inside_one_framework_trace_share_one_root(agents_env, scenario):
+    """`Runner.run` inside a user's `with trace(...)` creates no trace of its
+    own, so one `invoke_workflow` carries both agents."""
+    from agents.tracing import trace
+
+    scenario(_decide_single)
+
+    async def both() -> None:
+        with trace("outer"):
+            await Runner.run(Agent(name="agent_a", instructions="a", model="gpt-4o-mini"), "hi")
+            await Runner.run(Agent(name="agent_b", instructions="b", model="gpt-4o-mini"), "hi")
+
+    _init()
+    try:
+        asyncio.run(both())
+        spans = _spans()
+    finally:
+        wardex.close()
+    root = _one(spans, "invoke_workflow outer")
+    for name in ("agent_a", "agent_b"):
+        assert _one(spans, f"invoke_agent {name}").parent_span_id == root.context.span_id
+    assert len([s for s in _adapter_spans(spans) if s.parent_span_id is None]) == 1
+    assert _extra(root)["wardex.openai_agents.agents"] == 2
+
+
+def test_without_task_and_turn_spans_only_the_turn_attribute_disappears(agents_env, scenario):
+    scenario(_decide_chain)
+    _init()
+    try:
+        _run(_chain_agents(), run_config=RunConfig(tracing={"include_task_and_turn_spans": False}))
+        spans = _spans()
+    finally:
+        wardex.close()
+    names = sorted(s.name for s in _adapter_spans(spans))
+    assert names == [
+        "handoff agent_a→agent_b",
+        "handoff agent_b→agent_c",
+        "invoke_agent agent_a",
+        "invoke_agent agent_b",
+        "invoke_agent agent_c",
+        "invoke_workflow Agent workflow",
+    ]
+    marker = _one(spans, "handoff agent_a→agent_b")
+    assert "wardex.openai_agents.turn" not in _extra(marker)
+    assert _extra(_one(spans, "invoke_workflow Agent workflow"))["wardex.openai_agents.turns"] == 0
+
+
+def test_no_framework_identifier_can_shape_this_adapters_tree():
+    """The product claim as an AST test over the shipped module's own source:
+    none of the verbs by which an identifier could shape the tree, and no
+    read of the framework's `parent_id`, appears anywhere in it."""
+    import ast
+    import inspect
+
+    import wardex_sdk._adapters._openai_agents as mod
+
+    source = inspect.getsource(mod)
+    assert "parent_id" not in source
+    forbidden = {"rejoin", "attach", "claim", "claim_run"}
+    used = set()
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Attribute):
+            used.add(node.attr)
+        elif isinstance(node, ast.Name):
+            used.add(node.id)
+    assert used & forbidden == set()
+
+
+def test_a_handoff_whose_target_never_resolves_is_an_error_marker(agents_env, scenario):
+    """`on_handoff` raising: the framework's span has no `to_agent`. The
+    marker reads `agent_a→unresolved` at ERROR `handoff_error`, the agent
+    fails with the framework's generic error, and the root follows."""
+    from agents import handoff
+
+    scenario(_decide_handoff_once)
+
+    def boom(ctx):  # noqa: ANN001, ANN202
+        raise RuntimeError("no such target")
+
+    agent_b = Agent(name="agent_b", instructions="b", model="gpt-4o-mini")
+    agent_a = Agent(
+        name="agent_a",
+        instructions="a",
+        handoffs=[handoff(agent_b, on_handoff=boom)],
+        model="gpt-4o-mini",
+    )
+    _init()
+    try:
+        with pytest.raises(RuntimeError):
+            _run(agent_a)
+        spans = _spans()
+    finally:
+        wardex.close()
+    marker = _one(spans, "handoff agent_a→unresolved")
+    assert (marker.status, marker.error_type) == (StatusCode.ERROR, "handoff_error")
+    assert marker.agent.name == "unresolved" and marker.agent.parent_agent == "agent_a"
+    assert counters.get("adapters.openai_agents.handoff_unresolved") == 1
+    agent = _one(spans, "invoke_agent agent_a")
+    assert (agent.status, agent.error_type) == (StatusCode.ERROR, "agent_run_error")
+    root = _one(spans, "invoke_workflow Agent workflow")
+    assert (root.status, root.error_type) == (StatusCode.ERROR, "agent_run_error")
+    assert [s.name for s in _adapter_spans(spans) if s.name.startswith("invoke_agent")] == [
+        "invoke_agent agent_a"
+    ]
+
+
+def test_two_handoffs_in_one_response_mark_the_handoff_and_nothing_else(agents_env, scenario):
+    scenario(_decide_two_handoffs)
+    agent_c = Agent(name="agent_c", instructions="c", model="gpt-4o-mini")
+    agent_b = Agent(name="agent_b", instructions="b", model="gpt-4o-mini")
+    agent_a = Agent(
+        name="agent_a", instructions="a", handoffs=[agent_b, agent_c], model="gpt-4o-mini"
+    )
+    _init()
+    try:
+        assert _run(agent_a).last_agent.name == "agent_b"
+        spans = _spans()
+    finally:
+        wardex.close()
+    marker = _one(spans, "handoff agent_a→agent_b")
+    assert (marker.status, marker.error_type) == (StatusCode.ERROR, "multiple_handoffs_requested")
+    assert _one(spans, "invoke_agent agent_b").status is StatusCode.OK
+    assert _one(spans, "invoke_workflow Agent workflow").status is StatusCode.OK

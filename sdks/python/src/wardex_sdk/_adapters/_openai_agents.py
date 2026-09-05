@@ -9,9 +9,9 @@ with `asyncio.create_task` AFTER the enclosing agent span started, so it
 inherits whatever wardex made ambient on the opening task. A unit pinned at
 `on_span_start` and unpinned at `on_span_end` therefore reaches every child
 span, every tool body and every HTTP request underneath at confidence 1.0,
-and the framework's own `span_id`/`parent_id` are never consulted for the
-shape of the tree. A test asserts over this file's own source that the
-identifier-rejoining verbs appear nowhere in it.
+and the framework's own span ids and parent references are never consulted
+for the shape of the tree. A test asserts over this file's own source that
+the verbs by which an identifier could shape a tree appear nowhere in it.
 
 What the wire already shows, measured on openai-agents 0.22 with no adapter:
 a three-turn run (tool call, handoff, final answer) is three parentless
@@ -92,18 +92,26 @@ import asyncio
 import importlib.metadata
 import os
 import threading
+from datetime import datetime
 from inspect import signature
 from pathlib import Path
 from typing import Any
 
 from .._assembly import (
+    AgentAttributes,
+    ConversationContext,
     Limitation,
+    LinkReason,
+    SpanIntent,
+    UnitKey,
+    UnitKind,
     counters,
     diag_info,
     report_once,
 )
+from .._enums import StatusCode
 from ._base import AdapterInterface
-from ._context import AdapterContext
+from ._context import AdapterContext, Placement, RunHandle
 
 _FRAMEWORK = "openai_agents"
 _DISTRIBUTION = "openai-agents"
@@ -627,19 +635,373 @@ _END_ONLY: frozenset[str] = frozenset(
 def _start_handler(kind: str) -> Any | None:
     """Span-data class name -> the start handler, an explicit chain rather than
     a table so that one read of this function is the complete mapping."""
+    if kind == "AgentSpanData":
+        return _agent_start
+    if kind == "TurnSpanData":
+        return _turn_start
     return None
 
 
 def _end_handler(kind: str) -> Any | None:
+    if kind == "AgentSpanData":
+        return _agent_end
+    if kind == "TurnSpanData":
+        return _turn_end
+    if kind == "HandoffSpanData":
+        return _handoff_end
     return None
 
 
-__all__ = ["FRAMEWORK_EXTRA_PREFIXES", "OpenAIAgentsAdapter"]
+# -- shared pieces ---------------------------------------------------------
+
+
+def _pin(adapter: OpenAIAgentsAdapter, handle: RunHandle, driver: object, subject: str) -> bool:
+    """Pin `handle` on the task the callback arrived on, and say so if refused.
+
+    A degraded handle is not a refusal — its open already reported — so it
+    is neither counted nor reported here.
+    """
+    ctx = adapter._ctx
+    if ctx is None or handle.degraded:
+        return False
+    ok = handle.pin(driver=driver)
+    ctx.count("pin_ok" if ok else "pin_refused")
+    if not ok:
+        report_once(
+            "openai-agents adapter: a framework callback arrived on a task other than the "
+            f"one that opened its span; spans under {subject} carry correlation_conflict",
+            key="adapters.openai_agents.pin_refused",
+        )
+    return ok
+
+
+def _unpin(adapter: OpenAIAgentsAdapter, handle: RunHandle) -> None:
+    """Take a handle's pin down, counted so the pin/unpin ledger balances."""
+    ctx = adapter._ctx
+    if ctx is not None and handle.unpin():
+        ctx.count("unpin")
+
+
+def _started_ns(span: Any) -> int | None:
+    """The framework's own start instant, or None when unreadable."""
+    raw = span.started_at
+    if not isinstance(raw, str):
+        return None
+    return int(datetime.fromisoformat(raw).timestamp() * 1_000_000_000)
+
+
+def _error_message(span: Any) -> str | None:
+    err = span.error
+    if isinstance(err, dict):
+        message = err.get("message")
+        return str(message) if message is not None else None
+    return None
+
+
+def _error_data(span: Any) -> dict[str, Any]:
+    err = span.error
+    data = err.get("data") if isinstance(err, dict) else None
+    return data if isinstance(data, dict) else {}
+
+
+# -- the run -----------------------------------------------------------------
 
 
 def _trace_start(adapter: OpenAIAgentsAdapter, trace: Any) -> None:
-    return None
+    """One `invoke_workflow` per framework trace, pinned on the task that
+    started it — the run's own task, or `run_streamed`'s background loop task
+    (which copied the caller's context when it was created)."""
+    ctx = adapter._ctx
+    if ctx is None:
+        return
+    run = ctx.slot(trace)
+    if run.get("handle") is not None:
+        ctx.count("trace_start_twice")
+        return
+    name = str(trace.name)
+    group = trace.group_id
+    conversation = ConversationContext(conversation_id=str(group)) if group else None
+    trace_id = str(trace.trace_id)
+    driver = _driver()
+
+    def describe(h: RunHandle) -> None:
+        h.draft.set_workflow_name(name)
+        h.draft.set_extra("wardex.framework", _FRAMEWORK)
+        h.draft.set_extra("wardex.openai_agents.trace_id", trace_id)
+
+    h = ctx.open_run(
+        UnitKind.SESSION,
+        intent=SpanIntent.INVOKE_WORKFLOW,
+        placement=Placement.ROOT,
+        subject=name,
+        conversation=conversation,
+        describe=describe,
+    )
+    run["handle"] = h
+    run["stack"] = []
+    run["agents"] = {}
+    run["turn"] = None
+    run["response_id"] = None
+    run["calls"] = {}
+    run["last_handoff"] = None
+    run["first_error"] = None
+    run["agent_count"] = 0
+    _pin(adapter, h, driver, name)
+    ctx.confirm_active("trace")
 
 
 def _trace_end(adapter: OpenAIAgentsAdapter, trace: Any) -> None:
-    return None
+    ctx = adapter._ctx
+    if ctx is None:
+        return
+    run = ctx.slot(trace)
+    h = run.get("handle")
+    if h is None:
+        ctx.count("trace_end_unmatched")
+        return
+    h.draft.set_extra("wardex.openai_agents.turns", int(run.get("turn") or 0))
+    h.draft.set_extra("wardex.openai_agents.agents", int(run.get("agent_count") or 0))
+    error = run.get("first_error")
+    run.clear()
+    _unpin(adapter, h)
+    if error is not None:
+        h.close(status=StatusCode.ERROR, error_type=error)
+    else:
+        h.close()
+
+
+# -- agents ------------------------------------------------------------------
+
+
+def _agent_start(adapter: OpenAIAgentsAdapter, run: dict[str, Any], span: Any) -> None:
+    """One `invoke_agent`, pinned for the span's lifetime.
+
+    A handoff RECEIVER opens after the sender closed — so under the run's
+    pin, as the sender's SIBLING — and carries `parent_agent` plus a
+    `HANDOFF_FROM` link to the marker the sender's last turn shipped. An
+    agent opened while another is live (agent-as-tool) is that agent's
+    child by context, and is remembered as NESTED so its failure never
+    reaches the run root.
+    """
+    ctx = adapter._ctx
+    if ctx is None:
+        return
+    sd = span.span_data
+    name = str(sd.name)
+    pending = run.get("last_handoff")
+    parent_agent = None
+    key = None
+    if pending is not None and pending[1] == name:
+        parent_agent, key = pending[0], pending[2]
+        run["last_handoff"] = None
+    stack = run["stack"]
+    driver = _driver()
+
+    def describe(h: RunHandle) -> None:
+        h.draft.set_agent(AgentAttributes(name=name, parent_agent=parent_agent))
+        h.draft.set_extra("wardex.framework", _FRAMEWORK)
+        if key is not None:
+            h.link(LinkReason.HANDOFF_FROM, key)
+
+    h = ctx.open_run(
+        UnitKind.AGENT,
+        intent=SpanIntent.INVOKE_AGENT,
+        placement=Placement.NESTED,
+        subject=name,
+        describe=describe,
+    )
+    if stack and not stack[-1]["pinned"]:
+        h.note(Limitation.CORRELATION_CONFLICT)
+    pinned = _pin(adapter, h, driver, name)
+    entry = ctx.slot(span)
+    entry["handle"] = h
+    entry["pinned"] = pinned
+    entry["kind"] = "agent"
+    entry["name"] = name
+    entry["turns"] = 0
+    entry["error"] = None
+    entry["top_level"] = not stack
+    run["agent_count"] = int(run.get("agent_count") or 0) + 1
+    if len(stack) < _MAX_AGENT_STACK:
+        stack.append(entry)
+        run["agents"].setdefault(name, []).append(entry)
+    else:
+        ctx.count("agent_stack_overflow")
+    ctx.confirm_active("agent")
+
+
+def _agent_end(adapter: OpenAIAgentsAdapter, run: dict[str, Any], span: Any) -> None:
+    ctx = adapter._ctx
+    if ctx is None:
+        return
+    entry = ctx.slot(span)
+    h = entry.get("handle")
+    if h is None:
+        ctx.count("agent_end_unmatched")
+        return
+    sd = span.span_data
+    tools = sd.tools
+    handoffs = sd.handoffs
+    h.draft.set_extra("wardex.openai_agents.turns", int(entry.get("turns") or 0))
+    h.draft.set_extra("wardex.openai_agents.tools_count", len(tools) if tools else 0)
+    h.draft.set_extra("wardex.openai_agents.handoffs_count", len(handoffs) if handoffs else 0)
+    last = run.get("response_id")
+    if last is not None:
+        h.draft.set_extra("wardex.openai_agents.last_response_id", str(last))
+    error_type = None
+    fatal = False
+    message = _error_message(span)
+    if message is not None:
+        error_type, fatal = _classify_error(adapter, message)
+        max_turns = _error_data(span).get("max_turns")
+        if isinstance(max_turns, int):
+            h.draft.set_extra("wardex.openai_agents.max_turns", max_turns)
+    elif entry.get("error") is not None:
+        error_type, fatal = entry["error"]
+    propagate = fatal and bool(entry.get("top_level")) and run.get("first_error") is None
+    if error_type is not None and propagate:
+        run["first_error"] = error_type
+    if error_type is not None:
+        h.close(status=StatusCode.ERROR, error_type=error_type)
+    else:
+        h.close()
+    _unpin(adapter, h)
+    stack = run.get("stack")
+    if stack is not None and entry in stack:
+        stack.remove(entry)
+    live = run.get("agents", {}).get(entry.get("name"))
+    if live and entry in live:
+        live.remove(entry)
+    entry["handle"] = None
+
+
+# -- handoffs ------------------------------------------------------------------
+
+
+def _handoff_end(adapter: OpenAIAgentsAdapter, run: dict[str, Any], span: Any) -> None:
+    """A MARKER, opened at end (the target is known only then) and closed at
+    once at the framework's own start instant. The receiving agent is NOT
+    nested under it; it links back to this marker by a run-scoped alias."""
+    ctx = adapter._ctx
+    if ctx is None:
+        return
+    sd = span.span_data
+    frm = str(sd.from_agent) if sd.from_agent is not None else "unresolved"
+    to = str(sd.to_agent) if sd.to_agent is not None else None
+    start_ns = None
+    with ctx.guard("handoff_started_at"):
+        start_ns = _started_ns(span)
+    message = _error_message(span)
+    turn = run.get("turn")
+    response_id = run.get("response_id")
+    subject = f"{frm}→{to if to is not None else 'unresolved'}"
+    receiver = to if to is not None else "unresolved"
+    key_holder: list[UnitKey] = []
+
+    def describe(h: RunHandle) -> None:
+        h.draft.set_agent(AgentAttributes(name=receiver, parent_agent=frm))
+        h.draft.set_extra("wardex.framework", _FRAMEWORK)
+        if turn is not None:
+            h.draft.set_extra("wardex.openai_agents.turn", int(turn))
+        if response_id is not None:
+            h.draft.set_extra("wardex.openai_agents.response_id", str(response_id))
+        if to is not None:
+            token = h.run_token()
+            if token is not None:
+                key = UnitKey("openai_agents.handoff", f"{token}:{to}")
+                h.alias(key, remember=True)
+                key_holder.append(key)
+
+    h = ctx.open_run(
+        UnitKind.CALL,
+        intent=SpanIntent.HANDOFF,
+        placement=Placement.NESTED,
+        subject=subject,
+        start_ns=start_ns,
+        describe=describe,
+    )
+    if to is None:
+        h.close(status=StatusCode.ERROR, error_type="handoff_error")
+        ctx.count("handoff_unresolved")
+    else:
+        if message is not None:
+            error_type, _fatal = _classify_error(adapter, message)
+            h.close(status=StatusCode.ERROR, error_type=error_type)
+        else:
+            h.close()
+        if key_holder:
+            run["last_handoff"] = (frm, to, key_holder[0])
+    ctx.confirm_active("handoff")
+
+
+# -- turns -----------------------------------------------------------------------
+
+
+def _turn_start(adapter: OpenAIAgentsAdapter, run: dict[str, Any], span: Any) -> None:
+    """No span. The turn number is what later spans of this turn carry."""
+    ctx = adapter._ctx
+    if ctx is None:
+        return
+    sd = span.span_data
+    run["turn"] = int(sd.turn)
+    live = run.get("agents", {}).get(str(sd.agent_name))
+    if live:
+        live[-1]["turns"] = int(live[-1].get("turns") or 0) + 1
+
+
+def _turn_end(adapter: OpenAIAgentsAdapter, run: dict[str, Any], span: Any) -> None:
+    """A turn's error is the agent's: folded onto the agent that ran it."""
+    ctx = adapter._ctx
+    if ctx is None:
+        return
+    message = _error_message(span)
+    if message is None:
+        return
+    sd = span.span_data
+    live = run.get("agents", {}).get(str(sd.agent_name))
+    if not live:
+        ctx.count("turn_error_fold_missed")
+        return
+    if len(live) > 1:
+        ctx.count("turn_error_fold_ambiguous")
+    entry = live[-1]
+    if entry.get("error") is None:
+        entry["error"] = _classify_error(adapter, message)
+
+
+# -- failure mapping ---------------------------------------------------------------
+
+#: The framework's span error message -> (wardex error type, fatal to the run).
+_ERROR_TABLE: dict[str, tuple[str, bool]] = {
+    "Max turns exceeded": ("max_turns_exceeded", True),
+    "Guardrail tripwire triggered": ("guardrail_tripwire", True),
+    "Tool execution cancelled": ("tool_cancelled", False),
+    "Error running tool": ("tool_error", True),
+    "Error running tool (non-fatal)": ("tool_error_handled", False),
+    "Multiple handoffs requested": ("multiple_handoffs_requested", False),
+    "Error in agent run": ("agent_run_error", True),
+    "Error in call_model_input_filter": ("model_behavior_error", True),
+    "Invalid JSON provided": ("model_behavior_error", True),
+    "Invalid JSON": ("model_behavior_error", True),
+}
+_MODEL_BEHAVIOR_PREFIXES = ("Program ", "Tool approval ", "Invalid input filter")
+
+
+def _classify_error(adapter: OpenAIAgentsAdapter, message: str) -> tuple[str, bool]:
+    known = _ERROR_TABLE.get(message)
+    if known is not None:
+        return known
+    if message.endswith(" not found") or message.startswith(_MODEL_BEHAVIOR_PREFIXES):
+        return ("model_behavior_error", True)
+    ctx = adapter._ctx
+    if ctx is not None:
+        ctx.count("error_message_unmapped")
+    report_once(
+        f"openai-agents adapter: the framework reported an error this adapter does not "
+        f"map ({message!r}); the span carries error_type=openai_agents_error",
+        key=f"adapters.openai_agents.unmapped:{message}",
+    )
+    return ("openai_agents_error", False)
+
+
+__all__ = ["FRAMEWORK_EXTRA_PREFIXES", "OpenAIAgentsAdapter"]

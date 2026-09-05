@@ -212,6 +212,9 @@ _MEMBER_SITES: dict[str, frozenset[str]] = {
             # A second `system/init` naming a different run on a transport key
             # this table still holds live: two agent runs sharing one root.
             "_adapters/_assembler.py",
+            # A child opened while the live agent's pin had been refused: the
+            # context it read is the run's, not the agent's it sits under.
+            "_adapters/_openai_agents.py",
             # `_EDGE_MARKERS` again — see PARENT_UNRESOLVED above.
             "testing/conformance.py",
         }
