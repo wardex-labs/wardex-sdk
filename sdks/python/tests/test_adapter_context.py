@@ -1834,3 +1834,16 @@ def test_a_stated_conversation_reaches_a_nested_child_and_a_wire_span_under_the_
     for span in spans:
         assert span.conversation is not None
         assert span.conversation.conversation_id == "conv-123"
+
+
+def test_the_fork_reset_drops_every_slot():
+    """A slot holds a run's in-flight bookkeeping; the child must start empty."""
+    ctx, _ = context()
+
+    class Holder:
+        pass
+
+    holder = Holder()
+    ctx.slot(holder)["handle"] = "parent's"
+    ctx._at_fork_reinit()
+    assert ctx.slot(holder) == {}
