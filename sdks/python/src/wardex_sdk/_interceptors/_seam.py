@@ -926,6 +926,13 @@ def _assemble(p: _PendingTxn, *, parse: bool, extra: tuple[Limitation, ...]) -> 
             parse_failed = True
     unparsed = ((not parse) or parse_failed) and not p.is_grpc
     if not _should_capture(p.prefilter, txn, sem, mode=p.mode, unparsed=unparsed):
+        if classify_path(txn.path) == "provider_state":
+            # A Conversations-API-shaped path (provider-owned agent state, no
+            # model, no usage) the mode refused. Not an LLM call, so refusing
+            # is right — but a recognised provider path must never vanish
+            # uncounted. Generic refusals stay uncounted: they are every
+            # non-LLM request.
+            counters.bump("interceptors.seam.provider_state_dropped")
         return None
     withhold_bodies = unparsed and not _should_capture(
         p.prefilter, txn, sem, mode=p.mode, unparsed=False
