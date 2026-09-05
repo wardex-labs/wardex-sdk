@@ -775,14 +775,127 @@ def test_two_runs_inside_one_framework_trace_share_one_root(agents_env, scenario
     assert _extra(root)["wardex.openai_agents.agents"] == 2
 
 
-def test_agents_finished_under_one_trace_leave_no_name_keys_behind(agents_env, scenario):
-    """The run's per-name table (`run["agents"]`) gains a key per distinct
-    agent NAME. Only the stack is bounded by `_MAX_AGENT_STACK`; a key that
-    outlived its last entry would let the table grow by one empty list per
-    name for the life of the trace. Read while the trace is still open — its
-    end clears the whole slot, which would hide exactly this."""
+def test_two_concurrent_runs_under_one_trace_are_top_level_siblings(agents_env, scenario):
+    """The framework's documented parallelization: several `Runner.run`s
+    gathered under ONE `with trace(...)`. Each run's agent starts on its own
+    task with no agent current there, so both are TOP-LEVEL siblings of the
+    root — and agent_b's `max_turns` failure, fatal on a top-level agent,
+    reaches the root. Judged by stack emptiness, the second starter read as
+    NESTED and the root shipped OK for a run that raised."""
+    from agents import function_tool
+    from agents.exceptions import MaxTurnsExceeded
     from agents.tracing import trace
 
+    def decide(inp: object) -> list[dict]:
+        items = inp if isinstance(inp, list) else []
+        user = [x for x in items if isinstance(x, dict) and x.get("role") == "user"]
+        if user and user[0].get("content") == "loop":
+            return _decide_loop(inp)
+        return _DONE
+
+    @function_tool
+    def get_weather(city: str) -> str:
+        return f"sunny in {city}"
+
+    scenario(decide)
+    agent_a = Agent(name="agent_a", instructions="a", model="gpt-4o-mini")
+    agent_b = Agent(name="agent_b", instructions="b", tools=[get_weather], model="gpt-4o-mini")
+
+    async def both() -> list[Any]:
+        with trace("wf"):
+            return await asyncio.gather(
+                Runner.run(agent_a, "hi", max_turns=10),
+                Runner.run(agent_b, "loop", max_turns=1),
+                return_exceptions=True,
+            )
+
+    _init()
+    try:
+        results = asyncio.run(both())
+        assert results[0].final_output == "done"
+        assert isinstance(results[1], MaxTurnsExceeded)
+        spans = _spans()
+        assert counters.get("adapters.openai_agents.pin_refused") == 0
+    finally:
+        wardex.close()
+    root = _one(spans, "invoke_workflow wf")
+    a = _one(spans, "invoke_agent agent_a")
+    b = _one(spans, "invoke_agent agent_b")
+    for s in (a, b):
+        assert s.parent_span_id == root.context.span_id
+        assert _edge(s) == (ParentSource.UNIT_ACTIVE, 1.0, ())
+    assert a.status is StatusCode.OK
+    assert (b.status, b.error_type) == (StatusCode.ERROR, "max_turns_exceeded")
+    assert (root.status, root.error_type) == (StatusCode.ERROR, "max_turns_exceeded")
+    tool = _one(spans, "execute_tool get_weather")
+    assert tool.parent_span_id == b.context.span_id
+    assert _extra(root)["wardex.openai_agents.agents"] == 2
+
+
+def _decide_tool_and_handoff_in_one_response(inp: object) -> list[dict]:
+    """agent_a's first response requests `helper_tool` (an agent as a tool)
+    AND a handoff to agent_b; the nested helper run and agent_b answer at once."""
+    items = inp if isinstance(inp, list) else []
+    if any(isinstance(x, dict) and x.get("content") == "INNER" for x in items):
+        return _DONE
+    if "helper_tool" not in _calls_made(inp):
+        return [
+            _fc("helper_tool", "call_1", '{"input":"INNER"}'),
+            _fc("transfer_to_agent_b", "call_h1"),
+        ]
+    return _DONE
+
+
+def test_a_handoff_beside_an_agent_as_tool_carries_the_outer_response_id(agents_env, scenario):
+    """The nested run (agent-as-tool) finishes BEFORE the handoff span ends,
+    and its own response used to overwrite the run-wide response id — so the
+    marker joined the INNER agent's chat span. Turn and response id are the
+    SENDER's: read from agent_a's own entry, they are the outer response
+    that requested both the tool and the handoff."""
+    scenario(_decide_tool_and_handoff_in_one_response)
+    helper = Agent(name="helper", instructions="inner", model="gpt-4o-mini")
+    agent_b = Agent(name="agent_b", instructions="b", model="gpt-4o-mini")
+    agent_a = Agent(
+        name="agent_a",
+        instructions="a",
+        tools=[helper.as_tool(tool_name="helper_tool", tool_description="helps")],
+        handoffs=[agent_b],
+        model="gpt-4o-mini",
+    )
+    _init()
+    try:
+        res = _run(agent_a)
+        assert res.final_output == "done" and res.last_agent.name == "agent_b"
+        spans = _spans()
+    finally:
+        wardex.close()
+    chats = sorted(_chat_spans(spans), key=lambda c: c.start_time_ns)
+    assert [c.gen_ai.response_id for c in chats] == ["resp_1", "resp_2", "resp_3"]
+    marker = _one(spans, "handoff agent_a→agent_b")
+    assert _extra(marker)["wardex.openai_agents.response_id"] == "resp_1"
+    assert _extra(marker)["wardex.openai_agents.turn"] == 1
+    tool = _one(spans, "execute_tool helper_tool")
+    assert _extra(tool)["wardex.openai_agents.response_id"] == "resp_1"
+    assert (
+        _extra(_one(spans, "invoke_agent agent_a"))["wardex.openai_agents.last_response_id"]
+        == "resp_1"
+    )
+    assert (
+        _extra(_one(spans, "invoke_agent helper"))["wardex.openai_agents.last_response_id"]
+        == "resp_2"
+    )
+
+
+def test_agents_finished_under_one_trace_leave_no_bookkeeping_behind(agents_env, scenario):
+    """The run's slot holds no per-agent table at all: an agent's state
+    lives on its OWN span's slot and is reached through the task-inherited
+    current-agent variable, so many differently named agents in sequence
+    cost the run nothing that grows. Read while the trace is still open —
+    its end clears the whole slot, which would hide exactly this — and on
+    the task the runs finished on, where no agent may still be current."""
+    from agents.tracing import trace
+
+    from wardex_sdk._adapters import _openai_agents
     from wardex_sdk._adapters._registry import get_registry
 
     scenario(_decide_single)
@@ -794,8 +907,9 @@ def test_agents_finished_under_one_trace_leave_no_name_keys_behind(agents_env, s
             for name in names:
                 await Runner.run(Agent(name=name, instructions="x", model="gpt-4o-mini"), "hi")
             run = get_registry()._contexts["openai_agents"].slot(t)
-            seen["agents"] = dict(run["agents"])
-            seen["stack"] = list(run["stack"])
+            seen["run"] = dict(run)
+            seen["current"] = _openai_agents._CURRENT_AGENT.get()
+            seen["pending"] = _openai_agents._PENDING_HANDOFF.get()
 
     _init()
     try:
@@ -803,8 +917,9 @@ def test_agents_finished_under_one_trace_leave_no_name_keys_behind(agents_env, s
         spans = _spans()
     finally:
         wardex.close()
-    assert seen["stack"] == []
-    assert seen["agents"] == {}, f"stale per-name keys: {sorted(seen['agents'])}"
+    grows = {k: v for k, v in seen["run"].items() if isinstance(v, (dict, list, set))}
+    assert grows == {}, f"per-run collections that would grow with the workload: {grows}"
+    assert seen["current"] is None and seen["pending"] is None
     root = _one(spans, "invoke_workflow outer")
     assert _extra(root)["wardex.openai_agents.agents"] == len(names)
 

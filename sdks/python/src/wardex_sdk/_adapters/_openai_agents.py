@@ -94,6 +94,7 @@ then carries the marker and no join — the wire span is the only holder.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import hashlib
 import importlib.metadata
 import importlib.util
@@ -134,10 +135,28 @@ _ENV_DISABLED = "OPENAI_AGENTS_DISABLE_TRACING"
 #: module's source; the vocabulary layer accepts any `wardex.*` key today.
 FRAMEWORK_EXTRA_PREFIXES = ("wardex.openai_agents.",)
 
-#: Live `invoke_agent` handles a run may hold at once. Beyond it the unit is
-#: still opened — the span ships — but is not pushed onto the run's stack, so
-#: a pathological agent-as-tool recursion costs bookkeeping, never spans.
-_MAX_AGENT_STACK = 64
+#: The agent entry CURRENT on this task — set at `AgentSpanData` start on the
+#: task that opened it, restored to the enclosing one at its end. Every task
+#: the framework spawns underneath (the model task, one per tool call, one
+#: per guardrail, a nested run's loop) copies the context and so inherits it:
+#: the same mechanism that carries the pin, applied to the adapter's own
+#: per-agent bookkeeping. Keyed this way rather than on the trace because a
+#: trace is not one agent: the framework's parallelization pattern gathers
+#: several `Runner.run`s under one `with trace(...)`, and any "current agent"
+#: held on the trace would be whichever started last.
+_CURRENT_AGENT: contextvars.ContextVar[dict[str, Any] | None] = contextvars.ContextVar(
+    "wardex_openai_agents_current_agent", default=None
+)
+
+#: The `(from, to, marker key)` of the handoff the agent that just ENDED on
+#: this task shipped, for the receiver that starts here next. Published at
+#: the sender's END rather than at the marker's: the framework runs a turn
+#: — its handoff included — in a task of its own (measured: the first turn
+#: of a run), and a value set in that child task never reaches the run's
+#: task, where the sender's span ends and the receiver's begins.
+_PENDING_HANDOFF: contextvars.ContextVar[tuple[str, str, UnitKey] | None] = contextvars.ContextVar(
+    "wardex_openai_agents_pending_handoff", default=None
+)
 
 _TRACING_DISABLED_NOTICE = (
     "openai-agents tracing is disabled, so wardex will show only the LLM calls "
@@ -329,9 +348,11 @@ def _driver() -> object:
 class OpenAIAgentsAdapter(AdapterInterface):
     """Registers ONE `TracingProcessor` with the framework and reads its
     callbacks. Holds no table of its own: per-run state lives in
-    `ctx.slot(trace)` and per-span state in `ctx.slot(span)`, keyed on the
-    framework's own objects by identity, released when the framework drops
-    them, and cleared by the context's fork reset.
+    `ctx.slot(trace)`, per-agent and per-span state in `ctx.slot(span)`,
+    keyed on the framework's own objects by identity, released when the
+    framework drops them, and cleared by the context's fork reset. The
+    agent a callback belongs to is found through `_CURRENT_AGENT`, a
+    task-inherited variable, never through the trace.
     """
 
     CONTROL_FLOW: tuple[type[BaseException], ...] = ()
@@ -548,12 +569,13 @@ def _mark_degraded(adapter: OpenAIAgentsAdapter, obj: Any) -> None:
     ctx = adapter._ctx
     if ctx is None:
         return
-    trace = obj if hasattr(obj, "group_id") else _trace_of(adapter, obj)
-    if trace is None:
-        return
-    run = ctx.slot(trace)
-    stack = run.get("stack") or ()
-    target = stack[-1].get("handle") if stack else run.get("handle")
+    current = _CURRENT_AGENT.get()
+    target = current.get("handle") if current is not None else None
+    if target is None:
+        trace = obj if hasattr(obj, "group_id") else _trace_of(adapter, obj)
+        if trace is None:
+            return
+        target = ctx.slot(trace).get("handle")
     if target is not None:
         target.note(Limitation.INSTRUMENTATION_DEGRADED)
 
@@ -623,13 +645,16 @@ class _WardexTracingProcessor:
             ctx.count("force_flush")
 
 
-# -- per-run and per-span state --------------------------------------------
+# -- per-run, per-agent and per-span state ---------------------------------
 #
-# A run's state is a dict in `ctx.slot(trace)`; a span's is a dict in
-# `ctx.slot(span)`. The trace object is found through the framework's OWN
+# A run's state is a dict in `ctx.slot(trace)`: its handle, the first fatal
+# error, and two counts. An AGENT's state — the current turn, the response
+# that turn received and the calls it requested, the turn count, the folded
+# turn error, whether its pin held — is a dict in `ctx.slot(span)` of its
+# agent span, reached from any callback underneath it through
+# `_CURRENT_AGENT`. The trace object is found through the framework's OWN
 # notion of the current trace — the callback runs in a task that inherited
-# it — and the trace slot is then the one table every callback of the run
-# shares. Nothing here is keyed on a `trace_id` string, so nothing here can
+# it. Nothing here is keyed on a `trace_id` string, so nothing here can
 # outlive the objects the framework holds.
 
 
@@ -754,6 +779,16 @@ def _pin(adapter: OpenAIAgentsAdapter, handle: RunHandle, driver: object, subjec
     return ok
 
 
+def _note_refused_pin(handle: RunHandle) -> None:
+    """The adapter's half of a refused agent pin: a child opened while that
+    agent is current hangs under whatever IS ambient — the session, or an
+    earlier agent — at 1.0, so the child says the edge is not what it looks
+    like. The registry marks only the refused unit itself."""
+    current = _CURRENT_AGENT.get()
+    if current is not None and not current.get("pinned", True):
+        handle.note(Limitation.CORRELATION_CONFLICT)
+
+
 def _unpin(adapter: OpenAIAgentsAdapter, handle: RunHandle) -> None:
     """Take a handle's pin down, counted so the pin/unpin ledger balances."""
     ctx = adapter._ctx
@@ -817,14 +852,9 @@ def _trace_start(adapter: OpenAIAgentsAdapter, trace: Any) -> None:
         describe=describe,
     )
     run["handle"] = h
-    run["stack"] = []
-    run["agents"] = {}
-    run["turn"] = None
-    run["response_id"] = None
-    run["calls"] = {}
-    run["last_handoff"] = None
     run["first_error"] = None
     run["agent_count"] = 0
+    run["turn_max"] = 0
     _pin(adapter, h, driver, name)
     ctx.confirm_active("trace")
 
@@ -838,7 +868,7 @@ def _trace_end(adapter: OpenAIAgentsAdapter, trace: Any) -> None:
     if h is None:
         ctx.count("trace_end_unmatched")
         return
-    h.draft.set_extra("wardex.openai_agents.turns", int(run.get("turn") or 0))
+    h.draft.set_extra("wardex.openai_agents.turns", int(run.get("turn_max") or 0))
     h.draft.set_extra("wardex.openai_agents.agents", int(run.get("agent_count") or 0))
     error = run.get("first_error")
     run.clear()
@@ -853,27 +883,31 @@ def _trace_end(adapter: OpenAIAgentsAdapter, trace: Any) -> None:
 
 
 def _agent_start(adapter: OpenAIAgentsAdapter, run: dict[str, Any], span: Any) -> None:
-    """One `invoke_agent`, pinned for the span's lifetime.
+    """One `invoke_agent`, pinned for the span's lifetime, and made the
+    CURRENT agent on this task for every callback and task underneath.
 
     A handoff RECEIVER opens after the sender closed — so under the run's
     pin, as the sender's SIBLING — and carries `parent_agent` plus a
     `HANDOFF_FROM` link to the marker the sender's last turn shipped. An
-    agent opened while another is live (agent-as-tool) is that agent's
-    child by context, and is remembered as NESTED so its failure never
-    reaches the run root.
+    agent that opens while another is current on its task (agent-as-tool)
+    is that agent's child by context, and is remembered as NESTED so its
+    failure never reaches the run root. TOP-LEVEL is therefore "no agent is
+    current here", which is true of every `Runner.run` gathered under one
+    trace and false of every nested run — not "the run's stack is empty",
+    which one concurrent sibling was enough to make false.
     """
     ctx = adapter._ctx
     if ctx is None:
         return
     sd = span.span_data
     name = str(sd.name)
-    pending = run.get("last_handoff")
+    outer = _CURRENT_AGENT.get()
+    pending = _PENDING_HANDOFF.get()
     parent_agent = None
     key = None
     if pending is not None and pending[1] == name:
         parent_agent, key = pending[0], pending[2]
-        run["last_handoff"] = None
-    stack = run["stack"]
+        _PENDING_HANDOFF.set(None)
     driver = _driver()
 
     def describe(h: RunHandle) -> None:
@@ -889,23 +923,22 @@ def _agent_start(adapter: OpenAIAgentsAdapter, run: dict[str, Any], span: Any) -
         subject=name,
         describe=describe,
     )
-    if stack and not stack[-1]["pinned"]:
-        h.note(Limitation.CORRELATION_CONFLICT)
+    _note_refused_pin(h)
     pinned = _pin(adapter, h, driver, name)
     entry = ctx.slot(span)
     entry["handle"] = h
     entry["pinned"] = pinned
-    entry["kind"] = "agent"
     entry["name"] = name
     entry["turns"] = 0
     entry["error"] = None
-    entry["top_level"] = not stack
+    entry["top_level"] = outer is None
+    entry["outer"] = outer
+    entry["turn"] = None
+    entry["response_id"] = None
+    entry["calls"] = {}
+    entry["handoff_out"] = None
+    _CURRENT_AGENT.set(entry)
     run["agent_count"] = int(run.get("agent_count") or 0) + 1
-    if len(stack) < _MAX_AGENT_STACK:
-        stack.append(entry)
-        run["agents"].setdefault(name, []).append(entry)
-    else:
-        ctx.count("agent_stack_overflow")
     ctx.confirm_active("agent")
 
 
@@ -924,7 +957,7 @@ def _agent_end(adapter: OpenAIAgentsAdapter, run: dict[str, Any], span: Any) -> 
     h.draft.set_extra("wardex.openai_agents.turns", int(entry.get("turns") or 0))
     h.draft.set_extra("wardex.openai_agents.tools_count", len(tools) if tools else 0)
     h.draft.set_extra("wardex.openai_agents.handoffs_count", len(handoffs) if handoffs else 0)
-    last = run.get("response_id")
+    last = entry.get("response_id")
     if last is not None:
         h.draft.set_extra("wardex.openai_agents.last_response_id", str(last))
     error_type = None
@@ -945,21 +978,11 @@ def _agent_end(adapter: OpenAIAgentsAdapter, run: dict[str, Any], span: Any) -> 
     else:
         h.close()
     _unpin(adapter, h)
-    stack = run.get("stack")
-    if stack is not None and entry in stack:
-        stack.remove(entry)
-    agents = run.get("agents") or {}
-    name = entry.get("name")
-    live = agents.get(name)
-    if live is not None:
-        if entry in live:
-            live.remove(entry)
-        if not live:
-            # The key leaves with its last entry. The table is keyed by agent
-            # NAME and only the stack is bounded, so a trace that runs many
-            # differently named agents in sequence would otherwise keep one
-            # empty list per name until the trace ends.
-            del agents[name]
+    # The enclosing agent (or none) is current again on this task. A set on
+    # a task other than the start's touches only that task's context, so a
+    # callback arriving elsewhere cannot corrupt the opening task's view.
+    _CURRENT_AGENT.set(entry.get("outer"))
+    _PENDING_HANDOFF.set(entry.get("handoff_out"))
     entry["handle"] = None
 
 
@@ -980,8 +1003,12 @@ def _handoff_end(adapter: OpenAIAgentsAdapter, run: dict[str, Any], span: Any) -
     with ctx.guard("handoff_started_at"):
         start_ns = _started_ns(span)
     message = _error_message(span)
-    turn = run.get("turn")
-    response_id = run.get("response_id")
+    # The SENDER's own turn and response: the marker ends on the sender's
+    # task, where the sender is current, and a nested run (agent-as-tool)
+    # that the same response requested wrote its responses to its OWN entry.
+    sender = _CURRENT_AGENT.get()
+    turn = sender.get("turn") if sender is not None else None
+    response_id = sender.get("response_id") if sender is not None else None
     subject = f"{frm}→{to if to is not None else 'unresolved'}"
     receiver = to if to is not None else "unresolved"
     key_holder: list[UnitKey] = []
@@ -1012,9 +1039,7 @@ def _handoff_end(adapter: OpenAIAgentsAdapter, run: dict[str, Any], span: Any) -
     # it is not ambient there, so the marker hangs under whatever is (the
     # session, or an earlier agent) at 1.0 — the same misparenting the tool
     # and guardrail children get, and it carries the same marker.
-    stack = run.get("stack") or ()
-    if stack and not stack[-1]["pinned"]:
-        h.note(Limitation.CORRELATION_CONFLICT)
+    _note_refused_pin(h)
     if to is None:
         h.close(status=StatusCode.ERROR, error_type="handoff_error")
         ctx.count("handoff_unresolved")
@@ -1024,8 +1049,13 @@ def _handoff_end(adapter: OpenAIAgentsAdapter, run: dict[str, Any], span: Any) -
             h.close(status=StatusCode.ERROR, error_type=error_type)
         else:
             h.close()
-        if key_holder:
-            run["last_handoff"] = (frm, to, key_holder[0])
+        if key_holder and sender is not None:
+            # On the sender's ENTRY, which the run's task shares by reference
+            # even when this marker ended in a child task; `_agent_end`
+            # publishes it on the task the receiver will start on.
+            sender["handoff_out"] = (frm, to, key_holder[0])
+        elif key_holder:
+            ctx.count("handoff_without_agent")
     ctx.confirm_active("handoff")
 
 
@@ -1033,15 +1063,21 @@ def _handoff_end(adapter: OpenAIAgentsAdapter, run: dict[str, Any], span: Any) -
 
 
 def _turn_start(adapter: OpenAIAgentsAdapter, run: dict[str, Any], span: Any) -> None:
-    """No span. The turn number is what later spans of this turn carry."""
+    """No span. The turn number is what later spans of this turn carry, on
+    the agent that is current here — checked by name against the span's
+    own `agent_name`, so a turn arriving on a task where another agent is
+    current is counted, not misfiled."""
     ctx = adapter._ctx
     if ctx is None:
         return
     sd = span.span_data
-    run["turn"] = int(sd.turn)
-    live = run.get("agents", {}).get(str(sd.agent_name))
-    if live:
-        live[-1]["turns"] = int(live[-1].get("turns") or 0) + 1
+    turn = int(sd.turn)
+    run["turn_max"] = max(int(run.get("turn_max") or 0), turn)
+    agent = _agent_named(adapter, str(sd.agent_name), "turn")
+    if agent is None:
+        return
+    agent["turn"] = turn
+    agent["turns"] = int(agent.get("turns") or 0) + 1
 
 
 def _turn_end(adapter: OpenAIAgentsAdapter, run: dict[str, Any], span: Any) -> None:
@@ -1052,16 +1088,23 @@ def _turn_end(adapter: OpenAIAgentsAdapter, run: dict[str, Any], span: Any) -> N
     message = _error_message(span)
     if message is None:
         return
-    sd = span.span_data
-    live = run.get("agents", {}).get(str(sd.agent_name))
-    if not live:
-        ctx.count("turn_error_fold_missed")
+    agent = _agent_named(adapter, str(span.span_data.agent_name), "turn_error_fold")
+    if agent is None:
         return
-    if len(live) > 1:
-        ctx.count("turn_error_fold_ambiguous")
-    entry = live[-1]
-    if entry.get("error") is None:
-        entry["error"] = _classify_error(adapter, message)
+    if agent.get("error") is None:
+        agent["error"] = _classify_error(adapter, message)
+
+
+def _agent_named(adapter: OpenAIAgentsAdapter, name: str, site: str) -> dict[str, Any] | None:
+    """The current agent's entry when it IS the agent the framework named,
+    else None with the miss counted under `{site}_missed`."""
+    ctx = adapter._ctx
+    current = _CURRENT_AGENT.get()
+    if current is not None and current.get("name") == name:
+        return current
+    if ctx is not None:
+        ctx.count(f"{site}_missed")
+    return None
 
 
 # -- the model call: no span, no usage -------------------------------------------
@@ -1076,15 +1119,19 @@ def _response_end(adapter: OpenAIAgentsAdapter, run: dict[str, Any], span: Any) 
     ctx = adapter._ctx
     if ctx is None:
         return
+    agent = _CURRENT_AGENT.get()
+    if agent is None:
+        ctx.count("response_without_agent")
+        return
     sd = span.span_data
     response = sd.response
     calls: dict[tuple[str, str], list[str]] = {}
     if response is None:
-        run["response_id"] = None
+        agent["response_id"] = None
         ctx.count("response_id_unavailable")
     else:
         rid = response.id
-        run["response_id"] = str(rid) if rid is not None else None
+        agent["response_id"] = str(rid) if rid is not None else None
         if rid is None:
             ctx.count("response_id_unavailable")
         for item in response.output or ():
@@ -1092,7 +1139,7 @@ def _response_end(adapter: OpenAIAgentsAdapter, run: dict[str, Any], span: Any) 
                 continue
             key = (str(item.name), str(item.arguments))
             calls.setdefault(key, []).append(str(item.call_id))
-    run["calls"] = calls
+    agent["calls"] = calls
 
 
 # -- tools ---------------------------------------------------------------------
@@ -1106,16 +1153,17 @@ def _function_start(adapter: OpenAIAgentsAdapter, run: dict[str, Any], span: Any
     The arguments are NOT on the span yet: the framework opens the span first
     and stamps `input` on it afterwards, so the call id is recovered at the
     END (`_function_end`). What is remembered here is the response that
-    requested this call — the run's current one — because a nested run
-    (agent-as-tool) may replace it before this span closes.
+    requested this call — the current agent's latest — because the agent's
+    next turn may replace it before a slow parallel sibling closes.
     """
     ctx = adapter._ctx
     if ctx is None:
         return
     sd = span.span_data
     name = str(sd.name)
-    turn = run.get("turn")
-    response_id = run.get("response_id")
+    agent = _CURRENT_AGENT.get()
+    turn = agent.get("turn") if agent is not None else None
+    response_id = agent.get("response_id") if agent is not None else None
     driver = _driver()
 
     def describe(h: RunHandle) -> None:
@@ -1137,15 +1185,13 @@ def _function_start(adapter: OpenAIAgentsAdapter, run: dict[str, Any], span: Any
         subject=name,
         describe=describe,
     )
-    stack = run.get("stack") or ()
-    if stack and not stack[-1]["pinned"]:
-        h.note(Limitation.CORRELATION_CONFLICT)
+    _note_refused_pin(h)
     entry = ctx.slot(span)
     entry["handle"] = h
     entry["pinned"] = _pin(adapter, h, driver, name)
     entry["kind"] = "tool"
     entry["name"] = name
-    entry["calls"] = run.get("calls") or {}
+    entry["calls"] = (agent.get("calls") if agent is not None else None) or {}
     ctx.confirm_active("tool")
 
 
@@ -1240,9 +1286,7 @@ def _guardrail_start(adapter: OpenAIAgentsAdapter, run: dict[str, Any], span: An
         subject=name,
         describe=describe,
     )
-    stack = run.get("stack") or ()
-    if stack and not stack[-1]["pinned"]:
-        h.note(Limitation.CORRELATION_CONFLICT)
+    _note_refused_pin(h)
     entry = ctx.slot(span)
     entry["handle"] = h
     entry["pinned"] = _pin(adapter, h, driver, name)
