@@ -1436,6 +1436,86 @@ def test_a_streamed_input_guardrail_tripwire_reaches_the_consumer(agents_env, sc
     _assert_tripwire(spans, name="block_input", posts=len(posts), made=1)
 
 
+def test_a_guardrail_cancelled_by_a_siblings_tripwire_is_not_rendered(agents_env, scenario):
+    """The framework assigns `triggered` only AFTER `await guardrail.run(...)`,
+    so a guardrail whose sibling tripped first is cancelled mid-body and its
+    span exits with `triggered=False` — which used to ship as a completed
+    PASS. wardex did not observe a verdict, so it says so: status UNSET,
+    `score_label="not_rendered"`, no `wardex.evaluation.triggered`, and a
+    counter. The sibling that tripped, the agent and the run read as before."""
+    import asyncio as aio
+
+    from agents import GuardrailFunctionOutput, input_guardrail
+    from agents.exceptions import InputGuardrailTripwireTriggered
+
+    @input_guardrail
+    async def slow_ok(ctx, agent, inp):  # noqa: ANN001, ANN202
+        await aio.sleep(5)
+        return GuardrailFunctionOutput(output_info=None, tripwire_triggered=False)
+
+    @input_guardrail
+    async def fast_trip(ctx, agent, inp):  # noqa: ANN001, ANN202
+        return GuardrailFunctionOutput(output_info=None, tripwire_triggered=True)
+
+    scenario(_decide_single)
+    agent = Agent(
+        name="agent_a",
+        instructions="a",
+        input_guardrails=[slow_ok, fast_trip],
+        model="gpt-4o-mini",
+    )
+    _init()
+    try:
+        with pytest.raises(InputGuardrailTripwireTriggered):
+            _run(agent)
+        spans = _spans()
+        assert counters.get("adapters.openai_agents.guardrail_interrupted") == 1
+        assert counters.get("adapters.openai_agents.guardrail_failed") == 0
+    finally:
+        wardex.close()
+    cancelled = _one(spans, "evaluate slow_ok")
+    assert (cancelled.status, cancelled.error_type) == (StatusCode.UNSET, None)
+    assert cancelled.evaluation.score_label == "not_rendered"
+    assert "wardex.evaluation.triggered" not in _extra(cancelled)
+    tripped = _one(spans, "evaluate fast_trip")
+    assert (tripped.status, tripped.error_type) == (StatusCode.ERROR, "guardrail_tripwire")
+    assert tripped.evaluation.score_label == "tripwire"
+    for name in ("invoke_agent agent_a", "invoke_workflow Agent workflow"):
+        s = _one(spans, name)
+        assert (s.status, s.error_type) == (StatusCode.ERROR, "guardrail_tripwire")
+
+
+def test_a_guardrail_whose_body_raises_is_an_error_not_a_pass(agents_env, scenario):
+    """A guardrail body that raises exits its span with `triggered=False` and
+    no `span.error` (the framework puts the error on the agent). That is the
+    GUARDRAIL's failure, not wardex's, so the evaluate span is ERROR with the
+    exception's class name and `score_label="not_rendered"`; the exception
+    reaches the host untouched."""
+    from agents import GuardrailFunctionOutput, input_guardrail
+
+    @input_guardrail
+    async def broken(ctx, agent, inp):  # noqa: ANN001, ANN202
+        raise RuntimeError("the guardrail failed")
+        return GuardrailFunctionOutput(output_info=None, tripwire_triggered=False)  # noqa: B901
+
+    scenario(_decide_single)
+    agent = Agent(name="agent_a", instructions="a", input_guardrails=[broken], model="gpt-4o-mini")
+    _init()
+    try:
+        with pytest.raises(RuntimeError, match="the guardrail failed"):
+            _run(agent)
+        spans = _spans()
+        assert counters.get("adapters.openai_agents.guardrail_failed") == 1
+        assert counters.get("adapters.openai_agents.guardrail_interrupted") == 0
+    finally:
+        wardex.close()
+    evaluate = _one(spans, "evaluate broken")
+    assert (evaluate.status, evaluate.error_type) == (StatusCode.ERROR, "RuntimeError")
+    assert evaluate.evaluation.score_label == "not_rendered"
+    assert "wardex.evaluation.triggered" not in _extra(evaluate)
+    assert evaluate.parent_span_id == _one(spans, "invoke_agent agent_a").context.span_id
+
+
 # --------------------------------------------------------------------------
 # MCP list-tools
 # --------------------------------------------------------------------------

@@ -63,8 +63,13 @@ Seams, and the shape each forces:
   an EXACT and UNIQUE `(name, arguments)` match against the response that
   requested it, labelled at the source; anything less than unique ships the
   `tool_call_id_unavailable_in_process` marker instead of a guess.
-* `GuardrailSpanData` — `evaluate`, `score_label` pass/tripwire, ERROR with
-  `guardrail_tripwire` when tripped.
+* `GuardrailSpanData` — `evaluate`. `score_label` is one of three:
+  `pass` (the body returned, no tripwire), `tripwire` (ERROR
+  `guardrail_tripwire`), or `not_rendered` — the body never returned a
+  verdict, which is read off the exception in flight at the span's exit:
+  its own raise is ERROR with that exception's class name, and an
+  interruption (a sibling's tripwire cancelling it) is UNSET.
+  `wardex.evaluation.triggered` is present only when a verdict was rendered.
 * `MCPListToolsSpanData` — `execute_step mcp.list_tools`, carrying a hash and
   a count of the tool names and never the names.
 
@@ -93,6 +98,7 @@ import hashlib
 import importlib.metadata
 import importlib.util
 import os
+import sys
 import threading
 from datetime import datetime
 from inspect import signature
@@ -1257,14 +1263,33 @@ def _guardrail_end(adapter: OpenAIAgentsAdapter, run: dict[str, Any], span: Any)
     sd = span.span_data
     triggered = bool(sd.triggered)
     name = str(sd.name)
-    h.draft.set_evaluation(
-        EvaluationAttributes(name=name, score_label="tripwire" if triggered else "pass")
-    )
-    h.draft.set_extra("wardex.evaluation.triggered", triggered)
+    # The framework assigns `triggered` only AFTER `await guardrail.run(...)`,
+    # so a span that exits by exception — a body that raised, or a task a
+    # sibling's tripwire cancelled — reads `triggered=False` with `span.error`
+    # unset (the error goes to the agent). This callback runs inside the
+    # span's `__exit__`, where that exception is the one being handled, so
+    # `sys.exc_info()` is the ONLY evidence that no verdict was rendered.
+    inflight = sys.exc_info()[1]
     if triggered:
+        h.draft.set_evaluation(EvaluationAttributes(name=name, score_label="tripwire"))
+        h.draft.set_extra("wardex.evaluation.triggered", True)
         h.close(status=StatusCode.ERROR, error_type="guardrail_tripwire")
-    else:
+    elif inflight is None:
+        h.draft.set_evaluation(EvaluationAttributes(name=name, score_label="pass"))
+        h.draft.set_extra("wardex.evaluation.triggered", False)
         h.close()
+    elif isinstance(inflight, Exception):
+        # The guardrail's OWN failure: its body raised. Named after the
+        # exception's class, the way the context surface names a host raise.
+        h.draft.set_evaluation(EvaluationAttributes(name=name, score_label="not_rendered"))
+        ctx.count("guardrail_failed")
+        h.close(status=StatusCode.ERROR, error_type=type(inflight).__name__)
+    else:
+        # Interrupted (`CancelledError` from a sibling's tripwire, or a
+        # shutdown): nobody failed and nothing was decided, so no status.
+        h.draft.set_evaluation(EvaluationAttributes(name=name, score_label="not_rendered"))
+        ctx.count("guardrail_interrupted")
+        h.close(status=StatusCode.UNSET)
     _unpin(adapter, h)
     entry["handle"] = None
 
