@@ -176,7 +176,7 @@ All notable changes to this project are documented here. The format follows
   `Runner.run` / `run_sync` / `run_streamed` (named after
   `RunConfig(workflow_name=…)`, default `Agent workflow`), one `invoke_agent`
   per agent, a `handoff {from}→{to}` MARKER with the receiving agent as the
-  sender's SIBLING (carrying `gen_ai.agent.parent_agent` and a `handoff_from`
+  sender's SIBLING (carrying `wardex.agent.parent` and a `handoff_from`
   link — a five-hop chain stays one level deep), one `execute_tool` per
   function tool with `gen_ai.tool.call.id` recovered by an exact, unique
   match against the response that requested it (labelled

@@ -629,7 +629,7 @@ diagnostic line (traceback under `debug=True`).
   nothing internal patched. One `invoke_workflow` per `Runner.run` /
   `run_sync` / `run_streamed`, one `invoke_agent` per agent, a
   `handoff {from}→{to}` marker with the receiving agent as the sender's
-  sibling (not nested — `gen_ai.agent.parent_agent` and a `handoff_from`
+  sibling (not nested — `wardex.agent.parent` and a `handoff_from`
   link carry the causality), one `execute_tool` per function tool with the
   call id recovered by a unique match against the response that requested it
   (labelled `wardex.openai_agents.tool_call_id_source`), one `evaluate` per
