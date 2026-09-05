@@ -98,6 +98,7 @@ import contextvars
 import hashlib
 import importlib.metadata
 import importlib.util
+import json
 import os
 import sys
 import threading
@@ -105,6 +106,7 @@ from datetime import datetime
 from inspect import signature
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote, urlsplit
 
 from .._assembly import (
     AgentAttributes,
@@ -241,7 +243,9 @@ def _installed_distribution() -> importlib.metadata.Distribution | None:
         return None
 
 
-def _shadow_path(dist: importlib.metadata.Distribution) -> tuple[str, str] | None:
+def _shadow_path(
+    dist: importlib.metadata.Distribution, ctx: AdapterContext
+) -> tuple[str, str] | None:
     """`(resolved module path, distribution path)` when the package that
     `import agents` WOULD answer is not the installed distribution's, else None.
 
@@ -252,6 +256,14 @@ def _shadow_path(dist: importlib.metadata.Distribution) -> tuple[str, str] | Non
     way rather than declined in silence by a failed `import agents.tracing`.
     A module the import system cannot locate answers None and leaves the
     import step to decline; a namespace package has no origin and does the same.
+
+    An EDITABLE install (`pip install -e`, `uv --editable`, a workspace
+    member) resolves `agents` to the project tree, never to
+    `site-packages/agents`, so the path comparison alone would decline the
+    adapter on the very machine the framework is developed on. The
+    distribution's own record of where it came from (PEP 610's
+    `direct_url.json`) settles it: a module under that editable root IS the
+    installed distribution. A corrupt record is counted, not raised.
     """
     spec = importlib.util.find_spec(_MODULE)
     origin = spec.origin if spec is not None else None
@@ -261,7 +273,29 @@ def _shadow_path(dist: importlib.metadata.Distribution) -> tuple[str, str] | Non
     expected = Path(str(dist.locate_file(_MODULE))).resolve()
     if found == expected:
         return None
+    editable = None
+    with ctx.guard("direct_url_read"):
+        editable = _editable_root(dist)
+    if editable is not None and (found == editable or editable in found.parents):
+        return None
     return str(found), str(expected)
+
+
+def _editable_root(dist: importlib.metadata.Distribution) -> Path | None:
+    """The project directory an EDITABLE install of `dist` points at, or None
+    for a regular install (no `direct_url.json`, or one that records an
+    archive, an index, or a non-editable local directory whose package was
+    COPIED into site-packages and so must still match `locate_file`)."""
+    raw = dist.read_text("direct_url.json")
+    if not raw:
+        return None
+    data = json.loads(raw)
+    if not isinstance(data, dict) or not (data.get("dir_info") or {}).get("editable"):
+        return None
+    url = urlsplit(str(data.get("url", "")))
+    if url.scheme != "file":
+        return None
+    return Path(unquote(url.path)).resolve()
 
 
 def _constructs(cls: Any, attrs: dict[str, Any], reads: tuple[str, ...] | None = None) -> bool:
@@ -396,7 +430,7 @@ class OpenAIAgentsAdapter(AdapterInterface):
         dist = _installed_distribution()
         if dist is None:
             return
-        shadow = _shadow_path(dist)
+        shadow = _shadow_path(dist, ctx)
         if shadow is not None:
             report_once(
                 f"openai-agents adapter: the module 'agents' resolved to {shadow[0]}, which "

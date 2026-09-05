@@ -575,6 +575,67 @@ def test_a_shadowed_module_declines_loudly_without_importing_it(tmp_path, with_t
     assert "failed to load" not in warnings[0]
 
 
+def _dist_info(tmp_path, *, direct_url: str | None) -> Any:  # noqa: ANN001
+    """A real `PathDistribution` for `openai-agents`, rooted in `tmp_path` so
+    `locate_file("agents")` answers `tmp_path / "agents"` — the site-packages
+    shape — with PEP 610's `direct_url.json` written when given."""
+    from importlib.metadata import PathDistribution
+
+    info = tmp_path / "site" / "openai_agents-0.22.0.dist-info"
+    info.mkdir(parents=True)
+    (info / "METADATA").write_text("Metadata-Version: 2.1\nName: openai-agents\nVersion: 0.22.0\n")
+    if direct_url is not None:
+        (info / "direct_url.json").write_text(direct_url)
+    return PathDistribution(info)
+
+
+@pytest.mark.parametrize(
+    ("direct_url", "layout", "shadowed"),
+    [
+        # pip install -e / uv --editable / a workspace member: the package
+        # lives in the project tree, which direct_url.json names.
+        ('{{"url": "file://{root}", "dir_info": {{"editable": true}}}}', "src/agents", False),
+        ('{{"url": "file://{root}", "dir_info": {{"editable": true}}}}', "agents", False),
+        # A non-editable direct install from a local directory: the package
+        # was COPIED into site-packages, so a module resolving elsewhere is
+        # still a shadow.
+        ('{{"url": "file://{root}", "dir_info": {{}}}}', "src/agents", True),
+        # A wheel from an index: no direct_url.json at all.
+        (None, "src/agents", True),
+    ],
+)
+def test_an_editable_install_of_the_real_framework_is_not_a_shadow(
+    tmp_path, monkeypatch, direct_url, layout, shadowed
+):
+    """`find_spec("agents").origin` under an EDITABLE install is the project
+    tree, never `site-packages/agents`, so comparing it with
+    `locate_file("agents")` alone declined the adapter on the very machine
+    the framework is developed on. The distribution's own record of where
+    it was installed from decides: a module under the editable root is the
+    installed distribution."""
+    import importlib.util
+    from types import SimpleNamespace
+
+    from wardex_sdk._adapters._openai_agents import _shadow_path
+
+    project = tmp_path / "project"
+    module_dir = project / layout
+    module_dir.mkdir(parents=True)
+    (module_dir / "__init__.py").write_text("")
+    dist = _dist_info(tmp_path, direct_url=direct_url.format(root=project) if direct_url else None)
+    monkeypatch.setattr(
+        importlib.util,
+        "find_spec",
+        lambda name: SimpleNamespace(origin=str(module_dir / "__init__.py")),
+    )
+    with installed_adapter(OpenAIAgentsAdapter) as live:
+        answer = _shadow_path(dist, live.adapter._ctx)
+    if shadowed:
+        assert answer == (str(module_dir.resolve()), str((tmp_path / "site" / "agents").resolve()))
+    else:
+        assert answer is None
+
+
 # --------------------------------------------------------------------------
 # scenarios on the fake server
 # --------------------------------------------------------------------------
