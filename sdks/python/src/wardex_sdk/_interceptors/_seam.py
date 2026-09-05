@@ -625,7 +625,10 @@ class ByteSeamInterceptor(InterceptorInterface):
         # gRPC: skip LLM semantic extraction (protobuf isn't LLM JSON).
         is_grpc = ct.startswith("application/grpc") and not ct.startswith("application/grpc-web")
         connect_ms, handshake_ms, reused, timing_markers = self._resolve_timing(obj, st)
-        if classify_path(txn.path) == "excluded":
+        # Classified once here and carried on the job: `_assemble` reads the
+        # same answer for the provider-state count instead of asking again.
+        treatment = classify_path(txn.path)
+        if treatment == "excluded":
             # A telemetry upload (the OpenAI Agents SDK POSTs its whole run
             # record to /v1/traces/ingest). Not wardex's to copy: skipped in
             # every mode and above the allowlist, before any parse is queued
@@ -653,6 +656,7 @@ class ByteSeamInterceptor(InterceptorInterface):
             server_address=st.server_address,
             server_port=st.server_port,
             is_grpc=is_grpc,
+            treatment=treatment,
             prefilter=pre,
             mode=capture_mode_of(client),
             connect_ms=connect_ms,
@@ -824,6 +828,9 @@ class _PendingTxn:
     server_address: str
     server_port: int
     is_grpc: bool
+    #: `classify_path(txn.path)`: "llm_call" | "provider_state" | None —
+    #: never "excluded", which returns before a job is sealed.
+    treatment: str | None
     prefilter: Prefilter
     mode: CaptureMode
     connect_ms: float
@@ -939,7 +946,7 @@ def _assemble(p: _PendingTxn, *, parse: bool, extra: tuple[Limitation, ...]) -> 
             parse_failed = True
     unparsed = ((not parse) or parse_failed) and not p.is_grpc
     if not _should_capture(p.prefilter, txn, sem, mode=p.mode, unparsed=unparsed):
-        if classify_path(txn.path) == "provider_state":
+        if p.treatment == "provider_state":
             # A Conversations-API-shaped path (provider-owned agent state, no
             # model, no usage) the mode refused. Not an LLM call, so refusing
             # is right — but a recognised provider path must never vanish

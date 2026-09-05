@@ -46,13 +46,36 @@ pub struct Endpoint {
     pub ws_transport: bool,
 }
 
+/// One segment of a path pattern: a literal, or any single segment (a
+/// resource id). Both tables below are written in it and matched by the one
+/// `suffix_matches`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Seg {
+    Lit(&'static str),
+    Any,
+}
+
+use Seg::{Any, Lit};
+
+/// Does `pattern` match the LAST segments of `segments`?
+fn suffix_matches(segments: &[&str], pattern: &[Seg]) -> bool {
+    if segments.len() < pattern.len() {
+        return false;
+    }
+    let tail = &segments[segments.len() - pattern.len()..];
+    pattern.iter().zip(tail).all(|(seg, got)| match seg {
+        Lit(want) => want == got,
+        Any => true,
+    })
+}
+
 /// Matched against the path's LAST segments — query, fragment and trailing
 /// `/` stripped, then split on `/`. Gateway prefixes (`/openai/v1/...`,
 /// `/proxy/...`) pass through; sub-resources (`/v1/responses/{id}`,
 /// `/v1/messages/count_tokens`, `/v1/messages/batches`) do not match.
-const ENDPOINTS: &[(&[&str], Endpoint)] = &[
+const ENDPOINTS: &[(&[Seg], Endpoint)] = &[
     (
-        &["chat", "completions"],
+        &[Lit("chat"), Lit("completions")],
         Endpoint {
             api: Api::OpenAiChatCompletions,
             operation: "chat",
@@ -61,7 +84,7 @@ const ENDPOINTS: &[(&[&str], Endpoint)] = &[
         },
     ),
     (
-        &["responses"],
+        &[Lit("responses")],
         Endpoint {
             api: Api::OpenAiResponses,
             operation: "chat",
@@ -76,7 +99,7 @@ const ENDPOINTS: &[(&[&str], Endpoint)] = &[
     // becoming the model's words. Listed AFTER the /responses row so
     // `lookup(Api::OpenAiResponses)` keeps answering with /responses.
     (
-        &["responses", "compact"],
+        &[Lit("responses"), Lit("compact")],
         Endpoint {
             api: Api::OpenAiResponses,
             operation: "chat",
@@ -85,7 +108,7 @@ const ENDPOINTS: &[(&[&str], Endpoint)] = &[
         },
     ),
     (
-        &["embeddings"],
+        &[Lit("embeddings")],
         Endpoint {
             api: Api::OpenAiEmbeddings,
             operation: "embeddings",
@@ -94,7 +117,7 @@ const ENDPOINTS: &[(&[&str], Endpoint)] = &[
         },
     ),
     (
-        &["messages"],
+        &[Lit("messages")],
         Endpoint {
             api: Api::AnthropicMessages,
             operation: "chat",
@@ -116,24 +139,16 @@ fn segments_of(path: &str) -> Vec<&str> {
 /// None, never a guess (body-shape capture on arbitrary paths is the
 /// compat-gateway follow-up, not this table's job).
 pub fn from_path(path: &str) -> Option<Endpoint> {
-    let segments = segments_of(path);
-    for (suffix, endpoint) in ENDPOINTS {
-        if segments.len() >= suffix.len() && segments[segments.len() - suffix.len()..] == **suffix {
-            return Some(*endpoint);
-        }
-    }
-    None
+    endpoint_of(&segments_of(path))
 }
 
-/// One segment of a non-LLM path pattern: a literal, or any single segment
-/// (a resource id).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Seg {
-    Lit(&'static str),
-    Any,
+/// `from_path` over already-split segments, so `treatment` splits once.
+fn endpoint_of(segments: &[&str]) -> Option<Endpoint> {
+    ENDPOINTS
+        .iter()
+        .find(|(suffix, _)| suffix_matches(segments, suffix))
+        .map(|(_, endpoint)| *endpoint)
 }
-
-use Seg::{Any, Lit};
 
 /// What the seam does with a provider path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -180,24 +195,14 @@ const NON_LLM_PATHS: &[(&[Seg], Treatment)] = &[
 /// first `NON_LLM_PATHS` suffix match, else None (an unrecognised path —
 /// ordinary HTTP, no claim).
 pub fn treatment(path: &str) -> Option<Treatment> {
-    if from_path(path).is_some() {
+    let segments = segments_of(path);
+    if endpoint_of(&segments).is_some() {
         return Some(Treatment::LlmCall);
     }
-    let segments = segments_of(path);
-    for (pattern, treatment) in NON_LLM_PATHS {
-        if segments.len() < pattern.len() {
-            continue;
-        }
-        let tail = &segments[segments.len() - pattern.len()..];
-        let matches = pattern.iter().zip(tail).all(|(seg, got)| match seg {
-            Lit(want) => want == got,
-            Any => true,
-        });
-        if matches {
-            return Some(*treatment);
-        }
-    }
-    None
+    NON_LLM_PATHS
+        .iter()
+        .find(|(pattern, _)| suffix_matches(&segments, pattern))
+        .map(|(_, treatment)| *treatment)
 }
 
 /// The WebSocket-transport question's answer: the upgrade path is a
