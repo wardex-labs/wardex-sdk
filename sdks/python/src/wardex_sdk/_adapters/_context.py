@@ -1073,11 +1073,14 @@ class AdapterContext:
         `degraded` and no-ops every verb.
 
         `conversation` is the identity a framework RUN already carries — its
-        group id — handed in at the open so that every child unit and every
-        wire span issued under the run's pin inherits it, the way a session
-        the parentage issued one for would. Only this opener takes it: a run
-        is where a framework states a conversation, and a nested `enter()`
-        inherits its parent's.
+        group id — handed in at the open so that every child unit opened
+        under the run inherits it, the way a session the parentage issued one
+        for would. It reaches the ambient a pin installs too, but NOT the
+        wire spans issued under that pin: the byte seam latches only the span
+        context at request time (`_interceptors/_seam.py::_latched`), so a
+        wire `chat` span under the run carries no conversation yet. Only this
+        opener takes it: a run is where a framework states a conversation,
+        and a nested `enter()` inherits its parent's.
         """
         unit = None
         handle = None

@@ -45,8 +45,11 @@ Seams, and the shape each forces:
 
 * `on_trace_start` / `on_trace_end` — the run. `open_run` + `pin` on the
   task that fired the callback; `unpin` + `close` at the end. A `group_id`
-  becomes `gen_ai.conversation.id` on every span underneath, handed to the
-  registry at the open so children and the pinned carrier inherit it.
+  becomes `gen_ai.conversation.id` on every ADAPTER span underneath, handed
+  to the registry at the open so child units inherit it — unless the host
+  opened its own `wardex.conversation(...)` around the run, which wins.
+  The wire `chat` spans do not carry it yet: the byte seam latches only
+  the span context at request time, not the ambient conversation.
 * `AgentSpanData` — one `invoke_agent`, pinned for the span's lifetime.
   The receiver of a handoff opens AFTER the sender closed (the framework
   finishes the sender's span before starting the receiver's), so it opens

@@ -1804,11 +1804,15 @@ def test_two_sequential_pinned_runs_on_one_task_are_two_clean_roots(monkeypatch)
     assert Limitation.CORRELATION_CONFLICT in second.capture_integrity.limitations
 
 
-def test_a_stated_conversation_reaches_a_nested_child_and_a_wire_span_under_the_pin():
+def test_a_stated_conversation_reaches_a_nested_child_and_the_ambient_under_the_pin():
     """`open_run(conversation=)` is the framework's group id: the run's own
-    span, a child unit opened under it, and the ambient a byte seam latches
-    under the run's pin all carry it."""
-    from wardex_sdk._assembly import latch_ambient, resolve_parentage
+    span, a child unit opened under it, and the AMBIENT under the run's pin
+    all carry it. What this does NOT prove — and the last assertion pins as
+    the documented gap — is that a wire span carries it: the byte seam
+    builds its own `Ambient(conversation=None)` from the latched span
+    context, so `resolve_parentage` over what the seam actually latches
+    answers no conversation."""
+    from wardex_sdk._assembly import Ambient, latch_ambient, resolve_parentage
 
     ctx, sink = context()
     conv = ConversationContext(conversation_id="conv-123")
@@ -1825,8 +1829,14 @@ def test_a_stated_conversation_reaches_a_nested_child_and_a_wire_span_under_the_
     ) as s:
         s.draft.set_tool(ToolAttributes(name="t"))
         wire = resolve_parentage(latch_ambient())
+        # The seam's own latch, as `_interceptors/_seam.py::_latched` builds
+        # it: the span context alone. A wire span parented through it has no
+        # conversation — the gap the README and CHANGELOG name.
+        seam = resolve_parentage(Ambient(latch_ambient().span_context, None, None))
     assert wire.parent_span_id == s.draft.context.span_id
     assert wire.conversation is not None and wire.conversation.conversation_id == "conv-123"
+    assert seam.parent_span_id == s.draft.context.span_id
+    assert seam.conversation is None
     run.unpin()
     run.close()
     spans = [d.finish() for d in sink.drafts]
