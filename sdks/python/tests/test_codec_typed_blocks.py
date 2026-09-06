@@ -239,6 +239,87 @@ def test_a_batch_with_one_unmarshallable_span_ships_the_other_spans():
     assert counters.get("transport.otlp.span_unmarshalled") == 1
 
 
+def test_an_unmarshallable_span_puts_no_host_text_on_stderr_off_debug():
+    """The span name and the marshaller's exception are HOST text: a name is
+    the host's, and the exception may be a host `__str__` quoting the value
+    it choked on. Off-debug the report is a fixed line and the counter;
+    under debug the names and reasons follow, on the debug channel."""
+    import logging
+
+    from wardex_sdk import _hub
+    from wardex_sdk._assembly._diag import reset_reports_for_test
+    from wardex_sdk._client import Client
+    from wardex_sdk._config import BackendConfig, WardexConfig
+    from wardex_sdk._types import Envelope
+    from wardex_sdk.testing import RecordingTransport
+
+    class _Records(logging.Handler):
+        def __init__(self) -> None:
+            super().__init__(level=logging.DEBUG)
+            self.lines: list[str] = []
+
+        def emit(self, record: logging.LogRecord) -> None:
+            self.lines.append(record.getMessage())
+
+    class _Leaky:
+        """A host value whose `__str__` raises quoting itself."""
+
+        def __str__(self) -> str:
+            raise RuntimeError("SECRET-VALUE-4711")
+
+    def encode(*, debug: bool) -> list[str]:
+        reset_reports_for_test()
+        _hub.reset_for_test()
+        transport = RecordingTransport()
+        _hub.set_client(
+            Client(WardexConfig(backend=BackendConfig(api_key="k"), debug=debug), transport)
+        )
+        logger = logging.getLogger("wardex_sdk")
+        handler = _Records()
+        logger.addHandler(handler)
+        level = logger.level
+        logger.setLevel(logging.DEBUG)
+        try:
+            bad = _span(
+                name="SECRET-SPAN-NAME",
+                # `explanation` is marshalled with `str()`, so the host's own
+                # `__str__` runs and its text is the exception's text.
+                evaluation=EvaluationAttributes(explanation=_Leaky()),  # type: ignore[arg-type]
+            )
+            env = Envelope(header=_env(bad).header, spans=(_span(name="good"), bad))
+            transport.encode(env, compress=False)
+        finally:
+            logger.removeHandler(handler)
+            logger.setLevel(level)
+            _hub.reset_for_test()
+        return handler.lines
+
+    off = encode(debug=False)
+    assert len(off) == 1 and "could not be marshalled" in off[0]
+    assert "SECRET-SPAN-NAME" not in off[0] and "SECRET-VALUE-4711" not in off[0]
+    on = encode(debug=True)
+    assert any("SECRET-SPAN-NAME" in line and "SECRET-VALUE-4711" in line for line in on)
+
+
+def test_a_failure_outside_the_typed_blocks_still_raises_on_the_export_path():
+    """The skip is for HOST values the marshaller cannot read, not for the
+    encoder's own fields: a span whose wardex-owned `events` cannot be
+    walked is an encoder bug, and the export encoder raises it rather than
+    dropping the span as one more unmarshallable."""
+    from dataclasses import replace
+
+    from wardex_sdk._assembly import counters
+    from wardex_sdk._types import Envelope
+    from wardex_sdk.testing import RecordingTransport
+
+    before = counters.get("transport.otlp.span_unmarshalled")
+    broken = replace(_span(name="broken"), events=object())  # type: ignore[arg-type]
+    env = Envelope(header=_env(broken).header, spans=(broken,))
+    with pytest.raises(Exception):  # noqa: B017 - the exact type is the encoder's
+        RecordingTransport().encode(env, compress=False)
+    assert counters.get("transport.otlp.span_unmarshalled") == before
+
+
 def test_every_block_the_vocabulary_declares_has_a_marshal_site():
     """The check that would have caught the conversation and evaluation
     blocks — and then the retrieval block — six months earlier: a `Block`

@@ -732,7 +732,18 @@ fn state_to_proto(s: &Bound<PyAny>) -> PyResult<pb::StateSnapshot> {
 
 // --- span ---
 
-fn span_to_proto(sp: &Bound<PyAny>) -> PyResult<pb::Span> {
+/// One span is three steps — this head, `flatten_typed_blocks`, then
+/// `span_tail_to_proto` — run in that order by `envelope_to_proto`, and
+/// split so the export path can skip exactly ONE of them: the core fields
+/// and the wardex-owned blocks (head and tail) are the encoder's own and a
+/// failure there is an encoder bug that must raise; the HOST-FACING typed
+/// blocks in the middle hold values the host wrote, and a value the
+/// marshaller cannot read there is that one span's loss and nothing else's.
+///
+/// The head is the core fields and the caller's `extra`, in wire order
+/// ahead of the typed blocks so the attribute sequence is unchanged by the
+/// split.
+fn span_head_to_proto(sp: &Bound<PyAny>) -> PyResult<pb::Span> {
     let ctx = sp.getattr("context")?;
     let mut span = pb::Span {
         trace_id: id_bytes(&ctx.getattr("trace_id")?)?,
@@ -771,7 +782,14 @@ fn span_to_proto(sp: &Bound<PyAny>) -> PyResult<pb::Span> {
     }
     // extra passthrough
     kv_list(&sp.getattr("extra")?, &mut span.extra)?;
-    // gen_ai flattening → extra
+    Ok(span)
+}
+
+/// The host-facing typed blocks (`gen_ai`, `agent`, `tool`, `embeddings`,
+/// `retrieval`, `conversation`, `evaluation`), flattened into `extra`: the
+/// one step whose failure `envelope_to_proto` may turn into a skipped span,
+/// because every value read here was written by the host.
+fn flatten_typed_blocks(sp: &Bound<PyAny>, span: &mut pb::Span) -> PyResult<()> {
     if let Some(g) = opt(sp, "gen_ai")? {
         flatten_gen_ai(&g, &mut span.extra)?;
     }
@@ -804,6 +822,12 @@ fn span_to_proto(sp: &Bound<PyAny>) -> PyResult<pb::Span> {
         span.extra
             .push(kv_str(UNMARSHALLED_FIELD_KEY, unmarshalled.join(",")));
     }
+    Ok(())
+}
+
+/// The wardex-owned blocks after the typed ones: transport, integrity,
+/// correlation, events and links. Encoder-owned, so a failure raises.
+fn span_tail_to_proto(sp: &Bound<PyAny>, span: &mut pb::Span) -> PyResult<()> {
     if let Some(t) = opt(sp, "transport")? {
         span.transport = Some(transport_to_proto(&t)?);
     }
@@ -829,7 +853,7 @@ fn span_to_proto(sp: &Bound<PyAny>) -> PyResult<pb::Span> {
     }
     events_to_proto(sp, &mut span.events)?;
     links_to_proto(sp, &mut span.links)?;
-    Ok(span)
+    Ok(())
 }
 
 /// `InternalSpan.events` -> `Span.events` (tag 10).
@@ -930,13 +954,16 @@ fn header_to_proto(h: &Bound<PyAny>) -> PyResult<pb::EnvelopeHeader> {
 /// Envelope → proto, plus the spans it could NOT marshal, when asked to go on.
 ///
 /// `skip_unmarshallable` is the export path's setting. A span whose typed
-/// block holds a value of the wrong Python type fails `span_to_proto` for
-/// that one span; raising here made the client's drain drop the WHOLE batch
-/// (its `except` is fail-closed and silent off-debug), so one bad value
-/// deleted every good span around it. With the flag set the bad span is
-/// skipped and named — `"{span name}: {reason}"` — for the caller to count
-/// and report; the fidelity encoders keep raising, because a round-trip tool
-/// that hides a span is lying about what it round-tripped.
+/// block holds a value of the wrong Python type fails `flatten_typed_blocks`
+/// for that one span; raising here made the client's drain drop the WHOLE
+/// batch (its `except` is fail-closed and silent off-debug), so one bad
+/// value deleted every good span around it. With the flag set the bad span
+/// is skipped and named — `"{span name}: {reason}"`, host text, for the
+/// caller to count and to show only under debug; the fidelity encoders keep
+/// raising, because a round-trip tool that hides a span is lying about what
+/// it round-tripped. ONLY the typed-block step is skippable: a failure in
+/// the core fields or the wardex-owned blocks is an encoder bug, and the
+/// flag does not turn that into a quiet per-span loss.
 fn envelope_to_proto(
     env: &Bound<PyAny>,
     state_snapshots: bool,
@@ -946,18 +973,19 @@ fn envelope_to_proto(
     let mut unmarshalled = Vec::new();
     for sp in env.getattr("spans")?.iter()? {
         let sp = sp?;
-        let span = match span_to_proto(&sp) {
-            Ok(span) => span,
-            Err(e) if skip_unmarshallable => {
-                let name = sp
-                    .getattr("name")
-                    .and_then(|n| n.str().map(|s| s.to_string()))
-                    .unwrap_or_else(|_| "<unnamed>".into());
-                unmarshalled.push(format!("{name}: {e}"));
-                continue;
+        let mut span = span_head_to_proto(&sp)?;
+        if let Err(e) = flatten_typed_blocks(&sp, &mut span) {
+            if !skip_unmarshallable {
+                return Err(e);
             }
-            Err(e) => return Err(e),
-        };
+            let name = sp
+                .getattr("name")
+                .and_then(|n| n.str().map(|s| s.to_string()))
+                .unwrap_or_else(|_| "<unnamed>".into());
+            unmarshalled.push(format!("{name}: {e}"));
+            continue;
+        }
+        span_tail_to_proto(&sp, &mut span)?;
         items.push(pb::EnvelopeItem {
             header: Some(pb::EnvelopeItemHeader {
                 r#type: "span".into(),
