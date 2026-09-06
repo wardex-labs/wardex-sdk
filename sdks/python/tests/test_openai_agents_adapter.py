@@ -947,6 +947,73 @@ def test_the_uninstall_sweep_unpins_in_reverse_so_the_host_scope_is_current_agai
         _hub.reset_for_test()
 
 
+def test_the_uninstall_sweep_still_closes_open_units_when_the_slot_walk_fails():
+    """The slot table is a WeakKeyDictionary; on 3.10-3.13 a worker thread's
+    `_span_end -> ctx.forget(span)` could pop a key while the sweep copied
+    it, and the RuntimeError was swallowed by the registry's guard BEFORE
+    `close_all` ran -- every open unit stranded. The copy now takes the same
+    lock the slot writes take, and `close_all` sits in a `finally`: even an
+    injected failure of the walk leaves no unit open and unmarked."""
+    import weakref
+
+    from wardex_sdk._adapters._context import Placement
+    from wardex_sdk._assembly import SpanIntent, UnitKind
+
+    class _Broken(weakref.WeakKeyDictionary):
+        def values(self):  # noqa: ANN202
+            raise RuntimeError("dictionary changed size during iteration")
+
+    with installed_adapter(OpenAIAgentsAdapter) as live:
+        ctx = live.ctx
+        ctx.open_run(
+            UnitKind.SESSION,
+            intent=SpanIntent.INVOKE_WORKFLOW,
+            placement=Placement.ROOT,
+            # The vocabulary refuses an `invoke_workflow` span with no name.
+            describe=lambda h: h.draft.set_workflow_name("w"),
+        )
+        real = ctx._slots
+        ctx._slots = _Broken()
+        try:
+            with pytest.raises(RuntimeError):
+                live.adapter.close_units(marker=Limitation.ADAPTER_UNINSTALLED)
+        finally:
+            ctx._slots = real
+        [root] = live.spans
+        assert Limitation.ADAPTER_UNINSTALLED in root.capture_integrity.limitations
+
+
+def test_slot_reads_writes_and_the_sweep_copy_share_one_lock():
+    """`slot`, `peek`, `forget` and the sweep's snapshot all take the same
+    lock, so a worker thread's forget cannot land inside the sweep's copy."""
+
+    class _Key:
+        pass
+
+    class _Counting:
+        def __init__(self, inner) -> None:  # noqa: ANN001
+            self.inner = inner
+            self.entered = 0
+
+        def __enter__(self):  # noqa: ANN204
+            self.entered += 1
+            return self.inner.__enter__()
+
+        def __exit__(self, *exc):  # noqa: ANN002, ANN204
+            return self.inner.__exit__(*exc)
+
+    with installed_adapter(OpenAIAgentsAdapter) as live:
+        ctx = live.ctx
+        ctx._slots_lock = _Counting(ctx._slots_lock)
+        key = _Key()
+        ctx.slot(key)["x"] = 1
+        assert ctx.peek(key) == {"x": 1}
+        assert ctx.slots_snapshot() == [{"x": 1}]
+        ctx.forget(key)
+        assert ctx.peek(key) is None
+        assert ctx._slots_lock.entered == 5
+
+
 def test_a_run_inside_a_host_span_hangs_off_it(agents_env, scenario):
     scenario(_decide_single)
     _init()

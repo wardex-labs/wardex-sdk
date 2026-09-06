@@ -52,6 +52,7 @@ belong in the body are the host's own call and `record_output`.
 
 from __future__ import annotations
 
+import threading
 import weakref
 from collections.abc import Callable, Iterator, Mapping, MutableMapping, Sequence
 from contextlib import contextmanager
@@ -556,6 +557,7 @@ class AdapterContext:
         "_anon_seq",
         "_control_flow",
         "_slots",
+        "_slots_lock",
         "_tripped",
         "_units",
         "debug",
@@ -601,6 +603,13 @@ class AdapterContext:
         self._anon_ns = f"adapters.{name}"
         self._anon_seq = count()
         self._slots: MutableMapping[Any, dict[str, Any]] = weakref.WeakKeyDictionary()
+        # One lock over every slot read, write and copy. The table is walked
+        # by the uninstall sweep on the closing thread while a framework
+        # worker thread can still be ending spans -- `forget` pops a key --
+        # and a WeakKeyDictionary mutated under a copy raises RuntimeError
+        # on 3.10-3.13, which the registry's guard swallowed before the
+        # sweep reached `close_all`: every open unit stranded, unmarked.
+        self._slots_lock = threading.Lock()
         # A READER, not a tuple. `AdapterRegistry.install` builds this context
         # BEFORE it calls `adapter.install()`, and an adapter can only import its
         # framework's error classes in there — so a tuple taken here is `()` for
@@ -628,6 +637,8 @@ class AdapterContext:
         declare no reset of their own.
         """
         self.patches._at_fork_reinit()
+        # Replaced, never acquired: the parent may have held it at the fork.
+        self._slots_lock = threading.Lock()
         self._slots.clear()
 
     @property
@@ -673,10 +684,11 @@ class AdapterContext:
         bookkeeping. A weak key also releases the entry when the host does,
         rather than holding it until something notices.
         """
-        existing = self._slots.get(obj)
-        if existing is None:
-            existing = {}
-            self._slots[obj] = existing
+        with self._slots_lock:
+            existing = self._slots.get(obj)
+            if existing is None:
+                existing = {}
+                self._slots[obj] = existing
         return existing
 
     def peek(self, obj: object) -> dict[str, Any] | None:
@@ -687,11 +699,23 @@ class AdapterContext:
         here?) would otherwise leave an empty entry per object it asked
         about, for as long as the framework holds the object.
         """
-        return self._slots.get(obj)
+        with self._slots_lock:
+            return self._slots.get(obj)
 
     def forget(self, obj: object) -> None:
         """Drop `obj`'s slot if it has one, allocating nothing if it has not."""
-        self._slots.pop(obj, None)
+        with self._slots_lock:
+            self._slots.pop(obj, None)
+
+    def slots_snapshot(self) -> list[dict[str, Any]]:
+        """Every slot, copied under the lock, in insertion order.
+
+        The ONE way to walk the table: a walk over `_slots` itself races a
+        worker thread's `forget`, and the copy is what a sweep iterates
+        after the lock is released.
+        """
+        with self._slots_lock:
+            return list(self._slots.values())
 
     def _alias(self, unit: Unit, key: UnitKey, *, remember: bool) -> None:
         self._units.bind_alias(unit, key, remember=remember)

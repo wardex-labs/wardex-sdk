@@ -484,15 +484,22 @@ class OpenAIAgentsAdapter(AdapterInterface):
                 key="adapters.openai_agents.uninstall_processor_left_inert",
             )
             ctx.count("uninstall_processor_left_inert")
-        self._unpin_held()
-        ctx.close_all(marker=Limitation.ADAPTER_UNINSTALLED)
+        # `close_all` in a `finally`: a sweep that fails part-way must not
+        # leave the open units behind, unclosed and unmarked -- the failure
+        # itself is the registry's guard's to count.
+        try:
+            self._unpin_held()
+        finally:
+            ctx.close_all(marker=Limitation.ADAPTER_UNINSTALLED)
 
     def close_units(self, *, marker: Limitation) -> None:
         """Overridden: this adapter holds a run's units open across callbacks."""
         self._check_processor_removed()
         if self._ctx is not None:
-            self._unpin_held()
-            self._ctx.close_all(marker=marker)
+            try:
+                self._unpin_held()
+            finally:
+                self._ctx.close_all(marker=marker)
 
     def _unpin_held(self) -> None:
         """Take down the pins of every handle this adapter still holds, BEFORE
@@ -516,7 +523,7 @@ class OpenAIAgentsAdapter(AdapterInterface):
         # unpin restores what was current when ITS pin was installed: swept
         # run-first, the run's unpin restored the host's scope and the agent's
         # then put the run's dead fork back on top of it.
-        for entry in reversed(list(ctx._slots.values())):
+        for entry in reversed(ctx.slots_snapshot()):
             h = entry.get("handle")
             if not isinstance(h, RunHandle) or h.degraded:
                 continue
