@@ -683,6 +683,25 @@ def test_an_editable_install_of_the_real_framework_is_not_a_shadow(
         assert answer is None
 
 
+def test_a_spec_less_stub_module_is_left_to_the_import_step(tmp_path, monkeypatch):
+    """A stub placed in `sys.modules` by a test harness or a plugin loader
+    carries no `__spec__`, and `find_spec` raises `ValueError` for such a
+    name instead of answering. The probe cannot judge it and says so by
+    answering `None` -- the import step decides -- rather than by raising,
+    which the registry's guard reported as the adapter having failed to
+    load."""
+    import sys
+    import types
+
+    from wardex_sdk._adapters._probe import shadow_path
+
+    stub = types.ModuleType("agents")
+    stub.__spec__ = None
+    monkeypatch.setitem(sys.modules, "agents", stub)
+    dist = _dist_info(tmp_path, direct_url=None)
+    assert shadow_path("agents", dist, where="adapters.openai_agents") is None
+
+
 @pytest.mark.parametrize(
     ("oracle", "url", "expected"),
     [
