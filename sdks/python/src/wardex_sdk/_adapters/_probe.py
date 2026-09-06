@@ -101,10 +101,12 @@ def shadow_path(
     it: a module under that editable root IS the installed distribution. A
     corrupt record is counted under `<where>.direct_url_read`, not raised.
     """
-    try:
+    # Guarded, not bare: a stub in `sys.modules` with no `__spec__` makes
+    # `find_spec` raise ValueError. Counted under `<where>.find_spec`, and
+    # the import step answers for such a module.
+    spec = None
+    with guard(f"{where}.find_spec"):
         spec = importlib.util.find_spec(module)
-    except Exception:  # noqa: BLE001 — a stub in sys.modules with no __spec__ raises ValueError here; the import step answers for it
-        spec = None
     origin = spec.origin if spec is not None else None
     if not origin:
         return None
