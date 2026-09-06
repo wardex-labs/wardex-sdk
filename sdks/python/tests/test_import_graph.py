@@ -372,6 +372,9 @@ _REPORTING_CALLS = frozenset(
     {
         "guard",
         "bump",
+        # `AdapterContext.count(where)` IS `counters.bump` under the adapter's
+        # namespace — the same evidence, spelled from inside an adapter.
+        "count",
         "parser_disable_log",
         "print",
         "log",
