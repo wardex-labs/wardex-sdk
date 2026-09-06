@@ -48,19 +48,33 @@ model, messages and token usage are the ones that actually crossed the
 socket, and the tool `call_id` the framework echoes into the next turn joins
 each `execute_tool` span to the `chat` span that requested it.
 
+From a checkout of this repository (the example script is not in the
+wheel), on Python 3.10 or newer, with a Phoenix started as in
+[`examples/README.md`](examples/README.md):
+
 ```bash
-pip install wardex-sdk openai-agents
+git clone https://github.com/wardex-labs/wardex-sdk && cd wardex-sdk
+python -m venv .venv && source .venv/bin/activate
+pip install "wardex-sdk>=0.6.0b1" openai-agents          # prebuilt wheel, nothing to compile
+export OPENAI_API_KEY=sk-...                             # the framework's own requirement
 export WARDEX_ENDPOINT=http://127.0.0.1:6006/v1/traces   # a local Phoenix
 python examples/openai_agents_quickstart.py
 ```
+
+The adapter ships in 0.6.0b1; until that version is on PyPI, `pip install
+./sdks/python openai-agents` builds it from the checkout (Rust toolchain
+required). Measured from a fresh virtualenv following the walkthrough, with
+the Phoenix image already pulled: 1.3 minutes to the tree below on screen.
 
 ![Phoenix showing one openai-agents run: invoke_workflow travel_concierge → invoke_agent concierge (chat, execute_tool lookup_weather, chat, handoff concierge→booking_agent) and its sibling invoke_agent booking_agent (chat)](https://raw.githubusercontent.com/wardex-labs/wardex-sdk/main/examples/openai-agents-phoenix.png)
 
 The receiving agent of a handoff is the sender's **sibling**, not its
 child, so a long handoff chain stays one level deep; `wardex.agent.parent`
-and a `handoff_from` link record who handed off to whom. The script, the
-Phoenix and Langfuse walkthroughs and the exact tree to expect are in
-[`examples/README.md`](examples/README.md).
+and a `handoff_from` link record who handed off to whom. Phoenix draws that
+indentation only once its trace drawer is widened — the walkthrough in
+[`examples/README.md`](examples/README.md) says where to click and what to
+drag, covers Langfuse, and explains the framework's own `[non-fatal]
+Tracing client error 401` line if you see one.
 
 Two cases where you do **not** get that tree, and what wardex says instead:
 

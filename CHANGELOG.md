@@ -217,20 +217,31 @@ All notable changes to this project are documented here. The format follows
 - **A runnable openai-agents quickstart, and the README path to it.**
   `examples/openai_agents_quickstart.py` runs a travel concierge with a
   function tool that hands off to a booking agent, once with `Runner.run`
-  and once with `Runner.run_streamed`, under a bare `wardex.init()` that
-  reads `WARDEX_ENDPOINT` — the one wardex variable a first run needs.
-  `examples/README.md` walks from `docker run` (Phoenix) or a
-  Basic-auth `OtlpHttpTransport` (Langfuse) to the eight-span tree in the
-  UI, and the README gained a "Works with openai-agents" section with a
-  screenshot of that tree and the two cases where it is not what you get
-  (Responses over WebSocket → `ws_llm_semantics_unread`; framework tracing
-  disabled → `chat` spans only plus one stderr line). Timed from a fresh
-  virtualenv following the docs alone, with Phoenix already up: venv, `pip
-  install`, the run and the tree on screen took about half a minute of
-  machine time — the ten-minute bar this SDK sets for a first view is met
-  with room to spare. The `examples/` directory is linted like the SDK
-  source: the root `pyproject.toml` extends the SDK's ruff config and CI
-  runs ruff over it.
+  and once with `Runner.run_streamed` (root spans `invoke_workflow
+  travel_concierge` and `invoke_workflow streamed_travel_concierge`, named
+  apart at the front so a trace list that clips names still tells them
+  apart), under a bare `wardex.init()` that reads `WARDEX_ENDPOINT` — the
+  one wardex variable a first run needs. Two switches belong to the script,
+  not to wardex: `EXAMPLE_NO_OPENAI_UPLOAD=1` drops the framework's own
+  upload of the run record to OpenAI (the source of the `[non-fatal]
+  Tracing client error 401` line a refused key produces) by calling
+  `agents.set_trace_processors([])` before `wardex.init()`, and
+  `LANGFUSE_HOST` + key pair export to Langfuse through the Basic-auth
+  `OtlpHttpTransport` that backend needs. `examples/README.md` walks from
+  `docker run` (Phoenix, with the reuse and port-conflict paths) to the
+  eight-span tree — including that Phoenix draws the tree's indentation
+  only once its trace drawer is widened — and the README gained a "Works
+  with openai-agents" section with a screenshot of that tree and the two
+  cases where it is not what you get (Responses over WebSocket →
+  `ws_llm_semantics_unread`; framework tracing disabled → `chat` spans only
+  plus one stderr line). Timed from a fresh virtualenv following the
+  walkthrough alone, Phoenix image already pulled: 1.3 minutes from
+  `python -m venv` to the tree on screen — the ten-minute bar this SDK sets
+  for a first view is met with room to spare; the one-time costs it leaves
+  out are the 1.1 GB Phoenix image pull and, only on the from-source path
+  documented until this version reaches PyPI, the Rust build. The
+  `examples/` directory is linted like the SDK source: the root
+  `pyproject.toml` extends the SDK's ruff config and CI runs ruff over it.
 - **A WebSocket connection carrying LLM calls is no longer invisible.** With
   the openai-agents SDK's opt-in `use_responses_websocket=True` every run went
   over one `wss://…/v1/responses` connection and, under the default capture
