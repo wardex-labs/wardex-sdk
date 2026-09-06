@@ -1302,6 +1302,64 @@ def test_a_handoff_whose_target_never_resolves_is_an_error_marker(agents_env, sc
     ]
 
 
+def test_a_handoff_whose_receiver_never_starts_does_not_leak_into_the_next_run(
+    agents_env, scenario
+):
+    """The sender's end publishes the pending handoff for the receiver that
+    starts NEXT on this task. Here the receiver never starts: its tool's
+    `is_enabled` raises inside `get_all_tools`, which the framework runs
+    BEFORE it opens the receiver's span, so the run fails with the handoff
+    still pending. The next run on the same task then opens a TOP-LEVEL
+    agent of the receiver's name -- and shipped `parent_agent="agent_a"`
+    with a HANDOFF_FROM link into the previous trace, at confidence 1.0 and
+    with no marker. The pending handoff belongs to its run: a receiver in
+    another run is not that handoff's receiver."""
+    from agents import function_tool
+
+    first = [True]
+
+    def decide(inp: object) -> list[dict]:
+        if first[0]:
+            first[0] = False
+            return [_fc("transfer_to_agent_b", "call_h1")]
+        return _DONE
+
+    scenario(decide)
+
+    def refuse(ctx, agent) -> bool:  # noqa: ANN001
+        raise RuntimeError("tool gate broken")
+
+    @function_tool(is_enabled=refuse)
+    def gated() -> str:
+        return "never"
+
+    agent_b = Agent(name="agent_b", instructions="b", model="gpt-4o-mini", tools=[gated])
+    agent_a = Agent(name="agent_a", instructions="a", handoffs=[agent_b], model="gpt-4o-mini")
+    fresh_b = Agent(name="agent_b", instructions="b", model="gpt-4o-mini")
+
+    async def two() -> None:
+        with pytest.raises(RuntimeError):
+            await Runner.run(agent_a, "hi")
+        await Runner.run(fresh_b, "hi")
+
+    _init()
+    try:
+        asyncio.run(two())
+        spans = _spans()
+    finally:
+        wardex.close()
+    marker = _one(spans, "handoff agent_a→agent_b")
+    assert marker.status is StatusCode.OK
+    agents = [s for s in _adapter_spans(spans) if s.name.startswith("invoke_agent")]
+    assert [s.agent.name for s in agents] == ["agent_a", "agent_b"]
+    later_b = agents[1]
+    assert later_b.agent.parent_agent is None
+    assert later_b.links == ()
+    roots = [s for s in _adapter_spans(spans) if s.parent_span_id is None]
+    assert len(roots) == 2 and later_b.context.trace_id == roots[1].context.trace_id
+    assert counters.get("adapters.openai_agents.handoff_receiver_never_started") == 1
+
+
 def test_two_handoffs_in_one_response_mark_the_handoff_and_nothing_else(agents_env, scenario):
     scenario(_decide_two_handoffs)
     agent_c = Agent(name="agent_c", instructions="c", model="gpt-4o-mini")

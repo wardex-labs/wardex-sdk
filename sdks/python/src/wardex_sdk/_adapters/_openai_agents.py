@@ -158,8 +158,17 @@ _CURRENT_AGENT: contextvars.ContextVar[dict[str, Any] | None] = contextvars.Cont
 #: — its handoff included — in a task of its own (measured: the first turn
 #: of a run), and a value set in that child task never reaches the run's
 #: task, where the sender's span ends and the receiver's begins.
-_PENDING_HANDOFF: contextvars.ContextVar[tuple[str, str, UnitKey] | None] = contextvars.ContextVar(
-    "wardex_openai_agents_pending_handoff", default=None
+#:
+#: Scoped to ITS RUN by the fourth member, the run's handle. A receiver
+#: that never starts (its tool's `is_enabled` raising inside the
+#: framework's `get_all_tools`, which runs before the receiver's span
+#: opens) leaves the entry standing, and the next run on the same task
+#: would otherwise hand it to a top-level agent of the receiver's name — a
+#: cross-trace link at confidence 1.0 with no marker. `_agent_start` takes
+#: an entry only for the run it was published in; `_trace_start` and
+#: `_close_run` clear it.
+_PENDING_HANDOFF: contextvars.ContextVar[tuple[str, str, UnitKey, RunHandle | None] | None] = (
+    contextvars.ContextVar("wardex_openai_agents_pending_handoff", default=None)
 )
 
 _TRACING_DISABLED_NOTICE = (
@@ -926,6 +935,7 @@ def _trace_start(adapter: OpenAIAgentsAdapter, trace: Any, *, resumed: bool = Fa
     if run.get("handle") is not None:
         ctx.count("trace_start_twice")
         return
+    _drop_pending_handoff(ctx)
     if resumed:
         ctx.count("run_root_reattached")
         report_once(
@@ -1014,6 +1024,18 @@ def _trace_end(adapter: OpenAIAgentsAdapter, trace: Any) -> None:
     _close_run(adapter, run)
 
 
+def _drop_pending_handoff(ctx: AdapterContext) -> None:
+    """Retire a pending handoff nobody received, counted.
+
+    Called where a run boundary is crossed on this task -- a run's close, the
+    next run's start -- and in `_agent_start` when the entry names another
+    run: whichever comes first sees the entry and counts it once.
+    """
+    if _PENDING_HANDOFF.get() is not None:
+        ctx.count("handoff_receiver_never_started")
+        _PENDING_HANDOFF.set(None)
+
+
 def _close_run(adapter: OpenAIAgentsAdapter, run: dict[str, Any]) -> None:
     """Close a run's root from its slot — the one end for a started trace's
     `on_trace_end` and a reattached trace's drop alike."""
@@ -1025,6 +1047,7 @@ def _close_run(adapter: OpenAIAgentsAdapter, run: dict[str, Any]) -> None:
     h.draft.set_extra("wardex.openai_agents.agents", int(run.get("agent_count") or 0))
     error = run.get("first_error")
     run.clear()
+    _drop_pending_handoff(ctx)
     _unpin(adapter, h)
     if error is not None:
         h.close(status=StatusCode.ERROR, error_type=error)
@@ -1058,6 +1081,10 @@ def _agent_start(adapter: OpenAIAgentsAdapter, run: dict[str, Any], span: Any) -
     pending = _PENDING_HANDOFF.get()
     parent_agent = None
     key = None
+    if pending is not None and pending[3] is not run.get("handle"):
+        # Not this run's handoff, whatever this agent is called.
+        _drop_pending_handoff(ctx)
+        pending = None
     if pending is not None and pending[1] == name:
         parent_agent, key = pending[0], pending[2]
         _PENDING_HANDOFF.set(None)
@@ -1134,7 +1161,8 @@ def _agent_end(adapter: OpenAIAgentsAdapter, run: dict[str, Any], span: Any) -> 
     # a task other than the start's touches only that task's context, so a
     # callback arriving elsewhere cannot corrupt the opening task's view.
     _CURRENT_AGENT.set(entry.get("outer"))
-    _PENDING_HANDOFF.set(entry.get("handoff_out"))
+    out = entry.get("handoff_out")
+    _PENDING_HANDOFF.set(None if out is None else (*out, run.get("handle")))
 
 
 # -- handoffs ------------------------------------------------------------------
