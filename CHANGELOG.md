@@ -5,6 +5,11 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+<!-- Next release: 0.6.0b1 — the install commands in README.md and
+     examples/README.md assume it. Kept as a comment so it renders
+     nowhere: scripts/release.py moves everything below this heading
+     under the new version heading. -->
+
 ### Fixed
 
 - **A conversation id and an evaluation verdict now reach the backend.**
