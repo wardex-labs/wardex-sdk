@@ -15,8 +15,11 @@ that accepts OTLP/HTTP directly, so the whole path is one container, two
 packages and one environment variable.
 
 **What you need.** Docker, Python 3.10 or newer (`python3 --version`), an
-OpenAI API key, and a checkout of this repository — the example script is
-not part of the wheel:
+OpenAI API key, a checkout of this repository — the example script is not
+part of the wheel — and, only until wardex-sdk 0.6.0b1 is on PyPI, a
+[Rust toolchain](https://rustup.rs) (`cargo --version`), because the
+install in step 2 then builds the native module from the checkout instead
+of downloading a prebuilt wheel. The walkthrough assumes a fresh clone:
 
 ```bash
 git clone https://github.com/wardex-labs/wardex-sdk
@@ -78,16 +81,30 @@ here, and they compose badly, so read both before typing:
 **2. Install the framework and wardex.**
 
 ```bash
-python3 -m venv .venv && source .venv/bin/activate
+python3 -m venv .venv-quickstart && source .venv-quickstart/bin/activate
 pip install "wardex-sdk>=0.6.0b1" openai-agents
 ```
 
+(The virtualenv is named `.venv-quickstart` rather than `.venv` so that a
+contributor running this inside an existing working copy does not replace
+the repository's own `uv`-managed `.venv`; it is git-ignored.)
+
 The openai-agents adapter ships in wardex-sdk 0.6.0b1; the wheel is
 prebuilt for macOS, Linux and Windows, so there is nothing to compile.
-Until that version is on PyPI (`pip` answers `No matching distribution`),
-build it from the checkout you are standing in instead — `pip install
-./sdks/python openai-agents` — which compiles the Rust core and therefore
-needs a [Rust toolchain](https://rustup.rs) on the PATH.
+Until that version is on PyPI, `pip` answers `No matching distribution
+found for wardex-sdk>=0.6.0b1`, and the install is instead built from the
+checkout you are standing in:
+
+```bash
+pip install ./sdks/python openai-agents   # needs cargo on the PATH; ~20 s warm, minutes cold
+```
+
+That build reports the version number the checkout declares in
+`sdks/python/pyproject.toml` — 0.5.0b1 today, because the number is bumped
+by the release, not by the commit that adds the adapter. So `pip show
+wardex-sdk` printing something *below* the 0.6.0b1 you were just told to
+require is expected, not a wrong package: the adapter is in the checkout,
+and the next step proves it.
 
 **3. Point wardex at Phoenix, give the framework its key, run.**
 
