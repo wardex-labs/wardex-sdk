@@ -679,6 +679,20 @@ class AdapterContext:
             self._slots[obj] = existing
         return existing
 
+    def peek(self, obj: object) -> dict[str, Any] | None:
+        """The slot `obj` HAS, or None — never one created for the read.
+
+        `slot()` creates on read, which is right for a site that will write;
+        a site that only asks (is this span's run open? did this span start
+        here?) would otherwise leave an empty entry per object it asked
+        about, for as long as the framework holds the object.
+        """
+        return self._slots.get(obj)
+
+    def forget(self, obj: object) -> None:
+        """Drop `obj`'s slot if it has one, allocating nothing if it has not."""
+        self._slots.pop(obj, None)
+
     def _alias(self, unit: Unit, key: UnitKey, *, remember: bool) -> None:
         self._units.bind_alias(unit, key, remember=remember)
 

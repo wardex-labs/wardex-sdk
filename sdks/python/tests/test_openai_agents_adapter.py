@@ -46,6 +46,7 @@ from wardex_sdk._adapters._openai_agents import (
     _TRACING_DISABLED_NOTICE,
     OpenAIAgentsAdapter,
 )
+from wardex_sdk._adapters._registry import get_registry
 from wardex_sdk._assembly import Limitation, LinkReason, ParentSource, counters
 from wardex_sdk._config import AdaptersConfig
 from wardex_sdk._enums import AdapterName, SpanKind, StatusCode
@@ -1559,14 +1560,14 @@ def test_a_tool_payload_is_the_frameworks_string_bounded_by_the_handshake():
     """A `str` is recorded as its own bytes; over the budget it comes back as
     exactly `budget + 1` bytes so the storage cap sets the truncated flag; a
     non-string keeps the LangGraph shaping (a dict's repr is a literal)."""
-    from wardex_sdk._adapters._openai_agents import _framework_payload
+    from wardex_sdk._adapters._payload import _shaped_payload
 
-    assert _framework_payload('{"city":"Seoul"}', 64) == b'{"city":"Seoul"}'
-    assert _framework_payload("sunny in Seoul", 64) == b"sunny in Seoul"
-    assert len(_framework_payload("x" * 10_000, 64)) == 65
-    assert len(_framework_payload("é" * 10_000, 64)) == 65
-    assert _framework_payload("x" * 64, 64) == b"x" * 64
-    assert _framework_payload({"city": "Seoul"}, 64) == b"{'city': 'Seoul'}"
+    assert _shaped_payload('{"city":"Seoul"}', 64) == b'{"city":"Seoul"}'
+    assert _shaped_payload("sunny in Seoul", 64) == b"sunny in Seoul"
+    assert len(_shaped_payload("x" * 10_000, 64)) == 65
+    assert len(_shaped_payload("é" * 10_000, 64)) == 65
+    assert _shaped_payload("x" * 64, 64) == b"x" * 64
+    assert _shaped_payload({"city": "Seoul"}, 64) == b"{'city': 'Seoul'}"
 
 
 def test_a_namespaced_tool_recovers_its_call_id(agents_env, scenario):
@@ -1900,6 +1901,43 @@ def test_a_passing_guardrail_inside_a_hosts_except_block_is_a_pass(agents_env, s
     assert (evaluate.status, evaluate.error_type) == (StatusCode.OK, None)
     assert evaluate.evaluation.score_label == "pass"
     assert _extra(evaluate)["wardex.evaluation.triggered"] is False
+
+
+# --------------------------------------------------------------------------
+# bookkeeping on the paths that record nothing
+# --------------------------------------------------------------------------
+
+
+def test_spans_that_arrive_without_a_run_leave_no_slot_behind(agents_env, scenario):
+    """A processor registered MID-RUN — `wardex.init()` inside a host's open
+    `with trace(...)` — sees spans whose run it never opened. They are
+    counted as `span_without_run` and recorded nowhere: neither the trace nor
+    any span gets an entry allocated just to be read or emptied, so a host
+    that holds its spans holds no wardex bookkeeping with them."""
+    from agents.tracing import trace
+
+    scenario(_decide_single)
+    agent = Agent(name="agent_a", instructions="a", model="gpt-4o-mini")
+    with trace("outer"):
+        _init()
+        try:
+            assert Runner.run_sync(agent, "hi").final_output == "done"
+            ctx = get_registry()._contexts[AdapterName.OPENAI_AGENTS.value]
+            assert counters.get("adapters.openai_agents.span_without_run") >= 1
+            assert _adapter_spans(_spans()) == []
+            assert dict(ctx._slots) == {}
+        finally:
+            wardex.close()
+
+
+def test_the_mcp_tool_list_digest_cannot_be_fooled_by_a_newline_in_a_name():
+    """The digest identifies the LIST, not a joined string: `["a\\nb"]` and
+    `["a", "b"]` are different catalogues and must not share one."""
+    from wardex_sdk._adapters._openai_agents import _tools_digest
+
+    assert _tools_digest(["a\nb"]) != _tools_digest(["a", "b"])
+    assert _tools_digest(["a", "b"]) == _tools_digest(["a", "b"])
+    assert len(_tools_digest([])) == 16
 
 
 # --------------------------------------------------------------------------

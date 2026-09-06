@@ -117,4 +117,27 @@ def _shaped_args(args: Any, budget: int) -> bytes:
     return joined
 
 
-__all__ = ["_shaped_args"]
+def _shaped_payload(value: Any, budget: int) -> bytes:
+    """A payload a framework hands over as its own text, or anything else.
+
+    Written for the OpenAI Agents adapter: the framework's
+    `FunctionSpanData.input` is the model's JSON STRING and its `output` is
+    usually the handler's string, so an exact `str` is recorded as its own
+    bytes — a backend then shows `{"city":"Seoul"}`, not the Python repr
+    `'{"city":"Seoul"}'` that `_shaped_args` (written for LangGraph's dict of
+    arguments, where the repr layer is free) would add. Same budget+1
+    handshake: a string that does not fit is returned as exactly `budget + 1`
+    bytes so the storage cap flags the cut, and the slice is taken on the
+    string BEFORE encoding so the cost stays O(budget). Anything that is not
+    exactly a `str` (a handler returning a dict, or a subclass with a
+    `__repr__` of its own) goes through `_shaped_args` — the ONE shaper for
+    structured values, so a rule about what may be materialised is written
+    once.
+    """
+    if type(value) is not str:
+        return _shaped_args(value, budget)
+    data = value[: budget + 1].encode("utf-8", "replace")
+    return data[: budget + 1] if len(data) > budget else data
+
+
+__all__ = ["_shaped_args", "_shaped_payload"]

@@ -100,7 +100,6 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
-import hashlib
 import os
 import sys
 import threading
@@ -125,9 +124,10 @@ from .._assembly import (
     report_once,
 )
 from .._enums import StatusCode, ToolExecutionType, ToolType
+from .._hash import hash_canonical
 from ._base import AdapterInterface
 from ._context import AdapterContext, Placement, RunHandle
-from ._payload import _shaped_args
+from ._payload import _shaped_payload
 from ._probe import probe
 
 _FRAMEWORK = "openai_agents"
@@ -681,7 +681,8 @@ def _trace_of(adapter: OpenAIAgentsAdapter, span: Any) -> Any | None:
     if ctx is None:
         return None
     kind = type(span.span_data).__name__
-    remembered = None if kind in _END_ONLY else ctx.slot(span).get("trace")
+    entry = None if kind in _END_ONLY else ctx.peek(span)
+    remembered = entry.get("trace") if entry is not None else None
     return remembered if remembered is not None else _current_trace(adapter, span)
 
 
@@ -691,8 +692,8 @@ def _run_state(adapter: OpenAIAgentsAdapter, trace: Any) -> dict[str, Any] | Non
     ctx = adapter._ctx
     if ctx is None:
         return None
-    run = ctx.slot(trace)
-    return run if run.get("handle") is not None else None
+    run = ctx.peek(trace)
+    return run if run is not None and run.get("handle") is not None else None
 
 
 def _span_start(adapter: OpenAIAgentsAdapter, span: Any) -> None:
@@ -754,8 +755,10 @@ def _span_end(adapter: OpenAIAgentsAdapter, span: Any) -> None:
         # The span's bookkeeping ends with the span. The slot is weakly keyed
         # and would go when the framework drops the object, but the framework
         # may hold a finished span for as long as it likes, and the entry
-        # holds a handle and the enclosing agent's entry with it.
-        adapter._ctx.slot(span).clear()  # type: ignore[union-attr]
+        # holds a handle and the enclosing agent's entry with it. `forget`,
+        # not `slot(...).clear()`: a span that never had an entry (one that
+        # arrived without a run) must not be given one just to empty it.
+        adapter._ctx.forget(span)  # type: ignore[union-attr]
 
 
 #: Kinds whose span is opened at END (the framework fills them late) and so
@@ -1393,10 +1396,10 @@ def _function_end(adapter: OpenAIAgentsAdapter, run: dict[str, Any], span: Any) 
         ctx.count("tool_call_id_ambiguous" if len(ids) > 1 else "tool_call_id_unmatched")
     budget = ctx.record_budget
     if raw_input is not None:
-        h.record_input(_framework_payload(raw_input, budget))
+        h.record_input(_shaped_payload(raw_input, budget))
     output = sd.output
     if output is not None:
-        h.record_output(_framework_payload(output, budget))
+        h.record_output(_shaped_payload(output, budget))
     message = _error_message(span)
     if message is not None:
         error_type, _fatal = _classify_error(adapter, message)
@@ -1404,27 +1407,6 @@ def _function_end(adapter: OpenAIAgentsAdapter, run: dict[str, Any], span: Any) 
     else:
         h.close()
     _unpin(adapter, h)
-
-
-def _framework_payload(value: Any, budget: int) -> bytes:
-    """A tool's arguments and result as the framework hands them, bounded.
-
-    The framework's `FunctionSpanData.input` is the model's JSON STRING and
-    its `output` is usually the handler's string, so they are recorded as
-    their own bytes: a backend then shows `{"city":"Seoul"}`, not the
-    Python repr `'{"city":"Seoul"}'` that `_shaped_args` (`_payload.py`,
-    written for LangGraph's dict of arguments, where the repr layer is free)
-    would add.
-    Same budget+1 handshake as that helper: a string that does not fit is
-    returned as exactly `budget + 1` bytes so the storage cap flags the cut,
-    and the slice is taken on the string BEFORE encoding so the cost stays
-    O(budget). Anything that is not exactly a `str` (a handler returning a
-    dict, or a subclass with a `__repr__` of its own) keeps `_shaped_args`.
-    """
-    if type(value) is not str:
-        return _shaped_args(value, budget)
-    data = value[: budget + 1].encode("utf-8", "replace")
-    return data[: budget + 1] if len(data) > budget else data
 
 
 # -- guardrails ----------------------------------------------------------------
@@ -1511,6 +1493,13 @@ def _guardrail_end(adapter: OpenAIAgentsAdapter, run: dict[str, Any], span: Any)
 # -- MCP list-tools --------------------------------------------------------------
 
 
+def _tools_digest(names: list[str]) -> str:
+    """A short identity for a sorted tool list: the canonical-JSON digest of
+    the list, so a newline inside a name cannot make two lists read as one
+    (a joined string could)."""
+    return hash_canonical(names)[:16]
+
+
 def _mcp_list_tools_end(adapter: OpenAIAgentsAdapter, run: dict[str, Any], span: Any) -> None:
     """A step, at the framework's own instants, carrying a HASH and a count of
     the tool names — never the names, which are the server's catalogue and
@@ -1521,7 +1510,7 @@ def _mcp_list_tools_end(adapter: OpenAIAgentsAdapter, run: dict[str, Any], span:
     sd = span.span_data
     server = str(sd.server) if sd.server is not None else None
     names = sorted(str(n) for n in (sd.result or ()))
-    digest = hashlib.sha256("\n".join(names).encode("utf-8")).hexdigest()[:16]
+    digest = _tools_digest(names)
     count = len(names)
     start_ns = None
     with ctx.guard("mcp_started_at"):
