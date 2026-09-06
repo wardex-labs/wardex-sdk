@@ -240,14 +240,14 @@ All notable changes to this project are documented here. The format follows
   measured, plus an estimated — not clocked — 25 seconds of clicking to the
   tree on screen; the ten-minute bar this SDK sets for a first view is met
   with room to spare, and the walkthrough now also carries a browser-free
-  `curl` check against Phoenix's REST API (16 spans across 2 traces for one
-  script run) for a headless or CI reader; it also states what the run
+  `curl` check against Phoenix's REST API (2 traces per script run, up to
+  16 spans) for a headless or CI reader; it also states what the run
   costs, that the framework uploads the transcript to OpenAI by default and
   the switch that stops it, and the `docker ps` port check that tells a
   published Phoenix from a container `docker start` brought up without its
   port. The one-time costs the number leaves out are the 1.1 GB Phoenix
-  image pull and a cold Rust build on the from-source path documented until
-  this version reaches PyPI. The
+  image pull and a cold Rust build on the from-source fallback the
+  walkthrough documents for a checkout ahead of the last PyPI release. The
   `examples/` directory is linted like the SDK source: the root
   `pyproject.toml` extends the SDK's ruff config and CI runs ruff over it.
 - **A WebSocket connection carrying LLM calls is no longer invisible.** With

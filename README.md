@@ -61,10 +61,11 @@ export WARDEX_ENDPOINT=http://127.0.0.1:6006/v1/traces   # a local Phoenix
 python examples/openai_agents_quickstart.py
 ```
 
-The adapter ships in 0.6.0b1; until that version is on PyPI, `pip install
-./sdks/python openai-agents` builds it from the checkout (Rust toolchain
-required, and the build reports the checkout's own, lower, version
-number — expected). The script makes six short `gpt-4o-mini` calls against
+The adapter ships in 0.6.0b1. If `pip` cannot find that version, your
+checkout is ahead of the last PyPI release: `pip install ./sdks/python
+openai-agents` builds it from the checkout instead (needs cargo, and the
+build reports the checkout's own, lower, version number — expected). The
+script makes six short `gpt-4o-mini` calls against
 your key. Measured from a fresh clone and virtualenv following the
 walkthrough, Phoenix image already pulled: under a minute in the terminal,
 18 seconds of it the from-checkout build. That is the measured part; the
