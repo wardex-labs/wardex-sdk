@@ -1904,6 +1904,33 @@ def test_a_passing_guardrail_inside_a_hosts_except_block_is_a_pass(agents_env, s
 
 
 # --------------------------------------------------------------------------
+# the framework's own start instants
+# --------------------------------------------------------------------------
+
+
+def test_a_naive_started_at_is_read_as_utc_and_an_unparsable_one_is_counted():
+    """The framework's `time_iso()` is a host-replaceable hook. The default
+    is aware UTC; a host's naive string is UTC too — the framework's clock
+    is `datetime.now(timezone.utc)` — so it must not be read as LOCAL time,
+    which would shift every handoff marker and MCP step by the zone offset.
+    A string that is not a timestamp at all is a `None` start (the span
+    falls back to wardex's own clock) and a count, never a raise."""
+    from types import SimpleNamespace
+
+    from wardex_sdk._adapters._openai_agents import _started_ns
+
+    seen: list[str] = []
+    ctx = SimpleNamespace(count=seen.append)
+    aware = _started_ns(ctx, SimpleNamespace(started_at="2026-03-01T12:00:00+00:00"))
+    naive = _started_ns(ctx, SimpleNamespace(started_at="2026-03-01T12:00:00"))
+    assert aware == naive == 1_772_366_400 * 1_000_000_000
+    assert _started_ns(ctx, SimpleNamespace(started_at=None)) is None
+    assert seen == []
+    assert _started_ns(ctx, SimpleNamespace(started_at="yesterday")) is None
+    assert seen == ["started_at_unparsed"]
+
+
+# --------------------------------------------------------------------------
 # a pin stranded by wardex.close() mid-run
 # --------------------------------------------------------------------------
 

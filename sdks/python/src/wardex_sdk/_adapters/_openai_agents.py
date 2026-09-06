@@ -108,7 +108,7 @@ import os
 import sys
 import threading
 import weakref
-from datetime import datetime
+from datetime import datetime, timezone
 from inspect import signature
 from pathlib import Path
 from typing import Any
@@ -936,12 +936,27 @@ def _unpin(adapter: OpenAIAgentsAdapter, handle: RunHandle) -> None:
         ctx.count("unpin")
 
 
-def _started_ns(span: Any) -> int | None:
-    """The framework's own start instant, or None when unreadable."""
+def _started_ns(ctx: AdapterContext, span: Any) -> int | None:
+    """The framework's own start instant, or None when unreadable.
+
+    `started_at` comes from the provider's `time_iso()`, a hook a host may
+    replace. The framework's own is aware UTC; a NAIVE string is read as UTC
+    as well, because `datetime.timestamp()` would otherwise read it as the
+    process's local time and shift the instant by the zone offset. A string
+    that does not parse is counted and answered None: the span then takes
+    wardex's own clock, which is late but not wrong.
+    """
     raw = span.started_at
     if not isinstance(raw, str):
         return None
-    return int(datetime.fromisoformat(raw).timestamp() * 1_000_000_000)
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError:
+        ctx.count("started_at_unparsed")
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return int(parsed.timestamp() * 1_000_000_000)
 
 
 def _error_message(span: Any) -> str | None:
@@ -1210,7 +1225,7 @@ def _handoff_end(adapter: OpenAIAgentsAdapter, run: dict[str, Any], span: Any) -
     to = str(sd.to_agent) if sd.to_agent is not None else None
     start_ns = None
     with ctx.guard("handoff_started_at"):
-        start_ns = _started_ns(span)
+        start_ns = _started_ns(ctx, span)
     message = _error_message(span)
     # The SENDER's own turn and response: the marker ends on the sender's
     # task, where the sender is current, and a nested run (agent-as-tool)
@@ -1582,7 +1597,7 @@ def _mcp_list_tools_end(adapter: OpenAIAgentsAdapter, run: dict[str, Any], span:
     count = len(names)
     start_ns = None
     with ctx.guard("mcp_started_at"):
-        start_ns = _started_ns(span)
+        start_ns = _started_ns(ctx, span)
 
     def describe(h: RunHandle) -> None:
         h.draft.set_extra("wardex.step.name", "mcp.list_tools")
