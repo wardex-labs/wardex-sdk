@@ -234,12 +234,13 @@ All notable changes to this project are documented here. The format follows
   with openai-agents" section with a screenshot of that tree and the two
   cases where it is not what you get (Responses over WebSocket →
   `ws_llm_semantics_unread`; framework tracing disabled → `chat` spans only
-  plus one stderr line). Timed from a fresh virtualenv following the
-  walkthrough alone, Phoenix image already pulled: 1.3 minutes from
-  `python -m venv` to the tree on screen — the ten-minute bar this SDK sets
-  for a first view is met with room to spare; the one-time costs it leaves
-  out are the 1.1 GB Phoenix image pull and, only on the from-source path
-  documented until this version reaches PyPI, the Rust build. The
+  plus one stderr line). Timed from a fresh clone and virtualenv following
+  the walkthrough alone, Phoenix image already pulled: 41 seconds in the
+  terminal (34 of them the from-checkout build) plus about 25 seconds of
+  clicking to the tree on screen — the ten-minute bar this SDK sets for a
+  first view is met with room to spare; the one-time costs it leaves out
+  are the 1.1 GB Phoenix image pull and a cold Rust build on the
+  from-source path documented until this version reaches PyPI. The
   `examples/` directory is linted like the SDK source: the root
   `pyproject.toml` extends the SDK's ruff config and CI runs ruff over it.
 - **A WebSocket connection carrying LLM calls is no longer invisible.** With

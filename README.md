@@ -54,7 +54,7 @@ wheel), on Python 3.10 or newer, with a Phoenix started as in
 
 ```bash
 git clone https://github.com/wardex-labs/wardex-sdk && cd wardex-sdk
-python -m venv .venv && source .venv/bin/activate
+python3 -m venv .venv && source .venv/bin/activate
 pip install "wardex-sdk>=0.6.0b1" openai-agents          # prebuilt wheel, nothing to compile
 export OPENAI_API_KEY=sk-...                             # the framework's own requirement
 export WARDEX_ENDPOINT=http://127.0.0.1:6006/v1/traces   # a local Phoenix
@@ -63,8 +63,9 @@ python examples/openai_agents_quickstart.py
 
 The adapter ships in 0.6.0b1; until that version is on PyPI, `pip install
 ./sdks/python openai-agents` builds it from the checkout (Rust toolchain
-required). Measured from a fresh virtualenv following the walkthrough, with
-the Phoenix image already pulled: 1.3 minutes to the tree below on screen.
+required). Measured from a fresh clone and virtualenv following the
+walkthrough, Phoenix image already pulled: a little over a minute to the
+tree below on screen, 34 seconds of it the from-checkout build.
 
 ![Phoenix showing one openai-agents run: invoke_workflow travel_concierge → invoke_agent concierge (chat, execute_tool lookup_weather, chat, handoff concierge→booking_agent) and its sibling invoke_agent booking_agent (chat)](https://raw.githubusercontent.com/wardex-labs/wardex-sdk/main/examples/openai-agents-phoenix.png)
 

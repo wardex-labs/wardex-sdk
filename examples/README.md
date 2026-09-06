@@ -24,14 +24,16 @@ cd wardex-sdk
 ```
 
 **How long it takes.** Measured on 2026-09-06 by following exactly the
-steps below in a fresh virtualenv, with the Phoenix image already pulled and
-pip's cache warm: 1.3 minutes from `python -m venv` to the tree on screen,
-about 25 seconds of which is finding the trace in the UI. Two things happen
-only once and are not in that number: the first `docker run` pulls the
-Phoenix image (1.1 GB — a few minutes on a typical connection, and the
-longest step of a first setup), and the from-source install described under
-step 2 compiles the Rust core (minutes on a cold cache) — the PyPI wheel
-does not.
+steps below from a fresh clone and virtualenv, with the Phoenix image
+already pulled and pip's and cargo's caches warm: 41 seconds in the
+terminal, 34 of them the from-checkout install under step 2, plus the four
+clicks and one drag in the UI — about 25 seconds at human pace, 5 when
+scripted — so a little over a minute to the tree on screen. Two things
+happen only once and are not in that number: the first `docker run` pulls
+the Phoenix image (1.1 GB — a few minutes on a typical connection, and the
+longest step of a first setup), and a cold Rust build on the from-checkout
+path takes minutes rather than 34 seconds; the PyPI wheel skips the build
+altogether.
 
 **1. Start Phoenix.**
 
@@ -51,7 +53,7 @@ with `6007` in every URL below.
 **2. Install the framework and wardex.**
 
 ```bash
-python -m venv .venv && source .venv/bin/activate
+python3 -m venv .venv && source .venv/bin/activate
 pip install "wardex-sdk>=0.6.0b1" openai-agents
 ```
 
