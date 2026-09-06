@@ -1878,6 +1878,80 @@ def test_a_passing_guardrail_inside_a_hosts_except_block_is_a_pass(agents_env, s
 
 
 # --------------------------------------------------------------------------
+# resumed runs (tool approval)
+# --------------------------------------------------------------------------
+
+
+def _decide_weather_once(inp: object) -> list[dict]:
+    if "get_weather" not in _calls_made(inp):
+        return [_fc("get_weather", "call_w1", '{"city": "Seoul"}')]
+    return _DONE
+
+
+def test_a_run_resumed_after_a_tool_approval_ships_under_its_own_root(
+    agents_env, scenario, wardex_log
+):
+    """Human-in-the-loop. A tool with `needs_approval=True` interrupts the
+    run; the host approves and calls `Runner.run(agent, state)` in the same
+    process. The framework REATTACHES the persisted trace for the second
+    half and never announces its start, so no `on_trace_start` arrives —
+    the resumed half's agent and tool spans must still ship under a run
+    root, opened at the resume, counted and said once. Nothing is dropped
+    as `span_without_run`."""
+    from agents import function_tool
+
+    @function_tool(needs_approval=True)
+    def get_weather(city: str) -> str:
+        return f"sunny in {city}"
+
+    scenario(_decide_weather_once)
+    agent = Agent(name="agent_a", instructions="a", tools=[get_weather], model="gpt-4o-mini")
+    _init()
+    try:
+
+        async def drive() -> Any:
+            first = await Runner.run(agent, "hi")
+            assert first.interruptions, "the approval interrupt did not happen"
+            state = first.to_state()
+            for item in first.interruptions:
+                state.approve(item)
+            return await Runner.run(agent, state)
+
+        assert asyncio.run(drive()).final_output == "done"
+        spans = _spans()
+        assert counters.get("adapters.openai_agents.run_root_reattached") == 1
+        # Closed by the framework letting go of its reattached trace, BEFORE
+        # the uninstall sweep — the sweep would mark it ADAPTER_UNINSTALLED.
+        assert counters.get("adapters.openai_agents.run_root_reattached_closed") == 1
+        assert counters.get("adapters.openai_agents.span_without_run") == 0
+    finally:
+        wardex.close()
+    roots = [s for s in spans if s.name == "invoke_workflow Agent workflow"]
+    assert len(roots) == 2
+    resumed = [r for r in roots if _extra(r).get("wardex.openai_agents.resumed") is True]
+    assert len(resumed) == 1
+    assert (
+        _extra(roots[0])["wardex.openai_agents.trace_id"]
+        == _extra(roots[1])["wardex.openai_agents.trace_id"]
+    )
+    root_id = resumed[0].context.span_id
+    # The resumed half: the approved tool runs FIRST (on a subtask of the run
+    # task, under the root), then the agent's next turn. The first half's own
+    # `execute_tool` is the approval request and hangs under ITS agent.
+    resumed_agent = [
+        s for s in spans if s.name == "invoke_agent agent_a" and s.parent_span_id == root_id
+    ]
+    assert len(resumed_agent) == 1
+    tools = [s for s in spans if s.name == "execute_tool get_weather"]
+    assert len(tools) == 2
+    assert [t.parent_span_id == root_id for t in tools].count(True) == 1
+    assert (resumed[0].status, resumed[0].error_type) == (StatusCode.OK, None)
+    assert Limitation.ADAPTER_UNINSTALLED not in _edge(resumed[0])[2]
+    said = [m for m in wardex_log.lines(logging.WARNING) if "resumed" in m]
+    assert len(said) == 1
+
+
+# --------------------------------------------------------------------------
 # MCP list-tools
 # --------------------------------------------------------------------------
 

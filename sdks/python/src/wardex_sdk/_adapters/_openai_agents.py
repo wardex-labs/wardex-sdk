@@ -107,6 +107,7 @@ import json
 import os
 import sys
 import threading
+import weakref
 from datetime import datetime
 from inspect import signature
 from pathlib import Path
@@ -406,6 +407,11 @@ class OpenAIAgentsAdapter(AdapterInterface):
         self._before: tuple[Any, ...] | None = None
         self._mcp = False
         self._tracing: Any = None
+        #: The framework's `ReattachedTrace` class, when this version has one
+        #: (a run resumed from a `RunState` in the same process reattaches
+        #: its persisted trace instead of starting a new one). None on a
+        #: framework without the resume feature.
+        self._reattached: type | None = None
         #: `adapters.openai_agents.active.trace` as read at install. The
         #: counter is process-global and `wardex.close()` does not reset it,
         #: so "no run was ever recorded" is judged against THIS install's
@@ -459,6 +465,8 @@ class OpenAIAgentsAdapter(AdapterInterface):
             return
         self._mcp = _mcp_surface_ok(tracing)
         self._tracing = tracing
+        reattached = getattr(getattr(tracing, "traces", None), "ReattachedTrace", None)
+        self._reattached = reattached if isinstance(reattached, type) else None
         self._notice_if_tracing_disabled(tracing)
         provider = tracing.get_trace_provider()
         self._before = None
@@ -735,21 +743,49 @@ def _run_state(adapter: OpenAIAgentsAdapter, trace: Any) -> dict[str, Any] | Non
 
 
 def _span_start(adapter: OpenAIAgentsAdapter, span: Any) -> None:
+    ctx = adapter._ctx
+    if ctx is None:
+        return
     kind = type(span.span_data).__name__
     handler = _start_handler(kind)
-    if handler is None:
-        if kind not in _END_ONLY:
-            adapter._ctx.count("span_kind_ignored")  # type: ignore[union-attr]
+    if handler is None and kind in _END_ONLY:
         return
+    if handler is None:
+        ctx.count("span_kind_ignored")
     trace = _current_trace(adapter, span)
     if trace is None:
         return
     run = _run_state(adapter, trace)
-    if run is None:
-        adapter._ctx.count("span_without_run")  # type: ignore[union-attr]
+    if run is None and _is_reattached(adapter, trace):
+        # The ignored kinds take part in this one lookup on purpose: the
+        # resumed half's FIRST span is the framework's task span, on the run
+        # task, before the approved tool runs on a subtask of its own. A root
+        # opened there is pinned where the run's spans will look for it, and
+        # its pin lives in a context the framework resets when the run ends.
+        _trace_start(adapter, trace, resumed=True)
+        run = _run_state(adapter, trace)
+    if handler is None:
         return
-    adapter._ctx.slot(span)["trace"] = trace  # type: ignore[union-attr]
+    if run is None:
+        ctx.count("span_without_run")
+        return
+    ctx.slot(span)["trace"] = trace
     handler(adapter, run, span)
+
+
+def _is_reattached(adapter: OpenAIAgentsAdapter, trace: Any) -> bool:
+    """Whether `trace` is one the framework REATTACHED for a resumed run.
+
+    A run resumed from a `RunState` (a tool that needed approval, approved
+    and continued in the same process) does not start a trace: the framework
+    rebuilds the persisted one as a `ReattachedTrace` that fires no
+    `on_trace_start` and no `on_trace_end`. The class is the framework's own
+    word for it; the attribute check keeps a look-alike from qualifying.
+    """
+    cls = adapter._reattached
+    if cls is None or not isinstance(trace, cls):
+        return False
+    return all(hasattr(trace, a) for a in ("name", "trace_id", "group_id"))
 
 
 def _span_end(adapter: OpenAIAgentsAdapter, span: Any) -> None:
@@ -900,10 +936,22 @@ def _error_data(span: Any) -> dict[str, Any]:
 # -- the run -----------------------------------------------------------------
 
 
-def _trace_start(adapter: OpenAIAgentsAdapter, trace: Any) -> None:
+def _trace_start(adapter: OpenAIAgentsAdapter, trace: Any, *, resumed: bool = False) -> None:
     """One `invoke_workflow` per framework trace, pinned on the task that
     started it — the run's own task, or `run_streamed`'s background loop task
-    (which copied the caller's context when it was created)."""
+    (which copied the caller's context when it was created).
+
+    `resumed=True` is the lazy open for a REATTACHED trace (see
+    `_is_reattached`), reached from the first span callback of the resumed
+    half rather than from `on_trace_start`, which never arrives for it. The
+    root's start is therefore the RESUME instant, not the original run's:
+    the framework keeps no start time on the reattached object, and a root
+    that claimed the first half's start would cover time this process did
+    not observe. The two halves share `wardex.openai_agents.trace_id`; the
+    resumed root says `wardex.openai_agents.resumed=True`. Its end is the
+    framework dropping the trace object — the one signal a reattached trace
+    gives — through a weak finalizer; the uninstall sweep is the backstop.
+    """
     ctx = adapter._ctx
     if ctx is None:
         return
@@ -911,6 +959,13 @@ def _trace_start(adapter: OpenAIAgentsAdapter, trace: Any) -> None:
     if run.get("handle") is not None:
         ctx.count("trace_start_twice")
         return
+    if resumed:
+        ctx.count("run_root_reattached")
+        report_once(
+            "openai-agents adapter: a run resumed from a RunState reattached its trace; "
+            "its spans ship under a run root opened at the resume, not at the original start",
+            key="adapters.openai_agents.run_root_reattached",
+        )
     name = str(trace.name)
     group = trace.group_id
     trace_id = str(trace.trace_id)
@@ -937,6 +992,8 @@ def _trace_start(adapter: OpenAIAgentsAdapter, trace: Any) -> None:
         h.draft.set_extra("wardex.openai_agents.trace_id", trace_id)
         if shadowed is not None:
             h.draft.set_extra("wardex.openai_agents.group_id", shadowed)
+        if resumed:
+            h.draft.set_extra("wardex.openai_agents.resumed", True)
 
     h = ctx.open_run(
         UnitKind.SESSION,
@@ -952,6 +1009,25 @@ def _trace_start(adapter: OpenAIAgentsAdapter, trace: Any) -> None:
     run["turn_max"] = 0
     _pin(adapter, h, driver, name)
     ctx.confirm_active("trace")
+    if resumed:
+        # The finalizer holds the run's dict and the adapter, never the
+        # trace: a reference to the trace would keep it alive and the
+        # finalizer from ever running.
+        weakref.finalize(trace, _reattached_trace_dropped, adapter, run)
+
+
+def _reattached_trace_dropped(adapter: OpenAIAgentsAdapter, run: dict[str, Any]) -> None:
+    """The end of a resumed run: the framework let go of its reattached trace.
+
+    In CPython that is the return of the resuming `Runner.run`, where the
+    trace context manager's frame goes away. A run already closed by the
+    uninstall sweep has an empty dict here and nothing to do.
+    """
+    ctx = adapter._ctx
+    if ctx is None or run.get("handle") is None:
+        return
+    ctx.count("run_root_reattached_closed")
+    adapter._contained("reattached_trace_dropped", _close_run, run)
 
 
 def _trace_end(adapter: OpenAIAgentsAdapter, trace: Any) -> None:
@@ -959,10 +1035,19 @@ def _trace_end(adapter: OpenAIAgentsAdapter, trace: Any) -> None:
     if ctx is None:
         return
     run = ctx.slot(trace)
-    h = run.get("handle")
-    if h is None:
+    if run.get("handle") is None:
         ctx.count("trace_end_unmatched")
         return
+    _close_run(adapter, run)
+
+
+def _close_run(adapter: OpenAIAgentsAdapter, run: dict[str, Any]) -> None:
+    """Close a run's root from its slot — the one end for a started trace's
+    `on_trace_end` and a reattached trace's drop alike."""
+    ctx = adapter._ctx
+    if ctx is None:
+        return
+    h = run["handle"]
     h.draft.set_extra("wardex.openai_agents.turns", int(run.get("turn_max") or 0))
     h.draft.set_extra("wardex.openai_agents.agents", int(run.get("agent_count") or 0))
     error = run.get("first_error")
