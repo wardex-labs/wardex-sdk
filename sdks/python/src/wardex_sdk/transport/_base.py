@@ -258,13 +258,19 @@ class Transport(abc.ABC):
                 f"wardex native extension unavailable, so envelopes cannot be "
                 f"encoded ({unavailable_reason()})"
             )
+        # Three answers, not one: the bodies, the count of spans too large
+        # for a request, and the reasons for spans the marshaller could not
+        # read. The encoder does NOT raise for a bad typed-block value any
+        # more -- it skips that one span and names it here, where it is
+        # counted and reported. A raise here is still a raise: a corrupt
+        # envelope or an absent native module is not a per-span loss.
         bodies, dropped, unmarshalled = native.codec.encode_otlp_requests(
             envelope,
             self._pii_mode,
             list(self._pii_disabled),
             self._limits,
             compress,
-        )  # encode=fail-loud
+        )
         if unmarshalled:
             # A span the marshaller could not read -- a typed block holding a
             # value of the wrong Python type. It used to raise out of the

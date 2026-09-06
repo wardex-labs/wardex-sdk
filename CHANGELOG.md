@@ -407,6 +407,14 @@ All notable changes to this project are documented here. The format follows
 
 ### Changed
 
+- **The private native encoder returns three values.**
+  `wardex_sdk._wardex_native.codec.encode_otlp_requests` now answers
+  `(bodies, dropped, unmarshalled)` instead of `(bodies, dropped)`: the third
+  is the list of reasons for spans the marshaller could not read, which the
+  transport counts under `transport.otlp.span_unmarshalled` and reports once
+  while the rest of the batch ships (see the conversation/evaluation fix
+  above). The surface is private and unversioned; a tool that decoded through
+  it must unpack three.
 - **`capture_mode=ALL` and `intercept_hosts` have their first exception:**
   telemetry uploads (any host, path ending in `/v1/traces/ingest`) are never
   captured. README's capture_mode section says so.
