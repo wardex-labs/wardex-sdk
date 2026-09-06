@@ -5,6 +5,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.6.0b1] - 2026-09-06
+
 **What this release means for you.** openai-agents users get one tree per
 `Runner.run` — agent, handoff, tool, guardrail — a runnable quickstart, and the
 rest of that wire (compact, Conversations, WebSocket Responses). Anthropic
@@ -15,11 +17,6 @@ the parse off the event loop, limits that reach what enforces them, and the
 markers each needed — see **Added**, **Changed**, **Fixed**. Two surfaces move:
 `wardex_sdk.testing.AdapterSubject` requires `usage_expected` (BREAKING) and
 the private native encoder returns three values.
-
-<!-- Next release: 0.6.0b1 — the install commands in README.md and
-     examples/README.md assume it. Kept as a comment so it renders
-     nowhere: scripts/release.py moves everything below this heading
-     under the new version heading. -->
 
 ### Fixed
 
