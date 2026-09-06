@@ -96,12 +96,12 @@ Two cases where you do **not** get that tree, and what wardex says instead:
   HTTP transport for `chat` spans.
 - **Framework tracing disabled** (`OPENAI_AGENTS_DISABLE_TRACING=1` or
   `agents.set_tracing_disabled(True)`). There is nothing for the adapter to
-  hook, so you get the `chat` spans only, unparented, and one line on stderr
-  at `wardex.init()`: `[wardex] openai-agents tracing is disabled, so wardex
-  will show only the LLM calls its interceptor captures: no agent, handoff,
-  tool or guardrail spans. …` — followed by the two lines that re-enable the
-  framework's tracing without sending anything to OpenAI. wardex never flips
-  that setting for you.
+  hook, so you get the `chat` spans only, unparented, and one INFO log line
+  (on stderr under default logging) at `wardex.init()`: `[wardex]
+  openai-agents tracing is disabled, so wardex will show only the LLM calls
+  its interceptor captures: no agent, handoff, tool or guardrail spans. …`
+  — followed by the two lines that re-enable the framework's tracing without
+  sending anything to OpenAI. wardex never flips that setting for you.
 
 ## Configuration
 

@@ -348,8 +348,10 @@ what wardex says in each case:
   `agents.set_tracing_disabled(True)`). The adapter hooks the framework's own
   tracing, so with it off there are no `invoke_workflow`, `invoke_agent`,
   `execute_tool` or `handoff` spans — only the `chat` spans read from the
-  wire, unparented. wardex prints exactly one line on stderr at
-  `wardex.init()`:
+  wire, unparented. wardex emits one INFO log line at `wardex.init()` —
+  on stderr under default logging, and through the `wardex_sdk` logger, so
+  a host that raises that logger to WARNING or attaches its own handler
+  sees it wherever it sends INFO, or not at all:
 
   ```
   [wardex] openai-agents tracing is disabled, so wardex will show only the LLM calls its interceptor captures: no agent, handoff, tool or guardrail spans. To get them without sending anything to OpenAI, put these two lines BEFORE wardex.init(): agents.set_tracing_disabled(False); agents.set_trace_processors([]). Calling set_trace_processors after wardex.init() removes wardex's processor as well.

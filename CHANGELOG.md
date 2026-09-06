@@ -234,7 +234,7 @@ All notable changes to this project are documented here. The format follows
   with openai-agents" section with a screenshot of that tree and the two
   cases where it is not what you get (Responses over WebSocket →
   `ws_llm_semantics_unread`; framework tracing disabled → `chat` spans only
-  plus one stderr line). Timed from a fresh clone and virtualenv following
+  plus one INFO log line). Timed from a fresh clone and virtualenv following
   the walkthrough alone, Phoenix image already pulled: 47 seconds in the
   terminal (18 of them the from-checkout build, model round-trips local),
   measured, plus an estimated — not clocked — 25 seconds of clicking to the
