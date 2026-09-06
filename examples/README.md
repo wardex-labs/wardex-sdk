@@ -206,14 +206,21 @@ curl -s 'http://127.0.0.1:6006/v1/projects/default/spans?limit=100' | python3 -c
 # 16 spans 2 traces
 ```
 
-One run of the script is **16 spans across 2 traces**: the eight-span tree
-shown below, once for `Runner.run` and once for `Runner.run_streamed`. A
+Read the **trace count** as the pass criterion: one run of the script is
+**2 traces**, one for `Runner.run` and one for `Runner.run_streamed`,
+however the model behaved inside them. The span count is the softer half —
+a full run is the eight-span tree shown below twice, so **up to 16
+spans**, but a real model may skip the tool call or answer without the
+handoff (the script's module docstring says so under "What to expect"),
+and a tree with fewer branches has fewer spans. Fewer than 16 spans across
+2 traces is a shorter path through the agents, not a lost export. A
 Phoenix that has already taken earlier runs counts those too, and the
 `limit=100` above caps one page, so a long-lived one stops at `100 spans`;
-that exact pair of numbers is what a container started fresh for this
-walkthrough prints. `0 spans 0 traces`, an empty project list, or a
-refused connection means nothing was exported — re-read the
-`WARDEX_ENDPOINT` line in step 3 and the port check in step 1.
+`16 spans 2 traces` is what a container started fresh for this walkthrough
+prints on a run that took every branch. `0 spans 0 traces`, an empty
+project list, or a refused connection is the failure signal — nothing was
+exported: re-read the `WARDEX_ENDPOINT` line in step 3 and the port check
+in step 1.
 
 **4. Look at the tree.**
 
