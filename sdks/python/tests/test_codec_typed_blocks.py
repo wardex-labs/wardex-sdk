@@ -188,6 +188,31 @@ def test_a_score_value_the_marshaller_cannot_read_is_named_not_fatal():
 
 
 @pytest.mark.usefixtures("fresh_counters")
+def test_two_unmarshallable_fields_on_one_span_are_named_under_one_key():
+    """`wardex.codec.unmarshalled` is ONE attribute: with a bad field in the
+    conversation block and another in the evaluation block, a key pushed per
+    field would be a duplicate that an OTLP decoder keeps one of, and the
+    other loss would go unnamed. The names travel comma-joined, in block
+    order, with everything readable in both blocks intact."""
+    from wardex_sdk._types import ConversationContext
+
+    conv = _unchecked(ConversationContext, conversation_id="c1", session_id=None, turn_index="x")
+    ev = _unchecked(
+        EvaluationAttributes, name="judge", explanation=None, score_value="high", score_label=None
+    )
+    out = _codec.decode(_codec.encode(_env(_span(conversation=conv, evaluation=ev))))
+    span = out["items"][0]["span"]
+    extra = _extra_dict(span)
+    keys = [kv["key"] for kv in span.get("extra", [])]
+    assert keys.count("wardex.codec.unmarshalled") == 1
+    assert (
+        extra["wardex.codec.unmarshalled"]
+        == "wardex.conversation.turn_index,gen_ai.evaluation.score.value"
+    )
+    assert extra["gen_ai.conversation.id"] == "c1"
+    assert extra["gen_ai.evaluation.name"] == "judge"
+
+
 def test_a_batch_with_one_unmarshallable_span_ships_the_other_spans():
     """The EXPORT path. One span whose tool block holds an int for a name
     cannot be marshalled at all; before, that raise reached the client's

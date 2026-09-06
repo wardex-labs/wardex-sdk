@@ -391,6 +391,9 @@ fn flatten_tool(t: &Bound<PyAny>, out: &mut Vec<pb::KeyValue>) -> PyResult<()> {
 /// `ConversationContext(conversation_id=uuid)` or an
 /// `EvaluationAttributes(score_value="0.9")` raised out of the encoder and
 /// the client dropped the ENTIRE batch, every good span with it, in silence.
+/// One attribute per span, comma-joined in block order: two bad fields
+/// used to push the key twice, and an OTLP decoder keeps one of a
+/// duplicated key.
 const UNMARSHALLED_FIELD_KEY: &str = "wardex.codec.unmarshalled";
 
 /// `float(v)`-tolerant read: an f64, or a string that parses as one.
@@ -414,7 +417,11 @@ fn as_f64(v: &Bound<PyAny>) -> Option<f64> {
 /// or an integer session key here as naturally as a string, and the value's
 /// text is what a backend groups by either way. `turn_index` is the one
 /// field a host can plausibly set to `None`; that reads as absent.
-fn flatten_conversation(c: &Bound<PyAny>, out: &mut Vec<pb::KeyValue>) -> PyResult<()> {
+fn flatten_conversation(
+    c: &Bound<PyAny>,
+    out: &mut Vec<pb::KeyValue>,
+    unmarshalled: &mut Vec<&'static str>,
+) -> PyResult<()> {
     out.push(kv_str(
         "gen_ai.conversation.id",
         c.getattr("conversation_id")?.str()?.to_string(),
@@ -429,10 +436,7 @@ fn flatten_conversation(c: &Bound<PyAny>, out: &mut Vec<pb::KeyValue>) -> PyResu
         match v.extract::<i64>() {
             Ok(turn) if turn != 0 => out.push(kv_int("wardex.conversation.turn_index", turn)),
             Ok(_) => {}
-            Err(_) => out.push(kv_str(
-                UNMARSHALLED_FIELD_KEY,
-                "wardex.conversation.turn_index".into(),
-            )),
+            Err(_) => unmarshalled.push("wardex.conversation.turn_index"),
         }
     }
     Ok(())
@@ -443,7 +447,11 @@ fn flatten_conversation(c: &Bound<PyAny>, out: &mut Vec<pb::KeyValue>) -> PyResu
 /// conversation block above — declared, set by adapters, never marshalled —
 /// until both were flattened together. `score_value` accepts what `float()`
 /// would; anything else is omitted and named under `UNMARSHALLED_FIELD_KEY`.
-fn flatten_evaluation(e: &Bound<PyAny>, out: &mut Vec<pb::KeyValue>) -> PyResult<()> {
+fn flatten_evaluation(
+    e: &Bound<PyAny>,
+    out: &mut Vec<pb::KeyValue>,
+    unmarshalled: &mut Vec<&'static str>,
+) -> PyResult<()> {
     for (attr, key) in [
         ("name", "gen_ai.evaluation.name"),
         ("explanation", "gen_ai.evaluation.explanation"),
@@ -456,10 +464,7 @@ fn flatten_evaluation(e: &Bound<PyAny>, out: &mut Vec<pb::KeyValue>) -> PyResult
     if let Some(v) = opt(e, "score_value")? {
         match as_f64(&v) {
             Some(f) => out.push(kv_double("gen_ai.evaluation.score.value", f)),
-            None => out.push(kv_str(
-                UNMARSHALLED_FIELD_KEY,
-                "gen_ai.evaluation.score.value".into(),
-            )),
+            None => unmarshalled.push("gen_ai.evaluation.score.value"),
         }
     }
     Ok(())
@@ -782,11 +787,19 @@ fn span_to_proto(sp: &Bound<PyAny>) -> PyResult<pb::Span> {
     if let Some(r) = opt(sp, "retrieval")? {
         flatten_retrieval(&r, &mut span.extra)?;
     }
+    // The fields the blocks below could not read are named under ONE key:
+    // a key pushed per field would be a duplicate attribute, of which an
+    // OTLP decoder keeps one, and the other loss would go unnamed.
+    let mut unmarshalled: Vec<&'static str> = Vec::new();
     if let Some(c) = opt(sp, "conversation")? {
-        flatten_conversation(&c, &mut span.extra)?;
+        flatten_conversation(&c, &mut span.extra, &mut unmarshalled)?;
     }
     if let Some(e) = opt(sp, "evaluation")? {
-        flatten_evaluation(&e, &mut span.extra)?;
+        flatten_evaluation(&e, &mut span.extra, &mut unmarshalled)?;
+    }
+    if !unmarshalled.is_empty() {
+        span.extra
+            .push(kv_str(UNMARSHALLED_FIELD_KEY, unmarshalled.join(",")));
     }
     if let Some(t) = opt(sp, "transport")? {
         span.transport = Some(transport_to_proto(&t)?);
