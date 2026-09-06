@@ -5,6 +5,15 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- The openai-agents quickstart docs no longer describe a from-source
+  install. `pip install "wardex-sdk>=0.6.0b1" openai-agents` is a prebuilt
+  wheel, so the Rust toolchain prerequisite and the fallback for a checkout
+  ahead of the last release are gone from `README.md` and
+  `examples/README.md`; contributors working on a checkout use the
+  development install in `CONTRIBUTING.md` instead.
+
 ## [0.6.0b1] - 2026-09-06
 
 **What this release means for you.** openai-agents users get one tree per
@@ -283,11 +292,10 @@ the private native encoder returns three values.
   costs, that the framework uploads the transcript to OpenAI by default and
   the switch that stops it, and the `docker ps` port check that tells a
   published Phoenix from a container `docker start` brought up without its
-  port. The one-time costs the number leaves out are the 1.1 GB Phoenix
-  image pull and a cold Rust build on the from-source fallback the
-  walkthrough documents for a checkout ahead of the last PyPI release. The
-  `examples/` directory is linted like the SDK source: the root
-  `pyproject.toml` extends the SDK's ruff config and CI runs ruff over it.
+  port. The one-time cost the number leaves out is the 1.1 GB Phoenix
+  image pull. The `examples/` directory is linted like the SDK source: the
+  root `pyproject.toml` extends the SDK's ruff config and CI runs ruff over
+  it.
 - **A WebSocket connection carrying LLM calls is no longer invisible.** With
   the openai-agents SDK's opt-in `use_responses_websocket=True` every run went
   over one `wss://…/v1/responses` connection and, under the default capture
