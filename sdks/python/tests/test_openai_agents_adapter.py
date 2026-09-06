@@ -900,6 +900,53 @@ def test_two_runs_on_one_task_are_two_clean_roots_and_unpin_is_why(
     assert Limitation.CORRELATION_CONFLICT in _edge(roots[1])[2]
 
 
+def test_the_uninstall_sweep_unpins_in_reverse_so_the_host_scope_is_current_again():
+    """Run, agent and tool pinned on ONE task, in that order, and then
+    `wardex.close()` mid-run: each unpin restores "what was current when
+    that pin was installed", so a sweep in pin order puts the RUN's fork
+    back last-but-one and leaves the AGENT's fork current -- a dead unit's
+    scope standing on the host's task. Reverse order retires them the way a
+    stack unwinds, and the host's own scope is current when the sweep ends."""
+    import threading
+
+    from wardex_sdk._adapters._context import Placement
+    from wardex_sdk._assembly import SpanIntent, UnitKind
+    from wardex_sdk._types import SpanContext, SpanId, TraceId
+
+    class _Key:
+        """A slot key: `object()` itself cannot be weakly referenced."""
+
+    host = SpanContext(trace_id=TraceId(b"\x0a" * 16), span_id=SpanId(b"\x0b" * 8))
+    try:
+        with installed_adapter(OpenAIAgentsAdapter) as live:
+            # After the harness's own scope reset, so this is the host's scope.
+            _hub.get_current_scope().active_span_context = host
+            ctx = live.ctx
+            driver = threading.current_thread()
+            run = ctx.open_run(
+                UnitKind.SESSION, intent=SpanIntent.INVOKE_WORKFLOW, placement=Placement.ROOT
+            )
+            assert run.pin(driver=driver)
+            agent = ctx.open_run(
+                UnitKind.AGENT, intent=SpanIntent.INVOKE_AGENT, placement=Placement.NESTED
+            )
+            assert agent.pin(driver=driver)
+            tool = ctx.open_run(
+                UnitKind.CALL, intent=SpanIntent.EXECUTE_TOOL, placement=Placement.NESTED
+            )
+            assert tool.pin(driver=driver)
+            keys = [_Key() for _ in range(3)]  # weak-referenceable, in pin order
+            for key, h in zip(keys, (run, agent, tool), strict=True):
+                ctx.slot(key)["handle"] = h
+            assert _hub.get_current_scope().active_span_context == tool._unit.context
+            live.adapter._unpin_held()
+            assert _hub.get_current_scope().active_span_context == host
+            assert counters.get("adapters.openai_agents.unpin") == 3
+            live.adapter.close_units(marker=Limitation.ADAPTER_UNINSTALLED)
+    finally:
+        _hub.reset_for_test()
+
+
 def test_a_run_inside_a_host_span_hangs_off_it(agents_env, scenario):
     scenario(_decide_single)
     _init()

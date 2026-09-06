@@ -511,7 +511,12 @@ class OpenAIAgentsAdapter(AdapterInterface):
         ctx = self._ctx
         if ctx is None:
             return
-        for entry in list(ctx._slots.values()):
+        # In REVERSE slot order, the way a stack unwinds. Slots are made in
+        # pin order (run, then its agent, then that agent's tool), and each
+        # unpin restores what was current when ITS pin was installed: swept
+        # run-first, the run's unpin restored the host's scope and the agent's
+        # then put the run's dead fork back on top of it.
+        for entry in reversed(list(ctx._slots.values())):
             h = entry.get("handle")
             if not isinstance(h, RunHandle) or h.degraded:
                 continue
