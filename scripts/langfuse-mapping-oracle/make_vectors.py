@@ -273,9 +273,7 @@ def _vector_c():
     finally:
         receiver.close()
     siblings = [s for s in client.spans if s.name == "execute_step llm_request"]
-    assert len(siblings) == 2, (
-        "the join must be ambiguous for this vector to mean anything"
-    )
+    assert len(siblings) == 2, "the join must be ambiguous for this vector to mean anything"
     return client.spans
 
 
@@ -298,9 +296,7 @@ def _write(out: Path, name: str, spans, meta: dict) -> dict:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--out", required=True, help="directory to write the vectors into"
-    )
+    parser.add_argument("--out", required=True, help="directory to write the vectors into")
     args = parser.parse_args()
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -310,9 +306,7 @@ def main() -> None:
     # self-certified by the encoder under test).
     import sys
 
-    sys.path.insert(
-        0, str(Path(__file__).resolve().parents[2] / "sdks" / "python" / "tests")
-    )
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "sdks" / "python" / "tests"))
 
     manifest = {
         "model": MODEL,
