@@ -15,25 +15,13 @@ that accepts OTLP/HTTP directly, so the whole path is one container, two
 packages and one environment variable.
 
 **What you need.** Docker, Python 3.10 or newer (`python3 --version`), an
-OpenAI API key, a checkout of this repository — the example script is not
-part of the wheel — and, if your checkout is newer than the last PyPI
-release, a [Rust toolchain](https://rustup.rs) (`cargo --version`),
-because the install in step 2 then falls back to building the native
-module from the checkout instead of downloading a prebuilt wheel. Without
-cargo that install does not stop
-with a missing-prerequisite message: it runs for a while and then fails as
-a build error many lines deep in pip's output, ending in
-
-```
-💥 maturin failed
-  Caused by: Cargo metadata failed. Do you have cargo in your PATH?
-  Caused by: No such file or directory (os error 2)
-```
-
-which names maturin — the build backend — rather than wardex, and is easy
-to read as a broken package. It is not: install the Rust toolchain from
-the rustup link above, open a new shell so `cargo --version` answers, and
-run the same `pip install` again. The walkthrough assumes a fresh clone:
+OpenAI API key, and a checkout of this repository — the example script is
+not part of the wheel, so a clone is the easy way to have it. Nothing is
+compiled: the install in step 2 downloads a prebuilt wheel from PyPI. A
+reader who instead copies the single example file out of this repository
+needs no clone at all — only the two packages and the environment
+variables below, and then `python openai_agents_quickstart.py` wherever
+the copy landed. The walkthrough assumes a fresh clone:
 
 ```bash
 git clone https://github.com/wardex-labs/wardex-sdk
@@ -41,28 +29,25 @@ cd wardex-sdk
 ```
 
 Every command below that one is run **from the repository root** — the
-virtualenv, `pip install ./sdks/python` and `python examples/...` are all
-written relative to it, so `cd` back here if you wander off.
+virtualenv and `python examples/...` are both written relative to it, so
+`cd` back here if you wander off.
 
 **How long it takes.** Measured in a second run-through of exactly the
 steps below, from a fresh virtualenv, with the Phoenix image already
-pulled and pip's and cargo's caches warm, on a checkout ahead of the last
-PyPI release — so the measurement includes step 2's fallback: 47 seconds
-in the terminal — 2 of them creating the virtualenv, 1 the `pip install`
-from PyPI failing to find the version, 18 the from-checkout install it
-falls back to, 4 the run itself, and 22 finding the trace and reading all
-eight spans back — so well under a minute in the terminal, and about a
-minute once the four clicks and one drag in the UI are added. Those clicks
-are an estimate of roughly 25 seconds at human pace, not a clocked number;
-every terminal figure above is measured. A reader whose `pip install`
-finds the wheel on PyPI pays neither of those first two install figures
-nor the build behind them. The model round-trips in that run were local,
-so a real `gpt-4o-mini` adds its own latency for the six calls. Two things
-happen only once and are not in that number: the first `docker run` pulls
+pulled and pip's cache warm: 2 seconds creating the virtualenv, 4 the run
+itself, and 22 finding the trace and reading all eight spans back — 28
+seconds of measured terminal time. Step 2's `pip install` is not in that
+28: the run-through that produced these figures predates the release, so
+the figure it measured there was a build that no longer happens. What
+replaces it is a prebuilt-wheel download, which compiles nothing. So:
+well under a minute in the terminal, and about a minute once the four
+clicks and one drag in the UI are added. Those clicks are an estimate of
+roughly 25 seconds at human pace, not a clocked number; every terminal
+figure above is measured. The model round-trips in that run were local, so
+a real `gpt-4o-mini` adds its own latency for the six calls. One thing
+happens only once and is not in that number: the first `docker run` pulls
 the Phoenix image (1.1 GB — a few minutes on a typical connection, and the
-longest step of a first setup), and a cold Rust build on the from-checkout
-path takes minutes rather than 18 seconds; the prebuilt wheel skips the
-build altogether.
+longest step of a first setup).
 
 **1. Start Phoenix.**
 
@@ -132,21 +117,7 @@ contributor running this inside an existing working copy does not replace
 the repository's own `uv`-managed `.venv`; it is git-ignored.)
 
 The openai-agents adapter ships in wardex-sdk 0.6.0b1; the wheel is
-prebuilt for macOS, Linux and Windows, so there is nothing to compile. If
-`pip` answers `No matching distribution found for wardex-sdk>=0.6.0b1`,
-your checkout is ahead of the last PyPI release — build the install from
-the checkout you are standing in instead:
-
-```bash
-pip install ./sdks/python openai-agents   # needs cargo on the PATH; ~20 s warm, minutes cold
-```
-
-That build reports the version number the checkout declares in
-`sdks/python/pyproject.toml`, which is still the last *released* number:
-the release bumps it, not the commit that adds the adapter. So on this
-path `pip show wardex-sdk` printing something *below* the version you were
-just told to require is expected, not a wrong package — the adapter is in
-the checkout, and the next step proves it.
+prebuilt for macOS, Linux and Windows, so there is nothing to compile.
 
 **3. Point wardex at Phoenix, give the framework its key, run.**
 
