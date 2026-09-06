@@ -153,6 +153,26 @@ def _no_job_left_pending(request):
 
 
 @pytest.fixture(autouse=True)
+def _retire_ambient_unit_after_test():
+    """Clear the ambient-unit carrier of the test's own thread afterwards.
+
+    A pin is a ContextVar entry on the task that installed it, and a test
+    that closes wardex from ANOTHER thread while a run is pinned on this one
+    (the stranded-pin cases) leaves that entry standing here on purpose:
+    the product retires the scope fork under it from the closing thread and
+    the entry itself on this thread's next read, but that next read is the
+    NEXT test's -- which then sees a foreign-registry counter it never
+    caused. `clean_state()` does this at entry for the adapter harness; this
+    is the same retirement for every test, at exit.
+    """
+    yield
+    from wardex_sdk._assembly._units import _ambient_unit
+
+    if _ambient_unit.get() is not None:
+        _ambient_unit.set(None)
+
+
+@pytest.fixture(autouse=True)
 def _close_hub_client_after_test():
     """Join the background worker thread any test may have started.
 

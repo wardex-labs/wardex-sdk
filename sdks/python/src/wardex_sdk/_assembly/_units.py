@@ -195,6 +195,25 @@ _ambient_unit: contextvars.ContextVar[_AmbientUnit | None] = contextvars.Context
 )
 
 
+def _retire_dead_foreign(entry: _AmbientUnit) -> None:
+    """Take a DEAD entry of another registry off this task's carrier.
+
+    The other half of `_Carrier.retire_from_afar`. A unit closed from another
+    thread has its scope fork retired there, but its `_ambient_unit` entry is
+    a ContextVar of the pinned task and only that task can clear it -- and
+    after a re-init nothing ever will: the registry that owned the unit is
+    gone and the pin token with it. Left standing, every read on this task
+    counts it as foreign for the life of the thread, which buries the one
+    count that meant something. So the owning task retires it on the read
+    that finds it dead: counted once as foreign, then gone. A LIVE foreign
+    entry is left alone -- a dropped registry's units are never closed, and
+    two adapters side by side put each other's live units here all day.
+    """
+    if not entry.unit.is_live and entry.owner is _current_task():
+        _ambient_unit.set(None)
+        counters.bump("assembly._units.ambient_foreign_retired")
+
+
 def _current_task() -> object:
     """The identity of the task (or thread) running right now.
 
@@ -1280,6 +1299,7 @@ class UnitRegistry:
             # hand out, and the staleness gate below does NOT catch it: nothing
             # closes a dropped registry's units, so it is still `is_live`.
             counters.bump("assembly._units.ambient_foreign_registry")
+            _retire_dead_foreign(entry)
             return None
         if not entry.unit.is_live:
             same_task = entry.owner is _current_task()
@@ -1370,6 +1390,7 @@ class UnitRegistry:
         if entry.unit._registry is not self:
             if entry.pinned:
                 counters.bump("assembly._units.stale_pin_foreign_registry")
+            _retire_dead_foreign(entry)
             return None
         if entry.unit.is_live:
             return None

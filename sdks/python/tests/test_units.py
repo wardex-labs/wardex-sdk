@@ -584,6 +584,16 @@ def test_a_unit_closed_on_another_thread_retires_its_pin_fork_in_place():
     assert get_current_scope().active_span_context == host
     assert get_current_scope().conversation.conversation_id == "host-chat"
     assert counters.get("assembly._units.pin_retired_from_afar") == 1
+    # After a re-init the entry is another registry's corpse on this task's
+    # carrier, and nothing but this task can clear it: the first read that
+    # finds it dead counts it as foreign ONCE and retires it, so a process
+    # that re-inits is not counting a ghost on every read for its lifetime.
+    later = registry()
+    assert later.current() is None
+    assert _ambient_unit.get() is None
+    assert later.current() is None
+    assert counters.get("assembly._units.ambient_foreign_registry") == 1
+    assert counters.get("assembly._units.ambient_foreign_retired") == 1
     # The owning task's own unpin still restores the same host scope.
     reg.unpin(token)
     assert get_current_scope().active_span_context == host
