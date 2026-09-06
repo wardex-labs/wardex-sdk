@@ -5,6 +5,17 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+**What this release means for you.** openai-agents users get one tree per
+`Runner.run` — agent, handoff, tool, guardrail — a runnable quickstart, and the
+rest of that wire (compact, Conversations, WebSocket Responses). Anthropic
+users' token and cost columns move: inclusive `gen_ai.usage.input_tokens`,
+thinking tokens kept, `count_tokens`/`batches` no longer failed chat calls.
+Everyone gets Responses API parsing, no duplicate export from forked workers,
+the parse off the event loop, limits that reach what enforces them, and the
+markers each needed — see **Added**, **Changed**, **Fixed**. Two surfaces move:
+`wardex_sdk.testing.AdapterSubject` requires `usage_expected` (BREAKING) and
+the private native encoder returns three values.
+
 <!-- Next release: 0.6.0b1 — the install commands in README.md and
      examples/README.md assume it. Kept as a comment so it renders
      nowhere: scripts/release.py moves everything below this heading
@@ -24,7 +35,12 @@ All notable changes to this project are documented here. The format follows
   and a non-zero `wardex.conversation.turn_index` ride along when set) and
   filter guardrail spans by `gen_ai.evaluation.score.label`. The
   openai-agents adapter's `RunConfig(group_id=…)` and `evaluate` spans
-  below depend on this.
+  below depend on this. The retrieval block — which no shipped adapter
+  sets yet — gained its flattener in the same pass (`gen_ai.data_source.id`,
+  `gen_ai.retrieval.query.text`, the documents, and a `str` value for those
+  documents no longer costs the whole span at export), and every `Block`
+  member is now held to a wire test, which is the check that would have
+  caught all three gaps.
 - **The openai-agents SDK's own trace upload no longer becomes a span.** By
   default the framework POSTs its whole run record — every prompt,
   completion, model and usage of the run — to `/v1/traces/ingest`. Under
@@ -36,6 +52,25 @@ All notable changes to this project are documented here. The format follows
   through the per-connection buffer, capped by
   `LimitsConfig.max_body_bytes`, and are discarded unparsed — and counted
   under `interceptors.seam.path_excluded`.
+- **An adapter no longer imports a framework the host only appears to
+  have.** Auto-detection now requires the framework's installed
+  distribution AND that the module on the path is the one that
+  distribution owns — checked in one place, before the adapter's import
+  runs — so a project-local `agents/` or `langgraph/` directory is
+  declined instead of having its body executed by the probe (an editable
+  install of the real framework is not mistaken for such a shadow).
+  Naming an adapter in `AdaptersConfig(enabled=...)` still installs it off
+  the import alone, which restores the previous release's behavior for a
+  framework that is importable without dist-info — a PyInstaller bundle
+  built without `copy_metadata`, a vendored checkout on `PYTHONPATH`; that
+  path warns once that the shadow check was skipped and counts
+  `distribution_absent_explicit`.
+- **`wardex.conversation(name, id="")` no longer raises out of your own
+  `with` line.** An empty id reads as "no id" now, like `None`, and a
+  uuid4 is minted. Constructing a `ConversationContext` directly still
+  raises `ValueError` for both — and for `None`, which used to be coerced
+  to the literal id `"None"`, shared on the wire by every session that
+  did it.
 - **A raising LLM-semantic parser no longer deletes the span.** The parse
   exception used to be swallowed uncounted (`sem=None`), and under the
   default AGENT mode with no ambient parent the whole span was then gated
@@ -175,7 +210,8 @@ All notable changes to this project are documented here. The format follows
 ### Added
 
 - **OpenAI Agents SDK adapter (`AdapterName.OPENAI_AGENTS`, `openai-agents>=0.22,<0.23`).**
-  Auto-detected when the `agents` module is importable. Before, a three-turn
+  Auto-detected when the `openai-agents` distribution is installed and owns
+  the `agents` module on the path. Before, a three-turn
   `Runner.run` (tool call, handoff, final answer) was three parentless
   `chat gpt-4o-mini` spans; now it is ONE tree: one `invoke_workflow` per
   `Runner.run` / `run_sync` / `run_streamed` (named after
