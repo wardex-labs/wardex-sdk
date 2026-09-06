@@ -42,13 +42,38 @@ docker run -d --name wardex-phoenix -p 6006:6006 arizephoenix/phoenix:latest
 ```
 
 Phoenix is ready when <http://localhost:6006> opens in a browser, about
-fifteen seconds after the image is local. If you have done this before,
-the container already exists: `docker start wardex-phoenix` brings it
-back. If `docker run` fails with `Bind for 0.0.0.0:6006 failed: port is
-already allocated`, something else — usually another Phoenix, see
-`docker ps` — already listens on 6006: either use that one as it is, or
-publish this one on a different port (`-p 6007:6006`) and replace `6006`
-with `6007` in every URL below.
+fifteen seconds after the image is local. Before moving on, check that the
+port is really published to the container you expect:
+
+```bash
+docker ps --filter name=phoenix --format '{{.Names}}  {{.Status}}  {{.Ports}}'
+# wardex-phoenix  Up 20 seconds  0.0.0.0:6006->6006/tcp, [::]:6006->6006/tcp
+```
+
+The `0.0.0.0:6006->6006/tcp` part is the one that matters: it is what
+makes `localhost:6006` reach *this* container. Two things can go wrong
+here, and they compose badly, so read both before typing:
+
+- `docker run` fails with `Bind for 0.0.0.0:6006 failed: port is already
+  allocated`: something else — usually another Phoenix — already listens
+  on 6006, and `docker ps` shows which. Either use that one as it is (it
+  is a Phoenix; the URL below is the same), or publish this one on another
+  port (`-p 6007:6006`) and replace `6006` with `6007` in every URL below.
+  The failed `docker run` leaves a container named `wardex-phoenix` behind
+  in `Created` state, which is why the *same* command fails a second time
+  with `The container name "/wardex-phoenix" is already in use` — remove it
+  with `docker rm wardex-phoenix` before running it again.
+- **Do not `docker start` that leftover container.** `docker start
+  wardex-phoenix` reports success and Phoenix logs "up and running", but
+  `docker ps` shows the port as a bare `6006/tcp` with no `0.0.0.0:6006->`
+  in front of it — and it stays that way even after the other listener is
+  gone (verified: a container whose first start lost the bind never
+  publishes the port again). Nothing on `localhost:6006` reaches it, the
+  export goes to whatever does hold the port, and no error says so. Remove
+  it and re-create it with the `docker run` line above. `docker start` is
+  the right verb only for a container you stopped yourself with `docker
+  stop wardex-phoenix`; that one comes back with its mapping, and `docker
+  ps` is the way to tell the two apart.
 
 **2. Install the framework and wardex.**
 
