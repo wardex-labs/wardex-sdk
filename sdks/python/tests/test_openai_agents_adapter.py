@@ -662,6 +662,40 @@ def test_an_editable_install_of_the_real_framework_is_not_a_shadow(
         assert answer is None
 
 
+@pytest.mark.parametrize(
+    ("oracle", "url", "expected"),
+    [
+        # PEP 610 spells a Windows path as `file:///C:/...`; its path part is
+        # `/C:/...`, and a `Path()` of that on Windows is `\C:\...`, which
+        # `resolve()` roots under the current drive -- every editable install
+        # there compared unequal and was declined as a shadow.
+        ("nt", "file:///C:/work/agents", "C:\\work\\agents"),
+        ("nt", "file:///C:/work/my%20agents", "C:\\work\\my agents"),
+        ("posix", "file:///home/me/agents", "/home/me/agents"),
+        ("posix", "file:///home/me/my%20agents", "/home/me/my agents"),
+    ],
+)
+def test_an_editable_root_is_read_as_the_platform_spells_paths(monkeypatch, oracle, url, expected):
+    """The record's URL is turned into a path by the stdlib's own
+    `url2pathname`, exercised here with BOTH platforms' spellings so the
+    Windows shape is held on every host rather than only where CI does not
+    run."""
+    import json
+    import nturl2path
+    import urllib.request
+
+    from wardex_sdk._adapters import _probe
+
+    monkeypatch.setattr(
+        _probe,
+        "url2pathname",
+        nturl2path.url2pathname if oracle == "nt" else urllib.request.url2pathname,
+    )
+    raw = json.dumps({"url": url, "dir_info": {"editable": True}})
+    assert _probe.editable_root_pathname(raw) == expected
+    assert _probe.editable_root_pathname(json.dumps({"url": url, "dir_info": {}})) is None
+
+
 # --------------------------------------------------------------------------
 # scenarios on the fake server
 # --------------------------------------------------------------------------

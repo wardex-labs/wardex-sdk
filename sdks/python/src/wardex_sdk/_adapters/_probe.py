@@ -24,11 +24,19 @@ import importlib.util
 import json
 from pathlib import Path
 from typing import NamedTuple
-from urllib.parse import unquote, urlsplit
+from urllib.parse import urlsplit
+from urllib.request import url2pathname
 
 from .._assembly import guard
 
-__all__ = ["Probe", "editable_root", "installed_distribution", "probe", "shadow_path"]
+__all__ = [
+    "Probe",
+    "editable_root",
+    "editable_root_pathname",
+    "installed_distribution",
+    "probe",
+    "shadow_path",
+]
 
 
 class Probe(NamedTuple):
@@ -114,7 +122,21 @@ def editable_root(dist: importlib.metadata.Distribution) -> Path | None:
     for a regular install (no `direct_url.json`, or one that records an
     archive, an index, or a non-editable local directory whose package was
     COPIED into site-packages and so must still match `locate_file`)."""
-    raw = dist.read_text("direct_url.json")
+    root = editable_root_pathname(dist.read_text("direct_url.json"))
+    return None if root is None else Path(root).resolve()
+
+
+def editable_root_pathname(raw: str | None) -> str | None:
+    """The path text a PEP 610 record names for an EDITABLE install, else None.
+
+    The text part of `editable_root`, kept apart from `Path(...).resolve()`
+    so the Windows spelling can be held on every host. The URL's path is
+    turned into a filesystem path by the stdlib's own `url2pathname`: a
+    record written on Windows reads `file:///C:/work/agents`, whose path part
+    is `/C:/work/agents`, and a `Path()` of that there is `\\C:\\work\\agents`
+    -- rooted under the current drive by `resolve()`, so every editable
+    install compared unequal and was declined as a shadow.
+    """
     if not raw:
         return None
     data = json.loads(raw)
@@ -123,4 +145,4 @@ def editable_root(dist: importlib.metadata.Distribution) -> Path | None:
     url = urlsplit(str(data.get("url", "")))
     if url.scheme != "file":
         return None
-    return Path(unquote(url.path)).resolve()
+    return url2pathname(url.path)
