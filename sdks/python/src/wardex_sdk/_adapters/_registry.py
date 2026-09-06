@@ -91,8 +91,19 @@ class AdapterRegistry:
         self._installed: dict[str, AdapterInterface] = {}
         self._contexts: dict[str, AdapterContext] = {}
 
-    def install(self, adapter: AdapterInterface, client: Client | None) -> None:
+    def install(
+        self, adapter: AdapterInterface, client: Client | None, *, explicit: bool = False
+    ) -> None:
         """Install one adapter. A failure here costs its spans and nothing else.
+
+        PROBED FIRST, and only here. `adapter.install()` imports its
+        framework, and a project-local package of the framework's name would
+        have its body executed by that import — so the framework probe
+        (distribution present, module not shadowed) runs in front of it, at
+        the one place every way in passes through: auto-detection,
+        `enabled=` (which sets `explicit`, see `_framework_present`), and
+        `testing.installed_adapter`. Spelled per adapter, it was spelled in
+        one adapter and missing from the others.
 
         GUARDED, which it was not. `uninstall_all` has always been total, and
         the asymmetry was the bug: an adapter raising out of `install()` took
@@ -115,6 +126,13 @@ class AdapterRegistry:
         """
         name = adapter.name()
         if name in self._installed:
+            return
+        # Lazily, for the reason `context_for` gives: the package `__init__`
+        # imports this module before the registration table exists.
+        from . import _framework_present
+
+        debug = bool(getattr(getattr(client, "config", None), "debug", False))
+        if not _framework_present(name, explicit=explicit, debug=debug):
             return
         ctx = context_for(name, client, adapter)
         self._installed[name] = adapter

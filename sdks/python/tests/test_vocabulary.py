@@ -163,10 +163,15 @@ def test_status_error_requires_an_error_type():
 
 
 def test_an_empty_conversation_id_is_rejected():
-    """§6.3: `""` collides across every session in any store that keys on it."""
+    """§6.3: `""` collides across every session in any store that keys on it.
+    The constructor refuses it first; this is the finish-time check behind
+    it, reached by the route that skips `__init__`."""
     draft = _draft()
     draft.set_gen_ai(_gen_ai())
-    draft.set_conversation(ConversationContext(conversation_id=""))
+    empty = object.__new__(ConversationContext)
+    for key, value in (("conversation_id", ""), ("session_id", None), ("turn_index", 0)):
+        object.__setattr__(empty, key, value)
+    draft.set_conversation(empty)
     with pytest.raises(VocabularyError, match="conversation_id"):
         draft.finish(2)
 

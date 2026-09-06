@@ -52,6 +52,7 @@ belong in the body are the host's own call and `record_output`.
 
 from __future__ import annotations
 
+import threading
 import weakref
 from collections.abc import Callable, Iterator, Mapping, MutableMapping, Sequence
 from contextlib import contextmanager
@@ -64,11 +65,13 @@ from .._assembly import (
     EMPTY_AMBIENT,
     NULL_DRAFT,
     Ambient,
+    ConversationContext,
     Evidence,
     Limitation,
     LinkReason,
     ParentSource,
     PatchSet,
+    PinToken,
     SpanDraft,
     SpanIntent,
     Unit,
@@ -389,7 +392,15 @@ class RunHandle(Scope):
     questions, and a degraded handle would have needed all four written twice.
     """
 
-    __slots__ = ()
+    __slots__ = ("_pin",)
+
+    def __init__(self, unit: Unit | None, ctx: AdapterContext) -> None:
+        super().__init__(unit, ctx)
+        #: The token of the pin THIS handle installed, kept so that `unpin()`
+        #: can take it down again. A handle holds at most one: a second `pin()`
+        #: replaces the token, and the earlier pin is then the registry's to
+        #: retire through staleness — the same rule a dropped token follows.
+        self._pin: PinToken | None = None
 
     def pin(self, *, driver: object) -> bool:
         """Make this run the ambient parent on the task that DRIVES a generator.
@@ -411,7 +422,48 @@ class RunHandle(Scope):
         """
         if self._unit is None:
             return False
-        return self._ctx._units.pin_driver(self._unit, owner_task=driver).installed
+        token = self._ctx._units.pin_driver(self._unit, owner_task=driver)
+        self._pin = token
+        return token.installed
+
+    @property
+    def pinned(self) -> bool:
+        """Whether this handle holds an installed pin, on whatever task."""
+        token = self._pin
+        return token is not None and token.installed
+
+    @property
+    def pinned_here(self) -> bool:
+        """Whether this handle holds an installed pin that the CURRENT task can
+        take down. A teardown that sweeps the handles it still holds unpins
+        those, and counts the rest as stranded."""
+        token = self._pin
+        return token is not None and token.on_this_task()
+
+    def unpin(self) -> bool:
+        """Take the pin this handle installed back down, on the task it was put on.
+
+        The half `pin()` did not have, and the reason a callback-driven adapter
+        can hold a unit ambient for exactly the framework's own span lifetime:
+        a span-start callback pins, the matching span-end callback unpins, and
+        whatever was ambient before — the enclosing run's pin, or a host's own
+        span — is current again. Without it a closed unit's pin stays on the
+        task until staleness retires it, and the next sibling opened on that
+        task is refused the dead ambient and marked `CORRELATION_CONFLICT`.
+
+        Answers True when there was an installed pin to remove and False when
+        there was nothing to do — a refused pin, a degraded handle, or a second
+        call. A removal attempted from another task is COUNTED by the registry
+        rather than raised, so the answer is about what was asked, never a
+        promise about the carrier. `close()` does not call this: a unit may
+        legitimately close on one task while its pin lives on another.
+        """
+        token = self._pin
+        self._pin = None
+        if token is None or not token.installed:
+            return False
+        self._ctx._units.unpin(token)
+        return True
 
     def close(self, *, status: StatusCode = StatusCode.OK, error_type: str | None = None) -> None:
         if self._unit is None:
@@ -505,6 +557,7 @@ class AdapterContext:
         "_anon_seq",
         "_control_flow",
         "_slots",
+        "_slots_lock",
         "_tripped",
         "_units",
         "debug",
@@ -550,6 +603,16 @@ class AdapterContext:
         self._anon_ns = f"adapters.{name}"
         self._anon_seq = count()
         self._slots: MutableMapping[Any, dict[str, Any]] = weakref.WeakKeyDictionary()
+        # One lock over every slot read, write and copy. The table is walked
+        # by the uninstall sweep on the closing thread while a framework
+        # worker thread can still be ending spans -- `forget` pops a key --
+        # and a WeakKeyDictionary mutated under a copy raises RuntimeError
+        # on 3.10-3.13, which the registry's guard swallowed before the
+        # sweep reached `close_all`: every open unit stranded, unmarked.
+        # REENTRANT: a reattached trace's end arrives through a weakref
+        # finalizer, which runs wherever a reference count reaches zero --
+        # possibly on this very thread while a slot call holds the lock.
+        self._slots_lock = threading.RLock()
         # A READER, not a tuple. `AdapterRegistry.install` builds this context
         # BEFORE it calls `adapter.install()`, and an adapter can only import its
         # framework's error classes in there — so a tuple taken here is `()` for
@@ -559,19 +622,27 @@ class AdapterContext:
         self._control_flow = control_flow
 
     def _at_fork_reinit(self) -> None:
-        """Fork-child reset: replace the PatchSet's lock, and nothing else.
+        """Fork-child reset: replace the PatchSet's lock, drop the per-object
+        slots, and nothing else.
 
         The context's other state is per-install bookkeeping the child keeps
         (I-fork-4: the patches recorded here crossed the fork and still work,
         and the child's teardown needs the records to restore them). The lock
         is the one thing that cannot be trusted — `restore_all()` holds it
         across the whole restore walk, and `AdapterRegistry.uninstall` takes
-        exactly that path in the child (P/Q/R row Q). Called by
+        exactly that path in the child (P/Q/R row Q). The slots are the other:
+        they hold the parent's in-flight run bookkeeping — handles onto units
+        the registry's own fork reset has already dropped — and an adapter
+        that keys every run on `slot()` (openai-agents does) would otherwise
+        finish the parent's runs in the child. Called by
         `AdapterRegistry._at_fork_reinit`, the owner of every live context —
         adapters like LangGraph patch exclusively through their context and
         declare no reset of their own.
         """
         self.patches._at_fork_reinit()
+        # Replaced, never acquired: the parent may have held it at the fork.
+        self._slots_lock = threading.RLock()
+        self._slots.clear()
 
     @property
     def tripped(self) -> bool:
@@ -590,7 +661,7 @@ class AdapterContext:
         A shaper handing `record_*` more than this is truncated and flagged by
         the storage cap itself; a shaper that stops early must hand back
         `budget + 1` bytes whenever it cut anything, so the flag still fires —
-        the +1 handshake (see the LangGraph adapter's `_shaped_args`). Read off
+        the +1 handshake (see `_adapters/_payload.py`'s `_shaped_args`). Read off
         the registry rather than `self.limits` because the registry's cap is
         the one that is ENFORCED: the two cannot disagree when they are one
         read, and they did disagree for as long as they were two — the registry
@@ -616,11 +687,38 @@ class AdapterContext:
         bookkeeping. A weak key also releases the entry when the host does,
         rather than holding it until something notices.
         """
-        existing = self._slots.get(obj)
-        if existing is None:
-            existing = {}
-            self._slots[obj] = existing
+        with self._slots_lock:
+            existing = self._slots.get(obj)
+            if existing is None:
+                existing = {}
+                self._slots[obj] = existing
         return existing
+
+    def peek(self, obj: object) -> dict[str, Any] | None:
+        """The slot `obj` HAS, or None — never one created for the read.
+
+        `slot()` creates on read, which is right for a site that will write;
+        a site that only asks (is this span's run open? did this span start
+        here?) would otherwise leave an empty entry per object it asked
+        about, for as long as the framework holds the object.
+        """
+        with self._slots_lock:
+            return self._slots.get(obj)
+
+    def forget(self, obj: object) -> None:
+        """Drop `obj`'s slot if it has one, allocating nothing if it has not."""
+        with self._slots_lock:
+            self._slots.pop(obj, None)
+
+    def slots_snapshot(self) -> list[dict[str, Any]]:
+        """Every slot, copied under the lock, in insertion order.
+
+        The ONE way to walk the table: a walk over `_slots` itself races a
+        worker thread's `forget`, and the copy is what a sweep iterates
+        after the lock is released.
+        """
+        with self._slots_lock:
+            return list(self._slots.values())
 
     def _alias(self, unit: Unit, key: UnitKey, *, remember: bool) -> None:
         self._units.bind_alias(unit, key, remember=remember)
@@ -724,6 +822,7 @@ class AdapterContext:
         parent: Unit | None = None,
         evidence: Evidence | None = None,
         fallback: Fallback = Fallback.NONE,
+        conversation: ConversationContext | None = None,
     ) -> Unit:
         holder = parent if parent is not None else self._units.current()
         # Latched ONCE and used for both the declaration and the open. Two reads
@@ -763,6 +862,7 @@ class AdapterContext:
             aliases=aliases,
             start_ns=start_ns,
             owner=self.name,
+            conversation=conversation,
         )
         if conflicted:
             # The WORD is the registry's to choose, exactly as it chooses it for
@@ -1019,12 +1119,23 @@ class AdapterContext:
         selector: UnitKey | None = None,
         start_ns: int | None = None,
         fallback: Fallback = Fallback.NONE,
+        conversation: ConversationContext | None = None,
         describe: Callable[[RunHandle], None] | None = None,
     ) -> RunHandle:
         """A unit that outlives this call. NOT installed; see `RunHandle.pin`.
 
         NEVER None and NEVER raises; a handle whose open failed answers
         `degraded` and no-ops every verb.
+
+        `conversation` is the identity a framework RUN already carries — its
+        group id — handed in at the open so that every child unit opened
+        under the run inherits it, the way a session the parentage issued one
+        for would. It reaches the ambient a pin installs too, but NOT the
+        wire spans issued under that pin: the byte seam latches only the span
+        context at request time (`_interceptors/_seam.py::_latched`), so a
+        wire `chat` span under the run carries no conversation yet. Only this
+        opener takes it: a run is where a framework states a conversation,
+        and a nested `enter()` inherits its parent's.
         """
         unit = None
         handle = None
@@ -1039,6 +1150,7 @@ class AdapterContext:
                 aliases=(),
                 start_ns=start_ns,
                 fallback=fallback,
+                conversation=conversation,
             )
             handle = RunHandle(unit, self)
             if describe is not None:

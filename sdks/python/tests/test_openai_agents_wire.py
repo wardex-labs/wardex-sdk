@@ -33,8 +33,12 @@ from agents.tracing.processors import BackendSpanExporter, BatchTraceProcessor
 import wardex_sdk as wardex
 from conftest import client_spans
 from wardex_sdk._assembly import Limitation, counters
+from wardex_sdk._config import AdaptersConfig
 from wardex_sdk._enums import CaptureMode, OperationName
 from wardex_sdk.testing import RecordingTransport
+
+#: This file is the WIRE with no adapter — and the adapter now auto-detects.
+_NO_ADAPTER = AdaptersConfig(enabled=())
 
 _USAGE = {
     "input_tokens": 10,
@@ -235,7 +239,7 @@ def _exported_names(t: RecordingTransport) -> list[str]:
 def test_runner_run_three_turns_are_three_llm_spans(agents_env):
     base, posts = agents_env
     t = RecordingTransport()
-    wardex.init(transport=t)
+    wardex.init(transport=t, adapters=_NO_ADAPTER)
     try:
         res = asyncio.run(Runner.run(_agents(), "hi"))
         assert res.final_output == "done"
@@ -251,7 +255,7 @@ def test_runner_run_three_turns_are_three_llm_spans(agents_env):
 async def test_runner_run_streamed_three_turns_are_three_llm_spans(agents_env):
     base, posts = agents_env
     t = RecordingTransport()
-    wardex.init(transport=t)
+    wardex.init(transport=t, adapters=_NO_ADAPTER)
     try:
         result = Runner.run_streamed(_agents(), "hi")
         async for _ in result.stream_events():
@@ -271,7 +275,7 @@ def test_default_trace_upload_is_excluded_and_counted(agents_env, mode):
     proc = BatchTraceProcessor(BackendSpanExporter(endpoint=f"{base}/traces/ingest"))
     set_trace_processors([proc])
     t = RecordingTransport()
-    wardex.init(transport=t, capture_mode=mode)
+    wardex.init(transport=t, capture_mode=mode, adapters=_NO_ADAPTER)
     try:
         asyncio.run(Runner.run(_agents(), "hi"))
         flush_traces()
@@ -296,7 +300,7 @@ def test_runner_run_with_conversation_id_sends_the_delta_and_no_join_key(agents_
     the Conversations API itself: every POST is `/v1/responses`."""
     base, posts = agents_env
     t = RecordingTransport()
-    wardex.init(transport=t)
+    wardex.init(transport=t, adapters=_NO_ADAPTER)
     try:
         res = asyncio.run(Runner.run(_agents(), "hi", conversation_id="conv_1"))
         assert res.final_output == "done"

@@ -3,7 +3,7 @@ from __future__ import annotations
 import abc
 from typing import TYPE_CHECKING
 
-from .._assembly import report_once
+from .._assembly import counters, diag_info, guard, report_once
 from .._native import NATIVE_OK, native, unavailable_reason
 from .._types import Envelope
 
@@ -148,6 +148,20 @@ class CallerBudget(float):
         return f"CallerBudget({float(self)!r}, requested={self.requested!r})"
 
 
+def _debug_enabled() -> bool:
+    """Whether the debug channel is on. TOTAL: this runs on the export path,
+    so a client whose config read raises must not take the batch with it.
+    The hub is imported here, not at the top, because the hub's runtime
+    imports the transports."""
+    debug = False
+    with guard("transport.debug_flag", debug=False):
+        from .. import _hub
+
+        config = getattr(_hub.get_client(), "config", None)
+        debug = bool(getattr(config, "debug", False))
+    return debug
+
+
 class Transport(abc.ABC):
     """The one advertised extension point: where finished envelopes go.
 
@@ -258,13 +272,40 @@ class Transport(abc.ABC):
                 f"wardex native extension unavailable, so envelopes cannot be "
                 f"encoded ({unavailable_reason()})"
             )
-        bodies, dropped = native.codec.encode_otlp_requests(
+        # Three answers, not one: the bodies, the count of spans too large
+        # for a request, and the reasons for spans the marshaller could not
+        # read. The encoder does NOT raise for a bad typed-block value any
+        # more -- it skips that one span and names it here, where it is
+        # counted and reported. A raise here is still a raise: a corrupt
+        # envelope or an absent native module is not a per-span loss.
+        bodies, dropped, unmarshalled = native.codec.encode_otlp_requests(
             envelope,
             self._pii_mode,
             list(self._pii_disabled),
             self._limits,
             compress,
-        )  # encode=fail-loud
+        )
+        if unmarshalled:
+            # A span the marshaller could not read -- a typed block holding a
+            # value of the wrong Python type. It used to raise out of the
+            # encoder, and the client's drain then dropped the WHOLE batch:
+            # every good span around it, silently off-debug. Now the one span
+            # is skipped, counted, and said once per process; the rest of
+            # the batch ships. The reasons stay off stderr unless debug is
+            # on: each is "{span name}: {exception}", and both halves are
+            # HOST text -- a span name is the host's, and the exception may
+            # be a host `__str__` quoting the value it choked on -- which
+            # would reach stderr outside PII masking.
+            for _ in unmarshalled:
+                counters.bump("transport.otlp.span_unmarshalled")
+            report_once(
+                f"{len(unmarshalled)} span(s) could not be marshalled for export and "
+                "were dropped; the rest of the batch shipped (counted under "
+                "transport.otlp.span_unmarshalled; re-run with debug=True to see which)",
+                key="transport.otlp.span_unmarshalled",
+            )
+            if _debug_enabled():
+                diag_info("spans not marshalled: " + "; ".join(unmarshalled))
         if dropped:
             # A span so large it would not fit a request even with its payload
             # removed. `report_once` rather than a debug print: the marker

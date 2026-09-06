@@ -54,7 +54,7 @@ from wardex_sdk._assembly._units import _ambient_unit
 from wardex_sdk._assembly._vocab import VocabularyError
 from wardex_sdk._enums import AgentType, StatusCode
 from wardex_sdk._hub import reset_for_test
-from wardex_sdk._types import AgentAttributes, ToolAttributes
+from wardex_sdk._types import AgentAttributes, ConversationContext, ToolAttributes
 from wardex_sdk.context._contextvar import activate_span
 
 
@@ -855,8 +855,12 @@ _DEGRADED_VERB_ARGS = {
     "record_output": ((b"out",), {}),
     "record_failure": (("tool_error",), {}),
     "pin": ((), {"driver": threading.current_thread()}),
+    "unpin": ((), {}),
     "close": ((), {}),
 }
+#: RunHandle-only readers, answered False on a degraded handle (it holds no
+#: pin), and absent on a plain `Scope` the way `pin`/`unpin` are.
+_DEGRADED_HANDLE_READERS = ("pinned", "pinned_here")
 _DEGRADED_READERS = ("draft", "accepted", "degraded")
 
 
@@ -873,7 +877,9 @@ def test_every_verb_on_a_degraded_scope_is_answerable_and_none_of_them_raises(mo
 
     members = {n for n in dir(Scope) if not n.startswith("_")}
     members |= {n for n in dir(RunHandle) if not n.startswith("_")}
-    uncovered = members - set(_DEGRADED_VERB_ARGS) - set(_DEGRADED_READERS)
+    uncovered = (
+        members - set(_DEGRADED_VERB_ARGS) - set(_DEGRADED_READERS) - set(_DEGRADED_HANDLE_READERS)
+    )
     assert uncovered == set(), (
         f"{sorted(uncovered)} is reachable on a degraded handle and untested here.\n"
         "Add it to _DEGRADED_VERB_ARGS, and give it a total answer in _context.py."
@@ -898,6 +904,8 @@ def test_every_verb_on_a_degraded_scope_is_answerable_and_none_of_them_raises(mo
         for target in (scope, handle):
             for name in _DEGRADED_READERS:
                 getattr(target, name)
+            for name in _DEGRADED_HANDLE_READERS:
+                assert getattr(target, name, False) is False
             for name, (args, kwargs) in _DEGRADED_VERB_ARGS.items():
                 verb = getattr(target, name, None)
                 if verb is not None:
@@ -1717,3 +1725,142 @@ def test_a_nested_site_whose_describe_dies_still_reports_one_span(capsys):
     err = capsys.readouterr().err
     assert "one span is incomplete or missing" in err
     assert "NO span of its own" not in err
+
+
+# ==========================================================================
+# A pin can be taken down again — on the task that installed it
+# ==========================================================================
+
+
+def test_unpin_on_the_same_task_restores_what_was_current():
+    """The enclosing pin — or nothing — is current again after `unpin()`."""
+    ctx, sink = context()
+    outer = ctx.open_run(UnitKind.SESSION, intent=SpanIntent.INVOKE_AGENT, placement=Placement.ROOT)
+    _agent(outer)
+    assert outer.pin(driver=threading.current_thread()) is True
+    inner = ctx.open_run(UnitKind.AGENT, intent=SpanIntent.INVOKE_AGENT, placement=Placement.NESTED)
+    _agent(inner)
+    assert inner.pin(driver=threading.current_thread()) is True
+    assert ctx._units.current() is inner._unit
+
+    assert inner.unpin() is True
+    assert ctx._units.current() is outer._unit
+    assert inner.unpin() is False, "a second unpin has nothing to remove"
+    inner.close()
+
+    assert outer.unpin() is True
+    assert ctx._units.current() is None
+    outer.close()
+    assert counters.get("assembly._units.unpin") == 0
+
+
+def test_unpin_from_another_task_is_counted_and_never_raises():
+    ctx, sink = context()
+    run = ctx.open_run(UnitKind.SESSION, intent=SpanIntent.INVOKE_AGENT, placement=Placement.ROOT)
+    _agent(run)
+    assert run.pin(driver=threading.current_thread()) is True
+
+    answer: list[object] = []
+    th = threading.Thread(target=lambda: answer.append(run.unpin()))
+    th.start()
+    th.join()
+    assert answer == [True], "the question was answered, and the registry did the counting"
+    assert counters.get("assembly._units.unpin") >= 1
+    run.close()
+
+
+def _two_runs(ctx, *, unpin: bool) -> list:  # noqa: ANN001
+    spans = []
+    for name in ("first", "second"):
+        run = ctx.open_run(
+            UnitKind.SESSION, intent=SpanIntent.INVOKE_AGENT, placement=Placement.ROOT, subject=name
+        )
+        _agent(run)
+        run.pin(driver=threading.current_thread())
+        run.close()
+        if unpin:
+            run.unpin()
+        spans.append(run)
+    return spans
+
+
+def test_two_sequential_pinned_runs_on_one_task_are_two_clean_roots(monkeypatch):
+    """Pin, close, unpin, repeat: the second run opens on a clean carrier.
+
+    The NEGATIVE CONTROL is the same sequence with `unpin` turned into a no-op:
+    the first run's dead pin is then still standing when the second opens,
+    the registry refuses it, and the second root carries the conflict marker.
+    That is the failure `unpin()` exists to make unnecessary, shown here so the
+    two outcomes are distinguishable by the test and not only by the prose.
+    """
+    ctx, sink = context()
+    _two_runs(ctx, unpin=True)
+    spans = [d.finish() for d in sink.drafts]
+    assert [s.name for s in spans] == ["invoke_agent first", "invoke_agent second"]
+    for span in spans:
+        assert span.parent_span_id is None
+        assert span.capture_integrity is None or (
+            Limitation.CORRELATION_CONFLICT not in span.capture_integrity.limitations
+        )
+
+    ctx2, sink2 = context()
+    monkeypatch.setattr(RunHandle, "unpin", lambda self: False)
+    _two_runs(ctx2, unpin=True)
+    second = sink2.drafts[-1].finish()
+    assert second.name == "invoke_agent second"
+    assert Limitation.CORRELATION_CONFLICT in second.capture_integrity.limitations
+
+
+def test_a_stated_conversation_reaches_a_nested_child_and_the_ambient_under_the_pin():
+    """`open_run(conversation=)` is the framework's group id: the run's own
+    span, a child unit opened under it, and the AMBIENT under the run's pin
+    all carry it. What this does NOT prove — and the last assertion pins as
+    the documented gap — is that a wire span carries it: the byte seam
+    builds its own `Ambient(conversation=None)` from the latched span
+    context, so `resolve_parentage` over what the seam actually latches
+    answers no conversation."""
+    from wardex_sdk._assembly import Ambient, latch_ambient, resolve_parentage
+
+    ctx, sink = context()
+    conv = ConversationContext(conversation_id="conv-123")
+    run = ctx.open_run(
+        UnitKind.SESSION,
+        intent=SpanIntent.INVOKE_AGENT,
+        placement=Placement.ROOT,
+        conversation=conv,
+    )
+    _agent(run)
+    assert run.pin(driver=threading.current_thread()) is True
+    with ctx.enter(
+        UnitKind.CALL, intent=SpanIntent.EXECUTE_TOOL, placement=Placement.NESTED, subject="t"
+    ) as s:
+        s.draft.set_tool(ToolAttributes(name="t"))
+        wire = resolve_parentage(latch_ambient())
+        # The seam's own latch, as `_interceptors/_seam.py::_latched` builds
+        # it: the span context alone. A wire span parented through it has no
+        # conversation — the gap the README and CHANGELOG name.
+        seam = resolve_parentage(Ambient(latch_ambient().span_context, None, None))
+    assert wire.parent_span_id == s.draft.context.span_id
+    assert wire.conversation is not None and wire.conversation.conversation_id == "conv-123"
+    assert seam.parent_span_id == s.draft.context.span_id
+    assert seam.conversation is None
+    run.unpin()
+    run.close()
+    spans = [d.finish() for d in sink.drafts]
+    assert {s.name for s in spans} == {"execute_tool t", "invoke_agent"}
+    for span in spans:
+        assert span.conversation is not None
+        assert span.conversation.conversation_id == "conv-123"
+
+
+def test_the_fork_reset_drops_every_slot():
+    """A slot holds a run's in-flight bookkeeping; the child must start empty."""
+    ctx, _ = context()
+
+    class Holder:
+        pass
+
+    holder = Holder()
+    ctx.slot(holder)["handle"] = "parent's"
+    ctx._at_fork_reinit()
+    assert ctx.slot(holder) == {}

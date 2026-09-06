@@ -1,8 +1,16 @@
-"""Round-trip tests for AgentAttributes/ToolAttributes flattening (typed blocks)."""
+"""Round-trip tests for the typed blocks' flattening (agent, tool,
+conversation, evaluation)."""
+
+import pytest
 
 from test_codec import _env, _span  # reuse the existing envelope/span helpers
 from wardex_sdk._enums import AgentType, ToolExecutionType, ToolType
-from wardex_sdk._types import AgentAttributes, ToolAttributes
+from wardex_sdk._types import (
+    AgentAttributes,
+    ConversationContext,
+    EvaluationAttributes,
+    ToolAttributes,
+)
 from wardex_sdk.transport import _codec
 
 
@@ -40,10 +48,353 @@ def test_tool_attributes_flatten_to_extra():
     assert extra["wardex.tool.execution_type"] == "in_process"
 
 
+def test_conversation_context_flattens_to_extra():
+    """The id every span of a conversation is grouped by, and the two
+    wardex-side fields only when they carry something: a `turn_index` of 0
+    is the dataclass default, not a fact."""
+    conv = ConversationContext(conversation_id="conv-123")
+    out = _codec.decode(_codec.encode(_env(_span(conversation=conv))))
+    extra = _extra_dict(out["items"][0]["span"])
+    assert extra["gen_ai.conversation.id"] == "conv-123"
+    assert not any(k.startswith("wardex.conversation.") for k in extra)
+
+    full = ConversationContext(conversation_id="conv-123", session_id="sess-1", turn_index=3)
+    out = _codec.decode(_codec.encode(_env(_span(conversation=full))))
+    extra = _extra_dict(out["items"][0]["span"])
+    assert extra["wardex.conversation.session_id"] == "sess-1"
+    assert extra["wardex.conversation.turn_index"] == 3
+
+
+def test_evaluation_attributes_flatten_to_extra():
+    ev = EvaluationAttributes(
+        name="block_input", explanation="why", score_value=0.25, score_label="tripwire"
+    )
+    out = _codec.decode(_codec.encode(_env(_span(evaluation=ev))))
+    extra = _extra_dict(out["items"][0]["span"])
+    assert extra["gen_ai.evaluation.name"] == "block_input"
+    assert extra["gen_ai.evaluation.explanation"] == "why"
+    assert extra["gen_ai.evaluation.score.value"] == 0.25
+    assert extra["gen_ai.evaluation.score.label"] == "tripwire"
+
+    partial = EvaluationAttributes(name="pass_only", score_label="pass")
+    out = _codec.decode(_codec.encode(_env(_span(evaluation=partial))))
+    extra = _extra_dict(out["items"][0]["span"])
+    assert set(k for k in extra if k.startswith("gen_ai.evaluation.")) == {
+        "gen_ai.evaluation.name",
+        "gen_ai.evaluation.score.label",
+    }
+
+
 def test_absent_blocks_add_no_keys():
     out = _codec.decode(_codec.encode(_env(_span())))
     extra = _extra_dict(out["items"][0]["span"])
     assert not any(
-        k.startswith(("gen_ai.agent.", "gen_ai.tool.", "wardex.agent.", "wardex.tool."))
+        k.startswith(
+            (
+                "gen_ai.agent.",
+                "gen_ai.tool.",
+                "gen_ai.conversation.",
+                "gen_ai.evaluation.",
+                "wardex.agent.",
+                "wardex.tool.",
+                "wardex.conversation.",
+            )
+        )
         for k in extra
     )
+
+
+# --------------------------------------------------------------------------
+# a wrong-typed value in a typed block costs one attribute, never the batch
+# --------------------------------------------------------------------------
+
+
+def _unchecked(cls, **fields):  # noqa: ANN001, ANN202
+    """The dataclass with its constructor coercion BYPASSED — the shape a
+    caller reaches by any route that skips `__init__`, and the one the
+    marshaller has to survive on its own."""
+    obj = object.__new__(cls)
+    for key, value in fields.items():
+        object.__setattr__(obj, key, value)
+    return obj
+
+
+def test_a_uuid_conversation_id_and_a_none_turn_index_export_cleanly():
+    """The constructor: a UUID id is its text, `turn_index=None` is the
+    default. The marshaller, with the constructor bypassed: the same two
+    values still leave as one attribute and no error."""
+    import uuid
+
+    ident = uuid.uuid4()
+    conv = ConversationContext(conversation_id=ident, turn_index=None)
+    assert conv.conversation_id == str(ident) and conv.turn_index == 0
+    out = _codec.decode(_codec.encode(_env(_span(conversation=conv))))
+    assert _extra_dict(out["items"][0]["span"])["gen_ai.conversation.id"] == str(ident)
+
+    raw = _unchecked(ConversationContext, conversation_id=ident, session_id=None, turn_index=None)
+    out = _codec.decode(_codec.encode(_env(_span(conversation=raw))))
+    extra = _extra_dict(out["items"][0]["span"])
+    assert extra["gen_ai.conversation.id"] == str(ident)
+    assert "wardex.conversation.turn_index" not in extra
+    assert "wardex.codec.unmarshalled" not in extra
+
+    with pytest.raises(TypeError):
+        ConversationContext(conversation_id="c", turn_index="three")
+
+
+def test_a_none_or_empty_conversation_id_is_refused_at_the_hosts_line():
+    """The id is what a backend groups by. `None` and `""` used to be
+    `str()`-coerced into the id "None" or rejected at export, one batch
+    later; both are a `ValueError` at the constructor now. A uuid or an
+    integer key is still coerced to its text."""
+    import uuid
+
+    from wardex_sdk._types import ConversationContext
+
+    for bad in (None, ""):
+        with pytest.raises(ValueError, match="conversation_id"):
+            ConversationContext(conversation_id=bad)
+    u = uuid.uuid4()
+    assert ConversationContext(conversation_id=u).conversation_id == str(u)
+    assert ConversationContext(conversation_id=7).conversation_id == "7"
+
+
+def test_a_score_value_the_marshaller_cannot_read_is_named_not_fatal():
+    """`"0.9"` is a score, by `float()`'s rule at the constructor and by the
+    marshaller's when the constructor was bypassed; `"high"` is a
+    `ValueError` at the host's line, and — bypassed — an omitted attribute
+    NAMED under `wardex.codec.unmarshalled`, with the rest of the block and
+    the span intact."""
+    ev = EvaluationAttributes(name="judge", score_value="0.9")
+    assert ev.score_value == 0.9
+    with pytest.raises(ValueError):
+        EvaluationAttributes(name="judge", score_value="high")
+
+    raw = _unchecked(
+        EvaluationAttributes, name="judge", explanation=None, score_value="0.9", score_label=None
+    )
+    out = _codec.decode(_codec.encode(_env(_span(evaluation=raw))))
+    assert _extra_dict(out["items"][0]["span"])["gen_ai.evaluation.score.value"] == 0.9
+
+    bad = _unchecked(
+        EvaluationAttributes, name="judge", explanation=None, score_value="high", score_label="x"
+    )
+    out = _codec.decode(_codec.encode(_env(_span(evaluation=bad))))
+    extra = _extra_dict(out["items"][0]["span"])
+    assert "gen_ai.evaluation.score.value" not in extra
+    assert extra["gen_ai.evaluation.name"] == "judge"
+    assert extra["gen_ai.evaluation.score.label"] == "x"
+    assert extra["wardex.codec.unmarshalled"] == "gen_ai.evaluation.score.value"
+
+
+@pytest.mark.usefixtures("fresh_counters")
+def test_two_unmarshallable_fields_on_one_span_are_named_under_one_key():
+    """`wardex.codec.unmarshalled` is ONE attribute: with a bad field in the
+    conversation block and another in the evaluation block, a key pushed per
+    field would be a duplicate that an OTLP decoder keeps one of, and the
+    other loss would go unnamed. The names travel comma-joined, in block
+    order, with everything readable in both blocks intact."""
+    from wardex_sdk._types import ConversationContext
+
+    conv = _unchecked(ConversationContext, conversation_id="c1", session_id=None, turn_index="x")
+    ev = _unchecked(
+        EvaluationAttributes, name="judge", explanation=None, score_value="high", score_label=None
+    )
+    out = _codec.decode(_codec.encode(_env(_span(conversation=conv, evaluation=ev))))
+    span = out["items"][0]["span"]
+    extra = _extra_dict(span)
+    keys = [kv["key"] for kv in span.get("extra", [])]
+    assert keys.count("wardex.codec.unmarshalled") == 1
+    assert (
+        extra["wardex.codec.unmarshalled"]
+        == "wardex.conversation.turn_index,gen_ai.evaluation.score.value"
+    )
+    assert extra["gen_ai.conversation.id"] == "c1"
+    assert extra["gen_ai.evaluation.name"] == "judge"
+
+
+def test_a_batch_with_one_unmarshallable_span_ships_the_other_spans():
+    """The EXPORT path. One span whose tool block holds an int for a name
+    cannot be marshalled at all; before, that raise reached the client's
+    drain and the whole batch was dropped in silence. Now the two good spans
+    leave, the bad one is counted, and one line names it."""
+    from wardex_sdk import _wardex_native
+    from wardex_sdk._assembly import counters
+    from wardex_sdk._types import Envelope
+    from wardex_sdk.testing import RecordingTransport
+
+    good_a = _span(name="good-a")
+    bad = _span(name="bad", tool=ToolAttributes(name=123))  # type: ignore[arg-type]
+    good_b = _span(name="good-b")
+    env = Envelope(header=_env(good_a).header, spans=(good_a, bad, good_b))
+    bodies = RecordingTransport().encode(env, compress=False)
+    names = [
+        sp["name"]
+        for body in bodies
+        for rs in _wardex_native.codec.decode_otlp_traces(body)["resource_spans"]
+        for ss in rs["scope_spans"]
+        for sp in ss["spans"]
+    ]
+    assert names == ["good-a", "good-b"]
+    assert counters.get("transport.otlp.span_unmarshalled") == 1
+
+
+def test_an_unmarshallable_span_puts_no_host_text_on_stderr_off_debug():
+    """The span name and the marshaller's exception are HOST text: a name is
+    the host's, and the exception may be a host `__str__` quoting the value
+    it choked on. Off-debug the report is a fixed line and the counter;
+    under debug the names and reasons follow, on the debug channel."""
+    import logging
+
+    from wardex_sdk import _hub
+    from wardex_sdk._assembly._diag import reset_reports_for_test
+    from wardex_sdk._client import Client
+    from wardex_sdk._config import BackendConfig, WardexConfig
+    from wardex_sdk._types import Envelope
+    from wardex_sdk.testing import RecordingTransport
+
+    class _Records(logging.Handler):
+        def __init__(self) -> None:
+            super().__init__(level=logging.DEBUG)
+            self.lines: list[str] = []
+
+        def emit(self, record: logging.LogRecord) -> None:
+            self.lines.append(record.getMessage())
+
+    class _Leaky:
+        """A host value whose `__str__` raises quoting itself."""
+
+        def __str__(self) -> str:
+            raise RuntimeError("SECRET-VALUE-4711")
+
+    def encode(*, debug: bool) -> list[str]:
+        reset_reports_for_test()
+        _hub.reset_for_test()
+        transport = RecordingTransport()
+        _hub.set_client(
+            Client(WardexConfig(backend=BackendConfig(api_key="k"), debug=debug), transport)
+        )
+        logger = logging.getLogger("wardex_sdk")
+        handler = _Records()
+        logger.addHandler(handler)
+        level = logger.level
+        logger.setLevel(logging.DEBUG)
+        try:
+            bad = _span(
+                name="SECRET-SPAN-NAME",
+                # `explanation` is marshalled with `str()`, so the host's own
+                # `__str__` runs and its text is the exception's text.
+                evaluation=EvaluationAttributes(explanation=_Leaky()),  # type: ignore[arg-type]
+            )
+            env = Envelope(header=_env(bad).header, spans=(_span(name="good"), bad))
+            transport.encode(env, compress=False)
+        finally:
+            logger.removeHandler(handler)
+            logger.setLevel(level)
+            _hub.reset_for_test()
+        return handler.lines
+
+    off = encode(debug=False)
+    assert len(off) == 1 and "could not be marshalled" in off[0]
+    assert "SECRET-SPAN-NAME" not in off[0] and "SECRET-VALUE-4711" not in off[0]
+    on = encode(debug=True)
+    assert any("SECRET-SPAN-NAME" in line and "SECRET-VALUE-4711" in line for line in on)
+
+
+def test_a_failure_outside_the_typed_blocks_still_raises_on_the_export_path():
+    """The skip is for HOST values the marshaller cannot read, not for the
+    encoder's own fields: a span whose wardex-owned `events` cannot be
+    walked is an encoder bug, and the export encoder raises it rather than
+    dropping the span as one more unmarshallable."""
+    from dataclasses import replace
+
+    from wardex_sdk._assembly import counters
+    from wardex_sdk._types import Envelope
+    from wardex_sdk.testing import RecordingTransport
+
+    before = counters.get("transport.otlp.span_unmarshalled")
+    broken = replace(_span(name="broken"), events=object())  # type: ignore[arg-type]
+    env = Envelope(header=_env(broken).header, spans=(broken,))
+    with pytest.raises(Exception):  # noqa: B017 - the exact type is the encoder's
+        RecordingTransport().encode(env, compress=False)
+    assert counters.get("transport.otlp.span_unmarshalled") == before
+
+
+def test_every_block_the_vocabulary_declares_has_a_marshal_site():
+    """The check that would have caught the conversation and evaluation
+    blocks — and then the retrieval block — six months earlier: a `Block`
+    is a typed field the vocabulary can REQUIRE of an intent, so a member
+    with no marshal site is a span that passes `finish()` and leaves the
+    process without the very thing the intent exists for. One sample per
+    member, encoded and decoded, at least one wire key each; a member added
+    to `Block` without a row here fails on the set equality."""
+    from wardex_sdk._assembly import Block
+    from wardex_sdk._enums import OperationName
+    from wardex_sdk._types import EmbeddingsAttributes, GenAIAttributes, RetrievalAttributes
+
+    samples = {
+        Block.GEN_AI: (
+            {"gen_ai": GenAIAttributes(operation=OperationName.CHAT, request_model="m")},
+            lambda span, extra: extra["gen_ai.request.model"] == "m",
+        ),
+        Block.AGENT: (
+            {"agent": AgentAttributes(name="a")},
+            lambda span, extra: extra["gen_ai.agent.name"] == "a",
+        ),
+        Block.TOOL: (
+            {"tool": ToolAttributes(name="t")},
+            lambda span, extra: extra["gen_ai.tool.name"] == "t",
+        ),
+        Block.RETRIEVAL: (
+            {
+                "retrieval": RetrievalAttributes(
+                    data_source_id="ds-1", query_text="q", documents=b'[{"id":1}]'
+                )
+            },
+            lambda span, extra: (
+                extra["gen_ai.data_source.id"] == "ds-1"
+                and extra["gen_ai.retrieval.query.text"] == "q"
+                and extra["gen_ai.retrieval.documents"] == b'[{"id":1}]'
+            ),
+        ),
+        Block.EMBEDDINGS: (
+            {"embeddings": EmbeddingsAttributes(dimension_count=3)},
+            lambda span, extra: extra["gen_ai.embeddings.dimension.count"] == 3,
+        ),
+        Block.EVALUATION: (
+            {"evaluation": EvaluationAttributes(name="judge")},
+            lambda span, extra: extra["gen_ai.evaluation.name"] == "judge",
+        ),
+        Block.WORKFLOW_NAME: (
+            {"workflow_name": "wf"},
+            lambda span, extra: span["workflow_name"] == "wf",
+        ),
+    }
+    assert set(samples) == set(Block), "a Block member has no sample row here"
+    for block, (fields, holds) in samples.items():
+        out = _codec.decode(_codec.encode(_env(_span(**fields))))
+        span = out["items"][0]["span"]
+        assert holds(span, _extra_dict(span)), f"{block} reached the wire with no key"
+    # And an empty `documents` -- the dataclass default -- is not a fact.
+    out = _codec.decode(_codec.encode(_env(_span(retrieval=RetrievalAttributes()))))
+    assert "gen_ai.retrieval.documents" not in _extra_dict(out["items"][0]["span"])
+
+
+def test_retrieval_documents_given_as_text_reach_the_wire_as_bytes():
+    """`documents` is declared `bytes` and documented as JSON, and JSON is
+    what a host has as a `str`. A string is encoded UTF-8 at the constructor;
+    with the constructor bypassed, the marshaller reads the string itself
+    rather than refusing the span. Both routes carry the same bytes."""
+    from wardex_sdk._types import RetrievalAttributes
+
+    r = RetrievalAttributes(documents='[{"id": 1}]')
+    assert r.documents == b'[{"id": 1}]'
+    out = _codec.decode(_codec.encode(_env(_span(retrieval=r))))
+    assert _extra_dict(out["items"][0]["span"])["gen_ai.retrieval.documents"] == b'[{"id": 1}]'
+
+    raw = _unchecked(RetrievalAttributes, data_source_id="db", query_text=None, documents="[]x")
+    out = _codec.decode(_codec.encode(_env(_span(retrieval=raw))))
+    extra = _extra_dict(out["items"][0]["span"])
+    assert extra["gen_ai.retrieval.documents"] == b"[]x"
+    assert extra["gen_ai.data_source.id"] == "db"
+    assert "wardex.codec.unmarshalled" not in extra

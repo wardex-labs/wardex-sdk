@@ -1,5 +1,7 @@
 """Adapter registry + config-driven activation tests."""
 
+import logging
+from typing import Any
 from unittest import mock
 
 import pytest
@@ -32,6 +34,15 @@ class _FakeAdapter(AdapterInterface):
 
     def uninstall(self) -> None:
         self.uninstalled += 1
+
+
+class _FakeLangGraph(_FakeAdapter):
+    """A fake under a SHIPPED adapter's name: the registry probes rows by
+    `adapter.name()`, so this one is held to the framework probe while
+    `_FakeAdapter` ("fake", no row) is not."""
+
+    def name(self) -> str:
+        return "langgraph"
 
 
 class _BrokenInstallAdapter(AdapterInterface):
@@ -84,12 +95,11 @@ def test_a_member_exists_iff_its_adapter_ships():
     names a user could select that installed nothing at all. They are not
     rejected any more; they are UNSPELLABLE, which is the stronger property:
     a name that cannot be written needs no validation, and each returns as a
-    member when its adapter ships. The set equality holds both directions —
+    member when its adapter ships — `OPENAI_AGENTS` has. The set equality holds both directions —
     a row without a member is an adapter nothing can select.
     """
     assert set(_ADAPTERS) == set(AdapterName)
     assert not hasattr(AdapterName, "LANGCHAIN")
-    assert not hasattr(AdapterName, "OPENAI_AGENTS")
 
 
 def test_per_adapter_options_fields_name_the_adapter_they_configure():
@@ -196,6 +206,180 @@ def test_broken_adapter_install_does_not_break_init():
         install_configured_adapters(None, _config(None))  # must not raise
         assert not get_registry().is_installed("broken-install")
     get_registry().uninstall_all()
+
+
+def _quiet() -> tuple[Any, ...]:  # noqa: ANN401
+    from wardex_sdk._assembly import counters
+    from wardex_sdk._assembly._diag import reset_reports_for_test
+
+    reset_reports_for_test()
+    counters.reset()
+    get_registry().uninstall_all()
+    return (counters,)
+
+
+class _Lines(logging.Handler):
+    def __init__(self) -> None:
+        super().__init__(level=logging.DEBUG)
+        self.records: list[logging.LogRecord] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.records.append(record)
+
+    def warnings(self) -> list[str]:
+        return [r.getMessage() for r in self.records if r.levelno == logging.WARNING]
+
+
+@pytest.fixture
+def wardex_lines():
+    logger = logging.getLogger("wardex_sdk")
+    handler = _Lines()
+    logger.addHandler(handler)
+    level = logger.level
+    logger.setLevel(logging.DEBUG)
+    try:
+        yield handler
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(level)
+
+
+def test_a_shadowed_framework_is_declined_before_its_adapter_installs():
+    """The probe runs ONCE, in `AdapterRegistry.install`, in front of
+    `adapter.install()` — the step that imports the framework — for every
+    way in (the auto-detected path, the `enabled=` path, and
+    `testing.installed_adapter`): a project-local package of the framework's
+    name never has its body executed by an adapter's install-time import,
+    and the decline is said once and counted under the adapter's own name.
+    Building the adapter OBJECT imports nothing of the host's, which is the
+    doctrine every adapter module keeps (its framework import lives inside
+    `install()`)."""
+    from wardex_sdk._adapters._probe import Probe
+
+    (counters,) = _quiet()
+    shadowed = Probe("shadowed", "/app/langgraph", "/site/langgraph")
+    fakes = []
+    for enabled in (None, (AdapterName.LANGGRAPH,)):
+        fake = _FakeLangGraph()
+        fakes.append(fake)
+        with (
+            # Only langgraph is detected: `_make_adapter` answers this one fake
+            # for whatever name it is asked, so a detection of every row would
+            # probe the same adapter three times on the auto path.
+            mock.patch("wardex_sdk._adapters._detect_package", side_effect="langgraph".__eq__),
+            mock.patch("wardex_sdk._adapters.probe", return_value=shadowed),
+            mock.patch("wardex_sdk._adapters._make_adapter", return_value=fake),
+        ):
+            install_configured_adapters(None, _config(enabled))
+    assert [f.installed for f in fakes] == [0, 0]
+    assert counters.get("adapters.langgraph.shadowed") == 2
+    assert not get_registry().is_installed("langgraph")
+
+
+def test_an_explicitly_enabled_adapter_installs_without_package_metadata(wardex_lines):
+    """`enabled=` NAMES the framework; a host that ships it without dist-info
+    (a PyInstaller bundle without `copy_metadata`, a vendored checkout on
+    `PYTHONPATH`) still gets the adapter — the previous release's
+    behaviour. The shadow check cannot run without a distribution, so the
+    install is said once as a warning and counted, never silent."""
+    from wardex_sdk._adapters._probe import Probe
+
+    (counters,) = _quiet()
+    fake = _FakeLangGraph()
+    with (
+        mock.patch("wardex_sdk._adapters._detect_package", return_value=True),
+        mock.patch("wardex_sdk._adapters.probe", return_value=Probe("absent")),
+        mock.patch("wardex_sdk._adapters._make_adapter", return_value=fake),
+    ):
+        install_configured_adapters(None, _config((AdapterName.LANGGRAPH,)))
+    assert fake.installed == 1
+    assert get_registry().is_installed("langgraph")
+    assert counters.get("adapters.langgraph.distribution_absent_explicit") == 1
+    assert counters.get("adapters.langgraph.distribution_absent") == 0
+    warnings = wardex_lines.warnings()
+    assert len(warnings) == 1
+    assert "without package metadata" in warnings[0] and "shadow check" in warnings[0]
+    get_registry().uninstall_all()
+
+
+def test_auto_detection_still_requires_the_distribution(wardex_lines):
+    """Auto-detection has no user assertion behind it: a module the import
+    system finds with no distribution is not installed, and the absence is
+    an answer (counted, one debug line) rather than a warning."""
+    from wardex_sdk._adapters._probe import Probe
+
+    (counters,) = _quiet()
+    fake = _FakeLangGraph()
+    with (
+        mock.patch("wardex_sdk._adapters._detect_package", return_value=True),
+        mock.patch("wardex_sdk._adapters.probe", return_value=Probe("absent")),
+        mock.patch("wardex_sdk._adapters._make_adapter", return_value=fake),
+    ):
+        install_configured_adapters(None, _config(None))
+    assert fake.installed == 0
+    assert not get_registry().is_installed("langgraph")
+    assert counters.get("adapters.langgraph.distribution_absent") >= 1
+    assert counters.get("adapters.langgraph.distribution_absent_explicit") == 0
+    assert wardex_lines.warnings() == []
+
+
+_SHADOW_SCRIPT = """
+import json, logging, sys
+seen = []
+class H(logging.Handler):
+    def emit(self, r):
+        seen.append([r.levelno, r.getMessage()])
+logging.getLogger("wardex_sdk").addHandler(H(level=logging.DEBUG))
+import wardex_sdk as wardex
+from wardex_sdk import AdapterName, AdaptersConfig
+from wardex_sdk._assembly import counters
+from wardex_sdk.testing import RecordingTransport
+enabled = AdaptersConfig(enabled=(AdapterName.LANGGRAPH,))
+wardex.init(transport=RecordingTransport(), adapters=enabled)
+wardex.close()
+print(json.dumps({
+    "imported": "langgraph" in sys.modules,
+    "lines": seen,
+    "shadowed": counters.get("adapters.langgraph.shadowed"),
+}))
+"""
+
+
+def test_a_project_local_langgraph_package_is_never_imported(tmp_path):
+    """The cross-adapter hazard, measured on an adapter OTHER than the one
+    the probe was first written for. A folder called `langgraph/` ahead of
+    the wheel on `sys.path` (a project folder named after the framework):
+    its `__init__` leaves a file behind if it ever runs. The LangGraph
+    adapter's install would import it; the registry's probe declines first,
+    loudly, and the file is never written. A fresh process, because this
+    suite's own process has the real package imported already."""
+    import os
+    import subprocess
+    import sys
+
+    pkg = tmp_path / "langgraph"
+    pkg.mkdir()
+    marker = tmp_path / "imported.txt"
+    (pkg / "__init__.py").write_text(f"open({str(marker)!r}, 'w').write('x')\n")
+    proc = subprocess.run(
+        [sys.executable, "-c", _SHADOW_SCRIPT],
+        env={**os.environ, "PYTHONPATH": str(tmp_path)},
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stderr == "", proc.stderr
+    import json
+
+    out = json.loads(proc.stdout.strip().splitlines()[-1])
+    assert not marker.exists()
+    assert out["imported"] is False
+    assert out["shadowed"] == 1
+    warnings = [m for lvl, m in out["lines"] if lvl == 30]
+    assert len(warnings) == 1
+    assert "resolved to" in warnings[0] and str(tmp_path) in warnings[0]
 
 
 # --- AdapterContext.options: the one channel an adapter's config arrives on ---

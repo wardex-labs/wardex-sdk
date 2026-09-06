@@ -553,6 +553,72 @@ def test_a_pin_on_the_calling_task_installs_and_survives_the_call():
     assert reg.current() is None
 
 
+def test_a_unit_closed_on_another_thread_retires_its_pin_fork_in_place():
+    """The pin stands on the main thread; the unit dies on a worker (a
+    `wardex.close()` from another thread while the run's block is still
+    open). No task but the main one can take the pin down, and the dead
+    unit's scope fork stayed current there: every later `restore_scope` put
+    it back and, after a re-init, the new registry could not judge it as its
+    own corpse, so every later root on the main thread opened UNDER the dead
+    unit at 1.0 with no marker. The registry now retires the fork in place
+    from the closing thread: the main thread reads the host's scope again --
+    the host's own span context and conversation, not the dead unit's."""
+    from wardex_sdk._hub import get_current_scope
+    from wardex_sdk._types import ConversationContext, SpanContext, SpanId, TraceId
+
+    reset_for_test()
+    host = SpanContext(trace_id=TraceId(b"\x0a" * 16), span_id=SpanId(b"\x0b" * 8))
+    get_current_scope().active_span_context = host
+    get_current_scope().conversation = ConversationContext(conversation_id="host-chat")
+    reg = registry()
+    root = open_session(reg)
+    token = reg.pin_driver(root, owner_task=threading.current_thread())
+    assert token.installed is True
+    assert get_current_scope().active_span_context == root.context
+
+    worker = threading.Thread(target=reg.close, args=(root,))
+    worker.start()
+    worker.join()
+
+    assert root.is_live is False
+    assert get_current_scope().active_span_context == host
+    assert get_current_scope().conversation.conversation_id == "host-chat"
+    assert counters.get("assembly._units.pin_retired_from_afar") == 1
+    # After a re-init the entry is another registry's corpse on this task's
+    # carrier, and nothing but this task can clear it: the first read that
+    # finds it dead counts it as foreign ONCE and retires it, so a process
+    # that re-inits is not counting a ghost on every read for its lifetime.
+    later = registry()
+    assert later.current() is None
+    assert _ambient_unit.get() is None
+    assert later.current() is None
+    assert counters.get("assembly._units.ambient_foreign_registry") == 1
+    assert counters.get("assembly._units.ambient_foreign_retired") == 1
+    # The owning task's own unpin still restores the same host scope.
+    reg.unpin(token)
+    assert get_current_scope().active_span_context == host
+    reset_for_test()
+
+
+def test_a_unit_closed_on_its_own_thread_leaves_its_pin_to_unpin():
+    """The negative control of the retirement: a pin whose unit closes on
+    the pinning task is that task's to take down, and until it does the dead
+    fork is a leftover the staleness gate refuses WITH a marker -- the audit
+    signal pin discipline is measured by. Retiring it here would hide that."""
+    from wardex_sdk._hub import get_current_scope
+
+    reset_for_test()
+    reg = registry()
+    root = open_session(reg)
+    token = reg.pin_driver(root, owner_task=threading.current_thread())
+    reg.close(root)
+    assert get_current_scope().active_span_context == root.context
+    assert counters.get("assembly._units.pin_retired_from_afar") == 0
+    reg.unpin(token)
+    assert get_current_scope().active_span_context is None
+    reset_for_test()
+
+
 def test_a_pin_survives_the_token_being_discarded():
     """The shipped call site reads `.installed` and throws the token away.
 

@@ -408,7 +408,11 @@ class _WithOnly:
 
 @contextmanager
 def _conversation(name: str, *, id: str | None, op: OperationName | None) -> Iterator[Span]:
-    conversation = ConversationContext(conversation_id=id if id is not None else str(uuid.uuid4()))
+    # `""` reads as "no id" like `None`: this runs BEFORE the host's block, so a
+    # host forwarding an unset session field would otherwise see a ValueError
+    # raised out of its own `with` line. The dataclass keeps that error for
+    # direct construction, where the caller wrote the value.
+    conversation = ConversationContext(conversation_id=id or str(uuid.uuid4()))
     # Reading the scope and stamping the conversation onto it are wardex's own
     # work, and they run BEFORE the host's block — so a failure here would take
     # the block with it. A conversation that could not be installed costs the
@@ -449,9 +453,16 @@ def conversation(
     `gen_ai.conversation.id` every span captured inside the block is stamped
     with, which is how a backend groups the turns of one chat.
 
-    `id=None` mints a fresh uuid4. An explicit `id` is used verbatim: a
+    `id=None` (or `""`) mints a fresh uuid4. An explicit `id` is used verbatim: a
     multi-turn chat app passes its own session id so that every turn joins ONE
     conversation instead of each turn becoming its own.
+
+    THE HOST WINS over a framework's own conversation id. An adapter run that
+    opens inside this block — an OpenAI Agents `RunConfig(group_id=...)`, say
+    — keeps this id on every span it opens and records the framework's as a
+    separate attribute (`wardex.openai_agents.group_id`), so one trace never
+    carries two conversation ids. Outside the block, the framework's id is
+    the conversation.
     """
     return _WithOnly("conversation", _conversation(name, id=id, op=op))
 

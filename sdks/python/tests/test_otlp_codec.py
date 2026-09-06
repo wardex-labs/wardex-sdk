@@ -239,6 +239,28 @@ def test_gen_ai_flattened_to_attributes():
     assert attrs["gen_ai.response.finish_reasons"] == ["stop"]
 
 
+def test_conversation_and_evaluation_blocks_reach_the_otlp_attributes():
+    """Measured before this: a span built with `wardex.conversation()` or an
+    adapter's `set_evaluation` left the process with NEITHER key — the two
+    blocks were declared and never marshalled. The receiver is what the
+    README promises `gen_ai.conversation.id` to, so this asserts there."""
+    from wardex_sdk._types import ConversationContext, EvaluationAttributes
+
+    env = Envelope(
+        header=_header(),
+        spans=(
+            _span(
+                conversation=ConversationContext(conversation_id="conv-123"),
+                evaluation=EvaluationAttributes(name="block_input", score_label="tripwire"),
+            ),
+        ),
+    )
+    attrs = _first_span(env)["attributes"]
+    assert attrs["gen_ai.conversation.id"] == "conv-123"
+    assert attrs["gen_ai.evaluation.name"] == "block_input"
+    assert attrs["gen_ai.evaluation.score.label"] == "tripwire"
+
+
 def test_cache_and_reasoning_tokens_ship_under_the_semconv_dot_spellings():
     """The dataclass fields keep their snake_case names; only the wire key
     moved to semconv's dot spellings (defined since semconv 1.40.0)."""

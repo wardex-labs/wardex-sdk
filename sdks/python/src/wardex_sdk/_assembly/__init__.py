@@ -62,7 +62,7 @@ What lives here, and the duplication each module exists to remove:
 not here yet. `__all__` grows as modules land and does not shrink.
 """
 
-from .._types import ToolAttributes
+from .._types import AgentAttributes, ConversationContext, EvaluationAttributes, ToolAttributes
 from ._builder import NULL_DRAFT, IntegrityBuilder, SpanDraft
 from ._diag import Counters, counters, diag_info, diag_warning, guard, report_once
 from ._integrity import Limitation
@@ -90,6 +90,7 @@ from ._units import (
     UnitKey,
     UnitKind,
     UnitRegistry,
+    ambient_owner,
     parent_is_closed_unit,
 )
 from ._vocab import (
@@ -105,10 +106,13 @@ from ._vocab import (
 
 __all__ = [
     "AMBIENT",
+    "AgentAttributes",
     "Ambient",
     "Block",
+    "ConversationContext",
     "Counters",
     "EMPTY_AMBIENT",
+    "EvaluationAttributes",
     "Evidence",
     "IntegrityBuilder",
     "Limitation",
@@ -131,6 +135,7 @@ __all__ = [
     "UnitKind",
     "UnitRegistry",
     "VocabularyError",
+    "ambient_owner",
     "capture_mode_of",
     "child_of",
     "counters",

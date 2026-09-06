@@ -95,7 +95,7 @@ from .._enums import CaptureSource, StatusCode
 from .._limits import LimitsConfig
 from .._scope import Scope
 from .._types import ConversationContext, SpanContext
-from ..context._contextvar import activate_span, install_span, restore_scope
+from ..context._contextvar import activate_span, install_span, restore_scope, retire_fork
 from ._builder import SpanDraft
 from ._diag import counters, guard
 from ._integrity import Limitation
@@ -195,6 +195,25 @@ _ambient_unit: contextvars.ContextVar[_AmbientUnit | None] = contextvars.Context
 )
 
 
+def _retire_dead_foreign(entry: _AmbientUnit) -> None:
+    """Take a DEAD entry of another registry off this task's carrier.
+
+    The other half of `_Carrier.retire_from_afar`. A unit closed from another
+    thread has its scope fork retired there, but its `_ambient_unit` entry is
+    a ContextVar of the pinned task and only that task can clear it -- and
+    after a re-init nothing ever will: the registry that owned the unit is
+    gone and the pin token with it. Left standing, every read on this task
+    counts it as foreign for the life of the thread, which buries the one
+    count that meant something. So the owning task retires it on the read
+    that finds it dead: counted once as foreign, then gone. A LIVE foreign
+    entry is left alone -- a dropped registry's units are never closed, and
+    two adapters side by side put each other's live units here all day.
+    """
+    if not entry.unit.is_live and entry.owner is _current_task():
+        _ambient_unit.set(None)
+        counters.bump("assembly._units.ambient_foreign_retired")
+
+
 def _current_task() -> object:
     """The identity of the task (or thread) running right now.
 
@@ -236,7 +255,7 @@ class _Carrier:
     asymmetry ships a wrong parent at confidence 1.0 with no marker.
     """
 
-    __slots__ = ("_prev_scope", "_span_cm", "_token", "owner", "unit")
+    __slots__ = ("_fork", "_prev_scope", "_span_cm", "_token", "owner", "unit")
 
     def __init__(self, unit: Unit, *, pinned: bool) -> None:
         self.unit = unit
@@ -248,9 +267,12 @@ class _Carrier:
         # `_fork` states that override rule once for both forms.
         self._span_cm: contextlib.AbstractContextManager[None] | None
         self._prev_scope: Scope | None
+        #: The pin's own scope fork, kept so `retire_from_afar` can reach it
+        #: from a task that cannot touch this task's ContextVar.
+        self._fork: Scope | None = None
         if pinned:
             self._span_cm = None
-            self._prev_scope = install_span(
+            self._prev_scope, self._fork = install_span(
                 unit.context, conversation=unit.conversation, tracestate=unit.tracestate
             )
         else:
@@ -293,6 +315,21 @@ class _Carrier:
             else:
                 restore_scope(self._prev_scope)
 
+    def retire_from_afar(self) -> None:
+        """Take a PIN's fork out of service from a task that cannot remove it.
+
+        For the unit that dies on another thread while its pin stands: the
+        `_ambient_unit` entry there is a dead unit's, which every reader
+        already refuses, but the SCOPE fork under it kept the dead unit's
+        span context and conversation -- and after a re-init the new
+        registry cannot judge that fork as its own corpse, so later roots
+        opened under it at 1.0. Writing the previous scope's fields onto the
+        fork in place is what the pinned task's readers see from then on.
+        `remove()` on the owning task later restores the same scope object.
+        """
+        if self._fork is not None and self._prev_scope is not None:
+            retire_fork(self._fork, self._prev_scope)
+
 
 class PinToken:
     """The handle returned by `UnitRegistry.pin_driver`.
@@ -309,6 +346,13 @@ class PinToken:
         self.owner = owner
         self._carrier = carrier
         self.installed = carrier is not None
+
+    def on_this_task(self) -> bool:
+        """Whether an installed pin can come down HERE: it was put on the task
+        (or thread) running right now. A teardown sweeping the pins it still
+        holds asks this first, so a pin on another task is counted as left
+        standing instead of costing two cross-task failures."""
+        return self.installed and self.owner is _current_task()
 
 
 @dataclass(frozen=True, slots=True)
@@ -862,6 +906,7 @@ class UnitRegistry:
         "_max_record_bytes",
         "_max_total_units",
         "_max_units",
+        "_pins",
         "_roots",
         "_sink",
     )
@@ -933,6 +978,11 @@ class UnitRegistry:
         self._lock = threading.RLock()
         self._roots: dict[Unit, None] = {}
         self._live_units: dict[Unit, None] = {}
+        #: The pin each unit holds, so the unit's death can retire it. A pin
+        #: comes down on its own task through `unpin`; a unit closed from
+        #: ANOTHER task (a worker thread's `wardex.close()`) leaves its pin
+        #: standing there, and `_detach_locked` retires that fork in place.
+        self._pins: dict[Unit, _Carrier] = {}
         self._by_alias: dict[UnitKey, Unit] = {}
         #: The closed-unit link memory: remembered alias keys -> the span
         #: context their unit owned when it closed. A plain dict, because
@@ -980,6 +1030,7 @@ class UnitRegistry:
         self._lock = threading.RLock()
         self._roots.clear()
         self._live_units.clear()
+        self._pins.clear()
         self._by_alias.clear()
         self._link_memory.clear()
 
@@ -998,8 +1049,18 @@ class UnitRegistry:
         aliases: Sequence[UnitKey] = (),
         start_ns: int | None = None,
         owner: str | None = None,
+        conversation: ConversationContext | None = None,
     ) -> Unit:
         """Open a unit and the span it owns.
+
+        `conversation`, when given, is the identity the FRAMEWORK stated for
+        this unit — a run's group id — and it replaces what the parent unit or
+        the parentage would have handed down, so children and the carrier a
+        pin installs inherit the framework's word rather than an issued one.
+        Absent, the inheritance rules below are unchanged. PRECEDENCE is the
+        caller's to decide before it states one: the openai-agents adapter
+        yields to a host conversation already ambient (the host wins) and
+        states the group id only when nothing is.
 
         `owner` names the adapter this unit belongs to, for the day one
         process-wide registry serves several at once. Defaulting it to None
@@ -1024,6 +1085,7 @@ class UnitRegistry:
         strands have different repairs.
         """
         now = start_ns if start_ns is not None else time.time_ns()
+        stated = conversation
         if parent_unit is not None:
             if evidence is AMBIENT:
                 evidence = _IN_UNIT
@@ -1041,6 +1103,8 @@ class UnitRegistry:
             parentage = resolve_parentage(ambient, evidence)
             conversation = parentage.conversation
             tracestate = parentage.tracestate
+        if stated is not None:
+            conversation = stated
 
         draft = SpanDraft(
             parentage,
@@ -1049,6 +1113,11 @@ class UnitRegistry:
             source=CaptureSource.ADAPTER,
             start_ns=now,
         )
+        if stated is not None:
+            # The draft copied the PARENTAGE's conversation at construction;
+            # the framework's stated one has to reach the unit's own span as
+            # well as its children.
+            draft.set_conversation(stated)
 
         unit = Unit(
             self,
@@ -1230,6 +1299,7 @@ class UnitRegistry:
             # hand out, and the staleness gate below does NOT catch it: nothing
             # closes a dropped registry's units, so it is still `is_live`.
             counters.bump("assembly._units.ambient_foreign_registry")
+            _retire_dead_foreign(entry)
             return None
         if not entry.unit.is_live:
             same_task = entry.owner is _current_task()
@@ -1320,6 +1390,7 @@ class UnitRegistry:
         if entry.unit._registry is not self:
             if entry.pinned:
                 counters.bump("assembly._units.stale_pin_foreign_registry")
+            _retire_dead_foreign(entry)
             return None
         if entry.unit.is_live:
             return None
@@ -1592,7 +1663,10 @@ class UnitRegistry:
             counters.bump("assembly._units.pin_foreign_task")
             unit.note(Limitation.CORRELATION_CONFLICT)
             return PinToken(unit, observed, None)
-        return PinToken(unit, observed, _Carrier(unit, pinned=True))
+        carrier = _Carrier(unit, pinned=True)
+        with self._lock:
+            self._pins[unit] = carrier
+        return PinToken(unit, observed, carrier)
 
     def unpin(self, token: PinToken) -> None:
         """Remove a pin. MUST run on the task that installed it.
@@ -1603,6 +1677,9 @@ class UnitRegistry:
         """
         if token._carrier is None:
             return
+        with self._lock:
+            if self._pins.get(token.unit) is token._carrier:
+                del self._pins[token.unit]
         token._carrier.remove(where="assembly._units.unpin", debug=self._debug)
         token._carrier = None
         token.installed = False
@@ -1866,6 +1943,15 @@ class UnitRegistry:
         unit._open.clear()
         self._roots.pop(unit, None)
         self._live_units.pop(unit, None)
+        # A pin standing on a task other than the closing one can never come
+        # down through `unpin` from here: retire its scope fork in place, so
+        # that task reads the host's scope and not this corpse's. A pin on
+        # THIS task is left to `unpin` (or to the staleness gate, marked),
+        # which is the negative control the pin discipline is audited by.
+        pin = self._pins.pop(unit, None)
+        if pin is not None and pin.owner is not _current_task():
+            pin.retire_from_afar()
+            counters.bump("assembly._units.pin_retired_from_afar")
         if unit.parent is not None:
             unit.parent._children.pop(unit, None)
         # Remembered aliases move into the closed-unit link memory BEFORE the
@@ -1943,6 +2029,20 @@ class UnitRegistry:
                 self._sink.emit(draft, agent_semantic=True)
 
 
+def ambient_owner() -> str | None:
+    """Which adapter installed the ambient unit, LIVE OR NOT, or None.
+
+    `current()` answers a different question — "which unit may I hang off" —
+    and retires a closed pin and a previous registry's unit alike. This reads
+    the carrier as it stands: an adapter deciding whether an ambient
+    conversation is the HOST's word or its own leftover (a pin its earlier
+    run could not take down, on a thread that outlived the run) needs the
+    owner of what is there, not whether it may still be used.
+    """
+    entry = _ambient_unit.get()
+    return None if entry is None else entry.unit.owner
+
+
 def parent_is_closed_unit(parent: SpanContext | None) -> bool:
     """Was `parent` latched off a unit that had ALREADY CLOSED? — design §10.3(b).
 
@@ -1992,6 +2092,7 @@ __all__ = [
     "PinToken",
     "SpanSink",
     "Unit",
+    "ambient_owner",
     "UnitKey",
     "UnitKind",
     "UnitRegistry",

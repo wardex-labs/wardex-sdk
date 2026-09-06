@@ -161,11 +161,36 @@ class ToolAttributes:
 @dataclass(frozen=True, slots=True)
 class ConversationContext:
     """Identifies a single conversation session (multi-turn, multi-agent).
-    Auto-issued + Scope override."""
+    Auto-issued + Scope override.
+
+    The id is coerced to `str` at construction: a host hands `uuid.uuid4()` or
+    an integer session key here as naturally as a string, and the text is what
+    a backend groups by either way. `None` and `""` are a `ValueError` here
+    instead -- coerced, `None` became the id "None" that every such session
+    would share, and `""` was rejected one batch later at export. `turn_index=None`
+    reads as the default (absent); any other non-integer is a `TypeError` at
+    the host's own line, which is where a wrong type belongs -- not raised out
+    of the exporter later, where it would cost the whole batch instead of one
+    call.
+    """
 
     conversation_id: str  # gen_ai.conversation.id
     session_id: str | None = None  # wardex-custom (parent session)
     turn_index: int = 0
+
+    def __post_init__(self) -> None:
+        ident = self.conversation_id
+        if ident is None or ident == "":
+            raise ValueError("conversation_id must be a non-empty id, not None or ''")
+        if not isinstance(ident, str):
+            object.__setattr__(self, "conversation_id", str(ident))
+        if self.session_id is not None and not isinstance(self.session_id, str):
+            object.__setattr__(self, "session_id", str(self.session_id))
+        turn = self.turn_index
+        if turn is None:
+            object.__setattr__(self, "turn_index", 0)
+        elif isinstance(turn, bool) or not isinstance(turn, int):
+            raise TypeError(f"turn_index must be an int or None, not {type(turn).__name__}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -199,9 +224,18 @@ class ToolDefinitionSet:
 
 @dataclass(frozen=True, slots=True)
 class RetrievalAttributes:
+    """`documents` is JSON, and JSON is what a host holds as a `str`: a
+    string is encoded UTF-8 at the constructor, so the field a backend reads
+    is the bytes it was declared as. The marshaller reads a string on its own
+    as well, for a value that reached it by a route that skipped `__init__`."""
+
     data_source_id: str | None = None  # gen_ai.data_source.id
     query_text: str | None = None  # gen_ai.retrieval.query.text (opt-in PII)
     documents: bytes = b""  # gen_ai.retrieval.documents (opt-in, JSON)
+
+    def __post_init__(self) -> None:
+        if isinstance(self.documents, str):
+            object.__setattr__(self, "documents", self.documents.encode("utf-8"))
 
 
 @dataclass(frozen=True, slots=True)
@@ -216,6 +250,13 @@ class EvaluationAttributes:
     explanation: str | None = None  # gen_ai.evaluation.explanation
     score_value: float | None = None  # gen_ai.evaluation.score.value
     score_label: str | None = None  # gen_ai.evaluation.score.label
+
+    def __post_init__(self) -> None:
+        # `float()`'s own rule, at the constructor: "0.9" is a score, "high"
+        # is a `ValueError` here rather than a span lost at export.
+        value = self.score_value
+        if value is not None and not isinstance(value, float):
+            object.__setattr__(self, "score_value", float(value))
 
 
 # --- Forensic new types (v2) ---

@@ -27,7 +27,8 @@ from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.prebuilt import ToolNode
 
 from wardex_sdk._adapters._context import Placement
-from wardex_sdk._adapters._langgraph import LangGraphAdapter, _shaped_args
+from wardex_sdk._adapters._langgraph import LangGraphAdapter
+from wardex_sdk._adapters._payload import _shaped_args
 from wardex_sdk._adapters._registry import AdapterRegistry
 from wardex_sdk._assembly import SpanIntent, UnitKind, counters
 from wardex_sdk._assembly._diag import reset_reports_for_test
@@ -1097,4 +1098,17 @@ def test_tool_attributes_is_reachable_without_naming_a_forbidden_module():
     import wardex_sdk._assembly as assembly
 
     assert "ToolAttributes" in assembly.__all__
+    assert assembly.__all__ == sorted(assembly.__all__)
+
+
+def test_agent_conversation_and_evaluation_blocks_are_reachable_without_naming_a_forbidden_module():
+    """The three typed blocks an agent-structure adapter needs — `invoke_agent`
+    and `handoff` require the agent block, `evaluate` the evaluation block,
+    and `group_id` travels as a conversation — re-exported the same way
+    `ToolAttributes` is, for the same C-S1 reason."""
+    import wardex_sdk._assembly as assembly
+
+    for name in ("AgentAttributes", "ConversationContext", "EvaluationAttributes"):
+        assert name in assembly.__all__
+        assert getattr(assembly, name) is not None
     assert assembly.__all__ == sorted(assembly.__all__)

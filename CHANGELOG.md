@@ -7,6 +7,19 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- **A conversation id and an evaluation verdict now reach the backend.**
+  `wardex.conversation(...)` promised `gen_ai.conversation.id` on every span
+  inside it, and an adapter's evaluation block (`gen_ai.evaluation.name`,
+  `.explanation`, `.score.value`, `.score.label`) was set on guardrail
+  spans — but neither block was marshalled at export: the span held them
+  in-process and the OTLP request left without them, measured by decoding
+  what the transport received. Both are flattened into attributes now, the
+  way the agent and tool blocks already were, so a backend can group a
+  chat's turns by `gen_ai.conversation.id` (`wardex.conversation.session_id`
+  and a non-zero `wardex.conversation.turn_index` ride along when set) and
+  filter guardrail spans by `gen_ai.evaluation.score.label`. The
+  openai-agents adapter's `RunConfig(group_id=…)` and `evaluate` spans
+  below depend on this.
 - **The openai-agents SDK's own trace upload no longer becomes a span.** By
   default the framework POSTs its whole run record — every prompt,
   completion, model and usage of the run — to `/v1/traces/ingest`. Under
@@ -156,6 +169,51 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- **OpenAI Agents SDK adapter (`AdapterName.OPENAI_AGENTS`, `openai-agents>=0.22,<0.23`).**
+  Auto-detected when the `agents` module is importable. Before, a three-turn
+  `Runner.run` (tool call, handoff, final answer) was three parentless
+  `chat gpt-4o-mini` spans; now it is ONE tree: one `invoke_workflow` per
+  `Runner.run` / `run_sync` / `run_streamed` (named after
+  `RunConfig(workflow_name=…)`, default `Agent workflow`), one `invoke_agent`
+  per agent, a `handoff {from}→{to}` MARKER with the receiving agent as the
+  sender's SIBLING (carrying `wardex.agent.parent` and a `handoff_from`
+  link — a five-hop chain stays one level deep), one `execute_tool` per
+  function tool with `gen_ai.tool.call.id` recovered by an exact, unique
+  match against the response that requested it (labelled
+  `wardex.openai_agents.tool_call_id_source`; ambiguous or absent matches ship
+  the `tool_call_id_unavailable_in_process` marker instead of a guess), one
+  `evaluate {guardrail}` per guardrail (`score_label` pass/tripwire, ERROR
+  `guardrail_tripwire` when tripped), and an `execute_step mcp.list_tools`
+  carrying a hash and a count of the tool names, never the names.
+  `RunConfig(group_id=…)` becomes `gen_ai.conversation.id` on every adapter
+  span — unless the run is inside the host's own `wardex.conversation(...)`,
+  whose id then stays on every span (HOST WINS: one trace, one conversation)
+  while the group id rides along on the root as `wardex.openai_agents.group_id`.
+  Every edge comes from in-process context propagation — the tool
+  spans of two parallel tool calls sit at confidence 1.0 — and the
+  framework's own span ids are never consulted for the tree. The LLM call
+  stays the wire's: the adapter emits no `chat` span and discards the
+  framework's usage, so a token is billed once; `gen_ai.response.id` on the
+  chat span joins `wardex.openai_agents.response_id` on the tool and handoff
+  spans of the same turn. Failures map to a closed table (`max_turns_exceeded`,
+  `guardrail_tripwire`, `model_behavior_error`, `tool_error` /
+  `tool_error_handled`, `agent_run_error`, …): a fatal error on a top-level
+  agent makes the run root ERROR, a handled tool failure stays on the tool
+  span, an agent-as-tool failure never reaches the root. Hooked through the
+  framework's official `TracingProcessor`, nothing internal is patched. When
+  the framework's tracing is disabled (`OPENAI_AGENTS_DISABLE_TRACING`,
+  `set_tracing_disabled(True)`) the adapter logs ONE INFO line at install —
+  wardex then shows only the LLM calls — with the two lines that enable
+  tracing without sending anything to OpenAI. The framework's own upload to
+  `api.openai.com/v1/traces/ingest` is left as the host configured it.
+  `wardex.init()` wall time, measured on one developer machine with one
+  method (a fresh interpreter per run, seven runs, median) on this branch
+  and on the commit before the adapter: auto-detect 985 ms (979–1091)
+  against 431 ms (429–485) before, so auto-detecting this adapter costs
+  about 550 ms, almost all of it the framework's own import (`import
+  agents` alone: 745 ms, unchanged by wardex); with
+  `adapters=AdaptersConfig(enabled=())` 19 ms on both, so a host that names
+  its adapters pays nothing new.
 - **A WebSocket connection carrying LLM calls is no longer invisible.** With
   the openai-agents SDK's opt-in `use_responses_websocket=True` every run went
   over one `wss://…/v1/responses` connection and, under the default capture
@@ -349,6 +407,14 @@ All notable changes to this project are documented here. The format follows
 
 ### Changed
 
+- **The private native encoder returns three values.**
+  `wardex_sdk._wardex_native.codec.encode_otlp_requests` now answers
+  `(bodies, dropped, unmarshalled)` instead of `(bodies, dropped)`: the third
+  is the list of reasons for spans the marshaller could not read, which the
+  transport counts under `transport.otlp.span_unmarshalled` and reports once
+  while the rest of the batch ships (see the conversation/evaluation fix
+  above). The surface is private and unversioned; a tool that decoded through
+  it must unpack three.
 - **`capture_mode=ALL` and `intercept_hosts` have their first exception:**
   telemetry uploads (any host, path ending in `/v1/traces/ingest`) are never
   captured. README's capture_mode section says so.
