@@ -12,8 +12,26 @@ endpoint, run, open the backend.
 
 [Phoenix](https://github.com/Arize-ai/phoenix) is an open-source tracing UI
 that accepts OTLP/HTTP directly, so the whole path is one container, two
-packages and one environment variable. The steps below take about five
-minutes on a machine that already has Docker and Python.
+packages and one environment variable.
+
+**What you need.** Docker, Python 3.10 or newer (`python3 --version`), an
+OpenAI API key, and a checkout of this repository — the example script is
+not part of the wheel:
+
+```bash
+git clone https://github.com/wardex-labs/wardex-sdk
+cd wardex-sdk
+```
+
+**How long it takes.** Measured on 2026-09-06 by following exactly the
+steps below in a fresh virtualenv, with the Phoenix image already pulled and
+pip's cache warm: 1.3 minutes from `python -m venv` to the tree on screen,
+about 25 seconds of which is finding the trace in the UI. Two things happen
+only once and are not in that number: the first `docker run` pulls the
+Phoenix image (1.1 GB — a few minutes on a typical connection, and the
+longest step of a first setup), and the from-source install described under
+step 2 compiles the Rust core (minutes on a cold cache) — the PyPI wheel
+does not.
 
 **1. Start Phoenix.**
 
@@ -21,12 +39,28 @@ minutes on a machine that already has Docker and Python.
 docker run -d --name wardex-phoenix -p 6006:6006 arizephoenix/phoenix:latest
 ```
 
+Phoenix is ready when <http://localhost:6006> opens in a browser, about
+fifteen seconds after the image is local. If you have done this before,
+the container already exists: `docker start wardex-phoenix` brings it
+back. If `docker run` fails with `Bind for 0.0.0.0:6006 failed: port is
+already allocated`, something else — usually another Phoenix, see
+`docker ps` — already listens on 6006: either use that one as it is, or
+publish this one on a different port (`-p 6007:6006`) and replace `6006`
+with `6007` in every URL below.
+
 **2. Install the framework and wardex.**
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
-pip install wardex-sdk openai-agents
+pip install "wardex-sdk>=0.6.0b1" openai-agents
 ```
+
+The openai-agents adapter ships in wardex-sdk 0.6.0b1; the wheel is
+prebuilt for macOS, Linux and Windows, so there is nothing to compile.
+Until that version is on PyPI (`pip` answers `No matching distribution`),
+build it from the checkout you are standing in instead — `pip install
+./sdks/python openai-agents` — which compiles the Rust core and therefore
+needs a [Rust toolchain](https://rustup.rs) on the PATH.
 
 **3. Point wardex at Phoenix, give the framework its key, run.**
 
@@ -36,56 +70,96 @@ export WARDEX_ENDPOINT=http://127.0.0.1:6006/v1/traces  # the only wardex variab
 python examples/openai_agents_quickstart.py
 ```
 
-`WARDEX_ENDPOINT` is the full OTLP traces URL. Phoenix listens on
-`/v1/traces`, and wardex would append that path to a bare
-`http://127.0.0.1:6006` anyway, so either spelling works. Nothing else is
-configured: the openai-agents adapter is auto-detected because the
-`openai-agents` distribution is installed, and PII masking is on by default,
-so a real run never sends an email address or an API key to the backend.
+`WARDEX_ENDPOINT` is the full OTLP traces URL; Phoenix listens on
+`/v1/traces`. (A bare `http://127.0.0.1:6006` also works — an endpoint
+with no path gets `/v1/traces` appended, the rule stated under
+*Environment variables* in the README.) Nothing else is configured: the
+openai-agents adapter is auto-detected because the `openai-agents`
+distribution is installed, and PII masking is on by default, so a real run
+never sends an email address or an API key to the backend.
+
+The script prints the two final answers and then where to click. If the
+very last line is
+
+```
+[non-fatal] Tracing client error 401. Response data is redacted.
+```
+
+that is the framework, not wardex, and not a failure of this quickstart:
+openai-agents uploads its own record of every run to OpenAI's trace
+dashboard at `api.openai.com`, and a key that dashboard refuses gets a 401
+the framework itself labels non-fatal. wardex exported to Phoenix, not to
+OpenAI, so the tree is complete either way. To keep the run record off
+OpenAI altogether, run with `EXAMPLE_NO_OPENAI_UPLOAD=1`; the script then
+calls `agents.set_trace_processors([])` **before** `wardex.init()`, which is
+the order that matters — after it, the same call removes wardex's processor
+too. (That switch belongs to the example script, not to wardex; wardex never
+changes the framework's settings on its own.)
 
 **4. Look at the tree.**
 
-Open <http://localhost:6006>, click **Traces** in the left sidebar, and pick
-either of the two traces named `invoke_workflow travel_concierge` (one per
-`Runner.run` / `Runner.run_streamed`). Expanding it shows:
+Open <http://localhost:6006>. **Tracing** in the left sidebar lists
+projects; open **default** — Phoenix files everything that arrives without a
+project name there. The project opens on its **Spans** tab, which lists
+root spans newest first; the **Traces** tab next to it lists the same rows
+as traces. Either way the top two rows are this run: `invoke_workflow
+stre…` (the `Runner.run_streamed` run, which finished last) above
+`invoke_workflow trav…` (the `Runner.run` run). The name column clips
+long names, which is why the two workflow names differ at the front; older
+rows, if any, are earlier runs against the same Phoenix.
+
+Click `invoke_workflow trav…`. The trace opens in a drawer with all eight
+spans already expanded — but at the drawer's default width Phoenix draws
+them as a **flat list**, without the indentation that shows who is inside
+whom. Drag the drawer's left edge to the left until the span list is about
+half the window wide; the indentation and the connector lines appear, and
+the list reads:
 
 ```
-invoke_workflow travel_concierge
+invoke_workflow travel_concierge                 unknown
 ├── invoke_agent concierge                       AGENT
 │   ├── chat gpt-4o-mini                         LLM   — messages, model, tokens
 │   ├── execute_tool lookup_weather              TOOL  — gen_ai.tool.call.id, arguments, result
 │   ├── chat gpt-4o-mini                         LLM
-│   └── handoff concierge→booking_agent          marker, receiver named in gen_ai.agent.name
+│   └── handoff concierge→booking_agent          unknown — receiver named in gen_ai.agent.name
 └── invoke_agent booking_agent                   AGENT — wardex.agent.parent=concierge
     └── chat gpt-4o-mini                         LLM
 ```
 
 The receiving agent is the sender's **sibling**, not its child: a chain of
 five handoffs stays one level deep, and `wardex.agent.parent` plus a
-`handoff_from` span link carry who sent whom. Phoenix assigns the AGENT /
-LLM / TOOL badges itself from the OpenTelemetry `gen_ai.*` attributes;
-`invoke_workflow` and `handoff` have no OpenInference counterpart and show
-without a badge. Click a `chat` span to see the request and response
-messages and the token counts read from the wire, and a `execute_tool` span
-to see the arguments and the tool's return value.
-
-The framework's own trace upload to `api.openai.com/v1/traces/ingest` keeps
-running as it always did; wardex neither replaces it nor captures it. If
-you would rather not upload the run record to OpenAI, put
-`agents.set_trace_processors([])` **before** `wardex.init()` — the other
-order removes wardex's processor as well.
+`handoff_from` span link carry who sent whom. The chip on each row is
+Phoenix's: it assigns AGENT / LLM / TOOL from the OpenTelemetry `gen_ai.*`
+attributes itself, and `invoke_workflow` and `handoff`, which have no
+OpenInference kind, get its chip for "no kind", which reads `unknown`.
+That is a label, not an error. Click a `chat` span to see the request and
+response messages and the token counts read from the wire (the `449` next
+to each one is Phoenix's total-token chip), and the `execute_tool` span to
+see the arguments and the tool's return value.
 
 ## openai-agents → Langfuse
 
 Langfuse also accepts OTLP/HTTP, on `/api/public/otel/v1/traces`, but it
 authenticates with a project's public/secret key pair as HTTP Basic auth
 rather than a bearer token, and `WARDEX_ENDPOINT` + `WARDEX_API_KEY` only
-know how to send `Authorization: Bearer …`. So this path needs one explicit
-transport in place of the bare `wardex.init()` — the agent code is still
-untouched.
+know how to send `Authorization: Bearer …`. So this backend needs one
+explicit transport, and the example script builds it when it sees
+`LANGFUSE_HOST` — the agent code is still untouched, and nothing in the
+script is edited.
 
-Step 2 above stays the same; `WARDEX_ENDPOINT` is not used on this path.
-Replace the `wardex.init()` call in the example with:
+Steps 2 and 3 above stay the same except for the variables: in place of
+`WARDEX_ENDPOINT`, set the three the script reads and run it again.
+
+```bash
+export OPENAI_API_KEY=sk-...
+export LANGFUSE_HOST=http://127.0.0.1:3000   # or your cloud region's host
+export LANGFUSE_PUBLIC_KEY=pk-lf-...
+export LANGFUSE_SECRET_KEY=sk-lf-...
+python examples/openai_agents_quickstart.py
+```
+
+What the script does with them, if you want the same thing in your own
+`wardex.init()`:
 
 ```python
 import base64
@@ -94,7 +168,7 @@ import os
 import wardex_sdk as wardex
 from wardex_sdk.transport import OtlpHttpTransport
 
-base = os.environ["LANGFUSE_HOST"]  # e.g. http://127.0.0.1:3000 or your cloud region's host
+base = os.environ["LANGFUSE_HOST"].rstrip("/")
 auth = base64.b64encode(
     f"{os.environ['LANGFUSE_PUBLIC_KEY']}:{os.environ['LANGFUSE_SECRET_KEY']}".encode()
 ).decode()
@@ -111,8 +185,9 @@ self-hosted `langfuse/langfuse` v4 docker-compose stack. For the hostname
 of a cloud region, or a different self-hosted version, see Langfuse's own
 OpenTelemetry ingestion docs — nothing in this repo verifies those.
 
-Once running, open your Langfuse project's traces list; the run appears
-under the name `invoke_workflow travel_concierge` with the same tree.
+Once running, open your Langfuse project's traces list; the two runs
+appear under the names `invoke_workflow travel_concierge` and
+`invoke_workflow streamed_travel_concierge` with the same tree as above.
 Langfuse's `totalTokens` column reads 0 because wardex ships no
 `gen_ai.usage.total_tokens` (the key does not exist in the OpenTelemetry
 registry); `promptTokens`, `completionTokens` and the cost figures are exact.
