@@ -64,8 +64,14 @@ def install_span(
     *,
     conversation: ConversationContext | None = None,
     tracestate: str | None = None,
-) -> Scope:
-    """Fork the scope with NO finaliser. Returns the scope that was current.
+) -> tuple[Scope, Scope]:
+    """Fork the scope with NO finaliser. Returns `(the scope that was
+    current, the fork now installed)`.
+
+    The fork is returned as well as the previous scope because a pin's
+    carrier may have to retire it from ANOTHER task (`retire_fork`): the
+    fork object is what that task's ContextVar holds, and the only handle
+    on it that survives leaving this task.
 
     For a carrier that is never exited — a pin (design §5.6), whose whole point
     is that the driver task keeps the unit ambient for the rest of its life.
@@ -80,8 +86,28 @@ def install_span(
     deliberate, same-task way back, and there is no other.
     """
     prev = _hub.get_current_scope()
-    _hub._current_scope.set(_fork(prev, ctx, conversation, tracestate))
-    return prev
+    fork = _fork(prev, ctx, conversation, tracestate)
+    _hub._current_scope.set(fork)
+    return prev, fork
+
+
+def retire_fork(fork: Scope, prev: Scope) -> None:
+    """Make `fork` read as `prev` again, IN PLACE, from any task.
+
+    The cross-task half of `restore_scope`. A ContextVar can only be set on
+    the task that holds it, so a pin whose unit dies on another thread
+    (`wardex.close()` from a worker while the run's `with trace(...)` is
+    still open on the main thread) cannot be taken down there -- and the
+    dead unit's fork stayed current on the pinned thread, where every later
+    `restore_scope` put it back and every later root opened under it. The
+    fork object IS what that thread's ContextVar holds, so writing the
+    previous scope's trace fields onto it is what its readers see: the
+    host's own scope, as if the pin had come down. Tags, user and contexts
+    were cloned at the fork and are left alone.
+    """
+    fork.active_span_context = prev.active_span_context
+    fork.conversation = prev.conversation
+    fork.tracestate = prev.tracestate
 
 
 def restore_scope(prev: Scope) -> None:

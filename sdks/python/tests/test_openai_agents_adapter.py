@@ -2244,15 +2244,6 @@ def _close_mid_run_then_run_again(*, close_from: str) -> list[Any]:
         return _spans()
     finally:
         wardex.close()
-        if close_from != "main":
-            # The strand this case makes ON PURPOSE has the main thread as
-            # its carrier, so it outlives the test and every later test on
-            # this thread would read a dead unit's scope. Retire it by hand,
-            # the way the harness retires a scope between tests.
-            from wardex_sdk._assembly._units import _ambient_unit
-
-            _ambient_unit.set(None)
-            _hub.reset_for_test()
 
 
 @pytest.mark.parametrize("close_from", ["main", "worker_thread"])
@@ -2261,14 +2252,18 @@ def test_a_pin_stranded_by_a_close_mid_run_does_not_demote_the_next_runs_group_i
 ):
     """Two defences, measured one at a time. Closed from the MAIN thread,
     the uninstall takes the stranded pin down itself. Closed from a WORKER
-    thread the pin cannot be removed (a pin comes down only on the task that
-    installed it) and stays on the main thread's scope — so the next run's
-    open must recognise the ambient conversation as the adapter's OWN
-    leftover, not the host's, and let `group_id` be the conversation."""
+    thread the pin cannot be removed on that thread (a pin comes down only
+    on the task that installed it), so the registry retires the dead unit's
+    scope fork IN PLACE from where it closes: the main thread reads the
+    host's original scope again. Either way the next run is a FRESH root --
+    no parent, its own trace -- and not a child of the dead run at 1.0, and
+    the next run's `group_id` is its conversation, not the dead run's."""
     scenario(_decide_single)
     spans = _close_mid_run_then_run_again(close_from=close_from)
     assert counters.get("adapters.openai_agents.group_id_shadowed_by_host") == 0
     root = _one(spans, "invoke_workflow Agent workflow")
+    assert root.parent_span_id is None
+    assert _edge(root) == (ParentSource.TRACE_ROOT, 1.0, ())
     assert root.conversation is not None
     assert root.conversation.conversation_id == "g-second"
     assert "wardex.openai_agents.group_id" not in _extra(root)

@@ -95,7 +95,7 @@ from .._enums import CaptureSource, StatusCode
 from .._limits import LimitsConfig
 from .._scope import Scope
 from .._types import ConversationContext, SpanContext
-from ..context._contextvar import activate_span, install_span, restore_scope
+from ..context._contextvar import activate_span, install_span, restore_scope, retire_fork
 from ._builder import SpanDraft
 from ._diag import counters, guard
 from ._integrity import Limitation
@@ -236,7 +236,7 @@ class _Carrier:
     asymmetry ships a wrong parent at confidence 1.0 with no marker.
     """
 
-    __slots__ = ("_prev_scope", "_span_cm", "_token", "owner", "unit")
+    __slots__ = ("_fork", "_prev_scope", "_span_cm", "_token", "owner", "unit")
 
     def __init__(self, unit: Unit, *, pinned: bool) -> None:
         self.unit = unit
@@ -248,9 +248,12 @@ class _Carrier:
         # `_fork` states that override rule once for both forms.
         self._span_cm: contextlib.AbstractContextManager[None] | None
         self._prev_scope: Scope | None
+        #: The pin's own scope fork, kept so `retire_from_afar` can reach it
+        #: from a task that cannot touch this task's ContextVar.
+        self._fork: Scope | None = None
         if pinned:
             self._span_cm = None
-            self._prev_scope = install_span(
+            self._prev_scope, self._fork = install_span(
                 unit.context, conversation=unit.conversation, tracestate=unit.tracestate
             )
         else:
@@ -292,6 +295,21 @@ class _Carrier:
                 raise ValueError("a pin may only be removed on the task that installed it")
             else:
                 restore_scope(self._prev_scope)
+
+    def retire_from_afar(self) -> None:
+        """Take a PIN's fork out of service from a task that cannot remove it.
+
+        For the unit that dies on another thread while its pin stands: the
+        `_ambient_unit` entry there is a dead unit's, which every reader
+        already refuses, but the SCOPE fork under it kept the dead unit's
+        span context and conversation -- and after a re-init the new
+        registry cannot judge that fork as its own corpse, so later roots
+        opened under it at 1.0. Writing the previous scope's fields onto the
+        fork in place is what the pinned task's readers see from then on.
+        `remove()` on the owning task later restores the same scope object.
+        """
+        if self._fork is not None and self._prev_scope is not None:
+            retire_fork(self._fork, self._prev_scope)
 
 
 class PinToken:
@@ -869,6 +887,7 @@ class UnitRegistry:
         "_max_record_bytes",
         "_max_total_units",
         "_max_units",
+        "_pins",
         "_roots",
         "_sink",
     )
@@ -940,6 +959,11 @@ class UnitRegistry:
         self._lock = threading.RLock()
         self._roots: dict[Unit, None] = {}
         self._live_units: dict[Unit, None] = {}
+        #: The pin each unit holds, so the unit's death can retire it. A pin
+        #: comes down on its own task through `unpin`; a unit closed from
+        #: ANOTHER task (a worker thread's `wardex.close()`) leaves its pin
+        #: standing there, and `_detach_locked` retires that fork in place.
+        self._pins: dict[Unit, _Carrier] = {}
         self._by_alias: dict[UnitKey, Unit] = {}
         #: The closed-unit link memory: remembered alias keys -> the span
         #: context their unit owned when it closed. A plain dict, because
@@ -987,6 +1011,7 @@ class UnitRegistry:
         self._lock = threading.RLock()
         self._roots.clear()
         self._live_units.clear()
+        self._pins.clear()
         self._by_alias.clear()
         self._link_memory.clear()
 
@@ -1617,7 +1642,10 @@ class UnitRegistry:
             counters.bump("assembly._units.pin_foreign_task")
             unit.note(Limitation.CORRELATION_CONFLICT)
             return PinToken(unit, observed, None)
-        return PinToken(unit, observed, _Carrier(unit, pinned=True))
+        carrier = _Carrier(unit, pinned=True)
+        with self._lock:
+            self._pins[unit] = carrier
+        return PinToken(unit, observed, carrier)
 
     def unpin(self, token: PinToken) -> None:
         """Remove a pin. MUST run on the task that installed it.
@@ -1628,6 +1656,9 @@ class UnitRegistry:
         """
         if token._carrier is None:
             return
+        with self._lock:
+            if self._pins.get(token.unit) is token._carrier:
+                del self._pins[token.unit]
         token._carrier.remove(where="assembly._units.unpin", debug=self._debug)
         token._carrier = None
         token.installed = False
@@ -1891,6 +1922,15 @@ class UnitRegistry:
         unit._open.clear()
         self._roots.pop(unit, None)
         self._live_units.pop(unit, None)
+        # A pin standing on a task other than the closing one can never come
+        # down through `unpin` from here: retire its scope fork in place, so
+        # that task reads the host's scope and not this corpse's. A pin on
+        # THIS task is left to `unpin` (or to the staleness gate, marked),
+        # which is the negative control the pin discipline is audited by.
+        pin = self._pins.pop(unit, None)
+        if pin is not None and pin.owner is not _current_task():
+            pin.retire_from_afar()
+            counters.bump("assembly._units.pin_retired_from_afar")
         if unit.parent is not None:
             unit.parent._children.pop(unit, None)
         # Remembered aliases move into the closed-unit link memory BEFORE the
