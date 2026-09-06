@@ -37,6 +37,48 @@ by the default exporter. With `WARDEX_ENDPOINT` set in the environment, a bare
 `wardex.init()` is a working first run — see
 [Environment variables](#environment-variables).
 
+## Works with openai-agents
+
+Install wardex next to the OpenAI Agents SDK, set one environment variable,
+and every `Runner.run` / `run_sync` / `run_streamed` becomes one trace with
+the agents, the tool calls and the handoffs in it — no decorator, no
+callback, no processor to register. The framework's own tracing hooks give
+wardex the structure; the LLM calls underneath are read from the wire, so
+model, messages and token usage are the ones that actually crossed the
+socket, and the tool `call_id` the framework echoes into the next turn joins
+each `execute_tool` span to the `chat` span that requested it.
+
+```bash
+pip install wardex-sdk openai-agents
+export WARDEX_ENDPOINT=http://127.0.0.1:6006/v1/traces   # a local Phoenix
+python examples/openai_agents_quickstart.py
+```
+
+![Phoenix showing one openai-agents run: invoke_workflow travel_concierge → invoke_agent concierge (chat, execute_tool lookup_weather, chat, handoff concierge→booking_agent) and its sibling invoke_agent booking_agent (chat)](https://raw.githubusercontent.com/wardex-labs/wardex-sdk/main/examples/openai-agents-phoenix.png)
+
+The receiving agent of a handoff is the sender's **sibling**, not its
+child, so a long handoff chain stays one level deep; `wardex.agent.parent`
+and a `handoff_from` link record who handed off to whom. The script, the
+Phoenix and Langfuse walkthroughs and the exact tree to expect are in
+[`examples/README.md`](examples/README.md).
+
+Two cases where you do **not** get that tree, and what wardex says instead:
+
+- **Responses over WebSocket** (`use_responses_websocket=True`). The LLM
+  calls are inside WebSocket frames wardex does not parse, so the `chat`
+  spans are replaced by one `WS /v1/responses` span per connection carrying
+  the marker `ws_llm_semantics_unread` — no model, tokens or messages. The
+  agent, tool and handoff spans are unaffected. Use the framework's default
+  HTTP transport for `chat` spans.
+- **Framework tracing disabled** (`OPENAI_AGENTS_DISABLE_TRACING=1` or
+  `agents.set_tracing_disabled(True)`). There is nothing for the adapter to
+  hook, so you get the `chat` spans only, unparented, and one line on stderr
+  at `wardex.init()`: `[wardex] openai-agents tracing is disabled, so wardex
+  will show only the LLM calls its interceptor captures: no agent, handoff,
+  tool or guardrail spans. …` — followed by the two lines that re-enable the
+  framework's tracing without sending anything to OpenAI. wardex never flips
+  that setting for you.
+
 ## Configuration
 
 Settings are grouped by concern, and the group names are the same in every
@@ -648,7 +690,9 @@ diagnostic line (traceback under `debug=True`).
   replace it. For the structure without that upload, IN THIS ORDER:
   `agents.set_trace_processors([])` and THEN `wardex.init()` (the reverse
   order removes wardex's processor too). `RunConfig(workflow_name=…)` names
-  the root; the default is `Agent workflow`. Known limitations: the wire
+  the root; the default is `Agent workflow`. Runnable end to end in
+  [`examples/openai_agents_quickstart.py`](examples/openai_agents_quickstart.py)
+  (see [Works with openai-agents](#works-with-openai-agents)). Known limitations: the wire
   `chat` spans carry no `gen_ai.agent.name` — filter by walking up the tree
   to the `invoke_agent` span; a Responses-over-WebSocket run stays the
   counted, marked connection (`ws_llm_semantics_unread`) with no structure

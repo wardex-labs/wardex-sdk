@@ -214,6 +214,23 @@ All notable changes to this project are documented here. The format follows
   agents` alone: 745 ms, unchanged by wardex); with
   `adapters=AdaptersConfig(enabled=())` 19 ms on both, so a host that names
   its adapters pays nothing new.
+- **A runnable openai-agents quickstart, and the README path to it.**
+  `examples/openai_agents_quickstart.py` runs a travel concierge with a
+  function tool that hands off to a booking agent, once with `Runner.run`
+  and once with `Runner.run_streamed`, under a bare `wardex.init()` that
+  reads `WARDEX_ENDPOINT` — the one wardex variable a first run needs.
+  `examples/README.md` walks from `docker run` (Phoenix) or a
+  Basic-auth `OtlpHttpTransport` (Langfuse) to the eight-span tree in the
+  UI, and the README gained a "Works with openai-agents" section with a
+  screenshot of that tree and the two cases where it is not what you get
+  (Responses over WebSocket → `ws_llm_semantics_unread`; framework tracing
+  disabled → `chat` spans only plus one stderr line). Timed from a fresh
+  virtualenv following the docs alone, with Phoenix already up: venv, `pip
+  install`, the run and the tree on screen took about half a minute of
+  machine time — the ten-minute bar this SDK sets for a first view is met
+  with room to spare. The `examples/` directory is linted like the SDK
+  source: the root `pyproject.toml` extends the SDK's ruff config and CI
+  runs ruff over it.
 - **A WebSocket connection carrying LLM calls is no longer invisible.** With
   the openai-agents SDK's opt-in `use_responses_websocket=True` every run went
   over one `wss://…/v1/responses` connection and, under the default capture
