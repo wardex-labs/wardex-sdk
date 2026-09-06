@@ -5,3 +5,10 @@ members = ["sdks/python"]
 # the `test` group of `sdks/python/pyproject.toml`, next to the tests that
 # import it, so one `--group test` installs a complete test environment. A
 # group split across two files is a group that cannot be named in one flag.
+
+# `examples/` sits outside `sdks/python`, so without this block ruff would fall
+# back to its built-in defaults there (88 columns, the E4/E7/E9/F rules only).
+# One config, extended rather than copied: the settings stay next to the code
+# that owns them, and an example is linted exactly like the source it shows.
+[tool.ruff]
+extend = "sdks/python/pyproject.toml"
