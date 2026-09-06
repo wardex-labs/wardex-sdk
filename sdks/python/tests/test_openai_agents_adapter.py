@@ -336,10 +336,10 @@ def test_a_processor_removed_after_init_is_reported_once_at_uninstall(agents_env
 def test_a_processor_removed_in_a_later_init_cycle_is_still_reported(agents_env, wardex_log):
     """`wardex.close()` leaves the process-global counters alone, so a second
     `init` in the same process starts with `active.trace` already above zero
-    from the first cycle's runs. "No run was ever recorded" has to be judged
-    against the count at THIS install, not against zero: the host that
-    replaces the processor list after the second init has recorded nothing
-    since, and must hear so."""
+    from the first cycle's runs. "No run was ever recorded" is judged by the
+    ADAPTER INSTANCE's own count, which starts at zero with each install: the
+    host that replaces the processor list after the second init has recorded
+    nothing since, and must hear so."""
     from wardex_sdk._assembly._diag import reset_reports_for_test
 
     # The notice's `report_once` key is process-global too, and the removal
@@ -361,6 +361,31 @@ def test_a_processor_removed_in_a_later_init_cycle_is_still_reported(agents_env,
     assert wardex_log.lines(logging.WARNING).count(_PROCESSOR_REMOVED_NOTICE) == 1
     assert counters.get("adapters.openai_agents.processor_removed") == 1
     assert counters.get("adapters.openai_agents.processor_removed_after_runs") == 0
+
+
+def test_a_counter_reset_between_install_and_uninstall_does_not_change_the_verdict(
+    agents_env, wardex_log
+):
+    """ "No run recorded since this install" is the adapter's OWN count, not a
+    process-global counter measured against a baseline: `Runtime.after_in_child`
+    resets the counters in a fork child and `wardex_sdk.testing.clean_state()`
+    resets them for a test, and either would have made a run this install DID
+    record look like none. A run, a reset, then the removal: a change of mind,
+    counted, never the blind-spot notice."""
+    from wardex_sdk._assembly._diag import reset_reports_for_test
+
+    reset_reports_for_test()
+    _init()
+    try:
+        assert _run(_agents()).final_output == "done"
+        counters.reset()
+        set_trace_processors([])
+        assert _run(_agents()).final_output == "done"
+    finally:
+        wardex.close()
+    assert wardex_log.lines(logging.WARNING).count(_PROCESSOR_REMOVED_NOTICE) == 0
+    assert counters.get("adapters.openai_agents.processor_removed") == 0
+    assert counters.get("adapters.openai_agents.processor_removed_after_runs") == 1
 
 
 # --------------------------------------------------------------------------

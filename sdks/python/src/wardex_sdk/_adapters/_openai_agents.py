@@ -124,7 +124,6 @@ from .._assembly import (
     ToolAttributes,
     UnitKey,
     UnitKind,
-    counters,
     diag_info,
     latch_ambient,
     report_once,
@@ -412,12 +411,11 @@ class OpenAIAgentsAdapter(AdapterInterface):
         #: its persisted trace instead of starting a new one). None on a
         #: framework without the resume feature.
         self._reattached: type | None = None
-        #: `adapters.openai_agents.active.trace` as read at install. The
-        #: counter is process-global and `wardex.close()` does not reset it,
-        #: so "no run was ever recorded" is judged against THIS install's
-        #: starting value, not against zero — or a second init/close cycle in
-        #: one process would inherit the first cycle's runs and never report.
-        self._trace_baseline = 0
+        #: Runs THIS install recorded. An instance field and not a reading
+        #: of the process-global `active.trace` counter: that counter is
+        #: reset by the fork child's re-init and by the testing harness, and
+        #: a run this install did record would then look like none.
+        self._runs = 0
 
     def name(self) -> str:
         return _FRAMEWORK
@@ -481,7 +479,6 @@ class OpenAIAgentsAdapter(AdapterInterface):
                 key="adapters.openai_agents.processors_read_failed",
             )
             ctx.count("processors_read_failed")
-        self._trace_baseline = counters.get("adapters.openai_agents.active.trace")
         tracing.add_trace_processor(self._processor)
         self._installed = True
 
@@ -529,9 +526,8 @@ class OpenAIAgentsAdapter(AdapterInterface):
         Only when NO run was recorded since this install: a processor removed
         after runs is a change of mind rather than a silent blind spot, and is
         counted under its own name instead of reported. "Since this install"
-        is measured against `_trace_baseline`, because the counter outlives
-        `wardex.close()` and a later init in the same process would otherwise
-        read the earlier cycle's runs as its own.
+        is the instance's own `_runs`, which starts at zero with each install
+        and is reset by nothing else.
         """
         ctx = self._ctx
         if ctx is None:
@@ -539,7 +535,7 @@ class OpenAIAgentsAdapter(AdapterInterface):
         current = self._current_processors()
         if current is None or self._processor in current:
             return
-        if counters.get("adapters.openai_agents.active.trace") == self._trace_baseline:
+        if self._runs == 0:
             report_once(_PROCESSOR_REMOVED_NOTICE, key="adapters.openai_agents.processor_removed")
             ctx.count("processor_removed")
         else:
@@ -1007,6 +1003,7 @@ def _trace_start(adapter: OpenAIAgentsAdapter, trace: Any, *, resumed: bool = Fa
     run["first_error"] = None
     run["agent_count"] = 0
     run["turn_max"] = 0
+    adapter._runs += 1
     _pin(adapter, h, driver, name)
     ctx.confirm_active("trace")
     if resumed:
