@@ -425,6 +425,20 @@ class RunHandle(Scope):
         self._pin = token
         return token.installed
 
+    @property
+    def pinned(self) -> bool:
+        """Whether this handle holds an installed pin, on whatever task."""
+        token = self._pin
+        return token is not None and token.installed
+
+    @property
+    def pinned_here(self) -> bool:
+        """Whether this handle holds an installed pin that the CURRENT task can
+        take down. A teardown that sweeps the handles it still holds unpins
+        those, and counts the rest as stranded."""
+        token = self._pin
+        return token is not None and token.on_this_task()
+
     def unpin(self) -> bool:
         """Take the pin this handle installed back down, on the task it was put on.
 

@@ -25,6 +25,7 @@ import os
 import subprocess
 import sys
 import textwrap
+import threading
 from typing import Any
 
 import pytest
@@ -1900,6 +1901,64 @@ def test_a_passing_guardrail_inside_a_hosts_except_block_is_a_pass(agents_env, s
     assert (evaluate.status, evaluate.error_type) == (StatusCode.OK, None)
     assert evaluate.evaluation.score_label == "pass"
     assert _extra(evaluate)["wardex.evaluation.triggered"] is False
+
+
+# --------------------------------------------------------------------------
+# a pin stranded by wardex.close() mid-run
+# --------------------------------------------------------------------------
+
+
+def _close_mid_run_then_run_again(*, close_from: str) -> list[Any]:
+    """`with trace(...)` on the main thread pins the run root there;
+    `wardex.close()` INSIDE the block means the trace's own end arrives
+    after the uninstall and is ignored. Then a second init and a run with
+    its own group id, whose root and children are returned."""
+    from agents.tracing import trace
+
+    agent = Agent(name="agent_a", instructions="a", model="gpt-4o-mini")
+    _init()
+    with trace("outer", group_id="g-first"):
+        assert Runner.run_sync(agent, "hi").final_output == "done"
+        if close_from == "main":
+            wardex.close()
+        else:
+            worker = threading.Thread(target=wardex.close)
+            worker.start()
+            worker.join()
+    _init()
+    try:
+        assert (
+            Runner.run_sync(agent, "hi", run_config=RunConfig(group_id="g-second")).final_output
+            == "done"
+        )
+        return _spans()
+    finally:
+        wardex.close()
+
+
+@pytest.mark.parametrize("close_from", ["main", "worker_thread"])
+def test_a_pin_stranded_by_a_close_mid_run_does_not_demote_the_next_runs_group_id(
+    agents_env, scenario, close_from
+):
+    """Two defences, measured one at a time. Closed from the MAIN thread,
+    the uninstall takes the stranded pin down itself. Closed from a WORKER
+    thread the pin cannot be removed (a pin comes down only on the task that
+    installed it) and stays on the main thread's scope — so the next run's
+    open must recognise the ambient conversation as the adapter's OWN
+    leftover, not the host's, and let `group_id` be the conversation."""
+    scenario(_decide_single)
+    spans = _close_mid_run_then_run_again(close_from=close_from)
+    assert counters.get("adapters.openai_agents.group_id_shadowed_by_host") == 0
+    root = _one(spans, "invoke_workflow Agent workflow")
+    assert root.conversation is not None
+    assert root.conversation.conversation_id == "g-second"
+    assert "wardex.openai_agents.group_id" not in _extra(root)
+    for s in spans:
+        assert Limitation.CORRELATION_CONFLICT not in _edge(s)[2], s.name
+    if close_from == "main":
+        assert counters.get("adapters.openai_agents.pin_stranded") == 0
+    else:
+        assert counters.get("adapters.openai_agents.pin_stranded") == 1
 
 
 # --------------------------------------------------------------------------

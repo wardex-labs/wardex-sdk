@@ -858,6 +858,9 @@ _DEGRADED_VERB_ARGS = {
     "unpin": ((), {}),
     "close": ((), {}),
 }
+#: RunHandle-only readers, answered False on a degraded handle (it holds no
+#: pin), and absent on a plain `Scope` the way `pin`/`unpin` are.
+_DEGRADED_HANDLE_READERS = ("pinned", "pinned_here")
 _DEGRADED_READERS = ("draft", "accepted", "degraded")
 
 
@@ -874,7 +877,9 @@ def test_every_verb_on_a_degraded_scope_is_answerable_and_none_of_them_raises(mo
 
     members = {n for n in dir(Scope) if not n.startswith("_")}
     members |= {n for n in dir(RunHandle) if not n.startswith("_")}
-    uncovered = members - set(_DEGRADED_VERB_ARGS) - set(_DEGRADED_READERS)
+    uncovered = (
+        members - set(_DEGRADED_VERB_ARGS) - set(_DEGRADED_READERS) - set(_DEGRADED_HANDLE_READERS)
+    )
     assert uncovered == set(), (
         f"{sorted(uncovered)} is reachable on a degraded handle and untested here.\n"
         "Add it to _DEGRADED_VERB_ARGS, and give it a total answer in _context.py."
@@ -899,6 +904,8 @@ def test_every_verb_on_a_degraded_scope_is_answerable_and_none_of_them_raises(mo
         for target in (scope, handle):
             for name in _DEGRADED_READERS:
                 getattr(target, name)
+            for name in _DEGRADED_HANDLE_READERS:
+                assert getattr(target, name, False) is False
             for name, (args, kwargs) in _DEGRADED_VERB_ARGS.items():
                 verb = getattr(target, name, None)
                 if verb is not None:

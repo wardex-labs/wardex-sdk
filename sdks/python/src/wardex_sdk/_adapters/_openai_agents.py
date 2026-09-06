@@ -124,6 +124,7 @@ from .._assembly import (
     ToolAttributes,
     UnitKey,
     UnitKind,
+    ambient_owner,
     diag_info,
     latch_ambient,
     report_once,
@@ -571,13 +572,41 @@ class OpenAIAgentsAdapter(AdapterInterface):
                 key="adapters.openai_agents.uninstall_processor_left_inert",
             )
             ctx.count("uninstall_processor_left_inert")
+        self._unpin_held()
         ctx.close_all(marker=Limitation.ADAPTER_UNINSTALLED)
 
     def close_units(self, *, marker: Limitation) -> None:
         """Overridden: this adapter holds a run's units open across callbacks."""
         self._check_processor_removed()
         if self._ctx is not None:
+            self._unpin_held()
             self._ctx.close_all(marker=marker)
+
+    def _unpin_held(self) -> None:
+        """Take down the pins of every handle this adapter still holds, BEFORE
+        the units close.
+
+        A run still open at `wardex.close()` never sees its own end: the
+        framework's `on_trace_end` arrives after the uninstall and is ignored,
+        so the pin its start installed would stay on the carrier. A task's
+        carrier dies with the task; a THREAD's does not (`with trace(...)`
+        on the host's main thread pins there), and the next run on that
+        thread would then open under a finished unit's scope and read that
+        unit's conversation as the host's. Only a pin on THIS task can come
+        down; the rest are counted as stranded, and the open path treats an
+        ambient unit of this adapter's own as a leftover, never as the host.
+        """
+        ctx = self._ctx
+        if ctx is None:
+            return
+        for entry in list(ctx._slots.values()):
+            h = entry.get("handle")
+            if not isinstance(h, RunHandle) or h.degraded:
+                continue
+            if h.pinned_here:
+                _unpin(self, h)
+            elif h.pinned:
+                ctx.count("pin_stranded")
 
     # -- containment -----------------------------------------------------
 
@@ -973,10 +1002,15 @@ def _trace_start(adapter: OpenAIAgentsAdapter, trace: Any, *, resumed: bool = Fa
     # replacing the ambient id on every span underneath. With nothing
     # ambient the group id IS the conversation, handed to the registry at
     # the open so children and the pinned carrier inherit it.
+    #
+    # The host's word is an ambient conversation that the host set. One
+    # installed by THIS adapter's own unit is a leftover — a run closed by
+    # `wardex.close()` on a thread whose carrier outlived it — and is not
+    # what the host asked for: `group_id` stays the conversation.
     conversation = None
     shadowed = None
     if group:
-        if latch_ambient().conversation is not None:
+        if latch_ambient().conversation is not None and ambient_owner() != ctx.name:
             shadowed = str(group)
             ctx.count("group_id_shadowed_by_host")
         else:

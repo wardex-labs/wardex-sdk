@@ -90,6 +90,7 @@ from ._units import (
     UnitKey,
     UnitKind,
     UnitRegistry,
+    ambient_owner,
     parent_is_closed_unit,
 )
 from ._vocab import (
@@ -143,6 +144,7 @@ __all__ = [
     "guard",
     "in_degraded_run",
     "is_declared_extra_key",
+    "ambient_owner",
     "latch_ambient",
     "parent_is_closed_unit",
     "report_once",

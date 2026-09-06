@@ -310,6 +310,13 @@ class PinToken:
         self._carrier = carrier
         self.installed = carrier is not None
 
+    def on_this_task(self) -> bool:
+        """Whether an installed pin can come down HERE: it was put on the task
+        (or thread) running right now. A teardown sweeping the pins it still
+        holds asks this first, so a pin on another task is counted as left
+        standing instead of costing two cross-task failures."""
+        return self.installed and self.owner is _current_task()
+
 
 @dataclass(frozen=True, slots=True)
 class _OpenDraft:
@@ -1961,6 +1968,20 @@ class UnitRegistry:
                 self._sink.emit(draft, agent_semantic=True)
 
 
+def ambient_owner() -> str | None:
+    """Which adapter installed the ambient unit, LIVE OR NOT, or None.
+
+    `current()` answers a different question — "which unit may I hang off" —
+    and retires a closed pin and a previous registry's unit alike. This reads
+    the carrier as it stands: an adapter deciding whether an ambient
+    conversation is the HOST's word or its own leftover (a pin its earlier
+    run could not take down, on a thread that outlived the run) needs the
+    owner of what is there, not whether it may still be used.
+    """
+    entry = _ambient_unit.get()
+    return None if entry is None else entry.unit.owner
+
+
 def parent_is_closed_unit(parent: SpanContext | None) -> bool:
     """Was `parent` latched off a unit that had ALREADY CLOSED? — design §10.3(b).
 
@@ -2010,6 +2031,7 @@ __all__ = [
     "PinToken",
     "SpanSink",
     "Unit",
+    "ambient_owner",
     "UnitKey",
     "UnitKind",
     "UnitRegistry",
