@@ -141,7 +141,8 @@ if __name__ == "__main__":
     asyncio.run(main())
     wardex.close()  # optional — spans also flush every 5s and at exit
     print()
-    print("Now open your backend. Phoenix: http://localhost:6006 → Tracing → project `default`")
-    print("→ Traces tab; the top two rows are this run (`invoke_workflow streamed_travel_...`")
-    print("above `invoke_workflow travel_...`). Open one and widen the span panel to see the")
-    print("tree: both agents, the tool call and the handoff.")
+    print("Now open your backend. Phoenix: http://localhost:6006 → Tracing → project `default`.")
+    print("It opens on the Spans tab; the top two rows are this run")
+    print("(`invoke_workflow streamed_travel_...` above `invoke_workflow travel_...`).")
+    print("Click one, then drag the drawer's left edge wider until the rows indent:")
+    print("both agents, the tool call and the handoff.")
