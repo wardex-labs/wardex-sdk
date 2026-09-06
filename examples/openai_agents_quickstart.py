@@ -54,6 +54,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import os
+import sys
 
 import agents
 from agents import Agent, RunConfig, Runner, function_tool
@@ -122,8 +123,15 @@ def init_wardex() -> None:
 
     from wardex_sdk.transport import OtlpHttpTransport
 
-    pair = f"{os.environ['LANGFUSE_PUBLIC_KEY']}:{os.environ['LANGFUSE_SECRET_KEY']}"
-    auth = base64.b64encode(pair.encode()).decode()
+    # Checked rather than indexed: the host alone is a half-configured backend,
+    # and a bare KeyError here reads as a bug in the example, not as a missing
+    # variable in your shell.
+    public = os.environ.get("LANGFUSE_PUBLIC_KEY")
+    secret = os.environ.get("LANGFUSE_SECRET_KEY")
+    if not public or not secret:
+        sys.exit("LANGFUSE_HOST needs LANGFUSE_PUBLIC_KEY and LANGFUSE_SECRET_KEY")
+
+    auth = base64.b64encode(f"{public}:{secret}".encode()).decode()
     wardex.init(
         transport=OtlpHttpTransport(
             endpoint=f"{host.rstrip('/')}/api/public/otel/v1/traces",

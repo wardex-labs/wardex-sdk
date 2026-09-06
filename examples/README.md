@@ -270,12 +270,20 @@ Steps 2 and 3 above stay the same except for the variables: in place of
 `WARDEX_ENDPOINT`, set the three the script reads and run it again.
 
 ```bash
+unset WARDEX_ENDPOINT                        # the transport below carries its own address
 export OPENAI_API_KEY=sk-...
 export LANGFUSE_HOST=http://127.0.0.1:3000   # or your cloud region's host
 export LANGFUSE_PUBLIC_KEY=pk-lf-...
 export LANGFUSE_SECRET_KEY=sk-lf-...
 python examples/openai_agents_quickstart.py
 ```
+
+The `unset` is not decoration: if you ran the Phoenix path in this same
+shell, `WARDEX_ENDPOINT` is still exported, and an explicit `transport=`
+next to it makes `wardex.init()` warn `WardexConfigWarning: backend
+endpoint ignored: transport= carries its own address`. The export still
+goes to Langfuse — the transport wins — but the warning is telling you a
+setting was dropped, and the leftover variable is the whole reason.
 
 What the script does with them, if you want the same thing in your own
 `wardex.init()`:
