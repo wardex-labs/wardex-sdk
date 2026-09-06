@@ -135,8 +135,8 @@ Phoenix's: it assigns AGENT / LLM / TOOL from the OpenTelemetry `gen_ai.*`
 attributes itself, and `invoke_workflow` and `handoff`, which have no
 OpenInference kind, get its chip for "no kind", which reads `unknown`.
 That is a label, not an error. Click a `chat` span to see the request and
-response messages and the token counts read from the wire (the `449` next
-to each one is Phoenix's total-token chip), and the `execute_tool` span to
+response messages and the token counts read from the wire (the number next
+to each `chat` row is Phoenix's total-token chip), and the `execute_tool` span to
 see the arguments and the tool's return value.
 
 ## openai-agents → Langfuse
