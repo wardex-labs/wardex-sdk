@@ -70,8 +70,8 @@ check, which runs pytest — so after editing it, run it once more under
 ```bash
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
-uv run ruff check sdks/python
-uv run ruff format --check sdks/python
+uv run ruff check sdks/python examples
+uv run ruff format --check sdks/python examples
 buf lint
 ```
 

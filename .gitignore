@@ -10,6 +10,8 @@ __pycache__/
 .venv/
 # scripts/check-py310.sh keeps the 3.10 floor environment beside `.venv`
 .venv-py310/
+# examples/README.md has readers create this one beside `.venv`, not in its place
+.venv-quickstart/
 .env
 *.egg-info/
 dist/

@@ -86,8 +86,8 @@ jobs:
       - name: uv sync (builds wardex_sdk via maturin)
         run: uv sync --python ${{ matrix.python-version }}
       - name: ruff check
-        run: uv run ruff check sdks/python
+        run: uv run ruff check sdks/python examples
       - name: ruff format --check
-        run: uv run ruff format --check sdks/python
+        run: uv run ruff format --check sdks/python examples
       - name: pytest
         run: uv run pytest sdks/python/tests -v

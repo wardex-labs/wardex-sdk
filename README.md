@@ -37,6 +37,72 @@ by the default exporter. With `WARDEX_ENDPOINT` set in the environment, a bare
 `wardex.init()` is a working first run — see
 [Environment variables](#environment-variables).
 
+## Works with openai-agents
+
+Install wardex next to the OpenAI Agents SDK, set one environment variable,
+and every `Runner.run` / `run_sync` / `run_streamed` becomes one trace with
+the agents, the tool calls and the handoffs in it — no decorator, no
+callback, no processor to register. The framework's own tracing hooks give
+wardex the structure; the LLM calls underneath are read from the wire, so
+model, messages and token usage are the ones that actually crossed the
+socket, and the tool `call_id` the framework echoes into the next turn joins
+each `execute_tool` span to the `chat` span that requested it.
+
+From a checkout of this repository (the example script is not in the
+wheel), on Python 3.10 or newer, with a Phoenix started as in
+[`examples/README.md`](examples/README.md):
+
+```bash
+git clone https://github.com/wardex-labs/wardex-sdk && cd wardex-sdk
+python3 -m venv .venv-quickstart && source .venv-quickstart/bin/activate
+pip install "wardex-sdk>=0.6.0b1" openai-agents          # prebuilt wheel, nothing to compile
+export OPENAI_API_KEY=sk-...                             # the framework's own requirement
+export WARDEX_ENDPOINT=http://127.0.0.1:6006/v1/traces   # a local Phoenix
+python examples/openai_agents_quickstart.py
+```
+
+The adapter ships in 0.6.0b1. If `pip` cannot find that version, your
+checkout is ahead of the last PyPI release: `pip install ./sdks/python
+openai-agents` builds it from the checkout instead (needs cargo, and the
+build reports the checkout's own, lower, version number — expected). The
+script makes six short `gpt-4o-mini` calls against
+your key. Measured from a fresh clone and virtualenv following the
+walkthrough, Phoenix image already pulled: under a minute in the terminal,
+18 seconds of it the from-checkout build. That is the measured part; the
+clicks in Phoenix to the tree below add an estimated half-minute on top,
+paced by hand rather than clocked.
+
+<!-- Absolute URL on purpose: this file is also the PyPI long description
+     (readme = "README.md" in sdks/python/pyproject.toml), where a relative
+     image path renders as a broken link. The trade-off is that the image
+     404s on branches and in PR views until the PNG is on main. -->
+![Phoenix showing one openai-agents run: invoke_workflow travel_concierge → invoke_agent concierge (chat, execute_tool lookup_weather, chat, handoff concierge→booking_agent) and its sibling invoke_agent booking_agent (chat)](https://raw.githubusercontent.com/wardex-labs/wardex-sdk/main/examples/openai-agents-phoenix.png)
+
+The receiving agent of a handoff is the sender's **sibling**, not its
+child, so a long handoff chain stays one level deep; `wardex.agent.parent`
+and a `handoff_from` link record who handed off to whom. Phoenix draws that
+indentation only once its trace drawer is widened — the walkthrough in
+[`examples/README.md`](examples/README.md) says where to click and what to
+drag, covers Langfuse, and explains the framework's own `[non-fatal]
+Tracing client error 401` line if you see one.
+
+Two cases where you do **not** get that tree, and what wardex says instead:
+
+- **Responses over WebSocket** (`use_responses_websocket=True`). The LLM
+  calls are inside WebSocket frames wardex does not parse, so the `chat`
+  spans are replaced by one `WS /v1/responses` span per connection carrying
+  the marker `ws_llm_semantics_unread` — no model, tokens or messages. The
+  agent, tool and handoff spans are unaffected. Use the framework's default
+  HTTP transport for `chat` spans.
+- **Framework tracing disabled** (`OPENAI_AGENTS_DISABLE_TRACING=1` or
+  `agents.set_tracing_disabled(True)`). There is nothing for the adapter to
+  hook, so you get the `chat` spans only, unparented, and one INFO log line
+  (on stderr under default logging) at `wardex.init()`: `[wardex]
+  openai-agents tracing is disabled, so wardex will show only the LLM calls
+  its interceptor captures: no agent, handoff, tool or guardrail spans. …`
+  — followed by the two lines that re-enable the framework's tracing without
+  sending anything to OpenAI. wardex never flips that setting for you.
+
 ## Configuration
 
 Settings are grouped by concern, and the group names are the same in every
@@ -648,7 +714,9 @@ diagnostic line (traceback under `debug=True`).
   replace it. For the structure without that upload, IN THIS ORDER:
   `agents.set_trace_processors([])` and THEN `wardex.init()` (the reverse
   order removes wardex's processor too). `RunConfig(workflow_name=…)` names
-  the root; the default is `Agent workflow`. Known limitations: the wire
+  the root; the default is `Agent workflow`. Runnable end to end in
+  [`examples/openai_agents_quickstart.py`](examples/openai_agents_quickstart.py)
+  (see [Works with openai-agents](#works-with-openai-agents)). Known limitations: the wire
   `chat` spans carry no `gen_ai.agent.name` — filter by walking up the tree
   to the `invoke_agent` span; a Responses-over-WebSocket run stays the
   counted, marked connection (`ws_llm_semantics_unread`) with no structure

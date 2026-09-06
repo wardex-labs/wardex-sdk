@@ -15,8 +15,8 @@ uv run pytest sdks/python/tests -v
 ```bash
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
-uv run ruff check sdks/python
-uv run ruff format --check sdks/python
+uv run ruff check sdks/python examples
+uv run ruff format --check sdks/python examples
 buf lint
 scripts/check-py310.sh   # if you touched anything under sdks/python
 ```
