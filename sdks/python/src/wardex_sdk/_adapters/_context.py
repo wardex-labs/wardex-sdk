@@ -609,7 +609,10 @@ class AdapterContext:
         # and a WeakKeyDictionary mutated under a copy raises RuntimeError
         # on 3.10-3.13, which the registry's guard swallowed before the
         # sweep reached `close_all`: every open unit stranded, unmarked.
-        self._slots_lock = threading.Lock()
+        # REENTRANT: a reattached trace's end arrives through a weakref
+        # finalizer, which runs wherever a reference count reaches zero --
+        # possibly on this very thread while a slot call holds the lock.
+        self._slots_lock = threading.RLock()
         # A READER, not a tuple. `AdapterRegistry.install` builds this context
         # BEFORE it calls `adapter.install()`, and an adapter can only import its
         # framework's error classes in there — so a tuple taken here is `()` for
@@ -638,7 +641,7 @@ class AdapterContext:
         """
         self.patches._at_fork_reinit()
         # Replaced, never acquired: the parent may have held it at the fork.
-        self._slots_lock = threading.Lock()
+        self._slots_lock = threading.RLock()
         self._slots.clear()
 
     @property
