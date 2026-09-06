@@ -142,6 +142,23 @@ def test_a_uuid_conversation_id_and_a_none_turn_index_export_cleanly():
         ConversationContext(conversation_id="c", turn_index="three")
 
 
+def test_a_none_or_empty_conversation_id_is_refused_at_the_hosts_line():
+    """The id is what a backend groups by. `None` and `""` used to be
+    `str()`-coerced into the id "None" or rejected at export, one batch
+    later; both are a `ValueError` at the constructor now. A uuid or an
+    integer key is still coerced to its text."""
+    import uuid
+
+    from wardex_sdk._types import ConversationContext
+
+    for bad in (None, ""):
+        with pytest.raises(ValueError, match="conversation_id"):
+            ConversationContext(conversation_id=bad)
+    u = uuid.uuid4()
+    assert ConversationContext(conversation_id=u).conversation_id == str(u)
+    assert ConversationContext(conversation_id=7).conversation_id == "7"
+
+
 def test_a_score_value_the_marshaller_cannot_read_is_named_not_fatal():
     """`"0.9"` is a score, by `float()`'s rule at the constructor and by the
     marshaller's when the constructor was bypassed; `"high"` is a

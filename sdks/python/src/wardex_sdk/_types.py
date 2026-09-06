@@ -165,10 +165,13 @@ class ConversationContext:
 
     The id is coerced to `str` at construction: a host hands `uuid.uuid4()` or
     an integer session key here as naturally as a string, and the text is what
-    a backend groups by either way. `turn_index=None` reads as the default
-    (absent); any other non-integer is a `TypeError` at the host's own line,
-    which is where a wrong type belongs -- not raised out of the exporter
-    later, where it would cost the whole batch instead of one call.
+    a backend groups by either way. `None` and `""` are a `ValueError` here
+    instead -- coerced, `None` became the id "None" that every such session
+    would share, and `""` was rejected one batch later at export. `turn_index=None`
+    reads as the default (absent); any other non-integer is a `TypeError` at
+    the host's own line, which is where a wrong type belongs -- not raised out
+    of the exporter later, where it would cost the whole batch instead of one
+    call.
     """
 
     conversation_id: str  # gen_ai.conversation.id
@@ -176,8 +179,11 @@ class ConversationContext:
     turn_index: int = 0
 
     def __post_init__(self) -> None:
-        if not isinstance(self.conversation_id, str):
-            object.__setattr__(self, "conversation_id", str(self.conversation_id))
+        ident = self.conversation_id
+        if ident is None or ident == "":
+            raise ValueError("conversation_id must be a non-empty id, not None or ''")
+        if not isinstance(ident, str):
+            object.__setattr__(self, "conversation_id", str(ident))
         if self.session_id is not None and not isinstance(self.session_id, str):
             object.__setattr__(self, "session_id", str(self.session_id))
         turn = self.turn_index
