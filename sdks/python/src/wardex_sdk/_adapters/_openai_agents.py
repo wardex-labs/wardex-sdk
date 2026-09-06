@@ -1394,6 +1394,9 @@ def _guardrail_start(adapter: OpenAIAgentsAdapter, run: dict[str, Any], span: An
     entry = ctx.slot(span)
     entry["handle"] = h
     entry["name"] = name
+    # The exception the HOST is already handling when the guardrail opens, so
+    # the end can tell the host's from the guardrail's own (see there).
+    entry["host_inflight"] = sys.exc_info()[1]
     _pin(adapter, h, driver, name)
 
 
@@ -1415,7 +1418,14 @@ def _guardrail_end(adapter: OpenAIAgentsAdapter, run: dict[str, Any], span: Any)
     # unset (the error goes to the agent). This callback runs inside the
     # span's `__exit__`, where that exception is the one being handled, so
     # `sys.exc_info()` is the ONLY evidence that no verdict was rendered.
+    # It is also where the HOST's own in-flight exception shows up: a run
+    # driven from inside a synchronous `except` block carries that exception
+    # through `asyncio.run` and `Task.__step` into every span's `__exit__`.
+    # It was already in flight when the guardrail OPENED (snapshotted on the
+    # entry), so only a DIFFERENT exception object is the guardrail's own.
     inflight = sys.exc_info()[1]
+    if inflight is not None and inflight is entry.get("host_inflight"):
+        inflight = None
     if triggered:
         h.draft.set_evaluation(EvaluationAttributes(name=name, score_label="tripwire"))
         h.draft.set_extra("wardex.evaluation.triggered", True)

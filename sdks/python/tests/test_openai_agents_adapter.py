@@ -1845,6 +1845,38 @@ def test_a_guardrail_whose_body_raises_is_an_error_not_a_pass(agents_env, scenar
     assert evaluate.parent_span_id == _one(spans, "invoke_agent agent_a").context.span_id
 
 
+def test_a_passing_guardrail_inside_a_hosts_except_block_is_a_pass(agents_env, scenario):
+    """The host's OWN in-flight exception is not the guardrail's. A run driven
+    from inside a synchronous `except` block — retry-on-error is the common
+    shape — carries that exception through `asyncio.run` and `Task.__step`
+    into the guardrail span's `__exit__`, where `sys.exc_info()` reports it as
+    the exception being handled. A verdict WAS rendered: the span is a pass,
+    not an ERROR named after the host's exception class."""
+    from agents import GuardrailFunctionOutput, input_guardrail
+
+    @input_guardrail
+    async def fine(ctx, agent, inp):  # noqa: ANN001, ANN202
+        return GuardrailFunctionOutput(output_info=None, tripwire_triggered=False)
+
+    scenario(_decide_single)
+    agent = Agent(name="agent_a", instructions="a", input_guardrails=[fine], model="gpt-4o-mini")
+    _init()
+    try:
+        try:
+            raise KeyError("primary path failed")
+        except KeyError:
+            assert Runner.run_sync(agent, "hi").final_output == "done"
+        spans = _spans()
+        assert counters.get("adapters.openai_agents.guardrail_failed") == 0
+        assert counters.get("adapters.openai_agents.guardrail_interrupted") == 0
+    finally:
+        wardex.close()
+    evaluate = _one(spans, "evaluate fine")
+    assert (evaluate.status, evaluate.error_type) == (StatusCode.OK, None)
+    assert evaluate.evaluation.score_label == "pass"
+    assert _extra(evaluate)["wardex.evaluation.triggered"] is False
+
+
 # --------------------------------------------------------------------------
 # MCP list-tools
 # --------------------------------------------------------------------------
