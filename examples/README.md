@@ -26,17 +26,20 @@ git clone https://github.com/wardex-labs/wardex-sdk
 cd wardex-sdk
 ```
 
-**How long it takes.** Measured on 2026-09-06 by following exactly the
-steps below from a fresh clone and virtualenv, with the Phoenix image
-already pulled and pip's and cargo's caches warm: 41 seconds in the
-terminal, 34 of them the from-checkout install under step 2, plus the four
-clicks and one drag in the UI — about 25 seconds at human pace, 5 when
-scripted — so a little over a minute to the tree on screen. Two things
-happen only once and are not in that number: the first `docker run` pulls
-the Phoenix image (1.1 GB — a few minutes on a typical connection, and the
-longest step of a first setup), and a cold Rust build on the from-checkout
-path takes minutes rather than 34 seconds; the PyPI wheel skips the build
-altogether.
+**How long it takes.** Measured on 2026-09-06 by a second person following
+exactly the steps below, from a fresh virtualenv, with the Phoenix image
+already pulled and pip's and cargo's caches warm: 47 seconds in the
+terminal — 18 of them the from-checkout install under step 2, 4 the run
+itself, and 22 finding the trace and reading all eight spans back — so
+well under a minute to the tree, and about a minute with the four clicks
+and one drag in the UI (roughly 25 seconds at human pace; that part was
+estimated, not clocked, in the second measurement). The model round-trips
+in that run were local, so a real `gpt-4o-mini` adds its own latency for
+the six calls. Two things happen only once and are not in that number:
+the first `docker run` pulls the Phoenix image (1.1 GB — a few minutes on
+a typical connection, and the longest step of a first setup), and a cold
+Rust build on the from-checkout path takes minutes rather than 18
+seconds; the PyPI wheel skips the build altogether.
 
 **1. Start Phoenix.**
 

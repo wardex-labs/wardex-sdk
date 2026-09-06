@@ -235,10 +235,15 @@ All notable changes to this project are documented here. The format follows
   cases where it is not what you get (Responses over WebSocket →
   `ws_llm_semantics_unread`; framework tracing disabled → `chat` spans only
   plus one stderr line). Timed from a fresh clone and virtualenv following
-  the walkthrough alone, Phoenix image already pulled: 41 seconds in the
-  terminal (34 of them the from-checkout build) plus about 25 seconds of
-  clicking to the tree on screen — the ten-minute bar this SDK sets for a
-  first view is met with room to spare; the one-time costs it leaves out
+  the walkthrough alone, Phoenix image already pulled: 47 seconds in the
+  terminal (18 of them the from-checkout build, model round-trips local)
+  plus about 25 seconds of clicking to the tree on screen — the ten-minute
+  bar this SDK sets for a first view is met with room to spare; the
+  walkthrough also states what the run costs, that the framework uploads
+  the transcript to OpenAI by default and the switch that stops it, and
+  the `docker ps` port check that tells a published Phoenix from a
+  container `docker start` brought up without its port. The one-time costs
+  the number leaves out
   are the 1.1 GB Phoenix image pull and a cold Rust build on the
   from-source path documented until this version reaches PyPI. The
   `examples/` directory is linted like the SDK source: the root
