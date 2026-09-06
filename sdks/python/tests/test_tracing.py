@@ -257,6 +257,20 @@ def test_conversation_uses_an_explicit_id_verbatim():
     assert inner.conversation.conversation_id == "chat-777"
 
 
+def test_conversation_mints_an_id_for_the_empty_string():
+    """`id=""` reads as "no id" exactly like `id=None`: a host that forwards an
+    unset session field must not see a ValueError raised out of its own
+    `with` line, and the spans inside must not ship an empty conversation id."""
+    t = _setup()
+    with conversation("turn", id=""):
+        with span("inner"):
+            pass
+    _hub.get_client().flush()
+    inner = next(sp for sp in t.envelopes[0].spans if sp.name == "inner")
+    assert inner.conversation is not None
+    assert inner.conversation.conversation_id != ""
+
+
 def test_conversation_joins_the_ambient_trace_as_a_child():
     """The reason it is not called "trace": no new trace_id is minted here."""
     t = _setup()
