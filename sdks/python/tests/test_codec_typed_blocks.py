@@ -255,3 +255,23 @@ def test_every_block_the_vocabulary_declares_has_a_marshal_site():
     # And an empty `documents` -- the dataclass default -- is not a fact.
     out = _codec.decode(_codec.encode(_env(_span(retrieval=RetrievalAttributes()))))
     assert "gen_ai.retrieval.documents" not in _extra_dict(out["items"][0]["span"])
+
+
+def test_retrieval_documents_given_as_text_reach_the_wire_as_bytes():
+    """`documents` is declared `bytes` and documented as JSON, and JSON is
+    what a host has as a `str`. A string is encoded UTF-8 at the constructor;
+    with the constructor bypassed, the marshaller reads the string itself
+    rather than refusing the span. Both routes carry the same bytes."""
+    from wardex_sdk._types import RetrievalAttributes
+
+    r = RetrievalAttributes(documents='[{"id": 1}]')
+    assert r.documents == b'[{"id": 1}]'
+    out = _codec.decode(_codec.encode(_env(_span(retrieval=r))))
+    assert _extra_dict(out["items"][0]["span"])["gen_ai.retrieval.documents"] == b'[{"id": 1}]'
+
+    raw = _unchecked(RetrievalAttributes, data_source_id="db", query_text=None, documents="[]x")
+    out = _codec.decode(_codec.encode(_env(_span(retrieval=raw))))
+    extra = _extra_dict(out["items"][0]["span"])
+    assert extra["gen_ai.retrieval.documents"] == b"[]x"
+    assert extra["gen_ai.data_source.id"] == "db"
+    assert "wardex.codec.unmarshalled" not in extra

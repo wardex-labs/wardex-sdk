@@ -218,9 +218,18 @@ class ToolDefinitionSet:
 
 @dataclass(frozen=True, slots=True)
 class RetrievalAttributes:
+    """`documents` is JSON, and JSON is what a host holds as a `str`: a
+    string is encoded UTF-8 at the constructor, so the field a backend reads
+    is the bytes it was declared as. The marshaller reads a string on its own
+    as well, for a value that reached it by a route that skipped `__init__`."""
+
     data_source_id: str | None = None  # gen_ai.data_source.id
     query_text: str | None = None  # gen_ai.retrieval.query.text (opt-in PII)
     documents: bytes = b""  # gen_ai.retrieval.documents (opt-in, JSON)
+
+    def __post_init__(self) -> None:
+        if isinstance(self.documents, str):
+            object.__setattr__(self, "documents", self.documents.encode("utf-8"))
 
 
 @dataclass(frozen=True, slots=True)

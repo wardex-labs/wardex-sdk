@@ -327,7 +327,13 @@ fn flatten_retrieval(r: &Bound<PyAny>, out: &mut Vec<pb::KeyValue>) -> PyResult<
         }
     }
     if let Some(v) = opt(r, "documents")? {
-        let docs: Vec<u8> = v.extract()?;
+        // A `str` that skipped the dataclass's own coercion is read as its
+        // UTF-8 rather than refused: the field is documented as JSON, and a
+        // refusal here used to cost the whole span.
+        let docs: Vec<u8> = match v.extract::<Vec<u8>>() {
+            Ok(b) => b,
+            Err(_) => v.extract::<String>()?.into_bytes(),
+        };
         if !docs.is_empty() {
             out.push(kv_bytes("gen_ai.retrieval.documents", docs));
         }
