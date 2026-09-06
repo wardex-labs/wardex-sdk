@@ -19,25 +19,43 @@ OpenAI API key, a checkout of this repository — the example script is not
 part of the wheel — and, only until wardex-sdk 0.6.0b1 is on PyPI, a
 [Rust toolchain](https://rustup.rs) (`cargo --version`), because the
 install in step 2 then builds the native module from the checkout instead
-of downloading a prebuilt wheel. The walkthrough assumes a fresh clone:
+of downloading a prebuilt wheel. Without cargo that install does not stop
+with a missing-prerequisite message: it runs for a while and then fails as
+a build error many lines deep in pip's output, ending in
+
+```
+💥 maturin failed
+  Caused by: Cargo metadata failed. Do you have cargo in your PATH?
+  Caused by: No such file or directory (os error 2)
+```
+
+which names maturin — the build backend — rather than wardex, and is easy
+to read as a broken package. It is not: install the Rust toolchain from
+the rustup link above, open a new shell so `cargo --version` answers, and
+run the same `pip install` again. The walkthrough assumes a fresh clone:
 
 ```bash
 git clone https://github.com/wardex-labs/wardex-sdk
 cd wardex-sdk
 ```
 
-**How long it takes.** Measured on 2026-09-06 by a second person following
-exactly the steps below, from a fresh virtualenv, with the Phoenix image
-already pulled and pip's and cargo's caches warm: 47 seconds in the
-terminal — 18 of them the from-checkout install under step 2, 4 the run
-itself, and 22 finding the trace and reading all eight spans back — so
-well under a minute to the tree, and about a minute with the four clicks
-and one drag in the UI (roughly 25 seconds at human pace; that part was
-estimated, not clocked, in the second measurement). The model round-trips
-in that run were local, so a real `gpt-4o-mini` adds its own latency for
-the six calls. Two things happen only once and are not in that number:
-the first `docker run` pulls the Phoenix image (1.1 GB — a few minutes on
-a typical connection, and the longest step of a first setup), and a cold
+Every command below that one is run **from the repository root** — the
+virtualenv, `pip install ./sdks/python` and `python examples/...` are all
+written relative to it, so `cd` back here if you wander off.
+
+**How long it takes.** Measured in a second run-through of exactly the
+steps below, from a fresh virtualenv, with the Phoenix image already
+pulled and pip's and cargo's caches warm: 47 seconds in the terminal — 18
+of them the from-checkout install under step 2, 4 the run itself, and 22
+finding the trace and reading all eight spans back — so well under a
+minute to the tree, and about a minute once the four clicks and one drag
+in the UI are added. Those clicks are an estimate of roughly 25 seconds at
+human pace, not a clocked number; every terminal figure above is
+measured. The model round-trips in that run were local, so a real
+`gpt-4o-mini` adds its own latency for the six calls. Two things happen
+only once and are not in that number: the first `docker run` pulls the
+Phoenix image (1.1 GB — a few minutes on a typical connection, and the
+longest step of a first setup), and a cold
 Rust build on the from-checkout path takes minutes rather than 18
 seconds; the PyPI wheel skips the build altogether.
 
@@ -56,19 +74,35 @@ docker ps --filter name=phoenix --format '{{.Names}}  {{.Status}}  {{.Ports}}'
 # wardex-phoenix  Up 20 seconds  0.0.0.0:6006->6006/tcp, [::]:6006->6006/tcp
 ```
 
-The `0.0.0.0:6006->6006/tcp` part is the one that matters: it is what
-makes `localhost:6006` reach *this* container. Two things can go wrong
-here, and they compose badly, so read both before typing:
+What matters in that last column is the `0.0.0.0:<your host port>->6006/tcp`
+shape: the right-hand number is always 6006 (the port inside the
+container), while the left-hand one is whatever you passed to `-p` — 6006
+above, but 6007 if you took the port-conflict advice below, in which case
+the line reads `0.0.0.0:6007->6006/tcp, [::]:6007->6006/tcp` instead. That
+mapping is what makes `localhost:<your host port>` reach *this* container.
+Three things can go wrong here, and they compose badly, so read all three
+before typing:
+
+- `docker run` fails with `The container name "/wardex-phoenix" is already
+  in use`: **this is the first failure most machines hit**, before any port
+  error, because a container of that name is left over — from an earlier
+  walkthrough, or from a `docker run` that failed on the port below and
+  left the container behind in `Created` state. Nothing is listening and
+  nothing is wrong with your setup; the name is simply taken. Delete it and
+  re-run the `docker run` line above unchanged:
+
+  ```bash
+  docker rm wardex-phoenix        # docker rm -f … if it is still running
+  ```
 
 - `docker run` fails with `Bind for 0.0.0.0:6006 failed: port is already
   allocated`: something else — usually another Phoenix — already listens
   on 6006, and `docker ps` shows which. Either use that one as it is (it
   is a Phoenix; the URL below is the same), or publish this one on another
   port (`-p 6007:6006`) and replace `6006` with `6007` in every URL below.
-  The failed `docker run` leaves a container named `wardex-phoenix` behind
-  in `Created` state, which is why the *same* command fails a second time
-  with `The container name "/wardex-phoenix" is already in use` — remove it
-  with `docker rm wardex-phoenix` before running it again.
+  This failure is also what plants the leftover `Created` container that
+  produces the name conflict above, so the next attempt needs the
+  `docker rm` first.
 - **Do not `docker start` that leftover container.** `docker start
   wardex-phoenix` reports success and Phoenix logs "up and running", but
   `docker ps` shows the port as a bare `6006/tcp` with no `0.0.0.0:6006->`
@@ -156,6 +190,30 @@ calls `agents.set_trace_processors([])` **before** `wardex.init()`, which is
 the order that matters — after it, the same call removes wardex's processor
 too. (That switch belongs to the example script, not to wardex; wardex never
 changes the framework's settings on its own.)
+
+**Confirm the export without a browser.** Step 4 below is a UI walk; on a
+headless box, over SSH, or in CI there is a shorter answer to the only
+question that matters — did the spans arrive. Phoenix has a REST API on
+the same port, and files a run that carries no project name under
+`default`:
+
+```bash
+curl -s http://127.0.0.1:6006/v1/projects
+# {"data":[{"name":"default","description":"Default project","id":"UHJvamVjdDox"}],"next_cursor":null}
+
+curl -s 'http://127.0.0.1:6006/v1/projects/default/spans?limit=100' | python3 -c \
+  'import json,sys; d=json.load(sys.stdin)["data"]; print(len(d), "spans", len({s["context"]["trace_id"] for s in d}), "traces")'
+# 16 spans 2 traces
+```
+
+One run of the script is **16 spans across 2 traces**: the eight-span tree
+shown below, once for `Runner.run` and once for `Runner.run_streamed`. A
+Phoenix that has already taken earlier runs counts those too, and the
+`limit=100` above caps one page, so a long-lived one stops at `100 spans`;
+that exact pair of numbers is what a container started fresh for this
+walkthrough prints. `0 spans 0 traces`, an empty project list, or a
+refused connection means nothing was exported — re-read the
+`WARDEX_ENDPOINT` line in step 3 and the port check in step 1.
 
 **4. Look at the tree.**
 
