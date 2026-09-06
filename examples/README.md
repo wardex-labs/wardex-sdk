@@ -45,19 +45,23 @@ written relative to it, so `cd` back here if you wander off.
 
 **How long it takes.** Measured in a second run-through of exactly the
 steps below, from a fresh virtualenv, with the Phoenix image already
-pulled and pip's and cargo's caches warm: 47 seconds in the terminal — 18
-of them the from-checkout install under step 2, 4 the run itself, and 22
-finding the trace and reading all eight spans back — so well under a
-minute to the tree, and about a minute once the four clicks and one drag
-in the UI are added. Those clicks are an estimate of roughly 25 seconds at
-human pace, not a clocked number; every terminal figure above is
-measured. The model round-trips in that run were local, so a real
-`gpt-4o-mini` adds its own latency for the six calls. Two things happen
-only once and are not in that number: the first `docker run` pulls the
-Phoenix image (1.1 GB — a few minutes on a typical connection, and the
-longest step of a first setup), and a cold
-Rust build on the from-checkout path takes minutes rather than 18
-seconds; the PyPI wheel skips the build altogether.
+pulled and pip's and cargo's caches warm, on a checkout ahead of the last
+PyPI release — so the measurement includes step 2's fallback: 47 seconds
+in the terminal — 2 of them creating the virtualenv, 1 the `pip install`
+from PyPI failing to find the version, 18 the from-checkout install it
+falls back to, 4 the run itself, and 22 finding the trace and reading all
+eight spans back — so well under a minute in the terminal, and about a
+minute once the four clicks and one drag in the UI are added. Those clicks
+are an estimate of roughly 25 seconds at human pace, not a clocked number;
+every terminal figure above is measured. A reader whose `pip install`
+finds the wheel on PyPI pays neither of those first two install figures
+nor the build behind them. The model round-trips in that run were local,
+so a real `gpt-4o-mini` adds its own latency for the six calls. Two things
+happen only once and are not in that number: the first `docker run` pulls
+the Phoenix image (1.1 GB — a few minutes on a typical connection, and the
+longest step of a first setup), and a cold Rust build on the from-checkout
+path takes minutes rather than 18 seconds; the prebuilt wheel skips the
+build altogether.
 
 **1. Start Phoenix.**
 
