@@ -111,8 +111,22 @@ and the next step proves it.
 ```bash
 export OPENAI_API_KEY=sk-...                            # the framework's own requirement
 export WARDEX_ENDPOINT=http://127.0.0.1:6006/v1/traces  # the only wardex variable
+export EXAMPLE_NO_OPENAI_UPLOAD=1                       # optional: keep the run record off OpenAI's dashboard
 python examples/openai_agents_quickstart.py
 ```
+
+**What it costs.** The script makes six Responses API calls against your
+key — three turns per run, two runs — all on `gpt-4o-mini` with a
+one-sentence prompt, so a few thousand tokens in total: a fraction of a
+cent at that model's list price. If one tree is enough, delete the
+`Runner.run_streamed` half of `main()` and you pay for three.
+
+**Where the transcript goes.** By default, openai-agents also uploads its
+own record of every run — including the prompt and the model's replies —
+to OpenAI's trace dashboard, independently of wardex. That is the
+framework's default, not wardex's, and the third line above turns it off
+for this script (details under the `401` note below). Decide that before
+the first run rather than after it; it is not a troubleshooting step.
 
 `WARDEX_ENDPOINT` is the full OTLP traces URL; Phoenix listens on
 `/v1/traces`. (A bare `http://127.0.0.1:6006` also works — an endpoint
@@ -133,8 +147,8 @@ that is the framework, not wardex, and not a failure of this quickstart:
 openai-agents uploads its own record of every run to OpenAI's trace
 dashboard at `api.openai.com`, and a key that dashboard refuses gets a 401
 the framework itself labels non-fatal. wardex exported to Phoenix, not to
-OpenAI, so the tree is complete either way. To keep the run record off
-OpenAI altogether, run with `EXAMPLE_NO_OPENAI_UPLOAD=1`; the script then
+OpenAI, so the tree is complete either way. With `EXAMPLE_NO_OPENAI_UPLOAD=1`
+set, as in the block above, the line does not appear at all: the script
 calls `agents.set_trace_processors([])` **before** `wardex.init()`, which is
 the order that matters — after it, the same call removes wardex's processor
 too. (That switch belongs to the example script, not to wardex; wardex never
