@@ -1998,6 +1998,15 @@ def _close_mid_run_then_run_again(*, close_from: str) -> list[Any]:
         return _spans()
     finally:
         wardex.close()
+        if close_from != "main":
+            # The strand this case makes ON PURPOSE has the main thread as
+            # its carrier, so it outlives the test and every later test on
+            # this thread would read a dead unit's scope. Retire it by hand,
+            # the way the harness retires a scope between tests.
+            from wardex_sdk._assembly._units import _ambient_unit
+
+            _ambient_unit.set(None)
+            _hub.reset_for_test()
 
 
 @pytest.mark.parametrize("close_from", ["main", "worker_thread"])
