@@ -1,5 +1,7 @@
 """Adapter registry + config-driven activation tests."""
 
+import logging
+from typing import Any
 from unittest import mock
 
 import pytest
@@ -32,6 +34,15 @@ class _FakeAdapter(AdapterInterface):
 
     def uninstall(self) -> None:
         self.uninstalled += 1
+
+
+class _FakeLangGraph(_FakeAdapter):
+    """A fake under a SHIPPED adapter's name: the registry probes rows by
+    `adapter.name()`, so this one is held to the framework probe while
+    `_FakeAdapter` ("fake", no row) is not."""
+
+    def name(self) -> str:
+        return "langgraph"
 
 
 class _BrokenInstallAdapter(AdapterInterface):
@@ -137,7 +148,6 @@ def test_auto_detection_installs_when_package_present():
     get_registry().uninstall_all()
     with (
         mock.patch("wardex_sdk._adapters._detect_package", return_value=True),
-        mock.patch("wardex_sdk._adapters._probe_row", return_value=True),
         mock.patch("wardex_sdk._adapters._make_adapter") as make,
     ):
         make.return_value = _FakeAdapter()
@@ -164,7 +174,6 @@ def test_empty_tuple_disables_all():
     get_registry().uninstall_all()
     with (
         mock.patch("wardex_sdk._adapters._detect_package", return_value=True),
-        mock.patch("wardex_sdk._adapters._probe_row", return_value=True),
         mock.patch("wardex_sdk._adapters._make_adapter") as make,
     ):
         install_configured_adapters(None, _config(()))
@@ -175,7 +184,6 @@ def test_explicit_tuple_installs_even_without_detection():
     get_registry().uninstall_all()
     with (
         mock.patch("wardex_sdk._adapters._detect_package", return_value=False),
-        mock.patch("wardex_sdk._adapters._probe_row", return_value=True),
         mock.patch("wardex_sdk._adapters._make_adapter") as make,
     ):
         make.return_value = _FakeAdapter()
@@ -192,7 +200,6 @@ def test_broken_adapter_install_does_not_break_init():
     get_registry().uninstall_all()
     with (
         mock.patch("wardex_sdk._adapters._detect_package", return_value=True),
-        mock.patch("wardex_sdk._adapters._probe_row", return_value=True),
         mock.patch("wardex_sdk._adapters._make_adapter") as make,
     ):
         make.return_value = _BrokenInstallAdapter()
@@ -201,30 +208,119 @@ def test_broken_adapter_install_does_not_break_init():
     get_registry().uninstall_all()
 
 
-def test_a_shadowed_framework_is_declined_before_its_adapter_is_built():
-    """The probe runs in FRONT of `row.build()`, for every row and on both
-    the auto-detected and the `enabled=` path: a project-local package of
-    the framework's name never has its body executed by an adapter's
-    install-time import, and the decline is said once and counted under the
-    adapter's own name."""
-    from wardex_sdk._adapters._probe import Probe
+def _quiet() -> tuple[Any, ...]:  # noqa: ANN401
     from wardex_sdk._assembly import counters
     from wardex_sdk._assembly._diag import reset_reports_for_test
 
     reset_reports_for_test()
     counters.reset()
     get_registry().uninstall_all()
+    return (counters,)
+
+
+class _Lines(logging.Handler):
+    def __init__(self) -> None:
+        super().__init__(level=logging.DEBUG)
+        self.records: list[logging.LogRecord] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.records.append(record)
+
+    def warnings(self) -> list[str]:
+        return [r.getMessage() for r in self.records if r.levelno == logging.WARNING]
+
+
+@pytest.fixture
+def wardex_lines():
+    logger = logging.getLogger("wardex_sdk")
+    handler = _Lines()
+    logger.addHandler(handler)
+    level = logger.level
+    logger.setLevel(logging.DEBUG)
+    try:
+        yield handler
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(level)
+
+
+def test_a_shadowed_framework_is_declined_before_its_adapter_installs():
+    """The probe runs ONCE, in `AdapterRegistry.install`, in front of
+    `adapter.install()` — the step that imports the framework — for every
+    way in (the auto-detected path, the `enabled=` path, and
+    `testing.installed_adapter`): a project-local package of the framework's
+    name never has its body executed by an adapter's install-time import,
+    and the decline is said once and counted under the adapter's own name.
+    Building the adapter OBJECT imports nothing of the host's, which is the
+    doctrine every adapter module keeps (its framework import lives inside
+    `install()`)."""
+    from wardex_sdk._adapters._probe import Probe
+
+    (counters,) = _quiet()
     shadowed = Probe("shadowed", "/app/langgraph", "/site/langgraph")
+    fakes = []
     for enabled in (None, (AdapterName.LANGGRAPH,)):
+        fake = _FakeLangGraph()
+        fakes.append(fake)
         with (
-            mock.patch("wardex_sdk._adapters._detect_package", return_value=True),
+            # Only langgraph is detected: `_make_adapter` answers this one fake
+            # for whatever name it is asked, so a detection of every row would
+            # probe the same adapter three times on the auto path.
+            mock.patch("wardex_sdk._adapters._detect_package", side_effect="langgraph".__eq__),
             mock.patch("wardex_sdk._adapters.probe", return_value=shadowed),
-            mock.patch("wardex_sdk._adapters._make_adapter") as make,
+            mock.patch("wardex_sdk._adapters._make_adapter", return_value=fake),
         ):
             install_configured_adapters(None, _config(enabled))
-            make.assert_not_called()
+    assert [f.installed for f in fakes] == [0, 0]
     assert counters.get("adapters.langgraph.shadowed") == 2
     assert not get_registry().is_installed("langgraph")
+
+
+def test_an_explicitly_enabled_adapter_installs_without_package_metadata(wardex_lines):
+    """`enabled=` NAMES the framework; a host that ships it without dist-info
+    (a PyInstaller bundle without `copy_metadata`, a vendored checkout on
+    `PYTHONPATH`) still gets the adapter — the previous release's
+    behaviour. The shadow check cannot run without a distribution, so the
+    install is said once as a warning and counted, never silent."""
+    from wardex_sdk._adapters._probe import Probe
+
+    (counters,) = _quiet()
+    fake = _FakeLangGraph()
+    with (
+        mock.patch("wardex_sdk._adapters._detect_package", return_value=True),
+        mock.patch("wardex_sdk._adapters.probe", return_value=Probe("absent")),
+        mock.patch("wardex_sdk._adapters._make_adapter", return_value=fake),
+    ):
+        install_configured_adapters(None, _config((AdapterName.LANGGRAPH,)))
+    assert fake.installed == 1
+    assert get_registry().is_installed("langgraph")
+    assert counters.get("adapters.langgraph.distribution_absent_explicit") == 1
+    assert counters.get("adapters.langgraph.distribution_absent") == 0
+    warnings = wardex_lines.warnings()
+    assert len(warnings) == 1
+    assert "without package metadata" in warnings[0] and "shadow check" in warnings[0]
+    get_registry().uninstall_all()
+
+
+def test_auto_detection_still_requires_the_distribution(wardex_lines):
+    """Auto-detection has no user assertion behind it: a module the import
+    system finds with no distribution is not installed, and the absence is
+    an answer (counted, one debug line) rather than a warning."""
+    from wardex_sdk._adapters._probe import Probe
+
+    (counters,) = _quiet()
+    fake = _FakeLangGraph()
+    with (
+        mock.patch("wardex_sdk._adapters._detect_package", return_value=True),
+        mock.patch("wardex_sdk._adapters.probe", return_value=Probe("absent")),
+        mock.patch("wardex_sdk._adapters._make_adapter", return_value=fake),
+    ):
+        install_configured_adapters(None, _config(None))
+    assert fake.installed == 0
+    assert not get_registry().is_installed("langgraph")
+    assert counters.get("adapters.langgraph.distribution_absent") >= 1
+    assert counters.get("adapters.langgraph.distribution_absent_explicit") == 0
+    assert wardex_lines.warnings() == []
 
 
 _SHADOW_SCRIPT = """

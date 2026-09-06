@@ -109,30 +109,55 @@ def _detect_package(module_name: str) -> bool:
         return False
 
 
-def _probe_row(name: AdapterName, row: _Registration, *, debug: bool) -> bool:
-    """Whether `row`'s framework is here to be adapted, decided BEFORE
-    `row.build()` and without importing anything of the host's.
+def _framework_present(name: str, *, explicit: bool, debug: bool) -> bool:
+    """Whether the framework of the adapter called `name` is here to be
+    adapted. Run by `AdapterRegistry.install` — ONCE, in front of
+    `adapter.install()`, the step that imports the framework — for every way
+    in, and without importing anything of the host's. An adapter with no
+    registration row (every test double) has no framework to probe and is
+    present by definition.
 
-    Absent is silent (one debug line): a config shared across services
-    legitimately names frameworks some of them lack. Shadowed is said once
-    with both paths and counted under `adapters.<name>.shadowed`, the same
-    name an adapter's own probe uses, so a dashboard reads one count.
+    Shadowed is said once with both paths and counted under
+    `adapters.<name>.shadowed`, whichever path the adapter came in by.
+
+    Absent splits on who asked. Under auto-detection it is silent (one
+    debug line): a config shared across services legitimately names
+    frameworks some of them lack. Under `enabled=` the user NAMED the
+    framework, and a host that ships it without dist-info (a PyInstaller
+    bundle built without `copy_metadata`, a vendored checkout on
+    `PYTHONPATH`) is still a host with the framework — so when the import
+    system finds the module the install goes ahead on the adapter's own
+    import, the way it did before the probe existed. The shadow check needs
+    a distribution to compare against and cannot run there, which is said
+    once as a warning and counted under `distribution_absent_explicit`.
     """
-    verdict = probe(row.distribution, row.detect, where=f"adapters.{name.value}")
+    row = next((r for member, r in _ADAPTERS.items() if member.value == name), None)
+    if row is None:
+        return True
+    verdict = probe(row.distribution, row.detect, where=f"adapters.{name}")
     if verdict.outcome == "present":
         return True
     if verdict.outcome == "shadowed":
         report_once(
-            f"{name.value} adapter: the module '{row.detect}' resolved to {verdict.found}, "
+            f"{name} adapter: the module '{row.detect}' resolved to {verdict.found}, "
             f"which is not the installed {row.distribution} distribution ({verdict.expected}); "
             "the adapter declined. Rename the local package or fix sys.path",
-            key=f"adapters.{name.value}.shadowed",
+            key=f"adapters.{name}.shadowed",
         )
-        counters.bump(f"adapters.{name.value}.shadowed")
+        counters.bump(f"adapters.{name}.shadowed")
         return False
-    counters.bump(f"adapters.{name.value}.distribution_absent")
+    if explicit and _detect_package(row.detect):
+        report_once(
+            f"{name} adapter: the module '{row.detect}' was found without package "
+            f"metadata for {row.distribution}, so the shadow check was skipped; "
+            "installing because adapters.enabled names it",
+            key=f"adapters.{name}.distribution_absent_explicit",
+        )
+        counters.bump(f"adapters.{name}.distribution_absent_explicit")
+        return True
+    counters.bump(f"adapters.{name}.distribution_absent")
     if debug:
-        diag_info(f"{name.value} adapter: distribution {row.distribution} not installed")
+        diag_info(f"{name} adapter: distribution {row.distribution} not installed")
     return False
 
 
@@ -187,14 +212,12 @@ def install_configured_adapters(client: Client | None, config: WardexConfig) -> 
                     diag_info(
                         f"{name.value} options set but the adapter is not installed (not detected)"
                     )
+    explicit = config.adapters.enabled is not None
     for name in wanted:
         try:
-            row = _ADAPTERS.get(name)
-            if row is not None and not _probe_row(name, row, debug=config.debug):
-                continue
             adapter = _make_adapter(name)
             if adapter is not None:
-                get_registry().install(adapter, client)
+                get_registry().install(adapter, client, explicit=explicit)
         except Exception as exc:  # noqa: BLE001 — a broken adapter must not break init()
             diag_warning(f"adapter {name.value} failed to load ({exc})")
             continue

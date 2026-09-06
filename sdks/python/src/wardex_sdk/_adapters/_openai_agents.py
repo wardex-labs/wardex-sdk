@@ -128,7 +128,6 @@ from .._hash import hash_canonical
 from ._base import AdapterInterface
 from ._context import AdapterContext, Placement, RunHandle
 from ._payload import _shaped_payload
-from ._probe import probe
 
 _FRAMEWORK = "openai_agents"
 _DISTRIBUTION = "openai-agents"
@@ -350,16 +349,13 @@ class OpenAIAgentsAdapter(AdapterInterface):
         """Probe, then register. ORDER IS LOAD-BEARING and is spelled out.
 
         The distribution and the shadow check (`_probe.probe`, shared with
-        every adapter and run by the registry once more before this adapter
-        is even built) both run BEFORE anything is imported — the first
-        through `importlib.metadata`, the second through the import system's
-        spec — so a host without the framework pays no import, and a host
-        with a local package called `agents` (with or without a distribution
-        behind it) is declined without that package's body ever running.
-        Kept here as well because the registry is not the only way in
-        (`wardex_sdk.testing.installed_adapter` builds an adapter directly).
-        Only then is `agents.tracing` imported and probed.
-        `self._installed = True` stays the LAST line.
+        every adapter) have already run: `AdapterRegistry.install` runs them
+        in front of this call for every way in, including
+        `wardex_sdk.testing.installed_adapter`, so a host without the
+        framework pays no import and a host with a local package called
+        `agents` is declined without that package's body ever running. This
+        method starts at the framework import: `agents.tracing` is imported
+        and its surface probed. `self._installed = True` stays the LAST line.
         """
         if self._installed:
             return
@@ -367,18 +363,6 @@ class OpenAIAgentsAdapter(AdapterInterface):
         if self._ctx is None:
             return
         ctx = self._ctx
-        verdict = probe(_DISTRIBUTION, _MODULE, where=f"adapters.{_FRAMEWORK}")
-        if verdict.outcome == "absent":
-            return
-        if verdict.outcome == "shadowed":
-            report_once(
-                f"openai-agents adapter: the module 'agents' resolved to {verdict.found}, "
-                f"which is not the installed openai-agents distribution ({verdict.expected}); "
-                "the adapter declined. Rename the local package or fix sys.path",
-                key="adapters.openai_agents.shadowed",
-            )
-            ctx.count("shadowed")
-            return
         tracing = _import_agents_tracing()
         if tracing is None:
             return

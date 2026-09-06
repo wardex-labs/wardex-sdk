@@ -514,7 +514,7 @@ _DECLINE_SCRIPT = textwrap.dedent(
     """
     import importlib.metadata as md, json, logging, sys
     mode = sys.argv[1]
-    if mode == "absent":
+    if mode.startswith("absent"):
         real = md.distribution
         def absent(name):
             if name == "openai-agents":
@@ -530,7 +530,7 @@ _DECLINE_SCRIPT = textwrap.dedent(
     from wardex_sdk import AdapterName, AdaptersConfig
     from wardex_sdk._assembly import counters
     from wardex_sdk.testing import RecordingTransport
-    kw = {} if mode == "shadowed_auto" else {
+    kw = {} if mode.endswith("_auto") else {
         "adapters": AdaptersConfig(enabled=(AdapterName.OPENAI_AGENTS,))
     }
     wardex.init(transport=RecordingTransport(), **kw)
@@ -566,16 +566,37 @@ def _decline_in_a_fresh_process(tmp_path, mode: str) -> dict:  # noqa: ANN001
     return json.loads(proc.stdout.strip().splitlines()[-1])
 
 
-def test_an_absent_distribution_declines_before_importing_anything(tmp_path):
-    """A local package called `agents` with no `openai-agents` distribution:
-    the adapter never imports it, so its side effects never run, and nothing
-    is logged — absence is an answer, not a failure."""
+def test_an_absent_distribution_declines_auto_detection_before_importing_anything(tmp_path):
+    """A local package called `agents` with no `openai-agents` distribution,
+    and nothing naming the adapter: auto-detection never imports it, so its
+    side effects never run, and nothing is logged — absence is an answer,
+    not a failure."""
     marker = _fake_agents_package(tmp_path, with_tracing=True)
-    out = _decline_in_a_fresh_process(tmp_path, "absent")
+    out = _decline_in_a_fresh_process(tmp_path, "absent_auto")
     assert not marker.exists()
     assert out["agents_imported"] is False
     assert out["lines"] == []
     assert out["shadowed"] == 0 and out["unsupported"] == 0
+
+
+def test_a_named_adapter_installs_a_framework_that_has_no_package_metadata(tmp_path):
+    """`enabled=` names the adapter and `import agents` succeeds, but no
+    distribution is installed — a PyInstaller bundle or a vendored checkout.
+    The user's word wins, as it did before the probe existed: the adapter
+    installs on its own import. What the probe could not do (the shadow
+    check needs a distribution to compare against) is said once as a
+    warning; the empty `tracing` module of this stand-in then declines the
+    surface, which is the second warning and the only counter."""
+    marker = _fake_agents_package(tmp_path, with_tracing=True)
+    out = _decline_in_a_fresh_process(tmp_path, "absent")
+    assert marker.exists()
+    assert out["agents_imported"] is True
+    assert out["shadowed"] == 0 and out["unsupported"] == 1
+    warnings = [m for lvl, m in out["lines"] if lvl == logging.WARNING]
+    assert len(warnings) == 2
+    assert "without package metadata" in warnings[0] and "shadow check" in warnings[0]
+    assert "surface unrecognized" in warnings[1]
+    assert not any("failed to load" in m for m in warnings)
 
 
 @pytest.mark.parametrize(
