@@ -420,7 +420,7 @@ fn as_f64(v: &Bound<PyAny>) -> Option<f64> {
 fn flatten_conversation(
     c: &Bound<PyAny>,
     out: &mut Vec<pb::KeyValue>,
-    unmarshalled: &mut Vec<&'static str>,
+    unmarshalled: &mut Vec<String>,
 ) -> PyResult<()> {
     out.push(kv_str(
         "gen_ai.conversation.id",
@@ -436,7 +436,7 @@ fn flatten_conversation(
         match v.extract::<i64>() {
             Ok(turn) if turn != 0 => out.push(kv_int("wardex.conversation.turn_index", turn)),
             Ok(_) => {}
-            Err(_) => unmarshalled.push("wardex.conversation.turn_index"),
+            Err(_) => unmarshalled.push("wardex.conversation.turn_index".into()),
         }
     }
     Ok(())
@@ -450,7 +450,7 @@ fn flatten_conversation(
 fn flatten_evaluation(
     e: &Bound<PyAny>,
     out: &mut Vec<pb::KeyValue>,
-    unmarshalled: &mut Vec<&'static str>,
+    unmarshalled: &mut Vec<String>,
 ) -> PyResult<()> {
     for (attr, key) in [
         ("name", "gen_ai.evaluation.name"),
@@ -464,7 +464,7 @@ fn flatten_evaluation(
     if let Some(v) = opt(e, "score_value")? {
         match as_f64(&v) {
             Some(f) => out.push(kv_double("gen_ai.evaluation.score.value", f)),
-            None => unmarshalled.push("gen_ai.evaluation.score.value"),
+            None => unmarshalled.push("gen_ai.evaluation.score.value".into()),
         }
     }
     Ok(())
@@ -789,8 +789,11 @@ fn span_to_proto(sp: &Bound<PyAny>) -> PyResult<pb::Span> {
     }
     // The fields the blocks below could not read are named under ONE key:
     // a key pushed per field would be a duplicate attribute, of which an
-    // OTLP decoder keeps one, and the other loss would go unnamed.
-    let mut unmarshalled: Vec<&'static str> = Vec::new();
+    // OTLP decoder keeps one, and the other loss would go unnamed. Owned
+    // strings, deliberately: `Vec<&'static str>` is the shape of a
+    // limitation-marker channel in this codebase and the census reads every
+    // such declaration as one; these are attribute names, not markers.
+    let mut unmarshalled: Vec<String> = Vec::new();
     if let Some(c) = opt(sp, "conversation")? {
         flatten_conversation(&c, &mut span.extra, &mut unmarshalled)?;
     }
