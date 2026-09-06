@@ -70,6 +70,10 @@ walkthrough, Phoenix image already pulled: under a minute in the terminal,
 18 seconds of it the from-checkout build, plus the clicks in Phoenix to
 the tree below.
 
+<!-- Absolute URL on purpose: this file is also the PyPI long description
+     (readme = "README.md" in sdks/python/pyproject.toml), where a relative
+     image path renders as a broken link. The trade-off is that the image
+     404s on branches and in PR views until the PNG is on main. -->
 ![Phoenix showing one openai-agents run: invoke_workflow travel_concierge → invoke_agent concierge (chat, execute_tool lookup_weather, chat, handoff concierge→booking_agent) and its sibling invoke_agent booking_agent (chat)](https://raw.githubusercontent.com/wardex-labs/wardex-sdk/main/examples/openai-agents-phoenix.png)
 
 The receiving agent of a handoff is the sender's **sibling**, not its
