@@ -137,6 +137,7 @@ def test_auto_detection_installs_when_package_present():
     get_registry().uninstall_all()
     with (
         mock.patch("wardex_sdk._adapters._detect_package", return_value=True),
+        mock.patch("wardex_sdk._adapters._probe_row", return_value=True),
         mock.patch("wardex_sdk._adapters._make_adapter") as make,
     ):
         make.return_value = _FakeAdapter()
@@ -163,6 +164,7 @@ def test_empty_tuple_disables_all():
     get_registry().uninstall_all()
     with (
         mock.patch("wardex_sdk._adapters._detect_package", return_value=True),
+        mock.patch("wardex_sdk._adapters._probe_row", return_value=True),
         mock.patch("wardex_sdk._adapters._make_adapter") as make,
     ):
         install_configured_adapters(None, _config(()))
@@ -173,6 +175,7 @@ def test_explicit_tuple_installs_even_without_detection():
     get_registry().uninstall_all()
     with (
         mock.patch("wardex_sdk._adapters._detect_package", return_value=False),
+        mock.patch("wardex_sdk._adapters._probe_row", return_value=True),
         mock.patch("wardex_sdk._adapters._make_adapter") as make,
     ):
         make.return_value = _FakeAdapter()
@@ -189,12 +192,98 @@ def test_broken_adapter_install_does_not_break_init():
     get_registry().uninstall_all()
     with (
         mock.patch("wardex_sdk._adapters._detect_package", return_value=True),
+        mock.patch("wardex_sdk._adapters._probe_row", return_value=True),
         mock.patch("wardex_sdk._adapters._make_adapter") as make,
     ):
         make.return_value = _BrokenInstallAdapter()
         install_configured_adapters(None, _config(None))  # must not raise
         assert not get_registry().is_installed("broken-install")
     get_registry().uninstall_all()
+
+
+def test_a_shadowed_framework_is_declined_before_its_adapter_is_built():
+    """The probe runs in FRONT of `row.build()`, for every row and on both
+    the auto-detected and the `enabled=` path: a project-local package of
+    the framework's name never has its body executed by an adapter's
+    install-time import, and the decline is said once and counted under the
+    adapter's own name."""
+    from wardex_sdk._adapters._probe import Probe
+    from wardex_sdk._assembly import counters
+    from wardex_sdk._assembly._diag import reset_reports_for_test
+
+    reset_reports_for_test()
+    counters.reset()
+    get_registry().uninstall_all()
+    shadowed = Probe("shadowed", "/app/langgraph", "/site/langgraph")
+    for enabled in (None, (AdapterName.LANGGRAPH,)):
+        with (
+            mock.patch("wardex_sdk._adapters._detect_package", return_value=True),
+            mock.patch("wardex_sdk._adapters.probe", return_value=shadowed),
+            mock.patch("wardex_sdk._adapters._make_adapter") as make,
+        ):
+            install_configured_adapters(None, _config(enabled))
+            make.assert_not_called()
+    assert counters.get("adapters.langgraph.shadowed") == 2
+    assert not get_registry().is_installed("langgraph")
+
+
+_SHADOW_SCRIPT = """
+import json, logging, sys
+seen = []
+class H(logging.Handler):
+    def emit(self, r):
+        seen.append([r.levelno, r.getMessage()])
+logging.getLogger("wardex_sdk").addHandler(H(level=logging.DEBUG))
+import wardex_sdk as wardex
+from wardex_sdk import AdapterName, AdaptersConfig
+from wardex_sdk._assembly import counters
+from wardex_sdk.testing import RecordingTransport
+enabled = AdaptersConfig(enabled=(AdapterName.LANGGRAPH,))
+wardex.init(transport=RecordingTransport(), adapters=enabled)
+wardex.close()
+print(json.dumps({
+    "imported": "langgraph" in sys.modules,
+    "lines": seen,
+    "shadowed": counters.get("adapters.langgraph.shadowed"),
+}))
+"""
+
+
+def test_a_project_local_langgraph_package_is_never_imported(tmp_path):
+    """The cross-adapter hazard, measured on an adapter OTHER than the one
+    the probe was first written for. A folder called `langgraph/` ahead of
+    the wheel on `sys.path` (a project folder named after the framework):
+    its `__init__` leaves a file behind if it ever runs. The LangGraph
+    adapter's install would import it; the registry's probe declines first,
+    loudly, and the file is never written. A fresh process, because this
+    suite's own process has the real package imported already."""
+    import os
+    import subprocess
+    import sys
+
+    pkg = tmp_path / "langgraph"
+    pkg.mkdir()
+    marker = tmp_path / "imported.txt"
+    (pkg / "__init__.py").write_text(f"open({str(marker)!r}, 'w').write('x')\n")
+    proc = subprocess.run(
+        [sys.executable, "-c", _SHADOW_SCRIPT],
+        env={**os.environ, "PYTHONPATH": str(tmp_path)},
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stderr == "", proc.stderr
+    import json
+
+    out = json.loads(proc.stdout.strip().splitlines()[-1])
+    assert not marker.exists()
+    assert out["imported"] is False
+    assert out["shadowed"] == 1
+    warnings = [m for lvl, m in out["lines"] if lvl == 30]
+    assert len(warnings) == 1
+    assert "resolved to" in warnings[0] and str(tmp_path) in warnings[0]
 
 
 # --- AdapterContext.options: the one channel an adapter's config arrives on ---

@@ -1108,13 +1108,17 @@ _CS4_BUDGET = {
     # is how the stdlib spells "the carrier here is the thread".
     "_adapters/_anthropic_agent_sdk.py": 2,
     "_adapters/_assembler.py": 2,
-    # Two, both ABSENCES rather than failures, the same pair the Anthropic
-    # adapter carries: `importlib.metadata.distribution("openai-agents")`
-    # raising `PackageNotFoundError` (the distribution is not installed — the
-    # answer install() asks for, and the exception-free spelling was measured
-    # to answer wrongly on the 3.10 floor) and `import agents.tracing` inside
-    # `_import_agents_tracing`.
-    "_adapters/_openai_agents.py": 2,
+    # One ABSENCE rather than a failure: `import agents.tracing` inside
+    # `_import_agents_tracing`. It was two; the `PackageNotFoundError` half
+    # moved to `_probe.py` with the distribution probe (below), a MOVE of one
+    # budget, not a rise.
+    "_adapters/_openai_agents.py": 1,
+    # One, the ABSENCE the openai-agents adapter used to carry:
+    # `importlib.metadata.distribution(name)` raising `PackageNotFoundError`
+    # (the distribution is not installed — the answer the probe asks for, and
+    # the exception-free spelling was measured to answer wrongly on the 3.10
+    # floor). Shared by every adapter now, so it lives here once.
+    "_adapters/_probe.py": 1,
     # Two, and the same justification as the adapter above: both are ABSENCES
     # rather than failures. `_import_pregel` asks "is langgraph installed" and
     # `_import_toolnode` asks "is langgraph-prebuilt installed" — a separately

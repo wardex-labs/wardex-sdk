@@ -642,7 +642,7 @@ def test_an_editable_install_of_the_real_framework_is_not_a_shadow(
     import importlib.util
     from types import SimpleNamespace
 
-    from wardex_sdk._adapters._openai_agents import _shadow_path
+    from wardex_sdk._adapters._probe import shadow_path
 
     project = tmp_path / "project"
     module_dir = project / layout
@@ -654,8 +654,7 @@ def test_an_editable_install_of_the_real_framework_is_not_a_shadow(
         "find_spec",
         lambda name: SimpleNamespace(origin=str(module_dir / "__init__.py")),
     )
-    with installed_adapter(OpenAIAgentsAdapter) as live:
-        answer = _shadow_path(dist, live.adapter._ctx)
+    answer = shadow_path("agents", dist, where="adapters.openai_agents")
     if shadowed:
         assert answer == (str(module_dir.resolve()), str((tmp_path / "site" / "agents").resolve()))
     else:

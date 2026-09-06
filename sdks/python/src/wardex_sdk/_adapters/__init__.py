@@ -6,9 +6,10 @@ import importlib.util
 from operator import attrgetter
 from typing import TYPE_CHECKING, NamedTuple
 
-from .._assembly import diag_info, diag_warning
+from .._assembly import counters, diag_info, diag_warning, report_once
 from .._config import AdaptersConfig, _non_default_adapter_options
 from .._enums import AdapterName
+from ._probe import probe
 from ._registry import get_registry
 
 if TYPE_CHECKING:
@@ -33,7 +34,16 @@ class _Registration(NamedTuple):
     """
 
     detect: str
-    """The distribution module probed to decide whether the framework is here."""
+    """The framework's import name, probed to decide whether it is here."""
+
+    distribution: str
+    """The framework's distribution name, as `importlib.metadata` knows it.
+
+    What the pre-build probe checks `detect` against: a module that resolves
+    somewhere other than this distribution's package is a project-local
+    shadow, declined before the adapter is built — and so before its
+    `install()` could import, and thereby EXECUTE, the local package.
+    """
 
     build: Callable[[], AdapterInterface]
     """Constructs the adapter, importing its module on the way.
@@ -77,10 +87,13 @@ def _openai_agents() -> AdapterInterface:
 #: its module — nothing else in this file, and no branch anywhere.
 _ADAPTERS: dict[AdapterName, _Registration] = {
     AdapterName.ANTHROPIC_AGENT_SDK: _Registration(
-        "claude_agent_sdk", _anthropic_agent_sdk, attrgetter("anthropic_agent_sdk")
+        "claude_agent_sdk",
+        "claude-agent-sdk",
+        _anthropic_agent_sdk,
+        attrgetter("anthropic_agent_sdk"),
     ),
-    AdapterName.LANGGRAPH: _Registration("langgraph", _langgraph),
-    AdapterName.OPENAI_AGENTS: _Registration("agents", _openai_agents),
+    AdapterName.LANGGRAPH: _Registration("langgraph", "langgraph", _langgraph),
+    AdapterName.OPENAI_AGENTS: _Registration("agents", "openai-agents", _openai_agents),
 }
 
 #: AdapterName -> distribution package to probe for auto-detection. DERIVED from
@@ -94,6 +107,33 @@ def _detect_package(module_name: str) -> bool:
         return importlib.util.find_spec(module_name) is not None
     except Exception:  # noqa: BLE001 — detection must never raise
         return False
+
+
+def _probe_row(name: AdapterName, row: _Registration, *, debug: bool) -> bool:
+    """Whether `row`'s framework is here to be adapted, decided BEFORE
+    `row.build()` and without importing anything of the host's.
+
+    Absent is silent (one debug line): a config shared across services
+    legitimately names frameworks some of them lack. Shadowed is said once
+    with both paths and counted under `adapters.<name>.shadowed`, the same
+    name an adapter's own probe uses, so a dashboard reads one count.
+    """
+    verdict = probe(row.distribution, row.detect, where=f"adapters.{name.value}")
+    if verdict.outcome == "present":
+        return True
+    if verdict.outcome == "shadowed":
+        report_once(
+            f"{name.value} adapter: the module '{row.detect}' resolved to {verdict.found}, "
+            f"which is not the installed {row.distribution} distribution ({verdict.expected}); "
+            "the adapter declined. Rename the local package or fix sys.path",
+            key=f"adapters.{name.value}.shadowed",
+        )
+        counters.bump(f"adapters.{name.value}.shadowed")
+        return False
+    counters.bump(f"adapters.{name.value}.distribution_absent")
+    if debug:
+        diag_info(f"{name.value} adapter: distribution {row.distribution} not installed")
+    return False
 
 
 def _make_adapter(name: AdapterName) -> AdapterInterface | None:
@@ -149,6 +189,9 @@ def install_configured_adapters(client: Client | None, config: WardexConfig) -> 
                     )
     for name in wanted:
         try:
+            row = _ADAPTERS.get(name)
+            if row is not None and not _probe_row(name, row, debug=config.debug):
+                continue
             adapter = _make_adapter(name)
             if adapter is not None:
                 get_registry().install(adapter, client)

@@ -101,18 +101,13 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import hashlib
-import importlib.metadata
-import importlib.util
-import json
 import os
 import sys
 import threading
 import weakref
 from datetime import datetime, timezone
 from inspect import signature
-from pathlib import Path
 from typing import Any
-from urllib.parse import unquote, urlsplit
 
 from .._assembly import (
     AgentAttributes,
@@ -133,6 +128,7 @@ from .._enums import StatusCode, ToolExecutionType, ToolType
 from ._base import AdapterInterface
 from ._context import AdapterContext, Placement, RunHandle
 from ._payload import _shaped_args
+from ._probe import probe
 
 _FRAMEWORK = "openai_agents"
 _DISTRIBUTION = "openai-agents"
@@ -232,77 +228,6 @@ def _import_agents_tracing() -> Any | None:
     except Exception:  # noqa: BLE001 — an absent framework is the answer, not a failure
         return None
     return tracing
-
-
-def _installed_distribution() -> importlib.metadata.Distribution | None:
-    """The `openai-agents` distribution, found WITHOUT importing anything: a
-    host with a local `agents/` package and no distribution answers `None`
-    here and nothing of theirs is imported.
-
-    The absence is an ANSWER, spelled as the stdlib spells it. The
-    exception-free `packages_distributions()` was tried first and answers
-    `None` for this very wheel on the 3.10 floor (it reads `top_level.txt`
-    only there), which would have declined the adapter on every 3.10 host.
-    """
-    try:
-        return importlib.metadata.distribution(_DISTRIBUTION)
-    except importlib.metadata.PackageNotFoundError:
-        return None
-
-
-def _shadow_path(
-    dist: importlib.metadata.Distribution, ctx: AdapterContext
-) -> tuple[str, str] | None:
-    """`(resolved module path, distribution path)` when the package that
-    `import agents` WOULD answer is not the installed distribution's, else None.
-
-    Read from the import system's spec, so the answer costs no import: a
-    project-local `agents/` package (an app folder named `agents` is the
-    common shape) is named here, with both paths, BEFORE anything of it could
-    run — and a local package with no `tracing` submodule is reported the same
-    way rather than declined in silence by a failed `import agents.tracing`.
-    A module the import system cannot locate answers None and leaves the
-    import step to decline; a namespace package has no origin and does the same.
-
-    An EDITABLE install (`pip install -e`, `uv --editable`, a workspace
-    member) resolves `agents` to the project tree, never to
-    `site-packages/agents`, so the path comparison alone would decline the
-    adapter on the very machine the framework is developed on. The
-    distribution's own record of where it came from (PEP 610's
-    `direct_url.json`) settles it: a module under that editable root IS the
-    installed distribution. A corrupt record is counted, not raised.
-    """
-    spec = importlib.util.find_spec(_MODULE)
-    origin = spec.origin if spec is not None else None
-    if not origin:
-        return None
-    found = Path(origin).parent.resolve()
-    expected = Path(str(dist.locate_file(_MODULE))).resolve()
-    if found == expected:
-        return None
-    editable = None
-    with ctx.guard("direct_url_read"):
-        editable = _editable_root(dist)
-    if editable is not None and (found == editable or editable in found.parents):
-        return None
-    return str(found), str(expected)
-
-
-def _editable_root(dist: importlib.metadata.Distribution) -> Path | None:
-    """The project directory an EDITABLE install of `dist` points at, or None
-    for a regular install (no `direct_url.json`, or one that records an
-    archive, an index, or a non-editable local directory whose package was
-    COPIED into site-packages and so must still match `locate_file`)."""
-    raw = dist.read_text("direct_url.json")
-    if not raw:
-        return None
-    data = json.loads(raw)
-    if not isinstance(data, dict) or not (data.get("dir_info") or {}).get("editable"):
-        return None
-    url = urlsplit(str(data.get("url", "")))
-    if url.scheme != "file":
-        return None
-    return Path(unquote(url.path)).resolve()
 
 
 def _constructs(cls: Any, attrs: dict[str, Any], reads: tuple[str, ...] | None = None) -> bool:
@@ -424,12 +349,16 @@ class OpenAIAgentsAdapter(AdapterInterface):
     def install(self, client: object | None = None, ctx: object | None = None) -> None:
         """Probe, then register. ORDER IS LOAD-BEARING and is spelled out.
 
-        The distribution and the shadow check both run BEFORE anything is
-        imported — the first through `importlib.metadata`, the second through
-        the import system's spec — so a host without the framework pays no
-        import, and a host with a local package called `agents` (with or
-        without a distribution behind it) is declined without that package's
-        body ever running. Only then is `agents.tracing` imported and probed.
+        The distribution and the shadow check (`_probe.probe`, shared with
+        every adapter and run by the registry once more before this adapter
+        is even built) both run BEFORE anything is imported — the first
+        through `importlib.metadata`, the second through the import system's
+        spec — so a host without the framework pays no import, and a host
+        with a local package called `agents` (with or without a distribution
+        behind it) is declined without that package's body ever running.
+        Kept here as well because the registry is not the only way in
+        (`wardex_sdk.testing.installed_adapter` builds an adapter directly).
+        Only then is `agents.tracing` imported and probed.
         `self._installed = True` stays the LAST line.
         """
         if self._installed:
@@ -438,15 +367,14 @@ class OpenAIAgentsAdapter(AdapterInterface):
         if self._ctx is None:
             return
         ctx = self._ctx
-        dist = _installed_distribution()
-        if dist is None:
+        verdict = probe(_DISTRIBUTION, _MODULE, where=f"adapters.{_FRAMEWORK}")
+        if verdict.outcome == "absent":
             return
-        shadow = _shadow_path(dist, ctx)
-        if shadow is not None:
+        if verdict.outcome == "shadowed":
             report_once(
-                f"openai-agents adapter: the module 'agents' resolved to {shadow[0]}, which "
-                f"is not the installed openai-agents distribution ({shadow[1]}); the adapter "
-                "declined. Rename the local package or fix sys.path",
+                f"openai-agents adapter: the module 'agents' resolved to {verdict.found}, "
+                f"which is not the installed openai-agents distribution ({verdict.expected}); "
+                "the adapter declined. Rename the local package or fix sys.path",
                 key="adapters.openai_agents.shadowed",
             )
             ctx.count("shadowed")
