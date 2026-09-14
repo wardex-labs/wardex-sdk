@@ -99,8 +99,16 @@ All notable changes to this project are documented here. The format follows
   `server.port=443` and a URL like `http://unknown:443/v1/chat/completions`,
   with nothing on the span to say the address was made up. It now ships port
   `0` in both places, the new limitation marker `peer_unresolved`, and a count
-  under `interceptors.seam.peer_unresolved`; the call is still captured. The
-  seam also stops re-reading the peer address on every send once it has one.
+  under `interceptors.seam.peer_unresolved`; the call is still captured.
+  **This includes every async TLS call.** Asyncio and anyio TLS (httpx
+  `AsyncClient`, and so `AsyncOpenAI` and `AsyncAnthropic`; aiohttp) runs on a
+  memory-BIO `ssl.SSLObject`, which has no peer address to read, so each of
+  those spans now reports `server.port=0`, a URL like
+  `https://api.openai.com:0/v1/chat/completions`, `peer_unresolved`, and one
+  count, where it used to report 443 (a guess, wrong for any TLS server on
+  another port). `server.address` there is still the TLS server name. Sync
+  clients (`httpx.Client`, `requests`) ride an `ssl.SSLSocket` and keep their
+  real port. The seam also stops calling `getpeername()` on every send.
   Wire change: `peer_unresolved` is a new value (50) of `wardex.v1.Limitation`.
 
 ## [0.6.0b1] - 2026-09-06

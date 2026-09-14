@@ -395,3 +395,40 @@ def test_disabled_reason_not_logged_without_debug(capsys):
     interceptor._on_response_bytes(obj, not_http)
 
     assert capsys.readouterr().err == ""
+
+
+@pytest.mark.asyncio
+async def test_async_https_reports_port_zero_because_an_sslobject_has_no_peer(
+    tls_server, fresh_counters
+):
+    """The widest reach of the unresolved-peer rule, pinned so it cannot pass
+    for a unix-socket-only change.
+
+    Asyncio and anyio TLS (httpx's `AsyncClient`, and so the async OpenAI and
+    Anthropic clients; aiohttp) encrypt through a memory-BIO `ssl.SSLObject`.
+    It has a `server_hostname` but no `getpeername()`, so the seam cannot read
+    the port the connection went to. It used to report 443 there, which was a
+    guess that happened to be right for most public APIs and wrong for any TLS
+    server on another port — this one included. Every such call now reports
+    port 0, the `PEER_UNRESOLVED` marker and one count, exactly as a unix
+    socket does. The sync client below it rides an `SSLSocket`, which does
+    have a peer, so the same server yields its real port and no marker.
+    """
+    from wardex_sdk._assembly import counters
+
+    port = int(tls_server.rsplit(":", 1)[1])
+    wardex.init(intercept=True, capture_mode=CaptureMode.ALL)
+    async with httpx.AsyncClient(verify=_verify_ctx()) as client:
+        resp = await client.post(f"{tls_server}/v1/messages", json={"model": "y"})
+    assert resp.status_code == 200
+    httpx.post(f"{tls_server}/v1/messages", json={"model": "y"}, verify=_verify_ctx())
+
+    spans = [s for s in _captured_spans() if s.kind == SpanKind.CLIENT]
+    assert len(spans) == 2
+    async_span, sync_span = spans
+    assert async_span.server_port == 0
+    assert async_span.transport.http.url.endswith(":0/v1/messages")
+    assert Limitation.PEER_UNRESOLVED in async_span.capture_integrity.limitations
+    assert sync_span.server_port == port
+    assert Limitation.PEER_UNRESOLVED not in sync_span.capture_integrity.limitations
+    assert counters.get("interceptors.seam.peer_unresolved") == 1

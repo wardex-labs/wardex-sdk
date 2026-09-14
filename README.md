@@ -562,8 +562,10 @@ carried LLM calls wardex did not read) and
 `interceptors.seam.ws_llm_endpoint_unconfirmed` (Responses-path WebSocket
 connections wardex could not corroborate) and
 `interceptors.seam.peer_unresolved` (requests on a connection whose peer
-address wardex could not read, such as a unix socket; the span says port `0`
-and carries `peer_unresolved`); table-eviction counters are under
+address wardex could not read: a unix socket, and every asyncio/anyio TLS
+call, such as httpx `AsyncClient` or `AsyncOpenAI`, because a memory-BIO
+`SSLObject` has no peer address; the span says port `0` and carries
+`peer_unresolved`); table-eviction counters are under
 Resource limits. `ffi.panic_converted` counts a panic in the Rust core that
 the FFI boundary turned into `NativePanic` -- a `RuntimeError`, so the guard
 around the host's call swallowed it -- on top of the site's own count.

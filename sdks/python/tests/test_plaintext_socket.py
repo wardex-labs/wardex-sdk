@@ -366,14 +366,15 @@ def test_the_peer_address_is_asked_once_per_connection_not_once_per_send():
     assert sock.calls == 1
 
 
-def test_only_the_bare_unknown_placeholder_is_asked_again():
-    """The one re-ask the per-send rule keeps, and what it may not claim.
+def test_only_the_bare_unknown_placeholder_takes_a_late_server_name():
+    """The one re-read the per-send rule keeps, and what it may not claim.
 
-    A connection whose address is the bare `unknown` placeholder is asked again
-    on the next send, because a `server_hostname` that appears later is a
-    better host for the span. A better host is still not a read peer: the port
-    stays 0, which is what keeps the connection marked. Once the host is no
-    longer the bare placeholder, nothing is asked again.
+    A connection whose host is the bare `unknown` placeholder re-reads its
+    `server_hostname` on the next send, because a name that appears later is a
+    better host for the span. That is an attribute read: `getpeername()` is not
+    asked again, since a connected socket's peer does not change. A better host
+    is still not a read peer: the port stays 0, which is what keeps the
+    connection marked. Once the host is a real name, nothing is re-read.
     """
     seam = RawSocketInterceptor()
     seam._client = _InlineClient()
@@ -383,15 +384,60 @@ def test_only_the_bare_unknown_placeholder_is_asked_again():
     seam._on_request_bytes(sock, b"POST /v1/chat/completions HTTP/1.1\r\n")
     st = seam._conns[id(sock)]
     assert (st.server_address, st.server_port) == ("unknown", 0)
-    asked = sock.calls
 
     sock.server_hostname = "models.internal"
     seam._on_request_bytes(sock, b"Host: models.internal\r\n")
-    assert sock.calls == asked + 1
     assert (st.server_address, st.server_port) == ("models.internal", 0)
 
+    sock.server_hostname = "renamed.internal"
     seam._on_request_bytes(sock, b"Content-Length: 2\r\n\r\n{}")
-    assert sock.calls == asked + 1
+    assert st.server_address == "models.internal"
+    assert sock.calls == 1
+
+
+def test_a_unix_socket_is_not_asked_for_its_peer_on_every_send():
+    """The per-send rule must hold on the connection it was written for.
+
+    A unix socket's host stays the bare `unknown` placeholder for its whole
+    life, which is exactly the condition under which the seam re-asks. What
+    can still change there is a `server_hostname`, never the `getpeername()`
+    answer — a connected socket's peer is fixed — so the re-ask reads the name
+    and leaves the syscall alone: three sends, one query.
+    """
+    seam = RawSocketInterceptor()
+    seam._client = _InlineClient()
+    sock = _CountingPeerSocket("/run/model.sock")
+
+    seam._on_request_bytes(sock, b"POST /v1/chat/completions HTTP/1.1\r\n")
+    seam._on_request_bytes(sock, b"Host: localhost\r\nContent-Length: 2\r\n\r\n")
+    seam._on_request_bytes(sock, b"{}")
+
+    assert sock.calls == 1
+    st = seam._conns[id(sock)]
+    assert (st.server_address, st.server_port) == ("unknown", 0)
+
+
+@pytest.mark.usefixtures("fresh_counters")
+def test_an_excluded_path_on_an_unresolved_peer_still_counts_the_invented_address():
+    """The count exists so an unaddressable connection is visible even when no
+    span survives, and a transaction on an excluded path (a telemetry upload)
+    is one that never becomes a span. It used to return before the count."""
+    seam = RawSocketInterceptor()
+    seam._client = _InlineClient()
+    sock = _CountingPeerSocket("/run/model.sock")
+    st = seam._state(sock)
+    txn = st.tracker.on_request_bytes(
+        b"POST /v1/traces/ingest HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\n\r\n{}"
+    )
+    assert txn == [], "precondition: nothing completes before the response"
+    done = st.tracker.on_response_bytes(
+        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}"
+    )
+    assert len(done) == 1
+
+    assert seam._seal(sock, st, done[0], seam._client) is None
+    assert counters.get("interceptors.seam.path_excluded") == 1
+    assert counters.get(_PEER_UNRESOLVED) == 1
 
 
 @pytest.mark.parametrize(

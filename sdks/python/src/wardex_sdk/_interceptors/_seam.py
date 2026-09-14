@@ -57,7 +57,7 @@ from .._types import (
 from ._base import InterceptorInterface
 from ._close_hook import install_shared_close_hook, on_close, uninstall_shared_close_hook
 from ._conn_timing import install_shared_timing, uninstall_shared_timing
-from ._peer import UNRESOLVED_HOST, UNRESOLVED_PORT, peer_address
+from ._peer import UNRESOLVED_HOST, UNRESOLVED_PORT, peer_address, placeholder_host
 from ._trackers import _Txn, _WebSocketTracker
 
 if TYPE_CHECKING:
@@ -526,8 +526,8 @@ class ByteSeamInterceptor(InterceptorInterface):
         st = self._state(obj)
         if not self._gate(st, data, "request"):
             return
-        if st.server_address == UNRESOLVED_HOST:  # asked once otherwise; see `_peer.py`
-            st.server_address, st.server_port = peer_address(obj)
+        if st.server_address == UNRESOLVED_HOST:  # only a TLS name can still arrive; see `_peer.py`
+            st.server_address = placeholder_host(obj)
         for txn in st.tracker.on_request_bytes(data):
             if txn.version == "websocket":
                 self._emit_ws(st, txn)
@@ -626,6 +626,9 @@ class ByteSeamInterceptor(InterceptorInterface):
         # Classified once here and carried on the job: `_assemble` reads the
         # same answer for the provider-state count instead of asking again.
         treatment = classify_path(txn.path)
+        if st.server_port == UNRESOLVED_PORT:  # counted even if excluded; see `_peer.py`
+            timing_markers = (*timing_markers, Limitation.PEER_UNRESOLVED)
+            counters.bump("interceptors.seam.peer_unresolved")
         if treatment == "excluded":
             # A telemetry upload (the OpenAI Agents SDK POSTs its whole run
             # record to /v1/traces/ingest). Not wardex's to copy: skipped in
@@ -641,9 +644,6 @@ class ByteSeamInterceptor(InterceptorInterface):
             st.reset_at_fork = False
             timing_markers = (*timing_markers, Limitation.TRACKING_RESET_AT_FORK)
             counters.bump("interceptors.seam.tracking_reset_at_fork")
-        if st.server_port == UNRESOLVED_PORT:  # a placeholder address; see `_peer.py`
-            timing_markers = (*timing_markers, Limitation.PEER_UNRESOLVED)
-            counters.bump("interceptors.seam.peer_unresolved")
         pre = self._prefilter_of(st)
         if pre is Prefilter.DENY:
             return None
