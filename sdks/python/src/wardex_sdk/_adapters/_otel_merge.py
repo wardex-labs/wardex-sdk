@@ -55,6 +55,7 @@ CLI happens to stamp usage on today.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Any
 
 from .._assembly import counters
 
@@ -64,7 +65,11 @@ from .._assembly import counters
 #: reads a message late, shifting the window boundaries that message
 #: defines), not clock skew. The strict pass runs first, so this widens
 #: candidacy only for requests strictness could not place; a request that
-#: still fails, fails HONESTLY (no merge, markers kept), never wrongly.
+#: still fails, fails HONESTLY (no merge, markers kept). A request this pass
+#: DOES place is not thereby proven right: when a chat's own request never
+#: reached the bridge (truncation, the pending bound), the neighbouring
+#: request is the one inside the widened window. So the pass reports which
+#: pairs it made (`_JoinOutcome.tolerant`) and the merge marks them.
 JOIN_EPS_NS = 1_000_000_000
 
 #: CLI span names with no wardex counterpart, mapped to their step name.
@@ -302,11 +307,43 @@ class _ChatWindow:
 class _JoinOutcome:
     #: (chat key, llm) pairs that matched uniquely in BOTH directions.
     pairs: list[tuple[int, _OtelLlm]] = field(default_factory=list)
+    #: The chat keys in `pairs` that only the TOLERANCE pass could place. A
+    #: parallel set rather than a flag inside each pair, so the pair shape
+    #: every consumer already unpacks stays what it was. The two passes used
+    #: to merge into one list with nothing to tell them apart, and the
+    #: consumer rewrote timing and dropped the IPC-timing markers for both —
+    #: so a chat that received a NEIGHBOURING request's timing, because its
+    #: own request never arrived, shipped reading as a precise merge.
+    tolerant: set[int] = field(default_factory=set)
     #: Every llm_request that did not merge — ambiguous or unmatched alike.
     #: The assembler ships each as a SIBLING step span that says so, because
     #: CLI-measured LLM work must not disappear just because the tree could
     #: not place it.
     unjoined: list[_OtelLlm] = field(default_factory=list)
+
+
+def sequence_chat_windows(pending: list[Any]) -> list[_ChatWindow]:
+    """The join windows of a session's pended chat drafts, SEQUENCED per scope.
+
+    Every chat of one agentic loop shares the same host write, so their
+    recorded turn starts collide — and colliding windows made every multi-turn
+    session degenerate to the ambiguity fallback (measured against a live CLI).
+    The request that produced chat N cannot have started before chat N-1's
+    message arrived, so N-1's arrival is N's floor. Keys are pending indexes.
+    `pending` holds the assembler's `_PendingSpan` records, read by field only.
+    """
+    windows = []
+    floor_by_scope: dict[str | None, int] = {}
+    for i, rec in enumerate(pending):
+        if rec.kind != "chat" or rec.window is None:
+            continue
+        start_ns, end_ns = rec.window
+        floor = floor_by_scope.get(rec.agent_id)
+        if floor is not None and floor > start_ns:
+            start_ns = floor
+        floor_by_scope[rec.agent_id] = end_ns
+        windows.append(_ChatWindow(key=i, start_ns=start_ns, end_ns=end_ns, agent_id=rec.agent_id))
+    return windows
 
 
 def _start_within(chat: _ChatWindow, llm: _OtelLlm, eps_ns: int) -> bool:
@@ -350,6 +387,12 @@ def join_chats(
     chats over one llm, or two llms over one chat, unmatch every party
     involved: no merge is the only answer the evidence backs (I4), and the
     drafts keep their timing markers honestly.
+
+    Pairs the tolerance pass made are recorded in `tolerant` as well as in
+    `pairs`: unique inside a widened window is weaker evidence than unique
+    inside the exact one, and only the consumer can put that on the span.
+    Keyed on `tolerance > 0` rather than on the pass index, so a caller that
+    passes `eps_ns=0` gets two strict passes and no pair called tolerant.
     """
     outcome = _JoinOutcome()
     remaining_chats = list(chats)
@@ -359,6 +402,8 @@ def join_chats(
         if not pairs:
             continue
         outcome.pairs.extend(pairs)
+        if tolerance > 0:
+            outcome.tolerant.update(key for key, _ in pairs)
         taken_chats = {key for key, _ in pairs}
         taken_llms = {id(llm) for _, llm in pairs}
         remaining_chats = [c for c in remaining_chats if c.key not in taken_chats]

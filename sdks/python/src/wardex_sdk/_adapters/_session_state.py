@@ -23,6 +23,19 @@ from typing import Any
 from .._assembly import Limitation, SpanDraft, Unit, UnitKey
 from .._protocol._claude_stream import AgentStreamEvent
 
+#: The two provenances a chat span's `input_data` can have, published as the
+#: `wardex.agent.prompt_source` extra on every chat span that carries a prompt.
+#: They double as the internal pending-source states on `_Session`, which is
+#: why they live beside it. The two SHAPES differ on the wire, and the extra is
+#: what lets a consumer parse `input_data`: "stream" is the byte-exact
+#: message-object JSON slice from the transport tee (content authority); "hook"
+#: is the CLI's re-decoded prompt text from the `UserPromptSubmit` payload — the
+#: degraded fallback for a write the stream did not record, published as the
+#: text wardex actually saw rather than dressed up as a message object wardex
+#: never saw.
+_PROMPT_STREAM = "stream"
+_PROMPT_HOOK = "hook"
+
 
 @dataclass
 class _BridgeBinding:
@@ -93,6 +106,15 @@ class _OpenTool:
     #: in-process handler wrapper may have taken the key over in between — which
     #: is exactly what happens for every SDK MCP tool.
     claim_key: UnitKey | None = None
+    #: The hook that CREATED this record reached its session only because that
+    #: session was the sole live one (`_session_for_hook`'s last tier) — neither
+    #: the scope nor the payload's id named it. Carried on the record because
+    #: the span is built at CLOSE, possibly from a later hook that was attributed
+    #: properly, and the guess the record was born from must still reach the
+    #: wire as `UNIT_INFERRED_SOLE`. A closing hook that finds this record by its
+    #: `tool_use_id` does not clear it: an id match proves the two hooks describe
+    #: one call, not that the call belongs to this session.
+    sole_inferred: bool = False
 
 
 @dataclass
@@ -127,6 +149,12 @@ class _EvictedTool:
     name: str
     agent_id: str | None
     completed: bool = False
+    #: `_OpenTool.sole_inferred`, kept across the eviction for the same reason
+    #: `start_ns` and `agent_id` are: the completion half is rebuilt from this
+    #: breadcrumb, and a flag the record was born with is exactly what the
+    #: completion cannot re-derive. One bool, not payload bytes, so the bound
+    #: still reclaims what it exists to reclaim.
+    sole_inferred: bool = False
 
 
 @dataclass
@@ -178,7 +206,7 @@ class _Session:
     #: most one prompt pends per session — a new observation REPLACES it
     #: (counted), never appends, so the slot is bounded by construction — and
     #: it is consumed exactly once, by the first main-thread assistant turn.
-    #: All three `pending_prompt*` fields are cleared together at consumption
+    #: All four `pending_prompt*` fields are cleared together at consumption
     #: and destroyed with this record on close/evict/teardown.
     pending_prompt: bytes = b""
     #: Which channel recorded `pending_prompt`: "stream" (the byte-exact
@@ -190,6 +218,12 @@ class _Session:
     #: hook. A second submit while the same prompt still pends then reads as a
     #: NEW user turn whose write the stream missed, not as a duplicate.
     pending_prompt_hook_seen: bool = False
+    #: The pending prompt (and the turn boundary it set) came from a
+    #: `UserPromptSubmit` hook that reached this session only as the sole live
+    #: one. The chat span that consumes the prompt is built out of that guess,
+    #: so it carries `UNIT_INFERRED_SOLE`. Written wherever `pending_prompt` is,
+    #: so the flag cannot outlive the prompt it describes.
+    pending_prompt_sole_inferred: bool = False
     open_tools: dict[str, _OpenTool] = field(default_factory=dict)  # keyed by tool_use_id
     subagents: dict[str, _OpenSubagent] = field(default_factory=dict)  # keyed by agent_id
     #: What the two span-owning tables above leave behind when the bound evicts

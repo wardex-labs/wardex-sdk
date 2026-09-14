@@ -931,6 +931,107 @@ def test_an_unattributable_hook_is_counted_rather_than_silently_discarded(tallie
     assert tallies("adapters.assembler.hook_session_unresolved") == 2
 
 
+def test_a_hook_attributed_to_the_sole_live_session_says_so_on_its_span(tallies):
+    """The inference the docstring promised to mark, marked on the wire.
+
+    One session live, no session in scope, and an id that names nothing this
+    assembler holds: `_session_for_hook` takes the only live session. That is the
+    right answer far more often than not — hooks legitimately arrive before the
+    stream's `system/init` — but it is also exactly what a LATE hook from a CLI
+    whose session was already retired looks like, and then the tool call lands
+    under someone else's run. The counter alone left the resulting span
+    byte-identical to one whose session was proven by scope, so nothing
+    downstream could tell the two apart. The span now carries
+    `UNIT_INFERRED_SOLE`, the member the unit registry already uses for the same
+    decision one layer down.
+    """
+    client = FakeClient()
+    asm = SessionAssembler(client)
+    _outbound(asm, key=1)
+    asm.on_inbound(1, INIT)
+
+    asm.on_hook(
+        "PreToolUse",
+        {"session_id": "s-nobody", "tool_name": "Bash", "tool_input": {}},
+        "toolu_y",
+    )
+    asm.on_hook(
+        "PostToolUse",
+        {"session_id": "s-nobody", "tool_name": "Bash", "tool_response": "ok"},
+        "toolu_y",
+    )
+
+    (tool,) = [s for s in client.spans if s.name == "execute_tool Bash"]
+    assert Limitation.UNIT_INFERRED_SOLE in tool.capture_integrity.limitations
+    assert tallies("adapters.assembler.hook_session_inferred_sole") == 2
+    assert tallies("adapters.assembler.hook_session_unresolved") == 0
+
+
+def test_only_the_spans_an_inferred_hook_creates_carry_the_inference_marker(tallies):
+    """The marker follows the HOOK that was inferred, never the session.
+
+    A sub-agent opened by an inferred `SubagentStart` and a chat turn whose
+    boundary and prompt an inferred `UserPromptSubmit` seeded are both built out
+    of that guess, so both say so. A tool call the same session later proves by
+    its own session id is not: marking the whole session would charge one
+    payload's missing id to every span of the run, which is the same
+    over-reach that keeps `CORRELATION_CONFLICT` off the session root.
+    """
+    client = FakeClient()
+    asm = SessionAssembler(client)
+    asm.on_inbound(1, INIT)
+
+    asm.on_hook(
+        "SubagentStart",
+        {"session_id": "s-late", "agent_id": "a-1", "agent_type": "researcher"},
+        None,
+    )
+    asm.on_hook("UserPromptSubmit", {"session_id": "s-late", "prompt": "hello"}, None)
+    asm.on_inbound(1, ASSISTANT_2)
+    asm.on_hook("SubagentStop", {"session_id": "s-1", "agent_id": "a-1"}, None)
+    asm.on_hook(
+        "PreToolUse",
+        {"session_id": "s-1", "tool_name": "Bash", "tool_input": {}},
+        "toolu_proven",
+    )
+    asm.on_hook(
+        "PostToolUse",
+        {"session_id": "s-1", "tool_name": "Bash", "tool_response": "ok"},
+        "toolu_proven",
+    )
+    asm.on_inbound(1, RESULT)
+    asm.on_close(1, None)
+
+    sub = next(s for s in client.spans if s.agent and s.agent.name == "researcher")
+    (chat,) = [s for s in client.spans if s.name.startswith("chat")]
+    (tool,) = [s for s in client.spans if s.name == "execute_tool Bash"]
+    root = next(s for s in client.spans if s.parent_span_id is None)
+
+    assert Limitation.UNIT_INFERRED_SOLE in sub.capture_integrity.limitations
+    assert ("wardex.agent.prompt_source", "hook") in chat.extra
+    assert Limitation.UNIT_INFERRED_SOLE in chat.capture_integrity.limitations
+    assert Limitation.UNIT_INFERRED_SOLE not in tool.capture_integrity.limitations
+    assert Limitation.UNIT_INFERRED_SOLE not in root.capture_integrity.limitations
+    assert tallies("adapters.assembler.hook_session_inferred_sole") == 2
+
+
+def test_a_stream_prompt_that_replaces_an_inferred_one_is_not_marked(tallies):
+    """The prompt slot's inference flag lives and dies with the prompt it
+    describes: once the stream's own write replaces a hook-seeded prompt, the
+    turn it starts owes nothing to the guess, so its chat ships unmarked."""
+    client = FakeClient()
+    asm = SessionAssembler(client)
+    asm.on_inbound(1, INIT)
+    asm.on_hook("UserPromptSubmit", {"session_id": "s-late", "prompt": "hello"}, None)
+    _outbound(asm, key=1, text="from the stream")
+    asm.on_inbound(1, ASSISTANT_2)
+
+    (chat,) = [s for s in client.spans if s.name.startswith("chat")]
+    assert ("wardex.agent.prompt_source", "stream") in chat.extra
+    assert Limitation.UNIT_INFERRED_SOLE not in chat.capture_integrity.limitations
+    assert tallies("adapters.assembler.hook_session_inferred_sole") == 1
+
+
 def test_a_registry_evicted_session_is_retired_and_the_run_resumes_on_a_fresh_root(tallies):
     """The OTHER bound, and the one that had no reconciliation path at all.
 

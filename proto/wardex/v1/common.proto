@@ -362,6 +362,17 @@ enum Limitation {
   LIMITATION_OTEL_BRIDGE_NO_DATA = 41;
   LIMITATION_OTEL_BRIDGE_SCHEMA_UNKNOWN = 42;
 
+  // -- Agent SDK OTel bridge, join quality. Rides a CHAT span the bridge merged
+  //    with a CLI `claude_code.llm_request` that only the join's tolerance
+  //    pass (the chat window widened by one second) could place. The span
+  //    takes the CLI's interval and ttft but keeps the IPC-timing markers
+  //    (TRANSPORT_TIMING_UNAVAILABLE_SUBPROCESS, TTFT_IPC_APPROXIMATION),
+  //    because when a chat's own request never reached the bridge the request
+  //    inside the widened window is a neighbour's. Reader's next action: read
+  //    this span's timing as an estimate. Not CORRELATION_CONFLICT (3):
+  //    nothing disagreed; the evidence is only weaker than an exact fit.
+  LIMITATION_OTEL_BRIDGE_JOIN_TOLERANT = 52;
+
   // A META value, not vocabulary — hence the separate number band. It means
   // "the sending SDK held a marker this schema has no value for", and it always
   // travels with the original string in `Span.extra["wardex.limitation.unmapped"]`.
