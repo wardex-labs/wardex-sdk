@@ -47,13 +47,11 @@ reason to stop tracking a draft and never a reason to promote one the
 arbitration rejected.
 
 The other two hold no span, so their evictions emit NOTHING when they happen,
-and what reaches the data is the CONSEQUENCE. An evicted claim key forgets who
-owned the arbitration, so a lower-ranked observer of the same event can win it
-again and open a second span for one call. A dropped alias's would read
-backwards — the rung below a 0.9 alias hit is the ambient scope at 1.0, so a
-sub-agent would hang off its session with confidence UP and the edge WORSE — so
-it is marked: `_forgotten.py` remembers the dropped ids, and the next edge that
-asks for one carries `ALIAS_FORGOTTEN` at no more than 0.9.
+and what reaches the data is the CONSEQUENCE. An evicted claim key lets a
+lower-ranked observer win the arbitration again: two spans for one call. A
+dropped alias's would read backwards (a sub-agent hung off its session at 1.0,
+up from 0.9), so `_forgotten.py` remembers the dropped ids, and an edge the
+loss actually changed carries `ALIAS_FORGOTTEN` at no more than 0.9.
 
 Every per-unit eviction counts (`child_table_full`, `open_span_table_full`,
 `alias_table_full`, `claim_table_full`); the root evictions do not, because the
@@ -1238,10 +1236,12 @@ class UnitRegistry:
                 return None
             return unit
 
-    def alias_was_forgotten(self, alias: UnitKey) -> bool:
-        """After a `find()` miss: did the alias bound drop it? Counted. See `_forgotten`."""
+    def alias_was_forgotten(
+        self, alias: UnitKey, *, amb: Ambient | None = None, holder: Unit | None = None
+    ) -> bool:
+        """After a `find()` miss: was it dropped, at a cost to this edge? See `_forgotten`."""
         with self._lock:
-            return self._forgotten.recall(alias)
+            return self._forgotten.recall(alias, amb=amb, holder=holder)
 
     def resolve_link_target(self, selector: UnitKey) -> SpanContext | None:
         """A span context to LINK to — live alias first, then closed memory.
@@ -1592,7 +1592,7 @@ class UnitRegistry:
             # captured earlier ON THE CORRECT TASK, addressed by the framework id.
             return unit.child(Evidence(ParentSource.UNIT_ALIAS, request_id=hint))
 
-        if alias is not None and self.alias_was_forgotten(alias):  # never the rung below, unmarked
+        if alias is not None and self.alias_was_forgotten(alias, amb=amb):  # marked, if it cost
             return forgotten_edge(self.sole_live(UnitKind.SESSION), amb, hint)
         if amb.span_context is not None:
             return resolve_parentage(amb, AMBIENT)

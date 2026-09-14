@@ -68,6 +68,39 @@ def forgotten_edge(sole: Unit | None, amb: Ambient, hint: str | None) -> Parenta
     return edge.with_limitation(Limitation.ALIAS_FORGOTTEN)
 
 
+def _lost_nothing(owner: Unit, amb: Ambient | None, holder: Unit | None) -> bool:
+    """Would the id, still bound to `owner`, have given this same edge anyway?
+
+    The measure is the edge the id gave while it resolved, so the record can
+    never make an edge worse than keeping the id would have — nor mark one the
+    loss did not touch. Two ways the answer is yes:
+
+    - `rejoin`: the live unit `holder` IS `owner` or sits below it. The placement
+      edge lands inside the unit the id named, read off the carrier; the id
+      could only have pulled it up to `owner`, never somewhere more specific.
+    - `UnitRegistry._edge`: the ambient span is in `owner`'s trace and `owner` is
+      not below it. That is the branch where a bound id only corroborates the
+      context (`CONTEXTVAR`, 1.0) — the ambient span is `owner`'s own, or below
+      it, or beside it — so the ordinary ambient rung is the same edge. Only an
+      ambient span ABOVE `owner` (the session root under a pin) or in another
+      trace is a scope the id used to override, and those stay marked.
+    """
+    node = holder
+    while node is not None:
+        if node is owner:
+            return True
+        node = node.parent
+    ctx = amb.span_context if amb is not None else None
+    if ctx is None or ctx.trace_id != owner.context.trace_id:
+        return False
+    node = owner.parent
+    while node is not None:
+        if node.context.span_id == ctx.span_id:
+            return False
+        node = node.parent
+    return True
+
+
 class ForgottenAliases:
     """Dropped alias keys, indexed by key for lookup and by unit for bounding.
 
@@ -93,16 +126,22 @@ class ForgottenAliases:
         ring.append(key)
         self._by_key[key] = unit
 
-    def recall(self, key: UnitKey) -> bool:
-        """Was `key` dropped by the bound? Asking is consuming, and counted.
+    def recall(
+        self, key: UnitKey, *, amb: Ambient | None = None, holder: Unit | None = None
+    ) -> bool:
+        """Did the bound drop `key` AT A COST to the edge being built? Counted when yes.
 
         The callers ask at the moment they are about to build an edge from a
         `find()` miss, so `alias_forgotten_consumed` says how many edges the
         bound degraded, where `alias_table_full` says how many ids it dropped.
         The record is NOT removed by asking: a second lookup of the same id is
         the same loss, and must say so again.
+
+        A recorded id whose loss changed nothing answers no, unmarked and
+        uncounted — see `_lost_nothing` for when that is.
         """
-        if key not in self._by_key:
+        owner = self._by_key.get(key)
+        if owner is None or _lost_nothing(owner, amb, holder):
             return False
         counters.bump("assembly._units.alias_forgotten_consumed")
         return True

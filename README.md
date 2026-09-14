@@ -908,11 +908,16 @@ the ambient wardex span, which for a sub-agent is usually its enclosing
 session, at 1.0. Unmarked, the sub-agent's subtree would flatten into the
 session while the confidence went up. So wardex remembers which identifiers the
 bound dropped (per unit, as many as the alias table holds, oldest forgotten
-first), and a span whose parent was looked up by one of them arrives marked
-**`alias_forgotten`**: parented to the only live session (0.5, also marked
-`unit_inferred_sole`) when there is exactly one, otherwise to the ambient span
-at no more than 0.9, otherwise unparented (also marked `parent_unresolved`).
-Each such span also counts `assembly._units.alias_forgotten_consumed`. If you
+first), and a span whose parent was looked up by one of them, and whose edge
+the loss actually changed, arrives marked **`alias_forgotten`**. Where it lands
+depends on the path. A span the registry resolves goes to the only live session
+(0.5, also marked `unit_inferred_sole`) when there is exactly one, otherwise to
+the ambient span at no more than 0.9, otherwise unparented (also marked
+`parent_unresolved`). A span an adapter reopens under that identifier keeps the
+parent its declared placement gives it, capped at 0.9. When the loss changed
+nothing, nothing is marked: a live scope that is the identifier's own unit, or
+anything below it, is a parent at least as specific as the identifier's.
+Each marked span also counts `assembly._units.alias_forgotten_consumed`. If you
 see the marker, raise `max_entries_per_unit`. The behaviour is pinned by
 `sdks/python/tests/test_units.py::test_a_forgotten_alias_marks_the_next_edge_instead_of_flattening_silently`.
 

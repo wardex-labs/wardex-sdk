@@ -23,6 +23,7 @@ it lost something.
 
 from __future__ import annotations
 
+import contextlib
 import threading
 
 import pytest
@@ -370,22 +371,32 @@ def test_rejoin_on_a_forgotten_alias_lowers_the_edge_and_says_the_id_was_dropped
 
     An id pushed out of a full alias table misses `find()` exactly like an id
     nobody ever bound, and the ordinary miss takes the placement table — here
-    the live run at 1.0, which is ABOVE the 0.9 the id earned while it
-    resolved. Left unmarked that is a lost lookup reading as a better edge; so
-    the miss is still honoured, capped at the alias tier, and marked.
+    the live run at 1.0, which is ABOVE the 0.9 the id earned while it resolved
+    its own sub-agent unit below that run. Left unmarked that is a lost lookup
+    reading as a better edge; so the miss is still honoured, capped at the alias
+    tier, and marked.
     """
     sink = RecordingSink()
     units = UnitRegistry(sink=sink, max_entries_per_unit=2)
     ctx = AdapterContext("test", units=units, limits={})
-    key = UnitKey("test.run", "r1")
+    key = UnitKey("test.agent", "a1")
 
     with ctx.enter(
         UnitKind.SESSION,
         intent=SpanIntent.INVOKE_AGENT,
         placement=Placement.ROOT,
-        selector=key,
+        selector=UnitKey("test.run", "r1"),
         describe=_agent,
     ):
+        # Live, below the run, and NOT ambient: the unit the id used to pick.
+        units.open(
+            UnitKind.AGENT,
+            key,
+            ambient=EMPTY_AMBIENT,
+            parent_unit=units.current(),
+            intent=SpanIntent.INVOKE_AGENT,
+            subject="sub",
+        )
         units.alias(key, UnitKey("extra", "one"))
         units.alias(UnitKey("extra", "one"), UnitKey("extra", "two"))
         with ctx.rejoin(
@@ -402,6 +413,53 @@ def test_rejoin_on_a_forgotten_alias_lowers_the_edge_and_says_the_id_was_dropped
     assert Limitation.ALIAS_FORGOTTEN in markers
     assert Limitation.INSTRUMENTATION_DEGRADED not in markers, "a bound is not a wardex fault"
     assert counters.get("assembly._units.alias_forgotten_consumed") == 1
+    assert not ctx.tripped
+
+
+@pytest.mark.parametrize("nested", [False, True], ids=["in the unit", "below the unit"])
+def test_rejoin_on_a_forgotten_alias_inside_its_own_unit_cost_nothing_and_is_not_marked(nested):
+    """Losing the id costs `rejoin` nothing when the live unit already IS the
+    unit the id named, or sits below it: the placement edge lands there anyway,
+    read off the carrier rather than off the framework's word. Capping and
+    marking that edge would be a false alarm on a correct span.
+    """
+    sink = RecordingSink()
+    units = UnitRegistry(sink=sink, max_entries_per_unit=2)
+    ctx = AdapterContext("test", units=units, limits={})
+    key = UnitKey("test.run", "r1")
+
+    with ctx.enter(
+        UnitKind.SESSION,
+        intent=SpanIntent.INVOKE_AGENT,
+        placement=Placement.ROOT,
+        selector=key,
+        describe=_agent,
+    ):
+        units.alias(key, UnitKey("extra", "one"))
+        units.alias(UnitKey("extra", "one"), UnitKey("extra", "two"))
+        with (
+            ctx.enter(
+                UnitKind.STEP,
+                intent=SpanIntent.EXECUTE_STEP,
+                placement=Placement.NESTED,
+                describe=_step,
+            )
+            if nested
+            else contextlib.nullcontext()
+        ):
+            with ctx.rejoin(
+                key,
+                UnitKind.STEP,
+                intent=SpanIntent.EXECUTE_STEP,
+                placement=Placement.NESTED,
+                describe=_step,
+            ):
+                pass
+            source, confidence, markers = _edge(sink)
+
+    assert (source, confidence) == (ParentSource.UNIT_ACTIVE, 1.0)
+    assert markers == ()
+    assert counters.get("assembly._units.alias_forgotten_consumed") == 0
     assert not ctx.tripped
 
 

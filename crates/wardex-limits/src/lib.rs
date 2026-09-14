@@ -157,12 +157,12 @@ pub struct Limits {
     /// down its ladder, whose next rung is the ambient span at `1.0` — for a
     /// sub-agent, its enclosing session. So the host SDK remembers which ids
     /// this bound dropped (per unit, FIFO, as many as the alias table holds)
-    /// and a later lookup of one ships marked `alias_forgotten`: on the
-    /// sole-live guess (`0.5`, beside `unit_inferred_sole`), on the ambient
-    /// span capped at `0.9`, or beside `parent_unresolved` (`0.0`). An evicted
-    /// de-duplication key can let one logical call be
-    /// observed twice, and an evicted server handle degrades a hook's tool-name
-    /// lookup to the builtin key space, which can do the same.
+    /// and a later lookup of one whose edge the loss changed ships marked
+    /// `alias_forgotten`: on the sole-live guess (`0.5`, beside
+    /// `unit_inferred_sole`), on the ambient span capped at `0.9`, or beside
+    /// `parent_unresolved` (`0.0`). An evicted de-duplication key can let one
+    /// logical call be observed twice, and an evicted server handle degrades a
+    /// hook's tool-name lookup to the builtin key space, which can do the same.
     pub max_entries_per_unit: usize,
     /// Maximum entries in the unit registry's closed-unit link memory: the
     /// alias-key -> span-context table kept AFTER a unit closes, so a later

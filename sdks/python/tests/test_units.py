@@ -1032,6 +1032,37 @@ def test_a_forgotten_alias_with_nothing_to_fall_to_is_unresolved_and_says_why():
     assert Limitation.ALIAS_FORGOTTEN in p.limitations
 
 
+@pytest.mark.parametrize("sessions", [1, 2])
+@pytest.mark.parametrize("ambient", ["the unit itself", "a unit below it"])
+def test_a_forgotten_alias_under_its_own_unit_cost_nothing_and_is_not_marked(ambient, sessions):
+    """The record says an id was dropped; it does not say the drop cost THIS edge.
+
+    With the id still bound, an ambient scope that is the named unit, or sits
+    anywhere below it, already wins: the id only corroborates it and the edge
+    is `CONTEXTVAR` at 1.0. So losing the id there changes nothing, and neither
+    the sole-session guess (which would hang a sub-agent's work off its session,
+    the flattening the record exists to prevent) nor a capped, marked copy of a
+    correct edge may replace it. One session and two, because the sole-session
+    rung and the ambient rung are the two ways a false positive could ship.
+    """
+    reg = registry(max_entries_per_unit=2)
+    root = open_session(reg)
+    if sessions == 2:
+        open_session(reg, "s2")
+    sub = open_subagent(reg, root)
+    key = _forget_the_subagent_alias(reg, sub)
+    holder = sub if ambient == "the unit itself" else open_subagent(reg, sub, "c1")
+
+    with holder.activate():
+        p = reg.resolve(key)
+
+    assert p.parent_span_id == holder.context.span_id
+    assert p.correlation.strategy is ParentSource.CONTEXTVAR
+    assert p.correlation.confidence == 1.0
+    assert p.limitations == ()
+    assert counters.get("assembly._units.alias_forgotten_consumed") == 0
+
+
 def test_a_forgotten_alias_stops_being_forgotten_when_it_is_bound_again():
     """Rebinding makes the id resolve, so the record of losing it is stale —
     and a stale record would mark a perfectly good alias edge later.

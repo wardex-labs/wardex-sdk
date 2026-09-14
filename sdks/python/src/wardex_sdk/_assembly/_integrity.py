@@ -189,9 +189,9 @@ Two emit sites, and the first is the mechanism the second restates.
     """
 
     ALIAS_FORGOTTEN = "alias_forgotten"
-    """An id the alias bound (``max_entries_per_unit``) dropped was looked up again, so this
-    edge came from a lower rung. Unmarked it reads backwards: below an alias hit (0.9) is the
-    ambient scope at 1.0, where a sub-agent hangs off its session with nothing to say so.
+    """An id the alias bound (``max_entries_per_unit``) dropped was looked up again and the loss
+    changed this edge: it came from a lower rung. Unmarked it reads backwards: below an alias hit
+    (0.9) is the ambient scope at 1.0, where a sub-agent hangs off its session silently.
     Emitted by ``_assembly/_forgotten.py::forgotten_edge`` (``UnitRegistry._edge``'s ladder for
     such a miss, ambient capped at 0.9) and ``_adapters/_context.py::AdapterContext.rejoin``.
     Not ``UNIT_TABLE_FULL`` (that entry owned a span and shipped early), nor

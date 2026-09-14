@@ -87,6 +87,8 @@ All notable changes to this project are documented here. The format follows
   = 51`): on the sole live session (0.5, beside `unit_inferred_sole`), on the
   ambient span capped at 0.9, or beside `parent_unresolved`. A framework
   adapter's `rejoin` on such an identifier is capped and marked the same way.
+  A lookup the loss did not change stays unmarked: under the identifier's own
+  unit, or below it, the live scope is a parent at least as specific as its own.
   Counters: `assembly._units.alias_forgotten_consumed` per marked edge,
   `assembly._units.alias_forgotten_table_full` when the record itself overflows.
 

@@ -822,7 +822,7 @@ class AdapterContext:
         evidence: Evidence | None = None,
         fallback: Fallback = Fallback.NONE,
         conversation: ConversationContext | None = None,
-        forgotten: bool = False,
+        forgotten: UnitKey | None = None,
     ) -> Unit:
         holder = parent if parent is not None else self._units.current()
         # Latched ONCE and used for both the declaration and the open. Two reads would be two
@@ -850,7 +850,8 @@ class AdapterContext:
                 # in a run it has nothing to do with.
                 conflicted = self._units.closed_unit_in_scope()
                 holder, evidence = sole, _SOLE
-        if forgotten:  # see `rejoin`; `open()` swaps AMBIENT by identity, so do it before the cap
+        lost = forgotten is not None and self._units.alias_was_forgotten(forgotten, holder=holder)
+        if lost:  # see `rejoin`; `open()` swaps AMBIENT by identity, so do it before the cap
             evidence = cap_at_alias_tier(_IN_UNIT if evidence is AMBIENT and holder else evidence)
         unit = self._units.open(
             kind,
@@ -865,6 +866,8 @@ class AdapterContext:
             owner=self.name,
             conversation=conversation,
         )
+        if lost:
+            unit.note(Limitation.ALIAS_FORGOTTEN)
         if conflicted:
             # The WORD is the registry's to choose, exactly as it chooses it for
             # the refusal `open()` performs itself: a strand left by the
@@ -1225,7 +1228,6 @@ class AdapterContext:
         scope = None
         ok = False
         with self.guard(f"rejoin.{intent.value}"):
-            forgotten = found and target is None and self._units.alias_was_forgotten(selector)
             unit = self._open(
                 kind,
                 intent=intent,
@@ -1236,12 +1238,10 @@ class AdapterContext:
                 start_ns=None,
                 parent=target,
                 evidence=self._rejoin_evidence(selector, target, found=found),
-                forgotten=forgotten,
+                forgotten=selector if found and target is None else None,
             )
             if not found:
                 unit.note(Limitation.INSTRUMENTATION_DEGRADED)
-            if forgotten:
-                unit.note(Limitation.ALIAS_FORGOTTEN)
             scope = Scope(unit, self)
             if describe is not None:
                 describe(scope)
