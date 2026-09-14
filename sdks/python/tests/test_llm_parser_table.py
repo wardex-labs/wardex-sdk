@@ -47,8 +47,16 @@ _CASES: dict[str, tuple[str, str]] = {
 }
 
 
+#: The negative corpus lives one level down and is NOT a `_CASES` row: its
+#: cases carry their dispatch inputs and their truth in `truth.json` instead of
+#: an `expect.json`, because what they assert is attribution (which provider,
+#: and whether the label was a guess), not the full extraction set above.
+#: `test_every_negative_directory_has_truth` holds that corpus to its own layout.
+_NEGATIVES = _FIXTURES / "negatives"
+
+
 def test_every_fixture_directory_has_a_row():
-    on_disk = {p.name for p in _FIXTURES.iterdir() if p.is_dir()}
+    on_disk = {p.name for p in _FIXTURES.iterdir() if p.is_dir() and p != _NEGATIVES}
     assert on_disk == set(_CASES), (
         f"fixtures with no table row: {sorted(on_disk - set(_CASES))}; "
         f"rows with no fixture: {sorted(set(_CASES) - on_disk)}"
@@ -132,3 +140,96 @@ def test_fixture_parses_to_its_expectation(case: str):
     if "error_code" in expect:
         body = json.loads(bytes(sem.decoded_response))
         assert body["error"]["code"] == expect["error_code"], case
+
+
+# ---------------------------------------------------------------------------
+# Provider attribution: the misattribution rate over positives + negatives
+# ---------------------------------------------------------------------------
+
+#: The ceiling every place the SDK infers rather than observes is held to. With a
+#: corpus this small it is a statement about ZERO: 0.1 % of 18 cases is less
+#: than one case, so a single misattribution fails the gate, and the failure
+#: message says "N of M" so nobody reads the percentage as more resolution
+#: than the corpus has.
+_MISATTRIBUTION_CEILING = 0.001
+
+#: Hosts that ARE the provider's own. A label read off one of these is proven;
+#: every other label is a guess and must say so.
+_OFFICIAL_HOSTS = frozenset({"api.openai.com", "api.anthropic.com"})
+
+
+def _negative_cases() -> dict[str, dict]:
+    return {
+        d.name: json.loads((d / "truth.json").read_text())
+        for d in sorted(_NEGATIVES.iterdir())
+        if d.is_dir()
+    }
+
+
+def test_every_negative_directory_has_truth():
+    """Each negative case mirrors the positive layout (request + response)
+    and adds its truth and its provenance, so a case cannot join the corpus
+    without saying what the right answer is and where the bytes came from."""
+    cases = _negative_cases()
+    assert len(cases) >= 3, sorted(cases)
+    for case, truth in cases.items():
+        d = _NEGATIVES / case
+        assert (d / "request.json").exists(), case
+        assert (d / "response.json").exists() or (d / "stream.sse").exists(), case
+        assert (d / "provenance.md").read_text().strip(), case
+        assert {"host", "path", "provider", "inferred"} <= set(truth), case
+        assert isinstance(truth["inferred"], bool), case
+
+
+def _attribution_corpus() -> list[tuple[str, str, str, bytes, bytes, str, bool]]:
+    """(case, host, path, request, response, true provider, truly inferred).
+
+    Positives take their truth from `expect.json` and are inferred exactly
+    when their host is not the provider's own (all fifteen are official
+    today). Negatives take it from `truth.json`.
+    """
+    corpus = []
+    for case, (host, path) in sorted(_CASES.items()):
+        request, response, expect = _load(case)
+        corpus.append(
+            (case, host, path, request, response, expect["provider"], host not in _OFFICIAL_HOSTS)
+        )
+    for case, truth in _negative_cases().items():
+        d = _NEGATIVES / case
+        body = d / "response.json"
+        response = body.read_bytes() if body.exists() else (d / "stream.sse").read_bytes()
+        corpus.append(
+            (
+                f"negatives/{case}",
+                truth["host"],
+                truth["path"],
+                (d / "request.json").read_bytes(),
+                response,
+                truth["provider"],
+                truth["inferred"],
+            )
+        )
+    return corpus
+
+
+def test_provider_misattribution_rate_is_under_the_ceiling():
+    """A case is MISATTRIBUTED when the provider label differs from the truth,
+    or when a label the truth calls inferred reaches Python without
+    `provider_inferred` (a guess presented as a fact is the failure this gate
+    exists for), or when a proven label is flagged as a guess (a marker on
+    every span would make the marker mean nothing)."""
+    corpus = _attribution_corpus()
+    wrong: list[str] = []
+    for case, host, path, request, response, provider, inferred in corpus:
+        sem = parse_llm_semantics(host, path, request, response, LimitsConfig().to_native())
+        got_provider = sem.provider if sem is not None else None
+        got_inferred = bool(sem.provider_inferred) if sem is not None else False
+        if got_provider != provider:
+            wrong.append(f"{case}: label {got_provider!r}, truth {provider!r}")
+        elif got_inferred != inferred:
+            wrong.append(f"{case}: inferred={got_inferred}, truth inferred={inferred}")
+    rate = len(wrong) / len(corpus)
+    assert rate <= _MISATTRIBUTION_CEILING, (
+        f"provider misattribution {len(wrong)} of {len(corpus)} "
+        f"({rate:.1%}, ceiling {_MISATTRIBUTION_CEILING:.1%} = 0 of {len(corpus)}): {wrong}"
+    )

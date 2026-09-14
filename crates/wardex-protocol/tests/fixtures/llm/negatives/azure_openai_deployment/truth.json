@@ -1,0 +1,7 @@
+{
+ "host": "prod-east.openai.azure.com",
+ "path": "/openai/deployments/gpt-4o-mini-prod/chat/completions?api-version=2024-10-21",
+ "provider": "openai",
+ "inferred": true,
+ "why": "An Azure OpenAI deployment is labelled openai by the host substring, not by an official openai.com host. There is no azure_openai label yet, so openai is the deliberate alias and the label must carry the inference marker."
+}

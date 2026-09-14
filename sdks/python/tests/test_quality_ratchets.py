@@ -290,8 +290,10 @@ _OVERSIZED_BUDGET = {
     # Raised by exactly one member (h2_request_evicted, 53): the closed
     # Limitation enum cannot move a member out, and the census demands each
     # one carry its own provenance docstring in this module. Every line of
-    # prose around the member stayed on the diet.
-    "_assembly/_integrity.py": 1088,
+    # prose around the member stayed on the diet. Lowered to 1083 when
+    # provider_inferred (54) paid for its docstring by rewrapping two
+    # sections' docstrings to the line length, words unchanged.
+    "_assembly/_integrity.py": 1083,
     "_assembly/_builder.py": 970,
     "_adapters/_anthropic_agent_sdk.py": 944,
 }

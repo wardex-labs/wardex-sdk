@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from .._assembly import counters
+from .._assembly import Limitation, counters
 from .._enums import OperationName, ProviderName
 from .._types import EmbeddingsAttributes, GenAIAttributes
 
@@ -100,6 +100,24 @@ def identifies_llm_call(sem: Any) -> bool:
         and bool(getattr(sem, "operation", ""))
         and getattr(sem, "request_model", None) is not None
     )
+
+
+def provider_limitation(sem: Any) -> Limitation | None:
+    """`PROVIDER_INFERRED` when the provider label is a guess, else None.
+
+    The native parser proves a label only off the provider's own host; a
+    hostname that merely contains the name, a body shape or an API shape sets
+    `provider_inferred`. The count travels with the marker as one fact, so the
+    seam asks this only for a span that will carry the label (`build_gen_ai`
+    ran). `getattr` for the same reason as `identifies_llm_call`.
+    """
+    if not getattr(sem, "provider_inferred", False):
+        return None
+    counters.bump("protocol.semantic.provider_inferred")
+    # Spelled into a marker-ish name so the limitation census reads the member
+    # here, where it is decided; the seam only forwards it.
+    limitation = Limitation.PROVIDER_INFERRED
+    return limitation
 
 
 def build_gen_ai(sem: Any) -> GenAIAttributes:

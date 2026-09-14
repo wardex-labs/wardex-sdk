@@ -1,0 +1,32 @@
+{
+ "id": "chatcmpl-fx1",
+ "object": "chat.completion",
+ "model": "gpt-4o-mini-2024-07-18",
+ "service_tier": "default",
+ "system_fingerprint": "fp_fx1",
+ "choices": [
+  {
+   "index": 0,
+   "finish_reason": "stop",
+   "message": {
+    "role": "assistant",
+    "content": "Hello!"
+   }
+  }
+ ],
+ "usage": {
+  "prompt_tokens": 19,
+  "completion_tokens": 4,
+  "total_tokens": 23,
+  "prompt_tokens_details": {
+   "cached_tokens": 8,
+   "audio_tokens": 0
+  },
+  "completion_tokens_details": {
+   "reasoning_tokens": 2,
+   "audio_tokens": 0,
+   "accepted_prediction_tokens": 0,
+   "rejected_prediction_tokens": 0
+  }
+ }
+}

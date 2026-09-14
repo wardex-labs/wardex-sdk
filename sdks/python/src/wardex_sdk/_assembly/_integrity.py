@@ -864,73 +864,75 @@ Two emit sites, and the first is the mechanism the second restates.
     # ------------------------------------------------------------------
 
     FRAME_PARSE_FAILED = "frame_parse_failed"
-    """The framing layer failed, so the transport fields on this span are
-    partial or synthesized.
+    """The framing layer failed, so the transport fields on this span are partial or synthesized.
 
-    Emitted from ``_semantics/_grpc.py::build_grpc_fields`` (gRPC frame
-    parse raised; the span falls back to plain h2 fields) and
-    ``_interceptors/_trackers.py::_WebSocketTracker._build_txn`` (either
-    direction's frame parser latched off). Before the census those two sites
-    emitted the free strings ``grpc_parse_failed`` and ``ws_parse_failed``.
+    Emitted from ``_semantics/_grpc.py::build_grpc_fields`` (gRPC frame parse raised; the span falls
+    back to plain h2 fields) and ``_interceptors/_trackers.py::_WebSocketTracker._build_txn``
+    (either direction's frame parser latched off). Before the census those two sites emitted the
+    free strings ``grpc_parse_failed`` and ``ws_parse_failed``.
 
-    This member carries a LIMIT as well as a bug, which its name does not say:
-    a WebSocket frame whose declared payload exceeds ``max_ws_frame_bytes``
-    makes ``crates/wardex-protocol/src/websocket.rs`` return ``ParseStep::Error``
-    and latch ``disabled``, which the tracker reads back as ``ws_parse_failed``.
-    So a user who sees this on a WebSocket span has two candidate causes — a
-    desynced parser and a frame above the cap — and only the second has a knob.
-    ``WS_PAYLOAD_TRUNCATED`` is NOT that knob; see its docstring.
+    This member carries a LIMIT as well as a bug, which its name does not say: a WebSocket frame
+    whose declared payload exceeds ``max_ws_frame_bytes`` makes
+    ``crates/wardex-protocol/src/websocket.rs`` return ``ParseStep::Error`` and latch ``disabled``,
+    which the tracker reads back as ``ws_parse_failed``. So a user who sees this on a WebSocket span
+    has two candidate causes — a desynced parser and a frame above the cap — and only the second has
+    a knob. ``WS_PAYLOAD_TRUNCATED`` is NOT that knob; see its docstring.
 
-    NOTE (census): merged, and deliberately NOT merged with
-    ``SEMANTIC_PARSE_FAILED``. That one is a different layer — framing
-    succeeded and the transport fields are valid — and it leads to a different
-    follow-up (parser bug vs unsupported provider).
+    NOTE (census): merged, and deliberately NOT merged with ``SEMANTIC_PARSE_FAILED``. That one is a
+    different layer — framing succeeded and the transport fields are valid — and it leads to a
+    different follow-up (parser bug vs unsupported provider).
     """
 
     SEMANTIC_PARSE_FAILED = "semantic_parse_failed"
-    """Framing succeeded but the LLM body parser produced no core semantics and
-    no output messages, so the span has transport truth and no gen_ai truth.
+    """Framing succeeded but the LLM body parser produced no core semantics and no output messages,
+    so the span has transport truth and no gen_ai truth.
 
     Emitted from ``_interceptors/_seam.py::ByteSeamInterceptor._build_span``.
     """
 
     PAYLOAD_COMPRESSED = "payload_compressed"
-    """The payload was observed compressed and wardex did not decompress it, so
-    body bytes on this span are not readable content.
+    """The payload was observed compressed and wardex did not decompress it, so body bytes on this
+    span are not readable content.
 
-    Emitted from ``_semantics/_grpc.py::build_grpc_fields`` (any request or
-    response message had its compressed flag set) and
-    ``_interceptors/_trackers.py::_WebSocketTracker._build_txn``
-    (permessage-deflate negotiated). Before the census those two sites emitted
-    the free strings ``grpc_compressed`` and ``ws_compressed``.
+    Emitted from ``_semantics/_grpc.py::build_grpc_fields`` (any request or response message had its
+    compressed flag set) and ``_interceptors/_trackers.py::_WebSocketTracker._build_txn``
+    (permessage-deflate negotiated). Before the census those two sites emitted the free strings
+    ``grpc_compressed`` and ``ws_compressed``.
 
-    NOTE (census): merged. What is lost is which protocol it was —
-    ``TransportAttributes.protocol`` already carries that, and encoding a
-    protocol into a marker duplicates a field.
+    NOTE (census): merged. What is lost is which protocol it was — ``TransportAttributes.protocol``
+    already carries that, and encoding a protocol into a marker duplicates a field.
     """
 
     TOOL_ARGS_UNPARSED = "tool_args_unparsed"
-    """A tool call was found in the response but its arguments were not valid
-    JSON, so they are carried as an opaque string.
+    """A tool call was found in the response but its arguments were not valid JSON, so they are
+    carried as an opaque string.
 
     Emitted from ``_interceptors/_seam.py::ByteSeamInterceptor._build_span``.
     """
 
     OUTPUT_MESSAGES_UNMAPPED_PART = "output_messages_unmapped_part"
-    """``gen_ai.output.messages`` was reconstructed with at least one part the
-    mapper did not recognize, so the *response* replay is incomplete.
+    """``gen_ai.output.messages`` was reconstructed with at least one part the mapper did not
+    recognize, so the *response* replay is incomplete.
 
-    Emitted from ``_interceptors/_seam.py::ByteSeamInterceptor._build_span``.
-    Deliberately NOT merged with the input-side marker: in a forensic replay,
-    an incomplete response and an incomplete prompt support different
-    conclusions.
+    Emitted from ``_interceptors/_seam.py::ByteSeamInterceptor._build_span``. Deliberately NOT
+    merged with the input-side marker: in a forensic replay, an incomplete response and an
+    incomplete prompt support different conclusions.
     """
 
     INPUT_MESSAGES_UNMAPPED_PART = "input_messages_unmapped_part"
-    """``gen_ai.input.messages`` was reconstructed with at least one part the
-    mapper did not recognize, so the *prompt* replay is incomplete.
+    """``gen_ai.input.messages`` was reconstructed with at least one part the mapper did not
+    recognize, so the *prompt* replay is incomplete.
 
     Emitted from ``_interceptors/_seam.py::ByteSeamInterceptor._build_span``.
+    """
+
+    PROVIDER_INFERRED = "provider_inferred"
+    """``gen_ai.provider.name`` is a guess: not read off the provider's own host but off a hostname
+    that merely contains its name (proxy, mock, Azure deployment), the body shape, or the API shape.
+
+    Decided by ``_semantics/_genai.py::provider_limitation`` from the native ``provider_inferred``,
+    counted as ``protocol.semantic.provider_inferred``, attached by ``_seam.py::_assemble`` on an
+    identified span. Names NO knob; not ``SSE_UNKNOWN_PROVIDER``, where no label exists at all.
     """
 
     # ------------------------------------------------------------------
@@ -964,58 +966,51 @@ Two emit sites, and the first is the mechanism the second restates.
     # ------------------------------------------------------------------
 
     GRPC_WEB_UNSUPPORTED = "grpc_web_unsupported"
-    """The content type was ``application/grpc-web``, whose framing wardex does
-    not parse; the span was left as plain HTTP/2.
+    """The content type was ``application/grpc-web``, whose framing wardex does not parse; the span
+    was left as plain HTTP/2.
 
     Emitted from ``_interceptors/_seam.py::ByteSeamInterceptor._build_span``.
     """
 
     GRPC_STATUS_UNAVAILABLE = "grpc_status_unavailable"
-    """No ``grpc-status`` was observed — trailers-only response, or trailers the
-    seam never saw — so the span's status is derived from HTTP alone.
+    """No ``grpc-status`` was observed — trailers-only response, or trailers the seam never saw — so
+    the span's status is derived from HTTP alone.
 
     Emitted from ``_semantics/_grpc.py::build_grpc_fields``.
     """
 
     WS_NO_CLOSE = "ws_no_close"
-    """The WebSocket span was emitted without ever seeing a CLOSE frame, so its
-    close code and duration are not trustworthy.
+    """The WebSocket span was emitted without ever seeing a CLOSE frame, so its close code and
+    duration are not trustworthy.
 
     Emitted from ``_interceptors/_seam.py::ByteSeamInterceptor._retire``, via
-    ``_WebSocketTracker.flush(marker)``, reached from ``uninstall()`` and from
-    the shared socket-close hook (``_connection_closed``). The uninstall path
-    travels alongside ``ADAPTER_UNINSTALLED``; see that member for why they
-    stay two markers.
+    ``_WebSocketTracker.flush(marker)``, reached from ``uninstall()`` and from the shared
+    socket-close hook (``_connection_closed``). The uninstall path travels alongside
+    ``ADAPTER_UNINSTALLED``; see that member for why they stay two markers.
     """
 
     WS_LLM_SEMANTICS_UNREAD = "ws_llm_semantics_unread"
-    """A WebSocket connection carried LLM calls wardex read none of: the
-    upgrade path is a row the endpoint table marks WebSocket-capable (the
-    OpenAI Responses API, ``wss://…/v1/responses``, the openai-agents SDK's
-    opt-in transport), the host is that provider's own (``api.openai.com`` or
-    a subdomain of ``openai.com``) — or, on any other host, the first client
-    message is a Responses ``response.create`` — and at least
-    one client message crossed (on the provider's host, client bytes the
-    framing parser could not read count as crossed, and ``FRAME_PARSE_FAILED``
-    rides along). Responses events inside WebSocket frames are not parsed,
-    by decision, so the span carries transport counts and payload samples but
-    no model, tokens or messages; ``ws.messages.sent`` approximates the
-    calls. Reader's next action: the framework's HTTP transport
-    (openai-agents ``use_responses_websocket=False``, the default) yields
-    gen_ai spans. Names NO knob.
+    """A WebSocket connection carried LLM calls wardex read none of: the upgrade path is a row the
+    endpoint table marks WebSocket-capable (the OpenAI Responses API, ``wss://…/v1/responses``, the
+    openai-agents SDK's opt-in transport), the host is that provider's own (``api.openai.com`` or a
+    subdomain of ``openai.com``) — or, on any other host, the first client message is a Responses
+    ``response.create`` — and at least one client message crossed (on the provider's host, client
+    bytes the framing parser could not read count as crossed, and ``FRAME_PARSE_FAILED`` rides
+    along). Responses events inside WebSocket frames are not parsed, by decision, so the span
+    carries transport counts and payload samples but no model, tokens or messages;
+    ``ws.messages.sent`` approximates the calls. Reader's next action: the framework's HTTP
+    transport (openai-agents ``use_responses_websocket=False``, the default) yields gen_ai spans.
+    Names NO knob.
 
-    Not ``FRAME_PARSE_FAILED``: that is the framing layer's own failure,
-    which this marker neither implies nor excludes. Not
-    ``SEMANTIC_PARSE_FAILED``: no parser ran; none exists for this transport.
-    Not ``SSE_UNKNOWN_PROVIDER``: provider and endpoint are KNOWN; the
-    transport is the gap. Not ``PARSE_BACKLOG_FULL`` /
-    ``PARSE_SKIPPED_AT_SHUTDOWN``: those skip a parse for capacity and a knob
-    restores it.
+    Not ``FRAME_PARSE_FAILED``: that is the framing layer's own failure, which this marker neither
+    implies nor excludes. Not ``SEMANTIC_PARSE_FAILED``: no parser ran; none exists for this
+    transport. Not ``SSE_UNKNOWN_PROVIDER``: provider and endpoint are KNOWN; the transport is the
+    gap. Not ``PARSE_BACKLOG_FULL`` / ``PARSE_SKIPPED_AT_SHUTDOWN``: those skip a parse for capacity
+    and a knob restores it.
 
-    Emitted from ``_interceptors/_trackers.py::_WebSocketTracker._build_txn``,
-    decided on the first client message and stamped at close; the seam's gate
-    reads the same fact (``_Txn.ws_llm_call``) as a capture claim, and
-    ``_seam.py::_build_ws_span`` counts it — at close, before the gate.
+    Emitted from ``_interceptors/_trackers.py::_WebSocketTracker._build_txn``, decided on the first
+    client message and stamped at close; the seam's gate reads the same fact (``_Txn.ws_llm_call``)
+    as a capture claim, and ``_seam.py::_build_ws_span`` counts it — at close, before the gate.
     """
 
     # ------------------------------------------------------------------

@@ -55,6 +55,9 @@ _SEAM_CONSUMED = frozenset(
         # read by build_gen_ai, tallied into the diagnostics registry.
         "usage_totals_unpaired",
         "usage_overflowed",
+        # The provider label's inference flag: `provider_limitation` turns it
+        # into the PROVIDER_INFERRED marker and its count.
+        "provider_inferred",
     }
 )
 
@@ -89,14 +92,14 @@ def test_the_surface_partition_is_exhaustive_and_disjoint():
     for i, a in enumerate(sets):
         for b in sets[i + 1 :]:
             assert not (a & b), f"claimed twice: {sorted(a & b)}"
-    # The partition arithmetic the integration record pins: 20 + 6 + 4 + 14.
+    # The partition arithmetic the integration record pins: 20 + 6 + 4 + 15.
     assert (len(fields), len(_GEN_AI_TRANSFORMED), len(extras), len(_SEAM_CONSUMED)) == (
         20,
         6,
         4,
-        14,
+        15,
     )
-    assert len(surface) == 44
+    assert len(surface) == 45
 
 
 def test_every_seam_consumed_name_appears_in_a_consumer_source():

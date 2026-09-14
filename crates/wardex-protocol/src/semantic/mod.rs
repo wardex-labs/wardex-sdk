@@ -32,7 +32,12 @@ use wardex_limits::Limits;
 /// Neutral semantic fields absorbing per-provider differences. All Option (None = not extracted).
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct LlmSemantics {
-    pub provider: String,  // "openai" | "anthropic"
+    pub provider: String, // "openai" | "anthropic"
+    /// `provider` is a guess: it was not read off one of that provider's own
+    /// hosts (`endpoint::is_official_host`) but off a hostname that merely
+    /// contains a provider's name, the response body's shape, or the API
+    /// shape of the path. False when `provider` is empty (nothing labelled).
+    pub provider_inferred: bool,
     pub operation: String, // "chat" | "embeddings"
     pub request_model: Option<String>,
     pub response_model: Option<String>,
@@ -118,6 +123,9 @@ impl StringOrVec {
     }
 }
 
+/// The provider label a hostname SUGGESTS, by substring. A hint, not proof:
+/// `myopenai-proxy.internal` and `prod.openai.azure.com` both answer
+/// `openai`. Whether a label is proven is `label_inferred`'s question.
 fn provider_from_host(host: &str) -> Option<&'static str> {
     if host.contains("openai") {
         Some("openai")
@@ -126,6 +134,13 @@ fn provider_from_host(host: &str) -> Option<&'static str> {
     } else {
         None
     }
+}
+
+/// A label is proven only when the host is that provider's own; every other
+/// route to it (host substring, body shape, API shape) is an inference the
+/// span must mark.
+fn label_inferred(provider: &str, host: &str) -> bool {
+    !provider.is_empty() && !endpoint::is_official_host(provider, host)
 }
 
 /// If the body is SSE, reassemble it for semantic extraction. Otherwise None (falls through to the existing path).
@@ -156,21 +171,21 @@ fn try_parse_sse(
         Some(Api::OpenAiChatCompletions) => {
             let reassembled = reassemble_openai(&events);
             let body = reassembled.body.clone();
-            let mut out = sse_semantics(matched.unwrap(), provider, reassembled);
+            let mut out = sse_semantics(matched.unwrap(), host, provider, reassembled);
             fill_openai_chat(&mut out, req, &body, bounds);
             Some(out)
         }
         Some(Api::AnthropicMessages) => {
             let reassembled = reassemble_anthropic(&events);
             let body = reassembled.body.clone();
-            let mut out = sse_semantics(matched.unwrap(), provider, reassembled);
+            let mut out = sse_semantics(matched.unwrap(), host, provider, reassembled);
             fill_anthropic(&mut out, req, &body, bounds);
             Some(out)
         }
         Some(Api::OpenAiResponses) => {
             let reassembled = reassemble_responses(&events);
             let body = reassembled.body.clone();
-            let mut out = sse_semantics(matched.unwrap(), provider, reassembled);
+            let mut out = sse_semantics(matched.unwrap(), host, provider, reassembled);
             fill_openai_responses(&mut out, req, &body, bounds);
             Some(out)
         }
@@ -199,16 +214,18 @@ fn try_parse_sse(
 
 /// The shared SSE scaffold: operation/api_type from the endpoint, the
 /// provider label from the host when it names one (the endpoint's implied
-/// provider otherwise), the synthetic body, and the terminal verdict.
+/// provider otherwise) and whether that label was inferred, the synthetic
+/// body, and the terminal verdict.
 fn sse_semantics(
     endpoint: Endpoint,
+    host: &str,
     provider: Option<&'static str>,
     reassembled: parts::Reassembled,
 ) -> LlmSemantics {
+    let provider = provider.unwrap_or_else(|| endpoint.api.provider());
     LlmSemantics {
-        provider: provider
-            .unwrap_or_else(|| endpoint.api.provider())
-            .to_string(),
+        provider: provider.to_string(),
+        provider_inferred: label_inferred(provider, host),
         operation: endpoint.operation.to_string(),
         api_type: endpoint.api_type,
         reassembled_from_stream: true,
@@ -267,6 +284,7 @@ pub fn parse_llm(
     })?;
     let mut out = LlmSemantics {
         provider: provider.to_string(),
+        provider_inferred: label_inferred(provider, host),
         operation: matched.operation.to_string(),
         api_type: matched.api_type,
         decoded_response: Some(decoded.clone()),

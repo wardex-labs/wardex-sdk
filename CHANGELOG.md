@@ -187,6 +187,23 @@ All notable changes to this project are documented here. The format follows
   discards them, and a response whose request the parser never saw (the stream
   was opened before capture attached) is no longer shipped but counted under
   `protocol.http2.request_unobserved`.
+- **An LLM span now says when its provider name is a guess.** wardex labels a
+  call `openai` or `anthropic` from the hostname when the hostname contains
+  the provider's name, and otherwise from the shape of the response body or of
+  the API path. So a proxy (`myopenai-proxy.internal`), a mock
+  (`openai-mock.corp`), an Azure OpenAI deployment (`*.openai.azure.com`) and
+  an OpenAI-compatible gateway (`llm-gw.corp.internal`) all shipped
+  `gen_ai.provider.name=openai`, indistinguishable from a call to
+  `api.openai.com`. The name is unchanged, but only a call to the provider's
+  own host (`api.openai.com`, `api.anthropic.com`, or another host under
+  `openai.com` / `anthropic.com`) now ships without a marker; every other
+  labelled call carries the new marker `provider_inferred` (vocabulary 54) and
+  counts under `protocol.semantic.provider_inferred`. To separate direct
+  provider traffic from gateway traffic in a backend, filter on
+  `provider_inferred` in `wardex.limitations`. Expect it on every call through
+  a local model server or a gateway. The parser's fixture corpus gains three
+  such cases, and a test fails if any fixture's provider or its guess flag
+  comes out wrong.
 
 ## [0.6.0b1] - 2026-09-06
 

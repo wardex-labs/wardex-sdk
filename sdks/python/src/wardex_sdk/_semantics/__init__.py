@@ -49,7 +49,8 @@ else:
   half of the gen_ai mapping: registry-namespaced provider scalars
   (`openai.*`), the provider-usage mirror (`wardex.usage.*`, whose drop-count
   key is exported so the seam and this module cannot drift on its spelling),
-  and the embeddings block.
+  and the embeddings block. `provider_limitation` is the marker (and count)
+  for a provider label the native parser only inferred.
 
   `build_grpc_fields` — the gRPC branch, the one with enough protocol logic to
   be worth testing on its own.
@@ -71,6 +72,7 @@ from ._genai import (
     has_core_semantics,
     identifies_llm_call,
     provider_extras,
+    provider_limitation,
 )
 from ._grpc import build_grpc_fields
 from ._ws import ws_close_name
@@ -83,5 +85,6 @@ __all__ = [
     "has_core_semantics",
     "identifies_llm_call",
     "provider_extras",
+    "provider_limitation",
     "ws_close_name",
 ]
