@@ -967,6 +967,86 @@ def test_a_hook_attributed_to_the_sole_live_session_says_so_on_its_span(tallies)
     assert tallies("adapters.assembler.hook_session_unresolved") == 0
 
 
+def test_an_inferred_tool_record_is_cleared_when_its_closing_hook_proves_the_session(tallies):
+    """A later proof of membership retires the guess the record was born from.
+
+    `PreToolUse` arrives before `system/init`, so no session id is known yet and
+    the hook reaches its session only as the sole live one. `PostToolUse` then
+    names the session by its own id and finds the open record by `tool_use_id`
+    INSIDE that session. The two hooks describe one call and the second one
+    proved which session that call belongs to, so the span has nothing left to
+    confess: marking it would report a guess that was already settled.
+    """
+    client = FakeClient()
+    asm = SessionAssembler(client)
+    _outbound(asm, key=1)
+
+    asm.on_hook(
+        "PreToolUse",
+        {"session_id": "s-1", "tool_name": "Bash", "tool_input": {}},
+        "toolu_early",
+    )
+    asm.on_inbound(1, INIT)
+    asm.on_hook(
+        "PostToolUse",
+        {"session_id": "s-1", "tool_name": "Bash", "tool_response": "ok"},
+        "toolu_early",
+    )
+
+    (tool,) = [s for s in client.spans if s.name == "execute_tool Bash"]
+    assert Limitation.UNIT_INFERRED_SOLE not in tool.capture_integrity.limitations
+    assert tallies("adapters.assembler.hook_session_inferred_sole") == 1
+
+
+def test_an_inferred_tool_record_is_cleared_when_its_own_transport_announced_the_call(tallies):
+    """The stream is the other proof. A `tool_use` id that arrived on this
+    session's transport says the call belongs to this session, whatever tier the
+    hooks describing it were attributed by, so the span ships unmarked even when
+    both hooks were inferred."""
+    client = FakeClient()
+    asm = SessionAssembler(client)
+    _outbound(asm, key=1)
+
+    asm.on_hook(
+        "PreToolUse",
+        {"session_id": "s-nobody", "tool_name": "Bash", "tool_input": {}},
+        "toolu_01",
+    )
+    asm.on_inbound(1, INIT)
+    asm.on_inbound(1, ASSISTANT)
+    asm.on_hook(
+        "PostToolUse",
+        {"session_id": "s-nobody", "tool_name": "Bash", "tool_response": "ok"},
+        "toolu_01",
+    )
+
+    (tool,) = [s for s in client.spans if s.name == "execute_tool Bash"]
+    assert Limitation.UNIT_INFERRED_SOLE not in tool.capture_integrity.limitations
+    assert tallies("adapters.assembler.hook_session_inferred_sole") == 2
+
+
+def test_an_inferred_close_of_an_evicted_call_opened_by_a_proven_hook_is_not_marked(tallies):
+    """The breadcrumb remembers the opening hook's proof as well as its guess.
+
+    The call was opened by a hook that named its session, then evicted. Its
+    `PostToolUse` carries an id nothing matches and reaches the session only as
+    the sole live one, but it finds the breadcrumb for this call INSIDE that
+    session, so membership was already settled by the opening hook. Marking the
+    completion half would charge the closing payload's missing id to a call
+    whose session is known.
+    """
+    client, asm = _evict_one_tool()
+    asm.on_hook(
+        "PostToolUse",
+        {"session_id": "s-nobody", "tool_name": "Bash", "tool_response": "late"},
+        "t0",
+    )
+
+    _evicted, completion = _tools(client, "t0")
+    assert not _has(completion, Limitation.UNIT_INFERRED_SOLE)
+    assert tallies("adapters.assembler.hook_session_inferred_sole") == 1
+
+
 def test_only_the_spans_an_inferred_hook_creates_carry_the_inference_marker(tallies):
     """The marker follows the HOOK that was inferred, never the session.
 

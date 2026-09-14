@@ -1212,11 +1212,11 @@ class SessionAssembler:
                 # reconstructed from the CLI's stdout.
                 from_hook=True,
                 claim_key=key,
-                # This hook creates the record; an evicted half's opening hook
-                # supplied its start and parent, so that hook's inference counts.
-                sole_inferred=inferred or (crumb is not None and crumb.sole_inferred),
+                sole_inferred=inferred and (crumb is None or crumb.sole_inferred),
             )
         meta = sess.stream_tool_meta.pop(tool_use_id, None)
+        # Any proof of membership settles the guess: see `_OpenTool.sole_inferred`.
+        tool.sole_inferred = tool.sole_inferred and inferred and meta is None
         if meta is not None:
             stream_name, stream_input = meta
             if stream_name:

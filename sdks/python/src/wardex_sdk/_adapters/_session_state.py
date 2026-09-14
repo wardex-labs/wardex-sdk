@@ -109,11 +109,15 @@ class _OpenTool:
     #: The hook that CREATED this record reached its session only because that
     #: session was the sole live one (`_session_for_hook`'s last tier) — neither
     #: the scope nor the payload's id named it. Carried on the record because
-    #: the span is built at CLOSE, possibly from a later hook that was attributed
-    #: properly, and the guess the record was born from must still reach the
-    #: wire as `UNIT_INFERRED_SOLE`. A closing hook that finds this record by its
-    #: `tool_use_id` does not clear it: an id match proves the two hooks describe
-    #: one call, not that the call belongs to this session.
+    #: the span is built at CLOSE, and `_close_tool` decides there whether the
+    #: guess still stands. It ships as `UNIT_INFERRED_SOLE` only when EVERY hook
+    #: describing the call was inferred and this session's own stream never
+    #: announced its `tool_use` id. Any one proof settles membership: a hook
+    #: attributed by scope or by its own session id that finds the call's id
+    #: inside this session, or the id arriving on this session's transport. An
+    #: id match between two inferred hooks does not: it proves they describe one
+    #: call, not that the call belongs here — which is exactly a late hook from a
+    #: retired CLI landing on the only session left.
     sole_inferred: bool = False
 
 
