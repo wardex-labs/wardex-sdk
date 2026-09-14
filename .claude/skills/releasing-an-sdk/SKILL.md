@@ -69,8 +69,11 @@ git fetch origin
 git rev-parse HEAD; git rev-parse origin/main   # must be equal (in sync)
 ```
 
-CI green on the exact commit you're releasing (this is what lets us skip
-re-running tests locally — the passing CI run already tested this code):
+CI green on the exact commit you're releasing. The release workflow's `gate`
+job re-runs the same checks on the tagged commit before `publish`, so a red CI
+here is not the last line of defense — but it is the cheap one: a tag on a red
+commit costs a full workflow run to be refused, and a green CI run is what lets
+us skip re-running tests locally:
 
 ```bash
 gh run list --workflow=ci.yml --branch=main --limit=20 \
@@ -101,7 +104,7 @@ five wheels and stops short of PyPI whatever ref you aim it at:
 ```bash
 gh workflow run release-python.yml --ref main
 gh run list --workflow=release-python.yml --limit=1 --json databaseId,status
-gh run watch <databaseId>   # all six smoke entries green
+gh run watch <databaseId>   # all six smoke entries and both gate entries green
 ```
 
 Skip it for a release that only touches Python or Rust source CI already

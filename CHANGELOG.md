@@ -44,6 +44,17 @@ All notable changes to this project are documented here. The format follows
 
 ### Changed
 
+- **A wheel reaches PyPI only from a commit that passed every check, at
+  publish time.** `release-python.yml` gained a `gate` job that re-runs
+  `cargo fmt --check`, `clippy -D warnings`, `cargo test --workspace`,
+  `ruff check`, `ruff format --check`, and the full Python suite on the exact
+  commit the tag points at, on the floor interpreter (3.10) and the newest,
+  and `publish` waits on it alongside `build` and `smoke`. Before, CI and the
+  release workflow did not know about each other — `RELEASING.md` said so —
+  and a tag on a commit whose CI was red published just the same, because the
+  smoke step only proves the wheel imports. That sentence is gone from
+  `RELEASING.md`; what replaced it says what the gate covers and what it does
+  not (a tag pushed by hand around `scripts/release.py`).
 - The openai-agents quickstart docs no longer describe a from-source
   install. `pip install "wardex-sdk>=0.6.0b1" openai-agents` is a prebuilt
   wheel, so the Rust toolchain prerequisite and the fallback for a checkout
