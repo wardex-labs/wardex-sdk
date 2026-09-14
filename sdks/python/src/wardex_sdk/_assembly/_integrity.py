@@ -760,6 +760,14 @@ Two emit sites, and the first is the mechanism the second restates.
     prefix because the connection table is not WebSocket-specific.
     """
 
+    H2_REQUEST_EVICTED = "h2_request_evicted"
+    """The h2 stream table hit ``max_streams`` and evicted this stream's request
+    half (lowest id first) before its response completed: method, path and
+    request body are absent (``? /``); status and response are observed. Emitted,
+    ``truncated`` and counted (``protocol.http2.stream_evicted``) from
+    ``_interceptors/_trackers.py::_Http2Tracker._mk``. Not ``CONNECTION_EVICTED``
+    (``max_connections``, a whole connection) — see ``common.proto``."""
+
     PARSE_SKIPPED_AT_SHUTDOWN = "parse_skipped_at_shutdown"
     """The process was ending and the shutdown budget ran out before this
     transaction's deferred LLM-semantic parse: it shipped unparsed rather than

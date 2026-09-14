@@ -265,6 +265,45 @@ def test_disabled_reason_logged_once_per_connection_in_debug(capsys):
     assert "headers_exceeded" in err
 
 
+@pytest.mark.parametrize("debug", [True, False])
+def test_an_h2_latch_is_counted_once_and_logged_only_in_debug(fake_ssl_socket, capsys, debug):
+    """The h2 parser latches off on a header block HPACK cannot decode — the
+    ordinary outcome of attaching to a pooled keep-alive connection — and it
+    used to do so in silence even under `debug=True`, because the seam asked
+    the tracker for a reason the h2 tracker did not have.
+
+    The counter is not a debug feature: a connection that stopped being
+    captured is a fact about capture whether or not anyone is watching stderr,
+    so it fires under both settings, once per connection. The log line stays
+    debug-only.
+    """
+    from wardex_sdk._assembly import counters
+
+    class _Config:
+        pass
+
+    client = _DebugRecordingClient()
+    client.config = _Config()
+    client.config.debug = debug
+    interceptor = SSLInterceptor()
+    interceptor._client = client
+    sock = fake_ssl_socket(alpn="h2")
+    counters.reset()
+
+    poison = bytes.fromhex("000001010400000001ff")
+    interceptor._on_response_bytes(sock, poison)
+    interceptor._on_response_bytes(sock, poison)
+    interceptor._on_response_bytes(sock, poison)
+
+    assert counters.snapshot().get("interceptors.seam.parser_disabled") == 1
+    err = capsys.readouterr().err
+    if debug:
+        assert err.count("[wardex] parser disabled for") == 1
+        assert "hpack_decode_failed" in err
+    else:
+        assert "parser disabled" not in err
+
+
 def test_non_http_tls_traffic_produces_no_log(capsys):
     """Layering check: pure non-HTTP traffic is stopped by the seam gate
     before it ever reaches the parser, so the parser's own disable-latch

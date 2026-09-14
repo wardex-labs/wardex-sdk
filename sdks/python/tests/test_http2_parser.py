@@ -25,3 +25,36 @@ def test_truncated_hpack_size_update_latches_off_instead_of_raising():
     p = Http2Parser()
     assert p.feed(False, poison) == ([], [])
     assert p.feed(True, request) == ([], []), "the parser must stay latched off"
+
+
+# A HEADERS frame (END_HEADERS, stream 1) whose one-octet HPACK block is an
+# indexed field with a saturated 7-bit prefix and no continuation octets: the
+# block cannot be decoded. This is what the first header block on a pooled
+# keep-alive connection looks like to a parser that attached after the
+# connection's HPACK dynamic table was built.
+_HPACK_POISON = bytes.fromhex("000001010400000001ff")
+
+
+def test_the_native_parser_reports_why_it_latched_off():
+    """The h2 latch used to be the one parser latch with no reason anywhere:
+    no accessor in Rust, none across the FFI, so a connection went silent and
+    `init(debug=True)` had nothing to print."""
+    from wardex_sdk import _wardex_native
+
+    native = _wardex_native.protocol.Http2Parser(None)
+    assert native.disabled_reason() is None
+    native.feed(False, _HPACK_POISON)
+    assert native.disabled_reason() == "hpack_decode_failed"
+
+
+def test_the_wrapper_and_the_tracker_delegate_the_reason():
+    from wardex_sdk._interceptors._trackers import _Http2Tracker
+
+    p = Http2Parser()
+    p.feed(False, _HPACK_POISON)
+    assert p.disabled_reason() == "hpack_decode_failed"
+
+    tracker = _Http2Tracker()
+    assert tracker.disabled_reason() is None
+    assert tracker.on_response_bytes(_HPACK_POISON) == []
+    assert tracker.disabled_reason() == "hpack_decode_failed"

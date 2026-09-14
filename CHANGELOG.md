@@ -162,6 +162,23 @@ All notable changes to this project are documented here. The format follows
   timing it received was a neighbour's. The new marker is value 52 in
   `wardex.v1.Limitation`, and `adapters.anthropic.otel_bridge.llm_join_tolerant`
   counts it.
+- **An HTTP/2 connection that stops being captured now says so.** The h2
+  parser latches a connection off when a header block cannot be decoded — the
+  ordinary outcome of attaching `wardex.init()` to a pooled keep-alive whose
+  HPACK table was built earlier — and it was the one parser with no reason to
+  report: `init(debug=True)` printed nothing and no counter moved. The reason
+  (`hpack_decode_failed`, `continuation_without_headers`,
+  `push_promise_unsynced`, `frame_malformed`) is now printed under debug, and
+  every latched connection, h2 or HTTP/1, counts once under
+  `interceptors.seam.parser_disabled` whether debug is on or not.
+- **A burst of HTTP/2 streams past `max_streams` no longer produces unmarked
+  `? /` spans.** The stream table evicted an arbitrary stream (a hash-map
+  iteration order) and the evicted stream's response became a span with no
+  method, no path, `truncated=False` and no marker; streams opened by DATA
+  frames were not bounded at all. The lowest stream ids are now evicted first,
+  every frame type is held to the bound, and the response of an evicted stream
+  ships `truncated` with the new marker `h2_request_evicted` (vocabulary 53),
+  counted under `protocol.http2.stream_evicted`.
 
 ## [0.6.0b1] - 2026-09-06
 

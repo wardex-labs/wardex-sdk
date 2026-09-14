@@ -616,34 +616,93 @@ def _probe_max_decoded_bytes() -> bool:
     )
 
 
-def _probe_max_streams() -> bool:
+def _h2_open_requests_then_respond(sids: list[int]) -> tuple[bytes, bytes]:
+    """Every request left open (no END_STREAM), then every response ended.
+
+    The requests are all in the table at once, so a bound below `len(sids)`
+    has to evict some of them before any response arrives to complete one.
+    """
     from hpack import Encoder
 
-    def surviving(limits) -> int:
+    client_enc, server_enc = Encoder(), Encoder()
+    requests = b"".join(
+        _h2_frame(0x1, 0x4, sid, client_enc.encode([(b":method", b"POST"), (b":path", b"/s")]))
+        for sid in sids
+    )
+    responses = b"".join(
+        _h2_frame(0x1, 0x4 | 0x1, sid, server_enc.encode([(b":status", b"200")])) for sid in sids
+    )
+    return requests, responses
+
+
+def _probe_max_streams() -> bool:
+    sids = [1 + 2 * i for i in range(8)]
+    requests, responses = _h2_open_requests_then_respond(sids)
+
+    def surviving(limits) -> int | None:
         parser = _wardex_native.protocol.Http2Parser(limits)
-        client_enc, server_enc = Encoder(), Encoder()
-        sids = [1 + 2 * i for i in range(8)]
-        parser.feed(
-            True,
-            b"".join(
-                _h2_frame(
-                    0x1, 0x4, sid, client_enc.encode([(b":method", b"POST"), (b":path", b"/s")])
-                )
-                for sid in sids
-            ),
-        )
-        _opened, txns = parser.feed(
-            False,
-            b"".join(
-                _h2_frame(0x1, 0x4 | 0x1, sid, server_enc.encode([(b":status", b"200")]))
-                for sid in sids
-            ),
-        )
-        # A stream evicted by the cap loses the request half it was holding, so
-        # its transaction comes back without the method it was opened with.
+        parser.feed(True, requests)
+        _opened, txns = parser.feed(False, responses)
+        # A stream evicted by the cap loses the request half it was holding,
+        # so its transaction comes back without the method it was opened
+        # with — and says so. A method-less transaction that does NOT say so
+        # is the silent loss this bound used to produce; it fails the probe
+        # rather than counting as enforcement.
+        if any(t.method != "POST" and not t.request_evicted for t in txns):
+            return None
         return sum(1 for t in txns if t.method == "POST")
 
-    return surviving(_native(max_streams=1)) < 8 and surviving(None) == 8
+    tight = surviving(_native(max_streams=1))
+    return tight is not None and tight < 8 and surviving(None) == 8
+
+
+def test_max_streams_evicts_lowest_ids_and_marks_every_evicted_response():
+    """The stream table's bound, end to end through the h2 tracker.
+
+    Two defects met here. The Rust table evicted whichever key its `HashMap`
+    iterated first, so the survivors of a burst were arbitrary (measured:
+    streams 3 and 7 of eight); and an evicted stream's response still became
+    a span — `? /`, `truncated=False`, no marker, no counter — that looked
+    exactly like a request with no method and no path.
+
+    Now the lowest ids go first, matching the correlation latch beside the
+    table, and a response whose request half was evicted ships marked: its
+    status and its end are real, only the request is missing.
+    """
+    from wardex_sdk._assembly import counters
+    from wardex_sdk._interceptors._trackers import _Http2Tracker
+
+    sids = [1 + 2 * i for i in range(8)]
+    requests, responses = _h2_open_requests_then_respond(sids)
+    counters.reset()
+    tracker = _Http2Tracker(_native(max_streams=2))
+    assert tracker.on_request_bytes(requests) == []
+    txns = tracker.on_response_bytes(responses)
+
+    assert len(txns) == len(sids)
+    clean = [t for t in txns if Limitation.H2_REQUEST_EVICTED not in t.limitations]
+    assert sorted((t.method, t.path) for t in clean) == [("POST", "/s"), ("POST", "/s")]
+    evicted = [t for t in txns if Limitation.H2_REQUEST_EVICTED in t.limitations]
+    assert len(evicted) == 6
+    for t in evicted:
+        assert t.truncated is True
+        assert (t.method, t.path) == ("?", "/")
+        assert t.status == 200
+    for t in clean:
+        assert t.truncated is False
+    assert counters.snapshot().get("protocol.http2.stream_evicted") == 6
+
+
+def test_max_streams_survivors_are_the_highest_ids():
+    """Which streams survive is the policy, so it is asserted by id."""
+    sids = [1 + 2 * i for i in range(8)]
+    requests, responses = _h2_open_requests_then_respond(sids)
+    parser = _wardex_native.protocol.Http2Parser(_native(max_streams=2))
+    parser.feed(True, requests)
+    _opened, txns = parser.feed(False, responses)
+    kept = sorted(t.stream_id for t in txns if not t.request_evicted)
+    assert kept == [13, 15]
+    assert all(t.method == "" for t in txns if t.request_evicted)
 
 
 def _probe_max_ws_frame_bytes() -> bool:

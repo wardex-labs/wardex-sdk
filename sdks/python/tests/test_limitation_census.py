@@ -234,6 +234,9 @@ _MEMBER_SITES: dict[str, frozenset[str]] = {
     "GRPC_MESSAGE_TRUNCATED": frozenset({"_semantics/_grpc.py"}),
     "WS_PAYLOAD_TRUNCATED": frozenset({"_interceptors/_seam.py", "_interceptors/_trackers.py"}),
     "CONNECTION_EVICTED": frozenset({"_interceptors/_seam.py"}),
+    # The native stream table's bound, read off `request_evicted` by the h2
+    # tracker's `_mk` — the one place the native transaction becomes a `_Txn`.
+    "H2_REQUEST_EVICTED": frozenset({"_interceptors/_trackers.py"}),
     # --- parsing / interpretation ---
     "FRAME_PARSE_FAILED": frozenset(
         {"_interceptors/_seam.py", "_interceptors/_trackers.py", "_semantics/_grpc.py"}
@@ -448,6 +451,14 @@ _DISABLED_REASONS: frozenset[str] = frozenset(
         "not_http",
         "chunk_size_exceeded",
         "stream_buffer_exceeded",
+        # The HTTP/2 connection latch (`crates/wardex-protocol/src/http2.rs`).
+        # All four latch the whole connection before any transaction exists,
+        # so none has a span to ride; the seam counts them
+        # (`interceptors.seam.parser_disabled`) and debug mode prints them.
+        "hpack_decode_failed",
+        "continuation_without_headers",
+        "push_promise_unsynced",
+        "frame_malformed",
     }
 )
 """`disabled_reason` is a SEPARATE, OPEN vocabulary and must never become enum
@@ -699,6 +710,11 @@ _EMITTED_MEMBERS: frozenset[str] = frozenset(
         # with no marker — the one eviction whose consequence read as an
         # improvement.
         "ALIAS_FORGOTTEN",
+        # The twenty-third: the h2 stream table's evicted request half, minted
+        # WITH its emitter (the h2 tracker's `_mk`, fed by the native
+        # transaction's `request_evicted`). Before it, the response of an
+        # evicted stream shipped as `? /` with no marker and no counter.
+        "H2_REQUEST_EVICTED",
     }
 )
 """Which MEMBERS have an emit site today, derived independently below.
@@ -1679,10 +1695,15 @@ _VOCABULARY: dict[str, str] = {
     #     entry owned a span and shipped; this one marks the NEXT edge) and
     #     from PARENT_UNRESOLVED (on the ambient rung a parent WAS found) ---
     "ALIAS_FORGOTTEN": "alias_forgotten",
+    # --- added after the census, by the HTTP/2 stream table (1): a request
+    #     half evicted at max_streams whose response then completed — kept
+    #     apart from CONNECTION_EVICTED (a different table and knob, and a
+    #     whole connection rather than half of one exchange) ---
+    "H2_REQUEST_EVICTED": "h2_request_evicted",
 }
 
 
-def test_the_vocabulary_is_exactly_these_fifty_two() -> None:
+def test_the_vocabulary_is_exactly_these_fifty_three() -> None:
     """15 declared before the census + 21 from it + 1 from §5.4 + 1 for wardex
     itself + 1 for the OTLP size guard + 1 for the registry breadth bound
     + 2 for the OTel bridge's fail-open pair + 1 for the adapter's per-session
@@ -1690,7 +1711,8 @@ def test_the_vocabulary_is_exactly_these_fifty_two() -> None:
     + 2 for the deferred-parse queue's unparsed shipments + 1 for the
     WebSocket LLM-transport marker + 1 for the ambiguous LangGraph join
     + 1 for the unresolved peer address + 1 for the alias bound's forgotten
-    id + 1 for the OTel bridge's tolerant chat join, name by name.
+    id + 1 for the OTel bridge's tolerant chat join + 1 for the h2 stream
+    table's evicted request half, name by name.
 
     A count alone is not enough: a RENAME keeps the count and is the single most
     expensive mistake available here. These are proto enum values in

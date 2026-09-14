@@ -61,7 +61,7 @@ impl Http2FrameDecoder {
 }
 
 use fluke_hpack::Decoder;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use wardex_limits::Limits;
 
 const FRAME_DATA: u8 = 0x0;
@@ -89,6 +89,14 @@ pub struct Http2Transaction {
     pub request_body: Vec<u8>,
     pub response_body: Vec<u8>,
     pub truncated: bool,
+    /// The stream table evicted this stream's request half before its
+    /// response completed, so `method`, `path`, the request body and the
+    /// request's content type are absent rather than empty. The status, the
+    /// response half and the fact that the exchange ended are still real
+    /// observations, which is why the transaction is emitted at all instead
+    /// of being dropped: a caller that shows it must say the request is
+    /// missing, and this flag is the only place that fact survives.
+    pub request_evicted: bool,
 }
 
 /// Result of a single feed call: streams whose request just ended + transactions whose response also ended.
@@ -117,7 +125,21 @@ struct StreamState {
     req_ended: bool,
     resp_ended: bool,
     truncated: bool,
+    /// A client header block was decoded into this entry. Only such an entry
+    /// has a request half to lose, so only evicting one of these may raise
+    /// the eviction mark — an entry built from DATA alone (a stream opened
+    /// before capture attached) held nothing a later response could miss.
+    request_seen: bool,
+    /// Recreated for an id the table had already evicted with its request
+    /// half. Carried to `Http2Transaction::request_evicted`.
+    request_evicted: bool,
 }
+
+/// Why a frame stopped this connection's capture for good. The string is the
+/// `disabled_reason` vocabulary shared with the other stream parsers: a debug
+/// string for a connection, never a span marker, because by construction no
+/// transaction exists to carry it.
+struct Fail(&'static str);
 
 struct Pending {
     from_client: bool,
@@ -131,11 +153,37 @@ pub struct Http2Connection {
     server_frames: Http2FrameDecoder,
     req_decoder: Decoder<'static>,
     resp_decoder: Decoder<'static>,
-    streams: HashMap<u32, StreamState>,
+    /// Ordered by stream id so eviction can take the lowest id
+    /// deterministically. A `HashMap` evicted whichever key its hasher put
+    /// first — a different stream on every run, and not the policy the host's
+    /// correlation latch documents for the same bound.
+    streams: BTreeMap<u32, StreamState>,
     pending: HashMap<u32, Pending>,
     preface_buf: Vec<u8>,
     preface_seen: bool,
-    disabled: bool,
+    /// Set once, by the first frame that fails; `feed` is a no-op afterwards.
+    disabled: Option<&'static str>,
+    /// The highest stream id whose request half the table evicted, and — with
+    /// `first_request` below — the whole memory of eviction this connection
+    /// keeps. One integer instead of a set of evicted ids, because a set
+    /// needs its own bound and then forgets ids under exactly the burst that
+    /// fills it. It is exact for this policy: client stream ids only increase
+    /// and eviction takes the lowest id first, so every request half evicted
+    /// so far has an id at or below this mark.
+    ///
+    /// What it cannot tell apart is an id that completed normally and then
+    /// receives a stray frame — a peer protocol violation — or a stream reset
+    /// while the server's frames for it were already in flight. Both used to
+    /// surface as a transaction with an empty method and no explanation;
+    /// under the mark they surface flagged, which is true about what the
+    /// transaction lacks even where it names the wrong cause.
+    evicted_through: u32,
+    /// The first stream id whose request half this connection held — and so,
+    /// with ids only increasing, the lowest. Zero until one is. The floor keeps the mark from claiming a stream
+    /// opened before capture attached: that stream's id is below every id
+    /// the parser saw a request for, and its request was never held, so it
+    /// was never evicted.
+    first_request: u32,
     limits: Limits,
 }
 
@@ -152,18 +200,33 @@ impl Http2Connection {
             server_frames: Http2FrameDecoder::new(),
             req_decoder: Decoder::new(),
             resp_decoder: Decoder::new(),
-            streams: HashMap::new(),
+            streams: BTreeMap::new(),
             pending: HashMap::new(),
             preface_buf: Vec::new(),
             preface_seen: false,
-            disabled: false,
+            disabled: None,
+            evicted_through: 0,
+            first_request: 0,
             limits,
         }
     }
 
+    /// Why the parser latched off, if it did. Surfaced for debug logging: no
+    /// span exists to carry it, because the frame that latched it was never
+    /// turned into a transaction.
+    ///
+    /// Without it an h2 connection went silent with nothing to say why, and
+    /// the likeliest way to get here is ordinary: attaching capture to a
+    /// pooled keep-alive connection whose HPACK dynamic table was built
+    /// before the parser was watching, so the first real header block that
+    /// references it fails to decode.
+    pub fn disabled_reason(&self) -> Option<&'static str> {
+        self.disabled
+    }
+
     pub fn feed(&mut self, from_client: bool, data: &[u8]) -> Http2FeedResult {
         let mut result = Http2FeedResult::default();
-        if self.disabled {
+        if self.disabled.is_some() {
             return result;
         }
         let frames = if from_client {
@@ -175,12 +238,52 @@ impl Http2Connection {
             self.server_frames.feed(data)
         };
         for frame in frames {
-            if self.handle_frame(from_client, frame, &mut result).is_err() {
-                self.disabled = true;
+            if let Err(Fail(reason)) = self.handle_frame(from_client, frame, &mut result) {
+                self.disabled = Some(reason);
                 break;
             }
+            self.evict_past_bound();
         }
         result
+    }
+
+    /// The table entry for `stream_id`, created if absent. Every path that
+    /// creates an entry — request and response header blocks, DATA, and the
+    /// end-of-stream bookkeeping — comes through here, so an id the table
+    /// already evicted is recognised the same way whichever frame names it
+    /// next.
+    fn stream(&mut self, stream_id: u32) -> &mut StreamState {
+        let evicted = self.first_request != 0
+            && self.first_request <= stream_id
+            && stream_id <= self.evicted_through;
+        self.streams
+            .entry(stream_id)
+            .or_insert_with(|| StreamState {
+                request_evicted: evicted,
+                ..Default::default()
+            })
+    }
+
+    /// Hold the table to `max_streams`, dropping the lowest ids first.
+    ///
+    /// Applied after each frame rather than before each insertion, and that
+    /// order is load-bearing. A response for an evicted stream is inserted
+    /// below every live id; evicting before inserting would push out a live
+    /// stream (the policy's newest) to make room for it, and a single
+    /// HEADERS frame with END_STREAM would then cost a healthy request half
+    /// to emit one that was already lost. Trimming afterwards lets that
+    /// transaction complete and leave in the same frame, and a frame creates
+    /// at most one entry, so the table never rests above the bound.
+    fn evict_past_bound(&mut self) {
+        let cap = self.limits.max_streams.max(1);
+        while self.streams.len() > cap {
+            let Some((id, st)) = self.streams.pop_first() else {
+                break;
+            };
+            if st.request_seen {
+                self.evicted_through = self.evicted_through.max(id);
+            }
+        }
     }
 
     /// Strips the connection preface (24 bytes) from the client's first bytes. Handles split arrival.
@@ -212,7 +315,7 @@ impl Http2Connection {
         from_client: bool,
         frame: Http2Frame,
         result: &mut Http2FeedResult,
-    ) -> Result<(), ()> {
+    ) -> Result<(), Fail> {
         match frame.frame_type {
             FRAME_HEADERS => self.on_headers(from_client, frame, result),
             FRAME_CONTINUATION => self.on_continuation(frame, result),
@@ -235,24 +338,24 @@ impl Http2Connection {
         from_client: bool,
         frame: Http2Frame,
         result: &mut Http2FeedResult,
-    ) -> Result<(), ()> {
+    ) -> Result<(), Fail> {
         let mut payload = &frame.payload[..];
         let mut pad_len = 0usize;
         if frame.flags & FLAG_PADDED != 0 {
             if payload.is_empty() {
-                return Err(());
+                return Err(Fail("frame_malformed"));
             }
             pad_len = payload[0] as usize;
             payload = &payload[1..];
         }
         if frame.flags & FLAG_PRIORITY != 0 {
             if payload.len() < 5 {
-                return Err(());
+                return Err(Fail("frame_malformed"));
             }
             payload = &payload[5..];
         }
         if payload.len() < pad_len {
-            return Err(());
+            return Err(Fail("frame_malformed"));
         }
         let block = &payload[..payload.len() - pad_len];
         let end_stream = frame.flags & FLAG_END_STREAM != 0;
@@ -276,10 +379,10 @@ impl Http2Connection {
         &mut self,
         frame: Http2Frame,
         result: &mut Http2FeedResult,
-    ) -> Result<(), ()> {
+    ) -> Result<(), Fail> {
         let mut p = match self.pending.remove(&frame.stream_id) {
             Some(p) => p,
-            None => return Err(()), // CONTINUATION without HEADERS → desync
+            None => return Err(Fail("continuation_without_headers")),
         };
         p.buf.extend_from_slice(&frame.payload);
         if frame.flags & FLAG_END_HEADERS != 0 {
@@ -298,7 +401,7 @@ impl Http2Connection {
         block: &[u8],
         end_stream: bool,
         result: &mut Http2FeedResult,
-    ) -> Result<(), ()> {
+    ) -> Result<(), Fail> {
         // HPACK decode — scope the decoder's mutable borrow to this block, then access streams
         let headers = {
             let decoder = if from_client {
@@ -306,24 +409,15 @@ impl Http2Connection {
             } else {
                 &mut self.resp_decoder
             };
-            // `fluke-hpack` 0.3 unwraps inside its dynamic-table size update:
-            // a `0x3f` prefix whose integer continues past the end of the
-            // block, or continues for more octets than fit, is a panic and
-            // not a `DecoderError`. A panic here unwinds through the caller's
-            // `disabled = true` latch and then through PyO3 as a
-            // `BaseException` the host's `recv()` sees. Catching it turns the
-            // frame into the same `Err` any other bad block produces, so the
-            // connection latches off and stays off.
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| decoder.decode(block)))
-                .map_err(|_| ())?
-                .map_err(|_| ())?
+            hpack_decode(decoder, block)?
         };
-        if self.streams.len() > self.limits.max_streams {
-            if let Some(&k) = self.streams.keys().next() {
-                self.streams.remove(&k);
-            }
+        if from_client && self.first_request == 0 {
+            self.first_request = stream_id;
         }
-        let st = self.streams.entry(stream_id).or_default();
+        let st = self.stream(stream_id);
+        if from_client {
+            st.request_seen = true;
+        }
         for (name, value) in headers {
             match name.as_slice() {
                 b":method" => st.method = Some(String::from_utf8_lossy(&value).into_owned()),
@@ -369,7 +463,8 @@ impl Http2Connection {
         }
         let body = &payload[..payload.len() - pad_len];
         {
-            let st = self.streams.entry(frame.stream_id).or_default();
+            let limits = self.limits;
+            let st = self.stream(frame.stream_id);
             // Raises the effective cap from the previous hardcoded 8 MiB to
             // max_body_bytes (32 MiB by default), which is derived from the
             // Anthropic Messages API request ceiling so a valid LLM request is
@@ -386,7 +481,7 @@ impl Http2Connection {
             } else {
                 st.resp_content_type.as_deref()
             };
-            let cap = crate::http1::cap_for_content_type(this_direction_ct, &self.limits);
+            let cap = crate::http1::cap_for_content_type(this_direction_ct, &limits);
             let target = if from_client {
                 &mut st.req_body
             } else {
@@ -405,40 +500,48 @@ impl Http2Connection {
         }
     }
 
-    fn on_push_promise(&mut self, frame: Http2Frame) -> Result<(), ()> {
+    fn on_push_promise(&mut self, frame: Http2Frame) -> Result<(), Fail> {
         // Feed the header block into the response decoder to keep the table in sync. Push streams aren't emitted.
         let mut payload = &frame.payload[..];
         let mut pad_len = 0usize;
         if frame.flags & FLAG_PADDED != 0 {
             if payload.is_empty() {
-                return Err(());
+                return Err(Fail("frame_malformed"));
             }
             pad_len = payload[0] as usize;
             payload = &payload[1..];
         }
         if payload.len() < 4 {
-            return Err(());
+            return Err(Fail("frame_malformed"));
         }
         payload = &payload[4..]; // skip promised stream id
         if payload.len() < pad_len {
-            return Err(());
+            return Err(Fail("frame_malformed"));
         }
         let block = &payload[..payload.len() - pad_len];
         if frame.flags & FLAG_END_HEADERS != 0 {
-            self.resp_decoder.decode(block).map_err(|_| ())?;
+            hpack_decode(&mut self.resp_decoder, block)?;
             Ok(())
         } else {
             // Push promises continued by CONTINUATION are rare — sync can't be guaranteed, so disable safely
-            Err(())
+            Err(Fail("push_promise_unsynced"))
         }
     }
 
     fn mark_ended(&mut self, from_client: bool, stream_id: u32, result: &mut Http2FeedResult) {
-        let st = self.streams.entry(stream_id).or_default();
+        let st = self.stream(stream_id);
         if from_client {
+            // A stream whose request half was evicted is not reported as
+            // opened a second time when the rest of its request body ends.
+            // The host latches its correlation parent on this signal, keyed
+            // by stream id in increasing-id order; re-announcing a low id
+            // would latch whatever happens to be ambient now under a request
+            // issued earlier, and break the order its own eviction relies on.
             if !st.req_ended {
                 st.req_ended = true;
-                result.opened_request_streams.push(stream_id);
+                if !st.request_evicted {
+                    result.opened_request_streams.push(stream_id);
+                }
             }
         } else {
             st.resp_ended = true;
@@ -466,10 +569,31 @@ impl Http2Connection {
                     request_body: s.req_body,
                     response_body: s.resp_body,
                     truncated: s.truncated,
+                    request_evicted: s.request_evicted,
                 });
             }
         }
     }
+}
+
+/// One decoded header, name and value, as `fluke-hpack` hands it back.
+type HeaderField = (Vec<u8>, Vec<u8>);
+
+/// HPACK-decode one header block, turning every way it can fail into the one
+/// latch reason.
+///
+/// `fluke-hpack` 0.3 unwraps inside its dynamic-table size update: a `0x3f`
+/// prefix whose integer continues past the end of the block, or continues for
+/// more octets than fit, is a panic and not a `DecoderError`. A panic here
+/// would unwind past `feed`'s latch and then through PyO3 as a
+/// `BaseException` the host's `recv()` sees. Catching it turns the frame into
+/// the same `Err` any other bad block produces, so the connection latches off
+/// and stays off. PUSH_PROMISE blocks go through here too: they feed the same
+/// response decoder, so they reach the same `unwrap`.
+fn hpack_decode(decoder: &mut Decoder<'static>, block: &[u8]) -> Result<Vec<HeaderField>, Fail> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| decoder.decode(block)))
+        .map_err(|_| Fail("hpack_decode_failed"))?
+        .map_err(|_| Fail("hpack_decode_failed"))
 }
 
 #[cfg(test)]
@@ -743,6 +867,184 @@ mod tests {
         let r2 = c.feed(true, &frame(0x1, FH | FS, 3, &block));
         assert!(r.transactions.is_empty());
         assert!(r2.opened_request_streams.is_empty());
+    }
+
+    #[test]
+    fn desync_reports_its_reason() {
+        // One connection per Err source, because the latch is permanent: the
+        // first reason is the only one a connection can ever report.
+        let latched = |from_client: bool, bytes: Vec<u8>| {
+            let mut c = Http2Connection::new(Limits::default());
+            assert_eq!(
+                c.disabled_reason(),
+                None,
+                "a fresh connection is not disabled"
+            );
+            c.feed(from_client, &bytes);
+            c.disabled_reason()
+        };
+
+        // A header block HPACK cannot decode: an indexed field whose 7-bit
+        // prefix saturates and whose continuation octets never arrive.
+        assert_eq!(
+            latched(false, frame(FRAME_HEADERS, FH, 1, &[0xff])),
+            Some("hpack_decode_failed")
+        );
+        // The same failure reached through a PUSH_PROMISE, which feeds the
+        // response decoder only to keep its dynamic table in step.
+        let mut promise = vec![0, 0, 0, 2];
+        promise.push(0xff);
+        assert_eq!(
+            latched(false, frame(FRAME_PUSH_PROMISE, FH, 1, &promise)),
+            Some("hpack_decode_failed")
+        );
+
+        // CONTINUATION on a stream with no HEADERS block left open.
+        assert_eq!(
+            latched(true, frame(FRAME_CONTINUATION, FH, 1, &[0x82])),
+            Some("continuation_without_headers")
+        );
+
+        // PUSH_PROMISE whose header block is continued: the parser does not
+        // follow promised blocks across CONTINUATION frames, so the response
+        // decoder's table can no longer be trusted. A following non-
+        // CONTINUATION frame changes nothing — the latch fired already.
+        let mut unsynced = frame(FRAME_PUSH_PROMISE, 0, 1, &[0, 0, 0, 2, 0x88]);
+        unsynced.extend_from_slice(&frame(0x4, 0, 0, b""));
+        assert_eq!(latched(false, unsynced), Some("push_promise_unsynced"));
+
+        // Frames whose declared lengths contradict their own payload.
+        // PADDED with no pad-length octet at all:
+        assert_eq!(
+            latched(true, frame(FRAME_HEADERS, FH | FLAG_PADDED, 1, b"")),
+            Some("frame_malformed")
+        );
+        // PRIORITY with fewer than the five priority octets:
+        assert_eq!(
+            latched(true, frame(FRAME_HEADERS, FH | FLAG_PRIORITY, 1, &[0, 0])),
+            Some("frame_malformed")
+        );
+        // A pad length longer than what is left of the payload:
+        assert_eq!(
+            latched(true, frame(FRAME_HEADERS, FH | FLAG_PADDED, 1, &[9, 0x82])),
+            Some("frame_malformed")
+        );
+        // A PUSH_PROMISE too short to hold its promised stream id:
+        assert_eq!(
+            latched(false, frame(FRAME_PUSH_PROMISE, FH, 1, &[0, 0])),
+            Some("frame_malformed")
+        );
+
+        // A latched connection keeps its first reason and stays a no-op.
+        let mut c = Http2Connection::new(Limits::default());
+        c.feed(false, &frame(FRAME_HEADERS, FH, 1, &[0xff]));
+        let block = hpack(&[(b":method", b"GET"), (b":path", b"/")]);
+        let r = c.feed(true, &frame(FRAME_CONTINUATION, FH, 3, &block));
+        assert!(r.opened_request_streams.is_empty());
+        assert_eq!(c.disabled_reason(), Some("hpack_decode_failed"));
+
+        // Healthy traffic never sets a reason.
+        let mut c = Http2Connection::new(Limits::default());
+        c.feed(true, &frame(FRAME_HEADERS, FH | FS, 1, &block));
+        assert_eq!(c.disabled_reason(), None);
+    }
+
+    #[test]
+    fn data_frames_cannot_grow_the_table_past_max_streams() {
+        // DATA for streams no HEADERS ever opened: a peer (or capture that
+        // attached mid-connection) can name any id, and each one used to be a
+        // fresh, unbounded table entry.
+        let limits = Limits {
+            max_streams: 4,
+            ..Default::default()
+        };
+        let mut c = Http2Connection::new(limits);
+        for i in 0..1000u32 {
+            let sid = 1 + 2 * i;
+            c.feed(true, &frame(FRAME_DATA, 0, sid, b"x"));
+            c.feed(false, &frame(FRAME_DATA, 0, sid, b"y"));
+            assert!(
+                c.streams.len() <= 4,
+                "{} streams resident after DATA on stream {sid}",
+                c.streams.len()
+            );
+        }
+        // And the survivors are the four highest ids, not an arbitrary four.
+        let kept: Vec<u32> = c.streams.keys().copied().collect();
+        assert_eq!(kept, vec![1993, 1995, 1997, 1999]);
+    }
+
+    #[test]
+    fn eviction_is_lowest_id_first_and_marks_the_survivor_response() {
+        let limits = Limits {
+            max_streams: 2,
+            ..Default::default()
+        };
+        let mut c = Http2Connection::new(limits);
+        let sids = [1u32, 3, 5, 7];
+        // Four requests left open (no END_STREAM): the table can hold two.
+        let mut req = Vec::new();
+        for sid in sids {
+            let block = hpack(&[(b":method", b"POST"), (b":path", b"/s")]);
+            req.extend_from_slice(&frame(FRAME_HEADERS, FH, sid, &block));
+        }
+        c.feed(true, &req);
+        let kept: Vec<u32> = c.streams.keys().copied().collect();
+        assert_eq!(
+            kept,
+            vec![5, 7],
+            "the two lowest ids must be the ones evicted"
+        );
+
+        // Every response arrives. The evicted streams' responses are real
+        // observations — a status and an end — so they are emitted, and they
+        // say that their request half is gone.
+        let mut resp = Vec::new();
+        for sid in sids {
+            let block = hpack(&[(b":status", b"200")]);
+            resp.extend_from_slice(&frame(FRAME_HEADERS, FH | FS, sid, &block));
+        }
+        let r = c.feed(false, &resp);
+        let by_id: std::collections::BTreeMap<u32, &Http2Transaction> =
+            r.transactions.iter().map(|t| (t.stream_id, t)).collect();
+        assert_eq!(by_id.keys().copied().collect::<Vec<_>>(), sids.to_vec());
+        for sid in [1, 3] {
+            let t = by_id[&sid];
+            assert!(t.request_evicted, "stream {sid} lost its request half");
+            assert_eq!(t.method, "");
+            assert_eq!(t.status, 200);
+        }
+        for sid in [5, 7] {
+            let t = by_id[&sid];
+            assert!(!t.request_evicted, "stream {sid} kept its request half");
+            assert_eq!(t.method, "POST");
+            assert_eq!(t.path, "/s");
+        }
+        // The responses for evicted ids did not push the survivors out.
+        assert!(c.streams.is_empty());
+    }
+
+    #[test]
+    fn a_stream_opened_before_capture_is_not_reported_as_evicted() {
+        // Capture attached mid-connection: stream 1 was opened before the
+        // parser saw anything, so its request half was never held and never
+        // evicted. Only ids inside the range the table actually held and
+        // then dropped may claim eviction.
+        let limits = Limits {
+            max_streams: 1,
+            ..Default::default()
+        };
+        let mut c = Http2Connection::new(limits);
+        let block = hpack(&[(b":method", b"GET"), (b":path", b"/")]);
+        let mut req = frame(FRAME_HEADERS, FH, 3, &block);
+        req.extend_from_slice(&frame(FRAME_HEADERS, FH, 5, &block));
+        c.feed(true, &req); // evicts 3
+        let s = hpack(&[(b":status", b"200")]);
+        let r = c.feed(false, &frame(FRAME_HEADERS, FH | FS, 1, &s));
+        assert_eq!(r.transactions.len(), 1);
+        assert!(!r.transactions[0].request_evicted);
+        let r = c.feed(false, &frame(FRAME_HEADERS, FH | FS, 3, &s));
+        assert!(r.transactions[0].request_evicted);
     }
 
     #[test]
