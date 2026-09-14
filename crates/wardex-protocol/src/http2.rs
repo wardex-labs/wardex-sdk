@@ -61,7 +61,7 @@ impl Http2FrameDecoder {
 }
 
 use fluke_hpack::Decoder;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use wardex_limits::Limits;
 
 const FRAME_DATA: u8 = 0x0;
@@ -171,13 +171,20 @@ pub struct Http2Connection {
     /// and eviction takes the lowest id first, so every request half evicted
     /// so far has an id at or below this mark.
     ///
-    /// What it cannot tell apart is an id that completed normally and then
-    /// receives a stray frame — a peer protocol violation — or a stream reset
-    /// while the server's frames for it were already in flight. Both used to
-    /// surface as a transaction with an empty method and no explanation;
-    /// under the mark they surface flagged, which is true about what the
-    /// transaction lacks even where it names the wrong cause.
+    /// A reset stream below the mark is told apart by `reset`, not by the
+    /// mark. What the mark still cannot tell apart is an id that completed
+    /// normally and then receives a stray frame — a peer protocol violation.
     evicted_through: u32,
+    /// Ids a RST_STREAM ended, so frames the peer had already sent for them
+    /// are discarded rather than recreating the entry. Without it, a response
+    /// in flight when the host cancelled completed as a transaction with no
+    /// request half — flagged as evicted when its id sat under the mark,
+    /// which names `max_streams` for a loss that knob cannot prevent.
+    ///
+    /// Held to `max_streams`, lowest id first, like the table. An id this
+    /// memory has forgotten falls back to the rules above; it is forgotten
+    /// only because of that same bound.
+    reset: BTreeSet<u32>,
     /// The first stream id whose request half this connection held — and so,
     /// with ids only increasing, the lowest. Zero until one is. The floor keeps the mark from claiming a stream
     /// opened before capture attached: that stream's id is below every id
@@ -206,6 +213,7 @@ impl Http2Connection {
             preface_seen: false,
             disabled: None,
             evicted_through: 0,
+            reset: BTreeSet::new(),
             first_request: 0,
             limits,
         }
@@ -327,6 +335,11 @@ impl Http2Connection {
             FRAME_RST_STREAM => {
                 self.streams.remove(&frame.stream_id);
                 self.pending.remove(&frame.stream_id);
+                self.reset.insert(frame.stream_id);
+                let cap = self.limits.max_streams.max(1);
+                while self.reset.len() > cap {
+                    self.reset.pop_first();
+                }
                 Ok(())
             }
             _ => Ok(()), // Skip SETTINGS/PRIORITY/WINDOW_UPDATE/PING/GOAWAY, etc.
@@ -411,6 +424,11 @@ impl Http2Connection {
             };
             hpack_decode(decoder, block)?
         };
+        // Decoded all the same — the HPACK table must stay in step — but a
+        // reset stream's late header block describes nothing the host kept.
+        if self.reset.contains(&stream_id) {
+            return Ok(());
+        }
         if from_client && self.first_request == 0 {
             self.first_request = stream_id;
         }
@@ -462,6 +480,9 @@ impl Http2Connection {
             return;
         }
         let body = &payload[..payload.len() - pad_len];
+        if self.reset.contains(&frame.stream_id) {
+            return;
+        }
         {
             let limits = self.limits;
             let st = self.stream(frame.stream_id);
@@ -531,17 +552,15 @@ impl Http2Connection {
     fn mark_ended(&mut self, from_client: bool, stream_id: u32, result: &mut Http2FeedResult) {
         let st = self.stream(stream_id);
         if from_client {
-            // A stream whose request half was evicted is not reported as
-            // opened a second time when the rest of its request body ends.
-            // The host latches its correlation parent on this signal, keyed
-            // by stream id in increasing-id order; re-announcing a low id
-            // would latch whatever happens to be ambient now under a request
-            // issued earlier, and break the order its own eviction relies on.
+            // Announced even when the request half was evicted before its
+            // END_STREAM arrived. That stream was never announced (it had not
+            // ended), and the write carrying its END_STREAM comes from the
+            // context that issued the request, so the host can still latch
+            // the right parent here. Staying silent left the response with no
+            // parent and nothing on the span to say one was lost.
             if !st.req_ended {
                 st.req_ended = true;
-                if !st.request_evicted {
-                    result.opened_request_streams.push(stream_id);
-                }
+                result.opened_request_streams.push(stream_id);
             }
         } else {
             st.resp_ended = true;
@@ -1045,6 +1064,88 @@ mod tests {
         assert!(!r.transactions[0].request_evicted);
         let r = c.feed(false, &frame(FRAME_HEADERS, FH | FS, 3, &s));
         assert!(r.transactions[0].request_evicted);
+    }
+
+    #[test]
+    fn an_evicted_stream_is_still_announced_when_its_request_ends() {
+        // The table evicted stream 1's request half while its body was still
+        // being sent. When the client's END_STREAM for it finally arrives, the
+        // host is writing that request from the context that issued it, so
+        // the stream must still be announced: the host latches the request's
+        // parent on this signal, and a stream never announced ships with no
+        // parent and nothing to say one was lost.
+        let limits = Limits {
+            max_streams: 2,
+            ..Default::default()
+        };
+        let mut c = Http2Connection::new(limits);
+        let block = hpack(&[(b":method", b"POST"), (b":path", b"/s")]);
+        let mut req = Vec::new();
+        for sid in [1u32, 3, 5] {
+            req.extend_from_slice(&frame(FRAME_HEADERS, FH, sid, &block));
+        }
+        let r = c.feed(true, &req);
+        assert!(r.opened_request_streams.is_empty());
+        assert!(
+            !c.streams.contains_key(&1),
+            "precondition: stream 1 was evicted"
+        );
+
+        let r = c.feed(true, &frame(FRAME_DATA, FS, 1, b"tail"));
+        assert_eq!(r.opened_request_streams, vec![1]);
+
+        let s = hpack(&[(b":status", b"200")]);
+        let r = c.feed(false, &frame(FRAME_HEADERS, FH | FS, 1, &s));
+        assert_eq!(r.transactions.len(), 1);
+        assert!(r.transactions[0].request_evicted);
+    }
+
+    #[test]
+    fn a_reset_stream_ignores_the_frames_already_in_flight_for_it() {
+        // RST_STREAM ends a stream for both peers; frames the other side had
+        // already sent are discarded by the receiver (RFC 9113 section 5.1).
+        // They used to recreate the entry and complete as a transaction with
+        // no method, no path and no explanation.
+        let block = hpack(&[(b":method", b"POST"), (b":path", b"/s")]);
+        let s = hpack(&[(b":status", b"200")]);
+        let rst = frame(FRAME_RST_STREAM, 0, 1, &[0, 0, 0, 8]);
+
+        let mut c = Http2Connection::new(Limits::default());
+        c.feed(true, &frame(FRAME_HEADERS, FH | FS, 1, &block));
+        c.feed(true, &rst);
+        let mut late = frame(FRAME_HEADERS, FH, 1, &s);
+        late.extend_from_slice(&frame(FRAME_DATA, FS, 1, b"late"));
+        let r = c.feed(false, &late);
+        assert!(r.transactions.is_empty());
+        assert!(c.streams.is_empty(), "a reset stream must not be recreated");
+
+        // Reset below the eviction mark: still not the table's loss, so it
+        // must not be reported as an evicted request half.
+        let limits = Limits {
+            max_streams: 2,
+            ..Default::default()
+        };
+        let mut c = Http2Connection::new(limits);
+        c.feed(true, &frame(FRAME_HEADERS, FH, 1, &block));
+        c.feed(true, &rst);
+        for sid in [3u32, 5, 7] {
+            c.feed(true, &frame(FRAME_HEADERS, FH, sid, &block));
+        }
+        assert!(c.evicted_through >= 3, "precondition: stream 3 was evicted");
+        let r = c.feed(false, &frame(FRAME_HEADERS, FH | FS, 1, &s));
+        assert!(r.transactions.is_empty());
+        let r = c.feed(false, &frame(FRAME_HEADERS, FH | FS, 3, &s));
+        assert_eq!(r.transactions.len(), 1);
+        assert!(r.transactions[0].request_evicted);
+
+        // The memory of resets is held to the same bound as the table.
+        for i in 0..100u32 {
+            c.feed(
+                true,
+                &frame(FRAME_RST_STREAM, 0, 101 + 2 * i, &[0, 0, 0, 8]),
+            );
+        }
+        assert!(c.reset.len() <= 2);
     }
 
     #[test]

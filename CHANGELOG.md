@@ -178,7 +178,12 @@ All notable changes to this project are documented here. The format follows
   frames were not bounded at all. The lowest stream ids are now evicted first,
   every frame type is held to the bound, and the response of an evicted stream
   ships `truncated` with the new marker `h2_request_evicted` (vocabulary 53),
-  counted under `protocol.http2.stream_evicted`.
+  counted under `protocol.http2.stream_evicted`. Two other sources of the same
+  unmarked `? /` span are closed as well: frames the server had already sent
+  for a stream the host reset are now discarded, as the host's own client
+  discards them, and a response whose request the parser never saw (the stream
+  was opened before capture attached) is no longer shipped but counted under
+  `protocol.http2.request_unobserved`.
 
 ## [0.6.0b1] - 2026-09-06
 

@@ -542,9 +542,9 @@ class ByteSeamInterceptor(InterceptorInterface):
             return
         txns = st.tracker.on_response_bytes(data)
         try:
-            # No span can carry a latch reason, so it is reported once per connection (guarded by
-            # st.disabled_logged, not st.gate, which the sniff-latch owns). The count fires in
-            # every mode: an uncaptured connection is a capture fact. Only the log is debug's.
+            # No span carries a latch reason: once per connection (st.disabled_logged; st.gate is
+            # the sniff-latch's), counted in every mode, logged in debug. Asked each read until
+            # then: for h2 one allocation-free native call (~60 ns), small beside the recv.
             if not st.disabled_logged:
                 reason = getattr(st.tracker, "disabled_reason", lambda: None)()
                 if reason is not None:

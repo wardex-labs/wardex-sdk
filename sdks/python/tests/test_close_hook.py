@@ -601,6 +601,21 @@ def _h2_answer(enc: Encoder, stream_id: int) -> bytes:
     return _frame(0x1, 0x4 | 0x1, stream_id, enc.encode([(b":status", b"200")]))
 
 
+def _h2_open_unended(enc: Encoder, stream_id: int) -> bytes:
+    """HEADERS without END_STREAM: the request body is still to come, so the
+    parser holds the request half but reports nothing opened yet."""
+    block = enc.encode([(b":method", b"POST"), (b":path", b"/v1/messages")])
+    return _frame(0x1, 0x4, stream_id, block)  # END_HEADERS only
+
+
+def _h2_end_body(stream_id: int) -> bytes:
+    return _frame(0x0, 0x1, stream_id, b"{}")  # DATA, END_STREAM
+
+
+def _h2_rst(stream_id: int) -> bytes:
+    return _frame(0x3, 0x0, stream_id, b"\x00\x00\x00\x08")  # RST_STREAM CANCEL
+
+
 def test_an_h2_stream_that_never_answers_loses_its_latch_entry_at_close(
     fake_ssl_socket, bare_ssl_interceptor
 ):
@@ -667,12 +682,15 @@ def test_an_unlatched_stream_above_the_eviction_mark_is_not_blamed_on_the_cap():
     """The other half of the same decision, and the one that keeps the marker
     worth reading: a stream whose entry the cap never touched must not be
     reported as degraded just because it has no entry. Here nothing has been
-    evicted at all, so an answer for a stream this tracker never saw opened —
-    capture that began mid-connection — is an ordinary unparented transaction.
+    evicted at all: the server answered before the request body ended, so the
+    stream was never reported opened and never latched.
     """
     tracker = _Http2Tracker(LimitsConfig(max_streams=8).to_native())
+    tracker.on_request_bytes(_h2_open_unended(Encoder(), 7))
     (txn,) = tracker.on_response_bytes(_h2_answer(Encoder(), 7))
+    assert (txn.method, txn.path) == ("POST", "/v1/messages")
     assert txn.parent_evicted is False
+    assert txn.limitations == ()
 
 
 def test_a_stream_opened_before_capture_attached_is_not_blamed_on_the_cap():
@@ -694,11 +712,87 @@ def test_a_stream_opened_before_capture_attached_is_not_blamed_on_the_cap():
         tracker.on_request_bytes(_h2_open(client_enc, sid))
     assert tracker._latch_evicted_below == 101, "precondition: the cap dropped stream 101"
 
-    (before,) = tracker.on_response_bytes(_h2_answer(server_enc, 7))
-    assert before.parent_evicted is False, "a stream this tracker never latched is not its loss"
+    # Its response has no request half this parser ever saw, and none the
+    # bound took: it is counted and not shipped, so it cannot open the gate.
+    assert tracker.on_response_bytes(_h2_answer(server_enc, 7)) == []
+    assert counters.snapshot().get("protocol.http2.request_unobserved") == 1
+    assert counters.snapshot().get("protocol.http2.stream_evicted") is None
 
     (evicted,) = tracker.on_response_bytes(_h2_answer(server_enc, 101))
     assert evicted.parent_evicted is True
+
+
+def test_an_evicted_request_that_ends_later_still_latches_its_parent():
+    """The native table evicted stream 1's request half while its body was
+    still being written. The write that ends it comes from the context that
+    issued the request, so the parent is latched there — otherwise the
+    response ships parentless with nothing to say a parent was lost, and under
+    the AGENT capture mode the gate drops it outright.
+    """
+    from wardex_sdk import _hub
+    from wardex_sdk._types import SpanContext, SpanId, TraceId
+
+    tracker = _Http2Tracker(LimitsConfig(max_streams=2).to_native())
+    client_enc, server_enc = Encoder(), Encoder()
+    for sid in (1, 3, 5):
+        tracker.on_request_bytes(_h2_open_unended(client_enc, sid))
+    ctx = SpanContext(trace_id=TraceId.generate(), span_id=SpanId.generate())
+    with _hub.new_scope() as scope:
+        scope.active_span_context = ctx
+        tracker.on_request_bytes(_h2_end_body(1))
+    assert 1 in tracker._latch
+
+    (txn,) = tracker.on_response_bytes(_h2_answer(server_enc, 1))
+    assert txn.parent == ctx
+    assert txn.parent_evicted is False
+    assert Limitation.H2_REQUEST_EVICTED in txn.limitations
+    assert txn.truncated is True
+
+
+def test_a_late_low_stream_id_is_evicted_before_higher_ones():
+    """The latch's mark is exact only if eviction is lowest id first. A stream
+    whose request ends late is latched after higher ids, so evicting in
+    insertion order would drop a higher id and leave the mark claiming the
+    wrong streams."""
+    tracker = _Http2Tracker(LimitsConfig(max_streams=2).to_native())
+    enc = Encoder()
+    tracker.on_request_bytes(_h2_open_unended(enc, 1))
+    for sid in (3, 5):
+        tracker._latch[sid] = (None, False, 0)
+    tracker.on_request_bytes(_h2_end_body(1))
+    assert set(tracker._latch) == {3, 5}
+    assert tracker._latch_first == 1
+    assert tracker._latch_evicted_below == 1
+
+
+def test_a_reset_stream_whose_response_was_in_flight_ships_nothing():
+    """The host cancelled the stream; the server's already-sent response is
+    discarded by the host's client, and the parser discards it too. It used
+    to complete as `? /` with no marker — or, under an eviction mark from
+    other streams, as an evicted request half blaming `max_streams`."""
+    tracker = _Http2Tracker(LimitsConfig(max_streams=8).to_native())
+    client_enc, server_enc = Encoder(), Encoder()
+    tracker.on_request_bytes(_h2_open(client_enc, 1))
+    tracker.on_request_bytes(_h2_rst(1))
+    assert tracker.on_response_bytes(_h2_answer(server_enc, 1)) == []
+
+    tracker = _Http2Tracker(LimitsConfig(max_streams=2).to_native())
+    client_enc, server_enc = Encoder(), Encoder()
+    tracker.on_request_bytes(_h2_open_unended(client_enc, 1))
+    tracker.on_request_bytes(_h2_rst(1))
+    for sid in (3, 5, 7):
+        tracker.on_request_bytes(_h2_open_unended(client_enc, sid))
+    assert tracker.on_response_bytes(_h2_answer(server_enc, 1)) == []
+    assert counters.snapshot().get("protocol.http2.stream_evicted") is None
+
+
+def test_a_response_with_no_observed_request_is_counted_not_shipped_as_a_phantom():
+    """Capture attached after the host opened the stream: the parser holds a
+    status and nothing else. Shipping it meant a `? /` span with no marker,
+    indistinguishable from a request that really had no method and no path."""
+    tracker = _Http2Tracker(LimitsConfig(max_streams=8).to_native())
+    assert tracker.on_response_bytes(_h2_answer(Encoder(), 7)) == []
+    assert counters.snapshot().get("protocol.http2.request_unobserved") == 1
 
 
 def test_closing_the_connection_forgets_the_eviction_mark_too():
