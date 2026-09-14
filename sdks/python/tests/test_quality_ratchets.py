@@ -286,7 +286,7 @@ _OVERSIZED_BUDGET = {
     "_client.py": 1587,
     "_adapters/_context.py": 1305,
     "_interceptors/_seam.py": 1197,
-    "_adapters/_langgraph.py": 1094,
+    "_adapters/_langgraph.py": 1035,
     "_assembly/_integrity.py": 1082,
     "_assembly/_builder.py": 970,
     "_adapters/_anthropic_agent_sdk.py": 944,

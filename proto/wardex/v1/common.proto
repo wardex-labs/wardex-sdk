@@ -218,6 +218,18 @@ enum Limitation {
   LIMITATION_TOOL_CALL_ID_UNAVAILABLE_IN_PROCESS = 14;
   LIMITATION_SNAPSHOT_TYPE_UNKNOWN = 15;
   LIMITATION_TOOL_NAME_COLLISION = 16;
+  //    A causal link this span is owed was NOT added: the framework's string
+  //    naming its source admits more than one reading, or cannot be read
+  //    without facts the seam lacks. Emitted for a LangGraph
+  //    `join:{a}+{b}:{end}` trigger — `+` is legal inside a node name and is
+  //    also the source separator, so the sources are read against the
+  //    running graph's node set and a string with zero, several, or
+  //    unknowable readings links nothing. Reader's next action: the real
+  //    sources are in the graph definition; a node name without `+` makes the
+  //    join resolvable. Names NO knob. Not TOOL_NAME_COLLISION (16): there the
+  //    span's own identity is ambiguous; here the span is certain and the
+  //    edge to another one is not.
+  LIMITATION_LINK_AMBIGUOUS = 49;
 
   // -- Transport timing.
   LIMITATION_CONNECT_TIMING_UNAVAILABLE = 17;

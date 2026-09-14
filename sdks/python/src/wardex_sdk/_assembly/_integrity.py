@@ -16,26 +16,11 @@ correction costs a second deliberate schema break. Emitters must never invent a
 marker string inline.
 
 **The census closed at 37 members = 15 originally declared + 21 from it + 1
-from §5.4.** Six more landed since, each by its own deliberate core PR:
-``INSTRUMENTATION_DEGRADED`` (38, wardex's own failure),
-``OTLP_ATTRIBUTE_TRUNCATED`` (39, the OTLP export size guard),
-``UNIT_TABLE_FULL`` (40, the registry's breadth bound), the Agent SDK
-OTel bridge's fail-open pair ``OTEL_BRIDGE_NO_DATA`` (41, confirmed injection
-and nothing arrived) / ``OTEL_BRIDGE_SCHEMA_UNKNOWN`` (42, data arrived and
-classified as nothing), and ``SESSION_ENTRY_TABLE_FULL`` (43, the adapter's
-per-session bound, which is the registry's breadth bound one layer out and a
-different FIELD). Five more since that paragraph was last true:
-``EXTRA_KEYS_DROPPED`` (44, the dynamic-key bound on the provider-usage
-mirror), ``TRACKING_RESET_AT_FORK`` (45, the fork child's per-connection
-tracking reset — the one member that names a process event and no knob), and
-the deferred-parse pair ``PARSE_BACKLOG_FULL`` (46, the backlog's capacity
-bound — a transaction shipped unparsed to admit a newer one) /
-``PARSE_SKIPPED_AT_SHUTDOWN`` (47, the shutdown budget ran out first — same
-unparsed shipment, different knob, so a different member by the census rule),
-and ``WS_LLM_SEMANTICS_UNREAD`` (48, LLM calls crossed a WebSocket connection
-wardex only counted — the transport, not a parser, is the gap).
-``tests/test_limitation_census.py`` is the live count; this paragraph is its
-history, not its source.
+from §5.4.** Every member since landed by its own deliberate core change, WITH
+its emitter, and the reason for each is recorded beside its entry in
+``tests/test_limitation_census.py`` (``_VOCABULARY``, ``_EMITTED_MEMBERS``) —
+that file is the live count and the history; this module no longer keeps a
+second copy of either.
 The census read every assignment and append site that reaches
 ``CaptureIntegrity.limitations`` and found 25 distinct strings (24 Python, 1
 Rust). Four of those merged away — see the ``NOTE (census)`` comments on
@@ -636,6 +621,21 @@ Two emit sites, and the first is the mechanism the second restates.
       * ``CLAUDE_AGENT_SDK_MCP_NO_PREFIX`` is set and two wrapped servers export
         the same bare name, so the hook cannot attribute its observation at all
         and stands down — this span is the only record of the call.
+    """
+
+    LINK_AMBIGUOUS = "link_ambiguous"
+    """A causal link this span is owed was NOT added: the framework's string
+    naming its source has more than one reading, or none this seam can check.
+
+    Emitted from ``_adapters/_langgraph_links.py::_node_links`` for a LangGraph
+    ``join:{a}+{b}:{end}`` trigger. ``+`` is legal inside a node name and is
+    also the source separator, so ``join:a+b+a:c`` is ``a+b``, ``a`` in one
+    graph and ``a``, ``b``, ``a`` in another; ``_join_sources`` reads it
+    against the run's node set and links only a unique reading. Travels with
+    the counter ``adapters.langgraph.join_ambiguous``. Reader's next action:
+    the real sources are in the graph definition; node names without ``+``
+    make every join resolvable. Names NO knob. Not ``TOOL_NAME_COLLISION``:
+    that is a span's own identity; here its edge to another span is unsure.
     """
 
     # ------------------------------------------------------------------
