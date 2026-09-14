@@ -3,8 +3,9 @@
 `server.address`/`server.port` and the URL on a seam span come from here.
 These answer with a READ address, and each is the TCP peer:
 
-  * A connected INET socket's own `getpeername()` — every sync client, TLS or
-    not, since an `ssl.SSLSocket` is a socket.
+  * A connected INET socket's own `getpeername()` — every sync client on a
+    direct or CONNECT-tunnelled socket, TLS or not, since an `ssl.SSLSocket`
+    is a socket.
   * What a memory-BIO `ssl.SSLObject` rides on. The object has no
     `getpeername()`, but at the moment it is set up something that holds both
     it and the socket is in hand, and the close probe
@@ -15,11 +16,12 @@ These answer with a READ address, and each is the TCP peer:
         `asyncio.open_connection`): `SSLProtocol.connection_made` is handed
         the raw socket transport, whose `peername` extra is the socket's
         `getpeername()`, while the protocol already owns the object;
-      - anyio TLS (httpx's `AsyncClient`, and so the async OpenAI and
-        Anthropic clients): `TLSStream.wrap` returns a stream whose public
+      - anyio TLS (httpx's `AsyncClient` on asyncio, and so the async OpenAI
+        and Anthropic clients): `TLSStream.wrap` returns a stream whose public
         typed attributes name the object and the socket's remote address.
-    Under TLS inside TLS (an HTTPS proxy) that is the proxy, exactly as a sync
-    socket's `getpeername()` would say.
+    On these two async stacks, TLS inside TLS (an HTTPS target behind an HTTPS
+    proxy) reports the proxy, as the outer connection's socket would. The sync
+    stacks do not: see the placeholder list.
 
 Everything else is a placeholder: the TLS server name when there is one, else
 `unknown`, and port `UNRESOLVED_PORT` (0). The traffic is still captured — a
@@ -28,6 +30,14 @@ local model server over a unix socket is an LLM call to the user. The cases:
   * `AF_UNIX` (httpx's `uds=`, docker-py, local model servers): `getpeername()`
     answers with a path.
   * A socket that is not connected: `getpeername()` raises.
+  * Sync TLS inside TLS: an HTTPS target behind an HTTPS proxy on a sync
+    client. httpcore's `TLSinTLSStream` (httpx `Client`) and urllib3's
+    `SSLTransport` (`requests`) run the inner TLS on a memory-BIO
+    `ssl.SSLObject` of their own, built with `wrap_bio` and pumped over the
+    proxy socket by hand; neither stamping site sees it.
+  * trio TLS, including httpx's `AsyncClient` under trio: httpcore picks its
+    trio backend there, and `trio.SSLStream` goes through neither
+    `SSLProtocol` nor anyio's `TLSStream`.
   * uvloop TLS. uvloop's `SSLProtocol` is its own Cython class, not
     `asyncio.sslproto.SSLProtocol`, so the patch that reads the transport
     never runs. (anyio TLS over uvloop still goes through `TLSStream.wrap`,

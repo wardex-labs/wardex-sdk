@@ -109,7 +109,8 @@ All notable changes to this project are documented here. The format follows
   `ssl.SSLObject`, which has no peer address of its own, so wardex reads the
   peer where the connection is set up: off the socket transport on asyncio TLS
   (aiohttp, `asyncio.open_connection(ssl=...)`), and off anyio's TLS stream on
-  anyio TLS (httpx `AsyncClient`, and so `AsyncOpenAI` and `AsyncAnthropic`).
+  anyio TLS (httpx `AsyncClient` on asyncio, and so `AsyncOpenAI` and
+  `AsyncAnthropic`).
   Those spans report the real port, and the IP connected to in
   `server.address`, exactly as sync clients (`httpx.Client`, `requests`) do;
   the URL keeps the TLS server name as its host. They used to report port 443
@@ -117,8 +118,11 @@ All notable changes to this project are documented here. The format follows
   `server.port` over OTLP), a URL like
   `https://api.openai.com:0/v1/chat/completions`, `peer_unresolved`, and one
   count, with the TLS server name in `server.address`: asyncio TLS under
-  uvloop, whose TLS protocol is its own (anyio over uvloop is read), and an
-  async TLS connection opened before `wardex.init()`. A WebSocket session on
+  uvloop, whose TLS protocol is its own (anyio over uvloop is read); trio TLS,
+  including httpx `AsyncClient` under trio; a sync client's (`httpx.Client`,
+  `requests`) HTTPS call through an HTTPS proxy, whose inner TLS runs on its
+  own memory-BIO object; and an async TLS connection opened before
+  `wardex.init()`. A WebSocket session on
   such a connection counts once per session,
   including one the capture mode refuses. The seam also stops calling
   `getpeername()` on every send.

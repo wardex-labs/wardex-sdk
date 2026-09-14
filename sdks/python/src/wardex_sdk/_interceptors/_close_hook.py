@@ -448,9 +448,12 @@ class CloseProbe:
     connection made before `install()`: both stay unread.
 
     anyio's `TLSStream.wrap` is the FIFTH, and it is the same fact on the other
-    async TLS stack. httpx's `AsyncClient` — so the async OpenAI and Anthropic
-    clients — does not use asyncio's TLS protocol at all: anyio builds its own
-    `SSLObject` over a byte stream, and the FOURTH patch never sees it. The
+    async TLS stack. httpx's `AsyncClient` on asyncio — so the async OpenAI and
+    Anthropic clients — does not use asyncio's TLS protocol at all: anyio
+    builds its own `SSLObject` over a byte stream, and the FOURTH patch never
+    sees it. (Under trio httpcore uses `trio.SSLStream`, which neither patch
+    sees; a sync client's TLS inside TLS is a hand-pumped `wrap_bio` object,
+    likewise unread.) The
     classmethod returns the finished stream, whose typed attributes are public
     anyio API and name both the object (`TLSAttribute.ssl_object`) and the
     socket's peer (`SocketAttribute.remote_address`), so the read runs after

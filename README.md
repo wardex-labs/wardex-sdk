@@ -562,12 +562,12 @@ carried LLM calls wardex did not read),
 `interceptors.seam.ws_llm_endpoint_unconfirmed` (Responses-path WebSocket
 connections wardex could not corroborate) and
 `interceptors.seam.peer_unresolved` (requests on a connection whose peer
-address wardex could not read: a unix socket, asyncio TLS under uvloop, or
-an async TLS connection opened before `wardex.init()`. Other async TLS --
-aiohttp, httpx `AsyncClient`, `AsyncOpenAI` -- has its peer read where the
-connection is set up and is not counted. The in-process span says port `0`,
-the URL
-renders `:0`, OTLP export omits `server.port` because 0 is proto3 "unset", and
+address wardex could not read: a unix socket, asyncio TLS under uvloop, trio
+TLS (httpx `AsyncClient` under trio included), a sync client's HTTPS call
+through an HTTPS proxy, or an async TLS connection opened before
+`wardex.init()`. Other async TLS on asyncio -- aiohttp, httpx `AsyncClient`,
+`AsyncOpenAI` -- has its peer read where the connection is set up and is not
+counted. The in-process span says port `0`, the URL renders `:0`, OTLP export omits `server.port` because 0 is proto3 "unset", and
 `peer_unresolved` in `wardex.limitations` is the marker to filter on);
 table-eviction counters are under
 Resource limits. `ffi.panic_converted` counts a panic in the Rust core that
