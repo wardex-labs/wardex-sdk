@@ -397,6 +397,26 @@ def test_init_without_flag_does_not_patch():
     wardex_sdk.close()
 
 
+def test_default_init_patches_no_http_client():
+    """The opt-in promise, proved on the path a host actually takes.
+
+    `intercept` defaults to True, so the test above proves the promise only
+    for `intercept=False` — a configuration almost nobody runs — and only for
+    one attribute out of the four. The failure this closes: an interceptor
+    added to the default set reaches for a client library instead of the
+    stdlib socket/ssl seams, a plain `init()` starts wrapping outbound
+    requests and headers, and every existing test in this file still passes.
+    """
+    _hub.reset_for_test()
+    before = _patched_attributes()
+    wardex_sdk.init()
+    try:
+        assert _patched_attributes() == before
+    finally:
+        wardex_sdk.close()
+    assert _patched_attributes() == before
+
+
 def _patched_attributes() -> dict[str, object]:
     """The four attributes this module patches, as they stand right now."""
     import aiohttp

@@ -5,6 +5,43 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **The quality budgets this SDK holds itself to are now recorded and
+  enforced, and you can re-measure them from a clone.**
+  `scripts/quality-snapshot.sh` prints them as JSON from the source tree alone
+  — no venv, no `cargo`, nothing imported from the built package, so a stale
+  wheel cannot change a number it reports — and CI runs it on every push as a
+  recorded step that gates nothing.
+  `sdks/python/tests/test_quality_ratchets.py` is what enforces them: the
+  panic surface of the Rust core (172 `unwrap()`/`expect(` sites, falling
+  only) and of the FFI layer (zero, permanently), module size, undocumented
+  public names, skip markers without a named reason, and the wheel's runtime
+  dependency count. A number that moves the wrong way fails
+  `pytest sdks/python/tests`, on every push and pull request. `README.md`
+  describes what each budget holds and `CONTRIBUTING.md` sends contributors
+  through the snapshot before opening a pull request.
+- **`sdks/python/tests/test_import_purity.py` pins two claims the README makes
+  about what the SDK costs a process that is not using it.** In one
+  subprocess, `import wardex_sdk` is shown to start no thread, leave the
+  `ssl`/`socket` send and receive attributes identical by `is`, read no
+  `WARDEX_*` or `OTEL_*` variable, and add no provider package to
+  `sys.modules`; its `atexit`, `signal`, and fork registrations are asserted by
+  owner rather than by count, because a bare import really does add CPython's
+  own and hiding that behind a count would make the test a lie. In a second,
+  an SDK initialised with everything disabled and then closed is shown to
+  return threads, socket-attribute identity, signal dispositions, and provider
+  imports to the post-import baseline.
+- **The layer ranks in `AGENTS.md` are now a tested fact.**
+  `sdks/python/tests/test_import_graph.py` reads the architecture diagram out
+  of `AGENTS.md`, fails if it and the rank table disagree, and fails if any of
+  the 25 Python units imports a higher-ranked one. Five known wrong-way imports
+  are recorded by name as six occurrences that may only shrink.
+- **`AGENTS.md` now names every check that no gate runs** — four hand-run
+  Python files and eight `#[ignore]`d Rust probes — each with the change that
+  should trigger it, what it needs, and its budget.
+  `test_quality_ratchets.py` fails if one of them is added and not named here.
+
 ### Changed
 
 - The openai-agents quickstart docs no longer describe a from-source

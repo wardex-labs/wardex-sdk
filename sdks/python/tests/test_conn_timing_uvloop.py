@@ -8,7 +8,7 @@ import wardex_sdk as wardex
 from wardex_sdk import _hub
 from wardex_sdk._enums import CaptureMode, SpanKind
 
-uvloop = pytest.importorskip("uvloop")
+uvloop = pytest.importorskip("uvloop", reason="optional dep; the uvloop connect path needs it")
 
 
 @pytest.fixture(autouse=True)

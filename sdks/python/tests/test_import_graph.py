@@ -25,7 +25,9 @@ Two kinds of assertion live here, and the difference matters when one fails:
 from __future__ import annotations
 
 import ast
+import copy
 import pathlib
+import re
 
 import pytest
 
@@ -481,19 +483,58 @@ def _tally(make_predicate, *, under: tuple[str, ...] | None = None) -> dict[str,
     return counts
 
 
+#: What to do about a budget that went UP. The default belongs to the C-S
+#: budgets below; a rule with a different remedy passes its own.
+_BUDGET_REMEDY = (
+    "These budgets are a ratchet over code that predates wardex_sdk._assembly.\n"
+    "They may only be LOWERED. If you need a new occurrence, you need the\n"
+    "_assembly/ entry point instead — that is the whole point of the rule.\n"
+    "See design §10.4."
+)
+
+
 def _assert_within_budget(
-    actual: dict[str, int], budget: dict[str, int], rule: str, why: str
+    actual: dict[str, int],
+    budget: dict[str, int],
+    rule: str,
+    why: str,
+    *,
+    remedy: str = _BUDGET_REMEDY,
 ) -> None:
+    """A ratchet that holds in BOTH directions: the count may not rise, and it
+    may not quietly fall either.
+
+    Failing only on `actual > budget` is what a ratchet looks like when nobody
+    has thought about the slack. A budget left HIGH after the code improved is
+    not stale bookkeeping — it is an open slot where a brand-new occurrence
+    lands and changes nothing any test can see, because the number was already
+    paid for. One such slot sat open in `_CS5_BUDGET` from the day the
+    assembler's sink calls went from three to one until the day this branch was
+    written, and no test in this file could tell.
+
+    So a fall is a failure too, and the only way to clear it is to write the new
+    number down. That makes "the budget is the measurement" true rather than
+    aspirational, which is the whole reason an outside reader can trust it.
+    """
     over = {rel: (n, budget.get(rel, 0)) for rel, n in actual.items() if n > budget.get(rel, 0)}
     assert not over, (
         f"{rule} regressed.\n"
         + "\n".join(f"  {rel}: {n} occurrences, budget {b}" for rel, (n, b) in sorted(over.items()))
         + f"\n\nWHY: {why}\n"
-        "These budgets are a ratchet over code that predates wardex_sdk._assembly.\n"
-        "They may only be LOWERED. If you need a new occurrence, you need the\n"
-        "_assembly/ entry point instead — that is the whole point of the rule.\n"
-        "See design §10.4."
+        + remedy
     )
+    under = {rel: (actual.get(rel, 0), b) for rel, b in budget.items() if actual.get(rel, 0) < b}
+    if under:
+        pytest.fail(
+            f"{rule} improved — record it.\n"
+            + "\n".join(
+                f"  {rel}: {n} occurrences, budget {b}" for rel, (n, b) in sorted(under.items())
+            )
+            + "\n\nLower each budget above to the number beside it in THIS commit,\n"
+            "deleting the entry when it reaches 0, and record the new totals\n"
+            "in the commit body. A budget higher than the tree is a\n"
+            "free slot: the next occurrence to land there is invisible."
+        )
 
 
 # --------------------------------------------------------------------------
@@ -562,6 +603,17 @@ def test_assembly_imports_only_leaf_and_scope_layers():
     )
 
 
+# Its own reason, and a module constant rather than a literal inside the assert
+# so the rank rule below can print the SAME sentence for the same violation
+# instead of a second copy that drifts on the next edit.
+_OBSERVER_SIBLINGS_WHY = (
+    "they are two independent observers of the same run. A direct\n"
+    "edge between them is how one layer ends up owning the other's spans,\n"
+    "which is exactly the double-instrumentation mess design §8 exists to\n"
+    "prevent. Anything they need to share belongs in _assembly/."
+)
+
+
 def test_adapters_and_interceptors_do_not_import_each_other():
     violations: list[str] = []
     for a, b in (("_adapters/", f"{_PKG}._interceptors"), ("_interceptors/", f"{_PKG}._adapters")):
@@ -574,10 +626,8 @@ def test_adapters_and_interceptors_do_not_import_each_other():
     assert not violations, (
         "_adapters/ and _interceptors/ are siblings, not a stack:\n"
         + "\n".join(sorted(violations))
-        + "\n\nWHY: they are two independent observers of the same run. A direct\n"
-        "edge between them is how one layer ends up owning the other's spans,\n"
-        "which is exactly the double-instrumentation mess design §8 exists to\n"
-        "prevent. Anything they need to share belongs in _assembly/."
+        + "\n\nWHY: "
+        + _OBSERVER_SIBLINGS_WHY
     )
 
 
@@ -649,6 +699,17 @@ _SEMANTICS_MAY_IMPORT = frozenset(
 _SEMANTICS_MAY_IMPORT_PACKAGES = (f"{_PKG}._assembly", f"{_PKG}._protocol")
 
 
+# A module constant for the same reason `_OBSERVER_SIBLINGS_WHY` is one: the
+# rank rule below reprints it, and two copies of a sentence are two sentences.
+_SEMANTICS_WHY = (
+    "_semantics/ exists so a SECOND byte seam — and eventually a second\n"
+    "language SDK — can reuse the protocol-to-gen_ai mapping without\n"
+    "dragging in the interceptor that happens to call it today. One import\n"
+    "of _interceptors/ or _adapters/ makes the package a private helper of\n"
+    "that caller again, and the extraction was for nothing."
+)
+
+
 def test_semantics_imports_neither_sibling_observer():
     """The rule the package's own docstring asserts, made checkable.
 
@@ -687,12 +748,7 @@ def test_semantics_imports_neither_sibling_observer():
             violations.append(f"{rel} -> {target}")
 
     assert not violations, (
-        f"_semantics/ reached outside its layer: {violations}\n\n"
-        "WHY: _semantics/ exists so a SECOND byte seam — and eventually a second\n"
-        "language SDK — can reuse the protocol-to-gen_ai mapping without\n"
-        "dragging in the interceptor that happens to call it today. One import\n"
-        "of _interceptors/ or _adapters/ makes the package a private helper of\n"
-        "that caller again, and the extraction was for nothing."
+        f"_semantics/ reached outside its layer: {violations}\n\n" + "WHY: " + _SEMANTICS_WHY
     )
 
 
@@ -747,6 +803,414 @@ def test_assembly_public_surface_is_declared_and_resolvable():
     assert list(assembly.__all__) == sorted(assembly.__all__), "keep __all__ sorted"
     missing = [name for name in assembly.__all__ if not hasattr(assembly, name)]
     assert not missing, f"assembly.__all__ names nothing importable: {missing}"
+
+
+# --------------------------------------------------------------------------
+# design §3.1 — the whole order, not four edges of it (BUDGET -> HARD RULE)
+# --------------------------------------------------------------------------
+#
+# The four rules above are scoped by IMPORTER: each names a package and asks
+# what that package may reach. Every module they do not name is therefore free
+# to import anything. `_client.py` is named by none of them, so a new
+# `from ._adapters import X` inside it — the client reaching up into an observer
+# — is green today. `transport/` IS named, but its forbidden list is two target
+# packages spelled out by name, so a new `from .._client import Y` inside it is
+# green too. Both are design §3.1's arrow running backwards, and both are
+# invisible to every assertion in this file.
+#
+# This is the same rule stated over the whole package instead of once per
+# package: a rank for every top-level unit, and no module may import a STRICTLY
+# higher one. Equal ranks import each other freely, which is what lets a rank
+# table be an honest description of a package that contains a cycle rather than
+# a wish about one that does not.
+#
+# It lands the way this file's header prescribes. HARD RULE for the order;
+# BUDGET for the edges that contradict it today. `_LAYER_RANK_DEBT` records
+# every one of them by name, may only shrink, and — now that
+# `_assert_within_budget` fails in both directions — cannot be left stale after
+# an edge is removed.
+#
+# WHAT COUNTS AS AN EDGE. Imports inside `if TYPE_CHECKING:` do not: they create
+# no runtime edge at all, and `_types.py` already argues exactly that in the
+# comment above its own TYPE_CHECKING block, where three imports of `_assembly/`
+# sit for the sole reason that running them would be a real cycle. Imports
+# inside a function DO count. Deferring an import changes WHEN the edge is
+# taken, not whether it exists; the two deferred `_runtime` imports in the
+# registries are ordinary runtime edges that happen to be taken late, so they
+# are recorded below rather than excused. Excluding them would have been the
+# convenient choice and would have made the rule mean less.
+#
+# WHAT A RANK DOES NOT BOUND. Reachability. `_hub.get_client()` hands a rank-8
+# `Client` to a caller at any rank, and `transport/_base.py` and
+# `context/_inject.py` already take it that way without importing `_client.py`.
+# No import-graph rule can see that, so nothing here may be read as "the layer
+# is closed". This rule bounds the import graph. Closing the layer is a
+# different piece of work, and `_hub.py` is where it starts.
+
+# `_wardex_native` is the compiled extension `_wardex_native.abi3.so`, a real
+# submodule of the package and the floor of the stack. It is not a `.py` file,
+# so `_known_modules()` cannot see it and `from .. import _wardex_native`
+# resolves to the pseudo-target `wardex_sdk:_wardex_native` — a symbol on the
+# package ROOT, which ranks at the top. Left alone that fabricates a violation
+# in every module that touches the native core (seven of them today). It is
+# named here instead, and `_unit_of_target` maps both spellings onto it.
+_NATIVE_UNIT = "_wardex_native"
+_NATIVE_TARGETS = frozenset({f"{_PKG}._wardex_native", f"{_PKG}:_wardex_native"})
+
+#: Every top-level unit of the package and the layer it sits in. A unit is a
+#: top-level module (`_hub.py`) or a top-level subpackage (`context/`) — the
+#: granularity the architecture is actually described at.
+#:
+#: There is deliberately NO default and no catch-all "leaf" bucket. Only five of
+#: the seventeen top-level modules import nothing from the package; a bucket
+#: would be a guess about the other twelve. A new file fails
+#: `test_the_rank_table_covers_every_unit_on_disk` until someone ranks it, which
+#: is the one moment the decision is cheap.
+_LAYER_RANK: dict[str, int] = {
+    # 0 — the native core, and the modules that import nothing from the package.
+    "_enums.py": 0,
+    "_hash.py": 0,
+    "_native.py": 0,
+    "_suppress.py": 0,
+    "_version.py": 0,
+    _NATIVE_UNIT: 0,
+    # 1 — the closed vocabulary every layer above is written in.
+    "_limits.py": 1,
+    "_types.py": 1,
+    # 2 — configuration, the wardex scope, and the process-global accessor.
+    #     `_hub.py` belongs at the BOTTOM because everything depends on it; its
+    #     two upward imports are recorded debt, not an argument for moving it.
+    "_config.py": 2,
+    "_hub.py": 2,
+    "_scope.py": 2,
+    # 3 — the ContextVar layer: below the observers, above the scope it carries.
+    "context/": 3,
+    # 4 — the span machinery. The layer everything else depends ON.
+    "_assembly/": 4,
+    # 5 — bytes to parsed messages. Thin wrappers over the native core.
+    "_protocol/": 5,
+    # 6 — parsed messages to gen_ai meaning. Reads 5, writes 4's vocabulary.
+    "_semantics/": 6,
+    # 7 — the exit: the batching worker and the wire.
+    "_worker.py": 7,
+    "transport/": 7,
+    # 8 — the client and the shutdown path it owns.
+    "_client.py": 8,
+    "_finalize.py": 8,
+    # 9 — the two observers. They are siblings, so they share a rank; the rule
+    #     that they must not import EACH OTHER cannot be a rank rule, because
+    #     equal ranks may import in both directions. It stays above, on its own.
+    "_adapters/": 9,
+    "_interceptors/": 9,
+    # 10 — the composition root: what installs the observers.
+    "_runtime.py": 10,
+    # 11 — the public verbs.
+    "_snapshot_api.py": 11,
+    "_tracing.py": 11,
+    # 12 — the published surface, and the harness that exercises it.
+    "__init__.py": 12,
+    "testing/": 12,
+}
+
+#: BUDGET. Every import in the tree that points at a strictly higher rank, keyed
+#: `"<importer path> -> <target unit>"` and valued by how many distinct resolved
+#: targets that edge covers. It may only SHRINK, and because
+#: `_assert_within_budget` now fails from underneath, an edge that goes away
+#: must leave this dict in the same commit.
+#:
+#: These five are not scattered accidents. Together they are the cycle that
+#: makes twelve of the twenty-five units mutually reachable, which is why ranks
+#: 2..10 above describe an intended order rather than a proven one.
+_LAYER_RANK_DEBT = {
+    # The hinge, and the only entry whose removal would change the shape of the
+    # package rather than tidy it. `_hub.py` is 103 lines whose job is to hand
+    # out the process-global client, so nearly every layer below imports it —
+    # and to do that job it imports the two units at the very top. Remove these
+    # two edges and ranks 3..10 become a fact instead of an intention.
+    "_hub.py -> _client.py": 1,
+    "_hub.py -> _runtime.py": 1,
+    # Two resolved targets for one import statement: `from .._assembly import
+    # PatchSet` names the package AND a symbol re-exported by it, and both are
+    # counted so that a second symbol cannot be smuggled onto a paid-for edge.
+    # `_assembly/` imports `context/` back — `_ASSEMBLY_MAY_IMPORT_PACKAGES`
+    # above sanctions that half — so this is a two-unit cycle, and no rank
+    # assignment can express it. The patch machinery both ends reach for
+    # belongs to neither package.
+    "context/_inject.py -> _assembly/": 2,
+    # Deferred on purpose, and still real. Each registry asks the composition
+    # root for the live runtime only when a host installs something, because a
+    # module-level import would close the cycle at import time; both docstrings
+    # say so. Deferring moves when the edge is taken, not whether it exists, so
+    # it is recorded rather than excused — the alternative is a rule that any
+    # violation can step around by moving one line inside a function.
+    "_adapters/_registry.py -> _runtime.py": 1,
+    "_interceptors/_registry.py -> _runtime.py": 1,
+}
+
+_RANK_ORDER_WHY = (
+    "design §3.1's arrow belongs to the whole package, not to one package at a\n"
+    "time. A module that imports a strictly higher layer turns the order into a\n"
+    "cycle, and a cycle is exactly why the four rules above have to be written\n"
+    "one package at a time: once everything can reach everything, there is no\n"
+    "layer left to put the shared thing IN. Move the shared thing DOWN to the\n"
+    "rank both ends already live at, or change the rank table — and then say in\n"
+    "the commit what the new order is, and mirror it in the AGENTS.md diagram."
+)
+
+_RANK_DEBT_REMEDY = (
+    "This record is the list of edges that already point the wrong way. It may\n"
+    "only SHRINK. A new edge is never added here to make the suite green: the\n"
+    "shared thing moves down to the rank both ends already live at, or the rank\n"
+    "table changes and the commit says what the new order is.\n"
+    "See design §3.1."
+)
+
+
+def _unit_of_module(rel: str) -> str:
+    """The unit a module belongs to: `context/_inject.py` -> `context/`."""
+    head, _, rest = rel.partition("/")
+    return f"{head}/" if rest else head
+
+
+def _unit_of_target(target: str) -> str | None:
+    """The unit a resolved import target names, or None when it names none.
+
+    Two kinds of target name no unit. `wardex_sdk` exactly is the package
+    OBJECT, which `from .. import _hub` always produces alongside the real edge
+    and which importing any submodule executes anyway; ranking it would make
+    `__init__.py`'s own rank unsatisfiable while asserting nothing. `<dynamic>`
+    is an import whose target is not a literal — it cannot be resolved, so it
+    cannot be ranked, and the positive allowlists above are where an unauditable
+    import is caught for the layers that have one.
+    """
+    if target in _NATIVE_TARGETS:
+        return _NATIVE_UNIT
+    if target in (_PKG, "<dynamic>"):
+        return None
+    if target[len(_PKG)] == ":":
+        return "__init__.py"  # a symbol re-exported by the package root
+    head = target[len(_PKG) + 1 :].split(".")[0].split(":")[0]
+    return f"{head}/" if (_SRC / head).is_dir() else f"{head}.py"
+
+
+def _is_type_checking(test: ast.expr) -> bool:
+    if isinstance(test, ast.Name):
+        return test.id == "TYPE_CHECKING"
+    return isinstance(test, ast.Attribute) and test.attr == "TYPE_CHECKING"
+
+
+class _DropTypeChecking(ast.NodeTransformer):
+    """Removes `if TYPE_CHECKING:` bodies, keeping any `else:` — which runs."""
+
+    def visit_If(self, node: ast.If) -> ast.stmt | list[ast.stmt]:
+        if _is_type_checking(node.test):
+            return [self.visit(stmt) for stmt in node.orelse]
+        self.generic_visit(node)
+        return node
+
+
+def _runtime_tree(tree: ast.Module) -> ast.Module:
+    """`tree` with only the imports that actually run. See the section header."""
+    return _DropTypeChecking().visit(copy.deepcopy(tree))
+
+
+def _upward_edges(extra: tuple[str, str] | None = None) -> dict[str, int]:
+    """Every import that points at a strictly higher rank.
+
+    Keyed `"<importer path> -> <target unit>"`, valued by the number of distinct
+    resolved targets on that edge — so `from .._assembly import PatchSet`, which
+    resolves to both the package and the re-exported symbol, counts two and a
+    second symbol on the same edge cannot arrive for free.
+
+    `extra` adds one hypothetical `(importer path, resolved target)` import that
+    is not in the tree. It exists so the rule can be shown to catch an edge
+    without anyone having to break the package to watch it fail.
+    """
+    edges: dict[str, int] = {}
+    for rel, tree in _modules().items():
+        importer = _unit_of_module(rel)
+        targets = _imported_modules(rel, _runtime_tree(tree))
+        if extra is not None and extra[0] == rel:
+            targets = targets | {extra[1]}
+        for target in sorted(targets):
+            unit = _unit_of_target(target)
+            if unit is None or unit == importer:
+                continue
+            if _LAYER_RANK[unit] > _LAYER_RANK[importer]:
+                key = f"{rel} -> {unit}"
+                edges[key] = edges.get(key, 0) + 1
+    return edges
+
+
+def _rank_why(edges: set[str]) -> str:
+    """`_RANK_ORDER_WHY`, plus whichever layer's own reason applies.
+
+    A violation prints the sentence its own layer already has, so the rank rule
+    and the scoped rule above it never explain the same edge two different ways.
+    `_OBSERVER_SIBLINGS_WHY` is absent on purpose: `_adapters/` and
+    `_interceptors/` share a rank, so an edge between them is never UPWARD and
+    this rule can never fire on it. That rule is not expressible as an order,
+    which is why it keeps its own test.
+    """
+    parts = [_RANK_ORDER_WHY]
+    importers = {edge.split(" -> ")[0] for edge in edges}
+    if any(rel.startswith("_assembly/") for rel in importers):
+        parts.append(_LAYERING_WHY)
+    if any(rel.startswith(_BELOW_THE_OBSERVERS) for rel in importers):
+        parts.append(_BELOW_THE_OBSERVERS_WHY)
+    if any(rel.startswith("_semantics/") for rel in importers):
+        parts.append(_SEMANTICS_WHY)
+    return "\n\n".join(parts)
+
+
+def test_the_rank_table_covers_every_unit_on_disk():
+    """HARD RULE: the table ranks the package, not a subset of it.
+
+    Without this, a rank table is a dict with a default, and a default ranks new
+    code at whichever end is convenient — at the bottom, where every import it
+    makes is legal. The exhaustiveness check is what turns "add a file" into
+    "decide where it sits", at the only moment that decision is cheap.
+    """
+    on_disk = {_NATIVE_UNIT}
+    for path in _SRC.rglob("*.py"):
+        parts = path.relative_to(_SRC).parts
+        on_disk.add(f"{parts[0]}/" if len(parts) > 1 else parts[0])
+    assert set(_LAYER_RANK) == on_disk, (
+        "the rank table and the package disagree about what exists:\n"
+        f"  on disk, unranked: {sorted(on_disk - set(_LAYER_RANK))}\n"
+        f"  ranked, not on disk: {sorted(set(_LAYER_RANK) - on_disk)}\n\n"
+        "WHY: rank the new unit in _LAYER_RANK and in the AGENTS.md diagram that\n"
+        "mirrors it. A unit nobody ranked is a unit nobody placed, and the rule\n"
+        "below would wave every import it makes through."
+    )
+
+
+def test_no_module_imports_a_higher_layer():
+    """HARD RULE for the order, BUDGET for the edges that contradict it."""
+    actual = _upward_edges()
+    disputed = {
+        edge
+        for edge in set(actual) | set(_LAYER_RANK_DEBT)
+        if actual.get(edge, 0) != _LAYER_RANK_DEBT.get(edge, 0)
+    }
+    _assert_within_budget(
+        actual,
+        _LAYER_RANK_DEBT,
+        "design §3.1 (a module imported a strictly higher layer)",
+        _rank_why(disputed),
+        remedy=_RANK_DEBT_REMEDY,
+    )
+
+
+def test_the_rank_rule_sees_the_edges_the_scoped_rules_miss():
+    """The two backwards edges nothing else in this file catches.
+
+    `_client.py` is named by no importer-scoped rule here, so the client
+    reaching up into an observer is green. `transport/` IS scoped, but its rule
+    forbids two target packages by name, so reaching up into the client is green
+    too. Both edges are constructed in memory rather than in the source: a rule
+    is only worth landing if the failure it promises can be demonstrated without
+    breaking the package to watch it happen.
+    """
+    today = _upward_edges()
+    for importer, target, expected in (
+        ("_client.py", f"{_PKG}._adapters", "_client.py -> _adapters/"),
+        ("transport/_base.py", f"{_PKG}._client", "transport/_base.py -> _client.py"),
+    ):
+        new = set(_upward_edges((importer, target))) - set(today)
+        assert new == {expected}, (
+            f"a new `import {target}` in {importer} should be exactly one new\n"
+            f"violation ({expected}); the rule reported {sorted(new)}."
+        )
+        assert expected not in _LAYER_RANK_DEBT, (
+            f"{expected} is recorded in _LAYER_RANK_DEBT, so the rule would stay\n"
+            "green on a brand-new edge. Recording an edge that is not in the\n"
+            "tree is the one way this budget can lie."
+        )
+
+
+# The architecture section of AGENTS.md and `_LAYER_RANK` are two statements of
+# one fact, and a reader has no way to tell which is stale. So the diagram is
+# read as data. The contract is narrow on purpose: inside the FIRST fenced block
+# under `_DIAGRAM_HEADING`, a line matching `rank <n> ...` contributes every
+# backticked token on it at rank `<n>`, and every other line is ignored — so the
+# block may grow a title, a blank line or an ASCII arrow without changing what
+# is asserted. Prose OUTSIDE the fence is not read at all, which is what lets
+# the section name `crates/wardex-pipeline` in backticks without a Rust crate
+# becoming a Python layer.
+_ROOT = pathlib.Path(__file__).resolve().parents[3]
+_DIAGRAM_HEADING = "## Architecture (one mental model)"
+_DIAGRAM_RANK_LINE = re.compile(r"^rank (\d+)\s+(.*)$")
+_DIAGRAM_TOKEN = re.compile(r"`([^`]+)`")
+
+
+def _diagram_ranks() -> dict[str, int]:
+    lines = (_ROOT / "AGENTS.md").read_text(encoding="utf-8").splitlines()
+    assert _DIAGRAM_HEADING in lines, (
+        f"AGENTS.md has no line exactly equal to {_DIAGRAM_HEADING!r}. The rank\n"
+        "table is read from the first fenced block under that heading; renaming\n"
+        "the heading means renaming _DIAGRAM_HEADING here in the same commit."
+    )
+    start = lines.index(_DIAGRAM_HEADING)
+    opening = [i for i in range(start + 1, len(lines)) if lines[i].startswith("```")]
+    assert opening, f"no fenced block after {_DIAGRAM_HEADING!r} in AGENTS.md"
+    closing = [i for i in range(opening[0] + 1, len(lines)) if lines[i].rstrip() == "```"]
+    assert closing, f"unterminated fenced block after {_DIAGRAM_HEADING!r} in AGENTS.md"
+    ranks: dict[str, int] = {}
+    # A token that appears on two `rank <n>` lines used to be last-wins, which
+    # made the equality below satisfiable by a diagram no human would call
+    # correct: put `_assembly/` on the rank 1 line as well as the rank 4 one and
+    # the test still passed, while the block a reader sees files one unit in two
+    # layers. Last-wins is the wrong reading of a duplicate anywhere — the
+    # diagram claims each unit HAS a rank — so collect every repeat and name the
+    # two ranks it was given, rather than silently keeping whichever came last.
+    repeated: list[str] = []
+    for line in lines[opening[0] + 1 : closing[0]]:
+        match = _DIAGRAM_RANK_LINE.match(line)
+        if match is None:
+            continue
+        rank = int(match.group(1))
+        for token in _DIAGRAM_TOKEN.findall(match.group(2)):
+            if token in ranks:
+                repeated.append(f"  `{token}`: rank {ranks[token]} and rank {rank}")
+            ranks[token] = rank
+    assert not repeated, (
+        "the AGENTS.md architecture diagram ranks a unit more than once:\n"
+        + "\n".join(sorted(repeated))
+        + "\n\nWHY: a unit sits in exactly one layer. Two rank lines naming the same\n"
+        "token is a diagram that disagrees with itself, and reading it as the last\n"
+        "one wins would let the rank table below agree with a block a human reads\n"
+        "as wrong. Delete the token from every line but the layer it belongs to."
+    )
+    return ranks
+
+
+def test_the_architecture_diagram_is_the_rank_table():
+    """HARD RULE: the diagram a human reads and the table a test reads agree.
+
+    The diagram this replaces had drifted into being wrong in three ways at
+    once, and every one of them was a sentence nobody could check: it named a
+    layer that is a Rust crate with no Python package behind it, it left out the
+    package holding the largest module in the SDK, and it claimed a cross-cut in
+    a direction the imports do not go. Prose about layering is exactly the kind
+    of thing that is true when written and false a quarter later. Equality in
+    both directions is what makes that a test failure instead of a
+    reading-comprehension problem.
+    """
+    diagram = _diagram_ranks()
+    missing = sorted(set(_LAYER_RANK) - set(diagram))
+    extra = sorted(set(diagram) - set(_LAYER_RANK))
+    moved = sorted(k for k in set(diagram) & set(_LAYER_RANK) if diagram[k] != _LAYER_RANK[k])
+    assert diagram == _LAYER_RANK, (
+        "the AGENTS.md architecture diagram and _LAYER_RANK are not the same fact:\n"
+        f"  in the table, absent from the diagram: {missing}\n"
+        f"  in the diagram, not a ranked unit: {extra}\n"
+        f"  ranked differently in each: {[(k, diagram[k], _LAYER_RANK[k]) for k in moved]}\n\n"
+        "WHY: the diagram is the first thing a new reader believes and the last\n"
+        "thing anyone updates. Only backticked tokens on a `rank <n>` line inside\n"
+        "the first fenced block under the architecture heading are read, so prose\n"
+        "below the fence stays free to say anything it needs to."
+    )
 
 
 # --------------------------------------------------------------------------
@@ -1257,14 +1721,14 @@ _CS5_BUDGET = {
     # shape as `_adapters/_sink.py` below.
     "_snapshot_api.py": 1,
     "_tracing.py": 1,
-    # 4 -> 3 + 1: the assembler's `_ClientSink` moved WHOLE into `_adapters/_sink.py`.
-    # A relocation, not a new occurrence — the total is unchanged and the
-    # assembler's own budget ratchets down, which is the only direction this
-    # table allows. The new entry is the last one that will need lowering: this
-    # rule's stated destination is `_assembly/_emit.py`, and the sink standing
-    # alone in a module of its own is what lets it arrive there whole. When it
-    # does, the entry does not shrink — it disappears.
-    "_adapters/_assembler.py": 3,
+    # 3 -> 1, and the drop happened on 2026-08-13, not in the commit that
+    # writes this number: extracting `_ClientSink` into `_adapters/_sink.py`
+    # took two of the three calls with it, leaving only the one at
+    # `_assembler.py:578`. The budget kept saying 3 for weeks, and nothing
+    # failed — which is precisely the open slot `_assert_within_budget` now
+    # fails on from underneath. Two further sink calls could have appeared here
+    # in that window and no test would have said a word.
+    "_adapters/_assembler.py": 1,
     "_adapters/_sink.py": 1,
     "_interceptors/_mcp_stdio.py": 2,
     # 2 -> 3: `capture_deferred` is a THIRD door into the client sink — a
