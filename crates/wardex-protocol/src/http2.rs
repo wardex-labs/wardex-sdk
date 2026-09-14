@@ -158,6 +158,20 @@ pub struct Http2Connection {
     /// first — a different stream on every run, and not the policy the host's
     /// correlation latch documents for the same bound.
     streams: BTreeMap<u32, StreamState>,
+    /// Entries recreated for a stream whose request half the table already
+    /// evicted — in practice, the response to it. Kept apart from `streams`
+    /// and held to their own `max_streams`, lowest id first, for two reasons.
+    /// In one table such an entry has the lowest id of all, so trimming took
+    /// it at the end of the very frame that created it: a response whose
+    /// status arrives in HEADERS and whose END_STREAM arrives in a later DATA
+    /// frame lost its status and completed as nothing. And letting it outrank
+    /// the lowest live entry instead would evict a request half still held,
+    /// to keep a response whose request is already gone.
+    ///
+    /// An entry trimmed from here is the bound's loss too, and it is not
+    /// silent: a later frame for that id recreates it, still flagged as
+    /// evicted, so the transaction completes marked (with no status).
+    orphans: BTreeMap<u32, StreamState>,
     pending: HashMap<u32, Pending>,
     preface_buf: Vec<u8>,
     preface_seen: bool,
@@ -208,6 +222,7 @@ impl Http2Connection {
             req_decoder: Decoder::new(),
             resp_decoder: Decoder::new(),
             streams: BTreeMap::new(),
+            orphans: BTreeMap::new(),
             pending: HashMap::new(),
             preface_buf: Vec::new(),
             preface_seen: false,
@@ -260,28 +275,36 @@ impl Http2Connection {
     /// end-of-stream bookkeeping — comes through here, so an id the table
     /// already evicted is recognised the same way whichever frame names it
     /// next.
+    ///
+    /// Only an odd id can claim eviction: even ids are server-initiated
+    /// (pushed) streams, whose request was never a client header block the
+    /// table held, even when the id falls inside the evicted range.
     fn stream(&mut self, stream_id: u32) -> &mut StreamState {
-        let evicted = self.first_request != 0
-            && self.first_request <= stream_id
-            && stream_id <= self.evicted_through;
-        self.streams
-            .entry(stream_id)
-            .or_insert_with(|| StreamState {
-                request_evicted: evicted,
-                ..Default::default()
-            })
+        let orphan = self.orphans.contains_key(&stream_id);
+        let evicted = orphan
+            || (!self.streams.contains_key(&stream_id)
+                && stream_id % 2 == 1
+                && self.first_request != 0
+                && self.first_request <= stream_id
+                && stream_id <= self.evicted_through);
+        let table = if evicted {
+            &mut self.orphans
+        } else {
+            &mut self.streams
+        };
+        table.entry(stream_id).or_insert_with(|| StreamState {
+            request_evicted: evicted,
+            ..Default::default()
+        })
     }
 
     /// Hold the table to `max_streams`, dropping the lowest ids first.
     ///
-    /// Applied after each frame rather than before each insertion, and that
-    /// order is load-bearing. A response for an evicted stream is inserted
-    /// below every live id; evicting before inserting would push out a live
-    /// stream (the policy's newest) to make room for it, and a single
-    /// HEADERS frame with END_STREAM would then cost a healthy request half
-    /// to emit one that was already lost. Trimming afterwards lets that
-    /// transaction complete and leave in the same frame, and a frame creates
-    /// at most one entry, so the table never rests above the bound.
+    /// Applied after each frame rather than before each insertion: a frame
+    /// creates at most one entry, so neither map rests above the bound, and a
+    /// transaction a frame completes has already left before the trim runs.
+    /// `orphans` is trimmed to the same bound on its own, so a connection
+    /// holds at most twice `max_streams` entries.
     fn evict_past_bound(&mut self) {
         let cap = self.limits.max_streams.max(1);
         while self.streams.len() > cap {
@@ -291,6 +314,10 @@ impl Http2Connection {
             if st.request_seen {
                 self.evicted_through = self.evicted_through.max(id);
             }
+        }
+        while self.orphans.len() > cap {
+            // Already under the mark, so the mark has nothing to learn.
+            self.orphans.pop_first();
         }
     }
 
@@ -334,6 +361,7 @@ impl Http2Connection {
             FRAME_PUSH_PROMISE => self.on_push_promise(frame),
             FRAME_RST_STREAM => {
                 self.streams.remove(&frame.stream_id);
+                self.orphans.remove(&frame.stream_id);
                 self.pending.remove(&frame.stream_id);
                 self.reset.insert(frame.stream_id);
                 let cap = self.limits.max_streams.max(1);
@@ -565,13 +593,9 @@ impl Http2Connection {
         } else {
             st.resp_ended = true;
         }
-        let done = self
-            .streams
-            .get(&stream_id)
-            .map(|s| s.resp_ended)
-            .unwrap_or(false);
-        if done {
-            if let Some(s) = self.streams.remove(&stream_id) {
+        if st.resp_ended {
+            let s = self.streams.remove(&stream_id);
+            if let Some(s) = s.or_else(|| self.orphans.remove(&stream_id)) {
                 result.transactions.push(Http2Transaction {
                     stream_id,
                     method: s.method.unwrap_or_default(),
@@ -1041,6 +1065,117 @@ mod tests {
         }
         // The responses for evicted ids did not push the survivors out.
         assert!(c.streams.is_empty());
+    }
+
+    /// Eight requests that each end in their HEADERS frame, against a table of
+    /// two: the six lowest ids lose their request half before any response.
+    fn eight_ended_requests_past_a_bound_of_two() -> Http2Connection {
+        let limits = Limits {
+            max_streams: 2,
+            ..Default::default()
+        };
+        let mut c = Http2Connection::new(limits);
+        let block = hpack(&[(b":method", b"POST"), (b":path", b"/s")]);
+        let mut req = Vec::new();
+        for i in 0..8u32 {
+            req.extend_from_slice(&frame(FRAME_HEADERS, FH | FS, 1 + 2 * i, &block));
+        }
+        c.feed(true, &req);
+        c
+    }
+
+    #[test]
+    fn an_evicted_stream_keeps_a_response_split_across_headers_and_data() {
+        // The shape real responses take: HEADERS carrying the status, then
+        // DATA carrying END_STREAM. The response HEADERS recreates the evicted
+        // stream's entry at the lowest id in the table; trimming that entry at
+        // the end of the same frame threw the status away, and the DATA frame
+        // then completed a transaction with status 0 that the host drops.
+        let mut c = eight_ended_requests_past_a_bound_of_two();
+        let s = hpack(&[(b":status", b"200")]);
+        let mut resp = Vec::new();
+        for i in 0..8u32 {
+            let sid = 1 + 2 * i;
+            resp.extend_from_slice(&frame(FRAME_HEADERS, FH, sid, &s));
+            resp.extend_from_slice(&frame(FRAME_DATA, FS, sid, b"ok"));
+        }
+        let r = c.feed(false, &resp);
+        assert_eq!(r.transactions.len(), 8);
+        let evicted: Vec<&Http2Transaction> = r
+            .transactions
+            .iter()
+            .filter(|t| t.request_evicted)
+            .collect();
+        assert_eq!(evicted.len(), 6);
+        for t in &evicted {
+            assert_eq!(t.status, 200, "stream {} lost its status", t.stream_id);
+            assert_eq!(t.response_body, b"ok");
+            assert!(t.stream_id <= 11);
+        }
+        for t in r.transactions.iter().filter(|t| !t.request_evicted) {
+            assert_eq!((t.method.as_str(), t.status), ("POST", 200));
+        }
+        assert!(c.streams.is_empty() && c.orphans.is_empty());
+    }
+
+    #[test]
+    fn responses_of_evicted_streams_are_bounded_and_their_loss_stays_marked() {
+        // Every response starts before any ends — multiplexed streaming. The
+        // responses whose request half is already gone are held to the same
+        // bound as the table, lowest id first, and never push out a stream
+        // whose request half is still held. A response trimmed from that
+        // memory still completes marked as evicted (with no status), so the
+        // host counts it rather than losing it silently.
+        let mut c = eight_ended_requests_past_a_bound_of_two();
+        let s = hpack(&[(b":status", b"200")]);
+        let mut heads = Vec::new();
+        for i in 0..8u32 {
+            heads.extend_from_slice(&frame(FRAME_HEADERS, FH, 1 + 2 * i, &s));
+        }
+        c.feed(false, &heads);
+        assert_eq!(c.streams.keys().copied().collect::<Vec<_>>(), vec![13, 15]);
+        assert_eq!(c.orphans.keys().copied().collect::<Vec<_>>(), vec![9, 11]);
+
+        let mut tails = Vec::new();
+        for i in 0..8u32 {
+            tails.extend_from_slice(&frame(FRAME_DATA, FS, 1 + 2 * i, b"ok"));
+        }
+        let r = c.feed(false, &tails);
+        assert_eq!(r.transactions.len(), 8);
+        for t in &r.transactions {
+            match t.stream_id {
+                13 | 15 => assert!(!t.request_evicted && t.status == 200),
+                9 | 11 => assert!(t.request_evicted && t.status == 200),
+                _ => assert!(t.request_evicted && t.status == 0),
+            }
+        }
+    }
+
+    #[test]
+    fn a_pushed_stream_is_not_reported_as_an_evicted_request() {
+        // Server-initiated streams have even ids and no request half the
+        // client ever sent, so the table cannot have evicted one — even when
+        // the even id falls inside the range the eviction mark covers.
+        let limits = Limits {
+            max_streams: 2,
+            ..Default::default()
+        };
+        let mut c = Http2Connection::new(limits);
+        let block = hpack(&[(b":method", b"GET"), (b":path", b"/")]);
+        for sid in [1u32, 3, 5, 7] {
+            c.feed(true, &frame(FRAME_HEADERS, FH | FS, sid, &block));
+        }
+        assert!(
+            c.evicted_through >= 3,
+            "precondition: streams 1 and 3 were evicted"
+        );
+        let mut promise = vec![0, 0, 0, 2];
+        promise.extend_from_slice(&hpack(&[(b":method", b"GET"), (b":path", b"/pushed")]));
+        c.feed(false, &frame(FRAME_PUSH_PROMISE, FH, 7, &promise));
+        let s = hpack(&[(b":status", b"200")]);
+        let r = c.feed(false, &frame(FRAME_HEADERS, FH | FS, 2, &s));
+        assert_eq!(r.transactions.len(), 1);
+        assert!(!r.transactions[0].request_evicted);
     }
 
     #[test]

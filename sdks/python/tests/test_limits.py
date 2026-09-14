@@ -693,6 +693,41 @@ def test_max_streams_evicts_lowest_ids_and_marks_every_evicted_response():
     assert counters.snapshot().get("protocol.http2.stream_evicted") == 6
 
 
+def test_max_streams_marks_evicted_responses_that_arrive_as_headers_then_data():
+    """The response shape real servers send: the status in HEADERS, the end in
+    a later DATA frame. The evicted stream's recreated entry used to be the
+    lowest id in the table and was trimmed at the end of its own HEADERS frame,
+    so the DATA frame completed a transaction with status 0 and nothing
+    shipped — policy (b) held only for single-frame responses.
+    """
+    from hpack import Encoder
+
+    from wardex_sdk._assembly import counters
+    from wardex_sdk._interceptors._trackers import _Http2Tracker
+
+    sids = [1 + 2 * i for i in range(8)]
+    client_enc, server_enc = Encoder(), Encoder()
+    requests = b"".join(
+        _h2_frame(0x1, 0x4 | 0x1, sid, client_enc.encode([(b":method", b"GET"), (b":path", b"/s")]))
+        for sid in sids
+    )
+    responses = b"".join(
+        _h2_frame(0x1, 0x4, sid, server_enc.encode([(b":status", b"200")]))
+        + _h2_frame(0x0, 0x1, sid, b"ok")
+        for sid in sids
+    )
+    counters.reset()
+    tracker = _Http2Tracker(_native(max_streams=2))
+    tracker.on_request_bytes(requests)
+    txns = tracker.on_response_bytes(responses)
+
+    evicted = [t for t in txns if Limitation.H2_REQUEST_EVICTED in t.limitations]
+    assert len(evicted) == 6
+    assert all(t.status == 200 and t.truncated is True for t in evicted)
+    assert sorted(t.method for t in txns if t not in evicted) == ["GET", "GET"]
+    assert counters.snapshot().get("protocol.http2.stream_evicted") == 6
+
+
 def test_max_streams_survivors_are_the_highest_ids():
     """Which streams survive is the policy, so it is asserted by id."""
     sids = [1 + 2 * i for i in range(8)]
