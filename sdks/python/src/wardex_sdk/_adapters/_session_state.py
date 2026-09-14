@@ -109,16 +109,28 @@ class _OpenTool:
     #: The hook that CREATED this record reached its session only because that
     #: session was the sole live one (`_session_for_hook`'s last tier) — neither
     #: the scope nor the payload's id named it. Carried on the record because
-    #: the span is built at CLOSE, and `_close_tool` decides there whether the
-    #: guess still stands. It ships as `UNIT_INFERRED_SOLE` only when EVERY hook
-    #: describing the call was inferred and this session's own stream never
-    #: announced its `tool_use` id. Any one proof settles membership: a hook
+    #: the span is built later — at close, at a bound's eviction, or by the
+    #: drain of a call that never closed — and the guess may be settled by then.
+    #: Every one of those paths builds through `_tool_draft`, which asks
+    #: `_sole_guess_stands` below whether it still does. It ships as
+    #: `UNIT_INFERRED_SOLE` only when EVERY hook describing the call was
+    #: inferred, this session's own stream never announced its `tool_use` id,
+    #: and the opening hook's own session id (`hook_session_id`) is not the id
+    #: this session later bound. Any one proof settles membership: a hook
     #: attributed by scope or by its own session id that finds the call's id
-    #: inside this session, or the id arriving on this session's transport. An
-    #: id match between two inferred hooks does not: it proves they describe one
-    #: call, not that the call belongs here — which is exactly a late hook from a
-    #: retired CLI landing on the only session left.
+    #: inside this session, the id arriving on this session's transport, or the
+    #: opener's payload naming this session once `system/init` has said who it
+    #: is. An id match between two inferred hooks does not: it proves they
+    #: describe one call, not that the call belongs here — which is exactly a
+    #: late hook from a retired CLI landing on the only session left.
     sole_inferred: bool = False
+    #: The `session_id` the opening hook's payload carried, kept only when that
+    #: hook was inferred (`sole_inferred`). A hook that arrives before
+    #: `system/init` names a session nobody has bound yet; once init binds the
+    #: same id to this session, the payload turns out to have named it, which is
+    #: the same proof `_session_for_hook`'s id tier would have accepted had the
+    #: two arrived in the other order.
+    hook_session_id: str | None = None
 
 
 @dataclass
@@ -159,6 +171,21 @@ class _EvictedTool:
     #: completion cannot re-derive. One bool, not payload bytes, so the bound
     #: still reclaims what it exists to reclaim.
     sole_inferred: bool = False
+    #: `_OpenTool.hook_session_id`, for the same reason: the completion half is
+    #: built after the eviction, and `system/init` may bind the id in between.
+    hook_session_id: str | None = None
+
+    @classmethod
+    def left_by(cls, sess: _Session, tool_use_id: str, tool: _OpenTool) -> _EvictedTool:
+        """The breadcrumb `tool` leaves, its guess read at eviction time: the
+        evicted half ships now, and the completion must agree with it."""
+        return cls(
+            tool.start_ns,
+            tool.name,
+            tool.agent_id,
+            sole_inferred=_sole_guess_stands(sess, tool_use_id, tool),
+            hook_session_id=tool.hook_session_id,
+        )
 
 
 @dataclass
@@ -183,7 +210,17 @@ class _EvictedSubagent:
 
 @dataclass
 class _OpenSubagent:
-    """A subagent span opened at `SubagentStart` and finished at `SubagentStop`."""
+    """A subagent span opened at `SubagentStart` and finished at `SubagentStop`.
+
+    Its sole-live mark is decided at `SubagentStart` and kept even when a later
+    `SubagentStop` proves the session, unlike a tool's (`_sole_guess_stands`).
+    A tool record is plain data until it becomes a span, so its guess can be
+    read late; this draft exists from the start because its context is the
+    anchor the sub-agent's own tools and chat turns hang off, and a parentage
+    marker attached at construction has no withdrawal (see `_PendingSpan`). A
+    span whose guess a later hook settled errs toward confessing, never toward
+    hiding one.
+    """
 
     draft: SpanDraft
     agent_type: str
@@ -256,3 +293,27 @@ class _Session:
     #: and flushed on EVERY retirement path — finalize, teardown, and the
     #: registry-eviction retirement — so pending never deletes a span (I10).
     pending: list[_PendingSpan] = field(default_factory=list)
+
+
+def _sole_guess_stands(
+    sess: _Session, tool_use_id: str | None, record: _OpenTool | _EvictedTool
+) -> bool:
+    """Does a hook-opened call still owe the wire `UNIT_INFERRED_SOLE`?
+
+    The ONE reading of the rule on `_OpenTool.sole_inferred`, taken wherever a
+    record becomes a span or a breadcrumb — close, eviction, and the drain of a
+    call that never closed alike. Deciding it only at close marked a proven call
+    or not depending on whether it happened to be interrupted.
+
+    Two proofs are read here because both can still be in hand when no closing
+    hook ever arrives: this session's own stream announced the call's
+    `tool_use` id (still in `stream_tool_meta`, which only a close pops), or the
+    opening hook's payload named the id `system/init` later bound to this
+    session. The third proof, a closing hook attributed by scope or by id, exists
+    only at close, and `_close_tool` folds it into the flag before building.
+    """
+    if not record.sole_inferred:
+        return False
+    if tool_use_id is not None and tool_use_id in sess.stream_tool_meta:
+        return False
+    return record.hook_session_id is None or record.hook_session_id != sess.session_id

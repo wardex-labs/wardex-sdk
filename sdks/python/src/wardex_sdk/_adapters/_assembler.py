@@ -72,6 +72,7 @@ from ._session_state import (
     _OpenTool,
     _PendingSpan,
     _Session,
+    _sole_guess_stands,
 )
 from ._sink import _ClientSink
 
@@ -808,11 +809,9 @@ class SessionAssembler:
             return by_context, False
         if by_id is not None:
             return by_id, False
-        # Exactly one live session -> attribute the hook to it. Covers hooks
-        # arriving before the pin is installed or before the stream's
-        # session_init line lands. An inference, so counted AND marked: without
-        # the `True` its spans read exactly like scope-proven ones, even when the
-        # hook came from a CLI whose own session was just evicted or closed.
+        # Exactly one live session -> an inference, counted AND marked (`True`):
+        # right for a hook ahead of the pin or of system/init, wrong for a late
+        # hook from a CLI whose own session was just evicted or closed.
         if len(self._by_key) == 1:
             only = next(iter(self._by_key.values()))
             sole = self._live_session(only.key, now)
@@ -1129,9 +1128,7 @@ class SessionAssembler:
             # completion arriving after that is a call this session can no
             # longer recognize, and the counter is the only record of why.
             self._room_for(sess.evicted_tools, "evicted_tool")
-            sess.evicted_tools[oldest_id] = _EvictedTool(
-                oldest.start_ns, oldest.name, oldest.agent_id, sole_inferred=oldest.sole_inferred
-            )
+            sess.evicted_tools[oldest_id] = _EvictedTool.left_by(sess, oldest_id, oldest)
         sess.open_tools[tool_use_id] = _OpenTool(
             tool_use_id=tool_use_id,
             name=payload.get("tool_name") or "unknown",
@@ -1141,6 +1138,7 @@ class SessionAssembler:
             from_hook=True,
             claim_key=key,
             sole_inferred=inferred,
+            hook_session_id=payload.get("session_id") if inferred else None,
         )
 
     def _close_tool(
@@ -1213,9 +1211,9 @@ class SessionAssembler:
                 from_hook=True,
                 claim_key=key,
                 sole_inferred=inferred and (crumb is None or crumb.sole_inferred),
+                hook_session_id=crumb.hook_session_id if crumb is not None else None,
             )
         meta = sess.stream_tool_meta.pop(tool_use_id, None)
-        # Any proof of membership settles the guess: see `_OpenTool.sole_inferred`.
         tool.sole_inferred = tool.sole_inferred and inferred and meta is None
         if meta is not None:
             stream_name, stream_input = meta
@@ -1341,7 +1339,8 @@ class SessionAssembler:
                 crumb = sess.evicted_subagents.get(tool.agent_id)
                 if crumb is not None:
                     anchor = crumb.context
-        p = child_of(anchor, _SOLE_LIVE if tool.sole_inferred else _IN_SESSION)
+        sole = _sole_guess_stands(sess, tool.tool_use_id, tool)
+        p = child_of(anchor, _SOLE_LIVE if sole else _IN_SESSION)
 
         draft = SpanDraft(
             p,

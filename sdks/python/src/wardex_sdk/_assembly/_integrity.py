@@ -136,19 +136,17 @@ Two emit sites, and the first is the mechanism the second restates.
     UNIT_INFERRED_SOLE = "unit_inferred_sole"
     """Exactly one logical unit was live, so it was taken as the parent.
 
-    The same shape as ``PARENT_UNRESOLVED`` above: the ``_MARKER`` table in
-    ``_assembly/_parentage.py`` attaches it to every edge built for
-    ``ParentSource.UNIT_SOLE``, and ``_assembly/_units.py::UnitRegistry._edge``
-    names it again at ``resolve()``'s sole-live tier — no alias and no live
-    scope, but exactly one SESSION unit open, so it is taken as the parent.
-
-    An ADAPTER reaches this by declaring ``Fallback.SOLE_LIVE_RUN`` at a site it
-    expects to be reached through a carrier the framework may not have
-    propagated to, and that declaration is the whole of what it may say: the
-    candidate comes from the registry's own table, filtered to that adapter's
-    own runs, and only when there is exactly one. What it replaces dropped an
-    unattributable call outright, with no marker; a marked 0.5 edge beats
-    unmarked data loss, and beats a call that becomes its own trace root.
+    The ``_MARKER`` table in ``_assembly/_parentage.py`` attaches it to every
+    edge built for ``ParentSource.UNIT_SOLE``. Two sole-live tiers choose it.
+    ``_assembly/_units.py::UnitRegistry._edge`` names it at ``resolve()``'s,
+    reached by an ADAPTER declaring ``Fallback.SOLE_LIVE_RUN``; the candidate is
+    that adapter's one live run in the registry's own table. The Agent SDK
+    assembler's is ``_adapters/_assembler.py::SessionAssembler._session_for_hook``
+    (the one session in its own ``_by_key``), whose hook's spans parent through
+    ``Evidence(ParentSource.UNIT_SOLE)`` — tool, sub-agent and chat drafts.
+    Both replaced dropping an unattributable call outright, with no marker; a
+    marked 0.5 edge beats unmarked data loss, and beats a call that becomes its
+    own trace root.
     """
 
     CORRELATION_CONFLICT = "correlation_conflict"
