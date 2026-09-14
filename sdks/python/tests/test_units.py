@@ -994,6 +994,36 @@ def test_a_forgotten_alias_marks_the_next_edge_instead_of_flattening_silently():
     assert counters.get("assembly._units.alias_forgotten_consumed") == 1
 
 
+def test_a_forgotten_alias_under_another_trace_keeps_the_conflict_the_bound_id_reported():
+    """An ambient span in ANOTHER trace is a disagreement the bound id reported
+    itself: context wins at 0.8 and the edge carries `CORRELATION_CONFLICT`.
+    Losing the id must not tidy that away. Capping only at the alias tier would
+    ship the same parent at 0.9 with the conflict gone, a lost lookup reading as
+    a MORE certain edge than the id gave while it still resolved.
+
+    Three sessions live, so `sole_live` refuses and the ambient rung decides.
+    """
+    reg = registry(max_entries_per_unit=2)
+    root = open_session(reg)
+    open_session(reg, "s2")
+    elsewhere = open_session(reg, "s3")
+    sub = open_subagent(reg, root)
+
+    with elsewhere.activate():
+        bound = reg.resolve(UnitKey("test.agent_id", "a1"))
+    key = _forget_the_subagent_alias(reg, sub)
+    with elsewhere.activate():
+        lost = reg.resolve(key)
+
+    assert bound.correlation.confidence == 0.8
+    assert Limitation.CORRELATION_CONFLICT in bound.limitations
+    assert lost.parent_span_id == bound.parent_span_id
+    assert lost.correlation.strategy is ParentSource.CONTEXTVAR
+    assert lost.correlation.confidence <= bound.correlation.confidence
+    assert Limitation.CORRELATION_CONFLICT in lost.limitations
+    assert Limitation.ALIAS_FORGOTTEN in lost.limitations
+
+
 def test_a_forgotten_alias_with_no_ambient_takes_the_sole_live_guess_and_says_both():
     """No ambient span: the ladder was already honest here (0.5 plus
     `UNIT_INFERRED_SOLE`), and it stays so — but WHY the guess was needed is a

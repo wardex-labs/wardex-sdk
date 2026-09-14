@@ -43,7 +43,7 @@ if TYPE_CHECKING:
     from ._units import Unit, UnitKey
 
 
-def forgotten_edge(sole: Unit | None, amb: Ambient, hint: str | None) -> Parentage:
+def forgotten_edge(sole: Unit | None, amb: Ambient, hint: str | None, owner: Unit) -> Parentage:
     """`UnitRegistry._edge`'s ladder for a `find()` miss on a FORGOTTEN id.
 
     The ordinary miss takes the ambient scope first, and that is exactly the
@@ -55,14 +55,24 @@ def forgotten_edge(sole: Unit | None, amb: Ambient, hint: str | None) -> Parenta
     `ALIAS_FORGOTTEN`, which is the one fact none of those rungs can say: the
     edge is a fallback because wardex's own bound threw the id away.
 
+    An ambient span in a different trace from `owner` (the unit the id named)
+    is a disagreement the bound id reported itself, at 0.8 with
+    `CORRELATION_CONFLICT`, so that rung keeps both: capped at the alias tier
+    alone it would ship the same parent MORE certain than the id gave, with the
+    conflict gone.
+
     `sole` is asked by the caller, which owns the table it is asked of.
     """
     if sole is not None:
         edge = sole.child(Evidence(ParentSource.UNIT_SOLE, request_id=hint))
     elif amb.span_context is not None:
-        edge = resolve_parentage(
-            amb, cap_at_alias_tier(Evidence(ParentSource.CONTEXTVAR, request_id=hint))
-        )
+        cross = amb.span_context.trace_id != owner.context.trace_id
+        # 0.8 is `UnitRegistry._edge`'s own number for the bound id's cross-trace branch.
+        tier = 0.8 if cross else None
+        evidence = Evidence(ParentSource.CONTEXTVAR, request_id=hint, confidence=tier)
+        edge = resolve_parentage(amb, cap_at_alias_tier(evidence))
+        if cross:
+            edge = edge.with_limitation(Limitation.CORRELATION_CONFLICT)
     else:
         edge = resolve_parentage(EMPTY_AMBIENT, Evidence(ParentSource.UNRESOLVED, request_id=hint))
     return edge.with_limitation(Limitation.ALIAS_FORGOTTEN)
@@ -108,12 +118,15 @@ class ForgottenAliases:
     of its own, so it adds no lock to the ordering the registry already keeps.
     """
 
-    __slots__ = ("_bound", "_by_key", "_by_unit")
+    __slots__ = ("_bound", "_by_key", "_by_unit", "_reported")
 
     def __init__(self, bound: int) -> None:
         self._bound = bound
         self._by_key: dict[UnitKey, Unit] = {}
         self._by_unit: dict[Unit, list[UnitKey]] = {}
+        #: Recorded keys `recall` has already answered yes for. A subset of
+        #: `_by_key`'s keys, so bounded by it; see `rebound` for its one reader.
+        self._reported: set[UnitKey] = set()
 
     def forget(self, key: UnitKey, unit: Unit) -> None:
         """Record that the bound dropped `key` while `unit` still owned it."""
@@ -122,14 +135,19 @@ class ForgottenAliases:
             oldest = ring.pop(0)
             if self._by_key.get(oldest) is unit:
                 del self._by_key[oldest]
+                self._reported.discard(oldest)
             counters.bump("assembly._units.alias_forgotten_table_full")
         ring.append(key)
         self._by_key[key] = unit
+        self._reported.discard(key)  # a fresh loss, not yet told to anyone
 
     def recall(
         self, key: UnitKey, *, amb: Ambient | None = None, holder: Unit | None = None
-    ) -> bool:
+    ) -> Unit | None:
         """Did the bound drop `key` AT A COST to the edge being built? Counted when yes.
+
+        Yes is the unit that owned `key` when it was dropped (still live: the
+        record dies with it), so the caller can compare the edge against it.
 
         The callers ask at the moment they are about to build an edge from a
         `find()` miss, so `alias_forgotten_consumed` says how many edges the
@@ -142,30 +160,45 @@ class ForgottenAliases:
         """
         owner = self._by_key.get(key)
         if owner is None or _lost_nothing(owner, amb, holder):
-            return False
+            return None
         counters.bump("assembly._units.alias_forgotten_consumed")
-        return True
+        self._reported.add(key)
+        return owner
 
-    def rebound(self, key: UnitKey) -> None:
-        """`key` resolves again, so any record of having dropped it is stale.
+    def rebound(self, key: UnitKey, unit: Unit) -> None:
+        """`unit` binds `key`, so it resolves again: is the record now stale?
 
-        Kept, it would mark a good alias edge the next time the key missed for
-        an unrelated reason. One O(1) pop on the common path, which is
+        Usually yes. Kept, it would mark a good alias edge the next time the key
+        missed for an unrelated reason. One O(1) pop on the common path, which is
         `UnitRegistry.open()`'s.
+
+        Not when the loss was already REPORTED and the binder is not the unit
+        that lost the id. That binder was built on the loss: `AdapterContext.rejoin`
+        opens its unit under the very id `recall` just said was dropped. The unit
+        the id named is still live, so once the rejoined unit closes, the next
+        lookup of the id is the same loss again, and erasing the record here
+        would let it ship as an honest miss at 1.0. Nothing is lost while the
+        binder holds the key either: `find()` hits, and `recall` is only asked
+        after a miss.
         """
-        owner = self._by_key.pop(key, None)
-        if owner is not None:
-            ring = self._by_unit.get(owner)
-            if ring is not None and key in ring:
-                ring.remove(key)
+        owner = self._by_key.get(key)
+        if owner is None or (owner is not unit and key in self._reported):
+            return
+        del self._by_key[key]
+        self._reported.discard(key)
+        ring = self._by_unit.get(owner)
+        if ring is not None and key in ring:
+            ring.remove(key)
 
     def drop_unit(self, unit: Unit) -> None:
         """The unit closed: its ids now miss for an ordinary reason."""
         for key in self._by_unit.pop(unit, ()):
             if self._by_key.get(key) is unit:
                 del self._by_key[key]
+                self._reported.discard(key)
 
     def _at_fork_reinit(self) -> None:
         """Fork-child reset: the parent's units are not the child's to mark."""
         self._by_key.clear()
         self._by_unit.clear()
+        self._reported.clear()

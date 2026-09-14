@@ -85,10 +85,13 @@ All notable changes to this project are documented here. The format follows
   identifiers the bound dropped (per unit, as many as the table holds) and marks
   the next edge that asks for one `alias_forgotten` (`LIMITATION_ALIAS_FORGOTTEN
   = 51`): on the sole live session (0.5, beside `unit_inferred_sole`), on the
-  ambient span capped at 0.9, or beside `parent_unresolved`. A framework
-  adapter's `rejoin` on such an identifier is capped and marked the same way.
-  A lookup the loss did not change stays unmarked: under the identifier's own
-  unit, or below it, the live scope is a parent at least as specific as its own.
+  ambient span capped at 0.9 (0.8 beside `correlation_conflict` when that span
+  is in another trace), or beside `parent_unresolved`. A framework adapter's
+  `rejoin` on such an identifier is capped and marked the same way, every time
+  it is asked while the unit the identifier named is still live. A lookup the
+  loss did not change stays unmarked: under the identifier's own unit, below it,
+  or (for the registry) beside it in the same trace, the identifier would have
+  given that same parent.
   Counters: `assembly._units.alias_forgotten_consumed` per marked edge,
   `assembly._units.alias_forgotten_table_full` when the record itself overflows.
 

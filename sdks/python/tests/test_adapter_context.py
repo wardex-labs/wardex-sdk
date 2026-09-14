@@ -416,6 +416,64 @@ def test_rejoin_on_a_forgotten_alias_lowers_the_edge_and_says_the_id_was_dropped
     assert not ctx.tripped
 
 
+def test_rejoin_on_a_forgotten_alias_says_so_again_after_its_own_unit_closes():
+    """The unit `rejoin` opens takes the forgotten id as its own key, and that
+    binding must not erase the record of the loss it was built on.
+
+    The sub-agent the id named is still live after the rejoined unit closes, so
+    every later lookup of the id is the same loss again: a second `rejoin`, and a
+    plain `resolve()`. Erased, both would read as honest misses and ship the
+    enclosing run at 1.0 unmarked, which is the flattening the record exists
+    to stop.
+    """
+    sink = RecordingSink()
+    units = UnitRegistry(sink=sink, max_entries_per_unit=2)
+    ctx = AdapterContext("test", units=units, limits={})
+    key = UnitKey("test.agent", "a1")
+
+    def rejoin_once():
+        with ctx.rejoin(
+            key,
+            UnitKind.STEP,
+            intent=SpanIntent.EXECUTE_STEP,
+            placement=Placement.NESTED,
+            describe=_step,
+        ):
+            pass
+        return _edge(sink)
+
+    with ctx.enter(
+        UnitKind.SESSION,
+        intent=SpanIntent.INVOKE_AGENT,
+        placement=Placement.ROOT,
+        selector=UnitKey("test.run", "r1"),
+        describe=_agent,
+    ):
+        session = units.current()
+        units.open(
+            UnitKind.AGENT,
+            key,
+            ambient=EMPTY_AMBIENT,
+            parent_unit=session,
+            intent=SpanIntent.INVOKE_AGENT,
+            subject="sub",
+        )
+        units.alias(key, UnitKey("extra", "one"))
+        units.alias(UnitKey("extra", "one"), UnitKey("extra", "two"))
+        first = rejoin_once()
+        second = rejoin_once()
+        with session.activate():
+            later = units.resolve(key)
+
+    for source, confidence, markers in (first, second):
+        assert (source, confidence) == (ParentSource.UNIT_ACTIVE, 0.9)
+        assert Limitation.ALIAS_FORGOTTEN in markers
+    assert later.correlation.confidence < 1.0
+    assert Limitation.ALIAS_FORGOTTEN in later.limitations
+    assert counters.get("assembly._units.alias_forgotten_consumed") == 3
+    assert not ctx.tripped
+
+
 @pytest.mark.parametrize("nested", [False, True], ids=["in the unit", "below the unit"])
 def test_rejoin_on_a_forgotten_alias_inside_its_own_unit_cost_nothing_and_is_not_marked(nested):
     """Losing the id costs `rejoin` nothing when the live unit already IS the

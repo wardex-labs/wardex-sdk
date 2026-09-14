@@ -219,6 +219,10 @@ _MEMBER_SITES: dict[str, frozenset[str]] = {
             "_adapters/_openai_agents.py",
             # `_EDGE_MARKERS` again — see PARENT_UNRESOLVED above.
             "testing/conformance.py",
+            # The same cross-trace disagreement as `resolve()`'s, reached after
+            # the alias bound dropped the id: the forgotten-id ladder keeps the
+            # conflict the bound id would have reported instead of losing it.
+            "_assembly/_forgotten.py",
         }
     ),
     # --- transport timing ---
@@ -268,7 +272,8 @@ _MEMBER_SITES: dict[str, frozenset[str]] = {
     # The alias bound's consequence, marked on the NEXT edge rather than at the
     # eviction (an alias owns no span): `_forgotten.py::forgotten_edge`, the
     # ladder `UnitRegistry._edge` hands a miss for an id the registry remembers
-    # dropping, and `AdapterContext.rejoin` on the same miss — the one
+    # dropping, and `AdapterContext._open`, which notes it on the unit
+    # `AdapterContext.rejoin` opens after the same miss — `rejoin` being the one
     # adapter-surface method where an id shapes the tree. The conformance suite
     # names it too, as an edge marker a healthy run never carries.
     "ALIAS_FORGOTTEN": frozenset(
@@ -679,7 +684,7 @@ _EMITTED_MEMBERS: frozenset[str] = frozenset(
         "PEER_UNRESOLVED",
         # The twenty-second: the alias bound's forgotten-id marker, minted WITH its
         # two emitters (the registry's forgotten-id ladder and the adapter
-        # surface's `rejoin`). Before it, a lookup of an id the bound had dropped fell to
+        # surface's `_open`, on `rejoin`'s miss). Before it, a lookup of an id the bound had dropped fell to
         # the ambient scope at confidence 1.0 with no marker — the one eviction
         # whose consequence read as an improvement.
         "ALIAS_FORGOTTEN",

@@ -912,11 +912,16 @@ first), and a span whose parent was looked up by one of them, and whose edge
 the loss actually changed, arrives marked **`alias_forgotten`**. Where it lands
 depends on the path. A span the registry resolves goes to the only live session
 (0.5, also marked `unit_inferred_sole`) when there is exactly one, otherwise to
-the ambient span at no more than 0.9, otherwise unparented (also marked
+the ambient span at no more than 0.9 (0.8, also marked `correlation_conflict`,
+when that span is in another trace), otherwise unparented (also marked
 `parent_unresolved`). A span an adapter reopens under that identifier keeps the
-parent its declared placement gives it, capped at 0.9. When the loss changed
-nothing, nothing is marked: a live scope that is the identifier's own unit, or
-anything below it, is a parent at least as specific as the identifier's.
+parent its declared placement gives it, capped at 0.9, and so does every later
+lookup of the identifier while the unit it named is still live. When the loss
+changed nothing, nothing is marked. For an adapter reopening a span, that is a
+live scope that is the identifier's own unit or anything below it. For a span
+the registry resolves, it is an ambient span in the same trace that is not
+above that unit (the unit itself, anything below it, or anything beside it):
+the identifier, still held, would have given that same parent at 1.0.
 Each marked span also counts `assembly._units.alias_forgotten_consumed`. If you
 see the marker, raise `max_entries_per_unit`. The behaviour is pinned by
 `sdks/python/tests/test_units.py::test_a_forgotten_alias_marks_the_next_edge_instead_of_flattening_silently`.

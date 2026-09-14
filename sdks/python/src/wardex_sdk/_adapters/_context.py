@@ -850,7 +850,7 @@ class AdapterContext:
                 # in a run it has nothing to do with.
                 conflicted = self._units.closed_unit_in_scope()
                 holder, evidence = sole, _SOLE
-        lost = forgotten is not None and self._units.alias_was_forgotten(forgotten, holder=holder)
+        lost = forgotten is not None and self._units.forgotten_owner(forgotten, holder=holder)
         if lost:  # see `rejoin`; `open()` swaps AMBIENT by identity, so do it before the cap
             evidence = cap_at_alias_tier(_IN_UNIT if evidence is AMBIENT and holder else evidence)
         unit = self._units.open(

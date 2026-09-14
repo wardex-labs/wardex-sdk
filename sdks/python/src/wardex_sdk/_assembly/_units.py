@@ -1223,7 +1223,7 @@ class UnitRegistry:
         """Resolve a framework id to a live unit, or None.
 
         Returns `Unit | None` and nothing else. That is the mechanical half of
-        I2: a miss sends the caller down the ladder, and `alias_was_forgotten`
+        I2: a miss sends the caller down the ladder, and `forgotten_owner`
         tells apart a miss on an id the alias bound DROPPED, so "silently re-parent
         a lost id into the ambient scope, like a real attachment" is inexpressible.
         """
@@ -1236,10 +1236,10 @@ class UnitRegistry:
                 return None
             return unit
 
-    def alias_was_forgotten(
+    def forgotten_owner(
         self, alias: UnitKey, *, amb: Ambient | None = None, holder: Unit | None = None
-    ) -> bool:
-        """After a `find()` miss: was it dropped, at a cost to this edge? See `_forgotten`."""
+    ) -> Unit | None:
+        """After a `find()` miss: the unit that dropped it, if at a cost to this edge."""
         with self._lock:
             return self._forgotten.recall(alias, amb=amb, holder=holder)
 
@@ -1592,8 +1592,8 @@ class UnitRegistry:
             # captured earlier ON THE CORRECT TASK, addressed by the framework id.
             return unit.child(Evidence(ParentSource.UNIT_ALIAS, request_id=hint))
 
-        if alias is not None and self.alias_was_forgotten(alias, amb=amb):  # marked, if it cost
-            return forgotten_edge(self.sole_live(UnitKind.SESSION), amb, hint)
+        if alias is not None and (owner := self.forgotten_owner(alias, amb=amb)) is not None:
+            return forgotten_edge(self.sole_live(UnitKind.SESSION), amb, hint, owner)  # marked
         if amb.span_context is not None:
             return resolve_parentage(amb, AMBIENT)
 
@@ -1979,7 +1979,7 @@ class UnitRegistry:
         existing = self._by_alias.get(key)
         if existing is not None and existing is not unit:
             counters.bump("assembly._units.alias_rebound")
-        self._forgotten.rebound(key)
+        self._forgotten.rebound(key, unit)
         if key not in unit._alias_keys:
             evicted = unit._evict_alias()
             if evicted is not None and self._by_alias.get(evicted) is unit:
