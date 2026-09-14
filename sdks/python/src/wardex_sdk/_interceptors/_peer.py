@@ -30,9 +30,12 @@ in `_seam.py` can stay one line:
   * THE URL RENDERS `:0`. Omitting the port is not neutral: a URL with no port
     reads as the scheme's default, which is the same invention again. `:0`
     agrees with `server.port`.
-  * COUNTED PER SEALED TRANSACTION, not per connection. Both counted sites sit
-    above the capture gate and the excluded-path return, so a transaction that
-    never becomes a span (refused by the mode, a telemetry upload) still counts. The
+  * COUNTED PER UNIT THAT COULD BECOME A SPAN, never at the fallback. HTTP
+    counts once per sealed transaction, in `_seal`, above the excluded-path
+    return and the capture gate. A WebSocket session is one span built at
+    close and never sealed, so it counts once per session, in
+    `_build_ws_span`, above the same gate. Either way a unit that never
+    becomes a span (refused by the mode, a telemetry upload) still counts. The
     fallback itself runs when the seam first builds a connection's state, but
     every unix socket in the process reaches that point on its first byte —
     asyncio's self-pipe is a `socketpair()` — so a count there would tally

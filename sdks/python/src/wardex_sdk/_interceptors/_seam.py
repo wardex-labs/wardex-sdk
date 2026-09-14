@@ -726,16 +726,17 @@ class ByteSeamInterceptor(InterceptorInterface):
             client.capture_span(span)
 
     def _build_ws_span(self, st: _ConnectionState, txn: _Txn) -> Any:
-        # The tracker's answer to the LLM-transport question, counted HERE
-        # and BEFORE the gate: every `interceptors.seam.*` bump lives in this
-        # module, and a span the mode refuses must still count — the counter
-        # is the only trace an unconfirmed connection leaves under the
-        # default mode. Once per connection, because this runs once per
-        # connection: the WS span is built at close.
+        # The tracker's LLM-transport answer and an unread peer (`_peer.py`),
+        # counted HERE and BEFORE the gate: every `interceptors.seam.*` bump
+        # lives in this module, and a span the mode refuses must still count —
+        # the counter is its only trace under the default mode. Once per
+        # connection, because the WS span is built once, at close.
         if txn.ws_llm_call:
             counters.bump("interceptors.seam.ws_llm_semantics_unread")
         elif txn.ws_llm_unconfirmed:
             counters.bump("interceptors.seam.ws_llm_endpoint_unconfirmed")
+        if peer_unresolved := st.server_port == UNRESOLVED_PORT:
+            counters.bump("interceptors.seam.peer_unresolved")
         # `sem=None`: a WS session carries no parsed LLM semantics (by
         # construction on this path), so it is captured under ALL, an
         # allowlisted host, a live local span, or — the one claim this path
@@ -766,9 +767,8 @@ class ByteSeamInterceptor(InterceptorInterface):
             start_ns=txn.start_ns,
         )
         self._stamp_fork_reset(st, draft)
-        if st.server_port == UNRESOLVED_PORT:  # never sealed, so stamped here
+        if peer_unresolved:  # never sealed, so stamped here
             draft.add_limitation(Limitation.PEER_UNRESOLVED)
-            counters.bump("interceptors.seam.peer_unresolved")
         draft.set_extra("network.protocol.version", "websocket")
         draft.set_extra("ws.messages.sent", txn.ws_messages_sent)
         draft.set_extra("ws.messages.received", txn.ws_messages_received)

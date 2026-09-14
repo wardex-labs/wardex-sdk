@@ -97,18 +97,25 @@ All notable changes to this project are documented here. The format follows
   address.** An HTTP call over a unix socket (httpx `uds=`, docker-py, a local
   model server), or on a socket whose `getpeername()` fails, used to ship
   `server.port=443` and a URL like `http://unknown:443/v1/chat/completions`,
-  with nothing on the span to say the address was made up. It now ships port
-  `0` in both places, the new limitation marker `peer_unresolved`, and a count
-  under `interceptors.seam.peer_unresolved`; the call is still captured.
+  with nothing on the span to say the address was made up. It now reports
+  port `0` on the in-process span (`server_port`) and in the URL
+  (`http://unknown:0/...`), carries the new limitation marker
+  `peer_unresolved`, and counts under `interceptors.seam.peer_unresolved`; the
+  call is still captured. Over OTLP, port 0 is proto3 "unset", so the exported
+  span has no `server.port` attribute at all rather than `server.port=0`: to
+  find these spans in a backend, filter on `peer_unresolved` in
+  `wardex.limitations`, not on the port.
   **This includes every async TLS call.** Asyncio and anyio TLS (httpx
   `AsyncClient`, and so `AsyncOpenAI` and `AsyncAnthropic`; aiohttp) runs on a
   memory-BIO `ssl.SSLObject`, which has no peer address to read, so each of
-  those spans now reports `server.port=0`, a URL like
+  those spans now reports port 0 (no `server.port` over OTLP), a URL like
   `https://api.openai.com:0/v1/chat/completions`, `peer_unresolved`, and one
   count, where it used to report 443 (a guess, wrong for any TLS server on
   another port). `server.address` there is still the TLS server name. Sync
   clients (`httpx.Client`, `requests`) ride an `ssl.SSLSocket` and keep their
-  real port. The seam also stops calling `getpeername()` on every send.
+  real port. A WebSocket session on such a connection counts once per session,
+  including one the capture mode refuses. The seam also stops calling
+  `getpeername()` on every send.
   Wire change: `peer_unresolved` is a new value (50) of `wardex.v1.Limitation`.
 
 ## [0.6.0b1] - 2026-09-06

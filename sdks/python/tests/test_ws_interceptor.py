@@ -346,3 +346,57 @@ def test_realtime_websocket_is_still_dropped_under_agent_mode():
     assert _ws_spans() == []
     assert counters.get(_UNREAD) == 0
     assert counters.get(_UNCONFIRMED) == 0
+
+
+# --- a WebSocket peer wardex cannot address ---
+
+_PEER_UNRESOLVED = "interceptors.seam.peer_unresolved"
+
+
+def _plain_session(mode: CaptureMode | None) -> None:
+    """One ordinary WebSocket session on a memory-BIO-shaped object: it has a
+    `server_hostname` and no `getpeername()`, so the port is never read."""
+    if mode is None:
+        wardex.init(intercept=True)
+    else:
+        wardex.init(intercept=True, capture_mode=mode)
+    from wardex_sdk._interceptors._registry import get_registry
+
+    interceptor = get_registry()._installed["ssl"]  # type: ignore[attr-defined]
+    obj = _FakeSSLObj("chat.example.com")
+    interceptor._on_request_bytes(
+        obj,
+        b"GET /socket HTTP/1.1\r\nHost: chat.example.com\r\n"
+        b"Upgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+    )
+    interceptor._on_response_bytes(
+        obj,
+        b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+    )
+    interceptor._on_request_bytes(obj, _frame(True, 0x1, b"hi"))
+    interceptor._on_response_bytes(obj, _frame(True, 0x8, (1000).to_bytes(2, "big")))
+
+
+def test_an_unaddressed_websocket_the_mode_refuses_still_counts_its_unread_peer():
+    """The count exists so an address wardex could not read is visible even
+    when no span survives. The HTTP seal counts above the capture gate; the
+    WebSocket span is built at close, and it used to count only after the
+    gate accepted — so the same unaddressable peer was counted over HTTP and
+    silently not over a WebSocket the default mode refuses. One session, one
+    count, whatever the gate decides."""
+    _plain_session(None)
+    assert _ws_spans() == [], "precondition: the default mode refuses this session"
+    assert counters.get(_PEER_UNRESOLVED) == 1
+
+
+def test_an_unaddressed_websocket_span_carries_the_unresolved_marker_and_port_zero():
+    """Captured, the same session says what it could not read: port 0 on the
+    span and in its URL, the `PEER_UNRESOLVED` marker, and still one count."""
+    _plain_session(CaptureMode.ALL)
+    spans = _ws_spans()
+    assert len(spans) == 1
+    sp = spans[0]
+    assert Limitation.PEER_UNRESOLVED in sp.capture_integrity.limitations
+    assert sp.server_port == 0
+    assert sp.transport.http.url == "wss://chat.example.com:0/socket"
+    assert counters.get(_PEER_UNRESOLVED) == 1
