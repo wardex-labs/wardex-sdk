@@ -25,6 +25,7 @@ use wardex_core::codec::{decode_envelope, encode_envelope};
 use wardex_core::pipeline::pii;
 
 use crate::limits::PyLimits;
+use crate::shield::shielded;
 
 // --- getattr helpers ---
 
@@ -1414,27 +1415,31 @@ fn encode_envelope_py(
     pii_disabled: Vec<String>,
     limits: Option<PyLimits>,
 ) -> PyResult<Py<PyBytes>> {
-    // `zstd_level` is the only limit the codec reads, and it must come from
-    // the caller's resolved limits: hardcoding the default here would let a
-    // configured level be validated and then silently discarded.
-    let limits = limits.map(|p| p.inner).unwrap_or_default();
-    // Marshalling walks Python objects — the only part that needs the GIL.
-    let (mut proto, _) = envelope_to_proto(envelope, true, false)?;
-    // Masking + protobuf + zstd are pure Rust: release the GIL so app threads
-    // keep running while the batch worker encodes (design §9).
-    let bytes = py.allow_threads(|| -> PyResult<Vec<u8>> {
-        pii_apply_envelope(&mut proto, pii_mode, &pii_disabled)?;
-        encode_envelope(&proto, limits)
-            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
-    })?;
-    Ok(PyBytes::new_bound(py, &bytes).unbind())
+    shielded(|| {
+        // `zstd_level` is the only limit the codec reads, and it must come from
+        // the caller's resolved limits: hardcoding the default here would let a
+        // configured level be validated and then silently discarded.
+        let limits = limits.map(|p| p.inner).unwrap_or_default();
+        // Marshalling walks Python objects — the only part that needs the GIL.
+        let (mut proto, _) = envelope_to_proto(envelope, true, false)?;
+        // Masking + protobuf + zstd are pure Rust: release the GIL so app threads
+        // keep running while the batch worker encodes (design §9).
+        let bytes = py.allow_threads(|| -> PyResult<Vec<u8>> {
+            pii_apply_envelope(&mut proto, pii_mode, &pii_disabled)?;
+            encode_envelope(&proto, limits)
+                .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+        })?;
+        Ok(PyBytes::new_bound(py, &bytes).unbind())
+    })
 }
 
 #[pyfunction]
 fn decode_envelope_py(py: Python<'_>, data: &[u8]) -> PyResult<PyObject> {
-    let env = decode_envelope(data)
-        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
-    envelope_to_dict(py, &env)
+    shielded(|| {
+        let env = decode_envelope(data)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        envelope_to_dict(py, &env)
+    })
 }
 
 /// Who the OTLP mapping should say produced the export.
@@ -1487,32 +1492,34 @@ fn encode_otlp_traces(
     pii_disabled: Vec<String>,
     limits: Option<PyLimits>,
 ) -> PyResult<Py<PyBytes>> {
-    // ONE request, uncompressed, whatever its size — the bare serialization of
-    // an envelope. `encode_otlp_requests` is what an EXPORT calls: this one
-    // answers "what does this envelope look like on the wire", which is a
-    // question with one answer, and a caller that needs a body a receiver will
-    // accept needs the other function's several.
-    //
-    // Marshalling walks Python objects — the only part that needs the GIL.
-    // Traces only: state snapshots have no OTLP trace form, so walking them
-    // here would spend the GIL on records the mapping drops.
-    //
-    // ONE marshaller feeds both export surfaces, which means this walk reads a
-    // few fields the trace mapping does not project. That is the price of the
-    // envelope being the only model either surface is built from: a narrower
-    // walk for traces would be a second marshaling path to keep in step, and
-    // the first time the two disagreed it would show up as a missing attribute
-    // on a user's wire rather than as a failing build.
-    let (proto, _) = envelope_to_proto(envelope, false, false)?;
-    let limits = limits.map(|p| p.inner).unwrap_or_default();
-    // Mapping + masking + protobuf are pure Rust: release the GIL so app
-    // threads keep running while the batch worker encodes (design §9).
-    let bytes = py.allow_threads(move || -> PyResult<Vec<u8>> {
-        let req = otlp_request(proto, pii_mode, &pii_disabled, limits)?;
-        otlp::encode_traces(&req)
-            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
-    })?;
-    Ok(PyBytes::new_bound(py, &bytes).unbind())
+    shielded(|| {
+        // ONE request, uncompressed, whatever its size — the bare serialization of
+        // an envelope. `encode_otlp_requests` is what an EXPORT calls: this one
+        // answers "what does this envelope look like on the wire", which is a
+        // question with one answer, and a caller that needs a body a receiver will
+        // accept needs the other function's several.
+        //
+        // Marshalling walks Python objects — the only part that needs the GIL.
+        // Traces only: state snapshots have no OTLP trace form, so walking them
+        // here would spend the GIL on records the mapping drops.
+        //
+        // ONE marshaller feeds both export surfaces, which means this walk reads a
+        // few fields the trace mapping does not project. That is the price of the
+        // envelope being the only model either surface is built from: a narrower
+        // walk for traces would be a second marshaling path to keep in step, and
+        // the first time the two disagreed it would show up as a missing attribute
+        // on a user's wire rather than as a failing build.
+        let (proto, _) = envelope_to_proto(envelope, false, false)?;
+        let limits = limits.map(|p| p.inner).unwrap_or_default();
+        // Mapping + masking + protobuf are pure Rust: release the GIL so app
+        // threads keep running while the batch worker encodes (design §9).
+        let bytes = py.allow_threads(move || -> PyResult<Vec<u8>> {
+            let req = otlp_request(proto, pii_mode, &pii_disabled, limits)?;
+            otlp::encode_traces(&req)
+                .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+        })?;
+        Ok(PyBytes::new_bound(py, &bytes).unbind())
+    })
 }
 
 /// Envelope → `(request bodies, spans dropped)` — the export path's encoder.
@@ -1540,25 +1547,29 @@ fn encode_otlp_requests(
     limits: Option<PyLimits>,
     compress: bool,
 ) -> PyResult<(Py<PyAny>, usize, Vec<String>)> {
-    let (proto, unmarshalled) = envelope_to_proto(envelope, false, true)?;
-    let limits = limits.map(|p| p.inner).unwrap_or_default();
-    let requests = py.allow_threads(move || -> PyResult<otlp::split::Requests> {
-        let req = otlp_request(proto, pii_mode, &pii_disabled, limits)?;
-        otlp::split::encode_requests(req, limits, compress)
-            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
-    })?;
-    let bodies = PyList::empty_bound(py);
-    for body in &requests.bodies {
-        bodies.append(PyBytes::new_bound(py, body))?;
-    }
-    Ok((bodies.into_py(py), requests.dropped_spans, unmarshalled))
+    shielded(|| {
+        let (proto, unmarshalled) = envelope_to_proto(envelope, false, true)?;
+        let limits = limits.map(|p| p.inner).unwrap_or_default();
+        let requests = py.allow_threads(move || -> PyResult<otlp::split::Requests> {
+            let req = otlp_request(proto, pii_mode, &pii_disabled, limits)?;
+            otlp::split::encode_requests(req, limits, compress)
+                .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+        })?;
+        let bodies = PyList::empty_bound(py);
+        for body in &requests.bodies {
+            bodies.append(PyBytes::new_bound(py, body))?;
+        }
+        Ok((bodies.into_py(py), requests.dropped_spans, unmarshalled))
+    })
 }
 
 #[pyfunction]
 fn decode_otlp_traces(py: Python<'_>, data: &[u8]) -> PyResult<PyObject> {
-    let req = otlp::decode_traces(data)
-        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
-    otlp_traces_to_dict(py, &req)
+    shielded(|| {
+        let req = otlp::decode_traces(data)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        otlp_traces_to_dict(py, &req)
+    })
 }
 
 /// The declared span vocabulary, as `{enum name: {wardex value: proto number}}`.
@@ -1577,100 +1588,102 @@ fn decode_otlp_traces(py: Python<'_>, data: &[u8]) -> PyResult<PyObject> {
 /// in `extra` — so a mismatch here is a mismatch a consumer would see.
 #[pyfunction]
 fn vocabulary_tables(py: Python<'_>) -> PyResult<PyObject> {
-    let out = PyDict::new_bound(py);
+    shielded(|| {
+        let out = PyDict::new_bound(py);
 
-    let ops = PyDict::new_bound(py);
-    for name in [
-        "chat",
-        "text_completion",
-        "embeddings",
-        "execute_tool",
-        "create_agent",
-        "invoke_agent",
-        "invoke_workflow",
-        "generate_content",
-        "retrieval",
-        "execute_step",
-        "handoff",
-        "evaluate",
-    ] {
-        ops.set_item(name, map_operation_name(name))?;
-    }
-    out.set_item("OperationName", ops)?;
-
-    let tools = PyDict::new_bound(py);
-    for name in ["network", "in_process", "ipc", "unknown"] {
-        tools.set_item(name, map_tool_execution_type(name))?;
-    }
-    out.set_item("ToolExecutionType", tools)?;
-
-    let links = PyDict::new_bound(py);
-    for name in [
-        "triggered_by",
-        "handoff_from",
-        "resumed_from",
-        "retried_from",
-        "cache_source",
-    ] {
-        links.set_item(name, map_link_reason(name))?;
-    }
-    out.set_item("LinkReason", links)?;
-
-    let snaps = PyDict::new_bound(py);
-    for name in ["span_start", "span_end", "turn_start"] {
-        snaps.set_item(name, map_snapshot_type(name))?;
-    }
-    out.set_item("SnapshotType", snaps)?;
-
-    // The three closed vocabularies that live on the wire, exposed the OTHER
-    // way round — number → name, walking the schema rather than a list written
-    // here. A table keyed by hand would only prove that this file agrees with
-    // itself; walking the numbers lets a Python test compare the SCHEMA against
-    // `assembly._integrity.Limitation`, `assembly._parentage.ParentSource` and
-    // `_enums.CaptureSource` member for member, in both directions, which is
-    // what makes a missing member a CI failure instead of a silently
-    // unnameable span.
-    let limits_tbl = PyDict::new_bound(py);
-    for n in 1..=200 {
-        let name = vocab::limitation_name(n);
-        if !name.contains("unrecognized") {
-            limits_tbl.set_item(name, n)?;
+        let ops = PyDict::new_bound(py);
+        for name in [
+            "chat",
+            "text_completion",
+            "embeddings",
+            "execute_tool",
+            "create_agent",
+            "invoke_agent",
+            "invoke_workflow",
+            "generate_content",
+            "retrieval",
+            "execute_step",
+            "handoff",
+            "evaluate",
+        ] {
+            ops.set_item(name, map_operation_name(name))?;
         }
-    }
-    out.set_item("Limitation", limits_tbl)?;
+        out.set_item("OperationName", ops)?;
 
-    let sources = PyDict::new_bound(py);
-    for n in 1..=200 {
-        let name = vocab::parent_source_name(n);
-        if !name.contains("unrecognized") {
-            sources.set_item(name, n)?;
+        let tools = PyDict::new_bound(py);
+        for name in ["network", "in_process", "ipc", "unknown"] {
+            tools.set_item(name, map_tool_execution_type(name))?;
         }
-    }
-    out.set_item("ParentSource", sources)?;
+        out.set_item("ToolExecutionType", tools)?;
 
-    // `CaptureSource` had no parity table until the bridge added a member to
-    // it: `Span.capture_sources` was already on the wire, so a spelling drift
-    // between `_enums.CaptureSource` and `CAPTURE_SOURCE_*` would have
-    // flattened a real observation channel to UNSPECIFIED with nothing to
-    // notice. Same schema walk as the two above.
-    let capture_sources = PyDict::new_bound(py);
-    for n in 1..=200 {
-        let name = vocab::capture_source_name(n);
-        if !name.contains("unrecognized") {
-            capture_sources.set_item(name, n)?;
+        let links = PyDict::new_bound(py);
+        for name in [
+            "triggered_by",
+            "handoff_from",
+            "resumed_from",
+            "retried_from",
+            "cache_source",
+        ] {
+            links.set_item(name, map_link_reason(name))?;
         }
-    }
-    out.set_item("CaptureSource", capture_sources)?;
+        out.set_item("LinkReason", links)?;
 
-    // The meta value, kept OUT of the vocabulary table above on purpose — a
-    // consumer iterating "the vocabulary" must not find it there — but exposed
-    // so a test can pin both its number and the fact that it is not vocabulary.
-    let meta = PyDict::new_bound(py);
-    let unmapped = pb::Limitation::VocabularyUnmapped as i32;
-    meta.set_item(vocab::limitation_name(unmapped), unmapped)?;
-    out.set_item("LimitationMeta", meta)?;
+        let snaps = PyDict::new_bound(py);
+        for name in ["span_start", "span_end", "turn_start"] {
+            snaps.set_item(name, map_snapshot_type(name))?;
+        }
+        out.set_item("SnapshotType", snaps)?;
 
-    Ok(out.into_py(py))
+        // The three closed vocabularies that live on the wire, exposed the OTHER
+        // way round — number → name, walking the schema rather than a list written
+        // here. A table keyed by hand would only prove that this file agrees with
+        // itself; walking the numbers lets a Python test compare the SCHEMA against
+        // `assembly._integrity.Limitation`, `assembly._parentage.ParentSource` and
+        // `_enums.CaptureSource` member for member, in both directions, which is
+        // what makes a missing member a CI failure instead of a silently
+        // unnameable span.
+        let limits_tbl = PyDict::new_bound(py);
+        for n in 1..=200 {
+            let name = vocab::limitation_name(n);
+            if !name.contains("unrecognized") {
+                limits_tbl.set_item(name, n)?;
+            }
+        }
+        out.set_item("Limitation", limits_tbl)?;
+
+        let sources = PyDict::new_bound(py);
+        for n in 1..=200 {
+            let name = vocab::parent_source_name(n);
+            if !name.contains("unrecognized") {
+                sources.set_item(name, n)?;
+            }
+        }
+        out.set_item("ParentSource", sources)?;
+
+        // `CaptureSource` had no parity table until the bridge added a member to
+        // it: `Span.capture_sources` was already on the wire, so a spelling drift
+        // between `_enums.CaptureSource` and `CAPTURE_SOURCE_*` would have
+        // flattened a real observation channel to UNSPECIFIED with nothing to
+        // notice. Same schema walk as the two above.
+        let capture_sources = PyDict::new_bound(py);
+        for n in 1..=200 {
+            let name = vocab::capture_source_name(n);
+            if !name.contains("unrecognized") {
+                capture_sources.set_item(name, n)?;
+            }
+        }
+        out.set_item("CaptureSource", capture_sources)?;
+
+        // The meta value, kept OUT of the vocabulary table above on purpose — a
+        // consumer iterating "the vocabulary" must not find it there — but exposed
+        // so a test can pin both its number and the fact that it is not vocabulary.
+        let meta = PyDict::new_bound(py);
+        let unmapped = pb::Limitation::VocabularyUnmapped as i32;
+        meta.set_item(vocab::limitation_name(unmapped), unmapped)?;
+        out.set_item("LimitationMeta", meta)?;
+
+        Ok(out.into_py(py))
+    })
 }
 
 /// Registers the `_wardex_native.codec` submodule.

@@ -306,7 +306,17 @@ impl Http2Connection {
             } else {
                 &mut self.resp_decoder
             };
-            decoder.decode(block).map_err(|_| ())?
+            // `fluke-hpack` 0.3 unwraps inside its dynamic-table size update:
+            // a `0x3f` prefix whose integer continues past the end of the
+            // block, or continues for more octets than fit, is a panic and
+            // not a `DecoderError`. A panic here unwinds through the caller's
+            // `disabled = true` latch and then through PyO3 as a
+            // `BaseException` the host's `recv()` sees. Catching it turns the
+            // frame into the same `Err` any other bad block produces, so the
+            // connection latches off and stays off.
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| decoder.decode(block)))
+                .map_err(|_| ())?
+                .map_err(|_| ())?
         };
         if self.streams.len() > self.limits.max_streams {
             if let Some(&k) = self.streams.keys().next() {
@@ -733,6 +743,28 @@ mod tests {
         let r2 = c.feed(true, &frame(0x1, FH | FS, 3, &block));
         assert!(r.transactions.is_empty());
         assert!(r2.opened_request_streams.is_empty());
+    }
+
+    #[test]
+    fn truncated_hpack_size_update_latches_off_instead_of_panicking() {
+        // `0x3f` is a dynamic-table size update (001xxxxx) whose 5-bit prefix
+        // saturates, so the integer must continue in the following octets.
+        // The first block ends right there; the second continues for more
+        // octets than the decoder's integer allows. Both reach an `unwrap()`
+        // inside `fluke-hpack` rather than a `DecoderError`. Bytes as the
+        // server sends them: `00 00 01 01 04 00 00 00 01 3f` is the first.
+        for payload in [&[0x3f][..], &[0x3f, 0xff, 0xff, 0xff, 0xff, 0xff][..]] {
+            let mut c = Http2Connection::new(Limits::default());
+            let r = c.feed(false, &frame(0x1, FH, 1, payload));
+            assert!(r.transactions.is_empty());
+            // Latched off: a well-formed request on a new stream is not opened.
+            let block = hpack(&[(b":method", b"GET"), (b":path", b"/")]);
+            let r2 = c.feed(true, &frame(0x1, FH | FS, 3, &block));
+            assert!(
+                r2.opened_request_streams.is_empty(),
+                "the parser must latch off after a panic inside HPACK, payload {payload:?}"
+            );
+        }
     }
 
     #[test]

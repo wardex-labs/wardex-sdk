@@ -51,6 +51,26 @@ All notable changes to this project are documented here. The format follows
   `examples/README.md`; contributors working on a checkout use the
   development install in `CONTRIBUTING.md` instead.
 
+### Fixed
+
+- **A panic in the Rust core no longer reaches your `recv()`.** PyO3 converts
+  a panic into `PanicException`, which inherits from `BaseException`, so it
+  walked through every `except Exception` guard the SDK puts around its own
+  work and surfaced inside the host's socket read after the bytes were already
+  consumed. Every FFI entry point now runs inside a shield that converts a
+  panic into `NativePanic`, a `RuntimeError` the guards swallow and count
+  (under the site, and under `ffi.panic_converted`). The one known trigger is
+  fixed at its source as well: an HTTP/2 HEADERS frame whose HPACK block is a
+  dynamic-table size update with its integer cut off (`00 00 01 01 04 00 00
+  00 01 3f` as a server sends it) made the HPACK decoder unwrap, and the
+  parser now latches that connection off exactly as it does any other bad
+  block. `sdks/python/tests/test_ffi_panic.py` injects a panic through a
+  test-only hook and reads the binding sources to hold the rule; the
+  development build (`uv sync`) compiles that hook in, the release wheel does
+  not. What remains: the panic hook's one `thread '<unnamed>' panicked at`
+  line on stderr, which only a process-global hook could silence, and wardex
+  does not replace the host's.
+
 ## [0.6.0b1] - 2026-09-06
 
 **What this release means for you.** openai-agents users get one tree per
