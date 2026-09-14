@@ -285,8 +285,12 @@ your own code to read back and are not stamped onto spans.
 
 ## Distributed tracing
 
-Trace context propagation is **opt-in** — a plain `wardex.init(...)` never
-touches your outbound requests or headers. Turn it on with:
+Trace context propagation is **opt-in** — after a plain `wardex.init(...)` the
+four HTTP client entry points propagation patches (`httpx.Client.send`,
+`httpx.AsyncClient.send`, `requests.Session.send`,
+`aiohttp.ClientSession._request`) are still the objects they were before the
+call, so nothing wardex installed is in a position to put a `traceparent` on
+your outbound requests. Turn it on with:
 
 ```python
 from wardex_sdk import PropagationConfig
@@ -904,6 +908,25 @@ Which number to raise depends on which counter moved.
 `max_session_entries`. The two are separate fields — the core limits table
 calls the first a generalization of the second, but raising it leaves the second
 exactly where it was.
+
+## Quality budgets
+
+Several of the claims on this page are numbers, and a number nobody re-measures
+becomes a wish. The ones that guard this SDK's cost to your process are pinned
+by tests you can run against a clone, without taking our word for any of them:
+
+| Where | What it holds |
+|---|---|
+| `sdks/python/tests/test_quality_ratchets.py` | The panic surface of the Rust core and of the FFI layer, module size, undocumented public names, skip markers, and the wheel's runtime dependency count. Each is a recorded number that the test allows to move in one direction only |
+| `sdks/python/tests/test_import_purity.py` | `import wardex_sdk` starts no thread, patches no socket attribute, reads no environment variable, and loads no provider module; a disabled SDK, once closed, leaves none of those behind either. Both halves run in subprocesses so nothing another test did can mask the result |
+| `sdks/python/tests/test_import_graph.py` | The layer ranks in AGENTS.md are the real import graph, and the architecture diagram there is the same fact as the table the test enforces |
+| `scripts/quality-snapshot.sh` | Prints every one of those numbers for the current tree as JSON. It reads the source only — no venv, no `cargo`, nothing imported from the built package — so a stale wheel cannot change a number it reports. CI runs it on every push and records the output in the run log, where it gates nothing |
+
+Two of those numbers are worth reading before you plan around them. The Rust
+core holds 172 `unwrap()`/`expect(` call sites, which may only fall; the FFI
+layer in `bindings/python/src` holds zero and may never hold one, because a
+panic there is the one that reaches your interpreter. Where a budget is higher
+than we would like, the number says so rather than the prose hiding it.
 
 ## Versioning
 

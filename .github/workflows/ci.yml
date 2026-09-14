@@ -51,9 +51,14 @@ jobs:
       # `HEAD~1` is correct only when the event carries exactly one commit: for a
       # push of A..B it compares B against A, so a break introduced in A is
       # already present in the baseline and passes green (measured). `main` here
-      # advances almost entirely by fast-forward — 2 merge commits in 108 — so
-      # multi-commit pushes are the normal case, not the edge one, and that is
-      # exactly the path this step exists to cover.
+      # takes work by fast-forward as the rule and by merge commit only as the
+      # exception, so a push carrying several commits is the normal case rather
+      # than the edge one, and that is exactly the path this step exists to
+      # cover. Measured 2026-09-13: 4 of the last 108 commits on `main` were
+      # merges, counted by parents per commit —
+      #   git log -108 --pretty='%p' | awk '{if(NF>1)c++} END{print c+0}'
+      # (`git log --merges -108` is the wrong instrument: it filters before the
+      # cap, so it counts merges across all of history instead of this window.)
       #
       # `github.event.before` is the pre-push tip; `pull_request.base.sha` is the
       # base branch tip. GitHub sends an all-zero `before` for a branch's first
@@ -68,6 +73,18 @@ jobs:
             exit 0
           fi
           buf breaking --against ".git#format=git,ref=$BUF_BREAKING_BASE"
+
+      # The quality budgets, printed into the run log so anyone reading a public
+      # CI run can recover the numbers behind the claims in README.md without a
+      # checkout. The step decides nothing, and `if: always()` plus
+      # `continue-on-error` are deliberate: it reports even after a gate above
+      # has failed, and it can never itself turn a build red. What ENFORCES the
+      # budgets is `sdks/python/tests/test_quality_ratchets.py`, collected by
+      # the pytest step in the job below; this step only records them.
+      - name: quality snapshot (recorded, never gating)
+        if: always()
+        continue-on-error: true
+        run: bash scripts/quality-snapshot.sh
 
   python:
     runs-on: ubuntu-latest

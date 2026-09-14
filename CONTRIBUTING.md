@@ -21,6 +21,19 @@ buf lint
 scripts/check-py310.sh   # if you touched anything under sdks/python
 ```
 
+Then read what your change did to the recorded numbers:
+
+```bash
+bash scripts/quality-snapshot.sh
+```
+
+It prints the budgets described under "Quality budgets" in `README.md` as JSON,
+from the source tree alone. The tests enforce the ones that may only move one
+way, so a wrong-way move is already a red suite; the snapshot is for the other
+half of the question, which no command can answer for you — whether the change
+still claims what it did before. A pull request that moves a budget says so in
+its description, in the direction it moved and why.
+
 `scripts/check-py310.sh` runs the suite on CPython 3.10, the floor
 `sdks/python/pyproject.toml` declares. The development venv is a much newer
 interpreter, so a 3.11+-only API passes locally and turns red only in CI's 3.10
