@@ -162,9 +162,54 @@ jobs:
             -v "$PWD/dist:/dist:ro" -v "$PWD/smoke.sh:/smoke.sh:ro" \
             python:${{ matrix.platform.python }}-slim bash /smoke.sh
 
+  # Every check `ci.yml` runs, re-run on the exact commit the tag points at.
+  # `ci.yml` and this workflow do not know about each other: CI runs on branch
+  # pushes and pull requests, this runs on tags, and before this job existed a
+  # tag on a commit whose CI was red published just the same -- `smoke` only
+  # proves the wheel imports, not that the code in it is right. Now `publish`
+  # waits on this job too, so a wheel reaches PyPI only from a commit on which
+  # rustfmt, clippy, the Rust suite, ruff, and the Python suite all passed,
+  # here, at publish time, and not "on some earlier run somebody checked".
+  #
+  # Two interpreters, not the five `ci.yml` covers: the floor `requires-python`
+  # promises (the one that catches a 3.11+-only API, which the newest
+  # interpreter never does) and the newest, in parallel. Same steps as `ci.yml`
+  # -- when one changes, change the other; there is no shared definition yet.
+  gate:
+    name: gate (fmt, clippy, cargo test, ruff, pytest on py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: cargo fmt --check
+        run: cargo fmt --all --check
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: cargo test (workspace)
+        run: cargo test --workspace
+      - uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+          cache-dependency-glob: "**/pyproject.toml"
+      - name: uv sync (builds wardex_sdk via maturin)
+        run: uv sync --python ${{ matrix.python-version }}
+      - name: ruff check
+        run: uv run ruff check sdks/python examples
+      - name: ruff format --check
+        run: uv run ruff format --check sdks/python examples
+      - name: pytest
+        run: uv run pytest sdks/python/tests -q
+
   publish:
     name: publish to PyPI
-    needs: [build, smoke]
+    needs: [build, smoke, gate]
     # Only a *pushed* `python-v*` tag publishes. The trigger is half the guard
     # because workflow_dispatch takes a tag ref too — the ref picker has a Tag
     # tab, and `gh workflow run --ref python-v1.2.3` is the obvious way to

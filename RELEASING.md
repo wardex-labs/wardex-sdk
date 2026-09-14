@@ -14,10 +14,15 @@ git push origin python-v0.1.0b2            # push the TAG — this triggers the 
 also requires a `## [Unreleased]` header in `CHANGELOG.md` (it moves that section
 under the new version) and stops if the header is missing.
 
-The `release-python.yml` workflow (on `python-v*` tags) builds abi3 wheels
-(manylinux x86_64/aarch64, macOS x86_64/arm64, Windows), installs and imports
-each one, and publishes to PyPI via Trusted Publishing (OIDC) — no API token.
-(A source distribution is a follow-up; the beta ships wheels only.)
+The `release-python.yml` workflow (on `python-v*` tags) runs three gates in
+parallel and publishes only when all three are green: `build` makes the abi3
+wheels (manylinux x86_64/aarch64, macOS x86_64/arm64, Windows); `smoke`
+installs and imports each one; `gate` re-runs every check CI runs — `cargo fmt
+--check`, `clippy -D warnings`, `cargo test --workspace`, `ruff check`, `ruff
+format --check`, and the full Python suite — on the exact commit the tag points
+at, on the floor interpreter and the newest. `publish` then uploads to PyPI via
+Trusted Publishing (OIDC) — no API token. (A source distribution is a
+follow-up; the beta ships wheels only.)
 
 The same workflow also runs on demand, which is how you prove the build and
 wheel-install steps *before* the tag exists:
@@ -48,12 +53,18 @@ skips pre-releases by default; testers need `pip install wardex-sdk --pre`
 - **A published version is immutable.** PyPI will not let you reuse or overwrite a
   version. If a release is broken, publish the next one (e.g. `0.1.0b3`).
 - **Publishing is all-or-nothing.** The publish job needs every platform wheel to
-  build *and* every smoke entry to install and import it; if either stage has one
-  red job, nothing is published (no partial release) and the version is still
-  free to re-tag once the cause is fixed.
-- **CI and release are independent.** `ci.yml` runs on branch pushes/PRs;
-  `release-python.yml` runs on `python-v*` tags. A CI failure does not block a
-  tagged release, and vice versa.
+  build, every smoke entry to install and import it, *and* both `gate` entries
+  to pass; if any stage has one red job, nothing is published (no partial
+  release) and the version is still free to re-tag once the cause is fixed.
+- **The tag commit is tested at publish time, not trusted.** `ci.yml` runs on
+  branch pushes and pull requests; `release-python.yml` runs on `python-v*`
+  tags; the two do not know about each other. So the release workflow carries
+  its own `gate` job with the same checks, run on the tagged commit itself. A
+  red `gate` on a commit whose CI was green means the tag does not point where
+  you think it does — check `git rev-parse python-vX.Y.Z` against `origin/main`
+  before anything else. What no gate covers: a tag pushed by hand around
+  `scripts/release.py` still publishes if the checks pass; the script is the
+  procedure, the workflow is the guard.
 
 ## Future SDKs
 
