@@ -8,10 +8,14 @@ import json
 import socket
 import threading
 
+import pytest
+
 import wardex_sdk as wardex
 from conftest import client_spans
 from wardex_sdk import ConsoleTransport
+from wardex_sdk._assembly import Limitation, counters
 from wardex_sdk._enums import CaptureSource
+from wardex_sdk._interceptors._peer import peer_address
 from wardex_sdk._interceptors._seam import _ConnectionState
 from wardex_sdk._interceptors._socket import RawSocketInterceptor
 
@@ -207,6 +211,213 @@ def test_allowlist_matching_is_case_insensitive():
     assert seam._in_allow(state("other.local", 80)) is False  # port still counts
     assert seam._in_allow(state("elsewhere.local", 80)) is False
     assert RawSocketInterceptor()._in_allow(state("mybox.local", 80)) is False
+
+
+# --- a peer wardex cannot name: unix sockets and a failing getpeername() ---
+
+_PEER_UNRESOLVED = "interceptors.seam.peer_unresolved"
+
+
+def _read_http_response(sock: socket.socket) -> bytes:
+    """One Content-Length-framed HTTP/1.1 response, read off a raw socket."""
+    buf = b""
+    while b"\r\n\r\n" not in buf:
+        chunk = sock.recv(65536)
+        if not chunk:
+            return buf
+        buf += chunk
+    head, _, body = buf.partition(b"\r\n\r\n")
+    want = 0
+    for line in head.split(b"\r\n"):
+        if line.lower().startswith(b"content-length:"):
+            want = int(line.split(b":", 1)[1])
+    while len(body) < want:
+        chunk = sock.recv(65536)
+        if not chunk:
+            break
+        body += chunk
+    return head + b"\r\n\r\n" + body
+
+
+@pytest.mark.usefixtures("fresh_counters")
+def test_a_unix_socket_llm_call_ships_port_zero_and_says_the_peer_is_unresolved():
+    """A local model server behind a unix socket is still an LLM call, and the
+    span must not dress it up as a TCP connection to port 443.
+
+    `socket.socketpair()` is `AF_UNIX`, the family httpx's `uds=`, docker-py and
+    local model servers ride. Its `getpeername()` answers with a PATH, not a
+    `(host, port)` pair, so there is no port to report. The seam used to fall
+    back to the literal host `unknown` and port 443 and ship
+    `http://unknown:443/...` with no marker and no counter — an invented
+    address indistinguishable from a real one. The honest shape is port 0 in
+    both `server.port` and the URL, the `PEER_UNRESOLVED` marker on the span,
+    and one tick of the counter for the one sealed transaction.
+    """
+    body = b'{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}'
+    request = (
+        b"POST /v1/chat/completions HTTP/1.1\r\n"
+        b"Host: localhost\r\n"
+        b"Content-Type: application/json\r\n"
+        b"Content-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body
+    )
+    response = (
+        b"HTTP/1.1 200 OK\r\n"
+        b"Content-Type: application/json\r\n"
+        b"Content-Length: " + str(len(_LLM_RESP)).encode() + b"\r\n\r\n" + _LLM_RESP
+    )
+    client_end, server_end = socket.socketpair()
+    assert client_end.family == socket.AF_UNIX, "precondition: socketpair is a unix socket"
+
+    def serve() -> None:
+        buf = b""
+        while len(buf) < len(request):
+            chunk = server_end.recv(65536)
+            if not chunk:
+                return
+            buf += chunk
+        server_end.sendall(response)
+
+    try:
+        wardex.init(transport=ConsoleTransport(), intercept=True)
+        server = threading.Thread(target=serve, daemon=True)
+        server.start()
+        client_end.sendall(request)
+        received = _read_http_response(client_end)
+        server.join(timeout=5)
+        assert received.endswith(_LLM_RESP), "precondition: the whole response arrived"
+
+        spans = client_spans()
+        assert len(spans) == 1
+        span = spans[0]
+        assert span.gen_ai is not None, "precondition: the call was identified as LLM traffic"
+        assert Limitation.PEER_UNRESOLVED in span.capture_integrity.limitations
+        assert span.server_port == 0
+        assert span.server_address == "unknown"
+        assert span.transport.http.url == "http://unknown:0/v1/chat/completions"
+        assert counters.get(_PEER_UNRESOLVED) == 1
+    finally:
+        wardex.close()
+        client_end.close()
+        server_end.close()
+
+
+def test_a_resolved_tcp_peer_carries_no_unresolved_marker():
+    """The other half of the contract: a loopback TCP connection has a real
+    address and port, so the marker would be a false alarm there."""
+    httpd, host, port = _server(_LLM_RESP)
+    try:
+        wardex.init(transport=ConsoleTransport(), intercept=True)
+        _post(host, port, b'{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}')
+        spans = client_spans()
+        assert len(spans) == 1
+        assert Limitation.PEER_UNRESOLVED not in spans[0].capture_integrity.limitations
+        assert spans[0].server_port == port
+    finally:
+        wardex.close()
+        httpd.shutdown()
+        httpd.server_close()
+
+
+class _CountingPeerSocket:
+    """A socket double whose `getpeername()` counts how often it is asked."""
+
+    def __init__(self, peer: object = ("127.0.0.1", 8080)) -> None:
+        self.peer = peer
+        self.calls = 0
+
+    def getpeername(self) -> object:
+        self.calls += 1
+        if isinstance(self.peer, BaseException):
+            raise self.peer
+        return self.peer
+
+    def fileno(self) -> int:
+        return -1
+
+
+class _InlineClient:
+    """Just enough client for a seam driven directly, without `install()`."""
+
+    class config:  # noqa: N801 - mirrors `Client.config`
+        debug = False
+
+    def capture_span(self, span: object) -> None:
+        pass
+
+    def capture_deferred(self, job: object) -> None:
+        pass
+
+
+def test_the_peer_address_is_asked_once_per_connection_not_once_per_send():
+    """`_state` already resolved the address when it built the connection, and
+    `_on_request_bytes` used to ask the socket again on every send — a syscall
+    per write on the hottest path the seam has, and on a memory-BIO
+    `SSLObject` a raised-and-caught `AttributeError` per write. A resolved
+    address cannot change while the connection lives, so three sends must cost
+    exactly one query."""
+    seam = RawSocketInterceptor()
+    seam._client = _InlineClient()
+    sock = _CountingPeerSocket()
+
+    seam._on_request_bytes(sock, b"POST /v1/chat/completions HTTP/1.1\r\n")
+    seam._on_request_bytes(sock, b"Host: localhost\r\nContent-Length: 2\r\n\r\n")
+    seam._on_request_bytes(sock, b"{}")
+
+    assert sock.calls == 1
+
+
+def test_only_the_bare_unknown_placeholder_is_asked_again():
+    """The one re-ask the per-send rule keeps, and what it may not claim.
+
+    A connection whose address is the bare `unknown` placeholder is asked again
+    on the next send, because a `server_hostname` that appears later is a
+    better host for the span. A better host is still not a read peer: the port
+    stays 0, which is what keeps the connection marked. Once the host is no
+    longer the bare placeholder, nothing is asked again.
+    """
+    seam = RawSocketInterceptor()
+    seam._client = _InlineClient()
+    sock = _CountingPeerSocket(OSError("not connected"))
+    sock.server_hostname = None
+
+    seam._on_request_bytes(sock, b"POST /v1/chat/completions HTTP/1.1\r\n")
+    st = seam._conns[id(sock)]
+    assert (st.server_address, st.server_port) == ("unknown", 0)
+    asked = sock.calls
+
+    sock.server_hostname = "models.internal"
+    seam._on_request_bytes(sock, b"Host: models.internal\r\n")
+    assert sock.calls == asked + 1
+    assert (st.server_address, st.server_port) == ("models.internal", 0)
+
+    seam._on_request_bytes(sock, b"Content-Length: 2\r\n\r\n{}")
+    assert sock.calls == asked + 1
+
+
+@pytest.mark.parametrize(
+    ("peer", "hostname", "expected"),
+    [
+        # A real INET/INET6 answer is used as-is.
+        (("10.0.0.7", 8000), None, ("10.0.0.7", 8000)),
+        (("::1", 8000, 0, 0), None, ("::1", 8000)),
+        # AF_UNIX answers with a path. The old `int(peer[1])` read a path such
+        # as "/9" as host "/" on port 9 — a resolved-looking lie — so the shape
+        # is checked rather than indexed.
+        ("/9.sock", None, ("unknown", 0)),
+        ("", None, ("unknown", 0)),
+        (b"\x00abstract", None, ("unknown", 0)),
+        # getpeername() raising: the TLS server name is the best host there is,
+        # and the port is still not known.
+        (OSError("not connected"), "api.example.com", ("api.example.com", 0)),
+        (OSError("not connected"), None, ("unknown", 0)),
+    ],
+)
+def test_an_unread_peer_address_is_reported_as_port_zero(peer, hostname, expected):
+    """Port 0 is the mark the seam keys `PEER_UNRESOLVED` on, so every shape
+    that did not yield an INET address must land on it — and none that did."""
+    sock = _CountingPeerSocket(peer)
+    sock.server_hostname = hostname
+    assert peer_address(sock) == expected
 
 
 def test_plaintext_ws_requires_allowlist():

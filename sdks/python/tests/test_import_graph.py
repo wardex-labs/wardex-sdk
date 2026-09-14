@@ -1615,11 +1615,18 @@ _CS4_BUDGET = {
     # which is exactly the graduation this budget exists to force. Lowered in
     # the same commit rather than left stale: `_assert_within_budget` only
     # fails on `actual > budget`, so a number left high is a free slot for a
-    # brand-new silent swallow that no test notices. The three that remain:
+    # brand-new silent swallow that no test notices. The two that remain:
     # the composed gate's fail-open (design §5.1 — losing data is worse than
-    # noise), the debug-log containment in `_on_response_bytes`, and
-    # `_peer`'s address fallback.
-    "_interceptors/_seam.py": 3,
+    # noise) and the debug-log containment in `_on_response_bytes`. It was
+    # three until the peer-address fallback MOVED to `_peer.py` below — a
+    # move of one budget, not a fall.
+    "_interceptors/_seam.py": 2,
+    # One, moved here from `_seam.py`: `peer_address`'s `getpeername()` probe.
+    # Its handler only records `peer = None`, so the predicate still reads it
+    # as a swallow, but nothing is hidden: an unread address comes back as port
+    # 0, and the seam turns that into `PEER_UNRESOLVED` and the
+    # `interceptors.seam.peer_unresolved` count.
+    "_interceptors/_peer.py": 1,
     "_interceptors/_socket.py": 6,
     "_interceptors/_ssl.py": 6,
     "_semantics/_grpc.py": 1,

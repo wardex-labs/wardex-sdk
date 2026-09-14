@@ -250,7 +250,7 @@ def test_disabled_reason_logged_once_per_connection_in_debug(capsys):
     # being discarded by the already-latched parser.
     interceptor = SSLInterceptor()
     interceptor._client = _DebugRecordingClient()
-    obj = object()  # no getpeername/selected_alpn_protocol → falls back in _peer/_select_tracker
+    obj = object()  # no getpeername/selected_alpn_protocol → both lookups fall back
     interceptor._on_request_bytes(obj, b"POST /v1/messages HTTP/1.1\r\nContent-Length: 0\r\n\r\n")
     too_many_headers = (
         b"HTTP/1.1 200 OK\r\n" + b"".join(f"X-{i}: v\r\n".encode() for i in range(100)) + b"\r\n"

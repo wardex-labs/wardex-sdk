@@ -57,6 +57,7 @@ from .._types import (
 from ._base import InterceptorInterface
 from ._close_hook import install_shared_close_hook, on_close, uninstall_shared_close_hook
 from ._conn_timing import install_shared_timing, uninstall_shared_timing
+from ._peer import UNRESOLVED_HOST, UNRESOLVED_PORT, peer_address
 from ._trackers import _Txn, _WebSocketTracker
 
 if TYPE_CHECKING:
@@ -463,7 +464,7 @@ class ByteSeamInterceptor(InterceptorInterface):
         cid = id(obj)
         st = self._conns.get(cid)
         if st is None:
-            addr, port = _peer(obj)
+            addr, port = peer_address(obj)
             st = _ConnectionState(self._select_tracker(obj), addr, port)
             if cid in self._reset_at_fork_ids:
                 # This object was tracked when the fork reset the table, so it
@@ -525,9 +526,8 @@ class ByteSeamInterceptor(InterceptorInterface):
         st = self._state(obj)
         if not self._gate(st, data, "request"):
             return
-        addr, port = _peer(obj)
-        st.server_address = addr
-        st.server_port = port
+        if st.server_address == UNRESOLVED_HOST:  # asked once otherwise; see `_peer.py`
+            st.server_address, st.server_port = peer_address(obj)
         for txn in st.tracker.on_request_bytes(data):
             if txn.version == "websocket":
                 self._emit_ws(st, txn)
@@ -641,6 +641,9 @@ class ByteSeamInterceptor(InterceptorInterface):
             st.reset_at_fork = False
             timing_markers = (*timing_markers, Limitation.TRACKING_RESET_AT_FORK)
             counters.bump("interceptors.seam.tracking_reset_at_fork")
+        if st.server_port == UNRESOLVED_PORT:  # a placeholder address; see `_peer.py`
+            timing_markers = (*timing_markers, Limitation.PEER_UNRESOLVED)
+            counters.bump("interceptors.seam.peer_unresolved")
         pre = self._prefilter_of(st)
         if pre is Prefilter.DENY:
             return None
@@ -763,6 +766,9 @@ class ByteSeamInterceptor(InterceptorInterface):
             start_ns=txn.start_ns,
         )
         self._stamp_fork_reset(st, draft)
+        if st.server_port == UNRESOLVED_PORT:  # never sealed, so stamped here
+            draft.add_limitation(Limitation.PEER_UNRESOLVED)
+            counters.bump("interceptors.seam.peer_unresolved")
         draft.set_extra("network.protocol.version", "websocket")
         draft.set_extra("ws.messages.sent", txn.ws_messages_sent)
         draft.set_extra("ws.messages.received", txn.ws_messages_received)
@@ -971,7 +977,7 @@ def _assemble(p: _PendingTxn, *, parse: bool, extra: tuple[Limitation, ...]) -> 
         parent_closed=txn.parent_closed,
         parent_evicted=txn.parent_evicted,
     )
-    url = f"{p.url_scheme}://{p.url_host}:{p.server_port}{txn.path}"
+    url = f"{p.url_scheme}://{p.url_host}:{p.server_port}{txn.path}"  # `:0` too; see `_peer.py`
     transfer = max(0.0, (txn.end_ns - txn.start_ns) / 1e6 - txn.ttfb_ms)
 
     # TRANSPORT mode, not an intent (design §6.1 correction in `_vocab.py`):
@@ -1182,16 +1188,7 @@ def _latched(txn: _Txn) -> Ambient:
 
 def _url_host(obj: Any, st: _ConnectionState) -> str:
     """The host a URL on this connection names: the TLS server name when
-    there is one, else the peer address `_peer` recorded on `st`. One
+    there is one, else the peer address `peer_address` recorded on `st`. One
     expression for the WS swap site and `_seal`, so the WebSocket-transport
     question and the HTTP span's URL are asked about the same host."""
     return getattr(obj, "server_hostname", None) or st.server_address
-
-
-def _peer(obj: Any) -> tuple[str, int]:
-    try:
-        peer = obj.getpeername()
-        return str(peer[0]), int(peer[1])
-    except Exception:
-        host = getattr(obj, "server_hostname", None) or "unknown"
-        return str(host), 443

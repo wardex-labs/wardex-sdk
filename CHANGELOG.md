@@ -93,6 +93,15 @@ All notable changes to this project are documented here. The format follows
   not. What remains: the panic hook's one `thread '<unnamed>' panicked at`
   line on stderr, which only a process-global hook could silence, and wardex
   does not replace the host's.
+- **A span no longer invents port 443 when wardex cannot read the peer's
+  address.** An HTTP call over a unix socket (httpx `uds=`, docker-py, a local
+  model server), or on a socket whose `getpeername()` fails, used to ship
+  `server.port=443` and a URL like `http://unknown:443/v1/chat/completions`,
+  with nothing on the span to say the address was made up. It now ships port
+  `0` in both places, the new limitation marker `peer_unresolved`, and a count
+  under `interceptors.seam.peer_unresolved`; the call is still captured. The
+  seam also stops re-reading the peer address on every send once it has one.
+  Wire change: `peer_unresolved` is a new value (50) of `wardex.v1.Limitation`.
 
 ## [0.6.0b1] - 2026-09-06
 

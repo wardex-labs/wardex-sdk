@@ -310,7 +310,7 @@ class _FakeSSLSocket:
     """Minimal ssl.SSLSocket-shaped stub for driving SSLInterceptor._gate in
     isolation, without a real TLS handshake. Only exposes what the seam
     actually touches: the negotiated ALPN protocol, the peer address (for
-    _peer()), and a file descriptor (for the connection-timing store)."""
+    peer_address()), and a file descriptor (for the connection-timing store)."""
 
     def __init__(self, alpn: str | None) -> None:
         self._alpn = alpn
