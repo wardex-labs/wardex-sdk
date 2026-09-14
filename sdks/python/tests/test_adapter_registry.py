@@ -1,6 +1,11 @@
 """Adapter registry + config-driven activation tests."""
 
+import json
 import logging
+import os
+import subprocess
+import sys
+import textwrap
 from typing import Any
 from unittest import mock
 
@@ -158,6 +163,48 @@ def test_auto_detection_installs_when_package_present():
         # that framework happens to be installed. This spelling never goes stale.
         assert make.call_args_list == [mock.call(name) for name in _DETECT_PACKAGES]
     get_registry().uninstall_all()
+
+
+_BARE_INIT_SCRIPT = textwrap.dedent(
+    """
+    import json, sys
+    import wardex_sdk as wardex
+    from wardex_sdk._adapters._registry import get_registry
+    from wardex_sdk._enums import AdapterName
+    from wardex_sdk.testing import RecordingTransport
+    assert "agents" not in sys.modules
+    wardex.init(transport=RecordingTransport())
+    try:
+        print(json.dumps({
+            "installed": get_registry().is_installed(AdapterName.OPENAI_AGENTS.value),
+            "imported": "agents" in sys.modules,
+        }))
+    finally:
+        wardex.close()
+    """
+)
+
+
+def test_a_bare_init_installs_the_adapter_of_a_framework_that_is_installed():
+    """README: "zero-instrumentation" and "auto-detected". The positive half
+    of auto-detection, against the real `openai-agents` distribution this
+    suite has, in a process that has not imported it yet: `wardex.init()`
+    with no adapter named installs the adapter, and importing the framework
+    is part of that. The tests above patch detection to say yes or no; the
+    decline paths run in `test_openai_agents_adapter.py`; this is the one
+    test that says a bare init actually does something with a real package.
+    A subprocess because this suite imported `agents` at collection, and the
+    claim is about a process that did not."""
+    proc = subprocess.run(
+        [sys.executable, "-c", _BARE_INIT_SCRIPT],
+        env={**os.environ, "OPENAI_API_KEY": "sk-test"},
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout.strip().splitlines()[-1]) == {"installed": True, "imported": True}
 
 
 def test_auto_detection_skips_when_package_absent():

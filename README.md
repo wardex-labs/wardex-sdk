@@ -250,9 +250,12 @@ def search(query: str): ...
 trace as a child, and an explicit `id=` is used verbatim — a multi-turn chat
 app passes its own session id so every turn joins one conversation. It also
 **wins over a framework's own conversation id**: an adapter run opened inside
-the block (an OpenAI Agents `RunConfig(group_id=…)`, say) keeps your id on
-every span and carries the framework's as a separate attribute
-(`wardex.openai_agents.group_id`), so one trace never has two conversation ids.
+the block (an OpenAI Agents `RunConfig(group_id=…)`, say) keeps your id as
+`gen_ai.conversation.id` on every span it opens and carries the framework's as
+a separate attribute (`wardex.openai_agents.group_id`) rather than as the
+conversation. Two `conversation()` blocks opened side by side under one span
+are two conversations in one trace, by design — the block scopes the id, not
+the trace.
 `workflow` / `agent` / `step` / `tool` map to the `gen_ai.operation.name`
 values `invoke_workflow` / `invoke_agent` / `execute_step` / `execute_tool`,
 so decorated spans appear on operation-keyed dashboards. `span()` and
