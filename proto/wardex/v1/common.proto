@@ -241,8 +241,8 @@ enum Limitation {
   //    The span's server.address / server.port and its URL are a placeholder,
   //    not an address read off the connection: no INET (host, port) pair was
   //    read — a unix socket answers getpeername() with a path, and a
-  //    memory-BIO TLS object has no getpeername and, off asyncio's own TLS
-  //    protocol (anyio, uvloop), no transport peer wardex could read — so the
+  //    memory-BIO TLS object has no getpeername and, on uvloop TLS or when set
+  //    up before wardex, no transport peer wardex could read — so the
   //    port is 0 and the host is the TLS server name, else `unknown`. The
   //    traffic is still captured. Names NO knob. Not
   //    CONNECT_TIMING_UNAVAILABLE (17): that is a missing duration on a peer

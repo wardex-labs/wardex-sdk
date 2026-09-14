@@ -1,18 +1,25 @@
 """The peer address a byte seam reports, and what it reports when it has none.
 
-`server.address`/`server.port` and the URL on a seam span come from here. Two
-places answer with a READ address, and both are the TCP peer:
+`server.address`/`server.port` and the URL on a seam span come from here.
+These answer with a READ address, and each is the TCP peer:
 
   * A connected INET socket's own `getpeername()` — every sync client, TLS or
     not, since an `ssl.SSLSocket` is a socket.
-  * The transport under a memory-BIO `ssl.SSLObject`. The object has no
-    `getpeername()`, but asyncio's `SSLProtocol.connection_made` is handed the
-    raw socket transport, whose `peername` extra is that socket's
-    `getpeername()`, at a moment the protocol already owns the object. The
-    close probe (`_close_hook.CloseProbe`) reads it there and stamps it onto
-    the object as `TRANSPORT_PEER`, the way `_conn_timing` stamps
-    `_wardex_timing`; `peer_address` prefers the stamp. This is asyncio TLS —
-    aiohttp, `loop.create_connection(ssl=...)`, `asyncio.open_connection`.
+  * What a memory-BIO `ssl.SSLObject` rides on. The object has no
+    `getpeername()`, but at the moment it is set up something that holds both
+    it and the socket is in hand, and the close probe
+    (`_close_hook.CloseProbe`) reads the peer there and stamps it onto the
+    object as `TRANSPORT_PEER` — the way `_conn_timing` stamps
+    `_wardex_timing` — for `peer_address` to prefer:
+      - asyncio TLS (aiohttp, `loop.create_connection(ssl=...)`,
+        `asyncio.open_connection`): `SSLProtocol.connection_made` is handed
+        the raw socket transport, whose `peername` extra is the socket's
+        `getpeername()`, while the protocol already owns the object;
+      - anyio TLS (httpx's `AsyncClient`, and so the async OpenAI and
+        Anthropic clients): `TLSStream.wrap` returns a stream whose public
+        typed attributes name the object and the socket's remote address.
+    Under TLS inside TLS (an HTTPS proxy) that is the proxy, exactly as a sync
+    socket's `getpeername()` would say.
 
 Everything else is a placeholder: the TLS server name when there is one, else
 `unknown`, and port `UNRESOLVED_PORT` (0). The traffic is still captured — a
@@ -21,15 +28,15 @@ local model server over a unix socket is an LLM call to the user. The cases:
   * `AF_UNIX` (httpx's `uds=`, docker-py, local model servers): `getpeername()`
     answers with a path.
   * A socket that is not connected: `getpeername()` raises.
-  * anyio TLS — httpx's `AsyncClient`, and so the async OpenAI and Anthropic
-    clients. anyio's `TLSStream` builds its own `SSLObject` over a byte
-    stream and never passes through `asyncio.sslproto`, so nothing stamps it.
   * uvloop TLS. uvloop's `SSLProtocol` is its own Cython class, not
     `asyncio.sslproto.SSLProtocol`, so the patch that reads the transport
-    never runs.
-  * An asyncio TLS connection whose `connection_made` ran before wardex was
-    installed — one a pool opened ahead of `init()`. The moment the peer is
-    read has passed, and nothing later is taken as a stand-in for it.
+    never runs. (anyio TLS over uvloop still goes through `TLSStream.wrap`,
+    and is read.)
+  * An async TLS connection set up before wardex was installed — one a pool
+    opened ahead of `init()`. The moment the peer is read has passed, and
+    nothing later is taken as a stand-in for it.
+  * anyio without its `abc`/`streams.tls` modules importable, or a stream
+    that does not publish both attributes: nothing names the peer.
 
 The seam's contract with that placeholder, stated once here so each call site
 in `_seam.py` can stay one line:
@@ -76,8 +83,8 @@ UNRESOLVED_HOST = "unknown"
 UNRESOLVED_PORT = 0
 
 #: The attribute an `ssl.SSLObject` carries its transport's INET peer under,
-#: named after `_conn_timing`'s `_wardex_timing`. Only `stamp_transport_peer`
-#: writes it, and only with a tuple that already passed `_is_inet`.
+#: named after `_conn_timing`'s `_wardex_timing`. Only `stamp_peer` writes it,
+#: and only with a tuple that already passed `_is_inet`.
 TRANSPORT_PEER = "_wardex_peer"
 
 
@@ -115,21 +122,17 @@ def peer_address(obj: Any) -> tuple[str, int]:
     return placeholder_host(obj), UNRESOLVED_PORT
 
 
-def stamp_transport_peer(sslobj: Any, transport: Any) -> None:
-    """Carry `transport`'s INET peer to the seam on `sslobj`, if it has one.
+def stamp_peer(sslobj: Any, peer: Any) -> None:
+    """Carry an INET `peer` to the seam on `sslobj`; anything else, drop.
 
-    Called by the close probe's `SSLProtocol.connection_made` wrapper, after
-    asyncio's own method. `sslobj` is None when the protocol names no object
-    where `_close_hook._sslobj_of` looks; a transport with no `get_extra_info`,
-    or a `peername` that is not an INET tuple (a unix-socket transport's is a
-    path), is an answer too, and leaves the object unstamped — so its spans
-    keep port 0 and the marker. Anything that RAISES is the caller's to count.
+    Called by the close probe once asyncio or anyio has named both halves.
+    `sslobj` is None when nothing named an object, and a `peer` that is None
+    (no socket under the transport) or not an INET tuple (a unix-socket
+    transport's is a path) is an answer too: the object stays unstamped, so
+    its spans keep port 0 and the marker. Anything that RAISES while the
+    caller READ those halves is the caller's to count.
     """
-    get_extra_info = getattr(transport, "get_extra_info", None)
-    if sslobj is None or get_extra_info is None:
-        return
-    peer = get_extra_info("peername")
-    if _is_inet(peer):
+    if sslobj is not None and _is_inet(peer):
         setattr(sslobj, TRANSPORT_PEER, peer)
 
 

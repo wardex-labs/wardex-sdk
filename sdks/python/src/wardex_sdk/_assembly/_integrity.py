@@ -682,8 +682,8 @@ Two emit sites, and the first is the mechanism the second restates.
     PEER_UNRESOLVED = "peer_unresolved"
     """``server.address``/``server.port`` and the URL's host and port are a
     placeholder: no INET ``(host, port)`` was read — a unix socket's peer is a
-    path; a memory-BIO ``SSLObject`` (anyio, uvloop, or made before install)
-    has no ``getpeername`` and no transport peer stamped by asyncio — so the
+    path; a memory-BIO ``SSLObject`` on uvloop TLS, or set up before install,
+    has no ``getpeername`` and no peer stamped by asyncio or anyio — so the
     port is ``0`` and the host the TLS server name, else ``unknown``. Still
     captured; the old fallback said port 443 and nothing said it was invented.
 

@@ -355,16 +355,23 @@ def test_installing_and_uninstalling_leaves_the_asyncio_protocol_untouched():
     # pointing at asyncio — naming a renamed internal for what is actually
     # somebody else's `init()` without a `close()`.
     assert _close_hook._refcount == 0, "the shared close hook was left installed by an earlier test"
+    from anyio.streams.tls import TLSStream
+
     orig = sslproto.SSLProtocol.connection_lost
     orig_made = sslproto.SSLProtocol.connection_made
+    # The raw descriptor: a restore that put back the BOUND method would leave
+    # `wrap` callable but no longer a classmethod for subclasses.
+    orig_wrap = TLSStream.__dict__["wrap"]
     install_shared_close_hook()
     try:
         assert sslproto.SSLProtocol.connection_lost is not orig
         assert sslproto.SSLProtocol.connection_made is not orig_made
+        assert TLSStream.__dict__["wrap"] is not orig_wrap
     finally:
         uninstall_shared_close_hook()
     assert sslproto.SSLProtocol.connection_lost is orig
     assert sslproto.SSLProtocol.connection_made is orig_made
+    assert TLSStream.__dict__["wrap"] is orig_wrap
 
 
 def test_a_protocol_that_refuses_the_private_read_still_reaches_asyncios_own_handler():
@@ -421,6 +428,53 @@ def test_a_protocol_that_refuses_the_peer_read_still_makes_its_connection():
     assert wrapped(Hostile(), "transport") == "made"
     assert ran == ["transport"]
     assert counters.get("interceptors.close_hook.connection_made") == 1, (
+        "the refused read was not counted, so either it did not raise or it escaped the guard"
+    )
+
+
+def test_anyio_still_publishes_what_the_peer_read_asks_for():
+    """The canary for the anyio half of the peer read.
+
+    It depends on public anyio names only, but on three of them, and a miss on
+    any one is silent: `install()` skips the patch and every httpx
+    `AsyncClient` span goes back to port 0 and `PEER_UNRESOLVED`.
+    """
+    from anyio.abc import SocketAttribute
+    from anyio.streams.tls import TLSAttribute, TLSStream
+
+    assert isinstance(TLSStream.__dict__.get("wrap"), classmethod)
+    assert TLSAttribute.ssl_object is not None
+    assert SocketAttribute.remote_address is not None
+    assert _close_hook._anyio_tls() == (
+        TLSStream,
+        TLSAttribute.ssl_object,
+        SocketAttribute.remote_address,
+    )
+
+
+def test_a_tls_stream_that_refuses_the_peer_read_is_still_returned():
+    """`extra()` runs whatever the stream stack beneath the TLS layer provides.
+    A raise there, after anyio's handshake succeeded, must not turn the host's
+    working connection into a failed one: the stream comes back and the refusal
+    is counted."""
+    import asyncio
+
+    class Hostile:
+        def extra(self, attribute, default=None):  # noqa: ANN001, ANN202
+            raise RuntimeError("this stream does not answer that")
+
+    stream = Hostile()
+
+    async def wrap(cls, *a, **k):  # noqa: ANN001, ANN202
+        return stream
+
+    wrapped = _close_hook.CloseProbe._mk_tls_stream_wrap(wrap, "ssl", "peer")
+
+    class Carrier:
+        wrap = wrapped
+
+    assert asyncio.run(Carrier.wrap()) is stream
+    assert counters.get("interceptors.close_hook.tls_stream_wrap") == 1, (
         "the refused read was not counted, so either it did not raise or it escaped the guard"
     )
 

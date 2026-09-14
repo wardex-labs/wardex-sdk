@@ -105,20 +105,20 @@ All notable changes to this project are documented here. The format follows
   span has no `server.port` attribute at all rather than `server.port=0`: to
   find these spans in a backend, filter on `peer_unresolved` in
   `wardex.limitations`, not on the port.
-  **Async TLS: asyncio reads the real peer; anyio does not yet.** Async TLS
-  runs on a memory-BIO `ssl.SSLObject`, which has no peer address of its own.
-  On asyncio TLS (aiohttp, `asyncio.open_connection(ssl=...)`) wardex now reads
-  the peer off the socket transport when the connection is made, so those
-  spans report the real port and the IP connected to in `server.address`,
-  exactly as sync clients (`httpx.Client`, `requests`) do; the URL keeps the
-  TLS server name as its host. They used to report port 443 and the server
-  name, which was a guess. anyio TLS (httpx `AsyncClient`, and so
-  `AsyncOpenAI` and `AsyncAnthropic`) builds its `SSLObject` outside asyncio's
-  TLS protocol, and uvloop TLS uses its own; both, and an asyncio TLS
-  connection opened before `wardex.init()`, still report port 0 (no
+  **Async TLS calls now report the real peer.** Async TLS runs on a memory-BIO
+  `ssl.SSLObject`, which has no peer address of its own, so wardex reads the
+  peer where the connection is set up: off the socket transport on asyncio TLS
+  (aiohttp, `asyncio.open_connection(ssl=...)`), and off anyio's TLS stream on
+  anyio TLS (httpx `AsyncClient`, and so `AsyncOpenAI` and `AsyncAnthropic`).
+  Those spans report the real port, and the IP connected to in
+  `server.address`, exactly as sync clients (`httpx.Client`, `requests`) do;
+  the URL keeps the TLS server name as its host. They used to report port 443
+  and the server name, which was a guess. What still reports port 0 (no
   `server.port` over OTLP), a URL like
   `https://api.openai.com:0/v1/chat/completions`, `peer_unresolved`, and one
-  count, with the TLS server name in `server.address`. A WebSocket session on
+  count, with the TLS server name in `server.address`: asyncio TLS under
+  uvloop, whose TLS protocol is its own (anyio over uvloop is read), and an
+  async TLS connection opened before `wardex.init()`. A WebSocket session on
   such a connection counts once per session,
   including one the capture mode refuses. The seam also stops calling
   `getpeername()` on every send.
