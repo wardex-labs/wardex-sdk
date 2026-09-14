@@ -72,6 +72,16 @@ else:
     NATIVE_OK = True
     NATIVE_ERROR = None
 
+#: The exception the core raises in place of a panic: `NativePanic`, a
+#: `RuntimeError` the FFI boundary substitutes for PyO3's `BaseException`-
+#: derived `PanicException` (`bindings/python/src/shield.rs`). `_diag.guard`
+#: reads it to count a converted panic under `ffi.panic_converted` on top of
+#: the site's own count. `None` only when the extension is absent. Read as an
+#: attribute and not through `getattr(..., None)`: a native module older than
+#: this file is a stale build, and `uv sync --reinstall-package wardex-sdk`
+#: is the fix -- a silent `None` would hide it behind a counter that never moves.
+NATIVE_PANIC: type[BaseException] | None = native.NativePanic if NATIVE_OK else None
+
 
 def unavailable_reason() -> str:
     """One line naming why the core is absent, for a message aimed at a human.

@@ -1,13 +1,21 @@
 //! PyO3 entry point for the `_wardex_native` extension module.
 
+// In the trampoline code generated when the pyo3 #[pyfunction] macro wraps a function
+// returning `PyResult<T>`, clippy mistakes the `?`'s `From<PyErr> for PyErr` (identity)
+// conversion for a useless conversion
+// (a pre-existing pyo3 0.22 issue; a function-level #[allow] can't cover macro-generated sibling items).
+#![allow(clippy::useless_conversion)]
+
 mod codec;
 mod limits;
+mod shield;
 
 use limits::PyLimits;
 use pyo3::prelude::*;
 use pyo3::pybacked::{PyBackedBytes, PyBackedStr};
 use pyo3::types::PyBytes;
 use pyo3::wrap_pyfunction;
+use shield::shielded;
 use wardex_core::protocol::claude_stream_json as ccs;
 use wardex_core::protocol::grpc::{
     grpc_status_name as core_grpc_status_name, parse_grpc_frames as core_parse_grpc_frames,
@@ -137,21 +145,29 @@ struct Http2Parser {
 impl Http2Parser {
     #[new]
     #[pyo3(signature = (limits=None))]
-    fn new(limits: Option<PyLimits>) -> Self {
-        let l = limits.map(|p| p.inner).unwrap_or_default();
-        Self {
-            inner: Http2Connection::new(l),
-        }
+    fn new(limits: Option<PyLimits>) -> PyResult<Self> {
+        shielded(|| {
+            let l = limits.map(|p| p.inner).unwrap_or_default();
+            Ok(Self {
+                inner: Http2Connection::new(l),
+            })
+        })
     }
 
-    fn feed(&mut self, from_client: bool, data: &[u8]) -> (Vec<u32>, Vec<Http2Transaction>) {
-        let r = self.inner.feed(from_client, data);
-        let txns = r
-            .transactions
-            .into_iter()
-            .map(|inner| Http2Transaction { inner })
-            .collect();
-        (r.opened_request_streams, txns)
+    fn feed(
+        &mut self,
+        from_client: bool,
+        data: &[u8],
+    ) -> PyResult<(Vec<u32>, Vec<Http2Transaction>)> {
+        shielded(|| {
+            let r = self.inner.feed(from_client, data);
+            let txns = r
+                .transactions
+                .into_iter()
+                .map(|inner| Http2Transaction { inner })
+                .collect();
+            Ok((r.opened_request_streams, txns))
+        })
     }
 }
 
@@ -165,31 +181,39 @@ struct Http1Parser {
 impl Http1Parser {
     #[new]
     #[pyo3(signature = (is_request, limits=None))]
-    fn new(is_request: bool, limits: Option<PyLimits>) -> Self {
-        let l = limits.map(|p| p.inner).unwrap_or_default();
-        Self {
-            inner: Http1Stream::new(is_request, l),
-        }
+    fn new(is_request: bool, limits: Option<PyLimits>) -> PyResult<Self> {
+        shielded(|| {
+            let l = limits.map(|p| p.inner).unwrap_or_default();
+            Ok(Self {
+                inner: Http1Stream::new(is_request, l),
+            })
+        })
     }
 
-    fn feed(&mut self, data: &[u8]) -> Vec<RawHttpMessage> {
-        self.inner
-            .feed(data)
-            .into_iter()
-            .map(|inner| RawHttpMessage { inner })
-            .collect()
+    fn feed(&mut self, data: &[u8]) -> PyResult<Vec<RawHttpMessage>> {
+        shielded(|| {
+            Ok(self
+                .inner
+                .feed(data)
+                .into_iter()
+                .map(|inner| RawHttpMessage { inner })
+                .collect())
+        })
     }
 
-    fn flush_truncated(&mut self) -> Option<RawHttpMessage> {
-        self.inner
-            .flush_truncated()
-            .map(|inner| RawHttpMessage { inner })
+    fn flush_truncated(&mut self) -> PyResult<Option<RawHttpMessage>> {
+        shielded(|| {
+            Ok(self
+                .inner
+                .flush_truncated()
+                .map(|inner| RawHttpMessage { inner }))
+        })
     }
 
     /// Why the parser latched off, if it did. `None` while the stream is
     /// still parsing normally.
-    fn disabled_reason(&self) -> Option<&'static str> {
-        self.inner.disabled_reason()
+    fn disabled_reason(&self) -> PyResult<Option<&'static str>> {
+        shielded(|| Ok(self.inner.disabled_reason()))
     }
 }
 
@@ -467,30 +491,35 @@ struct JsonRpcParser {
 impl JsonRpcParser {
     #[new]
     #[pyo3(signature = (limits=None))]
-    fn new(limits: Option<PyLimits>) -> Self {
-        let l = limits.map(|p| p.inner).unwrap_or_default();
-        Self {
-            inner: JsonRpcStream::new(l),
-        }
+    fn new(limits: Option<PyLimits>) -> PyResult<Self> {
+        shielded(|| {
+            let l = limits.map(|p| p.inner).unwrap_or_default();
+            Ok(Self {
+                inner: JsonRpcStream::new(l),
+            })
+        })
     }
 
-    fn feed(&mut self, data: &[u8]) -> Vec<JsonRpcMessage> {
-        self.inner
-            .feed(data)
-            .into_iter()
-            .map(|inner| JsonRpcMessage { inner })
-            .collect()
+    fn feed(&mut self, data: &[u8]) -> PyResult<Vec<JsonRpcMessage>> {
+        shielded(|| {
+            Ok(self
+                .inner
+                .feed(data)
+                .into_iter()
+                .map(|inner| JsonRpcMessage { inner })
+                .collect())
+        })
     }
 
     /// Why the parser latched off, if it did. `None` while the stream is
     /// still parsing normally.
-    fn disabled_reason(&self) -> Option<&'static str> {
-        self.inner.disabled_reason()
+    fn disabled_reason(&self) -> PyResult<Option<&'static str>> {
+        shielded(|| Ok(self.inner.disabled_reason()))
     }
 
     /// Bytes currently held awaiting a newline.
-    fn buffered_len(&self) -> usize {
-        self.inner.buffered_len()
+    fn buffered_len(&self) -> PyResult<usize> {
+        shielded(|| Ok(self.inner.buffered_len()))
     }
 }
 
@@ -600,19 +629,23 @@ struct WsParser {
 impl WsParser {
     #[new]
     #[pyo3(signature = (limits=None))]
-    fn new(limits: Option<PyLimits>) -> Self {
-        let l = limits.map(|p| p.inner).unwrap_or_default();
-        Self {
-            inner: CoreWsParser::new(l),
-        }
+    fn new(limits: Option<PyLimits>) -> PyResult<Self> {
+        shielded(|| {
+            let l = limits.map(|p| p.inner).unwrap_or_default();
+            Ok(Self {
+                inner: CoreWsParser::new(l),
+            })
+        })
     }
-    fn feed(&mut self, data: &[u8]) -> WsFeedResult {
-        WsFeedResult {
-            inner: self.inner.feed(data),
-        }
+    fn feed(&mut self, data: &[u8]) -> PyResult<WsFeedResult> {
+        shielded(|| {
+            Ok(WsFeedResult {
+                inner: self.inner.feed(data),
+            })
+        })
     }
-    fn is_disabled(&self) -> bool {
-        self.inner.is_disabled()
+    fn is_disabled(&self) -> PyResult<bool> {
+        shielded(|| Ok(self.inner.is_disabled()))
     }
 }
 
@@ -753,28 +786,34 @@ impl ClaudeStreamEvent {
 
 /// Parse one stream-json line. Returns None for unknown/non-semantic lines.
 #[pyfunction]
-fn parse_claude_stream_line(data: &[u8], outbound: bool) -> Option<ClaudeStreamEvent> {
-    ccs::parse_stream_line(data, outbound).map(|inner| ClaudeStreamEvent { inner })
+fn parse_claude_stream_line(data: &[u8], outbound: bool) -> PyResult<Option<ClaudeStreamEvent>> {
+    shielded(|| Ok(ccs::parse_stream_line(data, outbound).map(|inner| ClaudeStreamEvent { inner })))
 }
 
 #[pyfunction]
-fn parse_grpc_frames(body: &[u8]) -> GrpcFrames {
-    GrpcFrames {
-        inner: core_parse_grpc_frames(body),
-    }
+fn parse_grpc_frames(body: &[u8]) -> PyResult<GrpcFrames> {
+    shielded(|| {
+        Ok(GrpcFrames {
+            inner: core_parse_grpc_frames(body),
+        })
+    })
 }
 
 #[pyfunction]
-fn grpc_status_name(code: i32) -> &'static str {
-    core_grpc_status_name(code)
+fn grpc_status_name(code: i32) -> PyResult<&'static str> {
+    shielded(|| Ok(core_grpc_status_name(code)))
 }
 
 /// The one finish-reason normalizer (total: unknown raw values pass through).
 /// Exported so the Agent SDK assembler spells a stop exactly the way the wire
 /// parsers do — one producer, one spelling per fact.
 #[pyfunction]
-fn normalize_finish_reason(provider: &str, raw: &str) -> String {
-    wardex_core::protocol::semantic::normalize_finish_reason(provider, raw)
+fn normalize_finish_reason(provider: &str, raw: &str) -> PyResult<String> {
+    shielded(|| {
+        Ok(wardex_core::protocol::semantic::normalize_finish_reason(
+            provider, raw,
+        ))
+    })
 }
 
 /// The one whole-body parse on the capture path, and the one native call that
@@ -800,36 +839,43 @@ fn parse_llm_semantics(
     req: PyBackedBytes,
     resp: PyBackedBytes,
     limits: Option<PyLimits>,
-) -> Option<LlmSemantics> {
-    let l = limits.map(|p| p.inner).unwrap_or_default();
-    let inner = py.allow_threads(move || parse_llm(&host, &path, &req, &resp, l));
-    inner.map(|inner| LlmSemantics { inner })
+) -> PyResult<Option<LlmSemantics>> {
+    shielded(|| {
+        let l = limits.map(|p| p.inner).unwrap_or_default();
+        let inner = py.allow_threads(move || parse_llm(&host, &path, &req, &resp, l));
+        Ok(inner.map(|inner| LlmSemantics { inner }))
+    })
 }
 
 /// "llm_call" | "provider_state" | "excluded" | None. Strings, not an enum
 /// class: three values, one consumer, and the seam only ever compares.
 #[pyfunction]
-fn classify_path(path: &str) -> Option<&'static str> {
-    treatment(path).map(|t| match t {
-        Treatment::LlmCall => "llm_call",
-        Treatment::ProviderState => "provider_state",
-        Treatment::Excluded => "excluded",
+fn classify_path(path: &str) -> PyResult<Option<&'static str>> {
+    shielded(|| {
+        Ok(treatment(path).map(|t| match t {
+            Treatment::LlmCall => "llm_call",
+            Treatment::ProviderState => "provider_state",
+            Treatment::Excluded => "excluded",
+        }))
     })
 }
 
 /// "known_provider" | "unknown_host" | None — the WS-transport question, see
 /// endpoint.rs.
 #[pyfunction]
-fn classify_ws_upgrade(host: &str, path: &str) -> Option<&'static str> {
-    ws_upgrade(host, path).map(|w| match w {
-        WsUpgrade::KnownProvider => "known_provider",
-        WsUpgrade::UnknownHost => "unknown_host",
+fn classify_ws_upgrade(host: &str, path: &str) -> PyResult<Option<&'static str>> {
+    shielded(|| {
+        Ok(ws_upgrade(host, path).map(|w| match w {
+            WsUpgrade::KnownProvider => "known_provider",
+            WsUpgrade::UnknownHost => "unknown_host",
+        }))
     })
 }
 
 #[pymodule]
 fn _wardex_native(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
+    shield::register(m)?;
     limits::register(m)?;
 
     let protocol = PyModule::new_bound(py, "protocol")?;

@@ -55,12 +55,44 @@ All notable changes to this project are documented here. The format follows
   smoke step only proves the wheel imports. That sentence is gone from
   `RELEASING.md`; what replaced it says what the gate covers and what it does
   not (a tag pushed by hand around `scripts/release.py`).
+- **The README's conversation-id sentence was overclaiming, and is narrowed.**
+  It said a host `conversation()` block wins over a framework's own id "so one
+  trace never has two conversation ids". The first half is true and tested;
+  the second is false: two `conversation()` blocks opened side by side under
+  one span are two conversations in one trace, by design, because the block
+  scopes the id and not the trace. The README and the `conversation()`
+  docstring now say exactly that. Two claims next to it gained the test they
+  lacked: `init()` and `close()` leave the OpenAI Agents tracing switch (the
+  manual one and its environment variable) exactly as they found it, in all
+  nine combinations; and a bare `wardex.init()` in a fresh process with the
+  real `openai-agents` distribution installs the adapter without being told
+  to, which is what "auto-detected" has to mean.
 - The openai-agents quickstart docs no longer describe a from-source
   install. `pip install "wardex-sdk>=0.6.0b1" openai-agents` is a prebuilt
   wheel, so the Rust toolchain prerequisite and the fallback for a checkout
   ahead of the last release are gone from `README.md` and
   `examples/README.md`; contributors working on a checkout use the
   development install in `CONTRIBUTING.md` instead.
+
+### Fixed
+
+- **A panic in the Rust core no longer reaches your `recv()`.** PyO3 converts
+  a panic into `PanicException`, which inherits from `BaseException`, so it
+  walked through every `except Exception` guard the SDK puts around its own
+  work and surfaced inside the host's socket read after the bytes were already
+  consumed. Every FFI entry point now runs inside a shield that converts a
+  panic into `NativePanic`, a `RuntimeError` the guards swallow and count
+  (under the site, and under `ffi.panic_converted`). The one known trigger is
+  fixed at its source as well: an HTTP/2 HEADERS frame whose HPACK block is a
+  dynamic-table size update with its integer cut off (`00 00 01 01 04 00 00
+  00 01 3f` as a server sends it) made the HPACK decoder unwrap, and the
+  parser now latches that connection off exactly as it does any other bad
+  block. `sdks/python/tests/test_ffi_panic.py` injects a panic through a
+  test-only hook and reads the binding sources to hold the rule; the
+  development build (`uv sync`) compiles that hook in, the release wheel does
+  not. What remains: the panic hook's one `thread '<unnamed>' panicked at`
+  line on stderr, which only a process-global hook could silence, and wardex
+  does not replace the host's.
 
 ## [0.6.0b1] - 2026-09-06
 

@@ -1,6 +1,15 @@
 [tool.uv.workspace]
 members = ["sdks/python"]
 
+[tool.uv]
+# `uv sync` compiles the extension with the `panic-injection` cargo feature,
+# which exposes `_panic_for_test()` for `sdks/python/tests/test_ffi_panic.py`
+# (`bindings/python/src/shield.rs`). Scoped to this package so no third-party
+# source build sees the argument. The release workflow builds with maturin
+# directly and never reads this table, so a shipped wheel has no function
+# whose purpose is to fail.
+config-settings-package = { wardex-sdk = { build-args = "--features panic-injection" } }
+
 # No dependency groups here on purpose: everything the suite imports lives in
 # the `test` group of `sdks/python/pyproject.toml`, next to the tests that
 # import it, so one `--group test` installs a complete test environment. A

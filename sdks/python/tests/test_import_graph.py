@@ -560,6 +560,11 @@ _ASSEMBLY_MAY_IMPORT = frozenset(
         # diagnostic channel enters it around every logger emission so a host
         # log handler that POSTs cannot have its traffic captured by the seams.
         f"{_PKG}._suppress",
+        # The one place the extension is imported, and the flag every module
+        # reads instead of importing it again. `_diag.guard` reads
+        # `NATIVE_PANIC` from it to count a converted Rust panic; the module
+        # itself imports nothing from the package, so it is a leaf.
+        f"{_PKG}._native",
     }
 )
 

@@ -250,9 +250,12 @@ def search(query: str): ...
 trace as a child, and an explicit `id=` is used verbatim — a multi-turn chat
 app passes its own session id so every turn joins one conversation. It also
 **wins over a framework's own conversation id**: an adapter run opened inside
-the block (an OpenAI Agents `RunConfig(group_id=…)`, say) keeps your id on
-every span and carries the framework's as a separate attribute
-(`wardex.openai_agents.group_id`), so one trace never has two conversation ids.
+the block (an OpenAI Agents `RunConfig(group_id=…)`, say) keeps your id as
+`gen_ai.conversation.id` on every span it opens and carries the framework's as
+a separate attribute (`wardex.openai_agents.group_id`) rather than as the
+conversation. Two `conversation()` blocks opened side by side under one span
+are two conversations in one trace, by design — the block scopes the id, not
+the trace.
 `workflow` / `agent` / `step` / `tool` map to the `gen_ai.operation.name`
 values `invoke_workflow` / `invoke_agent` / `execute_step` / `execute_tool`,
 so decorated spans appear on operation-keyed dashboards. `span()` and
@@ -558,7 +561,9 @@ Conversations-API-shaped path the mode did not capture),
 carried LLM calls wardex did not read) and
 `interceptors.seam.ws_llm_endpoint_unconfirmed` (Responses-path WebSocket
 connections wardex could not corroborate); table-eviction counters are under
-Resource limits.
+Resource limits. `ffi.panic_converted` counts a panic in the Rust core that
+the FFI boundary turned into `NativePanic` -- a `RuntimeError`, so the guard
+around the host's call swallowed it -- on top of the site's own count.
 
 ## Testing your instrumentation
 
@@ -925,7 +930,10 @@ by tests you can run against a clone, without taking our word for any of them:
 Two of those numbers are worth reading before you plan around them. The Rust
 core holds 172 `unwrap()`/`expect(` call sites, which may only fall; the FFI
 layer in `bindings/python/src` holds zero and may never hold one, because a
-panic there is the one that reaches your interpreter. Where a budget is higher
+panic there is the one that reaches your interpreter; and every entry point in
+that layer runs inside a shield that converts a panic beneath it into an
+ordinary `RuntimeError` before PyO3 can raise it as a `BaseException` no guard
+catches (`sdks/python/tests/test_ffi_panic.py`). Where a budget is higher
 than we would like, the number says so rather than the prose hiding it.
 
 ## Versioning

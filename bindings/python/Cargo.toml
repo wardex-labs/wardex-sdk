@@ -15,3 +15,15 @@ crate-type = ["cdylib"]
 pyo3               = { workspace = true }
 wardex-core        = { path = "../../crates/wardex-core" }
 wardex-limits      = { workspace = true }
+
+[lints.rust]
+# `pyo3::create_exception!` (used in `src/shield.rs`) expands to items gated on
+# pyo3's own `gil-refs` feature, which this crate does not declare; without
+# naming it here `-D warnings` fails on `unexpected_cfgs`.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("gil-refs"))'] }
+
+[features]
+# Test-only: exposes `_panic_for_test()` so the FFI panic conversion can be
+# exercised end to end. The development build turns it on; release wheels
+# never do (see `bindings/python/src/shield.rs`).
+panic-injection = []

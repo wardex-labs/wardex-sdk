@@ -124,6 +124,35 @@ def _init(**kwargs: Any) -> RecordingTransport:
     return t
 
 
+@pytest.mark.parametrize("manual", [None, True, False])
+@pytest.mark.parametrize("env", [None, "1", "false"])
+def test_init_and_close_leave_the_frameworks_tracing_switch_where_they_found_it(
+    agents_env, tracing_enabled, monkeypatch, manual, env
+):
+    """README: "wardex never flips that setting for you". The framework's
+    switch has two halves -- the manual one (`set_tracing_disabled`) and the
+    environment variable it falls back to -- and install and uninstall READ
+    both and WRITE neither. Nine combinations, so the sentence holds for the
+    host that set nothing, the one that disabled tracing on purpose, and the
+    one that re-enabled it the way wardex's own notice suggests."""
+    provider = get_trace_provider()
+    if env is None:
+        monkeypatch.delenv("OPENAI_AGENTS_DISABLE_TRACING", raising=False)
+    else:
+        monkeypatch.setenv("OPENAI_AGENTS_DISABLE_TRACING", env)
+    provider._manual_disabled = manual
+    provider._refresh_disabled_flag()
+
+    _init()
+    try:
+        assert provider._manual_disabled is manual
+        assert os.environ.get("OPENAI_AGENTS_DISABLE_TRACING") == env
+    finally:
+        wardex.close()
+    assert provider._manual_disabled is manual
+    assert os.environ.get("OPENAI_AGENTS_DISABLE_TRACING") == env
+
+
 def _spans() -> list[Any]:
     client = _hub.get_client()
     client._settle()
