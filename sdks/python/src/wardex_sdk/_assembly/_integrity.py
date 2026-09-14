@@ -687,8 +687,8 @@ Two emit sites, and the first is the mechanism the second restates.
     the TLS server name, else ``unknown``. The call is still captured; before
     this member the fallback said port 443 and nothing said it was invented.
 
-    Emitted from ``_interceptors/_seam.py`` (``_seal``, ``_build_ws_span``) on
-    port 0, counted as ``interceptors.seam.peer_unresolved``; the placeholder
+    Emitted from ``_interceptors/_seam.py::ByteSeamInterceptor._seal``/``._build_ws_span``
+    on port 0, counted as ``interceptors.seam.peer_unresolved``; the placeholder
     is ``_interceptors/_peer.py::peer_address``'s. Names NO knob; not
     ``CONNECT_TIMING_UNAVAILABLE``, a missing duration on a named peer.
     """

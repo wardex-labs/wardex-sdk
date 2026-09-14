@@ -558,7 +558,7 @@ section's neighbours mention `interceptors.seam.path_excluded` (telemetry
 uploads skipped), `interceptors.seam.provider_state_dropped` (requests on a
 Conversations-API-shaped path the mode did not capture),
 `interceptors.seam.ws_llm_semantics_unread` (WebSocket connections that
-carried LLM calls wardex did not read) and
+carried LLM calls wardex did not read),
 `interceptors.seam.ws_llm_endpoint_unconfirmed` (Responses-path WebSocket
 connections wardex could not corroborate) and
 `interceptors.seam.peer_unresolved` (requests on a connection whose peer
