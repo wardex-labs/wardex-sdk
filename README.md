@@ -921,7 +921,12 @@ changed nothing, nothing is marked. For an adapter reopening a span, that is a
 live scope that is the identifier's own unit or anything below it. For a span
 the registry resolves, it is an ambient span in the same trace that is not
 above that unit (the unit itself, anything below it, or anything beside it):
-the identifier, still held, would have given that same parent at 1.0.
+the identifier, still held, would have given that same parent at 1.0. (One
+case is marked although the parent is the same: with no ambient span, an
+identifier that named the only live session itself gets that session at 0.5,
+where it gave 0.9.) An identifier some other unit binds again is no longer
+counted as dropped, just as a larger table would have handed it over; only the
+span an adapter reopens under it keeps the record standing.
 Each marked span also counts `assembly._units.alias_forgotten_consumed`. If you
 see the marker, raise `max_entries_per_unit`. The behaviour is pinned by
 `sdks/python/tests/test_units.py::test_a_forgotten_alias_marks_the_next_edge_instead_of_flattening_silently`.
