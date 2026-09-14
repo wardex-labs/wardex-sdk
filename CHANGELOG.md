@@ -44,6 +44,18 @@ All notable changes to this project are documented here. The format follows
 
 ### Changed
 
+- **The README's conversation-id sentence was overclaiming, and is narrowed.**
+  It said a host `conversation()` block wins over a framework's own id "so one
+  trace never has two conversation ids". The first half is true and tested;
+  the second is false: two `conversation()` blocks opened side by side under
+  one span are two conversations in one trace, by design, because the block
+  scopes the id and not the trace. The README and the `conversation()`
+  docstring now say exactly that. Two claims next to it gained the test they
+  lacked: `init()` and `close()` leave the OpenAI Agents tracing switch (the
+  manual one and its environment variable) exactly as they found it, in all
+  nine combinations; and a bare `wardex.init()` in a fresh process with the
+  real `openai-agents` distribution installs the adapter without being told
+  to, which is what "auto-detected" has to mean.
 - The openai-agents quickstart docs no longer describe a from-source
   install. `pip install "wardex-sdk>=0.6.0b1" openai-agents` is a prebuilt
   wheel, so the Rust toolchain prerequisite and the fallback for a checkout
