@@ -320,6 +320,9 @@ def test_the_asyncio_tls_protocol_still_has_the_shape_the_probe_reads():
 
     assert hasattr(sslproto, "SSLProtocol")
     assert hasattr(sslproto.SSLProtocol, "connection_lost")
+    # The peer read rides the same class: without `connection_made` every
+    # asyncio TLS span goes back to port 0 and `PEER_UNRESOLVED`.
+    assert hasattr(sslproto.SSLProtocol, "connection_made")
     # One of the two spellings `_sslobj_of` reads must be assigned by the
     # constructor: `_sslobj` since the 3.11 rewrite, `_sslpipe` before it. Read
     # off `__init__`'s names and nothing else — `SSLProtocol` declares no
@@ -353,12 +356,15 @@ def test_installing_and_uninstalling_leaves_the_asyncio_protocol_untouched():
     # somebody else's `init()` without a `close()`.
     assert _close_hook._refcount == 0, "the shared close hook was left installed by an earlier test"
     orig = sslproto.SSLProtocol.connection_lost
+    orig_made = sslproto.SSLProtocol.connection_made
     install_shared_close_hook()
     try:
         assert sslproto.SSLProtocol.connection_lost is not orig
+        assert sslproto.SSLProtocol.connection_made is not orig_made
     finally:
         uninstall_shared_close_hook()
     assert sslproto.SSLProtocol.connection_lost is orig
+    assert sslproto.SSLProtocol.connection_made is orig_made
 
 
 def test_a_protocol_that_refuses_the_private_read_still_reaches_asyncios_own_handler():
@@ -390,6 +396,65 @@ def test_a_protocol_that_refuses_the_private_read_still_reaches_asyncios_own_han
     assert counters.get("interceptors.close_hook.connection_lost") == 1, (
         "the refused read was not counted, so either it did not raise or it escaped the guard"
     )
+
+
+def test_a_protocol_that_refuses_the_peer_read_still_makes_its_connection():
+    """The peer read after `connection_made` is somebody else's private
+    attributes, read on a class third parties subclass. A raise there must not
+    leave `connection_made`: the event loop would fail the host's
+    `open_connection` over a span attribute. The original's result comes back,
+    and the refusal is counted rather than hidden.
+    """
+    ran = []
+
+    class Hostile:
+        """`_sslobj` shadowed by a property that raises past `getattr`'s default."""
+
+        @property
+        def _sslobj(self):  # noqa: ANN202
+            raise RuntimeError("this protocol does not answer that")
+
+    wrapped = _close_hook.CloseProbe._mk_connection_made(
+        lambda this, transport: ran.append(transport) or "made"
+    )
+
+    assert wrapped(Hostile(), "transport") == "made"
+    assert ran == ["transport"]
+    assert counters.get("interceptors.close_hook.connection_made") == 1, (
+        "the refused read was not counted, so either it did not raise or it escaped the guard"
+    )
+
+
+def test_a_transport_without_an_inet_peer_leaves_the_ssl_object_unstamped():
+    """A unix-socket transport's `peername` is a path, and a transport may name
+    no peer at all. Both are answers, not failures: the object stays unstamped
+    so its spans keep port 0 and the marker, and nothing is counted as a
+    swallowed error."""
+    from wardex_sdk._interceptors._peer import TRANSPORT_PEER
+
+    class Obj:
+        pass
+
+    class Protocol:
+        def __init__(self) -> None:
+            self._sslobj = Obj()
+
+    class Transport:
+        def __init__(self, peer: object) -> None:
+            self.peer = peer
+
+        def get_extra_info(self, name: str) -> object:
+            return self.peer if name == "peername" else None
+
+    wrapped = _close_hook.CloseProbe._mk_connection_made(lambda this, transport: None)
+    for transport in (Transport("/run/model.sock"), Transport(None), object()):
+        proto = Protocol()
+        wrapped(proto, transport)
+        assert not hasattr(proto._sslobj, TRANSPORT_PEER)
+    proto = Protocol()
+    wrapped(proto, Transport(("10.0.0.7", 8443)))
+    assert getattr(proto._sslobj, TRANSPORT_PEER) == ("10.0.0.7", 8443)
+    assert counters.get("interceptors.close_hook.connection_made") == 0
 
 
 def test_a_pooled_ssl_object_is_retired_when_its_transport_ends(tls_server):

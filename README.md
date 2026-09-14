@@ -562,9 +562,12 @@ carried LLM calls wardex did not read),
 `interceptors.seam.ws_llm_endpoint_unconfirmed` (Responses-path WebSocket
 connections wardex could not corroborate) and
 `interceptors.seam.peer_unresolved` (requests on a connection whose peer
-address wardex could not read: a unix socket, and every asyncio/anyio TLS
-call, such as httpx `AsyncClient` or `AsyncOpenAI`, because a memory-BIO
-`SSLObject` has no peer address; the in-process span says port `0`, the URL
+address wardex could not read: a unix socket, and an async TLS call whose
+memory-BIO `SSLObject` no transport peer was read for -- anyio TLS such as
+httpx `AsyncClient` or `AsyncOpenAI`, uvloop TLS, or an asyncio TLS
+connection opened before `wardex.init()`; asyncio TLS such as aiohttp reads
+the peer off the socket transport and is not counted. The in-process span
+says port `0`, the URL
 renders `:0`, OTLP export omits `server.port` because 0 is proto3 "unset", and
 `peer_unresolved` in `wardex.limitations` is the marker to filter on);
 table-eviction counters are under

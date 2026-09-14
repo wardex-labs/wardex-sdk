@@ -398,21 +398,21 @@ def test_disabled_reason_not_logged_without_debug(capsys):
 
 
 @pytest.mark.asyncio
-async def test_async_https_reports_port_zero_because_an_sslobject_has_no_peer(
+async def test_anyio_tls_reports_port_zero_because_nothing_read_its_peer(
     tls_server, fresh_counters
 ):
-    """The widest reach of the unresolved-peer rule, pinned so it cannot pass
-    for a unix-socket-only change.
+    """The async TLS path that still has no peer, pinned next to a sync call
+    to the same server that does.
 
-    Asyncio and anyio TLS (httpx's `AsyncClient`, and so the async OpenAI and
-    Anthropic clients; aiohttp) encrypt through a memory-BIO `ssl.SSLObject`.
-    It has a `server_hostname` but no `getpeername()`, so the seam cannot read
-    the port the connection went to. It used to report 443 there, which was a
-    guess that happened to be right for most public APIs and wrong for any TLS
-    server on another port — this one included. Every such call now reports
-    port 0, the `PEER_UNRESOLVED` marker and one count, exactly as a unix
-    socket does. The sync client below it rides an `SSLSocket`, which does
-    have a peer, so the same server yields its real port and no marker.
+    httpx's `AsyncClient` (and so the async OpenAI and Anthropic clients)
+    encrypts through anyio's `TLSStream`, which builds a memory-BIO
+    `ssl.SSLObject` over a byte stream of its own and never passes through
+    `asyncio.sslproto.SSLProtocol` — so the transport read that gives asyncio
+    TLS its peer never runs. The object has a `server_hostname` but no
+    `getpeername()`. It used to report 443, a guess wrong for any TLS server
+    on another port, this one included; it reports port 0, the
+    `PEER_UNRESOLVED` marker and one count. The sync client rides an
+    `SSLSocket`, which does have a peer, so it yields the real port.
     """
     from wardex_sdk._assembly import counters
 
@@ -431,4 +431,90 @@ async def test_async_https_reports_port_zero_because_an_sslobject_has_no_peer(
     assert Limitation.PEER_UNRESOLVED in async_span.capture_integrity.limitations
     assert sync_span.server_port == port
     assert Limitation.PEER_UNRESOLVED not in sync_span.capture_integrity.limitations
+    assert counters.get("interceptors.seam.peer_unresolved") == 1
+
+
+async def _asyncio_tls_post(tls_server: str, *, writer_ready=None) -> bytes:
+    """One `POST /v1/messages` over `asyncio.open_connection(ssl=...)`.
+
+    Connected to the IP and verified against `localhost`, a name the fixture's
+    certificate also carries, so the TLS server name and the peer address are
+    different strings and an assertion on `server_address` can tell a read
+    peer from the server-name placeholder. `writer_ready`, when given, is
+    awaited between the handshake and the first request byte.
+    """
+    from urllib.parse import urlsplit
+
+    parts = urlsplit(tls_server)
+    reader, writer = await asyncio.open_connection(
+        parts.hostname, parts.port, ssl=_verify_ctx(), server_hostname="localhost"
+    )
+    if writer_ready is not None:
+        await writer_ready()
+    body = b'{"model": "y"}'
+    writer.write(
+        b"POST /v1/messages HTTP/1.1\r\nHost: localhost\r\n"
+        b"Content-Type: application/json\r\nConnection: close\r\n"
+        b"Content-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body
+    )
+    await writer.drain()
+    # To EOF: application data left in the incoming BIO makes the TLS shutdown
+    # below raise inside asyncio, for a reason unrelated to the peer.
+    response = await reader.read()
+    writer.close()
+    await writer.wait_closed()
+    return response
+
+
+@pytest.mark.asyncio
+async def test_asyncio_tls_reads_the_peer_off_the_transport(tls_server, fresh_counters):
+    """A memory-BIO `SSLObject` has no `getpeername()`, but the connection it
+    rides does have a peer, and asyncio holds it.
+
+    `asyncio.sslproto.SSLProtocol.connection_made` is handed the raw socket
+    transport, whose `peername` extra is the socket's own `getpeername()`, at
+    a moment the protocol already owns the `SSLObject`. Read there, the async
+    span reports what the sync path reports for the same server: the IP it
+    connected to and its real port, with no `PEER_UNRESOLVED` and no count.
+    Before, this span said port 0 and carried the marker, which put the marker
+    on every aiohttp call and made it useless for finding a real unread peer.
+    """
+    from wardex_sdk._assembly import counters
+
+    port = int(tls_server.rsplit(":", 1)[1])
+    wardex.init(intercept=True, capture_mode=CaptureMode.ALL)
+    assert b"200" in await _asyncio_tls_post(tls_server)
+
+    spans = [s for s in _captured_spans() if s.kind == SpanKind.CLIENT]
+    assert len(spans) == 1
+    (span,) = spans
+    assert span.server_port == port
+    assert span.server_address == "127.0.0.1"
+    assert span.transport.http.url == f"https://localhost:{port}/v1/messages"
+    assert Limitation.PEER_UNRESOLVED not in span.capture_integrity.limitations
+    assert counters.get("interceptors.seam.peer_unresolved") == 0
+
+
+@pytest.mark.asyncio
+async def test_an_asyncio_tls_connection_made_before_init_stays_unread(tls_server, fresh_counters):
+    """The transport's peer is read when the connection is MADE, so a
+    connection whose handshake finished before `wardex.init()` — one a pool
+    opened at startup, say — was never seen at that moment and carries no
+    peer. Its later requests are still captured and still say so: port 0, the
+    server name as the host, `PEER_UNRESOLVED`, one count. A peer is not
+    guessed for it from anything read later.
+    """
+    from wardex_sdk._assembly import counters
+
+    async def init_after_the_handshake() -> None:
+        wardex.init(intercept=True, capture_mode=CaptureMode.ALL)
+
+    assert b"200" in await _asyncio_tls_post(tls_server, writer_ready=init_after_the_handshake)
+
+    spans = [s for s in _captured_spans() if s.kind == SpanKind.CLIENT]
+    assert len(spans) == 1
+    (span,) = spans
+    assert span.server_port == 0
+    assert span.server_address == "localhost"
+    assert Limitation.PEER_UNRESOLVED in span.capture_integrity.limitations
     assert counters.get("interceptors.seam.peer_unresolved") == 1

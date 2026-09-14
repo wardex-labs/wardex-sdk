@@ -83,6 +83,7 @@ from collections.abc import Callable
 from typing import Any
 
 from .._assembly import PatchSet, guard
+from ._peer import stamp_transport_peer
 
 __all__ = [
     "CloseProbe",
@@ -111,6 +112,12 @@ _IMPORT_SSLPROTO = guard("interceptors.close_hook.sslproto_import")
 #: a `__getattr__` or a property of its own, so the read is somebody else's code
 #: and is treated as such.
 _CONNECTION_LOST = guard("interceptors.close_hook.connection_lost")
+#: The `SSLProtocol.connection_made` wrapper's peer read. It runs AFTER the
+#: original, so a raise here could not stop the handshake asyncio has already
+#: started — but it would propagate out of `connection_made` into the event
+#: loop's connection setup, and the host's `open_connection` would fail over a
+#: span attribute. Same private attributes, same subclassing risk, same guard.
+_CONNECTION_MADE = guard("interceptors.close_hook.connection_made")
 
 
 class _Entry:
@@ -344,7 +351,7 @@ def _sslobj_of(protocol: Any) -> Any:
 class CloseProbe:
     """Turns the end of a connection into a registry event. Idempotent, fail-silent.
 
-    THREE patches. Two of them are on `socket.socket`, because `close()` is not
+    FOUR patches. Two of them are on `socket.socket`, because `close()` is not
     reliably the end of anything:
 
         def close(self):
@@ -389,6 +396,21 @@ class CloseProbe:
     `_SSLPipe` that holds it on the way out. Two attribute paths for the same
     thing: `SSLProtocol._sslobj` since the 3.11 rewrite, and the pipe's
     `ssl_object` before it.
+
+    `SSLProtocol.connection_made` is the FOURTH, and it is not an end: it is
+    the other moment the same protocol holds the `SSLObject` and its transport
+    at once, and the only one at which the transport it is handed is the raw
+    socket transport whose `peername` is the TCP peer. The object has no
+    `getpeername()`, so without this the seam reported every asyncio TLS call
+    as an unread peer (see `_peer.py`). It lives here rather than in a probe of
+    its own because it is the same private class, read through the same two
+    spellings, and must come out with the same `restore_all()`. It reads AFTER
+    the original, which is what gives the object time to exist: 3.11+ builds
+    it in `__init__`, but 3.10 builds it inside `connection_made`, in the
+    pipe's `do_handshake`. Nothing reads the stamp before the first application
+    byte, and no application byte crosses the object before that call returns.
+    Absent under uvloop, whose TLS protocol is its own class, and on a
+    connection made before `install()`: both stay unread.
     """
 
     __slots__ = ("_installed", "_patches", "_registry")
@@ -412,6 +434,9 @@ class CloseProbe:
         lost = getattr(proto, "connection_lost", None)
         if lost is not None:
             self._patches.patch(proto, "connection_lost", self._mk_connection_lost(lost))
+        made = getattr(proto, "connection_made", None)
+        if made is not None:
+            self._patches.patch(proto, "connection_made", self._mk_connection_made(made))
         self._installed = True
 
     def uninstall(self) -> None:
@@ -464,6 +489,18 @@ class CloseProbe:
                 if sslobj is not None:
                     registry.fire(sslobj)
             return orig(this, *a, **k)
+
+        return wrapper
+
+    @staticmethod
+    def _mk_connection_made(orig: Any):  # noqa: ANN205
+        def wrapper(this: Any, transport: Any, *a: Any, **k: Any) -> Any:
+            ret = orig(this, transport, *a, **k)
+            # After the original, and only if it returned: a protocol whose
+            # setup raised has nothing worth a peer. See `_CONNECTION_MADE`.
+            with _CONNECTION_MADE:
+                stamp_transport_peer(_sslobj_of(this), transport)
+            return ret
 
         return wrapper
 

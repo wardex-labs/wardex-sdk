@@ -681,11 +681,11 @@ Two emit sites, and the first is the mechanism the second restates.
 
     PEER_UNRESOLVED = "peer_unresolved"
     """``server.address``/``server.port`` and the URL's host and port are a
-    placeholder, not an address read off the connection: ``getpeername()`` gave
-    no INET ``(host, port)`` — a unix socket answers with a path, a memory-BIO
-    ``SSLObject`` has no ``getpeername`` — so the port is ``0`` and the host is
-    the TLS server name, else ``unknown``. The call is still captured; before
-    this member the fallback said port 443 and nothing said it was invented.
+    placeholder: no INET ``(host, port)`` was read — a unix socket's peer is a
+    path; a memory-BIO ``SSLObject`` (anyio, uvloop, or made before install)
+    has no ``getpeername`` and no transport peer stamped by asyncio — so the
+    port is ``0`` and the host the TLS server name, else ``unknown``. Still
+    captured; the old fallback said port 443 and nothing said it was invented.
 
     Emitted from ``_interceptors/_seam.py::ByteSeamInterceptor._seal``/``._build_ws_span``
     on port 0, counted as ``interceptors.seam.peer_unresolved``; the placeholder
