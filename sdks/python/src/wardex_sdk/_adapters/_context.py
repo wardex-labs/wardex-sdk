@@ -865,6 +865,7 @@ class AdapterContext:
             start_ns=start_ns,
             owner=self.name,
             conversation=conversation,
+            carries_loss=bool(lost),  # opened ON the loss: binding the id must not erase its record
         )
         if lost:
             unit.note(Limitation.ALIAS_FORGOTTEN)
@@ -1198,13 +1199,12 @@ class AdapterContext:
     ) -> Iterator[Scope]:
         """`enter()`, but under the unit an identifier selects — if it resolves.
 
-        The ONE method where an identifier influences the shape of the tree, and
-        a separate name so that one grep is the complete list. A hit is clamped
-        to `UNIT_ALIAS` at 0.9: no argument raises it, because the identifier was
-        the framework's word and not a scope wardex read. A miss falls through to
-        the ordinary table for the declared placement rather than quietly picking
-        a plausible root; if the registry's alias bound DROPPED the id, capped at
-        0.9 and noted `ALIAS_FORGOTTEN`, so a lost lookup never reads as a better edge.
+        The ONE method where an identifier influences the shape of the tree, and a separate name so
+        that one grep is the complete list. A hit is clamped to `UNIT_ALIAS` at 0.9: no argument
+        raises it, because the identifier was the framework's word and not a scope wardex read. A
+        miss falls through to the ordinary table for the declared placement rather than quietly
+        picking a plausible root; if the registry's alias bound DROPPED the id, capped at 0.9 and
+        noted `ALIAS_FORGOTTEN`, so a lost lookup never reads as a better edge.
 
         A lookup that BROKE is neither of those. It is its own step with its own
         guard, and what it may do to the edge is bounded in one direction: see

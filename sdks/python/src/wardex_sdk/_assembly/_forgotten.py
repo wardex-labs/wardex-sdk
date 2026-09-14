@@ -82,8 +82,14 @@ def _lost_nothing(owner: Unit, amb: Ambient | None, holder: Unit | None) -> bool
     """Would the id, still bound to `owner`, have given this same edge anyway?
 
     The measure is the edge the id gave while it resolved, so the record can
-    never make an edge worse than keeping the id would have — nor mark one the
-    loss did not touch. Two ways the answer is yes:
+    never make an edge worse than keeping the id would have, and it leaves
+    unmarked the edges that stay byte-identical. It is a structural test, not a
+    full comparison, so it does not catch every edge the loss left alone: with
+    no ambient span and `owner` itself the only live session, the sole-session
+    rung reaches the same parent the id gave, at 0.5 and marked where the id
+    gave 0.9 unmarked. The parent is unchanged there; the source and the
+    number are the lower rung's, and the marker says why that rung was used.
+    Two ways the answer is yes:
 
     - `rejoin`: the live unit `holder` IS `owner` or sits below it. The placement
       edge lands inside the unit the id named, read off the carrier; the id
@@ -118,15 +124,12 @@ class ForgottenAliases:
     of its own, so it adds no lock to the ordering the registry already keeps.
     """
 
-    __slots__ = ("_bound", "_by_key", "_by_unit", "_reported")
+    __slots__ = ("_bound", "_by_key", "_by_unit")
 
     def __init__(self, bound: int) -> None:
         self._bound = bound
         self._by_key: dict[UnitKey, Unit] = {}
         self._by_unit: dict[Unit, list[UnitKey]] = {}
-        #: Recorded keys `recall` has already answered yes for. A subset of
-        #: `_by_key`'s keys, so bounded by it; see `rebound` for its one reader.
-        self._reported: set[UnitKey] = set()
 
     def forget(self, key: UnitKey, unit: Unit) -> None:
         """Record that the bound dropped `key` while `unit` still owned it."""
@@ -135,11 +138,9 @@ class ForgottenAliases:
             oldest = ring.pop(0)
             if self._by_key.get(oldest) is unit:
                 del self._by_key[oldest]
-                self._reported.discard(oldest)
             counters.bump("assembly._units.alias_forgotten_table_full")
         ring.append(key)
         self._by_key[key] = unit
-        self._reported.discard(key)  # a fresh loss, not yet told to anyone
 
     def recall(
         self, key: UnitKey, *, amb: Ambient | None = None, holder: Unit | None = None
@@ -162,30 +163,33 @@ class ForgottenAliases:
         if owner is None or _lost_nothing(owner, amb, holder):
             return None
         counters.bump("assembly._units.alias_forgotten_consumed")
-        self._reported.add(key)
         return owner
 
-    def rebound(self, key: UnitKey, unit: Unit) -> None:
+    def rebound(self, key: UnitKey, unit: Unit, *, carries_loss: bool = False) -> None:
         """`unit` binds `key`, so it resolves again: is the record now stale?
 
-        Usually yes. Kept, it would mark a good alias edge the next time the key
-        missed for an unrelated reason. One O(1) pop on the common path, which is
+        Yes, unless the caller says the binding is built ON the loss. Kept, the
+        record would mark a good edge the next time the key missed for an
+        unrelated reason: a unit that rebinds the id takes it off the unit that
+        lost it, which an unbounded table would do too, so once that unit closes
+        the miss is an honest one. One O(1) pop on the common path, which is
         `UnitRegistry.open()`'s.
 
-        Not when the loss was already REPORTED and the binder is not the unit
-        that lost the id. That binder was built on the loss: `AdapterContext.rejoin`
-        opens its unit under the very id `recall` just said was dropped. The unit
+        `carries_loss` is the one exception, and it is stated by the caller
+        rather than inferred here: `AdapterContext._open` passes it for the unit
+        `rejoin` opens under the very id `recall` just said was dropped. The unit
         the id named is still live, so once the rejoined unit closes, the next
-        lookup of the id is the same loss again, and erasing the record here
-        would let it ship as an honest miss at 1.0. Nothing is lost while the
-        binder holds the key either: `find()` hits, and `recall` is only asked
-        after a miss.
+        lookup of the id is the same loss again, and erasing the record would
+        let it ship as an honest miss at 1.0. Nothing is lost while that unit
+        holds the key either: `find()` hits, and `recall` is only asked after a
+        miss. Inferring it instead (say, from whether a lookup had already
+        reported the loss) would make the same final registry ship marked or
+        unmarked depending on whether someone happened to look in between.
         """
         owner = self._by_key.get(key)
-        if owner is None or (owner is not unit and key in self._reported):
+        if owner is None or (carries_loss and owner is not unit):
             return
         del self._by_key[key]
-        self._reported.discard(key)
         ring = self._by_unit.get(owner)
         if ring is not None and key in ring:
             ring.remove(key)
@@ -195,10 +199,8 @@ class ForgottenAliases:
         for key in self._by_unit.pop(unit, ()):
             if self._by_key.get(key) is unit:
                 del self._by_key[key]
-                self._reported.discard(key)
 
     def _at_fork_reinit(self) -> None:
         """Fork-child reset: the parent's units are not the child's to mark."""
         self._by_key.clear()
         self._by_unit.clear()
-        self._reported.clear()

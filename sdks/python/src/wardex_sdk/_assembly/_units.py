@@ -46,12 +46,11 @@ discarded rather than emitted (`claim_superseded`), because the bound is a
 reason to stop tracking a draft and never a reason to promote one the
 arbitration rejected.
 
-The other two hold no span, so their evictions emit NOTHING when they happen,
-and what reaches the data is the CONSEQUENCE. An evicted claim key lets a
-lower-ranked observer win the arbitration again: two spans for one call. A
-dropped alias's would read backwards (a sub-agent hung off its session at 1.0,
-up from 0.9), so `_forgotten.py` remembers the dropped ids, and an edge the
-loss actually changed carries `ALIAS_FORGOTTEN` at no more than 0.9.
+The other two hold no span, so their evictions emit NOTHING when they happen, and what reaches
+the data is the CONSEQUENCE. An evicted claim key lets a lower-ranked observer win the arbitration
+again: two spans for one call. A dropped alias's would read backwards (a sub-agent hung off its
+session at 1.0, up from 0.9), so `_forgotten.py` remembers the dropped ids, and an edge the loss
+actually changed carries `ALIAS_FORGOTTEN` at no more than 0.9.
 
 Every per-unit eviction counts (`child_table_full`, `open_span_table_full`,
 `alias_table_full`, `claim_table_full`); the root evictions do not, because the
@@ -1039,6 +1038,7 @@ class UnitRegistry:
         start_ns: int | None = None,
         owner: str | None = None,
         conversation: ConversationContext | None = None,
+        carries_loss: bool = False,  # `rejoin`'s unit, opened ON a dropped id: see `_forgotten.py`
     ) -> Unit:
         """Open a unit and the span it owns.
 
@@ -1174,7 +1174,7 @@ class UnitRegistry:
             # phantom, once per call. Guarded here the fault costs the ALIAS —
             # `find(key)` misses — and the span still ships.
             with guard("assembly._units.open_bind", debug=self._debug):
-                self._bind_alias_locked(key, unit)
+                self._bind_alias_locked(key, unit, carries_loss=carries_loss)
                 for extra in aliases:
                     self._bind_alias_locked(extra, unit)
         self._flush(pending)
@@ -1223,9 +1223,9 @@ class UnitRegistry:
         """Resolve a framework id to a live unit, or None.
 
         Returns `Unit | None` and nothing else. That is the mechanical half of
-        I2: a miss sends the caller down the ladder, and `forgotten_owner`
-        tells apart a miss on an id the alias bound DROPPED, so "silently re-parent
-        a lost id into the ambient scope, like a real attachment" is inexpressible.
+        I2: a miss sends the caller down the ladder, and `forgotten_owner` tells apart a miss on
+        an id the alias bound DROPPED, so "silently re-parent a lost id into the ambient scope,
+        like a real attachment" is inexpressible.
         """
         with self._lock:
             unit = self._by_alias.get(alias)
@@ -1975,11 +1975,11 @@ class UnitRegistry:
 
     # -- plumbing --------------------------------------------------------
 
-    def _bind_alias_locked(self, key: UnitKey, unit: Unit) -> None:
+    def _bind_alias_locked(self, key: UnitKey, unit: Unit, *, carries_loss: bool = False) -> None:
         existing = self._by_alias.get(key)
         if existing is not None and existing is not unit:
             counters.bump("assembly._units.alias_rebound")
-        self._forgotten.rebound(key, unit)
+        self._forgotten.rebound(key, unit, carries_loss=carries_loss)
         if key not in unit._alias_keys:
             evicted = unit._evict_alias()
             if evicted is not None and self._by_alias.get(evicted) is unit:

@@ -684,9 +684,10 @@ _EMITTED_MEMBERS: frozenset[str] = frozenset(
         "PEER_UNRESOLVED",
         # The twenty-second: the alias bound's forgotten-id marker, minted WITH its
         # two emitters (the registry's forgotten-id ladder and the adapter
-        # surface's `_open`, on `rejoin`'s miss). Before it, a lookup of an id the bound had dropped fell to
-        # the ambient scope at confidence 1.0 with no marker — the one eviction
-        # whose consequence read as an improvement.
+        # surface's `_open`, on `rejoin`'s miss). Before it, a lookup of an id
+        # the bound had dropped fell to the ambient scope at confidence 1.0
+        # with no marker — the one eviction whose consequence read as an
+        # improvement.
         "ALIAS_FORGOTTEN",
     }
 )

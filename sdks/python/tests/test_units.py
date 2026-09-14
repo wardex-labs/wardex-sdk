@@ -1112,6 +1112,36 @@ def test_a_forgotten_alias_stops_being_forgotten_when_it_is_bound_again():
     assert p.limitations == ()
 
 
+def test_a_forgotten_alias_bound_by_another_unit_is_not_forgotten_even_after_it_was_reported():
+    """Same final state as the test above, with one lookup of the lost id first.
+
+    Whether an earlier lookup reported the loss is not a fact about the id, so
+    it may not decide what a later edge says. `other` binding the id takes it
+    off the unit that lost it, which is exactly what an unbounded table would
+    do too: `alias_rebound`, and once `other` closes, an honest miss. Only the
+    unit `rejoin` opens on the loss is told to keep the record; a plain rebind
+    is not that unit, reported or not.
+    """
+    reg = registry(max_entries_per_unit=2)
+    root = open_session(reg)
+    open_session(reg, "s2")
+    sub = open_subagent(reg, root)
+    key = _forget_the_subagent_alias(reg, sub)
+    with root.activate():
+        reported = reg.resolve(key)
+    assert Limitation.ALIAS_FORGOTTEN in reported.limitations
+    other = open_subagent(reg, root, "b1")
+
+    reg.bind_alias(other, key)
+    reg.close(other)
+    with root.activate():
+        p = reg.resolve(key)
+
+    assert p.correlation.strategy is ParentSource.CONTEXTVAR
+    assert p.correlation.confidence == 1.0
+    assert p.limitations == ()
+
+
 def test_the_forgotten_alias_record_dies_with_its_unit_and_is_itself_bounded():
     """Two bounds on the record, because it may not grow what it shadows.
 
