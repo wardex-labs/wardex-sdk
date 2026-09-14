@@ -159,6 +159,17 @@ enum Limitation {
   LIMITATION_CORRELATION_CONFLICT = 3;
   LIMITATION_CONTEXT_PROPAGATION_DEGRADED = 4;
   LIMITATION_CONTEXT_PROPAGATION_UNAVAILABLE = 5;
+  //    The framework id this edge was looked up by had been dropped from a full
+  //    per-unit alias table, so it no longer selected its unit and the parent
+  //    came from a rung further down: the sole live session (with 2), the
+  //    ambient scope capped at the alias tier's confidence, or none (with 1).
+  //    Names `max_entries_per_unit`. The eviction itself ships nothing — an
+  //    alias owns no span — so the marker rides the NEXT edge that asks for the
+  //    id, the only span where the loss shows. Not UNIT_TABLE_FULL (40): that
+  //    entry owned a span and shipped early, while this span is complete and
+  //    its parent is less specific than the id named. Not PARENT_UNRESOLVED
+  //    (1): on the ambient rung a parent WAS found.
+  LIMITATION_ALIAS_FORGOTTEN = 51;
 
   // -- Unit lifecycle.
   LIMITATION_UNIT_EVICTED = 6;

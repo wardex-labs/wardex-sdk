@@ -1,57 +1,48 @@
 """Capture-integrity vocabulary — design §6.5 tier 3, §6.5.1, §I9.
 
-A limitation marker says what wardex *failed* to capture, or captured only by
-interpretation. It is the third and last tier of the "concept has no home in
-the vocabulary" disposition table: tier 1 is a namespaced ``extra`` key, tier 2
-is an ``InternalSpanEvent``, tier 3 is a marker here. Anything that would need
-a new span kind is dropped.
+A limitation marker says what wardex *failed* to capture, or captured only by interpretation. It is
+the third and last tier of the "concept has no home in the vocabulary" disposition table: tier 1 is
+a namespaced ``extra`` key, tier 2 is an ``InternalSpanEvent``, tier 3 is a marker here. Anything
+that would need a new span kind is dropped.
 
-The enum is CLOSED, and as of the 2026-07-29 census (design §6.5.1) it is also
-**complete**: it is the full vocabulary, not a sample of it. Every limitation
-string the SDK can attach to a span today — Python and Rust — has a member
-below. Adding a member is a core change on purpose: the dashboard renders these
-and they are a proto enum (``wardex.v1.Limitation``) whose value names lock the
-moment they are declared (``buf`` ``ENUM_VALUE_SAME_NAME``), so a late
-correction costs a second deliberate schema break. Emitters must never invent a
-marker string inline.
+The enum is CLOSED, and as of the 2026-07-29 census (design §6.5.1) it is also **complete**: it is
+the full vocabulary, not a sample of it. Every limitation string the SDK can attach to a span today
+— Python and Rust — has a member below. Adding a member is a core change on purpose: the dashboard
+renders these and they are a proto enum (``wardex.v1.Limitation``) whose value names lock the moment
+they are declared (``buf`` ``ENUM_VALUE_SAME_NAME``), so a late correction costs a second deliberate
+schema break. Emitters must never invent a marker string inline.
 
-**The census closed at 37 members = 15 originally declared + 21 from it + 1 from
-§5.4.** It read every assignment and append site that reaches
-``CaptureIntegrity.limitations`` and found 25 distinct strings (24 Python, 1
-Rust); four merged away (the ``NOTE (census)`` comments on
-``CONNECT_TIMING_UNAVAILABLE``, ``PAYLOAD_COMPRESSED``, ``FRAME_PARSE_FAILED``
-and ``CHILD_SPAN_UNCLOSED``), leaving 21 new members. Every later member landed
-WITH its emitter, by its own deliberate change; its reason is recorded where a
-test reads it (``_VOCABULARY``, the live count, and ``_EMITTED_MEMBERS`` in
-``tests/test_limitation_census.py``) and its proto number in ``common.proto``.
+**The census closed at 37 members = 15 originally declared + 21 from it + 1 from §5.4.** It read
+every assignment and append site that reaches ``CaptureIntegrity.limitations`` and found 25 distinct
+strings (24 Python, 1 Rust); four merged away (the ``NOTE (census)`` comments on
+``CONNECT_TIMING_UNAVAILABLE``, ``PAYLOAD_COMPRESSED``, ``FRAME_PARSE_FAILED`` and
+``CHILD_SPAN_UNCLOSED``), leaving 21 new members. Every later member landed WITH its emitter, by its
+own deliberate change; its reason is recorded where a test reads it (``_VOCABULARY``, the live
+count, and ``_EMITTED_MEMBERS`` in ``tests/test_limitation_census.py``) and its proto number in
+``common.proto``.
 
-**Two vocabularies, not one — do not merge them.** A ``disabled_reason`` is why
-a Rust parser latched *itself* off for a whole connection; nothing was parsed,
-so no span exists to carry it and it stays a ``&'static str`` that
-``init(debug=True)`` prints once to stderr — ``headers_exceeded``, ``not_http``
-and ``chunk_size_exceeded``, deliberately absent below. The trap is
+**Two vocabularies, not one — do not merge them.** A ``disabled_reason`` is why a Rust parser
+latched *itself* off for a whole connection; nothing was parsed, so no span exists to carry it and
+it stays a ``&'static str`` that ``init(debug=True)`` prints once to stderr — ``headers_exceeded``,
+``not_http`` and ``chunk_size_exceeded``, deliberately absent below. The trap is
 ``stream_buffer_exceeded``, which is **both**: the HTTP/1 latch
-(``crates/wardex-protocol/src/http1.rs``) is a debug reason and stays out, while
-the MCP-stdio JSON-RPC instance (``json_rpc.rs``) happens with a pending request
-already open, so a span exists and design §4.6 site-3 makes it reportable —
-hence ``STREAM_BUFFER_EXCEEDED``. They stay separate proto enums: different
-lifetimes, different consumers (wire contract vs stderr).
+(``crates/wardex-protocol/src/http1.rs``) is a debug reason and stays out, while the MCP-stdio
+JSON-RPC instance (``json_rpc.rs``) happens with a pending request already open, so a span exists
+and design §4.6 site-3 makes it reportable — hence ``STREAM_BUFFER_EXCEEDED``. They stay separate
+proto enums: different lifetimes, different consumers (wire contract vs stderr).
 
-**Read this before adding a member.** ``tests/test_limitation_census.py``
-re-runs the census on every test run and fails if any marker string, in either
-language, has no member here. If it just failed on you, ask not "how do I make
-it pass" but "is my new string a wire-contract marker (add a member) or a
-connection-level debug reason (add it to the exclusion set instead)".
+**Read this before adding a member.** ``tests/test_limitation_census.py`` re-runs the census on
+every test run and fails if any marker string, in either language, has no member here. If it just
+failed on you, ask not "how do I make it pass" but "is my new string a wire-contract marker (add a
+member) or a connection-level debug reason (add it to the exclusion set instead)".
 
-This module is the **python half** of the census, the hard prerequisite for
-routing all six span-emit sites through ``SpanDraft.finish()``: it raises
-``VocabularyError`` on a non-member, which the site's ``guard()`` swallows, so
-an incomplete enum would have silently deleted every gRPC, streaming chat, WS
-and adapter span. **Every Python emitter now names a member**, the seven
-pre-rename free strings are gone, and the census test asserts an EMPTY string
-census as the standing rule. One producer is still textual:
-``body_cap_exceeded``, built in ``crates/wardex-protocol`` and resolved once at
-the PyO3 boundary by ``Limitation.from_wire``; retyping the Rust side would make
+This module is the **python half** of the census, the hard prerequisite for routing all six
+span-emit sites through ``SpanDraft.finish()``: it raises ``VocabularyError`` on a non-member, which
+the site's ``guard()`` swallows, so an incomplete enum would have silently deleted every gRPC,
+streaming chat, WS and adapter span. **Every Python emitter now names a member**, the seven
+pre-rename free strings are gone, and the census test asserts an EMPTY string census as the standing
+rule. One producer is still textual: ``body_cap_exceeded``, built in ``crates/wardex-protocol`` and
+resolved once at the PyO3 boundary by ``Limitation.from_wire``; retyping the Rust side would make
 proto the single source of truth for every language SDK (§6.6).
 """
 
@@ -63,31 +54,29 @@ from enum import Enum
 class Limitation(Enum):
     """CLOSED and complete. The only legal values of a span's limitation markers.
 
-    Values are the wire contract (``CaptureIntegrity.limitations``), lower_snake
-    like every other wardex enum, and must not be renamed casually: four were
-    renamed by the census on the way in, riding the same deliberate ``wardex.v1``
-    break that put this enum on the wire (§6.7). There is no second chance.
+    Values are the wire contract (``CaptureIntegrity.limitations``), lower_snake like every other
+    wardex enum, and must not be renamed casually: four were renamed by the census on the way in,
+    riding the same deliberate ``wardex.v1`` break that put this enum on the wire (§6.7). There is
+    no second chance.
 
-    Each member records the condition that emits it and the function that
-    ATTACHES it, module-qualified rather than by line number. On the byte seam
-    and in the Agent SDK assembler that is the ``_build_*`` half of a
-    ``_build_*``/``_emit_*`` pair — ``_emit_*`` only guards the build and sinks
-    the span, so it holds no marker to grep for. A member marked "declared; no
-    emitter" is vocabulary the design named and a later seam wires up — not dead
-    code, and not evidence that the census missed something.
+    Each member records the condition that emits it and the function that ATTACHES it,
+    module-qualified rather than by line number. On the byte seam and in the Agent SDK assembler
+    that is the ``_build_*`` half of a ``_build_*``/``_emit_*`` pair — ``_emit_*`` only guards the
+    build and sinks the span, so it holds no marker to grep for. A member marked "declared; no
+    emitter" is vocabulary the design named and a later seam wires up — not dead code, and not
+    evidence that the census missed something.
     """
 
     @classmethod
     def from_wire(cls, value: str) -> Limitation | None:
         """A marker that arrived as a STRING, resolved to its member, or None.
 
-        Exactly one caller is legitimate: the PyO3 boundary. The Rust protocol
-        parsers still build `Vec<&'static str>` (retyping them means touching
-        `bindings/python/src/lib.rs` and the PII walk that runs regexes over the
-        strings too), so a marker produced in Rust reaches Python as text and is
-        resolved once, at the seam that folds it into a span. Python-side
-        emitters name the member directly; a string-to-member lookup used as a
-        general entry point is the drift this enum exists to end.
+        Exactly one caller is legitimate: the PyO3 boundary. The Rust protocol parsers still build
+        `Vec<&'static str>` (retyping them means touching `bindings/python/src/lib.rs` and the PII
+        walk that runs regexes over the strings too), so a marker produced in Rust reaches Python as
+        text and is resolved once, at the seam that folds it into a span. Python-side emitters name
+        the member directly; a string-to-member lookup used as a general entry point is the drift
+        this enum exists to end.
 
         Returns `None` rather than raising for an unrecognized string: the
         alternative on that path is deleting the span (`finish()` rejects a
@@ -197,6 +186,17 @@ Two emit sites, and the first is the mechanism the second restates.
       ``refused_ambient_marker`` for the word, so an evict-origin strand says
       ``INSTRUMENTATION_DEGRADED`` there exactly as it would had ``open()``
       seen the corpse itself.
+    """
+
+    ALIAS_FORGOTTEN = "alias_forgotten"
+    """An id the alias bound (``max_entries_per_unit``) dropped was looked up again, so this
+    edge came from a lower rung. Unmarked it reads backwards: below an alias hit (0.9) is the
+    ambient scope at 1.0, where a sub-agent hangs off its session with nothing to say so.
+    Emitted by ``_assembly/_forgotten.py::forgotten_edge`` (``UnitRegistry._edge``'s ladder for
+    such a miss, ambient capped at 0.9) and ``_adapters/_context.py::AdapterContext.rejoin``.
+    Not ``UNIT_TABLE_FULL`` (that entry owned a span and shipped early), nor
+    ``PARENT_UNRESOLVED`` (a parent may well have been found, just a less specific one). Each
+    marked edge also counts ``assembly._units.alias_forgotten_consumed``.
     """
 
     # ------------------------------------------------------------------

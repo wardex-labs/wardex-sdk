@@ -77,17 +77,20 @@ _OPENERS = frozenset({"enter", "open_run", "rejoin"})
 
 #: Markers that say the EDGE is not what it looks like. A healthy run may carry
 #: plenty of others — the Agent SDK's root always reports that a subprocess has
-#: no transport timing — so the tier half asks about these four and not about an
+#: no transport timing — so the tier half asks about these five and not about an
 #: empty set, which would be a rule the first honest observation breaks.
+#: `ALIAS_FORGOTTEN` is the newest: an id the alias bound dropped was looked up
+#: again, so the edge is less specific than the one the id used to pick.
 #:
 #: Named `_EDGE_MARKERS` so the limitation census can SEE it. A name without
-#: `marker` in it would put four member references in a slot the scanner is not
+#: `marker` in it would put five member references in a slot the scanner is not
 #: looking at, which is a hiding place whether or not anything is hidden there.
 _EDGE_MARKERS = (
     Limitation.PARENT_UNRESOLVED,
     Limitation.UNIT_INFERRED_SOLE,
     Limitation.CORRELATION_CONFLICT,
     Limitation.INSTRUMENTATION_DEGRADED,
+    Limitation.ALIAS_FORGOTTEN,
 )
 
 

@@ -901,13 +901,20 @@ dropped server handle, can let one tool call be reported twice. A dropped
 streamed metadata entry costs a tool call its byte-exact input, and if no hook
 observed that call, its span entirely.
 
-A dropped **alias** is the one to know about, because it does not look like a
-loss. That identifier stops resolving, so the parent is decided one rung further
-down: if the work carries an ambient wardex span, the span arrives at confidence
-**1.0 with no marker** — hanging off the enclosing session instead of the
-sub-agent it belonged to. A sub-agent's subtree flattens and nothing in the data
-says so. Only when there is no ambient span does it arrive marked
-`unit_inferred_sole` (0.5) or `parent_unresolved`.
+A dropped **alias** is the one to know about, because its consequence would
+not look like a loss. That identifier stops resolving, so the parent is decided
+one rung further down — and the rung below an alias match (confidence 0.9) is
+the ambient wardex span, which for a sub-agent is usually its enclosing
+session, at 1.0. Unmarked, the sub-agent's subtree would flatten into the
+session while the confidence went up. So wardex remembers which identifiers the
+bound dropped (per unit, as many as the alias table holds, oldest forgotten
+first), and a span whose parent was looked up by one of them arrives marked
+**`alias_forgotten`**: parented to the only live session (0.5, also marked
+`unit_inferred_sole`) when there is exactly one, otherwise to the ambient span
+at no more than 0.9, otherwise unparented (also marked `parent_unresolved`).
+Each such span also counts `assembly._units.alias_forgotten_consumed`. If you
+see the marker, raise `max_entries_per_unit`. The behaviour is pinned by
+`sdks/python/tests/test_units.py::test_a_forgotten_alias_marks_the_next_edge_instead_of_flattening_silently`.
 
 The evictions that DO reach your traces are counted as well, so you can see one
 coming before it is a shape in your data:

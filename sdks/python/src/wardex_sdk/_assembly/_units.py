@@ -46,27 +46,14 @@ discarded rather than emitted (`claim_superseded`), because the bound is a
 reason to stop tracking a draft and never a reason to promote one the
 arbitration rejected.
 
-The other two hold no span, so their evictions emit NOTHING and no marker for
-them exists. A dropped lookup alias counts `alias_table_full`; a dropped
-de-duplication key counts `claim_table_full`. Neither is undetectable, but
-neither is detectable from the exported spans alone: the counters are the
-record, and what shows up in the data is only the CONSEQUENCE.
-
-The alias consequence is worth stating exactly, because the obvious reading of
-it is backwards. An alias edge is `UNIT_ALIAS` at 0.9 and carries no marker.
-Losing the alias makes the id stop resolving, which sends `_edge` back down the
-ladder — and the next rung is the ambient scope, not the sole-live guess. So
-when the task carries an ambient span the replacement edge is `CONTEXTVAR` at
-1.0 with no marker: confidence goes UP while the edge gets WORSE, because a
-sub-agent that was hanging off its own unit now hangs off the enclosing
-session. That is the flattening `_edge`'s own docstring says most-specific-wins
-exists to prevent, arrived at from the other direction. Only when there is no
-ambient span at all does the ladder reach `UNIT_INFERRED_SOLE` at 0.5 or
-`PARENT_UNRESOLVED`.
-
-An evicted claim key forgets who owned the arbitration, so a lower-ranked
-observer of the same event can win it a second time and open a second span for
-one logical call.
+The other two hold no span, so their evictions emit NOTHING when they happen,
+and what reaches the data is the CONSEQUENCE. An evicted claim key forgets who
+owned the arbitration, so a lower-ranked observer of the same event can win it
+again and open a second span for one call. A dropped alias's would read
+backwards — the rung below a 0.9 alias hit is the ambient scope at 1.0, so a
+sub-agent would hang off its session with confidence UP and the edge WORSE — so
+it is marked: `_forgotten.py` remembers the dropped ids, and the next edge that
+asks for one carries `ALIAS_FORGOTTEN` at no more than 0.9.
 
 Every per-unit eviction counts (`child_table_full`, `open_span_table_full`,
 `alias_table_full`, `claim_table_full`); the root evictions do not, because the
@@ -98,6 +85,7 @@ from .._types import ConversationContext, SpanContext
 from ..context._contextvar import activate_span, install_span, restore_scope, retire_fork
 from ._builder import SpanDraft
 from ._diag import counters, guard
+from ._forgotten import ForgottenAliases, forgotten_edge
 from ._integrity import Limitation
 from ._parentage import (
     AMBIENT,
@@ -898,6 +886,7 @@ class UnitRegistry:
     __slots__ = (
         "_by_alias",
         "_debug",
+        "_forgotten",
         "_link_memory",
         "_live_units",
         "_lock",
@@ -990,6 +979,7 @@ class UnitRegistry:
         #: matching every other bounded table here. Bounded by
         #: `max_link_targets` at the insertion site in `_detach_locked`.
         self._link_memory: dict[UnitKey, SpanContext] = {}
+        self._forgotten = ForgottenAliases(self._max_entries_per_unit)  # see `_forgotten.py`
 
     @property
     def max_record_bytes(self) -> int:
@@ -1033,6 +1023,7 @@ class UnitRegistry:
         self._pins.clear()
         self._by_alias.clear()
         self._link_memory.clear()
+        self._forgotten._at_fork_reinit()
 
     # -- lifecycle -------------------------------------------------------
 
@@ -1234,10 +1225,9 @@ class UnitRegistry:
         """Resolve a framework id to a live unit, or None.
 
         Returns `Unit | None` and nothing else. That is the mechanical half of
-        I2: on a miss the caller's only options are `sole_live()` (0.5 plus a
-        marker) or a new trace (0.0 plus `PARENT_UNRESOLVED`). "Silently
-        re-parent an uninterpretable id into the ambient scope, indistinguishable
-        from a real attachment" is not expressible.
+        I2: a miss sends the caller down the ladder, and `alias_was_forgotten`
+        tells apart a miss on an id the alias bound DROPPED, so "silently re-parent
+        a lost id into the ambient scope, like a real attachment" is inexpressible.
         """
         with self._lock:
             unit = self._by_alias.get(alias)
@@ -1247,6 +1237,11 @@ class UnitRegistry:
                 del self._by_alias[alias]
                 return None
             return unit
+
+    def alias_was_forgotten(self, alias: UnitKey) -> bool:
+        """After a `find()` miss: did the alias bound drop it? Counted. See `_forgotten`."""
+        with self._lock:
+            return self._forgotten.recall(alias)
 
     def resolve_link_target(self, selector: UnitKey) -> SpanContext | None:
         """A span context to LINK to — live alias first, then closed memory.
@@ -1597,6 +1592,8 @@ class UnitRegistry:
             # captured earlier ON THE CORRECT TASK, addressed by the framework id.
             return unit.child(Evidence(ParentSource.UNIT_ALIAS, request_id=hint))
 
+        if alias is not None and self.alias_was_forgotten(alias):  # never the rung below, unmarked
+            return forgotten_edge(self.sole_live(UnitKind.SESSION), amb, hint)
         if amb.span_context is not None:
             return resolve_parentage(amb, AMBIENT)
 
@@ -1970,6 +1967,7 @@ class UnitRegistry:
                         del self._link_memory[next(iter(self._link_memory))]
                         counters.bump("assembly._units.link_memory_full")
         unit._remembered = None
+        self._forgotten.drop_unit(unit)
         for key in unit._alias_keys:
             if self._by_alias.get(key) is unit:
                 del self._by_alias[key]
@@ -1981,10 +1979,12 @@ class UnitRegistry:
         existing = self._by_alias.get(key)
         if existing is not None and existing is not unit:
             counters.bump("assembly._units.alias_rebound")
+        self._forgotten.rebound(key)
         if key not in unit._alias_keys:
             evicted = unit._evict_alias()
             if evicted is not None and self._by_alias.get(evicted) is unit:
                 del self._by_alias[evicted]
+                self._forgotten.forget(evicted, unit)
             unit._alias_keys.append(key)
         self._by_alias[key] = unit
         # Binding makes the LIVE unit the key's authority, so any closed

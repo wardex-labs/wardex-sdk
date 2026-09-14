@@ -128,6 +128,28 @@ def _confidence_for(source: ParentSource, evidence: Evidence) -> float:
     return max(0.0, min(default, supplied))
 
 
+def cap_at_alias_tier(evidence: Evidence) -> Evidence:
+    """`evidence`, with its confidence lowered to what an alias hit earns at most.
+
+    For an edge that fell down the ladder BECAUSE an alias was lost: the id used
+    to select a unit at `UNIT_ALIAS`, the registry's bound dropped it, and
+    whatever rung answered instead is not allowed to read as more certain than
+    the answer it replaced. Without the cap the ambient rung ships at 1.0 —
+    confidence rising exactly as the edge gets less specific.
+
+    A cap and not an assignment, so it composes with `_confidence_for`'s own
+    clamp: a source whose default is already lower (`UNIT_SOLE`, `UNRESOLVED`)
+    keeps its lower number, and a caller that had already lowered it keeps that.
+    The number is read from the table rather than spelled, so the cap cannot
+    drift above the tier it is named after.
+    """
+    tier = _CONFIDENCE[ParentSource.UNIT_ALIAS]
+    supplied = evidence.confidence
+    if supplied is None or supplied != supplied:  # None, or NaN: "does not know"
+        return replace(evidence, confidence=tier)
+    return replace(evidence, confidence=min(tier, supplied))
+
+
 def _markers_for(source: ParentSource) -> tuple[Limitation, ...]:
     marker = _MARKER[source]
     return () if marker is None else (marker,)
