@@ -16,6 +16,8 @@ use pyo3::types::PyDict;
 use pyo3::wrap_pyfunction;
 use wardex_limits::Limits;
 
+use crate::shield::shielded;
+
 /// Python-visible resource limits. Unspecified fields keep the core default.
 #[pyclass(name = "Limits")]
 #[derive(Clone, Copy)]
@@ -66,43 +68,46 @@ impl PyLimits {
         max_otlp_attribute_bytes: Option<usize>,
         max_otlp_request_bytes: Option<usize>,
         max_link_targets: Option<usize>,
-    ) -> Self {
-        let d = Limits::default();
-        Self {
-            inner: Limits {
-                max_headers: max_headers.unwrap_or(d.max_headers),
-                max_body_bytes: max_body_bytes.unwrap_or(d.max_body_bytes),
-                max_opaque_body_bytes: max_opaque_body_bytes.unwrap_or(d.max_opaque_body_bytes),
-                max_stream_buffer_bytes: max_stream_buffer_bytes
-                    .unwrap_or(d.max_stream_buffer_bytes),
-                max_decoded_bytes: max_decoded_bytes.unwrap_or(d.max_decoded_bytes),
-                max_streams: max_streams.unwrap_or(d.max_streams),
-                max_ws_frame_bytes: max_ws_frame_bytes.unwrap_or(d.max_ws_frame_bytes),
-                ws_sample_bytes: ws_sample_bytes.unwrap_or(d.ws_sample_bytes),
-                max_connections: max_connections.unwrap_or(d.max_connections),
-                max_sessions: max_sessions.unwrap_or(d.max_sessions),
-                max_session_entries: max_session_entries.unwrap_or(d.max_session_entries),
-                max_units: max_units.unwrap_or(d.max_units),
-                max_entries_per_unit: max_entries_per_unit.unwrap_or(d.max_entries_per_unit),
-                mcp_sniff_bytes: mcp_sniff_bytes.unwrap_or(d.mcp_sniff_bytes),
-                max_extra_keys: max_extra_keys.unwrap_or(d.max_extra_keys),
-                max_parse_backlog: max_parse_backlog.unwrap_or(d.max_parse_backlog),
-                max_parse_backlog_bytes: max_parse_backlog_bytes
-                    .unwrap_or(d.max_parse_backlog_bytes),
-                max_buffer_spans: max_buffer_spans.unwrap_or(d.max_buffer_spans),
-                max_buffer_bytes: max_buffer_bytes.unwrap_or(d.max_buffer_bytes),
-                replay_buffer_size: replay_buffer_size.unwrap_or(d.replay_buffer_size),
-                max_otel_bridge_body_bytes: max_otel_bridge_body_bytes
-                    .unwrap_or(d.max_otel_bridge_body_bytes),
-                max_otel_bridge_spans_per_session: max_otel_bridge_spans_per_session
-                    .unwrap_or(d.max_otel_bridge_spans_per_session),
-                zstd_level: zstd_level.unwrap_or(d.zstd_level),
-                max_otlp_attribute_bytes: max_otlp_attribute_bytes
-                    .unwrap_or(d.max_otlp_attribute_bytes),
-                max_otlp_request_bytes: max_otlp_request_bytes.unwrap_or(d.max_otlp_request_bytes),
-                max_link_targets: max_link_targets.unwrap_or(d.max_link_targets),
-            },
-        }
+    ) -> PyResult<Self> {
+        shielded(|| {
+            let d = Limits::default();
+            Ok(Self {
+                inner: Limits {
+                    max_headers: max_headers.unwrap_or(d.max_headers),
+                    max_body_bytes: max_body_bytes.unwrap_or(d.max_body_bytes),
+                    max_opaque_body_bytes: max_opaque_body_bytes.unwrap_or(d.max_opaque_body_bytes),
+                    max_stream_buffer_bytes: max_stream_buffer_bytes
+                        .unwrap_or(d.max_stream_buffer_bytes),
+                    max_decoded_bytes: max_decoded_bytes.unwrap_or(d.max_decoded_bytes),
+                    max_streams: max_streams.unwrap_or(d.max_streams),
+                    max_ws_frame_bytes: max_ws_frame_bytes.unwrap_or(d.max_ws_frame_bytes),
+                    ws_sample_bytes: ws_sample_bytes.unwrap_or(d.ws_sample_bytes),
+                    max_connections: max_connections.unwrap_or(d.max_connections),
+                    max_sessions: max_sessions.unwrap_or(d.max_sessions),
+                    max_session_entries: max_session_entries.unwrap_or(d.max_session_entries),
+                    max_units: max_units.unwrap_or(d.max_units),
+                    max_entries_per_unit: max_entries_per_unit.unwrap_or(d.max_entries_per_unit),
+                    mcp_sniff_bytes: mcp_sniff_bytes.unwrap_or(d.mcp_sniff_bytes),
+                    max_extra_keys: max_extra_keys.unwrap_or(d.max_extra_keys),
+                    max_parse_backlog: max_parse_backlog.unwrap_or(d.max_parse_backlog),
+                    max_parse_backlog_bytes: max_parse_backlog_bytes
+                        .unwrap_or(d.max_parse_backlog_bytes),
+                    max_buffer_spans: max_buffer_spans.unwrap_or(d.max_buffer_spans),
+                    max_buffer_bytes: max_buffer_bytes.unwrap_or(d.max_buffer_bytes),
+                    replay_buffer_size: replay_buffer_size.unwrap_or(d.replay_buffer_size),
+                    max_otel_bridge_body_bytes: max_otel_bridge_body_bytes
+                        .unwrap_or(d.max_otel_bridge_body_bytes),
+                    max_otel_bridge_spans_per_session: max_otel_bridge_spans_per_session
+                        .unwrap_or(d.max_otel_bridge_spans_per_session),
+                    zstd_level: zstd_level.unwrap_or(d.zstd_level),
+                    max_otlp_attribute_bytes: max_otlp_attribute_bytes
+                        .unwrap_or(d.max_otlp_attribute_bytes),
+                    max_otlp_request_bytes: max_otlp_request_bytes
+                        .unwrap_or(d.max_otlp_request_bytes),
+                    max_link_targets: max_link_targets.unwrap_or(d.max_link_targets),
+                },
+            })
+        })
     }
 
     #[getter]
@@ -215,38 +220,40 @@ impl PyLimits {
 /// parity against this so a new limit cannot be added without mirroring it.
 #[pyfunction]
 fn limits_defaults(py: Python<'_>) -> PyResult<Bound<'_, PyDict>> {
-    let d = Limits::default();
-    let out = PyDict::new_bound(py);
-    out.set_item("max_headers", d.max_headers)?;
-    out.set_item("max_body_bytes", d.max_body_bytes)?;
-    out.set_item("max_opaque_body_bytes", d.max_opaque_body_bytes)?;
-    out.set_item("max_stream_buffer_bytes", d.max_stream_buffer_bytes)?;
-    out.set_item("max_decoded_bytes", d.max_decoded_bytes)?;
-    out.set_item("max_streams", d.max_streams)?;
-    out.set_item("max_ws_frame_bytes", d.max_ws_frame_bytes)?;
-    out.set_item("ws_sample_bytes", d.ws_sample_bytes)?;
-    out.set_item("max_connections", d.max_connections)?;
-    out.set_item("max_sessions", d.max_sessions)?;
-    out.set_item("max_session_entries", d.max_session_entries)?;
-    out.set_item("max_units", d.max_units)?;
-    out.set_item("max_entries_per_unit", d.max_entries_per_unit)?;
-    out.set_item("mcp_sniff_bytes", d.mcp_sniff_bytes)?;
-    out.set_item("max_extra_keys", d.max_extra_keys)?;
-    out.set_item("max_parse_backlog", d.max_parse_backlog)?;
-    out.set_item("max_parse_backlog_bytes", d.max_parse_backlog_bytes)?;
-    out.set_item("max_buffer_spans", d.max_buffer_spans)?;
-    out.set_item("max_buffer_bytes", d.max_buffer_bytes)?;
-    out.set_item("replay_buffer_size", d.replay_buffer_size)?;
-    out.set_item("max_otel_bridge_body_bytes", d.max_otel_bridge_body_bytes)?;
-    out.set_item(
-        "max_otel_bridge_spans_per_session",
-        d.max_otel_bridge_spans_per_session,
-    )?;
-    out.set_item("zstd_level", d.zstd_level)?;
-    out.set_item("max_otlp_attribute_bytes", d.max_otlp_attribute_bytes)?;
-    out.set_item("max_otlp_request_bytes", d.max_otlp_request_bytes)?;
-    out.set_item("max_link_targets", d.max_link_targets)?;
-    Ok(out)
+    shielded(|| {
+        let d = Limits::default();
+        let out = PyDict::new_bound(py);
+        out.set_item("max_headers", d.max_headers)?;
+        out.set_item("max_body_bytes", d.max_body_bytes)?;
+        out.set_item("max_opaque_body_bytes", d.max_opaque_body_bytes)?;
+        out.set_item("max_stream_buffer_bytes", d.max_stream_buffer_bytes)?;
+        out.set_item("max_decoded_bytes", d.max_decoded_bytes)?;
+        out.set_item("max_streams", d.max_streams)?;
+        out.set_item("max_ws_frame_bytes", d.max_ws_frame_bytes)?;
+        out.set_item("ws_sample_bytes", d.ws_sample_bytes)?;
+        out.set_item("max_connections", d.max_connections)?;
+        out.set_item("max_sessions", d.max_sessions)?;
+        out.set_item("max_session_entries", d.max_session_entries)?;
+        out.set_item("max_units", d.max_units)?;
+        out.set_item("max_entries_per_unit", d.max_entries_per_unit)?;
+        out.set_item("mcp_sniff_bytes", d.mcp_sniff_bytes)?;
+        out.set_item("max_extra_keys", d.max_extra_keys)?;
+        out.set_item("max_parse_backlog", d.max_parse_backlog)?;
+        out.set_item("max_parse_backlog_bytes", d.max_parse_backlog_bytes)?;
+        out.set_item("max_buffer_spans", d.max_buffer_spans)?;
+        out.set_item("max_buffer_bytes", d.max_buffer_bytes)?;
+        out.set_item("replay_buffer_size", d.replay_buffer_size)?;
+        out.set_item("max_otel_bridge_body_bytes", d.max_otel_bridge_body_bytes)?;
+        out.set_item(
+            "max_otel_bridge_spans_per_session",
+            d.max_otel_bridge_spans_per_session,
+        )?;
+        out.set_item("zstd_level", d.zstd_level)?;
+        out.set_item("max_otlp_attribute_bytes", d.max_otlp_attribute_bytes)?;
+        out.set_item("max_otlp_request_bytes", d.max_otlp_request_bytes)?;
+        out.set_item("max_link_targets", d.max_link_targets)?;
+        Ok(out)
+    })
 }
 
 /// Registers `Limits` and `limits_defaults()` on the top-level `_wardex_native`

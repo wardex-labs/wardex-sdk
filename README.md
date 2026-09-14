@@ -558,7 +558,9 @@ Conversations-API-shaped path the mode did not capture),
 carried LLM calls wardex did not read) and
 `interceptors.seam.ws_llm_endpoint_unconfirmed` (Responses-path WebSocket
 connections wardex could not corroborate); table-eviction counters are under
-Resource limits.
+Resource limits. `ffi.panic_converted` counts a panic in the Rust core that
+the FFI boundary turned into `NativePanic` -- a `RuntimeError`, so the guard
+around the host's call swallowed it -- on top of the site's own count.
 
 ## Testing your instrumentation
 
@@ -925,7 +927,10 @@ by tests you can run against a clone, without taking our word for any of them:
 Two of those numbers are worth reading before you plan around them. The Rust
 core holds 172 `unwrap()`/`expect(` call sites, which may only fall; the FFI
 layer in `bindings/python/src` holds zero and may never hold one, because a
-panic there is the one that reaches your interpreter. Where a budget is higher
+panic there is the one that reaches your interpreter; and every entry point in
+that layer runs inside a shield that converts a panic beneath it into an
+ordinary `RuntimeError` before PyO3 can raise it as a `BaseException` no guard
+catches (`sdks/python/tests/test_ffi_panic.py`). Where a budget is higher
 than we would like, the number says so rather than the prose hiding it.
 
 ## Versioning

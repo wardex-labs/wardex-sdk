@@ -29,6 +29,7 @@ from functools import wraps
 from types import TracebackType
 from typing import Any, TypeVar
 
+from .. import _native
 from .._suppress import suppress_capture
 
 _F = TypeVar("_F", bound=Callable[..., Any])
@@ -442,6 +443,12 @@ class guard:  # noqa: N801 — a context manager reads as a verb at the call sit
         if not issubclass(exc_type, Exception):
             return False  # CancelledError/KeyboardInterrupt propagate
         counters.bump(self._where)
+        if _native.NATIVE_PANIC is not None and issubclass(exc_type, _native.NATIVE_PANIC):
+            # A Rust panic the FFI converted (`bindings/python/src/shield.rs`).
+            # Counted a second time under one fixed name so that a panic
+            # anywhere in the core is findable without knowing which of the
+            # guarded sites it surfaced through.
+            counters.bump("ffi.panic_converted")
         if self._debug and exc is not None:
             _log_with_traceback(self._where, exc)
         return True
