@@ -1902,3 +1902,185 @@ def test_a_hand_installed_adapter_still_honours_the_configured_bounds():
         assert units._max_record_bytes == 4096
     finally:
         adapter.uninstall()
+
+
+# --- span start instants: each thread's own floor ---
+#
+# The defect these pin: one session-wide turn start, set by the host's write,
+# was the start of EVERY chat and every stream-only tool of an agentic loop —
+# so a 46-second run shipped 83 chats that all "began" at the prompt and all
+# lasted the whole session. Sorting by start put them in arrival order and
+# pushed the only correctly timed spans (HTTP interceptor) to the wrong end.
+
+
+def _assistant(msg_id, *, parent=None, tool_uses=(), stop="end_turn"):
+    content = [
+        {"type": "tool_use", "id": tool_id, "name": name, "input": {}}
+        for tool_id, name in tool_uses
+    ] or [{"type": "text", "text": "text"}]
+    line = {
+        "type": "assistant",
+        "session_id": "s-1",
+        "message": {
+            "id": msg_id,
+            "model": "claude-sonnet-5",
+            "stop_reason": stop,
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+            "content": content,
+        },
+    }
+    if parent is not None:
+        line["parent_tool_use_id"] = parent
+    return line
+
+
+def _result_line(tool_use_id, *, parent=None):
+    """A stream tool result as the CLI writes it: `parent_tool_use_id` names
+    the sub-agent's `Task` call, and is null on the main thread."""
+    return {
+        "type": "user",
+        "session_id": "s-1",
+        "parent_tool_use_id": parent,
+        "message": {
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": tool_use_id, "content": "ok"}],
+        },
+    }
+
+
+def _delta(parent=None):
+    return {
+        "type": "stream_event",
+        "session_id": "s-1",
+        "uuid": "u",
+        "parent_tool_use_id": parent,
+        "event": {"type": "content_block_delta"},
+    }
+
+
+def test_each_chat_of_an_agentic_loop_starts_where_its_thread_left_off():
+    """Chat N of one user turn starts at the arrival of the last event on its
+    thread — the tool result the CLI waited on — not at the user's write."""
+    client = FakeClient()
+    asm = SessionAssembler(client)
+    t_write = time.time_ns()
+    _outbound(asm, key=1, text="go")
+    asm.on_inbound(1, INIT)
+    asm.on_inbound(1, _assistant("m1", tool_uses=(("toolu_01", "Bash"),), stop="tool_use"))
+    time.sleep(0.002)
+    t_before_result = time.time_ns()
+    asm.on_inbound(1, _result_line("toolu_01"))
+    t_after_result = time.time_ns()
+    time.sleep(0.002)
+    asm.on_inbound(1, _assistant("m2"))
+
+    chat1, chat2 = _chats(client)
+    assert t_write <= chat1.start_time_ns <= chat1.end_time_ns
+    assert t_before_result <= chat2.start_time_ns <= t_after_result
+    assert chat2.start_time_ns >= chat1.end_time_ns
+    assert chat2.end_time_ns > chat2.start_time_ns
+    # The old duration: the whole session so far. The new one excludes the
+    # first turn and the tool call.
+    assert chat2.end_time_ns - chat2.start_time_ns < chat2.end_time_ns - chat1.start_time_ns
+    for chat in (chat1, chat2):
+        assert _has(chat, Limitation.TRANSPORT_TIMING_UNAVAILABLE_SUBPROCESS)
+
+
+def test_parallel_subagent_threads_keep_their_own_floors():
+    """Two sub-agents spawned by one message run at once. Each first turn
+    floors at the message that spawned them; a sibling's arrivals move
+    neither the other's floor nor its next turn's start."""
+    client = FakeClient()
+    asm = SessionAssembler(client)
+    _outbound(asm, key=1)
+    asm.on_inbound(1, INIT)
+    t_before_spawn = time.time_ns()
+    asm.on_inbound(
+        1, _assistant("m1", tool_uses=(("task_a", "Task"), ("task_b", "Task")), stop="tool_use")
+    )
+    t_after_spawn = time.time_ns()
+    time.sleep(0.002)
+    asm.on_inbound(
+        1, _assistant("a1", parent="task_a", tool_uses=(("toolu_a", "Bash"),), stop="tool_use")
+    )
+    time.sleep(0.002)
+    asm.on_inbound(1, _assistant("b1", parent="task_b"))
+    time.sleep(0.002)
+    t_before_a_result = time.time_ns()
+    asm.on_inbound(1, _result_line("toolu_a", parent="task_a"))
+    time.sleep(0.002)
+    asm.on_inbound(1, _assistant("a2", parent="task_a"))
+
+    _main, a1, b1, a2 = _chats(client)
+    for first_turn in (a1, b1):
+        assert t_before_spawn <= first_turn.start_time_ns <= t_after_spawn
+    # A session-wide floor would have put B's start after A's first arrival.
+    assert b1.start_time_ns < a1.end_time_ns
+    # A's second turn floors at A's own result, which came after B's message.
+    assert a2.start_time_ns >= t_before_a_result > b1.end_time_ns
+
+
+def test_a_stream_only_tool_starts_when_its_call_was_announced():
+    """No hook opened the call, so its start is the arrival of the assistant
+    message carrying the `tool_use` block — not the session's turn start."""
+    client = FakeClient()
+    asm = SessionAssembler(client)
+    t_write = time.time_ns()
+    _outbound(asm, key=1)
+    asm.on_inbound(1, INIT)
+    time.sleep(0.002)
+    t_before = time.time_ns()
+    asm.on_inbound(1, _assistant("m1", tool_uses=(("toolu_01", "Bash"),), stop="tool_use"))
+    t_after = time.time_ns()
+    time.sleep(0.002)
+    asm.on_inbound(1, _result_line("toolu_01"))
+
+    (tool,) = _tools(client, "toolu_01")
+    assert CaptureSource.STDIO in tool.capture_sources
+    assert t_before <= tool.start_time_ns <= t_after
+    assert tool.start_time_ns > t_write
+    assert tool.end_time_ns > tool.start_time_ns
+
+
+def test_ttft_is_measured_against_each_turns_own_floor():
+    """The first chunk of turn N is priced against turn N's floor and spent
+    with turn N: turn N+1 with no chunk of its own reports no ttft, rather
+    than inheriting turn N's."""
+    client = FakeClient()
+    asm = SessionAssembler(client)
+    _outbound(asm, key=1)
+    asm.on_inbound(1, INIT)
+    asm.on_inbound(1, _delta())
+    asm.on_inbound(1, _assistant("m1", tool_uses=(("toolu_01", "Bash"),), stop="tool_use"))
+    asm.on_inbound(1, _result_line("toolu_01"))
+    time.sleep(0.005)
+    asm.on_inbound(1, _delta())
+    asm.on_inbound(1, _assistant("m2"))
+    asm.on_inbound(1, _assistant("m3"))  # no chunk seen since m2
+
+    chat1, chat2, chat3 = _chats(client)
+    assert chat1.gen_ai.time_to_first_chunk_s is not None
+    assert chat2.gen_ai.time_to_first_chunk_s is not None
+    assert chat2.gen_ai.time_to_first_chunk_s >= 0.005
+    assert chat2.gen_ai.time_to_first_chunk_s <= (chat2.end_time_ns - chat2.start_time_ns) / 1e9
+    assert _has(chat2, Limitation.TTFT_IPC_APPROXIMATION)
+    assert chat3.gen_ai.time_to_first_chunk_s is None
+    assert not _has(chat3, Limitation.TTFT_IPC_APPROXIMATION)
+
+
+def test_the_thread_table_is_bounded_and_counts_its_evictions(tallies):
+    """Sub-agent threads share the per-session bound; the main thread is a
+    field of its own and never competes for it. An evicted thread costs only
+    its floor, and the counter says it happened."""
+    client = FakeClient()
+    asm = SessionAssembler(client, max_session_entries=1)
+    _outbound(asm, key=1)
+    asm.on_inbound(1, INIT)
+    asm.on_inbound(1, _assistant("a1", parent="task_a"))
+    asm.on_inbound(1, _assistant("b1", parent="task_b"))
+    asm.on_inbound(1, _assistant("m1"))
+
+    assert tallies("adapters.assembler.thread_table_full") == 1
+    assert len(_chats(client)) == 3
+    for chat in _chats(client):
+        assert chat.start_time_ns <= chat.end_time_ns

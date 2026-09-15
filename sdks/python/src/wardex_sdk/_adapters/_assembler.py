@@ -325,8 +325,7 @@ class SessionAssembler:
             sess = self._ensure_session(key, now)
             if bridge is not None and sess.bridge is None and self._bridge is not None:
                 sess.bridge = bridge
-            sess.turn_start_ns = now
-            sess.first_delta_ns = 0
+            sess.mark_thread(ev.parent_tool_use_id, now, new_turn=True)
             if ev.content_json and ev.parent_tool_use_id is None:
                 if sess.pending_prompt_source is not None:
                     # A prompt was seen and no chat span ever consumed it. It
@@ -403,12 +402,12 @@ class SessionAssembler:
                     # oldest entry is the one most likely to be read next.
                     # Evicting it would discard exactly that.
                     if self._has_room(sess.stream_tool_meta, "stream_tool_meta"):
-                        sess.stream_tool_meta[tu_id] = (tu_name, tu_input)
+                        sess.stream_tool_meta[tu_id] = (tu_name, tu_input, now)
             elif ev.kind == "tool_result":
                 self._on_stream_tool_result(sess, ev, now)
+                sess.mark_thread(ev.parent_tool_use_id, now)
             elif ev.kind == "stream_delta":
-                if sess.first_delta_ns == 0:
-                    sess.first_delta_ns = now
+                sess.thread(ev.parent_tool_use_id, now).note_chunk(now)
             elif ev.kind == "session_result":
                 sess.result = ev
             elif ev.kind == "task_lifecycle":
@@ -541,8 +540,7 @@ class SessionAssembler:
         sess.pending_prompt_source = _PROMPT_HOOK
         sess.pending_prompt_hook_seen = True
         sess.pending_prompt_sole_inferred = inferred
-        sess.turn_start_ns = now
-        sess.first_delta_ns = 0
+        sess.mark_thread(None, now, new_turn=True)
 
     # --- emission helpers (all build via SpanDraft, emit via capture_span) ---
 
@@ -682,7 +680,7 @@ class SessionAssembler:
         # once the stream reports a model.
         unit.draft.set_agent(AgentAttributes(name="agent", agent_type=AgentType.PRIMARY))
         unit.draft.add_limitation(_BASE_LIMITATION)
-        sess = _Session(unit=unit, start_ns=now, key=key)
+        sess = _Session(unit=unit, start_ns=now, key=key, max_threads=self._max_session_entries)
         if previous is not None:
             self._resume(sess, previous)
         self._by_key[key] = sess
@@ -865,15 +863,15 @@ class SessionAssembler:
         return crumb.context if crumb is not None else sess.unit.context
 
     def _emit_chat(self, sess: _Session, ev: AgentStreamEvent, now: int) -> None:
-        if sess.bridge is not None:
-            with self._guard("adapters.assembler.emit_chat"):
-                self._pend_chat(sess, ev, now)
-            sess.turn_index += 1
-            return
         span = None
         with self._guard("adapters.assembler.emit_chat"):
-            span = self._build_chat(sess, ev, now)
+            if sess.bridge is not None:
+                self._pend_chat(sess, ev, now)
+            else:
+                span = self._build_chat(sess, ev, now)
+        # The message arrived whether or not a span was built: the thread moves on.
         sess.turn_index += 1
+        sess.mark_thread(ev.parent_tool_use_id, now, new_turn=True)
         if span is not None:
             self._capture(span)
 
@@ -903,11 +901,11 @@ class SessionAssembler:
         consume = ev.parent_tool_use_id is None and sess.pending_prompt_source is not None
         evidence = _SOLE_LIVE if consume and sess.pending_prompt_sole_inferred else _IN_SESSION
         p = child_of(self._resolve_subagent_anchor(sess, ev.parent_tool_use_id), evidence)
-        start_ns = sess.turn_start_ns or now
-
-        ttft: float | None = None
-        if sess.first_delta_ns:
-            ttft = (sess.first_delta_ns - sess.turn_start_ns) / 1e9
+        # The thread's floor (see `_Thread`), never the session's turn start:
+        # that gave every chat of one loop the prompt's instant as its start.
+        thread = sess.thread(ev.parent_tool_use_id, now)
+        start_ns = min(thread.last_ns, now)
+        ttft = thread.ttft_s(start_ns)
 
         # `subject=ev.model`, not an f-string. A turn whose stream never reported
         # a model used to produce the literal span name "chat None"; the grammar
@@ -1216,7 +1214,7 @@ class SessionAssembler:
         meta = sess.stream_tool_meta.pop(tool_use_id, None)
         tool.sole_inferred = tool.sole_inferred and inferred and meta is None
         if meta is not None:
-            stream_name, stream_input = meta
+            stream_name, stream_input, _announced_ns = meta
             if stream_name:
                 tool.name = stream_name
             # Content authority: the byte-exact stream input always wins over
@@ -1438,7 +1436,9 @@ class SessionAssembler:
             # fallback stands down too.
             return
         after_evict = False
-        start_ns = sess.turn_start_ns or now
+        # No hook opened this call: it started when the message announcing
+        # it arrived (`announce_ns`), not at the session's turn start.
+        start_ns = meta[2] if meta is not None else now
         agent_id: str | None = None
         if crumb is not None:
             # The completion half again, from the stream side. `agent_id` comes

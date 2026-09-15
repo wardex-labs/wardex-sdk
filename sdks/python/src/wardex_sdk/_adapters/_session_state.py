@@ -20,7 +20,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
-from .._assembly import Limitation, SpanDraft, Unit, UnitKey
+from .._assembly import Limitation, SpanDraft, Unit, UnitKey, counters
 from .._protocol._claude_stream import AgentStreamEvent
 
 #: The two provenances a chat span's `input_data` can have, published as the
@@ -73,7 +73,8 @@ class _PendingSpan:
     deferred_markers: tuple[Limitation, ...] = ()
     tool_use_id: str | None = None
     agent_id: str | None = None
-    #: Chat only: (turn_start_ns, end_ns) — the join window.
+    #: Chat only: (start_ns, end_ns) — the join window, from the thread's
+    #: floor to the message's arrival.
     window: tuple[int, int] | None = None
     #: Chat only: the GenAIAttributes block, kept for the ttft rewrite.
     #: Typed Any because `_types` is off-limits in `_adapters/` (C-S1).
@@ -227,6 +228,48 @@ class _OpenSubagent:
 
 
 @dataclass
+class _Thread:
+    """The timing state of one conversational thread inside a session.
+
+    A session runs several threads at once: the main thread and one per
+    `Task` call, each keyed by the stream's `parent_tool_use_id` (None for the
+    main thread). The CLI issues a thread's next LLM request only after that
+    thread's previous message and tool results have arrived, so the arrival
+    of the last event on a thread is the closest observable floor for the
+    request that produces the thread's next chat span.
+
+    Kept PER THREAD because sub-agents run in parallel: a session-wide "last
+    event" would let a sibling's tool result open the window of a chat it had
+    nothing to do with. What used to sit here was one session-wide turn start
+    set by the host's write, which made every chat of one agentic loop start
+    at the moment the user's prompt was written — and, with the end stamped
+    per message, gave each of them the whole session's duration.
+    """
+
+    #: Arrival instant of the last stream event observed on this thread — the
+    #: floor for its next chat span. It is an IPC-side estimate of the
+    #: request instant and every span built from it says so
+    #: (`TRANSPORT_TIMING_UNAVAILABLE_SUBPROCESS`); the bridge's merge
+    #: replaces it with the CLI's own interval when one arrives.
+    last_ns: int
+    #: Arrival instant of the first `stream_event` of the turn in flight, or
+    #: 0 when none has arrived since the last chat span. Reset per chat, so
+    #: turn N's ttft is measured against turn N's own first chunk.
+    first_delta_ns: int = 0
+
+    def note_chunk(self, now: int) -> None:
+        """The first chunk since the last chat span; later ones change nothing."""
+        if self.first_delta_ns == 0:
+            self.first_delta_ns = now
+
+    def ttft_s(self, start_ns: int) -> float | None:
+        """Seconds from `start_ns` to this turn's first chunk, or None without one."""
+        if self.first_delta_ns > start_ns:
+            return (self.first_delta_ns - start_ns) / 1e9
+        return None
+
+
+@dataclass
 class _Session:
     #: The session's logical unit. `unit.draft` is its own two-phase span and
     #: `unit.context` is the P2 anchor every span below it hangs off — the same
@@ -241,8 +284,21 @@ class _Session:
     key: int
     session_id: str | None = None
     model: str | None = None  # from init -> request_model
-    turn_start_ns: int = 0
-    first_delta_ns: int = 0
+    #: The main thread's timing, floored at the session's start. A field of
+    #: its own rather than an entry in `threads`, so the bound below can never
+    #: evict it: the main thread lives as long as the session, and losing its
+    #: floor would hand the next main-thread chat the session's start — the
+    #: defect `_Thread` replaces.
+    main_thread: _Thread = field(default_factory=lambda: _Thread(last_ns=0))
+    #: Timing per SUB-AGENT thread, keyed by the stream's `parent_tool_use_id`
+    #: (the `Task` call that spawned it). Bounded by `max_threads` — the
+    #: assembler's `max_session_entries`, like the other per-session tables;
+    #: a thread the bound evicted is re-created on its next event from the
+    #: best floor still known (see `thread`).
+    threads: dict[str, _Thread] = field(default_factory=dict)
+    #: The bound on `threads`; 0 leaves it unbounded, which only a record built
+    #: outside the assembler can ask for.
+    max_threads: int = 0
     #: The not-yet-consumed user prompt for the NEXT main-thread chat span. At
     #: most one prompt pends per session — a new observation REPLACES it
     #: (counted), never appends, so the slot is bounded by construction — and
@@ -280,8 +336,11 @@ class _Session:
     # would otherwise collide with every span of every other session in any
     # store that keys on it, and `SpanDraft.finish()` now refuses to ship "".
     issued_conversation_id: str = field(default_factory=lambda: uuid.uuid4().hex)
-    stream_tool_meta: dict[str, tuple[str, bytes]] = field(default_factory=dict)
-    # ^ tool_use_id -> (name, input_json) observed on the stream
+    stream_tool_meta: dict[str, tuple[str, bytes, int]] = field(default_factory=dict)
+    # ^ tool_use_id -> (name, input_json, announce_ns) observed on the stream.
+    # `announce_ns` is the arrival of the assistant message that carried the
+    # `tool_use` block: the closest observable start for a call no hook opened,
+    # and the floor of the thread a `Task` call spawns.
     result: AgentStreamEvent | None = None
     error: str | None = None
     #: The OTel bridge tie, or None for a bridge-off session — and None is the
@@ -293,6 +352,54 @@ class _Session:
     #: and flushed on EVERY retirement path — finalize, teardown, and the
     #: registry-eviction retirement — so pending never deletes a span (I10).
     pending: list[_PendingSpan] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        if self.main_thread.last_ns == 0:
+            self.main_thread.last_ns = self.start_ns
+
+    def thread(self, parent_tool_use_id: str | None, now: int) -> _Thread:
+        """The timing record of one thread, created on first sight.
+
+        The main thread (`parent_tool_use_id` None) always exists. A
+        sub-agent thread is created on its first event, floored at the best
+        instant already observed for it: the arrival of the assistant message
+        that announced the `Task` call spawning it (its `stream_tool_meta`
+        entry), else the main thread's own floor — a sub-agent cannot have
+        started before the turn that spawned it. `now` is never the floor of
+        a thread created by a CHAT: that would make the chat zero-length,
+        which is a different wrong answer from the old one.
+        """
+        if parent_tool_use_id is None:
+            return self.main_thread
+        thread = self.threads.get(parent_tool_use_id)
+        if thread is None:
+            meta = self.stream_tool_meta.get(parent_tool_use_id)
+            floor = meta[2] if meta is not None else self.main_thread.last_ns
+            if self.max_threads and len(self.threads) >= self.max_threads:
+                # Evicting a thread loses only its floor: the next event on
+                # it re-creates it from the fallbacks above, and the counter
+                # says how often that happened.
+                self.threads.pop(next(iter(self.threads)))
+                counters.bump("adapters.assembler.thread_table_full")
+            thread = self.threads[parent_tool_use_id] = _Thread(last_ns=min(floor, now))
+        return thread
+
+    def mark_thread(
+        self, parent_tool_use_id: str | None, now: int, *, new_turn: bool = False
+    ) -> None:
+        """Record that an event on this thread arrived at `now`.
+
+        Every event a thread observes moves its floor forward: a tool result
+        is the floor of the request the CLI sends once the results it waits
+        on are in, and a message's arrival is the floor of the next one.
+        `new_turn` also discards the first-chunk instant of the turn in
+        flight — a user prompt or a delivered message starts a new request,
+        and a chunk seen before it belongs to the previous one.
+        """
+        thread = self.thread(parent_tool_use_id, now)
+        thread.last_ns = now
+        if new_turn:
+            thread.first_delta_ns = 0
 
 
 def _sole_guess_stands(

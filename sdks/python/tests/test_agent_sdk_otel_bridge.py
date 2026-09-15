@@ -1223,10 +1223,12 @@ def test_an_evicted_bridge_sessions_pended_spans_still_ship(receiver):
 
 def test_a_multi_turn_agentic_loop_joins_each_llm_request_uniquely(receiver):
     """The live-CLI regression, pinned: chats of one agentic loop share ONE
-    host write, so their raw turn starts collide — sequencing each window
-    from the previous same-scope chat's arrival is what lets two real
+    host write. Their raw starts used to collide on it, and sequencing each
+    window from the previous same-scope chat's arrival is what let two real
     llm_requests join two of three chats uniquely, with the duplicate-view
-    chat unmerged and NO conflict siblings."""
+    chat unmerged and NO conflict siblings. The assembler now floors each
+    chat at its thread's last event itself, so the windows it pends arrive
+    already sequenced — and the join must behave the same either way."""
     client = FakeClient()
     asm = SessionAssembler(client, bridge=receiver)
     receiver.reserve(TRACE)
@@ -1238,12 +1240,13 @@ def test_a_multi_turn_agentic_loop_joins_each_llm_request_uniquely(receiver):
     asm.on_inbound(1, ASSISTANT_2)  # chat 3 — the post-tool response
     asm.on_inbound(1, RESULT)
 
-    # The REAL recorded windows (their raw starts all collide on the one host
-    # write — the exact shape the live CLI produced). Each llm_request starts
-    # just before its own chat's arrival, as a real one does.
+    # The recorded windows: one host write, three chats, and each window
+    # already floored at the previous same-thread arrival. Each llm_request
+    # starts just before its own chat's arrival, as a real one does.
     raw_windows = [rec.window for rec in asm._by_key[1].pending if rec.kind == "chat"]
     assert len(raw_windows) == 3
-    assert raw_windows[0][0] == raw_windows[1][0] == raw_windows[2][0]  # collision
+    for earlier, later in zip(raw_windows, raw_windows[1:], strict=False):
+        assert later[0] >= earlier[1]  # sequenced at the source, not only in the join
     body = _otlp_build.request(
         [
             _otlp_build.span(
