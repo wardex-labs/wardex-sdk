@@ -17,10 +17,11 @@ uses it.
 from __future__ import annotations
 
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-from .._assembly import Limitation, SpanDraft, Unit, UnitKey, counters
+from .._assembly import Limitation, SpanDraft, Unit, UnitKey
 from .._protocol._claude_stream import AgentStreamEvent
 
 #: The two provenances a chat span's `input_data` can have, published as the
@@ -290,15 +291,16 @@ class _Session:
     #: floor would hand the next main-thread chat the session's start — the
     #: defect `_Thread` replaces.
     main_thread: _Thread = field(default_factory=lambda: _Thread(last_ns=0))
-    #: Timing per SUB-AGENT thread, keyed by the stream's `parent_tool_use_id`
-    #: (the `Task` call that spawned it). Bounded by `max_threads` — the
-    #: assembler's `max_session_entries`, like the other per-session tables;
-    #: a thread the bound evicted is re-created on its next event from the
-    #: best floor still known (see `thread`).
+    #: Timing per LIVE sub-agent thread, keyed by the stream's
+    #: `parent_tool_use_id` (the `Task` call that spawned it) and dropped when
+    #: that call's result arrives (`end_tool`), so the table holds only the
+    #: sub-agents running at once. Bounded through `has_room` (see `thread`).
     threads: dict[str, _Thread] = field(default_factory=dict)
-    #: The bound on `threads`; 0 leaves it unbounded, which only a record built
-    #: outside the assembler can ask for.
-    max_threads: int = 0
+    #: The assembler's `_has_room`: the one per-session bound, applied by the
+    #: helper that owns it rather than re-implemented here. None leaves
+    #: `threads` unbounded, which only a record built outside the assembler
+    #: can ask for.
+    has_room: Callable[[dict[str, Any], str], bool] | None = None
     #: The not-yet-consumed user prompt for the NEXT main-thread chat span. At
     #: most one prompt pends per session — a new observation REPLACES it
     #: (counted), never appends, so the slot is bounded by construction — and
@@ -368,6 +370,14 @@ class _Session:
         started before the turn that spawned it. `now` is never the floor of
         a thread created by a CHAT: that would make the chat zero-length,
         which is a different wrong answer from the old one.
+
+        When the table is full the NEWEST thread is refused, as
+        `stream_tool_meta` refuses its newest entry: nothing here owns a span,
+        and evicting a running sub-agent's floor would corrupt a thread that
+        was being timed correctly. A refused thread is handed an unrecorded
+        record built from the fallbacks above, so its chats floor at their
+        spawn instant, and `_has_room` counts every event that met the full
+        table (`adapters.assembler.thread_table_full`).
         """
         if parent_tool_use_id is None:
             return self.main_thread
@@ -375,14 +385,23 @@ class _Session:
         if thread is None:
             meta = self.stream_tool_meta.get(parent_tool_use_id)
             floor = meta[2] if meta is not None else self.main_thread.last_ns
-            if self.max_threads and len(self.threads) >= self.max_threads:
-                # Evicting a thread loses only its floor: the next event on
-                # it re-creates it from the fallbacks above, and the counter
-                # says how often that happened.
-                self.threads.pop(next(iter(self.threads)))
-                counters.bump("adapters.assembler.thread_table_full")
-            thread = self.threads[parent_tool_use_id] = _Thread(last_ns=min(floor, now))
+            thread = _Thread(last_ns=min(floor, now))
+            if self.has_room is None or self.has_room(self.threads, "thread"):
+                self.threads[parent_tool_use_id] = thread
         return thread
+
+    def end_tool(self, parent_tool_use_id: str | None, tool_use_id: str | None, now: int) -> None:
+        """A tool result arrived on `parent_tool_use_id`'s thread for `tool_use_id`.
+
+        It moves that thread's floor — the CLI sends the thread's next request
+        once the results it waits on are in — and, when the finished call was a
+        `Task`, ends the sub-agent thread it spawned: no event can arrive on a
+        thread after its spawning call has returned, so keeping the entry would
+        only spend the bound that live sub-agents need.
+        """
+        self.mark_thread(parent_tool_use_id, now)
+        if tool_use_id is not None:
+            self.threads.pop(tool_use_id, None)
 
     def mark_thread(
         self, parent_tool_use_id: str | None, now: int, *, new_turn: bool = False

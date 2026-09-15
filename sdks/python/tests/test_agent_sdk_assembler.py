@@ -2068,10 +2068,11 @@ def test_ttft_is_measured_against_each_turns_own_floor():
     assert not _has(chat3, Limitation.TTFT_IPC_APPROXIMATION)
 
 
-def test_the_thread_table_is_bounded_and_counts_its_evictions(tallies):
+def test_the_thread_table_refuses_the_newest_live_thread_and_counts_it(tallies):
     """Sub-agent threads share the per-session bound; the main thread is a
-    field of its own and never competes for it. An evicted thread costs only
-    its floor, and the counter says it happened."""
+    field of its own and never competes for it. A full table refuses the
+    NEWEST thread, whose chats then floor at their spawn instant, and leaves
+    the running one's floor alone."""
     client = FakeClient()
     asm = SessionAssembler(client, max_session_entries=1)
     _outbound(asm, key=1)
@@ -2080,7 +2081,24 @@ def test_the_thread_table_is_bounded_and_counts_its_evictions(tallies):
     asm.on_inbound(1, _assistant("b1", parent="task_b"))
     asm.on_inbound(1, _assistant("m1"))
 
-    assert tallies("adapters.assembler.thread_table_full") == 1
+    assert tallies("adapters.assembler.thread_table_full") > 0
+    assert set(asm._by_key[1].threads) == {"task_a"}
     assert len(_chats(client)) == 3
     for chat in _chats(client):
         assert chat.start_time_ns <= chat.end_time_ns
+
+
+def test_a_finished_subagent_gives_its_thread_slot_back(tallies):
+    """The table holds only sub-agents running at once: the `Task` call's
+    result ends its thread, so sequential sub-agents never meet the bound."""
+    client = FakeClient()
+    asm = SessionAssembler(client, max_session_entries=1)
+    _outbound(asm, key=1)
+    asm.on_inbound(1, INIT)
+    for task in ("task_a", "task_b", "task_c"):
+        asm.on_inbound(1, _assistant(f"spawn_{task}", tool_uses=((task, "Task"),), stop="tool_use"))
+        asm.on_inbound(1, _assistant(f"{task}_1", parent=task))
+        asm.on_inbound(1, _result_line(task))
+
+    assert tallies("adapters.assembler.thread_table_full") == 0
+    assert asm._by_key[1].threads == {}

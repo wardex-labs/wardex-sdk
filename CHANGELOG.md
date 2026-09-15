@@ -98,9 +98,11 @@ All notable changes to this project are documented here. The format follows
   sub-agents: chat starts went from 1 distinct value to 34 of 39 (sub-agents
   spawned by one message share their floor by design), tool starts from 1 to
   38 of 38, and chat durations from 4–87 s to 0.1–4 s.
-  Counter: `adapters.assembler.thread_table_full` when a sub-agent thread's
-  floor is evicted by the per-session bound (it is re-created from the
-  spawning message's arrival).
+  Sub-agent threads live until their `Task` call returns and share the
+  per-session entry bound; past it the newest thread is refused and its chats
+  floor at the spawning message's arrival. Counter:
+  `adapters.assembler.thread_table_full`, once per event that met the full
+  table.
 
 - **A sub-agent whose identifier fell out of a full alias table no longer
   flattens into its session silently.** Each unit keeps at most

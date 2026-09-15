@@ -405,7 +405,7 @@ class SessionAssembler:
                         sess.stream_tool_meta[tu_id] = (tu_name, tu_input, now)
             elif ev.kind == "tool_result":
                 self._on_stream_tool_result(sess, ev, now)
-                sess.mark_thread(ev.parent_tool_use_id, now)
+                sess.end_tool(ev.parent_tool_use_id, ev.tool_result_id, now)
             elif ev.kind == "stream_delta":
                 sess.thread(ev.parent_tool_use_id, now).note_chunk(now)
             elif ev.kind == "session_result":
@@ -680,7 +680,7 @@ class SessionAssembler:
         # once the stream reports a model.
         unit.draft.set_agent(AgentAttributes(name="agent", agent_type=AgentType.PRIMARY))
         unit.draft.add_limitation(_BASE_LIMITATION)
-        sess = _Session(unit=unit, start_ns=now, key=key, max_threads=self._max_session_entries)
+        sess = _Session(unit=unit, start_ns=now, key=key, has_room=self._has_room)
         if previous is not None:
             self._resume(sess, previous)
         self._by_key[key] = sess
