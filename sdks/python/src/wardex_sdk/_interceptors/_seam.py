@@ -542,17 +542,17 @@ class ByteSeamInterceptor(InterceptorInterface):
             return
         txns = st.tracker.on_response_bytes(data)
         try:
-            # No span exists to carry a disable reason (the whole point of
-            # the latch is that no message was ever parsed), so debug mode
-            # logs it instead. Guarded by st.disabled_logged (not st.gate,
-            # which the plaintext seam's sniff-latch owns) so a disabled
-            # connection logs once, not once per subsequent read.
-            if self._client is not None and self._client.config.debug:
+            # No span carries a latch reason: once per connection (st.disabled_logged; st.gate is
+            # the sniff-latch's), counted in every mode, logged in debug. Asked each read until
+            # then: for h2 one allocation-free native call (~60 ns), small beside the recv.
+            if not st.disabled_logged:
                 reason = getattr(st.tracker, "disabled_reason", lambda: None)()
-                if reason is not None and not st.disabled_logged:
+                if reason is not None:
                     st.disabled_logged = True
-                    diag_warning(f"parser disabled for {st.server_address}: {reason}")
-        except Exception:  # noqa: BLE001 — debug-only logging must never break capture
+                    counters.bump("interceptors.seam.parser_disabled")
+                    if self._client is not None and self._client.config.debug:
+                        diag_warning(f"parser disabled for {st.server_address}: {reason}")
+        except Exception:  # noqa: BLE001 — off-span reporting must never break capture
             pass
         for txn in txns:
             if getattr(txn, "ws_upgrade", False):

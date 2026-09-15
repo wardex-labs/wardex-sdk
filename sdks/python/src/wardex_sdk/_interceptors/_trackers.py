@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .. import _hub, _wardex_native
-from .._assembly import Limitation, parent_is_closed_unit
+from .._assembly import Limitation, counters, parent_is_closed_unit
 from .._protocol import WsParser
 from .._protocol._http1 import Http1RequestParser, Http1ResponseParser
 from .._protocol._http2 import Http2Parser
@@ -328,8 +328,9 @@ class _Http2Tracker:
         #: eviction this tracker keeps. One integer rather than a set of dropped
         #: ids, because a set is the same unbounded table again under a
         #: different name — and it is exact for the policy above: entries are
-        #: inserted in increasing id order and dropped lowest-first, so the ids
-        #: evicted are precisely the ones latched at or below this mark.
+        #: dropped lowest id first (not insertion order: a stream whose request
+        #: body ends late is latched after higher ids), so the ids evicted are
+        #: precisely the ones latched at or below this mark.
         #:
         #: What it buys is in `_mk`. An evicted entry that no transaction ever
         #: claims cost nothing and is worth saying nothing about; one that a
@@ -362,36 +363,55 @@ class _Http2Tracker:
         parent_closed = parent_is_closed_unit(parent) if opened else False
         for sid in opened:
             self._latch[sid] = (parent, parent_closed, now)
-        if opened and self._latch_first == 0:
-            self._latch_first = min(opened)
-        # Drop-oldest, which for h2 is drop-lowest-stream-id: ids only ever
-        # increase, so the entry evicted is the one likeliest to be stranded
-        # already. Losing it costs that stream its parentage, never a span —
-        # `_mk` falls back to (None, False, now) and says so on the span.
+        if opened:
+            low = min(opened)
+            self._latch_first = low if self._latch_first == 0 else min(self._latch_first, low)
+        # Drop-lowest-stream-id: ids only ever increase, so the entry evicted
+        # is the one likeliest to be stranded already. Lowest by id, not by
+        # insertion — a stream announced late (its request body ended after
+        # higher ids') is still the oldest request. Losing it costs that stream
+        # its parentage, never a span — `_mk` falls back to (None, False, now)
+        # and says so on the span. `min` is a scan of at most `max_streams + 1`
+        # keys, run only on the writes that overflow the cap.
         while len(self._latch) > self._latch_cap:
-            evicted = next(iter(self._latch))
+            evicted = min(self._latch)
             self._latch.pop(evicted)
             self._latch_evicted_below = max(self._latch_evicted_below, evicted)
-        # Always call _mk to pop the _latch entry (prevents leaks); status==0
-        # (degenerate transaction) is excluded from the result
-        out: list[_Txn] = []
-        for t in txns:
-            txn = self._mk(t)
-            if t.status:
-                out.append(txn)
-        return out
+        return self._ship(txns)
 
     def on_response_bytes(self, data: bytes) -> list[_Txn]:
         # server push (PUSH_PROMISE) unsupported — response-side stream_id ignored
         _opened, txns = self._conn.feed(False, data)
-        # Always call _mk to pop the _latch entry (prevents leaks); status==0
-        # (degenerate transaction) is excluded from the result
+        return self._ship(txns)
+
+    def _ship(self, txns: list[Any]) -> list[_Txn]:
+        """`_mk` every native transaction — it pops the latch entry, so skipping
+        one would leak it — and keep the ones that describe an exchange.
+
+        Two kinds are left out. status==0 is a degenerate transaction. A
+        transaction with no method that the stream table did NOT evict is a
+        response whose request this parser never observed: the host opened
+        the stream before capture attached. Shipping it meant a `? /` span with
+        no marker, indistinguishable from a request with no method and no path,
+        and with a start instant invented at the response. It is counted
+        instead. `? /` ships only with `H2_REQUEST_EVICTED`, which names the
+        bound that took the request.
+        """
         out: list[_Txn] = []
         for t in txns:
             txn = self._mk(t)
-            if t.status:
-                out.append(txn)
+            if not t.status:
+                continue
+            if not t.method and not t.request_evicted:
+                counters.bump("protocol.http2.request_unobserved")
+                continue
+            out.append(txn)
         return out
+
+    def disabled_reason(self) -> str | None:
+        """The native parser's latch reason. One connection, both directions,
+        one parser — so unlike HTTP/1 there is a single reason to ask for."""
+        return self._conn.disabled_reason()
 
     def on_connection_close(self, marker: Limitation) -> list[_Txn]:
         """Release the per-stream latch — the eviction the entries were waiting for.
@@ -463,6 +483,19 @@ class _Http2Tracker:
         else:
             parent, parent_closed, start = entry
             parent_evicted = False
+        # The OTHER half of the same bound: the native stream table evicted
+        # this stream's request before its response completed. The response
+        # is a real observation — a status, an end — so the span ships, but
+        # its `? /` is a display fallback for a request wardex lost, and it
+        # may only ever appear with the marker that says so. Counted here,
+        # before the seam's status and capture-mode filters, so the loss is
+        # visible even when no span survives them.
+        #
+        # A plain attribute read: a default here is the shape that would make
+        # every marker vanish silently if the native field were ever renamed.
+        request_evicted = bool(t.request_evicted)
+        if request_evicted:
+            counters.bump("protocol.http2.stream_evicted")
         return _Txn(
             method=t.method or "?",
             path=t.path or "/",
@@ -475,7 +508,8 @@ class _Http2Tracker:
             start_ns=start,
             end_ns=now,
             ttfb_ms=0.0,  # per-h2-stream first-byte not tracked (limitation)
-            truncated=t.truncated,
+            truncated=t.truncated or request_evicted,
+            limitations=(Limitation.H2_REQUEST_EVICTED,) if request_evicted else (),
             version="2",
             ttft_ms=0.0,  # per-h2-stream first-body-byte not tracked (limitation)
             content_type=getattr(t, "content_type", None),

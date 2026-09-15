@@ -133,6 +133,12 @@ impl Http2Transaction {
     fn grpc_message(&self) -> Option<String> {
         self.inner.grpc_message.clone()
     }
+    /// The stream table evicted this stream's request half before the
+    /// response completed: `method` and `path` are absent, not empty.
+    #[getter]
+    fn request_evicted(&self) -> bool {
+        self.inner.request_evicted
+    }
 }
 
 /// Incremental parser for a single h2 connection.
@@ -168,6 +174,12 @@ impl Http2Parser {
                 .collect();
             Ok((r.opened_request_streams, txns))
         })
+    }
+
+    /// Why the parser latched off, if it did. `None` while the connection is
+    /// still parsing normally.
+    fn disabled_reason(&self) -> PyResult<Option<&'static str>> {
+        shielded(|| Ok(self.inner.disabled_reason()))
     }
 }
 

@@ -346,6 +346,14 @@ enum Limitation {
   //    and endpoint are KNOWN; the transport is the gap. Not 46/47: those skip
   //    a parse for capacity and a knob restores it.
   LIMITATION_WS_LLM_SEMANTICS_UNREAD = 48;
+  //    The HTTP/2 stream table hit `max_streams` and evicted this stream's
+  //    request half (lowest stream id first) before its response completed:
+  //    method, path and request body are absent, while the status, the
+  //    response half and the end of the exchange are real observations. The
+  //    span is also truncated. Names `max_streams`. Not CONNECTION_EVICTED
+  //    (22): that names `max_connections` and ends a whole connection's span;
+  //    this removes half of one exchange on a connection still captured.
+  LIMITATION_H2_REQUEST_EVICTED = 53;
 
   // -- Adapter session.
   LIMITATION_SESSION_ABORTED = 37;

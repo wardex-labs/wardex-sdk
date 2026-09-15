@@ -162,6 +162,31 @@ All notable changes to this project are documented here. The format follows
   timing it received was a neighbour's. The new marker is value 52 in
   `wardex.v1.Limitation`, and `adapters.anthropic.otel_bridge.llm_join_tolerant`
   counts it.
+- **An HTTP/2 connection that stops being captured now says so.** The h2
+  parser latches a connection off when a header block cannot be decoded — the
+  ordinary outcome of attaching `wardex.init()` to a pooled keep-alive whose
+  HPACK table was built earlier — and it was the one parser with no reason to
+  report: `init(debug=True)` printed nothing and no counter moved. The reason
+  (`hpack_decode_failed`, `continuation_without_headers`,
+  `push_promise_unsynced`, `frame_malformed`) is now printed under debug, and
+  every latched connection, h2 or HTTP/1, counts once under
+  `interceptors.seam.parser_disabled` whether debug is on or not.
+- **A burst of HTTP/2 streams past `max_streams` no longer produces unmarked
+  `? /` spans.** The stream table evicted an arbitrary stream (a hash-map
+  iteration order) and the evicted stream's response became a span with no
+  method, no path, `truncated=False` and no marker; streams opened by DATA
+  frames were not bounded at all. The lowest stream ids are now evicted first,
+  every frame type is held to the bound, and the response of an evicted stream
+  ships `truncated` with the new marker `h2_request_evicted` (vocabulary 53),
+  counted under `protocol.http2.stream_evicted` — whether the response arrives
+  in one HEADERS frame or as HEADERS then DATA. Responses to evicted streams
+  are held to their own `max_streams` bound, so they never push out a request
+  still held; a server-pushed (even-id) stream is never reported as evicted. Two other sources of the same
+  unmarked `? /` span are closed as well: frames the server had already sent
+  for a stream the host reset are now discarded, as the host's own client
+  discards them, and a response whose request the parser never saw (the stream
+  was opened before capture attached) is no longer shipped but counted under
+  `protocol.http2.request_unobserved`.
 
 ## [0.6.0b1] - 2026-09-06
 

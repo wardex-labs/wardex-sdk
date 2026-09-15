@@ -16,3 +16,8 @@ class Http2Parser:
     def feed(self, from_client: bool, data: bytes) -> tuple[list[int], list[Any]]:
         # returns: (opened_request_streams, [native Http2Transaction ...])
         return self._native.feed(from_client, data)
+
+    def disabled_reason(self) -> str | None:
+        """Why the connection latched off, if it did — a debug string, never a
+        span marker: no transaction exists to carry it."""
+        return self._native.disabled_reason()  # type: ignore[no-any-return]
