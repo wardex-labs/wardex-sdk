@@ -37,11 +37,13 @@ from test_langgraph_adapter import (
     TrailState,
     _clean_scope,  # noqa: F401 — the autouse determinism fixture this module needs too
     adapter_counters,
+    extra_of,
     installed,  # noqa: F401 — a fixture, usable here only because it is imported
     runs,
     steps,
 )
-from wardex_sdk._assembly import LinkReason
+from wardex_sdk._adapters._langgraph_links import _join_sources
+from wardex_sdk._assembly import Limitation, LinkReason
 from wardex_sdk._types import Envelope
 from wardex_sdk.transport import _codec
 
@@ -107,6 +109,35 @@ def _send_fanout(name: str = "Fan"):
     return app
 
 
+def _plus_join_graph(extra_nodes: tuple[str, ...], name: str):
+    """A joint edge FROM a node literally named `a+b` and from `a`, into `c`.
+
+    The compiler spells the trigger `join:a+b+a:c` — verified on the pinned
+    band — so a `+` inside a node name and the `+` between two sources are
+    the same character. `extra_nodes` are nodes that exist and run but are
+    NOT sources of the join: they are what decides how many readings the
+    string admits.
+    """
+    g = StateGraph(TrailState)
+    for node in ("a", "a+b", "c", *extra_nodes):
+        g.add_node(node, _node(node))
+    g.add_edge(START, "a")
+    g.add_edge("a", "a+b")
+    for node in extra_nodes:
+        g.add_edge(START, node)
+        g.add_edge(node, END)
+    g.add_edge(["a+b", "a"], "c")
+    g.add_edge("c", END)
+    app = g.compile()
+    app.name = name
+    return app
+
+
+def _markers(span) -> tuple:
+    integrity = span.capture_integrity
+    return tuple(integrity.limitations) if integrity else ()
+
+
 def _step_named(spans, name: str):
     return next(s for s in steps(spans) if s.name == f"execute_step {name}")
 
@@ -138,6 +169,82 @@ def test_a_join_edge_names_its_sources_and_each_gets_a_triggered_by_link(install
     assert {link.span_id for link in c.links} == {a.context.span_id, b.context.span_id}
     assert all(link.trace_id == c.context.trace_id for link in c.links)
     assert "adapters.langgraph.link_target_unresolved" not in adapter_counters()
+
+
+def test_a_plus_inside_a_node_name_resolves_against_the_graphs_node_set(installed):  # noqa: F811
+    """`join:a+b+a:c` split on every `+` reads as sources `a`, `b`, `a` — and
+    with no node `b` in the graph, the only reading of the string that spells
+    node names is `a+b`, `a`. The node set is what makes the split exact, so
+    the joined step links to the two nodes that really wrote the barrier and
+    says nothing about ambiguity, because there was none.
+    """
+    _plus_join_graph((), "PlusResolved").invoke({"trail": []})
+
+    spans = installed.spans
+    a, a_plus_b, c = (_step_named(spans, n) for n in ("a", "a+b", "c"))
+    assert "join:a+b+a:c" in extra_of(c)["wardex.step.trigger"]
+    assert all(link.reason is LinkReason.TRIGGERED_BY for link in c.links)
+    assert sorted(link.span_id.value for link in c.links) == sorted(
+        [a.context.span_id.value, a_plus_b.context.span_id.value]
+    )
+    assert Limitation.LINK_AMBIGUOUS not in _markers(c)
+    assert "adapters.langgraph.join_ambiguous" not in adapter_counters()
+    assert "adapters.langgraph.link_target_unresolved" not in adapter_counters()
+
+
+def test_a_plus_inside_a_node_name_never_manufactures_a_link_to_its_parts(installed):  # noqa: F811
+    """The same joint edge in a graph that ALSO has a node `b`, which runs and
+    is no source of `c`. Splitting on `+` would link `c` to `b` — an edge that
+    does not exist, with both aliases resolving, so no counter would ever have
+    said so.
+
+    Resolving against the node set does not rescue this string: the compiler
+    keeps a repeated start verbatim (`add_edge(["a", "b", "a"], "c")` spells
+    `join:a+b+a:c` too), so `a`, `b`, `a` is a reading the graph could have
+    produced beside `a+b`, `a`. Two readings, so NO link, and the refusal is
+    visible twice: a counter for the operator and a marker on the step.
+    """
+    _plus_join_graph(("b",), "PlusWithParts").invoke({"trail": []})
+
+    spans = installed.spans
+    b, c = _step_named(spans, "b"), _step_named(spans, "c")
+    assert all(link.span_id != b.context.span_id for link in c.links)
+    assert c.links == ()
+    assert adapter_counters()["adapters.langgraph.join_ambiguous"] == 1
+    assert Limitation.LINK_AMBIGUOUS in _markers(c)
+    assert "adapters.langgraph.link_target_unresolved" not in adapter_counters()
+
+
+def test_a_join_string_with_two_readings_of_distinct_nodes_links_nothing(installed):  # noqa: F811
+    """Nodes `a`, `b`, `a+b` and `b+a`: `a+b+a` spells `a+b`, `a` AND `a`,
+    `b+a` — two joins the compiler would print identically, each naming
+    distinct real nodes. No selector can pick between them, so the step
+    carries zero `TRIGGERED_BY` links, one `join_ambiguous` count and the
+    `LINK_AMBIGUOUS` marker, and no span anywhere is linked by guesswork.
+    """
+    _plus_join_graph(("b", "b+a"), "PlusAmbiguous").invoke({"trail": []})
+
+    spans = installed.spans
+    c = _step_named(spans, "c")
+    assert [link for link in c.links if link.reason is LinkReason.TRIGGERED_BY] == []
+    assert adapter_counters()["adapters.langgraph.join_ambiguous"] == 1
+    assert Limitation.LINK_AMBIGUOUS in _markers(c)
+    assert all(s.links == () for s in steps(spans))
+
+
+def test_a_plus_join_is_refused_when_the_node_set_is_unknown():
+    """The resolver's own contract, for the one input a real graph run cannot
+    reach on demand: a step whose run's node set was never recorded (the
+    run's describe failed, or the step is not under the run it claims). A
+    `+`-free string has exactly one reading and needs no node set; anything
+    with a `+` does, and without it the answer is a refusal, never a split.
+    """
+    assert _join_sources("worker", None) == ("worker",)
+    assert _join_sources("a+b", None) is None
+    assert _join_sources("a+b", frozenset({"a", "b"})) == ("a", "b")
+    assert _join_sources("a+b", frozenset({"a", "b", "a+b"})) is None
+    assert _join_sources("a+b+a", frozenset({"a", "a+b"})) == ("a+b", "a")
+    assert _join_sources("a+c", frozenset({"a", "b"})) is None
 
 
 def test_a_plain_chain_carries_no_triggered_by_links(installed):  # noqa: F811

@@ -253,6 +253,10 @@ _MEMBER_SITES: dict[str, frozenset[str]] = {
     # The tracker names the member (confirmed on the first client message);
     # the seam re-attaches `txn.ws_markers` by variable, not by site.
     "WS_LLM_SEMANTICS_UNREAD": frozenset({"_interceptors/_trackers.py"}),
+    # --- identity ambiguity ---
+    # The LangGraph join trigger whose `+`-joined sources have more than one
+    # reading against the graph's node set: no link, this marker instead.
+    "LINK_AMBIGUOUS": frozenset({"_adapters/_langgraph_links.py"}),
     # --- unit / adapter lifecycle ---
     "CHILD_SPAN_UNCLOSED": frozenset({"_adapters/_assembler.py", "_assembly/_units.py"}),
     # The registry's own breadth bound: `UnitRegistry.open` (child table) and
@@ -645,6 +649,11 @@ _EMITTED_MEMBERS: frozenset[str] = frozenset(
         # it, a Responses-over-WebSocket connection produced no span and no
         # counter under the default mode.
         "WS_LLM_SEMANTICS_UNREAD",
+        # The twentieth: the ambiguous-join marker, minted WITH its emitter
+        # (the LangGraph adapter's `_langgraph_links._node_links`) in the same commit. Before
+        # it, a `+` inside a node name split into a link to a node that never
+        # triggered the step, with nothing counted and nothing marked.
+        "LINK_AMBIGUOUS",
     }
 )
 """Which MEMBERS have an emit site today, derived independently below.
@@ -1605,16 +1614,22 @@ _VOCABULARY: dict[str, str] = {
     #     SEMANTIC_PARSE_FAILED (no parser ran) and from the deferred-parse
     #     pair (no knob restores the parse; the transport is the gap) ---
     "WS_LLM_SEMANTICS_UNREAD": "ws_llm_semantics_unread",
+    # --- added after the census, by the LangGraph join reading (1): a link
+    #     the span is owed and did not get, because the source string has
+    #     more than one reading — kept apart from TOOL_NAME_COLLISION (that
+    #     is the span's own identity; this is an edge to another span) ---
+    "LINK_AMBIGUOUS": "link_ambiguous",
 }
 
 
-def test_the_vocabulary_is_exactly_these_forty_eight() -> None:
+def test_the_vocabulary_is_exactly_these_forty_nine() -> None:
     """15 declared before the census + 21 from it + 1 from §5.4 + 1 for wardex
     itself + 1 for the OTLP size guard + 1 for the registry breadth bound
     + 2 for the OTel bridge's fail-open pair + 1 for the adapter's per-session
     bound + 1 for the dynamic-key bound + 1 for the fork tracking reset
     + 2 for the deferred-parse queue's unparsed shipments + 1 for the
-    WebSocket LLM-transport marker, name by name.
+    WebSocket LLM-transport marker + 1 for the ambiguous LangGraph join,
+    name by name.
 
     A count alone is not enough: a RENAME keeps the count and is the single most
     expensive mistake available here. These are proto enum values in
