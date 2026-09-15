@@ -36,7 +36,6 @@ from wardex_sdk.transport import _codec
 def _header() -> EnvelopeHeader:
     return EnvelopeHeader(
         event_id="evt-1",
-        api_key="k",
         sdk=SdkInfo(
             name="wardex.python", version="0.1.0", python_version="3.12", os="mac", arch="arm64"
         ),
@@ -99,7 +98,10 @@ def test_roundtrip_header():
     out = _codec.decode(_codec.encode(_env(_span())))
     h = out["header"]
     assert h["event_id"] == "evt-1"
-    assert h["api_key"] == "k"
+    # No credential rides in the body, and the project slot leaves the SDK
+    # empty: the receiver, not the sender, says which project a batch is.
+    assert "api_key" not in h
+    assert h["project_id"] == ""
     assert h["sent_at_unix_nano"] == 42
     assert h["sdk"]["name"] == "wardex.python"
     assert h["sdk"]["version"] == "0.1.0"

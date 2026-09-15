@@ -15,12 +15,25 @@ message Envelope {
 
 message EnvelopeHeader {
   string event_id = 1;
-  string api_key = 2;
+  // Field 2 was `string api_key`, retired before any envelope was ever
+  // stored. A credential travels in the HTTP `Authorization` header of the
+  // request that carries the envelope and is never written into a body: a
+  // stored batch must be readable without holding a secret. The number and
+  // the name are both reserved so neither can be reused with a new meaning.
+  reserved 2;
+  reserved "api_key";
   SdkInfo sdk = 3;
   fixed64 sent_at_unix_nano = 4;
   SessionStatus session_status = 5;
   RetentionClass retention_class = 6;  // retention grade for this batch trace (v2)
   ResourceInfo resource = 7;           // the host APPLICATION's identity (never the SDK's)
+  // Which project this batch belongs to. STAMPED BY THE RECEIVER from the
+  // API key it authenticated, before the envelope is stored: one key names
+  // one project, so the receiver knows the answer and the sender is never
+  // asked to claim it. The SDK sends this empty; a non-empty value from a
+  // client is overwritten and counted, never trusted. Empty in a stored
+  // envelope is a receiver bug, not a legal state.
+  string project_id = 8;
 }
 
 // The exporting APPLICATION's identity — what OTLP resource attributes are

@@ -23,7 +23,9 @@ PII_INPUT = b"contact john.doe@acme.com card 4111-1111-1111-1111 from 10.0.0.5"
 def _header() -> EnvelopeHeader:
     return EnvelopeHeader(
         event_id="evt-1",
-        api_key="sk-live-aaaaaaaaaaaaaaaa1234",  # secret-shaped on purpose: must survive
+        # Secret-shaped on purpose: the receiver-stamped id is whitelisted and
+        # must survive masking untouched.
+        project_id="sk-live-aaaaaaaaaaaaaaaa1234",
         sdk=SdkInfo(
             name="wardex.python", version="0.1.0", python_version="3.12", os="mac", arch="arm64"
         ),
@@ -60,10 +62,10 @@ class TestNativeContract:
         assert b"10.0.0.5" not in span["input_data"]
         assert span["capture_integrity"]["redacted"] is True
 
-    def test_api_key_is_never_masked(self):
+    def test_project_id_is_never_masked(self):
         env = _env(_span(input_data=PII_INPUT))
         out = _codec.decode(_codec.encode(env, pii_mode="mask", pii_disabled=()))
-        assert out["header"]["api_key"] == "sk-live-aaaaaaaaaaaaaaaa1234"
+        assert out["header"]["project_id"] == "sk-live-aaaaaaaaaaaaaaaa1234"
 
     def test_off_mode_is_byte_identical_to_legacy(self):
         env = _env(_span(input_data=PII_INPUT))

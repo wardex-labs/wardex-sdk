@@ -42,7 +42,6 @@ from wardex_sdk._types import (
 def _header() -> EnvelopeHeader:
     return EnvelopeHeader(
         event_id="evt-1",
-        api_key="k",
         sdk=SdkInfo(
             name="wardex.python",
             version="0.1.0",
@@ -406,7 +405,6 @@ def test_resource_identity_comes_from_the_configured_resource():
     env = Envelope(
         header=EnvelopeHeader(
             event_id="evt-1",
-            api_key="k",
             sdk=_header().sdk,
             sent_at_ns=42,
             resource=ResourceInfo(

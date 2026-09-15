@@ -1088,7 +1088,6 @@ def _otlp_envelope(payload: bytes):
     return Envelope(
         header=EnvelopeHeader(
             event_id="evt",
-            api_key="k",
             sdk=SdkInfo(
                 name="wardex.python",
                 version="0.1.0",

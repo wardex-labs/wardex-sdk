@@ -84,7 +84,6 @@ _ANTHROPIC_RESP = json.dumps(
 def _header() -> EnvelopeHeader:
     return EnvelopeHeader(
         event_id="oracle",
-        api_key="k",
         sdk=SdkInfo(
             name="wardex.python",
             version="0.0.0",

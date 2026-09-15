@@ -222,7 +222,6 @@ def test_embeddings_span_is_embeddings_with_usage_once_and_no_output_type():
     env = Envelope(
         header=EnvelopeHeader(
             event_id="evt-emb",
-            api_key="k",
             sdk=SdkInfo(
                 name="wardex.python",
                 version="0",

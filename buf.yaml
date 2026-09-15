@@ -7,3 +7,11 @@ lint:
 breaking:
   use:
     - FILE
+  # `EnvelopeHeader.api_key` (field 2) was retired on purpose, before any
+  # envelope had been stored anywhere, so there are no bytes to stay
+  # compatible with. Listing the file here is the deliberate act that lets
+  # the deletion through: remove this entry and `buf breaking` turns red on
+  # that field, which is exactly what should happen to the next attempt.
+  ignore_only:
+    FIELD_NO_DELETE:
+      - proto/wardex/v1/envelope.proto

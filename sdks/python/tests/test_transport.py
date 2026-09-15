@@ -7,7 +7,7 @@ def _envelope():
     sdk = SdkInfo(
         name="wardex.python", version="0.1.0", python_version="3.10", os="darwin", arch="arm64"
     )
-    return Envelope(header=EnvelopeHeader(event_id="e1", api_key="", sdk=sdk, sent_at_ns=0))
+    return Envelope(header=EnvelopeHeader(event_id="e1", sdk=sdk, sent_at_ns=0))
 
 
 def test_noop_captures_nothing_and_closes():

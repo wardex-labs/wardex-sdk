@@ -128,12 +128,15 @@ fn mask_any(engine: &PiiEngine, v: &mut pb::AnyValue) -> bool {
 fn mask_header(engine: &PiiEngine, h: &mut pb::EnvelopeHeader) {
     let pb::EnvelopeHeader {
         event_id,
-        api_key: _, // WHITELIST: our own backend credential — masking breaks auth (§4.4)
         sdk,
         sent_at_unix_nano: _,
         session_status: _,
         retention_class: _,
         resource,
+        // WHITELIST: stamped by the receiver from the authenticated API key,
+        // never host free text — the SDK sends it empty. Rewriting it would
+        // detach a stored batch from its project.
+        project_id: _,
     } = h;
     mask_string(engine, event_id);
     if let Some(r) = resource {
@@ -655,7 +658,9 @@ mod tests {
         pb::Envelope {
             header: Some(pb::EnvelopeHeader {
                 event_id: "evt".into(),
-                api_key: "sk-live-aaaaaaaaaaaaaaaa1234".into(), // matches the secret pattern on purpose
+                // Secret-shaped on purpose: the whitelist must hold even for a
+                // value the secret pattern would otherwise catch.
+                project_id: "sk-live-aaaaaaaaaaaaaaaa1234".into(),
                 ..Default::default()
             }),
             items: vec![pb::EnvelopeItem {
@@ -693,11 +698,11 @@ mod tests {
     }
 
     #[test]
-    fn api_key_is_whitelisted() {
+    fn project_id_is_whitelisted() {
         let mut env = env_with(pii_span());
         mask_envelope(&engine(), &mut env);
         assert_eq!(
-            env.header.as_ref().unwrap().api_key,
+            env.header.as_ref().unwrap().project_id,
             "sk-live-aaaaaaaaaaaaaaaa1234"
         );
     }
