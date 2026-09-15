@@ -427,6 +427,13 @@ impl LlmSemantics {
     fn output_messages(&self) -> Option<String> {
         self.inner.output_messages.clone()
     }
+    /// The provider label is a guess (host substring, body shape or API
+    /// shape), not read off the provider's own host. Python marks the span
+    /// `provider_inferred` and counts it.
+    #[getter]
+    fn provider_inferred(&self) -> bool {
+        self.inner.provider_inferred
+    }
     #[getter]
     fn tool_args_unparsed(&self) -> bool {
         self.inner.tool_args_unparsed

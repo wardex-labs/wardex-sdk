@@ -1,0 +1,7 @@
+{
+ "host": "openai-mock.corp",
+ "path": "/v1/responses",
+ "provider": "openai",
+ "inferred": true,
+ "why": "A mock whose hostname merely contains the provider's name. The host substring names openai, but the host is not an openai.com host, so the label must carry the inference marker."
+}

@@ -316,6 +316,14 @@ enum Limitation {
   LIMITATION_TOOL_ARGS_UNPARSED = 28;
   LIMITATION_OUTPUT_MESSAGES_UNMAPPED_PART = 29;
   LIMITATION_INPUT_MESSAGES_UNMAPPED_PART = 30;
+  //    `gen_ai.provider.name` is a guess, not read off one of that provider's
+  //    own hosts: the hostname merely contains a provider's name (a proxy, a
+  //    mock, an Azure OpenAI deployment), or names none and the label came
+  //    from the response body's shape or the path's API shape (a gateway,
+  //    localhost). The semantics are parsed as usual; only the label is
+  //    uncertain. Names NO knob. Not SSE_UNKNOWN_PROVIDER (33): there no
+  //    reassembler recognized the stream and no label exists at all.
+  LIMITATION_PROVIDER_INFERRED = 54;
 
   // -- Streaming.
   LIMITATION_REASSEMBLED_FROM_STREAM = 31;

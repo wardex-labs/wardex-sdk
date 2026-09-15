@@ -1,0 +1,7 @@
+{
+ "host": "llm-gw.corp.internal",
+ "path": "/v1/chat/completions",
+ "provider": "openai",
+ "inferred": true,
+ "why": "A gateway host that names no provider. The label comes from the OpenAI-shaped response body; the upstream model vendor behind the gateway is not visible on the wire, so the label is a guess and must carry the inference marker."
+}

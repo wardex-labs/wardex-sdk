@@ -1986,3 +1986,157 @@ fn input_text_is_text_only_under_a_non_assistant_role() {
         serde_json::json!([{"type": "input_text"}])
     );
 }
+
+// --- provider-label inference (the heuristic the label used to hide) -------
+
+/// `parse_llm` that must answer, spelled without `unwrap`/`expect` so these
+/// tests stay out of the crate's panic-site count.
+fn parsed(host: &str, path: &str, req: &[u8], resp: &[u8]) -> LlmSemantics {
+    match parse_llm(host, path, req, resp, Limits::default()) {
+        Some(s) => s,
+        None => panic!("{host}{path}: no semantics"),
+    }
+}
+
+/// The provider label is proven only by the provider's own host. Every other
+/// way to arrive at it — a hostname that merely CONTAINS a provider's name, a
+/// response body's shape, or the API shape of the path when the host names
+/// nothing — is a guess, and `provider_inferred` says so, so the span can
+/// carry a marker instead of presenting the guess as a fact.
+#[test]
+fn provider_label_is_inferred_unless_the_host_is_the_providers_own() {
+    let official = [
+        (
+            "api.openai.com",
+            "/v1/chat/completions",
+            OPENAI_REQ,
+            OPENAI_CHAT,
+        ),
+        (
+            "api.anthropic.com",
+            "/v1/messages",
+            b"{}" as &[u8],
+            ANTHROPIC_MSG,
+        ),
+        // The Anthropic-owned host serving the OpenAI-compatible Chat shape:
+        // the label is still the host's, and the host is the provider's own.
+        (
+            "api.anthropic.com",
+            "/v1/chat/completions",
+            OPENAI_REQ,
+            OPENAI_CHAT,
+        ),
+    ];
+    for (host, path, req, resp) in official {
+        let s = parsed(host, path, req, resp);
+        assert!(
+            !s.provider_inferred,
+            "{host}{path}: official host marked inferred"
+        );
+    }
+    let inferred = [
+        // host substring on a host the provider does not own
+        (
+            "myopenai-proxy.internal",
+            "/v1/chat/completions",
+            OPENAI_REQ,
+            OPENAI_CHAT,
+            "openai",
+        ),
+        (
+            "openai.com.example.net",
+            "/v1/chat/completions",
+            OPENAI_REQ,
+            OPENAI_CHAT,
+            "openai",
+        ),
+        (
+            "anthropic-proxy.corp",
+            "/v1/messages",
+            b"{}" as &[u8],
+            ANTHROPIC_MSG,
+            "anthropic",
+        ),
+        // body shape, the host names nothing
+        (
+            "127.0.0.1",
+            "/v1/chat/completions",
+            OPENAI_REQ,
+            OPENAI_CHAT,
+            "openai",
+        ),
+        (
+            "127.0.0.1",
+            "/v1/messages",
+            b"{}" as &[u8],
+            ANTHROPIC_MSG,
+            "anthropic",
+        ),
+        // API shape of a stream, the host names nothing
+        (
+            "127.0.0.1",
+            "/v1/chat/completions",
+            b"{}" as &[u8],
+            OPENAI_SSE,
+            "openai",
+        ),
+    ];
+    for (host, path, req, resp, want) in inferred {
+        let s = parsed(host, path, req, resp);
+        assert_eq!(s.provider, want, "{host}{path}");
+        assert!(
+            s.provider_inferred,
+            "{host}{path}: inferred label not marked"
+        );
+    }
+    // An official host's stream is not a guess either.
+    let s = parsed("api.openai.com", "/v1/chat/completions", b"{}", OPENAI_SSE);
+    assert!(!s.provider_inferred);
+}
+
+/// The negative corpus (`fixtures/llm/negatives/`), read by the Python rate
+/// table too: each case names its dispatch inputs and its truth in
+/// `truth.json`, and the parser must agree on BOTH the label and whether the
+/// label was inferred.
+#[test]
+fn negative_fixtures_match_their_truth() {
+    let cases = [
+        (
+            "azure_openai_deployment",
+            fixture!("negatives/azure_openai_deployment", "truth.json"),
+            fixture!("negatives/azure_openai_deployment", "request.json"),
+            fixture!("negatives/azure_openai_deployment", "response.json"),
+        ),
+        (
+            "litellm_gateway",
+            fixture!("negatives/litellm_gateway", "truth.json"),
+            fixture!("negatives/litellm_gateway", "request.json"),
+            fixture!("negatives/litellm_gateway", "response.json"),
+        ),
+        (
+            "openai_mock_host",
+            fixture!("negatives/openai_mock_host", "truth.json"),
+            fixture!("negatives/openai_mock_host", "request.json"),
+            fixture!("negatives/openai_mock_host", "response.json"),
+        ),
+    ];
+    for (case, truth, req, resp) in cases {
+        let Ok(truth) = serde_json::from_slice::<serde_json::Value>(truth) else {
+            panic!("{case}: truth.json is not JSON");
+        };
+        let (Some(host), Some(path)) = (truth["host"].as_str(), truth["path"].as_str()) else {
+            panic!("{case}: truth.json names no host/path");
+        };
+        let s = parsed(host, path, req, resp);
+        assert_eq!(
+            Some(s.provider.as_str()),
+            truth["provider"].as_str(),
+            "{case}"
+        );
+        assert_eq!(
+            Some(s.provider_inferred),
+            truth["inferred"].as_bool(),
+            "{case}"
+        );
+    }
+}

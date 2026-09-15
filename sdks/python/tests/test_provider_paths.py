@@ -218,8 +218,11 @@ def test_responses_compact_is_a_billable_llm_call_under_agent_mode():
             assert sp.gen_ai.response_id == "resp_cmp1"
             assert not sp.gen_ai.finish_reasons
             assert sp.gen_ai.response_status is None
-            # provider from the body shape: the host here is 127.0.0.1
+            # provider from the body shape: the host here is 127.0.0.1, so the
+            # label is a guess and the span says so, once, with one count
             assert sp.gen_ai.provider == ProviderName.OPENAI
+            assert Limitation.PROVIDER_INFERRED in sp.capture_integrity.limitations
+            assert counters.get("protocol.semantic.provider_inferred") == 1
             extra = dict(sp.extra)
             assert extra["openai.api.type"] == "responses"
             # the one thing that tells a compaction from a chat at export
@@ -238,3 +241,25 @@ def test_responses_compact_is_a_billable_llm_call_under_agent_mode():
                     assert all(part.get("content") != "hello" for part in m["parts"])
         finally:
             wardex.close()
+
+
+class _Sem:
+    """The two facts `provider_limitation` reads, and nothing else."""
+
+    def __init__(self, provider: str, provider_inferred: bool) -> None:
+        self.provider = provider
+        self.provider_inferred = provider_inferred
+
+
+def test_a_proven_provider_label_carries_no_marker_and_no_count():
+    from wardex_sdk._semantics import provider_limitation
+
+    assert provider_limitation(_Sem("openai", False)) is None
+    assert counters.get("protocol.semantic.provider_inferred") == 0
+
+
+def test_an_inferred_provider_label_is_marked_and_counted():
+    from wardex_sdk._semantics import provider_limitation
+
+    assert provider_limitation(_Sem("openai", True)) is Limitation.PROVIDER_INFERRED
+    assert counters.get("protocol.semantic.provider_inferred") == 1

@@ -227,7 +227,9 @@ pub enum WsUpgrade {
 /// `/v1/responses` must not earn that on the strength of its hostname. The
 /// HTTP path refuses the same claim (the seam wants parsed semantics, not a
 /// hostname) and this keeps the two transports honest to the same degree.
-fn is_official_host(provider: &str, host: &str) -> bool {
+/// The provider label asks it too, afterwards: a label this does not confirm
+/// ships with `provider_inferred` set, so the hint is marked as one.
+pub(super) fn is_official_host(provider: &str, host: &str) -> bool {
     let host = host.to_ascii_lowercase();
     let domain = match provider {
         "openai" => "openai.com",

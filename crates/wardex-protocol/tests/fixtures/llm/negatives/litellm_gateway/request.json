@@ -1,0 +1,18 @@
+{
+ "model": "gpt-4o-mini",
+ "temperature": 0.5,
+ "max_tokens": 256,
+ "top_p": 1.0,
+ "service_tier": "auto",
+ "reasoning_effort": "low",
+ "messages": [
+  {
+   "role": "system",
+   "content": "You are a helpful assistant."
+  },
+  {
+   "role": "user",
+   "content": "Say hello."
+  }
+ ]
+}

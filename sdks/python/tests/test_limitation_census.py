@@ -246,6 +246,10 @@ _MEMBER_SITES: dict[str, frozenset[str]] = {
     "TOOL_ARGS_UNPARSED": frozenset({"_interceptors/_seam.py"}),
     "OUTPUT_MESSAGES_UNMAPPED_PART": frozenset({"_interceptors/_seam.py"}),
     "INPUT_MESSAGES_UNMAPPED_PART": frozenset({"_interceptors/_seam.py"}),
+    # Decided in `_semantics/_genai.py::provider_limitation` off the native
+    # parser's `provider_inferred`; the seam forwards it (the recorded
+    # `Name:limitation` hole) onto an identified span.
+    "PROVIDER_INFERRED": frozenset({"_semantics/_genai.py"}),
     # --- streaming ---
     "REASSEMBLED_FROM_STREAM": frozenset({"_interceptors/_seam.py"}),
     "STREAM_USAGE_UNAVAILABLE": frozenset({"_interceptors/_seam.py"}),
@@ -715,6 +719,11 @@ _EMITTED_MEMBERS: frozenset[str] = frozenset(
         # transaction's `request_evicted`). Before it, the response of an
         # evicted stream shipped as `? /` with no marker and no counter.
         "H2_REQUEST_EVICTED",
+        # The twenty-fourth: the inferred provider label, minted WITH its
+        # emitter (`provider_limitation`, fed by the native parser's
+        # `provider_inferred`). Before it, a gateway, a mock or an Azure
+        # deployment labelled `openai` looked exactly like `api.openai.com`.
+        "PROVIDER_INFERRED",
     }
 )
 """Which MEMBERS have an emit site today, derived independently below.
@@ -1281,6 +1290,11 @@ _UNRESOLVED_PY: frozenset[tuple[str, str]] = frozenset(
         ("_adapters/_context.py", "Name:marker"),
         ("_interceptors/_seam.py", "Name:marker"),
         ("_interceptors/_seam.py", "Tuple"),
+        # `if (limitation := provider_limitation(sem)) is not None:
+        # draft.add_limitation(limitation)` — a forward of the one member
+        # `_semantics/_genai.py::provider_limitation` decides, spelled there in
+        # a marker-ish assignment `_MEMBER_SITES` records.
+        ("_interceptors/_seam.py", "Name:limitation"),
         # `_seal`'s `timing_markers=tuple(timing_markers)` — the sealed copy
         # of `_resolve_timing`'s tuple (plus, on a fork-crossing connection,
         # TRACKING_RESET_AT_FORK, spelled out two lines above where
@@ -1700,10 +1714,15 @@ _VOCABULARY: dict[str, str] = {
     #     apart from CONNECTION_EVICTED (a different table and knob, and a
     #     whole connection rather than half of one exchange) ---
     "H2_REQUEST_EVICTED": "h2_request_evicted",
+    # --- added after the census, by the LLM parser's provider label (1): a
+    #     label read off a hostname that merely contains a provider's name, a
+    #     body shape or an API shape, rather than the provider's own host —
+    #     kept apart from SSE_UNKNOWN_PROVIDER (no label exists there at all) ---
+    "PROVIDER_INFERRED": "provider_inferred",
 }
 
 
-def test_the_vocabulary_is_exactly_these_fifty_three() -> None:
+def test_the_vocabulary_is_exactly_these_fifty_four() -> None:
     """15 declared before the census + 21 from it + 1 from §5.4 + 1 for wardex
     itself + 1 for the OTLP size guard + 1 for the registry breadth bound
     + 2 for the OTel bridge's fail-open pair + 1 for the adapter's per-session
@@ -1712,7 +1731,8 @@ def test_the_vocabulary_is_exactly_these_fifty_three() -> None:
     WebSocket LLM-transport marker + 1 for the ambiguous LangGraph join
     + 1 for the unresolved peer address + 1 for the alias bound's forgotten
     id + 1 for the OTel bridge's tolerant chat join + 1 for the h2 stream
-    table's evicted request half, name by name.
+    table's evicted request half + 1 for the inferred provider label, name by
+    name.
 
     A count alone is not enough: a RENAME keeps the count and is the single most
     expensive mistake available here. These are proto enum values in

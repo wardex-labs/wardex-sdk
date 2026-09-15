@@ -1,0 +1,16 @@
+{
+ "model": "gpt-4.1",
+ "input": "Say hello.",
+ "instructions": "You are a helpful assistant.",
+ "reasoning": {
+  "effort": "low"
+ },
+ "max_output_tokens": 256,
+ "temperature": 0.7,
+ "service_tier": "auto",
+ "text": {
+  "format": {
+   "type": "text"
+  }
+ }
+}

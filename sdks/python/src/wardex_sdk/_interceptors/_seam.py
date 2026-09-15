@@ -46,6 +46,7 @@ from .._semantics import (
     has_core_semantics,
     identifies_llm_call,
     provider_extras,
+    provider_limitation,
     ws_close_name,
 )
 from .._suppress import is_suppressed
@@ -1065,12 +1066,12 @@ def _assemble(p: _PendingTxn, *, parse: bool, extra: tuple[Limitation, ...]) -> 
             identified = _is_llm_traffic(txn, sem)
             if identified:
                 draft.set_gen_ai(build_gen_ai(sem))
-                # The open half rides only on an IDENTIFIED span: the
-                # `openai.*` scalars, the provider-usage mirror, and —
-                # when the key-count bound dropped leaves — the marker,
-                # the count and the diagnostics bump as ONE fact. An
-                # unidentified span gets none of the family, so a marker
-                # explaining keys that are not there cannot exist.
+                if (limitation := provider_limitation(sem)) is not None:
+                    draft.add_limitation(limitation)  # the label above is a guess
+                # The open half rides only on an IDENTIFIED span: the `openai.*` scalars, the
+                # provider-usage mirror, and — when the key-count bound dropped leaves — the
+                # marker, the count and the diagnostics bump as ONE fact. An unidentified span
+                # gets none of the family, so a marker explaining absent keys cannot exist.
                 for key, value in provider_extras(sem):
                     draft.set_extra(key, value)
                 dropped = getattr(sem, "usage_dropped_count", 0)
@@ -1082,9 +1083,8 @@ def _assemble(p: _PendingTxn, *, parse: bool, extra: tuple[Limitation, ...]) -> 
                 if embeddings is not None:
                     draft.set_embeddings(embeddings)
             if streamed and sem.stream_terminated is False:
-                # Outside the identity gate on purpose: pure diagnostics
-                # (no marker, no wire artifact) building the volume
-                # evidence a STREAM_INCOMPLETE-class marker would need.
+                # Outside the identity gate on purpose: pure diagnostics (no marker, no wire
+                # artifact), the volume evidence a STREAM_INCOMPLETE-class marker would need.
                 counters.bump("interceptors.seam.stream_unterminated")
             if streamed:
                 # Keyed on `streamed` rather than on the response having
