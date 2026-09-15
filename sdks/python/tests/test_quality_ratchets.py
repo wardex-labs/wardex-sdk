@@ -281,13 +281,13 @@ _MODULE_CEILING = 800
 #: cross the ceiling; a module that drops below it is removed from this dict.
 _OVERSIZED_BUDGET = {
     "_assembly/_units.py": 2100,
-    "_adapters/_assembler.py": 1939,
+    "_adapters/_assembler.py": 1934,
     "_adapters/_openai_agents.py": 1605,
     "_client.py": 1587,
     "_adapters/_context.py": 1305,
     "_interceptors/_seam.py": 1194,
     "_adapters/_langgraph.py": 1035,
-    "_assembly/_integrity.py": 1082,
+    "_assembly/_integrity.py": 1080,
     "_assembly/_builder.py": 970,
     "_adapters/_anthropic_agent_sdk.py": 944,
 }

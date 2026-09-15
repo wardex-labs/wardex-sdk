@@ -326,6 +326,11 @@ _MEMBER_SITES: dict[str, frozenset[str]] = {
     # the one place that holds the root draft.
     "OTEL_BRIDGE_NO_DATA": frozenset({"_adapters/_assembler.py"}),
     "OTEL_BRIDGE_SCHEMA_UNKNOWN": frozenset({"_adapters/_assembler.py"}),
+    # The bridge's join-quality marker, attached by the same `_merge_bridge` to
+    # a CHAT span the tolerance pass placed. The classifier (`_otel_merge.py`)
+    # only reports which pairs that pass made; the marker decision stays with
+    # the one place that holds the pended drafts, like the fail-open pair.
+    "OTEL_BRIDGE_JOIN_TOLERANT": frozenset({"_adapters/_assembler.py"}),
     # The two shutdown markers, and the split between them is which shutdown
     # actually happened rather than which code path ran. The adapter's
     # `uninstall()` names ADAPTER_UNINSTALLED, and it is what an ordinary exit
@@ -640,6 +645,11 @@ _EMITTED_MEMBERS: frozenset[str] = frozenset(
         # vocabulary-without-an-emitter, applied at authoring time.
         "OTEL_BRIDGE_NO_DATA",
         "OTEL_BRIDGE_SCHEMA_UNKNOWN",
+        # The bridge's join-quality marker, minted WITH its emitter
+        # (`_merge_bridge`, on a chat only the tolerance pass could place) in
+        # the same change. Before it, that pass's merges shipped reading
+        # exactly like the strict pass's, IPC-timing markers removed.
+        "OTEL_BRIDGE_JOIN_TOLERANT",
         # The fourteenth: the adapter's per-session bound, minted WITH its
         # sites in the same PR for the same reason. Two of those sites are a
         # marker swap the way UNIT_TABLE_FULL was (the open-tool eviction gave
@@ -1627,6 +1637,11 @@ _VOCABULARY: dict[str, str] = {
     #     differs (nothing arrived vs data arrived and meant nothing) ---
     "OTEL_BRIDGE_NO_DATA": "otel_bridge_no_data",
     "OTEL_BRIDGE_SCHEMA_UNKNOWN": "otel_bridge_schema_unknown",
+    # --- added after the census, by the OTel bridge's chat join (1): a merge
+    #     only the tolerance pass could place — kept apart from
+    #     CORRELATION_CONFLICT (nothing disagreed) and from the fail-open pair
+    #     (the bridge delivered; this is one join's evidence, not the session) ---
+    "OTEL_BRIDGE_JOIN_TOLERANT": "otel_bridge_join_tolerant",
     # --- added after the census, by the dynamic-key bound (1): the
     #     provider-usage mirror is an open key family, and its cap names its
     #     own knob (max_extra_keys) — 39 cuts values, this drops keys ---
@@ -1667,7 +1682,7 @@ _VOCABULARY: dict[str, str] = {
 }
 
 
-def test_the_vocabulary_is_exactly_these_fifty_one() -> None:
+def test_the_vocabulary_is_exactly_these_fifty_two() -> None:
     """15 declared before the census + 21 from it + 1 from §5.4 + 1 for wardex
     itself + 1 for the OTLP size guard + 1 for the registry breadth bound
     + 2 for the OTel bridge's fail-open pair + 1 for the adapter's per-session
@@ -1675,7 +1690,7 @@ def test_the_vocabulary_is_exactly_these_fifty_one() -> None:
     + 2 for the deferred-parse queue's unparsed shipments + 1 for the
     WebSocket LLM-transport marker + 1 for the ambiguous LangGraph join
     + 1 for the unresolved peer address + 1 for the alias bound's forgotten
-    id, name by name.
+    id + 1 for the OTel bridge's tolerant chat join, name by name.
 
     A count alone is not enough: a RENAME keeps the count and is the single most
     expensive mistake available here. These are proto enum values in

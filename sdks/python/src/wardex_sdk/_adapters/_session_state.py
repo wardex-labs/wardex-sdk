@@ -23,6 +23,19 @@ from typing import Any
 from .._assembly import Limitation, SpanDraft, Unit, UnitKey
 from .._protocol._claude_stream import AgentStreamEvent
 
+#: The two provenances a chat span's `input_data` can have, published as the
+#: `wardex.agent.prompt_source` extra on every chat span that carries a prompt.
+#: They double as the internal pending-source states on `_Session`, which is
+#: why they live beside it. The two SHAPES differ on the wire, and the extra is
+#: what lets a consumer parse `input_data`: "stream" is the byte-exact
+#: message-object JSON slice from the transport tee (content authority); "hook"
+#: is the CLI's re-decoded prompt text from the `UserPromptSubmit` payload — the
+#: degraded fallback for a write the stream did not record, published as the
+#: text wardex actually saw rather than dressed up as a message object wardex
+#: never saw.
+_PROMPT_STREAM = "stream"
+_PROMPT_HOOK = "hook"
+
 
 @dataclass
 class _BridgeBinding:
@@ -93,6 +106,31 @@ class _OpenTool:
     #: in-process handler wrapper may have taken the key over in between — which
     #: is exactly what happens for every SDK MCP tool.
     claim_key: UnitKey | None = None
+    #: The hook that CREATED this record reached its session only because that
+    #: session was the sole live one (`_session_for_hook`'s last tier) — neither
+    #: the scope nor the payload's id named it. Carried on the record because
+    #: the span is built later — at close, at a bound's eviction, or by the
+    #: drain of a call that never closed — and the guess may be settled by then.
+    #: Every one of those paths builds through `_tool_draft`, which asks
+    #: `_sole_guess_stands` below whether it still does. It ships as
+    #: `UNIT_INFERRED_SOLE` only when EVERY hook describing the call was
+    #: inferred, this session's own stream never announced its `tool_use` id,
+    #: and the opening hook's own session id (`hook_session_id`) is not the id
+    #: this session later bound. Any one proof settles membership: a hook
+    #: attributed by scope or by its own session id that finds the call's id
+    #: inside this session, the id arriving on this session's transport, or the
+    #: opener's payload naming this session once `system/init` has said who it
+    #: is. An id match between two inferred hooks does not: it proves they
+    #: describe one call, not that the call belongs here — which is exactly a
+    #: late hook from a retired CLI landing on the only session left.
+    sole_inferred: bool = False
+    #: The `session_id` the opening hook's payload carried, kept only when that
+    #: hook was inferred (`sole_inferred`). A hook that arrives before
+    #: `system/init` names a session nobody has bound yet; once init binds the
+    #: same id to this session, the payload turns out to have named it, which is
+    #: the same proof `_session_for_hook`'s id tier would have accepted had the
+    #: two arrived in the other order.
+    hook_session_id: str | None = None
 
 
 @dataclass
@@ -127,6 +165,27 @@ class _EvictedTool:
     name: str
     agent_id: str | None
     completed: bool = False
+    #: `_OpenTool.sole_inferred`, kept across the eviction for the same reason
+    #: `start_ns` and `agent_id` are: the completion half is rebuilt from this
+    #: breadcrumb, and a flag the record was born with is exactly what the
+    #: completion cannot re-derive. One bool, not payload bytes, so the bound
+    #: still reclaims what it exists to reclaim.
+    sole_inferred: bool = False
+    #: `_OpenTool.hook_session_id`, for the same reason: the completion half is
+    #: built after the eviction, and `system/init` may bind the id in between.
+    hook_session_id: str | None = None
+
+    @classmethod
+    def left_by(cls, sess: _Session, tool_use_id: str, tool: _OpenTool) -> _EvictedTool:
+        """The breadcrumb `tool` leaves, its guess read at eviction time: the
+        evicted half ships now, and the completion must agree with it."""
+        return cls(
+            tool.start_ns,
+            tool.name,
+            tool.agent_id,
+            sole_inferred=_sole_guess_stands(sess, tool_use_id, tool),
+            hook_session_id=tool.hook_session_id,
+        )
 
 
 @dataclass
@@ -151,7 +210,17 @@ class _EvictedSubagent:
 
 @dataclass
 class _OpenSubagent:
-    """A subagent span opened at `SubagentStart` and finished at `SubagentStop`."""
+    """A subagent span opened at `SubagentStart` and finished at `SubagentStop`.
+
+    Its sole-live mark is decided at `SubagentStart` and kept even when a later
+    `SubagentStop` proves the session, unlike a tool's (`_sole_guess_stands`).
+    A tool record is plain data until it becomes a span, so its guess can be
+    read late; this draft exists from the start because its context is the
+    anchor the sub-agent's own tools and chat turns hang off, and a parentage
+    marker attached at construction has no withdrawal (see `_PendingSpan`). A
+    span whose guess a later hook settled errs toward confessing, never toward
+    hiding one.
+    """
 
     draft: SpanDraft
     agent_type: str
@@ -178,7 +247,7 @@ class _Session:
     #: most one prompt pends per session — a new observation REPLACES it
     #: (counted), never appends, so the slot is bounded by construction — and
     #: it is consumed exactly once, by the first main-thread assistant turn.
-    #: All three `pending_prompt*` fields are cleared together at consumption
+    #: All four `pending_prompt*` fields are cleared together at consumption
     #: and destroyed with this record on close/evict/teardown.
     pending_prompt: bytes = b""
     #: Which channel recorded `pending_prompt`: "stream" (the byte-exact
@@ -190,6 +259,12 @@ class _Session:
     #: hook. A second submit while the same prompt still pends then reads as a
     #: NEW user turn whose write the stream missed, not as a duplicate.
     pending_prompt_hook_seen: bool = False
+    #: The pending prompt (and the turn boundary it set) came from a
+    #: `UserPromptSubmit` hook that reached this session only as the sole live
+    #: one. The chat span that consumes the prompt is built out of that guess,
+    #: so it carries `UNIT_INFERRED_SOLE`. Written wherever `pending_prompt` is,
+    #: so the flag cannot outlive the prompt it describes.
+    pending_prompt_sole_inferred: bool = False
     open_tools: dict[str, _OpenTool] = field(default_factory=dict)  # keyed by tool_use_id
     subagents: dict[str, _OpenSubagent] = field(default_factory=dict)  # keyed by agent_id
     #: What the two span-owning tables above leave behind when the bound evicts
@@ -218,3 +293,27 @@ class _Session:
     #: and flushed on EVERY retirement path — finalize, teardown, and the
     #: registry-eviction retirement — so pending never deletes a span (I10).
     pending: list[_PendingSpan] = field(default_factory=list)
+
+
+def _sole_guess_stands(
+    sess: _Session, tool_use_id: str | None, record: _OpenTool | _EvictedTool
+) -> bool:
+    """Does a hook-opened call still owe the wire `UNIT_INFERRED_SOLE`?
+
+    The ONE reading of the rule on `_OpenTool.sole_inferred`, taken wherever a
+    record becomes a span or a breadcrumb — close, eviction, and the drain of a
+    call that never closed alike. Deciding it only at close marked a proven call
+    or not depending on whether it happened to be interrupted.
+
+    Two proofs are read here because both can still be in hand when no closing
+    hook ever arrives: this session's own stream announced the call's
+    `tool_use` id (still in `stream_tool_meta`, which only a close pops), or the
+    opening hook's payload named the id `system/init` later bound to this
+    session. The third proof, a closing hook attributed by scope or by id, exists
+    only at close, and `_close_tool` folds it into the flag before building.
+    """
+    if not record.sole_inferred:
+        return False
+    if tool_use_id is not None and tool_use_id in sess.stream_tool_meta:
+        return False
+    return record.hook_session_id is None or record.hook_session_id != sess.session_id

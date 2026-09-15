@@ -53,7 +53,7 @@ import threading
 from collections.abc import Mapping
 from typing import Any
 
-from .._assembly import UnitKey, counters
+from .._assembly import Unit, UnitKey, counters
 from .._limits import LimitsConfig
 
 _PREFIX = "mcp__"
@@ -90,6 +90,27 @@ def builtin_tool_key(tool_name: str) -> UnitKey:
     to share a name.
     """
     return UnitKey("tool.name", tool_name)
+
+
+#: The rank the HOOK observer claims a tool call at. The in-process handler
+#: wrapper claims the same key at 10, and the higher rank wins however late it
+#: arrives — `PreToolUse` fires BEFORE the handler body, so first-come would hand
+#: every in-process tool to the observer that did not wrap the execution.
+HOOK_RANK = 0
+
+
+def outranked(unit: Unit, key: UnitKey, rank: int) -> bool:
+    """Has a HIGHER-ranked observer taken `key` since we claimed it?
+
+    Not `claim() is False`. `claim()` refuses an EQUAL rank too, which is how it
+    keeps one observer from silently replacing another of the same standing — but
+    two hook observations of two concurrent `Bash` calls share one name key at
+    one rank, and reading that refusal as "someone else owns this" would delete
+    the second call's span. The question that decides ownership is strictly
+    "does something outrank me", and this is it.
+    """
+    owner = unit.owner_rank(key)
+    return owner is not None and owner > rank
 
 
 def prefix_disabled(env: Mapping[str, str] | None = None) -> bool:

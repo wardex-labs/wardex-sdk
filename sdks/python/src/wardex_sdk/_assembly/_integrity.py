@@ -136,19 +136,17 @@ Two emit sites, and the first is the mechanism the second restates.
     UNIT_INFERRED_SOLE = "unit_inferred_sole"
     """Exactly one logical unit was live, so it was taken as the parent.
 
-    The same shape as ``PARENT_UNRESOLVED`` above: the ``_MARKER`` table in
-    ``_assembly/_parentage.py`` attaches it to every edge built for
-    ``ParentSource.UNIT_SOLE``, and ``_assembly/_units.py::UnitRegistry._edge``
-    names it again at ``resolve()``'s sole-live tier — no alias and no live
-    scope, but exactly one SESSION unit open, so it is taken as the parent.
-
-    An ADAPTER reaches this by declaring ``Fallback.SOLE_LIVE_RUN`` at a site it
-    expects to be reached through a carrier the framework may not have
-    propagated to, and that declaration is the whole of what it may say: the
-    candidate comes from the registry's own table, filtered to that adapter's
-    own runs, and only when there is exactly one. What it replaces dropped an
-    unattributable call outright, with no marker; a marked 0.5 edge beats
-    unmarked data loss, and beats a call that becomes its own trace root.
+    The ``_MARKER`` table in ``_assembly/_parentage.py`` attaches it to every
+    edge built for ``ParentSource.UNIT_SOLE``. Two sole-live tiers choose it.
+    ``_assembly/_units.py::UnitRegistry._edge`` names it at ``resolve()``'s,
+    reached by an ADAPTER declaring ``Fallback.SOLE_LIVE_RUN``; the candidate is
+    that adapter's one live run in the registry's own table. The Agent SDK
+    assembler's is ``_adapters/_assembler.py::SessionAssembler._session_for_hook``
+    (the one session in its own ``_by_key``), whose hook's spans parent through
+    ``Evidence(ParentSource.UNIT_SOLE)`` — tool, sub-agent and chat drafts.
+    Both replaced dropping an unattributable call outright, with no marker; a
+    marked 0.5 edge beats unmarked data loss, and beats a call that becomes its
+    own trace root.
     """
 
     CORRELATION_CONFLICT = "correlation_conflict"
@@ -227,45 +225,37 @@ Two emit sites, and the first is the mechanism the second restates.
     # ------------------------------------------------------------------
 
     UNIT_EVICTED = "unit_evicted"
-    """A unit hit a capacity bound and was evicted before the framework closed
-    it — ``max_units`` in the registry, ``max_sessions`` in the Anthropic
-    adapter's own session table.
+    """A unit hit a capacity bound and was evicted before the framework closed it — ``max_units`` in
+    the registry, ``max_sessions`` in the Anthropic adapter's own session table.
 
-    Points at a UNIT bound. Deliberately NOT merged with ``CONNECTION_EVICTED``,
-    which points at ``max_connections``: merging them would send a user to turn
-    the wrong knob.
+    Points at a UNIT bound. Deliberately NOT merged with ``CONNECTION_EVICTED``, which points at
+    ``max_connections``: merging them would send a user to turn the wrong knob.
 
-    Three emit sites. ``_assembly/_units.py::UnitRegistry._evict_root_locked``
-    CLOSES the oldest root at ``max_units``, so its span is emitted carrying
-    this marker, and ``_adapters/_assembler.py::SessionAssembler._make_room``
-    does the same for ``max_sessions``. The third,
-    ``_adapters/_assembler.py::SessionAssembler._resume``, is not an eviction: it
-    puts the marker on the NEW root that continues a run whose predecessor was
-    evicted, which is what turns "a second root appeared from nowhere" into
-    "this run was truncated and resumes here".
+    Three emit sites. ``_assembly/_units.py::UnitRegistry._evict_root_locked`` CLOSES the oldest
+    root at ``max_units``, so its span is emitted carrying this marker, and
+    ``_adapters/_assembler.py::SessionAssembler._make_room`` does the same for ``max_sessions``. The
+    third, ``_adapters/_assembler.py::SessionAssembler._resume``, is not an eviction: it puts the
+    marker on the NEW root that continues a run whose predecessor was evicted, which is what turns
+    "a second root appeared from nowhere" into "this run was truncated and resumes here".
 
-    What both of the evictions replace dropped the unit and its root span
-    outright, with no marker and no test, so a workload that crossed a cap
-    simply stopped producing traces (I10).
+    What both of the evictions replace dropped the unit and its root span outright, with no marker
+    and no test, so a workload that crossed a cap simply stopped producing traces (I10).
     """
 
     UNIT_INTERRUPTED = "unit_interrupted"
-    """The unit was torn down by cancellation or interpreter shutdown rather
-    than by a normal end-of-run.
+    """The unit was torn down by cancellation or interpreter shutdown rather than by a normal
+    end-of-run.
 
-    Emitted by ``_runtime.py``'s signal handler, and by that one alone. It is
-    reached only on the disposition where the app left the signal at its
-    default: there the handler ends the process itself, so ``atexit`` never
-    runs and the ordinary teardown never gets its turn. Under any other
-    disposition the program either exits through the interpreter — where atexit
-    reaches the adapter's ``uninstall`` and the span carries
-    ``ADAPTER_UNINSTALLED`` instead — or carries on running, and closing a
-    session that is still being driven would be the lie this marker exists to
+    Emitted by ``_runtime.py``'s signal handler, and by that one alone. It is reached only on the
+    disposition where the app left the signal at its default: there the handler ends the process
+    itself, so ``atexit`` never runs and the ordinary teardown never gets its turn. Under any other
+    disposition the program either exits through the interpreter — where atexit reaches the
+    adapter's ``uninstall`` and the span carries ``ADAPTER_UNINSTALLED`` instead — or carries on
+    running, and closing a session that is still being driven would be the lie this marker exists to
     avoid telling.
 
-    Reads as the more honest of the pair: it says a shutdown cut the run off,
-    which is what a user wants to know, where its sibling says only that wardex
-    stopped watching.
+    Reads as the more honest of the pair: it says a shutdown cut the run off, which is what a user
+    wants to know, where its sibling says only that wardex stopped watching.
     """
 
     CHILD_SPAN_UNCLOSED = "child_span_unclosed"
@@ -655,28 +645,29 @@ Two emit sites, and the first is the mechanism the second restates.
     """
 
     TTFT_IPC_APPROXIMATION = "ttft_ipc_approximation"
-    """Time-to-first-token was measured at the IPC boundary, not at the wire, so
-    it includes subprocess and pipe latency.
+    """Time-to-first-token was measured at the IPC boundary, not at the wire, so it includes
+    subprocess and pipe latency.
 
-    Emitted from ``_adapters/_assembler.py::SessionAssembler._build_chat``
-    whenever a first-delta timestamp exists for the turn.
+    Emitted from ``_adapters/_assembler.py::SessionAssembler._build_chat`` whenever a first-delta
+    timestamp exists for the turn; with the bridge on, by ``_emit_pending`` (unmerged) and
+    ``_merge_bridge`` (merged without a CLI ttft, or placed only by the tolerance pass:
+    ``OTEL_BRIDGE_JOIN_TOLERANT``).
     """
 
     TRANSPORT_TIMING_UNAVAILABLE_SUBPROCESS = "transport_timing_unavailable_subprocess"
-    """No transport timing at all: the LLM call happened inside a CLI subprocess
-    and wardex observed only the IPC stream.
+    """No transport timing at all: the LLM call happened inside a CLI subprocess and wardex observed
+    only the IPC stream.
 
-    Emitted from ``_adapters/_assembler.py`` as the module constant
-    ``_BASE_LIMITATION``, on the four span classes that module assembles out of
-    the IPC stream and the hook payloads: the root ``invoke_agent``, a sub-agent
-    ``invoke_agent``, ``chat``, and the hook/stream-driven ``execute_tool``.
+    Emitted from ``_adapters/_assembler.py`` as the module constant ``_BASE_LIMITATION``, on the
+    four span classes that module assembles out of the IPC stream and the hook payloads: the root
+    ``invoke_agent``, a sub-agent ``invoke_agent``, ``chat``, and the hook/stream-driven
+    ``execute_tool``.
 
-    The adapter's FIFTH span class does not carry it, and must not. The
-    in-process ``execute_tool`` span opened by
-    ``_adapters/_anthropic_agent_sdk.py::_run_tool`` brackets a handler
-    wardex wrapped in *this* process, so its duration is measured directly
-    rather than inferred from an IPC stream — attaching the marker there would
-    claim the timing is absent when it is the one timing the adapter owns.
+    The adapter's FIFTH span class does not carry it, and must not. The in-process ``execute_tool``
+    span opened by ``_adapters/_anthropic_agent_sdk.py::_run_tool`` brackets a handler wardex
+    wrapped in *this* process, so its duration is measured directly rather than inferred from an IPC
+    stream — attaching the marker there would claim the timing is absent when it is the one timing
+    the adapter owns.
     """
 
     PEER_UNRESOLVED = "peer_unresolved"
@@ -1037,43 +1028,50 @@ Two emit sites, and the first is the mechanism the second restates.
     # ------------------------------------------------------------------
 
     OTEL_BRIDGE_NO_DATA = "otel_bridge_no_data"
-    """The bridge injected telemetry env into this session's CLI — the
-    subprocess-env read-back CONFIRMED the injection landed — and zero spans
-    were routed to the session before it finalized. The tree below this root
-    is exactly the bridge-off tree.
+    """The bridge injected telemetry env into this session's CLI — the subprocess-env read-back
+    CONFIRMED the injection landed — and zero spans were routed to the session before it finalized.
+    The tree below this root is exactly the bridge-off tree.
 
-    Emitted from ``_adapters/_assembler.py::SessionAssembler._merge_bridge``
-    at session finalize. A CONDITION marker that names no knob: the next
-    action lives outside wardex (check the CLI version, or a machine policy
-    that strips subprocess env or blocks loopback connections). Gated on the
-    read-back-CONFIRMED binding, never on "bridge configured": an injection
-    wardex cannot prove reached the subprocess env — a user transport, an SDK
-    surface change — must not be reported as the CLI staying silent (I4), so
-    unconfirmed sessions get the counter
+    Emitted from ``_adapters/_assembler.py::SessionAssembler._merge_bridge`` at session finalize. A
+    CONDITION marker that names no knob: the next action lives outside wardex (check the CLI
+    version, or a machine policy that strips subprocess env or blocks loopback connections). Gated
+    on the read-back-CONFIRMED binding, never on "bridge configured": an injection wardex cannot
+    prove reached the subprocess env — a user transport, an SDK surface change — must not be
+    reported as the CLI staying silent (I4), so unconfirmed sessions get the counter
     ``adapters.assembler.otel_bridge_unconfirmed_no_data`` instead.
 
-    Not merged with ``OTEL_BRIDGE_SCHEMA_UNKNOWN``, by the census rule
-    (§6.5.1): the reader's next action differs. Here nothing ARRIVED —
-    a transport-level fact; there, data arrived and meant nothing to the
-    bridge — a schema-level fact whose fix is a report or an SDK upgrade.
+    Not merged with ``OTEL_BRIDGE_SCHEMA_UNKNOWN``, by the census rule (§6.5.1): the reader's next
+    action differs. Here nothing ARRIVED — a transport-level fact; there, data arrived and meant
+    nothing to the bridge — a schema-level fact whose fix is a report or an SDK upgrade.
     """
 
     OTEL_BRIDGE_SCHEMA_UNKNOWN = "otel_bridge_schema_unknown"
-    """Bridge telemetry arrived for this session and decoded to nothing the
-    bridge recognizes: classification produced zero known ``claude_code.*``
-    spans, or a POST under the bridge's token did not decode as OTLP at all.
+    """Bridge telemetry arrived for this session and decoded to nothing the bridge recognizes:
+    classification produced zero known ``claude_code.*`` spans, or a POST under the bridge's token
+    did not decode as OTLP at all.
 
-    Emitted from ``_adapters/_assembler.py::SessionAssembler._merge_bridge``
-    at finalize, on two routes: the session's routed spans classified to
-    nothing known, or the receiver counted an undecodable POST attributable
-    to the sole live bridge session (a counted inference — with several live
-    sessions only the counter ``adapters.anthropic.otel_bridge.undecodable``
-    speaks, because attributing a bodyless failure to one of N sessions would
-    be a guess). The CLI's telemetry is beta —
-    ``CLAUDE_CODE_ENHANCED_TELEMETRY_BETA`` disclaims stability by name — so
-    this is the reachable fail-open the design requires: the tree stays
-    exactly today's and the root says why the bridge added nothing. See
-    ``OTEL_BRIDGE_NO_DATA`` for why the two stay separate members.
+    Emitted from ``_adapters/_assembler.py::SessionAssembler._merge_bridge`` at finalize, on two
+    routes: the session's routed spans classified to nothing known, or the receiver counted an
+    undecodable POST attributable to the sole live bridge session (a counted inference — with
+    several live sessions only the counter ``adapters.anthropic.otel_bridge.undecodable`` speaks,
+    because attributing a bodyless failure to one of N sessions would be a guess). The CLI's
+    telemetry is beta — ``CLAUDE_CODE_ENHANCED_TELEMETRY_BETA`` disclaims stability by name — so
+    this is the reachable fail-open the design requires: the tree stays exactly today's and the root
+    says why the bridge added nothing. See ``OTEL_BRIDGE_NO_DATA`` for why the two stay separate
+    members.
+    """
+
+    OTEL_BRIDGE_JOIN_TOLERANT = "otel_bridge_join_tolerant"
+    """A chat span merged with a CLI ``claude_code.llm_request`` that only the join's TOLERANCE pass
+    placed — the request started outside the chat's exact window, inside it widened by
+    ``_otel_merge.JOIN_EPS_NS`` (one second).
+
+    Emitted from ``_adapters/_assembler.py::SessionAssembler._merge_bridge`` for each key in
+    ``_JoinOutcome.tolerant``, with the counter
+    ``adapters.anthropic.otel_bridge.llm_join_tolerant``. The span takes the CLI's interval and ttft
+    but KEEPS ``TRANSPORT_TIMING_UNAVAILABLE_SUBPROCESS`` and ``TTFT_IPC_APPROXIMATION``: when a
+    chat's own request never reached the bridge, the one in the widened window is a neighbour's.
+    Next action: read the timing as an estimate. Not ``CORRELATION_CONFLICT``: nothing disagreed.
     """
 
 

@@ -53,16 +53,18 @@ from .._types import (
     GenAIAttributes,
     ToolAttributes,
 )
-from ._anthropic_names import McpToolCatalog
+from ._anthropic_names import HOOK_RANK, McpToolCatalog, outranked
 from ._otel_merge import (
     OTEL_EXTRA_PREFIX,
-    _ChatWindow,
     _OtelSpan,
     allowlisted_extras,
     classify,
     join_chats,
+    sequence_chat_windows,
 )
 from ._session_state import (
+    _PROMPT_HOOK,
+    _PROMPT_STREAM,
     _BridgeBinding,
     _EvictedSubagent,
     _EvictedTool,
@@ -70,6 +72,7 @@ from ._session_state import (
     _OpenTool,
     _PendingSpan,
     _Session,
+    _sole_guess_stands,
 )
 from ._sink import _ClientSink
 
@@ -88,12 +91,20 @@ from ._sink import _ClientSink
 # `CorrelationInfo` and both have earned it. The remaining sub-root edges here
 # do not: which sub-agent a stream event belongs to is
 # `_resolve_subagent_anchor`'s guess and which session a hook belongs to is
-# `_session_for_hook`'s, and both silently fall back to the session root. Those
+# `_session_for_hook`'s; the first falls back to the session root silently, the
+# second's sole-live tier is marked (`_SOLE_LIVE`) but claims no edge either. Those
 # two are the ingestion code design §3.4 moves into `_normalize.py`, where they
 # produce a `UnitKey` for `UnitRegistry.resolve()` instead of choosing an anchor
 # themselves; until then, publishing `unit_active`/1.0 for an edge picked that
 # way would assert certainty about a guess, which is I4's exact prohibition.
 _IN_SESSION = Evidence(ParentSource.UNIT_ACTIVE)
+
+# For spans built from a hook `_session_for_hook` attributed ONLY because its
+# session was the sole live one — which is also what a late hook from a retired
+# CLI looks like. `child_of` attaches `UNIT_INFERRED_SOLE` from the parentage
+# core's own marker table, so the guess is on the wire without this adapter
+# stamping an edge marker by hand. Only that hook's spans: see `_OpenTool`.
+_SOLE_LIVE = Evidence(ParentSource.UNIT_SOLE)
 
 # Rides all four span classes THIS MODULE builds — the root `invoke_agent`, a
 # sub-agent `invoke_agent`, `chat`, and the hook/stream-driven `execute_tool` —
@@ -121,40 +132,6 @@ _TableValue = TypeVar("_TableValue")
 #: everything, precisely so a guess cannot cross a framework boundary.
 #: `test_agent_sdk_units.py` asserts the two spellings agree.
 _OWNER = "anthropic_agent_sdk"
-
-
-#: The two provenances a chat span's `input_data` can have, published as the
-#: `wardex.agent.prompt_source` extra on every chat span that carries a prompt.
-#: They double as the internal pending-source states on `_Session`. The two
-#: SHAPES differ on the wire, and the extra is what lets a consumer parse
-#: `input_data`: "stream" is the byte-exact message-object JSON slice from the
-#: transport tee (content authority); "hook" is the CLI's re-decoded prompt
-#: text from the `UserPromptSubmit` payload — the degraded fallback for a write
-#: the stream did not record, published as the text wardex actually saw rather
-#: than dressed up as a message object wardex never saw.
-_PROMPT_STREAM = "stream"
-_PROMPT_HOOK = "hook"
-
-
-#: The rank the HOOK observer claims a tool call at. The in-process handler
-#: wrapper claims the same key at 10, and the higher rank wins however late it
-#: arrives — `PreToolUse` fires BEFORE the handler body, so first-come would hand
-#: every in-process tool to the observer that did not wrap the execution.
-HOOK_RANK = 0
-
-
-def outranked(unit: Unit, key: UnitKey, rank: int) -> bool:
-    """Has a HIGHER-ranked observer taken `key` since we claimed it?
-
-    Not `claim() is False`. `claim()` refuses an EQUAL rank too, which is how it
-    keeps one observer from silently replacing another of the same standing — but
-    two hook observations of two concurrent `Bash` calls share one name key at
-    one rank, and reading that refusal as "someone else owns this" would delete
-    the second call's span. The question that decides ownership is strictly
-    "does something outrank me", and this is it.
-    """
-    owner = unit.owner_rank(key)
-    return owner is not None and owner > rank
 
 
 def _safe_json_bytes(value: Any) -> bytes:
@@ -358,6 +335,7 @@ class SessionAssembler:
                 sess.pending_prompt = ev.content_json
                 sess.pending_prompt_source = _PROMPT_STREAM
                 sess.pending_prompt_hook_seen = False
+                sess.pending_prompt_sole_inferred = False
 
     def on_inbound(self, key: int, msg: dict) -> None:
         try:
@@ -462,13 +440,15 @@ class SessionAssembler:
     def on_hook(self, event: str, payload: dict, tool_use_id: str | None) -> None:
         now = time.time_ns()
         with self._lock:
-            sess = self._session_for_hook(payload, now)
-            if sess is None:
+            found = self._session_for_hook(payload, now)
+            if found is None:
                 return
+            sess, inferred = found
             if event == "PreToolUse":
-                self._open_tool(sess, payload, tool_use_id, now)
+                self._open_tool(sess, payload, tool_use_id, now, inferred)
             elif event in ("PostToolUse", "PostToolUseFailure"):
-                self._close_tool(sess, payload, tool_use_id, now, failed=event.endswith("Failure"))
+                failed = event.endswith("Failure")
+                self._close_tool(sess, payload, tool_use_id, now, failed, inferred)
             elif event == "SubagentStart":
                 agent_id = payload.get("agent_id")
                 if agent_id:
@@ -502,7 +482,7 @@ class SessionAssembler:
                         )
                     agent_type = payload.get("agent_type") or "sub_agent"
                     draft = SpanDraft(
-                        child_of(sess.unit.context, _IN_SESSION),
+                        child_of(sess.unit.context, _SOLE_LIVE if inferred else _IN_SESSION),
                         intent=SpanIntent.INVOKE_AGENT,
                         subject=agent_type,
                         source=CaptureSource.ADAPTER,
@@ -521,9 +501,9 @@ class SessionAssembler:
             elif event == "SubagentStop":
                 self._emit_subagent(sess, payload.get("agent_id"), now)
             elif event == "UserPromptSubmit":
-                self._on_prompt_submit(sess, payload, now)
+                self._on_prompt_submit(sess, payload, now, inferred)
 
-    def _on_prompt_submit(self, sess: _Session, payload: dict, now: int) -> None:
+    def _on_prompt_submit(self, sess: _Session, payload: dict, now: int, inferred: bool) -> None:
         """Consume a `UserPromptSubmit` hook: corroborate the stream, or fall back.
 
         The stream stays the CONTENT authority. A pending stream prompt not yet
@@ -545,10 +525,11 @@ class SessionAssembler:
         matchers that run before wardex's appended one, while the tee'd write is
         causally earlier and unpolluted.
 
-        The fallback cannot create a session: a hook for a transport whose
-        writes never parsed is dropped (counted) by `_session_for_hook` before
-        this method runs, so it covers prompt-line misses within an observed
-        session only — it is not stream-independence.
+        The fallback cannot create a session, so it covers prompt-line misses
+        within an observed session only — it is not stream-independence. A hook
+        for a transport whose writes never parsed is dropped (counted) by
+        `_session_for_hook` unless exactly one session is live; then it lands on
+        that session as an inference, and the chat consuming it says so.
         """
         if sess.pending_prompt_source == _PROMPT_STREAM and not sess.pending_prompt_hook_seen:
             sess.pending_prompt_hook_seen = True
@@ -559,6 +540,7 @@ class SessionAssembler:
         sess.pending_prompt = prompt.encode() if isinstance(prompt, str) else b""
         sess.pending_prompt_source = _PROMPT_HOOK
         sess.pending_prompt_hook_seen = True
+        sess.pending_prompt_sole_inferred = inferred
         sess.turn_start_ns = now
         sess.first_delta_ns = 0
 
@@ -771,7 +753,7 @@ class SessionAssembler:
                 return sess
         return None
 
-    def _session_for_hook(self, payload: dict, now: int) -> _Session | None:
+    def _session_for_hook(self, payload: dict, now: int) -> tuple[_Session, bool] | None:
         """Which session does this hook belong to? CONTEXT first, the id second.
 
         The order is the product's whole claim (I2). What this replaces asked
@@ -793,6 +775,7 @@ class SessionAssembler:
         answers, the observation is dropped WITH A COUNTER: with two sessions
         live and an id naming neither, there is no defensible parent to prefer,
         and inventing one would be the wrong tree this method exists to avoid.
+        The bool returned with the session is that mark, threaded to the spans.
         """
         by_context = self._session_in_scope()
 
@@ -823,18 +806,18 @@ class SessionAssembler:
                 # different traces. Until then the counter is the record, the
                 # same way it is for the unattributable hook below.
                 counters.bump("adapters.assembler.hook_session_conflict")
-            return by_context
+            return by_context, False
         if by_id is not None:
-            return by_id
-        # Exactly one live session -> attribute the hook to it. Covers hooks
-        # arriving before the pin is installed or before the stream's
-        # session_init line lands, and it is an inference, so it is counted.
+            return by_id, False
+        # Exactly one live session -> an inference, counted AND marked (`True`):
+        # right for a hook ahead of the pin or of system/init, wrong for a late
+        # hook from a CLI whose own session was just evicted or closed.
         if len(self._by_key) == 1:
             only = next(iter(self._by_key.values()))
             sole = self._live_session(only.key, now)
             if sole is not None:
                 counters.bump("adapters.assembler.hook_session_inferred_sole")
-                return sole
+                return sole, True
         # Nothing answered, so the observation is dropped — but never in silence.
         # `on_hook` returns on None, which leaves no span, no limitation and, if
         # this line were missing, nothing whatsoever to distinguish a hook that
@@ -908,7 +891,18 @@ class SessionAssembler:
         along for the merge's ttft rewrite, the ttft for the marker decision,
         and the start for the join window.
         """
-        p = child_of(self._resolve_subagent_anchor(sess, ev.parent_tool_use_id), _IN_SESSION)
+        # Consumption is gated exactly the way installation is (`on_outbound`):
+        # only a MAIN-THREAD assistant turn consumes the pending prompt. A
+        # subagent-attributed chat's input is the subagent's task, not the
+        # user's session prompt, so it ships `input_attempted=False` and leaves
+        # the pending prompt for the next main-thread turn. `attempted`, not
+        # `bool(payload)`: an intermediate assistant turn of one agentic loop
+        # HAS no user prompt, and saying so is different from reporting an
+        # empty capture as a failed one. Decided before the edge: a prompt a
+        # sole-live-inferred hook seeded makes this turn's session a guess too.
+        consume = ev.parent_tool_use_id is None and sess.pending_prompt_source is not None
+        evidence = _SOLE_LIVE if consume and sess.pending_prompt_sole_inferred else _IN_SESSION
+        p = child_of(self._resolve_subagent_anchor(sess, ev.parent_tool_use_id), evidence)
         start_ns = sess.turn_start_ns or now
 
         ttft: float | None = None
@@ -953,15 +947,6 @@ class SessionAssembler:
         draft.set_conversation(self._conversation(sess, turn_index=sess.turn_index))
         draft.set_status(StatusCode.OK)
 
-        # Consumption is gated exactly the way installation is (`on_outbound`):
-        # only a MAIN-THREAD assistant turn consumes the pending prompt. A
-        # subagent-attributed chat's input is the subagent's task, not the
-        # user's session prompt, so it ships `input_attempted=False` and leaves
-        # the pending prompt for the next main-thread turn. `attempted`, not
-        # `bool(payload)`: an intermediate assistant turn of one agentic loop
-        # HAS no user prompt, and saying so is different from reporting an
-        # empty capture as a failed one.
-        consume = ev.parent_tool_use_id is None and sess.pending_prompt_source is not None
         draft.set_io(
             input_data=sess.pending_prompt if consume else b"",
             output_data=ev.content_json or b"",
@@ -974,6 +959,7 @@ class SessionAssembler:
             sess.pending_prompt = b""
             sess.pending_prompt_source = None
             sess.pending_prompt_hook_seen = False
+            sess.pending_prompt_sole_inferred = False
         # No correlation: the anchor above may be a fallback (see
         # `_resolve_subagent_anchor`), and the parentage's own record would
         # report it as `unit_active`/1.0 with no marker — a claim this span
@@ -1096,7 +1082,14 @@ class SessionAssembler:
         counters.bump(f"adapters.assembler.{where}_table_full")
         return False
 
-    def _open_tool(self, sess: _Session, payload: dict, tool_use_id: str | None, now: int) -> None:
+    def _open_tool(
+        self,
+        sess: _Session,
+        payload: dict,
+        tool_use_id: str | None,
+        now: int,
+        inferred: bool = False,
+    ) -> None:
         if tool_use_id is None:
             return
         key = self._claim_key(sess, payload.get("tool_name") or "unknown")
@@ -1135,9 +1128,7 @@ class SessionAssembler:
             # completion arriving after that is a call this session can no
             # longer recognize, and the counter is the only record of why.
             self._room_for(sess.evicted_tools, "evicted_tool")
-            sess.evicted_tools[oldest_id] = _EvictedTool(
-                start_ns=oldest.start_ns, name=oldest.name, agent_id=oldest.agent_id
-            )
+            sess.evicted_tools[oldest_id] = _EvictedTool.left_by(sess, oldest_id, oldest)
         sess.open_tools[tool_use_id] = _OpenTool(
             tool_use_id=tool_use_id,
             name=payload.get("tool_name") or "unknown",
@@ -1146,10 +1137,18 @@ class SessionAssembler:
             input_data=_safe_json_bytes(payload.get("tool_input", {})),
             from_hook=True,
             claim_key=key,
+            sole_inferred=inferred,
+            hook_session_id=payload.get("session_id") if inferred else None,
         )
 
     def _close_tool(
-        self, sess: _Session, payload: dict, tool_use_id: str | None, now: int, failed: bool
+        self,
+        sess: _Session,
+        payload: dict,
+        tool_use_id: str | None,
+        now: int,
+        failed: bool,
+        inferred: bool = False,
     ) -> None:
         if tool_use_id is None:
             return
@@ -1211,8 +1210,11 @@ class SessionAssembler:
                 # reconstructed from the CLI's stdout.
                 from_hook=True,
                 claim_key=key,
+                sole_inferred=inferred and (crumb is None or crumb.sole_inferred),
+                hook_session_id=crumb.hook_session_id if crumb is not None else None,
             )
         meta = sess.stream_tool_meta.pop(tool_use_id, None)
+        tool.sole_inferred = tool.sole_inferred and inferred and meta is None
         if meta is not None:
             stream_name, stream_input = meta
             if stream_name:
@@ -1337,7 +1339,8 @@ class SessionAssembler:
                 crumb = sess.evicted_subagents.get(tool.agent_id)
                 if crumb is not None:
                     anchor = crumb.context
-        p = child_of(anchor, _IN_SESSION)
+        sole = _sole_guess_stands(sess, tool.tool_use_id, tool)
+        p = child_of(anchor, _SOLE_LIVE if sole else _IN_SESSION)
 
         draft = SpanDraft(
             p,
@@ -1587,8 +1590,9 @@ class SessionAssembler:
         Authority split (spec rule): time and skeleton are the CLI's — it
         measured inside its own process; content and semantics stay the
         stream's. Merged chat spans get the CLI interval and lose the timing
-        markers (the headline deliverable); merged tool spans keep IPC times
-        AND the marker, gaining the CLI-measured duration as an additive
+        markers (the headline deliverable) unless only the tolerance pass placed
+        them (`OTEL_BRIDGE_JOIN_TOLERANT`); merged tool spans keep IPC times AND
+        the marker, gaining the CLI-measured duration as an additive
         extra — a rewritten time under a "timing unavailable" marker would
         lie, and removing the marker there would exceed what the merge can
         honestly claim. Fail-open verdicts land on the session ROOT:
@@ -1653,27 +1657,9 @@ class SessionAssembler:
                 rec.merged = True
                 anchors[spawn.span_id] = rec.draft.context
 
-        # (3) chats — the unique-start-window join, scoped by agent. The
-        # windows are SEQUENCED per scope before matching: every chat of one
-        # agentic loop shares the same host write, so their recorded turn
-        # starts collide — and colliding windows made every multi-turn
-        # session degenerate to the ambiguity fallback (measured against a
-        # live CLI). The request that produced chat N cannot have started
-        # before chat N-1's message arrived, so N-1's arrival is N's floor.
-        windows = []
-        floor_by_scope: dict[str | None, int] = {}
-        for i, rec in enumerate(sess.pending):
-            if rec.kind != "chat" or rec.window is None:
-                continue
-            start_ns, end_ns = rec.window
-            floor = floor_by_scope.get(rec.agent_id)
-            if floor is not None and floor > start_ns:
-                start_ns = floor
-            floor_by_scope[rec.agent_id] = end_ns
-            windows.append(
-                _ChatWindow(key=i, start_ns=start_ns, end_ns=end_ns, agent_id=rec.agent_id)
-            )
-        outcome = join_chats(windows, view.llm)
+        # (3) chats — the unique-start-window join, scoped by agent, over
+        # windows SEQUENCED per scope first (see `sequence_chat_windows`).
+        outcome = join_chats(sequence_chat_windows(sess.pending), view.llm)
         for key, llm in outcome.pairs:
             if not (0 < llm.span.start_ns < llm.span.end_ns):
                 # No real interval means no time rewrite, and marker removal
@@ -1681,6 +1667,15 @@ class SessionAssembler:
                 outcome.unjoined.append(llm)
                 continue
             rec = sess.pending[key]
+            if key in outcome.tolerant:
+                # Only the widened window placed it. The CLI interval is still
+                # the better estimate, so it is written below — but if this
+                # chat's own request never reached the bridge, it is a
+                # neighbour's. Say which pass joined, and keep the IPC markers.
+                rec.draft.add_limitation(Limitation.OTEL_BRIDGE_JOIN_TOLERANT)
+                for marker in rec.deferred_markers:
+                    rec.draft.add_limitation(marker)
+                counters.bump("adapters.anthropic.otel_bridge.llm_join_tolerant")
             rec.draft.set_start_ns(llm.span.start_ns)
             rec.draft.set_end_ns(llm.span.end_ns)
             if llm.ttft_ms is not None and rec.gen_ai is not None:

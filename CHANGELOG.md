@@ -146,6 +146,22 @@ All notable changes to this project are documented here. The format follows
   including one the capture mode refuses. The seam also stops calling
   `getpeername()` on every send.
   Wire change: `peer_unresolved` is a new value (50) of `wardex.v1.Limitation`.
+- **Two guesses the Claude Agent SDK adapter made now show on the span.**
+  When a hook could not be matched to a session by scope or by session id and
+  exactly one session was live, the hook was attributed to that session and
+  only a counter recorded it; the tool, sub-agent and chat spans built from
+  that hook looked exactly like ones whose session was proven, including when
+  the hook really came from a CLI whose own session had just been evicted or
+  closed. Those spans now carry `unit_inferred_sole` (spans a later, properly
+  attributed hook builds do not). And with the OTel bridge on, a chat that
+  only the join's one-second tolerance pass could pair with a CLI
+  `llm_request` still takes the CLI's timing but now carries the new
+  `otel_bridge_join_tolerant` marker and keeps
+  `transport_timing_unavailable_subprocess` / `ttft_ipc_approximation`, which
+  it used to lose: if that chat's own request never reached the bridge, the
+  timing it received was a neighbour's. The new marker is value 52 in
+  `wardex.v1.Limitation`, and `adapters.anthropic.otel_bridge.llm_join_tolerant`
+  counts it.
 
 ## [0.6.0b1] - 2026-09-06
 

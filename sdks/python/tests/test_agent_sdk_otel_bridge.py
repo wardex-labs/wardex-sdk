@@ -325,7 +325,11 @@ def test_a_hand_built_otlp_post_merges_into_the_session_tree(receiver):
     asm.on_inbound(1, RESULT)
     t1 = time.time_ns()
 
-    llm_start, llm_end = t0 + 1_000, t1 + 2_000_000
+    # Strictly INSIDE the chat's recorded window, not merely near it: a start
+    # only the join's tolerance pass could place is a weaker merge that keeps
+    # the timing markers, and this test pins the strict one.
+    (window,) = [rec.window for rec in asm._by_key[1].pending if rec.kind == "chat"]
+    llm_start, llm_end = (window[0] + window[1]) // 2, t1 + 2_000_000
     body = _otlp_build.request(
         [
             _otlp_build.span(
@@ -1117,18 +1121,20 @@ def test_close_all_sessions_never_drains(receiver):
     client = FakeClient()
     asm = SessionAssembler(client, bridge=receiver)
     receiver.reserve(TRACE)
-    t0 = time.time_ns()
     _outbound(asm, 1, bridge=_binding())
     asm.on_inbound(1, INIT)
     asm.on_inbound(1, ASSISTANT)
     t1 = time.time_ns()
+    # Strictly inside the chat's window, so the merge is the strict one whose
+    # marker removal this test asserts.
+    (window,) = [rec.window for rec in asm._by_key[1].pending if rec.kind == "chat"]
     body = _otlp_build.request(
         [
             _otlp_build.span(
                 name="claude_code.llm_request",
                 trace_id=TRACE,
                 span_id="02" * 8,
-                start_ns=t0 + 1_000,
+                start_ns=(window[0] + window[1]) // 2,
                 end_ns=t1,
                 attrs={"gen_ai.response.id": "req_x", "ttft_ms": 50},
             )
@@ -1273,3 +1279,99 @@ def test_a_multi_turn_agentic_loop_joins_each_llm_request_uniquely(receiver):
     unmerged = [s for s in chats if s not in merged]
     assert len(unmerged) == 1 and _TIMING in _limitations(unmerged[0])
     assert not any(s.name == "execute_step llm_request" for s in client.spans)
+
+
+STREAM_DELTA = {
+    "type": "stream_event",
+    "session_id": "s-1",
+    "uuid": "u1",
+    "event": {"type": "content_block_delta"},
+}
+
+
+def _one_timed_chat_with_an_llm_request(receiver, llm_start_offset_ns: int):
+    """One bridge session with ONE chat turn that has a first-delta timestamp,
+    plus one CLI `llm_request` whose START sits `llm_start_offset_ns` away from
+    the chat window's start (negative is earlier). Returns the captured spans
+    and the chat's recorded window."""
+    client = FakeClient()
+    asm = SessionAssembler(client, bridge=receiver)
+    receiver.reserve(TRACE)
+    _outbound(asm, 1, bridge=_binding())
+    asm.on_inbound(1, INIT)
+    asm.on_inbound(1, STREAM_DELTA)
+    asm.on_inbound(1, ASSISTANT_2)
+    asm.on_inbound(1, RESULT)
+    (window,) = [rec.window for rec in asm._by_key[1].pending if rec.kind == "chat"]
+    body = _otlp_build.request(
+        [
+            _otlp_build.span(
+                name="claude_code.llm_request",
+                trace_id=TRACE,
+                span_id="0a" * 8,
+                start_ns=window[0] + llm_start_offset_ns,
+                end_ns=window[1],
+                attrs={"gen_ai.response.id": "req_tol", "ttft_ms": 120},
+            )
+        ]
+    )
+    assert _post(receiver, body) == 200
+    asm.on_close(1, None)
+    return client.spans, window
+
+
+def test_a_tolerance_joined_chat_says_so_and_keeps_its_approximation_markers(receiver):
+    """The second join pass, which had no test at all, made visible.
+
+    A request that starts half a second BEFORE the only chat's window cannot be
+    placed by the strict pass, and the ±1 s tolerance pass takes it. That pass
+    exists for host-arrival lag, and when it is right the CLI's interval is the
+    better estimate — so the timing is still rewritten. But the same pass is also
+    what places a NEIGHBOURING request's timing on this chat when the chat's own
+    request never reached the bridge, and nothing on the span used to tell the
+    two apart: both lost their IPC-timing markers and read as a precise merge.
+    So a tolerance-joined chat carries `OTEL_BRIDGE_JOIN_TOLERANT` and keeps
+    `TRANSPORT_TIMING_UNAVAILABLE_SUBPROCESS` / `TTFT_IPC_APPROXIMATION`.
+    """
+    spans, _window = _one_timed_chat_with_an_llm_request(receiver, -500_000_000)
+
+    (chat,) = [s for s in spans if s.name.startswith("chat")]
+    assert CaptureSource.OTEL_BRIDGE in chat.capture_sources
+    assert ("wardex.anthropic_agent_sdk.otel.request_id", "req_tol") in chat.extra
+    assert chat.gen_ai.time_to_first_chunk_s == pytest.approx(0.12)
+    assert Limitation.OTEL_BRIDGE_JOIN_TOLERANT in _limitations(chat)
+    assert _TIMING in _limitations(chat)
+    assert Limitation.TTFT_IPC_APPROXIMATION in _limitations(chat)
+    assert counters.get("adapters.anthropic.otel_bridge.llm_join_tolerant") == 1
+    assert counters.get("adapters.anthropic.otel_bridge.llm_join_ambiguous") == 0
+    assert not any(s.name == "execute_step llm_request" for s in spans)
+
+
+def test_a_strictly_joined_chat_carries_no_tolerance_marker(receiver):
+    """The control for the test above: the headline merge is unchanged when the
+    strict pass places the request — markers gone, no tolerance marker, no
+    tolerance counter."""
+    spans, _window = _one_timed_chat_with_an_llm_request(receiver, 1_000)
+
+    (chat,) = [s for s in spans if s.name.startswith("chat")]
+    assert CaptureSource.OTEL_BRIDGE in chat.capture_sources
+    assert Limitation.OTEL_BRIDGE_JOIN_TOLERANT not in _limitations(chat)
+    assert _TIMING not in _limitations(chat)
+    assert Limitation.TTFT_IPC_APPROXIMATION not in _limitations(chat)
+    assert counters.get("adapters.anthropic.otel_bridge.llm_join_tolerant") == 0
+
+
+def test_a_request_beyond_the_tolerance_window_is_not_joined(receiver):
+    """1.5 s before the window is outside both passes: no merge, the chat keeps
+    today's markers, and the request ships as a conflicted sibling step span."""
+    spans, _window = _one_timed_chat_with_an_llm_request(receiver, -1_500_000_000)
+
+    (chat,) = [s for s in spans if s.name.startswith("chat")]
+    assert chat.capture_sources == (CaptureSource.ADAPTER,)
+    assert _TIMING in _limitations(chat)
+    assert Limitation.TTFT_IPC_APPROXIMATION in _limitations(chat)
+    assert Limitation.OTEL_BRIDGE_JOIN_TOLERANT not in _limitations(chat)
+    sibling = _named(spans, "execute_step llm_request")
+    assert Limitation.CORRELATION_CONFLICT in _limitations(sibling)
+    assert counters.get("adapters.anthropic.otel_bridge.llm_join_ambiguous") == 1
+    assert counters.get("adapters.anthropic.otel_bridge.llm_join_tolerant") == 0
