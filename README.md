@@ -33,7 +33,9 @@ wardex.close()  # optional — spans auto-flush every 5s, on buffer threshold, a
 Interception is **on by default**: `init()` is the consent, and
 zero-instrumentation capture of LLM traffic is the product (`intercept=False`
 is the opt-out). `api_key` is sent as an `Authorization: Bearer <key>` header
-by the default exporter. With `WARDEX_ENDPOINT` set in the environment, a bare
+by the default exporter and never inside the exported data: one key names one
+project, and the receiver stamps that project onto what it stores. With
+`WARDEX_ENDPOINT` set in the environment, a bare
 `wardex.init()` is a working first run — see
 [Environment variables](#environment-variables).
 

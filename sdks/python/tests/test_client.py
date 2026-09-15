@@ -60,6 +60,28 @@ def test_build_sdk_info_has_runtime_meta():
     assert info.python_version and info.os and info.arch
 
 
+def test_envelope_carries_no_credential_and_no_project_claim():
+    """The API key authenticates the REQUEST, never the body: a stored batch
+    must be readable without holding a secret. And which project a batch
+    belongs to is the receiver's fact, stamped from the key it authenticated,
+    so the sender leaves the slot empty rather than claiming it."""
+    from wardex_sdk.transport import _codec
+
+    secret = "sk-live-not-for-the-wire-0000"
+    t = _Recording()
+    c = Client(WardexConfig(backend=BackendConfig(api_key=secret)), t)
+    c.capture_span(_span())
+    c.flush()
+    env = t.envelopes[0]
+    assert not hasattr(env.header, "api_key")
+    assert env.header.project_id == ""
+    decoded = _codec.decode(_codec.encode(env))
+    assert "api_key" not in decoded["header"]
+    assert decoded["header"]["project_id"] == ""
+    assert secret not in repr(decoded)
+    c.close()
+
+
 def test_flush_emits_buffered_spans_in_one_envelope():
     t = _Recording()
     c = Client(WardexConfig(backend=BackendConfig(api_key="k")), t)

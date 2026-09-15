@@ -266,7 +266,6 @@ def main() -> int:
         blocks = [_normal_gen_ai(), _buggy_gen_ai(), _reasoning_gen_ai()]
         header = EnvelopeHeader(
             event_id="dry",
-            api_key="k",
             sdk=SdkInfo(name="wardex.python", version="0", python_version="3", os="x", arch="y"),
             sent_at_ns=1,
         )

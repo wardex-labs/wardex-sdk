@@ -1054,7 +1054,6 @@ class Client:
                 return
             header = EnvelopeHeader(
                 event_id=str(uuid.uuid4()),
-                api_key=self._config.backend.api_key or "",
                 sdk=self._sdk_info,
                 sent_at_ns=time.time_ns(),
                 # The pid is stamped LIVE, per batch, never cached: it is then

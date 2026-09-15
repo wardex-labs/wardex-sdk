@@ -917,7 +917,7 @@ fn header_to_proto(h: &Bound<PyAny>) -> PyResult<pb::EnvelopeHeader> {
     let sdk = h.getattr("sdk")?;
     let mut header = pb::EnvelopeHeader {
         event_id: h.getattr("event_id")?.extract()?,
-        api_key: h.getattr("api_key")?.extract()?,
+        project_id: h.getattr("project_id")?.extract()?,
         sent_at_unix_nano: h.getattr("sent_at_ns")?.extract()?,
         sdk: Some(pb::SdkInfo {
             name: sdk.getattr("name")?.extract()?,
@@ -1170,7 +1170,7 @@ fn envelope_to_dict(py: Python<'_>, env: &pb::Envelope) -> PyResult<PyObject> {
     let h = PyDict::new_bound(py);
     if let Some(header) = &env.header {
         h.set_item("event_id", &header.event_id)?;
-        h.set_item("api_key", &header.api_key)?;
+        h.set_item("project_id", &header.project_id)?;
         h.set_item("sent_at_unix_nano", header.sent_at_unix_nano)?;
         let sdk = PyDict::new_bound(py);
         if let Some(s) = &header.sdk {

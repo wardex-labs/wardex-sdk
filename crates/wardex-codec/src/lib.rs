@@ -125,7 +125,7 @@ mod tests {
         pb::Envelope {
             header: Some(pb::EnvelopeHeader {
                 event_id: "evt-1".into(),
-                api_key: "k".into(),
+                project_id: "proj-1".into(),
                 sdk: Some(pb::SdkInfo {
                     name: "wardex.python".into(),
                     version: "0.1.0".into(),

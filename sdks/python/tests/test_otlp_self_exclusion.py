@@ -92,7 +92,6 @@ def test_otlp_transport_wraps_post_with_suppress_capture(monkeypatch):
     envelope = Envelope(
         header=EnvelopeHeader(
             event_id="evt-1",
-            api_key="k",
             sdk=SdkInfo(
                 name="wardex.python",
                 version="0.1.0",

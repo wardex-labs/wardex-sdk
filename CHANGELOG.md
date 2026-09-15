@@ -44,6 +44,20 @@ All notable changes to this project are documented here. The format follows
 
 ### Changed
 
+- **The envelope no longer carries the API key, and it gained a `project_id`
+  slot the receiver fills.** `EnvelopeHeader.api_key` (wire field 2) is
+  retired and reserved; the key now travels only as the `Authorization:
+  Bearer` header the default exporter already sends, so a stored batch holds
+  no credential and the console transport's `repr` no longer prints one.
+  `EnvelopeHeader.project_id` (field 8) is new and the SDK leaves it empty on
+  purpose: one API key names one project, so the receiver stamps the project
+  from the key it authenticated rather than trusting a claim from the sender.
+  This is a deliberate wire break, made while no envelope has ever been
+  stored (the OTLP export path never used this encoder), and `buf.yaml`
+  records the exception so the next attempt fails the build instead.
+  `EnvelopeHeader(...)` is internal; a hand-built header that passed
+  `api_key=` now raises `TypeError`.
+
 - **A wheel reaches PyPI only from a commit that passed every check, at
   publish time.** `release-python.yml` gained a `gate` job that re-runs
   `cargo fmt --check`, `clippy -D warnings`, `cargo test --workspace`,

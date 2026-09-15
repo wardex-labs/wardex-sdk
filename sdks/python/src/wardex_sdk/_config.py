@@ -159,7 +159,10 @@ class BackendConfig:
     """
 
     api_key: str | None = field(default=None, repr=False)
-    """Identifies the project on every envelope header.
+    """The project key: one key names one project at the receiver. The default
+    exporter sends it as an `Authorization: Bearer` header on every request.
+    It is never written into an envelope — the receiver stamps the project it
+    names onto each stored batch, so stored data holds no credential.
 
     `repr=False` because a config object's string form ends up in logs, crash
     reports and debugger output, none of which is a place for a credential:

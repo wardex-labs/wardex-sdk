@@ -32,7 +32,6 @@ from wardex_sdk.transport._otlp_http import OtlpHttpTransport
 def _header() -> EnvelopeHeader:
     return EnvelopeHeader(
         event_id="evt-1",
-        api_key="k",
         sdk=SdkInfo(
             name="wardex.python",
             version="0.1.0",

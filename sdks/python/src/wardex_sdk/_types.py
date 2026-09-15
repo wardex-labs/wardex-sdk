@@ -529,13 +529,22 @@ class ClientReport:
 
 @dataclass(frozen=True, slots=True)
 class EnvelopeHeader:
+    """What every batch says about itself. Deliberately carries NO credential:
+    the API key authenticates the HTTP request that carries the envelope
+    (`Authorization: Bearer`), and a stored batch must be readable without
+    holding a secret."""
+
     event_id: str  # UUID
-    api_key: str
     sdk: SdkInfo
     sent_at_ns: int
     # The app's identity (service_name/release/environment). Optional so a
     # hand-built header still encodes; the client fills it from the config.
     resource: ResourceInfo | None = None
+    # Which project the batch belongs to. The SDK never fills this: one API
+    # key names one project, so the RECEIVER stamps it from the key it
+    # authenticated before storing, and overwrites anything a client sent.
+    # Left empty here on purpose — a value would be a claim, not a fact.
+    project_id: str = ""
 
 
 @dataclass(frozen=True, slots=True)

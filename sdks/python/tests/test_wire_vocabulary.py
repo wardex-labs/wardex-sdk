@@ -151,7 +151,6 @@ def _roundtrip(span: InternalSpan) -> dict:
     env = Envelope(
         header=EnvelopeHeader(
             event_id="evt-1",
-            api_key="k",
             sdk=SdkInfo(
                 name="wardex.python",
                 version="0.1.0",
