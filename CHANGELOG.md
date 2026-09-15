@@ -76,6 +76,34 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- **Every `chat` and stream-reconstructed `execute_tool` span of one Claude
+  Agent SDK run no longer starts at the moment the prompt was written.** The
+  assembler kept one turn start per session, set only when the host wrote a
+  user message, and stamped it as the start of every chat span and every
+  stream-only tool span that followed — so an agentic loop of 75 assistant
+  turns shipped 75 chats with one identical `start_time_ns` and durations
+  running from the prompt to each message (up to the whole session). Sorted by
+  start, they collapsed into arrival order and pushed the correctly timed HTTP
+  spans out of sequence. Each conversational thread (the main thread and one
+  per `Task` call, keyed by the stream's `parent_tool_use_id`) now carries its
+  own floor: the arrival of the last event observed on it — the user's write,
+  the previous message, or the last tool result the CLI waited on — which is
+  the closest instant to the request wardex can see from outside the CLI. A
+  stream-only tool span starts when the message announcing its `tool_use`
+  block arrived. Time-to-first-chunk is measured per turn against that floor
+  and no longer inherits the first turn's value. The spans stay marked
+  `transport_timing_unavailable_subprocess` as before — the start is still an
+  IPC-side estimate — and the OTel bridge's merge still replaces it with the
+  CLI's own interval. Measured on a 51-second run with eight parallel
+  sub-agents: chat starts went from 1 distinct value to 34 of 39 (sub-agents
+  spawned by one message share their floor by design), tool starts from 1 to
+  38 of 38, and chat durations from 4–87 s to 0.1–4 s.
+  Sub-agent threads live until their `Task` call returns and share the
+  per-session entry bound; past it the newest thread is refused and its chats
+  floor at the spawning message's arrival. Counter:
+  `adapters.assembler.thread_table_full`, once per event that met the full
+  table.
+
 - **A sub-agent whose identifier fell out of a full alias table no longer
   flattens into its session silently.** Each unit keeps at most
   `max_entries_per_unit` lookup aliases and drops the oldest. Looking the

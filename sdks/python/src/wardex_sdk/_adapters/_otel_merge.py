@@ -325,11 +325,14 @@ class _JoinOutcome:
 def sequence_chat_windows(pending: list[Any]) -> list[_ChatWindow]:
     """The join windows of a session's pended chat drafts, SEQUENCED per scope.
 
-    Every chat of one agentic loop shares the same host write, so their
-    recorded turn starts collide — and colliding windows made every multi-turn
-    session degenerate to the ambiguity fallback (measured against a live CLI).
     The request that produced chat N cannot have started before chat N-1's
-    message arrived, so N-1's arrival is N's floor. Keys are pending indexes.
+    message arrived, so N-1's arrival is N's floor. The assembler now records
+    each chat's start from its thread's own last event (`_Thread`), so the
+    windows it pends already respect this; the floor stays as the join's own
+    guarantee, because colliding windows made every multi-turn session
+    degenerate to the ambiguity fallback (measured against a live CLI) back
+    when every chat of one loop was stamped with the same host write. Keys
+    are pending indexes.
     `pending` holds the assembler's `_PendingSpan` records, read by field only.
     """
     windows = []
