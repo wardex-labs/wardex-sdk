@@ -280,6 +280,10 @@ _MEMBER_SITES: dict[str, frozenset[str]] = {
     # names a process event and no knob — see its docstring for why it is not
     # CONNECTION_EVICTED.
     "TRACKING_RESET_AT_FORK": frozenset({"_interceptors/_seam.py"}),
+    # Two stamps in the one module: `_seal` appends it to the sealed markers of
+    # an HTTP transaction, `_build_ws_span` adds it to a WebSocket session's
+    # span, which is built inline and never sealed.
+    "PEER_UNRESOLVED": frozenset({"_interceptors/_seam.py"}),
     # The deferred-parse queue's two unparsed shipments, every site in one
     # file: `submit` decides PARSE_BACKLOG_FULL (the eviction and the
     # oversize clamp hand it to the fallback helper), and `drain_all`'s
@@ -654,6 +658,12 @@ _EMITTED_MEMBERS: frozenset[str] = frozenset(
         # it, a `+` inside a node name split into a link to a node that never
         # triggered the step, with nothing counted and nothing marked.
         "LINK_AMBIGUOUS",
+        # The twenty-first: the unresolved-peer marker, minted WITH its emitters
+        # (the seam's `_seal` and `_build_ws_span`). Before it a unix
+        # socket or a failing `getpeername()` shipped port 443 on
+        # `server.port` and in the URL, with nothing on the span or in the
+        # counters to say the address was invented.
+        "PEER_UNRESOLVED",
     }
 )
 """Which MEMBERS have an emit site today, derived independently below.
@@ -1619,17 +1629,22 @@ _VOCABULARY: dict[str, str] = {
     #     more than one reading — kept apart from TOOL_NAME_COLLISION (that
     #     is the span's own identity; this is an edge to another span) ---
     "LINK_AMBIGUOUS": "link_ambiguous",
+    # --- added after the census, by the byte seam's peer fallback (1): a
+    #     connection whose peer address wardex could not read ships port 0
+    #     and says so — kept apart from CONNECT_TIMING_UNAVAILABLE, which is
+    #     a missing duration on a peer wardex DID name ---
+    "PEER_UNRESOLVED": "peer_unresolved",
 }
 
 
-def test_the_vocabulary_is_exactly_these_forty_nine() -> None:
+def test_the_vocabulary_is_exactly_these_fifty() -> None:
     """15 declared before the census + 21 from it + 1 from §5.4 + 1 for wardex
     itself + 1 for the OTLP size guard + 1 for the registry breadth bound
     + 2 for the OTel bridge's fail-open pair + 1 for the adapter's per-session
     bound + 1 for the dynamic-key bound + 1 for the fork tracking reset
     + 2 for the deferred-parse queue's unparsed shipments + 1 for the
-    WebSocket LLM-transport marker + 1 for the ambiguous LangGraph join,
-    name by name.
+    WebSocket LLM-transport marker + 1 for the ambiguous LangGraph join
+    + 1 for the unresolved peer address, name by name.
 
     A count alone is not enough: a RENAME keeps the count and is the single most
     expensive mistake available here. These are proto enum values in

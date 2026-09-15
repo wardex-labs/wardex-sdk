@@ -58,7 +58,7 @@ class RawSocketInterceptor(ByteSeamInterceptor):
         super().__init__()
         # Case-folded on the way in, and matched case-folded below. What the
         # allowlist is compared against is usually a peer IP, where case cannot
-        # differ — but `_peer()` falls back to the connection's
+        # differ — but `peer_address()` falls back to the connection's
         # `server_hostname` when `getpeername()` fails, and that string is
         # whatever the caller passed to connect. A user who wrote `MyBox.local`
         # in the config and a connection wardex names `mybox.local` are the same

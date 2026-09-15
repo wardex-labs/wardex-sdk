@@ -558,9 +558,18 @@ section's neighbours mention `interceptors.seam.path_excluded` (telemetry
 uploads skipped), `interceptors.seam.provider_state_dropped` (requests on a
 Conversations-API-shaped path the mode did not capture),
 `interceptors.seam.ws_llm_semantics_unread` (WebSocket connections that
-carried LLM calls wardex did not read) and
+carried LLM calls wardex did not read),
 `interceptors.seam.ws_llm_endpoint_unconfirmed` (Responses-path WebSocket
-connections wardex could not corroborate); table-eviction counters are under
+connections wardex could not corroborate) and
+`interceptors.seam.peer_unresolved` (requests on a connection whose peer
+address wardex could not read: a unix socket, asyncio TLS under uvloop, trio
+TLS (httpx `AsyncClient` under trio included), a sync client's HTTPS call
+through an HTTPS proxy, or an async TLS connection opened before
+`wardex.init()`. Other async TLS on asyncio -- aiohttp, httpx `AsyncClient`,
+`AsyncOpenAI` -- has its peer read where the connection is set up and is not
+counted. The in-process span says port `0`, the URL renders `:0`, OTLP export omits `server.port` because 0 is proto3 "unset", and
+`peer_unresolved` in `wardex.limitations` is the marker to filter on);
+table-eviction counters are under
 Resource limits. `ffi.panic_converted` counts a panic in the Rust core that
 the FFI boundary turned into `NativePanic` -- a `RuntimeError`, so the guard
 around the host's call swallowed it -- on top of the site's own count.

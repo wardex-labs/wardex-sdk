@@ -237,6 +237,18 @@ enum Limitation {
   LIMITATION_TTFT_IPC_APPROXIMATION = 19;
   LIMITATION_TRANSPORT_TIMING_UNAVAILABLE_SUBPROCESS = 20;
 
+  // -- Transport address.
+  //    The span's server.address / server.port and its URL are a placeholder,
+  //    not an address read off the connection: no INET (host, port) pair was
+  //    read — a unix socket answers getpeername() with a path, and a
+  //    memory-BIO TLS object has no getpeername and, on uvloop TLS or when set
+  //    up before wardex, no transport peer wardex could read — so the
+  //    port is 0 and the host is the TLS server name, else `unknown`. The
+  //    traffic is still captured. Names NO knob. Not
+  //    CONNECT_TIMING_UNAVAILABLE (17): that is a missing duration on a peer
+  //    wardex did name; this is the peer itself.
+  LIMITATION_PEER_UNRESOLVED = 50;
+
   // -- Caps reached. Each names a DIFFERENT tunable in `wardex-limits`, which
   //    is why they are not merged: the user's next action differs per value.
   LIMITATION_BODY_CAP_EXCEEDED = 21;

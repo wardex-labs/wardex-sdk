@@ -44,7 +44,7 @@ def test_seam_skips_when_suppressed():
     # (early return from _state means self._conns stays empty too).
     interceptor = SSLInterceptor()
     interceptor._client = _RecordingClient()
-    obj = object()  # no getpeername/selected_alpn_protocol → falls back in _peer/_select_tracker
+    obj = object()  # no getpeername/selected_alpn_protocol → both lookups fall back
 
     with suppress_capture():
         interceptor._on_request_bytes(obj, _REQUEST)

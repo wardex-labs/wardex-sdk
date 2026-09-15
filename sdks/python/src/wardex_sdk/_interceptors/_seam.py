@@ -57,6 +57,7 @@ from .._types import (
 from ._base import InterceptorInterface
 from ._close_hook import install_shared_close_hook, on_close, uninstall_shared_close_hook
 from ._conn_timing import install_shared_timing, uninstall_shared_timing
+from ._peer import UNRESOLVED_HOST, UNRESOLVED_PORT, peer_address, placeholder_host
 from ._trackers import _Txn, _WebSocketTracker
 
 if TYPE_CHECKING:
@@ -463,7 +464,7 @@ class ByteSeamInterceptor(InterceptorInterface):
         cid = id(obj)
         st = self._conns.get(cid)
         if st is None:
-            addr, port = _peer(obj)
+            addr, port = peer_address(obj)
             st = _ConnectionState(self._select_tracker(obj), addr, port)
             if cid in self._reset_at_fork_ids:
                 # This object was tracked when the fork reset the table, so it
@@ -525,9 +526,8 @@ class ByteSeamInterceptor(InterceptorInterface):
         st = self._state(obj)
         if not self._gate(st, data, "request"):
             return
-        addr, port = _peer(obj)
-        st.server_address = addr
-        st.server_port = port
+        if st.server_address == UNRESOLVED_HOST:  # only a TLS name can still arrive; see `_peer.py`
+            st.server_address = placeholder_host(obj)
         for txn in st.tracker.on_request_bytes(data):
             if txn.version == "websocket":
                 self._emit_ws(st, txn)
@@ -626,6 +626,9 @@ class ByteSeamInterceptor(InterceptorInterface):
         # Classified once here and carried on the job: `_assemble` reads the
         # same answer for the provider-state count instead of asking again.
         treatment = classify_path(txn.path)
+        if st.server_port == UNRESOLVED_PORT:  # counted even if excluded; see `_peer.py`
+            timing_markers = (*timing_markers, Limitation.PEER_UNRESOLVED)
+            counters.bump("interceptors.seam.peer_unresolved")
         if treatment == "excluded":
             # A telemetry upload (the OpenAI Agents SDK POSTs its whole run
             # record to /v1/traces/ingest). Not wardex's to copy: skipped in
@@ -723,16 +726,17 @@ class ByteSeamInterceptor(InterceptorInterface):
             client.capture_span(span)
 
     def _build_ws_span(self, st: _ConnectionState, txn: _Txn) -> Any:
-        # The tracker's answer to the LLM-transport question, counted HERE
-        # and BEFORE the gate: every `interceptors.seam.*` bump lives in this
-        # module, and a span the mode refuses must still count — the counter
-        # is the only trace an unconfirmed connection leaves under the
-        # default mode. Once per connection, because this runs once per
-        # connection: the WS span is built at close.
+        # The tracker's LLM-transport answer and an unread peer (`_peer.py`),
+        # counted HERE and BEFORE the gate: every `interceptors.seam.*` bump
+        # lives in this module, and a span the mode refuses must still count —
+        # the counter is its only trace under the default mode. Once per
+        # connection, because the WS span is built once, at close.
         if txn.ws_llm_call:
             counters.bump("interceptors.seam.ws_llm_semantics_unread")
         elif txn.ws_llm_unconfirmed:
             counters.bump("interceptors.seam.ws_llm_endpoint_unconfirmed")
+        if peer_unresolved := st.server_port == UNRESOLVED_PORT:
+            counters.bump("interceptors.seam.peer_unresolved")
         # `sem=None`: a WS session carries no parsed LLM semantics (by
         # construction on this path), so it is captured under ALL, an
         # allowlisted host, a live local span, or — the one claim this path
@@ -763,6 +767,8 @@ class ByteSeamInterceptor(InterceptorInterface):
             start_ns=txn.start_ns,
         )
         self._stamp_fork_reset(st, draft)
+        if peer_unresolved:  # never sealed, so stamped here
+            draft.add_limitation(Limitation.PEER_UNRESOLVED)
         draft.set_extra("network.protocol.version", "websocket")
         draft.set_extra("ws.messages.sent", txn.ws_messages_sent)
         draft.set_extra("ws.messages.received", txn.ws_messages_received)
@@ -971,7 +977,7 @@ def _assemble(p: _PendingTxn, *, parse: bool, extra: tuple[Limitation, ...]) -> 
         parent_closed=txn.parent_closed,
         parent_evicted=txn.parent_evicted,
     )
-    url = f"{p.url_scheme}://{p.url_host}:{p.server_port}{txn.path}"
+    url = f"{p.url_scheme}://{p.url_host}:{p.server_port}{txn.path}"  # `:0` too; see `_peer.py`
     transfer = max(0.0, (txn.end_ns - txn.start_ns) / 1e6 - txn.ttfb_ms)
 
     # TRANSPORT mode, not an intent (design §6.1 correction in `_vocab.py`):
@@ -1182,16 +1188,7 @@ def _latched(txn: _Txn) -> Ambient:
 
 def _url_host(obj: Any, st: _ConnectionState) -> str:
     """The host a URL on this connection names: the TLS server name when
-    there is one, else the peer address `_peer` recorded on `st`. One
+    there is one, else the peer address `peer_address` recorded on `st`. One
     expression for the WS swap site and `_seal`, so the WebSocket-transport
     question and the HTTP span's URL are asked about the same host."""
     return getattr(obj, "server_hostname", None) or st.server_address
-
-
-def _peer(obj: Any) -> tuple[str, int]:
-    try:
-        peer = obj.getpeername()
-        return str(peer[0]), int(peer[1])
-    except Exception:
-        host = getattr(obj, "server_hostname", None) or "unknown"
-        return str(host), 443

@@ -93,6 +93,40 @@ All notable changes to this project are documented here. The format follows
   not. What remains: the panic hook's one `thread '<unnamed>' panicked at`
   line on stderr, which only a process-global hook could silence, and wardex
   does not replace the host's.
+- **A span no longer invents port 443 when wardex cannot read the peer's
+  address.** An HTTP call over a unix socket (httpx `uds=`, docker-py, a local
+  model server), or on a socket whose `getpeername()` fails, used to ship
+  `server.port=443` and a URL like `http://unknown:443/v1/chat/completions`,
+  with nothing on the span to say the address was made up. It now reports
+  port `0` on the in-process span (`server_port`) and in the URL
+  (`http://unknown:0/...`), carries the new limitation marker
+  `peer_unresolved`, and counts under `interceptors.seam.peer_unresolved`; the
+  call is still captured. Over OTLP, port 0 is proto3 "unset", so the exported
+  span has no `server.port` attribute at all rather than `server.port=0`: to
+  find these spans in a backend, filter on `peer_unresolved` in
+  `wardex.limitations`, not on the port.
+  **Async TLS calls now report the real peer.** Async TLS runs on a memory-BIO
+  `ssl.SSLObject`, which has no peer address of its own, so wardex reads the
+  peer where the connection is set up: off the socket transport on asyncio TLS
+  (aiohttp, `asyncio.open_connection(ssl=...)`), and off anyio's TLS stream on
+  anyio TLS (httpx `AsyncClient` on asyncio, and so `AsyncOpenAI` and
+  `AsyncAnthropic`).
+  Those spans report the real port, and the IP connected to in
+  `server.address`, exactly as sync clients (`httpx.Client`, `requests`) do;
+  the URL keeps the TLS server name as its host. They used to report port 443
+  and the server name, which was a guess. What still reports port 0 (no
+  `server.port` over OTLP), a URL like
+  `https://api.openai.com:0/v1/chat/completions`, `peer_unresolved`, and one
+  count, with the TLS server name in `server.address`: asyncio TLS under
+  uvloop, whose TLS protocol is its own (anyio over uvloop is read); trio TLS,
+  including httpx `AsyncClient` under trio; a sync client's (`httpx.Client`,
+  `requests`) HTTPS call through an HTTPS proxy, whose inner TLS runs on its
+  own memory-BIO object; and an async TLS connection opened before
+  `wardex.init()`. A WebSocket session on
+  such a connection counts once per session,
+  including one the capture mode refuses. The seam also stops calling
+  `getpeername()` on every send.
+  Wire change: `peer_unresolved` is a new value (50) of `wardex.v1.Limitation`.
 
 ## [0.6.0b1] - 2026-09-06
 

@@ -15,52 +15,44 @@ moment they are declared (``buf`` ``ENUM_VALUE_SAME_NAME``), so a late
 correction costs a second deliberate schema break. Emitters must never invent a
 marker string inline.
 
-**The census closed at 37 members = 15 originally declared + 21 from it + 1
-from §5.4.** Every member since landed by its own deliberate core change, WITH
-its emitter, and the reason for each is recorded beside its entry in
-``tests/test_limitation_census.py`` (``_VOCABULARY``, ``_EMITTED_MEMBERS``) —
-that file is the live count and the history; this module no longer keeps a
-second copy of either.
-The census read every assignment and append site that reaches
+**The census closed at 37 members = 15 originally declared + 21 from it + 1 from
+§5.4.** It read every assignment and append site that reaches
 ``CaptureIntegrity.limitations`` and found 25 distinct strings (24 Python, 1
-Rust). Four of those merged away — see the ``NOTE (census)`` comments on
+Rust); four merged away (the ``NOTE (census)`` comments on
 ``CONNECT_TIMING_UNAVAILABLE``, ``PAYLOAD_COMPRESSED``, ``FRAME_PARSE_FAILED``
-and ``CHILD_SPAN_UNCLOSED`` — leaving 21 new members.
+and ``CHILD_SPAN_UNCLOSED``), leaving 21 new members. Every later member landed
+WITH its emitter, by its own deliberate change; its reason is recorded where a
+test reads it (``_VOCABULARY``, the live count, and ``_EMITTED_MEMBERS`` in
+``tests/test_limitation_census.py``) and its proto number in ``common.proto``.
 
 **Two vocabularies, not one — do not merge them.** A ``disabled_reason`` is why
-a Rust parser latched *itself* off for a whole connection; no span exists to
-carry it (nothing was ever parsed), so it stays a ``&'static str`` that
-``init(debug=True)`` prints once to stderr. ``headers_exceeded``, ``not_http``
-and ``chunk_size_exceeded`` are those, and they are deliberately absent below.
-The trap is ``stream_buffer_exceeded``, which is **both**: the HTTP/1 latch
-(``crates/wardex-protocol/src/http1.rs``) is a debug reason and stays out,
-while the MCP-stdio JSON-RPC instance (``json_rpc.rs``) happens with a pending
-request already open, so a span exists and design §4.6 site-3 makes it
-reportable — that is why ``STREAM_BUFFER_EXCEEDED`` is a member. The two
-vocabularies must stay in separate proto enums; they have different lifetimes
-and different consumers (wire contract vs stderr).
+a Rust parser latched *itself* off for a whole connection; nothing was parsed,
+so no span exists to carry it and it stays a ``&'static str`` that
+``init(debug=True)`` prints once to stderr — ``headers_exceeded``, ``not_http``
+and ``chunk_size_exceeded``, deliberately absent below. The trap is
+``stream_buffer_exceeded``, which is **both**: the HTTP/1 latch
+(``crates/wardex-protocol/src/http1.rs``) is a debug reason and stays out, while
+the MCP-stdio JSON-RPC instance (``json_rpc.rs``) happens with a pending request
+already open, so a span exists and design §4.6 site-3 makes it reportable —
+hence ``STREAM_BUFFER_EXCEEDED``. They stay separate proto enums: different
+lifetimes, different consumers (wire contract vs stderr).
 
 **Read this before adding a member.** ``tests/test_limitation_census.py``
-re-runs the census against the source on every test run and fails if any marker
-string, in either language, has no member here. That test is the mechanism;
-this docstring is only its description. If it just failed on you, the question
-to answer is not "how do I make it pass" but "is my new string a wire-contract
-marker (add a member) or a connection-level debug reason (add it to the
-exclusion set instead)".
+re-runs the census on every test run and fails if any marker string, in either
+language, has no member here. If it just failed on you, ask not "how do I make
+it pass" but "is my new string a wire-contract marker (add a member) or a
+connection-level debug reason (add it to the exclusion set instead)".
 
-This module is the **python half** of the census, and completing it was the
-hard prerequisite for routing all six span-emit sites through
-``SpanDraft.finish()`` — ``finish()`` raises ``VocabularyError`` on a marker
-that is not a member here, which the emit site's ``guard()`` swallows. Against
-an incomplete enum that routing would have silently deleted every gRPC span,
-every streaming chat span, every WS span and every adapter span. It is done:
-**every Python emitter now names a member**, the seven pre-rename free strings
-are gone from the tree, and ``tests/test_limitation_census.py`` asserts an
-EMPTY string census as the standing rule. One producer is still textual —
+This module is the **python half** of the census, the hard prerequisite for
+routing all six span-emit sites through ``SpanDraft.finish()``: it raises
+``VocabularyError`` on a non-member, which the site's ``guard()`` swallows, so
+an incomplete enum would have silently deleted every gRPC, streaming chat, WS
+and adapter span. **Every Python emitter now names a member**, the seven
+pre-rename free strings are gone, and the census test asserts an EMPTY string
+census as the standing rule. One producer is still textual:
 ``body_cap_exceeded``, built in ``crates/wardex-protocol`` and resolved once at
-the PyO3 boundary by ``Limitation.from_wire``. Retyping the Rust side is the
-remaining work, and it is what would make proto the single source of truth for
-every language SDK (§6.6).
+the PyO3 boundary by ``Limitation.from_wire``; retyping the Rust side would make
+proto the single source of truth for every language SDK (§6.6).
 """
 
 from __future__ import annotations
@@ -71,49 +63,43 @@ from enum import Enum
 class Limitation(Enum):
     """CLOSED and complete. The only legal values of a span's limitation markers.
 
-    Values are the wire contract (``CaptureIntegrity.limitations``); they are
-    lower_snake to match every other wardex enum and must not be renamed
-    casually. Four values below were renamed by the census on the way in — that
-    rename is itself a wire change, and it rode the same deliberate
-    ``wardex.v1`` break that put this enum on the wire (§6.7). There is no
-    second chance.
+    Values are the wire contract (``CaptureIntegrity.limitations``), lower_snake
+    like every other wardex enum, and must not be renamed casually: four were
+    renamed by the census on the way in, riding the same deliberate ``wardex.v1``
+    break that put this enum on the wire (§6.7). There is no second chance.
 
-    Each member records the condition that emits it and the site that does so,
-    as module-qualified functions rather than line numbers. The site named is
-    the function that ATTACHES the marker, which on the byte seam and in the
-    Agent SDK assembler is the ``_build_*`` half of a ``_build_*``/``_emit_*``
-    pair — the ``_emit_*`` wrapper only guards the build and hands the finished
-    span to the sink, so it holds no marker to grep for. A member marked
-    "declared; no emitter" is vocabulary the design named and a later seam
-    wires up — it is not dead code, and it is not evidence that the census
-    missed something.
+    Each member records the condition that emits it and the function that
+    ATTACHES it, module-qualified rather than by line number. On the byte seam
+    and in the Agent SDK assembler that is the ``_build_*`` half of a
+    ``_build_*``/``_emit_*`` pair — ``_emit_*`` only guards the build and sinks
+    the span, so it holds no marker to grep for. A member marked "declared; no
+    emitter" is vocabulary the design named and a later seam wires up — not dead
+    code, and not evidence that the census missed something.
     """
 
     @classmethod
     def from_wire(cls, value: str) -> Limitation | None:
         """A marker that arrived as a STRING, resolved to its member, or None.
 
-        Exactly one caller is legitimate and it is the PyO3 boundary: the Rust
-        protocol parsers still build `Vec<&'static str>` (retyping them means
-        touching `bindings/python/src/lib.rs` and the PII walk that runs
-        regexes over the strings too), so a marker produced in Rust reaches Python
-        as text and has to be resolved once, at the seam that folds it into a
-        span. Python-side emitters name the member directly and must not come
-        here — a string-to-member lookup used as a general entry point is the
-        drift this enum exists to end.
+        Exactly one caller is legitimate: the PyO3 boundary. The Rust protocol
+        parsers still build `Vec<&'static str>` (retyping them means touching
+        `bindings/python/src/lib.rs` and the PII walk that runs regexes over the
+        strings too), so a marker produced in Rust reaches Python as text and is
+        resolved once, at the seam that folds it into a span. Python-side
+        emitters name the member directly; a string-to-member lookup used as a
+        general entry point is the drift this enum exists to end.
 
-        Returns `None` rather than raising for an unrecognized string, because
-        the alternative on that path is deleting the span (`finish()` rejects a
-        marker it cannot type) over a marker wardex itself produced. That is
-        not a silent hole: `tests/test_limitation_census.py` scans `crates/`
-        and `bindings/` on every run and fails the build if the Rust side
-        starts emitting a string with no member here, so an unknown value is
+        Returns `None` rather than raising for an unrecognized string: the
+        alternative on that path is deleting the span (`finish()` rejects a
+        marker it cannot type) over a marker wardex itself produced. Not a
+        silent hole: `tests/test_limitation_census.py` scans `crates/` and
+        `bindings/` on every run and fails the build if the Rust side starts
+        emitting a string with no member here, so an unknown value is
         unreachable rather than merely tolerated.
 
         A dict lookup rather than `cls(value)` in a `try`: `_assembly/` is held
-        to zero silent swallows (C-S4), and an `except ValueError: return None`
-        here would be one — indistinguishable in a diff from a swallow that is
-        hiding something.
+        to zero silent swallows (C-S4), and `except ValueError: return None`
+        would be one — indistinguishable in a diff from a swallow hiding something.
         """
         return _BY_VALUE.get(value)
 
@@ -639,7 +625,7 @@ Two emit sites, and the first is the mechanism the second restates.
     """
 
     # ------------------------------------------------------------------
-    # Transport timing (census) — a duration is missing, not zero
+    # Transport (census + one since) — a duration or the peer is missing, not zero
     # ------------------------------------------------------------------
 
     CONNECT_TIMING_UNAVAILABLE = "connect_timing_unavailable"
@@ -691,6 +677,20 @@ Two emit sites, and the first is the mechanism the second restates.
     wardex wrapped in *this* process, so its duration is measured directly
     rather than inferred from an IPC stream — attaching the marker there would
     claim the timing is absent when it is the one timing the adapter owns.
+    """
+
+    PEER_UNRESOLVED = "peer_unresolved"
+    """``server.address``/``server.port`` and the URL's host and port are a
+    placeholder: no INET ``(host, port)`` was read — a unix socket's peer is a
+    path; a memory-BIO ``SSLObject`` on uvloop or trio TLS, sync TLS in TLS,
+    or set up before install, has no ``getpeername`` and no asyncio/anyio
+    stamp — so the port is ``0`` and the host the TLS server name, else
+    ``unknown``. Still captured; the old fallback said 443, marked nothing.
+
+    Emitted from ``_interceptors/_seam.py::ByteSeamInterceptor._seal``/``._build_ws_span``
+    on port 0, counted as ``interceptors.seam.peer_unresolved``; the placeholder
+    is ``_interceptors/_peer.py::peer_address``'s. Names NO knob; not
+    ``CONNECT_TIMING_UNAVAILABLE``, a missing duration on a named peer.
     """
 
     # ------------------------------------------------------------------

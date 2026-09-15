@@ -135,7 +135,9 @@ def _drive(
     seam._client = client
     seam._load_limits(client)
 
-    obj = SimpleNamespace(server_hostname=host.decode())
+    # A real peer address, so the only markers compared below are the ones the
+    # capture mode could influence (an unread one would add PEER_UNRESOLVED).
+    obj = SimpleNamespace(server_hostname=host.decode(), getpeername=lambda: ("203.0.113.10", 443))
     seam._on_request_bytes(
         obj,
         b"POST " + path + b" HTTP/1.1\r\nHost: " + host + b"\r\n"

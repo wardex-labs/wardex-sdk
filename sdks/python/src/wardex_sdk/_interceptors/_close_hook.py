@@ -77,12 +77,15 @@ process at the exact moment it was wrapped. A detach is a handoff, not an end.
 
 from __future__ import annotations
 
+import importlib.util
 import socket
+import sys
 import weakref
 from collections.abc import Callable
 from typing import Any
 
 from .._assembly import PatchSet, guard
+from ._peer import stamp_peer
 
 __all__ = [
     "CloseProbe",
@@ -111,6 +114,22 @@ _IMPORT_SSLPROTO = guard("interceptors.close_hook.sslproto_import")
 #: a `__getattr__` or a property of its own, so the read is somebody else's code
 #: and is treated as such.
 _CONNECTION_LOST = guard("interceptors.close_hook.connection_lost")
+#: The `SSLProtocol.connection_made` wrapper's peer read. It runs AFTER the
+#: original, so a raise here could not stop the handshake asyncio has already
+#: started — but it would propagate out of `connection_made` into the event
+#: loop's connection setup, and the host's `open_connection` would fail over a
+#: span attribute. Same private attributes, same subclassing risk, same guard.
+_CONNECTION_MADE = guard("interceptors.close_hook.connection_made")
+#: Importing anyio's TLS stream and socket attributes once anyio has been FOUND.
+#: Its absence is an answer and is asked, not attempted (see `_anyio_tls`); a
+#: package that is present and still fails to import is a fact about this
+#: environment worth a count.
+_IMPORT_ANYIO = guard("interceptors.close_hook.anyio_import")
+#: The `TLSStream.wrap` wrapper's peer read, after anyio's own handshake has
+#: returned. `extra()` runs whatever the stream stack beneath it provides,
+#: which is the host's code; a raise there must not turn the host's
+#: successful TLS setup into a failed one.
+_TLS_STREAM_WRAP = guard("interceptors.close_hook.tls_stream_wrap")
 
 
 class _Entry:
@@ -341,10 +360,33 @@ def _sslobj_of(protocol: Any) -> Any:
     return getattr(getattr(protocol, "_sslpipe", None), "ssl_object", None)
 
 
+def _anyio_tls() -> tuple[Any, Any, Any] | None:
+    """`(TLSStream, TLSAttribute.ssl_object, SocketAttribute.remote_address)`,
+    or None where anyio is not installed.
+
+    ASKED before it is attempted, for `_supports_weakref`'s reason: anyio is an
+    optional third party, so its absence is an answer, and catching the
+    `ImportError` would file it under a `guard()` counter that means a wardex
+    failure. `sys.modules` is consulted first because `find_spec` raises for a
+    module already imported without a `__spec__`. Once anyio is found, the
+    import is guarded and counted: present and unimportable is a fact about
+    this environment, and the async TLS peer on anyio then stays unread.
+    """
+    if "anyio" not in sys.modules and importlib.util.find_spec("anyio") is None:
+        return None
+    found: tuple[Any, Any, Any] | None = None
+    with _IMPORT_ANYIO:
+        from anyio.abc import SocketAttribute
+        from anyio.streams.tls import TLSAttribute, TLSStream
+
+        found = (TLSStream, TLSAttribute.ssl_object, SocketAttribute.remote_address)
+    return found
+
+
 class CloseProbe:
     """Turns the end of a connection into a registry event. Idempotent, fail-silent.
 
-    THREE patches. Two of them are on `socket.socket`, because `close()` is not
+    FIVE patches. Two of them are on `socket.socket`, because `close()` is not
     reliably the end of anything:
 
         def close(self):
@@ -389,6 +431,38 @@ class CloseProbe:
     `_SSLPipe` that holds it on the way out. Two attribute paths for the same
     thing: `SSLProtocol._sslobj` since the 3.11 rewrite, and the pipe's
     `ssl_object` before it.
+
+    `SSLProtocol.connection_made` is the FOURTH, and it is not an end: it is
+    the other moment the same protocol holds the `SSLObject` and its transport
+    at once, and the only one at which the transport it is handed is the raw
+    socket transport whose `peername` is the TCP peer. The object has no
+    `getpeername()`, so without this the seam reported every asyncio TLS call
+    as an unread peer (see `_peer.py`). It lives here rather than in a probe of
+    its own because it is the same private class, read through the same two
+    spellings, and must come out with the same `restore_all()`. It reads AFTER
+    the original, which is what gives the object time to exist: 3.11+ builds
+    it in `__init__`, but 3.10 builds it inside `connection_made`, in the
+    pipe's `do_handshake`. Nothing reads the stamp before the first application
+    byte, and no application byte crosses the object before that call returns.
+    Absent under uvloop, whose TLS protocol is its own class, and on a
+    connection made before `install()`: both stay unread.
+
+    anyio's `TLSStream.wrap` is the FIFTH, and it is the same fact on the other
+    async TLS stack. httpx's `AsyncClient` on asyncio — so the async OpenAI and
+    Anthropic clients — does not use asyncio's TLS protocol at all: anyio
+    builds its own `SSLObject` over a byte stream, and the FOURTH patch never
+    sees it. (Under trio httpcore uses `trio.SSLStream`, which neither patch
+    sees; a sync client's TLS inside TLS is a hand-pumped `wrap_bio` object,
+    likewise unread.) The
+    classmethod returns the finished stream, whose typed attributes are public
+    anyio API and name both the object (`TLSAttribute.ssl_object`) and the
+    socket's peer (`SocketAttribute.remote_address`), so the read runs after
+    the handshake and before anyio hands the stream to anything that could
+    send an application byte. Optional, like anyio: a process without it has
+    no such stream to read, and the patch is simply not made. It is here, and
+    not in `_mcp_stdio` beside the other anyio patch, because a peer stamp
+    must be in place for every seam that reads `SSLObject`s and must come out
+    with the same `restore_all()` as the asyncio half.
     """
 
     __slots__ = ("_installed", "_patches", "_registry")
@@ -412,6 +486,20 @@ class CloseProbe:
         lost = getattr(proto, "connection_lost", None)
         if lost is not None:
             self._patches.patch(proto, "connection_lost", self._mk_connection_lost(lost))
+        made = getattr(proto, "connection_made", None)
+        if made is not None:
+            self._patches.patch(proto, "connection_made", self._mk_connection_made(made))
+        tls = _anyio_tls()
+        if tls is not None:
+            stream_cls, ssl_attr, peer_attr = tls
+            # The function under the classmethod, so a subclass calling
+            # `wrap` still arrives as its own `cls`. `patch()` records the raw
+            # descriptor from the class `__dict__`, so restore puts the
+            # classmethod back exactly as it was.
+            func = getattr(getattr(stream_cls, "wrap", None), "__func__", None)
+            if func is not None:
+                wrapper = self._mk_tls_stream_wrap(func, ssl_attr, peer_attr)
+                self._patches.patch(stream_cls, "wrap", wrapper)
         self._installed = True
 
     def uninstall(self) -> None:
@@ -466,6 +554,33 @@ class CloseProbe:
             return orig(this, *a, **k)
 
         return wrapper
+
+    @staticmethod
+    def _mk_connection_made(orig: Any):  # noqa: ANN205
+        def wrapper(this: Any, transport: Any, *a: Any, **k: Any) -> Any:
+            ret = orig(this, transport, *a, **k)
+            # After the original, and only if it returned: a protocol whose
+            # setup raised has nothing worth a peer. See `_CONNECTION_MADE`.
+            with _CONNECTION_MADE:
+                get_extra_info = getattr(transport, "get_extra_info", None)
+                peer = get_extra_info("peername") if get_extra_info is not None else None
+                stamp_peer(_sslobj_of(this), peer)
+            return ret
+
+        return wrapper
+
+    @staticmethod
+    def _mk_tls_stream_wrap(func: Any, ssl_attr: Any, peer_attr: Any) -> classmethod:
+        async def wrapper(cls: Any, *a: Any, **k: Any) -> Any:
+            stream = await func(cls, *a, **k)
+            # Only once anyio returned a stream: a failed handshake raised
+            # above and has no peer worth reading. See `_TLS_STREAM_WRAP`.
+            with _TLS_STREAM_WRAP:
+                extra = stream.extra
+                stamp_peer(extra(ssl_attr, None), extra(peer_attr, None))
+            return stream
+
+        return classmethod(wrapper)
 
 
 # --- Module singleton: the SSL seam, the plaintext seam and the timing probe

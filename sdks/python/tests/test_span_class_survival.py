@@ -186,7 +186,10 @@ def _ws_frame(fin: bool, opcode: int, payload: bytes) -> bytes:
 
 
 def _drive_seam(seam: _Seam, host: str, request: bytes, response: bytes) -> None:
-    obj = SimpleNamespace(server_hostname=host)
+    # A real peer address, as a connected TLS socket reports one. Without it
+    # the seam would report the placeholder port and count it, and this
+    # file's no-counter harness would read that as a swallowed span.
+    obj = SimpleNamespace(server_hostname=host, getpeername=lambda: ("203.0.113.10", 443))
     seam._on_request_bytes(obj, request)
     seam._on_response_bytes(obj, response)
 
