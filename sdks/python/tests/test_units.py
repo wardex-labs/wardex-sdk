@@ -920,8 +920,13 @@ def test_a_closed_unit_is_no_longer_findable():
 
 def test_a_full_alias_table_drops_the_oldest_alias():
     """Aliases are bounded per unit like every other table. Losing one costs a
-    lookup, not a span: the next `resolve()` degrades to `sole_live` or to
-    `unresolved`, and both of those mark themselves.
+    lookup, not a span, and the eviction itself emits nothing — there is no span
+    to mark, so `alias_table_full` is the record of it.
+
+    What the NEXT `resolve()` through the dropped id does is not this test's
+    business, and the obvious guess about it is wrong: the ladder's next rung is
+    the ambient scope, not `sole_live`. See
+    `test_a_forgotten_alias_marks_the_next_edge_instead_of_flattening_silently`.
     """
     reg = registry(max_entries_per_unit=2)
     root = open_session(reg)  # its own key takes the first slot
@@ -931,6 +936,238 @@ def test_a_full_alias_table_drops_the_oldest_alias():
     assert reg.find(UnitKey("test.session", "s1")) is None
     assert reg.find(UnitKey("extra", "two")) is root
     assert counters.get("assembly._units.alias_table_full") == 1
+
+
+def _forget_the_subagent_alias(reg: UnitRegistry, sub) -> UnitKey:
+    """Push `sub`'s own key out of its two-slot alias table, and return it.
+
+    Two aliases on top of the key the unit was opened with: the second one is
+    the arrival that evicts the oldest entry, which is the sub-agent's id.
+    """
+    key = UnitKey("test.agent_id", "a1")
+    reg.alias(key, UnitKey("extra", "one"))
+    reg.alias(UnitKey("extra", "one"), UnitKey("extra", "two"))
+    assert reg.find(key) is None
+    assert counters.get("assembly._units.alias_table_full") == 1
+    return key
+
+
+def test_a_forgotten_alias_marks_the_next_edge_instead_of_flattening_silently():
+    """The alias bound's consequence, which reads as an IMPROVEMENT if unmarked.
+
+    Under a pin the hook task's ambient is the session root, and the sub-agent's
+    id is what picks the more specific node below it (0.9). Evict that id and
+    the ladder's next rung is the ambient scope, so a plausible wrong
+    implementation — the one this replaces — hangs the sub-agent's work off the
+    SESSION at confidence 1.0 with no marker: the edge got worse while the
+    number went up, and a host triaging on `confidence < 1.0` or non-empty
+    `limitations` cannot find it.
+
+    The registry remembers which ids it dropped, so the same miss now says what
+    happened: the ambient edge is still the best answer left, but it ships
+    capped at the alias tier's 0.9 and carrying `ALIAS_FORGOTTEN`.
+
+    Two sessions are live on purpose, so that `sole_live` refuses and the edge
+    is decided by the ambient rung this test is about.
+    """
+    reg = registry(max_entries_per_unit=2)
+    root = open_session(reg)
+    open_session(reg, "s2")
+    sub = open_subagent(reg, root)
+    key = _forget_the_subagent_alias(reg, sub)
+
+    with root.activate():
+        p = reg.resolve(key)
+        honest = reg.resolve(UnitKey("test.agent_id", "never-bound"))
+
+    assert p.parent_span_id == root.context.span_id
+    assert p.correlation.strategy is ParentSource.CONTEXTVAR
+    assert p.correlation.confidence == 0.9, "a forgotten alias outranked a live one"
+    assert Limitation.ALIAS_FORGOTTEN in p.limitations
+    assert counters.get("assembly._units.alias_forgotten_consumed") == 1
+
+    # The negative control: an id the registry never held is an honest miss,
+    # and the ambient edge it gets is exactly what it was before.
+    assert honest.correlation.strategy is ParentSource.CONTEXTVAR
+    assert honest.correlation.confidence == 1.0
+    assert honest.limitations == ()
+    assert counters.get("assembly._units.alias_forgotten_consumed") == 1
+
+
+def test_a_forgotten_alias_under_another_trace_keeps_the_conflict_the_bound_id_reported():
+    """An ambient span in ANOTHER trace is a disagreement the bound id reported
+    itself: context wins at 0.8 and the edge carries `CORRELATION_CONFLICT`.
+    Losing the id must not tidy that away. Capping only at the alias tier would
+    ship the same parent at 0.9 with the conflict gone, a lost lookup reading as
+    a MORE certain edge than the id gave while it still resolved.
+
+    Three sessions live, so `sole_live` refuses and the ambient rung decides.
+    """
+    reg = registry(max_entries_per_unit=2)
+    root = open_session(reg)
+    open_session(reg, "s2")
+    elsewhere = open_session(reg, "s3")
+    sub = open_subagent(reg, root)
+
+    with elsewhere.activate():
+        bound = reg.resolve(UnitKey("test.agent_id", "a1"))
+    key = _forget_the_subagent_alias(reg, sub)
+    with elsewhere.activate():
+        lost = reg.resolve(key)
+
+    assert bound.correlation.confidence == 0.8
+    assert Limitation.CORRELATION_CONFLICT in bound.limitations
+    assert lost.parent_span_id == bound.parent_span_id
+    assert lost.correlation.strategy is ParentSource.CONTEXTVAR
+    assert lost.correlation.confidence <= bound.correlation.confidence
+    assert Limitation.CORRELATION_CONFLICT in lost.limitations
+    assert Limitation.ALIAS_FORGOTTEN in lost.limitations
+
+
+def test_a_forgotten_alias_with_no_ambient_takes_the_sole_live_guess_and_says_both():
+    """No ambient span: the ladder was already honest here (0.5 plus
+    `UNIT_INFERRED_SOLE`), and it stays so — but WHY the guess was needed is a
+    second fact, and a reader looking at `max_entries_per_unit` needs it.
+    """
+    reg = registry(max_entries_per_unit=2)
+    root = open_session(reg)
+    sub = open_subagent(reg, root)
+    key = _forget_the_subagent_alias(reg, sub)
+
+    p = reg.resolve(key, ambient=EMPTY_AMBIENT)
+
+    assert p.parent_span_id == root.context.span_id
+    assert p.correlation.strategy is ParentSource.UNIT_SOLE
+    assert p.correlation.confidence == 0.5
+    assert Limitation.UNIT_INFERRED_SOLE in p.limitations
+    assert Limitation.ALIAS_FORGOTTEN in p.limitations
+
+
+def test_a_forgotten_alias_with_nothing_to_fall_to_is_unresolved_and_says_why():
+    reg = registry(max_entries_per_unit=2)
+    lone = reg.open(
+        UnitKind.AGENT,
+        UnitKey("test.agent_id", "a1"),
+        ambient=EMPTY_AMBIENT,
+        intent=SpanIntent.INVOKE_AGENT,
+        subject="sub",
+    )
+    key = _forget_the_subagent_alias(reg, lone)
+
+    p = reg.resolve(key, ambient=EMPTY_AMBIENT)
+
+    assert p.parent_span_id is None
+    assert p.correlation.strategy is ParentSource.UNRESOLVED
+    assert Limitation.PARENT_UNRESOLVED in p.limitations
+    assert Limitation.ALIAS_FORGOTTEN in p.limitations
+
+
+@pytest.mark.parametrize("sessions", [1, 2])
+@pytest.mark.parametrize("ambient", ["the unit itself", "a unit below it"])
+def test_a_forgotten_alias_under_its_own_unit_cost_nothing_and_is_not_marked(ambient, sessions):
+    """The record says an id was dropped; it does not say the drop cost THIS edge.
+
+    With the id still bound, an ambient scope that is the named unit, or sits
+    anywhere below it, already wins: the id only corroborates it and the edge
+    is `CONTEXTVAR` at 1.0. So losing the id there changes nothing, and neither
+    the sole-session guess (which would hang a sub-agent's work off its session,
+    the flattening the record exists to prevent) nor a capped, marked copy of a
+    correct edge may replace it. One session and two, because the sole-session
+    rung and the ambient rung are the two ways a false positive could ship.
+    """
+    reg = registry(max_entries_per_unit=2)
+    root = open_session(reg)
+    if sessions == 2:
+        open_session(reg, "s2")
+    sub = open_subagent(reg, root)
+    key = _forget_the_subagent_alias(reg, sub)
+    holder = sub if ambient == "the unit itself" else open_subagent(reg, sub, "c1")
+
+    with holder.activate():
+        p = reg.resolve(key)
+
+    assert p.parent_span_id == holder.context.span_id
+    assert p.correlation.strategy is ParentSource.CONTEXTVAR
+    assert p.correlation.confidence == 1.0
+    assert p.limitations == ()
+    assert counters.get("assembly._units.alias_forgotten_consumed") == 0
+
+
+def test_a_forgotten_alias_stops_being_forgotten_when_it_is_bound_again():
+    """Rebinding makes the id resolve, so the record of losing it is stale —
+    and a stale record would mark a perfectly good alias edge later.
+    """
+    reg = registry(max_entries_per_unit=2)
+    root = open_session(reg)
+    sub = open_subagent(reg, root)
+    key = _forget_the_subagent_alias(reg, sub)
+    other = open_subagent(reg, root, "b1")
+
+    reg.bind_alias(other, key)
+    reg.close(other)
+    with root.activate():
+        p = reg.resolve(key)
+
+    assert p.correlation.confidence == 1.0
+    assert p.limitations == ()
+
+
+def test_a_forgotten_alias_bound_by_another_unit_is_not_forgotten_even_after_it_was_reported():
+    """Same final state as the test above, with one lookup of the lost id first.
+
+    Whether an earlier lookup reported the loss is not a fact about the id, so
+    it may not decide what a later edge says. `other` binding the id takes it
+    off the unit that lost it, which is exactly what an unbounded table would
+    do too: `alias_rebound`, and once `other` closes, an honest miss. Only the
+    unit `rejoin` opens on the loss is told to keep the record; a plain rebind
+    is not that unit, reported or not.
+    """
+    reg = registry(max_entries_per_unit=2)
+    root = open_session(reg)
+    open_session(reg, "s2")
+    sub = open_subagent(reg, root)
+    key = _forget_the_subagent_alias(reg, sub)
+    with root.activate():
+        reported = reg.resolve(key)
+    assert Limitation.ALIAS_FORGOTTEN in reported.limitations
+    other = open_subagent(reg, root, "b1")
+
+    reg.bind_alias(other, key)
+    reg.close(other)
+    with root.activate():
+        p = reg.resolve(key)
+
+    assert p.correlation.strategy is ParentSource.CONTEXTVAR
+    assert p.correlation.confidence == 1.0
+    assert p.limitations == ()
+
+
+def test_the_forgotten_alias_record_dies_with_its_unit_and_is_itself_bounded():
+    """Two bounds on the record, because it may not grow what it shadows.
+
+    A CLOSED unit's ids all stop resolving, and that is an ordinary miss the
+    alias bound had no part in — so closing drops the record. And the record
+    per unit is as long as the table it shadows, FIFO: an id forgotten long
+    enough ago is forgotten twice, which is counted.
+    """
+    reg = registry(max_entries_per_unit=2)
+    root = open_session(reg)
+    sub = open_subagent(reg, root)
+    key = _forget_the_subagent_alias(reg, sub)
+    for n in ("three", "four"):
+        reg.alias(UnitKey("extra", "two"), UnitKey("extra", n))
+
+    with root.activate():
+        p = reg.resolve(key)
+        q = reg.resolve(UnitKey("extra", "two"))
+    assert p.limitations == (), "the oldest forgotten id outlived the record's bound"
+    assert Limitation.ALIAS_FORGOTTEN in q.limitations
+    assert counters.get("assembly._units.alias_forgotten_table_full") == 1
+
+    reg.close(sub)
+    with root.activate():
+        r = reg.resolve(UnitKey("extra", "two"))
+    assert r.limitations == ()
 
 
 def test_aliasing_an_unknown_key_is_a_counted_no_op():

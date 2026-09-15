@@ -159,6 +159,28 @@ enum Limitation {
   LIMITATION_CORRELATION_CONFLICT = 3;
   LIMITATION_CONTEXT_PROPAGATION_DEGRADED = 4;
   LIMITATION_CONTEXT_PROPAGATION_UNAVAILABLE = 5;
+  //    The framework id this edge was looked up by had been dropped from a full
+  //    per-unit alias table while the unit it named was still live, and the
+  //    loss changed this edge: it came from a rung further down than the id
+  //    would have given. The rungs: the sole live session (with 2); the ambient
+  //    scope, capped at 0.9, or at 0.8 together with CORRELATION_CONFLICT (3)
+  //    when that scope is in another trace from the named unit; or no parent
+  //    (with 1). A placement edge opened by a rejoin on the dropped id carries
+  //    it too, capped at 0.9, and so does every later lookup of the id while
+  //    the named unit lives.
+  //    NOT every lookup of a dropped id is marked. Where the bound id would
+  //    have given the same edge anyway — the ambient scope is in the named
+  //    unit's trace and is that unit, below it, or beside it (not above it),
+  //    or a rejoin's live unit is that unit or below it — the edge ships
+  //    unmarked at its ordinary confidence. Once the named unit closes, its
+  //    ids miss for an ordinary reason and are unmarked too.
+  //    Names `max_entries_per_unit`. The eviction itself ships nothing — an
+  //    alias owns no span — so the marker rides the NEXT edge that asks for the
+  //    id, the only span where the loss shows. Not UNIT_TABLE_FULL (40): that
+  //    entry owned a span and shipped early, while this span is complete and
+  //    its parent is less specific than the id named. Not PARENT_UNRESOLVED
+  //    (1): on the ambient rung a parent WAS found.
+  LIMITATION_ALIAS_FORGOTTEN = 51;
 
   // -- Unit lifecycle.
   LIMITATION_UNIT_EVICTED = 6;

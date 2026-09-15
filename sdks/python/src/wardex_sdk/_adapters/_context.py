@@ -62,7 +62,6 @@ from typing import Any
 
 from .._assembly import (
     AMBIENT,
-    EMPTY_AMBIENT,
     NULL_DRAFT,
     Ambient,
     ConversationContext,
@@ -78,6 +77,7 @@ from .._assembly import (
     UnitKey,
     UnitKind,
     UnitRegistry,
+    cap_at_alias_tier,
     counters,
     degraded_run,
     guard,
@@ -530,19 +530,18 @@ class Attachment:
 #: placements — everywhere else `UnitRegistry.open` already decides correctly.
 _ORPHAN = Evidence(ParentSource.UNRESOLVED)
 
-#: What `rejoin()` claims when the LOOKUP ITSELF blew up and a live scope was
-#: standing. Same strategy the ordinary fall-through would have taken, half the
-#: confidence: a failed lookup may only ever LOWER what wardex claims. Reading
-#: it as an ordinary miss would be an UPGRADE — the miss path takes the live
-#: scope at 1.0, above the 0.9 a real alias hit earns — so a wardex bug would
+#: What `rejoin()` claims when the LOOKUP ITSELF blew up and a live scope was standing. Same
+#: strategy the ordinary fall-through would have taken, half the confidence: a failed lookup may
+#: only ever LOWER what wardex claims. Reading it as an ordinary miss would be an UPGRADE — the miss
+#: path takes the live scope at 1.0, above the 0.9 a real alias hit earns — so a wardex bug would
 #: make the edge look more certain than the id it was told to honour.
 _LOOKUP_BROKEN = Evidence(ParentSource.UNIT_ACTIVE, confidence=0.5)
 
-#: What `Fallback.SOLE_LIVE_RUN` claims. `resolve_parentage`'s marker table
-#: attaches `UNIT_INFERRED_SOLE` on its own, so there is no site here that could
-#: forget it — the source's DEFINITION is interpretation, and I4 makes that the
-#: table's job rather than the caller's.
+#: What `Fallback.SOLE_LIVE_RUN` claims. `resolve_parentage`'s marker table attaches
+#: `UNIT_INFERRED_SOLE` on its own, so there is no site here that could forget it — the source's
+#: DEFINITION is interpretation, and I4 makes that the table's job rather than the caller's.
 _SOLE = Evidence(ParentSource.UNIT_SOLE)
+_IN_UNIT = Evidence(ParentSource.UNIT_ACTIVE)  # what `UnitRegistry.open` swaps AMBIENT for
 
 
 class AdapterContext:
@@ -823,12 +822,12 @@ class AdapterContext:
         evidence: Evidence | None = None,
         fallback: Fallback = Fallback.NONE,
         conversation: ConversationContext | None = None,
+        forgotten: UnitKey | None = None,
     ) -> Unit:
         holder = parent if parent is not None else self._units.current()
-        # Latched ONCE and used for both the declaration and the open. Two reads
-        # would be two different instants on the same carrier, and the whole
-        # point of the declaration is that it describes the ambient `open()`
-        # actually receives.
+        # Latched ONCE and used for both the declaration and the open. Two reads would be two
+        # different instants on the same carrier, and the whole point of the declaration is that it
+        # describes the ambient `open()` actually receives.
         ambient = latch_ambient()
         if evidence is None:
             evidence = self._evidence(placement, ambient)
@@ -851,6 +850,9 @@ class AdapterContext:
                 # in a run it has nothing to do with.
                 conflicted = self._units.closed_unit_in_scope()
                 holder, evidence = sole, _SOLE
+        lost = forgotten is not None and self._units.forgotten_owner(forgotten, holder=holder)
+        if lost:  # see `rejoin`; `open()` swaps AMBIENT by identity, so do it before the cap
+            evidence = cap_at_alias_tier(_IN_UNIT if evidence is AMBIENT and holder else evidence)
         unit = self._units.open(
             kind,
             selector if selector is not None else UnitKey(self._anon_ns, str(next(self._anon_seq))),
@@ -863,7 +865,10 @@ class AdapterContext:
             start_ns=start_ns,
             owner=self.name,
             conversation=conversation,
+            carries_loss=bool(lost),  # opened ON the loss: binding the id must not erase its record
         )
+        if lost:
+            unit.note(Limitation.ALIAS_FORGOTTEN)
         if conflicted:
             # The WORD is the registry's to choose, exactly as it chooses it for
             # the refusal `open()` performs itself: a strand left by the
@@ -1194,12 +1199,12 @@ class AdapterContext:
     ) -> Iterator[Scope]:
         """`enter()`, but under the unit an identifier selects — if it resolves.
 
-        The ONE method where an identifier influences the shape of the tree, and
-        a separate name so that one grep is the complete list. A hit is clamped
-        to `UNIT_ALIAS` at 0.9: no argument raises it, because the identifier was
-        the framework's word and not a scope wardex read. A miss falls through to
-        the ordinary table for the declared placement rather than quietly picking
-        a plausible root.
+        The ONE method where an identifier influences the shape of the tree, and a separate name so
+        that one grep is the complete list. A hit is clamped to `UNIT_ALIAS` at 0.9: no argument
+        raises it, because the identifier was the framework's word and not a scope wardex read. A
+        miss falls through to the ordinary table for the declared placement rather than quietly
+        picking a plausible root; if the registry's alias bound DROPPED the id, capped at 0.9 and
+        noted `ALIAS_FORGOTTEN`, so a lost lookup never reads as a better edge.
 
         A lookup that BROKE is neither of those. It is its own step with its own
         guard, and what it may do to the edge is bounded in one direction: see
@@ -1211,11 +1216,10 @@ class AdapterContext:
             target = self._units.find(selector)
             found = True
         if not found:
-            # REPORTED, not `_degrade`d. The span that lost something is the one
-            # about to be opened, and it does not exist yet — so `_degrade` would
-            # have marked whatever happened to be enclosing, which lost nothing
-            # and would send a reader looking in the wrong place. The marker goes
-            # on the new unit below, beside the confidence the same fault lowered.
+            # REPORTED, not `_degrade`d. The span that lost something is the one about to be opened,
+            # and it does not exist yet — so `_degrade` would have marked whatever happened to be
+            # enclosing, which lost nothing and would send a reader looking in the wrong place. The
+            # marker goes on the new unit below, beside the confidence the same fault lowered.
             self._report(
                 "rejoin_find",
                 "this span's parent edge is a guess, not the id it was told to honour",
@@ -1234,6 +1238,7 @@ class AdapterContext:
                 start_ns=None,
                 parent=target,
                 evidence=self._rejoin_evidence(selector, target, found=found),
+                forgotten=selector if found and target is None else None,
             )
             if not found:
                 unit.note(Limitation.INSTRUMENTATION_DEGRADED)
@@ -1265,10 +1270,9 @@ class AdapterContext:
             return Evidence(ParentSource.UNIT_ALIAS, request_id=selector.value)
         if found:
             return None  # an honest miss: the ordinary table for this placement
-        # The lookup broke. Lowering only makes sense where the ordinary path
-        # would have claimed something: with nothing live, `UNIT_ACTIVE` would
-        # name a unit that is not there, so the honest answer is the same
-        # fall-through a miss takes.
+        # The lookup broke. Lowering only makes sense where the ordinary path would have claimed
+        # something: with nothing live, `UNIT_ACTIVE` would name a unit that is not there, so the
+        # honest answer is the same fall-through a miss takes.
         return _LOOKUP_BROKEN if self._units.current() is not None else None
 
     def close_all(self, *, marker: Limitation) -> None:
@@ -1299,7 +1303,3 @@ __all__ = [
     "RunHandle",
     "Scope",
 ]
-
-# `EMPTY_AMBIENT` is imported for the type it documents rather than used; the
-# ambient is always latched here, never supplied.
-_ = EMPTY_AMBIENT

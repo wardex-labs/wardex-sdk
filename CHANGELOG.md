@@ -76,6 +76,25 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- **A sub-agent whose identifier fell out of a full alias table no longer
+  flattens into its session silently.** Each unit keeps at most
+  `max_entries_per_unit` lookup aliases and drops the oldest. Looking the
+  dropped identifier up again used to land on the ambient span — usually the
+  enclosing session — at confidence 1.0 with no marker, higher than the 0.9 the
+  identifier earned while it still resolved. wardex now remembers the
+  identifiers the bound dropped (per unit, as many as the table holds) and marks
+  the next edge that asks for one `alias_forgotten` (`LIMITATION_ALIAS_FORGOTTEN
+  = 51`): on the sole live session (0.5, beside `unit_inferred_sole`), on the
+  ambient span capped at 0.9 (0.8 beside `correlation_conflict` when that span
+  is in another trace), or beside `parent_unresolved`. A framework adapter's
+  `rejoin` on such an identifier is capped and marked the same way, every time
+  it is asked while the unit the identifier named is still live. A lookup the
+  loss did not change stays unmarked: under the identifier's own unit, below it,
+  or (for the registry) beside it in the same trace, the identifier would have
+  given that same parent.
+  Counters: `assembly._units.alias_forgotten_consumed` per marked edge,
+  `assembly._units.alias_forgotten_table_full` when the record itself overflows.
+
 - **A panic in the Rust core no longer reaches your `recv()`.** PyO3 converts
   a panic into `PanicException`, which inherits from `BaseException`, so it
   walked through every `except Exception` guard the SDK puts around its own

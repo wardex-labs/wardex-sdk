@@ -152,16 +152,17 @@ pub struct Limits {
     /// `adapters.anthropic.server_table_full` in the Python SDK).
     ///
     /// What surfaces from a silent eviction is a consequence, and the alias one
-    /// is worth stating precisely because it can look like an IMPROVEMENT. An
-    /// alias edge is `unit_alias` at `0.9`; losing the alias does not simply
-    /// lower that. It sends the resolver back down its ladder, and if the task
-    /// carries an ambient span the ladder stops at `contextvar` — confidence
-    /// `1.0`, no marker — which for a sub-agent means its subtree silently
-    /// flattens into the enclosing session. Only when there is no ambient span
-    /// at all does it reach `unit_inferred_sole` (`0.5`) or `parent_unresolved`
-    /// (`0.0`). An evicted de-duplication key can let one logical call be
-    /// observed twice, and an evicted server handle degrades a hook's tool-name
-    /// lookup to the builtin key space, which can do the same.
+    /// is marked because unmarked it would look like an IMPROVEMENT. An alias
+    /// edge is `unit_alias` at `0.9`; losing the alias sends the resolver back
+    /// down its ladder, whose next rung is the ambient span at `1.0` — for a
+    /// sub-agent, its enclosing session. So the host SDK remembers which ids
+    /// this bound dropped (per unit, FIFO, as many as the alias table holds)
+    /// and a later lookup of one whose edge the loss changed ships marked
+    /// `alias_forgotten`: on the sole-live guess (`0.5`, beside
+    /// `unit_inferred_sole`), on the ambient span capped at `0.9`, or beside
+    /// `parent_unresolved` (`0.0`). An evicted de-duplication key can let one
+    /// logical call be observed twice, and an evicted server handle degrades a
+    /// hook's tool-name lookup to the builtin key space, which can do the same.
     pub max_entries_per_unit: usize,
     /// Maximum entries in the unit registry's closed-unit link memory: the
     /// alias-key -> span-context table kept AFTER a unit closes, so a later

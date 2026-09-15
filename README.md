@@ -901,13 +901,35 @@ dropped server handle, can let one tool call be reported twice. A dropped
 streamed metadata entry costs a tool call its byte-exact input, and if no hook
 observed that call, its span entirely.
 
-A dropped **alias** is the one to know about, because it does not look like a
-loss. That identifier stops resolving, so the parent is decided one rung further
-down: if the work carries an ambient wardex span, the span arrives at confidence
-**1.0 with no marker** — hanging off the enclosing session instead of the
-sub-agent it belonged to. A sub-agent's subtree flattens and nothing in the data
-says so. Only when there is no ambient span does it arrive marked
-`unit_inferred_sole` (0.5) or `parent_unresolved`.
+A dropped **alias** is the one to know about, because its consequence would
+not look like a loss. That identifier stops resolving, so the parent is decided
+one rung further down — and the rung below an alias match (confidence 0.9) is
+the ambient wardex span, which for a sub-agent is usually its enclosing
+session, at 1.0. Unmarked, the sub-agent's subtree would flatten into the
+session while the confidence went up. So wardex remembers which identifiers the
+bound dropped (per unit, as many as the alias table holds, oldest forgotten
+first), and a span whose parent was looked up by one of them, and whose edge
+the loss actually changed, arrives marked **`alias_forgotten`**. Where it lands
+depends on the path. A span the registry resolves goes to the only live session
+(0.5, also marked `unit_inferred_sole`) when there is exactly one, otherwise to
+the ambient span at no more than 0.9 (0.8, also marked `correlation_conflict`,
+when that span is in another trace), otherwise unparented (also marked
+`parent_unresolved`). A span an adapter reopens under that identifier keeps the
+parent its declared placement gives it, capped at 0.9, and so does every later
+lookup of the identifier while the unit it named is still live. When the loss
+changed nothing, nothing is marked. For an adapter reopening a span, that is a
+live scope that is the identifier's own unit or anything below it. For a span
+the registry resolves, it is an ambient span in the same trace that is not
+above that unit (the unit itself, anything below it, or anything beside it):
+the identifier, still held, would have given that same parent at 1.0. (One
+case is marked although the parent is the same: with no ambient span, an
+identifier that named the only live session itself gets that session at 0.5,
+where it gave 0.9.) An identifier some other unit binds again is no longer
+counted as dropped, just as a larger table would have handed it over; only the
+span an adapter reopens under it keeps the record standing.
+Each marked span also counts `assembly._units.alias_forgotten_consumed`. If you
+see the marker, raise `max_entries_per_unit`. The behaviour is pinned by
+`sdks/python/tests/test_units.py::test_a_forgotten_alias_marks_the_next_edge_instead_of_flattening_silently`.
 
 The evictions that DO reach your traces are counted as well, so you can see one
 coming before it is a shape in your data:

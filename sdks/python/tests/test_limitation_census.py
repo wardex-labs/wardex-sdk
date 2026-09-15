@@ -166,7 +166,7 @@ _MEMBER_SITES: dict[str, frozenset[str]] = {
     # attach the marker, so there is no site left in an adapter that could
     # stamp one of these onto an edge it decided itself.
     # `testing/conformance.py` is a third site for both and attaches NEITHER: it
-    # is the conformance suite's `_EDGE_MARKERS`, the four members whose
+    # is the conformance suite's `_EDGE_MARKERS`, the five members whose
     # presence on any span of a healthy run means the parent edge is not what it
     # looks like. It is named so the scanner can see it — see the note on
     # ADAPTER_UNINSTALLED below.
@@ -219,6 +219,10 @@ _MEMBER_SITES: dict[str, frozenset[str]] = {
             "_adapters/_openai_agents.py",
             # `_EDGE_MARKERS` again — see PARENT_UNRESOLVED above.
             "testing/conformance.py",
+            # The same cross-trace disagreement as `resolve()`'s, reached after
+            # the alias bound dropped the id: the forgotten-id ladder keeps the
+            # conflict the bound id would have reported instead of losing it.
+            "_assembly/_forgotten.py",
         }
     ),
     # --- transport timing ---
@@ -265,6 +269,20 @@ _MEMBER_SITES: dict[str, frozenset[str]] = {
     # carry SESSION_ENTRY_TABLE_FULL below — see both members' docstrings for
     # why a generalization in the core limits table is still a separate field.
     "UNIT_TABLE_FULL": frozenset({"_assembly/_units.py"}),
+    # The alias bound's consequence, marked on the NEXT edge rather than at the
+    # eviction (an alias owns no span): `_forgotten.py::forgotten_edge`, the
+    # ladder `UnitRegistry._edge` hands a miss for an id the registry remembers
+    # dropping, and `AdapterContext._open`, which notes it on the unit
+    # `AdapterContext.rejoin` opens after the same miss — `rejoin` being the one
+    # adapter-surface method where an id shapes the tree. The conformance suite
+    # names it too, as an edge marker a healthy run never carries.
+    "ALIAS_FORGOTTEN": frozenset(
+        {
+            "_assembly/_forgotten.py",
+            "_adapters/_context.py",
+            "testing/conformance.py",
+        }
+    ),
     # The adapter's per-session bound, every site in one file: the open-tool
     # eviction, the sub-agent eviction, and the completion half that reports
     # the same eviction from the other end.
@@ -664,6 +682,13 @@ _EMITTED_MEMBERS: frozenset[str] = frozenset(
         # `server.port` and in the URL, with nothing on the span or in the
         # counters to say the address was invented.
         "PEER_UNRESOLVED",
+        # The twenty-second: the alias bound's forgotten-id marker, minted WITH its
+        # two emitters (the registry's forgotten-id ladder and the adapter
+        # surface's `_open`, on `rejoin`'s miss). Before it, a lookup of an id
+        # the bound had dropped fell to the ambient scope at confidence 1.0
+        # with no marker — the one eviction whose consequence read as an
+        # improvement.
+        "ALIAS_FORGOTTEN",
     }
 )
 """Which MEMBERS have an emit site today, derived independently below.
@@ -1265,7 +1290,7 @@ _UNRESOLVED_PY: frozenset[tuple[str, str]] = frozenset(
         # `Name:marker` is two slots of one shape: `_assert_shipped(live, root,
         # marker)` asking whether the member the shutdown checks passed to
         # `close_units_all` came back on the wire, and the loop over
-        # `_EDGE_MARKERS` asking whether any of the four members that would mean
+        # `_EDGE_MARKERS` asking whether any of the five members that would mean
         # the parent edge is not what it looks like is present. Every member
         # either slot can carry is spelled out as a literal in that same file,
         # which is why it appears six times in `_MEMBER_SITES`.
@@ -1634,17 +1659,23 @@ _VOCABULARY: dict[str, str] = {
     #     and says so — kept apart from CONNECT_TIMING_UNAVAILABLE, which is
     #     a missing duration on a peer wardex DID name ---
     "PEER_UNRESOLVED": "peer_unresolved",
+    # --- added after the census, by the registry's alias bound (1): a lookup
+    #     of an id the bound dropped — kept apart from UNIT_TABLE_FULL (that
+    #     entry owned a span and shipped; this one marks the NEXT edge) and
+    #     from PARENT_UNRESOLVED (on the ambient rung a parent WAS found) ---
+    "ALIAS_FORGOTTEN": "alias_forgotten",
 }
 
 
-def test_the_vocabulary_is_exactly_these_fifty() -> None:
+def test_the_vocabulary_is_exactly_these_fifty_one() -> None:
     """15 declared before the census + 21 from it + 1 from §5.4 + 1 for wardex
     itself + 1 for the OTLP size guard + 1 for the registry breadth bound
     + 2 for the OTel bridge's fail-open pair + 1 for the adapter's per-session
     bound + 1 for the dynamic-key bound + 1 for the fork tracking reset
     + 2 for the deferred-parse queue's unparsed shipments + 1 for the
     WebSocket LLM-transport marker + 1 for the ambiguous LangGraph join
-    + 1 for the unresolved peer address, name by name.
+    + 1 for the unresolved peer address + 1 for the alias bound's forgotten
+    id, name by name.
 
     A count alone is not enough: a RENAME keeps the count and is the single most
     expensive mistake available here. These are proto enum values in
