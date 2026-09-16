@@ -85,6 +85,7 @@ _STEPS = (
     "wsgi_middleware",
     "transport_ctor",
     "transport_export",
+    "wardex_transport_export",
     "noop_transport_export",
     "console_transport_export",
     "flush",
@@ -145,6 +146,7 @@ from wardex_sdk import (
     NoOpTransport,
     OtlpHttpTransport,
     UserInfo,
+    WardexTransport,
 )
 
 # A well-formed inbound header, so the propagation entry points do real work
@@ -256,6 +258,14 @@ def _transport_export():
     # A published symbol a host can drive by hand without ever reaching init().
     # It must decline, not raise, and it must not open a socket. The private
     # policy plumbing init() uses must also work without a core.
+    t._set_pii_policy(wardex_sdk.PIIConfig())
+    t.export(_NonEmptyEnvelope())
+
+
+def _wardex_transport_export():
+    # The default exporter, same claim: without a core there is no envelope
+    # encoder, so it must say so once and decline rather than raise or POST.
+    t = WardexTransport("http://127.0.0.1:1", "wdx_us_k")
     t._set_pii_policy(wardex_sdk.PIIConfig())
     t.export(_NonEmptyEnvelope())
 
@@ -393,6 +403,7 @@ STEPS = [
     ("wsgi_middleware", _wsgi_middleware),
     ("transport_ctor", lambda: OtlpHttpTransport("http://127.0.0.1:1")),
     ("transport_export", _transport_export),
+    ("wardex_transport_export", _wardex_transport_export),
     ("noop_transport_export", _noop_transport_export),
     ("console_transport_export", _console_transport_export),
     ("flush", lambda: wardex_sdk.flush()),
@@ -552,6 +563,7 @@ _DRIVEN = frozenset(
         "NoOpTransport",
         "ConsoleTransport",
         "OtlpHttpTransport",
+        "WardexTransport",
     }
 )
 

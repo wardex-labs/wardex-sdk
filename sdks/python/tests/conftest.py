@@ -111,6 +111,7 @@ def _shield_tests_from_ambient_env(monkeypatch):
     scrub."""
     for name in (
         "WARDEX_API_KEY",
+        "WARDEX_BASE_URL",
         "WARDEX_ENDPOINT",
         "WARDEX_SERVICE_NAME",
         "WARDEX_RELEASE",
@@ -118,6 +119,7 @@ def _shield_tests_from_ambient_env(monkeypatch):
         "WARDEX_DEBUG",
         "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
         "OTEL_EXPORTER_OTLP_ENDPOINT",
+        "OTEL_EXPORTER_OTLP_HEADERS",
     ):
         monkeypatch.delenv(name, raising=False)
 

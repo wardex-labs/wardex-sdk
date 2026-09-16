@@ -2,7 +2,7 @@
 everything a transport implementer needs.
 
 `Transport` (subclass it, implement `export()`, reach bytes through
-`encode()`), the three shipped transports, the `Envelope` the hook and
+`encode()`), the four shipped transports, the `Envelope` the hook and
 `export()` receive, the `UNDELIVERED` decline sentinel and its `Undelivered`
 type for the return annotation, `CallerBudget` for the Python-only budget
 diagnostic, and `DEFAULT_TIMEOUT`, the shared default every budget on this
@@ -21,12 +21,14 @@ from ._base import DEFAULT_TIMEOUT, UNDELIVERED, CallerBudget, Transport, Undeli
 from ._console import ConsoleTransport
 from ._noop import NoOpTransport
 from ._otlp_http import OtlpHttpTransport
+from ._wardex import WardexTransport
 
 __all__ = [
     "Transport",
     "NoOpTransport",
     "ConsoleTransport",
     "OtlpHttpTransport",
+    "WardexTransport",
     "Envelope",
     "UNDELIVERED",
     "Undelivered",

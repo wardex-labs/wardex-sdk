@@ -13,8 +13,10 @@ recorded here, in the module that defines them, because a contract kept in a
 design document is a contract nobody edits when the code moves:
 
     backend=BackendConfig(...)          WHERE the data goes and whose it is.
-                                        The endpoint and the project key that
-                                        travels on every envelope header.
+                                        The project key (which names the
+                                        wardex receiver), a self-hosted
+                                        receiver's base URL, or a third-party
+                                        OTLP collector's endpoint and headers.
 
     pii=PIIConfig(...)                  WHAT LEAVES THE PROCESS. The masking
                                         mode and the categories exempted from
@@ -68,9 +70,11 @@ and every removed name with a message saying why it is gone.
 from __future__ import annotations
 
 import os
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from collections.abc import Set as AbstractSet
 from dataclasses import dataclass, field, fields
+from types import MappingProxyType
+from urllib.parse import unquote
 
 from ._enums import (
     AdapterName,
@@ -147,6 +151,40 @@ _REMOVED: dict[str, str] = {
 }
 
 
+#: Which wardex receiver a project key's REGION names. The key carries the
+#: region (`wdx_us_...`), so this table -- not a single host constant -- is what
+#: `init()` consults when no `base_url` is configured. A second region is a
+#: row here and a key issued for it; nothing else in the SDK changes. Ordered
+#: by the region tag as it appears in the key.
+WARDEX_INGEST_HOSTS: dict[str, str] = {
+    "us": "https://ingest.us.wardex.dev",
+}
+
+_KEY_PREFIX = "wdx_"
+
+
+def region_of_key(api_key: str) -> str:
+    """The region tag a project key carries: `wdx_<region>_<secret>` -> `<region>`.
+
+    Raises `ValueError` for anything else. The alternative -- falling back to
+    some default host for a key that does not say where it belongs -- would
+    send a batch to a receiver that rejects it, with a 401 the transport is
+    fail-silent about; the whole point of the region riding in the key is that
+    the SDK never has to guess.
+    """
+    if not api_key.startswith(_KEY_PREFIX):
+        raise ValueError(
+            "api_key is not a wardex project key (expected the form wdx_<region>_<secret>)"
+        )
+    rest = api_key[len(_KEY_PREFIX) :]
+    region, sep, secret = rest.partition("_")
+    if not sep or not region or not secret:
+        raise ValueError(
+            "api_key is not a wardex project key (expected the form wdx_<region>_<secret>)"
+        )
+    return region
+
+
 @dataclass(frozen=True, slots=True, kw_only=True)
 class BackendConfig:
     """Where captured data goes, and whose project it belongs to.
@@ -156,13 +194,23 @@ class BackendConfig:
     Transport OBJECT, so a group called `transport=` could never be spelled
     through the SDK's only entry point, and a user who tried would hand `init()`
     a config group where a Transport was expected.
+
+    Two destinations live here and they do not mix. A WARDEX RECEIVER is named
+    by `api_key` (the project key; its region picks the host) or by `base_url`
+    (a self-hosted receiver). A THIRD-PARTY OTLP COLLECTOR is named by
+    `endpoint`, with `headers` for whatever that collector wants. `init()`
+    picks the wardex receiver whenever `api_key` is set and announces a losing
+    `endpoint` with a `WardexConfigWarning`; the project key is never sent to
+    a collector that is not ours.
     """
 
     api_key: str | None = field(default=None, repr=False)
-    """The project key: one key names one project at the receiver. The default
-    exporter sends it as an `Authorization: Bearer` header on every request.
-    It is never written into an envelope — the receiver stamps the project it
-    names onto each stored batch, so stored data holds no credential.
+    """The wardex project key: one key names one project at the receiver, and
+    its region tag (`wdx_us_...`) names the receiver. The default exporter
+    sends it as an `Authorization: Bearer` header to the wardex receiver and
+    NOWHERE ELSE -- it is not written into an envelope (the receiver stamps
+    the project it names onto each stored batch, so stored data holds no
+    credential) and it is not sent to a third-party OTLP collector.
 
     `repr=False` because a config object's string form ends up in logs, crash
     reports and debugger output, none of which is a place for a credential:
@@ -171,24 +219,75 @@ class BackendConfig:
     Unset, `init()` reads `WARDEX_API_KEY` from the environment.
     """
 
+    base_url: str | None = None
+    """A wardex receiver's address, for a self-hosted receiver or a proxy in
+    front of ours -- `http://127.0.0.1:8080`, without the route. Unset, the
+    receiver is the one the key's region names (`WARDEX_INGEST_HOSTS`). Only
+    meaningful with `api_key`: a receiver address with no key cannot
+    authenticate, and `init()` refuses the pair with a `ValueError`.
+
+    Unset, `init()` reads `WARDEX_BASE_URL` from the environment.
+    """
+
     endpoint: str | None = None
-    """Where to send. `init()` without a `transport=` builds the default
-    OTLP/HTTP exporter against this address; with neither, it installs
-    `NoOpTransport`, captures into nothing, and says so once on stderr.
+    """A third-party OTLP/HTTP collector to send to instead. `init()` without
+    a `transport=` and without an `api_key` builds the OTLP exporter against
+    this address; with none of the three, it installs `NoOpTransport`,
+    captures into nothing, and says so once on stderr.
 
     Unset, `init()` reads `WARDEX_ENDPOINT`, then
     `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`, then `OTEL_EXPORTER_OTLP_ENDPOINT`.
 
     THE ENDPOINT RULE: a URL whose path is empty or `/` gets `/v1/traces`
-    appended when the default transport is built — `http://collector:4318`
-    exports to `http://collector:4318/v1/traces` — while a URL with an explicit
+    appended when the default transport is built -- `http://collector:4318`
+    exports to `http://collector:4318/v1/traces` -- while a URL with an explicit
     path is used verbatim. The append happens at transport construction and is
     never written back here: this field reads back exactly as configured.
 
-    An explicit `transport=` wins over this field — a `Transport` carries its
-    own address (`OtlpHttpTransport(endpoint=...)`) — and the losing endpoint
-    is announced with a `WardexConfigWarning` rather than ignored in silence.
+    An explicit `transport=` wins over this field, and so does `api_key` (the
+    project key routes to the wardex receiver); the losing endpoint is
+    announced with a `WardexConfigWarning` rather than ignored in silence.
     """
+
+    headers: Mapping[str, str] | None = None
+    """Request headers for the third-party OTLP exporter -- the collector's own
+    authentication, in whatever spelling it wants (`{"x-honeycomb-team": ...}`,
+    `{"Authorization": "Basic ..."}`). Read only when `endpoint` builds the
+    OTLP transport; the wardex receiver authenticates with `api_key` and
+    ignores this field. Reads back as an immutable mapping.
+
+    Unset, `init()` reads `OTEL_EXPORTER_OTLP_HEADERS` from the environment,
+    in the OpenTelemetry form `key=value,key2=value2` with percent-encoded
+    values -- the variable a host already exporting OTLP elsewhere has set.
+    """
+
+    def __post_init__(self) -> None:
+        if self.headers is not None:
+            # Canonicalize to an immutable mapping (lossless, like the tuple
+            # and frozenset canonicalizations elsewhere): a config that reads
+            # back as written must not be editable through a dict it handed
+            # out, and a plain `dict` would be.
+            object.__setattr__(self, "headers", MappingProxyType(dict(self.headers)))
+
+
+def _otlp_headers_from_env() -> Mapping[str, str] | None:
+    """`OTEL_EXPORTER_OTLP_HEADERS`, parsed the way the OTel specification
+    says: comma-separated `key=value` pairs, values percent-encoded, whitespace
+    around each pair ignored. `None` when the variable is absent or empty, so
+    the config reads "nothing configured" rather than an empty mapping."""
+    raw = os.environ.get("OTEL_EXPORTER_OTLP_HEADERS", "")
+    if not raw.strip():
+        return None
+    headers: dict[str, str] = {}
+    for pair in raw.split(","):
+        pair = pair.strip()
+        if not pair:
+            continue
+        key, sep, value = pair.partition("=")
+        if not sep or not key.strip():
+            raise ValueError(f"OTEL_EXPORTER_OTLP_HEADERS entry {pair!r} is not key=value")
+        headers[key.strip()] = unquote(value.strip())
+    return headers
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -575,8 +674,8 @@ def _resolve_config(
     what `init()` installs and what `client.config` answers with — so an env
     value that won is readable there rather than applied invisibly.
 
-    A GROUP IS NOT AN ALL-OR-NOTHING OVERRIDE. `backend`'s two fields resolve
-    independently: a caller who sets only `backend=BackendConfig(endpoint=...)`
+    A GROUP IS NOT AN ALL-OR-NOTHING OVERRIDE. `backend`'s fields resolve
+    independently: a caller who sets only `backend=BackendConfig(base_url=...)`
     still gets `WARDEX_API_KEY`. The alternative — skipping both env reads as
     soon as a `backend=` arrives — is a silent ignore one level down, and
     grouping made the whole-group spelling the normal one.
@@ -593,7 +692,9 @@ def _resolve_config(
     given = backend if backend is not None else BackendConfig()
     resolved_backend = BackendConfig(
         api_key=given.api_key or os.environ.get("WARDEX_API_KEY"),
+        base_url=given.base_url or os.environ.get("WARDEX_BASE_URL"),
         endpoint=given.endpoint or _endpoint_from_env(),
+        headers=given.headers if given.headers is not None else _otlp_headers_from_env(),
     )
     return WardexConfig(
         backend=resolved_backend,

@@ -7,6 +7,25 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- **`WardexTransport`, the default exporter: a project key alone is now a
+  working first run.** `wardex.init(backend=BackendConfig(api_key="wdx_us_..."))`
+  — or a bare `init()` with `WARDEX_API_KEY` set — ships the SDK's own
+  envelope (`wardex.v1.Envelope`, protobuf under zstd) to the wardex receiver
+  the key's region names, as `POST /v1/envelope` with the key in the
+  `Authorization: Bearer` header and nowhere else. Masking and limits apply
+  through the same stored policy the OTLP exporter uses. The receiver stamps
+  the project onto each stored batch; the envelope leaves with `project_id`
+  empty. Before this, a key with no endpoint captured into `NoOpTransport`.
+- **`BackendConfig.base_url` (`WARDEX_BASE_URL`)** names a self-hosted wardex
+  receiver; without it the key's region tag picks the host from a table the
+  SDK carries, and a region this build does not know is refused at `init()`
+  rather than sent anywhere. A `base_url` without a key is refused too.
+- **`BackendConfig.headers` (`OTEL_EXPORTER_OTLP_HEADERS`)** carries a
+  third-party OTLP collector's own request headers, parsed the way the
+  OpenTelemetry specification says, so a host already exporting OTLP
+  elsewhere authenticates wardex against the same collector with zero new
+  variables.
+
 - **The quality budgets this SDK holds itself to are now recorded and
   enforced, and you can re-measure them from a clone.**
   `scripts/quality-snapshot.sh` prints them as JSON from the source tree alone
@@ -43,6 +62,16 @@ All notable changes to this project are documented here. The format follows
   `test_quality_ratchets.py` fails if one of them is added and not named here.
 
 ### Changed
+
+- **`api_key` is the wardex project key and is no longer sent to OTLP
+  collectors.** It used to ride as `Authorization: Bearer` on the OTLP
+  exporter's requests; a credential that names a wardex project must never
+  reach a receiver that is not ours, so the OTLP exporter now takes its
+  headers from `BackendConfig.headers` / `OTEL_EXPORTER_OTLP_HEADERS` only.
+  `api_key` next to `endpoint` routes to the wardex receiver and announces the
+  losing endpoint with a `WardexConfigWarning`. No compatibility shim: the
+  SDK has no released receiver yet, so no deployed configuration depended on
+  the old meaning.
 
 - **The envelope no longer carries the API key, and it gained a `project_id`
   slot the receiver fills.** `EnvelopeHeader.api_key` (wire field 2) is
