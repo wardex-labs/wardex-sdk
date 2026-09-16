@@ -242,12 +242,13 @@ see the arguments and the tool's return value.
 ## openai-agents → Langfuse
 
 Langfuse also accepts OTLP/HTTP, on `/api/public/otel/v1/traces`, but it
-authenticates with a project's public/secret key pair as HTTP Basic auth
-rather than a bearer token, and `WARDEX_ENDPOINT` + `WARDEX_API_KEY` only
-know how to send `Authorization: Bearer …`. So this backend needs one
-explicit transport, and the example script builds it when it sees
-`LANGFUSE_HOST` — the agent code is still untouched, and nothing in the
-script is edited.
+authenticates with a project's public/secret key pair as HTTP Basic auth.
+`WARDEX_API_KEY` is the wardex project key and is never sent to a third-party
+collector, so the Basic header has to arrive another way: either
+`OTEL_EXPORTER_OTLP_HEADERS=Authorization=Basic%20<base64>` next to
+`WARDEX_ENDPOINT`, or one explicit transport. The example script takes the
+second route and builds it when it sees `LANGFUSE_HOST` — the agent code is
+still untouched, and nothing in the script is edited.
 
 Steps 2 and 3 above stay the same except for the variables: in place of
 `WARDEX_ENDPOINT`, set the three the script reads and run it again.

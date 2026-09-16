@@ -212,7 +212,6 @@ def test_init_then_close_puts_every_patched_attribute_back():
 
     wardex.init(
         intercept=True,
-        backend=BackendConfig(api_key="k"),
         propagation=PropagationConfig(enabled=True),
     )
     during = _process_seams()
@@ -275,7 +274,6 @@ def test_the_atexit_teardown_drops_the_propagation_patches_too():
     original = httpx.Client.send
     wardex.init(
         intercept=False,
-        backend=BackendConfig(api_key="k"),
         propagation=PropagationConfig(enabled=True),
     )
     assert httpx.Client.send is not original, "propagation never installed"
@@ -345,18 +343,22 @@ def test_an_explicit_endpoint_path_is_used_verbatim():
 
 
 def test_backend_api_key_authenticates_the_default_transport_on_the_wire():
-    """`backend.api_key` is WIRED: the default exporter sends it as
-    `Authorization: Bearer <key>` on every POST. Asserted on what actually
-    arrives at a receiver, not on a headers dict."""
+    """`backend.api_key` is WIRED: it names a wardex project, so the default
+    exporter is `WardexTransport`, and the key arrives at the receiver as
+    `Authorization: Bearer <key>` on `/v1/envelope`. Asserted on what actually
+    arrives, not on a headers dict. `base_url` points the transport at the
+    in-process receiver the way a self-hosted one would be named."""
     from http.server import BaseHTTPRequestHandler, HTTPServer
 
-    seen: list[str | None] = []
+    seen: list[tuple[str, str | None, str | None]] = []
 
     class _Handler(BaseHTTPRequestHandler):
         def do_POST(self):  # noqa: N802 — BaseHTTPRequestHandler's spelling
             self.rfile.read(int(self.headers.get("Content-Length", 0)))
-            seen.append(self.headers.get("Authorization"))
-            self.send_response(200)
+            seen.append(
+                (self.path, self.headers.get("Authorization"), self.headers.get("Content-Encoding"))
+            )
+            self.send_response(202)
             self.end_headers()
 
         def log_message(self, *args):
@@ -364,8 +366,10 @@ def test_backend_api_key_authenticates_the_default_transport_on_the_wire():
 
     srv = HTTPServer(("127.0.0.1", 0), _Handler)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
-    endpoint = f"http://127.0.0.1:{srv.server_address[1]}/v1/traces"
-    wardex.init(intercept=False, backend=BackendConfig(endpoint=endpoint, api_key="wk-secret-123"))
+    base_url = f"http://127.0.0.1:{srv.server_address[1]}"
+    wardex.init(
+        intercept=False, backend=BackendConfig(base_url=base_url, api_key="wdx_us_secret123")
+    )
     try:
         with wardex.span("authenticated"):
             pass
@@ -374,7 +378,98 @@ def test_backend_api_key_authenticates_the_default_transport_on_the_wire():
         wardex.close()
         srv.shutdown()
         srv.server_close()
-    assert seen == ["Bearer wk-secret-123"]
+    assert seen == [("/v1/envelope", "Bearer wdx_us_secret123", "zstd")]
+
+
+def test_a_project_key_alone_routes_to_the_receiver_its_region_names():
+    """The five-row table, row one: a key and nothing else is a working first
+    run against the wardex cloud. The host comes from the key's region tag,
+    never from a constant a self-hosted receiver would have to override."""
+    from wardex_sdk._config import WARDEX_INGEST_HOSTS
+    from wardex_sdk.transport import WardexTransport
+
+    wardex.init(intercept=False, backend=BackendConfig(api_key="wdx_us_secret123"))
+    client = _hub.get_client()
+    try:
+        assert isinstance(client._transport, WardexTransport)
+        assert client._transport.url == WARDEX_INGEST_HOSTS["us"] + "/v1/envelope"
+    finally:
+        # Nothing was captured, so the drain on close has no batch to POST —
+        # the cloud receiver is never contacted.
+        wardex.close()
+
+
+def test_base_url_names_a_self_hosted_receiver_over_the_region_table():
+    from wardex_sdk.transport import WardexTransport
+
+    wardex.init(
+        intercept=False,
+        backend=BackendConfig(api_key="wdx_us_secret123", base_url="http://127.0.0.1:1/"),
+    )
+    client = _hub.get_client()
+    try:
+        assert isinstance(client._transport, WardexTransport)
+        assert client._transport.url == "http://127.0.0.1:1/v1/envelope"
+    finally:
+        wardex.close()
+
+
+def test_a_key_next_to_an_endpoint_routes_to_wardex_and_says_the_endpoint_lost():
+    """Two destinations named. The project key wins — it is never sent to a
+    third-party collector — and the losing endpoint is announced, because an
+    OTLP address that sits inert in silence looks exactly like one that was
+    honoured."""
+    from wardex_sdk.transport import WardexTransport
+
+    with pytest.warns(wardex.WardexConfigWarning, match="api_key routes to the wardex receiver"):
+        wardex.init(
+            intercept=False,
+            backend=BackendConfig(
+                api_key="wdx_us_secret123", endpoint="http://collector.invalid/v1/traces"
+            ),
+        )
+    client = _hub.get_client()
+    try:
+        assert isinstance(client._transport, WardexTransport)
+    finally:
+        wardex.close()
+
+
+def test_a_base_url_without_a_key_is_refused():
+    """A receiver address with nothing to authenticate with would turn every
+    POST into a silent 401 — the one outcome a config change may not have."""
+    with pytest.raises(ValueError, match="backend.api_key is unset"):
+        wardex.init(intercept=False, backend=BackendConfig(base_url="http://127.0.0.1:1"))
+    assert _hub.get_client() is None
+
+
+def test_a_key_from_an_unknown_region_is_refused_rather_than_routed():
+    """The region tag is the whole of the routing. A tag this build has no
+    receiver for must raise at `init()`, never fall back to some default host
+    that would answer 401 to every batch."""
+    with pytest.raises(ValueError, match="region 'mars'"):
+        wardex.init(intercept=False, backend=BackendConfig(api_key="wdx_mars_secret123"))
+    with pytest.raises(ValueError, match="not a wardex project key"):
+        wardex.init(intercept=False, backend=BackendConfig(api_key="k"))
+    assert _hub.get_client() is None
+
+
+def test_an_endpoint_takes_its_headers_from_the_otel_variable(monkeypatch):
+    """A third-party collector authenticates the OTel way: the headers a host
+    already exports OTLP with, parsed per the specification (percent-encoded
+    values), reach the OTLP transport. The project key is not among them."""
+    from wardex_sdk.transport import OtlpHttpTransport
+
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_HEADERS", "x-honeycomb-team=abc%3D, x-other=1")
+    wardex.init(
+        intercept=False, backend=BackendConfig(endpoint="http://collector.invalid/v1/traces")
+    )
+    client = _hub.get_client()
+    try:
+        assert isinstance(client._transport, OtlpHttpTransport)
+        assert client._transport._headers == {"x-honeycomb-team": "abc=", "x-other": "1"}
+    finally:
+        wardex.close()
 
 
 def test_no_api_key_means_no_authorization_header():
@@ -391,17 +486,16 @@ def test_no_api_key_means_no_authorization_header():
 def test_the_api_key_never_reaches_stderr(capsys):
     """The credential rides only in the request header. `debug=True` prints the
     resolved config (api_key is repr=False) and the transport's own debug lines
-    never echo an Authorization value."""
+    never echo the key."""
     wardex.init(
         intercept=False,
-        backend=BackendConfig(
-            endpoint="http://collector.invalid/v1/traces", api_key="wk-secret-123"
-        ),
+        backend=BackendConfig(base_url="http://127.0.0.1:1", api_key="wdx_us_wk-secret-123"),
         debug=True,
     )
     client = _hub.get_client()
     try:
-        assert client._transport._headers["Authorization"] == "Bearer wk-secret-123"
+        assert client._transport._api_key == "wdx_us_wk-secret-123"
+        assert "wk-secret-123" not in repr(client._transport)
         assert "wk-secret-123" not in capsys.readouterr().err
     finally:
         wardex.close()
@@ -444,15 +538,15 @@ def test_pii_exemptions_under_mode_off_are_announced():
 def test_no_transport_and_no_endpoint_still_installs_the_noop_default(capsys):
     from wardex_sdk.transport._noop import NoOpTransport
 
-    wardex.init(intercept=False, backend=BackendConfig(api_key="k"))
+    wardex.init(intercept=False)
     client = _hub.get_client()
     try:
         assert isinstance(client._transport, NoOpTransport)
         # Unconditional, not debug-gated: a wardex capturing into nothing looks
         # exactly like a backend receiving no traffic, so it says so once.
         assert (
-            "no transport or backend.endpoint configured: capturing, exporting nothing"
-            in capsys.readouterr().err
+            "no transport, backend.api_key or backend.endpoint configured: "
+            "capturing, exporting nothing" in capsys.readouterr().err
         )
     finally:
         wardex.close()
@@ -522,7 +616,7 @@ def test_close_after_a_teardown_is_a_no_op():
 
 
 def test_reset_twice_is_a_no_op():
-    wardex.init(intercept=False, backend=BackendConfig(api_key="k"))
+    wardex.init(intercept=False)
     _hub.reset_for_test()
     _hub.reset_for_test()  # must not raise on an already-empty runtime
     assert _runtime.runtime().client is None

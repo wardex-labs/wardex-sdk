@@ -525,3 +525,52 @@ def test_the_api_key_never_appears_in_a_repr():
     secret = "wk-secret-123"
     assert secret not in repr(BackendConfig(api_key=secret))
     assert secret not in repr(WardexConfig(backend=BackendConfig(api_key=secret)))
+
+
+def test_resolve_config_reads_base_url_and_otel_headers(monkeypatch):
+    """The two fields added with the wardex receiver: `WARDEX_BASE_URL` fills
+    `base_url`, and `OTEL_EXPORTER_OTLP_HEADERS` fills `headers` parsed the way
+    the OTel specification says (comma-separated pairs, percent-encoded
+    values, whitespace around pairs ignored)."""
+    monkeypatch.setenv("WARDEX_BASE_URL", "http://127.0.0.1:8080")
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_HEADERS", " a=1 , b=x%20y ,,")
+    c = _resolve_config()
+    assert c.backend.base_url == "http://127.0.0.1:8080"
+    assert dict(c.backend.headers) == {"a": "1", "b": "x y"}
+
+
+def test_resolve_config_headers_absent_reads_as_none_and_explicit_wins(monkeypatch):
+    monkeypatch.delenv("OTEL_EXPORTER_OTLP_HEADERS", raising=False)
+    assert _resolve_config().backend.headers is None
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_HEADERS", "a=env")
+    c = _resolve_config(backend=BackendConfig(headers={"a": "explicit"}))
+    assert dict(c.backend.headers) == {"a": "explicit"}
+
+
+def test_malformed_otel_headers_are_refused_not_dropped(monkeypatch):
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_HEADERS", "no-equals-sign")
+    with pytest.raises(ValueError, match="not key=value"):
+        _resolve_config()
+
+
+def test_backend_headers_read_back_immutable_and_equal():
+    """Lossless canonicalization, like the tuple/frozenset ones: a config that
+    reads back as written must not be editable through a dict it handed out."""
+    given = {"x-honeycomb-team": "abc"}
+    c = BackendConfig(headers=given)
+    given["x-honeycomb-team"] = "changed"
+    assert c.headers == {"x-honeycomb-team": "abc"}
+    with pytest.raises(TypeError):
+        c.headers["k"] = "v"  # type: ignore[index]
+    assert BackendConfig(headers={"a": "1"}) == BackendConfig(headers={"a": "1"})
+
+
+def test_region_of_key_parses_the_tag_and_refuses_everything_else():
+    from wardex_sdk._config import WARDEX_INGEST_HOSTS, region_of_key
+
+    assert region_of_key("wdx_us_abc") == "us"
+    assert region_of_key("wdx_eu_a_b_c") == "eu"
+    assert "us" in WARDEX_INGEST_HOSTS
+    for bad in ("k", "wdx_", "wdx_us", "wdx_us_", "wdx__abc", "sk-lf-abc"):
+        with pytest.raises(ValueError, match="not a wardex project key"):
+            region_of_key(bad)

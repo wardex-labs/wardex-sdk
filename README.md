@@ -23,7 +23,7 @@ pip install wardex-sdk
 import wardex_sdk as wardex
 from wardex_sdk import BackendConfig
 
-wardex.init(backend=BackendConfig(endpoint="https://<collector>/v1/traces", api_key="..."))
+wardex.init(backend=BackendConfig(api_key="wdx_us_..."))
 
 # your app code — LLM calls, tools and agent runs are captured automatically
 
@@ -32,12 +32,33 @@ wardex.close()  # optional — spans auto-flush every 5s, on buffer threshold, a
 
 Interception is **on by default**: `init()` is the consent, and
 zero-instrumentation capture of LLM traffic is the product (`intercept=False`
-is the opt-out). `api_key` is sent as an `Authorization: Bearer <key>` header
-by the default exporter and never inside the exported data: one key names one
-project, and the receiver stamps that project onto what it stores. With
-`WARDEX_ENDPOINT` set in the environment, a bare
-`wardex.init()` is a working first run — see
+is the opt-out). `api_key` is the wardex project key: one key names one
+project, its region tag (`wdx_us_...`) names the receiver, and the key travels
+as an `Authorization: Bearer <key>` header to that receiver and nowhere else —
+never inside the exported data, never to a third-party collector. The receiver
+stamps the project onto what it stores. With `WARDEX_API_KEY` set in the
+environment, a bare `wardex.init()` is a working first run — see
+[Where the data goes](#where-the-data-goes) and
 [Environment variables](#environment-variables).
+
+## Where the data goes
+
+The destination is decided by what you configured, and nothing else. When two
+settings name different destinations, the one that loses is announced with a
+`WardexConfigWarning` rather than ignored.
+
+| You set | Data goes to |
+|---|---|
+| `api_key` | the wardex receiver the key's region names (`WardexTransport`) |
+| `api_key` + `base_url` | a self-hosted wardex receiver at `base_url` (`<base_url>/v1/envelope`) |
+| `endpoint` (or the OTel endpoint variables) | a third-party OTLP/HTTP collector (`OtlpHttpTransport`), authenticated by `headers` / `OTEL_EXPORTER_OTLP_HEADERS` |
+| `transport=` | that transport, always |
+| none of these | nowhere: `NoOpTransport`, said once on stderr |
+
+`api_key` next to `endpoint` routes to the wardex receiver and warns that the
+endpoint lost. A `base_url` without a key is refused with a `ValueError`, and
+so is a key whose region this SDK version has no receiver for — a batch sent
+to the wrong receiver would be a 401 the exporter is silent about.
 
 ## Works with openai-agents
 
@@ -109,7 +130,7 @@ way.
 
 | Group | What it decides |
 |---|---|
-| `backend=BackendConfig(...)` | Where the data goes and whose it is: `endpoint`, `api_key` |
+| `backend=BackendConfig(...)` | Where the data goes and whose it is: `api_key`, `base_url`, `endpoint`, `headers` |
 | `pii=PIIConfig(...)` | What leaves the process: `mode`, `disabled_categories` |
 | `batching=BatchingConfig(...)` | When buffered spans are sent: `flush_interval`, `flush_on_signals`, `shutdown_timeout` |
 | `limits=LimitsConfig(...)` | How much is captured — see [Resource limits](#resource-limits) |
@@ -121,7 +142,7 @@ import wardex_sdk as wardex
 from wardex_sdk import BackendConfig, BatchingConfig, PIIConfig, PIIMode
 
 wardex.init(
-    backend=BackendConfig(endpoint="https://<collector>/v1/traces", api_key="..."),
+    backend=BackendConfig(api_key="wdx_us_..."),
     batching=BatchingConfig(flush_interval=2.0),
     pii=PIIConfig(mode=PIIMode.OFF),
 )
@@ -178,15 +199,17 @@ environment variable; only then does the default apply. The contract:
 
 | Variable | Fills |
 |---|---|
-| `WARDEX_API_KEY` | `backend.api_key` |
-| `WARDEX_ENDPOINT` | `backend.endpoint` — else `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`, else `OTEL_EXPORTER_OTLP_ENDPOINT` |
+| `WARDEX_API_KEY` | `backend.api_key` — the project key; its region picks the wardex receiver |
+| `WARDEX_BASE_URL` | `backend.base_url` — a self-hosted wardex receiver |
+| `WARDEX_ENDPOINT` | `backend.endpoint` — a third-party OTLP collector; else `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`, else `OTEL_EXPORTER_OTLP_ENDPOINT` |
+| `OTEL_EXPORTER_OTLP_HEADERS` | `backend.headers` — that collector's own headers, `key=value,key2=value2` with percent-encoded values |
 | `WARDEX_SERVICE_NAME` | `service_name` |
 | `WARDEX_RELEASE` | `release` |
 | `WARDEX_ENVIRONMENT` | `environment` |
 | `WARDEX_DEBUG` | `debug` — `true` (case-insensitive) can only turn it ON |
 
 A host already exporting OTLP elsewhere points wardex at the same collector
-with zero new variables. **The endpoint rule:** a URL with no path component
+with zero new variables, headers included. **The endpoint rule:** a URL with no path component
 (or `/`) gets `/v1/traces` appended when the default transport is built —
 `http://collector:4318` exports to `http://collector:4318/v1/traces` — while a
 URL with an explicit path is used verbatim. The config always reads back

@@ -160,6 +160,7 @@ def test_the_transport_module_is_the_complete_implementer_home():
         "NoOpTransport",
         "ConsoleTransport",
         "OtlpHttpTransport",
+        "WardexTransport",
         "Envelope",
         "UNDELIVERED",
         "Undelivered",

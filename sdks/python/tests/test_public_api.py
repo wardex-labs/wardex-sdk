@@ -25,7 +25,7 @@ def test_init_console_and_trace_flush(capsys):
 
 
 def test_capture_state_snapshot_recorded():
-    wardex_sdk.init(backend=BackendConfig(api_key="k"), intercept=False)
+    wardex_sdk.init(intercept=False)
     with wardex_sdk.conversation("s"):
         wardex_sdk.capture_state_snapshot(
             turn_index=0,
@@ -56,6 +56,8 @@ def test_public_exports_exist():
         "Transport",
         "NoOpTransport",
         "ConsoleTransport",
+        "OtlpHttpTransport",
+        "WardexTransport",
         "UserInfo",
         "InputRef",
     ):
@@ -68,7 +70,7 @@ def test_limits_config_is_public():
 
 
 def test_capture_state_snapshot_with_input_refs():
-    wardex_sdk.init(backend=BackendConfig(api_key="k"), intercept=False)
+    wardex_sdk.init(intercept=False)
     with wardex_sdk.conversation("s"):
         wardex_sdk.capture_state_snapshot(
             turn_index=1,
