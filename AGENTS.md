@@ -127,7 +127,15 @@ cargo clippy --workspace --all-targets -- -D warnings
 uv run ruff check sdks/python examples
 uv run ruff format --check sdks/python examples
 buf lint
+buf breaking --against '.git#format=git,ref=origin/main'
+scripts/check-buf-exceptions.sh '.git#format=git,ref=origin/main'
 ```
+
+`buf breaking` fails on an incompatible change to `proto/`. A deliberate one
+lands with an `ignore_only` entry under `breaking:` in `buf.yaml`, and the
+very next change removes that entry: it excuses a whole file rather than one
+field, so left behind it silences the check for that file.
+`scripts/check-buf-exceptions.sh` fails CI while a stale entry remains.
 
 ## Conventions
 

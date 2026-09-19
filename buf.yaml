@@ -12,3 +12,4 @@ breaking:
   # silently lets every later deletion in that file through. A deliberate break
   # adds its entry in the same change and the very next change removes it (the
   # baseline already contains the break by then, so nothing needs excusing).
+  # `scripts/check-buf-exceptions.sh` enforces the second half in CI.
