@@ -48,21 +48,77 @@ def test_tool_attributes_flatten_to_extra():
     assert extra["wardex.tool.execution_type"] == "in_process"
 
 
-def test_conversation_context_flattens_to_extra():
-    """The id every span of a conversation is grouped by, and the two
-    wardex-side fields only when they carry something: a `turn_index` of 0
-    is the dataclass default, not a fact."""
+def test_conversation_context_rides_its_typed_field_and_no_extra_key():
+    """The conversation leaves in `Span.conversation`, the field the schema
+    declares for it, and in NO `extra` key.
+
+    The escape this closes: the encoder flattened the block into `extra` and
+    left the typed field empty. An OTLP backend saw the id; a receiver of the
+    envelope reads the typed field, so it stored `""` as the conversation id
+    of every span — with every test green, because the sender's tests looked
+    in `extra` and the receiver's tests built the typed field by hand. Found
+    by decoding a real encode and looking for the field. One home, asserted
+    here; the OTLP spelling is derived from it and asserted in
+    `test_otlp_codec.py`."""
     conv = ConversationContext(conversation_id="conv-123")
-    out = _codec.decode(_codec.encode(_env(_span(conversation=conv))))
-    extra = _extra_dict(out["items"][0]["span"])
-    assert extra["gen_ai.conversation.id"] == "conv-123"
-    assert not any(k.startswith("wardex.conversation.") for k in extra)
+    span = _codec.decode(_codec.encode(_env(_span(conversation=conv))))["items"][0]["span"]
+    assert span["conversation"] == {
+        "conversation_id": "conv-123",
+        "session_id": "",
+        "turn_index": 0,
+    }
+    assert not any("conversation" in k for k in _extra_dict(span))
 
     full = ConversationContext(conversation_id="conv-123", session_id="sess-1", turn_index=3)
-    out = _codec.decode(_codec.encode(_env(_span(conversation=full))))
-    extra = _extra_dict(out["items"][0]["span"])
-    assert extra["wardex.conversation.session_id"] == "sess-1"
-    assert extra["wardex.conversation.turn_index"] == 3
+    span = _codec.decode(_codec.encode(_env(_span(conversation=full))))["items"][0]["span"]
+    assert span["conversation"] == {
+        "conversation_id": "conv-123",
+        "session_id": "sess-1",
+        "turn_index": 3,
+    }
+    assert not any("conversation" in k for k in _extra_dict(span))
+
+
+def test_a_span_without_a_conversation_decodes_without_the_key():
+    """Absent is absent: a dict of empty strings would be a conversation a
+    reader has to tell apart from none."""
+    span = _codec.decode(_codec.encode(_env(_span())))["items"][0]["span"]
+    assert "conversation" not in span
+    assert "call_site" not in span
+
+
+def test_call_site_rides_its_typed_field():
+    """Same class as the conversation escape above, found by the same read:
+    `CallSite` is declared in the schema, filled by the tracing decorator,
+    settable by a host through `Span.call_site`, read by a receiver of the
+    envelope — and the encoder never wrote it."""
+    from wardex_sdk._types import CallSite
+
+    site = CallSite(file="/app/booking.py", line=42, function="reserve", module="app.booking")
+    span = _codec.decode(_codec.encode(_env(_span(call_site=site))))["items"][0]["span"]
+    assert span["call_site"] == {
+        "file": "/app/booking.py",
+        "line": 42,
+        "function": "reserve",
+        "module": "app.booking",
+    }
+    assert not any(k.startswith("code.") for k in _extra_dict(span))
+
+    bare = CallSite(file="f.py", line=1, function="g")  # module is optional
+    span = _codec.decode(_codec.encode(_env(_span(call_site=bare))))["items"][0]["span"]
+    assert span["call_site"]["module"] == ""
+
+
+def test_a_call_site_value_the_field_cannot_hold_is_named_not_fatal():
+    """`Span.call_site` is the host's to set, so a wrong type there is one
+    field's loss: the rest of the location and the span still ship, and the
+    lost attribute is named once even when two source fields compose it."""
+    from wardex_sdk._types import CallSite
+
+    raw = _unchecked(CallSite, file="f.py", line="forty-two", function=7, module=8)
+    span = _codec.decode(_codec.encode(_env(_span(call_site=raw))))["items"][0]["span"]
+    assert span["call_site"] == {"file": "f.py", "line": 0, "function": "", "module": ""}
+    assert _extra_dict(span)["wardex.codec.unmarshalled"] == "code.function.name,code.line.number"
 
 
 def test_evaluation_attributes_flatten_to_extra():
@@ -129,14 +185,17 @@ def test_a_uuid_conversation_id_and_a_none_turn_index_export_cleanly():
     conv = ConversationContext(conversation_id=ident, turn_index=None)
     assert conv.conversation_id == str(ident) and conv.turn_index == 0
     out = _codec.decode(_codec.encode(_env(_span(conversation=conv))))
-    assert _extra_dict(out["items"][0]["span"])["gen_ai.conversation.id"] == str(ident)
+    assert out["items"][0]["span"]["conversation"]["conversation_id"] == str(ident)
 
     raw = _unchecked(ConversationContext, conversation_id=ident, session_id=None, turn_index=None)
     out = _codec.decode(_codec.encode(_env(_span(conversation=raw))))
-    extra = _extra_dict(out["items"][0]["span"])
-    assert extra["gen_ai.conversation.id"] == str(ident)
-    assert "wardex.conversation.turn_index" not in extra
-    assert "wardex.codec.unmarshalled" not in extra
+    span = out["items"][0]["span"]
+    assert span["conversation"] == {
+        "conversation_id": str(ident),
+        "session_id": "",
+        "turn_index": 0,
+    }
+    assert "wardex.codec.unmarshalled" not in _extra_dict(span)
 
     with pytest.raises(TypeError):
         ConversationContext(conversation_id="c", turn_index="three")
@@ -209,8 +268,19 @@ def test_two_unmarshallable_fields_on_one_span_are_named_under_one_key():
         extra["wardex.codec.unmarshalled"]
         == "wardex.conversation.turn_index,gen_ai.evaluation.score.value"
     )
-    assert extra["gen_ai.conversation.id"] == "c1"
+    assert span["conversation"]["conversation_id"] == "c1"
+    assert span["conversation"]["turn_index"] == 0  # the unreadable turn reads as unset
     assert extra["gen_ai.evaluation.name"] == "judge"
+
+
+def test_a_turn_index_past_int32_is_named_not_wrapped():
+    """The typed field is an `int32`. A turn that does not fit is a value the
+    field cannot hold, named like any other — never a silently wrapped number
+    a store would key on."""
+    conv = _unchecked(ConversationContext, conversation_id="c1", session_id=None, turn_index=2**40)
+    span = _codec.decode(_codec.encode(_env(_span(conversation=conv))))["items"][0]["span"]
+    assert span["conversation"]["turn_index"] == 0
+    assert _extra_dict(span)["wardex.codec.unmarshalled"] == "wardex.conversation.turn_index"
 
 
 def test_a_batch_with_one_unmarshallable_span_ships_the_other_spans():

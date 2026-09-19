@@ -190,6 +190,22 @@ const LIMITATIONS_KEY: &str = "wardex.limitations";
 /// body was truncated", with nothing to distinguish them from spans that had
 /// nothing to report.
 fn uncertainty(sp: &pb::Span, attrs: &mut Vec<otlp_pb::common::KeyValue>) {
+    // HOW each span was captured — seen by an adapter's hook, rebuilt from
+    // wire bytes, merged from a bridge — is the same grade of fact as the
+    // markers below: it says how far the span can be trusted. The envelope has
+    // carried it in a typed field all along and this mapping left it out, so
+    // an OTLP backend could not tell an observed tool call from a
+    // reconstructed one. Zero is "unset" and names nothing; a number this
+    // build does not know says so in its own name.
+    let sources: Vec<String> = sp
+        .capture_sources
+        .iter()
+        .map(|n| vocab::capture_source_name(*n))
+        .filter(|name| !name.is_empty())
+        .collect();
+    if !sources.is_empty() {
+        attrs.push(kv_strs("wardex.capture_sources", sources));
+    }
     if let Some(c) = &sp.correlation {
         // Zero is "no parent source recorded", not a source: naming it would
         // make a span whose parentage was never interpreted look interpreted.
@@ -248,6 +264,67 @@ fn uncertainty(sp: &pb::Span, attrs: &mut Vec<otlp_pb::common::KeyValue>) {
                 "wardex.capture.dropped_chunks",
                 i.dropped_chunk_count as i64,
             ));
+        }
+    }
+}
+
+/// Push `kv` unless `attrs` already carries its key.
+///
+/// The typed fields below are the sender's one home for their values, but
+/// `extra` is the host's to write: a host that put `gen_ai.conversation.id`
+/// there by hand must not end up with the key twice, because an OTLP decoder
+/// keeps one of a duplicated key and which one is the backend's choice. The
+/// host's spelling was pushed first and stays.
+fn push_absent(attrs: &mut Vec<otlp_pb::common::KeyValue>, kv: otlp_pb::common::KeyValue) {
+    if !attrs.iter().any(|have| have.key == kv.key) {
+        attrs.push(kv);
+    }
+}
+
+/// `Span.conversation` and `Span.call_site` → OTLP span attributes.
+///
+/// Both are typed fields on the envelope and the only place the sender writes
+/// them, so this projection is what an OTLP backend sees of either. The
+/// conversation keys and their omission rules are the ones the sender used
+/// when it flattened the block itself: the id whenever there is a block, the
+/// session id when set, the turn when non-zero, zero being proto3's "unset".
+///
+/// The call site takes semconv's stable `code.*` names. `code.function.name`
+/// is defined as FULLY QUALIFIED, with the namespace inside it rather than
+/// beside it, so the module is composed in; a module with no function names no
+/// function and is left out.
+fn typed_blocks(sp: &pb::Span, attrs: &mut Vec<otlp_pb::common::KeyValue>) {
+    if let Some(c) = &sp.conversation {
+        if !c.conversation_id.is_empty() {
+            push_absent(attrs, kv_str("gen_ai.conversation.id", &c.conversation_id));
+        }
+        if !c.session_id.is_empty() {
+            push_absent(
+                attrs,
+                kv_str("wardex.conversation.session_id", &c.session_id),
+            );
+        }
+        if c.turn_index != 0 {
+            push_absent(
+                attrs,
+                kv_int("wardex.conversation.turn_index", c.turn_index as i64),
+            );
+        }
+    }
+    if let Some(c) = &sp.call_site {
+        if !c.file.is_empty() {
+            push_absent(attrs, kv_str("code.file.path", &c.file));
+        }
+        if c.line != 0 {
+            push_absent(attrs, kv_int("code.line.number", c.line as i64));
+        }
+        if !c.function.is_empty() {
+            let name = if c.module.is_empty() {
+                c.function.clone()
+            } else {
+                format!("{}.{}", c.module, c.function)
+            };
+            push_absent(attrs, kv_str("code.function.name", &name));
         }
     }
 }
@@ -458,6 +535,7 @@ fn span(mut sp: pb::Span) -> otlp_pb::trace::Span {
     if !output.is_empty() {
         attrs.push(kv_bytes(output_key, output));
     }
+    typed_blocks(&sp, &mut attrs);
     uncertainty(&sp, &mut attrs);
 
     // `error.type` is a span attribute — semconv's home for it — and the
@@ -1728,5 +1806,162 @@ mod tests {
         let sp = &mut req.resource_spans[0].scope_spans[0].spans[0];
         drop_payload_attributes(sp);
         assert!(attr(sp, "wardex.limitations").is_none());
+    }
+
+    use otlp_pb::common::any_value::Value as V;
+
+    fn keys(sp: &otlp_pb::trace::Span, key: &str) -> usize {
+        sp.attributes.iter().filter(|kv| kv.key == key).count()
+    }
+
+    /// The typed conversation field is the sender's ONLY home for these
+    /// values, so this projection is all an OTLP backend sees of them. The
+    /// escape it closes: the sender wrote the keys into `extra` and left the
+    /// typed field empty, which a receiver of the envelope — reading the typed
+    /// field — stored as an empty conversation id on every span. Found by
+    /// decoding a real encode and looking for the field, not by a failing run.
+    #[test]
+    fn the_typed_conversation_projects_onto_the_keys_a_backend_groups_by() {
+        let sp = only_span(envelope(pb::Span {
+            conversation: Some(pb::ConversationContext {
+                conversation_id: "conv-1".into(),
+                session_id: "sess-1".into(),
+                turn_index: 2,
+            }),
+            ..Default::default()
+        }));
+        assert_eq!(
+            attr(&sp, "gen_ai.conversation.id"),
+            Some(&V::StringValue("conv-1".into()))
+        );
+        assert_eq!(
+            attr(&sp, "wardex.conversation.session_id"),
+            Some(&V::StringValue("sess-1".into()))
+        );
+        assert_eq!(
+            attr(&sp, "wardex.conversation.turn_index"),
+            Some(&V::IntValue(2))
+        );
+    }
+
+    #[test]
+    fn an_unset_session_and_turn_add_no_keys() {
+        let sp = only_span(envelope(pb::Span {
+            conversation: Some(pb::ConversationContext {
+                conversation_id: "conv-1".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }));
+        assert!(attr(&sp, "gen_ai.conversation.id").is_some());
+        assert!(attr(&sp, "wardex.conversation.session_id").is_none());
+        assert!(attr(&sp, "wardex.conversation.turn_index").is_none());
+    }
+
+    #[test]
+    fn a_span_with_no_typed_blocks_gains_no_keys() {
+        let sp = only_span(envelope(pb::Span::default()));
+        for key in [
+            "gen_ai.conversation.id",
+            "wardex.conversation.session_id",
+            "wardex.conversation.turn_index",
+            "wardex.capture_sources",
+            "code.file.path",
+            "code.line.number",
+            "code.function.name",
+        ] {
+            assert!(attr(&sp, key).is_none(), "{key} on an empty span");
+        }
+    }
+
+    /// `extra` is the host's to write. A host that spelled the conversation
+    /// key there itself keeps its value and the key appears once: an OTLP
+    /// decoder keeps one of a duplicated key, and which one is its choice.
+    #[test]
+    fn a_key_the_host_already_wrote_is_not_pushed_twice() {
+        let sp = only_span(envelope(pb::Span {
+            extra: vec![kv_wardex("gen_ai.conversation.id", "host-said")],
+            conversation: Some(pb::ConversationContext {
+                conversation_id: "typed".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }));
+        assert_eq!(keys(&sp, "gen_ai.conversation.id"), 1);
+        assert_eq!(
+            attr(&sp, "gen_ai.conversation.id"),
+            Some(&V::StringValue("host-said".into()))
+        );
+    }
+
+    #[test]
+    fn the_call_site_takes_the_stable_code_names_with_the_module_in_the_function() {
+        let sp = only_span(envelope(pb::Span {
+            call_site: Some(pb::CallSite {
+                file: "/app/booking.py".into(),
+                line: 42,
+                function: "reserve".into(),
+                module: "app.booking".into(),
+            }),
+            ..Default::default()
+        }));
+        assert_eq!(
+            attr(&sp, "code.file.path"),
+            Some(&V::StringValue("/app/booking.py".into()))
+        );
+        assert_eq!(attr(&sp, "code.line.number"), Some(&V::IntValue(42)));
+        assert_eq!(
+            attr(&sp, "code.function.name"),
+            Some(&V::StringValue("app.booking.reserve".into()))
+        );
+    }
+
+    #[test]
+    fn a_call_site_without_a_module_names_the_bare_function() {
+        let sp = only_span(envelope(pb::Span {
+            call_site: Some(pb::CallSite {
+                function: "reserve".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }));
+        assert_eq!(
+            attr(&sp, "code.function.name"),
+            Some(&V::StringValue("reserve".into()))
+        );
+        assert!(attr(&sp, "code.file.path").is_none());
+        assert!(attr(&sp, "code.line.number").is_none());
+    }
+
+    /// How a span was captured reaches an OTLP backend by name. Zero is
+    /// "unset" and names nothing; a number this build does not know declares
+    /// itself rather than vanishing.
+    #[test]
+    fn capture_sources_project_by_name() {
+        let sp = only_span(envelope(pb::Span {
+            capture_sources: vec![
+                pb::CaptureSource::Adapter as i32,
+                pb::CaptureSource::Unspecified as i32,
+                pb::CaptureSource::Ssl as i32,
+                9_999,
+            ],
+            ..Default::default()
+        }));
+        let Some(V::ArrayValue(arr)) = attr(&sp, "wardex.capture_sources") else {
+            panic!("wardex.capture_sources is missing or not an array");
+        };
+        // Owned strings joined for the comparison, deliberately: a borrowed
+        // string vector is the shape the limitation census reads as a marker
+        // channel, and it registers the binding's NAME repository-wide.
+        let got = arr
+            .values
+            .iter()
+            .filter_map(|v| match v.value.as_ref() {
+                Some(V::StringValue(s)) => Some(s.clone()),
+                _ => None,
+            })
+            .collect::<Vec<String>>()
+            .join(",");
+        assert_eq!(got, "adapter,ssl,capture_source_unrecognized_9999");
     }
 }
