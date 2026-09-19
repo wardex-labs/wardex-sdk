@@ -939,27 +939,23 @@ class UnitRegistry:
         self._max_link_targets = (
             max_link_targets if max_link_targets is not None else resolved["max_link_targets"]
         )
-        # Bytes a unit may accumulate through record_input/record_output. Not a
-        # knob of its own: the payload ceiling the rest of the SDK already
-        # applies to a captured body is the honest ceiling for one assembled
-        # from many fragments. The PARAMETER is spelled after the knob rather
-        # than after the attribute, because the two mean different things —
-        # `max_body_bytes` caps one body, `_max_record_bytes` caps a record
-        # accumulated from many — and the delivery table reads better when the
-        # keyword and the field it comes from are the same word.
+        # Bytes a unit may accumulate through record_input/record_output. Not a knob of its own: the
+        # payload ceiling the rest of the SDK already applies to a captured body is the honest
+        # ceiling for one assembled from many fragments. The PARAMETER is spelled after the knob
+        # rather than after the attribute, because the two mean different things — `max_body_bytes`
+        # caps one body, `_max_record_bytes` caps a record accumulated from many — and the delivery
+        # table reads better when the keyword and the field it comes from are the same word.
         self._max_record_bytes = (
             max_body_bytes if max_body_bytes is not None else resolved["max_body_bytes"]
         )
-        # `max_units` bounds ROOTS, deliberately (a flat LRU would make "evict
-        # the oldest unit" pick a long-lived session root nearly every time, so
-        # one chatty session would evict OTHER sessions' roots). Children are
-        # bounded per parent — which bounds BREADTH but not DEPTH, so a chain of
-        # child-of-child units would grow forever under one live root. This
-        # derived ceiling closes that without inventing a knob a user would have
-        # to discover, and it is safe to enforce by evicting a ROOT because
-        # every live unit is reachable from one: a child opened under a closed
-        # parent is registered as a root (see `open`), so "live units exist but
-        # no root does" is unreachable.
+        # `max_units` bounds ROOTS, deliberately (a flat LRU would make "evict the oldest unit" pick
+        # a long-lived session root nearly every time, so one chatty session would evict OTHER
+        # sessions' roots). Children are bounded per parent — which bounds BREADTH but not DEPTH, so
+        # a chain of child-of-child units would grow forever under one live root. This derived
+        # ceiling closes that without inventing a knob a user would have to discover, and it is safe
+        # to enforce by evicting a ROOT because every live unit is reachable from one: a child
+        # opened under a closed parent is registered as a root (see `open`), so "live units exist
+        # but no root does" is unreachable.
         self._max_total_units = self._max_units * self._max_entries_per_unit
         self._lock = threading.RLock()
         self._roots: dict[Unit, None] = {}
@@ -1132,14 +1128,12 @@ class UnitRegistry:
             if parent_unit is not None and parent_unit.is_live and parent_unit._registry is self:
                 evicted = parent_unit._evict_oldest(parent_unit._children, "child")
                 if evicted is not None:
-                    # Only the entry that HIT the bound carries the table-full
-                    # fact; its descendants, closed by the same walk below, keep
-                    # CHILD_SPAN_UNCLOSED — they truly were closed by their
-                    # parent's teardown, which is that member's exact sentence.
-                    # The breadcrumb is written BEFORE the close, which is what
-                    # makes `refused_ambient_marker`'s lock-free read safe: a
-                    # fork that reads its unit as dead already reads it as
-                    # evicted when it was.
+                    # Only the entry that HIT the bound carries the table-full fact; its
+                    # descendants, closed by the same walk below, keep CHILD_SPAN_UNCLOSED — they
+                    # truly were closed by their parent's teardown, which is that member's exact
+                    # sentence. The breadcrumb is written BEFORE the close, which is what makes
+                    # `refused_ambient_marker`'s lock-free read safe: a fork that reads its unit as
+                    # dead already reads it as evicted when it was.
                     evicted[0]._evicted = True
                     evicted[0].note(Limitation.UNIT_TABLE_FULL)
                     pending += self._close_locked(
@@ -1147,14 +1141,12 @@ class UnitRegistry:
                     )
                 parent_unit._children[unit] = None
             else:
-                # A child of a CLOSED — or FOREIGN — parent is a root for
-                # bookkeeping. Its span still hangs off the parent's context (a
-                # closed unit's span was already emitted, so it is a perfectly
-                # good parent) but its LIFETIME cannot be managed by a unit this
-                # registry does not own or that no longer has a child table:
-                # left as a child it would be reachable from no root of EITHER
-                # registry, so no bound would ever evict it and `close_all`
-                # would never see it. A foreign parent also means the per-parent
+                # A child of a CLOSED — or FOREIGN — parent is a root for bookkeeping. Its span
+                # still hangs off the parent's context (a closed unit's span was already emitted, so
+                # it is a perfectly good parent) but its LIFETIME cannot be managed by a unit this
+                # registry does not own or that no longer has a child table: left as a child it
+                # would be reachable from no root of EITHER registry, so no bound would ever evict
+                # it and `close_all` would never see it. A foreign parent also means the per-parent
                 # breadth bound applied would be the OTHER registry's.
                 if parent_unit is not None and not parent_unit.is_live:
                     counters.bump("assembly._units.parent_closed")
@@ -2029,18 +2021,26 @@ class UnitRegistry:
                 self._sink.emit(draft, agent_semantic=True)
 
 
-def ambient_owner() -> str | None:
-    """Which adapter installed the ambient unit, LIVE OR NOT, or None.
+def ambient_stated_conversation(owner: str, conversation: ConversationContext) -> bool:
+    """Did a unit of `owner`'s, LIVE OR NOT, STATE the ambient `conversation`?
 
-    `current()` answers a different question — "which unit may I hang off" —
-    and retires a closed pin and a previous registry's unit alike. This reads
-    the carrier as it stands: an adapter deciding whether an ambient
-    conversation is the HOST's word or its own leftover (a pin its earlier
-    run could not take down, on a thread that outlived the run) needs the
-    owner of what is there, not whether it may still be used.
+    `current()` answers a different question — "which unit may I hang off" — and retires a
+    closed pin and a previous registry's unit alike. This reads the carrier as it stands: an
+    adapter deciding whether an ambient conversation is the HOST's word needs to know whether
+    one of its own runs put it there — a nested run's parent, or a pin an earlier run could not
+    take down on a thread that outlived it. Who OWNS the ambient unit does not answer that: a
+    run opened inside the host's `wardex.conversation(...)` is the adapter's own unit carrying
+    the host's id. A unit that INHERITED a conversation holds the very object its parentage
+    handed down, so the walk climbs while the object is the same and stops at the unit that
+    holds it without having been handed it: that unit stated it.
     """
     entry = _ambient_unit.get()
-    return None if entry is None else entry.unit.owner
+    unit = None if entry is None else entry.unit
+    while unit is not None and unit.owner == owner and unit.conversation is conversation:
+        if unit.parentage.conversation is not conversation:
+            return True
+        unit = unit.parent
+    return False
 
 
 def parent_is_closed_unit(parent: SpanContext | None) -> bool:
@@ -2092,7 +2092,7 @@ __all__ = [
     "PinToken",
     "SpanSink",
     "Unit",
-    "ambient_owner",
+    "ambient_stated_conversation",
     "UnitKey",
     "UnitKind",
     "UnitRegistry",

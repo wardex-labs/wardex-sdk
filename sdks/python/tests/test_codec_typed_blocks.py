@@ -3,11 +3,13 @@ conversation, evaluation)."""
 
 import pytest
 
-from test_codec import _env, _span  # reuse the existing envelope/span helpers
+from test_codec import _env, _header, _span  # reuse the existing envelope/span helpers
+from wardex_sdk import _wardex_native
 from wardex_sdk._enums import AgentType, ToolExecutionType, ToolType
 from wardex_sdk._types import (
     AgentAttributes,
     ConversationContext,
+    Envelope,
     EvaluationAttributes,
     ToolAttributes,
 )
@@ -118,7 +120,53 @@ def test_a_call_site_value_the_field_cannot_hold_is_named_not_fatal():
     raw = _unchecked(CallSite, file="f.py", line="forty-two", function=7, module=8)
     span = _codec.decode(_codec.encode(_env(_span(call_site=raw))))["items"][0]["span"]
     assert span["call_site"] == {"file": "f.py", "line": 0, "function": "", "module": ""}
-    assert _extra_dict(span)["wardex.codec.unmarshalled"] == "code.function.name,code.line.number"
+    # The module has no attribute of its own — it is composed into
+    # `code.function.name` — so it is named as the field it is.
+    assert (
+        _extra_dict(span)["wardex.codec.unmarshalled"]
+        == "code.function.name,call_site.module,code.line.number"
+    )
+
+
+class _NoText:
+    def __str__(self) -> str:
+        raise RuntimeError("no text")
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"call_site": ("booking.py", 42, "reserve")},  # `Span.call_site` validates nothing
+        {"call_site": "booking.py:42"},
+        {"conversation": "conv-1"},  # not a ConversationContext at all
+        {"conversation": object()},
+    ],
+)
+def test_a_block_that_is_not_its_declared_type_costs_the_block_not_the_batch(fields):
+    """Found by review, by running it through the public API: a host that set
+    `span.call_site = ("booking.py", 42, "reserve")` lost EVERY span of the
+    batch on the envelope transport, in silence — the read of a missing
+    attribute raised out of the encoder, and that transport encodes a batch in
+    one call. Before `call_site` was encoded the same line was harmless. No
+    host-written value may raise here: the neighbours ship, and so does the
+    span itself."""
+    env = Envelope(header=_header(), spans=(_span(**fields), _span(name="good")))
+    out = _codec.decode(_codec.encode(env))
+    assert [item["span"]["name"] for item in out["items"]] == ["GET /v1/chat", "good"]
+    otlp = _wardex_native.codec.decode_otlp_traces(_wardex_native.codec.encode_otlp_traces(env))
+    assert len(otlp["resource_spans"][0]["scope_spans"][0]["spans"]) == 2
+
+
+def test_a_conversation_id_with_no_text_is_named_and_the_span_ships():
+    raw = _unchecked(
+        ConversationContext, conversation_id=_NoText(), session_id=_NoText(), turn_index=1
+    )
+    span = _codec.decode(_codec.encode(_env(_span(conversation=raw))))["items"][0]["span"]
+    assert span["conversation"] == {"conversation_id": "", "session_id": "", "turn_index": 1}
+    assert (
+        _extra_dict(span)["wardex.codec.unmarshalled"]
+        == "gen_ai.conversation.id,wardex.conversation.session_id"
+    )
 
 
 def test_evaluation_attributes_flatten_to_extra():

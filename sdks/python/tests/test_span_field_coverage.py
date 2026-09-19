@@ -20,6 +20,17 @@ read the attribute and wrote it to the wrong place.
 A field that is deliberately not encoded goes in `_NOT_ON_THE_WIRE` with the
 reason. The table is empty, and the way to keep it empty is to delete a field
 nothing ships rather than list it.
+
+WHAT THIS DOES NOT REACH, so that a green run is not read as more than it is:
+
+* One sentinel per TOP-LEVEL field. A block that ships while one of its
+  sub-fields is dropped passes: `GenAIAttributes.system_instructions` and
+  `tool_definitions_hash` are not encoded today, and no row here fails.
+* The ENVELOPE only. A field present on the envelope and absent from the OTLP
+  export — which is what `capture_sources` was — cannot fail it; the OTLP side
+  is asserted attribute by attribute in `test_otlp_codec.py`.
+* What the Python DECODER returns. A value that is on the wire but that
+  `decode()` does not surface reads here as missing, not as present.
 """
 
 from __future__ import annotations
