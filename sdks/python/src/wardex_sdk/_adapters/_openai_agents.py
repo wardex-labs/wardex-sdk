@@ -110,7 +110,6 @@ from typing import Any
 
 from .._assembly import (
     AgentAttributes,
-    ConversationContext,
     EvaluationAttributes,
     Limitation,
     LinkReason,
@@ -118,15 +117,14 @@ from .._assembly import (
     ToolAttributes,
     UnitKey,
     UnitKind,
-    ambient_owner,
     diag_info,
-    latch_ambient,
     report_once,
 )
 from .._enums import StatusCode, ToolExecutionType, ToolType
 from .._hash import hash_canonical
 from ._base import AdapterInterface
 from ._context import AdapterContext, Placement, RunHandle
+from ._conversation import framework_conversation
 from ._payload import _shaped_payload
 
 _FRAMEWORK = "openai_agents"
@@ -944,29 +942,14 @@ def _trace_start(adapter: OpenAIAgentsAdapter, trace: Any, *, resumed: bool = Fa
             key="adapters.openai_agents.run_root_reattached",
         )
     name = str(trace.name)
-    group = trace.group_id
     trace_id = str(trace.trace_id)
     driver = _driver()
-    # HOST WINS. A run opened inside the host's own `wardex.conversation(...)`
-    # keeps that id: one trace, one conversation, and the host's word is the
-    # one its backend already groups by. The framework's `group_id` then
-    # rides along on the root as its own attribute, counted, instead of
-    # replacing the ambient id on every span underneath. With nothing
-    # ambient the group id IS the conversation, handed to the registry at
-    # the open so children and the pinned carrier inherit it.
-    #
-    # The host's word is an ambient conversation that the host set. One
-    # installed by THIS adapter's own unit is a leftover — a run closed by
-    # `wardex.close()` on a thread whose carrier outlived it — and is not
-    # what the host asked for: `group_id` stays the conversation.
-    conversation = None
-    shadowed = None
-    if group:
-        if latch_ambient().conversation is not None and ambient_owner() != ctx.name:
-            shadowed = str(group)
-            ctx.count("group_id_shadowed_by_host")
-        else:
-            conversation = ConversationContext(conversation_id=str(group))
+    # HOST WINS — see `framework_conversation`. The `group_id` a host's own
+    # conversation shadowed rides along on the root as its own attribute, and
+    # the pinned carrier inherits whichever id the run opened with.
+    conversation, shadowed = framework_conversation(
+        ctx, trace.group_id, shadowed_counter="group_id_shadowed_by_host"
+    )
 
     def describe(h: RunHandle) -> None:
         h.draft.set_workflow_name(name)

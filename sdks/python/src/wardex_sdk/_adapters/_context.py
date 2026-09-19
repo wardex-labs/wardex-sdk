@@ -1059,6 +1059,7 @@ class AdapterContext:
         aliases: Sequence[UnitKey] = (),
         start_ns: int | None = None,
         fallback: Fallback = Fallback.NONE,
+        conversation: ConversationContext | None = None,
         describe: Callable[[Scope], None] | None = None,
     ) -> Iterator[Scope]:
         """Open a unit, make it the ambient parent, and close it on the way out.
@@ -1095,6 +1096,7 @@ class AdapterContext:
                 aliases=aliases,
                 start_ns=start_ns,
                 fallback=fallback,
+                conversation=conversation,
             )
             scope = Scope(unit, self)
             if describe is not None:
@@ -1132,15 +1134,13 @@ class AdapterContext:
         NEVER None and NEVER raises; a handle whose open failed answers
         `degraded` and no-ops every verb.
 
-        `conversation` is the identity a framework RUN already carries — its
-        group id — handed in at the open so that every child unit opened
-        under the run inherits it, the way a session the parentage issued one
-        for would. It reaches the ambient a pin installs too, but NOT the
-        wire spans issued under that pin: the byte seam latches only the span
-        context at request time (`_interceptors/_seam.py::_latched`), so a
-        wire `chat` span under the run carries no conversation yet. Only this
-        opener takes it: a run is where a framework states a conversation,
-        and a nested `enter()` inherits its parent's.
+        `conversation` is the identity a framework RUN already carries — its group id, its thread
+        id — handed in at the open so that every child unit opened under the run inherits it, the
+        way a session the parentage issued one for would. It reaches the ambient a pin installs
+        too, but NOT the wire spans issued under that pin: the byte seam latches only the span
+        context at request time (`_interceptors/_seam.py::_latched`), so a wire `chat` span under
+        the run carries no conversation yet. `enter()` takes it for a run opened as a scope; a
+        nested `enter()` given none inherits its parent's.
         """
         unit = None
         handle = None

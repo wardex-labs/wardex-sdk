@@ -63,6 +63,14 @@ All notable changes to this project are documented here. The format follows
 
 ### Changed
 
+- **Claude Agent SDK turns are numbered from 1.**
+  `wardex.conversation.turn_index` counted the assistant messages of a session
+  from 0, and 0 is proto3's "unset": the first turn left the process with no
+  turn attribute at all, and on the envelope it was stored exactly like a span
+  that carries no turn. Every turn now has a number — the first is 1 — and a
+  stored 0 means only "this span has no turn". **Every existing value moves up
+  by one.** What a "turn" counts is unchanged: one per assistant message of the
+  session, sub-agent messages included.
 - **`api_key` is the wardex project key and is no longer sent to OTLP
   collectors.** It used to ride as `Authorization: Bearer` on the OTLP
   exporter's requests; a credential that names a wardex project must never
@@ -148,6 +156,19 @@ All notable changes to this project are documented here. The format follows
   was missing from the OTLP export, so a backend could not tell an observed
   span from a reconstructed one. It is the string array
   `wardex.capture_sources` now, beside `wardex.limitations`.
+- **A LangGraph run's `thread_id` is its conversation.** `thread_id` is what a
+  host hands LangGraph to continue one chat, and the adapter read it — a
+  resumed run is linked to its predecessor by it — yet recorded it only as
+  `wardex.langgraph.thread_id`. A host that had already said which
+  conversation a run belongs to shipped spans with no conversation id, and a
+  backend grouping by `gen_ai.conversation.id` put every LangGraph run in one
+  unnamed bucket. The run and every span under it now carry it; the
+  `wardex.langgraph.thread_id` attribute stays. The host's own
+  `wardex.conversation(...)` wins, exactly as it does over an OpenAI Agents
+  `group_id` — the two adapters now share one implementation of that rule —
+  and the shadowing is counted as
+  `adapters.langgraph.thread_id_shadowed_by_host`. A run given no `thread_id`
+  carries no conversation: wardex does not mint one.
 - **A span field can no longer go missing from the wire unnoticed.**
   `test_span_field_coverage.py` builds a span with a sentinel in every
   `InternalSpan` field, round-trips it through the real encoder, and looks for

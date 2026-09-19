@@ -96,6 +96,7 @@ from inspect import isasyncgenfunction, isgeneratorfunction, signature
 from typing import Any
 
 from .._assembly import (
+    ConversationContext,
     Limitation,
     LinkReason,
     SpanIntent,
@@ -107,6 +108,7 @@ from .._assembly import (
 from .._enums import ToolExecutionType, ToolType
 from ._base import AdapterInterface
 from ._context import AdapterContext, Fallback, Placement, Scope
+from ._conversation import framework_conversation
 from ._langgraph_links import _node_links, _record_graph_nodes
 from ._payload import _shaped_args
 
@@ -115,17 +117,14 @@ _FRAMEWORK = "langgraph"
 
 # -- surface probes ------------------------------------------------------
 #
-# Three groups, probed and declined independently. Group 2 because
-# `langgraph/prebuilt/*` ships in a separately versioned distribution:
-# `langgraph_prebuilt-1.1.0` owns all eight of those files and
-# `langgraph-1.2.10` owns none of them. Group 3 because
-# `langgraph.pregel.remote` hard-imports the platform client (`langgraph_sdk`)
-# and is only worth touching on hosts that can construct a `RemoteGraph` at
-# all. The run and node seams can install while either other group declines.
+# Three groups, probed and declined independently. Group 2 because `langgraph/prebuilt/*` ships in a
+# separately versioned distribution: `langgraph_prebuilt-1.1.0` owns all eight of those files and
+# `langgraph-1.2.10` owns none of them. Group 3 because `langgraph.pregel.remote` hard-imports the
+# platform client (`langgraph_sdk`) and is only worth touching on hosts that can construct a
+# `RemoteGraph` at all. The run and node seams can install while either other group declines.
 #
-# No version parsing anywhere. The attribute set IS the version floor, which is
-# the only spelling that stays true when a release moves a symbol without
-# moving its number.
+# No version parsing anywhere. The attribute set IS the version floor, which is the only spelling
+# that stays true when a release moves a symbol without moving its number.
 
 
 def _surface_ok(pregel_mod: Any, runner_mod: Any, task_cls: Any) -> bool:
@@ -201,12 +200,11 @@ def _remote_surface_ok(remote_cls: Any) -> bool:
 # between releases then costs the whole span, loudly, instead of shipping one
 # that reads `status=OK` with an arbitrary suffix of its markers missing.
 #
-# And each one is SPLIT — the mandatory typed field and the two fixed keys
-# first, then everything optional inside its own nested guard. If `describe`
-# raises, `enter` abandons the unit and the host's body runs with nothing
-# ambient, so `sole_live` finds no live run and every node underneath orphans
-# at confidence 0.0. An optional enrichment key can therefore cost the entire
-# run's tree, which is a much larger blast radius than the missing key.
+# And each one is SPLIT — the mandatory typed field and the two fixed keys first, then everything
+# optional inside its own nested guard. If `describe` raises, `enter` abandons the unit and the
+# host's body runs with nothing ambient, so `sole_live` finds no live run and every node underneath
+# orphans at confidence 0.0. An optional enrichment key can therefore cost the entire run's tree,
+# which is a much larger blast radius than the missing key.
 
 
 #: What LangGraph itself calls a graph the user did not name
@@ -245,6 +243,12 @@ def _configurable(args: tuple[Any, ...], kwargs: dict[str, Any]) -> dict[str, An
     return conf if type(conf) is dict else {}
 
 
+def _conversation_of(ctx: AdapterContext, args: Any, kwargs: Any) -> ConversationContext | None:
+    """`thread_id` continues one chat, so it IS the conversation; see `framework_conversation`."""
+    thread_id = _configurable(args, kwargs).get("thread_id")
+    return framework_conversation(ctx, thread_id, shadowed_counter="thread_id_shadowed_by_host")[0]
+
+
 def _describe_run(adapter: Any, graph: Any, args: Any, kwargs: Any, run: Scope) -> None:
     """MANDATORY half first, OPTIONAL half under its own guard.
 
@@ -271,19 +275,16 @@ def _describe_run(adapter: Any, graph: Any, args: Any, kwargs: Any, run: Scope) 
         if isinstance(thread_id, str | int):
             run.draft.set_extra("wardex.langgraph.thread_id", thread_id)
             key = UnitKey("langgraph.thread_id", str(thread_id))
-            # ORDER IS LOAD-BEARING: link FIRST, alias AFTER. Aliased first,
-            # live-first resolution would answer this very run — the self-link
-            # guard would refuse AND (being `expected=False`) stay silent, so
-            # a healthy resume would lose its link. Linked first, the selector
-            # resolves the PREDECESSOR: live if a same-thread run is still
-            # streaming (the alias is bound and thread-state continuity is
-            # real), else from the closed-unit memory. The alias then hands
-            # the thread to the NEXT run. `expected=False` because a first
-            # run on a thread and a cross-process resume are indistinguishable
-            # at this seam — counting every fresh thread would fabricate a
-            # loss the adapter cannot attest. Cross-process resume stays the
-            # documented boundary: nothing persists an identity across
-            # processes.
+            # ORDER IS LOAD-BEARING: link FIRST, alias AFTER. Aliased first, live-first resolution
+            # would answer this very run — the self-link guard would refuse AND (being
+            # `expected=False`) stay silent, so a healthy resume would lose its link. Linked first,
+            # the selector resolves the PREDECESSOR: live if a same-thread run is still streaming
+            # (the alias is bound and thread-state continuity is real), else from the closed-unit
+            # memory. The alias then hands the thread to the NEXT run. `expected=False` because a
+            # first run on a thread and a cross-process resume are indistinguishable at this seam —
+            # counting every fresh thread would fabricate a loss the adapter cannot attest.
+            # Cross-process resume stays the documented boundary: nothing persists an identity
+            # across processes.
             run.link(LinkReason.RESUMED_FROM, key, expected=False)
             run.alias(key, remember=True)
     with adapter._ctx.guard("describe_run_nodes"):
@@ -526,9 +527,10 @@ def _mk_stream(
         if ctx is None:
             return (yield from original(self, *args, **kwargs))
         ctx.confirm_active(site)
-        subject = None
+        subject = conversation = None
         with ctx.guard(prologue):
             subject = _graph_name(self)
+            conversation = _conversation_of(ctx, args, kwargs)
         describe = partial(describe_fn, adapter, self, args, kwargs)
         carrier = threading.current_thread()
         try:
@@ -537,23 +539,21 @@ def _mk_stream(
                 intent=SpanIntent.INVOKE_WORKFLOW,
                 placement=Placement.ROOT,
                 subject=subject,
+                conversation=conversation,
                 describe=describe,
             ):
                 return (yield from original(self, *args, **kwargs))
         finally:
-            # `enter` in a generator installs the run on the carrier that pumps
-            # the FIRST `next()` and can only take it down when the generator is
-            # FINALIZED, on the carrier that finalizes it. These two counters are
-            # the only handle an operator has on the two shapes where that does
-            # not happen: `finalized` against the site's `active.*` counter
-            # counts streams the host never finished — whose scope is still
-            # standing — and the second counts the ones finalized somewhere
-            # else. A counter rather than a marker because a marker can only be
-            # attached to a span, and in the never-finalized shape the span
-            # never ships.
+            # `enter` in a generator installs the run on the carrier that pumps the FIRST `next()`
+            # and can only take it down when the generator is FINALIZED, on the carrier that
+            # finalizes it. These two counters are the only handle an operator has on the two shapes
+            # where that does not happen: `finalized` against the site's `active.*` counter counts
+            # streams the host never finished — whose scope is still standing — and the second
+            # counts the ones finalized somewhere else. A counter rather than a marker because a
+            # marker can only be attached to a span, and in the never-finalized shape the span never
+            # ships.
             #
-            # Both live OUTSIDE the `enter` body, so C-S6's `Return` case is
-            # untouched.
+            # Both live OUTSIDE the `enter` body, so C-S6's `Return` case is untouched.
             ctx.count(finalized)
             if carrier is not threading.current_thread():
                 ctx.count(off_carrier)
@@ -594,9 +594,10 @@ def _mk_astream(
                 yield chunk
             return
         ctx.confirm_active(site)
-        subject = None
+        subject = conversation = None
         with ctx.guard(prologue):
             subject = _graph_name(self)
+            conversation = _conversation_of(ctx, args, kwargs)
         describe = partial(describe_fn, adapter, self, args, kwargs)
         carrier = asyncio.current_task()
         try:
@@ -605,14 +606,14 @@ def _mk_astream(
                 intent=SpanIntent.INVOKE_WORKFLOW,
                 placement=Placement.ROOT,
                 subject=subject,
+                conversation=conversation,
                 describe=describe,
             ):
                 async for chunk in original(self, *args, **kwargs):
                     yield chunk
         finally:
-            # An abandoned async generator is finalized by the LOOP, on its own
-            # finalizer task, so this counter fires on the ORDINARY abandon
-            # rather than on a corner case.
+            # An abandoned async generator is finalized by the LOOP, on its own finalizer task, so
+            # this counter fires on the ORDINARY abandon rather than on a corner case.
             ctx.count(finalized)
             if carrier is not asyncio.current_task():
                 ctx.count(off_carrier)
@@ -647,11 +648,10 @@ def _mk_run_with_retry(
             name = task.name
         if name is None or name == start:  # `__start__` is a real task on every fresh run
             return original(task, retry_policy, *args, **kwargs)
-        # BELOW the filter, deliberately: above it the site counts tasks that
-        # reached the seam, which is `nodes + 1` on a fresh run and `nodes` on a
-        # resumed one — a number with no stable relation to anything. Below it
-        # the counter is exactly "node spans this seam opened", which is what
-        # makes it assertable against `len(steps)` on every workload.
+        # BELOW the filter, deliberately: above it the site counts tasks that reached the seam,
+        # which is `nodes + 1` on a fresh run and `nodes` on a resumed one — a number with no stable
+        # relation to anything. Below it the counter is exactly "node spans this seam opened", which
+        # is what makes it assertable against `len(steps)` on every workload.
         ctx.confirm_active("runner.run_with_retry")
         describe = partial(_describe_node, adapter, task)
         with ctx.enter(
