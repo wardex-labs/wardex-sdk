@@ -271,7 +271,6 @@ class SpanDraft:
         "_call_site",
         "_conversation",
         "_correlation",
-        "_cost_usd",
         "_embeddings",
         "_emitted",
         "_end_ns",
@@ -336,7 +335,6 @@ class SpanDraft:
         self._conversation: ConversationContext | None = parentage.conversation
         self._correlation: CorrelationInfo | None = parentage.correlation
         self._call_site: CallSite | None = None
-        self._cost_usd: float | None = None
         self._workflow_name: str | None = None
         self._server_address: str | None = None
         self._server_port: int | None = None
@@ -478,9 +476,6 @@ class SpanDraft:
 
     def set_workflow_name(self, name: str | None) -> None:
         self._workflow_name = name
-
-    def set_cost_usd(self, cost: float | None) -> None:
-        self._cost_usd = cost
 
     def set_server(self, address: str | None, port: int | None) -> None:
         self._server_address = address
@@ -747,7 +742,6 @@ class SpanDraft:
             retrieval=self._retrieval,
             embeddings=self._embeddings,
             evaluation=self._evaluation,
-            cost_usd=self._cost_usd,
             conversation=self._conversation,
             call_site=self._call_site,
             error_type=self._error_type,
@@ -896,7 +890,6 @@ class _NullDraft:
     def set_conversation(self, conv: ConversationContext | None) -> None: ...
     def set_call_site(self, call_site: CallSite | None) -> None: ...
     def set_workflow_name(self, name: str | None) -> None: ...
-    def set_cost_usd(self, cost: float | None) -> None: ...
     def set_server(self, address: str | None, port: int | None) -> None: ...
     def set_io(self, **kw: Any) -> None: ...
     def set_end_ns(self, end_ns: int) -> None: ...

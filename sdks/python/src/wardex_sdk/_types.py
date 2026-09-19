@@ -346,11 +346,10 @@ class InternalSpan:
     retrieval: RetrievalAttributes | None = None  # new (RAG)
     embeddings: EmbeddingsAttributes | None = None  # new
     evaluation: EvaluationAttributes | None = None  # new
-    cost_usd: float | None = None
 
     # New fields aligned with OTel
     conversation: ConversationContext | None = None  # gen_ai.conversation.id (+turn)
-    call_site: CallSite | None = None  # code.filepath/lineno/function
+    call_site: CallSite | None = None  # code.file.path / line.number / function.name
     error_type: str | None = None  # error.type (required on failure)
     server_address: str | None = None  # server.address
     server_port: int | None = None  # server.port (required when address is set)

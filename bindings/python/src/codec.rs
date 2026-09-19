@@ -405,48 +405,80 @@ fn as_f64(v: &Bound<PyAny>) -> Option<f64> {
     v.str().ok()?.to_str().ok()?.trim().parse::<f64>().ok()
 }
 
-/// ConversationContext → extra KeyValue. The id always; the rest only when set.
+/// ConversationContext → `Span.conversation` (field 23), its typed home.
 ///
-/// This block was declared (`span.proto` field 23, `_types.py`'s
-/// `gen_ai.conversation.id` note, `wardex.conversation()`'s docstring) and
-/// never marshalled: neither the typed field nor an attribute left the
-/// process, so a conversation id was held in-process and dropped at export.
-/// Flattened like the agent and tool blocks, so both export surfaces carry
-/// one spelling.
+/// This block has been lost twice. First it was declared (`span.proto`
+/// field 23, `wardex.conversation()`'s docstring) and never marshalled at
+/// all. Then it was flattened into `extra` beside the agent and tool blocks,
+/// which reached an OTLP backend and left field 23 empty — and a receiver of
+/// the envelope reads field 23, so it stored every conversation id as "".
+/// The typed field is the one source now; the OTLP mapping derives
+/// `gen_ai.conversation.id` and the two `wardex.conversation.*` keys from it,
+/// so the value rides the envelope once and the two surfaces cannot disagree.
 ///
 /// The id is `str()`-ed rather than extracted: a host hands `uuid.uuid4()`
 /// or an integer session key here as naturally as a string, and the value's
 /// text is what a backend groups by either way. `turn_index` is the one
-/// field a host can plausibly set to `None`; that reads as absent.
-fn flatten_conversation(
+/// field a host can plausibly set to `None`; that reads as absent, which on
+/// the wire is 0. A turn that does not fit the field's `int32` is named as
+/// unmarshalled like any other value the block's type cannot hold.
+fn conversation_to_proto(
     c: &Bound<PyAny>,
-    out: &mut Vec<pb::KeyValue>,
     unmarshalled: &mut Vec<String>,
-) -> PyResult<()> {
-    out.push(kv_str(
-        "gen_ai.conversation.id",
-        c.getattr("conversation_id")?.str()?.to_string(),
-    ));
+) -> PyResult<pb::ConversationContext> {
+    let mut conv = pb::ConversationContext {
+        conversation_id: c.getattr("conversation_id")?.str()?.to_string(),
+        ..Default::default()
+    };
     if let Some(v) = opt(c, "session_id")? {
-        out.push(kv_str(
-            "wardex.conversation.session_id",
-            v.str()?.to_string(),
-        ));
+        conv.session_id = v.str()?.to_string();
     }
     if let Some(v) = opt(c, "turn_index")? {
-        match v.extract::<i64>() {
-            Ok(turn) if turn != 0 => out.push(kv_int("wardex.conversation.turn_index", turn)),
-            Ok(_) => {}
-            Err(_) => unmarshalled.push("wardex.conversation.turn_index".into()),
+        match v.extract::<i64>().ok().and_then(|t| i32::try_from(t).ok()) {
+            Some(turn) => conv.turn_index = turn,
+            None => unmarshalled.push("wardex.conversation.turn_index".into()),
         }
     }
-    Ok(())
+    Ok(conv)
+}
+
+/// CallSite → `Span.call_site` (field 22), its typed home.
+///
+/// Declared in the schema, filled by the tracing decorator and settable by a
+/// host through `Span.call_site`, read by a receiver of the envelope — and
+/// never written here, so a location the host was told it could record left
+/// the process nowhere. The values are the host's own, so each is read
+/// tolerantly: one the field's type cannot hold is named as unmarshalled
+/// under the attribute the OTLP mapping would have given it, and the rest of
+/// the location still ships.
+fn call_site_to_proto(c: &Bound<PyAny>, unmarshalled: &mut Vec<String>) -> PyResult<pb::CallSite> {
+    let mut site = pb::CallSite::default();
+    for (attr, key, slot) in [
+        ("file", "code.file.path", &mut site.file),
+        ("function", "code.function.name", &mut site.function),
+        ("module", "code.function.name", &mut site.module),
+    ] {
+        if let Some(v) = opt(c, attr)? {
+            match v.extract::<String>() {
+                Ok(s) => *slot = s,
+                Err(_) => unmarshalled.push(key.into()),
+            }
+        }
+    }
+    if let Some(v) = opt(c, "line")? {
+        match v.extract::<i64>().ok().and_then(|n| i32::try_from(n).ok()) {
+            Some(line) => site.line = line,
+            None => unmarshalled.push("code.line.number".into()),
+        }
+    }
+    Ok(site)
 }
 
 /// EvaluationAttributes → extra KeyValue (semconv `gen_ai.evaluation.*`).
 /// Only populated fields. This block had the same omission as the
-/// conversation block above — declared, set by adapters, never marshalled —
-/// until both were flattened together. `score_value` accepts what `float()`
+/// conversation block above — declared, set by adapters, never marshalled.
+/// It has no typed field in the schema, so `extra` is its one home.
+/// `score_value` accepts what `float()`
 /// would; anything else is omitted and named under `UNMARSHALLED_FIELD_KEY`.
 fn flatten_evaluation(
     e: &Bound<PyAny>,
@@ -786,8 +818,9 @@ fn span_head_to_proto(sp: &Bound<PyAny>) -> PyResult<pb::Span> {
     Ok(span)
 }
 
-/// The host-facing typed blocks (`gen_ai`, `agent`, `tool`, `embeddings`,
-/// `retrieval`, `conversation`, `evaluation`), flattened into `extra`: the
+/// The host-facing typed blocks: `gen_ai`, `agent`, `tool`, `embeddings`,
+/// `retrieval` and `evaluation` flattened into `extra`, `conversation` and
+/// `call_site` written to the typed fields the schema declares for them. The
 /// one step whose failure `envelope_to_proto` may turn into a skipped span,
 /// because every value read here was written by the host.
 fn flatten_typed_blocks(sp: &Bound<PyAny>, span: &mut pb::Span) -> PyResult<()> {
@@ -813,12 +846,21 @@ fn flatten_typed_blocks(sp: &Bound<PyAny>, span: &mut pb::Span) -> PyResult<()> 
     // limitation-marker channel in this codebase and the census reads every
     // such declaration as one; these are attribute names, not markers.
     let mut unmarshalled: Vec<String> = Vec::new();
+    // The two host-facing blocks the schema gives a typed field of their own.
+    // They are written THERE and nowhere else: a value with two homes on one
+    // envelope is a value whose readers can each pick a different one.
     if let Some(c) = opt(sp, "conversation")? {
-        flatten_conversation(&c, &mut span.extra, &mut unmarshalled)?;
+        span.conversation = Some(conversation_to_proto(&c, &mut unmarshalled)?);
+    }
+    if let Some(c) = opt(sp, "call_site")? {
+        span.call_site = Some(call_site_to_proto(&c, &mut unmarshalled)?);
     }
     if let Some(e) = opt(sp, "evaluation")? {
         flatten_evaluation(&e, &mut span.extra, &mut unmarshalled)?;
     }
+    // `function` and `module` compose one attribute, so both failing names it
+    // twice in a row.
+    unmarshalled.dedup();
     if !unmarshalled.is_empty() {
         span.extra
             .push(kv_str(UNMARSHALLED_FIELD_KEY, unmarshalled.join(",")));
@@ -1072,6 +1114,25 @@ fn span_to_dict(py: Python<'_>, sp: &pb::Span) -> PyResult<PyObject> {
     d.set_item("server_address", &sp.server_address)?;
     d.set_item("server_port", sp.server_port)?;
     d.set_item("workflow_name", &sp.workflow_name)?;
+    // Present only when the sender set the message, like `transport` below:
+    // a span that was never given a conversation decodes without the key
+    // rather than with a dict of empty strings a reader would have to tell
+    // apart from one.
+    if let Some(c) = &sp.conversation {
+        let cd = PyDict::new_bound(py);
+        cd.set_item("conversation_id", &c.conversation_id)?;
+        cd.set_item("session_id", &c.session_id)?;
+        cd.set_item("turn_index", c.turn_index)?;
+        d.set_item("conversation", cd)?;
+    }
+    if let Some(c) = &sp.call_site {
+        let cd = PyDict::new_bound(py);
+        cd.set_item("file", &c.file)?;
+        cd.set_item("line", c.line)?;
+        cd.set_item("function", &c.function)?;
+        cd.set_item("module", &c.module)?;
+        d.set_item("call_site", cd)?;
+    }
     d.set_item("input_data", PyBytes::new_bound(py, &sp.input_data))?;
     d.set_item("output_data", PyBytes::new_bound(py, &sp.output_data))?;
     d.set_item("capture_sources", sp.capture_sources.clone())?;

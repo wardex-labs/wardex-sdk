@@ -260,6 +260,78 @@ def test_conversation_and_evaluation_blocks_reach_the_otlp_attributes():
     assert attrs["gen_ai.evaluation.score.label"] == "tripwire"
 
 
+def test_the_conversation_keys_keep_their_spelling_and_their_omission_rules():
+    """The conversation moved from `extra` to its typed envelope field, and an
+    OTLP backend must not be able to tell: the same three keys, the session id
+    only when set, the turn only when non-zero. The mapping derives them from
+    the typed field now, so this is the test that fails if it stops."""
+    from wardex_sdk._types import ConversationContext
+
+    def attrs_of(conv: ConversationContext) -> dict:
+        return _first_span(Envelope(header=_header(), spans=(_span(conversation=conv),)))[
+            "attributes"
+        ]
+
+    bare = attrs_of(ConversationContext(conversation_id="conv-123"))
+    assert bare["gen_ai.conversation.id"] == "conv-123"
+    assert not any(k.startswith("wardex.conversation.") for k in bare)
+
+    full = attrs_of(
+        ConversationContext(conversation_id="conv-123", session_id="sess-1", turn_index=3)
+    )
+    assert full["gen_ai.conversation.id"] == "conv-123"
+    assert full["wardex.conversation.session_id"] == "sess-1"
+    assert full["wardex.conversation.turn_index"] == 3
+
+
+def test_a_conversation_key_the_host_wrote_by_hand_is_not_doubled():
+    """`extra` is the host's. One that spelled `gen_ai.conversation.id` there
+    keeps its value and the attribute appears once — an OTLP decoder keeps one
+    of a duplicated key, and which one is the backend's choice."""
+    from wardex_sdk._types import ConversationContext
+
+    span = _span(
+        conversation=ConversationContext(conversation_id="typed"),
+        extra=(("gen_ai.conversation.id", "host-said"),),
+    )
+    data = _wardex_native.codec.encode_otlp_traces(Envelope(header=_header(), spans=(span,)))
+    assert data.count(b"gen_ai.conversation.id") == 1
+    assert (
+        _first_span(Envelope(header=_header(), spans=(span,)))["attributes"][
+            "gen_ai.conversation.id"
+        ]
+        == "host-said"
+    )
+
+
+def test_capture_sources_reach_the_otlp_attributes_by_name():
+    """How a span was captured — an adapter's hook, wire bytes, a bridge — is
+    the same grade of fact as `wardex.limitations`, and the envelope carried
+    it while this export dropped it: an OTLP backend could not tell an
+    observed span from a reconstructed one."""
+    from wardex_sdk._enums import CaptureSource
+
+    span = _span(capture_sources=(CaptureSource.ADAPTER, CaptureSource.SSL))
+    attrs = _first_span(Envelope(header=_header(), spans=(span,)))["attributes"]
+    assert attrs["wardex.capture_sources"] == ["adapter", "ssl"]
+
+
+def test_the_call_site_reaches_the_otlp_attributes_under_the_stable_code_names():
+    """semconv's stable spellings, with the module composed into the function
+    name the way `code.function.name` is defined: fully qualified."""
+    from wardex_sdk._types import CallSite
+
+    span = _span(
+        call_site=CallSite(
+            file="/app/booking.py", line=42, function="reserve", module="app.booking"
+        )
+    )
+    attrs = _first_span(Envelope(header=_header(), spans=(span,)))["attributes"]
+    assert attrs["code.file.path"] == "/app/booking.py"
+    assert attrs["code.line.number"] == 42
+    assert attrs["code.function.name"] == "app.booking.reserve"
+
+
 def test_cache_and_reasoning_tokens_ship_under_the_semconv_dot_spellings():
     """The dataclass fields keep their snake_case names; only the wire key
     moved to semconv's dot spellings (defined since semconv 1.40.0)."""

@@ -120,6 +120,41 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- **A conversation id now reaches the wardex receiver.** The envelope encoder
+  wrote `ConversationContext` into `extra` (`gen_ai.conversation.id`,
+  `wardex.conversation.session_id`, `wardex.conversation.turn_index`) and left
+  `Span.conversation`, the typed field the schema declares for it, empty. An
+  OTLP backend saw the id; a receiver of the envelope reads the typed field, so
+  every span sent through `WardexTransport` was stored with an empty
+  conversation id. The typed field is the one home now, and the OTLP export
+  derives the same three attributes from it — same spelling, same omission
+  rules (the session id only when set, the turn only when non-zero) — so an
+  OTLP backend sees no difference. A host that writes
+  `gen_ai.conversation.id` into `extra` by hand keeps its value and the
+  attribute appears once.
+- **`Span.call_site` is exported.** The location the `@wardex.workflow`,
+  `@wardex.agent`, `@wardex.tool` and `@wardex.step` decorators record, and
+  the one a host sets through `Span.call_site`, was accepted and then dropped
+  at export: no typed field, no attribute. It now rides `Span.call_site` on the
+  envelope and semconv's stable `code.file.path`, `code.line.number` and
+  `code.function.name` on OTLP, with the module composed into the function
+  name as that attribute is defined. **This sends the path of the decorated
+  function's source file** — `code.co_filename`, usually absolute — to your
+  backend, which the SDK did not do before. A value `CallSite`'s fields cannot
+  hold is named under `wardex.codec.unmarshalled` and the rest of the span
+  ships.
+- **How a span was captured reaches an OTLP backend.** `capture_sources` — an
+  adapter's hook, wire bytes, a bridge — has always been on the envelope and
+  was missing from the OTLP export, so a backend could not tell an observed
+  span from a reconstructed one. It is the string array
+  `wardex.capture_sources` now, beside `wardex.limitations`.
+- **A span field can no longer go missing from the wire unnoticed.**
+  `test_span_field_coverage.py` builds a span with a sentinel in every
+  `InternalSpan` field, round-trips it through the real encoder, and looks for
+  each sentinel in that field's home. The three fixes above are what it found;
+  the fourth was `InternalSpan.cost_usd`, which nothing set and nothing
+  encoded, and which is deleted rather than excused (the cost the Claude CLI
+  reports still ships as `wardex.agent.cost_usd`).
 - **Every `chat` and stream-reconstructed `execute_tool` span of one Claude
   Agent SDK run no longer starts at the moment the prompt was written.** The
   assembler kept one turn start per session, set only when the host wrote a

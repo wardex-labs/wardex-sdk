@@ -294,7 +294,7 @@ _OVERSIZED_BUDGET = {
     # provider_inferred (54) paid for its docstring by rewrapping two
     # sections' docstrings to the line length, words unchanged.
     "_assembly/_integrity.py": 1083,
-    "_assembly/_builder.py": 970,
+    "_assembly/_builder.py": 963,
     "_adapters/_anthropic_agent_sdk.py": 944,
 }
 
