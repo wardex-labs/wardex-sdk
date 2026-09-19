@@ -53,8 +53,9 @@ All notable changes to this project are documented here. The format follows
   purpose: one API key names one project, so the receiver stamps the project
   from the key it authenticated rather than trusting a claim from the sender.
   This is a deliberate wire break, made while no envelope has ever been
-  stored (the OTLP export path never used this encoder), and `buf.yaml`
-  records the exception so the next attempt fails the build instead.
+  stored (the OTLP export path never used this encoder). The `buf.yaml`
+  exception that let it through was removed right after it landed, so
+  `buf breaking` fails the build on any further field deletion.
   `EnvelopeHeader(...)` is internal; a hand-built header that passed
   `api_key=` now raises `TypeError`.
 

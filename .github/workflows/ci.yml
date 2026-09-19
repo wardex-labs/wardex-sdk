@@ -47,6 +47,13 @@ jobs:
       # landing it requires an explicit `ignore_only` entry in `buf.yaml` in the
       # same commit, rather than an accident nobody notices.
       #
+      # That entry comes out again in the first change after the break lands.
+      # `ignore_only` excuses a whole file, not one field, and once the baseline
+      # contains the break there is nothing left to excuse: an entry left behind
+      # only switches this step off for every later deletion in that file
+      # (measured: with a stale entry, deleting any `envelope.proto` field exits
+      # 0; without it, the same deletion exits 100).
+      #
       # The baseline is the state the branch had BEFORE this event, NOT `HEAD~1`.
       # `HEAD~1` is correct only when the event carries exactly one commit: for a
       # push of A..B it compares B against A, so a break introduced in A is
