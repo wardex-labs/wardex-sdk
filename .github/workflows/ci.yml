@@ -80,6 +80,22 @@ jobs:
             exit 0
           fi
           buf breaking --against ".git#format=git,ref=$BUF_BREAKING_BASE"
+      # The step above cannot see an exception that stayed in `buf.yaml` after
+      # its break landed: a stale entry makes it pass, which is the whole
+      # problem. This one runs the same comparison with the exceptions stripped
+      # and fails if that still passes, so "the entry comes out in the next
+      # change" is enforced by the next change's own CI run, not by a reader
+      # remembering the comment.
+      - name: buf breaking exceptions are not stale
+        env:
+          BUF_BREAKING_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          if [ -z "$BUF_BREAKING_BASE" ] || \
+             [ "$BUF_BREAKING_BASE" = "0000000000000000000000000000000000000000" ]; then
+            echo "no baseline for this event (first push of a branch); nothing to compare against"
+            exit 0
+          fi
+          scripts/check-buf-exceptions.sh ".git#format=git,ref=$BUF_BREAKING_BASE"
 
       # The quality budgets, printed into the run log so anyone reading a public
       # CI run can recover the numbers behind the claims in README.md without a
