@@ -135,11 +135,14 @@ All notable changes to this project are documented here. The format follows
   OTLP backend saw the id; a receiver of the envelope reads the typed field, so
   every span sent through `WardexTransport` was stored with an empty
   conversation id. The typed field is the one home now, and the OTLP export
-  derives the same three attributes from it — same spelling, same omission
-  rules (the session id only when set, the turn only when non-zero) — so an
-  OTLP backend sees no difference. A host that writes
-  `gen_ai.conversation.id` into `extra` by hand keeps its value and the
-  attribute appears once.
+  derives the same three attributes from it, spelled as before. What an OTLP
+  backend can see change is at the edges, where the typed field is stricter
+  than a free-form attribute was: an empty `session_id` is no longer emitted
+  as `""` (proto3 cannot tell it from unset), a `turn_index` that does not fit
+  an `int32` is left out and named under `wardex.codec.unmarshalled` instead
+  of shipped, and a host that also writes `gen_ai.conversation.id` into
+  `extra` by hand now gets the typed value, once — so OTLP and the envelope
+  say the same thing about one span — where it used to get the key twice.
 - **`Span.call_site` is exported.** The location the `@wardex.workflow`,
   `@wardex.agent`, `@wardex.tool` and `@wardex.step` decorators record, and
   the one a host sets through `Span.call_site`, was accepted and then dropped
@@ -148,9 +151,11 @@ All notable changes to this project are documented here. The format follows
   `code.function.name` on OTLP, with the module composed into the function
   name as that attribute is defined. **This sends the path of the decorated
   function's source file** — `code.co_filename`, usually absolute — to your
-  backend, which the SDK did not do before. A value `CallSite`'s fields cannot
-  hold is named under `wardex.codec.unmarshalled` and the rest of the span
-  ships.
+  backend, which the SDK did not do before; it goes through the masking
+  policy like any other exported value. `Span.call_site` validates nothing, so
+  what arrives may not be a `CallSite` at all: a value a field cannot hold —
+  or a tuple where the object was expected — is named under
+  `wardex.codec.unmarshalled` and the span, and its batch, still ship.
 - **How a span was captured reaches an OTLP backend.** `capture_sources` — an
   adapter's hook, wire bytes, a bridge — has always been on the envelope and
   was missing from the OTLP export, so a backend could not tell an observed
@@ -166,16 +171,24 @@ All notable changes to this project are documented here. The format follows
   `wardex.langgraph.thread_id` attribute stays. The host's own
   `wardex.conversation(...)` wins, exactly as it does over an OpenAI Agents
   `group_id` — the two adapters now share one implementation of that rule —
-  and the shadowing is counted as
-  `adapters.langgraph.thread_id_shadowed_by_host`. A run given no `thread_id`
-  carries no conversation: wardex does not mint one.
-- **A span field can no longer go missing from the wire unnoticed.**
-  `test_span_field_coverage.py` builds a span with a sentinel in every
-  `InternalSpan` field, round-trips it through the real encoder, and looks for
-  each sentinel in that field's home. The three fixes above are what it found;
-  the fourth was `InternalSpan.cost_usd`, which nothing set and nothing
-  encoded, and which is deleted rather than excused (the cost the Claude CLI
-  reports still ships as `wardex.agent.cost_usd`). Beside it,
+  including for a subgraph run nested under it, and the shadowing is counted
+  as `adapters.langgraph.thread_id_shadowed_by_host`. A `thread_id` that is
+  not a string — an integer, a `uuid.UUID` — is carried as its text. A run
+  given no `thread_id` carries no conversation: wardex does not mint one. One
+  gap is pinned rather than closed: a host conversation opened INSIDE a node
+  does not reach a subgraph run called from that node, which inherits the
+  outer run's thread instead.
+- **A top-level span field can no longer go missing from the envelope
+  unnoticed.** `test_span_field_coverage.py` builds a span with a sentinel in
+  every `InternalSpan` field, round-trips it through the real encoder, and
+  looks for each sentinel in that field's home. Against the previous encoder
+  it fails on `conversation`, on `call_site`, and on `cost_usd` — a field
+  nothing set and nothing encoded, which is deleted rather than excused (the
+  cost the Claude CLI reports still ships as `wardex.agent.cost_usd`). Its
+  reach is stated in the file: it checks one value per top-level field on the
+  envelope, so a SUB-field of a block, or a field present on the envelope and
+  missing only from OTLP — which is what `capture_sources` was — is outside
+  it. Beside it,
   `test_adapter_envelopes.py` drives each of the three adapters, encodes what
   it emitted with the real encoder, and checks that the conversation id the
   host or the framework stated is in the typed field of every span the adapter

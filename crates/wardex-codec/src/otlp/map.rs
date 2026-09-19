@@ -204,7 +204,7 @@ fn uncertainty(sp: &pb::Span, attrs: &mut Vec<otlp_pb::common::KeyValue>) {
         .filter(|name| !name.is_empty())
         .collect();
     if !sources.is_empty() {
-        attrs.push(kv_strs("wardex.capture_sources", sources));
+        set_attr(attrs, kv_strs("wardex.capture_sources", sources));
     }
     if let Some(c) = &sp.correlation {
         // Zero is "no parent source recorded", not a source: naming it would
@@ -268,26 +268,29 @@ fn uncertainty(sp: &pb::Span, attrs: &mut Vec<otlp_pb::common::KeyValue>) {
     }
 }
 
-/// Push `kv` unless `attrs` already carries its key.
+/// Set `kv`, REPLACING a same-keyed attribute rather than sitting beside it.
 ///
-/// The typed fields below are the sender's one home for their values, but
-/// `extra` is the host's to write: a host that put `gen_ai.conversation.id`
-/// there by hand must not end up with the key twice, because an OTLP decoder
-/// keeps one of a duplicated key and which one is the backend's choice. The
-/// host's spelling was pushed first and stays.
-fn push_absent(attrs: &mut Vec<otlp_pb::common::KeyValue>, kv: otlp_pb::common::KeyValue) {
-    if !attrs.iter().any(|have| have.key == kv.key) {
-        attrs.push(kv);
-    }
+/// The typed fields below are the sender's one home for their values, and a
+/// receiver of the envelope reads them there. `extra` is the host's to write,
+/// so a host can have spelled `gen_ai.conversation.id` into it by hand — and
+/// then two rules collide. Left in place it would be a duplicated key, of
+/// which an OTLP decoder keeps one, the backend's choice which. Allowed to win
+/// it would make the two export surfaces disagree about one span: the envelope
+/// says the typed value, OTLP says the host's. The typed value wins on both,
+/// once.
+fn set_attr(attrs: &mut Vec<otlp_pb::common::KeyValue>, kv: otlp_pb::common::KeyValue) {
+    attrs.retain(|have| have.key != kv.key);
+    attrs.push(kv);
 }
 
 /// `Span.conversation` and `Span.call_site` → OTLP span attributes.
 ///
 /// Both are typed fields on the envelope and the only place the sender writes
 /// them, so this projection is what an OTLP backend sees of either. The
-/// conversation keys and their omission rules are the ones the sender used
-/// when it flattened the block itself: the id whenever there is a block, the
-/// session id when set, the turn when non-zero, zero being proto3's "unset".
+/// conversation keys are the ones the sender used when it flattened the block
+/// itself, and each is emitted when the typed field holds something: proto3
+/// cannot tell an empty string or a zero from "unset", so an empty id, an
+/// empty session id and a turn of 0 emit nothing.
 ///
 /// The call site takes semconv's stable `code.*` names. `code.function.name`
 /// is defined as FULLY QUALIFIED, with the namespace inside it rather than
@@ -296,16 +299,16 @@ fn push_absent(attrs: &mut Vec<otlp_pb::common::KeyValue>, kv: otlp_pb::common::
 fn typed_blocks(sp: &pb::Span, attrs: &mut Vec<otlp_pb::common::KeyValue>) {
     if let Some(c) = &sp.conversation {
         if !c.conversation_id.is_empty() {
-            push_absent(attrs, kv_str("gen_ai.conversation.id", &c.conversation_id));
+            set_attr(attrs, kv_str("gen_ai.conversation.id", &c.conversation_id));
         }
         if !c.session_id.is_empty() {
-            push_absent(
+            set_attr(
                 attrs,
                 kv_str("wardex.conversation.session_id", &c.session_id),
             );
         }
         if c.turn_index != 0 {
-            push_absent(
+            set_attr(
                 attrs,
                 kv_int("wardex.conversation.turn_index", c.turn_index as i64),
             );
@@ -313,10 +316,10 @@ fn typed_blocks(sp: &pb::Span, attrs: &mut Vec<otlp_pb::common::KeyValue>) {
     }
     if let Some(c) = &sp.call_site {
         if !c.file.is_empty() {
-            push_absent(attrs, kv_str("code.file.path", &c.file));
+            set_attr(attrs, kv_str("code.file.path", &c.file));
         }
         if c.line != 0 {
-            push_absent(attrs, kv_int("code.line.number", c.line as i64));
+            set_attr(attrs, kv_int("code.line.number", c.line as i64));
         }
         if !c.function.is_empty() {
             let name = if c.module.is_empty() {
@@ -324,7 +327,7 @@ fn typed_blocks(sp: &pb::Span, attrs: &mut Vec<otlp_pb::common::KeyValue>) {
             } else {
                 format!("{}.{}", c.module, c.function)
             };
-            push_absent(attrs, kv_str("code.function.name", &name));
+            set_attr(attrs, kv_str("code.function.name", &name));
         }
     }
 }
@@ -1874,24 +1877,49 @@ mod tests {
         }
     }
 
-    /// `extra` is the host's to write. A host that spelled the conversation
-    /// key there itself keeps its value and the key appears once: an OTLP
-    /// decoder keeps one of a duplicated key, and which one is its choice.
+    /// A host that spelled a typed field's key into `extra` by hand gets the
+    /// TYPED value, once: a duplicated key is the backend's coin toss, and the
+    /// host's value winning would make OTLP disagree with the envelope a
+    /// receiver reads. Found by review: `wardex.capture_sources` was pushed
+    /// bare and shipped twice.
     #[test]
-    fn a_key_the_host_already_wrote_is_not_pushed_twice() {
+    fn a_typed_value_replaces_a_same_keyed_extra_and_appears_once() {
         let sp = only_span(envelope(pb::Span {
-            extra: vec![kv_wardex("gen_ai.conversation.id", "host-said")],
+            extra: vec![
+                kv_wardex("gen_ai.conversation.id", "host-said"),
+                kv_wardex("wardex.capture_sources", "host-said"),
+                kv_wardex("code.file.path", "host-said"),
+            ],
             conversation: Some(pb::ConversationContext {
                 conversation_id: "typed".into(),
                 ..Default::default()
             }),
+            call_site: Some(pb::CallSite {
+                file: "/typed.py".into(),
+                ..Default::default()
+            }),
+            capture_sources: vec![pb::CaptureSource::Adapter as i32],
             ..Default::default()
         }));
-        assert_eq!(keys(&sp, "gen_ai.conversation.id"), 1);
+        for key in [
+            "gen_ai.conversation.id",
+            "wardex.capture_sources",
+            "code.file.path",
+        ] {
+            assert_eq!(keys(&sp, key), 1, "{key}");
+        }
         assert_eq!(
             attr(&sp, "gen_ai.conversation.id"),
-            Some(&V::StringValue("host-said".into()))
+            Some(&V::StringValue("typed".into()))
         );
+        assert_eq!(
+            attr(&sp, "code.file.path"),
+            Some(&V::StringValue("/typed.py".into()))
+        );
+        assert!(matches!(
+            attr(&sp, "wardex.capture_sources"),
+            Some(V::ArrayValue(_))
+        ));
     }
 
     #[test]

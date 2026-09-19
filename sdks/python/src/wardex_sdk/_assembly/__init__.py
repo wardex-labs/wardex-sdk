@@ -91,7 +91,7 @@ from ._units import (
     UnitKey,
     UnitKind,
     UnitRegistry,
-    ambient_owner,
+    ambient_stated_conversation,
     parent_is_closed_unit,
 )
 from ._vocab import (
@@ -136,7 +136,7 @@ __all__ = [
     "UnitKind",
     "UnitRegistry",
     "VocabularyError",
-    "ambient_owner",
+    "ambient_stated_conversation",
     "cap_at_alias_tier",
     "capture_mode_of",
     "child_of",

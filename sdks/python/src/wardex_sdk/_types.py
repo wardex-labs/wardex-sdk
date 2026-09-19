@@ -196,7 +196,12 @@ class ConversationContext:
 @dataclass(frozen=True, slots=True)
 class CallSite:
     """The host code location that created the span. A clue for Replay's 'where to call again from'.
-    Maps to OTel code.filepath/lineno/function. Cost is microseconds, no PII (code path only)."""
+
+    Exported as `Span.call_site` on the envelope and as OTel `code.file.path` /
+    `code.line.number` / `code.function.name`, the module composed into the function name.
+    `file` is whatever the code object reports — usually an absolute path, which can carry a
+    user name — and it goes through the same masking policy as every other exported value.
+    Reading it costs microseconds."""
 
     file: str
     line: int

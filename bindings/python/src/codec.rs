@@ -405,6 +405,23 @@ fn as_f64(v: &Bound<PyAny>) -> Option<f64> {
     v.str().ok()?.to_str().ok()?.trim().parse::<f64>().ok()
 }
 
+/// A host-written attribute, read so that NOTHING the host put there can raise
+/// out of the encoder: absent, `None`, or an object with no such attribute at
+/// all (a tuple where a `CallSite` was expected) all read as "not there".
+///
+/// Every read in the two typed blocks below goes through this, because
+/// `Span.call_site` and the conversation are the host's to set, and a raise
+/// here is not one span's loss. The envelope transport encodes a batch in one
+/// call, so one bad value would cost every span in it, in silence.
+fn host_attr<'py>(obj: &Bound<'py, PyAny>, name: &str) -> Option<Bound<'py, PyAny>> {
+    obj.getattr(name).ok().filter(|v| !v.is_none())
+}
+
+/// `str(v)`, or `None` when the object's own `__str__` raises.
+fn host_text(v: &Bound<PyAny>) -> Option<String> {
+    v.str().ok().map(|s| s.to_string())
+}
+
 /// ConversationContext → `Span.conversation` (field 23), its typed home.
 ///
 /// This block has been lost twice. First it was declared (`span.proto`
@@ -413,65 +430,74 @@ fn as_f64(v: &Bound<PyAny>) -> Option<f64> {
 /// which reached an OTLP backend and left field 23 empty — and a receiver of
 /// the envelope reads field 23, so it stored every conversation id as "".
 /// The typed field is the one source now; the OTLP mapping derives
-/// `gen_ai.conversation.id` and the two `wardex.conversation.*` keys from it,
-/// so the value rides the envelope once and the two surfaces cannot disagree.
+/// `gen_ai.conversation.id` and the two `wardex.conversation.*` keys from it
+/// and lets them replace a same-keyed `extra`, so the value rides the envelope
+/// once and the two surfaces carry the same one.
 ///
 /// The id is `str()`-ed rather than extracted: a host hands `uuid.uuid4()`
 /// or an integer session key here as naturally as a string, and the value's
 /// text is what a backend groups by either way. `turn_index` is the one
 /// field a host can plausibly set to `None`; that reads as absent, which on
-/// the wire is 0. A turn that does not fit the field's `int32` is named as
-/// unmarshalled like any other value the block's type cannot hold.
+/// the wire is 0. A value the field cannot hold — an id with no text, a turn
+/// that is not an integer or does not fit `int32` — is named as unmarshalled
+/// and left unset; it is never wrapped and never raised.
 fn conversation_to_proto(
     c: &Bound<PyAny>,
     unmarshalled: &mut Vec<String>,
-) -> PyResult<pb::ConversationContext> {
-    let mut conv = pb::ConversationContext {
-        conversation_id: c.getattr("conversation_id")?.str()?.to_string(),
-        ..Default::default()
-    };
-    if let Some(v) = opt(c, "session_id")? {
-        conv.session_id = v.str()?.to_string();
+) -> pb::ConversationContext {
+    let mut conv = pb::ConversationContext::default();
+    match host_attr(c, "conversation_id").as_ref().and_then(host_text) {
+        Some(id) => conv.conversation_id = id,
+        None => unmarshalled.push("gen_ai.conversation.id".into()),
     }
-    if let Some(v) = opt(c, "turn_index")? {
+    if let Some(v) = host_attr(c, "session_id") {
+        match host_text(&v) {
+            Some(id) => conv.session_id = id,
+            None => unmarshalled.push("wardex.conversation.session_id".into()),
+        }
+    }
+    if let Some(v) = host_attr(c, "turn_index") {
         match v.extract::<i64>().ok().and_then(|t| i32::try_from(t).ok()) {
             Some(turn) => conv.turn_index = turn,
             None => unmarshalled.push("wardex.conversation.turn_index".into()),
         }
     }
-    Ok(conv)
+    conv
 }
 
 /// CallSite → `Span.call_site` (field 22), its typed home.
 ///
-/// Declared in the schema, filled by the tracing decorator and settable by a
+/// Declared in the schema, filled by the tracing decorators and settable by a
 /// host through `Span.call_site`, read by a receiver of the envelope — and
 /// never written here, so a location the host was told it could record left
-/// the process nowhere. The values are the host's own, so each is read
-/// tolerantly: one the field's type cannot hold is named as unmarshalled
-/// under the attribute the OTLP mapping would have given it, and the rest of
-/// the location still ships.
-fn call_site_to_proto(c: &Bound<PyAny>, unmarshalled: &mut Vec<String>) -> PyResult<pb::CallSite> {
+/// the process nowhere. The setter validates nothing, so what arrives may not
+/// be a `CallSite` at all: each field is read tolerantly, one the field's type
+/// cannot hold is named as unmarshalled, and the rest of the location ships.
+/// The names are the OTLP attributes the mapping derives, except the module,
+/// which has none of its own — it is composed into `code.function.name` — and
+/// is named as the field it is, so that losing it does not read as losing the
+/// function.
+fn call_site_to_proto(c: &Bound<PyAny>, unmarshalled: &mut Vec<String>) -> pb::CallSite {
     let mut site = pb::CallSite::default();
-    for (attr, key, slot) in [
+    for (attr, name, slot) in [
         ("file", "code.file.path", &mut site.file),
         ("function", "code.function.name", &mut site.function),
-        ("module", "code.function.name", &mut site.module),
+        ("module", "call_site.module", &mut site.module),
     ] {
-        if let Some(v) = opt(c, attr)? {
+        if let Some(v) = host_attr(c, attr) {
             match v.extract::<String>() {
                 Ok(s) => *slot = s,
-                Err(_) => unmarshalled.push(key.into()),
+                Err(_) => unmarshalled.push(name.into()),
             }
         }
     }
-    if let Some(v) = opt(c, "line")? {
+    if let Some(v) = host_attr(c, "line") {
         match v.extract::<i64>().ok().and_then(|n| i32::try_from(n).ok()) {
             Some(line) => site.line = line,
             None => unmarshalled.push("code.line.number".into()),
         }
     }
-    Ok(site)
+    site
 }
 
 /// EvaluationAttributes → extra KeyValue (semconv `gen_ai.evaluation.*`).
@@ -850,17 +876,14 @@ fn flatten_typed_blocks(sp: &Bound<PyAny>, span: &mut pb::Span) -> PyResult<()> 
     // They are written THERE and nowhere else: a value with two homes on one
     // envelope is a value whose readers can each pick a different one.
     if let Some(c) = opt(sp, "conversation")? {
-        span.conversation = Some(conversation_to_proto(&c, &mut unmarshalled)?);
+        span.conversation = Some(conversation_to_proto(&c, &mut unmarshalled));
     }
     if let Some(c) = opt(sp, "call_site")? {
-        span.call_site = Some(call_site_to_proto(&c, &mut unmarshalled)?);
+        span.call_site = Some(call_site_to_proto(&c, &mut unmarshalled));
     }
     if let Some(e) = opt(sp, "evaluation")? {
         flatten_evaluation(&e, &mut span.extra, &mut unmarshalled)?;
     }
-    // `function` and `module` compose one attribute, so both failing names it
-    // twice in a row.
-    unmarshalled.dedup();
     if !unmarshalled.is_empty() {
         span.extra
             .push(kv_str(UNMARSHALLED_FIELD_KEY, unmarshalled.join(",")));

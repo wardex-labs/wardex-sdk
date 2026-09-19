@@ -946,9 +946,10 @@ def _trace_start(adapter: OpenAIAgentsAdapter, trace: Any, *, resumed: bool = Fa
     driver = _driver()
     # HOST WINS — see `framework_conversation`. The `group_id` a host's own
     # conversation shadowed rides along on the root as its own attribute, and
-    # the pinned carrier inherits whichever id the run opened with.
+    # the pinned carrier inherits whichever id the run opened with. `or None`:
+    # this adapter has always read a falsy group id as "none given".
     conversation, shadowed = framework_conversation(
-        ctx, trace.group_id, shadowed_counter="group_id_shadowed_by_host"
+        ctx, trace.group_id or None, shadowed_counter="group_id_shadowed_by_host"
     )
 
     def describe(h: RunHandle) -> None:

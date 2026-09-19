@@ -284,24 +284,32 @@ def test_the_conversation_keys_keep_their_spelling_and_their_omission_rules():
     assert full["wardex.conversation.turn_index"] == 3
 
 
-def test_a_conversation_key_the_host_wrote_by_hand_is_not_doubled():
-    """`extra` is the host's. One that spelled `gen_ai.conversation.id` there
-    keeps its value and the attribute appears once — an OTLP decoder keeps one
-    of a duplicated key, and which one is the backend's choice."""
-    from wardex_sdk._types import ConversationContext
+def test_a_typed_value_replaces_a_same_keyed_extra_and_appears_once():
+    """A host that spelled a typed field's key into `extra` by hand gets the
+    TYPED value, once. A duplicated key is the backend's coin toss; the host's
+    value winning would make this export disagree with the envelope a receiver
+    reads for the same span. Found by review: `wardex.capture_sources` was
+    pushed bare and shipped twice."""
+    from wardex_sdk._types import CallSite, ConversationContext
 
     span = _span(
         conversation=ConversationContext(conversation_id="typed"),
-        extra=(("gen_ai.conversation.id", "host-said"),),
+        call_site=CallSite(file="/typed.py", line=1, function="f"),
+        capture_sources=(CaptureSource.ADAPTER,),
+        extra=(
+            ("gen_ai.conversation.id", "host-said"),
+            ("wardex.capture_sources", "host-said"),
+            ("code.file.path", "host-said"),
+        ),
     )
-    data = _wardex_native.codec.encode_otlp_traces(Envelope(header=_header(), spans=(span,)))
-    assert data.count(b"gen_ai.conversation.id") == 1
-    assert (
-        _first_span(Envelope(header=_header(), spans=(span,)))["attributes"][
-            "gen_ai.conversation.id"
-        ]
-        == "host-said"
-    )
+    env = Envelope(header=_header(), spans=(span,))
+    data = _wardex_native.codec.encode_otlp_traces(env)
+    for key in (b"gen_ai.conversation.id", b"wardex.capture_sources", b"code.file.path"):
+        assert data.count(key) == 1, key
+    attrs = _first_span(env)["attributes"]
+    assert attrs["gen_ai.conversation.id"] == "typed"
+    assert attrs["wardex.capture_sources"] == ["adapter"]
+    assert attrs["code.file.path"] == "/typed.py"
 
 
 def test_capture_sources_reach_the_otlp_attributes_by_name():
