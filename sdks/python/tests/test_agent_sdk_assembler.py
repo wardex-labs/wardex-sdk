@@ -1601,8 +1601,12 @@ def test_each_turns_prompt_rides_its_own_chat_span(tallies):
     assert ("wardex.agent.prompt_source", "stream") in chat2.extra
     # Turn numbering stays the per-assistant-message ordinal: uniqueness of
     # (conversation_id, turn_index) is load-bearing for stores that key on it.
-    assert chat1.conversation.turn_index == 0
-    assert chat2.conversation.turn_index == 1
+    # It runs from ONE. The typed wire field is a proto3 int32, where 0 and
+    # "unset" are the same bytes, so a first turn numbered 0 was stored exactly
+    # like a span that carries no turn at all — and a reader checking a
+    # conversation for a missing turn could never confirm the first arrived.
+    assert chat1.conversation.turn_index == 1
+    assert chat2.conversation.turn_index == 2
     assert tallies("adapters.assembler.prompt_overwritten") == 0
 
 

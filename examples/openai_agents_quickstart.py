@@ -101,13 +101,26 @@ async def main() -> None:
     # `Agent workflow`, is what you would look for in the backend. The two runs
     # get names that differ at the front so a trace list that truncates long
     # names still tells them apart.
+    #
+    # `group_id` is openai-agents' own way of saying "these runs are one
+    # conversation" — in a real app, your chat session's id, the same on every
+    # turn of that session. wardex carries it as the conversation id of every
+    # span the run opens (`gen_ai.conversation.id` on OTLP), which is what lets
+    # a backend group a session's runs together. Leave it out and those spans
+    # carry no conversation at all: wardex does not invent one for you.
     result = await Runner.run(
-        concierge, PROMPT, run_config=RunConfig(workflow_name="travel_concierge")
+        concierge,
+        PROMPT,
+        run_config=RunConfig(workflow_name="travel_concierge", group_id="lisbon-weekend"),
     )
     print("Runner.run:         ", result.final_output)
 
     streamed = Runner.run_streamed(
-        concierge, PROMPT, run_config=RunConfig(workflow_name="streamed_travel_concierge")
+        concierge,
+        PROMPT,
+        run_config=RunConfig(
+            workflow_name="streamed_travel_concierge", group_id="lisbon-weekend-streamed"
+        ),
     )
     async for _event in streamed.stream_events():
         pass  # draining the stream is what completes the run

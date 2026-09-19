@@ -864,13 +864,14 @@ class SessionAssembler:
 
     def _emit_chat(self, sess: _Session, ev: AgentStreamEvent, now: int) -> None:
         span = None
+        # Counted BEFORE the span is built, so turns run from 1 and a wire 0 — proto3's "unset" —
+        # only ever means "no turn". The message arrived whether or not a span gets built.
+        sess.turn_index += 1
         with self._guard("adapters.assembler.emit_chat"):
             if sess.bridge is not None:
                 self._pend_chat(sess, ev, now)
             else:
                 span = self._build_chat(sess, ev, now)
-        # The message arrived whether or not a span was built: the thread moves on.
-        sess.turn_index += 1
         sess.mark_thread(ev.parent_tool_use_id, now, new_turn=True)
         if span is not None:
             self._capture(span)
@@ -1878,13 +1879,12 @@ class SessionAssembler:
         self._drain_children(sess, now)
         self._flush_pending(sess)
 
-        # (3) Root invoke_agent span — the unit opened in `_ensure_session`,
-        # whose context every span above is anchored to. Closing the UNIT rather
-        # than emitting its draft is what makes the two facts one action: the
-        # registry drops it from the live tables, force-closes anything still
-        # attached to it, and hands the span to the sink after releasing its lock
-        # (I11). A pin left on the reader task also stops being ambient here,
-        # because `current()` refuses a unit that is no longer live.
+        # (3) Root invoke_agent span — the unit opened in `_ensure_session`, whose context every
+        # span above is anchored to. Closing the UNIT rather than emitting its draft is what makes
+        # the two facts one action: the registry drops it from the live tables, force-closes
+        # anything still attached to it, and hands the span to the sink after releasing its lock
+        # (I11). A pin left on the reader task also stops being ambient here, because `current()`
+        # refuses a unit that is no longer live.
         status, error_type = StatusCode.UNSET, None
         with self._guard("adapters.assembler.finalize"):
             status, error_type = self._stamp_root(sess, error)

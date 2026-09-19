@@ -282,7 +282,7 @@ _MODULE_CEILING = 800
 _OVERSIZED_BUDGET = {
     "_assembly/_units.py": 2100,
     "_adapters/_assembler.py": 1934,
-    "_adapters/_openai_agents.py": 1605,
+    "_adapters/_openai_agents.py": 1588,
     "_client.py": 1586,
     "_adapters/_context.py": 1305,
     "_interceptors/_seam.py": 1194,
