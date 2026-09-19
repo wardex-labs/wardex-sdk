@@ -175,7 +175,13 @@ All notable changes to this project are documented here. The format follows
   each sentinel in that field's home. The three fixes above are what it found;
   the fourth was `InternalSpan.cost_usd`, which nothing set and nothing
   encoded, and which is deleted rather than excused (the cost the Claude CLI
-  reports still ships as `wardex.agent.cost_usd`).
+  reports still ships as `wardex.agent.cost_usd`). Beside it,
+  `test_adapter_envelopes.py` drives each of the three adapters, encodes what
+  it emitted with the real encoder, and checks that the conversation id the
+  host or the framework stated is in the typed field of every span the adapter
+  opened. The request bodies it produces are committed under
+  `sdks/python/tests/fixtures/adapter_envelopes/`, so a receiver's test suite
+  can read what this SDK really sends instead of an envelope built by hand.
 - **Every `chat` and stream-reconstructed `execute_tool` span of one Claude
   Agent SDK run no longer starts at the moment the prompt was written.** The
   assembler kept one turn start per session, set only when the host wrote a
