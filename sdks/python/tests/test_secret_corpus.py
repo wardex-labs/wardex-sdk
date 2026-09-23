@@ -56,6 +56,11 @@ def test_the_corpora_are_the_size_the_contract_names():
     assert len(values) == len(set(values)), "each value must be findable on its own"
     for e in SECRETS:
         assert e["source"].startswith("https://"), e["name"]
+    # A short value (`3`, `ko`) is found in any export — in a timestamp, an id
+    # — so its presence would prove nothing. Each debugging value carries a
+    # unique tail, which is what makes "it survived" a measurement.
+    for e in BENIGN:
+        assert "-wdxb" in e["value"], e["name"]
 
 
 # --- loopback servers --------------------------------------------------------
@@ -242,8 +247,11 @@ def _ws_session(target: str) -> None:
 
 
 def _carriers(http_port: int, h2_port: int) -> dict[str, Callable[[str, str], None]]:
+    # Each call carries one neighbour argument, `wdxprobe`, a name in neither
+    # corpus: a neighbour that shared a corpus name (`q`) would overwrite that
+    # entry's value in the dict and fake a loss.
     def form_body(name: str, value: str) -> None:
-        body = urllib.parse.urlencode({name: value, "q": "probe"}).encode()
+        body = urllib.parse.urlencode({"wdxprobe": "1", name: value}).encode()
         _h1(
             http_port,
             "POST",
@@ -253,7 +261,7 @@ def _carriers(http_port: int, h2_port: int) -> dict[str, Callable[[str, str], No
         )
 
     def tool_args(name: str, value: str) -> None:
-        args = urllib.parse.quote(json.dumps({name: value, "city": "seoul"}))
+        args = urllib.parse.quote(json.dumps({"wdxprobe": "1", name: value}))
         _h1(
             http_port,
             "POST",
@@ -263,12 +271,12 @@ def _carriers(http_port: int, h2_port: int) -> dict[str, Callable[[str, str], No
         )
 
     return {
-        "get_query": lambda n, v: _h1(http_port, "GET", f"/tool?{n}={v}&q=probe"),
+        "get_query": lambda n, v: _h1(http_port, "GET", f"/tool?{n}={v}&wdxprobe=1"),
         "json_top": lambda n, v: _h1(
             http_port,
             "POST",
             "/tool",
-            json.dumps({n: v, "q": "probe"}).encode(),
+            json.dumps({"wdxprobe": "1", n: v}).encode(),
             {"Content-Type": "application/json"},
         ),
         "json_nested": lambda n, v: _h1(
@@ -279,7 +287,7 @@ def _carriers(http_port: int, h2_port: int) -> dict[str, Callable[[str, str], No
             {"Content-Type": "application/json"},
         ),
         "form_body": form_body,
-        "http2_query": lambda n, v: _h2_get(h2_port, f"/tool?{n}={v}&q=probe"),
+        "http2_query": lambda n, v: _h2_get(h2_port, f"/tool?{n}={v}&wdxprobe=1"),
         "websocket_query": lambda n, v: _ws_session(f"/socket?{n}={v}"),
         "tool_args": tool_args,
     }

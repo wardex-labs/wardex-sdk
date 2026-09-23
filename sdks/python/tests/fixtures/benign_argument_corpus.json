@@ -1,254 +1,254 @@
 {
- "about": "Arguments a debugger needs to read. Each must survive masking on every transport. Values are URL-safe so the same string can be searched for on every path.",
+ "about": "Arguments a debugger needs to read. Each must survive masking on every transport. Every value keeps its real shape and carries a unique `-wdxbNN` tail, so finding it in exported bytes proves THIS value survived rather than a digit that happens to appear in a timestamp. Values are URL-safe so the same string can be searched for on every path.",
  "entries": [
   {
    "name": "q",
-   "value": "seoul-weather",
+   "value": "seoul-weather-wdxb00",
    "why": "search text"
   },
   {
    "name": "query",
-   "value": "seoul-weather-today",
+   "value": "seoul-weather-today-wdxb01",
    "why": "search text"
   },
   {
    "name": "keyword",
-   "value": "umbrella",
+   "value": "umbrella-wdxb02",
    "why": "search term; contains `key` as a substring"
   },
   {
    "name": "page",
-   "value": "3",
+   "value": "3-wdxb03",
    "why": "pagination"
   },
   {
    "name": "limit",
-   "value": "25",
+   "value": "25-wdxb04",
    "why": "pagination"
   },
   {
    "name": "offset",
-   "value": "50",
+   "value": "50-wdxb05",
    "why": "pagination"
   },
   {
    "name": "sort",
-   "value": "created-desc",
+   "value": "created-desc-wdxb06",
    "why": "ordering"
   },
   {
    "name": "api-version",
-   "value": "2024-10-21",
+   "value": "2024-10-21-wdxb07",
    "why": "Azure API version"
   },
   {
    "name": "model",
-   "value": "gpt-4o-mini",
+   "value": "gpt-4o-mini-wdxb08",
    "why": "model selection"
   },
   {
    "name": "country_code",
-   "value": "KR",
+   "value": "KR-wdxb09",
    "why": "locale; ends in `code`"
   },
   {
    "name": "currency_code",
-   "value": "KRW",
+   "value": "KRW-wdxb10",
    "why": "money; ends in `code`"
   },
   {
    "name": "zipcode",
-   "value": "04524",
+   "value": "04524-wdxb11",
    "why": "location"
   },
   {
    "name": "lang",
-   "value": "ko",
+   "value": "ko-wdxb12",
    "why": "locale"
   },
   {
    "name": "trace_id",
-   "value": "4bf92f3577b34da6a3ce929d0e0e4736",
+   "value": "4bf92f3577b34da6a3ce929d0e0e4736-wdxb13",
    "why": "correlation"
   },
   {
    "name": "monkey",
-   "value": "banana",
+   "value": "banana-wdxb14",
    "why": "contains `key` as a substring"
   },
   {
    "name": "inside",
-   "value": "yes",
+   "value": "yes-wdxb15",
    "why": "contains `sid` as a substring"
   },
   {
    "name": "units",
-   "value": "metric",
+   "value": "metric-wdxb16",
    "why": "OpenWeatherMap units"
   },
   {
    "name": "format",
-   "value": "json",
+   "value": "json-wdxb17",
    "why": "response format"
   },
   {
    "name": "city",
-   "value": "Seoul",
+   "value": "Seoul-wdxb18",
    "why": "location"
   },
   {
    "name": "lat",
-   "value": "37.5665",
+   "value": "37.5665-wdxb19",
    "why": "location"
   },
   {
    "name": "lon",
-   "value": "126.9780",
+   "value": "126.9780-wdxb20",
    "why": "location"
   },
   {
    "name": "per_page",
-   "value": "100",
+   "value": "100-wdxb21",
    "why": "pagination"
   },
   {
    "name": "order",
-   "value": "asc",
+   "value": "asc-wdxb22",
    "why": "ordering"
   },
   {
    "name": "filter",
-   "value": "status-open",
+   "value": "status-open-wdxb23",
    "why": "filtering"
   },
   {
    "name": "fields",
-   "value": "id-name-price",
+   "value": "id-name-price-wdxb24",
    "why": "field selection"
   },
   {
    "name": "include",
-   "value": "author",
+   "value": "author-wdxb25",
    "why": "expansion"
   },
   {
    "name": "start_date",
-   "value": "2026-09-01",
+   "value": "2026-09-01-wdxb26",
    "why": "range"
   },
   {
    "name": "end_date",
-   "value": "2026-09-23",
+   "value": "2026-09-23-wdxb27",
    "why": "range"
   },
   {
    "name": "timezone",
-   "value": "Asia-Seoul",
+   "value": "Asia-Seoul-wdxb28",
    "why": "locale"
   },
   {
    "name": "region",
-   "value": "ap-northeast-2",
+   "value": "ap-northeast-2-wdxb29",
    "why": "cloud region"
   },
   {
    "name": "locale",
-   "value": "ko-KR",
+   "value": "ko-KR-wdxb30",
    "why": "locale"
   },
   {
    "name": "max_tokens",
-   "value": "512",
+   "value": "512-wdxb31",
    "why": "LLM budget; plural `tokens` is a count"
   },
   {
    "name": "temperature",
-   "value": "0.2",
+   "value": "0.2-wdxb32",
    "why": "LLM sampling"
   },
   {
    "name": "top_p",
-   "value": "0.9",
+   "value": "0.9-wdxb33",
    "why": "LLM sampling"
   },
   {
    "name": "key_id",
-   "value": "kid-2026-rotation",
+   "value": "kid-2026-rotation-wdxb34",
    "why": "a key's public identifier; `key` is not the last word"
   },
   {
    "name": "token_type",
-   "value": "Bearer",
+   "value": "Bearer-wdxb35",
    "why": "OAuth response field; `token` is not the last word"
   },
   {
    "name": "session_id",
-   "value": "conv-20260923-01",
+   "value": "conv-20260923-01-wdxb36",
    "why": "an agent conversation id"
   },
   {
    "name": "sessionId",
-   "value": "conv-20260923-02",
+   "value": "conv-20260923-02-wdxb37",
    "why": "an agent conversation id, camelCase"
   },
   {
    "name": "app_id",
-   "value": "fbapp-8841",
+   "value": "fbapp-8841-wdxb38",
    "why": "a public application id"
   },
   {
    "name": "user_id",
-   "value": "u-1029",
+   "value": "u-1029-wdxb39",
    "why": "caller identity for debugging"
   },
   {
    "name": "state",
-   "value": "af0ifjsldkj",
+   "value": "af0ifjsldkj-wdxb40",
    "why": "OAuth CSRF state, echoed back"
   },
   {
    "name": "scope",
-   "value": "openid-profile",
+   "value": "openid-profile-wdxb41",
    "why": "OAuth scope"
   },
   {
    "name": "response_type",
-   "value": "code",
+   "value": "code-wdxb42",
    "why": "OAuth flow selector whose value is the word code"
   },
   {
    "name": "grant_type",
-   "value": "authorization_code",
+   "value": "authorization_code-wdxb43",
    "why": "OAuth grant selector"
   },
   {
    "name": "redirect_uri",
-   "value": "https-app.example.test-callback",
+   "value": "https-app.example.test-callback-wdxb44",
    "why": "OAuth redirect"
   },
   {
    "name": "status",
-   "value": "active",
+   "value": "active-wdxb45",
    "why": "filtering"
   },
   {
    "name": "category",
-   "value": "electronics",
+   "value": "electronics-wdxb46",
    "why": "filtering"
   },
   {
    "name": "version",
-   "value": "v2",
+   "value": "v2-wdxb47",
    "why": "API version"
   },
   {
    "name": "tags",
-   "value": "red-blue",
+   "value": "red-blue-wdxb48",
    "why": "filtering"
   },
   {
    "name": "input_tokens",
-   "value": "1200",
+   "value": "1200-wdxb49",
    "why": "usage count"
   }
  ]
