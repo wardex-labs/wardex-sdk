@@ -7,6 +7,17 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- **A masked span says what was masked and why.** Every span that had a value
+  replaced carries `wardex.redaction.count`, `wardex.redaction.rules` (which
+  rule: a PII category, `secret_value`, one of the name rules, or
+  `url_userinfo`) and `wardex.redaction.names` (the argument names a name rule
+  matched) beside `wardex.redacted` over OTLP, and the same facts in the new
+  `CaptureIntegrity.redaction_count`, `redaction_rules` and `redaction_names`
+  fields of the wardex envelope (`RedactionRule` is a new closed enum).
+- **`PIIConfig(extra_secret_names=..., reveal_names=...)`** adds your own secret
+  argument names and keeps names you need to read. Both compare by words, so
+  one entry covers `x_corp_auth`, `xCorpAuth` and `X-Corp-Auth`; a revealed
+  name whose value itself looks like a credential is still masked.
 - **`WardexTransport`, the default exporter: a project key alone is now a
   working first run.** `wardex.init(backend=BackendConfig(api_key="wdx_us_..."))`
   — or a bare `init()` with `WARDEX_API_KEY` set — ships the SDK's own
@@ -128,6 +139,25 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- **A credential passed as an argument is masked whatever carries it, and the
+  argument's other values are no longer thrown away.** Masking recognised a
+  credential only by its shape (`sk-…`, `AKIA…`), so a key with no shape went
+  out in plain text: `POST /search {"api_key": "…", "appid": "…"}` shipped
+  both values to your backend, and a request to `GET /tool?api_key=…` put the
+  key in the span's NAME. At the same time OTLP's `url.full` silently cut every
+  query, so `?q=seoul&page=2` — what the agent actually asked for — never
+  arrived, while the same arguments sent as a POST body arrived whole,
+  credentials included. Masking now also judges the argument NAME a value sits
+  under, with one rule for a URL query, a form body, JSON (including a tool
+  call's escaped `arguments`) and span attributes; the rule and its limits are
+  in the README's "Masking secrets and personal data". User-visible changes:
+  **span names no longer carry a query, fragment or `user:password@`**
+  (`HTTP GET /tool?x=1` is now `HTTP GET /tool`, so a filter that matched the
+  query part of a name needs updating); **`url.full` carries the whole URL
+  again**, masked by the same rules; `user:password@` in a URL becomes
+  `REDACTED:REDACTED@` even under `PIIMode.OFF`; and values under names such
+  as `page_token` or `idempotency_key` now read `[SECRET]` unless you list them
+  in `reveal_names`.
 - **A conversation id now reaches the wardex receiver.** The envelope encoder
   wrote `ConversationContext` into `extra` (`gen_ai.conversation.id`,
   `wardex.conversation.session_id`, `wardex.conversation.turn_index`) and left

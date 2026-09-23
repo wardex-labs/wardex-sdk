@@ -133,7 +133,7 @@ class WardexTransport(Transport):
         # encoder applies the policy inside the native call -- there is no
         # Python-side path to bytes that skips it.
         body = native.codec.encode_envelope(
-            envelope, self._pii_mode, list(self._pii_disabled), self._limits
+            envelope, self._pii_mode, list(self._pii_disabled), self._limits, **self._pii_names()
         )
         remaining = deadline - time.monotonic()
         if remaining <= 0:

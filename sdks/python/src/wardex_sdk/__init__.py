@@ -325,6 +325,14 @@ def init(
             WardexConfigWarning,
             stacklevel=2,
         )
+    if config.pii.mode is PIIMode.OFF and (
+        config.pii.extra_secret_names or config.pii.reveal_names
+    ):
+        _warnings.warn(
+            "pii extra_secret_names and reveal_names have no effect when pii mode is OFF",
+            WardexConfigWarning,
+            stacklevel=2,
+        )
     if config.interceptors is not None and not config.intercept:
         # Detected here rather than at install time: `_interceptors/` keeps the
         # matching behavior (a selection under intercept=False installs

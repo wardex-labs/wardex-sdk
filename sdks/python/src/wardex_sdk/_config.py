@@ -84,6 +84,7 @@ from ._enums import (
     PIIMode,
 )
 from ._limits import LimitsConfig
+from ._native import NATIVE_OK, native
 from ._types import BeforeSendEnvelopeCallback
 
 
@@ -301,6 +302,18 @@ class PIIConfig:
     OFF, and `init()` says so with a `WardexConfigWarning` rather than leaving
     the caller to conclude the exemption was honoured."""
 
+    extra_secret_names: AbstractSet[str] = frozenset()
+    """Argument names whose values are secrets, beyond the built-in list —
+    `{"x_corp_auth"}` masks the value of `x_corp_auth=...` in a URL or form
+    and of `"xCorpAuth": ...` in JSON. Compared by words, the way the built-in
+    names are: split at `_ - .`, spaces and camelCase, case ignored, so one
+    entry covers every spelling of the same words."""
+    reveal_names: AbstractSet[str] = frozenset()
+    """Argument names exempt from the NAME rules — `{"page_token"}` keeps a
+    pagination cursor readable. Compared by words like `extra_secret_names`.
+    The value rules still apply: a revealed name holding `sk-...` is still
+    masked, because the value itself says what it is."""
+
     def __post_init__(self) -> None:
         # Materialize ONCE, then validate, then canonicalize: "any iterable"
         # includes a generator, which the validation loop would otherwise
@@ -315,6 +328,42 @@ class PIIConfig:
                     f"pii disabled_categories entries must be PIICategory members, got {category!r}"
                 )
         object.__setattr__(self, "disabled_categories", frozenset(categories))
+        extra = _secret_names("extra_secret_names", self.extra_secret_names)
+        reveal = _secret_names("reveal_names", self.reveal_names)
+        if NATIVE_OK:
+            # Overlap by WORDS, the unit the masker compares: `apiKey` and
+            # `api_key` are one name to it, so listing them on both sides is
+            # a contradiction even though the strings differ.
+            revealed = {tuple(native.codec.pii_name_words(n)): n for n in reveal}
+            for name in extra:
+                other = revealed.get(tuple(native.codec.pii_name_words(name)))
+                if other is not None:
+                    raise ValueError(
+                        f"pii name {name!r} is in extra_secret_names and, as {other!r}, "
+                        "in reveal_names; a name can be masked or revealed, not both"
+                    )
+        object.__setattr__(self, "extra_secret_names", extra)
+        object.__setattr__(self, "reveal_names", reveal)
+
+
+def _secret_names(field_name: str, names: object) -> frozenset[str]:
+    """`names` as a frozenset of names the masker can match, or a ValueError
+    naming the entry that cannot be.
+
+    A bare string is refused rather than iterated: `reveal_names="code"` would
+    otherwise read back as the four one-letter names c, o, d and e."""
+    if isinstance(names, (str, bytes)):
+        raise ValueError(f"pii {field_name} takes a collection of names, got the string {names!r}")
+    out = tuple(names)  # type: ignore[call-overload]  # any iterable, checked below
+    for name in out:
+        if not isinstance(name, str):
+            raise ValueError(f"pii {field_name} entries must be strings, got {name!r}")
+        if not any(c.isalnum() for c in name):
+            raise ValueError(
+                f"pii {field_name} entry {name!r} has no letters or digits, so it can "
+                "never match an argument name"
+            )
+    return frozenset(out)
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

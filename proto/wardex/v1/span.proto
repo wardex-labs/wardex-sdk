@@ -74,6 +74,24 @@ message CaptureIntegrity {
   int32 dropped_chunk_count = 7;
 
   repeated Limitation limitation_codes = 9;
+
+  // What the in-process masking replaced on this span, written by the masker
+  // itself after every text field was scanned. `redacted` above says that
+  // something was replaced; these say how much, by which rule, and under
+  // which argument names, so a reader can tell why a value reads [SECRET]
+  // without opening the SDK. All three stay empty on a span nothing was
+  // replaced in.
+  //
+  // `redaction_count` counts replacements, not fields: two secrets in one
+  // body count two.
+  int32 redaction_count = 10;
+  // Each rule that replaced at least one value, once, in enum order.
+  repeated RedactionRule redaction_rules = 11;
+  // The argument names a name rule matched (`api_key`, `X-Amz-Signature`), as
+  // spelled in the payload, deduplicated in first-seen order and capped. The
+  // names themselves pass through the value rules before they are recorded,
+  // so a key that is itself an e-mail address does not ride out here.
+  repeated string redaction_names = 12;
 }
 
 message CorrelationInfo {

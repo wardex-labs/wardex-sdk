@@ -137,6 +137,39 @@ enum LinkReason {
   LINK_REASON_CACHE_SOURCE = 5;
 }
 
+// Which masking rule replaced a value. CLOSED: the masker is the only writer,
+// and every rule it can apply has a value here. The rule names are the ones the
+// SDK documentation lists, so a reader of `CaptureIntegrity.redaction_rules`
+// can look the rule up by the name it reads.
+enum RedactionRule {
+  REDACTION_RULE_UNSPECIFIED = 0;
+
+  // -- Value shape: the value itself looks like the category.
+  REDACTION_RULE_EMAIL = 1;
+  REDACTION_RULE_PHONE_NUMBER = 2;
+  REDACTION_RULE_CREDIT_CARD = 3;
+  REDACTION_RULE_US_SSN = 4;
+  REDACTION_RULE_IP_ADDRESS = 5;
+  REDACTION_RULE_US_BANK_ROUTING = 6;
+  REDACTION_RULE_IBAN = 7;
+  //    A credential by its shape: a known prefix (`sk-`, `AKIA`), a bearer
+  //    token, a JWT, a PEM private key.
+  REDACTION_RULE_SECRET_VALUE = 8;
+
+  // -- Argument name: the value sits under a name that says it is a secret.
+  //    A strong secret word anywhere in the name (`password_confirmation`).
+  REDACTION_RULE_SECRET_WORD = 9;
+  //    The name's last word is `key` or `token` (`api_key`, `X-Amz-Security-Token`).
+  REDACTION_RULE_SECRET_LAST_WORD = 10;
+  //    The whole name is one listed word (`apikey`, `appid`, `sessionid`).
+  REDACTION_RULE_SECRET_EXACT_NAME = 11;
+  //    The name is one the application listed in `extra_secret_names`.
+  REDACTION_RULE_SECRET_USER_NAME = 12;
+
+  // -- Credentials written into a URL as `user:password@host`.
+  REDACTION_RULE_URL_USERINFO = 13;
+}
+
 // Why a span is incomplete, or was assembled by interpretation rather than
 // observation. CLOSED and, as of the 2026-07-29 census, COMPLETE: every marker
 // string any wardex SDK can attach to a span has a value here. This is the

@@ -140,6 +140,15 @@ pub(crate) static BUILTINS: &[PatternDef] = &[
         replacement: Replacement::Label("[SECRET]"),
         retry_on_reject: false,
     },
+    // A JWT: two base64url JSON segments (`eyJ` is `{"`) and a signature,
+    // which is empty for an unsigned token. The shape alone, not a decode.
+    PatternDef {
+        category: "secret",
+        regex: r"\beyJ[A-Za-z0-9_-]{5,}\.eyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]*",
+        validator: None,
+        replacement: Replacement::Label("[SECRET]"),
+        retry_on_reject: false,
+    },
     PatternDef {
         category: "secret",
         regex: r"(?s)-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----",

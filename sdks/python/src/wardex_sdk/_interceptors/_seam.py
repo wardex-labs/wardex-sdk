@@ -59,7 +59,7 @@ from ._base import InterceptorInterface
 from ._close_hook import install_shared_close_hook, on_close, uninstall_shared_close_hook
 from ._conn_timing import install_shared_timing, uninstall_shared_timing
 from ._peer import UNRESOLVED_HOST, UNRESOLVED_PORT, peer_address, placeholder_host
-from ._trackers import _Txn, _WebSocketTracker
+from ._trackers import _Txn, _url_target, _WebSocketTracker
 
 if TYPE_CHECKING:
     from .._client import Client
@@ -796,7 +796,7 @@ class ByteSeamInterceptor(InterceptorInterface):
                 http=HttpMeta(
                     method="GET",
                     url=(
-                        f"{self._url_scheme(True)}://{st.server_address}:{st.server_port}{txn.path}"
+                        f"{self._url_scheme(True)}://{st.server_address}:{st.server_port}{_url_target(txn)}"
                     ),
                     status_code=101,
                 ),
@@ -944,7 +944,7 @@ def _assemble(p: _PendingTxn, *, parse: bool, extra: tuple[Limitation, ...]) -> 
     bodies are withheld. The user's mode excluded this traffic; overload
     must not become the reason its payloads leave the process. Transport
     metadata, timing, status and markers stay — what happened is still
-    said; what was SAID in the bodies is not.
+    said; what was SAID in the bodies and the query is not.
     """
     txn = p.txn
     sem: Any = None
@@ -962,11 +962,10 @@ def _assemble(p: _PendingTxn, *, parse: bool, extra: tuple[Limitation, ...]) -> 
     unparsed = ((not parse) or parse_failed) and not p.is_grpc
     if not _should_capture(p.prefilter, txn, sem, mode=p.mode, unparsed=unparsed):
         if p.treatment == "provider_state":
-            # A Conversations-API-shaped path (provider-owned agent state, no
-            # model, no usage) the mode refused. Not an LLM call, so refusing
-            # is right — but a recognised provider path must never vanish
-            # uncounted. Generic refusals stay uncounted: they are every
-            # non-LLM request.
+            # A Conversations-API-shaped path (provider-owned agent state, no model, no usage) the
+            # mode refused. Not an LLM call, so refusing is right — but a recognised provider path
+            # must never vanish uncounted. Generic refusals stay uncounted: they are every non-LLM
+            # request.
             counters.bump("interceptors.seam.provider_state_dropped")
         return None
     withhold_bodies = unparsed and not _should_capture(
@@ -978,7 +977,8 @@ def _assemble(p: _PendingTxn, *, parse: bool, extra: tuple[Limitation, ...]) -> 
         parent_closed=txn.parent_closed,
         parent_evicted=txn.parent_evicted,
     )
-    url = f"{p.url_scheme}://{p.url_host}:{p.server_port}{txn.path}"  # `:0` too; see `_peer.py`
+    # `:0` too; see `_peer.py`. The target keeps its query unless the bodies are withheld.
+    url = f"{p.url_scheme}://{p.url_host}:{p.server_port}{_url_target(txn, withhold_bodies)}"
     transfer = max(0.0, (txn.end_ns - txn.start_ns) / 1e6 - txn.ttfb_ms)
 
     # TRANSPORT mode, not an intent (design §6.1 correction in `_vocab.py`):

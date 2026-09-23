@@ -165,6 +165,13 @@ closed_vocabulary!(
     parent_source_name,
     "`CorrelationInfo.parent_source` — how the parent edge was derived."
 );
+closed_vocabulary!(
+    pb::RedactionRule,
+    "REDACTION_RULE",
+    redaction_rule_to_proto,
+    redaction_rule_name,
+    "`CaptureIntegrity.redaction_rules` — which masking rule replaced a value."
+);
 
 #[cfg(test)]
 mod tests {
@@ -247,6 +254,17 @@ mod tests {
         // The Python enum has exactly seven members; an eighth appearing on the
         // wire means the two drifted.
         assert!(parent_source_name(8).contains("unrecognized"));
+    }
+
+    #[test]
+    fn every_redaction_rule_round_trips() {
+        for n in 1..=13 {
+            let value = redaction_rule_name(n);
+            assert!(!value.contains("unrecognized"), "rule {n} is not declared");
+            assert_eq!(redaction_rule_to_proto(&value), Some(n));
+        }
+        assert_eq!(redaction_rule_name(9), "secret_word");
+        assert!(redaction_rule_name(14).contains("unrecognized"));
     }
 
     /// `VOCABULARY_UNMAPPED` is a META value, not vocabulary. It must be

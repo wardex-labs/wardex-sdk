@@ -189,9 +189,13 @@ class TestTransportPolicy:
 
         captured = {}
 
-        def fake_encode(envelope, pii_mode, pii_disabled, limits, compress):
+        def fake_encode(
+            envelope, pii_mode, pii_disabled, limits, compress, *, pii_extra_names, pii_reveal_names
+        ):
             captured["pii_mode"] = pii_mode
             captured["pii_disabled"] = pii_disabled
+            captured["pii_extra_names"] = pii_extra_names
+            captured["pii_reveal_names"] = pii_reveal_names
             # One empty body; the subsequent POST fails silently (the endpoint
             # is unreachable). Returning no bodies at all would let the
             # transport return before it ever built a request, which is a
@@ -201,7 +205,17 @@ class TestTransportPolicy:
         monkeypatch.setattr(_wardex_native.codec, "encode_otlp_requests", fake_encode)
         t = OtlpHttpTransport(endpoint="http://localhost:1")
         t._set_pii_policy(
-            PIIConfig(mode=PIIMode.MASK, disabled_categories={PIICategory.IP_ADDRESS})
+            PIIConfig(
+                mode=PIIMode.MASK,
+                disabled_categories={PIICategory.IP_ADDRESS},
+                extra_secret_names={"x_corp_auth"},
+                reveal_names={"page_token"},
+            )
         )
         t._send_batch(_env(_span(input_data=PII_INPUT)))
-        assert captured == {"pii_mode": "mask", "pii_disabled": ["ip_address"]}
+        assert captured == {
+            "pii_mode": "mask",
+            "pii_disabled": ["ip_address"],
+            "pii_extra_names": ["x_corp_auth"],
+            "pii_reveal_names": ["page_token"],
+        }

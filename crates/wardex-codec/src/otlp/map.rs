@@ -259,6 +259,26 @@ fn uncertainty(sp: &pb::Span, attrs: &mut Vec<otlp_pb::common::KeyValue>) {
         if i.redacted {
             attrs.push(kv_bool("wardex.capture.redacted", true));
         }
+        // What an envelope masked before it reached this mapping. On the
+        // export path the envelope arrives unmasked and these are empty; the
+        // OTLP masker writes the same three keys for what it replaces.
+        if i.redaction_count > 0 {
+            attrs.push(kv_int(
+                "wardex.redaction.count",
+                i64::from(i.redaction_count),
+            ));
+            let rules: Vec<String> = i
+                .redaction_rules
+                .iter()
+                .map(|n| vocab::redaction_rule_name(*n))
+                .collect();
+            if !rules.is_empty() {
+                attrs.push(kv_strs("wardex.redaction.rules", rules));
+            }
+            if !i.redaction_names.is_empty() {
+                attrs.push(kv_strs("wardex.redaction.names", i.redaction_names.clone()));
+            }
+        }
         if i.dropped_chunk_count > 0 {
             attrs.push(kv_int(
                 "wardex.capture.dropped_chunks",
@@ -368,17 +388,6 @@ fn link(ln: pb::SpanLink) -> otlp_pb::trace::span::Link {
         attributes,
         ..Default::default()
     }
-}
-
-/// A captured URL up to (excluding) its query string and fragment.
-///
-/// Byte positions, not a URL parser: `?` and `#` are not legal in the parts
-/// that precede them, so the first occurrence of either is where the URL's
-/// stable identity ends — and a malformed URL is truncated at worst, never a
-/// panic on the export path.
-fn strip_query(url: &str) -> &str {
-    let end = url.find(['?', '#']).unwrap_or(url.len());
-    &url[..end]
 }
 
 /// The non-empty string an `extra` key carries, if it carries one.
@@ -515,14 +524,15 @@ fn span(mut sp: pb::Span) -> otlp_pb::trace::Span {
         if let Some(h) = &t.http {
             attrs.push(kv_str("http.request.method", &h.method));
             attrs.push(kv_int("http.response.status_code", h.status_code as i64));
-            // QUERY-STRIPPED, deliberately: `url.full` is semconv's name for
-            // the whole URL, but query strings are where credentials and PII
-            // ride (`?api_key=`, `?token=`), and a captured URL is exported
-            // for grouping, not replay. Everything before `?` (and `#`).
-            // An empty captured URL emits nothing — there is no URL to strip.
-            let url = strip_query(&h.url);
-            if !url.is_empty() {
-                attrs.push(kv_str("url.full", url));
+            // The WHOLE URL, query included: `url.full` is semconv's one home
+            // for a client span's URL, and the query is the call's arguments
+            // (`?q=seoul&page=2`) — dropping it silently threw away what an
+            // agent asked for while the same arguments sent in a POST body
+            // shipped whole. Credentials in it are the masker's to replace,
+            // by the same name rules that cover a body, before this request
+            // leaves the process. An empty captured URL emits nothing.
+            if !h.url.is_empty() {
+                attrs.push(kv_str("url.full", &h.url));
             }
         }
     }
@@ -1323,7 +1333,7 @@ mod tests {
     }
 
     #[test]
-    fn url_full_is_query_stripped_and_absent_when_nothing_was_captured() {
+    fn url_full_keeps_the_query_and_is_absent_when_nothing_was_captured() {
         let with_query = |url: &str| {
             envelope(pb::Span {
                 transport: Some(pb::TransportAttributes {
@@ -1338,18 +1348,15 @@ mod tests {
                 ..Default::default()
             })
         };
+        // The mapping carries the URL as captured; masking is not its job.
         let sp = only_span(with_query(
-            "https://api.example.com/v1/chat?api_key=sk-x#frag",
+            "https://api.example.com/v1/chat?q=seoul&page=2#frag",
         ));
         assert_eq!(
             attr(&sp, "url.full"),
-            Some(&str_value("https://api.example.com/v1/chat"))
-        );
-        // Fragment alone is stripped too.
-        let sp = only_span(with_query("https://api.example.com/v1/chat#sect"));
-        assert_eq!(
-            attr(&sp, "url.full"),
-            Some(&str_value("https://api.example.com/v1/chat"))
+            Some(&str_value(
+                "https://api.example.com/v1/chat?q=seoul&page=2#frag"
+            ))
         );
         // An empty captured URL emits nothing at all.
         let sp = only_span(with_query(""));
