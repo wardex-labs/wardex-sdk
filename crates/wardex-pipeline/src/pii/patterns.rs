@@ -160,12 +160,12 @@ pub(crate) static BUILTINS: &[PatternDef] = &[
         replacement: Replacement::Label("[SECRET]"),
         retry_on_reject: false,
     },
-    // A Basic or Bearer credential written as a header in free text (a curl
+    // A Basic, Bearer or `token` credential written as a header in free text (a curl
     // command in a tool's arguments), whatever its length: the header names
     // it. As a JSON or form value it is the name rule's.
     PatternDef {
         category: "secret",
-        regex: r"(?i)\bauthorization\s*:\s*(?:basic|bearer)\s+[A-Za-z0-9._~+/-]+=*",
+        regex: r"(?i)\bauthorization\s*:\s*(?:basic|bearer|token)\s+[A-Za-z0-9._~+/-]+=*",
         validator: None,
         replacement: Replacement::AfterColon("[SECRET]"),
         retry_on_reject: false,

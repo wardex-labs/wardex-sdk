@@ -42,19 +42,16 @@ pub const STRONG_WORDS: &[&str] = &[
     "authorization",
     "cookie",
     "cookies",
-    "pass",
-    "passcode",
-    "otp",
-    "totp",
-    "cvv",
-    "cvc",
 ];
 
-/// Rule 2: the name's LAST word, when the name has two or more words. `key`
-/// and `token` name many harmless things when they are not the head noun
-/// (`key_id`, `token_type`); as the head noun they name the credential
-/// (`api_key`, `access_token`). Singular only: `max_tokens` is a count.
-pub const LAST_WORDS: &[&str] = &["key", "token"];
+/// Rule 2: the name's LAST word, when the name has two or more words. These
+/// words name many harmless things when they are not the head noun
+/// (`key_id`, `token_type`, `pass_through`, `otp_length`); as the head noun
+/// they name the credential (`api_key`, `access_token`, `db_pass`,
+/// `sms_otp`, `card_cvv`). Singular only: `max_tokens` is a count.
+pub const LAST_WORDS: &[&str] = &[
+    "key", "token", "pass", "passcode", "otp", "totp", "cvv", "cvc",
+];
 
 /// Rule 3: whole names, compared word for word. Mostly names written as one
 /// word, which the word split cannot see inside (`apikey`, `appid`), plus a
@@ -83,6 +80,12 @@ pub const EXACT_NAMES: &[&str] = &[
     "SAMLResponse",
     "code_verifier",
     "pw",
+    "pass",
+    "passcode",
+    "otp",
+    "totp",
+    "cvv",
+    "cvc",
     "pin",
     "pincode",
     "pin_code",
@@ -275,11 +278,11 @@ impl NameRules {
         if dec.len() == enc.len() {
             return; // nothing was encoded
         }
-        let Ok(decoded) = std::str::from_utf8(&dec) else {
-            return;
-        };
+        // A Latin-1 `%E9` must not hide the rest of the value: judge a
+        // same-length stand-in, whose offsets are the decoded bytes' own.
+        let decoded = super::ascii_stand_in(&dec);
         let mut inner = Vec::new();
-        self.scan(decoded, &mut inner);
+        self.scan(&decoded, &mut inner);
         for h in inner {
             hits.push(NameHit {
                 start: start + map[h.start],
@@ -295,10 +298,29 @@ impl NameRules {
     /// blank line, then the value up to the next boundary. A part with a
     /// `filename` is a file, not an argument.
     fn scan_multipart(&self, text: &str, hits: &mut Vec<NameHit>) {
-        for (pos, _) in text.match_indices("form-data;") {
-            let Some(line_end) = text[pos..].find("\r\n").map(|x| pos + x) else {
-                continue;
+        // Linear however many `form-data;` a text holds: the next line end
+        // and the next blank line are each found once and reused until the
+        // scan passes them, and a header block or header line longer than
+        // its bound is not a multipart header.
+        const HEADER_MAX: usize = 1024;
+        const HEADERS_MAX: usize = 8192;
+        let next = |cache: &mut Option<Option<usize>>, from: usize, needle: &str| {
+            if cache.is_none_or(|c| c.is_some_and(|at| at < from)) {
+                *cache = Some(text[from..].find(needle).map(|x| from + x));
+            }
+            cache.flatten()
+        };
+        let mut crlf: Option<Option<usize>> = None;
+        let mut blank: Option<Option<usize>> = None;
+        let mut from = 0;
+        while let Some(pos) = text[from..].find("form-data;").map(|x| from + x) {
+            from = pos + "form-data;".len();
+            let Some(line_end) = next(&mut crlf, pos, "\r\n") else {
+                break; // no line end anywhere after this: no header can end
             };
+            if line_end - pos > HEADER_MAX {
+                continue;
+            }
             let header = &text[pos..line_end];
             if header.contains("filename=") {
                 continue;
@@ -309,14 +331,18 @@ impl NameRules {
             let Some(ne) = text[ns..line_end].find('"').map(|x| ns + x) else {
                 continue;
             };
+            let Some(body) = next(&mut blank, line_end, "\r\n\r\n").map(|x| x + 4) else {
+                break; // no blank line anywhere after this: no part has a body
+            };
+            if body - line_end > HEADERS_MAX {
+                continue;
+            }
+            let end = text[body..].find("\r\n--").map_or(text.len(), |x| body + x);
+            from = from.max(end);
             let name = &text[ns..ne];
             let Some(rule) = self.judge(name, Shape::UrlForm) else {
                 continue;
             };
-            let Some(body) = text[line_end..].find("\r\n\r\n").map(|x| line_end + x + 4) else {
-                continue;
-            };
-            let end = text[body..].find("\r\n--").map_or(text.len(), |x| body + x);
             let value = &text[body..end];
             if value.is_empty() || value == PLACEHOLDER {
                 continue;

@@ -55,6 +55,13 @@ def port() -> Iterator[int]:
     srv.shutdown()
 
 
+#: Categories off in tests that count replacements exactly. The loopback
+#: address is an IP, and a connection id is a process object id that passes
+#: the card checksum about one run in ten — both are replaced, correctly or
+#: not, independently of the rule under test.
+_OWN_IDS_OFF = frozenset({wardex.PIICategory.IP_ADDRESS, wardex.PIICategory.CREDIT_CARD})
+
+
 class _Capture(Transport):
     def __init__(self) -> None:
         self.otlp: list[bytes] = []
@@ -130,7 +137,7 @@ def test_a_masked_span_says_how_many_by_which_rule_under_which_names(port):
             ("POST", "/search?q=seoul&appid=owm999key", {"query": "seoul", "api_key": "abc123"}),
             ("GET", "/clean?q=seoul&page=2", None),
         ],
-        pii=PIIConfig(disabled_categories=frozenset({wardex.PIICategory.IP_ADDRESS})),
+        pii=PIIConfig(disabled_categories=_OWN_IDS_OFF),
     )
     ci = _by_path(env, "/search")["capture_integrity"]
     assert ci["redacted"] is True
@@ -161,7 +168,7 @@ def test_a_name_that_is_itself_personal_data_is_masked_in_the_names_list(port):
     env, otlp = _run(
         port,
         [("POST", "/k", {"john.doe@example.com_token": "t0ken-value"})],
-        pii=PIIConfig(disabled_categories=frozenset({wardex.PIICategory.IP_ADDRESS})),
+        pii=PIIConfig(disabled_categories=_OWN_IDS_OFF),
     )
     names = _by_path(env, "/k")["capture_integrity"]["redaction_names"]
     assert names == ["[EMAIL]_token"]
@@ -178,7 +185,7 @@ def test_extra_secret_names_masks_every_spelling_of_the_same_words(port):
         ],
         pii=PIIConfig(
             extra_secret_names={"x_corp_widget"},
-            disabled_categories=frozenset({wardex.PIICategory.IP_ADDRESS}),
+            disabled_categories=_OWN_IDS_OFF,
         ),
     )
     text = repr(env) + repr(otlp)
@@ -196,7 +203,7 @@ def test_reveal_names_exempts_the_name_rules_but_not_a_credential_shaped_value(p
         ],
         pii=PIIConfig(
             reveal_names={"code", "page_token"},
-            disabled_categories=frozenset({wardex.PIICategory.IP_ADDRESS}),
+            disabled_categories=_OWN_IDS_OFF,
         ),
     )
     otlp_text = repr(otlp)
@@ -326,7 +333,7 @@ def test_a_masked_envelope_body_for_receivers(port):
         transport=cap,
         intercept=True,
         capture_mode=CaptureMode.ALL,
-        pii=PIIConfig(disabled_categories=frozenset({wardex.PIICategory.IP_ADDRESS})),
+        pii=PIIConfig(disabled_categories=_OWN_IDS_OFF),
     )
     _call(port, "POST", "/search?q=seoul&appid=S3CRETowm", {"query": "seoul", "api_key": "S3CRETk"})
     wardex.flush()
@@ -390,3 +397,30 @@ def test_a_multipart_field_is_masked_like_a_form_field(port):
     wardex.flush()
     text = repr([_wardex_native.codec.decode_envelope(b) for b in cap.envelopes])
     assert "MPSEC1" not in text and "seoul-mp" in text
+
+
+def test_inflation_is_bounded_marked_and_never_invents_a_body():
+    """A body that merely starts like a zlib header stays as it was; one that
+    inflates past the bound keeps its inflated prefix and says it was cut."""
+    import gzip
+    import zlib
+
+    from wardex_sdk._interceptors._trackers import _inflated
+
+    class _T:
+        truncated = False
+
+    class _L:
+        max_decoded_bytes = 1024
+        max_opaque_body_bytes = 4096
+
+    plain = b"HK: hello this is a plain text body that only starts like zlib"
+    assert _inflated(_T(), plain, _L()) is plain
+    txn = _T()
+    big = gzip.compress(b'{"access_token": "BIG"}' + b" " * 5000)
+    out = _inflated(txn, big, _L())
+    assert out.startswith(b'{"access_token": "BIG"}') and len(out) == 1024
+    assert txn.truncated is True
+    small = _T()
+    assert _inflated(small, zlib.compress(b"q=seoul"), _L()) == b"q=seoul"
+    assert small.truncated is False

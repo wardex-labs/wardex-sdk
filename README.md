@@ -91,9 +91,9 @@ end.
 
 | Rule | The value is masked when | Names |
 |---|---|---|
-| `secret_word` | any word of the name is one of | `password`, `passwd`, `pwd`, `passphrase`, `secret`, `credential`, `credentials`, `jwt`, `bearer`, `signature`, `authorization`, `cookie`, `cookies`, `pass`, `passcode`, `otp`, `totp`, `cvv`, `cvc` |
-| `secret_last_word` | the name has two or more words and the last is | `key`, `token` |
-| `secret_exact_name` | the whole name is, word for word | `token`, `auth`, `apikey`, `apitoken`, `hapikey`, `appid`, `accesstoken`, `authtoken`, `privatetoken`, `accesskey`, `secretkey`, `privatekey`, `clientsecret`, `apisecret`, `sessionid`, `jsessionid`, `phpsessid`, `csrf`, `xsrf`, `csrfmiddlewaretoken`, `SAMLResponse`, `code_verifier`, `pw`, `pin`, `pincode`, `pin_code`, `csrftoken`, `connect.sid`, `auth_code`, `device_code`, `mfa_code` |
+| `secret_word` | any word of the name is one of | `password`, `passwd`, `pwd`, `passphrase`, `secret`, `credential`, `credentials`, `jwt`, `bearer`, `signature`, `authorization`, `cookie`, `cookies` |
+| `secret_last_word` | the name has two or more words and the last is | `key`, `token`, `pass`, `passcode`, `otp`, `totp`, `cvv`, `cvc` |
+| `secret_exact_name` | the whole name is, word for word | `token`, `auth`, `apikey`, `apitoken`, `hapikey`, `appid`, `accesstoken`, `authtoken`, `privatetoken`, `accesskey`, `secretkey`, `privatekey`, `clientsecret`, `apisecret`, `sessionid`, `jsessionid`, `phpsessid`, `csrf`, `xsrf`, `csrfmiddlewaretoken`, `SAMLResponse`, `code_verifier`, `pw`, `pass`, `passcode`, `otp`, `totp`, `cvv`, `cvc`, `pin`, `pincode`, `pin_code`, `csrftoken`, `connect.sid`, `auth_code`, `device_code`, `mfa_code` |
 | `secret_exact_name`, `name=value` only | the whole name is, in a URL query, a form body or a WebSocket target | `code`, `sig`, `key`, `sid` |
 
 So `api_key`, `access_token`, `X-Amz-Security-Token` and
@@ -147,9 +147,10 @@ wardex.init(
 A name in both sets, a bare string instead of a collection, or a name with no
 letters or digits is refused with a `ValueError` when the config is built.
 
-**Compressed bodies** (gzip or zlib) are captured inflated, up to
-`max_decoded_bytes`, so what you read and what is masked is the text the
-body carries.
+**Compressed bodies** (gzip or zlib) are captured inflated, so what you read
+and what is masked is the text the body carries. Inflation stops at the
+smaller of `max_decoded_bytes` and `max_opaque_body_bytes`; a body cut there
+keeps its inflated prefix and is marked truncated.
 
 **What masking does not catch.** Say so before you rely on it:
 
@@ -165,6 +166,11 @@ body carries.
 - a JSON name written with `\u` escapes or an escaped quote, and a name
   longer than 128 characters;
 - a credential inside a URL path (`/bot<token>/sendMessage`);
+- inside an argument that is itself percent-encoded, only secret names are
+  judged — not credential shapes or `user:password@` — and a value encoded
+  twice (`%253D`) is not decoded;
+- a `multipart/form-data` part that is not written as the standard requires
+  (CRLF line ends, a lowercase `form-data;`, a quoted `name="…"`);
 - payloads that are not text: the bytes between valid UTF-8 stretches pass
   through, and a body compressed other than gzip or zlib (Brotli, zstd) is
   not inflated;

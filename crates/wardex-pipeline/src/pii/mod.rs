@@ -127,7 +127,7 @@ fn category_rule(category: &str) -> Rule {
 /// or quoting byte — a raw password may itself contain `@`. A scanner rather
 /// than a regex so there is no compile step that could fail on the export
 /// path.
-fn userinfo_hits(text: &str, hits: &mut Vec<Hit>) {
+fn userinfo_hits(text: &str, hits: &mut Vec<Hit>, spans: &mut Vec<(usize, usize)>) {
     let b = text.as_bytes();
     let mut from = 0;
     while let Some(off) = text[from..].find("://") {
@@ -165,6 +165,11 @@ fn userinfo_hits(text: &str, hits: &mut Vec<Hit>) {
                     | b','
                     | b'('
                     | b')'
+                    // An argument boundary: `cb=http://h&password=p@ss` is
+                    // two arguments, not one URL's userinfo.
+                    | b'&'
+                    | b'='
+                    | b';'
             )
         {
             if b[stop] == b'@' {
@@ -187,6 +192,7 @@ fn userinfo_hits(text: &str, hits: &mut Vec<Hit>) {
         if userinfo == replacement {
             continue; // already redacted — not a second replacement
         }
+        spans.push((start, end));
         hits.push(Hit {
             start,
             end,
@@ -195,6 +201,17 @@ fn userinfo_hits(text: &str, hits: &mut Vec<Hit>) {
             name: None,
         });
     }
+}
+
+/// `bytes` as text of the same length: each byte of an invalid UTF-8
+/// sequence becomes `?`, a byte no rule treats as a boundary.
+pub(crate) fn ascii_stand_in(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len());
+    for chunk in bytes.utf8_chunks() {
+        out.push_str(chunk.valid());
+        out.extend(std::iter::repeat_n('?', chunk.invalid().len()));
+    }
+    out
 }
 
 impl PiiEngine {
@@ -263,6 +280,47 @@ impl PiiEngine {
     /// re-probe within a rejected candidate); replaced regions are never
     /// rescanned, so placeholders cannot re-match (design §5.2).
     pub fn mask_text_into(&self, text: &str, report: &mut Report) -> Option<String> {
+        let edits = self.edits(text, report);
+        if edits.is_empty() {
+            return None;
+        }
+        let mut out = String::with_capacity(text.len());
+        let mut pos = 0usize;
+        for (start, end, replacement) in edits {
+            out.push_str(&text[pos..start]);
+            out.push_str(&replacement);
+            pos = end;
+        }
+        out.push_str(&text[pos..]);
+        Some(out)
+    }
+
+    /// Bytes that may not be UTF-8 as a whole. Each invalid byte is judged as
+    /// a `?` — one byte for one byte, so every offset holds — and the edits
+    /// land on the original bytes. A Latin-1 `é` inside a password therefore
+    /// no longer splits the value in two and ships its tail.
+    pub fn mask_bytes_into(&self, bytes: &[u8], report: &mut Report) -> Option<Vec<u8>> {
+        let text = std::str::from_utf8(bytes)
+            .map(std::borrow::Cow::Borrowed)
+            .unwrap_or_else(|_| std::borrow::Cow::Owned(ascii_stand_in(bytes)));
+        let edits = self.edits(&text, report);
+        if edits.is_empty() {
+            return None;
+        }
+        let mut out = Vec::with_capacity(bytes.len());
+        let mut pos = 0usize;
+        for (start, end, replacement) in edits {
+            out.extend_from_slice(&bytes[pos..start]);
+            out.extend_from_slice(replacement.as_bytes());
+            pos = end;
+        }
+        out.extend_from_slice(&bytes[pos..]);
+        Some(out)
+    }
+
+    /// Every replacement `text` needs, as non-overlapping `(start, end,
+    /// replacement)` in order, each recorded into `report`.
+    fn edits(&self, text: &str, report: &mut Report) -> Vec<(usize, usize, String)> {
         let mut hits: Vec<Hit> = Vec::new();
         for p in &self.active {
             let mut at = 0;
@@ -317,25 +375,31 @@ impl PiiEngine {
                 name: Some(h.name),
             }));
         }
-        let before = hits.len();
-        userinfo_hits(text, &mut hits);
-        if hits.len() > before {
-            // A userinfo is the credential and nothing else: a value rule
+        let mut spans: Vec<(usize, usize)> = Vec::new();
+        userinfo_hits(text, &mut hits, &mut spans);
+        if !spans.is_empty() {
+            // A userinfo is the credential and nothing else: a VALUE rule
             // that starts inside it (`PW@api.example.com` read as an e-mail)
-            // would otherwise run its replacement over the host.
-            let spans: Vec<(usize, usize)> =
-                hits[before..].iter().map(|h| (h.start, h.end)).collect();
+            // would otherwise run its replacement over the host. Name-rule
+            // hits stay — they are secrets whatever they overlap. `spans` is
+            // in text order, so each lookup is a binary search.
             hits.retain(|h| {
-                h.rule == Rule::UrlUserinfo
-                    || !spans.iter().any(|&(s, e)| h.start >= s && h.start <= e)
+                if h.rule == Rule::UrlUserinfo || h.name.is_some() {
+                    return true;
+                }
+                let i = spans.partition_point(|&(s, _)| s <= h.start);
+                i == 0 || h.start > spans[i - 1].1
             });
         }
-        if hits.is_empty() {
-            return None;
-        }
-        // leftmost first; on ties the longer match wins (§5.2)
-        hits.sort_by(|a, b| a.start.cmp(&b.start).then(b.end.cmp(&a.end)));
-        let mut out = String::with_capacity(text.len());
+        // Leftmost first; on ties the longer match wins (§5.2), and on an
+        // identical range the name rule's hit, so the report keeps the name.
+        hits.sort_by(|a, b| {
+            a.start
+                .cmp(&b.start)
+                .then(b.end.cmp(&a.end))
+                .then(a.name.is_none().cmp(&b.name.is_none()))
+        });
+        let mut edits = Vec::with_capacity(hits.len());
         let mut pos = 0usize;
         for h in hits {
             if h.start < pos {
@@ -344,19 +408,17 @@ impl PiiEngine {
                 // span's tail raw (e.g. a Luhn-passing card that bled
                 // backwards into a preceding IP match).
                 if h.end > pos {
-                    out.push_str(&h.replacement);
+                    edits.push((pos, h.end, h.replacement));
                     pos = h.end;
                     report.record(h.rule, h.name.as_deref());
                 }
                 continue;
             }
-            out.push_str(&text[pos..h.start]);
-            out.push_str(&h.replacement);
             pos = h.end;
             report.record(h.rule, h.name.as_deref());
+            edits.push((h.start, h.end, h.replacement));
         }
-        out.push_str(&text[pos..]);
-        Some(out)
+        edits
     }
 }
 
@@ -650,6 +712,58 @@ mod tests {
         assert_eq!(
             mask("authorization:Basic YWxpY2U6aHVudGVyMg=="),
             "authorization:[SECRET]"
+        );
+    }
+
+    #[test]
+    fn a_url_argument_does_not_swallow_its_neighbours() {
+        let e = engine();
+        // `&` ends an argument, so the URL has no userinfo and the password
+        // after it is masked by its name.
+        assert_eq!(
+            e.mask_text("redirect=http://app.example.com&password=p@ssw0rd&x=1")
+                .unwrap(),
+            "redirect=http://app.example.com&password=[SECRET]&x=1"
+        );
+        assert_eq!(
+            e.mask_text("callback=http://myhost.example.com&user=john@corp.com&page=2")
+                .unwrap(),
+            "callback=http://myhost.example.com&user=[EMAIL]&page=2"
+        );
+        assert_eq!(
+            PiiEngine::userinfo_only().mask_text("cb=http://h&mail=a@b.co&page=2"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_byte_that_is_not_utf8_inside_a_secret_does_not_split_it() {
+        let e = engine();
+        let mut r = Report::default();
+        assert_eq!(
+            e.mask_bytes_into(b"password=p\xe4ssword&q=seoul", &mut r)
+                .unwrap(),
+            b"password=[SECRET]&q=seoul".to_vec()
+        );
+        assert_eq!(
+            e.mask_text("url=https%3A%2F%2Fh%2Fs%3Fq%3Dcaf%E9%26api_key%3DSEC1&page=2")
+                .unwrap(),
+            "url=https%3A%2F%2Fh%2Fs%3Fq%3Dcaf%E9%26api_key%3D[SECRET]&page=2"
+        );
+        assert_eq!(r.count, 1);
+    }
+
+    #[test]
+    fn head_nouns_are_not_prefixes() {
+        let e = engine();
+        assert_eq!(
+            e.mask_text("pass_through=true&otp_length=6&cvv_required=false&db_pass=S1&sms_otp=S2"),
+            Some("pass_through=true&otp_length=6&cvv_required=false&db_pass=[SECRET]&sms_otp=[SECRET]".into())
+        );
+        assert_eq!(
+            e.mask_text("curl -H 'Authorization: token abc123'")
+                .unwrap(),
+            "curl -H 'Authorization: [SECRET]'"
         );
     }
 

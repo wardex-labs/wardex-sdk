@@ -36,6 +36,8 @@ fn masks_one_mebibyte_under_100ms() {
         "password=".repeat(1024 * 1024 / 9 + 1),
         format!("{}=", "a".repeat(127)).repeat(1024 * 1024 / 128 + 1),
         "\"password\":[".repeat(1024 * 1024 / 12 + 1),
+        "form-data; name=\"q\"\r\n".repeat(1024 * 1024 / 24 + 1),
+        "a://u@h/ password=x ".repeat(1024 * 1024 / 20 + 1),
     ] {
         let start = std::time::Instant::now();
         engine.mask_text(&pathological);
