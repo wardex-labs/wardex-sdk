@@ -9,11 +9,12 @@ from __future__ import annotations
 
 import re
 import time
+import zlib
 from dataclasses import dataclass
 from typing import Any
 
 from .. import _hub, _wardex_native
-from .._assembly import Limitation, counters, parent_is_closed_unit
+from .._assembly import Limitation, counters, guard, parent_is_closed_unit
 from .._protocol import WsParser
 from .._protocol._http1 import Http1RequestParser, Http1ResponseParser
 from .._protocol._http2 import Http2Parser
@@ -95,6 +96,32 @@ def _url_target(txn: _Txn, withhold: bool = False) -> str:
     if withhold or txn.target is None:
         return txn.path
     return txn.target
+
+
+def _inflated(body: bytes, limits: object | None) -> bytes:
+    """A gzip- or zlib-compressed body as the bytes it carries.
+
+    A captured body is what a debugger reads and what masking scans, and
+    neither can see through compression: a gzipped OAuth token response
+    shipped its `access_token` as base64 anyone could gunzip. Recognised by
+    its header, as the semantic parser recognises it, and bounded by the
+    job's own `max_decoded_bytes` against decompression bombs. A body cut
+    short by the capture cap yields what it holds; one that inflates past the
+    bound, or fails to inflate, is returned as it was.
+    """
+    cap = getattr(limits, "max_decoded_bytes", 0)
+    is_gzip = body[:2] == b"\x1f\x8b"
+    # A zlib header: deflate method, and a check value divisible by 31 —
+    # which a text body that merely starts with `x` almost never is.
+    is_zlib = len(body) >= 2 and body[0] & 0x0F == 8 and (body[0] << 8 | body[1]) % 31 == 0
+    if not cap or not (is_gzip or is_zlib):
+        return body
+    out = None
+    with guard("interceptors.inflate"):
+        out = zlib.decompressobj(wbits=47).decompress(body, cap + 1)  # 47: gzip or zlib
+    if not out or len(out) > cap:
+        return body
+    return out
 
 
 def _is_ws_upgrade_request(headers: object) -> bool:

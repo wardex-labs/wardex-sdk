@@ -29,6 +29,23 @@ fn masks_one_mebibyte_under_100ms() {
     assert!(masked.contains(r#""api_key": "[SECRET]""#));
     assert!(masked.contains("appid=[SECRET]"));
     eprintln!("masked {} bytes in {elapsed:?}", corpus.len());
+
+    // The adversarial shapes: a secret name whose value never ends, and
+    // name after name with no separator, each a full mebibyte.
+    for pathological in [
+        "password=".repeat(1024 * 1024 / 9 + 1),
+        format!("{}=", "a".repeat(127)).repeat(1024 * 1024 / 128 + 1),
+        "\"password\":[".repeat(1024 * 1024 / 12 + 1),
+    ] {
+        let start = std::time::Instant::now();
+        engine.mask_text(&pathological);
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed.as_millis() < 100,
+            "masking 1 MiB of {:?}... took {elapsed:?} (budget: 100ms)",
+            &pathological[..12]
+        );
+    }
     assert!(
         elapsed.as_millis() < 100,
         "masking 1 MiB took {elapsed:?} (budget: 100ms)"

@@ -338,3 +338,55 @@ def test_a_masked_envelope_body_for_receivers(port):
         _MASKED_DIR.mkdir(parents=True, exist_ok=True)
         (_MASKED_DIR / "masked_http.envelope.zst").write_bytes(body)
     _check_masked_body((_MASKED_DIR / "masked_http.envelope.zst").read_bytes())
+
+
+class _GzipHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def do_POST(self) -> None:
+        import gzip
+
+        self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        body = gzip.compress(b'{"access_token": "GZSEC1", "token_type": "Bearer"}')
+        self.send_response(200)
+        self.send_header("Content-Encoding", "gzip")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args: object) -> None:
+        pass
+
+
+def test_a_gzipped_response_is_captured_inflated_and_masked():
+    """A token endpoint answering in gzip used to ship its `access_token` as
+    compressed bytes anyone could inflate; the captured body is now the text
+    it carries, masked like any other."""
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), _GzipHandler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        env, otlp = _run(srv.server_address[1], [("POST", "/oauth/token", {"grant_type": "x"})])
+    finally:
+        srv.shutdown()
+    text = repr(env) + repr(otlp)
+    assert "GZSEC1" not in text
+    (sp,) = [s for s in otlp if s["name"] == "HTTP POST /oauth/token"]
+    assert sp["attributes"]["wardex.output_data"] == (
+        '{"access_token": "[SECRET]", "token_type": "Bearer"}'
+    )
+
+
+def test_a_multipart_field_is_masked_like_a_form_field(port):
+    cap = _Capture()
+    wardex.init(transport=cap, intercept=True, capture_mode=CaptureMode.ALL)
+    body = (
+        b'--xb\r\nContent-Disposition: form-data; name="password"\r\n\r\nMPSEC1\r\n'
+        b'--xb\r\nContent-Disposition: form-data; name="q"\r\n\r\nseoul-mp\r\n--xb--\r\n'
+    )
+    c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    c.request("POST", "/upload", body, {"Content-Type": "multipart/form-data; boundary=xb"})
+    c.getresponse().read()
+    c.close()
+    wardex.flush()
+    text = repr([_wardex_native.codec.decode_envelope(b) for b in cap.envelopes])
+    assert "MPSEC1" not in text and "seoul-mp" in text
