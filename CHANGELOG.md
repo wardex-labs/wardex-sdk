@@ -173,7 +173,12 @@ All notable changes to this project are documented here. The format follows
   `group_id` — the two adapters now share one implementation of that rule —
   including for a subgraph run nested under it, and the shadowing is counted
   as `adapters.langgraph.thread_id_shadowed_by_host`. A `thread_id` that is
-  not a string — an integer, a `uuid.UUID` — is carried as its text. A run
+  not a string — an integer, a `uuid.UUID` — is carried as its text. The
+  `wardex.langgraph.thread_id` attribute and the `RESUMED_FROM` link now read
+  the thread by that same rule, so a `uuid.UUID` thread links a resumed run
+  where it used to link nothing, and an empty `thread_id` — which states no
+  conversation — no longer chains every run that passed one into a single
+  resume history. A run
   given no `thread_id` carries no conversation: wardex does not mint one. One
   gap is pinned rather than closed: a host conversation opened INSIDE a node
   does not reach a subgraph run called from that node, which inherits the

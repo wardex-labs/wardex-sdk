@@ -340,6 +340,40 @@ def test_a_second_run_on_the_same_thread_links_resumed_from(installed):  # noqa:
     assert "adapters.langgraph.link_target_unresolved" not in adapter_counters()
 
 
+def test_a_uuid_thread_id_links_resumed_from_and_is_recorded_as_its_text(installed):  # noqa: F811
+    """The thread reads through the same rule as the conversation id. Before,
+    a `str | int` filter here let a `uuid.UUID` thread — which LangGraph
+    accepts — become the conversation while its own attribute and the resume
+    link were dropped, so one run said two different things about its thread.
+    """
+    import uuid
+
+    thread = uuid.UUID("12345678-1234-5678-1234-567812345678")
+    app = _thread_graph()
+    config = {"configurable": {"thread_id": thread}}
+    app.invoke({"trail": []}, config)
+    app.invoke({"trail": []}, config)
+
+    run1, run2 = sorted(runs(installed.spans), key=lambda s: s.start_time_ns)
+    assert [dict(r.extra)["wardex.langgraph.thread_id"] for r in (run1, run2)] == [str(thread)] * 2
+    (link,) = run2.links
+    assert link.reason is LinkReason.RESUMED_FROM
+    assert link.span_id == run1.context.span_id
+
+
+def test_an_empty_thread_id_neither_links_nor_is_recorded(installed):  # noqa: F811
+    """`""` is "nobody said" for the conversation id, and the thread attribute
+    and the resume link now read it the same way instead of chaining every
+    run that passed an empty thread into one resume history."""
+    app = _thread_graph()
+    config = {"configurable": {"thread_id": ""}}
+    app.invoke({"trail": []}, config)
+    app.invoke({"trail": []}, config)
+
+    assert [s.links for s in runs(installed.spans)] == [(), ()]
+    assert all("wardex.langgraph.thread_id" not in dict(s.extra) for s in runs(installed.spans))
+
+
 def test_the_first_run_on_a_thread_claims_no_resume_and_counts_nothing(installed):  # noqa: F811
     """A fresh thread and a cross-process resume are indistinguishable at this
     seam, so the miss is SILENT (`expected=False`): counting every first run

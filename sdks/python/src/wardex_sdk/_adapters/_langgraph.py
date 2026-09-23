@@ -272,7 +272,8 @@ def _describe_run(adapter: Any, graph: Any, args: Any, kwargs: Any, run: Scope) 
     run.draft.set_extra("wardex.framework", _FRAMEWORK)
     with adapter._ctx.guard("describe_run_extras"):
         thread_id = _configurable(args, kwargs).get("thread_id")
-        if isinstance(thread_id, str | int):
+        if thread_id is not None and thread_id != "":  # as `framework_conversation`; UUID as text
+            thread_id = thread_id if isinstance(thread_id, str | int) else str(thread_id)
             run.draft.set_extra("wardex.langgraph.thread_id", thread_id)
             key = UnitKey("langgraph.thread_id", str(thread_id))
             # ORDER IS LOAD-BEARING: link FIRST, alias AFTER. Aliased first, live-first resolution
@@ -816,9 +817,8 @@ class LangGraphAdapter(AdapterInterface):
             )
             self._ctx.count("unsupported_surface")
             return
-        # After the probe, so a declined install leaves the classvar empty; and
-        # before the first patch, so no wrapper can be live and take a
-        # `GraphBubbleUp` while this is still `()`.
+        # After the probe, so a declined install leaves the classvar empty; and before the first
+        # patch, so no wrapper can be live and take a `GraphBubbleUp` while this is still `()`.
         type(self).CONTROL_FLOW = (errors.GraphBubbleUp,)
         patches = self._ctx.patches
         orig_stream = pregel_mod.Pregel.stream

@@ -1123,12 +1123,14 @@ def test_a_hostile_configurable_reaches_the_host_as_the_frameworks_own_error():
         live.teardown()
 
 
-def test_a_thread_id_that_is_not_a_scalar_is_skipped_without_a_guard_trip():
-    """The optional half declines on TYPE, so the ordinary hostile value costs nothing.
+def test_a_thread_id_that_is_not_a_scalar_is_carried_as_its_text_without_a_guard_trip():
+    """The optional half reads the thread as the conversation id does, and costs nothing.
 
-    A non-scalar `thread_id` is the shape a user's own config most easily takes,
-    and `isinstance(thread_id, str | int)` is what keeps it from reaching
-    `set_extra`. No guard fires, the key is simply absent, and the rest of the
+    A non-scalar `thread_id` is the shape a user's own config most easily takes.
+    It is the host's word, so it is carried as its text — the same text the run
+    carries as its conversation id, where a type filter here used to drop the
+    attribute while the conversation kept the value, so one run said two
+    different things about its thread. No guard fires, and the rest of the
     run — the run span, both node spans, one trace — is untouched. An optional
     enrichment key that could cost the run's whole tree is the failure the split
     inside `_describe_run` exists to prevent.
@@ -1140,7 +1142,9 @@ def test_a_thread_id_that_is_not_a_scalar_is_skipped_without_a_guard_trip():
 
         run = one(live.spans, "invoke_workflow Cfg")
         assert run.workflow_name == "Cfg"
-        assert "wardex.langgraph.thread_id" not in extra_of(run)
+        text = str(["not", "scalar"])
+        assert extra_of(run)["wardex.langgraph.thread_id"] == text
+        assert run.conversation.conversation_id == text
         assert len(traces(live.spans)) == 1
         assert len(steps(live.spans)) == 2
         assert "adapters.langgraph.describe_run_extras" not in adapter_counters()
