@@ -16,6 +16,7 @@ import threading
 import warnings
 from collections.abc import Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -294,3 +295,46 @@ def test_the_readme_name_table_is_the_list_the_masker_runs():
         "secret_exact_name": set(rules["exact_names"]),
         "secret_exact_name:url_form": set(rules["url_form_only_names"]),
     }
+
+
+_MASKED_DIR = Path(__file__).parent / "fixtures" / "masked_envelopes"
+
+
+def _check_masked_body(body: bytes) -> None:
+    """The contract a receiver can rely on for a body the masker touched: the
+    secrets are gone, the arguments are not, and the report says why."""
+    spans = [
+        it["span"] for it in _wardex_native.codec.decode_envelope(body)["items"] if "span" in it
+    ]
+    (http,) = [s for s in spans if s["name"] == "HTTP POST /search"]
+    assert "S3CRET" not in repr(spans)
+    assert http["transport"]["http"]["url"].endswith("/search?q=seoul&appid=[SECRET]")
+    ci = http["capture_integrity"]
+    assert ci["redacted"] is True and ci["redaction_count"] == 2
+    assert sorted(ci["redaction_rules"]) == ["secret_exact_name", "secret_last_word"]
+    assert sorted(ci["redaction_names"]) == ["api_key", "appid"]
+
+
+def test_a_masked_envelope_body_for_receivers(port):
+    """A body exactly as `WardexTransport` would POST it after masking, for a
+    receiver's tests to read in place of a hand-built one. Written only under
+    `WARDEX_REGEN_ENVELOPES=1`; the committed copy is checked on every run."""
+    import os
+
+    cap = _Capture()
+    wardex.init(
+        transport=cap,
+        intercept=True,
+        capture_mode=CaptureMode.ALL,
+        pii=PIIConfig(disabled_categories=frozenset({wardex.PIICategory.IP_ADDRESS})),
+    )
+    _call(port, "POST", "/search?q=seoul&appid=S3CRETowm", {"query": "seoul", "api_key": "S3CRETk"})
+    wardex.flush()
+    # The body the wardex wire carries: the envelope encoder with the policy
+    # `init()` installed, zstd included.
+    (body,) = cap.envelopes
+    _check_masked_body(body)
+    if os.environ.get("WARDEX_REGEN_ENVELOPES") == "1":
+        _MASKED_DIR.mkdir(parents=True, exist_ok=True)
+        (_MASKED_DIR / "masked_http.envelope.zst").write_bytes(body)
+    _check_masked_body((_MASKED_DIR / "masked_http.envelope.zst").read_bytes())
