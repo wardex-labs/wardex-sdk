@@ -66,6 +66,22 @@ def _merge_markers(*groups: tuple[Limitation, ...]) -> tuple[Limitation, ...]:
     return tuple(out)
 
 
+def _without_query(target: str | None) -> str | None:
+    """A request target up to (excluding) its query string and fragment.
+
+    Query strings are where credentials ride (`?api_key=`, `?sig=`, `?code=`),
+    and the path reaches the wire in a span's NAME and in its URL, so the
+    query is dropped where the path first enters Python, before anything can
+    carry it further. Nothing downstream reads it: the endpoint table, the
+    WebSocket classifier and the LLM parser all cut at the same two
+    characters. The OTLP codec applies the same rule to `url.full`, for URLs
+    that did not come through here.
+    """
+    if target is None:
+        return None
+    return target.split("?", 1)[0].split("#", 1)[0]
+
+
 def _is_ws_upgrade_request(headers: object) -> bool:
     up = _header_get(headers, "upgrade")
     conn = _header_get(headers, "connection")
@@ -182,7 +198,7 @@ class _Http1Tracker:
             self._parent_closed = parent_is_closed_unit(self._parent)
         for msg in self._req.feed(data):
             self._method = msg.method
-            self._path = msg.url
+            self._path = _without_query(msg.url)
             self._req_body = msg.body
             self._req_truncated = msg.truncated
             self._req_limitations = msg.limitations
@@ -498,7 +514,7 @@ class _Http2Tracker:
             counters.bump("protocol.http2.stream_evicted")
         return _Txn(
             method=t.method or "?",
-            path=t.path or "/",
+            path=_without_query(t.path) or "/",
             status=t.status,
             request_body=t.request_body,
             response_body=t.response_body,

@@ -128,6 +128,19 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- **A request's query string no longer reaches your backend in a span name.**
+  An HTTP, HTTP/2 or WebSocket span that wardex captured from the wire was
+  named `HTTP GET /tool?api_key=...` — the raw request target — and the
+  envelope's `http.url` carried the same query, while OTLP's `url.full` had
+  always cut it. A tool that authenticates by query string (`?api_key=`,
+  `?sig=`, `?code=`) therefore shipped its credential in plain text to the
+  span-name column of Phoenix, Langfuse or the wardex receiver, and the
+  default masking patterns, which key on fixed prefixes, did not catch it.
+  The target is now cut at its first `?` or `#` where it enters the SDK, so
+  the name, the envelope URL and `url.full` all follow the one rule. **Span
+  names change** for any captured request that had a query: `HTTP GET
+  /search?q=x` is now `HTTP GET /search`. A dashboard or filter that matched
+  on the query part of a name needs updating.
 - **A conversation id now reaches the wardex receiver.** The envelope encoder
   wrote `ConversationContext` into `extra` (`gen_ai.conversation.id`,
   `wardex.conversation.session_id`, `wardex.conversation.turn_index`) and left
