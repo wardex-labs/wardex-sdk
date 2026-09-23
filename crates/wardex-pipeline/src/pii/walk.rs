@@ -112,19 +112,36 @@ fn mask_string(m: &mut Masker<'_>, s: &mut String) -> bool {
     }
 }
 
-/// bytes are masked only when they decode as UTF-8; raw binary passes through
-/// (documented limitation, design §4.4).
+/// Bytes are masked as text, run by run: every stretch that is valid UTF-8
+/// is masked, and the bytes between stretches pass through untouched. One
+/// Latin-1 `é` in a form body used to switch masking off for the whole body;
+/// raw binary still passes through (documented limitation, design §4.4).
 fn mask_bytes(m: &mut Masker<'_>, b: &mut Vec<u8>) -> bool {
-    let Ok(text) = std::str::from_utf8(b) else {
-        return false;
-    };
-    match m.engine.mask_text_into(text, &mut m.report) {
-        Some(masked) => {
-            *b = masked.into_bytes();
-            true
-        }
-        None => false,
+    if let Ok(text) = std::str::from_utf8(b) {
+        return match m.engine.mask_text_into(text, &mut m.report) {
+            Some(masked) => {
+                *b = masked.into_bytes();
+                true
+            }
+            None => false,
+        };
     }
+    let mut out = Vec::with_capacity(b.len());
+    let mut hit = false;
+    for chunk in b.utf8_chunks() {
+        match m.engine.mask_text_into(chunk.valid(), &mut m.report) {
+            Some(masked) => {
+                out.extend_from_slice(masked.as_bytes());
+                hit = true;
+            }
+            None => out.extend_from_slice(chunk.valid().as_bytes()),
+        }
+        out.extend_from_slice(chunk.invalid());
+    }
+    if hit {
+        *b = out;
+    }
+    hit
 }
 
 /// Keys are attribute NAMES: never rewritten, but judged by the name rules —
@@ -1017,6 +1034,21 @@ mod tests {
         });
         mask_envelope(&engine(), &mut env);
         assert!(span_of(&env).capture_integrity.is_none());
+    }
+
+    #[test]
+    fn one_byte_that_is_not_utf8_no_longer_switches_a_body_off() {
+        let mut span = pb::Span {
+            name: "HTTP POST /login".into(),
+            input_data: b"password=LATIN1&name=caf\xe9".to_vec(),
+            ..Default::default()
+        };
+        let mut env = env_with(std::mem::take(&mut span));
+        mask_envelope(&engine(), &mut env);
+        assert_eq!(
+            span_of(&env).input_data,
+            b"password=[SECRET]&name=caf\xe9".to_vec()
+        );
     }
 
     fn text_kv(key: &str, v: &str) -> pb::KeyValue {

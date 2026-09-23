@@ -123,9 +123,10 @@ fn category_rule(category: &str) -> Rule {
 }
 
 /// The userinfo of every `scheme://userinfo@host` in `text`: after `://`,
-/// everything up to an `@` that comes before any path, query, fragment,
-/// whitespace or quoting byte. A scanner rather than a regex so there is no
-/// compile step that could fail on the export path.
+/// everything up to the LAST `@` before any path, query, fragment, whitespace
+/// or quoting byte — a raw password may itself contain `@`. A scanner rather
+/// than a regex so there is no compile step that could fail on the export
+/// path.
 fn userinfo_hits(text: &str, hits: &mut Vec<Hit>) {
     let b = text.as_bytes();
     let mut from = 0;
@@ -146,17 +147,35 @@ fn userinfo_hits(text: &str, hits: &mut Vec<Hit>) {
             continue; // no scheme before `://`
         }
         let start = sep + 3;
-        let mut end = start;
-        while end < b.len()
-            && !b[end].is_ascii_whitespace()
+        let mut stop = start;
+        let mut at = None;
+        while stop < b.len()
+            && !b[stop].is_ascii_whitespace()
             && !matches!(
-                b[end],
-                b'/' | b'?' | b'#' | b'@' | b'[' | b']' | b'"' | b'\'' | b'<' | b'>' | b'\\'
+                b[stop],
+                b'/' | b'?'
+                    | b'#'
+                    | b'['
+                    | b']'
+                    | b'"'
+                    | b'\''
+                    | b'<'
+                    | b'>'
+                    | b'\\'
+                    | b','
+                    | b'('
+                    | b')'
             )
         {
-            end += 1;
+            if b[stop] == b'@' {
+                at = Some(stop);
+            }
+            stop += 1;
         }
-        if end == start || end >= b.len() || b[end] != b'@' {
+        let Some(end) = at else {
+            continue;
+        };
+        if end == start {
             continue;
         }
         let userinfo = &text[start..end];
@@ -298,7 +317,19 @@ impl PiiEngine {
                 name: Some(h.name),
             }));
         }
+        let before = hits.len();
         userinfo_hits(text, &mut hits);
+        if hits.len() > before {
+            // A userinfo is the credential and nothing else: a value rule
+            // that starts inside it (`PW@api.example.com` read as an e-mail)
+            // would otherwise run its replacement over the host.
+            let spans: Vec<(usize, usize)> =
+                hits[before..].iter().map(|h| (h.start, h.end)).collect();
+            hits.retain(|h| {
+                h.rule == Rule::UrlUserinfo
+                    || !spans.iter().any(|&(s, e)| h.start >= s && h.start <= e)
+            });
+        }
         if hits.is_empty() {
             return None;
         }
@@ -370,6 +401,14 @@ fn apply(r: &Replacement, matched: &str) -> String {
                 "CardLast4 requires the >=13-digit Luhn floor"
             );
             format!("****-****-****-{}", &digits[digits.len() - 4..])
+        }
+        Replacement::AfterColon(label) => {
+            // The pattern guarantees a colon; the name and the spacing after
+            // it are the writer's and stay as written.
+            let keep = matched.find(':').map_or(0, |c| {
+                c + 1 + matched[c + 1..].len() - matched[c + 1..].trim_start().len()
+            });
+            format!("{}{label}", &matched[..keep])
         }
     }
 }
@@ -573,10 +612,45 @@ mod tests {
             None,
             "redacted userinfo is not replaced again"
         );
+        assert_eq!(
+            e.mask_text("http://bob:p@ss@h/p").unwrap(),
+            "http://REDACTED:REDACTED@h/p"
+        );
+        // With every rule on, the e-mail rule must not eat the host.
+        assert_eq!(
+            engine()
+                .mask_text("https://alice:PW1@api.example.com/v1?x=1")
+                .unwrap(),
+            "https://REDACTED:REDACTED@api.example.com/v1?x=1"
+        );
         let glued = e.mask_text("http://h:80http://u:pw@h/p").unwrap();
         assert_eq!(glued, "http://h:80http://REDACTED:REDACTED@h/p");
         // An e-mail in a path is not userinfo: a `/` comes before the `@`.
         assert_eq!(e.mask_text("http://h/u/john@x.com"), None);
+    }
+
+    #[test]
+    fn provider_token_shapes_are_masked() {
+        // Built from pieces so no whole provider token sits in the source,
+        // where a repository secret scanner would stop the push.
+        let cases = [
+            ["ASIA", "IOSFODNN7EXAMPLE"].concat(),
+            ["sk_", "live_", "abcdefghijklmnop1234"].concat(),
+            ["ya29", ".", "a0AfH6SMBxxxxxxxxxxxxxxxxxxxx"].concat(),
+            ["glpat", "-", "xxxxxxxxxxxxxxxxxxxx"].concat(),
+            ["hf_", "abcdefghijklmnopqrstuvwxyzABCDEF"].concat(),
+        ];
+        for token in cases {
+            assert_eq!(mask(&format!("t {token} ok")), "t [SECRET] ok", "{token}");
+        }
+        assert_eq!(
+            mask("curl -H 'Authorization: Bearer abc123' x"),
+            "curl -H 'Authorization: [SECRET]' x"
+        );
+        assert_eq!(
+            mask("authorization:Basic YWxpY2U6aHVudGVyMg=="),
+            "authorization:[SECRET]"
+        );
     }
 
     #[test]

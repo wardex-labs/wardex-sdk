@@ -125,12 +125,13 @@ class TestTransportPolicy:
         assert "[EMAIL]" in attrs["wardex.input_data"]
         assert attrs["wardex.redacted"] is True
 
-    def test_otlp_mask_mode_with_binary_payload_goes_base64_unmasked(self):
-        """Non-UTF-8 payloads pass the PII engine untouched (documented
-        limitation, design §4.4 — `mask_bytes` only scans valid UTF-8) and
-        must still leave the OTLP surface as a marked base64 string, not
-        bytes_value. Masking runs on the raw bytes BEFORE the base64 rewrite,
-        so if §4.4 is ever lifted the mask lands here with no further change."""
+    def test_otlp_mask_mode_with_binary_payload_masks_its_text_and_goes_base64(self):
+        """A payload that is not UTF-8 as a whole is masked stretch by stretch:
+        the valid UTF-8 runs are masked, the bytes between them pass through,
+        and the result still leaves the OTLP surface as a marked base64
+        string, not bytes_value. Masking runs on the raw bytes BEFORE the
+        base64 rewrite — which is why lifting the old all-or-nothing rule
+        (design §4.4) landed the mask here with no further change."""
         import base64
 
         from wardex_sdk import _wardex_native
@@ -141,7 +142,7 @@ class TestTransportPolicy:
         out = _wardex_native.codec.decode_otlp_traces(data)
         attrs = out["resource_spans"][0]["scope_spans"][0]["spans"][0]["attributes"]
         assert attrs["wardex.input_data.encoding"] == "base64"
-        assert base64.b64decode(attrs["wardex.input_data"]) == payload
+        assert base64.b64decode(attrs["wardex.input_data"]) == b"\xff\xfe" + b"contact: [EMAIL];"
 
     def test_otlp_masking_runs_before_base64_never_on_it(self):
         """Pins mask-then-debyte ordering with an observable divergence: a

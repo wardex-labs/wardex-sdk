@@ -157,7 +157,17 @@ All notable changes to this project are documented here. The format follows
   again**, masked by the same rules; `user:password@` in a URL becomes
   `REDACTED:REDACTED@` even under `PIIMode.OFF`; and values under names such
   as `page_token` or `idempotency_key` now read `[SECRET]` unless you list them
-  in `reveal_names`.
+  in `reveal_names`. The same rule covers `multipart/form-data` fields, an
+  argument percent-encoded inside another (`url=https%3A…%3Fapi_key%3D…`),
+  every leaf of an object or list passed under a secret name, and a value the
+  capture cap cut short.
+- **A gzip- or zlib-compressed HTTP body is captured as the text it carries.**
+  The captured body of a non-LLM request or response was the compressed bytes
+  — unreadable in your backend, and invisible to masking, so a gzipped OAuth
+  token response shipped its `access_token` for anyone to inflate. It is now
+  inflated at capture, bounded by `max_decoded_bytes`, as the seam's own
+  documentation already said it was. A body that inflates past the bound, or
+  is compressed another way, is kept as it was.
 - **A conversation id now reaches the wardex receiver.** The envelope encoder
   wrote `ConversationContext` into `extra` (`gen_ai.conversation.id`,
   `wardex.conversation.session_id`, `wardex.conversation.turn_index`) and left

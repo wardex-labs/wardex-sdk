@@ -59,7 +59,7 @@ from ._base import InterceptorInterface
 from ._close_hook import install_shared_close_hook, on_close, uninstall_shared_close_hook
 from ._conn_timing import install_shared_timing, uninstall_shared_timing
 from ._peer import UNRESOLVED_HOST, UNRESOLVED_PORT, peer_address, placeholder_host
-from ._trackers import _Txn, _url_target, _WebSocketTracker
+from ._trackers import _inflated, _Txn, _url_target, _WebSocketTracker
 
 if TYPE_CHECKING:
     from .._client import Client
@@ -1020,7 +1020,7 @@ def _assemble(p: _PendingTxn, *, parse: bool, extra: tuple[Limitation, ...]) -> 
         # never returned an answer) and silence was the old defect.
         draft.add_limitation(Limitation.INSTRUMENTATION_DEGRADED)
 
-    output_data = txn.response_body
+    output_data = _inflated(txn.response_body, p.limits)
     status_code = StatusCode.OK if 200 <= txn.status < 400 else StatusCode.ERROR
     # `finish()` refuses `status=ERROR` with no `error.type` and a refused
     # span is a DELETED span, so this may not be left `None`: without it
@@ -1158,7 +1158,7 @@ def _assemble(p: _PendingTxn, *, parse: bool, extra: tuple[Limitation, ...]) -> 
         # "attempted and succeeded", not "non-empty": the seam read both
         # bodies off the tracker, and a zero-length body is a captured
         # zero-length body. Withheld only under §3.9's restraint above.
-        draft.set_io(input_data=txn.request_body, output_data=output_data)
+        draft.set_io(input_data=_inflated(txn.request_body, p.limits), output_data=output_data)
     draft.integrity.truncated(txn.truncated)
     return draft.finish(txn.end_ns)
 

@@ -11,6 +11,9 @@ pub(crate) enum Replacement {
     Label(&'static str),
     /// PCI display rule: keep only the last four digits.
     CardLast4,
+    /// A header written as text: the name through its colon stays, the value
+    /// becomes the label (`Authorization: [SECRET]`).
+    AfterColon(&'static str),
 }
 
 pub(crate) struct PatternDef {
@@ -107,7 +110,7 @@ pub(crate) static BUILTINS: &[PatternDef] = &[
     },
     PatternDef {
         category: "secret",
-        regex: r"\bAKIA[0-9A-Z]{16}\b",
+        regex: r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b", // long-term and STS key ids
         validator: None,
         replacement: Replacement::Label("[SECRET]"),
         retry_on_reject: false,
@@ -138,6 +141,33 @@ pub(crate) static BUILTINS: &[PatternDef] = &[
         regex: r"(?i)\bbearer\s+[A-Za-z0-9._~+/-]{16,}=*",
         validator: None,
         replacement: Replacement::Label("[SECRET]"),
+        retry_on_reject: false,
+    },
+    // Stripe secret and restricted keys (`sk_live_…`, `rk_test_…`).
+    PatternDef {
+        category: "secret",
+        regex: r"\b[rs]k_(?:live|test)_[A-Za-z0-9]{16,}",
+        validator: None,
+        replacement: Replacement::Label("[SECRET]"),
+        retry_on_reject: false,
+    },
+    // Google OAuth access tokens, GitLab personal access tokens, Hugging Face
+    // tokens.
+    PatternDef {
+        category: "secret",
+        regex: r"\b(?:ya29\.[A-Za-z0-9_-]{20,}|glpat-[A-Za-z0-9_-]{20,}|hf_[A-Za-z0-9]{30,})",
+        validator: None,
+        replacement: Replacement::Label("[SECRET]"),
+        retry_on_reject: false,
+    },
+    // A Basic or Bearer credential written as a header in free text (a curl
+    // command in a tool's arguments), whatever its length: the header names
+    // it. As a JSON or form value it is the name rule's.
+    PatternDef {
+        category: "secret",
+        regex: r"(?i)\bauthorization\s*:\s*(?:basic|bearer)\s+[A-Za-z0-9._~+/-]+=*",
+        validator: None,
+        replacement: Replacement::AfterColon("[SECRET]"),
         retry_on_reject: false,
     },
     // A JWT: two base64url JSON segments (`eyJ` is `{"`) and a signature,

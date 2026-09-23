@@ -70,33 +70,46 @@ for. Two kinds of rule decide what is masked.
 
 **Value rules** look at the value itself: e-mail addresses, phone numbers,
 credit cards (Luhn-checked, last four kept), US SSNs, IP addresses, US bank
-routing numbers, IBANs, and credential shapes — `sk-…`, `AKIA…`, `ghp_…`,
-`xoxb-…`, `AIza…`, `Bearer …`, JWTs and PEM private keys.
+routing numbers, IBANs, and credential shapes — `sk-…`, `sk_live_…`,
+`AKIA…`/`ASIA…`, `ghp_…`, `glpat-…`, `hf_…`, `xoxb-…`, `AIza…`, `ya29.…`,
+`Bearer …`, an `Authorization: Basic|Bearer …` header written as text, JWTs
+and PEM private keys.
 
 **Name rules** look at the argument name the value is passed under. A URL
 query argument, a form field, a JSON key (including JSON escaped inside a
 string, such as a tool call's `arguments`) and a span attribute are all the
-same kind of argument, so `?api_key=…`, `{"api_key": …}` and
-`s.set_attribute("api_key", …)` are masked alike, whatever the transport. A
-name is split into words at `_`, `-`, `.`, spaces, brackets, `%XX` escapes and
-camelCase, and compared without case: `apiKey`, `X-Api-Key` and `API_KEY` are
-one name, and `keyword` or `monkey` never match `key`.
+same kind of argument, so `?api_key=…`, `{"api_key": …}`, a
+`multipart/form-data` field and `s.set_attribute("api_key", …)` are masked
+alike, whatever the transport; so is an argument percent-encoded inside
+another (`url=https%3A%2F%2F…%3Fapi_key%3D…`). A name is `%XX`-decoded, split
+into words at `_`, `-`, `.`, spaces, brackets and camelCase, stripped of
+trailing digits, and compared without case: `apiKey`, `X-Api-Key`,
+`API_KEY` and `api_key2` are one name, and `keyword` or `monkey` never match
+`key`. Under a secret name, a list or an object is masked leaf by leaf — its
+keys stay readable — and a value the capture cap cut short is masked to its
+end.
 
 | Rule | The value is masked when | Names |
 |---|---|---|
-| `secret_word` | any word of the name is one of | `password`, `passwd`, `pwd`, `passphrase`, `secret`, `credential`, `credentials`, `jwt`, `bearer`, `signature`, `authorization`, `cookie` |
+| `secret_word` | any word of the name is one of | `password`, `passwd`, `pwd`, `passphrase`, `secret`, `credential`, `credentials`, `jwt`, `bearer`, `signature`, `authorization`, `cookie`, `cookies`, `pass`, `passcode`, `otp`, `totp`, `cvv`, `cvc` |
 | `secret_last_word` | the name has two or more words and the last is | `key`, `token` |
-| `secret_exact_name` | the whole name is, word for word | `token`, `auth`, `apikey`, `apitoken`, `hapikey`, `appid`, `accesstoken`, `authtoken`, `privatetoken`, `accesskey`, `secretkey`, `privatekey`, `clientsecret`, `apisecret`, `sessionid`, `jsessionid`, `phpsessid`, `csrf`, `xsrf`, `csrfmiddlewaretoken`, `SAMLResponse`, `code_verifier` |
-| `secret_exact_name`, `name=value` only | the whole name is, in a URL query, a form body or a WebSocket target | `code`, `sig`, `key` |
+| `secret_exact_name` | the whole name is, word for word | `token`, `auth`, `apikey`, `apitoken`, `hapikey`, `appid`, `accesstoken`, `authtoken`, `privatetoken`, `accesskey`, `secretkey`, `privatekey`, `clientsecret`, `apisecret`, `sessionid`, `jsessionid`, `phpsessid`, `csrf`, `xsrf`, `csrfmiddlewaretoken`, `SAMLResponse`, `code_verifier`, `pw`, `pin`, `pincode`, `pin_code`, `csrftoken`, `connect.sid`, `auth_code`, `device_code`, `mfa_code` |
+| `secret_exact_name`, `name=value` only | the whole name is, in a URL query, a form body or a WebSocket target | `code`, `sig`, `key`, `sid` |
 
 So `api_key`, `access_token`, `X-Amz-Security-Token` and
 `password_confirmation` are masked, while `key_id`, `token_type`,
-`max_tokens`, `session_id` and `country_code` are not. `page_token` and
-`idempotency_key` **are** masked by default — their last word is `token` or
-`key`; reveal them if you need them (below). `code`, `sig` and `key` are
-credentials where OAuth, Azure SAS and Google send them, as `name=value`; in
-JSON the same names are an error code (`"code": -32601`), a code
-interpreter's source, or a map entry's key, and are kept.
+`max_tokens`, `session_id` and `country_code` are not. `page_token`,
+`next_token`, `idempotency_key`, `public_key`, `object_key` and
+`partition_key` **are** masked by default — their last word is `token` or
+`key`; reveal the ones you need (below). An object under a secret name is
+masked whole, so `{"Credentials": {"Expiration": …}}` loses its expiry too.
+
+`code`, `sig`, `key` and `sid` are credentials where OAuth, Azure SAS, Google
+and session cookies send them, as `name=value`; in JSON the same names are an
+error code (`"code": -32601`), a code interpreter's source, a map entry's key
+or a resource id, and are kept. The `name=value` shape is judged wherever it
+appears in text, so a SQL string `WHERE token=1` in a query argument reads
+`token=[SECRET]`.
 
 **URLs.** A span's name never carries a query, a fragment or credentials
 (`HTTP GET /v1/search`). The URL itself — `url.full` over OTLP — carries the
@@ -134,15 +147,27 @@ wardex.init(
 A name in both sets, a bare string instead of a collection, or a name with no
 letters or digits is refused with a `ValueError` when the config is built.
 
+**Compressed bodies** (gzip or zlib) are captured inflated, up to
+`max_decoded_bytes`, so what you read and what is masked is the text the
+body carries.
+
 **What masking does not catch.** Say so before you rely on it:
 
 - a secret under an ordinary name with no recognisable shape
-  (`{"value": "hunter2"}`) — no name rule and no value rule can see it;
-- `name: value` in prose or YAML, and `name = value` with spaces around `=`;
-- `code`, `sig` and `key` in JSON (kept on purpose, above) and plural names
-  such as `api_keys`, whose last word is not `key`;
+  (`{"value": "hunter2"}`, `x-auth`, `x_api_key_v2`) — no name rule and no
+  value rule can see it;
+- `name: value` in prose or YAML, `name = value` with spaces around `=`, and
+  XML (`<password>…</password>`);
+- `code`, `sig`, `key` and `sid` in JSON (kept on purpose, above) and plural
+  names such as `api_keys`, whose last word is not `key`;
+- the part of a `name=value` value after `;`, `,`, `\`, `#`, a quote, `<`,
+  `>`, `}` or whitespace, which end the value;
+- a JSON name written with `\u` escapes or an escaped quote, and a name
+  longer than 128 characters;
 - a credential inside a URL path (`/bot<token>/sendMessage`);
-- payloads that are not UTF-8 text, which pass through unmasked;
+- payloads that are not text: the bytes between valid UTF-8 stretches pass
+  through, and a body compressed other than gzip or zlib (Brotli, zstd) is
+  not inflated;
 - anything you read before the encoder runs: `before_send_envelope`,
   `ConsoleTransport` and a transport that serializes envelopes itself all see
   pre-masking data.
