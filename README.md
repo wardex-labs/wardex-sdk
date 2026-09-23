@@ -288,6 +288,16 @@ so decorated spans appear on operation-keyed dashboards. `span()` and
 a `TypeError` naming the decorators (a decorator would silently break async
 functions).
 
+The four decorators also record **where the decorated function is defined** —
+its source file, first line, function name and module — and export it as the
+span's call site: `Span.call_site` on the envelope, and `code.file.path`,
+`code.line.number` and `code.function.name` over OTLP. The file is whatever
+Python reports for the function, usually an absolute path such as
+`/Users/<you>/app/agent.py`, so it can carry an OS user name. It goes through
+PII masking like every other exported value, but no built-in category matches
+a user name inside a path, and there is no setting yet that leaves the call
+site out.
+
 ## Scope
 
 Ambient data that rides on every span captured under it:
@@ -1009,8 +1019,9 @@ runtime version probe.
 5. Node/TS and Java SDKs
 
 > PII masking caveats: `before_send_envelope` sees pre-masking data (masking runs inside
-> the encoder), the Console transport prints raw (local debugging only), and
-> non-UTF-8 binary payloads pass through unmasked.
+> the encoder), the Console transport prints raw (local debugging only),
+> non-UTF-8 binary payloads pass through unmasked, and no category matches a user
+> name inside a decorated function's source file path (see Tracing).
 
 ## License
 
