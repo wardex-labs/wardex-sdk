@@ -60,6 +60,93 @@ endpoint lost. A `base_url` without a key is refused with a `ValueError`, and
 so is a key whose region this SDK version has no receiver for — a batch sent
 to the wrong receiver would be a 401 the exporter is silent about.
 
+## Masking secrets and personal data
+
+Masking is on by default and runs **inside your process**, in the encoder,
+before a byte is sent — to the wardex receiver or to any OTLP collector. It
+never drops an argument: a value it masks becomes a placeholder in place, and
+the argument's name stays readable, so you can still see what an agent asked
+for. Two kinds of rule decide what is masked.
+
+**Value rules** look at the value itself: e-mail addresses, phone numbers,
+credit cards (Luhn-checked, last four kept), US SSNs, IP addresses, US bank
+routing numbers, IBANs, and credential shapes — `sk-…`, `AKIA…`, `ghp_…`,
+`xoxb-…`, `AIza…`, `Bearer …`, JWTs and PEM private keys.
+
+**Name rules** look at the argument name the value is passed under. A URL
+query argument, a form field, a JSON key (including JSON escaped inside a
+string, such as a tool call's `arguments`) and a span attribute are all the
+same kind of argument, so `?api_key=…`, `{"api_key": …}` and
+`s.set_attribute("api_key", …)` are masked alike, whatever the transport. A
+name is split into words at `_`, `-`, `.`, spaces, brackets, `%XX` escapes and
+camelCase, and compared without case: `apiKey`, `X-Api-Key` and `API_KEY` are
+one name, and `keyword` or `monkey` never match `key`.
+
+| Rule | The value is masked when | Names |
+|---|---|---|
+| `secret_word` | any word of the name is one of | `password`, `passwd`, `pwd`, `passphrase`, `secret`, `credential`, `credentials`, `jwt`, `bearer`, `signature`, `authorization`, `cookie` |
+| `secret_last_word` | the name has two or more words and the last is | `key`, `token` |
+| `secret_exact_name` | the whole name is, word for word | `token`, `auth`, `apikey`, `apitoken`, `hapikey`, `appid`, `accesstoken`, `authtoken`, `privatetoken`, `accesskey`, `secretkey`, `privatekey`, `clientsecret`, `apisecret`, `sessionid`, `jsessionid`, `phpsessid`, `csrf`, `xsrf`, `csrfmiddlewaretoken`, `SAMLResponse`, `code_verifier` |
+| `secret_exact_name`, `name=value` only | the whole name is, in a URL query, a form body or a WebSocket target | `code`, `sig`, `key` |
+
+So `api_key`, `access_token`, `X-Amz-Security-Token` and
+`password_confirmation` are masked, while `key_id`, `token_type`,
+`max_tokens`, `session_id` and `country_code` are not. `page_token` and
+`idempotency_key` **are** masked by default — their last word is `token` or
+`key`; reveal them if you need them (below). `code`, `sig` and `key` are
+credentials where OAuth, Azure SAS and Google send them, as `name=value`; in
+JSON the same names are an error code (`"code": -32601`), a code
+interpreter's source, or a map entry's key, and are kept.
+
+**URLs.** A span's name never carries a query, a fragment or credentials
+(`HTTP GET /v1/search`). The URL itself — `url.full` over OTLP — carries the
+whole query, masked by the same rules, and `user:password@` becomes
+`REDACTED:REDACTED@` **even with `PIIMode.OFF`**, as OpenTelemetry's semantic
+conventions require: an opt-out of masking is an opt-out of losing debugging
+values, and a URL's credentials are never one.
+
+**What a masked span tells you.** Every span that had anything replaced says
+how much, by which rule, and under which names. Over OTLP: `wardex.redacted`,
+`wardex.redaction.count`, `wardex.redaction.rules` (the rule names above, or a
+value rule's category such as `email` or `secret_value`, or `url_userinfo`) and
+`wardex.redaction.names` (the argument names a name rule matched, at most 32,
+themselves passed through the value rules). On the wardex envelope, the same
+facts in `CaptureIntegrity.redaction_count`, `redaction_rules` and
+`redaction_names`. A span nothing was replaced in carries none of them.
+
+**Your own names.** Add names your services use, or keep names you need to
+read. Both compare by words, like the built-in names, so one entry covers
+every spelling:
+
+```python
+from wardex_sdk import PIIConfig
+
+wardex.init(
+    pii=PIIConfig(
+        # Also masks xCorpAuth and X-Corp-Auth.
+        extra_secret_names={"x_corp_auth"},
+        # Kept, unless the value itself looks like a credential (sk-…).
+        reveal_names={"page_token", "code"},
+    ),
+)
+```
+
+A name in both sets, a bare string instead of a collection, or a name with no
+letters or digits is refused with a `ValueError` when the config is built.
+
+**What masking does not catch.** Say so before you rely on it:
+
+- a secret under an ordinary name with no recognisable shape
+  (`{"value": "hunter2"}`) — no name rule and no value rule can see it;
+- `name: value` in prose or YAML, and `name = value` with spaces around `=`;
+- `code`, `sig` and `key` in JSON (kept on purpose, above) and plural names
+  such as `api_keys`, whose last word is not `key`;
+- a credential inside a URL path (`/bot<token>/sendMessage`);
+- payloads that are not UTF-8 text, which pass through unmasked;
+- anything you read before the encoder runs: `before_send_envelope`,
+  `ConsoleTransport` and a transport that serializes envelopes itself all see
+  pre-masking data.
+
 ## Works with openai-agents
 
 Install wardex next to the OpenAI Agents SDK, set one environment variable,
@@ -131,7 +218,7 @@ way.
 | Group | What it decides |
 |---|---|
 | `backend=BackendConfig(...)` | Where the data goes and whose it is: `api_key`, `base_url`, `endpoint`, `headers` |
-| `pii=PIIConfig(...)` | What leaves the process: `mode`, `disabled_categories` |
+| `pii=PIIConfig(...)` | What leaves the process: `mode`, `disabled_categories`, `extra_secret_names`, `reveal_names` — see [Masking](#masking-secrets-and-personal-data) |
 | `batching=BatchingConfig(...)` | When buffered spans are sent: `flush_interval`, `flush_on_signals`, `shutdown_timeout` |
 | `limits=LimitsConfig(...)` | How much is captured — see [Resource limits](#resource-limits) |
 | `propagation=PropagationConfig(...)` | Whether wardex touches outbound traffic: `enabled`, `targets` |
@@ -717,8 +804,11 @@ diagnostic line (traceback under `debug=True`).
 - Export to any OpenTelemetry backend via `OtlpHttpTransport`
 - Manual span decorators: `@workflow` / `@agent` / `@step` / `@tool`
 - PII masking on by default: emails, phone numbers, credit cards (Luhn-verified),
-  US SSNs, IP addresses, bank routing numbers, IBANs, and API-key/token secrets
-  are masked before anything leaves the process (`pii=PIIConfig(mode=PIIMode.OFF)`
+  US SSNs, IP addresses, bank routing numbers, IBANs, credential-shaped values,
+  and any value passed under a secret argument name (`api_key`, `password`,
+  `X-Amz-Signature`, …) are masked before anything leaves the process, and each
+  masked span says what was replaced and why — see
+  [Masking](#masking-secrets-and-personal-data) (`pii=PIIConfig(mode=PIIMode.OFF)`
   to disable, `pii=PIIConfig(disabled_categories={PIICategory.IP_ADDRESS})` for
   per-category opt-out)
 - Background batching: automatic flush every 5s / on buffer threshold /
@@ -1020,8 +1110,10 @@ runtime version probe.
 
 > PII masking caveats: `before_send_envelope` sees pre-masking data (masking runs inside
 > the encoder), the Console transport prints raw (local debugging only),
-> non-UTF-8 binary payloads pass through unmasked, and no category matches a user
-> name inside a decorated function's source file path (see Tracing).
+> non-UTF-8 binary payloads pass through unmasked, no category matches a user
+> name inside a decorated function's source file path (see Tracing), and a
+> secret with neither a secret name nor a credential shape passes (see
+> [Masking](#masking-secrets-and-personal-data)).
 
 ## License
 

@@ -9,7 +9,45 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use wardex_codec::otlp::otlp_pb;
 use wardex_codec::proto::wardex::v1 as pb;
 
-use super::{PiiEngine, PII_FILTER_ERROR};
+use super::{PiiEngine, Report, Rule, Shape, PII_FILTER_ERROR, PLACEHOLDER};
+
+/// The engine plus what it has replaced so far in ONE record. A span gets a
+/// fresh one, so its report says what was masked in that span and nowhere
+/// else; the envelope header and snapshots use a scratch one.
+struct Masker<'e> {
+    engine: &'e PiiEngine,
+    report: Report,
+}
+
+impl<'e> Masker<'e> {
+    fn new(engine: &'e PiiEngine) -> Masker<'e> {
+        Masker {
+            engine,
+            report: Report::default(),
+        }
+    }
+
+    /// The rule a structured attribute's KEY puts its value under. A key is a
+    /// name in the JSON sense — `span.set_attribute("api_key", v)` is the
+    /// same argument as `{"api_key": v}` — so the `name=value`-only names do
+    /// not apply.
+    fn key_rule(&self, key: &str) -> Option<Rule> {
+        self.engine.name_rules()?.judge(key, Shape::Json)
+    }
+
+    /// The report with its names passed through the value rules: a key that
+    /// is itself an e-mail address must not leave the process in the list of
+    /// names that were masked.
+    fn finish(self) -> Report {
+        let Masker { engine, mut report } = self;
+        for n in &mut report.names {
+            if let Some(masked) = engine.mask_text(n) {
+                *n = masked;
+            }
+        }
+        report
+    }
+}
 
 /// Test-only panic injection for the fail-closed path.
 #[cfg(test)]
@@ -21,14 +59,14 @@ pub(super) const TEST_PANIC_SPAN_NAME: &str = "__wardex_test_panic__";
 pub fn mask_envelope(engine: &PiiEngine, env: &mut pb::Envelope) {
     let pb::Envelope { header, items } = env;
     if let Some(h) = header {
-        mask_header(engine, h);
+        mask_header(&mut Masker::new(engine), h);
     }
     for item in items {
         let pb::EnvelopeItem { header, payload } = item;
         if let Some(pb::EnvelopeItemHeader { r#type, length: _ }) = header {
             // Item-level metadata, masked at the same tier as the envelope
             // header — it does not feed any per-span redacted flag.
-            mask_string(engine, r#type);
+            mask_string(&mut Masker::new(engine), r#type);
         }
         match payload {
             Some(pb::envelope_item::Payload::Span(span)) => {
@@ -38,7 +76,9 @@ pub fn mask_envelope(engine: &PiiEngine, env: &mut pb::Envelope) {
                 }
             }
             Some(pb::envelope_item::Payload::StateSnapshot(snap)) => {
-                let masked = catch_unwind(AssertUnwindSafe(|| mask_snapshot(engine, snap)));
+                let masked = catch_unwind(AssertUnwindSafe(|| {
+                    mask_snapshot(&mut Masker::new(engine), snap)
+                }));
                 if masked.is_err() {
                     scrub_snapshot_fail_closed(snap);
                 }
@@ -62,8 +102,8 @@ pub fn mask_envelope(engine: &PiiEngine, env: &mut pb::Envelope) {
 
 // --- primitives ---
 
-fn mask_string(engine: &PiiEngine, s: &mut String) -> bool {
-    match engine.mask_text(s) {
+fn mask_string(m: &mut Masker<'_>, s: &mut String) -> bool {
+    match m.engine.mask_text_into(s, &mut m.report) {
         Some(masked) => {
             *s = masked;
             true
@@ -74,11 +114,11 @@ fn mask_string(engine: &PiiEngine, s: &mut String) -> bool {
 
 /// bytes are masked only when they decode as UTF-8; raw binary passes through
 /// (documented limitation, design §4.4).
-fn mask_bytes(engine: &PiiEngine, b: &mut Vec<u8>) -> bool {
+fn mask_bytes(m: &mut Masker<'_>, b: &mut Vec<u8>) -> bool {
     let Ok(text) = std::str::from_utf8(b) else {
         return false;
     };
-    match engine.mask_text(text) {
+    match m.engine.mask_text_into(text, &mut m.report) {
         Some(masked) => {
             *b = masked.into_bytes();
             true
@@ -87,34 +127,79 @@ fn mask_bytes(engine: &PiiEngine, b: &mut Vec<u8>) -> bool {
     }
 }
 
-fn mask_kvs(engine: &PiiEngine, kvs: &mut [pb::KeyValue]) -> bool {
+/// Keys are attribute NAMES: never rewritten, but judged by the name rules —
+/// a host's `set_attribute("db.password", v)` is a secret argument like any
+/// other.
+fn mask_kvs(m: &mut Masker<'_>, kvs: &mut [pb::KeyValue]) -> bool {
     let mut hit = false;
     for kv in kvs.iter_mut() {
-        let pb::KeyValue { key: _, value } = kv; // keys are our own attribute names
+        let pb::KeyValue { key, value } = kv;
         if let Some(v) = value {
-            hit |= mask_any(engine, v);
+            hit |= match m.key_rule(key) {
+                Some(rule) => replace_any(m, v, rule, key),
+                None => mask_any(m, v),
+            };
         }
     }
     hit
 }
 
-fn mask_any(engine: &PiiEngine, v: &mut pb::AnyValue) -> bool {
+/// Replace a value that sits under a secret name. Scalars become the
+/// placeholder (a number becomes a string, as it does in JSON); a list has
+/// each element replaced; a nested map is walked, its own keys judged in turn.
+fn replace_any(m: &mut Masker<'_>, v: &mut pb::AnyValue, rule: Rule, key: &str) -> bool {
     use pb::any_value::Value;
     let pb::AnyValue { value } = v;
-    match value {
-        Some(Value::StringValue(s)) => mask_string(engine, s),
-        Some(Value::BytesValue(b)) => mask_bytes(engine, b),
+    let replaced = match value {
+        Some(Value::StringValue(s)) if !s.is_empty() && s != PLACEHOLDER => {
+            *s = PLACEHOLDER.into();
+            true
+        }
+        Some(Value::BytesValue(b)) if !b.is_empty() && b != PLACEHOLDER.as_bytes() => {
+            *b = PLACEHOLDER.as_bytes().to_vec();
+            true
+        }
+        Some(Value::IntValue(_)) | Some(Value::DoubleValue(_)) => {
+            *value = Some(Value::StringValue(PLACEHOLDER.into()));
+            true
+        }
         Some(Value::ArrayValue(arr)) => {
             let pb::ArrayValue { values } = arr;
             let mut hit = false;
             for item in values {
-                hit |= mask_any(engine, item);
+                hit |= replace_any(m, item, rule, key);
+            }
+            return hit;
+        }
+        Some(Value::KvlistValue(kvl)) => {
+            let pb::KeyValueList { values } = kvl;
+            return mask_kvs(m, values);
+        }
+        _ => false,
+    };
+    if replaced {
+        m.report.record(rule, Some(key));
+    }
+    replaced
+}
+
+fn mask_any(m: &mut Masker<'_>, v: &mut pb::AnyValue) -> bool {
+    use pb::any_value::Value;
+    let pb::AnyValue { value } = v;
+    match value {
+        Some(Value::StringValue(s)) => mask_string(m, s),
+        Some(Value::BytesValue(b)) => mask_bytes(m, b),
+        Some(Value::ArrayValue(arr)) => {
+            let pb::ArrayValue { values } = arr;
+            let mut hit = false;
+            for item in values {
+                hit |= mask_any(m, item);
             }
             hit
         }
         Some(Value::KvlistValue(kvl)) => {
             let pb::KeyValueList { values } = kvl;
-            mask_kvs(engine, values)
+            mask_kvs(m, values)
         }
         Some(Value::BoolValue(_))
         | Some(Value::IntValue(_))
@@ -125,7 +210,7 @@ fn mask_any(engine: &PiiEngine, v: &mut pb::AnyValue) -> bool {
 
 // --- message walks ---
 
-fn mask_header(engine: &PiiEngine, h: &mut pb::EnvelopeHeader) {
+fn mask_header(m: &mut Masker<'_>, h: &mut pb::EnvelopeHeader) {
     let pb::EnvelopeHeader {
         event_id,
         sdk,
@@ -138,7 +223,7 @@ fn mask_header(engine: &PiiEngine, h: &mut pb::EnvelopeHeader) {
         // detach a stored batch from its project.
         project_id: _,
     } = h;
-    mask_string(engine, event_id);
+    mask_string(m, event_id);
     if let Some(r) = resource {
         // The app's identity strings are host-supplied free text, so they get
         // the same treatment as SdkInfo's strings below.
@@ -151,9 +236,9 @@ fn mask_header(engine: &PiiEngine, h: &mut pb::EnvelopeHeader) {
             // attribution (fork parent vs child) the field exists to carry.
             process_pid: _,
         } = r;
-        mask_string(engine, service_name);
-        mask_string(engine, release);
-        mask_string(engine, environment);
+        mask_string(m, service_name);
+        mask_string(m, release);
+        mask_string(m, environment);
     }
     if let Some(s) = sdk {
         let pb::SdkInfo {
@@ -167,23 +252,24 @@ fn mask_header(engine: &PiiEngine, h: &mut pb::EnvelopeHeader) {
             otel_semconv_version,
             shell,
         } = s;
-        mask_string(engine, name);
-        mask_string(engine, version);
-        mask_string(engine, python_version);
-        mask_string(engine, os);
-        mask_string(engine, arch);
+        mask_string(m, name);
+        mask_string(m, version);
+        mask_string(m, python_version);
+        mask_string(m, os);
+        mask_string(m, arch);
         for a in adapters {
-            mask_string(engine, a);
+            mask_string(m, a);
         }
         for i in interceptors {
-            mask_string(engine, i);
+            mask_string(m, i);
         }
-        mask_string(engine, otel_semconv_version);
-        mask_string(engine, shell);
+        mask_string(m, otel_semconv_version);
+        mask_string(m, shell);
     }
 }
 
 fn mask_span(engine: &PiiEngine, span: &mut pb::Span) {
+    let m = &mut Masker::new(engine);
     #[cfg(test)]
     if span.name == TEST_PANIC_SPAN_NAME {
         panic!("injected test panic");
@@ -217,19 +303,19 @@ fn mask_span(engine: &PiiEngine, span: &mut pb::Span) {
         correlation,
     } = span;
     let mut hit = false;
-    hit |= mask_string(engine, name);
+    hit |= mask_string(m, name);
     if let Some(pb::Status { code: _, message }) = status {
-        hit |= mask_string(engine, message);
+        hit |= mask_string(m, message);
     }
-    hit |= mask_kvs(engine, extra);
+    hit |= mask_kvs(m, extra);
     for ev in events {
         let pb::SpanEvent {
             name,
             time_unix_nano: _,
             attributes,
         } = ev;
-        hit |= mask_string(engine, name);
-        hit |= mask_kvs(engine, attributes);
+        hit |= mask_string(m, name);
+        hit |= mask_kvs(m, attributes);
     }
     for link in links {
         let pb::SpanLink {
@@ -243,16 +329,16 @@ fn mask_span(engine: &PiiEngine, span: &mut pb::Span) {
             // "what Rust must receive".
             reason: _,
         } = link;
-        hit |= mask_kvs(engine, attributes);
+        hit |= mask_kvs(m, attributes);
     }
-    hit |= mask_bytes(engine, input_data);
-    hit |= mask_bytes(engine, output_data);
+    hit |= mask_bytes(m, input_data);
+    hit |= mask_bytes(m, output_data);
     if let Some(t) = transport {
-        hit |= mask_transport(engine, t);
+        hit |= mask_transport(m, t);
     }
-    hit |= mask_string(engine, error_type);
-    hit |= mask_string(engine, server_address);
-    hit |= mask_string(engine, workflow_name);
+    hit |= mask_string(m, error_type);
+    hit |= mask_string(m, server_address);
+    hit |= mask_string(m, workflow_name);
     if let Some(pb::CallSite {
         file,
         line: _,
@@ -260,9 +346,9 @@ fn mask_span(engine: &PiiEngine, span: &mut pb::Span) {
         module,
     }) = call_site
     {
-        hit |= mask_string(engine, file);
-        hit |= mask_string(engine, function);
-        hit |= mask_string(engine, module);
+        hit |= mask_string(m, file);
+        hit |= mask_string(m, function);
+        hit |= mask_string(m, module);
     }
     if let Some(pb::ConversationContext {
         conversation_id,
@@ -270,8 +356,8 @@ fn mask_span(engine: &PiiEngine, span: &mut pb::Span) {
         turn_index: _,
     }) = conversation
     {
-        hit |= mask_string(engine, conversation_id);
-        hit |= mask_string(engine, session_id);
+        hit |= mask_string(m, conversation_id);
+        hit |= mask_string(m, session_id);
     }
     if let Some(pb::CorrelationInfo {
         operation_id,
@@ -285,23 +371,26 @@ fn mask_span(engine: &PiiEngine, span: &mut pb::Span) {
         parent_source: _,
     }) = correlation
     {
-        hit |= mask_string(engine, operation_id);
-        hit |= mask_string(engine, request_id);
-        hit |= mask_string(engine, attempt_id);
+        hit |= mask_string(m, operation_id);
+        hit |= mask_string(m, request_id);
+        hit |= mask_string(m, attempt_id);
     }
     // `CaptureIntegrity` is deliberately NOT destructured any more. Every one
     // of its fields is a bool, an i32 or a repeated closed enum; none can carry
     // PII, so masking it was work with no possible effect.
-    // Note the ordering that survives: `redacted` is still written below from
-    // `hit`, and it has to stay after every other field has been scanned.
+    // Note the ordering that survives: `redacted` and the report are written
+    // below, and they have to stay after every other field has been scanned.
+    let report = std::mem::replace(m, Masker::new(engine)).finish();
     if hit {
-        capture_integrity
-            .get_or_insert_with(Default::default)
-            .redacted = true;
+        let ci = capture_integrity.get_or_insert_with(Default::default);
+        ci.redacted = true;
+        ci.redaction_count = i32::try_from(report.count).unwrap_or(i32::MAX);
+        ci.redaction_rules = report.rules.iter().map(|r| *r as i32).collect();
+        ci.redaction_names = report.names;
     }
 }
 
-fn mask_transport(engine: &PiiEngine, t: &mut pb::TransportAttributes) -> bool {
+fn mask_transport(m: &mut Masker<'_>, t: &mut pb::TransportAttributes) -> bool {
     let pb::TransportAttributes {
         connection_id,
         protocol: _,
@@ -325,7 +414,7 @@ fn mask_transport(engine: &PiiEngine, t: &mut pb::TransportAttributes) -> bool {
         connection_reused: _,
     } = t;
     let mut hit = false;
-    hit |= mask_string(engine, connection_id);
+    hit |= mask_string(m, connection_id);
     // All numeric today; the exhaustive destructure is the §4.3 compile-time
     // tripwire for future text fields.
     if let Some(pb::TransportTiming {
@@ -342,8 +431,8 @@ fn mask_transport(engine: &PiiEngine, t: &mut pb::TransportAttributes) -> bool {
         url,
     }) = http
     {
-        hit |= mask_string(engine, method);
-        hit |= mask_string(engine, url);
+        hit |= mask_string(m, method);
+        hit |= mask_string(m, url);
     }
     if let Some(pb::GrpcMeta {
         service,
@@ -354,35 +443,35 @@ fn mask_transport(engine: &PiiEngine, t: &mut pb::TransportAttributes) -> bool {
         decoded_payload,
     }) = grpc
     {
-        hit |= mask_string(engine, service);
-        hit |= mask_string(engine, method);
-        hit |= mask_string(engine, encoding);
-        hit |= mask_string(engine, decoded_payload);
+        hit |= mask_string(m, service);
+        hit |= mask_string(m, method);
+        hit |= mask_string(m, encoding);
+        hit |= mask_string(m, decoded_payload);
     }
     if let Some(pb::WebSocketMeta {
         opcode: _,
         direction,
     }) = websocket
     {
-        hit |= mask_string(engine, direction);
+        hit |= mask_string(m, direction);
     }
     if let Some(pb::McpMeta { rpc_method, rpc_id }) = mcp {
-        hit |= mask_string(engine, rpc_method);
-        hit |= mask_string(engine, rpc_id);
+        hit |= mask_string(m, rpc_method);
+        hit |= mask_string(m, rpc_id);
     }
     if let Some(pb::SseMeta { event_type }) = sse {
-        hit |= mask_string(engine, event_type);
+        hit |= mask_string(m, event_type);
     }
     if let Some(pb::A2aMeta { task_id, transport }) = a2a {
-        hit |= mask_string(engine, task_id);
-        hit |= mask_string(engine, transport);
+        hit |= mask_string(m, task_id);
+        hit |= mask_string(m, transport);
     }
-    hit |= mask_string(engine, request_blob_ref);
-    hit |= mask_string(engine, response_blob_ref);
+    hit |= mask_string(m, request_blob_ref);
+    hit |= mask_string(m, response_blob_ref);
     hit
 }
 
-fn mask_snapshot(engine: &PiiEngine, snap: &mut pb::StateSnapshot) {
+fn mask_snapshot(m: &mut Masker<'_>, snap: &mut pb::StateSnapshot) {
     let pb::StateSnapshot {
         trace_id: _,
         span_id: _,
@@ -394,17 +483,17 @@ fn mask_snapshot(engine: &PiiEngine, snap: &mut pb::StateSnapshot) {
         input_refs,
         tool_definitions,
     } = snap;
-    mask_kvs(engine, attributes);
-    mask_bytes(engine, conversation_state);
+    mask_kvs(m, attributes);
+    mask_bytes(m, conversation_state);
     for r in input_refs {
         let pb::InputRef {
             key,
             content_hash,
             blob_ref,
         } = r;
-        mask_string(engine, key);
-        mask_string(engine, content_hash);
-        mask_string(engine, blob_ref);
+        mask_string(m, key);
+        mask_string(m, content_hash);
+        mask_string(m, blob_ref);
     }
     if let Some(pb::ToolDefinitionSet { tools, set_hash }) = tool_definitions {
         for tool in tools {
@@ -416,14 +505,14 @@ fn mask_snapshot(engine: &PiiEngine, snap: &mut pb::StateSnapshot) {
                 r#type,
                 hash,
             } = tool;
-            mask_string(engine, name);
-            mask_string(engine, description);
-            mask_bytes(engine, parameters_schema);
-            mask_string(engine, version);
-            mask_string(engine, r#type);
-            mask_string(engine, hash);
+            mask_string(m, name);
+            mask_string(m, description);
+            mask_bytes(m, parameters_schema);
+            mask_string(m, version);
+            mask_string(m, r#type);
+            mask_string(m, hash);
         }
-        mask_string(engine, set_hash);
+        mask_string(m, set_hash);
     }
 }
 
@@ -447,9 +536,9 @@ pub fn mask_otlp(engine: &PiiEngine, req: &mut otlp_pb::trace_service::ExportTra
             dropped_attributes_count: _,
         }) = resource
         {
-            mask_otlp_kvs(engine, attributes);
+            mask_otlp_kvs(&mut Masker::new(engine), attributes);
         }
-        mask_string(engine, schema_url);
+        mask_string(&mut Masker::new(engine), schema_url);
         for ss in scope_spans {
             let otlp_pb::trace::ScopeSpans {
                 scope,
@@ -463,23 +552,26 @@ pub fn mask_otlp(engine: &PiiEngine, req: &mut otlp_pb::trace_service::ExportTra
                 dropped_attributes_count: _,
             }) = scope
             {
-                mask_string(engine, name);
-                mask_string(engine, version);
-                mask_otlp_kvs(engine, attributes);
+                let m = &mut Masker::new(engine);
+                mask_string(m, name);
+                mask_string(m, version);
+                mask_otlp_kvs(m, attributes);
             }
-            mask_string(engine, schema_url);
+            mask_string(&mut Masker::new(engine), schema_url);
             for span in spans {
                 match catch_unwind(AssertUnwindSafe(|| mask_otlp_span(engine, span))) {
                     Err(_) => scrub_otlp_span_fail_closed(span),
-                    Ok(true) => span.attributes.push(otlp_kv_bool("wardex.redacted", true)),
-                    Ok(false) => {}
+                    Ok(Some(report)) => push_otlp_report(&mut span.attributes, report),
+                    Ok(None) => {}
                 }
             }
         }
     }
 }
 
-fn mask_otlp_span(engine: &PiiEngine, span: &mut otlp_pb::trace::Span) -> bool {
+/// `Some(report)` when anything in the span was replaced.
+fn mask_otlp_span(engine: &PiiEngine, span: &mut otlp_pb::trace::Span) -> Option<Report> {
+    let m = &mut Masker::new(engine);
     #[cfg(test)]
     if span.name == TEST_PANIC_SPAN_NAME {
         panic!("injected test panic");
@@ -503,9 +595,9 @@ fn mask_otlp_span(engine: &PiiEngine, span: &mut otlp_pb::trace::Span) -> bool {
         status,
     } = span;
     let mut hit = false;
-    hit |= mask_string(engine, trace_state);
-    hit |= mask_string(engine, name);
-    hit |= mask_otlp_kvs(engine, attributes);
+    hit |= mask_string(m, trace_state);
+    hit |= mask_string(m, name);
+    hit |= mask_otlp_kvs(m, attributes);
     for ev in events {
         let otlp_pb::trace::span::Event {
             time_unix_nano: _,
@@ -513,8 +605,8 @@ fn mask_otlp_span(engine: &PiiEngine, span: &mut otlp_pb::trace::Span) -> bool {
             attributes,
             dropped_attributes_count: _,
         } = ev;
-        hit |= mask_string(engine, name);
-        hit |= mask_otlp_kvs(engine, attributes);
+        hit |= mask_string(m, name);
+        hit |= mask_otlp_kvs(m, attributes);
     }
     for link in links {
         let otlp_pb::trace::span::Link {
@@ -525,43 +617,163 @@ fn mask_otlp_span(engine: &PiiEngine, span: &mut otlp_pb::trace::Span) -> bool {
             dropped_attributes_count: _,
             flags: _,
         } = link;
-        hit |= mask_string(engine, trace_state);
-        hit |= mask_otlp_kvs(engine, attributes);
+        hit |= mask_string(m, trace_state);
+        hit |= mask_otlp_kvs(m, attributes);
     }
     if let Some(otlp_pb::trace::Status { message, code: _ }) = status {
-        hit |= mask_string(engine, message);
+        hit |= mask_string(m, message);
     }
-    hit
+    hit.then(|| std::mem::replace(m, Masker::new(engine)).finish())
 }
 
-fn mask_otlp_kvs(engine: &PiiEngine, kvs: &mut [otlp_pb::common::KeyValue]) -> bool {
+/// `wardex.redacted` plus what was replaced, merged into whatever the mapping
+/// already carried from the envelope's own report — one set of keys per span,
+/// however many passes wrote to it.
+fn push_otlp_report(attrs: &mut Vec<otlp_pb::common::KeyValue>, report: Report) {
+    use otlp_pb::common::any_value::Value;
+    let take = |attrs: &mut Vec<otlp_pb::common::KeyValue>, key: &str| {
+        attrs
+            .iter()
+            .position(|kv| kv.key == key)
+            .and_then(|i| attrs.remove(i).value)
+            .and_then(|v| v.value)
+    };
+    let mut count = i64::from(report.count);
+    if let Some(Value::IntValue(prior)) = take(attrs, "wardex.redaction.count") {
+        count = count.saturating_add(prior);
+    }
+    let strings = |v: Option<Value>| -> Vec<String> {
+        match v {
+            Some(Value::ArrayValue(a)) => a
+                .values
+                .into_iter()
+                .filter_map(|x| match x.value {
+                    Some(Value::StringValue(s)) => Some(s),
+                    _ => None,
+                })
+                .collect(),
+            _ => Vec::new(),
+        }
+    };
+    let mut rules = strings(take(attrs, "wardex.redaction.rules"));
+    for r in &report.rules {
+        let name = wardex_codec::vocab::redaction_rule_name(*r as i32);
+        if !rules.contains(&name) {
+            rules.push(name);
+        }
+    }
+    let mut names = strings(take(attrs, "wardex.redaction.names"));
+    for n in report.names {
+        if names.len() < super::MAX_REPORTED_NAMES && !names.contains(&n) {
+            names.push(n);
+        }
+    }
+    if !attrs.iter().any(|kv| kv.key == "wardex.redacted") {
+        attrs.push(otlp_kv_bool("wardex.redacted", true));
+    }
+    attrs.push(otlp_pb::common::KeyValue {
+        key: "wardex.redaction.count".into(),
+        value: Some(otlp_pb::common::AnyValue {
+            value: Some(Value::IntValue(count)),
+        }),
+    });
+    for (key, list) in [
+        ("wardex.redaction.rules", rules),
+        ("wardex.redaction.names", names),
+    ] {
+        if list.is_empty() {
+            continue;
+        }
+        attrs.push(otlp_pb::common::KeyValue {
+            key: key.into(),
+            value: Some(otlp_pb::common::AnyValue {
+                value: Some(Value::ArrayValue(otlp_pb::common::ArrayValue {
+                    values: list
+                        .into_iter()
+                        .map(|s| otlp_pb::common::AnyValue {
+                            value: Some(Value::StringValue(s)),
+                        })
+                        .collect(),
+                })),
+            }),
+        });
+    }
+}
+
+/// The OTLP twin of `mask_kvs`: keys judged, never rewritten.
+fn mask_otlp_kvs(m: &mut Masker<'_>, kvs: &mut [otlp_pb::common::KeyValue]) -> bool {
     let mut hit = false;
     for kv in kvs.iter_mut() {
-        let otlp_pb::common::KeyValue { key: _, value } = kv;
+        let otlp_pb::common::KeyValue { key, value } = kv;
         if let Some(v) = value {
-            hit |= mask_otlp_any(engine, v);
+            hit |= match m.key_rule(key) {
+                Some(rule) => replace_otlp_any(m, v, rule, key),
+                None => mask_otlp_any(m, v),
+            };
         }
     }
     hit
 }
 
-fn mask_otlp_any(engine: &PiiEngine, v: &mut otlp_pb::common::AnyValue) -> bool {
+/// The OTLP twin of `replace_any`.
+fn replace_otlp_any(
+    m: &mut Masker<'_>,
+    v: &mut otlp_pb::common::AnyValue,
+    rule: Rule,
+    key: &str,
+) -> bool {
     use otlp_pb::common::any_value::Value;
     let otlp_pb::common::AnyValue { value } = v;
-    match value {
-        Some(Value::StringValue(s)) => mask_string(engine, s),
-        Some(Value::BytesValue(b)) => mask_bytes(engine, b),
+    let replaced = match value {
+        Some(Value::StringValue(s)) if !s.is_empty() && s != PLACEHOLDER => {
+            *s = PLACEHOLDER.into();
+            true
+        }
+        Some(Value::BytesValue(b)) if !b.is_empty() && b != PLACEHOLDER.as_bytes() => {
+            *b = PLACEHOLDER.as_bytes().to_vec();
+            true
+        }
+        Some(Value::IntValue(_)) | Some(Value::DoubleValue(_)) => {
+            *value = Some(Value::StringValue(PLACEHOLDER.into()));
+            true
+        }
         Some(Value::ArrayValue(arr)) => {
             let otlp_pb::common::ArrayValue { values } = arr;
             let mut hit = false;
             for item in values {
-                hit |= mask_otlp_any(engine, item);
+                hit |= replace_otlp_any(m, item, rule, key);
+            }
+            return hit;
+        }
+        Some(Value::KvlistValue(kvl)) => {
+            let otlp_pb::common::KeyValueList { values } = kvl;
+            return mask_otlp_kvs(m, values);
+        }
+        _ => false,
+    };
+    if replaced {
+        m.report.record(rule, Some(key));
+    }
+    replaced
+}
+
+fn mask_otlp_any(m: &mut Masker<'_>, v: &mut otlp_pb::common::AnyValue) -> bool {
+    use otlp_pb::common::any_value::Value;
+    let otlp_pb::common::AnyValue { value } = v;
+    match value {
+        Some(Value::StringValue(s)) => mask_string(m, s),
+        Some(Value::BytesValue(b)) => mask_bytes(m, b),
+        Some(Value::ArrayValue(arr)) => {
+            let otlp_pb::common::ArrayValue { values } = arr;
+            let mut hit = false;
+            for item in values {
+                hit |= mask_otlp_any(m, item);
             }
             hit
         }
         Some(Value::KvlistValue(kvl)) => {
             let otlp_pb::common::KeyValueList { values } = kvl;
-            mask_otlp_kvs(engine, values)
+            mask_otlp_kvs(m, values)
         }
         Some(Value::BoolValue(_))
         | Some(Value::IntValue(_))
@@ -627,7 +839,7 @@ fn scrub_snapshot_fail_closed(snap: &mut pb::StateSnapshot) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pii::PiiEngine;
+    use crate::pii::{PiiEngine, Rule};
 
     fn engine() -> PiiEngine {
         PiiEngine::new(&[]).unwrap()
@@ -773,6 +985,140 @@ mod tests {
     // --- OTLP tests ---
 
     use wardex_codec::otlp::otlp_pb;
+
+    #[test]
+    fn a_masked_span_reports_count_rules_and_names() {
+        let mut env = env_with(pii_span());
+        mask_envelope(&engine(), &mut env);
+        let ci = span_of(&env).capture_integrity.clone().unwrap();
+        assert!(ci.redacted);
+        // name + status (two e-mails), the card, the `sk-` key in the URL.
+        assert_eq!(ci.redaction_count, 4);
+        let rules: Vec<Rule> = ci
+            .redaction_rules
+            .iter()
+            .map(|n| Rule::try_from(*n).unwrap())
+            .collect();
+        assert_eq!(
+            rules,
+            vec![Rule::Email, Rule::CreditCard, Rule::SecretValue]
+        );
+        // `?key=` is a name-rule hit too, but the `sk-` value hit starts at the
+        // same byte and wins the tie, so the rule that is reported is the
+        // value's and no name is recorded.
+        assert!(ci.redaction_names.is_empty(), "{:?}", ci.redaction_names);
+    }
+
+    #[test]
+    fn a_clean_span_reports_nothing() {
+        let mut env = env_with(pb::Span {
+            name: "HTTP GET /v1/models".into(),
+            ..Default::default()
+        });
+        mask_envelope(&engine(), &mut env);
+        assert!(span_of(&env).capture_integrity.is_none());
+    }
+
+    fn text_kv(key: &str, v: &str) -> pb::KeyValue {
+        pb::KeyValue {
+            key: key.into(),
+            value: Some(pb::AnyValue {
+                value: Some(pb::any_value::Value::StringValue(v.into())),
+            }),
+        }
+    }
+
+    fn int_kv(key: &str, v: i64) -> pb::KeyValue {
+        pb::KeyValue {
+            key: key.into(),
+            value: Some(pb::AnyValue {
+                value: Some(pb::any_value::Value::IntValue(v)),
+            }),
+        }
+    }
+
+    #[test]
+    fn a_host_attribute_under_a_secret_name_is_replaced_whole() {
+        let mut span = pb::Span {
+            name: "tool".into(),
+            extra: vec![
+                text_kv("db.password", "hunter2"),
+                int_kv("pin_token", 1234),
+                text_kv("session_id", "conv-1"),
+                text_kv("code", "E42"),
+                pb::KeyValue {
+                    key: "request".into(),
+                    value: Some(pb::AnyValue {
+                        value: Some(pb::any_value::Value::KvlistValue(pb::KeyValueList {
+                            values: vec![text_kv("api_key", "abc"), text_kv("q", "seoul")],
+                        })),
+                    }),
+                },
+            ],
+            ..Default::default()
+        };
+        let mut env = env_with(std::mem::take(&mut span));
+        mask_envelope(&engine(), &mut env);
+        let sp = span_of(&env);
+        let get = |k: &str| {
+            sp.extra
+                .iter()
+                .find(|kv| kv.key == k)
+                .and_then(|kv| kv.value.clone())
+                .and_then(|v| v.value)
+        };
+        use pb::any_value::Value;
+        assert_eq!(
+            get("db.password"),
+            Some(Value::StringValue("[SECRET]".into()))
+        );
+        assert_eq!(
+            get("pin_token"),
+            Some(Value::StringValue("[SECRET]".into()))
+        );
+        // Not secret names: an agent conversation id, and a JSON-shaped `code`.
+        assert_eq!(get("session_id"), Some(Value::StringValue("conv-1".into())));
+        assert_eq!(get("code"), Some(Value::StringValue("E42".into())));
+        match get("request") {
+            Some(Value::KvlistValue(kvl)) => {
+                assert_eq!(
+                    kvl.values[0].value.clone().unwrap().value,
+                    Some(Value::StringValue("[SECRET]".into()))
+                );
+                assert_eq!(
+                    kvl.values[1].value.clone().unwrap().value,
+                    Some(Value::StringValue("seoul".into()))
+                );
+            }
+            other => panic!("expected a kvlist, got {other:?}"),
+        }
+        let ci = sp.capture_integrity.clone().unwrap();
+        assert_eq!(ci.redaction_count, 3);
+        assert_eq!(
+            ci.redaction_names,
+            vec!["db.password", "pin_token", "api_key"]
+        );
+    }
+
+    #[test]
+    fn otlp_reports_merge_into_one_set_of_keys() {
+        let mut req = otlp_req_with_pii();
+        mask_otlp(&engine(), &mut req);
+        let span = &req.resource_spans[0].scope_spans[0].spans[0];
+        let count = |k: &str| span.attributes.iter().filter(|kv| kv.key == k).count();
+        assert_eq!(count("wardex.redacted"), 1);
+        assert_eq!(count("wardex.redaction.count"), 1);
+        assert_eq!(count("wardex.redaction.rules"), 1);
+        match otlp_attr(span, "wardex.redaction.count").unwrap() {
+            otlp_pb::common::any_value::Value::IntValue(n) => assert_eq!(*n, 3),
+            other => panic!("{other:?}"),
+        }
+        // Masking the already-masked request again replaces nothing and
+        // leaves the report as it was.
+        let before = req.clone();
+        mask_otlp(&engine(), &mut req);
+        assert_eq!(req, before);
+    }
 
     fn otlp_kv_str(key: &str, v: &str) -> otlp_pb::common::KeyValue {
         otlp_pb::common::KeyValue {

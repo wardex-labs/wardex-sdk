@@ -17,6 +17,9 @@ def encode(
     pii_mode: str = "off",
     pii_disabled: tuple[str, ...] = (),
     limits: object | None = None,
+    *,
+    pii_extra_names: tuple[str, ...] = (),
+    pii_reveal_names: tuple[str, ...] = (),
 ) -> bytes:
     """Encode to wire bytes. PII policy is applied inside the native call
     (marshal -> mask -> serialize, design §4.2). Transports always pass the
@@ -31,7 +34,14 @@ def encode(
     `Transport.encode()` is the sanctioned path that does so) — this "off"
     default is for local round-trip fidelity only, it must never be relied on
     for an export path."""
-    return _wardex_native.codec.encode_envelope(envelope, pii_mode, list(pii_disabled), limits)
+    return _wardex_native.codec.encode_envelope(
+        envelope,
+        pii_mode,
+        list(pii_disabled),
+        limits,
+        pii_extra_names=list(pii_extra_names),
+        pii_reveal_names=list(pii_reveal_names),
+    )
 
 
 def decode(data: bytes) -> dict[str, Any]:

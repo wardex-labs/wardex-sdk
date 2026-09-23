@@ -717,10 +717,10 @@ def test_an_sse_span_is_http_on_the_wire_and_sse_under_the_wardex_key():
     assert "wardex.transport.protocol" not in attrs
 
 
-def test_url_full_is_query_stripped_and_absent_when_no_url_was_captured():
-    """Query strings are where credentials and PII ride (`?api_key=`); the
-    exported URL is for grouping, not replay, so everything from `?` (and `#`)
-    is dropped. No captured URL, no key."""
+def test_url_full_carries_the_query_and_is_absent_when_no_url_was_captured():
+    """The query is the call's arguments (`?q=seoul`), so `url.full` carries
+    it; a credential in it is the masker's to replace, not the mapping's to
+    drop. No captured URL, no key."""
 
     def _with_url(url: str) -> Envelope:
         return Envelope(
@@ -735,11 +735,17 @@ def test_url_full_is_query_stripped_and_absent_when_no_url_was_captured():
             ),
         )
 
-    attrs = _first_span(_with_url("https://api.example.com/v1/chat?api_key=sk-x#frag"))[
-        "attributes"
-    ]
-    assert attrs["url.full"] == "https://api.example.com/v1/chat"
-    assert "sk-x" not in str(attrs)
+    env = _with_url("https://api.example.com/v1/chat?q=seoul&api_key=abc123#frag")
+    attrs = _first_span(env)["attributes"]
+    assert attrs["url.full"] == "https://api.example.com/v1/chat?q=seoul&api_key=abc123#frag"
+
+    masked = _wardex_native.codec.decode_otlp_traces(
+        _wardex_native.codec.encode_otlp_traces(env, "mask")
+    )
+    span = masked["resource_spans"][0]["scope_spans"][0]["spans"][0]
+    assert span["attributes"]["url.full"] == (
+        "https://api.example.com/v1/chat?q=seoul&api_key=[SECRET]#frag"
+    )
 
     attrs = _first_span(_with_url(""))["attributes"]
     assert "url.full" not in attrs

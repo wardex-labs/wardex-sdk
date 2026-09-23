@@ -682,6 +682,12 @@ fn integrity_to_proto(c: &Bound<PyAny>) -> PyResult<(pb::CaptureIntegrity, Vec<S
             truncated: c.getattr("truncated")?.extract()?,
             dropped_chunk_count: c.getattr("dropped_chunk_count")?.extract()?,
             limitation_codes: codes,
+            // Written by the masker after marshalling, never by the host: a
+            // span in Python has no report yet, and one it claimed would be
+            // a report of masking that did not happen here.
+            redaction_count: 0,
+            redaction_rules: Vec::new(),
+            redaction_names: Vec::new(),
         },
         unmapped,
     ))
@@ -1211,6 +1217,15 @@ fn span_to_dict(py: Python<'_>, sp: &pb::Span) -> PyResult<PyObject> {
                 .map(|n| vocab::limitation_name(*n))
                 .collect::<Vec<_>>(),
         )?;
+        cd.set_item("redaction_count", c.redaction_count)?;
+        cd.set_item(
+            "redaction_rules",
+            c.redaction_rules
+                .iter()
+                .map(|n| vocab::redaction_rule_name(*n))
+                .collect::<Vec<_>>(),
+        )?;
+        cd.set_item("redaction_names", c.redaction_names.clone())?;
         d.set_item("capture_integrity", cd)?;
     }
     if let Some(c) = &sp.correlation {
@@ -1447,58 +1462,66 @@ fn otlp_traces_to_dict(
 
 // --- pyfunctions + submodule ---
 
-/// Apply the PII policy to a marshalled wardex envelope (design §4.2).
-/// pii_mode contract: "mask" | "off" — anything else is a hard error
-/// (REDACT/HASH are rejected earlier by Python init; defense in depth here).
-fn pii_apply_envelope(
-    proto: &mut pb::Envelope,
-    pii_mode: &str,
-    pii_disabled: &[String],
-) -> PyResult<()> {
-    match pii_mode {
-        "off" => Ok(()),
-        "mask" => {
-            let engine = pii::engine_for(pii_disabled)
-                .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
-            pii::mask_envelope(&engine, proto);
-            Ok(())
+/// The PII policy one encode call applies: the mode, the exempted
+/// categories, and the application's own secret names and exemptions.
+struct PiiPolicy<'a> {
+    mode: &'a str,
+    disabled: Vec<String>,
+    extra_names: Vec<String>,
+    reveal_names: Vec<String>,
+}
+
+impl PiiPolicy<'_> {
+    /// The engine this policy runs. pii_mode contract: "mask" | "off" —
+    /// anything else is a hard error (REDACT/HASH are rejected earlier by
+    /// Python init; defense in depth here). "off" still runs the URL
+    /// credentials rule: semantic conventions require `user:password@` out of
+    /// a URL, and an opt-out of masking is an opt-out of losing debugging
+    /// values, which a URL's credentials never are.
+    fn engine(&self) -> PyResult<std::sync::Arc<pii::PiiEngine>> {
+        match self.mode {
+            "off" => Ok(pii::userinfo_engine()),
+            "mask" => pii::engine_for_policy(&self.disabled, &self.extra_names, &self.reveal_names)
+                .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string())),
+            other => Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "unsupported pii_mode {other:?} (expected \"mask\" or \"off\")"
+            ))),
         }
-        other => Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "unsupported pii_mode {other:?} (expected \"mask\" or \"off\")"
-        ))),
     }
+}
+
+/// Apply the PII policy to a marshalled wardex envelope (design §4.2).
+fn pii_apply_envelope(proto: &mut pb::Envelope, policy: &PiiPolicy<'_>) -> PyResult<()> {
+    pii::mask_envelope(&*policy.engine()?, proto);
+    Ok(())
 }
 
 /// Apply the PII policy to a marshalled OTLP export request (design §4.2).
-/// Same "mask" | "off" contract as `pii_apply_envelope`.
 fn pii_apply_otlp(
     req: &mut otlp_pb::trace_service::ExportTraceServiceRequest,
-    pii_mode: &str,
-    pii_disabled: &[String],
+    policy: &PiiPolicy<'_>,
 ) -> PyResult<()> {
-    match pii_mode {
-        "off" => Ok(()),
-        "mask" => {
-            let engine = pii::engine_for(pii_disabled)
-                .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
-            pii::mask_otlp(&engine, req);
-            Ok(())
-        }
-        other => Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "unsupported pii_mode {other:?} (expected \"mask\" or \"off\")"
-        ))),
-    }
+    pii::mask_otlp(&*policy.engine()?, req);
+    Ok(())
 }
 
 #[pyfunction]
-#[pyo3(signature = (envelope, pii_mode = "off", pii_disabled = Vec::new(), limits = None))]
+#[pyo3(signature = (envelope, pii_mode = "off", pii_disabled = Vec::new(), limits = None, *, pii_extra_names = Vec::new(), pii_reveal_names = Vec::new()))]
 fn encode_envelope_py(
     py: Python<'_>,
     envelope: &Bound<'_, PyAny>,
     pii_mode: &str,
     pii_disabled: Vec<String>,
     limits: Option<PyLimits>,
+    pii_extra_names: Vec<String>,
+    pii_reveal_names: Vec<String>,
 ) -> PyResult<Py<PyBytes>> {
+    let policy = PiiPolicy {
+        mode: pii_mode,
+        disabled: pii_disabled,
+        extra_names: pii_extra_names,
+        reveal_names: pii_reveal_names,
+    };
     shielded(|| {
         // `zstd_level` is the only limit the codec reads, and it must come from
         // the caller's resolved limits: hardcoding the default here would let a
@@ -1509,7 +1532,7 @@ fn encode_envelope_py(
         // Masking + protobuf + zstd are pure Rust: release the GIL so app threads
         // keep running while the batch worker encodes (design §9).
         let bytes = py.allow_threads(|| -> PyResult<Vec<u8>> {
-            pii_apply_envelope(&mut proto, pii_mode, &pii_disabled)?;
+            pii_apply_envelope(&mut proto, &policy)?;
             encode_envelope(&proto, limits)
                 .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
         })?;
@@ -1553,29 +1576,36 @@ const PRODUCER: otlp::map::Producer<'static> = otlp::map::Producer {
 /// different policy to the same envelope.
 fn otlp_request(
     proto: pb::Envelope,
-    pii_mode: &str,
-    pii_disabled: &[String],
+    policy: &PiiPolicy<'_>,
     limits: wardex_limits::Limits,
 ) -> PyResult<otlp_pb::trace_service::ExportTraceServiceRequest> {
     // `proto` is CONSUMED here, so the envelope's payloads move into the
     // request instead of being copied beside it — one flush of a full batch
     // holds one copy of every captured body, not two.
     let mut req = otlp::map::envelope_to_traces(proto, PRODUCER);
-    pii_apply_otlp(&mut req, pii_mode, pii_disabled)?;
+    pii_apply_otlp(&mut req, policy)?;
     otlp::map::cap_attribute_values(&mut req, limits);
     otlp::map::strip_bytes_values(&mut req);
     Ok(req)
 }
 
 #[pyfunction]
-#[pyo3(signature = (envelope, pii_mode = "off", pii_disabled = Vec::new(), limits = None))]
+#[pyo3(signature = (envelope, pii_mode = "off", pii_disabled = Vec::new(), limits = None, *, pii_extra_names = Vec::new(), pii_reveal_names = Vec::new()))]
 fn encode_otlp_traces(
     py: Python<'_>,
     envelope: &Bound<'_, PyAny>,
     pii_mode: &str,
     pii_disabled: Vec<String>,
     limits: Option<PyLimits>,
+    pii_extra_names: Vec<String>,
+    pii_reveal_names: Vec<String>,
 ) -> PyResult<Py<PyBytes>> {
+    let policy = PiiPolicy {
+        mode: pii_mode,
+        disabled: pii_disabled,
+        extra_names: pii_extra_names,
+        reveal_names: pii_reveal_names,
+    };
     shielded(|| {
         // ONE request, uncompressed, whatever its size — the bare serialization of
         // an envelope. `encode_otlp_requests` is what an EXPORT calls: this one
@@ -1598,7 +1628,7 @@ fn encode_otlp_traces(
         // Mapping + masking + protobuf are pure Rust: release the GIL so app
         // threads keep running while the batch worker encodes (design §9).
         let bytes = py.allow_threads(move || -> PyResult<Vec<u8>> {
-            let req = otlp_request(proto, pii_mode, &pii_disabled, limits)?;
+            let req = otlp_request(proto, &policy, limits)?;
             otlp::encode_traces(&req)
                 .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
         })?;
@@ -1622,7 +1652,10 @@ fn encode_otlp_traces(
 /// silent kind, and the caller is the only one who can say it out loud. The
 /// third used to be a raise, and the raise cost the whole batch.
 #[pyfunction]
-#[pyo3(signature = (envelope, pii_mode = "off", pii_disabled = Vec::new(), limits = None, compress = true))]
+#[pyo3(signature = (envelope, pii_mode = "off", pii_disabled = Vec::new(), limits = None, compress = true, *, pii_extra_names = Vec::new(), pii_reveal_names = Vec::new()))]
+// One argument per Python keyword: the signature IS the Python API, and a
+// bundling struct would only move the same fields behind a `FromPyObject`.
+#[allow(clippy::too_many_arguments)]
 fn encode_otlp_requests(
     py: Python<'_>,
     envelope: &Bound<'_, PyAny>,
@@ -1630,12 +1663,20 @@ fn encode_otlp_requests(
     pii_disabled: Vec<String>,
     limits: Option<PyLimits>,
     compress: bool,
+    pii_extra_names: Vec<String>,
+    pii_reveal_names: Vec<String>,
 ) -> PyResult<(Py<PyAny>, usize, Vec<String>)> {
+    let policy = PiiPolicy {
+        mode: pii_mode,
+        disabled: pii_disabled,
+        extra_names: pii_extra_names,
+        reveal_names: pii_reveal_names,
+    };
     shielded(|| {
         let (proto, unmarshalled) = envelope_to_proto(envelope, false, true)?;
         let limits = limits.map(|p| p.inner).unwrap_or_default();
         let requests = py.allow_threads(move || -> PyResult<otlp::split::Requests> {
-            let req = otlp_request(proto, pii_mode, &pii_disabled, limits)?;
+            let req = otlp_request(proto, &policy, limits)?;
             otlp::split::encode_requests(req, limits, compress)
                 .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
         })?;
@@ -1653,6 +1694,29 @@ fn decode_otlp_traces(py: Python<'_>, data: &[u8]) -> PyResult<PyObject> {
         let req = otlp::decode_traces(data)
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
         otlp_traces_to_dict(py, &req)
+    })
+}
+
+/// A secret-name candidate split into the words the masker judges it by.
+/// `PIIConfig` validates `extra_secret_names` / `reveal_names` with this, so a
+/// name the masker could never match is refused at `init()` rather than
+/// accepted and silently inert.
+#[pyfunction]
+fn pii_name_words(name: &str) -> PyResult<Vec<String>> {
+    shielded(|| Ok(pii::words(name)))
+}
+
+/// The built-in name rules, verbatim: what the documentation's table is
+/// checked against, so the published list and the running list are one fact.
+#[pyfunction]
+fn pii_name_rules(py: Python<'_>) -> PyResult<PyObject> {
+    shielded(|| {
+        let d = PyDict::new_bound(py);
+        d.set_item("strong_words", pii::STRONG_WORDS.to_vec())?;
+        d.set_item("last_words", pii::LAST_WORDS.to_vec())?;
+        d.set_item("exact_names", pii::EXACT_NAMES.to_vec())?;
+        d.set_item("url_form_only_names", pii::URL_FORM_ONLY_NAMES.to_vec())?;
+        Ok(d.into_py(py))
     })
 }
 
@@ -1779,6 +1843,8 @@ pub fn register(parent: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(encode_otlp_requests, &m)?)?;
     m.add_function(wrap_pyfunction!(decode_otlp_traces, &m)?)?;
     m.add_function(wrap_pyfunction!(vocabulary_tables, &m)?)?;
+    m.add_function(wrap_pyfunction!(pii_name_words, &m)?)?;
+    m.add_function(wrap_pyfunction!(pii_name_rules, &m)?)?;
     // Exposed in Python as codec.encode_envelope / codec.decode_envelope
     m.add("encode_envelope", m.getattr("encode_envelope_py")?)?;
     m.add("decode_envelope", m.getattr("decode_envelope_py")?)?;

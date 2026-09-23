@@ -66,6 +66,37 @@ def _merge_markers(*groups: tuple[Limitation, ...]) -> tuple[Limitation, ...]:
     return tuple(out)
 
 
+def _name_path(target: str) -> str:
+    """The part of a request target a span NAME may carry.
+
+    A name groups spans; it is not a place for data. The query and fragment
+    are the call's arguments and go to the URL, where the masker judges each
+    one; the userinfo of an absolute-form target (`http://user:pw@host/p`) is
+    a credential and goes nowhere near a name. Byte positions, not a URL
+    parser: a malformed target is shortened at worst.
+    """
+    path = target.split("?", 1)[0].split("#", 1)[0]
+    scheme, sep, rest = path.partition("://")
+    if not sep:
+        return path
+    authority, slash, tail = rest.partition("/")
+    return f"{scheme}://{authority.rpartition('@')[2]}{slash}{tail}"
+
+
+def _url_target(txn: _Txn, withhold: bool = False) -> str:
+    """The request target a span's URL carries: the whole target as sent.
+
+    The query rides in the URL like a body rides in the payload, and under the
+    same policy: when the seam withholds a transaction's bodies (capture
+    admitted only by wardex's own degradation), the query is withheld with
+    them. Credentials in it are the native masker's to replace, and a URL's
+    userinfo is replaced even when masking is off.
+    """
+    if withhold or txn.target is None:
+        return txn.path
+    return txn.target
+
+
 def _is_ws_upgrade_request(headers: object) -> bool:
     up = _header_get(headers, "upgrade")
     conn = _header_get(headers, "connection")
@@ -91,6 +122,7 @@ class _Txn:
     """A single protocol-neutral transaction (request + response)."""
 
     method: str
+    #: The request target as a span NAME may show it (`_name_path`).
     path: str
     status: int
     request_body: bytes
@@ -143,6 +175,9 @@ class _Txn:
     #: sem=None. The seam counts it (`interceptors.seam.ws_llm_semantics_unread`)
     #: when it builds the connection's span.
     ws_llm_call: bool = False
+    #: The request target as sent, query included (`_url_target` reads it).
+    #: `None` when the transaction never had one beyond `path`.
+    target: str | None = None
     #: The upgrade path was a WebSocket-capable LLM row on a host that is not
     #: the provider's, and nothing corroborated an LLM call: no claim, but a
     #: recognised path must not vanish uncounted. The seam counts it
@@ -207,7 +242,8 @@ class _Http1Tracker:
                 out.append(
                     _Txn(
                         method=self._method or "GET",
-                        path=self._path or "/",
+                        path=_name_path(self._path or "/"),
+                        target=self._path or "/",
                         status=101,
                         request_body=b"",
                         response_body=b"",
@@ -246,7 +282,8 @@ class _Http1Tracker:
             out.append(
                 _Txn(
                     method=self._method or "?",
-                    path=self._path or "/",
+                    path=_name_path(self._path or "/"),
+                    target=self._path or "/",
                     status=msg.status_code or 0,
                     request_body=self._req_body,
                     response_body=msg.body,
@@ -498,7 +535,8 @@ class _Http2Tracker:
             counters.bump("protocol.http2.stream_evicted")
         return _Txn(
             method=t.method or "?",
-            path=t.path or "/",
+            path=_name_path(t.path or "/"),
+            target=t.path or "/",
             status=t.status,
             request_body=t.request_body,
             response_body=t.response_body,
@@ -544,7 +582,8 @@ class _WebSocketTracker:
         self._llm_unconfirmed = False
         self._sent = WsParser(limits)  # client -> server
         self._recv = WsParser(limits)  # server -> client
-        self._path = path
+        self._path = _name_path(path)
+        self._target = path
         self._deflate = deflate
         self._parent = parent
         # Inherited from the UPGRADE transaction rather than re-latched: a WS
@@ -681,6 +720,7 @@ class _WebSocketTracker:
         return _Txn(
             method="GET",
             path=self._path,
+            target=self._target,
             status=101,
             request_body=bytes(self._sample_in),
             response_body=bytes(self._sample_out),

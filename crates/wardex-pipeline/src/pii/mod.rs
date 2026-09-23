@@ -1,12 +1,22 @@
 //! PII masking engine — design doc 2026-07-07-phase3-pii-masking.
 //!
 //! Detection is fully deterministic: regex proposes, checksum validators
-//! confirm (design §5.1). No ML/entropy heuristics.
+//! confirm (design §5.1). No ML/entropy heuristics. Two families of rules feed
+//! one replacement pass: VALUE rules recognise a value by its shape
+//! (`patterns.rs`), NAME rules recognise it by the argument it is passed as
+//! (`names.rs`). Every replacement is recorded against the rule that made it,
+//! so a span can say what was masked and why.
 
+mod names;
 mod patterns;
 mod walk;
 
+pub use names::{
+    words, NameRules, Shape, EXACT_NAMES, LAST_WORDS, PLACEHOLDER, STRONG_WORDS,
+    URL_FORM_ONLY_NAMES,
+};
 pub use walk::{mask_envelope, mask_otlp};
+pub use wardex_codec::proto::wardex::v1::RedactionRule as Rule;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -18,6 +28,15 @@ use patterns::{Replacement, BUILTINS, CATEGORIES};
 /// Fail-closed placeholder — what a span's text becomes when masking itself
 /// failed and we refuse to ship the original (design §8).
 pub const PII_FILTER_ERROR: &str = "[PII_FILTER_ERROR]";
+
+/// What replaces the credentials in `scheme://user:password@host` — the value
+/// OTel's semantic conventions prescribe for `url.full`.
+pub const USERINFO_REDACTED: &str = "REDACTED:REDACTED";
+
+/// Most distinct argument names one span records. The count and the rules are
+/// never capped; only this list is, so a body with thousands of secret-named
+/// fields cannot grow a span without bound.
+pub const MAX_REPORTED_NAMES: usize = 32;
 
 #[derive(Debug, thiserror::Error)]
 pub enum PiiError {
@@ -32,6 +51,7 @@ struct Compiled {
     regex: Regex,
     validator: Option<fn(&str) -> bool>,
     replacement: &'static Replacement,
+    rule: Rule,
     /// Rescan policy after a validator rejection. A rejected candidate
     /// normally suppresses its whole span — that is how the `{3,}` IPv4 tail
     /// rejects version strings like "1.2.3.4.5" outright. Credit cards are
@@ -42,16 +62,136 @@ struct Compiled {
     retry_on_reject: bool,
 }
 
+/// What masking replaced, accumulated over every text of one record (a span).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Report {
+    /// Replacements made. Two secrets in one body count two.
+    pub count: u32,
+    /// Each rule that replaced at least one value, in enum order.
+    pub rules: Vec<Rule>,
+    /// Argument names a name rule matched, first-seen order, deduplicated,
+    /// at most `MAX_REPORTED_NAMES`.
+    pub names: Vec<String>,
+}
+
+impl Report {
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    fn record(&mut self, rule: Rule, name: Option<&str>) {
+        self.count = self.count.saturating_add(1);
+        if let Err(at) = self.rules.binary_search(&rule) {
+            self.rules.insert(at, rule);
+        }
+        if let Some(n) = name {
+            if self.names.len() < MAX_REPORTED_NAMES && !self.names.iter().any(|x| x == n) {
+                self.names.push(n.to_string());
+            }
+        }
+    }
+}
+
+struct Hit {
+    start: usize,
+    end: usize,
+    replacement: String,
+    rule: Rule,
+    name: Option<String>,
+}
+
 /// Compiled pattern set. Build once per config via `engine_for` (design §4.3).
 #[derive(Debug)]
 pub struct PiiEngine {
     active: Vec<Compiled>,
+    /// `None` when the `secret` category is disabled: the name rules belong to
+    /// it, as the value shapes of secrets do.
+    names: Option<NameRules>,
+}
+
+fn category_rule(category: &str) -> Rule {
+    match category {
+        "email" => Rule::Email,
+        "phone_number" => Rule::PhoneNumber,
+        "credit_card" => Rule::CreditCard,
+        "us_ssn" => Rule::UsSsn,
+        "ip_address" => Rule::IpAddress,
+        "us_bank_routing" => Rule::UsBankRouting,
+        "iban" => Rule::Iban,
+        _ => Rule::SecretValue,
+    }
+}
+
+/// The userinfo of every `scheme://userinfo@host` in `text`: after `://`,
+/// everything up to an `@` that comes before any path, query, fragment,
+/// whitespace or quoting byte. A scanner rather than a regex so there is no
+/// compile step that could fail on the export path.
+fn userinfo_hits(text: &str, hits: &mut Vec<Hit>) {
+    let b = text.as_bytes();
+    let mut from = 0;
+    while let Some(off) = text[from..].find("://") {
+        let sep = from + off;
+        from = sep + 3;
+        let mut s = sep;
+        while s > 0 && (b[s - 1].is_ascii_alphanumeric() || matches!(b[s - 1], b'+' | b'.' | b'-'))
+        {
+            s -= 1;
+        }
+        // A scheme starts with a letter; digits glued on before it are not
+        // part of it (`…:8080http://` when a target is appended to a URL).
+        while s < sep && !b[s].is_ascii_alphabetic() {
+            s += 1;
+        }
+        if s == sep {
+            continue; // no scheme before `://`
+        }
+        let start = sep + 3;
+        let mut end = start;
+        while end < b.len()
+            && !b[end].is_ascii_whitespace()
+            && !matches!(
+                b[end],
+                b'/' | b'?' | b'#' | b'@' | b'[' | b']' | b'"' | b'\'' | b'<' | b'>' | b'\\'
+            )
+        {
+            end += 1;
+        }
+        if end == start || end >= b.len() || b[end] != b'@' {
+            continue;
+        }
+        let userinfo = &text[start..end];
+        let replacement = if userinfo.contains(':') {
+            USERINFO_REDACTED
+        } else {
+            "REDACTED"
+        };
+        if userinfo == replacement {
+            continue; // already redacted — not a second replacement
+        }
+        hits.push(Hit {
+            start,
+            end,
+            replacement: replacement.to_string(),
+            rule: Rule::UrlUserinfo,
+            name: None,
+        });
+    }
 }
 
 impl PiiEngine {
     /// Build an engine with `disabled` categories removed.
     /// Unknown category names are a hard error — the FFI contract is fail-loud.
     pub fn new(disabled: &[String]) -> Result<PiiEngine, PiiError> {
+        PiiEngine::with_names(disabled, &[], &[])
+    }
+
+    /// `new`, plus the application's own secret names (`extra`) and names
+    /// exempted from the name rules (`reveal`).
+    pub fn with_names(
+        disabled: &[String],
+        extra: &[String],
+        reveal: &[String],
+    ) -> Result<PiiEngine, PiiError> {
         for d in disabled {
             if !CATEGORIES.contains(&d.as_str()) {
                 return Err(PiiError::UnknownCategory(d.clone()));
@@ -70,23 +210,52 @@ impl PiiEngine {
                 regex,
                 validator: def.validator,
                 replacement: &def.replacement,
+                rule: category_rule(def.category),
                 retry_on_reject: def.retry_on_reject,
             });
         }
-        Ok(PiiEngine { active })
+        let names =
+            (!disabled.iter().any(|d| d == "secret")).then(|| NameRules::new(extra, reveal));
+        Ok(PiiEngine { active, names })
+    }
+
+    /// The engine `PIIMode.OFF` still runs: URL credentials only. OTel's
+    /// semantic conventions require them out of `url.full`, and a
+    /// `user:password@` has no debugging value an opt-out could be protecting.
+    pub fn userinfo_only() -> PiiEngine {
+        PiiEngine {
+            active: Vec::new(),
+            names: None,
+        }
+    }
+
+    /// The name rules this engine applies, if the `secret` category is on.
+    pub fn name_rules(&self) -> Option<&NameRules> {
+        self.names.as_ref()
     }
 
     /// Mask every validated match. `None` means "no change".
+    pub fn mask_text(&self, text: &str) -> Option<String> {
+        self.mask_text_into(text, &mut Report::default())
+    }
+
+    /// `mask_text`, recording each replacement into `report`.
     /// Single pass over the original text (retry-on-reject patterns may
     /// re-probe within a rejected candidate); replaced regions are never
     /// rescanned, so placeholders cannot re-match (design §5.2).
-    pub fn mask_text(&self, text: &str) -> Option<String> {
-        let mut hits: Vec<(usize, usize, String)> = Vec::new();
+    pub fn mask_text_into(&self, text: &str, report: &mut Report) -> Option<String> {
+        let mut hits: Vec<Hit> = Vec::new();
         for p in &self.active {
             let mut at = 0;
             while let Some(m) = p.regex.find_at(text, at) {
                 if p.validator.is_none_or(|v| v(m.as_str())) {
-                    hits.push((m.start(), m.end(), apply(p.replacement, m.as_str())));
+                    hits.push(Hit {
+                        start: m.start(),
+                        end: m.end(),
+                        replacement: apply(p.replacement, m.as_str()),
+                        rule: p.rule,
+                        name: None,
+                    });
                     at = m.end();
                 } else if let Some((end, rep)) = p
                     .retry_on_reject
@@ -96,7 +265,13 @@ impl PiiEngine {
                     // The greedy candidate bled into a trailing digit run; a
                     // shorter end at the same start re-validated (e.g. the
                     // 16-digit PAN inside "4111 1111 1111 1111 999").
-                    hits.push((m.start(), end, rep));
+                    hits.push(Hit {
+                        start: m.start(),
+                        end,
+                        replacement: rep,
+                        rule: p.rule,
+                        name: None,
+                    });
                     at = end;
                 } else if p.retry_on_reject {
                     // Resume just past the rejected candidate's first char so
@@ -112,28 +287,42 @@ impl PiiEngine {
                 }
             }
         }
+        if let Some(rules) = &self.names {
+            let mut found = Vec::new();
+            rules.scan(text, &mut found);
+            hits.extend(found.into_iter().map(|h| Hit {
+                start: h.start,
+                end: h.end,
+                replacement: h.replacement,
+                rule: h.rule,
+                name: Some(h.name),
+            }));
+        }
+        userinfo_hits(text, &mut hits);
         if hits.is_empty() {
             return None;
         }
         // leftmost first; on ties the longer match wins (§5.2)
-        hits.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
+        hits.sort_by(|a, b| a.start.cmp(&b.start).then(b.end.cmp(&a.end)));
         let mut out = String::with_capacity(text.len());
         let mut pos = 0usize;
-        for (start, end, rep) in hits {
-            if start < pos {
+        for h in hits {
+            if h.start < pos {
                 // Overlapped by an earlier winner. An overlapped-but-validated
                 // hit still masks its remainder — never emit a validated
                 // span's tail raw (e.g. a Luhn-passing card that bled
                 // backwards into a preceding IP match).
-                if end > pos {
-                    out.push_str(&rep);
-                    pos = end;
+                if h.end > pos {
+                    out.push_str(&h.replacement);
+                    pos = h.end;
+                    report.record(h.rule, h.name.as_deref());
                 }
                 continue;
             }
-            out.push_str(&text[pos..start]);
-            out.push_str(&rep);
-            pos = end;
+            out.push_str(&text[pos..h.start]);
+            out.push_str(&h.replacement);
+            pos = h.end;
+            report.record(h.rule, h.name.as_deref());
         }
         out.push_str(&text[pos..]);
         Some(out)
@@ -188,18 +377,41 @@ fn apply(r: &Replacement, matched: &str) -> String {
 /// Process-wide engine cache keyed by the sorted disabled list.
 /// Regex compilation is the expensive part — pay it once per config (§4.3).
 pub fn engine_for(disabled: &[String]) -> Result<Arc<PiiEngine>, PiiError> {
-    static CACHE: OnceLock<Mutex<HashMap<Vec<String>, Arc<PiiEngine>>>> = OnceLock::new();
-    let mut key: Vec<String> = disabled.to_vec();
-    key.sort();
-    key.dedup();
+    engine_for_policy(disabled, &[], &[])
+}
+
+/// `engine_for` with the application's secret names and exemptions, all three
+/// lists part of the cache key.
+pub fn engine_for_policy(
+    disabled: &[String],
+    extra: &[String],
+    reveal: &[String],
+) -> Result<Arc<PiiEngine>, PiiError> {
+    type Key = (Vec<String>, Vec<String>, Vec<String>);
+    static CACHE: OnceLock<Mutex<HashMap<Key, Arc<PiiEngine>>>> = OnceLock::new();
+    let canon = |v: &[String]| {
+        let mut k = v.to_vec();
+        k.sort();
+        k.dedup();
+        k
+    };
+    let key = (canon(disabled), canon(extra), canon(reveal));
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     let mut guard = cache.lock().expect("pii engine cache poisoned");
     if let Some(e) = guard.get(&key) {
         return Ok(e.clone());
     }
-    let engine = Arc::new(PiiEngine::new(&key)?);
+    let engine = Arc::new(PiiEngine::with_names(&key.0, &key.1, &key.2)?);
     guard.insert(key, engine.clone());
     Ok(engine)
+}
+
+/// The shared `userinfo_only` engine.
+pub fn userinfo_engine() -> Arc<PiiEngine> {
+    static ENGINE: OnceLock<Arc<PiiEngine>> = OnceLock::new();
+    ENGINE
+        .get_or_init(|| Arc::new(PiiEngine::userinfo_only()))
+        .clone()
 }
 
 #[cfg(test)]
@@ -232,6 +444,10 @@ mod tests {
         assert_eq!(mask("iban GB82WEST12345698765432"), "iban [IBAN]");
         assert_eq!(mask("key sk-abcdefghijklmnop1234"), "key [SECRET]");
         assert_eq!(mask("aws AKIAIOSFODNN7EXAMPLE"), "aws [SECRET]");
+        assert_eq!(
+            mask("jwt eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ3ZHgifQ.c2lnbmF0dXJl ok"),
+            "jwt [SECRET] ok"
+        );
         assert_eq!(
             mask("Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.payload.sig"),
             "Authorization: [SECRET]"
@@ -337,6 +553,43 @@ mod tests {
         let a = engine_for(&["email".to_string()]).unwrap();
         let b = engine_for(&["email".to_string()]).unwrap();
         assert!(std::sync::Arc::ptr_eq(&a, &b));
+    }
+
+    #[test]
+    fn url_userinfo_is_redacted_and_counted_once() {
+        let e = PiiEngine::userinfo_only();
+        let mut r = Report::default();
+        let out = e
+            .mask_text_into("GET http://user:SECRET@host/p and ftp://tok@h/x", &mut r)
+            .unwrap();
+        assert_eq!(
+            out,
+            "GET http://REDACTED:REDACTED@host/p and ftp://REDACTED@h/x"
+        );
+        assert_eq!(r.count, 2);
+        assert_eq!(r.rules, vec![Rule::UrlUserinfo]);
+        assert_eq!(
+            e.mask_text(&out),
+            None,
+            "redacted userinfo is not replaced again"
+        );
+        let glued = e.mask_text("http://h:80http://u:pw@h/p").unwrap();
+        assert_eq!(glued, "http://h:80http://REDACTED:REDACTED@h/p");
+        // An e-mail in a path is not userinfo: a `/` comes before the `@`.
+        assert_eq!(e.mask_text("http://h/u/john@x.com"), None);
+    }
+
+    #[test]
+    fn reported_names_are_capped_but_the_count_is_not() {
+        let e = engine();
+        let body: String = (0..40)
+            .map(|i| format!("{{\"svc{i}_token\": \"v{i}\"}} "))
+            .collect();
+        let mut r = Report::default();
+        e.mask_text_into(&body, &mut r).unwrap();
+        assert_eq!(r.count, 40);
+        assert_eq!(r.names.len(), MAX_REPORTED_NAMES);
+        assert_eq!(r.names[0], "svc0_token");
     }
 
     #[test]

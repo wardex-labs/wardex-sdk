@@ -198,6 +198,8 @@ class Transport(abc.ABC):
     # init() still masks.
     _pii_mode: str = "mask"
     _pii_disabled: tuple[str, ...] = ()
+    _pii_extra_names: tuple[str, ...] = ()
+    _pii_reveal_names: tuple[str, ...] = ()
 
     export_timeout: float = DEFAULT_TIMEOUT
     """How long this transport may spend on ONE export, in seconds.
@@ -284,6 +286,7 @@ class Transport(abc.ABC):
             list(self._pii_disabled),
             self._limits,
             compress,
+            **self._pii_names(),
         )
         if unmarshalled:
             # A span the marshaller could not read -- a typed block holding a
@@ -334,6 +337,17 @@ class Transport(abc.ABC):
         """
         self._pii_mode = policy.mode.value
         self._pii_disabled = tuple(sorted(c.value for c in policy.disabled_categories))
+        self._pii_extra_names = tuple(sorted(policy.extra_secret_names))
+        self._pii_reveal_names = tuple(sorted(policy.reveal_names))
+
+    def _pii_names(self) -> dict[str, list[str]]:
+        """The name half of the stored policy, as the native encoders' keyword
+        arguments. One reader, so the envelope and OTLP wires cannot be handed
+        different names."""
+        return {
+            "pii_extra_names": list(self._pii_extra_names),
+            "pii_reveal_names": list(self._pii_reveal_names),
+        }
 
     def _set_limits(self, limits: object | None) -> None:
         """Install the resolved resource limits. Called by `init()` — plumbing,
