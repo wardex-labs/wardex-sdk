@@ -165,9 +165,10 @@ All notable changes to this project are documented here. The format follows
   The captured body of a non-LLM request or response was the compressed bytes
   — unreadable in your backend, and invisible to masking, so a gzipped OAuth
   token response shipped its `access_token` for anyone to inflate. It is now
-  inflated at capture, bounded by `max_decoded_bytes`, as the seam's own
-  documentation already said it was. A body that inflates past the bound, or
-  is compressed another way, is kept as it was.
+  inflated at capture, as the seam's own documentation already said it was,
+  bounded by the smaller of `max_decoded_bytes` and `max_opaque_body_bytes`:
+  a body that inflates past the bound keeps its inflated prefix and is marked
+  truncated. A body compressed another way (Brotli, zstd) is kept as it was.
 - **A conversation id now reaches the wardex receiver.** The envelope encoder
   wrote `ConversationContext` into `extra` (`gen_ai.conversation.id`,
   `wardex.conversation.session_id`, `wardex.conversation.turn_index`) and left

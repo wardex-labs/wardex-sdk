@@ -112,41 +112,21 @@ fn mask_string(m: &mut Masker<'_>, s: &mut String) -> bool {
     }
 }
 
-/// Bytes are masked as text, run by run: every stretch that is valid UTF-8
-/// is masked, and the bytes between stretches pass through untouched. One
-/// Latin-1 `é` in a form body used to switch masking off for the whole body;
-/// raw binary still passes through (documented limitation, design §4.4).
+/// Bytes are masked as text even when they are not valid UTF-8 throughout:
+/// the engine judges a same-length stand-in and edits the original bytes, so
+/// one Latin-1 `é` in a form body no longer switches masking off for the
+/// body, nor splits a password around it. Binary payloads still hold nothing
+/// the rules recognise (documented limitation, design §4.4).
 fn mask_bytes(m: &mut Masker<'_>, b: &mut Vec<u8>) -> bool {
-    if let Ok(text) = std::str::from_utf8(b) {
-        return match m.engine.mask_text_into(text, &mut m.report) {
-            Some(masked) => {
-                *b = masked.into_bytes();
-                true
-            }
-            None => false,
-        };
-    }
-    let mut out = Vec::with_capacity(b.len());
-    let mut hit = false;
-    for chunk in b.utf8_chunks() {
-        match m.engine.mask_text_into(chunk.valid(), &mut m.report) {
-            Some(masked) => {
-                out.extend_from_slice(masked.as_bytes());
-                hit = true;
-            }
-            None => out.extend_from_slice(chunk.valid().as_bytes()),
+    match m.engine.mask_bytes_into(b, &mut m.report) {
+        Some(masked) => {
+            *b = masked;
+            true
         }
-        out.extend_from_slice(chunk.invalid());
+        None => false,
     }
-    if hit {
-        *b = out;
-    }
-    hit
 }
 
-/// Keys are attribute NAMES: never rewritten, but judged by the name rules —
-/// a host's `set_attribute("db.password", v)` is a secret argument like any
-/// other.
 fn mask_kvs(m: &mut Masker<'_>, kvs: &mut [pb::KeyValue]) -> bool {
     let mut hit = false;
     for kv in kvs.iter_mut() {
@@ -1018,12 +998,11 @@ mod tests {
             .collect();
         assert_eq!(
             rules,
-            vec![Rule::Email, Rule::CreditCard, Rule::SecretValue]
+            vec![Rule::Email, Rule::CreditCard, Rule::SecretExactName]
         );
-        // `?key=` is a name-rule hit too, but the `sk-` value hit starts at the
-        // same byte and wins the tie, so the rule that is reported is the
-        // value's and no name is recorded.
-        assert!(ci.redaction_names.is_empty(), "{:?}", ci.redaction_names);
+        // `?key=sk-...` is a name-rule hit and a value-rule hit over the same
+        // range; the name rule's wins the tie, so the report keeps the name.
+        assert_eq!(ci.redaction_names, vec!["key"]);
     }
 
     #[test]
