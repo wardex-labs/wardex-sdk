@@ -409,6 +409,16 @@ All notable changes to this project are documented here. The format follows
   a local model server or a gateway. The parser's fixture corpus gains three
   such cases, and a test fails if any fixture's provider or its guess flag
   comes out wrong.
+- **A span the OTLP exporter skips is counted once, and the report no longer
+  says the batch shipped.** `transport.otlp.span_unmarshalled` was bumped when
+  the batch was encoded, so a batch whose encode spent the export budget, and
+  went back to the buffer, counted the same span again on every retry. It is
+  now counted by the attempt that decides the batch: the first request going
+  out, or nothing left to send. The report line read "the rest of the batch
+  shipped" even when every span was skipped and nothing was sent; it now says
+  only that the other spans were not affected. The span names follow the
+  transport's own `debug` flag as well as `init(debug=True)`. A transport of
+  your own that calls `Transport.encode()` still counts and reports there.
 
 ## [0.6.0b1] - 2026-09-06
 

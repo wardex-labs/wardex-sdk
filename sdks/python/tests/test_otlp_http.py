@@ -902,3 +902,122 @@ def test_the_missing_wheel_is_named_off_debug_even_with_a_spent_deadline(monkeyp
         f"a degraded process with a spent deadline said nothing at all: {err!r}"
     )
     reset_reports_for_test()
+
+
+def _bad_span_envelope(*names_ok: str) -> Envelope:
+    """Spans named in `names_ok`, plus one whose tool block holds an int for a
+    name -- a value the marshaller cannot read, so the export skips it."""
+    from wardex_sdk._types import ToolAttributes
+
+    spans = tuple(_span(name=n) for n in names_ok)
+    bad = _span(name="SKIPPED-SPAN", tool=ToolAttributes(name=1))  # type: ignore[arg-type]
+    return Envelope(header=_header(), spans=(*spans, bad))
+
+
+def _report_lines(fn) -> list[str]:
+    """Every line the `wardex_sdk` logger emits while `fn` runs, at any level,
+    with the once-per-process report memory cleared first."""
+    import logging
+
+    from wardex_sdk._assembly._diag import reset_reports_for_test
+
+    lines: list[str] = []
+
+    class _Records(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            lines.append(record.getMessage())
+
+    reset_reports_for_test()
+    logger = logging.getLogger("wardex_sdk")
+    handler = _Records(level=logging.DEBUG)
+    logger.addHandler(handler)
+    level = logger.level
+    logger.setLevel(logging.DEBUG)
+    try:
+        fn()
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(level)
+    return lines
+
+
+@pytest.mark.usefixtures("fresh_counters")
+def test_a_retried_batch_counts_its_unmarshallable_span_once():
+    """A budget the encode spends answers `UNDELIVERED`, and the drain hands
+    the batch back to the buffer. Counting the skipped span at encode time made
+    every such retry count it again; it is counted by the attempt that decides
+    the batch's fate -- here, the one that finally POSTs."""
+    from wardex_sdk._assembly import counters
+
+    srv = _serve()
+    try:
+        t = OtlpHttpTransport(endpoint=f"http://127.0.0.1:{srv.server_address[1]}/v1/traces")
+        env = _bad_span_envelope("good")
+        assert t.export(env, timeout=1e-9) is UNDELIVERED
+        assert t.export(env, timeout=1e-9) is UNDELIVERED
+        assert counters.get("transport.otlp.span_unmarshalled") == 0
+        assert t.export(env) is None
+        assert counters.get("transport.otlp.span_unmarshalled") == 1
+        assert [_span_names(r) for r in _Handler.requests] == [["good"]]
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+@pytest.mark.usefixtures("fresh_counters")
+def test_the_skip_report_claims_nothing_about_what_shipped():
+    """Every span in a batch can be the skipped kind, and then nothing is
+    POSTed. The report still counts the skip, and says nothing that would be
+    false in that case -- no "the rest of the batch shipped"."""
+    from wardex_sdk._assembly import counters
+
+    srv = _serve()
+    try:
+        t = OtlpHttpTransport(endpoint=f"http://127.0.0.1:{srv.server_address[1]}/v1/traces")
+        lines = _report_lines(lambda: t.export(_bad_span_envelope()))
+        assert _Handler.requests == []
+        assert counters.get("transport.otlp.span_unmarshalled") == 1
+        (report,) = [line for line in lines if "could not be marshalled" in line]
+        assert "shipped" not in report
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+@pytest.mark.usefixtures("fresh_counters")
+def test_a_custom_transport_calling_encode_still_counts_and_reports():
+    """`Transport.encode()` is the sanctioned path a hand-written transport
+    calls. It still counts and reports the skipped span itself, at encode
+    time: that transport has no `UNDELIVERED` retry of its own to defer to."""
+    from wardex_sdk._assembly import counters
+    from wardex_sdk.transport import Transport
+
+    class _Custom(Transport):
+        def export(self, envelope, *, timeout=None):
+            self.encode(envelope)
+
+    lines = _report_lines(lambda: _Custom().export(_bad_span_envelope("good")))
+    assert counters.get("transport.otlp.span_unmarshalled") == 1
+    assert any("could not be marshalled" in line for line in lines)
+
+
+def test_the_transports_own_debug_flag_reveals_the_skipped_span_names():
+    """The report tells a person to re-run with debug=True. On the OTLP
+    exporter that must work where they set it on the transport itself, not
+    only through `init()`: either flag reveals the names."""
+    srv = _serve()
+    try:
+        endpoint = f"http://127.0.0.1:{srv.server_address[1]}/v1/traces"
+        quiet = _report_lines(
+            lambda: OtlpHttpTransport(endpoint=endpoint).export(_bad_span_envelope("good"))
+        )
+        loud = _report_lines(
+            lambda: OtlpHttpTransport(endpoint=endpoint, debug=True).export(
+                _bad_span_envelope("good")
+            )
+        )
+        assert not any("SKIPPED-SPAN" in line for line in quiet)
+        assert any("SKIPPED-SPAN" in line for line in loud)
+    finally:
+        srv.shutdown()
+        srv.server_close()
