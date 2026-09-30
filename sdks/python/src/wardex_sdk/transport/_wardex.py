@@ -34,10 +34,10 @@ from __future__ import annotations
 import time
 import urllib.request
 
-from .._assembly import diag_info, diag_warning, report_once
+from .._assembly import counters, diag_info, diag_warning, report_once
 from .._native import NATIVE_OK, native, unavailable_reason
 from .._types import Envelope
-from ._base import UNDELIVERED, Transport, Undelivered
+from ._base import UNDELIVERED, Transport, Undelivered, _debug_enabled
 from ._otlp_http import _cut_short_by_the_caller
 
 #: The receiver route every wardex receiver serves, appended to `base_url`.
@@ -132,16 +132,50 @@ class WardexTransport(Transport):
         # this transport is masked exactly as one leaving through OTLP. The
         # encoder applies the policy inside the native call -- there is no
         # Python-side path to bytes that skips it.
-        body = native.codec.encode_envelope(
+        #
+        # The EXPORT encoder, not the fidelity one: a span whose typed block
+        # holds a value of the wrong Python type is skipped and named rather
+        # than raised. The raise reached the client's drain, which drops the
+        # WHOLE batch -- every good span beside the bad one, silently
+        # off-debug. A failure outside the typed blocks still raises: that is
+        # an encoder bug, not one host value.
+        body, unmarshalled = native.codec.encode_envelope_export(
             envelope, self._pii_mode, list(self._pii_disabled), self._limits, **self._pii_names()
         )
         remaining = deadline - time.monotonic()
-        if remaining <= 0:
+        if body is not None and remaining <= 0:
             # The encode ate the budget. Nothing went on the wire, so this is
-            # a decline rather than a loss.
+            # a decline rather than a loss. Skipped spans are NOT counted on
+            # this path: the batch goes back to the buffer, the next attempt
+            # re-encodes it and meets the same spans, and that attempt counts
+            # them -- so one bad span is one count, however many retries.
             if self._debug:
                 diag_info("wardex export skipped (deadline spent encoding)")
             return UNDELIVERED
+        if unmarshalled:
+            # Counted and said as `Transport.encode()` does for OTLP. The
+            # reasons stay off stderr unless debug is on: each is "{span
+            # name}: {exception}", and both halves are HOST text that would
+            # reach stderr outside PII masking. "Debug" is this transport's
+            # flag OR the client's, so the `init(debug=True)` the line below
+            # tells a person to try reveals them for a hand-built transport
+            # too.
+            for _ in unmarshalled:
+                counters.bump("transport.wardex.span_unmarshalled")
+            report_once(
+                f"{len(unmarshalled)} span(s) could not be marshalled for export and "
+                "were left out; the other spans in their batch were not affected "
+                "(counted under transport.wardex.span_unmarshalled; re-run with "
+                "debug=True to see which)",
+                key="transport.wardex.span_unmarshalled",
+            )
+            if self._debug or _debug_enabled():
+                diag_info("spans not marshalled: " + "; ".join(unmarshalled))
+        if body is None:
+            # Every item was skipped. Not `UNDELIVERED`: handing the batch
+            # back would fail on the same spans at every retry and pin them in
+            # the buffer; and a header with nothing under it is not a POST.
+            return None
         headers = {
             "Content-Type": "application/x-protobuf",
             # The envelope encoder's output IS a zstd frame; the header

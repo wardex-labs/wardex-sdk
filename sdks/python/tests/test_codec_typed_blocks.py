@@ -419,6 +419,28 @@ def test_an_unmarshallable_span_puts_no_host_text_on_stderr_off_debug():
     assert any("SECRET-SPAN-NAME" in line and "SECRET-VALUE-4711" in line for line in on)
 
 
+def test_a_keyboard_interrupt_while_marshalling_is_not_an_unmarshallable_span():
+    """The export path skips a span whose value the marshaller could not read
+    -- an `Exception`. A `KeyboardInterrupt` raised by host code the
+    marshaller calls is the host's control flow: it propagates out of the
+    encoder instead of being counted as one more skipped span."""
+    from wardex_sdk._assembly import counters
+    from wardex_sdk._types import Envelope
+    from wardex_sdk.testing import RecordingTransport
+
+    class _Interrupting:
+        @property
+        def value(self):
+            raise KeyboardInterrupt("ctrl-c while wardex read a host value")
+
+    before = counters.get("transport.otlp.span_unmarshalled")
+    bad = _span(name="bad", tool=ToolAttributes(name="t", type=_Interrupting()))  # type: ignore[arg-type]
+    env = Envelope(header=_env(bad).header, spans=(_span(name="good"), bad))
+    with pytest.raises(KeyboardInterrupt):
+        RecordingTransport().encode(env, compress=False)
+    assert counters.get("transport.otlp.span_unmarshalled") == before
+
+
 def test_a_failure_outside_the_typed_blocks_still_raises_on_the_export_path():
     """The skip is for HOST values the marshaller cannot read, not for the
     encoder's own fields: a span whose wardex-owned `events` cannot be

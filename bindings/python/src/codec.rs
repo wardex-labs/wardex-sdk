@@ -1017,6 +1017,34 @@ fn header_to_proto(h: &Bound<PyAny>) -> PyResult<pb::EnvelopeHeader> {
     Ok(header)
 }
 
+/// `"{span name}: {exception type}: {text}"` for a span the export path skips.
+///
+/// Built by hand rather than through `Display for PyErr`, which runs the
+/// host's `__str__` and the class's `__qualname__` and swallows whatever they
+/// raise — a `KeyboardInterrupt` included — and which `format!` turns into a
+/// panic when the class refuses its name. Here a failure that is an
+/// `Exception` becomes a placeholder, so one odd host value still costs one
+/// span; a failure that is not one is the host's control flow and is
+/// returned, to be raised.
+fn skip_reason(sp: &Bound<'_, PyAny>, e: &PyErr) -> PyResult<String> {
+    let py = sp.py();
+    let host_text =
+        |text: PyResult<Bound<'_, pyo3::types::PyString>>, placeholder: &str| -> PyResult<String> {
+            match text {
+                Ok(s) => Ok(s.to_string_lossy().into_owned()),
+                Err(err) if err.is_instance_of::<pyo3::exceptions::PyException>(py) => {
+                    Ok(placeholder.into())
+                }
+                Err(err) => Err(err),
+            }
+        };
+    let name = host_text(sp.getattr("name").and_then(|n| n.str()), "<unnamed>")?;
+    let value = e.value_bound(py);
+    let kind = host_text(value.get_type().qualname(), "<unnamed exception>")?;
+    let text = host_text(value.str(), "<exception str() failed>")?;
+    Ok(format!("{name}: {kind}: {text}"))
+}
+
 /// `InternalEnvelope`(Python) → `pb::Envelope`.
 ///
 /// `state_snapshots` is a parameter because the OTLP surface is traces-only:
@@ -1047,14 +1075,15 @@ fn envelope_to_proto(
         let sp = sp?;
         let mut span = span_head_to_proto(&sp)?;
         if let Err(e) = flatten_typed_blocks(&sp, &mut span) {
-            if !skip_unmarshallable {
+            // Only an `Exception` is a value the marshaller could not read. A
+            // `BaseException` that is not one — `KeyboardInterrupt` from a
+            // host `__str__`, `SystemExit` — is the host's control flow and
+            // must reach the host untouched, not become one more skipped span.
+            if !skip_unmarshallable || !e.is_instance_of::<pyo3::exceptions::PyException>(env.py())
+            {
                 return Err(e);
             }
-            let name = sp
-                .getattr("name")
-                .and_then(|n| n.str().map(|s| s.to_string()))
-                .unwrap_or_else(|_| "<unnamed>".into());
-            unmarshalled.push(format!("{name}: {e}"));
+            unmarshalled.push(skip_reason(&sp, &e)?);
             continue;
         }
         span_tail_to_proto(&sp, &mut span)?;
@@ -1523,21 +1552,75 @@ fn encode_envelope_py(
         reveal_names: pii_reveal_names,
     };
     shielded(|| {
-        // `zstd_level` is the only limit the codec reads, and it must come from
-        // the caller's resolved limits: hardcoding the default here would let a
-        // configured level be validated and then silently discarded.
-        let limits = limits.map(|p| p.inner).unwrap_or_default();
         // Marshalling walks Python objects — the only part that needs the GIL.
-        let (mut proto, _) = envelope_to_proto(envelope, true, false)?;
-        // Masking + protobuf + zstd are pure Rust: release the GIL so app threads
-        // keep running while the batch worker encodes (design §9).
-        let bytes = py.allow_threads(|| -> PyResult<Vec<u8>> {
-            pii_apply_envelope(&mut proto, &policy)?;
-            encode_envelope(&proto, limits)
-                .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
-        })?;
-        Ok(PyBytes::new_bound(py, &bytes).unbind())
+        let (proto, _) = envelope_to_proto(envelope, true, false)?;
+        masked_envelope_bytes(py, proto, &policy, limits)
     })
+}
+
+/// Envelope → `(body, unmarshalled)` — the export path's envelope encoder.
+///
+/// `encode_envelope` is the fidelity encoder: a span it cannot marshal is a
+/// raise, because a round-trip tool that hides a span is lying about what it
+/// round-tripped. On the export path that raise reached the client's drain,
+/// which drops the WHOLE batch — so one host value of the wrong type cost
+/// every good span shipped beside it, silently off-debug. This encoder skips
+/// that one span and names it, exactly as `encode_otlp_requests` does on the
+/// OTLP wire; the caller counts and reports, because the core has no channel
+/// to a user.
+///
+/// `body` is `None` when no item survived the skip: an envelope with nothing
+/// in it is nothing to send, and the caller must not post a header alone.
+#[pyfunction]
+#[pyo3(signature = (envelope, pii_mode = "off", pii_disabled = Vec::new(), limits = None, *, pii_extra_names = Vec::new(), pii_reveal_names = Vec::new()))]
+fn encode_envelope_export(
+    py: Python<'_>,
+    envelope: &Bound<'_, PyAny>,
+    pii_mode: &str,
+    pii_disabled: Vec<String>,
+    limits: Option<PyLimits>,
+    pii_extra_names: Vec<String>,
+    pii_reveal_names: Vec<String>,
+) -> PyResult<(Option<Py<PyBytes>>, Vec<String>)> {
+    let policy = PiiPolicy {
+        mode: pii_mode,
+        disabled: pii_disabled,
+        extra_names: pii_extra_names,
+        reveal_names: pii_reveal_names,
+    };
+    shielded(|| {
+        let (proto, unmarshalled) = envelope_to_proto(envelope, true, true)?;
+        if proto.items.is_empty() {
+            return Ok((None, unmarshalled));
+        }
+        Ok((
+            Some(masked_envelope_bytes(py, proto, &policy, limits)?),
+            unmarshalled,
+        ))
+    })
+}
+
+/// A marshalled envelope → masked, serialized, zstd-framed bytes: the half
+/// both envelope encoders share, so the fidelity and export paths cannot
+/// drift on masking or compression.
+fn masked_envelope_bytes(
+    py: Python<'_>,
+    mut proto: pb::Envelope,
+    policy: &PiiPolicy<'_>,
+    limits: Option<PyLimits>,
+) -> PyResult<Py<PyBytes>> {
+    // `zstd_level` is the only limit the codec reads, and it must come from
+    // the caller's resolved limits: hardcoding the default here would let a
+    // configured level be validated and then silently discarded.
+    let limits = limits.map(|p| p.inner).unwrap_or_default();
+    // Masking + protobuf + zstd are pure Rust: release the GIL so app threads
+    // keep running while the batch worker encodes (design §9).
+    let bytes = py.allow_threads(|| -> PyResult<Vec<u8>> {
+        pii_apply_envelope(&mut proto, policy)?;
+        encode_envelope(&proto, limits)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    })?;
+    Ok(PyBytes::new_bound(py, &bytes).unbind())
 }
 
 #[pyfunction]
@@ -1838,6 +1921,7 @@ fn vocabulary_tables(py: Python<'_>) -> PyResult<PyObject> {
 pub fn register(parent: &Bound<'_, PyModule>) -> PyResult<()> {
     let m = PyModule::new_bound(parent.py(), "codec")?;
     m.add_function(wrap_pyfunction!(encode_envelope_py, &m)?)?;
+    m.add_function(wrap_pyfunction!(encode_envelope_export, &m)?)?;
     m.add_function(wrap_pyfunction!(decode_envelope_py, &m)?)?;
     m.add_function(wrap_pyfunction!(encode_otlp_traces, &m)?)?;
     m.add_function(wrap_pyfunction!(encode_otlp_requests, &m)?)?;

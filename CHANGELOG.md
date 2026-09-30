@@ -26,7 +26,11 @@ All notable changes to this project are documented here. The format follows
   `Authorization: Bearer` header and nowhere else. Masking and limits apply
   through the same stored policy the OTLP exporter uses. The receiver stamps
   the project onto each stored batch; the envelope leaves with `project_id`
-  empty. Before this, a key with no endpoint captured into `NoOpTransport`.
+  empty. A span holding a value its typed block cannot carry costs that span
+  only, as on the OTLP wire: it is skipped, counted under
+  `transport.wardex.span_unmarshalled` and reported once, and the rest of the
+  batch ships. Before this, a key with no endpoint captured into
+  `NoOpTransport`.
 - **`BackendConfig.base_url` (`WARDEX_BASE_URL`)** names a self-hosted wardex
   receiver; without it the key's region tag picks the host from a table the
   SDK carries, and a region this build does not know is refused at `init()`
@@ -139,6 +143,14 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- **Ctrl-C reaches your program while a batch is being exported.** The OTLP
+  exporter skips a span it cannot marshal instead of dropping the batch, and
+  it treated a `KeyboardInterrupt` or `SystemExit` raised by your code during
+  that read — a value's property, an exception's `__str__` or its class's
+  `__qualname__` — as one more skipped span, so the interrupt never arrived.
+  Only an `Exception` is skipped now; anything else propagates. An exception
+  whose class refuses its own name no longer turns the skip into a native
+  panic that dropped the batch after all.
 - **A credential passed as an argument is masked whatever carries it, and the
   argument's other values are no longer thrown away.** Masking recognised a
   credential only by its shape (`sk-…`, `AKIA…`), so a key with no shape went
