@@ -24,7 +24,14 @@ import urllib.request
 from .._assembly import diag_info, diag_warning, report_once
 from .._native import NATIVE_OK, unavailable_reason
 from .._types import Envelope
-from ._base import UNDELIVERED, CallerBudget, Transport, Undelivered
+from ._base import (
+    UNDELIVERED,
+    CallerBudget,
+    Transport,
+    Undelivered,
+    _debug_enabled,
+    _report_unmarshalled,
+)
 
 
 def _cut_short_by_the_caller(
@@ -147,6 +154,12 @@ class OtlpHttpTransport(Transport):
     def export(self, envelope: Envelope, *, timeout: float | None = None) -> Undelivered | None:
         return self._send_batch(envelope, timeout)
 
+    def _count_unmarshalled(self, unmarshalled: list[str]) -> None:
+        # "Debug" is this transport's flag OR the client's, as on the wardex
+        # envelope exporter: the report tells a person to re-run with
+        # debug=True, and either place they set it must reveal the names.
+        _report_unmarshalled(unmarshalled, debug=self._debug or _debug_enabled())
+
     def _send_batch(self, envelope: Envelope, timeout: float | None = None) -> Undelivered | None:
         # zero spans means an empty batch — skip the POST. Not a decline: there
         # is nothing here for a later attempt to deliver.
@@ -211,15 +224,21 @@ class OtlpHttpTransport(Transport):
         # the time you asked for".
         started = time.monotonic()
         deadline = started + effective
-        # THE SANCTIONED PATH: `Transport.encode()` runs the native encoder
-        # with this transport's stored PII policy and limits, splits at
-        # `max_otlp_request_bytes`, and reports (once per process) any span too
-        # large to ship even bare. The `compress` constructor flag feeds it.
-        bodies = self.encode(envelope, compress=self._compress)
+        # THE SANCTIONED PATH, minus one report: `_encode_requests` is
+        # `Transport.encode()` -- the native encoder with this transport's
+        # stored PII policy and limits, split at `max_otlp_request_bytes`, the
+        # over-cap span reported once per process -- except that the spans the
+        # marshaller skipped come back uncounted. They are counted below, where
+        # this batch's fate is decided: counting here, before a spent budget
+        # hands the batch back as `UNDELIVERED`, made the retry count the same
+        # span again. The `compress` constructor flag feeds it.
+        bodies, unmarshalled = self._encode_requests(envelope, compress=self._compress)
         if not bodies:
-            # Every span in the batch was dropped by encode()'s over-cap guard.
-            # Nothing to POST, and not `UNDELIVERED`: a later attempt would
-            # encode to the same nothing.
+            # Every span in the batch was dropped -- by encode()'s over-cap
+            # guard, or skipped as unmarshallable. Nothing to POST, and not
+            # `UNDELIVERED`: a later attempt would encode to the same nothing.
+            # The fate is decided, so the skipped spans are counted now.
+            self._count_unmarshalled(unmarshalled)
             return None
         headers = {"Content-Type": "application/x-protobuf"}
         # Host headers next, as they always have been: a caller who sets one of
@@ -264,6 +283,9 @@ class OtlpHttpTransport(Transport):
                     # them instead of guessing. Same answer as the spent-budget
                     # guard above, reached by the encode having eaten the budget
                     # rather than the caller having arrived with none.
+                    # The skipped spans are NOT counted on this path: the batch
+                    # goes back to the buffer, and the attempt that finally
+                    # decides it meets and counts them -- once.
                     if self._debug:
                         diag_info("OTLP export skipped (deadline spent encoding)")
                     return UNDELIVERED
@@ -283,6 +305,11 @@ class OtlpHttpTransport(Transport):
                     key="transport.otlp.split_export_out_of_budget",
                 )
                 break
+            if index == 0:
+                # The first request is going on the wire: this batch will not
+                # come back as `UNDELIVERED`, so its skipped spans are counted
+                # here, exactly once.
+                self._count_unmarshalled(unmarshalled)
             req = urllib.request.Request(self._endpoint, data=body, headers=headers, method="POST")
             try:
                 with suppress_capture():
