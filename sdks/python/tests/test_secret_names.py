@@ -13,16 +13,18 @@ from __future__ import annotations
 import http.client
 import json
 import threading
+import uuid
 import warnings
 from collections.abc import Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
 import wardex_sdk as wardex
-from wardex_sdk import _hub, _wardex_native
+from wardex_sdk import _hub, _tracing, _wardex_native
 from wardex_sdk._config import PIIConfig
 from wardex_sdk._enums import CaptureMode, PIIMode
 from wardex_sdk.transport import Transport
@@ -229,6 +231,47 @@ def test_two_hundred_real_connections_keep_their_ids_out_of_the_card_rule(port):
     for name, s in spans.items():
         rules = s.get("capture_integrity", {}).get("redaction_rules", [])
         assert set(rules) <= {"ip_address"}, (name, rules)
+
+
+def test_a_conversation_id_the_sdk_mints_is_never_taken_for_a_card(port, monkeypatch):
+    """`wardex.conversation(name)` with no id mints `str(uuid.uuid4())`. About
+    one such id in seven thousand has a run of groups that is all decimal and
+    passes the card checksum, and the card rule used to rewrite it to
+    `****-****-****-...` and record `credit_card` on the span — on both wires.
+
+    The mint is made to return one of those ids, a genuine version-4 UUID, and
+    the real path runs with every category on. A host that names its own
+    conversation keeps its masking; that side is pinned in the Rust census.
+    """
+    minted = uuid.UUID("48620579-8682-4828-a0e5-0454f31af317")
+    assert minted.version == 4 and minted.variant == uuid.RFC_4122
+    monkeypatch.setattr(_tracing, "uuid", SimpleNamespace(uuid4=lambda: minted))
+    cap = _Capture()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        wardex.init(transport=cap, intercept=True, capture_mode=CaptureMode.ALL)
+    with wardex.conversation("chat"):
+        _call(port, "GET", "/minted")
+    wardex.flush()
+    (chat,) = [
+        it["span"]
+        for b in cap.envelopes
+        for it in _wardex_native.codec.decode_envelope(b)["items"]
+        if "span" in it and it["span"]["name"] == "chat"
+    ]
+    assert chat["conversation"]["conversation_id"] == str(minted)
+    assert chat.get("capture_integrity", {}).get("redaction_rules", []) == []
+    (otlp_chat,) = [
+        sp
+        for b in cap.otlp
+        for rs in _wardex_native.codec.decode_otlp_traces(b)["resource_spans"]
+        for ss in rs["scope_spans"]
+        for sp in ss["spans"]
+        if sp["name"] == "chat"
+    ]
+    attrs = otlp_chat["attributes"]
+    assert attrs["gen_ai.conversation.id"] == str(minted)
+    assert not any(k.startswith("wardex.redact") for k in attrs), attrs
 
 
 def test_a_name_that_is_itself_personal_data_is_masked_in_the_names_list(port):
