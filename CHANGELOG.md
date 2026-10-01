@@ -143,6 +143,19 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- **A span's connection id is no longer masked as a card number, and its
+  masking record no longer reports a card that was never there.** The
+  connection id is a value the SDK makes for itself (`str(id(socket))`). On
+  64-bit Linux it is about fifteen digits and roughly one in ten passes the
+  card checksum, so the default `credit_card` rule rewrote it to
+  `****-****-****-NNNN` on the wardex envelope — spans from one connection
+  could no longer be grouped by it — and wrote `credit_card` into the span's
+  `redaction_rules` and count. Text the SDK writes itself is now never
+  masked: the connection id, the envelope's `event_id` and item type, the
+  SDK's name, version, Python version, OS, architecture and semconv version,
+  and on OTLP the instrumentation scope's name and version and the
+  `telemetry.sdk.*` resource attributes. Everything your application or its
+  traffic puts on a span is masked exactly as before.
 - **Ctrl-C reaches your program while a batch is being exported.** The OTLP
   exporter skips a span it cannot marshal instead of dropping the batch, and
   it treated a `KeyboardInterrupt` or `SystemExit` raised by your code during
