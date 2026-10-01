@@ -16,6 +16,11 @@
 //! One field is the SDK's only sometimes: the conversation id is the host's
 //! when it names one and the SDK's when nobody does. That field stays masked,
 //! and its value is judged instead — see `is_sdk_minted_id`.
+//!
+//! A span attribute the SDK computes is judged the same way, by its key and
+//! the exact form the SDK writes under it — see `SDK_VALUE_ATTRS`. Attributes
+//! are a map anyone can write into, so a key alone does not say the SDK wrote
+//! the value; the form says the SDK could have.
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
@@ -160,10 +165,52 @@ fn is_sdk_minted_id(text: &str) -> bool {
     }
 }
 
-/// A span attribute holding a conversation id the SDK could have minted —
-/// left as written, for the reason `is_sdk_minted_id` gives.
-fn is_minted_conversation_attr(key: &str, value: Option<&str>) -> bool {
-    key == CONVERSATION_ID_KEY && value.is_some_and(is_sdk_minted_id)
+/// Where the OpenAI Agents adapter writes the identity of the tool list an
+/// MCP server answered with: `hash_canonical(sorted(names))[:16]`.
+const MCP_TOOLS_HASH_KEY: &str = "wardex.openai_agents.mcp.tools_hash";
+
+/// SDK-COMPUTED: `text` is, byte for byte, a value of the form the SDK writes
+/// under `MCP_TOOLS_HASH_KEY` — the first sixteen digits of a SHA-256 in
+/// lowercase hex, as `hashlib`'s `hexdigest()` writes them.
+///
+/// A digest whose sixteen digits are all decimal and pass the checksum reads
+/// as a card number, about one tool list in eighteen thousand, and unlike a
+/// fresh id it is the same digest on every run against that server. The card
+/// rule is the only built-in rule that can match inside this form, so leaving
+/// it alone gives up that rule's matches on a sixteen-digit value under this
+/// one key and nothing else.
+fn is_sdk_tools_digest(text: &str) -> bool {
+    text.len() == 16
+        && text
+            .bytes()
+            .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+}
+
+/// Whether a text is in the exact form the SDK writes under one key.
+type SdkForm = fn(&str) -> bool;
+
+/// Span attributes whose value the SDK makes itself, each by the key it
+/// writes it under and the exact form it writes. An attribute matching both
+/// ships as written and goes into no record; under any other key, or in any
+/// other form, the same text is judged like everything else the host put on
+/// the span. `tests/sdk_generated_fields.rs` proves both sides, and
+/// `sdks/python/tests/test_sdk_attribute_census.py` reads every attribute the
+/// SDK writes out of its source and fails until each is classified, this
+/// list included.
+const SDK_VALUE_ATTRS: &[(&str, SdkForm)] = &[
+    // The SDK's when nobody named the conversation; see `is_sdk_minted_id`.
+    (CONVERSATION_ID_KEY, is_sdk_minted_id),
+    (MCP_TOOLS_HASH_KEY, is_sdk_tools_digest),
+];
+
+/// A span attribute holding a value the SDK could have written itself —
+/// left as written, for the reasons `SDK_VALUE_ATTRS` gives.
+fn is_sdk_value_attr(key: &str, value: Option<&str>) -> bool {
+    value.is_some_and(|text| {
+        SDK_VALUE_ATTRS
+            .iter()
+            .any(|(k, form)| *k == key && form(text))
+    })
 }
 
 fn pb_text(v: &Option<pb::AnyValue>) -> Option<&str> {
@@ -383,13 +430,14 @@ fn mask_span(engine: &PiiEngine, span: &mut pb::Span) {
     if let Some(pb::Status { code: _, message }) = status {
         hit |= mask_string(m, message);
     }
-    // A host can spell the conversation id into `extra` by hand, and that is
-    // the value the OTLP mapping ships under its key when the typed field is
-    // unset — so it is judged here as `mask_otlp_span` judges it there, and
-    // the two wires agree on what was masked.
+    // The attributes the SDK computes, in the form it writes them, are left
+    // as written. The OTLP mapping ships `extra` under the same keys, and
+    // the conversation id's key also holds the typed field there, so
+    // `mask_otlp_span` judges the same pairs the same way and the two wires
+    // agree on what was masked.
     for kv in extra
         .iter_mut()
-        .filter(|kv| !is_minted_conversation_attr(&kv.key, pb_text(&kv.value)))
+        .filter(|kv| !is_sdk_value_attr(&kv.key, pb_text(&kv.value)))
     {
         hit |= mask_kvs(m, std::slice::from_mut(kv));
     }
@@ -703,11 +751,11 @@ fn mask_otlp_span(engine: &PiiEngine, span: &mut otlp_pb::trace::Span) -> Option
     let mut hit = false;
     hit |= mask_string(m, trace_state);
     hit |= mask_string(m, name);
-    // `gen_ai.conversation.id` is where the mapping writes the typed
-    // conversation id, so it gets that field's treatment — see `mask_span`.
+    // `extra`'s pairs arrive here under their own keys, and the typed
+    // conversation id under `gen_ai.conversation.id` — see `mask_span`.
     for kv in attributes
         .iter_mut()
-        .filter(|kv| !is_minted_conversation_attr(&kv.key, otlp_text(&kv.value)))
+        .filter(|kv| !is_sdk_value_attr(&kv.key, otlp_text(&kv.value)))
     {
         hit |= mask_otlp_kvs(m, std::slice::from_mut(kv));
     }
@@ -1138,6 +1186,54 @@ mod tests {
             span.capture_integrity.as_ref().unwrap().redaction_rules,
             vec![Rule::CreditCard as i32]
         );
+    }
+
+    #[test]
+    fn a_tool_list_digest_that_passes_the_card_checksum_is_left_alone() {
+        // What the OpenAI Agents adapter writes for an MCP server listing
+        // `get_weather` and `search_docs_v28401`: sixteen decimal digits
+        // that pass the checksum, on every run against that server.
+        let digest = "8096697742134142";
+        assert_eq!(
+            engine().mask_text(digest).as_deref(),
+            Some("****-****-****-4142")
+        );
+        let with = |key: &str, value: &str| {
+            env_with(pb::Span {
+                name: "execute_step mcp.list_tools".into(),
+                extra: vec![text_kv(key, value)],
+                ..Default::default()
+            })
+        };
+        let mut env = with(MCP_TOOLS_HASH_KEY, digest);
+        let before = env.clone();
+        mask_envelope(&engine(), &mut env);
+        assert_eq!(env, before);
+        // The same digits under another key, or another form under this
+        // key, are judged as before.
+        for (key, value) in [
+            ("wardex.openai_agents.mcp.server", digest),
+            (MCP_TOOLS_HASH_KEY, "4111-1111-1111-1111"),
+            (MCP_TOOLS_HASH_KEY, "80966977421341424"),
+        ] {
+            let mut env = with(key, value);
+            mask_envelope(&engine(), &mut env);
+            let span = span_of(&env);
+            assert_eq!(
+                span.capture_integrity.as_ref().unwrap().redaction_rules,
+                vec![Rule::CreditCard as i32],
+                "{key} = {value}"
+            );
+        }
+        assert!(is_sdk_tools_digest("0123456789abcdef"));
+        for text in [
+            "0123456789ABCDEF",
+            "0123456789abcde",
+            "0123456789abcdefa",
+            "0123456789abcdeg",
+        ] {
+            assert!(!is_sdk_tools_digest(text), "{text}");
+        }
     }
 
     #[test]
