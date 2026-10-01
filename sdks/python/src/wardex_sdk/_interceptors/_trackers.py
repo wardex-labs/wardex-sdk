@@ -19,7 +19,7 @@ from .._protocol import WsParser
 from .._protocol._http1 import Http1RequestParser, Http1ResponseParser
 from .._protocol._http2 import Http2Parser
 from .._types import ConversationContext, SpanContext
-from ._h2_issuer import StreamIssuers
+from ._h2_issuer import IssuerLink
 
 
 def _ttft_from_marks(marks: list[tuple[int, int]], header_len: int, start_ns: int) -> float:
@@ -167,7 +167,7 @@ def _is_ws_upgrade_request(headers: object) -> bool:
 #: by the message, which the frame parser already caps. Consulted only when
 #: nothing hides the payload.
 _RESPONSES_CREATE = re.compile(rb'"type"\s*:\s*"response\.create"')
-_StreamLatch = tuple[SpanContext | None, bool, ConversationContext | None, int]
+_StreamLatch = tuple[SpanContext | None, bool, ConversationContext | None, bool, int]
 
 
 @dataclass
@@ -200,6 +200,8 @@ class _Txn:
     parent_evicted: bool = False
     #: The conversation the request was ISSUED in, latched beside `parent` for the same reason.
     conversation: ConversationContext | None = None
+    #: False where no h2 issuer was proven (`_h2_issuer`): `conversation` is unknown, not none.
+    issuer_proven: bool = True
     truncated: bool = False
     # Capture-limitation markers the protocol parser attached to this
     # transaction, merged into the span's CaptureIntegrity.limitations by the
@@ -396,7 +398,7 @@ class _Http2Tracker:
     def __init__(self, limits: object | None = None) -> None:
         self._conn = Http2Parser(limits)
         # stream_id -> (parent span, whether its unit had already closed, the conversation — the
-        # issuer's, where `_h2_issuer` proved it — request start ns)
+        # issuer's, where `_h2_issuer` proved it — whether it was proved, request start ns)
         #
         # `_mk` pops on every transaction, so the entries that accumulate are the streams that end
         # WITHOUT one: RST_STREAM, a GOAWAY that strands everything above `last_stream_id`, a server
@@ -443,10 +445,10 @@ class _Http2Tracker:
         #: the test for every real stream id.
         self._latch_first = 0
         #: Who opened each stream, read in the opening call itself (`_h2_issuer`).
-        self._issuers = StreamIssuers(self._latch_cap)
+        self._issuers = IssuerLink(self._latch_cap)
 
     def on_request_bytes(self, data: bytes) -> list[_Txn]:
-        self._issuers.claim(data)
+        self._issuers.see(data)
         opened, txns = self._conn.feed(True, data)
         now = time.time_ns()
         # The WRITER's scope, which on a shared connection may be any task's: any
@@ -455,8 +457,7 @@ class _Http2Tracker:
         parent = _hub.get_current_scope().active_span_context
         parent_closed = parent_is_closed_unit(parent) if opened else False
         for sid in opened:
-            issued = self._issuers.take(sid)
-            self._latch[sid] = (*issued, now) if issued else (parent, parent_closed, None, now)
+            self._latch[sid] = (*self._issuers.latch(sid, parent, parent_closed), now)
         if opened:
             low = min(opened)
             self._latch_first = low if self._latch_first == 0 else min(self._latch_first, low)
@@ -540,7 +541,7 @@ class _Http2Tracker:
         now = time.time_ns()
         entry = self._latch.pop(t.stream_id, None)
         if entry is None:
-            parent, parent_closed, conversation, start = None, False, None, now
+            parent, parent_closed, conversation, proven, start = None, False, None, False, now
             # The DECISION the cap owes the span. An absent latch entry has two causes that look
             # identical here and mean opposite things: nothing was ambient when the request went out
             # (an honest trace root, and under `capture_mode=AGENT` the gate has usually dropped it
@@ -570,7 +571,7 @@ class _Http2Tracker:
             # that had filtered the span out.
             parent_evicted = self._latch_first <= t.stream_id <= self._latch_evicted_below
         else:
-            parent, parent_closed, conversation, start = entry
+            parent, parent_closed, conversation, proven, start = entry
             parent_evicted = False
         # The OTHER half of the same bound: the native stream table evicted
         # this stream's request before its response completed. The response
@@ -596,6 +597,7 @@ class _Http2Tracker:
             parent_closed=parent_closed,
             parent_evicted=parent_evicted,
             conversation=conversation,
+            issuer_proven=proven,
             start_ns=start,
             end_ns=now,
             ttfb_ms=0.0,  # per-h2-stream first-byte not tracked (limitation)

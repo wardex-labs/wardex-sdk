@@ -209,8 +209,11 @@ All notable changes to this project are documented here. The format follows
   that one; a pooled socket reused across conversations names none of them.
   On one shared HTTP/2 connection the bytes are no witness — httpx sends
   every queued frame from whichever task holds the connection — so wardex
-  reads who issued each stream where the `h2` library opens it. An HTTP/2
-  client that is not built on `h2` names no conversation on its streams,
+  reads who issued each stream where the `h2` library opens it, and proves
+  which connection carries which `h2` connection object by the very bytes the
+  client writes, over TLS or plaintext h2c, however many connections open at
+  once. A stream it cannot prove that for (an HTTP/2 client not built on `h2`,
+  or one that copies its chunks before writing them) names no conversation,
   rather than a guessed one.
 - **Concurrent calls on one HTTP/2 connection hang under the span that issued
   them.** With httpx's `http2=True` (so an OpenAI or Anthropic client built
@@ -227,10 +230,13 @@ All notable changes to this project are documented here. The format follows
   your `wardex.conversation(...)`, or a run that states one — that one wins,
   the same rule that keeps your id over a framework's `group_id`, and the
   request's differing id rides along as `wardex.openai.conversation_id`,
-  counted under `semantics.request_conversation_shadowed`. Under the OpenAI
-  Agents adapter this reaches the `chat` spans only: the framework hands
-  `conversation_id` to the model call and never to its trace, so the run's
-  own spans carry it only when `group_id` names it too.
+  counted under `semantics.request_conversation_shadowed`. On a call whose
+  conversation wardex could not read (an unproven HTTP/2 stream, above), the
+  request's id does not stand in for yours, which may have won: it rides along
+  the same way, counted under `semantics.request_conversation_withheld`. Under
+  the OpenAI Agents adapter this reaches the `chat` spans only: the framework
+  hands `conversation_id` to the model call and never to its trace, so the
+  run's own spans carry it only when `group_id` names it too.
 - **Concurrent `wardex.conversation()` blocks no longer lend each other their
   ids.** The block wrote its id onto a scope object that every task of an
   `asyncio.gather` — and every thread `bind_context` carried — shares, so work

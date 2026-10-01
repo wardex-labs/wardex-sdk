@@ -975,9 +975,7 @@ def _assemble(p: _PendingTxn, *, parse: bool, extra: tuple[Limitation, ...]) -> 
     )
 
     edge = resolve_observed(
-        _latched(txn),
-        parent_closed=txn.parent_closed,
-        parent_evicted=txn.parent_evicted,
+        _latched(txn), parent_closed=txn.parent_closed, parent_evicted=txn.parent_evicted
     )
     # `:0` too; see `_peer.py`. The target keeps its query unless the bodies are withheld.
     url = f"{p.url_scheme}://{p.url_host}:{p.server_port}{_url_target(txn, withhold_bodies)}"
@@ -1068,7 +1066,8 @@ def _assemble(p: _PendingTxn, *, parse: bool, extra: tuple[Limitation, ...]) -> 
             identified = _is_llm_traffic(txn, sem)
             if identified:
                 draft.set_gen_ai(build_gen_ai(sem))
-                apply_request_conversation(draft, edge.conversation, sem.conversation_id)
+                known = txn.issuer_proven and not txn.parent_closed  # closed: refused at the edge
+                apply_request_conversation(draft, edge.conversation, sem.conversation_id, known)
                 if (limitation := provider_limitation(sem)) is not None:
                     draft.add_limitation(limitation)  # the label above is a guess
                 # The open half rides only on an IDENTIFIED span: the `openai.*` scalars, the

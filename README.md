@@ -403,15 +403,21 @@ the trace.
 the conversation its request was issued in, so blocks running concurrently —
 under `asyncio.gather`, or on threads carried by `wardex.bind_context` — each
 keep their own id, and a call outside every block carries none. That holds on
-one shared HTTP/2 connection too (httpx with `http2=True`), where any task may
-write another's frames: wardex reads who issued each stream where the `h2`
-library opens it, and a stream from an HTTP/2 client not built on `h2` carries
-no conversation rather than a guessed one. A Responses
+one shared HTTP/2 connection too (httpx with `http2=True`, over TLS or as
+plaintext h2c), where any task may write another's frames: wardex reads who
+issued each stream where the `h2` library opens it, and proves which connection
+carries which `h2` connection object by the very bytes the client writes. A
+stream it cannot prove that for (an HTTP/2 client not built on `h2`, or one
+that copies its chunks before writing them) carries no conversation rather than
+a guessed one. A Responses
 request can name a conversation itself (`conversation="conv_…"`, which the
 OpenAI Agents SDK's `Runner.run(conversation_id=…)` sends): outside any block
 that id is the call's `gen_ai.conversation.id`; inside one, your id wins and
 the request's rides along as `wardex.openai.conversation_id`, counted under
-`semantics.request_conversation_shadowed`.
+`semantics.request_conversation_shadowed`. On a call whose conversation wardex
+could not read (the unproven stream above), the request's id does not stand in
+for yours, which may have won: it rides along the same way, counted under
+`semantics.request_conversation_withheld`.
 `workflow` / `agent` / `step` / `tool` map to the `gen_ai.operation.name`
 values `invoke_workflow` / `invoke_agent` / `execute_step` / `execute_tool`,
 so decorated spans appear on operation-keyed dashboards. `span()` and
