@@ -118,17 +118,24 @@ All notable changes to this project are documented here. The format follows
   returns before the handshake, and the fraction of a millisecond that call
   took used to ship as the connect time, unmarked), the TLS handshake of a
   plaintext connection, and the first-byte, first-body-byte and transfer
-  times of an HTTP/2 stream; `request_size` is unset on an HTTP/2 stream
-  whose request half the stream table evicted before its response arrived
-  (marked `h2_request_evicted`), where it used to say `0`, an empty body;
-  `connection_reused` is `false` only on a connection the SDK saw open and is
-  unset on one it did not (opened before `init`, say, where it used to say
-  `false` on a connection that had already carried requests); and the
-  modalities are unspecified, since nothing detects one yet. On the schema,
-  `request_size`, `is_streaming`, `connection_reused` and the five intervals
-  gained explicit presence (`optional`). In Python, `TransportTiming`'s
-  fields, `request_size`, `is_streaming`, `connection_reused` and both
-  modalities default to `None`.
+  times of an HTTP/2 stream; `request_size` and `response_size` are set only
+  when the SDK counted the whole half — unset when its body went past the
+  capture limit (`max_body_bytes`, or `max_opaque_body_bytes` for an opaque
+  type such as audio), where the kept length used to ship as the size (a
+  1 MB speech response said 262144); on an HTTP/2 stream whose request half
+  the stream table evicted before its response arrived (marked
+  `h2_request_evicted`), where it used to say `0`; on an HTTP/1 request the
+  parser had not finished reading when its response arrived; and on a
+  WebSocket direction whose frame parser stopped (marked
+  `frame_parse_failed`), along with that direction's `ws.messages.*` and
+  `ws.bytes.*` counts; `connection_reused` is `false` only on a connection the
+  SDK saw open and is unset on one it did not (opened before `init`, say,
+  where it used to say `false` on a connection that had already carried
+  requests); and the modalities are unspecified, since nothing detects one
+  yet. On the schema, `request_size`, `response_size`, `is_streaming`,
+  `connection_reused` and the five intervals gained explicit presence
+  (`optional`). In Python, `TransportTiming`'s fields, both sizes,
+  `is_streaming`, `connection_reused` and both modalities default to `None`.
 - **`TransportAttributes.chunk_index` and `is_final_chunk` are removed.**
   Nothing ever filled them, so every span carried `0` and `true`. Their tags
   (25, 26) and names are reserved and will not be reused. The Python fields
@@ -197,6 +204,24 @@ All notable changes to this project are documented here. The format follows
   development install in `CONTRIBUTING.md` instead.
 
 ### Fixed
+
+- **Transport timings measure the interval they name.** A TLS handshake an
+  event loop drives without blocking (Tornado's `SSLIOStream` calls
+  `do_handshake()` until it stops raising `SSLWantReadError`) reported the
+  duration of its last call, a few milliseconds of a 150 ms handshake; it is
+  now timed from the first attempt to the one that completed it, as the
+  asyncio path already was. One the SDK cannot time whole — begun before
+  `init`, or completed by OpenSSL inside the first write with no
+  `do_handshake()` call to observe — is unset. On the asyncio path, a
+  connection opened by `create_connection` with a socket that was already
+  connected (aiohttp's happy-eyeballs dialer hands one over) reported loop
+  overhead as its TCP connect time, and one given a host name included the
+  DNS lookup; both are now unset and marked `connect_timing_unavailable`. On
+  HTTP/2, the connect and handshake time and `connection_reused = false` went
+  to whichever stream finished first, while stream 1, the one the connection
+  was opened for, said it opened nothing; they now go to stream 1. After a
+  `100 Continue`, `ttft_ms` was the arrival of the final response's header
+  block rather than of its first body byte.
 
 - **Ctrl-C reaches your program while a batch is being exported.** The OTLP
   exporter skips a span it cannot marshal instead of dropping the batch, and

@@ -379,10 +379,10 @@ def test_no_default_in_a_transport_dataclass_claims_an_observation():
         connection_id="",
         protocol=Protocol.HTTP,
         direction=Direction.OUTBOUND,
-        response_size=0,
     )
     for name in (
         "request_size",
+        "response_size",
         "is_streaming",
         "connection_reused",
         "request_modality",

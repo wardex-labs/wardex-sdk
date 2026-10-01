@@ -88,7 +88,14 @@ pub struct Http2Transaction {
     pub grpc_message: Option<String>,
     pub request_body: Vec<u8>,
     pub response_body: Vec<u8>,
+    /// Either half stopped at its body cap: `request_truncated ||
+    /// response_truncated`.
     pub truncated: bool,
+    /// The request body stopped at its cap, so `request_body` is a prefix and
+    /// its length is not the size of the body that was sent.
+    pub request_truncated: bool,
+    /// The same, for the response body.
+    pub response_truncated: bool,
     /// The stream table evicted this stream's request half before its
     /// response completed, so `method`, `path`, the request body and the
     /// request's content type are absent rather than empty. The status, the
@@ -124,7 +131,10 @@ struct StreamState {
     resp_body: Vec<u8>,
     req_ended: bool,
     resp_ended: bool,
-    truncated: bool,
+    // Per direction, like the caps: which half was cut is what decides
+    // whether that half's length is the size of what crossed the wire.
+    req_truncated: bool,
+    resp_truncated: bool,
     /// A client header block was decoded into this entry. Only such an entry
     /// has a request half to lose, so only evicting one of these may raise
     /// the eviction mark — an entry built from DATA alone (a stream opened
@@ -531,17 +541,17 @@ impl Http2Connection {
                 st.resp_content_type.as_deref()
             };
             let cap = crate::http1::cap_for_content_type(this_direction_ct, &limits);
-            let target = if from_client {
-                &mut st.req_body
+            let (target, truncated) = if from_client {
+                (&mut st.req_body, &mut st.req_truncated)
             } else {
-                &mut st.resp_body
+                (&mut st.resp_body, &mut st.resp_truncated)
             };
             let room = cap.saturating_sub(target.len());
             if body.len() <= room {
                 target.extend_from_slice(body);
             } else {
                 target.extend_from_slice(&body[..room]);
-                st.truncated = true;
+                *truncated = true;
             }
         }
         if frame.flags & FLAG_END_STREAM != 0 {
@@ -611,7 +621,9 @@ impl Http2Connection {
                     grpc_message: s.grpc_message,
                     request_body: s.req_body,
                     response_body: s.resp_body,
-                    truncated: s.truncated,
+                    truncated: s.req_truncated || s.resp_truncated,
+                    request_truncated: s.req_truncated,
+                    response_truncated: s.resp_truncated,
                     request_evicted: s.request_evicted,
                 });
             }
@@ -1325,6 +1337,7 @@ mod tests {
         let txn = r.transactions.first().expect("one transaction");
         assert!(txn.truncated);
         assert!(txn.request_body.len() <= 4);
+        assert!(txn.request_truncated && !txn.response_truncated);
     }
 
     #[test]
@@ -1528,5 +1541,8 @@ mod tests {
         assert_eq!(txn.request_body, b"0123456789");
         // Response declared octet-stream → opaque cap, truncated to 4.
         assert_eq!(txn.response_body, b"0123");
+        // Only the response was cut, and the transaction says which half:
+        // the request's length is still the size of the body that was sent.
+        assert!(txn.truncated && txn.response_truncated && !txn.request_truncated);
     }
 }

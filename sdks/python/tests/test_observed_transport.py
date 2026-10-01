@@ -227,9 +227,10 @@ def _check(body: bytes) -> None:
     assert t["is_streaming"] is None
     assert t["connection_reused"] is None
 
-    # Each request was captured whole, so its size is a reading.
+    # Each request and response was counted whole, so its size is a reading.
     for span in [*chats, *ws]:
         assert isinstance(span["transport"]["request_size"], int)
+        assert isinstance(span["transport"]["response_size"], int)
 
     # No producer names a modality.
     for span in spans:

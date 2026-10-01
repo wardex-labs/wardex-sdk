@@ -644,10 +644,10 @@ const T_TTFT_MS: &str = "wardex.transport.timing.ttft_ms";
 ///
 /// Only what was observed goes out. A field with presence emits its key when
 /// the sender set it and no key otherwise; a string emits when non-empty; an
-/// enum when it names a value. `request_size` has presence because a request
-/// half can be lost before it is captured (an evicted HTTP/2 stream); a span
-/// exists only for a response that was seen, so `response_size` always goes
-/// out, and its zero is an empty body.
+/// enum when it names a value. Both sizes have presence: a half whose body
+/// went past its capture limit kept only a prefix, and a half the SDK lost
+/// (an evicted HTTP/2 request) was never counted, so neither length is the
+/// size of what crossed the wire. A zero that goes out is an empty body.
 /// Exhaustive on its input, so a field added to the schema does not compile
 /// here until it is mapped or bound to `_` with its reason in [`WIRE_FIELDS`].
 fn transport(t: &pb::TransportAttributes, attrs: &mut Vec<otlp_pb::common::KeyValue>) {
@@ -691,7 +691,9 @@ fn transport(t: &pb::TransportAttributes, attrs: &mut Vec<otlp_pb::common::KeyVa
     if let Some(v) = request_size {
         attrs.push(kv_int(T_REQUEST_SIZE, i64::from(*v)));
     }
-    attrs.push(kv_int(T_RESPONSE_SIZE, i64::from(*response_size)));
+    if let Some(v) = response_size {
+        attrs.push(kv_int(T_RESPONSE_SIZE, i64::from(*v)));
+    }
     if let Some(v) = is_streaming {
         attrs.push(kv_bool(T_IS_STREAMING, *v));
     }
@@ -2517,7 +2519,7 @@ mod tests {
                 ttft_ms: Some(55.5),
             }),
             request_size: Some(4321),
-            response_size: 8765,
+            response_size: Some(8765),
             http: Some(pb::HttpMeta {
                 method: "PATCH".into(),
                 status_code: 418,
@@ -2630,6 +2632,7 @@ mod tests {
             T_CONNECTION_ID,
             T_DIRECTION,
             T_REQUEST_SIZE,
+            T_RESPONSE_SIZE,
             T_IS_STREAMING,
             T_CONNECTION_REUSED,
             T_TCP_CONNECT_MS,
@@ -2676,7 +2679,7 @@ mod tests {
                     ..Default::default()
                 }),
                 request_size: Some(0),
-                response_size: 0,
+                response_size: Some(0),
                 ..Default::default()
             }),
             ..Default::default()

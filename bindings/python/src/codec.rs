@@ -551,8 +551,9 @@ fn map_modality(s: &str) -> i32 {
 /// field's zero value as if the SDK had observed it, which is the exact defect
 /// the presence-carrying fields exist to prevent.
 ///
-/// The fields the SDK may not observe (`request_size`, `is_streaming`,
-/// `connection_reused`, every timing interval) carry presence on the wire:
+/// The fields the SDK may not observe (`request_size`, `response_size`,
+/// `is_streaming`, `connection_reused`, every timing interval) carry presence
+/// on the wire:
 /// Python `None` stays unset rather than becoming `0`, `false` or `0.0`. An
 /// unset modality is `None` on the Python side and `MODALITY_UNSPECIFIED` here.
 fn transport_to_proto(t: &Bound<PyAny>) -> PyResult<pb::TransportAttributes> {

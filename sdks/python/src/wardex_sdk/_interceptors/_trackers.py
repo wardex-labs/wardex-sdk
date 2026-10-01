@@ -201,6 +201,14 @@ class _Txn:
     #: a fact about the traffic. See `assembly._parentage.resolve_observed`.
     parent_evicted: bool = False
     truncated: bool = False
+    #: Was every byte of this half counted? False when its body went past the
+    #: capture cap (a prefix was kept), the half was lost or never finished
+    #: parsing, or a WebSocket direction's frame parser stopped. The seam
+    #: ships a size only for a half that was.
+    request_counted: bool = True
+    response_counted: bool = True
+    #: The HTTP/2 stream this transaction rode; None on HTTP/1.
+    stream_id: int | None = None
     # Capture-limitation markers the protocol parser attached to this
     # transaction, merged into the span's CaptureIntegrity.limitations by the
     # seam. Members, not strings: the parser's `&'static str` was resolved once
@@ -327,6 +335,10 @@ class _Http1Tracker:
             # real final response that follows).
             # (101 upgrade is already handled in the branch above.)
             if msg.status_code is not None and 100 <= msg.status_code < 200:
+                # Re-base the byte marks on the final response's first byte, or
+                # its TTFT would land on the arrival of its own header block.
+                self._resp_marks = [(c - msg.header_len, ns) for c, ns in self._resp_marks]
+                self._resp_cum -= msg.header_len
                 continue
             # --- Regular HTTP response (existing behavior) ---
             now = time.time_ns()
@@ -350,6 +362,8 @@ class _Http1Tracker:
                     end_ns=now,
                     ttfb_ms=ttfb,
                     truncated=self._req_truncated or msg.truncated,
+                    request_counted=self._method is not None and not self._req_truncated,
+                    response_counted=not msg.truncated,
                     limitations=_merge_markers(self._req_limitations, msg.limitations),
                     version="1.1",
                     ttft_ms=ttft,
@@ -394,59 +408,52 @@ class _Http2Tracker:
 
     def __init__(self, limits: object | None = None) -> None:
         self._conn = Http2Parser(limits)
-        # stream_id -> (active span at request time, whether that span's unit
-        # had already closed then, request start ns)
+        # stream_id -> (active span at request time, whether that span's unit had already closed
+        # then, request start ns)
         #
-        # `_mk` pops on every transaction, so the entries that accumulate are
-        # the streams that end WITHOUT one: RST_STREAM, a GOAWAY that strands
-        # everything above `last_stream_id`, a server that stops mid-response.
-        # There is no per-stream close signal to act on — the parser reports
-        # transactions, not stream lifecycles.
+        # `_mk` pops on every transaction, so the entries that accumulate are the streams that end
+        # WITHOUT one: RST_STREAM, a GOAWAY that strands everything above `last_stream_id`, a
+        # server that stops mid-response. There is no per-stream close signal to act on — the
+        # parser reports transactions, not stream lifecycles.
         #
-        # So there are TWO bounds, because the first one is not reachable
-        # everywhere. `on_connection_close` is the honest one and empties this
-        # table outright — but it is driven by the close hook, and the async TLS
-        # seam's carrier is an `ssl.SSLObject`: no `close()` to patch, and
-        # pinned by asyncio's `SSLProtocol` for the life of a pooled connection,
-        # so it is neither closed nor collected. That is exactly the h2
-        # keep-alive to a model provider this leak was found on.
+        # So there are TWO bounds, because the first one is not reachable everywhere.
+        # `on_connection_close` is the honest one and empties this table outright — but it is
+        # driven by the close hook, and the async TLS seam's carrier is an `ssl.SSLObject`: no
+        # `close()` to patch, and pinned by asyncio's `SSLProtocol` for the life of a pooled
+        # connection, so it is neither closed nor collected. That is exactly the h2 keep-alive to a
+        # model provider this leak was found on.
         #
-        # The close hook now reaches that carrier too, through the protocol's
-        # `connection_lost` — but only where asyncio's own TLS implementation is
-        # the one running (not uvloop's) and only when the pool actually drops
-        # the connection, which for a keep-alive to a model provider may be
-        # never. A cap that needs no signal at all is what makes the bound
+        # The close hook now reaches that carrier too, through the protocol's `connection_lost` —
+        # but only where asyncio's own TLS implementation is the one running (not uvloop's) and
+        # only when the pool actually drops the connection, which for a keep-alive to a model
+        # provider may be never. A cap that needs no signal at all is what makes the bound
         # unconditional, and that is the FIFO cap below.
         self._latch: dict[int, tuple[SpanContext | None, bool, int]] = {}
         self._latch_cap = _max_streams(limits)
-        #: The highest stream id the cap has evicted, and the whole memory of
-        #: eviction this tracker keeps. One integer rather than a set of dropped
-        #: ids, because a set is the same unbounded table again under a
-        #: different name — and it is exact for the policy above: entries are
-        #: dropped lowest id first (not insertion order: a stream whose request
-        #: body ends late is latched after higher ids), so the ids evicted are
-        #: precisely the ones latched at or below this mark.
+        #: The highest stream id the cap has evicted, and the whole memory of eviction this tracker
+        #: keeps. One integer rather than a set of dropped ids, because a set is the same unbounded
+        #: table again under a different name — and it is exact for the policy above: entries are
+        #: dropped lowest id first (not insertion order: a stream whose request body ends late is
+        #: latched after higher ids), so the ids evicted are precisely the ones latched at or below
+        #: this mark.
         #:
-        #: What it buys is in `_mk`. An evicted entry that no transaction ever
-        #: claims cost nothing and is worth saying nothing about; one that a
-        #: LATE response then claims would otherwise ship as a clean trace root
-        #: at confidence 1.0, which is a span asserting the host issued this
-        #: request outside any agent work when wardex simply lost the parent.
+        #: What it buys is in `_mk`. An evicted entry that no transaction ever claims cost nothing
+        #: and is worth saying nothing about; one that a LATE response then claims would otherwise
+        #: ship as a clean trace root at confidence 1.0, which is a span asserting the host issued
+        #: this request outside any agent work when wardex simply lost the parent.
         #:
-        #: Reset by `on_connection_close` along with the latch itself: stream
-        #: ids restart at 1 on a new connection, so a mark carried across one
-        #: would name a different set of streams than the ones it was taken on.
+        #: Reset by `on_connection_close` along with the latch itself: stream ids restart at 1 on a
+        #: new connection, so a mark carried across one would name a different set of streams than
+        #: the ones it was taken on.
         self._latch_evicted_below = 0
-        #: The LOWEST stream id this tracker ever latched, and the floor that
-        #: keeps the mark above from over-claiming. Capture can attach
-        #: mid-connection: a response for a stream opened before the seam was
-        #: watching has no latch entry either, and its id is strictly below
-        #: anything this tracker put in the table. Without the floor such a
-        #: stream reads as evicted once the cap has run — a span blaming wardex
-        #: for a parent wardex was never in a position to hold, and, since
-        #: `parent_evicted` also opens the AGENT-mode gate, a span whose bodies
-        #: ship under a mode that had filtered it out. Zero means "nothing
-        #: latched yet", which fails the test for every real stream id.
+        #: The LOWEST stream id this tracker ever latched, and the floor that keeps the mark above
+        #: from over-claiming. Capture can attach mid-connection: a response for a stream opened
+        #: before the seam was watching has no latch entry either, and its id is strictly below
+        #: anything this tracker put in the table. Without the floor such a stream reads as evicted
+        #: once the cap has run — a span blaming wardex for a parent wardex was never in a position
+        #: to hold, and, since `parent_evicted` also opens the AGENT-mode gate, a span whose bodies
+        #: ship under a mode that had filtered it out. Zero means "nothing latched yet", which
+        #: fails the test for every real stream id.
         self._latch_first = 0
 
     def on_request_bytes(self, data: bytes) -> list[_Txn]:
@@ -541,53 +548,46 @@ class _Http2Tracker:
         entry = self._latch.pop(t.stream_id, None)
         if entry is None:
             parent, parent_closed, start = None, False, now
-            # The DECISION the cap owes the span. An absent latch entry has two
-            # causes that look identical here and mean opposite things: nothing
-            # was ambient when the request went out (an honest trace root, and
-            # under `capture_mode=AGENT` the gate has usually dropped it long
-            # before this line), or a parent WAS latched and the cap discarded
-            # it. Shipping the second as the first is the one degradation a
-            # consumer cannot detect downstream — same edge, same confidence,
-            # no marker — so the bound reports itself, exactly as the unit
-            # registry's does when it closes a root at `max_units`.
+            # The DECISION the cap owes the span. An absent latch entry has two causes that look
+            # identical here and mean opposite things: nothing was ambient when the request went
+            # out (an honest trace root, and under `capture_mode=AGENT` the gate has usually
+            # dropped it long before this line), or a parent WAS latched and the cap discarded it.
+            # Shipping the second as the first is the one degradation a consumer cannot detect
+            # downstream — same edge, same confidence, no marker — so the bound reports itself,
+            # exactly as the unit registry's does when it closes a root at `max_units`.
             #
-            # A separate `Limitation` member was the alternative and is refused:
-            # the vocabulary is closed on the wire, and what a user would read
-            # off a new one — "wardex dropped what belongs on this span" —
-            # `PARENT_UNRESOLVED` plus `INSTRUMENTATION_DEGRADED` already say,
-            # from the site that owns the edge. `resolve_observed` attaches
-            # them; this only reports the fact.
+            # A separate `Limitation` member was the alternative and is refused: the vocabulary is
+            # closed on the wire, and what a user would read off a new one — "wardex dropped what
+            # belongs on this span" — `PARENT_UNRESOLVED` plus `INSTRUMENTATION_DEGRADED` already
+            # say, from the site that owns the edge. `resolve_observed` attaches them; this only
+            # reports the fact.
             #
-            # It reports the EVICTION and not "a parent was lost", because the
-            # two are not separable from here: what the entry held went with it.
-            # That is also why the claim is never an over-reach on a stream that
-            # had no parent to lose — every entry carries the REQUEST START
-            # INSTANT as well, so `start` below is a fabrication on this path
-            # regardless, the span's duration is near-zero and its start is the
-            # response instant. Something that belongs on this span is missing
-            # in every case, which is the whole content of the marker; a second
-            # marker for the clock half would split one fact across two words.
+            # It reports the EVICTION and not "a parent was lost", because the two are not
+            # separable from here: what the entry held went with it. That is also why the claim is
+            # never an over-reach on a stream that had no parent to lose — every entry carries the
+            # REQUEST START INSTANT as well, so `start` below is a fabrication on this path
+            # regardless, the span's duration is near-zero and its start is the response instant.
+            # Something that belongs on this span is missing in every case, which is the whole
+            # content of the marker; a second marker for the clock half would split one fact across
+            # two words.
             #
-            # Bounded at BOTH ends, and the floor is not decoration: the mark
-            # alone would also claim a stream opened before capture attached,
-            # whose id is below everything this tracker latched. That claim is
-            # not merely imprecise — `parent_evicted` feeds the capture gate as
-            # well as the marker, so a false one exports request and response
+            # Bounded at BOTH ends, and the floor is not decoration: the mark alone would also
+            # claim a stream opened before capture attached, whose id is below everything this
+            # tracker latched. That claim is not merely imprecise — `parent_evicted` feeds the
+            # capture gate as well as the marker, so a false one exports request and response
             # bodies under a mode that had filtered the span out.
             parent_evicted = self._latch_first <= t.stream_id <= self._latch_evicted_below
         else:
             parent, parent_closed, start = entry
             parent_evicted = False
-        # The OTHER half of the same bound: the native stream table evicted
-        # this stream's request before its response completed. The response
-        # is a real observation — a status, an end — so the span ships, but
-        # its `? /` is a display fallback for a request wardex lost, and it
-        # may only ever appear with the marker that says so. Counted here,
-        # before the seam's status and capture-mode filters, so the loss is
-        # visible even when no span survives them.
+        # The OTHER half of the same bound: the native stream table evicted this stream's request
+        # before its response completed. The response is a real observation — a status, an end — so
+        # the span ships, but its `? /` is a display fallback for a request wardex lost, and it may
+        # only ever appear with the marker that says so. Counted here, before the seam's status and
+        # capture-mode filters, so the loss is visible even when no span survives them.
         #
-        # A plain attribute read: a default here is the shape that would make
-        # every marker vanish silently if the native field were ever renamed.
+        # A plain attribute read: a default here is the shape that would make every marker vanish
+        # silently if the native field were ever renamed.
         request_evicted = bool(t.request_evicted)
         if request_evicted:
             counters.bump("protocol.http2.stream_evicted")
@@ -605,6 +605,9 @@ class _Http2Tracker:
             end_ns=now,
             ttfb_ms=None,  # per-h2-stream first-byte not tracked: not measured
             truncated=t.truncated or request_evicted,
+            request_counted=not (t.request_truncated or request_evicted),
+            response_counted=not t.response_truncated,
+            stream_id=t.stream_id,
             limitations=(Limitation.H2_REQUEST_EVICTED,) if request_evicted else (),
             version="2",
             ttft_ms=None,  # per-h2-stream first-body-byte not tracked: not measured
@@ -630,12 +633,10 @@ class _WebSocketTracker:
         sample_cap: int | None = None,
         llm_upgrade: str | None = None,
     ) -> None:
-        # "known_provider" | "unknown_host" | None: the endpoint table's
-        # answer about the upgrade path (`classify_ws_upgrade`), decided by
-        # the seam at the swap site. The tracker only confirms it — once:
-        # `_decide_llm` nulls this, so "already decided" and "nothing to
-        # decide" are the same state and there is no second flag to keep in
-        # step with it.
+        # "known_provider" | "unknown_host" | None: the endpoint table's answer about the upgrade
+        # path (`classify_ws_upgrade`), decided by the seam at the swap site. The tracker only
+        # confirms it — once: `_decide_llm` nulls this, so "already decided" and "nothing to
+        # decide" are the same state and there is no second flag to keep in step with it.
         self._llm_upgrade = llm_upgrade
         self._llm_call = False
         self._llm_unconfirmed = False
@@ -693,16 +694,14 @@ class _WebSocketTracker:
         return self._maybe_emit()
 
     def _decide_llm(self, first: bytes | None) -> None:
-        # Decided once, on the first client message — the moment "a call
-        # crossed" becomes true — or, when the client-direction parser
-        # disables before yielding one, on the bytes that killed it (`first`
-        # is None then). The path alone is a suffix match; it is corroborated
-        # by the provider's own host or, when nothing hides the payload (no
-        # permessage-deflate, a readable message), by the Responses envelope
-        # itself. The tracker only records the answer on the `_Txn` it emits
-        # at close; the seam reads it there and counts — so the two counters
-        # move when the connection closes, not at this first message, and a
-        # span the capture gate then refuses is still counted.
+        # Decided once, on the first client message — the moment "a call crossed" becomes true —
+        # or, when the client-direction parser disables before yielding one, on the bytes that
+        # killed it (`first` is None then). The path alone is a suffix match; it is corroborated by
+        # the provider's own host or, when nothing hides the payload (no permessage-deflate, a
+        # readable message), by the Responses envelope itself. The tracker only records the answer
+        # on the `_Txn` it emits at close; the seam reads it there and counts — so the two counters
+        # move when the connection closes, not at this first message, and a span the capture gate
+        # then refuses is still counted.
         if self._llm_upgrade == "known_provider" or (
             first is not None and not self._deflate and _RESPONSES_CREATE.search(first) is not None
         ):
@@ -750,12 +749,11 @@ class _WebSocketTracker:
             return []
         return [self._build_txn((marker,))]
 
-    #: The connection-close verb every tracker answers to. For a WS session it
-    #: IS `flush`, and an ALIAS rather than a delegating wrapper: this is the one
-    #: tracker with something to save at close — its span exists only once the
-    #: session ends — so the two names must never be able to drift apart.
-    #: Before the close hook, that span waited for `uninstall()` and was lost
-    #: whenever the process never reached one.
+    #: The connection-close verb every tracker answers to. For a WS session it IS `flush`, and an
+    #: ALIAS rather than a delegating wrapper: this is the one tracker with something to save at
+    #: close — its span exists only once the session ends — so the two names must never be able to
+    #: drift apart. Before the close hook, that span waited for `uninstall()` and was lost whenever
+    #: the process never reached one.
     on_connection_close = flush
 
     def _build_txn(self, extra_markers: tuple[Limitation, ...]) -> _Txn:
@@ -794,6 +792,8 @@ class _WebSocketTracker:
             ws_messages_received=self._recv_msgs,
             ws_bytes_sent=self._sent_bytes,
             ws_bytes_received=self._recv_bytes,
+            request_counted=not self._sent.is_disabled(),
+            response_counted=not self._recv.is_disabled(),
             ws_markers=tuple(markers),
             ws_llm_call=self._llm_call,
             ws_llm_unconfirmed=self._llm_unconfirmed,

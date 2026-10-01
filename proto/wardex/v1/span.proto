@@ -141,16 +141,19 @@ message TransportAttributes {
   Protocol protocol = 2;
   Direction direction = 3;
   TransportTiming timing = 4;
-  // Body bytes captured: for HTTP the body, for a WebSocket session the
-  // payload bytes sent and received, for MCP stdio the params and the result
-  // or error. A body cut by the capture limit counts what was captured (the
-  // span is marked truncated). Unset: the SDK captured nothing of the
-  // request, as for an HTTP/2 stream whose request half the stream table
-  // evicted before the response arrived (marked `h2_request_evicted`). A span
-  // is only built once a response was seen, so `response_size` has no
-  // unobserved case.
+  // Bytes the SDK counted, each half on its own: for HTTP the body as it
+  // crossed the wire (content-coded, without chunk framing), for a WebSocket
+  // session the payload bytes sent and received, for MCP stdio the params and
+  // the result or error. Set only when the count is whole. Unset: the body
+  // went past its capture limit, so only a prefix was kept and its length is
+  // not the body's size (marked `body_cap_exceeded` on HTTP/1; HTTP/2 marks
+  // the span truncated); an HTTP/2 stream whose request half the stream table
+  // evicted before the response arrived (marked `h2_request_evicted`); an
+  // HTTP/1 request the parser had not finished reading when its response
+  // arrived; a WebSocket direction whose frame parser stopped (marked
+  // `frame_parse_failed`).
   optional int32 request_size = 5;
-  int32 response_size = 6;
+  optional int32 response_size = 6;
 
   HttpMeta http = 10;
   GrpcMeta grpc = 11;
@@ -175,9 +178,10 @@ message TransportAttributes {
   // Whether this transaction rode a pooled connection opened by an earlier
   // one. When true, `tcp_connect_ms` / `tls_handshake_ms` of 0 mean this
   // transaction opened nothing. false only where the SDK saw the connection
-  // open. Unset where the producer cannot tell either way: a connection the
-  // SDK did not see open (one opened before it started), a WebSocket session,
-  // stdio.
+  // open; on HTTP/2, for stream 1, the one it was opened for. Unset where the
+  // producer cannot tell either way: on a connection the SDK did not see open
+  // (one opened before it started), the first HTTP/1 transaction it saw or
+  // HTTP/2 stream 1; a WebSocket session; stdio.
   optional bool connection_reused = 27;
 }
 
@@ -185,7 +189,9 @@ message TransportAttributes {
 // never that it took no time.
 message TransportTiming {
   optional float tcp_connect_ms = 1;
+  // From the first `do_handshake()` attempt to the one that completed it.
   optional float tls_handshake_ms = 2;
+  // MCP stdio: the time until the response message was read.
   optional float ttfb_ms = 3;
   optional float transfer_ms = 4;
   optional float ttft_ms = 5;  // time to the first response body byte (HTTP/1)

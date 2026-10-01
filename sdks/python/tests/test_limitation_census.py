@@ -236,8 +236,8 @@ _MEMBER_SITES: dict[str, frozenset[str]] = {
     "CONNECTION_EVICTED": frozenset({"_interceptors/_seam.py"}),
     # The native stream table's bound, read off `request_evicted` by the h2
     # tracker's `_mk` — the one place the native transaction becomes a `_Txn`.
-    # The seam reads it back to leave the lost request's size unset.
-    "H2_REQUEST_EVICTED": frozenset({"_interceptors/_seam.py", "_interceptors/_trackers.py"}),
+    # The lost request's unset size rides `_Txn.request_counted`, set there too.
+    "H2_REQUEST_EVICTED": frozenset({"_interceptors/_trackers.py"}),
     # --- parsing / interpretation ---
     "FRAME_PARSE_FAILED": frozenset(
         {"_interceptors/_seam.py", "_interceptors/_trackers.py", "_semantics/_grpc.py"}

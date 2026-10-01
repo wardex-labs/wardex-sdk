@@ -57,27 +57,25 @@ from .._types import (
 )
 from ._base import InterceptorInterface
 from ._close_hook import install_shared_close_hook, on_close, uninstall_shared_close_hook
-from ._conn_timing import install_shared_timing, uninstall_shared_timing
+from ._conn_timing import install_shared_timing, opening_timing, uninstall_shared_timing
 from ._peer import UNRESOLVED_HOST, UNRESOLVED_PORT, peer_address, placeholder_host
 from ._trackers import _inflated, _Txn, _url_target, _WebSocketTracker
 
 if TYPE_CHECKING:
     from .._client import Client
 
-# Headers are parsed but intentionally not recorded on the span (secret protection).
-# Bodies are recorded, and their PII is masked later — in the Rust core, at encode
-# time (`codec.encode_otlp_traces` takes the mode and the disabled categories), not
-# here.
+# Headers are parsed but intentionally not recorded on the span (secret protection). Bodies are
+# recorded, and their PII is masked later — in the Rust core, at encode time
+# (`codec.encode_otlp_traces` takes the mode and the disabled categories), not here.
 #
 # --- Where "do we capture this?" is asked, and why it is asked twice ---
 #
-# The question has two halves, split by WHEN each can be answered rather than by
-# what it means. Getting that split wrong is expensive in one direction and
-# WRONG in the other, so it is written down here.
+# The question has two halves, split by WHEN each can be answered rather than by what it means.
+# Getting that split wrong is expensive in one direction and WRONG in the other, so it is written
+# down here.
 #
-# INVARIANT — settled for the life of the connection, so `_capture_possible`
-# answers them in the patch wrapper, before the send/recv buffer is copied and
-# before a single byte reaches a tracker:
+# INVARIANT — settled for the life of the connection, so `_capture_possible` answers them in the
+# patch wrapper, before the send/recv buffer is copied and before a single byte reaches a tracker:
 #
 #   * no client on this seam. Both emit paths already returned on a `None`
 #     client, so nothing behind one was ever going to become a span — but the
@@ -93,26 +91,24 @@ if TYPE_CHECKING:
 #     bytearray, which is the shape the asyncio and httpx paths use) to
 #     re-derive a verdict that was reached on the first write.
 #
-# CONTEXT-DEPENDENT — an answer about ONE transaction, and only ever correct
-# for the instant it was asked, so they live in the module `_should_capture` on the
-# response side: the shared policy's ambient-span clause and the LLM-semantic
-# claim `_parse_semantics` earns. An agent unit can ACTIVATE after a connection
-# was opened — a pooled keep-alive socket outlives any single run — so a
-# per-connection early-out on "no agent unit is ambient right now" would
-# silently drop every later request on that socket. That is data loss, and the
-# parse it would save is the one the gate needs.
+# CONTEXT-DEPENDENT — an answer about ONE transaction, and only ever correct for the instant it was
+# asked, so they live in the module `_should_capture` on the response side: the shared policy's
+# ambient-span clause and the LLM-semantic claim `_parse_semantics` earns. An agent unit can
+# ACTIVATE after a connection was opened — a pooled keep-alive socket outlives any single run — so
+# a per-connection early-out on "no agent unit is ambient right now" would silently drop every
+# later request on that socket. That is data loss, and the parse it would save is the one the gate
+# needs.
 #
-# And a THIRD moment since the parse moved off the caller's thread: the gate
-# now usually runs on the finalize WORKER, over a `_PendingTxn` sealed at the
-# response instant. What keeps its answer honest there is the seal — the
-# prefilter verdict, the mode, and `copy_context()` all travel with the job —
-# so the gate reads the response instant's facts wherever and whenever it
-# actually executes.
+# And a THIRD moment since the parse moved off the caller's thread: the gate now usually runs on
+# the finalize WORKER, over a `_PendingTxn` sealed at the response instant. What keeps its answer
+# honest there is the seal — the prefilter verdict, the mode, and `copy_context()` all travel with
+# the job — so the gate reads the response instant's facts wherever and whenever it actually
+# executes.
 #
-# NOT here, deliberately: "the transport is a NoOpTransport". `init()` resolves
-# a missing `transport=` argument to exactly that, so it is the out-of-the-box
-# configuration rather than a statement that capture is off, and reading it as
-# one would turn `wardex.init(intercept=True)` into a silent no-op.
+# NOT here, deliberately: "the transport is a NoOpTransport". `init()` resolves a missing
+# `transport=` argument to exactly that, so it is the out-of-the-box configuration rather than a
+# statement that capture is off, and reading it as one would turn `wardex.init(intercept=True)`
+# into a silent no-op.
 
 
 def _accepted_prefix(data: Any, n: int) -> Any:
@@ -180,6 +176,7 @@ class _ConnectionState:
         self.server_address = server_address
         self.server_port = server_port
         self.timing_consumed = False
+        self.h2_opening: tuple[Any, ...] | None = None  # see `opening_timing`
         self.gate: str | None = None  # None=undetermined, "http", "h2c", "h2", "ignore"
         # This state was built for a socket that OUTLIVED an os.fork(): the
         # tracker starts mid-stream, so the first span assembled from it
@@ -623,7 +620,10 @@ class ByteSeamInterceptor(InterceptorInterface):
         ct = txn.content_type or ""
         # gRPC: skip LLM semantic extraction (protobuf isn't LLM JSON).
         is_grpc = ct.startswith("application/grpc") and not ct.startswith("application/grpc-web")
-        connect_ms, handshake_ms, reused, timing_markers = self._resolve_timing(obj, st)
+        got = connect_ms, handshake_ms, reused, timing_markers = self._resolve_timing(obj, st)
+        if txn.stream_id is not None:  # HTTP/2 streams finish out of order: see `opening_timing`
+            got = opening_timing(got, partial(self._resolve_timing, obj, st), st, txn.stream_id)
+            connect_ms, handshake_ms, reused, timing_markers = got
         # Classified once here and carried on the job: `_assemble` reads the
         # same answer for the provider-state count instead of asking again.
         treatment = classify_path(txn.path)
@@ -769,10 +769,15 @@ class ByteSeamInterceptor(InterceptorInterface):
         if peer_unresolved:  # never sealed, so stamped here
             draft.add_limitation(Limitation.PEER_UNRESOLVED)
         draft.set_extra("network.protocol.version", "websocket")
-        draft.set_extra("ws.messages.sent", txn.ws_messages_sent)
-        draft.set_extra("ws.messages.received", txn.ws_messages_received)
-        draft.set_extra("ws.bytes.sent", txn.ws_bytes_sent)
-        draft.set_extra("ws.bytes.received", txn.ws_bytes_received)
+        # A direction whose frame parser stopped counted part of it: no count, not a low one.
+        sent = txn.ws_bytes_sent if txn.request_counted else None
+        received = txn.ws_bytes_received if txn.response_counted else None
+        if sent is not None:
+            draft.set_extra("ws.messages.sent", txn.ws_messages_sent)
+            draft.set_extra("ws.bytes.sent", sent)
+        if received is not None:
+            draft.set_extra("ws.messages.received", txn.ws_messages_received)
+            draft.set_extra("ws.bytes.received", received)
         if code is not None:
             draft.set_extra("ws.close_code", code)
 
@@ -785,8 +790,8 @@ class ByteSeamInterceptor(InterceptorInterface):
                 protocol=Protocol.HTTP,
                 direction=Direction.OUTBOUND,
                 timing=timing,
-                request_size=txn.ws_bytes_sent,
-                response_size=txn.ws_bytes_received,
+                request_size=sent,
+                response_size=received,
                 http=HttpMeta(
                     method="GET",
                     url=(
@@ -990,17 +995,15 @@ def _assemble(p: _PendingTxn, *, parse: bool, extra: tuple[Limitation, ...]) -> 
     # fork-crossing connection's first sealed transaction, the fork latch.
     for marker in p.timing_markers:
         draft.add_limitation(marker)
-    # Markers the protocol parser attached to the transaction (a body that
-    # hit its cap, say). They arrive as MEMBERS: the string-to-member
-    # crossing happens once, at the PyO3 boundary in `_protocol/_http1.py`,
-    # which is where the Rust `&'static str` actually enters Python.
+    # Markers the protocol parser attached to the transaction (a body that hit its cap, say). They
+    # arrive as MEMBERS: the string-to-member crossing happens once, at the PyO3 boundary in
+    # `_protocol/_http1.py`, which is where the Rust `&'static str` actually enters Python.
     #
-    # A plain attribute access, not `getattr(txn, "limitations", ())`. The
-    # default could never fire — `_Txn.limitations` is a declared field —
-    # but it is the exact shape that fails silently if the field is ever
-    # renamed or a non-`_Txn` reaches here: every parser marker would
-    # vanish with no error and no counter. An AttributeError is the correct
-    # outcome for that, and it is what the callers' guards are for.
+    # A plain attribute access, not `getattr(txn, "limitations", ())`. The default could never fire
+    # — `_Txn.limitations` is a declared field — but it is the exact shape that fails silently if
+    # the field is ever renamed or a non-`_Txn` reaches here: every parser marker would vanish with
+    # no error and no counter. An AttributeError is the correct outcome for that, and it is what
+    # the callers' guards are for.
     for marker in txn.limitations:
         draft.add_limitation(marker)
     # The queue's verdict about THIS finalization: PARSE_BACKLOG_FULL,
@@ -1016,15 +1019,13 @@ def _assemble(p: _PendingTxn, *, parse: bool, extra: tuple[Limitation, ...]) -> 
 
     output_data = _inflated(txn, txn.response_body, p.limits)
     status_code = StatusCode.OK if 200 <= txn.status < 400 else StatusCode.ERROR
-    # `finish()` refuses `status=ERROR` with no `error.type` and a refused
-    # span is a DELETED span, so this may not be left `None`: without it
-    # every 4xx/5xx on every byte seam — the rate limit, the auth failure,
-    # the provider outage, i.e. the highest-value spans this SDK captures —
-    # disappears into a counter. The value is the response status rendered
-    # as a string, which is what OTel's HTTP-client semconv prescribes when
-    # the instrumentation has no richer classification. That is exactly
-    # wardex's position here: the seam observed a 500, it did not observe
-    # why. Low cardinality, and a fact rather than a guess.
+    # `finish()` refuses `status=ERROR` with no `error.type` and a refused span is a DELETED span,
+    # so this may not be left `None`: without it every 4xx/5xx on every byte seam — the rate limit,
+    # the auth failure, the provider outage, i.e. the highest-value spans this SDK captures —
+    # disappears into a counter. The value is the response status rendered as a string, which is
+    # what OTel's HTTP-client semconv prescribes when the instrumentation has no richer
+    # classification. That is exactly wardex's position here: the seam observed a 500, it did not
+    # observe why. Low cardinality, and a fact rather than a guess.
     error_type: str | None = str(txn.status) if status_code is StatusCode.ERROR else None
     draft.set_extra("network.protocol.version", txn.version)
 
@@ -1133,17 +1134,16 @@ def _assemble(p: _PendingTxn, *, parse: bool, extra: tuple[Limitation, ...]) -> 
     body_read = parse and not parse_failed and not p.is_grpc
     sniffed = bool(getattr(sem, "reassembled_from_stream", False)) if body_read else None
     streamed = txn.event_stream or sniffed
-    # Sizes are wire (compressed) bytes; output_data is the inflated body. A request half the
-    # HTTP/2 stream table evicted was never captured, so its size is unset, not an empty 0.
-    req_size = None if Limitation.H2_REQUEST_EVICTED in txn.limitations else len(txn.request_body)
+    # Sizes are wire (compressed) bytes; output_data is the inflated body. A half whose count is
+    # not whole (cut at its cap, lost, unfinished: `_Txn.request_counted`) has no size, not a 0.
     draft.set_transport(
         TransportAttributes(
             connection_id=p.connection_id,
             protocol=Protocol.HTTP,
             direction=Direction.OUTBOUND,
             timing=timing,
-            request_size=req_size,
-            response_size=len(txn.response_body),
+            request_size=len(txn.request_body) if txn.request_counted else None,
+            response_size=len(txn.response_body) if txn.response_counted else None,
             http=HttpMeta(method=txn.method, url=url, status_code=txn.status),
             is_streaming=streamed,
             connection_reused=p.reused,

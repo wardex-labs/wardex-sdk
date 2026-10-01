@@ -622,18 +622,18 @@ Two emit sites, and the first is the mechanism the second restates.
     """``tcp_connect_ms`` could not be measured, so it is left unset rather than
     reported as an instant connection.
 
-    Emitted from ``_interceptors/_socket.py::RawSocketInterceptor._resolve_timing``
-    and ``_interceptors/_ssl.py::SSLInterceptor._resolve_timing`` (sync path) when
-    the shared timing store held no timed connect for this fileno: none was seen,
-    or a non-blocking one (asyncio) returned before its handshake did; and from
-    the SSL async path when no ``_wardex_timing`` record was stamped at all.
+    Emitted from ``_interceptors/_socket.py::RawSocketInterceptor._resolve_timing`` and
+    ``_interceptors/_ssl.py::SSLInterceptor._resolve_timing`` (sync path) when the shared timing
+    store held no timed connect for this fileno: none was seen, or a non-blocking one (asyncio)
+    returned before its handshake did; and from the SSL async path when no ``_wardex_timing``
+    record was stamped at all, or its ``total_ms`` is 0 because ``create_connection`` was handed
+    ``sock=`` or a host name and so timed more than a connect.
 
     NOTE (census): absorbed the free string ``async_connect_unavailable``
-    (``_ssl.py::_resolve_timing``, anyio/httpx path where TLS and TCP are
-    separate layers so ``total_ms`` is 0 and connect cannot be derived). What is
-    lost is the provenance — sync fileno miss vs anyio layer split. Merged
-    anyway: both assert the same fact, ``tcp_connect_ms`` is unknown rather than
-    zero, and the user action in both cases is the same (none).
+    (``_ssl.py::_resolve_timing``, anyio/httpx path where TLS and TCP are separate layers so
+    ``total_ms`` is 0 and connect cannot be derived). What is lost is the provenance — sync fileno
+    miss vs anyio layer split. Merged anyway: both assert the same fact, ``tcp_connect_ms`` is
+    unknown rather than zero, and the user action in both cases is the same (none).
     """
 
     TTFT_UNAVAILABLE_H2 = "ttft_unavailable_h2"

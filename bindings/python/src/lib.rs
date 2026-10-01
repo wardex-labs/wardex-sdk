@@ -121,6 +121,16 @@ impl Http2Transaction {
     fn truncated(&self) -> bool {
         self.inner.truncated
     }
+    /// The request body stopped at its cap: its length is not the size sent.
+    #[getter]
+    fn request_truncated(&self) -> bool {
+        self.inner.request_truncated
+    }
+    /// The response body stopped at its cap: its length is not the size received.
+    #[getter]
+    fn response_truncated(&self) -> bool {
+        self.inner.response_truncated
+    }
     #[getter]
     fn content_type(&self) -> Option<String> {
         self.inner.content_type.clone()

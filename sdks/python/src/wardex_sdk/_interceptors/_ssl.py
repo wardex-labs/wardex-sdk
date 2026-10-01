@@ -219,13 +219,13 @@ class SSLInterceptor(ByteSeamInterceptor):
         # user action in either case (none).
         rec = getattr(obj, "_wardex_timing", None)
         if rec is not None:
-            if rec.total_ms > 0.0:
+            handshake = rec.handshake_ms  # None: no observed call completed it
+            if rec.total_ms > 0.0 and handshake is not None:
                 # raw-asyncio path: total was measured successfully → connect can be derived
-                connect = max(0.0, rec.total_ms - rec.handshake_ms)
-                return (connect, rec.handshake_ms, False, ())
-            else:
-                # anyio/httpx path: total could not be measured → connect unset + marker.
-                # Reuse is still known: the record was stamped when this TLS object
-                # was created, so the seam saw the connection open.
-                return (None, rec.handshake_ms, False, (Limitation.CONNECT_TIMING_UNAVAILABLE,))
+                return (max(0.0, rec.total_ms - handshake), handshake, False, ())
+            # anyio/httpx path, or a `create_connection` whose wall time holds
+            # more than a connect (`sock=`, a DNS lookup): connect unset + marker.
+            # Reuse is still known: the record was stamped when this TLS object
+            # was created, so the seam saw the connection open.
+            return (None, handshake, False, (Limitation.CONNECT_TIMING_UNAVAILABLE,))
         return (None, None, None, (Limitation.CONNECT_TIMING_UNAVAILABLE,))

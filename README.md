@@ -833,17 +833,36 @@ diagnostic line (traceback under `debug=True`).
   request and response size, connection id and reuse, and whether the
   response was a Server-Sent Events stream — over OTLP as
   `wardex.transport.timing.*` and `wardex.transport.*`, and in the envelope's
-  transport block. Only what was measured is sent: a connect time the seam
-  could not time (a plaintext connection opened by asyncio, whose
-  non-blocking connect returns before the handshake does; an `anyio`/httpx
-  TLS connection; one opened before `init`; each marked
-  `connect_timing_unavailable`), the TLS handshake of a plaintext connection,
-  the first-byte and transfer times of an HTTP/2 stream, the size of an
-  HTTP/2 request the SDK lost before capturing it (marked
-  `h2_request_evicted`), and everything but a WebSocket session's length
-  carry no key rather than a `0`. Connection reuse is sent only for a
-  connection the SDK saw open, not one opened before `init`; a response is a
-  stream when it declared `text/event-stream` or its body read as one
+  transport block. A TLS handshake is timed from its first `do_handshake()`
+  attempt to the one that completed it, so a non-blocking one an event loop
+  drives counts whole. On a pooled connection the connect time is `0`, and so
+  is the handshake over TLS (`connection_reused` is true: the call opened
+  nothing); on HTTP/2 the stream the connection was opened for, stream 1,
+  carries them. A size is the body as sent (content-coded, without chunk
+  framing); for a WebSocket session, the payload bytes each way; for MCP
+  stdio, the params and the result or error. For MCP stdio the first-byte
+  time is the time until its response message was read.
+  Only what was measured whole is sent, and the rest carries no key rather
+  than a `0`: a connect time the seam could not time (a plaintext connection
+  opened by asyncio, whose non-blocking connect returns before the handshake
+  does; an `anyio`/httpx TLS connection; an asyncio `create_connection` handed
+  an already connected socket, as aiohttp does, or a host name to resolve;
+  one opened before `init`; each marked `connect_timing_unavailable`); a TLS
+  handshake on a plaintext connection, one begun before `init`, or one
+  OpenSSL completed with no `do_handshake()` call to time; the first-byte and
+  transfer times of an HTTP/2 stream; the size of a body that went past its
+  capture limit (marked `body_cap_exceeded` on HTTP/1; on HTTP/2 the span is
+  marked truncated), of an HTTP/2 request the SDK lost before capturing it
+  (marked `h2_request_evicted`), of an HTTP/1 request it had not finished
+  reading when the response arrived, and of a WebSocket direction whose frame
+  parser stopped (marked `frame_parse_failed`); and everything about a
+  WebSocket session but its length and sizes. A WebSocket session the SDK
+  ended before it closed (at `wardex.close()`, or when its connection table
+  was full; marked `ws_no_close` or `connection_evicted`) reports its length
+  and bytes up to that moment. Connection reuse is `false` only on a
+  connection the SDK saw open; on one opened before `init`, the first request
+  it sees (on HTTP/2, stream 1) carries none. A response is a stream when it
+  declared `text/event-stream` or its body read as one
 - gRPC (grpclib), WebSocket (`wss`;
   a Responses-over-WebSocket connection is captured at close and marked
   `ws_llm_semantics_unread` when the host is `api.openai.com` or a subdomain
