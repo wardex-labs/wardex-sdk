@@ -434,27 +434,223 @@ def test_the_hosts_conversation_wins_over_the_request_body(llm):
 # --------------------------------------------------------------------------
 
 
-def test_h2_streams_on_one_connection_latch_their_own_conversation(
+def test_h2_bytes_name_no_conversation_without_a_proven_opener(
     fake_ssl_socket, bare_ssl_interceptor
 ):
-    """Three streams multiplexed on one connection, issued in A, in B and in
-    none, answered in reverse order while yet another conversation is ambient."""
+    """Three streams written in A, in B and in none, with no `h2` state machine
+    behind them. On a shared HTTP/2 connection any task may write another's
+    frames, so the scope a stream's bytes were written in does not prove who
+    issued it, and a conversation is never guessed: none is named."""
     itc = bare_ssl_interceptor
     itc._client.config.capture_mode = CaptureMode.ALL
     sock = fake_ssl_socket(alpn="h2")
     client_enc, server_enc = Encoder(), Encoder()
-    for sid, cid in ((1, "A"), (3, "B")):
-        with _hub.new_scope() as scope:
-            scope.conversation = ConversationContext(conversation_id=cid)
+    for sid, cid in ((1, "A"), (3, "B"), (5, None)):
+        with _issued_in(cid):
             itc._on_request_bytes(sock, _h2_open(client_enc, sid))
-    itc._on_request_bytes(sock, _h2_open(client_enc, 5))
-    with _hub.new_scope() as scope:
-        scope.conversation = ConversationContext(conversation_id="response-side")
-        itc._on_response_bytes(
-            sock,
-            _h2_answer(server_enc, 5) + _h2_answer(server_enc, 3) + _h2_answer(server_enc, 1),
-        )
-    assert [_conv(s) for s in itc._client.spans] == [None, "B", "A"]
+    itc._on_response_bytes(
+        sock, _h2_answer(server_enc, 5) + _h2_answer(server_enc, 3) + _h2_answer(server_enc, 1)
+    )
+    assert [_conv(s) for s in itc._client.spans] == [None, None, None]
+
+
+_H2_REQUEST = [(":method", "POST"), (":scheme", "https"), (":authority", "a"), (":path", "/v1/m")]
+
+
+@pytest.fixture
+def h2_reads() -> Iterator[Any]:
+    """The `h2` state machine with the shared probe's reads on it, as `install()` puts them."""
+    import h2.connection
+
+    from wardex_sdk._interceptors._close_hook import (
+        install_shared_close_hook,
+        uninstall_shared_close_hook,
+    )
+
+    real = h2.connection.H2Connection.send_headers
+    install_shared_close_hook()
+    try:
+        assert h2.connection.H2Connection.send_headers is not real
+        yield h2.connection.H2Connection
+    finally:
+        uninstall_shared_close_hook()
+    assert h2.connection.H2Connection.send_headers is real, "the probe left its read behind"
+
+
+def _flushed_by_another_task(itc: Any, sock: Any, conn: Any, *, link: bool) -> list[Any]:
+    """httpcore's shape without the network: the tasks issuing in A and in B
+    queue their streams' frames on one connection, and a THIRD task, holding
+    the write lock in conversation W, writes every frame queued."""
+    conn.initiate_connection()
+    preface = conn.data_to_send()
+    itc._on_request_bytes(sock, preface if link else bytes(bytearray(preface)))
+    for sid, cid in ((1, "A"), (3, "B")):
+        with _issued_in(cid):
+            conn.send_headers(sid, _H2_REQUEST, end_stream=True)
+    with _issued_in("W"):
+        itc._on_request_bytes(sock, conn.data_to_send())
+    server_enc = Encoder()
+    itc._on_response_bytes(sock, _h2_answer(server_enc, 3) + _h2_answer(server_enc, 1))
+    return itc._client.spans
+
+
+def test_an_h2_stream_carries_the_conversation_of_the_task_that_opened_it(
+    fake_ssl_socket, bare_ssl_interceptor, h2_reads
+):
+    """The connection preface the client wrote IS the object its state machine
+    returned, which links the two; from then on each stream's opener is read in
+    `send_headers`, where the opening task is still the caller."""
+    itc = bare_ssl_interceptor
+    itc._client.config.capture_mode = CaptureMode.ALL
+    spans = _flushed_by_another_task(itc, fake_ssl_socket(alpn="h2"), h2_reads(), link=True)
+    assert [_conv(s) for s in spans] == ["B", "A"]
+
+
+def test_an_h2_stream_names_no_conversation_when_its_connection_is_not_proven(
+    fake_ssl_socket, bare_ssl_interceptor, h2_reads
+):
+    """The same streams, but the preface was written as a COPY: equal bytes are
+    not proof that this connection carries that state machine's output, so
+    nothing links, and neither the openers' ids nor the writer's W is named."""
+    itc = bare_ssl_interceptor
+    itc._client.config.capture_mode = CaptureMode.ALL
+    spans = _flushed_by_another_task(itc, fake_ssl_socket(alpn="h2"), h2_reads(), link=False)
+    assert [_conv(s) for s in spans] == [None, None]
+
+
+@pytest.fixture
+def h2_llm() -> Iterator[tuple[str, Any]]:
+    """A loopback Responses API over TLS that speaks only HTTP/2. A call
+    tagged `hN-...` is billed `10 * (N + 1)` input tokens."""
+    import socket
+    import ssl
+
+    import h2.config
+    import h2.connection
+    import h2.events
+
+    from conftest import CERT, KEY
+
+    accepted = []
+
+    def handle(sock: Any) -> None:
+        conn = h2.connection.H2Connection(h2.config.H2Configuration(client_side=False))
+        conn.initiate_connection()
+        sock.sendall(conn.data_to_send())
+        bodies: dict[int, bytes] = {}
+        while data := sock.recv(65535):
+            for ev in conn.receive_data(data):
+                if isinstance(ev, h2.events.DataReceived):
+                    bodies[ev.stream_id] = bodies.get(ev.stream_id, b"") + ev.data
+                    conn.acknowledge_received_data(ev.flow_controlled_length, ev.stream_id)
+                elif isinstance(ev, h2.events.StreamEnded):
+                    tag = json.loads(bodies.pop(ev.stream_id))["input"]
+                    body = _response(int(tag.split("-")[0][1:]) + 1)
+                    conn.send_headers(
+                        ev.stream_id,
+                        [(":status", "200"), ("content-type", "application/json")],
+                    )
+                    conn.send_data(ev.stream_id, body, end_stream=True)
+            sock.sendall(conn.data_to_send())
+
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(certfile=str(CERT), keyfile=str(KEY))
+    ctx.set_alpn_protocols(["h2"])
+    listener = socket.create_server(("127.0.0.1", 0))
+    listener.settimeout(0.2)
+    stop = threading.Event()
+
+    def serve() -> None:
+        while not stop.is_set():
+            try:
+                raw, _ = listener.accept()
+            except (TimeoutError, OSError):
+                continue
+            accepted.append(raw)
+            tls = ctx.wrap_socket(raw, server_side=True)
+            threading.Thread(target=handle, args=(tls,), daemon=True).start()
+
+    threading.Thread(target=serve, daemon=True).start()
+    try:
+        yield f"https://127.0.0.1:{listener.getsockname()[1]}", accepted
+    finally:
+        stop.set()
+        listener.close()
+
+
+def _assert_one_h2_connection_kept_each_call_to_its_own(spans: list[Any], n: int) -> None:
+    chats = _chats(spans)
+    assert sorted(_tag(s) for s in chats) == sorted(f"h{i}-0" for i in range(n))
+    # The safety property: a call names its own conversation or none, never another's.
+    leaked = [(_tag(s), _conv(s)) for s in chats if _conv(s) not in (_want(_tag(s)), None)]
+    assert not leaked, f"calls carrying ANOTHER conversation's id (tag, carried): {leaked}"
+    # The query: a conversation's token sum is its own calls', none of another's.
+    totals: dict[str | None, int] = {}
+    for s in chats:
+        totals[_conv(s)] = totals.get(_conv(s), 0) + s.gen_ai.input_tokens
+    assert totals == {f"h{i}": 10 * (i + 1) for i in range(n)}
+    # And the parent: the block the call was issued in, not the one that flushed it.
+    blocks = {s.context.span_id: _conv(s) for s in spans if s.name == "c"}
+    assert {_tag(s): blocks.get(s.parent_span_id) for s in chats} == {
+        f"h{i}-0": f"h{i}" for i in range(n)
+    }
+
+
+@pytest.mark.parametrize("n", [2, 8])
+def test_concurrent_conversations_on_one_http2_connection_keep_their_own_ids(h2_llm, n):
+    """`asyncio.gather` over ONE HTTP/2 connection — httpx's `http2=True`, as an
+    OpenAI or Anthropic client built on it. httpcore queues each call's frames
+    from the task that issued it and lets whichever task holds the write lock
+    send them all, so the bytes of one conversation's call were routinely
+    written by another's task: seven of eight calls carried the wrong id, and
+    the per-conversation token sums came out as zero and double."""
+    import ssl
+
+    from conftest import CERT
+
+    base, accepted = h2_llm
+    verify = ssl.create_default_context(cafile=str(CERT))
+
+    async def one(client: httpx.AsyncClient, i: int) -> None:
+        with wardex.conversation("c", id=f"h{i}"):
+            r = await client.post(f"{base}/v1/responses", content=_body(f"h{i}-0"))
+            assert (r.status_code, r.http_version) == (200, "HTTP/2")
+
+    async def main() -> None:
+        async with httpx.AsyncClient(http2=True, verify=verify) as client:
+            await asyncio.gather(*(one(client, i) for i in range(n)))
+
+    spans, _ = _shipped(lambda: asyncio.run(main()))
+    assert len(accepted) == 1, "the calls did not share one connection"
+    _assert_one_h2_connection_kept_each_call_to_its_own(spans, n)
+
+
+def test_concurrent_conversations_on_one_http2_connection_from_a_thread_pool(h2_llm):
+    """The same over a sync `httpx.Client(http2=True)` shared by pool threads,
+    whose connection lock hands the write to any of them."""
+    import ssl
+
+    from conftest import CERT
+
+    base, accepted = h2_llm
+    verify = ssl.create_default_context(cafile=str(CERT))
+    n = 8
+
+    def run() -> None:
+        with httpx.Client(http2=True, verify=verify) as client:
+
+            def one(i: int) -> None:
+                with wardex.conversation("c", id=f"h{i}"):
+                    r = client.post(f"{base}/v1/responses", content=_body(f"h{i}-0"))
+                    assert (r.status_code, r.http_version) == (200, "HTTP/2")
+
+            with concurrent.futures.ThreadPoolExecutor(n) as pool:
+                for f in [pool.submit(wardex.bind_context(one), i) for i in range(n)]:
+                    f.result()
+
+    spans, _ = _shipped(run)
+    assert len(accepted) == 1, "the calls did not share one connection"
+    _assert_one_h2_connection_kept_each_call_to_its_own(spans, n)
 
 
 def test_a_websocket_session_carries_the_conversation_its_handshake_was_issued_in(

@@ -19,6 +19,7 @@ from .._protocol import WsParser
 from .._protocol._http1 import Http1RequestParser, Http1ResponseParser
 from .._protocol._http2 import Http2Parser
 from .._types import ConversationContext, SpanContext
+from ._h2_issuer import StreamIssuers
 
 
 def _ttft_from_marks(marks: list[tuple[int, int]], header_len: int, start_ns: int) -> float:
@@ -394,71 +395,68 @@ class _Http2Tracker:
 
     def __init__(self, limits: object | None = None) -> None:
         self._conn = Http2Parser(limits)
-        # stream_id -> (active span, whether its unit had already closed, the
-        # ambient conversation — all three at request time — request start ns)
+        # stream_id -> (parent span, whether its unit had already closed, the conversation — the
+        # issuer's, where `_h2_issuer` proved it — request start ns)
         #
-        # `_mk` pops on every transaction, so the entries that accumulate are
-        # the streams that end WITHOUT one: RST_STREAM, a GOAWAY that strands
-        # everything above `last_stream_id`, a server that stops mid-response.
-        # There is no per-stream close signal to act on — the parser reports
-        # transactions, not stream lifecycles.
+        # `_mk` pops on every transaction, so the entries that accumulate are the streams that end
+        # WITHOUT one: RST_STREAM, a GOAWAY that strands everything above `last_stream_id`, a server
+        # that stops mid-response. There is no per-stream close signal to act on — the parser
+        # reports transactions, not stream lifecycles.
         #
-        # So there are TWO bounds, because the first one is not reachable
-        # everywhere. `on_connection_close` is the honest one and empties this
-        # table outright — but it is driven by the close hook, and the async TLS
-        # seam's carrier is an `ssl.SSLObject`: no `close()` to patch, and
-        # pinned by asyncio's `SSLProtocol` for the life of a pooled connection,
-        # so it is neither closed nor collected. That is exactly the h2
-        # keep-alive to a model provider this leak was found on.
+        # So there are TWO bounds, because the first one is not reachable everywhere.
+        # `on_connection_close` is the honest one and empties this table outright — but it is driven
+        # by the close hook, and the async TLS seam's carrier is an `ssl.SSLObject`: no `close()` to
+        # patch, and pinned by asyncio's `SSLProtocol` for the life of a pooled connection, so it is
+        # neither closed nor collected. That is exactly the h2 keep-alive to a model provider this
+        # leak was found on.
         #
-        # The close hook now reaches that carrier too, through the protocol's
-        # `connection_lost` — but only where asyncio's own TLS implementation is
-        # the one running (not uvloop's) and only when the pool actually drops
-        # the connection, which for a keep-alive to a model provider may be
-        # never. A cap that needs no signal at all is what makes the bound
-        # unconditional, and that is the FIFO cap below.
+        # The close hook now reaches that carrier too, through the protocol's `connection_lost` —
+        # but only where asyncio's own TLS implementation is the one running (not uvloop's) and only
+        # when the pool actually drops the connection, which for a keep-alive to a model provider
+        # may be never. A cap that needs no signal at all is what makes the bound unconditional, and
+        # that is the FIFO cap below.
         self._latch: dict[int, _StreamLatch] = {}
         self._latch_cap = _max_streams(limits)
-        #: The highest stream id the cap has evicted, and the whole memory of
-        #: eviction this tracker keeps. One integer rather than a set of dropped
-        #: ids, because a set is the same unbounded table again under a
-        #: different name — and it is exact for the policy above: entries are
-        #: dropped lowest id first (not insertion order: a stream whose request
-        #: body ends late is latched after higher ids), so the ids evicted are
-        #: precisely the ones latched at or below this mark.
+        #: The highest stream id the cap has evicted, and the whole memory of eviction this tracker
+        #: keeps. One integer rather than a set of dropped ids, because a set is the same unbounded
+        #: table again under a different name — and it is exact for the policy above: entries are
+        #: dropped lowest id first (not insertion order: a stream whose request body ends late is
+        #: latched after higher ids), so the ids evicted are precisely the ones latched at or below
+        #: this mark.
         #:
-        #: What it buys is in `_mk`. An evicted entry that no transaction ever
-        #: claims cost nothing and is worth saying nothing about; one that a
-        #: LATE response then claims would otherwise ship as a clean trace root
-        #: at confidence 1.0, which is a span asserting the host issued this
-        #: request outside any agent work when wardex simply lost the parent.
+        #: What it buys is in `_mk`. An evicted entry that no transaction ever claims cost nothing
+        #: and is worth saying nothing about; one that a LATE response then claims would otherwise
+        #: ship as a clean trace root at confidence 1.0, which is a span asserting the host issued
+        #: this request outside any agent work when wardex simply lost the parent.
         #:
-        #: Reset by `on_connection_close` along with the latch itself: stream
-        #: ids restart at 1 on a new connection, so a mark carried across one
-        #: would name a different set of streams than the ones it was taken on.
+        #: Reset by `on_connection_close` along with the latch itself: stream ids restart at 1 on a
+        #: new connection, so a mark carried across one would name a different set of streams than
+        #: the ones it was taken on.
         self._latch_evicted_below = 0
-        #: The LOWEST stream id this tracker ever latched, and the floor that
-        #: keeps the mark above from over-claiming. Capture can attach
-        #: mid-connection: a response for a stream opened before the seam was
-        #: watching has no latch entry either, and its id is strictly below
-        #: anything this tracker put in the table. Without the floor such a
-        #: stream reads as evicted once the cap has run — a span blaming wardex
-        #: for a parent wardex was never in a position to hold, and, since
-        #: `parent_evicted` also opens the AGENT-mode gate, a span whose bodies
-        #: ship under a mode that had filtered it out. Zero means "nothing
-        #: latched yet", which fails the test for every real stream id.
+        #: The LOWEST stream id this tracker ever latched, and the floor that keeps the mark above
+        #: from over-claiming. Capture can attach mid-connection: a response for a stream opened
+        #: before the seam was watching has no latch entry either, and its id is strictly below
+        #: anything this tracker put in the table. Without the floor such a stream reads as evicted
+        #: once the cap has run — a span blaming wardex for a parent wardex was never in a position
+        #: to hold, and, since `parent_evicted` also opens the AGENT-mode gate, a span whose bodies
+        #: ship under a mode that had filtered it out. Zero means "nothing latched yet", which fails
+        #: the test for every real stream id.
         self._latch_first = 0
+        #: Who opened each stream, read in the opening call itself (`_h2_issuer`).
+        self._issuers = StreamIssuers(self._latch_cap)
 
     def on_request_bytes(self, data: bytes) -> list[_Txn]:
+        self._issuers.claim(data)
         opened, txns = self._conn.feed(True, data)
         now = time.time_ns()
-        scope = _hub.get_current_scope()  # ONE read: parent and conversation are one fact
-        parent, conversation = scope.active_span_context, scope.conversation
-        # Asked ONCE per feed rather than once per stream: every stream this
-        # write opened was issued from this carrier at this instant.
+        # The WRITER's scope, which on a shared connection may be any task's: any
+        # of them flushes the others' queued frames. So it is the parent only of
+        # a stream with no proven issuer, and never anyone's conversation.
+        parent = _hub.get_current_scope().active_span_context
         parent_closed = parent_is_closed_unit(parent) if opened else False
         for sid in opened:
-            self._latch[sid] = (parent, parent_closed, conversation, now)
+            issued = self._issuers.take(sid)
+            self._latch[sid] = (*issued, now) if issued else (parent, parent_closed, None, now)
         if opened:
             low = min(opened)
             self._latch_first = low if self._latch_first == 0 else min(self._latch_first, low)
@@ -533,6 +531,7 @@ class _Http2Tracker:
         connection reporting a parent wardex never lost.
         """
         self._latch.clear()
+        self._issuers.clear()
         self._latch_evicted_below = 0
         self._latch_first = 0
         return []

@@ -207,6 +207,18 @@ All notable changes to this project are documented here. The format follows
   session is one span for every call on the socket, so it carries a
   conversation only when its handshake and every message on it were issued in
   that one; a pooled socket reused across conversations names none of them.
+  On one shared HTTP/2 connection the bytes are no witness — httpx sends
+  every queued frame from whichever task holds the connection — so wardex
+  reads who issued each stream where the `h2` library opens it. An HTTP/2
+  client that is not built on `h2` names no conversation on its streams,
+  rather than a guessed one.
+- **Concurrent calls on one HTTP/2 connection hang under the span that issued
+  them.** With httpx's `http2=True` (so an OpenAI or Anthropic client built
+  on it) and calls running side by side under `asyncio.gather` or on threads,
+  a call's span was parented under whichever task happened to write the
+  connection's queued frames: under another agent step, another tool, another
+  conversation's block. The parent is now read where the stream is opened,
+  in the task that issued it.
 - **A Responses request's own `conversation` is its conversation id.** With
   `Runner.run(conversation_id=…)`, or any `POST /v1/responses` that sets
   `conversation` (the id, or `{"id": …}`), the request names the provider-held

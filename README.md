@@ -402,7 +402,11 @@ the trace.
 "Every span" includes the LLM calls wardex reads off the wire: a call carries
 the conversation its request was issued in, so blocks running concurrently —
 under `asyncio.gather`, or on threads carried by `wardex.bind_context` — each
-keep their own id, and a call outside every block carries none. A Responses
+keep their own id, and a call outside every block carries none. That holds on
+one shared HTTP/2 connection too (httpx with `http2=True`), where any task may
+write another's frames: wardex reads who issued each stream where the `h2`
+library opens it, and a stream from an HTTP/2 client not built on `h2` carries
+no conversation rather than a guessed one. A Responses
 request can name a conversation itself (`conversation="conv_…"`, which the
 OpenAI Agents SDK's `Runner.run(conversation_id=…)` sends): outside any block
 that id is the call's `gen_ai.conversation.id`; inside one, your id wins and
