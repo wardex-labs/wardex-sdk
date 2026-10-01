@@ -140,6 +140,28 @@ All notable changes to this project are documented here. The format follows
   ahead of the last release are gone from `README.md` and
   `examples/README.md`; contributors working on a checkout use the
   development install in `CONTRIBUTING.md` instead.
+- **A decorator's call-site file is relative to its package, so your OS user
+  name no longer leaves with it.** `@wardex.workflow`, `@wardex.agent`,
+  `@wardex.tool` and `@wardex.step` recorded the decorated function's
+  `co_filename`, usually absolute, so
+  `/Users/alice/work/acme/support_bot/agent.py` reached `Span.call_site.file`
+  on the envelope and `code.file.path` over OTLP with the user name and every
+  folder above the project in it, and no masking category matched it. The file
+  is now relative to the folder the module's top-level package was imported
+  from — the rule Sentry's Python SDK uses for a frame's `filename` — so that
+  function exports `support_bot/agent.py`. A top-level module or a
+  `python agent.py` script exports its file name alone, and so does every
+  function the SDK cannot place under its package (no module name, a
+  namespace package, code outside its package's folder): never an absolute
+  path.
+  **The value changes for every decorated span**: a filter or saved view in
+  Phoenix or Langfuse keyed on the absolute `code.file.path` stops matching.
+  Call sites are first exported in this same release, so only a build of the
+  unreleased tree ever sent the absolute path. OpenTelemetry's conventions
+  prefer an absolute path in `code.file.path` without requiring one. `line`,
+  `function` and `module` are unchanged, the path is worked out once when the
+  decorator is applied, and a `CallSite` you set through `Span.call_site` is
+  not rewritten.
 
 ### Fixed
 
@@ -203,12 +225,12 @@ All notable changes to this project are documented here. The format follows
   envelope and semconv's stable `code.file.path`, `code.line.number` and
   `code.function.name` on OTLP, with the module composed into the function
   name as that attribute is defined. **This sends the path of the decorated
-  function's source file** — `code.co_filename`, usually absolute — to your
-  backend, which the SDK did not do before; it goes through the masking
-  policy like any other exported value. `Span.call_site` validates nothing, so
-  what arrives may not be a `CallSite` at all: a value a field cannot hold —
-  or a tuple where the object was expected — is named under
-  `wardex.codec.unmarshalled` and the span, and its batch, still ship.
+  function's source file** to your backend, which the SDK did not do before:
+  relative to its package's import root and never absolute (see Changed), and
+  through the masking policy like any other exported value. `Span.call_site`
+  validates nothing, so what arrives may not be a `CallSite` at all: a value a
+  field cannot hold — or a tuple where the object was expected — is named
+  under `wardex.codec.unmarshalled` and the span, and its batch, still ship.
 - **How a span was captured reaches an OTLP backend.** `capture_sources` — an
   adapter's hook, wire bytes, a bridge — has always been on the envelope and
   was missing from the OTLP export, so a backend could not tell an observed
