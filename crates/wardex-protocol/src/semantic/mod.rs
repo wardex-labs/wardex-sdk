@@ -86,6 +86,12 @@ pub struct LlmSemantics {
     pub reasoning_level: Option<String>,
     /// `gen_ai.request.previous_response.id` (Responses chaining).
     pub previous_response_id: Option<String>,
+    /// The conversation the REQUEST names (Responses `conversation`, either
+    /// the bare id or the object's `id`) — the provider-held conversation
+    /// the call appends to. The seam turns it into `gen_ai.conversation.id`
+    /// when the request was not issued inside one of its own. None when the
+    /// field is absent, empty, or a shape that carries no id.
+    pub conversation_id: Option<String>,
     /// `gen_ai.response.status` (Responses only: queued/in_progress/completed/
     /// incomplete/failed/cancelled).
     pub response_status: Option<String>,

@@ -58,6 +58,11 @@ _SEAM_CONSUMED = frozenset(
         # The provider label's inference flag: `provider_limitation` turns it
         # into the PROVIDER_INFERRED marker and its count.
         "provider_inferred",
+        # The conversation the request body names: `_apply_request_conversation`
+        # makes it the span's conversation, or rides it along beside the one
+        # the request was issued in. Not a `GenAIAttributes` field — the
+        # conversation is the span's own typed block.
+        "conversation_id",
     }
 )
 
@@ -92,14 +97,14 @@ def test_the_surface_partition_is_exhaustive_and_disjoint():
     for i, a in enumerate(sets):
         for b in sets[i + 1 :]:
             assert not (a & b), f"claimed twice: {sorted(a & b)}"
-    # The partition arithmetic the integration record pins: 20 + 6 + 4 + 15.
+    # The partition arithmetic the integration record pins: 20 + 6 + 4 + 16.
     assert (len(fields), len(_GEN_AI_TRANSFORMED), len(extras), len(_SEAM_CONSUMED)) == (
         20,
         6,
         4,
-        15,
+        16,
     )
-    assert len(surface) == 45
+    assert len(surface) == 46
 
 
 def test_every_seam_consumed_name_appears_in_a_consumer_source():

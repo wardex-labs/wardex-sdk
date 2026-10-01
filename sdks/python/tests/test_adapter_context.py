@@ -1970,12 +1970,12 @@ def test_two_sequential_pinned_runs_on_one_task_are_two_clean_roots(monkeypatch)
 def test_a_stated_conversation_reaches_a_nested_child_and_the_ambient_under_the_pin():
     """`open_run(conversation=)` is the framework's group id: the run's own
     span, a child unit opened under it, and the AMBIENT under the run's pin
-    all carry it. What this does NOT prove — and the last assertion pins as
-    the documented gap — is that a wire span carries it: the byte seam
-    builds its own `Ambient(conversation=None)` from the latched span
-    context, so `resolve_parentage` over what the seam actually latches
-    answers no conversation."""
-    from wardex_sdk._assembly import Ambient, latch_ambient, resolve_parentage
+    all carry it — and so does a wire span: the byte seam's tracker latches
+    the conversation beside the parent at request time, and the edge the seam
+    resolves from what it latched carries it, after the unit has gone."""
+    from wardex_sdk._assembly import latch_ambient, resolve_observed, resolve_parentage
+    from wardex_sdk._interceptors._seam import _latched
+    from wardex_sdk._interceptors._trackers import _Http1Tracker
 
     ctx, sink = context()
     conv = ConversationContext(conversation_id="conv-123")
@@ -1987,19 +1987,22 @@ def test_a_stated_conversation_reaches_a_nested_child_and_the_ambient_under_the_
     )
     _agent(run)
     assert run.pin(driver=threading.current_thread()) is True
+    tracker = _Http1Tracker()
     with ctx.enter(
         UnitKind.CALL, intent=SpanIntent.EXECUTE_TOOL, placement=Placement.NESTED, subject="t"
     ) as s:
         s.draft.set_tool(ToolAttributes(name="t"))
         wire = resolve_parentage(latch_ambient())
-        # The seam's own latch, as `_interceptors/_seam.py::_latched` builds
-        # it: the span context alone. A wire span parented through it has no
-        # conversation — the gap the README and CHANGELOG name.
-        seam = resolve_parentage(Ambient(latch_ambient().span_context, None, None))
+        # The seam's own latch: request bytes issued under the tool...
+        tracker.on_request_bytes(b"POST /v1/x HTTP/1.1\r\nHost: a\r\nContent-Length: 2\r\n\r\nhi")
+    # ...and the response read after the tool closed, where the ambient scope
+    # is the run's again. The edge is the one latched at the request.
+    (txn,) = tracker.on_response_bytes(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+    seam = resolve_observed(_latched(txn), parent_closed=txn.parent_closed)
     assert wire.parent_span_id == s.draft.context.span_id
     assert wire.conversation is not None and wire.conversation.conversation_id == "conv-123"
     assert seam.parent_span_id == s.draft.context.span_id
-    assert seam.conversation is None
+    assert seam.conversation is not None and seam.conversation.conversation_id == "conv-123"
     run.unpin()
     run.close()
     spans = [d.finish() for d in sink.drafts]

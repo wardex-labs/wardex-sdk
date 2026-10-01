@@ -52,6 +52,11 @@ else:
   and the embeddings block. `provider_limitation` is the marker (and count)
   for a provider label the native parser only inferred.
 
+  `apply_request_conversation` / `REQUEST_CONVERSATION_KEY` — the
+  conversation a request body names, and the rule that decides whether it is
+  the span's conversation or rides along beside the one the request was issued
+  in.
+
   `build_grpc_fields` — the gRPC branch, the one with enough protocol logic to
   be worth testing on its own.
 
@@ -66,7 +71,9 @@ is not.
 """
 
 from ._genai import (
+    REQUEST_CONVERSATION_KEY,
     USAGE_DROPPED_KEY,
+    apply_request_conversation,
     build_gen_ai,
     embeddings_attrs,
     has_core_semantics,
@@ -78,7 +85,9 @@ from ._grpc import build_grpc_fields
 from ._ws import ws_close_name
 
 __all__ = [
+    "REQUEST_CONVERSATION_KEY",
     "USAGE_DROPPED_KEY",
+    "apply_request_conversation",
     "build_gen_ai",
     "build_grpc_fields",
     "embeddings_attrs",

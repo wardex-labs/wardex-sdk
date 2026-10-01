@@ -1459,14 +1459,13 @@ def _assert_three_turn_tree(spans: list[Any], *, streamed: bool) -> None:
         (LinkReason.HANDOFF_FROM, marker.context.span_id)
     ]
     assert marker.agent.name == "agent_b" and marker.agent.parent_agent == "agent_a"
-    # the conversation, on every adapter span. NOT on the chat spans: the
-    # byte seam's tracker latches the span context alone at request time
-    # (`_interceptors/_seam.py::_latched`), a documented, pre-existing gap
-    # of the wire layer that the adapter cannot close from its side.
+    # the conversation, on every span of the run: the adapter's, and the wire
+    # `chat` spans, which the byte seam latches at request time beside the
+    # parent off the run's pinned carrier
     for s in _adapter_spans(spans):
         assert s.conversation is not None and s.conversation.conversation_id == "conv-123"
     for c in chats:
-        assert c.conversation is None
+        assert c.conversation is not None and c.conversation.conversation_id == "conv-123"
     # no usage anywhere but the wire
     for s in _adapter_spans(spans):
         assert s.gen_ai is None
@@ -1514,6 +1513,9 @@ def test_runner_run_three_turns_are_one_tree(agents_env):
     for name in (_ROOT, "invoke_agent agent_a", "invoke_agent agent_b", "handoff agent_a→agent_b"):
         assert attrs[name]["gen_ai.conversation.id"] == "conv-123", name
     assert attrs["execute_tool get_weather"]["gen_ai.conversation.id"] == "conv-123"
+    # ...and on the LLM calls, the spans that carry the tokens a "what did this
+    # conversation cost" query sums.
+    assert attrs["chat gpt-4o-mini"]["gen_ai.conversation.id"] == "conv-123"
     # Handoff causality as the README names it: the receiver's parent agent
     # is a `wardex.*` attribute (the codec flattens `AgentAttributes.parent_agent`
     # there), not a `gen_ai.*` one — the docs once promised the wrong key.
@@ -1542,6 +1544,10 @@ def test_a_host_conversation_wins_over_the_frameworks_group_id(agents_env):
     adapter_spans = [s for s in _adapter_spans(spans) if s.name != "chat"]
     for s in adapter_spans:
         assert s.conversation is not None and s.conversation.conversation_id == "host-1", s.name
+    chats = _chat_spans(spans)
+    assert len(chats) == 3
+    for c in chats:
+        assert c.conversation is not None and c.conversation.conversation_id == "host-1"
     root = _one(spans, _ROOT)
     assert _extra(root)["wardex.openai_agents.group_id"] == "conv-123"
     assert "wardex.openai_agents.group_id" not in _extra(_one(spans, "invoke_agent agent_a"))
@@ -1549,6 +1555,7 @@ def test_a_host_conversation_wins_over_the_frameworks_group_id(agents_env):
     assert attrs[_ROOT]["gen_ai.conversation.id"] == "host-1"
     assert attrs[_ROOT]["wardex.openai_agents.group_id"] == "conv-123"
     assert attrs["execute_tool get_weather"]["gen_ai.conversation.id"] == "host-1"
+    assert attrs["chat gpt-4o-mini"]["gen_ai.conversation.id"] == "host-1"
 
     _init()
     try:
@@ -1560,6 +1567,33 @@ def test_a_host_conversation_wins_over_the_frameworks_group_id(agents_env):
     root = _one(spans, _ROOT)
     assert root.conversation.conversation_id == "conv-123"
     assert "wardex.openai_agents.group_id" not in _extra(root)
+
+
+def test_the_runs_conversation_wins_over_the_requests_own(agents_env):
+    """`RunConfig(group_id=…)` AND `Runner.run(conversation_id=…)`: the run
+    states one conversation, and every request in it names another in its
+    body. The run's wins on the `chat` spans too — they are the run's calls,
+    and one run ships one conversation id — and the request's rides along
+    under its own attribute, counted once per call."""
+    transport = _init()
+    try:
+        result = _run(_agents(), run_config=_run_config(), conversation_id="conv_1")
+        assert result.final_output == "done"
+        spans = _spans()
+        assert counters.get("semantics.request_conversation_shadowed") == 3
+    finally:
+        wardex.close()
+    for s in spans:
+        assert s.conversation is not None and s.conversation.conversation_id == "conv-123", s.name
+    chats = _chat_spans(spans)
+    assert len(chats) == 3
+    for c in chats:
+        assert _extra(c)["wardex.openai.conversation_id"] == "conv_1"
+    for s in _adapter_spans(spans):
+        assert "wardex.openai.conversation_id" not in _extra(s)
+    attrs = _otlp_attributes(transport)
+    assert attrs["chat gpt-4o-mini"]["gen_ai.conversation.id"] == "conv-123"
+    assert attrs["chat gpt-4o-mini"]["wardex.openai.conversation_id"] == "conv_1"
 
 
 def test_run_sync_three_turns_are_one_tree(agents_env):

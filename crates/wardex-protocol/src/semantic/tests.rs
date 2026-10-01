@@ -1667,6 +1667,94 @@ fn responses_function_call_becomes_tool_call_part_with_call_id() {
     assert_eq!(s.previous_response_id.as_deref(), Some("resp_fx_prev"));
 }
 
+/// The request's `conversation` comes in two spellings, a bare id and an
+/// object carrying one, and both name the same conversation.
+#[test]
+fn responses_request_conversation_is_read_in_both_spellings() {
+    let resp = fixture!("openai_responses", "response.json");
+    for (req, want) in [
+        (
+            &br#"{"model":"gpt-4.1","input":"hi","conversation":"conv_str"}"#[..],
+            "conv_str",
+        ),
+        (
+            &br#"{"model":"gpt-4.1","input":"hi","conversation":{"id":"conv_obj"}}"#[..],
+            "conv_obj",
+        ),
+    ] {
+        let Some(s) = parse_llm(
+            "api.openai.com",
+            "/v1/responses",
+            req,
+            resp,
+            Limits::default(),
+        ) else {
+            panic!("a Responses body is supported");
+        };
+        assert_eq!(s.conversation_id.as_deref(), Some(want));
+        assert_eq!(s.request_model.as_deref(), Some("gpt-4.1"));
+    }
+}
+
+/// A `conversation` that names no id names no conversation — and an odd
+/// shape costs that one field, never the rest of the request half.
+#[test]
+fn responses_request_conversation_without_an_id_is_none_and_harmless() {
+    let resp = fixture!("openai_responses", "response.json");
+    for req in [
+        &br#"{"model":"gpt-4.1","input":"hi"}"#[..],
+        &br#"{"model":"gpt-4.1","input":"hi","conversation":""}"#[..],
+        &br#"{"model":"gpt-4.1","input":"hi","conversation":{"id":""}}"#[..],
+        &br#"{"model":"gpt-4.1","input":"hi","conversation":{}}"#[..],
+        &br#"{"model":"gpt-4.1","input":"hi","conversation":{"id":42}}"#[..],
+        &br#"{"model":"gpt-4.1","input":"hi","conversation":42}"#[..],
+        &br#"{"model":"gpt-4.1","input":"hi","conversation":null}"#[..],
+        &br#"{"model":"gpt-4.1","input":"hi","conversation":["conv_x"]}"#[..],
+    ] {
+        let Some(s) = parse_llm(
+            "api.openai.com",
+            "/v1/responses",
+            req,
+            resp,
+            Limits::default(),
+        ) else {
+            panic!("a Responses body is supported");
+        };
+        assert_eq!(s.conversation_id, None, "{}", String::from_utf8_lossy(req));
+        assert_eq!(s.request_model.as_deref(), Some("gpt-4.1"));
+        assert!(s.input_messages.is_some());
+    }
+}
+
+/// The streamed shape reads the same request half.
+#[test]
+fn responses_sse_request_conversation_is_read() {
+    let s = parse_responses_fixture(
+        fixture!("openai_responses_sse", "request.json"),
+        fixture!("openai_responses_sse", "stream.sse"),
+    );
+    assert_eq!(s.conversation_id.as_deref(), Some("conv_fx_sse"));
+    assert!(s.reassembled_from_stream);
+}
+
+/// Only the Responses request names a conversation: a Chat Completions body
+/// that happens to carry the key is not read for one.
+#[test]
+fn chat_completions_request_never_names_a_conversation() {
+    let req = br#"{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}],"conversation":"conv_x"}"#;
+    let resp = fixture!("openai_chat", "response.json");
+    let Some(s) = parse_llm(
+        "api.openai.com",
+        "/v1/chat/completions",
+        req,
+        resp,
+        Limits::default(),
+    ) else {
+        panic!("a Chat Completions body is supported");
+    };
+    assert_eq!(s.conversation_id, None);
+}
+
 /// T-R3 — reasoning items and status mapping.
 #[test]
 fn responses_reasoning_item_becomes_reasoning_part() {

@@ -13,6 +13,7 @@
  ],
  "output_messages_present": true,
  "response_status": "completed",
+ "conversation_id": "conv_fx_sse",
  "stream_terminated": true,
  "output_text": "Hello from the snapshot!",
  "usage_leaves": {

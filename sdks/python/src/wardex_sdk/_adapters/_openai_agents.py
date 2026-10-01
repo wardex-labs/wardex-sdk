@@ -48,8 +48,8 @@ Seams, and the shape each forces:
   becomes `gen_ai.conversation.id` on every ADAPTER span underneath, handed
   to the registry at the open so child units inherit it — unless the host
   opened its own `wardex.conversation(...)` around the run, which wins.
-  The wire `chat` spans do not carry it yet: the byte seam latches only
-  the span context at request time, not the ambient conversation.
+  The wire `chat` spans carry it too: the byte seam latches the pinned
+  carrier's conversation at request time, beside the parent.
 * `AgentSpanData` — one `invoke_agent`, pinned for the span's lifetime.
   The receiver of a handoff opens AFTER the sender closed (the framework
   finishes the sender's span before starting the receiver's), so it opens
