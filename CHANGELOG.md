@@ -143,8 +143,9 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
-- **A span's connection id is no longer masked as a card number, and its
-  masking record no longer reports a card that was never there.** The
+- **A span's connection id, and a conversation id the SDK minted, are no
+  longer masked as a card number, and the span's masking record no longer
+  reports a card that was never there.** The
   connection id is a value the SDK makes for itself (`str(id(socket))`). On
   64-bit Linux it is about fifteen digits and roughly one in ten passes the
   card checksum, so the default `credit_card` rule rewrote it to
@@ -154,8 +155,16 @@ All notable changes to this project are documented here. The format follows
   masked: the connection id, the envelope's `event_id` and item type, the
   SDK's name, version, Python version, OS, architecture and semconv version,
   and on OTLP the instrumentation scope's name and version and the
-  `telemetry.sdk.*` resource attributes. Everything your application or its
-  traffic puts on a span is masked exactly as before.
+  `telemetry.sdk.*` resource attributes. The conversation id is yours when
+  you name one and the SDK's when you don't (`wardex.conversation()` without
+  an id mints `str(uuid.uuid4())`, about one in seven thousand of which the
+  card rule rewrote the same way), so it stays masked and only an id in the
+  exact form the SDK mints, a lowercase version-4 UUID with or without
+  dashes, is left as written, on the envelope and as
+  `gen_ai.conversation.id` on OTLP. The only built-in rule that can match
+  inside that form is the card rule, on the UUID's own digit groups.
+  Everything else your application or its traffic puts on a span is masked
+  exactly as before.
 - **Ctrl-C reaches your program while a batch is being exported.** The OTLP
   exporter skips a span it cannot marshal instead of dropping the batch, and
   it treated a `KeyboardInterrupt` or `SystemExit` raised by your code during
