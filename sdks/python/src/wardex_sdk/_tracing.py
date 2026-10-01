@@ -415,19 +415,24 @@ def _conversation(name: str, *, id: str | None, op: OperationName | None) -> Ite
     # raised out of its own `with` line. The dataclass keeps that error for
     # direct construction, where the caller wrote the value.
     conversation = ConversationContext(conversation_id=id or str(uuid.uuid4()))
-    # Reading the scope and stamping the conversation onto it are wardex's own
-    # work, and they run BEFORE the host's block — so a failure here would take
-    # the block with it. A conversation that could not be installed costs the
-    # id on the spans inside; it does not cost the trace.
-    scope = None
-    installed = False
+    # Reading the scope and installing the conversation are wardex's own work,
+    # and they run BEFORE the host's block — so a failure here would take the
+    # block with it. A conversation that could not be installed costs the id
+    # on the spans inside; it does not cost the trace.
+    #
+    # Installed on a FORK of the current scope, never written onto the scope
+    # object the caller holds. That object is shared: every task an
+    # `asyncio.gather` started, and every thread a `bind_context` carried, holds
+    # the same one. Written onto it, a sibling issuing work OUTSIDE any
+    # conversation read this block's id for as long as the block was open, and
+    # the last block to close restored the id the other one had written — so a
+    # call after both blocks still carried a conversation it was never in.
+    token = None
     with guard("tracing.conversation_scope", debug=_debug_enabled()):
-        scope = _hub.get_current_scope()
-        prev_conv = scope.conversation
-        scope.conversation = conversation
-        installed = True
-    if not installed:
-        scope = None
+        fork = _hub.get_current_scope().clone()
+        fork.conversation = conversation
+        token = _hub._current_scope.set(fork)
+    if token is None:
         report_once(
             "wardex.conversation(): internal error reading the active "
             "scope; spans in this block will not carry a conversation id "
@@ -439,9 +444,9 @@ def _conversation(name: str, *, id: str | None, op: OperationName | None) -> Ite
             builder.operation = op
             yield builder
     finally:
-        if scope is not None:
+        if token is not None:
             with guard("tracing.conversation_scope_restore", debug=_debug_enabled()):
-                scope.conversation = prev_conv
+                _hub._current_scope.reset(token)
 
 
 def conversation(

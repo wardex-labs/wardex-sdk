@@ -1,6 +1,9 @@
+import asyncio
+import threading
+
 import pytest
 
-from wardex_sdk import _hub
+from wardex_sdk import _hub, bind_context
 from wardex_sdk._client import Client
 from wardex_sdk._config import BackendConfig, WardexConfig
 from wardex_sdk._enums import OperationName, ProviderName, SpanKind, StatusCode
@@ -282,6 +285,84 @@ def test_conversation_joins_the_ambient_trace_as_a_child():
     assert spans["turn"].context.trace_id.value == outer.context.trace_id.value
     assert spans["turn"].parent_span_id is not None
     assert spans["turn"].parent_span_id.value == outer.context.span_id.value
+
+
+def _conversations_by_name(t: _Recording) -> dict[str, str | None]:
+    _hub.get_client().flush()
+    return {
+        sp.name: sp.conversation.conversation_id if sp.conversation else None
+        for env in t.envelopes
+        for sp in env.spans
+    }
+
+
+def test_concurrent_conversation_blocks_under_gather_keep_their_own_ids():
+    """Tasks of one `gather` share the scope object their parent span left
+    current. A block that wrote its id onto that object lent it to a sibling
+    working outside every conversation while the block was open — and the last
+    block to close restored the OTHER block's id onto it, so a span opened
+    after both had closed still carried a conversation it was never in."""
+    t = _setup()
+
+    async def inside(cid: str) -> None:
+        with conversation(f"conv-{cid}", id=cid):
+            await asyncio.sleep(0)
+            with span(f"in-{cid}"):
+                await asyncio.sleep(0)
+
+    async def outside() -> None:
+        for i in range(3):
+            with span(f"out-{i}"):
+                pass
+            await asyncio.sleep(0)
+
+    async def main() -> None:
+        with span("parent"):
+            await asyncio.gather(inside("A"), inside("B"), outside())
+            with span("after"):
+                pass
+
+    asyncio.run(main())
+    got = _conversations_by_name(t)
+    assert (got["in-A"], got["in-B"]) == ("A", "B")
+    assert [got[f"out-{i}"] for i in range(3)] == [None, None, None]
+    assert (got["after"], got["parent"]) == (None, None)
+
+
+def test_concurrent_conversation_blocks_on_threads_keep_their_own_ids():
+    """The same on threads `bind_context` carries, which share the submitting
+    thread's scope object. The barriers hold both blocks open while the third
+    thread opens its span, so the overlap is certain rather than likely."""
+    t = _setup()
+    opened, done = threading.Barrier(3), threading.Barrier(3)
+
+    def inside(cid: str) -> None:
+        with conversation(f"conv-{cid}", id=cid):
+            with span(f"in-{cid}"):
+                opened.wait(timeout=10)
+                done.wait(timeout=10)
+
+    def outside() -> None:
+        opened.wait(timeout=10)
+        with span("out"):
+            pass
+        done.wait(timeout=10)
+
+    with span("parent"):
+        threads = [
+            threading.Thread(target=bind_context(inside), args=("TA",)),
+            threading.Thread(target=bind_context(inside), args=("TB",)),
+            threading.Thread(target=bind_context(outside)),
+        ]
+        for th in threads:
+            th.start()
+        for th in threads:
+            th.join(timeout=10)
+        with span("after"):
+            pass
+    got = _conversations_by_name(t)
+    assert (got["in-TA"], got["in-TB"]) == ("TA", "TB")
+    assert (got["out"], got["after"], got["parent"]) == (None, None, None)
 
 
 # ==========================================================================
