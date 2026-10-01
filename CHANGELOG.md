@@ -143,28 +143,34 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
-- **A span's connection id, and a conversation id the SDK minted, are no
-  longer masked as a card number, and the span's masking record no longer
-  reports a card that was never there.** The
-  connection id is a value the SDK makes for itself (`str(id(socket))`). On
-  64-bit Linux it is about fifteen digits and roughly one in ten passes the
-  card checksum, so the default `credit_card` rule rewrote it to
-  `****-****-****-NNNN` on the wardex envelope — spans from one connection
-  could no longer be grouped by it — and wrote `credit_card` into the span's
-  `redaction_rules` and count. Text the SDK writes itself is now never
-  masked: the connection id, the envelope's `event_id` and item type, the
-  SDK's name, version, Python version, OS, architecture and semconv version,
-  and on OTLP the instrumentation scope's name and version and the
-  `telemetry.sdk.*` resource attributes. The conversation id is yours when
-  you name one and the SDK's when you don't (`wardex.conversation()` without
-  an id mints `str(uuid.uuid4())`, about one in seven thousand of which the
-  card rule rewrote the same way), so it stays masked and only an id in the
-  exact form the SDK mints, a lowercase version-4 UUID with or without
-  dashes, is left as written, on the envelope and as
-  `gen_ai.conversation.id` on OTLP. The only built-in rule that can match
-  inside that form is the card rule, on the UUID's own digit groups.
-  Everything else your application or its traffic puts on a span is masked
-  exactly as before.
+- **Values the SDK makes itself are no longer masked as a card number, and
+  a span's masking record no longer reports a card that was never there.**
+  The case that showed it is a span's connection id, a value the SDK makes
+  for itself (`str(id(socket))`). On 64-bit Linux it is about fifteen digits
+  and roughly one in ten passes the card checksum, so the default
+  `credit_card` rule rewrote it to `****-****-****-NNNN` on the wardex
+  envelope — spans from one connection could no longer be grouped by it —
+  and wrote `credit_card` into the span's `redaction_rules` and count. These
+  fields only the SDK fills are now never masked: the connection id, the
+  envelope's `event_id` and item type, the SDK's name, version, Python
+  version, OS, architecture and semconv version, and on OTLP the
+  instrumentation scope's name and version and the `telemetry.sdk.*`
+  resource attributes. Two more values are the SDK's in a place you can also
+  write to, so each is left as written only in the exact form the SDK
+  writes it, and masked as before in any other form. The conversation id is
+  yours when you name one and the SDK's when you don't
+  (`wardex.conversation()` without an id mints `str(uuid.uuid4())`, about
+  one in seven thousand of which the card rule rewrote the same way): a
+  lowercase version-4 UUID, with or without dashes, is left as written on
+  the envelope and as `gen_ai.conversation.id` on OTLP. The OpenAI Agents
+  adapter's MCP tool-list digest, `wardex.openai_agents.mcp.tools_hash`, is
+  sixteen hex digits of a SHA-256; for about one tool list in eighteen
+  thousand all sixteen are decimal and pass the checksum, and since a tool
+  list's digest does not change, the card rule rewrote it on every run
+  against that server. Sixteen lowercase hex digits under that key are now
+  left as written on both wires. In both forms the card rule is the only
+  built-in rule that can match. Everything else your application or its
+  traffic puts on a span is masked exactly as before.
 - **Ctrl-C reaches your program while a batch is being exported.** The OTLP
   exporter skips a span it cannot marshal instead of dropping the batch, and
   it treated a `KeyboardInterrupt` or `SystemExit` raised by your code during

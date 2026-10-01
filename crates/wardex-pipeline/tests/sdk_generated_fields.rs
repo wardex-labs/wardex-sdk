@@ -12,7 +12,14 @@
 //! One field holds an SDK-minted value only some of the time: the
 //! conversation id, the host's when it names a conversation and a fresh
 //! UUID of the SDK's when nobody does. The field stays masked; the minted
-//! form passes. The last tests here pin that split.
+//! form passes. The tests after the census pin that split.
+//!
+//! Span attributes are the same kind of place: a map the host writes into
+//! and the SDK writes into too. An attribute whose value the SDK computes
+//! passes under its own key in the form the SDK writes; the same text
+//! anywhere else, or another form under that key, is masked. The last
+//! tests here pin that, for the list the Python suite's attribute census
+//! derives from the SDK's source.
 use std::collections::{BTreeMap, BTreeSet};
 
 use wardex_codec::otlp::map::{envelope_to_traces, Producer};
@@ -1084,4 +1091,196 @@ fn nothing_but_the_card_rule_can_match_inside_a_minted_id() {
         card[0]
     );
     assert_eq!(card[1], 0);
+}
+
+// --- Attribute values the SDK computes ---
+
+/// Span attributes whose value the SDK computes itself, each with the code
+/// that writes it and a value that code really produced. Which attributes
+/// belong here is decided by the Python suite's attribute census
+/// (`test_sdk_attribute_census.py`), which reads every attribute the SDK
+/// writes out of its source; this list is the walk's half of that answer.
+const SDK_COMPUTED_ATTRS: &[(&str, &str, &str)] = &[(
+    "wardex.openai_agents.mcp.tools_hash",
+    // `_tools_digest(["get_weather", "search_docs_v28401"])`: the first
+    // sixteen hex digits of the SHA-256 of the canonical JSON of the sorted
+    // tool names. All sixteen are decimal and pass the card checksum.
+    "hash_canonical(sorted(tool names))[:16]",
+    "8096697742134142",
+)];
+
+fn span_with(extra: Vec<pb::KeyValue>, payload: &str) -> pb::Envelope {
+    pb::Envelope {
+        header: None,
+        items: vec![pb::EnvelopeItem {
+            header: None,
+            payload: Some(pb::envelope_item::Payload::Span(pb::Span {
+                name: "execute_step mcp.list_tools".into(),
+                extra,
+                input_data: payload.as_bytes().to_vec(),
+                output_data: payload.as_bytes().to_vec(),
+                ..Default::default()
+            })),
+        }],
+    }
+}
+
+fn text_kv(key: &str, value: &str) -> pb::KeyValue {
+    pb::KeyValue {
+        key: key.into(),
+        value: Some(pb::AnyValue {
+            value: Some(pb::any_value::Value::StringValue(value.into())),
+        }),
+    }
+}
+
+#[test]
+fn an_sdk_computed_attribute_is_shipped_as_written_and_unrecorded() {
+    let engine = engine();
+    for (key, producer, value) in SDK_COMPUTED_ATTRS {
+        // The value is one the card rule rewrites anywhere it judges it.
+        let mut report = Report::default();
+        assert!(
+            engine.mask_text_into(value, &mut report).is_some(),
+            "{producer}"
+        );
+        assert_eq!(report.rules, vec![Rule::CreditCard], "{producer}");
+        let env = span_with(vec![text_kv(key, value)], "");
+        let mut masked = env.clone();
+        mask_envelope(&engine, &mut masked);
+        // Byte-identical: the value as written, and no CaptureIntegrity.
+        assert_eq!(masked, env, "{producer}");
+        let mut req = envelope_to_traces(env, PYTHON);
+        let before = req.clone();
+        mask_otlp(&engine, &mut req);
+        assert_eq!(req, before, "{producer}");
+        assert!(!otlp_redacted(&req), "{producer}");
+        assert_eq!(
+            otlp_texts(&req)
+                .get(&format!("Span[0].attributes[{key}]"))
+                .map(String::as_str),
+            Some(*value),
+            "{producer}"
+        );
+    }
+}
+
+#[test]
+fn the_same_value_anywhere_else_is_still_masked() {
+    let engine = engine();
+    for (_, producer, value) in SDK_COMPUTED_ATTRS {
+        // A tool call's arguments and result, and the same digits under the
+        // neighbouring attribute the adapter fills from the host's config.
+        let env = span_with(
+            vec![text_kv("wardex.openai_agents.mcp.server", value)],
+            value,
+        );
+        let mut masked = env.clone();
+        mask_envelope(&engine, &mut masked);
+        let span = the_span(&masked);
+        assert_eq!(redaction_rules(span), vec![Rule::CreditCard], "{producer}");
+        assert_eq!(span.capture_integrity.as_ref().unwrap().redaction_count, 3);
+        let kept: Vec<_> = texts(&mut masked)
+            .into_iter()
+            .filter(|(_, text)| text.contains(value))
+            .collect();
+        assert!(kept.is_empty(), "{producer}: {kept:?}");
+        let mut req = envelope_to_traces(env, PYTHON);
+        assert!(
+            otlp_texts(&req)
+                .values()
+                .filter(|t| t.contains(value))
+                .count()
+                >= 3,
+            "{producer}"
+        );
+        mask_otlp(&engine, &mut req);
+        let kept: Vec<_> = otlp_texts(&req)
+            .into_iter()
+            .filter(|(_, text)| text.contains(value))
+            .collect();
+        assert!(kept.is_empty(), "{producer}: {kept:?}");
+        assert!(otlp_redacted(&req), "{producer}");
+    }
+}
+
+#[test]
+fn a_value_of_any_other_form_under_an_sdk_key_is_still_masked() {
+    let engine = engine();
+    let every = every_rule();
+    for (key, producer, value) in SDK_COMPUTED_ATTRS {
+        for other in [
+            // A card spelled as a card, one digit longer than the form, the
+            // form with text run on, and a value every rule fires on.
+            "4111-1111-1111-1111".to_string(),
+            "4111 1111 1111 1111".to_string(),
+            "80966977421341424".to_string(),
+            format!("{value} john.doe@acme.com"),
+            every.clone(),
+        ] {
+            let alone = engine
+                .mask_text(&other)
+                .unwrap_or_else(|| panic!("{other} fires no rule"));
+            let env = span_with(vec![text_kv(key, &other)], "");
+            let mut masked = env.clone();
+            mask_envelope(&engine, &mut masked);
+            let span = the_span(&masked);
+            assert!(
+                span.capture_integrity.as_ref().unwrap().redacted,
+                "{producer}: {other}"
+            );
+            for (_, text) in texts(&mut masked) {
+                assert!(!text.contains(&other), "{producer}: {other}");
+            }
+            let mut req = envelope_to_traces(env, PYTHON);
+            mask_otlp(&engine, &mut req);
+            assert!(otlp_redacted(&req), "{producer}: {other}");
+            let shipped = otlp_texts(&req)
+                .get(&format!("Span[0].attributes[{key}]"))
+                .cloned();
+            assert_ne!(shipped.as_deref(), Some(other.as_str()), "{producer}");
+            // Where only the value rules are at work, the text is what
+            // they make of it alone.
+            if !other.contains('=') {
+                assert_eq!(shipped.as_deref(), Some(alone.as_str()), "{producer}");
+            }
+        }
+    }
+}
+
+/// What leaving a tool-list digest alone gives up: nothing a rule exists for.
+/// Over many sixteen-digit lowercase hex values, drawn so nearly every digit
+/// is decimal (the case that reaches the digit rules), the card rule is the
+/// only rule that ever fires.
+#[test]
+fn nothing_but_the_card_rule_can_match_inside_a_tool_list_digest() {
+    let mut state = 0x0d16_e57a_u64;
+    let mut next = move || {
+        state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^ (z >> 31)
+    };
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let engine = engine();
+    let mut card = 0usize;
+    for _ in 0..20_000 {
+        let digest: String = (0..16)
+            .map(|_| {
+                let r = next();
+                char::from(if r % 16 == 0 {
+                    HEX[10 + (r >> 8) as usize % 6]
+                } else {
+                    HEX[(r >> 8) as usize % 10]
+                })
+            })
+            .collect();
+        let mut report = Report::default();
+        if engine.mask_text_into(&digest, &mut report).is_some() {
+            assert_eq!(report.rules, vec![Rule::CreditCard], "{digest}");
+            card += 1;
+        }
+    }
+    assert!(card > 100, "only {card} digests hit the card rule");
 }
