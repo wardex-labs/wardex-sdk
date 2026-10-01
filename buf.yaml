@@ -16,11 +16,11 @@ breaking:
   #
   # The entry below is one such break, and only these: in `span.proto`,
   # `TransportAttributes.chunk_index` (25) and `is_final_chunk` (26) are
-  # deleted and reserved, and `is_streaming`, `connection_reused` and the five
-  # `TransportTiming` fields gain explicit presence, so that a value the SDK
-  # did not observe leaves the field unset instead of shipping its zero value
-  # as a reading. No envelope has been stored by any receiver yet. Remove the
-  # entry in the next change.
+  # deleted and reserved, and `request_size`, `is_streaming`,
+  # `connection_reused` and the five `TransportTiming` fields gain explicit
+  # presence, so that a value the SDK did not observe leaves the field unset
+  # instead of shipping its zero value as a reading. No envelope has been
+  # stored by any receiver yet. Remove the entry in the next change.
   ignore_only:
     FIELD_NO_DELETE:
       - proto/wardex/v1/span.proto

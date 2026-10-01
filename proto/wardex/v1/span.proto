@@ -141,7 +141,15 @@ message TransportAttributes {
   Protocol protocol = 2;
   Direction direction = 3;
   TransportTiming timing = 4;
-  int32 request_size = 5;
+  // Body bytes captured: for HTTP the body, for a WebSocket session the
+  // payload bytes sent and received, for MCP stdio the params and the result
+  // or error. A body cut by the capture limit counts what was captured (the
+  // span is marked truncated). Unset: the SDK captured nothing of the
+  // request, as for an HTTP/2 stream whose request half the stream table
+  // evicted before the response arrived (marked `h2_request_evicted`). A span
+  // is only built once a response was seen, so `response_size` has no
+  // unobserved case.
+  optional int32 request_size = 5;
   int32 response_size = 6;
 
   HttpMeta http = 10;

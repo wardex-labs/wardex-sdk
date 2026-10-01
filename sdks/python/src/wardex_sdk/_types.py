@@ -443,8 +443,8 @@ class TransportAttributes:
 
     Every field holds what the producer observed, or says nothing. A field the
     producer may not observe defaults to `None` and ships unset; the fields
-    with a value default (`connection_id`, `protocol`, `direction`, the two
-    sizes) are passed explicitly by every producer, which
+    with a value default (`connection_id`, `protocol`, `direction`,
+    `response_size`) are passed explicitly by every producer, which
     `tests/test_wire_field_census.py` checks against the source."""
 
     connection_id: str = ""
@@ -454,7 +454,9 @@ class TransportAttributes:
     # Timing — the network-only intervals (tcp_connect_ms, tls_handshake_ms) are None for IPC
     timing: TransportTiming = field(default_factory=TransportTiming)
 
-    request_size: int = 0
+    #: Body bytes captured; an empty body is 0. None when nothing of the request
+    #: was captured (an HTTP/2 stream whose request half was evicted).
+    request_size: int | None = None
     response_size: int = 0
 
     # Per-protocol metadata (only one is set)

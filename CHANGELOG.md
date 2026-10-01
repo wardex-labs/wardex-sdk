@@ -113,16 +113,22 @@ All notable changes to this project are documented here. The format follows
   was not parsed; the five `TransportTiming` intervals are unset when they
   were not measured — including a connect time the seam marks
   `connect_timing_unavailable` (a socket connected before `init` and
-  TLS-wrapped after it among them), the TLS handshake of a plaintext
-  connection, and the first-byte, first-body-byte and transfer times of an
-  HTTP/2 stream;
+  TLS-wrapped after it among them, and a plaintext connection opened by
+  asyncio, as httpx's async client opens one: its non-blocking `connect`
+  returns before the handshake, and the fraction of a millisecond that call
+  took used to ship as the connect time, unmarked), the TLS handshake of a
+  plaintext connection, and the first-byte, first-body-byte and transfer
+  times of an HTTP/2 stream; `request_size` is unset on an HTTP/2 stream
+  whose request half the stream table evicted before its response arrived
+  (marked `h2_request_evicted`), where it used to say `0`, an empty body;
   `connection_reused` is `false` only on a connection the SDK saw open and is
   unset on one it did not (opened before `init`, say, where it used to say
   `false` on a connection that had already carried requests); and the
   modalities are unspecified, since nothing detects one yet. On the schema,
-  `is_streaming`, `connection_reused` and the five intervals gained explicit
-  presence (`optional`). In Python, `TransportTiming`'s fields,
-  `is_streaming`, `connection_reused` and both modalities default to `None`.
+  `request_size`, `is_streaming`, `connection_reused` and the five intervals
+  gained explicit presence (`optional`). In Python, `TransportTiming`'s
+  fields, `request_size`, `is_streaming`, `connection_reused` and both
+  modalities default to `None`.
 - **`TransportAttributes.chunk_index` and `is_final_chunk` are removed.**
   Nothing ever filled them, so every span carried `0` and `true`. Their tags
   (25, 26) and names are reserved and will not be reused. The Python fields

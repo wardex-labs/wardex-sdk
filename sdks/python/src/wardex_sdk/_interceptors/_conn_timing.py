@@ -94,7 +94,10 @@ class ConnTimingStore:
             self._by_fileno[fileno] = slot
         return slot
 
-    def set_connect(self, fileno: int, connect_ms: float) -> None:
+    def set_connect(self, fileno: int, connect_ms: float | None) -> None:
+        """Record a connect on `fileno`. None: the seam saw the connection
+        open but did not time its handshake — the slot still proves the
+        connection was opened after `init`."""
         self._slot(fileno)[0] = connect_ms
 
     def set_handshake(self, fileno: int, handshake_ms: float) -> None:
@@ -197,11 +200,21 @@ class ConnTimingProbe:
 
         def wrapper(this: Any, *a: Any, **k: Any) -> Any:
             t0 = time.perf_counter()
+            returned = False
             try:
-                return orig(this, *a, **k)
+                result = orig(this, *a, **k)
+                returned = True
+                return result
             finally:
                 try:
-                    ms = (time.perf_counter() - t0) * 1000.0
+                    # Only a call that RETURNED spans the TCP handshake. On a
+                    # non-blocking socket (asyncio's `sock_connect`, which
+                    # httpx's async client reaches through anyio) `connect`
+                    # raises EINPROGRESS at once and the handshake completes
+                    # later in the event loop, so the elapsed time is one
+                    # syscall, not a connect. That one is recorded as seen but
+                    # not timed, never as a fast connect.
+                    ms = (time.perf_counter() - t0) * 1000.0 if returned else None
                     fileno = this.fileno()
                     store.set_connect(fileno, ms)
                     _release_at_close(store, this, fileno)

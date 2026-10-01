@@ -114,7 +114,12 @@ class RawSocketInterceptor(ByteSeamInterceptor):
             popped = shared_timing_store().pop(obj.fileno())
         except Exception:
             popped = None
-        if popped is not None and popped[0] is not None:
+        if popped is not None:
+            # A record proves the seam saw this connection open, so this is its
+            # first transaction. Its connect half is None when the connect was
+            # not timed: a non-blocking connect returns before the handshake.
+            if popped[0] is None:
+                return (None, None, False, (Limitation.CONNECT_TIMING_UNAVAILABLE,))
             return (popped[0], None, False, ())
         # No connect record: the seam did not see this connection open — it
         # may have been opened, and used, before `init` — so whether this is

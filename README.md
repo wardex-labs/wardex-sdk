@@ -834,13 +834,16 @@ diagnostic line (traceback under `debug=True`).
   response was a Server-Sent Events stream — over OTLP as
   `wardex.transport.timing.*` and `wardex.transport.*`, and in the envelope's
   transport block. Only what was measured is sent: a connect time the seam
-  could not see (an `anyio`/httpx connection, marked
+  could not time (a plaintext connection opened by asyncio, whose
+  non-blocking connect returns before the handshake does; an `anyio`/httpx
+  TLS connection; one opened before `init`; each marked
   `connect_timing_unavailable`), the TLS handshake of a plaintext connection,
-  the first-byte and transfer times of an HTTP/2 stream, and everything but a
-  WebSocket session's length carry no key rather than a `0`. Connection reuse
-  is sent only for a connection the SDK saw open, not one opened before
-  `init`; a response is a stream when it declared `text/event-stream` or its
-  body read as one
+  the first-byte and transfer times of an HTTP/2 stream, the size of an
+  HTTP/2 request the SDK lost before capturing it (marked
+  `h2_request_evicted`), and everything but a WebSocket session's length
+  carry no key rather than a `0`. Connection reuse is sent only for a
+  connection the SDK saw open, not one opened before `init`; a response is a
+  stream when it declared `text/event-stream` or its body read as one
 - gRPC (grpclib), WebSocket (`wss`;
   a Responses-over-WebSocket connection is captured at close and marked
   `ws_llm_semantics_unread` when the host is `api.openai.com` or a subdomain

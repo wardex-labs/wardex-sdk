@@ -623,10 +623,10 @@ Two emit sites, and the first is the mechanism the second restates.
     reported as an instant connection.
 
     Emitted from ``_interceptors/_socket.py::RawSocketInterceptor._resolve_timing``
-    (the shared timing store held no connect for this fileno) and
-    ``_interceptors/_ssl.py::SSLInterceptor._resolve_timing`` (sync path: the
-    store held no connect for this fileno; async path: no stamped
-    ``_wardex_timing`` record at all).
+    and ``_interceptors/_ssl.py::SSLInterceptor._resolve_timing`` (sync path) when
+    the shared timing store held no timed connect for this fileno: none was seen,
+    or a non-blocking one (asyncio) returned before its handshake did; and from
+    the SSL async path when no ``_wardex_timing`` record was stamped at all.
 
     NOTE (census): absorbed the free string ``async_connect_unavailable``
     (``_ssl.py::_resolve_timing``, anyio/httpx path where TLS and TCP are

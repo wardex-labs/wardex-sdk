@@ -28,6 +28,34 @@ def test_store_handshake_without_connect_leaves_connect_unmeasured():
     assert s.pop(3) == (None, 5.0)
 
 
+def test_only_a_connect_call_that_returned_is_timed():
+    """A non-blocking connect raises EINPROGRESS before the handshake, so the
+    time the call took is not a connect time. The slot is still written: it is
+    the proof that the seam saw this connection open."""
+    import errno
+    import socket as _s
+
+    store = ConnTimingStore()
+    probe = ConnTimingProbe(store)
+
+    def in_progress(sock, address):
+        raise BlockingIOError(errno.EINPROGRESS, "Operation now in progress")
+
+    with _s.socket() as sock:
+        try:
+            probe._mk_connect(in_progress)(sock, ("127.0.0.1", 9))
+        except BlockingIOError:
+            pass
+        else:
+            raise AssertionError("the wrapper must re-raise what connect raised")
+        assert store.pop(sock.fileno()) == (None, None)
+
+    with _s.socket() as sock:
+        probe._mk_connect(lambda sock, address: None)(sock, ("127.0.0.1", 9))
+        connect, handshake = store.pop(sock.fileno())
+        assert isinstance(connect, float) and handshake is None
+
+
 def test_store_fifo_cap_evicts_oldest():
     s = ConnTimingStore(cap=2)
     s.set_connect(1, 1.0)

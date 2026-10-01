@@ -379,10 +379,15 @@ def test_no_default_in_a_transport_dataclass_claims_an_observation():
         connection_id="",
         protocol=Protocol.HTTP,
         direction=Direction.OUTBOUND,
-        request_size=0,
         response_size=0,
     )
-    for name in ("is_streaming", "connection_reused", "request_modality", "response_modality"):
+    for name in (
+        "request_size",
+        "is_streaming",
+        "connection_reused",
+        "request_modality",
+        "response_modality",
+    ):
         assert getattr(plain, name) is None, name
     assert not hasattr(_types.TransportAttributes, "chunk_index")
     assert not hasattr(_types.TransportAttributes, "is_final_chunk")

@@ -43,6 +43,7 @@ from typing import Any
 
 import wardex_sdk as wardex
 from wardex_sdk import _wardex_native
+from wardex_sdk._assembly import Limitation
 from wardex_sdk._enums import CaptureMode
 from wardex_sdk._limits import LimitsConfig
 from wardex_sdk._types import Envelope
@@ -225,6 +226,10 @@ def _check(body: bytes) -> None:
     assert t["timing"]["transfer_ms"] is not None
     assert t["is_streaming"] is None
     assert t["connection_reused"] is None
+
+    # Each request was captured whole, so its size is a reading.
+    for span in [*chats, *ws]:
+        assert isinstance(span["transport"]["request_size"], int)
 
     # No producer names a modality.
     for span in spans:
@@ -424,3 +429,102 @@ def test_an_event_stream_served_under_another_label_is_still_read_as_one():
 
 def test_a_body_neither_declared_nor_read_as_an_event_stream_is_not_streaming():
     assert _is_streaming(_JSON, {"Content-Type": "application/json"}) == (False, False)
+
+
+def test_an_asyncio_connect_is_seen_open_but_not_timed():
+    """A plaintext connection opened by asyncio, as httpx's async client opens one.
+
+    asyncio connects a non-blocking socket: `connect()` raises EINPROGRESS at
+    once and the handshake completes later in the event loop. The time that
+    call took (a fraction of a millisecond, whatever the network) used to ship
+    as `tcp_connect_ms` with no marker. The seam did see the connection open,
+    so reuse is still a reading; the connect time is not.
+    """
+    import asyncio
+
+    httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Provider)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    body = json.dumps({"model": "gpt-4o", "messages": [{"role": "user", "content": "hi"}]})
+    request = (
+        f"POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+        f"Content-Type: application/json\r\nContent-Length: {len(body)}\r\n"
+        f"Connection: close\r\n\r\n{body}"
+    ).encode()
+
+    async def call() -> bytes:
+        reader, writer = await asyncio.open_connection("127.0.0.1", httpd.server_address[1])
+        writer.write(request)
+        await writer.drain()
+        response = await reader.read()
+        writer.close()
+        return response
+
+    transport = RecordingTransport()
+    try:
+        wardex.init(transport=transport, intercept=True, capture_mode=CaptureMode.ALL)
+        assert asyncio.run(call()).startswith(b"HTTP/1.1 200")
+    finally:
+        wardex.close()
+        httpd.shutdown()
+        httpd.server_close()
+
+    env, (span,) = _envelope_spans(transport)
+    t = span["transport"]
+    assert t["timing"]["tcp_connect_ms"] is None
+    assert "connect_timing_unavailable" in span["capture_integrity"]["limitations"]
+    assert t["connection_reused"] is False
+    (otlp,) = [s for s in _otlp_spans(env) if "wardex.transport.direction" in s["attributes"]]
+    assert "wardex.transport.timing.tcp_connect_ms" not in otlp["attributes"]
+    assert otlp["attributes"]["wardex.transport.connection_reused"] is False
+
+
+def test_a_request_the_http2_stream_table_evicted_has_no_size():
+    """More streams open at once than `max_streams`: the table evicts the
+    oldest request halves before their responses arrive. Nothing of those
+    requests was captured, so their size is unknown — it used to ship as
+    `request_size = 0`, an empty body nobody observed."""
+    from hpack import Encoder
+
+    import test_span_class_survival as h
+    from test_codec import _header
+    from wardex_sdk import _hub
+    from wardex_sdk._interceptors._trackers import _Http2Tracker
+
+    client = h._FakeClient()
+    _hub.set_client(client)
+    seam = h._seam(client, _Http2Tracker(_wardex_native.Limits(max_streams=2)))
+    body = json.dumps({"model": "gpt-4o", "messages": [{"role": "user", "content": "x" * 64}]})
+    sids = [1 + 2 * i for i in range(8)]
+    client_enc, server_enc = Encoder(), Encoder()
+    headers = [(b":method", b"POST"), (b":path", b"/v1/chat/completions")]
+    requests = b"".join(
+        h._h2_frame(
+            0x1, 0x4, sid, client_enc.encode([*headers, (b":authority", b"api.openai.com")])
+        )
+        + h._h2_frame(0x0, 0x1, sid, body.encode())
+        for sid in sids
+    )
+    responses = b"".join(
+        h._h2_frame(0x1, 0x4, sid, server_enc.encode([(b":status", b"200")]))
+        + h._h2_frame(0x0, 0x1, sid, _JSON)
+        for sid in sids
+    )
+    h._drive_seam(seam, "api.openai.com", requests, responses)
+
+    evicted = [
+        s for s in client.spans if Limitation.H2_REQUEST_EVICTED in s.capture_integrity.limitations
+    ]
+    kept = [s for s in client.spans if s not in evicted]
+    assert len(evicted) == 6 and len(kept) == 2
+    assert all(s.transport.request_size is None for s in evicted)
+    assert all(s.transport.request_size == len(body) for s in kept)
+
+    env = Envelope(header=_header(), spans=tuple(client.spans))
+    decoded = [i["span"] for i in _codec.decode(_codec.encode(env))["items"] if "span" in i]
+    assert sorted(str(s["transport"]["request_size"]) for s in decoded) == sorted(
+        ["None"] * 6 + [str(len(body))] * 2
+    )
+    sizes = [s["attributes"].get("wardex.transport.request_size") for s in _otlp_spans(env)]
+    assert sorted(str(v) for v in sizes) == sorted(["None"] * 6 + [str(len(body))] * 2)
+    # The response half was observed: its size still ships.
+    assert all(s["transport"]["response_size"] == len(_JSON) for s in decoded)

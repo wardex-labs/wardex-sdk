@@ -1094,13 +1094,11 @@ def _assemble(p: _PendingTxn, *, parse: bool, extra: tuple[Limitation, ...]) -> 
                 else:
                     draft.add_limitation(Limitation.SSE_UNKNOWN_PROVIDER)
             elif not has_core_semantics(sem) and status_code is StatusCode.OK:
-                # Narrowed to a SUCCESSFUL response the parser could not
-                # read. A 4xx/5xx body is an error envelope; the parse did
-                # not fail, so claiming it did sent every rate limit and
-                # every auth failure out under a marker that says "wardex
-                # could not understand this" when the truth — already on the
-                # span as `status=ERROR` and `error.type` — is that the
-                # provider refused.
+                # Narrowed to a SUCCESSFUL response the parser could not read. A 4xx/5xx
+                # body is an error envelope; the parse did not fail, so claiming it did sent
+                # every rate limit and every auth failure out under a marker that says
+                # "wardex could not understand this" when the truth — already on the span as
+                # `status=ERROR` and `error.type` — is that the provider refused.
                 #
                 # No need for semantic_parse_failed if tool_calls extraction succeeded.
                 if sem.output_messages is None:
@@ -1135,15 +1133,16 @@ def _assemble(p: _PendingTxn, *, parse: bool, extra: tuple[Limitation, ...]) -> 
     body_read = parse and not parse_failed and not p.is_grpc
     sniffed = bool(getattr(sem, "reassembled_from_stream", False)) if body_read else None
     streamed = txn.event_stream or sniffed
-    # response_size is the wire (compressed) size, while output_data is the
-    # decompressed body, so lengths may differ for gzip responses (intended behavior).
+    # Sizes are wire (compressed) bytes; output_data is the inflated body. A request half the
+    # HTTP/2 stream table evicted was never captured, so its size is unset, not an empty 0.
+    req_size = None if Limitation.H2_REQUEST_EVICTED in txn.limitations else len(txn.request_body)
     draft.set_transport(
         TransportAttributes(
             connection_id=p.connection_id,
             protocol=Protocol.HTTP,
             direction=Direction.OUTBOUND,
             timing=timing,
-            request_size=len(txn.request_body),
+            request_size=req_size,
             response_size=len(txn.response_body),
             http=HttpMeta(method=txn.method, url=url, status_code=txn.status),
             is_streaming=streamed,
