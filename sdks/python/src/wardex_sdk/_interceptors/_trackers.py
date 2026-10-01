@@ -21,14 +21,16 @@ from .._protocol._http2 import Http2Parser
 from .._types import SpanContext
 
 
-def _ttft_from_marks(marks: list[tuple[int, int]], header_len: int, start_ns: int) -> float:
+def _ttft_from_marks(marks: list[tuple[int, int]], header_len: int, start_ns: int) -> float | None:
     """marks=[(cumulative_wire_bytes, ns)]. TTFT (ms) is computed from the ns of the
-    first mark that crosses the header_len boundary. Returns 0.0 if no mark crosses the
-    boundary, or if the request start time is unknown (mid-connection capture)."""
+    first mark that crosses the header_len boundary. None — not measured, which
+    ships as an unset field rather than as a 0 ms reading — if no mark crosses the
+    boundary (no body byte arrived), or if the request start time is unknown
+    (mid-connection capture)."""
     for cum, ns in marks:
         if cum > header_len:
-            return max(0.0, (ns - start_ns) / 1e6) if start_ns else 0.0
-    return 0.0
+            return max(0.0, (ns - start_ns) / 1e6) if start_ns else None
+    return None
 
 
 def _header_get(headers: object, name: str) -> str | None:
@@ -181,7 +183,9 @@ class _Txn:
     parent: SpanContext | None
     start_ns: int
     end_ns: int
-    ttfb_ms: float
+    #: None when this tracker cannot time the first response byte (an HTTP/2
+    #: stream, a capture that joined mid-connection): not measured, not zero.
+    ttfb_ms: float | None
     #: Was `parent` latched off a unit that had ALREADY closed? Latched HERE,
     #: beside the parent and on the task that ISSUED the request, because the
     #: answer is a property of that instant: a request issued while the run was
@@ -203,7 +207,8 @@ class _Txn:
     # at the PyO3 boundary (`_protocol/_http1.py`).
     limitations: tuple[Limitation, ...] = ()
     version: str = "1.1"
-    ttft_ms: float = 0.0
+    #: See `ttfb_ms`; also None when no body byte arrived.
+    ttft_ms: float | None = None
     content_type: str | None = None
     grpc_status: int | None = None
     grpc_message: str | None = None
@@ -302,7 +307,7 @@ class _Http1Tracker:
                         parent_closed=self._parent_closed,
                         start_ns=self._req_start_ns or now,
                         end_ns=now,
-                        ttfb_ms=0.0,
+                        ttfb_ms=None,
                         version="1.1",
                         ws_upgrade=True,
                         ws_upgrade_path=self._path or "/",
@@ -327,7 +332,7 @@ class _Http1Tracker:
             ttfb = (
                 max(0.0, (self._resp_first_ns - self._req_start_ns) / 1e6)
                 if self._req_start_ns and self._resp_first_ns
-                else 0.0
+                else None
             )
             ttft = _ttft_from_marks(self._resp_marks, msg.header_len, self._req_start_ns)
             out.append(
@@ -596,11 +601,11 @@ class _Http2Tracker:
             parent_evicted=parent_evicted,
             start_ns=start,
             end_ns=now,
-            ttfb_ms=0.0,  # per-h2-stream first-byte not tracked (limitation)
+            ttfb_ms=None,  # per-h2-stream first-byte not tracked: not measured
             truncated=t.truncated or request_evicted,
             limitations=(Limitation.H2_REQUEST_EVICTED,) if request_evicted else (),
             version="2",
-            ttft_ms=0.0,  # per-h2-stream first-body-byte not tracked (limitation)
+            ttft_ms=None,  # per-h2-stream first-body-byte not tracked: not measured
             content_type=getattr(t, "content_type", None),
             grpc_status=getattr(t, "grpc_status", None),
             grpc_message=getattr(t, "grpc_message", None),
@@ -779,7 +784,7 @@ class _WebSocketTracker:
             parent_closed=self._parent_closed,
             start_ns=self._start_ns,
             end_ns=now,
-            ttfb_ms=0.0,
+            ttfb_ms=None,
             version="websocket",
             ws_close_code=self._close_code,
             ws_messages_sent=self._sent_msgs,

@@ -619,8 +619,8 @@ Two emit sites, and the first is the mechanism the second restates.
     # ------------------------------------------------------------------
 
     CONNECT_TIMING_UNAVAILABLE = "connect_timing_unavailable"
-    """``tcp_connect_ms`` is 0 because it could not be measured, not because the
-    connection was instant.
+    """``tcp_connect_ms`` could not be measured, so it is left unset rather than
+    reported as an instant connection.
 
     Emitted from ``_interceptors/_socket.py::RawSocketInterceptor._resolve_timing``
     (always — the raw-socket seam has no connect-time store) and

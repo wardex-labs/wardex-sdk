@@ -124,7 +124,19 @@ message SpanLink {
   LinkReason reason = 4;  // why this span points at that one (causality, not containment)
 }
 
+// Every field here says either what the SDK observed or nothing. A field the
+// SDK can fail to observe has explicit presence (`optional`), so "not
+// observed" leaves it unset instead of shipping its zero value as a reading;
+// an enum's unset is its `*_UNSPECIFIED` zero.
 message TransportAttributes {
+  // Tags 25 and 26 were `int32 chunk_index` and `bool is_final_chunk`. Nothing
+  // ever filled them, so every span carried 0 and true: a claim about
+  // streaming chunks that no one observed. Removed before any envelope was
+  // stored, the last point a deletion is allowed; reserved so the numbers and
+  // names never come back meaning something else.
+  reserved 25, 26;
+  reserved "chunk_index", "is_final_chunk";
+
   string connection_id = 1;
   Protocol protocol = 2;
   Direction direction = 3;
@@ -142,21 +154,29 @@ message TransportAttributes {
   string request_blob_ref = 20;
   string response_blob_ref = 21;
 
+  // Unset means not observed. No producer in this SDK names a modality yet.
   Modality request_modality = 22;
   Modality response_modality = 23;
 
-  bool is_streaming = 24;
-  int32 chunk_index = 25;
-  bool is_final_chunk = 26;
-  bool connection_reused = 27;  // whether the connection was reused via pooling (if true, connect/handshake=0 means "reused")
+  // true: the response body was read and was a Server-Sent Events stream.
+  // false: it was read and was not. Unset: the body was not read (gRPC, a
+  // skipped or failed parse, a WebSocket session, stdio).
+  optional bool is_streaming = 24;
+  // Whether this transaction rode a pooled connection opened by an earlier
+  // one. When true, `tcp_connect_ms` / `tls_handshake_ms` of 0 mean this
+  // transaction opened nothing. Unset where the producer cannot tell either
+  // way (a WebSocket session, stdio).
+  optional bool connection_reused = 27;
 }
 
+// Unset means the SDK did not measure that interval on this transaction —
+// never that it took no time.
 message TransportTiming {
-  float tcp_connect_ms = 1;
-  float tls_handshake_ms = 2;
-  float ttfb_ms = 3;
-  float transfer_ms = 4;
-  float ttft_ms = 5;  // time-to-first-token (SSE streaming)
+  optional float tcp_connect_ms = 1;
+  optional float tls_handshake_ms = 2;
+  optional float ttfb_ms = 3;
+  optional float transfer_ms = 4;
+  optional float ttft_ms = 5;  // time to the first response body byte (HTTP/1)
 }
 
 message HttpMeta {

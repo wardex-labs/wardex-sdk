@@ -380,11 +380,20 @@ class InternalSpan:
 
 @dataclass(frozen=True, slots=True)
 class TransportTiming:
-    tcp_connect_ms: float = 0.0
-    tls_handshake_ms: float = 0.0
-    ttfb_ms: float = 0.0
-    ttft_ms: float = 0.0
-    transfer_ms: float = 0.0
+    """Transport intervals in milliseconds.
+
+    `None` means the SDK did not measure that interval on this transaction —
+    never that it took no time — and it ships as an unset field. A `0.0` here
+    is a reading: on a reused connection, for instance, this transaction
+    opened nothing and spent no time connecting.
+    """
+
+    tcp_connect_ms: float | None = None
+    tls_handshake_ms: float | None = None
+    ttfb_ms: float | None = None
+    #: Time to the first response body byte (HTTP/1).
+    ttft_ms: float | None = None
+    transfer_ms: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -430,13 +439,19 @@ class A2aMeta:
 class TransportAttributes:
     """Transport-layer observation data that interceptors enrich the Span with.
     Covers both network (HTTP, gRPC, etc.) and IPC (stdio, pipe, etc.).
-    A Span carrying this attribute is auto-generated even when Interceptors run alone."""
+    A Span carrying this attribute is auto-generated even when Interceptors run alone.
+
+    Every field holds what the producer observed, or says nothing. A field the
+    producer may not observe defaults to `None` and ships unset; the fields
+    with a value default (`connection_id`, `protocol`, `direction`, the two
+    sizes) are passed explicitly by every producer, which
+    `tests/test_wire_field_census.py` checks against the source."""
 
     connection_id: str = ""
     protocol: Protocol = Protocol.HTTP
     direction: Direction = Direction.OUTBOUND
 
-    # Timing — network-only fields (tcp_connect_ms, tls_handshake_ms) are 0 for IPC
+    # Timing — the network-only intervals (tcp_connect_ms, tls_handshake_ms) are None for IPC
     timing: TransportTiming = field(default_factory=TransportTiming)
 
     request_size: int = 0
@@ -454,13 +469,15 @@ class TransportAttributes:
     request_blob_ref: str | None = None
     response_blob_ref: str | None = None
 
-    # Modality + streaming
-    request_modality: Modality = Modality.TEXT
-    response_modality: Modality = Modality.TEXT
-    is_streaming: bool = False
-    chunk_index: int = 0
-    is_final_chunk: bool = True
-    connection_reused: bool = False
+    # Modality — no producer names one yet, so it ships unset.
+    request_modality: Modality | None = None
+    response_modality: Modality | None = None
+    #: True when the response body was read and was a Server-Sent Events
+    #: stream, False when it was read and was not, None when it was not read.
+    is_streaming: bool | None = None
+    #: Whether this transaction rode a connection an earlier one opened. None
+    #: where the producer cannot tell either way (a WebSocket session, stdio).
+    connection_reused: bool | None = None
 
 
 @dataclass(frozen=True, slots=True)

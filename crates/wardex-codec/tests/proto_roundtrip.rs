@@ -13,12 +13,16 @@ fn envelope_default_roundtrip() {
 
 #[test]
 fn transport_attributes_connection_reused_roundtrip() {
-    let original = TransportAttributes {
-        connection_reused: true,
-        ..Default::default()
-    };
-    let bytes = original.encode_to_vec();
-    let decoded = TransportAttributes::decode(&bytes[..]).expect("decode failed");
-    assert_eq!(original, decoded);
-    assert!(decoded.connection_reused);
+    // Explicit presence: `Some(false)` is a reading and must survive the wire
+    // as one, distinct from unset.
+    for value in [Some(true), Some(false), None] {
+        let original = TransportAttributes {
+            connection_reused: value,
+            ..Default::default()
+        };
+        let bytes = original.encode_to_vec();
+        let decoded = TransportAttributes::decode(&bytes[..]).expect("decode failed");
+        assert_eq!(original, decoded);
+        assert_eq!(decoded.connection_reused, value);
+    }
 }

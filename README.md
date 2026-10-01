@@ -401,7 +401,8 @@ are two conversations in one trace, by design — the block scopes the id, not
 the trace.
 `workflow` / `agent` / `step` / `tool` map to the `gen_ai.operation.name`
 values `invoke_workflow` / `invoke_agent` / `execute_step` / `execute_tool`,
-so decorated spans appear on operation-keyed dashboards. `span()` and
+so decorated spans appear on operation-keyed dashboards. A workflow's name
+ships as `gen_ai.workflow.name`. `span()` and
 `conversation()` are context managers only — using one as a decorator raises
 a `TypeError` naming the decorators (a decorator would silently break async
 functions).
@@ -827,11 +828,22 @@ diagnostic line (traceback under `debug=True`).
 - Failed provider calls (429 rate limits, 401s, 5xx) are captured with the same
   `gen_ai` identity and content as successful ones — only the response-side
   fields are empty
-- Transport metrics (TCP/TLS timing, TTFT), gRPC (grpclib), WebSocket (`wss`;
+- Transport metrics: TCP connect and TLS handshake time, time to the first
+  response byte and to the first body byte, transfer time (milliseconds),
+  request and response size, connection id and reuse, and whether the
+  response was a Server-Sent Events stream — over OTLP as
+  `wardex.transport.timing.*` and `wardex.transport.*`, and in the envelope's
+  transport block. Only what was measured is sent: a connect time the seam
+  could not see (an `anyio`/httpx connection, marked
+  `connect_timing_unavailable`), the TLS handshake of a plaintext connection,
+  the first-byte and transfer times of an HTTP/2 stream, and everything but a
+  WebSocket session's length carry no key rather than a `0`
+- gRPC (grpclib), WebSocket (`wss`;
   a Responses-over-WebSocket connection is captured at close and marked
   `ws_llm_semantics_unread` when the host is `api.openai.com` or a subdomain
   of `openai.com` — on any other host with compression it is only counted,
-  see capture_mode), MCP stdio
+  see capture_mode), MCP stdio (`mcp.method.name` and `jsonrpc.request.id`
+  over OTLP)
 - Export to any OpenTelemetry backend via `OtlpHttpTransport`
 - Manual span decorators: `@workflow` / `@agent` / `@step` / `@tool`
 - PII masking on by default: emails, phone numbers, credit cards (Luhn-verified),

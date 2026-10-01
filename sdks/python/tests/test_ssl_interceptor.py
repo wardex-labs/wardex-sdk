@@ -170,8 +170,9 @@ async def test_async_capture_populates_handshake(tls_server):
     sp = [s for s in _captured_spans() if s.kind == SpanKind.CLIENT][0]
     assert sp.transport.connection_reused is False
     assert sp.transport.timing.tls_handshake_ms > 0.0
-    # On the anyio/httpx path, TCP connect can't be derived by subtraction → connect=0 + marker
-    assert sp.transport.timing.tcp_connect_ms == 0.0
+    # On the anyio/httpx path, TCP connect can't be derived by subtraction →
+    # left unset (not a 0 ms connect) + marker
+    assert sp.transport.timing.tcp_connect_ms is None
     # Census merge (design §6.5.1): `async_connect_unavailable` folded into
     # CONNECT_TIMING_UNAVAILABLE. Both said the same thing — tcp_connect_ms is
     # unknown rather than zero — and differed only in provenance.

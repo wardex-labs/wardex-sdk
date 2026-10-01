@@ -406,8 +406,6 @@ fn mask_transport(m: &mut Masker<'_>, t: &mut pb::TransportAttributes) -> bool {
         request_modality: _,
         response_modality: _,
         is_streaming: _,
-        chunk_index: _,
-        is_final_chunk: _,
         connection_reused: _,
     } = t;
     let mut hit = false;

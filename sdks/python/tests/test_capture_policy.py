@@ -392,7 +392,8 @@ def test_the_gate_does_not_change_which_request_owns_the_connect_cost():
 
         (span,) = seam._client.spans
         assert span.transport.timing.tcp_connect_ms == 0.0
-        assert span.transport.timing.tls_handshake_ms == 0.0
+        # Plaintext: there is no TLS handshake to time, reused or not.
+        assert span.transport.timing.tls_handshake_ms is None
         assert span.transport.connection_reused is True
     finally:
         uninstall_shared_timing()

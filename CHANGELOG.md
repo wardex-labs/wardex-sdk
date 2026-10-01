@@ -7,6 +7,26 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- **The transport values the interceptors measure now reach OTLP.** Before,
+  an OTLP backend received only the protocol and the HTTP method, status and
+  URL of a captured call; every other value the seam measures was dropped at
+  export. Now each one the SDK observed rides the span:
+  `wardex.transport.timing.tcp_connect_ms`, `.tls_handshake_ms`, `.ttfb_ms`,
+  `.transfer_ms` and `.ttft_ms` (milliseconds), `wardex.transport.request_size`
+  and `.response_size`, `wardex.transport.connection_id` and
+  `.connection_reused`, `wardex.transport.direction`, and
+  `wardex.transport.is_streaming`. An MCP stdio call carries its method as
+  `mcp.method.name` and its JSON-RPC id as `jsonrpc.request.id`, and the
+  workflow name a decorator or an adapter records ships as
+  `gen_ai.workflow.name` — it never reached OTLP before. A value the SDK did
+  not observe has no key at all, rather than a `0` or a `false`. The fields
+  no producer fills (modality, blob references, the gRPC / WebSocket / SSE /
+  A2A meta blocks) are listed with that reason in
+  `crates/wardex-codec/src/otlp/map.rs` (`WIRE_FIELDS`), and
+  `sdks/python/tests/test_wire_field_census.py` fails when a field is added
+  to the schema, filled by a producer, or dropped by the encoder, the decoder
+  or the mapping without that table saying where it goes.
+
 - **A masked span says what was masked and why.** Every span that had a value
   replaced carries `wardex.redaction.count`, `wardex.redaction.rules` (which
   rule: a PII category, `secret_value`, one of the name rules, or
@@ -78,6 +98,28 @@ All notable changes to this project are documented here. The format follows
 
 ### Changed
 
+- **The wardex envelope says what the SDK observed about a transport, or
+  nothing.** Transport fields nobody measured used to ship under their zero
+  values as if they had been read off the connection: every span said
+  `is_streaming = false` (a streaming chat call included, beside its own
+  `gen_ai.request.stream = true`), a `TEXT` request and response modality
+  nobody detected, `is_final_chunk = true` and `chunk_index = 0`, and a
+  WebSocket session said 0 ms for a connect, a TLS handshake, a first byte and
+  a first token it never timed. Now `is_streaming` is `true` or `false` when
+  the SDK read the response body (whether it was a Server-Sent Events stream)
+  and unset when it did not; the five `TransportTiming` intervals and
+  `connection_reused` are unset when they were not measured — including a
+  connect time the seam marks `connect_timing_unavailable`, the TLS handshake
+  of a plaintext connection, and the first-byte, first-body-byte and transfer
+  times of an HTTP/2 stream; and the modalities are unspecified, since
+  nothing detects one yet. On the schema,
+  `is_streaming`, `connection_reused` and the five intervals gained explicit
+  presence (`optional`). In Python, `TransportTiming`'s fields,
+  `is_streaming`, `connection_reused` and both modalities default to `None`.
+- **`TransportAttributes.chunk_index` and `is_final_chunk` are removed.**
+  Nothing ever filled them, so every span carried `0` and `true`. Their tags
+  (25, 26) and names are reserved and will not be reused. The Python fields
+  are gone from `TransportAttributes` too.
 - **Claude Agent SDK turns are numbered from 1.**
   `wardex.conversation.turn_index` counted the assistant messages of a session
   from 0, and 0 is proto3's "unset": the first turn left the process with no

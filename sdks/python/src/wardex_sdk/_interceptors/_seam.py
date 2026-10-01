@@ -397,7 +397,7 @@ class ByteSeamInterceptor(InterceptorInterface):
     @abstractmethod
     def _resolve_timing(
         self, obj: Any, st: _ConnectionState
-    ) -> tuple[float, float, bool, tuple[Limitation, ...]]: ...
+    ) -> tuple[float | None, float | None, bool, tuple[Limitation, ...]]: ...
 
     def _guard(self, where: str) -> guard:
         """The one authorized swallow, wired to this seam's debug setting.
@@ -738,13 +738,11 @@ class ByteSeamInterceptor(InterceptorInterface):
             counters.bump("interceptors.seam.ws_llm_endpoint_unconfirmed")
         if peer_unresolved := st.server_port == UNRESOLVED_PORT:
             counters.bump("interceptors.seam.peer_unresolved")
-        # `sem=None`: a WS session carries no parsed LLM semantics (by
-        # construction on this path), so it is captured under ALL, an
-        # allowlisted host, a live local span, or — the one claim this path
-        # can make — a connection that confirmed LLM calls crossed it
-        # (`ws_llm_call`). Inline — WS never defers (§3.6) — but the DECISION
-        # is the same module `_gate` the deferred path uses, composed with the
-        # same fail-open prefilter.
+        # `sem=None`: a WS session carries no parsed LLM semantics (by construction on this
+        # path), so it is captured under ALL, an allowlisted host, a live local span, or — the
+        # one claim this path can make — a connection that confirmed LLM calls crossed it
+        # (`ws_llm_call`). Inline — WS never defers (§3.6) — but the DECISION is the same
+        # module `_gate` the deferred path uses, composed with the same fail-open prefilter.
         if not _should_capture(
             self._prefilter_of(st), txn, None, mode=capture_mode_of(self._client)
         ):
@@ -778,13 +776,9 @@ class ByteSeamInterceptor(InterceptorInterface):
         if code is not None:
             draft.set_extra("ws.close_code", code)
 
-        timing = TransportTiming(
-            tcp_connect_ms=0.0,
-            tls_handshake_ms=0.0,
-            ttfb_ms=0.0,
-            ttft_ms=0.0,
-            transfer_ms=max(0.0, (txn.end_ns - txn.start_ns) / 1e6),
-        )
+        # Only the session's length is timed here. Connect, handshake, first byte,
+        # first token and connection reuse are not observed, so they stay unset.
+        timing = TransportTiming(transfer_ms=max(0.0, (txn.end_ns - txn.start_ns) / 1e6))
         draft.set_transport(
             TransportAttributes(
                 connection_id=str(id(st)),
@@ -800,7 +794,6 @@ class ByteSeamInterceptor(InterceptorInterface):
                     ),
                     status_code=101,
                 ),
-                connection_reused=False,
             )
         )
         draft.set_server(st.server_address, st.server_port)
@@ -848,8 +841,8 @@ class _PendingTxn:
     treatment: str | None
     prefilter: Prefilter
     mode: CaptureMode
-    connect_ms: float
-    handshake_ms: float
+    connect_ms: float | None
+    handshake_ms: float | None
     reused: bool
     timing_markers: tuple[Limitation, ...]
     limits: Any
@@ -979,7 +972,8 @@ def _assemble(p: _PendingTxn, *, parse: bool, extra: tuple[Limitation, ...]) -> 
     )
     # `:0` too; see `_peer.py`. The target keeps its query unless the bodies are withheld.
     url = f"{p.url_scheme}://{p.url_host}:{p.server_port}{_url_target(txn, withhold_bodies)}"
-    transfer = max(0.0, (txn.end_ns - txn.start_ns) / 1e6 - txn.ttfb_ms)
+    ttfb = txn.ttfb_ms  # None when not timed; the transfer after it is then unknowable too
+    transfer = None if ttfb is None else max(0.0, (txn.end_ns - txn.start_ns) / 1e6 - ttfb)
 
     # TRANSPORT mode, not an intent (design §6.1 correction in `_vocab.py`):
     # the seam knows a request happened and, on the branches below, what the
@@ -1137,6 +1131,10 @@ def _assemble(p: _PendingTxn, *, parse: bool, extra: tuple[Limitation, ...]) -> 
         ttft_ms=txn.ttft_ms,
         transfer_ms=transfer,
     )
+    # A parse that ran read the body as SSE first (`looks_like_sse`), so it knows whether it
+    # streamed; where none ran (gRPC, skipped, raised) the body was not read: no claim.
+    body_read = parse and not parse_failed and not p.is_grpc
+    streamed = bool(getattr(sem, "reassembled_from_stream", False)) if body_read else None
     # response_size is the wire (compressed) size, while output_data is the
     # decompressed body, so lengths may differ for gzip responses (intended behavior).
     draft.set_transport(
@@ -1148,6 +1146,7 @@ def _assemble(p: _PendingTxn, *, parse: bool, extra: tuple[Limitation, ...]) -> 
             request_size=len(txn.request_body),
             response_size=len(txn.response_body),
             http=HttpMeta(method=txn.method, url=url, status_code=txn.status),
+            is_streaming=streamed,
             connection_reused=p.reused,
         )
     )
