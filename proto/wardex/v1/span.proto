@@ -158,14 +158,18 @@ message TransportAttributes {
   Modality request_modality = 22;
   Modality response_modality = 23;
 
-  // true: the response body was read and was a Server-Sent Events stream.
-  // false: it was read and was not. Unset: the body was not read (gRPC, a
-  // skipped or failed parse, a WebSocket session, stdio).
+  // true: the response was a Server-Sent Events stream — it declared
+  // `Content-Type: text/event-stream`, whether or not its body could be read,
+  // or its body read as one. false: it did not declare one, and its body did
+  // not read as one. Unset: it did not declare one and its body was not parsed
+  // (gRPC, a skipped or failed parse, a WebSocket session, stdio).
   optional bool is_streaming = 24;
   // Whether this transaction rode a pooled connection opened by an earlier
   // one. When true, `tcp_connect_ms` / `tls_handshake_ms` of 0 mean this
-  // transaction opened nothing. Unset where the producer cannot tell either
-  // way (a WebSocket session, stdio).
+  // transaction opened nothing. false only where the SDK saw the connection
+  // open. Unset where the producer cannot tell either way: a connection the
+  // SDK did not see open (one opened before it started), a WebSocket session,
+  // stdio.
   optional bool connection_reused = 27;
 }
 

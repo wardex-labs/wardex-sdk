@@ -33,6 +33,28 @@ def _resolve_markers(raw: object) -> tuple[Limitation, ...]:
     return tuple(out)
 
 
+def declares_event_stream(content_type: str | None) -> bool:
+    """Did this Content-Type value declare a Server-Sent Events stream?
+
+    The media type alone, case-insensitive, parameters dropped — the reading
+    `crates/wardex-protocol/src/http1.rs::bare_media_type` gives the header
+    when it picks a body cap. The header is the stream's declaration by
+    protocol, so the body is not consulted: a stream whose bytes no parser can
+    read (an encoding it does not decode, a cap that cut it mid-character) is
+    still the stream the server said it was.
+
+    Both HTTP trackers ask it. Their `_Txn.event_stream` is a field of its own
+    rather than `content_type`, which only the HTTP/2 tracker fills and which
+    also picks the gRPC branches. The HTTP/2 parser's value is the response's
+    Content-Type, or the request's when the response named none;
+    `text/event-stream` is a response format no client sends as a request
+    body, so in practice it reads the response's declaration there too.
+    """
+    if not content_type:
+        return False
+    return content_type.split(";", 1)[0].strip().lower() == "text/event-stream"
+
+
 def _to_parsed(raw: object) -> ParsedMessage:
     # raw: _wardex_native.protocol.RawHttpMessage
     return ParsedMessage(

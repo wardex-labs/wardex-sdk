@@ -623,9 +623,9 @@ Two emit sites, and the first is the mechanism the second restates.
     reported as an instant connection.
 
     Emitted from ``_interceptors/_socket.py::RawSocketInterceptor._resolve_timing``
-    (always — the raw-socket seam has no connect-time store) and
+    (the shared timing store held no connect for this fileno) and
     ``_interceptors/_ssl.py::SSLInterceptor._resolve_timing`` (sync path: the
-    shared timing store had no record for this fileno; async path: no stamped
+    store held no connect for this fileno; async path: no stamped
     ``_wardex_timing`` record at all).
 
     NOTE (census): absorbed the free string ``async_connect_unavailable``

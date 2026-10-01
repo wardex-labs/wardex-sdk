@@ -50,3 +50,29 @@ def test_tracker_surfaces_grpc_fields_on_txn():
     assert t.grpc_status == 0
     assert t.path == "/echo.Echo/Say"
     assert t.version == "2"
+
+
+def _h2_response_txn(content_type: bytes):
+    tracker = _Http2Tracker()
+    client_enc = Encoder()
+    server_enc = Encoder()
+    req_block = client_enc.encode(
+        [
+            (b":method", b"POST"),
+            (b":path", b"/v1/chat/completions"),
+            (b"content-type", b"application/json"),
+        ]
+    )
+    tracker.on_request_bytes(_frame(0x1, FH, 1, req_block) + _frame(0x0, FS, 1, b"{}"))
+    resp_hdr = server_enc.encode([(b":status", b"200"), (b"content-type", content_type)])
+    (txn,) = tracker.on_response_bytes(
+        _frame(0x1, FH, 1, resp_hdr) + _frame(0x0, FS, 1, b"data: {}\n\n")
+    )
+    return txn
+
+
+def test_an_h2_response_declaring_an_event_stream_says_so_on_the_txn():
+    assert _h2_response_txn(b"Text/Event-Stream; charset=utf-8").event_stream is True
+    # The request's `application/json` is what the parser falls back to when a
+    # response names no type; it must not read as a declaration either way.
+    assert _h2_response_txn(b"application/json").event_stream is False

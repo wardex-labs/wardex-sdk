@@ -16,7 +16,7 @@ from typing import Any
 from .. import _hub, _wardex_native
 from .._assembly import Limitation, counters, guard, parent_is_closed_unit
 from .._protocol import WsParser
-from .._protocol._http1 import Http1RequestParser, Http1ResponseParser
+from .._protocol._http1 import Http1RequestParser, Http1ResponseParser, declares_event_stream
 from .._protocol._http2 import Http2Parser
 from .._types import SpanContext
 
@@ -210,6 +210,7 @@ class _Txn:
     #: See `ttfb_ms`; also None when no body byte arrived.
     ttft_ms: float | None = None
     content_type: str | None = None
+    event_stream: bool = False  # see `declares_event_stream`
     grpc_status: int | None = None
     grpc_message: str | None = None
     # WS upgrade signal (set on 101 detection — used by _ssl.py as the SWAP trigger)
@@ -352,6 +353,7 @@ class _Http1Tracker:
                     limitations=_merge_markers(self._req_limitations, msg.limitations),
                     version="1.1",
                     ttft_ms=ttft,
+                    event_stream=declares_event_stream(_header_get(msg.headers, "content-type")),
                 )
             )
             self._method = None
@@ -607,6 +609,7 @@ class _Http2Tracker:
             version="2",
             ttft_ms=None,  # per-h2-stream first-body-byte not tracked: not measured
             content_type=getattr(t, "content_type", None),
+            event_stream=declares_event_stream(getattr(t, "content_type", None)),
             grpc_status=getattr(t, "grpc_status", None),
             grpc_message=getattr(t, "grpc_message", None),
         )

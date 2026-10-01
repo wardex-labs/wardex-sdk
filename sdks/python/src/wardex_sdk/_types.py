@@ -472,11 +472,15 @@ class TransportAttributes:
     # Modality — no producer names one yet, so it ships unset.
     request_modality: Modality | None = None
     response_modality: Modality | None = None
-    #: True when the response body was read and was a Server-Sent Events
-    #: stream, False when it was read and was not, None when it was not read.
+    #: True when the response was a Server-Sent Events stream: it declared
+    #: `Content-Type: text/event-stream` (read or not), or its body read as
+    #: one. False when it did not declare one and its body did not read as
+    #: one. None when it did not declare one and its body was not parsed.
     is_streaming: bool | None = None
-    #: Whether this transaction rode a connection an earlier one opened. None
-    #: where the producer cannot tell either way (a WebSocket session, stdio).
+    #: Whether this transaction rode a connection an earlier one opened. False
+    #: only where the producer saw the connection open; None where it cannot
+    #: tell either way (a connection opened before `init`, a WebSocket
+    #: session, stdio).
     connection_reused: bool | None = None
 
 

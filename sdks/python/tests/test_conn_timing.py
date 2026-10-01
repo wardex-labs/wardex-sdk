@@ -19,10 +19,13 @@ def test_store_pop_missing_is_none():
     assert ConnTimingStore().pop(999) is None
 
 
-def test_store_handshake_without_connect_defaults_connect_zero():
+def test_store_handshake_without_connect_leaves_connect_unmeasured():
+    # A socket connected before `init` and TLS-wrapped after it: the store saw
+    # the handshake and never the connect. A 0.0 here shipped as a connection
+    # that took no time to open.
     s = ConnTimingStore()
     s.set_handshake(3, 5.0)
-    assert s.pop(3) == (0.0, 5.0)
+    assert s.pop(3) == (None, 5.0)
 
 
 def test_store_fifo_cap_evicts_oldest():
@@ -31,7 +34,7 @@ def test_store_fifo_cap_evicts_oldest():
     s.set_connect(2, 2.0)
     s.set_connect(3, 3.0)  # evicts 1
     assert s.pop(1) is None
-    assert s.pop(3) == (3.0, 0.0)
+    assert s.pop(3) == (3.0, None)
 
 
 def _verify_ctx() -> ssl.SSLContext:
@@ -77,8 +80,14 @@ def test_probe_sync_records_connect_and_handshake(tls_server):
         real_hs = ssl.SSLSocket.do_handshake
 
         def spy(self, *a, **k):
+            # The client's socket only. The test server runs in this process,
+            # so its side of the handshake goes through the same patched
+            # method; that slot has a handshake and no connect (the server
+            # accepted, it never connected), and whichever side finished last
+            # used to decide which slot this test read.
             try:
-                captured["fileno"] = self.fileno()
+                if not self.server_side:
+                    captured["fileno"] = self.fileno()
             except Exception:
                 pass
             return real_hs(self, *a, **k)

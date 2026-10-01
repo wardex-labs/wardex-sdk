@@ -176,12 +176,17 @@ class SSLInterceptor(ByteSeamInterceptor):
 
     def _resolve_timing(
         self, obj: Any, st: _ConnectionState
-    ) -> tuple[float | None, float | None, bool, tuple[Limitation, ...]]:
+    ) -> tuple[float | None, float | None, bool | None, tuple[Limitation, ...]]:
         """(tcp_connect_ms, tls_handshake_ms, connection_reused, limitations).
 
         An interval this seam could not measure is None, which ships unset,
         and CONNECT_TIMING_UNAVAILABLE says why. On a reused connection both
-        are 0.0: this transaction opened nothing, which is a reading."""
+        are 0.0: this transaction opened nothing, which is a reading.
+
+        `connection_reused` is False only where a record proves the seam saw
+        this connection open (a connect or handshake in the store, a
+        `_wardex_timing` stamped when the TLS object was created). With no
+        record the connection may predate `init`, so it is None too."""
         if st.timing_consumed:
             return (0.0, 0.0, True, ())
         st.timing_consumed = True
@@ -192,8 +197,15 @@ class SSLInterceptor(ByteSeamInterceptor):
             except Exception:
                 popped = None
             if popped is not None:
-                return (popped[0], popped[1], False, ())
-            return (None, None, False, (Limitation.CONNECT_TIMING_UNAVAILABLE,))
+                connect, handshake = popped
+                # A record proves the seam saw the connection open. Its connect
+                # half is missing when the socket was connected before `init`
+                # and wrapped after it: the handshake is a reading, the connect
+                # time is not.
+                if connect is None:
+                    return (None, handshake, False, (Limitation.CONNECT_TIMING_UNAVAILABLE,))
+                return (connect, handshake, False, ())
+            return (None, None, None, (Limitation.CONNECT_TIMING_UNAVAILABLE,))
         # async: SSLObject — derive total−handshake from the stamped record
         # The anyio path handles TCP connect and TLS in separate layers, so when
         # total_ms is 0 the connect time cannot be derived. It is left unset
@@ -212,6 +224,8 @@ class SSLInterceptor(ByteSeamInterceptor):
                 connect = max(0.0, rec.total_ms - rec.handshake_ms)
                 return (connect, rec.handshake_ms, False, ())
             else:
-                # anyio/httpx path: total could not be measured → connect unset + marker
+                # anyio/httpx path: total could not be measured → connect unset + marker.
+                # Reuse is still known: the record was stamped when this TLS object
+                # was created, so the seam saw the connection open.
                 return (None, rec.handshake_ms, False, (Limitation.CONNECT_TIMING_UNAVAILABLE,))
-        return (None, None, False, (Limitation.CONNECT_TIMING_UNAVAILABLE,))
+        return (None, None, None, (Limitation.CONNECT_TIMING_UNAVAILABLE,))

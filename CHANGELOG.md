@@ -105,14 +105,21 @@ All notable changes to this project are documented here. The format follows
   `gen_ai.request.stream = true`), a `TEXT` request and response modality
   nobody detected, `is_final_chunk = true` and `chunk_index = 0`, and a
   WebSocket session said 0 ms for a connect, a TLS handshake, a first byte and
-  a first token it never timed. Now `is_streaming` is `true` or `false` when
-  the SDK read the response body (whether it was a Server-Sent Events stream)
-  and unset when it did not; the five `TransportTiming` intervals and
-  `connection_reused` are unset when they were not measured — including a
-  connect time the seam marks `connect_timing_unavailable`, the TLS handshake
-  of a plaintext connection, and the first-byte, first-body-byte and transfer
-  times of an HTTP/2 stream; and the modalities are unspecified, since
-  nothing detects one yet. On the schema,
+  a first token it never timed. Now `is_streaming` is `true` when the response
+  declared `Content-Type: text/event-stream` — even when its body was in an
+  encoding the parser does not decode, or was cut by `max_body_bytes` — or its
+  body read as a Server-Sent Events stream, `false` when it declared none and
+  its body did not read as one, and unset when it declared none and its body
+  was not parsed; the five `TransportTiming` intervals are unset when they
+  were not measured — including a connect time the seam marks
+  `connect_timing_unavailable` (a socket connected before `init` and
+  TLS-wrapped after it among them), the TLS handshake of a plaintext
+  connection, and the first-byte, first-body-byte and transfer times of an
+  HTTP/2 stream;
+  `connection_reused` is `false` only on a connection the SDK saw open and is
+  unset on one it did not (opened before `init`, say, where it used to say
+  `false` on a connection that had already carried requests); and the
+  modalities are unspecified, since nothing detects one yet. On the schema,
   `is_streaming`, `connection_reused` and the five intervals gained explicit
   presence (`optional`). In Python, `TransportTiming`'s fields,
   `is_streaming`, `connection_reused` and both modalities default to `None`.

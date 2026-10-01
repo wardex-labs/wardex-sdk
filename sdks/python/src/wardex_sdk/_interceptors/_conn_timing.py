@@ -64,6 +64,10 @@ class _TimingRecord:
 class ConnTimingStore:
     """Sync-path-only handoff buffer: fileno → (connect_ms, handshake_ms).
 
+    A half nobody measured is None, not 0.0: a socket connected before
+    `init` and TLS-wrapped after it has a handshake and no connect, and a
+    0.0 there would ship as a connection that took no time to open.
+
     A slot is released when the transaction that needed it is emitted (`pop`)
     or when its socket closes (`discard`, wired by the close hook in
     `ConnTimingProbe`). The FIFO cap is the BACKSTOP for whatever neither of
@@ -75,18 +79,18 @@ class ConnTimingStore:
     """
 
     def __init__(self, cap: int | None = None) -> None:
-        self._by_fileno: dict[int, list[float]] = {}
+        self._by_fileno: dict[int, list[float | None]] = {}
         # None means "use the core default" — resolved here (rather than hardcoded)
         # so this can never silently drift from crates/wardex-limits.
         self._cap = cap if cap is not None else _wardex_native.limits_defaults()["max_connections"]
 
-    def _slot(self, fileno: int) -> list[float]:
+    def _slot(self, fileno: int) -> list[float | None]:
         slot = self._by_fileno.get(fileno)
         if slot is None:
             if len(self._by_fileno) >= self._cap:
                 # FIFO eviction: remove the first entry in dict insertion order
                 self._by_fileno.pop(next(iter(self._by_fileno)))
-            slot = [0.0, 0.0]  # [connect_ms, handshake_ms]
+            slot = [None, None]  # [connect_ms, handshake_ms]; None = not measured
             self._by_fileno[fileno] = slot
         return slot
 
@@ -96,7 +100,7 @@ class ConnTimingStore:
     def set_handshake(self, fileno: int, handshake_ms: float) -> None:
         self._slot(fileno)[1] = handshake_ms
 
-    def pop(self, fileno: int) -> tuple[float, float] | None:
+    def pop(self, fileno: int) -> tuple[float | None, float | None] | None:
         slot = self._by_fileno.pop(fileno, None)
         if slot is None:
             return None

@@ -397,7 +397,7 @@ class ByteSeamInterceptor(InterceptorInterface):
     @abstractmethod
     def _resolve_timing(
         self, obj: Any, st: _ConnectionState
-    ) -> tuple[float | None, float | None, bool, tuple[Limitation, ...]]: ...
+    ) -> tuple[float | None, float | None, bool | None, tuple[Limitation, ...]]: ...
 
     def _guard(self, where: str) -> guard:
         """The one authorized swallow, wired to this seam's debug setting.
@@ -843,7 +843,7 @@ class _PendingTxn:
     mode: CaptureMode
     connect_ms: float | None
     handshake_ms: float | None
-    reused: bool
+    reused: bool | None
     timing_markers: tuple[Limitation, ...]
     limits: Any
     debug: bool
@@ -1081,11 +1081,10 @@ def _assemble(p: _PendingTxn, *, parse: bool, extra: tuple[Limitation, ...]) -> 
                 # artifact), the volume evidence a STREAM_INCOMPLETE-class marker would need.
                 counters.bump("interceptors.seam.stream_unterminated")
             if streamed:
-                # Keyed on `streamed` rather than on the response having
-                # yielded semantics: a reassembled stream is reassembled
-                # whatever came back, and hanging these off the identity
-                # test makes a known provider's usage-less stream stop
-                # saying it was reassembled at all.
+                # Keyed on `streamed` rather than on the response having yielded semantics: a
+                # reassembled stream is reassembled whatever came back, and hanging these off the
+                # identity test makes a known provider's usage-less stream stop saying it was
+                # reassembled at all.
                 if identified:
                     draft.add_limitation(Limitation.REASSEMBLED_FROM_STREAM)
                     if sem.output_tokens is None:
@@ -1131,10 +1130,11 @@ def _assemble(p: _PendingTxn, *, parse: bool, extra: tuple[Limitation, ...]) -> 
         ttft_ms=txn.ttft_ms,
         transfer_ms=transfer,
     )
-    # A parse that ran read the body as SSE first (`looks_like_sse`), so it knows whether it
-    # streamed; where none ran (gRPC, skipped, raised) the body was not read: no claim.
+    # SSE if it declared `text/event-stream` (read or not: undecodable, cut by a cap) or a parse
+    # read it as SSE (`looks_like_sse`); no parse (gRPC, skipped, raised), no declaration: no claim.
     body_read = parse and not parse_failed and not p.is_grpc
-    streamed = bool(getattr(sem, "reassembled_from_stream", False)) if body_read else None
+    sniffed = bool(getattr(sem, "reassembled_from_stream", False)) if body_read else None
+    streamed = txn.event_stream or sniffed
     # response_size is the wire (compressed) size, while output_data is the
     # decompressed body, so lengths may differ for gzip responses (intended behavior).
     draft.set_transport(
