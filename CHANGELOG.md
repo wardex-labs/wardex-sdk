@@ -200,11 +200,13 @@ All notable changes to this project are documented here. The format follows
   a LangGraph `thread_id`: the run's own spans carried the id, its `chat`
   spans did not. Grouping a backend's spans by conversation id and summing
   tokens therefore answered zero for every conversation. Every span the byte
-  seam builds — HTTP/1, HTTP/2, WebSocket — now carries the conversation its
-  request was issued in, read at the moment the request went out (never when
-  the response came back, by which time your code may be in the next
-  conversation), and a call made outside every conversation still carries
-  none.
+  seam builds — HTTP/1, HTTP/2 — now carries the conversation its request was
+  issued in, read at the moment the request went out (never when the response
+  came back, by which time your code may be in the next conversation), and a
+  call made outside every conversation still carries none. A WebSocket
+  session is one span for every call on the socket, so it carries a
+  conversation only when its handshake and every message on it were issued in
+  that one; a pooled socket reused across conversations names none of them.
 - **A Responses request's own `conversation` is its conversation id.** With
   `Runner.run(conversation_id=…)`, or any `POST /v1/responses` that sets
   `conversation` (the id, or `{"id": …}`), the request names the provider-held
@@ -213,7 +215,10 @@ All notable changes to this project are documented here. The format follows
   your `wardex.conversation(...)`, or a run that states one — that one wins,
   the same rule that keeps your id over a framework's `group_id`, and the
   request's differing id rides along as `wardex.openai.conversation_id`,
-  counted under `semantics.request_conversation_shadowed`.
+  counted under `semantics.request_conversation_shadowed`. Under the OpenAI
+  Agents adapter this reaches the `chat` spans only: the framework hands
+  `conversation_id` to the model call and never to its trace, so the run's
+  own spans carry it only when `group_id` names it too.
 - **Concurrent `wardex.conversation()` blocks no longer lend each other their
   ids.** The block wrote its id onto a scope object that every task of an
   `asyncio.gather` — and every thread `bind_context` carried — shares, so work
