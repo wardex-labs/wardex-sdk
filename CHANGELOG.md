@@ -243,6 +243,12 @@ All notable changes to this project are documented here. The format follows
   running beside an open block outside any conversation picked up that
   block's id, and once both blocks of a pair had closed, code after them still
   carried one of their ids. Each block now installs its id on its own copy.
+  That also means a block scopes the context it was entered in, as any context
+  variable does. One entered on a worker thread with a copy of your context —
+  FastAPI runs a plain `def` generator dependency's setup and teardown that
+  way — used to reach the endpoint only through that same shared write, so a
+  concurrent request with no conversation of its own carried it too. It now
+  reaches only that thread's work: open the block in the endpoint.
 - **Ctrl-C reaches your program while a batch is being exported.** The OTLP
   exporter skips a span it cannot marshal instead of dropping the batch, and
   it treated a `KeyboardInterrupt` or `SystemExit` raised by your code during

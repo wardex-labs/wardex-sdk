@@ -360,6 +360,71 @@ def test_concurrent_conversations_on_a_thread_pool_keep_their_own_ids(llm):
     _assert_each_carries_its_own(spans, inside=9, outside=5)
 
 
+def test_a_block_entered_on_a_worker_thread_lends_its_id_to_no_concurrent_request(llm):
+    """FastAPI's plain-`def` generator dependency: its setup and its teardown
+    each run on a worker thread, on a COPY of the request's context
+    (`fastapi.concurrency.contextmanager_in_threadpool`), and the endpoint runs
+    in the request's task in between. A block entered there reached the
+    endpoint only by writing its id onto the scope object every request
+    shares, so a concurrent request with no conversation carried it too.
+
+    The block now scopes the context it was entered in, as any context
+    variable set on a copy does: the work on its own thread carries its id, and
+    no other request's work carries it. (The endpoint's own work does not
+    either; a block meant for it is opened in the endpoint.)"""
+    import anyio.to_thread
+
+    host, port = llm
+    base = f"http://{host}:{port}"
+
+    def dependency(cid: str) -> Iterator[None]:
+        with wardex.conversation("c", id=cid):
+            _post(host, port, f"{cid}-dep")  # on the worker thread, inside the block
+            yield
+
+    @contextlib.asynccontextmanager
+    async def in_threadpool(cm: Any) -> Any:
+        yield await anyio.to_thread.run_sync(cm.__enter__)
+        await anyio.to_thread.run_sync(cm.__exit__, None, None, None)
+
+    async def request(client: httpx.AsyncClient, cid: str | None, delay: float) -> None:
+        async def endpoint() -> None:
+            await asyncio.sleep(delay)  # the requests overlap, as on a server
+            with wardex.span(f"endpoint-{cid}"):
+                await client.post(f"{base}/v1/responses", content=_body(f"endpoint{cid}-0"))
+
+        if cid is None:
+            await endpoint()
+            return
+        async with in_threadpool(contextlib.contextmanager(dependency)(cid)):
+            await endpoint()
+
+    async def main() -> None:
+        async with httpx.AsyncClient() as client:
+            await asyncio.gather(
+                request(client, "A", 0.2), request(client, "B", 0.05), request(client, None, 0.1)
+            )
+
+    spans, _ = _shipped(lambda: asyncio.run(main()))
+    got = {_tag(s): _conv(s) for s in _chats(spans)}
+    got.update({s.name: _conv(s) for s in spans if s.name.startswith("endpoint-")})
+    assert set(got) == {
+        "A-dep",
+        "B-dep",
+        "endpointA-0",
+        "endpointB-0",
+        "endpointNone-0",
+        "endpoint-A",
+        "endpoint-B",
+        "endpoint-None",
+    }
+    assert (got["A-dep"], got["B-dep"]) == ("A", "B")
+    assert (got["endpoint-None"], got["endpointNone-0"]) == (None, None)
+    for cid in ("A", "B"):
+        assert got[f"endpoint-{cid}"] in (cid, None)
+        assert got[f"endpoint{cid}-0"] in (cid, None)
+
+
 def test_a_reused_connection_latches_each_request_where_it_was_issued(llm):
     """One keep-alive connection, three requests: in conversation A, in B, in
     none. And the response half read somewhere else entirely — the id is the
