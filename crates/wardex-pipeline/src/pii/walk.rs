@@ -3,6 +3,15 @@
 //! Every message is destructured WITHOUT `..` so that adding a proto field
 //! breaks this build until someone decides whether the new field is masked
 //! (design §4.3). Non-text fields are bound to `_`.
+//!
+//! A text field the SDK fills by itself is bound to `_` too, under an
+//! `SDK-GENERATED` note. Masking is for what the host and its traffic put on
+//! a span; an id the SDK minted is neither, and a rule that fires on it is
+//! wrong twice — it rewrites the id, and it writes into the span's record a
+//! masking of data that was never there. `str(id(socket))` is the case that
+//! happened: fifteen digits on 64-bit Linux, and about one in ten passes the
+//! card checksum. `tests/sdk_generated_fields.rs` holds the list and proves
+//! both sides of it.
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
@@ -63,11 +72,14 @@ pub fn mask_envelope(engine: &PiiEngine, env: &mut pb::Envelope) {
     }
     for item in items {
         let pb::EnvelopeItem { header, payload } = item;
-        if let Some(pb::EnvelopeItemHeader { r#type, length: _ }) = header {
-            // Item-level metadata, masked at the same tier as the envelope
-            // header — it does not feed any per-span redacted flag.
-            mask_string(&mut Masker::new(engine), r#type);
-        }
+        // Still destructured, so a field added here has to be classified.
+        if let Some(pb::EnvelopeItemHeader {
+            // SDK-GENERATED: the marshaller's own item tag, "span" or
+            // "state_snapshot".
+            r#type: _,
+            length: _,
+        }) = header
+        {}
         match payload {
             Some(pb::envelope_item::Payload::Span(span)) => {
                 let masked = catch_unwind(AssertUnwindSafe(|| mask_span(engine, span)));
@@ -209,7 +221,9 @@ fn mask_any(m: &mut Masker<'_>, v: &mut pb::AnyValue) -> bool {
 
 fn mask_header(m: &mut Masker<'_>, h: &mut pb::EnvelopeHeader) {
     let pb::EnvelopeHeader {
-        event_id,
+        // SDK-GENERATED: `str(uuid.uuid4())`, minted per batch. A UUID whose
+        // first sixteen hex digits are all decimal can pass the card checksum.
+        event_id: _,
         sdk,
         sent_at_unix_nano: _,
         session_status: _,
@@ -220,10 +234,9 @@ fn mask_header(m: &mut Masker<'_>, h: &mut pb::EnvelopeHeader) {
         // detach a stored batch from its project.
         project_id: _,
     } = h;
-    mask_string(m, event_id);
     if let Some(r) = resource {
-        // The app's identity strings are host-supplied free text, so they get
-        // the same treatment as SdkInfo's strings below.
+        // The app's identity strings are host-supplied free text, so they are
+        // masked — unlike most of SdkInfo below, which the SDK writes itself.
         let pb::ResourceInfo {
             service_name,
             release,
@@ -239,28 +252,28 @@ fn mask_header(m: &mut Masker<'_>, h: &mut pb::EnvelopeHeader) {
     }
     if let Some(s) = sdk {
         let pb::SdkInfo {
-            name,
-            version,
-            python_version,
-            os,
-            arch,
+            // SDK-GENERATED: the SDK's name and version, the semconv release
+            // it was reconciled against, and the interpreter's own
+            // `platform.python_version()`, `sys.platform` and
+            // `platform.machine()` — read by the SDK, never host free text.
+            name: _,
+            version: _,
+            python_version: _,
+            os: _,
+            arch: _,
+            otel_semconv_version: _,
+            // No producer fills these three yet. Until one does and says
+            // what it writes, they are masked like host text.
             adapters,
             interceptors,
-            otel_semconv_version,
             shell,
         } = s;
-        mask_string(m, name);
-        mask_string(m, version);
-        mask_string(m, python_version);
-        mask_string(m, os);
-        mask_string(m, arch);
         for a in adapters {
             mask_string(m, a);
         }
         for i in interceptors {
             mask_string(m, i);
         }
-        mask_string(m, otel_semconv_version);
         mask_string(m, shell);
     }
 }
@@ -389,7 +402,9 @@ fn mask_span(engine: &PiiEngine, span: &mut pb::Span) {
 
 fn mask_transport(m: &mut Masker<'_>, t: &mut pb::TransportAttributes) -> bool {
     let pb::TransportAttributes {
-        connection_id,
+        // SDK-GENERATED: `str(id(socket))`, the process object id the SDK
+        // keys a connection by — the field this whole list exists for.
+        connection_id: _,
         protocol: _,
         direction: _,
         timing,
@@ -411,7 +426,6 @@ fn mask_transport(m: &mut Masker<'_>, t: &mut pb::TransportAttributes) -> bool {
         connection_reused: _,
     } = t;
     let mut hit = false;
-    hit |= mask_string(m, connection_id);
     // All numeric today; the exhaustive destructure is the §4.3 compile-time
     // tripwire for future text fields.
     if let Some(pb::TransportTiming {
@@ -515,6 +529,17 @@ fn mask_snapshot(m: &mut Masker<'_>, snap: &mut pb::StateSnapshot) {
 
 // --- OTLP masking (design §4.2, OTLP path) ---
 
+/// SDK-GENERATED resource attributes: the mapping writes them from the
+/// producer the binding passes and from `SdkInfo.version`. A resource has no
+/// host-supplied attributes beside them under these keys — the mapping builds
+/// the whole resource, and the host's part of it is `service.*` and
+/// `deployment.*`.
+const SDK_RESOURCE_KEYS: [&str; 3] = [
+    "telemetry.sdk.name",
+    "telemetry.sdk.version",
+    "telemetry.sdk.language",
+];
+
 /// Mask an OTLP export request (design §4.2, OTLP path). A span that panics
 /// is scrubbed whole; a span with replacements gains `wardex.redacted=true`
 /// (OTLP spans have no capture_integrity — this is the OTLP equivalent).
@@ -533,7 +558,13 @@ pub fn mask_otlp(engine: &PiiEngine, req: &mut otlp_pb::trace_service::ExportTra
             dropped_attributes_count: _,
         }) = resource
         {
-            mask_otlp_kvs(&mut Masker::new(engine), attributes);
+            let m = &mut Masker::new(engine);
+            for kv in attributes
+                .iter_mut()
+                .filter(|kv| !SDK_RESOURCE_KEYS.contains(&kv.key.as_str()))
+            {
+                mask_otlp_kvs(m, std::slice::from_mut(kv));
+            }
         }
         mask_string(&mut Masker::new(engine), schema_url);
         for ss in scope_spans {
@@ -543,16 +574,15 @@ pub fn mask_otlp(engine: &PiiEngine, req: &mut otlp_pb::trace_service::ExportTra
                 schema_url,
             } = ss;
             if let Some(otlp_pb::common::InstrumentationScope {
-                name,
-                version,
+                // SDK-GENERATED: the producer's scope name and the SDK's
+                // version, which the mapping writes and nothing else does.
+                name: _,
+                version: _,
                 attributes,
                 dropped_attributes_count: _,
             }) = scope
             {
-                let m = &mut Masker::new(engine);
-                mask_string(m, name);
-                mask_string(m, version);
-                mask_otlp_kvs(m, attributes);
+                mask_otlp_kvs(&mut Masker::new(engine), attributes);
             }
             mask_string(&mut Masker::new(engine), schema_url);
             for span in spans {
@@ -900,9 +930,11 @@ mod tests {
         assert_eq!(span.status.as_ref().unwrap().message, "failed for [EMAIL]");
         let url = &span.transport.as_ref().unwrap().http.as_ref().unwrap().url;
         assert_eq!(url, "https://api.x.com?key=[SECRET]");
+        // The item tag is the marshaller's own, so it ships as written even
+        // when it holds an address — see `tests/sdk_generated_fields.rs`.
         assert_eq!(
             env.items[0].header.as_ref().unwrap().r#type,
-            "span for [EMAIL]"
+            "span for john.doe@acme.com"
         );
     }
 
@@ -914,6 +946,35 @@ mod tests {
             env.header.as_ref().unwrap().project_id,
             "sk-live-aaaaaaaaaaaaaaaa1234"
         );
+    }
+
+    #[test]
+    fn a_connection_id_that_passes_the_card_checksum_is_left_alone() {
+        // `str(id(socket))` on 64-bit Linux: fifteen digits, and about one in
+        // ten passes the Luhn checksum. This one does, so the card rule would
+        // replace it anywhere it judged it.
+        let cid = "140234567890138";
+        assert_eq!(
+            engine().mask_text(cid).as_deref(),
+            Some("****-****-****-0138")
+        );
+        let mut env = env_with(pb::Span {
+            name: "HTTP GET /v1/models".into(),
+            transport: Some(pb::TransportAttributes {
+                connection_id: cid.into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        mask_envelope(&engine(), &mut env);
+        let span = span_of(&env);
+        assert_eq!(span.transport.as_ref().unwrap().connection_id, cid);
+        let rules = span
+            .capture_integrity
+            .as_ref()
+            .map(|ci| ci.redaction_rules.clone())
+            .unwrap_or_default();
+        assert!(rules.is_empty(), "redaction_rules = {rules:?}");
     }
 
     #[test]
