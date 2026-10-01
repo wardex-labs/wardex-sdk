@@ -85,6 +85,7 @@ from collections.abc import Callable
 from typing import Any
 
 from .._assembly import PatchSet, guard
+from ._h2_issuer import _at_fork_reinit as _h2_at_fork_reinit
 from ._h2_issuer import patch_h2
 from ._peer import stamp_peer
 
@@ -625,11 +626,13 @@ def _at_fork_reinit() -> None:
     `CloseRegistry` is deliberately unlocked (see its docstring), but the
     probe's `PatchSet` is not, and the child's teardown reaches its
     `restore_all()` through `uninstall_shared_close_hook()` — so its lock is
-    replaced here (P/Q/R row Q), never acquired. Reached by
-    `Runtime.after_in_child` through `sys.modules`.
+    replaced here (P/Q/R row Q), never acquired. The `h2` reads the probe
+    patched keep tables of the parent's connections too, and they go here.
+    Reached by `Runtime.after_in_child` through `sys.modules`.
     """
     _registry.clear()
     _probe._patches._at_fork_reinit()
+    _h2_at_fork_reinit()
 
 
 def install_shared_close_hook() -> None:

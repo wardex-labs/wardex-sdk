@@ -14,25 +14,41 @@ and the per-conversation token sums came out as zero and double.
 The one place the issuer is still the caller is the state machine's own
 `send_headers`, where the stream is opened: httpcore, urllib3's HTTP/2 and a
 hand-driven `h2` all open a stream from the call that issues the request. So the
-issuer is read THERE and handed to the tracker of the connection those frames
-are written to. Linking
-the two is the part that has to be proven rather than assumed, and it is proven
-once per connection, by object identity:
+issuer is read THERE, into a table that belongs to that state machine, and the
+tracker of the connection those frames are written to reads it. Linking the two
+is the part that has to be proven rather than assumed, and it is proven once per
+connection, by object identity:
 
 * `data_to_send` returns the bytes the client is about to write. Until its state
-  machine is linked, those bytes are OFFERED on the calling thread.
-* The next h2 tracker write on that thread takes the offer, and links only if
-  the bytes it was handed ARE that object (`is`, not `==`): the client wrote
-  this state machine's output to this connection. httpcore, urllib3 and a
-  hand-driven `h2` all write the chunk in the call right after they take it, so
-  an offer that does not match is a write that was not that chunk, and it is
-  dropped.
+  machine is linked, the latest such chunk is OFFERED: kept on the state
+  machine's table and indexed by its object id on the calling thread.
+* An h2 tracker that is not linked yet looks up every chunk it is handed in that
+  index, and links only if the chunk IS the offered object (`is`, not `==`): the
+  client wrote this state machine's output to this connection.
 
-A stream whose issuer was not read here names NO conversation: the state
-machine was never linked (a client on another HTTP/2 library, a chunk copied
-before it was written, capture attached after the stream was opened), and the
-writer's scope is a guess on a shared connection. A conversation is never
-guessed. Its parent is latched as it was before this module existed.
+The index holds every pending offer on the thread, not just the last one,
+because the write is not always the next thing the thread does. anyio's
+plaintext `SocketStream.send` yields to the event loop before it writes, so with
+several HTTP/2 connections opening under one `asyncio.gather` every client's
+preface is offered before any of them is written. With one slot, each offer
+replaced the last, the first write found another connection's chunk, and the
+connections it did not link named no conversation for their first calls. An
+entry is only ever a pointer: the proof is still that the written chunk is the
+very object its state machine handed out.
+
+The issuer is recorded whether or not the state machine is linked yet, and
+BEFORE the original `send_headers` queues the frame, so no thread can flush the
+frame first. A stream opened before the link (capture attached mid-connection,
+or a first chunk that was not written as handed out) is therefore still proven
+by the link a later chunk makes, as long as its request half ends after that.
+
+A stream whose issuer was not read here is UNPROVEN, and names no conversation:
+the state machine was never linked (a client on another HTTP/2 library, every
+chunk copied before it was written) or the stream was opened before capture,
+and the writer's scope is a guess on a shared connection. A conversation is
+never guessed, and a request body's own id does not stand in for the unknown
+one either (`_semantics.apply_request_conversation`): the host's, had it been
+read, would have won. Its parent is latched as it was before this module existed.
 """
 
 from __future__ import annotations
@@ -51,67 +67,84 @@ from .._types import ConversationContext, SpanContext
 #: whether that span's unit had already closed, and its conversation.
 Issued = tuple[SpanContext | None, bool, ConversationContext | None]
 
-#: The largest chunk offered for linking. An offer holds its bytes until the
-#: thread's next h2 tracker write, and linking needs one small chunk only: the
-#: connection preface a client writes first, or any later control frame. The
-#: floor is a frame header, which also keeps out the empty and one-byte `bytes`
-#: objects CPython shares between callers, for which `is` would prove nothing.
-_OFFER_MIN, _OFFER_MAX = 9, 1 << 16
-_offer = threading.local()
-#: State machine -> weak reference to its linked connection's `StreamIssuers`.
-#: Weak at both ends: the link keeps neither the host's connection nor the
-#: tracker alive, and a dead tracker (its connection retired, or reset by a
-#: fork) reads as "not linked", so the next offer links its successor.
-_linked: weakref.WeakKeyDictionary[Any, weakref.ref[StreamIssuers]] = weakref.WeakKeyDictionary()
+#: The sizes of chunk offered for linking. An offer holds its bytes until the
+#: state machine is linked or offers again, so a connection no tracker ever
+#: proves (one wardex does not capture) keeps its latest small chunk for as long
+#: as it lives. Linking needs one chunk only, and a small one comes early: the
+#: connection preface a client writes first, the HEADERS httpcore writes apart
+#: from the body, any later control frame. The floor is a frame header, which
+#: also keeps out the empty and one-byte `bytes` objects CPython shares between
+#: callers, for which `is` would prove nothing.
+_OFFER_MIN, _OFFER_MAX = 9, 1 << 12
+#: Streams recorded before a tracker proves the link (and so before it says its
+#: own `max_streams`): the few opened between capture attaching mid-connection
+#: and the first chunk written after it. Small, because a connection that wardex
+#: never captures records every stream it opens and no tracker ever takes one.
+_UNLINKED_CAP = 64
+#: How many pending offers one thread indexes: one per connection whose chunk
+#: has been handed out and not yet written. Oldest first out. An entry is an int
+#: and a weak reference; losing one costs that connection the link on that
+#: chunk, and the next chunk it offers tries again.
+_INDEX_CAP = 1024
+#: Per thread, `id(chunk) -> weak reference to the StreamIssuers that offered
+#: it`. Per thread so the index never needs a lock: the offer and the write of
+#: one chunk happen on one thread in every client this links.
+_index = threading.local()
+#: State machine -> its issuers. Weak at the key: the table dies with the host's
+#: connection, and wardex keeps no connection alive.
+_issuers_of: weakref.WeakKeyDictionary[Any, StreamIssuers] = weakref.WeakKeyDictionary()
 
 #: Importing `h2` once it has been FOUND, as `_close_hook` imports anyio: its
 #: absence is an answer, and present but unimportable is worth a count.
 _IMPORT_H2 = guard("interceptors.h2_issuer.import")
-#: The two wrappers run inside the host's HTTP/2 client, after the original has
-#: returned. A raise here would fail a request over a span attribute.
+#: The two wrappers run inside the host's HTTP/2 client. A raise here would fail
+#: a request over a span attribute.
 _RECORD = guard("interceptors.h2_issuer.record")
 _OFFER = guard("interceptors.h2_issuer.offer")
 
 
 class StreamIssuers:
-    """One h2 connection's proven issuers, by stream id, until each stream opens.
+    """One h2 state machine's issuers, by stream id, until each stream opens in
+    a tracker; and the chunk it offers until a tracker proves the link.
 
-    Bounded like the tracker's latch beside it, lowest stream id first: an
-    entry whose stream never ends its request half (reset before END_STREAM)
-    would otherwise stay for the life of the connection. Losing one costs that
-    stream its proof, so it names no conversation, never the wrong one.
+    Bounded like the tracker's latch, lowest stream id first: an entry whose
+    stream never ends its request half (reset before END_STREAM, or written
+    before the link was proven) would otherwise stay for the life of the
+    connection. Losing one costs that stream its proof, so it names no
+    conversation, never the wrong one.
     """
 
-    __slots__ = ("__weakref__", "_by_stream", "_cap", "linked")
+    __slots__ = ("__weakref__", "_by_stream", "_cap", "_link", "_offered")
 
     def __init__(self, cap: int) -> None:
         self._by_stream: dict[int, Issued] = {}
         self._cap = cap
-        self.linked = False
+        #: The latest chunk `data_to_send` returned while unlinked.
+        self._offered: bytes | None = None
+        #: The tracker's end of the link, once a chunk proved it. Weak: a tracker
+        #: that died (its connection retired, or reset by a fork) reads as
+        #: unlinked, so the next chunk this state machine offers links its successor.
+        self._link: weakref.ref[IssuerLink] | None = None
 
-    def claim(self, data: bytes) -> None:
-        """Link to the state machine whose offered chunk `data` is, if it is one."""
-        if self.linked:
-            return
-        offer = getattr(_offer, "pending", None)
-        if offer is None:
-            return
-        _offer.pending = None
-        conn = offer[0]()
-        if conn is not None and offer[1] is data:
-            _linked[conn] = weakref.ref(self)
-            self.linked = True
+    @property
+    def linked(self) -> bool:
+        return self._link is not None and self._link() is not None
 
-    def record(self, stream_id: int) -> None:
+    def record(self, stream_id: int) -> bool:
         """The CALLER's scope, as the issuer of `stream_id`. Only the first call
-        for a stream counts: a later `send_headers` on it sends trailers."""
+        for a stream counts: a later `send_headers` on it sends trailers. True if
+        this call recorded it."""
         if stream_id in self._by_stream:
-            return
+            return False
         scope = _hub.get_current_scope()  # ONE read: parent and conversation are one fact
         parent = scope.active_span_context
         self._by_stream[stream_id] = (parent, parent_is_closed_unit(parent), scope.conversation)
         while len(self._by_stream) > self._cap:
             self._by_stream.pop(min(self._by_stream))
+        return True
+
+    def forget(self, stream_id: int) -> None:
+        self._by_stream.pop(stream_id, None)
 
     def take(self, stream_id: int) -> Issued | None:
         return self._by_stream.pop(stream_id, None)
@@ -119,21 +152,104 @@ class StreamIssuers:
     def clear(self) -> None:
         self._by_stream.clear()
 
+    def offer(self, chunk: bytes) -> None:
+        self._offered = chunk
+        index: dict[int, weakref.ref[StreamIssuers]] | None = getattr(_index, "by_id", None)
+        if index is None:
+            index = _index.by_id = {}
+        index.pop(id(chunk), None)  # re-inserted at the young end
+        index[id(chunk)] = weakref.ref(self)
+        while len(index) > _INDEX_CAP:
+            del index[next(iter(index))]
 
-def _linked_issuers(conn: Any) -> StreamIssuers | None:
-    ref = _linked.get(conn)
-    return ref() if ref is not None else None
+
+def claim(data: bytes, link: IssuerLink, cap: int) -> StreamIssuers | None:
+    """The issuers of the state machine whose offered chunk `data` is, linked to
+    `link`; or None, when `data` is no pending offer on this thread."""
+    index = getattr(_index, "by_id", None)
+    if not index:
+        return None
+    ref = index.pop(id(data), None)
+    issuers = ref() if ref is not None else None
+    # The id is only where to look. The proof is that the offer IS this object:
+    # an entry left by an older chunk, whose id a new object now reuses, fails here.
+    if issuers is None or issuers._offered is not data:
+        return None
+    issuers._offered = None
+    issuers._link = weakref.ref(link)
+    issuers._cap = cap  # the tracker's own `max_streams` from here on
+    return issuers
+
+
+class IssuerLink:
+    """An h2 tracker's end of the link: the issuers of the state machine its
+    connection's bytes are proven to come from, once a chunk proves it."""
+
+    __slots__ = ("__weakref__", "_cap", "_issuers")
+
+    def __init__(self, cap: int) -> None:
+        self._cap = cap
+        self._issuers: StreamIssuers | None = None
+
+    def see(self, data: bytes) -> None:
+        """Every request chunk the tracker is handed, until one proves the link."""
+        if self._issuers is None:
+            self._issuers = claim(data, self, self._cap)
+
+    def latch(
+        self, stream_id: int, parent: SpanContext | None, parent_closed: bool
+    ) -> tuple[SpanContext | None, bool, ConversationContext | None, bool]:
+        """`(parent, parent_closed, conversation, proven)` for a stream that just
+        opened. Its issuer's, where one was proven. Otherwise the WRITER's
+        parent, which on a shared connection may be any task's, and so never
+        anyone's conversation: none is named, and `proven` says it is unknown."""
+        issued = self._issuers.take(stream_id) if self._issuers is not None else None
+        return (*issued, True) if issued is not None else (parent, parent_closed, None, False)
+
+    def clear(self) -> None:
+        if self._issuers is not None:
+            self._issuers.clear()
+
+
+def _issuers(conn: Any) -> StreamIssuers:
+    found = _issuers_of.get(conn)
+    if found is None:
+        found = _issuers_of.setdefault(conn, StreamIssuers(_UNLINKED_CAP))
+    return found
+
+
+def _at_fork_reinit() -> None:
+    """Fork-child reset: forget the parent's state machines and offers.
+
+    Each table pairs a parent connection with the scopes of the parent's tasks,
+    and each offer points at one. The child's trackers start unlinked (the
+    seam's own reset drops them), so a state machine the child does use offers
+    again and is proven again, from the child's own writes. The thread-local
+    index is reset for the forking thread, the only thread the child has.
+    Reached by `_close_hook._at_fork_reinit`, whose probe owns the patches.
+    """
+    _issuers_of.clear()
+    _index.by_id = {}
 
 
 def _mk_send_headers(orig: Any):  # noqa: ANN202
     def send_headers(this: Any, stream_id: Any, *args: Any, **kwargs: Any) -> Any:
-        ret = orig(this, stream_id, *args, **kwargs)
-        # After the original, and only if it returned: a refused stream was never opened.
+        recorded: StreamIssuers | None = None
+        # BEFORE the original: once it returns, the frame is queued and another
+        # thread holding the write lock may flush it before a later record lands.
         with _RECORD:
-            issuers = _linked_issuers(this)
-            if issuers is not None:
-                issuers.record(stream_id)
-        return ret
+            if this.config.client_side:
+                issuers = _issuers(this)
+                if issuers.record(stream_id):
+                    recorded = issuers
+        try:
+            return orig(this, stream_id, *args, **kwargs)
+        except BaseException:
+            # A refused stream was never opened, and its id may be retried.
+            if recorded is not None:
+                with _RECORD:
+                    recorded.forget(stream_id)
+            raise
 
     return send_headers
 
@@ -146,9 +262,10 @@ def _mk_data_to_send(orig: Any):  # noqa: ANN202
                 isinstance(out, bytes)
                 and _OFFER_MIN <= len(out) <= _OFFER_MAX
                 and this.config.client_side
-                and _linked_issuers(this) is None
             ):
-                _offer.pending = (weakref.ref(this), out)
+                issuers = _issuers(this)
+                if not issuers.linked:
+                    issuers.offer(out)
         return out
 
     return data_to_send

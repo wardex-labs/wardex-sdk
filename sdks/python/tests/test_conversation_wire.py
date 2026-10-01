@@ -19,7 +19,10 @@ The rules these tests hold:
 * A Responses request may name its own conversation in its body. With nothing
   ambient that id is the conversation; inside a conversation the ambient one
   wins (the host's word, as over a framework's `group_id`), and the body's id
-  rides along under its own attribute, counted.
+  rides along under its own attribute, counted. Where wardex could not read the
+  conversation the request was issued in (an unproven HTTP/2 stream, a latch
+  refused at the edge), the body's id does not stand in for it: it rides along
+  the same way, counted apart.
 """
 
 from __future__ import annotations
@@ -477,18 +480,24 @@ def h2_reads() -> Iterator[Any]:
     assert h2.connection.H2Connection.send_headers is real, "the probe left its read behind"
 
 
+def _copy(chunk: bytes) -> bytes:
+    """Equal bytes in a different object: what a client that copies its chunks writes."""
+    return bytes(bytearray(chunk))
+
+
 def _flushed_by_another_task(itc: Any, sock: Any, conn: Any, *, link: bool) -> list[Any]:
     """httpcore's shape without the network: the tasks issuing in A and in B
     queue their streams' frames on one connection, and a THIRD task, holding
-    the write lock in conversation W, writes every frame queued."""
+    the write lock in conversation W, writes every frame queued. With
+    `link=False` every chunk is written as a copy, so none proves the link."""
+    write = (lambda chunk: chunk) if link else _copy
     conn.initiate_connection()
-    preface = conn.data_to_send()
-    itc._on_request_bytes(sock, preface if link else bytes(bytearray(preface)))
+    itc._on_request_bytes(sock, write(conn.data_to_send()))
     for sid, cid in ((1, "A"), (3, "B")):
         with _issued_in(cid):
             conn.send_headers(sid, _H2_REQUEST, end_stream=True)
     with _issued_in("W"):
-        itc._on_request_bytes(sock, conn.data_to_send())
+        itc._on_request_bytes(sock, write(conn.data_to_send()))
     server_enc = Encoder()
     itc._on_response_bytes(sock, _h2_answer(server_enc, 3) + _h2_answer(server_enc, 1))
     return itc._client.spans
@@ -509,7 +518,7 @@ def test_an_h2_stream_carries_the_conversation_of_the_task_that_opened_it(
 def test_an_h2_stream_names_no_conversation_when_its_connection_is_not_proven(
     fake_ssl_socket, bare_ssl_interceptor, h2_reads
 ):
-    """The same streams, but the preface was written as a COPY: equal bytes are
+    """The same streams, but every chunk was written as a COPY: equal bytes are
     not proof that this connection carries that state machine's output, so
     nothing links, and neither the openers' ids nor the writer's W is named."""
     itc = bare_ssl_interceptor
@@ -518,10 +527,63 @@ def test_an_h2_stream_names_no_conversation_when_its_connection_is_not_proven(
     assert [_conv(s) for s in spans] == [None, None]
 
 
-@pytest.fixture
-def h2_llm() -> Iterator[tuple[str, Any]]:
-    """A loopback Responses API over TLS that speaks only HTTP/2. A call
-    tagged `hN-...` is billed `10 * (N + 1)` input tokens."""
+def test_a_stream_opened_before_its_connection_was_proven_is_proven_by_the_chunk_that_links_it(
+    fake_ssl_socket, bare_ssl_interceptor, h2_reads
+):
+    """The preface was written as a copy, so the streams opened in A and B are
+    opened on a connection nothing has proven yet. The chunk that carries them
+    is written as handed out, which proves the link, and the openers read in
+    `send_headers` before it still count: a link is about the connection, not
+    about the streams opened after it."""
+    itc = bare_ssl_interceptor
+    itc._client.config.capture_mode = CaptureMode.ALL
+    sock, conn = fake_ssl_socket(alpn="h2"), h2_reads()
+    conn.initiate_connection()
+    itc._on_request_bytes(sock, _copy(conn.data_to_send()))
+    for sid, cid in ((1, "A"), (3, "B")):
+        with _issued_in(cid):
+            conn.send_headers(sid, _H2_REQUEST, end_stream=True)
+    with _issued_in("W"):
+        itc._on_request_bytes(sock, conn.data_to_send())
+    server_enc = Encoder()
+    itc._on_response_bytes(sock, _h2_answer(server_enc, 3) + _h2_answer(server_enc, 1))
+    assert [_conv(s) for s in itc._client.spans] == ["B", "A"]
+
+
+def test_connections_whose_chunks_are_written_out_of_order_each_prove_their_own(
+    fake_ssl_socket, bare_ssl_interceptor, h2_reads
+):
+    """anyio's plaintext `SocketStream.send` yields to the event loop BEFORE it
+    writes, so with several connections opening under one `asyncio.gather`
+    every client hands out its preface before any is written, and they are
+    written in whatever order the loop resumes them. One pending offer per
+    thread meant the last preface handed out was the only one that could link:
+    the first write found another connection's chunk and dropped it, and the
+    connection it should have proven named no conversation for its first calls.
+    Every connection is proven by its own chunk, in any order."""
+    itc = bare_ssl_interceptor
+    itc._client.config.capture_mode = CaptureMode.ALL
+    conns = {cid: (fake_ssl_socket(alpn="h2"), h2_reads()) for cid in ("A", "B", "C")}
+    prefaces = {}
+    for cid, (_sock, conn) in conns.items():
+        conn.initiate_connection()
+        prefaces[cid] = conn.data_to_send()
+    for cid in ("A", "C", "B"):  # neither the order handed out nor its reverse
+        itc._on_request_bytes(conns[cid][0], prefaces[cid])
+    for cid, (sock, conn) in conns.items():
+        with _issued_in(cid):
+            conn.send_headers(1, _H2_REQUEST, end_stream=True)
+        with _issued_in("W"):
+            itc._on_request_bytes(sock, conn.data_to_send())
+        itc._on_response_bytes(sock, _h2_answer(Encoder(), 1))
+    assert [_conv(s) for s in itc._client.spans] == ["A", "B", "C"]
+
+
+@contextlib.contextmanager
+def _h2_serving(*, tls: bool) -> Iterator[tuple[str, Any]]:
+    """A loopback Responses API that speaks only HTTP/2: over TLS, or as h2c
+    (plaintext, prior knowledge). A call tagged `hN-...` is billed
+    `10 * (N + 1)` input tokens. Yields the base URL and the accepted sockets."""
     import socket
     import ssl
 
@@ -553,9 +615,11 @@ def h2_llm() -> Iterator[tuple[str, Any]]:
                     conn.send_data(ev.stream_id, body, end_stream=True)
             sock.sendall(conn.data_to_send())
 
-    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    ctx.load_cert_chain(certfile=str(CERT), keyfile=str(KEY))
-    ctx.set_alpn_protocols(["h2"])
+    ctx = None
+    if tls:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(certfile=str(CERT), keyfile=str(KEY))
+        ctx.set_alpn_protocols(["h2"])
     listener = socket.create_server(("127.0.0.1", 0))
     listener.settimeout(0.2)
     stop = threading.Event()
@@ -567,15 +631,28 @@ def h2_llm() -> Iterator[tuple[str, Any]]:
             except (TimeoutError, OSError):
                 continue
             accepted.append(raw)
-            tls = ctx.wrap_socket(raw, server_side=True)
-            threading.Thread(target=handle, args=(tls,), daemon=True).start()
+            sock = ctx.wrap_socket(raw, server_side=True) if ctx is not None else raw
+            threading.Thread(target=handle, args=(sock,), daemon=True).start()
 
     threading.Thread(target=serve, daemon=True).start()
+    scheme = "https" if tls else "http"
     try:
-        yield f"https://127.0.0.1:{listener.getsockname()[1]}", accepted
+        yield f"{scheme}://127.0.0.1:{listener.getsockname()[1]}", accepted
     finally:
         stop.set()
         listener.close()
+
+
+@pytest.fixture
+def h2_llm() -> Iterator[tuple[str, Any]]:
+    with _h2_serving(tls=True) as served:
+        yield served
+
+
+@pytest.fixture
+def h2c_llm() -> Iterator[tuple[str, Any]]:
+    with _h2_serving(tls=False) as served:
+        yield served
 
 
 def _assert_one_h2_connection_kept_each_call_to_its_own(spans: list[Any], n: int) -> None:
@@ -651,6 +728,111 @@ def test_concurrent_conversations_on_one_http2_connection_from_a_thread_pool(h2_
     spans, _ = _shipped(run)
     assert len(accepted) == 1, "the calls did not share one connection"
     _assert_one_h2_connection_kept_each_call_to_its_own(spans, n)
+
+
+@pytest.mark.parametrize("stated", [None, "conv_body"])
+def test_http2_connections_opened_together_each_carry_their_own_conversation(h2c_llm, stated):
+    """Four h2c clients (`http1=False, http2=True`: plaintext, prior
+    knowledge), one connection each, opened together under `asyncio.gather`,
+    three calls each inside the client's own conversation. anyio's plaintext
+    writer yields before it writes, so every client handed out its preface
+    before any was written; only one connection could be proven, the others'
+    first calls carried NO conversation, and with a body naming `conv_body` the
+    body's id took the call outright, beating the host's.
+
+    Every call must carry its own block's id, and a body that names another
+    rides along beside it, as on every other path."""
+    base, accepted = h2c_llm
+    n, calls = 4, 3
+    extra = {} if stated is None else {"conversation": stated}
+
+    async def one(i: int) -> None:
+        async with httpx.AsyncClient(http1=False, http2=True) as client:
+            for k in range(calls):
+                with wardex.conversation("c", id=f"h{i}"):
+                    r = await client.post(
+                        f"{base}/v1/responses", content=_body(f"h{i}-{k}", **extra)
+                    )
+                    assert (r.status_code, r.http_version) == (200, "HTTP/2")
+
+    async def main() -> None:
+        await asyncio.gather(*(one(i) for i in range(n)))
+
+    spans, _ = _shipped(lambda: asyncio.run(main()))
+    assert len(accepted) == n, "each client was to open its own connection"
+    chats = _chats(spans)
+    assert {_tag(s): _conv(s) for s in chats} == {
+        f"h{i}-{k}": f"h{i}" for i in range(n) for k in range(calls)
+    }
+    assert {_tag(s): dict(s.extra).get(REQUEST_CONVERSATION_KEY) for s in chats} == {
+        f"h{i}-{k}": stated for i in range(n) for k in range(calls)
+    }
+    assert counters.get("semantics.request_conversation_shadowed") == (
+        0 if stated is None else n * calls
+    )
+    assert counters.get("semantics.request_conversation_withheld") == 0
+    totals: dict[str | None, int] = {}
+    for s in chats:
+        totals[_conv(s)] = totals.get(_conv(s), 0) + s.gen_ai.input_tokens
+    assert totals == {f"h{i}": calls * 10 * (i + 1) for i in range(n)}
+
+
+def _h2c_post_copied(base: str, body: bytes) -> None:
+    """One POST from a hand-driven `h2` client that writes a COPY of every
+    chunk its state machine hands out: equal bytes, never the object, as a
+    client that buffers its own writes would. Nothing proves its connection."""
+    import socket
+
+    import h2.config
+    import h2.connection
+    import h2.events
+
+    host, port = base.removeprefix("http://").split(":")
+    sock = socket.create_connection((host, int(port)))
+    conn = h2.connection.H2Connection(h2.config.H2Configuration(client_side=True))
+    conn.initiate_connection()
+    sock.sendall(_copy(conn.data_to_send()))
+    headers = [
+        (":method", "POST"),
+        (":scheme", "http"),
+        (":authority", f"{host}:{port}"),
+        (":path", "/v1/responses"),
+        ("content-type", "application/json"),
+    ]
+    conn.send_headers(1, headers)
+    conn.send_data(1, body, end_stream=True)
+    sock.sendall(_copy(conn.data_to_send()))
+    ended = False
+    while not ended and (data := sock.recv(65535)):
+        for ev in conn.receive_data(data):
+            ended = ended or (isinstance(ev, h2.events.StreamEnded) and ev.stream_id == 1)
+        if out := conn.data_to_send():
+            sock.sendall(_copy(out))
+    sock.close()
+
+
+def test_a_request_body_does_not_outrank_a_conversation_wardex_could_not_read(h2c_llm):
+    """HOST WINS needs to know the host's conversation. On a stream whose opener
+    nothing proved, wardex does not: the call may have been issued inside a
+    block, whose id would win. So the body's id is not made the conversation on
+    the guess that there was none; it rides along under its own attribute, and
+    the withholding is counted. Outside every block the result is the same, for
+    the same reason: from this connection the two cannot be told apart."""
+    base, _accepted = h2c_llm
+
+    def run() -> None:
+        with wardex.conversation("c", id="host-9"):
+            _h2c_post_copied(base, _body("h0-in", conversation="conv_body"))
+        _h2c_post_copied(base, _body("h0-out", conversation="conv_body"))
+
+    spans, _ = _shipped(run)
+    chats = {_tag(s): s for s in _chats(spans)}
+    assert set(chats) == {"h0-in", "h0-out"}
+    for s in chats.values():
+        assert _conv(s) is None
+        assert dict(s.extra)[REQUEST_CONVERSATION_KEY] == "conv_body"
+    assert counters.get("semantics.request_conversation_withheld") == 2
+    assert counters.get("semantics.request_conversation_shadowed") == 0
 
 
 def test_a_websocket_session_carries_the_conversation_its_handshake_was_issued_in(
@@ -774,6 +956,37 @@ def test_a_websocket_session_whose_parser_died_weighs_every_later_write(later, w
         t.on_request_bytes(b"\x81\x02hi")
     (txn,) = t.flush(Limitation.WS_NO_CLOSE)
     assert (txn.conversation.conversation_id if txn.conversation else None) == want
+
+
+def test_a_request_body_does_not_outrank_a_conversation_refused_with_a_closed_unit(llm):
+    """A call issued under an activation its unit's close could not take down
+    latches that unit's fork, and with it the host's `host-9`. The edge refuses
+    both as stale, so wardex does not know the call's conversation, and the
+    body's `conv_body` would otherwise have become it, beating the host's id it
+    may well have been issued in. It rides along instead, counted."""
+    from test_units import open_session, registry
+
+    host, port = llm
+
+    def run() -> None:
+        with wardex.conversation("c", id="host-9"):
+            reg = registry()
+            unit = open_session(reg)
+            cm = unit.activate()
+            cm.__enter__()
+            try:
+                closer = threading.Thread(target=lambda: reg.close(unit))
+                closer.start()
+                closer.join()
+                _post(host, port, "closed", conversation="conv_body")
+            finally:
+                del cm
+
+    spans, _ = _shipped(run)
+    (chat,) = _chats(spans)
+    assert _conv(chat) is None
+    assert dict(chat.extra)[REQUEST_CONVERSATION_KEY] == "conv_body"
+    assert counters.get("semantics.request_conversation_withheld") == 1
 
 
 def test_a_closed_units_carrier_does_not_lend_its_conversation():

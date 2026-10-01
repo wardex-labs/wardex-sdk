@@ -68,9 +68,9 @@ USAGE_EXTRA_PREFIX = "wardex.usage."
 USAGE_DROPPED_KEY = "wardex.usage_leaves.dropped_count"
 
 #: Where a request's own conversation id rides when the conversation the request
-#: was issued in names a different one. `wardex.*`, not `openai.*`: the semconv
-#: `openai.*` registry declares no such key, and a key under a registry prefix
-#: that the registry does not hold is a claim nobody made.
+#: was issued in names a different one, or could not be read. `wardex.*`, not
+#: `openai.*`: the semconv `openai.*` registry declares no such key, and a key
+#: under a registry prefix that the registry does not hold is a claim nobody made.
 REQUEST_CONVERSATION_KEY = "wardex.openai.conversation_id"
 
 
@@ -189,7 +189,10 @@ def embeddings_attrs(sem: Any) -> EmbeddingsAttributes | None:
 
 
 def apply_request_conversation(
-    draft: SpanDraft, latched: ConversationContext | None, stated: str | None
+    draft: SpanDraft,
+    latched: ConversationContext | None,
+    stated: str | None,
+    issuer_known: bool = True,
 ) -> None:
     """The conversation a request BODY names (a Responses `conversation`),
     under the rule an adapter's own conversation id already follows.
@@ -204,13 +207,25 @@ def apply_request_conversation(
     id IS the conversation — the request said which one it belongs to, and that
     is not a guess.
 
+    "Nothing latched" has to MEAN the request was issued outside every
+    conversation, and `issuer_known=False` says it does not: the seam could not
+    read who issued the request (an HTTP/2 stream whose opener was not proven,
+    a latch entry that was lost or refused). The host may have been inside a
+    conversation of its own, which would win, so the body's id is not made the
+    conversation on a guess that there was none: it rides along under the same
+    key, and the withholding is counted.
+
     An absent or empty id says nothing and changes nothing: wardex never mints a
     conversation for a request that named none.
     """
     if not stated:
         return
-    if latched is None:
+    if latched is not None:
+        if latched.conversation_id != stated:
+            counters.bump("semantics.request_conversation_shadowed")
+            draft.set_extra(REQUEST_CONVERSATION_KEY, stated)
+    elif issuer_known:
         draft.set_conversation(ConversationContext(conversation_id=stated))
-    elif latched.conversation_id != stated:
-        counters.bump("semantics.request_conversation_shadowed")
+    else:
+        counters.bump("semantics.request_conversation_withheld")
         draft.set_extra(REQUEST_CONVERSATION_KEY, stated)
