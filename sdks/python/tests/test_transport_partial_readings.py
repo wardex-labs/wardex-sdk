@@ -15,7 +15,10 @@ part, as if it were the whole one:
   its own header block;
 * a request still being read when its response arrived reported `0` bytes;
 * a WebSocket direction whose frame parser stopped reported the bytes it had
-  counted up to then.
+  counted up to then;
+* a WebSocket session still open when the SDK let go of it (at
+  `wardex.close()`, or when the connection table was full) reported the bytes
+  and the length it had seen up to then as the session's.
 
 Each now ships the whole measurement or nothing, on the envelope and on OTLP.
 """
@@ -37,6 +40,7 @@ from urllib.parse import urlsplit
 
 import pytest
 
+import test_observed_transport as o
 import test_span_class_survival as h
 import wardex_sdk as wardex
 from test_codec import _header
@@ -49,7 +53,7 @@ from wardex_sdk._interceptors._conn_timing import (
     _TimingRecord,
     opening_timing,
 )
-from wardex_sdk._interceptors._seam import _ConnectionState
+from wardex_sdk._interceptors._seam import ByteSeamInterceptor, _ConnectionState
 from wardex_sdk._interceptors._ssl import SSLInterceptor
 from wardex_sdk._interceptors._trackers import _Http1Tracker, _Http2Tracker, _WebSocketTracker
 from wardex_sdk._limits import LimitsConfig
@@ -545,3 +549,104 @@ def test_a_websocket_direction_whose_frame_parser_stopped_has_no_size(client):
     extra = dict(span.extra)
     assert "ws.bytes.received" not in extra and "ws.messages.received" not in extra
     assert extra["ws.bytes.sent"] == 2
+
+
+def _ws_session_ended_by(client, ending: str):
+    """One WebSocket session through the seam's real connection table, ended
+    the way `ending` says, before any CLOSE frame crossed."""
+    tracker = _WebSocketTracker(
+        path="/realtime", deflate=False, parent=None, start_ns=1, limits=_wardex_native.Limits()
+    )
+    seam = h._seam(client, tracker)
+    obj = SimpleNamespace(
+        server_hostname="ws.example.com", getpeername=lambda: ("203.0.113.9", 443)
+    )
+    seam._state(obj)
+    tracker.on_request_bytes(h._ws_frame(True, 0x1, b"hello"))
+    tracker.on_response_bytes(h._ws_frame(True, 0x1, b"echo:hello"))
+    if ending == "socket closed":
+        seam._connection_closed(id(obj))  # what the close hook runs
+    elif ending == "uninstall":
+        ByteSeamInterceptor.uninstall(seam)  # the real one; the harness stubs it out
+    else:  # the connection table is full and this session is its oldest entry
+        seam._limits = {**seam._limits, "max_connections": 0}
+        seam._state(SimpleNamespace(getpeername=lambda: ("203.0.113.10", 443)))
+    (span,) = client.spans
+    return span
+
+
+def test_a_websocket_session_whose_socket_closed_keeps_its_length_and_sizes(client):
+    # No CLOSE frame, but the socket is gone: nothing more can cross it, so
+    # what was counted is the whole session.
+    span = _ws_session_ended_by(client, "socket closed")
+    assert Limitation.WS_NO_CLOSE in span.capture_integrity.limitations
+    assert (span.transport.request_size, span.transport.response_size) == (5, 10)
+    assert span.transport.timing.transfer_ms is not None
+    assert dict(span.extra)["ws.bytes.received"] == 10
+
+
+@pytest.mark.parametrize(
+    ("ending", "marker"),
+    [("uninstall", Limitation.WS_NO_CLOSE), ("evicted", Limitation.CONNECTION_EVICTED)],
+)
+def test_a_websocket_session_let_go_of_while_open_has_no_length_or_sizes(client, ending, marker):
+    span = _ws_session_ended_by(client, ending)
+    assert marker in span.capture_integrity.limitations
+    assert (span.transport.request_size, span.transport.response_size) == (None, None)
+    assert span.transport.timing.transfer_ms is None
+    extra = dict(span.extra)
+    assert not [k for k in extra if k.startswith(("ws.bytes.", "ws.messages."))], extra
+
+
+def test_a_websocket_session_open_at_close_ships_no_partial_count_or_length():
+    """A long-lived session still open when `wardex.close()` runs, which then
+    carries on: the bytes and time seen before the close are part of it."""
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+
+    def serve() -> None:
+        conn, _ = srv.accept()
+        with conn:
+            o._read_until(conn, b"\r\n\r\n")
+            conn.sendall(
+                b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n"
+                b"Connection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n"
+            )
+            for _ in range(2):
+                echo = b"echo:" + o._read_frame(conn)
+                conn.sendall(bytes([0x81, len(echo)]) + echo)
+            o._read_frame(conn)
+            conn.sendall(b"\x88\x02\x03\xe8")
+        srv.close()
+
+    threading.Thread(target=serve, daemon=True).start()
+    transport = RecordingTransport()
+    wardex.init(transport=transport, intercept=True, capture_mode=CaptureMode.ALL)
+    with socket.create_connection(srv.getsockname()) as sock:
+        sock.sendall(
+            b"GET /realtime HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\n"
+            b"Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+            b"Sec-WebSocket-Version: 13\r\n\r\n"
+        )
+        o._read_until(sock, b"\r\n\r\n")
+        sock.sendall(o._masked(0x1, b"before"))
+        o._read_frame(sock)
+        wardex.close()  # the session is still open
+        sock.sendall(o._masked(0x1, b"after the close"))
+        o._read_frame(sock)
+        sock.sendall(o._masked(0x8, (1000).to_bytes(2, "big")))
+        o._read_frame(sock)
+
+    env, decoded, otlp = _spans(transport)
+    (ws,) = [s for s in decoded if s["name"] == "WS /realtime"]
+    assert "ws_no_close" in ws["capture_integrity"]["limitations"]
+    t = ws["transport"]
+    assert (t["request_size"], t["response_size"], t["timing"]["transfer_ms"]) == (None, None, None)
+    (attrs,) = [sp["attributes"] for sp in otlp if sp["name"] == "WS /realtime"]
+    leaked = [
+        k
+        for k in attrs
+        if k.endswith(("_size", "transfer_ms")) or k.startswith(("ws.bytes.", "ws.messages."))
+    ]
+    assert leaked == [], leaked

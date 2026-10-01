@@ -37,7 +37,7 @@ from .._enums import (
     StatusCode,
 )
 from .._limits import LimitsConfig, LimitsConsumer, limits_kwargs
-from .._protocol import classify_path, classify_ws_upgrade, parse_llm_semantics
+from .._protocol import classify_path, classify_ws_upgrade, parse_llm_semantics, sniff_event_stream
 from .._semantics import (
     USAGE_DROPPED_KEY,
     build_gen_ai,
@@ -183,13 +183,11 @@ class _ConnectionState:
         # carries `TRACKING_RESET_AT_FORK` (once — the stamp clears it). Set
         # by `_state` from the seam's fork latch, never by the trackers.
         self.reset_at_fork = False
-        # Guards the once-per-connection debug log below. Deliberately a
-        # separate field from `gate`: `gate` is owned by the plaintext seam's
-        # protocol sniff-latch (_socket.py), which never re-evaluates once
-        # set — reusing it here would let a disable-log event permanently
-        # gate off all further bytes on that seam, including a still-healthy
-        # direction, as an unintended side effect of two unrelated concerns
-        # sharing one field.
+        # Guards the once-per-connection debug log below. Deliberately a separate field from `gate`:
+        # `gate` is owned by the plaintext seam's protocol sniff-latch (_socket.py), which never
+        # re-evaluates once set — reusing it here would let a disable-log event permanently gate off
+        # all further bytes on that seam, including a still-healthy direction, as an unintended side
+        # effect of two unrelated concerns sharing one field.
         self.disabled_logged = False
 
     def latched_off(self) -> bool:
@@ -302,7 +300,7 @@ class ByteSeamInterceptor(InterceptorInterface):
         self._patches.restore_all()
         self._release_probes()
         for st in list(self._conns.values()):
-            self._retire(st, Limitation.WS_NO_CLOSE)
+            self._retire(st, Limitation.WS_NO_CLOSE, still_open=True)
         self._conns.clear()
         self._installed = False
 
@@ -465,16 +463,14 @@ class ByteSeamInterceptor(InterceptorInterface):
             addr, port = peer_address(obj)
             st = _ConnectionState(self._select_tracker(obj), addr, port)
             if cid in self._reset_at_fork_ids:
-                # This object was tracked when the fork reset the table, so it
-                # is (to the limit of id() identity) an INHERITED connection:
-                # the new tracker starts mid-stream. Consume the id — the
-                # marker is a fact about the reset, and the reset happened
-                # once.
+                # This object was tracked when the fork reset the table, so it is (to the limit of
+                # id() identity) an INHERITED connection: the new tracker starts mid-stream. Consume
+                # the id — the marker is a fact about the reset, and the reset happened once.
                 self._reset_at_fork_ids.discard(cid)
                 st.reset_at_fork = True
             if len(self._conns) > self._limits["max_connections"]:
-                old_cid = next(iter(self._conns))
-                self._retire(self._conns.pop(old_cid), Limitation.CONNECTION_EVICTED)
+                oldest = self._conns.pop(next(iter(self._conns)))
+                self._retire(oldest, Limitation.CONNECTION_EVICTED, still_open=True)
             self._conns[cid] = st
             # The hook closes over the ID, never over `obj`: an eviction
             # mechanism that referenced the socket would keep the host's file
@@ -498,23 +494,24 @@ class ByteSeamInterceptor(InterceptorInterface):
         """
         st = self._conns.pop(cid, None)
         if st is not None:
-            self._retire(st, Limitation.WS_NO_CLOSE)
+            self._retire(st, Limitation.WS_NO_CLOSE, still_open=False)
 
-    def _retire(self, st: _ConnectionState, marker: Limitation) -> None:
+    def _retire(self, st: _ConnectionState, marker: Limitation, *, still_open: bool) -> None:
         """The single place a connection's state stops existing.
 
-        Three callers — the close hook, the FIFO cap and `uninstall()` — and
-        they differ only in the marker they can honestly claim. The tracker
-        decides what survives its own end: a WebSocket session is a span that
-        exists ONLY at close, so it is emitted here rather than dropped, and
-        every other tracker answers with an empty list after releasing whatever
-        it was holding.
+        Three callers — the close hook, the FIFO cap and `uninstall()` — and they differ only in
+        the marker they can honestly claim and in whether the connection is over. The tracker
+        decides what survives its own end: a WebSocket session is a span that exists ONLY at
+        close, so it is emitted here rather than dropped, and every other tracker answers with an
+        empty list after releasing whatever it was holding. `still_open` (the FIFO cap,
+        `uninstall()`): the session goes on unwatched, so what was counted and timed so far is part
+        of it, not its size or length.
 
         Runs inside `socket.close()` and inside garbage collection, so it must
         stay short and must not raise; `_emit_ws` already carries the guard.
         """
         for txn in st.tracker.on_connection_close(marker):
-            self._emit_ws(st, txn)
+            self._emit_ws(st, txn, whole=not still_open)
 
     # --- Tracker delegation + span assembly ---
 
@@ -631,14 +628,12 @@ class ByteSeamInterceptor(InterceptorInterface):
             timing_markers = (*timing_markers, Limitation.PEER_UNRESOLVED)
             counters.bump("interceptors.seam.peer_unresolved")
         if treatment == "excluded":
-            # A telemetry upload (the OpenAI Agents SDK POSTs its whole run
-            # record to /v1/traces/ingest). Not wardex's to copy: skipped in
-            # every mode and above the allowlist, before any parse is queued
-            # or the body attached to a span — counted, not spanned. The
-            # tracker has already buffered the body (capped by max_body_bytes)
-            # by the time a `_Txn` exists; dropping the `_Txn` here is what
-            # discards it. Does not consume the fork latch: the marker belongs
-            # on the first transaction that becomes a span.
+            # A telemetry upload (the OpenAI Agents SDK POSTs its whole run record to
+            # /v1/traces/ingest). Not wardex's to copy: skipped in every mode and above the
+            # allowlist, before any parse is queued or the body attached to a span — counted, not
+            # spanned. The tracker has already buffered the body (capped by max_body_bytes) by the
+            # time a `_Txn` exists; dropping the `_Txn` here is what discards it. Does not consume
+            # the fork latch: the marker belongs on the first transaction that becomes a span.
             counters.bump("interceptors.seam.path_excluded")
             return None
         if st.reset_at_fork:
@@ -716,17 +711,17 @@ class ByteSeamInterceptor(InterceptorInterface):
         if span is not None:
             client.capture_span(span)
 
-    def _emit_ws(self, st: _ConnectionState, txn: _Txn) -> None:
+    def _emit_ws(self, st: _ConnectionState, txn: _Txn, *, whole: bool = True) -> None:
         client = self._client
         if client is None:
             return
         span = None
         with self._guard("interceptors.seam.emit_ws"):
-            span = self._build_ws_span(st, txn)
+            span = self._build_ws_span(st, txn, whole)
         if span is not None:
             client.capture_span(span)
 
-    def _build_ws_span(self, st: _ConnectionState, txn: _Txn) -> Any:
+    def _build_ws_span(self, st: _ConnectionState, txn: _Txn, whole: bool) -> Any:
         # The tracker's LLM-transport answer and an unread peer (`_peer.py`),
         # counted HERE and BEFORE the gate: every `interceptors.seam.*` bump
         # lives in this module, and a span the mode refuses must still count —
@@ -769,9 +764,10 @@ class ByteSeamInterceptor(InterceptorInterface):
         if peer_unresolved:  # never sealed, so stamped here
             draft.add_limitation(Limitation.PEER_UNRESOLVED)
         draft.set_extra("network.protocol.version", "websocket")
-        # A direction whose frame parser stopped counted part of it: no count, not a low one.
-        sent = txn.ws_bytes_sent if txn.request_counted else None
-        received = txn.ws_bytes_received if txn.response_counted else None
+        # A direction whose frame parser stopped, or a session still open when the seam let go of it
+        # (`whole=False`), counted part of it: no count, not a low one.
+        sent = txn.ws_bytes_sent if whole and txn.request_counted else None
+        received = txn.ws_bytes_received if whole and txn.response_counted else None
         if sent is not None:
             draft.set_extra("ws.messages.sent", txn.ws_messages_sent)
             draft.set_extra("ws.bytes.sent", sent)
@@ -781,9 +777,10 @@ class ByteSeamInterceptor(InterceptorInterface):
         if code is not None:
             draft.set_extra("ws.close_code", code)
 
-        # Only the session's length is timed here. Connect, handshake, first byte,
-        # first token and connection reuse are not observed, so they stay unset.
-        timing = TransportTiming(transfer_ms=max(0.0, (txn.end_ns - txn.start_ns) / 1e6))
+        # Only the session's length is timed, and only once it ended. Connect, handshake, first
+        # byte, first token and connection reuse are not observed, so they stay unset.
+        length = max(0.0, (txn.end_ns - txn.start_ns) / 1e6) if whole else None
+        timing = TransportTiming(transfer_ms=length)
         draft.set_transport(
             TransportAttributes(
                 connection_id=str(id(st)),
@@ -1130,10 +1127,13 @@ def _assemble(p: _PendingTxn, *, parse: bool, extra: tuple[Limitation, ...]) -> 
         transfer_ms=transfer,
     )
     # SSE if it declared `text/event-stream` (read or not: undecodable, cut by a cap) or a parse
-    # read it as SSE (`looks_like_sse`); no parse (gRPC, skipped, raised), no declaration: no claim.
+    # read it as SSE. Not SSE only if the WHOLE body read as something else; a body cut by its cap
+    # or not text (binary, a coding nothing inflated), or no parse (gRPC, skipped, raised): unset.
     body_read = parse and not parse_failed and not p.is_grpc
-    sniffed = bool(getattr(sem, "reassembled_from_stream", False)) if body_read else None
-    streamed = txn.event_stream or sniffed
+    if txn.event_stream or (body_read and getattr(sem, "reassembled_from_stream", False)):
+        streamed = True
+    else:
+        streamed = sniff_event_stream(output_data) if body_read and txn.response_counted else None
     # Sizes are wire (compressed) bytes; output_data is the inflated body. A half whose count is
     # not whole (cut at its cap, lost, unfinished: `_Txn.request_counted`) has no size, not a 0.
     draft.set_transport(

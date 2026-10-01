@@ -109,9 +109,11 @@ All notable changes to this project are documented here. The format follows
   declared `Content-Type: text/event-stream` — even when its body was in an
   encoding the parser does not decode, or was cut by `max_body_bytes` — or its
   body read as a Server-Sent Events stream, `false` when it declared none and
-  its body did not read as one, and unset when it declared none and its body
-  was not parsed; the five `TransportTiming` intervals are unset when they
-  were not measured — including a connect time the seam marks
+  its whole body read as something else (JSON, or text with no event line),
+  and unset when it declared none and its body was not read: not parsed, cut
+  by the capture limit, or not text (binary, or compressed in a coding the
+  SDK does not inflate); the five `TransportTiming` intervals are unset when
+  they were not measured — including a connect time the seam marks
   `connect_timing_unavailable` (a socket connected before `init` and
   TLS-wrapped after it among them, and a plaintext connection opened by
   asyncio, as httpx's async client opens one: its non-blocking `connect`
@@ -125,10 +127,14 @@ All notable changes to this project are documented here. The format follows
   1 MB speech response said 262144); on an HTTP/2 stream whose request half
   the stream table evicted before its response arrived (marked
   `h2_request_evicted`), where it used to say `0`; on an HTTP/1 request the
-  parser had not finished reading when its response arrived; and on a
-  WebSocket direction whose frame parser stopped (marked
-  `frame_parse_failed`), along with that direction's `ws.messages.*` and
-  `ws.bytes.*` counts; `connection_reused` is `false` only on a connection the
+  parser had not finished reading when its response arrived; on a WebSocket
+  direction whose frame parser stopped (marked `frame_parse_failed`), along
+  with that direction's `ws.messages.*` and `ws.bytes.*` counts; and on a
+  WebSocket session the SDK stopped following while it was still open (at
+  `wardex.close()`, marked `ws_no_close`, or when its connection table was
+  full, marked `connection_evicted`), which used to report the bytes and the
+  length up to that moment as the session's and now carries no sizes, counts
+  or `transfer_ms`; `connection_reused` is `false` only on a connection the
   SDK saw open and is unset on one it did not (opened before `init`, say,
   where it used to say `false` on a connection that had already carried
   requests); and the modalities are unspecified, since nothing detects one
@@ -136,6 +142,10 @@ All notable changes to this project are documented here. The format follows
   `connection_reused` and the five intervals gained explicit presence
   (`optional`). In Python, `TransportTiming`'s fields, both sizes,
   `is_streaming`, `connection_reused` and both modalities default to `None`.
+  On MCP stdio both sizes are, as before, the params and the result or error
+  re-encoded as compact JSON (the payload as captured): a server's whitespace
+  and needless `\u` escapes are not counted, so they are not the bytes on
+  the pipe.
 - **`TransportAttributes.chunk_index` and `is_final_chunk` are removed.**
   Nothing ever filled them, so every span carried `0` and `true`. Their tags
   (25, 26) and names are reserved and will not be reused. The Python fields

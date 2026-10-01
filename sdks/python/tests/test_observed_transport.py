@@ -432,6 +432,37 @@ def test_a_body_neither_declared_nor_read_as_an_event_stream_is_not_streaming():
     assert _is_streaming(_JSON, {"Content-Type": "application/json"}) == (False, False)
 
 
+# The same SSE stream under another label, in a form the parser could not read.
+# Read whole, it is a stream (above); unread, "not a stream" was never observed.
+
+
+def test_an_undeclared_event_stream_cut_inside_a_character_by_the_body_cap_says_nothing():
+    payload = _korean_sse(40)
+    cap = 1000
+    while (payload[cap] & 0xC0) != 0x80:  # land the cap inside a UTF-8 character
+        cap += 1
+    headers = {"Content-Type": "application/json"}
+    got = _is_streaming(payload, headers, limits=LimitsConfig(max_body_bytes=cap))
+    assert got == (None, None)
+
+
+def test_an_undeclared_event_stream_in_an_encoding_the_parser_cannot_read_says_nothing():
+    deflater = zlib.compressobj(9, zlib.DEFLATED, -15)  # raw deflate: nothing inflates it
+    payload = deflater.compress(_korean_sse(10)) + deflater.flush()
+    headers = {"Content-Type": "application/json", "Content-Encoding": "deflate"}
+    assert _is_streaming(payload, headers) == (None, None)
+
+
+def test_an_undeclared_body_that_is_not_text_says_nothing():
+    payload = bytes(range(256)) * 4
+    assert _is_streaming(payload, {"Content-Type": "application/octet-stream"}) == (None, None)
+
+
+def test_an_undeclared_text_body_with_no_event_line_is_not_streaming():
+    payload = "안녕하세요, plain text.\n".encode()
+    assert _is_streaming(payload, {"Content-Type": "text/plain"}) == (False, False)
+
+
 def test_an_asyncio_connect_is_seen_open_but_not_timed():
     """A plaintext connection opened by asyncio, as httpx's async client opens one.
 

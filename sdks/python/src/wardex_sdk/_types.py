@@ -454,9 +454,11 @@ class TransportAttributes:
     # Timing — the network-only intervals (tcp_connect_ms, tls_handshake_ms) are None for IPC
     timing: TransportTiming = field(default_factory=TransportTiming)
 
-    #: Bytes counted for each half; an empty body is 0. None when the count is
-    #: not whole: the body went past its capture limit (only a prefix was
-    #: kept), or the half was lost or never finished being read.
+    #: Bytes counted for each half as captured; an empty body is 0. MCP stdio
+    #: counts the params and result re-encoded as compact JSON, not the pipe's
+    #: bytes. None when the count is not whole: the body went past its capture
+    #: limit (only a prefix was kept), the half was lost or never finished
+    #: being read, or a WebSocket session was let go of while still open.
     request_size: int | None = None
     response_size: int | None = None
 
@@ -477,8 +479,9 @@ class TransportAttributes:
     response_modality: Modality | None = None
     #: True when the response was a Server-Sent Events stream: it declared
     #: `Content-Type: text/event-stream` (read or not), or its body read as
-    #: one. False when it did not declare one and its body did not read as
-    #: one. None when it did not declare one and its body was not parsed.
+    #: one. False when it did not declare one and its whole body was read as
+    #: something else. None when it did not declare one and its body was not
+    #: read: not parsed, cut by its capture limit, or not text.
     is_streaming: bool | None = None
     #: Whether this transaction rode a connection an earlier one opened. False
     #: only where the producer saw the connection open; None where it cannot

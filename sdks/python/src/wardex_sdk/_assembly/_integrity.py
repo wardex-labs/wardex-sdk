@@ -746,18 +746,18 @@ Two emit sites, and the first is the mechanism the second restates.
     """
 
     CONNECTION_EVICTED = "connection_evicted"
-    """The connection table hit ``max_connections`` and this connection's
-    tracker was flushed early, so its span ends at the eviction instant.
+    """The connection table hit ``max_connections`` and this connection's tracker was flushed
+    early, so its span ends at the eviction instant (a WebSocket session's, with no length and
+    no sizes: it goes on unwatched).
 
     Emitted from ``_interceptors/_seam.py::ByteSeamInterceptor._state`` via
     ``_WebSocketTracker.flush(marker)``. Before the census rewired that site it
     was the free string ``ws_evicted``.
 
-    NOTE (census): renamed, NOT merged into ``UNIT_EVICTED``. Both say
-    "something was evicted", but they name different tables and different
-    tunables — ``max_connections`` here, ``max_units`` there — and a merged
-    marker would send the user to the wrong knob. The rename drops the ``ws_``
-    prefix because the connection table is not WebSocket-specific.
+    NOTE (census): renamed, NOT merged into ``UNIT_EVICTED``. Both say "something was evicted",
+    but they name different tables and different tunables — ``max_connections`` here,
+    ``max_units`` there — and a merged marker would send the user to the wrong knob. The rename
+    drops the ``ws_`` prefix because the connection table is not WebSocket-specific.
     """
 
     H2_REQUEST_EVICTED = "h2_request_evicted"
@@ -980,13 +980,13 @@ Two emit sites, and the first is the mechanism the second restates.
     """
 
     WS_NO_CLOSE = "ws_no_close"
-    """The WebSocket span was emitted without ever seeing a CLOSE frame, so its close code and
-    duration are not trustworthy.
+    """The WebSocket span was emitted without ever seeing a CLOSE frame, so it has no close code.
 
     Emitted from ``_interceptors/_seam.py::ByteSeamInterceptor._retire``, via
-    ``_WebSocketTracker.flush(marker)``, reached from ``uninstall()`` and from the shared
-    socket-close hook (``_connection_closed``). The uninstall path travels alongside
-    ``ADAPTER_UNINSTALLED``; see that member for why they stay two markers.
+    ``_WebSocketTracker.flush(marker)``, reached from ``uninstall()`` (the session goes on
+    unwatched, so it ships no length and no sizes) and from the shared socket-close hook
+    (``_connection_closed``: the socket is gone, so both are whole). The uninstall path travels
+    alongside ``ADAPTER_UNINSTALLED``; see that member for why they stay two markers.
     """
 
     WS_LLM_SEMANTICS_UNREAD = "ws_llm_semantics_unread"

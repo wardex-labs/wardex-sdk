@@ -840,8 +840,11 @@ diagnostic line (traceback under `debug=True`).
   nothing); on HTTP/2 the stream the connection was opened for, stream 1,
   carries them. A size is the body as sent (content-coded, without chunk
   framing); for a WebSocket session, the payload bytes each way; for MCP
-  stdio, the params and the result or error. For MCP stdio the first-byte
-  time is the time until its response message was read.
+  stdio, the params and the result or error as the SDK captures them,
+  re-encoded as compact JSON — a server's whitespace and needless `\u`
+  escapes are not counted, so this is not the byte count on the pipe. For
+  MCP stdio the first-byte time is the time until its response message was
+  read.
   Only what was measured whole is sent, and the rest carries no key rather
   than a `0`: a connect time the seam could not time (a plaintext connection
   opened by asyncio, whose non-blocking connect returns before the handshake
@@ -855,14 +858,18 @@ diagnostic line (traceback under `debug=True`).
   marked truncated), of an HTTP/2 request the SDK lost before capturing it
   (marked `h2_request_evicted`), of an HTTP/1 request it had not finished
   reading when the response arrived, and of a WebSocket direction whose frame
-  parser stopped (marked `frame_parse_failed`); and everything about a
-  WebSocket session but its length and sizes. A WebSocket session the SDK
-  ended before it closed (at `wardex.close()`, or when its connection table
-  was full; marked `ws_no_close` or `connection_evicted`) reports its length
-  and bytes up to that moment. Connection reuse is `false` only on a
+  parser stopped (marked `frame_parse_failed`); the length and sizes of a
+  WebSocket session the SDK stopped following while it was still open (at
+  `wardex.close()`, marked `ws_no_close`, or when its connection table was
+  full, marked `connection_evicted`); and everything about a WebSocket
+  session but its length and sizes. Connection reuse is `false` only on a
   connection the SDK saw open; on one opened before `init`, the first request
   it sees (on HTTP/2, stream 1) carries none. A response is a stream when it
-  declared `text/event-stream` or its body read as one
+  declared `text/event-stream` or its body read as one, and not a stream
+  when it declared none and its whole body read as something else; with no
+  declaration, a body that did not read as one and was cut by its capture
+  limit or is not text (binary, or compressed in a coding the SDK does not
+  inflate) says neither
 - gRPC (grpclib), WebSocket (`wss`;
   a Responses-over-WebSocket connection is captured at close and marked
   `ws_llm_semantics_unread` when the host is `api.openai.com` or a subdomain

@@ -1,5 +1,7 @@
 //! Generic JSON-RPC 2.0 parser — stdio newline-delimited framing.
-//! MCP-agnostic, pyo3-free. params/result/error are preserved as raw JSON bytes (semantic extraction happens upstream).
+//! MCP-agnostic, pyo3-free. params/result/error are kept as JSON bytes re-encoded compact by
+//! serde_json, not as the bytes on the pipe: a sender's whitespace and needless `\u` escapes are
+//! dropped (semantic extraction happens upstream).
 
 use serde_json::Value;
 use wardex_limits::Limits;
@@ -17,9 +19,9 @@ pub struct JsonRpcMessage {
     pub kind: JsonRpcKind,
     pub id: Option<String>, // numeric/string id normalized to a string (correlation key)
     pub method: Option<String>, // request/notification
-    pub params: Option<Vec<u8>>, // request/notification raw JSON
-    pub result: Option<Vec<u8>>, // response success raw JSON
-    pub error: Option<Vec<u8>>, // response error raw JSON
+    pub params: Option<Vec<u8>>, // request/notification JSON, re-encoded compact
+    pub result: Option<Vec<u8>>, // response success JSON, re-encoded compact
+    pub error: Option<Vec<u8>>, // response error JSON, re-encoded compact
 }
 
 /// Incremental parser for one direction (stdin or stdout) of a byte stream. Carves out messages at newline boundaries.
@@ -174,6 +176,17 @@ mod tests {
         assert_eq!(m.id.as_deref(), Some("7"));
         assert!(m.result.is_some());
         assert!(m.error.is_none());
+    }
+
+    #[test]
+    fn params_and_result_are_re_encoded_compact_not_kept_as_sent() {
+        // Spaced and `\u`-escaped on the pipe, as Python's stdlib json writes it.
+        let sent = "{\"jsonrpc\": \"2.0\", \"id\": 7, \"result\": {\"text\": \"\\uc548\\ub155\", \"n\": [1, 2]}}\n";
+        let kept = one(sent).result.unwrap();
+        let compact = "{\"text\":\"안녕\",\"n\":[1,2]}";
+        assert_eq!(kept.len(), compact.len());
+        assert!(!kept.contains(&b' '));
+        assert!(!kept.windows(2).any(|w| w == b"\\u"));
     }
 
     #[test]

@@ -876,6 +876,15 @@ fn parse_llm_semantics(
     })
 }
 
+/// The SSE sniff `parse_llm_semantics` runs, over a body already decoded:
+/// True, False, or None when the body is not text and so was never read (see
+/// `sse::sniff`). The seam asks it when the parse read no stream, so a span
+/// says "not a stream" only when a body was read as something else.
+#[pyfunction]
+fn sniff_event_stream(body: &[u8]) -> PyResult<Option<bool>> {
+    shielded(|| Ok(wardex_core::protocol::sse::sniff(body)))
+}
+
 /// "llm_call" | "provider_state" | "excluded" | None. Strings, not an enum
 /// class: three values, one consumer, and the seam only ever compares.
 #[pyfunction]
@@ -916,6 +925,7 @@ fn _wardex_native(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     protocol.add_class::<JsonRpcParser>()?;
     protocol.add_class::<JsonRpcMessage>()?;
     protocol.add_function(wrap_pyfunction!(parse_llm_semantics, &protocol)?)?;
+    protocol.add_function(wrap_pyfunction!(sniff_event_stream, &protocol)?)?;
     protocol.add_function(wrap_pyfunction!(classify_path, &protocol)?)?;
     protocol.add_function(wrap_pyfunction!(classify_ws_upgrade, &protocol)?)?;
     protocol.add_function(wrap_pyfunction!(normalize_finish_reason, &protocol)?)?;

@@ -1,4 +1,5 @@
 import asyncio
+import json
 import sys
 
 import anyio
@@ -63,6 +64,46 @@ async def test_anyio_stdio_tools_call_is_captured():
     assert b"Created #42" in sp.output_data
     assert sp.status == StatusCode.OK
     assert sp.transport.timing.ttfb_ms > 0.0  # measured round-trip latency (request → response)
+
+
+# A server written as a hand-rolled one often is, with the stdlib json module's
+# defaults: every non-ASCII character escaped, a space after each separator.
+_ESCAPING_SERVER = (
+    "import sys, json\n"
+    "req = json.loads(sys.stdin.readline())\n"
+    "result = {'content': [{'type': 'text', 'text': '안녕하세요 ' * 20}], 'isError': False}\n"
+    "sys.stdout.write(json.dumps({'jsonrpc': '2.0', 'id': req['id'], 'result': result}) + '\\n')\n"
+    "sys.stdout.flush()\n"
+)
+
+
+@pytest.mark.asyncio
+async def test_an_mcp_size_is_the_payload_as_captured_not_the_bytes_on_the_pipe():
+    """`request_size` / `response_size` on MCP stdio count the params and the
+    result as the SDK captures them, re-encoded as compact JSON. The server's
+    spacing and `\\u` escapes are not counted, so the figure is smaller than
+    what crossed the pipe here; the schema and the README say exactly that."""
+    wardex.init(intercept=True)
+    proc = await anyio.open_process([sys.executable, "-c", _ESCAPING_SERVER])
+    params = {"name": "greet", "arguments": {"who": "세계"}}
+    request = {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": params}
+    await proc.stdin.send(json.dumps(request).encode() + b"\n")
+    line = b""
+    while b"\n" not in line:
+        chunk = await proc.stdout.receive()
+        if not chunk:
+            break
+        line += chunk
+    await proc.wait()
+
+    (sp,) = [s for s in _client_spans() if s.transport and s.transport.mcp is not None]
+    result = json.loads(line)["result"]
+
+    def compact(v: object) -> int:
+        return len(json.dumps(v, ensure_ascii=False, separators=(",", ":")).encode())
+
+    assert sp.transport.request_size == compact(params) < len(json.dumps(params))
+    assert sp.transport.response_size == compact(result) < len(json.dumps(result))
 
 
 @pytest.mark.asyncio

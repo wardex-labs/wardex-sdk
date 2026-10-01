@@ -63,20 +63,27 @@ pub fn parse(body: &[u8]) -> Vec<SseEvent> {
 /// Sniffs whether the body looks like SSE. If the first non-whitespace character after leading
 /// whitespace is '{'/'[', it's JSON (false); otherwise true if it contains a "data:"/"event:" line.
 pub fn looks_like_sse(body: &[u8]) -> bool {
+    sniff(body) == Some(true)
+}
+
+/// The same sniff, saying when it could not read the body at all. `Some(true)`: an event stream.
+/// `Some(false)`: something else was read — JSON (first non-blank byte `{`/`[`), an empty body, or
+/// text with no "data:"/"event:" line. `None`: the body is not UTF-8 text (binary, compressed in a
+/// coding nothing inflated, or cut inside a character), so "not SSE" was never observed.
+pub fn sniff(body: &[u8]) -> Option<bool> {
     let first = body
         .iter()
         .find(|&&b| b != b' ' && b != b'\t' && b != b'\r' && b != b'\n');
     match first {
-        None => return false,
-        Some(&b) if b == b'{' || b == b'[' => return false,
+        None => return Some(false),
+        Some(&b) if b == b'{' || b == b'[' => return Some(false),
         _ => {}
     }
-    let text = match std::str::from_utf8(body) {
-        Ok(t) => t,
-        Err(_) => return false,
-    };
-    text.lines()
-        .any(|l| l.starts_with("data:") || l.starts_with("event:"))
+    let text = std::str::from_utf8(body).ok()?;
+    Some(
+        text.lines()
+            .any(|l| l.starts_with("data:") || l.starts_with("event:")),
+    )
 }
 
 #[cfg(test)]
@@ -129,5 +136,24 @@ mod tests {
         assert!(!looks_like_sse(b"{\"choices\":[]}"));
         assert!(!looks_like_sse(b"  [1,2,3]"));
         assert!(!looks_like_sse(b""));
+    }
+
+    #[test]
+    fn sniff_reads_text_and_json_and_says_so() {
+        assert_eq!(sniff("data: {\"t\":\"안녕\"}\n\n".as_bytes()), Some(true));
+        assert_eq!(sniff(b"{\"choices\":[]}"), Some(false));
+        assert_eq!(sniff(b"plain text, no event lines"), Some(false));
+        assert_eq!(sniff(b""), Some(false));
+    }
+
+    #[test]
+    fn sniff_cannot_read_a_body_that_is_not_text() {
+        // An SSE body cut inside a multi-byte character: no longer UTF-8.
+        let whole = "data: {\"t\":\"안녕\"}\n\n".as_bytes();
+        let cut = &whole[..whole.iter().position(|&b| b >= 0x80).unwrap() + 1];
+        assert_eq!(sniff(cut), None);
+        assert!(!looks_like_sse(cut));
+        // Compressed bytes nothing inflated.
+        assert_eq!(sniff(&[0xcb, 0x48, 0xcd, 0xc9, 0xc9, 0x07, 0x00]), None);
     }
 }
