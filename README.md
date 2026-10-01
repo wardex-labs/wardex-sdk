@@ -409,7 +409,10 @@ issued each stream where the `h2` library opens it, and proves which connection
 carries which `h2` connection object by the very bytes the client writes. A
 stream it cannot prove that for (an HTTP/2 client not built on `h2`, or one
 that copies its chunks before writing them) carries no conversation rather than
-a guessed one. A Responses
+a guessed one. A block scopes the context it was entered in, as any context
+variable does: entered on a worker thread with a copy of your context (FastAPI
+runs a plain `def` generator dependency's setup and teardown that way), it
+reaches only that thread's work, so open it in the endpoint instead. A Responses
 request can name a conversation itself (`conversation="conv_…"`, which the
 OpenAI Agents SDK's `Runner.run(conversation_id=…)` sends): outside any block
 that id is the call's `gen_ai.conversation.id`; inside one, your id wins and
