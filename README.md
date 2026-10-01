@@ -908,8 +908,12 @@ diagnostic line (traceback under `debug=True`).
   `chat` spans carry no `gen_ai.agent.name` — filter by walking up the tree
   to the `invoke_agent` span; a Responses-over-WebSocket run stays the
   counted, marked connection (`ws_llm_semantics_unread`) with no structure
-  read from the frames; with the framework's tracing disabled wardex logs one
-  INFO line at install and shows only the LLM calls; a `max_turns` handled by
+  read from the frames; `Runner.run(conversation_id=…)` reaches only the
+  `chat` spans — the framework hands that id to the model call, never to its
+  trace, so the run's own spans carry it only when `group_id` (or your
+  `wardex.conversation(...)`) names it too; with the framework's tracing
+  disabled wardex logs one INFO line at install and shows only the LLM calls;
+  a `max_turns` handled by
   `error_handlers` still ships ERROR on the agent and the root (the
   framework marks the span before consulting the handler); and with
   `trace_include_sensitive_data=False` the tool span carries the

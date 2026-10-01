@@ -14,6 +14,8 @@ The rules these tests hold:
   ambient scope may already be in the next conversation.
 * A span outside every conversation carries none, and concurrent conversations
   — `asyncio.gather`, a thread pool — never lend each other their ids.
+* A WebSocket session is ONE span for every call on the socket, so it names a
+  conversation only when its handshake and every message were issued in it.
 * A Responses request may name its own conversation in its body. With nothing
   ambient that id is the conversation; inside a conversation the ambient one
   wins (the host's word, as over a framework's `group_id`), and the body's id
@@ -24,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import contextlib
 import http.client
 import http.server
 import json
@@ -39,10 +42,16 @@ from hpack import Encoder
 import wardex_sdk as wardex
 from test_close_hook import _h2_answer, _h2_open
 from wardex_sdk import _hub, _wardex_native
-from wardex_sdk._assembly import EMPTY_AMBIENT, counters, resolve_observed, resolve_parentage
+from wardex_sdk._assembly import (
+    EMPTY_AMBIENT,
+    Limitation,
+    counters,
+    resolve_observed,
+    resolve_parentage,
+)
 from wardex_sdk._enums import CaptureMode, SpanKind
 from wardex_sdk._interceptors._seam import _latched
-from wardex_sdk._interceptors._trackers import _Txn
+from wardex_sdk._interceptors._trackers import _Txn, _WebSocketTracker
 from wardex_sdk._semantics import REQUEST_CONVERSATION_KEY
 from wardex_sdk._types import ConversationContext
 from wardex_sdk.testing import RecordingTransport
@@ -469,6 +478,106 @@ def test_a_websocket_session_carries_the_conversation_its_handshake_was_issued_i
     (span,) = itc._client.spans
     assert span.name.startswith("WS")
     assert _conv(span) == "ws-conv"
+
+
+def _ws_frame(opcode: int, payload: bytes) -> bytes:
+    return bytes([0x80 | opcode, len(payload)]) + payload  # FIN, unmasked, payload < 126
+
+
+_WS_CREATE = _ws_frame(0x1, json.dumps({"type": "response.create", "model": "m"}).encode())
+_WS_CLIENT_CLOSE = _ws_frame(0x8, (1000).to_bytes(2, "big"))
+#: A Text frame header claiming 2 MiB, above `max_ws_frame_bytes`: the client
+#: parser dies on it and never yields a message again.
+_WS_OVERSIZE = bytes([0x81, 127]) + (2 * 1024 * 1024).to_bytes(8, "big")
+
+
+@contextlib.contextmanager
+def _issued_in(cid: str | None) -> Iterator[None]:
+    """A scope whose ambient conversation is `cid`; None is outside every one."""
+    with _hub.new_scope() as scope:
+        scope.conversation = None if cid is None else ConversationContext(conversation_id=cid)
+        yield
+
+
+def test_a_websocket_session_reused_in_another_conversation_names_neither(
+    fake_ssl_socket, bare_ssl_interceptor
+):
+    """A pooled Responses socket opened lazily in conversation A, its next
+    call issued in B, closed outside both. The session is ONE span and
+    neither conversation issued all of it, so it names neither: stamping the
+    handshake's A on B's call is the cross-conversation leak this rules out."""
+    itc = bare_ssl_interceptor
+    itc._client.config.capture_mode = CaptureMode.ALL
+    sock = fake_ssl_socket(alpn=None)
+    with _issued_in("A"):
+        itc._on_request_bytes(
+            sock,
+            b"GET /v1/responses HTTP/1.1\r\nHost: api.openai.com\r\nUpgrade: websocket\r\n"
+            b"Connection: Upgrade\r\nSec-WebSocket-Key: x\r\n\r\n",
+        )
+    itc._on_response_bytes(
+        sock,
+        b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+    )
+    with _issued_in("B"):
+        itc._on_request_bytes(sock, _WS_CREATE)
+        itc._on_response_bytes(sock, _ws_frame(0x1, b'{"type":"response.created"}'))
+    itc._on_response_bytes(sock, _ws_frame(0x8, (1000).to_bytes(2, "big")))
+    (span,) = itc._client.spans
+    assert dict(span.extra)["ws.messages.sent"] == 1
+    assert span.conversation is None
+
+
+@pytest.mark.parametrize(
+    ("handshake", "messages", "closer", "want"),
+    [
+        # Every message issued in A. The client's close frame, written outside
+        # any conversation, is a control frame and not a message: it splits nothing.
+        ("A", ["A", "A"], None, "A"),
+        ("A", ["B"], "B", None),  # opened in A, every call in B
+        ("A", ["A", "B"], "A", None),  # reused across conversations
+        ("A", ["A", None], "A", None),  # one call issued outside every conversation
+        (None, ["B"], "B", None),  # opened outside, its calls in B
+        (None, [None], None, None),  # nothing to name, nothing named
+    ],
+)
+def test_a_websocket_session_names_a_conversation_only_if_every_message_was_issued_in_it(
+    handshake, messages, closer, want
+):
+    t = _WebSocketTracker(
+        path="/v1/responses",
+        deflate=False,
+        parent=None,
+        start_ns=1,
+        conversation=None if handshake is None else ConversationContext(conversation_id=handshake),
+    )
+    for cid in messages:
+        with _issued_in(cid):
+            assert t.on_request_bytes(_WS_CREATE) == []
+    with _issued_in(closer):
+        (txn,) = t.on_request_bytes(_WS_CLIENT_CLOSE)
+    assert txn.ws_messages_sent == len(messages)
+    assert (txn.conversation.conversation_id if txn.conversation else None) == want
+
+
+@pytest.mark.parametrize(("later", "want"), [("A", "A"), ("B", None), (None, None)])
+def test_a_websocket_session_whose_parser_died_weighs_every_later_write(later, want):
+    """A dead client parser can no longer tell a message from a control frame,
+    so every write after it counts, and one issued elsewhere splits the session."""
+    t = _WebSocketTracker(
+        path="/v1/responses",
+        deflate=False,
+        parent=None,
+        start_ns=1,
+        conversation=ConversationContext(conversation_id="A"),
+    )
+    with _issued_in("A"):
+        t.on_request_bytes(_WS_OVERSIZE)
+    assert t._sent.is_disabled()
+    with _issued_in(later):
+        t.on_request_bytes(b"\x81\x02hi")
+    (txn,) = t.flush(Limitation.WS_NO_CLOSE)
+    assert (txn.conversation.conversation_id if txn.conversation else None) == want
 
 
 def test_a_closed_units_carrier_does_not_lend_its_conversation():

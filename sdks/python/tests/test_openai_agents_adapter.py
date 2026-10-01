@@ -1596,6 +1596,46 @@ def test_the_runs_conversation_wins_over_the_requests_own(agents_env):
     assert attrs["chat gpt-4o-mini"]["wardex.openai.conversation_id"] == "conv_1"
 
 
+def test_concurrent_runs_chat_spans_carry_the_conversation_each_request_names(agents_env):
+    """`Runner.run(conversation_id=…)` with the adapter ON and no `group_id`,
+    two runs at once naming different conversations. The framework hands that
+    id to the model call and never to its trace, so the run opens with none;
+    the `chat` spans still carry it, read off each request's own
+    `conversation`. Each run's spans carry its own id or none, never the
+    other run's."""
+
+    async def both() -> list[Any]:
+        return await asyncio.gather(
+            *(
+                Runner.run(
+                    _agents(), "hi", run_config=RunConfig(workflow_name="wf"), conversation_id=c
+                )
+                for c in ("convA", "convB")
+            )
+        )
+
+    _init()
+    try:
+        assert [r.final_output for r in asyncio.run(both())] == ["done", "done"]
+        spans = _spans()
+        assert counters.get("semantics.request_conversation_shadowed") == 0
+    finally:
+        wardex.close()
+    by_trace: dict[Any, list[Any]] = {}
+    for s in spans:
+        by_trace.setdefault(s.context.trace_id, []).append(s)
+    named = []
+    for trace in by_trace.values():
+        chats = _chat_spans(trace)
+        assert len(chats) == 3
+        (cid,) = {c.conversation.conversation_id for c in chats if c.conversation is not None}
+        assert all(c.conversation is not None for c in chats)
+        carried = {s.conversation.conversation_id for s in trace if s.conversation is not None}
+        assert carried == {cid}, [(s.name, s.conversation) for s in trace]
+        named.append(cid)
+    assert sorted(named) == ["convA", "convB"]
+
+
 def test_run_sync_three_turns_are_one_tree(agents_env):
     _init()
     try:

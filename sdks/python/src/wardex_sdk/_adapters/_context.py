@@ -1137,10 +1137,10 @@ class AdapterContext:
         `conversation` is the identity a framework RUN already carries — its group id, its thread
         id — handed in at the open so that every child unit opened under the run inherits it, the
         way a session the parentage issued one for would. It reaches the ambient a pin installs
-        too, but NOT the wire spans issued under that pin: the byte seam latches only the span
-        context at request time (`_interceptors/_seam.py::_latched`), so a wire `chat` span under
-        the run carries no conversation yet. `enter()` takes it for a run opened as a scope; a
-        nested `enter()` given none inherits its parent's.
+        too, and through it the wire spans issued under that pin: the byte seam latches it beside
+        the span context at request time (`_interceptors/_seam.py::_latched`), so a wire `chat`
+        span under the run carries it. `enter()` takes it for a run opened as a scope; a nested
+        `enter()` given none inherits its parent's.
         """
         unit = None
         handle = None
