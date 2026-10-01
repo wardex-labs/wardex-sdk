@@ -399,6 +399,15 @@ a separate attribute (`wardex.openai_agents.group_id`) rather than as the
 conversation. Two `conversation()` blocks opened side by side under one span
 are two conversations in one trace, by design — the block scopes the id, not
 the trace.
+"Every span" includes the LLM calls wardex reads off the wire: a call carries
+the conversation its request was issued in, so blocks running concurrently —
+under `asyncio.gather`, or on threads carried by `wardex.bind_context` — each
+keep their own id, and a call outside every block carries none. A Responses
+request can name a conversation itself (`conversation="conv_…"`, which the
+OpenAI Agents SDK's `Runner.run(conversation_id=…)` sends): outside any block
+that id is the call's `gen_ai.conversation.id`; inside one, your id wins and
+the request's rides along as `wardex.openai.conversation_id`, counted under
+`semantics.request_conversation_shadowed`.
 `workflow` / `agent` / `step` / `tool` map to the `gen_ai.operation.name`
 values `invoke_workflow` / `invoke_agent` / `execute_step` / `execute_tool`,
 so decorated spans appear on operation-keyed dashboards. `span()` and
@@ -643,8 +652,8 @@ under `interceptors.seam.provider_state_dropped`. With the OpenAI Agents
 SDK's `Runner.run(conversation_id=…)` (measured on 0.22) each turn is still
 a `chat` span, but its input is only the items the framework had not sent
 yet — the second turn's input is the tool result alone — and the
-`conversation` id that joins the turns is not yet surfaced as a span
-attribute.
+`conversation` id that joins the turns is each `chat` span's
+`gen_ai.conversation.id`.
 
 ## asyncio
 
@@ -886,8 +895,9 @@ diagnostic line (traceback under `debug=True`).
   `wardex.conversation(...)`, in which case the host's id stays on every
   span and the group id rides along on the root as
   `wardex.openai_agents.group_id`. The LLM calls stay the wire's `chat` spans, parented
-  under the agent by context; the adapter discards the framework's usage so
-  nothing is billed twice. By default the framework's own upload to
+  under the agent by context and carrying the run's conversation id; the
+  adapter discards the framework's usage so nothing is billed twice. By
+  default the framework's own upload to
   `api.openai.com/v1/traces/ingest` continues unchanged; wardex does not
   replace it. For the structure without that upload, IN THIS ORDER:
   `agents.set_trace_processors([])` and THEN `wardex.init()` (the reverse
@@ -910,13 +920,6 @@ diagnostic line (traceback under `debug=True`).
   tools invoked outside a graph — those produce no structural spans today, and
   a LangChain-built *agent* is covered by the LangGraph adapter above because
   `create_agent` compiles to a `Pregel` graph
-- The `conversation` id in the request is not yet surfaced as a span
-  attribute on the wire `chat` spans (no `gen_ai.conversation.id` there). It
-  is a plain field in the Responses request body — measured, present in
-  every POST of a `Runner.run(conversation_id=…)` run — and the byte seam
-  latches only the span context at request time, so the adapter's
-  `group_id` does not reach the chat spans either; it is a wire-side
-  follow-up
 - Node/TS and Java SDKs
 
 **Notes**

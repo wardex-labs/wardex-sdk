@@ -319,6 +319,12 @@ impl LlmSemantics {
     fn previous_response_id(&self) -> Option<String> {
         self.inner.previous_response_id.clone()
     }
+    /// The conversation the request names (Responses `conversation`). The
+    /// seam decides whether it becomes the span's `gen_ai.conversation.id`.
+    #[getter]
+    fn conversation_id(&self) -> Option<String> {
+        self.inner.conversation_id.clone()
+    }
     /// `gen_ai.response.status` (Responses only).
     #[getter]
     fn response_status(&self) -> Option<String> {

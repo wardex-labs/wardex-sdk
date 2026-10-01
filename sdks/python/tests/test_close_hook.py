@@ -758,7 +758,7 @@ def test_a_late_low_stream_id_is_evicted_before_higher_ones():
     enc = Encoder()
     tracker.on_request_bytes(_h2_open_unended(enc, 1))
     for sid in (3, 5):
-        tracker._latch[sid] = (None, False, 0)
+        tracker._latch[sid] = (None, False, None, 0)
     tracker.on_request_bytes(_h2_end_body(1))
     assert set(tracker._latch) == {3, 5}
     assert tracker._latch_first == 1

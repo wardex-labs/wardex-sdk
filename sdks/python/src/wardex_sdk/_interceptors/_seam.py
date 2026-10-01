@@ -40,6 +40,7 @@ from .._limits import LimitsConfig, LimitsConsumer, limits_kwargs
 from .._protocol import classify_path, classify_ws_upgrade, parse_llm_semantics
 from .._semantics import (
     USAGE_DROPPED_KEY,
+    apply_request_conversation,
     build_gen_ai,
     build_grpc_fields,
     embeddings_attrs,
@@ -563,6 +564,7 @@ class ByteSeamInterceptor(InterceptorInterface):
                     deflate=txn.ws_deflate,
                     parent=txn.parent,
                     parent_closed=txn.parent_closed,
+                    conversation=txn.conversation,
                     start_ns=txn.start_ns,
                     limits=self._native_limits,
                     llm_upgrade=classify_ws_upgrade(url_host, txn.ws_upgrade_path or "/"),
@@ -1066,6 +1068,7 @@ def _assemble(p: _PendingTxn, *, parse: bool, extra: tuple[Limitation, ...]) -> 
             identified = _is_llm_traffic(txn, sem)
             if identified:
                 draft.set_gen_ai(build_gen_ai(sem))
+                apply_request_conversation(draft, edge.conversation, sem.conversation_id)
                 if (limitation := provider_limitation(sem)) is not None:
                     draft.add_limitation(limitation)  # the label above is a guess
                 # The open half rides only on an IDENTIFIED span: the `openai.*` scalars, the
@@ -1176,14 +1179,11 @@ def _latched(txn: _Txn) -> Ambient:
     the shape `resolve_parentage` consumes, not a place to keep one seam's
     bookkeeping. `_build_span` and `_build_ws_span` pass it explicitly.
 
-    `conversation` and `tracestate` are None because the tracker latches neither
-    today; that is exactly the pre-existing behaviour (the seam never set
-    `InternalSpan.conversation`), and widening the latch to a full `Ambient`
-    belongs with the seam decomposition (design §3.3) — it is a change to what
-    the tracker captures at request time, not to how this function shapes what
-    it already captured.
+    `conversation` was latched beside the parent, off the same scope read.
+    `tracestate` is None: the tracker does not latch it, and widening to a full
+    `Ambient` belongs with the seam decomposition (design §3.3).
     """
-    return Ambient(span_context=txn.parent, conversation=None, tracestate=None)
+    return Ambient(span_context=txn.parent, conversation=txn.conversation, tracestate=None)
 
 
 def _url_host(obj: Any, st: _ConnectionState) -> str:

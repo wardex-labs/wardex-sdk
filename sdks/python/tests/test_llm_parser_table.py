@@ -89,6 +89,9 @@ def test_fixture_parses_to_its_expectation(case: str):
     assert sem.input_tokens == expect.get("input_tokens"), case
     assert sem.output_tokens == expect.get("output_tokens"), case
     assert sem.finish_reasons == expect.get("finish_reasons"), case
+    # Asserted for EVERY case, not only where declared: a request that names
+    # no conversation must come back with none, never one made up.
+    assert sem.conversation_id == expect.get("conversation_id"), case
     if expect["output_messages_present"]:
         assert sem.output_messages, f"{case}: output_messages empty"
     else:

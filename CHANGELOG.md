@@ -193,6 +193,33 @@ All notable changes to this project are documented here. The format follows
   left as written on both wires. In both forms the card rule is the only
   built-in rule that can match. Everything else your application or its
   traffic puts on a span is masked exactly as before.
+- **The LLM calls inside a conversation carry its id.** `wardex.conversation()`
+  promised `gen_ai.conversation.id` on every span inside the block, and every
+  span had it except the LLM calls read off the wire — the spans that carry
+  the tokens. The same held under an OpenAI Agents `RunConfig(group_id=…)` and
+  a LangGraph `thread_id`: the run's own spans carried the id, its `chat`
+  spans did not. Grouping a backend's spans by conversation id and summing
+  tokens therefore answered zero for every conversation. Every span the byte
+  seam builds — HTTP/1, HTTP/2, WebSocket — now carries the conversation its
+  request was issued in, read at the moment the request went out (never when
+  the response came back, by which time your code may be in the next
+  conversation), and a call made outside every conversation still carries
+  none.
+- **A Responses request's own `conversation` is its conversation id.** With
+  `Runner.run(conversation_id=…)`, or any `POST /v1/responses` that sets
+  `conversation` (the id, or `{"id": …}`), the request names the provider-held
+  conversation it belongs to; that id is now the `chat` span's
+  `gen_ai.conversation.id`. When the call is already inside a conversation —
+  your `wardex.conversation(...)`, or a run that states one — that one wins,
+  the same rule that keeps your id over a framework's `group_id`, and the
+  request's differing id rides along as `wardex.openai.conversation_id`,
+  counted under `semantics.request_conversation_shadowed`.
+- **Concurrent `wardex.conversation()` blocks no longer lend each other their
+  ids.** The block wrote its id onto a scope object that every task of an
+  `asyncio.gather` — and every thread `bind_context` carried — shares, so work
+  running beside an open block outside any conversation picked up that
+  block's id, and once both blocks of a pair had closed, code after them still
+  carried one of their ids. Each block now installs its id on its own copy.
 - **Ctrl-C reaches your program while a batch is being exported.** The OTLP
   exporter skips a span it cannot marshal instead of dropping the batch, and
   it treated a `KeyboardInterrupt` or `SystemExit` raised by your code during
@@ -1109,17 +1136,6 @@ the private native encoder returns three values.
   processor in front. The open check is the oracle's Phoenix counterpart
   (the Langfuse e2e driver pointed at a live Phoenix); until someone runs
   it, treat Phoenix cost columns under wardex as unverified.
-
-### Known limitations
-
-- **wardex does not yet surface the request's `conversation` id (no
-  `gen_ai.conversation.id`).** Under openai-agents
-  `Runner.run(conversation_id=…)` the field is on the wire in every request —
-  measured on 0.22 in `tests/test_openai_agents_wire.py`, all three POSTs
-  carry `conversation=conv_1` — so the id that joins the turns is there to be
-  read and wardex simply does not map it onto the span. Nothing about the
-  framework blocks it; it is a wire-side follow-up, not an ecosystem gap.
-
 
 ## [0.5.0b1] - 2026-08-16
 

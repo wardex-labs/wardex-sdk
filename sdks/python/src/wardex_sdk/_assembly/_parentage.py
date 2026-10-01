@@ -448,8 +448,9 @@ def resolve_observed(
     `resolve_parentage`'s JOIN branch and ships `joined=True` with a parent
     while `strategy=UNRESOLVED` claims there is none — a span simultaneously
     adopting and disowning, which is the exact undetectable shape this whole
-    module exists to prevent. Nothing is lost by the substitution: the byte
-    seam's carrier on this path holds no conversation and no tracestate either.
+    module exists to prevent. Nothing is lost by the substitution: the evicted
+    latch entry took the request's conversation with it, and the byte seam's
+    carrier holds no tracestate.
     """
     if parent_closed:
         return resolve_parentage(EMPTY_AMBIENT, _ORPHANED_BY_WARDEX)

@@ -21,7 +21,8 @@ This file closes it from the sender's side, per adapter, in two halves:
 The contract, for every adapter: an id the host or the framework stated is in
 the typed conversation field of every span the adapter opened, nothing about
 the conversation is in `extra`, and a span the adapter did not open — a wire
-`chat` span — carries no conversation rather than an invented one.
+`chat` span issued inside the run — carries the run's conversation too, the
+one its request was issued in.
 
 Regenerate the committed files (bytes differ per run — ids and clocks — and
 are not compared; only the contract is):
@@ -99,10 +100,14 @@ def _check(adapter: str, body: bytes) -> None:
         leaked = [k for k in keys if k == "gen_ai.conversation.id" or k.startswith("wardex.conv")]
         assert not leaked, f"{adapter}: {span['name']!r} still writes {leaked} into extra"
     if adapter == "openai_agents":
-        # The LLM calls are read off the wire, and the byte seam does not latch
-        # the run's conversation: they carry none. Pinned here so that the day
-        # they gain it, this line is where it is noticed — not a store.
-        assert wire and all("conversation" not in s for s in wire)
+        # The LLM calls are read off the wire, and the byte seam latches the
+        # conversation their requests were issued in: the run's. These are the
+        # spans that carry the tokens, so a receiver summing a conversation's
+        # cost reads them here.
+        assert wire
+        for span in wire:
+            got = span.get("conversation", {}).get("conversation_id")
+            assert got == conversation_id, f"{adapter}: wire {span['name']!r} carries {got!r}"
     if adapter == "agent_sdk":
         turns = sorted(
             s["conversation"]["turn_index"] for s in spans if s["conversation"]["turn_index"]
