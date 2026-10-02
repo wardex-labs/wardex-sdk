@@ -3,6 +3,24 @@
 //! Every message is destructured WITHOUT `..` so that adding a proto field
 //! breaks this build until someone decides whether the new field is masked
 //! (design §4.3). Non-text fields are bound to `_`.
+//!
+//! A text field the SDK fills by itself is bound to `_` too, under an
+//! `SDK-GENERATED` note. Masking is for what the host and its traffic put on
+//! a span; an id the SDK minted is neither, and a rule that fires on it is
+//! wrong twice — it rewrites the id, and it writes into the span's record a
+//! masking of data that was never there. `str(id(socket))` is the case that
+//! happened: fifteen digits on 64-bit Linux, and about one in ten passes the
+//! card checksum. `tests/sdk_generated_fields.rs` holds the list and proves
+//! both sides of it.
+//!
+//! One field is the SDK's only sometimes: the conversation id is the host's
+//! when it names one and the SDK's when nobody does. That field stays masked,
+//! and its value is judged instead — see `is_sdk_minted_id`.
+//!
+//! A span attribute the SDK computes is judged the same way, by its key and
+//! the exact form the SDK writes under it — see `SDK_VALUE_ATTRS`. Attributes
+//! are a map anyone can write into, so a key alone does not say the SDK wrote
+//! the value; the form says the SDK could have.
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
@@ -63,11 +81,14 @@ pub fn mask_envelope(engine: &PiiEngine, env: &mut pb::Envelope) {
     }
     for item in items {
         let pb::EnvelopeItem { header, payload } = item;
-        if let Some(pb::EnvelopeItemHeader { r#type, length: _ }) = header {
-            // Item-level metadata, masked at the same tier as the envelope
-            // header — it does not feed any per-span redacted flag.
-            mask_string(&mut Masker::new(engine), r#type);
-        }
+        // Still destructured, so a field added here has to be classified.
+        if let Some(pb::EnvelopeItemHeader {
+            // SDK-GENERATED: the marshaller's own item tag, "span" or
+            // "state_snapshot".
+            r#type: _,
+            length: _,
+        }) = header
+        {}
         match payload {
             Some(pb::envelope_item::Payload::Span(span)) => {
                 let masked = catch_unwind(AssertUnwindSafe(|| mask_span(engine, span)));
@@ -101,6 +122,110 @@ pub fn mask_envelope(engine: &PiiEngine, env: &mut pb::Envelope) {
 }
 
 // --- primitives ---
+
+/// The key the conversation id is spelled under as an attribute: where the
+/// OTLP mapping writes `ConversationContext.conversation_id`, and where a
+/// host that spells it into a span's attributes by hand puts its own.
+const CONVERSATION_ID_KEY: &str = "gen_ai.conversation.id";
+
+/// SDK-MINTED: `text` is, byte for byte, an id of the form the SDK makes up
+/// for a conversation nobody named — `str(uuid.uuid4())` when
+/// `wardex.conversation()` is opened without an id, and `uuid.uuid4().hex`
+/// for an Agent SDK session the CLI has not named yet. Lowercase hex, the
+/// version digit `4` and a variant digit `8`, `9`, `a` or `b`, as Python
+/// writes them.
+///
+/// The conversation id cannot be left alone the way `connection_id` is: a
+/// host that names a conversation names it there, in its own words. So the
+/// field is masked and an id of this form is not. A host id of exactly this
+/// form is left alone too, since no byte says who wrote it. What that gives
+/// up is the card rule's matches on it and nothing else: no other built-in
+/// rule can match inside the form, and the card rule only on the UUID's own
+/// digit groups (`8-4-4` or `4-12`) when every hex digit in them happens to
+/// be decimal, which with the checksum is about one random id in seven
+/// thousand. Any other text, a UUID in capitals or of another version
+/// included, is judged as before.
+fn is_sdk_minted_id(text: &str) -> bool {
+    let hex = |c: u8| c.is_ascii_digit() || (b'a'..=b'f').contains(&c);
+    let variant = |c: u8| matches!(c, b'8' | b'9' | b'a' | b'b');
+    let b = text.as_bytes();
+    match b.len() {
+        36 => b.iter().enumerate().all(|(i, &c)| match i {
+            8 | 13 | 18 | 23 => c == b'-',
+            14 => c == b'4',
+            19 => variant(c),
+            _ => hex(c),
+        }),
+        32 => b.iter().enumerate().all(|(i, &c)| match i {
+            12 => c == b'4',
+            16 => variant(c),
+            _ => hex(c),
+        }),
+        _ => false,
+    }
+}
+
+/// Where the OpenAI Agents adapter writes the identity of the tool list an
+/// MCP server answered with: `hash_canonical(sorted(names))[:16]`.
+const MCP_TOOLS_HASH_KEY: &str = "wardex.openai_agents.mcp.tools_hash";
+
+/// SDK-COMPUTED: `text` is, byte for byte, a value of the form the SDK writes
+/// under `MCP_TOOLS_HASH_KEY` — the first sixteen digits of a SHA-256 in
+/// lowercase hex, as `hashlib`'s `hexdigest()` writes them.
+///
+/// A digest whose sixteen digits are all decimal and pass the checksum reads
+/// as a card number, about one tool list in eighteen thousand, and unlike a
+/// fresh id it is the same digest on every run against that server. The card
+/// rule is the only built-in rule that can match inside this form, so leaving
+/// it alone gives up that rule's matches on a sixteen-digit value under this
+/// one key and nothing else.
+fn is_sdk_tools_digest(text: &str) -> bool {
+    text.len() == 16
+        && text
+            .bytes()
+            .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+}
+
+/// Whether a text is in the exact form the SDK writes under one key.
+type SdkForm = fn(&str) -> bool;
+
+/// Span attributes whose value the SDK makes itself, each by the key it
+/// writes it under and the exact form it writes. An attribute matching both
+/// ships as written and goes into no record; under any other key, or in any
+/// other form, the same text is judged like everything else the host put on
+/// the span. `tests/sdk_generated_fields.rs` proves both sides, and
+/// `sdks/python/tests/test_sdk_attribute_census.py` reads every attribute the
+/// SDK writes out of its source and fails until each is classified, this
+/// list included.
+const SDK_VALUE_ATTRS: &[(&str, SdkForm)] = &[
+    // The SDK's when nobody named the conversation; see `is_sdk_minted_id`.
+    (CONVERSATION_ID_KEY, is_sdk_minted_id),
+    (MCP_TOOLS_HASH_KEY, is_sdk_tools_digest),
+];
+
+/// A span attribute holding a value the SDK could have written itself —
+/// left as written, for the reasons `SDK_VALUE_ATTRS` gives.
+fn is_sdk_value_attr(key: &str, value: Option<&str>) -> bool {
+    value.is_some_and(|text| {
+        SDK_VALUE_ATTRS
+            .iter()
+            .any(|(k, form)| *k == key && form(text))
+    })
+}
+
+fn pb_text(v: &Option<pb::AnyValue>) -> Option<&str> {
+    match v.as_ref()?.value.as_ref()? {
+        pb::any_value::Value::StringValue(s) => Some(s),
+        _ => None,
+    }
+}
+
+fn otlp_text(v: &Option<otlp_pb::common::AnyValue>) -> Option<&str> {
+    match v.as_ref()?.value.as_ref()? {
+        otlp_pb::common::any_value::Value::StringValue(s) => Some(s),
+        _ => None,
+    }
+}
 
 fn mask_string(m: &mut Masker<'_>, s: &mut String) -> bool {
     match m.engine.mask_text_into(s, &mut m.report) {
@@ -209,7 +334,9 @@ fn mask_any(m: &mut Masker<'_>, v: &mut pb::AnyValue) -> bool {
 
 fn mask_header(m: &mut Masker<'_>, h: &mut pb::EnvelopeHeader) {
     let pb::EnvelopeHeader {
-        event_id,
+        // SDK-GENERATED: `str(uuid.uuid4())`, minted per batch. A UUID whose
+        // first sixteen hex digits are all decimal can pass the card checksum.
+        event_id: _,
         sdk,
         sent_at_unix_nano: _,
         session_status: _,
@@ -220,10 +347,9 @@ fn mask_header(m: &mut Masker<'_>, h: &mut pb::EnvelopeHeader) {
         // detach a stored batch from its project.
         project_id: _,
     } = h;
-    mask_string(m, event_id);
     if let Some(r) = resource {
-        // The app's identity strings are host-supplied free text, so they get
-        // the same treatment as SdkInfo's strings below.
+        // The app's identity strings are host-supplied free text, so they are
+        // masked — unlike most of SdkInfo below, which the SDK writes itself.
         let pb::ResourceInfo {
             service_name,
             release,
@@ -239,28 +365,28 @@ fn mask_header(m: &mut Masker<'_>, h: &mut pb::EnvelopeHeader) {
     }
     if let Some(s) = sdk {
         let pb::SdkInfo {
-            name,
-            version,
-            python_version,
-            os,
-            arch,
+            // SDK-GENERATED: the SDK's name and version, the semconv release
+            // it was reconciled against, and the interpreter's own
+            // `platform.python_version()`, `sys.platform` and
+            // `platform.machine()` — read by the SDK, never host free text.
+            name: _,
+            version: _,
+            python_version: _,
+            os: _,
+            arch: _,
+            otel_semconv_version: _,
+            // No producer fills these three yet. Until one does and says
+            // what it writes, they are masked like host text.
             adapters,
             interceptors,
-            otel_semconv_version,
             shell,
         } = s;
-        mask_string(m, name);
-        mask_string(m, version);
-        mask_string(m, python_version);
-        mask_string(m, os);
-        mask_string(m, arch);
         for a in adapters {
             mask_string(m, a);
         }
         for i in interceptors {
             mask_string(m, i);
         }
-        mask_string(m, otel_semconv_version);
         mask_string(m, shell);
     }
 }
@@ -304,7 +430,17 @@ fn mask_span(engine: &PiiEngine, span: &mut pb::Span) {
     if let Some(pb::Status { code: _, message }) = status {
         hit |= mask_string(m, message);
     }
-    hit |= mask_kvs(m, extra);
+    // The attributes the SDK computes, in the form it writes them, are left
+    // as written. The OTLP mapping ships `extra` under the same keys, and
+    // the conversation id's key also holds the typed field there, so
+    // `mask_otlp_span` judges the same pairs the same way and the two wires
+    // agree on what was masked.
+    for kv in extra
+        .iter_mut()
+        .filter(|kv| !is_sdk_value_attr(&kv.key, pb_text(&kv.value)))
+    {
+        hit |= mask_kvs(m, std::slice::from_mut(kv));
+    }
     for ev in events {
         let pb::SpanEvent {
             name,
@@ -353,7 +489,11 @@ fn mask_span(engine: &PiiEngine, span: &mut pb::Span) {
         turn_index: _,
     }) = conversation
     {
-        hit |= mask_string(m, conversation_id);
+        // The host's when it named the conversation, the SDK's when it did
+        // not: masked, except a value in the form the SDK mints.
+        if !is_sdk_minted_id(conversation_id) {
+            hit |= mask_string(m, conversation_id);
+        }
         hit |= mask_string(m, session_id);
     }
     if let Some(pb::CorrelationInfo {
@@ -389,7 +529,9 @@ fn mask_span(engine: &PiiEngine, span: &mut pb::Span) {
 
 fn mask_transport(m: &mut Masker<'_>, t: &mut pb::TransportAttributes) -> bool {
     let pb::TransportAttributes {
-        connection_id,
+        // SDK-GENERATED: `str(id(socket))`, the process object id the SDK
+        // keys a connection by — the field this whole list exists for.
+        connection_id: _,
         protocol: _,
         direction: _,
         timing,
@@ -409,7 +551,6 @@ fn mask_transport(m: &mut Masker<'_>, t: &mut pb::TransportAttributes) -> bool {
         connection_reused: _,
     } = t;
     let mut hit = false;
-    hit |= mask_string(m, connection_id);
     // All numeric today; the exhaustive destructure is the §4.3 compile-time
     // tripwire for future text fields.
     if let Some(pb::TransportTiming {
@@ -513,6 +654,17 @@ fn mask_snapshot(m: &mut Masker<'_>, snap: &mut pb::StateSnapshot) {
 
 // --- OTLP masking (design §4.2, OTLP path) ---
 
+/// SDK-GENERATED resource attributes: the mapping writes them from the
+/// producer the binding passes and from `SdkInfo.version`. A resource has no
+/// host-supplied attributes beside them under these keys — the mapping builds
+/// the whole resource, and the host's part of it is `service.*` and
+/// `deployment.*`.
+const SDK_RESOURCE_KEYS: [&str; 3] = [
+    "telemetry.sdk.name",
+    "telemetry.sdk.version",
+    "telemetry.sdk.language",
+];
+
 /// Mask an OTLP export request (design §4.2, OTLP path). A span that panics
 /// is scrubbed whole; a span with replacements gains `wardex.redacted=true`
 /// (OTLP spans have no capture_integrity — this is the OTLP equivalent).
@@ -531,7 +683,13 @@ pub fn mask_otlp(engine: &PiiEngine, req: &mut otlp_pb::trace_service::ExportTra
             dropped_attributes_count: _,
         }) = resource
         {
-            mask_otlp_kvs(&mut Masker::new(engine), attributes);
+            let m = &mut Masker::new(engine);
+            for kv in attributes
+                .iter_mut()
+                .filter(|kv| !SDK_RESOURCE_KEYS.contains(&kv.key.as_str()))
+            {
+                mask_otlp_kvs(m, std::slice::from_mut(kv));
+            }
         }
         mask_string(&mut Masker::new(engine), schema_url);
         for ss in scope_spans {
@@ -541,16 +699,15 @@ pub fn mask_otlp(engine: &PiiEngine, req: &mut otlp_pb::trace_service::ExportTra
                 schema_url,
             } = ss;
             if let Some(otlp_pb::common::InstrumentationScope {
-                name,
-                version,
+                // SDK-GENERATED: the producer's scope name and the SDK's
+                // version, which the mapping writes and nothing else does.
+                name: _,
+                version: _,
                 attributes,
                 dropped_attributes_count: _,
             }) = scope
             {
-                let m = &mut Masker::new(engine);
-                mask_string(m, name);
-                mask_string(m, version);
-                mask_otlp_kvs(m, attributes);
+                mask_otlp_kvs(&mut Masker::new(engine), attributes);
             }
             mask_string(&mut Masker::new(engine), schema_url);
             for span in spans {
@@ -592,7 +749,14 @@ fn mask_otlp_span(engine: &PiiEngine, span: &mut otlp_pb::trace::Span) -> Option
     let mut hit = false;
     hit |= mask_string(m, trace_state);
     hit |= mask_string(m, name);
-    hit |= mask_otlp_kvs(m, attributes);
+    // `extra`'s pairs arrive here under their own keys, and the typed
+    // conversation id under `gen_ai.conversation.id` — see `mask_span`.
+    for kv in attributes
+        .iter_mut()
+        .filter(|kv| !is_sdk_value_attr(&kv.key, otlp_text(&kv.value)))
+    {
+        hit |= mask_otlp_kvs(m, std::slice::from_mut(kv));
+    }
     for ev in events {
         let otlp_pb::trace::span::Event {
             time_unix_nano: _,
@@ -898,9 +1062,11 @@ mod tests {
         assert_eq!(span.status.as_ref().unwrap().message, "failed for [EMAIL]");
         let url = &span.transport.as_ref().unwrap().http.as_ref().unwrap().url;
         assert_eq!(url, "https://api.x.com?key=[SECRET]");
+        // The item tag is the marshaller's own, so it ships as written even
+        // when it holds an address — see `tests/sdk_generated_fields.rs`.
         assert_eq!(
             env.items[0].header.as_ref().unwrap().r#type,
-            "span for [EMAIL]"
+            "span for john.doe@acme.com"
         );
     }
 
@@ -912,6 +1078,160 @@ mod tests {
             env.header.as_ref().unwrap().project_id,
             "sk-live-aaaaaaaaaaaaaaaa1234"
         );
+    }
+
+    #[test]
+    fn a_connection_id_that_passes_the_card_checksum_is_left_alone() {
+        // `str(id(socket))` on 64-bit Linux: fifteen digits, and about one in
+        // ten passes the Luhn checksum. This one does, so the card rule would
+        // replace it anywhere it judged it.
+        let cid = "140234567890138";
+        assert_eq!(
+            engine().mask_text(cid).as_deref(),
+            Some("****-****-****-0138")
+        );
+        let mut env = env_with(pb::Span {
+            name: "HTTP GET /v1/models".into(),
+            transport: Some(pb::TransportAttributes {
+                connection_id: cid.into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        mask_envelope(&engine(), &mut env);
+        let span = span_of(&env);
+        assert_eq!(span.transport.as_ref().unwrap().connection_id, cid);
+        let rules = span
+            .capture_integrity
+            .as_ref()
+            .map(|ci| ci.redaction_rules.clone())
+            .unwrap_or_default();
+        assert!(rules.is_empty(), "redaction_rules = {rules:?}");
+    }
+
+    #[test]
+    fn a_minted_id_is_exactly_what_python_writes_for_a_uuid4() {
+        // `str(uuid.uuid4())` and `uuid.uuid4().hex`.
+        for id in [
+            "48620579-8682-4828-a0e5-0454f31af317",
+            "9f1c2ab7-5e0d-4c3a-8013-123456891959",
+            "00000000-0000-4000-b000-000000000000",
+            "12345678901241238123456789012345",
+            "9f1c2ab75e0d4c3abfff123456891959",
+        ] {
+            assert!(is_sdk_minted_id(id), "{id}");
+        }
+        for id in [
+            // Capitals: Python never writes them.
+            "48620579-8682-4828-A0E5-0454F31AF317",
+            // Version 1, and the NCS and Microsoft variants.
+            "48620579-8682-1828-a0e5-0454f31af317",
+            "48620579-8682-4828-70e5-0454f31af317",
+            "48620579-8682-4828-c0e5-0454f31af317",
+            // Wrapped, prefixed, padded, cut or run on.
+            "{48620579-8682-4828-a0e5-0454f31af317}",
+            "urn:uuid:48620579-8682-4828-a0e5-0454f31af317",
+            " 48620579-8682-4828-a0e5-0454f31af317",
+            "48620579-8682-4828-a0e5-0454f31af31",
+            "48620579-8682-4828-a0e5-0454f31af317 john.doe@acme.com",
+            // Dashes out of place, or a non-hex letter.
+            "4862057-98682-4828-a0e5-0454f31af317",
+            "48620579-8682-4828-a0e5-0454f31af31g",
+            "1234567890124123812345678901234g",
+            "12345678901231238123456789012345",
+            "",
+        ] {
+            assert!(!is_sdk_minted_id(id), "{id}");
+        }
+    }
+
+    #[test]
+    fn a_minted_conversation_id_that_passes_the_card_checksum_is_left_alone() {
+        // `wardex.conversation()` with no id: its first three groups are all
+        // decimal and pass the checksum, so the card rule would replace them.
+        let cid = "48620579-8682-4828-a0e5-0454f31af317";
+        assert_eq!(
+            engine().mask_text(cid).as_deref(),
+            Some("****-****-****-4828-a0e5-0454f31af317")
+        );
+        let mut env = env_with(pb::Span {
+            name: "chat".into(),
+            conversation: Some(pb::ConversationContext {
+                conversation_id: cid.into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        mask_envelope(&engine(), &mut env);
+        let span = span_of(&env);
+        assert_eq!(span.conversation.as_ref().unwrap().conversation_id, cid);
+        assert!(span.capture_integrity.is_none());
+        // A host's id of any other form is judged as before.
+        let mut env = env_with(pb::Span {
+            conversation: Some(pb::ConversationContext {
+                conversation_id: "48620579-8682-4828-c0e5-0454f31af317".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        mask_envelope(&engine(), &mut env);
+        let span = span_of(&env);
+        assert_eq!(
+            span.conversation.as_ref().unwrap().conversation_id,
+            "****-****-****-4828-c0e5-0454f31af317"
+        );
+        assert_eq!(
+            span.capture_integrity.as_ref().unwrap().redaction_rules,
+            vec![Rule::CreditCard as i32]
+        );
+    }
+
+    #[test]
+    fn a_tool_list_digest_that_passes_the_card_checksum_is_left_alone() {
+        // What the OpenAI Agents adapter writes for an MCP server listing
+        // `get_weather` and `search_docs_v28401`: sixteen decimal digits
+        // that pass the checksum, on every run against that server.
+        let digest = "8096697742134142";
+        assert_eq!(
+            engine().mask_text(digest).as_deref(),
+            Some("****-****-****-4142")
+        );
+        let with = |key: &str, value: &str| {
+            env_with(pb::Span {
+                name: "execute_step mcp.list_tools".into(),
+                extra: vec![text_kv(key, value)],
+                ..Default::default()
+            })
+        };
+        let mut env = with(MCP_TOOLS_HASH_KEY, digest);
+        let before = env.clone();
+        mask_envelope(&engine(), &mut env);
+        assert_eq!(env, before);
+        // The same digits under another key, or another form under this
+        // key, are judged as before.
+        for (key, value) in [
+            ("wardex.openai_agents.mcp.server", digest),
+            (MCP_TOOLS_HASH_KEY, "4111-1111-1111-1111"),
+            (MCP_TOOLS_HASH_KEY, "80966977421341424"),
+        ] {
+            let mut env = with(key, value);
+            mask_envelope(&engine(), &mut env);
+            let span = span_of(&env);
+            assert_eq!(
+                span.capture_integrity.as_ref().unwrap().redaction_rules,
+                vec![Rule::CreditCard as i32],
+                "{key} = {value}"
+            );
+        }
+        assert!(is_sdk_tools_digest("0123456789abcdef"));
+        for text in [
+            "0123456789ABCDEF",
+            "0123456789abcde",
+            "0123456789abcdefa",
+            "0123456789abcdeg",
+        ] {
+            assert!(!is_sdk_tools_digest(text), "{text}");
+        }
     }
 
     #[test]

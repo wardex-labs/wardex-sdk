@@ -2383,8 +2383,9 @@ def test_a_run_resumed_after_a_tool_approval_ships_under_its_own_root(
 # --------------------------------------------------------------------------
 
 
-def _in_process_mcp():  # noqa: ANN202
-    """An MCP server that lists ONE tool and never leaves the process."""
+def _in_process_mcp(tools: tuple[str, ...] = ("secret_tool_name",)):  # noqa: ANN202
+    """An MCP server that lists `tools` (one by default) and never leaves the
+    process."""
     from agents.mcp import MCPServer
     from mcp.types import CallToolResult, Tool
 
@@ -2403,7 +2404,7 @@ def _in_process_mcp():  # noqa: ANN202
             return None
 
         async def list_tools(self, run_context=None, agent=None):  # noqa: ANN001, ANN202
-            return [Tool(name="secret_tool_name", inputSchema={"type": "object"})]
+            return [Tool(name=n, inputSchema={"type": "object"}) for n in tools]
 
         async def call_tool(self, tool_name, arguments, meta=None):  # noqa: ANN001, ANN202
             return CallToolResult(content=[])
@@ -2440,6 +2441,83 @@ def test_an_mcp_list_tools_span_carries_a_hash_and_never_a_name(agents_env, scen
         assert "secret_tool_name" not in s.name
     # fired before the agent's first turn: the run root is its parent
     assert step.parent_span_id == _one(spans, "invoke_workflow Agent workflow").context.span_id
+
+
+def _passes_card_checksum(digits: str) -> bool:
+    total = 0
+    for i, ch in enumerate(reversed(digits)):
+        d = int(ch) * (2 if i % 2 else 1)
+        total += d - 9 if d > 9 else d
+    return total % 10 == 0
+
+
+def test_a_tool_list_digest_that_reads_as_a_card_number_ships_as_written(agents_env, scenario):
+    """The digest is the SDK's own: sixteen hex digits of a SHA-256 of the
+    sorted tool names. For about one tool list in eighteen thousand all
+    sixteen are decimal and pass the card checksum, and then the default card
+    rule rewrote the digest to `****-****-****-NNNN` and wrote `credit_card`
+    into the span's record, on both wires and on every run against that
+    server. This list is one of those; the real adapter runs it and the real
+    codec encodes it with the default rules."""
+    from wardex_sdk import _wardex_native
+    from wardex_sdk._adapters._openai_agents import _tools_digest
+    from wardex_sdk.transport import Transport
+
+    tools = ("get_weather", "search_docs_v28401")
+    digest = _tools_digest(sorted(tools))
+    assert digest == "8096697742134142" and _passes_card_checksum(digest)
+
+    class Wires(Transport):
+        def __init__(self) -> None:
+            self.envelopes: list[bytes] = []
+            self.otlp: list[bytes] = []
+
+        def export(self, envelope: Any, *, timeout: float | None = None) -> None:
+            self.otlp.extend(self.encode(envelope, compress=False))
+            self.envelopes.append(
+                _wardex_native.codec.encode_envelope(
+                    envelope,
+                    self._pii_mode,
+                    list(self._pii_disabled),
+                    self._limits,
+                    **self._pii_names(),
+                )
+            )
+
+    scenario(_decide_single)
+    wires = Wires()
+    wardex.init(transport=wires, adapters=_ENABLED)
+    try:
+        agent = Agent(
+            name="agent_a",
+            instructions="a",
+            mcp_servers=[_in_process_mcp(tools)],
+            model="gpt-4o-mini",
+        )
+        assert _run(agent).final_output == "done"
+        wardex.flush()
+    finally:
+        wardex.close()
+    (step,) = [
+        it["span"]
+        for b in wires.envelopes
+        for it in _wardex_native.codec.decode_envelope(b)["items"]
+        if "span" in it and it["span"]["name"] == "execute_step mcp.list_tools"
+    ]
+    extra = {kv["key"]: kv["value"] for kv in step["extra"]}
+    assert extra["wardex.openai_agents.mcp.tools_hash"] == digest
+    assert step.get("capture_integrity", {}).get("redaction_rules", []) == []
+    (otlp_step,) = [
+        sp
+        for b in wires.otlp
+        for rs in _wardex_native.codec.decode_otlp_traces(b)["resource_spans"]
+        for ss in rs["scope_spans"]
+        for sp in ss["spans"]
+        if sp["name"] == "execute_step mcp.list_tools"
+    ]
+    attrs = otlp_step["attributes"]
+    assert attrs["wardex.openai_agents.mcp.tools_hash"] == digest
+    assert not any(k.startswith("wardex.redact") for k in attrs), attrs
 
 
 # --------------------------------------------------------------------------

@@ -212,9 +212,59 @@ All notable changes to this project are documented here. The format follows
   ahead of the last release are gone from `README.md` and
   `examples/README.md`; contributors working on a checkout use the
   development install in `CONTRIBUTING.md` instead.
+- **A decorator's call-site file is relative to its package, so your OS user
+  name no longer leaves with it.** `@wardex.workflow`, `@wardex.agent`,
+  `@wardex.tool` and `@wardex.step` recorded the decorated function's
+  `co_filename`, usually absolute, so
+  `/Users/alice/work/acme/support_bot/agent.py` reached `Span.call_site.file`
+  on the envelope and `code.file.path` over OTLP with the user name and every
+  folder above the project in it, and no masking category matched it. The file
+  is now relative to the folder the module's top-level package was imported
+  from — the rule Sentry's Python SDK uses for a frame's `filename` — so that
+  function exports `support_bot/agent.py`. A top-level module or a
+  `python agent.py` script exports its file name alone, and so does every
+  function the SDK cannot place under its package (no module name, a
+  namespace package, code outside its package's folder): never an absolute
+  path.
+  **The value changes for every decorated span**: a filter or saved view in
+  Phoenix or Langfuse keyed on the absolute `code.file.path` stops matching.
+  Call sites are first exported in this same release, so only a build of the
+  unreleased tree ever sent the absolute path. OpenTelemetry's conventions
+  prefer an absolute path in `code.file.path` without requiring one. `line`,
+  `function` and `module` are unchanged, the path is worked out once when the
+  decorator is applied, and a `CallSite` you set through `Span.call_site` is
+  not rewritten.
 
 ### Fixed
 
+- **Values the SDK makes itself are no longer masked as a card number, and
+  a span's masking record no longer reports a card that was never there.**
+  The case that showed it is a span's connection id, a value the SDK makes
+  for itself (`str(id(socket))`). On 64-bit Linux it is about fifteen digits
+  and roughly one in ten passes the card checksum, so the default
+  `credit_card` rule rewrote it to `****-****-****-NNNN` on the wardex
+  envelope — spans from one connection could no longer be grouped by it —
+  and wrote `credit_card` into the span's `redaction_rules` and count. These
+  fields only the SDK fills are now never masked: the connection id, the
+  envelope's `event_id` and item type, the SDK's name, version, Python
+  version, OS, architecture and semconv version, and on OTLP the
+  instrumentation scope's name and version and the `telemetry.sdk.*`
+  resource attributes. Two more values are the SDK's in a place you can also
+  write to, so each is left as written only in the exact form the SDK
+  writes it, and masked as before in any other form. The conversation id is
+  yours when you name one and the SDK's when you don't
+  (`wardex.conversation()` without an id mints `str(uuid.uuid4())`, about
+  one in seven thousand of which the card rule rewrote the same way): a
+  lowercase version-4 UUID, with or without dashes, is left as written on
+  the envelope and as `gen_ai.conversation.id` on OTLP. The OpenAI Agents
+  adapter's MCP tool-list digest, `wardex.openai_agents.mcp.tools_hash`, is
+  sixteen hex digits of a SHA-256; for about one tool list in eighteen
+  thousand all sixteen are decimal and pass the checksum, and since a tool
+  list's digest does not change, the card rule rewrote it on every run
+  against that server. Sixteen lowercase hex digits under that key are now
+  left as written on both wires. In both forms the card rule is the only
+  built-in rule that can match. Everything else your application or its
+  traffic puts on a span is masked exactly as before.
 - **Transport timings measure the interval they name.** A TLS handshake an
   event loop drives without blocking (Tornado's `SSLIOStream` calls
   `do_handshake()` until it stops raising `SSLWantReadError`) reported the
@@ -293,12 +343,12 @@ All notable changes to this project are documented here. The format follows
   envelope and semconv's stable `code.file.path`, `code.line.number` and
   `code.function.name` on OTLP, with the module composed into the function
   name as that attribute is defined. **This sends the path of the decorated
-  function's source file** — `code.co_filename`, usually absolute — to your
-  backend, which the SDK did not do before; it goes through the masking
-  policy like any other exported value. `Span.call_site` validates nothing, so
-  what arrives may not be a `CallSite` at all: a value a field cannot hold —
-  or a tuple where the object was expected — is named under
-  `wardex.codec.unmarshalled` and the span, and its batch, still ship.
+  function's source file** to your backend, which the SDK did not do before:
+  relative to its package's import root and never absolute (see Changed), and
+  through the masking policy like any other exported value. `Span.call_site`
+  validates nothing, so what arrives may not be a `CallSite` at all: a value a
+  field cannot hold — or a tuple where the object was expected — is named
+  under `wardex.codec.unmarshalled` and the span, and its batch, still ship.
 - **How a span was captured reaches an OTLP backend.** `capture_sources` — an
   adapter's hook, wire bytes, a bridge — has always been on the envelope and
   was missing from the OTLP export, so a backend could not tell an observed

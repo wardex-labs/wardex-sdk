@@ -410,12 +410,20 @@ functions).
 The four decorators also record **where the decorated function is defined** —
 its source file, first line, function name and module — and export it as the
 span's call site: `Span.call_site` on the envelope, and `code.file.path`,
-`code.line.number` and `code.function.name` over OTLP. The file is whatever
-Python reports for the function, usually an absolute path such as
-`/Users/<you>/app/agent.py`, so it can carry an OS user name. It goes through
-PII masking like every other exported value, but no built-in category matches
-a user name inside a path, and there is no setting yet that leaves the call
-site out.
+`code.line.number` and `code.function.name` over OTLP. The file is **relative
+to the folder the module's top-level package was imported from**, the rule
+Sentry's Python SDK uses for a frame's `filename`: `support_bot.agent` defined
+in `/Users/<you>/work/<project>/support_bot/agent.py` exports
+`support_bot/agent.py`, so your OS user name and the folders above your import
+root stay on your machine. A top-level module (`helpers.py`) and a script run
+as `python agent.py` export the file name alone. So does every function the
+SDK cannot place under its package — one with no module name (made by `exec`,
+say), one in a namespace package, one whose code lives outside its package's
+folder: the file name, never an absolute path. The path is worked out once,
+when the decorator is applied, and on Windows keeps its `\` separators.
+OpenTelemetry's conventions prefer an absolute path in `code.file.path`
+without requiring one. A `CallSite` you set yourself through `Span.call_site`
+is not rewritten.
 
 ## Scope
 
@@ -1186,8 +1194,9 @@ runtime version probe.
 > PII masking caveats: `before_send_envelope` sees pre-masking data (masking runs inside
 > the encoder), the Console transport prints raw (local debugging only),
 > non-UTF-8 binary payloads pass through unmasked, no category matches a user
-> name inside a decorated function's source file path (see Tracing), and a
-> secret with neither a secret name nor a credential shape passes (see
+> name inside a file path (a tool argument or an error message can carry one; a
+> decorator's call site does not, see Tracing), and a secret with neither a
+> secret name nor a credential shape passes (see
 > [Masking](#masking-secrets-and-personal-data)).
 
 ## License

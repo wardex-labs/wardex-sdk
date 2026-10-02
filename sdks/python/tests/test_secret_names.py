@@ -13,16 +13,18 @@ from __future__ import annotations
 import http.client
 import json
 import threading
+import uuid
 import warnings
 from collections.abc import Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
 import wardex_sdk as wardex
-from wardex_sdk import _hub, _wardex_native
+from wardex_sdk import _hub, _tracing, _wardex_native
 from wardex_sdk._config import PIIConfig
 from wardex_sdk._enums import CaptureMode, PIIMode
 from wardex_sdk.transport import Transport
@@ -55,11 +57,13 @@ def port() -> Iterator[int]:
     srv.shutdown()
 
 
-#: Categories off in tests that count replacements exactly. The loopback
-#: address is an IP, and a connection id is a process object id that passes
-#: the card checksum about one run in ten — both are replaced, correctly or
-#: not, independently of the rule under test.
-_OWN_IDS_OFF = frozenset({wardex.PIICategory.IP_ADDRESS, wardex.PIICategory.CREDIT_CARD})
+#: The one category off in tests that count replacements exactly: every URL
+#: here names the loopback address, an IP, which is replaced correctly but
+#: independently of the rule under test. Every other category stays on,
+#: the card rule included — the SDK's own connection id is a process object
+#: id that passes the card checksum about one time in ten on 64-bit Linux,
+#: and no rule may count it.
+_LOOPBACK_OFF = frozenset({wardex.PIICategory.IP_ADDRESS})
 
 
 class _Capture(Transport):
@@ -137,7 +141,7 @@ def test_a_masked_span_says_how_many_by_which_rule_under_which_names(port):
             ("POST", "/search?q=seoul&appid=owm999key", {"query": "seoul", "api_key": "abc123"}),
             ("GET", "/clean?q=seoul&page=2", None),
         ],
-        pii=PIIConfig(disabled_categories=_OWN_IDS_OFF),
+        pii=PIIConfig(disabled_categories=_LOOPBACK_OFF),
     )
     ci = _by_path(env, "/search")["capture_integrity"]
     assert ci["redacted"] is True
@@ -164,11 +168,117 @@ def test_a_masked_span_says_how_many_by_which_rule_under_which_names(port):
     assert clean["url.full"].endswith("/clean?q=seoul&page=2")
 
 
+def _passes_card_checksum(digits: str) -> bool:
+    """The card rule's own test: 13 to 19 digits and a valid Luhn sum."""
+    if not (13 <= len(digits) <= 19 and digits.isdigit()):
+        return False
+    total = 0
+    for i, ch in enumerate(reversed(digits)):
+        d = int(ch) * (2 if i % 2 else 1)
+        total += d - 9 if d > 9 else d
+    return total % 10 == 0
+
+
+def test_two_hundred_real_connections_keep_their_ids_out_of_the_card_rule(port):
+    """A span's connection id is `str(id(socket))`. On 64-bit Linux that is
+    fifteen digits, and about one in ten passes the card checksum — so with
+    every category on, the card rule used to rewrite the id and write
+    `credit_card` into the span's record of what it masked, though no card
+    was ever there. The SDK minted the id; no rule may touch it.
+
+    Each request opens its own connection and its socket object is held to
+    the end, so no address is reused and the 200 ids are 200 different
+    numbers. Where ids are shorter than a card (macOS: ten digits) this
+    passes without exercising anything; the Linux CI job is where it bites.
+    """
+    cap = _Capture()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        wardex.init(transport=cap, intercept=True, capture_mode=CaptureMode.ALL)
+    socks = []
+    for i in range(200):
+        c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        try:
+            c.request("GET", f"/conn/{i}")
+            c.getresponse().read()
+            socks.append(c.sock)
+        finally:
+            c.close()
+    wardex.flush()
+    ids = [str(id(s)) for s in socks]
+    assert len(set(ids)) == 200
+    spans = {
+        s["name"]: s
+        for b in cap.envelopes
+        for it in _wardex_native.codec.decode_envelope(b)["items"]
+        if "span" in it
+        for s in [it["span"]]
+        if s["name"].startswith("HTTP GET /conn/")
+    }
+    assert len(spans) == 200
+    card_shaped = {f"HTTP GET /conn/{i}" for i, cid in enumerate(ids) if _passes_card_checksum(cid)}
+    masked_as_card = {
+        name
+        for name, s in spans.items()
+        if "credit_card" in s.get("capture_integrity", {}).get("redaction_rules", [])
+    }
+    assert masked_as_card == set(), (
+        f"{len(masked_as_card)} of 200 spans say a card was masked; "
+        f"{len(card_shaped)} connection ids pass the card checksum; "
+        f"the same spans: {masked_as_card == card_shaped}"
+    )
+    # Nothing but the loopback address in each URL was replaced.
+    for name, s in spans.items():
+        rules = s.get("capture_integrity", {}).get("redaction_rules", [])
+        assert set(rules) <= {"ip_address"}, (name, rules)
+
+
+def test_a_conversation_id_the_sdk_mints_is_never_taken_for_a_card(port, monkeypatch):
+    """`wardex.conversation(name)` with no id mints `str(uuid.uuid4())`. About
+    one such id in seven thousand has a run of groups that is all decimal and
+    passes the card checksum, and the card rule used to rewrite it to
+    `****-****-****-...` and record `credit_card` on the span — on both wires.
+
+    The mint is made to return one of those ids, a genuine version-4 UUID, and
+    the real path runs with every category on. A host that names its own
+    conversation keeps its masking; that side is pinned in the Rust census.
+    """
+    minted = uuid.UUID("48620579-8682-4828-a0e5-0454f31af317")
+    assert minted.version == 4 and minted.variant == uuid.RFC_4122
+    monkeypatch.setattr(_tracing, "uuid", SimpleNamespace(uuid4=lambda: minted))
+    cap = _Capture()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        wardex.init(transport=cap, intercept=True, capture_mode=CaptureMode.ALL)
+    with wardex.conversation("chat"):
+        _call(port, "GET", "/minted")
+    wardex.flush()
+    (chat,) = [
+        it["span"]
+        for b in cap.envelopes
+        for it in _wardex_native.codec.decode_envelope(b)["items"]
+        if "span" in it and it["span"]["name"] == "chat"
+    ]
+    assert chat["conversation"]["conversation_id"] == str(minted)
+    assert chat.get("capture_integrity", {}).get("redaction_rules", []) == []
+    (otlp_chat,) = [
+        sp
+        for b in cap.otlp
+        for rs in _wardex_native.codec.decode_otlp_traces(b)["resource_spans"]
+        for ss in rs["scope_spans"]
+        for sp in ss["spans"]
+        if sp["name"] == "chat"
+    ]
+    attrs = otlp_chat["attributes"]
+    assert attrs["gen_ai.conversation.id"] == str(minted)
+    assert not any(k.startswith("wardex.redact") for k in attrs), attrs
+
+
 def test_a_name_that_is_itself_personal_data_is_masked_in_the_names_list(port):
     env, otlp = _run(
         port,
         [("POST", "/k", {"john.doe@example.com_token": "t0ken-value"})],
-        pii=PIIConfig(disabled_categories=_OWN_IDS_OFF),
+        pii=PIIConfig(disabled_categories=_LOOPBACK_OFF),
     )
     names = _by_path(env, "/k")["capture_integrity"]["redaction_names"]
     assert names == ["[EMAIL]_token"]
@@ -185,7 +295,7 @@ def test_extra_secret_names_masks_every_spelling_of_the_same_words(port):
         ],
         pii=PIIConfig(
             extra_secret_names={"x_corp_widget"},
-            disabled_categories=_OWN_IDS_OFF,
+            disabled_categories=_LOOPBACK_OFF,
         ),
     )
     text = repr(env) + repr(otlp)
@@ -203,7 +313,7 @@ def test_reveal_names_exempts_the_name_rules_but_not_a_credential_shaped_value(p
         ],
         pii=PIIConfig(
             reveal_names={"code", "page_token"},
-            disabled_categories=_OWN_IDS_OFF,
+            disabled_categories=_LOOPBACK_OFF,
         ),
     )
     otlp_text = repr(otlp)
@@ -333,7 +443,7 @@ def test_a_masked_envelope_body_for_receivers(port):
         transport=cap,
         intercept=True,
         capture_mode=CaptureMode.ALL,
-        pii=PIIConfig(disabled_categories=_OWN_IDS_OFF),
+        pii=PIIConfig(disabled_categories=_LOOPBACK_OFF),
     )
     _call(port, "POST", "/search?q=seoul&appid=S3CRETowm", {"query": "seoul", "api_key": "S3CRETk"})
     wardex.flush()

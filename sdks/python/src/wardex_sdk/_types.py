@@ -199,9 +199,11 @@ class CallSite:
 
     Exported as `Span.call_site` on the envelope and as OTel `code.file.path` /
     `code.line.number` / `code.function.name`, the module composed into the function name.
-    `file` is whatever the code object reports — usually an absolute path, which can carry a
-    user name — and it goes through the same masking policy as every other exported value.
-    Reading it costs microseconds."""
+    The decorators fill `file` relative to the folder the module's top-level package was
+    imported from (`support_bot/agent.py`), or with the file name alone — never an absolute
+    path, so no OS user name; a host that sets `Span.call_site` itself sends what it set. It
+    goes through the same masking policy as every other exported value. Reading it costs
+    microseconds."""
 
     file: str
     line: int
