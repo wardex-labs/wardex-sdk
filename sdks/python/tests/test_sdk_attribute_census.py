@@ -138,8 +138,9 @@ _SITES: list[tuple[str, str, str, str]] = [
     (_SEAM, "'network.protocol.version'", "'websocket'", LITERAL),
     (_SEAM, "'ws.messages.sent'", "txn.ws_messages_sent", NUMBER),
     (_SEAM, "'ws.messages.received'", "txn.ws_messages_received", NUMBER),
-    (_SEAM, "'ws.bytes.sent'", "txn.ws_bytes_sent", NUMBER),
-    (_SEAM, "'ws.bytes.received'", "txn.ws_bytes_received", NUMBER),
+    # A direction's byte count, set only when that direction was counted whole.
+    (_SEAM, "'ws.bytes.sent'", "sent", NUMBER),
+    (_SEAM, "'ws.bytes.received'", "received", NUMBER),
     (_SEAM, "USAGE_DROPPED_KEY", "dropped", NUMBER),
     # The peer's close code and HTTP version, the gRPC fields and provider
     # extras read off the wire, and the messages the provider was sent.
