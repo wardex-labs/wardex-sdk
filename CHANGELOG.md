@@ -264,11 +264,15 @@ All notable changes to this project are documented here. The format follows
   block's id, and once both blocks of a pair had closed, code after them still
   carried one of their ids. Each block now installs its id on its own copy.
   That also means a block scopes the context it was entered in, as any context
-  variable does. One entered on a worker thread with a copy of your context —
-  FastAPI runs a plain `def` generator dependency's setup and teardown that
-  way — used to reach the endpoint only through that same shared write, so a
-  concurrent request with no conversation of its own carried it too. It now
-  reaches only that thread's work: open the block in the endpoint.
+  variable does. **A block opened in a plain `def` generator dependency no
+  longer reaches the endpoint.** FastAPI runs that dependency's setup and
+  teardown on a worker thread with a copy of the request's context, and the
+  block reached the endpoint only through that same shared write: the endpoint
+  saw it when a scope was already open above the request (under
+  `WardexAsgiMiddleware`, say), and every concurrent request under that same
+  scope saw it too. It now reaches only that thread's work. Open the block in
+  an `async def` dependency, whose setup FastAPI runs in the request's own
+  task, or inside the endpoint.
 - **Ctrl-C reaches your program while a batch is being exported.** The OTLP
   exporter skips a span it cannot marshal instead of dropping the batch, and
   it treated a `KeyboardInterrupt` or `SystemExit` raised by your code during
