@@ -131,6 +131,12 @@ impl Http2Transaction {
     fn response_truncated(&self) -> bool {
         self.inner.response_truncated
     }
+    /// The request half ended before the response did: false means the
+    /// request body is what was sent so far, not the whole request.
+    #[getter]
+    fn request_ended(&self) -> bool {
+        self.inner.request_ended
+    }
     #[getter]
     fn content_type(&self) -> Option<String> {
         self.inner.content_type.clone()

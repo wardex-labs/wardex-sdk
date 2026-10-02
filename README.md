@@ -621,9 +621,10 @@ span carries `ws.messages.sent` (about one per call), byte counts and payload
 samples (compressed bytes, marked `payload_compressed`, when
 permessage-deflate was negotiated), no model or tokens; switch the framework
 to its default HTTP transport for `gen_ai` spans. A connection that ends
-without a WebSocket close handshake — a server drop, a timeout, process exit,
-or wardex uninstalled first — still yields the span, additionally marked
-`ws_no_close`. The connection counts as an LLM connection only when the host
+before either side sent a WebSocket Close frame — a server drop, a timeout,
+process exit, or wardex uninstalled first — still yields the span,
+additionally marked `ws_no_close`. The connection counts as an LLM
+connection only when the host
 is the provider's own — exactly `api.openai.com` or a subdomain of
 `openai.com`; a host that merely contains the name, such as
 `openai-mock.corp`, is not — or when the first client message carries a
@@ -877,7 +878,9 @@ diagnostic line (traceback under `debug=True`).
   is the handshake over TLS (`connection_reused` is true: the call opened
   nothing); on HTTP/2 the stream the connection was opened for, stream 1,
   carries them. A size is the body as sent (content-coded, without chunk
-  framing); for a WebSocket session, the payload bytes each way; for MCP
+  framing); for a WebSocket session, the payload bytes each way until a Close
+  frame has crossed each way or the socket closed, and its length (transfer
+  time) runs from the upgrade request to that end; for MCP
   stdio, the params and the result or error as the SDK captures them,
   re-encoded as compact JSON — a server's whitespace and needless `\u`
   escapes are not counted, so this is not the byte count on the pipe. For
@@ -894,14 +897,17 @@ diagnostic line (traceback under `debug=True`).
   transfer times of an HTTP/2 stream; the size of a body that went past its
   capture limit (marked `body_cap_exceeded` on HTTP/1; on HTTP/2 the span is
   marked truncated), of an HTTP/2 request the SDK lost before capturing it
-  (marked `h2_request_evicted`), of an HTTP/1 request it had not finished
-  reading when the response arrived, and of a WebSocket direction whose frame
-  parser stopped (marked `frame_parse_failed`); the length and sizes of a
-  WebSocket session the SDK stopped following while it was still open (at
-  `wardex.close()`, marked `ws_no_close`, or when its connection table was
-  full, marked `connection_evicted`); and everything about a WebSocket
-  session but its length and sizes. A WebSocket session cut while still open
-  (`ws_no_close` at `wardex.close()`, or `connection_evicted`) has a span that
+  (marked `h2_request_evicted`), of a request the SDK had not seen end when
+  its response did (an HTTP/1 request it had not finished reading; an HTTP/2
+  request with no END_STREAM yet, such as an upload the server refused
+  part-way or a client-streaming gRPC call it ended with a status), and of a
+  WebSocket direction whose frame parser stopped (marked
+  `frame_parse_failed`); the length and sizes of a WebSocket session the SDK
+  stopped following while it was still open (at `wardex.close()`, marked
+  `ws_no_close` unless a Close frame had crossed, or when its connection
+  table was full, marked `connection_evicted`); and everything about a
+  WebSocket session but its length and sizes. A WebSocket session cut while
+  still open (at `wardex.close()`, or `connection_evicted`) has a span that
   ends at the cut, so the span's duration is not the session's length.
   Connection reuse is `false` only on a connection the SDK saw open; on one
   opened before `init`, the first request it sees (on HTTP/2, stream 1)

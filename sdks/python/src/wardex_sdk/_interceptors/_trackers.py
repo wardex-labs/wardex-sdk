@@ -572,7 +572,9 @@ class _Http2Tracker:
             end_ns=now,
             ttfb_ms=None,  # per-h2-stream first-byte not tracked: not measured
             truncated=t.truncated or request_evicted,
-            request_counted=not (t.request_truncated or request_evicted),
+            # A request whose END_STREAM had not arrived when the response ended holds only what was
+            # sent so far (an upload refused part-way): like HTTP/1's unfinished request, no size.
+            request_counted=t.request_ended and not (t.request_truncated or request_evicted),
             response_counted=not t.response_truncated,
             stream_id=t.stream_id,
             limitations=(Limitation.H2_REQUEST_EVICTED,) if request_evicted else (),
@@ -588,7 +590,7 @@ class _Http2Tracker:
 
 class _WebSocketTracker:
     """One WS connection — per-direction frame parser + aggregation + 64KB content sample.
-    Emits 1 span on close/flush."""
+    Emits 1 span once both Close frames have crossed, or on flush."""
 
     def __init__(
         self,
@@ -640,18 +642,15 @@ class _WebSocketTracker:
         self._in_trunc = False
         self._out_trunc = False
         self._close_code: int | None = None
-        self._closed = False
+        #: The directions ("sent", "received") a Close frame crossed in. The session ends when both
+        #: have: the peer may still send data after the first Close (RFC 6455 5.5.1), and its own
+        #: Close is part of the session too, so a span built at the first one undercounted both.
+        self._close_from: set[str] = set()
         self._emitted = False
 
     def on_request_bytes(self, data: bytes) -> list[_Txn]:
         r = self._sent.feed(data)
-        for f in r.frames:
-            self._sent_bytes += f.payload_len
-            if f.close_code is not None:
-                self._close_code = f.close_code
-                self._closed = True
-            if f.opcode == "close":
-                self._closed = True
+        self._sent_bytes += self._count(r.frames, "sent")
         self._sent_msgs += len(r.messages)
         # A parser that died can no longer tell a message from a frame, so every write counts then.
         if (r.messages or self._sent.is_disabled()) and self._conversation is not None:
@@ -688,13 +687,7 @@ class _WebSocketTracker:
 
     def on_response_bytes(self, data: bytes) -> list[_Txn]:
         r = self._recv.feed(data)
-        for f in r.frames:
-            self._recv_bytes += f.payload_len
-            if f.close_code is not None:
-                self._close_code = f.close_code
-                self._closed = True
-            if f.opcode == "close":
-                self._closed = True
+        self._recv_bytes += self._count(r.frames, "received")
         self._recv_msgs += len(r.messages)
         self._out_trunc = self._append_sample(self._sample_out, r.messages) or self._out_trunc
         return self._maybe_emit()
@@ -715,15 +708,29 @@ class _WebSocketTracker:
                 buf += m
         return truncated
 
+    def _count(self, frames: list[Any], side: str) -> int:
+        """The payload bytes in `frames`, noting a Close frame from `side`. The session's close
+        code is the first Close frame's: the one that began the closing handshake."""
+        for f in frames:
+            if f.opcode == "close":
+                if not self._close_from:
+                    self._close_code = f.close_code
+                self._close_from.add(side)
+        return sum(f.payload_len for f in frames)
+
     def _maybe_emit(self) -> list[_Txn]:
-        if self._closed and not self._emitted:
+        if len(self._close_from) == 2 and not self._emitted:
             return [self._build_txn(())]
         return []
 
     def flush(self, marker: Limitation) -> list[_Txn]:
+        """The socket closed or the seam let go before the closing handshake completed.
+        `WS_NO_CLOSE` says no Close frame crossed at all, so a session that saw one does not take
+        it; the seam decides from the ending whether the counts are whole."""
         if self._emitted:
             return []
-        return [self._build_txn((marker,))]
+        drop = marker is Limitation.WS_NO_CLOSE and bool(self._close_from)
+        return [self._build_txn(() if drop else (marker,))]
 
     #: The connection-close verb every tracker answers to. For a WS session it IS `flush`, and an
     #: ALIAS rather than a delegating wrapper: this is the one tracker with something to save at

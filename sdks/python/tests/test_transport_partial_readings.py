@@ -13,12 +13,16 @@ part, as if it were the whole one:
   opened the connection, and stream 1 claimed it opened nothing;
 * a response after `100 Continue` timed its first body byte at the arrival of
   its own header block;
-* a request still being read when its response arrived reported `0` bytes;
+* a request still being read when its response arrived reported `0` bytes,
+  and on HTTP/2 the part of it sent so far (an upload the server refused
+  part-way, a client-streaming gRPC call it ended with a status);
 * a WebSocket direction whose frame parser stopped reported the bytes it had
   counted up to then;
 * a WebSocket session still open when the SDK let go of it (at
   `wardex.close()`, or when the connection table was full) reported the bytes
-  and the length it had seen up to then as the session's.
+  and the length it had seen up to then as the session's;
+* a WebSocket session ended at its FIRST Close frame, leaving out what the
+  peer still sent and its own Close, and the time they took.
 
 Each now ships the whole measurement or nothing, on the envelope and on OTLP.
 """
@@ -457,6 +461,57 @@ def test_an_http2_half_over_its_cap_has_no_size_and_the_other_half_keeps_its_own
     assert decoded["transport"]["request_size"] == len(req)
 
 
+@pytest.mark.parametrize("call", ["upload refused part-way", "grpc ended early"])
+def test_an_http2_request_its_response_ended_before_has_no_size(client, call):
+    """The server answered before the client finished sending: an upload
+    refused with 413 after its first kilobyte, or a client-streaming gRPC call
+    the server ended with a status. The request half has no END_STREAM, so
+    what the SDK saw of it is the part sent so far, not the request's size."""
+    from hpack import Encoder
+
+    client_enc, server_enc = Encoder(), Encoder()
+    if call == "upload refused part-way":
+        path, ctype, sent = b"/v1/files", b"application/json", b'{"file":"' + b"A" * 1000
+        body = b'{"error":"too large"}'
+        response = h._h2_frame(0x1, 0x4, 1, server_enc.encode([(b":status", b"413")]))
+        response += h._h2_frame(0x0, 0x1, 1, body)  # the whole answer, END_STREAM
+        response += h._h2_frame(0x3, 0x0, 1, b"\x00\x00\x00\x00")  # RST_STREAM(NO_ERROR)
+    else:
+        path, ctype = b"/pkg.Svc/Upload", b"application/grpc"
+        sent = (b"\x00" + (20).to_bytes(4, "big") + b"x" * 20) * 3  # three messages of many
+        body = b""
+        head = server_enc.encode([(b":status", b"200"), (b"content-type", ctype)])
+        response = h._h2_frame(0x1, 0x4, 1, head)
+        trailers = server_enc.encode([(b"grpc-status", b"3")])
+        response += h._h2_frame(0x1, 0x5, 1, trailers)  # END_HEADERS | END_STREAM
+    block = client_enc.encode(
+        [
+            (b":method", b"POST"),
+            (b":path", path),
+            (b":authority", b"a.example"),
+            (b"content-type", ctype),
+        ]
+    )
+    # HEADERS, then DATA with no END_STREAM: the client is still sending.
+    requests = h._h2_frame(0x1, 0x4, 1, block) + h._h2_frame(0x0, 0x0, 1, sent)
+    _drive(_h2_seam(client, _Http2Tracker()), requests, [response])
+
+    (span,) = client.spans
+    assert (span.transport.request_size, span.transport.response_size) == (None, len(body))
+    env = Envelope(header=_header(), spans=(span,))
+    (decoded,) = [i["span"] for i in _codec.decode(_codec.encode(env))["items"] if "span" in i]
+    assert decoded["transport"]["request_size"] is None
+    otlp = _wardex_native.codec.decode_otlp_traces(_wardex_native.codec.encode_otlp_traces(env))
+    (attrs,) = [
+        sp["attributes"]
+        for rs in otlp["resource_spans"]
+        for ss in rs["scope_spans"]
+        for sp in ss["spans"]
+    ]
+    assert "wardex.transport.request_size" not in attrs
+    assert attrs["wardex.transport.response_size"] == len(body)
+
+
 def test_an_http2_stream_that_finished_before_stream_1_did_not_open_the_connection(client):
     """Streams finish in any order. The connection's opening values used to go
     to whichever finished first: here stream 3, which claimed it opened the
@@ -553,9 +608,10 @@ def test_a_websocket_direction_whose_frame_parser_stopped_has_no_size(client):
     assert extra["ws.bytes.sent"] == 2
 
 
-def _ws_session_ended_by(client, ending: str):
+def _ws_session_ended_by(client, ending: str, *, client_closed: bool = False):
     """One WebSocket session through the seam's real connection table, ended
-    the way `ending` says, before any CLOSE frame crossed."""
+    the way `ending` says, before any CLOSE frame crossed — or, with
+    `client_closed`, after the client's Close and before the server's answer."""
     tracker = _WebSocketTracker(
         path="/realtime", deflate=False, parent=None, start_ns=1, limits=_wardex_native.Limits()
     )
@@ -566,6 +622,8 @@ def _ws_session_ended_by(client, ending: str):
     seam._state(obj)
     tracker.on_request_bytes(h._ws_frame(True, 0x1, b"hello"))
     tracker.on_response_bytes(h._ws_frame(True, 0x1, b"echo:hello"))
+    if client_closed:
+        assert tracker.on_request_bytes(h._ws_frame(True, 0x8, (1000).to_bytes(2, "big"))) == []
     if ending == "socket closed":
         seam._connection_closed(id(obj))  # what the close hook runs
     elif ending == "uninstall":
@@ -585,6 +643,86 @@ def test_a_websocket_session_whose_socket_closed_keeps_its_length_and_sizes(clie
     assert (span.transport.request_size, span.transport.response_size) == (5, 10)
     assert span.transport.timing.transfer_ms is not None
     assert dict(span.extra)["ws.bytes.received"] == 10
+
+
+def test_a_websocket_session_whose_socket_closed_mid_closing_handshake_is_whole(client):
+    # The client's Close crossed and the socket closed before the server's
+    # answer did: the session is over, every byte the host exchanged was
+    # counted, and the session has a close code, so no `ws_no_close`.
+    span = _ws_session_ended_by(client, "socket closed", client_closed=True)
+    assert span.capture_integrity.limitations == ()
+    assert (span.transport.request_size, span.transport.response_size) == (5 + 2, 10)
+    assert span.transport.timing.transfer_ms is not None
+    assert dict(span.extra)["ws.close_code"] == 1000
+
+
+def test_a_websocket_session_let_go_of_mid_closing_handshake_has_no_length_or_sizes(client):
+    # `wardex.close()` between the client's Close and the server's answer: the
+    # answer (and whatever the server still sends first) is not counted.
+    span = _ws_session_ended_by(client, "uninstall", client_closed=True)
+    assert Limitation.WS_NO_CLOSE not in span.capture_integrity.limitations
+    assert (span.transport.request_size, span.transport.response_size) == (None, None)
+    assert span.transport.timing.transfer_ms is None
+    assert dict(span.extra)["ws.close_code"] == 1000
+
+
+def test_a_websocket_session_counts_what_crosses_after_the_first_close():
+    """The client closes; the server still sends data (RFC 6455 5.5.1), waits,
+    then answers with its own Close. The session's span used to be built at
+    the client's Close and shipped a received count without either frame, and
+    a length without the closing handshake, as whole readings."""
+    late = b"late data after the client's close"
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+
+    def serve() -> None:
+        conn, _ = srv.accept()
+        with conn:
+            o._read_until(conn, b"\r\n\r\n")
+            conn.sendall(
+                b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n"
+                b"Connection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n"
+            )
+            echo = b"echo:" + o._read_frame(conn)
+            conn.sendall(bytes([0x81, len(echo)]) + echo)
+            o._read_frame(conn)  # the client's close
+            time.sleep(0.1)
+            conn.sendall(bytes([0x81, len(late)]) + late + b"\x88\x02\x03\xe8")
+            while conn.recv(4096):  # until the client hangs up
+                pass
+        srv.close()
+
+    threading.Thread(target=serve, daemon=True).start()
+    transport = RecordingTransport()
+    wardex.init(transport=transport, intercept=True, capture_mode=CaptureMode.ALL)
+    try:
+        with socket.create_connection(srv.getsockname()) as sock:
+            sock.sendall(
+                b"GET /realtime HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\n"
+                b"Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+                b"Sec-WebSocket-Version: 13\r\n\r\n"
+            )
+            o._read_until(sock, b"\r\n\r\n")
+            sock.sendall(o._masked(0x1, b"ping"))
+            o._read_frame(sock)
+            sock.sendall(o._masked(0x8, (1000).to_bytes(2, "big")))
+            assert o._read_frame(sock) == late
+            o._read_frame(sock)  # the server's close
+    finally:
+        wardex.close()
+
+    env, decoded, otlp = _spans(transport)
+    (ws,) = [s for s in decoded if s["name"] == "WS /realtime"]
+    t = ws["transport"]
+    received = len(b"echo:ping") + len(late) + 2
+    assert (t["request_size"], t["response_size"]) == (4 + 2, received)
+    assert t["timing"]["transfer_ms"] >= 100.0
+    assert ws["capture_integrity"]["limitations"] == []
+    (attrs,) = [sp["attributes"] for sp in otlp if sp["name"] == "WS /realtime"]
+    assert attrs["wardex.transport.response_size"] == received
+    assert attrs["wardex.transport.timing.transfer_ms"] >= 100.0
+    assert attrs["ws.close_code"] == 1000
 
 
 @pytest.mark.parametrize(

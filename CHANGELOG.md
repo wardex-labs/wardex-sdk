@@ -137,13 +137,17 @@ All notable changes to this project are documented here. The format follows
   type such as audio), where the kept length used to ship as the size (a
   1 MB speech response said 262144); on an HTTP/2 stream whose request half
   the stream table evicted before its response arrived (marked
-  `h2_request_evicted`), where it used to say `0`; on an HTTP/1 request the
-  parser had not finished reading when its response arrived; on a WebSocket
-  direction whose frame parser stopped (marked `frame_parse_failed`), along
-  with that direction's `ws.messages.*` and `ws.bytes.*` counts; and on a
-  WebSocket session the SDK stopped following while it was still open (at
-  `wardex.close()`, marked `ws_no_close`, or when its connection table was
-  full, marked `connection_evicted`), which used to report the bytes and the
+  `h2_request_evicted`), where it used to say `0`; on a request the SDK had
+  not seen end when its response did — an HTTP/1 request the parser had not
+  finished reading, or an HTTP/2 request with no END_STREAM yet (an upload
+  the server refused part-way, a client-streaming gRPC call it ended with a
+  status), where the part sent so far used to ship as the size; on a
+  WebSocket direction whose frame parser stopped (marked
+  `frame_parse_failed`), along with that direction's `ws.messages.*` and
+  `ws.bytes.*` counts; and on a WebSocket session the SDK stopped following
+  while it was still open (at `wardex.close()`, marked `ws_no_close` unless a
+  Close frame had crossed, or when its connection table was full, marked
+  `connection_evicted`), which used to report the bytes and the
   length up to that moment as the session's and now carries no sizes, counts
   or `transfer_ms`; `connection_reused` is `false` only on a connection the
   SDK saw open and is unset on one it did not (opened before `init`, say,
@@ -168,6 +172,20 @@ All notable changes to this project are documented here. The format follows
   absent. A filter or saved view on `is_streaming = false` no longer matches
   those calls. `false` now means the SDK read the whole body and it was
   something else (JSON, or text with no event line).
+- **A WebSocket session ends when a Close frame has crossed each way, not at
+  the first one.** Its span used to be built at the first Close frame, so
+  what the peer still sent after it (data, which RFC 6455 allows until the
+  peer's own Close, and that Close) was left out of the session's
+  `ws.bytes.*` and `ws.messages.*` counts and its `request_size` or
+  `response_size`, and `transfer_ms` stopped before the closing handshake
+  did, while all of them shipped as whole readings. Now the span is built
+  when the answering Close arrives, or when the socket closes first. Every
+  ordinary session's received (or, when the server closes first, sent) byte
+  count grows by the answering Close's payload, 2 bytes for a bare status
+  code. `ws.close_code` is still the code of the Close that began the
+  handshake. A session the SDK lets go of between the two (at
+  `wardex.close()`) has no sizes, counts or length and is not marked
+  `ws_no_close`, which says no Close frame crossed at all.
 - **`TransportAttributes.chunk_index` and `is_final_chunk` are removed.**
   Nothing ever filled them, so every span carried `0` and `true`. Their tags
   (25, 26) and names are reserved and will not be reused. The Python fields

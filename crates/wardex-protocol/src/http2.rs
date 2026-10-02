@@ -100,6 +100,12 @@ pub struct Http2Transaction {
     pub request_truncated: bool,
     /// The same, for the response body.
     pub response_truncated: bool,
+    /// The client's END_STREAM for this stream arrived before its response
+    /// ended. False when the server answered first — an upload refused
+    /// part-way, a client-streaming gRPC call ended by its status — so
+    /// `request_body` holds only what was sent so far and its length is not
+    /// the size of the request.
+    pub request_ended: bool,
     /// The stream table evicted this stream's request half before its
     /// response completed, so `method`, `path`, the request body and the
     /// request's content type are absent rather than empty. The status, the
@@ -633,6 +639,7 @@ impl Http2Connection {
                     truncated: s.req_truncated || s.resp_truncated,
                     request_truncated: s.req_truncated,
                     response_truncated: s.resp_truncated,
+                    request_ended: s.req_ended,
                     request_evicted: s.request_evicted,
                 });
             }
@@ -872,6 +879,30 @@ mod tests {
         assert_eq!(r.transactions[0].request_body, b"{\"a\":1}");
         assert_eq!(r.transactions[0].response_body, b"ok");
         assert_eq!(r.transactions[0].status, 201);
+        assert!(r.transactions[0].request_ended);
+    }
+
+    #[test]
+    fn a_response_that_ends_before_its_request_says_the_request_had_not_ended() {
+        // An upload the server refuses part-way: it answers 413 while the
+        // client is still sending, so the request body is only a prefix.
+        let mut c = Http2Connection::new(Limits::default());
+        let req_block = hpack(&[(b":method", b"POST"), (b":path", b"/upload")]);
+        let mut req = frame(0x1, FH, 1, &req_block);
+        req.extend_from_slice(&frame(0x0, 0, 1, b"first part"));
+        let r = c.feed(true, &req);
+        assert!(r.opened_request_streams.is_empty());
+
+        let resp_block = hpack(&[(b":status", b"413")]);
+        let r = c.feed(false, &frame(0x1, FH | FS, 1, &resp_block));
+        assert_eq!(r.transactions.len(), 1);
+        let t = &r.transactions[0];
+        assert_eq!(
+            (t.status, t.request_body.as_slice()),
+            (413, &b"first part"[..])
+        );
+        assert!(!t.request_ended);
+        assert!(!t.request_truncated && !t.request_evicted);
     }
 
     #[test]

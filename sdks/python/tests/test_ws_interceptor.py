@@ -67,8 +67,11 @@ def test_ws_upgrade_to_close_emits_one_span():
     )
     # Client sends text
     interceptor._on_request_bytes(obj, _frame(True, 0x1, b'{"x":1}'))
-    # Server close(1000)
+    # Server close(1000): the closing handshake has begun, the session has not ended
     interceptor._on_response_bytes(obj, _frame(True, 0x8, (1000).to_bytes(2, "big")))
+    assert _ws_spans() == []
+    # The client's answering close ends it
+    interceptor._on_request_bytes(obj, _frame(True, 0x8, (1000).to_bytes(2, "big")))
 
     spans = _ws_spans()
     assert len(spans) == 1
@@ -124,6 +127,7 @@ def test_deflate_negotiation_marks_compressed():
         b"Sec-WebSocket-Extensions: permessage-deflate\r\n\r\n",
     )
     interceptor._on_response_bytes(obj, _frame(True, 0x8, (1000).to_bytes(2, "big")))
+    interceptor._on_request_bytes(obj, _frame(True, 0x8, (1000).to_bytes(2, "big")))
     spans = _ws_spans()
     assert len(spans) == 1
     # Census merge (design §6.5.1): `ws_compressed` and `grpc_compressed` folded
@@ -148,8 +152,10 @@ def test_client_close_error_code_maps_error_status():
         obj,
         b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
     )
-    # Client sends close(1008 policy_violation) → _on_request_bytes' WS branch + ERROR mapping
+    # Client sends close(1008 policy_violation) and the server answers 1000. The session's code is
+    # the one that began the closing handshake, so the span still maps to ERROR.
     interceptor._on_request_bytes(obj, _frame(True, 0x8, (1008).to_bytes(2, "big")))
+    interceptor._on_response_bytes(obj, _frame(True, 0x8, (1000).to_bytes(2, "big")))
 
     spans = _ws_spans()
     assert len(spans) == 1
@@ -209,7 +215,8 @@ _UNCONFIRMED = "interceptors.seam.ws_llm_endpoint_unconfirmed"
 
 def _session(host: str, path: str, *, deflate: bool, first: bytes) -> None:
     """One WebSocket session under the DEFAULT capture mode (AGENT, no local
-    span): upgrade, one client Text, two server Texts, server close 1001."""
+    span): upgrade, one client Text, two server Texts, server close 1001 and
+    the client's answering close."""
     wardex.init(intercept=True)
     from wardex_sdk._interceptors._registry import get_registry
 
@@ -230,6 +237,7 @@ def _session(host: str, path: str, *, deflate: bool, first: bytes) -> None:
     interceptor._on_response_bytes(obj, _frame(True, 0x1, b'{"type":"response.created"}'))
     interceptor._on_response_bytes(obj, _frame(True, 0x1, b'{"type":"response.completed"}'))
     interceptor._on_response_bytes(obj, _frame(True, 0x8, (1001).to_bytes(2, "big")))
+    interceptor._on_request_bytes(obj, _frame(True, 0x8, (1001).to_bytes(2, "big")))
 
 
 def test_responses_websocket_ships_marked_under_default_agent_mode():
@@ -277,7 +285,7 @@ def test_loopback_responses_websocket_with_deflate_is_unconfirmed():
 def test_ws_llm_counters_move_at_connection_close():
     """Counted from the seam when the connection's one span is built, not
     from the tracker on the first message: after the first client message
-    nothing has moved, after the close exactly one count has."""
+    nothing has moved, after the closing handshake exactly one count has."""
     wardex.init(intercept=True)
     from wardex_sdk._interceptors._registry import get_registry
 
@@ -295,6 +303,8 @@ def test_ws_llm_counters_move_at_connection_close():
     interceptor._on_request_bytes(obj, _frame(True, 0x1, b'{"type":"response.create"}'))
     assert counters.get(_UNREAD) == 0
     interceptor._on_response_bytes(obj, _frame(True, 0x8, (1000).to_bytes(2, "big")))
+    assert counters.get(_UNREAD) == 0  # one Close: the session has not ended yet
+    interceptor._on_request_bytes(obj, _frame(True, 0x8, (1000).to_bytes(2, "big")))
     assert counters.get(_UNREAD) == 1
     assert len(_ws_spans()) == 1
 
@@ -375,6 +385,7 @@ def _plain_session(mode: CaptureMode | None) -> None:
     )
     interceptor._on_request_bytes(obj, _frame(True, 0x1, b"hi"))
     interceptor._on_response_bytes(obj, _frame(True, 0x8, (1000).to_bytes(2, "big")))
+    interceptor._on_request_bytes(obj, _frame(True, 0x8, (1000).to_bytes(2, "big")))
 
 
 def test_an_unaddressed_websocket_the_mode_refuses_still_counts_its_unread_peer():

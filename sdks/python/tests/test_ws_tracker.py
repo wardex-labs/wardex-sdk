@@ -21,9 +21,10 @@ def test_close_emits_span_with_counts_and_sample():
     assert t.on_request_bytes(_frame(True, 0x1, b"hello")) == []
     # server sends 1 text message
     assert t.on_response_bytes(_frame(True, 0x1, b"world")) == []
-    # server close(1000)
+    # server close(1000), then the client's answer, which ends the session
     close_payload = (1000).to_bytes(2, "big")
-    out = t.on_response_bytes(_frame(True, 0x8, close_payload))
+    assert t.on_response_bytes(_frame(True, 0x8, close_payload)) == []
+    out = t.on_request_bytes(_frame(True, 0x8, close_payload))
     assert len(out) == 1
     txn = out[0]
     assert txn.version == "websocket"
@@ -50,6 +51,40 @@ def test_flush_emits_with_no_close_marker():
     assert t.flush(Limitation.WS_NO_CLOSE) == []
 
 
+def test_the_session_ends_when_a_close_frame_has_crossed_each_way():
+    """The peer may still send data after the first Close (RFC 6455 5.5.1), and
+    its own Close belongs to the session too. A span built at the first Close
+    shipped a count short by both as the session's size."""
+    t = _WebSocketTracker(path="/realtime", deflate=False, parent=None, start_ns=1)
+    t.on_request_bytes(_frame(True, 0x1, b"ping"))
+    t.on_response_bytes(_frame(True, 0x1, b"echo:ping"))
+    assert t.on_request_bytes(_frame(True, 0x8, (1000).to_bytes(2, "big"))) == []
+    assert t.on_response_bytes(_frame(True, 0x1, b"late data")) == []
+    (txn,) = t.on_response_bytes(_frame(True, 0x8, (1001).to_bytes(2, "big")))
+    assert (txn.ws_bytes_sent, txn.ws_bytes_received) == (4 + 2, 9 + 9 + 2)
+    assert (txn.ws_messages_sent, txn.ws_messages_received) == (1, 2)
+    # The code is the one that began the closing handshake, not the answer's.
+    assert txn.ws_close_code == 1000
+    assert txn.ws_markers == ()
+    assert t.flush(Limitation.WS_NO_CLOSE) == []
+
+
+@pytest.mark.parametrize(
+    ("marker", "kept"),
+    [(Limitation.WS_NO_CLOSE, False), (Limitation.CONNECTION_EVICTED, True)],
+)
+def test_a_session_flushed_after_one_close_frame_has_its_close_code(marker, kept):
+    """`ws_no_close` says no Close frame crossed, so no close code: a session one
+    Close crossed before its socket closed (or the seam let go) does not take it.
+    Eviction is a fact about the seam's table and stays."""
+    t = _WebSocketTracker(path="/realtime", deflate=False, parent=None, start_ns=1)
+    t.on_request_bytes(_frame(True, 0x1, b"hi"))
+    assert t.on_request_bytes(_frame(True, 0x8, (1000).to_bytes(2, "big"))) == []
+    (txn,) = t.flush(marker)
+    assert txn.ws_close_code == 1000
+    assert (marker in txn.ws_markers) is kept
+
+
 # --- the WebSocket LLM-transport question ---------------------------------
 #
 # The tracker only DECIDES; it reports the decision as `_Txn.ws_llm_call` /
@@ -57,6 +92,17 @@ def test_flush_emits_with_no_close_marker():
 # (test_ws_interceptor.py). No counter moves in here.
 
 _CLOSE_1001 = _frame(True, 0x8, (1001).to_bytes(2, "big"))
+
+
+def _closed(t: _WebSocketTracker):
+    """The server closes and the client answers; the answer ends the session. A
+    client parser that died cannot read the answer, so the socket closing does."""
+    assert t.on_response_bytes(_CLOSE_1001) == []
+    if t._sent.is_disabled():
+        (txn,) = t.flush(Limitation.WS_NO_CLOSE)
+    else:
+        (txn,) = t.on_request_bytes(_CLOSE_1001)
+    return txn
 
 
 def _tracker(llm_upgrade: str | None, *, deflate: bool) -> _WebSocketTracker:
@@ -73,7 +119,7 @@ def test_known_provider_confirms_on_first_client_message():
     assert t._llm_call is True
     # decided once: a second message cannot flip or re-make the decision
     assert t.on_request_bytes(_frame(True, 0x1, b'{"op":"ping"}')) == []
-    (txn,) = t.on_response_bytes(_CLOSE_1001)
+    txn = _closed(t)
     assert txn.ws_llm_call is True
     assert txn.ws_llm_unconfirmed is False
     assert Limitation.WS_LLM_SEMANTICS_UNREAD in txn.ws_markers
@@ -82,7 +128,7 @@ def test_known_provider_confirms_on_first_client_message():
 def test_unknown_host_confirms_from_the_responses_envelope():
     t = _tracker("unknown_host", deflate=False)
     t.on_request_bytes(_frame(True, 0x1, b'{"type": "response.create", "model": "gpt-4o-mini"}'))
-    (txn,) = t.on_response_bytes(_CLOSE_1001)
+    txn = _closed(t)
     assert txn.ws_llm_call is True
     assert txn.ws_llm_unconfirmed is False
     assert Limitation.WS_LLM_SEMANTICS_UNREAD in txn.ws_markers
@@ -108,7 +154,7 @@ def test_unknown_host_envelope_is_found_anywhere_in_the_first_message(first: byt
     t = _tracker("unknown_host", deflate=False)
     header = bytes([0x81, 126]) + len(first).to_bytes(2, "big")
     t.on_request_bytes(header + first)
-    (txn,) = t.on_response_bytes(_CLOSE_1001)
+    txn = _closed(t)
     assert txn.ws_llm_call is True
     assert txn.ws_llm_unconfirmed is False
 
@@ -116,7 +162,7 @@ def test_unknown_host_envelope_is_found_anywhere_in_the_first_message(first: byt
 def test_unknown_host_with_deflate_stays_unconfirmed():
     t = _tracker("unknown_host", deflate=True)
     t.on_request_bytes(_frame(True, 0x1, b'{"type": "response.create"}'))
-    (txn,) = t.on_response_bytes(_CLOSE_1001)
+    txn = _closed(t)
     assert txn.ws_llm_call is False
     assert txn.ws_llm_unconfirmed is True
     assert Limitation.WS_LLM_SEMANTICS_UNREAD not in txn.ws_markers
@@ -127,7 +173,7 @@ def test_unknown_host_non_responses_message_stays_unconfirmed():
     t.on_request_bytes(_frame(True, 0x1, b'{"op":"ping"}'))
     # decided once: a later `response.create` does not reopen the question
     t.on_request_bytes(_frame(True, 0x1, b'{"type":"response.create"}'))
-    (txn,) = t.on_response_bytes(_CLOSE_1001)
+    txn = _closed(t)
     assert txn.ws_llm_call is False
     assert txn.ws_llm_unconfirmed is True
     assert Limitation.WS_LLM_SEMANTICS_UNREAD not in txn.ws_markers
@@ -149,7 +195,7 @@ def test_known_provider_confirms_when_the_first_frame_kills_the_parser():
     # single-shot: the disabled parser keeps reporting disabled, and the
     # decision is not made again
     assert t.on_request_bytes(b"\x81\x02hi") == []
-    (txn,) = t.on_response_bytes(_CLOSE_1001)
+    txn = _closed(t)
     assert txn.ws_llm_call is True
     assert txn.ws_llm_unconfirmed is False
     assert Limitation.WS_LLM_SEMANTICS_UNREAD in txn.ws_markers
@@ -162,7 +208,7 @@ def test_unknown_host_is_unconfirmed_when_the_first_frame_kills_the_parser():
     t = _tracker("unknown_host", deflate=False)
     assert t.on_request_bytes(_OVERSIZE_FIRST_FRAME) == []
     assert t.on_request_bytes(b"\x81\x02hi") == []
-    (txn,) = t.on_response_bytes(_CLOSE_1001)
+    txn = _closed(t)
     assert txn.ws_llm_call is False
     assert txn.ws_llm_unconfirmed is True
     assert Limitation.WS_LLM_SEMANTICS_UNREAD not in txn.ws_markers
@@ -172,7 +218,7 @@ def test_unknown_host_is_unconfirmed_when_the_first_frame_kills_the_parser():
 def test_no_client_message_confirms_nothing():
     """A connection that never sent a client message carried no call."""
     t = _tracker("known_provider", deflate=False)
-    (txn,) = t.on_response_bytes(_CLOSE_1001)
+    txn = _closed(t)
     assert txn.ws_llm_call is False
     assert txn.ws_llm_unconfirmed is False
     assert Limitation.WS_LLM_SEMANTICS_UNREAD not in txn.ws_markers
@@ -181,7 +227,7 @@ def test_no_client_message_confirms_nothing():
 def test_unrecognised_upgrade_claims_nothing():
     t = _tracker(None, deflate=False)
     t.on_request_bytes(_frame(True, 0x1, b'{"type": "response.create"}'))
-    (txn,) = t.on_response_bytes(_CLOSE_1001)
+    txn = _closed(t)
     assert txn.ws_llm_call is False
     assert txn.ws_llm_unconfirmed is False
     assert Limitation.WS_LLM_SEMANTICS_UNREAD not in txn.ws_markers
