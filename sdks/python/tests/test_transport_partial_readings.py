@@ -223,7 +223,9 @@ def test_a_connect_starts_a_new_connection_on_its_fileno():
 
 def test_an_async_handshake_no_observed_call_completed_has_no_reading():
     # OpenSSL can finish a handshake inside the first write; nothing timed it.
-    obj = ssl.create_default_context().wrap_bio(ssl.MemoryBIO(), ssl.MemoryBIO())
+    obj = ssl.create_default_context().wrap_bio(
+        ssl.MemoryBIO(), ssl.MemoryBIO(), server_hostname="localhost"
+    )
     rec = _TimingRecord()
     rec.total_ms = 40.0
     obj._wardex_timing = rec

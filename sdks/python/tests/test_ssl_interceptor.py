@@ -206,7 +206,9 @@ def test_resolve_timing_a_store_record_with_no_connect_still_proves_the_open():
 
 
 def test_resolve_timing_an_ssl_object_with_no_stamped_record_leaves_reuse_unset():
-    obj = ssl.create_default_context().wrap_bio(ssl.MemoryBIO(), ssl.MemoryBIO())
+    obj = ssl.create_default_context().wrap_bio(
+        ssl.MemoryBIO(), ssl.MemoryBIO(), server_hostname="localhost"
+    )
     assert getattr(obj, "_wardex_timing", None) is None
     got = SSLInterceptor()._resolve_timing(obj, _fresh_state())
     assert got == (None, None, None, (Limitation.CONNECT_TIMING_UNAVAILABLE,))
@@ -215,7 +217,9 @@ def test_resolve_timing_an_ssl_object_with_no_stamped_record_leaves_reuse_unset(
 def test_resolve_timing_an_ssl_object_stamped_at_creation_is_a_fresh_connection():
     # The anyio layer split: no connect time, but the record was stamped when
     # the TLS object was created after `init`, so the open was seen.
-    obj = ssl.create_default_context().wrap_bio(ssl.MemoryBIO(), ssl.MemoryBIO())
+    obj = ssl.create_default_context().wrap_bio(
+        ssl.MemoryBIO(), ssl.MemoryBIO(), server_hostname="localhost"
+    )
     rec = _TimingRecord()
     rec.handshake_ms = 3.0
     obj._wardex_timing = rec
