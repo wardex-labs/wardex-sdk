@@ -84,11 +84,28 @@ pub struct Http2Transaction {
     pub path: String,
     pub status: u16,
     pub content_type: Option<String>,
+    /// The response's `content-encoding`, as declared: the coding its body
+    /// bytes are in. The request's is not kept; nothing reads a request body
+    /// as anything but bytes.
+    pub content_encoding: Option<String>,
     pub grpc_status: Option<i32>,
     pub grpc_message: Option<String>,
     pub request_body: Vec<u8>,
     pub response_body: Vec<u8>,
+    /// Either half stopped at its body cap: `request_truncated ||
+    /// response_truncated`.
     pub truncated: bool,
+    /// The request body stopped at its cap, so `request_body` is a prefix and
+    /// its length is not the size of the body that was sent.
+    pub request_truncated: bool,
+    /// The same, for the response body.
+    pub response_truncated: bool,
+    /// The client's END_STREAM for this stream arrived before its response
+    /// ended. False when the server answered first — an upload refused
+    /// part-way, a client-streaming gRPC call ended by its status — so
+    /// `request_body` holds only what was sent so far and its length is not
+    /// the size of the request.
+    pub request_ended: bool,
     /// The stream table evicted this stream's request half before its
     /// response completed, so `method`, `path`, the request body and the
     /// request's content type are absent rather than empty. The status, the
@@ -118,13 +135,17 @@ struct StreamState {
     // generous one.
     req_content_type: Option<String>,
     resp_content_type: Option<String>,
+    resp_content_encoding: Option<String>,
     grpc_status: Option<i32>,
     grpc_message: Option<String>,
     req_body: Vec<u8>,
     resp_body: Vec<u8>,
     req_ended: bool,
     resp_ended: bool,
-    truncated: bool,
+    // Per direction, like the caps: which half was cut is what decides
+    // whether that half's length is the size of what crossed the wire.
+    req_truncated: bool,
+    resp_truncated: bool,
     /// A client header block was decoded into this entry. Only such an entry
     /// has a request half to lose, so only evicting one of these may raise
     /// the eviction mark — an entry built from DATA alone (a stream opened
@@ -479,6 +500,9 @@ impl Http2Connection {
                         st.resp_content_type = Some(ct);
                     }
                 }
+                b"content-encoding" if !from_client => {
+                    st.resp_content_encoding = Some(String::from_utf8_lossy(&value).into_owned());
+                }
                 b"grpc-status" => {
                     st.grpc_status = String::from_utf8_lossy(&value).trim().parse().ok();
                 }
@@ -531,17 +555,17 @@ impl Http2Connection {
                 st.resp_content_type.as_deref()
             };
             let cap = crate::http1::cap_for_content_type(this_direction_ct, &limits);
-            let target = if from_client {
-                &mut st.req_body
+            let (target, truncated) = if from_client {
+                (&mut st.req_body, &mut st.req_truncated)
             } else {
-                &mut st.resp_body
+                (&mut st.resp_body, &mut st.resp_truncated)
             };
             let room = cap.saturating_sub(target.len());
             if body.len() <= room {
                 target.extend_from_slice(body);
             } else {
                 target.extend_from_slice(&body[..room]);
-                st.truncated = true;
+                *truncated = true;
             }
         }
         if frame.flags & FLAG_END_STREAM != 0 {
@@ -607,11 +631,15 @@ impl Http2Connection {
                     // falling back to the request's. Cap selection in on_data
                     // does *not* use this merged value — see the comment there.
                     content_type: s.resp_content_type.or(s.req_content_type),
+                    content_encoding: s.resp_content_encoding,
                     grpc_status: s.grpc_status,
                     grpc_message: s.grpc_message,
                     request_body: s.req_body,
                     response_body: s.resp_body,
-                    truncated: s.truncated,
+                    truncated: s.req_truncated || s.resp_truncated,
+                    request_truncated: s.req_truncated,
+                    response_truncated: s.resp_truncated,
+                    request_ended: s.req_ended,
                     request_evicted: s.request_evicted,
                 });
             }
@@ -775,6 +803,31 @@ mod tests {
         assert_eq!(t.status, 200);
     }
 
+    #[test]
+    fn keeps_the_response_content_encoding_and_not_the_requests() {
+        let mut c = Http2Connection::new(Limits::default());
+        let req_block = hpack(&[
+            (b":method", b"POST"),
+            (b":path", b"/v1/chat/completions"),
+            (b"content-encoding", b"gzip"),
+        ]);
+        c.feed(true, &frame(0x1, FH | FS, 1, &req_block));
+        let resp_block = hpack(&[(b":status", b"200"), (b"content-encoding", b"br")]);
+        let mut resp = frame(0x1, FH, 1, &resp_block);
+        resp.extend_from_slice(&frame(0x0, FS, 1, b"\x5b\x35\xab"));
+        let r = c.feed(false, &resp);
+        assert_eq!(r.transactions.len(), 1);
+        assert_eq!(r.transactions[0].content_encoding.as_deref(), Some("br"));
+
+        // A response that names no coding has none, whatever the request declared.
+        let mut c = Http2Connection::new(Limits::default());
+        c.feed(true, &frame(0x1, FH | FS, 1, &req_block));
+        let plain = hpack(&[(b":status", b"200")]);
+        let r = c.feed(false, &frame(0x1, FH | FS, 1, &plain));
+        assert_eq!(r.transactions.len(), 1);
+        assert_eq!(r.transactions[0].content_encoding, None);
+    }
+
     // Build a header block with the HPACK encoder (test-only — round-trips with real encoding)
     fn hpack(headers: &[(&[u8], &[u8])]) -> Vec<u8> {
         let mut enc = fluke_hpack::Encoder::new();
@@ -826,6 +879,30 @@ mod tests {
         assert_eq!(r.transactions[0].request_body, b"{\"a\":1}");
         assert_eq!(r.transactions[0].response_body, b"ok");
         assert_eq!(r.transactions[0].status, 201);
+        assert!(r.transactions[0].request_ended);
+    }
+
+    #[test]
+    fn a_response_that_ends_before_its_request_says_the_request_had_not_ended() {
+        // An upload the server refuses part-way: it answers 413 while the
+        // client is still sending, so the request body is only a prefix.
+        let mut c = Http2Connection::new(Limits::default());
+        let req_block = hpack(&[(b":method", b"POST"), (b":path", b"/upload")]);
+        let mut req = frame(0x1, FH, 1, &req_block);
+        req.extend_from_slice(&frame(0x0, 0, 1, b"first part"));
+        let r = c.feed(true, &req);
+        assert!(r.opened_request_streams.is_empty());
+
+        let resp_block = hpack(&[(b":status", b"413")]);
+        let r = c.feed(false, &frame(0x1, FH | FS, 1, &resp_block));
+        assert_eq!(r.transactions.len(), 1);
+        let t = &r.transactions[0];
+        assert_eq!(
+            (t.status, t.request_body.as_slice()),
+            (413, &b"first part"[..])
+        );
+        assert!(!t.request_ended);
+        assert!(!t.request_truncated && !t.request_evicted);
     }
 
     #[test]
@@ -1325,6 +1402,7 @@ mod tests {
         let txn = r.transactions.first().expect("one transaction");
         assert!(txn.truncated);
         assert!(txn.request_body.len() <= 4);
+        assert!(txn.request_truncated && !txn.response_truncated);
     }
 
     #[test]
@@ -1528,5 +1606,8 @@ mod tests {
         assert_eq!(txn.request_body, b"0123456789");
         // Response declared octet-stream → opaque cap, truncated to 4.
         assert_eq!(txn.response_body, b"0123");
+        // Only the response was cut, and the transaction says which half:
+        // the request's length is still the size of the body that was sent.
+        assert!(txn.truncated && txn.response_truncated && !txn.request_truncated);
     }
 }

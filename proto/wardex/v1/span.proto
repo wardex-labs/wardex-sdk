@@ -124,13 +124,46 @@ message SpanLink {
   LinkReason reason = 4;  // why this span points at that one (causality, not containment)
 }
 
+// Every field here says either what the SDK observed or nothing. A field the
+// SDK can fail to observe has explicit presence (`optional`), so "not
+// observed" leaves it unset instead of shipping its zero value as a reading;
+// an enum's unset is its `*_UNSPECIFIED` zero.
 message TransportAttributes {
+  // Tags 25 and 26 were `int32 chunk_index` and `bool is_final_chunk`. Nothing
+  // ever filled them, so every span carried 0 and true: a claim about
+  // streaming chunks that no one observed. Removed before any envelope was
+  // stored, the last point a deletion is allowed; reserved so the numbers and
+  // names never come back meaning something else.
+  reserved 25, 26;
+  reserved "chunk_index", "is_final_chunk";
+
   string connection_id = 1;
   Protocol protocol = 2;
   Direction direction = 3;
   TransportTiming timing = 4;
-  int32 request_size = 5;
-  int32 response_size = 6;
+  // The size in bytes of each half as the SDK captured it: for HTTP the body
+  // as it crossed the wire (content-coded, without chunk framing); for a
+  // WebSocket session the payload bytes sent and received until a Close frame
+  // had crossed each way or its socket closed; for MCP stdio the params and
+  // the result or error re-encoded as compact JSON, the form the payload is
+  // captured in, which drops the server's whitespace and needless `\u`
+  // escapes, so it is not the count of bytes on the pipe. Set only when the
+  // half was captured whole. Unset: the body went past its capture limit, so
+  // only a prefix was kept and its length is not the body's size (marked
+  // `body_cap_exceeded` on HTTP/1; HTTP/2 marks the span truncated); an
+  // HTTP/2 stream whose request half the stream table evicted before the
+  // response arrived (marked `h2_request_evicted`); a request the SDK had not
+  // seen end when its response did (an HTTP/1 request the parser had not
+  // finished reading; an HTTP/2 request with no END_STREAM yet, such as an
+  // upload the server refused part-way or a client-streaming gRPC call it
+  // ended with a status); a WebSocket direction whose frame parser stopped
+  // (marked `frame_parse_failed`); a WebSocket session the SDK stopped
+  // following while it was still open (at `wardex.close()`, marked
+  // `ws_no_close` unless a Close frame had crossed, or when its connection
+  // table was full, marked `connection_evicted`), which also leaves its
+  // length unset.
+  optional int32 request_size = 5;
+  optional int32 response_size = 6;
 
   HttpMeta http = 10;
   GrpcMeta grpc = 11;
@@ -142,21 +175,43 @@ message TransportAttributes {
   string request_blob_ref = 20;
   string response_blob_ref = 21;
 
+  // Unset means not observed. No producer in this SDK names a modality yet.
   Modality request_modality = 22;
   Modality response_modality = 23;
 
-  bool is_streaming = 24;
-  int32 chunk_index = 25;
-  bool is_final_chunk = 26;
-  bool connection_reused = 27;  // whether the connection was reused via pooling (if true, connect/handshake=0 means "reused")
+  // true: the response was a Server-Sent Events stream — it declared
+  // `Content-Type: text/event-stream`, whether or not its body could be read,
+  // or its body read as one (of a body cut by its capture limit, the part the
+  // SDK read shows event lines). false: it did not declare one, and its whole
+  // body was read as something else (JSON, or text with no event line).
+  // Unset: it did not declare one and its body was not read as either: not
+  // parsed (gRPC, a skipped or failed parse, a WebSocket session, stdio), cut
+  // by its capture limit with no event line in the part read, in a
+  // `Content-Encoding` the SDK does not inflate (it inflates one gzip or zlib
+  // layer), or not text (binary).
+  optional bool is_streaming = 24;
+  // Whether this transaction rode a pooled connection opened by an earlier
+  // one. When true, `tcp_connect_ms` / `tls_handshake_ms` of 0 mean this
+  // transaction opened nothing. false only where the SDK saw the connection
+  // open; on HTTP/2, for stream 1, the one it was opened for. Unset where the
+  // producer cannot tell either way: on a connection the SDK did not see open
+  // (one opened before it started), the first HTTP/1 transaction it saw or
+  // HTTP/2 stream 1; a WebSocket session; stdio.
+  optional bool connection_reused = 27;
 }
 
+// Unset means the SDK did not measure that interval on this transaction —
+// never that it took no time.
 message TransportTiming {
-  float tcp_connect_ms = 1;
-  float tls_handshake_ms = 2;
-  float ttfb_ms = 3;
-  float transfer_ms = 4;
-  float ttft_ms = 5;  // time-to-first-token (SSE streaming)
+  optional float tcp_connect_ms = 1;
+  // From the first `do_handshake()` attempt to the one that completed it.
+  optional float tls_handshake_ms = 2;
+  // MCP stdio: the time until the response message was read.
+  optional float ttfb_ms = 3;
+  // A WebSocket session: its length, from its upgrade request to its end,
+  // when a Close frame had crossed each way or its socket closed.
+  optional float transfer_ms = 4;
+  optional float ttft_ms = 5;  // time to the first response body byte (HTTP/1)
 }
 
 message HttpMeta {

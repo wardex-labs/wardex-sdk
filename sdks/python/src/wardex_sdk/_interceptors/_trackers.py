@@ -9,27 +9,28 @@ from __future__ import annotations
 
 import re
 import time
-import zlib
 from dataclasses import dataclass
 from typing import Any
 
 from .. import _hub, _wardex_native
-from .._assembly import Limitation, counters, guard, parent_is_closed_unit
+from .._assembly import Limitation, counters, parent_is_closed_unit
 from .._protocol import WsParser
-from .._protocol._http1 import Http1RequestParser, Http1ResponseParser
+from .._protocol._http1 import Http1RequestParser, Http1ResponseParser, declares_event_stream
 from .._protocol._http2 import Http2Parser
 from .._types import ConversationContext, SpanContext
 from ._h2_issuer import IssuerLink
 
 
-def _ttft_from_marks(marks: list[tuple[int, int]], header_len: int, start_ns: int) -> float:
+def _ttft_from_marks(marks: list[tuple[int, int]], header_len: int, start_ns: int) -> float | None:
     """marks=[(cumulative_wire_bytes, ns)]. TTFT (ms) is computed from the ns of the
-    first mark that crosses the header_len boundary. Returns 0.0 if no mark crosses the
-    boundary, or if the request start time is unknown (mid-connection capture)."""
+    first mark that crosses the header_len boundary. None — not measured, which
+    ships as an unset field rather than as a 0 ms reading — if no mark crosses the
+    boundary (no body byte arrived), or if the request start time is unknown
+    (mid-connection capture)."""
     for cum, ns in marks:
         if cum > header_len:
-            return max(0.0, (ns - start_ns) / 1e6) if start_ns else 0.0
-    return 0.0
+            return max(0.0, (ns - start_ns) / 1e6) if start_ns else None
+    return None
 
 
 def _header_get(headers: object, name: str) -> str | None:
@@ -99,56 +100,6 @@ def _url_target(txn: _Txn, withhold: bool = False) -> str:
     return txn.target
 
 
-def _inflated(txn: _Txn, body: bytes, limits: object | None) -> bytes:
-    """A gzip- or zlib-compressed body as the bytes it carries.
-
-    A captured body is what a debugger reads and what masking scans, and
-    neither can see through compression: a gzipped OAuth token response
-    shipped its `access_token` as base64 anyone could gunzip. Recognised by
-    its header, as the semantic parser recognises it.
-
-    Bounded by the smaller of `max_decoded_bytes` and `max_opaque_body_bytes`:
-    the compressed bytes were admitted under some cap, and inflating must not
-    turn a 13 KB download into a multi-megabyte span. A body that inflates
-    past the bound keeps its inflated prefix and marks the transaction
-    truncated — never the compressed bytes, whose secrets anyone could
-    recover. Accepted only when the stream completed, or when a stream cut
-    short (by the capture cap) inflated to text: a plain body that merely
-    starts like a zlib header decodes to noise, and is returned as it was.
-    """
-    cap = min(
-        getattr(limits, "max_decoded_bytes", 0) or 0,
-        getattr(limits, "max_opaque_body_bytes", 0) or 0,
-    )
-    is_gzip = body[:2] == b"\x1f\x8b"
-    # A zlib header: deflate method, and a check value divisible by 31 —
-    # which a text body that merely starts with `x` almost never is.
-    is_zlib = len(body) >= 2 and body[0] & 0x0F == 8 and (body[0] << 8 | body[1]) % 31 == 0
-    if not cap or not (is_gzip or is_zlib):
-        return body
-    result = None
-    with guard("interceptors.inflate"):
-        result = _inflate_once(body, cap)
-    if result is None or not result[0]:
-        return body
-    out, complete = result
-    # Text, give or take the one character a cut stream may end inside.
-    text_len = len(out.decode("utf-8", "ignore").encode())
-    if not complete and len(out) <= cap and text_len < len(out) - 3:
-        return body
-    if len(out) > cap:
-        txn.truncated = True
-        return out[:cap]
-    return out
-
-
-def _inflate_once(body: bytes, cap: int) -> tuple[bytes, bool]:
-    """Up to `cap + 1` inflated bytes, and whether the stream completed."""
-    inflater = zlib.decompressobj(wbits=47)  # 47: a gzip or a zlib header
-    out = inflater.decompress(body, cap + 1)
-    return out, inflater.eof
-
-
 def _is_ws_upgrade_request(headers: object) -> bool:
     up = _header_get(headers, "upgrade")
     conn = _header_get(headers, "connection")
@@ -183,7 +134,9 @@ class _Txn:
     parent: SpanContext | None
     start_ns: int
     end_ns: int
-    ttfb_ms: float
+    #: None when this tracker cannot time the first response byte (an HTTP/2
+    #: stream, a capture that joined mid-connection): not measured, not zero.
+    ttfb_ms: float | None
     #: Was `parent` latched off a unit that had ALREADY closed? Latched HERE,
     #: beside the parent and on the task that ISSUED the request, because the
     #: answer is a property of that instant: a request issued while the run was
@@ -203,14 +156,25 @@ class _Txn:
     #: False where no h2 issuer was proven (`_h2_issuer`): `conversation` is unknown, not none.
     issuer_proven: bool = True
     truncated: bool = False
+    #: Was every byte of this half counted? False when its body went past the
+    #: capture cap (a prefix was kept), the half was lost or never finished
+    #: parsing, or a WebSocket direction's frame parser stopped. The seam
+    #: ships a size only for a half that was.
+    request_counted: bool = True
+    response_counted: bool = True
+    #: The HTTP/2 stream this transaction rode; None on HTTP/1.
+    stream_id: int | None = None
     # Capture-limitation markers the protocol parser attached to this
     # transaction, merged into the span's CaptureIntegrity.limitations by the
     # seam. Members, not strings: the parser's `&'static str` was resolved once
     # at the PyO3 boundary (`_protocol/_http1.py`).
     limitations: tuple[Limitation, ...] = ()
     version: str = "1.1"
-    ttft_ms: float = 0.0
+    #: See `ttfb_ms`; also None when no body byte arrived.
+    ttft_ms: float | None = None
     content_type: str | None = None
+    event_stream: bool = False  # see `declares_event_stream`
+    content_encoding: str | None = None  # the response's; see `sniff_decoded_body`
     grpc_status: int | None = None
     grpc_message: str | None = None
     # WS upgrade signal (set on 101 detection — used by _ssl.py as the SWAP trigger)
@@ -311,7 +275,7 @@ class _Http1Tracker:
                         conversation=self._conversation,
                         start_ns=self._req_start_ns or now,
                         end_ns=now,
-                        ttfb_ms=0.0,
+                        ttfb_ms=None,
                         version="1.1",
                         ws_upgrade=True,
                         ws_upgrade_path=self._path or "/",
@@ -330,13 +294,17 @@ class _Http1Tracker:
             # real final response that follows).
             # (101 upgrade is already handled in the branch above.)
             if msg.status_code is not None and 100 <= msg.status_code < 200:
+                # Re-base the byte marks on the final response's first byte, or
+                # its TTFT would land on the arrival of its own header block.
+                self._resp_marks = [(c - msg.header_len, ns) for c, ns in self._resp_marks]
+                self._resp_cum -= msg.header_len
                 continue
             # --- Regular HTTP response (existing behavior) ---
             now = time.time_ns()
             ttfb = (
                 max(0.0, (self._resp_first_ns - self._req_start_ns) / 1e6)
                 if self._req_start_ns and self._resp_first_ns
-                else 0.0
+                else None
             )
             ttft = _ttft_from_marks(self._resp_marks, msg.header_len, self._req_start_ns)
             out.append(
@@ -354,9 +322,13 @@ class _Http1Tracker:
                     end_ns=now,
                     ttfb_ms=ttfb,
                     truncated=self._req_truncated or msg.truncated,
+                    request_counted=self._method is not None and not self._req_truncated,
+                    response_counted=not msg.truncated,
                     limitations=_merge_markers(self._req_limitations, msg.limitations),
                     version="1.1",
                     ttft_ms=ttft,
+                    event_stream=declares_event_stream(_header_get(msg.headers, "content-type")),
+                    content_encoding=_header_get(msg.headers, "content-encoding"),
                 )
             )
             self._method = None
@@ -573,16 +545,14 @@ class _Http2Tracker:
         else:
             parent, parent_closed, conversation, proven, start = entry
             parent_evicted = False
-        # The OTHER half of the same bound: the native stream table evicted
-        # this stream's request before its response completed. The response
-        # is a real observation — a status, an end — so the span ships, but
-        # its `? /` is a display fallback for a request wardex lost, and it
-        # may only ever appear with the marker that says so. Counted here,
-        # before the seam's status and capture-mode filters, so the loss is
-        # visible even when no span survives them.
+        # The OTHER half of the same bound: the native stream table evicted this stream's request
+        # before its response completed. The response is a real observation — a status, an end — so
+        # the span ships, but its `? /` is a display fallback for a request wardex lost, and it may
+        # only ever appear with the marker that says so. Counted here, before the seam's status and
+        # capture-mode filters, so the loss is visible even when no span survives them.
         #
-        # A plain attribute read: a default here is the shape that would make
-        # every marker vanish silently if the native field were ever renamed.
+        # A plain attribute read: a default here is the shape that would make every marker vanish
+        # silently if the native field were ever renamed.
         request_evicted = bool(t.request_evicted)
         if request_evicted:
             counters.bump("protocol.http2.stream_evicted")
@@ -600,12 +570,19 @@ class _Http2Tracker:
             issuer_proven=proven,
             start_ns=start,
             end_ns=now,
-            ttfb_ms=0.0,  # per-h2-stream first-byte not tracked (limitation)
+            ttfb_ms=None,  # per-h2-stream first-byte not tracked: not measured
             truncated=t.truncated or request_evicted,
+            # A request whose END_STREAM had not arrived when the response ended holds only what was
+            # sent so far (an upload refused part-way): like HTTP/1's unfinished request, no size.
+            request_counted=t.request_ended and not (t.request_truncated or request_evicted),
+            response_counted=not t.response_truncated,
+            stream_id=t.stream_id,
             limitations=(Limitation.H2_REQUEST_EVICTED,) if request_evicted else (),
             version="2",
-            ttft_ms=0.0,  # per-h2-stream first-body-byte not tracked (limitation)
+            ttft_ms=None,  # per-h2-stream first-body-byte not tracked: not measured
             content_type=getattr(t, "content_type", None),
+            event_stream=declares_event_stream(getattr(t, "content_type", None)),
+            content_encoding=t.content_encoding,
             grpc_status=getattr(t, "grpc_status", None),
             grpc_message=getattr(t, "grpc_message", None),
         )
@@ -613,7 +590,7 @@ class _Http2Tracker:
 
 class _WebSocketTracker:
     """One WS connection — per-direction frame parser + aggregation + 64KB content sample.
-    Emits 1 span on close/flush."""
+    Emits 1 span once both Close frames have crossed, or on flush."""
 
     def __init__(
         self,
@@ -627,12 +604,10 @@ class _WebSocketTracker:
         llm_upgrade: str | None = None,
         conversation: ConversationContext | None = None,
     ) -> None:
-        # "known_provider" | "unknown_host" | None: the endpoint table's
-        # answer about the upgrade path (`classify_ws_upgrade`), decided by
-        # the seam at the swap site. The tracker only confirms it — once:
-        # `_decide_llm` nulls this, so "already decided" and "nothing to
-        # decide" are the same state and there is no second flag to keep in
-        # step with it.
+        # "known_provider" | "unknown_host" | None: the endpoint table's answer about the upgrade
+        # path (`classify_ws_upgrade`), decided by the seam at the swap site. The tracker only
+        # confirms it — once: `_decide_llm` nulls this, so "already decided" and "nothing to
+        # decide" are the same state and there is no second flag to keep in step with it.
         self._llm_upgrade = llm_upgrade
         self._llm_call = False
         self._llm_unconfirmed = False
@@ -667,18 +642,15 @@ class _WebSocketTracker:
         self._in_trunc = False
         self._out_trunc = False
         self._close_code: int | None = None
-        self._closed = False
+        #: The directions ("sent", "received") a Close frame crossed in. The session ends when both
+        #: have: the peer may still send data after the first Close (RFC 6455 5.5.1), and its own
+        #: Close is part of the session too, so a span built at the first one undercounted both.
+        self._close_from: set[str] = set()
         self._emitted = False
 
     def on_request_bytes(self, data: bytes) -> list[_Txn]:
         r = self._sent.feed(data)
-        for f in r.frames:
-            self._sent_bytes += f.payload_len
-            if f.close_code is not None:
-                self._close_code = f.close_code
-                self._closed = True
-            if f.opcode == "close":
-                self._closed = True
+        self._sent_bytes += self._count(r.frames, "sent")
         self._sent_msgs += len(r.messages)
         # A parser that died can no longer tell a message from a frame, so every write counts then.
         if (r.messages or self._sent.is_disabled()) and self._conversation is not None:
@@ -715,13 +687,7 @@ class _WebSocketTracker:
 
     def on_response_bytes(self, data: bytes) -> list[_Txn]:
         r = self._recv.feed(data)
-        for f in r.frames:
-            self._recv_bytes += f.payload_len
-            if f.close_code is not None:
-                self._close_code = f.close_code
-                self._closed = True
-            if f.opcode == "close":
-                self._closed = True
+        self._recv_bytes += self._count(r.frames, "received")
         self._recv_msgs += len(r.messages)
         self._out_trunc = self._append_sample(self._sample_out, r.messages) or self._out_trunc
         return self._maybe_emit()
@@ -742,15 +708,29 @@ class _WebSocketTracker:
                 buf += m
         return truncated
 
+    def _count(self, frames: list[Any], side: str) -> int:
+        """The payload bytes in `frames`, noting a Close frame from `side`. The session's close
+        code is the first Close frame's: the one that began the closing handshake."""
+        for f in frames:
+            if f.opcode == "close":
+                if not self._close_from:
+                    self._close_code = f.close_code
+                self._close_from.add(side)
+        return sum(f.payload_len for f in frames)
+
     def _maybe_emit(self) -> list[_Txn]:
-        if self._closed and not self._emitted:
+        if len(self._close_from) == 2 and not self._emitted:
             return [self._build_txn(())]
         return []
 
     def flush(self, marker: Limitation) -> list[_Txn]:
+        """The socket closed or the seam let go before the closing handshake completed.
+        `WS_NO_CLOSE` says no Close frame crossed at all, so a session that saw one does not take
+        it; the seam decides from the ending whether the counts are whole."""
         if self._emitted:
             return []
-        return [self._build_txn((marker,))]
+        drop = marker is Limitation.WS_NO_CLOSE and bool(self._close_from)
+        return [self._build_txn(() if drop else (marker,))]
 
     #: The connection-close verb every tracker answers to. For a WS session it IS `flush`, and an
     #: ALIAS rather than a delegating wrapper: this is the one tracker with something to save at
@@ -787,13 +767,15 @@ class _WebSocketTracker:
             conversation=self._conversation,
             start_ns=self._start_ns,
             end_ns=now,
-            ttfb_ms=0.0,
+            ttfb_ms=None,
             version="websocket",
             ws_close_code=self._close_code,
             ws_messages_sent=self._sent_msgs,
             ws_messages_received=self._recv_msgs,
             ws_bytes_sent=self._sent_bytes,
             ws_bytes_received=self._recv_bytes,
+            request_counted=not self._sent.is_disabled(),
+            response_counted=not self._recv.is_disabled(),
             ws_markers=tuple(markers),
             ws_llm_call=self._llm_call,
             ws_llm_unconfirmed=self._llm_unconfirmed,

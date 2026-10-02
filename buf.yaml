@@ -7,9 +7,22 @@ lint:
 breaking:
   use:
     - FILE
-  # No `ignore_only` entries on purpose. An exception here is scoped to a whole
-  # file, not to one field, so one that outlives the change it was written for
-  # silently lets every later deletion in that file through. A deliberate break
-  # adds its entry in the same change and the very next change removes it (the
-  # baseline already contains the break by then, so nothing needs excusing).
-  # `scripts/check-buf-exceptions.sh` enforces the second half in CI.
+  # An exception here is scoped to a whole file, not to one field, so one that
+  # outlives the change it was written for silently lets every later break in
+  # that file through. A deliberate break adds its entry in the same change and
+  # the very next change removes it (the baseline already contains the break by
+  # then, so nothing needs excusing). `scripts/check-buf-exceptions.sh`
+  # enforces the second half in CI.
+  #
+  # The entry below is one such break, and only these: in `span.proto`,
+  # `TransportAttributes.chunk_index` (25) and `is_final_chunk` (26) are
+  # deleted and reserved, and `request_size`, `response_size`,
+  # `is_streaming`, `connection_reused` and the five `TransportTiming` fields
+  # gain explicit presence, so that a value the SDK did not observe leaves the field unset
+  # instead of shipping its zero value as a reading. No envelope has been
+  # stored by any receiver yet. Remove the entry in the next change.
+  ignore_only:
+    FIELD_NO_DELETE:
+      - proto/wardex/v1/span.proto
+    FIELD_SAME_CARDINALITY:
+      - proto/wardex/v1/span.proto

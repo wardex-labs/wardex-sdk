@@ -424,7 +424,8 @@ for yours, which may have won: it rides along the same way, counted under
 `semantics.request_conversation_withheld`.
 `workflow` / `agent` / `step` / `tool` map to the `gen_ai.operation.name`
 values `invoke_workflow` / `invoke_agent` / `execute_step` / `execute_tool`,
-so decorated spans appear on operation-keyed dashboards. `span()` and
+so decorated spans appear on operation-keyed dashboards. A workflow's name
+ships as `gen_ai.workflow.name`. `span()` and
 `conversation()` are context managers only — using one as a decorator raises
 a `TypeError` naming the decorators (a decorator would silently break async
 functions).
@@ -620,9 +621,10 @@ span carries `ws.messages.sent` (about one per call), byte counts and payload
 samples (compressed bytes, marked `payload_compressed`, when
 permessage-deflate was negotiated), no model or tokens; switch the framework
 to its default HTTP transport for `gen_ai` spans. A connection that ends
-without a WebSocket close handshake — a server drop, a timeout, process exit,
-or wardex uninstalled first — still yields the span, additionally marked
-`ws_no_close`. The connection counts as an LLM connection only when the host
+before either side sent a WebSocket Close frame — a server drop, a timeout,
+process exit, or wardex uninstalled first — still yields the span,
+additionally marked `ws_no_close`. The connection counts as an LLM
+connection only when the host
 is the provider's own — exactly `api.openai.com` or a subdomain of
 `openai.com`; a host that merely contains the name, such as
 `openai-mock.corp`, is not — or when the first client message carries a
@@ -858,11 +860,72 @@ diagnostic line (traceback under `debug=True`).
 - Failed provider calls (429 rate limits, 401s, 5xx) are captured with the same
   `gen_ai` identity and content as successful ones — only the response-side
   fields are empty
-- Transport metrics (TCP/TLS timing, TTFT), gRPC (grpclib), WebSocket (`wss`;
+- Transport metrics: TCP connect and TLS handshake time, time to the first
+  response byte and to the first body byte, transfer time (milliseconds),
+  request and response size, connection id and reuse, and whether the
+  response was a Server-Sent Events stream — over OTLP as
+  `wardex.transport.timing.*` and `wardex.transport.*`, and in the envelope's
+  transport block. **The `wardex.transport.*` names are reserved** for these
+  values: an attribute your code sets under one of them is replaced on OTLP
+  export by the value the SDK observed, or left out where it observed none,
+  so the names never carry a reading the SDK did not make; each such
+  attribute is counted under `transport.otlp.reserved_attribute_overwritten`
+  and said once per process. `wardex.transport.connection_id` is never
+  masked: it is the SDK's own `str(id(socket))`, fifteen digits on 64-bit
+  Linux, the shape of a card number. A TLS handshake is timed from its first `do_handshake()`
+  attempt to the one that completed it, so a non-blocking one an event loop
+  drives counts whole. On a pooled connection the connect time is `0`, and so
+  is the handshake over TLS (`connection_reused` is true: the call opened
+  nothing); on HTTP/2 the stream the connection was opened for, stream 1,
+  carries them. A size is the body as sent (content-coded, without chunk
+  framing); for a WebSocket session, the payload bytes each way until a Close
+  frame has crossed each way or the socket closed, and its length (transfer
+  time) runs from the upgrade request to that end; for MCP
+  stdio, the params and the result or error as the SDK captures them,
+  re-encoded as compact JSON — a server's whitespace and needless `\u`
+  escapes are not counted, so this is not the byte count on the pipe. For
+  MCP stdio the first-byte time is the time until its response message was
+  read.
+  Only what was measured whole is sent, and the rest carries no key rather
+  than a `0`: a connect time the seam could not time (a plaintext connection
+  opened by asyncio, whose non-blocking connect returns before the handshake
+  does; an `anyio`/httpx TLS connection; an asyncio `create_connection` handed
+  an already connected socket, as aiohttp does, or a host name to resolve;
+  one opened before `init`; each marked `connect_timing_unavailable`); a TLS
+  handshake on a plaintext connection, one begun before `init`, or one
+  OpenSSL completed with no `do_handshake()` call to time; the first-byte and
+  transfer times of an HTTP/2 stream; the size of a body that went past its
+  capture limit (marked `body_cap_exceeded` on HTTP/1; on HTTP/2 the span is
+  marked truncated), of an HTTP/2 request the SDK lost before capturing it
+  (marked `h2_request_evicted`), of a request the SDK had not seen end when
+  its response did (an HTTP/1 request it had not finished reading; an HTTP/2
+  request with no END_STREAM yet, such as an upload the server refused
+  part-way or a client-streaming gRPC call it ended with a status), and of a
+  WebSocket direction whose frame parser stopped (marked
+  `frame_parse_failed`); the length and sizes of a WebSocket session the SDK
+  stopped following while it was still open (at `wardex.close()`, marked
+  `ws_no_close` unless a Close frame had crossed, or when its connection
+  table was full, marked `connection_evicted`); and everything about a
+  WebSocket session but its length and sizes. A WebSocket session cut while
+  still open (at `wardex.close()`, or `connection_evicted`) has a span that
+  ends at the cut, so the span's duration is not the session's length.
+  Connection reuse is `false` only on a connection the SDK saw open; on one
+  opened before `init`, the first request it sees (on HTTP/2, stream 1)
+  carries none. A response is a stream when it declared `text/event-stream`
+  or its body read as one (for a body cut by its capture limit, as sent or
+  once inflated: see Compressed bodies, when the part the SDK read shows
+  event lines), and not a stream when it declared none and its whole body
+  read as something else; with no declaration, a cut body whose part read
+  shows no event line, a body in a `Content-Encoding` the SDK does not
+  inflate (it inflates one gzip or zlib layer; `br`, `zstd` and raw deflate
+  stay unread, whatever their bytes look like), or one that is not text
+  (binary) says neither
+- gRPC (grpclib), WebSocket (`wss`;
   a Responses-over-WebSocket connection is captured at close and marked
   `ws_llm_semantics_unread` when the host is `api.openai.com` or a subdomain
   of `openai.com` — on any other host with compression it is only counted,
-  see capture_mode), MCP stdio
+  see capture_mode), MCP stdio (`mcp.method.name` and `jsonrpc.request.id`
+  over OTLP)
 - Export to any OpenTelemetry backend via `OtlpHttpTransport`
 - Manual span decorators: `@workflow` / `@agent` / `@step` / `@tool`
 - PII masking on by default: emails, phone numbers, credit cards (Luhn-verified),

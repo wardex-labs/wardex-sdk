@@ -385,17 +385,17 @@ Two emit sites, and the first is the mechanism the second restates.
     ADAPTER_UNINSTALLED = "adapter_uninstalled"
     """The span was closed by ``uninstall()`` rather than by the framework.
 
-    Emitted from ``_adapters/_anthropic_agent_sdk.py::uninstall``, which is also
-    the path an ordinary interpreter exit takes: ``atexit`` tears the adapter
-    down, so this — not ``UNIT_INTERRUPTED`` — is what a Ctrl-C ultimately puts
-    on the span. The two are not interchangeable. This one is mechanical and
-    always true of an uninstall; its sibling additionally claims the process was
-    cut off, which is only knowable in the signal handler.
+    Emitted from each adapter's ``uninstall`` (``_adapters/_anthropic_agent_sdk.py``,
+    ``_adapters/_langgraph.py``, ``_adapters/_openai_agents.py``), which is also the path an
+    ordinary interpreter exit takes: ``atexit`` tears the adapter down, so this — not
+    ``UNIT_INTERRUPTED`` — is what a Ctrl-C ultimately puts on the span. The two are not
+    interchangeable. This one is mechanical and always true of an uninstall; its sibling
+    additionally claims the process was cut off, which is only knowable in the signal handler.
 
-    Deliberately NOT merged with ``WS_NO_CLOSE`` even though both of today's
-    ``ws_no_close`` sites sit inside ``uninstall()``: the fact a user reads off
-    ``WS_NO_CLOSE`` is capture completeness (no CLOSE frame, so close code and
-    duration are untrustworthy), not lifecycle. The two are correct *together*.
+    Deliberately NOT merged with ``WS_NO_CLOSE``, which the byte seam's own ``uninstall()`` also
+    emits at ``wardex.close()``: that marker sits on a WebSocket span, never on an adapter's, and
+    its other site, the socket-close hook, involves no uninstall. What a user reads off it is
+    capture completeness (no CLOSE frame, so no close code), not lifecycle.
     """
 
     PATCH_SUPERSEDED = "patch_superseded"
@@ -409,10 +409,9 @@ Two emit sites, and the first is the mechanism the second restates.
     delete the other library's interception from a component that has just
     announced it is gone.
 
-    Detectable only at restore time, when the component has stopped producing
-    spans — so the live signal is the counter ``PatchSet`` bumps
-    (``<owner>.patch_superseded``), and ``PatchSet.limitations()`` offers the
-    member to any caller that does hold a span to hang it on.
+    Detectable only at restore time, when the component has stopped producing spans — so the live
+    signal is the counter ``PatchSet`` bumps (``<owner>.patch_superseded``), and
+    ``PatchSet.limitations()`` offers the member to any caller that does hold a span to hang it on.
     """
 
     INSTRUMENTATION_DEGRADED = "instrumentation_degraded"
@@ -619,21 +618,21 @@ Two emit sites, and the first is the mechanism the second restates.
     # ------------------------------------------------------------------
 
     CONNECT_TIMING_UNAVAILABLE = "connect_timing_unavailable"
-    """``tcp_connect_ms`` is 0 because it could not be measured, not because the
-    connection was instant.
+    """``tcp_connect_ms`` could not be measured, so it is left unset rather than
+    reported as an instant connection.
 
-    Emitted from ``_interceptors/_socket.py::RawSocketInterceptor._resolve_timing``
-    (always — the raw-socket seam has no connect-time store) and
-    ``_interceptors/_ssl.py::SSLInterceptor._resolve_timing`` (sync path: the
-    shared timing store had no record for this fileno; async path: no stamped
-    ``_wardex_timing`` record at all).
+    Emitted from ``_interceptors/_socket.py::RawSocketInterceptor._resolve_timing`` and
+    ``_interceptors/_ssl.py::SSLInterceptor._resolve_timing`` (sync path) when the shared timing
+    store held no timed connect for this fileno: none was seen, or a non-blocking one (asyncio)
+    returned before its handshake did; and from the SSL async path when no ``_wardex_timing``
+    record was stamped at all, or its ``total_ms`` is 0 because ``create_connection`` was handed
+    ``sock=`` or a host name and so timed more than a connect.
 
     NOTE (census): absorbed the free string ``async_connect_unavailable``
-    (``_ssl.py::_resolve_timing``, anyio/httpx path where TLS and TCP are
-    separate layers so ``total_ms`` is 0 and connect cannot be derived). What is
-    lost is the provenance — sync fileno miss vs anyio layer split. Merged
-    anyway: both assert the same fact, ``tcp_connect_ms`` is unknown rather than
-    zero, and the user action in both cases is the same (none).
+    (``_ssl.py::_resolve_timing``, anyio/httpx path where TLS and TCP are separate layers so
+    ``total_ms`` is 0 and connect cannot be derived). What is lost is the provenance — sync fileno
+    miss vs anyio layer split. Merged anyway: both assert the same fact, ``tcp_connect_ms`` is
+    unknown rather than zero, and the user action in both cases is the same (none).
     """
 
     TTFT_UNAVAILABLE_H2 = "ttft_unavailable_h2"
@@ -746,18 +745,18 @@ Two emit sites, and the first is the mechanism the second restates.
     """
 
     CONNECTION_EVICTED = "connection_evicted"
-    """The connection table hit ``max_connections`` and this connection's
-    tracker was flushed early, so its span ends at the eviction instant.
+    """The connection table hit ``max_connections`` and this connection's tracker was flushed
+    early, so its span ends at the eviction instant (a WebSocket session's, with no length and
+    no sizes: it goes on unwatched).
 
     Emitted from ``_interceptors/_seam.py::ByteSeamInterceptor._state`` via
     ``_WebSocketTracker.flush(marker)``. Before the census rewired that site it
     was the free string ``ws_evicted``.
 
-    NOTE (census): renamed, NOT merged into ``UNIT_EVICTED``. Both say
-    "something was evicted", but they name different tables and different
-    tunables — ``max_connections`` here, ``max_units`` there — and a merged
-    marker would send the user to the wrong knob. The rename drops the ``ws_``
-    prefix because the connection table is not WebSocket-specific.
+    NOTE (census): renamed, NOT merged into ``UNIT_EVICTED``. Both say "something was evicted",
+    but they name different tables and different tunables — ``max_connections`` here,
+    ``max_units`` there — and a merged marker would send the user to the wrong knob. The rename
+    drops the ``ws_`` prefix because the connection table is not WebSocket-specific.
     """
 
     H2_REQUEST_EVICTED = "h2_request_evicted"
@@ -980,13 +979,14 @@ Two emit sites, and the first is the mechanism the second restates.
     """
 
     WS_NO_CLOSE = "ws_no_close"
-    """The WebSocket span was emitted without ever seeing a CLOSE frame, so its close code and
-    duration are not trustworthy.
+    """The WebSocket span was emitted without ever seeing a CLOSE frame, so it has no close code.
 
-    Emitted from ``_interceptors/_seam.py::ByteSeamInterceptor._retire``, via
-    ``_WebSocketTracker.flush(marker)``, reached from ``uninstall()`` and from the shared
-    socket-close hook (``_connection_closed``). The uninstall path travels alongside
-    ``ADAPTER_UNINSTALLED``; see that member for why they stay two markers.
+    Emitted from ``_interceptors/_seam.py::ByteSeamInterceptor._retire`` via
+    ``_WebSocketTracker.flush(marker)`` at two sites: the seam's own ``uninstall()``, run by
+    ``wardex.close()`` (the session goes on unwatched, so its span ends there with no length and no
+    sizes), and the socket-close hook (``_connection_closed``: the socket is gone, so both are
+    whole). ``ADAPTER_UNINSTALLED`` marks adapter spans, never this one; see that member for why
+    they stay two markers.
     """
 
     WS_LLM_SEMANTICS_UNREAD = "ws_llm_semantics_unread"

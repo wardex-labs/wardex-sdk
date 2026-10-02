@@ -19,10 +19,41 @@ def test_store_pop_missing_is_none():
     assert ConnTimingStore().pop(999) is None
 
 
-def test_store_handshake_without_connect_defaults_connect_zero():
+def test_store_handshake_without_connect_leaves_connect_unmeasured():
+    # A socket connected before `init` and TLS-wrapped after it: the store saw
+    # the handshake and never the connect. A 0.0 here shipped as a connection
+    # that took no time to open.
     s = ConnTimingStore()
     s.set_handshake(3, 5.0)
-    assert s.pop(3) == (0.0, 5.0)
+    assert s.pop(3) == (None, 5.0)
+
+
+def test_only_a_connect_call_that_returned_is_timed():
+    """A non-blocking connect raises EINPROGRESS before the handshake, so the
+    time the call took is not a connect time. The slot is still written: it is
+    the proof that the seam saw this connection open."""
+    import errno
+    import socket as _s
+
+    store = ConnTimingStore()
+    probe = ConnTimingProbe(store)
+
+    def in_progress(sock, address):
+        raise BlockingIOError(errno.EINPROGRESS, "Operation now in progress")
+
+    with _s.socket() as sock:
+        try:
+            probe._mk_connect(in_progress)(sock, ("127.0.0.1", 9))
+        except BlockingIOError:
+            pass
+        else:
+            raise AssertionError("the wrapper must re-raise what connect raised")
+        assert store.pop(sock.fileno()) == (None, None)
+
+    with _s.socket() as sock:
+        probe._mk_connect(lambda sock, address: None)(sock, ("127.0.0.1", 9))
+        connect, handshake = store.pop(sock.fileno())
+        assert isinstance(connect, float) and handshake is None
 
 
 def test_store_fifo_cap_evicts_oldest():
@@ -31,7 +62,7 @@ def test_store_fifo_cap_evicts_oldest():
     s.set_connect(2, 2.0)
     s.set_connect(3, 3.0)  # evicts 1
     assert s.pop(1) is None
-    assert s.pop(3) == (3.0, 0.0)
+    assert s.pop(3) == (3.0, None)
 
 
 def _verify_ctx() -> ssl.SSLContext:
@@ -77,8 +108,14 @@ def test_probe_sync_records_connect_and_handshake(tls_server):
         real_hs = ssl.SSLSocket.do_handshake
 
         def spy(self, *a, **k):
+            # The client's socket only. The test server runs in this process,
+            # so its side of the handshake goes through the same patched
+            # method; that slot has a handshake and no connect (the server
+            # accepted, it never connected), and whichever side finished last
+            # used to decide which slot this test read.
             try:
-                captured["fileno"] = self.fileno()
+                if not self.server_side:
+                    captured["fileno"] = self.fileno()
             except Exception:
                 pass
             return real_hs(self, *a, **k)

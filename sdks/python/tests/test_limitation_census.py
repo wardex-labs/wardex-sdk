@@ -236,6 +236,7 @@ _MEMBER_SITES: dict[str, frozenset[str]] = {
     "CONNECTION_EVICTED": frozenset({"_interceptors/_seam.py"}),
     # The native stream table's bound, read off `request_evicted` by the h2
     # tracker's `_mk` — the one place the native transaction becomes a `_Txn`.
+    # The lost request's unset size rides `_Txn.request_counted`, set there too.
     "H2_REQUEST_EVICTED": frozenset({"_interceptors/_trackers.py"}),
     # --- parsing / interpretation ---
     "FRAME_PARSE_FAILED": frozenset(
@@ -259,8 +260,10 @@ _MEMBER_SITES: dict[str, frozenset[str]] = {
     "GRPC_STATUS_UNAVAILABLE": frozenset({"_semantics/_grpc.py"}),
     # One site, not two: both byte seams flushed their open WS sessions with the
     # same six lines, and the copy is what let one of them keep a stale
-    # installed-flag gate on the uninstall the other had outgrown.
-    "WS_NO_CLOSE": frozenset({"_interceptors/_seam.py"}),
+    # installed-flag gate on the uninstall the other had outgrown. The tracker
+    # names it only to decline it: a session one Close frame crossed has a
+    # close code, which is what the marker says is missing.
+    "WS_NO_CLOSE": frozenset({"_interceptors/_seam.py", "_interceptors/_trackers.py"}),
     # The tracker names the member (confirmed on the first client message);
     # the seam re-attaches `txn.ws_markers` by variable, not by site.
     "WS_LLM_SEMANTICS_UNREAD": frozenset({"_interceptors/_trackers.py"}),

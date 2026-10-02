@@ -63,20 +63,30 @@ pub fn parse(body: &[u8]) -> Vec<SseEvent> {
 /// Sniffs whether the body looks like SSE. If the first non-whitespace character after leading
 /// whitespace is '{'/'[', it's JSON (false); otherwise true if it contains a "data:"/"event:" line.
 pub fn looks_like_sse(body: &[u8]) -> bool {
-    let first = body
-        .iter()
-        .find(|&&b| b != b' ' && b != b'\t' && b != b'\r' && b != b'\n');
+    sniff(body) == Some(true)
+}
+
+/// The same sniff, saying when it could not read the body at all. `Some(true)`: an event stream.
+/// `Some(false)`: something else was read — JSON (first non-blank byte `{`/`[`), an empty body, or
+/// text with no "data:"/"event:" line. `None`: the body is not UTF-8 text (binary, compressed in a
+/// coding nothing inflated, or cut inside a character), so "not SSE" was never observed.
+///
+/// The whole body must be text before any answer, the JSON one included: compressed bytes can
+/// begin with `{` or `[` (a brotli stream of 64 KiB to 1 MiB at the default window starts with
+/// `[`, and a raw deflate block can start with either), and one byte is not a body read as JSON.
+pub fn sniff(body: &[u8]) -> Option<bool> {
+    let text = std::str::from_utf8(body).ok()?;
+    let first = text
+        .bytes()
+        .find(|&b| b != b' ' && b != b'\t' && b != b'\r' && b != b'\n');
     match first {
-        None => return false,
-        Some(&b) if b == b'{' || b == b'[' => return false,
-        _ => {}
+        None => Some(false),
+        Some(b'{' | b'[') => Some(false),
+        Some(_) => Some(
+            text.lines()
+                .any(|l| l.starts_with("data:") || l.starts_with("event:")),
+        ),
     }
-    let text = match std::str::from_utf8(body) {
-        Ok(t) => t,
-        Err(_) => return false,
-    };
-    text.lines()
-        .any(|l| l.starts_with("data:") || l.starts_with("event:"))
 }
 
 #[cfg(test)]
@@ -129,5 +139,38 @@ mod tests {
         assert!(!looks_like_sse(b"{\"choices\":[]}"));
         assert!(!looks_like_sse(b"  [1,2,3]"));
         assert!(!looks_like_sse(b""));
+    }
+
+    #[test]
+    fn sniff_reads_text_and_json_and_says_so() {
+        assert_eq!(sniff("data: {\"t\":\"안녕\"}\n\n".as_bytes()), Some(true));
+        assert_eq!(sniff(b"{\"choices\":[]}"), Some(false));
+        assert_eq!(sniff(b"plain text, no event lines"), Some(false));
+        assert_eq!(sniff(b""), Some(false));
+    }
+
+    #[test]
+    fn sniff_cannot_read_a_body_that_is_not_text() {
+        // An SSE body cut inside a multi-byte character: no longer UTF-8.
+        let whole = "data: {\"t\":\"안녕\"}\n\n".as_bytes();
+        let cut = &whole[..whole.iter().position(|&b| b >= 0x80).unwrap() + 1];
+        assert_eq!(sniff(cut), None);
+        assert!(!looks_like_sse(cut));
+        // Compressed bytes nothing inflated.
+        assert_eq!(sniff(&[0xcb, 0x48, 0xcd, 0xc9, 0xc9, 0x07, 0x00]), None);
+    }
+
+    #[test]
+    fn sniff_does_not_call_compressed_bytes_json_by_their_first_byte() {
+        // The head of a real brotli stream (`brotli -w 22`, a 109 KB SSE body): its first byte is
+        // `[` because of the window and length bits, not because the body is a JSON array.
+        let brotli = [
+            0x5b, 0x35, 0xab, 0x01, 0xc4, 0xaa, 0xc0, 0x6e, 0x33, 0xfd, 0xa4, 0x82,
+        ];
+        assert_eq!(sniff(&brotli), None);
+        assert!(!looks_like_sse(&brotli));
+        assert_eq!(sniff(&[b' ', b'{', 0xff, 0x00, 0x9c]), None);
+        // Text that is JSON still reads as JSON.
+        assert_eq!(sniff(b" [1, 2, \"\xec\x95\x88\"]"), Some(false));
     }
 }

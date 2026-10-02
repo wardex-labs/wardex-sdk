@@ -443,12 +443,9 @@ def test_streaming_chat_span_survives_with_gen_ai_and_its_markers(client):
 def test_websocket_span_survives(client):
     seam = _seam(client, _WebSocketTracker(path="/realtime", deflate=True, parent=None, start_ns=1))
 
-    _drive_seam(
-        seam,
-        "ws.example.com",
-        _ws_frame(True, 0x1, b'{"a":1}'),
-        _ws_frame(True, 0x8, (1000).to_bytes(2, "big")),
-    )
+    close = _ws_frame(True, 0x8, (1000).to_bytes(2, "big"))
+    # The client sends and closes; the server's answering Close ends the session.
+    _drive_seam(seam, "ws.example.com", _ws_frame(True, 0x1, b'{"a":1}') + close, close)
 
     ws = [s for s in client.spans if s.name.startswith("WS ")]
     assert ws, "the WebSocket span class disappeared"

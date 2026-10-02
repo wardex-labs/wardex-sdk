@@ -76,16 +76,17 @@ def test_inputref_and_snapshot_refs():
     assert snap.attributes == (("code.cwd", "/x"),)
 
 
-def test_transport_attributes_connection_reused_default_and_set():
+def test_transport_attributes_connection_reused_is_unobserved_until_set():
     from wardex_sdk import _types
 
-    assert _types.TransportAttributes().connection_reused is False
+    # None, not False: a producer that never observed reuse claims nothing.
+    assert _types.TransportAttributes().connection_reused is None
     t = _types.TransportAttributes(connection_reused=True)
     assert t.connection_reused is True
 
 
-def test_transport_timing_has_ttft_default():
+def test_transport_timing_ttft_is_unmeasured_until_set():
     from wardex_sdk._types import TransportTiming
 
     t = TransportTiming()
-    assert t.ttft_ms == 0.0
+    assert t.ttft_ms is None

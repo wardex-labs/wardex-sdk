@@ -511,26 +511,22 @@ def test_a_multipart_field_is_masked_like_a_form_field(port):
 
 def test_inflation_is_bounded_marked_and_never_invents_a_body():
     """A body that merely starts like a zlib header stays as it was; one that
-    inflates past the bound keeps its inflated prefix and says it was cut."""
+    inflates past the bound keeps its inflated prefix and says it was cut (the
+    seam marks that span truncated: `test_observed_transport.py`)."""
     import gzip
     import zlib
 
-    from wardex_sdk._interceptors._trackers import _inflated
-
-    class _T:
-        truncated = False
+    from wardex_sdk._protocol._http1 import inflate_body
 
     class _L:
         max_decoded_bytes = 1024
         max_opaque_body_bytes = 4096
 
     plain = b"HK: hello this is a plain text body that only starts like zlib"
-    assert _inflated(_T(), plain, _L()) is plain
-    txn = _T()
+    out, cut = inflate_body(plain, _L())
+    assert out is plain and cut is False
     big = gzip.compress(b'{"access_token": "BIG"}' + b" " * 5000)
-    out = _inflated(txn, big, _L())
+    out, cut = inflate_body(big, _L())
     assert out.startswith(b'{"access_token": "BIG"}') and len(out) == 1024
-    assert txn.truncated is True
-    small = _T()
-    assert _inflated(small, zlib.compress(b"q=seoul"), _L()) == b"q=seoul"
-    assert small.truncated is False
+    assert cut is True
+    assert inflate_body(zlib.compress(b"q=seoul"), _L()) == (b"q=seoul", False)

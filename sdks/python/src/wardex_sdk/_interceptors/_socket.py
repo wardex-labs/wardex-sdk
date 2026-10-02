@@ -104,17 +104,27 @@ class RawSocketInterceptor(ByteSeamInterceptor):
 
     def _resolve_timing(
         self, obj: Any, st: _ConnectionState
-    ) -> tuple[float, float, bool, tuple[Limitation, ...]]:
+    ) -> tuple[float | None, float | None, bool | None, tuple[Limitation, ...]]:
+        # Plaintext: there is no TLS handshake to time, so that interval is
+        # always None — unset on the wire, never a 0 ms handshake.
         if st.timing_consumed:
-            return (0.0, 0.0, True, ())
+            return (0.0, None, True, ())
         st.timing_consumed = True
         try:
             popped = shared_timing_store().pop(obj.fileno())
         except Exception:
             popped = None
         if popped is not None:
-            return (popped[0], 0.0, False, ())  # plaintext: no TLS handshake
-        return (0.0, 0.0, False, (Limitation.CONNECT_TIMING_UNAVAILABLE,))
+            # A record proves the seam saw this connection open, so this is its
+            # first transaction. Its connect half is None when the connect was
+            # not timed: a non-blocking connect returns before the handshake.
+            if popped[0] is None:
+                return (None, None, False, (Limitation.CONNECT_TIMING_UNAVAILABLE,))
+            return (popped[0], None, False, ())
+        # No connect record: the seam did not see this connection open — it
+        # may have been opened, and used, before `init` — so whether this is
+        # its first transaction is as unknown as how long the connect took.
+        return (None, None, None, (Limitation.CONNECT_TIMING_UNAVAILABLE,))
 
     def _gate(self, st: _ConnectionState, data: bytes, phase: str) -> bool:
         """Sniff-latch: determine the protocol from the first request bytes; never re-decided.

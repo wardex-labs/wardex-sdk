@@ -7,6 +7,34 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- **The transport values the interceptors measure now reach OTLP.** Before,
+  an OTLP backend received only the protocol and the HTTP method, status and
+  URL of a captured call; every other value the seam measures was dropped at
+  export. Now each one the SDK observed rides the span:
+  `wardex.transport.timing.tcp_connect_ms`, `.tls_handshake_ms`, `.ttfb_ms`,
+  `.transfer_ms` and `.ttft_ms` (milliseconds), `wardex.transport.request_size`
+  and `.response_size`, `wardex.transport.connection_id` and
+  `.connection_reused`, `wardex.transport.direction`, and
+  `wardex.transport.is_streaming`. An MCP stdio call carries its method as
+  `mcp.method.name` and its JSON-RPC id as `jsonrpc.request.id`, and the
+  workflow name a decorator or an adapter records ships as
+  `gen_ai.workflow.name` — it never reached OTLP before. A value the SDK did
+  not observe has no key at all, rather than a `0` or a `false`. The
+  `wardex.transport.*` names are reserved for these values: an attribute
+  your code sets under one is replaced by the SDK's value, or left out where
+  the SDK observed none, so a span you created yourself cannot ship a
+  transport reading the SDK never made, and a captured call never carries
+  your value beside the SDK's under one key. Each is counted under
+  `transport.otlp.reserved_attribute_overwritten` and said once per process.
+  `wardex.transport.connection_id` is never masked, as the connection id on
+  the envelope is not. The fields
+  no producer fills (modality, blob references, the gRPC / WebSocket / SSE /
+  A2A meta blocks) are listed with that reason in
+  `crates/wardex-codec/src/otlp/map.rs` (`WIRE_FIELDS`), and
+  `sdks/python/tests/test_wire_field_census.py` fails when a field is added
+  to the schema, filled by a producer, or dropped by the encoder, the decoder
+  or the mapping without that table saying where it goes.
+
 - **A masked span says what was masked and why.** Every span that had a value
   replaced carries `wardex.redaction.count`, `wardex.redaction.rules` (which
   rule: a PII category, `secret_value`, one of the name rules, or
@@ -78,6 +106,90 @@ All notable changes to this project are documented here. The format follows
 
 ### Changed
 
+- **The wardex envelope says what the SDK observed about a transport, or
+  nothing.** Transport fields nobody measured used to ship under their zero
+  values as if they had been read off the connection: every span said
+  `is_streaming = false` (a streaming chat call included, beside its own
+  `gen_ai.request.stream = true`), a `TEXT` request and response modality
+  nobody detected, `is_final_chunk = true` and `chunk_index = 0`, and a
+  WebSocket session said 0 ms for a connect, a TLS handshake, a first byte and
+  a first token it never timed. Now `is_streaming` is `true` when the response
+  declared `Content-Type: text/event-stream` — even when its body was in an
+  encoding the parser does not decode, or was cut by `max_body_bytes` — or its
+  body read as a Server-Sent Events stream (a body cut by the capture limit,
+  as sent or when inflating a gzip or zlib body past the smaller of
+  `max_decoded_bytes` and `max_opaque_body_bytes`, when the part the SDK read
+  shows event lines), `false` when it declared none and its whole body read
+  as something else (JSON, or text with no event line), and unset when it
+  declared none and its body was not read as either: not parsed, cut by the
+  capture limit with no event line in the part read, in a `Content-Encoding`
+  the SDK does not inflate, or not text (binary); the five `TransportTiming`
+  intervals are unset when they were not measured — including a connect time the seam marks
+  `connect_timing_unavailable` (a socket connected before `init` and
+  TLS-wrapped after it among them, and a plaintext connection opened by
+  asyncio, as httpx's async client opens one: its non-blocking `connect`
+  returns before the handshake, and the fraction of a millisecond that call
+  took used to ship as the connect time, unmarked), the TLS handshake of a
+  plaintext connection, and the first-byte, first-body-byte and transfer
+  times of an HTTP/2 stream; `request_size` and `response_size` are set only
+  when the SDK counted the whole half — unset when its body went past the
+  capture limit (`max_body_bytes`, or `max_opaque_body_bytes` for an opaque
+  type such as audio), where the kept length used to ship as the size (a
+  1 MB speech response said 262144); on an HTTP/2 stream whose request half
+  the stream table evicted before its response arrived (marked
+  `h2_request_evicted`), where it used to say `0`; on a request the SDK had
+  not seen end when its response did — an HTTP/1 request the parser had not
+  finished reading, or an HTTP/2 request with no END_STREAM yet (an upload
+  the server refused part-way, a client-streaming gRPC call it ended with a
+  status), where the part sent so far used to ship as the size; on a
+  WebSocket direction whose frame parser stopped (marked
+  `frame_parse_failed`), along with that direction's `ws.messages.*` and
+  `ws.bytes.*` counts; and on a WebSocket session the SDK stopped following
+  while it was still open (at `wardex.close()`, marked `ws_no_close` unless a
+  Close frame had crossed, or when its connection table was full, marked
+  `connection_evicted`), which used to report the bytes and the
+  length up to that moment as the session's and now carries no sizes, counts
+  or `transfer_ms`; `connection_reused` is `false` only on a connection the
+  SDK saw open and is unset on one it did not (opened before `init`, say,
+  where it used to say `false` on a connection that had already carried
+  requests); and the modalities are unspecified, since nothing detects one
+  yet. On the schema, `request_size`, `response_size`, `is_streaming`,
+  `connection_reused` and the five intervals gained explicit presence
+  (`optional`). In Python, `TransportTiming`'s fields, both sizes,
+  `is_streaming`, `connection_reused` and both modalities default to `None`.
+  On MCP stdio both sizes are, as before, the params and the result or error
+  re-encoded as compact JSON (the payload as captured): a server's whitespace
+  and needless `\u` escapes are not counted, so they are not the bytes on
+  the pipe.
+- **`is_streaming` is unset, not `false`, for a response whose body the SDK
+  could not read.** A response that declares no event stream and whose body
+  is binary or undecodable — an `audio/mpeg` speech response, an
+  `application/octet-stream` download, a body in a `Content-Encoding` the SDK
+  does not inflate (`br`, `zstd`, raw deflate; it inflates one gzip or zlib
+  layer) — used to ship `is_streaming = false` on the wardex envelope, and
+  now ships it unset: the receiver's read API returns `null`, and on OTLP,
+  where the key is new in this release, `wardex.transport.is_streaming` is
+  absent. A filter or saved view on `is_streaming = false` no longer matches
+  those calls. `false` now means the SDK read the whole body and it was
+  something else (JSON, or text with no event line).
+- **A WebSocket session ends when a Close frame has crossed each way, not at
+  the first one.** Its span used to be built at the first Close frame, so
+  what the peer still sent after it (data, which RFC 6455 allows until the
+  peer's own Close, and that Close) was left out of the session's
+  `ws.bytes.*` and `ws.messages.*` counts and its `request_size` or
+  `response_size`, and `transfer_ms` stopped before the closing handshake
+  did, while all of them shipped as whole readings. Now the span is built
+  when the answering Close arrives, or when the socket closes first. Every
+  ordinary session's received (or, when the server closes first, sent) byte
+  count grows by the answering Close's payload, 2 bytes for a bare status
+  code. `ws.close_code` is still the code of the Close that began the
+  handshake. A session the SDK lets go of between the two (at
+  `wardex.close()`) has no sizes, counts or length and is not marked
+  `ws_no_close`, which says no Close frame crossed at all.
+- **`TransportAttributes.chunk_index` and `is_final_chunk` are removed.**
+  Nothing ever filled them, so every span carried `0` and `true`. Their tags
+  (25, 26) and names are reserved and will not be reused. The Python fields
+  are gone from `TransportAttributes` too.
 - **Claude Agent SDK turns are numbered from 1.**
   `wardex.conversation.turn_index` counted the assistant messages of a session
   from 0, and 0 is proto3's "unset": the first turn left the process with no
@@ -193,6 +305,23 @@ All notable changes to this project are documented here. The format follows
   left as written on both wires. In both forms the card rule is the only
   built-in rule that can match. Everything else your application or its
   traffic puts on a span is masked exactly as before.
+- **Transport timings measure the interval they name.** A TLS handshake an
+  event loop drives without blocking (Tornado's `SSLIOStream` calls
+  `do_handshake()` until it stops raising `SSLWantReadError`) reported the
+  duration of its last call, a few milliseconds of a 150 ms handshake; it is
+  now timed from the first attempt to the one that completed it, as the
+  asyncio path already was. One the SDK cannot time whole — begun before
+  `init`, or completed by OpenSSL inside the first write with no
+  `do_handshake()` call to observe — is unset. On the asyncio path, a
+  connection opened by `create_connection` with a socket that was already
+  connected (aiohttp's happy-eyeballs dialer hands one over) reported loop
+  overhead as its TCP connect time, and one given a host name included the
+  DNS lookup; both are now unset and marked `connect_timing_unavailable`. On
+  HTTP/2, the connect and handshake time and `connection_reused = false` went
+  to whichever stream finished first, while stream 1, the one the connection
+  was opened for, said it opened nothing; they now go to stream 1. After a
+  `100 Continue`, `ttft_ms` was the arrival of the final response's header
+  block rather than of its first body byte.
 - **The LLM calls inside a conversation carry its id.** `wardex.conversation()`
   promised `gen_ai.conversation.id` on every span inside the block, and every
   span had it except the LLM calls read off the wire — the spans that carry

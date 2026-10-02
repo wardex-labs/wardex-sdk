@@ -191,6 +191,30 @@ def _report_unmarshalled(unmarshalled: list[str], *, debug: bool) -> None:
         diag_info("spans not marshalled: " + "; ".join(unmarshalled))
 
 
+def _report_reserved_overwritten(overwritten: int) -> None:
+    """Count and say the host attributes the OTLP mapping did not export as set.
+
+    `wardex.transport.*` names the transport values the SDK observed, so an
+    attribute your code set under one of those names would ship as a
+    measurement the SDK never made, or beside the one it did. The mapping
+    replaces it with the SDK's value, or leaves it out where the SDK has none,
+    and this is where that is said: counted per attribute, and one line per
+    process naming the counter.
+    """
+    if not overwritten:
+        return
+    for _ in range(overwritten):
+        counters.bump("transport.otlp.reserved_attribute_overwritten")
+    report_once(
+        f"{overwritten} span attribute(s) set under a reserved wardex.transport.* name "
+        "were not exported as set: those names carry the transport values the SDK "
+        "observed, so the SDK's value replaced yours, or the attribute was left out "
+        "where it observed none. Rename the attribute to keep it (counted under "
+        "transport.otlp.reserved_attribute_overwritten)",
+        key="transport.otlp.reserved_attribute_overwritten",
+    )
+
+
 class Transport(abc.ABC):
     """The one advertised extension point: where finished envelopes go.
 
@@ -295,24 +319,28 @@ class Transport(abc.ABC):
         the wire to carry a marker. The report lives here, concrete and
         shared, so every transport that encodes gets it.
         """
-        bodies, unmarshalled = self._encode_requests(envelope, compress=compress)
+        bodies, unmarshalled, overwritten = self._encode_requests(envelope, compress=compress)
         _report_unmarshalled(unmarshalled, debug=_debug_enabled())
+        _report_reserved_overwritten(overwritten)
         return bodies
 
     def _encode_requests(
         self, envelope: Envelope, *, compress: bool
-    ) -> tuple[tuple[bytes, ...], list[str]]:
-        """`encode()` without the unmarshalled-span report: the bodies, and the
-        reasons for the spans the marshaller skipped, for a transport that has
-        to decide the batch's fate before it counts them.
+    ) -> tuple[tuple[bytes, ...], list[str], int]:
+        """`encode()` without its two counted reports: the bodies, the reasons
+        for the spans the marshaller skipped, and the number of host attributes
+        under a reserved `wardex.transport.*` name the mapping replaced or left
+        out, for a transport that has to decide the batch's fate before it
+        counts them.
 
-        `encode()` counts a skipped span the moment it encodes. A transport
-        that may then hand the batch back as `UNDELIVERED` -- the encode spent
-        its budget -- would have the next attempt meet and count the same span
+        `encode()` counts both the moment it encodes. A transport that may
+        then hand the batch back as `UNDELIVERED` -- the encode spent its
+        budget -- would have the next attempt meet and count the same span
         again, so one bad span read as two. Such a transport encodes here and
-        calls `_report_unmarshalled` at the point the batch's fate is known.
-        Masking, limits and the over-cap report are identical to `encode()`'s;
-        only the timing of that one report moves.
+        calls `_report_unmarshalled` and `_report_reserved_overwritten` at the
+        point the batch's fate is known. Masking, limits and the over-cap
+        report are identical to `encode()`'s; only the timing of those two
+        reports moves.
         """
         if not NATIVE_OK:
             # Reachable from a hand-constructed transport that never went
@@ -328,7 +356,7 @@ class Transport(abc.ABC):
         # more -- it skips that one span and names it, for the caller to
         # count and report. A raise here is still a raise: a corrupt envelope
         # or an absent native module is not a per-span loss.
-        bodies, dropped, unmarshalled = native.codec.encode_otlp_requests(
+        bodies, dropped, unmarshalled, overwritten = native.codec.encode_otlp_requests(
             envelope,
             self._pii_mode,
             list(self._pii_disabled),
@@ -352,7 +380,7 @@ class Transport(abc.ABC):
                 f"max_otlp_request_bytes if your collector accepts more.",
                 key="transport.otlp.span_over_request_cap",
             )
-        return tuple(bodies), unmarshalled
+        return tuple(bodies), unmarshalled, overwritten
 
     def _set_pii_policy(self, policy: PIIConfig) -> None:
         """Install the PII policy resolved from `WardexConfig`. Called by

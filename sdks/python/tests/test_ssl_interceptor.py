@@ -12,7 +12,14 @@ from wardex_sdk import _hub
 from wardex_sdk._assembly import Limitation
 from wardex_sdk._enums import CaptureMode, SpanKind
 from wardex_sdk._interceptors._base import InterceptorInterface
+from wardex_sdk._interceptors._conn_timing import (
+    _TimingRecord,
+    install_shared_timing,
+    shared_timing_store,
+    uninstall_shared_timing,
+)
 from wardex_sdk._interceptors._registry import InterceptorRegistry
+from wardex_sdk._interceptors._seam import _ConnectionState
 from wardex_sdk._interceptors._ssl import SSLInterceptor
 
 
@@ -159,6 +166,74 @@ def test_sync_keepalive_second_request_is_reused(tls_server):
     assert second.transport.timing.tcp_connect_ms == 0.0
 
 
+def test_sync_connection_opened_before_init_leaves_reuse_unset(tls_server):
+    # The seam never saw this TLS connection open — no connect, no handshake
+    # in the store — so it cannot say the request it sees is the first.
+    with httpx.Client(verify=_verify_ctx()) as client:
+        assert client.post(f"{tls_server}/v1/ping", json={}).status_code == 200
+        wardex.init(intercept=True, capture_mode=CaptureMode.ALL)
+        assert client.post(f"{tls_server}/v1/ping", json={}).status_code == 200
+
+    (sp,) = [s for s in _captured_spans() if s.kind == SpanKind.CLIENT]
+    assert sp.transport.connection_reused is None
+    assert sp.transport.timing.tcp_connect_ms is None
+    assert sp.transport.timing.tls_handshake_ms is None
+    assert Limitation.CONNECT_TIMING_UNAVAILABLE in sp.capture_integrity.limitations
+
+
+def _fresh_state() -> _ConnectionState:
+    return _ConnectionState(tracker=None, server_address="127.0.0.1", server_port=443)
+
+
+class _Fileno:
+    def __init__(self, fileno: int) -> None:
+        self._fileno = fileno
+
+    def fileno(self) -> int:
+        return self._fileno
+
+
+def test_resolve_timing_a_store_record_with_no_connect_still_proves_the_open():
+    # Connected before `init`, TLS-wrapped after it: the handshake is a reading
+    # and proves the connection is new; the connect time is unknown, not 0.
+    install_shared_timing()
+    try:
+        shared_timing_store().set_handshake(4343, 7.5)
+        got = SSLInterceptor()._resolve_timing(_Fileno(4343), _fresh_state())
+    finally:
+        uninstall_shared_timing()
+    assert got == (None, 7.5, False, (Limitation.CONNECT_TIMING_UNAVAILABLE,))
+
+
+def test_resolve_timing_an_ssl_object_with_no_stamped_record_leaves_reuse_unset():
+    obj = ssl.create_default_context().wrap_bio(
+        ssl.MemoryBIO(), ssl.MemoryBIO(), server_hostname="localhost"
+    )
+    assert getattr(obj, "_wardex_timing", None) is None
+    got = SSLInterceptor()._resolve_timing(obj, _fresh_state())
+    assert got == (None, None, None, (Limitation.CONNECT_TIMING_UNAVAILABLE,))
+
+
+def test_resolve_timing_an_ssl_object_stamped_at_creation_is_a_fresh_connection():
+    # The anyio layer split: no connect time, but the record was stamped when
+    # the TLS object was created after `init`, so the open was seen.
+    obj = ssl.create_default_context().wrap_bio(
+        ssl.MemoryBIO(), ssl.MemoryBIO(), server_hostname="localhost"
+    )
+    rec = _TimingRecord()
+    rec.handshake_ms = 3.0
+    obj._wardex_timing = rec
+    st = _fresh_state()
+    seam = SSLInterceptor()
+    assert seam._resolve_timing(obj, st) == (
+        None,
+        3.0,
+        False,
+        (Limitation.CONNECT_TIMING_UNAVAILABLE,),
+    )
+    assert seam._resolve_timing(obj, st) == (0.0, 0.0, True, ())
+
+
 @pytest.mark.asyncio
 async def test_async_capture_populates_handshake(tls_server):
     # capture_mode=ALL: targets async handshake timing, not the policy gate.
@@ -170,8 +245,9 @@ async def test_async_capture_populates_handshake(tls_server):
     sp = [s for s in _captured_spans() if s.kind == SpanKind.CLIENT][0]
     assert sp.transport.connection_reused is False
     assert sp.transport.timing.tls_handshake_ms > 0.0
-    # On the anyio/httpx path, TCP connect can't be derived by subtraction → connect=0 + marker
-    assert sp.transport.timing.tcp_connect_ms == 0.0
+    # On the anyio/httpx path, TCP connect can't be derived by subtraction →
+    # left unset (not a 0 ms connect) + marker
+    assert sp.transport.timing.tcp_connect_ms is None
     # Census merge (design §6.5.1): `async_connect_unavailable` folded into
     # CONNECT_TIMING_UNAVAILABLE. Both said the same thing — tcp_connect_ms is
     # unknown rather than zero — and differed only in provenance.

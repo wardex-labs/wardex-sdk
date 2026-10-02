@@ -1040,6 +1040,7 @@ def test_a_websocket_session_carries_the_conversation_its_handshake_was_issued_i
         b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n"
         b"\x88\x02\x03\xe8",  # the server's close frame, code 1000
     )
+    itc._on_request_bytes(sock, b"\x88\x02\x03\xe8")  # the client's answer ends the session
     (span,) = itc._client.spans
     assert span.name.startswith("WS")
     assert _conv(span) == "ws-conv"
@@ -1050,7 +1051,8 @@ def _ws_frame(opcode: int, payload: bytes) -> bytes:
 
 
 _WS_CREATE = _ws_frame(0x1, json.dumps({"type": "response.create", "model": "m"}).encode())
-_WS_CLIENT_CLOSE = _ws_frame(0x8, (1000).to_bytes(2, "big"))
+#: A Close frame, code 1000. The session ends once one has crossed each way.
+_WS_CLOSE = _ws_frame(0x8, (1000).to_bytes(2, "big"))
 #: A Text frame header claiming 2 MiB, above `max_ws_frame_bytes`: the client
 #: parser dies on it and never yields a message again.
 _WS_OVERSIZE = bytes([0x81, 127]) + (2 * 1024 * 1024).to_bytes(8, "big")
@@ -1087,7 +1089,8 @@ def test_a_websocket_session_reused_in_another_conversation_names_neither(
     with _issued_in("B"):
         itc._on_request_bytes(sock, _WS_CREATE)
         itc._on_response_bytes(sock, _ws_frame(0x1, b'{"type":"response.created"}'))
-    itc._on_response_bytes(sock, _ws_frame(0x8, (1000).to_bytes(2, "big")))
+    itc._on_response_bytes(sock, _WS_CLOSE)
+    itc._on_request_bytes(sock, _WS_CLOSE)
     (span,) = itc._client.spans
     assert dict(span.extra)["ws.messages.sent"] == 1
     assert span.conversation is None
@@ -1120,7 +1123,8 @@ def test_a_websocket_session_names_a_conversation_only_if_every_message_was_issu
         with _issued_in(cid):
             assert t.on_request_bytes(_WS_CREATE) == []
     with _issued_in(closer):
-        (txn,) = t.on_request_bytes(_WS_CLIENT_CLOSE)
+        assert t.on_request_bytes(_WS_CLOSE) == []
+    (txn,) = t.on_response_bytes(_WS_CLOSE)
     assert txn.ws_messages_sent == len(messages)
     assert (txn.conversation.conversation_id if txn.conversation else None) == want
 
@@ -1198,3 +1202,45 @@ def test_a_closed_units_carrier_does_not_lend_its_conversation():
     assert resolve_observed(_latched(txn), parent_closed=True).conversation is None
     live = _Txn(**{**txn.__dict__, "parent_closed": False})
     assert resolve_observed(_latched(live), parent_closed=False).conversation is conv
+
+
+def test_a_chat_span_carries_its_conversation_beside_what_the_seam_observed(llm, h2_llm):
+    """The conversation a wire span was issued in and the transport the seam
+    observed are two facts on one span, and both reach both wires: the wardex
+    envelope (`conversation`, `transport`) and OTLP (`gen_ai.conversation.id`,
+    `wardex.transport.*`), over HTTP/1.1 and over HTTP/2 alike."""
+    import ssl
+
+    from conftest import CERT
+    from wardex_sdk.transport import _codec
+
+    host, port = llm
+    base, _accepted = h2_llm
+    verify = ssl.create_default_context(cafile=str(CERT))
+
+    def run() -> None:
+        with wardex.conversation("c", id="conv-both"):
+            _post(host, port, "h1-0")
+            with httpx.Client(http2=True, verify=verify) as client:
+                r = client.post(f"{base}/v1/responses", content=_body("h1-1"))
+                assert (r.status_code, r.http_version) == (200, "HTTP/2")
+
+    spans, t = _shipped(run)
+    assert sorted(_tag(s) for s in _chats(spans)) == ["h1-0", "h1-1"]
+    envelopes = [_codec.decode(b) for b in (_codec.encode(e) for e in t.envelopes)]
+    wire = [i["span"] for d in envelopes for i in d["items"] if "span" in i]
+    chats = [s for s in wire if "transport" in s]  # the two calls are the only wire spans
+    assert len(chats) == 2
+    for s in chats:
+        assert s["conversation"]["conversation_id"] == "conv-both"
+        tr = s["transport"]
+        assert tr["is_streaming"] is False  # a JSON body, read whole
+        assert tr["connection_id"] and tr["request_size"] and tr["response_size"]
+    assert {s["transport"]["http"]["url"].split(":")[0] for s in chats} == {"http", "https"}
+    otlp = [a for _n, a in _otlp(t) if "wardex.transport.direction" in a]
+    assert len(otlp) == 2
+    for a in otlp:
+        assert a["gen_ai.conversation.id"] == "conv-both"
+        assert a["wardex.transport.is_streaming"] is False
+        for key in ("connection_id", "request_size", "response_size", "direction"):
+            assert f"wardex.transport.{key}" in a, key

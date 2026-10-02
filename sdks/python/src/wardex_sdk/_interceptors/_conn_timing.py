@@ -2,8 +2,12 @@
 
 sync: measures socket.connect / SSLSocket.do_handshake directly, keyed by fileno.
 async: connect time is derived by subtraction — create_connection total time minus
-       accumulated SSLObject.do_handshake time — stamped onto the SSLObject via
-       a ContextVar→wrap_bio bridge.
+       the SSLObject handshake — stamped onto the SSLObject via a
+       ContextVar→wrap_bio bridge.
+A handshake on either path is the wall time from its FIRST `do_handshake()`
+attempt to the attempt that completed it: a non-blocking handshake is many
+calls (each raises SSLWantRead/WriteError until the peer's flight arrives),
+and any one of them alone is a syscall, not a handshake.
 fail-silent: measurement failures are silently ignored and never interfere with
        the original behavior.
 """
@@ -56,13 +60,42 @@ class _TimingRecord:
 
     def __init__(self) -> None:
         self.connect_ms = 0.0
-        self.handshake_ms = 0.0
-        self.total_ms = 0.0
+        #: None until a `do_handshake()` call the probe saw COMPLETED the
+        #: handshake. OpenSSL can also finish one inside the first write, which
+        #: no probe times; that handshake has no reading.
+        self.handshake_ms: float | None = None
+        self.total_ms = 0.0  # 0.0: not timed (see `_times_only_connect_and_tls`)
         self.hs_start = 0.0
+
+
+class _Slot:
+    """What the sync probe saw of one connection, keyed by its fileno."""
+
+    __slots__ = ("connect_seen", "connect_ms", "handshake_ms", "hs_start", "hs_done")
+
+    def __init__(self) -> None:
+        #: `socket.connect` ran on this fileno after `init`, so every handshake
+        #: attempt on the connection came after it too.
+        self.connect_seen = False
+        self.connect_ms: float | None = None  # None: not measured
+        self.handshake_ms: float | None = None  # None: not measured
+        #: perf_counter of the first handshake attempt; None before one, and
+        #: `_UNATTRIBUTED` when that attempt may not have been the first.
+        self.hs_start: float | None = None
+        self.hs_done = False
+
+
+#: The first handshake attempt the probe saw may not have been the first one
+#: made, so no interval that starts there is the handshake.
+_UNATTRIBUTED = -1.0
 
 
 class ConnTimingStore:
     """Sync-path-only handoff buffer: fileno → (connect_ms, handshake_ms).
+
+    A half nobody measured is None, not 0.0: a socket connected before
+    `init` and TLS-wrapped after it has a handshake and no connect, and a
+    0.0 there would ship as a connection that took no time to open.
 
     A slot is released when the transaction that needed it is emitted (`pop`)
     or when its socket closes (`discard`, wired by the close hook in
@@ -75,32 +108,68 @@ class ConnTimingStore:
     """
 
     def __init__(self, cap: int | None = None) -> None:
-        self._by_fileno: dict[int, list[float]] = {}
+        self._by_fileno: dict[int, _Slot] = {}
         # None means "use the core default" — resolved here (rather than hardcoded)
         # so this can never silently drift from crates/wardex-limits.
         self._cap = cap if cap is not None else _wardex_native.limits_defaults()["max_connections"]
 
-    def _slot(self, fileno: int) -> list[float]:
-        slot = self._by_fileno.get(fileno)
+    def _slot(self, fileno: int, fresh: bool = False) -> _Slot:
+        slot = None if fresh else self._by_fileno.get(fileno)
         if slot is None:
+            self._by_fileno.pop(fileno, None)
             if len(self._by_fileno) >= self._cap:
                 # FIFO eviction: remove the first entry in dict insertion order
                 self._by_fileno.pop(next(iter(self._by_fileno)))
-            slot = [0.0, 0.0]  # [connect_ms, handshake_ms]
+            slot = _Slot()
             self._by_fileno[fileno] = slot
         return slot
 
-    def set_connect(self, fileno: int, connect_ms: float) -> None:
-        self._slot(fileno)[0] = connect_ms
+    def set_connect(self, fileno: int, connect_ms: float | None) -> None:
+        """Record a connect on `fileno`. None: the seam saw the connection
+        open but did not time its handshake — the slot still proves the
+        connection was opened after `init`.
 
-    def set_handshake(self, fileno: int, handshake_ms: float) -> None:
-        self._slot(fileno)[1] = handshake_ms
+        A connect starts a NEW connection on this fileno, so whatever a dead
+        socket that held the same descriptor left in the slot goes with it."""
+        slot = self._slot(fileno, fresh=True)
+        slot.connect_seen = True
+        slot.connect_ms = connect_ms
 
-    def pop(self, fileno: int) -> tuple[float, float] | None:
+    def set_handshake(self, fileno: int, handshake_ms: float | None) -> None:
+        self._slot(fileno).handshake_ms = handshake_ms
+
+    def handshake_attempt(
+        self, fileno: int, t0: float, t1: float, outcome: str, blocking: bool
+    ) -> None:
+        """One `SSLSocket.do_handshake()` call, from `t0` to `t1`.
+
+        `outcome` is "done" (it returned), "pending" (SSLWantRead/WriteError:
+        a non-blocking handshake waiting on the peer) or "failed". The
+        handshake is timed from the connection's FIRST attempt to the one that
+        completed it; a call after completion is not a handshake and changes
+        nothing.
+
+        Attributable only when the probe saw every attempt. A blocking call is
+        the whole handshake on its own. A non-blocking one may be a later
+        attempt of a handshake begun before `init`, unless this fileno's
+        connect was seen (then every attempt came after it): left unset then.
+        """
+        slot = self._slot(fileno)
+        if slot.hs_done:
+            return
+        if slot.hs_start is None:
+            slot.hs_start = t0 if blocking or slot.connect_seen else _UNATTRIBUTED
+        if outcome == "pending":
+            return
+        slot.hs_done = True
+        if outcome == "done" and slot.hs_start != _UNATTRIBUTED:
+            slot.handshake_ms = (t1 - slot.hs_start) * 1000.0
+
+    def pop(self, fileno: int) -> tuple[float | None, float | None] | None:
         slot = self._by_fileno.pop(fileno, None)
         if slot is None:
             return None
-        return (slot[0], slot[1])
+        return (slot.connect_ms, slot.handshake_ms)
 
     def discard(self, fileno: int) -> None:
         """Release a slot nobody will consume — the socket that owned it is gone.
@@ -193,11 +262,21 @@ class ConnTimingProbe:
 
         def wrapper(this: Any, *a: Any, **k: Any) -> Any:
             t0 = time.perf_counter()
+            returned = False
             try:
-                return orig(this, *a, **k)
+                result = orig(this, *a, **k)
+                returned = True
+                return result
             finally:
                 try:
-                    ms = (time.perf_counter() - t0) * 1000.0
+                    # Only a call that RETURNED spans the TCP handshake. On a
+                    # non-blocking socket (asyncio's `sock_connect`, which
+                    # httpx's async client reaches through anyio) `connect`
+                    # raises EINPROGRESS at once and the handshake completes
+                    # later in the event loop, so the elapsed time is one
+                    # syscall, not a connect. That one is recorded as seen but
+                    # not timed, never as a fast connect.
+                    ms = (time.perf_counter() - t0) * 1000.0 if returned else None
                     fileno = this.fileno()
                     store.set_connect(fileno, ms)
                     _release_at_close(store, this, fileno)
@@ -211,13 +290,22 @@ class ConnTimingProbe:
 
         def wrapper(this: Any, *a: Any, **k: Any) -> Any:
             t0 = time.perf_counter()
+            outcome = "failed"
             try:
-                return orig(this, *a, **k)
+                result = orig(this, *a, **k)
+                outcome = "done"
+                return result
+            except (ssl.SSLWantReadError, ssl.SSLWantWriteError):
+                outcome = "pending"
+                raise
             finally:
                 try:
-                    ms = (time.perf_counter() - t0) * 1000.0
+                    t1 = time.perf_counter()
                     fileno = this.fileno()
-                    store.set_handshake(fileno, ms)
+                    # `do_handshake(block=True)` blocks for the call on any socket.
+                    block = k.get("block", a[0] if a else False)
+                    blocking = this.gettimeout() != 0.0 or bool(block)
+                    store.handshake_attempt(fileno, t0, t1, outcome, blocking)
                     # The connect was measured on the plain socket, which
                     # `wrap_socket` has already detached; THIS object is the one
                     # the host will close, so the slot is bound to it as well.
@@ -233,13 +321,15 @@ class ConnTimingProbe:
                 rec = _TimingRecord()
                 token = _establishing.set(rec)
                 t0 = time.perf_counter()
+                timed = _times_only_connect_and_tls(a, k)  # cannot raise: no I/O, no parse
                 try:
                     return await orig(this, *a, **k)
                 finally:
                     # fail-silent: each statement handles its own exception independently
                     # to avoid masking the original exception
                     try:
-                        rec.total_ms = (time.perf_counter() - t0) * 1000.0
+                        if timed:
+                            rec.total_ms = (time.perf_counter() - t0) * 1000.0
                     except Exception:
                         pass
                     try:
@@ -278,16 +368,72 @@ class ConnTimingProbe:
                     rec.hs_start = time.perf_counter()
             except Exception:
                 pass
+            done = False
             try:
-                return orig(this, *a, **k)
+                result = orig(this, *a, **k)
+                done = True
+                return result
             finally:
-                if rec is not None:
+                # Set once, by the call that completed it: from the first
+                # attempt to here. A call after completion changes nothing.
+                if done and rec is not None and rec.handshake_ms is None:
                     try:
                         rec.handshake_ms = (time.perf_counter() - rec.hs_start) * 1000.0
                     except Exception:
                         pass
 
         return wrapper
+
+
+def _times_only_connect_and_tls(args: tuple[Any, ...], kwargs: dict[str, Any]) -> bool:
+    """Is `create_connection`'s wall time a connect plus a TLS handshake?
+
+    Only then does "total minus handshake" leave a connect time. Given `sock=`,
+    the connect already happened elsewhere (aiohttp hands over a socket its
+    happy-eyeballs dialer connected without blocking, which no probe timed),
+    so the remainder is event-loop overhead. Given a host NAME, the total also
+    holds the DNS lookup. Either way the derived number is not a connect time,
+    and the connect is left unset (`connect_timing_unavailable`).
+    """
+    if kwargs.get("sock") is not None:
+        return False
+    host = args[1] if len(args) > 1 else kwargs.get("host")
+    if not isinstance(host, str):
+        return False
+    # An address literal, read the way asyncio skips the lookup for one. No
+    # host name holds a colon, so one with a colon is IPv6; else dotted IPv4.
+    if ":" in host:
+        return True
+    parts = host.split(".")
+    return len(parts) == 4 and all(p.isdigit() and len(p) <= 3 for p in parts)
+
+
+def opening_timing(
+    got: tuple[Any, ...], resolve: Any, st: Any, stream_id: int | None
+) -> tuple[Any, ...]:
+    """A seam's `_resolve_timing` answer `got`, handed to the transaction that
+    opened the connection: `(tcp_connect_ms, tls_handshake_ms, reused, markers)`.
+
+    The first `_resolve_timing` call on a connection returns its opening values
+    and every later one (`resolve()`) the reused answer. HTTP/1 runs one
+    transaction at a time, so the first one sealed opened the connection.
+    HTTP/2 streams finish in any order, and the stream a connection is opened
+    for is stream 1 (client stream ids start there and only rise): a stream
+    sealed before it opened nothing and gets the reused answer, and the opening
+    values wait on `st.h2_opening` for stream 1. Handing them to whichever
+    stream finished first claimed that stream opened the connection and that
+    stream 1, which did, opened it in 0 ms.
+    """
+    if stream_id is None:
+        return got
+    if got[2] is not True:  # the first call on this connection: the opening values
+        if stream_id == 1:
+            return got
+        st.h2_opening = got
+        return resolve()
+    if stream_id == 1 and st.h2_opening is not None:
+        got, st.h2_opening = st.h2_opening, None
+    return got
 
 
 def _release_at_close(store: ConnTimingStore, obj: Any, fileno: int) -> None:

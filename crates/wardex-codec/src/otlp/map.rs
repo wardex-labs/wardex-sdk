@@ -352,6 +352,432 @@ fn typed_blocks(sp: &pb::Span, attrs: &mut Vec<otlp_pb::common::KeyValue>) {
     }
 }
 
+// --- where every wire field goes ---
+
+/// Where one wire field lands in the OTLP export.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OtlpHome {
+    /// A span attribute under this key, carrying the field's own value (an
+    /// enum by its vocabulary name, a millisecond interval as a double).
+    /// Whether an unset or empty value still emits the key is said where the
+    /// field is mapped; a value the SDK did not observe never does.
+    Attribute(&'static str),
+    /// A field of the OTLP span itself, or a block projected onto several
+    /// keys by its own function in this module and asserted by that
+    /// function's tests. The text says where.
+    Projected(&'static str),
+    /// Deliberately not exported. The text is why.
+    NotExported(&'static str),
+}
+
+/// The census of the wire fields this mapping is answerable for: every field
+/// of `Span`, and every leaf under `Span.transport`. Each says where it lands
+/// in OTLP or why it does not.
+///
+/// It exists because a field the mapping never read used to vanish from the
+/// OTLP export with no error and every test green: `workflow_name` never
+/// reached it, and of the sixteen transport values the SDK measures only four
+/// did. Two checks hold this table to the code. `span` and `transport` below
+/// destructure their input exhaustively, so a field added to the schema does
+/// not compile until it is read or bound to `_`; and the tests compare this
+/// table against the field list in `span.proto` and run a span carrying a
+/// sentinel in every `Attribute` field through the mapping. The Python suite
+/// asks the same table, through the binding, whether each value the SDK
+/// produces survives the whole way.
+///
+/// A `NotExported` transport field is one nothing in the SDK fills: its
+/// reason is "no producer", and the Python census fails the moment a
+/// producer appears, which is when its OTLP name has to be decided.
+pub const WIRE_FIELDS: &[(&str, OtlpHome)] = &[
+    // -- Span
+    ("Span.trace_id", OtlpHome::Projected("OTLP Span.trace_id")),
+    ("Span.span_id", OtlpHome::Projected("OTLP Span.span_id")),
+    (
+        "Span.parent_span_id",
+        OtlpHome::Projected("OTLP Span.parent_span_id"),
+    ),
+    (
+        "Span.name",
+        OtlpHome::Projected("OTLP Span.name (`span_name` renames a model call)"),
+    ),
+    (
+        "Span.kind",
+        OtlpHome::Projected("OTLP Span.kind (`span_kind` renumbers)"),
+    ),
+    (
+        "Span.start_time_unix_nano",
+        OtlpHome::Projected("OTLP Span.start_time_unix_nano"),
+    ),
+    (
+        "Span.end_time_unix_nano",
+        OtlpHome::Projected("OTLP Span.end_time_unix_nano"),
+    ),
+    (
+        "Span.status",
+        OtlpHome::Projected("OTLP Span.status (`status_code` renumbers)"),
+    ),
+    (
+        "Span.extra",
+        OtlpHome::Projected(
+            "span attributes, key for key, except a reserved wardex.transport.* name (`span`)",
+        ),
+    ),
+    (
+        "Span.events",
+        OtlpHome::Projected("OTLP Span.events (`event`)"),
+    ),
+    (
+        "Span.links",
+        OtlpHome::Projected("OTLP Span.links (`link`)"),
+    ),
+    (
+        "Span.dropped_extra_count",
+        OtlpHome::NotExported(NO_PRODUCER_DROPPED),
+    ),
+    (
+        "Span.dropped_events_count",
+        OtlpHome::NotExported(NO_PRODUCER_DROPPED),
+    ),
+    (
+        "Span.dropped_links_count",
+        OtlpHome::NotExported(NO_PRODUCER_DROPPED),
+    ),
+    (
+        "Span.input_data",
+        OtlpHome::Projected("wardex.input_data, or gen_ai.tool.call.arguments on execute_tool"),
+    ),
+    (
+        "Span.output_data",
+        OtlpHome::Projected("wardex.output_data, or gen_ai.tool.call.result on execute_tool"),
+    ),
+    (
+        "Span.transport",
+        OtlpHome::Projected("its leaves, each listed below"),
+    ),
+    ("Span.error_type", OtlpHome::Attribute("error.type")),
+    ("Span.server_address", OtlpHome::Attribute("server.address")),
+    ("Span.server_port", OtlpHome::Attribute("server.port")),
+    ("Span.workflow_name", OtlpHome::Attribute(WORKFLOW_NAME)),
+    (
+        "Span.call_site",
+        OtlpHome::Projected(
+            "code.file.path, code.line.number, code.function.name (`typed_blocks`)",
+        ),
+    ),
+    (
+        "Span.conversation",
+        OtlpHome::Projected("gen_ai.conversation.id, wardex.conversation.* (`typed_blocks`)"),
+    ),
+    (
+        "Span.capture_sources",
+        OtlpHome::Projected("wardex.capture_sources (`uncertainty`)"),
+    ),
+    (
+        "Span.capture_integrity",
+        OtlpHome::Projected(
+            "wardex.limitations, wardex.capture.*, wardex.redaction.* (`uncertainty`)",
+        ),
+    ),
+    (
+        "Span.correlation",
+        OtlpHome::Projected(
+            "wardex.parent_source, wardex.parent_confidence, wardex.correlation.* (`uncertainty`)",
+        ),
+    ),
+    // -- TransportAttributes
+    (
+        "TransportAttributes.connection_id",
+        OtlpHome::Attribute(T_CONNECTION_ID),
+    ),
+    (
+        "TransportAttributes.protocol",
+        OtlpHome::Projected(
+            "network.protocol.name; SSE goes out as http plus wardex.transport.protocol",
+        ),
+    ),
+    (
+        "TransportAttributes.direction",
+        OtlpHome::Attribute(T_DIRECTION),
+    ),
+    (
+        "TransportAttributes.timing",
+        OtlpHome::Projected("its leaves, each listed below"),
+    ),
+    (
+        "TransportAttributes.request_size",
+        OtlpHome::Attribute(T_REQUEST_SIZE),
+    ),
+    (
+        "TransportAttributes.response_size",
+        OtlpHome::Attribute(T_RESPONSE_SIZE),
+    ),
+    (
+        "TransportAttributes.http",
+        OtlpHome::Projected("its leaves, each listed below"),
+    ),
+    (
+        "TransportAttributes.grpc",
+        OtlpHome::Projected("its leaves, each listed below"),
+    ),
+    (
+        "TransportAttributes.websocket",
+        OtlpHome::Projected("its leaves, each listed below"),
+    ),
+    (
+        "TransportAttributes.mcp",
+        OtlpHome::Projected("its leaves, each listed below"),
+    ),
+    (
+        "TransportAttributes.sse",
+        OtlpHome::Projected("its leaves, each listed below"),
+    ),
+    (
+        "TransportAttributes.a2a",
+        OtlpHome::Projected("its leaves, each listed below"),
+    ),
+    (
+        "TransportAttributes.request_blob_ref",
+        OtlpHome::NotExported(NO_PRODUCER),
+    ),
+    (
+        "TransportAttributes.response_blob_ref",
+        OtlpHome::NotExported(NO_PRODUCER),
+    ),
+    (
+        "TransportAttributes.request_modality",
+        OtlpHome::NotExported(NO_PRODUCER),
+    ),
+    (
+        "TransportAttributes.response_modality",
+        OtlpHome::NotExported(NO_PRODUCER),
+    ),
+    (
+        "TransportAttributes.is_streaming",
+        OtlpHome::Attribute(T_IS_STREAMING),
+    ),
+    (
+        "TransportAttributes.connection_reused",
+        OtlpHome::Attribute(T_CONNECTION_REUSED),
+    ),
+    (
+        "TransportTiming.tcp_connect_ms",
+        OtlpHome::Attribute(T_TCP_CONNECT_MS),
+    ),
+    (
+        "TransportTiming.tls_handshake_ms",
+        OtlpHome::Attribute(T_TLS_HANDSHAKE_MS),
+    ),
+    ("TransportTiming.ttfb_ms", OtlpHome::Attribute(T_TTFB_MS)),
+    (
+        "TransportTiming.transfer_ms",
+        OtlpHome::Attribute(T_TRANSFER_MS),
+    ),
+    ("TransportTiming.ttft_ms", OtlpHome::Attribute(T_TTFT_MS)),
+    (
+        "HttpMeta.method",
+        OtlpHome::Attribute("http.request.method"),
+    ),
+    (
+        "HttpMeta.status_code",
+        OtlpHome::Attribute("http.response.status_code"),
+    ),
+    ("HttpMeta.url", OtlpHome::Attribute("url.full")),
+    ("GrpcMeta.service", OtlpHome::NotExported(NO_PRODUCER_GRPC)),
+    ("GrpcMeta.method", OtlpHome::NotExported(NO_PRODUCER_GRPC)),
+    (
+        "GrpcMeta.stream_id",
+        OtlpHome::NotExported(NO_PRODUCER_GRPC),
+    ),
+    (
+        "GrpcMeta.status_code",
+        OtlpHome::NotExported(NO_PRODUCER_GRPC),
+    ),
+    ("GrpcMeta.encoding", OtlpHome::NotExported(NO_PRODUCER_GRPC)),
+    (
+        "GrpcMeta.decoded_payload",
+        OtlpHome::NotExported(NO_PRODUCER_GRPC),
+    ),
+    (
+        "WebSocketMeta.opcode",
+        OtlpHome::NotExported(NO_PRODUCER_WS),
+    ),
+    (
+        "WebSocketMeta.direction",
+        OtlpHome::NotExported(NO_PRODUCER_WS),
+    ),
+    ("McpMeta.rpc_method", OtlpHome::Attribute(MCP_METHOD_NAME)),
+    ("McpMeta.rpc_id", OtlpHome::Attribute(JSONRPC_REQUEST_ID)),
+    ("SseMeta.event_type", OtlpHome::NotExported(NO_PRODUCER)),
+    ("A2aMeta.task_id", OtlpHome::NotExported(NO_PRODUCER)),
+    ("A2aMeta.transport", OtlpHome::NotExported(NO_PRODUCER)),
+];
+
+const NO_PRODUCER: &str = "no producer: nothing in the SDK fills this field, so every span \
+     carries it empty; its OTLP name is decided by the change that first fills it";
+const NO_PRODUCER_GRPC: &str = "no producer: nothing in the SDK fills GrpcMeta; a gRPC span \
+     carries the same facts as the semconv rpc.* keys in `extra`, which reach OTLP as they are";
+const NO_PRODUCER_WS: &str = "no producer: nothing in the SDK fills WebSocketMeta; a WebSocket \
+     session span carries its facts as ws.* keys in `extra`, which reach OTLP as they are";
+const NO_PRODUCER_DROPPED: &str = "no producer: the SDK reports dropped keys as the \
+     extra_keys_dropped limitation and the wardex.usage_leaves.dropped_count key instead";
+
+/// `gen_ai.workflow.name` — GenAI semantic conventions (development).
+const WORKFLOW_NAME: &str = "gen_ai.workflow.name";
+/// `mcp.method.name` — GenAI semantic conventions, MCP (development).
+const MCP_METHOD_NAME: &str = "mcp.method.name";
+/// `jsonrpc.request.id` — semantic conventions registry (development).
+const JSONRPC_REQUEST_ID: &str = "jsonrpc.request.id";
+/// The OTLP attribute names reserved for the transport values the SDK
+/// observed: what [`transport`] writes, and nothing else. A host attribute
+/// under one of them would ship as if the SDK had measured it, on a span with
+/// no transport at all or beside the SDK's own reading as a second copy of the
+/// key, of which a backend keeps one. So the mapping leaves every such host
+/// attribute out before it writes its own and reports how many it left
+/// ([`Mapped::reserved_overwritten`]): the SDK's value replaces the host's,
+/// and where the SDK has none the name does not go out.
+pub const RESERVED_TRANSPORT_PREFIX: &str = "wardex.transport.";
+
+fn is_reserved_transport_key(key: &str) -> bool {
+    key.starts_with(RESERVED_TRANSPORT_PREFIX)
+}
+
+// No semantic convention defines these as span attributes, so they keep the
+// field's own path under `wardex.transport.`, the rule `wardex.transport.protocol`
+// already follows. The intervals stay in the schema's milliseconds.
+/// `TransportAttributes.connection_id`, which only the SDK fills
+/// (`str(id(socket))`). Public because the OTLP masker leaves it alone by this
+/// name, and only the reservation above makes the name say who wrote it.
+pub const T_CONNECTION_ID: &str = "wardex.transport.connection_id";
+const T_DIRECTION: &str = "wardex.transport.direction";
+const T_REQUEST_SIZE: &str = "wardex.transport.request_size";
+const T_RESPONSE_SIZE: &str = "wardex.transport.response_size";
+const T_IS_STREAMING: &str = "wardex.transport.is_streaming";
+const T_CONNECTION_REUSED: &str = "wardex.transport.connection_reused";
+const T_TCP_CONNECT_MS: &str = "wardex.transport.timing.tcp_connect_ms";
+const T_TLS_HANDSHAKE_MS: &str = "wardex.transport.timing.tls_handshake_ms";
+const T_TTFB_MS: &str = "wardex.transport.timing.ttfb_ms";
+const T_TRANSFER_MS: &str = "wardex.transport.timing.transfer_ms";
+const T_TTFT_MS: &str = "wardex.transport.timing.ttft_ms";
+
+/// `Span.transport` → OTLP span attributes.
+///
+/// Only what was observed goes out. A field with presence emits its key when
+/// the sender set it and no key otherwise; a string emits when non-empty; an
+/// enum when it names a value. Both sizes have presence: a half whose body
+/// went past its capture limit kept only a prefix, and a half the SDK lost
+/// (an evicted HTTP/2 request) was never counted, so neither length is the
+/// size of what crossed the wire. A zero that goes out is an empty body.
+/// Exhaustive on its input, so a field added to the schema does not compile
+/// here until it is mapped or bound to `_` with its reason in [`WIRE_FIELDS`].
+///
+/// Every key is written with [`set_attr`]: a `wardex.transport.*` name
+/// reaches here already cleared of host values ([`RESERVED_TRANSPORT_PREFIX`]),
+/// and a semantic-convention name a host spelled by hand gives way to the
+/// observed value rather than shipping beside it.
+fn transport(t: &pb::TransportAttributes, attrs: &mut Vec<otlp_pb::common::KeyValue>) {
+    let pb::TransportAttributes {
+        connection_id,
+        protocol,
+        direction,
+        timing,
+        request_size,
+        response_size,
+        http,
+        grpc: _,
+        websocket: _,
+        mcp,
+        sse: _,
+        a2a: _,
+        request_blob_ref: _,
+        response_blob_ref: _,
+        request_modality: _,
+        response_modality: _,
+        is_streaming,
+        connection_reused,
+    } = t;
+    let protocol = vocab::protocol_name(*protocol);
+    if protocol == "sse" {
+        // SSE is not a network protocol, it is a framing over HTTP —
+        // `network.protocol.name = "sse"` fails every backend's HTTP
+        // grouping. The observed fact survives under a wardex key.
+        set_attr(attrs, kv_str("network.protocol.name", "http"));
+        set_attr(attrs, kv_str("wardex.transport.protocol", &protocol));
+    } else {
+        set_attr(attrs, kv_str("network.protocol.name", &protocol));
+    }
+    if !connection_id.is_empty() {
+        set_attr(attrs, kv_str(T_CONNECTION_ID, connection_id));
+    }
+    let direction = vocab::direction_name(*direction);
+    if !direction.is_empty() {
+        set_attr(attrs, kv_str(T_DIRECTION, &direction));
+    }
+    if let Some(v) = request_size {
+        set_attr(attrs, kv_int(T_REQUEST_SIZE, i64::from(*v)));
+    }
+    if let Some(v) = response_size {
+        set_attr(attrs, kv_int(T_RESPONSE_SIZE, i64::from(*v)));
+    }
+    if let Some(v) = is_streaming {
+        set_attr(attrs, kv_bool(T_IS_STREAMING, *v));
+    }
+    if let Some(v) = connection_reused {
+        set_attr(attrs, kv_bool(T_CONNECTION_REUSED, *v));
+    }
+    if let Some(pb::TransportTiming {
+        tcp_connect_ms,
+        tls_handshake_ms,
+        ttfb_ms,
+        transfer_ms,
+        ttft_ms,
+    }) = timing
+    {
+        for (value, key) in [
+            (tcp_connect_ms, T_TCP_CONNECT_MS),
+            (tls_handshake_ms, T_TLS_HANDSHAKE_MS),
+            (ttfb_ms, T_TTFB_MS),
+            (transfer_ms, T_TRANSFER_MS),
+            (ttft_ms, T_TTFT_MS),
+        ] {
+            if let Some(ms) = value {
+                set_attr(attrs, kv_f64(key, widen(*ms)));
+            }
+        }
+    }
+    if let Some(pb::HttpMeta {
+        method,
+        status_code,
+        url,
+    }) = http
+    {
+        set_attr(attrs, kv_str("http.request.method", method));
+        set_attr(
+            attrs,
+            kv_int("http.response.status_code", i64::from(*status_code)),
+        );
+        // The WHOLE URL, query included: `url.full` is semconv's one home
+        // for a client span's URL, and the query is the call's arguments
+        // (`?q=seoul&page=2`) — dropping it silently threw away what an
+        // agent asked for while the same arguments sent in a POST body
+        // shipped whole. Credentials in it are the masker's to replace,
+        // by the same name rules that cover a body, before this request
+        // leaves the process. An empty captured URL emits nothing.
+        if !url.is_empty() {
+            set_attr(attrs, kv_str("url.full", url));
+        }
+    }
+    if let Some(pb::McpMeta { rpc_method, rpc_id }) = mcp {
+        if !rpc_method.is_empty() {
+            set_attr(attrs, kv_str(MCP_METHOD_NAME, rpc_method));
+        }
+        // semconv: a request without an id is a notification, and the
+        // attribute is left out rather than written empty.
+        if !rpc_id.is_empty() {
+            set_attr(attrs, kv_str(JSONRPC_REQUEST_ID, rpc_id));
+        }
+    }
+}
+
 /// `Span.events` → OTLP `Span.events`.
 ///
 /// OTLP is the surface that actually leaves the process, so filling
@@ -477,8 +903,43 @@ fn span_name(sp: &pb::Span) -> String {
     }
 }
 
-fn span(mut sp: pb::Span) -> otlp_pb::trace::Span {
+/// One span, mapped. `overwritten` gains the host attributes under a reserved
+/// transport name that this span does not ship ([`RESERVED_TRANSPORT_PREFIX`]).
+fn span(mut sp: pb::Span, overwritten: &mut usize) -> otlp_pb::trace::Span {
     use std::mem::take;
+
+    // Every field of the input, named once, read nowhere: a field added to
+    // `Span` does not compile here until it has a line, and a line is only
+    // honest once `WIRE_FIELDS` says where the value goes. The mapping below
+    // reads them off `sp` as it always has.
+    let pb::Span {
+        trace_id: _,
+        span_id: _,
+        parent_span_id: _,
+        name: _,
+        kind: _,
+        start_time_unix_nano: _,
+        end_time_unix_nano: _,
+        status: _,
+        extra: _,
+        events: _,
+        links: _,
+        dropped_extra_count: _,
+        dropped_events_count: _,
+        dropped_links_count: _,
+        input_data: _,
+        output_data: _,
+        transport: _,
+        error_type: _,
+        server_address: _,
+        server_port: _,
+        workflow_name: _,
+        call_site: _,
+        conversation: _,
+        capture_sources: _,
+        capture_integrity: _,
+        correlation: _,
+    } = &sp;
 
     // Read before anything is moved out: naming consults `extra`, and
     // `uncertainty` wants the whole span.
@@ -501,6 +962,12 @@ fn span(mut sp: pb::Span) -> otlp_pb::trace::Span {
     // cannot drift.
     let mut attrs: Vec<otlp_pb::common::KeyValue> =
         take(&mut sp.extra).into_iter().map(key_value).collect();
+    // The reserved transport names are the SDK's alone: a host's value under
+    // one goes before `transport` writes the SDK's, whether or not the SDK has
+    // one to write, and is counted.
+    let host_attrs = attrs.len();
+    attrs.retain(|kv| !is_reserved_transport_key(&kv.key));
+    *overwritten += host_attrs - attrs.len();
 
     // server.* — the empty string and port 0 are proto3 "unset", and neither is
     // a value a host could have meant.
@@ -511,30 +978,12 @@ fn span(mut sp: pb::Span) -> otlp_pb::trace::Span {
         attrs.push(kv_int("server.port", sp.server_port as i64));
     }
     if let Some(t) = &sp.transport {
-        let protocol = vocab::protocol_name(t.protocol);
-        if protocol == "sse" {
-            // SSE is not a network protocol, it is a framing over HTTP —
-            // `network.protocol.name = "sse"` fails every backend's HTTP
-            // grouping. The observed fact survives under a wardex key.
-            attrs.push(kv_str("network.protocol.name", "http"));
-            attrs.push(kv_str("wardex.transport.protocol", &protocol));
-        } else {
-            attrs.push(kv_str("network.protocol.name", &protocol));
-        }
-        if let Some(h) = &t.http {
-            attrs.push(kv_str("http.request.method", &h.method));
-            attrs.push(kv_int("http.response.status_code", h.status_code as i64));
-            // The WHOLE URL, query included: `url.full` is semconv's one home
-            // for a client span's URL, and the query is the call's arguments
-            // (`?q=seoul&page=2`) — dropping it silently threw away what an
-            // agent asked for while the same arguments sent in a POST body
-            // shipped whole. Credentials in it are the masker's to replace,
-            // by the same name rules that cover a body, before this request
-            // leaves the process. An empty captured URL emits nothing.
-            if !h.url.is_empty() {
-                attrs.push(kv_str("url.full", &h.url));
-            }
-        }
+        transport(t, &mut attrs);
+    }
+    // The typed field is the sender's one home for the name; a host that also
+    // spelled the key into `extra` does not get a second copy (`set_attr`).
+    if !sp.workflow_name.is_empty() {
+        set_attr(&mut attrs, kv_str(WORKFLOW_NAME, &sp.workflow_name));
     }
     // Raw I/O → payload attributes (omitted if empty). The key pair was chosen
     // above from the operation. Built as bytes so PII masking sees the raw
@@ -576,7 +1025,15 @@ fn span(mut sp: pb::Span) -> otlp_pb::trace::Span {
         attributes: attrs,
         events: take(&mut sp.events).into_iter().map(event).collect(),
         links: take(&mut sp.links).into_iter().map(link).collect(),
-        ..Default::default()
+        // Spelled out rather than defaulted, so each zero below is a decision
+        // a reader can see. The wire carries no W3C trace state or trace
+        // flags for a span, and the `Span.dropped_*` counts have no producer
+        // (see `WIRE_FIELDS`).
+        trace_state: String::new(),
+        flags: 0,
+        dropped_attributes_count: 0,
+        dropped_events_count: 0,
+        dropped_links_count: 0,
     }
 }
 
@@ -595,16 +1052,47 @@ fn span(mut sp: pb::Span) -> otlp_pb::trace::Span {
 /// request and response body, against a `max_buffer_bytes` backstop that
 /// accounts for one.
 pub fn envelope_to_traces(
-    mut env: pb::Envelope,
+    env: pb::Envelope,
     producer: Producer<'_>,
 ) -> otlp_pb::trace_service::ExportTraceServiceRequest {
+    map_envelope(env, producer).request
+}
+
+/// An OTLP request, and what its mapping did that the request cannot say for
+/// itself.
+#[derive(Debug)]
+pub struct Mapped {
+    pub request: otlp_pb::trace_service::ExportTraceServiceRequest,
+    /// Host attributes under a reserved transport name that did not ship as
+    /// the host set them: each was replaced by the SDK's own value or, where
+    /// the SDK had none, left out ([`RESERVED_TRANSPORT_PREFIX`]). The mapping
+    /// has no channel to a user, so the binding that called it says so.
+    pub reserved_overwritten: usize,
+}
+
+/// [`envelope_to_traces`], with the count the request does not carry. The
+/// export path calls this one, so the count is of exactly what was mapped.
+pub fn map_envelope(mut env: pb::Envelope, producer: Producer<'_>) -> Mapped {
+    let mut reserved_overwritten = 0;
     let spans: Vec<otlp_pb::trace::Span> = std::mem::take(&mut env.items)
         .into_iter()
         .filter_map(|item| match item.payload {
-            Some(pb::envelope_item::Payload::Span(sp)) => Some(span(sp)),
+            Some(pb::envelope_item::Payload::Span(sp)) => Some(span(sp, &mut reserved_overwritten)),
             _ => None,
         })
         .collect();
+    let request = traces_request(&env, spans, producer);
+    Mapped {
+        request,
+        reserved_overwritten,
+    }
+}
+
+fn traces_request(
+    env: &pb::Envelope,
+    spans: Vec<otlp_pb::trace::Span>,
+    producer: Producer<'_>,
+) -> otlp_pb::trace_service::ExportTraceServiceRequest {
     if spans.is_empty() {
         return otlp_pb::trace_service::ExportTraceServiceRequest {
             resource_spans: vec![],
@@ -1998,5 +2486,395 @@ mod tests {
             .collect::<Vec<String>>()
             .join(",");
         assert_eq!(got, "adapter,ssl,capture_source_unrecognized_9999");
+    }
+
+    // --- the wire field census ---
+
+    /// `Msg.field` for every field of the messages `WIRE_FIELDS` answers for,
+    /// read off the schema file itself rather than off a list kept beside it.
+    fn schema_fields() -> Vec<String> {
+        const MESSAGES: &[&str] = &[
+            "Span",
+            "TransportAttributes",
+            "TransportTiming",
+            "HttpMeta",
+            "GrpcMeta",
+            "WebSocketMeta",
+            "McpMeta",
+            "SseMeta",
+            "A2aMeta",
+        ];
+        let schema = include_str!("../../../../proto/wardex/v1/span.proto");
+        let mut out = Vec::new();
+        let mut current: Option<&str> = None;
+        for raw in schema.lines() {
+            let line = raw.split("//").next().unwrap_or("").trim();
+            if let Some(rest) = line.strip_prefix("message ") {
+                current = rest.split_whitespace().next();
+                continue;
+            }
+            if line == "}" {
+                current = None;
+                continue;
+            }
+            let Some(msg) = current.filter(|m| MESSAGES.contains(m)) else {
+                continue;
+            };
+            if line.is_empty() || line.starts_with("reserved") || !line.contains('=') {
+                continue;
+            }
+            let decl = line
+                .trim_start_matches("optional ")
+                .trim_start_matches("repeated ");
+            let name = decl
+                .split_whitespace()
+                .nth(1)
+                .expect("a field line is `type name = n;`");
+            out.push(format!("{msg}.{name}"));
+        }
+        out
+    }
+
+    #[test]
+    fn every_span_and_transport_field_has_a_stated_otlp_home() {
+        let schema = schema_fields();
+        assert!(
+            schema.len() > 60,
+            "the schema parse found too few fields: {schema:?}"
+        );
+        let census: Vec<&str> = WIRE_FIELDS.iter().map(|(path, _)| *path).collect();
+        let mut seen = std::collections::HashSet::new();
+        for path in &census {
+            assert!(seen.insert(*path), "{path} is listed twice");
+        }
+        for field in &schema {
+            assert!(
+                seen.contains(field.as_str()),
+                "{field} is in span.proto but WIRE_FIELDS does not say where it goes"
+            );
+        }
+        for path in &census {
+            assert!(
+                schema.iter().any(|f| f == path),
+                "{path} is in WIRE_FIELDS but not in span.proto"
+            );
+        }
+        for (path, home) in WIRE_FIELDS {
+            if let OtlpHome::NotExported(reason) = home {
+                assert!(
+                    reason.split_whitespace().count() >= 8,
+                    "{path}: a reason a stranger could act on"
+                );
+            }
+        }
+    }
+
+    fn sentinel_transport() -> pb::TransportAttributes {
+        // Exhaustive literals, no `..Default::default()`: a field added to
+        // one of these messages fails to compile here, next to the sentinel
+        // it needs.
+        pb::TransportAttributes {
+            connection_id: "sentinel-conn".into(),
+            protocol: pb::Protocol::Http as i32,
+            direction: pb::Direction::Inbound as i32,
+            timing: Some(pb::TransportTiming {
+                tcp_connect_ms: Some(11.25),
+                tls_handshake_ms: Some(22.5),
+                ttfb_ms: Some(33.75),
+                transfer_ms: Some(44.0),
+                ttft_ms: Some(55.5),
+            }),
+            request_size: Some(4321),
+            response_size: Some(8765),
+            http: Some(pb::HttpMeta {
+                method: "PATCH".into(),
+                status_code: 418,
+                url: "http://sentinel/x?q=1".into(),
+            }),
+            grpc: Some(pb::GrpcMeta {
+                service: "sentinel.Svc".into(),
+                method: "Sentinel".into(),
+                stream_id: 77,
+                status_code: 13,
+                encoding: "sentinel-enc".into(),
+                decoded_payload: "sentinel-payload".into(),
+            }),
+            websocket: Some(pb::WebSocketMeta {
+                opcode: 9,
+                direction: "sentinel-ws".into(),
+            }),
+            mcp: Some(pb::McpMeta {
+                rpc_method: "tools/call".into(),
+                rpc_id: "sentinel-rpc".into(),
+            }),
+            sse: Some(pb::SseMeta {
+                event_type: "sentinel-event".into(),
+            }),
+            a2a: Some(pb::A2aMeta {
+                task_id: "sentinel-task".into(),
+                transport: "sentinel-a2a".into(),
+            }),
+            request_blob_ref: "sentinel-req-blob".into(),
+            response_blob_ref: "sentinel-resp-blob".into(),
+            request_modality: pb::Modality::Image as i32,
+            response_modality: pb::Modality::Audio as i32,
+            is_streaming: Some(true),
+            connection_reused: Some(true),
+        }
+    }
+
+    #[test]
+    fn every_attribute_home_carries_the_value_the_sender_wrote() {
+        let sp = only_span(envelope(pb::Span {
+            error_type: "SentinelError".into(),
+            server_address: "sentinel.host".into(),
+            server_port: 4321,
+            workflow_name: "sentinel-workflow".into(),
+            transport: Some(sentinel_transport()),
+            ..Default::default()
+        }));
+        let s = |v: &str| V::StringValue(v.into());
+        let expected: &[(&str, V)] = &[
+            ("Span.error_type", s("SentinelError")),
+            ("Span.server_address", s("sentinel.host")),
+            ("Span.server_port", V::IntValue(4321)),
+            ("Span.workflow_name", s("sentinel-workflow")),
+            ("TransportAttributes.connection_id", s("sentinel-conn")),
+            ("TransportAttributes.direction", s("inbound")),
+            ("TransportAttributes.request_size", V::IntValue(4321)),
+            ("TransportAttributes.response_size", V::IntValue(8765)),
+            ("TransportAttributes.is_streaming", V::BoolValue(true)),
+            ("TransportAttributes.connection_reused", V::BoolValue(true)),
+            ("TransportTiming.tcp_connect_ms", V::DoubleValue(11.25)),
+            ("TransportTiming.tls_handshake_ms", V::DoubleValue(22.5)),
+            ("TransportTiming.ttfb_ms", V::DoubleValue(33.75)),
+            ("TransportTiming.transfer_ms", V::DoubleValue(44.0)),
+            ("TransportTiming.ttft_ms", V::DoubleValue(55.5)),
+            ("HttpMeta.method", s("PATCH")),
+            ("HttpMeta.status_code", V::IntValue(418)),
+            ("HttpMeta.url", s("http://sentinel/x?q=1")),
+            ("McpMeta.rpc_method", s("tools/call")),
+            ("McpMeta.rpc_id", s("sentinel-rpc")),
+        ];
+        let attribute_homes: Vec<(&str, &str)> = WIRE_FIELDS
+            .iter()
+            .filter_map(|(path, home)| match home {
+                OtlpHome::Attribute(key) => Some((*path, *key)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            attribute_homes.len(),
+            expected.len(),
+            "every Attribute home needs a sentinel here, and nothing else does"
+        );
+        for (path, key) in attribute_homes {
+            let (_, want) = expected
+                .iter()
+                .find(|(p, _)| *p == path)
+                .unwrap_or_else(|| panic!("{path} has no sentinel in this test"));
+            assert_eq!(attr(&sp, key), Some(want), "{path} under `{key}`");
+        }
+    }
+
+    #[test]
+    fn a_field_the_sdk_did_not_observe_emits_no_key() {
+        let sp = only_span(envelope(pb::Span {
+            transport: Some(pb::TransportAttributes {
+                protocol: pb::Protocol::McpStdio as i32,
+                timing: Some(pb::TransportTiming {
+                    ttfb_ms: Some(3.5),
+                    ..Default::default()
+                }),
+                mcp: Some(pb::McpMeta {
+                    rpc_method: "notifications/initialized".into(),
+                    rpc_id: String::new(),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }));
+        for key in [
+            T_CONNECTION_ID,
+            T_DIRECTION,
+            T_REQUEST_SIZE,
+            T_RESPONSE_SIZE,
+            T_IS_STREAMING,
+            T_CONNECTION_REUSED,
+            T_TCP_CONNECT_MS,
+            T_TLS_HANDSHAKE_MS,
+            T_TRANSFER_MS,
+            T_TTFT_MS,
+            JSONRPC_REQUEST_ID,
+            WORKFLOW_NAME,
+        ] {
+            assert!(
+                attr(&sp, key).is_none(),
+                "`{key}` was emitted with nothing observed"
+            );
+        }
+        assert_eq!(attr(&sp, T_TTFB_MS), Some(&V::DoubleValue(3.5)));
+        assert_eq!(
+            attr(&sp, MCP_METHOD_NAME),
+            Some(&str_value("notifications/initialized"))
+        );
+    }
+
+    #[test]
+    fn the_typed_workflow_name_replaces_a_same_keyed_extra_and_appears_once() {
+        let sp = only_span(envelope(pb::Span {
+            workflow_name: "typed".into(),
+            extra: vec![kv_wardex(WORKFLOW_NAME, "host")],
+            ..Default::default()
+        }));
+        assert_eq!(keys(&sp, WORKFLOW_NAME), 1);
+        assert_eq!(attr(&sp, WORKFLOW_NAME), Some(&str_value("typed")));
+    }
+
+    fn kv_bool_extra(key: &str, v: bool) -> pb::KeyValue {
+        pb::KeyValue {
+            key: key.into(),
+            value: Some(pb::AnyValue {
+                value: Some(pb::any_value::Value::BoolValue(v)),
+            }),
+        }
+    }
+
+    fn mapped(sp: pb::Span) -> (otlp_pb::trace::Span, usize) {
+        let Mapped {
+            mut request,
+            reserved_overwritten,
+        } = map_envelope(envelope(sp), PRODUCER);
+        let sp = request
+            .resource_spans
+            .remove(0)
+            .scope_spans
+            .remove(0)
+            .spans
+            .remove(0);
+        (sp, reserved_overwritten)
+    }
+
+    fn reserved_keys(sp: &otlp_pb::trace::Span) -> Vec<&str> {
+        sp.attributes
+            .iter()
+            .map(|kv| kv.key.as_str())
+            .filter(|k| k.starts_with(RESERVED_TRANSPORT_PREFIX))
+            .collect()
+    }
+
+    /// A span the SDK observed no transport for — a host's own span — ships
+    /// no `wardex.transport.*` name, whatever the host set under one: the
+    /// names say "the SDK measured this", and here it measured nothing.
+    #[test]
+    fn a_host_value_under_a_reserved_name_does_not_ship_as_a_measurement() {
+        let (sp, overwritten) = mapped(pb::Span {
+            name: "host-step".into(),
+            extra: vec![
+                kv_bool_extra(T_IS_STREAMING, true),
+                kv_wardex(T_CONNECTION_ID, "host-conn"),
+                kv_wardex("wardex.transport.anything_else", "host"),
+                kv_wardex("wardex.transportation", "kept: not under the prefix"),
+            ],
+            ..Default::default()
+        });
+        assert_eq!(reserved_keys(&sp), Vec::<&str>::new());
+        assert_eq!(overwritten, 3);
+        assert_eq!(
+            attr(&sp, "wardex.transportation"),
+            Some(&str_value("kept: not under the prefix"))
+        );
+    }
+
+    /// Where the SDK has a value, it replaces the host's under the same name,
+    /// once: the duplicate this closes shipped the host's `true` beside the
+    /// SDK's observed `false`, and a backend keeps one of the two.
+    #[test]
+    fn the_sdk_value_replaces_a_host_value_under_its_reserved_name_once() {
+        let (sp, overwritten) = mapped(pb::Span {
+            extra: vec![
+                kv_bool_extra(T_IS_STREAMING, true),
+                kv_wardex(T_CONNECTION_ID, "host-conn"),
+                kv_wardex("wardex.transport.protocol", "host"),
+                kv_wardex(T_TTFT_MS, "host"),
+            ],
+            transport: Some(pb::TransportAttributes {
+                connection_id: "123456789012345".into(),
+                protocol: pb::Protocol::Http as i32,
+                is_streaming: Some(false),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        assert_eq!(reserved_keys(&sp), vec![T_CONNECTION_ID, T_IS_STREAMING]);
+        assert_eq!(attr(&sp, T_IS_STREAMING), Some(&V::BoolValue(false)));
+        assert_eq!(
+            attr(&sp, T_CONNECTION_ID),
+            Some(&str_value("123456789012345"))
+        );
+        assert_eq!(overwritten, 4);
+    }
+
+    /// The count is of host attributes only: a span with none under a
+    /// reserved name counts nothing, however many the SDK writes.
+    #[test]
+    fn the_sdks_own_transport_values_are_not_counted() {
+        let (_, overwritten) = mapped(pb::Span {
+            transport: Some(sentinel_transport()),
+            ..Default::default()
+        });
+        assert_eq!(overwritten, 0);
+    }
+
+    /// A semantic-convention name the transport block projects onto gives way
+    /// to the observed value too, without a count: those names are not
+    /// reserved, and a host value under one ships where the SDK has none.
+    #[test]
+    fn an_observed_value_replaces_a_host_value_under_its_semconv_name() {
+        let (sp, overwritten) = mapped(pb::Span {
+            extra: vec![
+                kv_wardex(MCP_METHOD_NAME, "host"),
+                kv_wardex(JSONRPC_REQUEST_ID, "host-id"),
+            ],
+            transport: Some(pb::TransportAttributes {
+                protocol: pb::Protocol::McpStdio as i32,
+                mcp: Some(pb::McpMeta {
+                    rpc_method: "tools/call".into(),
+                    rpc_id: String::new(),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        assert_eq!(keys(&sp, MCP_METHOD_NAME), 1);
+        assert_eq!(attr(&sp, MCP_METHOD_NAME), Some(&str_value("tools/call")));
+        assert_eq!(attr(&sp, JSONRPC_REQUEST_ID), Some(&str_value("host-id")));
+        assert_eq!(overwritten, 0);
+    }
+
+    #[test]
+    fn an_observed_false_or_zero_is_emitted_not_dropped() {
+        // Presence is the whole point: `false` and `0.0` are readings when
+        // the sender set them, and only an unset field is silent.
+        let sp = only_span(envelope(pb::Span {
+            transport: Some(pb::TransportAttributes {
+                protocol: pb::Protocol::Http as i32,
+                is_streaming: Some(false),
+                connection_reused: Some(false),
+                timing: Some(pb::TransportTiming {
+                    tcp_connect_ms: Some(0.0),
+                    ..Default::default()
+                }),
+                request_size: Some(0),
+                response_size: Some(0),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }));
+        assert_eq!(attr(&sp, T_IS_STREAMING), Some(&V::BoolValue(false)));
+        assert_eq!(attr(&sp, T_CONNECTION_REUSED), Some(&V::BoolValue(false)));
+        assert_eq!(attr(&sp, T_TCP_CONNECT_MS), Some(&V::DoubleValue(0.0)));
+        assert_eq!(attr(&sp, T_REQUEST_SIZE), Some(&V::IntValue(0)));
+        assert_eq!(attr(&sp, T_RESPONSE_SIZE), Some(&V::IntValue(0)));
     }
 }

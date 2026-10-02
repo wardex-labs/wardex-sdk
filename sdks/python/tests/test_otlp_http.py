@@ -1001,6 +1001,116 @@ def test_a_custom_transport_calling_encode_still_counts_and_reports():
     assert any("could not be marshalled" in line for line in lines)
 
 
+def _reserved_name_envelope() -> Envelope:
+    """A host span that set two reserved transport names and observed no
+    transport, beside a captured call whose own values those names carry."""
+    host = _span(
+        name="host-step",
+        extra=(
+            ("wardex.transport.is_streaming", True),
+            ("wardex.transport.timing.ttft_ms", 0.5),
+        ),
+    )
+    captured = _span(
+        name="captured",
+        extra=(("wardex.transport.connection_id", "host-conn"),),
+        transport=TransportAttributes(
+            connection_id="140234567890120",
+            protocol=Protocol.HTTP,
+            direction=Direction.OUTBOUND,
+            is_streaming=False,
+        ),
+    )
+    return Envelope(header=_header(), spans=(host, captured))
+
+
+def _transport_attributes(request: dict) -> dict[str, dict]:
+    return {
+        sp["name"]: {k: v for k, v in sp["attributes"].items() if k.startswith("wardex.transport.")}
+        for rs in _decode(request)["resource_spans"]
+        for ss in rs["scope_spans"]
+        for sp in ss["spans"]
+    }
+
+
+@pytest.mark.usefixtures("fresh_counters")
+def test_a_host_value_under_a_reserved_transport_name_is_replaced_and_counted_once():
+    """`wardex.transport.*` carries what the SDK observed about a call. A host
+    value under one of those names used to ship as that observation: on a span
+    with no transport at all, and as a second copy of the key beside the SDK's
+    own reading. The SDK's value replaces it, or it is left out, and each one
+    is counted by the attempt that decides the batch's fate, like a skipped
+    span, so a retried batch does not count it twice."""
+    from wardex_sdk._assembly import counters
+
+    srv = _serve()
+    try:
+        t = OtlpHttpTransport(endpoint=f"http://127.0.0.1:{srv.server_address[1]}/v1/traces")
+        env = _reserved_name_envelope()
+        assert t.export(env, timeout=1e-9) is UNDELIVERED
+        assert counters.get("transport.otlp.reserved_attribute_overwritten") == 0
+        lines = _report_lines(lambda: t.export(env))
+        assert counters.get("transport.otlp.reserved_attribute_overwritten") == 3
+        assert any("reserved_attribute_overwritten" in line for line in lines)
+        (request,) = _Handler.requests
+        assert _transport_attributes(request) == {
+            "host-step": {},
+            "captured": {
+                "wardex.transport.connection_id": "140234567890120",
+                "wardex.transport.direction": "outbound",
+                "wardex.transport.is_streaming": False,
+            },
+        }
+        body = request["body"]
+        if request["content_encoding"] == "gzip":
+            body = gzip.decompress(body)
+        assert body.count(b"wardex.transport.connection_id") == 1
+        assert b"host-conn" not in body
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+@pytest.mark.usefixtures("fresh_counters")
+def test_the_sdks_card_shaped_connection_id_is_not_masked_on_otlp():
+    """`str(id(socket))` is fifteen digits on 64-bit Linux, and about one in
+    ten passes the card checksum. Under the default masking it shipped as
+    `****-****-****-0120` with `credit_card` recorded on a span that held no
+    card. The name is the SDK's alone, so the value ships as the SDK wrote it."""
+    srv = _serve()
+    try:
+        t = OtlpHttpTransport(endpoint=f"http://127.0.0.1:{srv.server_address[1]}/v1/traces")
+        assert t._pii_mode == "mask"
+        t.export(_reserved_name_envelope())
+        (request,) = _Handler.requests
+        (captured,) = [
+            sp
+            for rs in _decode(request)["resource_spans"]
+            for ss in rs["scope_spans"]
+            for sp in ss["spans"]
+            if sp["name"] == "captured"
+        ]
+        attrs = captured["attributes"]
+        assert attrs["wardex.transport.connection_id"] == "140234567890120"
+        assert not any(k.startswith("wardex.redact") for k in attrs), attrs
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+@pytest.mark.usefixtures("fresh_counters")
+def test_a_custom_transport_calling_encode_counts_a_reserved_name_overwrite():
+    from wardex_sdk._assembly import counters
+    from wardex_sdk.transport import Transport
+
+    class _Custom(Transport):
+        def export(self, envelope, *, timeout=None):
+            self.encode(envelope)
+
+    _Custom().export(_reserved_name_envelope())
+    assert counters.get("transport.otlp.reserved_attribute_overwritten") == 3
+
+
 def test_the_transports_own_debug_flag_reveals_the_skipped_span_names():
     """The report tells a person to re-run with debug=True. On the OTLP
     exporter that must work where they set it on the transport itself, not

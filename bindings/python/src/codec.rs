@@ -543,9 +543,95 @@ fn map_modality(s: &str) -> i32 {
 
 // --- transport / capture_integrity / correlation / state ---
 
+/// `TransportAttributes` → proto.
+///
+/// The struct is built in one exhaustive literal, with no `..Default::default()`:
+/// a field added to the schema does not compile here until this function says
+/// where its value comes from. A default that filled the gap would ship the
+/// field's zero value as if the SDK had observed it, which is the exact defect
+/// the presence-carrying fields exist to prevent.
+///
+/// The fields the SDK may not observe (`request_size`, `response_size`,
+/// `is_streaming`, `connection_reused`, every timing interval) carry presence
+/// on the wire:
+/// Python `None` stays unset rather than becoming `0`, `false` or `0.0`. An
+/// unset modality is `None` on the Python side and `MODALITY_UNSPECIFIED` here.
 fn transport_to_proto(t: &Bound<PyAny>) -> PyResult<pb::TransportAttributes> {
     let tm = t.getattr("timing")?;
-    let mut tr = pb::TransportAttributes {
+    let http = match opt(t, "http")? {
+        Some(h) => Some(pb::HttpMeta {
+            method: h.getattr("method")?.extract()?,
+            url: h.getattr("url")?.extract()?,
+            status_code: h.getattr("status_code")?.extract()?,
+        }),
+        None => None,
+    };
+    let grpc = match opt(t, "grpc")? {
+        Some(g) => {
+            let mut m = pb::GrpcMeta {
+                service: g.getattr("service")?.extract()?,
+                method: g.getattr("method")?.extract()?,
+                ..Default::default()
+            };
+            if let Some(v) = opt(&g, "stream_id")? {
+                m.stream_id = v.extract()?;
+            }
+            if let Some(v) = opt(&g, "status_code")? {
+                m.status_code = v.extract()?;
+            }
+            if let Some(v) = opt(&g, "encoding")? {
+                m.encoding = v.extract()?;
+            }
+            Some(m)
+        }
+        None => None,
+    };
+    let websocket = match opt(t, "websocket")? {
+        Some(w) => Some(pb::WebSocketMeta {
+            opcode: w.getattr("opcode")?.extract()?,
+            direction: w.getattr("direction")?.extract()?,
+        }),
+        None => None,
+    };
+    let mcp = match opt(t, "mcp")? {
+        Some(mc) => Some(pb::McpMeta {
+            rpc_method: mc.getattr("rpc_method")?.extract()?,
+            rpc_id: opt(&mc, "rpc_id")?
+                .map(|v| v.extract())
+                .transpose()?
+                .unwrap_or_default(),
+        }),
+        None => None,
+    };
+    let sse = match opt(t, "sse")? {
+        Some(se) => Some(pb::SseMeta {
+            event_type: opt(&se, "event_type")?
+                .map(|v| v.extract())
+                .transpose()?
+                .unwrap_or_default(),
+        }),
+        None => None,
+    };
+    let a2a = match opt(t, "a2a")? {
+        Some(a) => Some(pb::A2aMeta {
+            task_id: a.getattr("task_id")?.extract()?,
+            transport: a.getattr("transport")?.extract()?,
+        }),
+        None => None,
+    };
+    let modality = |name: &str| -> PyResult<i32> {
+        Ok(match opt(t, name)? {
+            Some(m) => map_modality(&enum_str(&m)?),
+            None => pb::Modality::Unspecified as i32,
+        })
+    };
+    let blob_ref = |name: &str| -> PyResult<String> {
+        Ok(opt(t, name)?
+            .map(|v| v.extract())
+            .transpose()?
+            .unwrap_or_default())
+    };
+    Ok(pb::TransportAttributes {
         connection_id: t.getattr("connection_id")?.extract()?,
         protocol: map_protocol(&enum_str(&t.getattr("protocol")?)?),
         direction: map_direction(&enum_str(&t.getattr("direction")?)?),
@@ -558,74 +644,19 @@ fn transport_to_proto(t: &Bound<PyAny>) -> PyResult<pb::TransportAttributes> {
         }),
         request_size: t.getattr("request_size")?.extract()?,
         response_size: t.getattr("response_size")?.extract()?,
-        request_modality: map_modality(&enum_str(&t.getattr("request_modality")?)?),
-        response_modality: map_modality(&enum_str(&t.getattr("response_modality")?)?),
+        http,
+        grpc,
+        websocket,
+        mcp,
+        sse,
+        a2a,
+        request_blob_ref: blob_ref("request_blob_ref")?,
+        response_blob_ref: blob_ref("response_blob_ref")?,
+        request_modality: modality("request_modality")?,
+        response_modality: modality("response_modality")?,
         is_streaming: t.getattr("is_streaming")?.extract()?,
-        chunk_index: t.getattr("chunk_index")?.extract()?,
-        is_final_chunk: t.getattr("is_final_chunk")?.extract()?,
         connection_reused: t.getattr("connection_reused")?.extract()?,
-        ..Default::default()
-    };
-    if let Some(h) = opt(t, "http")? {
-        tr.http = Some(pb::HttpMeta {
-            method: h.getattr("method")?.extract()?,
-            url: h.getattr("url")?.extract()?,
-            status_code: h.getattr("status_code")?.extract()?,
-        });
-    }
-    if let Some(g) = opt(t, "grpc")? {
-        let mut m = pb::GrpcMeta {
-            service: g.getattr("service")?.extract()?,
-            method: g.getattr("method")?.extract()?,
-            ..Default::default()
-        };
-        if let Some(v) = opt(&g, "stream_id")? {
-            m.stream_id = v.extract()?;
-        }
-        if let Some(v) = opt(&g, "status_code")? {
-            m.status_code = v.extract()?;
-        }
-        if let Some(v) = opt(&g, "encoding")? {
-            m.encoding = v.extract()?;
-        }
-        tr.grpc = Some(m);
-    }
-    if let Some(w) = opt(t, "websocket")? {
-        tr.websocket = Some(pb::WebSocketMeta {
-            opcode: w.getattr("opcode")?.extract()?,
-            direction: w.getattr("direction")?.extract()?,
-        });
-    }
-    if let Some(mc) = opt(t, "mcp")? {
-        let mut m = pb::McpMeta {
-            rpc_method: mc.getattr("rpc_method")?.extract()?,
-            ..Default::default()
-        };
-        if let Some(v) = opt(&mc, "rpc_id")? {
-            m.rpc_id = v.extract()?;
-        }
-        tr.mcp = Some(m);
-    }
-    if let Some(se) = opt(t, "sse")? {
-        let mut m = pb::SseMeta::default();
-        if let Some(v) = opt(&se, "event_type")? {
-            m.event_type = v.extract()?;
-        }
-        tr.sse = Some(m);
-    }
-    if let Some(a) = opt(t, "a2a")? {
-        tr.a2a = Some(pb::A2aMeta {
-            task_id: a.getattr("task_id")?.extract()?,
-            transport: a.getattr("transport")?.extract()?,
-        });
-    }
-    if let Some(v) = opt(t, "request_blob_ref")? {
-        tr.request_blob_ref = v.extract()?;
-    }
-    if let Some(v) = opt(t, "response_blob_ref")? {
-        tr.response_blob_ref = v.extract()?;
-    }
-    Ok(tr)
+    })
 }
 
 /// The key that carries a marker the schema could not name. Read the comment on
@@ -1153,6 +1184,130 @@ fn kv_to_py(py: Python<'_>, kvs: &[pb::KeyValue]) -> PyResult<PyObject> {
     Ok(list.into_py(py))
 }
 
+/// `TransportAttributes` → dict, every field of it.
+///
+/// Exhaustive on purpose — a field added to the schema does not compile here
+/// until it is decoded — because this dict is the only place a Python test can
+/// see what the envelope carried. A field the decoder leaves out is a field no
+/// test can assert ever reached the wire. A field without a value decodes to
+/// `None`: explicit presence for the ones that have it, the empty string or
+/// the unspecified enum for the rest, and an absent meta block.
+fn transport_to_dict<'py>(
+    py: Python<'py>,
+    t: &pb::TransportAttributes,
+) -> PyResult<Bound<'py, PyDict>> {
+    let pb::TransportAttributes {
+        connection_id,
+        protocol,
+        direction,
+        timing,
+        request_size,
+        response_size,
+        http,
+        grpc,
+        websocket,
+        mcp,
+        sse,
+        a2a,
+        request_blob_ref,
+        response_blob_ref,
+        request_modality,
+        response_modality,
+        is_streaming,
+        connection_reused,
+    } = t;
+    let non_empty = |s: &String| (!s.is_empty()).then(|| s.clone());
+    let named = |n: String| (!n.is_empty()).then_some(n);
+    let td = PyDict::new_bound(py);
+    td.set_item("connection_id", non_empty(connection_id))?;
+    td.set_item("protocol", *protocol)?;
+    td.set_item("direction", *direction)?;
+    td.set_item("request_size", *request_size)?;
+    td.set_item("response_size", *response_size)?;
+    td.set_item("is_streaming", *is_streaming)?;
+    td.set_item("connection_reused", *connection_reused)?;
+    td.set_item(
+        "request_modality",
+        named(vocab::modality_name(*request_modality)),
+    )?;
+    td.set_item(
+        "response_modality",
+        named(vocab::modality_name(*response_modality)),
+    )?;
+    td.set_item("request_blob_ref", request_blob_ref)?;
+    td.set_item("response_blob_ref", response_blob_ref)?;
+    if let Some(pb::TransportTiming {
+        tcp_connect_ms,
+        tls_handshake_ms,
+        ttfb_ms,
+        transfer_ms,
+        ttft_ms,
+    }) = timing
+    {
+        let d2 = PyDict::new_bound(py);
+        d2.set_item("tcp_connect_ms", *tcp_connect_ms)?;
+        d2.set_item("tls_handshake_ms", *tls_handshake_ms)?;
+        d2.set_item("ttfb_ms", *ttfb_ms)?;
+        d2.set_item("transfer_ms", *transfer_ms)?;
+        d2.set_item("ttft_ms", *ttft_ms)?;
+        td.set_item("timing", d2)?;
+    }
+    if let Some(pb::HttpMeta {
+        method,
+        status_code,
+        url,
+    }) = http
+    {
+        let d2 = PyDict::new_bound(py);
+        d2.set_item("method", method)?;
+        d2.set_item("url", url)?;
+        d2.set_item("status_code", *status_code)?;
+        td.set_item("http", d2)?;
+    }
+    if let Some(pb::GrpcMeta {
+        service,
+        method,
+        stream_id,
+        status_code,
+        encoding,
+        decoded_payload,
+    }) = grpc
+    {
+        let d2 = PyDict::new_bound(py);
+        d2.set_item("service", service)?;
+        d2.set_item("method", method)?;
+        d2.set_item("stream_id", *stream_id)?;
+        d2.set_item("status_code", *status_code)?;
+        d2.set_item("encoding", encoding)?;
+        d2.set_item("decoded_payload", decoded_payload)?;
+        td.set_item("grpc", d2)?;
+    }
+    if let Some(pb::WebSocketMeta { opcode, direction }) = websocket {
+        let d2 = PyDict::new_bound(py);
+        d2.set_item("opcode", *opcode)?;
+        d2.set_item("direction", direction)?;
+        td.set_item("websocket", d2)?;
+    }
+    if let Some(pb::McpMeta { rpc_method, rpc_id }) = mcp {
+        let d2 = PyDict::new_bound(py);
+        d2.set_item("rpc_method", rpc_method)?;
+        d2.set_item("rpc_id", rpc_id)?;
+        td.set_item("mcp", d2)?;
+    }
+    if let Some(pb::SseMeta { event_type }) = sse {
+        let d2 = PyDict::new_bound(py);
+        d2.set_item("event_type", event_type)?;
+        td.set_item("sse", d2)?;
+    }
+    if let Some(pb::A2aMeta { task_id, transport }) = a2a {
+        let d2 = PyDict::new_bound(py);
+        d2.set_item("task_id", task_id)?;
+        d2.set_item("transport", transport)?;
+        td.set_item("a2a", d2)?;
+    }
+    Ok(td)
+}
+
 fn span_to_dict(py: Python<'_>, sp: &pb::Span) -> PyResult<PyObject> {
     let d = PyDict::new_bound(py);
     d.set_item("trace_id", PyBytes::new_bound(py, &sp.trace_id))?;
@@ -1196,38 +1351,7 @@ fn span_to_dict(py: Python<'_>, sp: &pb::Span) -> PyResult<PyObject> {
     d.set_item("capture_sources", sp.capture_sources.clone())?;
     d.set_item("extra", kv_to_py(py, &sp.extra)?)?;
     if let Some(t) = &sp.transport {
-        let td = PyDict::new_bound(py);
-        td.set_item("protocol", t.protocol)?;
-        td.set_item("direction", t.direction)?;
-        td.set_item("request_size", t.request_size)?;
-        td.set_item("response_size", t.response_size)?;
-        td.set_item("is_streaming", t.is_streaming)?;
-        td.set_item("connection_reused", t.connection_reused)?;
-        if let Some(tm) = &t.timing {
-            let d2 = PyDict::new_bound(py);
-            d2.set_item("tcp_connect_ms", tm.tcp_connect_ms)?;
-            d2.set_item("tls_handshake_ms", tm.tls_handshake_ms)?;
-            d2.set_item("ttfb_ms", tm.ttfb_ms)?;
-            d2.set_item("transfer_ms", tm.transfer_ms)?;
-            d2.set_item("ttft_ms", tm.ttft_ms)?;
-            td.set_item("timing", d2)?;
-        }
-        if let Some(h) = &t.http {
-            let d2 = PyDict::new_bound(py);
-            d2.set_item("method", &h.method)?;
-            d2.set_item("url", &h.url)?;
-            d2.set_item("status_code", h.status_code)?;
-            td.set_item("http", d2)?;
-        }
-        if let Some(a) = &t.a2a {
-            let d2 = PyDict::new_bound(py);
-            d2.set_item("task_id", &a.task_id)?;
-            d2.set_item("transport", &a.transport)?;
-            td.set_item("a2a", d2)?;
-        }
-        td.set_item("request_blob_ref", &t.request_blob_ref)?;
-        td.set_item("response_blob_ref", &t.response_blob_ref)?;
-        d.set_item("transport", td)?;
+        d.set_item("transport", transport_to_dict(py, t)?)?;
     }
     if let Some(c) = &sp.capture_integrity {
         let cd = PyDict::new_bound(py);
@@ -1656,20 +1780,24 @@ const PRODUCER: otlp::map::Producer<'static> = otlp::map::Producer {
 ///     `bytes_value` and this is the point of no return for the raw payload.
 ///
 /// Shared by both entry points below so the two cannot drift into applying a
-/// different policy to the same envelope.
+/// different policy to the same envelope. The count beside the request is the
+/// mapping's `reserved_overwritten`, for the export path to report.
 fn otlp_request(
     proto: pb::Envelope,
     policy: &PiiPolicy<'_>,
     limits: wardex_limits::Limits,
-) -> PyResult<otlp_pb::trace_service::ExportTraceServiceRequest> {
+) -> PyResult<(otlp_pb::trace_service::ExportTraceServiceRequest, usize)> {
     // `proto` is CONSUMED here, so the envelope's payloads move into the
     // request instead of being copied beside it — one flush of a full batch
     // holds one copy of every captured body, not two.
-    let mut req = otlp::map::envelope_to_traces(proto, PRODUCER);
+    let otlp::map::Mapped {
+        request: mut req,
+        reserved_overwritten,
+    } = otlp::map::map_envelope(proto, PRODUCER);
     pii_apply_otlp(&mut req, policy)?;
     otlp::map::cap_attribute_values(&mut req, limits);
     otlp::map::strip_bytes_values(&mut req);
-    Ok(req)
+    Ok((req, reserved_overwritten))
 }
 
 #[pyfunction]
@@ -1711,7 +1839,9 @@ fn encode_otlp_traces(
         // Mapping + masking + protobuf are pure Rust: release the GIL so app
         // threads keep running while the batch worker encodes (design §9).
         let bytes = py.allow_threads(move || -> PyResult<Vec<u8>> {
-            let req = otlp_request(proto, &policy, limits)?;
+            // Not an export, so nothing here is counted: the reserved-name
+            // count is the export encoder's to report.
+            let (req, _) = otlp_request(proto, &policy, limits)?;
             otlp::encode_traces(&req)
                 .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
         })?;
@@ -1730,10 +1860,12 @@ fn encode_otlp_traces(
 /// The second element of the return value is a count of spans that could not
 /// be made to fit even alone, after their payload was dropped; the third names
 /// the spans that could not be MARSHALLED at all (a typed block holding a
-/// value of the wrong Python type), each as `"{name}: {reason}"`. Both exist
-/// because the core has no channel to a user: a loss reported nowhere is the
-/// silent kind, and the caller is the only one who can say it out loud. The
-/// third used to be a raise, and the raise cost the whole batch.
+/// value of the wrong Python type), each as `"{name}: {reason}"`; the fourth
+/// counts the host attributes under a reserved `wardex.transport.*` name the
+/// mapping did not ship as set (`otlp::map::Mapped`). They exist because the
+/// core has no channel to a user: a loss reported nowhere is the silent kind,
+/// and the caller is the only one who can say it out loud. The third used to
+/// be a raise, and the raise cost the whole batch.
 #[pyfunction]
 #[pyo3(signature = (envelope, pii_mode = "off", pii_disabled = Vec::new(), limits = None, compress = true, *, pii_extra_names = Vec::new(), pii_reveal_names = Vec::new()))]
 // One argument per Python keyword: the signature IS the Python API, and a
@@ -1748,7 +1880,7 @@ fn encode_otlp_requests(
     compress: bool,
     pii_extra_names: Vec<String>,
     pii_reveal_names: Vec<String>,
-) -> PyResult<(Py<PyAny>, usize, Vec<String>)> {
+) -> PyResult<(Py<PyAny>, usize, Vec<String>, usize)> {
     let policy = PiiPolicy {
         mode: pii_mode,
         disabled: pii_disabled,
@@ -1758,16 +1890,23 @@ fn encode_otlp_requests(
     shielded(|| {
         let (proto, unmarshalled) = envelope_to_proto(envelope, false, true)?;
         let limits = limits.map(|p| p.inner).unwrap_or_default();
-        let requests = py.allow_threads(move || -> PyResult<otlp::split::Requests> {
-            let req = otlp_request(proto, &policy, limits)?;
-            otlp::split::encode_requests(req, limits, compress)
-                .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
-        })?;
+        let (requests, overwritten) =
+            py.allow_threads(move || -> PyResult<(otlp::split::Requests, usize)> {
+                let (req, overwritten) = otlp_request(proto, &policy, limits)?;
+                let requests = otlp::split::encode_requests(req, limits, compress)
+                    .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+                Ok((requests, overwritten))
+            })?;
         let bodies = PyList::empty_bound(py);
         for body in &requests.bodies {
             bodies.append(PyBytes::new_bound(py, body))?;
         }
-        Ok((bodies.into_py(py), requests.dropped_spans, unmarshalled))
+        Ok((
+            bodies.into_py(py),
+            requests.dropped_spans,
+            unmarshalled,
+            overwritten,
+        ))
     })
 }
 
@@ -1800,6 +1939,31 @@ fn pii_name_rules(py: Python<'_>) -> PyResult<PyObject> {
         d.set_item("exact_names", pii::EXACT_NAMES.to_vec())?;
         d.set_item("url_form_only_names", pii::URL_FORM_ONLY_NAMES.to_vec())?;
         Ok(d.into_py(py))
+    })
+}
+
+/// `otlp::map::WIRE_FIELDS` as `[(path, kind, text)]`, kind one of
+/// `"attribute"` (text is the key), `"projected"` (text says where) or
+/// `"not_exported"` (text is why).
+///
+/// Handed to Python so the field census there checks the one table the
+/// mapping itself is held to, instead of a copy kept beside it: the Python
+/// half is where the producers, the dataclasses and the envelope decoder can
+/// be seen, and an exclusion stated twice is an exclusion that can disagree.
+#[pyfunction]
+fn otlp_wire_fields(py: Python<'_>) -> PyResult<PyObject> {
+    shielded(|| {
+        use otlp::map::OtlpHome;
+        let out = PyList::empty_bound(py);
+        for (path, home) in otlp::map::WIRE_FIELDS {
+            let (kind, text) = match home {
+                OtlpHome::Attribute(key) => ("attribute", *key),
+                OtlpHome::Projected(where_) => ("projected", *where_),
+                OtlpHome::NotExported(why) => ("not_exported", *why),
+            };
+            out.append((*path, kind, text))?;
+        }
+        Ok(out.into_py(py))
     })
 }
 
@@ -1927,6 +2091,7 @@ pub fn register(parent: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(encode_otlp_requests, &m)?)?;
     m.add_function(wrap_pyfunction!(decode_otlp_traces, &m)?)?;
     m.add_function(wrap_pyfunction!(vocabulary_tables, &m)?)?;
+    m.add_function(wrap_pyfunction!(otlp_wire_fields, &m)?)?;
     m.add_function(wrap_pyfunction!(pii_name_words, &m)?)?;
     m.add_function(wrap_pyfunction!(pii_name_rules, &m)?)?;
     // Exposed in Python as codec.encode_envelope / codec.decode_envelope
