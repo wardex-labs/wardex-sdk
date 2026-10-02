@@ -233,10 +233,30 @@ All notable changes to this project are documented here. The format follows
   counted under `semantics.request_conversation_shadowed`. On a call whose
   conversation wardex could not read (an unproven HTTP/2 stream, above), the
   request's id does not stand in for yours, which may have won: it rides along
-  the same way, counted under `semantics.request_conversation_withheld`. Under
-  the OpenAI Agents adapter this reaches the `chat` spans only: the framework
-  hands `conversation_id` to the model call and never to its trace, so the
-  run's own spans carry it only when `group_id` names it too.
+  the same way, counted under `semantics.request_conversation_withheld`.
+- **OpenAI Agents: a run's `conversation_id` is the conversation id of every
+  span of the run.** `Runner.run(conversation_id=…)`, `run_sync` and
+  `run_streamed` put that id in every request and never in the framework's
+  trace, so the run's root, agents, tools and handoffs carried no
+  conversation while its LLM calls carried this one, and a backend filter on
+  the id found the calls without the run around them. The adapter now wraps
+  those three entry points to read the argument — it changes no argument,
+  result or exception, and holds none of the call's arguments while the run
+  executes, so an error the framework redacted stays redacted — and the id is
+  the run's conversation the way a `group_id` is. A run resumed from a
+  `RunState` without one continues the id the state recorded, as the
+  framework does. Each call reads its own id on its own task or thread, so
+  runs gathered on one loop or run on separate threads never carry each
+  other's. Precedence: your own `wardex.conversation(...)` wins over
+  everything, as before; when `RunConfig(group_id=…)` is set, nothing
+  changes — the group id stays the run's conversation and the requests' own
+  id rides along on each LLM call as `wardex.openai.conversation_id`; only
+  with no `group_id` does `conversation_id` become the run's conversation id.
+  Under your own `with trace(...)` around one or more runs, the root is your
+  trace's and carries no run's id; each run's top-level agents state their
+  call's id, and everything under them inherits it (a `group_id` on that
+  trace still wins). If a future release moves these entry points, the
+  adapter says so once and the id reaches the LLM calls alone, as before.
 - **Concurrent `wardex.conversation()` blocks no longer lend each other their
   ids.** The block wrote its id onto a scope object that every task of an
   `asyncio.gather` — and every thread `bind_context` carried — shares, so work

@@ -50,6 +50,7 @@ from wardex_sdk._adapters._registry import get_registry
 from wardex_sdk._assembly import Limitation, LinkReason, ParentSource, counters
 from wardex_sdk._config import AdaptersConfig
 from wardex_sdk._enums import AdapterName, SpanKind, StatusCode
+from wardex_sdk._semantics import REQUEST_CONVERSATION_KEY
 from wardex_sdk.testing import RecordingTransport, installed_adapter
 
 pytestmark = pytest.mark.usefixtures("fresh_counters")
@@ -1415,7 +1416,9 @@ def test_two_handoffs_in_one_response_mark_the_handoff_and_nothing_else(agents_e
 _ROOT = "invoke_workflow wf"
 
 
-def _assert_three_turn_tree(spans: list[Any], *, streamed: bool) -> None:
+def _assert_three_turn_tree(
+    spans: list[Any], *, streamed: bool, conversation: str = "conv-123"
+) -> None:
     """The target tree: 8 spans, 1 trace, every edge read from the context,
     chains asserted by span id, and the joins that make the tree navigable."""
     assert len(spans) == 8
@@ -1463,9 +1466,9 @@ def _assert_three_turn_tree(spans: list[Any], *, streamed: bool) -> None:
     # `chat` spans, which the byte seam latches at request time beside the
     # parent off the run's pinned carrier
     for s in _adapter_spans(spans):
-        assert s.conversation is not None and s.conversation.conversation_id == "conv-123"
+        assert s.conversation is not None and s.conversation.conversation_id == conversation
     for c in chats:
-        assert c.conversation is not None and c.conversation.conversation_id == "conv-123"
+        assert c.conversation is not None and c.conversation.conversation_id == conversation
     # no usage anywhere but the wire
     for s in _adapter_spans(spans):
         assert s.gen_ai is None
@@ -1596,13 +1599,13 @@ def test_the_runs_conversation_wins_over_the_requests_own(agents_env):
     assert attrs["chat gpt-4o-mini"]["wardex.openai.conversation_id"] == "conv_1"
 
 
-def test_concurrent_runs_chat_spans_carry_the_conversation_each_request_names(agents_env):
+def test_concurrent_runs_each_carry_the_conversation_their_call_names(agents_env):
     """`Runner.run(conversation_id=…)` with the adapter ON and no `group_id`,
-    two runs at once naming different conversations. The framework hands that
-    id to the model call and never to its trace, so the run opens with none;
-    the `chat` spans still carry it, read off each request's own
-    `conversation`. Each run's spans carry its own id or none, never the
-    other run's."""
+    two runs at once naming different conversations under `asyncio.gather`.
+    The framework hands that id to the model call and never to its trace; the
+    entry hook reads it off each call, on each call's own task. Every span of
+    each run — root, agents, tool, handoff, LLM calls — carries its own id,
+    never the other run's."""
 
     async def both() -> list[Any]:
         return await asyncio.gather(
@@ -1629,11 +1632,349 @@ def test_concurrent_runs_chat_spans_carry_the_conversation_each_request_names(ag
         chats = _chat_spans(trace)
         assert len(chats) == 3
         (cid,) = {c.conversation.conversation_id for c in chats if c.conversation is not None}
-        assert all(c.conversation is not None for c in chats)
-        carried = {s.conversation.conversation_id for s in trace if s.conversation is not None}
+        assert all(s.conversation is not None for s in trace), [s.name for s in trace]
+        carried = {s.conversation.conversation_id for s in trace}
         assert carried == {cid}, [(s.name, s.conversation) for s in trace]
+        assert len(_adapter_spans(trace)) == 5
         named.append(cid)
     assert sorted(named) == ["convA", "convB"]
+
+
+def _no_group() -> RunConfig:
+    """Fresh per run, like `_run_config`, and naming no `group_id`."""
+    return RunConfig(workflow_name="wf")
+
+
+def _drive(entry: str, **kwargs: Any) -> Any:
+    """The three-turn run through one entry point, drained, its final output.
+
+    `run_streamed_positional` passes every argument up to `conversation_id`
+    by position, the one entry point whose signature allows it."""
+    if entry == "run":
+        return asyncio.run(Runner.run(_agents(), "hi", **kwargs)).final_output
+    if entry == "run_sync":
+        return Runner.run_sync(_agents(), "hi", **kwargs).final_output
+
+    async def go() -> Any:
+        if entry == "run_streamed_positional":
+            cid = kwargs.pop("conversation_id")
+            config = kwargs.pop("run_config")
+            result = Runner.run_streamed(_agents(), "hi", None, 10, None, config, None, False, cid)
+        else:
+            result = Runner.run_streamed(_agents(), "hi", **kwargs)
+        async for _ in result.stream_events():
+            pass
+        return result.final_output
+
+    return asyncio.run(go())
+
+
+@pytest.mark.parametrize("entry", ["run", "run_sync", "run_streamed", "run_streamed_positional"])
+def test_a_runs_conversation_id_is_the_conversation_of_every_span_of_the_run(agents_env, entry):
+    """`Runner.run(conversation_id=…)` and no `group_id`: the framework puts
+    the id in every request and never in its trace, so the run's own spans
+    used to carry none while its LLM calls carried it. The entry hook reads the
+    argument, and the id is the run's conversation: on the root, both agents,
+    the tool, the handoff marker and the three LLM calls, through each entry
+    point. Nothing shadows anything, so nothing rides along."""
+    transport = _init()
+    try:
+        assert _drive(entry, run_config=_no_group(), conversation_id="conv_1") == "done"
+        spans = _spans()
+        _assert_three_turn_tree(
+            spans, streamed=entry.startswith("run_streamed"), conversation="conv_1"
+        )
+        _assert_counters_clean()
+        assert counters.get("semantics.request_conversation_shadowed") == 0
+    finally:
+        wardex.close()
+    for s in spans:
+        assert REQUEST_CONVERSATION_KEY not in _extra(s), s.name
+    attrs = _otlp_attributes(transport)
+    for name in (
+        _ROOT,
+        "invoke_agent agent_a",
+        "invoke_agent agent_b",
+        "handoff agent_a→agent_b",
+        "execute_tool get_weather",
+        "chat gpt-4o-mini",
+    ):
+        assert attrs[name]["gen_ai.conversation.id"] == "conv_1", name
+
+
+def test_a_host_conversation_wins_over_the_runs_conversation_id(agents_env):
+    """HOST WINS, the rule a `group_id` follows: inside `wardex.conversation`
+    every span of the run carries the host's id, and the run's own id rides
+    along on each LLM call whose request named it."""
+    _init()
+    try:
+        with wardex.conversation("host", id="host-1"):
+            assert _drive("run", run_config=_no_group(), conversation_id="conv_1") == "done"
+        spans = _spans()
+        shadowed = counters.get("adapters.openai_agents.conversation_id_shadowed_by_host")
+        assert shadowed == 1
+    finally:
+        wardex.close()
+    for s in spans:
+        assert s.conversation is not None and s.conversation.conversation_id == "host-1", s.name
+    chats = _chat_spans(spans)
+    assert len(chats) == 3
+    for c in chats:
+        assert _extra(c)[REQUEST_CONVERSATION_KEY] == "conv_1"
+    for s in _adapter_spans(spans):
+        assert REQUEST_CONVERSATION_KEY not in _extra(s), s.name
+
+
+def _decide_weather_then_done(inp: object) -> list[dict]:
+    if _outputs_done(inp) == 0:
+        return [_fc("get_weather", "call_w", '{"city":"Seoul"}')]
+    return _DONE
+
+
+def _weather(gate: threading.Barrier | None = None) -> Any:
+    from agents import function_tool
+
+    @function_tool
+    def get_weather(city: str) -> str:
+        if gate is not None:
+            gate.wait(10)
+        return f"sunny in {city}"
+
+    return get_weather
+
+
+def _by_agent(spans: list[Any]) -> dict[str, set[str | None]]:
+    """Each top-level agent's subtree's conversation ids, its LLM calls'
+    included: `{agent name: {ids}}`."""
+    kids: dict[Any, list[Any]] = {}
+    for s in spans:
+        kids.setdefault(s.parent_span_id, []).append(s)
+    out: dict[str, set[str | None]] = {}
+    for agent in [s for s in spans if s.name.startswith("invoke_agent ")]:
+        seen: set[str | None] = set()
+        todo = [agent]
+        while todo:
+            s = todo.pop()
+            seen.add(s.conversation.conversation_id if s.conversation is not None else None)
+            todo += kids.get(s.context.span_id, [])
+        out[agent.agent.name] = seen
+    return out
+
+
+def test_runs_gathered_under_the_hosts_own_trace_each_carry_their_call_id(agents_env, scenario):
+    """The framework's parallelization pattern: several `Runner.run`s gathered
+    under ONE `with trace(...)`. The root is the host's trace and no one call's,
+    so it states no id; each call's top-level agent states its own, and its
+    tool and LLM calls inherit it. No id crosses from one call to the other."""
+    from agents.tracing import trace
+
+    scenario(_decide_weather_then_done)
+    gate = threading.Barrier(2)
+    agents = {
+        name: Agent(name=name, instructions=name, tools=[_weather(gate)], model="gpt-4o-mini")
+        for name in ("agent_a", "agent_b")
+    }
+
+    async def both() -> list[Any]:
+        with trace("wf"):
+            return await asyncio.gather(
+                Runner.run(agents["agent_a"], "hi", conversation_id="convA"),
+                Runner.run(agents["agent_b"], "hi", conversation_id="convB"),
+            )
+
+    _init()
+    try:
+        assert [r.final_output for r in asyncio.run(both())] == ["done", "done"]
+        spans = _spans()
+    finally:
+        wardex.close()
+    assert _one(spans, _ROOT).conversation is None
+    assert _by_agent(spans) == {"agent_a": {"convA"}, "agent_b": {"convB"}}
+    assert len(_chat_spans(spans)) == 4
+    assert len([s for s in spans if s.name == "execute_tool get_weather"]) == 2
+
+
+def test_a_group_id_on_the_hosts_own_trace_wins_over_the_calls_id(agents_env, scenario):
+    """`with trace(..., group_id=…)` around `Runner.run(conversation_id=…)`:
+    the group id is the run's conversation, as it is on `RunConfig`, so the
+    agent states nothing of its own and the call's id rides along on the LLM
+    call only."""
+    from agents.tracing import trace
+
+    scenario(_decide_single)
+
+    async def one() -> Any:
+        with trace("wf", group_id="g-1"):
+            agent = Agent(name="agent_a", instructions="a", model="gpt-4o-mini")
+            return await Runner.run(agent, "hi", conversation_id="conv_1")
+
+    _init()
+    try:
+        assert asyncio.run(one()).final_output == "done"
+        spans = _spans()
+        assert counters.get("adapters.openai_agents.conversation_id_shadowed_by_group_id") == 1
+    finally:
+        wardex.close()
+    for s in spans:
+        assert s.conversation is not None and s.conversation.conversation_id == "g-1", s.name
+    (chat,) = _chat_spans(spans)
+    assert _extra(chat)[REQUEST_CONVERSATION_KEY] == "conv_1"
+
+
+def test_concurrent_run_sync_calls_on_threads_each_carry_their_own_id(agents_env, scenario):
+    """`run_sync` on two threads at once, held inside their tools until both
+    are there: each thread's call reads its own id, on its own loop, and every
+    span of each run carries it."""
+    scenario(_decide_weather_then_done)
+    gate = threading.Barrier(2)
+    out: dict[str, Any] = {}
+
+    def drive(name: str, cid: str) -> None:
+        agent = Agent(name=name, instructions=name, tools=[_weather(gate)], model="gpt-4o-mini")
+        try:
+            out[name] = Runner.run_sync(
+                agent, "hi", conversation_id=cid, run_config=RunConfig(workflow_name=name)
+            ).final_output
+        except BaseException as exc:  # noqa: BLE001 — reported to the test
+            out[name] = exc
+
+    _init()
+    try:
+        threads = [
+            threading.Thread(target=drive, args=(n, c))
+            for n, c in (("agent_a", "convA"), ("agent_b", "convB"))
+        ]
+        for th in threads:
+            th.start()
+        for th in threads:
+            th.join(30)
+        assert out == {"agent_a": "done", "agent_b": "done"}
+        spans = _spans()
+    finally:
+        wardex.close()
+    for name, cid in (("agent_a", "convA"), ("agent_b", "convB")):
+        (root,) = [s for s in spans if s.name == f"invoke_workflow {name}"]
+        trace = [s for s in spans if s.context.trace_id == root.context.trace_id]
+        assert len(trace) == 5, [s.name for s in trace]
+        assert {s.conversation.conversation_id for s in trace if s.conversation} == {cid}
+        assert all(s.conversation is not None for s in trace)
+
+
+def test_a_call_whose_entry_surface_moved_still_runs_and_names_the_llm_calls(
+    agents_env, monkeypatch, wardex_log
+):
+    """Group 3 of the probe declines on its own: with `Runner` unrecognized
+    the entry points are left untouched, said once, and the run still ships
+    its whole tree; the id then reaches only the LLM calls, which read it off
+    the request."""
+    import wardex_sdk._adapters._openai_agents_entry as entry
+
+    monkeypatch.setattr(entry, "_entry_surface", lambda run_mod: None)
+    before = {name: vars(Runner)[name] for name in ("run", "run_sync", "run_streamed")}
+    _init()
+    try:
+        assert {name: vars(Runner)[name] for name in before} == before
+        assert _drive("run", run_config=_no_group(), conversation_id="conv_1") == "done"
+        spans = _spans()
+        assert counters.get("adapters.openai_agents.unsupported_entry_surface") == 1
+    finally:
+        wardex.close()
+    assert len(spans) == 8
+    for s in spans:
+        want = "conv_1" if s.kind is SpanKind.CLIENT else None
+        assert _conv_of(s) == want, s.name
+    assert len([m for m in wardex_log.lines(logging.WARNING) if "entry points" in m]) == 1
+
+
+def _conv_of(span: Any) -> str | None:
+    return span.conversation.conversation_id if span.conversation is not None else None
+
+
+@pytest.mark.parametrize("entry", ["run", "run_sync"])
+def test_a_redacted_error_passes_the_entry_hook_holding_none_of_the_calls_arguments(
+    agents_env, monkeypatch, entry
+):
+    """The framework raises an error whose data it redacted from frames that
+    own no payload: it drops the traceback and clears its own locals first,
+    so an error tracker that records each frame's locals records no input.
+    The wrapper sits in that traceback and must hold no argument either."""
+    from agents import run as run_mod
+    from agents.exceptions import _mark_error_data_redacted
+
+    secret = "SECRET-INPUT-7f3a"
+
+    def boom() -> RuntimeError:
+        err = RuntimeError("redacted")
+        _mark_error_data_redacted(err)
+        return err
+
+    class _Runner:
+        async def run(self, *args: Any, **kwargs: Any) -> Any:
+            raise boom()
+
+        def run_sync(self, *args: Any, **kwargs: Any) -> Any:
+            raise boom()
+
+    monkeypatch.setattr(run_mod, "DEFAULT_AGENT_RUNNER", _Runner())
+    agent = Agent(name="agent_a", instructions="a", model="gpt-4o-mini")
+    _init()
+    try:
+        with pytest.raises(RuntimeError) as info:
+            if entry == "run":
+                asyncio.run(Runner.run(agent, secret, conversation_id="conv_1"))
+            else:
+                Runner.run_sync(agent, secret, conversation_id="conv_1")
+    finally:
+        wardex.close()
+    frames = []
+    tb = info.value.__traceback__
+    while tb is not None:
+        frames.append(tb.tb_frame)
+        tb = tb.tb_next
+    # The first frame is this test's, which holds the secret it passed.
+    assert frames[0].f_code is sys._getframe().f_code
+    assert "entry" in [f.f_code.co_name for f in frames[1:]]
+    for f in frames[1:]:
+        assert secret not in repr(f.f_locals), (f.f_code.co_name, f.f_locals)
+
+
+def test_a_resumed_run_carries_the_conversation_its_state_recorded(agents_env, scenario):
+    """A run interrupted for a tool approval and resumed with
+    `Runner.run(agent, state)` names no id in the second call; the framework
+    continues the conversation the state recorded, and so does every span of
+    the resumed half — its root, agent, tool and LLM call."""
+    from agents import function_tool
+
+    @function_tool(needs_approval=True)
+    def get_weather(city: str) -> str:
+        return f"sunny in {city}"
+
+    # Decided off the tool OUTPUTS in the input: a run the provider holds the
+    # conversation for sends only what is new, so the call itself is gone
+    # from the resumed half's request.
+    scenario(_decide_weather_then_done)
+    agent = Agent(name="agent_a", instructions="a", tools=[get_weather], model="gpt-4o-mini")
+    _init()
+    try:
+
+        async def drive() -> Any:
+            first = await Runner.run(agent, "hi", conversation_id="conv_r")
+            assert first.interruptions, "the approval interrupt did not happen"
+            state = first.to_state()
+            for item in first.interruptions:
+                state.approve(item)
+            return await Runner.run(agent, state)
+
+        assert asyncio.run(drive()).final_output == "done"
+        spans = _spans()
+        assert counters.get("adapters.openai_agents.run_root_reattached") == 1
+    finally:
+        wardex.close()
+    resumed = [s for s in spans if _extra(s).get("wardex.openai_agents.resumed") is True]
+    assert len(resumed) == 1
+    assert len(spans) >= 7, [s.name for s in spans]
+    for s in spans:
+        assert _conv_of(s) == "conv_r", s.name
 
 
 def test_run_sync_three_turns_are_one_tree(agents_env):
