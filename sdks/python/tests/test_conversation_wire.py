@@ -35,7 +35,10 @@ import http.server
 import json
 import pathlib
 import threading
+import uuid
+import warnings
 from collections.abc import Iterator
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
@@ -44,7 +47,7 @@ from hpack import Encoder
 
 import wardex_sdk as wardex
 from test_close_hook import _h2_answer, _h2_open
-from wardex_sdk import _hub, _wardex_native
+from wardex_sdk import PIICategory, PIIConfig, _hub, _tracing, _wardex_native
 from wardex_sdk._assembly import (
     EMPTY_AMBIENT,
     Limitation,
@@ -58,6 +61,7 @@ from wardex_sdk._interceptors._trackers import _Txn, _WebSocketTracker
 from wardex_sdk._semantics import REQUEST_CONVERSATION_KEY
 from wardex_sdk._types import ConversationContext
 from wardex_sdk.testing import RecordingTransport
+from wardex_sdk.transport import Transport
 
 pytestmark = pytest.mark.usefixtures("fresh_counters")
 
@@ -495,6 +499,124 @@ def test_the_hosts_conversation_wins_over_the_request_body(llm):
     assert [(a["gen_ai.conversation.id"], a[REQUEST_CONVERSATION_KEY]) for a in exported] == [
         ("host-9", "conv_body")
     ]
+
+
+# --------------------------------------------------------------------------
+# masking: an id the SDK minted ships as written, anyone else's is judged
+# --------------------------------------------------------------------------
+
+#: A genuine version-4 UUID whose first three groups are all decimal and pass
+#: the card checksum: the card rule rewrites it to `****-****-****-...` unless
+#: the walk recognises the form the SDK mints.
+_MINTED = uuid.UUID("48620579-8682-4828-a0e5-0454f31af317")
+_CARD = "4111111111111111"
+
+
+class _Masked(Transport):
+    """Both wires as they leave the process: masked by the configured rules."""
+
+    def __init__(self) -> None:
+        self.otlp: list[bytes] = []
+        self.envelopes: list[bytes] = []
+
+    def export(self, envelope: Any, *, timeout: float | None = None) -> None:
+        self.otlp.extend(self.encode(envelope, compress=False))
+        self.envelopes.append(
+            _wardex_native.codec.encode_envelope(
+                envelope,
+                self._pii_mode,
+                list(self._pii_disabled),
+                self._limits,
+                **self._pii_names(),
+            )
+        )
+
+
+def _masked_chats(fn) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
+    """Run `fn` with every masking category on but the loopback address's, and
+    return each LLM call's span by the `input` it was sent with — as the
+    envelope decodes and as the OTLP export decodes."""
+    t = _Masked()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        wardex.init(
+            transport=t,
+            pii=PIIConfig(disabled_categories=frozenset({PIICategory.IP_ADDRESS})),
+        )
+    try:
+        fn()
+        _hub.get_client()._settle()
+        wardex.flush()
+    finally:
+        wardex.close()
+    env = {
+        json.loads(it["span"]["input_data"])["input"]: it["span"]
+        for b in t.envelopes
+        for it in _wardex_native.codec.decode_envelope(b)["items"]
+        if "span" in it and it["span"]["name"] == "HTTP POST /v1/responses"
+    }
+    otlp = {
+        json.loads(sp["attributes"]["wardex.input_data"])["input"]: sp["attributes"]
+        for b in t.otlp
+        for rs in _wardex_native.codec.decode_otlp_traces(b)["resource_spans"]
+        for ss in rs["scope_spans"]
+        for sp in ss["spans"]
+        if sp["name"] == "chat gpt-4o-mini"
+    }
+    return env, otlp
+
+
+def _rules(span: dict[str, Any]) -> list[str]:
+    return span.get("capture_integrity", {}).get("redaction_rules", [])
+
+
+def test_a_minted_conversation_id_ships_as_written_on_the_llm_calls_it_reaches(llm, monkeypatch):
+    """`wardex.conversation(name)` with no id mints a version-4 UUID, and the
+    walk leaves that exact form unmasked so the card rule cannot rewrite the
+    one value the block's spans are grouped by. The LLM calls now carry the
+    block's id too, and the exemption has to hold on them as well: the mint is
+    made to return a card-shaped id and the real masking path runs."""
+    assert _MINTED.version == 4 and _MINTED.variant == uuid.RFC_4122
+    monkeypatch.setattr(_tracing, "uuid", SimpleNamespace(uuid4=lambda: _MINTED))
+    host, port = llm
+
+    def run() -> None:
+        with wardex.conversation("minted"):
+            _post(host, port, "minted")
+
+    env, otlp = _masked_chats(run)
+    assert env["minted"]["conversation"]["conversation_id"] == str(_MINTED)
+    assert "credit_card" not in _rules(env["minted"])
+    assert otlp["minted"]["gen_ai.conversation.id"] == str(_MINTED)
+    assert "credit_card" not in otlp["minted"].get("wardex.redaction.rules", "")
+
+
+def test_a_host_or_provider_conversation_id_is_judged_on_the_llm_calls(llm):
+    """The exemption is for the form the SDK mints, not for the field. An id
+    the host names, and one the provider holds that a request body names, are
+    the host's text and its traffic's: the card rule takes a card number in
+    either, on the LLM call that carries it as its conversation and on the one
+    where it rides along beside the host's."""
+    host, port = llm
+
+    def run() -> None:
+        with wardex.conversation("named", id=_CARD):
+            _post(host, port, "host")
+        _post(host, port, "body", conversation=_CARD)
+        with wardex.conversation("named", id="host-1"):
+            _post(host, port, "beside", conversation=_CARD)
+
+    env, otlp = _masked_chats(run)
+    for tag in ("host", "body"):
+        assert _CARD not in env[tag]["conversation"]["conversation_id"], tag
+        assert "credit_card" in _rules(env[tag]), tag
+        assert _CARD not in otlp[tag]["gen_ai.conversation.id"], tag
+    beside = {kv["key"]: kv["value"] for kv in env["beside"]["extra"]}
+    assert env["beside"]["conversation"]["conversation_id"] == "host-1"
+    assert _CARD not in beside[REQUEST_CONVERSATION_KEY]
+    assert "credit_card" in _rules(env["beside"])
+    assert _CARD not in otlp["beside"][REQUEST_CONVERSATION_KEY]
+    assert otlp["beside"]["gen_ai.conversation.id"] == "host-1"
 
 
 # --------------------------------------------------------------------------
