@@ -100,21 +100,20 @@ def _url_target(txn: _Txn, withhold: bool = False) -> str:
     return txn.target
 
 
-def _inflated(txn: _Txn, body: bytes, limits: object | None) -> bytes:
-    """A gzip- or zlib-compressed body as the bytes it carries.
+def _inflated(txn: _Txn, body: bytes, limits: object | None) -> tuple[bytes, bool]:
+    """A gzip- or zlib-compressed body as the bytes it carries, and whether it is just a prefix.
 
     A captured body is what a debugger reads and what masking scans, and
     neither can see through compression: a gzipped OAuth token response
     shipped its `access_token` as base64 anyone could gunzip. Recognised by
     its header, as the semantic parser recognises it.
 
-    Bounded by the smaller of `max_decoded_bytes` and `max_opaque_body_bytes`:
-    the compressed bytes were admitted under some cap, and inflating must not
-    turn a 13 KB download into a multi-megabyte span. A body that inflates
-    past the bound keeps its inflated prefix and marks the transaction
-    truncated — never the compressed bytes, whose secrets anyone could
-    recover. Accepted only when the stream completed, or when a stream cut
-    short (by the capture cap) inflated to text: a plain body that merely
+    Bounded by the smaller of `max_decoded_bytes` and `max_opaque_body_bytes`: the compressed bytes
+    were admitted under some cap, and inflating must not turn a 13 KB download into a
+    multi-megabyte span. A body that inflates past the bound keeps its inflated prefix, marks the
+    transaction truncated and says so (the body's whole content was not read) — never the
+    compressed bytes, whose secrets anyone could recover. Accepted only when the stream completed,
+    or when a stream cut short (by the capture cap) inflated to text: a plain body that merely
     starts like a zlib header decodes to noise, and is returned as it was.
     """
     cap = min(
@@ -126,21 +125,21 @@ def _inflated(txn: _Txn, body: bytes, limits: object | None) -> bytes:
     # which a text body that merely starts with `x` almost never is.
     is_zlib = len(body) >= 2 and body[0] & 0x0F == 8 and (body[0] << 8 | body[1]) % 31 == 0
     if not cap or not (is_gzip or is_zlib):
-        return body
+        return body, False
     result = None
     with guard("interceptors.inflate"):
         result = _inflate_once(body, cap)
     if result is None or not result[0]:
-        return body
+        return body, False
     out, complete = result
     # Text, give or take the one character a cut stream may end inside.
     text_len = len(out.decode("utf-8", "ignore").encode())
     if not complete and len(out) <= cap and text_len < len(out) - 3:
-        return body
+        return body, False
     if len(out) > cap:
         txn.truncated = True
-        return out[:cap]
-    return out
+        return out[:cap], True
+    return out, False
 
 
 def _inflate_once(body: bytes, cap: int) -> tuple[bytes, bool]:

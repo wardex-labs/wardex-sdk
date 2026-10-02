@@ -1006,13 +1006,12 @@ def _assemble(p: _PendingTxn, *, parse: bool, extra: tuple[Limitation, ...]) -> 
     for marker in extra:
         draft.add_limitation(marker)
     if parse_failed:
-        # The parser RAISED (already counted by the guard above): the span
-        # ships saying wardex broke, instead of vanishing with a green
-        # counter — SEMANTIC_PARSE_FAILED would be a lie here (the parser
-        # never returned an answer) and silence was the old defect.
+        # The parser RAISED (already counted by the guard above): the span ships saying wardex
+        # broke, instead of vanishing with a green counter — SEMANTIC_PARSE_FAILED would be a lie
+        # here (the parser never returned an answer) and silence was the old defect.
         draft.add_limitation(Limitation.INSTRUMENTATION_DEGRADED)
 
-    output_data = _inflated(txn, txn.response_body, p.limits)
+    output_data, inflate_cut = _inflated(txn, txn.response_body, p.limits)
     status_code = StatusCode.OK if 200 <= txn.status < 400 else StatusCode.ERROR
     # `finish()` refuses `status=ERROR` with no `error.type` and a refused span is a DELETED span,
     # so this may not be left `None`: without it every 4xx/5xx on every byte seam — the rate limit,
@@ -1030,10 +1029,9 @@ def _assemble(p: _PendingTxn, *, parse: bool, extra: tuple[Limitation, ...]) -> 
         draft.add_limitation(Limitation.GRPC_WEB_UNSUPPORTED)
 
     if p.is_grpc:
-        # gRPC fields; `sem` is None on this path (the parse above skips
-        # gRPC) and the framing walk ALWAYS runs — inline and fallback alike
-        # (there IS no fallback for gRPC: §3.6, nothing was deferred) — so
-        # the GRPC label, status and error type are never downgraded.
+        # gRPC fields; `sem` is None on this path (the parse above skips gRPC) and the framing walk
+        # ALWAYS runs — inline and fallback alike (there IS no fallback for gRPC: §3.6, nothing was
+        # deferred) — so the GRPC label, status and error type are never downgraded.
         _name, status_code, error_type, grpc_extra, grpc_markers = build_grpc_fields(txn, (), ())
         for key, value in grpc_extra:
             draft.set_extra(key, value)
@@ -1125,12 +1123,13 @@ def _assemble(p: _PendingTxn, *, parse: bool, extra: tuple[Limitation, ...]) -> 
         transfer_ms=transfer,
     )
     # SSE if it declared `text/event-stream` (read or not: undecodable, cut by a cap) or a parse
-    # read it as SSE. Not SSE only if the WHOLE body read as something else; a body cut by its cap,
-    # in a coding the SDK did not undo (`br`, raw deflate), not text, or not parsed: unset.
+    # read it as SSE. Not SSE only if the WHOLE body read as something else; a body cut by its cap
+    # (as sent, or once inflated), in a coding the SDK did not undo (`br`, raw deflate), not text,
+    # or not parsed: unset.
     body_read = parse and not parse_failed and not p.is_grpc
     if txn.event_stream or (body_read and getattr(sem, "reassembled_from_stream", False)):
         streamed = True
-    elif body_read and txn.response_counted:
+    elif body_read and txn.response_counted and not inflate_cut:
         streamed = sniff_decoded_body(txn.content_encoding, txn.response_body, output_data)
     else:
         streamed = None
@@ -1156,7 +1155,8 @@ def _assemble(p: _PendingTxn, *, parse: bool, extra: tuple[Limitation, ...]) -> 
         # "attempted and succeeded", not "non-empty": the seam read both
         # bodies off the tracker, and a zero-length body is a captured
         # zero-length body. Withheld only under §3.9's restraint above.
-        draft.set_io(input_data=_inflated(txn, txn.request_body, p.limits), output_data=output_data)
+        input_data, _ = _inflated(txn, txn.request_body, p.limits)
+        draft.set_io(input_data=input_data, output_data=output_data)
     draft.integrity.truncated(txn.truncated)
     return draft.finish(txn.end_ns)
 

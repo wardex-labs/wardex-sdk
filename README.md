@@ -885,7 +885,8 @@ diagnostic line (traceback under `debug=True`).
   carries none. A response is a stream when it declared `text/event-stream`
   or its body read as one, and not a stream when it declared none and its
   whole body read as something else; with no declaration, a body that did
-  not read as one and was cut by its capture limit, is in a
+  not read as one and was cut by its capture limit (as sent, or once
+  inflated: see Compressed bodies), is in a
   `Content-Encoding` the SDK does not inflate (it inflates one gzip or zlib
   layer; `br`, `zstd` and raw deflate stay unread, whatever their bytes look
   like), or is not text (binary) says neither

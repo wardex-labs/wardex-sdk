@@ -119,8 +119,9 @@ All notable changes to this project are documented here. The format follows
   body read as a Server-Sent Events stream, `false` when it declared none and
   its whole body read as something else (JSON, or text with no event line),
   and unset when it declared none and its body was not read: not parsed, cut
-  by the capture limit, in a `Content-Encoding` the SDK does not inflate, or
-  not text (binary); the five `TransportTiming` intervals are unset when
+  by the capture limit (as sent, or when inflating a gzip or zlib body, past
+  the smaller of `max_decoded_bytes` and `max_opaque_body_bytes`), in a
+  `Content-Encoding` the SDK does not inflate, or not text (binary); the five `TransportTiming` intervals are unset when
   they were not measured — including a connect time the seam marks
   `connect_timing_unavailable` (a socket connected before `init` and
   TLS-wrapped after it among them, and a plaintext connection opened by

@@ -525,12 +525,13 @@ def test_inflation_is_bounded_marked_and_never_invents_a_body():
         max_opaque_body_bytes = 4096
 
     plain = b"HK: hello this is a plain text body that only starts like zlib"
-    assert _inflated(_T(), plain, _L()) is plain
+    out, cut = _inflated(_T(), plain, _L())
+    assert out is plain and cut is False
     txn = _T()
     big = gzip.compress(b'{"access_token": "BIG"}' + b" " * 5000)
-    out = _inflated(txn, big, _L())
+    out, cut = _inflated(txn, big, _L())
     assert out.startswith(b'{"access_token": "BIG"}') and len(out) == 1024
-    assert txn.truncated is True
+    assert txn.truncated is True and cut is True
     small = _T()
-    assert _inflated(small, zlib.compress(b"q=seoul"), _L()) == b"q=seoul"
+    assert _inflated(small, zlib.compress(b"q=seoul"), _L()) == (b"q=seoul", False)
     assert small.truncated is False

@@ -492,6 +492,23 @@ def test_a_body_the_sdk_inflated_is_read_whole():
     assert _is_streaming(gzip.compress(_korean_sse(3)), gzipped) == (True, True)
 
 
+def test_a_body_inflated_only_as_far_as_its_cap_says_nothing():
+    """A gzip body the SDK inflated only up to its cap was read as a prefix, and
+    `false` says the WHOLE body read as something else. The event lines here sit
+    past the cap, so a prefix of comments read as "not a stream" while the
+    same body sent uncompressed reads as one."""
+    body = b": keepalive\n" * 2000 + b'event: done\ndata: {"ok": 1}\n\n'
+    caps = LimitsConfig(max_decoded_bytes=4096, max_opaque_body_bytes=4096)
+    plain = {"Content-Type": "text/plain"}
+    gzipped = {**plain, "Content-Encoding": "gzip"}
+    assert len(body) > 4 * 4096
+    assert _is_streaming(gzip.compress(body), gzipped, limits=caps) == (None, None)
+    # The controls: inflated whole, the same body reads as a stream, and a
+    # body that is not one still reads as not one.
+    assert _is_streaming(gzip.compress(body), gzipped) == (True, True)
+    assert _is_streaming(gzip.compress(_JSON), gzipped, limits=caps) == (False, False)
+
+
 def test_a_host_span_cannot_ship_a_transport_reading_the_sdk_never_made():
     """`wardex.transport.*` on OTLP is what the SDK observed. A host's own span
     that sets one of those names observed no transport, so none ships; on a
