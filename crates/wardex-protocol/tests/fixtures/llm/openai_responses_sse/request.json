@@ -1,5 +1,8 @@
 {
  "model": "gpt-4.1",
  "input": "Say hello.",
- "stream": true
+ "stream": true,
+ "conversation": {
+  "id": "conv_fx_sse"
+ }
 }

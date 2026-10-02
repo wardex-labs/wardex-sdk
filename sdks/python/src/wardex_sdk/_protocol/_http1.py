@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import zlib
+
 from .. import _wardex_native
-from .._assembly import Limitation, counters
+from .._assembly import Limitation, counters, guard
 from .._enums import Protocol
 from .._types import ParsedMessage
 from ._base import ProtocolParserInterface
@@ -56,7 +58,7 @@ def declares_event_stream(content_type: str | None) -> bool:
 
 
 #: The one coding layer the SDK undoes. Both inflaters (the semantic parser's and
-#: `_interceptors/_trackers.py::_inflated`) recognise gzip and zlib by the bytes' own header.
+#: `inflate_body` below) recognise gzip and zlib by the bytes' own header.
 _INFLATED_CODINGS = frozenset({"gzip", "x-gzip", "deflate"})
 
 
@@ -139,3 +141,51 @@ class Http1RequestParser(_Http1Parser):
 class Http1ResponseParser(_Http1Parser):
     def __init__(self, limits: object | None = None) -> None:
         super().__init__(False, limits)
+
+
+def inflate_body(body: bytes, limits: object | None) -> tuple[bytes, bool]:
+    """A gzip- or zlib-compressed body as the bytes it carries, and whether it is just a prefix.
+
+    A captured body is what a debugger reads and what masking scans, and
+    neither can see through compression: a gzipped OAuth token response
+    shipped its `access_token` as base64 anyone could gunzip. Recognised by
+    its header, as the semantic parser recognises it.
+
+    Bounded by the smaller of `max_decoded_bytes` and `max_opaque_body_bytes`: the compressed bytes
+    were admitted under some cap, and inflating must not turn a 13 KB download into a
+    multi-megabyte span. A body that inflates past the bound keeps its inflated prefix and says so
+    (the body's whole content was not read), and the caller marks the transaction truncated —
+    never the compressed bytes, whose secrets anyone could recover. Accepted only when the stream
+    completed, or when a stream cut short (by the capture cap) inflated to text: a plain body that
+    merely starts like a zlib header decodes to noise, and is returned as it was.
+    """
+    cap = min(
+        getattr(limits, "max_decoded_bytes", 0) or 0,
+        getattr(limits, "max_opaque_body_bytes", 0) or 0,
+    )
+    is_gzip = body[:2] == b"\x1f\x8b"
+    # A zlib header: deflate method, and a check value divisible by 31 —
+    # which a text body that merely starts with `x` almost never is.
+    is_zlib = len(body) >= 2 and body[0] & 0x0F == 8 and (body[0] << 8 | body[1]) % 31 == 0
+    if not cap or not (is_gzip or is_zlib):
+        return body, False
+    result = None
+    with guard("interceptors.inflate"):
+        result = _inflate_once(body, cap)
+    if result is None or not result[0]:
+        return body, False
+    out, complete = result
+    # Text, give or take the one character a cut stream may end inside.
+    text_len = len(out.decode("utf-8", "ignore").encode())
+    if not complete and len(out) <= cap and text_len < len(out) - 3:
+        return body, False
+    if len(out) > cap:
+        return out[:cap], True
+    return out, False
+
+
+def _inflate_once(body: bytes, cap: int) -> tuple[bytes, bool]:
+    """Up to `cap + 1` inflated bytes, and whether the stream completed."""
+    inflater = zlib.decompressobj(wbits=47)  # 47: a gzip or a zlib header
+    out = inflater.decompress(body, cap + 1)
+    return out, inflater.eof

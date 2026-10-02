@@ -70,6 +70,7 @@ _OA = "_adapters/_openai_agents.py"
 _LG = "_adapters/_langgraph.py"
 _AS = "_adapters/_assembler.py"
 _SEAM = "_interceptors/_seam.py"
+_GENAI = "_semantics/_genai.py"
 
 #: Every `set_extra` call in the package: (module, key as written, value as
 #: written) and where the value comes from. One row per call, so a key written
@@ -151,6 +152,12 @@ _SITES: list[tuple[str, str, str, str]] = [
     (_SEAM, "'gen_ai.output.messages'", "om", HOST),
     (_SEAM, "'gen_ai.input.messages'", "im", HOST),
     (_SEAM, "'gen_ai.system_instructions'", "si", HOST),
+    # -- the semantics layer --
+    # The conversation a Responses request body names: the provider's id for a
+    # conversation it holds, put in the request by the host or its framework.
+    # Traffic, so judged like any other text the request carried.
+    (_GENAI, "REQUEST_CONVERSATION_KEY", "stated", HOST),
+    (_GENAI, "REQUEST_CONVERSATION_KEY", "stated", HOST),
     # -- the published API: `Span.set_attribute` and a snapshot's attributes --
     ("_tracing.py", "key", "value", HOST),
     ("_assembly/_snapshot.py", "key", "value", HOST),

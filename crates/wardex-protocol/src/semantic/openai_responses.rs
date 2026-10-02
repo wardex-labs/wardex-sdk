@@ -79,8 +79,25 @@ struct ResponsesRequest {
     service_tier: Option<String>,
     #[serde(default)]
     previous_response_id: Option<String>,
+    /// A `Value` rather than a typed enum: the field is a string OR an
+    /// object, and a typed shape that did not match would fail the whole
+    /// request half — model, input, every parameter — over one field.
+    #[serde(default)]
+    conversation: Option<serde_json::Value>,
     #[serde(default)]
     text: Option<serde_json::Value>,
+}
+
+/// The id a Responses request's `conversation` field names: the bare string,
+/// or the object form's `id`. Anything else — an empty id, a number, an object
+/// without one — names no conversation, and none is made up in its place.
+fn conversation_id(v: Option<&serde_json::Value>) -> Option<String> {
+    let id = match v? {
+        serde_json::Value::String(s) => s.as_str(),
+        serde_json::Value::Object(o) => o.get("id")?.as_str()?,
+        _ => return None,
+    };
+    (!id.is_empty()).then(|| id.to_string())
 }
 
 #[derive(Deserialize)]
@@ -211,6 +228,7 @@ pub(super) fn fill_openai_responses(
             out.request_service_tier = Some(v);
         }
         out.previous_response_id = q.previous_response_id;
+        out.conversation_id = conversation_id(q.conversation.as_ref());
         if let Some(effort) = q
             .reasoning
             .as_ref()

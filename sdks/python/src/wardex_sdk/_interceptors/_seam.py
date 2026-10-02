@@ -37,9 +37,11 @@ from .._enums import (
     StatusCode,
 )
 from .._limits import LimitsConfig, LimitsConsumer, limits_kwargs
-from .._protocol import classify_path, classify_ws_upgrade, parse_llm_semantics, sniff_decoded_body
+from .._protocol import classify_path, classify_ws_upgrade, parse_llm_semantics
+from .._protocol._http1 import inflate_body, sniff_decoded_body
 from .._semantics import (
     USAGE_DROPPED_KEY,
+    apply_request_conversation,
     build_gen_ai,
     build_grpc_fields,
     embeddings_attrs,
@@ -59,7 +61,7 @@ from ._base import InterceptorInterface
 from ._close_hook import install_shared_close_hook, on_close, uninstall_shared_close_hook
 from ._conn_timing import install_shared_timing, opening_timing, uninstall_shared_timing
 from ._peer import UNRESOLVED_HOST, UNRESOLVED_PORT, peer_address, placeholder_host
-from ._trackers import _inflated, _Txn, _url_target, _WebSocketTracker
+from ._trackers import _Txn, _url_target, _WebSocketTracker
 
 if TYPE_CHECKING:
     from .._client import Client
@@ -178,10 +180,9 @@ class _ConnectionState:
         self.timing_consumed = False
         self.h2_opening: tuple[Any, ...] | None = None  # see `opening_timing`
         self.gate: str | None = None  # None=undetermined, "http", "h2c", "h2", "ignore"
-        # This state was built for a socket that OUTLIVED an os.fork(): the
-        # tracker starts mid-stream, so the first span assembled from it
-        # carries `TRACKING_RESET_AT_FORK` (once — the stamp clears it). Set
-        # by `_state` from the seam's fork latch, never by the trackers.
+        # This state was built for a socket that OUTLIVED an os.fork(): the tracker starts
+        # mid-stream, so the first span assembled from it carries `TRACKING_RESET_AT_FORK` (once —
+        # the stamp clears it). Set by `_state` from the seam's fork latch, never by the trackers.
         self.reset_at_fork = False
         # Guards the once-per-connection debug log below. Deliberately a separate field from `gate`:
         # `gate` is owned by the plaintext seam's protocol sniff-latch (_socket.py), which never
@@ -470,10 +471,9 @@ class ByteSeamInterceptor(InterceptorInterface):
                 oldest = self._conns.pop(next(iter(self._conns)))
                 self._retire(oldest, Limitation.CONNECTION_EVICTED, still_open=True)
             self._conns[cid] = st
-            # The hook closes over the ID, never over `obj`: an eviction
-            # mechanism that referenced the socket would keep the host's file
-            # descriptor open for as long as this seam is installed, which is a
-            # worse bug than the one it fixes (see `_close_hook`).
+            # The hook closes over the ID, never over `obj`: an eviction mechanism that referenced
+            # the socket would keep the host's file descriptor open for as long as this seam is
+            # installed, which is a worse bug than the one it fixes (see `_close_hook`).
             on_close(obj, partial(self._connection_closed, cid))
         return st
 
@@ -555,6 +555,7 @@ class ByteSeamInterceptor(InterceptorInterface):
                     deflate=txn.ws_deflate,
                     parent=txn.parent,
                     parent_closed=txn.parent_closed,
+                    conversation=txn.conversation,
                     start_ns=txn.start_ns,
                     limits=self._native_limits,
                     llm_upgrade=classify_ws_upgrade(url_host, txn.ws_upgrade_path or "/"),
@@ -720,11 +721,10 @@ class ByteSeamInterceptor(InterceptorInterface):
             client.capture_span(span)
 
     def _build_ws_span(self, st: _ConnectionState, txn: _Txn, whole: bool) -> Any:
-        # The tracker's LLM-transport answer and an unread peer (`_peer.py`),
-        # counted HERE and BEFORE the gate: every `interceptors.seam.*` bump
-        # lives in this module, and a span the mode refuses must still count —
-        # the counter is its only trace under the default mode. Once per
-        # connection, because the WS span is built once, at close.
+        # The tracker's LLM-transport answer and an unread peer (`_peer.py`), counted HERE and
+        # BEFORE the gate: every `interceptors.seam.*` bump lives in this module, and a span the
+        # mode refuses must still count — the counter is its only trace under the default mode.
+        # Once per connection, because the WS span is built once, at close.
         if txn.ws_llm_call:
             counters.bump("interceptors.seam.ws_llm_semantics_unread")
         elif txn.ws_llm_unconfirmed:
@@ -965,9 +965,7 @@ def _assemble(p: _PendingTxn, *, parse: bool, extra: tuple[Limitation, ...]) -> 
     )
 
     edge = resolve_observed(
-        _latched(txn),
-        parent_closed=txn.parent_closed,
-        parent_evicted=txn.parent_evicted,
+        _latched(txn), parent_closed=txn.parent_closed, parent_evicted=txn.parent_evicted
     )
     # `:0` too; see `_peer.py`. The target keeps its query unless the bodies are withheld.
     url = f"{p.url_scheme}://{p.url_host}:{p.server_port}{_url_target(txn, withhold_bodies)}"
@@ -1010,7 +1008,8 @@ def _assemble(p: _PendingTxn, *, parse: bool, extra: tuple[Limitation, ...]) -> 
         # here (the parser never returned an answer) and silence was the old defect.
         draft.add_limitation(Limitation.INSTRUMENTATION_DEGRADED)
 
-    output_data, inflate_cut = _inflated(txn, txn.response_body, p.limits)
+    output_data, inflate_cut = inflate_body(txn.response_body, p.limits)
+    txn.truncated |= inflate_cut  # a prefix of what it inflated to
     status_code = StatusCode.OK if 200 <= txn.status < 400 else StatusCode.ERROR
     # `finish()` refuses `status=ERROR` with no `error.type` and a refused span is a DELETED span,
     # so this may not be left `None`: without it every 4xx/5xx on every byte seam — the rate limit,
@@ -1053,6 +1052,8 @@ def _assemble(p: _PendingTxn, *, parse: bool, extra: tuple[Limitation, ...]) -> 
             identified = _is_llm_traffic(txn, sem)
             if identified:
                 draft.set_gen_ai(build_gen_ai(sem))
+                known = txn.issuer_proven and not txn.parent_closed  # closed: refused at the edge
+                apply_request_conversation(draft, edge.conversation, sem.conversation_id, known)
                 if (limitation := provider_limitation(sem)) is not None:
                     draft.add_limitation(limitation)  # the label above is a guess
                 # The open half rides only on an IDENTIFIED span: the `openai.*` scalars, the
@@ -1155,7 +1156,8 @@ def _assemble(p: _PendingTxn, *, parse: bool, extra: tuple[Limitation, ...]) -> 
         # "attempted and succeeded", not "non-empty": the seam read both
         # bodies off the tracker, and a zero-length body is a captured
         # zero-length body. Withheld only under §3.9's restraint above.
-        input_data, _ = _inflated(txn, txn.request_body, p.limits)
+        input_data, input_cut = inflate_body(txn.request_body, p.limits)
+        txn.truncated |= input_cut
         draft.set_io(input_data=input_data, output_data=output_data)
     draft.integrity.truncated(txn.truncated)
     return draft.finish(txn.end_ns)
@@ -1174,14 +1176,11 @@ def _latched(txn: _Txn) -> Ambient:
     the shape `resolve_parentage` consumes, not a place to keep one seam's
     bookkeeping. `_build_span` and `_build_ws_span` pass it explicitly.
 
-    `conversation` and `tracestate` are None because the tracker latches neither
-    today; that is exactly the pre-existing behaviour (the seam never set
-    `InternalSpan.conversation`), and widening the latch to a full `Ambient`
-    belongs with the seam decomposition (design §3.3) — it is a change to what
-    the tracker captures at request time, not to how this function shapes what
-    it already captured.
+    `conversation` was latched beside the parent, off the same scope read.
+    `tracestate` is None: the tracker does not latch it, and widening to a full
+    `Ambient` belongs with the seam decomposition (design §3.3).
     """
-    return Ambient(span_context=txn.parent, conversation=None, tracestate=None)
+    return Ambient(span_context=txn.parent, conversation=txn.conversation, tracestate=None)
 
 
 def _url_host(obj: Any, st: _ConnectionState) -> str:

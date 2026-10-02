@@ -9,16 +9,16 @@ from __future__ import annotations
 
 import re
 import time
-import zlib
 from dataclasses import dataclass
 from typing import Any
 
 from .. import _hub, _wardex_native
-from .._assembly import Limitation, counters, guard, parent_is_closed_unit
+from .._assembly import Limitation, counters, parent_is_closed_unit
 from .._protocol import WsParser
 from .._protocol._http1 import Http1RequestParser, Http1ResponseParser, declares_event_stream
 from .._protocol._http2 import Http2Parser
-from .._types import SpanContext
+from .._types import ConversationContext, SpanContext
+from ._h2_issuer import IssuerLink
 
 
 def _ttft_from_marks(marks: list[tuple[int, int]], header_len: int, start_ns: int) -> float | None:
@@ -100,55 +100,6 @@ def _url_target(txn: _Txn, withhold: bool = False) -> str:
     return txn.target
 
 
-def _inflated(txn: _Txn, body: bytes, limits: object | None) -> tuple[bytes, bool]:
-    """A gzip- or zlib-compressed body as the bytes it carries, and whether it is just a prefix.
-
-    A captured body is what a debugger reads and what masking scans, and
-    neither can see through compression: a gzipped OAuth token response
-    shipped its `access_token` as base64 anyone could gunzip. Recognised by
-    its header, as the semantic parser recognises it.
-
-    Bounded by the smaller of `max_decoded_bytes` and `max_opaque_body_bytes`: the compressed bytes
-    were admitted under some cap, and inflating must not turn a 13 KB download into a
-    multi-megabyte span. A body that inflates past the bound keeps its inflated prefix, marks the
-    transaction truncated and says so (the body's whole content was not read) — never the
-    compressed bytes, whose secrets anyone could recover. Accepted only when the stream completed,
-    or when a stream cut short (by the capture cap) inflated to text: a plain body that merely
-    starts like a zlib header decodes to noise, and is returned as it was.
-    """
-    cap = min(
-        getattr(limits, "max_decoded_bytes", 0) or 0,
-        getattr(limits, "max_opaque_body_bytes", 0) or 0,
-    )
-    is_gzip = body[:2] == b"\x1f\x8b"
-    # A zlib header: deflate method, and a check value divisible by 31 —
-    # which a text body that merely starts with `x` almost never is.
-    is_zlib = len(body) >= 2 and body[0] & 0x0F == 8 and (body[0] << 8 | body[1]) % 31 == 0
-    if not cap or not (is_gzip or is_zlib):
-        return body, False
-    result = None
-    with guard("interceptors.inflate"):
-        result = _inflate_once(body, cap)
-    if result is None or not result[0]:
-        return body, False
-    out, complete = result
-    # Text, give or take the one character a cut stream may end inside.
-    text_len = len(out.decode("utf-8", "ignore").encode())
-    if not complete and len(out) <= cap and text_len < len(out) - 3:
-        return body, False
-    if len(out) > cap:
-        txn.truncated = True
-        return out[:cap], True
-    return out, False
-
-
-def _inflate_once(body: bytes, cap: int) -> tuple[bytes, bool]:
-    """Up to `cap + 1` inflated bytes, and whether the stream completed."""
-    inflater = zlib.decompressobj(wbits=47)  # 47: a gzip or a zlib header
-    out = inflater.decompress(body, cap + 1)
-    return out, inflater.eof
-
-
 def _is_ws_upgrade_request(headers: object) -> bool:
     up = _header_get(headers, "upgrade")
     conn = _header_get(headers, "connection")
@@ -167,6 +118,7 @@ def _is_ws_upgrade_request(headers: object) -> bool:
 #: by the message, which the frame parser already caps. Consulted only when
 #: nothing hides the payload.
 _RESPONSES_CREATE = re.compile(rb'"type"\s*:\s*"response\.create"')
+_StreamLatch = tuple[SpanContext | None, bool, ConversationContext | None, bool, int]
 
 
 @dataclass
@@ -199,6 +151,10 @@ class _Txn:
     #: wardex threw it away, which is a defect the span has to carry rather than
     #: a fact about the traffic. See `assembly._parentage.resolve_observed`.
     parent_evicted: bool = False
+    #: The conversation the request was ISSUED in, latched beside `parent` for the same reason.
+    conversation: ConversationContext | None = None
+    #: False where no h2 issuer was proven (`_h2_issuer`): `conversation` is unknown, not none.
+    issuer_proven: bool = True
     truncated: bool = False
     #: Was every byte of this half counted? False when its body went past the
     #: capture cap (a prefix was kept), the half was lost or never finished
@@ -266,6 +222,7 @@ class _Http1Tracker:
         self._resp_first_ns: int = 0
         self._parent: SpanContext | None = None
         self._parent_closed: bool = False
+        self._conversation: ConversationContext | None = None
         self._resp_cum: int = 0
         self._resp_marks: list[tuple[int, int]] = []
         self._expect_ws: bool = False
@@ -274,7 +231,8 @@ class _Http1Tracker:
     def on_request_bytes(self, data: bytes) -> list[_Txn]:
         if self._req_start_ns == 0:
             self._req_start_ns = time.time_ns()
-            self._parent = _hub.get_current_scope().active_span_context
+            scope = _hub.get_current_scope()  # ONE read: parent and conversation are one fact
+            self._parent, self._conversation = scope.active_span_context, scope.conversation
             # Asked on THIS line, where the request is being issued, so that a
             # context a finished unit left standing is refused before it can
             # become a parent — or open the `capture_mode=AGENT` gate — for
@@ -314,6 +272,7 @@ class _Http1Tracker:
                         response_body=b"",
                         parent=self._parent,
                         parent_closed=self._parent_closed,
+                        conversation=self._conversation,
                         start_ns=self._req_start_ns or now,
                         end_ns=now,
                         ttfb_ms=None,
@@ -358,6 +317,7 @@ class _Http1Tracker:
                     response_body=msg.body,
                     parent=self._parent,
                     parent_closed=self._parent_closed,
+                    conversation=self._conversation,
                     start_ns=self._req_start_ns or now,
                     end_ns=now,
                     ttfb_ms=ttfb,
@@ -378,7 +338,7 @@ class _Http1Tracker:
             self._req_limitations = ()
             self._req_start_ns = 0
             self._resp_first_ns = 0
-            self._parent = None
+            self._parent = self._conversation = None
             self._parent_closed = False
             self._resp_cum = 0
             self._resp_marks = []
@@ -409,27 +369,27 @@ class _Http2Tracker:
 
     def __init__(self, limits: object | None = None) -> None:
         self._conn = Http2Parser(limits)
-        # stream_id -> (active span at request time, whether that span's unit had already closed
-        # then, request start ns)
+        # stream_id -> (parent span, whether its unit had already closed, the conversation — the
+        # issuer's, where `_h2_issuer` proved it — whether it was proved, request start ns)
         #
         # `_mk` pops on every transaction, so the entries that accumulate are the streams that end
-        # WITHOUT one: RST_STREAM, a GOAWAY that strands everything above `last_stream_id`, a
-        # server that stops mid-response. There is no per-stream close signal to act on — the
-        # parser reports transactions, not stream lifecycles.
+        # WITHOUT one: RST_STREAM, a GOAWAY that strands everything above `last_stream_id`, a server
+        # that stops mid-response. There is no per-stream close signal to act on — the parser
+        # reports transactions, not stream lifecycles.
         #
         # So there are TWO bounds, because the first one is not reachable everywhere.
-        # `on_connection_close` is the honest one and empties this table outright — but it is
-        # driven by the close hook, and the async TLS seam's carrier is an `ssl.SSLObject`: no
-        # `close()` to patch, and pinned by asyncio's `SSLProtocol` for the life of a pooled
-        # connection, so it is neither closed nor collected. That is exactly the h2 keep-alive to a
-        # model provider this leak was found on.
+        # `on_connection_close` is the honest one and empties this table outright — but it is driven
+        # by the close hook, and the async TLS seam's carrier is an `ssl.SSLObject`: no `close()` to
+        # patch, and pinned by asyncio's `SSLProtocol` for the life of a pooled connection, so it is
+        # neither closed nor collected. That is exactly the h2 keep-alive to a model provider this
+        # leak was found on.
         #
         # The close hook now reaches that carrier too, through the protocol's `connection_lost` —
-        # but only where asyncio's own TLS implementation is the one running (not uvloop's) and
-        # only when the pool actually drops the connection, which for a keep-alive to a model
-        # provider may be never. A cap that needs no signal at all is what makes the bound
-        # unconditional, and that is the FIFO cap below.
-        self._latch: dict[int, tuple[SpanContext | None, bool, int]] = {}
+        # but only where asyncio's own TLS implementation is the one running (not uvloop's) and only
+        # when the pool actually drops the connection, which for a keep-alive to a model provider
+        # may be never. A cap that needs no signal at all is what makes the bound unconditional, and
+        # that is the FIFO cap below.
+        self._latch: dict[int, _StreamLatch] = {}
         self._latch_cap = _max_streams(limits)
         #: The highest stream id the cap has evicted, and the whole memory of eviction this tracker
         #: keeps. One integer rather than a set of dropped ids, because a set is the same unbounded
@@ -453,19 +413,23 @@ class _Http2Tracker:
         #: anything this tracker put in the table. Without the floor such a stream reads as evicted
         #: once the cap has run — a span blaming wardex for a parent wardex was never in a position
         #: to hold, and, since `parent_evicted` also opens the AGENT-mode gate, a span whose bodies
-        #: ship under a mode that had filtered it out. Zero means "nothing latched yet", which
-        #: fails the test for every real stream id.
+        #: ship under a mode that had filtered it out. Zero means "nothing latched yet", which fails
+        #: the test for every real stream id.
         self._latch_first = 0
+        #: Who opened each stream, read in the opening call itself (`_h2_issuer`).
+        self._issuers = IssuerLink(self._latch_cap)
 
     def on_request_bytes(self, data: bytes) -> list[_Txn]:
+        self._issuers.see(data)
         opened, txns = self._conn.feed(True, data)
         now = time.time_ns()
+        # The WRITER's scope, which on a shared connection may be any task's: any
+        # of them flushes the others' queued frames. So it is the parent only of
+        # a stream with no proven issuer, and never anyone's conversation.
         parent = _hub.get_current_scope().active_span_context
-        # Asked ONCE per feed rather than once per stream: every stream this
-        # write opened was issued from this carrier at this instant.
         parent_closed = parent_is_closed_unit(parent) if opened else False
         for sid in opened:
-            self._latch[sid] = (parent, parent_closed, now)
+            self._latch[sid] = (*self._issuers.latch(sid, parent, parent_closed), now)
         if opened:
             low = min(opened)
             self._latch_first = low if self._latch_first == 0 else min(self._latch_first, low)
@@ -473,7 +437,7 @@ class _Http2Tracker:
         # is the one likeliest to be stranded already. Lowest by id, not by
         # insertion — a stream announced late (its request body ended after
         # higher ids') is still the oldest request. Losing it costs that stream
-        # its parentage, never a span — `_mk` falls back to (None, False, now)
+        # its parentage, never a span — `_mk` falls back to a parentless entry
         # and says so on the span. `min` is a scan of at most `max_streams + 1`
         # keys, run only on the writes that overflow the cap.
         while len(self._latch) > self._latch_cap:
@@ -519,7 +483,7 @@ class _Http2Tracker:
     def on_connection_close(self, marker: Limitation) -> list[_Txn]:
         """Release the per-stream latch — the eviction the entries were waiting for.
 
-        A latch entry is one `SpanContext` plus two scalars, so this is small
+        A latch entry is two references and two scalars, so this is small
         money per connection and, without the cap in `__init__`, unbounded money
         over a process: an h2 client that resets a stream per cancelled request
         accumulates one entry per cancellation for the life of the connection,
@@ -540,6 +504,7 @@ class _Http2Tracker:
         connection reporting a parent wardex never lost.
         """
         self._latch.clear()
+        self._issuers.clear()
         self._latch_evicted_below = 0
         self._latch_first = 0
         return []
@@ -548,14 +513,14 @@ class _Http2Tracker:
         now = time.time_ns()
         entry = self._latch.pop(t.stream_id, None)
         if entry is None:
-            parent, parent_closed, start = None, False, now
+            parent, parent_closed, conversation, proven, start = None, False, None, False, now
             # The DECISION the cap owes the span. An absent latch entry has two causes that look
-            # identical here and mean opposite things: nothing was ambient when the request went
-            # out (an honest trace root, and under `capture_mode=AGENT` the gate has usually
-            # dropped it long before this line), or a parent WAS latched and the cap discarded it.
-            # Shipping the second as the first is the one degradation a consumer cannot detect
-            # downstream — same edge, same confidence, no marker — so the bound reports itself,
-            # exactly as the unit registry's does when it closes a root at `max_units`.
+            # identical here and mean opposite things: nothing was ambient when the request went out
+            # (an honest trace root, and under `capture_mode=AGENT` the gate has usually dropped it
+            # long before this line), or a parent WAS latched and the cap discarded it. Shipping the
+            # second as the first is the one degradation a consumer cannot detect downstream — same
+            # edge, same confidence, no marker — so the bound reports itself, exactly as the unit
+            # registry's does when it closes a root at `max_units`.
             #
             # A separate `Limitation` member was the alternative and is refused: the vocabulary is
             # closed on the wire, and what a user would read off a new one — "wardex dropped what
@@ -563,23 +528,22 @@ class _Http2Tracker:
             # say, from the site that owns the edge. `resolve_observed` attaches them; this only
             # reports the fact.
             #
-            # It reports the EVICTION and not "a parent was lost", because the two are not
-            # separable from here: what the entry held went with it. That is also why the claim is
-            # never an over-reach on a stream that had no parent to lose — every entry carries the
-            # REQUEST START INSTANT as well, so `start` below is a fabrication on this path
-            # regardless, the span's duration is near-zero and its start is the response instant.
-            # Something that belongs on this span is missing in every case, which is the whole
-            # content of the marker; a second marker for the clock half would split one fact across
-            # two words.
+            # It reports the EVICTION and not "a parent was lost", because the two are not separable
+            # from here: what the entry held went with it. That is also why the claim is never an
+            # over-reach on a stream that had no parent to lose — every entry carries the REQUEST
+            # START INSTANT as well, so `start` below is a fabrication on this path regardless, the
+            # span's duration is near-zero and its start is the response instant. Something that
+            # belongs on this span is missing in every case, which is the whole content of the
+            # marker; a second marker for the clock half would split one fact across two words.
             #
-            # Bounded at BOTH ends, and the floor is not decoration: the mark alone would also
-            # claim a stream opened before capture attached, whose id is below everything this
-            # tracker latched. That claim is not merely imprecise — `parent_evicted` feeds the
-            # capture gate as well as the marker, so a false one exports request and response
-            # bodies under a mode that had filtered the span out.
+            # Bounded at BOTH ends, and the floor is not decoration: the mark alone would also claim
+            # a stream opened before capture attached, whose id is below everything this tracker
+            # latched. That claim is not merely imprecise — `parent_evicted` feeds the capture gate
+            # as well as the marker, so a false one exports request and response bodies under a mode
+            # that had filtered the span out.
             parent_evicted = self._latch_first <= t.stream_id <= self._latch_evicted_below
         else:
-            parent, parent_closed, start = entry
+            parent, parent_closed, conversation, proven, start = entry
             parent_evicted = False
         # The OTHER half of the same bound: the native stream table evicted this stream's request
         # before its response completed. The response is a real observation — a status, an end — so
@@ -602,6 +566,8 @@ class _Http2Tracker:
             parent=parent,
             parent_closed=parent_closed,
             parent_evicted=parent_evicted,
+            conversation=conversation,
+            issuer_proven=proven,
             start_ns=start,
             end_ns=now,
             ttfb_ms=None,  # per-h2-stream first-byte not tracked: not measured
@@ -634,6 +600,7 @@ class _WebSocketTracker:
         limits: object | None = None,
         sample_cap: int | None = None,
         llm_upgrade: str | None = None,
+        conversation: ConversationContext | None = None,
     ) -> None:
         # "known_provider" | "unknown_host" | None: the endpoint table's answer about the upgrade
         # path (`classify_ws_upgrade`), decided by the seam at the swap site. The tracker only
@@ -652,6 +619,10 @@ class _WebSocketTracker:
         # session's parent is the scope that issued the handshake, and so is the
         # question of whether that scope's unit had already died.
         self._parent_closed = parent_closed
+        # The handshake's conversation, kept only while every message the client sends is issued in
+        # it too: the session is ONE span, so a socket reused across conversations names none of
+        # them rather than whichever one happened to open it.
+        self._conversation = conversation
         self._start_ns = start_ns
         # None means "use the core default" — resolved here (rather than hardcoded)
         # so this can never silently drift from crates/wardex-limits.
@@ -682,6 +653,10 @@ class _WebSocketTracker:
             if f.opcode == "close":
                 self._closed = True
         self._sent_msgs += len(r.messages)
+        # A parser that died can no longer tell a message from a frame, so every write counts then.
+        if (r.messages or self._sent.is_disabled()) and self._conversation is not None:
+            if _hub.get_current_scope().conversation != self._conversation:
+                self._conversation = None
         if self._llm_upgrade is not None:
             if r.messages:
                 self._decide_llm(r.messages[0])
@@ -695,14 +670,14 @@ class _WebSocketTracker:
         return self._maybe_emit()
 
     def _decide_llm(self, first: bytes | None) -> None:
-        # Decided once, on the first client message — the moment "a call crossed" becomes true —
-        # or, when the client-direction parser disables before yielding one, on the bytes that
-        # killed it (`first` is None then). The path alone is a suffix match; it is corroborated by
-        # the provider's own host or, when nothing hides the payload (no permessage-deflate, a
-        # readable message), by the Responses envelope itself. The tracker only records the answer
-        # on the `_Txn` it emits at close; the seam reads it there and counts — so the two counters
-        # move when the connection closes, not at this first message, and a span the capture gate
-        # then refuses is still counted.
+        # Decided once, on the first client message — the moment "a call crossed" becomes true — or,
+        # when the client-direction parser disables before yielding one, on the bytes that killed it
+        # (`first` is None then). The path alone is a suffix match; it is corroborated by the
+        # provider's own host or, when nothing hides the payload (no permessage-deflate, a readable
+        # message), by the Responses envelope itself. The tracker only records the answer on the
+        # `_Txn` it emits at close; the seam reads it there and counts — so the two counters move
+        # when the connection closes, not at this first message, and a span the capture gate then
+        # refuses is still counted.
         if self._llm_upgrade == "known_provider" or (
             first is not None and not self._deflate and _RESPONSES_CREATE.search(first) is not None
         ):
@@ -782,6 +757,7 @@ class _WebSocketTracker:
             response_body=bytes(self._sample_out),
             parent=self._parent,
             parent_closed=self._parent_closed,
+            conversation=self._conversation,
             start_ns=self._start_ns,
             end_ns=now,
             ttfb_ms=None,

@@ -304,7 +304,86 @@ All notable changes to this project are documented here. The format follows
   was opened for, said it opened nothing; they now go to stream 1. After a
   `100 Continue`, `ttft_ms` was the arrival of the final response's header
   block rather than of its first body byte.
-
+- **The LLM calls inside a conversation carry its id.** `wardex.conversation()`
+  promised `gen_ai.conversation.id` on every span inside the block, and every
+  span had it except the LLM calls read off the wire — the spans that carry
+  the tokens. The same held under an OpenAI Agents `RunConfig(group_id=…)` and
+  a LangGraph `thread_id`: the run's own spans carried the id, its `chat`
+  spans did not. Grouping a backend's spans by conversation id and summing
+  tokens therefore answered zero for every conversation. Every span the byte
+  seam builds — HTTP/1, HTTP/2 — now carries the conversation its request was
+  issued in, read at the moment the request went out (never when the response
+  came back, by which time your code may be in the next conversation), and a
+  call made outside every conversation still carries none. A WebSocket
+  session is one span for every call on the socket, so it carries a
+  conversation only when its handshake and every message on it were issued in
+  that one; a pooled socket reused across conversations names none of them.
+  On one shared HTTP/2 connection the bytes are no witness — httpx sends
+  every queued frame from whichever task holds the connection — so wardex
+  reads who issued each stream where the `h2` library opens it, and proves
+  which connection carries which `h2` connection object by the very bytes the
+  client writes, over TLS or plaintext h2c, however many connections open at
+  once. A stream it cannot prove that for (an HTTP/2 client not built on `h2`,
+  or one that copies its chunks before writing them) names no conversation,
+  rather than a guessed one.
+- **Concurrent calls on one HTTP/2 connection hang under the span that issued
+  them.** With httpx's `http2=True` (so an OpenAI or Anthropic client built
+  on it) and calls running side by side under `asyncio.gather` or on threads,
+  a call's span was parented under whichever task happened to write the
+  connection's queued frames: under another agent step, another tool, another
+  conversation's block. The parent is now read where the stream is opened,
+  in the task that issued it.
+- **A Responses request's own `conversation` is its conversation id.** With
+  `Runner.run(conversation_id=…)`, or any `POST /v1/responses` that sets
+  `conversation` (the id, or `{"id": …}`), the request names the provider-held
+  conversation it belongs to; that id is now the `chat` span's
+  `gen_ai.conversation.id`. When the call is already inside a conversation —
+  your `wardex.conversation(...)`, or a run that states one — that one wins,
+  the same rule that keeps your id over a framework's `group_id`, and the
+  request's differing id rides along as `wardex.openai.conversation_id`,
+  counted under `semantics.request_conversation_shadowed`. On a call whose
+  conversation wardex could not read (an unproven HTTP/2 stream, above), the
+  request's id does not stand in for yours, which may have won: it rides along
+  the same way, counted under `semantics.request_conversation_withheld`.
+- **OpenAI Agents: a run's `conversation_id` is the conversation id of every
+  span of the run.** `Runner.run(conversation_id=…)`, `run_sync` and
+  `run_streamed` put that id in every request and never in the framework's
+  trace, so the run's root, agents, tools and handoffs carried no
+  conversation while its LLM calls carried this one, and a backend filter on
+  the id found the calls without the run around them. The adapter now wraps
+  those three entry points to read the argument — it changes no argument,
+  result or exception, and holds none of the call's arguments while the run
+  executes, so an error the framework redacted stays redacted — and the id is
+  the run's conversation the way a `group_id` is. A run resumed from a
+  `RunState` without one continues the id the state recorded, as the
+  framework does. Each call reads its own id on its own task or thread, so
+  runs gathered on one loop or run on separate threads never carry each
+  other's. Precedence: your own `wardex.conversation(...)` wins over
+  everything, as before; when `RunConfig(group_id=…)` is set, nothing
+  changes — the group id stays the run's conversation and the requests' own
+  id rides along on each LLM call as `wardex.openai.conversation_id`; only
+  with no `group_id` does `conversation_id` become the run's conversation id.
+  Under your own `with trace(...)` around one or more runs, the root is your
+  trace's and carries no run's id; each run's top-level agents state their
+  call's id, and everything under them inherits it (a `group_id` on that
+  trace still wins). If a future release moves these entry points, the
+  adapter says so once and the id reaches the LLM calls alone, as before.
+- **Concurrent `wardex.conversation()` blocks no longer lend each other their
+  ids.** The block wrote its id onto a scope object that every task of an
+  `asyncio.gather` — and every thread `bind_context` carried — shares, so work
+  running beside an open block outside any conversation picked up that
+  block's id, and once both blocks of a pair had closed, code after them still
+  carried one of their ids. Each block now installs its id on its own copy.
+  That also means a block scopes the context it was entered in, as any context
+  variable does. **A block opened in a plain `def` generator dependency no
+  longer reaches the endpoint.** FastAPI runs that dependency's setup and
+  teardown on a worker thread with a copy of the request's context, and the
+  block reached the endpoint only through that same shared write: the endpoint
+  saw it when a scope was already open above the request (under
+  `WardexAsgiMiddleware`, say), and every concurrent request under that same
+  scope saw it too. It now reaches only that thread's work. Open the block in
+  an `async def` dependency, whose setup FastAPI runs in the request's own
+  task, or inside the endpoint.
 - **Ctrl-C reaches your program while a batch is being exported.** The OTLP
   exporter skips a span it cannot marshal instead of dropping the batch, and
   it treated a `KeyboardInterrupt` or `SystemExit` raised by your code during
@@ -1221,17 +1300,6 @@ the private native encoder returns three values.
   processor in front. The open check is the oracle's Phoenix counterpart
   (the Langfuse e2e driver pointed at a live Phoenix); until someone runs
   it, treat Phoenix cost columns under wardex as unverified.
-
-### Known limitations
-
-- **wardex does not yet surface the request's `conversation` id (no
-  `gen_ai.conversation.id`).** Under openai-agents
-  `Runner.run(conversation_id=…)` the field is on the wire in every request —
-  measured on 0.22 in `tests/test_openai_agents_wire.py`, all three POSTs
-  carry `conversation=conv_1` — so the id that joins the turns is there to be
-  read and wardex simply does not map it onto the span. Nothing about the
-  framework blocks it; it is a wire-side follow-up, not an ecosystem gap.
-
 
 ## [0.5.0b1] - 2026-08-16
 

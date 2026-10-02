@@ -16,9 +16,9 @@ from __future__ import annotations
 
 from typing import Any
 
-from .._assembly import Limitation, counters
+from .._assembly import Limitation, SpanDraft, counters
 from .._enums import OperationName, ProviderName
-from .._types import EmbeddingsAttributes, GenAIAttributes
+from .._types import ConversationContext, EmbeddingsAttributes, GenAIAttributes
 
 _OPERATION_MAP = {"chat": OperationName.CHAT, "embeddings": OperationName.EMBEDDINGS}
 _PROVIDER_MAP = {"openai": ProviderName.OPENAI, "anthropic": ProviderName.ANTHROPIC}
@@ -66,6 +66,12 @@ _PROVIDER_EXTRAS: tuple[tuple[str, str], ...] = (
 #: `usage.dropped_count` leaf of its own under the same spelling.
 USAGE_EXTRA_PREFIX = "wardex.usage."
 USAGE_DROPPED_KEY = "wardex.usage_leaves.dropped_count"
+
+#: Where a request's own conversation id rides when the conversation the request
+#: was issued in names a different one, or could not be read. `wardex.*`, not
+#: `openai.*`: the semconv `openai.*` registry declares no such key, and a key
+#: under a registry prefix that the registry does not hold is a claim nobody made.
+REQUEST_CONVERSATION_KEY = "wardex.openai.conversation_id"
 
 
 def has_core_semantics(sem: Any) -> bool:
@@ -180,3 +186,46 @@ def embeddings_attrs(sem: Any) -> EmbeddingsAttributes | None:
     if dimensions is None:
         return None
     return EmbeddingsAttributes(dimension_count=dimensions)
+
+
+def apply_request_conversation(
+    draft: SpanDraft,
+    latched: ConversationContext | None,
+    stated: str | None,
+    issuer_known: bool = True,
+) -> None:
+    """The conversation a request BODY names (a Responses `conversation`),
+    under the rule an adapter's own conversation id already follows.
+
+    The latched conversation wins. It is the one the request was issued in —
+    the host's `wardex.conversation(...)`, or the run an adapter opened with
+    the framework's group or thread id — and every other span of that
+    conversation already carries it, so the call keeps it: the host's word over
+    a framework's or a provider's. The body's differing id then rides along
+    under `REQUEST_CONVERSATION_KEY` and the shadowing is counted, exactly as a
+    shadowed `group_id` rides on its run root. With nothing latched the body's
+    id IS the conversation — the request said which one it belongs to, and that
+    is not a guess.
+
+    "Nothing latched" has to MEAN the request was issued outside every
+    conversation, and `issuer_known=False` says it does not: the seam could not
+    read who issued the request (an HTTP/2 stream whose opener was not proven,
+    a latch entry that was lost or refused). The host may have been inside a
+    conversation of its own, which would win, so the body's id is not made the
+    conversation on a guess that there was none: it rides along under the same
+    key, and the withholding is counted.
+
+    An absent or empty id says nothing and changes nothing: wardex never mints a
+    conversation for a request that named none.
+    """
+    if not stated:
+        return
+    if latched is not None:
+        if latched.conversation_id != stated:
+            counters.bump("semantics.request_conversation_shadowed")
+            draft.set_extra(REQUEST_CONVERSATION_KEY, stated)
+    elif issuer_known:
+        draft.set_conversation(ConversationContext(conversation_id=stated))
+    else:
+        counters.bump("semantics.request_conversation_withheld")
+        draft.set_extra(REQUEST_CONVERSATION_KEY, stated)

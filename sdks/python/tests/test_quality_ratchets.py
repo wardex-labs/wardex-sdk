@@ -282,10 +282,10 @@ _MODULE_CEILING = 800
 _OVERSIZED_BUDGET = {
     "_assembly/_units.py": 2100,
     "_adapters/_assembler.py": 1934,
-    "_adapters/_openai_agents.py": 1589,
+    "_adapters/_openai_agents.py": 1588,
     "_client.py": 1586,
     "_adapters/_context.py": 1305,
-    "_interceptors/_seam.py": 1192,
+    "_interceptors/_seam.py": 1191,
     "_adapters/_langgraph.py": 1035,
     # Raised by exactly one member (h2_request_evicted, 53): the closed
     # Limitation enum cannot move a member out, and the census demands each

@@ -544,6 +544,40 @@ def test_a_body_inflated_only_as_far_as_its_cap_is_streaming_when_that_part_show
     assert _is_streaming(gzip.compress(big_json), as_json, limits=caps) == (None, None)
 
 
+def test_a_body_inflated_only_as_far_as_its_cap_ships_marked_truncated():
+    """`inflate_body` hands back the prefix and says it is one; the seam marks the
+    span truncated, for a response and for a request body alike."""
+    caps = LimitsConfig(max_decoded_bytes=4096, max_opaque_body_bytes=4096)
+    big = gzip.compress(_korean_sse(200))
+    gzipped = {"Content-Type": "text/plain", "Content-Encoding": "gzip"}
+    got = []
+    for response, headers, request in (
+        (big, gzipped, b"{}"),
+        (_JSON, {"Content-Type": "application/json"}, big),
+        (_JSON, {"Content-Type": "application/json"}, gzip.compress(b"{}")),
+    ):
+        httpd = _serve(response, headers)
+        transport = RecordingTransport()
+        try:
+            wardex.init(
+                transport=transport, intercept=True, capture_mode=CaptureMode.ALL, limits=caps
+            )
+            conn = http.client.HTTPConnection("127.0.0.1", httpd.server_address[1])
+            sent = {"Content-Type": "application/json", "Content-Encoding": "gzip"}
+            conn.request(
+                "POST", "/v1/chat/completions", request, sent if request[:2] == b"\x1f\x8b" else {}
+            )
+            conn.getresponse().read()
+            conn.close()
+        finally:
+            wardex.close()
+            httpd.shutdown()
+            httpd.server_close()
+        _env, (span,) = _envelope_spans(transport)
+        got.append(span["capture_integrity"]["truncated"])
+    assert got == [True, True, False]
+
+
 def test_a_host_span_cannot_ship_a_transport_reading_the_sdk_never_made():
     """`wardex.transport.*` on OTLP is what the SDK observed. A host's own span
     that sets one of those names observed no transport, so none ships; on a

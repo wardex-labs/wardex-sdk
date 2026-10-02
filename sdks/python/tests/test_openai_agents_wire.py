@@ -9,7 +9,8 @@ loopback fake of the Responses API. Nothing here is the framework's own
 tracing: its default run-record upload to `/v1/traces/ingest` is pointed
 at the same fake in one test and asserted EXCLUDED and counted. A
 `conversation_id` run pins the one shape that differs: delta inputs, a
-`conversation` field on every request, and no Conversations-API call.
+`conversation` field on every request — which is each `chat` span's
+conversation id — and no Conversations-API call.
 
 Measured on openai-agents 0.22 only (see the pin in pyproject.toml). The
 fake server speaks HTTP/1.0 on purpose: the framework's process-wide pooled
@@ -199,6 +200,9 @@ def _check(spans, posts, *, streamed: bool) -> None:
     assert len(spans) == 3
     for i, sp in enumerate(spans):
         assert sp.gen_ai is not None
+        # No conversation was named anywhere — not by the host, not by the
+        # request — so none is carried, and none is made up.
+        assert sp.conversation is None
         assert sp.gen_ai.operation == OperationName.CHAT
         assert (sp.gen_ai.input_tokens, sp.gen_ai.output_tokens) == (10, 3)
         assert sp.gen_ai.request_model == "gpt-4o-mini"
@@ -234,6 +238,23 @@ def _exported_names(t: RecordingTransport) -> list[str]:
                 for ss in rs["scope_spans"]:
                     names += [sp["name"] for sp in ss["spans"]]
     return names
+
+
+def _exported_attributes(t: RecordingTransport) -> list[dict]:
+    """Each span's attributes as a receiver decodes the OTLP export."""
+    from wardex_sdk._wardex_native import codec
+
+    attrs: list[dict] = []
+    for env in t.envelopes:
+        for body in t.encode(env):
+            try:
+                body = gzip.decompress(body)
+            except OSError:
+                pass
+            for rs in codec.decode_otlp_traces(body)["resource_spans"]:
+                for ss in rs["scope_spans"]:
+                    attrs += [sp["attributes"] for sp in ss["spans"]]
+    return attrs
 
 
 def test_runner_run_three_turns_are_three_llm_spans(agents_env):
@@ -291,13 +312,15 @@ def test_default_trace_upload_is_excluded_and_counted(agents_env, mode):
         wardex.close()
 
 
-def test_runner_run_with_conversation_id_sends_the_delta_and_no_join_key(agents_env):
+def test_runner_run_with_conversation_id_sends_the_delta_and_joins_the_turns(agents_env):
     """`Runner.run(conversation_id=…)` is still three `chat` spans, but each
     request carries `conversation` and only the items the framework has not
     sent yet — turn two is the tool result alone, turn three the handoff
-    result alone — so `gen_ai.input.messages` is that delta, and the id that
-    joins the turns is not a span attribute yet. The framework never calls
-    the Conversations API itself: every POST is `/v1/responses`."""
+    result alone — so `gen_ai.input.messages` is that delta. The id that
+    joins the turns is the request's own `conversation`, and it is each
+    span's `gen_ai.conversation.id`: with no adapter and no host
+    conversation, the request is the only one that said. The framework never
+    calls the Conversations API itself: every POST is `/v1/responses`."""
     base, posts = agents_env
     t = RecordingTransport()
     wardex.init(transport=t, adapters=_NO_ADAPTER)
@@ -318,7 +341,13 @@ def test_runner_run_with_conversation_id_sends_the_delta_and_no_join_key(agents_
         ]
         assert ids == [[], ["call_1"], ["call_2"]]
         assert [len(msgs) for msgs in inputs] == [1, 1, 1]
+        assert [s.conversation.conversation_id for s in spans] == ["conv_1"] * 3
+        # The conversation is the span's typed block, not an attribute in `extra`.
         assert all("conv_1" not in json.dumps(dict(s.extra)) for s in spans)
         assert counters.get("interceptors.seam.provider_state_dropped") == 0
+        assert counters.get("semantics.request_conversation_shadowed") == 0
+        wardex.flush()
+        attrs = _exported_attributes(t)
+        assert [a["gen_ai.conversation.id"] for a in attrs] == ["conv_1"] * 3
     finally:
         wardex.close()

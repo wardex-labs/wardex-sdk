@@ -6,7 +6,7 @@ adapter and encoding what it emitted with the real encoder. A receiver's test
 suite reads these in place of hand-built envelopes. Every value in them is
 synthetic: a scripted model, a loopback server, canned tool output.
 
-- Produced: 2026-09-19
+- Produced: 2026-10-01
 - wardex-sdk: 0.6.0b1, Python 3.14.3
 - Source: `sdks/python/tests/test_adapter_envelopes.py`, which also holds the
   contract each body is checked against on every run
@@ -15,5 +15,5 @@ synthetic: a scripted model, a loopback server, canned tool output.
 | File | Conversation id it states | Framework |
 |---|---|---|
 | `openai_agents.envelope.zst` | `conv-openai-agents` | openai-agents 0.22.3 |
-| `langgraph.envelope.zst` | `conv-langgraph` | langgraph 1.2.11 |
+| `langgraph.envelope.zst` | `conv-langgraph` | langgraph 1.2.12 |
 | `agent_sdk.envelope.zst` | `s-1` | none (scripted stream) |

@@ -85,6 +85,8 @@ from collections.abc import Callable
 from typing import Any
 
 from .._assembly import PatchSet, guard
+from ._h2_issuer import _at_fork_reinit as _h2_at_fork_reinit
+from ._h2_issuer import patch_h2
 from ._peer import stamp_peer
 
 __all__ = [
@@ -386,7 +388,7 @@ def _anyio_tls() -> tuple[Any, Any, Any] | None:
 class CloseProbe:
     """Turns the end of a connection into a registry event. Idempotent, fail-silent.
 
-    FIVE patches. Two of them are on `socket.socket`, because `close()` is not
+    SEVEN patches. Two of them are on `socket.socket`, because `close()` is not
     reliably the end of anything:
 
         def close(self):
@@ -463,6 +465,13 @@ class CloseProbe:
     not in `_mcp_stdio` beside the other anyio patch, because a peer stamp
     must be in place for every seam that reads `SSLObject`s and must come out
     with the same `restore_all()` as the asyncio half.
+
+    `h2`'s `H2Connection.send_headers` and `data_to_send` are the SIXTH and
+    SEVENTH, and they are not about an end either: they name the task that
+    issued each HTTP/2 stream, which the bytes cannot (`_h2_issuer`). Here for
+    the peer stamp's reason: both seams run an h2 tracker, so the reads must be
+    in place for every seam and come out with the same `restore_all()`.
+    Optional, like anyio: without `h2` installed the patch is not made.
     """
 
     __slots__ = ("_installed", "_patches", "_registry")
@@ -500,6 +509,7 @@ class CloseProbe:
             if func is not None:
                 wrapper = self._mk_tls_stream_wrap(func, ssl_attr, peer_attr)
                 self._patches.patch(stream_cls, "wrap", wrapper)
+        patch_h2(self._patches)
         self._installed = True
 
     def uninstall(self) -> None:
@@ -616,11 +626,13 @@ def _at_fork_reinit() -> None:
     `CloseRegistry` is deliberately unlocked (see its docstring), but the
     probe's `PatchSet` is not, and the child's teardown reaches its
     `restore_all()` through `uninstall_shared_close_hook()` — so its lock is
-    replaced here (P/Q/R row Q), never acquired. Reached by
-    `Runtime.after_in_child` through `sys.modules`.
+    replaced here (P/Q/R row Q), never acquired. The `h2` reads the probe
+    patched keep tables of the parent's connections too, and they go here.
+    Reached by `Runtime.after_in_child` through `sys.modules`.
     """
     _registry.clear()
     _probe._patches._at_fork_reinit()
+    _h2_at_fork_reinit()
 
 
 def install_shared_close_hook() -> None:
