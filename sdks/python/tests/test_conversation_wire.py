@@ -1198,3 +1198,45 @@ def test_a_closed_units_carrier_does_not_lend_its_conversation():
     assert resolve_observed(_latched(txn), parent_closed=True).conversation is None
     live = _Txn(**{**txn.__dict__, "parent_closed": False})
     assert resolve_observed(_latched(live), parent_closed=False).conversation is conv
+
+
+def test_a_chat_span_carries_its_conversation_beside_what_the_seam_observed(llm, h2_llm):
+    """The conversation a wire span was issued in and the transport the seam
+    observed are two facts on one span, and both reach both wires: the wardex
+    envelope (`conversation`, `transport`) and OTLP (`gen_ai.conversation.id`,
+    `wardex.transport.*`), over HTTP/1.1 and over HTTP/2 alike."""
+    import ssl
+
+    from conftest import CERT
+    from wardex_sdk.transport import _codec
+
+    host, port = llm
+    base, _accepted = h2_llm
+    verify = ssl.create_default_context(cafile=str(CERT))
+
+    def run() -> None:
+        with wardex.conversation("c", id="conv-both"):
+            _post(host, port, "h1-0")
+            with httpx.Client(http2=True, verify=verify) as client:
+                r = client.post(f"{base}/v1/responses", content=_body("h1-1"))
+                assert (r.status_code, r.http_version) == (200, "HTTP/2")
+
+    spans, t = _shipped(run)
+    assert sorted(_tag(s) for s in _chats(spans)) == ["h1-0", "h1-1"]
+    envelopes = [_codec.decode(b) for b in (_codec.encode(e) for e in t.envelopes)]
+    wire = [i["span"] for d in envelopes for i in d["items"] if "span" in i]
+    chats = [s for s in wire if "transport" in s]  # the two calls are the only wire spans
+    assert len(chats) == 2
+    for s in chats:
+        assert s["conversation"]["conversation_id"] == "conv-both"
+        tr = s["transport"]
+        assert tr["is_streaming"] is False  # a JSON body, read whole
+        assert tr["connection_id"] and tr["request_size"] and tr["response_size"]
+    assert {s["transport"]["http"]["url"].split(":")[0] for s in chats} == {"http", "https"}
+    otlp = [a for _n, a in _otlp(t) if "wardex.transport.direction" in a]
+    assert len(otlp) == 2
+    for a in otlp:
+        assert a["gen_ai.conversation.id"] == "conv-both"
+        assert a["wardex.transport.is_streaming"] is False
+        for key in ("connection_id", "request_size", "response_size", "direction"):
+            assert f"wardex.transport.{key}" in a, key
