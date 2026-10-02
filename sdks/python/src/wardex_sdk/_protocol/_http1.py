@@ -60,7 +60,9 @@ def declares_event_stream(content_type: str | None) -> bool:
 _INFLATED_CODINGS = frozenset({"gzip", "x-gzip", "deflate"})
 
 
-def sniff_decoded_body(content_encoding: str | None, wire: bytes, body: bytes) -> bool | None:
+def sniff_decoded_body(
+    content_encoding: str | None, wire: bytes, body: bytes, whole: bool = True
+) -> bool | None:
     """The event-stream sniff over a response body, or None when the SDK never read that body.
 
     `wire` is the body as sent, still in its content coding, and `body` what the SDK made of it,
@@ -71,12 +73,29 @@ def sniff_decoded_body(content_encoding: str | None, wire: bytes, body: bytes) -
     leaves bytes the SDK did not read, whatever they look like: a brotli stream can begin with `[`,
     and a few can even be valid text. The sniff itself answers None for a body that is not text
     (`crates/wardex-protocol/src/sse.rs::sniff`).
+
+    `whole=False`: `body` is only the part of the content the SDK read, a prefix cut by a capture
+    cap as sent or by the inflate cap. Event lines in that part were seen, so it answers True; an
+    answer of "not a stream" is about the rest too, which nobody read, so it answers None instead.
+    A cap can end the part inside a character, so the sniff reads it up to the last whole one.
     """
     codings = [c.strip().lower() for c in (content_encoding or "").split(",")]
     codings = [c for c in codings if c and c != "identity"]
     if codings and not (len(codings) == 1 and codings[0] in _INFLATED_CODINGS and body != wire):
         return None
-    return _wardex_native.protocol.sniff_event_stream(body)  # type: ignore[no-any-return]
+    if whole:
+        return _wardex_native.protocol.sniff_event_stream(body)  # type: ignore[no-any-return]
+    return True if _wardex_native.protocol.sniff_event_stream(_whole_chars(body)) else None
+
+
+def _whole_chars(part: bytes) -> bytes:
+    """`part` without the one UTF-8 character a cut may have split at its end; else unchanged."""
+    try:
+        part.decode("utf-8")
+    except UnicodeDecodeError as err:
+        if err.reason == "unexpected end of data":  # only a sequence the end cut short
+            return part[: err.start]
+    return part
 
 
 def _to_parsed(raw: object) -> ParsedMessage:

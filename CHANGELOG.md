@@ -116,13 +116,15 @@ All notable changes to this project are documented here. The format follows
   a first token it never timed. Now `is_streaming` is `true` when the response
   declared `Content-Type: text/event-stream` — even when its body was in an
   encoding the parser does not decode, or was cut by `max_body_bytes` — or its
-  body read as a Server-Sent Events stream, `false` when it declared none and
-  its whole body read as something else (JSON, or text with no event line),
-  and unset when it declared none and its body was not read: not parsed, cut
-  by the capture limit (as sent, or when inflating a gzip or zlib body, past
-  the smaller of `max_decoded_bytes` and `max_opaque_body_bytes`), in a
-  `Content-Encoding` the SDK does not inflate, or not text (binary); the five `TransportTiming` intervals are unset when
-  they were not measured — including a connect time the seam marks
+  body read as a Server-Sent Events stream (a body cut by the capture limit,
+  as sent or when inflating a gzip or zlib body past the smaller of
+  `max_decoded_bytes` and `max_opaque_body_bytes`, when the part the SDK read
+  shows event lines), `false` when it declared none and its whole body read
+  as something else (JSON, or text with no event line), and unset when it
+  declared none and its body was not read as either: not parsed, cut by the
+  capture limit with no event line in the part read, in a `Content-Encoding`
+  the SDK does not inflate, or not text (binary); the five `TransportTiming`
+  intervals are unset when they were not measured — including a connect time the seam marks
   `connect_timing_unavailable` (a socket connected before `init` and
   TLS-wrapped after it among them, and a plaintext connection opened by
   asyncio, as httpx's async client opens one: its non-blocking `connect`

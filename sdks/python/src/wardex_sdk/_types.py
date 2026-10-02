@@ -481,10 +481,11 @@ class TransportAttributes:
     response_modality: Modality | None = None
     #: True when the response was a Server-Sent Events stream: it declared
     #: `Content-Type: text/event-stream` (read or not), or its body read as
-    #: one. False when it did not declare one and its whole body was read as
-    #: something else. None when it did not declare one and its body was not
-    #: read: not parsed, cut by its capture limit, in a `Content-Encoding` the
-    #: SDK does not inflate, or not text.
+    #: one (cut by its capture limit: the part read shows event lines). False
+    #: when it did not declare one and its whole body was read as something
+    #: else. None when it did not declare one and its body was not read as
+    #: either: not parsed, cut by its capture limit with no event line in the
+    #: part read, in a `Content-Encoding` the SDK does not inflate, or not text.
     is_streaming: bool | None = None
     #: Whether this transaction rode a connection an earlier one opened. False
     #: only where the producer saw the connection open; None where it cannot

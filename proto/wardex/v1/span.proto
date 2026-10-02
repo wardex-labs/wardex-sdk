@@ -176,12 +176,14 @@ message TransportAttributes {
 
   // true: the response was a Server-Sent Events stream — it declared
   // `Content-Type: text/event-stream`, whether or not its body could be read,
-  // or its body read as one. false: it did not declare one, and its whole
+  // or its body read as one (of a body cut by its capture limit, the part the
+  // SDK read shows event lines). false: it did not declare one, and its whole
   // body was read as something else (JSON, or text with no event line).
   // Unset: it did not declare one and its body was not read as either: not
   // parsed (gRPC, a skipped or failed parse, a WebSocket session, stdio), cut
-  // by its capture limit, in a `Content-Encoding` the SDK does not inflate
-  // (it inflates one gzip or zlib layer), or not text (binary).
+  // by its capture limit with no event line in the part read, in a
+  // `Content-Encoding` the SDK does not inflate (it inflates one gzip or zlib
+  // layer), or not text (binary).
   optional bool is_streaming = 24;
   // Whether this transaction rode a pooled connection opened by an earlier
   // one. When true, `tcp_connect_ms` / `tls_handshake_ms` of 0 mean this

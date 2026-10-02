@@ -883,13 +883,14 @@ diagnostic line (traceback under `debug=True`).
   Connection reuse is `false` only on a connection the SDK saw open; on one
   opened before `init`, the first request it sees (on HTTP/2, stream 1)
   carries none. A response is a stream when it declared `text/event-stream`
-  or its body read as one, and not a stream when it declared none and its
-  whole body read as something else; with no declaration, a body that did
-  not read as one and was cut by its capture limit (as sent, or once
-  inflated: see Compressed bodies), is in a
-  `Content-Encoding` the SDK does not inflate (it inflates one gzip or zlib
-  layer; `br`, `zstd` and raw deflate stay unread, whatever their bytes look
-  like), or is not text (binary) says neither
+  or its body read as one (for a body cut by its capture limit, as sent or
+  once inflated: see Compressed bodies, when the part the SDK read shows
+  event lines), and not a stream when it declared none and its whole body
+  read as something else; with no declaration, a cut body whose part read
+  shows no event line, a body in a `Content-Encoding` the SDK does not
+  inflate (it inflates one gzip or zlib layer; `br`, `zstd` and raw deflate
+  stay unread, whatever their bytes look like), or one that is not text
+  (binary) says neither
 - gRPC (grpclib), WebSocket (`wss`;
   a Responses-over-WebSocket connection is captured at close and marked
   `ws_llm_semantics_unread` when the host is `api.openai.com` or a subdomain

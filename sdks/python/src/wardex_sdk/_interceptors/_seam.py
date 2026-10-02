@@ -943,9 +943,8 @@ def _assemble(p: _PendingTxn, *, parse: bool, extra: tuple[Limitation, ...]) -> 
     sem: Any = None
     parse_failed = False
     if parse and not p.is_grpc:
-        # `parsed` distinguishes "the parser raised" (swallowed and counted
-        # by the guard) from the parser's own honest None ("not an LLM
-        # body") — `sem` cannot carry both facts.
+        # `parsed` distinguishes "the parser raised" (swallowed and counted by the guard) from the
+        # parser's own honest None ("not an LLM body") — `sem` cannot carry both facts.
         parsed = False
         with guard("interceptors.seam.parse", debug=p.debug):
             sem = _parse_semantics(p)
@@ -1122,15 +1121,16 @@ def _assemble(p: _PendingTxn, *, parse: bool, extra: tuple[Limitation, ...]) -> 
         ttft_ms=txn.ttft_ms,
         transfer_ms=transfer,
     )
-    # SSE if it declared `text/event-stream` (read or not: undecodable, cut by a cap) or a parse
-    # read it as SSE. Not SSE only if the WHOLE body read as something else; a body cut by its cap
-    # (as sent, or once inflated), in a coding the SDK did not undo (`br`, raw deflate), not text,
-    # or not parsed: unset.
+    # SSE if it declared `text/event-stream` (read or not: undecodable, cut by a cap), a parse read
+    # it as SSE, or the part the SDK read (cut by its cap as sent, or once inflated) shows event
+    # lines. Not SSE only if the WHOLE body read as something else; a cut body showing none, one in
+    # a coding the SDK did not undo (`br`, raw deflate), not text, or not parsed: unset.
     body_read = parse and not parse_failed and not p.is_grpc
     if txn.event_stream or (body_read and getattr(sem, "reassembled_from_stream", False)):
         streamed = True
-    elif body_read and txn.response_counted and not inflate_cut:
-        streamed = sniff_decoded_body(txn.content_encoding, txn.response_body, output_data)
+    elif body_read:
+        whole = txn.response_counted and not inflate_cut
+        streamed = sniff_decoded_body(txn.content_encoding, txn.response_body, output_data, whole)
     else:
         streamed = None
     # Sizes are wire (compressed) bytes; output_data is the inflated body. A half whose count is

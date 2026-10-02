@@ -435,17 +435,34 @@ def test_a_body_neither_declared_nor_read_as_an_event_stream_is_not_streaming():
     assert _is_streaming(_JSON, {"Content-Type": "application/json"}) == (False, False)
 
 
-# The same SSE stream under another label, in a form the parser could not read.
-# Read whole, it is a stream (above); unread, "not a stream" was never observed.
-
-
-def test_an_undeclared_event_stream_cut_inside_a_character_by_the_body_cap_says_nothing():
-    payload = _korean_sse(40)
-    cap = 1000
+def _cap_inside_a_character(payload: bytes, at_least: int) -> int:
+    cap = at_least
     while (payload[cap] & 0xC0) != 0x80:  # land the cap inside a UTF-8 character
         cap += 1
+    return cap
+
+
+# The same SSE stream under another label, cut by a cap or in a form the parser
+# could not read. Event lines in the part the SDK read were seen; "not a stream"
+# is a reading of the whole body, so a part that shows none says nothing.
+
+
+def test_an_undeclared_event_stream_cut_inside_a_character_by_the_body_cap_is_streaming():
+    """The cap split a character, and the event lines before it were read."""
+    payload = _korean_sse(40)
+    cap = _cap_inside_a_character(payload, 1000)
     headers = {"Content-Type": "application/json"}
     got = _is_streaming(payload, headers, limits=LimitsConfig(max_body_bytes=cap))
+    assert got == (True, True)
+
+
+def test_an_undeclared_text_cut_inside_a_character_by_the_body_cap_says_nothing():
+    """The same cut through text with no event line: the rest was never read."""
+    payload = "안녕하세요, plain text.\n".encode() * 200
+    cap = _cap_inside_a_character(payload, 1000)
+    got = _is_streaming(
+        payload, {"Content-Type": "text/plain"}, limits=LimitsConfig(max_body_bytes=cap)
+    )
     assert got == (None, None)
 
 
@@ -509,6 +526,24 @@ def test_a_body_inflated_only_as_far_as_its_cap_says_nothing():
     assert _is_streaming(gzip.compress(_JSON), gzipped, limits=caps) == (False, False)
 
 
+def test_a_body_inflated_only_as_far_as_its_cap_is_streaming_when_that_part_shows_event_lines():
+    """The inflated prefix the SDK holds is the part it read. Event lines in it were
+    seen, whether or not the response declared a stream, and wherever the cap fell,
+    inside a character included; a prefix with none says nothing, JSON included."""
+    caps = LimitsConfig(max_decoded_bytes=4096, max_opaque_body_bytes=4096)
+    gzipped = {"Content-Type": "text/plain", "Content-Encoding": "gzip"}
+    sse = _korean_sse(200)
+    assert len(sse) > 4 * 4096 and (sse[4096] & 0xC0) != 0x80  # the cap falls between characters
+    assert _is_streaming(gzip.compress(sse), gzipped, limits=caps) == (True, True)
+    split = _cap_inside_a_character(sse, 4096)
+    inside = LimitsConfig(max_decoded_bytes=split, max_opaque_body_bytes=split)
+    assert _is_streaming(gzip.compress(sse), gzipped, limits=inside) == (True, True)
+    as_json = {"Content-Type": "application/json", "Content-Encoding": "gzip"}
+    big_json = json.dumps({"id": "c2", "text": "안녕하세요 " * 5000}, ensure_ascii=False).encode()
+    assert len(big_json) > 4 * 4096
+    assert _is_streaming(gzip.compress(big_json), as_json, limits=caps) == (None, None)
+
+
 def test_a_host_span_cannot_ship_a_transport_reading_the_sdk_never_made():
     """`wardex.transport.*` on OTLP is what the SDK observed. A host's own span
     that sets one of those names observed no transport, so none ships; on a
@@ -549,6 +584,23 @@ def test_the_sniff_answers_only_for_a_body_whose_declared_coding_was_undone():
     for coding in ("br", "zstd", "compress", "gzip, br", "br, gzip", "gzip, gzip"):
         assert sniff_decoded_body(coding, b"<wire>", sse) is None
         assert sniff_decoded_body(coding, json_body, json_body) is None
+
+
+def test_the_sniff_over_a_part_of_the_body_answers_only_what_that_part_shows():
+    """`whole=False`: event lines in the part read are a stream; anything else in it
+    is no answer, since "not a stream" needs the part nobody read. A cap that split
+    a character leaves the characters before it to read; bytes that are not text
+    anywhere else still read as nothing."""
+    sse = _korean_sse(3)
+    split = _cap_inside_a_character(sse, 40)
+    assert sniff_decoded_body(None, sse[:split], sse[:split]) is None  # whole: not text
+    assert sniff_decoded_body(None, sse[:split], sse[:split], whole=False) is True
+    assert sniff_decoded_body("gzip", b"<wire>", sse[:split], whole=False) is True
+    assert sniff_decoded_body(None, _JSON[:20], _JSON[:20], whole=False) is None
+    text = "안녕하세요, plain text.\n".encode()
+    assert sniff_decoded_body(None, text[:4], text[:4], whole=False) is None
+    assert sniff_decoded_body(None, b"\xff" + sse, b"\xff" + sse, whole=False) is None
+    assert sniff_decoded_body("br", b"<wire>", sse, whole=False) is None
 
 
 def _h2_is_streaming(payload: bytes, response_headers: list[tuple[bytes, bytes]]) -> Any:
