@@ -665,6 +665,17 @@ const SDK_RESOURCE_KEYS: [&str; 3] = [
     "telemetry.sdk.language",
 ];
 
+/// SDK-GENERATED span attributes, left alone by name. The OTLP mapping writes
+/// `TransportAttributes.connection_id` under this key, and a key alone can say
+/// who wrote the value only because the mapping reserves the
+/// `wardex.transport.*` names: a host attribute under one never reaches this
+/// walk (`wardex_codec::otlp::map::RESERVED_TRANSPORT_PREFIX`). The name, not
+/// the value's form, is the test, because the form cannot tell the two apart:
+/// `str(id(socket))` on 64-bit Linux is fifteen digits, the shape of a card
+/// number, and about one in ten passes its checksum. The envelope's twin is
+/// the `connection_id: _` binding in `mask_transport`.
+const SDK_SPAN_KEYS: [&str; 1] = [wardex_codec::otlp::map::T_CONNECTION_ID];
+
 /// Mask an OTLP export request (design §4.2, OTLP path). A span that panics
 /// is scrubbed whole; a span with replacements gains `wardex.redacted=true`
 /// (OTLP spans have no capture_integrity — this is the OTLP equivalent).
@@ -750,11 +761,12 @@ fn mask_otlp_span(engine: &PiiEngine, span: &mut otlp_pb::trace::Span) -> Option
     hit |= mask_string(m, trace_state);
     hit |= mask_string(m, name);
     // `extra`'s pairs arrive here under their own keys, and the typed
-    // conversation id under `gen_ai.conversation.id` — see `mask_span`.
-    for kv in attributes
-        .iter_mut()
-        .filter(|kv| !is_sdk_value_attr(&kv.key, otlp_text(&kv.value)))
-    {
+    // conversation id under `gen_ai.conversation.id` — see `mask_span`. The
+    // SDK's own connection id arrives under a name only the SDK may write.
+    for kv in attributes.iter_mut().filter(|kv| {
+        !SDK_SPAN_KEYS.contains(&kv.key.as_str())
+            && !is_sdk_value_attr(&kv.key, otlp_text(&kv.value))
+    }) {
         hit |= mask_otlp_kvs(m, std::slice::from_mut(kv));
     }
     for ev in events {

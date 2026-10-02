@@ -1780,20 +1780,24 @@ const PRODUCER: otlp::map::Producer<'static> = otlp::map::Producer {
 ///     `bytes_value` and this is the point of no return for the raw payload.
 ///
 /// Shared by both entry points below so the two cannot drift into applying a
-/// different policy to the same envelope.
+/// different policy to the same envelope. The count beside the request is the
+/// mapping's `reserved_overwritten`, for the export path to report.
 fn otlp_request(
     proto: pb::Envelope,
     policy: &PiiPolicy<'_>,
     limits: wardex_limits::Limits,
-) -> PyResult<otlp_pb::trace_service::ExportTraceServiceRequest> {
+) -> PyResult<(otlp_pb::trace_service::ExportTraceServiceRequest, usize)> {
     // `proto` is CONSUMED here, so the envelope's payloads move into the
     // request instead of being copied beside it — one flush of a full batch
     // holds one copy of every captured body, not two.
-    let mut req = otlp::map::envelope_to_traces(proto, PRODUCER);
+    let otlp::map::Mapped {
+        request: mut req,
+        reserved_overwritten,
+    } = otlp::map::map_envelope(proto, PRODUCER);
     pii_apply_otlp(&mut req, policy)?;
     otlp::map::cap_attribute_values(&mut req, limits);
     otlp::map::strip_bytes_values(&mut req);
-    Ok(req)
+    Ok((req, reserved_overwritten))
 }
 
 #[pyfunction]
@@ -1835,7 +1839,9 @@ fn encode_otlp_traces(
         // Mapping + masking + protobuf are pure Rust: release the GIL so app
         // threads keep running while the batch worker encodes (design §9).
         let bytes = py.allow_threads(move || -> PyResult<Vec<u8>> {
-            let req = otlp_request(proto, &policy, limits)?;
+            // Not an export, so nothing here is counted: the reserved-name
+            // count is the export encoder's to report.
+            let (req, _) = otlp_request(proto, &policy, limits)?;
             otlp::encode_traces(&req)
                 .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
         })?;
@@ -1854,10 +1860,12 @@ fn encode_otlp_traces(
 /// The second element of the return value is a count of spans that could not
 /// be made to fit even alone, after their payload was dropped; the third names
 /// the spans that could not be MARSHALLED at all (a typed block holding a
-/// value of the wrong Python type), each as `"{name}: {reason}"`. Both exist
-/// because the core has no channel to a user: a loss reported nowhere is the
-/// silent kind, and the caller is the only one who can say it out loud. The
-/// third used to be a raise, and the raise cost the whole batch.
+/// value of the wrong Python type), each as `"{name}: {reason}"`; the fourth
+/// counts the host attributes under a reserved `wardex.transport.*` name the
+/// mapping did not ship as set (`otlp::map::Mapped`). They exist because the
+/// core has no channel to a user: a loss reported nowhere is the silent kind,
+/// and the caller is the only one who can say it out loud. The third used to
+/// be a raise, and the raise cost the whole batch.
 #[pyfunction]
 #[pyo3(signature = (envelope, pii_mode = "off", pii_disabled = Vec::new(), limits = None, compress = true, *, pii_extra_names = Vec::new(), pii_reveal_names = Vec::new()))]
 // One argument per Python keyword: the signature IS the Python API, and a
@@ -1872,7 +1880,7 @@ fn encode_otlp_requests(
     compress: bool,
     pii_extra_names: Vec<String>,
     pii_reveal_names: Vec<String>,
-) -> PyResult<(Py<PyAny>, usize, Vec<String>)> {
+) -> PyResult<(Py<PyAny>, usize, Vec<String>, usize)> {
     let policy = PiiPolicy {
         mode: pii_mode,
         disabled: pii_disabled,
@@ -1882,16 +1890,23 @@ fn encode_otlp_requests(
     shielded(|| {
         let (proto, unmarshalled) = envelope_to_proto(envelope, false, true)?;
         let limits = limits.map(|p| p.inner).unwrap_or_default();
-        let requests = py.allow_threads(move || -> PyResult<otlp::split::Requests> {
-            let req = otlp_request(proto, &policy, limits)?;
-            otlp::split::encode_requests(req, limits, compress)
-                .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
-        })?;
+        let (requests, overwritten) =
+            py.allow_threads(move || -> PyResult<(otlp::split::Requests, usize)> {
+                let (req, overwritten) = otlp_request(proto, &policy, limits)?;
+                let requests = otlp::split::encode_requests(req, limits, compress)
+                    .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+                Ok((requests, overwritten))
+            })?;
         let bodies = PyList::empty_bound(py);
         for body in &requests.bodies {
             bodies.append(PyBytes::new_bound(py, body))?;
         }
-        Ok((bodies.into_py(py), requests.dropped_spans, unmarshalled))
+        Ok((
+            bodies.into_py(py),
+            requests.dropped_spans,
+            unmarshalled,
+            overwritten,
+        ))
     })
 }
 

@@ -30,6 +30,7 @@ from ._base import (
     Transport,
     Undelivered,
     _debug_enabled,
+    _report_reserved_overwritten,
     _report_unmarshalled,
 )
 
@@ -154,11 +155,12 @@ class OtlpHttpTransport(Transport):
     def export(self, envelope: Envelope, *, timeout: float | None = None) -> Undelivered | None:
         return self._send_batch(envelope, timeout)
 
-    def _count_unmarshalled(self, unmarshalled: list[str]) -> None:
+    def _count_encode_reports(self, unmarshalled: list[str], overwritten: int) -> None:
         # "Debug" is this transport's flag OR the client's, as on the wardex
         # envelope exporter: the report tells a person to re-run with
         # debug=True, and either place they set it must reveal the names.
         _report_unmarshalled(unmarshalled, debug=self._debug or _debug_enabled())
+        _report_reserved_overwritten(overwritten)
 
     def _send_batch(self, envelope: Envelope, timeout: float | None = None) -> Undelivered | None:
         # zero spans means an empty batch — skip the POST. Not a decline: there
@@ -224,21 +226,24 @@ class OtlpHttpTransport(Transport):
         # the time you asked for".
         started = time.monotonic()
         deadline = started + effective
-        # THE SANCTIONED PATH, minus one report: `_encode_requests` is
+        # THE SANCTIONED PATH, minus two reports: `_encode_requests` is
         # `Transport.encode()` -- the native encoder with this transport's
         # stored PII policy and limits, split at `max_otlp_request_bytes`, the
         # over-cap span reported once per process -- except that the spans the
-        # marshaller skipped come back uncounted. They are counted below, where
-        # this batch's fate is decided: counting here, before a spent budget
-        # hands the batch back as `UNDELIVERED`, made the retry count the same
-        # span again. The `compress` constructor flag feeds it.
-        bodies, unmarshalled = self._encode_requests(envelope, compress=self._compress)
+        # marshaller skipped, and the host attributes the mapping replaced
+        # under a reserved `wardex.transport.*` name, come back uncounted.
+        # They are counted below, where this batch's fate is decided: counting
+        # here, before a spent budget hands the batch back as `UNDELIVERED`,
+        # made the retry count the same span again. The `compress` constructor
+        # flag feeds it.
+        bodies, unmarshalled, overwritten = self._encode_requests(envelope, compress=self._compress)
         if not bodies:
             # Every span in the batch was dropped -- by encode()'s over-cap
             # guard, or skipped as unmarshallable. Nothing to POST, and not
             # `UNDELIVERED`: a later attempt would encode to the same nothing.
-            # The fate is decided, so the skipped spans are counted now.
-            self._count_unmarshalled(unmarshalled)
+            # The fate is decided, so the skipped spans (and any replaced
+            # reserved-name attributes) are counted now.
+            self._count_encode_reports(unmarshalled, overwritten)
             return None
         headers = {"Content-Type": "application/x-protobuf"}
         # Host headers next, as they always have been: a caller who sets one of
@@ -309,7 +314,7 @@ class OtlpHttpTransport(Transport):
                 # The first request is going on the wire: this batch will not
                 # come back as `UNDELIVERED`, so its skipped spans are counted
                 # here, exactly once.
-                self._count_unmarshalled(unmarshalled)
+                self._count_encode_reports(unmarshalled, overwritten)
             req = urllib.request.Request(self._endpoint, data=body, headers=headers, method="POST")
             try:
                 with suppress_capture():

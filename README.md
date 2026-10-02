@@ -841,7 +841,14 @@ diagnostic line (traceback under `debug=True`).
   request and response size, connection id and reuse, and whether the
   response was a Server-Sent Events stream — over OTLP as
   `wardex.transport.timing.*` and `wardex.transport.*`, and in the envelope's
-  transport block. A TLS handshake is timed from its first `do_handshake()`
+  transport block. **The `wardex.transport.*` names are reserved** for these
+  values: an attribute your code sets under one of them is replaced on OTLP
+  export by the value the SDK observed, or left out where it observed none,
+  so the names never carry a reading the SDK did not make; each such
+  attribute is counted under `transport.otlp.reserved_attribute_overwritten`
+  and said once per process. `wardex.transport.connection_id` is never
+  masked: it is the SDK's own `str(id(socket))`, fifteen digits on 64-bit
+  Linux, the shape of a card number. A TLS handshake is timed from its first `do_handshake()`
   attempt to the one that completed it, so a non-blocking one an event loop
   drives counts whole. On a pooled connection the connect time is `0`, and so
   is the handshake over TLS (`connection_reused` is true: the call opened

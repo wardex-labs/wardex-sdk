@@ -492,6 +492,33 @@ def test_a_body_the_sdk_inflated_is_read_whole():
     assert _is_streaming(gzip.compress(_korean_sse(3)), gzipped) == (True, True)
 
 
+def test_a_host_span_cannot_ship_a_transport_reading_the_sdk_never_made():
+    """`wardex.transport.*` on OTLP is what the SDK observed. A host's own span
+    that sets one of those names observed no transport, so none ships; on a
+    captured call the SDK's reading is the one that ships, once."""
+    httpd = _serve(_JSON, {"Content-Type": "application/json"})
+    transport = RecordingTransport()
+    try:
+        wardex.init(transport=transport, intercept=True, capture_mode=CaptureMode.ALL)
+        with wardex.span("host-step") as step:
+            step.set_attribute("wardex.transport.is_streaming", True)
+            step.set_attribute("wardex.transport.timing.ttft_ms", 0.5)
+            _chat(httpd.server_address[1], stream=False)
+    finally:
+        wardex.close()
+        httpd.shutdown()
+        httpd.server_close()
+    env, _ = _envelope_spans(transport)
+    reserved = {
+        sp["name"]: {k: v for k, v in sp["attributes"].items() if k.startswith("wardex.transport.")}
+        for sp in _otlp_spans(env)
+    }
+    assert reserved.pop("host-step") == {}
+    (call,) = reserved.values()
+    assert call["wardex.transport.is_streaming"] is False
+    assert "wardex.transport.timing.ttfb_ms" in call
+
+
 def test_the_sniff_answers_only_for_a_body_whose_declared_coding_was_undone():
     """`sniff_decoded_body` over bytes that would read either way as text, so only the
     declared coding decides: the SDK inflates one gzip or zlib layer and nothing else."""

@@ -55,13 +55,16 @@ const SDK_GENERATED_ENVELOPE: &[&str] = &[
 /// passes and from `SdkInfo.version`. `service.name` is not one: its
 /// fallback `unknown_service:<language>` is the mapping's, but the key is
 /// the host's, and the one language a binding passes today matches no
-/// rule.
+/// rule. The connection id is the envelope field above under a span
+/// attribute name the mapping reserves for the SDK, so no host value
+/// reaches it (`a_host_value_under_the_connection_id_name_never_ships`).
 const SDK_GENERATED_OTLP: &[&str] = &[
     "InstrumentationScope.name",
     "InstrumentationScope.version",
     "Resource.attributes[telemetry.sdk.name]",
     "Resource.attributes[telemetry.sdk.version]",
     "Resource.attributes[telemetry.sdk.language]",
+    "Span[0].attributes[wardex.transport.connection_id]",
 ];
 
 /// Left alone for its own reason: the receiver stamps it from the API key
@@ -356,8 +359,6 @@ fn each_transport_text(t: &mut pb::TransportAttributes, f: &mut Visit<'_>) {
         request_modality: _,
         response_modality: _,
         is_streaming: _,
-        chunk_index: _,
-        is_final_chunk: _,
         connection_reused: _,
     } = t;
     f(
@@ -782,6 +783,57 @@ fn every_other_otlp_text_field_still_loses_it() {
             before.contains_key(*path),
             "the census names {path}, no field"
         );
+    }
+}
+
+/// The connection id is left alone on OTLP by its name alone, which is
+/// only sound because that name is the SDK's: a host attribute spelled
+/// under it, holding text every rule fires on, is not shipped at all —
+/// neither beside the SDK's id nor, on a span with no transport, in its
+/// place — so the exemption never reaches a host value.
+#[test]
+fn a_host_value_under_the_connection_id_name_never_ships() {
+    let value = every_rule();
+    let host = pb::KeyValue {
+        key: "wardex.transport.connection_id".into(),
+        value: Some(pb::AnyValue {
+            value: Some(pb::any_value::Value::StringValue(value.clone())),
+        }),
+    };
+    for transport in [
+        None,
+        Some(pb::TransportAttributes {
+            connection_id: "140234567890120".into(),
+            ..Default::default()
+        }),
+    ] {
+        let had_transport = transport.is_some();
+        let env = pb::Envelope {
+            header: None,
+            items: vec![pb::EnvelopeItem {
+                header: None,
+                payload: Some(pb::envelope_item::Payload::Span(pb::Span {
+                    extra: vec![host.clone()],
+                    transport,
+                    ..Default::default()
+                })),
+            }],
+        };
+        let mut req = envelope_to_traces(env, PYTHON);
+        mask_otlp(&engine(), &mut req);
+        let texts = otlp_texts(&req);
+        assert!(
+            texts.values().all(|t| !t.contains("john.doe@acme.com")),
+            "a host value shipped: {texts:?}"
+        );
+        let shipped = texts.get("Span[0].attributes[wardex.transport.connection_id]");
+        if had_transport {
+            // The SDK's id, card-shaped and checksum-valid, as written.
+            assert_eq!(shipped.map(String::as_str), Some("140234567890120"));
+            assert!(!otlp_redacted(&req), "the SDK's id was recorded as masked");
+        } else {
+            assert_eq!(shipped, None);
+        }
     }
 }
 

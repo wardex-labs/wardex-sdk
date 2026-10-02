@@ -19,7 +19,15 @@ All notable changes to this project are documented here. The format follows
   `mcp.method.name` and its JSON-RPC id as `jsonrpc.request.id`, and the
   workflow name a decorator or an adapter records ships as
   `gen_ai.workflow.name` — it never reached OTLP before. A value the SDK did
-  not observe has no key at all, rather than a `0` or a `false`. The fields
+  not observe has no key at all, rather than a `0` or a `false`. The
+  `wardex.transport.*` names are reserved for these values: an attribute
+  your code sets under one is replaced by the SDK's value, or left out where
+  the SDK observed none, so a span you created yourself cannot ship a
+  transport reading the SDK never made, and a captured call never carries
+  your value beside the SDK's under one key. Each is counted under
+  `transport.otlp.reserved_attribute_overwritten` and said once per process.
+  `wardex.transport.connection_id` is never masked, as the connection id on
+  the envelope is not. The fields
   no producer fills (modality, blob references, the gRPC / WebSocket / SSE /
   A2A meta blocks) are listed with that reason in
   `crates/wardex-codec/src/otlp/map.rs` (`WIRE_FIELDS`), and
