@@ -180,8 +180,8 @@ message TransportAttributes {
   // body was read as something else (JSON, or text with no event line).
   // Unset: it did not declare one and its body was not read as either: not
   // parsed (gRPC, a skipped or failed parse, a WebSocket session, stdio), cut
-  // by its capture limit, or not text (binary, or compressed in a coding the
-  // SDK does not inflate).
+  // by its capture limit, in a `Content-Encoding` the SDK does not inflate
+  // (it inflates one gzip or zlib layer), or not text (binary).
   optional bool is_streaming = 24;
   // Whether this transaction rode a pooled connection opened by an earlier
   // one. When true, `tcp_connect_ms` / `tls_handshake_ms` of 0 mean this

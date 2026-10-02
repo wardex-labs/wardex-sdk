@@ -37,7 +37,7 @@ from .._enums import (
     StatusCode,
 )
 from .._limits import LimitsConfig, LimitsConsumer, limits_kwargs
-from .._protocol import classify_path, classify_ws_upgrade, parse_llm_semantics, sniff_event_stream
+from .._protocol import classify_path, classify_ws_upgrade, parse_llm_semantics, sniff_decoded_body
 from .._semantics import (
     USAGE_DROPPED_KEY,
     build_gen_ai,
@@ -281,15 +281,13 @@ class ByteSeamInterceptor(InterceptorInterface):
         flag turned the rollback into a no-op for every interceptor this SDK
         ships, which is a guard that reads as a fix and is not one.
 
-        The flag cannot answer "was anything patched?", because it is only ever
-        set once everything was. The things that CAN answer it are the pieces
-        themselves, and each is asked separately: `PatchSet.restore_all()` is
-        idempotent and empty until the first `patch()` lands, `_timing_held` and
-        `_close_hook_held` record the two acquisitions that are refcounted
-        elsewhere and so must not be released twice or unearned, and `_conns` is
-        empty until a byte flows.
-        Every step is a no-op on a seam that never installed, which is what
-        makes this safe to call unconditionally, twice, or on a fresh object.
+        The flag cannot answer "was anything patched?", because it is only ever set once everything
+        was. The things that CAN answer it are the pieces themselves, and each is asked separately:
+        `PatchSet.restore_all()` is idempotent and empty until the first `patch()` lands,
+        `_timing_held` and `_close_hook_held` record the two acquisitions that are refcounted
+        elsewhere and so must not be released twice or unearned, and `_conns` is empty until a byte
+        flows. Every step is a no-op on a seam that never installed, which is what makes this safe
+        to call unconditionally, twice, or on a fresh object.
 
         The WebSocket flush stays: a live WS session holds a span that only
         exists once the session ends, and dropping it at uninstall would be the
@@ -1127,13 +1125,15 @@ def _assemble(p: _PendingTxn, *, parse: bool, extra: tuple[Limitation, ...]) -> 
         transfer_ms=transfer,
     )
     # SSE if it declared `text/event-stream` (read or not: undecodable, cut by a cap) or a parse
-    # read it as SSE. Not SSE only if the WHOLE body read as something else; a body cut by its cap
-    # or not text (binary, a coding nothing inflated), or no parse (gRPC, skipped, raised): unset.
+    # read it as SSE. Not SSE only if the WHOLE body read as something else; a body cut by its cap,
+    # in a coding the SDK did not undo (`br`, raw deflate), not text, or not parsed: unset.
     body_read = parse and not parse_failed and not p.is_grpc
     if txn.event_stream or (body_read and getattr(sem, "reassembled_from_stream", False)):
         streamed = True
+    elif body_read and txn.response_counted:
+        streamed = sniff_decoded_body(txn.content_encoding, txn.response_body, output_data)
     else:
-        streamed = sniff_event_stream(output_data) if body_read and txn.response_counted else None
+        streamed = None
     # Sizes are wire (compressed) bytes; output_data is the inflated body. A half whose count is
     # not whole (cut at its cap, lost, unfinished: `_Txn.request_counted`) has no size, not a 0.
     draft.set_transport(

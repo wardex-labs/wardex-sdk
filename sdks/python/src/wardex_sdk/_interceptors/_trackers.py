@@ -219,6 +219,7 @@ class _Txn:
     ttft_ms: float | None = None
     content_type: str | None = None
     event_stream: bool = False  # see `declares_event_stream`
+    content_encoding: str | None = None  # the response's; see `sniff_decoded_body`
     grpc_status: int | None = None
     grpc_message: str | None = None
     # WS upgrade signal (set on 101 detection — used by _ssl.py as the SWAP trigger)
@@ -368,6 +369,7 @@ class _Http1Tracker:
                     version="1.1",
                     ttft_ms=ttft,
                     event_stream=declares_event_stream(_header_get(msg.headers, "content-type")),
+                    content_encoding=_header_get(msg.headers, "content-encoding"),
                 )
             )
             self._method = None
@@ -613,6 +615,7 @@ class _Http2Tracker:
             ttft_ms=None,  # per-h2-stream first-body-byte not tracked: not measured
             content_type=getattr(t, "content_type", None),
             event_stream=declares_event_stream(getattr(t, "content_type", None)),
+            content_encoding=t.content_encoding,
             grpc_status=getattr(t, "grpc_status", None),
             grpc_message=getattr(t, "grpc_message", None),
         )
@@ -684,11 +687,10 @@ class _WebSocketTracker:
             if r.messages:
                 self._decide_llm(r.messages[0])
             elif self._sent.is_disabled():
-                # The parser died on the first client frame (oversize,
-                # desync) and will never yield a message. Bytes crossed all
-                # the same, so decide now on nothing readable: a decision
-                # that waited for a message would be starved by the parse
-                # failure and the connection would vanish without a counter.
+                # The parser died on the first client frame (oversize, desync) and will never yield
+                # a message. Bytes crossed all the same, so decide now on nothing readable: a
+                # decision that waited for a message would be starved by the parse failure and the
+                # connection would vanish without a counter.
                 self._decide_llm(None)
         self._in_trunc = self._append_sample(self._sample_in, r.messages) or self._in_trunc
         return self._maybe_emit()
@@ -762,14 +764,12 @@ class _WebSocketTracker:
         if self._in_trunc or self._out_trunc:
             markers.append(Limitation.WS_PAYLOAD_TRUNCATED)
         if self._deflate:
-            # Census merge (§6.5.1): `ws_compressed` folded into
-            # PAYLOAD_COMPRESSED. What is lost is which protocol it was, and
-            # `TransportAttributes.protocol` already carries that.
+            # Census merge (§6.5.1): `ws_compressed` folded into PAYLOAD_COMPRESSED. What is lost is
+            # which protocol it was, and `TransportAttributes.protocol` already carries that.
             markers.append(Limitation.PAYLOAD_COMPRESSED)
         if self._sent.is_disabled() or self._recv.is_disabled():
-            # Census merge: `ws_parse_failed` and `grpc_parse_failed` are one
-            # fact — the framing layer failed, so the transport fields on this
-            # span are partial or synthesized.
+            # Census merge: `ws_parse_failed` and `grpc_parse_failed` are one fact — the framing
+            # layer failed, so the transport fields on this span are partial or synthesized.
             markers.append(Limitation.FRAME_PARSE_FAILED)
         if self._llm_call:
             markers.append(Limitation.WS_LLM_SEMANTICS_UNREAD)

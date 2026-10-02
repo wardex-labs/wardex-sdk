@@ -55,6 +55,30 @@ def declares_event_stream(content_type: str | None) -> bool:
     return content_type.split(";", 1)[0].strip().lower() == "text/event-stream"
 
 
+#: The one coding layer the SDK undoes. Both inflaters (the semantic parser's and
+#: `_interceptors/_trackers.py::_inflated`) recognise gzip and zlib by the bytes' own header.
+_INFLATED_CODINGS = frozenset({"gzip", "x-gzip", "deflate"})
+
+
+def sniff_decoded_body(content_encoding: str | None, wire: bytes, body: bytes) -> bool | None:
+    """The event-stream sniff over a response body, or None when the SDK never read that body.
+
+    `wire` is the body as sent, still in its content coding, and `body` what the SDK made of it,
+    inflated when it could. The sniff answers only for bytes that are the body's content: the
+    response declared no `Content-Encoding` (`identity` is none), or declared one gzip or deflate
+    layer and the SDK inflated it (`body` is not `wire`). Any other declared coding (`br`, `zstd`,
+    more than one layer), or a gzip or deflate nothing inflated (raw deflate, a corrupt stream),
+    leaves bytes the SDK did not read, whatever they look like: a brotli stream can begin with `[`,
+    and a few can even be valid text. The sniff itself answers None for a body that is not text
+    (`crates/wardex-protocol/src/sse.rs::sniff`).
+    """
+    codings = [c.strip().lower() for c in (content_encoding or "").split(",")]
+    codings = [c for c in codings if c and c != "identity"]
+    if codings and not (len(codings) == 1 and codings[0] in _INFLATED_CODINGS and body != wire):
+        return None
+    return _wardex_native.protocol.sniff_event_stream(body)  # type: ignore[no-any-return]
+
+
 def _to_parsed(raw: object) -> ParsedMessage:
     # raw: _wardex_native.protocol.RawHttpMessage
     return ParsedMessage(

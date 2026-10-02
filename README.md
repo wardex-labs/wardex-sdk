@@ -870,14 +870,18 @@ diagnostic line (traceback under `debug=True`).
   WebSocket session the SDK stopped following while it was still open (at
   `wardex.close()`, marked `ws_no_close`, or when its connection table was
   full, marked `connection_evicted`); and everything about a WebSocket
-  session but its length and sizes. Connection reuse is `false` only on a
-  connection the SDK saw open; on one opened before `init`, the first request
-  it sees (on HTTP/2, stream 1) carries none. A response is a stream when it
-  declared `text/event-stream` or its body read as one, and not a stream
-  when it declared none and its whole body read as something else; with no
-  declaration, a body that did not read as one and was cut by its capture
-  limit or is not text (binary, or compressed in a coding the SDK does not
-  inflate) says neither
+  session but its length and sizes. A WebSocket session cut while still open
+  (`ws_no_close` at `wardex.close()`, or `connection_evicted`) has a span that
+  ends at the cut, so the span's duration is not the session's length.
+  Connection reuse is `false` only on a connection the SDK saw open; on one
+  opened before `init`, the first request it sees (on HTTP/2, stream 1)
+  carries none. A response is a stream when it declared `text/event-stream`
+  or its body read as one, and not a stream when it declared none and its
+  whole body read as something else; with no declaration, a body that did
+  not read as one and was cut by its capture limit, is in a
+  `Content-Encoding` the SDK does not inflate (it inflates one gzip or zlib
+  layer; `br`, `zstd` and raw deflate stay unread, whatever their bytes look
+  like), or is not text (binary) says neither
 - gRPC (grpclib), WebSocket (`wss`;
   a Responses-over-WebSocket connection is captured at close and marked
   `ws_llm_semantics_unread` when the host is `api.openai.com` or a subdomain

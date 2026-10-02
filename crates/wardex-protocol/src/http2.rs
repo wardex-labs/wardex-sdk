@@ -84,6 +84,10 @@ pub struct Http2Transaction {
     pub path: String,
     pub status: u16,
     pub content_type: Option<String>,
+    /// The response's `content-encoding`, as declared: the coding its body
+    /// bytes are in. The request's is not kept; nothing reads a request body
+    /// as anything but bytes.
+    pub content_encoding: Option<String>,
     pub grpc_status: Option<i32>,
     pub grpc_message: Option<String>,
     pub request_body: Vec<u8>,
@@ -125,6 +129,7 @@ struct StreamState {
     // generous one.
     req_content_type: Option<String>,
     resp_content_type: Option<String>,
+    resp_content_encoding: Option<String>,
     grpc_status: Option<i32>,
     grpc_message: Option<String>,
     req_body: Vec<u8>,
@@ -489,6 +494,9 @@ impl Http2Connection {
                         st.resp_content_type = Some(ct);
                     }
                 }
+                b"content-encoding" if !from_client => {
+                    st.resp_content_encoding = Some(String::from_utf8_lossy(&value).into_owned());
+                }
                 b"grpc-status" => {
                     st.grpc_status = String::from_utf8_lossy(&value).trim().parse().ok();
                 }
@@ -617,6 +625,7 @@ impl Http2Connection {
                     // falling back to the request's. Cap selection in on_data
                     // does *not* use this merged value — see the comment there.
                     content_type: s.resp_content_type.or(s.req_content_type),
+                    content_encoding: s.resp_content_encoding,
                     grpc_status: s.grpc_status,
                     grpc_message: s.grpc_message,
                     request_body: s.req_body,
@@ -785,6 +794,31 @@ mod tests {
         assert_eq!(t.grpc_status, Some(5));
         assert_eq!(t.content_type.as_deref(), Some("application/grpc"));
         assert_eq!(t.status, 200);
+    }
+
+    #[test]
+    fn keeps_the_response_content_encoding_and_not_the_requests() {
+        let mut c = Http2Connection::new(Limits::default());
+        let req_block = hpack(&[
+            (b":method", b"POST"),
+            (b":path", b"/v1/chat/completions"),
+            (b"content-encoding", b"gzip"),
+        ]);
+        c.feed(true, &frame(0x1, FH | FS, 1, &req_block));
+        let resp_block = hpack(&[(b":status", b"200"), (b"content-encoding", b"br")]);
+        let mut resp = frame(0x1, FH, 1, &resp_block);
+        resp.extend_from_slice(&frame(0x0, FS, 1, b"\x5b\x35\xab"));
+        let r = c.feed(false, &resp);
+        assert_eq!(r.transactions.len(), 1);
+        assert_eq!(r.transactions[0].content_encoding.as_deref(), Some("br"));
+
+        // A response that names no coding has none, whatever the request declared.
+        let mut c = Http2Connection::new(Limits::default());
+        c.feed(true, &frame(0x1, FH | FS, 1, &req_block));
+        let plain = hpack(&[(b":status", b"200")]);
+        let r = c.feed(false, &frame(0x1, FH | FS, 1, &plain));
+        assert_eq!(r.transactions.len(), 1);
+        assert_eq!(r.transactions[0].content_encoding, None);
     }
 
     // Build a header block with the HPACK encoder (test-only — round-trips with real encoding)

@@ -28,7 +28,9 @@ and are not compared; only the contract is):
 
 from __future__ import annotations
 
+import base64
 import datetime
+import gzip
 import http.client
 import http.server
 import json
@@ -46,6 +48,7 @@ from wardex_sdk import _wardex_native
 from wardex_sdk._assembly import Limitation
 from wardex_sdk._enums import CaptureMode
 from wardex_sdk._limits import LimitsConfig
+from wardex_sdk._protocol import sniff_decoded_body
 from wardex_sdk._types import Envelope
 from wardex_sdk.testing import RecordingTransport
 from wardex_sdk.transport import _codec
@@ -461,6 +464,84 @@ def test_an_undeclared_body_that_is_not_text_says_nothing():
 def test_an_undeclared_text_body_with_no_event_line_is_not_streaming():
     payload = "안녕하세요, plain text.\n".encode()
     assert _is_streaming(payload, {"Content-Type": "text/plain"}) == (False, False)
+
+
+# `_korean_sse(600)` (109 KB of SSE) through `brotli -w 22`, the encoder's default quality. A
+# brotli stream whose one meta-block holds 64 KiB to 1 MiB begins with `[` (its window and length
+# bits), so a sniff that judged a body by its first byte read this stream as a JSON array.
+_SSE_600_BROTLI = base64.b64decode(
+    "WzWrAcSqwG4z/aSC9FybeYMB+VUEyQJTg6yrs4fIW1fiZWyqVswENhs2L36ICXrD43+oxaWs5NbvUWADziMeN92W6RbZ"
+    "gtkbOra8gLW6pAvoEyvBRAIcwQQH7tMbHpTjkdSW5nWR5BrdCiUQ9NVWy+KvQxLO6E0KJV7qEucXbXM5smPZMbElDoyB"
+    "voNHpPysy7/T3drGs7uOfKAW7UYaNKDNzyAaoFED7xENHG2Zi/DeegsB"
+)
+
+
+def test_an_undeclared_event_stream_in_brotli_says_nothing_though_it_begins_like_json():
+    assert _SSE_600_BROTLI[:1] == b"["
+    declared = {"Content-Type": "application/json", "Content-Encoding": "br"}
+    assert _is_streaming(_SSE_600_BROTLI, declared) == (None, None)
+    # Unlabelled, the same bytes are still not a body read as JSON: they are not text.
+    unlabelled = {"Content-Type": "application/octet-stream"}
+    assert _is_streaming(_SSE_600_BROTLI, unlabelled) == (None, None)
+
+
+def test_a_body_the_sdk_inflated_is_read_whole():
+    """The control: one gzip layer is undone, so the inflated body answers both ways."""
+    gzipped = {"Content-Type": "application/json", "Content-Encoding": "gzip"}
+    assert _is_streaming(gzip.compress(_JSON), gzipped) == (False, False)
+    assert _is_streaming(gzip.compress(_korean_sse(3)), gzipped) == (True, True)
+
+
+def test_the_sniff_answers_only_for_a_body_whose_declared_coding_was_undone():
+    """`sniff_decoded_body` over bytes that would read either way as text, so only the
+    declared coding decides: the SDK inflates one gzip or zlib layer and nothing else."""
+    sse, json_body = _korean_sse(1), _JSON
+    for coding in (None, "", "identity", " Identity "):
+        assert sniff_decoded_body(coding, sse, sse) is True
+        assert sniff_decoded_body(coding, json_body, json_body) is False
+    for coding in ("gzip", "x-gzip", "deflate", "GZIP"):
+        assert sniff_decoded_body(coding, b"<wire>", sse) is True  # inflated: body is not wire
+        assert sniff_decoded_body(coding, sse, sse) is None  # declared, but nothing inflated
+    for coding in ("br", "zstd", "compress", "gzip, br", "br, gzip", "gzip, gzip"):
+        assert sniff_decoded_body(coding, b"<wire>", sse) is None
+        assert sniff_decoded_body(coding, json_body, json_body) is None
+
+
+def _h2_is_streaming(payload: bytes, response_headers: list[tuple[bytes, bytes]]) -> Any:
+    """One HTTP/2 chat call answered with `payload` under `response_headers`."""
+    from hpack import Encoder
+
+    import test_span_class_survival as h
+    from wardex_sdk import _hub
+    from wardex_sdk._interceptors._trackers import _Http2Tracker
+
+    client = h._FakeClient()
+    _hub.set_client(client)
+    seam = h._seam(client, _Http2Tracker(_wardex_native.Limits()))
+    request_headers = [
+        (b":method", b"POST"),
+        (b":path", b"/v1/chat/completions"),
+        (b":authority", b"api.openai.com"),
+    ]
+    request = h._h2_frame(0x1, 0x4, 1, Encoder().encode(request_headers)) + h._h2_frame(
+        0x0, 0x1, 1, b'{"model":"gpt-4o","stream":true}'
+    )
+    status = [(b":status", b"200"), *response_headers]
+    response = h._h2_frame(0x1, 0x4, 1, Encoder().encode(status)) + h._h2_frame(
+        0x0, 0x1, 1, payload
+    )
+    h._drive_seam(seam, "api.openai.com", request, response)
+    (span,) = client.spans
+    return span.transport.is_streaming
+
+
+def test_an_http2_body_in_a_coding_the_sdk_does_not_inflate_says_nothing():
+    json_type = (b"content-type", b"application/json")
+    assert _h2_is_streaming(_SSE_600_BROTLI, [json_type, (b"content-encoding", b"br")]) is None
+    assert _h2_is_streaming(_JSON, [json_type, (b"content-encoding", b"br")]) is None
+    assert _h2_is_streaming(_JSON, [json_type]) is False
+    gzipped = gzip.compress(_JSON)
+    assert _h2_is_streaming(gzipped, [json_type, (b"content-encoding", b"gzip")]) is False
 
 
 def test_an_asyncio_connect_is_seen_open_but_not_timed():

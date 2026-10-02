@@ -111,8 +111,8 @@ All notable changes to this project are documented here. The format follows
   body read as a Server-Sent Events stream, `false` when it declared none and
   its whole body read as something else (JSON, or text with no event line),
   and unset when it declared none and its body was not read: not parsed, cut
-  by the capture limit, or not text (binary, or compressed in a coding the
-  SDK does not inflate); the five `TransportTiming` intervals are unset when
+  by the capture limit, in a `Content-Encoding` the SDK does not inflate, or
+  not text (binary); the five `TransportTiming` intervals are unset when
   they were not measured — including a connect time the seam marks
   `connect_timing_unavailable` (a socket connected before `init` and
   TLS-wrapped after it among them, and a plaintext connection opened by
@@ -146,6 +146,17 @@ All notable changes to this project are documented here. The format follows
   re-encoded as compact JSON (the payload as captured): a server's whitespace
   and needless `\u` escapes are not counted, so they are not the bytes on
   the pipe.
+- **`is_streaming` is unset, not `false`, for a response whose body the SDK
+  could not read.** A response that declares no event stream and whose body
+  is binary or undecodable — an `audio/mpeg` speech response, an
+  `application/octet-stream` download, a body in a `Content-Encoding` the SDK
+  does not inflate (`br`, `zstd`, raw deflate; it inflates one gzip or zlib
+  layer) — used to ship `is_streaming = false` on the wardex envelope, and
+  now ships it unset: the receiver's read API returns `null`, and on OTLP,
+  where the key is new in this release, `wardex.transport.is_streaming` is
+  absent. A filter or saved view on `is_streaming = false` no longer matches
+  those calls. `false` now means the SDK read the whole body and it was
+  something else (JSON, or text with no event line).
 - **`TransportAttributes.chunk_index` and `is_final_chunk` are removed.**
   Nothing ever filled them, so every span carried `0` and `true`. Their tags
   (25, 26) and names are reserved and will not be reused. The Python fields

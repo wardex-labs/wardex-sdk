@@ -2,7 +2,7 @@
 
 from .._wardex_native import protocol as _native_protocol
 from ._base import ProtocolParserInterface
-from ._http1 import Http1RequestParser, Http1ResponseParser
+from ._http1 import Http1RequestParser, Http1ResponseParser, sniff_decoded_body
 from ._http2 import Http2Parser
 
 parse_llm_semantics = _native_protocol.parse_llm_semantics
@@ -22,6 +22,7 @@ __all__ = [
     "Http2Parser",
     "parse_llm_semantics",
     "sniff_event_stream",
+    "sniff_decoded_body",
     "normalize_finish_reason",
     "classify_path",
     "classify_ws_upgrade",

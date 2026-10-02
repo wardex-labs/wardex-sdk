@@ -135,6 +135,11 @@ impl Http2Transaction {
     fn content_type(&self) -> Option<String> {
         self.inner.content_type.clone()
     }
+    /// The response's declared `content-encoding`; None when it named none.
+    #[getter]
+    fn content_encoding(&self) -> Option<String> {
+        self.inner.content_encoding.clone()
+    }
     #[getter]
     fn grpc_status(&self) -> Option<i32> {
         self.inner.grpc_status

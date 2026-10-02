@@ -385,17 +385,17 @@ Two emit sites, and the first is the mechanism the second restates.
     ADAPTER_UNINSTALLED = "adapter_uninstalled"
     """The span was closed by ``uninstall()`` rather than by the framework.
 
-    Emitted from ``_adapters/_anthropic_agent_sdk.py::uninstall``, which is also
-    the path an ordinary interpreter exit takes: ``atexit`` tears the adapter
-    down, so this — not ``UNIT_INTERRUPTED`` — is what a Ctrl-C ultimately puts
-    on the span. The two are not interchangeable. This one is mechanical and
-    always true of an uninstall; its sibling additionally claims the process was
-    cut off, which is only knowable in the signal handler.
+    Emitted from each adapter's ``uninstall`` (``_adapters/_anthropic_agent_sdk.py``,
+    ``_adapters/_langgraph.py``, ``_adapters/_openai_agents.py``), which is also the path an
+    ordinary interpreter exit takes: ``atexit`` tears the adapter down, so this — not
+    ``UNIT_INTERRUPTED`` — is what a Ctrl-C ultimately puts on the span. The two are not
+    interchangeable. This one is mechanical and always true of an uninstall; its sibling
+    additionally claims the process was cut off, which is only knowable in the signal handler.
 
-    Deliberately NOT merged with ``WS_NO_CLOSE`` even though both of today's
-    ``ws_no_close`` sites sit inside ``uninstall()``: the fact a user reads off
-    ``WS_NO_CLOSE`` is capture completeness (no CLOSE frame, so close code and
-    duration are untrustworthy), not lifecycle. The two are correct *together*.
+    Deliberately NOT merged with ``WS_NO_CLOSE``, which the byte seam's own ``uninstall()`` also
+    emits at ``wardex.close()``: that marker sits on a WebSocket span, never on an adapter's, and
+    its other site, the socket-close hook, involves no uninstall. What a user reads off it is
+    capture completeness (no CLOSE frame, so no close code), not lifecycle.
     """
 
     PATCH_SUPERSEDED = "patch_superseded"
@@ -409,10 +409,9 @@ Two emit sites, and the first is the mechanism the second restates.
     delete the other library's interception from a component that has just
     announced it is gone.
 
-    Detectable only at restore time, when the component has stopped producing
-    spans — so the live signal is the counter ``PatchSet`` bumps
-    (``<owner>.patch_superseded``), and ``PatchSet.limitations()`` offers the
-    member to any caller that does hold a span to hang it on.
+    Detectable only at restore time, when the component has stopped producing spans — so the live
+    signal is the counter ``PatchSet`` bumps (``<owner>.patch_superseded``), and
+    ``PatchSet.limitations()`` offers the member to any caller that does hold a span to hang it on.
     """
 
     INSTRUMENTATION_DEGRADED = "instrumentation_degraded"
@@ -982,11 +981,12 @@ Two emit sites, and the first is the mechanism the second restates.
     WS_NO_CLOSE = "ws_no_close"
     """The WebSocket span was emitted without ever seeing a CLOSE frame, so it has no close code.
 
-    Emitted from ``_interceptors/_seam.py::ByteSeamInterceptor._retire``, via
-    ``_WebSocketTracker.flush(marker)``, reached from ``uninstall()`` (the session goes on
-    unwatched, so it ships no length and no sizes) and from the shared socket-close hook
-    (``_connection_closed``: the socket is gone, so both are whole). The uninstall path travels
-    alongside ``ADAPTER_UNINSTALLED``; see that member for why they stay two markers.
+    Emitted from ``_interceptors/_seam.py::ByteSeamInterceptor._retire`` via
+    ``_WebSocketTracker.flush(marker)`` at two sites: the seam's own ``uninstall()``, run by
+    ``wardex.close()`` (the session goes on unwatched, so its span ends there with no length and no
+    sizes), and the socket-close hook (``_connection_closed``: the socket is gone, so both are
+    whole). ``ADAPTER_UNINSTALLED`` marks adapter spans, never this one; see that member for why
+    they stay two markers.
     """
 
     WS_LLM_SEMANTICS_UNREAD = "ws_llm_semantics_unread"
