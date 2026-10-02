@@ -895,8 +895,10 @@ diagnostic line (traceback under `debug=True`).
   the remote run's internals execute out of process and are not captured. A
   cached node ships no span — no work ran.
 - Framework adapter: **OpenAI Agents SDK** (`openai-agents>=0.22,<0.23`) —
-  auto-detected, hooked through the framework's own `TracingProcessor`,
-  nothing internal patched. One `invoke_workflow` per `Runner.run` /
+  auto-detected, hooked through the framework's own `TracingProcessor` and
+  its three public `Runner` entry points (wrapped only to read the run's
+  `conversation_id`, which the framework never hands its trace), nothing
+  internal patched. One `invoke_workflow` per `Runner.run` /
   `run_sync` / `run_streamed`, one `invoke_agent` per agent, a
   `handoff {from}→{to}` marker with the receiving agent as the sender's
   sibling (not nested — `wardex.agent.parent` and a `handoff_from`
@@ -907,7 +909,15 @@ diagnostic line (traceback under `debug=True`).
   every adapter span — unless the run sits inside the host's own
   `wardex.conversation(...)`, in which case the host's id stays on every
   span and the group id rides along on the root as
-  `wardex.openai_agents.group_id`. The LLM calls stay the wire's `chat` spans, parented
+  `wardex.openai_agents.group_id`. With no `group_id`, the
+  `conversation_id=…` passed to `Runner.run` / `run_sync` / `run_streamed`
+  (or recorded in the `RunState` a run resumes from) is the run's
+  conversation id the same way, host's id first. With both, the group id
+  stays the conversation and the requests' own id rides along on each LLM
+  call as `wardex.openai.conversation_id`. Under your own
+  `with trace(...)` around one or more runs, the root is your trace's and
+  carries no run's id; each run's agents, tools, handoffs and LLM calls
+  carry its own. The LLM calls stay the wire's `chat` spans, parented
   under the agent by context and carrying the run's conversation id; the
   adapter discards the framework's usage so nothing is billed twice. By
   default the framework's own upload to
@@ -921,10 +931,7 @@ diagnostic line (traceback under `debug=True`).
   `chat` spans carry no `gen_ai.agent.name` — filter by walking up the tree
   to the `invoke_agent` span; a Responses-over-WebSocket run stays the
   counted, marked connection (`ws_llm_semantics_unread`) with no structure
-  read from the frames; `Runner.run(conversation_id=…)` reaches only the
-  `chat` spans — the framework hands that id to the model call, never to its
-  trace, so the run's own spans carry it only when `group_id` (or your
-  `wardex.conversation(...)`) names it too; with the framework's tracing
+  read from the frames; with the framework's tracing
   disabled wardex logs one INFO line at install and shows only the LLM calls;
   a `max_turns` handled by
   `error_handlers` still ships ERROR on the agent and the root (the

@@ -5,10 +5,12 @@ workload must produce, and a run left open mid-tool. The claims are in
 `wardex_sdk.testing.conformance` and are the same ones the LangGraph and
 Agent SDK adapters answer next door.
 
-The seam is the framework's PROCESSOR TUPLE, not a patched attribute: the
-adapter registers one `TracingProcessor` and hands the framework its original
-tuple back on uninstall, and `tuple(t) is t` is what lets the suite's identity
-check hold on the way out. The model is an in-process fake implementing
+The main seam is the framework's PROCESSOR TUPLE, not a patched attribute:
+the adapter registers one `TracingProcessor` and hands the framework its
+original tuple back on uninstall, and `tuple(t) is t` is what lets the suite's
+identity check hold on the way out. The other three are `Runner`'s entry
+points, wrapped to read a run's `conversation_id` and handed back as the very
+classmethod objects they were. The model is an in-process fake implementing
 `agents.models.interface.Model`, so no HTTP happens and no wire span appears —
 the declared tree is the adapter's spans alone.
 
@@ -196,13 +198,21 @@ def _wardex_only_processors():
 
 
 def seams() -> dict[str, object]:
-    """The one attribute the adapter changes: the framework's processor tuple.
+    """The attributes the adapter changes: the framework's processor tuple,
+    and the three `Runner` entry points it wraps to read a run's
+    `conversation_id`.
 
-    Read through the framework's own provider rather than off the adapter: what
-    has to be restored is the FRAMEWORK's tuple, and asking the adapter what it
+    Read through the framework's own provider and `Runner`'s own namespace
+    rather than off the adapter: what has to be restored is the FRAMEWORK's
+    tuple and the framework's raw classmethods, and asking the adapter what it
     registered would take its word for the very thing under test.
     """
-    return {"provider.processors": get_trace_provider()._multi_processor._processors}
+    out: dict[str, object] = {
+        "provider.processors": get_trace_provider()._multi_processor._processors
+    }
+    for name in ("run", "run_sync", "run_streamed"):
+        out[f"Runner.{name}"] = vars(Runner)[name]
+    return out
 
 
 def workload(live):  # noqa: ANN001, ANN201
