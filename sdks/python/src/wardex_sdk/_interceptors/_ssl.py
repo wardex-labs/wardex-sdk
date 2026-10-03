@@ -47,6 +47,7 @@ class SSLInterceptor(ByteSeamInterceptor):
         self._patches.patch(sock, "send", self._mk_send("send", sock.send))
         self._patches.patch(sock, "recv", self._mk_recv(sock.recv))
         self._patches.patch(sock, "recv_into", self._mk_recv_into(sock.recv_into))
+        self._patches.patch(sock, "shutdown", self._mk_shutdown(sock.shutdown))
         self._patches.patch(obj, "write", self._mk_send("write", obj.write))
         self._patches.patch(obj, "read", self._mk_read(obj.read))
         self._acquire_probes()
@@ -153,6 +154,18 @@ class SSLInterceptor(ByteSeamInterceptor):
             except Exception:
                 pass
             return n
+
+        return wrapper
+
+    def _mk_shutdown(self, real: Any):  # noqa: ANN202
+        def wrapper(this: Any, *args: Any, **kwargs: Any) -> Any:
+            try:
+                return real(this, *args, **kwargs)
+            finally:
+                # `SSLSocket.shutdown` drops the TLS layer before the socket call, whatever `how`
+                # says and even when that call raises: no later empty read is the TLS stream's end.
+                with self._guard("interceptors.ssl.shutdown"):
+                    self._on_read_shutdown(this)
 
         return wrapper
 

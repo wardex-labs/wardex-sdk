@@ -94,6 +94,7 @@ class RawSocketInterceptor(ByteSeamInterceptor):
         self._patches.patch(sock, "sendall", self._mk_sendall(sock.sendall))
         self._patches.patch(sock, "recv", self._mk_recv(sock.recv))
         self._patches.patch(sock, "recv_into", self._mk_recv_into(sock.recv_into))
+        self._patches.patch(sock, "shutdown", self._mk_shutdown(sock.shutdown))
         self._acquire_probes()
         self._installed = True
 
@@ -252,5 +253,16 @@ class RawSocketInterceptor(ByteSeamInterceptor):
             except Exception:
                 pass
             return n
+
+        return wrapper
+
+    def _mk_shutdown(self, real: Any):  # noqa: ANN202
+        def wrapper(this: Any, *args: Any, **kwargs: Any) -> Any:
+            ret = real(this, *args, **kwargs)
+            with self._guard("interceptors.socket.shutdown"):
+                # After its own read side is shut, a socket's empty read is not the peer's EOF.
+                if args and args[0] in (socket.SHUT_RD, socket.SHUT_RDWR):
+                    self._on_read_shutdown(this)
+            return ret
 
         return wrapper

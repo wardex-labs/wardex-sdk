@@ -117,23 +117,21 @@ if TYPE_CHECKING:
 def _accepted_prefix(data: Any, n: int) -> Any:
     """The first `n` bytes of a send buffer, without materializing the rest.
 
-    `send`/`write` may report a SHORT write, and the caller then keeps the tail
-    and calls again with the whole remainder — asyncio's plaintext writer does
-    exactly that on 3.10/3.11 (`_write_ready` calls `send(self._buffer)` on one
-    bytearray and then `del self._buffer[:n]`). `bytes(data)[:n]` copies that
-    entire remainder before throwing away everything the kernel refused, so a
-    multi-megabyte body costs a copy per call: quadratic in body size, and on
-    the branch the gate deliberately leaves OPEN — a local plaintext model
-    server is HTTP, so it latches "http" and pays this on every partial write.
+    `send`/`write` may report a SHORT write, and the caller then keeps the tail and calls again with
+    the whole remainder — asyncio's plaintext writer does exactly that on 3.10/3.11 (`_write_ready`
+    calls `send(self._buffer)` on one bytearray and then `del self._buffer[:n]`). `bytes(data)[:n]`
+    copies that entire remainder before throwing away everything the kernel refused, so a
+    multi-megabyte body costs a copy per call: quadratic in body size, and on the branch the gate
+    deliberately leaves OPEN — a local plaintext model server is HTTP, so it latches "http" and pays
+    this on every partial write.
 
-    Returns something `bytes()` accepts rather than `bytes`, so that an exact
-    `bytes` argument written in full stays the same object and costs nothing at
-    all; the caller materializes once, immediately.
+    Returns something `bytes()` accepts rather than `bytes`, so that an exact `bytes` argument
+    written in full stays the same object and costs nothing at all; the caller materializes once,
+    immediately.
 
-    The three arms are an isinstance chain rather than a `try`, because a
-    handler here would be a silent swallow on a path that has a correct answer
-    without one: anything that is not one of the three buffer types the socket
-    API actually takes falls through to what this line used to be.
+    The three arms are an isinstance chain rather than a `try`, because a handler here would be a
+    silent swallow on a path that has a correct answer without one: anything that is not one of the
+    three buffer types the socket API actually takes falls through to what this line used to be.
     """
     if isinstance(data, bytes):
         return data[:n]
@@ -152,21 +150,19 @@ def _http_error(txn: Any) -> bool:
 def _is_llm_traffic(txn: Any, sem: Any) -> bool:
     """Is this an LLM call, for the capture policy and for the gen_ai block alike?
 
-    One predicate for both questions on purpose: a transaction the gate admits
-    as agent traffic and then leaves with `gen_ai=None` is worse than either
-    answer alone — captured volume with no identity on it.
+    One predicate for both questions on purpose: a transaction the gate admits as agent traffic and
+    then leaves with `gen_ai=None` is worse than either answer alone — captured volume with no
+    identity on it.
 
-    The request-side half is admitted only for an HTTP ERROR, and that is the
-    narrow reading rather than the tidy one. Both provider gates in the Rust
-    parser are SUBSTRING matches on host and path, so an internal service at
-    `anthropic-proxy.corp/v1/messages` whose body happens to carry a `model`
-    field parses as an Anthropic chat call. On a 2xx that shape is genuinely
-    ambiguous — it may be an LLM endpoint wardex cannot read, or not an LLM
-    endpoint at all — and it is already dropped today, so admitting it would be
-    a behaviour change nobody asked for on traffic nobody identified. A 4xx/5xx
-    from a host and path that parse as a provider is not ambiguous in the same
-    way: the request was addressed to a chat endpoint with a model on it, and
-    the reply is the provider refusing. That is the call the fix is about.
+    The request-side half is admitted only for an HTTP ERROR, and that is the narrow reading rather
+    than the tidy one. Both provider gates in the Rust parser are SUBSTRING matches on host and
+    path, so an internal service at `anthropic-proxy.corp/v1/messages` whose body happens to carry a
+    `model` field parses as an Anthropic chat call. On a 2xx that shape is genuinely ambiguous — it
+    may be an LLM endpoint wardex cannot read, or not an LLM endpoint at all — and it is already
+    dropped today, so admitting it would be a behaviour change nobody asked for on traffic nobody
+    identified. A 4xx/5xx from a host and path that parse as a provider is not ambiguous in the same
+    way: the request was addressed to a chat endpoint with a model on it, and the reply is the
+    provider refusing. That is the call the fix is about.
     """
     return has_core_semantics(sem) or (_http_error(txn) and identifies_llm_call(sem))
 
@@ -183,6 +179,7 @@ class _ConnectionState:
         # Read off the socket by `_state`, for `_seal` once the socket is gone (`_retire`).
         self.server_hostname, self.connection_id = hostname, ""
         self.timing_consumed = False
+        self.read_shut = False  # the client shut its own read side: see `_on_read_shutdown`
         self.h2_opening: tuple[Any, ...] | None = None  # see `opening_timing`
         self.gate: str | None = None  # None=undetermined, "http", "h2c", "h2", "ignore"
         # This state was built for a socket that OUTLIVED an os.fork(): the tracker starts
@@ -199,16 +196,15 @@ class _ConnectionState:
     def latched_off(self) -> bool:
         """Has the sniff-latch already ruled this connection out for good?
 
-        The early gate acts on this answer, so what matters is that it is
-        STABLE: each seam's `_gate` writes `gate` once, from the first bytes it
-        sees, and never revisits it (see the two `_gate` docstrings, and
-        `test_latch_stays_ignore_once_closed`). "ignore" is therefore a fact
-        about the connection rather than about the call that observed it, which
-        is what makes it safe to skip the buffer copy on every later call.
+        The early gate acts on this answer, so what matters is that it is STABLE: each seam's
+        `_gate` writes `gate` once, from the first bytes it sees, and never revisits it (see the two
+        `_gate` docstrings, and `test_latch_stays_ignore_once_closed`). "ignore" is therefore a fact
+        about the connection rather than about the call that observed it, which is what makes it
+        safe to skip the buffer copy on every later call.
 
-        Asked as "is it ignore" rather than "is it one of the live protocols"
-        so that `None` — undetermined, the state of a connection whose first
-        bytes have not arrived — reads as "keep going", never as "drop".
+        Asked as "is it ignore" rather than "is it one of the live protocols" so that `None` —
+        undetermined, the state of a connection whose first bytes have not arrived — reads as "keep
+        going", never as "drop".
         """
         return self.gate == "ignore"
 
@@ -434,13 +430,11 @@ class ByteSeamInterceptor(InterceptorInterface):
     def _transport_prefilter(self, st: _ConnectionState) -> Prefilter:
         """This seam's opinion about the connection itself, before the policy.
 
-        `DEFER` is the base answer, and it is the honest one for a TLS seam: it
-        knows nothing about the peer that `assembly.should_capture` does not
-        already know better. A seam that DOES know something — the plaintext
-        socket seam, which must never read a link-local metadata endpoint and
-        must always honour `intercept_hosts` — overrides this, and only this.
-        Overriding `_should_capture` itself is what produced the two bugs
-        design §4.4 names.
+        `DEFER` is the base answer, and it is the honest one for a TLS seam: it knows nothing about
+        the peer that `assembly.should_capture` does not already know better. A seam that DOES know
+        something — the plaintext socket seam, which must never read a link-local metadata endpoint
+        and must always honour `intercept_hosts` — overrides this, and only this. Overriding
+        `_should_capture` itself is what produced the two bugs design §4.4 names.
         """
         return Prefilter.DEFER
 
@@ -572,10 +566,17 @@ class ByteSeamInterceptor(InterceptorInterface):
         """A read that asked for bytes got none: the peer closed its side. The HTTP/1 tracker ends
         a body with no framing here (`on_response_eof`) and its span ships while `obj` is live."""
         st = self._conns.get(id(obj))
-        if st is None or not self._capture_possible(obj):
+        if st is None or st.read_shut or not self._capture_possible(obj):
             return
         for txn in getattr(st.tracker, "on_response_eof", list)():
             self._emit_span(obj, st, txn)
+
+    def _on_read_shutdown(self, obj: Any) -> None:
+        """The client shut its own read side (`shutdown`): from here an empty read is that
+        shutdown's answer, not the peer's EOF, so nothing in flight is ended by one — the close
+        that follows ships it as let go."""
+        if (st := self._conns.get(id(obj))) is not None:
+            st.read_shut = True
 
     def _prefilter_of(self, st: _ConnectionState) -> Prefilter:
         """This seam's transport prefilter, evaluated NOW and fail-open.
@@ -875,25 +876,23 @@ def _parse_semantics(p: _PendingTxn) -> Any:
 def _should_capture(
     prefilter: Prefilter, txn: Any, sem: Any, *, mode: CaptureMode, unparsed: bool = False
 ) -> bool:
-    """The seam's capture decision: the transport prefilter composed with the
-    one shared policy. The old method of the same name, made a function of
-    its inputs (so the worker can ask it over a sealed `_PendingTxn`).
+    """The seam's capture decision: the transport prefilter composed with the one shared policy. The
+    old method of the same name, made a function of its inputs (so the worker can ask it over a
+    sealed `_PendingTxn`).
 
-    `unparsed` widens `degraded` (§3.9): "wardex is the reason a gate input
-    is missing" now covers the SEMANTIC CLAIM as well as the parent — a
-    fallback that skipped the parse cannot honestly answer `agent_semantic`,
-    exactly as `degraded_run` cannot honestly answer `parent`. The policy's
+    `unparsed` widens `degraded` (§3.9): "wardex is the reason a gate input is missing" now covers
+    the SEMANTIC CLAIM as well as the parent — a fallback that skipped the parse cannot honestly
+    answer `agent_semantic`, exactly as `degraded_run` cannot honestly answer `parent`. The policy's
     signature does not change; the widening is this caller's input.
 
-    A WS session that confirmed LLM calls crossed it claims `agent_semantic`
-    without a `sem`: the calls happened, wardex did not read them, and the
-    marked span is the only place that fact can ship.
+    A WS session that confirmed LLM calls crossed it claims `agent_semantic` without a `sem`: the
+    calls happened, wardex did not read them, and the marked span is the only place that fact can
+    ship.
 
-    Failing OPEN around the composition stays this function's job rather
-    than the policy's: `has_core_semantics` runs parser output through
-    host-supplied objects and can raise, `should_capture` cannot — so the
-    swallow sits where the risk is (design §5.1: losing data is worse than
-    noise).
+    Failing OPEN around the composition stays this function's job rather than the policy's:
+    `has_core_semantics` runs parser output through host-supplied objects and can raise,
+    `should_capture` cannot — so the swallow sits where the risk is (design §5.1: losing data is
+    worse than noise).
     """
     try:
         if prefilter is Prefilter.DENY:
@@ -1163,19 +1162,18 @@ def _assemble(p: _PendingTxn, *, parse: bool, extra: tuple[Limitation, ...]) -> 
 def _latched(txn: _Txn) -> Ambient:
     """The scope as it was when this transaction's request was ISSUED.
 
-    Both emit paths run on the RESPONSE side, where the ambient context has
-    already moved on — so neither may call `latch_ambient()` itself. The tracker
-    did the latching at request time (`_trackers.py`, `self._parent`), and this
-    wraps what it captured in the shape `resolve_parentage` consumes.
+    Both emit paths run on the RESPONSE side, where the ambient context has already moved on — so
+    neither may call `latch_ambient()` itself. The tracker did the latching at request time
+    (`_trackers.py`, `self._parent`), and this wraps what it captured in the shape
+    `resolve_parentage` consumes.
 
-    `parent_closed` travels BESIDE this rather than inside the `Ambient`, for
-    the same reason: it is a fact about the latch INSTANT, and an `Ambient` is
-    the shape `resolve_parentage` consumes, not a place to keep one seam's
-    bookkeeping. `_build_span` and `_build_ws_span` pass it explicitly.
+    `parent_closed` travels BESIDE this rather than inside the `Ambient`, for the same reason: it is
+    a fact about the latch INSTANT, and an `Ambient` is the shape `resolve_parentage` consumes, not
+    a place to keep one seam's bookkeeping. `_build_span` and `_build_ws_span` pass it explicitly.
 
-    `conversation` was latched beside the parent, off the same scope read.
-    `tracestate` is None: the tracker does not latch it, and widening to a full
-    `Ambient` belongs with the seam decomposition (design §3.3).
+    `conversation` was latched beside the parent, off the same scope read. `tracestate` is None: the
+    tracker does not latch it, and widening to a full `Ambient` belongs with the seam decomposition
+    (design §3.3).
     """
     return Ambient(span_context=txn.parent, conversation=txn.conversation, tracestate=None)
 

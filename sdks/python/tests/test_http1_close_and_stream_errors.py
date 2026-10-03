@@ -16,10 +16,11 @@ Two holes, both silent before:
   status OK, no finish reason, and nothing in its body naming the failure.
 
 The line between "whole" and "cut short" is the peer's EOF: a read that asked
-for bytes and got none. A close the CLIENT makes first is not it — that is a
-stream let go, and shipping it as whole would claim an end nobody saw. And what
-counts as the end is the response's own framing, which for an answer to HEAD or
-CONNECT the request decides: no body, so nothing is in flight to be cut.
+for bytes and got none. A close the CLIENT makes first is not it, nor is the
+empty read after the client shut its own read side — that is a stream let go,
+and shipping it as whole would claim an end nobody saw. And what counts as the
+end is the response's own framing, which for an answer to HEAD or CONNECT the
+request decides: no body, so nothing is in flight to be cut.
 """
 
 from __future__ import annotations
@@ -330,6 +331,40 @@ def test_a_tls_response_ending_with_its_connection_names_the_tls_host(peer_close
     assert span.transport.http.url.startswith("https://llm.example.test:")
     assert span.status is (StatusCode.OK if peer_closes else StatusCode.UNSET)
     assert (Limitation.FRAME_PARSE_FAILED in _markers(span)) is not peer_closes
+
+
+@pytest.mark.parametrize("tls", [False, True], ids=["plaintext", "tls"])
+def test_a_client_that_shuts_its_own_read_side_has_let_the_stream_go(tls: bool):
+    """After `shutdown(SHUT_RD)` the client's own reads come back empty while the
+    server still holds the stream open. That empty read is the client letting
+    go, not the server ending the body, so the span says the end was not seen."""
+    hold = threading.Event()
+    port = _serve_once(UNFRAMED + CUT_SSE, tls=tls, hold=hold)
+    request = (
+        b"POST /v1/chat/completions HTTP/1.1\r\nHost: llm.example.test\r\n"
+        + f"Content-Length: {len(CHAT_REQUEST)}\r\n\r\n".encode()
+        + CHAT_REQUEST
+    )
+
+    def drive() -> None:
+        raw = socket.create_connection(("127.0.0.1", port), timeout=5)
+        sock = _client_tls().wrap_socket(raw, server_hostname="llm.example.test") if tls else raw
+        with sock:
+            sock.sendall(request)
+            sock.recv(65536)  # the headers and part of the body
+            sock.shutdown(socket.SHUT_RD)
+            while sock.recv(65536):  # ends at the client's own shutdown, not the server's
+                pass
+
+    try:
+        span = _one_chat_span(_captured(drive))
+    finally:
+        hold.set()
+
+    assert Limitation.FRAME_PARSE_FAILED in _markers(span)
+    assert span.status is StatusCode.UNSET
+    assert span.capture_integrity.truncated is True
+    assert span.transport.response_size is None
 
 
 @pytest.mark.parametrize("server_closes", [True, False], ids=["server-closes", "client-closes"])
