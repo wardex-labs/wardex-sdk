@@ -14,9 +14,14 @@ evidence: an `Exception` leaving the run (`failure_leaving`). The agent and
 trace spans close INSIDE the call, on that exception's way out, so it is read
 there, where it is in flight; holding them open until the entry point returns
 would move every run's end instants, a handoff sender's past its receiver's.
-The entry point's own exit then checks the verdict after the fact: a call
-that raised after the root it opened closed OK is counted and said once,
-because that root under-reports the failure and nothing else would tell.
+The call's exit then settles what is left. A root still open there — the one
+the HOST opened around the call (`with trace(...)`) — takes the exception's
+class name unless an agent already failed it, since no span of the run need
+be open when it raises (a run that fails between two agents). A root the call
+opened that closed OK is counted and said once, because it under-reports the
+failure and nothing else would tell. `run_streamed` returns before its run
+does, so its exit is the end of the framework's run-loop task, the outcome
+the stream hands the host.
 
 The three public entry points — `Runner.run`, `run_sync` and `run_streamed` —
 are wrapped to READ the argument and the outcome, and do nothing else: no
@@ -41,6 +46,7 @@ conversation.
 
 from __future__ import annotations
 
+import asyncio
 import contextvars
 import functools
 import sys
@@ -79,18 +85,29 @@ RUN_REQUEST: contextvars.ContextVar[RunRequest | None] = contextvars.ContextVar(
 
 
 class RunCall:
-    """One entry-point call while it runs, whatever it names.
+    """One entry-point call while it runs, whatever it names, and the root it runs under.
 
-    A trace that STARTS while a call is current is the one the framework
-    opened for that call — a trace the host opened around the call started
-    before it — so its root reads the call's outcome at its close, and records
-    here whether it closed OK for the call's exit to check.
+    `root` is that root's run state: the one the HOST opened around the call,
+    read at the call's entry, or else the one the framework opens inside it
+    (`opened_by_call`). A trace that STARTS while a call is current is the
+    framework's for that call — a trace the host opened started before it — so
+    its root reads the call's outcome at its close, and records in
+    `root_closed_ok` whether it closed OK for the call's exit to check.
     """
 
-    __slots__ = ("root_closed_ok",)
+    __slots__ = ("root", "root_closed_ok")
 
-    def __init__(self) -> None:
+    def __init__(self, root: dict[str, Any] | None) -> None:
+        self.root = root
         self.root_closed_ok: bool | None = None
+
+    def undecided(self) -> bool:
+        """Whether the call's outcome could still change what ships: its own
+        root closed OK, or its root is open with no error yet."""
+        run = self.root
+        if self.root_closed_ok:
+            return True
+        return run is not None and run.get("handle") is not None and run.get("first_error") is None
 
 
 #: The entry-point call the current task or thread is inside, or None.
@@ -99,9 +116,14 @@ RUN_CALL: contextvars.ContextVar[RunCall | None] = contextvars.ContextVar(
 )
 
 
-def current_call() -> RunCall | None:
-    """The entry-point call in progress on this task or thread, or None."""
-    return RUN_CALL.get()
+def opened_by_call(run: dict[str, Any]) -> RunCall | None:
+    """The entry-point call in progress here, whose framework opened the root
+    `run` is the state of, or None when no call is. A call already under a
+    root keeps it: that is the one its failure belongs to."""
+    call = RUN_CALL.get()
+    if call is not None and call.root is None:
+        call.root = run
+    return call
 
 
 def failure_leaving(host_inflight: BaseException | None) -> str | None:
@@ -175,17 +197,24 @@ def call_conversation(ctx: AdapterContext, run: dict[str, Any]) -> ConversationC
 # -- the hook ------------------------------------------------------------------
 
 
-def install_entry_hook(ctx: AdapterContext, live: Callable[[], bool]) -> None:
+def install_entry_hook(
+    ctx: AdapterContext,
+    live: Callable[[], bool],
+    host_root: Callable[[], dict[str, Any] | None],
+) -> None:
     """Group 3 of the adapter's probe, declined on its own without touching
     the processor.
 
     Without it every span still ships; what is lost is a run's
     `conversation_id` on the run's own spans, which then reaches its LLM calls
-    alone (they read it off the request). Through `ctx.patches`, so uninstall
-    hands each classmethod back by identity and a patch another library laid
-    over ours is left in place. `live` answers whether the adapter is still
-    installed: a wrapper someone kept a reference to only passes calls through
-    once it is not.
+    alone (they read it off the request), and the failure of a run that raised
+    with none of its spans open, under a root the host opened. Through
+    `ctx.patches`, so uninstall hands each classmethod back by identity and a
+    patch another library laid over ours is left in place. `live` answers
+    whether the adapter is still installed: a wrapper someone kept a reference
+    to only passes calls through once it is not. `host_root` answers, at a
+    call's entry, the state of the root the host opened that the call runs
+    under, or None.
     """
     run_mod = None
     surface = None
@@ -206,7 +235,7 @@ def install_entry_hook(ctx: AdapterContext, live: Callable[[], bool]) -> None:
     state_cls = state_cls if isinstance(state_cls, type) else None
     runner = run_mod.Runner
     for name, awaited in ENTRY_POINTS:
-        reader = _Reader(ctx, live, state_cls, surface[name])
+        reader = _Reader(ctx, live, host_root, state_cls, surface[name], name == "run_streamed")
         ctx.patches.patch(runner, name, _wrap(vars(runner)[name], reader, awaited=awaited))
 
 
@@ -244,22 +273,27 @@ def _entry_surface(run_mod: Any) -> dict[str, tuple[int | None, int | None]] | N
 
 class _Reader:
     """What one wrapped entry point needs to read a call: the adapter's
-    context and liveness, the framework's `RunState`, and where the entry point
-    takes `input` and `conversation_id` positionally."""
+    context, liveness and host-root lookup, the framework's `RunState`, where
+    the entry point takes `input` and `conversation_id` positionally, and
+    whether its outcome arrives after it returns (`run_streamed`)."""
 
-    __slots__ = ("ctx", "live", "state_cls", "input_at", "conversation_at")
+    __slots__ = ("ctx", "live", "host_root", "state_cls", "input_at", "conversation_at", "streamed")
 
     def __init__(
         self,
         ctx: AdapterContext,
         live: Callable[[], bool],
+        host_root: Callable[[], dict[str, Any] | None],
         state_cls: type | None,
         at: tuple[int | None, int | None],
+        streamed: bool,
     ) -> None:
         self.ctx = ctx
         self.live = live
+        self.host_root = host_root
         self.state_cls = state_cls
         self.input_at, self.conversation_at = at
+        self.streamed = streamed
 
     def request(self, args: tuple[Any, ...], kwargs: dict[str, Any]) -> RunRequest | None:
         """The conversation the call names, or None.
@@ -293,18 +327,17 @@ class _Reader:
         request = None
         with self.ctx.guard("run_entry"):
             request = self.request(args, kwargs)
-        record = RunCall()
+        root = None
+        with self.ctx.guard("run_entry_root"):
+            root = self.host_root()
+        record = RunCall(root)
         return [call], (RUN_REQUEST.set(request), RUN_CALL.set(record), record)
 
-    def leave(self, entered: tuple[Any, ...] | None, raised: BaseException | None) -> None:
-        """Reset the call's variables, then check the verdict against what the host gets.
-
-        A call that raised an `Exception` after the root it opened closed OK
-        means that root under-reports a failure — the framework closed it off
-        the exception's path — and the span cannot be reopened, so the miss is
-        counted and said once. The message stays off the line: it can be host
-        content.
-        """
+    def leave(
+        self, entered: tuple[Any, ...] | None, raised: BaseException | None, result: Any = None
+    ) -> None:
+        """Reset the call's variables, then settle the call's outcome: the
+        exception that left it, or for `run_streamed` the end of its run."""
         if entered is None:
             return
         request_token, call_token, record = entered
@@ -314,9 +347,53 @@ class _Reader:
             RUN_REQUEST.reset(request_token)
         with self.ctx.guard("run_exit"):
             RUN_CALL.reset(call_token)
-        if not isinstance(raised, Exception) or not record.root_closed_ok:
+        if raised is not None:
+            self.settle(record, raised)
+        elif self.streamed:
+            with self.ctx.guard("run_outcome"):
+                self.watch(record, result)
+
+    def watch(self, record: RunCall, result: Any) -> None:
+        """Settle a streamed call when the framework's run-loop task ends.
+
+        That task's exception is the one the stream raises to the host once it
+        is drained. The callback holds the call's record and never the result,
+        which keeps caller-visible run data. `Task.exception()` counts as
+        retrieving the exception, so it is read only while the outcome could
+        still change what ships, and a cancelled run is never asked.
+        """
+        task = getattr(result, "run_loop_task", None)
+        if not isinstance(task, asyncio.Future):
+            self.ctx.count("streamed_outcome_unreadable")
+            return
+
+        def ended(task: asyncio.Future[Any]) -> None:
+            # Contained like every other read: a raise here would reach the host loop's handler.
+            if not self.live():
+                return
+            with self.ctx.guard("run_outcome"):
+                if not task.cancelled() and record.undecided():
+                    self.settle(record, task.exception())
+
+        task.add_done_callback(ended)
+
+    def settle(self, record: RunCall, raised: BaseException | None) -> None:
+        """What an `Exception` leaving the call changes; anything else is no failure.
+
+        A root still open takes the exception's class name unless something
+        already failed it: the one the host opened around the call, which
+        outlives it. A root the call opened that closed OK under-reports the
+        failure — the framework closed it off the exception's path — and the
+        span cannot be reopened, so the miss is counted and said once. The
+        message stays off the line: it can be host content.
+        """
+        if not isinstance(raised, Exception) or not record.undecided():
             return
         with self.ctx.guard("run_outcome"):
+            if not record.root_closed_ok:
+                record.root["first_error"] = type(raised).__name__  # type: ignore[index]
+                self.ctx.count("root_failed_at_call_exit")
+                return
             self.ctx.count("run_raised_after_root_ok")
             report_once(
                 "openai-agents adapter: a run raised to its caller after its run root had "
@@ -358,7 +435,7 @@ def _wrap(original: Any, reader: _Reader, *, awaited: bool) -> classmethod:  # t
             except BaseException as exc:
                 reader.leave(entered, exc)
                 raise
-            reader.leave(entered, None)
+            reader.leave(entered, None, result)
             return result
 
     else:
@@ -371,7 +448,7 @@ def _wrap(original: Any, reader: _Reader, *, awaited: bool) -> classmethod:  # t
             except BaseException as exc:
                 reader.leave(entered, exc)
                 raise
-            reader.leave(entered, None)
+            reader.leave(entered, None, result)
             return result
 
     functools.update_wrapper(entry, original.__func__)

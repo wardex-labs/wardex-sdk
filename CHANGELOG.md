@@ -291,12 +291,17 @@ All notable changes to this project are documented here. The format follows
   message names it. A run that fails between two agents (after a handoff,
   before the receiver starts) fails its root too, and an error message the
   adapter does not recognise no longer leaves the root OK when the run
-  raised. A tool failure the framework handled and moved past still marks
-  only the tool span, a nested agent-as-tool run that raised marks only its
-  own agent, and a cancelled run is not a failure. Should a framework release
-  close the root before the exception reaches your code, the run is counted
-  under `adapters.openai_agents.run_raised_after_root_ok` and said once
-  instead of shipping a silent OK.
+  raised. When the root is a trace you opened yourself (`with trace(...)`
+  around the run), a run inside it that raised to your code fails that root
+  even when no agent was running at the time, and even if you catch the
+  exception inside the trace, as a retry does. A tool failure the framework
+  handled and moved past still marks only the tool span, a nested run that
+  raised to a tool (agent-as-tool, or a tool that runs an agent itself and
+  handles its failure) marks only its own agent, and a cancelled run is not a
+  failure. Should a framework release close the root before the exception
+  reaches your code (for `run_streamed`, before its run ends), the run is
+  counted under `adapters.openai_agents.run_raised_after_root_ok` and said
+  once instead of shipping a silent OK.
 - **Values the SDK makes itself are no longer masked as a card number, and
   a span's masking record no longer reports a card that was never there.**
   The case that showed it is a span's connection id, a value the SDK makes
