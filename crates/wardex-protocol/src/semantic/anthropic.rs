@@ -560,6 +560,23 @@ mod tests {
         assert_eq!(msgs[0]["parts"][0]["content"], "Hel");
     }
 
+    /// An `error` event as the stream's ONLY event, before anything named an
+    /// id or a model: still the provider's failure declaration. No response
+    /// field names the model, so the seam keeps this call on the request's
+    /// model and this declaration together; none is invented here.
+    #[test]
+    fn an_error_event_alone_still_declares_the_failure() {
+        let sse = b"event: error\ndata: {\"type\":\"error\",\
+                    \"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n";
+        let s = messages(br#"{"model":"claude-sonnet-4-6","stream":true}"#, sse);
+        assert_eq!(s.error_type.as_deref(), Some("overloaded_error"));
+        assert_eq!(s.finish_reasons, Some(vec!["error".to_string()]));
+        assert_eq!(s.stream_terminated, Some(true));
+        assert_eq!(s.request_model.as_deref(), Some("claude-sonnet-4-6"));
+        assert_eq!(s.response_model, None);
+        assert_eq!(s.response_id, None);
+    }
+
     /// The HTTP error envelope every 4xx/5xx carries is NOT a response
     /// object: no finish, no output message, no declared error type. That
     /// span keeps taking its error from the HTTP status.

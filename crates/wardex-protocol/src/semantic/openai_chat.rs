@@ -599,6 +599,23 @@ mod tests {
         assert!(body.get("error").is_none(), "{body}");
     }
 
+    /// An `error` chunk as the stream's ONLY event, before anything named an
+    /// id or a model: still the provider's failure declaration. No response
+    /// field names the model, so the seam keeps this call on the request's
+    /// model and this declaration together; none is invented here.
+    #[test]
+    fn an_error_chunk_alone_still_declares_the_failure() {
+        let sse = b"data: {\"error\":{\"message\":\"x\",\"type\":\"server_error\",\
+                    \"param\":null,\"code\":null}}\n\n";
+        let s = chat(br#"{"model":"gpt-4o","stream":true}"#, sse);
+        assert_eq!(s.error_type.as_deref(), Some("server_error"));
+        assert_eq!(s.finish_reasons, Some(vec!["error".to_string()]));
+        assert_eq!(s.stream_terminated, Some(true));
+        assert_eq!(s.request_model.as_deref(), Some("gpt-4o"));
+        assert_eq!(s.response_model, None);
+        assert_eq!(s.response_id, None);
+    }
+
     /// The HTTP error envelope every 4xx/5xx carries is NOT a response
     /// object: no finish, no output message, no declared error type. That
     /// span keeps taking its error from the HTTP status.
