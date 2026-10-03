@@ -400,11 +400,11 @@ pub(super) fn reassemble_openai(events: &[SseEvent]) -> Reassembled {
     // unterminated stream when its last chunk said why it stopped.
     let mut terminated = false;
     // The in-stream failure: a chunk whose top-level `error` is the
-    // provider's error object (the shape the OpenAI SDK raises `APIError`
-    // from mid-stream). The only bytes that name the failure, so they are
-    // kept for the synthetic body, and a terminal form: the provider said
-    // why the stream ends. Such a chunk carries no choice, so only a chunk
-    // without one is asked — the ordinary chunk pays nothing for this.
+    // provider's error object (the OpenAI SDK raises `APIError` on any chunk
+    // that sets it). The only bytes that name the failure, so they are kept
+    // for the synthetic body, and a terminal form: the provider said why the
+    // stream ends. Asked of every chunk, choices or not: OpenRouter's
+    // documented mid-stream error carries a choice beside the error.
     let mut error: Option<serde_json::Value> = None;
     for ev in events {
         if ev.data.trim() == "[DONE]" {
@@ -462,7 +462,8 @@ pub(super) fn reassemble_openai(events: &[SseEvent]) -> Reassembled {
                 finish = Some(fr.to_string());
                 terminated = true;
             }
-        } else if let Some(e) = v.get("error").filter(|e| !e.is_null()) {
+        }
+        if let Some(e) = v.get("error").filter(|e| !e.is_null()) {
             error = Some(e.clone());
             terminated = true;
         }
@@ -584,6 +585,51 @@ mod tests {
             let s = chat(br#"{"model":"m"}"#, sse.as_bytes());
             assert_eq!(s.error_type.as_deref(), Some(expected), "{error}");
             assert_eq!(s.finish_reasons, Some(vec!["error".to_string()]), "{error}");
+        }
+    }
+
+    /// An `error` chunk that ALSO carries a `choices` array is still the
+    /// provider's failure declaration. OpenRouter documents its mid-stream
+    /// error that way: the error at the top level plus a choice whose finish
+    /// is `"error"`. A choice with no finish at all, or an empty array, must
+    /// not hide the error either: the OpenAI SDK raises on any chunk whose
+    /// top-level `error` is set, whatever else the chunk holds.
+    #[test]
+    fn an_error_chunk_that_also_carries_choices_still_declares_the_failure() {
+        let head =
+            r#"data: {"id":"c","model":"m","choices":[{"index":0,"delta":{"content":"Hel"}}]}"#;
+        for (choices, error, expected) in [
+            (
+                r#"[{"index":0,"delta":{"content":""},"finish_reason":"error","native_finish_reason":"error"}]"#,
+                r#"{"code":502,"message":"Provider returned error","metadata":{"error_type":"upstream"}}"#,
+                "502",
+            ),
+            (
+                r#"[{"index":0,"delta":{},"finish_reason":null}]"#,
+                r#"{"message":"boom","type":"server_error","param":null,"code":null}"#,
+                "server_error",
+            ),
+            (
+                "[]",
+                r#"{"message":"boom","type":"server_error","param":null,"code":null}"#,
+                "server_error",
+            ),
+        ] {
+            let sse = format!(
+                "{head}\n\ndata: {{\"id\":\"c\",\"model\":\"m\",\"error\":{error},\"choices\":{choices}}}\n\n"
+            );
+            let s = chat(br#"{"model":"m","stream":true}"#, sse.as_bytes());
+            assert_eq!(s.error_type.as_deref(), Some(expected), "{choices}");
+            assert_eq!(
+                s.finish_reasons,
+                Some(vec!["error".to_string()]),
+                "{choices}"
+            );
+            assert_eq!(s.stream_terminated, Some(true), "{choices}");
+            let body = json(s.decoded_response.as_deref());
+            assert_eq!(body["error"], json(Some(error.as_bytes())), "{choices}");
+            let msgs = json(s.output_messages.as_deref().map(str::as_bytes));
+            assert_eq!(msgs[0]["parts"][0]["content"], "Hel", "{choices}");
         }
     }
 

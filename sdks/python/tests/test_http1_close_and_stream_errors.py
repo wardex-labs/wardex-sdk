@@ -484,6 +484,45 @@ def test_a_provider_error_mid_stream_fails_the_chat_span(case, path, error_type,
     assert Limitation.FRAME_PARSE_FAILED not in _markers(span)
 
 
+#: An OpenAI-compatible error chunk that ALSO carries `choices`, after one
+#: ordinary chunk. OpenRouter documents its mid-stream error this way (the error
+#: at the top level plus a choice finishing with "error"); a choice with no
+#: finish, the other shape, must not hide the error either.
+ERROR_WITH_CHOICES = {
+    "error-and-finishing-choice": (
+        {"code": 502, "message": "Provider returned error", "metadata": {"error_type": "upstream"}},
+        [{"index": 0, "delta": {"content": ""}, "finish_reason": "error"}],
+        "502",
+    ),
+    "error-and-unfinished-choice": (
+        {"message": "boom", "type": "server_error", "param": None, "code": None},
+        [{"index": 0, "delta": {}, "finish_reason": None}],
+        "server_error",
+    ),
+}
+
+
+@pytest.mark.parametrize("shape", sorted(ERROR_WITH_CHOICES))
+def test_a_provider_error_that_also_carries_choices_fails_the_chat_span(shape):
+    """The top-level `error` is the provider's failure whatever else its chunk
+    holds: a choice alongside it does not turn the call into a success, and the
+    error object stays in the body."""
+    error, choices, error_type = ERROR_WITH_CHOICES[shape]
+    first = {"id": "c1", "model": "gpt-4o", "choices": [{"index": 0, "delta": {"content": "Hel"}}]}
+    failing = {"id": "c1", "model": "gpt-4o", "error": error, "choices": choices}
+    stream = b"".join(b"data: " + json.dumps(c).encode() + b"\n\n" for c in (first, failing))
+    response = SSE_HEAD + f"Content-Length: {len(stream)}\r\n\r\n".encode() + stream
+    port = _serve_once(response)
+
+    span = _one_chat_span(_captured(lambda: _post(port, "/v1/chat/completions", CHAT_REQUEST)))
+
+    assert span.status is StatusCode.ERROR
+    assert span.error_type == error_type
+    assert span.gen_ai.finish_reasons == ("error",)
+    assert json.loads(span.output_data)["error"] == error
+    assert Limitation.FRAME_PARSE_FAILED not in _markers(span)
+
+
 #: A stream whose ONLY event is the provider's failure: no chunk named the model
 #: or an id first, so nothing on the response side says "LLM call" except the
 #: error itself. Nothing in either stream format promises a model-bearing chunk
