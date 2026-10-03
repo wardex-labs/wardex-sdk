@@ -965,8 +965,12 @@ diagnostic line (traceback under `debug=True`).
   `wardex.conversation(...)`. With a checkpointer, a later top-level run on
   the same thread in the same process links `resumed_from` to the previous
   one; a subgraph inherits its parent's thread and links nothing, and so
-  does a run without a checkpointer. One shape still links as a turn: a
-  subgraph with a checkpointer of its own that a node starts on a plain
+  does a run without a checkpointer. The link is keyed by the thread id
+  alone — a checkpointer object is no identity for a thread, since one built
+  per request over the same database resumes it — so runs that keep that
+  id's state in different checkpointers still link as turns of one thread:
+  two graphs compiled with separate checkpointers that share a thread id, or
+  a subgraph with a checkpointer of its own that a node starts on a plain
   worker thread (no context copied) under the parent's thread id. A node
   span's `wardex.step.index` is LangGraph's superstep number on that
   checkpoint thread, not the node's position in the run: a second turn on

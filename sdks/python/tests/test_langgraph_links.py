@@ -649,6 +649,27 @@ def test_a_subgraph_with_its_own_saver_on_a_plain_worker_thread_links_as_a_turn(
     assert [lk.span_id for lk in parent2.links] == [sub1.context.span_id]  # and its echo
 
 
+def test_two_graphs_with_separate_savers_on_one_thread_id_link_as_turns(installed):  # noqa: F811
+    """THE SAME BOUNDARY in its plainest shape, pinned for the same reason.
+
+    Two graphs, each compiled with a saver of its own, run on one thread id.
+    LangGraph keeps two separate states, so the second graph starts from
+    nothing — yet both are top-level checkpointed runs of that id, so the
+    second links to the first, and the first graph's next turn links to the
+    second instead of to its own previous turn. Telling them apart takes an
+    identity for a thread beyond its id, and the saver object is not one."""
+    alpha, beta = _thread_graph("Alpha"), _thread_graph("Beta")
+    config = {"configurable": {"thread_id": "shared"}}
+    assert alpha.invoke({"trail": []}, config) == {"trail": ["only"]}
+    assert beta.invoke({"trail": []}, config) == {"trail": ["only"]}, "nothing carried over"
+    assert alpha.invoke({"trail": []}, config) == {"trail": ["only", "only"]}
+
+    alpha1, alpha2 = _runs_named(installed.spans, "Alpha")
+    (beta1,) = _runs_named(installed.spans, "Beta")
+    assert [lk.span_id for lk in beta1.links] == [alpha1.context.span_id]  # the gap
+    assert [lk.span_id for lk in alpha2.links] == [beta1.context.span_id]  # and its echo
+
+
 def test_a_top_level_run_inside_a_plain_langchain_runnable_still_links(installed):  # noqa: F811
     """An ambient runnable config is not an enclosing graph: only a LangGraph
     task's config names a checkpoint namespace, and the root namespace `""`

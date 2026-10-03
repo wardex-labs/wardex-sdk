@@ -277,8 +277,9 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
-- **A LangGraph conversation chain now links only turns that really resumed
-  the thread, and a `thread_id` is read however LangGraph lets you give it.**
+- **A LangGraph conversation chain no longer links a subgraph as a turn of
+  its parent's thread, and a `thread_id` is read however LangGraph lets you
+  give it.**
   Each top-level run on a checkpointed `thread_id` links `resumed_from` to the
   previous run on that thread. LangGraph hands a subgraph its parent's
   `thread_id` — a compiled graph used as a node, a `create_agent` inside a
@@ -289,7 +290,10 @@ All notable changes to this project are documented here. The format follows
   from inside a node of another graph, and one with no checkpointer — which
   starts from nothing whatever thread it names, as a subgraph a node runs on
   a plain worker thread does — links nothing, and still carries
-  `wardex.langgraph.thread_id` when it runs on a thread. And only the call's
+  `wardex.langgraph.thread_id` when it runs on a thread. The link is still
+  keyed by the thread id alone, so top-level runs that keep one thread id's
+  state in different checkpointers — two graphs compiled with separate
+  savers, say — still link as turns of one thread. And only the call's
   own config was read, so a thread given any other way LangGraph accepts was
   ignored: bound with `graph.with_config(configurable={"thread_id": ...})` —
   local or `RemoteGraph` — or carried by the config of whatever encloses the

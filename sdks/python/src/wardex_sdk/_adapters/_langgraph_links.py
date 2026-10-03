@@ -357,13 +357,18 @@ def _resume_link(
     aliases nothing, and nothing is counted, because no resume was lost. A
     subgraph compiled with `checkpointer=True` keeps its own state across
     turns, and that continuation is not linked either: the link means "this
-    turn continues that turn", which is the top-level run's to say. The one
-    shape left is a subgraph with a saver OF ITS OWN started on such a plain
-    worker thread under its parent's thread id: LangGraph runs it as a root
-    run of that thread in its own saver, nothing reaching this seam tells it
-    from a second top-level turn, and it links as one — the key is the thread
-    id alone, because a saver object is no identity for a thread (a host may
-    build one per request over the same database).
+    turn continues that turn", which is the top-level run's to say.
+
+    THE KEY IS THE THREAD ID ALONE, because a saver object is no identity for
+    a thread (a host may build one per request over the same database, and
+    keying by it would lose every real resume across those requests). So two
+    top-level runs that keep one thread id's state in DIFFERENT savers link
+    as turns of one thread, though the second starts from nothing: two graphs
+    compiled with separate savers that share a thread id, and a subgraph with
+    a saver of its own started on such a plain worker thread under its
+    parent's thread id, which LangGraph runs as a root run of that thread in
+    its own saver. Nothing reaching this seam tells either from a second
+    turn; `test_langgraph_links.py` pins both shapes as the known boundary.
 
     ORDER IS LOAD-BEARING: link FIRST, alias AFTER. Aliased first, live-first
     resolution would answer this very run — the self-link guard would refuse
