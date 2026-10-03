@@ -242,6 +242,16 @@ impl Http1Parser {
         })
     }
 
+    /// The request the next final response answers used `method`: a response
+    /// to HEAD has no body, and a 2xx to CONNECT opens a tunnel (RFC 9112
+    /// §6.3), which the response's own headers cannot say.
+    fn expect_response_to(&mut self, method: &str) -> PyResult<()> {
+        shielded(|| {
+            self.inner.expect_response_to(method);
+            Ok(())
+        })
+    }
+
     /// The response in flight when the stream ended, if its header block
     /// completed. `peer_closed`: the peer's EOF was observed, which is what
     /// ends a body with no framing; anything else in flight is `incomplete`.

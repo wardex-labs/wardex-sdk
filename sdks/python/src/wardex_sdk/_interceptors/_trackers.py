@@ -110,12 +110,11 @@ def _is_ws_upgrade_request(headers: object) -> bool:
     )
 
 
-#: The `type` of the one client message the Responses WebSocket transport
-#: sends per call, searched for anywhere in the first client message rather
-#: than matched as a prefix: key order (`sort_keys`), a BOM or leading
-#: whitespace must not decide the connection's fate. The search is bounded
-#: by the message, which the frame parser already caps. Consulted only when
-#: nothing hides the payload.
+#: The `type` of the one client message the Responses WebSocket transport sends per call, searched
+#: for anywhere in the first client message rather than matched as a prefix: key order
+#: (`sort_keys`), a BOM or leading whitespace must not decide the connection's fate. The search is
+#: bounded by the message, which the frame parser already caps. Consulted only when nothing hides
+#: the payload.
 _RESPONSES_CREATE = re.compile(rb'"type"\s*:\s*"response\.create"')
 _StreamLatch = tuple[SpanContext | None, bool, ConversationContext | None, bool, int]
 
@@ -136,39 +135,35 @@ class _Txn:
     #: None when this tracker cannot time the first response byte (an HTTP/2
     #: stream, a capture that joined mid-connection): not measured, not zero.
     ttfb_ms: float | None
-    #: Was `parent` latched off a unit that had ALREADY closed? Latched HERE,
-    #: beside the parent and on the task that ISSUED the request, because the
-    #: answer is a property of that instant: a request issued while the run was
-    #: live is a child of the run's span whether or not the run finishes before
-    #: the response arrives, and re-asking on the response side would orphan it.
-    #: See `assembly._units.parent_is_closed_unit`.
+    #: Was `parent` latched off a unit that had ALREADY closed? Latched HERE, beside the parent and
+    #: on the task that ISSUED the request, because the answer is a property of that instant: a
+    #: request issued while the run was live is a child of the run's span whether or not the run
+    #: finishes before the response arrives, and re-asking on the response side would orphan it. See
+    #: `assembly._units.parent_is_closed_unit`.
     parent_closed: bool = False
-    #: Was the latched parent DISCARDED by the tracker's own bound before this
-    #: transaction arrived to claim it? Only `_Http2Tracker` can answer yes.
-    #: Distinct from `parent is None`, which is the ordinary "nothing was
-    #: ambient" and an honest trace root; this one says a parent was latched and
-    #: wardex threw it away, which is a defect the span has to carry rather than
-    #: a fact about the traffic. See `assembly._parentage.resolve_observed`.
+    #: Was the latched parent DISCARDED by the tracker's own bound before this transaction arrived
+    #: to claim it? Only `_Http2Tracker` can answer yes. Distinct from `parent is None`, which is
+    #: the ordinary "nothing was ambient" and an honest trace root; this one says a parent was
+    #: latched and wardex threw it away, which is a defect the span has to carry rather than a fact
+    #: about the traffic. See `assembly._parentage.resolve_observed`.
     parent_evicted: bool = False
     #: The conversation the request was ISSUED in, latched beside `parent` for the same reason.
     conversation: ConversationContext | None = None
     #: False where no h2 issuer was proven (`_h2_issuer`): `conversation` is unknown, not none.
     issuer_proven: bool = True
     truncated: bool = False
-    #: Was every byte of this half counted? False when its body went past the
-    #: capture cap (a prefix was kept), the half was lost or never finished
-    #: parsing, or a WebSocket direction's frame parser stopped. The seam
-    #: ships a size only for a half that was.
+    #: Was every byte of this half counted? False when its body went past the capture cap (a prefix
+    #: was kept), the half was lost or never finished parsing, or a WebSocket direction's frame
+    #: parser stopped. The seam ships a size only for a half that was.
     request_counted: bool = True
     response_counted: bool = True
     #: `ParsedMessage.incomplete`: status and headers were observed, how the exchange ended was not.
     response_cut: bool = False
     #: The HTTP/2 stream this transaction rode; None on HTTP/1.
     stream_id: int | None = None
-    # Capture-limitation markers the protocol parser attached to this
-    # transaction, merged into the span's CaptureIntegrity.limitations by the
-    # seam. Members, not strings: the parser's `&'static str` was resolved once
-    # at the PyO3 boundary (`_protocol/_http1.py`).
+    # Capture-limitation markers the protocol parser attached to this transaction, merged into the
+    # span's CaptureIntegrity.limitations by the seam. Members, not strings: the parser's
+    # `&'static str` was resolved once at the PyO3 boundary (`_protocol/_http1.py`).
     limitations: tuple[Limitation, ...] = ()
     version: str = "1.1"
     #: See `ttfb_ms`; also None when no body byte arrived.
@@ -200,10 +195,9 @@ class _Txn:
     #: The request target as sent, query included (`_url_target` reads it).
     #: `None` when the transaction never had one beyond `path`.
     target: str | None = None
-    #: The upgrade path was a WebSocket-capable LLM row on a host that is not
-    #: the provider's, and nothing corroborated an LLM call: no claim, but a
-    #: recognised path must not vanish uncounted. The seam counts it
-    #: (`interceptors.seam.ws_llm_endpoint_unconfirmed`) when it builds the
+    #: The upgrade path was a WebSocket-capable LLM row on a host that is not the provider's, and
+    #: nothing corroborated an LLM call: no claim, but a recognised path must not vanish uncounted.
+    #: The seam counts it (`interceptors.seam.ws_llm_endpoint_unconfirmed`) when it builds the
     #: connection's span. Exclusive with `ws_llm_call`.
     ws_llm_unconfirmed: bool = False
 
@@ -240,6 +234,7 @@ class _Http1Tracker:
             # traffic that has nothing to do with that run.
             self._parent_closed = parent_is_closed_unit(self._parent)
         for msg in self._req.feed(data):
+            self._resp.expect_response_to(msg.method or "")  # HEAD and CONNECT frame their answers
             self._method = msg.method
             self._path = msg.url
             self._req_body = msg.body
@@ -299,6 +294,11 @@ class _Http1Tracker:
                 # its TTFT would land on the arrival of its own header block.
                 self._resp_marks = [(c - msg.header_len, ns) for c, ns in self._resp_marks]
                 self._resp_cum -= msg.header_len
+                continue
+            if self._method == "CONNECT" and 200 <= (msg.status_code or 0) < 300:
+                # A tunnel opened; the calls inside are the TLS seam's. Its opening ships no span: a
+                # span URL cannot yet carry an authority-form target (`host:443`).
+                self._reset()
                 continue
             # --- Regular HTTP response (existing behavior) ---
             out.append(self._response_txn(msg, time.time_ns()))

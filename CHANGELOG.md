@@ -292,6 +292,13 @@ All notable changes to this project are documented here. The format follows
   2xx: the success was never seen (a 4xx/5xx stays an error). A request whose
   response headers never arrived still makes no span, since nothing was
   observed to report.
+- **A response to `HEAD` now becomes a span, and no longer takes the next
+  response on its connection with it.** A `HEAD` response declares the length
+  its body would have had and sends no body. The SDK waited for that body, so
+  such a `HEAD` call over HTTP/1 never shipped, and on a kept-alive connection
+  the next response was read as that body, so its call was lost too. Now a
+  response to `HEAD` ends with its headers, as the protocol says, and the
+  response after it is read on its own.
 - **A provider error in the middle of a stream now fails the chat span.** When
   an OpenAI Chat Completions stream sent a top-level `error` chunk, or an
   Anthropic Messages stream sent an `error` event (an `overloaded_error`

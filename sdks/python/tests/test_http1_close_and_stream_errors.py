@@ -17,7 +17,9 @@ Two holes, both silent before:
 
 The line between "whole" and "cut short" is the peer's EOF: a read that asked
 for bytes and got none. A close the CLIENT makes first is not it — that is a
-stream let go, and shipping it as whole would claim an end nobody saw.
+stream let go, and shipping it as whole would claim an end nobody saw. And what
+counts as the end is the response's own framing, which for an answer to HEAD or
+CONNECT the request decides: no body, so nothing is in flight to be cut.
 """
 
 from __future__ import annotations
@@ -55,6 +57,16 @@ UNFRAMED = SSE_HEAD + b"Connection: close\r\n\r\n"
 #: The first event whole and the second cut: the call is still recognisable as a
 #: chat call (the first event names the model), and the stream never finished.
 CUT_SSE = CHAT_SSE[: CHAT_SSE.index(b"\n\n") + 12]
+CHAT_RESPONSE = SSE_HEAD + f"Content-Length: {len(CHAT_SSE)}\r\n\r\n".encode() + CHAT_SSE
+#: A whole response to HEAD: the length a GET would have had, and no body.
+HEAD_RESPONSE = b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 1234\r\n\r\n"
+
+
+def _client_tls() -> ssl.SSLContext:
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    return ctx
 
 
 def _read_request(conn: socket.socket) -> None:
@@ -77,27 +89,37 @@ def _read_request(conn: socket.socket) -> None:
         body += conn.recv(65536)
 
 
-def _serve_once(response: bytes, *, tls: bool = False, hold: threading.Event | None = None) -> int:
-    """One connection: read one request, write `response`, close.
+def _serve_once(
+    *responses: bytes,
+    tls: bool = False,
+    hold: threading.Event | None = None,
+    tunnel: bool = False,
+) -> int:
+    """One connection: for each of `responses`, read one request and write it; then close.
 
-    `hold`: write `response`, then keep the connection open until the event is
-    set — a response still in flight while the test acts.
+    `hold`: write the responses, then keep the connection open until the event
+    is set — a response still in flight while the test acts. `tunnel`: be a
+    proxy first — answer the CONNECT with a 200 and speak TLS inside it.
     """
     srv = socket.socket()
     srv.bind(("127.0.0.1", 0))
     srv.listen(1)
     ctx = None
-    if tls:
+    if tls or tunnel:
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         ctx.load_cert_chain(certfile=str(_CERTS / "cert.pem"), keyfile=str(_CERTS / "key.pem"))
 
     def run() -> None:
         conn, _ = srv.accept()
         try:
+            if tunnel:
+                _read_request(conn)
+                conn.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
             if ctx is not None:
                 conn = ctx.wrap_socket(conn, server_side=True)
-            _read_request(conn)
-            conn.sendall(response)
+            for response in responses:
+                _read_request(conn)
+                conn.sendall(response)
             if hold is not None:
                 hold.wait(5)
         except OSError:
@@ -282,9 +304,7 @@ def test_a_tls_response_ending_with_its_connection_names_the_tls_host(peer_close
     client let go, so only the close could end it)."""
     hold = None if peer_closes else threading.Event()
     port = _serve_once(UNFRAMED + (CHAT_SSE if peer_closes else CUT_SSE), tls=True, hold=hold)
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
+    ctx = _client_tls()
     request = (
         b"POST /v1/chat/completions HTTP/1.1\r\nHost: llm.example.test\r\n"
         + f"Content-Length: {len(CHAT_REQUEST)}\r\n\r\n".encode()
@@ -310,6 +330,80 @@ def test_a_tls_response_ending_with_its_connection_names_the_tls_host(peer_close
     assert span.transport.http.url.startswith("https://llm.example.test:")
     assert span.status is (StatusCode.OK if peer_closes else StatusCode.UNSET)
     assert (Limitation.FRAME_PARSE_FAILED in _markers(span)) is not peer_closes
+
+
+@pytest.mark.parametrize("server_closes", [True, False], ids=["server-closes", "client-closes"])
+def test_a_head_response_is_whole_at_its_header_block(server_closes: bool):
+    """A response to HEAD has no body whatever its Content-Length says, so the
+    exchange is complete when its headers arrive: whichever side then closes,
+    nothing was cut short. (`ALL`: a HEAD names no provider.)"""
+    hold = None if server_closes else threading.Event()
+    port = _serve_once(HEAD_RESPONSE, hold=hold)
+
+    def drive() -> None:
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        conn.request("HEAD", "/index.html")
+        conn.getresponse().read()
+        if server_closes:
+            assert conn.sock.recv(1) == b""  # the server's close, after its whole response
+        conn.close()
+
+    try:
+        (span,) = _captured(drive, CaptureMode.ALL)
+    finally:
+        if hold is not None:
+            hold.set()
+
+    assert span.transport.http.method == "HEAD"
+    assert span.status is StatusCode.OK
+    assert span.capture_integrity.truncated is False
+    assert span.transport.response_size == 0
+    assert Limitation.FRAME_PARSE_FAILED not in _markers(span)
+
+
+def test_the_response_after_a_head_on_a_kept_alive_connection_is_its_own():
+    """Read as a body, the HEAD's declared length would swallow the next response
+    on the connection. Both exchanges ship, each whole."""
+    port = _serve_once(HEAD_RESPONSE, CHAT_RESPONSE)
+
+    def drive() -> None:
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        conn.request("HEAD", "/index.html")
+        conn.getresponse().read()
+        conn.request("POST", "/v1/chat/completions", CHAT_REQUEST, {"Content-Type": "x"})
+        conn.getresponse().read()
+        conn.close()
+
+    spans = _captured(drive, CaptureMode.ALL)
+
+    assert sorted(s.transport.http.method for s in spans) == ["HEAD", "POST"]
+    chat = _one_chat_span(spans)
+    assert chat.status is StatusCode.OK
+    assert chat.gen_ai.finish_reasons == ("stop",)
+    assert chat.transport.response_size == len(CHAT_SSE)
+    assert not any(Limitation.FRAME_PARSE_FAILED in _markers(s) for s in spans)
+
+
+def test_a_proxy_tunnel_ships_the_call_inside_and_no_cut_opening():
+    """A 2xx to CONNECT has no body: from its header block on the connection is a
+    tunnel. The call inside ships (the TLS seam sees it); the opening exchange is
+    not a response cut short when the plain socket is handed over to TLS."""
+    port = _serve_once(CHAT_RESPONSE, tunnel=True)
+
+    def drive() -> None:
+        conn = http.client.HTTPSConnection("127.0.0.1", port, timeout=5, context=_client_tls())
+        conn.set_tunnel("llm.example.test", 443)
+        conn.request("POST", "/v1/chat/completions", CHAT_REQUEST, {"Content-Type": "x"})
+        conn.getresponse().read()
+        conn.close()
+
+    spans = _captured(drive, CaptureMode.ALL)
+
+    assert [s.transport.http.method for s in spans] == ["POST"]
+    (span,) = spans
+    assert span.transport.http.url.startswith("https://llm.example.test:")
+    assert span.status is StatusCode.OK
+    assert Limitation.FRAME_PARSE_FAILED not in _markers(span)
 
 
 @pytest.mark.parametrize(

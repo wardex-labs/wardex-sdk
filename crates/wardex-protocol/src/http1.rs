@@ -39,6 +39,19 @@ pub struct Http1Stream {
     limits: Limits,
     state: State,
     bytes_scanned: u64,
+    /// What the request the next final response answers says about that
+    /// response's framing; see `expect_response_to`.
+    answering: Answering,
+}
+
+/// The request methods whose responses frame differently (RFC 9112 §6.3).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Answering {
+    Other,
+    /// Rule 1: a response to HEAD has no body, whatever its headers declare.
+    Head,
+    /// Rule 2: a 2xx to CONNECT has no body; the connection is a tunnel after it.
+    Connect,
 }
 
 /// Where the parser is within the message it is currently assembling.
@@ -61,6 +74,9 @@ enum State {
         dec: ChunkState,
         cap: usize,
     },
+    /// A 2xx answered CONNECT: every later byte belongs to the tunnel, which
+    /// is not HTTP, so nothing is framed or buffered and nothing is in flight.
+    Tunnel,
     /// The peer is not speaking HTTP, or the stream exceeded a resource
     /// ceiling; the parser has latched off. Carries a machine-readable
     /// reason, since no message was ever parsed to attach it to.
@@ -123,7 +139,21 @@ impl Http1Stream {
             limits,
             state: State::Headers,
             bytes_scanned: 0,
+            answering: Answering::Other,
         }
+    }
+
+    /// The request the next final response answers used `method`. The
+    /// response alone cannot say that it has no body because it answers HEAD,
+    /// or that a 2xx to CONNECT ends HTTP on the connection; the caller that
+    /// saw the request can. One slot, consumed by the next final (non-1xx)
+    /// response: the caller pairs one request with one response, unpipelined.
+    pub fn expect_response_to(&mut self, method: &str) {
+        self.answering = match method {
+            "HEAD" => Answering::Head,
+            "CONNECT" => Answering::Connect,
+            _ => Answering::Other,
+        };
     }
 
     /// Buffer bytes examined since construction, counted conservatively: the
@@ -144,7 +174,7 @@ impl Http1Stream {
 
     /// Accumulates bytes and returns zero or more completed messages (handles keep-alive).
     pub fn feed(&mut self, data: &[u8]) -> Vec<ParsedHttp> {
-        if matches!(self.state, State::Disabled(_)) {
+        if matches!(self.state, State::Disabled(_) | State::Tunnel) {
             return Vec::new();
         }
         self.buf.extend_from_slice(data);
@@ -152,8 +182,9 @@ impl Http1Stream {
         loop {
             match self.step() {
                 Step::Done(msg) => {
+                    // The step left the next state: `Headers`, or `Tunnel`
+                    // after a 2xx to CONNECT.
                     out.push(msg);
-                    self.state = State::Headers;
                     if self.avail().is_empty() {
                         break;
                     }
@@ -282,6 +313,11 @@ impl Http1Stream {
             } => self.step_body(msg, remaining, cap),
             State::Chunked { msg, dec, cap } => self.step_chunked(msg, dec, cap),
             State::UntilClose { msg, cap } => self.step_until_close(msg, cap),
+            State::Tunnel => {
+                self.state = State::Tunnel;
+                self.consume(self.avail().len());
+                Step::NeedMore
+            }
             State::Disabled(reason) => {
                 self.state = State::Disabled(reason);
                 Step::NeedMore
@@ -319,9 +355,19 @@ impl Http1Stream {
 
         // RFC 7230 §3.3.3: 1xx/204/304 responses have no body → complete immediately from headers alone.
         // (Without this, a 101 upgrade response with no Content-Length would be treated as EOF-terminated and never emitted.)
+        // An interim 1xx leaves its request waiting, so only a final response
+        // takes the answered request's rule (RFC 9112 §6.3 rules 1-2).
         if !msg.is_request {
             if let Some(code) = msg.status {
-                if (100..200).contains(&code) || code == 204 || code == 304 {
+                if (100..200).contains(&code) {
+                    return Step::Done(msg);
+                }
+                let answering = std::mem::replace(&mut self.answering, Answering::Other);
+                if answering == Answering::Connect && (200..300).contains(&code) {
+                    self.state = State::Tunnel;
+                    return Step::Done(msg);
+                }
+                if code == 204 || code == 304 || answering == Answering::Head {
                     return Step::Done(msg);
                 }
             }
@@ -1011,6 +1057,80 @@ mod tests {
             .feed(b"POST /x HTTP/1.1\r\nContent-Length: 10\r\n\r\nabc")
             .is_empty());
         assert!(s.finish(true).is_none());
+    }
+
+    #[test]
+    fn a_response_to_head_ends_with_its_header_block() {
+        // RFC 9112 §6.3 rule 1: the headers describe the body a GET would have
+        // had, so a declared length or chunking is not a body still to come.
+        for framing in [
+            "Content-Length: 1234\r\n",
+            "Transfer-Encoding: chunked\r\n",
+            "",
+        ] {
+            let mut s = Http1Stream::new(false, Limits::default());
+            s.expect_response_to("HEAD");
+            let raw = format!("HTTP/1.1 200 OK\r\n{framing}\r\n");
+            let msgs = s.feed(raw.as_bytes());
+            assert_eq!(msgs.len(), 1, "{framing:?}");
+            assert!(msgs[0].body.is_empty());
+            assert!(!msgs[0].truncated && !msgs[0].incomplete);
+            assert!(s.finish(false).is_none(), "nothing is in flight after it");
+        }
+    }
+
+    #[test]
+    fn the_response_after_a_head_response_frames_by_its_own_headers() {
+        // Keep-alive: the HEAD rule is one slot, taken by the HEAD's final
+        // response (an interim 1xx before it leaves it), so the next response
+        // is read by its own Content-Length.
+        let mut s = Http1Stream::new(false, Limits::default());
+        s.expect_response_to("HEAD");
+        let msgs = s.feed(
+            b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n\
+              HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello",
+        );
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[0].status, Some(100));
+        assert!(msgs[1].body.is_empty());
+        assert_eq!(msgs[2].body, b"hello");
+        s.expect_response_to("GET");
+        let msgs = s.feed(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+        assert_eq!(msgs[0].body, b"ok");
+    }
+
+    #[test]
+    fn a_2xx_to_connect_opens_a_tunnel_nothing_frames_inside() {
+        // RFC 9112 §6.3 rule 2: what follows the header block is the tunnel's,
+        // not a body and not a next response; and at the end, no response is
+        // in flight to report.
+        let mut s = Http1Stream::new(false, Limits::default());
+        s.expect_response_to("CONNECT");
+        let msgs = s.feed(b"HTTP/1.1 200 Connection established\r\n\r\n\x16\x03\x01\x02\x00");
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].status, Some(200));
+        assert!(msgs[0].body.is_empty());
+        assert!(s
+            .feed(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+            .is_empty());
+        assert_eq!(s.buffered_len(), 0);
+        assert!(
+            s.disabled_reason().is_none(),
+            "a tunnel is not a parse failure"
+        );
+        assert!(s.finish(true).is_none());
+    }
+
+    #[test]
+    fn a_refused_connect_frames_its_body_as_usual() {
+        // Only a 2xx opens the tunnel; a 407 is an ordinary response.
+        let mut s = Http1Stream::new(false, Limits::default());
+        s.expect_response_to("CONNECT");
+        let msgs = s.feed(b"HTTP/1.1 407 Proxy Auth\r\nContent-Length: 4\r\n\r\ndeny");
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].body, b"deny");
+        let msgs = s.feed(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+        assert_eq!(msgs[0].body, b"ok", "the tunnel rule was spent on the 407");
     }
 
     #[test]

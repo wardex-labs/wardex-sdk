@@ -126,6 +126,13 @@ class _Http1Parser(ProtocolParserInterface):
     def feed(self, data: bytes) -> list[ParsedMessage]:
         return [_to_parsed(m) for m in self._native.feed(data)]
 
+    def expect_response_to(self, method: str) -> None:
+        """The request the next final response answers used `method`: a response to HEAD has no
+        body whatever its headers declare, and a 2xx to CONNECT opens a tunnel nothing in which is
+        HTTP (RFC 9112 §6.3). Only the side that saw the request knows; one slot, for the next one.
+        """
+        self._native.expect_response_to(method)
+
     def flush(self, peer_closed: bool = False) -> ParsedMessage | None:
         """The response in flight when the stream ended, or None.
 
