@@ -323,12 +323,16 @@ All notable changes to this project are documented here. The format follows
   response's start to its last line, which is also the window the OTel bridge
   joins on. `turn_index` counts responses, not lines. The span ships when the
   response is over (the thread's next response begins, the turn's `result`
-  arrives, the sub-agent's `Task` call returns, or the session closes) rather
-  than on its first line; if the per-session bound has to close one early it
-  still ships, counted under `adapters.assembler.open_chat_table_full`. Tool
-  calls are still read from every line. Still wrong: `output_tokens` is the
-  count the CLI reported when the response started, because its `assistant`
-  lines carry nothing later, so it stays low.
+  arrives, the sub-agent's `Task` call returns, its task's
+  `task_notification` arrives, or the session closes) rather than on its
+  first line. A background sub-agent's call returns before it speaks, so its
+  last response is ended by the notification: that span ships when the
+  sub-agent finishes, not when a long-lived client closes. If the per-session
+  bound has to close a response early it still ships, counted under
+  `adapters.assembler.open_chat_table_full`. Tool calls are still read from
+  every line. Still wrong: `output_tokens` is the count the CLI reported when
+  the response started, because its `assistant` lines carry nothing later,
+  so it stays low.
 - **Values the SDK makes itself are no longer masked as a card number, and
   a span's masking record no longer reports a card that was never there.**
   The case that showed it is a span's connection id, a value the SDK makes

@@ -2305,6 +2305,110 @@ def test_a_held_response_ships_when_its_sub_agents_thread_ends():
     assert chat.gen_ai.response_id == "m-sub"
 
 
+def _task_notification(tool_use_id, status="completed"):
+    """The CLI's terminal frame for a task, as it writes it (trimmed to the
+    fields the parser reads): `tool_use_id` is the call that started it."""
+    return {
+        "type": "system",
+        "subtype": "task_notification",
+        "session_id": "s-1",
+        "task_id": f"task-of-{tool_use_id}",
+        "tool_use_id": tool_use_id,
+        "status": status,
+    }
+
+
+@pytest.mark.parametrize("status", ["completed", "failed", "stopped"])
+def test_a_background_sub_agents_last_response_ships_at_its_task_notification(status):
+    """A background sub-agent's `Agent` call returns the moment it launches,
+    before the sub-agent speaks, and the turn that spawned it settles too, so
+    neither of those can end the sub-agent's thread. Its task's terminal frame
+    is what does: the response it was holding ships then, as one span, rather
+    than when the session closes, which for a long-lived client is whenever the
+    process ends, and never if it is killed."""
+    client = FakeClient()
+    asm = SessionAssembler(client)
+    _outbound(asm, key=1, text="turn 1")
+    asm.on_inbound(1, INIT)
+    spawn = [{"type": "tool_use", "id": "task_bg", "name": "Agent", "input": {}}]
+    asm.on_inbound(1, _line("m1", spawn))
+    asm.on_inbound(1, _result_line("task_bg"))  # "launched": back before it speaks
+    asm.on_inbound(1, _line("m2", [{"type": "text", "text": "started"}]))
+    asm.on_inbound(1, RESULT)
+    usage = {"input_tokens": 710, "output_tokens": 1}
+    asm.on_inbound(1, _line("bg1", _TEXT, usage=usage, parent="task_bg"))
+    asm.on_inbound(
+        1, _line("bg1", [{"type": "text", "text": "pong"}], usage=usage, parent="task_bg")
+    )
+    # Another task ending (a background shell, say) is not this thread's end.
+    asm.on_inbound(1, _task_notification("toolu_some_other_task"))
+    assert [chat.gen_ai.response_id for chat in _chats(client)] == ["m1", "m2"]
+
+    asm.on_inbound(1, _task_notification("task_bg", status))
+
+    assert [chat.gen_ai.response_id for chat in _chats(client)] == ["m1", "m2", "bg1"]
+    bg1 = _chats(client)[-1]
+    assert bg1.gen_ai.input_tokens == 710
+    assert json.loads(bg1.output_data) == [*_TEXT, {"type": "text", "text": "pong"}]
+    # Later turns of the same client neither wait on it nor ship it again.
+    _outbound(asm, key=1, text="turn 2")
+    asm.on_inbound(1, _line("m3", [{"type": "text", "text": "ok"}]))
+    asm.on_inbound(1, RESULT)
+    asm.on_close(1, None)
+    assert [chat.gen_ai.response_id for chat in _chats(client)] == ["m1", "m2", "bg1", "m3"]
+
+
+def test_a_recorded_background_sub_agent_ships_its_response_when_its_task_ends():
+    """The real CLI with a background sub-agent, replayed. The recording shows
+    the shape the test above builds: the call's result and the turn's `result`
+    both arrive before the sub-agent's first line, the sub-agent's response
+    comes on two lines with one id, and its `task_notification` follows its
+    last line. The span ships at that frame, one span with the usage once."""
+    lines = _recording("background_agent")
+    responses = _by_response(lines)
+    (sub_id,) = [rid for rid, group in responses.items() if group[0]["parent_tool_use_id"]]
+    sub_lines = responses[sub_id]
+    thread = sub_lines[0]["parent_tool_use_id"]
+    first_sub = lines.index(sub_lines[0])
+    notification = next(
+        i for i, msg in enumerate(lines) if msg.get("subtype") == "task_notification"
+    )
+    call_result = next(
+        i
+        for i, msg in enumerate(lines)
+        if msg.get("type") == "user" and msg["message"]["content"][0].get("tool_use_id") == thread
+    )
+    first_result = next(i for i, msg in enumerate(lines) if msg.get("type") == "result")
+    assert call_result < first_result < first_sub < notification
+    assert lines[notification]["tool_use_id"] == thread
+    assert len(sub_lines) == 2
+
+    client = FakeClient()
+    asm = SessionAssembler(client)
+    for msg in lines[: notification + 1]:
+        asm.on_inbound(1, msg)
+    assert sub_id in [chat.gen_ai.response_id for chat in _chats(client)]
+    for msg in lines[notification + 1 :]:
+        asm.on_inbound(1, msg)
+    asm.on_close(1, None)
+
+    chats = _chats(client)
+    assert [chat.gen_ai.response_id for chat in chats] == list(responses)
+    for chat, group in zip(chats, responses.values(), strict=True):
+        usage = group[0]["message"]["usage"]
+        assert all(line["message"]["usage"] == usage for line in group)
+        assert chat.gen_ai.input_tokens == _inclusive_input(usage)
+        blocks = [block for line in group for block in line["message"]["content"]]
+        assert json.loads(chat.output_data) == blocks
+    # Each `result` totals its own turn's main-thread responses, and the
+    # main-thread chats add up to exactly those totals.
+    main = [chat for chat in chats if chat.gen_ai.response_id != sub_id]
+    totals = [msg["usage"] for msg in lines if msg.get("type") == "result"]
+    assert sum(chat.gen_ai.input_tokens for chat in main) == sum(
+        _inclusive_input(total) for total in totals
+    )
+
+
 def test_a_response_still_held_when_the_session_ends_ships_on_every_way_out():
     """Holding a response defers its span; it never owns it. Closing the
     transport, and the shutdown sweep, both ship what is still held."""

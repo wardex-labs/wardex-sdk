@@ -417,15 +417,15 @@ class SessionAssembler:
             elif ev.kind == "stream_delta":
                 sess.thread(ev.parent_tool_use_id, now).note_chunk(now)
             elif ev.kind == "session_result":
-                # The main thread's turn is over, so is its response. A sub-agent's is
-                # not closed here: a background one can still be mid-response.
+                # The main thread's turn is over, so is its response. A sub-agent's is not:
+                # a background one can still be mid-response. Its task's end closes it.
                 self._close_chats(sess, None)
                 sess.result = ev
             elif ev.kind == "task_lifecycle":
-                # Deliberately unconsumed for now: subagent spans are built from
-                # SubagentStart/Stop hooks; task usage enrichment is a deferred
-                # follow-up. Parsed and exposed so the wire surface is stable.
-                pass
+                # Only a task's END is read, as the end of its sub-agent's thread (see
+                # `_OpenChat`). Sub-agent spans come from the SubagentStart/Stop hooks.
+                if ev.subtype == "task_notification" and ev.task_tool_use_id:
+                    self._close_chats(sess, ev.task_tool_use_id)
 
     def on_close(self, key: int, error: str | None) -> None:
         now = time.time_ns()

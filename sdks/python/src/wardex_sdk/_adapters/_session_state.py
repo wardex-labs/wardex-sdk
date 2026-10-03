@@ -111,14 +111,26 @@ class _OpenChat:
     So a response's span is held here, on its thread, until the response is
     over: a line with a different id arrives on the same thread, the main
     thread's turn ends in a `result`, the sub-agent thread it belongs to ends
-    with its `Task` call's result, or the session itself ends. Nothing else
-    closes it. Not a tool result on the same thread: the CLI starts a call as
-    soon as its block is written (the recording shows the call's hook firing
-    between two blocks of one response), so nothing orders its result after
-    the later blocks. Not a host write either, which may be a message queued
-    mid-response. The draft is kept current as each line is folded in, so
-    whichever of those closes it ships what was seen and nothing has to be
-    re-derived at close.
+    with its `Task` call's result or its task's `task_notification`, or the
+    session itself ends.
+
+    The notification is the only end a BACKGROUND sub-agent's thread gets. Its
+    call's result comes back the moment it launches, before the sub-agent
+    speaks, and the turn that launched it settles too, so without it the
+    sub-agent's last response would be held until the session closed: for a
+    long-lived client, whenever the process ends. The CLI sends the frame only
+    with a terminal status, and its `tool_use_id` is the call whose id the
+    sub-agent's lines carry as `parent_tool_use_id`. Recorded against the real
+    CLI: the sub-agent's last line, two other system frames, this one, then
+    the main thread starts a turn to report the result.
+
+    Nothing else closes it. Not a tool result on the same thread: the CLI
+    starts a call as soon as its block is written (the recording shows the
+    call's hook firing between two blocks of one response), so nothing orders
+    its result after the later blocks. Not a host write either, which may be a
+    message queued mid-response. The draft is kept current as each line is
+    folded in, so whichever of those closes it ships what was seen and
+    nothing has to be re-derived at close.
     """
 
     #: The response's `message.id`, which is what a later line must match to
