@@ -14,7 +14,7 @@ from typing import Any
 
 from .. import _hub, _wardex_native
 from .._assembly import Limitation, counters, parent_is_closed_unit
-from .._protocol import WsParser
+from .._protocol import REQUEST_METHODS, WsParser
 from .._protocol._http1 import Http1RequestParser, Http1ResponseParser, declares_event_stream
 from .._protocol._http2 import Http2Parser
 from .._types import ConversationContext, SpanContext
@@ -208,9 +208,13 @@ class _Txn:
 
 
 class _Http1Tracker:
-    """HTTP/1.1 — per-direction parser + single-slot latch."""
+    """HTTP/1.1 — per-direction parser + single-slot latch. A response pairs only with a request
+    seen whole: with none of its request seen it is counted, never shipped; with only its start
+    seen it ships, counted, and ORPHANS that request: the next request line is not its body."""
 
     def __init__(self, limits: object | None = None) -> None:
+        self._limits = limits
+        self._orphaned = False  # the request parser waits on a request whose response shipped
         self._req = Http1RequestParser(limits)
         self._resp = Http1ResponseParser(limits)
         self._method: str | None = None
@@ -229,7 +233,9 @@ class _Http1Tracker:
         self._resp_raw: bytes = b""
 
     def on_request_bytes(self, data: bytes) -> list[_Txn]:
-        if self._req_start_ns == 0:
+        if self._orphaned and data.startswith(REQUEST_METHODS):  # the orphan's tail went unseen
+            self._req, self._orphaned = Http1RequestParser(self._limits), False
+        if self._req_start_ns == 0 and not self._orphaned:
             self._req_start_ns = time.time_ns()
             scope = _hub.get_current_scope()  # ONE read: parent and conversation are one fact
             self._parent, self._conversation = scope.active_span_context, scope.conversation
@@ -239,6 +245,9 @@ class _Http1Tracker:
             # traffic that has nothing to do with that run.
             self._parent_closed = parent_is_closed_unit(self._parent)
         for msg in self._req.feed(data):
+            if self._orphaned:  # its late tail completed it, and its response already shipped
+                self._orphaned = False
+                continue
             self._method = msg.method
             self._path = msg.url
             self._req_body = msg.body
@@ -301,6 +310,13 @@ class _Http1Tracker:
                 continue
             # --- Regular HTTP response (existing behavior) ---
             now = time.time_ns()
+            if self._method is None and self._req.disabled_reason() is None:
+                if self._req_start_ns == 0:  # none of its request arrived: nothing to pair
+                    counters.bump("protocol.http1.request_unobserved")
+                    self._resp_first_ns, self._resp_cum, self._resp_marks = 0, 0, []
+                    continue
+                counters.bump("protocol.http1.request_unfinished")
+                self._orphaned = True
             ttfb = (
                 max(0.0, (self._resp_first_ns - self._req_start_ns) / 1e6)
                 if self._req_start_ns and self._resp_first_ns
@@ -361,6 +377,7 @@ class _Http1Tracker:
         self._req_body = b""
         self._resp_raw = b""
         self._resp_marks = []
+        self._orphaned = False
         return []
 
 

@@ -19,10 +19,13 @@ from wardex_sdk._interceptors._peer import peer_address
 from wardex_sdk._interceptors._seam import _ConnectionState
 from wardex_sdk._interceptors._socket import RawSocketInterceptor
 
-# The four `socket.socket` methods this seam patches. All four are INHERITED
+# The `socket.socket` methods this seam patches. All of them are INHERITED
 # from the C base `_socket.socket` — `socket.socket` does not define them — and
-# that is what the restore assertions below turn on.
-_PATCHED = ("send", "sendall", "recv", "recv_into")
+# that is what the restore assertions below turn on. `sendmsg` only where the
+# platform has it (not on Windows).
+_PATCHED = ("send", "sendall", "sendto", "recv", "recv_into") + (
+    ("sendmsg",) if hasattr(socket.socket, "sendmsg") else ()
+)
 
 _LLM_RESP = json.dumps(
     {
@@ -74,7 +77,7 @@ def test_uninstall_leaves_no_trace_on_socket_socket():
     this one did not.
 
     The assertion is on the OWN-attribute namespace, not on identity, because
-    identity cannot see the second half of the bug. All four names are
+    identity cannot see the second half of the bug. All the patched names are
     inherited from `_socket.socket`, so a restore written as
     `setattr(socket.socket, "send", original)` — which is what this seam did
     before `PatchSet` — passes `socket.socket.send is original` while leaving a

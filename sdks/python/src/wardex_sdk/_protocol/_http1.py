@@ -10,6 +10,21 @@ from .._enums import Protocol
 from .._types import ParsedMessage
 from ._base import ProtocolParserInterface
 
+#: The methods an HTTP/1 request line opens with, each with its space. The seams sniff a
+#: connection's first bytes against it; `_Http1Tracker` tells a new request from the late
+#: rest of an unfinished one with it.
+REQUEST_METHODS = (
+    b"GET ",
+    b"POST ",
+    b"PUT ",
+    b"DELETE ",
+    b"HEAD ",
+    b"PATCH ",
+    b"OPTIONS ",
+    b"CONNECT ",  # proxied connections open with this
+    b"TRACE ",
+)
+
 
 def _resolve_markers(raw: object) -> tuple[Limitation, ...]:
     """Rust marker strings -> `Limitation` members. THE boundary, and the only one.

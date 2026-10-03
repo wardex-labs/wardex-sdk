@@ -7,10 +7,22 @@ explicit `intercept_hosts` match bypasses the mode — and everything else defer
 to the one shared policy in `assembly._policy`, the same rule the TLS seam
 answers to. Under the `agent` default that is LLM-semantic traffic plus
 anything issued inside a live local wardex span; under `all` it is everything.
-Reuses the existing _Http1Tracker/_WebSocketTracker.
-h2c and uvloop async are not supported.
-SSLSocket is a subclass of socket.socket but implements its own send/recv, so
-this patch does not double-capture TLS application data (regression-safe).
+Reuses the existing _Http1Tracker/_WebSocketTracker, and _Http2Tracker for h2c.
+
+What it sees is what passes through a `socket.socket` method in Python: `send`,
+`sendall`, `sendmsg` and `sendto` on the way out, `recv` and `recv_into` on the
+way in. That covers synchronous clients and asyncio's selector event loop, whose
+plaintext writer uses `send` for the first attempt of a `write()` and, from
+Python 3.12, `sendmsg` for everything after it (and for every `writelines()`).
+Bytes written below those methods are not seen: `os.sendfile` (what
+`loop.sendfile`/`sock_sendfile` and `socket.sendfile` use where the OS has it),
+`os.write` on the descriptor, uvloop (libuv writes and reads the descriptor
+itself) and the Windows proactor loop (overlapped `WSASend`/`WSARecv`). A
+response that arrives for a request the tracker did not see whole is counted,
+never paired with another request — see `_Http1Tracker`.
+SSLSocket is a subclass of socket.socket but implements its own send/recv, and
+refuses `sendmsg` (and `sendto` once its TLS layer exists), so this patch does
+not double-capture TLS application data (regression-safe).
 """
 
 from __future__ import annotations
@@ -21,6 +33,7 @@ from typing import TYPE_CHECKING, Any
 
 from .._assembly import Limitation, Prefilter
 from .._enums import CaptureSource
+from .._protocol import REQUEST_METHODS as _HTTP_METHODS
 from ._conn_timing import shared_timing_store
 from ._seam import ByteSeamInterceptor, _accepted_prefix, _ConnectionState
 from ._trackers import _Http1Tracker, _Http2Tracker
@@ -28,20 +41,32 @@ from ._trackers import _Http1Tracker, _Http2Tracker
 if TYPE_CHECKING:
     from .._client import Client
 
-_HTTP_METHODS = (
-    b"GET ",
-    b"POST ",
-    b"PUT ",
-    b"DELETE ",
-    b"HEAD ",
-    b"PATCH ",
-    b"OPTIONS ",
-    b"CONNECT ",  # proxied connections open with this
-    b"TRACE ",
-)
-
 # HTTP/2 connection preface (prior-knowledge h2c). TLS h2 sends the same bytes.
 _H2_PREFACE = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
+
+
+def _accepted_prefix_vectored(buffers: list[Any], n: int) -> bytes:
+    """The first `n` bytes of a `sendmsg` call: its buffers joined in order.
+
+    `sendmsg` returns how many bytes the kernel took ACROSS all the buffers, and
+    like `send` it may take fewer than were offered — asyncio passes its whole
+    write queue and keeps the remainder for the next call. Only the accepted
+    bytes may reach a tracker: the rest is offered again, and feeding it twice
+    would put the same body bytes into the request twice.
+
+    Each buffer is sliced, not copied whole, for the reason `_accepted_prefix`
+    gives; `sendmsg` already refused anything that is not a contiguous buffer,
+    so the `cast("B")` cannot meet a shape it does not take.
+    """
+    parts: list[Any] = []
+    left = n
+    for buf in buffers:
+        if left <= 0:
+            break
+        view = memoryview(buf).cast("B")
+        parts.append(view[:left])
+        left -= len(view)
+    return b"".join(parts)
 
 
 def _is_link_local(addr: str) -> bool:
@@ -83,6 +108,13 @@ class RawSocketInterceptor(ByteSeamInterceptor):
         sock = socket.socket
         self._patches.patch(sock, "send", self._mk_send(sock.send))
         self._patches.patch(sock, "sendall", self._mk_sendall(sock.sendall))
+        # Python 3.12+'s asyncio plaintext writer sends everything after a
+        # `write()`'s first attempt through `sendmsg`; without this patch the
+        # tail of every request larger than one `send` went by unseen.
+        # Absent on Windows, where `socket.socket` has no `sendmsg`.
+        if hasattr(sock, "sendmsg"):
+            self._patches.patch(sock, "sendmsg", self._mk_sendmsg(sock.sendmsg))
+        self._patches.patch(sock, "sendto", self._mk_sendto(sock.sendto))
         self._patches.patch(sock, "recv", self._mk_recv(sock.recv))
         self._patches.patch(sock, "recv_into", self._mk_recv_into(sock.recv_into))
         self._acquire_probes()
@@ -209,6 +241,44 @@ class RawSocketInterceptor(ByteSeamInterceptor):
                     self._on_request_bytes(this, bytes(data))
             except Exception:
                 pass
+            return ret
+
+        return wrapper
+
+    def _mk_sendmsg(self, real: Any):  # noqa: ANN202
+        # One guard per wrapper, built here where the client's debug setting is
+        # known: entering it is the whole per-call cost (see `assembly.guard`).
+        feed = self._guard("interceptors.socket.sendmsg")
+
+        def wrapper(this: Any, buffers: Any, *args: Any, **kwargs: Any) -> Any:
+            # Ancillary data, flags and an address are not HTTP bytes: they pass
+            # through untouched and are never fed.
+            capture = False
+            with feed:
+                capture = hasattr(buffers, "__iter__") and self._capture_possible(this)
+            if not capture:
+                return real(this, buffers, *args, **kwargs)
+            # Read twice — by the call and by the feed — and asyncio hands over a
+            # one-shot `itertools.islice`. A list of the same objects is what
+            # `sendmsg` builds from it anyway, so the call is unchanged, and an
+            # iterator that raises raises here as it would have inside `sendmsg`.
+            views = list(buffers)
+            ret = real(this, views, *args, **kwargs)
+            with feed:
+                if isinstance(ret, int) and ret > 0:
+                    self._on_request_bytes(this, _accepted_prefix_vectored(views, ret))
+            return ret
+
+        return wrapper
+
+    def _mk_sendto(self, real: Any):  # noqa: ANN202
+        feed = self._guard("interceptors.socket.sendto")
+
+        def wrapper(this: Any, data: Any, *args: Any, **kwargs: Any) -> Any:
+            ret = real(this, data, *args, **kwargs)
+            with feed:
+                if isinstance(ret, int) and self._capture_possible(this):
+                    self._on_request_bytes(this, bytes(_accepted_prefix(data, ret)))
             return ret
 
         return wrapper
