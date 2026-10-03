@@ -20,8 +20,8 @@ import os
 import re
 import sys
 import traceback
-from collections.abc import Mapping
-from types import TracebackType
+from collections.abc import Iterator, Mapping
+from types import MappingProxyType, TracebackType
 from typing import Any
 
 
@@ -88,9 +88,6 @@ def _call_site_file(
     return base + sep + inside
 
 
-#: A frame line of a formatted traceback (and a `SyntaxError`'s own location).
-_FRAME_FILE = re.compile(r'File "(.+?)", line (?=\d)')
-
 #: The frames each traceback in a stack trace keeps: the ones nearest where its
 #: exception was raised. Every span an exception leaves records it, so with no
 #: bound a recursion through a decorated function, N spans deep, formatted N
@@ -106,6 +103,12 @@ def _stacktrace(exc: Exception, tb: TracebackType | None) -> str:
     call-site rule: a path relative to its package's import root, or the bare
     file name, never an absolute path. Locals are never captured.
 
+    A file is placed on the lines where the formatter writes one, each frame's
+    `File "…", line N` and a `SyntaxError`'s own location, and nowhere else:
+    a message or a source line that itself says `File "<path>", line N` is the
+    host's text and reaches the trace as written, the same text that
+    `exception.message` carries.
+
     Each traceback in it, a chained one included, keeps its `_MAX_FRAMES`
     frames nearest the raise, the frames Python's own `limit=-_MAX_FRAMES`
     prints, and a cut one says how many earlier frames it left out. The span's
@@ -116,15 +119,13 @@ def _stacktrace(exc: Exception, tb: TracebackType | None) -> str:
     """
     head, left_out = _kept_frames(tb)
     summary = traceback.TracebackException(type(exc), exc, head, limit=-_MAX_FRAMES)
-    _own_stacks(summary, exc, left_out)
-    text = "".join(summary.format())
-    files = _frame_files(exc, head)
+    _own_stacks(summary, exc, left_out, _frame_files(exc, head))
+    return _scrub_home("".join(summary.format()))
 
-    def place(m: re.Match[str]) -> str:
-        path = m[1]
-        return f'File "{files.get(path) or _call_site_file(path, None)}", line '
 
-    return _scrub_home(_FRAME_FILE.sub(place, text))
+def _placed(path: str, files: Mapping[str, str]) -> str:
+    """`path` placed with the module its frame ran under, or as its bare name."""
+    return files.get(path) or _call_site_file(path, None)
 
 
 def _kept_frames(tb: TracebackType | None) -> tuple[TracebackType | None, int]:
@@ -152,26 +153,50 @@ _FORMATTED_MAX = 1024
 
 
 class _Frames(traceback.StackSummary):
-    """One traceback's kept frames, printed the way the stdlib prints them, with two additions.
+    """One traceback's kept frames, printed the way the stdlib prints them, with three changes.
 
-    A cut traceback starts with a line saying how many earlier frames it left
-    out. And a frame is formatted once, not once per span: the stdlib's frame
-    formatting is most of what recording costs (from 3.13 it parses the source
-    line twice to place the `^^^` markers), and when one exception leaves N
-    nested spans the same frames come back N times. The formatted text is
-    looked up by everything the formatter reads — the file, the line and
-    column positions, the function name and the source lines — so the same
-    frame prints the same text and a changed source line formats afresh.
+    Each frame's file is placed (`files`, else the bare name) on the frame's
+    own `File "…", line N` line, and nothing else of the frame is touched: its
+    source line is the host's code as written. A cut traceback starts with a
+    line saying how many earlier frames it left out. And a frame is formatted
+    once, not once per span: the stdlib's frame formatting is most of what
+    recording costs (from 3.13 it parses the source line twice to place the
+    `^^^` markers), and when one exception leaves N nested spans the same
+    frames come back N times. The formatted text is looked up by everything
+    the formatter reads — the file, the line and column positions, the
+    function name and the source lines — so the same frame prints the same
+    text and a changed source line formats afresh.
     """
 
     left_out = 0
+    files: Mapping[str, str] = MappingProxyType({})
 
     def format(self, **kwargs: Any) -> list[str]:
-        lines = super().format(**kwargs)
+        # The stdlib formats with the files as recorded, so it folds a
+        # recursion's repeats exactly as it would; each frame's text is then
+        # placed. Every frame's text starts with its `File "<file>", line `,
+        # so matching the frames' own files against that start finds the one
+        # line to place; the longest goes first, in case one file's name
+        # starts with another's.
+        paths = sorted({frame.filename for frame in self}, key=len, reverse=True)
+        lines = [self._place(text, paths) for text in super().format(**kwargs)]
         if self.left_out:
             plural = "s" if self.left_out > 1 else ""
             lines.insert(0, f"  [{self.left_out} earlier frame{plural} not recorded]\n")
         return lines
+
+    def _place(self, text: str, paths: list[str]) -> str:
+        """One frame's formatted text with the file on its first line placed.
+
+        Text that starts with no frame's file is left as it is: a `[Previous
+        line repeated …]` line, and a frame 3.13+ prints as `<stdin>`, which
+        names no folder.
+        """
+        for path in paths:
+            start = f'  File "{path}", line '
+            if text.startswith(start):
+                return f'  File "{_placed(path, self.files)}", line {text[len(start) :]}'
+        return text
 
     def format_frame_summary(self, frame_summary: traceback.FrameSummary, **kwargs: Any) -> str:
         # 3.11+ only: 3.10's `format` formats each frame inline, cheaply.
@@ -198,8 +223,14 @@ class _Frames(traceback.StackSummary):
         return text
 
 
-def _own_stacks(summary: traceback.TracebackException, exc: BaseException, n: int) -> None:
-    """Give every traceback in `summary` its `_Frames`, with how many frames it left out.
+def _own_stacks(
+    summary: traceback.TracebackException,
+    exc: BaseException,
+    n: int,
+    files: Mapping[str, str],
+) -> None:
+    """Give every traceback in `summary` its `_Frames`, with how many frames it
+    left out and where its files go, and place a `SyntaxError`'s own location.
 
     `summary` mirrors the exception graph it was built from — a `__cause__`, a
     `__context__` and a group's members each have their own summary, absent
@@ -210,7 +241,10 @@ def _own_stacks(summary: traceback.TracebackException, exc: BaseException, n: in
         s, e, left_out = todo.pop()
         frames = _Frames(s.stack)
         frames.left_out = left_out
+        frames.files = files
         s.stack = frames
+        if issubclass(type(e), SyntaxError):
+            _place_location(s, files)
         pairs = [(s.__cause__, e.__cause__), (s.__context__, e.__context__)]
         members = getattr(s, "exceptions", None)  # 3.11+, and set only for a group
         if members:
@@ -218,6 +252,32 @@ def _own_stacks(summary: traceback.TracebackException, exc: BaseException, n: in
         for sub, sub_exc in pairs:
             if sub is not None and sub_exc is not None:
                 todo.append((sub, sub_exc, _kept_frames(sub_exc.__traceback__)[1]))
+
+
+def _place_location(s: Any, files: Mapping[str, str]) -> None:
+    """Place the `File "<file>", line N` a `SyntaxError` prints for where it was found.
+
+    Every supported Python formats that line first, so the summary's own
+    `format_exception_only` is wrapped to place the first line it gives, and
+    only that line: the source and the message after it are the host's text.
+    Setting the summary's `filename` would place it too, but from 3.14 the
+    formatter may open that file (when the error holds no copy of its source)
+    to look for a misspelt keyword, and a bare name would open whatever file
+    of that name the working folder holds.
+    """
+    if s.lineno is None:  # no location line; the file goes in the message as `(<file>)`
+        return
+    path = s.filename or "<string>"
+    start = f'  File "{path}", line '
+    stdlib = s.format_exception_only
+
+    def format_exception_only(**kwargs: Any) -> Iterator[str]:
+        for i, line in enumerate(stdlib(**kwargs)):
+            if i == 0 and line.startswith(start):
+                line = f'  File "{_placed(path, files)}", line {line[len(start) :]}'
+            yield line
+
+    s.format_exception_only = format_exception_only
 
 
 def _frame_files(exc: BaseException, head: TracebackType | None) -> dict[str, str]:

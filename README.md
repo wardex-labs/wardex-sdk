@@ -472,9 +472,13 @@ the process (see [Masking secrets and personal data](#masking-secrets-and-person
 on the wardex envelope and over OTLP alike, so `no account for
 alice@example.com` ships as `no account for [EMAIL]`. Local variables are
 never captured. Every frame's file follows the call-site rule above —
-`support_bot/agent.py`, or the file name alone, never an absolute path — and
-your home folder is written as `~` wherever else the message or the trace
-starts a path with it (`[Errno 2] No such file or directory: '~/reports/q3.txt'`,
+`support_bot/agent.py`, or the file name alone, never an absolute path — on
+the line where Python names it, as is a `SyntaxError`'s own `File "…", line N`,
+and nowhere else: a message or a source line that itself says
+`File "/etc/app/config.yaml", line 3` reaches the trace as your code wrote it,
+the same text `exception.message` carries. And your home folder is written as
+`~` wherever else the message or the trace starts a path with it
+(`[Errno 2] No such file or directory: '~/reports/q3.txt'`,
 `permission denied for ~.`). "Starts a path" means the home folder comes after
 the start of the text, whitespace, a quote, an opening bracket, `=`, `:`, `,`,
 `;` or `file://`, and is followed by something a folder's name cannot go on

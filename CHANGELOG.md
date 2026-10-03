@@ -22,9 +22,11 @@ All notable changes to this project are documented here. The format follows
   stack trace is recorded by default**, through the same masking as every
   other value (an e-mail or an `sk-…` key in the message ships as `[EMAIL]` /
   `[SECRET]`); each frame's file is relative to its package's import root or
-  the bare file name, never an absolute path, and your home folder is written
-  as `~` wherever else the message or the trace starts a path with it, in a
-  sentence too (`'~/reports/q3.txt'`, `permission denied for ~.`). A folder
+  the bare file name, never an absolute path, on the frame's own line only (a
+  message that itself says `File "/etc/app/config.yaml", line 3` reaches the
+  trace as written, just as in `exception.message`), and your home folder is
+  written as `~` wherever else the message or the trace starts a path with
+  it, in a sentence too (`'~/reports/q3.txt'`, `permission denied for ~.`). A folder
   that only looks like yours is left as written rather than turned into `~`:
   one whose name begins like yours (`/Users/alice-old`) or a copy of yours
   under another folder (`/backup/Users/alice`). Local variables are never

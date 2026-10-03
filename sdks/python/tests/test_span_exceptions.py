@@ -535,6 +535,49 @@ def test_a_chained_traceback_places_every_frame(recording, fake_home):
     assert str(fake_home) not in stacktrace
 
 
+_CONFIG_ERROR = 'invalid config: File "/etc/app/config.yaml", line 3: unknown key'
+_CHILD_TRACE = 'child failed:\n  File "/opt/app/worker.py", line 3, in <module>\nRuntimeError: x'
+
+
+@pytest.mark.parametrize("text", [_CONFIG_ERROR, _CHILD_TRACE], ids=["config", "child-trace"])
+@pytest.mark.parametrize("read", [_otlp_events, _envelope_events], ids=["otlp", "envelope"])
+def test_a_message_that_names_a_file_and_line_reaches_the_trace_as_written(recording, read, text):
+    """Frame files used to be placed by a pattern run over the whole formatted text,
+    so a message that itself says `File "<path>", line N` (a config error, a child
+    process's traceback) had that path cut to its bare name in the stack trace's
+    last line while `exception.message` kept it: the record carried two versions of
+    the one string the host raised."""
+    with pytest.raises(ValueError), wardex.span("named"):
+        raise ValueError(text)
+
+    _spans(recording)
+    (event,) = read(recording, "named")
+    assert event["attributes"]["exception.message"] == text
+    assert event["attributes"]["exception.stacktrace"].endswith(f"ValueError: {text}\n")
+
+
+def test_a_source_line_that_names_a_file_and_line_reaches_the_trace_as_written(recording):
+    with pytest.raises(ValueError), wardex.span("literal"):
+        raise ValueError('invalid config: File "/etc/app/config.yaml", line 3: unknown key')
+
+    stacktrace = _the_exception(_spans(recording)["literal"])["exception.stacktrace"]
+    assert """raise ValueError('invalid config: File "/etc/app/config.yaml", line 3""" in (
+        stacktrace
+    )
+    (frame,) = [line for line in stacktrace.splitlines() if "in test_a_source_line" in line]
+    assert frame.startswith('  File "test_span_exceptions.py", line ')
+
+
+def test_a_syntax_errors_own_location_is_placed_like_a_frame(recording):
+    path = os.path.join(os.sep, "opt", "app", "plugins", "bad_plugin.py")
+    with pytest.raises(SyntaxError), wardex.span("compiled"):
+        compile("x = 1\nimprot os\n", path, "exec")
+
+    stacktrace = _the_exception(_spans(recording)["compiled"])["exception.stacktrace"]
+    assert '\n  File "bad_plugin.py", line 2\n' in stacktrace
+    assert "plugins" not in stacktrace
+
+
 def _message_through_a_span(recording: _Recording, text: str) -> tuple[str, str]:
     with pytest.raises(ValueError), wardex.span("scrubbed"):
         raise ValueError(text)
