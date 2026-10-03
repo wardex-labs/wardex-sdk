@@ -21,6 +21,9 @@ empty read after the client shut its own read side — that is a stream let go,
 and shipping it as whole would claim an end nobody saw. And what counts as the
 end is the response's own framing, which for an answer to HEAD or CONNECT the
 request decides: no body, so nothing is in flight to be cut.
+
+The default capture mode keeps a call whose reply failed or was cut on the
+model its request named, even when no response byte named one.
 """
 
 from __future__ import annotations
@@ -469,3 +472,108 @@ def test_a_provider_error_mid_stream_fails_the_chat_span(case, path, error_type,
     body = json.loads(span.output_data)
     assert body["error"]["message"] == message
     assert Limitation.FRAME_PARSE_FAILED not in _markers(span)
+
+
+#: A stream whose ONLY event is the provider's failure: no chunk named the model
+#: or an id first, so nothing on the response side says "LLM call" except the
+#: error itself. Nothing in either stream format promises a model-bearing chunk
+#: ahead of an `error` event.
+ERROR_ONLY_STREAMS = {
+    "openai": (
+        "/v1/chat/completions",
+        CHAT_REQUEST,
+        b'data: {"error":{"message":"The server had an error while processing your request.",'
+        b'"type":"server_error","param":null,"code":null}}\n\n',
+        "server_error",
+    ),
+    "anthropic": (
+        "/v1/messages",
+        json.dumps(
+            {
+                "model": "claude-sonnet-4-6",
+                "max_tokens": 64,
+                "stream": True,
+                "messages": [{"role": "user", "content": "hi"}],
+            }
+        ).encode(),
+        b"event: error\n"
+        b'data: {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}\n\n',
+        "overloaded_error",
+    ),
+}
+
+
+@pytest.mark.parametrize("framing", ["content-length", "unframed"])
+@pytest.mark.parametrize("provider", sorted(ERROR_ONLY_STREAMS))
+def test_a_stream_that_is_only_the_providers_error_fails_the_chat_span(provider, framing):
+    """The default mode keeps a call whose 200 stream carried nothing but the
+    provider's failure: the request named the model, and the reply is the
+    provider failing. It ships ERROR with the provider's class and the error
+    object in the body — not dropped as "not an LLM call", and not a success."""
+    path, request, stream, error_type = ERROR_ONLY_STREAMS[provider]
+    if framing == "content-length":
+        response = SSE_HEAD + f"Content-Length: {len(stream)}\r\n\r\n".encode() + stream
+    else:
+        response = UNFRAMED + stream
+    port = _serve_once(response)
+
+    span = _one_chat_span(_captured(lambda: _post(port, path, request)))
+
+    assert span.status is StatusCode.ERROR
+    assert span.error_type == error_type
+    assert span.gen_ai.finish_reasons == ("error",)
+    assert span.gen_ai.request_model == json.loads(request)["model"]
+    assert span.gen_ai.response_model is None  # no chunk named one; none is invented
+    assert json.loads(span.output_data)["error"]["type"] == error_type
+    assert span.capture_integrity.truncated is False
+    assert Limitation.FRAME_PARSE_FAILED not in _markers(span)
+
+
+def _post_tls(port: int, server_name: str, path: str, body: bytes) -> None:
+    """One POST over TLS to `server_name` (the name the client asks for, SNI), read to the close."""
+    raw = socket.create_connection(("127.0.0.1", port), timeout=5)
+    with _client_tls().wrap_socket(raw, server_hostname=server_name) as tls:
+        tls.sendall(
+            f"POST {path} HTTP/1.1\r\nHost: {server_name}\r\n".encode()
+            + f"Content-Length: {len(body)}\r\n\r\n".encode()
+            + body
+        )
+        while tls.recv(65536):
+            pass
+
+
+@pytest.mark.parametrize(
+    ("cut", "server_name"),
+    [
+        # Mid first event: what arrived names no model, but it is the endpoint's stream.
+        pytest.param(20, None, id="mid-first-event"),
+        # Not one body byte: the status line and headers are all that was observed. Over TLS to
+        # the provider's own name, which is what names the provider when no body byte can.
+        pytest.param(0, "api.openai.com", id="headers-only"),
+    ],
+)
+def test_a_body_cut_before_its_first_event_still_ships_marked(cut: int, server_name: str | None):
+    """The default mode keeps a call whose response was cut before any event
+    named the model: the request named it, and the reply never finished. What
+    was observed ships (status, headers, the bytes that came), marked; nothing
+    else is made up — no response model, no finish, no size, no success."""
+    response = SSE_HEAD + f"Content-Length: {len(CHAT_SSE)}\r\n\r\n".encode() + CHAT_SSE[:cut]
+    port = _serve_once(response, tls=server_name is not None)
+
+    def drive() -> None:
+        if server_name is None:
+            _post(port, "/v1/chat/completions", CHAT_REQUEST)
+        else:
+            _post_tls(port, server_name, "/v1/chat/completions", CHAT_REQUEST)
+
+    span = _one_chat_span(_captured(drive))
+
+    assert span.gen_ai.request_model == "gpt-4o"
+    assert span.gen_ai.response_model is None
+    assert span.gen_ai.finish_reasons is None
+    assert span.transport.http.status_code == 200
+    assert span.status is StatusCode.UNSET
+    assert span.capture_integrity.truncated is True
+    assert span.transport.response_size is None
+    assert Limitation.FRAME_PARSE_FAILED in _markers(span)
+

@@ -142,29 +142,26 @@ def _accepted_prefix(data: Any, n: int) -> Any:
     return bytes(data)[:n]
 
 
-def _http_error(txn: Any) -> bool:
-    """Did the peer answer with a 4xx/5xx? Absent status reads as success."""
-    return not 200 <= getattr(txn, "status", 200) < 400
-
-
 def _is_llm_traffic(txn: Any, sem: Any) -> bool:
-    """Is this an LLM call, for the capture policy and for the gen_ai block alike?
+    """Is this an LLM call, for the capture policy and for the gen_ai block alike? One predicate on
+    purpose: a span admitted as agent traffic and then left with `gen_ai=None` is captured volume
+    with no identity on it.
 
-    One predicate for both questions on purpose: a transaction the gate admits as agent traffic and
-    then leaves with `gen_ai=None` is worse than either answer alone — captured volume with no
-    identity on it.
-
-    The request-side half is admitted only for an HTTP ERROR, and that is the narrow reading rather
-    than the tidy one. Both provider gates in the Rust parser are SUBSTRING matches on host and
-    path, so an internal service at `anthropic-proxy.corp/v1/messages` whose body happens to carry a
-    `model` field parses as an Anthropic chat call. On a 2xx that shape is genuinely ambiguous — it
-    may be an LLM endpoint wardex cannot read, or not an LLM endpoint at all — and it is already
-    dropped today, so admitting it would be a behaviour change nobody asked for on traffic nobody
-    identified. A 4xx/5xx from a host and path that parse as a provider is not ambiguous in the same
-    way: the request was addressed to a chat endpoint with a model on it, and the reply is the
-    provider refusing. That is the call the fix is about.
+    The request half (`identifies_llm_call`) is admitted only for a reply that is not an answer: a
+    4xx/5xx; a stream whose provider declared a failure before any chunk named the model (an
+    `error` event first: `declared_error_type`); a body the connection cut before its framing ended
+    (`response_cut`). On a plain 2xx a request-only match is ambiguous — the parser's provider gates
+    are SUBSTRING matches, so `anthropic-proxy.corp/v1/messages` with a `model` in its body parses
+    as an Anthropic call — and stays dropped. A reply that refused, failed or never finished is not:
+    the request named a model at a chat endpoint, and the reply names none because it never became
+    an answer. `getattr`: the capture-policy tests drive doubles; an absent status reads as success.
     """
-    return has_core_semantics(sem) or (_http_error(txn) and identifies_llm_call(sem))
+    unanswered = (
+        not 200 <= getattr(txn, "status", 200) < 400
+        or getattr(txn, "response_cut", False)
+        or declared_error_type(sem) is not None
+    )
+    return has_core_semantics(sem) or (unanswered and identifies_llm_call(sem))
 
 
 class _ConnectionState:
