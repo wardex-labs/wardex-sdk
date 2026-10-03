@@ -320,8 +320,11 @@ All notable changes to this project are documented here. The format follows
   the error names none. That holds for a stream whose only event is the
   error, the provider failing before any chunk named the model: the default
   capture mode dropped that call as not an LLM call, and `capture_mode="all"`
-  shipped it as a success. An HTTP 4xx/5xx keeps its status code as
-  `error.type`, as before.
+  shipped it as a success. A Chat Completions `error` that is `null`, empty
+  or otherwise falsy (`{}`, `""`, `false`, `0`, `[]`) is not a failure, the
+  same test the OpenAI SDK raises on, so a chunk or response carrying one
+  beside its choices stays a success. An HTTP 4xx/5xx keeps its status code
+  as `error.type`, as before.
 - **Values the SDK makes itself are no longer masked as a card number, and
   a span's masking record no longer reports a card that was never there.**
   The case that showed it is a span's connection id, a value the SDK makes
