@@ -10,7 +10,7 @@ exception it raised, with the traceback it had.
 The message and the stack trace are host text, so they go through the encoder's
 masking on both wires, every frame's file is placed by the call-site rule (never an
 absolute path), and this process's home folder is written as `~` wherever else the
-text carries it.
+text starts a path with it, and nowhere it might be naming a different folder.
 """
 
 from __future__ import annotations
@@ -533,6 +533,61 @@ def test_a_chained_traceback_places_every_frame(recording, fake_home):
     assert "in explode" in stacktrace
     _assert_no_absolute_frame(stacktrace)
     assert str(fake_home) not in stacktrace
+
+
+def _message_through_a_span(recording: _Recording, text: str) -> tuple[str, str]:
+    with pytest.raises(ValueError), wardex.span("scrubbed"):
+        raise ValueError(text)
+    event = _the_exception(_spans(recording)["scrubbed"])
+    return event["exception.message"], event["exception.stacktrace"]
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("No such file: '{home}{sep}q3.txt'", "No such file: '~{sep}q3.txt'"),
+        ("File exists: '{home}'", "File exists: '~'"),
+        ('open("{home}{sep}notes.md")', 'open("~{sep}notes.md")'),
+        ("PATH=/usr/bin:{home}{sep}bin", "PATH=/usr/bin:~{sep}bin"),
+        ("cd {home}", "cd ~"),
+        ("root is {home}\nnext line", "root is ~\nnext line"),
+        ("see file://{home}{sep}a.txt", "see file://~{sep}a.txt"),
+    ],
+)
+def test_the_home_folder_is_written_as_tilde_where_it_starts_a_path(
+    recording, fake_home, text, expected
+):
+    home, sep = str(fake_home), os.sep
+    message, stacktrace = _message_through_a_span(recording, text.format(home=home, sep=sep))
+
+    assert message == expected.format(sep=sep)
+    assert expected.format(sep=sep) in stacktrace
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "copy {home}-old{sep}report.txt",
+        "copy {home}.bak{sep}report.txt",
+        "copy {home}+test{sep}report.txt",
+        "copy {home}berly{sep}report.txt",
+        "copy {home} 2{sep}report.txt",
+        "restore {sep}backup{home}{sep}report.txt",
+        "restore .{home}{sep}report.txt",
+    ],
+)
+def test_a_different_folder_that_contains_the_home_path_is_left_as_written(
+    recording, fake_home, text
+):
+    """The home folder used to be matched wherever its string appeared, so a sibling
+    whose name merely begins with it (`alice.kim-old`) and a copy of it under another
+    folder (`/backup/Users/alice.kim`) both left as `~`: a path the SDK never saw,
+    claiming a different folder was the host's home."""
+    written = text.format(home=str(fake_home), sep=os.sep)
+    message, stacktrace = _message_through_a_span(recording, written)
+
+    assert message == written
+    assert written in stacktrace
 
 
 def test_the_otlp_value_cap_cuts_a_long_stack_trace_and_says_so(recording):

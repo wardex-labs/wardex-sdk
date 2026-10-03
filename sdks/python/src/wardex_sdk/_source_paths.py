@@ -6,7 +6,7 @@ folder above the import root stay on the machine while the package path a
 developer needs to find the code leaves with the span. A stack trace carries
 paths in more places than its frame lines — an `OSError` names the file it
 could not open, a source line can hold a path literal — so it also has this
-process's home folder written as `~` wherever else the text carries it.
+process's home folder written as `~` wherever it starts a path.
 
 Imports nothing from the package, so any layer that has to place a host path
 can ask this module without importing the span machinery.
@@ -130,17 +130,39 @@ def _frame_files(exc: BaseException, tb: TracebackType | None) -> dict[str, str]
     return files
 
 
-def _scrub_home(text: str) -> str:
-    """`text` with this process's home folder written as `~`.
+#: What may stand right before the home folder for it to START a path: the
+#: start of the text, whitespace, a quote, an opening bracket, a `key=value` or
+#: list separator, or a `file://` scheme. Anything else, a letter, a dot or a
+#: slash included, means the match lies inside a longer path, such as a copy of
+#: the home folder under `/backup`.
+_HOME_STARTS = r"(?:\A|(?<=[\s'\"`(\[{<=,;:])|(?<=file://))"
 
-    The frame paths are already placed; this catches the home folder wherever
-    else the text carries it — an `OSError` names the file it could not open,
-    and a source line can hold a path literal. Also in its `repr` form, which
-    doubles a Windows backslash.
+#: What may stand right after it for the match to BE the home folder: a path
+#: separator, a quote, a line end or the end of the text. Any other character
+#: can go on a folder's name (`alice-old`, `alice.bak`, `alice 2`), and that
+#: folder is a different one.
+_HOME_ENDS = "(?=[{seps}'\"`\\r\\n]|\\Z)"
+
+
+def _scrub_home(text: str) -> str:
+    """`text` with this process's home folder written as `~` where it starts a path.
+
+    The frame paths are already placed; this catches the home folder where else
+    the text carries it — an `OSError` names the file it could not open, and a
+    source line can hold a path literal. Also in its `repr` form, which doubles
+    a Windows backslash.
+
+    Only where the text plainly names the home folder, so nothing here writes a
+    path the process did not see: a folder whose name merely begins with the
+    home folder's, or a copy of it under another folder, is left as written,
+    and so is the home folder followed by a space or a full stop, because a
+    folder's name can go on with either.
     """
-    home = os.path.expanduser("~")
+    seps = os.sep + (os.altsep or "")
+    home = os.path.expanduser("~").rstrip(seps)
     if len(home) < 2 or not os.path.isabs(home):
         return text
     forms = {home, home.replace("\\", "\\\\")}
     pattern = "|".join(re.escape(f) for f in sorted(forms, key=len, reverse=True))
-    return re.sub(f"(?:{pattern})(?!\\w)", "~", text)
+    ends = _HOME_ENDS.format(seps=re.escape(seps))
+    return re.sub(f"{_HOME_STARTS}(?:{pattern}){ends}", "~", text)

@@ -474,10 +474,17 @@ alice@example.com` ships as `no account for [EMAIL]`. Local variables are
 never captured. Every frame's file follows the call-site rule above —
 `support_bot/agent.py`, or the file name alone, never an absolute path — and
 your home folder is written as `~` wherever else the message or the trace
-carries it (`[Errno 2] No such file or directory: '~/reports/q3.txt'`). Over
-OTLP both values are capped by `max_otlp_attribute_bytes`, like every
-attribute (see [Resource limits](#resource-limits)). Masking cannot see what
-the rules above cannot see, so a secret with no recognisable shape in an
+starts a path with it (`[Errno 2] No such file or directory: '~/reports/q3.txt'`).
+"Starts a path" means the home folder comes after the start of the text,
+whitespace, a quote, an opening bracket, `=`, `:`, `,`, `;` or `file://`, and
+is followed by a path separator, a quote, a line end or the end of the text. Anything else
+is left as written, because it may be a different folder: one whose name
+only begins like yours (`/Users/alice-old`, `/Users/alice.bak`), a copy of
+yours under another folder (`/backup/Users/alice`), or your home folder
+followed by a space or a full stop, since a folder name can continue with
+either. Over OTLP both values are capped by `max_otlp_attribute_bytes`, like
+every attribute (see [Resource limits](#resource-limits)). Masking cannot see
+what the rules above cannot see, so a secret with no recognisable shape in an
 exception's message or on the source line that raised it leaves as written.
 
 ## Scope

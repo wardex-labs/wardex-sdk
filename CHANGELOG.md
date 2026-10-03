@@ -23,9 +23,12 @@ All notable changes to this project are documented here. The format follows
   other value (an e-mail or an `sk-…` key in the message ships as `[EMAIL]` /
   `[SECRET]`); each frame's file is relative to its package's import root or
   the bare file name, never an absolute path, and your home folder is written
-  as `~` wherever else the message or the trace carries it. Local variables
-  are never captured. Over OTLP both values are capped by
-  `max_otlp_attribute_bytes`.
+  as `~` wherever else the message or the trace starts a path with it
+  (`'~/reports/q3.txt'`). A folder that only looks like yours is left as
+  written rather than turned into `~`: one whose name begins like yours
+  (`/Users/alice-old`) or a copy of yours under another folder
+  (`/backup/Users/alice`). Local variables are never captured. Over OTLP both
+  values are capped by `max_otlp_attribute_bytes`.
 
 - **The transport values the interceptors measure now reach OTLP.** Before,
   an OTLP backend received only the protocol and the HTTP method, status and
