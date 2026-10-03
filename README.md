@@ -746,7 +746,15 @@ Conversations-API-shaped path the mode did not capture),
 `interceptors.seam.ws_llm_semantics_unread` (WebSocket connections that
 carried LLM calls wardex did not read),
 `interceptors.seam.ws_llm_endpoint_unconfirmed` (Responses-path WebSocket
-connections wardex could not corroborate) and
+connections wardex could not corroborate),
+`protocol.http1.request_unobserved` (HTTP/1 responses whose request wardex saw
+none of: it was written where no `socket.socket` method carries it, such as
+`os.write` on the descriptor — counted, not shipped as a span),
+`protocol.http1.request_unfinished` (HTTP/1 responses that arrived before
+wardex saw their request end: the rest of it went out that way, such as a body
+sent with `os.sendfile`, or the server answered an upload early — the span
+ships as `HTTP ? /` with no request size, and the next request on the
+connection is read as a new one) and
 `interceptors.seam.peer_unresolved` (requests on a connection whose peer
 address wardex could not read: a unix socket, asyncio TLS under uvloop, trio
 TLS (httpx `AsyncClient` under trio included), a sync client's HTTPS call
@@ -848,7 +856,16 @@ diagnostic line (traceback under `debug=True`).
 - Zero-instrumentation capture of LLM HTTP calls (OpenAI, Anthropic) over
   `https`, cleartext `http`, and h2c — Chat Completions, the **Responses API**
   (the openai-agents SDK's default path, non-streaming and SSE, plus
-  `/v1/responses/compact`), Embeddings, and Anthropic Messages
+  `/v1/responses/compact`), Embeddings, and Anthropic Messages. Cleartext
+  capture reads the bytes Python's `socket.socket` methods carry: synchronous
+  clients, and async ones on asyncio's default event loop on Linux and macOS,
+  whatever the request size (from Python 3.12 asyncio sends most of a large
+  request through `sendmsg`, which is read too). It does not see cleartext
+  under uvloop or the Windows proactor event loop, which write and read the
+  socket themselves, nor a request body sent with `os.sendfile`. A response
+  whose request wardex did not see whole is never paired with another request:
+  it is counted instead (`protocol.http1.request_unobserved`,
+  `protocol.http1.request_unfinished`, see [Diagnostics](#diagnostics))
 - `gen_ai` semantics: model, tokens, parameters, finish reasons, input/output messages
 - **Open usage capture**: every scalar leaf of the provider's `usage` object
   rides the span as `wardex.usage.<provider path>`, spelling preserved — a new

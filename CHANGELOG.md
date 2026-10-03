@@ -277,6 +277,31 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- **An async client on cleartext `http` gets one span per request, paired
+  with its own response, however large the request — on Python 3.12 and
+  later too.** From 3.12 asyncio sends everything after the first attempt of
+  a write through `socket.sendmsg`, which the cleartext seam did not read, so
+  once a request outgrew one `send` (a few hundred KiB on loopback, less
+  against a slow reader) the seam saw only its head. The calls on that
+  connection then went missing, and a later span carried two requests'
+  bodies paired with the second one's response, with no marker:
+  `AsyncOpenAI`, `AsyncAnthropic` or `httpx.AsyncClient` pointed at an
+  `http://` model server (Ollama, vLLM, a LiteLLM proxy) with a prompt that
+  grows every turn was the shape. aiohttp, which writes any request of
+  2 KiB or more with `writelines`, was not captured on those Pythons at all.
+  The seam now reads `sendmsg` and `sendto` as well, counting only the bytes
+  each call reports sent. A response whose request it still does not see
+  whole is never paired with another request: one it saw none of (the
+  request was written below `socket.socket`'s methods, such as with
+  `os.write` on the descriptor) is counted under
+  `protocol.http1.request_unobserved` and not shipped; one it saw only the
+  start of (the body went out with `os.sendfile`, or the server answered an
+  upload early) ships as before, with no request size, is counted under
+  `protocol.http1.request_unfinished`, and the next request on the
+  connection is read as a new request instead of as the rest of that one.
+  Cleartext under uvloop or the Windows proactor event loop is still not
+  captured, and the README now says so instead of listing cleartext `http`
+  without conditions.
 - **Values the SDK makes itself are no longer masked as a card number, and
   a span's masking record no longer reports a card that was never there.**
   The case that showed it is a span's connection id, a value the SDK makes
