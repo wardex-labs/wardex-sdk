@@ -284,15 +284,23 @@ All notable changes to this project are documented here. The format follows
   did a response the connection cut short of the length it declared, or one
   the client stopped reading. Now a body with no framing ships when the
   server's close arrives, as an ordinary span: the whole body, its size, its
-  status and its timing. A response whose end was not observed — a
-  `Content-Length` not reached, a chunked body short of its last chunk, a
-  body the client let go before the server finished — ships as what arrived,
-  marked `frame_parse_failed` and truncated, with no response size and no
-  finish reason made up, and with status unset when the status line said
-  2xx: the success was never seen (a 4xx/5xx stays an error). Its span ends
-  where the cut was seen: the server's close, or the client's. A request
-  whose response headers never arrived still makes no span, since nothing
-  was observed to report.
+  status and its timing. That includes the async clients — httpx's
+  `AsyncClient`, which the async OpenAI and Anthropic SDKs use, and aiohttp —
+  when a TLS server closes without TLS's own close alert (what a Python `ssl`
+  server does by default): there the call shipped cut short, or nothing until
+  garbage collection, though the client had read the whole body. A response
+  whose end was not observed — a `Content-Length` not reached, a chunked body
+  short of its last chunk, a body the client let go before the server
+  finished — ships as what arrived, marked `frame_parse_failed` and
+  truncated, with no response size and no finish reason made up, and with
+  status unset when the status line said 2xx: the success was never seen (a
+  4xx/5xx stays an error). Its span ends where the cut was seen: the
+  server's close, or the client's. The default capture mode keeps a cut chat
+  call whose request named the model even when the cut came before any event
+  did; on a host that names no provider (a local server, a gateway), a cut
+  before the first body byte leaves nothing the SDK can identify, and only
+  `capture_mode="all"` keeps it. A request whose response headers never
+  arrived still makes no span, since nothing was observed to report.
 - **A response to `HEAD` now becomes a span, and no longer takes the next
   response on its connection with it.** A `HEAD` response declares the length
   its body would have had and sends no body. The SDK waited for that body, so
@@ -308,7 +316,10 @@ All notable changes to this project are documented here. The format follows
   failure. Now the error object is kept in the reassembled body, the finish
   reason is `error`, and the span's status is ERROR with the provider's own
   error class (its `code`, else its `type`) as `error.type`, or `_OTHER` when
-  the error names none. An HTTP 4xx/5xx keeps its status code as
+  the error names none. That holds for a stream whose only event is the
+  error, the provider failing before any chunk named the model: the default
+  capture mode dropped that call as not an LLM call, and `capture_mode="all"`
+  shipped it as a success. An HTTP 4xx/5xx keeps its status code as
   `error.type`, as before.
 - **Values the SDK makes itself are no longer masked as a card number, and
   a span's masking record no longer reports a card that was never there.**
