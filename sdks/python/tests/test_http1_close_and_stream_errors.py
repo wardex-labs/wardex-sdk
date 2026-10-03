@@ -22,12 +22,17 @@ and shipping it as whole would claim an end nobody saw. And what counts as the
 end is the response's own framing, which for an answer to HEAD or CONNECT the
 request decides: no body, so nothing is in flight to be cut.
 
-The default capture mode keeps a call whose reply failed or was cut on the
+Over TLS the peer's EOF comes three ways, and all three count: an empty read
+on an `ssl.SSLSocket`; on an `ssl.SSLObject` with no close_notify, a raised
+`SSLEOFError` (anyio's TLS stream, under httpx's `AsyncClient`) or nothing at
+all, the event loop's transport telling asyncio's TLS protocol (aiohttp). And
+the default capture mode keeps a call whose reply failed or was cut on the
 model its request named, even when no response byte named one.
 """
 
 from __future__ import annotations
 
+import asyncio
 import http.client
 import json
 import socket
@@ -98,12 +103,15 @@ def _serve_once(
     tls: bool = False,
     hold: threading.Event | None = None,
     tunnel: bool = False,
+    close_notify: bool = False,
 ) -> int:
     """One connection: for each of `responses`, read one request and write it; then close.
 
     `hold`: write the responses, then keep the connection open until the event
     is set — a response still in flight while the test acts. `tunnel`: be a
-    proxy first — answer the CONNECT with a 200 and speak TLS inside it.
+    proxy first — answer the CONNECT with a 200 and speak TLS inside it. Over
+    TLS the close is a bare TCP close (what a Python `ssl` server does by
+    default) unless `close_notify` sends TLS's own end-of-stream alert first.
     """
     srv = socket.socket()
     srv.bind(("127.0.0.1", 0))
@@ -126,6 +134,8 @@ def _serve_once(
                 conn.sendall(response)
             if hold is not None:
                 hold.wait(5)
+            if close_notify and isinstance(conn, ssl.SSLSocket):
+                conn = conn.unwrap()
         except OSError:
             pass  # the client let go first; nothing here is under test
         finally:
@@ -577,3 +587,52 @@ def test_a_body_cut_before_its_first_event_still_ships_marked(cut: int, server_n
     assert span.transport.response_size is None
     assert Limitation.FRAME_PARSE_FAILED in _markers(span)
 
+
+async def _httpx_async_read(port: int) -> bytes:
+    import httpx
+
+    async with httpx.AsyncClient(verify=_client_tls()) as client:
+        async with client.stream(
+            "POST", f"https://127.0.0.1:{port}/v1/chat/completions", content=CHAT_REQUEST
+        ) as resp:
+            return b"".join([chunk async for chunk in resp.aiter_raw()])
+
+
+async def _aiohttp_read(port: int) -> bytes:
+    import aiohttp
+
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            f"https://127.0.0.1:{port}/v1/chat/completions", data=CHAT_REQUEST, ssl=_client_tls()
+        ) as resp:
+            return await resp.read()
+
+
+@pytest.mark.parametrize("close_notify", [False, True], ids=["bare-close", "close-notify"])
+@pytest.mark.parametrize(
+    "read",
+    [
+        # anyio's TLSStream over an `ssl.SSLObject`: what the async OpenAI and Anthropic SDKs ride.
+        pytest.param(_httpx_async_read, id="httpx-async"),
+        # asyncio's own TLS protocol over an `ssl.SSLObject`.
+        pytest.param(_aiohttp_read, id="aiohttp"),
+    ],
+)
+def test_an_async_tls_body_with_no_framing_ships_whole_when_the_server_closes(read, close_notify):
+    """The async TLS clients read through an `ssl.SSLObject`, which reports a
+    server's close differently from a socket: without TLS's close_notify (a
+    Python `ssl` server's default) it raises instead of reading empty, or says
+    nothing at all and the event loop's transport is told. Either way the
+    client takes it as the body's end, so the span does too — and it ships at
+    that close, not whenever the object happens to be collected."""
+    port = _serve_once(UNFRAMED + CHAT_SSE, tls=True, close_notify=close_notify)
+    got: list[bytes] = []
+
+    span = _one_chat_span(_captured(lambda: got.append(asyncio.run(read(port)))))
+
+    assert got == [CHAT_SSE]  # what the client received, whole
+    assert span.status is StatusCode.OK
+    assert span.gen_ai.finish_reasons == ("stop",)
+    assert span.transport.response_size == len(CHAT_SSE)
+    assert span.capture_integrity.truncated is False
+    assert Limitation.FRAME_PARSE_FAILED not in _markers(span)

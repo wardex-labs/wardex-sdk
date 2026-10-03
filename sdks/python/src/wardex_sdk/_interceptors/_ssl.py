@@ -14,6 +14,7 @@ import ssl
 from typing import TYPE_CHECKING, Any
 
 from .._assembly import Limitation
+from ._close_hook import _ssl_protocol_class, _sslobj_of
 from ._conn_timing import shared_timing_store
 from ._seam import ByteSeamInterceptor, _accepted_prefix, _ConnectionState
 from ._socket import _H2_PREFACE, _HTTP_METHODS, _asked_for_bytes
@@ -50,6 +51,12 @@ class SSLInterceptor(ByteSeamInterceptor):
         self._patches.patch(sock, "shutdown", self._mk_shutdown(sock.shutdown))
         self._patches.patch(obj, "write", self._mk_send("write", obj.write))
         self._patches.patch(obj, "read", self._mk_read(obj.read))
+        # Asked for, like the close probe's patches on the same private class; absent (no asyncio
+        # TLS protocol), a ragged EOF on that stack ships as let go when the connection closes.
+        proto = _ssl_protocol_class()
+        eof_received = getattr(proto, "eof_received", None)
+        if eof_received is not None:
+            self._patches.patch(proto, "eof_received", self._mk_eof_received(eof_received))
         self._acquire_probes()
         self._installed = True
 
@@ -169,9 +176,38 @@ class SSLInterceptor(ByteSeamInterceptor):
 
         return wrapper
 
+    def _mk_eof_received(self, real: Any):  # noqa: ANN202
+        def wrapper(this: Any, *args: Any, **kwargs: Any) -> Any:
+            # The peer's EOF on asyncio's TLS (aiohttp, `asyncio.open_connection(ssl=...)`): the
+            # transport reports the TCP close here, and `SSLObject.read` never shows it — asyncio
+            # gives the object no EOF, so a close without close_notify is no empty read and no
+            # raise. Read the object first: 3.10 keeps it in a pipe the close tears down.
+            sslobj = None
+            with self._guard("interceptors.ssl.eof_received"):
+                sslobj = _sslobj_of(this)
+            ret = real(this, *args, **kwargs)
+            # A false return lets the transport close: by then the protocol has handed the app every
+            # byte it decrypted and told it EOF. True (3.11+, the app paused reading) means bytes
+            # are still to come; the close that follows ships what arrived, as let go.
+            if not ret and sslobj is not None:
+                with self._guard("interceptors.ssl.eof_received"):
+                    self._on_response_eof(sslobj)
+            return ret
+
+        return wrapper
+
     def _mk_read(self, real: Any):  # noqa: ANN202
         def wrapper(this: Any, *args: Any, **kwargs: Any) -> Any:
-            ret = real(this, *args, **kwargs)
+            try:
+                ret = real(this, *args, **kwargs)
+            except ssl.SSLEOFError:
+                # The peer closed without close_notify. `SSLSocket` hides that as an empty read
+                # (`suppress_ragged_eofs`); an `SSLObject` raises it, once its incoming BIO was told
+                # the transport ended and nothing decrypted is left — anyio's TLSStream, under
+                # httpx's AsyncClient, hands its caller exactly that as the stream's end.
+                with self._guard("interceptors.ssl.ragged_eof"):
+                    self._on_response_eof(this)
+                raise
             try:
                 if self._capture_possible(this):
                     buffer = None

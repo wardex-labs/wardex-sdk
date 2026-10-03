@@ -426,19 +426,21 @@ def test_a_failed_interceptor_install_is_still_reachable_by_the_teardown_that_un
 def test_a_half_installed_ssl_seam_leaves_no_wrapper_on_the_hosts_sockets(monkeypatch):
     """The half a test double cannot prove, asked of the interceptor we ship.
 
-    `SSLInterceptor.install` patches six methods across `ssl.SSLSocket` and
-    `ssl.SSLObject` and only then takes the shared timing reference — so a
-    failure there is an install that has already rewritten the host's TLS
-    classes. The registry's rollback called `uninstall()`, and `uninstall()`
-    opened with `if not self._installed: return` against a flag `install()` sets
-    as its LAST statement. It read False, returned, the registry dropped the
-    entry, and six wrappers stayed in front of every TLS socket in the process
-    with no object left able to remove them.
+    `SSLInterceptor.install` patches seven methods across `ssl.SSLSocket`,
+    `ssl.SSLObject` and asyncio's TLS protocol, and only then takes the shared
+    timing reference — so a failure there is an install that has already
+    rewritten the host's TLS classes. The registry's rollback called
+    `uninstall()`, and `uninstall()` opened with `if not self._installed:
+    return` against a flag `install()` sets as its LAST statement. It read
+    False, returned, the registry dropped the entry, and seven wrappers stayed
+    in front of every TLS socket in the process with no object left able to
+    remove them.
 
     A version bump in the stdlib or in a package the user never chose is the
     ordinary way this raises, which is why it is `install_shared_timing` that is
     broken here rather than something invented.
     """
+    import asyncio.sslproto
     import ssl
 
     from wardex_sdk._interceptors import _seam
@@ -451,6 +453,8 @@ def test_a_half_installed_ssl_seam_leaves_no_wrapper_on_the_hosts_sockets(monkey
     pristine.update(
         {(ssl.SSLObject, name): ssl.SSLObject.__dict__[name] for name in ("write", "read")}
     )
+    proto = asyncio.sslproto.SSLProtocol
+    pristine[(proto, "eof_received")] = proto.__dict__["eof_received"]
 
     def boom(_cap=None):  # noqa: ANN001, ANN202
         raise RuntimeError("the shared timing seam is broken in this environment")
