@@ -290,14 +290,17 @@ All notable changes to this project are documented here. The format follows
   `wardex.langgraph.thread_id` when they run on a thread: a run under a
   checkpoint namespace; one started from inside a node of another graph, or
   created there with the graph's own `stream()`/`astream()` and drained
-  after the node returned; and one with no checkpointer, which starts from
+  after the node returned (a run is created where that entry is called, so
+  a `graph.stream` a node hands out and the host calls later at top level is
+  a turn, and links); and one with no checkpointer, which starts from
   nothing whatever thread it names, as a subgraph a node runs on a plain
   worker thread does. The link is still keyed by the thread id alone, so
   top-level runs that keep one thread id's state in different checkpointers
   — two graphs compiled with separate savers, say, or a subgraph with its
-  own saver that a node creates through a LangChain wrapper such as
-  `astream_events` and leaves undrained — still link as turns of one
-  thread. And only the call's
+  own saver that a node defers through a wrapper — LangChain's
+  `astream_events` or `with_retry()`, a `functools.partial` — calling the
+  graph only after the node returns — still link as turns of one thread.
+  And only the call's
   own config was read, so a thread given any other way LangGraph accepts was
   ignored: bound with `graph.with_config(configurable={"thread_id": ...})` —
   local or `RemoteGraph` — or carried by the config of whatever encloses the

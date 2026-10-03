@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import contextvars
 from collections.abc import Callable
+from functools import partial, update_wrapper
 from types import MethodType
 from typing import Any
 
@@ -371,8 +372,8 @@ def _resume_link(
     compiled with separate savers that share a thread id, and a subgraph with
     a saver of its own under its parent's thread id that LangGraph runs as a
     root run of that thread in its own saver — started on such a plain
-    worker thread, or created in a node through a LangChain generator around
-    the graph and drained after the node returned (`_NodeAwareEntry`).
+    worker thread, or through a call a node defers past its return with a
+    LangChain generator around the graph or a `partial` (`_NodeAwareEntry`).
     Nothing reaching this seam tells any of them from a second turn;
     `test_langgraph_links.py` pins those shapes as the known boundary.
 
@@ -424,8 +425,8 @@ class _InNode:
         _IN_NODE.reset(self._token)
 
 
-class _NodeAwareEntry:
-    """A patched run entry that learns, when it is looked up, whether that is in a node.
+class _NodeAwareEntry(partial):
+    """A patched run entry that learns, when it is CALLED, whether that is in a node.
 
     Calling a generator function runs none of it: the body starts at the first
     `next()`, on whatever pumps it. So a `sub.stream(...)` a node creates and
@@ -433,34 +434,58 @@ class _NodeAwareEntry:
     finished — `_IN_NODE` is False there, and the config, naming its own
     thread, carries no namespace — and with a saver of its own it would link
     to the enclosing run and take the thread over, though its saver holds
-    nothing for that thread. The entry is looked up where the call is written, so this
-    descriptor reads the marker at the lookup and hands back the seam the
-    factory built for that answer (`made_in_node`), and `_resume_link` takes a
-    run created or started inside a node for a subgraph.
+    nothing for that thread. The run is created by the call, so this reads the
+    marker in the call and hands it to the seam the factory built for that
+    answer (`made_in_node`), and `_resume_link` takes a run created or started
+    inside a node for a subgraph.
 
-    Both seams are built once, at install, so a lookup adds one context
-    variable read to the bound method any method lookup makes, and either
-    seam is a generator function: what `inspect.isgeneratorfunction` says of
-    `graph.stream` — which LangChain reads off a callable it is handed, to
-    decide how to call it — is unchanged, and on the class the lookup hands
-    back the function itself, as a function's would. Only a lookup on the
-    graph itself comes early enough. A LangChain generator around the graph
-    (`astream_events`, a `with_retry()` binding) looks the entry up when it is
-    first iterated, so a run created through one and drained after the node
-    returned is top-level to everything that reaches this seam: the known
-    boundary again, pinned in `test_langgraph_links.py` with `with_retry()`.
+    The call and not the lookup, because the two part whenever the host holds
+    the entry: a node may hand out `sub.stream` itself, or a `RunnableLambda`
+    around it, and the host's later turns through it, on the graph's own thread
+    and saver, are top-level runs that LangGraph resumes — read at the lookup,
+    each was a subgraph and none linked; and an entry looked up at top level
+    and called in a node creates a subgraph.
 
-    A non-data descriptor, as a function is, so an instance attribute still
-    shadows it and `PatchSet` restores the original by identity; and total —
-    `ContextVar.get` with a default cannot fail — because it runs on the
-    host's own lookup, outside every guard.
+    A `partial` because it is the one callable with a `__call__` of its own
+    that `inspect` sees through: `isgeneratorfunction` unwraps a bound method,
+    then a partial, to the seam it holds, so what it says of `graph.stream` —
+    which LangChain reads off a callable it is handed, to decide how to call
+    it — is unchanged, and the names and `__wrapped__` copied from that seam
+    keep `inspect.signature`, its source and closure, and a `RunnableLambda`'s
+    name as they were. Both seams are built once, at install, so a call adds
+    one context variable read to the call it forwards.
+
+    A non-data descriptor, as a function is: an instance lookup hands back a
+    bound method whose `__func__` is this object, so an instance attribute
+    still shadows it, two lookups compare equal and `PatchSet` restores the
+    original by identity; on the class it hands back itself, so an unbound
+    `Pregel.stream(graph, ...)` is read at its call too. What a lookup reports
+    differently is that class attribute, which `inspect.isroutine` accepts and
+    `inspect.isfunction` no longer does — no function can read the marker at
+    its call and still be a generator function — and a `__wrapped__` leading
+    to the top-level seam. And total — `ContextVar.get` with a default cannot
+    fail — because it runs on the host's own call, outside every guard.
+
+    Only a call of the graph's own entry comes early enough. A wrapper that
+    defers that call past the node's return — a LangChain generator around the
+    graph (`astream_events`, a `with_retry()` binding), which calls the entry
+    when it is first iterated, or a `functools.partial` of it — leaves a run
+    that is top-level to everything that reaches this seam: the known boundary
+    again, pinned in `test_langgraph_links.py` with `with_retry()` and with a
+    `partial`.
     """
 
-    __slots__ = ("_entries",)
+    __slots__ = ("_in_node",)
 
-    def __init__(self, factory: Callable[..., Any], /, *args: Any, **kwargs: Any) -> None:
-        self._entries = tuple(factory(*args, made_in_node=flag, **kwargs) for flag in (False, True))
+    def __new__(cls, factory: Callable[..., Any], /, *args: Any, **kwargs: Any) -> _NodeAwareEntry:
+        top = factory(*args, made_in_node=False, **kwargs)
+        self = super().__new__(cls, top)
+        self._in_node = factory(*args, made_in_node=True, **kwargs)
+        update_wrapper(self, top)
+        return self
 
     def __get__(self, obj: Any, owner: Any = None) -> Any:
-        entry = self._entries[1 if _IN_NODE.get() else 0]
-        return entry if obj is None else MethodType(entry, obj)
+        return self if obj is None else MethodType(self, obj)
+
+    def __call__(self, /, *args: Any, **kwargs: Any) -> Any:
+        return (self._in_node if _IN_NODE.get() else self.func)(*args, **kwargs)
