@@ -399,14 +399,12 @@ class SessionAssembler:
             elif ev.kind == "assistant_turn":
                 self._emit_chat(sess, ev, now)
                 for tu_id, tu_name, tu_input in ev.tool_uses:
-                    # Refuse the NEWEST and keep the oldest, which is the
-                    # opposite of the two tables above and deliberate. Nothing
-                    # here owns a span, and both consumers
-                    # (`_close_tool`, `_on_stream_tool_result`) pop by the id
-                    # whose RESULT arrived — in a turn, results come back
-                    # broadly in the order the uses were announced, so the
-                    # oldest entry is the one most likely to be read next.
-                    # Evicting it would discard exactly that.
+                    # Refuse the NEWEST and keep the oldest, which is the opposite of the two tables
+                    # above and deliberate. Nothing here owns a span, and both consumers
+                    # (`_close_tool`, `_on_stream_tool_result`) pop by the id whose RESULT arrived —
+                    # in a turn, results come back broadly in the order the uses were announced, so
+                    # the oldest entry is the one most likely to be read next. Evicting it would
+                    # discard exactly that.
                     if self._has_room(sess.stream_tool_meta, "stream_tool_meta"):
                         sess.stream_tool_meta[tu_id] = (tu_name, tu_input, now)
             elif ev.kind == "tool_result":
@@ -891,12 +889,15 @@ class SessionAssembler:
         elif sess.shipped_early(ev):  # its span is out, with this line's usage on it
             counters.bump("adapters.assembler.chat_line_after_evict")
         else:
+            repeat = sess.may_repeat(key)  # before the close below clears what the thread holds
             self._close_chats(sess, key)
             # Counted BEFORE the span is built, so turns run from 1 and a wire 0 (proto3's
             # "unset") only ever means "no turn". The response arrived either way.
             sess.turn_index += 1
             with self._guard("adapters.assembler.emit_chat"):
                 chat = self._open_chat(sess, ev, now)
+                if repeat:  # maybe a forgotten response's next line (see `_Session.may_repeat`)
+                    chat.draft.add_limitation(Limitation.SESSION_ENTRY_TABLE_FULL)
         sess.mark_thread(key, now, new_turn=True)
         if chat is not None:
             evicted = self._room_for(sess.open_chats, "open_chat")
@@ -1821,12 +1822,11 @@ class SessionAssembler:
                 # finalized — it opens a fresh one or is dropped, and either
                 # way it does not resurrect a root that is on its way out.
                 sess.unit.note(marker)
-                # NEVER a drain, and not by discipline: no wait exists on this
-                # path at all — the drain lives only in the adapter's async
-                # transport-close patch, so atexit/signal/uninstall keep
-                # their flush budgets structurally. The merge itself is free
-                # and opportunistic: whatever the CLI already exported still
-                # lands on the spans it belongs to.
+                # NEVER a drain, and not by discipline: no wait exists on this path at all — the
+                # drain lives only in the adapter's async transport-close patch, so
+                # atexit/signal/uninstall keep their flush budgets structurally. The merge itself is
+                # free and opportunistic: whatever the CLI already exported still lands on the spans
+                # it belongs to.
                 self._close_chats(sess)  # held responses pend first, so the merge sees them
                 if sess.bridge is not None:
                     with self._guard("adapters.assembler.otel_bridge_merge"):

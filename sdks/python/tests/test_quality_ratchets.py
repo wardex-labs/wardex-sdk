@@ -292,8 +292,9 @@ _OVERSIZED_BUDGET = {
     # one carry its own provenance docstring in this module. Every line of
     # prose around the member stayed on the diet. Lowered to 1083 when
     # provider_inferred (54) paid for its docstring by rewrapping two
-    # sections' docstrings to the line length, words unchanged.
-    "_assembly/_integrity.py": 1083,
+    # sections' docstrings to the line length, words unchanged. Lowered to
+    # 1082 when a fifth session-table emit site was paid for the same way.
+    "_assembly/_integrity.py": 1082,
     "_assembly/_builder.py": 963,
     "_adapters/_anthropic_agent_sdk.py": 944,
 }

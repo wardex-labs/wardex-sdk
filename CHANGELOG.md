@@ -348,11 +348,16 @@ All notable changes to this project are documented here. The format follows
   forget. The one exception is a sub-agent thread that started while the
   same bound was already tracking `max_session_entries` sub-agent threads:
   its id is then kept under the bound as well, and if further early closes
-  push it out, a later line of that response opens a second span (counted
-  under `adapters.assembler.evicted_chat_table_full`). Tool calls are still
-  read from every line. Still wrong: `output_tokens` is the count the CLI
-  reported when the response started, because its `assistant` lines carry
-  nothing later, so it stays low.
+  push it out, a later line of that response opens a second span. Nothing
+  tells that span from a new response, so once an id has been pushed out, a
+  new response on a sub-agent thread that holds no other response of its own
+  is marked `session_entry_table_full` too (with the status it was seen to
+  have), as both halves of a tool call the bound split are.
+  `adapters.assembler.evicted_chat_table_full` counts the ids pushed out, an
+  upper bound on those second spans. Tool calls are still read from every
+  line. Still wrong: `output_tokens` is the count the CLI reported when the
+  response started, because its `assistant` lines carry nothing later, so it
+  stays low.
 - **Values the SDK makes itself are no longer masked as a card number, and
   a span's masking record no longer reports a card that was never there.**
   The case that showed it is a span's connection id, a value the SDK makes

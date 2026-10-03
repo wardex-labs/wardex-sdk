@@ -521,11 +521,16 @@ class _Session:
     #: counts one request, and prices its tokens, twice. Under the same bound,
     #: keyed like `open_chats`, and dropped whenever the thread's response
     #: would have closed anyway (`end_chats`). Unlike the record, this memory
-    #: CAN be pushed out, by early closes on other untracked threads. A later
-    #: line of the forgotten response then opens a second span, and the
-    #: overflow counter (`adapters.assembler.evicted_chat_table_full`) is the
-    #: only record of it.
+    #: CAN be pushed out, by early closes on other untracked threads, and a
+    #: later line of the forgotten response then opens a second span. Nothing
+    #: tells that span from a new response, so from then on the session marks
+    #: the responses it might be (`may_repeat`). The overflow counter
+    #: (`adapters.assembler.evicted_chat_table_full`) counts the ids pushed
+    #: out: an upper bound on the second spans, since a forgotten response may
+    #: have had no line left to send.
     evicted_chats: dict[str, str] = field(default_factory=dict)
+    #: Whether `evicted_chats` has pushed an id out in this session.
+    forgot_early_close: bool = False
     subagents: dict[str, _OpenSubagent] = field(default_factory=dict)  # keyed by agent_id
     #: What the two span-owning tables above leave behind when the bound evicts
     #: an entry, under the SAME bound so the memory cannot outgrow what it
@@ -649,8 +654,27 @@ class _Session:
         if record is not None:
             record.closed_early = message_id
         elif parent_tool_use_id is not None:
-            room_for(self.evicted_chats, "evicted_chat")
+            if room_for(self.evicted_chats, "evicted_chat") is not None:
+                self.forgot_early_close = True
             self.evicted_chats[parent_tool_use_id] = message_id
+
+    def may_repeat(self, parent_tool_use_id: str | None) -> bool:
+        """Whether a NEW response on this thread may be a forgotten response's next line.
+
+        Only after `evicted_chats` pushed an id out, and only on a sub-agent thread
+        that holds nothing of its own: a response still arriving or an early close
+        still remembered began after whatever the thread sent before it, so a line
+        under another id is a new response. Read before the thread's state is closed.
+        What it says yes to is marked as the bound's, as both halves of a tool call
+        the bound split are: it cannot be told from the forgotten response's second
+        span, which counts that request's tokens a second time.
+        """
+        if not self.forgot_early_close or parent_tool_use_id is None:
+            return False
+        if parent_tool_use_id in self.open_chats or parent_tool_use_id in self.evicted_chats:
+            return False
+        record = self.threads.get(parent_tool_use_id)
+        return record is None or record.closed_early is None
 
     def shipped_early(self, ev: AgentStreamEvent) -> bool:
         """Whether `ev` is a later line of the response the bound shipped from its thread."""
@@ -671,6 +695,7 @@ class _Session:
         """
         if not threads:
             self.evicted_chats.clear()
+            self.forgot_early_close = False
             self.main_thread.closed_early = None
             for record in self.threads.values():
                 record.closed_early = None

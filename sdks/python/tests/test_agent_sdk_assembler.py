@@ -2657,6 +2657,49 @@ def test_a_tracked_sub_agent_thread_keeps_its_early_close_whatever_untracked_thr
     assert tallies("adapters.assembler.evicted_chat_table_full") == 1
 
 
+def test_a_new_response_that_may_repeat_one_whose_id_the_bound_forgot_is_marked(tallies):
+    """A sub-agent thread the bound had no room to track keeps its early close's
+    id under the bound itself, and further early closes can push it out. The
+    response's next line then opens a second span with the same usage copy, and
+    nothing can tell that span from a new response. It shipped status OK with no
+    marker, so a backend priced the request twice and only a counter knew.
+
+    The bound cannot hold every id, so the split remains, but it is marked now,
+    as both halves of a tool call the bound split are, with the status that was
+    seen. Only a sub-agent thread holding nothing of its own can carry such a
+    line, so the main thread's next response is not marked. The counter counts
+    ids pushed out, which bounds the splits from above: s2's was pushed out too,
+    and s2 had nothing more to send."""
+    client = FakeClient()
+    asm = SessionAssembler(client, max_session_entries=1)
+    _outbound(asm, key=1)
+    asm.on_inbound(1, INIT)
+
+    def usage(n):
+        return {"input_tokens": 10 + n, "output_tokens": 1}
+
+    asm.on_inbound(1, _line("s0", _TEXT, usage=usage(0), parent="task_0"))  # tracked
+    # Three sub-agents the one-entry thread table has no room for, each closing
+    # the response held before it early; s3's early close pushes s1's id out.
+    for n in (1, 2, 3):
+        asm.on_inbound(1, _line(f"s{n}", _TEXT, usage=usage(n), parent=f"task_{n}"))
+    asm.on_inbound(1, _line("s1", _CALL, usage=usage(1), parent="task_1"))
+    asm.on_inbound(1, _result_line("task_1"))  # s1's thread ends: its second span ships
+    asm.on_inbound(1, _line("m1", _TEXT, usage={"input_tokens": 100, "output_tokens": 2}))
+    asm.on_inbound(1, RESULT)
+    asm.on_close(1, None)
+
+    chats = _chats(client)
+    s1s = [chat for chat in chats if chat.gen_ai.response_id == "s1"]
+    assert [chat.gen_ai.input_tokens for chat in s1s] == [11, 11]
+    assert all(_has(chat, Limitation.SESSION_ENTRY_TABLE_FULL) for chat in s1s)
+    assert [chat.status for chat in s1s] == [StatusCode.UNSET, StatusCode.OK]
+    (m1,) = [chat for chat in chats if chat.gen_ai.response_id == "m1"]
+    assert not _has(m1, Limitation.SESSION_ENTRY_TABLE_FULL) and m1.status is StatusCode.OK
+    assert tallies("adapters.assembler.evicted_chat_table_full") == 2
+    assert tallies("adapters.assembler.chat_line_after_evict") == 0
+
+
 def test_join_blocks_keeps_every_block_whatever_shape_a_side_has():
     from wardex_sdk._adapters._session_state import _join_blocks
 
