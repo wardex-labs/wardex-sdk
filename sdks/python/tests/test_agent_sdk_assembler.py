@@ -2258,6 +2258,47 @@ def test_a_responses_usage_is_counted_once_whatever_lines_carry_it(first, second
     assert json.loads(chat.output_data) == _TEXT + _CALL
 
 
+_FULL_COPY = {"input_tokens": 100, "output_tokens": 2, "cache_read_input_tokens": 500}
+
+
+@pytest.mark.parametrize(
+    ("second", "expected"),
+    [
+        # The output count alone: it updates, and the input half seen first stays.
+        ({"output_tokens": 9}, (600, 9, 500, None)),
+        # A cache tier without the input count: the parser withholds the total
+        # it cannot form, and that copy does not displace the half that has one.
+        ({"output_tokens": 9, "cache_read_input_tokens": 700}, (600, 9, 500, None)),
+        # The input half reported whole replaces it whole: the total is never
+        # paired with a tier from a different copy than the one it was summed from.
+        (
+            {"input_tokens": 100, "output_tokens": 9, "cache_creation_input_tokens": 40},
+            (140, 9, None, 40),
+        ),
+    ],
+)
+def test_a_later_line_reporting_part_of_the_usage_keeps_the_counts_it_left_out(second, expected):
+    """Usage is taken from the latest copy one half at a time (input total with
+    its cache tiers, then output), so a later line that says less never erases
+    a count an earlier line of the same response reported."""
+    client = FakeClient()
+    asm = SessionAssembler(client)
+    _outbound(asm, key=1)
+    asm.on_inbound(1, INIT)
+    asm.on_inbound(1, _line("m1", _TEXT, usage=_FULL_COPY))
+    asm.on_inbound(1, _line("m1", _CALL, usage=second, stop="tool_use"))
+    asm.on_inbound(1, RESULT)
+
+    (chat,) = _chats(client)
+    g = chat.gen_ai
+    assert (
+        g.input_tokens,
+        g.output_tokens,
+        g.cache_read_input_tokens,
+        g.cache_creation_input_tokens,
+    ) == expected
+
+
 def test_a_folded_response_spans_its_first_lines_floor_to_its_last_lines_arrival():
     client = FakeClient()
     asm = SessionAssembler(client)

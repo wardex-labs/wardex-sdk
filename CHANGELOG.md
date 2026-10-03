@@ -320,7 +320,9 @@ All notable changes to this project are documented here. The format follows
   to 1.5x and 2x what the CLI itself reported. Lines with the same id on the
   same thread are now one span: its tokens are the response's usage counted
   once, its output holds every block in order, and it runs from the
-  response's start to its last line. The OTel bridge joins the span to
+  response's start to its last line. A later line that reports only part of
+  the usage (the output count alone, say) updates that part and keeps the
+  input and cache counts already reported. The OTel bridge joins the span to
   the CLI's request by its first line, because the request began before any
   of its lines arrived, and in the order responses began, so a main response
   held open while a sub-agent replied still joins its own request.

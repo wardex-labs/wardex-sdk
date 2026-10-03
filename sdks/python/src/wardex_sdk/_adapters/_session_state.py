@@ -179,22 +179,37 @@ class _OpenChat:
 
         USAGE IS REPLACED, NEVER ADDED. Every line carries its own copy of the
         response's usage, so adding them would rebuild the per-line inflation
-        inside one span. The latest line that reports usage stands, whole: the
-        one copy when the copies are identical (what the CLI sends), the
-        running total if a CLI ever sends running totals, the only copy if it
-        sends just one. Whole rather than field by field, because the input
-        total already includes the cache tiers of the copy it came from.
+        inside one span. The latest copy stands: the one copy when the copies
+        are identical (what the CLI sends), the running total if a CLI ever
+        sends running totals, the only copy if it sends just one.
+
+        It stands one HALF at a time, and only for the half it reports. The
+        input half is the input total and the two cache tiers, taken together
+        because the total was summed from that copy's own tiers, so mixing two
+        copies' fields could pair a total with tiers it does not include. The
+        output half is the output count alone. A copy that reports output only
+        therefore updates the output count and leaves the input counts already
+        seen where they were, instead of erasing them: no CLI recorded so far
+        sends such a copy, but a count that was observed must not vanish
+        because a later line said less. For the same reason a copy whose input
+        total is missing (the parser withholds a total it cannot form from
+        what the copy carried) never displaces a half that has one.
         """
         g = self.gen_ai
-        usage = (ev.input_tokens, ev.output_tokens, ev.cache_read_tokens, ev.cache_creation_tokens)
-        if any(n is not None for n in usage):
+        reports_input = (
+            ev.input_tokens is not None
+            or ev.cache_read_tokens is not None
+            or ev.cache_creation_tokens is not None
+        )
+        if reports_input and (ev.input_tokens is not None or g.input_tokens is None):
             g = replace(
                 g,
                 input_tokens=ev.input_tokens,
-                output_tokens=ev.output_tokens,
                 cache_read_input_tokens=ev.cache_read_tokens,
                 cache_creation_input_tokens=ev.cache_creation_tokens,
             )
+        if ev.output_tokens is not None:
+            g = replace(g, output_tokens=ev.output_tokens)
         if ev.stop_reason:
             g = replace(g, finish_reasons=(normalize_finish_reason("anthropic", ev.stop_reason),))
         if ev.model:
