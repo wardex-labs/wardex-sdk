@@ -277,6 +277,38 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- **A Claude Agent SDK session you close the documented way no longer reads
+  as an error.** Leaving `async with ClaudeSDKClient(...)` after a turn the
+  CLI reported as successful shipped the root `invoke_agent` span as `ERROR`
+  with `error.type=session_error`, `session_aborted` and an empty status
+  message: closing the client cancels the SDK's reader task, and the adapter
+  recorded that cancellation as a broken transport. `query()` runs were not
+  affected. The root now reports the CLI's own `result` for the turn in
+  flight: `OK`, or `ERROR` with `agent_error` when the CLI said the turn
+  failed. A session closed before that result arrived (you left mid-turn, or
+  a second turn was cut short after the first one finished) is `UNSET` with
+  `session_aborted`, never `OK`, and a CLI process that really dies is still
+  `ERROR` with `session_error`.
+- **A tool call whose `PostToolUse` hook never came reports what the CLI
+  said instead of `tool_unclosed`.** The CLI skips that hook for a call its
+  permission check refuses, and an in-process tool missing from
+  `allowed_tools` is one: `PreToolUse` fires, the call is blocked, and the
+  stream carries a `tool_result` with `is_error` and the CLI's reason. That
+  span shipped as `ERROR` with `error.type=tool_unclosed`,
+  `child_span_unclosed` and no result. It now closes from the stream's
+  result: `ERROR` with `tool_error` and the CLI's reason as its output for a
+  refused call, `OK` with the result for one that succeeded, ending when the
+  result arrived, with `stdio` among its `capture_sources`. A call nothing
+  reported on before the session ended is `UNSET` with `child_span_unclosed`,
+  instead of an `ERROR` nobody observed.
+- **A stream-json line the Agent SDK adapter has no rule for is counted.** A
+  line whose `type` the adapter does not know was dropped without a trace, so
+  a CLI that renamed a message type would make every `chat` span vanish while
+  the root still reported `OK`, its turns and its cost. Each such line now
+  bumps `adapters.assembler.stream_line_unrecognized`. The types the adapter
+  knowingly ignores (the SDK's control messages, `transcript_mirror`,
+  `keep_alive`, `tool_progress`, `rate_limit_event`) are not counted, so a
+  non-zero value means something went unread.
 - **Values the SDK makes itself are no longer masked as a card number, and
   a span's masking record no longer reports a card that was never there.**
   The case that showed it is a span's connection id, a value the SDK makes
