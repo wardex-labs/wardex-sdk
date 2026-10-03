@@ -428,12 +428,12 @@ def test_a_run_without_a_thread_id_neither_links_nor_aliases(installed):  # noqa
 # --------------------------------------------------------------------------
 
 
-def _sub_graph(name: str = "Sub"):
+def _sub_graph(name: str = "Sub", checkpointer=None):
     g = StateGraph(TrailState)
     g.add_node("inner", _node("inner"))
     g.add_edge(START, "inner")
     g.add_edge("inner", END)
-    app = g.compile()
+    app = g.compile(checkpointer=checkpointer)
     app.name = name
     return app
 
@@ -504,9 +504,10 @@ def test_an_async_subgraph_node_links_nothing_either(installed):  # noqa: F811
 def test_a_subgraph_started_from_a_node_with_its_own_config_links_nothing(installed):  # noqa: F811
     """The call names the parent's thread itself and no checkpoint namespace,
     and LangGraph drops the inherited one for a call that names a thread — so
-    the run's own config looks top-level. It is still inside the enclosing
-    run's task, which is what classifies it."""
-    sub = _sub_graph()
+    the config the run executes under looks top-level, and with a saver of its
+    own the subgraph IS a checkpointed root run to LangGraph. It is still
+    inside the enclosing run's task, which is what classifies it."""
+    sub = _sub_graph(checkpointer=InMemorySaver())
     app = _parent_graph(lambda s: sub.invoke(s, {"configurable": {"thread_id": "conv"}}))
     config = {"configurable": {"thread_id": "conv"}}
     app.invoke({"trail": []}, config)
@@ -522,7 +523,7 @@ def test_an_async_node_starting_a_subgraph_with_its_own_config_links_nothing(ins
     rides the same context copies as the run's spans, on every version."""
     import asyncio
 
-    sub = _sub_graph()
+    sub = _sub_graph(checkpointer=InMemorySaver())
 
     async def calls_sub(state):
         return await sub.ainvoke(state, {"configurable": {"thread_id": "conv"}})
@@ -556,6 +557,96 @@ def test_a_run_whose_config_names_a_checkpoint_namespace_links_nothing(installed
     app.invoke({"trail": []}, config)
 
     _assert_only_the_second_turn_links_to_the_first(installed.spans, "conv")
+
+
+def test_a_subgraph_a_node_invokes_with_no_config_carries_the_thread_and_links_nothing(installed):  # noqa: F811,E501
+    """`sub.invoke(state)` with no config at all: LangGraph merges in the
+    node's own config from the ambient, so the subgraph runs on the parent's
+    thread under the parent task's namespace. Only the call's and the bound
+    configs were read, so it shipped no `wardex.langgraph.thread_id` although
+    it ran on that thread."""
+    sub = _sub_graph()
+    app = _parent_graph(lambda s: sub.invoke(s))
+    config = {"configurable": {"thread_id": "conv"}}
+    app.invoke({"trail": []}, config)
+    app.invoke({"trail": []}, config)
+
+    _assert_only_the_second_turn_links_to_the_first(installed.spans, "conv")
+
+
+def test_a_subgraph_a_node_starts_on_a_plain_worker_thread_links_nothing(installed):  # noqa: F811
+    """A plain `ThreadPoolExecutor` copies no context, so neither the
+    enclosing task nor a namespace reaches the subgraph, and it names the
+    parent's thread itself — it linked to its own enclosing run, and the next
+    turn to it. It has no checkpointer, so LangGraph runs it from nothing on
+    that thread: there is no resume to link, whatever thread it names."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    sub = _sub_graph()
+    with ThreadPoolExecutor(max_workers=1) as pool:
+
+        def node(state):
+            return pool.submit(sub.invoke, state, {"configurable": {"thread_id": "conv"}}).result()
+
+        app = _parent_graph(node)
+        config = {"configurable": {"thread_id": "conv"}}
+        app.invoke({"trail": []}, config)
+        app.invoke({"trail": []}, config)
+
+    _assert_only_the_second_turn_links_to_the_first(installed.spans, "conv")
+
+
+def test_a_run_without_a_checkpointer_resumes_nothing_whatever_thread_it_names(installed):  # noqa: F811
+    """No saver, no state carried between runs: the second run starts from
+    nothing, so a resume link would claim a continuation that did not happen.
+    The thread is still the host's word — attribute and conversation — and
+    nothing is left in the link memory for a later run to find."""
+    g = StateGraph(TrailState)
+    g.add_node("only", _node("only"))
+    g.add_edge(START, "only")
+    g.add_edge("only", END)
+    app = g.compile()
+    app.name = "Unsaved"
+    config = {"configurable": {"thread_id": "t-unsaved"}}
+    out1 = app.invoke({"trail": []}, config)
+    out2 = app.invoke({"trail": []}, config)
+
+    assert out1 == out2 == {"trail": ["only"]}, "LangGraph itself carried nothing over"
+    run1, run2 = sorted(runs(installed.spans), key=lambda s: s.start_time_ns)
+    assert [extra_of(r)["wardex.langgraph.thread_id"] for r in (run1, run2)] == ["t-unsaved"] * 2
+    assert {r.conversation.conversation_id for r in (run1, run2)} == {"t-unsaved"}
+    assert [r.links for r in (run1, run2)] == [(), ()]
+    assert not any(k.namespace == "langgraph.thread_id" for k in installed.ctx._units._link_memory)
+    assert "adapters.langgraph.link_target_unresolved" not in adapter_counters()
+
+
+def test_a_subgraph_with_its_own_saver_on_a_plain_worker_thread_links_as_a_turn(installed):  # noqa: F811
+    """A KNOWN BOUNDARY, pinned so that closing it is a visible edit here.
+
+    No context copy, no namespace, and a saver of its own: LangGraph runs this
+    subgraph as a root run of the parent's thread in ITS saver, and nothing at
+    the run seam tells it from a second top-level turn. So it links to the
+    enclosing run and takes the thread over. The key is the thread id alone,
+    because a saver object is no identity for a thread — a host may build one
+    per request over the same database, and keying by it would lose every
+    real resume across those requests."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    sub = _sub_graph(checkpointer=InMemorySaver())
+    with ThreadPoolExecutor(max_workers=1) as pool:
+
+        def node(state):
+            return pool.submit(sub.invoke, state, {"configurable": {"thread_id": "conv"}}).result()
+
+        app = _parent_graph(node)
+        config = {"configurable": {"thread_id": "conv"}}
+        app.invoke({"trail": []}, config)
+        app.invoke({"trail": []}, config)
+
+    parent1, parent2 = _runs_named(installed.spans, "Parent")
+    sub1, _ = _runs_named(installed.spans, "Sub")
+    assert [lk.span_id for lk in sub1.links] == [parent1.context.span_id]  # the gap
+    assert [lk.span_id for lk in parent2.links] == [sub1.context.span_id]  # and its echo
 
 
 def test_a_top_level_run_inside_a_plain_langchain_runnable_still_links(installed):  # noqa: F811
@@ -629,6 +720,54 @@ def test_a_uuid_thread_bound_with_with_config_is_its_text_everywhere(installed):
     run1, run2 = sorted(runs(installed.spans), key=lambda s: s.start_time_ns)
     assert [extra_of(r)["wardex.langgraph.thread_id"] for r in (run1, run2)] == [str(thread)] * 2
     assert {s.conversation.conversation_id for s in installed.spans} == {str(thread)}
+    (link,) = run2.links
+    assert link.span_id == run1.context.span_id
+
+
+def test_a_thread_stated_only_by_an_enclosing_runnables_config_is_read(installed):  # noqa: F811
+    """The third spelling: no call config and nothing bound, the thread is in
+    the AMBIENT config of a LangChain runnable around the call. LangGraph
+    merges it in and checkpoints both turns on that thread; the run read only
+    the call and the bound configs, so it shipped no thread, no resume link
+    and no conversation, and nothing counted it."""
+    from langchain_core.runnables import RunnableLambda
+
+    app = _thread_graph()
+    outer = RunnableLambda(lambda x: app.invoke(x))
+    outer.invoke({"trail": []}, {"configurable": {"thread_id": "amb"}})
+    outer.invoke({"trail": []}, {"configurable": {"thread_id": "amb"}})
+
+    state = app.get_state({"configurable": {"thread_id": "amb"}})
+    assert len(state.values["trail"]) == 2, "LangGraph resumed thread amb on the second turn"
+    run1, run2 = sorted(runs(installed.spans), key=lambda s: s.start_time_ns)
+    assert [extra_of(r)["wardex.langgraph.thread_id"] for r in (run1, run2)] == ["amb"] * 2
+    assert {r.conversation.conversation_id for r in (run1, run2)} == {"amb"}
+    assert run1.links == ()
+    (link,) = run2.links
+    assert link.reason is LinkReason.RESUMED_FROM
+    assert link.span_id == run1.context.span_id
+
+
+def test_without_langgraphs_config_merge_the_bound_and_call_threads_are_still_read(
+    installed,  # noqa: F811
+    capsys,
+):
+    """A release without the `ensure_config` the run's entry calls costs the
+    ambient spelling only, and says so once, counted."""
+    from types import SimpleNamespace
+
+    from wardex_sdk._adapters._langgraph_links import _config_merge
+
+    assert _config_merge(SimpleNamespace(), installed.ctx) is None
+    assert adapter_counters()["adapters.langgraph.unsupported_config_merge"] == 1
+    assert "config merge unrecognized" in capsys.readouterr().err
+
+    installed.adapter._config_merge = None
+    app = _thread_graph().with_config(configurable={"thread_id": "bound"})
+    app.invoke({"trail": []})
+    app.invoke({"trail": []})
+    run1, run2 = sorted(runs(installed.spans), key=lambda s: s.start_time_ns)
+    assert [extra_of(r)["wardex.langgraph.thread_id"] for r in (run1, run2)] == ["bound"] * 2
     (link,) = run2.links
     assert link.span_id == run1.context.span_id
 

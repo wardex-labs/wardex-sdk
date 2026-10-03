@@ -70,6 +70,21 @@ def test_the_call_configs_thread_is_the_conversation_over_the_bound_one(installe
     assert _conversation_ids(installed.spans) == {"T-CALL"}
 
 
+def test_a_thread_in_an_enclosing_runnables_config_is_the_conversation(installed):  # noqa: F811
+    """LangGraph merges the ambient runnable config into a call that names no
+    thread and runs on the thread it carries, so that thread is the
+    conversation too; the call and bound configs alone said nothing."""
+    from langchain_core.runnables import RunnableLambda
+
+    app = _app()
+    RunnableLambda(lambda x: app.invoke(x)).invoke(
+        {"trail": []}, {"configurable": {"thread_id": "T-AMB"}}
+    )
+    (run,) = runs(installed.spans)
+    assert _conversation_ids(installed.spans) == {"T-AMB"}
+    assert extra_of(run)["wardex.langgraph.thread_id"] == "T-AMB"
+
+
 def test_an_integer_thread_id_is_its_text(installed):  # noqa: F811
     _app().invoke({"trail": []}, {"configurable": {"thread_id": 7}})
     assert _conversation_ids(installed.spans) == {"7"}

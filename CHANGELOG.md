@@ -278,26 +278,32 @@ All notable changes to this project are documented here. The format follows
 ### Fixed
 
 - **A LangGraph conversation chain now links only turns that really resumed
-  the thread, and a `thread_id` bound with `with_config` is read.** With a
-  checkpointer, each top-level run on a `thread_id` links `resumed_from` to the
+  the thread, and a `thread_id` is read however LangGraph lets you give it.**
+  Each top-level run on a checkpointed `thread_id` links `resumed_from` to the
   previous run on that thread. LangGraph hands a subgraph its parent's
   `thread_id` — a compiled graph used as a node, a `create_agent` inside a
   parent graph, a supervisor's workers — and every such subgraph linked too:
   it claimed to resume its own enclosing run, and the next turn then linked
   to the previous turn's subgraph instead of to the previous turn. Only
-  top-level runs link now; a run whose config names a checkpoint namespace,
-  or that is started from inside a node of another graph, links nothing and
-  still carries `wardex.langgraph.thread_id`, since it does run on that
-  thread. And a thread bound with `graph.with_config(configurable={"thread_id":
-  ...})` — local or `RemoteGraph` — was ignored, because only the call's own
-  config was read: those runs shipped no `wardex.langgraph.thread_id`, no
-  resume link and no conversation id, and nothing counted it. The bound
-  config is now read under the call's, the call's keys winning as they do in
-  LangGraph, for the attribute, the link and `gen_ai.conversation.id` alike.
-  `wardex.step.index` is unchanged, and its meaning is now written down: it
-  is LangGraph's superstep number on the node's checkpoint thread, not the
-  node's position in the run, so a second turn on one thread continues the
-  count rather than starting again at 1.
+  top-level runs link now. A run under a checkpoint namespace, one started
+  from inside a node of another graph, and one with no checkpointer — which
+  starts from nothing whatever thread it names, as a subgraph a node runs on
+  a plain worker thread does — links nothing, and still carries
+  `wardex.langgraph.thread_id` when it runs on a thread. And only the call's
+  own config was read, so a thread given any other way LangGraph accepts was
+  ignored: bound with `graph.with_config(configurable={"thread_id": ...})` —
+  local or `RemoteGraph` — or carried by the config of whatever encloses the
+  call, such as a LangChain runnable invoked with one, or the node whose
+  `sub.invoke(state)` names no config. Those runs shipped no
+  `wardex.langgraph.thread_id`, no resume link and no conversation id, and
+  nothing counted it. A local run's thread is now read through the same
+  config merge LangGraph itself runs (a `RemoteGraph` merges only its bound
+  config under the call's, so that is what it reads), for the attribute, the
+  link and `gen_ai.conversation.id` alike. `wardex.step.index` is unchanged,
+  and its meaning is now written down: it is LangGraph's superstep number on
+  the node's checkpoint thread, not the node's position in the run, so a
+  second turn on one thread continues the count rather than starting again
+  at 1.
 - **Values the SDK makes itself are no longer masked as a card number, and
   a span's masking record no longer reports a card that was never there.**
   The case that showed it is a span's connection id, a value the SDK makes

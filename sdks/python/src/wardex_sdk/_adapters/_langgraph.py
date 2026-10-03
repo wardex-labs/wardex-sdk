@@ -52,11 +52,10 @@ source — resolved through the registry's closed-unit link memory, since the
 sources' spans are finished by then (`_langgraph_links._node_links`). A node
 name may itself contain `+`, so the sources are read against the running
 graph's node set and a string with more than one reading links nothing and
-says so (`_join_sources`, `Limitation.LINK_AMBIGUOUS`). A TOP-LEVEL run whose
-config — the call's, over whatever `with_config` bound on the graph — carries
-a `thread_id` links `RESUMED_FROM` to the previous top-level run on the same
-thread and THEN aliases itself under it — link-before-alias, or live-first
-resolution would answer the run its own question. A subgraph inherits its
+says so (`_join_sources`, `Limitation.LINK_AMBIGUOUS`). A TOP-LEVEL run on a
+checkpointed `thread_id` — read from the config it executes under, call, bound
+and ambient (`_run_configurable`) — links `RESUMED_FROM` to the previous one
+on that thread and THEN aliases itself under it; a subgraph inherits its
 parent's thread and links nothing (`_langgraph_links._resume_link`). Three
 boundaries are honest refusals rather than gaps: a `branch:to:{self}` trigger
 names only the DESTINATION, so an ordinary edge's source is never guessed; a
@@ -110,11 +109,12 @@ from ._base import AdapterInterface
 from ._context import AdapterContext, Fallback, Placement, Scope
 from ._conversation import framework_conversation
 from ._langgraph_links import (
-    _configurable,
+    _config_merge,
     _InNode,
     _node_links,
     _record_graph_nodes,
     _resume_link,
+    _run_configurable,
     _thread_id,
 )
 from ._payload import _shaped_args
@@ -179,7 +179,7 @@ def _remote_surface_ok(remote_cls: Any) -> bool:
     attribute the restore must not delete. Generator-ness like group 1: the
     wrappers are generator functions holding a scope over the host's
     iteration. And the ordered `['self', 'input']` leading names pin the
-    `(input, config)` call shape `_configurable` reads `thread_id` from — a
+    `(input, config)` call shape `_run_configurable` reads `thread_id` from — a
     reordered signature would hand it the wrong argument while set containment
     reported the surface intact.
 
@@ -234,14 +234,10 @@ def _graph_name(graph: Any) -> str:
 
 
 def _conversation_of(
-    ctx: AdapterContext, graph: Any, args: Any, kwargs: Any
+    ctx: AdapterContext, adapter: Any, graph: Any, args: Any, kwargs: Any
 ) -> ConversationContext | None:
-    """`thread_id` continues one chat, so it IS the conversation; see `framework_conversation`.
-
-    Read from the same merged config as the attribute and the resume link, so a
-    thread pinned with `with_config` is the conversation too.
-    """
-    thread_id = _configurable(graph, args, kwargs).get("thread_id")
+    """`thread_id` continues one chat, so it IS the conversation: `framework_conversation`."""
+    thread_id = _run_configurable(adapter, graph, args, kwargs).get("thread_id")
     return framework_conversation(ctx, thread_id, shadowed_counter="thread_id_shadowed_by_host")[0]
 
 
@@ -267,11 +263,11 @@ def _describe_run(adapter: Any, graph: Any, args: Any, kwargs: Any, run: Scope) 
     run.draft.set_workflow_name(name)
     run.draft.set_extra("wardex.framework", _FRAMEWORK)
     with adapter._ctx.guard("describe_run_extras"):
-        conf = _configurable(graph, args, kwargs)  # the call's config over `with_config`'s
+        conf = _run_configurable(adapter, graph, args, kwargs)  # call, bound and ambient configs
         thread_id = _thread_id(conf)
         if thread_id is not None:
             run.draft.set_extra("wardex.langgraph.thread_id", thread_id)
-            _resume_link(conf, thread_id, run)  # top-level runs only: a subgraph inherits it
+            _resume_link(adapter, graph, conf, thread_id, run)  # top-level, checkpointed runs only
     with adapter._ctx.guard("describe_run_nodes"):
         _record_graph_nodes(graph, run)
 
@@ -523,7 +519,7 @@ def _mk_stream(
         subject = conversation = None
         with ctx.guard(prologue):
             subject = _graph_name(self)
-            conversation = _conversation_of(ctx, self, args, kwargs)
+            conversation = _conversation_of(ctx, adapter, self, args, kwargs)
         describe = partial(describe_fn, adapter, self, args, kwargs)
         carrier = threading.current_thread()
         try:
@@ -590,7 +586,7 @@ def _mk_astream(
         subject = conversation = None
         with ctx.guard(prologue):
             subject = _graph_name(self)
-            conversation = _conversation_of(ctx, self, args, kwargs)
+            conversation = _conversation_of(ctx, adapter, self, args, kwargs)
         describe = partial(describe_fn, adapter, self, args, kwargs)
         carrier = asyncio.current_task()
         try:
@@ -787,6 +783,8 @@ class LangGraphAdapter(AdapterInterface):
     def __init__(self) -> None:
         self._installed = False
         self._ctx: AdapterContext | None = None
+        self._pregel: Any = ()  # and the merge its runs call, from `install()`: `_run_configurable`
+        self._config_merge: Callable[..., Any] | None = None
 
     def name(self) -> str:
         return _FRAMEWORK
@@ -818,6 +816,7 @@ class LangGraphAdapter(AdapterInterface):
         # After the probe, so a declined install leaves the classvar empty; and before the first
         # patch, so no wrapper can be live and take a `GraphBubbleUp` while this is still `()`.
         type(self).CONTROL_FLOW = (errors.GraphBubbleUp,)
+        self._pregel, self._config_merge = pregel_mod.Pregel, _config_merge(pregel_mod, self._ctx)
         patches = self._ctx.patches
         orig_stream = pregel_mod.Pregel.stream
         patches.patch(

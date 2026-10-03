@@ -4,18 +4,21 @@ Split out of `_langgraph.py`, which owns the seams, because this half owns
 one question only — which earlier spans caused this one. For a node task the
 answer comes from strings the compiler prints (`task.triggers`) plus the node
 names the run publishes; for a run it is the previous top-level run on the
-same checkpoint thread (`_resume_link`). Nothing here imports langgraph,
-opens a span or chooses a parent: every edge is a LINK, resolved by selector
-through the registry, so the tree-shape claim the seam module makes over its
-own source holds for this one by construction.
+same checkpoint thread (`_resume_link`), which first takes knowing the config
+the run executes under (`_run_configurable`). Nothing here imports langgraph
+— the one LangGraph function called, its config merge, is handed over by
+`install()` — opens a span or chooses a parent: every edge is a LINK,
+resolved by selector through the registry, so the tree-shape claim the seam
+module makes over its own source holds for this one by construction.
 """
 
 from __future__ import annotations
 
 import contextvars
+from collections.abc import Callable
 from typing import Any
 
-from .._assembly import Limitation, LinkReason, UnitKey
+from .._assembly import Limitation, LinkReason, UnitKey, report_once
 from ._context import Scope
 
 #: Trigger-string formats are langgraph COMPILER internals, verified on the
@@ -32,10 +35,18 @@ _JOIN_PREFIX = "join:"
 #: executes has a non-empty one in its config, and that config is what a
 #: subgraph run is handed — while a top-level run has none, or `""`, the root
 #: namespace. Verified on the pinned band by executing graphs: the run of a
-#: compiled subgraph used as a node, and of one a node starts with
-#: `sub.invoke(state, config)`, receives its parent task's namespace; a
-#: top-level run, and one a node starts with a config of its own, receives none.
+#: compiled subgraph used as a node, of one a node starts with
+#: `sub.invoke(state, config)`, and of one it starts with `sub.invoke(state)`
+#: (LangGraph merges in the node's own config from the ambient) receives its
+#: parent task's namespace; a top-level run, and one a node starts with a
+#: config naming a thread of its own, receives none.
 _CHECKPOINT_NS = "checkpoint_ns"
+
+#: LangGraph's key for the checkpointer a run hands its subgraph tasks
+#: (`CONFIG_KEY_CHECKPOINTER`). `Pregel._defaults` resolves a run's saver from
+#: it before falling back to the graph's own; `_checkpointed` reads it the same
+#: way.
+_CHECKPOINTER = "__pregel_checkpointer"
 
 #: The node NAMES of the graph whose run is ambient on this task, as
 #: `(run_token, names)` — set by `_langgraph._describe_run` and read by
@@ -62,10 +73,12 @@ _GRAPH_NODES: contextvars.ContextVar[tuple[str, frozenset[str]] | None] = contex
 #: own config cannot always say so: a node that calls `sub.invoke(state,
 #: {"configurable": {"thread_id": ...}})` hands it no checkpoint namespace,
 #: and LangGraph drops the inherited one for a call that names its own thread
-#: — yet with the parent's thread id that run would alias the thread away from
-#: the next turn. LangGraph's own ambient config (`get_config()`) would say it
-#: too, except on Python 3.10 inside an async node, where LangGraph cannot
-#: carry it; this variable rides the same context copies as the run's units.
+#: — so a subgraph with a checkpointer of its own, started that way, is a
+#: checkpointed root run in LangGraph's eyes, and with the parent's thread id
+#: it would link to the enclosing run and alias the thread away from the next
+#: turn. LangGraph's ambient config (`get_config()`) would say it too, except
+#: on Python 3.10 inside an async node, where LangGraph cannot carry it; this
+#: variable rides the same context copies as the run's units.
 _IN_NODE: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "wardex_langgraph_in_node", default=False
 )
@@ -215,31 +228,74 @@ def _node_links(adapter: Any, task: Any, step: Scope) -> None:
         step.alias(UnitKey("langgraph.node", f"{token}/{name}"), remember=True)
 
 
-# -- the resume link ---------------------------------------------------------
+# -- the thread a run is on, and the resume link ----------------------------
 
 
-def _configurable(graph: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> dict[str, Any]:
-    """The run's `configurable`: the graph's bound config, with the call's over it.
+def _config_merge(pregel_mod: Any, ctx: Any) -> Callable[..., Any] | None:
+    """The `ensure_config` that `Pregel.stream` calls, bound once at install.
 
-    `Pregel.stream(self, input, config=None, ...)`; `args` excludes `self`.
-    This is LangGraph's own precedence — `Pregel.stream` runs
-    `ensure_config(self.config, config)` and `RemoteGraph` runs
-    `merge_configs(self.config, config)`, both shallow-merging `configurable`
-    with the call's keys winning — so `graph.with_config(configurable=...)`,
-    which binds its keys on a copy of the graph, states a thread exactly as a
-    call config does. Reading the call alone dropped every thread pinned that
-    way: no attribute, no resume link and no conversation, with nothing
-    counted.
+    Read off the CONSUMER's module, as the node seam patches the consumer's
+    `run_with_retry`: it is the very function the run will call. Absent — a
+    release that renamed it — the bound and call configs are still read, but a
+    thread stated only by the ambient config is not, and that is said once
+    and counted rather than left to look like a run with no thread.
+    """
+    merge = getattr(pregel_mod, "ensure_config", None)
+    if callable(merge):
+        return merge
+    report_once(
+        "langgraph adapter: config merge unrecognized; a thread_id stated only by an "
+        "enclosing runnable's config will not be read",
+        key="adapters.langgraph.unsupported_config_merge",
+    )
+    ctx.count("unsupported_config_merge")
+    return None
 
-    `type(config) is not dict`, not `isinstance`: a subclass whose `.get`
-    raises would defeat the whole point of the split this function sits in. A
-    `RunnableConfig` is a `TypedDict`, i.e. a plain `dict` at runtime, so the
-    exact-type test is not restrictive in practice.
+
+def _run_configurable(
+    adapter: Any, graph: Any, args: tuple[Any, ...], kwargs: dict[str, Any]
+) -> dict[str, Any]:
+    """The `configurable` this run executes under, read as its own entry reads it.
+
+    `Pregel.stream(self, input, config=None, ...)`; `args` excludes `self`. A
+    `thread_id` has three allowed spellings — the call's config, a config bound
+    with `graph.with_config(...)`, and the AMBIENT runnable config of whatever
+    encloses the call: a LangChain runnable invoked with one, or the node of
+    another graph, whose own config LangGraph hands a `sub.invoke(state)` made
+    without one. A `Pregel` run reads all three through `ensure_config(
+    self.config, config)`, so this calls that same function (`_config_merge`)
+    and the precedence is LangGraph's by construction — the call's keys over
+    the bound ones over the ambient, and an explicit thread or namespace
+    dropping the ambient `configurable` altogether, a rule that has changed
+    between releases. Reading fewer spellings dropped every thread stated the
+    other ways: no attribute, no resume link and no conversation, uncounted.
+
+    A `RemoteGraph` run merges only `merge_configs(self.config, config)` — the
+    platform never sees the caller's ambient config — so that is all it reads.
+
+    `type(config) is dict`, not `isinstance`, for both configs and for their
+    `configurable`: an object whose reads raise is never read here, nor handed
+    to LangGraph's merge from here, so its error reaches the host as
+    LangGraph's own. A `RunnableConfig` is a `TypedDict`, a plain `dict` at
+    runtime, so the exact-type test is not restrictive in practice.
     """
     config = kwargs.get("config")
     if config is None and len(args) >= 2:
         config = args[1]
-    return {**_conf(getattr(graph, "config", None)), **_conf(config)}
+    bound = getattr(graph, "config", None)
+    merge = adapter._config_merge if isinstance(graph, adapter._pregel) else None
+    if merge is None or not (_plain(config) and _plain(bound)):
+        return {**_conf(bound), **_conf(config)}
+    return _conf(merge(bound, config))
+
+
+def _plain(config: Any) -> bool:
+    if config is None:
+        return True
+    if type(config) is not dict:
+        return False
+    conf = config.get("configurable")
+    return conf is None or type(conf) is dict
 
 
 def _conf(config: Any) -> dict[str, Any]:
@@ -261,22 +317,53 @@ def _thread_id(conf: dict[str, Any]) -> str | int | None:
     return thread_id if isinstance(thread_id, str | int) else str(thread_id)
 
 
-def _resume_link(conf: dict[str, Any], thread_id: str | int, run: Scope) -> None:
+def _checkpointed(adapter: Any, graph: Any, conf: dict[str, Any]) -> bool:
+    """Will this run load and save its thread's state? Only then can it resume one.
+
+    A `Pregel` run's saver is `Pregel._defaults`' own resolution: none for
+    `checkpointer=False`, else the one its config hands it, else the graph's
+    own — and `checkpointer=True` is refused for a root run. A run without one
+    starts from nothing whatever `thread_id` it is given, so a link would
+    claim a continuation that did not happen. A `RemoteGraph` thread lives on
+    the platform, which keeps every thread it runs.
+    """
+    if not isinstance(graph, adapter._pregel):
+        return True
+    saver = getattr(graph, "checkpointer", None)
+    if saver is False:
+        return False
+    if _CHECKPOINTER in conf:
+        return conf[_CHECKPOINTER] is not None
+    return saver is not None and saver is not True
+
+
+def _resume_link(
+    adapter: Any, graph: Any, conf: dict[str, Any], thread_id: Any, run: Scope
+) -> None:
     """`RESUMED_FROM` the previous top-level run on this thread, then the alias for the next.
 
-    ONLY A TOP-LEVEL RUN takes part. LangGraph hands a subgraph its parent's
-    `thread_id` — a compiled graph used as a node, a `create_agent` inside a
-    parent graph, a supervisor's workers — so a subgraph that linked would
-    claim to resume its own enclosing run, and one that aliased would hand
-    the thread to itself, so the next turn would link to the previous turn's
-    subgraph instead of to the previous turn. Both are links to something
-    that did not happen. A run is a subgraph when its own config names a
-    checkpoint namespace, or when it is started from inside a node task of an
-    enclosing LangGraph run (`_IN_NODE`); either way it links and aliases
-    nothing, and nothing is counted, because no resume was lost. A
+    ONLY A TOP-LEVEL RUN ON A CHECKPOINTED THREAD takes part. LangGraph hands
+    a subgraph its parent's `thread_id` — a compiled graph used as a node, a
+    `create_agent` inside a parent graph, a supervisor's workers — so a
+    subgraph that linked would claim to resume its own enclosing run, and one
+    that aliased would hand the thread to itself, so the next turn would link
+    to the previous turn's subgraph instead of to the previous turn. Both are
+    links to something that did not happen. A run is a subgraph when the
+    config it executes under names a checkpoint namespace, or when it is
+    started from inside a node task of an enclosing LangGraph run
+    (`_IN_NODE`). And a run with no checkpointer (`_checkpointed`) resumes
+    nothing — the shape a subgraph takes when a node starts it on a plain
+    worker thread, where neither signal reaches it. Any of the three links and
+    aliases nothing, and nothing is counted, because no resume was lost. A
     subgraph compiled with `checkpointer=True` keeps its own state across
     turns, and that continuation is not linked either: the link means "this
-    turn continues that turn", which is the top-level run's to say.
+    turn continues that turn", which is the top-level run's to say. The one
+    shape left is a subgraph with a saver OF ITS OWN started on such a plain
+    worker thread under its parent's thread id: LangGraph runs it as a root
+    run of that thread in its own saver, nothing reaching this seam tells it
+    from a second top-level turn, and it links as one — the key is the thread
+    id alone, because a saver object is no identity for a thread (a host may
+    build one per request over the same database).
 
     ORDER IS LOAD-BEARING: link FIRST, alias AFTER. Aliased first, live-first
     resolution would answer this very run — the self-link guard would refuse
@@ -290,7 +377,7 @@ def _resume_link(conf: dict[str, Any], thread_id: str | int, run: Scope) -> None
     attest. Cross-process resume stays the documented boundary: nothing
     persists an identity across processes.
     """
-    if conf.get(_CHECKPOINT_NS) or _IN_NODE.get():
+    if conf.get(_CHECKPOINT_NS) or _IN_NODE.get() or not _checkpointed(adapter, graph, conf):
         return
     key = UnitKey("langgraph.thread_id", str(thread_id))
     run.link(LinkReason.RESUMED_FROM, key, expected=False)

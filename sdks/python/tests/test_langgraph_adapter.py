@@ -442,7 +442,7 @@ def test_a_moved_remote_surface_fails_the_remote_probe():
     `stream` as a plain function is a wrapper that would close the run before
     the platform produced a chunk; an INHERITED entry is a patch that would
     shadow a base attribute the restore must not delete; reordered leading
-    names would hand `_configurable` the wrong argument as `config`; and a
+    names would hand `_run_configurable` the wrong argument as `config`; and a
     Pydantic-shaped class defeats `PatchSet`'s `setattr` restore.
     """
     from wardex_sdk._adapters._langgraph import _remote_surface_ok

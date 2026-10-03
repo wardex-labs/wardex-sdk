@@ -958,12 +958,16 @@ diagnostic line (traceback under `debug=True`).
   marked `wardex.langgraph.remote`, with the platform HTTP request underneath;
   the remote run's internals execute out of process and are not captured. A
   cached node ships no span — no work ran. A run's `thread_id` — from the
-  call's config, or bound with `graph.with_config(...)`, the call's winning —
-  is recorded as `wardex.langgraph.thread_id` and is the run's
+  call's config, bound with `graph.with_config(...)`, or carried by the
+  config of whatever encloses the call, merged as LangGraph merges them — is
+  recorded as `wardex.langgraph.thread_id` and is the run's
   `gen_ai.conversation.id` unless the run sits inside your own
   `wardex.conversation(...)`. With a checkpointer, a later top-level run on
   the same thread in the same process links `resumed_from` to the previous
-  one; a subgraph inherits its parent's thread and links nothing. A node
+  one; a subgraph inherits its parent's thread and links nothing, and so
+  does a run without a checkpointer. One shape still links as a turn: a
+  subgraph with a checkpointer of its own that a node starts on a plain
+  worker thread (no context copied) under the parent's thread id. A node
   span's `wardex.step.index` is LangGraph's superstep number on that
   checkpoint thread, not the node's position in the run: a second turn on
   one thread continues the count (and the input and `__start__` supersteps
