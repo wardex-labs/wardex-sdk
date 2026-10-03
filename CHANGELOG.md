@@ -7,6 +7,35 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- **A span your code raised out of now says it failed, and why.** Before, an
+  exception leaving a `@wardex.workflow` / `@wardex.agent` / `@wardex.step` /
+  `@wardex.tool` function or a `with wardex.span()` / `wardex.conversation()`
+  block left the span `UNSET` with no trace of the exception, so the record of
+  a run could show where a branch died but not what killed it. Now the span
+  ships with status `ERROR`, `error.type` set to the exception's class
+  (fully qualified for your own, bare for a builtin: `ValueError`), and one
+  OpenTelemetry `exception` event with `exception.type`, `exception.message`
+  and `exception.stacktrace`, on the wardex envelope and over OTLP. Your code
+  receives the same exception object with its traceback unchanged. A status or
+  an `error.type` you set inside the block wins, and `asyncio.CancelledError`,
+  `KeyboardInterrupt`, `SystemExit` and `GeneratorExit` change nothing. **The
+  stack trace is recorded by default**, through the same masking as every
+  other value (an e-mail or an `sk-…` key in the message ships as `[EMAIL]` /
+  `[SECRET]`); each frame's file is relative to its package's import root or
+  the bare file name, never an absolute path, on the frame's own line only (a
+  message that itself says `File "/etc/app/config.yaml", line 3` reaches the
+  trace as written, just as in `exception.message`), and your home folder is
+  written as `~` wherever else its path appears in the message or the trace,
+  whatever comes before it (`'~/reports/q3.txt'`, `permission denied for ~.`,
+  `cat x >~/log.txt`, and `/backup~/x` for a copy of yours under another
+  folder, whose path still carries your user name). A folder whose name only
+  begins like yours (`/Users/alice-old`) is a different folder and is left as
+  written. Local variables are never captured. Each traceback keeps the 64
+  frames nearest the raise and says how many earlier ones it left out, so an
+  exception leaving hundreds of nested spans (a recursion through a decorated
+  function) costs each span at most 64 frames instead of the whole stack. Over
+  OTLP both values are capped by `max_otlp_attribute_bytes`.
+
 - **The transport values the interceptors measure now reach OTLP.** Before,
   an OTLP backend received only the protocol and the HTTP method, status and
   URL of a captured call; every other value the seam measures was dropped at
