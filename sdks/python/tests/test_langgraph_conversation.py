@@ -65,9 +65,14 @@ def test_a_thread_bound_with_with_config_is_the_conversation(installed):  # noqa
 
 
 def test_the_call_configs_thread_is_the_conversation_over_the_bound_one(installed):  # noqa: F811
+    """Both directions on one graph, so that neither reading alone passes: the
+    bound thread is the conversation until a call names its own, and the
+    call's wins for that run only."""
     app = _app().with_config(configurable={"thread_id": "T-BOUND"})
+    app.invoke({"trail": []})
     app.invoke({"trail": []}, {"configurable": {"thread_id": "T-CALL"}})
-    assert _conversation_ids(installed.spans) == {"T-CALL"}
+    in_order = sorted(runs(installed.spans), key=lambda s: s.start_time_ns)
+    assert [_conversation_ids([r]) for r in in_order] == [{"T-BOUND"}, {"T-CALL"}]
 
 
 def test_a_thread_in_an_enclosing_runnables_config_is_the_conversation(installed):  # noqa: F811
