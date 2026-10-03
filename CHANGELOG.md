@@ -277,6 +277,25 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- **The manual Langfuse pricing check,
+  `sdks/python/tests/e2e_usage_pricing_langfuse.py`, runs against Langfuse
+  v4 again.** It read back through the v1 observations list, which a v4
+  deployment refuses with a 404, so every run ended in three "not stored
+  within the deadline" failures and never reached a pricing claim. It also
+  looked spans up by the name it gave them, but a span carrying model usage
+  is stored as `chat {model}`, so that lookup could not match on any
+  version. It now reads `GET /api/public/v2/observations`, finds each span
+  by the trace and span id the SDK minted inside a start-time window, asks
+  for the `usage` field group (the v2 default returns no usage or cost), and
+  reads the v2 names `totalCost` and `inputUsage`. The reasoning-tier check
+  now picks out the one unpriced bucket from what Langfuse stored instead of
+  expecting one spelling, because Langfuse renamed that bucket in 4.7.0.
+  Checked against a local Langfuse 4.50.0, where every claim passes; that
+  release also fills in `totalUsage` from the bucket sum, which the driver
+  records rather than asserts. A refused query (wrong key, missing
+  endpoint) now ends the lookup at once with Langfuse's own message instead
+  of polling for two minutes per span.
+
 - **Values the SDK makes itself are no longer masked as a card number, and
   a span's masking record no longer reports a card that was never there.**
   The case that showed it is a span's connection id, a value the SDK makes
