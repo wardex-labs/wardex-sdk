@@ -359,6 +359,61 @@ def test_a_signal_while_recording_still_finishes_the_span(recording, monkeypatch
     assert spans["after"].parent_span_id is None
 
 
+class _ModuleLookupRaises(type):
+    """A host metaclass whose `__module__` is a property that raises."""
+
+    @property
+    def __module__(cls):
+        raise RuntimeError("the host's own metaclass failed")
+
+
+class _EveryLookupRaises(type):
+    """A host metaclass that refuses every attribute lookup on its classes."""
+
+    def __getattribute__(cls, name: str):
+        raise RuntimeError("the host's own metaclass failed")
+
+
+@pytest.mark.parametrize("meta", [_ModuleLookupRaises, _EveryLookupRaises])
+def test_an_exception_class_whose_name_lookup_raises_still_reaches_the_host(recording, meta):
+    """Naming the class used to run the host's metaclass outside any guard, so what
+    it raised left the block in place of the host's own exception, and the span
+    shipped UNSET with no event."""
+    odd = meta("Odd", (Exception,), {"__module__": "support_bot.errors", "__qualname__": "Odd"})
+    host = odd("the host's own failure")
+
+    seen = _catch(wardex.span("odd-class"), host)
+
+    assert seen is host
+    sp = _spans(recording)["odd-class"]
+    assert sp.status is StatusCode.ERROR
+    assert sp.error_type == "support_bot.errors.Odd"
+    event = _the_exception(sp)
+    assert event["exception.type"] == "support_bot.errors.Odd"
+    assert event["exception.message"] == "the host's own failure"
+
+
+def test_a_signal_whose_class_lookup_raises_still_reaches_the_host(recording):
+    """Telling a failure from a signal used to ask the exception for `__class__`,
+    which runs host code for anything that is not an `Exception`."""
+
+    class Stop(BaseException):
+        @property
+        def __class__(self):
+            raise RuntimeError("the host's own property failed")
+
+    host = Stop()
+    seen = _catch(wardex.span("odd-signal"), host)
+    with wardex.span("after"):
+        pass
+
+    assert seen is host
+    spans = _spans(recording)
+    assert spans["odd-signal"].status is StatusCode.UNSET
+    assert spans["odd-signal"].events == ()
+    assert spans["after"].parent_span_id is None
+
+
 # --------------------------------------------------------------------------
 # what leaves the process
 # --------------------------------------------------------------------------

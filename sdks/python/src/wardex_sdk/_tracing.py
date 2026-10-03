@@ -404,7 +404,13 @@ class _WithOnly:
         # Recorded HERE rather than in `_begin`, because this is the one place
         # that holds the traceback the host will see: once thrown into the
         # generator, it carries wardex's own frames at its head.
-        if isinstance(exc, Exception) and self._span is not None:
+        #
+        # `issubclass(type(exc), ...)`, not `isinstance(exc, ...)`: for anything
+        # that is not an `Exception`, `isinstance` asks the object for its
+        # `__class__`, which is the host's code and can raise in place of the
+        # exception the host is raising. `type()` and a subclass check against a
+        # builtin run nothing of the host's.
+        if issubclass(type(exc), Exception) and self._span is not None:
             try:
                 _record_exception(self._span, exc, tb)
             except BaseException:
@@ -527,7 +533,7 @@ def _record_exception(span: Span, exc: Exception, tb: TracebackType | None) -> N
     encoder masks them on both wires, and the OTLP value cap cuts them there.
     """
     draft = span._draft
-    name = _exception_type(type(exc))
+    name = _exception_type(type(exc))  # outside any guard, which is why it is TOTAL
     with guard("tracing.exception_status", debug=_debug_enabled()):
         if draft._status is StatusCode.UNSET:
             draft.set_status(StatusCode.ERROR, draft._status_message)
@@ -550,10 +556,50 @@ def _record_exception(span: Span, exc: Exception, tb: TracebackType | None) -> N
 
 
 def _exception_type(cls: type) -> str:
-    """The class's fully qualified name, bare for a builtin — OTel Python's rule."""
-    module = getattr(cls, "__module__", None)
-    qualname = getattr(cls, "__qualname__", None) or cls.__name__
-    return qualname if module in (None, "", "builtins") else f"{module}.{qualname}"
+    """The class's fully qualified name, bare for a builtin — OTel Python's rule.
+
+    TOTAL, because it runs outside any guard on the host's way out of a block,
+    over a class that is the host's: a metaclass can make `__module__` a
+    property, or refuse every lookup, and what it raises would leave the block
+    in place of the host's own exception. Python's own lookup goes first, so
+    the name matches the last line of the stack trace; when it raises or gives
+    something that is not a string, the names come from `type`'s own
+    descriptors, which read what the class statement stored and run nothing
+    of the host's. Only exact `str` values are compared or joined, so a string
+    subclass's `__eq__` or `__format__` never runs either.
+    """
+    try:
+        module, qualname = cls.__module__, cls.__qualname__
+    except Exception:
+        module = qualname = None
+    module = _exact_str(module)
+    if module is None:
+        module = _exact_str(_stored_module(cls))
+    qualname = _exact_str(qualname)
+    if qualname is None:
+        # Never raises: every class has a qualified name, and this getter reads
+        # it from the type object itself.
+        qualname = str.__str__(type.__dict__["__qualname__"].__get__(cls))
+    if module is None or module in ("", "builtins"):
+        return qualname
+    return f"{module}.{qualname}"
+
+
+def _stored_module(cls: type) -> object:
+    """The `__module__` the class statement stored, or None when it stored none."""
+    try:
+        return type.__dict__["__module__"].__get__(cls)
+    except Exception:
+        return None
+
+
+def _exact_str(value: object) -> str | None:
+    """`value` as an exact `str` (a copy, for a subclass), or None if it is no string.
+
+    `type()` and a subclass check against `str` read the object's real type, so
+    unlike `isinstance` they never ask the object for its `__class__`.
+    """
+    return str.__str__(value) if issubclass(type(value), str) else None
 
 
 def _call_site(fn: Callable[..., Any]) -> CallSite:
