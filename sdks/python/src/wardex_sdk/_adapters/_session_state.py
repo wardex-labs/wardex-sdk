@@ -497,6 +497,15 @@ class _Session:
     #: record would never be shipped. Bounded by the same per-session bound:
     #: the oldest is closed early, never dropped.
     open_chats: dict[str | None, _OpenChat] = field(default_factory=dict)
+    #: What an early close leaves behind: per thread, the `message.id` of the
+    #: response the bound shipped before its last line. Its later lines repeat
+    #: the usage that span already carries, so they are recognized as that
+    #: response's and add nothing, rather than open a second span that counts
+    #: one request, and prices its tokens, twice. What only they held is
+    #: missing from the span, which carries the bound's marker to say so. Under
+    #: the same bound, keyed like `open_chats`, and dropped whenever the
+    #: thread's response would have closed anyway (`end_chats`).
+    evicted_chats: dict[str | None, str | None] = field(default_factory=dict)
     subagents: dict[str, _OpenSubagent] = field(default_factory=dict)  # keyed by agent_id
     #: What the two span-owning tables above leave behind when the bound evicts
     #: an entry, under the SAME bound so the memory cannot outgrow what it
@@ -591,6 +600,29 @@ class _Session:
         if open_tool is not None and self.knows_subagent(open_tool.agent_id):
             return open_tool.agent_id
         return None
+
+    def shipped_early(self, ev: AgentStreamEvent) -> bool:
+        """Whether `ev` is a later line of the response the bound shipped from its thread."""
+        shipped = self.evicted_chats.get(ev.parent_tool_use_id)
+        return ev.message_id is not None and ev.message_id == shipped
+
+    def end_chats(self, threads: tuple[str | None, ...]) -> list[_OpenChat]:
+        """Take the responses these threads hold, every thread's when none is named.
+
+        Whatever ends a thread's response also forgets the one the bound shipped
+        early from it: past this point a line under that id is no longer the
+        shipped response's.
+        """
+        if not threads:
+            self.evicted_chats.clear()
+            threads = tuple(self.open_chats)
+        ended = []
+        for thread in threads:
+            self.evicted_chats.pop(thread, None)
+            chat = self.open_chats.pop(thread, None)
+            if chat is not None:
+                ended.append(chat)
+        return ended
 
     def knows_subagent(self, agent_id: str | None) -> bool:
         """Live, or evicted-but-remembered.

@@ -333,11 +333,16 @@ All notable changes to this project are documented here. The format follows
   first line. A background sub-agent's call returns before it speaks, so its
   last response is ended by the notification: that span ships when the
   sub-agent finishes, not when a long-lived client closes. If the per-session
-  bound has to close a response early it still ships, counted under
-  `adapters.assembler.open_chat_table_full`. Tool calls are still read from
-  every line. Still wrong: `output_tokens` is the count the CLI reported when
-  the response started, because its `assistant` lines carry nothing later,
-  so it stays low.
+  bound (`max_session_entries`) has to close a response before its last line,
+  that span is still the response's only one: it ships marked
+  `session_entry_table_full` with status `UNSET`, and the response's later
+  lines add no second span and no tokens, so the request and its usage are
+  still counted once. What only those later lines held is missing from its
+  output (counted under `adapters.assembler.chat_line_after_evict`; the early
+  close itself under `adapters.assembler.open_chat_table_full`). Tool calls
+  are still read from every line. Still wrong: `output_tokens` is the count
+  the CLI reported when the response started, because its `assistant` lines
+  carry nothing later, so it stays low.
 - **Values the SDK makes itself are no longer masked as a card number, and
   a span's masking record no longer reports a card that was never there.**
   The case that showed it is a span's connection id, a value the SDK makes

@@ -2484,6 +2484,58 @@ def test_the_held_response_table_closes_the_oldest_early_and_counts_it(tallies):
     assert sorted(chat.gen_ai.response_id for chat in _chats(client)) == ["a1", "b1"]
 
 
+def test_a_response_the_bound_closed_early_is_still_one_span_with_its_usage_counted_once(
+    tallies,
+):
+    """An early close must not split the response it closes. The response's
+    next line arrives after its span has shipped, and it used to open a second
+    span under the same id, carrying the same usage copy: one request priced
+    twice, with nothing on either span to tell it from a real second request.
+
+    The shipped span is the response: its later lines add no span and no
+    tokens. What only they held is missing from its output, so the span says
+    the bound closed it (UNSET, as for every entry a bound stops watching) and
+    the counter says how many lines it missed. Tool calls on those lines are
+    still read."""
+    client = FakeClient()
+    asm = SessionAssembler(client, max_session_entries=1)
+    _outbound(asm, key=1)
+    asm.on_inbound(1, INIT)
+    usage = {"input_tokens": 100, "output_tokens": 2}
+    asm.on_inbound(1, _line("m1", _TEXT, usage=usage))
+    # A sub-agent's response fills the one-entry table, so m1 is closed early...
+    sub_usage = {"input_tokens": 7, "output_tokens": 1}
+    asm.on_inbound(1, _line("s1", _TEXT, usage=sub_usage, parent="task_a"))
+    # ...and m1 goes on, on the main thread, with the same usage copy.
+    asm.on_inbound(1, _line("m1", _CALL, usage=usage, stop="tool_use"))
+    asm.on_inbound(1, _result_line("toolu_01"))
+    # The thread's NEXT response is a span of its own, whatever the bound left behind.
+    asm.on_inbound(1, _line("m2", _TEXT, usage={"input_tokens": 120, "output_tokens": 4}))
+    asm.on_inbound(1, RESULT)
+    asm.on_close(1, None)
+
+    chats = _chats(client)
+    assert sorted(chat.gen_ai.response_id for chat in chats) == ["m1", "m2", "s1"]
+    m1 = next(chat for chat in chats if chat.gen_ai.response_id == "m1")
+    assert m1.gen_ai.input_tokens == 100
+    assert _has(m1, Limitation.SESSION_ENTRY_TABLE_FULL)
+    assert m1.status is StatusCode.UNSET
+    assert json.loads(m1.output_data) == _TEXT  # the block after the close is not on it
+    assert tallies("adapters.assembler.chat_line_after_evict") == 1
+    # m2 needed the one entry too, so the bound closed s1 early as well.
+    s1 = next(chat for chat in chats if chat.gen_ai.response_id == "s1")
+    assert _has(s1, Limitation.SESSION_ENTRY_TABLE_FULL)
+    m2 = next(chat for chat in chats if chat.gen_ai.response_id == "m2")
+    assert m2.gen_ai.input_tokens == 120
+    assert not _has(m2, Limitation.SESSION_ENTRY_TABLE_FULL)
+    assert m2.status is StatusCode.OK
+    assert tallies("adapters.assembler.open_chat_table_full") == 2
+    # Responses are counted once each: the swallowed line is no turn of its own.
+    assert sorted(chat.conversation.turn_index for chat in chats) == [1, 2, 3]
+    # The tool call that only the swallowed line carried still ships.
+    assert [s.name for s in _tools(client, "toolu_01")] == ["execute_tool Bash"]
+
+
 def test_join_blocks_keeps_every_block_whatever_shape_a_side_has():
     from wardex_sdk._adapters._session_state import _join_blocks
 

@@ -1372,6 +1372,38 @@ def test_a_response_split_across_lines_joins_its_one_llm_request(receiver):
     assert not any(s.name == "execute_step llm_request" for s in client.spans)
 
 
+def test_a_response_the_bound_closed_early_pends_once_and_keeps_the_mark(receiver):
+    """The pending path of an early close. The bound pends the held response
+    so a newer one fits, and the response's next line, a copy of the same usage,
+    must not pend a second chat for the same request. The pending buffer shares
+    the bound, so the early-closed chat leaves it unmerged when the held ones
+    pend at the close: it ships once, with the deferred timing marks applied,
+    the bound's mark and the UNSET status."""
+    client = FakeClient()
+    asm = SessionAssembler(client, bridge=receiver, max_session_entries=1)
+    receiver.reserve(TRACE)
+    _outbound(asm, 1, bridge=_binding())
+    asm.on_inbound(1, INIT)
+    asm.on_inbound(1, _split_response_line([{"type": "text", "text": "running it"}]))
+    sub = _split_response_line([{"type": "text", "text": "looking"}], msg_id="s1")
+    asm.on_inbound(1, {**sub, "parent_tool_use_id": "task_a"})
+    call = {"type": "tool_use", "id": "toolu_01", "name": "Bash", "input": {"command": "ls"}}
+    asm.on_inbound(1, _split_response_line([call]))
+    asm.on_inbound(1, RESULT)
+
+    pended = [rec.gen_ai.response_id for rec in asm._by_key[1].pending if rec.kind == "chat"]
+    assert pended == ["m1"]  # s1 is still held, and m1 pended once
+    asm.on_close(1, None)
+
+    m1s = [s for s in client.spans if s.name.startswith("chat") and s.gen_ai.response_id == "m1"]
+    assert len(m1s) == 1
+    (m1,) = m1s
+    assert m1.gen_ai.input_tokens == 10
+    assert Limitation.SESSION_ENTRY_TABLE_FULL in _limitations(m1)
+    assert _TIMING in _limitations(m1)
+    assert m1.status is StatusCode.UNSET
+
+
 def test_a_main_response_held_across_a_sub_agents_reply_still_joins_its_request(receiver):
     """A main response that calls `Task` stays held until the main thread moves
     on, so it is pended AFTER the sub-agent's reply. With no SubagentStart that

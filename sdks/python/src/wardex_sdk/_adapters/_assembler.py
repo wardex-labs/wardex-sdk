@@ -417,13 +417,11 @@ class SessionAssembler:
             elif ev.kind == "stream_delta":
                 sess.thread(ev.parent_tool_use_id, now).note_chunk(now)
             elif ev.kind == "session_result":
-                # The main thread's turn is over, so is its response. A sub-agent's is not:
-                # a background one can still be mid-response. Its task's end closes it.
+                # The main thread's response ends with its turn; a background sub-agent's need not.
                 self._close_chats(sess, None)
                 sess.result = ev
             elif ev.kind == "task_lifecycle":
-                # Only a task's END is read, as the end of its sub-agent's thread (see
-                # `_OpenChat`). Sub-agent spans come from the SubagentStart/Stop hooks.
+                # Only a task's END is read: it ends its sub-agent's thread (see `_OpenChat`).
                 if ev.subtype == "task_notification" and ev.task_tool_use_id:
                     self._close_chats(sess, ev.task_tool_use_id)
 
@@ -876,9 +874,8 @@ class SessionAssembler:
         return crumb.context if crumb is not None else sess.unit.context
 
     def _emit_chat(self, sess: _Session, ev: AgentStreamEvent, now: int) -> None:
-        """One span per RESPONSE, not per line (see `_OpenChat`): a line with the
-        id of the response its thread holds is one more block of it, and any
-        other line means that response is over."""
+        """One span per RESPONSE, not per line (see `_OpenChat`): a line with the id of the response
+        its thread holds is one more block of it, and any other line means that response is over."""
         # Same FFI-value pattern as `build_gen_ai`: the native parser reports
         # the condition per line, the layer that owns `counters` tallies it.
         if ev.usage_totals_unpaired:
@@ -891,6 +888,8 @@ class SessionAssembler:
         if held is not None and held.continues(ev):
             with self._guard("adapters.assembler.emit_chat"):
                 held.fold(ev, now)
+        elif sess.shipped_early(ev):  # its span is out, with this line's usage on it
+            counters.bump("adapters.assembler.chat_line_after_evict")
         else:
             self._close_chats(sess, key)
             # Counted BEFORE the span is built, so turns run from 1 and a wire 0 (proto3's
@@ -901,22 +900,23 @@ class SessionAssembler:
         sess.mark_thread(key, now, new_turn=True)
         if chat is not None:
             evicted = self._room_for(sess.open_chats, "open_chat")
-            if evicted is not None:
-                self._ship_chat(sess, evicted[1])  # closed early, never dropped
+            if evicted is not None:  # closed early, never dropped, never split
+                self._ship_chat(sess, evicted[1], closed_early=True)
+                self._room_for(sess.evicted_chats, "evicted_chat")
+                sess.evicted_chats[evicted[0]] = evicted[1].message_id
             sess.open_chats[key] = chat
 
     def _open_chat(self, sess: _Session, ev: AgentStreamEvent, now: int) -> _OpenChat:
         """A response's chat span from its FIRST line, minus its END and its
         TIMING markers — those are `_ship_chat`'s, once the response is over."""
-        # Consumption is gated exactly the way installation is (`on_outbound`):
-        # only a MAIN-THREAD assistant turn consumes the pending prompt. A
-        # subagent-attributed chat's input is the subagent's task, not the
-        # user's session prompt, so it ships `input_attempted=False` and leaves
-        # the pending prompt for the next main-thread turn. `attempted`, not
-        # `bool(payload)`: an intermediate assistant turn of one agentic loop
-        # HAS no user prompt, and saying so is different from reporting an
-        # empty capture as a failed one. Decided before the edge: a prompt a
-        # sole-live-inferred hook seeded makes this turn's session a guess too.
+        # Consumption is gated exactly the way installation is (`on_outbound`): only a MAIN-THREAD
+        # assistant turn consumes the pending prompt. A subagent-attributed chat's input is the
+        # subagent's task, not the user's session prompt, so it ships `input_attempted=False` and
+        # leaves the pending prompt for the next main-thread turn. `attempted`, not
+        # `bool(payload)`: an intermediate assistant turn of one agentic loop HAS no user prompt,
+        # and saying so is different from reporting an empty capture as a failed one. Decided
+        # before the edge: a prompt a sole-live-inferred hook seeded makes this turn's session a
+        # guess too.
         consume = ev.parent_tool_use_id is None and sess.pending_prompt_source is not None
         evidence = _SOLE_LIVE if consume and sess.pending_prompt_sole_inferred else _IN_SESSION
         p = child_of(self._resolve_subagent_anchor(sess, ev.parent_tool_use_id), evidence)
@@ -926,10 +926,9 @@ class SessionAssembler:
         start_ns = min(thread.last_ns, now)
         ttft = thread.ttft_s(start_ns)
 
-        # `subject=ev.model`, not an f-string. A turn whose stream never reported
-        # a model used to produce the literal span name "chat None"; the grammar
-        # yields the bare operation instead, and there is no interpolation left
-        # at this site to get wrong.
+        # `subject=ev.model`, not an f-string. A turn whose stream never reported a model used to
+        # produce the literal span name "chat None"; the grammar yields the bare operation instead,
+        # and there is no interpolation left at this site to get wrong.
         draft = SpanDraft(
             p,
             intent=SpanIntent.CHAT,
@@ -980,22 +979,23 @@ class SessionAssembler:
             sess.pending_prompt_source = None
             sess.pending_prompt_hook_seen = False
             sess.pending_prompt_sole_inferred = False
-        # No correlation: the anchor above may be a fallback (see
-        # `_resolve_subagent_anchor`), and the parentage's own record would
-        # report it as `unit_active`/1.0 with no marker — a claim this span
-        # cannot back (I4). The ingestion move that turns that fallback into a
-        # `UnitKey` is what earns this field.
+        # No correlation: the anchor above may be a fallback (see `_resolve_subagent_anchor`), and
+        # the parentage's own record would report it as `unit_active`/1.0 with no marker — a claim
+        # this span cannot back (I4). The ingestion move that turns that fallback into a `UnitKey`
+        # is what earns this field.
         draft.replace_correlation(None)
         return chat
 
-    def _ship_chat(self, sess: _Session, chat: _OpenChat) -> None:
+    def _ship_chat(self, sess: _Session, chat: _OpenChat, *, closed_early: bool = False) -> None:
         """Finish a response's chat span, or hold it for the finalize-time merge.
 
-        One path for both, so the bridge's off state reproduces the span field
-        for field. Pending, the timing markers travel DEFERRED: a merge with a
-        `claude_code.llm_request` removes the rationale for both (CLI-measured
-        interval + ttft), and an unmerged flush applies them unchanged. The
-        join window ends at the response's first line (`_OpenChat.opened_ns`).
+        One path for both, so the bridge's off state reproduces the span field for field.
+        Pending, the timing markers travel DEFERRED: a merge with a `claude_code.llm_request`
+        removes the rationale for both (CLI-measured interval + ttft), and an unmerged flush
+        applies them unchanged. The join window ends at the response's first line
+        (`_OpenChat.opened_ns`). `closed_early`, the bound shipping it before its last line,
+        marks it and makes it UNSET before any pend, so no merge removes either: the CLI's
+        timing corrects the request's interval, not the blocks wardex never saw.
         """
         timing = (
             (_BASE_LIMITATION, Limitation.TTFT_IPC_APPROXIMATION)
@@ -1004,6 +1004,9 @@ class SessionAssembler:
         )
         span = None
         with self._guard("adapters.assembler.emit_chat"):
+            if closed_early:
+                chat.draft.set_status(StatusCode.UNSET)
+                chat.draft.add_limitation(Limitation.SESSION_ENTRY_TABLE_FULL)
             if sess.bridge is None:
                 for marker in timing:
                     chat.draft.add_limitation(marker)
@@ -1024,12 +1027,9 @@ class SessionAssembler:
             self._capture(span)
 
     def _close_chats(self, sess: _Session, *threads: str | None) -> None:
-        """Ship the responses these threads hold; every thread's when none is named.
-        Closing one early can only split a response, never drop it."""
-        for thread in threads or list(sess.open_chats):
-            chat = sess.open_chats.pop(thread, None)
-            if chat is not None:
-                self._ship_chat(sess, chat)
+        """Ship the responses these threads hold; every thread's when none is named."""
+        for chat in sess.end_chats(threads):
+            self._ship_chat(sess, chat)
 
     def _claim_key(self, sess: _Session, tool_name: str) -> UnitKey | None:
         """This hook observation's slot in the shared key space, or None.
