@@ -330,9 +330,12 @@ All notable changes to this project are documented here. The format follows
   response is over (the thread's next response begins, the turn's `result`
   arrives, the sub-agent's `Task` call returns, its task's
   `task_notification` arrives, or the session closes) rather than on its
-  first line. A background sub-agent's call returns before it speaks, so its
-  last response is ended by the notification: that span ships when the
-  sub-agent finishes, not when a long-lived client closes. If the per-session
+  first line. A background sub-agent's call returns when it launches, and
+  the CLI marks that result `async_launched`, so the adapter does not take it
+  for the end of the sub-agent's thread: the sub-agent's last response is
+  ended by the notification and ships when the sub-agent finishes, not when a
+  long-lived client closes, and a launch result written after the sub-agent's
+  first line no longer cuts that response in two. If the per-session
   bound (`max_session_entries`) has to close a response before its last line,
   that span is still the response's only one: it ships marked
   `session_entry_table_full` with status `UNSET`, and the response's later

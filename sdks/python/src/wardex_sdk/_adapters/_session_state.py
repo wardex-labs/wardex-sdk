@@ -116,10 +116,13 @@ class _OpenChat:
     session itself ends.
 
     The notification is the only end a BACKGROUND sub-agent's thread gets. Its
-    call's result comes back the moment it launches, before the sub-agent
-    speaks, and the turn that launched it settles too, so without it the
-    sub-agent's last response would be held until the session closed: for a
-    long-lived client, whenever the process ends. The CLI sends the frame only
+    call's result is the call's launch (`AgentStreamEvent.launched_async`) and
+    ends nothing: recorded, it came back before the sub-agent spoke, but nothing
+    makes the CLI write it before the sub-agent's first line, and taking it for
+    the thread's end split a response whose first line came first. The turn
+    that launched it settles too, so without the notification the sub-agent's
+    last response would be held until the session closed: for a long-lived
+    client, whenever the process ends. The CLI sends the frame only
     with a terminal status, and its `tool_use_id` is the call whose id the
     sub-agent's lines carry as `parent_tool_use_id`. Recorded against the real
     CLI: the sub-agent's last line, two other system frames, this one, then
@@ -429,8 +432,9 @@ class _Thread:
     #: response's (`_Session.shipped_early`). Kept on the thread's own record
     #: because nothing another thread does can remove that record: the main
     #: thread's is never evicted, and a sub-agent's is refused when the table
-    #: is full, never evicted, and dropped only when the `Task` call that
-    #: spawned it returns, which ends the response anyway. Held in a
+    #: is full, never evicted, and dropped only when its thread ends (the `Task`
+    #: call that spawned it returns or, for a call that returned at launch, its
+    #: task's notification arrives), which ends the response anyway. Held in a
     #: table of its own under the bound, the id was pushed out by the next
     #: early close on any other thread, and the response's next line opened a
     #: second span: the request priced twice, with nothing on it to say so.
@@ -694,18 +698,27 @@ class _Session:
             agent_id in self.subagents or agent_id in self.evicted_subagents
         )
 
-    def end_tool(self, parent_tool_use_id: str | None, tool_use_id: str | None, now: int) -> None:
+    def end_tool(
+        self, parent_tool_use_id: str | None, tool_use_id: str | None, now: int, launched: bool
+    ) -> bool:
         """A tool result arrived on `parent_tool_use_id`'s thread for `tool_use_id`.
 
         It moves that thread's floor — the CLI sends the thread's next request
         once the results it waits on are in — and, when the finished call was a
         `Task`, ends the sub-agent thread it spawned: no event can arrive on a
         thread after its spawning call has returned, so keeping the entry would
-        only spend the bound that live sub-agents need.
+        only spend the bound that live sub-agents need. Returns whether a thread
+        may have ended, for the caller to ship what that thread held.
+
+        A result that only LAUNCHED its call (`launched`, a background sub-agent)
+        ends nothing: the sub-agent's lines are still to come, and its thread
+        ends at its task's notification instead.
         """
         self.mark_thread(parent_tool_use_id, now)
-        if tool_use_id is not None:
-            self.threads.pop(tool_use_id, None)
+        if tool_use_id is None or launched:
+            return False
+        self.threads.pop(tool_use_id, None)
+        return True
 
     def mark_thread(
         self, parent_tool_use_id: str | None, now: int, *, new_turn: bool = False

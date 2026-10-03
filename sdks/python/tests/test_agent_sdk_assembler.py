@@ -2450,6 +2450,56 @@ def test_a_recorded_background_sub_agent_ships_its_response_when_its_task_ends()
     )
 
 
+def test_a_background_calls_launch_result_ends_nothing_even_after_its_sub_agent_has_spoken():
+    """A background `Agent` call's result is its LAUNCH (the CLI records it as
+    `async_launched`), and the sub-agent runs on after it. Recorded, it came
+    back before the sub-agent's first line, but nothing makes the CLI write it
+    first. Taken for the end of the sub-agent's thread, it shipped the response
+    that thread was holding, and the response's next line opened a second span
+    with the same usage copy, status OK and no marker: the request priced twice.
+
+    The recording, with the sub-agent's first line moved to just before the
+    launch result: the response is still one span with its usage once, and the
+    thread ends at its task's notification."""
+    lines = _recording("background_agent")
+    responses = _by_response(lines)
+    (sub_id,) = [rid for rid, group in responses.items() if group[0]["parent_tool_use_id"]]
+    first_sub = responses[sub_id][0]
+    thread = first_sub["parent_tool_use_id"]
+    launch = next(
+        msg
+        for msg in lines
+        if msg.get("type") == "user" and msg["message"]["content"][0].get("tool_use_id") == thread
+    )
+    assert launch["tool_use_result"]["status"] == "async_launched"
+    reordered = [msg for msg in lines if msg is not first_sub]
+    reordered.insert(reordered.index(launch), first_sub)
+    notification = next(
+        i for i, msg in enumerate(reordered) if msg.get("subtype") == "task_notification"
+    )
+
+    client = FakeClient()
+    asm = SessionAssembler(client)
+    for msg in reordered[:notification]:
+        asm.on_inbound(1, msg)
+    assert sub_id not in [chat.gen_ai.response_id for chat in _chats(client)]  # still arriving
+    asm.on_inbound(1, reordered[notification])
+    assert thread not in asm._by_key[1].threads  # its end, and the bound gets the entry back
+    for msg in reordered[notification + 1 :]:
+        asm.on_inbound(1, msg)
+    asm.on_close(1, None)
+
+    chats = _chats(client)
+    assert sorted(chat.gen_ai.response_id for chat in chats) == sorted(responses)
+    (sub,) = [chat for chat in chats if chat.gen_ai.response_id == sub_id]
+    group = responses[sub_id]
+    assert sub.gen_ai.input_tokens == _inclusive_input(group[0]["message"]["usage"])
+    blocks = [block for line in group for block in line["message"]["content"]]
+    assert json.loads(sub.output_data) == blocks
+    assert sub.status is StatusCode.OK
+    assert not _has(sub, Limitation.SESSION_ENTRY_TABLE_FULL)
+
+
 def test_a_response_still_held_when_the_session_ends_ships_on_every_way_out():
     """Holding a response defers its span; it never owns it. Closing the
     transport, and the shutdown sweep, both ship what is still held."""

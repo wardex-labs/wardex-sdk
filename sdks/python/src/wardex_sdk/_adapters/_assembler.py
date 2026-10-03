@@ -411,9 +411,8 @@ class SessionAssembler:
                         sess.stream_tool_meta[tu_id] = (tu_name, tu_input, now)
             elif ev.kind == "tool_result":
                 self._on_stream_tool_result(sess, ev, now)
-                sess.end_tool(ev.parent_tool_use_id, ev.tool_result_id, now)
-                if ev.tool_result_id is not None:  # a `Task` result ends its sub-agent's thread
-                    self._close_chats(sess, ev.tool_result_id)
+                if sess.end_tool(ev.parent_tool_use_id, ev.tool_result_id, now, ev.launched_async):
+                    self._close_chats(sess, ev.tool_result_id)  # a `Task` result ends its thread
             elif ev.kind == "stream_delta":
                 sess.thread(ev.parent_tool_use_id, now).note_chunk(now)
             elif ev.kind == "session_result":
@@ -424,6 +423,7 @@ class SessionAssembler:
                 # Only a task's END is read: it ends its sub-agent's thread (see `_OpenChat`).
                 if ev.subtype == "task_notification" and ev.task_tool_use_id:
                     self._close_chats(sess, ev.task_tool_use_id)
+                    sess.threads.pop(ev.task_tool_use_id, None)
 
     def on_close(self, key: int, error: str | None) -> None:
         now = time.time_ns()

@@ -32,7 +32,10 @@ What the recordings show, and what the replay tests in
   `system/task_updated` and then its task's `system/task_notification`,
   whose `tool_use_id` is the `Agent` call's id, the same id the sub-agent's
   lines carry as `parent_tool_use_id`. Then the CLI starts a new main-thread
-  turn to report the result.
+  turn to report the result. The call's result coming first is the order this
+  run happened to take, not one the CLI promises, so the assembler reads the
+  `async_launched` status instead, and one replay test moves the sub-agent's
+  first line ahead of that result.
 
 Provenance:
 
