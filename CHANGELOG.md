@@ -339,10 +339,17 @@ All notable changes to this project are documented here. The format follows
   lines add no second span and no tokens, so the request and its usage are
   still counted once. What only those later lines held is missing from its
   output (counted under `adapters.assembler.chat_line_after_evict`; the early
-  close itself under `adapters.assembler.open_chat_table_full`). Tool calls
-  are still read from every line. Still wrong: `output_tokens` is the count
-  the CLI reported when the response started, because its `assistant` lines
-  carry nothing later, so it stays low.
+  close itself under `adapters.assembler.open_chat_table_full`). The adapter
+  recognizes those lines by the response's id, which it keeps with the
+  response's own thread, so early closes on other threads cannot make it
+  forget. The one exception is a sub-agent thread that started while the
+  same bound was already tracking `max_session_entries` sub-agent threads:
+  its id is then kept under the bound as well, and if further early closes
+  push it out, a later line of that response opens a second span (counted
+  under `adapters.assembler.evicted_chat_table_full`). Tool calls are still
+  read from every line. Still wrong: `output_tokens` is the count the CLI
+  reported when the response started, because its `assistant` lines carry
+  nothing later, so it stays low.
 - **Values the SDK makes itself are no longer masked as a card number, and
   a span's masking record no longer reports a card that was never there.**
   The case that showed it is a span's connection id, a value the SDK makes

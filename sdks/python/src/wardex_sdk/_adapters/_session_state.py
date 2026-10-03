@@ -423,6 +423,18 @@ class _Thread:
     #: 0 when none has arrived since the last chat span. Reset per chat, so
     #: turn N's ttft is measured against turn N's own first chunk.
     first_delta_ns: int = 0
+    #: The `message.id` of this thread's response that the per-session bound
+    #: shipped before its last line, or None. Its later lines repeat the usage
+    #: that span already carries, so they must still be recognized as that
+    #: response's (`_Session.shipped_early`). Kept on the thread's own record
+    #: because nothing another thread does can remove that record: the main
+    #: thread's is never evicted, and a sub-agent's is refused when the table
+    #: is full, never evicted, and dropped only when the `Task` call that
+    #: spawned it returns, which ends the response anyway. Held in a
+    #: table of its own under the bound, the id was pushed out by the next
+    #: early close on any other thread, and the response's next line opened a
+    #: second span: the request priced twice, with nothing on it to say so.
+    closed_early: str | None = None
 
     def note_chunk(self, now: int) -> None:
         """The first chunk since the last chat span; later ones change nothing."""
@@ -497,15 +509,19 @@ class _Session:
     #: record would never be shipped. Bounded by the same per-session bound:
     #: the oldest is closed early, never dropped.
     open_chats: dict[str | None, _OpenChat] = field(default_factory=dict)
-    #: What an early close leaves behind: per thread, the `message.id` of the
-    #: response the bound shipped before its last line. Its later lines repeat
-    #: the usage that span already carries, so they are recognized as that
-    #: response's and add nothing, rather than open a second span that counts
-    #: one request, and prices its tokens, twice. What only they held is
-    #: missing from the span, which carries the bound's marker to say so. Under
-    #: the same bound, keyed like `open_chats`, and dropped whenever the
-    #: thread's response would have closed anyway (`end_chats`).
-    evicted_chats: dict[str | None, str | None] = field(default_factory=dict)
+    #: What an early close leaves behind on a sub-agent thread that the thread
+    #: table had no room to track, and that therefore has no record to keep
+    #: `_Thread.closed_early` on: per thread, the `message.id` of the response
+    #: the bound shipped before its last line. Its later lines are recognized
+    #: as that response's and add nothing, rather than open a second span that
+    #: counts one request, and prices its tokens, twice. Under the same bound,
+    #: keyed like `open_chats`, and dropped whenever the thread's response
+    #: would have closed anyway (`end_chats`). Unlike the record, this memory
+    #: CAN be pushed out, by early closes on other untracked threads. A later
+    #: line of the forgotten response then opens a second span, and the
+    #: overflow counter (`adapters.assembler.evicted_chat_table_full`) is the
+    #: only record of it.
+    evicted_chats: dict[str, str] = field(default_factory=dict)
     subagents: dict[str, _OpenSubagent] = field(default_factory=dict)  # keyed by agent_id
     #: What the two span-owning tables above leave behind when the bound evicts
     #: an entry, under the SAME bound so the memory cannot outgrow what it
@@ -601,10 +617,46 @@ class _Session:
             return open_tool.agent_id
         return None
 
+    def tracked_thread(self, parent_tool_use_id: str | None) -> _Thread | None:
+        """The thread's own record: always the main thread's, a sub-agent's only
+        when the table had room for it. Unlike `thread`, never makes one."""
+        if parent_tool_use_id is None:
+            return self.main_thread
+        return self.threads.get(parent_tool_use_id)
+
+    def remember_early_close(
+        self,
+        parent_tool_use_id: str | None,
+        message_id: str | None,
+        room_for: Callable[[dict[str, Any], str], object],
+    ) -> None:
+        """Remember the response the bound shipped from this thread before its last line.
+
+        On the thread's own record, which nothing another thread does can remove
+        (`_Thread.closed_early`). Only a sub-agent thread the table had no room
+        to track has no record (the main thread always has one), and falls back
+        to the bounded `evicted_chats`, made room in the assembler's way:
+        `room_for` is its `_room_for`. A response with no id has nothing a later
+        line could be recognized by, so it leaves nothing.
+        """
+        if message_id is None:
+            return
+        record = self.tracked_thread(parent_tool_use_id)
+        if record is not None:
+            record.closed_early = message_id
+        elif parent_tool_use_id is not None:
+            room_for(self.evicted_chats, "evicted_chat")
+            self.evicted_chats[parent_tool_use_id] = message_id
+
     def shipped_early(self, ev: AgentStreamEvent) -> bool:
         """Whether `ev` is a later line of the response the bound shipped from its thread."""
-        shipped = self.evicted_chats.get(ev.parent_tool_use_id)
-        return ev.message_id is not None and ev.message_id == shipped
+        if ev.message_id is None:
+            return False
+        record = self.tracked_thread(ev.parent_tool_use_id)
+        if record is not None and record.closed_early == ev.message_id:
+            return True
+        key = ev.parent_tool_use_id
+        return key is not None and self.evicted_chats.get(key) == ev.message_id
 
     def end_chats(self, threads: tuple[str | None, ...]) -> list[_OpenChat]:
         """Take the responses these threads hold, every thread's when none is named.
@@ -615,10 +667,17 @@ class _Session:
         """
         if not threads:
             self.evicted_chats.clear()
+            self.main_thread.closed_early = None
+            for record in self.threads.values():
+                record.closed_early = None
             threads = tuple(self.open_chats)
         ended = []
         for thread in threads:
-            self.evicted_chats.pop(thread, None)
+            if thread is not None:
+                self.evicted_chats.pop(thread, None)
+            record = self.tracked_thread(thread)
+            if record is not None:
+                record.closed_early = None
             chat = self.open_chats.pop(thread, None)
             if chat is not None:
                 ended.append(chat)

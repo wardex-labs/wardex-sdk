@@ -350,16 +350,16 @@ Two emit sites, and the first is the mechanism the second restates.
 
     Four emit sites, all in ``_adapters/_assembler.py`` and all one bound.
     ``SessionAssembler._open_tool`` force-closes the oldest OPEN TOOL of a full ``open_tools``
-    table; the ``SubagentStart`` branch of ``::on_hook`` does the same for the oldest OPEN
-    SUB-AGENT of a full ``subagents`` table (which used to be dropped with no span at all, and
-    whose span CONTEXT is kept in an ``_EvictedSubagent`` breadcrumb so its children keep their
-    parent); ``::_ship_chat`` puts it on the oldest model response still arriving, closed before
-    its last line to hold a newer one (its later lines add no second span, so its output lacks what
-    only they held); and ``::_close_tool`` / ``::_on_stream_tool_result`` put it on the COMPLETION
-    half — the span built when a tool's own ``PostToolUse`` or stream ``tool_result`` arrives after
-    wardex had already evicted its open record. That is the same bound reported from the other end,
-    and the ``_EvictedTool`` breadcrumb is what lets the completion say so instead of shipping as a
-    second, zero-duration tool call under the wrong parent.
+    table; the ``SubagentStart`` branch of ``::on_hook`` does the same for the oldest OPEN SUB-AGENT
+    of a full ``subagents`` table (which used to be dropped with no span at all, and whose span
+    CONTEXT is kept in an ``_EvictedSubagent`` breadcrumb so its children keep their parent);
+    ``::_ship_chat`` puts it on the oldest model response still arriving, closed before its last
+    line to hold a newer one (its later lines add no second span, so its output lacks what only they
+    held; but see ``_Session.evicted_chats``); and ``::_close_tool`` / ``::_on_stream_tool_result``
+    put it on the COMPLETION half — the span built when a tool's own ``PostToolUse`` or stream
+    ``tool_result`` arrives after wardex had already evicted its open record. That is the same bound
+    reported from the other end, and the ``_EvictedTool`` breadcrumb is what lets the completion say
+    so instead of shipping as a second, zero-duration tool call under the wrong parent.
 
     ONE CALL, TWO OBSERVATIONS. An evicted call that later completes ships two
     spans with the same ``call_id``, both carrying this marker, and they

@@ -900,10 +900,10 @@ class SessionAssembler:
         sess.mark_thread(key, now, new_turn=True)
         if chat is not None:
             evicted = self._room_for(sess.open_chats, "open_chat")
-            if evicted is not None:  # closed early, never dropped, never split
+            if evicted is not None:  # closed early, never dropped
                 self._ship_chat(sess, evicted[1], closed_early=True)
-                self._room_for(sess.evicted_chats, "evicted_chat")
-                sess.evicted_chats[evicted[0]] = evicted[1].message_id
+                # Nor split: its later lines are still recognized (see `_Thread.closed_early`).
+                sess.remember_early_close(evicted[0], evicted[1].message_id, self._room_for)
             sess.open_chats[key] = chat
 
     def _open_chat(self, sess: _Session, ev: AgentStreamEvent, now: int) -> _OpenChat:
@@ -1053,8 +1053,8 @@ class SessionAssembler:
         The assembler's half of `Unit._evict_oldest`, written to the same shape
         on purpose: one bound, one policy, two containers with different
         owners. Returns the evicted `(key, value)` so the CALLER decides what an
-        evicted entry owes the wire — a span (open tools, sub-agents) or a
-        breadcrumb (the two memories that outlive them).
+        evicted entry owes the wire — a span (open tools, sub-agents, arriving
+        responses) or a breadcrumb (the memories that outlive them).
 
         Returns the pair rather than taking a callback so the non-evicting path,
         which is every path until the table is full, allocates nothing: a

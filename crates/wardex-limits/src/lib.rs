@@ -104,7 +104,13 @@ pub struct Limits {
     /// several lines that each repeat its usage, so an evicted response's later
     /// lines add no second span: one would count the request, and its tokens,
     /// twice. Only the response's id is remembered across the eviction, and
-    /// the content only those lines carried is missing from the span.
+    /// the content only those lines carried is missing from the span. The id
+    /// is kept with the response's own thread, so evictions on other threads
+    /// cannot drop it. The exception is a sub-agent thread that started while
+    /// this bound was already tracking that many sub-agent threads: its id is
+    /// held under this bound too, and a later line that arrives after the id
+    /// was dropped does open a second span
+    /// (`adapters.assembler.evicted_chat_table_full` in the Python SDK).
     ///
     /// The other two evict nothing to the wire. Streamed tool metadata is
     /// consumed in ARRIVAL order, so a full table refuses the NEWEST entry

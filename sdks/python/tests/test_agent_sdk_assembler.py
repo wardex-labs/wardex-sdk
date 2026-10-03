@@ -2536,6 +2536,77 @@ def test_a_response_the_bound_closed_early_is_still_one_span_with_its_usage_coun
     assert [s.name for s in _tools(client, "toolu_01")] == ["execute_tool Bash"]
 
 
+def test_other_threads_early_closes_never_make_the_bound_forget_a_main_response_it_closed(
+    tallies,
+):
+    """The id that recognizes an early-closed response's later lines used to sit
+    in a table of its own under the same bound, so the NEXT early close, on any
+    other thread, could push it out. The response's next line then opened a
+    second span under the same id with the same usage copy, status OK and no
+    marker: one request priced twice and nothing on the wire to say so.
+
+    The id is kept with the thread the response came from, and the main thread
+    is always tracked, so no activity on other threads can drop it."""
+    client = FakeClient()
+    asm = SessionAssembler(client, max_session_entries=1)
+    _outbound(asm, key=1)
+    asm.on_inbound(1, INIT)
+    usage = {"input_tokens": 100, "output_tokens": 2}
+    asm.on_inbound(1, _line("m1", _TEXT, usage=usage))
+    # Two sub-agents' responses, each closing the one held before it early.
+    asm.on_inbound(
+        1, _line("s1", _TEXT, usage={"input_tokens": 7, "output_tokens": 1}, parent="task_a")
+    )
+    asm.on_inbound(
+        1, _line("s2", _TEXT, usage={"input_tokens": 8, "output_tokens": 1}, parent="task_b")
+    )
+    asm.on_inbound(1, _line("m1", _CALL, usage=usage, stop="tool_use"))
+    asm.on_inbound(1, RESULT)
+    asm.on_close(1, None)
+
+    chats = _chats(client)
+    m1s = [chat for chat in chats if chat.gen_ai.response_id == "m1"]
+    assert len(m1s) == 1
+    (m1,) = m1s
+    assert m1.gen_ai.input_tokens == 100
+    assert _has(m1, Limitation.SESSION_ENTRY_TABLE_FULL) and m1.status is StatusCode.UNSET
+    assert json.loads(m1.output_data) == _TEXT
+    assert tallies("adapters.assembler.chat_line_after_evict") == 1
+    assert tallies("adapters.assembler.evicted_chat_table_full") == 0
+    assert sorted(chat.conversation.turn_index for chat in chats) == [1, 2, 3]
+
+
+def test_a_tracked_sub_agent_thread_keeps_its_early_close_whatever_untracked_threads_do(
+    tallies,
+):
+    """The same holds for a sub-agent thread the session is tracking. Only a
+    thread the bound had no room to track keeps the id under the bound itself,
+    and when that memory overflows it is counted, never silent."""
+    client = FakeClient()
+    asm = SessionAssembler(client, max_session_entries=1)
+    _outbound(asm, key=1)
+    asm.on_inbound(1, INIT)
+    usage = {"input_tokens": 50, "output_tokens": 1}
+    asm.on_inbound(1, _line("s0", _TEXT, usage=usage, parent="task_0"))  # tracked
+    # Three more sub-agents the one-entry thread table has no room for, each
+    # closing the response held before it early.
+    for n in (1, 2, 3):
+        other = {"input_tokens": 10 + n, "output_tokens": 1}
+        asm.on_inbound(1, _line(f"s{n}", _TEXT, usage=other, parent=f"task_{n}"))
+    asm.on_inbound(1, _line("s0", _CALL, usage=usage, stop="tool_use", parent="task_0"))
+    asm.on_close(1, None)
+
+    chats = _chats(client)
+    s0s = [chat for chat in chats if chat.gen_ai.response_id == "s0"]
+    assert len(s0s) == 1
+    (s0,) = s0s
+    assert s0.gen_ai.input_tokens == 50
+    assert _has(s0, Limitation.SESSION_ENTRY_TABLE_FULL) and s0.status is StatusCode.UNSET
+    assert tallies("adapters.assembler.chat_line_after_evict") == 1
+    # The untracked threads' memory is the one under the bound, and its overflow is counted.
+    assert tallies("adapters.assembler.evicted_chat_table_full") == 1
+
+
 def test_join_blocks_keeps_every_block_whatever_shape_a_side_has():
     from wardex_sdk._adapters._session_state import _join_blocks
 
