@@ -277,6 +277,25 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- **A batch dropped because your transport or your `before_send_envelope`
+  raised is now counted, and a raising transport is said once per process
+  with `debug` off.** Before, an exception from `Transport.export` dropped the
+  whole batch and said so only under `debug=True`, so a default process whose
+  transport raised on every batch looked exactly like one with nothing to
+  send. A raising `before_send_envelope` printed its one line but counted
+  nothing, so nothing said how much every later raise took. Now each span and
+  state snapshot dropped this way is counted, under
+  `client.drain.span_dropped.export_raised` and
+  `client.drain.span_dropped.before_send_raised` (snapshots under the same
+  names with `snapshot_dropped`), and the transport case prints one line per
+  process giving the size of the batch and naming its counter. Spans your
+  `before_send_envelope` removed on purpose are not counted as dropped. A
+  batch whose export raised is still not retried: the transport may already
+  have sent part of it, and a retry could ship it twice. Under `debug=True`
+  the transport's exception is printed as a traceback rather than formatted
+  into the line, so an exception whose text cannot be rendered no longer
+  raises a second time out of `flush()` or `close()`.
+
 - **Values the SDK makes itself are no longer masked as a card number, and
   a span's masking record no longer reports a card that was never there.**
   The case that showed it is a span's connection id, a value the SDK makes
