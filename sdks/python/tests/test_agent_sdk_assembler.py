@@ -2346,3 +2346,41 @@ def test_join_blocks_keeps_every_block_whatever_shape_a_side_has():
     assert _join_blocks(b"", b'[{"b":2}]') == b'[{"b":2}]'
     assert _join_blocks(b'[{"a":1}]', b"[]") == b'[{"a":1}]'
     assert json.loads(_join_blocks(b'"text"', b'[{"b":2}]')) == ["text", [{"b": 2}]]
+
+
+def test_a_user_message_into_a_sub_agents_thread_moves_neither_the_main_chats_start_nor_ttft():
+    """A host write addressed into a sub-agent's thread starts a turn on THAT
+    thread only. It used to reset the session-wide turn start and first-chunk
+    instant, so the next main-thread chat started at the sub-agent's write and
+    lost the first chunk its own request had already produced."""
+    client = FakeClient()
+    asm = SessionAssembler(client)
+    _outbound(asm, key=1, text="go")
+    t_after_write = time.time_ns()
+    asm.on_inbound(1, INIT)
+    time.sleep(0.002)
+    asm.on_inbound(1, _delta())  # the main thread's first chunk
+    t_after_chunk = time.time_ns()
+    time.sleep(0.002)
+    t_before_sub = time.time_ns()
+    asm.on_outbound(
+        1,
+        json.dumps(
+            {
+                "type": "user",
+                "session_id": "s-1",
+                "parent_tool_use_id": "task_a",
+                "message": {"role": "user", "content": "into the subagent"},
+            }
+        ),
+    )
+    time.sleep(0.002)
+    asm.on_inbound(1, _assistant("m1"))
+    asm.on_inbound(1, RESULT)
+
+    (chat,) = _chats(client)
+    assert chat.start_time_ns <= t_after_write < t_before_sub
+    ttft = chat.gen_ai.time_to_first_chunk_s
+    assert ttft is not None
+    assert ttft <= (t_after_chunk - chat.start_time_ns) / 1e9
+    assert _has(chat, Limitation.TTFT_IPC_APPROXIMATION)
