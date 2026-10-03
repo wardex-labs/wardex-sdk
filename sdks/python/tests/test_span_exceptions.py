@@ -9,8 +9,9 @@ exception it raised, with the traceback it had.
 
 The message and the stack trace are host text, so they go through the encoder's
 masking on both wires, every frame's file is placed by the call-site rule (never an
-absolute path), and this process's home folder is written as `~` wherever else the
-text starts a path with it, and nowhere it might be naming a different folder.
+absolute path) on the frame's own line and nowhere else, and this process's home
+folder is written as `~` wherever else its path appears, and not where the folder's
+name goes on into a different folder's.
 """
 
 from __future__ import annotations
@@ -645,23 +646,66 @@ def test_the_home_folder_a_sentence_names_leaves_as_tilde_on_both_wires(
 
 
 @pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        # A validation error quoting a model's output prints it as a `repr`, so a
+        # newline before the path arrives as the two characters `\n`.
+        ("bad output: {repr_home}", "bad output: {repr_tilde}"),
+        ("cat x >{home}{sep}log.txt", "cat x >~{sep}log.txt"),
+        ("see|{home}{sep}log.txt", "see|~{sep}log.txt"),
+        ("open {sep}{home}{sep}x", "open {sep}~{sep}x"),
+        # Inside a longer path, too: the user name is in it all the same.
+        ("restore {sep}backup{home}{sep}report.txt", "restore {sep}backup~{sep}report.txt"),
+        ("restore .{home}{sep}report.txt", "restore .~{sep}report.txt"),
+    ],
+    ids=["repr-newline", "redirect", "pipe", "double-slash", "under-a-folder", "after-a-dot"],
+)
+@pytest.mark.parametrize("read", [_otlp_events, _envelope_events], ids=["otlp", "envelope"])
+def test_the_home_folder_is_written_as_tilde_wherever_its_path_appears(
+    recording, fake_home, read, text, expected
+):
+    """The home folder used to be rewritten only after a character from a fixed list
+    (whitespace, a quote, an opening bracket, `=`, `:`, `,`, `;`, `file://`), so one
+    that came after a `repr`'d newline, a shell redirect `>`, a pipe `|`, a second
+    slash or another folder left with the OS user name in the message and in the
+    stack trace, on both wires."""
+    home, sep = str(fake_home), os.sep
+    fields = {
+        "home": home,
+        "sep": sep,
+        "repr_home": repr(f"ok\n{home}{sep}out.txt"),
+        "repr_tilde": repr(f"ok\n~{sep}out.txt"),
+    }
+    with pytest.raises(ValueError), wardex.span("anywhere"):
+        raise ValueError(text.format(**fields))
+
+    _spans(recording)
+    (event,) = read(recording, "anywhere")
+    message = event["attributes"]["exception.message"]
+    stacktrace = event["attributes"]["exception.stacktrace"]
+    assert message == expected.format(**fields)
+    assert stacktrace.endswith(f"ValueError: {message}\n")
+    for value in (message, stacktrace):
+        assert home not in value
+        assert "alice.kim" not in value
+
+
+@pytest.mark.parametrize(
     "text",
     [
         "copy {home}-old{sep}report.txt",
         "copy {home}.bak{sep}report.txt",
         "copy {home}+test{sep}report.txt",
         "copy {home}berly{sep}report.txt",
-        "restore {sep}backup{home}{sep}report.txt",
-        "restore .{home}{sep}report.txt",
     ],
 )
-def test_a_different_folder_that_contains_the_home_path_is_left_as_written(
+def test_a_different_folder_whose_name_begins_like_the_home_folder_is_left_as_written(
     recording, fake_home, text
 ):
     """The home folder used to be matched wherever its string appeared, so a sibling
-    whose name merely begins with it (`alice.kim-old`) and a copy of it under another
-    folder (`/backup/Users/alice.kim`) both left as `~`: a path the SDK never saw,
-    claiming a different folder was the host's home."""
+    whose name merely begins with it (`alice.kim-old`) left as `~-old`, and
+    `alice.kimberly` as `~berly`, which reads as the home folder of a user named
+    `berly`: a folder the SDK never saw, claimed to be someone's home."""
     written = text.format(home=str(fake_home), sep=os.sep)
     message, stacktrace = _message_through_a_span(recording, written)
 

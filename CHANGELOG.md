@@ -25,16 +25,16 @@ All notable changes to this project are documented here. The format follows
   the bare file name, never an absolute path, on the frame's own line only (a
   message that itself says `File "/etc/app/config.yaml", line 3` reaches the
   trace as written, just as in `exception.message`), and your home folder is
-  written as `~` wherever else the message or the trace starts a path with
-  it, in a sentence too (`'~/reports/q3.txt'`, `permission denied for ~.`). A folder
-  that only looks like yours is left as written rather than turned into `~`:
-  one whose name begins like yours (`/Users/alice-old`) or a copy of yours
-  under another folder (`/backup/Users/alice`). Local variables are never
-  captured. Each traceback keeps the 64 frames nearest the raise and says how
-  many earlier ones it left out, so an exception leaving hundreds of nested
-  spans (a recursion through a decorated function) costs each span at most 64
-  frames instead of the whole stack. Over OTLP both values are capped by
-  `max_otlp_attribute_bytes`.
+  written as `~` wherever else its path appears in the message or the trace,
+  whatever comes before it (`'~/reports/q3.txt'`, `permission denied for ~.`,
+  `cat x >~/log.txt`, and `/backup~/x` for a copy of yours under another
+  folder, whose path still carries your user name). A folder whose name only
+  begins like yours (`/Users/alice-old`) is a different folder and is left as
+  written. Local variables are never captured. Each traceback keeps the 64
+  frames nearest the raise and says how many earlier ones it left out, so an
+  exception leaving hundreds of nested spans (a recursion through a decorated
+  function) costs each span at most 64 frames instead of the whole stack. Over
+  OTLP both values are capped by `max_otlp_attribute_bytes`.
 
 - **The transport values the interceptors measure now reach OTLP.** Before,
   an OTLP backend received only the protocol and the HTTP method, status and

@@ -477,21 +477,21 @@ the line where Python names it, as is a `SyntaxError`'s own `File "…", line N`
 and nowhere else: a message or a source line that itself says
 `File "/etc/app/config.yaml", line 3` reaches the trace as your code wrote it,
 the same text `exception.message` carries. And your home folder is written as
-`~` wherever else the message or the trace starts a path with it
-(`[Errno 2] No such file or directory: '~/reports/q3.txt'`,
-`permission denied for ~.`). "Starts a path" means the home folder comes after
-the start of the text, whitespace, a quote, an opening bracket, `=`, `:`, `,`,
-`;` or `file://`, and is followed by something a folder's name cannot go on
-with: a path separator, a quote, a space, a bracket, a comma, a full stop that
-ends a sentence, or the end of the text. A letter, a digit, `_`, `-`, `+`, or a
-`.` with one of those after it, may make it a different folder, and that is
-left as written: one whose name only begins like yours (`/Users/alice-old`,
-`/Users/alice.bak`), as is a copy of yours under another folder
-(`/backup/Users/alice`). The one folder this writes wrongly is a sibling named
-like yours plus a space: `/Users/alice 2` becomes `~ 2`, because a space after
-your home folder is far more often a sentence going on, and your user name must
-not leave with the sentence. Over OTLP both values are capped by
-`max_otlp_attribute_bytes`, like every attribute (see
+`~` wherever else its path appears in the message or the trace, whatever comes
+before it: `[Errno 2] No such file or directory: '~/reports/q3.txt'`,
+`permission denied for ~.`, `cat x >~/log.txt`, a `repr`'d `'ok\n~/out.txt'`,
+and `/backup~/x` for a copy of yours under another folder, whose path carries
+your user name all the same (`~` stands for exactly the text it replaces).
+What comes after it decides whether it is your home folder: something a
+folder's name cannot go on with — a path separator, a quote, a space, a
+bracket, a comma, a full stop that ends a sentence, or the end of the text. A
+letter, a digit, `_`, `-`, `+`, or a `.` with one of those after it makes it a
+different folder, left as written: one whose name only begins like yours
+(`/Users/alice-old`, `/Users/alice.bak`). The one folder this writes wrongly is
+a sibling named like yours plus a space: `/Users/alice 2` becomes `~ 2`,
+because a space after your home folder is far more often a sentence going on,
+and your user name must not leave with the sentence. Over OTLP both values are
+capped by `max_otlp_attribute_bytes`, like every attribute (see
 [Resource limits](#resource-limits)). Masking cannot see what the rules above
 cannot see, so a secret with no recognisable shape in an exception's message or
 on the source line that raised it leaves as written.
