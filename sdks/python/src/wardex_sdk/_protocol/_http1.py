@@ -147,6 +147,14 @@ class _Http1Parser(ProtocolParserInterface):
     def disabled_reason(self) -> str | None:
         return self._native.disabled_reason()  # type: ignore[no-any-return]
 
+    def idle(self) -> bool:
+        """Between messages: the last one completed and no byte of the next has arrived."""
+        return self._native.is_idle()  # type: ignore[no-any-return]
+
+    def method_in_flight(self) -> str | None:
+        """The method of the request whose header block parsed and whose body is arriving."""
+        return self._native.method_in_flight()  # type: ignore[no-any-return]
+
 
 class Http1RequestParser(_Http1Parser):
     def __init__(self, limits: object | None = None) -> None:
