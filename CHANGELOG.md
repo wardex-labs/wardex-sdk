@@ -7,6 +7,26 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- **A span your code raised out of now says it failed, and why.** Before, an
+  exception leaving a `@wardex.workflow` / `@wardex.agent` / `@wardex.step` /
+  `@wardex.tool` function or a `with wardex.span()` / `wardex.conversation()`
+  block left the span `UNSET` with no trace of the exception, so the record of
+  a run could show where a branch died but not what killed it. Now the span
+  ships with status `ERROR`, `error.type` set to the exception's class
+  (fully qualified for your own, bare for a builtin: `ValueError`), and one
+  OpenTelemetry `exception` event with `exception.type`, `exception.message`
+  and `exception.stacktrace`, on the wardex envelope and over OTLP. Your code
+  receives the same exception object with its traceback unchanged. A status or
+  an `error.type` you set inside the block wins, and `asyncio.CancelledError`,
+  `KeyboardInterrupt`, `SystemExit` and `GeneratorExit` change nothing. **The
+  stack trace is recorded by default**, through the same masking as every
+  other value (an e-mail or an `sk-…` key in the message ships as `[EMAIL]` /
+  `[SECRET]`); each frame's file is relative to its package's import root or
+  the bare file name, never an absolute path, and your home folder is written
+  as `~` wherever else the message or the trace carries it. Local variables
+  are never captured. Over OTLP both values are capped by
+  `max_otlp_attribute_bytes`.
+
 - **The transport values the interceptors measure now reach OTLP.** Before,
   an OTLP backend received only the protocol and the HTTP method, status and
   URL of a captured call; every other value the seam measures was dropped at
