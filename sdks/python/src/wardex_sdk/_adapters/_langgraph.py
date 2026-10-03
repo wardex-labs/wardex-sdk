@@ -52,10 +52,12 @@ source — resolved through the registry's closed-unit link memory, since the
 sources' spans are finished by then (`_langgraph_links._node_links`). A node
 name may itself contain `+`, so the sources are read against the running
 graph's node set and a string with more than one reading links nothing and
-says so (`_join_sources`, `Limitation.LINK_AMBIGUOUS`). A run whose config
-carries a `thread_id` links `RESUMED_FROM` to the previous run on the same
+says so (`_join_sources`, `Limitation.LINK_AMBIGUOUS`). A TOP-LEVEL run whose
+config — the call's, over whatever `with_config` bound on the graph — carries
+a `thread_id` links `RESUMED_FROM` to the previous top-level run on the same
 thread and THEN aliases itself under it — link-before-alias, or live-first
-resolution would answer the run its own question (`_describe_run`). Three
+resolution would answer the run its own question. A subgraph inherits its
+parent's thread and links nothing (`_langgraph_links._resume_link`). Three
 boundaries are honest refusals rather than gaps: a `branch:to:{self}` trigger
 names only the DESTINATION, so an ordinary edge's source is never guessed; a
 `Send` fan-out produces same-named siblings no selector could pick between, so
@@ -98,10 +100,8 @@ from typing import Any
 from .._assembly import (
     ConversationContext,
     Limitation,
-    LinkReason,
     SpanIntent,
     ToolAttributes,
-    UnitKey,
     UnitKind,
     report_once,
 )
@@ -109,7 +109,14 @@ from .._enums import ToolExecutionType, ToolType
 from ._base import AdapterInterface
 from ._context import AdapterContext, Fallback, Placement, Scope
 from ._conversation import framework_conversation
-from ._langgraph_links import _node_links, _record_graph_nodes
+from ._langgraph_links import (
+    _configurable,
+    _InNode,
+    _node_links,
+    _record_graph_nodes,
+    _resume_link,
+    _thread_id,
+)
 from ._payload import _shaped_args
 
 _FRAMEWORK = "langgraph"
@@ -226,26 +233,15 @@ def _graph_name(graph: Any) -> str:
     return getattr(graph, "name", None) or _DEFAULT_GRAPH_NAME
 
 
-def _configurable(args: tuple[Any, ...], kwargs: dict[str, Any]) -> dict[str, Any]:
-    """`Pregel.stream(self, input, config=None, ...)`; `args` excludes `self`.
+def _conversation_of(
+    ctx: AdapterContext, graph: Any, args: Any, kwargs: Any
+) -> ConversationContext | None:
+    """`thread_id` continues one chat, so it IS the conversation; see `framework_conversation`.
 
-    `type(config) is not dict`, not `isinstance`: a subclass whose `.get`
-    raises would defeat the whole point of the split this function sits in. A
-    `RunnableConfig` is a `TypedDict`, i.e. a plain `dict` at runtime, so the
-    exact-type test is not restrictive in practice.
+    Read from the same merged config as the attribute and the resume link, so a
+    thread pinned with `with_config` is the conversation too.
     """
-    config = kwargs.get("config")
-    if config is None and len(args) >= 2:
-        config = args[1]
-    if type(config) is not dict:
-        return {}
-    conf = config.get("configurable")
-    return conf if type(conf) is dict else {}
-
-
-def _conversation_of(ctx: AdapterContext, args: Any, kwargs: Any) -> ConversationContext | None:
-    """`thread_id` continues one chat, so it IS the conversation; see `framework_conversation`."""
-    thread_id = _configurable(args, kwargs).get("thread_id")
+    thread_id = _configurable(graph, args, kwargs).get("thread_id")
     return framework_conversation(ctx, thread_id, shadowed_counter="thread_id_shadowed_by_host")[0]
 
 
@@ -271,23 +267,11 @@ def _describe_run(adapter: Any, graph: Any, args: Any, kwargs: Any, run: Scope) 
     run.draft.set_workflow_name(name)
     run.draft.set_extra("wardex.framework", _FRAMEWORK)
     with adapter._ctx.guard("describe_run_extras"):
-        thread_id = _configurable(args, kwargs).get("thread_id")
-        if thread_id is not None and thread_id != "":  # as `framework_conversation`; UUID as text
-            thread_id = thread_id if isinstance(thread_id, str | int) else str(thread_id)
+        conf = _configurable(graph, args, kwargs)  # the call's config over `with_config`'s
+        thread_id = _thread_id(conf)
+        if thread_id is not None:
             run.draft.set_extra("wardex.langgraph.thread_id", thread_id)
-            key = UnitKey("langgraph.thread_id", str(thread_id))
-            # ORDER IS LOAD-BEARING: link FIRST, alias AFTER. Aliased first, live-first resolution
-            # would answer this very run — the self-link guard would refuse AND (being
-            # `expected=False`) stay silent, so a healthy resume would lose its link. Linked first,
-            # the selector resolves the PREDECESSOR: live if a same-thread run is still streaming
-            # (the alias is bound and thread-state continuity is real), else from the closed-unit
-            # memory. The alias then hands the thread to the NEXT run. `expected=False` because a
-            # first run on a thread and a cross-process resume are indistinguishable at this seam —
-            # counting every fresh thread would fabricate a loss the adapter cannot attest.
-            # Cross-process resume stays the documented boundary: nothing persists an identity
-            # across processes.
-            run.link(LinkReason.RESUMED_FROM, key, expected=False)
-            run.alias(key, remember=True)
+            _resume_link(conf, thread_id, run)  # top-level runs only: a subgraph inherits it
     with adapter._ctx.guard("describe_run_nodes"):
         _record_graph_nodes(graph, run)
 
@@ -323,6 +307,14 @@ def _node_extras(task: Any, step: Scope) -> None:
     functional API, and `create_react_agent`'s default `version="v2"` all
     produce siblings identical in name, index, trigger and namespace prefix —
     and the task id is their sole discriminator.
+
+    `wardex.step.index` is LangGraph's `langgraph_step`, shipped as is: the
+    SUPERSTEP NUMBER of the checkpoint thread the node runs on — of its
+    namespace, inside a subgraph — not the node's position in this run.
+    Without a checkpointer every run counts from the start; with one, a later
+    turn on the same thread continues the count, and the input and `__start__`
+    supersteps take numbers no step span carries. Measured on a one-node graph
+    over three turns on one thread: 1, 4, 7.
 
     Nothing derives from `task.path`. For a `@task` it is a NESTED tuple,
     `('__pregel_push', ('__pregel_pull', 'wf'))`, so a join or an index would
@@ -531,7 +523,7 @@ def _mk_stream(
         subject = conversation = None
         with ctx.guard(prologue):
             subject = _graph_name(self)
-            conversation = _conversation_of(ctx, args, kwargs)
+            conversation = _conversation_of(ctx, self, args, kwargs)
         describe = partial(describe_fn, adapter, self, args, kwargs)
         carrier = threading.current_thread()
         try:
@@ -598,7 +590,7 @@ def _mk_astream(
         subject = conversation = None
         with ctx.guard(prologue):
             subject = _graph_name(self)
-            conversation = _conversation_of(ctx, args, kwargs)
+            conversation = _conversation_of(ctx, self, args, kwargs)
         describe = partial(describe_fn, adapter, self, args, kwargs)
         carrier = asyncio.current_task()
         try:
@@ -655,13 +647,16 @@ def _mk_run_with_retry(
         # is what makes it assertable against `len(steps)` on every workload.
         ctx.confirm_active("runner.run_with_retry")
         describe = partial(_describe_node, adapter, task)
-        with ctx.enter(
-            UnitKind.STEP,
-            intent=SpanIntent.EXECUTE_STEP,
-            placement=Placement.NESTED,
-            subject=name,
-            fallback=Fallback.SOLE_LIVE_RUN,
-            describe=describe,
+        with (
+            _InNode(),  # a run started in the body is a subgraph; total, see `_InNode`
+            ctx.enter(
+                UnitKind.STEP,
+                intent=SpanIntent.EXECUTE_STEP,
+                placement=Placement.NESTED,
+                subject=name,
+                fallback=Fallback.SOLE_LIVE_RUN,
+                describe=describe,
+            ),
         ):
             return original(task, retry_policy, *args, **kwargs)
 
@@ -684,13 +679,16 @@ def _mk_arun_with_retry(
             return await original(task, retry_policy, *args, **kwargs)
         ctx.confirm_active("runner.arun_with_retry")
         describe = partial(_describe_node, adapter, task)
-        with ctx.enter(
-            UnitKind.STEP,
-            intent=SpanIntent.EXECUTE_STEP,
-            placement=Placement.NESTED,
-            subject=name,
-            fallback=Fallback.SOLE_LIVE_RUN,
-            describe=describe,
+        with (
+            _InNode(),  # a run started in the body is a subgraph; total, see `_InNode`
+            ctx.enter(
+                UnitKind.STEP,
+                intent=SpanIntent.EXECUTE_STEP,
+                placement=Placement.NESTED,
+                subject=name,
+                fallback=Fallback.SOLE_LIVE_RUN,
+                describe=describe,
+            ),
         ):
             return await original(task, retry_policy, *args, **kwargs)
 

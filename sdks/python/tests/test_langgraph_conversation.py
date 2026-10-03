@@ -53,6 +53,23 @@ def test_the_thread_id_is_the_conversation_of_the_run_and_of_every_span_under_it
     assert extra_of(run)["wardex.langgraph.thread_id"] == "T-1"
 
 
+def test_a_thread_bound_with_with_config_is_the_conversation(installed):  # noqa: F811
+    """`graph.with_config(configurable={"thread_id": ...})` states the thread as
+    surely as a call config — LangGraph checkpoints under it — and the run read
+    only the call, so it shipped no conversation at all."""
+    _app().with_config(configurable={"thread_id": "T-BOUND"}).invoke({"trail": []})
+    (run,) = runs(installed.spans)
+    assert run.conversation == ConversationContext(conversation_id="T-BOUND")
+    assert _conversation_ids(installed.spans) == {"T-BOUND"}
+    assert extra_of(run)["wardex.langgraph.thread_id"] == "T-BOUND"
+
+
+def test_the_call_configs_thread_is_the_conversation_over_the_bound_one(installed):  # noqa: F811
+    app = _app().with_config(configurable={"thread_id": "T-BOUND"})
+    app.invoke({"trail": []}, {"configurable": {"thread_id": "T-CALL"}})
+    assert _conversation_ids(installed.spans) == {"T-CALL"}
+
+
 def test_an_integer_thread_id_is_its_text(installed):  # noqa: F811
     _app().invoke({"trail": []}, {"configurable": {"thread_id": 7}})
     assert _conversation_ids(installed.spans) == {"7"}

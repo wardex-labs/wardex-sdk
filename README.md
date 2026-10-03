@@ -957,7 +957,17 @@ diagnostic line (traceback under `debug=True`).
   `RemoteGraph` (LangGraph Platform) call ships one `invoke_workflow` span
   marked `wardex.langgraph.remote`, with the platform HTTP request underneath;
   the remote run's internals execute out of process and are not captured. A
-  cached node ships no span — no work ran.
+  cached node ships no span — no work ran. A run's `thread_id` — from the
+  call's config, or bound with `graph.with_config(...)`, the call's winning —
+  is recorded as `wardex.langgraph.thread_id` and is the run's
+  `gen_ai.conversation.id` unless the run sits inside your own
+  `wardex.conversation(...)`. With a checkpointer, a later top-level run on
+  the same thread in the same process links `resumed_from` to the previous
+  one; a subgraph inherits its parent's thread and links nothing. A node
+  span's `wardex.step.index` is LangGraph's superstep number on that
+  checkpoint thread, not the node's position in the run: a second turn on
+  one thread continues the count (and the input and `__start__` supersteps
+  take numbers no node span carries).
 - Framework adapter: **OpenAI Agents SDK** (`openai-agents>=0.22,<0.23`) —
   auto-detected, hooked through the framework's own `TracingProcessor` and
   its three public `Runner` entry points (wrapped only to read the run's

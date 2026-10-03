@@ -424,6 +424,216 @@ def test_a_run_without_a_thread_id_neither_links_nor_aliases(installed):  # noqa
 
 
 # --------------------------------------------------------------------------
+# RESUMED_FROM — top-level runs only; a subgraph inherits its parent's thread
+# --------------------------------------------------------------------------
+
+
+def _sub_graph(name: str = "Sub"):
+    g = StateGraph(TrailState)
+    g.add_node("inner", _node("inner"))
+    g.add_edge(START, "inner")
+    g.add_edge("inner", END)
+    app = g.compile()
+    app.name = name
+    return app
+
+
+def _parent_graph(sub_node, name: str = "Parent"):
+    """A checkpointed parent whose second node is `sub_node`: a compiled
+    subgraph, or a function that starts one."""
+    g = StateGraph(TrailState)
+    g.add_node("before", _node("before"))
+    g.add_node("sub", sub_node)
+    g.add_edge(START, "before")
+    g.add_edge("before", "sub")
+    g.add_edge("sub", END)
+    app = g.compile(checkpointer=InMemorySaver())
+    app.name = name
+    return app
+
+
+def _runs_named(spans, name: str):
+    return sorted(
+        (s for s in runs(spans) if s.name == f"invoke_workflow {name}"),
+        key=lambda s: s.start_time_ns,
+    )
+
+
+def _assert_only_the_second_turn_links_to_the_first(spans, thread: str) -> None:
+    parent1, parent2 = _runs_named(spans, "Parent")
+    subs = _runs_named(spans, "Sub")
+    assert len(subs) == 2
+    assert [s.links for s in subs] == [(), ()], "a subgraph resumed nothing"
+    assert parent1.links == ()
+    (link,) = parent2.links
+    assert link.reason is LinkReason.RESUMED_FROM
+    assert link.span_id == parent1.context.span_id, "the previous TURN, not its subgraph"
+    # The inherited thread is real — the subgraph runs on it — so it is still recorded.
+    assert {extra_of(s)["wardex.langgraph.thread_id"] for s in subs} == {thread}
+
+
+def test_a_subgraph_node_links_nothing_and_the_next_turn_links_to_the_previous_turn(installed):  # noqa: F811
+    """LangGraph hands a compiled subgraph its parent's `thread_id`. Linking it
+    claimed the subgraph resumed its own enclosing run, and aliasing it handed
+    the thread to the subgraph, so the next turn linked to the previous turn's
+    subgraph instead of to the previous turn."""
+    app = _parent_graph(_sub_graph())
+    config = {"configurable": {"thread_id": "conv"}}
+    app.invoke({"trail": []}, config)
+    app.invoke({"trail": []}, config)
+
+    _assert_only_the_second_turn_links_to_the_first(installed.spans, "conv")
+    assert "adapters.langgraph.link_target_unresolved" not in adapter_counters()
+
+
+def test_an_async_subgraph_node_links_nothing_either(installed):  # noqa: F811
+    import asyncio
+
+    app = _parent_graph(_sub_graph())
+    config = {"configurable": {"thread_id": "conv-async"}}
+
+    async def two_turns():
+        await app.ainvoke({"trail": []}, config)
+        await app.ainvoke({"trail": []}, config)
+
+    asyncio.run(two_turns())
+
+    _assert_only_the_second_turn_links_to_the_first(installed.spans, "conv-async")
+
+
+def test_a_subgraph_started_from_a_node_with_its_own_config_links_nothing(installed):  # noqa: F811
+    """The call names the parent's thread itself and no checkpoint namespace,
+    and LangGraph drops the inherited one for a call that names a thread — so
+    the run's own config looks top-level. It is still inside the enclosing
+    run's task, which is what classifies it."""
+    sub = _sub_graph()
+    app = _parent_graph(lambda s: sub.invoke(s, {"configurable": {"thread_id": "conv"}}))
+    config = {"configurable": {"thread_id": "conv"}}
+    app.invoke({"trail": []}, config)
+    app.invoke({"trail": []}, config)
+
+    _assert_only_the_second_turn_links_to_the_first(installed.spans, "conv")
+
+
+def test_an_async_node_starting_a_subgraph_with_its_own_config_links_nothing(installed):  # noqa: F811
+    """The same shape from an async node. On Python 3.10 LangGraph cannot carry
+    its own ambient config into an async node, so this is the case a check on
+    LangGraph's ambient config would miss there; the adapter's node marker
+    rides the same context copies as the run's spans, on every version."""
+    import asyncio
+
+    sub = _sub_graph()
+
+    async def calls_sub(state):
+        return await sub.ainvoke(state, {"configurable": {"thread_id": "conv"}})
+
+    app = _parent_graph(calls_sub)
+    config = {"configurable": {"thread_id": "conv"}}
+
+    async def two_turns():
+        await app.ainvoke({"trail": []}, config)
+        await app.ainvoke({"trail": []}, config)
+
+    asyncio.run(two_turns())
+
+    _assert_only_the_second_turn_links_to_the_first(installed.spans, "conv")
+
+
+def test_a_run_whose_config_names_a_checkpoint_namespace_links_nothing(installed):  # noqa: F811
+    """The other signal, alone: the subgraph is started in an EMPTY context, so
+    no enclosing task is visible to it, but the config it was handed names its
+    parent task's namespace."""
+    import contextvars
+
+    sub = _sub_graph()
+
+    def detached(state, config):
+        return contextvars.Context().run(sub.invoke, state, config)
+
+    app = _parent_graph(detached)
+    config = {"configurable": {"thread_id": "conv"}}
+    app.invoke({"trail": []}, config)
+    app.invoke({"trail": []}, config)
+
+    _assert_only_the_second_turn_links_to_the_first(installed.spans, "conv")
+
+
+def test_a_top_level_run_inside_a_plain_langchain_runnable_still_links(installed):  # noqa: F811
+    """An ambient runnable config is not an enclosing graph: only a LangGraph
+    task's config names a checkpoint namespace, and the root namespace `""`
+    is no namespace."""
+    from langchain_core.runnables import RunnableLambda
+
+    app = _thread_graph()
+    config = {"configurable": {"thread_id": "t1", "checkpoint_ns": ""}}
+    outer = RunnableLambda(lambda x: app.invoke(x, config))
+    outer.invoke({"trail": []}, {"configurable": {"user": "u"}})
+    outer.invoke({"trail": []}, {"configurable": {"user": "u"}})
+
+    run1, run2 = sorted(runs(installed.spans), key=lambda s: s.start_time_ns)
+    (link,) = run2.links
+    assert link.reason is LinkReason.RESUMED_FROM
+    assert link.span_id == run1.context.span_id
+
+
+# --------------------------------------------------------------------------
+# the thread a graph has bound with `with_config`
+# --------------------------------------------------------------------------
+
+
+def test_a_thread_bound_with_with_config_is_recorded_and_links_resumed_from(installed):  # noqa: F811
+    """`with_config(configurable=...)` binds the thread on a copy of the graph,
+    and LangGraph checkpoints under it exactly as under a call config. Reading
+    the call alone dropped the attribute and the link, uncounted."""
+    app = _thread_graph().with_config(configurable={"thread_id": "bound"})
+    app.invoke({"trail": []})
+    app.invoke({"trail": []})
+
+    run1, run2 = sorted(runs(installed.spans), key=lambda s: s.start_time_ns)
+    assert [extra_of(r)["wardex.langgraph.thread_id"] for r in (run1, run2)] == ["bound"] * 2
+    assert run1.links == ()
+    (link,) = run2.links
+    assert link.reason is LinkReason.RESUMED_FROM
+    assert link.span_id == run1.context.span_id
+
+
+def test_the_call_configs_thread_wins_over_the_bound_one(installed):  # noqa: F811
+    """LangGraph's own precedence: the call's `configurable` keys over the
+    bound ones. The run on the call's thread neither links to nor is linked
+    from the runs on the bound thread."""
+    app = _thread_graph().with_config(configurable={"thread_id": "bound"})
+    app.invoke({"trail": []})
+    app.invoke({"trail": []}, {"configurable": {"thread_id": "call"}})
+    app.invoke({"trail": []})
+
+    run1, run2, run3 = sorted(runs(installed.spans), key=lambda s: s.start_time_ns)
+    assert [extra_of(r)["wardex.langgraph.thread_id"] for r in (run1, run2, run3)] == [
+        "bound",
+        "call",
+        "bound",
+    ]
+    assert run2.links == ()
+    (link,) = run3.links
+    assert link.span_id == run1.context.span_id
+
+
+def test_a_uuid_thread_bound_with_with_config_is_its_text_everywhere(installed):  # noqa: F811
+    """The attribute, the link key and the conversation read one value."""
+    import uuid
+
+    thread = uuid.UUID("12345678-1234-5678-1234-567812345678")
+    app = _thread_graph().with_config(configurable={"thread_id": thread})
+    app.invoke({"trail": []})
+    app.invoke({"trail": []})
+
+    run1, run2 = sorted(runs(installed.spans), key=lambda s: s.start_time_ns)
+    assert [extra_of(r)["wardex.langgraph.thread_id"] for r in (run1, run2)] == [str(thread)] * 2
+    assert {s.conversation.conversation_id for s in installed.spans} == {str(thread)}
+    (link,) = run2.links
+    assert link.span_id == run1.context.span_id
+
+
+# --------------------------------------------------------------------------
 # the wire — links as they actually ship
 # --------------------------------------------------------------------------
 
