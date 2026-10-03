@@ -314,7 +314,9 @@ def test_a_guessed_adapter_edge_makes_no_confidence_claim():
     client = _client()
 
     with conversation("root"):
-        _assembler_with_an_unresolvable_stream_parent(client)
+        # Closed, because a chat span ships once its response is over and
+        # nothing else here says this one is.
+        _assembler_with_an_unresolvable_stream_parent(client).on_close(1, None)
 
     chat = next(s for s in client.spans if s.name.startswith("chat "))
     assert chat.correlation is None

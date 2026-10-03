@@ -18,10 +18,11 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from .._assembly import Limitation, SpanDraft, Unit, UnitKey
+from .._protocol import normalize_finish_reason
 from .._protocol._claude_stream import AgentStreamEvent
 
 #: The two provenances a chat span's `input_data` can have, published as the
@@ -92,6 +93,122 @@ class _PendingSpan:
     #: by blanking `tool_use_id`: that field is the call's identity, and a
     #: future consumer would read the blank as a fact.
     mergeable: bool = True
+
+
+@dataclass
+class _OpenChat:
+    """One model response whose chat span is still being assembled.
+
+    The CLI does not deliver a response as one `assistant` line. It sends a
+    line per content block — a text block and then the tool call after it,
+    or each of several parallel tool calls — and every one of those lines
+    carries the same `message.id` and a copy of the same `usage`. Recorded
+    against a real CLI (2.1.286): two lines for a text-then-tool response,
+    three for a response with three parallel tool calls, and the identical
+    usage object on every line. A span per line reported one request as two
+    or three, and a backend priced every copy of the input and cache tokens.
+
+    So a response's span is held here, on its thread, until the response is
+    over: a line with a different id arrives on the same thread, the main
+    thread's turn ends in a `result`, the sub-agent thread it belongs to ends
+    with its `Task` call's result, or the session itself ends. Nothing else
+    closes it. Not a tool result on the same thread: the CLI starts a call as
+    soon as its block is written (the recording shows the call's hook firing
+    between two blocks of one response), so nothing orders its result after
+    the later blocks. Not a host write either, which may be a message queued
+    mid-response. The draft is kept current as each line is folded in, so
+    whichever of those closes it ships what was seen and nothing has to be
+    re-derived at close.
+    """
+
+    #: The response's `message.id`, which is what a later line must match to
+    #: be folded in. None for a line that named no id: such a line can only
+    #: ever be a span of its own, because nothing proves a neighbour is the
+    #: same response.
+    message_id: str | None
+    draft: SpanDraft
+    #: The gen_ai block as it stands. Typed Any because `_types` is off-limits
+    #: here (see `_PendingSpan.gen_ai`).
+    gen_ai: Any
+    #: Measured on the FIRST line, against the thread's floor: the first chunk
+    #: of a response belongs to its first block, and every later block of the
+    #: same response arrives after it.
+    ttft: float | None
+    start_ns: int
+    #: Arrival of the latest line folded in — the response is not over before
+    #: its last block has arrived.
+    end_ns: int
+    #: The bridge join's scope key, decided when the response OPENED: the
+    #: sub-agent it belongs to may have stopped, and left `subagents`, by the
+    #: time the response is closed.
+    agent_id: str | None
+    #: The prompt this response consumed, kept so the output can be rewritten
+    #: without touching the input (`SpanDraft.set_io` sets both at once).
+    input_data: bytes
+    input_attempted: bool
+    #: The response's content blocks so far, as one JSON array.
+    output_data: bytes
+
+    def continues(self, ev: AgentStreamEvent) -> bool:
+        """Whether `ev` is one more line of this response."""
+        return ev.message_id is not None and ev.message_id == self.message_id
+
+    def fold(self, ev: AgentStreamEvent, now: int) -> None:
+        """Fold one more line of this response into the held span.
+
+        USAGE IS REPLACED, NEVER ADDED. Every line carries its own copy of the
+        response's usage, so adding them would rebuild the per-line inflation
+        inside one span. The latest line that reports usage stands, whole: the
+        one copy when the copies are identical (what the CLI sends), the
+        running total if a CLI ever sends running totals, the only copy if it
+        sends just one. Whole rather than field by field, because the input
+        total already includes the cache tiers of the copy it came from.
+        """
+        g = self.gen_ai
+        usage = (ev.input_tokens, ev.output_tokens, ev.cache_read_tokens, ev.cache_creation_tokens)
+        if any(n is not None for n in usage):
+            g = replace(
+                g,
+                input_tokens=ev.input_tokens,
+                output_tokens=ev.output_tokens,
+                cache_read_input_tokens=ev.cache_read_tokens,
+                cache_creation_input_tokens=ev.cache_creation_tokens,
+            )
+        if ev.stop_reason:
+            g = replace(g, finish_reasons=(normalize_finish_reason("anthropic", ev.stop_reason),))
+        if ev.model:
+            g = replace(g, response_model=ev.model)
+        self.gen_ai = g
+        self.output_data = _join_blocks(self.output_data, ev.content_json or b"")
+        self.end_ns = now
+        self.apply()
+
+    def apply(self) -> None:
+        """Write the gen_ai block and the I/O as they stand onto the draft."""
+        self.draft.set_gen_ai(self.gen_ai)
+        self.draft.set_io(
+            input_data=self.input_data,
+            output_data=self.output_data,
+            input_attempted=self.input_attempted,
+        )
+
+
+def _join_blocks(held: bytes, more: bytes) -> bytes:
+    """Two lines' content arrays as one, every block byte-for-byte as it came.
+
+    The native parser hands each line's `content` over as compact JSON, so
+    splicing two arrays at their brackets gives exactly the bytes one line
+    holding every block would have produced. A side that is not an array is
+    not spliced into something that would no longer parse: the two values are
+    kept side by side in an outer array, so no block is ever lost.
+    """
+    if not held or held == b"[]":
+        return more
+    if not more or more == b"[]":
+        return held
+    if held[:1] == more[:1] == b"[" and held[-1:] == more[-1:] == b"]":
+        return held[:-1] + b"," + more[1:]
+    return b"[" + held + b"," + more + b"]"
 
 
 @dataclass
@@ -208,7 +325,7 @@ class _EvictedSubagent:
     its shape.
 
     The three anchor lookups (`_tool_draft`, `_resolve_subagent_anchor`,
-    `_chat_agent_id`) resolve a sub-agent at EMIT time, not at open time, and
+    `_Session.chat_scope`) resolve a sub-agent at EMIT time, not at open time, and
     all three fall silently to the session root on a miss. Evicting a LIVE
     sub-agent without this would re-parent every still-open tool and every later
     chat turn of that sub-agent onto the root and say nothing — trading one
@@ -336,6 +453,13 @@ class _Session:
     #: so the flag cannot outlive the prompt it describes.
     pending_prompt_sole_inferred: bool = False
     open_tools: dict[str, _OpenTool] = field(default_factory=dict)  # keyed by tool_use_id
+    #: The response each thread is still receiving lines of, keyed like
+    #: `threads` (None is the main thread). A table of its own rather than a
+    #: field on `_Thread`, because a sub-agent thread refused by the full
+    #: thread table is handed an unrecorded record, and a span held on that
+    #: record would never be shipped. Bounded by the same per-session bound:
+    #: the oldest is closed early, never dropped.
+    open_chats: dict[str | None, _OpenChat] = field(default_factory=dict)
     subagents: dict[str, _OpenSubagent] = field(default_factory=dict)  # keyed by agent_id
     #: What the two span-owning tables above leave behind when the bound evicts
     #: an entry, under the SAME bound so the memory cannot outgrow what it
@@ -411,6 +535,36 @@ class _Session:
             if self.has_room is None or self.has_room(self.threads, "thread"):
                 self.threads[parent_tool_use_id] = thread
         return thread
+
+    def chat_scope(self, parent_tool_use_id: str | None) -> str | None:
+        """The subagent scope a chat is anchored to — the merge join's scope key.
+
+        Mirrors the assembler's `_resolve_subagent_anchor`'s two matches; None
+        is the main thread. Kept separate rather than derived from the anchor
+        because the anchor silently falls back to the session root, and a
+        fallback must not masquerade as a main-thread scope claim in a JOIN —
+        an unmatched scope fails honestly (no merge), a wrong scope merges
+        wrongly.
+        """
+        if not parent_tool_use_id:
+            return None
+        if self.knows_subagent(parent_tool_use_id):
+            return parent_tool_use_id
+        open_tool = self.open_tools.get(parent_tool_use_id)
+        if open_tool is not None and self.knows_subagent(open_tool.agent_id):
+            return open_tool.agent_id
+        return None
+
+    def knows_subagent(self, agent_id: str | None) -> bool:
+        """Live, or evicted-but-remembered.
+
+        An evicted sub-agent is still a real scope: its context is a valid
+        parent and its subtree keeps its shape, so a chat turn inside it is
+        still that turn's scope key and not the main thread.
+        """
+        return agent_id is not None and (
+            agent_id in self.subagents or agent_id in self.evicted_subagents
+        )
 
     def end_tool(self, parent_tool_use_id: str | None, tool_use_id: str | None, now: int) -> None:
         """A tool result arrived on `parent_tool_use_id`'s thread for `tool_use_id`.

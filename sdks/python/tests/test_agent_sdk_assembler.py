@@ -1,6 +1,7 @@
 """SessionAssembler unit tests — synthetic events, no SDK involved."""
 
 import json
+import pathlib
 import time
 
 import pytest
@@ -1214,6 +1215,7 @@ def test_a_stream_prompt_that_replaces_an_inferred_one_is_not_marked(tallies):
     asm.on_hook("UserPromptSubmit", {"session_id": "s-late", "prompt": "hello"}, None)
     _outbound(asm, key=1, text="from the stream")
     asm.on_inbound(1, ASSISTANT_2)
+    asm.on_inbound(1, RESULT)  # the turn is over, so its last response ships
 
     (chat,) = [s for s in client.spans if s.name.startswith("chat")]
     assert ("wardex.agent.prompt_source", "stream") in chat.extra
@@ -1642,6 +1644,7 @@ def test_the_hook_prompt_stands_down_when_the_stream_saw_the_turn(tallies):
     asm.on_inbound(1, INIT)
     _submit(asm, "go")
     asm.on_inbound(1, ASSISTANT)
+    asm.on_inbound(1, RESULT)  # the turn is over, so its last response ships
 
     (chat,) = _chats(client)
     # The stream's shape (a message object), not the hook's bare text.
@@ -1665,6 +1668,7 @@ def test_a_prompt_the_stream_missed_is_captured_from_the_hook_and_says_so():
     t_mark = time.time_ns()
     _submit(asm, "second")  # turn 2's write never reached the tee
     asm.on_inbound(1, ASSISTANT_2)
+    asm.on_inbound(1, RESULT)  # the turn is over, so its last response ships
 
     chat1, chat2 = _chats(client)
     assert chat2.input_data == b"second"
@@ -1691,6 +1695,7 @@ def test_a_second_stream_prompt_with_no_assistant_between_keeps_the_last_and_cou
     asm.on_inbound(1, INIT)
     _outbound(asm, key=1, text="second")
     asm.on_inbound(1, ASSISTANT)
+    asm.on_inbound(1, RESULT)  # the turn is over, so its last response ships
 
     (chat,) = _chats(client)
     assert b"second" in chat.input_data
@@ -1713,6 +1718,7 @@ def test_a_second_hook_prompt_while_one_pends_reads_as_a_new_turn_not_a_duplicat
     # through a write the stream did not record.
     _submit(asm, "retry")
     asm.on_inbound(1, ASSISTANT)
+    asm.on_inbound(1, RESULT)  # the turn is over, so its last response ships
 
     (chat,) = _chats(client)
     assert chat.input_data == b"retry"
@@ -1747,6 +1753,7 @@ def test_a_subagent_chat_does_not_consume_the_users_pending_prompt():
     }
     asm.on_inbound(1, subagent_chat)  # BEFORE any main-thread assistant turn
     asm.on_inbound(1, ASSISTANT_2)
+    asm.on_close(1, None)  # the session is over, so every held response ships
 
     sub_chat, main_chat = _chats(client)
     assert sub_chat.input_data == b""
@@ -1779,6 +1786,7 @@ def test_an_outbound_line_into_a_subagents_thread_does_not_overwrite_the_pending
         ),
     )
     asm.on_inbound(1, ASSISTANT_2)
+    asm.on_inbound(1, RESULT)  # the turn is over, so its last response ships
 
     (chat,) = _chats(client)
     assert b"main question" in chat.input_data
@@ -1806,6 +1814,7 @@ def test_an_outbound_line_into_a_subagents_thread_does_not_install_a_pending_pro
     )
     asm.on_inbound(1, INIT)
     asm.on_inbound(1, ASSISTANT_2)
+    asm.on_inbound(1, RESULT)  # the turn is over, so its last response ships
 
     (chat,) = _chats(client)
     assert chat.input_data == b""
@@ -1977,6 +1986,7 @@ def test_each_chat_of_an_agentic_loop_starts_where_its_thread_left_off():
     t_after_result = time.time_ns()
     time.sleep(0.002)
     asm.on_inbound(1, _assistant("m2"))
+    asm.on_inbound(1, RESULT)  # the turn is over, so its last response ships
 
     chat1, chat2 = _chats(client)
     assert t_write <= chat1.start_time_ns <= chat1.end_time_ns
@@ -2014,8 +2024,12 @@ def test_parallel_subagent_threads_keep_their_own_floors():
     asm.on_inbound(1, _result_line("toolu_a", parent="task_a"))
     time.sleep(0.002)
     asm.on_inbound(1, _assistant("a2", parent="task_a"))
+    asm.on_close(1, None)  # the session is over, so every held response ships
 
-    _main, a1, b1, a2 = _chats(client)
+    # By response id: a response ships when its thread moves on, so the
+    # order the four reach the sink is not the order they began.
+    by_id = {chat.gen_ai.response_id: chat for chat in _chats(client)}
+    a1, b1, a2 = by_id["a1"], by_id["b1"], by_id["a2"]
     for first_turn in (a1, b1):
         assert t_before_spawn <= first_turn.start_time_ns <= t_after_spawn
     # A session-wide floor would have put B's start after A's first arrival.
@@ -2061,6 +2075,7 @@ def test_ttft_is_measured_against_each_turns_own_floor():
     asm.on_inbound(1, _delta())
     asm.on_inbound(1, _assistant("m2"))
     asm.on_inbound(1, _assistant("m3"))  # no chunk seen since m2
+    asm.on_inbound(1, RESULT)  # the turn is over, so its last response ships
 
     chat1, chat2, chat3 = _chats(client)
     assert chat1.gen_ai.time_to_first_chunk_s is not None
@@ -2087,6 +2102,7 @@ def test_the_thread_table_refuses_the_newest_live_thread_and_counts_it(tallies):
 
     assert tallies("adapters.assembler.thread_table_full") > 0
     assert set(asm._by_key[1].threads) == {"task_a"}
+    asm.on_inbound(1, RESULT)  # the turn is over, so its last response ships
     assert len(_chats(client)) == 3
     for chat in _chats(client):
         assert chat.start_time_ns <= chat.end_time_ns
@@ -2106,3 +2122,227 @@ def test_a_finished_subagent_gives_its_thread_slot_back(tallies):
 
     assert tallies("adapters.assembler.thread_table_full") == 0
     assert asm._by_key[1].threads == {}
+
+
+# --- one model response is one chat span, however many lines it arrives on ---
+#
+# The CLI writes a response as one `assistant` line per content block, every
+# line under the response's `message.id` and carrying a copy of its usage. A
+# span per line reported one request as two or three and priced each copy.
+
+_RECORDINGS = pathlib.Path(__file__).parent / "fixtures" / "agent_sdk_stream"
+
+
+def _recording(name):
+    """A real CLI session's inbound lines, as committed (see PROVENANCE.md)."""
+    text = (_RECORDINGS / f"{name}.jsonl").read_text(encoding="utf-8")
+    return [json.loads(line) for line in text.splitlines()]
+
+
+def _by_response(lines):
+    """`message.id` -> that response's `assistant` lines, in arrival order."""
+    responses = {}
+    for msg in lines:
+        if msg.get("type") == "assistant":
+            responses.setdefault(msg["message"]["id"], []).append(msg)
+    return responses
+
+
+def _inclusive_input(usage):
+    """The semconv input total: Anthropic reports the cache tiers OUTSIDE it."""
+    return (
+        usage["input_tokens"]
+        + usage["cache_read_input_tokens"]
+        + usage["cache_creation_input_tokens"]
+    )
+
+
+@pytest.mark.parametrize(
+    ("name", "lines_per_response", "input_per_response"),
+    [
+        # Read off the committed recordings; the test re-derives them too.
+        ("text_then_tool", [2, 1], [75340, 75454]),
+        ("parallel_tools", [3, 1], [75353, 75671]),
+    ],
+)
+def test_a_recorded_response_split_across_lines_replays_as_one_chat_span(
+    name, lines_per_response, input_per_response
+):
+    """The recording, replayed. Response N is chat span N, its tokens are the
+    usage the response's lines carry counted ONCE, its output holds every
+    block, and the chats add up to the CLI's own `result` totals — the check a
+    per-line span failed by 1.5x and 2x on these two sessions."""
+    lines = _recording(name)
+    client = FakeClient()
+    asm = SessionAssembler(client)
+    for msg in lines:
+        asm.on_inbound(1, msg)
+    asm.on_close(1, None)
+
+    responses = _by_response(lines)
+    assert [len(group) for group in responses.values()] == lines_per_response
+    chats = _chats(client)
+    assert [chat.gen_ai.response_id for chat in chats] == list(responses)
+    for chat, group, expected_input in zip(
+        chats, responses.values(), input_per_response, strict=True
+    ):
+        usage = group[0]["message"]["usage"]
+        # What the recording shows: every line carries the same copy.
+        assert all(line["message"]["usage"] == usage for line in group)
+        assert chat.gen_ai.input_tokens == _inclusive_input(usage) == expected_input
+        assert chat.gen_ai.output_tokens == usage["output_tokens"]
+        assert chat.gen_ai.cache_read_input_tokens == usage["cache_read_input_tokens"]
+        assert chat.gen_ai.cache_creation_input_tokens == usage["cache_creation_input_tokens"]
+        blocks = [block for line in group for block in line["message"]["content"]]
+        assert json.loads(chat.output_data) == blocks
+    assert [chat.conversation.turn_index for chat in chats] == [1, 2]
+
+    total = next(msg for msg in lines if msg.get("type") == "result")["usage"]
+    assert sum(chat.gen_ai.input_tokens for chat in chats) == _inclusive_input(total)
+    assert (
+        sum(chat.gen_ai.cache_read_input_tokens for chat in chats)
+        == (total["cache_read_input_tokens"])
+    )
+    assert (
+        sum(chat.gen_ai.cache_creation_input_tokens for chat in chats)
+        == (total["cache_creation_input_tokens"])
+    )
+    # Tool-call metadata is still read per line: every `tool_use` block, on
+    # whichever line it came, is one call span.
+    for group in responses.values():
+        for line in group:
+            for block in line["message"]["content"]:
+                if block["type"] == "tool_use":
+                    assert len(_tools(client, block["id"])) == 1
+
+
+def _line(msg_id, content, *, usage=None, parent=None, stop=None):
+    """One `assistant` line as the CLI writes it: one block, no stop reason."""
+    message = {"id": msg_id, "model": "claude-sonnet-5", "stop_reason": stop, "content": content}
+    if usage is not None:
+        message["usage"] = usage
+    line = {"type": "assistant", "session_id": "s-1", "message": message}
+    if parent is not None:
+        line["parent_tool_use_id"] = parent
+    return line
+
+
+_TEXT = [{"type": "text", "text": "running it"}]
+_CALL = [{"type": "tool_use", "id": "toolu_01", "name": "Bash", "input": {}}]
+
+
+@pytest.mark.parametrize(
+    ("first", "second", "expected"),
+    [
+        # Repeated copies — what the CLI sends: one copy is the response's usage.
+        ({"input_tokens": 5, "output_tokens": 2}, {"input_tokens": 5, "output_tokens": 2}, (5, 2)),
+        # Running totals: the latest copy is the whole response, never the sum.
+        ({"input_tokens": 5, "output_tokens": 2}, {"input_tokens": 5, "output_tokens": 9}, (5, 9)),
+        # One copy only, on either line: that copy stands.
+        (None, {"input_tokens": 5, "output_tokens": 9}, (5, 9)),
+        ({"input_tokens": 5, "output_tokens": 2}, None, (5, 2)),
+    ],
+)
+def test_a_responses_usage_is_counted_once_whatever_lines_carry_it(first, second, expected):
+    client = FakeClient()
+    asm = SessionAssembler(client)
+    _outbound(asm, key=1)
+    asm.on_inbound(1, INIT)
+    asm.on_inbound(1, _line("m1", _TEXT, usage=first))
+    asm.on_inbound(1, _line("m1", _CALL, usage=second, stop="tool_use"))
+    asm.on_inbound(1, RESULT)
+
+    (chat,) = _chats(client)
+    assert (chat.gen_ai.input_tokens, chat.gen_ai.output_tokens) == expected
+    assert chat.gen_ai.finish_reasons == ("tool_call",)
+    assert json.loads(chat.output_data) == _TEXT + _CALL
+
+
+def test_a_folded_response_spans_its_first_lines_floor_to_its_last_lines_arrival():
+    client = FakeClient()
+    asm = SessionAssembler(client)
+    t_write = time.time_ns()
+    _outbound(asm, key=1)
+    asm.on_inbound(1, INIT)
+    asm.on_inbound(1, _line("m1", _TEXT))
+    time.sleep(0.002)
+    t_before_last = time.time_ns()
+    asm.on_inbound(1, _line("m1", _CALL))
+    asm.on_inbound(1, RESULT)
+
+    (chat,) = _chats(client)
+    assert t_write <= chat.start_time_ns < t_before_last <= chat.end_time_ns
+
+
+def test_lines_without_a_message_id_are_never_folded_together():
+    """Nothing proves two id-less lines are one response, so each stays a span."""
+    client = FakeClient()
+    asm = SessionAssembler(client)
+    _outbound(asm, key=1)
+    asm.on_inbound(1, INIT)
+    asm.on_inbound(1, _line(None, _TEXT))
+    asm.on_inbound(1, _line(None, _CALL))
+    asm.on_inbound(1, RESULT)
+
+    assert len(_chats(client)) == 2
+
+
+def test_a_held_response_ships_when_its_sub_agents_thread_ends():
+    """The `Task` call's result ends its sub-agent's thread, so the response
+    that thread was holding is over — it ships then, and not before."""
+    client = FakeClient()
+    asm = SessionAssembler(client)
+    _outbound(asm, key=1)
+    asm.on_inbound(1, INIT)
+    asm.on_inbound(1, _line("m-sub", _TEXT, parent="task_a"))
+    # The main turn's `result` does not end it: a background sub-agent can
+    # still be mid-response when the turn that spawned it settles.
+    asm.on_inbound(1, RESULT)
+    assert _chats(client) == []
+    asm.on_inbound(1, _result_line("task_a"))
+
+    (chat,) = _chats(client)
+    assert chat.gen_ai.response_id == "m-sub"
+
+
+def test_a_response_still_held_when_the_session_ends_ships_on_every_way_out():
+    """Holding a response defers its span; it never owns it. Closing the
+    transport, and the shutdown sweep, both ship what is still held."""
+    for close in (
+        lambda asm: asm.on_close(1, None),
+        lambda asm: asm.close_all_sessions(marker=Limitation.ADAPTER_UNINSTALLED),
+    ):
+        client = FakeClient()
+        asm = SessionAssembler(client)
+        _outbound(asm, key=1)
+        asm.on_inbound(1, INIT)
+        asm.on_inbound(1, _line("m1", _TEXT))
+        assert _chats(client) == []
+        close(asm)
+        (chat,) = _chats(client)
+        assert chat.gen_ai.response_id == "m1"
+
+
+def test_the_held_response_table_closes_the_oldest_early_and_counts_it(tallies):
+    """Bounded like every per-session table, and an eviction here is an EARLY
+    CLOSE: the response ships with what it has, and the bound says so."""
+    client = FakeClient()
+    asm = SessionAssembler(client, max_session_entries=1)
+    _outbound(asm, key=1)
+    asm.on_inbound(1, INIT)
+    asm.on_inbound(1, _line("a1", _TEXT, parent="task_a"))
+    asm.on_inbound(1, _line("b1", _TEXT, parent="task_b"))
+
+    assert [chat.gen_ai.response_id for chat in _chats(client)] == ["a1"]
+    assert tallies("adapters.assembler.open_chat_table_full") == 1
+    asm.on_close(1, None)
+    assert sorted(chat.gen_ai.response_id for chat in _chats(client)) == ["a1", "b1"]
+
+
+def test_join_blocks_keeps_every_block_whatever_shape_a_side_has():
+    from wardex_sdk._adapters._session_state import _join_blocks
+
+    assert _join_blocks(b'[{"a":1}]', b'[{"b":2}]') == b'[{"a":1},{"b":2}]'
+    assert _join_blocks(b"", b'[{"b":2}]') == b'[{"b":2}]'
+    assert _join_blocks(b'[{"a":1}]', b"[]") == b'[{"a":1}]'
+    assert json.loads(_join_blocks(b'"text"', b'[{"b":2}]')) == ["text", [{"b": 2}]]
