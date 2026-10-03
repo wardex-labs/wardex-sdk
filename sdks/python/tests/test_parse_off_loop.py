@@ -811,27 +811,38 @@ def test_parse_never_runs_on_the_byte_feeding_thread(monkeypatch):
     clock: `parse_llm_semantics` must never run on a thread that is feeding
     bytes into the seam, whatever host or protocol that thread serves. An
     explicit flush()/settle() MAY parse on its calling thread (documented),
-    so the assertion is scoped to the feed instants."""
-    idents: list[int] = []
+    so the assertion is scoped to the feed instants.
+
+    Threads are compared as `Thread` objects, never as `get_ident()` numbers.
+    An ident names a thread only while it runs: once `loop-alike` is joined,
+    the next thread started may be handed the same number (on Linux glibc
+    reuses the joined thread's stack, and the ident is an address inside it).
+    When the settler drew it, its parse, the documented one, read as a parse
+    on a feeder. Which thread draws it turns on everything the process
+    allocated before, so the false failure came and went with unrelated
+    changes elsewhere in the suite. A held object stays distinct for as long
+    as the test holds it."""
+    ran_on: list[threading.Thread] = []
     real = seam_mod.parse_llm_semantics
 
     def spy(*args, **kwargs):
-        idents.append(threading.get_ident())
+        ran_on.append(threading.current_thread())
         return real(*args, **kwargs)
 
     monkeypatch.setattr(seam_mod, "parse_llm_semantics", spy)
 
     c, t = _seam_client()
-    feeders: set[int] = set()
+    c2 = None
+    feeders: set[threading.Thread] = set()
     try:
         seam = _live_seam(c)
         # (a) this thread feeds a TLS HTTP/1 exchange
-        feeders.add(threading.get_ident())
+        feeders.add(threading.current_thread())
         _exchange(seam, _sock())
 
         # (b) a second thread feeds one — the "event loop thread" shape
         def feed():
-            feeders.add(threading.get_ident())
+            feeders.add(threading.current_thread())
             _exchange(seam, _sock())
 
         loop_alike = threading.Thread(target=feed, name="loop-alike")
@@ -842,7 +853,7 @@ def test_parse_never_runs_on_the_byte_feeding_thread(monkeypatch):
         c2, _t2 = _seam_client(limits=LimitsConfig(max_parse_backlog=1))
         c2._finalize.stop(1.0)
         seam2 = _live_seam(c2)
-        feeders.add(threading.get_ident())
+        feeders.add(threading.current_thread())
         _exchange(seam2, _sock())
         _exchange(seam2, _sock())  # evicts the first as a fallback, right here
 
@@ -853,12 +864,16 @@ def test_parse_never_runs_on_the_byte_feeding_thread(monkeypatch):
         settled.start()
         settled.join(5.0)
 
-        assert idents, "the spy never saw a parse — the fixture went vacuous"
-        assert not (set(idents) & feeders), (
+        assert ran_on, "the spy never saw a parse — the fixture went vacuous"
+        assert not (set(ran_on) & feeders), (
             "parse_llm_semantics ran on a byte-feeding thread — the inline path is back"
         )
-        c2.close()
     finally:
+        # Both clients, and in a `finally`: a failed assertion used to skip
+        # `c2.close()`, so its batch worker kept running for the rest of the
+        # session and failed `test_worker`'s count of those threads as well.
+        if c2 is not None:
+            c2.close()
         c.close()
 
 

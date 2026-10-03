@@ -229,9 +229,10 @@ enum Limitation {
   LIMITATION_UNIT_TABLE_FULL = 40;
   //    The same shape one layer out, and separate from 40 for the same reason
   //    40 is separate from 8: this one names `max_session_entries`, the
-  //    adapter's per-SESSION tables (open tool calls, sub-agents, streamed
-  //    tool metadata, the OTel bridge's pending buffer), and raising
-  //    `max_entries_per_unit` leaves that bound exactly where it was.
+  //    adapter's per-SESSION tables (open tool calls, sub-agents, model
+  //    responses still arriving, streamed tool metadata, the OTel bridge's
+  //    pending buffer), and raising `max_entries_per_unit` leaves that bound
+  //    exactly where it was.
   //    `wardex-limits` calls the per-unit knob a generalization of this one —
   //    same order, same semantics — but the census's operative test is not
   //    whether two markers mean the same thing, it is whether the knob the
