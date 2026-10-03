@@ -289,9 +289,10 @@ All notable changes to this project are documented here. The format follows
   body the client let go before the server finished — ships as what arrived,
   marked `frame_parse_failed` and truncated, with no response size and no
   finish reason made up, and with status unset when the status line said
-  2xx: the success was never seen (a 4xx/5xx stays an error). A request whose
-  response headers never arrived still makes no span, since nothing was
-  observed to report.
+  2xx: the success was never seen (a 4xx/5xx stays an error). Its span ends
+  where the cut was seen: the server's close, or the client's. A request
+  whose response headers never arrived still makes no span, since nothing
+  was observed to report.
 - **A response to `HEAD` now becomes a span, and no longer takes the next
   response on its connection with it.** A `HEAD` response declares the length
   its body would have had and sends no body. The SDK waited for that body, so
