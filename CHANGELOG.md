@@ -28,7 +28,11 @@ All notable changes to this project are documented here. The format follows
   that only looks like yours is left as written rather than turned into `~`:
   one whose name begins like yours (`/Users/alice-old`) or a copy of yours
   under another folder (`/backup/Users/alice`). Local variables are never
-  captured. Over OTLP both values are capped by `max_otlp_attribute_bytes`.
+  captured. Each traceback keeps the 64 frames nearest the raise and says how
+  many earlier ones it left out, so an exception leaving hundreds of nested
+  spans (a recursion through a decorated function) costs each span at most 64
+  frames instead of the whole stack. Over OTLP both values are capped by
+  `max_otlp_attribute_bytes`.
 
 - **The transport values the interceptors measure now reach OTLP.** Before,
   an OTLP backend received only the protocol and the HTTP method, status and

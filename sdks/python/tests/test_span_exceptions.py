@@ -27,7 +27,7 @@ from pathlib import Path
 import pytest
 
 import wardex_sdk as wardex
-from wardex_sdk import _hub, _tracing
+from wardex_sdk import _hub, _source_paths, _tracing
 from wardex_sdk._assembly import counters
 from wardex_sdk._client import Client
 from wardex_sdk._config import BackendConfig, WardexConfig
@@ -641,3 +641,133 @@ def test_the_otlp_value_cap_cuts_a_long_stack_trace_and_says_so(recording):
             decoded = native.codec.decode_otlp_traces(gzip.decompress(body))
             (sp,) = decoded["resource_spans"][0]["scope_spans"][0]["spans"]
             assert "otlp_attribute_truncated" in str(sp["attributes"].get("wardex.limitations"))
+
+
+# --------------------------------------------------------------------------
+# what recording costs the host
+# --------------------------------------------------------------------------
+
+
+def _frame_count(stacktrace: str) -> int:
+    return len(_frame_files(stacktrace))
+
+
+def _left_out(stacktrace: str) -> list[int]:
+    found = re.findall(r"^ *\[(\d+) earlier frames? not recorded\]$", stacktrace, re.M)
+    return [int(n) for n in found]
+
+
+def test_a_deep_recursion_records_a_bounded_stack_trace_on_every_span(recording):
+    """Every span an exception leaves records it, and each used to format the whole
+    traceback below it. A recursion through a decorated function, N spans deep,
+    formatted N traces of up to 2N frames while the host unwound: about 10 s and
+    20 MB of text for one RecursionError that unwinds in 10 ms without recording.
+    Each traceback now keeps its frames nearest the raise and says how many came
+    before."""
+
+    @wardex.tool
+    def descend(n):
+        return descend(n + 1)
+
+    with pytest.raises(RecursionError) as caught:
+        descend(0)
+
+    _hub.get_client().flush()
+    spans = [sp for env in recording.envelopes for sp in env.spans]
+    traces = {
+        sp.context.span_id: ev["exception.stacktrace"]
+        for sp in spans
+        for ev in _exception_events(sp)
+        if ev["exception.stacktrace"]
+    }
+    assert len(traces) > _source_paths._MAX_FRAMES  # deep enough for the cut to bite
+    for trace in traces.values():
+        assert _frame_count(trace) <= _source_paths._MAX_FRAMES
+        assert trace.splitlines()[-1].startswith("RecursionError: maximum recursion depth")
+
+    (outermost,) = [sp for sp in spans if sp.parent_span_id is None]
+    trace = traces[outermost.context.span_id]
+    # The test's own frame is the one frame of the caught traceback above the span.
+    depth = sum(1 for _ in traceback.walk_tb(caught.tb)) - 1
+    assert _frame_count(trace) == _source_paths._MAX_FRAMES
+    assert _left_out(trace) == [depth - _source_paths._MAX_FRAMES]
+
+
+def _sink(n: int) -> None:
+    if n == 0:
+        raise ValueError("bottom")
+    _sink(n - 1)
+
+
+def test_a_chained_traceback_is_cut_the_same_way(recording):
+    with pytest.raises(RuntimeError), wardex.span("wrap"):
+        try:
+            _sink(100)
+        except ValueError as e:
+            cause_depth = sum(1 for _ in traceback.walk_tb(e.__traceback__))
+            raise RuntimeError("outer") from e
+
+    trace = _the_exception(_spans(recording)["wrap"])["exception.stacktrace"]
+    cause, _, outer = trace.partition("The above exception was the direct cause")
+    assert _left_out(cause) == [cause_depth - _source_paths._MAX_FRAMES]
+    assert _frame_count(cause) <= _source_paths._MAX_FRAMES
+    assert "ValueError: bottom" in cause
+    assert _left_out(outer) == []
+    assert outer.endswith("RuntimeError: outer\n")
+
+
+def _placed_as_python_prints(exc: BaseException) -> str:
+    text = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    return re.sub(r'File "(.+?)", line ', lambda m: f'File "{os.path.basename(m[1])}", line ', text)
+
+
+def test_a_stack_trace_under_the_cut_is_what_python_prints(recording):
+    """The cut and the per-frame formatting reuse change no frame Python prints:
+    under the cap the stack trace is the stdlib's own, files placed, every time."""
+    try:
+        try:
+            _sink(3)
+        except ValueError as e:
+            raise RuntimeError("outer") from e
+    except RuntimeError as e:
+        first = _source_paths._stacktrace(e, e.__traceback__)
+        again = _source_paths._stacktrace(e, e.__traceback__)
+        expected = _placed_as_python_prints(e)
+
+    assert first == expected
+    assert again == expected
+
+
+#: 3.10 formats each frame inline in `StackSummary.format`: no per-frame hook, so
+#: nothing is formatted through `_Frames.format_frame_summary` and nothing is held.
+_HOOKED = hasattr(traceback.StackSummary, "format_frame_summary")
+
+
+def test_a_frame_is_formatted_once_and_a_changed_line_afresh(monkeypatch):
+    monkeypatch.setattr(_source_paths, "_FORMATTED", {})
+    calls = []
+    stdlib = getattr(traceback.StackSummary, "format_frame_summary", None)
+
+    def counting(self, frame_summary, **kwargs):
+        calls.append(frame_summary.line)
+        return stdlib(self, frame_summary, **kwargs)
+
+    monkeypatch.setattr(traceback.StackSummary, "format_frame_summary", counting, raising=False)
+
+    def frames(*lines: str) -> list[str]:
+        summaries = [traceback.FrameSummary("agent.py", 7, "run", line=line) for line in lines]
+        return _source_paths._Frames(summaries).format()
+
+    assert frames("x = 1", "x = 1") == frames("x = 1", "x = 1")
+    assert calls == (["x = 1"] if _HOOKED else [])
+    assert frames("x = 2") != frames("x = 1")
+    assert calls == (["x = 1", "x = 2"] if _HOOKED else [])
+
+
+def test_the_formatted_frames_held_are_bounded(monkeypatch):
+    monkeypatch.setattr(_source_paths, "_FORMATTED", {})
+    for i in range(_source_paths._FORMATTED_MAX + 10):
+        summary = traceback.FrameSummary("agent.py", i + 1, "run", line="pass")
+        _source_paths._Frames([summary]).format()
+        assert len(_source_paths._FORMATTED) <= _source_paths._FORMATTED_MAX
+    assert bool(_source_paths._FORMATTED) is _HOOKED

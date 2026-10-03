@@ -6,7 +6,9 @@ folder above the import root stay on the machine while the package path a
 developer needs to find the code leaves with the span. A stack trace carries
 paths in more places than its frame lines — an `OSError` names the file it
 could not open, a source line can hold a path literal — so it also has this
-process's home folder written as `~` wherever it starts a path.
+process's home folder written as `~` wherever it starts a path. And a stack
+trace is recorded on every span its exception leaves, so how much of it is
+formatted is bounded here too.
 
 Imports nothing from the package, so any layer that has to place a host path
 can ask this module without importing the span machinery.
@@ -89,13 +91,34 @@ def _call_site_file(
 #: A frame line of a formatted traceback (and a `SyntaxError`'s own location).
 _FRAME_FILE = re.compile(r'File "(.+?)", line (?=\d)')
 
+#: The frames each traceback in a stack trace keeps: the ones nearest where its
+#: exception was raised. Every span an exception leaves records it, so with no
+#: bound a recursion through a decorated function, N spans deep, formatted N
+#: traces of up to 2N frames each while the host was unwinding: seconds of the
+#: host's time and megabytes of text for one failure, the cost growing with the
+#: square of the depth. With it a span pays for at most this many frames per
+#: traceback, however deep the stack.
+_MAX_FRAMES = 64
+
 
 def _stacktrace(exc: Exception, tb: TracebackType | None) -> str:
     """The traceback as Python prints it, with every frame's file placed by the
     call-site rule: a path relative to its package's import root, or the bare
-    file name, never an absolute path. Locals are never captured."""
-    text = "".join(traceback.TracebackException(type(exc), exc, tb).format())
-    files = _frame_files(exc, tb)
+    file name, never an absolute path. Locals are never captured.
+
+    Each traceback in it, a chained one included, keeps its `_MAX_FRAMES`
+    frames nearest the raise, the frames Python's own `limit=-_MAX_FRAMES`
+    prints, and a cut one says how many earlier frames it left out. The span's
+    own traceback is cut before anything is read: the formatter is handed it
+    from its first kept frame on, so its cost is the kept frames, not the
+    depth. A chained one is cut by the formatter's `limit`, which still steps
+    through the frames it drops.
+    """
+    head, left_out = _kept_frames(tb)
+    summary = traceback.TracebackException(type(exc), exc, head, limit=-_MAX_FRAMES)
+    _own_stacks(summary, exc, left_out)
+    text = "".join(summary.format())
+    files = _frame_files(exc, head)
 
     def place(m: re.Match[str]) -> str:
         path = m[1]
@@ -104,8 +127,101 @@ def _stacktrace(exc: Exception, tb: TracebackType | None) -> str:
     return _scrub_home(_FRAME_FILE.sub(place, text))
 
 
-def _frame_files(exc: BaseException, tb: TracebackType | None) -> dict[str, str]:
-    """Each frame's file, placed with the module its frame ran under.
+def _kept_frames(tb: TracebackType | None) -> tuple[TracebackType | None, int]:
+    """Where `tb`'s `_MAX_FRAMES` frames nearest the raise begin, and how many come before.
+
+    Follows `tb_next` and nothing else, so no frame, line or code position is
+    read for a frame that is not kept.
+    """
+    depth = 0
+    node = tb
+    while node is not None:
+        depth += 1
+        node = node.tb_next
+    left_out = max(depth - _MAX_FRAMES, 0)
+    head = tb
+    for _ in range(left_out):
+        head = head.tb_next  # type: ignore[union-attr]  # depth counted it
+    return head, left_out
+
+
+#: Formatted frames, looked up by everything the stdlib's formatter reads; see `_Frames`.
+_FORMATTED: dict[tuple[Any, ...], str] = {}
+#: How many formatted frames `_FORMATTED` holds before it starts over.
+_FORMATTED_MAX = 1024
+
+
+class _Frames(traceback.StackSummary):
+    """One traceback's kept frames, printed the way the stdlib prints them, with two additions.
+
+    A cut traceback starts with a line saying how many earlier frames it left
+    out. And a frame is formatted once, not once per span: the stdlib's frame
+    formatting is most of what recording costs (from 3.13 it parses the source
+    line twice to place the `^^^` markers), and when one exception leaves N
+    nested spans the same frames come back N times. The formatted text is
+    looked up by everything the formatter reads — the file, the line and
+    column positions, the function name and the source lines — so the same
+    frame prints the same text and a changed source line formats afresh.
+    """
+
+    left_out = 0
+
+    def format(self, **kwargs: Any) -> list[str]:
+        lines = super().format(**kwargs)
+        if self.left_out:
+            plural = "s" if self.left_out > 1 else ""
+            lines.insert(0, f"  [{self.left_out} earlier frame{plural} not recorded]\n")
+        return lines
+
+    def format_frame_summary(self, frame_summary: traceback.FrameSummary, **kwargs: Any) -> str:
+        # 3.11+ only: 3.10's `format` formats each frame inline, cheaply.
+        if frame_summary.locals is not None:  # never captured here; not looked up if it were
+            return super().format_frame_summary(frame_summary, **kwargs)
+        key = (
+            frame_summary.filename,
+            frame_summary.lineno,
+            getattr(frame_summary, "end_lineno", None),
+            getattr(frame_summary, "colno", None),
+            getattr(frame_summary, "end_colno", None),
+            frame_summary.name,
+            frame_summary.line,
+            getattr(frame_summary, "_original_lines", None),  # what 3.13+ reads
+            getattr(frame_summary, "_original_line", None),  # what 3.11 and 3.12 read
+            tuple(sorted(kwargs.items())),
+        )
+        text = _FORMATTED.get(key)
+        if text is None:
+            text = super().format_frame_summary(frame_summary, **kwargs)
+            if len(_FORMATTED) >= _FORMATTED_MAX:
+                _FORMATTED.clear()
+            _FORMATTED[key] = text
+        return text
+
+
+def _own_stacks(summary: traceback.TracebackException, exc: BaseException, n: int) -> None:
+    """Give every traceback in `summary` its `_Frames`, with how many frames it left out.
+
+    `summary` mirrors the exception graph it was built from — a `__cause__`, a
+    `__context__` and a group's members each have their own summary, absent
+    where the formatter will not print one — so the two are walked together.
+    """
+    todo: list[tuple[Any, BaseException, int]] = [(summary, exc, n)]
+    while todo:
+        s, e, left_out = todo.pop()
+        frames = _Frames(s.stack)
+        frames.left_out = left_out
+        s.stack = frames
+        pairs = [(s.__cause__, e.__cause__), (s.__context__, e.__context__)]
+        members = getattr(s, "exceptions", None)  # 3.11+, and set only for a group
+        if members:
+            pairs += zip(members, e.exceptions, strict=False)
+        for sub, sub_exc in pairs:
+            if sub is not None and sub_exc is not None:
+                todo.append((sub, sub_exc, _kept_frames(sub_exc.__traceback__)[1]))
+
+
+def _frame_files(exc: BaseException, head: TracebackType | None) -> dict[str, str]:
+    """Each kept frame's file, placed with the module its frame ran under.
 
     Walks the whole graph the formatter prints — `__cause__`, `__context__` and
     an exception group's members — because a chained traceback's frames are
@@ -113,7 +229,7 @@ def _frame_files(exc: BaseException, tb: TracebackType | None) -> dict[str, str]
     """
     files: dict[str, str] = {}
     seen: set[int] = set()
-    todo: list[tuple[BaseException, TracebackType | None]] = [(exc, tb)]
+    todo: list[tuple[BaseException, TracebackType | None]] = [(exc, head)]
     while todo:
         e, t = todo.pop()
         if id(e) in seen:
@@ -126,7 +242,7 @@ def _frame_files(exc: BaseException, tb: TracebackType | None) -> dict[str, str]
         members = getattr(e, "exceptions", ())
         for nxt in (e.__cause__, e.__context__, *(members if isinstance(members, tuple) else ())):
             if isinstance(nxt, BaseException):
-                todo.append((nxt, nxt.__traceback__))
+                todo.append((nxt, _kept_frames(nxt.__traceback__)[0]))
     return files
 
 
@@ -168,5 +284,7 @@ def _scrub_home(text: str) -> str:
     if len(home) < 2 or not os.path.isabs(home):
         return text
     forms = {home, home.replace("\\", "\\\\")}
+    if not any(f in text for f in forms):
+        return text  # the common case, and a substring search costs far less than the pattern
     pattern = "|".join(re.escape(f) for f in sorted(forms, key=len, reverse=True))
     return re.sub(f"{_HOME_STARTS}(?:{pattern}){_HOME_ENDS}", "~", text)

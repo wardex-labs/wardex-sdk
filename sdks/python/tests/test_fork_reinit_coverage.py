@@ -107,6 +107,13 @@ _FORK_EXEMPT: dict[tuple[str, str], str] = {
     ("_interceptors/_registry.py", "_installed"): "install record, kept (I-fork-4)",
     ("context/_inject.py", "_installed"): "patch record, kept (I-fork-4)",
     ("_assembly/_patchset.py", "_patches"): "restore records, kept (I-fork-4)",
+    # -- a memo of a pure function, keyed by every input it reads: what the
+    #    child finds in it is exactly what it would have computed itself.
+    ("_source_paths.py", "_FORMATTED"): (
+        "formatted stack-trace frames keyed by everything the formatter reads; "
+        "names no connection, span or pid, so an entry the child inherits is the text it "
+        "would format itself"
+    ),
     # -- signal dispositions cross the fork with the signal table itself; the
     #    child's handlers are as installed as the parent's (design §3.8).
     ("_runtime.py", "_prev_handlers"): "signal dispositions survive fork by design (§3.8)",

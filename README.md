@@ -492,6 +492,20 @@ not leave with the sentence. Over OTLP both values are capped by
 cannot see, so a secret with no recognisable shape in an exception's message or
 on the source line that raised it leaves as written.
 
+Each traceback in a stack trace, a chained cause included, keeps the 64 frames
+nearest where its exception was raised — what Python's own
+`traceback.format_exception(exc, limit=-64)` prints — and one cut that way
+starts with a line saying how many earlier frames it left out
+(`[436 earlier frames not recorded]`). Every span an exception leaves records
+it, so without the cut a recursion through a decorated function, about 500
+spans deep, would have each span format the whole stack below it on your
+code's way out: about ten seconds and twenty megabytes of text for one
+`RecursionError`. With it each span pays for at most 64 frames per traceback,
+however deep the stack: the same recursion records in 0.3 to 0.6 s, where it
+unwinds in about 10 ms with nothing recorded. An ordinary failure is far
+shorter than the cut: a LangGraph node that raises is 9 frames below
+`graph.invoke()` (measured on langgraph 1.2.12).
+
 ## Scope
 
 Ambient data that rides on every span captured under it:
