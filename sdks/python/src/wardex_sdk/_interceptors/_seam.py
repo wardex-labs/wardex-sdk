@@ -116,14 +116,14 @@ if TYPE_CHECKING:
 def _accepted_prefix(data: Any, n: int) -> Any:
     """The first `n` bytes of a send buffer, without materializing the rest.
 
-    `send`/`write` may report a SHORT write, and the caller then keeps the tail
-    and calls again with the whole remainder — asyncio's plaintext writer does
-    exactly that on 3.10/3.11 (`_write_ready` calls `send(self._buffer)` on one
-    bytearray and then `del self._buffer[:n]`). `bytes(data)[:n]` copies that
-    entire remainder before throwing away everything the kernel refused, so a
-    multi-megabyte body costs a copy per call: quadratic in body size, and on
-    the branch the gate deliberately leaves OPEN — a local plaintext model
-    server is HTTP, so it latches "http" and pays this on every partial write.
+    `send`/`write` may report a SHORT write, and the caller then keeps the tail and calls
+    again with the whole remainder: asyncio's plaintext writer does, with `send(self._buffer)`
+    on 3.10/3.11 and, from 3.12, `send` for a `write()`'s first attempt and `sendmsg` for the
+    rest (`_socket._accepted_prefix_vectored`). `bytes(data)[:n]` copies that entire remainder
+    before throwing away everything the kernel refused, so a multi-megabyte body costs a copy
+    per call: quadratic in body size, and on the branch the gate deliberately leaves OPEN — a
+    local plaintext model server is HTTP, so it latches "http" and pays this on every partial
+    write.
 
     Returns something `bytes()` accepts rather than `bytes`, so that an exact
     `bytes` argument written in full stays the same object and costs nothing at

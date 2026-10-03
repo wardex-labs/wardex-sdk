@@ -10,6 +10,21 @@ from .._enums import Protocol
 from .._types import ParsedMessage
 from ._base import ProtocolParserInterface
 
+#: The methods an HTTP/1 request line opens with, each with its space. The seams sniff a
+#: connection's first bytes against it; `_Http1Tracker` tells a new request from the late
+#: rest of an unfinished one with it.
+REQUEST_METHODS = (
+    b"GET ",
+    b"POST ",
+    b"PUT ",
+    b"DELETE ",
+    b"HEAD ",
+    b"PATCH ",
+    b"OPTIONS ",
+    b"CONNECT ",  # proxied connections open with this
+    b"TRACE ",
+)
+
 
 def _resolve_markers(raw: object) -> tuple[Limitation, ...]:
     """Rust marker strings -> `Limitation` members. THE boundary, and the only one.
@@ -131,6 +146,14 @@ class _Http1Parser(ProtocolParserInterface):
 
     def disabled_reason(self) -> str | None:
         return self._native.disabled_reason()  # type: ignore[no-any-return]
+
+    def idle(self) -> bool:
+        """Between messages: the last one completed and no byte of the next has arrived."""
+        return self._native.is_idle()  # type: ignore[no-any-return]
+
+    def method_in_flight(self) -> str | None:
+        """The method of the request whose header block parsed and whose body is arriving."""
+        return self._native.method_in_flight()  # type: ignore[no-any-return]
 
 
 class Http1RequestParser(_Http1Parser):

@@ -243,6 +243,18 @@ impl Http1Parser {
         })
     }
 
+    /// True between messages: the last one completed and no byte of the next
+    /// has arrived.
+    fn is_idle(&self) -> PyResult<bool> {
+        shielded(|| Ok(self.inner.is_idle()))
+    }
+
+    /// The method of the request whose header block parsed and whose body is
+    /// still arriving, if there is one.
+    fn method_in_flight(&self) -> PyResult<Option<String>> {
+        shielded(|| Ok(self.inner.method_in_flight().map(str::to_owned)))
+    }
+
     /// Why the parser latched off, if it did. `None` while the stream is
     /// still parsing normally.
     fn disabled_reason(&self) -> PyResult<Option<&'static str>> {
