@@ -277,6 +277,26 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- **An OpenAI Agents run that raised to your code no longer ships as a
+  success.** A typed handoff (`handoff(..., input_type=...)`) whose arguments
+  the model got wrong ends `Runner.run` with `ModelBehaviorError`, yet only
+  the `handoff …→unresolved` span was ERROR: the agent and the run's root
+  `invoke_workflow` read OK, so the run was missing from failure counts and
+  alerts. The framework marks whichever span it chooses, and it leaves
+  `ModelBehaviorError` out of its generic agent error on purpose, so the
+  root's status no longer rests on that choice. An exception leaving the
+  run, the one `Runner.run`, `run_sync` or a drained `run_streamed` hands
+  your code, now makes the agent that was running and the root ERROR, named
+  after the exception's class (`ModelBehaviorError`) where no framework error
+  message names it. A run that fails between two agents (after a handoff,
+  before the receiver starts) fails its root too, and an error message the
+  adapter does not recognise no longer leaves the root OK when the run
+  raised. A tool failure the framework handled and moved past still marks
+  only the tool span, a nested agent-as-tool run that raised marks only its
+  own agent, and a cancelled run is not a failure. Should a framework release
+  close the root before the exception reaches your code, the run is counted
+  under `adapters.openai_agents.run_raised_after_root_ok` and said once
+  instead of shipping a silent OK.
 - **Values the SDK makes itself are no longer masked as a card number, and
   a span's masking record no longer reports a card that was never there.**
   The case that showed it is a span's connection id, a value the SDK makes

@@ -1,4 +1,4 @@
-"""The OpenAI Agents run's ENTRY: the one value the framework's trace never carries.
+"""The OpenAI Agents run's ENTRY and EXIT: what the framework's trace never carries.
 
 `Runner.run(conversation_id=...)` names the provider-held conversation a run
 continues. The framework hands that id to every model call (it is each
@@ -6,11 +6,24 @@ request's `conversation`) and never to its trace, so no `TracingProcessor`
 callback can read it, and the run's own spans used to carry no conversation
 while its LLM calls carried this one.
 
+The other thing the trace never carries is whether the run FAILED. The
+framework marks whichever span it chose to blame — for a typed handoff whose
+arguments do not validate, only the handoff span — and `Runner.run` raises
+while the agent and the trace read OK. What the host receives is the
+evidence: an `Exception` leaving the run (`failure_leaving`). The agent and
+trace spans close INSIDE the call, on that exception's way out, so it is read
+there, where it is in flight; holding them open until the entry point returns
+would move every run's end instants, a handoff sender's past its receiver's.
+The entry point's own exit then checks the verdict after the fact: a call
+that raised after the root it opened closed OK is counted and said once,
+because that root under-reports the failure and nothing else would tell.
+
 The three public entry points — `Runner.run`, `run_sync` and `run_streamed` —
-are wrapped to READ the argument, and do nothing else: no argument, result or
-exception is changed. They are the framework's documented surface, not its run
-loop, which is why this is not the internal patching the adapter's own
-docstring rejects. Each call puts its id in `RUN_REQUEST` for the length of the
+are wrapped to READ the argument and the outcome, and do nothing else: no
+argument, result or exception is changed. They are the framework's
+documented surface, not its run loop, which is why this is not the internal
+patching the adapter's own docstring rejects. Each call puts its id in
+`RUN_REQUEST`, and a fresh `RunCall` in `RUN_CALL`, for the length of the
 call, on the task or thread the host called from. Every callback of the run
 fires there or on a task created from there — `run_sync`'s task on the
 thread's loop, `run_streamed`'s run-loop task, the model, tool and guardrail
@@ -30,6 +43,7 @@ from __future__ import annotations
 
 import contextvars
 import functools
+import sys
 from collections.abc import Callable
 from inspect import iscoroutinefunction, signature
 from typing import Any
@@ -62,6 +76,49 @@ class RunRequest:
 RUN_REQUEST: contextvars.ContextVar[RunRequest | None] = contextvars.ContextVar(
     "wardex_openai_agents_run_request", default=None
 )
+
+
+class RunCall:
+    """One entry-point call while it runs, whatever it names.
+
+    A trace that STARTS while a call is current is the one the framework
+    opened for that call — a trace the host opened around the call started
+    before it — so its root reads the call's outcome at its close, and records
+    here whether it closed OK for the call's exit to check.
+    """
+
+    __slots__ = ("root_closed_ok",)
+
+    def __init__(self) -> None:
+        self.root_closed_ok: bool | None = None
+
+
+#: The entry-point call the current task or thread is inside, or None.
+RUN_CALL: contextvars.ContextVar[RunCall | None] = contextvars.ContextVar(
+    "wardex_openai_agents_run_call", default=None
+)
+
+
+def current_call() -> RunCall | None:
+    """The entry-point call in progress on this task or thread, or None."""
+    return RUN_CALL.get()
+
+
+def failure_leaving(host_inflight: BaseException | None) -> str | None:
+    """The class name of the `Exception` leaving the run where a span closes, or None.
+
+    Read where the framework closes an agent span or its own trace: in a
+    `finally` or an `__exit__` on the exception's way out to the host, the one
+    place it is in flight. Only an `Exception` is a failure; a cancellation, an
+    interrupt or a shutdown is not. `host_inflight` is what was in flight when
+    the span OPENED: a run driven from inside the host's own `except` block
+    carries that exception into every frame underneath, and it is the host's,
+    not the run's.
+    """
+    inflight = sys.exc_info()[1]
+    if not isinstance(inflight, Exception) or inflight is host_inflight:
+        return None
+    return type(inflight).__name__
 
 
 # -- what the open of a run and of its top-level agents reads ----------------
@@ -224,8 +281,8 @@ class _Reader:
 
     def enter(
         self, original: Any, cls: type, args: tuple[Any, ...], kwargs: dict[str, Any]
-    ) -> tuple[list[Any], contextvars.Token[RunRequest | None] | None]:
-        """`([the framework's call, ready to make], the token to reset)`.
+    ) -> tuple[list[Any], tuple[Any, ...] | None]:
+        """`([the framework's call, ready to make], what `leave` resets and checks)`.
 
         The read runs under the adapter's guard: a call whose id could not be
         read runs with none rather than not at all.
@@ -236,12 +293,36 @@ class _Reader:
         request = None
         with self.ctx.guard("run_entry"):
             request = self.request(args, kwargs)
-        return [call], RUN_REQUEST.set(request)
+        record = RunCall()
+        return [call], (RUN_REQUEST.set(request), RUN_CALL.set(record), record)
 
-    def leave(self, token: contextvars.Token[RunRequest | None] | None) -> None:
-        if token is not None:
-            with self.ctx.guard("run_exit"):
-                RUN_REQUEST.reset(token)
+    def leave(self, entered: tuple[Any, ...] | None, raised: BaseException | None) -> None:
+        """Reset the call's variables, then check the verdict against what the host gets.
+
+        A call that raised an `Exception` after the root it opened closed OK
+        means that root under-reports a failure — the framework closed it off
+        the exception's path — and the span cannot be reopened, so the miss is
+        counted and said once. The message stays off the line: it can be host
+        content.
+        """
+        if entered is None:
+            return
+        request_token, call_token, record = entered
+        # One guard each: a `RunCall` left standing on this carrier would mark
+        # the next trace the HOST opens here as one the framework opened.
+        with self.ctx.guard("run_exit"):
+            RUN_REQUEST.reset(request_token)
+        with self.ctx.guard("run_exit"):
+            RUN_CALL.reset(call_token)
+        if not isinstance(raised, Exception) or not record.root_closed_ok:
+            return
+        with self.ctx.guard("run_outcome"):
+            self.ctx.count("run_raised_after_root_ok")
+            report_once(
+                "openai-agents adapter: a run raised to its caller after its run root had "
+                "closed with status OK, so that root under-reports the failure",
+                key="adapters.openai_agents.run_raised_after_root_ok",
+            )
 
 
 def _argument(args: tuple[Any, ...], kwargs: dict[str, Any], name: str, at: int | None) -> Any:
@@ -263,27 +344,35 @@ def _wrap(original: Any, reader: _Reader, *, awaited: bool) -> classmethod:  # t
     would hand them to anything that reads a traceback's locals, the way an
     error tracker does. So the call is made ready in a one-item list, the
     argument names are deleted, and the list is emptied by the expression that
-    makes the call.
+    makes the call. The exception, when one leaves, is handed to `leave` from
+    inside the `except` block and never bound past it: a frame that kept it
+    would make a cycle through the exception's own traceback.
     """
     if awaited:
 
         async def entry(cls: type, *args: Any, **kwargs: Any) -> Any:
-            box, token = reader.enter(original, cls, args, kwargs)
+            box, entered = reader.enter(original, cls, args, kwargs)
             del args, kwargs
             try:
-                return await box.pop()()
-            finally:
-                reader.leave(token)
+                result = await box.pop()()
+            except BaseException as exc:
+                reader.leave(entered, exc)
+                raise
+            reader.leave(entered, None)
+            return result
 
     else:
 
         def entry(cls: type, *args: Any, **kwargs: Any) -> Any:  # type: ignore[misc]
-            box, token = reader.enter(original, cls, args, kwargs)
+            box, entered = reader.enter(original, cls, args, kwargs)
             del args, kwargs
             try:
-                return box.pop()()
-            finally:
-                reader.leave(token)
+                result = box.pop()()
+            except BaseException as exc:
+                reader.leave(entered, exc)
+                raise
+            reader.leave(entered, None)
+            return result
 
     functools.update_wrapper(entry, original.__func__)
     return classmethod(entry)
