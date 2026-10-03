@@ -3438,8 +3438,9 @@ def test_a_run_that_fails_between_two_agents_fails_the_root_the_host_opened(
 def test_a_nested_run_a_hosts_tool_handles_leaves_the_host_root_ok(agents_env, scenario):
     """A tool that runs an agent itself and handles that run's failure, all
     under the host's trace. The nested call raised to ITS caller, the tool,
-    which went on: the inner agent is ERROR and nothing above it is, so the
-    call's exit fails a root only for a call made while no agent is current."""
+    which went on: the inner agent is ERROR and nothing above it is. The
+    host's trace was opened outside every run, so a call made while an agent
+    is current is nested in that agent's run and its exit fails no root."""
     from agents import function_tool, trace
 
     def decide(inp: object) -> list[dict]:
@@ -3473,6 +3474,193 @@ def test_a_nested_run_a_hosts_tool_handles_leaves_the_host_root_ok(agents_env, s
     inner = _one(spans, "invoke_agent helper")
     assert (inner.status, inner.error_type) == (StatusCode.ERROR, "ModelBehaviorError")
     for name in ("execute_tool delegate", "invoke_agent agent_a", "invoke_workflow host workflow"):
+        s = _one(spans, name)
+        assert (s.status, s.error_type) == (StatusCode.OK, None)
+
+
+def _said(inp: object, text: str) -> bool:
+    """Whether the request's input carries a message whose content is `text`."""
+    items = inp if isinstance(inp, list) else []
+    return any(isinstance(x, dict) and x.get("content") == text for x in items)
+
+
+@pytest.mark.parametrize("failure", ["between_agents", "typed_handoff"])
+def test_a_trace_a_tool_opens_does_not_stand_in_for_the_root_of_the_run_it_is_in(
+    agents_env, scenario, wardex_log, failure
+):
+    """A tool that opens its own `with trace(...)` around a run of its own, and
+    the outer run, under the host's trace, fails after the tool returned. The
+    tool's trace opened and closed OK while the outer call ran, and its close
+    was once taken for that call's root closing OK: the host's root then read
+    OK for a run that failed between two agents, and a typed-handoff failure
+    the agent did report was still counted and said as an under-reported one.
+    Only the root the call's framework opens speaks for the call: the host's
+    root is ERROR, named after the exception, and nothing is said."""
+    from agents import function_tool, trace
+    from agents.exceptions import ModelBehaviorError
+
+    from wardex_sdk._assembly._diag import reset_reports_for_test
+
+    then = _decide_handoff_once if failure == "between_agents" else _decide_typed_handoff
+
+    def decide(inp: object) -> list[dict]:
+        if _said(inp, "INNER"):
+            return _DONE
+        if "delegate" not in _calls_made(inp):
+            return [_fc("delegate", "call_1", '{"q":"x"}')]
+        return then(inp)
+
+    @function_tool
+    async def delegate(q: str) -> str:
+        with trace("inner workflow"):
+            helper = Agent(name="helper", instructions="h", model="gpt-4o-mini")
+            return (await Runner.run(helper, "INNER")).final_output
+
+    async def go() -> None:
+        with trace("host workflow"):
+            await Runner.run(outer, "hi")
+
+    scenario(decide)
+    handoffs = (
+        _receiver_never_starts() if failure == "between_agents" else _typed_handoff_agent()
+    ).handoffs
+    outer = Agent(
+        name="agent_a",
+        instructions="a",
+        tools=[delegate],
+        handoffs=list(handoffs),
+        model="gpt-4o-mini",
+    )
+    raised = RuntimeError if failure == "between_agents" else ModelBehaviorError
+    reset_reports_for_test()  # the line is once per process: let this run say it if it would
+    _init()
+    try:
+        with pytest.raises(raised):
+            asyncio.run(go())
+        spans = _spans()
+        failed_at_exit = counters.get("adapters.openai_agents.root_failed_at_call_exit")
+        backstop = counters.get("adapters.openai_agents.run_raised_after_root_ok")
+    finally:
+        wardex.close()
+        reset_reports_for_test()
+    root = _one(spans, "invoke_workflow host workflow")
+    assert (root.status, root.error_type) == (StatusCode.ERROR, raised.__name__)
+    for name in ("invoke_workflow inner workflow", "invoke_agent helper"):
+        assert _one(spans, name).status is StatusCode.OK
+    # Between two agents no span is open, so the call's exit fails the root; a typed handoff's
+    # failure leaves the agent while its span is open, and the agent fails the root first.
+    assert (failed_at_exit, backstop) == (1 if failure == "between_agents" else 0, 0)
+    assert [m for m in wardex_log.lines(logging.WARNING) if "under-reports" in m] == []
+
+
+def test_a_trace_opened_inside_a_nested_run_is_not_that_runs_root(agents_env, scenario, wardex_log):
+    """A tool runs an agent without a trace of its own, so that nested call
+    runs under the outer run's trace and its framework opens none. A tool of
+    the nested agent then opens and closes a trace, and the nested run raises
+    to the outer tool, which the framework handles. That trace was once taken
+    for the nested call's own root closing OK, so a run the outer agent
+    handled was counted and said as an under-reported failure. It is no call's
+    root: nothing is counted or said, the nested agent is ERROR and the root,
+    whose run went on, is OK."""
+    from agents import function_tool, trace
+
+    from wardex_sdk._assembly._diag import reset_reports_for_test
+
+    def decide(inp: object) -> list[dict]:
+        if _said(inp, "INNER"):
+            if "probe" not in _calls_made(inp):
+                return [_fc("probe", "call_p1", "{}")]
+            return _decide_typed_handoff(inp)
+        if _outputs_done(inp) == 0:
+            return [_fc("delegate", "call_1", '{"q":"x"}')]
+        return _DONE
+
+    @function_tool
+    def probe() -> str:
+        with trace("tool trace"):
+            return "probed"
+
+    @function_tool
+    async def delegate(q: str) -> str:
+        return (await Runner.run(helper, "INNER")).final_output
+
+    scenario(decide)
+    helper = Agent(
+        name="helper",
+        instructions="h",
+        tools=[probe],
+        handoffs=list(_typed_handoff_agent().handoffs),
+        model="gpt-4o-mini",
+    )
+    outer = Agent(name="agent_a", instructions="a", tools=[delegate], model="gpt-4o-mini")
+    reset_reports_for_test()  # the line is once per process: let this run say it if it would
+    _init()
+    try:
+        assert asyncio.run(Runner.run(outer, "hi")).final_output == "done"
+        spans = _spans()
+        backstop = counters.get("adapters.openai_agents.run_raised_after_root_ok")
+    finally:
+        wardex.close()
+        reset_reports_for_test()
+    assert backstop == 0
+    assert [m for m in wardex_log.lines(logging.WARNING) if "under-reports" in m] == []
+    inner = _one(spans, "invoke_agent helper")
+    assert (inner.status, inner.error_type) == (StatusCode.ERROR, "ModelBehaviorError")
+    for name in ("invoke_workflow tool trace", "invoke_workflow Agent workflow"):
+        assert _one(spans, name).status is StatusCode.OK
+
+
+@pytest.mark.parametrize("host_trace", [False, True])
+@pytest.mark.parametrize("caught", [False, True])
+def test_a_run_that_raises_inside_a_trace_its_tool_opened_fails_that_trace(
+    agents_env, scenario, host_trace, caught
+):
+    """A tool opens its own `with trace(...)` around a run of its own, and that
+    run raises to the tool. The tool's trace is a root the host's code opened
+    around the call, like the host's own: the call's exit fails it, whether
+    the tool lets the exception out of its trace or catches it inside, as a
+    fallback does — it used to stay OK then. The outer run handled the tool's
+    outcome and went on, so its agent and its root stay OK."""
+    from agents import function_tool, trace
+
+    def decide(inp: object) -> list[dict]:
+        if _said(inp, "INNER"):
+            return _decide_typed_handoff(inp)
+        if _outputs_done(inp) == 0:
+            return [_fc("delegate", "call_1", '{"q":"x"}')]
+        return _DONE
+
+    @function_tool
+    async def delegate(q: str) -> str:
+        with trace("inner workflow"):
+            if not caught:
+                return (await Runner.run(_typed_handoff_agent("helper"), "INNER")).final_output
+            try:
+                return (await Runner.run(_typed_handoff_agent("helper"), "INNER")).final_output
+            except Exception:
+                return "fallback"
+
+    async def go() -> Any:
+        if not host_trace:
+            return (await Runner.run(outer, "hi")).final_output
+        with trace("host workflow"):
+            return (await Runner.run(outer, "hi")).final_output
+
+    scenario(decide)
+    outer = Agent(name="agent_a", instructions="a", tools=[delegate], model="gpt-4o-mini")
+    _init()
+    try:
+        assert asyncio.run(go()) == "done"
+        spans = _spans()
+        backstop = counters.get("adapters.openai_agents.run_raised_after_root_ok")
+    finally:
+        wardex.close()
+    assert backstop == 0
+    for name in ("invoke_workflow inner workflow", "invoke_agent helper"):
+        s = _one(spans, name)
+        assert (s.status, s.error_type) == (StatusCode.ERROR, "ModelBehaviorError")
+    outer_root = "invoke_workflow host workflow" if host_trace else "invoke_workflow Agent workflow"
+    for name in ("invoke_agent agent_a", outer_root):
         s = _one(spans, name)
         assert (s.status, s.error_type) == (StatusCode.OK, None)
 

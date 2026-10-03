@@ -119,8 +119,9 @@ from ._context import AdapterContext, Placement, RunHandle
 from ._openai_agents_entry import (
     call_conversation,
     failure_leaving,
+    host_opened,
     install_entry_hook,
-    opened_by_call,
+    open_root,
     run_conversation,
 )
 from ._payload import _shaped_payload
@@ -687,13 +688,12 @@ def _run_state(adapter: OpenAIAgentsAdapter, trace: Any) -> dict[str, Any] | Non
 
 
 def _host_root(adapter: OpenAIAgentsAdapter) -> dict[str, Any] | None:
-    """At an entry-point call's entry: the state of the root the HOST opened that the call runs
-    under, or None — no trace is current, or an agent is (a call from a tool or hook is nested in
-    that agent's run, which handles its failure), or the framework opened it for an outer call."""
+    """At an entry-point call's entry: the state of the root the HOST opened around the call, or
+    None — no trace is current, or the current one is no such root for this call (`host_opened`)."""
     tracing = adapter._tracing
     trace = tracing.get_current_trace() if tracing is not None else None
-    run = _run_state(adapter, trace) if trace is not None and _CURRENT_AGENT.get() is None else None
-    return run if run is not None and run.get("call") is None else None
+    run = _run_state(adapter, trace) if trace is not None else None
+    return run if host_opened(run, _CURRENT_AGENT.get()) else None
 
 
 def _span_start(adapter: OpenAIAgentsAdapter, span: Any) -> None:
@@ -966,7 +966,7 @@ def _trace_start(adapter: OpenAIAgentsAdapter, trace: Any, *, resumed: bool = Fa
     run["agent_count"] = 0
     run["turn_max"] = 0
     run["request"], run["stated"] = request, conversation is not None
-    run["call"], run["host_inflight"] = opened_by_call(run), sys.exc_info()[1]
+    open_root(run, trace, adapter._tracing, _CURRENT_AGENT.get())
     adapter._runs += 1
     _pin(adapter, h, driver, name)
     ctx.confirm_active("trace")

@@ -15,13 +15,15 @@ trace spans close INSIDE the call, on that exception's way out, so it is read
 there, where it is in flight; holding them open until the entry point returns
 would move every run's end instants, a handoff sender's past its receiver's.
 The call's exit then settles what is left. A root still open there — the one
-the HOST opened around the call (`with trace(...)`) — takes the exception's
+the HOST opened around the call (`with trace(...)`), in its own code or in a
+tool that opens a trace of its own around a run — takes the exception's
 class name unless an agent already failed it, since no span of the run need
-be open when it raises (a run that fails between two agents). A root the call
-opened that closed OK is counted and said once, because it under-reports the
-failure and nothing else would tell. `run_streamed` returns before its run
-does, so its exit is the end of the framework's run-loop task, the outcome
-the stream hands the host.
+be open when it raises (a run that fails between two agents). A root the
+call's framework opened that closed OK is counted and said once, because it
+under-reports the failure and nothing else would tell; only that root's close
+counts, never a trace a tool opened and closed while the call ran.
+`run_streamed` returns before its run does, so its exit is the end of the
+framework's run-loop task, the outcome the stream hands the host.
 
 The three public entry points — `Runner.run`, `run_sync` and `run_streamed` —
 are wrapped to READ the argument and the outcome, and do nothing else: no
@@ -88,11 +90,12 @@ class RunCall:
     """One entry-point call while it runs, whatever it names, and the root it runs under.
 
     `root` is that root's run state: the one the HOST opened around the call,
-    read at the call's entry, or else the one the framework opens inside it
-    (`opened_by_call`). A trace that STARTS while a call is current is the
-    framework's for that call — a trace the host opened started before it — so
-    its root reads the call's outcome at its close, and records in
-    `root_closed_ok` whether it closed OK for the call's exit to check.
+    read at the call's entry (`host_opened`), or else the one the framework
+    opens inside it (`open_root`). Only that second kind is the call's OWN
+    root: it reads the call's outcome at its close, and records in
+    `root_closed_ok` whether it closed OK for the call's exit to check. Any
+    other trace that closes while the call runs — one a tool opened for itself
+    — says nothing about this call.
     """
 
     __slots__ = ("root", "root_closed_ok")
@@ -116,14 +119,44 @@ RUN_CALL: contextvars.ContextVar[RunCall | None] = contextvars.ContextVar(
 )
 
 
-def opened_by_call(run: dict[str, Any]) -> RunCall | None:
-    """The entry-point call in progress here, whose framework opened the root
-    `run` is the state of, or None when no call is. A call already under a
-    root keeps it: that is the one its failure belongs to."""
+def open_root(run: dict[str, Any], trace: Any, tracing: Any, agent: Any) -> None:
+    """Record, on the state `run` of a root as it opens, whose root it is.
+
+    `run["call"]` is the entry-point call whose framework opened `trace`, or
+    None. The framework opens a trace for a call only when no trace is current,
+    so that is a trace that starts while a call with no root yet is current and
+    finds no other trace current (the framework tells its processors before it
+    marks its trace current; either order reads the same here). A trace that
+    starts while another is current was opened by the host's own code running
+    inside a run — a tool's `with trace(...)` — so it is no call's: its close
+    must not stand in for the outer call's root, which is still open or was
+    the host's. `run["opened_in"]` is the agent `agent` current at the open,
+    None outside every run, for `host_opened`. `run["host_inflight"]` is the
+    exception in flight at the open: the host's, never the run's.
+    """
     call = RUN_CALL.get()
-    if call is not None and call.root is None:
+    current = tracing.get_current_trace() if tracing is not None else None
+    if call is not None and call.root is None and (current is None or current is trace):
         call.root = run
-    return call
+    else:
+        call = None
+    run["call"], run["opened_in"], run["host_inflight"] = call, agent, sys.exc_info()[1]
+
+
+def host_opened(run: dict[str, Any] | None, agent: Any) -> bool:
+    """Whether `run` is a root the HOST opened around a call made now, with
+    agent `agent` current.
+
+    A root the host opened is one no call's framework did. A call made under
+    it while the agent current at its open is still the current one is the
+    host's own call around which it was opened: `with trace(...)` around
+    `Runner.run` in the host's code, outside every run, and the same inside a
+    tool that opens its own trace around a run of its own. A call made while
+    an agent that opened since is current — from that agent's tool, guardrail
+    or hook, under a trace that agent's run is under — is nested in that run,
+    which handles its failure, so it fails no root itself.
+    """
+    return run is not None and run.get("call") is None and run.get("opened_in") is agent
 
 
 def failure_leaving(host_inflight: BaseException | None) -> str | None:

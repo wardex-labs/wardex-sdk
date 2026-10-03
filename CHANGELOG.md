@@ -294,14 +294,18 @@ All notable changes to this project are documented here. The format follows
   raised. When the root is a trace you opened yourself (`with trace(...)`
   around the run), a run inside it that raised to your code fails that root
   even when no agent was running at the time, and even if you catch the
-  exception inside the trace, as a retry does. A tool failure the framework
-  handled and moved past still marks only the tool span, a nested run that
-  raised to a tool (agent-as-tool, or a tool that runs an agent itself and
-  handles its failure) marks only its own agent, and a cancelled run is not a
-  failure. Should a framework release close the root before the exception
-  reaches your code (for `run_streamed`, before its run ends), the run is
-  counted under `adapters.openai_agents.run_raised_after_root_ok` and said
-  once instead of shipping a silent OK.
+  exception inside the trace, as a retry does. The same holds for a trace one
+  of your tools opens around a run of its own, which says nothing about the
+  run the tool is in. A tool failure the framework handled and moved past
+  still marks only the tool span, a nested run that raised to a tool
+  (agent-as-tool, or a tool that runs an agent itself and handles its
+  failure) marks only its own agent, and the tool's own trace if it opened
+  one, and a cancelled run is not a failure. Should a framework release close
+  the root before the exception reaches your code (for `run_streamed`, before
+  its run ends), the run is counted under
+  `adapters.openai_agents.run_raised_after_root_ok` and said once instead of
+  shipping a silent OK; only the root the framework opened for that call is
+  checked, so a run whose failure was reported is never counted.
 - **Values the SDK makes itself are no longer masked as a card number, and
   a span's masking record no longer reports a card that was never there.**
   The case that showed it is a span's connection id, a value the SDK makes
