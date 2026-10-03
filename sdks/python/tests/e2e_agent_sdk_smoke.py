@@ -8,10 +8,13 @@ dump raw inbound stream-json lines for parser golden tests.
 WARDEX_SMOKE_SCENARIO picks a prompt that makes the CLI split ONE model
 response across several `assistant` lines, which is what the replay fixtures
 under `fixtures/agent_sdk_stream/` hold:
-    text_then_tool  — a sentence, then one Bash call
-    parallel_tools  — three Bash calls in one response
-A scenario runs with only the Bash tool, no settings sources, in a fresh
-temporary directory.
+    text_then_tool    — a sentence, then one Bash call
+    parallel_tools    — three Bash calls in one response
+    background_agent  — a sub-agent launched in the background, whose
+                        response arrives after the turn that launched it
+The two Bash scenarios run with only the Bash tool; background_agent runs
+with only the Agent tool and one background sub-agent definition. Every
+scenario runs with no settings sources, in a fresh temporary directory.
 """
 
 import asyncio
@@ -32,6 +35,10 @@ SCENARIOS = {
         "with these three commands: echo one ; echo two ; echo three. "
         "Do not write any text before the tool calls. "
         "After all three results, reply with the single word: done."
+    ),
+    "background_agent": (
+        "Launch the pinger agent with the Agent tool. It runs in the background. "
+        "Do not wait for it: right after launching it, reply with the single word: started."
     ),
 }
 
@@ -79,7 +86,26 @@ async def main() -> int:
 
         prompt = "What is 2 + 2? Answer with one number."
         options = None
-        if scenario is not None:
+        if scenario == "background_agent":
+            prompt = SCENARIOS[scenario]
+            options = claude_agent_sdk.ClaudeAgentOptions(
+                tools=["Agent"],
+                allowed_tools=["Agent"],
+                cwd=tempfile.mkdtemp(prefix="wardex-smoke-"),
+                max_turns=6,
+                setting_sources=[],
+                model="sonnet",
+                agents={
+                    "pinger": claude_agent_sdk.AgentDefinition(
+                        description="Replies with one word. Always launch it in the background.",
+                        prompt="Reply with the single word: pong. Use no tools.",
+                        tools=[],
+                        model="haiku",
+                        background=True,
+                    )
+                },
+            )
+        elif scenario is not None:
             prompt = SCENARIOS[scenario]
             options = claude_agent_sdk.ClaudeAgentOptions(
                 tools=["Bash"],
