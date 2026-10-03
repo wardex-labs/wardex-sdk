@@ -286,7 +286,7 @@ _OVERSIZED_BUDGET = {
     "_client.py": 1586,
     "_adapters/_context.py": 1305,
     "_interceptors/_seam.py": 1191,
-    "_adapters/_langgraph.py": 1032,
+    "_adapters/_langgraph.py": 1035,
     # Raised by exactly one member (h2_request_evicted, 53): the closed
     # Limitation enum cannot move a member out, and the census demands each
     # one carry its own provenance docstring in this module. Every line of

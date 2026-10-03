@@ -112,6 +112,7 @@ from ._langgraph_links import (
     _config_merge,
     _InNode,
     _node_links,
+    _NodeAwareEntry,
     _record_graph_nodes,
     _resume_link,
     _run_configurable,
@@ -241,21 +242,20 @@ def _conversation_of(
     return framework_conversation(ctx, thread_id, shadowed_counter="thread_id_shadowed_by_host")[0]
 
 
-def _describe_run(adapter: Any, graph: Any, args: Any, kwargs: Any, run: Scope) -> None:
+def _describe_run(
+    adapter: Any, graph: Any, args: Any, kwargs: Any, made_in_node: bool, run: Scope
+) -> None:
     """MANDATORY half first, OPTIONAL half under its own guard.
 
-    The mandatory half is guarded too, and that is not a softening of the rule
-    — it is the one case the rule's own asymmetry allows. `INVOKE_WORKFLOW`
-    requires `workflow_name`, and a describe that raises costs the WHOLE RUN:
-    `enter` abandons the unit, the host's body then runs with nothing ambient,
-    and every node underneath orphans at confidence 0.0. So the question is not
-    "loud or silent" but *what is the loudest thing that is still true*, and for
-    this field there is a total answer — LangGraph's own default name — where
-    for an unknown framework read there is not.
+    The mandatory half is guarded too, and that is not a softening of the rule — it is the one case
+    the rule's own asymmetry allows. `INVOKE_WORKFLOW` requires `workflow_name`, and a describe that
+    raises costs the WHOLE RUN: `enter` abandons the unit, the host's body then runs with nothing
+    ambient, and every node underneath orphans at confidence 0.0. So the question is not "loud or
+    silent" but *what is the loudest thing that is still true*, and for this field there is a total
+    answer — LangGraph's own default name — where for an unknown framework read there is not.
 
-    `name` is bound to that answer BEFORE the guard and the guard's last
-    statement is its only assignment, so a read that moved costs one counter
-    and a degraded name instead of a shattered trace.
+    `name` is bound to that answer BEFORE the guard and the guard's last statement is its only
+    assignment, so a read that moved costs a counter and a degraded name, not a shattered trace.
     """
     name = _DEFAULT_GRAPH_NAME
     with adapter._ctx.guard("describe_run_name"):
@@ -267,12 +267,14 @@ def _describe_run(adapter: Any, graph: Any, args: Any, kwargs: Any, run: Scope) 
         thread_id = _thread_id(conf)
         if thread_id is not None:
             run.draft.set_extra("wardex.langgraph.thread_id", thread_id)
-            _resume_link(adapter, graph, conf, thread_id, run)  # top-level, checkpointed runs only
+            _resume_link(adapter, graph, conf, thread_id, run, made_in_node)  # top-level only
     with adapter._ctx.guard("describe_run_nodes"):
         _record_graph_nodes(graph, run)
 
 
-def _describe_remote_run(adapter: Any, graph: Any, args: Any, kwargs: Any, run: Scope) -> None:
+def _describe_remote_run(
+    adapter: Any, graph: Any, args: Any, kwargs: Any, made_in_node: bool, run: Scope
+) -> None:
     """`_describe_run` plus the one key that marks the run as remote.
 
     The extra is a literal — no framework read, so no extra guard: it is on
@@ -282,7 +284,7 @@ def _describe_remote_run(adapter: Any, graph: Any, args: Any, kwargs: Any, run: 
     `_graph_name` is total here, and the LangGraph default-name fallback stays
     honest for the one shape that could still reach it.
     """
-    _describe_run(adapter, graph, args, kwargs, run)
+    _describe_run(adapter, graph, args, kwargs, made_in_node, run)
     run.draft.set_extra("wardex.langgraph.remote", "true")
 
 
@@ -485,30 +487,28 @@ def _mk_stream(
     describe_fn: Callable[..., None],
     finalized: str,
     off_carrier: str,
+    made_in_node: bool,
 ) -> Callable[..., Any]:
     """A GENERATOR FUNCTION, so the scope's lifetime is the iteration's.
 
-    A plain function returning `original(...)` would close the run before the
-    first node ran. `yield from` also keeps `send`/`throw` intact, which is what
-    `interrupt()`/resume drives through this seam.
+    A plain function returning `original(...)` would close the run before the first node ran.
+    `yield from` also keeps `send`/`throw` intact, which `interrupt()`/resume drives through here.
 
-    Nothing computed lives in the `enter` header: every argument there is
-    evaluated BEFORE `__enter__`, i.e. outside every failure boundary wardex
-    has, so a framework read in a header breaks the HOST and no guard can ever
-    see it. Measured — a user config whose `.get` raises turns `graph.invoke()`
-    into a `KeyError` and emits zero spans. The prologue is only ever allowed
-    to compute a `subject`, because a `None` subject degrades to the bare
-    operation name while a missing required key deletes the span.
+    Nothing computed lives in the `enter` header: every argument there is evaluated BEFORE
+    `__enter__`, i.e. outside every failure boundary wardex has, so a framework read in a header
+    breaks the HOST and no guard can ever see it. Measured — a user config whose `.get` raises turns
+    `graph.invoke()` into a `KeyError` and emits zero spans. The prologue is only ever allowed to
+    compute a `subject`, because a `None` subject degrades to the bare operation name while a
+    missing required key deletes the span.
 
-    The abandonment status is deliberate: a run the host walked away from
-    ships ERROR carrying the interpreter's own exception name
-    (`GeneratorExit` here). `GeneratorExit` is NOT classified as control
-    flow, because control flow ships UNSET and UNSET claims a run completed
-    cleanly. The two `finally` counters below are the operator's handle on
-    the abandons that never finalize or finalize elsewhere.
+    The abandonment status is deliberate: a run the host walked away from ships ERROR carrying the
+    interpreter's own exception name (`GeneratorExit` here). `GeneratorExit` is NOT classified as
+    control flow, because control flow ships UNSET and UNSET claims a run completed cleanly. The two
+    `finally` counters below are the operator's handle on the abandons that never finalize or
+    finalize elsewhere.
 
-    Serves both the local (`Pregel`) and remote (`RemoteGraph`) run entry —
-    the labels are the only difference.
+    Serves the local (`Pregel`) and the remote (`RemoteGraph`) entry, the labels the only change,
+    and `_NodeAwareEntry` builds it twice for each: `made_in_node` says where the run was created.
     """
 
     def wrapper(self: Any, *args: Any, **kwargs: Any) -> Any:
@@ -520,7 +520,7 @@ def _mk_stream(
         with ctx.guard(prologue):
             subject = _graph_name(self)
             conversation = _conversation_of(ctx, adapter, self, args, kwargs)
-        describe = partial(describe_fn, adapter, self, args, kwargs)
+        describe = partial(describe_fn, adapter, self, args, kwargs, made_in_node)
         carrier = threading.current_thread()
         try:
             with ctx.enter(
@@ -559,21 +559,20 @@ def _mk_astream(
     describe_fn: Callable[..., None],
     finalized: str,
     off_carrier: str,
+    made_in_node: bool,
 ) -> Callable[..., Any]:
     """The async twin. Its `with` body is the one shape C-S6 admits for this.
 
-    An async generator cannot delegate with `yield from` — that is a syntax
-    error — so `async for chunk in original(...): yield chunk` is the only way
-    to hold a scope across the framework's own async iteration, and the body
-    rule admits exactly that shape and nothing computed inside it.
+    An async generator cannot delegate with `yield from` — that is a syntax error — so
+    `async for chunk in original(...): yield chunk` is the only way to hold a scope across the
+    framework's own async iteration, and the body rule admits exactly that shape and nothing
+    computed inside it.
 
-    Abandonment policy is `_mk_stream`'s, with one more spelling: the loop's
-    finalizer closes an abandoned async generator on its own task and the
-    wrapper reads `CancelledError`, while a host's own `aclose()` reads
-    `GeneratorExit`.
+    Abandonment policy is `_mk_stream`'s, with one more spelling: the loop's finalizer closes an
+    abandoned async generator on its own task and the wrapper reads `CancelledError`, while a host's
+    own `aclose()` reads `GeneratorExit`.
 
-    Serves both the local (`Pregel`) and remote (`RemoteGraph`) run entry —
-    the labels are the only difference.
+    Serves both run entries and is built twice for each, exactly as `_mk_stream` is.
     """
 
     async def wrapper(self: Any, *args: Any, **kwargs: Any) -> Any:
@@ -587,7 +586,7 @@ def _mk_astream(
         with ctx.guard(prologue):
             subject = _graph_name(self)
             conversation = _conversation_of(ctx, adapter, self, args, kwargs)
-        describe = partial(describe_fn, adapter, self, args, kwargs)
+        describe = partial(describe_fn, adapter, self, args, kwargs, made_in_node)
         carrier = asyncio.current_task()
         try:
             with ctx.enter(
@@ -822,7 +821,8 @@ class LangGraphAdapter(AdapterInterface):
         patches.patch(
             pregel_mod.Pregel,
             "stream",
-            _mk_stream(
+            _NodeAwareEntry(
+                _mk_stream,
                 orig_stream,
                 self,
                 site="pregel.stream",
@@ -836,7 +836,8 @@ class LangGraphAdapter(AdapterInterface):
         patches.patch(
             pregel_mod.Pregel,
             "astream",
-            _mk_astream(
+            _NodeAwareEntry(
+                _mk_astream,
                 orig_astream,
                 self,
                 site="pregel.astream",
@@ -915,7 +916,8 @@ class LangGraphAdapter(AdapterInterface):
         ctx.patches.patch(
             remote_cls,
             "stream",
-            _mk_stream(
+            _NodeAwareEntry(
+                _mk_stream,
                 orig_rstream,
                 self,
                 site="remote.stream",
@@ -929,7 +931,8 @@ class LangGraphAdapter(AdapterInterface):
         ctx.patches.patch(
             remote_cls,
             "astream",
-            _mk_astream(
+            _NodeAwareEntry(
+                _mk_astream,
                 orig_rastream,
                 self,
                 site="remote.astream",

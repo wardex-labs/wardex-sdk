@@ -5,7 +5,8 @@ one question only — which earlier spans caused this one. For a node task the
 answer comes from strings the compiler prints (`task.triggers`) plus the node
 names the run publishes; for a run it is the previous top-level run on the
 same checkpoint thread (`_resume_link`), which first takes knowing the config
-the run executes under (`_run_configurable`). Nothing here imports langgraph
+the run executes under (`_run_configurable`) and whether a node started or
+created it (`_InNode`, `_NodeAwareEntry`). Nothing here imports langgraph
 — the one LangGraph function called, its config merge, is handed over by
 `install()` — opens a span or chooses a parent: every edge is a LINK,
 resolved by selector through the registry, so the tree-shape claim the seam
@@ -16,6 +17,7 @@ from __future__ import annotations
 
 import contextvars
 from collections.abc import Callable
+from types import MethodType
 from typing import Any
 
 from .._assembly import Limitation, LinkReason, UnitKey, report_once
@@ -68,17 +70,18 @@ _GRAPH_NODES: contextvars.ContextVar[tuple[str, frozenset[str]] | None] = contex
 )
 
 #: True while a node task this adapter traced is executing — set and reset by
-#: `_InNode` around the node seam — and read by `_resume_link`: a run started
-#: while it is True is a subgraph of the run that node belongs to. The run's
-#: own config cannot always say so: a node that calls `sub.invoke(state,
-#: {"configurable": {"thread_id": ...}})` hands it no checkpoint namespace,
-#: and LangGraph drops the inherited one for a call that names its own thread
-#: — so a subgraph with a checkpointer of its own, started that way, is a
-#: checkpointed root run in LangGraph's eyes, and with the parent's thread id
-#: it would link to the enclosing run and alias the thread away from the next
-#: turn. LangGraph's ambient config (`get_config()`) would say it too, except
-#: on Python 3.10 inside an async node, where LangGraph cannot carry it; this
-#: variable rides the same context copies as the run's units.
+#: `_InNode` around the node seam — and read by `_resume_link`: a run started,
+#: or created (`_NodeAwareEntry`), while it is True is a subgraph of the run
+#: that node belongs to. The run's own config cannot always say so: a node
+#: that calls `sub.invoke(state, {"configurable": {"thread_id": ...}})` hands
+#: it no checkpoint namespace, and LangGraph drops the inherited one for a
+#: call that names its own thread — so a subgraph with a checkpointer of its
+#: own, started that way, is a checkpointed root run in LangGraph's eyes, and
+#: with the parent's thread id it would link to the enclosing run and alias the
+#: thread away from the next turn. LangGraph's ambient config (`get_config()`)
+#: would say it too, except on Python 3.10 inside an async node, where
+#: LangGraph cannot carry it; this variable rides the same context copies as
+#: the run's units.
 _IN_NODE: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "wardex_langgraph_in_node", default=False
 )
@@ -338,7 +341,7 @@ def _checkpointed(adapter: Any, graph: Any, conf: dict[str, Any]) -> bool:
 
 
 def _resume_link(
-    adapter: Any, graph: Any, conf: dict[str, Any], thread_id: Any, run: Scope
+    adapter: Any, graph: Any, conf: dict[str, Any], thread_id: Any, run: Scope, made_in_node: bool
 ) -> None:
     """`RESUMED_FROM` the previous top-level run on this thread, then the alias for the next.
 
@@ -351,10 +354,11 @@ def _resume_link(
     links to something that did not happen. A run is a subgraph when the
     config it executes under names a checkpoint namespace, or when it is
     started from inside a node task of an enclosing LangGraph run
-    (`_IN_NODE`). And a run with no checkpointer (`_checkpointed`) resumes
-    nothing — the shape a subgraph takes when a node starts it on a plain
-    worker thread, where neither signal reaches it. Any of the three links and
-    aliases nothing, and nothing is counted, because no resume was lost. A
+    (`_IN_NODE`) or created there (`made_in_node`, see `_NodeAwareEntry`).
+    And a run with no checkpointer (`_checkpointed`) resumes nothing — the
+    shape a subgraph takes when a node starts it on a plain worker thread,
+    where none of those signals reaches it. Any of these links and aliases
+    nothing, and nothing is counted, because no resume was lost. A
     subgraph compiled with `checkpointer=True` keeps its own state across
     turns, and that continuation is not linked either: the link means "this
     turn continues that turn", which is the top-level run's to say.
@@ -365,10 +369,12 @@ def _resume_link(
     top-level runs that keep one thread id's state in DIFFERENT savers link
     as turns of one thread, though the second starts from nothing: two graphs
     compiled with separate savers that share a thread id, and a subgraph with
-    a saver of its own started on such a plain worker thread under its
-    parent's thread id, which LangGraph runs as a root run of that thread in
-    its own saver. Nothing reaching this seam tells either from a second
-    turn; `test_langgraph_links.py` pins both shapes as the known boundary.
+    a saver of its own under its parent's thread id that LangGraph runs as a
+    root run of that thread in its own saver — started on such a plain
+    worker thread, or created in a node through a LangChain generator around
+    the graph and drained after the node returned (`_NodeAwareEntry`).
+    Nothing reaching this seam tells any of them from a second turn;
+    `test_langgraph_links.py` pins those shapes as the known boundary.
 
     ORDER IS LOAD-BEARING: link FIRST, alias AFTER. Aliased first, live-first
     resolution would answer this very run — the self-link guard would refuse
@@ -382,7 +388,8 @@ def _resume_link(
     attest. Cross-process resume stays the documented boundary: nothing
     persists an identity across processes.
     """
-    if conf.get(_CHECKPOINT_NS) or _IN_NODE.get() or not _checkpointed(adapter, graph, conf):
+    subgraph = conf.get(_CHECKPOINT_NS) or made_in_node or _IN_NODE.get()
+    if subgraph or not _checkpointed(adapter, graph, conf):
         return
     key = UnitKey("langgraph.thread_id", str(thread_id))
     run.link(LinkReason.RESUMED_FROM, key, expected=False)
@@ -415,3 +422,45 @@ class _InNode:
 
     def __exit__(self, *exc: object) -> None:
         _IN_NODE.reset(self._token)
+
+
+class _NodeAwareEntry:
+    """A patched run entry that learns, when it is looked up, whether that is in a node.
+
+    Calling a generator function runs none of it: the body starts at the first
+    `next()`, on whatever pumps it. So a `sub.stream(...)` a node creates and
+    returns undrained starts its run at top level, after the enclosing run has
+    finished — `_IN_NODE` is False there, and the config, naming its own
+    thread, carries no namespace — and with a saver of its own it would link
+    to the enclosing run and take the thread over, though its saver holds
+    nothing for that thread. The entry is looked up where the call is written, so this
+    descriptor reads the marker at the lookup and hands back the seam the
+    factory built for that answer (`made_in_node`), and `_resume_link` takes a
+    run created or started inside a node for a subgraph.
+
+    Both seams are built once, at install, so a lookup adds one context
+    variable read to the bound method any method lookup makes, and either
+    seam is a generator function: what `inspect.isgeneratorfunction` says of
+    `graph.stream` — which LangChain reads off a callable it is handed, to
+    decide how to call it — is unchanged, and on the class the lookup hands
+    back the function itself, as a function's would. Only a lookup on the
+    graph itself comes early enough. A LangChain generator around the graph
+    (`astream_events`, a `with_retry()` binding) looks the entry up when it is
+    first iterated, so a run created through one and drained after the node
+    returned is top-level to everything that reaches this seam: the known
+    boundary again, pinned in `test_langgraph_links.py` with `with_retry()`.
+
+    A non-data descriptor, as a function is, so an instance attribute still
+    shadows it and `PatchSet` restores the original by identity; and total —
+    `ContextVar.get` with a default cannot fail — because it runs on the
+    host's own lookup, outside every guard.
+    """
+
+    __slots__ = ("_entries",)
+
+    def __init__(self, factory: Callable[..., Any], /, *args: Any, **kwargs: Any) -> None:
+        self._entries = tuple(factory(*args, made_in_node=flag, **kwargs) for flag in (False, True))
+
+    def __get__(self, obj: Any, owner: Any = None) -> Any:
+        entry = self._entries[1 if _IN_NODE.get() else 0]
+        return entry if obj is None else MethodType(entry, obj)

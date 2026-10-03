@@ -540,6 +540,56 @@ def test_an_async_node_starting_a_subgraph_with_its_own_config_links_nothing(ins
     _assert_only_the_second_turn_links_to_the_first(installed.spans, "conv")
 
 
+def test_a_subgraph_stream_a_node_creates_but_the_host_drains_later_links_nothing(installed):  # noqa: F811,E501
+    """Calling a generator function runs none of it, so a `sub.stream(...)` a
+    node creates and returns undrained starts its run wherever it is first
+    iterated: here at top level, after the enclosing run has finished, with
+    neither the node marker nor a namespace in sight, a saver of its own and
+    the parent's thread named. It linked to the enclosing run although its
+    saver held nothing for that thread, and the next turn linked to it. Where
+    the run was CREATED classifies it as well as where it starts."""
+    sub = _sub_graph(checkpointer=InMemorySaver())
+    held = {}
+
+    def node(state):
+        held["run"] = sub.stream(state, {"configurable": {"thread_id": "conv"}})
+        return {"trail": ["deferred"]}
+
+    app = _parent_graph(node)
+    config = {"configurable": {"thread_id": "conv"}}
+    app.invoke({"trail": []}, config)
+    list(held.pop("run"))
+    assert sub.get_state(config).values["trail"] == ["before", "inner"], "it resumed nothing"
+    app.invoke({"trail": []}, config)
+    list(held.pop("run"))
+
+    _assert_only_the_second_turn_links_to_the_first(installed.spans, "conv")
+
+
+def test_an_async_subgraph_stream_a_node_creates_but_the_host_drains_later_links_nothing(installed):  # noqa: F811,E501
+    import asyncio
+
+    sub = _sub_graph(checkpointer=InMemorySaver())
+    held = {}
+
+    async def node(state):
+        held["run"] = sub.astream(state, {"configurable": {"thread_id": "conv"}})
+        return {"trail": ["deferred"]}
+
+    app = _parent_graph(node)
+    config = {"configurable": {"thread_id": "conv"}}
+
+    async def two_turns():
+        for _ in range(2):
+            await app.ainvoke({"trail": []}, config)
+            async for _chunk in held.pop("run"):
+                pass
+
+    asyncio.run(two_turns())
+
+    _assert_only_the_second_turn_links_to_the_first(installed.spans, "conv")
+
+
 def test_a_run_whose_config_names_a_checkpoint_namespace_links_nothing(installed):  # noqa: F811
     """The other signal, alone: the subgraph is started in an EMPTY context, so
     no enclosing task is visible to it, but the config it was handed names its
@@ -645,6 +695,35 @@ def test_a_subgraph_with_its_own_saver_on_a_plain_worker_thread_links_as_a_turn(
 
     parent1, parent2 = _runs_named(installed.spans, "Parent")
     sub1, _ = _runs_named(installed.spans, "Sub")
+    assert [lk.span_id for lk in sub1.links] == [parent1.context.span_id]  # the gap
+    assert [lk.span_id for lk in parent2.links] == [sub1.context.span_id]  # and its echo
+
+
+def test_a_subgraph_a_node_creates_through_a_langchain_wrapper_and_leaves_undrained_links_as_a_turn(  # noqa: E501
+    installed,  # noqa: F811
+):
+    """THE SAME BOUNDARY through a LangChain generator, pinned for the same reason.
+
+    `with_retry()` wraps the graph in a binding whose `stream` is a generator
+    of its own, so the graph's entry is looked up only when the host first
+    iterates it — at top level, after the node returned — and nothing the run
+    seam sees tells the run from a second turn. Created with the graph's own
+    `stream`, the same run is classified as a subgraph (see above)."""
+    sub = _sub_graph(checkpointer=InMemorySaver())
+    held = {}
+
+    def node(state):
+        held["run"] = sub.with_retry().stream(state, {"configurable": {"thread_id": "conv"}})
+        return {"trail": ["deferred"]}
+
+    app = _parent_graph(node)
+    config = {"configurable": {"thread_id": "conv"}}
+    app.invoke({"trail": []}, config)
+    list(held.pop("run"))
+    app.invoke({"trail": []}, config)
+
+    parent1, parent2 = _runs_named(installed.spans, "Parent")
+    (sub1,) = _runs_named(installed.spans, "Sub")
     assert [lk.span_id for lk in sub1.links] == [parent1.context.span_id]  # the gap
     assert [lk.span_id for lk in parent2.links] == [sub1.context.span_id]  # and its echo
 

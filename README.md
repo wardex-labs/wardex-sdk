@@ -970,8 +970,10 @@ diagnostic line (traceback under `debug=True`).
   per request over the same database resumes it — so runs that keep that
   id's state in different checkpointers still link as turns of one thread:
   two graphs compiled with separate checkpointers that share a thread id, or
-  a subgraph with a checkpointer of its own that a node starts on a plain
-  worker thread (no context copied) under the parent's thread id. A node
+  a subgraph with a checkpointer of its own under the parent's thread id
+  that a node starts on a plain worker thread (no context copied), or
+  creates through a LangChain wrapper (`astream_events`, `with_retry()`) and
+  leaves for you to drain after it returns. A node
   span's `wardex.step.index` is LangGraph's superstep number on that
   checkpoint thread, not the node's position in the run: a second turn on
   one thread continues the count (and the input and `__start__` supersteps
