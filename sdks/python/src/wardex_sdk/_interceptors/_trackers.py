@@ -17,7 +17,7 @@ from .._assembly import Limitation, counters, parent_is_closed_unit
 from .._protocol import WsParser
 from .._protocol._http1 import Http1RequestParser, Http1ResponseParser, declares_event_stream
 from .._protocol._http2 import Http2Parser
-from .._types import ConversationContext, SpanContext
+from .._types import ConversationContext, ParsedMessage, SpanContext
 from ._h2_issuer import IssuerLink
 
 
@@ -89,10 +89,9 @@ def _name_path(target: str) -> str:
 def _url_target(txn: _Txn, withhold: bool = False) -> str:
     """The request target a span's URL carries: the whole target as sent.
 
-    The query rides in the URL like a body rides in the payload, and under the
-    same policy: when the seam withholds a transaction's bodies (capture
-    admitted only by wardex's own degradation), the query is withheld with
-    them. Credentials in it are the native masker's to replace, and a URL's
+    The query rides in the URL like a body rides in the payload, and under the same policy: when the
+    seam withholds a transaction's bodies (capture admitted only by wardex's own degradation), the
+    query is withheld with them. Credentials in it are the native masker's to replace, and a URL's
     userinfo is replaced even when masking is off.
     """
     if withhold or txn.target is None:
@@ -162,6 +161,8 @@ class _Txn:
     #: ships a size only for a half that was.
     request_counted: bool = True
     response_counted: bool = True
+    #: `ParsedMessage.incomplete`: status and headers were observed, how the exchange ended was not.
+    response_cut: bool = False
     #: The HTTP/2 stream this transaction rode; None on HTTP/1.
     stream_id: int | None = None
     # Capture-limitation markers the protocol parser attached to this
@@ -300,68 +301,87 @@ class _Http1Tracker:
                 self._resp_cum -= msg.header_len
                 continue
             # --- Regular HTTP response (existing behavior) ---
-            now = time.time_ns()
-            ttfb = (
-                max(0.0, (self._resp_first_ns - self._req_start_ns) / 1e6)
-                if self._req_start_ns and self._resp_first_ns
-                else None
-            )
-            ttft = _ttft_from_marks(self._resp_marks, msg.header_len, self._req_start_ns)
-            out.append(
-                _Txn(
-                    method=self._method or "?",
-                    path=_name_path(self._path or "/"),
-                    target=self._path or "/",
-                    status=msg.status_code or 0,
-                    request_body=self._req_body,
-                    response_body=msg.body,
-                    parent=self._parent,
-                    parent_closed=self._parent_closed,
-                    conversation=self._conversation,
-                    start_ns=self._req_start_ns or now,
-                    end_ns=now,
-                    ttfb_ms=ttfb,
-                    truncated=self._req_truncated or msg.truncated,
-                    request_counted=self._method is not None and not self._req_truncated,
-                    response_counted=not msg.truncated,
-                    limitations=_merge_markers(self._req_limitations, msg.limitations),
-                    version="1.1",
-                    ttft_ms=ttft,
-                    event_stream=declares_event_stream(_header_get(msg.headers, "content-type")),
-                    content_encoding=_header_get(msg.headers, "content-encoding"),
-                )
-            )
-            self._method = None
-            self._path = None
-            self._req_body = b""
-            self._req_truncated = False
-            self._req_limitations = ()
-            self._req_start_ns = 0
-            self._resp_first_ns = 0
-            self._parent = self._conversation = None
-            self._parent_closed = False
-            self._resp_cum = 0
-            self._resp_marks = []
-            self._expect_ws = False
-            self._resp_raw = b""
+            out.append(self._response_txn(msg, time.time_ns()))
+            self._reset()
         return out
+
+    def on_response_eof(self) -> list[_Txn]:
+        """The peer closed its side (a read asked for bytes, got none): that ENDS a body with no
+        framing, so it ships whole, now; one whose framing promised more ships marked."""
+        msg = self._resp.flush(peer_closed=True)
+        if msg is None:
+            return []
+        txn = self._response_txn(msg, time.time_ns())
+        self._reset()
+        return [txn]
+
+    def _reset(self) -> None:
+        """Forget the finished exchange; the next request starts clean."""
+        self._method = None
+        self._path = None
+        self._req_body = b""
+        self._req_truncated = False
+        self._req_limitations = ()
+        self._req_start_ns = 0
+        self._resp_first_ns = 0
+        self._parent = self._conversation = None
+        self._parent_closed = False
+        self._resp_cum = 0
+        self._resp_marks = []
+        self._expect_ws = False
+        self._resp_raw = b""
+
+    def _response_txn(self, msg: ParsedMessage, now: int) -> _Txn:
+        """The transaction a final response completes at `now`. An `incomplete` one (the body is
+        partial) is marked `FRAME_PARSE_FAILED` and `response_cut`: its 2xx is not a success."""
+        ttfb = (
+            max(0.0, (self._resp_first_ns - self._req_start_ns) / 1e6)
+            if self._req_start_ns and self._resp_first_ns
+            else None
+        )
+        ttft = _ttft_from_marks(self._resp_marks, msg.header_len, self._req_start_ns)
+        cut = (Limitation.FRAME_PARSE_FAILED,) if msg.incomplete else ()
+        return _Txn(
+            method=self._method or "?",
+            path=_name_path(self._path or "/"),
+            target=self._path or "/",
+            status=msg.status_code or 0,
+            request_body=self._req_body,
+            response_body=msg.body,
+            parent=self._parent,
+            parent_closed=self._parent_closed,
+            conversation=self._conversation,
+            start_ns=self._req_start_ns or now,
+            end_ns=now,
+            ttfb_ms=ttfb,
+            truncated=self._req_truncated or msg.truncated,
+            request_counted=self._method is not None and not self._req_truncated,
+            response_counted=not msg.truncated,
+            response_cut=msg.incomplete,
+            limitations=_merge_markers(self._req_limitations, msg.limitations, cut),
+            version="1.1",
+            ttft_ms=ttft,
+            event_stream=declares_event_stream(_header_get(msg.headers, "content-type")),
+            content_encoding=_header_get(msg.headers, "content-encoding"),
+        )
 
     def disabled_reason(self) -> str | None:
         return self._resp.disabled_reason() or self._req.disabled_reason()
 
-    def on_connection_close(self, marker: Limitation) -> list[_Txn]:
-        """The connection ended. Nothing here survives it.
-
-        A request whose response never arrived is not a transaction: there is no
-        status, no end, and no ttfb, and a span assembled from the half of it
-        that exists would assert things the seam never observed. So the accrued
-        buffers are released — promptly, rather than whenever the last reference
-        to this tracker happens to go — and the caller gets nothing to emit.
-        """
+    def on_connection_close(self, marker: Limitation, *, still_open: bool = False) -> list[_Txn]:
+        """Closed: a response in flight whose headers arrived ships, as what arrived and marked —
+        its end (the peer's EOF, `on_response_eof`) was not seen. No headers, no transaction:
+        nothing was observed. `marker` is the seam's reason, not this span's. `still_open` (FIFO
+        cap, `uninstall()`): nothing ended, nothing ships. The buffers are released either way."""
+        out: list[_Txn] = []
+        if not still_open:
+            msg = self._resp.flush(peer_closed=False)
+            if msg is not None:
+                out.append(self._response_txn(msg, time.time_ns()))
         self._req_body = b""
         self._resp_raw = b""
         self._resp_marks = []
-        return []
+        return out
 
 
 class _Http2Tracker:
@@ -452,17 +472,15 @@ class _Http2Tracker:
         return self._ship(txns)
 
     def _ship(self, txns: list[Any]) -> list[_Txn]:
-        """`_mk` every native transaction — it pops the latch entry, so skipping
-        one would leak it — and keep the ones that describe an exchange.
+        """`_mk` every native transaction — it pops the latch entry, so skipping one would leak it —
+        and keep the ones that describe an exchange.
 
-        Two kinds are left out. status==0 is a degenerate transaction. A
-        transaction with no method that the stream table did NOT evict is a
-        response whose request this parser never observed: the host opened
-        the stream before capture attached. Shipping it meant a `? /` span with
-        no marker, indistinguishable from a request with no method and no path,
-        and with a start instant invented at the response. It is counted
-        instead. `? /` ships only with `H2_REQUEST_EVICTED`, which names the
-        bound that took the request.
+        Two kinds are left out. status==0 is a degenerate transaction. A transaction with no method
+        that the stream table did NOT evict is a response whose request this parser never observed:
+        the host opened the stream before capture attached. Shipping it meant a `? /` span with no
+        marker, indistinguishable from a request with no method and no path, and with a start
+        instant invented at the response. It is counted instead. `? /` ships only with
+        `H2_REQUEST_EVICTED`, which names the bound that took the request.
         """
         out: list[_Txn] = []
         for t in txns:
@@ -480,7 +498,7 @@ class _Http2Tracker:
         one parser — so unlike HTTP/1 there is a single reason to ask for."""
         return self._conn.disabled_reason()
 
-    def on_connection_close(self, marker: Limitation) -> list[_Txn]:
+    def on_connection_close(self, marker: Limitation, *, still_open: bool = False) -> list[_Txn]:
         """Release the per-stream latch — the eviction the entries were waiting for.
 
         A latch entry is two references and two scalars, so this is small
@@ -723,7 +741,7 @@ class _WebSocketTracker:
             return [self._build_txn(())]
         return []
 
-    def flush(self, marker: Limitation) -> list[_Txn]:
+    def flush(self, marker: Limitation, *, still_open: bool = False) -> list[_Txn]:
         """The socket closed or the seam let go before the closing handshake completed.
         `WS_NO_CLOSE` says no Close frame crossed at all, so a session that saw one does not take
         it; the seam decides from the ending whether the counts are whole."""

@@ -277,6 +277,31 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- **An HTTP/1 response that ends with its connection now becomes a span.**
+  A response with no `Content-Length` and no chunked encoding is ended by the
+  server closing the connection, and such calls — a streaming chat call from
+  a server that answers that way included — produced no span at all; neither
+  did a response the connection cut short of the length it declared, or one
+  the client stopped reading. Now a body with no framing ships when the
+  server's close arrives, as an ordinary span: the whole body, its size, its
+  status and its timing. A response whose end was not observed — a
+  `Content-Length` not reached, a chunked body short of its last chunk, a
+  body the client let go before the server finished — ships as what arrived,
+  marked `frame_parse_failed` and truncated, with no response size and no
+  finish reason made up, and with status unset when the status line said
+  2xx: the success was never seen (a 4xx/5xx stays an error). A request whose
+  response headers never arrived still makes no span, since nothing was
+  observed to report.
+- **A provider error in the middle of a stream now fails the chat span.** When
+  an OpenAI Chat Completions stream sent a top-level `error` chunk, or an
+  Anthropic Messages stream sent an `error` event (an `overloaded_error`
+  mid-stream is the documented case), the span shipped as a success: status
+  OK, no finish reason, and nothing in the reassembled body naming the
+  failure. Now the error object is kept in the reassembled body, the finish
+  reason is `error`, and the span's status is ERROR with the provider's own
+  error class (its `code`, else its `type`) as `error.type`, or `_OTHER` when
+  the error names none. An HTTP 4xx/5xx keeps its status code as
+  `error.type`, as before.
 - **Values the SDK makes itself are no longer masked as a card number, and
   a span's masking record no longer reports a card that was never there.**
   The case that showed it is a span's connection id, a value the SDK makes

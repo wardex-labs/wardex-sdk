@@ -44,6 +44,15 @@ _HTTP_METHODS = (
 _H2_PREFACE = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
 
 
+def _asked_for_bytes(size: Any, buffer: Any = None) -> bool:
+    """Did a read ask for at least one byte? Then an empty answer is the peer's EOF; one that
+    asked for none (`recv(0)`) proves nothing. With a buffer, a size of 0 or None means the
+    buffer's size — how `recv_into` and `SSLObject.read` both read it."""
+    if buffer is not None and not size:
+        size = memoryview(buffer).nbytes
+    return bool(size) and size > 0
+
+
 def _is_link_local(addr: str) -> bool:
     try:
         return ipaddress.ip_address(addr).is_link_local
@@ -103,13 +112,17 @@ class RawSocketInterceptor(ByteSeamInterceptor):
         return "ws" if is_ws else "http"
 
     def _resolve_timing(
-        self, obj: Any, st: _ConnectionState
+        self, obj: Any | None, st: _ConnectionState
     ) -> tuple[float | None, float | None, bool | None, tuple[Limitation, ...]]:
         # Plaintext: there is no TLS handshake to time, so that interval is
         # always None — unset on the wire, never a 0 ms handshake.
         if st.timing_consumed:
             return (0.0, None, True, ())
         st.timing_consumed = True
+        if obj is None:
+            # A response the close ended (`_retire`): the connect record was released at that
+            # close, ahead of the seam, so this is the no-record answer below.
+            return (None, None, None, (Limitation.CONNECT_TIMING_UNAVAILABLE,))
         try:
             popped = shared_timing_store().pop(obj.fileno())
         except Exception:
@@ -217,8 +230,11 @@ class RawSocketInterceptor(ByteSeamInterceptor):
         def wrapper(this: Any, *args: Any, **kwargs: Any) -> Any:
             ret = real(this, *args, **kwargs)
             try:
-                if self._capture_possible(this) and isinstance(ret, (bytes, bytearray)) and ret:
-                    self._on_response_bytes(this, bytes(ret))
+                if self._capture_possible(this) and isinstance(ret, (bytes, bytearray)):
+                    if ret:
+                        self._on_response_bytes(this, bytes(ret))
+                    elif _asked_for_bytes(args[0] if args else 0):
+                        self._on_response_eof(this)
             except Exception:
                 pass
             return ret
@@ -231,6 +247,8 @@ class RawSocketInterceptor(ByteSeamInterceptor):
             try:
                 if n and self._capture_possible(this):
                     self._on_response_bytes(this, bytes(buffer[:n]))
+                elif n == 0 and _asked_for_bytes(args[0] if args else kwargs.get("nbytes"), buffer):
+                    self._on_response_eof(this)
             except Exception:
                 pass
             return n

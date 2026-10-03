@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING, Any
 from .._assembly import Limitation
 from ._conn_timing import shared_timing_store
 from ._seam import ByteSeamInterceptor, _accepted_prefix, _ConnectionState
-from ._socket import _H2_PREFACE, _HTTP_METHODS
+from ._socket import _H2_PREFACE, _HTTP_METHODS, _asked_for_bytes
 from ._trackers import _Http1Tracker, _Http2Tracker
 
 if TYPE_CHECKING:
@@ -131,8 +131,11 @@ class SSLInterceptor(ByteSeamInterceptor):
             ret = real(this, *args, **kwargs)
             try:
                 # Ahead of `bytes(ret)`, for the reason `_mk_send` gives.
-                if self._capture_possible(this) and isinstance(ret, (bytes, bytearray)) and ret:
-                    self._on_response_bytes(this, bytes(ret))
+                if self._capture_possible(this) and isinstance(ret, (bytes, bytearray)):
+                    if ret:
+                        self._on_response_bytes(this, bytes(ret))
+                    elif _asked_for_bytes(args[0] if args else kwargs.get("buflen", 1024)):
+                        self._on_response_eof(this)  # the peer's EOF (a clean TLS close, too)
             except Exception:
                 pass
             return ret
@@ -145,6 +148,8 @@ class SSLInterceptor(ByteSeamInterceptor):
             try:
                 if n and self._capture_possible(this):
                     self._on_response_bytes(this, bytes(buffer[:n]))
+                elif n == 0 and _asked_for_bytes(args[0] if args else kwargs.get("nbytes"), buffer):
+                    self._on_response_eof(this)
             except Exception:
                 pass
             return n
@@ -166,6 +171,10 @@ class SSLInterceptor(ByteSeamInterceptor):
                             self._on_response_bytes(this, bytes(buffer[:ret]))
                     elif isinstance(ret, (bytes, bytearray)) and ret:
                         self._on_response_bytes(this, bytes(ret))
+                    if not ret and _asked_for_bytes(
+                        args[0] if args else kwargs.get("len", 1024), buffer
+                    ):
+                        self._on_response_eof(this)  # a clean close; a ragged one raises instead
             except Exception:
                 pass
             return ret
@@ -175,7 +184,7 @@ class SSLInterceptor(ByteSeamInterceptor):
     # --- Connection timing resolution (SSL-specific) ---
 
     def _resolve_timing(
-        self, obj: Any, st: _ConnectionState
+        self, obj: Any | None, st: _ConnectionState
     ) -> tuple[float | None, float | None, bool | None, tuple[Limitation, ...]]:
         """(tcp_connect_ms, tls_handshake_ms, connection_reused, limitations).
 
@@ -186,10 +195,16 @@ class SSLInterceptor(ByteSeamInterceptor):
         `connection_reused` is False only where a record proves the seam saw
         this connection open (a connect or handshake in the store, a
         `_wardex_timing` stamped when the TLS object was created). With no
-        record the connection may predate `init`, so it is None too."""
+        record the connection may predate `init`, so it is None too.
+
+        `obj` is None for a response the close ended (`_retire`): the record
+        was released at that close, ahead of the seam, so nothing is left to
+        read and the answer is the no-record one."""
         if st.timing_consumed:
             return (0.0, 0.0, True, ())
         st.timing_consumed = True
+        if obj is None:
+            return (None, None, None, (Limitation.CONNECT_TIMING_UNAVAILABLE,))
         # sync: SSLSocket — look up the store by fileno
         if not isinstance(obj, ssl.SSLObject):
             try:

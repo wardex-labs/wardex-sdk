@@ -43,6 +43,10 @@ struct AnthropicResponse {
     usage: Option<serde_json::Value>,
     #[serde(default)]
     content: Option<Vec<serde_json::Value>>,
+    /// Present on a bare HTTP error envelope, and on the synthetic body of a
+    /// stream that carried an `error` event (`reassemble_anthropic`).
+    #[serde(default)]
+    error: Option<serde_json::Value>,
 }
 #[derive(Deserialize)]
 struct AnthropicRequest {
@@ -179,17 +183,34 @@ pub(super) fn fill_anthropic(out: &mut LlmSemantics, req: &[u8], resp: &[u8], bo
     // The pre-split dispatcher stamped `output_type="text"` on every parse.
     out.output_type = Some("text".to_string());
     if let Ok(r) = serde_json::from_slice::<AnthropicResponse>(resp) {
+        // An error object INSIDE a response object is the provider's own
+        // failure declaration — the in-stream `error` event, which the
+        // reassembler keeps in the synthetic body — and it wins over any
+        // stop_reason. A bare HTTP error envelope (`{"type":"error",
+        // "error":{...}}`, no id, no content) is not a response object: it
+        // keeps an EMPTY response half, as before, and its span takes the
+        // error from the HTTP status.
+        let is_response_object = r.id.is_some() || r.content.is_some();
+        let declared = r
+            .error
+            .as_ref()
+            .filter(|e| is_response_object && !e.is_null())
+            .map(declared_error_type);
         out.response_id = r.id;
         out.response_model = r.model;
         // One producer for both carriers (`finish_reasons` and the message):
         // the normalized spelling, with unknown raw values passing through.
-        let finish_reason = r
-            .stop_reason
-            .as_deref()
-            .map(|sr| normalize_finish_reason("anthropic", sr));
+        let finish_reason = if declared.is_some() {
+            Some(FINISH_ERROR.to_string())
+        } else {
+            r.stop_reason
+                .as_deref()
+                .map(|sr| normalize_finish_reason("anthropic", sr))
+        };
         if let Some(f) = &finish_reason {
             out.finish_reasons = Some(vec![f.clone()]);
         }
+        out.error_type = declared;
         if let Some(u) = r.usage {
             // Anthropic reports the cache tiers OUTSIDE `input_tokens`; the
             // semconv Anthropic provider doc requires the inclusive sum, and
@@ -307,8 +328,13 @@ pub(super) fn reassemble_anthropic(events: &[SseEvent]) -> Reassembled {
     // documents the delta values as cumulative), so the cache tiers,
     // `server_tool_use` and `output_tokens_details` survive reassembly.
     let mut usage_val: Option<serde_json::Value> = None;
-    // Terminal = `message_stop` OR a `message_delta` carrying a stop_reason.
+    // Terminal = `message_stop` OR a `message_delta` carrying a stop_reason
+    // OR an `error` event.
     let mut terminated = false;
+    // The in-stream failure (an `overloaded_error` mid-stream is the
+    // documented case). The only bytes that name it, so its error object is
+    // kept for the synthetic body.
+    let mut error: Option<serde_json::Value> = None;
     // index -> (id, name, partial_json accumulated)
     let mut tool_uses: BTreeMap<i64, (Option<String>, Option<String>, String)> = BTreeMap::new();
     // server_tool_use: same shape as tool_use (input_json_delta accumulated)
@@ -416,6 +442,13 @@ pub(super) fn reassemble_anthropic(events: &[SseEvent]) -> Reassembled {
             Some("message_stop") => {
                 terminated = true;
             }
+            Some("error") => {
+                // The event wraps the error object (`{"type":"error",
+                // "error":{...}}`); an event without one is kept whole.
+                let e = v.get("error").filter(|e| !e.is_null()).unwrap_or(&v);
+                error = Some(e.clone());
+                terminated = true;
+            }
             _ => {}
         }
     }
@@ -467,8 +500,77 @@ pub(super) fn reassemble_anthropic(events: &[SseEvent]) -> Reassembled {
     if let Some(u) = usage_val {
         obj["usage"] = u;
     }
+    if let Some(e) = error {
+        // Preserved, not dropped: the fill maps it to `finish_reasons=
+        // ["error"]` and `error_type`, the provider's own declaration.
+        obj["error"] = e;
+    }
     Reassembled {
         body: serde_json::to_vec(&obj).unwrap_or_default(),
         terminated,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::{parse_llm, LlmSemantics};
+    use wardex_limits::Limits;
+
+    const ERROR_REQUEST: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/llm/anthropic_messages_sse_error/request.json"
+    ));
+    const ERROR_STREAM: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/llm/anthropic_messages_sse_error/stream.sse"
+    ));
+
+    fn messages(req: &[u8], resp: &[u8]) -> LlmSemantics {
+        parse_llm(
+            "api.anthropic.com",
+            "/v1/messages",
+            req,
+            resp,
+            Limits::default(),
+        )
+        .expect("a messages endpoint always parses")
+    }
+
+    fn json(bytes: Option<&[u8]>) -> serde_json::Value {
+        serde_json::from_slice(bytes.unwrap_or_default()).unwrap_or_default()
+    }
+
+    /// An `event: error` mid-stream (the documented `overloaded_error`): its
+    /// error object survives into the synthetic body, the text before it is
+    /// kept, and the finish is the provider's failure declaration — with no
+    /// stop_reason invented, since none arrived.
+    #[test]
+    fn an_error_event_is_kept_in_the_body_and_becomes_the_finish() {
+        let s = messages(ERROR_REQUEST, ERROR_STREAM);
+        assert_eq!(s.stream_terminated, Some(true), "the error ends the stream");
+        assert_eq!(s.finish_reasons, Some(vec!["error".to_string()]));
+        assert_eq!(s.error_type.as_deref(), Some("overloaded_error"));
+        let body = json(s.decoded_response.as_deref());
+        assert_eq!(body["error"]["type"], "overloaded_error");
+        assert_eq!(body["error"]["message"], "Overloaded");
+        assert!(body["stop_reason"].is_null(), "{body}");
+        let msgs = json(s.output_messages.as_deref().map(str::as_bytes));
+        assert_eq!(msgs.as_array().map(Vec::len), Some(1), "{msgs}");
+        assert_eq!(msgs[0]["finish_reason"], "error");
+        assert_eq!(msgs[0]["parts"][0]["content"], "Hel");
+    }
+
+    /// The HTTP error envelope every 4xx/5xx carries is NOT a response
+    /// object: no finish, no output message, no declared error type. That
+    /// span keeps taking its error from the HTTP status.
+    #[test]
+    fn a_bare_error_envelope_still_claims_nothing_about_the_response() {
+        let s = messages(
+            br#"{"model":"m"}"#,
+            br#"{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}"#,
+        );
+        assert_eq!(s.finish_reasons, None);
+        assert_eq!(s.output_messages, None);
+        assert_eq!(s.error_type, None);
     }
 }

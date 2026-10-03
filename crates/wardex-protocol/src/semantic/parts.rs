@@ -208,6 +208,12 @@ pub(super) fn server_tool_call_response_part(
     serde_json::Value::Object(m)
 }
 
+/// The finish reason a provider-declared failure normalizes to: what
+/// `normalize_finish_reason` gives Responses' `failed`, and what Chat and
+/// Anthropic report when their stream carried an `error` event instead of a
+/// finish. One constant, so the two routes cannot spell it two ways.
+pub(super) const FINISH_ERROR: &str = "error";
+
 /// The closed set every KNOWN provider finish reason maps into. An UNKNOWN
 /// raw value passes through in the provider's own spelling instead of being
 /// dropped: a new finish reason the provider invents shows up under its own
@@ -226,10 +232,26 @@ pub fn normalize_finish_reason(provider: &str, raw: &str) -> String {
         (_, "length") | ("anthropic", "max_tokens") | ("openai", "max_output_tokens") => "length",
         (_, "tool_calls") | (_, "function_call") | ("anthropic", "tool_use") => "tool_call",
         (_, "content_filter") | ("anthropic", "refusal") => "content_filter",
-        ("openai", "failed") | ("openai", "cancelled") => "error",
+        ("openai", "failed") | ("openai", "cancelled") => FINISH_ERROR,
         _ => return raw.to_string(), // total: unknown passes through as itself
     };
     v.to_string()
+}
+
+/// How a provider classified an error object it declared inside a response:
+/// its `code` (a string, or a number spelled in decimal), else its `type`,
+/// else empty — the provider declared a failure and named no class for it.
+/// Provider spellings pass through as they are; nothing here is a wardex
+/// vocabulary.
+pub(super) fn declared_error_type(err: &serde_json::Value) -> String {
+    for key in ["code", "type"] {
+        match err.get(key) {
+            Some(serde_json::Value::String(s)) if !s.is_empty() => return s.clone(),
+            Some(serde_json::Value::Number(n)) => return n.to_string(),
+            _ => {}
+        }
+    }
+    String::new()
 }
 
 /// One reassembled SSE stream: the synthetic body plus whether the stream

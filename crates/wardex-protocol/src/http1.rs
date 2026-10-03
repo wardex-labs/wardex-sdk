@@ -18,6 +18,12 @@ pub struct ParsedHttp {
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
     pub truncated: bool,
+    /// The stream ended before this message's own framing did: a declared
+    /// Content-Length was not reached, a chunked body never got its last
+    /// chunk, or a body with no framing was let go before the peer's EOF. What
+    /// arrived is in `body` (and `truncated` is set); how the message would
+    /// have ended was not observed. Only `finish` sets it.
+    pub incomplete: bool,
     pub header_len: usize,
     /// Capture-limitation markers surfaced on the span.
     pub limitations: Vec<&'static str>,
@@ -39,13 +45,16 @@ pub struct Http1Stream {
 enum State {
     /// Accumulating a header block.
     Headers,
-    /// Reading a body of known length. `remaining` is `usize::MAX` for an
-    /// EOF-terminated response, which only `flush_truncated` can end.
+    /// Reading a body of known length.
     Body {
         msg: ParsedHttp,
         remaining: usize,
         cap: usize,
     },
+    /// Reading a response body with no framing at all (no Content-Length, not
+    /// chunked; RFC 9112 §6.3 rule 8): the peer closing its side is what ends
+    /// it, so only `finish` can.
+    UntilClose { msg: ParsedHttp, cap: usize },
     /// Reading a chunked body.
     Chunked {
         msg: ParsedHttp,
@@ -193,24 +202,49 @@ impl Http1Stream {
         }
     }
 
-    /// Called on connection close — carves off the message in flight, whose body
-    /// had no framing (or never finished arriving).
-    pub fn flush_truncated(&mut self) -> Option<ParsedHttp> {
+    /// The stream ended: carves off the response in flight, if its header
+    /// block completed. `peer_closed` says how it ended — the peer's EOF was
+    /// observed (a read that asked for bytes got none), or the connection was
+    /// closed without that being seen (the client let go first, or the read
+    /// that would have seen it never ran). Endings that mean opposite things:
+    ///
+    /// * a body with no framing (`UntilClose`) is ended by the peer's EOF, so
+    ///   with `peer_closed` it comes back whole — not `truncated` (unless the
+    ///   body cap already made it so) and not `incomplete`;
+    /// * anything else still in flight comes back as what arrived, `truncated`
+    ///   and `incomplete`: a Content-Length not reached, a chunked body short
+    ///   of its last chunk, an unframed body whose end nobody saw. A chunked
+    ///   body that DID get its last chunk and lost only the trailer section is
+    ///   whole: no body byte is missing.
+    ///
+    /// None for a request, for a header block that never completed (no
+    /// response was observed), and when no message is in flight.
+    pub fn finish(&mut self, peer_closed: bool) -> Option<ParsedHttp> {
         if self.is_request {
             return None;
         }
-        match std::mem::replace(&mut self.state, State::Headers) {
-            State::Body { mut msg, .. } | State::Chunked { mut msg, .. } => {
+        let msg = match std::mem::replace(&mut self.state, State::Headers) {
+            State::UntilClose { msg, .. } if peer_closed => msg,
+            State::Chunked {
+                msg,
+                dec: ChunkState::Trailer,
+                ..
+            } => msg,
+            State::Body { mut msg, .. }
+            | State::Chunked { mut msg, .. }
+            | State::UntilClose { mut msg, .. } => {
                 msg.truncated = true;
-                self.buf = Vec::new();
-                self.pos = 0;
-                Some(msg)
+                msg.incomplete = true;
+                msg
             }
             other => {
                 self.state = other;
-                None
+                return None;
             }
-        }
+        };
+        self.buf = Vec::new();
+        self.pos = 0;
+        Some(msg)
     }
 
     /// Bytes fed but not yet consumed.
@@ -247,6 +281,7 @@ impl Http1Stream {
                 cap,
             } => self.step_body(msg, remaining, cap),
             State::Chunked { msg, dec, cap } => self.step_chunked(msg, dec, cap),
+            State::UntilClose { msg, cap } => self.step_until_close(msg, cap),
             State::Disabled(reason) => {
                 self.state = State::Disabled(reason);
                 Step::NeedMore
@@ -315,12 +350,8 @@ impl Http1Stream {
                     // a request with no CL/TE has no body (GET etc.) → complete
                     Step::Done(msg)
                 } else {
-                    // a response body is EOF-terminated → handled by flush_truncated on close
-                    self.state = State::Body {
-                        msg,
-                        remaining: usize::MAX,
-                        cap,
-                    };
+                    // a response body is EOF-terminated → ended by `finish` at the peer's EOF
+                    self.state = State::UntilClose { msg, cap };
                     self.step()
                 }
             }
@@ -345,6 +376,19 @@ impl Http1Stream {
             };
             Step::NeedMore
         }
+    }
+
+    /// Every available byte belongs to the body: nothing in the stream can end
+    /// it, so the state persists until `finish`.
+    fn step_until_close(&mut self, mut msg: ParsedHttp, cap: usize) -> Step {
+        let take = self.avail().len();
+        if take > 0 {
+            append_capped(&mut msg, &self.buf[self.pos..self.pos + take], cap);
+            self.bytes_scanned += take as u64;
+            self.consume(take);
+        }
+        self.state = State::UntilClose { msg, cap };
+        Step::NeedMore
     }
 
     fn step_chunked(&mut self, mut msg: ParsedHttp, mut dec: ChunkState, cap: usize) -> Step {
@@ -500,6 +544,7 @@ fn request_to_parsed(req: &httparse::Request) -> ParsedHttp {
         headers: collect_headers(req.headers),
         body: Vec::new(),
         truncated: false,
+        incomplete: false,
         header_len: 0,
         limitations: Vec::new(),
     }
@@ -515,6 +560,7 @@ fn response_to_parsed(resp: &httparse::Response) -> ParsedHttp {
         headers: collect_headers(resp.headers),
         body: Vec::new(),
         truncated: false,
+        incomplete: false,
         header_len: 0,
         limitations: Vec::new(),
     }
@@ -639,18 +685,66 @@ mod tests {
     }
 
     #[test]
-    fn flush_truncated_returns_partial_body() {
-        // a response with neither Content-Length nor chunked → flush on close
+    fn the_peers_eof_returns_an_unframed_body_whole() {
+        // Neither Content-Length nor chunked: the peer's EOF IS the framing, so
+        // the body that arrived is the whole body, across however many reads.
         let mut s = Http1Stream::new(false, Limits::default());
         assert_eq!(
-            s.feed(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\npartial")
+            s.feed(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\npart")
                 .len(),
             0
         );
-        let m = s.flush_truncated().expect("truncated message");
+        assert_eq!(s.feed(b"ial").len(), 0);
+        let m = s.finish(true).expect("the response in flight");
         assert_eq!(m.status, Some(200));
         assert_eq!(m.body, b"partial");
+        assert!(!m.truncated);
+        assert!(!m.incomplete);
+        assert!(m.limitations.is_empty());
+    }
+
+    #[test]
+    fn an_unframed_body_let_go_before_the_peers_eof_is_incomplete() {
+        // The client closed first (stopped reading a stream, timed out): the
+        // body's end — the peer's EOF — was never observed, so it is not whole.
+        let mut s = Http1Stream::new(false, Limits::default());
+        assert!(s.feed(b"HTTP/1.1 200 OK\r\n\r\ndata: a\n\n").is_empty());
+        let m = s.finish(false).expect("the response in flight");
+        assert_eq!(m.body, b"data: a\n\n");
         assert!(m.truncated);
+        assert!(m.incomplete);
+    }
+
+    #[test]
+    fn an_unframed_body_past_the_cap_is_capped_but_not_incomplete() {
+        // The two facts stay apart: the cap kept a prefix (truncated, with its
+        // marker), and the body still ended where its framing said it would.
+        let limits = Limits {
+            max_body_bytes: 4,
+            ..Default::default()
+        };
+        let mut s = Http1Stream::new(false, limits);
+        assert_eq!(s.feed(b"HTTP/1.1 200 OK\r\n\r\nhello world").len(), 0);
+        let m = s.finish(true).expect("the response in flight");
+        assert_eq!(m.body, b"hell");
+        assert!(m.truncated);
+        assert!(!m.incomplete);
+        assert_eq!(m.limitations, vec!["body_cap_exceeded"]);
+    }
+
+    #[test]
+    fn an_unframed_body_is_never_completed_by_more_bytes() {
+        // No byte sequence ends an unframed body, so a feed that looks like a
+        // second response is still body — split anywhere, the same body.
+        let raw = b"HTTP/1.1 200 OK\r\n\r\ndata: a\n\nHTTP/1.1 200 OK\r\n\r\n";
+        for split_at in 1..raw.len() {
+            let mut s = Http1Stream::new(false, Limits::default());
+            assert!(s.feed(&raw[..split_at]).is_empty(), "split at {split_at}");
+            assert!(s.feed(&raw[split_at..]).is_empty(), "split at {split_at}");
+            let m = s.finish(true).expect("the response in flight");
+            assert_eq!(m.body, &raw[19..], "split at {split_at}");
+            assert!(!m.incomplete, "split at {split_at}");
+        }
     }
 
     #[test]
@@ -833,7 +927,7 @@ mod tests {
     }
 
     #[test]
-    fn flush_truncated_decodes_a_partial_chunked_body() {
+    fn finish_decodes_a_partial_chunked_body() {
         // Cut mid-chunk on close. Retaining decode state means the caller gets
         // decoded payload — chunk-size lines and CRLF framing must not leak in.
         let mut s = Http1Stream::new(false, Limits::default());
@@ -842,10 +936,11 @@ mod tests {
                 .len(),
             0
         );
-        let m = s.flush_truncated().expect("truncated message");
+        let m = s.finish(true).expect("truncated message");
         assert_eq!(m.status, Some(200));
         assert_eq!(m.body, b"hello wo");
         assert!(m.truncated);
+        assert!(m.incomplete);
         // The only digits and CRLFs in this stream belong to the framing.
         assert!(
             !m.body
@@ -857,7 +952,7 @@ mod tests {
     }
 
     #[test]
-    fn flush_truncated_returns_a_short_content_length_body() {
+    fn finish_returns_a_short_content_length_body() {
         // Headers promised 11 bytes, 5 arrived, then the peer closed.
         let mut s = Http1Stream::new(false, Limits::default());
         assert_eq!(
@@ -865,18 +960,65 @@ mod tests {
                 .len(),
             0
         );
-        let m = s.flush_truncated().expect("truncated message");
+        let m = s.finish(true).expect("truncated message");
         assert_eq!(m.status, Some(200));
         assert_eq!(m.body, b"hello");
         assert!(m.truncated);
+        assert!(m.incomplete);
+        // A fact for the caller, not a marker: the parser names no limitation.
+        assert!(m.limitations.is_empty());
     }
 
     #[test]
-    fn flush_truncated_returns_none_when_no_message_is_in_flight() {
+    fn a_chunked_body_cut_at_any_framing_boundary_is_incomplete() {
+        // Every position short of the last chunk: mid size line, mid payload,
+        // between payload and its CRLF, and on a chunk boundary.
+        let head = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+        let body = b"5\r\nhello\r\n6\r\n world\r\n0\r\n";
+        for cut in 0..body.len() {
+            let mut raw = head.clone();
+            raw.extend_from_slice(&body[..cut]);
+            for peer_closed in [true, false] {
+                let mut s = Http1Stream::new(false, Limits::default());
+                assert!(s.feed(&raw).is_empty(), "cut at {cut}");
+                let m = s.finish(peer_closed).expect("the response in flight");
+                assert!(m.incomplete, "cut at {cut}, peer_closed {peer_closed}");
+                assert!(m.truncated, "cut at {cut}, peer_closed {peer_closed}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_chunked_body_that_lost_only_its_trailer_section_is_whole() {
+        // The last chunk arrived, so no body byte is missing; only the trailer
+        // section (which is consumed, never captured) did not finish.
+        let mut s = Http1Stream::new(false, Limits::default());
+        assert!(s
+            .feed(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\nX-Tr")
+            .is_empty());
+        let m = s.finish(false).expect("the response in flight");
+        assert_eq!(m.body, b"hello");
+        assert!(!m.incomplete);
+        assert!(!m.truncated);
+    }
+
+    #[test]
+    fn a_request_in_flight_is_never_flushed() {
+        // A request has no close-delimited form; what the caller wants at close
+        // is the response, and only the response parser answers.
+        let mut s = Http1Stream::new(true, Limits::default());
+        assert!(s
+            .feed(b"POST /x HTTP/1.1\r\nContent-Length: 10\r\n\r\nabc")
+            .is_empty());
+        assert!(s.finish(true).is_none());
+    }
+
+    #[test]
+    fn finish_returns_none_when_no_message_is_in_flight() {
         // A header block that never completed carries nothing to report.
         let mut partial = Http1Stream::new(false, Limits::default());
         assert_eq!(partial.feed(b"HTTP/1.1 200 OK\r\nContent-Len").len(), 0);
-        assert!(partial.flush_truncated().is_none());
+        assert!(partial.finish(true).is_none());
 
         // Nor does a connection whose last message completed cleanly.
         let mut done = Http1Stream::new(false, Limits::default());
@@ -885,11 +1027,11 @@ mod tests {
                 .len(),
             1
         );
-        assert!(done.flush_truncated().is_none());
+        assert!(done.finish(true).is_none());
 
         // Nor an untouched stream.
         assert!(Http1Stream::new(false, Limits::default())
-            .flush_truncated()
+            .finish(false)
             .is_none());
     }
 

@@ -112,6 +112,7 @@ def _to_parsed(raw: object) -> ParsedMessage:
         header_len=raw.header_len,  # type: ignore[attr-defined]
         truncated=raw.truncated,  # type: ignore[attr-defined]
         limitations=_resolve_markers(raw),
+        incomplete=raw.incomplete,  # type: ignore[attr-defined]
     )
 
 
@@ -125,8 +126,16 @@ class _Http1Parser(ProtocolParserInterface):
     def feed(self, data: bytes) -> list[ParsedMessage]:
         return [_to_parsed(m) for m in self._native.feed(data)]
 
-    def flush(self) -> ParsedMessage | None:
-        raw = self._native.flush_truncated()
+    def flush(self, peer_closed: bool = False) -> ParsedMessage | None:
+        """The response in flight when the stream ended, or None.
+
+        `peer_closed`: the peer's EOF was observed, which is what ends a body
+        with no framing — that one comes back whole. Anything else in flight
+        comes back `incomplete`: a Content-Length or chunked framing that
+        promised more, or an unframed body whose end nobody saw. None for a
+        header block that never completed, and on the request parser.
+        """
+        raw = self._native.finish(peer_closed)
         return _to_parsed(raw) if raw is not None else None
 
     def disabled_reason(self) -> str | None:

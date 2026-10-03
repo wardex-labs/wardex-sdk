@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from .._assembly import Limitation, SpanDraft, counters
+from .._assembly import OTEL_ERROR_TYPE_OTHER, Limitation, SpanDraft, counters
 from .._enums import OperationName, ProviderName
 from .._types import ConversationContext, EmbeddingsAttributes, GenAIAttributes
 
@@ -124,6 +124,22 @@ def provider_limitation(sem: Any) -> Limitation | None:
     # here, where it is decided; the seam only forwards it.
     limitation = Limitation.PROVIDER_INFERRED
     return limitation
+
+
+def declared_error_type(sem: Any) -> str | None:
+    """The `error.type` of a failure the provider declared INSIDE a response, else None.
+
+    The native parser fills `error_type` from an in-stream `error` event (Chat, Anthropic), whose
+    error object it keeps in the reassembled body while `finish_reasons` reads `error`. On a 2xx
+    that is an observed failure, so the seam makes the span ERROR with this type: the provider's
+    own class, or `_OTHER` — OTel's "unclassified" — when the error object named none. An HTTP
+    4xx/5xx keeps its status-code type instead; it is the first failure the wire showed. `getattr`
+    for the same reason as `identifies_llm_call`.
+    """
+    declared = getattr(sem, "error_type", None)
+    if declared is None:
+        return None
+    return declared or OTEL_ERROR_TYPE_OTHER
 
 
 def build_gen_ai(sem: Any) -> GenAIAttributes:
