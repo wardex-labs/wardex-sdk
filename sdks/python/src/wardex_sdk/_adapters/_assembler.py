@@ -62,6 +62,7 @@ from ._otel_merge import (
     join_chats,
     sequence_chat_windows,
 )
+from ._session_outcome import awaiting_after, close_from_stream, note_unparsed_line, root_status
 from ._session_state import (
     _PROMPT_HOOK,
     _PROMPT_STREAM,
@@ -326,6 +327,8 @@ class SessionAssembler:
             if bridge is not None and sess.bridge is None and self._bridge is not None:
                 sess.bridge = bridge
             sess.mark_thread(ev.parent_tool_use_id, now, new_turn=True)
+            if ev.parent_tool_use_id is None:
+                sess.awaiting_result = True  # a main-thread turn now owes a `result`
             if ev.content_json and ev.parent_tool_use_id is None:
                 if sess.pending_prompt_source is not None:
                     # A prompt was seen and no chat span ever consumed it. It
@@ -343,10 +346,12 @@ class SessionAssembler:
             return
         ev = parse_line(line, outbound=False)
         if ev is None:
+            note_unparsed_line(msg)
             return
         now = time.time_ns()
         with self._lock:
             sess = self._ensure_session(key, now)
+            sess.awaiting_result = awaiting_after(sess.awaiting_result, ev)
             if ev.kind == "session_init":
                 if sess.session_id and ev.session_id and sess.session_id != ev.session_id:
                     # A SECOND `system/init`, naming a different run, on a
@@ -541,6 +546,7 @@ class SessionAssembler:
         sess.pending_prompt_hook_seen = True
         sess.pending_prompt_sole_inferred = inferred
         sess.mark_thread(None, now, new_turn=True)
+        sess.awaiting_result = True  # the hook is this turn's only observation
 
     # --- emission helpers (all build via SpanDraft, emit via capture_span) ---
 
@@ -1367,7 +1373,7 @@ class SessionAssembler:
             # it gets here (`_close_tool`); the stream result block carries no
             # interrupt signal, so stream-only failures stay coarse-but-true.
             draft.set_error(error_type or "tool_error")
-        if not tool.from_hook:
+        if not tool.from_hook or tool.closed_by_stream:
             # Reconstructed from the CLI's stdout rather than announced by a
             # hook. The DIFFERENCE is real and worth publishing -- a stream-only
             # span has no hook payload behind it -- but it is a fact about who
@@ -1396,20 +1402,20 @@ class SessionAssembler:
         return draft
 
     def _on_stream_tool_result(self, sess: _Session, ev: AgentStreamEvent, now: int) -> None:
-        # `tool_result_id`, never `parent_tool_use_id`. The two answer different
-        # questions about the same line -- which CALL this result belongs to, and
-        # which SUB-AGENT produced the line -- and they differ exactly when a
-        # sub-agent runs a tool, which is when getting it wrong costs the most:
-        # the result was filed against the `Task` call, so `execute_tool Task`
-        # shipped carrying the inner tool's output and the inner call shipped no
-        # result at all. One span with the wrong bytes, one span missing, and no
-        # counter anywhere.
+        # `tool_result_id`, never `parent_tool_use_id`. The two answer different questions about
+        # the same line -- which CALL this result belongs to, and which SUB-AGENT produced the line
+        # -- and they differ exactly when a sub-agent runs a tool, which is when getting it wrong
+        # costs the most: the result was filed against the `Task` call, so `execute_tool Task`
+        # shipped carrying the inner tool's output and the inner call shipped no result at all. One
+        # span with the wrong bytes, one span missing, and no counter anywhere.
         tool_use_id = ev.tool_result_id
         if tool_use_id is None:
             return
-        if tool_use_id in sess.open_tools:
-            # A PreToolUse hook already opened this call; the eventual
-            # PostToolUse hook is the authority that will close it.
+        open_tool = sess.open_tools.get(tool_use_id)
+        if open_tool is not None:
+            # A PreToolUse hook opened this call and its closing hook stays the authority; the
+            # result is kept for the drain in case that hook never comes (`stream_result`).
+            open_tool.stream_result = (ev.content_json or b"", ev.is_error, now)
             return
         meta = sess.stream_tool_meta.pop(tool_use_id, None)
         # BEFORE the `meta is None` return and not after it. The state this
@@ -1841,25 +1847,25 @@ class SessionAssembler:
     def _drain_children(self, sess: _Session, now: int) -> None:
         """Force-close and EMIT everything the session still holds open.
 
-        Two callers, and they are the two ways a session stops being driven: the
-        transport closed (`_finalize`) or the registry evicted its root out from
-        under us (`_live_session`). Both must drain, and the second is why this
-        is a method rather than the first half of `_finalize`: a retired session
-        cannot be finalized — its root already shipped — but the tool calls it
-        was still holding are ordinary observations that belong on the wire with
-        a marker, not dropped on the floor (I10).
+        Two callers, and they are the two ways a session stops being driven: the transport closed
+        (`_finalize`) or the registry evicted its root out from under us (`_live_session`). Both
+        must drain, and the second is why this is a method rather than the first half of
+        `_finalize`: a retired session cannot be finalized — its root already shipped — but the
+        tool calls it was still holding are ordinary observations that belong on the wire with a
+        marker, not dropped on the floor (I10).
         """
-        # (1) Force-close any still-open tool spans — they never got a matching
+        # (1) Close every tool span still open — none of them got a matching
         # PostToolUse/PostToolUseFailure hook before the session ended.
         for tool_use_id in list(sess.open_tools.keys()):
             tool = sess.open_tools.pop(tool_use_id)
+            if tool.stream_result is not None:
+                meta = sess.stream_tool_meta.pop(tool_use_id, None)
+                status, error_type, end_ns = close_from_stream(tool, tool.stream_result, meta)
+                self._emit_tool(sess, tool, end_ns, status=status, error_type=error_type)
+                continue
+            # Nothing reported how it ended: UNSET, never an invented failure.
             self._emit_tool(
-                sess,
-                tool,
-                now,
-                status=StatusCode.ERROR,
-                markers=(Limitation.CHILD_SPAN_UNCLOSED,),
-                error_type="tool_unclosed",
+                sess, tool, now, status=StatusCode.UNSET, markers=(Limitation.CHILD_SPAN_UNCLOSED,)
             )
 
         # (2) Emit any subagent spans that never received a SubagentStop.
@@ -1893,16 +1899,15 @@ class SessionAssembler:
     def _stamp_root(self, sess: _Session, error: str | None) -> tuple[StatusCode, str | None]:
         """Fill in the session root's own fields; the registry stamps the rest.
 
-        Returns the verdict instead of setting it, because `UnitRegistry.close()`
-        is what ends a unit's span — status, `error.type` and the end instant
-        together, under the lock that also detaches it.
+        Returns the verdict instead of setting it, because `UnitRegistry.close()` is what ends a
+        unit's span — status, `error.type` and the end instant together, under the lock that also
+        detaches it.
         """
         draft = sess.unit.draft
-        # `agent.name` is still the model id here, which §6.3 calls out as wrong
-        # — the model belongs in `gen_ai.request.model`. Correcting it changes a
-        # field a dashboard groups by, and the extraction work that moved these
-        # sites onto `_assembly/` deliberately kept every span field identical,
-        # so it rides the adapter rewrite with the rest of the Anthropic
+        # `agent.name` is still the model id here, which §6.3 calls out as wrong — the model
+        # belongs in `gen_ai.request.model`. Correcting it changes a field a dashboard groups by,
+        # and the extraction work that moved these sites onto `_assembly/` deliberately kept every
+        # span field identical, so it rides the adapter rewrite with the rest of the Anthropic
         # semantics.
         draft.set_agent(AgentAttributes(name=sess.model or "agent", agent_type=AgentType.PRIMARY))
         draft.set_conversation(self._conversation(sess))
@@ -1915,20 +1920,14 @@ class SessionAssembler:
                 draft.set_extra("wardex.agent.cost_usd", result.total_cost_usd)
             if result.duration_api_ms is not None:
                 draft.set_extra("wardex.agent.api_duration_ms", result.duration_api_ms)
-            status = StatusCode.ERROR if result.is_error else StatusCode.OK
-            if error is not None:
-                status = StatusCode.ERROR
-                draft.add_limitation(Limitation.SESSION_ABORTED)
-        elif error is not None:
-            status = StatusCode.ERROR
-            draft.add_limitation(Limitation.SESSION_ABORTED)
-        else:
-            status = StatusCode.UNSET
+        # Only the CLI's own `result` for the turn in flight can produce OK.
+        status, cut_short = root_status(result, sess.awaiting_result, error)
+        if cut_short:
             draft.add_limitation(Limitation.SESSION_ABORTED)
 
         if status is not StatusCode.ERROR:
             return status, None
-        # ERROR requires a type. `error` is the transport-close reason and
-        # `result.is_error` is the CLI's own verdict; naming which of the two
-        # ended the session is the honest low-cardinality answer.
+        # ERROR requires a type. `error` is the transport-close reason and `result.is_error` is the
+        # CLI's own verdict; naming which of the two ended the session is the honest
+        # low-cardinality answer.
         return status, ("session_error" if error is not None else "agent_error")
