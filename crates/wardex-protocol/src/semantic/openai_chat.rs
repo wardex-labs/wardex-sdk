@@ -248,7 +248,9 @@ pub(super) fn fill_openai_chat(
         // An error object INSIDE a response object is the provider's own
         // failure declaration — the in-stream `error` chunk, which the
         // reassembler keeps in the synthetic body — and it wins over whatever
-        // finish the choices carried. A bare HTTP error envelope
+        // finish the choices carried. An empty or falsy `error` declares
+        // nothing (`declares_failure`, the same test the reassembler applies
+        // to each chunk). A bare HTTP error envelope
         // (`{"error":{...}}`, no id, no choices) is not a response object:
         // it keeps an EMPTY response half, as before, and its span takes the
         // error from the HTTP status.
@@ -256,7 +258,7 @@ pub(super) fn fill_openai_chat(
         let declared = r
             .error
             .as_ref()
-            .filter(|e| is_response_object && !e.is_null())
+            .filter(|e| is_response_object && declares_failure(e))
             .map(declared_error_type);
         out.response_id = r.id;
         out.response_model = r.model;
@@ -383,6 +385,24 @@ pub(super) fn output_type_from_format(format: Option<&serde_json::Value>) -> &'s
     }
 }
 
+/// Whether a top-level `error` value declares a failure. The OpenAI SDK's
+/// stream raises `APIError` only when `data.get("error")` is truthy, so this
+/// is Python truthiness over JSON: `null`, `false`, `0`, `""`, `[]` and `{}`
+/// declare nothing, and a chunk or body carrying one of them beside its
+/// choices is an ordinary one. Any other value is the provider's failure,
+/// whatever its shape.
+fn declares_failure(error: &serde_json::Value) -> bool {
+    use serde_json::Value;
+    match error {
+        Value::Null => false,
+        Value::Bool(b) => *b,
+        Value::Number(n) => n.as_f64() != Some(0.0),
+        Value::String(s) => !s.is_empty(),
+        Value::Array(a) => !a.is_empty(),
+        Value::Object(o) => !o.is_empty(),
+    }
+}
+
 /// OpenAI chat stream chunks → synthetic non-streaming-shaped JSON.
 /// Accumulates tool_call deltas into a BTreeMap keyed by index, concatenating the arguments string,
 /// then emits them as the choices[0].message.tool_calls array → fill_openai_chat reuses it for extraction.
@@ -399,12 +419,12 @@ pub(super) fn reassemble_openai(events: &[SseEvent]) -> Reassembled {
     // OpenAI-compatible gateway that omits `[DONE]` must not read as an
     // unterminated stream when its last chunk said why it stopped.
     let mut terminated = false;
-    // The in-stream failure: a chunk whose top-level `error` is the
-    // provider's error object (the OpenAI SDK raises `APIError` on any chunk
-    // that sets it). The only bytes that name the failure, so they are kept
-    // for the synthetic body, and a terminal form: the provider said why the
-    // stream ends. Asked of every chunk, choices or not: OpenRouter's
-    // documented mid-stream error carries a choice beside the error.
+    // The in-stream failure: a chunk whose top-level `error` declares one
+    // (`declares_failure`, the test the OpenAI SDK raises `APIError` on). The
+    // only bytes that name the failure, so they are kept for the synthetic
+    // body, and a terminal form: the provider said why the stream ends.
+    // Asked of every chunk, choices or not: OpenRouter's documented
+    // mid-stream error carries a choice beside the error.
     let mut error: Option<serde_json::Value> = None;
     for ev in events {
         if ev.data.trim() == "[DONE]" {
@@ -463,7 +483,7 @@ pub(super) fn reassemble_openai(events: &[SseEvent]) -> Reassembled {
                 terminated = true;
             }
         }
-        if let Some(e) = v.get("error").filter(|e| !e.is_null()) {
+        if let Some(e) = v.get("error").filter(|e| declares_failure(e)) {
             error = Some(e.clone());
             terminated = true;
         }
@@ -593,7 +613,7 @@ mod tests {
     /// error that way: the error at the top level plus a choice whose finish
     /// is `"error"`. A choice with no finish at all, or an empty array, must
     /// not hide the error either: the OpenAI SDK raises on any chunk whose
-    /// top-level `error` is set, whatever else the chunk holds.
+    /// top-level `error` is truthy, whatever else the chunk holds.
     #[test]
     fn an_error_chunk_that_also_carries_choices_still_declares_the_failure() {
         let head =
@@ -643,6 +663,64 @@ mod tests {
         assert_eq!(s.finish_reasons, Some(vec!["stop".to_string()]));
         let body = json(s.decoded_response.as_deref());
         assert!(body.get("error").is_none(), "{body}");
+    }
+
+    /// The OpenAI SDK raises only when a chunk's `error` is truthy, so an
+    /// empty or falsy one — beside a choice, or on a chunk of its own — is
+    /// not a failure: the stream finishes the way its choice said and the
+    /// body names no error. A non-empty string still is one.
+    #[test]
+    fn a_falsy_error_field_is_not_a_failure() {
+        let head =
+            r#"data: {"id":"c","model":"m","choices":[{"index":0,"delta":{"content":"Hel"}}]}"#;
+        let tail = r#"{"index":0,"delta":{"content":"lo"},"finish_reason":"stop"}"#;
+        for falsy in ["{}", r#""""#, "false", "0", "0.0", "[]"] {
+            for sse in [
+                format!(
+                    "{head}\n\ndata: {{\"id\":\"c\",\"model\":\"m\",\"error\":{falsy},\
+                     \"choices\":[{tail}]}}\n\ndata: [DONE]\n\n"
+                ),
+                format!(
+                    "{head}\n\ndata: {{\"error\":{falsy}}}\n\n\
+                     data: {{\"id\":\"c\",\"model\":\"m\",\"choices\":[{tail}]}}\n\n\
+                     data: [DONE]\n\n"
+                ),
+            ] {
+                let s = chat(br#"{"model":"m","stream":true}"#, sse.as_bytes());
+                assert_eq!(s.error_type, None, "{sse}");
+                assert_eq!(s.finish_reasons, Some(vec!["stop".to_string()]), "{sse}");
+                let body = json(s.decoded_response.as_deref());
+                assert!(body.get("error").is_none(), "{sse} -> {body}");
+                let msgs = json(s.output_messages.as_deref().map(str::as_bytes));
+                assert_eq!(msgs[0]["parts"][0]["content"], "Hello", "{sse}");
+            }
+        }
+        let sse = format!(
+            "{head}\n\ndata: {{\"id\":\"c\",\"model\":\"m\",\"error\":\"upstream failed\",\
+             \"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"error\"}}]}}\n\n"
+        );
+        let s = chat(br#"{"model":"m","stream":true}"#, sse.as_bytes());
+        assert_eq!(s.error_type.as_deref(), Some(""), "named no class");
+        assert_eq!(s.finish_reasons, Some(vec!["error".to_string()]));
+        assert_eq!(
+            json(s.decoded_response.as_deref())["error"],
+            "upstream failed"
+        );
+    }
+
+    /// A non-streaming response object whose `error` is empty or falsy names
+    /// no failure either: its finish is the one its choice carried.
+    #[test]
+    fn a_falsy_error_in_a_response_body_is_not_a_failure() {
+        for falsy in ["{}", r#""""#, "false", "0", "[]"] {
+            let body = format!(
+                "{{\"id\":\"c\",\"model\":\"m\",\"error\":{falsy},\"choices\":[{{\"index\":0,\
+                 \"message\":{{\"role\":\"assistant\",\"content\":\"x\"}},\"finish_reason\":\"stop\"}}]}}"
+            );
+            let s = chat(br#"{"model":"m"}"#, body.as_bytes());
+            assert_eq!(s.error_type, None, "{body}");
+            assert_eq!(s.finish_reasons, Some(vec!["stop".to_string()]), "{body}");
+        }
     }
 
     /// An `error` chunk as the stream's ONLY event, before anything named an

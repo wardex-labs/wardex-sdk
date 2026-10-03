@@ -523,6 +523,34 @@ def test_a_provider_error_that_also_carries_choices_fails_the_chat_span(shape):
     assert Limitation.FRAME_PARSE_FAILED not in _markers(span)
 
 
+@pytest.mark.parametrize(
+    "falsy", [{}, "", False, 0, []], ids=["object", "string", "false", "zero", "list"]
+)
+def test_an_empty_or_falsy_error_beside_a_choice_is_not_a_failure(falsy):
+    """The OpenAI SDK raises only when a chunk's `error` is truthy, so an empty
+    or falsy one beside an ordinary choice names no failure: the call ships OK,
+    finishing the way its choice said, and the body carries no error."""
+    first = {"id": "c1", "model": "gpt-4o", "choices": [{"index": 0, "delta": {"content": "Hel"}}]}
+    last = {
+        "id": "c1",
+        "model": "gpt-4o",
+        "error": falsy,
+        "choices": [{"index": 0, "delta": {"content": "lo"}, "finish_reason": "stop"}],
+    }
+    stream = b"".join(b"data: " + json.dumps(c).encode() + b"\n\n" for c in (first, last))
+    stream += b"data: [DONE]\n\n"
+    port = _serve_once(SSE_HEAD + f"Content-Length: {len(stream)}\r\n\r\n".encode() + stream)
+
+    span = _one_chat_span(_captured(lambda: _post(port, "/v1/chat/completions", CHAT_REQUEST)))
+
+    assert span.status is StatusCode.OK
+    assert span.error_type is None
+    assert span.gen_ai.finish_reasons == ("stop",)
+    body = json.loads(span.output_data)
+    assert "error" not in body
+    assert body["choices"][0]["message"]["content"] == "Hello"
+
+
 #: A stream whose ONLY event is the provider's failure: no chunk named the model
 #: or an id first, so nothing on the response side says "LLM call" except the
 #: error itself. Nothing in either stream format promises a model-bearing chunk
