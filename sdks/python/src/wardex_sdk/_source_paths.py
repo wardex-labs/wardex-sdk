@@ -137,26 +137,31 @@ def _frame_files(exc: BaseException, tb: TracebackType | None) -> dict[str, str]
 #: the home folder under `/backup`.
 _HOME_STARTS = r"(?:\A|(?<=[\s'\"`(\[{<=,;:])|(?<=file://))"
 
-#: What may stand right after it for the match to BE the home folder: a path
-#: separator, a quote, a line end or the end of the text. Any other character
-#: can go on a folder's name (`alice-old`, `alice.bak`, `alice 2`), and that
-#: folder is a different one.
-_HOME_ENDS = "(?=[{seps}'\"`\\r\\n]|\\Z)"
+#: What may stand right after it for the match to BE the home folder: anything
+#: that cannot go on a folder's name. A letter, a digit, `_`, `-` or `+` can
+#: (`alice-old`, `alice2`), and so can a `.` with one of those after it
+#: (`alice.bak`): that folder is a different one. Everything else ends the
+#: path — a separator, a quote, a space, a bracket, the end of the text, and
+#: the comma or full stop of the sentence the path stands in.
+_HOME_ENDS = r"(?![\w+\-]|\.[\w+\-])"
 
 
 def _scrub_home(text: str) -> str:
     """`text` with this process's home folder written as `~` where it starts a path.
 
     The frame paths are already placed; this catches the home folder where else
-    the text carries it — an `OSError` names the file it could not open, and a
-    source line can hold a path literal. Also in its `repr` form, which doubles
-    a Windows backslash.
+    the text carries it — an `OSError` names the file it could not open, a
+    message names a folder in a sentence, and a source line can hold a path
+    literal. Also in its `repr` form, which doubles a Windows backslash.
 
-    Only where the text plainly names the home folder, so nothing here writes a
-    path the process did not see: a folder whose name merely begins with the
-    home folder's, or a copy of it under another folder, is left as written,
-    and so is the home folder followed by a space or a full stop, because a
-    folder's name can go on with either.
+    Only where the text plainly names the home folder, so that no other folder
+    is claimed to be it: one whose name merely begins with the home folder's,
+    or a copy of it under another folder, is left as written. A space, a comma
+    or a full stop after the home folder ends it, because in an exception's
+    message that is the sentence going on (`permission denied for
+    /Users/alice.`) far more often than a folder's name, and the OS user name
+    must not leave with the sentence. The one folder that costs is a sibling
+    named like the home folder plus a space (`/Users/alice 2`), written `~ 2`.
     """
     seps = os.sep + (os.altsep or "")
     home = os.path.expanduser("~").rstrip(seps)
@@ -164,5 +169,4 @@ def _scrub_home(text: str) -> str:
         return text
     forms = {home, home.replace("\\", "\\\\")}
     pattern = "|".join(re.escape(f) for f in sorted(forms, key=len, reverse=True))
-    ends = _HOME_ENDS.format(seps=re.escape(seps))
-    return re.sub(f"{_HOME_STARTS}(?:{pattern}){ends}", "~", text)
+    return re.sub(f"{_HOME_STARTS}(?:{pattern}){_HOME_ENDS}", "~", text)

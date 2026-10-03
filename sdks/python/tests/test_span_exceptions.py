@@ -565,13 +565,49 @@ def test_the_home_folder_is_written_as_tilde_where_it_starts_a_path(
 
 
 @pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("permission denied for {home}.", "permission denied for ~."),
+        ("cannot write to {home} (read-only)", "cannot write to ~ (read-only)"),
+        ("searched {home}, then /tmp", "searched ~, then /tmp"),
+        ("{home}: Permission denied", "~: Permission denied"),
+        ("no config in ({home})", "no config in (~)"),
+        ("PATH={home}{sep}bin:{home}:/usr/bin", "PATH=~{sep}bin:~:/usr/bin"),
+        # A space ends the path even where a folder's name went on with one:
+        # the cost of never sending the user name out of a sentence.
+        ("copy {home} 2{sep}report.txt", "copy ~ 2{sep}report.txt"),
+    ],
+)
+@pytest.mark.parametrize("read", [_otlp_events, _envelope_events], ids=["otlp", "envelope"])
+def test_the_home_folder_a_sentence_names_leaves_as_tilde_on_both_wires(
+    recording, fake_home, read, text, expected
+):
+    """The home folder used to be rewritten only before a separator, a quote or a
+    line end, so a message naming it in a sentence (`permission denied for
+    /Users/alice.`, `cannot write to /Users/alice (read-only)`) sent the OS user
+    name out in the message and in the stack trace's last line, on both wires."""
+    home, sep = str(fake_home), os.sep
+    with pytest.raises(ValueError), wardex.span("prose"):
+        raise ValueError(text.format(home=home, sep=sep))
+
+    _spans(recording)
+    (event,) = read(recording, "prose")
+    message = event["attributes"]["exception.message"]
+    stacktrace = event["attributes"]["exception.stacktrace"]
+    assert message == expected.format(sep=sep)
+    assert stacktrace.endswith(f"ValueError: {message}\n")
+    for value in (message, stacktrace):
+        assert home not in value
+        assert "alice.kim" not in value
+
+
+@pytest.mark.parametrize(
     "text",
     [
         "copy {home}-old{sep}report.txt",
         "copy {home}.bak{sep}report.txt",
         "copy {home}+test{sep}report.txt",
         "copy {home}berly{sep}report.txt",
-        "copy {home} 2{sep}report.txt",
         "restore {sep}backup{home}{sep}report.txt",
         "restore .{home}{sep}report.txt",
     ],
