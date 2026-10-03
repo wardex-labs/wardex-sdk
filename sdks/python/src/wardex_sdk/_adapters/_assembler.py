@@ -964,6 +964,7 @@ class SessionAssembler:
             gen_ai=gen_ai,
             ttft=ttft,
             start_ns=start_ns,
+            opened_ns=now,
             end_ns=now,
             agent_id=sess.chat_scope(ev.parent_tool_use_id),
             input_data=sess.pending_prompt if consume else b"",
@@ -994,7 +995,7 @@ class SessionAssembler:
         for field. Pending, the timing markers travel DEFERRED: a merge with a
         `claude_code.llm_request` removes the rationale for both (CLI-measured
         interval + ttft), and an unmerged flush applies them unchanged. The
-        join window is the whole response, first line's floor to last arrival.
+        join window ends at the response's first line (`_OpenChat.opened_ns`).
         """
         timing = (
             (_BASE_LIMITATION, Limitation.TTFT_IPC_APPROXIMATION)
@@ -1008,7 +1009,6 @@ class SessionAssembler:
                     chat.draft.add_limitation(marker)
                 span = chat.draft.finish(chat.end_ns)
             else:
-                chat.draft.set_end_ns(chat.end_ns)
                 self._pend(
                     sess,
                     _PendingSpan(
@@ -1016,7 +1016,7 @@ class SessionAssembler:
                         kind="chat",
                         deferred_markers=timing,
                         agent_id=chat.agent_id,
-                        window=(chat.start_ns, chat.end_ns),
+                        window=(chat.start_ns, chat.opened_ns),
                         gen_ai=chat.gen_ai,
                     ),
                 )

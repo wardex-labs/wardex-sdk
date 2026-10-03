@@ -320,8 +320,11 @@ All notable changes to this project are documented here. The format follows
   to 1.5x and 2x what the CLI itself reported. Lines with the same id on the
   same thread are now one span: its tokens are the response's usage counted
   once, its output holds every block in order, and it runs from the
-  response's start to its last line, which is also the window the OTel bridge
-  joins on. `turn_index` counts responses, not lines. The span ships when the
+  response's start to its last line. The OTel bridge joins the span to
+  the CLI's request by its first line, because the request began before any
+  of its lines arrived, and in the order responses began, so a main response
+  held open while a sub-agent replied still joins its own request.
+  `turn_index` counts responses, not lines. The span ships when the
   response is over (the thread's next response begins, the turn's `result`
   arrives, the sub-agent's `Task` call returns, its task's
   `task_notification` arrives, or the session closes) rather than on its

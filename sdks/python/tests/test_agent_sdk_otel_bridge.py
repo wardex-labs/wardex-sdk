@@ -1133,7 +1133,7 @@ def test_close_all_sessions_never_drains(receiver):
     # has said it is over — so `close_all_sessions` must ship it before the
     # merge runs, or it could not join.
     held = asm._by_key[1].open_chats[None]
-    window = (held.start_ns, held.end_ns)
+    window = (held.start_ns, held.opened_ns)
     body = _otlp_build.request(
         [
             _otlp_build.span(
@@ -1318,9 +1318,10 @@ def _split_response_line(content, msg_id="m1"):
 def test_a_response_split_across_lines_joins_its_one_llm_request(receiver):
     """The shape a real CLI sends (recorded on 2.1.286): a text block and the
     tool call after it as two lines under ONE id, then the post-tool response.
-    One window per RESPONSE — first line's floor to last line's arrival — so
-    each llm_request joins its one chat and no duplicate-view chat is left
-    unmerged beside it."""
+    One window per RESPONSE, so each llm_request joins its one chat and no
+    duplicate-view chat is left unmerged beside it. The window runs from the
+    first line's floor to the first line's arrival: the request that produced
+    the response started before any of its lines arrived."""
     client = FakeClient()
     asm = SessionAssembler(client, bridge=receiver)
     receiver.reserve(TRACE)
@@ -1337,7 +1338,7 @@ def test_a_response_split_across_lines_joins_its_one_llm_request(receiver):
 
     windows = [rec.window for rec in asm._by_key[1].pending if rec.kind == "chat"]
     assert len(windows) == 2  # one per response, not one per line
-    assert windows[0][1] >= t_before_last  # response 1 ends at its LAST line
+    assert windows[0][1] < t_before_last  # the window ends at response 1's FIRST line
     assert windows[1][0] >= windows[0][1]
     body = _otlp_build.request(
         [
@@ -1369,6 +1370,77 @@ def test_a_response_split_across_lines_joins_its_one_llm_request(receiver):
     assert chats[0].gen_ai.input_tokens == 10  # one copy, not two
     assert [b["type"] for b in json.loads(chats[0].output_data)] == ["text", "tool_use"]
     assert not any(s.name == "execute_step llm_request" for s in client.spans)
+
+
+def test_a_main_response_held_across_a_sub_agents_reply_still_joins_its_request(receiver):
+    """A main response that calls `Task` stays held until the main thread moves
+    on, so it is pended AFTER the sub-agent's reply. With no SubagentStart that
+    names the call, both are in the main thread's scope, and the join floors
+    one scope's windows in sequence. In pend order that raised the main
+    response's start past its own end, and its request could no longer join.
+    In the order the responses began, every window keeps its shape and both
+    main responses join."""
+    from wardex_sdk._adapters._otel_merge import sequence_chat_windows
+
+    client = FakeClient()
+    asm = SessionAssembler(client, bridge=receiver)
+    receiver.reserve(TRACE)
+    _outbound(asm, 1, bridge=_binding())
+    asm.on_inbound(1, INIT)
+    time.sleep(0.002)
+    spawn = {"type": "tool_use", "id": "task_a", "name": "Task", "input": {}}
+    asm.on_inbound(1, _split_response_line([spawn]))
+    time.sleep(0.002)
+    for text in ("thinking", "answer"):  # the sub-agent's one response, in two lines
+        line = _split_response_line([{"type": "text", "text": text}], msg_id="sub1")
+        asm.on_inbound(1, {**line, "parent_tool_use_id": "task_a"})
+        time.sleep(0.002)
+    task_result = {"type": "tool_result", "tool_use_id": "task_a", "content": "ok"}
+    asm.on_inbound(
+        1,
+        {
+            "type": "user",
+            "session_id": "s-1",
+            "parent_tool_use_id": None,
+            "message": {"role": "user", "content": [task_result]},
+        },
+    )
+    time.sleep(0.002)
+    asm.on_inbound(1, ASSISTANT_3)
+    asm.on_inbound(1, RESULT)
+
+    pending = asm._by_key[1].pending
+    windows = {rec.gen_ai.response_id: rec.window for rec in pending if rec.kind == "chat"}
+    assert list(windows) == ["sub1", "m1", "m3"]  # the main response pended after the reply
+    sequenced = sequence_chat_windows(pending)
+    # Each main request starts strictly inside its own response's recorded window.
+    body = _otlp_build.request(
+        [
+            _otlp_build.span(
+                name="claude_code.llm_request",
+                trace_id=TRACE,
+                span_id=span_id,
+                start_ns=(windows[msg_id][0] + windows[msg_id][1]) // 2,
+                end_ns=windows[msg_id][1],
+                attrs={"gen_ai.response.id": request_id},
+            )
+            for span_id, request_id, msg_id in (
+                ("0a" * 8, "req_1", "m1"),
+                ("0b" * 8, "req_3", "m3"),
+            )
+        ]
+    )
+    assert _post(receiver, body) == 200
+    asm.on_close(1, None)
+
+    chats = {s.gen_ai.response_id: s for s in client.spans if s.name.startswith("chat")}
+    for msg_id, request_id in (("m1", "req_1"), ("m3", "req_3")):
+        chat = chats[msg_id]
+        assert dict(chat.extra).get("wardex.anthropic_agent_sdk.otel.request_id") == request_id
+        assert CaptureSource.OTEL_BRIDGE in chat.capture_sources
+        assert _TIMING not in _limitations(chat)
+    assert not any(s.name == "execute_step llm_request" for s in client.spans)
+    assert all(window.start_ns <= window.end_ns for window in sequenced)  # none inverted
 
 
 def test_a_recorded_session_pends_one_chat_per_response(receiver):

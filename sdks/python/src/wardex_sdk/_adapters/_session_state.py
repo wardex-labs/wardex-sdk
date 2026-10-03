@@ -76,7 +76,8 @@ class _PendingSpan:
     tool_use_id: str | None = None
     agent_id: str | None = None
     #: Chat only: (start_ns, end_ns) — the join window, from the thread's
-    #: floor to the message's arrival.
+    #: floor to the arrival of the response's FIRST line (see
+    #: `_OpenChat.opened_ns`).
     window: tuple[int, int] | None = None
     #: Chat only: the GenAIAttributes block, kept for the ttft rewrite.
     #: Typed Any because `_types` is off-limits in `_adapters/` (C-S1).
@@ -147,6 +148,14 @@ class _OpenChat:
     #: same response arrives after it.
     ttft: float | None
     start_ns: int
+    #: Arrival of the FIRST line, which is where the bridge's join window ends.
+    #: The request that produced this response started before any of its
+    #: lines arrived, so a window running on to the last line could only take
+    #: in a later request's start. And the join sequences its windows by this
+    #: instant, the order responses BEGAN: a held response is pended only when
+    #: it is over, so one held across a reply on another thread of the same
+    #: scope is pended after that reply (see `sequence_chat_windows`).
+    opened_ns: int
     #: Arrival of the latest line folded in — the response is not over before
     #: its last block has arrived.
     end_ns: int
@@ -196,7 +205,8 @@ class _OpenChat:
         self.apply()
 
     def apply(self) -> None:
-        """Write the gen_ai block and the I/O as they stand onto the draft."""
+        """Write the gen_ai block, the I/O and the end as they stand onto the draft."""
+        self.draft.set_end_ns(self.end_ns)
         self.draft.set_gen_ai(self.gen_ai)
         self.draft.set_io(
             input_data=self.input_data,
