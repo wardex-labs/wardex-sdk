@@ -44,6 +44,7 @@ from .._semantics import (
     apply_request_conversation,
     build_gen_ai,
     build_grpc_fields,
+    declared_error_type,
     embeddings_attrs,
     has_core_semantics,
     identifies_llm_call,
@@ -116,23 +117,21 @@ if TYPE_CHECKING:
 def _accepted_prefix(data: Any, n: int) -> Any:
     """The first `n` bytes of a send buffer, without materializing the rest.
 
-    `send`/`write` may report a SHORT write, and the caller then keeps the tail
-    and calls again with the whole remainder — asyncio's plaintext writer does
-    exactly that on 3.10/3.11 (`_write_ready` calls `send(self._buffer)` on one
-    bytearray and then `del self._buffer[:n]`). `bytes(data)[:n]` copies that
-    entire remainder before throwing away everything the kernel refused, so a
-    multi-megabyte body costs a copy per call: quadratic in body size, and on
-    the branch the gate deliberately leaves OPEN — a local plaintext model
-    server is HTTP, so it latches "http" and pays this on every partial write.
+    `send`/`write` may report a SHORT write, and the caller then keeps the tail and calls again with
+    the whole remainder — asyncio's plaintext writer does exactly that on 3.10/3.11 (`_write_ready`
+    calls `send(self._buffer)` on one bytearray and then `del self._buffer[:n]`). `bytes(data)[:n]`
+    copies that entire remainder before throwing away everything the kernel refused, so a
+    multi-megabyte body costs a copy per call: quadratic in body size, and on the branch the gate
+    deliberately leaves OPEN — a local plaintext model server is HTTP, so it latches "http" and pays
+    this on every partial write.
 
-    Returns something `bytes()` accepts rather than `bytes`, so that an exact
-    `bytes` argument written in full stays the same object and costs nothing at
-    all; the caller materializes once, immediately.
+    Returns something `bytes()` accepts rather than `bytes`, so that an exact `bytes` argument
+    written in full stays the same object and costs nothing at all; the caller materializes once,
+    immediately.
 
-    The three arms are an isinstance chain rather than a `try`, because a
-    handler here would be a silent swallow on a path that has a correct answer
-    without one: anything that is not one of the three buffer types the socket
-    API actually takes falls through to what this line used to be.
+    The three arms are an isinstance chain rather than a `try`, because a handler here would be a
+    silent swallow on a path that has a correct answer without one: anything that is not one of the
+    three buffer types the socket API actually takes falls through to what this line used to be.
     """
     if isinstance(data, bytes):
         return data[:n]
@@ -143,41 +142,41 @@ def _accepted_prefix(data: Any, n: int) -> Any:
     return bytes(data)[:n]
 
 
-def _http_error(txn: Any) -> bool:
-    """Did the peer answer with a 4xx/5xx? Absent status reads as success."""
-    return not 200 <= getattr(txn, "status", 200) < 400
-
-
 def _is_llm_traffic(txn: Any, sem: Any) -> bool:
-    """Is this an LLM call, for the capture policy and for the gen_ai block alike?
+    """Is this an LLM call, for the capture policy and for the gen_ai block alike? One predicate on
+    purpose: a span admitted as agent traffic and then left with `gen_ai=None` is captured volume
+    with no identity on it.
 
-    One predicate for both questions on purpose: a transaction the gate admits
-    as agent traffic and then leaves with `gen_ai=None` is worse than either
-    answer alone — captured volume with no identity on it.
-
-    The request-side half is admitted only for an HTTP ERROR, and that is the
-    narrow reading rather than the tidy one. Both provider gates in the Rust
-    parser are SUBSTRING matches on host and path, so an internal service at
-    `anthropic-proxy.corp/v1/messages` whose body happens to carry a `model`
-    field parses as an Anthropic chat call. On a 2xx that shape is genuinely
-    ambiguous — it may be an LLM endpoint wardex cannot read, or not an LLM
-    endpoint at all — and it is already dropped today, so admitting it would be
-    a behaviour change nobody asked for on traffic nobody identified. A 4xx/5xx
-    from a host and path that parse as a provider is not ambiguous in the same
-    way: the request was addressed to a chat endpoint with a model on it, and
-    the reply is the provider refusing. That is the call the fix is about.
+    The request half (`identifies_llm_call`) is admitted only for a reply that is not an answer: a
+    4xx/5xx; a stream whose provider declared a failure before any chunk named the model (an
+    `error` event first: `declared_error_type`); a body the connection cut before its framing ended
+    (`response_cut`). On a plain 2xx a request-only match is ambiguous — the parser's provider gates
+    are SUBSTRING matches, so `anthropic-proxy.corp/v1/messages` with a `model` in its body parses
+    as an Anthropic call — and stays dropped. A reply that refused, failed or never finished is not:
+    the request named a model at a chat endpoint, and the reply names none because it never became
+    an answer. `getattr`: the capture-policy tests drive doubles; an absent status reads as success.
     """
-    return has_core_semantics(sem) or (_http_error(txn) and identifies_llm_call(sem))
+    unanswered = (
+        not 200 <= getattr(txn, "status", 200) < 400
+        or getattr(txn, "response_cut", False)
+        or declared_error_type(sem) is not None
+    )
+    return has_core_semantics(sem) or (unanswered and identifies_llm_call(sem))
 
 
 class _ConnectionState:
     """Capture state for a single connection — holds the protocol tracker."""
 
-    def __init__(self, tracker: Any, server_address: str, server_port: int) -> None:
+    def __init__(
+        self, tracker: Any, server_address: str, server_port: int, hostname: str | None = None
+    ) -> None:
         self.tracker = tracker
         self.server_address = server_address
         self.server_port = server_port
+        # Read off the socket by `_state`, for `_seal` once the socket is gone (`_retire`).
+        self.server_hostname, self.connection_id = hostname, ""
         self.timing_consumed = False
+        self.read_shut = False  # the client shut its own read side: see `_on_read_shutdown`
         self.h2_opening: tuple[Any, ...] | None = None  # see `opening_timing`
         self.gate: str | None = None  # None=undetermined, "http", "h2c", "h2", "ignore"
         # This state was built for a socket that OUTLIVED an os.fork(): the tracker starts
@@ -194,16 +193,15 @@ class _ConnectionState:
     def latched_off(self) -> bool:
         """Has the sniff-latch already ruled this connection out for good?
 
-        The early gate acts on this answer, so what matters is that it is
-        STABLE: each seam's `_gate` writes `gate` once, from the first bytes it
-        sees, and never revisits it (see the two `_gate` docstrings, and
-        `test_latch_stays_ignore_once_closed`). "ignore" is therefore a fact
-        about the connection rather than about the call that observed it, which
-        is what makes it safe to skip the buffer copy on every later call.
+        The early gate acts on this answer, so what matters is that it is STABLE: each seam's
+        `_gate` writes `gate` once, from the first bytes it sees, and never revisits it (see the two
+        `_gate` docstrings, and `test_latch_stays_ignore_once_closed`). "ignore" is therefore a fact
+        about the connection rather than about the call that observed it, which is what makes it
+        safe to skip the buffer copy on every later call.
 
-        Asked as "is it ignore" rather than "is it one of the live protocols"
-        so that `None` — undetermined, the state of a connection whose first
-        bytes have not arrived — reads as "keep going", never as "drop".
+        Asked as "is it ignore" rather than "is it one of the live protocols" so that `None` —
+        undetermined, the state of a connection whose first bytes have not arrived — reads as "keep
+        going", never as "drop".
         """
         return self.gate == "ignore"
 
@@ -273,14 +271,13 @@ class ByteSeamInterceptor(InterceptorInterface):
     def uninstall(self) -> None:
         """Undo whatever this seam installed, however far `install()` got.
 
-        TOTAL, which it was not. It used to open with `if not self._installed:
-        return` while every `install()` sets that flag as its LAST statement, so
-        the two never overlapped where it mattered: an `install()` that raised
-        halfway had already patched part of `ssl.SSLSocket` or `socket.socket`,
-        and the undo the registry then called declined to run. Those wrappers
-        stayed in front of the host's sockets for the life of the process — the
-        flag turned the rollback into a no-op for every interceptor this SDK
-        ships, which is a guard that reads as a fix and is not one.
+        TOTAL, which it was not. It used to open with `if not self._installed: return` while every
+        `install()` sets that flag as its LAST statement, so the two never overlapped where it
+        mattered: an `install()` that raised halfway had already patched part of `ssl.SSLSocket` or
+        `socket.socket`, and the undo the registry then called declined to run. Those wrappers
+        stayed in front of the host's sockets for the life of the process — the flag turned the
+        rollback into a no-op for every interceptor this SDK ships, which is a guard that reads as a
+        fix and is not one.
 
         The flag cannot answer "was anything patched?", because it is only ever set once everything
         was. The things that CAN answer it are the pieces themselves, and each is asked separately:
@@ -290,11 +287,10 @@ class ByteSeamInterceptor(InterceptorInterface):
         flows. Every step is a no-op on a seam that never installed, which is what makes this safe
         to call unconditionally, twice, or on a fresh object.
 
-        The WebSocket flush stays: a live WS session holds a span that only
-        exists once the session ends, and dropping it at uninstall would be the
-        SDK losing data at teardown — the reason `uninstall_all` runs before
-        `client.close()` at all. It is `_retire`'s job now, because teardown and
-        a socket closing are the same question asked at two altitudes.
+        The WebSocket flush stays: a live WS session holds a span that only exists once the session
+        ends, and dropping it at uninstall would be the SDK losing data at teardown — the reason
+        `uninstall_all` runs before `client.close()` at all. It is `_retire`'s job now, because
+        teardown and a socket closing are the same question asked at two altitudes.
         """
         self._patches.restore_all()
         self._release_probes()
@@ -306,32 +302,26 @@ class ByteSeamInterceptor(InterceptorInterface):
     def _at_fork_reinit(self) -> None:
         """Fork-child reset: drop the inherited connection table, remember it.
 
-        NOT `uninstall()` in a smaller coat, and the differences are the
-        design: the patches stay installed (I-fork-4 — they crossed the fork
-        and still work), nothing is retired or emitted (`_retire` would EMIT
-        the inherited WS sessions, which the parent owns and will emit
-        itself — I-fork-3), and the probes keep their refcounts (the shared
-        singletons reset their own state through the runtime, not through the
-        seams). What goes is the per-connection state: an inherited entry
-        would hand a recycled `id()` a dead connection's tracker and latched
-        gate — the close-hook bug's cross-process edition — and an inherited
-        LIVE socket's tracker holds a parse position that is a lie in a child
-        that missed bytes.
+        NOT `uninstall()` in a smaller coat, and the differences are the design: the patches stay
+        installed (I-fork-4 — they crossed the fork and still work), nothing is retired or emitted
+        (`_retire` would EMIT the inherited WS sessions, which the parent owns and will emit itself
+        — I-fork-3), and the probes keep their refcounts (the shared singletons reset their own
+        state through the runtime, not through the seams). What goes is the per-connection state: an
+        inherited entry would hand a recycled `id()` a dead connection's tracker and latched gate —
+        the close-hook bug's cross-process edition — and an inherited LIVE socket's tracker holds a
+        parse position that is a lie in a child that missed bytes.
 
-        The ids are LATCHED before the clear, capped at `max_connections`
-        newest-first (dict order is insertion order; anything beyond the cap
-        was oldest and is dropped — the same drop-oldest posture as the table
-        itself). `_state` consumes the latch: the first span assembled on a
-        connection whose id survives here says `TRACKING_RESET_AT_FORK`
-        instead of silently reporting mid-stream parses as clean ones — every
-        OTHER path that discards a live `_ConnectionState` leaves a marker
-        (`CONNECTION_EVICTED`, `WS_NO_CLOSE`), and the fork path may not be
-        the one silent exception.
+        The ids are LATCHED before the clear, capped at `max_connections` newest-first (dict order
+        is insertion order; anything beyond the cap was oldest and is dropped — the same drop-oldest
+        posture as the table itself). `_state` consumes the latch: the first span assembled on a
+        connection whose id survives here says `TRACKING_RESET_AT_FORK` instead of silently
+        reporting mid-stream parses as clean ones — every OTHER path that discards a live
+        `_ConnectionState` leaves a marker (`CONNECTION_EVICTED`, `WS_NO_CLOSE`), and the fork path
+        may not be the one silent exception.
 
-        Locks: this seam's table has none to replace (`_conns` is unlocked by
-        the same argument `CloseRegistry` documents); the PatchSet's lock is
-        the one inherited lock this seam owns, and it is replaced through the
-        set's own reset.
+        Locks: this seam's table has none to replace (`_conns` is unlocked by the same argument
+        `CloseRegistry` documents); the PatchSet's lock is the one inherited lock this seam owns,
+        and it is replaced through the set's own reset.
         """
         self._patches._at_fork_reinit()
         ids = list(self._conns)
@@ -390,7 +380,7 @@ class ByteSeamInterceptor(InterceptorInterface):
 
     @abstractmethod
     def _resolve_timing(
-        self, obj: Any, st: _ConnectionState
+        self, obj: Any | None, st: _ConnectionState
     ) -> tuple[float | None, float | None, bool | None, tuple[Limitation, ...]]: ...
 
     def _guard(self, where: str) -> guard:
@@ -413,22 +403,19 @@ class ByteSeamInterceptor(InterceptorInterface):
     def _capture_possible(self, obj: Any) -> bool:
         """Can this seam capture ANYTHING on this connection, right now?
 
-        The early half of the split described at the top of this module. It
-        runs in front of every `send` and every `recv` of every socket in the
-        process, so it is three reads and no allocation — it has to cost less
-        than the buffer copy it exists to skip.
+        The early half of the split described at the top of this module. It runs in front of every
+        `send` and every `recv` of every socket in the process, so it is three reads and no
+        allocation — it has to cost less than the buffer copy it exists to skip.
 
-        A conservative answer in one direction only: True means "nothing
-        invariant rules this out", not "this will be captured". Everything that
-        depends on the transaction — the policy's ambient-span clause, the
-        LLM-semantic claim — is still ahead, in `_should_capture`.
+        A conservative answer in one direction only: True means "nothing invariant rules this out",
+        not "this will be captured". Everything that depends on the transaction — the policy's
+        ambient-span clause, the LLM-semantic claim — is still ahead, in `_should_capture`.
 
-        Asked again at the top of `_on_request_bytes`/`_on_response_bytes`
-        rather than trusted from the wrapper that already asked: those two are
-        the seam's real entry points, reached directly by every subclass and by
-        the tests, and a guard that lives only in the patch wrappers is not
-        there at all for half its callers. The repeat is a dict lookup and a
-        ContextVar read against work measured in kilobytes.
+        Asked again at the top of `_on_request_bytes`/`_on_response_bytes` rather than trusted from
+        the wrapper that already asked: those two are the seam's real entry points, reached directly
+        by every subclass and by the tests, and a guard that lives only in the patch wrappers is not
+        there at all for half its callers. The repeat is a dict lookup and a ContextVar read against
+        work measured in kilobytes.
         """
         if self._client is None:
             return False
@@ -440,13 +427,11 @@ class ByteSeamInterceptor(InterceptorInterface):
     def _transport_prefilter(self, st: _ConnectionState) -> Prefilter:
         """This seam's opinion about the connection itself, before the policy.
 
-        `DEFER` is the base answer, and it is the honest one for a TLS seam: it
-        knows nothing about the peer that `assembly.should_capture` does not
-        already know better. A seam that DOES know something — the plaintext
-        socket seam, which must never read a link-local metadata endpoint and
-        must always honour `intercept_hosts` — overrides this, and only this.
-        Overriding `_should_capture` itself is what produced the two bugs
-        design §4.4 names.
+        `DEFER` is the base answer, and it is the honest one for a TLS seam: it knows nothing about
+        the peer that `assembly.should_capture` does not already know better. A seam that DOES know
+        something — the plaintext socket seam, which must never read a link-local metadata endpoint
+        and must always honour `intercept_hosts` — overrides this, and only this. Overriding
+        `_should_capture` itself is what produced the two bugs design §4.4 names.
         """
         return Prefilter.DEFER
 
@@ -460,7 +445,9 @@ class ByteSeamInterceptor(InterceptorInterface):
         st = self._conns.get(cid)
         if st is None:
             addr, port = peer_address(obj)
-            st = _ConnectionState(self._select_tracker(obj), addr, port)
+            hostname = getattr(obj, "server_hostname", None)
+            st = _ConnectionState(self._select_tracker(obj), addr, port, hostname)
+            st.connection_id = str(cid)
             if cid in self._reset_at_fork_ids:
                 # This object was tracked when the fork reset the table, so it is (to the limit of
                 # id() identity) an INHERITED connection: the new tracker starts mid-stream. Consume
@@ -480,15 +467,14 @@ class ByteSeamInterceptor(InterceptorInterface):
     def _connection_closed(self, cid: int) -> None:
         """The connection behind `cid` is over: retire its state, keep its data.
 
-        The FIFO cap in `_state` was the only thing that ever removed an entry,
-        and it removes the wrong one — the oldest, which on a long-lived process
-        is the connection still streaming, while the entries of connections that
-        died an hour ago stay. Worse, the entry outliving its socket is what let
-        a recycled `id()` serve a new connection the dead one's tracker and its
+        The FIFO cap in `_state` was the only thing that ever removed an entry, and it removes the
+        wrong one — the oldest, which on a long-lived process is the connection still streaming,
+        while the entries of connections that died an hour ago stay. Worse, the entry outliving its
+        socket is what let a recycled `id()` serve a new connection the dead one's tracker and its
         latched "ignore" verdict.
 
-        Idempotent by construction: the registry fires a hook at most once, and
-        an already-evicted id pops nothing.
+        Idempotent by construction: the registry fires a hook at most once, and an already-evicted
+        id pops nothing.
         """
         st = self._conns.pop(cid, None)
         if st is not None:
@@ -500,16 +486,19 @@ class ByteSeamInterceptor(InterceptorInterface):
         Three callers — the close hook, the FIFO cap and `uninstall()` — and they differ only in
         the marker they can honestly claim and in whether the connection is over. The tracker
         decides what survives its own end: a WebSocket session is a span that exists ONLY at
-        close, so it is emitted here rather than dropped, and every other tracker answers with an
-        empty list after releasing whatever it was holding. `still_open` (the FIFO cap,
-        `uninstall()`): the session goes on unwatched, so what was counted and timed so far is part
-        of it, not its size or length.
+        close, and an HTTP/1 response still in flight at a REAL close ships as the partial span it
+        is (sealed with no socket: `_seal(None, ...)`); both are emitted here rather than
+        dropped. `still_open` (the FIFO cap, `uninstall()`): the session goes on unwatched, so what
+        was counted and timed so far is part of it, not its size or length.
 
-        Runs inside `socket.close()` and inside garbage collection, so it must
-        stay short and must not raise; `_emit_ws` already carries the guard.
+        Runs inside `socket.close()` and inside garbage collection, so it must stay short and must
+        not raise; `_emit_ws` and `_emit_span` already carry the guard.
         """
-        for txn in st.tracker.on_connection_close(marker):
-            self._emit_ws(st, txn, whole=not still_open)
+        for txn in st.tracker.on_connection_close(marker, still_open=still_open):
+            if txn.version == "websocket":
+                self._emit_ws(st, txn, whole=not still_open)
+            else:
+                self._emit_span(None, st, txn)
 
     # --- Tracker delegation + span assembly ---
 
@@ -570,6 +559,22 @@ class ByteSeamInterceptor(InterceptorInterface):
             else:
                 self._emit_span(obj, st, txn)
 
+    def _on_response_eof(self, obj: Any) -> None:
+        """A read that asked for bytes got none: the peer closed its side. The HTTP/1 tracker ends
+        a body with no framing here (`on_response_eof`) and its span ships while `obj` is live."""
+        st = self._conns.get(id(obj))
+        if st is None or st.read_shut or not self._capture_possible(obj):
+            return
+        for txn in getattr(st.tracker, "on_response_eof", list)():
+            self._emit_span(obj, st, txn)
+
+    def _on_read_shutdown(self, obj: Any) -> None:
+        """The client shut its own read side (`shutdown`): from here an empty read is that
+        shutdown's answer, not the peer's EOF, so nothing in flight is ended by one — the close
+        that follows ships it as let go."""
+        if (st := self._conns.get(id(obj))) is not None:
+            st.read_shut = True
+
     def _prefilter_of(self, st: _ConnectionState) -> Prefilter:
         """This seam's transport prefilter, evaluated NOW and fail-open.
 
@@ -586,31 +591,28 @@ class ByteSeamInterceptor(InterceptorInterface):
         return pre
 
     def _seal(
-        self, obj: Any, st: _ConnectionState, txn: _Txn, client: Client
+        self, obj: Any | None, st: _ConnectionState, txn: _Txn, client: Client
     ) -> _PendingTxn | None:
-        """Snapshot, on the CALLER's thread, everything a finalization may
-        need that only this thread can read — and nothing else.
+        """Snapshot, on the CALLER's thread, everything a finalization may need that only this
+        thread can read — and nothing else.
 
-        This is the whole caller-side cost of a completed transaction:
-        `_resolve_timing` (destructive and order-dependent, so it must run
-        here whatever the gate later says — see its comment), the prefilter,
-        a handful of attribute reads, and `copy_context()` (HAMT sharing,
+        This is the whole caller-side cost of a completed transaction: `_resolve_timing`
+        (destructive and order-dependent, so it must run here whatever the gate later says — see its
+        comment), the prefilter, a handful of attribute reads, and `copy_context()` (HAMT sharing,
         O(1)). The parse, the gate and the draft belong to the worker.
 
-        `None` means the prefilter DENIED the connection, or the path is one
-        the endpoint table EXCLUDES (`classify_path`) — either way cheaper
-        than today, because the parse this skips was unconditionally paid
-        before.
+        `None` means the prefilter DENIED the connection, or the path is one the endpoint table
+        EXCLUDES (`classify_path`) — either way cheaper than today, because the parse this skips was
+        unconditionally paid before.
 
-        The fork latch is consumed here rather than at assembly: `st` must
-        not travel with the job (I-F1), so the first transaction SEALED on a
-        fork-crossing connection carries the marker in its sealed
-        timing markers. (Before the deferred split the stamp happened below
-        the gate — first CAPTURED transaction; the seal is the earliest
-        moment the fact can leave the connection state, and a gate-refused
-        first transaction consumes the latch too; an EXCLUDED one does not —
-        it returns above the latch block — so the marker lands on the
-        connection's next sealed transaction.)
+        The fork latch is consumed here rather than at assembly: `st` must not travel with the job
+        (I-F1), so the first transaction SEALED on a fork-crossing connection carries the marker in
+        its sealed timing markers. (Before the deferred split the stamp happened below the gate —
+        first CAPTURED transaction; the seal is the earliest moment the fact can leave the
+        connection state, and a gate-refused first transaction consumes the latch too; an EXCLUDED
+        one does not — it returns above the latch block — so the marker lands on the connection's
+        next sealed transaction.) `obj` is None after a close (`_retire`): what it would give is
+        read off `st` instead.
         """
         url_host = _url_host(obj, st)
         ct = txn.content_type or ""
@@ -648,7 +650,7 @@ class ByteSeamInterceptor(InterceptorInterface):
             url_host=url_host,
             url_scheme=self._url_scheme(False),
             capture_source=self._capture_source(),
-            connection_id=str(id(obj)),
+            connection_id=str(id(obj)) if obj is not None else st.connection_id,
             server_address=st.server_address,
             server_port=st.server_port,
             is_grpc=is_grpc,
@@ -680,21 +682,18 @@ class ByteSeamInterceptor(InterceptorInterface):
             draft.add_limitation(Limitation.TRACKING_RESET_AT_FORK)
             counters.bump("interceptors.seam.tracking_reset_at_fork")
 
-    def _emit_span(self, obj: Any, st: _ConnectionState, txn: _Txn) -> None:
-        """Seal on this thread; finalize on the worker — with two measured
-        exceptions that assemble inline.
+    def _emit_span(self, obj: Any | None, st: _ConnectionState, txn: _Txn) -> None:
+        """Seal on this thread; finalize on the worker — with two measured exceptions that assemble
+        inline.
 
-        gRPC (§3.6): there is nothing to defer — `parse_llm_semantics` was
-        never called on protobuf, and `build_grpc_fields` is µs-grade framing
-        (offset jumps, no decompression). Queueing it would let a 64 MiB
-        protobuf body evict REAL parse jobs from the backlog, and a fallback
-        that skipped the framing would downgrade the label/status of a span
-        whose expensive step never existed. WebSocket rides `_emit_ws` below
-        for the same class of reason.
+        gRPC (§3.6): there is nothing to defer — `parse_llm_semantics` was never called on protobuf,
+        and `build_grpc_fields` is µs-grade framing (offset jumps, no decompression). Queueing it
+        would let a 64 MiB protobuf body evict REAL parse jobs from the backlog, and a fallback that
+        skipped the framing would downgrade the label/status of a span whose expensive step never
+        existed. WebSocket rides `_emit_ws` below for the same class of reason.
 
-        `capture_deferred` is a total function, but it stays inside the emit
-        guard anyway: the blast radius of this path must remain exactly what
-        it was before the split.
+        `capture_deferred` is a total function, but it stays inside the emit guard anyway: the blast
+        radius of this path must remain exactly what it was before the split.
         """
         client = self._client
         if client is None:
@@ -808,24 +807,21 @@ class ByteSeamInterceptor(InterceptorInterface):
 
 @dataclass(frozen=True, slots=True)
 class _PendingTxn:
-    """One sealed transaction — everything the finalization may read, and
-    NOTHING else (invariants I-F1/I-F2).
+    """One sealed transaction — everything the finalization may read, and NOTHING else (invariants
+    I-F1/I-F2).
 
-    No socket, no `_ConnectionState`, no tracker, no seam, no client. That is
-    not tidiness, it is the mechanism: `_assemble`/`_parse_semantics` below
-    are MODULE functions over this dataclass, so "the worker read seam state
-    that changed under it" is not a bug class that can be written — a
-    re-install that swaps `seam._native_limits` cannot touch a sealed job,
-    because the job holds its own `limits` and the seam is not in scope.
-    (An earlier draft kept them as methods and declared the snapshot in
-    prose; the prose was false within one review pass — `p.limits` was a
-    dead field. Structure over promise.)
+    No socket, no `_ConnectionState`, no tracker, no seam, no client. That is not tidiness, it is
+    the mechanism: `_assemble`/`_parse_semantics` below are MODULE functions over this dataclass, so
+    "the worker read seam state that changed under it" is not a bug class that can be written — a
+    re-install that swaps `seam._native_limits` cannot touch a sealed job, because the job holds its
+    own `limits` and the seam is not in scope. (An earlier draft kept them as methods and declared
+    the snapshot in prose; the prose was false within one review pass — `p.limits` was a dead field.
+    Structure over promise.)
 
-    `ctx` carries the IMMUTABLE-fact ContextVars (`in_degraded_run` and
-    friends) — `run`/`fallback` execute inside it. Mutable Scope state
-    travels separately, as the snapshot `Client.capture_deferred` takes
-    (design §3.7). `size` is the queue's byte-accounting unit: the raw
-    bodies this job keeps resident while it waits.
+    `ctx` carries the IMMUTABLE-fact ContextVars (`in_degraded_run` and friends) — `run`/`fallback`
+    execute inside it. Mutable Scope state travels separately, as the snapshot
+    `Client.capture_deferred` takes (design §3.7). `size` is the queue's byte-accounting unit: the
+    raw bodies this job keeps resident while it waits.
     """
 
     txn: _Txn
@@ -858,14 +854,12 @@ class _PendingTxn:
 
 
 def _parse_semantics(p: _PendingTxn) -> Any:
-    """LLM semantics for a sealed transaction, or None. A module function
-    with no try: the ONE swallow for a raising parser is the guard in
-    `_assemble`, which counts and (under debug) logs — the bare
-    `except: return None` this replaces was an uncounted I6 violation.
+    """LLM semantics for a sealed transaction, or None. A module function with no try: the ONE
+    swallow for a raising parser is the guard in `_assemble`, which counts and (under debug) logs —
+    the bare `except: return None` this replaces was an uncounted I6 violation.
 
-    The limits are THE JOB'S snapshot, not the seam's live attribute: that
-    is wiring, not prose — a re-install between seal and finalize cannot
-    change what bounds this parse.
+    The limits are THE JOB'S snapshot, not the seam's live attribute: that is wiring, not prose — a
+    re-install between seal and finalize cannot change what bounds this parse.
     """
     return parse_llm_semantics(
         p.url_host,
@@ -879,25 +873,23 @@ def _parse_semantics(p: _PendingTxn) -> Any:
 def _should_capture(
     prefilter: Prefilter, txn: Any, sem: Any, *, mode: CaptureMode, unparsed: bool = False
 ) -> bool:
-    """The seam's capture decision: the transport prefilter composed with the
-    one shared policy. The old method of the same name, made a function of
-    its inputs (so the worker can ask it over a sealed `_PendingTxn`).
+    """The seam's capture decision: the transport prefilter composed with the one shared policy. The
+    old method of the same name, made a function of its inputs (so the worker can ask it over a
+    sealed `_PendingTxn`).
 
-    `unparsed` widens `degraded` (§3.9): "wardex is the reason a gate input
-    is missing" now covers the SEMANTIC CLAIM as well as the parent — a
-    fallback that skipped the parse cannot honestly answer `agent_semantic`,
-    exactly as `degraded_run` cannot honestly answer `parent`. The policy's
+    `unparsed` widens `degraded` (§3.9): "wardex is the reason a gate input is missing" now covers
+    the SEMANTIC CLAIM as well as the parent — a fallback that skipped the parse cannot honestly
+    answer `agent_semantic`, exactly as `degraded_run` cannot honestly answer `parent`. The policy's
     signature does not change; the widening is this caller's input.
 
-    A WS session that confirmed LLM calls crossed it claims `agent_semantic`
-    without a `sem`: the calls happened, wardex did not read them, and the
-    marked span is the only place that fact can ship.
+    A WS session that confirmed LLM calls crossed it claims `agent_semantic` without a `sem`: the
+    calls happened, wardex did not read them, and the marked span is the only place that fact can
+    ship.
 
-    Failing OPEN around the composition stays this function's job rather
-    than the policy's: `has_core_semantics` runs parser output through
-    host-supplied objects and can raise, `should_capture` cannot — so the
-    swallow sits where the risk is (design §5.1: losing data is worse than
-    noise).
+    Failing OPEN around the composition stays this function's job rather than the policy's:
+    `has_core_semantics` runs parser output through host-supplied objects and can raise,
+    `should_capture` cannot — so the swallow sits where the risk is (design §5.1: losing data is
+    worse than noise).
     """
     try:
         if prefilter is Prefilter.DENY:
@@ -919,25 +911,22 @@ def _should_capture(
 def _assemble(p: _PendingTxn, *, parse: bool, extra: tuple[Limitation, ...]) -> Any:
     """One sealed transaction, finished into a span — on whatever thread.
 
-    The old `_build_span` from the gate down, rewritten over `_PendingTxn`
-    fields so the answer is the same wherever it runs (I-F10). Two callers:
-    the finalize worker (`run`/`fallback`, inside the sealed `ctx`) and the
-    gRPC inline branch of `_emit_span` (§3.6 — same thread that sealed, so
+    The old `_build_span` from the gate down, rewritten over `_PendingTxn` fields so the answer is
+    the same wherever it runs (I-F10). Two callers: the finalize worker (`run`/`fallback`, inside
+    the sealed `ctx`) and the gRPC inline branch of `_emit_span` (§3.6 — same thread that sealed, so
     its ambient context IS the sealed one).
 
-    `parse=False` is the fallback shape: the parse is SKIPPED — backlog
-    eviction, shutdown budget, spawn failure — and `extra` carries the
-    marker that says which. A parse that RAISES is the third shape: counted
-    under the parse guard, marked `INSTRUMENTATION_DEGRADED`, and the span
-    still ships (the defect this design fixes alongside the stall: the old
-    swallow left AGENT-mode spans silently gone with a zero counter).
+    `parse=False` is the fallback shape: the parse is SKIPPED — backlog eviction, shutdown budget,
+    spawn failure — and `extra` carries the marker that says which. A parse that RAISES is the third
+    shape: counted under the parse guard, marked `INSTRUMENTATION_DEGRADED`, and the span still
+    ships (the defect this design fixes alongside the stall: the old swallow left AGENT-mode spans
+    silently gone with a zero counter).
 
-    §3.9's restraint: when the gate admits the span ONLY because of
-    wardex's own degradation (`unparsed` flipped the answer), the raw
-    bodies are withheld. The user's mode excluded this traffic; overload
-    must not become the reason its payloads leave the process. Transport
-    metadata, timing, status and markers stay — what happened is still
-    said; what was SAID in the bodies and the query is not.
+    §3.9's restraint: when the gate admits the span ONLY because of wardex's own degradation
+    (`unparsed` flipped the answer), the raw bodies are withheld. The user's mode excluded this
+    traffic; overload must not become the reason its payloads leave the process. Transport metadata,
+    timing, status and markers stay — what happened is still said; what was SAID in the bodies and
+    the query is not.
     """
     txn = p.txn
     sem: Any = None
@@ -1011,6 +1000,8 @@ def _assemble(p: _PendingTxn, *, parse: bool, extra: tuple[Limitation, ...]) -> 
     output_data, inflate_cut = inflate_body(txn.response_body, p.limits)
     txn.truncated |= inflate_cut  # a prefix of what it inflated to
     status_code = StatusCode.OK if 200 <= txn.status < 400 else StatusCode.ERROR
+    if txn.response_cut and status_code is StatusCode.OK:  # a 2xx whose end nobody saw
+        status_code = StatusCode.UNSET
     # `finish()` refuses `status=ERROR` with no `error.type` and a refused span is a DELETED span,
     # so this may not be left `None`: without it every 4xx/5xx on every byte seam — the rate limit,
     # the auth failure, the provider outage, i.e. the highest-value spans this SDK captures —
@@ -1052,6 +1043,8 @@ def _assemble(p: _PendingTxn, *, parse: bool, extra: tuple[Limitation, ...]) -> 
             identified = _is_llm_traffic(txn, sem)
             if identified:
                 draft.set_gen_ai(build_gen_ai(sem))
+                if status_code is not StatusCode.ERROR and (declared := declared_error_type(sem)):
+                    status_code, error_type = StatusCode.ERROR, declared  # failed in-stream
                 known = txn.issuer_proven and not txn.parent_closed  # closed: refused at the edge
                 apply_request_conversation(draft, edge.conversation, sem.conversation_id, known)
                 if (limitation := provider_limitation(sem)) is not None:
@@ -1166,26 +1159,25 @@ def _assemble(p: _PendingTxn, *, parse: bool, extra: tuple[Limitation, ...]) -> 
 def _latched(txn: _Txn) -> Ambient:
     """The scope as it was when this transaction's request was ISSUED.
 
-    Both emit paths run on the RESPONSE side, where the ambient context has
-    already moved on — so neither may call `latch_ambient()` itself. The tracker
-    did the latching at request time (`_trackers.py`, `self._parent`), and this
-    wraps what it captured in the shape `resolve_parentage` consumes.
+    Both emit paths run on the RESPONSE side, where the ambient context has already moved on — so
+    neither may call `latch_ambient()` itself. The tracker did the latching at request time
+    (`_trackers.py`, `self._parent`), and this wraps what it captured in the shape
+    `resolve_parentage` consumes.
 
-    `parent_closed` travels BESIDE this rather than inside the `Ambient`, for
-    the same reason: it is a fact about the latch INSTANT, and an `Ambient` is
-    the shape `resolve_parentage` consumes, not a place to keep one seam's
-    bookkeeping. `_build_span` and `_build_ws_span` pass it explicitly.
+    `parent_closed` travels BESIDE this rather than inside the `Ambient`, for the same reason: it is
+    a fact about the latch INSTANT, and an `Ambient` is the shape `resolve_parentage` consumes, not
+    a place to keep one seam's bookkeeping. `_build_span` and `_build_ws_span` pass it explicitly.
 
-    `conversation` was latched beside the parent, off the same scope read.
-    `tracestate` is None: the tracker does not latch it, and widening to a full
-    `Ambient` belongs with the seam decomposition (design §3.3).
+    `conversation` was latched beside the parent, off the same scope read. `tracestate` is None: the
+    tracker does not latch it, and widening to a full `Ambient` belongs with the seam decomposition
+    (design §3.3).
     """
     return Ambient(span_context=txn.parent, conversation=txn.conversation, tracestate=None)
 
 
-def _url_host(obj: Any, st: _ConnectionState) -> str:
+def _url_host(obj: Any | None, st: _ConnectionState) -> str:
     """The host a URL on this connection names: the TLS server name when
     there is one, else the peer address `peer_address` recorded on `st`. One
     expression for the WS swap site and `_seal`, so the WebSocket-transport
     question and the HTTP span's URL are asked about the same host."""
-    return getattr(obj, "server_hostname", None) or st.server_address
+    return getattr(obj, "server_hostname", None) or st.server_hostname or st.server_address

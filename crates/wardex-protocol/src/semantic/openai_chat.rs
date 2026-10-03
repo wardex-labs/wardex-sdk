@@ -74,6 +74,10 @@ struct OpenAIChatResponse {
     service_tier: Option<String>,
     #[serde(default)]
     system_fingerprint: Option<String>,
+    /// Present on a bare HTTP error envelope, and on the synthetic body of a
+    /// stream that carried an in-stream `error` chunk (`reassemble_openai`).
+    #[serde(default)]
+    error: Option<serde_json::Value>,
 }
 #[derive(Deserialize)]
 struct OpenAIChatRequest {
@@ -241,6 +245,21 @@ pub(super) fn fill_openai_chat(
     // the request half below refines it from `response_format.type`.
     out.output_type = Some("text".to_string());
     if let Ok(r) = serde_json::from_slice::<OpenAIChatResponse>(resp) {
+        // An error object INSIDE a response object is the provider's own
+        // failure declaration — the in-stream `error` chunk, which the
+        // reassembler keeps in the synthetic body — and it wins over whatever
+        // finish the choices carried. An empty or falsy `error` declares
+        // nothing (`declares_failure`, the same test the reassembler applies
+        // to each chunk). A bare HTTP error envelope
+        // (`{"error":{...}}`, no id, no choices) is not a response object:
+        // it keeps an EMPTY response half, as before, and its span takes the
+        // error from the HTTP status.
+        let is_response_object = r.id.is_some() || !r.choices.is_empty();
+        let declared = r
+            .error
+            .as_ref()
+            .filter(|e| is_response_object && declares_failure(e))
+            .map(declared_error_type);
         out.response_id = r.id;
         out.response_model = r.model;
         let mut fr: Vec<String> = Vec::new();
@@ -249,10 +268,13 @@ pub(super) fn fill_openai_chat(
             // One producer for both carriers: the normalized value goes into
             // `finish_reasons` AND onto the message (unknown raw passes
             // through as itself — total function, never a silent drop).
-            let finish_reason = c
-                .finish_reason
-                .as_deref()
-                .map(|f| normalize_finish_reason("openai", f));
+            let finish_reason = if declared.is_some() {
+                Some(FINISH_ERROR.to_string())
+            } else {
+                c.finish_reason
+                    .as_deref()
+                    .map(|f| normalize_finish_reason("openai", f))
+            };
             if let Some(f) = &finish_reason {
                 fr.push(f.clone());
             }
@@ -297,6 +319,7 @@ pub(super) fn fill_openai_chat(
         if !fr.is_empty() {
             out.finish_reasons = Some(fr);
         }
+        out.error_type = declared;
         if out.output_messages.is_none() {
             out.output_messages = build_output_messages(msgs);
         }
@@ -362,6 +385,24 @@ pub(super) fn output_type_from_format(format: Option<&serde_json::Value>) -> &'s
     }
 }
 
+/// Whether a top-level `error` value declares a failure. The OpenAI SDK's
+/// stream raises `APIError` only when `data.get("error")` is truthy, so this
+/// is Python truthiness over JSON: `null`, `false`, `0`, `""`, `[]` and `{}`
+/// declare nothing, and a chunk or body carrying one of them beside its
+/// choices is an ordinary one. Any other value is the provider's failure,
+/// whatever its shape.
+fn declares_failure(error: &serde_json::Value) -> bool {
+    use serde_json::Value;
+    match error {
+        Value::Null => false,
+        Value::Bool(b) => *b,
+        Value::Number(n) => n.as_f64() != Some(0.0),
+        Value::String(s) => !s.is_empty(),
+        Value::Array(a) => !a.is_empty(),
+        Value::Object(o) => !o.is_empty(),
+    }
+}
+
 /// OpenAI chat stream chunks → synthetic non-streaming-shaped JSON.
 /// Accumulates tool_call deltas into a BTreeMap keyed by index, concatenating the arguments string,
 /// then emits them as the choices[0].message.tool_calls array → fill_openai_chat reuses it for extraction.
@@ -378,6 +419,13 @@ pub(super) fn reassemble_openai(events: &[SseEvent]) -> Reassembled {
     // OpenAI-compatible gateway that omits `[DONE]` must not read as an
     // unterminated stream when its last chunk said why it stopped.
     let mut terminated = false;
+    // The in-stream failure: a chunk whose top-level `error` declares one
+    // (`declares_failure`, the test the OpenAI SDK raises `APIError` on). The
+    // only bytes that name the failure, so they are kept for the synthetic
+    // body, and a terminal form: the provider said why the stream ends.
+    // Asked of every chunk, choices or not: OpenRouter's documented
+    // mid-stream error carries a choice beside the error.
+    let mut error: Option<serde_json::Value> = None;
     for ev in events {
         if ev.data.trim() == "[DONE]" {
             terminated = true;
@@ -435,6 +483,10 @@ pub(super) fn reassemble_openai(events: &[SseEvent]) -> Reassembled {
                 terminated = true;
             }
         }
+        if let Some(e) = v.get("error").filter(|e| declares_failure(e)) {
+            error = Some(e.clone());
+            terminated = true;
+        }
         if let Some(u) = v.get("usage") {
             if !u.is_null() {
                 usage = Some(u.clone());
@@ -466,8 +518,239 @@ pub(super) fn reassemble_openai(events: &[SseEvent]) -> Reassembled {
     if let Some(u) = usage {
         obj["usage"] = u;
     }
+    if let Some(e) = error {
+        // Preserved, not dropped: the fill maps it to `finish_reasons=
+        // ["error"]` and `error_type`, the provider's own declaration.
+        obj["error"] = e;
+    }
     Reassembled {
         body: serde_json::to_vec(&obj).unwrap_or_default(),
         terminated,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::{parse_llm, LlmSemantics};
+    use wardex_limits::Limits;
+
+    const ERROR_REQUEST: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/llm/openai_chat_sse_error/request.json"
+    ));
+    const ERROR_STREAM: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/llm/openai_chat_sse_error/stream.sse"
+    ));
+
+    fn chat(req: &[u8], resp: &[u8]) -> LlmSemantics {
+        parse_llm(
+            "api.openai.com",
+            "/v1/chat/completions",
+            req,
+            resp,
+            Limits::default(),
+        )
+        .expect("a chat endpoint always parses")
+    }
+
+    fn json(bytes: Option<&[u8]>) -> serde_json::Value {
+        serde_json::from_slice(bytes.unwrap_or_default()).unwrap_or_default()
+    }
+
+    /// A stream that ends in a top-level `error` chunk: the error object (the
+    /// only bytes that name the failure) survives into the synthetic body, the
+    /// text that arrived before it is kept, and the finish is the provider's
+    /// own failure declaration, normalized — not a silent drop.
+    #[test]
+    fn an_error_chunk_is_kept_in_the_body_and_becomes_the_finish() {
+        let s = chat(ERROR_REQUEST, ERROR_STREAM);
+        assert_eq!(s.stream_terminated, Some(true), "the error ends the stream");
+        assert_eq!(s.finish_reasons, Some(vec!["error".to_string()]));
+        assert_eq!(s.error_type.as_deref(), Some("server_error"));
+        assert_eq!(
+            s.usage.output_tokens(),
+            None,
+            "no usage arrived; none is invented"
+        );
+        let body = json(s.decoded_response.as_deref());
+        assert_eq!(body["error"]["type"], "server_error");
+        assert_eq!(
+            body["error"]["message"],
+            "The server had an error while processing your request."
+        );
+        let msgs = json(s.output_messages.as_deref().map(str::as_bytes));
+        assert_eq!(msgs.as_array().map(Vec::len), Some(1), "{msgs}");
+        assert_eq!(msgs[0]["finish_reason"], "error");
+        assert_eq!(msgs[0]["parts"][0]["content"], "Hello");
+    }
+
+    /// The error object is read where it is, not where one shape puts it: a
+    /// numeric `code` (OpenAI-compatible gateways put the HTTP status there),
+    /// a `type` alone, or neither — declared, unclassified, still a failure.
+    #[test]
+    fn an_error_chunk_is_classified_by_code_then_type() {
+        let head = r#"data: {"id":"c","model":"m","choices":[{"delta":{"content":"x"}}]}"#;
+        for (error, expected) in [
+            (
+                r#"{"code":"rate_limit_exceeded","type":"requests"}"#,
+                "rate_limit_exceeded",
+            ),
+            (r#"{"code":400,"type":"BadRequestError"}"#, "400"),
+            (r#"{"code":null,"type":"server_error"}"#, "server_error"),
+            (r#"{"message":"unclassified"}"#, ""),
+            (r#""a bare string""#, ""),
+        ] {
+            let sse = format!("{head}\n\ndata: {{\"error\":{error}}}\n\n");
+            let s = chat(br#"{"model":"m"}"#, sse.as_bytes());
+            assert_eq!(s.error_type.as_deref(), Some(expected), "{error}");
+            assert_eq!(s.finish_reasons, Some(vec!["error".to_string()]), "{error}");
+        }
+    }
+
+    /// An `error` chunk that ALSO carries a `choices` array is still the
+    /// provider's failure declaration. OpenRouter documents its mid-stream
+    /// error that way: the error at the top level plus a choice whose finish
+    /// is `"error"`. A choice with no finish at all, or an empty array, must
+    /// not hide the error either: the OpenAI SDK raises on any chunk whose
+    /// top-level `error` is truthy, whatever else the chunk holds.
+    #[test]
+    fn an_error_chunk_that_also_carries_choices_still_declares_the_failure() {
+        let head =
+            r#"data: {"id":"c","model":"m","choices":[{"index":0,"delta":{"content":"Hel"}}]}"#;
+        for (choices, error, expected) in [
+            (
+                r#"[{"index":0,"delta":{"content":""},"finish_reason":"error","native_finish_reason":"error"}]"#,
+                r#"{"code":502,"message":"Provider returned error","metadata":{"error_type":"upstream"}}"#,
+                "502",
+            ),
+            (
+                r#"[{"index":0,"delta":{},"finish_reason":null}]"#,
+                r#"{"message":"boom","type":"server_error","param":null,"code":null}"#,
+                "server_error",
+            ),
+            (
+                "[]",
+                r#"{"message":"boom","type":"server_error","param":null,"code":null}"#,
+                "server_error",
+            ),
+        ] {
+            let sse = format!(
+                "{head}\n\ndata: {{\"id\":\"c\",\"model\":\"m\",\"error\":{error},\"choices\":{choices}}}\n\n"
+            );
+            let s = chat(br#"{"model":"m","stream":true}"#, sse.as_bytes());
+            assert_eq!(s.error_type.as_deref(), Some(expected), "{choices}");
+            assert_eq!(
+                s.finish_reasons,
+                Some(vec!["error".to_string()]),
+                "{choices}"
+            );
+            assert_eq!(s.stream_terminated, Some(true), "{choices}");
+            let body = json(s.decoded_response.as_deref());
+            assert_eq!(body["error"], json(Some(error.as_bytes())), "{choices}");
+            let msgs = json(s.output_messages.as_deref().map(str::as_bytes));
+            assert_eq!(msgs[0]["parts"][0]["content"], "Hel", "{choices}");
+        }
+    }
+
+    /// `"error": null` on an ordinary chunk is not a failure, and the stream
+    /// still finishes the way it said.
+    #[test]
+    fn a_null_error_field_is_not_a_failure() {
+        let sse = b"data: {\"id\":\"c\",\"model\":\"m\",\"error\":null,\"choices\":[{\"delta\":{\"content\":\"x\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+        let s = chat(br#"{"model":"m"}"#, sse);
+        assert_eq!(s.error_type, None);
+        assert_eq!(s.finish_reasons, Some(vec!["stop".to_string()]));
+        let body = json(s.decoded_response.as_deref());
+        assert!(body.get("error").is_none(), "{body}");
+    }
+
+    /// The OpenAI SDK raises only when a chunk's `error` is truthy, so an
+    /// empty or falsy one — beside a choice, or on a chunk of its own — is
+    /// not a failure: the stream finishes the way its choice said and the
+    /// body names no error. A non-empty string still is one.
+    #[test]
+    fn a_falsy_error_field_is_not_a_failure() {
+        let head =
+            r#"data: {"id":"c","model":"m","choices":[{"index":0,"delta":{"content":"Hel"}}]}"#;
+        let tail = r#"{"index":0,"delta":{"content":"lo"},"finish_reason":"stop"}"#;
+        for falsy in ["{}", r#""""#, "false", "0", "0.0", "[]"] {
+            for sse in [
+                format!(
+                    "{head}\n\ndata: {{\"id\":\"c\",\"model\":\"m\",\"error\":{falsy},\
+                     \"choices\":[{tail}]}}\n\ndata: [DONE]\n\n"
+                ),
+                format!(
+                    "{head}\n\ndata: {{\"error\":{falsy}}}\n\n\
+                     data: {{\"id\":\"c\",\"model\":\"m\",\"choices\":[{tail}]}}\n\n\
+                     data: [DONE]\n\n"
+                ),
+            ] {
+                let s = chat(br#"{"model":"m","stream":true}"#, sse.as_bytes());
+                assert_eq!(s.error_type, None, "{sse}");
+                assert_eq!(s.finish_reasons, Some(vec!["stop".to_string()]), "{sse}");
+                let body = json(s.decoded_response.as_deref());
+                assert!(body.get("error").is_none(), "{sse} -> {body}");
+                let msgs = json(s.output_messages.as_deref().map(str::as_bytes));
+                assert_eq!(msgs[0]["parts"][0]["content"], "Hello", "{sse}");
+            }
+        }
+        let sse = format!(
+            "{head}\n\ndata: {{\"id\":\"c\",\"model\":\"m\",\"error\":\"upstream failed\",\
+             \"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"error\"}}]}}\n\n"
+        );
+        let s = chat(br#"{"model":"m","stream":true}"#, sse.as_bytes());
+        assert_eq!(s.error_type.as_deref(), Some(""), "named no class");
+        assert_eq!(s.finish_reasons, Some(vec!["error".to_string()]));
+        assert_eq!(
+            json(s.decoded_response.as_deref())["error"],
+            "upstream failed"
+        );
+    }
+
+    /// A non-streaming response object whose `error` is empty or falsy names
+    /// no failure either: its finish is the one its choice carried.
+    #[test]
+    fn a_falsy_error_in_a_response_body_is_not_a_failure() {
+        for falsy in ["{}", r#""""#, "false", "0", "[]"] {
+            let body = format!(
+                "{{\"id\":\"c\",\"model\":\"m\",\"error\":{falsy},\"choices\":[{{\"index\":0,\
+                 \"message\":{{\"role\":\"assistant\",\"content\":\"x\"}},\"finish_reason\":\"stop\"}}]}}"
+            );
+            let s = chat(br#"{"model":"m"}"#, body.as_bytes());
+            assert_eq!(s.error_type, None, "{body}");
+            assert_eq!(s.finish_reasons, Some(vec!["stop".to_string()]), "{body}");
+        }
+    }
+
+    /// An `error` chunk as the stream's ONLY event, before anything named an
+    /// id or a model: still the provider's failure declaration. No response
+    /// field names the model, so the seam keeps this call on the request's
+    /// model and this declaration together; none is invented here.
+    #[test]
+    fn an_error_chunk_alone_still_declares_the_failure() {
+        let sse = b"data: {\"error\":{\"message\":\"x\",\"type\":\"server_error\",\
+                    \"param\":null,\"code\":null}}\n\n";
+        let s = chat(br#"{"model":"gpt-4o","stream":true}"#, sse);
+        assert_eq!(s.error_type.as_deref(), Some("server_error"));
+        assert_eq!(s.finish_reasons, Some(vec!["error".to_string()]));
+        assert_eq!(s.stream_terminated, Some(true));
+        assert_eq!(s.request_model.as_deref(), Some("gpt-4o"));
+        assert_eq!(s.response_model, None);
+        assert_eq!(s.response_id, None);
+    }
+
+    /// The HTTP error envelope every 4xx/5xx carries is NOT a response
+    /// object: no finish, no output message, no declared error type. That
+    /// span keeps taking its error from the HTTP status.
+    #[test]
+    fn a_bare_error_envelope_still_claims_nothing_about_the_response() {
+        let s = chat(
+            br#"{"model":"m"}"#,
+            br#"{"error":{"message":"slow down","type":"requests","code":"rate_limit_exceeded"}}"#,
+        );
+        assert_eq!(s.finish_reasons, None);
+        assert_eq!(s.output_messages, None);
+        assert_eq!(s.error_type, None);
     }
 }

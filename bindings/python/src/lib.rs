@@ -71,6 +71,14 @@ impl RawHttpMessage {
     fn truncated(&self) -> bool {
         self.inner.truncated
     }
+    /// The stream ended before this message's framing did (a Content-Length
+    /// not reached, a chunked body short of its last chunk, an unframed body
+    /// let go before the peer's EOF). Only a message `finish` hands back can
+    /// carry it.
+    #[getter]
+    fn incomplete(&self) -> bool {
+        self.inner.incomplete
+    }
     #[getter]
     fn header_len(&self) -> usize {
         self.inner.header_len
@@ -234,11 +242,24 @@ impl Http1Parser {
         })
     }
 
-    fn flush_truncated(&mut self) -> PyResult<Option<RawHttpMessage>> {
+    /// The request the next final response answers used `method`: a response
+    /// to HEAD has no body, and a 2xx to CONNECT opens a tunnel (RFC 9112
+    /// §6.3), which the response's own headers cannot say.
+    fn expect_response_to(&mut self, method: &str) -> PyResult<()> {
+        shielded(|| {
+            self.inner.expect_response_to(method);
+            Ok(())
+        })
+    }
+
+    /// The response in flight when the stream ended, if its header block
+    /// completed. `peer_closed`: the peer's EOF was observed, which is what
+    /// ends a body with no framing; anything else in flight is `incomplete`.
+    fn finish(&mut self, peer_closed: bool) -> PyResult<Option<RawHttpMessage>> {
         shielded(|| {
             Ok(self
                 .inner
-                .flush_truncated()
+                .finish(peer_closed)
                 .map(|inner| RawHttpMessage { inner }))
         })
     }
@@ -364,6 +385,13 @@ impl LlmSemantics {
     #[getter]
     fn stream_terminated(&self) -> Option<bool> {
         self.inner.stream_terminated
+    }
+    /// The provider's classification of a failure it declared inside a
+    /// response (an in-stream `error` event): its `code`, else its `type`,
+    /// else "" (declared, unclassified). None when no such failure arrived.
+    #[getter]
+    fn error_type(&self) -> Option<String> {
+        self.inner.error_type.clone()
     }
     /// The `wardex.usage.*` mirror: every scalar leaf of the provider's
     /// usage tree, provider spelling preserved, as (dotted path, value).

@@ -19,10 +19,10 @@ from wardex_sdk._interceptors._peer import peer_address
 from wardex_sdk._interceptors._seam import _ConnectionState
 from wardex_sdk._interceptors._socket import RawSocketInterceptor
 
-# The four `socket.socket` methods this seam patches. All four are INHERITED
+# The five `socket.socket` methods this seam patches. All five are INHERITED
 # from the C base `_socket.socket` — `socket.socket` does not define them — and
 # that is what the restore assertions below turn on.
-_PATCHED = ("send", "sendall", "recv", "recv_into")
+_PATCHED = ("send", "sendall", "recv", "recv_into", "shutdown")
 
 _LLM_RESP = json.dumps(
     {
