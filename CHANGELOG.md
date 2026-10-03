@@ -309,10 +309,11 @@ All notable changes to this project are documented here. The format follows
   response to `HEAD` ends with its headers, as the protocol says, and the
   response after it is read on its own.
 - **A provider error in the middle of a stream now fails the chat span.** When
-  an OpenAI Chat Completions stream sent a top-level `error` chunk, or an
-  Anthropic Messages stream sent an `error` event (an `overloaded_error`
-  mid-stream is the documented case), the span shipped as a success: status
-  OK, no finish reason, and nothing in the reassembled body naming the
+  an OpenAI Chat Completions stream sent a top-level `error` chunk (with or
+  without a `choices` array beside it, as OpenRouter's documented mid-stream
+  error has), or an Anthropic Messages stream sent an `error` event (an
+  `overloaded_error` mid-stream is the documented case), the span shipped as
+  a success: status OK, and nothing in the reassembled body naming the
   failure. Now the error object is kept in the reassembled body, the finish
   reason is `error`, and the span's status is ERROR with the provider's own
   error class (its `code`, else its `type`) as `error.type`, or `_OTHER` when
