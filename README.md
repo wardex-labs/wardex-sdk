@@ -754,7 +754,7 @@ none of: it was written where no `socket.socket` method carries it, such as
 wardex saw their request end: the rest of it went out that way, such as a body
 sent with `os.sendfile`, or the server answered an upload early — the span
 ships as `HTTP ? /` with no request size, and the next request on the
-connection is read as a new one) and
+connection still gets its own span, whether that rest arrives late or never) and
 `interceptors.seam.peer_unresolved` (requests on a connection whose peer
 address wardex could not read: a unix socket, asyncio TLS under uvloop, trio
 TLS (httpx `AsyncClient` under trio included), a sync client's HTTPS call

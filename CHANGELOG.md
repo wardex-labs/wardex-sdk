@@ -296,9 +296,12 @@ All notable changes to this project are documented here. The format follows
   `os.write` on the descriptor) is counted under
   `protocol.http1.request_unobserved` and not shipped; one it saw only the
   start of (the body went out with `os.sendfile`, or the server answered an
-  upload early) ships as before, with no request size, is counted under
-  `protocol.http1.request_unfinished`, and the next request on the
-  connection is read as a new request instead of as the rest of that one.
+  upload early) ships as before, with no request size, and is counted under
+  `protocol.http1.request_unfinished`. The next request on that connection
+  still gets its own span, under the span it was issued in and timed from its
+  own first byte, whether the rest of the unfinished one never arrives or
+  arrives late in the same write (an upload a server answered early and kept
+  reading), and even when that rest happens to contain a request line.
   Cleartext under uvloop or the Windows proactor event loop is still not
   captured, and the README now says so instead of listing cleartext `http`
   without conditions.
