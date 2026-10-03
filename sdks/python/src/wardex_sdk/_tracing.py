@@ -3,11 +3,14 @@ from __future__ import annotations
 import functools
 import inspect
 import os
+import re
 import sys
 import time
+import traceback
 import uuid
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import AbstractContextManager, contextmanager
+from types import TracebackType
 from typing import TYPE_CHECKING, Any
 
 from . import _hub
@@ -389,16 +392,29 @@ class _WithOnly:
     `TypeError` at decoration time, naming the decorators that do it right.
     """
 
-    __slots__ = ("_api", "_cm")
+    __slots__ = ("_api", "_cm", "_span")
 
     def __init__(self, api: str, cm: Any) -> None:
         self._api = api
         self._cm = cm
+        self._span: Span | None = None
 
     def __enter__(self) -> Span:
-        return self._cm.__enter__()
+        self._span = self._cm.__enter__()
+        return self._span
 
     def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> bool | None:
+        # Recorded HERE rather than in `_begin`, because this is the one place
+        # that holds the traceback the host will see: once thrown into the
+        # generator, it carries wardex's own frames at its head.
+        if isinstance(exc, Exception) and self._span is not None:
+            try:
+                _record_exception(self._span, exc, tb)
+            except BaseException:
+                # A signal landing mid-record must not leave the span unfinished
+                # and its fork installed as the active parent.
+                self._cm.__exit__(exc_type, exc, tb)
+                raise
         return self._cm.__exit__(exc_type, exc, tb)
 
     def __call__(self, *args: Any, **kwargs: Any) -> None:
@@ -562,6 +578,108 @@ def _call_site_file(
     if not inside or ".." in inside.split(sep):
         return name
     return base + sep + inside
+
+
+#: A frame line of a formatted traceback (and a `SyntaxError`'s own location).
+_FRAME_FILE = re.compile(r'File "(.+?)", line (?=\d)')
+
+
+def _record_exception(span: Span, exc: Exception, tb: TracebackType | None) -> None:
+    """OTel's recorded exception: status ERROR, `error.type`, one `exception` event.
+
+    Only an `Exception` gets here: a cancellation or an exit signal is not the
+    agent failing. A status the host set inside the block wins, and so does an
+    error type it named; the event is recorded either way, because it is the
+    evidence rather than the verdict. Nothing here writes to `exc` or `tb`, so
+    the host re-raises the very object, with the traceback it had.
+
+    The message and the stack trace are host text like any attribute: the
+    encoder masks them on both wires, and the OTLP value cap cuts them there.
+    """
+    draft = span._draft
+    name = _exception_type(type(exc))
+    with guard("tracing.exception_status", debug=_debug_enabled()):
+        if draft._status is StatusCode.UNSET:
+            draft.set_status(StatusCode.ERROR, draft._status_message)
+        if draft._status is StatusCode.ERROR and not draft._error_type:
+            draft.set_error(name)
+    with guard("tracing.exception_event", debug=_debug_enabled()):
+        try:
+            message = str(exc)
+        except Exception:
+            message = "<exception str() failed>"  # the placeholder `traceback` prints
+        stack = ""
+        with guard("tracing.exception_stacktrace", debug=_debug_enabled()):
+            stack = _stacktrace(exc, tb)
+        attrs = {
+            "exception.type": name,
+            "exception.message": _scrub_home(message),
+            "exception.stacktrace": stack,
+        }
+        draft.add_event("exception", time.time_ns(), **attrs)
+
+
+def _exception_type(cls: type) -> str:
+    """The class's fully qualified name, bare for a builtin — OTel Python's rule."""
+    module = getattr(cls, "__module__", None)
+    qualname = getattr(cls, "__qualname__", None) or cls.__name__
+    return qualname if module in (None, "", "builtins") else f"{module}.{qualname}"
+
+
+def _stacktrace(exc: Exception, tb: TracebackType | None) -> str:
+    """The traceback as Python prints it, with every frame's file placed by the
+    call-site rule: a path relative to its package's import root, or the bare
+    file name, never an absolute path. Locals are never captured."""
+    text = "".join(traceback.TracebackException(type(exc), exc, tb).format())
+    files = _frame_files(exc, tb)
+
+    def place(m: re.Match[str]) -> str:
+        path = m[1]
+        return f'File "{files.get(path) or _call_site_file(path, None)}", line '
+
+    return _scrub_home(_FRAME_FILE.sub(place, text))
+
+
+def _frame_files(exc: BaseException, tb: TracebackType | None) -> dict[str, str]:
+    """Each frame's file, placed with the module its frame ran under.
+
+    Walks the whole graph the formatter prints — `__cause__`, `__context__` and
+    an exception group's members — because a chained traceback's frames are
+    paths too. A file this walk misses still leaves as its bare name.
+    """
+    files: dict[str, str] = {}
+    seen: set[int] = set()
+    todo: list[tuple[BaseException, TracebackType | None]] = [(exc, tb)]
+    while todo:
+        e, t = todo.pop()
+        if id(e) in seen:
+            continue
+        seen.add(id(e))
+        for frame, _ in traceback.walk_tb(t):
+            path = frame.f_code.co_filename
+            if path not in files:
+                files[path] = _call_site_file(path, frame.f_globals.get("__name__"))
+        members = getattr(e, "exceptions", ())
+        for nxt in (e.__cause__, e.__context__, *(members if isinstance(members, tuple) else ())):
+            if isinstance(nxt, BaseException):
+                todo.append((nxt, nxt.__traceback__))
+    return files
+
+
+def _scrub_home(text: str) -> str:
+    """`text` with this process's home folder written as `~`.
+
+    The frame paths are already placed; this catches the home folder wherever
+    else the text carries it — an `OSError` names the file it could not open,
+    and a source line can hold a path literal. Also in its `repr` form, which
+    doubles a Windows backslash.
+    """
+    home = os.path.expanduser("~")
+    if len(home) < 2 or not os.path.isabs(home):
+        return text
+    forms = {home, home.replace("\\", "\\\\")}
+    pattern = "|".join(re.escape(f) for f in sorted(forms, key=len, reverse=True))
+    return re.sub(f"(?:{pattern})(?!\\w)", "~", text)
 
 
 def _call_site(fn: Callable[..., Any]) -> CallSite:
