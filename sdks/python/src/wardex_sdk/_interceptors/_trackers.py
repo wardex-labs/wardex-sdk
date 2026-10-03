@@ -14,11 +14,12 @@ from typing import Any
 
 from .. import _hub, _wardex_native
 from .._assembly import Limitation, counters, parent_is_closed_unit
-from .._protocol import REQUEST_METHODS, WsParser
-from .._protocol._http1 import Http1RequestParser, Http1ResponseParser, declares_event_stream
+from .._protocol import WsParser
+from .._protocol._http1 import Http1ResponseParser, declares_event_stream
 from .._protocol._http2 import Http2Parser
 from .._types import ConversationContext, SpanContext
 from ._h2_issuer import IssuerLink
+from ._http1_requests import RequestSide
 
 
 def _ttft_from_marks(marks: list[tuple[int, int]], header_len: int, start_ns: int) -> float | None:
@@ -208,56 +209,30 @@ class _Txn:
 
 
 class _Http1Tracker:
-    """HTTP/1.1 — per-direction parser + single-slot latch. A response pairs only with a request
-    seen whole: with none of its request seen it is counted, never shipped; with only its start
-    seen it ships, counted, and ORPHANS that request: the next request line is not its body."""
+    """HTTP/1.1 — a response parser, and a request side (`_http1_requests`) that says which
+    request each final reply answers, including when the seam did not see every request byte."""
 
     def __init__(self, limits: object | None = None) -> None:
-        self._limits = limits
-        self._orphaned = False  # the request parser waits on a request whose response shipped
-        self._req = Http1RequestParser(limits)
+        self._requests = RequestSide(limits)
         self._resp = Http1ResponseParser(limits)
-        self._method: str | None = None
-        self._path: str | None = None
-        self._req_body: bytes = b""
-        self._req_truncated: bool = False
-        self._req_limitations: tuple[Limitation, ...] = ()
-        self._req_start_ns: int = 0
         self._resp_first_ns: int = 0
-        self._parent: SpanContext | None = None
-        self._parent_closed: bool = False
-        self._conversation: ConversationContext | None = None
         self._resp_cum: int = 0
         self._resp_marks: list[tuple[int, int]] = []
         self._expect_ws: bool = False
         self._resp_raw: bytes = b""
 
+    def _upgrade_requested(self) -> bool:
+        request = self._requests.request
+        return request is not None and _is_ws_upgrade_request(request.headers)
+
     def on_request_bytes(self, data: bytes) -> list[_Txn]:
-        if self._orphaned and data.startswith(REQUEST_METHODS):  # the orphan's tail went unseen
-            self._req, self._orphaned = Http1RequestParser(self._limits), False
-        if self._req_start_ns == 0 and not self._orphaned:
-            self._req_start_ns = time.time_ns()
-            scope = _hub.get_current_scope()  # ONE read: parent and conversation are one fact
-            self._parent, self._conversation = scope.active_span_context, scope.conversation
-            # Asked on THIS line, where the request is being issued, so that a
-            # context a finished unit left standing is refused before it can
-            # become a parent — or open the `capture_mode=AGENT` gate — for
-            # traffic that has nothing to do with that run.
-            self._parent_closed = parent_is_closed_unit(self._parent)
-        for msg in self._req.feed(data):
-            if self._orphaned:  # its late tail completed it, and its response already shipped
-                self._orphaned = False
-                continue
-            self._method = msg.method
-            self._path = msg.url
-            self._req_body = msg.body
-            self._req_truncated = msg.truncated
-            self._req_limitations = msg.limitations
-            if _is_ws_upgrade_request(msg.headers):
-                self._expect_ws = True
+        self._requests.feed(data)
+        self._expect_ws = self._upgrade_requested()
         return []
 
     def on_response_bytes(self, data: bytes) -> list[_Txn]:
+        if self._requests.decide():
+            self._expect_ws = self._upgrade_requested()
         now = time.time_ns()
         if self._resp_first_ns == 0:
             self._resp_first_ns = now
@@ -271,23 +246,25 @@ class _Http1Tracker:
             if self._expect_ws and msg.status_code == 101 and _is_ws_upgrade_request(msg.headers):
                 ext = _header_get(msg.headers, "sec-websocket-extensions") or ""
                 leftover = self._resp_raw[msg.header_len :]
+                request, issue = self._requests.request, self._requests.issue
+                path = (request.url if request is not None else None) or "/"
                 out.append(
                     _Txn(
-                        method=self._method or "GET",
-                        path=_name_path(self._path or "/"),
-                        target=self._path or "/",
+                        method=(request.method if request is not None else None) or "GET",
+                        path=_name_path(path),
+                        target=path,
                         status=101,
                         request_body=b"",
                         response_body=b"",
-                        parent=self._parent,
-                        parent_closed=self._parent_closed,
-                        conversation=self._conversation,
-                        start_ns=self._req_start_ns or now,
+                        parent=issue.parent,
+                        parent_closed=issue.parent_closed,
+                        conversation=issue.conversation,
+                        start_ns=issue.start_ns or now,
                         end_ns=now,
                         ttfb_ms=None,
                         version="1.1",
                         ws_upgrade=True,
-                        ws_upgrade_path=self._path or "/",
+                        ws_upgrade_path=path,
                         ws_deflate="permessage-deflate" in ext.lower(),
                         ws_leftover=leftover,
                     )
@@ -310,52 +287,45 @@ class _Http1Tracker:
                 continue
             # --- Regular HTTP response (existing behavior) ---
             now = time.time_ns()
-            if self._method is None and self._req.disabled_reason() is None:
-                if self._req_start_ns == 0:  # none of its request arrived: nothing to pair
-                    counters.bump("protocol.http1.request_unobserved")
-                    self._resp_first_ns, self._resp_cum, self._resp_marks = 0, 0, []
-                    continue
-                counters.bump("protocol.http1.request_unfinished")
-                self._orphaned = True
+            taken = self._requests.take()
+            if taken is None:  # none of its request was seen: nothing to pair it with (counted)
+                self._resp_first_ns, self._resp_cum, self._resp_marks = 0, 0, []
+                continue
+            request, issue = taken
             ttfb = (
-                max(0.0, (self._resp_first_ns - self._req_start_ns) / 1e6)
-                if self._req_start_ns and self._resp_first_ns
+                max(0.0, (self._resp_first_ns - issue.start_ns) / 1e6)
+                if issue.start_ns and self._resp_first_ns
                 else None
             )
-            ttft = _ttft_from_marks(self._resp_marks, msg.header_len, self._req_start_ns)
+            ttft = _ttft_from_marks(self._resp_marks, msg.header_len, issue.start_ns)
+            path = (request.url if request is not None else None) or "/"
             out.append(
                 _Txn(
-                    method=self._method or "?",
-                    path=_name_path(self._path or "/"),
-                    target=self._path or "/",
+                    method=(request.method if request is not None else None) or "?",
+                    path=_name_path(path),
+                    target=path,
                     status=msg.status_code or 0,
-                    request_body=self._req_body,
+                    request_body=request.body if request is not None else b"",
                     response_body=msg.body,
-                    parent=self._parent,
-                    parent_closed=self._parent_closed,
-                    conversation=self._conversation,
-                    start_ns=self._req_start_ns or now,
+                    parent=issue.parent,
+                    parent_closed=issue.parent_closed,
+                    conversation=issue.conversation,
+                    start_ns=issue.start_ns or now,
                     end_ns=now,
                     ttfb_ms=ttfb,
-                    truncated=self._req_truncated or msg.truncated,
-                    request_counted=self._method is not None and not self._req_truncated,
+                    truncated=(request is not None and request.truncated) or msg.truncated,
+                    request_counted=request is not None and not request.truncated,
                     response_counted=not msg.truncated,
-                    limitations=_merge_markers(self._req_limitations, msg.limitations),
+                    limitations=_merge_markers(
+                        request.limitations if request is not None else (), msg.limitations
+                    ),
                     version="1.1",
                     ttft_ms=ttft,
                     event_stream=declares_event_stream(_header_get(msg.headers, "content-type")),
                     content_encoding=_header_get(msg.headers, "content-encoding"),
                 )
             )
-            self._method = None
-            self._path = None
-            self._req_body = b""
-            self._req_truncated = False
-            self._req_limitations = ()
-            self._req_start_ns = 0
             self._resp_first_ns = 0
-            self._parent = self._conversation = None
-            self._parent_closed = False
             self._resp_cum = 0
             self._resp_marks = []
             self._expect_ws = False
@@ -363,7 +333,7 @@ class _Http1Tracker:
         return out
 
     def disabled_reason(self) -> str | None:
-        return self._resp.disabled_reason() or self._req.disabled_reason()
+        return self._resp.disabled_reason() or self._requests.disabled_reason()
 
     def on_connection_close(self, marker: Limitation) -> list[_Txn]:
         """The connection ended. Nothing here survives it.
@@ -374,10 +344,9 @@ class _Http1Tracker:
         buffers are released — promptly, rather than whenever the last reference
         to this tracker happens to go — and the caller gets nothing to emit.
         """
-        self._req_body = b""
+        self._requests.release()
         self._resp_raw = b""
         self._resp_marks = []
-        self._orphaned = False
         return []
 
 

@@ -12,9 +12,10 @@ path, and assert what a user reads: one span per request, each with its own
 request body and its own response. On Python 3.10/3.11 the same tests run
 over `send` and must pass unchanged.
 
-The last group covers writes the seam still cannot see (`os.sendfile`,
+The next group covers writes the seam still cannot see (`os.sendfile`,
 `os.write` on the descriptor): a response to such a request is counted and
-never paired with another request.
+never paired with another request. The last covers a reply that comes before
+its request ends, whose rest the seam sees late.
 """
 
 from __future__ import annotations
@@ -342,16 +343,87 @@ def test_the_next_request_after_an_unseen_tail_starts_a_fresh_request():
 
 
 @pytest.mark.usefixtures("fresh_counters")
+def test_a_request_smaller_than_the_unseen_rest_before_it_still_gets_its_own_reply():
+    """The same, with a next request that fits inside the rest that went unseen:
+    read as that rest, it leaves the unfinished request still unfinished, and
+    nothing in the bytes contradicts it. The reply settles it: a reply means a
+    request was sent, and only the other reading holds one."""
+    tracker = _Http1Tracker()
+    first, second = _body("tag1", 64 * 1024), _body("tag2", 512)
+    tracker.on_request_bytes(_head(len(first), "/first"))
+    tracker.on_response_bytes(_response(_reply("tag1")))
+    tracker.on_request_bytes(_head(len(second), "/second") + second)
+    (txn,) = tracker.on_response_bytes(_response(_reply("tag2")))
+
+    assert (txn.method, txn.path, txn.request_body) == ("POST", "/second", second)
+    assert txn.request_counted
+    assert tracker.disabled_reason() is None
+    assert counters.get(_UNFINISHED) == 1
+    assert counters.get(_UNOBSERVED) == 0
+
+
+@pytest.mark.usefixtures("fresh_counters")
+def test_a_next_request_whose_first_write_was_cut_inside_its_method_is_still_its_own():
+    """A nearly full socket buffer can take only `PO` of the next request. The
+    next request begins at the first chunk after the reply, cut or not."""
+    tracker = _Http1Tracker()
+    first, second = _body("tag1", 64 * 1024), _body("tag2", 512)
+    tracker.on_request_bytes(_head(len(first), "/first"))
+    tracker.on_response_bytes(_response(_reply("tag1")))
+    request = _head(len(second), "/second") + second
+    tracker.on_request_bytes(request[:2])
+    tracker.on_request_bytes(request[2:])
+    (txn,) = tracker.on_response_bytes(_response(_reply("tag2")))
+
+    assert (txn.method, txn.path, txn.request_body) == ("POST", "/second", second)
+
+
+@pytest.mark.usefixtures("fresh_counters")
+def test_one_unseen_byte_does_not_turn_the_next_request_into_another_method():
+    """With one byte of the rest unseen, reading on takes the next request's
+    `P` as that byte and parses `OST /second HTTP/1.1` as a whole request. No
+    client sends `OST`: the reply goes to the reading that began at `POST`."""
+    tracker = _Http1Tracker()
+    first, second = _body("tag1", 64), _body("tag2", 512)
+    tracker.on_request_bytes(_head(len(first), "/first") + first[:-1])
+    tracker.on_response_bytes(_response(_reply("tag1")))
+    tracker.on_request_bytes(_head(len(second), "/second") + second)
+    (txn,) = tracker.on_response_bytes(_response(_reply("tag2")))
+
+    assert (txn.method, txn.path, txn.request_body) == ("POST", "/second", second)
+    assert tracker.disabled_reason() is None
+
+
+@pytest.mark.usefixtures("fresh_counters")
+def test_a_reply_with_no_request_bytes_since_the_last_reply_is_counted_not_shipped():
+    tracker = _Http1Tracker()
+    body = _body("tag0", 64)
+    tracker.on_request_bytes(_head(len(body)) + body)
+    (first,) = tracker.on_response_bytes(_response(_reply("tag0")))
+    assert first.method == "POST"
+    # The next request was written entirely where the seam does not look.
+    assert tracker.on_response_bytes(_response(_reply("tag1"))) == []
+    assert counters.get(_UNOBSERVED) == 1
+
+
+# --- a reply that comes before its request ends --------------------------------
+#
+# A server may answer an upload early (a 413, a 401) and still read the rest of
+# it, so the connection stays usable. The rest then arrives AFTER the reply, and
+# it is the unfinished request's own: neither its content nor the write it rides
+# in may decide where the next request starts.
+
+_EARLY = b"HTTP/1.1 413 Payload Too Large\r\nContent-Length: 0\r\n\r\n"
+
+
+@pytest.mark.usefixtures("fresh_counters")
 def test_an_upload_answered_early_keeps_its_late_tail_out_of_the_next_request():
-    """A server may answer before the upload ends (a 413, a 401) and still read
-    the rest. That tail is the unfinished request's own: it is consumed, the
-    request it completes is dropped (its reply already shipped), and the next
-    request is latched at its own start rather than at the tail's."""
+    """That tail is consumed, the request it completes is dropped (its reply
+    already shipped), and the next request is latched at its own start rather
+    than at the tail's."""
     tracker = _Http1Tracker()
     tracker.on_request_bytes(_head(100, "/upload") + b"x" * 10)
-    (early,) = tracker.on_response_bytes(
-        b"HTTP/1.1 413 Payload Too Large\r\nContent-Length: 0\r\n\r\n"
-    )
+    (early,) = tracker.on_response_bytes(_EARLY)
     assert (early.status, early.request_counted) == (413, False)
     tracker.on_request_bytes(b"x" * 90)  # the rest of the upload, after the reply
     time.sleep(0.01)
@@ -367,15 +439,189 @@ def test_an_upload_answered_early_keeps_its_late_tail_out_of_the_next_request():
 
 
 @pytest.mark.usefixtures("fresh_counters")
-def test_a_reply_with_no_request_bytes_since_the_last_reply_is_counted_not_shipped():
+def test_a_late_tail_and_the_next_request_in_one_write_keep_the_next_requests_parent_and_start():
+    """asyncio queues a `write()` behind bytes still in its buffer and sends
+    them together, so the late tail and the whole next request reach the seam
+    as ONE chunk that opens with body bytes. The next request was still issued
+    where its first byte was seen: under the span that was live, and then."""
+    recorder = RecordingTransport()
+    wardex.init(transport=recorder)
+    try:
+        tracker = _Http1Tracker()
+        tracker.on_request_bytes(_head(100, "/upload") + b"x" * 10)
+        tracker.on_response_bytes(_EARLY)
+        second = _body("tag2", 512)
+        with wardex.span("agent-turn") as turn:
+            issued = time.time_ns()
+            tracker.on_request_bytes(b"x" * 90 + _head(len(second), "/second") + second)
+            time.sleep(0.01)
+            (txn,) = tracker.on_response_bytes(_response(_reply("tag2")))
+    finally:
+        wardex.close()
+
+    assert (txn.method, txn.path, txn.request_body) == ("POST", "/second", second)
+    assert txn.parent is not None, "the next request lost the span it was issued in"
+    assert txn.parent.span_id == turn.context.span_id
+    assert issued <= txn.start_ns < txn.end_ns, "the next request was never timed"
+    assert txn.ttfb_ms is not None
+    assert counters.get(_UNFINISHED) == 1
+
+
+@pytest.mark.parametrize(
+    "opening",
+    [
+        pytest.param(b"GET /index.html was fetched\n", id="a-method-word"),
+        pytest.param(b"GET /index.html HTTP/1.1\r\nHost: example\r\n\r\n", id="a-whole-request"),
+    ],
+)
+@pytest.mark.usefixtures("fresh_counters")
+def test_a_late_tail_that_opens_like_a_request_is_still_the_uploads_own(opening):
+    """An upload of logs or of a captured HTTP exchange can hold a request
+    line anywhere, and a write boundary can fall right before one. Read as a
+    new request it would stop the parser, and every later call on the keep-alive
+    connection would ship as `HTTP ?` paired with nobody's request."""
     tracker = _Http1Tracker()
-    body = _body("tag0", 64)
-    tracker.on_request_bytes(_head(len(body)) + body)
-    (first,) = tracker.on_response_bytes(_response(_reply("tag0")))
-    assert first.method == "POST"
-    # The next request was written entirely where the seam does not look.
-    assert tracker.on_response_bytes(_response(_reply("tag1"))) == []
-    assert counters.get(_UNOBSERVED) == 1
+    upload = b"lines of a log upload\n" + opening + b"z" * 200
+    seen = len(b"lines of a log upload\n")
+    tracker.on_request_bytes(_head(len(upload), "/upload") + upload[:seen])
+    tracker.on_response_bytes(_EARLY)
+    tracker.on_request_bytes(upload[seen:])  # the late tail opens with `GET `
+    assert tracker.disabled_reason() is None
+
+    for tag in ("tag2", "tag3"):
+        body = _body(tag, 512)
+        tracker.on_request_bytes(_head(len(body)) + body)
+        (txn,) = tracker.on_response_bytes(_response(_reply(tag)))
+        assert (txn.method, txn.path, txn.request_body) == ("POST", _PATH, body)
+        assert _REPLY_ID.findall(txn.response_body) == [tag.encode()]
+    assert counters.get(_UNFINISHED) == 1
+
+
+@pytest.mark.usefixtures("fresh_counters")
+def test_a_late_tail_holding_a_whole_request_does_not_take_the_next_reply():
+    """The late tail is exactly a whole request (`HEAD / HTTP/1.0`, from a
+    captured exchange), and the next request rides the same write and is
+    answered early too. Read as starting at the tail, the stream holds a
+    complete `HEAD` and then that next request; the reply answers the LAST
+    request begun, which both readings agree is the next request, so it does
+    not ship as `HEAD /`."""
+    tracker = _Http1Tracker()
+    upload = b"captured: " + b"HEAD / HTTP/1.0\r\n\r\n"
+    seen = len(b"captured: ")
+    tracker.on_request_bytes(_head(len(upload), "/upload") + upload[:seen])
+    tracker.on_response_bytes(_EARLY)
+    second = _body("tag2", 4096)
+    request = _head(len(second)) + second
+    tracker.on_request_bytes(upload[seen:] + request[:200])
+    (early,) = tracker.on_response_bytes(_EARLY)
+    assert (early.method, early.status, early.request_counted) == ("?", 413, False)
+
+    tracker.on_request_bytes(request[200:])  # its rest, read after the reply
+    third = _body("tag3", 512)
+    tracker.on_request_bytes(_head(len(third)) + third)
+    (txn,) = tracker.on_response_bytes(_response(_reply("tag3")))
+    assert (txn.method, txn.path, txn.request_body) == ("POST", _PATH, third)
+    assert counters.get(_UNFINISHED) == 2
+
+
+def _answer_the_upload_early(srv: socket.socket) -> None:
+    """Answers a large upload with a 413 before reading its body, reads the
+    body anyway so the connection stays usable, then answers the next request
+    with a completion named by its tag."""
+    conn, _ = srv.accept()
+    with conn:
+        conn.settimeout(30)
+
+        def request(buf: bytes) -> tuple[bytes, bytes]:
+            while b"\r\n\r\n" not in buf:
+                buf += conn.recv(65536)
+            head, _, buf = buf.partition(b"\r\n\r\n")
+            length = int(re.search(rb"Content-Length: (\d+)", head).group(1))
+            while len(buf) < length:
+                buf += conn.recv(65536)
+            return buf[:length], buf[length:]
+
+        buf = b""
+        while b"\r\n\r\n" not in buf:
+            buf += conn.recv(65536)
+        conn.sendall(_EARLY)
+        _, buf = request(buf)
+        body, _ = request(buf)
+        found = _TAG.search(body)
+        conn.sendall(_response(_reply(found.group(1).decode() if found else "none")))
+
+
+@pytest.mark.usefixtures("fresh_counters")
+def test_the_call_queued_behind_an_early_answered_upload_keeps_its_parent_and_duration(
+    monkeypatch,
+):
+    """The same on a real event loop, through the asyncio transport every
+    asyncio HTTP client writes with: a 4 MiB upload answered early, and the
+    next call written while the upload's tail is still in the transport's
+    buffer. Its span is a child of the span it was issued in, it has a
+    duration, and it carries its own request and its own reply."""
+    feeds: list[bytes] = []
+    feed = _Http1Tracker.on_request_bytes
+
+    def recording(self: _Http1Tracker, data: bytes) -> list:
+        feeds.append(bytes(data))
+        return feed(self, data)
+
+    monkeypatch.setattr(_Http1Tracker, "on_request_bytes", recording)
+    second = _body("tag2", 512)
+
+    class _Client(asyncio.Protocol):
+        def __init__(self) -> None:
+            loop = asyncio.get_running_loop()
+            self.received, self.early, self.done = b"", loop.create_future(), loop.create_future()
+
+        def data_received(self, data: bytes) -> None:
+            self.received += data
+            if b" 413 " in self.received and not self.early.done():
+                self.early.set_result(None)
+            if b"chatcmpl-tag2" in self.received and not self.done.done():
+                self.done.set_result(None)
+
+    async def run(port: int) -> int:
+        loop = asyncio.get_running_loop()
+        transport, client = await loop.create_connection(_Client, "127.0.0.1", port)
+        sock = transport.get_extra_info("socket")
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, _SMALL_BUFFER)
+        upload = b"x" * (4 * 1024 * 1024)
+        transport.write(_head(len(upload)) + upload)
+        await asyncio.wait_for(client.early, 30)
+        pending = transport.get_write_buffer_size()
+        transport.write(_head(len(second)) + second)
+        await asyncio.wait_for(client.done, 30)
+        transport.close()
+        return pending
+
+    with socket.socket() as srv:
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, _SMALL_BUFFER)
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(1)
+        server = threading.Thread(target=_answer_the_upload_early, args=(srv,), daemon=True)
+        server.start()
+        recorder = RecordingTransport()
+        wardex.init(transport=recorder, intercept=True)
+        try:
+            with wardex.span("agent-turn") as turn:
+                pending = asyncio.run(run(srv.getsockname()[1]))
+            spans = _http_spans(recorder)
+        finally:
+            wardex.close()
+            server.join(30)
+
+    assert pending > 0, "precondition: the next call was queued behind the upload's tail"
+    assert any(f.find(b"POST " + _PATH.encode()) > 0 for f in feeds), (
+        "precondition: the tail and the next call reached the seam in one write"
+    )
+    (call,) = [s for s in spans if _TAG.search(bytes(s.input_data or b""))]
+    assert bytes(call.input_data) == second
+    assert _REPLY_ID.findall(bytes(call.output_data or b"")) == [b"tag2"]
+    assert call.parent_span_id == turn.context.span_id, "the call lost the span it was issued in"
+    assert call.end_time_ns > call.start_time_ns, "the call was never timed"
+    assert counters.get(_UNFINISHED) == 1
 
 
 def _response(payload: bytes) -> bytes:

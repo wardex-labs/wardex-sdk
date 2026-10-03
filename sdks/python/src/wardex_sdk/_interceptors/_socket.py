@@ -19,7 +19,7 @@ Bytes written below those methods are not seen: `os.sendfile` (what
 `os.write` on the descriptor, uvloop (libuv writes and reads the descriptor
 itself) and the Windows proactor loop (overlapped `WSASend`/`WSARecv`). A
 response that arrives for a request the tracker did not see whole is counted,
-never paired with another request — see `_Http1Tracker`.
+never paired with another request — see `_http1_requests`.
 SSLSocket is a subclass of socket.socket but implements its own send/recv, and
 refuses `sendmsg` (and `sendto` once its TLS layer exists), so this patch does
 not double-capture TLS application data (regression-safe).
