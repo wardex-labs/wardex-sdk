@@ -2,7 +2,7 @@
 
 from .._wardex_native import protocol as _native_protocol
 from ._base import ProtocolParserInterface
-from ._http1 import Http1RequestParser, Http1ResponseParser, sniff_decoded_body
+from ._http1 import REQUEST_METHODS, Http1RequestParser, Http1ResponseParser, sniff_decoded_body
 from ._http2 import Http2Parser
 
 parse_llm_semantics = _native_protocol.parse_llm_semantics
@@ -16,6 +16,7 @@ JsonRpcParser = _native_protocol.JsonRpcParser
 WsParser = _native_protocol.WsParser
 
 __all__ = [
+    "REQUEST_METHODS",
     "ProtocolParserInterface",
     "Http1RequestParser",
     "Http1ResponseParser",

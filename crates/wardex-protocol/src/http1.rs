@@ -133,6 +133,23 @@ impl Http1Stream {
         self.buf.len() - self.pos
     }
 
+    /// True between messages: the last one (if any) completed, and not one
+    /// byte of the next has arrived. False inside a header block or a body,
+    /// and on a disabled stream, which is inside nothing it can name.
+    pub fn is_idle(&self) -> bool {
+        matches!(self.state, State::Headers) && self.buffered_len() == 0
+    }
+
+    /// The method of the request whose header block parsed and whose body is
+    /// still arriving; `None` between messages, inside a header block, and on
+    /// a response stream.
+    pub fn method_in_flight(&self) -> Option<&str> {
+        match &self.state {
+            State::Body { msg, .. } | State::Chunked { msg, .. } => msg.method.as_deref(),
+            _ => None,
+        }
+    }
+
     /// Accumulates bytes and returns zero or more completed messages (handles keep-alive).
     pub fn feed(&mut self, data: &[u8]) -> Vec<ParsedHttp> {
         if matches!(self.state, State::Disabled(_)) {
@@ -606,6 +623,38 @@ mod tests {
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0].path.as_deref(), Some("/a"));
         assert_eq!(msgs[1].path.as_deref(), Some("/b"));
+    }
+
+    #[test]
+    fn idle_only_between_messages() {
+        let mut s = Http1Stream::new(true, Limits::default());
+        assert!(s.is_idle(), "an untouched stream");
+        s.feed(b"POST /a HTTP/1.1\r\nContent-Le");
+        assert!(!s.is_idle(), "inside a header block");
+        s.feed(b"ngth: 4\r\n\r\nab");
+        assert!(!s.is_idle(), "inside a body, with nothing buffered");
+        assert_eq!(s.feed(b"cd").len(), 1);
+        assert!(s.is_idle(), "the message completed at the end of the feed");
+        // A message that ends inside a feed, with the next one's first bytes after it.
+        assert_eq!(s.feed(b"GET /b HTTP/1.1\r\n\r\nGE").len(), 1);
+        assert!(!s.is_idle(), "the next request began in the same feed");
+        s.feed(b"\x00 not http\r\n\r\n");
+        assert!(s.disabled_reason().is_some());
+        assert!(!s.is_idle(), "a disabled stream");
+    }
+
+    #[test]
+    fn method_in_flight_names_a_request_whose_body_is_arriving() {
+        let mut s = Http1Stream::new(true, Limits::default());
+        assert_eq!(s.method_in_flight(), None);
+        s.feed(b"PUT /a HTTP/1.1\r\nContent-Le");
+        assert_eq!(s.method_in_flight(), None, "inside a header block");
+        s.feed(b"ngth: 4\r\n\r\nab");
+        assert_eq!(s.method_in_flight(), Some("PUT"));
+        s.feed(b"cdPOST /b HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n2\r\n");
+        assert_eq!(s.method_in_flight(), Some("POST"), "a chunked body");
+        s.feed(b"ok\r\n0\r\n\r\n");
+        assert_eq!(s.method_in_flight(), None, "between messages");
     }
 
     #[test]
