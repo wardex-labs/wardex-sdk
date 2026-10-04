@@ -16,7 +16,8 @@ identify. When the bytes after an unfinished request read as two different
 requests equally well, the reply is not framed by either guess: framed by a
 wrong HEAD, its body is read as the next reply and the connection's parser
 stops; framed by a wrong CONNECT, every later call on the connection is lost
-without a count.
+without a count. When both readings hold a request of the same method, the
+framing is no guess, and the reply is framed by that method.
 """
 
 from __future__ import annotations
@@ -186,6 +187,33 @@ def test_a_reply_is_not_framed_by_a_request_that_only_won_a_tie(phantom: bytes):
 
     (reply,) = tracker.on_response_bytes(_reply("tag2"))
     assert b"chatcmpl-tag2" in reply.response_body, "the reply's body was framed away"
+
+    (txn,) = _exchange(tracker, "tag3", "/third")
+    assert (txn.method, txn.path) == ("POST", "/third")
+    assert b"chatcmpl-tag3" in txn.response_body
+    assert tracker.disabled_reason() is None
+    assert counters.get(_UNFINISHED) == 1
+
+
+@pytest.mark.parametrize("writes", [1, 2], ids=["rest-and-head-in-one-write", "separate-writes"])
+def test_two_readings_that_tie_on_the_same_head_frame_its_reply_as_head(writes: int):
+    """The server answered an upload early, and the upload's late rest is itself a
+    whole `HEAD / HTTP/1.0` request; a real HEAD follows. Read on from the upload,
+    the stream holds that HEAD; read fresh, it holds the rest-shaped HEAD and then
+    the same HEAD. The readings tie, but both say HEAD, so framing the reply as HEAD
+    is no guess: its Content-Length promises no body, and the replies after it are
+    read on their own instead of being swallowed as that body."""
+    rest = b"HEAD / HTTP/1.0\r\n\r\n"
+    real_head = b"HEAD /page HTTP/1.1\r\nHost: h\r\n\r\n"
+    tracker = _Http1Tracker()
+    tracker.on_request_bytes(_head(10 + len(rest), "/upload") + b"x" * 10)
+    (early,) = tracker.on_response_bytes(_reply("tag1", "413 Payload Too Large"))
+    assert (early.method, early.status) == ("?", 413)
+    for chunk in [rest + real_head] if writes == 1 else [rest, real_head]:
+        tracker.on_request_bytes(chunk)
+
+    (head,) = tracker.on_response_bytes(b"HTTP/1.1 200 OK\r\nContent-Length: 1234\r\n\r\n")
+    assert (head.method, head.path, head.response_body) == ("HEAD", "/page", b"")
 
     (txn,) = _exchange(tracker, "tag3", "/third")
     assert (txn.method, txn.path) == ("POST", "/third")

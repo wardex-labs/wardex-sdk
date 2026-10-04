@@ -111,6 +111,12 @@ class _Reading:
             return 0
         return 3 if _sent_by_a_client(self.request.method) else 1
 
+    def methods(self) -> tuple[str | None, str | None]:
+        """What a reply's framing can be read from in this reading: the waiting request's method,
+        and the method of the one in flight, which can complete before the reply has ended."""
+        waiting = self.request.method if self.request is not None else None
+        return waiting, self.parser.method_in_flight()
+
 
 class RequestSide:
     """The request half of one HTTP/1 connection: what the next final reply pairs with."""
@@ -126,8 +132,9 @@ class RequestSide:
         #: No request byte yet since a reply orphaned its request. The next request can begin only
         #: at the first chunk after that reply: anything seen before it was the orphan's rest.
         self._just_orphaned = False
-        #: The waiting request won a tie (`decide`): another reading held a request just as whole,
-        #: and the bytes could not say which one the next reply answers. Cleared when it is taken.
+        #: The waiting request won a tie (`decide`) against a request just as whole but of another
+        #: method, and the bytes could not say which one the next reply answers. Cleared when it is
+        #: taken.
         self._tied = False
 
     @property
@@ -138,9 +145,12 @@ class RequestSide:
     @property
     def method(self) -> str:
         """The method the next final reply is framed by (a reply to HEAD has no body, a 2xx to
-        CONNECT opens a tunnel): the waiting request's, or "" when none waits or it won a tie. A
-        tie's winner is a guess, and framing a reply by a guess can stop its connection's parser,
-        or end HTTP on it unseen, for every later call; a guessed pairing costs that one call."""
+        CONNECT opens a tunnel): the waiting request's, or "" when none waits or it won a tie
+        against a request of another method. That winner is a guess, and framing a reply by a
+        guess can stop its connection's parser, or end HTTP on it unseen, for every later call; a
+        guessed pairing costs that one call. Two readings of the same method frame the reply alike
+        whichever one it answers, so their tie keeps the method: blanked, a HEAD's Content-Length
+        would swallow every later reply on the connection as its body."""
         request = self._reading.request
         return "" if request is None or self._tied else request.method or ""
 
@@ -171,13 +181,15 @@ class RequestSide:
     def decide(self) -> bool:
         """A reply is arriving, so a request was sent: settle on the reading that holds more of
         one (`_Reading.claim`), the continuing one on a tie, since in it every byte was seen, and
-        remember the tie (`method`). Says whether that changed which request waits.
+        remember a tie whose two readings disagree on the methods a reply is framed by (`method`).
+        Says whether that changed which request waits.
         """
         fresh, self._fresh = self._fresh, None
         if fresh is None:
             return False
         mine, theirs = self._reading.claim(), fresh.claim()
-        self._tied = self._tied or mine == theirs > 0
+        guess = mine == theirs > 0 and self._reading.methods() != fresh.methods()
+        self._tied = self._tied or guess
         if theirs <= mine:
             return False
         self._reading = fresh
