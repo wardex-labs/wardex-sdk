@@ -342,6 +342,35 @@ All notable changes to this project are documented here. The format follows
   Cleartext under uvloop or the Windows proactor event loop is still not
   captured, and the README now says so instead of listing cleartext `http`
   without conditions.
+- **An OpenAI Agents run that raised to your code no longer ships as a
+  success.** A typed handoff (`handoff(..., input_type=...)`) whose arguments
+  the model got wrong ends `Runner.run` with `ModelBehaviorError`, yet only
+  the `handoff …→unresolved` span was ERROR: the agent and the run's root
+  `invoke_workflow` read OK, so the run was missing from failure counts and
+  alerts. The framework marks whichever span it chooses, and it leaves
+  `ModelBehaviorError` out of its generic agent error on purpose, so the
+  root's status no longer rests on that choice. An exception leaving the
+  run, the one `Runner.run`, `run_sync` or a drained `run_streamed` hands
+  your code, now makes the agent that was running and the root ERROR, named
+  after the exception's class (`ModelBehaviorError`) where no framework error
+  message names it. A run that fails between two agents (after a handoff,
+  before the receiver starts) fails its root too, and an error message the
+  adapter does not recognise no longer leaves the root OK when the run
+  raised. When the root is a trace you opened yourself (`with trace(...)`
+  around the run), a run inside it that raised to your code fails that root
+  even when no agent was running at the time, and even if you catch the
+  exception inside the trace, as a retry does. The same holds for a trace one
+  of your tools opens around a run of its own, which says nothing about the
+  run the tool is in. A tool failure the framework handled and moved past
+  still marks only the tool span, a nested run that raised to a tool
+  (agent-as-tool, or a tool that runs an agent itself and handles its
+  failure) marks only its own agent, and the tool's own trace if it opened
+  one, and a cancelled run is not a failure. Should a framework release close
+  the root before the exception reaches your code (for `run_streamed`, before
+  its run ends), the run is counted under
+  `adapters.openai_agents.run_raised_after_root_ok` and said once instead of
+  shipping a silent OK; only the root the framework opened for that call is
+  checked, so a run whose failure was reported is never counted.
 - **Values the SDK makes itself are no longer masked as a card number, and
   a span's masking record no longer reports a card that was never there.**
   The case that showed it is a span's connection id, a value the SDK makes

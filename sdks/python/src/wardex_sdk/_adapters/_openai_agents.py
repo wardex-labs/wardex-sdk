@@ -1,103 +1,90 @@
 """Adapter for the OpenAI Agents SDK (PyPI: openai-agents, module `agents`).
 
-THE TREE COMES FROM THE CONTEXT, NOT FROM AN IDENTIFIER — and here the claim
-is carried by the framework's OFFICIAL hook rather than by a patch. The
-framework's `TracingProcessor` callbacks run synchronously on the task that
-opened the span, and every task the framework spawns — the first turn's
-model task, one task per parallel tool call, one per guardrail — is created
-with `asyncio.create_task` AFTER the enclosing agent span started, so it
-inherits whatever wardex made ambient on the opening task. A unit pinned at
-`on_span_start` and unpinned at `on_span_end` therefore reaches every child
-span, every tool body and every HTTP request underneath at confidence 1.0,
-and the framework's own span ids and parent references are never consulted
-for the shape of the tree. A test asserts over this file's own source that
-the verbs by which an identifier could shape a tree appear nowhere in it.
+THE TREE COMES FROM THE CONTEXT, NOT FROM AN IDENTIFIER — and here the claim is carried by the
+framework's OFFICIAL hook rather than by a patch. The framework's `TracingProcessor` callbacks run
+synchronously on the task that opened the span, and every task the framework spawns — the first
+turn's model task, one task per parallel tool call, one per guardrail — is created with
+`asyncio.create_task` AFTER the enclosing agent span started, so it inherits whatever wardex made
+ambient on the opening task. A unit pinned at `on_span_start` and unpinned at `on_span_end`
+therefore reaches every child span, every tool body and every HTTP request underneath at confidence
+1.0, and the framework's own span ids and parent references are never consulted for the shape of
+the tree. A test asserts over this file's own source that the verbs by which an identifier could
+shape a tree appear nowhere in it.
 
-What the wire already shows, measured on openai-agents 0.22 with no adapter:
-a three-turn run (tool call, handoff, final answer) is three parentless
-`chat gpt-4o-mini` spans. No agent name, no handoff, no tool span. This
-adapter adds the STRUCTURE — one `invoke_workflow` per `Runner.run` /
-`run_sync` / `run_streamed`, one `invoke_agent` per agent, a `handoff`
-MARKER with the receiving agent as a SIBLING, one `execute_tool` per
-function tool with the tool call id recovered so the tool span joins the
-turn that requested it, and one `evaluate` per guardrail — while the wire
-keeps owning the LLM call: the framework's response span carries usage and
-the wire span carries usage, and the adapter DISCARDS the framework's copy
-rather than billing a token twice. The join between the two is evidence
-only: `gen_ai.response.id` on the wire span, `wardex.openai_agents.
-response_id` on the adapter's tool and handoff spans.
+What the wire already shows, measured on openai-agents 0.22 with no adapter: a three-turn run (tool
+call, handoff, final answer) is three parentless `chat gpt-4o-mini` spans. No agent name, no
+handoff, no tool span. This adapter adds the STRUCTURE — one `invoke_workflow` per `Runner.run` /
+`run_sync` / `run_streamed`, one `invoke_agent` per agent, a `handoff` MARKER with the receiving
+agent as a SIBLING, one `execute_tool` per function tool with the tool call id recovered so the
+tool span joins the turn that requested it, and one `evaluate` per guardrail — while the wire keeps
+owning the LLM call: the framework's response span carries usage and the wire span carries usage,
+and the adapter DISCARDS the framework's copy rather than billing a token twice. The join between
+the two is evidence only: `gen_ai.response.id` on the wire span, `wardex.openai_agents.response_id`
+on the adapter's tool and handoff spans.
 
-Hook decision, recorded rather than revisited. The official processor is a
-public, stable surface and its parentage was measured; the internal run loop
-(`run_single_turn`, `execute_handoffs`) already moved once between releases
-and now exists as two copies — non-streamed and streamed — with subtly
-different span placement, so a patch there would break silently on the next
-move and would have to be written twice. Internal patching is therefore
-REJECTED; the re-examination condition is a release in which the official
-hook loses structural information the internals still carry. When the
-framework's tracing is disabled the hook is silent; the adapter says so ONCE
-at install, as an INFO line with the two-line recipe that enables tracing
-without sending anything to OpenAI, and offers no `force_tracing` option —
-replacing the host's processor list is a host-behaviour change this SDK's
-own rules forbid an adapter to make.
+Hook decision, recorded rather than revisited. The official processor is a public, stable surface
+and its parentage was measured; the internal run loop (`run_single_turn`, `execute_handoffs`)
+already moved once between releases and now exists as two copies — non-streamed and streamed — with
+subtly different span placement, so a patch there would break silently on the next move and would
+have to be written twice. Internal patching is therefore REJECTED; the re-examination condition is
+a release in which the official hook loses structural information the internals still carry. When
+the framework's tracing is disabled the hook is silent; the adapter says so ONCE at install, as an
+INFO line with the two-line recipe that enables tracing without sending anything to OpenAI, and
+offers no `force_tracing` option — replacing the host's processor list is a host-behaviour change
+this SDK's own rules forbid an adapter to make.
 
 Seams, and the shape each forces:
 
-* `Runner.run` / `run_sync` / `run_streamed` — wrapped to READ the
-  `conversation_id` the framework never gives its trace
-  (`_openai_agents_entry.py`), and nothing else.
-* `on_trace_start` / `on_trace_end` — the run. `open_run` + `pin` on the
-  task that fired the callback; `unpin` + `close` at the end. A `group_id`
-  (with none, the run's `conversation_id`) becomes `gen_ai.conversation.id`
-  on every ADAPTER span underneath, handed to the registry at the open so
-  child units inherit it — unless the host opened its own
-  `wardex.conversation(...)` around the run, which wins. The wire `chat`
-  spans carry it too: the byte seam latches the pinned carrier's
-  conversation at request time, beside the parent.
-* `AgentSpanData` — one `invoke_agent`, pinned for the span's lifetime.
-  The receiver of a handoff opens AFTER the sender closed (the framework
-  finishes the sender's span before starting the receiver's), so it opens
-  under the run's pin and is the sender's sibling; it carries
+* `Runner.run` / `run_sync` / `run_streamed` — wrapped to READ the `conversation_id` the framework
+  never gives its trace, and the call's outcome (`_openai_agents_entry.py`), and nothing else.
+* `on_trace_start` / `on_trace_end` — the run. `open_run` + `pin` on the task that fired the
+  callback; `unpin` + `close` at the end. A `group_id` (with none, the run's `conversation_id`)
+  becomes `gen_ai.conversation.id` on every ADAPTER span underneath, handed to the registry at the
+  open so child units inherit it — unless the host opened its own `wardex.conversation(...)` around
+  the run, which wins. The wire `chat` spans carry it too: the byte seam latches the pinned
+  carrier's conversation at request time, beside the parent.
+* `AgentSpanData` — one `invoke_agent`, pinned for the span's lifetime. The receiver of a handoff
+  opens AFTER the sender closed (the framework finishes the sender's span before starting the
+  receiver's), so it opens under the run's pin and is the sender's sibling; it carries
   `parent_agent` and a `HANDOFF_FROM` link to the marker.
-* `HandoffSpanData` — opened at END (the target is known only then), closed
-  at once, at the framework's own start instant. A marker, never a container.
-* `TurnSpanData` — no span. The turn number is an attribute on what the turn
-  contained, and a turn's error is folded onto the agent that ran it.
-* `ResponseSpanData` — no span, no usage. The response id and the function
-  calls it requested are remembered for the tool spans that follow.
-* `FunctionSpanData` — `execute_tool`, pinned on the tool's own task so an
-  HTTP call inside the handler nests under it. The call id is recovered by
-  an EXACT and UNIQUE `(name, arguments)` match against the response that
-  requested it, labelled at the source; anything less than unique ships the
-  `tool_call_id_unavailable_in_process` marker instead of a guess. `name`
-  is the framework's TRACE name — `namespace.name` under `tool_namespace()`
-  — spelled the same on both sides of the match.
-* `GuardrailSpanData` — `evaluate`. `score_label` is one of three:
-  `pass` (the body returned, no tripwire), `tripwire` (ERROR
-  `guardrail_tripwire`), or `not_rendered` — the body never returned a
-  verdict, which is read off the exception in flight at the span's exit:
-  its own raise is ERROR with that exception's class name, and an
-  interruption (a sibling's tripwire cancelling it) is UNSET.
-  `wardex.evaluation.triggered` is present only when a verdict was rendered.
-* `MCPListToolsSpanData` — `execute_step mcp.list_tools`, carrying a hash and
-  a count of the tool names and never the names.
+* `HandoffSpanData` — opened at END (the target is known only then), closed at once, at the
+  framework's own start instant. A marker, never a container.
+* `TurnSpanData` — no span. The turn number is an attribute on what the turn contained, and a
+  turn's error is folded onto the agent that ran it.
+* `ResponseSpanData` — no span, no usage. The response id and the function calls it requested are
+  remembered for the tool spans that follow.
+* `FunctionSpanData` — `execute_tool`, pinned on the tool's own task so an HTTP call inside the
+  handler nests under it. The call id is recovered by an EXACT and UNIQUE `(name, arguments)` match
+  against the response that requested it, labelled at the source; anything less than unique ships
+  the `tool_call_id_unavailable_in_process` marker instead of a guess. `name` is the framework's
+  TRACE name — `namespace.name` under `tool_namespace()` — spelled the same on both sides of the
+  match.
+* `GuardrailSpanData` — `evaluate`. `score_label` is one of three: `pass` (the body returned, no
+  tripwire), `tripwire` (ERROR `guardrail_tripwire`), or `not_rendered` — the body never returned a
+  verdict, which is read off the exception in flight at the span's exit: its own raise is ERROR
+  with that exception's class name, and an interruption (a sibling's tripwire cancelling it) is
+  UNSET. `wardex.evaluation.triggered` is present only when a verdict was rendered.
+* `MCPListToolsSpanData` — `execute_step mcp.list_tools`, carrying a hash and a count of the tool
+  names and never the names.
 
-Failure mapping: the framework never marks its trace or task span. The
-agent, turn and response spans carry the error, so the run root's status is
-derived by this adapter: a TOP-LEVEL agent (one opened directly under the
-run) closing with a FATAL type makes the root ERROR with that type, first one
-wins; tool span errors never propagate by themselves; a nested agent's
-(agent-as-tool) error never reaches the root.
+Failure mapping: the framework never marks its trace or task span, and the span it does mark is its
+own choice (a typed handoff's invalid arguments mark only the handoff span). So what the caller
+RECEIVES comes first: an `Exception` in flight where the framework closes an agent span, or the
+trace it opened inside an entry-point call (`failure_leaving`), makes that span ERROR, under the
+span's own mapped type if it has one, else the exception's class name. Then the spans that carry an
+error decide the root: a TOP-LEVEL agent (one opened directly under the run) closing with a FATAL
+type makes the root ERROR with that type, first one wins. A root the host opened around the call
+outlives it, so the call's exit fails it if nothing did (`_host_root`). Tool span errors never
+propagate by themselves, as a tool failure the framework handled and moved past is not a failed
+run; a nested agent's (agent-as-tool) error never reaches the root.
 
-Decisions this adapter records rather than revisits: no `execute_step` per
-turn (a turn is an attribute, and a per-turn span would nest what the
-framework runs flat); the framework's `TurnSpanData.usage`,
-`TaskSpanData.usage` and `ResponseSpanData.usage` are all discarded, not
-only the response span's; a handled `max_turns` (`error_handlers`) still
-ships ERROR on the agent and the root, because the framework marks the span
-before it consults the handler; and `trace_include_sensitive_data=False`
-leaves the response id unavailable on the framework side, so the tool span
-then carries the marker and no join — the wire span is the only holder.
+Decisions this adapter records rather than revisits: no `execute_step` per turn (a turn is an
+attribute, and a per-turn span would nest what the framework runs flat); the framework's
+`TurnSpanData.usage`, `TaskSpanData.usage` and `ResponseSpanData.usage` are all discarded, not only
+the response span's; a handled `max_turns` (`error_handlers`) still ships ERROR on the agent and
+the root, because the framework marks the span before it consults the handler; and
+`trace_include_sensitive_data=False` leaves the response id unavailable on the framework side, so
+the tool span then carries the marker and no join — the wire span is the only holder.
 """
 
 from __future__ import annotations
@@ -129,7 +116,14 @@ from .._enums import StatusCode, ToolExecutionType, ToolType
 from .._hash import hash_canonical
 from ._base import AdapterInterface
 from ._context import AdapterContext, Placement, RunHandle
-from ._openai_agents_entry import call_conversation, install_entry_hook, run_conversation
+from ._openai_agents_entry import (
+    call_conversation,
+    failure_leaving,
+    host_opened,
+    install_entry_hook,
+    open_root,
+    run_conversation,
+)
 from ._payload import _shaped_payload
 
 _FRAMEWORK = "openai_agents"
@@ -338,15 +332,13 @@ class OpenAIAgentsAdapter(AdapterInterface):
         self._before: tuple[Any, ...] | None = None
         self._mcp = False
         self._tracing: Any = None
-        #: The framework's `ReattachedTrace` class, when this version has one
-        #: (a run resumed from a `RunState` in the same process reattaches
-        #: its persisted trace instead of starting a new one). None on a
-        #: framework without the resume feature.
+        #: The framework's `ReattachedTrace` class, when this version has one (a run resumed from a
+        #: `RunState` in the same process reattaches its persisted trace instead of starting a new
+        #: one). None on a framework without the resume feature.
         self._reattached: type | None = None
-        #: Runs THIS install recorded. An instance field and not a reading
-        #: of the process-global `active.trace` counter: that counter is
-        #: reset by the fork child's re-init and by the testing harness, and
-        #: a run this install did record would then look like none.
+        #: Runs THIS install recorded. An instance field and not a reading of the process-global
+        #: `active.trace` counter: that counter is reset by the fork child's re-init and by the
+        #: testing harness, and a run this install did record would then look like none.
         self._runs = 0
 
     def name(self) -> str:
@@ -400,7 +392,7 @@ class OpenAIAgentsAdapter(AdapterInterface):
             )
             ctx.count("processors_read_failed")
         tracing.add_trace_processor(self._processor)
-        install_entry_hook(ctx, lambda: self._installed)
+        install_entry_hook(ctx, lambda: self._installed, lambda: _host_root(self))
         self._installed = True
 
     def _notice_if_tracing_disabled(self, tracing: Any) -> None:
@@ -590,24 +582,21 @@ def _mark_degraded(adapter: OpenAIAgentsAdapter, obj: Any) -> None:
 class _WardexTracingProcessor:
     """The six callbacks, each a total function of the adapter's state.
 
-    DELIBERATELY NOT a subclass of the framework's `TracingProcessor`. The
-    base would have to be imported at class-definition time — at module
-    import, before `install()` has probed anything — and that import ran a
-    host's unrelated local `agents` package on a host without the framework
-    (measured: a package whose `__init__` writes a file wrote it, and one
-    with an empty `tracing.py` raised `AttributeError` out of the module
-    import, so the shadowed report never fired). The framework dispatches
-    by attribute, never by `isinstance` (no such check exists in its
-    provider or processor modules), and `_surface_ok` holds the abstract
-    method set of the real base equal to the six names below, so a release
-    that adds a callback declines instead of registering a partial processor.
+    DELIBERATELY NOT a subclass of the framework's `TracingProcessor`. The base would have to be
+    imported at class-definition time — at module import, before `install()` has probed anything —
+    and that import ran a host's unrelated local `agents` package on a host without the framework
+    (measured: a package whose `__init__` writes a file wrote it, and one with an empty `tracing.py`
+    raised `AttributeError` out of the module import, so the shadowed report never fired). The
+    framework dispatches by attribute, never by `isinstance` (no such check exists in its provider
+    or processor modules), and `_surface_ok` holds the abstract method set of the real base equal to
+    the six names below, so a release that adds a callback declines instead of registering a partial
+    processor.
 
-    Every callback's first line is the installed check: the framework may
-    keep calling a processor that is being uninstalled on another thread,
-    and a callback that ran after `uninstall()` would open a unit nothing
-    will ever close. The body runs inside `_contained`, so nothing here can
-    reach the framework's own error path — which would log wardex's failure
-    under the host's logger as if the host had misconfigured tracing.
+    Every callback's first line is the installed check: the framework may keep calling a processor
+    that is being uninstalled on another thread, and a callback that ran after `uninstall()` would
+    open a unit nothing will ever close. The body runs inside `_contained`, so nothing here can
+    reach the framework's own error path — which would log wardex's failure under the host's logger
+    as if the host had misconfigured tracing.
     """
 
     def __init__(self, adapter: OpenAIAgentsAdapter) -> None:
@@ -675,11 +664,10 @@ def _current_trace(adapter: OpenAIAgentsAdapter, span: Any) -> Any | None:
 
 
 def _trace_of(adapter: OpenAIAgentsAdapter, span: Any) -> Any | None:
-    """The trace `span` belongs to: remembered at its start when the kind has
-    one, else read from the carrier. A kind opened at END has no start to
-    remember at and gets NO slot entry here — `slot()` creates on read, and
-    an entry created for every LLM call and never cleared lived until the
-    framework dropped the span."""
+    """The trace `span` belongs to: remembered at its start when the kind has one, else read from
+    the carrier. A kind opened at END has no start to remember at and gets NO slot entry here —
+    `slot()` creates on read, and an entry created for every LLM call and never cleared lived until
+    the framework dropped the span."""
     ctx = adapter._ctx
     if ctx is None:
         return None
@@ -697,6 +685,15 @@ def _run_state(adapter: OpenAIAgentsAdapter, trace: Any) -> dict[str, Any] | Non
         return None
     run = ctx.peek(trace)
     return run if run is not None and run.get("handle") is not None else None
+
+
+def _host_root(adapter: OpenAIAgentsAdapter) -> dict[str, Any] | None:
+    """At an entry-point call's entry: the state of the root the HOST opened around the call, or
+    None — no trace is current, or the current one is no such root for this call (`host_opened`)."""
+    tracing = adapter._tracing
+    trace = tracing.get_current_trace() if tracing is not None else None
+    run = _run_state(adapter, trace) if trace is not None else None
+    return run if host_opened(run, _CURRENT_AGENT.get()) else None
 
 
 def _span_start(adapter: OpenAIAgentsAdapter, span: Any) -> None:
@@ -836,18 +833,15 @@ def _open_child(
     start_ns: int | None = None,
     conversation: ConversationContext | None = None,
 ) -> RunHandle:
-    """The ONE way a child unit opens under a run — agent, handoff marker,
-    tool, guardrail, MCP step alike — so that a sixth site cannot forget
-    what every child owes.
+    """The ONE way a child unit opens under a run — agent, handoff marker, tool, guardrail, MCP step
+    alike — so that a sixth site cannot forget what every child owes.
 
-    What every child owes is the adapter's half of a refused agent pin: a
-    child opened while that agent is current hangs under whatever IS
-    ambient — the session, or an earlier agent — at 1.0, so the child says
-    the edge is not what it looks like. The registry marks only the refused
-    unit itself. This used to be a four-line check copied at four of five
-    sites; the fifth (the MCP list-tools step) had none. `confirm_active`
-    is here for the same reason: a site that opens is a site that counts.
-    `conversation` is stated only by a top-level agent (`call_conversation`).
+    What every child owes is the adapter's half of a refused agent pin: a child opened while that
+    agent is current hangs under whatever IS ambient — the session, or an earlier agent — at 1.0, so
+    the child says the edge is not what it looks like. The registry marks only the refused unit
+    itself. This used to be a four-line check copied at four of five sites; the fifth (the MCP
+    list-tools step) had none. `confirm_active` is here for the same reason: a site that opens is a
+    site that counts. `conversation` is stated only by a top-level agent (`call_conversation`).
     """
     h = ctx.open_run(
         kind,
@@ -913,20 +907,18 @@ def _error_data(span: Any) -> dict[str, Any]:
 
 
 def _trace_start(adapter: OpenAIAgentsAdapter, trace: Any, *, resumed: bool = False) -> None:
-    """One `invoke_workflow` per framework trace, pinned on the task that
-    started it — the run's own task, or `run_streamed`'s background loop task
-    (which copied the caller's context when it was created).
+    """One `invoke_workflow` per framework trace, pinned on the task that started it — the run's own
+    task, or `run_streamed`'s background loop task (which copied the caller's context when it was
+    created).
 
-    `resumed=True` is the lazy open for a REATTACHED trace (see
-    `_is_reattached`), reached from the first span callback of the resumed
-    half rather than from `on_trace_start`, which never arrives for it. The
-    root's start is therefore the RESUME instant, not the original run's:
-    the framework keeps no start time on the reattached object, and a root
-    that claimed the first half's start would cover time this process did
-    not observe. The two halves share `wardex.openai_agents.trace_id`; the
-    resumed root says `wardex.openai_agents.resumed=True`. Its end is the
-    framework dropping the trace object — the one signal a reattached trace
-    gives — through a weak finalizer; the uninstall sweep is the backstop.
+    `resumed=True` is the lazy open for a REATTACHED trace (see `_is_reattached`), reached from the
+    first span callback of the resumed half rather than from `on_trace_start`, which never arrives
+    for it. The root's start is therefore the RESUME instant, not the original run's: the framework
+    keeps no start time on the reattached object, and a root that claimed the first half's start
+    would cover time this process did not observe. The two halves share
+    `wardex.openai_agents.trace_id`; the resumed root says `wardex.openai_agents.resumed=True`. Its
+    end is the framework dropping the trace object — the one signal a reattached trace gives —
+    through a weak finalizer; the uninstall sweep is the backstop.
     """
     ctx = adapter._ctx
     if ctx is None:
@@ -974,6 +966,7 @@ def _trace_start(adapter: OpenAIAgentsAdapter, trace: Any, *, resumed: bool = Fa
     run["agent_count"] = 0
     run["turn_max"] = 0
     run["request"], run["stated"] = request, conversation is not None
+    open_root(run, trace, adapter._tracing, _CURRENT_AGENT.get())
     adapter._runs += 1
     _pin(adapter, h, driver, name)
     ctx.confirm_active("trace")
@@ -1006,6 +999,8 @@ def _trace_end(adapter: OpenAIAgentsAdapter, trace: Any) -> None:
     if run.get("handle") is None:
         ctx.count("trace_end_unmatched")
         return
+    if run.get("call") is not None and run.get("first_error") is None:
+        run["first_error"] = failure_leaving(run.get("host_inflight"))
     _close_run(adapter, run)
 
 
@@ -1031,6 +1026,8 @@ def _close_run(adapter: OpenAIAgentsAdapter, run: dict[str, Any]) -> None:
     h.draft.set_extra("wardex.openai_agents.turns", int(run.get("turn_max") or 0))
     h.draft.set_extra("wardex.openai_agents.agents", int(run.get("agent_count") or 0))
     error = run.get("first_error")
+    if run.get("call") is not None:
+        run["call"].root_closed_ok = error is None
     run.clear()
     _drop_pending_handoff(ctx)
     _unpin(adapter, h)
@@ -1047,15 +1044,13 @@ def _agent_start(adapter: OpenAIAgentsAdapter, run: dict[str, Any], span: Any) -
     """One `invoke_agent`, pinned for the span's lifetime, and made the
     CURRENT agent on this task for every callback and task underneath.
 
-    A handoff RECEIVER opens after the sender closed — so under the run's
-    pin, as the sender's SIBLING — and carries `parent_agent` plus a
-    `HANDOFF_FROM` link to the marker the sender's last turn shipped. An
-    agent that opens while another is current on its task (agent-as-tool)
-    is that agent's child by context, and is remembered as NESTED so its
-    failure never reaches the run root. TOP-LEVEL is therefore "no agent is
-    current here", which is true of every `Runner.run` gathered under one
-    trace and false of every nested run — not "the run's stack is empty",
-    which one concurrent sibling was enough to make false.
+    A handoff RECEIVER opens after the sender closed — so under the run's pin, as the sender's
+    SIBLING — and carries `parent_agent` plus a `HANDOFF_FROM` link to the marker the sender's last
+    turn shipped. An agent that opens while another is current on its task (agent-as-tool) is that
+    agent's child by context, and is remembered as NESTED so its failure never reaches the run
+    root. TOP-LEVEL is therefore "no agent is current here", which is true of every `Runner.run`
+    gathered under one trace and false of every nested run — not "the run's stack is empty", which
+    one concurrent sibling was enough to make false.
     """
     ctx = adapter._ctx
     if ctx is None:
@@ -1103,6 +1098,8 @@ def _agent_start(adapter: OpenAIAgentsAdapter, run: dict[str, Any], span: Any) -
     entry["response_id"] = None
     entry["calls"] = {}
     entry["handoff_out"] = None
+    # What the HOST is already handling as this opens is never the run's failure.
+    entry["host_inflight"] = sys.exc_info()[1]
     _CURRENT_AGENT.set(entry)
     run["agent_count"] = int(run.get("agent_count") or 0) + 1
 
@@ -1135,6 +1132,9 @@ def _agent_end(adapter: OpenAIAgentsAdapter, run: dict[str, Any], span: Any) -> 
             h.draft.set_extra("wardex.openai_agents.max_turns", max_turns)
     elif entry.get("error") is not None:
         error_type, fatal = entry["error"]
+    raised = failure_leaving(entry.get("host_inflight"))
+    if raised is not None:
+        error_type, fatal = error_type or raised, True
     propagate = fatal and bool(entry.get("top_level")) and run.get("first_error") is None
     if error_type is not None and propagate:
         run["first_error"] = error_type
