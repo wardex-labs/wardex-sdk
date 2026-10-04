@@ -69,6 +69,7 @@ from ._session_state import (
     _BridgeBinding,
     _EvictedSubagent,
     _EvictedTool,
+    _OpenChat,
     _OpenSubagent,
     _OpenTool,
     _PendingSpan,
@@ -398,28 +399,29 @@ class SessionAssembler:
             elif ev.kind == "assistant_turn":
                 self._emit_chat(sess, ev, now)
                 for tu_id, tu_name, tu_input in ev.tool_uses:
-                    # Refuse the NEWEST and keep the oldest, which is the
-                    # opposite of the two tables above and deliberate. Nothing
-                    # here owns a span, and both consumers
-                    # (`_close_tool`, `_on_stream_tool_result`) pop by the id
-                    # whose RESULT arrived — in a turn, results come back
-                    # broadly in the order the uses were announced, so the
-                    # oldest entry is the one most likely to be read next.
-                    # Evicting it would discard exactly that.
+                    # Refuse the NEWEST and keep the oldest, which is the opposite of the two tables
+                    # above and deliberate. Nothing here owns a span, and both consumers
+                    # (`_close_tool`, `_on_stream_tool_result`) pop by the id whose RESULT arrived —
+                    # in a turn, results come back broadly in the order the uses were announced, so
+                    # the oldest entry is the one most likely to be read next. Evicting it would
+                    # discard exactly that.
                     if self._has_room(sess.stream_tool_meta, "stream_tool_meta"):
                         sess.stream_tool_meta[tu_id] = (tu_name, tu_input, now)
             elif ev.kind == "tool_result":
                 self._on_stream_tool_result(sess, ev, now)
-                sess.end_tool(ev.parent_tool_use_id, ev.tool_result_id, now)
+                if sess.end_tool(ev.parent_tool_use_id, ev.tool_result_id, now, ev.launched_async):
+                    self._close_chats(sess, ev.tool_result_id)  # a `Task` result ends its thread
             elif ev.kind == "stream_delta":
                 sess.thread(ev.parent_tool_use_id, now).note_chunk(now)
             elif ev.kind == "session_result":
+                # The main thread's response ends with its turn; a background sub-agent's need not.
+                self._close_chats(sess, None)
                 sess.result = ev
             elif ev.kind == "task_lifecycle":
-                # Deliberately unconsumed for now: subagent spans are built from
-                # SubagentStart/Stop hooks; task usage enrichment is a deferred
-                # follow-up. Parsed and exposed so the wire surface is stable.
-                pass
+                # Only a task's END is read: it ends its sub-agent's thread (see `_OpenChat`).
+                if ev.subtype == "task_notification" and ev.task_tool_use_id:
+                    self._close_chats(sess, ev.task_tool_use_id)
+                    sess.threads.pop(ev.task_tool_use_id, None)
 
     def on_close(self, key: int, error: str | None) -> None:
         now = time.time_ns()
@@ -605,6 +607,7 @@ class SessionAssembler:
         self._by_key.pop(key, None)
         if sess.session_id:
             self._by_session_id.pop(sess.session_id, None)
+        self._close_chats(sess)
         self._drain_children(sess, now)
         # The retirement half of the pending buffer's conservation rule: the
         # root already shipped, so there is no finalize-time merge left to
@@ -869,42 +872,52 @@ class SessionAssembler:
         return crumb.context if crumb is not None else sess.unit.context
 
     def _emit_chat(self, sess: _Session, ev: AgentStreamEvent, now: int) -> None:
-        span = None
-        # Counted BEFORE the span is built, so turns run from 1 and a wire 0 — proto3's "unset" —
-        # only ever means "no turn". The message arrived whether or not a span gets built.
-        sess.turn_index += 1
-        with self._guard("adapters.assembler.emit_chat"):
-            if sess.bridge is not None:
-                self._pend_chat(sess, ev, now)
-            else:
-                span = self._build_chat(sess, ev, now)
-        sess.mark_thread(ev.parent_tool_use_id, now, new_turn=True)
-        if span is not None:
-            self._capture(span)
+        """One span per RESPONSE, not per line (see `_OpenChat`): a line with the id of the response
+        its thread holds is one more block of it, and any other line means that response is over."""
+        # Same FFI-value pattern as `build_gen_ai`: the native parser reports
+        # the condition per line, the layer that owns `counters` tallies it.
+        if ev.usage_totals_unpaired:
+            counters.bump("adapters.assembler.stream_usage_totals_unpaired")
+        if ev.usage_overflowed:
+            counters.bump("adapters.assembler.stream_usage_overflowed")
+        key = ev.parent_tool_use_id
+        held = sess.open_chats.get(key)
+        chat = None
+        if held is not None and held.continues(ev):
+            with self._guard("adapters.assembler.emit_chat"):
+                held.fold(ev, now)
+        elif sess.shipped_early(ev):  # its span is out, with this line's usage on it
+            counters.bump("adapters.assembler.chat_line_after_evict")
+        else:
+            repeat = sess.may_repeat(key)  # before the close below clears what the thread holds
+            self._close_chats(sess, key)
+            # Counted BEFORE the span is built, so turns run from 1 and a wire 0 (proto3's
+            # "unset") only ever means "no turn". The response arrived either way.
+            sess.turn_index += 1
+            with self._guard("adapters.assembler.emit_chat"):
+                chat = self._open_chat(sess, ev, now)
+                if repeat:  # maybe a forgotten response's next line (see `_Session.may_repeat`)
+                    chat.draft.add_limitation(Limitation.SESSION_ENTRY_TABLE_FULL)
+        sess.mark_thread(key, now, new_turn=True)
+        if chat is not None:
+            evicted = self._room_for(sess.open_chats, "open_chat")
+            if evicted is not None:  # closed early, never dropped
+                self._ship_chat(sess, evicted[1], closed_early=True)
+                # Nor split: its later lines are still recognized (see `_Thread.closed_early`).
+                sess.remember_early_close(evicted[0], evicted[1].message_id, self._room_for)
+            sess.open_chats[key] = chat
 
-    def _chat_draft(self, sess: _Session, ev: AgentStreamEvent, now: int) -> tuple:
-        """One chat span, minus its END and its TIMING markers.
-
-        Shared by the immediate path (`_build_chat`) and the bridge's pending
-        path (`_pend_chat`) so the two cannot drift: the bridge's off state
-        must reproduce today's span field for field. The timing markers are
-        the callers' to attach because the merge is what can change their
-        truth — the immediate path attaches them on the spot, the pending path
-        defers them until the merge has answered.
-
-        Returns `(draft, gen_ai, ttft, start_ns)`: the gen_ai block rides
-        along for the merge's ttft rewrite, the ttft for the marker decision,
-        and the start for the join window.
-        """
-        # Consumption is gated exactly the way installation is (`on_outbound`):
-        # only a MAIN-THREAD assistant turn consumes the pending prompt. A
-        # subagent-attributed chat's input is the subagent's task, not the
-        # user's session prompt, so it ships `input_attempted=False` and leaves
-        # the pending prompt for the next main-thread turn. `attempted`, not
-        # `bool(payload)`: an intermediate assistant turn of one agentic loop
-        # HAS no user prompt, and saying so is different from reporting an
-        # empty capture as a failed one. Decided before the edge: a prompt a
-        # sole-live-inferred hook seeded makes this turn's session a guess too.
+    def _open_chat(self, sess: _Session, ev: AgentStreamEvent, now: int) -> _OpenChat:
+        """A response's chat span from its FIRST line, minus its END and its
+        TIMING markers — those are `_ship_chat`'s, once the response is over."""
+        # Consumption is gated exactly the way installation is (`on_outbound`): only a MAIN-THREAD
+        # assistant turn consumes the pending prompt. A subagent-attributed chat's input is the
+        # subagent's task, not the user's session prompt, so it ships `input_attempted=False` and
+        # leaves the pending prompt for the next main-thread turn. `attempted`, not
+        # `bool(payload)`: an intermediate assistant turn of one agentic loop HAS no user prompt,
+        # and saying so is different from reporting an empty capture as a failed one. Decided
+        # before the edge: a prompt a sole-live-inferred hook seeded makes this turn's session a
+        # guess too.
         consume = ev.parent_tool_use_id is None and sess.pending_prompt_source is not None
         evidence = _SOLE_LIVE if consume and sess.pending_prompt_sole_inferred else _IN_SESSION
         p = child_of(self._resolve_subagent_anchor(sess, ev.parent_tool_use_id), evidence)
@@ -914,10 +927,9 @@ class SessionAssembler:
         start_ns = min(thread.last_ns, now)
         ttft = thread.ttft_s(start_ns)
 
-        # `subject=ev.model`, not an f-string. A turn whose stream never reported
-        # a model used to produce the literal span name "chat None"; the grammar
-        # yields the bare operation instead, and there is no interpolation left
-        # at this site to get wrong.
+        # `subject=ev.model`, not an f-string. A turn whose stream never reported a model used to
+        # produce the literal span name "chat None"; the grammar yields the bare operation instead,
+        # and there is no interpolation left at this site to get wrong.
         draft = SpanDraft(
             p,
             intent=SpanIntent.CHAT,
@@ -925,12 +937,6 @@ class SessionAssembler:
             source=CaptureSource.ADAPTER,
             start_ns=start_ns,
         )
-        # Same FFI-value pattern as `build_gen_ai`: the native parser reports
-        # the condition, the layer that owns `counters` tallies it.
-        if ev.usage_totals_unpaired:
-            counters.bump("adapters.assembler.stream_usage_totals_unpaired")
-        if ev.usage_overflowed:
-            counters.bump("adapters.assembler.stream_usage_overflowed")
         gen_ai = GenAIAttributes(
             operation=SpanIntent.CHAT.operation,
             provider=ProviderName.ANTHROPIC,
@@ -952,11 +958,20 @@ class SessionAssembler:
         draft.set_conversation(self._conversation(sess, turn_index=sess.turn_index))
         draft.set_status(StatusCode.OK)
 
-        draft.set_io(
+        chat = _OpenChat(
+            message_id=ev.message_id,
+            draft=draft,
+            gen_ai=gen_ai,
+            ttft=ttft,
+            start_ns=start_ns,
+            opened_ns=now,
+            end_ns=now,
+            agent_id=sess.chat_scope(ev.parent_tool_use_id),
             input_data=sess.pending_prompt if consume else b"",
-            output_data=ev.content_json or b"",
             input_attempted=consume,
+            output_data=ev.content_json or b"",
         )
+        chat.apply()
         if consume:
             # Which channel the prompt bytes came from — the two shapes differ
             # on the wire (see `_PROMPT_STREAM`/`_PROMPT_HOOK`).
@@ -965,77 +980,57 @@ class SessionAssembler:
             sess.pending_prompt_source = None
             sess.pending_prompt_hook_seen = False
             sess.pending_prompt_sole_inferred = False
-        # No correlation: the anchor above may be a fallback (see
-        # `_resolve_subagent_anchor`), and the parentage's own record would
-        # report it as `unit_active`/1.0 with no marker — a claim this span
-        # cannot back (I4). The ingestion move that turns that fallback into a
-        # `UnitKey` is what earns this field.
+        # No correlation: the anchor above may be a fallback (see `_resolve_subagent_anchor`), and
+        # the parentage's own record would report it as `unit_active`/1.0 with no marker — a claim
+        # this span cannot back (I4). The ingestion move that turns that fallback into a `UnitKey`
+        # is what earns this field.
         draft.replace_correlation(None)
-        return draft, gen_ai, ttft, start_ns
+        return chat
 
-    def _build_chat(self, sess: _Session, ev: AgentStreamEvent, now: int) -> Any:
-        draft, _gen_ai, ttft, _start_ns = self._chat_draft(sess, ev, now)
-        draft.add_limitation(_BASE_LIMITATION)
-        if ttft is not None:
-            draft.add_limitation(Limitation.TTFT_IPC_APPROXIMATION)
-        return draft.finish(now)
+    def _ship_chat(self, sess: _Session, chat: _OpenChat, *, closed_early: bool = False) -> None:
+        """Finish a response's chat span, or hold it for the finalize-time merge.
 
-    def _pend_chat(self, sess: _Session, ev: AgentStreamEvent, now: int) -> None:
-        """Hold this turn's chat draft for the finalize-time merge.
-
-        The timing markers travel DEFERRED: the merge removes the whole
-        rationale for both when a `claude_code.llm_request` claims this turn
-        (CLI-measured interval + ttft), and an unmerged flush applies them
-        unchanged — so the bridge failing produces exactly today's span.
+        One path for both, so the bridge's off state reproduces the span field for field.
+        Pending, the timing markers travel DEFERRED: a merge with a `claude_code.llm_request`
+        removes the rationale for both (CLI-measured interval + ttft), and an unmerged flush
+        applies them unchanged. The join window ends at the response's first line
+        (`_OpenChat.opened_ns`). `closed_early`, the bound shipping it before its last line,
+        marks it and makes it UNSET before any pend, so no merge removes either: the CLI's
+        timing corrects the request's interval, not the blocks wardex never saw.
         """
-        draft, gen_ai, ttft, start_ns = self._chat_draft(sess, ev, now)
-        draft.set_end_ns(now)
-        deferred = (
+        timing = (
             (_BASE_LIMITATION, Limitation.TTFT_IPC_APPROXIMATION)
-            if ttft is not None
+            if chat.ttft is not None
             else (_BASE_LIMITATION,)
         )
-        self._pend(
-            sess,
-            _PendingSpan(
-                draft=draft,
-                kind="chat",
-                deferred_markers=deferred,
-                agent_id=self._chat_agent_id(sess, ev.parent_tool_use_id),
-                window=(start_ns, now),
-                gen_ai=gen_ai,
-            ),
-        )
+        span = None
+        with self._guard("adapters.assembler.emit_chat"):
+            if closed_early:
+                chat.draft.set_status(StatusCode.UNSET)
+                chat.draft.add_limitation(Limitation.SESSION_ENTRY_TABLE_FULL)
+            if sess.bridge is None:
+                for marker in timing:
+                    chat.draft.add_limitation(marker)
+                span = chat.draft.finish(chat.end_ns)
+            else:
+                self._pend(
+                    sess,
+                    _PendingSpan(
+                        draft=chat.draft,
+                        kind="chat",
+                        deferred_markers=timing,
+                        agent_id=chat.agent_id,
+                        window=(chat.start_ns, chat.opened_ns),
+                        gen_ai=chat.gen_ai,
+                    ),
+                )
+        if span is not None:
+            self._capture(span)
 
-    def _chat_agent_id(self, sess: _Session, parent_tool_use_id: str | None) -> str | None:
-        """The subagent scope a chat is anchored to — the merge join's scope key.
-
-        Mirrors `_resolve_subagent_anchor`'s two matches; None is the main
-        thread. Kept separate rather than derived from the anchor because the
-        anchor silently falls back to the session root, and a fallback must
-        not masquerade as a main-thread scope claim in a JOIN — an unmatched
-        scope fails honestly (no merge), a wrong scope merges wrongly.
-        """
-        if not parent_tool_use_id:
-            return None
-        if self._known_subagent(sess, parent_tool_use_id):
-            return parent_tool_use_id
-        open_tool = sess.open_tools.get(parent_tool_use_id)
-        if open_tool is not None and self._known_subagent(sess, open_tool.agent_id):
-            return open_tool.agent_id
-        return None
-
-    @staticmethod
-    def _known_subagent(sess: _Session, agent_id: str | None) -> bool:
-        """Live, or evicted-but-remembered. One question, three call sites.
-
-        An evicted sub-agent is still a real scope: its context is a valid
-        parent and its subtree keeps its shape, so a chat turn inside it is
-        still that turn's scope key and not the main thread.
-        """
-        return agent_id is not None and (
-            agent_id in sess.subagents or agent_id in sess.evicted_subagents
-        )
+    def _close_chats(self, sess: _Session, *threads: str | None) -> None:
+        """Ship the responses these threads hold; every thread's when none is named."""
+        for chat in sess.end_chats(threads):
+            self._ship_chat(sess, chat)
 
     def _claim_key(self, sess: _Session, tool_name: str) -> UnitKey | None:
         """This hook observation's slot in the shared key space, or None.
@@ -1059,8 +1054,8 @@ class SessionAssembler:
         The assembler's half of `Unit._evict_oldest`, written to the same shape
         on purpose: one bound, one policy, two containers with different
         owners. Returns the evicted `(key, value)` so the CALLER decides what an
-        evicted entry owes the wire — a span (open tools, sub-agents) or a
-        breadcrumb (the two memories that outlive them).
+        evicted entry owes the wire — a span (open tools, sub-agents, arriving
+        responses) or a breadcrumb (the memories that outlive them).
 
         Returns the pair rather than taking a callback so the non-evicting path,
         which is every path until the table is full, allocates nothing: a
@@ -1827,12 +1822,12 @@ class SessionAssembler:
                 # finalized — it opens a fresh one or is dropped, and either
                 # way it does not resurrect a root that is on its way out.
                 sess.unit.note(marker)
-                # NEVER a drain, and not by discipline: no wait exists on this
-                # path at all — the drain lives only in the adapter's async
-                # transport-close patch, so atexit/signal/uninstall keep
-                # their flush budgets structurally. The merge itself is free
-                # and opportunistic: whatever the CLI already exported still
-                # lands on the spans it belongs to.
+                # NEVER a drain, and not by discipline: no wait exists on this path at all — the
+                # drain lives only in the adapter's async transport-close patch, so
+                # atexit/signal/uninstall keep their flush budgets structurally. The merge itself is
+                # free and opportunistic: whatever the CLI already exported still lands on the spans
+                # it belongs to.
+                self._close_chats(sess)  # held responses pend first, so the merge sees them
                 if sess.bridge is not None:
                     with self._guard("adapters.assembler.otel_bridge_merge"):
                         self._merge_bridge(sess, now)
@@ -1873,6 +1868,7 @@ class SessionAssembler:
             self._emit_subagent(sess, agent_id, now)
 
     def _finalize(self, sess: _Session, error: str | None, now: int) -> None:
+        self._close_chats(sess)  # before the merge, so a held response can still join
         # The merge runs FIRST, against the drafts pended so far; the drain
         # below then pends whatever was still open (those flush unmerged —
         # a tool that never got its close hook is a degraded record with or

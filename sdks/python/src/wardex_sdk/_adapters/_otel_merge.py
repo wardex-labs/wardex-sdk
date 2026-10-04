@@ -333,19 +333,30 @@ def sequence_chat_windows(pending: list[Any]) -> list[_ChatWindow]:
     degenerate to the ambiguity fallback (measured against a live CLI) back
     when every chat of one loop was stamped with the same host write. Keys
     are pending indexes.
+
+    Sequenced in the order the responses BEGAN, which is each window's end
+    (the arrival of the response's first line), and not in the order they were
+    pended. The assembler pends a response only once it is over, so a main
+    response that called a sub-agent is pended after the sub-agent's reply
+    whenever both are in one scope. Flooring in pend order raised that
+    response's start past its own end, and its request could no longer join.
+    The sort is stable, so chats pended as they began are floored exactly as
+    before, and the windows come back in pend order either way.
     `pending` holds the assembler's `_PendingSpan` records, read by field only.
     """
+    chats = [
+        (i, rec) for i, rec in enumerate(pending) if rec.kind == "chat" and rec.window is not None
+    ]
     windows = []
     floor_by_scope: dict[str | None, int] = {}
-    for i, rec in enumerate(pending):
-        if rec.kind != "chat" or rec.window is None:
-            continue
+    for i, rec in sorted(chats, key=lambda item: item[1].window[1]):
         start_ns, end_ns = rec.window
         floor = floor_by_scope.get(rec.agent_id)
         if floor is not None and floor > start_ns:
             start_ns = floor
         floor_by_scope[rec.agent_id] = end_ns
         windows.append(_ChatWindow(key=i, start_ns=start_ns, end_ns=end_ns, agent_id=rec.agent_id))
+    windows.sort(key=lambda window: window.key)
     return windows
 
 

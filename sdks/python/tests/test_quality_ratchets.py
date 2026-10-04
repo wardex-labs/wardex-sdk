@@ -281,7 +281,7 @@ _MODULE_CEILING = 800
 #: cross the ceiling; a module that drops below it is removed from this dict.
 _OVERSIZED_BUDGET = {
     "_assembly/_units.py": 2100,
-    "_adapters/_assembler.py": 1933,
+    "_adapters/_assembler.py": 1929,
     "_adapters/_openai_agents.py": 1588,
     "_client.py": 1585,
     "_adapters/_context.py": 1305,
@@ -292,9 +292,10 @@ _OVERSIZED_BUDGET = {
     # one carry its own provenance docstring in this module. Every line of
     # prose around the member stayed on the diet. Lowered to 1083 when
     # provider_inferred (54) paid for its docstring by rewrapping two
-    # sections' docstrings to the line length, words unchanged. Lowered to 1082
-    # when frame_parse_failed gained its HTTP/1 emitter, paid the same way.
-    "_assembly/_integrity.py": 1082,
+    # sections' docstrings to the line length, words unchanged. Lowered to 1081
+    # when frame_parse_failed gained its HTTP/1 emitter and a fifth session-table
+    # emit site was added, each paid for the same way.
+    "_assembly/_integrity.py": 1081,
     "_assembly/_builder.py": 963,
     "_adapters/_anthropic_agent_sdk.py": 944,
 }

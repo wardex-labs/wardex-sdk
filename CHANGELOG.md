@@ -521,6 +521,55 @@ All notable changes to this project are documented here. The format follows
   knowingly ignores (the SDK's control messages, `transcript_mirror`,
   `keep_alive`, `tool_progress`, `rate_limit_event`) are not counted, so a
   non-zero value means something went unread.
+- **A Claude Agent SDK response that arrives in pieces is one `chat` span,
+  and its tokens are counted once.** The CLI writes one model response as one
+  `assistant` line per content block (a sentence and the tool call after it
+  are two lines, three parallel tool calls are three), and every line repeats
+  the response's `message.id` and the same usage. The adapter made a `chat`
+  span per line, so one request looked like two or three, and a backend that
+  prices spans charged its input and cache tokens two or three times: in two
+  sessions recorded against the real CLI, the chat spans' input tokens summed
+  to 1.5x and 2x what the CLI itself reported. Lines with the same id on the
+  same thread are now one span: its tokens are the response's usage counted
+  once, its output holds every block in order, and it runs from the
+  response's start to its last line. A later line that reports only part of
+  the usage (the output count alone, say) updates that part and keeps the
+  input and cache counts already reported. The OTel bridge joins the span to
+  the CLI's request by its first line, because the request began before any
+  of its lines arrived, and in the order responses began, so a main response
+  held open while a sub-agent replied still joins its own request.
+  `turn_index` counts responses, not lines. The span ships when the
+  response is over (the thread's next response begins, the turn's `result`
+  arrives, the sub-agent's `Task` call returns, its task's
+  `task_notification` arrives, or the session closes) rather than on its
+  first line. A background sub-agent's call returns when it launches, and
+  the CLI marks that result `async_launched`, so the adapter does not take it
+  for the end of the sub-agent's thread: the sub-agent's last response is
+  ended by the notification and ships when the sub-agent finishes, not when a
+  long-lived client closes, and a launch result written after the sub-agent's
+  first line no longer cuts that response in two. If the per-session
+  bound (`max_session_entries`) has to close a response before its last line,
+  that span is still the response's only one: it ships marked
+  `session_entry_table_full` with status `UNSET`, and the response's later
+  lines add no second span and no tokens, so the request and its usage are
+  still counted once. What only those later lines held is missing from its
+  output (counted under `adapters.assembler.chat_line_after_evict`; the early
+  close itself under `adapters.assembler.open_chat_table_full`). The adapter
+  recognizes those lines by the response's id, which it keeps with the
+  response's own thread, so early closes on other threads cannot make it
+  forget. The one exception is a sub-agent thread that started while the
+  same bound was already tracking `max_session_entries` sub-agent threads:
+  its id is then kept under the bound as well, and if further early closes
+  push it out, a later line of that response opens a second span. Nothing
+  tells that span from a new response, so once an id has been pushed out, a
+  new response on a sub-agent thread that holds no other response of its own
+  is marked `session_entry_table_full` too (with the status it was seen to
+  have), as both halves of a tool call the bound split are.
+  `adapters.assembler.evicted_chat_table_full` counts the ids pushed out, an
+  upper bound on those second spans. Tool calls are still read from every
+  line. Still wrong: `output_tokens` is the count the CLI reported when the
+  response started, because its `assistant` lines carry nothing later, so it
+  stays low.
 - **Values the SDK makes itself are no longer masked as a card number, and
   a span's masking record no longer reports a card that was never there.**
   The case that showed it is a span's connection id, a value the SDK makes

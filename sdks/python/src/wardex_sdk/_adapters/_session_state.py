@@ -18,10 +18,11 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from .._assembly import Limitation, SpanDraft, Unit, UnitKey
+from .._protocol import normalize_finish_reason
 from .._protocol._claude_stream import AgentStreamEvent
 
 #: The two provenances a chat span's `input_data` can have, published as the
@@ -75,7 +76,8 @@ class _PendingSpan:
     tool_use_id: str | None = None
     agent_id: str | None = None
     #: Chat only: (start_ns, end_ns) — the join window, from the thread's
-    #: floor to the message's arrival.
+    #: floor to the arrival of the response's FIRST line (see
+    #: `_OpenChat.opened_ns`).
     window: tuple[int, int] | None = None
     #: Chat only: the GenAIAttributes block, kept for the ttft rewrite.
     #: Typed Any because `_types` is off-limits in `_adapters/` (C-S1).
@@ -92,6 +94,161 @@ class _PendingSpan:
     #: by blanking `tool_use_id`: that field is the call's identity, and a
     #: future consumer would read the blank as a fact.
     mergeable: bool = True
+
+
+@dataclass
+class _OpenChat:
+    """One model response whose chat span is still being assembled.
+
+    The CLI does not deliver a response as one `assistant` line. It sends a
+    line per content block — a text block and then the tool call after it,
+    or each of several parallel tool calls — and every one of those lines
+    carries the same `message.id` and a copy of the same `usage`. Recorded
+    against a real CLI (2.1.286): two lines for a text-then-tool response,
+    three for a response with three parallel tool calls, and the identical
+    usage object on every line. A span per line reported one request as two
+    or three, and a backend priced every copy of the input and cache tokens.
+
+    So a response's span is held here, on its thread, until the response is
+    over: a line with a different id arrives on the same thread, the main
+    thread's turn ends in a `result`, the sub-agent thread it belongs to ends
+    with its `Task` call's result or its task's `task_notification`, or the
+    session itself ends.
+
+    The notification is the only end a BACKGROUND sub-agent's thread gets. Its
+    call's result is the call's launch (`AgentStreamEvent.launched_async`) and
+    ends nothing: recorded, it came back before the sub-agent spoke, but nothing
+    makes the CLI write it before the sub-agent's first line, and taking it for
+    the thread's end split a response whose first line came first. The turn
+    that launched it settles too, so without the notification the sub-agent's
+    last response would be held until the session closed: for a long-lived
+    client, whenever the process ends. The CLI sends the frame only
+    with a terminal status, and its `tool_use_id` is the call whose id the
+    sub-agent's lines carry as `parent_tool_use_id`. Recorded against the real
+    CLI: the sub-agent's last line, two other system frames, this one, then
+    the main thread starts a turn to report the result.
+
+    Nothing else closes it. Not a tool result on the same thread: the CLI
+    starts a call as soon as its block is written (the recording shows the
+    call's hook firing between two blocks of one response), so nothing orders
+    its result after the later blocks. Not a host write either, which may be a
+    message queued mid-response. The draft is kept current as each line is
+    folded in, so whichever of those closes it ships what was seen and
+    nothing has to be re-derived at close.
+    """
+
+    #: The response's `message.id`, which is what a later line must match to
+    #: be folded in. None for a line that named no id: such a line can only
+    #: ever be a span of its own, because nothing proves a neighbour is the
+    #: same response.
+    message_id: str | None
+    draft: SpanDraft
+    #: The gen_ai block as it stands. Typed Any because `_types` is off-limits
+    #: here (see `_PendingSpan.gen_ai`).
+    gen_ai: Any
+    #: Measured on the FIRST line, against the thread's floor: the first chunk
+    #: of a response belongs to its first block, and every later block of the
+    #: same response arrives after it.
+    ttft: float | None
+    start_ns: int
+    #: Arrival of the FIRST line, which is where the bridge's join window ends.
+    #: The request that produced this response started before any of its
+    #: lines arrived, so a window running on to the last line could only take
+    #: in a later request's start. And the join sequences its windows by this
+    #: instant, the order responses BEGAN: a held response is pended only when
+    #: it is over, so one held across a reply on another thread of the same
+    #: scope is pended after that reply (see `sequence_chat_windows`).
+    opened_ns: int
+    #: Arrival of the latest line folded in — the response is not over before
+    #: its last block has arrived.
+    end_ns: int
+    #: The bridge join's scope key, decided when the response OPENED: the
+    #: sub-agent it belongs to may have stopped, and left `subagents`, by the
+    #: time the response is closed.
+    agent_id: str | None
+    #: The prompt this response consumed, kept so the output can be rewritten
+    #: without touching the input (`SpanDraft.set_io` sets both at once).
+    input_data: bytes
+    input_attempted: bool
+    #: The response's content blocks so far, as one JSON array.
+    output_data: bytes
+
+    def continues(self, ev: AgentStreamEvent) -> bool:
+        """Whether `ev` is one more line of this response."""
+        return ev.message_id is not None and ev.message_id == self.message_id
+
+    def fold(self, ev: AgentStreamEvent, now: int) -> None:
+        """Fold one more line of this response into the held span.
+
+        USAGE IS REPLACED, NEVER ADDED. Every line carries its own copy of the
+        response's usage, so adding them would rebuild the per-line inflation
+        inside one span. The latest copy stands: the one copy when the copies
+        are identical (what the CLI sends), the running total if a CLI ever
+        sends running totals, the only copy if it sends just one.
+
+        It stands one HALF at a time, and only for the half it reports. The
+        input half is the input total and the two cache tiers, taken together
+        because the total was summed from that copy's own tiers, so mixing two
+        copies' fields could pair a total with tiers it does not include. The
+        output half is the output count alone. A copy that reports output only
+        therefore updates the output count and leaves the input counts already
+        seen where they were, instead of erasing them: no CLI recorded so far
+        sends such a copy, but a count that was observed must not vanish
+        because a later line said less. For the same reason a copy whose input
+        total is missing (the parser withholds a total it cannot form from
+        what the copy carried) never displaces a half that has one.
+        """
+        g = self.gen_ai
+        reports_input = (
+            ev.input_tokens is not None
+            or ev.cache_read_tokens is not None
+            or ev.cache_creation_tokens is not None
+        )
+        if reports_input and (ev.input_tokens is not None or g.input_tokens is None):
+            g = replace(
+                g,
+                input_tokens=ev.input_tokens,
+                cache_read_input_tokens=ev.cache_read_tokens,
+                cache_creation_input_tokens=ev.cache_creation_tokens,
+            )
+        if ev.output_tokens is not None:
+            g = replace(g, output_tokens=ev.output_tokens)
+        if ev.stop_reason:
+            g = replace(g, finish_reasons=(normalize_finish_reason("anthropic", ev.stop_reason),))
+        if ev.model:
+            g = replace(g, response_model=ev.model)
+        self.gen_ai = g
+        self.output_data = _join_blocks(self.output_data, ev.content_json or b"")
+        self.end_ns = now
+        self.apply()
+
+    def apply(self) -> None:
+        """Write the gen_ai block, the I/O and the end as they stand onto the draft."""
+        self.draft.set_end_ns(self.end_ns)
+        self.draft.set_gen_ai(self.gen_ai)
+        self.draft.set_io(
+            input_data=self.input_data,
+            output_data=self.output_data,
+            input_attempted=self.input_attempted,
+        )
+
+
+def _join_blocks(held: bytes, more: bytes) -> bytes:
+    """Two lines' content arrays as one, every block byte-for-byte as it came.
+
+    The native parser hands each line's `content` over as compact JSON, so
+    splicing two arrays at their brackets gives exactly the bytes one line
+    holding every block would have produced. A side that is not an array is
+    not spliced into something that would no longer parse: the two values are
+    kept side by side in an outer array, so no block is ever lost.
+    """
+    if not held or held == b"[]":
+        return more
+    if not more or more == b"[]":
+        return held
+    if held[:1] == more[:1] == b"[" and held[-1:] == more[-1:] == b"]":
+        return held[:-1] + b"," + more[1:]
+    return b"[" + held + b"," + more + b"]"
 
 
 @dataclass
@@ -208,7 +365,7 @@ class _EvictedSubagent:
     its shape.
 
     The three anchor lookups (`_tool_draft`, `_resolve_subagent_anchor`,
-    `_chat_agent_id`) resolve a sub-agent at EMIT time, not at open time, and
+    `_Session.chat_scope`) resolve a sub-agent at EMIT time, not at open time, and
     all three fall silently to the session root on a miss. Evicting a LIVE
     sub-agent without this would re-parent every still-open tool and every later
     chat turn of that sub-agent onto the root and say nothing — trading one
@@ -269,6 +426,19 @@ class _Thread:
     #: 0 when none has arrived since the last chat span. Reset per chat, so
     #: turn N's ttft is measured against turn N's own first chunk.
     first_delta_ns: int = 0
+    #: The `message.id` of this thread's response that the per-session bound
+    #: shipped before its last line, or None. Its later lines repeat the usage
+    #: that span already carries, so they must still be recognized as that
+    #: response's (`_Session.shipped_early`). Kept on the thread's own record
+    #: because nothing another thread does can remove that record: the main
+    #: thread's is never evicted, and a sub-agent's is refused when the table
+    #: is full, never evicted, and dropped only when its thread ends (the `Task`
+    #: call that spawned it returns or, for a call that returned at launch, its
+    #: task's notification arrives), which ends the response anyway. Held in a
+    #: table of its own under the bound, the id was pushed out by the next
+    #: early close on any other thread, and the response's next line opened a
+    #: second span: the request priced twice, with nothing on it to say so.
+    closed_early: str | None = None
 
     def note_chunk(self, now: int) -> None:
         """The first chunk since the last chat span; later ones change nothing."""
@@ -336,6 +506,31 @@ class _Session:
     #: so the flag cannot outlive the prompt it describes.
     pending_prompt_sole_inferred: bool = False
     open_tools: dict[str, _OpenTool] = field(default_factory=dict)  # keyed by tool_use_id
+    #: The response each thread is still receiving lines of, keyed like
+    #: `threads` (None is the main thread). A table of its own rather than a
+    #: field on `_Thread`, because a sub-agent thread refused by the full
+    #: thread table is handed an unrecorded record, and a span held on that
+    #: record would never be shipped. Bounded by the same per-session bound:
+    #: the oldest is closed early, never dropped.
+    open_chats: dict[str | None, _OpenChat] = field(default_factory=dict)
+    #: What an early close leaves behind on a sub-agent thread that the thread
+    #: table had no room to track, and that therefore has no record to keep
+    #: `_Thread.closed_early` on: per thread, the `message.id` of the response
+    #: the bound shipped before its last line. Its later lines are recognized
+    #: as that response's and add nothing, rather than open a second span that
+    #: counts one request, and prices its tokens, twice. Under the same bound,
+    #: keyed like `open_chats`, and dropped whenever the thread's response
+    #: would have closed anyway (`end_chats`). Unlike the record, this memory
+    #: CAN be pushed out, by early closes on other untracked threads, and a
+    #: later line of the forgotten response then opens a second span. Nothing
+    #: tells that span from a new response, so from then on the session marks
+    #: the responses it might be (`may_repeat`). The overflow counter
+    #: (`adapters.assembler.evicted_chat_table_full`) counts the ids pushed
+    #: out: an upper bound on the second spans, since a forgotten response may
+    #: have had no line left to send.
+    evicted_chats: dict[str, str] = field(default_factory=dict)
+    #: Whether `evicted_chats` has pushed an id out in this session.
+    forgot_early_close: bool = False
     subagents: dict[str, _OpenSubagent] = field(default_factory=dict)  # keyed by agent_id
     #: What the two span-owning tables above leave behind when the bound evicts
     #: an entry, under the SAME bound so the memory cannot outgrow what it
@@ -412,18 +607,143 @@ class _Session:
                 self.threads[parent_tool_use_id] = thread
         return thread
 
-    def end_tool(self, parent_tool_use_id: str | None, tool_use_id: str | None, now: int) -> None:
+    def chat_scope(self, parent_tool_use_id: str | None) -> str | None:
+        """The subagent scope a chat is anchored to — the merge join's scope key.
+
+        Mirrors the assembler's `_resolve_subagent_anchor`'s two matches; None
+        is the main thread. Kept separate rather than derived from the anchor
+        because the anchor silently falls back to the session root, and a
+        fallback must not masquerade as a main-thread scope claim in a JOIN —
+        an unmatched scope fails honestly (no merge), a wrong scope merges
+        wrongly.
+        """
+        if not parent_tool_use_id:
+            return None
+        if self.knows_subagent(parent_tool_use_id):
+            return parent_tool_use_id
+        open_tool = self.open_tools.get(parent_tool_use_id)
+        if open_tool is not None and self.knows_subagent(open_tool.agent_id):
+            return open_tool.agent_id
+        return None
+
+    def tracked_thread(self, parent_tool_use_id: str | None) -> _Thread | None:
+        """The thread's own record: always the main thread's, a sub-agent's only
+        when the table had room for it. Unlike `thread`, never makes one."""
+        if parent_tool_use_id is None:
+            return self.main_thread
+        return self.threads.get(parent_tool_use_id)
+
+    def remember_early_close(
+        self,
+        parent_tool_use_id: str | None,
+        message_id: str | None,
+        room_for: Callable[[dict[str, Any], str], object],
+    ) -> None:
+        """Remember the response the bound shipped from this thread before its last line.
+
+        On the thread's own record, which nothing another thread does can remove
+        (`_Thread.closed_early`). Only a sub-agent thread the table had no room
+        to track has no record (the main thread always has one), and falls back
+        to the bounded `evicted_chats`, made room in the assembler's way:
+        `room_for` is its `_room_for`. A response with no id has nothing a later
+        line could be recognized by, so it leaves nothing.
+        """
+        if message_id is None:
+            return
+        record = self.tracked_thread(parent_tool_use_id)
+        if record is not None:
+            record.closed_early = message_id
+        elif parent_tool_use_id is not None:
+            if room_for(self.evicted_chats, "evicted_chat") is not None:
+                self.forgot_early_close = True
+            self.evicted_chats[parent_tool_use_id] = message_id
+
+    def may_repeat(self, parent_tool_use_id: str | None) -> bool:
+        """Whether a NEW response on this thread may be a forgotten response's next line.
+
+        Only after `evicted_chats` pushed an id out, and only on a sub-agent thread
+        that holds nothing of its own: a response still arriving or an early close
+        still remembered began after whatever the thread sent before it, so a line
+        under another id is a new response. Read before the thread's state is closed.
+        What it says yes to is marked as the bound's, as both halves of a tool call
+        the bound split are: it cannot be told from the forgotten response's second
+        span, which counts that request's tokens a second time.
+        """
+        if not self.forgot_early_close or parent_tool_use_id is None:
+            return False
+        if parent_tool_use_id in self.open_chats or parent_tool_use_id in self.evicted_chats:
+            return False
+        record = self.threads.get(parent_tool_use_id)
+        return record is None or record.closed_early is None
+
+    def shipped_early(self, ev: AgentStreamEvent) -> bool:
+        """Whether `ev` is a later line of the response the bound shipped from its thread."""
+        if ev.message_id is None:
+            return False
+        record = self.tracked_thread(ev.parent_tool_use_id)
+        if record is not None and record.closed_early == ev.message_id:
+            return True
+        key = ev.parent_tool_use_id
+        return key is not None and self.evicted_chats.get(key) == ev.message_id
+
+    def end_chats(self, threads: tuple[str | None, ...]) -> list[_OpenChat]:
+        """Take the responses these threads hold, every thread's when none is named.
+
+        Whatever ends a thread's response also forgets the one the bound shipped
+        early from it: past this point a line under that id is no longer the
+        shipped response's.
+        """
+        if not threads:
+            self.evicted_chats.clear()
+            self.forgot_early_close = False
+            self.main_thread.closed_early = None
+            for record in self.threads.values():
+                record.closed_early = None
+            threads = tuple(self.open_chats)
+        ended = []
+        for thread in threads:
+            if thread is not None:
+                self.evicted_chats.pop(thread, None)
+            record = self.tracked_thread(thread)
+            if record is not None:
+                record.closed_early = None
+            chat = self.open_chats.pop(thread, None)
+            if chat is not None:
+                ended.append(chat)
+        return ended
+
+    def knows_subagent(self, agent_id: str | None) -> bool:
+        """Live, or evicted-but-remembered.
+
+        An evicted sub-agent is still a real scope: its context is a valid
+        parent and its subtree keeps its shape, so a chat turn inside it is
+        still that turn's scope key and not the main thread.
+        """
+        return agent_id is not None and (
+            agent_id in self.subagents or agent_id in self.evicted_subagents
+        )
+
+    def end_tool(
+        self, parent_tool_use_id: str | None, tool_use_id: str | None, now: int, launched: bool
+    ) -> bool:
         """A tool result arrived on `parent_tool_use_id`'s thread for `tool_use_id`.
 
         It moves that thread's floor — the CLI sends the thread's next request
         once the results it waits on are in — and, when the finished call was a
         `Task`, ends the sub-agent thread it spawned: no event can arrive on a
         thread after its spawning call has returned, so keeping the entry would
-        only spend the bound that live sub-agents need.
+        only spend the bound that live sub-agents need. Returns whether a thread
+        may have ended, for the caller to ship what that thread held.
+
+        A result that only LAUNCHED its call (`launched`, a background sub-agent)
+        ends nothing: the sub-agent's lines are still to come, and its thread
+        ends at its task's notification instead.
         """
         self.mark_thread(parent_tool_use_id, now)
-        if tool_use_id is not None:
-            self.threads.pop(tool_use_id, None)
+        if tool_use_id is None or launched:
+            return False
+        self.threads.pop(tool_use_id, None)
+        return True
 
     def mark_thread(
         self, parent_tool_use_id: str | None, now: int, *, new_turn: bool = False
