@@ -50,7 +50,8 @@ else:
   (`openai.*`), the provider-usage mirror (`wardex.usage.*`, whose drop-count
   key is exported so the seam and this module cannot drift on its spelling),
   and the embeddings block. `provider_limitation` is the marker (and count)
-  for a provider label the native parser only inferred.
+  for a provider label the native parser only inferred. `declared_error_type`
+  is the `error.type` of a failure the provider declared inside a response.
 
   `apply_request_conversation` / `REQUEST_CONVERSATION_KEY` — the
   conversation a request body names, and the rule that decides whether it is
@@ -75,6 +76,7 @@ from ._genai import (
     USAGE_DROPPED_KEY,
     apply_request_conversation,
     build_gen_ai,
+    declared_error_type,
     embeddings_attrs,
     has_core_semantics,
     identifies_llm_call,
@@ -90,6 +92,7 @@ __all__ = [
     "apply_request_conversation",
     "build_gen_ai",
     "build_grpc_fields",
+    "declared_error_type",
     "embeddings_attrs",
     "has_core_semantics",
     "identifies_llm_call",

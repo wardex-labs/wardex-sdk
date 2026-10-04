@@ -110,6 +110,14 @@ pub struct LlmSemantics {
     /// SSE only (None otherwise): whether the stream carried its provider's
     /// terminal event. `Some(false)` feeds a diagnostics counter, not a marker.
     pub stream_terminated: Option<bool>,
+    /// The provider declared a failure INSIDE a response — today the in-stream
+    /// `error` event of a Chat or Anthropic stream, whose error object the
+    /// reassembler keeps in the synthetic body — and this is how it classified
+    /// it: the error object's `code`, else its `type`, else empty (declared,
+    /// not classified). The seam makes the span `ERROR` with this as its
+    /// `error.type`. None for a bare HTTP error envelope: that span already
+    /// takes its error from the HTTP status.
+    pub error_type: Option<String>,
 }
 
 /// stop: allows both a string and an array of strings.

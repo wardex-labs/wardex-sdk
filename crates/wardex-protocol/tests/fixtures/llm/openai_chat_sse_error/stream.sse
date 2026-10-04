@@ -1,0 +1,6 @@
+data: {"id":"chatcmpl-fx4","model":"gpt-4o-mini","choices":[{"delta":{"role":"assistant","content":"Hel"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-fx4","model":"gpt-4o-mini","choices":[{"delta":{"content":"lo"},"finish_reason":null}]}
+
+data: {"error":{"message":"The server had an error while processing your request.","type":"server_error","param":null,"code":null}}
+

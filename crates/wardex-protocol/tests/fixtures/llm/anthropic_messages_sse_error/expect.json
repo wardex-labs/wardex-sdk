@@ -1,0 +1,22 @@
+{
+ "provider": "anthropic",
+ "operation": "chat",
+ "api_type": null,
+ "request_model": "claude-sonnet-4-6",
+ "response_model": "claude-sonnet-4-6",
+ "response_id": "msg_fx3",
+ "input_tokens": 25,
+ "output_tokens": 1,
+ "finish_reasons": [
+  "error"
+ ],
+ "output_messages_present": true,
+ "stream_terminated": true,
+ "error_type": "overloaded_error",
+ "error_message": "Overloaded",
+ "output_text": "Hel",
+ "usage_leaves": {
+  "input_tokens": 25,
+  "output_tokens": 1
+ }
+}

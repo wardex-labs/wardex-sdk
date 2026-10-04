@@ -1292,6 +1292,11 @@ _UNRESOLVED_PY: frozenset[tuple[str, str]] = frozenset(
         ("_adapters/_context.py", "Call:refused_ambient_marker"),
         ("_adapters/_context.py", "Name:marker"),
         ("_interceptors/_seam.py", "Name:marker"),
+        # `_retire`'s `on_connection_close(marker, still_open=still_open)`: R9
+        # makes every argument of that marker-taking callee read-all, and
+        # `still_open` is the bool saying whether the connection goes on — the
+        # trackers branch on it and never put it on a span.
+        ("_interceptors/_seam.py", "Name:still_open"),
         ("_interceptors/_seam.py", "Tuple"),
         # `if (limitation := provider_limitation(sem)) is not None:
         # draft.add_limitation(limitation)` — a forward of the one member

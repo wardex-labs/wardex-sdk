@@ -20,6 +20,7 @@ class ProtocolParserInterface(ABC):
 
     @abstractmethod
     def flush(self) -> ParsedMessage | None:
-        """On connection close, detaches any incomplete message as truncated
-        (None if there is none)."""
+        """On connection close, detaches the message in flight (None if there
+        is none). Whether the close ended it whole or cut it short is the
+        parser's to say, on the message it returns."""
         ...

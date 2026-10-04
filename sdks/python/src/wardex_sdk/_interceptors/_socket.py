@@ -14,6 +14,9 @@ What it sees is what passes through a `socket.socket` method in Python: `send`,
 way in. That covers synchronous clients and asyncio's selector event loop, whose
 plaintext writer uses `send` for the first attempt of a `write()` and, from
 Python 3.12, `sendmsg` for everything after it (and for every `writelines()`).
+An empty read that asked for bytes is the server's close, which ends a reply
+with no framing; `shutdown` is patched too, because after the client shuts its
+own read side an empty read is not that close.
 Bytes written below those methods are not seen: `os.sendfile` (what
 `loop.sendfile`/`sock_sendfile` and `socket.sendfile` use where the OS has it),
 `os.write` on the descriptor, uvloop (libuv writes and reads the descriptor
@@ -69,6 +72,15 @@ def _accepted_prefix_vectored(buffers: list[Any], n: int) -> bytes:
     return b"".join(parts)
 
 
+def _asked_for_bytes(size: Any, buffer: Any = None) -> bool:
+    """Did a read ask for at least one byte? Then an empty answer is the peer's EOF; one that
+    asked for none (`recv(0)`) proves nothing. With a buffer, a size of 0 or None means the
+    buffer's size — how `recv_into` and `SSLObject.read` both read it."""
+    if buffer is not None and not size:
+        size = memoryview(buffer).nbytes
+    return bool(size) and size > 0
+
+
 def _is_link_local(addr: str) -> bool:
     try:
         return ipaddress.ip_address(addr).is_link_local
@@ -117,6 +129,7 @@ class RawSocketInterceptor(ByteSeamInterceptor):
         self._patches.patch(sock, "sendto", self._mk_sendto(sock.sendto))
         self._patches.patch(sock, "recv", self._mk_recv(sock.recv))
         self._patches.patch(sock, "recv_into", self._mk_recv_into(sock.recv_into))
+        self._patches.patch(sock, "shutdown", self._mk_shutdown(sock.shutdown))
         self._acquire_probes()
         self._installed = True
 
@@ -135,13 +148,17 @@ class RawSocketInterceptor(ByteSeamInterceptor):
         return "ws" if is_ws else "http"
 
     def _resolve_timing(
-        self, obj: Any, st: _ConnectionState
+        self, obj: Any | None, st: _ConnectionState
     ) -> tuple[float | None, float | None, bool | None, tuple[Limitation, ...]]:
         # Plaintext: there is no TLS handshake to time, so that interval is
         # always None — unset on the wire, never a 0 ms handshake.
         if st.timing_consumed:
             return (0.0, None, True, ())
         st.timing_consumed = True
+        if obj is None:
+            # A response the close ended (`_retire`): the connect record was released at that
+            # close, ahead of the seam, so this is the no-record answer below.
+            return (None, None, None, (Limitation.CONNECT_TIMING_UNAVAILABLE,))
         try:
             popped = shared_timing_store().pop(obj.fileno())
         except Exception:
@@ -287,8 +304,11 @@ class RawSocketInterceptor(ByteSeamInterceptor):
         def wrapper(this: Any, *args: Any, **kwargs: Any) -> Any:
             ret = real(this, *args, **kwargs)
             try:
-                if self._capture_possible(this) and isinstance(ret, (bytes, bytearray)) and ret:
-                    self._on_response_bytes(this, bytes(ret))
+                if self._capture_possible(this) and isinstance(ret, (bytes, bytearray)):
+                    if ret:
+                        self._on_response_bytes(this, bytes(ret))
+                    elif _asked_for_bytes(args[0] if args else 0):
+                        self._on_response_eof(this)
             except Exception:
                 pass
             return ret
@@ -301,8 +321,21 @@ class RawSocketInterceptor(ByteSeamInterceptor):
             try:
                 if n and self._capture_possible(this):
                     self._on_response_bytes(this, bytes(buffer[:n]))
+                elif n == 0 and _asked_for_bytes(args[0] if args else kwargs.get("nbytes"), buffer):
+                    self._on_response_eof(this)
             except Exception:
                 pass
             return n
+
+        return wrapper
+
+    def _mk_shutdown(self, real: Any):  # noqa: ANN202
+        def wrapper(this: Any, *args: Any, **kwargs: Any) -> Any:
+            ret = real(this, *args, **kwargs)
+            with self._guard("interceptors.socket.shutdown"):
+                # After its own read side is shut, a socket's empty read is not the peer's EOF.
+                if args and args[0] in (socket.SHUT_RD, socket.SHUT_RDWR):
+                    self._on_read_shutdown(this)
+            return ret
 
         return wrapper

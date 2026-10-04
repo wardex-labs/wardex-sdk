@@ -63,7 +63,7 @@ not here yet. `__all__` grows as modules land and does not shrink.
 """
 
 from .._types import AgentAttributes, ConversationContext, EvaluationAttributes, ToolAttributes
-from ._builder import NULL_DRAFT, IntegrityBuilder, SpanDraft
+from ._builder import NULL_DRAFT, OTEL_ERROR_TYPE_OTHER, IntegrityBuilder, SpanDraft
 from ._diag import Counters, counters, diag_info, diag_warning, guard, report_once
 from ._integrity import Limitation
 from ._parentage import (
@@ -119,6 +119,7 @@ __all__ = [
     "Limitation",
     "LinkReason",
     "NULL_DRAFT",
+    "OTEL_ERROR_TYPE_OTHER",
     "ParentSource",
     "Parentage",
     "PatchSet",

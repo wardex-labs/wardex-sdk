@@ -32,6 +32,7 @@ _CASES: dict[str, tuple[str, str]] = {
     "openai_chat": ("api.openai.com", "/v1/chat/completions"),
     "openai_chat_tools": ("api.openai.com", "/v1/chat/completions"),
     "openai_chat_sse": ("api.openai.com", "/v1/chat/completions"),
+    "openai_chat_sse_error": ("api.openai.com", "/v1/chat/completions"),
     "openai_responses": ("api.openai.com", "/v1/responses"),
     "openai_responses_tools": ("api.openai.com", "/v1/responses"),
     "openai_responses_reasoning": ("api.openai.com", "/v1/responses"),
@@ -44,6 +45,7 @@ _CASES: dict[str, tuple[str, str]] = {
     "openai_embeddings": ("api.openai.com", "/v1/embeddings"),
     "anthropic_messages": ("api.anthropic.com", "/v1/messages"),
     "anthropic_messages_sse": ("api.anthropic.com", "/v1/messages"),
+    "anthropic_messages_sse_error": ("api.anthropic.com", "/v1/messages"),
 }
 
 
@@ -115,6 +117,7 @@ def test_fixture_parses_to_its_expectation(case: str):
         "encoding_formats",
         "embedding_dimensions",
         "output_type",
+        "error_type",
     ):
         if attr in expect:
             got = getattr(sem, attr)
@@ -143,6 +146,9 @@ def test_fixture_parses_to_its_expectation(case: str):
     if "error_code" in expect:
         body = json.loads(bytes(sem.decoded_response))
         assert body["error"]["code"] == expect["error_code"], case
+    if "error_message" in expect:
+        body = json.loads(bytes(sem.decoded_response))
+        assert body["error"]["message"] == expect["error_message"], case
 
 
 # ---------------------------------------------------------------------------
