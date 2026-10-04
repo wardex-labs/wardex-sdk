@@ -2,12 +2,11 @@ from __future__ import annotations
 
 import functools
 import inspect
-import os
-import sys
 import time
 import uuid
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, contextmanager
+from types import TracebackType
 from typing import TYPE_CHECKING, Any
 
 from . import _hub
@@ -25,6 +24,7 @@ from ._assembly import (
     resolve_parentage,
 )
 from ._enums import CaptureSource, OperationName, SpanKind, StatusCode
+from ._source_paths import _call_site_file, _scrub_home, _stacktrace
 from ._types import (
     AgentAttributes,
     CallSite,
@@ -389,16 +389,35 @@ class _WithOnly:
     `TypeError` at decoration time, naming the decorators that do it right.
     """
 
-    __slots__ = ("_api", "_cm")
+    __slots__ = ("_api", "_cm", "_span")
 
     def __init__(self, api: str, cm: Any) -> None:
         self._api = api
         self._cm = cm
+        self._span: Span | None = None
 
     def __enter__(self) -> Span:
-        return self._cm.__enter__()
+        self._span = self._cm.__enter__()
+        return self._span
 
     def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> bool | None:
+        # Recorded HERE rather than in `_begin`, because this is the one place
+        # that holds the traceback the host will see: once thrown into the
+        # generator, it carries wardex's own frames at its head.
+        #
+        # `issubclass(type(exc), ...)`, not `isinstance(exc, ...)`: for anything
+        # that is not an `Exception`, `isinstance` asks the object for its
+        # `__class__`, which is the host's code and can raise in place of the
+        # exception the host is raising. `type()` and a subclass check against a
+        # builtin run nothing of the host's.
+        if issubclass(type(exc), Exception) and self._span is not None:
+            try:
+                _record_exception(self._span, exc, tb)
+            except BaseException:
+                # A signal landing mid-record must not leave the span unfinished
+                # and its fork installed as the active parent.
+                self._cm.__exit__(exc_type, exc, tb)
+                raise
         return self._cm.__exit__(exc_type, exc, tb)
 
     def __call__(self, *args: Any, **kwargs: Any) -> None:
@@ -501,67 +520,86 @@ def span(
     return _WithOnly("span", _span(name, op, kind, agent, tool))
 
 
-def _call_site_file(
-    path: str,
-    module: object,
-    modules: Mapping[str, Any] | None = None,
-    pathmod: Any = os.path,
-) -> str:
-    """`path` relative to the folder its top-level package was imported from.
+def _record_exception(span: Span, exc: Exception, tb: TracebackType | None) -> None:
+    """OTel's recorded exception: status ERROR, `error.type`, one `exception` event.
 
-    `support_bot.agent` defined in `/Users/alice/work/acme/support_bot/agent.py`
-    gives `support_bot/agent.py`: the OS user name and every folder above the
-    import root stay on the machine, and the package path a developer needs to
-    find the code leaves with the span. A top-level module, `__main__`
-    included, gives its file name alone.
+    Only an `Exception` gets here: a cancellation or an exit signal is not the
+    agent failing. A status the host set inside the block wins, and so does an
+    error type it named; the event is recorded either way, because it is the
+    evidence rather than the verdict. Nothing here writes to `exc` or `tb`, so
+    the host re-raises the very object, with the traceback it had.
 
-    This is Sentry's `filename_for_module` (`sentry_sdk/utils.py`) for every
-    file that lies inside its top-level package's folder, and the file name
-    alone for every other one: the result is always `<package>/<path inside
-    the package>` or a bare file name, never an absolute path. Where Sentry
-    sends the absolute path (no module name, a top-level package missing from
-    `modules`, a namespace package with no `__file__`, any error), this sends
-    the file name. It also refuses what Sentry's cut lets through: a top-level
-    module that is not a package (two folders up from its file is one too
-    many), a path outside the package's folder (Sentry cuts wherever the root
-    first appears in the string, and `functools.wraps` copies `__module__`
-    without `__code__`, so the two can name different trees), a package
-    folder not named after the package, and a remainder that climbs out
-    through `..`.
-
-    `modules` and `pathmod` are injectable so the rule is testable against
-    Windows-shaped paths (`ntpath`) on any OS. `pathmod.altsep` is folded into
-    `pathmod.sep` first, so a mixed-separator path cannot cut at the wrong
-    folder.
+    The message and the stack trace are host text like any attribute: the
+    encoder masks them on both wires, and the OTLP value cap cuts them there.
     """
-    sep, altsep = pathmod.sep, pathmod.altsep
-    if altsep:
-        path = path.replace(altsep, sep)
-    if path.endswith(".pyc"):
-        path = path[:-1]
-    name = pathmod.basename(path)
-    if not isinstance(module, str) or not module:
-        return name
-    base = module.split(".", 1)[0]
-    if not base or base == module:
-        return name
+    draft = span._draft
+    name = _exception_type(type(exc))  # outside any guard, which is why it is TOTAL
+    with guard("tracing.exception_status", debug=_debug_enabled()):
+        if draft._status is StatusCode.UNSET:
+            draft.set_status(StatusCode.ERROR, draft._status_message)
+        if draft._status is StatusCode.ERROR and not draft._error_type:
+            draft.set_error(name)
+    with guard("tracing.exception_event", debug=_debug_enabled()):
+        try:
+            message = str(exc)
+        except Exception:
+            message = "<exception str() failed>"  # the placeholder `traceback` prints
+        stack = ""
+        with guard("tracing.exception_stacktrace", debug=_debug_enabled()):
+            stack = _stacktrace(exc, tb)
+        attrs = {
+            "exception.type": name,
+            "exception.message": _scrub_home(message),
+            "exception.stacktrace": stack,
+        }
+        draft.add_event("exception", time.time_ns(), **attrs)
+
+
+def _exception_type(cls: type) -> str:
+    """The class's fully qualified name, bare for a builtin — OTel Python's rule.
+
+    TOTAL, because it runs outside any guard on the host's way out of a block,
+    over a class that is the host's: a metaclass can make `__module__` a
+    property, or refuse every lookup, and what it raises would leave the block
+    in place of the host's own exception. Python's own lookup goes first, so
+    the name matches the last line of the stack trace; when it raises or gives
+    something that is not a string, the names come from `type`'s own
+    descriptors, which read what the class statement stored and run nothing
+    of the host's. Only exact `str` values are compared or joined, so a string
+    subclass's `__eq__` or `__format__` never runs either.
+    """
     try:
-        # A failure here is a reason to send less, never to fail the host's
-        # decoration: a module object can raise anything from attribute access.
-        base_file = (sys.modules if modules is None else modules)[base].__file__
+        module, qualname = cls.__module__, cls.__qualname__
     except Exception:
-        return name
-    if not isinstance(base_file, str):
-        return name
-    if altsep:
-        base_file = base_file.replace(altsep, sep)
-    package_dir, _, init = base_file.rpartition(sep)
-    if not init.startswith("__init__.") or package_dir.rpartition(sep)[2] != base:
-        return name
-    inside = path[len(package_dir) + 1 :] if path.startswith(package_dir + sep) else ""
-    if not inside or ".." in inside.split(sep):
-        return name
-    return base + sep + inside
+        module = qualname = None
+    module = _exact_str(module)
+    if module is None:
+        module = _exact_str(_stored_module(cls))
+    qualname = _exact_str(qualname)
+    if qualname is None:
+        # Never raises: every class has a qualified name, and this getter reads
+        # it from the type object itself.
+        qualname = str.__str__(type.__dict__["__qualname__"].__get__(cls))
+    if module is None or module in ("", "builtins"):
+        return qualname
+    return f"{module}.{qualname}"
+
+
+def _stored_module(cls: type) -> object:
+    """The `__module__` the class statement stored, or None when it stored none."""
+    try:
+        return type.__dict__["__module__"].__get__(cls)
+    except Exception:
+        return None
+
+
+def _exact_str(value: object) -> str | None:
+    """`value` as an exact `str` (a copy, for a subclass), or None if it is no string.
+
+    `type()` and a subclass check against `str` read the object's real type, so
+    unlike `isinstance` they never ask the object for its `__class__`.
+    """
+    return str.__str__(value) if issubclass(type(value), str) else None
 
 
 def _call_site(fn: Callable[..., Any]) -> CallSite:
