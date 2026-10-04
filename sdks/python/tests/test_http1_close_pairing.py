@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import socket
 import sys
 import threading
@@ -44,9 +45,26 @@ _PATH = "/v1/chat/completions"
 _UNFINISHED = "protocol.http1.request_unfinished"
 _UNOBSERVED = "protocol.http1.request_unobserved"
 _EARLY_UNFRAMED = b"HTTP/1.1 413 Payload Too Large\r\nConnection: close\r\n\r\ntoo large"
-# Small kernel buffers on both ends, so a large `write()` is not taken by one
-# `send()` and asyncio sends the rest with `sendmsg` from Python 3.12.
+# Small kernel buffers on both ends, so no single `send()` or `sendmsg()` takes a
+# large request whole and asyncio sends the rest with `sendmsg` from Python 3.12.
+# Linux doubles the value it is given; both stay far below `_LARGE`.
 _SMALL_BUFFER = 32 * 1024
+_LARGE = 1024 * 1024 + 4096
+
+
+def _asyncio_writes_with_sendmsg() -> bool:
+    """The test CPython's `asyncio.selector_events` makes when it is imported:
+    from Python 3.12, with `socket.sendmsg` present and `SC_IOV_MAX` known to
+    `os.sysconf`, the plaintext socket transport sends every `writelines()`, and
+    whatever the kernel did not take of a `write()`'s first `send()`, with
+    `sendmsg`. Anywhere else it writes with `send` alone."""
+    if sys.version_info < (3, 12) or not hasattr(socket.socket, "sendmsg"):
+        return False
+    try:
+        os.sysconf("SC_IOV_MAX")
+    except (OSError, ValueError):
+        return False
+    return True
 
 
 def _head(n: int, path: str = _PATH) -> bytes:
@@ -267,8 +285,16 @@ async def _post_httpx(port: int, body: bytes) -> None:
         assert reply.status_code == 200
 
 
+def _small_send_buffer_socket(addr_info: tuple) -> socket.socket:
+    family, type_, proto, _, _ = addr_info
+    sock = socket.socket(family=family, type=type_, proto=proto)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, _SMALL_BUFFER)
+    return sock
+
+
 async def _post_aiohttp(port: int, body: bytes) -> None:
-    async with aiohttp.ClientSession() as session:
+    connector = aiohttp.TCPConnector(socket_factory=_small_send_buffer_socket)
+    async with aiohttp.ClientSession(connector=connector) as session:
         headers = {"Content-Type": "application/json"}
         async with session.post(f"http://127.0.0.1:{port}{_PATH}", data=body, headers=headers) as r:
             assert r.status == 200
@@ -276,20 +302,29 @@ async def _post_aiohttp(port: int, body: bytes) -> None:
 
 
 @pytest.mark.parametrize(
-    ("post", "size"),
-    [
-        pytest.param(_post_httpx, 1024 * 1024 + 4096, id="httpx-large-write"),
-        pytest.param(_post_aiohttp, 64 * 1024, id="aiohttp-writelines"),
-    ],
+    "post", [pytest.param(_post_httpx, id="httpx"), pytest.param(_post_aiohttp, id="aiohttp")]
 )
 def test_a_request_asyncio_sent_with_sendmsg_pairs_with_the_reply_the_server_close_ends(
-    monkeypatch, post, size
+    monkeypatch, post
 ):
-    """A request whose tail asyncio sent with `sendmsg` (Python 3.12+), answered by
-    a server that ends its reply by closing: one span, carrying the whole request
-    and the whole reply, ended at the server's close and not marked as cut."""
+    """A request asyncio sent at least in part with `sendmsg`, answered by a server
+    that ends its reply by closing: one span, carrying the whole request and the
+    whole reply, ended at the server's close and not marked as cut.
+
+    Each client writes a 1 MiB request through a socket whose send buffer is far
+    smaller, so no kernel takes it in one call. httpx hands asyncio one `write()`:
+    its first `send()` takes part and `sendmsg` sends the rest. aiohttp hands it
+    `writelines()`, which goes out with `sendmsg` from the first byte, except on
+    CPython before 3.12.9 and on 3.13.0 and 3.13.1, where aiohttp avoids
+    `writelines()` (CVE-2024-12254) and joins the request into one `write()` that
+    goes out as httpx's does. Left to the kernel's own buffer, Linux took that
+    `write()` of a 64 KiB request whole in its first `send()`, so `sendmsg` was
+    never called.
+
+    Where asyncio has no `sendmsg` path (before Python 3.12), the same exchange
+    goes out with `send` alone and must pair the same way."""
     body = json.dumps(
-        {"model": "gpt-4o", "messages": [{"role": "user", "content": "x" * size}]}
+        {"model": "gpt-4o", "messages": [{"role": "user", "content": "x" * _LARGE}]}
     ).encode()
     reply = _completion("tag0")
     sendmsg_calls = []
@@ -310,8 +345,10 @@ def test_a_request_asyncio_sent_with_sendmsg_pairs_with_the_reply_the_server_clo
     finally:
         wardex.close()
 
-    if sys.version_info >= (3, 12) and hasattr(socket.socket, "sendmsg"):
+    if _asyncio_writes_with_sendmsg():
         assert sendmsg_calls, "precondition: asyncio sent part of the request with sendmsg"
+    else:
+        assert not sendmsg_calls, "precondition: asyncio here writes with send alone"
     spans = [s for e in recorder.envelopes for s in e.spans if s.name.startswith("HTTP ")]
     (span,) = spans
     assert span.name == f"HTTP POST {_PATH}"
