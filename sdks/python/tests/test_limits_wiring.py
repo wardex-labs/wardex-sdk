@@ -368,6 +368,7 @@ _NATIVE_ONLY: dict[str, str] = {
     "parse_llm_semantics": "wardex_sdk._protocol:parse_llm_semantics",
     "_Http1Tracker": "wardex_sdk._interceptors._trackers:_Http1Tracker",
     "_Http2Tracker": "wardex_sdk._interceptors._trackers:_Http2Tracker",
+    "RequestSide": "wardex_sdk._interceptors._http1_requests:RequestSide",
     "Http1RequestParser": "wardex_sdk._protocol._http1:Http1RequestParser",
     "Http1ResponseParser": "wardex_sdk._protocol._http1:Http1ResponseParser",
     "Http2Parser": "wardex_sdk._protocol._http2:Http2Parser",
