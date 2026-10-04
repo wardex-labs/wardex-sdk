@@ -283,7 +283,7 @@ _OVERSIZED_BUDGET = {
     "_assembly/_units.py": 2100,
     "_adapters/_assembler.py": 1934,
     "_adapters/_openai_agents.py": 1588,
-    "_client.py": 1586,
+    "_client.py": 1585,
     "_adapters/_context.py": 1305,
     "_interceptors/_seam.py": 1191,
     "_adapters/_langgraph.py": 1035,
