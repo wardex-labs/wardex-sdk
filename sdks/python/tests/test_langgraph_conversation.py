@@ -53,6 +53,43 @@ def test_the_thread_id_is_the_conversation_of_the_run_and_of_every_span_under_it
     assert extra_of(run)["wardex.langgraph.thread_id"] == "T-1"
 
 
+def test_a_thread_bound_with_with_config_is_the_conversation(installed):  # noqa: F811
+    """`graph.with_config(configurable={"thread_id": ...})` states the thread as
+    surely as a call config — LangGraph checkpoints under it — and the run read
+    only the call, so it shipped no conversation at all."""
+    _app().with_config(configurable={"thread_id": "T-BOUND"}).invoke({"trail": []})
+    (run,) = runs(installed.spans)
+    assert run.conversation == ConversationContext(conversation_id="T-BOUND")
+    assert _conversation_ids(installed.spans) == {"T-BOUND"}
+    assert extra_of(run)["wardex.langgraph.thread_id"] == "T-BOUND"
+
+
+def test_the_call_configs_thread_is_the_conversation_over_the_bound_one(installed):  # noqa: F811
+    """Both directions on one graph, so that neither reading alone passes: the
+    bound thread is the conversation until a call names its own, and the
+    call's wins for that run only."""
+    app = _app().with_config(configurable={"thread_id": "T-BOUND"})
+    app.invoke({"trail": []})
+    app.invoke({"trail": []}, {"configurable": {"thread_id": "T-CALL"}})
+    in_order = sorted(runs(installed.spans), key=lambda s: s.start_time_ns)
+    assert [_conversation_ids([r]) for r in in_order] == [{"T-BOUND"}, {"T-CALL"}]
+
+
+def test_a_thread_in_an_enclosing_runnables_config_is_the_conversation(installed):  # noqa: F811
+    """LangGraph merges the ambient runnable config into a call that names no
+    thread and runs on the thread it carries, so that thread is the
+    conversation too; the call and bound configs alone said nothing."""
+    from langchain_core.runnables import RunnableLambda
+
+    app = _app()
+    RunnableLambda(lambda x: app.invoke(x)).invoke(
+        {"trail": []}, {"configurable": {"thread_id": "T-AMB"}}
+    )
+    (run,) = runs(installed.spans)
+    assert _conversation_ids(installed.spans) == {"T-AMB"}
+    assert extra_of(run)["wardex.langgraph.thread_id"] == "T-AMB"
+
+
 def test_an_integer_thread_id_is_its_text(installed):  # noqa: F811
     _app().invoke({"trail": []}, {"configurable": {"thread_id": 7}})
     assert _conversation_ids(installed.spans) == {"7"}
