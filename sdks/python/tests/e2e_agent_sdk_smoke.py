@@ -4,6 +4,17 @@ Run locally (requires claude CLI + auth):
     uv run python sdks/python/tests/e2e_agent_sdk_smoke.py
 Also serves as the fixture recorder: set WARDEX_RECORD=/path/to/out.jsonl to
 dump raw inbound stream-json lines for parser golden tests.
+
+WARDEX_SMOKE_SCENARIO picks a prompt that makes the CLI split ONE model
+response across several `assistant` lines, which is what the replay fixtures
+under `fixtures/agent_sdk_stream/` hold:
+    text_then_tool    — a sentence, then one Bash call
+    parallel_tools    — three Bash calls in one response
+    background_agent  — a sub-agent launched in the background, whose
+                        response arrives after the turn that launched it
+The two Bash scenarios run with only the Bash tool; background_agent runs
+with only the Agent tool and one background sub-agent definition. Every
+scenario runs with no settings sources, in a fresh temporary directory.
 """
 
 import asyncio
@@ -11,6 +22,25 @@ import json
 import os
 import shutil
 import sys
+import tempfile
+
+SCENARIOS = {
+    "text_then_tool": (
+        "First write exactly one short sentence saying you will run a command. "
+        "Then call the Bash tool once to run: echo hello. "
+        "After the result, reply with the single word: done."
+    ),
+    "parallel_tools": (
+        "In ONE single response, call the Bash tool three times in parallel, "
+        "with these three commands: echo one ; echo two ; echo three. "
+        "Do not write any text before the tool calls. "
+        "After all three results, reply with the single word: done."
+    ),
+    "background_agent": (
+        "Launch the pinger agent with the Agent tool. It runs in the background. "
+        "Do not wait for it: right after launching it, reply with the single word: started."
+    ),
+}
 
 
 async def main() -> int:
@@ -24,6 +54,10 @@ async def main() -> int:
     from wardex_sdk import ConsoleTransport
 
     record_path = os.environ.get("WARDEX_RECORD")
+    scenario = os.environ.get("WARDEX_SMOKE_SCENARIO")
+    if scenario is not None and scenario not in SCENARIOS:
+        print(f"unknown WARDEX_SMOKE_SCENARIO {scenario!r}; one of {sorted(SCENARIOS)}")
+        return 2
     wardex_sdk.init(transport=ConsoleTransport())
 
     rec = None
@@ -50,9 +84,37 @@ async def main() -> int:
 
             cls.read_messages = read_messages
 
-        async for message in claude_agent_sdk.query(
-            prompt="What is 2 + 2? Answer with one number."
-        ):
+        prompt = "What is 2 + 2? Answer with one number."
+        options = None
+        if scenario == "background_agent":
+            prompt = SCENARIOS[scenario]
+            options = claude_agent_sdk.ClaudeAgentOptions(
+                tools=["Agent"],
+                allowed_tools=["Agent"],
+                cwd=tempfile.mkdtemp(prefix="wardex-smoke-"),
+                max_turns=6,
+                setting_sources=[],
+                model="sonnet",
+                agents={
+                    "pinger": claude_agent_sdk.AgentDefinition(
+                        description="Replies with one word. Always launch it in the background.",
+                        prompt="Reply with the single word: pong. Use no tools.",
+                        tools=[],
+                        model="haiku",
+                        background=True,
+                    )
+                },
+            )
+        elif scenario is not None:
+            prompt = SCENARIOS[scenario]
+            options = claude_agent_sdk.ClaudeAgentOptions(
+                tools=["Bash"],
+                allowed_tools=["Bash(echo:*)", "Bash"],
+                cwd=tempfile.mkdtemp(prefix="wardex-smoke-"),
+                max_turns=4,
+                setting_sources=[],
+            )
+        async for message in claude_agent_sdk.query(prompt=prompt, options=options):
             print(type(message).__name__)
 
         print("smoke OK — spans printed above by ConsoleTransport")

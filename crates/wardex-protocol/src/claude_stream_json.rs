@@ -41,6 +41,12 @@ pub struct ClaudeStreamEvent {
     /// `Task` call that spawned the agent, carrying the inner tool's output,
     /// and the inner call got no result at all.
     pub tool_result_id: Option<String>,
+    /// A `tool_result` that answers its call by LAUNCHING it, not by finishing
+    /// it: the line's `tool_use_result.status` is `async_launched`, as for an
+    /// `Agent` call run in the background. The call has returned; the
+    /// sub-agent it started has not, and goes on writing lines under the
+    /// call's id until its task's `task_notification`.
+    pub launched_async: bool,
     pub content_json: Option<Vec<u8>>,
     pub tool_uses: Vec<ToolUse>,
     /// Normalized (semconv-inclusive) — `parse_usage` names Anthropic's
@@ -67,6 +73,7 @@ impl ClaudeStreamEvent {
             stop_reason: None,
             parent_tool_use_id: None,
             tool_result_id: None,
+            launched_async: false,
             content_json: None,
             tool_uses: Vec::new(),
             usage: None,
@@ -199,6 +206,13 @@ pub fn parse_stream_line(line: &[u8], outbound: bool) -> Option<ClaudeStreamEven
             // the refusal on `parent_tool_use_id` also admitted a sub-agent's
             // ordinary user message, which carries that field and no result.
             e.tool_result_id.as_ref()?;
+            // Outside the message, in the CLI's own record of the call's
+            // outcome: the block itself reads like any other result.
+            e.launched_async = v
+                .get("tool_use_result")
+                .and_then(|r| r.get("status"))
+                .and_then(Value::as_str)
+                == Some("async_launched");
             e.content_json = v.get("message").and_then(raw);
             Some(e)
         }
@@ -289,6 +303,29 @@ mod tests {
         assert!(e.is_error);
         // and the ordinary one still does not
         assert!(!parse_stream_line(TOOL_RESULT, false).unwrap().is_error);
+    }
+
+    /// A background `Agent` call's result is its launch, recorded by the CLI
+    /// beside the block, and only that status says so: the block is ordinary.
+    #[test]
+    fn a_result_that_launched_its_call_says_so() {
+        const LAUNCHED: &[u8] = br#"{"type":"user","session_id":"s-1","parent_tool_use_id":null,"message":{"role":"user","content":[{"tool_use_id":"toolu_AGENT","type":"tool_result","content":[{"type":"text","text":"Async agent launched successfully."}]}]},"tool_use_result":{"isAsync":true,"status":"async_launched","agentId":"a1"}}"#;
+        const FINISHED: &[u8] = br#"{"type":"user","session_id":"s-1","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_AGENT","content":"done"}]},"tool_use_result":{"status":"completed"}}"#;
+        const TEXT_OUTCOME: &[u8] = br#"{"type":"user","session_id":"s-1","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_01","content":"boom","is_error":true}]},"tool_use_result":"Error: boom"}"#;
+        let e = parse_stream_line(LAUNCHED, false).unwrap();
+        assert_eq!(e.tool_result_id.as_deref(), Some("toolu_AGENT"));
+        assert!(e.launched_async);
+        assert!(!parse_stream_line(FINISHED, false).unwrap().launched_async);
+        assert!(
+            !parse_stream_line(TEXT_OUTCOME, false)
+                .unwrap()
+                .launched_async
+        );
+        assert!(
+            !parse_stream_line(TOOL_RESULT, false)
+                .unwrap()
+                .launched_async
+        );
     }
 
     /// A sub-agent's ordinary user message carries `parent_tool_use_id` and no

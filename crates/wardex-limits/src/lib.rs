@@ -77,18 +77,18 @@ pub struct Limits {
     /// Maximum concurrently tracked adapter sessions.
     pub max_sessions: usize,
     /// Maximum entries in each per-session tracking map an adapter keeps:
-    /// open tool calls, streamed tool metadata, sub-agents, and the OTel
-    /// bridge's pending buffer.
+    /// open tool calls, streamed tool metadata, sub-agents, model responses
+    /// still arriving, and the OTel bridge's pending buffer.
     ///
-    /// Only two of those four hold entries that OWN a span, and only those two
-    /// evictions reach the wire. Crossing the bound on open tools or on
-    /// sub-agents force-closes the OLDEST entry and emits its span carrying
-    /// `session_entry_table_full`, for the same reason as `max_units`: a
-    /// ceiling that dropped state silently would be a worse failure than an
-    /// unenforced one. That span ships `UNSET`, not `OK` and not `ERROR` —
-    /// the bound stopped the observation before the outcome, so `OK` would
-    /// claim a success nobody watched and `ERROR` would report a full table of
-    /// wardex's own as a failure of the agent.
+    /// Three of those five hold entries that OWN a span, and only those three
+    /// evictions reach the wire. Crossing the bound on open tools, on
+    /// sub-agents or on arriving responses force-closes the OLDEST entry and
+    /// emits its span carrying `session_entry_table_full`, for the same reason
+    /// as `max_units`: a ceiling that dropped state silently would be a worse
+    /// failure than an unenforced one. That span ships `UNSET`, not `OK` and
+    /// not `ERROR` — the bound stopped the observation before the outcome, so
+    /// `OK` would claim a success nobody watched and `ERROR` would report a
+    /// full table of wardex's own as a failure of the agent.
     ///
     /// ONE CALL, TWO OBSERVATIONS. An evicted tool call that later completes
     /// ships a SECOND span with the same call id and the same marker: the
@@ -100,6 +100,21 @@ pub struct Limits {
     /// name, owning sub-agent, span context) — never the payload bytes, which
     /// are the thing the bound exists to stop holding.
     ///
+    /// ONE RESPONSE, ONE SPAN. Unlike a tool call, a model response arrives as
+    /// several lines that each repeat its usage, so an evicted response's later
+    /// lines add no second span: one would count the request, and its tokens,
+    /// twice. Only the response's id is remembered across the eviction, and
+    /// the content only those lines carried is missing from the span. The id
+    /// is kept with the response's own thread, so evictions on other threads
+    /// cannot drop it. The exception is a sub-agent thread that started while
+    /// this bound was already tracking that many sub-agent threads: its id is
+    /// held under this bound too, and a later line that arrives after the id
+    /// was dropped does open a second span. Nothing tells that span from a new
+    /// response, so once an id is dropped, a new response on a sub-agent thread
+    /// holding no other response of its own carries `session_entry_table_full`
+    /// as well. The ids dropped are counted, an upper bound on those second
+    /// spans (`adapters.assembler.evicted_chat_table_full` in the Python SDK).
+    ///
     /// The other two evict nothing to the wire. Streamed tool metadata is
     /// consumed in ARRIVAL order, so a full table refuses the NEWEST entry
     /// rather than the oldest — dropping the oldest would discard the one most
@@ -109,7 +124,7 @@ pub struct Limits {
     /// are recorded in the host SDK's internal counters
     /// (`adapters.assembler.stream_tool_meta_table_full`,
     /// `adapters.assembler.otel_bridge_pending_overflow` in the Python SDK),
-    /// alongside one counter per site for the two that do reach the wire.
+    /// alongside one counter per site for the three that do reach the wire.
     ///
     /// Not the same field as `max_entries_per_unit`, which generalizes this
     /// bound to units of every kind. Raising that one leaves this one exactly
