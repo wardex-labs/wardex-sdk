@@ -53,6 +53,21 @@ def _span_size(span: InternalSpan) -> int:
     return _SPAN_OVERHEAD_BYTES + len(span.input_data or b"") + len(span.output_data or b"")
 
 
+def _count_dropped(cause: str, envelope: Envelope, spans: deque, snapshots: deque) -> str:
+    """Tally each item a raise made `_drain` drop, under `client.drain.span_dropped.<cause>`
+    and `client.drain.snapshot_dropped.<cause>`, and say how many: the envelope the raise took
+    (a hook may have filtered it on purpose), else the whole batch if it has no readable items."""
+    try:
+        n_spans, n_snapshots = len(envelope.spans), len(envelope.state_snapshots)
+    except Exception:  # runs inside a fail-closed handler, so it may not raise either
+        n_spans, n_snapshots = len(spans), len(snapshots)
+    for _ in range(n_spans):
+        counters.bump(f"client.drain.span_dropped.{cause}")
+    for _ in range(n_snapshots):
+        counters.bump(f"client.drain.snapshot_dropped.{cause}")
+    return f"{n_spans} span(s)" + (f" and {n_snapshots} state snapshot(s)" if n_snapshots else "")
+
+
 # Handed to Transport.flush() on the periodic path, which carries no deadline of
 # its own. Transport.flush() is a no-op for every transport we ship, so this is
 # only ever consumed by third-party transports that buffer.
@@ -965,71 +980,63 @@ class Client:
     ) -> None:
         """Export everything buffered, within `timeout` seconds end to end.
 
-        `timeout` is None (the periodic worker only) or a value already through
-        `_sanitize_timeout`; it is not re-validated here. `final=True` marks
-        close()'s last drain -- the one after which nothing will ever drain this
-        client again. See `_abandon` and `_undelivered`.
+        `timeout` is None (the periodic worker only) or a value already through `_sanitize_timeout`;
+        it is not re-validated here. `final=True` marks close()'s last drain -- the one after which
+        nothing will ever drain this client again. See `_abandon` and `_undelivered`.
 
-        `named_by_caller` says whether `timeout` is a number the APPLICATION
-        passed to `flush()`/`close()` or one wardex derived for it (the
-        transport's configured timeout, the shutdown default, the worker's
-        None). It changes nothing about how long this drain waits; it is
-        forwarded to the transport, which cannot tell the two apart from the
-        number alone and needs to, because "your budget cut this off" is a
-        report only the first kind of caller can act on. Default False -- the
-        silent direction -- so a new call site that forgets it under-diagnoses
-        rather than blaming a host for wardex's own number. See
+        `named_by_caller` says whether `timeout` is a number the APPLICATION passed to
+        `flush()`/`close()` or one wardex derived for it (the transport's configured timeout, the
+        shutdown default, the worker's None). It changes nothing about how long this drain waits; it
+        is forwarded to the transport, which cannot tell the two apart from the number alone and
+        needs to, because "your budget cut this off" is a report only the first kind of caller can
+        act on. Default False -- the silent direction -- so a new call site that forgets it
+        under-diagnoses rather than blaming a host for wardex's own number. See
         `transport._base.CallerBudget`.
 
-        `timeout` is a wall-clock bound on this whole call, not a per-step one.
-        It covers the wait for the export slot, the POST, and the transport
-        flush after it, all measured against a single monotonic deadline. This
-        is what makes the signal handler's flush(2.0) mean two seconds: before,
-        the drain lock was held across the synchronous POST, so a flush arriving
-        behind an in-flight export waited out that export's full transport
-        timeout, then spent its own, then flushed -- a "2s" bound that measured
-        22s on a stalled backend and delayed process exit by that much.
+        `timeout` is a wall-clock bound on this whole call, not a per-step one. It covers the wait
+        for the export slot, the POST, and the transport flush after it, all measured against a
+        single monotonic deadline. This is what makes the signal handler's flush(2.0) mean two
+        seconds: before, the drain lock was held across the synchronous POST, so a flush arriving
+        behind an in-flight export waited out that export's full transport timeout, then spent its
+        own, then flushed -- a "2s" bound that measured 22s on a stalled backend and delayed process
+        exit by that much.
 
-        The export lock is still held across the POST, because serializing
-        transport.export() is the guarantee third-party transports were written
-        against. What changed is that waiting for it is now bounded: a drain
-        that cannot get the slot in time declines and returns, having taken
-        nothing -- the swap happens after the acquire, so the spans are still in
-        the buffer and the next drain ships them.
+        The export lock is still held across the POST, because serializing transport.export() is the
+        guarantee third-party transports were written against. What changed is that waiting for it
+        is now bounded: a drain that cannot get the slot in time declines and returns, having taken
+        nothing -- the swap happens after the acquire, so the spans are still in the buffer and the
+        next drain ships them.
 
-        THE RULE, stated as a rule because three attempts to state it as a list
-        of cases were each missing one: a batch this drain swapped out belongs
-        to this drain until something OBSERVES that the transport took it. The
-        observation is `_export`'s return value -- the transport's own word at
-        the moment of the send. When it says no:
+        THE RULE, stated as a rule because three attempts to state it as a list of cases were each
+        missing one: a batch this drain swapped out belongs to this drain until something OBSERVES
+        that the transport took it. The observation is `_export`'s return value -- the transport's
+        own word at the moment of the send. When it says no:
 
-          * a non-final drain gives the batch back (`_return_to_buffer`), so the
-            next drain ships it, which is what the paragraph above promises and
-            what a `flush(0.0)` used to break -- it acquired the slot, swapped
-            the spans out, handed the transport a spent budget, and lost them;
-          * close()'s final drain has no next drain, so it counts and reports
-            instead (`_undelivered` -> `_report_lost`).
+          * a non-final drain gives the batch back (`_return_to_buffer`), so the next drain ships
+            it, which is what the paragraph above promises and what a `flush(0.0)` used to break --
+            it acquired the slot, swapped the spans out, handed the transport a spent budget, and
+            lost them;
+          * close()'s final drain has no next drain, so it counts and reports instead
+            (`_undelivered` -> `_report_lost`).
 
-        Nothing here tries to work out in ADVANCE whether the send will happen.
-        Every version that did was wrong in the same way: the prediction was
-        evaluated at a moment that was not the moment of the send, and the work
-        in between -- `before_send_envelope`, which is host code and can outlive any
-        budget -- invalidated it. There is no reason to guess about something
+        Nothing here tries to work out in ADVANCE whether the send will happen. Every version that
+        did was wrong in the same way: the prediction was evaluated at a moment that was not the
+        moment of the send, and the work in between -- `before_send_envelope`, which is host code
+        and can outlive any budget -- invalidated it. There is no reason to guess about something
         the callee can simply be asked.
 
-        The signal path has no next drain either, but the process then dies and
-        the tail dies with it -- that is the deliberate reading of
-        _SIGNAL_FLUSH_TIMEOUT's "never delay shutdown": a droppable tail is the
-        price of a bounded one. close() is *not* that path -- the process
-        carries on, since install() closes the previous client on every re-init
-        and wardex.close(timeout) is public API -- so its final drain does not
-        get to lose the tail quietly.
+        The signal path has no next drain either, but the process then dies and the tail dies with
+        it -- that is the deliberate reading of _SIGNAL_FLUSH_TIMEOUT's "never delay shutdown": a
+        droppable tail is the price of a bounded one. close() is *not* that path -- the process
+        carries on, since install() closes the previous client on every re-init and
+        wardex.close(timeout) is public API -- so its final drain does not get to lose the tail
+        quietly.
 
-        Only the buffer lock is released early (marked below); the export lock
-        is held to the end of the method.
+        Only the buffer lock is released early (marked below); the export lock is held to the end of
+        the method.
 
-        Errors from before_send_envelope or the export path drop the envelope
-        (fail-closed) and never propagate.
+        Errors from before_send_envelope or the export path drop the envelope (fail-closed), count
+        every item it carried (`_count_dropped`), say so once per process, and never propagate.
         """
         deadline = None if timeout is None else time.monotonic() + timeout
         if not self._acquire_export_slot(timeout):
@@ -1077,14 +1084,15 @@ class Client:
                     try:
                         maybe = self._config.before_send_envelope(envelope)
                     except Exception as exc:
-                        # HOST code raised, and the batch is dropped fail-closed
-                        # -- never ship half-filtered data. Said off-debug,
-                        # bounded to one line per process: the hook is the
-                        # host's own veto, so a raise that silently ate every
-                        # batch was byte-identical to a filter that dropped
-                        # them on purpose. The traceback is debug-gated because
-                        # it belongs to the host's code, not to wardex's
-                        # per-process announcement budget.
+                        # HOST code raised, and the batch is dropped fail-closed -- never
+                        # ship half-filtered data. Said off-debug, bounded to one line per
+                        # process: the hook is the host's own veto, so a raise that silently
+                        # ate every batch was byte-identical to a filter that dropped them on
+                        # purpose. Counted per item, because one line cannot say how much
+                        # every later raise ate. The traceback is debug-gated because it
+                        # belongs to the host's code, not to wardex's per-process
+                        # announcement budget.
+                        _count_dropped("before_send_raised", envelope, spans, snapshots)
                         report_once(
                             "before_send_envelope raised; batch dropped "
                             "(re-run with debug=True for the traceback)",
@@ -1108,14 +1116,23 @@ class Client:
                 )
                 shipped = self._export(envelope, deadline, named)
             except Exception as exc:  # fail-closed: drop, never ship half-filtered data
-                # Also not routed into `_undelivered`, deliberately. A raise
-                # means an attempt of unknown outcome -- the transport may have
-                # sent half of it -- so re-queueing risks a duplicate. (The
-                # hook's own raise is handled above, where it can be named; a
-                # raising hook would raise on this envelope every time, which
-                # would pin the batch in the buffer forever if re-queued.)
+                # Also not routed into `_undelivered`, deliberately. A raise means an attempt
+                # of unknown outcome -- the transport may have sent half of it -- so
+                # re-queueing risks a duplicate. (The hook's own raise is handled above, where
+                # it can be named; a raising hook would raise on this envelope every time,
+                # which would pin the batch in the buffer forever if re-queued.)
+                # Counted and said off-debug, as the hook's raise is: a transport that raised on
+                # every batch must not look, in a default process, like one with nothing to send.
+                what = _count_dropped("export_raised", envelope, spans, snapshots)
+                report_once(
+                    f"transport export raised; a batch of {what} was dropped and is not "
+                    "retried, because the transport may have sent part of it (every such drop "
+                    "is counted under client.drain.span_dropped.export_raised; re-run with "
+                    "debug=True for the traceback)",
+                    key="client.drain.span_dropped.export_raised",
+                )
                 if self._config.debug:
-                    diag_warning(f"envelope dropped ({exc})")
+                    _log_with_traceback("client.export", exc)
                 return
             if not shipped:
                 self._undelivered(spans, snapshots, final=final)
@@ -1127,38 +1144,32 @@ class Client:
         """Hand the envelope to the transport with whatever budget is left, and
         report back whether it went.
 
-        The client can bound how long it waits; only the transport can bound its
-        own I/O. A transport that ignores `timeout` still stalls the process for
-        as long as it likes -- this shrinks the blast radius to one drain, it
-        does not remove it.
+        The client can bound how long it waits; only the transport can bound its own I/O. A
+        transport that ignores `timeout` still stalls the process for as long as it likes -- this
+        shrinks the blast radius to one drain, it does not remove it.
 
-        `named` is the number the APPLICATION passed to `flush()`/`close()`, or
-        None when wardex derived the budget itself. It is the one fact the
-        transport cannot recover from what it receives: what arrives there is
-        `deadline - now`, which is always a little UNDER the transport's own
-        configured timeout even on a bare `flush()` that followed that very
-        timeout, so "smaller than configured" is not evidence of a caller. This
-        is the only site that turns it into the wire form -- one construction of
-        `CallerBudget`, on the one path where the caller really did choose the
-        number -- so there is nowhere else for the distinction to be re-derived
-        and got wrong.
+        `named` is the number the APPLICATION passed to `flush()`/`close()`, or None when wardex
+        derived the budget itself. It is the one fact the transport cannot recover from what it
+        receives: what arrives there is `deadline - now`, which is always a little UNDER the
+        transport's own configured timeout even on a bare `flush()` that followed that very timeout,
+        so "smaller than configured" is not evidence of a caller. This is the only site that turns
+        it into the wire form -- one construction of `CallerBudget`, on the one path where the
+        caller really did choose the number -- so there is nowhere else for the distinction to be
+        re-derived and got wrong.
 
-        The return value is the single fact `_drain` acts on, and it is an
-        OBSERVATION, not a forecast: False only when the transport itself
-        returned `UNDELIVERED` at the end of this very call. Everything else --
-        `None` from a transport written before the sentinel existed, a stray
-        value from a third-party one, an ignored deadline honoured by a POST
-        anyway -- reads as delivered, which is the direction that cannot destroy
-        data or invent a loss. See `UNDELIVERED` for the contract.
+        The return value is the single fact `_drain` acts on, and it is an OBSERVATION, not a
+        forecast: False only when the transport itself returned `UNDELIVERED` at the end of this
+        very call. Everything else -- `None` from a transport written before the sentinel existed, a
+        stray value from a third-party one, an ignored deadline honoured by a POST anyway -- reads
+        as delivered, which is the direction that cannot destroy data or invent a loss. See
+        `UNDELIVERED` for the contract.
 
-        Every reach into host code on this path lives here, inside `_drain`'s
-        fail-closed `try`: the signature probe and the call itself. A previous
-        version performed the probe from a second site outside that handler --
-        `Transport` is public and `_transport` is reassignable at runtime, so an
-        `export` that is a property raising RuntimeError turned close() into a
-        raise back into the host's shutdown path. That site existed only to
-        decide in advance whether the send would happen; asking the transport
-        afterwards needs no second site.
+        Every reach into host code on this path lives here, inside `_drain`'s fail-closed `try`: the
+        signature probe and the call itself. A previous version performed the probe from a second
+        site outside that handler -- `Transport` is public and `_transport` is reassignable at
+        runtime, so an `export` that is a property raising RuntimeError turned close() into a raise
+        back into the host's shutdown path. That site existed only to decide in advance whether the
+        send would happen; asking the transport afterwards needs no second site.
         """
         transport = self._transport
         if deadline is None:
@@ -1219,34 +1230,30 @@ class Client:
         """The transport said it did not send this batch. Do the one thing that
         follows -- which is not the same thing on the two paths.
 
-        This is the single site every "the tail vanished" defect in this file
-        now converges on, because it is reached from the single fact that causes
-        them (`_export` returning False) rather than from a list of situations
-        that might. Adding a new way for a send to be skipped adds no new site
-        here; that is the point of the shape.
+        This is the single site every "the tail vanished" defect in this file now converges on,
+        because it is reached from the single fact that causes them (`_export` returning False)
+        rather than from a list of situations that might. Adding a new way for a send to be skipped
+        adds no new site here; that is the point of the shape.
 
-        Non-final: the spans go back, because the drain's own contract says a
-        drain that does not ship costs nothing and the next drain ships them.
-        `flush(0.0)`, and any `flush(t)` whose acquire eats `t`, broke that
-        promise outright -- the slot was taken, the swap done, the transport
-        handed a spent budget, and the batch quietly ceased to exist.
+        Non-final: the spans go back, because the drain's own contract says a drain that does not
+        ship costs nothing and the next drain ships them. `flush(0.0)`, and any `flush(t)` whose
+        acquire eats `t`, broke that promise outright -- the slot was taken, the swap done, the
+        transport handed a spent budget, and the batch quietly ceased to exist.
 
-        Final: there is no next drain, so returning them would hide them in a
-        client nobody will ever drain again. They are counted and reported.
+        Final: there is no next drain, so returning them would hide them in a client nobody will
+        ever drain again. They are counted and reported.
 
-        And the case that is neither, which is why `_return_to_buffer` answers
-        rather than just acting: a NON-final drain against an ALREADY CLOSED
-        client. `flush()` after `close()` is one route to it and a drain still in
-        flight when `close()` runs is the other, and both end in the final
-        path's outcome, because "there is no next drain" is a fact about the
-        client, not about the flag this call was made with.
+        And the case that is neither, which is why `_return_to_buffer` answers rather than just
+        acting: a NON-final drain against an ALREADY CLOSED client. `flush()` after `close()` is one
+        route to it and a drain still in flight when `close()` runs is the other, and both end in
+        the final path's outcome, because "there is no next drain" is a fact about the client, not
+        about the flag this call was made with.
 
-        `spans`/`snapshots` are what the drain swapped OUT, not whatever
-        `before_send_envelope` turned them into. The next drain builds a fresh envelope
-        and runs `before_send_envelope` over it again, which is the only reading that
-        stays correct when the host's filter is stateful about the envelopes it
-        has already seen -- an envelope it rewrote was never sent, so it never
-        happened.
+        `spans`/`snapshots` are what the drain swapped OUT, not whatever `before_send_envelope`
+        turned them into. The next drain builds a fresh envelope and runs `before_send_envelope`
+        over it again, which is the only reading that stays correct when the host's filter is
+        stateful about the envelopes it has already seen -- an envelope it rewrote was never sent,
+        so it never happened.
         """
         if final:
             self._report_lost(
@@ -1280,53 +1287,45 @@ class Client:
         """Put a declined batch back where the next drain will find it, and say
         whether the buffer took it.
 
-        FALSE means the client is closed and the batch was NOT taken: after
-        close() no drain will ever run again, so returning spans here hides them
-        in a client that cannot ship them -- uncounted, unreported, `_spans`
-        still listing them as pending, which is the exact state `_abandon`'s
-        docstring says it exists to prevent. The caller reports them instead.
+        FALSE means the client is closed and the batch was NOT taken: after close() no drain will
+        ever run again, so returning spans here hides them in a client that cannot ship them --
+        uncounted, unreported, `_spans` still listing them as pending, which is the exact state
+        `_abandon`'s docstring says it exists to prevent. The caller reports them instead.
 
-        Two ways a live drain reaches a closed client, and the check is inside
-        the buffer lock because only one of them is sequential:
+        Two ways a live drain reaches a closed client, and the check is inside the buffer lock
+        because only one of them is sequential:
 
-          * `flush()` after `close()`. Nothing forbids it -- `flush` deliberately
-            does not test `_closed` -- and its drain is not `final`, so it
-            arrives right here.
-          * a race with no post-close flush at all: another thread is inside a
-            non-final drain when `close()` runs, `_abandon` empties the buffer,
-            and that drain then hands its batch back into the client `_abandon`
-            just finished emptying.
+          * `flush()` after `close()`. Nothing forbids it -- `flush` deliberately does not test
+            `_closed` -- and its drain is not `final`, so it arrives right here.
+          * a race with no post-close flush at all: another thread is inside a non-final drain when
+            `close()` runs, `_abandon` empties the buffer, and that drain then hands its batch back
+            into the client `_abandon` just finished emptying.
 
-        `close()` sets `_closed` (step 1) strictly before `_abandon` can empty
-        anything (step 3), so reading it under the same lock `_abandon` swaps
-        under is what makes the second case decidable: either this block runs
-        first and `_abandon` collects the returned batch, or `_abandon` ran first
-        and `_closed` is already True here. A check outside the lock would sit in
-        the window between the two.
+        `close()` sets `_closed` (step 1) strictly before `_abandon` can empty anything (step 3), so
+        reading it under the same lock `_abandon` swaps under is what makes the second case
+        decidable: either this block runs first and `_abandon` collects the returned batch, or
+        `_abandon` ran first and `_closed` is already True here. A check outside the lock would sit
+        in the window between the two.
 
-        Ordering: this batch predates everything captured since the swap, so it
-        goes on the FRONT, and it is walked newest-first so that the pushes land
-        it oldest-first. Wire order then still matches capture order, which is
-        the property the export lock exists to preserve.
+        Ordering: this batch predates everything captured since the swap, so it goes on the FRONT,
+        and it is walked newest-first so that the pushes land it oldest-first. Wire order then still
+        matches capture order, which is the property the export lock exists to preserve.
 
-        The cap wins over the returned batch, not the other way round. A drain
-        can be gone long enough for the buffer to have refilled, and silently
-        exceeding `max_buffer_spans`/`max_buffer_bytes` on the way back would
-        turn a bounded buffer into an unbounded one -- the exact failure the
-        limits exist to prevent, arrived at by way of a repair. What does not
-        fit is a buffer-full drop and is counted as one, on `_dropped`, which is
-        the counter that word already means.
+        The cap wins over the returned batch, not the other way round. A drain can be gone long
+        enough for the buffer to have refilled, and silently exceeding
+        `max_buffer_spans`/`max_buffer_bytes` on the way back would turn a bounded buffer into an
+        unbounded one -- the exact failure the limits exist to prevent, arrived at by way of a
+        repair. What does not fit is a buffer-full drop and is counted as one, on `_dropped`, which
+        is the counter that word already means.
 
-        The batch yields rather than evicting live spans, which is the same
-        drop-oldest policy `capture_span` applies: these are the oldest spans in
-        the process. Walking newest-first means the ones dropped are the oldest
-        of the batch. As in `capture_span`, an empty buffer always accepts, so a
-        single span larger than the byte budget is kept rather than discarded.
+        The batch yields rather than evicting live spans, which is the same drop-oldest policy
+        `capture_span` applies: these are the oldest spans in the process. Walking newest-first
+        means the ones dropped are the oldest of the batch. As in `capture_span`, an empty buffer
+        always accepts, so a single span larger than the byte budget is kept rather than discarded.
 
-        `self._buffer` is re-read on every iteration for the reason spelled out
-        at length in `capture_span`: a same-thread signal handler can drain
-        between any two statements here and swap the buffer out from under a
-        reference read earlier.
+        `self._buffer` is re-read on every iteration for the reason spelled out at length in
+        `capture_span`: a same-thread signal handler can drain between any two statements here and
+        swap the buffer out from under a reference read earlier.
         """
         dropped = 0
         with self._buffer_lock:
