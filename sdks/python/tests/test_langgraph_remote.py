@@ -150,6 +150,21 @@ def test_remote_thread_id_lands_as_an_extra(installed):  # noqa: F811
     assert extra_of(span)["wardex.langgraph.thread_id"] == "t-1"
 
 
+def test_a_remote_thread_bound_with_with_config_lands_like_a_call_thread(installed):  # noqa: F811
+    """`RemoteGraph.stream` merges `self.config` under the call's config before
+    it sends anything, so a thread bound with `with_config` is the thread the
+    platform runs on — and the run span says so, as for a local graph."""
+    graph = remote().with_config(configurable={"thread_id": "t-bound"})
+    graph.invoke({"q": 1})
+    graph.invoke({"q": 1})
+
+    run1, run2 = sorted(runs(installed.spans), key=lambda s: s.start_time_ns)
+    assert [extra_of(r)["wardex.langgraph.thread_id"] for r in (run1, run2)] == ["t-bound"] * 2
+    assert [c["thread_id"] for c in graph.sync_client.runs.calls] == ["t-bound"] * 2
+    (link,) = run2.links
+    assert link.span_id == run1.context.span_id
+
+
 def test_a_remote_error_event_ships_error_with_the_hosts_type(installed):  # noqa: F811
     """An `error` event makes `remote.py` raise `RemoteException` — not a
     `GraphBubbleUp`, so it is a real failure, not control flow."""
