@@ -111,11 +111,17 @@ class _Reading:
             return 0
         return 3 if _sent_by_a_client(self.request.method) else 1
 
+    def methods(self) -> tuple[str | None, str | None]:
+        """What a reply's framing can be read from in this reading: the waiting request's method,
+        and the method of the one in flight, which can complete before the reply has ended."""
+        waiting = self.request.method if self.request is not None else None
+        return waiting, self.parser.method_in_flight()
+
 
 class RequestSide:
     """The request half of one HTTP/1 connection: what the next final reply pairs with."""
 
-    __slots__ = ("_fresh", "_just_orphaned", "_limits", "_reading")
+    __slots__ = ("_fresh", "_just_orphaned", "_limits", "_reading", "_tied")
 
     def __init__(self, limits: object | None = None) -> None:
         self._limits = limits
@@ -126,11 +132,27 @@ class RequestSide:
         #: No request byte yet since a reply orphaned its request. The next request can begin only
         #: at the first chunk after that reply: anything seen before it was the orphan's rest.
         self._just_orphaned = False
+        #: The waiting request won a tie (`decide`) against a request just as whole but of another
+        #: method, and the bytes could not say which one the next reply answers. Cleared when it is
+        #: taken.
+        self._tied = False
 
     @property
     def request(self) -> ParsedMessage | None:
         """The complete request the next final reply answers, if one is waiting."""
         return self._reading.request
+
+    @property
+    def method(self) -> str:
+        """The method the next final reply is framed by (a reply to HEAD has no body, a 2xx to
+        CONNECT opens a tunnel): the waiting request's, or "" when none waits or it won a tie
+        against a request of another method. That winner is a guess, and framing a reply by a
+        guess can stop its connection's parser, or end HTTP on it unseen, for every later call; a
+        guessed pairing costs that one call. Two readings of the same method frame the reply alike
+        whichever one it answers, so their tie keeps the method: blanked, a HEAD's Content-Length
+        would swallow every later reply on the connection as its body."""
+        request = self._reading.request
+        return "" if request is None or self._tied else request.method or ""
 
     @property
     def issue(self) -> Issue:
@@ -158,19 +180,26 @@ class RequestSide:
 
     def decide(self) -> bool:
         """A reply is arriving, so a request was sent: settle on the reading that holds more of
-        one (`_Reading.claim`), the continuing one on a tie, since in it every byte was seen. Says
-        whether that changed which request waits.
+        one (`_Reading.claim`), the continuing one on a tie, since in it every byte was seen, and
+        remember a tie whose two readings disagree on the methods a reply is framed by (`method`).
+        Says whether that changed which request waits.
         """
         fresh, self._fresh = self._fresh, None
-        if fresh is None or fresh.claim() <= self._reading.claim():
+        if fresh is None:
+            return False
+        mine, theirs = self._reading.claim(), fresh.claim()
+        guess = mine == theirs > 0 and self._reading.methods() != fresh.methods()
+        self._tied = self._tied or guess
+        if theirs <= mine:
             return False
         self._reading = fresh
         return True
 
     def take(self) -> tuple[ParsedMessage | None, Issue] | None:
-        """At a final reply: the request it answers and where that request was issued, and the
-        side is ready for the next one. None when not one byte of it was seen (counted): there is
-        nothing to pair the reply with, and nothing about it to say.
+        """At a final reply (one the connection's close ended included): the request it answers and
+        where that request was issued, and the side is ready for the next one. None when not one
+        byte of it was seen (counted): there is nothing to pair the reply with, and nothing about
+        it to say.
 
         A request seen only in part pairs as `None` with its issue, counted, and is orphaned: the
         parser stays inside it, so that its rest, if it comes, is not read as the next request.
@@ -180,6 +209,7 @@ class RequestSide:
         r = self._reading
         request, issue = r.request, r.issue
         r.request = r.issue = None
+        self._tied = False
         if request is None and r.parser.disabled_reason() is None:
             if issue is None:
                 counters.bump("protocol.http1.request_unobserved")
@@ -191,5 +221,5 @@ class RequestSide:
     def release(self) -> None:
         """The connection ended: drop what it was holding."""
         self._reading.request = None
-        self._reading.orphan = self._just_orphaned = False
+        self._reading.orphan = self._just_orphaned = self._tied = False
         self._fresh = None

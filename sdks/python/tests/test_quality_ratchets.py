@@ -285,15 +285,16 @@ _OVERSIZED_BUDGET = {
     "_adapters/_openai_agents.py": 1588,
     "_client.py": 1585,
     "_adapters/_context.py": 1305,
-    "_interceptors/_seam.py": 1191,
+    "_interceptors/_seam.py": 1183,
     "_adapters/_langgraph.py": 1035,
     # Raised by exactly one member (h2_request_evicted, 53): the closed
     # Limitation enum cannot move a member out, and the census demands each
     # one carry its own provenance docstring in this module. Every line of
     # prose around the member stayed on the diet. Lowered to 1083 when
     # provider_inferred (54) paid for its docstring by rewrapping two
-    # sections' docstrings to the line length, words unchanged.
-    "_assembly/_integrity.py": 1083,
+    # sections' docstrings to the line length, words unchanged. Lowered to 1082
+    # when frame_parse_failed gained its HTTP/1 emitter, paid the same way.
+    "_assembly/_integrity.py": 1082,
     "_assembly/_builder.py": 963,
     "_adapters/_anthropic_agent_sdk.py": 944,
 }

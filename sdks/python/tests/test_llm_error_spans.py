@@ -338,11 +338,15 @@ def test_a_stream_from_an_unknown_provider_still_says_so():
     """The stream markers hang off `streamed`, not off identity. Keying them to
     the identity test instead makes a known provider's usage-less stream quietly
     stop reporting that it was reassembled at all.
+
+    The stream says nothing that identifies a call: a stream that is only the
+    provider's `error` event would (the request named a model, and the reply is
+    the provider failing), so that is not the stream used here.
     """
     span = _drive(
         mode=CaptureMode.ALL,
         status_line=b"200 OK",
-        body=b'event: error\ndata: {"type":"error","error":{"type":"overloaded_error"}}\n\n',
+        body=b'event: ping\ndata: {"type":"ping"}\n\n',
         host=b"llm-gw.internal",
         content_type=b"text/event-stream",
     )

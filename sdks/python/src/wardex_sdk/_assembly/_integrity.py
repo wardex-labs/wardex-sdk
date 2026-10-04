@@ -835,27 +835,22 @@ Two emit sites, and the first is the mechanism the second restates.
     """
 
     PARSE_BACKLOG_FULL = "parse_backlog_full"
-    """The deferred-parse queue was full, so the OLDEST captured-but-unparsed
-    transaction shipped without its LLM-semantic parse — transport, timing and
-    status are measured; ``gen_ai`` is absent because the parser never ran on
-    this body.
+    """The deferred-parse queue was full, so the OLDEST captured-but-unparsed transaction shipped
+    without its LLM-semantic parse — transport, timing and status are measured; ``gen_ai`` is absent
+    because the parser never ran on this body.
 
-    Emitted from ``_finalize.py`` — the single site that names it: on the
-    eviction fallback when the backlog crosses ``max_parse_backlog`` /
-    ``max_parse_backlog_bytes``, and on the clamp that keeps a single
-    over-bound body out of the queue entirely (so the byte bound stays
-    literal).
+    Emitted from ``_finalize.py`` — the single site that names it: on the eviction fallback when the
+    backlog crosses ``max_parse_backlog`` / ``max_parse_backlog_bytes``, and on the clamp that keeps
+    a single over-bound body out of the queue entirely (so the byte bound stays literal).
 
-    Not ``BODY_CAP_EXCEEDED``, by the caps-band rule: that one caps what one
-    body KEEPS in raw bytes; this one caps how many finished transactions may
-    WAIT for the deferred parse. And not ``CONNECTION_EVICTED``: same
-    eviction shape, different table — that one drops connection STATE before
-    a transaction exists, while this one ships a finished transaction
-    unparsed, never silently. Not ``SEMANTIC_PARSE_FAILED`` either: that
-    marker means the parser RAN and understood nothing, this one means it
-    never ran. Raw bodies ride along EXCEPT when wardex's own degradation is
-    the only reason the span passed the capture gate — a body the user's mode
-    excluded must not leave the process because wardex was overloaded.
+    Not ``BODY_CAP_EXCEEDED``, by the caps-band rule: that one caps what one body KEEPS in raw
+    bytes; this one caps how many finished transactions may WAIT for the deferred parse. And not
+    ``CONNECTION_EVICTED``: same eviction shape, different table — that one drops connection STATE
+    before a transaction exists, while this one ships a finished transaction unparsed, never
+    silently. Not ``SEMANTIC_PARSE_FAILED`` either: that marker means the parser RAN and understood
+    nothing, this one means it never ran. Raw bodies ride along EXCEPT when wardex's own degradation
+    is the only reason the span passed the capture gate — a body the user's mode excluded must not
+    leave the process because wardex was overloaded.
     """
 
     # ------------------------------------------------------------------
@@ -866,9 +861,13 @@ Two emit sites, and the first is the mechanism the second restates.
     """The framing layer failed, so the transport fields on this span are partial or synthesized.
 
     Emitted from ``_semantics/_grpc.py::build_grpc_fields`` (gRPC frame parse raised; the span falls
-    back to plain h2 fields) and ``_interceptors/_trackers.py::_WebSocketTracker._build_txn``
-    (either direction's frame parser latched off). Before the census those two sites emitted the
-    free strings ``grpc_parse_failed`` and ``ws_parse_failed``.
+    back to plain h2 fields), ``_interceptors/_trackers.py::_WebSocketTracker._build_txn`` (either
+    direction's frame parser latched off) and ``_Http1Tracker._response_txn`` there (an HTTP/1
+    response's stream ended before its framing did — a Content-Length not reached, a chunked body
+    short of its last chunk, an unframed body let go before the peer's EOF: the body is what came,
+    its size unset, a 2xx status UNSET). Before the census the first two emitted the free strings
+    ``grpc_parse_failed`` and ``ws_parse_failed``. On an HTTP span, look at the server, the network
+    or the client that let go: the parser read every byte that came.
 
     This member carries a LIMIT as well as a bug, which its name does not say: a WebSocket frame
     whose declared payload exceeds ``max_ws_frame_bytes`` makes

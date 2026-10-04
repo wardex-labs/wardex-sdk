@@ -630,6 +630,12 @@ class ParsedMessage:
     # marker with no member fails CI rather than reaching the seam.
     truncated: bool = False
     limitations: tuple[Limitation, ...] = ()
+    # The connection closed before this message's own framing ended it (a
+    # Content-Length not reached, a chunked body short of its last chunk):
+    # `body` is what arrived and `truncated` is set too. Only the HTTP/1
+    # parser's close flush produces it; a fact, not a marker — the tracker
+    # decides what the span says about it.
+    incomplete: bool = False
 
 
 # --- Callback protocols (concrete signatures instead of Callable) ---
