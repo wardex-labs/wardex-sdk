@@ -1036,7 +1036,30 @@ diagnostic line (traceback under `debug=True`).
   `RemoteGraph` (LangGraph Platform) call ships one `invoke_workflow` span
   marked `wardex.langgraph.remote`, with the platform HTTP request underneath;
   the remote run's internals execute out of process and are not captured. A
-  cached node ships no span — no work ran.
+  cached node ships no span — no work ran. A run's `thread_id` — from the
+  call's config, bound with `graph.with_config(...)`, or carried by the
+  config of whatever encloses the call, merged as LangGraph merges them — is
+  recorded as `wardex.langgraph.thread_id` and is the run's
+  `gen_ai.conversation.id` unless the run sits inside your own
+  `wardex.conversation(...)`. With a checkpointer, a later top-level run on
+  the same thread in the same process links `resumed_from` to the previous
+  one; a subgraph inherits its parent's thread and links nothing, and so
+  does a run without a checkpointer. The link is keyed by the thread id
+  alone — a checkpointer object is no identity for a thread, since one built
+  per request over the same database resumes it — so runs that keep that
+  id's state in different checkpointers still link as turns of one thread:
+  two graphs compiled with separate checkpointers that share a thread id, or
+  a subgraph with a checkpointer of its own under the parent's thread id
+  that a node starts on a plain worker thread (no context copied), or
+  defers through a wrapper (`astream_events`, `with_retry()`, a
+  `functools.partial`) that calls the graph only after the node returns. A
+  run belongs where the graph's own `stream()`/`astream()` is called, so a
+  `graph.stream` a node hands you, called later at top level, links as a
+  turn. A node
+  span's `wardex.step.index` is LangGraph's superstep number on that
+  checkpoint thread, not the node's position in the run: a second turn on
+  one thread continues the count (and the input and `__start__` supersteps
+  take numbers no node span carries).
 - Framework adapter: **OpenAI Agents SDK** (`openai-agents>=0.22,<0.23`) —
   auto-detected, hooked through the framework's own `TracingProcessor` and
   its three public `Runner` entry points (wrapped only to read the run's
