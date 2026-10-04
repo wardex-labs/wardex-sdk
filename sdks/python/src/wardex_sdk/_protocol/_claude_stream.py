@@ -18,6 +18,9 @@ class AgentStreamEvent:
     #: Which CALL a `tool_result` answers, never which sub-agent produced the
     #: line. One CLI line carries both and they are different questions.
     tool_result_id: str | None = None
+    #: The result is the call's LAUNCH, not its end (a background `Agent`
+    #: call): the sub-agent it started is still to write its lines.
+    launched_async: bool = False
     subtype: str | None = None
     task_id: str | None = None
     task_status: str | None = None
@@ -52,6 +55,7 @@ def parse_line(data: bytes, outbound: bool) -> AgentStreamEvent | None:
         stop_reason=raw.stop_reason,
         parent_tool_use_id=raw.parent_tool_use_id,
         tool_result_id=raw.tool_result_id,
+        launched_async=raw.launched_async,
         subtype=raw.subtype,
         task_id=raw.task_id,
         task_status=raw.task_status,

@@ -775,6 +775,10 @@ impl ClaudeStreamEvent {
     fn tool_result_id(&self) -> Option<String> {
         self.inner.tool_result_id.clone()
     }
+    #[getter]
+    fn launched_async(&self) -> bool {
+        self.inner.launched_async
+    }
 
     #[getter]
     fn parent_tool_use_id(&self) -> Option<String> {

@@ -55,6 +55,9 @@ ASSISTANT_2 = {
         "content": [{"type": "text", "text": "done"}],
     },
 }
+#: The response after a tool round-trip. Its own id, as every API call has:
+#: lines that share an id are blocks of ONE response and ship as one chat.
+ASSISTANT_3 = {**ASSISTANT_2, "message": {**ASSISTANT_2["message"], "id": "m3"}}
 TOOL_RESULT = {
     "type": "user",
     "session_id": "s-1",
@@ -1126,8 +1129,11 @@ def test_close_all_sessions_never_drains(receiver):
     asm.on_inbound(1, ASSISTANT)
     t1 = time.time_ns()
     # Strictly inside the chat's window, so the merge is the strict one whose
-    # marker removal this test asserts.
-    (window,) = [rec.window for rec in asm._by_key[1].pending if rec.kind == "chat"]
+    # marker removal this test asserts. The response is still HELD — no line
+    # has said it is over — so `close_all_sessions` must ship it before the
+    # merge runs, or it could not join.
+    held = asm._by_key[1].open_chats[None]
+    window = (held.start_ns, held.opened_ns)
     body = _otlp_build.request(
         [
             _otlp_build.span(
@@ -1166,7 +1172,10 @@ def test_pending_buffer_overflow_emits_oldest_unmerged(receiver):
     _outbound(asm, 1, bridge=_binding())
     asm.on_inbound(1, INIT)
     for i in range(3):
-        asm.on_inbound(1, ASSISTANT_2)
+        # Three turns are three responses, and a real CLI gives each its own
+        # id; the turn's `result` is what says its response is over.
+        asm.on_inbound(1, {**ASSISTANT_2, "message": {**ASSISTANT_2["message"], "id": f"m{i}"}})
+        asm.on_inbound(1, RESULT)
         _outbound(asm, 1, text=f"turn {i}")
 
     overflowed = [s for s in client.spans if s.name.startswith("chat")]
@@ -1228,7 +1237,13 @@ def test_a_multi_turn_agentic_loop_joins_each_llm_request_uniquely(receiver):
     llm_requests join two of three chats uniquely, with the duplicate-view
     chat unmerged and NO conflict siblings. The assembler now floors each
     chat at its thread's last event itself, so the windows it pends arrive
-    already sequenced — and the join must behave the same either way."""
+    already sequenced — and the join must behave the same either way.
+
+    The live run's duplicate view was a second line of response 1 under the
+    SAME id, and that is now folded into chat 1 before anything pends (the
+    real-CLI shape is the next test). Chat 2 here carries its own id, so it
+    stands for a chat no llm_request claims — the shape the join still has to
+    leave unmerged."""
     client = FakeClient()
     asm = SessionAssembler(client, bridge=receiver)
     receiver.reserve(TRACE)
@@ -1237,7 +1252,7 @@ def test_a_multi_turn_agentic_loop_joins_each_llm_request_uniquely(receiver):
     asm.on_inbound(1, ASSISTANT)  # chat 1 (text/tool_use view of response 1)
     asm.on_inbound(1, ASSISTANT_2)  # chat 2 — SAME turn, no host write between
     asm.on_inbound(1, TOOL_RESULT)
-    asm.on_inbound(1, ASSISTANT_2)  # chat 3 — the post-tool response
+    asm.on_inbound(1, ASSISTANT_3)  # chat 3 — the post-tool response, a new API call
     asm.on_inbound(1, RESULT)
 
     # The recorded windows: one host write, three chats, and each window
@@ -1282,6 +1297,211 @@ def test_a_multi_turn_agentic_loop_joins_each_llm_request_uniquely(receiver):
     unmerged = [s for s in chats if s not in merged]
     assert len(unmerged) == 1 and _TIMING in _limitations(unmerged[0])
     assert not any(s.name == "execute_step llm_request" for s in client.spans)
+
+
+def _split_response_line(content, msg_id="m1"):
+    """One block of a response, as the CLI writes it: the response's id and a
+    copy of its usage on every line, no stop reason yet."""
+    return {
+        "type": "assistant",
+        "session_id": "s-1",
+        "message": {
+            "id": msg_id,
+            "model": "claude-sonnet-5",
+            "stop_reason": None,
+            "usage": {"input_tokens": 10, "output_tokens": 3},
+            "content": content,
+        },
+    }
+
+
+def test_a_response_split_across_lines_joins_its_one_llm_request(receiver):
+    """The shape a real CLI sends (recorded on 2.1.286): a text block and the
+    tool call after it as two lines under ONE id, then the post-tool response.
+    One window per RESPONSE, so each llm_request joins its one chat and no
+    duplicate-view chat is left unmerged beside it. The window runs from the
+    first line's floor to the first line's arrival: the request that produced
+    the response started before any of its lines arrived."""
+    client = FakeClient()
+    asm = SessionAssembler(client, bridge=receiver)
+    receiver.reserve(TRACE)
+    _outbound(asm, 1, bridge=_binding())
+    asm.on_inbound(1, INIT)
+    asm.on_inbound(1, _split_response_line([{"type": "text", "text": "running it"}]))
+    time.sleep(0.002)
+    t_before_last = time.time_ns()
+    call = {"type": "tool_use", "id": "toolu_01", "name": "Bash", "input": {"command": "ls"}}
+    asm.on_inbound(1, _split_response_line([call]))
+    asm.on_inbound(1, {**TOOL_RESULT, "parent_tool_use_id": None})
+    asm.on_inbound(1, ASSISTANT_3)
+    asm.on_inbound(1, RESULT)
+
+    windows = [rec.window for rec in asm._by_key[1].pending if rec.kind == "chat"]
+    assert len(windows) == 2  # one per response, not one per line
+    assert windows[0][1] < t_before_last  # the window ends at response 1's FIRST line
+    assert windows[1][0] >= windows[0][1]
+    body = _otlp_build.request(
+        [
+            _otlp_build.span(
+                name="claude_code.llm_request",
+                trace_id=TRACE,
+                span_id=span_id,
+                start_ns=(start + end) // 2,
+                end_ns=end,
+                attrs={"gen_ai.response.id": request_id},
+            )
+            for span_id, request_id, (start, end) in (
+                ("0a" * 8, "req_1", windows[0]),
+                ("0b" * 8, "req_2", windows[1]),
+            )
+        ]
+    )
+    assert _post(receiver, body) == 200
+    asm.on_close(1, None)
+
+    chats = [s for s in client.spans if s.name.startswith("chat")]
+    assert [dict(s.extra).get("wardex.anthropic_agent_sdk.otel.request_id") for s in chats] == [
+        "req_1",
+        "req_2",
+    ]
+    for s in chats:
+        assert CaptureSource.OTEL_BRIDGE in s.capture_sources
+        assert _TIMING not in _limitations(s)
+    assert chats[0].gen_ai.input_tokens == 10  # one copy, not two
+    assert [b["type"] for b in json.loads(chats[0].output_data)] == ["text", "tool_use"]
+    assert not any(s.name == "execute_step llm_request" for s in client.spans)
+
+
+def test_a_response_the_bound_closed_early_pends_once_and_keeps_the_mark(receiver):
+    """The pending path of an early close. The bound pends the held response
+    so a newer one fits, and the response's next line, a copy of the same usage,
+    must not pend a second chat for the same request. The pending buffer shares
+    the bound, so the early-closed chat leaves it unmerged when the held ones
+    pend at the close: it ships once, with the deferred timing marks applied,
+    the bound's mark and the UNSET status."""
+    client = FakeClient()
+    asm = SessionAssembler(client, bridge=receiver, max_session_entries=1)
+    receiver.reserve(TRACE)
+    _outbound(asm, 1, bridge=_binding())
+    asm.on_inbound(1, INIT)
+    asm.on_inbound(1, _split_response_line([{"type": "text", "text": "running it"}]))
+    sub = _split_response_line([{"type": "text", "text": "looking"}], msg_id="s1")
+    asm.on_inbound(1, {**sub, "parent_tool_use_id": "task_a"})
+    call = {"type": "tool_use", "id": "toolu_01", "name": "Bash", "input": {"command": "ls"}}
+    asm.on_inbound(1, _split_response_line([call]))
+    asm.on_inbound(1, RESULT)
+
+    pended = [rec.gen_ai.response_id for rec in asm._by_key[1].pending if rec.kind == "chat"]
+    assert pended == ["m1"]  # s1 is still held, and m1 pended once
+    asm.on_close(1, None)
+
+    m1s = [s for s in client.spans if s.name.startswith("chat") and s.gen_ai.response_id == "m1"]
+    assert len(m1s) == 1
+    (m1,) = m1s
+    assert m1.gen_ai.input_tokens == 10
+    assert Limitation.SESSION_ENTRY_TABLE_FULL in _limitations(m1)
+    assert _TIMING in _limitations(m1)
+    assert m1.status is StatusCode.UNSET
+
+
+def test_a_main_response_held_across_a_sub_agents_reply_still_joins_its_request(receiver):
+    """A main response that calls `Task` stays held until the main thread moves
+    on, so it is pended AFTER the sub-agent's reply. With no SubagentStart that
+    names the call, both are in the main thread's scope, and the join floors
+    one scope's windows in sequence. In pend order that raised the main
+    response's start past its own end, and its request could no longer join.
+    In the order the responses began, every window keeps its shape and both
+    main responses join."""
+    from wardex_sdk._adapters._otel_merge import sequence_chat_windows
+
+    client = FakeClient()
+    asm = SessionAssembler(client, bridge=receiver)
+    receiver.reserve(TRACE)
+    _outbound(asm, 1, bridge=_binding())
+    asm.on_inbound(1, INIT)
+    time.sleep(0.002)
+    spawn = {"type": "tool_use", "id": "task_a", "name": "Task", "input": {}}
+    asm.on_inbound(1, _split_response_line([spawn]))
+    time.sleep(0.002)
+    for text in ("thinking", "answer"):  # the sub-agent's one response, in two lines
+        line = _split_response_line([{"type": "text", "text": text}], msg_id="sub1")
+        asm.on_inbound(1, {**line, "parent_tool_use_id": "task_a"})
+        time.sleep(0.002)
+    task_result = {"type": "tool_result", "tool_use_id": "task_a", "content": "ok"}
+    asm.on_inbound(
+        1,
+        {
+            "type": "user",
+            "session_id": "s-1",
+            "parent_tool_use_id": None,
+            "message": {"role": "user", "content": [task_result]},
+        },
+    )
+    time.sleep(0.002)
+    asm.on_inbound(1, ASSISTANT_3)
+    asm.on_inbound(1, RESULT)
+
+    pending = asm._by_key[1].pending
+    windows = {rec.gen_ai.response_id: rec.window for rec in pending if rec.kind == "chat"}
+    assert list(windows) == ["sub1", "m1", "m3"]  # the main response pended after the reply
+    sequenced = sequence_chat_windows(pending)
+    # Each main request starts strictly inside its own response's recorded window.
+    body = _otlp_build.request(
+        [
+            _otlp_build.span(
+                name="claude_code.llm_request",
+                trace_id=TRACE,
+                span_id=span_id,
+                start_ns=(windows[msg_id][0] + windows[msg_id][1]) // 2,
+                end_ns=windows[msg_id][1],
+                attrs={"gen_ai.response.id": request_id},
+            )
+            for span_id, request_id, msg_id in (
+                ("0a" * 8, "req_1", "m1"),
+                ("0b" * 8, "req_3", "m3"),
+            )
+        ]
+    )
+    assert _post(receiver, body) == 200
+    asm.on_close(1, None)
+
+    chats = {s.gen_ai.response_id: s for s in client.spans if s.name.startswith("chat")}
+    for msg_id, request_id in (("m1", "req_1"), ("m3", "req_3")):
+        chat = chats[msg_id]
+        assert dict(chat.extra).get("wardex.anthropic_agent_sdk.otel.request_id") == request_id
+        assert CaptureSource.OTEL_BRIDGE in chat.capture_sources
+        assert _TIMING not in _limitations(chat)
+    assert not any(s.name == "execute_step llm_request" for s in client.spans)
+    assert all(window.start_ns <= window.end_ns for window in sequenced)  # none inverted
+
+
+def test_a_recorded_session_pends_one_chat_per_response(receiver):
+    """The real recording through the bridge's pending path: the windows the
+    join sees are one per response, and a merge that never answers flushes
+    exactly the spans the bridge-off path ships — the same usage, once."""
+    from test_agent_sdk_assembler import _by_response, _recording
+
+    lines = _recording("parallel_tools")
+    client = FakeClient()
+    asm = SessionAssembler(client, bridge=receiver)
+    receiver.reserve(TRACE)
+    _outbound(asm, 1, bridge=_binding())
+    for msg in lines:
+        asm.on_inbound(1, msg)
+
+    pended = [rec for rec in asm._by_key[1].pending if rec.kind == "chat"]
+    responses = _by_response(lines)
+    assert [rec.gen_ai.response_id for rec in pended] == list(responses)
+    asm.on_close(1, None)
+
+    chats = [s for s in client.spans if s.name.startswith("chat")]
+    assert [s.gen_ai.response_id for s in chats] == list(responses)
+    for chat, group in zip(chats, responses.values(), strict=True):
+        assert (
+            chat.gen_ai.cache_creation_input_tokens
+            == (group[0]["message"]["usage"]["cache_creation_input_tokens"])
+        )
+        assert _TIMING in _limitations(chat)  # unmerged: the deferred marker stands
 
 
 STREAM_DELTA = {
