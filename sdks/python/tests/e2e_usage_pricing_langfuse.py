@@ -16,10 +16,27 @@ check: after editing, run it once under `.venv-py310/bin/python` (the
 `--dry-run` mode exists exactly for that syntax pass — it builds and encodes
 every span and never touches the network).
 
-    # stack: langfuse/langfuse v4.16.0 docker compose, seeded via LANGFUSE_INIT_*
+    # stack: the official langfuse/langfuse docker compose (v4, last run on
+    # 4.50.0), seeded headlessly via LANGFUSE_INIT_*
     WARDEX_E2E_LANGFUSE=http://127.0.0.1:3000 \
     WARDEX_E2E_LANGFUSE_PK=pk-lf-... WARDEX_E2E_LANGFUSE_SK=sk-lf-... \
         uv run python sdks/python/tests/e2e_usage_pricing_langfuse.py
+
+How it reads back, and why each choice is forced by Langfuse v4:
+
+  - `GET /api/public/v2/observations`, never the v1 list. A v4 deployment
+    runs in events_only mode, where `/api/public/observations` answers 404
+    and the single-observation GET is gone too.
+  - Looked up by the trace id and span id the SDK minted, inside a start-time
+    window around the run. Never by span name: the name this driver gives a
+    span is not the name that is stored, because a span carrying a gen_ai
+    block is exported as `chat {model}`.
+  - `fields=` names the `usage` group explicitly. The v2 default projection
+    is `core,basic`, which has no usage or cost at all; `usage` carries
+    usageDetails, costDetails and totalCost (there is no separate cost group).
+  - v2 field names: `totalCost` (was `calculatedTotalCost`), `inputUsage`,
+    `outputUsage`, `totalUsage` (were `promptTokens`, `completionTokens`,
+    `totalTokens`).
 
 What it asserts (claude-sonnet-4-6 Standard-tier prices):
 
@@ -29,17 +46,22 @@ What it asserts (claude-sonnet-4-6 Standard-tier prices):
   C  no raw spelling survives as a pass-through bucket
   D  every bucket priced at its unit price (keys derived from usageDetails,
      never hardcoded — a renamed bucket must fail in F, legibly, not KeyError)
-  E  calculatedTotalCost == 0.0204
+  E  totalCost == 0.0204
   F  every usage bucket has a cost counterpart (no-price == ABSENT, not 0)
   G  the pre-fix defect, reproduced on the same stack: input column 0,
      cost 0.0174 (-14.7%)
-  H  (measured, not asserted, except the input column): totalTokens and
-     usage.total are 0 because wardex ships no total bucket — the recorded
-     cost of the "no gen_ai.usage.total_tokens" decision — while promptTokens
-     must be 11000: the input COLUMN is never 0 after the fix.
-  L1-C  a reasoning-tier span: expected coverage failure
-        (output_reasoning_tokens priced nowhere on Claude models) — recorded
-        as the ecosystem finding, not a wardex failure.
+  H  (measured, not asserted, except the input column): totalUsage and
+     usageDetails.total. wardex ships no total bucket (there is no
+     gen_ai.usage.total_tokens in the semconv registry), so whatever these
+     read is Langfuse's own derivation and varies by version: a 4.5.0 stack
+     read 0, 4.50.0 fills in the bucket sum. inputUsage must be
+     11000: the input COLUMN is never 0 after the fix.
+  L1-C  a reasoning-tier span: expected coverage failure — the reasoning
+        bucket is the one usage bucket with no price on Claude models —
+        recorded as the ecosystem finding, not a wardex failure. Which bucket
+        that is comes from usageDetails, never from a fixed key: Langfuse
+        spells it `reasoning.output_tokens` before 4.7.0 and
+        `output_reasoning_tokens` from 4.7.0 on.
 """
 
 from __future__ import annotations
@@ -51,8 +73,10 @@ import os
 import secrets
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import datetime, timezone
 from math import isclose
 
 MODEL = "claude-sonnet-4-6"
@@ -153,27 +177,80 @@ def _reasoning_gen_ai():
     )
 
 
-def _observation(base: str, auth: str, name: str, timeout: float = 120.0) -> dict | None:
-    """The STORED observation of this name, once the worker has priced it."""
+#: The v2 field groups this driver reads. `core` (ids, times, type) is always
+#: returned; `usage` is the one that matters — without it the response has no
+#: usageDetails, costDetails or totalCost, and every claim below would read an
+#: absent key. `basic` is for one measurement: the name the span was stored
+#: under.
+_FIELDS = "core,basic,usage"
+
+#: Slack on each side of the start-time window. The window is built from the
+#: spans' own start times, which this process stamped, so it only has to
+#: absorb rounding, not clock skew between the host and the stack.
+_WINDOW_SLACK_NS = 60 * 1_000_000_000
+
+
+def _iso(ns: int) -> str:
+    """`ns` since the epoch as the ISO 8601 UTC instant the v2 API filters on."""
+    instant = datetime.fromtimestamp(ns / 1e9, tz=timezone.utc)
+    return instant.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def _observation(
+    base: str,
+    auth: str,
+    *,
+    trace_id: str,
+    span_id: str,
+    window: tuple[int, int],
+    timeout: float = 120.0,
+) -> dict | None:
+    """The STORED observation of this span, once Langfuse has priced it.
+
+    Keyed on the ids the SDK minted, never on the span name: the name a gen_ai
+    span is stored under is `chat {model}`, not the one the driver passed in.
+    Langfuse uses the OTLP span id as the observation id, so within the trace
+    the match is exact.
+    """
+    query = urllib.parse.urlencode(
+        {
+            "traceId": trace_id,
+            "fromStartTime": _iso(window[0]),
+            "toStartTime": _iso(window[1]),
+            "fields": _FIELDS,
+            "limit": 50,
+        }
+    )
+    url = f"{base}/api/public/v2/observations?{query}"
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        query = urllib.parse.urlencode({"name": name, "limit": 10})
-        request = urllib.request.Request(
-            f"{base}/api/public/observations?{query}",
-            headers={"Authorization": auth},
-        )
+        request = urllib.request.Request(url, headers={"Authorization": auth})
         try:
             with urllib.request.urlopen(request, timeout=20) as response:
                 page = json.loads(response.read())
-            data = page.get("data") or []
-            if data:
-                obs = data[0]
-                # Priced means processed: costDetails appears when the worker
-                # has run the model match, which is the read this driver needs.
-                if obs.get("costDetails"):
-                    return obs
+        except urllib.error.HTTPError as exc:
+            # A 4xx other than 408/429 will not change by asking again (wrong
+            # endpoint, bad key, rejected filter): say what the stack said now
+            # instead of polling into the deadline.
+            if 400 <= exc.code < 500 and exc.code not in (408, 429):
+                body = exc.read().decode("utf-8", "replace")[:300]
+                print(f"    (query refused: HTTP {exc.code} {body})")
+                return None
+            print(f"    (poll: {exc})")
         except Exception as exc:  # noqa: BLE001 — polling; the deadline reports
             print(f"    (poll: {exc})")
+        else:
+            obs = next((o for o in page.get("data") or [] if o.get("id") == span_id), None)
+            if obs is not None:
+                if "usageDetails" not in obs:
+                    # Found but projected without the usage group: waiting
+                    # cannot add a field the query did not ask for.
+                    print(f"    (observation has no usageDetails; fields={_FIELDS!r})")
+                    return None
+                # Priced means processed: costDetails is filled once Langfuse
+                # has matched the model, which is the read this driver needs.
+                if obs.get("costDetails"):
+                    return obs
         time.sleep(2.0)
     return None
 
@@ -215,8 +292,8 @@ def _assert_priced(report: Report, obs: dict, *, expect_cached: bool) -> None:
                 (units, cost.get(key)),
             )
 
-    total = obs.get("calculatedTotalCost", -1)
-    report.check(close(total, 0.0204), "E: calculatedTotalCost 0.0204", total)
+    total = obs.get("totalCost")
+    report.check(close(total if total is not None else -1, 0.0204), "E: totalCost 0.0204", total)
     report.check(
         close(cost.get("total", -1), 0.0204), "E: costDetails.total 0.0204", cost.get("total")
     )
@@ -228,14 +305,14 @@ def _assert_priced(report: Report, obs: dict, *, expect_cached: bool) -> None:
         uncovered,
     )
 
-    # H — the recorded cost of shipping no total bucket, and the headline
-    # column that must never be 0 again.
-    report.record("totalTokens", obs.get("totalTokens"))
-    report.record("usage.total", (obs.get("usage") or {}).get("total"))
-    report.record("promptTokens", obs.get("promptTokens"))
-    report.record("completionTokens", obs.get("completionTokens"))
+    # H — what Langfuse derives for the total wardex does not ship, and the
+    # headline column that must never be 0 again.
+    report.record("totalUsage", obs.get("totalUsage"))
+    report.record("usageDetails.total", usage.get("total"))
+    report.record("inputUsage", obs.get("inputUsage"))
+    report.record("outputUsage", obs.get("outputUsage"))
     report.check(
-        obs.get("promptTokens") == 11000, "H: the input column is NOT zero", obs.get("promptTokens")
+        obs.get("inputUsage") == 11000, "H: the input column is NOT zero", obs.get("inputUsage")
     )
 
 
@@ -309,46 +386,67 @@ def main() -> int:
     )
 
     g5_before = counters.get("assembly.builder.gen_ai_usage_not_inclusive")
+    # Each span opens with nothing ambient, so each roots its own trace; the
+    # ids it was minted with are how it is found again.
+    ids: dict[str, tuple[str, str]] = {}
+    starts: list[int] = []
     with wardex_sdk.span(names["a"]) as handle:
         handle.set_gen_ai(_normal_gen_ai())
+    ids["a"] = (handle.context.trace_id.hex(), handle.context.span_id.hex())
+    starts.append(handle.start_time_ns)
     with wardex_sdk.span(names["b"]) as handle:
         # The defect reproduction (G): the fixed capture path cannot produce
         # this span, so it is hand-assembled through the public API.
         handle.set_gen_ai(_buggy_gen_ai())
+    ids["b"] = (handle.context.trace_id.hex(), handle.context.span_id.hex())
+    starts.append(handle.start_time_ns)
     with wardex_sdk.span(names["c"]) as handle:
         handle.set_gen_ai(_reasoning_gen_ai())
+    ids["c"] = (handle.context.trace_id.hex(), handle.context.span_id.hex())
+    starts.append(handle.start_time_ns)
     wardex_sdk.flush(60.0)
     wardex_sdk.close(10.0)
-
+    window = (min(starts) - _WINDOW_SLACK_NS, time.time_ns() + _WINDOW_SLACK_NS)
     report = Report()
+
+    def lookup(key: str) -> dict | None:
+        trace_id, span_id = ids[key]
+        obs = _observation(base, auth, trace_id=trace_id, span_id=span_id, window=window)
+        if obs is not None:
+            # Measured, so the log shows why a name lookup can never match:
+            # the stored name is not the one passed to `wardex.span()`.
+            report.record(f"{key}.stored_name", obs.get("name"))
+        return obs
+
     print("\nfidelity of the defect reproduction")
     report.check(
         counters.get("assembly.builder.gen_ai_usage_not_inclusive") - g5_before == 1,
         "the G5 counter saw exactly the hand-built exclusive block",
     )
 
-    print(f"\nspan A ({names['a']}): the corrected pipeline, priced")
-    obs_a = _observation(base, auth, names["a"])
+    print(f"\nspan A ({names['a']}, trace {ids['a'][0]}): the corrected pipeline, priced")
+    obs_a = lookup("a")
     if obs_a is None:
         report.check(False, "span A was stored and priced within the deadline")
     else:
         _assert_priced(report, obs_a, expect_cached=True)
 
-    print(f"\nspan B ({names['b']}): the defect, on the same stack (G)")
-    obs_b = _observation(base, auth, names["b"])
+    print(f"\nspan B ({names['b']}, trace {ids['b'][0]}): the defect, on the same stack (G)")
+    obs_b = lookup("b")
     if obs_b is None:
         report.check(False, "span B was stored and priced within the deadline")
     else:
         usage_b = obs_b.get("usageDetails") or {}
+        total_b = obs_b.get("totalCost")
         report.check(usage_b.get("input") == 0, "G: exclusive input collapses to 0", usage_b)
         report.check(
-            close(obs_b.get("calculatedTotalCost", -1), 0.0174),
+            close(total_b if total_b is not None else -1, 0.0174),
             "G: the under-billed 0.0174 (-14.7%)",
-            obs_b.get("calculatedTotalCost"),
+            total_b,
         )
 
-    print(f"\nspan C ({names['c']}): reasoning tier price coverage (L1-C)")
-    obs_c = _observation(base, auth, names["c"])
+    print(f"\nspan C ({names['c']}, trace {ids['c'][0]}): reasoning tier price coverage (L1-C)")
+    obs_c = lookup("c")
     if obs_c is None:
         report.check(False, "span C was stored and priced within the deadline")
     else:
@@ -356,11 +454,15 @@ def main() -> int:
         cost_c = obs_c.get("costDetails") or {}
         uncovered = sorted(set(usage_c) - {"total"} - set(cost_c))
         # EXPECTED ecosystem finding — asserted as such, recorded for the
-        # deferred Langfuse price report.
+        # deferred Langfuse price report. The bucket is identified by what
+        # it holds (the 200 reasoning units, under a key naming reasoning),
+        # not by a spelling: Langfuse renamed it in 4.7.0.
         report.check(
-            uncovered == ["output_reasoning_tokens"],
+            len(uncovered) == 1
+            and "reasoning" in uncovered[0]
+            and usage_c.get(uncovered[0]) == 200,
             "L1-C: reasoning is the one unpriced bucket (expected finding)",
-            uncovered,
+            {key: usage_c.get(key) for key in uncovered},
         )
         report.record("reasoning.usageDetails", usage_c)
         report.record("reasoning.costDetails", cost_c)
