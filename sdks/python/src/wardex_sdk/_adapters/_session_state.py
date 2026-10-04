@@ -133,6 +133,18 @@ class _OpenTool:
     #: the same proof `_session_for_hook`'s id tier would have accepted had the
     #: two arrived in the other order.
     hook_session_id: str | None = None
+    #: The stream's `tool_result` for this call, `(content, is_error,
+    #: arrival_ns)`, when it arrived while the record was still open. HELD, not
+    #: acted on: the closing hook stays the authority and usually follows. But
+    #: the CLI does not always send one — a call its permission check refused
+    #: fires `PreToolUse` and never `PostToolUse` — and then this is the only
+    #: record of how the call ended. The drain closes from it instead of
+    #: calling a call that reported its own outcome "unclosed".
+    stream_result: tuple[bytes, bool, int] | None = None
+    #: Set by the drain when `stream_result` is what closed the span, so the
+    #: span names stdout among its observers (`CaptureSource.STDIO`): the hook
+    #: announced the call, the stream reported how it ended.
+    closed_by_stream: bool = False
 
 
 @dataclass
@@ -344,6 +356,16 @@ class _Session:
     # `tool_use` block: the closest observable start for a call no hook opened,
     # and the floor of the thread a `Task` call spawns.
     result: AgentStreamEvent | None = None
+    #: A main-thread turn is running and its `result` has not arrived yet: the
+    #: host wrote a prompt (or, when the stream missed the write,
+    #: `UserPromptSubmit` reported one), or a main-thread assistant message
+    #: showed the CLI running a turn it started itself (`awaiting_after`).
+    #: `result` alone cannot answer "did the CLI finish what it was asked": in
+    #: a multi-turn session it may be the PREVIOUS turn's, and a session closed
+    #: while turn two was still running would then read as a success. Cleared
+    #: by every `result`, so two prompts the CLI answers with one result still
+    #: settle.
+    awaiting_result: bool = False
     error: str | None = None
     #: The OTel bridge tie, or None for a bridge-off session — and None is the
     #: load-bearing default: every bridge branch in the assembler gates on it,

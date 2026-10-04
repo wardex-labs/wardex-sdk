@@ -68,6 +68,7 @@ from ._anthropic_names import McpToolCatalog, ServerHandle
 from ._assembler import SessionAssembler
 from ._base import AdapterInterface
 from ._context import AdapterContext, Fallback, Observer, Placement, Scope
+from ._session_outcome import reader_stopped
 from ._session_state import _BridgeBinding
 
 if TYPE_CHECKING:
@@ -441,18 +442,17 @@ def _read_tee(adapter: AnthropicAgentSdkAdapter, key: int, inner: Any):
     """Tee the transport's message iterator, and pin the session onto its driver.
 
     `inspect.isasyncgen(inner)` — the OBJECT, never the function. Measured:
-    `inspect.isasyncgenfunction(SubprocessCLITransport.read_messages)` is FALSE,
-    because it is a plain `def` that returns a generator, and the Transport ABC
-    declares the same signature. A guard asserting on the function therefore
-    disables the pin on exactly the transport it was written for — and on every
-    user transport too, since they follow the same ABC.
+    `inspect.isasyncgenfunction(SubprocessCLITransport.read_messages)` is FALSE, because it is a
+    plain `def` that returns a generator, and the Transport ABC declares the same signature. A
+    guard asserting on the function therefore disables the pin on exactly the transport it was
+    written for — and on every user transport too, since they follow the same ABC.
 
-    The pin is attempted after each observation until it takes, rather than once
-    before the loop, because the reader is usually driven BEFORE the first
-    outbound write has opened the session. It is legal here for three measured
-    reasons: `_read_messages` does not re-enter `read_messages`, there is one
-    reader task per Query, and that task is cancelled and awaited at close — so
-    the deliberately unbalanced `set()` cannot outlive the unit it names.
+    The pin is attempted after each observation until it takes, rather than once before the loop,
+    because the reader is usually driven BEFORE the first outbound write has opened the session. It
+    is legal here for three measured reasons: `_read_messages` does not re-enter `read_messages`,
+    there is one reader task per Query, and that task is cancelled and awaited at close — so the
+    deliberately unbalanced `set()` cannot outlive the unit it names. That cancel is no failure
+    (`reader_stopped`): the CLI's own `result` decides the root, and without one it is UNSET.
     """
     pinnable = inspect.isasyncgen(inner)
 
@@ -467,7 +467,7 @@ def _read_tee(adapter: AnthropicAgentSdkAdapter, key: int, inner: Any):
                 yield msg
         except BaseException as exc:
             with adapter._guard("adapters.anthropic.transport_error"):
-                adapter._on_close(key, repr(exc))
+                adapter._on_close(key, None if reader_stopped(exc) else repr(exc))
             raise
 
     return gen()
