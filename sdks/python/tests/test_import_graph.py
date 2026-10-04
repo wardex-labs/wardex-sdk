@@ -866,8 +866,8 @@ _NATIVE_TARGETS = frozenset({f"{_PKG}._wardex_native", f"{_PKG}:_wardex_native"}
 #: top-level module (`_hub.py`) or a top-level subpackage (`context/`) — the
 #: granularity the architecture is actually described at.
 #:
-#: There is deliberately NO default and no catch-all "leaf" bucket. Only five of
-#: the seventeen top-level modules import nothing from the package; a bucket
+#: There is deliberately NO default and no catch-all "leaf" bucket. Only six of
+#: the eighteen top-level modules import nothing from the package; a bucket
 #: would be a guess about the other twelve. A new file fails
 #: `test_the_rank_table_covers_every_unit_on_disk` until someone ranks it, which
 #: is the one moment the decision is cheap.
@@ -876,6 +876,7 @@ _LAYER_RANK: dict[str, int] = {
     "_enums.py": 0,
     "_hash.py": 0,
     "_native.py": 0,
+    "_source_paths.py": 0,
     "_suppress.py": 0,
     "_version.py": 0,
     _NATIVE_UNIT: 0,
@@ -924,7 +925,7 @@ _LAYER_RANK: dict[str, int] = {
 #: must leave this dict in the same commit.
 #:
 #: These five are not scattered accidents. Together they are the cycle that
-#: makes twelve of the twenty-five units mutually reachable, which is why ranks
+#: makes twelve of the twenty-six units mutually reachable, which is why ranks
 #: 2..10 above describe an intended order rather than a proven one.
 _LAYER_RANK_DEBT = {
     # The hinge, and the only entry whose removal would change the shape of the
