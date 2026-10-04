@@ -14,9 +14,10 @@ import ssl
 from typing import TYPE_CHECKING, Any
 
 from .._assembly import Limitation
+from ._close_hook import _ssl_protocol_class, _sslobj_of
 from ._conn_timing import shared_timing_store
 from ._seam import ByteSeamInterceptor, _accepted_prefix, _ConnectionState
-from ._socket import _H2_PREFACE, _HTTP_METHODS
+from ._socket import _H2_PREFACE, _HTTP_METHODS, _asked_for_bytes
 from ._trackers import _Http1Tracker, _Http2Tracker
 
 if TYPE_CHECKING:
@@ -47,8 +48,15 @@ class SSLInterceptor(ByteSeamInterceptor):
         self._patches.patch(sock, "send", self._mk_send("send", sock.send))
         self._patches.patch(sock, "recv", self._mk_recv(sock.recv))
         self._patches.patch(sock, "recv_into", self._mk_recv_into(sock.recv_into))
+        self._patches.patch(sock, "shutdown", self._mk_shutdown(sock.shutdown))
         self._patches.patch(obj, "write", self._mk_send("write", obj.write))
         self._patches.patch(obj, "read", self._mk_read(obj.read))
+        # Asked for, like the close probe's patches on the same private class; absent (no asyncio
+        # TLS protocol), a ragged EOF on that stack ships as let go when the connection closes.
+        proto = _ssl_protocol_class()
+        eof_received = getattr(proto, "eof_received", None)
+        if eof_received is not None:
+            self._patches.patch(proto, "eof_received", self._mk_eof_received(eof_received))
         self._acquire_probes()
         self._installed = True
 
@@ -131,8 +139,11 @@ class SSLInterceptor(ByteSeamInterceptor):
             ret = real(this, *args, **kwargs)
             try:
                 # Ahead of `bytes(ret)`, for the reason `_mk_send` gives.
-                if self._capture_possible(this) and isinstance(ret, (bytes, bytearray)) and ret:
-                    self._on_response_bytes(this, bytes(ret))
+                if self._capture_possible(this) and isinstance(ret, (bytes, bytearray)):
+                    if ret:
+                        self._on_response_bytes(this, bytes(ret))
+                    elif _asked_for_bytes(args[0] if args else kwargs.get("buflen", 1024)):
+                        self._on_response_eof(this)  # the peer's EOF (a clean TLS close, too)
             except Exception:
                 pass
             return ret
@@ -145,15 +156,58 @@ class SSLInterceptor(ByteSeamInterceptor):
             try:
                 if n and self._capture_possible(this):
                     self._on_response_bytes(this, bytes(buffer[:n]))
+                elif n == 0 and _asked_for_bytes(args[0] if args else kwargs.get("nbytes"), buffer):
+                    self._on_response_eof(this)
             except Exception:
                 pass
             return n
 
         return wrapper
 
+    def _mk_shutdown(self, real: Any):  # noqa: ANN202
+        def wrapper(this: Any, *args: Any, **kwargs: Any) -> Any:
+            try:
+                return real(this, *args, **kwargs)
+            finally:
+                # `SSLSocket.shutdown` drops the TLS layer before the socket call, whatever `how`
+                # says and even when that call raises: no later empty read is the TLS stream's end.
+                with self._guard("interceptors.ssl.shutdown"):
+                    self._on_read_shutdown(this)
+
+        return wrapper
+
+    def _mk_eof_received(self, real: Any):  # noqa: ANN202
+        def wrapper(this: Any, *args: Any, **kwargs: Any) -> Any:
+            # The peer's EOF on asyncio's TLS (aiohttp, `asyncio.open_connection(ssl=...)`): the
+            # transport reports the TCP close here, and `SSLObject.read` never shows it — asyncio
+            # gives the object no EOF, so a close without close_notify is no empty read and no
+            # raise. Read the object first: 3.10 keeps it in a pipe the close tears down.
+            sslobj = None
+            with self._guard("interceptors.ssl.eof_received"):
+                sslobj = _sslobj_of(this)
+            ret = real(this, *args, **kwargs)
+            # A false return lets the transport close: by then the protocol has handed the app every
+            # byte it decrypted and told it EOF. True (3.11+, the app paused reading) means bytes
+            # are still to come; the close that follows ships what arrived, as let go.
+            if not ret and sslobj is not None:
+                with self._guard("interceptors.ssl.eof_received"):
+                    self._on_response_eof(sslobj)
+            return ret
+
+        return wrapper
+
     def _mk_read(self, real: Any):  # noqa: ANN202
         def wrapper(this: Any, *args: Any, **kwargs: Any) -> Any:
-            ret = real(this, *args, **kwargs)
+            try:
+                ret = real(this, *args, **kwargs)
+            except ssl.SSLEOFError:
+                # The peer closed without close_notify. `SSLSocket` hides that as an empty read
+                # (`suppress_ragged_eofs`); an `SSLObject` raises it, once its incoming BIO was told
+                # the transport ended and nothing decrypted is left — anyio's TLSStream, under
+                # httpx's AsyncClient, hands its caller exactly that as the stream's end.
+                with self._guard("interceptors.ssl.ragged_eof"):
+                    self._on_response_eof(this)
+                raise
             try:
                 if self._capture_possible(this):
                     buffer = None
@@ -166,6 +220,10 @@ class SSLInterceptor(ByteSeamInterceptor):
                             self._on_response_bytes(this, bytes(buffer[:ret]))
                     elif isinstance(ret, (bytes, bytearray)) and ret:
                         self._on_response_bytes(this, bytes(ret))
+                    if not ret and _asked_for_bytes(
+                        args[0] if args else kwargs.get("len", 1024), buffer
+                    ):
+                        self._on_response_eof(this)  # a clean close; a ragged one raises instead
             except Exception:
                 pass
             return ret
@@ -175,7 +233,7 @@ class SSLInterceptor(ByteSeamInterceptor):
     # --- Connection timing resolution (SSL-specific) ---
 
     def _resolve_timing(
-        self, obj: Any, st: _ConnectionState
+        self, obj: Any | None, st: _ConnectionState
     ) -> tuple[float | None, float | None, bool | None, tuple[Limitation, ...]]:
         """(tcp_connect_ms, tls_handshake_ms, connection_reused, limitations).
 
@@ -186,10 +244,16 @@ class SSLInterceptor(ByteSeamInterceptor):
         `connection_reused` is False only where a record proves the seam saw
         this connection open (a connect or handshake in the store, a
         `_wardex_timing` stamped when the TLS object was created). With no
-        record the connection may predate `init`, so it is None too."""
+        record the connection may predate `init`, so it is None too.
+
+        `obj` is None for a response the close ended (`_retire`): the record
+        was released at that close, ahead of the seam, so nothing is left to
+        read and the answer is the no-record one."""
         if st.timing_consumed:
             return (0.0, 0.0, True, ())
         st.timing_consumed = True
+        if obj is None:
+            return (None, None, None, (Limitation.CONNECT_TIMING_UNAVAILABLE,))
         # sync: SSLSocket — look up the store by fileno
         if not isinstance(obj, ssl.SSLObject):
             try:

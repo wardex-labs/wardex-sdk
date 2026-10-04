@@ -63,6 +63,10 @@ _SEAM_CONSUMED = frozenset(
         # the request was issued in. Not a `GenAIAttributes` field — the
         # conversation is the span's own typed block.
         "conversation_id",
+        # A failure the provider declared inside a response (an in-stream
+        # `error` event): `declared_error_type` turns it into the span's
+        # ERROR status and `error.type`.
+        "error_type",
     }
 )
 
@@ -97,14 +101,14 @@ def test_the_surface_partition_is_exhaustive_and_disjoint():
     for i, a in enumerate(sets):
         for b in sets[i + 1 :]:
             assert not (a & b), f"claimed twice: {sorted(a & b)}"
-    # The partition arithmetic the integration record pins: 20 + 6 + 4 + 16.
+    # The partition arithmetic the integration record pins: 20 + 6 + 4 + 17.
     assert (len(fields), len(_GEN_AI_TRANSFORMED), len(extras), len(_SEAM_CONSUMED)) == (
         20,
         6,
         4,
-        16,
+        17,
     )
-    assert len(surface) == 46
+    assert len(surface) == 47
 
 
 def test_every_seam_consumed_name_appears_in_a_consumer_source():

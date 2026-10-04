@@ -255,15 +255,18 @@ async def test_async_capture_populates_handshake(tls_server):
 
 
 def test_install_uninstall_restores_originals():
-    # Patched methods: 5 ssl (send/recv/recv_into/write/read)
+    # Patched methods: 7 ssl (send/recv/recv_into/shutdown/write/read, asyncio's eof_received)
     # + 5 connection-timing (connect/do_handshake x2/wrap_bio/create_connection)
     _bel = asyncio.base_events.BaseEventLoop
+    _proto = asyncio.sslproto.SSLProtocol
     originals = {
         (ssl.SSLSocket, "send"): ssl.SSLSocket.send,
         (ssl.SSLSocket, "recv"): ssl.SSLSocket.recv,
         (ssl.SSLSocket, "recv_into"): ssl.SSLSocket.recv_into,
+        (ssl.SSLSocket, "shutdown"): ssl.SSLSocket.shutdown,
         (ssl.SSLObject, "write"): ssl.SSLObject.write,
         (ssl.SSLObject, "read"): ssl.SSLObject.read,
+        (_proto, "eof_received"): _proto.eof_received,
         # connection-timing patches
         (socket.socket, "connect"): socket.socket.connect,
         (ssl.SSLSocket, "do_handshake"): ssl.SSLSocket.do_handshake,

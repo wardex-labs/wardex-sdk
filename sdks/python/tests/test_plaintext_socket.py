@@ -23,7 +23,7 @@ from wardex_sdk._interceptors._socket import RawSocketInterceptor
 # from the C base `_socket.socket` — `socket.socket` does not define them — and
 # that is what the restore assertions below turn on. `sendmsg` only where the
 # platform has it (not on Windows).
-_PATCHED = ("send", "sendall", "sendto", "recv", "recv_into") + (
+_PATCHED = ("send", "sendall", "sendto", "recv", "recv_into", "shutdown") + (
     ("sendmsg",) if hasattr(socket.socket, "sendmsg") else ()
 )
 
