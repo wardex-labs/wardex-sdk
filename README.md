@@ -448,6 +448,68 @@ OpenTelemetry's conventions prefer an absolute path in `code.file.path`
 without requiring one. A `CallSite` you set yourself through `Span.call_site`
 is not rewritten.
 
+**An exception that leaves a span is recorded on it**, the way OpenTelemetry
+records one. When a decorated function, a `with wardex.span()` block or a
+`with wardex.conversation()` block raises, the span ships with status `ERROR`,
+`error.type` set to the exception's class (`ValueError`, or
+`support_bot.errors.ToolFailed` for one of your own), and one `exception`
+event carrying `exception.type`, `exception.message` and
+`exception.stacktrace` — the traceback as Python prints it, chained causes
+included. Your code still receives the very same exception object, with its
+traceback unchanged: wardex only reads it. Each span the exception leaves
+records it, so a failing tool inside an agent marks both; an exception your
+code catches inside the block marks nothing.
+
+- `asyncio.CancelledError`, `KeyboardInterrupt`, `SystemExit` and
+  `GeneratorExit` are not your agent failing: they leave the status as it was
+  and add no event.
+- A status you set inside the block wins. `s.set_status(StatusCode.OK)` before
+  an exception you expect keeps the span `OK` (the event is still recorded, as
+  evidence), and an `error.type` you named with `s.set_error(...)` is kept.
+
+The message and the stack trace are masked like every other text that leaves
+the process (see [Masking secrets and personal data](#masking-secrets-and-personal-data)),
+on the wardex envelope and over OTLP alike, so `no account for
+alice@example.com` ships as `no account for [EMAIL]`. Local variables are
+never captured. Every frame's file follows the call-site rule above —
+`support_bot/agent.py`, or the file name alone, never an absolute path — on
+the line where Python names it, as is a `SyntaxError`'s own `File "…", line N`,
+and nowhere else: a message or a source line that itself says
+`File "/etc/app/config.yaml", line 3` reaches the trace as your code wrote it,
+the same text `exception.message` carries. And your home folder is written as
+`~` wherever else its path appears in the message or the trace, whatever comes
+before it: `[Errno 2] No such file or directory: '~/reports/q3.txt'`,
+`permission denied for ~.`, `cat x >~/log.txt`, a `repr`'d `'ok\n~/out.txt'`,
+and `/backup~/x` for a copy of yours under another folder, whose path carries
+your user name all the same (`~` stands for exactly the text it replaces).
+What comes after it decides whether it is your home folder: something a
+folder's name cannot go on with — a path separator, a quote, a space, a
+bracket, a comma, a full stop that ends a sentence, or the end of the text. A
+letter, a digit, `_`, `-`, `+`, or a `.` with one of those after it makes it a
+different folder, left as written: one whose name only begins like yours
+(`/Users/alice-old`, `/Users/alice.bak`). The one folder this writes wrongly is
+a sibling named like yours plus a space: `/Users/alice 2` becomes `~ 2`,
+because a space after your home folder is far more often a sentence going on,
+and your user name must not leave with the sentence. Over OTLP both values are
+capped by `max_otlp_attribute_bytes`, like every attribute (see
+[Resource limits](#resource-limits)). Masking cannot see what the rules above
+cannot see, so a secret with no recognisable shape in an exception's message or
+on the source line that raised it leaves as written.
+
+Each traceback in a stack trace, a chained cause included, keeps the 64 frames
+nearest where its exception was raised — what Python's own
+`traceback.format_exception(exc, limit=-64)` prints — and one cut that way
+starts with a line saying how many earlier frames it left out
+(`[436 earlier frames not recorded]`). Every span an exception leaves records
+it, so without the cut a recursion through a decorated function, about 500
+spans deep, would have each span format the whole stack below it on your
+code's way out: about ten seconds and twenty megabytes of text for one
+`RecursionError`. With it each span pays for at most 64 frames per traceback,
+however deep the stack: the same recursion records in 0.3 to 0.6 s, where it
+unwinds in about 10 ms with nothing recorded. An ordinary failure is far
+shorter than the cut: a LangGraph node that raises is 9 frames below
+`graph.invoke()` (measured on langgraph 1.2.12).
+
 ## Scope
 
 Ambient data that rides on every span captured under it:
