@@ -162,19 +162,21 @@ def test_a_spent_budget_is_declined_not_lost(receiver):
     assert _Handler.received == {}
 
 
-def test_a_refused_connection_is_silent_and_taken():
-    """Fail-silent, and NOT `UNDELIVERED`: the POST was attempted, so a retry
+def test_a_refused_connection_is_taken_not_requeued():
+    """No raise, and NOT `UNDELIVERED`: the POST was attempted, so a retry
     could duplicate, and pinning a full buffer against a down receiver is the
-    stall the discipline exists to prevent."""
+    stall the discipline exists to prevent. The loss is counted and said once
+    per process instead (`test_drop_paths_census.py`)."""
     t = WardexTransport("http://127.0.0.1:1", KEY, timeout=2.0)
     started = time.monotonic()
     assert t.export(_envelope(_span("s"))) is None
     assert time.monotonic() - started < 2.0
 
 
-def test_a_rejecting_receiver_is_silent_and_taken(receiver):
+def test_a_rejecting_receiver_is_taken_not_requeued(receiver):
     """A 4xx is the receiver's answer, not a decline: the batch is gone and a
-    resend would be the same 4xx. No exception reaches the caller."""
+    resend would be the same 4xx. No exception reaches the caller; the status
+    is said once per process (`test_drop_paths_census.py`)."""
     _Handler.status = 401
     t = WardexTransport(receiver, KEY)
     assert t.export(_envelope(_span("s"))) is None

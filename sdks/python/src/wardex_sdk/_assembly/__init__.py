@@ -65,6 +65,16 @@ not here yet. `__all__` grows as modules land and does not shrink.
 from .._types import AgentAttributes, ConversationContext, EvaluationAttributes, ToolAttributes
 from ._builder import NULL_DRAFT, OTEL_ERROR_TYPE_OTHER, IntegrityBuilder, SpanDraft
 from ._diag import Counters, counters, diag_info, diag_warning, guard, report_once
+from ._drops import (
+    count_drain_drop,
+    report_buffer_evicted,
+    report_connection_parser_disabled,
+    report_export_failed,
+    report_signal_flush_raised,
+    report_stream_parser_disabled,
+    report_transport_raised,
+    report_worker_pass_raised,
+)
 from ._integrity import Limitation
 from ._parentage import (
     AMBIENT,
@@ -141,6 +151,7 @@ __all__ = [
     "cap_at_alias_tier",
     "capture_mode_of",
     "child_of",
+    "count_drain_drop",
     "counters",
     "degraded_run",
     "diag_info",
@@ -150,7 +161,14 @@ __all__ = [
     "is_declared_extra_key",
     "latch_ambient",
     "parent_is_closed_unit",
+    "report_buffer_evicted",
+    "report_connection_parser_disabled",
+    "report_export_failed",
     "report_once",
+    "report_signal_flush_raised",
+    "report_stream_parser_disabled",
+    "report_transport_raised",
+    "report_worker_pass_raised",
     "resolve_observed",
     "resolve_parentage",
     "should_capture",

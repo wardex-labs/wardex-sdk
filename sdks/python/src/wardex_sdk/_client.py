@@ -11,7 +11,16 @@ from collections import deque
 from dataclasses import replace
 from typing import Any
 
-from ._assembly import Limitation, counters, diag_info, diag_warning, guard, report_once
+from ._assembly import (
+    Limitation,
+    count_drain_drop,
+    counters,
+    diag_info,
+    guard,
+    report_buffer_evicted,
+    report_once,
+    report_transport_raised,
+)
 
 # The debug-gated traceback printer `guard()` itself uses: contained rendering
 # of a host exception (repr may raise, stderr may be gone) without a second
@@ -51,21 +60,6 @@ _SPAN_OVERHEAD_BYTES = 512
 
 def _span_size(span: InternalSpan) -> int:
     return _SPAN_OVERHEAD_BYTES + len(span.input_data or b"") + len(span.output_data or b"")
-
-
-def _count_dropped(cause: str, envelope: Envelope, spans: deque, snapshots: deque) -> str:
-    """Tally each item a raise made `_drain` drop, under `client.drain.span_dropped.<cause>`
-    and `client.drain.snapshot_dropped.<cause>`, and say how many: the envelope the raise took
-    (a hook may have filtered it on purpose), else the whole batch if it has no readable items."""
-    try:
-        n_spans, n_snapshots = len(envelope.spans), len(envelope.state_snapshots)
-    except Exception:  # runs inside a fail-closed handler, so it may not raise either
-        n_spans, n_snapshots = len(spans), len(snapshots)
-    for _ in range(n_spans):
-        counters.bump(f"client.drain.span_dropped.{cause}")
-    for _ in range(n_snapshots):
-        counters.bump(f"client.drain.snapshot_dropped.{cause}")
-    return f"{n_spans} span(s)" + (f" and {n_snapshots} state snapshot(s)" if n_snapshots else "")
 
 
 # Handed to Transport.flush() on the periodic path, which carries no deadline of
@@ -1036,7 +1030,7 @@ class Client:
         the method.
 
         Errors from before_send_envelope or the export path drop the envelope (fail-closed), count
-        every item it carried (`_count_dropped`), say so once per process, and never propagate.
+        every item it carried (`count_drain_drop`), say so once per process, and never propagate.
         """
         deadline = None if timeout is None else time.monotonic() + timeout
         if not self._acquire_export_slot(timeout):
@@ -1045,6 +1039,7 @@ class Client:
             elif self._config.debug:
                 diag_info("drain skipped (export in progress)")
             return
+        dropped = 0
         try:
             with self._buffer_lock:
                 buf, self._buffer = self._buffer, _SpanBuffer()
@@ -1054,8 +1049,6 @@ class Client:
             # -- buffer lock released here; new captures flow. The EXPORT lock
             # is still held: assembly and I/O below are serialized against every
             # other drain, which is what keeps swap order == wire order.
-            if dropped and self._config.debug:
-                diag_warning(f"dropped {dropped} spans (buffer full)")
             if not spans and not snapshots:
                 self._flush_transport(deadline)
                 return
@@ -1092,7 +1085,7 @@ class Client:
                         # every later raise ate. The traceback is debug-gated because it
                         # belongs to the host's code, not to wardex's per-process
                         # announcement budget.
-                        _count_dropped("before_send_raised", envelope, spans, snapshots)
+                        count_drain_drop("before_send_raised", envelope, spans, snapshots)
                         report_once(
                             "before_send_envelope raised; batch dropped "
                             "(re-run with debug=True for the traceback)",
@@ -1123,7 +1116,7 @@ class Client:
                 # which would pin the batch in the buffer forever if re-queued.)
                 # Counted and said off-debug, as the hook's raise is: a transport that raised on
                 # every batch must not look, in a default process, like one with nothing to send.
-                what = _count_dropped("export_raised", envelope, spans, snapshots)
+                what = count_drain_drop("export_raised", envelope, spans, snapshots)
                 report_once(
                     f"transport export raised; a batch of {what} was dropped and is not "
                     "retried, because the transport may have sent part of it (every such drop "
@@ -1139,6 +1132,8 @@ class Client:
             self._flush_transport(deadline)
         finally:
             self._export_lock.release()
+            if dropped:  # after the release: it bumps counters (see `report_buffer_evicted`)
+                report_buffer_evicted(dropped, debug=self._config.debug)
 
     def _export(self, envelope: Envelope, deadline: float | None, named: float | None) -> bool:
         """Hand the envelope to the transport with whatever budget is left, and
@@ -1192,8 +1187,7 @@ class Client:
         try:
             self._transport.flush(remaining)
         except Exception as exc:  # fail-silent: never crash the app or the exit path
-            if self._config.debug:
-                diag_warning(f"transport flush failed ({exc})")
+            report_transport_raised("flush", exc, debug=self._config.debug)
 
     def _abandon(self) -> None:
         """Take the tail close()'s final drain never got a slot for, and account
@@ -1213,6 +1207,9 @@ class Client:
             buf, self._buffer = self._buffer, _SpanBuffer()
             snapshots, self._snapshots = self._snapshots, deque()
             lost = len(buf.spans) + len(snapshots)
+            dropped, self._dropped = self._dropped, 0
+        if dropped:  # evicted since the last drain, which was the last one there will be
+            report_buffer_evicted(dropped, debug=self._config.debug)
         self._report_lost(
             lost,
             why="an export was already in flight and did not finish inside close()'s "
@@ -1422,8 +1419,7 @@ class Client:
         try:
             self._transport.close(budget)
         except Exception as exc:  # fail-silent: never crash the app or the exit path
-            if self._config.debug:
-                diag_warning(f"transport close failed ({exc})")
+            report_transport_raised("close", exc, debug=self._config.debug)
 
     def close(self, timeout: float = _SHUTDOWN_TIMEOUT) -> None:
         # Public API: sanitize before anything downstream is handed a value it

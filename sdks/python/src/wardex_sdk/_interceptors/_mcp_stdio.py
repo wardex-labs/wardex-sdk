@@ -22,11 +22,11 @@ from .._assembly import (
     TransportLabel,
     capture_mode_of,
     counters,
-    diag_warning,
     guard,
     latch_ambient,
     parent_is_closed_unit,
     report_once,
+    report_stream_parser_disabled,
     resolve_observed,
     should_capture,
 )
@@ -127,8 +127,8 @@ class _ProcState:
         # whole of the asymmetry `should_detach` describes.
         self._resp_bytes = 0
         self._msgs = 0
-        # Guards the once-per-stream debug log in McpStdioInterceptor — mirrors
-        # the seam's st.gate-adjacent dedupe for the HTTP/1 path, but on a
+        # Guards the once-per-stream count and debug log in McpStdioInterceptor —
+        # mirrors the seam's st.gate-adjacent dedupe for the HTTP/1 path, but on a
         # field owned solely by this concern (nothing else reads or writes it).
         self.disabled_logged = False
 
@@ -373,23 +373,26 @@ def _is_stream_end(exc: BaseException) -> bool:
 
 
 def _maybe_log_disabled(client: Client | None, state: _ProcState, pid: int | None) -> None:
-    """Debug-mode visibility for the JSON-RPC disable latch — mirrors
-    _seam.py's HTTP/1 equivalent. No span exists to carry a disable reason
-    (the whole point of the latch is that no message was ever parsed), so
-    this is the only way a caller can observe that an MCP stream stopped
-    being captured. Fires once per subprocess stream, not once per read.
+    """Visibility for the JSON-RPC disable latch — mirrors _seam.py's HTTP/1
+    equivalent. No span exists to carry a disable reason (the whole point of
+    the latch is that no message was ever parsed), so this is the only way a
+    caller can observe that an MCP stream stopped being captured.
+
+    Counted once per subprocess stream and said once per process in EVERY
+    mode; the per-stream line naming the pid stays debug's. It used to be
+    debug-only end to end, so in a default process a stream that stopped being
+    captured left no trace at all. The price is asking the parsers for a
+    reason on each read until one latches, as the seam already does.
     """
     try:
-        if client is None or not client.config.debug:
-            return
-        if state.disabled_logged:
+        if client is None or state.disabled_logged:
             return
         reason = state.disabled_reason()
         if reason is None:
             return
         state.disabled_logged = True
-        diag_warning(f"json-rpc parser disabled (pid={pid}): {reason}")
-    except Exception:  # noqa: BLE001 — debug-only logging must never break capture
+        report_stream_parser_disabled(reason, pid, client)
+    except Exception:  # noqa: BLE001 — off-span reporting must never break capture
         pass
 
 

@@ -23,9 +23,9 @@ from .._assembly import (
     TransportLabel,
     capture_mode_of,
     counters,
-    diag_warning,
     guard,
     in_degraded_run,
+    report_connection_parser_disabled,
     resolve_observed,
     should_capture,
 )
@@ -525,15 +525,13 @@ class ByteSeamInterceptor(InterceptorInterface):
         txns = st.tracker.on_response_bytes(data)
         try:
             # No span carries a latch reason: once per connection (st.disabled_logged; st.gate is
-            # the sniff-latch's), counted in every mode, logged in debug. Asked each read until
-            # then: for h2 one allocation-free native call (~60 ns), small beside the recv.
+            # the sniff-latch's), counted and said once per process in every mode, logged in debug.
+            # Asked each read until then: for h2 one allocation-free native call (~60 ns).
             if not st.disabled_logged:
                 reason = getattr(st.tracker, "disabled_reason", lambda: None)()
                 if reason is not None:
                     st.disabled_logged = True
-                    counters.bump("interceptors.seam.parser_disabled")
-                    if self._client is not None and self._client.config.debug:
-                        diag_warning(f"parser disabled for {st.server_address}: {reason}")
+                    report_connection_parser_disabled(reason, st.server_address, self._client)
         except Exception:  # noqa: BLE001 — off-span reporting must never break capture
             pass
         for txn in txns:

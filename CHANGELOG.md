@@ -306,6 +306,31 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- **A wrong project key, a receiver that is down, and every other loss no
+  span can carry now say so once with `debug` off, and are counted.**
+  Before, with the default `debug=False`, an export your receiver refused or
+  never answered left nothing on stderr and no counter, so a wrong key or a
+  wrong endpoint looked exactly like an install that never took. The same
+  silence covered spans the buffer evicted when it was full, a transport
+  `flush()` or `close()` that raised, a background pass that raised, the
+  flush wardex runs when the process is signalled to stop, and an MCP
+  subprocess stream the JSON-RPC parser stopped reading (an HTTP connection
+  the parser stopped reading was already counted, but not said). Each now
+  prints one `[wardex]` line per process naming what was lost and the
+  counter that tallies it: `transport.wardex.export_failed`,
+  `transport.otlp.export_failed`, `client.buffer.evicted`,
+  `client.transport.flush_failed`, `client.transport.close_failed`,
+  `worker.drain_raised`, `_runtime.signal_flush_raised`,
+  `interceptors.seam.parser_disabled` and
+  `interceptors.mcp_stdio.parser_disabled`. A failed export names the HTTP
+  status or the kind of error (`HTTP 401`, `ConnectionRefusedError`,
+  `gaierror`), never the error's text, the URL or your key, and a `401` or
+  `403` from the wardex receiver tells you to check `WARDEX_API_KEY`. Each
+  kind of failure gets its own line, so a DNS error at startup cannot hide a
+  later `401`. Nothing is retried that was not before: a batch whose POST
+  was attempted may already be at the receiver. `debug=True` still prints
+  every failure in full, and an exception whose text cannot be rendered no
+  longer raises out of `flush()` or `close()` through that line.
 - **The manual Langfuse pricing check,
   `sdks/python/tests/e2e_usage_pricing_langfuse.py`, runs against Langfuse
   v4 again.** It read back through the v1 observations list, which a v4
