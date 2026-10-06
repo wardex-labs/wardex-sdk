@@ -353,10 +353,12 @@ def test_an_h2_latch_is_counted_once_and_logged_only_in_debug(fake_ssl_socket, c
 
     The counter is not a debug feature: a connection that stopped being
     captured is a fact about capture whether or not anyone is watching stderr,
-    so it fires under both settings, once per connection. The log line stays
-    debug-only.
+    so it fires under both settings, once per connection. So does one line per
+    process naming the reason and the counter; the per-connection line, with
+    the address, stays debug-only.
     """
     from wardex_sdk._assembly import counters
+    from wardex_sdk._assembly._diag import reset_reports_for_test
 
     class _Config:
         pass
@@ -368,6 +370,7 @@ def test_an_h2_latch_is_counted_once_and_logged_only_in_debug(fake_ssl_socket, c
     interceptor._client = client
     sock = fake_ssl_socket(alpn="h2")
     counters.reset()
+    reset_reports_for_test()
 
     poison = bytes.fromhex("000001010400000001ff")
     interceptor._on_response_bytes(sock, poison)
@@ -376,6 +379,8 @@ def test_an_h2_latch_is_counted_once_and_logged_only_in_debug(fake_ssl_socket, c
 
     assert counters.snapshot().get("interceptors.seam.parser_disabled") == 1
     err = capsys.readouterr().err
+    reset_reports_for_test()
+    assert err.count("stopped reading a connection (hpack_decode_failed)") == 1
     if debug:
         assert err.count("[wardex] parser disabled for") == 1
         assert "hpack_decode_failed" in err

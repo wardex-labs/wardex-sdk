@@ -34,11 +34,11 @@ from __future__ import annotations
 import time
 import urllib.request
 
-from .._assembly import counters, diag_info, diag_warning, report_once
+from .._assembly import counters, diag_info, diag_warning, report_export_failed, report_once
 from .._native import NATIVE_OK, native, unavailable_reason
 from .._types import Envelope
 from ._base import UNDELIVERED, Transport, Undelivered, _debug_enabled
-from ._otlp_http import _cut_short_by_the_caller
+from ._otlp_http import _cut_short_by_the_caller, _describe_failure
 
 #: The receiver route every wardex receiver serves, appended to `base_url`.
 ENVELOPE_PATH = "/v1/envelope"
@@ -192,6 +192,7 @@ class WardexTransport(Transport):
                 with urllib.request.urlopen(req, timeout=remaining):
                     pass
         except Exception as exc:  # fail-silent: never crash the app
+            counters.bump("transport.wardex.export_failed")
             # `exc` may quote the URL; it never quotes the Authorization
             # header, so the debug line cannot echo the key.
             if self._debug:
@@ -212,6 +213,27 @@ class WardexTransport(Transport):
                     f"not resent, because the receiver may hold them and a resend would "
                     f"duplicate them. Pass a larger timeout to confirm delivery.",
                     key="transport.wardex.caller_budget_cut_short",
+                )
+            else:
+                # The receiver refused the batch or was not there to ask. This is
+                # the first thing an installer with a wrong key or a down
+                # receiver meets, and off-debug it used to be silence that read
+                # exactly like an install that never took. Said once per
+                # process on its own key, with a pointer to the key when the
+                # receiver's answer was about the key.
+                reason, status = _describe_failure(exc)
+                hint = (
+                    " The receiver refused the project key; check WARDEX_API_KEY, or "
+                    "the api_key passed to init()."
+                    if status in (401, 403)
+                    else ""
+                )
+                report_export_failed(
+                    "a wardex export",
+                    "transport.wardex.export_failed",
+                    reason,
+                    len(envelope.spans),
+                    hint,
                 )
         # No `UNDELIVERED` on the failure path, and not an oversight: the POST
         # was attempted, so the receiver may hold the batch. Handing it back

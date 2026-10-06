@@ -329,8 +329,9 @@ def test_a_split_export_abandoned_partway_says_so_off_debug(monkeypatch, capsys)
 
 def test_the_first_request_failing_is_not_reported_as_a_partial_export(monkeypatch, capsys):
     """The control for the test above. Nothing was delivered, so there is no
-    hole to explain, and spending the one-line-per-process budget on "your
-    backend is down" silences the report that would have been news."""
+    hole to explain: "your backend is down" has a line of its own, and saying
+    it on this key would spend the one line per process the partial report
+    gets, silencing the report that would have been news."""
     import urllib.request
 
     from wardex_sdk._assembly._diag import reset_reports_for_test
@@ -671,7 +672,7 @@ def test_a_degraded_transport_with_a_spent_deadline_still_names_the_missing_whee
 #
 # Two different events land in the same `except`, and only one of them is news.
 # A backend that is down, refusing, or simply slower than this transport was
-# configured for is already fail-silent by design with its own debug line.
+# configured for has a line of its own, under its own key.
 # A POST still in flight when a budget the CALLER named ran out is different:
 # nothing was wrong with the backend, the outcome is genuinely unknown, and the
 # fix belongs to whoever chose the budget. That one gets a line -- off-debug,
@@ -778,7 +779,7 @@ def test_an_ordinary_refusal_during_a_short_budget_is_not_reported(monkeypatch, 
     """The over-firing case that bit before: a connection refused instantly
     happens to arrive while a short budget is running, but the budget is not why
     it failed. Reporting it would spend the one line per process on "your
-    backend is down" -- a different event, already fail-silent by design -- and
+    backend is down" -- a different event, with a line of its own -- and
     the next genuine cut-short export would then print nothing."""
     import urllib.error
 

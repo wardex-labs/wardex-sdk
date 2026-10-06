@@ -2,7 +2,8 @@
 
 Synchronous POST-on-flush: `export()` delegates to `_send_batch`, the single POST
 path that a manual `flush()` and the background batch worker both reach.
-Network errors are fail-silent (an observability SDK must never crash the app) + debug log.
+Network errors are fail-silent (an observability SDK must never crash the app),
+counted, and said in one line per process -- the full error is the debug log's.
 
 One envelope may become SEVERAL POSTs. An OTLP request is accepted or rejected
 whole, so a batch over the receiver's body limit does not arrive short -- it
@@ -19,9 +20,10 @@ copies this file copies the path that applies PII masking and the limits.
 from __future__ import annotations
 
 import time
+import urllib.error
 import urllib.request
 
-from .._assembly import diag_info, diag_warning, report_once
+from .._assembly import counters, diag_info, diag_warning, report_export_failed, report_once
 from .._native import NATIVE_OK, unavailable_reason
 from .._types import Envelope
 from ._base import (
@@ -54,9 +56,10 @@ def _cut_short_by_the_caller(
 
       * a 500, a refused connection, a DNS failure, a POST that outlived the
         timeout this transport was CONFIGURED with -- the backend, or the
-        network, misbehaving. Already fail-silent by design, with its own
-        debug line, and reporting it would be reporting "your backend is down"
-        once per process on a channel meant for something else.
+        network, misbehaving. That one has a report of its own, under its own
+        key (`transport.otlp.export_failed`), and saying it on THIS key would
+        spend the one line per process the cut-short report gets on an event
+        the caller cannot fix by passing a larger number.
       * a POST that was still in flight when a budget the caller named ran out.
         Nothing was wrong with the backend; the caller simply did not wait long
         enough to find out. That one is worth a line, because the outcome is
@@ -97,6 +100,35 @@ def _cut_short_by_the_caller(
     except Exception:  # noqa: BLE001 — a probe with a safe answer, never a throw
         return None
     return budget if expired else None
+
+
+def _describe_failure(exc: BaseException) -> tuple[str, int | None]:
+    """Why a POST failed, in words safe to print off-debug, and the HTTP status
+    the backend answered with (None when it never answered).
+
+    The HTTP status the backend answered with, or the exception's TYPE name --
+    never `str(exc)`. The message is not wardex's text: an `HTTPError` carries
+    the reason phrase the backend chose, a `ValueError` from a malformed
+    endpoint quotes the URL, and a URL can carry a credential in its query.
+    The type name says which failure it was (`ConnectionRefusedError`,
+    `gaierror`, `TimeoutError`) and leaves the specifics to the debug line,
+    which prints the whole exception. `HTTPError` is tested first because it
+    is a `URLError` too.
+
+    Every attribute read is inside the one `try`, because the exception may be
+    a subclass whose `code` or `reason` raises -- and this runs inside the
+    export's own `except`, where a raise would escape the fail-silent path.
+    """
+    try:
+        if isinstance(exc, urllib.error.HTTPError):
+            status = int(exc.code)
+            return f"HTTP {status}", status
+        reason = exc.reason if isinstance(exc, urllib.error.URLError) else None
+        if isinstance(reason, BaseException):
+            return type(reason).__name__, None
+        return type(exc).__name__, None
+    except Exception:  # noqa: BLE001 — a reporting probe, never a throw
+        return "an unreadable error", None
 
 
 class OtlpHttpTransport(Transport):
@@ -321,6 +353,9 @@ class OtlpHttpTransport(Transport):
                     with urllib.request.urlopen(req, timeout=remaining):
                         pass
             except Exception as exc:  # fail-silent: never crash the app
+                # Every failed POST is counted, whichever line below says it,
+                # and before the debug line, whose `str(exc)` is host text.
+                counters.bump("transport.otlp.export_failed")
                 if self._debug:
                     diag_warning(f"OTLP export failed: {exc}")
                 cut_short_by = _cut_short_by_the_caller(exc, timeout, self._timeout, effective)
@@ -344,6 +379,29 @@ class OtlpHttpTransport(Transport):
                         f"duplicate them. Pass a larger timeout to confirm delivery.",
                         key="transport.otlp.caller_budget_cut_short",
                     )
+                elif not index:
+                    # The ordinary failure: the backend refused us, or was not
+                    # there to ask. Nothing of this batch was accepted, so there
+                    # is no hole to explain -- only that the spans are gone.
+                    # Off-debug that used to be silence indistinguishable from a
+                    # working export, so a wrong endpoint or a refused key read
+                    # as "the install did not take". One line per process on a
+                    # key of its own, so it can spend neither the cut-short
+                    # report above nor the partial one below.
+                    reason, status = _describe_failure(exc)
+                    hint = (
+                        " The backend refused this request's credentials; check the "
+                        "headers configured for it."
+                        if status in (401, 403)
+                        else ""
+                    )
+                    report_export_failed(
+                        "an OTLP export",
+                        "transport.otlp.export_failed",
+                        reason,
+                        len(envelope.spans),
+                        hint,
+                    )
                 if index:
                     # A PARTIAL export, which is new with splitting and is not
                     # the same event as "the backend is down". Earlier requests
@@ -352,9 +410,8 @@ class OtlpHttpTransport(Transport):
                     # "this call never happened", which is a worse answer than a
                     # missing trace. Reported off-debug, once per process,
                     # because nothing else on any channel says it; a failure on
-                    # the FIRST request is left to the debug line above, since
-                    # that one is the ordinary "your backend refused us" with no
-                    # partial state to explain.
+                    # the FIRST request is the ordinary "your backend refused
+                    # us", said above with no partial state to explain.
                     report_once(
                         f"an OTLP export was abandoned after {index} of "
                         f"{len(bodies)} requests failed to complete; the spans in the "

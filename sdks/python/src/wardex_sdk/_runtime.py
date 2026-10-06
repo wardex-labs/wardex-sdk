@@ -64,7 +64,7 @@ import threading
 import time
 from typing import TYPE_CHECKING, Any
 
-from ._assembly import Limitation, counters, diag_info, guard
+from ._assembly import Limitation, counters, diag_info, guard, report_signal_flush_raised
 from ._assembly._diag import diag_reset_for_new_process
 from ._client import Client, _UnnamedTimeout
 
@@ -463,7 +463,11 @@ class Runtime:
                 # is a job the process takes down with it.
                 client._shutdown_flush(_SIGNAL_FLUSH_TIMEOUT)
             except Exception:
-                pass  # a failed flush must never block the chain to the app's handler
+                # A failed flush must never block the chain to the app's
+                # handler -- and must not vanish either: under SIG_DFL this is
+                # the last thing the process does, so the line is the only
+                # record that the buffered tail went down with it.
+                report_signal_flush_raised()
         if callable(prev):
             prev(signum, frame)
         elif prev == signal.SIG_DFL:

@@ -26,7 +26,7 @@ import os
 import threading
 from collections.abc import Callable
 
-from ._assembly import diag_warning
+from ._assembly import diag_warning, report_worker_pass_raised
 from .transport._base import DEFAULT_TIMEOUT
 
 
@@ -193,5 +193,6 @@ class BatchWorker:
                 self._drain_fn()
             # Never die. BaseException (SystemExit etc.) is deliberately excluded.
             except Exception as exc:
+                report_worker_pass_raised(self._name)
                 if self._debug:
                     diag_warning(f"background flush failed: {exc}")
