@@ -82,7 +82,12 @@ test = [
 ]
 dev = [
     { include-group = "test" },
-    "ruff>=0.7",
+    # Pinned exactly. uv.lock is not committed, so a range lets CI resolve
+    # whatever ruff is newest while a local venv keeps the one it installed,
+    # and a formatter change (0.16 began formatting Python blocks inside
+    # Markdown) then fails CI on a tree that passes locally. Raise it on
+    # purpose, in a commit of its own, with the reformat it brings.
+    "ruff==0.16.10",
 ]
 
 [tool.pytest.ini_options]
