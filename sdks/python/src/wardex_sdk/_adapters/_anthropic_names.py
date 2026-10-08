@@ -243,8 +243,8 @@ class McpToolCatalog:
         the next install registers handles into a table this method then finds
         non-empty. The no-trim decision therefore rests on `handle_for` itself:
         its `while len(self._handles) >= self._max` loop converges on the next
-        registration, under a counter whose published meaning (the README's
-        "Resource limits" section) is overflow — which an over-full table is.
+        registration, under a counter whose meaning is overflow — which an
+        over-full table is.
         Trimming here would only move the same eviction earlier.
         """
         with self._lock:

@@ -241,8 +241,8 @@ def test_gen_ai_flattened_to_attributes():
 def test_conversation_and_evaluation_blocks_reach_the_otlp_attributes():
     """Measured before this: a span built with `wardex.conversation()` or an
     adapter's `set_evaluation` left the process with NEITHER key — the two
-    blocks were declared and never marshalled. The receiver is what the
-    README promises `gen_ai.conversation.id` to, so this asserts there."""
+    blocks were declared and never marshalled. The receiver is where
+    `gen_ai.conversation.id` has to arrive, so this asserts there."""
     from wardex_sdk._types import ConversationContext, EvaluationAttributes
 
     env = Envelope(

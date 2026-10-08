@@ -82,7 +82,7 @@ async def test_an_mcp_size_is_the_payload_as_captured_not_the_bytes_on_the_pipe(
     """`request_size` / `response_size` on MCP stdio count the params and the
     result as the SDK captures them, re-encoded as compact JSON. The server's
     spacing and `\\u` escapes are not counted, so the figure is smaller than
-    what crossed the pipe here; the schema and the README say exactly that."""
+    what crossed the pipe here; the schema says exactly that."""
     wardex.init(intercept=True)
     proc = await anyio.open_process([sys.executable, "-c", _ESCAPING_SERVER])
     params = {"name": "greet", "arguments": {"who": "세계"}}

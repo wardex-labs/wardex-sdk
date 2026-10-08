@@ -511,8 +511,8 @@ def test_a_client_with_no_config_at_all_filters_nothing(client):
 def test_a_config_whose_mode_cannot_be_read_narrows_instead_of_widening(client):
     """An unreadable policy must not become the widest policy.
 
-    `WardexConfig` does not validate this field, and the enum's values ARE the
-    strings the README prose uses, so `capture_mode="agent"` is accepted in
+    `WardexConfig` does not validate this field, and the enum's values ARE plain
+    strings a user can type, so `capture_mode="agent"` is accepted in
     silence. Answering `ALL` there would hand a user who explicitly asked for
     filtering the pre-Phase-4 firehose — every intercepted request and response
     body on both byte seams, exported. §5.1's fail-open rule covers wardex's own

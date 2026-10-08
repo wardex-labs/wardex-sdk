@@ -454,7 +454,7 @@ def test_non_http_tls_traffic_does_not_grow_memory(fake_ssl_socket, bare_ssl_int
 # and two of them were inert: the codec encoder hardcoded the default
 # limits (so a configured zstd_level was validated and then discarded) and the
 # byte seam called the semantic parser without limits (so max_decoded_bytes was
-# equally inert) -- while the README and the changelog both promised that every
+# equally inert) -- while the changelog promised that every
 # resource bound in the SDK is configurable. Nothing in the suite could notice.
 #
 # _PROBES closes that. Each probe drives the real code path twice, once with an

@@ -3,8 +3,8 @@
 Three measurements (design §4.10), each printing a table row:
 
   1. asyncio EVENT-LOOP DRIFT under concurrent SSE streaming, wardex on vs
-     off, h1 and h2, three body sizes. The claim under test is the README's
-     "Capture itself never blocks your coroutines": wardex-attributed drift
+     off, h1 and h2, three body sizes. The claim under test is "capture
+     itself never blocks your coroutines": wardex-attributed drift
      p99 <= 0.5 ms, and max drift INDEPENDENT of body size (<= 0.5 ms spread
      between 256 KB and 4 MB).
   2. sync THROUGHPUT: the request loop's wall clock must not regress (the

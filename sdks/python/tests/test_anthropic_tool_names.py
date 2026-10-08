@@ -73,9 +73,9 @@ def test_the_handler_and_the_hook_land_on_the_same_key():
 
 def test_the_token_is_the_dict_key_not_the_server_name():
     """`create_sdk_mcp_server(name="my-tools")` + `mcp_servers={"tools": ...}`
-    produces `mcp__tools__greet`, which the SDK's own README documents. Keying on
-    the server's name instead would split the key space for every user who names
-    the two differently — i.e. for the example in the SDK's README.
+    produces `mcp__tools__greet`: the tool is named by its `mcp_servers` key.
+    Keying on the server's name instead would split the key space for every user
+    who names the two differently.
     """
     catalog = McpToolCatalog()
     handle = catalog.handle_for("my-tools")
@@ -391,7 +391,7 @@ def test_max_entries_per_unit_reaches_the_mcp_tool_catalog():
     """The core says this table is bound by `max_entries_per_unit`, and it was not.
 
     `crates/wardex-limits` names this exact table in that field's own
-    documentation, and the README repeats the promise to users. The catalog is
+    documentation, and that is the promise users configure against. The catalog is
     built in the adapter's `__init__`, before there is a client to read a
     config off, so it resolved the CORE default and nothing ever revised it —
     a host that lowered the bound to 8 kept accumulating handles to 256. What

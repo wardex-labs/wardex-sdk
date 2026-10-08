@@ -130,7 +130,7 @@ def _init(**kwargs: Any) -> RecordingTransport:
 def test_init_and_close_leave_the_frameworks_tracing_switch_where_they_found_it(
     agents_env, tracing_enabled, monkeypatch, manual, env
 ):
-    """README: "wardex never flips that setting for you". The framework's
+    """wardex never flips the framework's tracing switch. The framework's
     switch has two halves -- the manual one (`set_tracing_disabled`) and the
     environment variable it falls back to -- and install and uninstall READ
     both and WRITE neither. Nine combinations, so the sentence holds for the
@@ -1513,8 +1513,8 @@ def test_runner_run_three_turns_are_one_tree(agents_env):
         _assert_counters_clean()
     finally:
         wardex.close()
-    # What a RECEIVER gets: the conversation id as the OTLP attribute the
-    # README promises, on every adapter span — measured absent before the
+    # What a RECEIVER gets: the conversation id as an OTLP attribute, on
+    # every adapter span — measured absent before the
     # codec marshalled the block, while the in-process span carried it.
     attrs = _otlp_attributes(transport)
     for name in (_ROOT, "invoke_agent agent_a", "invoke_agent agent_b", "handoff agent_a→agent_b"):
@@ -1523,7 +1523,7 @@ def test_runner_run_three_turns_are_one_tree(agents_env):
     # ...and on the LLM calls, the spans that carry the tokens a "what did this
     # conversation cost" query sums.
     assert attrs["chat gpt-4o-mini"]["gen_ai.conversation.id"] == "conv-123"
-    # Handoff causality as the README names it: the receiver's parent agent
+    # Handoff causality: the receiver's parent agent
     # is a `wardex.*` attribute (the codec flattens `AgentAttributes.parent_agent`
     # there), not a `gen_ai.*` one — the docs once promised the wrong key.
     assert attrs["invoke_agent agent_b"]["wardex.agent.parent"] == "agent_a"

@@ -1538,8 +1538,8 @@ class Client:
         import: a process where mp is not loaded cannot be an mp child, and
         the fork hook is the one place import-time side effects are least
         affordable. A raw `os.fork()` + `os._exit()` child is out of reach by
-        construction (neither atexit nor mp's exit function exists there);
-        the README says so and prescribes `wardex.flush()` before exiting.
+        construction (neither atexit nor mp's exit function exists there),
+        so such a child must call `wardex.flush()` itself before exiting.
 
         The bare `flush` is deliberate: "send what you have, on the
         transport's own budget" is exactly the tail-flush contract, and the
@@ -1557,7 +1557,7 @@ class Client:
         Finalize. In a raw `os.fork` child `_run_after_forkers` never runs
         and never needs to: a raw child either exits through the interpreter
         (atexit's teardown flushes) or through `os._exit` (out of reach by
-        construction — the README prescribes `wardex.flush()` there).
+        construction — such a child must call `wardex.flush()` itself).
         """
         if self._closed or self._mp_tail_flush_registered:
             return

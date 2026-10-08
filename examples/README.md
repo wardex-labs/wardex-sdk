@@ -143,8 +143,7 @@ the first run rather than after it; it is not a troubleshooting step.
 
 `WARDEX_ENDPOINT` is the full OTLP traces URL; Phoenix listens on
 `/v1/traces`. (A bare `http://127.0.0.1:6006` also works — an endpoint
-with no path gets `/v1/traces` appended, the rule stated under
-*Environment variables* in the README.) Nothing else is configured: the
+with no path gets `/v1/traces` appended.) Nothing else is configured: the
 openai-agents adapter is auto-detected because the `openai-agents`
 distribution is installed, and PII masking is on by default, so a real run
 never sends an email address or an API key to the backend.

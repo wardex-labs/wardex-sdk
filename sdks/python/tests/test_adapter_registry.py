@@ -186,7 +186,7 @@ _BARE_INIT_SCRIPT = textwrap.dedent(
 
 
 def test_a_bare_init_installs_the_adapter_of_a_framework_that_is_installed():
-    """README: "zero-instrumentation" and "auto-detected". The positive half
+    """Adapters install with no code change and are auto-detected. The positive half
     of auto-detection, against the real `openai-agents` distribution this
     suite has, in a process that has not imported it yet: `wardex.init()`
     with no adapter named installs the adapter, and importing the framework
