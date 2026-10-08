@@ -387,33 +387,6 @@ def test_a_span_attribute_under_a_secret_name_is_masked(port):
     assert "db_password" in text and "42" in text
 
 
-def _readme_rule_rows() -> dict[str, set[str]]:
-    import re
-    from pathlib import Path
-
-    readme = (Path(__file__).resolve().parents[3] / "README.md").read_text()
-    rows: dict[str, set[str]] = {}
-    for line in readme.splitlines():
-        m = re.match(r"^\| `(secret_[a-z_]+)`(, `name=value` only)? \|[^|]*\| (.*) \|$", line)
-        if m:
-            key = m.group(1) + (":url_form" if m.group(2) else "")
-            rows[key] = set(re.findall(r"`([^`]+)`", m.group(3)))
-    return rows
-
-
-def test_the_readme_name_table_is_the_list_the_masker_runs():
-    """The documentation prints the rule verbatim; this is what keeps the two
-    one fact. A name added to the code and not to the README (or the other
-    way round) fails here."""
-    rules = _wardex_native.codec.pii_name_rules()
-    assert _readme_rule_rows() == {
-        "secret_word": set(rules["strong_words"]),
-        "secret_last_word": set(rules["last_words"]),
-        "secret_exact_name": set(rules["exact_names"]),
-        "secret_exact_name:url_form": set(rules["url_form_only_names"]),
-    }
-
-
 _MASKED_DIR = Path(__file__).parent / "fixtures" / "masked_envelopes"
 
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Print the quality budgets of the current tree, as JSON. README.md describes
-# what each one holds; sdks/python/tests/test_quality_ratchets.py enforces the
-# ones that may move in one direction only.
+# Print the quality budgets of the current tree, as JSON.
+# sdks/python/tests/test_quality_ratchets.py enforces the ones that may move in
+# one direction only.
 #
 # Read-only and dependency-free on purpose: grep, awk and the system python3
 # only -- no venv, no cargo, and nothing imported from the built package, so a

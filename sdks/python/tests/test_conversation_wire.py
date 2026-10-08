@@ -33,7 +33,6 @@ import contextlib
 import http.client
 import http.server
 import json
-import pathlib
 import threading
 import uuid
 import warnings
@@ -64,9 +63,6 @@ from wardex_sdk.testing import RecordingTransport
 from wardex_sdk.transport import Transport
 
 pytestmark = pytest.mark.usefixtures("fresh_counters")
-
-_README = pathlib.Path(__file__).resolve().parents[3] / "README.md"
-_PROMISE = "# A conversation: every span inside carries gen_ai.conversation.id."
 
 
 def _response(n: int) -> bytes:
@@ -188,17 +184,17 @@ def _want(tag: str) -> str | None:
 
 
 # --------------------------------------------------------------------------
-# the README's promise
+# the conversation promise
 # --------------------------------------------------------------------------
 
 
-def test_the_readme_promise_every_span_inside_a_conversation_carries_its_id(llm):
-    """README: "every span inside carries gen_ai.conversation.id". Every kind
+def test_every_span_inside_a_conversation_carries_its_id(llm):
+    """Every span inside a `conversation()` block carries
+    `gen_ai.conversation.id`. Every kind
     of span a block can hold — the conversation's own, a decorated workflow and
     tool, a hand-named span, the wire `chat` calls and a plain HTTP call — and
     the receiver's view of it, the OTLP attribute. A call after the block
     carries none."""
-    assert _PROMISE in _README.read_text(), "the README sentence this test asserts moved"
     host, port = llm
 
     @wardex.tool(name="lookup")

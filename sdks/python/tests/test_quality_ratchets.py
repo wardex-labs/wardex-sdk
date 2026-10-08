@@ -1,4 +1,4 @@
-"""The quality budgets of README.md, enforced.
+"""The quality budgets, enforced.
 
 A budget is a number recorded here that may move in ONE direction. Each test
 below reads the tree and compares against the recorded value. If a test here

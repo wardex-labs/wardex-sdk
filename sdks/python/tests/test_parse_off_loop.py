@@ -1393,7 +1393,7 @@ def _max_loop_drift(url: str) -> float:
 
 
 def test_loop_thread_is_not_stalled_by_a_large_response(big_sse_tls_server):
-    """§6-1 — README's "Capture itself never blocks your coroutines", made
+    """§6-1 — the promise "Capture itself never blocks your coroutines", made
     true and pinned. Asserted against a same-test wardex-off BASELINE, not
     an absolute number (a loaded CI machine drifts on its own): before the
     deferred split the on-minus-off difference measured the whole ~40 ms

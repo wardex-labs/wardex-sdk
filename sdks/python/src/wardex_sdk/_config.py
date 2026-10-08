@@ -641,9 +641,7 @@ class WardexConfig:
                 "WardexConfig groups its fields by concern; these are not fields:\n"
                 + "\n".join(lines)
                 + "\nThe groups are backend, pii, batching, limits,"
-                " propagation and adapters — see the Configuration section of"
-                " the README:"
-                " https://github.com/wardex-labs/wardex-sdk#configuration"
+                " propagation and adapters."
             )
         # object.__new__, not super().__new__: @dataclass(slots=True) rebuilds
         # the class to attach __slots__, which invalidates the zero-arg

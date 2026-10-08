@@ -3,13 +3,104 @@
 [![PyPI](https://img.shields.io/pypi/v/wardex-sdk)](https://pypi.org/project/wardex-sdk/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](https://github.com/wardex-labs/wardex-sdk/blob/main/LICENSE)
 
-Open-source observability SDK for AI agents — zero-instrumentation capture,
-OpenTelemetry-native.
+Open-source observability SDK for AI agents. Install it, call `init()`, and
+your agent's model calls are recorded as OpenTelemetry traces, with no changes
+to your agent code. On the OpenAI Agents SDK, LangGraph or the Claude Agent
+SDK, its agents, tool calls and handoffs are recorded as well.
 
-> ⚠️ **Beta.** PII masking is on by default (see below), but the
-> SDK is still early: review the caveats below before sending sensitive data
-> through it. Versioning and stability promises are in
-> [VERSIONING.md](VERSIONING.md).
+> **Beta.** Interfaces may change between 0.x releases; the rules are in
+> [VERSIONING.md](https://github.com/wardex-labs/wardex-sdk/blob/main/VERSIONING.md).
+> PII masking is on by default. Read what it does not catch, under
+> [Data safety](#data-safety), before you send sensitive data through it.
+
+## Why agent observability
+
+A conventional service fails loudly: an exception, a 500, a stack trace. An
+agent usually fails quietly. A run is a chain of model calls, tool calls and
+handoffs between agents, and when one step starts answering differently, the
+process still exits cleanly, every HTTP status is 200, and the error tracker
+records nothing. The damage surfaces later and somewhere else: a retry loop
+that triples the token bill, a tool that returns an empty result the next step
+treats as an answer, a handoff to the wrong agent, an answer that has drifted
+since the last model upgrade.
+
+Teams usually learn about these failures from a customer complaint or an
+invoice, then spend days working out when the behaviour changed and which step
+changed it. Every model, prompt or tool change carries the same uncertainty.
+
+Answering "what did the agent actually do, and since when" takes a record with
+three properties:
+
+- **Complete.** Every model call, including calls made by libraries you did
+  not write, calls that failed, and calls made outside any framework.
+- **Causal.** Which agent requested which tool call and which model call,
+  across `asyncio` tasks, threads and services.
+- **Explicit about gaps.** When part of a run could not be observed, such as
+  a streamed response that never reported its token usage or a parent the
+  SDK never saw, the record says so, so an empty field is never mistaken for
+  a zero.
+
+wardex-sdk is built to produce that record.
+
+## How it works
+
+- **It reads model traffic where it crosses the socket.** Inside your process,
+  the SDK observes the traffic your code produces over HTTP/1.1, HTTP/2,
+  WebSocket, gRPC (grpclib) and MCP stdio. Calls to recognised model providers
+  are always recorded; other traffic is recorded while it runs inside a wardex
+  span. For OpenAI Chat Completions, Responses and Embeddings and for Anthropic
+  Messages, model, messages, parameters and token usage come from the bytes
+  the provider actually received and returned, streaming included. Two cases
+  are read another way: the Claude Agent SDK makes its model calls from a CLI
+  subprocess, so its adapter rebuilds them from that process's output, and
+  Responses over WebSocket is recorded as a marked connection whose calls are
+  left unread.
+- **It rebuilds the run tree from in-process context.** Parent links come from
+  context propagation inside your process, so a model call made deep inside a
+  tool lands under that tool even when no framework hook reports it. Each
+  link records how it was established and with what confidence, and a link
+  the SDK cannot back carries a marker instead.
+- **It marks what it could not see.** An incomplete span carries a named
+  marker in `wardex.limitations`, for example `stream_usage_unavailable` when
+  a streamed response carried no usage block, so its token counts are absent.
+  A loss that cannot ride on a span is counted in-process, and export, buffer
+  and parser losses are also reported once on the `wardex_sdk` logger.
+- **It masks before export.** Secrets and personal data are masked inside your
+  process, before a byte is sent, and each masked span records what was
+  replaced and by which rule.
+- **It speaks OpenTelemetry.** Spans follow the OpenTelemetry `gen_ai`
+  semantic conventions and export over OTLP/HTTP to any compatible backend, or
+  to the wardex receiver.
+- **It stays out of your way.** The core is Rust, the wheel has no runtime
+  Python dependencies, parsing runs on the SDK's own worker threads, and
+  nothing the SDK does after `init()` raises into your code.
+
+## Next to the tools you are evaluating
+
+**Langfuse, LangSmith, Arize Phoenix.** These platforms store, search and
+evaluate traces. Their integrations usually live in your code as a client
+wrapper, a decorator, an instrumentation package or a framework callback, and
+a trace contains what that integration chose to report. wardex-sdk is a
+collector that exports standard OTLP. Langfuse and Phoenix are tested
+destinations, so a team can keep the platform it already uses and change only
+how the data is collected.
+
+**LangGraph and other agent frameworks.** wardex records LangGraph runs
+without callbacks or `LangChainTracer`: one span per graph run, one per node,
+one per tool call a `ToolNode` dispatches, with every model and HTTP call
+underneath placed by context. The OpenAI Agents SDK and the Claude Agent SDK have adapters as well,
+and all three install themselves when `init()` finds the framework. On a
+framework with no adapter, model calls to recognised providers are still
+captured with their token usage and model ids, and a few decorators add the
+structure.
+
+**Building it in-house.** A wrapper around the model client is quick to write.
+The work that follows is what this SDK already does: reading streamed responses and
+their usage, keeping parent links correct across `asyncio.gather` and shared
+HTTP/2 connections, carrying context into worker threads, masking credentials in URLs, JSON bodies and tool
+arguments before they leave the process, bounding memory under load, and
+reporting explicitly when any of it failed. The SDK is Apache-2.0, so every
+one of those decisions is readable in the source.
 
 ## Install
 
@@ -17,1339 +108,158 @@ OpenTelemetry-native.
 pip install wardex-sdk
 ```
 
+Python 3.10 or newer. Prebuilt wheels cover Linux with glibc (x86_64,
+aarch64), macOS (x86_64, arm64) and Windows (x86_64), so nothing compiles on
+install. Other platforms, such as Alpine (musl), have no wheel yet.
+
 ## Quickstart
+
+Point the SDK at any OpenTelemetry backend that accepts OTLP/HTTP (Langfuse,
+Phoenix, an OTel Collector):
+
+```bash
+export WARDEX_ENDPOINT=http://127.0.0.1:6006/v1/traces
+```
 
 ```python
 import wardex_sdk as wardex
-from wardex_sdk import BackendConfig
 
-wardex.init(backend=BackendConfig(api_key="wdx_us_..."))
+wardex.init()
 
-# your app code — LLM calls, tools and agent runs are captured automatically
+# Your agent code, unchanged.
 
-wardex.close()  # optional — spans auto-flush every 5s, on buffer threshold, and at exit
+wardex.close()  # optional: spans also flush every 5 seconds and at exit
 ```
 
-Interception is **on by default**: `init()` is the consent, and
-zero-instrumentation capture of LLM traffic is the product (`intercept=False`
-is the opt-out). `api_key` is the wardex project key: one key names one
-project, its region tag (`wdx_us_...`) names the receiver, and the key travels
-as an `Authorization: Bearer <key>` header to that receiver and nowhere else —
-never inside the exported data, never to a third-party collector. The receiver
-stamps the project onto what it stores. With `WARDEX_API_KEY` set in the
-environment, a bare `wardex.init()` is a working first run — see
-[Where the data goes](#where-the-data-goes) and
-[Environment variables](#environment-variables).
+A host that already exports OTLP needs no new variable:
+`OTEL_EXPORTER_OTLP_ENDPOINT` and `OTEL_EXPORTER_OTLP_HEADERS` are read as
+well. Capture starts at `init()` (`intercept=False` turns it off). With no
+destination configured, the SDK sends nothing and says so once on stderr.
 
-## Where the data goes
-
-The destination is decided by what you configured, and nothing else. When two
-settings name different destinations, the one that loses is announced with a
-`WardexConfigWarning` rather than ignored.
+Where the data goes is decided by what you configured, and nothing else:
 
 | You set | Data goes to |
 |---|---|
-| `api_key` | the wardex receiver the key's region names (`WardexTransport`) |
-| `api_key` + `base_url` | a self-hosted wardex receiver at `base_url` (`<base_url>/v1/envelope`) |
-| `endpoint` (or the OTel endpoint variables) | a third-party OTLP/HTTP collector (`OtlpHttpTransport`), authenticated by `headers` / `OTEL_EXPORTER_OTLP_HEADERS` |
+| `endpoint` (`WARDEX_ENDPOINT`, or the OTel endpoint variables) | that OTLP/HTTP collector, authenticated by `headers` / `OTEL_EXPORTER_OTLP_HEADERS` |
+| `api_key` (`WARDEX_API_KEY`) | the hosted wardex receiver the key's region names |
+| `api_key` + `base_url` | a self-hosted wardex receiver at `base_url` |
 | `transport=` | that transport, always |
-| none of these | nowhere: `NoOpTransport`, said once on stderr |
+| none of these | nowhere, said once on stderr |
 
-`api_key` next to `endpoint` routes to the wardex receiver and warns that the
-endpoint lost. A `base_url` without a key is refused with a `ValueError`, and
-so is a key whose region this SDK version has no receiver for — a batch sent
-to the wrong receiver would be a 401 the exporter is silent about.
+When two settings name different destinations, the one that loses is announced
+with a `WardexConfigWarning`. The `api_key` rows are on the main branch and
+are not available in the current release.
 
-## Masking secrets and personal data
+## A real trace in under a minute
 
-Masking is on by default and runs **inside your process**, in the encoder,
-before a byte is sent — to the wardex receiver or to any OTLP collector. It
-never drops an argument: a value it masks becomes a placeholder in place, and
-the argument's name stays readable, so you can still see what an agent asked
-for. Two kinds of rule decide what is masked.
+The [openai-agents example](https://github.com/wardex-labs/wardex-sdk/blob/main/examples/README.md)
+runs two agents, a function tool and a handoff against a local Phoenix,
+started with one `docker run` as its walkthrough shows. From a fresh clone,
+with the Phoenix image already pulled, the terminal part measured under a
+minute.
 
-**Value rules** look at the value itself: e-mail addresses, phone numbers,
-credit cards (Luhn-checked, last four kept), US SSNs, IP addresses, US bank
-routing numbers, IBANs, and credential shapes — `sk-…`, `sk_live_…`,
-`AKIA…`/`ASIA…`, `ghp_…`, `glpat-…`, `hf_…`, `xoxb-…`, `AIza…`, `ya29.…`,
-`Bearer …`, an `Authorization: Basic|Bearer …` header written as text, JWTs
-and PEM private keys.
+```bash
+git clone https://github.com/wardex-labs/wardex-sdk && cd wardex-sdk
+python3 -m venv .venv-quickstart && source .venv-quickstart/bin/activate
+pip install "wardex-sdk>=0.6.0b1" openai-agents
+export OPENAI_API_KEY=sk-...                             # the framework's own requirement
+export WARDEX_ENDPOINT=http://127.0.0.1:6006/v1/traces   # a local Phoenix
+python examples/openai_agents_quickstart.py
+```
 
-**Name rules** look at the argument name the value is passed under. A URL
-query argument, a form field, a JSON key (including JSON escaped inside a
-string, such as a tool call's `arguments`) and a span attribute are all the
-same kind of argument, so `?api_key=…`, `{"api_key": …}`, a
-`multipart/form-data` field and `s.set_attribute("api_key", …)` are masked
-alike, whatever the transport; so is an argument percent-encoded inside
-another (`url=https%3A%2F%2F…%3Fapi_key%3D…`). A name is `%XX`-decoded, split
-into words at `_`, `-`, `.`, spaces, brackets and camelCase, stripped of
-trailing digits, and compared without case: `apiKey`, `X-Api-Key`,
-`API_KEY` and `api_key2` are one name, and `keyword` or `monkey` never match
-`key`. Under a secret name, a list or an object is masked leaf by leaf — its
-keys stay readable — and a value the capture cap cut short is masked to its
-end.
+<!-- Absolute URL on purpose: this file is also the PyPI long description
+     (readme = "README.md" in sdks/python/pyproject.toml), where a relative
+     path renders as a broken link. The trade-off is that the image and the
+     docs links 404 on branches and in PR views until they are on main. -->
+![Phoenix showing one openai-agents run: invoke_workflow travel_concierge → invoke_agent concierge (chat, execute_tool lookup_weather, chat, handoff concierge→booking_agent) and its sibling invoke_agent booking_agent (chat)](https://raw.githubusercontent.com/wardex-labs/wardex-sdk/main/examples/openai-agents-phoenix.png)
 
-| Rule | The value is masked when | Names |
-|---|---|---|
-| `secret_word` | any word of the name is one of | `password`, `passwd`, `pwd`, `passphrase`, `secret`, `credential`, `credentials`, `jwt`, `bearer`, `signature`, `authorization`, `cookie`, `cookies` |
-| `secret_last_word` | the name has two or more words and the last is | `key`, `token`, `pass`, `passcode`, `otp`, `totp`, `cvv`, `cvc` |
-| `secret_exact_name` | the whole name is, word for word | `token`, `auth`, `apikey`, `apitoken`, `hapikey`, `appid`, `accesstoken`, `authtoken`, `privatetoken`, `accesskey`, `secretkey`, `privatekey`, `clientsecret`, `apisecret`, `sessionid`, `jsessionid`, `phpsessid`, `csrf`, `xsrf`, `csrfmiddlewaretoken`, `SAMLResponse`, `code_verifier`, `pw`, `pass`, `passcode`, `otp`, `totp`, `cvv`, `cvc`, `pin`, `pincode`, `pin_code`, `csrftoken`, `connect.sid`, `auth_code`, `device_code`, `mfa_code` |
-| `secret_exact_name`, `name=value` only | the whole name is, in a URL query, a form body or a WebSocket target | `code`, `sig`, `key`, `sid` |
+No decorator, callback or processor was added to the agent code to get this
+tree.
 
-So `api_key`, `access_token`, `X-Amz-Security-Token` and
-`password_confirmation` are masked, while `key_id`, `token_type`,
-`max_tokens`, `session_id` and `country_code` are not. `page_token`,
-`next_token`, `idempotency_key`, `public_key`, `object_key` and
-`partition_key` **are** masked by default — their last word is `token` or
-`key`; reveal the ones you need (below). An object under a secret name is
-masked whole, so `{"Credentials": {"Expiration": …}}` loses its expiry too.
+## Frameworks
 
-`code`, `sig`, `key` and `sid` are credentials where OAuth, Azure SAS, Google
-and session cookies send them, as `name=value`; in JSON the same names are an
-error code (`"code": -32601`), a code interpreter's source, a map entry's key
-or a resource id, and are kept. The `name=value` shape is judged wherever it
-appears in text, so a SQL string `WHERE token=1` in a query argument reads
-`token=[SECRET]`.
+| Framework | What becomes a span |
+|---|---|
+| OpenAI Agents SDK (`openai-agents>=0.22,<0.23`) | each run, agent, function tool, handoff and guardrail; model calls read from the wire |
+| LangGraph (`langgraph>=1.2`) | each graph run, node and `ToolNode` tool call, including subgraphs and the functional API |
+| Claude Agent SDK (`claude_agent_sdk`) | agent turns and model calls, with tool calls correlated |
+| Any other framework, or your own loop | model calls with model, messages and token usage; decorators add the structure |
 
-**URLs.** A span's name never carries a query, a fragment or credentials
-(`HTTP GET /v1/search`). The URL itself — `url.full` over OTLP — carries the
-whole query, masked by the same rules, and `user:password@` becomes
-`REDACTED:REDACTED@` **even with `PIIMode.OFF`**, as OpenTelemetry's semantic
-conventions require: an opt-out of masking is an opt-out of losing debugging
-values, and a URL's credentials are never one.
+Adapters are detected automatically when the framework is installed;
+`AdaptersConfig` selects and configures them.
 
-**What a masked span tells you.** Every span that had anything replaced says
-how much, by which rule, and under which names. Over OTLP: `wardex.redacted`,
-`wardex.redaction.count`, `wardex.redaction.rules` (the rule names above, or a
-value rule's category such as `email` or `secret_value`, or `url_userinfo`) and
-`wardex.redaction.names` (the argument names a name rule matched, at most 32,
-themselves passed through the value rules). On the wardex envelope, the same
-facts in `CaptureIntegrity.redaction_count`, `redaction_rules` and
-`redaction_names`. A span nothing was replaced in carries none of them.
+## Adding structure to your own code
 
-**Your own names.** Add names your services use, or keep names you need to
-read. Both compare by words, like the built-in names, so one entry covers
-every spelling:
+```python
+import wardex_sdk as wardex
+
+@wardex.agent(name="researcher")
+def research(question: str): ...
+
+@wardex.tool(name="search")
+def search(query: str): ...
+
+with wardex.conversation("support-chat", id="session-123"):
+    research("Which plan includes SSO?")
+```
+
+The decorators produce `invoke_agent` and `execute_tool` spans (`@workflow`
+and `@step` produce `invoke_workflow` and `execute_step`). Every span inside a
+`conversation()` block, model calls included, carries
+`gen_ai.conversation.id`. An exception that leaves a span is recorded on it,
+and your code still receives the same exception. Hand-started threads need
+`wardex.bind_context(fn)` to carry the context; `asyncio` tasks inherit it.
+
+## Data safety
+
+Masking is on by default and runs in your process before export. It covers
+e-mail addresses, phone numbers, card numbers, US SSNs, IP addresses, IBANs,
+bank routing numbers, credential formats (`sk-…`, `AKIA…`, `ghp_…`, JWTs,
+PEM private keys and more), and any value passed under a secret-looking name
+such as `api_key` or `password`, whether it sits in a URL, a JSON body, a form
+field or a span attribute. Argument names stay readable, and each masked span
+records how many values were replaced and by which rule.
 
 ```python
 from wardex_sdk import PIIConfig
 
 wardex.init(
     pii=PIIConfig(
-        # Also masks xCorpAuth and X-Corp-Auth.
-        extra_secret_names={"x_corp_auth"},
-        # Kept, unless the value itself looks like a credential (sk-…).
-        reveal_names={"page_token", "code"},
+        extra_secret_names={"x_corp_auth"},  # also masks xCorpAuth, X-Corp-Auth
+        reveal_names={"page_token"},  # kept, unless the value looks like a credential
     ),
 )
 ```
 
-A name in both sets, a bare string instead of a collection, or a name with no
-letters or digits is refused with a `ValueError` when the config is built.
+What masking does not catch:
 
-**Compressed bodies** (gzip or zlib) are captured inflated, so what you read
-and what is masked is the text the body carries. Inflation stops at the
-smaller of `max_decoded_bytes` and `max_opaque_body_bytes`; a body cut there
-keeps its inflated prefix and is marked truncated.
-
-**What masking does not catch.** Say so before you rely on it:
-
-- a secret under an ordinary name with no recognisable shape
-  (`{"value": "hunter2"}`, `x-auth`, `x_api_key_v2`) — no name rule and no
-  value rule can see it;
-- `name: value` in prose or YAML, `name = value` with spaces around `=`, and
-  XML (`<password>…</password>`);
-- `code`, `sig`, `key` and `sid` in JSON (kept on purpose, above) and plural
-  names such as `api_keys`, whose last word is not `key`;
-- the part of a `name=value` value after `;`, `,`, `\`, `#`, a quote, `<`,
-  `>`, `}` or whitespace, which end the value;
-- a JSON name written with `\u` escapes or an escaped quote, and a name
-  longer than 128 characters;
-- a credential inside a URL path (`/bot<token>/sendMessage`);
-- inside an argument that is itself percent-encoded, only secret names are
-  judged — not credential shapes or `user:password@` — and a value encoded
-  twice (`%253D`) is not decoded;
-- a `multipart/form-data` part that is not written as the standard requires
-  (CRLF line ends, a lowercase `form-data;`, a quoted `name="…"`);
-- payloads that are not text: the bytes between valid UTF-8 stretches pass
-  through, and a body compressed other than gzip or zlib (Brotli, zstd) is
-  not inflated;
-- anything you read before the encoder runs: `before_send_envelope`,
+- a secret under an ordinary name with no recognisable shape, such as
+  `{"value": "hunter2"}`;
+- `name: value` in prose or YAML, and XML such as `<password>…</password>`;
+- a credential inside a URL path, such as `/bot<token>/sendMessage`;
+- payloads that are not text, and bodies compressed with anything other than
+  gzip or zlib;
+- anything read before the encoder runs: `before_send_envelope`,
   `ConsoleTransport` and a transport that serializes envelopes itself all see
-  pre-masking data.
-
-## Works with openai-agents
-
-Install wardex next to the OpenAI Agents SDK, set one environment variable,
-and every `Runner.run` / `run_sync` / `run_streamed` becomes one trace with
-the agents, the tool calls and the handoffs in it — no decorator, no
-callback, no processor to register. The framework's own tracing hooks give
-wardex the structure; the LLM calls underneath are read from the wire, so
-model, messages and token usage are the ones that actually crossed the
-socket, and the tool `call_id` the framework echoes into the next turn joins
-each `execute_tool` span to the `chat` span that requested it.
-
-From a checkout of this repository (the example script is not in the
-wheel), on Python 3.10 or newer, with a Phoenix started as in
-[`examples/README.md`](examples/README.md):
-
-```bash
-git clone https://github.com/wardex-labs/wardex-sdk && cd wardex-sdk
-python3 -m venv .venv-quickstart && source .venv-quickstart/bin/activate
-pip install "wardex-sdk>=0.6.0b1" openai-agents          # prebuilt wheel, nothing to compile
-export OPENAI_API_KEY=sk-...                             # the framework's own requirement
-export WARDEX_ENDPOINT=http://127.0.0.1:6006/v1/traces   # a local Phoenix
-python examples/openai_agents_quickstart.py
-```
-
-The script makes six short `gpt-4o-mini` calls against your key. Measured
-from a fresh clone and virtualenv following the walkthrough, Phoenix image
-already pulled: under a minute in the terminal — and the install is a
-prebuilt wheel, so none of that minute is a compile. That is the measured
-part; the clicks in Phoenix to the tree below add an estimated half-minute
-on top, paced by hand rather than clocked.
-
-<!-- Absolute URL on purpose: this file is also the PyPI long description
-     (readme = "README.md" in sdks/python/pyproject.toml), where a relative
-     image path renders as a broken link. The trade-off is that the image
-     404s on branches and in PR views until the PNG is on main. -->
-![Phoenix showing one openai-agents run: invoke_workflow travel_concierge → invoke_agent concierge (chat, execute_tool lookup_weather, chat, handoff concierge→booking_agent) and its sibling invoke_agent booking_agent (chat)](https://raw.githubusercontent.com/wardex-labs/wardex-sdk/main/examples/openai-agents-phoenix.png)
-
-The receiving agent of a handoff is the sender's **sibling**, not its
-child, so a long handoff chain stays one level deep; `wardex.agent.parent`
-and a `handoff_from` link record who handed off to whom. Phoenix draws that
-indentation only once its trace drawer is widened — the walkthrough in
-[`examples/README.md`](examples/README.md) says where to click and what to
-drag, covers Langfuse, and explains the framework's own `[non-fatal]
-Tracing client error 401` line if you see one.
-
-Two cases where you do **not** get that tree, and what wardex says instead:
-
-- **Responses over WebSocket** (`use_responses_websocket=True`). The LLM
-  calls are inside WebSocket frames wardex does not parse, so the `chat`
-  spans are replaced by one `WS /v1/responses` span per connection carrying
-  the marker `ws_llm_semantics_unread` — no model, tokens or messages. The
-  agent, tool and handoff spans are unaffected. Use the framework's default
-  HTTP transport for `chat` spans.
-- **Framework tracing disabled** (`OPENAI_AGENTS_DISABLE_TRACING=1` or
-  `agents.set_tracing_disabled(True)`). There is nothing for the adapter to
-  hook, so you get the `chat` spans only, unparented, and one INFO log line
-  (on stderr under default logging) at `wardex.init()`: `[wardex]
-  openai-agents tracing is disabled, so wardex will show only the LLM calls
-  its interceptor captures: no agent, handoff, tool or guardrail spans. …`
-  — followed by the two lines that re-enable the framework's tracing without
-  sending anything to OpenAI. wardex never flips that setting for you.
-
-## Configuration
-
-Settings are grouped by concern, and the group names are the same in every
-wardex SDK — a Node or Java service configured by the same team reads the same
-way.
-
-| Group | What it decides |
-|---|---|
-| `backend=BackendConfig(...)` | Where the data goes and whose it is: `api_key`, `base_url`, `endpoint`, `headers` |
-| `pii=PIIConfig(...)` | What leaves the process: `mode`, `disabled_categories`, `extra_secret_names`, `reveal_names` — see [Masking](#masking-secrets-and-personal-data) |
-| `batching=BatchingConfig(...)` | When buffered spans are sent: `flush_interval`, `flush_on_signals`, `shutdown_timeout` |
-| `limits=LimitsConfig(...)` | How much is captured — see [Resource limits](#resource-limits) |
-| `propagation=PropagationConfig(...)` | Whether wardex touches outbound traffic: `enabled`, `targets` |
-| `adapters=AdaptersConfig(...)` | Which framework adapters install, and each adapter's own options |
-
-```python
-import wardex_sdk as wardex
-from wardex_sdk import BackendConfig, BatchingConfig, PIIConfig, PIIMode
-
-wardex.init(
-    backend=BackendConfig(api_key="wdx_us_..."),
-    batching=BatchingConfig(flush_interval=2.0),
-    pii=PIIConfig(mode=PIIMode.OFF),
-)
-```
-
-Everything that belongs to no group stays top-level: `service_name`,
-`release`, `environment`, `debug`, `before_send_envelope`, `capture_mode`, and
-the interception trio `intercept` / `intercept_hosts` / `interceptors`. The
-config dataclasses are keyword-only and frozen; each group validates its own
-fields, so an invalid value fails on the line that constructed it. Collection
-fields accept any iterable and read back canonicalized (tuple/frozenset);
-enum-valued fields take enum members, not strings.
-
-### Adapters
-
-Framework adapters auto-detect by default. `adapters=` selects and configures
-them:
-
-```python
-from wardex_sdk import AdapterName, AdaptersConfig, AnthropicAgentSdkConfig
-
-wardex.init(
-    ...,
-    adapters=AdaptersConfig(
-        enabled=(  # None auto-detects; () installs none
-            AdapterName.ANTHROPIC_AGENT_SDK,
-            AdapterName.LANGGRAPH,
-            AdapterName.OPENAI_AGENTS,
-        ),
-        anthropic_agent_sdk=AnthropicAgentSdkConfig(...),  # per-adapter options
-    ),
-)
-```
-
-Selection and options are separate fields on purpose: setting an adapter's
-options never touches `enabled`, so auto-detection of every other framework
-survives. Options set for an adapter that `enabled=` excludes are announced
-with a `WardexConfigWarning`.
-
-### Refused, never ignored
-
-The flat spelling of a grouped setting (`api_key=...`, `flush_interval=...`,
-the old `before_send=` and the `adapters=(AdapterName.X,)` tuple) is refused
-with a `TypeError` naming its new home. Settings that were removed outright
-(`retention=`, `tags=`, `replay_buffer_size=`) are refused with a message
-saying why they are gone. There is no compatibility shim: a config setting
-that is silently ignored is worse than one that stops the program on the line
-that set it.
-
-## Environment variables
-
-Per field, an explicit `init()` argument wins; an unset one falls back to its
-environment variable; only then does the default apply. The contract:
-
-| Variable | Fills |
-|---|---|
-| `WARDEX_API_KEY` | `backend.api_key` — the project key; its region picks the wardex receiver |
-| `WARDEX_BASE_URL` | `backend.base_url` — a self-hosted wardex receiver |
-| `WARDEX_ENDPOINT` | `backend.endpoint` — a third-party OTLP collector; else `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`, else `OTEL_EXPORTER_OTLP_ENDPOINT` |
-| `OTEL_EXPORTER_OTLP_HEADERS` | `backend.headers` — that collector's own headers, `key=value,key2=value2` with percent-encoded values |
-| `WARDEX_SERVICE_NAME` | `service_name` |
-| `WARDEX_RELEASE` | `release` |
-| `WARDEX_ENVIRONMENT` | `environment` |
-| `WARDEX_DEBUG` | `debug` — `true` (case-insensitive) can only turn it ON |
-
-A host already exporting OTLP elsewhere points wardex at the same collector
-with zero new variables, headers included. **The endpoint rule:** a URL with no path component
-(or `/`) gets `/v1/traces` appended when the default transport is built —
-`http://collector:4318` exports to `http://collector:4318/v1/traces` — while a
-URL with an explicit path is used verbatim. The config always reads back
-exactly as written.
-
-With neither a `transport=` nor a resolved `backend.endpoint`, `init()`
-installs `NoOpTransport`, captures into nothing, and says so once (see
-[Diagnostics](#diagnostics)).
-
-## Identifying your service
-
-Three flat fields name the app in whatever OTel backend receives the data:
-
-| Field | OTLP resource attribute |
-|---|---|
-| `service_name` | `service.name` (unset: `unknown_service:python`) |
-| `release` | `service.version` (unset: not emitted) |
-| `environment` | `deployment.environment.name` (unset: not emitted) |
-
-`telemetry.sdk.name` is the constant `"wardex"` in every language — the SDK
-travels in `telemetry.sdk.*`, never in your service's identity.
-
-## Tracing
-
-Everything is captured without instrumentation; the tracing API exists to add
-**structure** — names, operations, and parents — around your own code.
-
-**Context managers take a positional name; decorators take an optional
-keyword name.** That family rule is frozen across SDKs.
-
-```python
-import wardex_sdk as wardex
-from wardex_sdk import ToolAttributes
-
-# A conversation: every span inside carries gen_ai.conversation.id.
-with wardex.conversation("support-chat", id=session_id):  # id=None mints a uuid4
-    ...
-
-# A hand-named span over a block, yielding a Span to enrich:
-with wardex.span("rank-results") as s:
-    s.set_attribute("candidates", 42)
-    ...
-
-
-# Decorators — bare or with keywords; name defaults to the function's name:
-@wardex.workflow
-def nightly_sync(): ...
-
-
-@wardex.agent(name="researcher")
-def run_agent(): ...
-
-
-@wardex.step
-def plan(): ...
-
-
-@wardex.tool(name="search", attributes=ToolAttributes(...))
-def search(query: str): ...
-```
-
-`conversation()` is **not** a trace root: the span it opens joins the ambient
-trace as a child, and an explicit `id=` is used verbatim — a multi-turn chat
-app passes its own session id so every turn joins one conversation. It also
-**wins over a framework's own conversation id**: an adapter run opened inside
-the block (an OpenAI Agents `RunConfig(group_id=…)`, say) keeps your id as
-`gen_ai.conversation.id` on every span it opens and carries the framework's as
-a separate attribute (`wardex.openai_agents.group_id`) rather than as the
-conversation. Two `conversation()` blocks opened side by side under one span
-are two conversations in one trace, by design — the block scopes the id, not
-the trace.
-"Every span" includes the LLM calls wardex reads off the wire: a call carries
-the conversation its request was issued in, so blocks running concurrently —
-under `asyncio.gather`, or on threads carried by `wardex.bind_context` — each
-keep their own id, and a call outside every block carries none. That holds on
-one shared HTTP/2 connection too (httpx with `http2=True`, over TLS or as
-plaintext h2c), where any task may write another's frames: wardex reads who
-issued each stream where the `h2` library opens it, and proves which connection
-carries which `h2` connection object by the very bytes the client writes. A
-stream it cannot prove that for (an HTTP/2 client not built on `h2`, or one
-that copies its chunks before writing them) carries no conversation rather than
-a guessed one. A block scopes the context it was entered in, as any context
-variable does: entered on a worker thread with a copy of your context (FastAPI
-runs a plain `def` generator dependency's setup and teardown that way), it
-reaches only that thread's work, so open it in an `async def` dependency or in
-the endpoint instead. A Responses
-request can name a conversation itself (`conversation="conv_…"`, which the
-OpenAI Agents SDK's `Runner.run(conversation_id=…)` sends): outside any block
-that id is the call's `gen_ai.conversation.id`; inside one, your id wins and
-the request's rides along as `wardex.openai.conversation_id`, counted under
-`semantics.request_conversation_shadowed`. On a call whose conversation wardex
-could not read (the unproven stream above), the request's id does not stand in
-for yours, which may have won: it rides along the same way, counted under
-`semantics.request_conversation_withheld`.
-`workflow` / `agent` / `step` / `tool` map to the `gen_ai.operation.name`
-values `invoke_workflow` / `invoke_agent` / `execute_step` / `execute_tool`,
-so decorated spans appear on operation-keyed dashboards. A workflow's name
-ships as `gen_ai.workflow.name`. `span()` and
-`conversation()` are context managers only — using one as a decorator raises
-a `TypeError` naming the decorators (a decorator would silently break async
-functions).
-
-The four decorators also record **where the decorated function is defined** —
-its source file, first line, function name and module — and export it as the
-span's call site: `Span.call_site` on the envelope, and `code.file.path`,
-`code.line.number` and `code.function.name` over OTLP. The file is **relative
-to the folder the module's top-level package was imported from**, the rule
-Sentry's Python SDK uses for a frame's `filename`: `support_bot.agent` defined
-in `/Users/<you>/work/<project>/support_bot/agent.py` exports
-`support_bot/agent.py`, so your OS user name and the folders above your import
-root stay on your machine. A top-level module (`helpers.py`) and a script run
-as `python agent.py` export the file name alone. So does every function the
-SDK cannot place under its package — one with no module name (made by `exec`,
-say), one in a namespace package, one whose code lives outside its package's
-folder: the file name, never an absolute path. The path is worked out once,
-when the decorator is applied, and on Windows keeps its `\` separators.
-OpenTelemetry's conventions prefer an absolute path in `code.file.path`
-without requiring one. A `CallSite` you set yourself through `Span.call_site`
-is not rewritten.
-
-**An exception that leaves a span is recorded on it**, the way OpenTelemetry
-records one. When a decorated function, a `with wardex.span()` block or a
-`with wardex.conversation()` block raises, the span ships with status `ERROR`,
-`error.type` set to the exception's class (`ValueError`, or
-`support_bot.errors.ToolFailed` for one of your own), and one `exception`
-event carrying `exception.type`, `exception.message` and
-`exception.stacktrace` — the traceback as Python prints it, chained causes
-included. Your code still receives the very same exception object, with its
-traceback unchanged: wardex only reads it. Each span the exception leaves
-records it, so a failing tool inside an agent marks both; an exception your
-code catches inside the block marks nothing.
-
-- `asyncio.CancelledError`, `KeyboardInterrupt`, `SystemExit` and
-  `GeneratorExit` are not your agent failing: they leave the status as it was
-  and add no event.
-- A status you set inside the block wins. `s.set_status(StatusCode.OK)` before
-  an exception you expect keeps the span `OK` (the event is still recorded, as
-  evidence), and an `error.type` you named with `s.set_error(...)` is kept.
-
-The message and the stack trace are masked like every other text that leaves
-the process (see [Masking secrets and personal data](#masking-secrets-and-personal-data)),
-on the wardex envelope and over OTLP alike, so `no account for
-alice@example.com` ships as `no account for [EMAIL]`. Local variables are
-never captured. Every frame's file follows the call-site rule above —
-`support_bot/agent.py`, or the file name alone, never an absolute path — on
-the line where Python names it, as is a `SyntaxError`'s own `File "…", line N`,
-and nowhere else: a message or a source line that itself says
-`File "/etc/app/config.yaml", line 3` reaches the trace as your code wrote it,
-the same text `exception.message` carries. And your home folder is written as
-`~` wherever else its path appears in the message or the trace, whatever comes
-before it: `[Errno 2] No such file or directory: '~/reports/q3.txt'`,
-`permission denied for ~.`, `cat x >~/log.txt`, a `repr`'d `'ok\n~/out.txt'`,
-and `/backup~/x` for a copy of yours under another folder, whose path carries
-your user name all the same (`~` stands for exactly the text it replaces).
-What comes after it decides whether it is your home folder: something a
-folder's name cannot go on with — a path separator, a quote, a space, a
-bracket, a comma, a full stop that ends a sentence, or the end of the text. A
-letter, a digit, `_`, `-`, `+`, or a `.` with one of those after it makes it a
-different folder, left as written: one whose name only begins like yours
-(`/Users/alice-old`, `/Users/alice.bak`). The one folder this writes wrongly is
-a sibling named like yours plus a space: `/Users/alice 2` becomes `~ 2`,
-because a space after your home folder is far more often a sentence going on,
-and your user name must not leave with the sentence. Over OTLP both values are
-capped by `max_otlp_attribute_bytes`, like every attribute (see
-[Resource limits](#resource-limits)). Masking cannot see what the rules above
-cannot see, so a secret with no recognisable shape in an exception's message or
-on the source line that raised it leaves as written.
-
-Each traceback in a stack trace, a chained cause included, keeps the 64 frames
-nearest where its exception was raised — what Python's own
-`traceback.format_exception(exc, limit=-64)` prints — and one cut that way
-starts with a line saying how many earlier frames it left out
-(`[436 earlier frames not recorded]`). Every span an exception leaves records
-it, so without the cut a recursion through a decorated function, about 500
-spans deep, would have each span format the whole stack below it on your
-code's way out: about ten seconds and twenty megabytes of text for one
-`RecursionError`. With it each span pays for at most 64 frames per traceback,
-however deep the stack: the same recursion records in 0.3 to 0.6 s, where it
-unwinds in about 10 ms with nothing recorded. An ordinary failure is far
-shorter than the cut: a LangGraph node that raises is 9 frames below
-`graph.invoke()` (measured on langgraph 1.2.12).
-
-## Scope
-
-Ambient data that rides on every span captured under it:
-
-```python
-wardex.set_tag("tenant", "acme")  # spans carry the tag
-wardex.set_user(wardex.UserInfo(id="u1", email=...))  # spans carry user.*
-wardex.set_user(None)  # clears the user
-wardex.set_context("job", {"attempt": 3})  # readable back; NOT exported
-
-with wardex.isolation_scope():  # fork: inherits current tags/user, mutations stay inside
-    wardex.set_tag("tenant", "other")  # this block only
-    ...
-```
-
-`set_tag` / `set_user` / `set_context` write the **isolation scope** — inside
-an `isolation_scope()` block (one request, one tenant, one job) they stay that
-unit's and cannot bleed onto other threads' spans; outside any block they
-behave like process-wide values in a simple script. Tags land on exported
-spans (a span-local attribute with the same key wins); `UserInfo` maps to
-`user.id` / `user.email` / `user.name` and `client.address`. Contexts are for
-your own code to read back and are not stamped onto spans.
-
-## Distributed tracing
-
-Trace context propagation is **opt-in** — after a plain `wardex.init(...)` the
-four HTTP client entry points propagation patches (`httpx.Client.send`,
-`httpx.AsyncClient.send`, `requests.Session.send`,
-`aiohttp.ClientSession._request`) are still the objects they were before the
-call, so nothing wardex installed is in a position to put a `traceparent` on
-your outbound requests. Turn it on with:
-
-```python
-from wardex_sdk import PropagationConfig
-
-wardex.init(
-    backend=BackendConfig(endpoint="https://<collector>/v1/traces"),
-    propagation=PropagationConfig(
-        enabled=True,  # inject W3C headers on outbound calls
-        targets=(
-            "api.internal.example.com",
-            "*.svc.cluster.local",
-        ),  # optional glob allowlist; default None = all hosts
-    ),
-)
-```
-
-With `propagation=PropagationConfig(enabled=True)`, outbound calls made through httpx (sync + async),
-requests, or aiohttp get a `traceparent` (and `tracestate`, if one was
-received) header attached automatically, as long as an active trace context
-exists and the request doesn't already carry a `traceparent`. **If
-`propagation.targets` is left unset, the trace ID is sent to every host you
-call — including third-party LLM providers.** Set it to an allowlist of glob
-patterns to scope injection to your own services; patterns are matched
-case-insensitively, since hostnames are.
-
-wardex only ever *adds* a header you did not write. A `traceparent` you set
-yourself wins whether you set it per request or once as a session default, and
-in that case nothing is injected at all; a `tracestate` you set is left exactly
-as written rather than replaced or duplicated.
-
-### Joining an inbound trace
-
-Drop the middleware in front of your app to join whatever trace the caller
-started:
-
-```python
-# ASGI (FastAPI, Starlette, Django ASGI)
-app.add_middleware(wardex.WardexAsgiMiddleware)
-
-# WSGI (Flask, Django WSGI)
-app.wsgi_app = wardex.WardexWsgiMiddleware(app.wsgi_app)
-```
-
-Both extract the incoming `traceparent`/`tracestate` and continue the trace
-for the lifetime of the request; a missing or malformed header just starts a
-fresh trace (never raises). One WSGI caveat: the joined context covers the
-app callable only, so streaming responses (work done while iterating the
-returned iterable) run outside it.
-
-### Manual propagation (the universal escape hatch)
-
-The baton is just a string, so it travels over any channel that can carry
-one — not just HTTP. `get_traceparent()` and `get_trace_headers()` are plain
-functions that return the current trace headers; `continue_trace(headers)`
-is a **context manager** — the remote parent is only installed inside the
-`with` block, so it must be entered, not merely called. Use them directly
-wherever the automatic client patches or ASGI/WSGI middleware don't reach:
-
-```python
-# gRPC metadata
-stub.Check(req, metadata=[("traceparent", wardex.get_traceparent())])
-
-# WebSocket handshake
-websockets.connect(uri, extra_headers=wardex.get_trace_headers())
-
-# Celery: put get_trace_headers() on the task's headers when sending it,
-# then inside the worker:
-with wardex.continue_trace(task.request.headers):
-    ...  # task body
-
-# Kafka: put get_trace_headers() on the message headers when producing,
-# then inside the consumer:
-with wardex.continue_trace(dict(msg.headers())):
-    ...  # process the message
-```
-
-**Pass it a `traceparent` a caller actually sent you, and nothing else.**
-`continue_trace()` takes a string and takes it at its word — that is what makes
-it work over any channel, and it is also its one sharp edge. Any string of the
-right shape becomes a parent, so deriving one from something that is not a
-propagated trace context (a framework's `run_id`, a request id, a hash of a job
-name) manufactures a causal edge that never existed. Spans parented this way are
-recorded with `parent_source = header`, which is how they stay distinguishable
-from the in-process edges wardex derives itself; what wardex cannot tell you is
-whether the header was genuine, because both are just strings. Everywhere else,
-the parent comes from real context propagation and is never built from an
-identifier.
-
-`with wardex.continue_from_otel():` is a one-line alternative to
-`continue_trace()` for code that already runs under an active OpenTelemetry
-span — it adopts that span as the remote parent for the duration of the
-`with` block (no-op if `opentelemetry` isn't installed or there's no active
-span). Like `continue_trace()`, it is a context manager and must be entered
-with `with`.
-
-### Propagating into threads
-
-`asyncio` tasks inherit the current trace context automatically; threads do
-not. Wrap the target with `wardex.bind_context()` at the point where you
-still have the right context:
-
-```python
-thread = threading.Thread(target=wardex.bind_context(worker_fn), args=(...,))
-thread.start()
-```
-
-### `capture_mode`: what gets captured without an active span
-
-`capture_mode` defaults to `CaptureMode.AGENT`: LLM-semantic traffic
-(recognized `gen_ai` calls, MCP stdio) is always captured, but generic
-HTTP/gRPC/WS traffic is only captured while it happens inside an active
-*local* wardex span (a `traceparent` received from an upstream caller doesn't
-count on its own — this keeps a service mesh stamping every request with a
-traceparent from reviving "capture everything" noise).
-
-A recognized provider's **failed** calls count as LLM-semantic traffic too, so
-a 429 or a 401 is captured under the default mode even outside a local span —
-the response status decides the span's `status`, never whether it exists.
-
-This means a bare, unwrapped call to an LLM provider wardex doesn't
-recognize — or a WebSocket provider whose path wardex doesn't recognize, such
-as OpenAI Realtime — can be silently dropped if it isn't inside a local span.
-Wrap that call with `@wardex.workflow` (or any of the span decorators), or set
-`capture_mode=wardex.CaptureMode.ALL` to restore capture-everything behavior:
-
-```python
-wardex.init(..., capture_mode=wardex.CaptureMode.ALL)
-```
-
-**Responses over WebSocket (openai-agents `use_responses_websocket=True`).**
-This opt-in transport sends every call over one `wss://…/v1/responses`
-connection, and it is the one WebSocket case that ships under the default
-mode without a wrapper: once the first call crosses the connection it is
-an LLM connection, and when the connection closes wardex counts it
-(`interceptors.seam.ws_llm_semantics_unread`) and emits one
-`WS /v1/responses` span marked
-`ws_llm_semantics_unread` — LLM calls crossed it and wardex read none of
-them, because Responses events inside WebSocket frames are not parsed. The
-span carries `ws.messages.sent` (about one per call), byte counts and payload
-samples (compressed bytes, marked `payload_compressed`, when
-permessage-deflate was negotiated), no model or tokens; switch the framework
-to its default HTTP transport for `gen_ai` spans. A connection that ends
-before either side sent a WebSocket Close frame — a server drop, a timeout,
-process exit, or wardex uninstalled first — still yields the span,
-additionally marked `ws_no_close`. The connection counts as an LLM
-connection only when the host
-is the provider's own — exactly `api.openai.com` or a subdomain of
-`openai.com`; a host that merely contains the name, such as
-`openai-mock.corp`, is not — or when the first client message carries a
-Responses `"type": "response.create"` (anywhere in that message, whatever
-the key order) on an uncompressed connection. The decision is made once,
-on that first client message, for the life of the connection. A
-Responses-path connection
-to any other host (localhost, a gateway, a mock) with compression — the
-`websockets` client's default — is only counted
-(`interceptors.seam.ws_llm_endpoint_unconfirmed`) and yields no span under
-the default mode. Under `ALL`, under an `intercept_hosts` entry,
-or inside a local span that same connection does ship — but as an ordinary
-WebSocket span, `WS /v1/responses` with status OK and no
-`ws_llm_semantics_unread` marker (measured against a loopback server: one
-span, markers `['payload_compressed']` only) — so the counter is the only
-signal that unread LLM calls crossed it.
-
-Plaintext hosts you've explicitly named via `intercept_hosts` are always
-captured regardless of `capture_mode` — a targeted allowlist entry is a
-stronger opt-in than the default policy.
-
-**One thing is never captured, in any mode and above any allowlist:
-telemetry uploads.** Any host, any path ending in `/v1/traces/ingest` — the
-OpenAI Agents SDK POSTs its whole run record there by default. The rule is
-by path: a custom exporter endpoint (`BackendSpanExporter(endpoint=…)`) that
-keeps the `/v1/traces/ingest` path is covered; one on another path is not —
-under `ALL`, under `intercept_hosts`, or inside a local span it ships as an
-ordinary HTTP span with the run record as its `input_data`. That body is
-yours on its way to a tracing backend, not agent activity, so wardex skips the
-request before parsing it or attaching it to a span, and counts the skip
-under `interceptors.seam.path_excluded`. To be precise about where that
-body goes: the bytes pass through wardex's per-connection buffer like any
-other request's (capped by `LimitsConfig.max_body_bytes`), and are then
-discarded — never parsed, never on a span, never exported. If your own
-service exposes that path, its requests are skipped by the same rule.
-Server-side conversation state
-(`…/v1/conversations/…`) is plain HTTP rather than an LLM call — no model,
-no usage — so it follows the non-LLM rule above: captured inside a local
-span, under `ALL` or under `intercept_hosts`, otherwise dropped and counted
-under `interceptors.seam.provider_state_dropped`. With the OpenAI Agents
-SDK's `Runner.run(conversation_id=…)` (measured on 0.22) each turn is still
-a `chat` span, but its input is only the items the framework had not sent
-yet — the second turn's input is the tool result alone — and the
-`conversation` id that joins the turns is each `chat` span's
-`gen_ai.conversation.id`.
-
-## asyncio
-
-`wardex.flush(timeout=None)` and `wardex.close(timeout=None)` are synchronous
-and **block the calling thread** — a bare `flush()` waits as long as the
-transport's own configured timeout, a bare `close()` follows
-`batching.shutdown_timeout` (5s default). From async code, run them in an
-executor so the event loop keeps breathing:
-
-```python
-await asyncio.get_running_loop().run_in_executor(None, wardex.flush)
-```
-
-Capture itself never blocks your coroutines: spans are buffered, **parsed**
-and exported from wardex's own worker threads. The expensive step — the
-LLM-semantic parse of a completed response — runs on a dedicated
-`wardex-finalize-worker` thread with the GIL released, so a large streamed
-completion finishing does not stall the event loop; `flush()` finishes any
-pending parses before it sends (which is also why calling it from async code
-belongs in an executor, as above). `asyncio` tasks inherit the trace
-context automatically; only hand-started threads need
-`wardex.bind_context()` (above).
-
-## Errors
-
-The exception contract has exactly two tiers:
-
-* **Configuration time raises.** `init()` and the config classes raise
-  `TypeError` / `ValueError` on a bad argument, like any Python constructor —
-  a config mistake stops the program on the line that made it.
-* **Runtime never raises.** Every capture and export path is fail-safe:
-  nothing wardex does after `init()` returns raises into host code, and every
-  public call (`flush`, `close`, `set_tag`, the tracing helpers, ...) is a
-  safe no-op before `init()` was ever called.
-
-There is deliberately no `WardexError` base class — there is no wardex
-exception a host is ever expected to catch.
-
-## Diagnostics
-
-Everything wardex says about itself goes through the stdlib logger
-**`wardex_sdk`**. Out of the box it carries one pre-attached stderr handler,
-so with zero configuration you see one-line messages prefixed `[wardex] ` —
-announcements (the NoOp-transport notice, the `debug=True` config dump) at
-INFO, losses and failures (a span dropped over the size cap, an export cut
-off at shutdown) at WARNING. Some finer-grained lines — a disabled parser, a
-buffer-full drop count — additionally sit behind `debug=True`; the gate
-changes whether they fire, never their severity.
-
-To route diagnostics into your own logging setup, replace the handler — the
-`[wardex] ` prefix lives in wardex's own handler, so yours receives clean
-messages:
-
-```python
-import logging
-
-logger = logging.getLogger("wardex_sdk")
-logger.handlers.clear()
-logger.addHandler(my_handler)  # or logging.NullHandler() to silence
-```
-
-The logger does not propagate to the root logger, so nothing double-prints
-under `logging.basicConfig()`. A `wardex_sdk` logger you configure *before*
-importing wardex is left untouched. Configuration conflicts — a setting
-another setting disables — are not log lines but real warnings
-(`WardexConfigWarning`), filterable with the `warnings` module.
-
-**Counters.** Conditions a span cannot carry — a request wardex skipped, a
-WebSocket connection it only counted — are tallied in-process:
-`wardex_sdk._assembly.counters.snapshot()` returns `{site: count}`. This
-section's neighbours mention `interceptors.seam.path_excluded` (telemetry
-uploads skipped), `interceptors.seam.provider_state_dropped` (requests on a
-Conversations-API-shaped path the mode did not capture),
-`interceptors.seam.ws_llm_semantics_unread` (WebSocket connections that
-carried LLM calls wardex did not read),
-`interceptors.seam.ws_llm_endpoint_unconfirmed` (Responses-path WebSocket
-connections wardex could not corroborate),
-`protocol.http1.request_unobserved` (HTTP/1 responses whose request wardex saw
-none of: it was written where no `socket.socket` method carries it, such as
-`os.write` on the descriptor — counted, not shipped as a span),
-`protocol.http1.request_unfinished` (HTTP/1 responses that arrived before
-wardex saw their request end: the rest of it went out that way, such as a body
-sent with `os.sendfile`, or the server answered an upload early — the span
-ships as `HTTP ? /` with no request size, and the next request on the
-connection still gets its own span, whether that rest arrives late or never) and
-`interceptors.seam.peer_unresolved` (requests on a connection whose peer
-address wardex could not read: a unix socket, asyncio TLS under uvloop, trio
-TLS (httpx `AsyncClient` under trio included), a sync client's HTTPS call
-through an HTTPS proxy, or an async TLS connection opened before
-`wardex.init()`. Other async TLS on asyncio -- aiohttp, httpx `AsyncClient`,
-`AsyncOpenAI` -- has its peer read where the connection is set up and is not
-counted. The in-process span says port `0`, the URL renders `:0`, OTLP export omits `server.port` because 0 is proto3 "unset", and
-`peer_unresolved` in `wardex.limitations` is the marker to filter on);
-table-eviction counters are under
-Resource limits. `ffi.panic_converted` counts a panic in the Rust core that
-the FFI boundary turned into `NativePanic` -- a `RuntimeError`, so the guard
-around the host's call swallowed it -- on top of the site's own count.
-
-## Testing your instrumentation
-
-`RecordingTransport` is the in-process test double: exports are recorded, not
-sent, and read back as structural nodes.
-
-```python
-import wardex_sdk as wardex
-from wardex_sdk.testing import RecordingTransport
-
-transport = RecordingTransport()
-wardex.init(transport=transport)
-
-run_the_code_under_test()
-wardex.flush()
-
-names = [node.name for node in transport.spans]
-assert "execute_tool search" in names
-```
-
-`transport.spans` yields every recorded span in export order as `SpanNode`s
-(name, span/parent/trace ids, parent-resolution confidence, limitation
-markers). Note it records **pre-masking, in-process data** — what was
-captured, not what a backend would have received.
-
-## Bring your own transport
-
-`Transport` is the one advertised extension point: subclass it, implement
-`export()`, and pass an instance as `init(transport=...)`. An explicit
-`transport=` carries its own address and wins over `backend.endpoint` (the
-losing endpoint is announced with a `WardexConfigWarning`) — never configure
-both expecting both to apply.
-
-```python
-from wardex_sdk.transport import UNDELIVERED, Transport, Undelivered
-from wardex_sdk import Envelope
-
-
-class MyTransport(Transport):
-    def export(self, envelope: Envelope, *, timeout: float | None = None) -> Undelivered | None:
-        for body in self.encode(envelope):  # masked, capped, split OTLP bodies
-            post(body)  # one POST per body, in order
-        return None  # or UNDELIVERED if nothing was sent
-```
-
-The contract, in brief — `wardex_sdk.transport` is the complete implementer
-home (`Transport`, `NoOpTransport`, `ConsoleTransport`, `OtlpHttpTransport`,
-`Envelope`, `UNDELIVERED`, `Undelivered`, `CallerBudget`, `DEFAULT_TIMEOUT`):
-
-* **Threading:** `export` / `flush` / `close` are called from wardex's own
-  worker thread, never from your event loop or request threads, and may block
-  up to their budget. That is the cross-language contract (Node binds
-  `export` as async and its pipeline awaits it; Java stays blocking).
-* **The envelope is opaque.** Its guaranteed surface is `span_count` and
-  `Transport.encode(envelope)`, which returns the wire bodies — protobuf,
-  gzipped by default, PII-masked, attribute-capped, and split at
-  `max_otlp_request_bytes`. `export()` itself receives **pre-masking** data:
-  serialize the envelope yourself and you own PII masking. Do not override
-  `encode()`.
-* **Declines:** return `UNDELIVERED` only when the envelope was not put on
-  the wire and an identical later attempt could succeed; the SDK then keeps
-  the spans for the next drain. Anything else (including `None`) means
-  "taken".
-* **Timeouts:** `timeout` is the remaining budget for this export (`None` =
-  no deadline); honour it by narrowing your own configured timeout, never
-  widening it. Declare how long a bare `flush()` should wait via the
-  `export_timeout` attribute. `CallerBudget` (a `float` subclass marking
-  budgets the application named) is a Python-only diagnostic refinement, not
-  part of the cross-language SPI.
-
-`ConsoleTransport` prints envelopes **raw — pre-masking — to stdout**; it is a
-local debugging tool, never an export path.
-
-### `before_send_envelope`
-
-The last-look hook before an export: `init(before_send_envelope=hook)` with
-`hook(envelope) -> Envelope | None`. Return the **received** envelope object
-to send (in v1 the only legal non-None return is that same object), or `None`
-to drop the batch. It is synchronous, sees **pre-masking** data (masking runs
-after it, inside the encoder), may run more than once for a batch a transport
-declined, and a raise inside it drops the batch fail-closed with one
-diagnostic line (traceback under `debug=True`).
+  data before masking.
 
 ## Status
 
-**Works today**
-- Zero-instrumentation capture of LLM HTTP calls (OpenAI, Anthropic) over
-  `https`, cleartext `http`, and h2c — Chat Completions, the **Responses API**
-  (the openai-agents SDK's default path, non-streaming and SSE, plus
-  `/v1/responses/compact`), Embeddings, and Anthropic Messages. Cleartext
-  capture reads the bytes Python's `socket.socket` methods carry: synchronous
-  clients, and async ones on asyncio's default event loop on Linux and macOS,
-  whatever the request size (from Python 3.12 asyncio sends most of a large
-  request through `sendmsg`, which is read too). It does not see cleartext
-  under uvloop or the Windows proactor event loop, which write and read the
-  socket themselves, nor a request body sent with `os.sendfile`. A response
-  whose request wardex did not see whole is never paired with another request:
-  it is counted instead (`protocol.http1.request_unobserved`,
-  `protocol.http1.request_unfinished`, see [Diagnostics](#diagnostics))
-- `gen_ai` semantics: model, tokens, parameters, finish reasons, input/output messages
-- **Open usage capture**: every scalar leaf of the provider's `usage` object
-  rides the span as `wardex.usage.<provider path>`, spelling preserved — a new
-  billing counter (a cache-write tier, a web-search charge, a thinking tier)
-  appears in your data the day the provider ships it, without an SDK release.
-  Bounded by `max_extra_keys` (default 64; a real usage object has 10–20
-  leaves), and a crossed bound says so: marker `extra_keys_dropped` plus
-  `wardex.usage_leaves.dropped_count`
-- Failed provider calls (429 rate limits, 401s, 5xx) are captured with the same
-  `gen_ai` identity and content as successful ones — only the response-side
-  fields are empty
-- Transport metrics: TCP connect and TLS handshake time, time to the first
-  response byte and to the first body byte, transfer time (milliseconds),
-  request and response size, connection id and reuse, and whether the
-  response was a Server-Sent Events stream — over OTLP as
-  `wardex.transport.timing.*` and `wardex.transport.*`, and in the envelope's
-  transport block. **The `wardex.transport.*` names are reserved** for these
-  values: an attribute your code sets under one of them is replaced on OTLP
-  export by the value the SDK observed, or left out where it observed none,
-  so the names never carry a reading the SDK did not make; each such
-  attribute is counted under `transport.otlp.reserved_attribute_overwritten`
-  and said once per process. `wardex.transport.connection_id` is never
-  masked: it is the SDK's own `str(id(socket))`, fifteen digits on 64-bit
-  Linux, the shape of a card number. A TLS handshake is timed from its first `do_handshake()`
-  attempt to the one that completed it, so a non-blocking one an event loop
-  drives counts whole. On a pooled connection the connect time is `0`, and so
-  is the handshake over TLS (`connection_reused` is true: the call opened
-  nothing); on HTTP/2 the stream the connection was opened for, stream 1,
-  carries them. A size is the body as sent (content-coded, without chunk
-  framing); for a WebSocket session, the payload bytes each way until a Close
-  frame has crossed each way or the socket closed, and its length (transfer
-  time) runs from the upgrade request to that end; for MCP
-  stdio, the params and the result or error as the SDK captures them,
-  re-encoded as compact JSON — a server's whitespace and needless `\u`
-  escapes are not counted, so this is not the byte count on the pipe. For
-  MCP stdio the first-byte time is the time until its response message was
-  read.
-  Only what was measured whole is sent, and the rest carries no key rather
-  than a `0`: a connect time the seam could not time (a plaintext connection
-  opened by asyncio, whose non-blocking connect returns before the handshake
-  does; an `anyio`/httpx TLS connection; an asyncio `create_connection` handed
-  an already connected socket, as aiohttp does, or a host name to resolve;
-  one opened before `init`; each marked `connect_timing_unavailable`); a TLS
-  handshake on a plaintext connection, one begun before `init`, or one
-  OpenSSL completed with no `do_handshake()` call to time; the first-byte and
-  transfer times of an HTTP/2 stream; the size of a body that went past its
-  capture limit (marked `body_cap_exceeded` on HTTP/1; on HTTP/2 the span is
-  marked truncated), of an HTTP/2 request the SDK lost before capturing it
-  (marked `h2_request_evicted`), of a request the SDK had not seen end when
-  its response did (an HTTP/1 request it had not finished reading; an HTTP/2
-  request with no END_STREAM yet, such as an upload the server refused
-  part-way or a client-streaming gRPC call it ended with a status), and of a
-  WebSocket direction whose frame parser stopped (marked
-  `frame_parse_failed`); the length and sizes of a WebSocket session the SDK
-  stopped following while it was still open (at `wardex.close()`, marked
-  `ws_no_close` unless a Close frame had crossed, or when its connection
-  table was full, marked `connection_evicted`); and everything about a
-  WebSocket session but its length and sizes. A WebSocket session cut while
-  still open (at `wardex.close()`, or `connection_evicted`) has a span that
-  ends at the cut, so the span's duration is not the session's length.
-  Connection reuse is `false` only on a connection the SDK saw open; on one
-  opened before `init`, the first request it sees (on HTTP/2, stream 1)
-  carries none. A response is a stream when it declared `text/event-stream`
-  or its body read as one (for a body cut by its capture limit, as sent or
-  once inflated: see Compressed bodies, when the part the SDK read shows
-  event lines), and not a stream when it declared none and its whole body
-  read as something else; with no declaration, a cut body whose part read
-  shows no event line, a body in a `Content-Encoding` the SDK does not
-  inflate (it inflates one gzip or zlib layer; `br`, `zstd` and raw deflate
-  stay unread, whatever their bytes look like), or one that is not text
-  (binary) says neither
-- gRPC (grpclib), WebSocket (`wss`;
-  a Responses-over-WebSocket connection is captured at close and marked
-  `ws_llm_semantics_unread` when the host is `api.openai.com` or a subdomain
-  of `openai.com` — on any other host with compression it is only counted,
-  see capture_mode), MCP stdio (`mcp.method.name` and `jsonrpc.request.id`
-  over OTLP)
-- Export to any OpenTelemetry backend via `OtlpHttpTransport`
-- Manual span decorators: `@workflow` / `@agent` / `@step` / `@tool`
-- PII masking on by default: emails, phone numbers, credit cards (Luhn-verified),
-  US SSNs, IP addresses, bank routing numbers, IBANs, credential-shaped values,
-  and any value passed under a secret argument name (`api_key`, `password`,
-  `X-Amz-Signature`, …) are masked before anything leaves the process, and each
-  masked span says what was replaced and why — see
-  [Masking](#masking-secrets-and-personal-data) (`pii=PIIConfig(mode=PIIMode.OFF)`
-  to disable, `pii=PIIConfig(disabled_categories={PIICategory.IP_ADDRESS})` for
-  per-category opt-out)
-- Background batching: automatic flush every 5s / on buffer threshold /
-  at exit and on SIGINT/SIGTERM (chained; opt out with
-  `batching=BatchingConfig(flush_on_signals=False)`)
-- Shutdown closes agent runs that are still in flight, so an interrupted run
-  still exports its span — marked `unit_interrupted` or `adapter_uninstalled`
-  — instead of vanishing along with its open tool calls
-- Framework adapter: Anthropic Agent SDK (`claude_agent_sdk`) — auto-detected,
-  zero-instrumentation `invoke_agent`/`chat` spans with tool-call correlation
-- Framework adapter: **LangGraph** (`langgraph>=1.2`) — auto-detected, no
-  callbacks and no `LangChainTracer`. One `invoke_workflow` span per graph run,
-  one `execute_step` span per node (all retries of a node inside ONE span), one
-  `execute_tool` span per tool call dispatched by a `ToolNode`, and every LLM
-  and HTTP call underneath parented by in-process context propagation rather
-  than by a framework `run_id`. Covers `invoke`/`stream`/`ainvoke`/`astream`/
-  `batch`/`abatch`, the functional API (`@entrypoint`/`@task`), subgraphs, and
-  agents built with either `langgraph.prebuilt.create_react_agent` or
-  `langchain.agents.create_agent`. `interrupt()` and `Command(goto=…,
-  graph=PARENT)` are recorded as control flow, not as failures. A
-  `RemoteGraph` (LangGraph Platform) call ships one `invoke_workflow` span
-  marked `wardex.langgraph.remote`, with the platform HTTP request underneath;
-  the remote run's internals execute out of process and are not captured. A
-  cached node ships no span — no work ran. A run's `thread_id` — from the
-  call's config, bound with `graph.with_config(...)`, or carried by the
-  config of whatever encloses the call, merged as LangGraph merges them — is
-  recorded as `wardex.langgraph.thread_id` and is the run's
-  `gen_ai.conversation.id` unless the run sits inside your own
-  `wardex.conversation(...)`. With a checkpointer, a later top-level run on
-  the same thread in the same process links `resumed_from` to the previous
-  one; a subgraph inherits its parent's thread and links nothing, and so
-  does a run without a checkpointer. The link is keyed by the thread id
-  alone — a checkpointer object is no identity for a thread, since one built
-  per request over the same database resumes it — so runs that keep that
-  id's state in different checkpointers still link as turns of one thread:
-  two graphs compiled with separate checkpointers that share a thread id, or
-  a subgraph with a checkpointer of its own under the parent's thread id
-  that a node starts on a plain worker thread (no context copied), or
-  defers through a wrapper (`astream_events`, `with_retry()`, a
-  `functools.partial`) that calls the graph only after the node returns. A
-  run belongs where the graph's own `stream()`/`astream()` is called, so a
-  `graph.stream` a node hands you, called later at top level, links as a
-  turn. A node
-  span's `wardex.step.index` is LangGraph's superstep number on that
-  checkpoint thread, not the node's position in the run: a second turn on
-  one thread continues the count (and the input and `__start__` supersteps
-  take numbers no node span carries).
-- Framework adapter: **OpenAI Agents SDK** (`openai-agents>=0.22,<0.23`) —
-  auto-detected, hooked through the framework's own `TracingProcessor` and
-  its three public `Runner` entry points (wrapped only to read the run's
-  `conversation_id`, which the framework never hands its trace), nothing
-  internal patched. One `invoke_workflow` per `Runner.run` /
-  `run_sync` / `run_streamed`, one `invoke_agent` per agent, a
-  `handoff {from}→{to}` marker with the receiving agent as the sender's
-  sibling (not nested — `wardex.agent.parent` and a `handoff_from`
-  link carry the causality), one `execute_tool` per function tool with the
-  call id recovered by a unique match against the response that requested it
-  (labelled `wardex.openai_agents.tool_call_id_source`), one `evaluate` per
-  guardrail, and `RunConfig(group_id=…)` as `gen_ai.conversation.id` on
-  every adapter span — unless the run sits inside the host's own
-  `wardex.conversation(...)`, in which case the host's id stays on every
-  span and the group id rides along on the root as
-  `wardex.openai_agents.group_id`. With no `group_id`, the
-  `conversation_id=…` passed to `Runner.run` / `run_sync` / `run_streamed`
-  (or recorded in the `RunState` a run resumes from) is the run's
-  conversation id the same way, host's id first. With both, the group id
-  stays the conversation and the requests' own id rides along on each LLM
-  call as `wardex.openai.conversation_id`. Under your own
-  `with trace(...)` around one or more runs, the root is your trace's and
-  carries no run's id; each run's agents, tools, handoffs and LLM calls
-  carry its own. The LLM calls stay the wire's `chat` spans, parented
-  under the agent by context and carrying the run's conversation id; the
-  adapter discards the framework's usage so nothing is billed twice. By
-  default the framework's own upload to
-  `api.openai.com/v1/traces/ingest` continues unchanged; wardex does not
-  replace it. For the structure without that upload, IN THIS ORDER:
-  `agents.set_trace_processors([])` and THEN `wardex.init()` (the reverse
-  order removes wardex's processor too). `RunConfig(workflow_name=…)` names
-  the root; the default is `Agent workflow`. Runnable end to end in
-  [`examples/openai_agents_quickstart.py`](examples/openai_agents_quickstart.py)
-  (see [Works with openai-agents](#works-with-openai-agents)). Known limitations: the wire
-  `chat` spans carry no `gen_ai.agent.name` — filter by walking up the tree
-  to the `invoke_agent` span; a Responses-over-WebSocket run stays the
-  counted, marked connection (`ws_llm_semantics_unread`) with no structure
-  read from the frames; with the framework's tracing
-  disabled wardex logs one INFO line at install and shows only the LLM calls;
-  a `max_turns` handled by
-  `error_handlers` still ships ERROR on the agent and the root (the
-  framework marks the span before consulting the handler); and with
-  `trace_include_sensitive_data=False` the tool span carries the
-  `tool_call_id_unavailable_in_process` marker rather than a call id.
+Available today: the Python SDK, the three framework adapters above, OTLP
+export to any OpenTelemetry backend, and masking on by default. Not yet: an
+adapter for plain LangChain LCEL chains, and SDKs for Node/TypeScript and Java.
 
-**Not yet (see Roadmap)**
-- A LangChain adapter for plain LCEL chains (`prompt | model | parser`) and
-  tools invoked outside a graph — those produce no structural spans today, and
-  a LangChain-built *agent* is covered by the LangGraph adapter above because
-  `create_agent` compiles to a `Pregel` graph
-- Node/TS and Java SDKs
-
-**Notes**
-- After `os.fork()` the SDK reinitializes its per-process state in the child
-  via `os.register_at_fork`: the inherited span buffer and any pending parse
-  jobs are discarded (the parent still owns and exports them, so each span
-  ships exactly once), locks and the worker threads are recreated, per-connection/per-session tracking
-  tables are reset (a span assembled on a connection that crossed the fork
-  carries the `tracking_reset_at_fork` marker), and every batch stamps the
-  live `process.pid`, so a parent and its forked children are distinguishable
-  at the backend. `multiprocessing` fork children flush their tail on exit; a
-  hand-rolled `os.fork()` + `os._exit()` child should call `wardex.flush()`
-  before exiting. `spawn`/`forkserver` start methods launch a fresh
-  interpreter and are unaffected. Under uWSGI enable threads
-  (`--enable-threads`).
-
-## Resource limits
-
-Every resource bound in the SDK — body size caps, buffer sizes, connection
-and session tracking — is configurable through `limits=LimitsConfig(...)`, but
-the defaults suit most workloads and most users never need to touch this. The
-body cap is set above the Anthropic Messages API's request size ceiling, so a
-request the API itself accepts is never truncated by capture.
-
-```python
-import wardex_sdk as wardex
-from wardex_sdk import LimitsConfig
-
-wardex.init(
-    limits=LimitsConfig(
-        max_body_bytes=64 * 1024 * 1024,  # larger multimodal payloads
-        max_buffer_bytes=16 * 1024 * 1024,  # tighter memory budget
-    )
-)
-```
-
-The deferred-parse queue has its own pair: `max_parse_backlog` (2048) and
-`max_parse_backlog_bytes` (64 MiB) bound how many completed-but-unparsed
-transactions may wait for the finalize worker. Over either bound, the OLDEST
-waiter ships immediately without its `gen_ai` block, carrying the
-`parse_backlog_full` marker — never silently — and a transaction still
-pending when a shutdown budget runs out ships the same way under
-`parse_skipped_at_shutdown`. Resident memory is therefore at most one
-backlog plus one span buffer.
-
-**`max_body_bytes` bounds two quantities, and only one of them is a message.**
-Besides capping a captured request or response body, it caps the bytes ONE
-logical unit accumulates from its adapter-side records — a tool call's input
-and output, an agent turn's payload — and the shaping budget an adapter derives
-from that cap so it stops building a representation exactly where storage would
-cut. Lowering it therefore lowers resident memory per live unit, which is the
-reason to lower it. Raising it raises that memory: the worst case is about
-`2 x max_body_bytes` per live unit, and the ceiling on live units is
-`max_units x max_entries_per_unit`, not `max_units` — `max_buffer_bytes` bounds
-the span buffer and does not cover a unit that is still open.
-
-Raising it also raises a TRANSIENT cost that is paid on your own thread. The
-LangGraph adapter shapes a tool call's arguments synchronously inside the tool
-call, and building that representation peaks near four times the cap for
-escape-heavy text: measured at 128 MiB peak / 65 ms for one 64 MiB string
-argument at the 32 MiB default, and 256 MiB / 135 ms at the 64 MiB setting
-suggested above. Raise it for payloads you want captured whole, not by reflex.
-
-**Two of the bounds are about the wire rather than about capture.** The OTLP
-surface encodes binary payloads as base64, so what leaves is up to a third
-larger than what was captured, and an OTLP request is accepted or rejected
-whole — a batch over the receiver's body limit does not arrive short, it does
-not arrive.
-
-* `max_otlp_attribute_bytes` (1 MiB) caps one attribute value as it appears on
-  the wire. A value over it is truncated and the span says so with an
-  `otlp_attribute_truncated` marker in `wardex.limitations`.
-* `max_otlp_request_bytes` (4 MiB, gRPC's own receive ceiling) caps one
-  request, measured both as the compressed body that goes on the wire and as
-  the message it decompresses to — receivers check both. A batch over either is
-  split across several POSTs instead of being sent whole and rejected. Raise it
-  if your collector accepts more.
-
-  A split is invisible in your traces, but that is the receiver's doing rather
-  than the SDK's: the POSTs carry the same trace id, and a receiver keys spans
-  by it, so what was one batch is stored and shown as one trace. Children
-  routinely arrive in earlier requests than the parent they name — spans leave
-  in completion order, so the root travels last — and a conforming receiver
-  resolves the edge when the parent lands. A span so large it would not fit a
-  request even with its payload removed is the one loss a split cannot absorb:
-  it is dropped, the rest of its batch still goes, and the SDK says so on the
-  diagnostic channel — once per process, at the first occurrence, with a count
-  that covers that batch and is not a running total. That loss cannot be marked
-  in `wardex.limitations` the way a truncation is, because the marker would
-  have to ride on the very span that never reaches the wire.
-
-Requests are gzipped by default. `OtlpHttpTransport(..., compress=False)` turns
-that off for a proxy or receiver that mishandles `Content-Encoding`.
-
-**`max_extra_keys` (64) bounds one open key family today: the provider-usage
-mirror.** `wardex.usage.*` is the one attribute family whose keys the provider
-names rather than wardex, so it is the one place a pathological body could mint
-unbounded keys. Lowering the knob prunes usage leaves only — every other
-attribute is untouched — and a span that lost leaves carries
-`extra_keys_dropped` with the count beside it as
-`wardex.usage_leaves.dropped_count`. The normalized `gen_ai.usage.*` totals are
-extracted separately and are never subject to this cap. (For scale: the mirror
-adds ~5–10 attributes to an LLM span, and the richest span the test corpus
-produces carries 47 attributes total against the OTel Collector's default
-`attribute_count_limit` of 128.)
-
-`max_units`, `max_entries_per_unit` and `max_session_entries` were on that list
-until the logical-unit registry and the Agent SDK assembler became their
-consumers. What crossing one of them looks like from your data depends on
-whether the evicted entry has a span of its own.
-
-**Evictions you can see in your traces.** A root unit evicted at `max_units`, a
-child unit or an in-flight span evicted at `max_entries_per_unit`, and an open
-tool call or a sub-agent evicted at `max_session_entries`, are each closed and
-**exported**, marked `unit_evicted`, `unit_table_full` or
-`session_entry_table_full`. Outgrowing one of these ceilings shows up as marked
-spans rather than as traces that quietly stop appearing. Each marker names the
-one knob that produced it, so the marker tells you which number to raise.
-
-A span evicted at `max_session_entries` carries status **unset** rather than
-`ok` or `error`: wardex stopped watching before the call's outcome, so `ok`
-would claim a success it never observed and `error` would report wardex's own
-full table as a failure of your agent.
-
-**One call, two observations.** If an evicted tool call later completes, its
-completion is reported as a *second* span with the same `gen_ai.tool.call.id`,
-also marked `session_entry_table_full`, and the two overlap: the `unset` one is
-`[start, evicted]` and holds the call's input, the other is `[start, end]` — the
-whole call — and holds its output. **When you aggregate tool latency, exclude
-the spans that carry `session_entry_table_full` AND status `unset`,** or you
-count that call twice.
-
-**Evictions you cannot.** The two per-table knobs also bound bookkeeping tables
-whose entries are not spans — the lookup aliases that map a framework's own
-identifiers onto units, the keys that de-duplicate two observers of one event,
-the table of
-in-process MCP servers wardex has wrapped, and the streamed tool metadata the
-assembler holds until a result arrives. Evicting from any of them exports
-nothing, because there is no span to mark. They are counted internally instead —
-`wardex_sdk._assembly.counters.snapshot()` reports them under
-`assembly._units.alias_table_full`, `assembly._units.claim_table_full`,
-`adapters.anthropic.server_table_full` and
-`adapters.assembler.stream_tool_meta_table_full` — and what reaches your data is
-the consequence rather than the eviction. A dropped de-duplication key, or a
-dropped server handle, can let one tool call be reported twice. A dropped
-streamed metadata entry costs a tool call its byte-exact input, and if no hook
-observed that call, its span entirely.
-
-A dropped **alias** is the one to know about, because its consequence would
-not look like a loss. That identifier stops resolving, so the parent is decided
-one rung further down — and the rung below an alias match (confidence 0.9) is
-the ambient wardex span, which for a sub-agent is usually its enclosing
-session, at 1.0. Unmarked, the sub-agent's subtree would flatten into the
-session while the confidence went up. So wardex remembers which identifiers the
-bound dropped (per unit, as many as the alias table holds, oldest forgotten
-first), and a span whose parent was looked up by one of them, and whose edge
-the loss actually changed, arrives marked **`alias_forgotten`**. Where it lands
-depends on the path. A span the registry resolves goes to the only live session
-(0.5, also marked `unit_inferred_sole`) when there is exactly one, otherwise to
-the ambient span at no more than 0.9 (0.8, also marked `correlation_conflict`,
-when that span is in another trace), otherwise unparented (also marked
-`parent_unresolved`). A span an adapter reopens under that identifier keeps the
-parent its declared placement gives it, capped at 0.9, and so does every later
-lookup of the identifier while the unit it named is still live. When the loss
-changed nothing, nothing is marked. For an adapter reopening a span, that is a
-live scope that is the identifier's own unit or anything below it. For a span
-the registry resolves, it is an ambient span in the same trace that is not
-above that unit (the unit itself, anything below it, or anything beside it):
-the identifier, still held, would have given that same parent at 1.0. (One
-case is marked although the parent is the same: with no ambient span, an
-identifier that named the only live session itself gets that session at 0.5,
-where it gave 0.9.) An identifier some other unit binds again is no longer
-counted as dropped, just as a larger table would have handed it over; only the
-span an adapter reopens under it keeps the record standing.
-Each marked span also counts `assembly._units.alias_forgotten_consumed`. If you
-see the marker, raise `max_entries_per_unit`. The behaviour is pinned by
-`sdks/python/tests/test_units.py::test_a_forgotten_alias_marks_the_next_edge_instead_of_flattening_silently`.
-
-The evictions that DO reach your traces are counted as well, so you can see one
-coming before it is a shape in your data:
-`adapters.assembler.open_tool_table_full` and
-`adapters.assembler.subagent_table_full` for the two `max_session_entries` sites
-that emit, plus `adapters.assembler.tool_completion_after_evict` for the second
-half of a call the first one closed.
-
-Which number to raise depends on which counter moved.
-`assembly._units.*` and `adapters.anthropic.server_table_full` are
-`max_entries_per_unit`; every `adapters.assembler.*_table_full` is
-`max_session_entries`. The two are separate fields — the core limits table
-calls the first a generalization of the second, but raising it leaves the second
-exactly where it was.
-
-## Quality budgets
-
-Several of the claims on this page are numbers, and a number nobody re-measures
-becomes a wish. The ones that guard this SDK's cost to your process are pinned
-by tests you can run against a clone, without taking our word for any of them:
-
-| Where | What it holds |
-|---|---|
-| `sdks/python/tests/test_quality_ratchets.py` | The panic surface of the Rust core and of the FFI layer, module size, undocumented public names, skip markers, and the wheel's runtime dependency count. Each is a recorded number that the test allows to move in one direction only |
-| `sdks/python/tests/test_import_purity.py` | `import wardex_sdk` starts no thread, patches no socket attribute, reads no environment variable, and loads no provider module; a disabled SDK, once closed, leaves none of those behind either. Both halves run in subprocesses so nothing another test did can mask the result |
-| `sdks/python/tests/test_import_graph.py` | The layer ranks in AGENTS.md are the real import graph, and the architecture diagram there is the same fact as the table the test enforces |
-| `scripts/quality-snapshot.sh` | Prints every one of those numbers for the current tree as JSON. It reads the source only — no venv, no `cargo`, nothing imported from the built package — so a stale wheel cannot change a number it reports. CI runs it on every push and records the output in the run log, where it gates nothing |
-
-Two of those numbers are worth reading before you plan around them. The Rust
-core holds 172 `unwrap()`/`expect(` call sites, which may only fall; the FFI
-layer in `bindings/python/src` holds zero and may never hold one, because a
-panic there is the one that reaches your interpreter; and every entry point in
-that layer runs inside a shield that converts a panic beneath it into an
-ordinary `RuntimeError` before PyO3 can raise it as a `BaseException` no guard
-catches (`sdks/python/tests/test_ffi_panic.py`). Where a budget is higher
-than we would like, the number says so rather than the prose hiding it.
-
-## Versioning
-
-Version semantics, what 0.x betas may break, the deprecation mechanism, and
-how the SDKs and the wire schema version relative to each other are recorded
-in [VERSIONING.md](VERSIONING.md). `wardex_sdk.__version__` is the canonical
-runtime version probe.
-
-## Roadmap
-
-1. ~~PII masking (pre-send safety)~~ — shipped
-2. ~~Batching & lifecycle (background worker, at-exit/periodic flush, concurrency)~~ — shipped
-3. ~~Distributed propagation (W3C)~~ — shipped
-4. Framework adapters — ~~Anthropic Agent SDK~~ shipped; ~~LangGraph~~ shipped;
-   ~~OpenAI Agents SDK~~ shipped; LangChain (non-graph runnables) next
-5. Node/TS and Java SDKs
-
-> PII masking caveats: `before_send_envelope` sees pre-masking data (masking runs inside
-> the encoder), the Console transport prints raw (local debugging only),
-> non-UTF-8 binary payloads pass through unmasked, no category matches a user
-> name inside a file path (a tool argument or an error message can carry one; a
-> decorator's call site does not, see Tracing), and a secret with neither a
-> secret name nor a credential shape passes (see
-> [Masking](#masking-secrets-and-personal-data)).
+`wardex_sdk.__version__` reports the installed version. Version semantics and
+the deprecation policy are in
+[VERSIONING.md](https://github.com/wardex-labs/wardex-sdk/blob/main/VERSIONING.md);
+release notes are in
+[CHANGELOG.md](https://github.com/wardex-labs/wardex-sdk/blob/main/CHANGELOG.md).
+To build from source or contribute, see
+[CONTRIBUTING.md](https://github.com/wardex-labs/wardex-sdk/blob/main/CONTRIBUTING.md).
 
 ## License
 
-Apache-2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
+Apache-2.0. See [LICENSE](https://github.com/wardex-labs/wardex-sdk/blob/main/LICENSE)
+and [NOTICE](https://github.com/wardex-labs/wardex-sdk/blob/main/NOTICE).
 
 "Wardex" is a trademark of Wardex Labs.

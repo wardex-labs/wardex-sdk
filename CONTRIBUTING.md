@@ -27,7 +27,7 @@ Then read what your change did to the recorded numbers:
 bash scripts/quality-snapshot.sh
 ```
 
-It prints the budgets described under "Quality budgets" in `README.md` as JSON,
+It prints the quality budgets as JSON,
 from the source tree alone. The tests enforce the ones that may only move one
 way, so a wrong-way move is already a red suite; the snapshot is for the other
 half of the question, which no command can answer for you — whether the change

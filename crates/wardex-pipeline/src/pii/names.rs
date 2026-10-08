@@ -882,7 +882,7 @@ mod tests {
         }
     }
 
-    /// The README's "what masking does not catch" list, pinned: if one of
+    /// The documented limits of masking, pinned: if one of
     /// these starts being masked, the documentation is what has to change.
     #[test]
     fn documented_limits_are_real() {

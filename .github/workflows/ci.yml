@@ -98,8 +98,7 @@ jobs:
           scripts/check-buf-exceptions.sh ".git#format=git,ref=$BUF_BREAKING_BASE"
 
       # The quality budgets, printed into the run log so anyone reading a public
-      # CI run can recover the numbers behind the claims in README.md without a
-      # checkout. The step decides nothing, and `if: always()` plus
+      # CI run can recover the numbers without a checkout. The step decides nothing, and `if: always()` plus
       # `continue-on-error` are deliberate: it reports even after a gate above
       # has failed, and it can never itself turn a build red. What ENFORCES the
       # budgets is `sdks/python/tests/test_quality_ratchets.py`, collected by
