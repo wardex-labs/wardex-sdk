@@ -193,11 +193,14 @@ Adapters are detected automatically when the framework is installed;
 ```python
 import wardex_sdk as wardex
 
+
 @wardex.agent(name="researcher")
 def research(question: str): ...
 
+
 @wardex.tool(name="search")
 def search(query: str): ...
+
 
 with wardex.conversation("support-chat", id="session-123"):
     research("Which plan includes SSO?")
