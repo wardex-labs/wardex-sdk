@@ -150,13 +150,12 @@ When two settings name different destinations, the one that loses is announced
 with a `WardexConfigWarning`. The `api_key` rows are on the main branch and
 are not available in the current release.
 
-## A real trace in under a minute
+## See a real trace
 
 The [openai-agents example](https://github.com/wardex-labs/wardex-sdk/blob/main/examples/README.md)
 runs two agents, a function tool and a handoff against a local Phoenix,
-started with one `docker run` as its walkthrough shows. From a fresh clone,
-with the Phoenix image already pulled, the terminal part measured under a
-minute.
+started with one `docker run` as its walkthrough shows. The script makes six
+short `gpt-4o-mini` calls against your OpenAI key.
 
 ```bash
 git clone https://github.com/wardex-labs/wardex-sdk && cd wardex-sdk
