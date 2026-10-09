@@ -27,12 +27,20 @@ import wardex_sdk
 #:   from `LlmSemantics.usage` (Rust-normalized).
 #: * `_adapters/_assembler.py` — the P3 chat draft; usage comes from
 #:   `AgentStreamEvent` (Rust-normalized).
+#: * `_adapters/_codex_exec.py` — two Codex sites, never both on one run.
+#:   Without the bridge, the run's own span carries the turn total from
+#:   `CodexExecEvent` (Rust-normalized, `InputConvention::Inclusive`). With
+#:   it, each chat's usage comes from
+#:   `_codex_otel.CodexCall`, read off Codex's own `gen_ai.usage.*` span
+#:   attributes, whose `input_tokens` already includes the cached part —
+#:   measured: the calls' usages sum exactly to the stream's turn total.
 #:
 #: (`dataclasses.replace` on an existing block is not a construction site:
 #: it can only start from a block one of these two produced.)
 _FROZEN_SITES = {
     "_semantics/_genai.py": 1,
     "_adapters/_assembler.py": 1,
+    "_adapters/_codex_exec.py": 2,
 }
 
 

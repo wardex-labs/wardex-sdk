@@ -423,6 +423,18 @@ enum Limitation {
   //    nothing disagreed; the evidence is only weaker than an exact fit.
   LIMITATION_OTEL_BRIDGE_JOIN_TOLERANT = 52;
 
+  // -- A CLI agent run observed as a subprocess, whose output stream names
+  //    neither the model nor how many times it was asked (`codex exec --json`:
+  //    one usage total per turn, no model, and not every tool call). Rides the
+  //    run's INVOKE_AGENT span, which then carries the turn's total usage; no
+  //    CHAT span ships, since none could say it was one call. Reader's next
+  //    action: enable the adapter's OTel bridge
+  //    (`CodexExecConfig(otel_bridge=True)`), which reads per-call model, usage
+  //    and timing from the CLI's own traces. Not
+  //    TRANSPORT_TIMING_UNAVAILABLE_SUBPROCESS (26): that says a call's TIMING
+  //    is the IPC stream's; this says the calls themselves were never seen.
+  LIMITATION_SUBPROCESS_MODEL_CALLS_UNOBSERVED = 55;
+
   // A META value, not vocabulary — hence the separate number band. It means
   // "the sending SDK held a marker this schema has no value for", and it always
   // travels with the original string in `Span.extra["wardex.limitation.unmapped"]`.

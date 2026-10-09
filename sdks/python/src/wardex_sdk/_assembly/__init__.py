@@ -62,7 +62,13 @@ What lives here, and the duplication each module exists to remove:
 not here yet. `__all__` grows as modules land and does not shrink.
 """
 
-from .._types import AgentAttributes, ConversationContext, EvaluationAttributes, ToolAttributes
+from .._types import (
+    AgentAttributes,
+    ConversationContext,
+    EvaluationAttributes,
+    GenAIAttributes,
+    ToolAttributes,
+)
 from ._builder import NULL_DRAFT, OTEL_ERROR_TYPE_OTHER, IntegrityBuilder, SpanDraft
 from ._diag import Counters, counters, diag_info, diag_warning, guard, report_once
 from ._drops import (
@@ -125,6 +131,7 @@ __all__ = [
     "EMPTY_AMBIENT",
     "EvaluationAttributes",
     "Evidence",
+    "GenAIAttributes",
     "IntegrityBuilder",
     "Limitation",
     "LinkReason",

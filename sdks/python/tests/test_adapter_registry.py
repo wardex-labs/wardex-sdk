@@ -153,14 +153,16 @@ def test_auto_detection_installs_when_package_present():
     get_registry().uninstall_all()
     with (
         mock.patch("wardex_sdk._adapters._detect_package", return_value=True),
+        mock.patch("wardex_sdk._adapters._detect_executable", return_value=True),
         mock.patch("wardex_sdk._adapters._make_adapter") as make,
     ):
         make.return_value = _FakeAdapter()
         install_configured_adapters(None, _config(None))
-        # EVERY registered row, in order — not a single named one. `_detect_package`
-        # is patched True for all of them here, so an assertion naming one adapter
-        # fails unconditionally on the next registration rather than only where
-        # that framework happens to be installed. This spelling never goes stale.
+        # EVERY registered row, in order — not a single named one. Detection —
+        # by module and by CLI on PATH — is patched True for all of them here,
+        # so an assertion naming one adapter fails unconditionally on the next
+        # registration rather than only where that framework happens to be
+        # installed. This spelling never goes stale.
         assert make.call_args_list == [mock.call(name) for name in _DETECT_PACKAGES]
     get_registry().uninstall_all()
 

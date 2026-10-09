@@ -8,28 +8,23 @@ INTERNALLY, on the calling carrier, at the instant of the call — so the questi
 "how did I know this was the parent" has one answer for every adapter that will
 ever exist, and an adapter author cannot get it wrong by trying harder.
 
-That is the product claim expressed as a type rather than as a rule. wardex
-builds its causal tree from in-process context propagation; competitors rebuild
-it from the `run_id`/`parent_run_id` a framework hands their callbacks, which
-marries them to the frameworks that emit those callbacks and breaks wherever one
-does not. A framework identifier reaches this surface only as a `UnitKey`, only
-through `rejoin()` and `attach()`, and `rejoin()` is deliberately its own method
-name so that ONE grep lists every place in an adapter where an identifier can
-affect the shape of the tree.
+That is the product claim expressed as a type rather than as a rule. wardex builds its causal tree
+from in-process context propagation; competitors rebuild it from the `run_id`/`parent_run_id` a
+framework hands their callbacks, which marries them to the frameworks that emit those callbacks and
+breaks wherever one does not. A framework identifier reaches this surface only as a `UnitKey`, only
+through `rejoin()` and `attach()`, and `rejoin()` is deliberately its own method name so that ONE
+grep lists every place in an adapter where an identifier can affect the shape of the tree.
 
 **Placement is mandatory, and that is the expensive lesson.** A run entry the
-adapter forgot to wrap does not fail loudly — every span underneath simply
-becomes its own trace root at confidence 1.0 with no marker, byte-identical to a
-legitimate run. The rule, measured on real langgraph rather than counted on one
-graph: with no run entry wrapped, **`traces == captured outbound calls`**, run
-spans `== 0`, node spans `== 0`, tool spans `== 0`, and every edge is
-`trace_root`/1.0 with no marker — so a graph is reported as as many genuine
-traces as it happened to make calls, indistinguishable downstream from that many
-real ones. (An earlier version of this paragraph cited "four", which was one
-graph's call count and not a property of the framework.) Declaring at each site
-whether it may begin a trace turns that silence into `PARENT_UNRESOLVED` at
-confidence 0.0. The whole of the difference is one argument that cannot be
-defaulted.
+adapter forgot to wrap does not fail loudly — every span underneath simply becomes its own trace
+root at confidence 1.0 with no marker, byte-identical to a legitimate run. The rule, measured on
+real langgraph rather than counted on one graph: with no run entry wrapped, **`traces == captured
+outbound calls`**, run spans `== 0`, node spans `== 0`, tool spans `== 0`, and every edge is
+`trace_root`/1.0 with no marker — so a graph is reported as as many genuine traces as it happened to
+make calls, indistinguishable downstream from that many real ones. (An earlier version of this
+paragraph cited "four", which was one graph's call count and not a property of the framework.)
+Declaring at each site whether it may begin a trace turns that silence into `PARENT_UNRESOLVED` at
+confidence 0.0. The whole of the difference is one argument that cannot be defaulted.
 
 **Nothing here raises an Exception of wardex's own making.** The host's call
 lives inside `enter()`'s `with` body, so a bug in wardex's own work — deciding
@@ -319,6 +314,7 @@ class Scope:
         *,
         subject: str | None = None,
         selector: UnitKey | None = None,
+        start_ns: int | None = None,
     ) -> SpanDraft:
         """A child span of this scope, tied to `selector`'s arbitration if given.
 
@@ -326,10 +322,15 @@ class Scope:
         rank recorded is whichever one already owns the selector, and
         `close_child` discards the draft if something has outranked it since.
         Claim first with `claim()`, then open.
+
+        `start_ns` is for work that happened ELSEWHERE and was measured there —
+        a model call inside a CLI subprocess, read back from the CLI's own
+        telemetry after it ran. Omitted, the child starts now, which is right
+        for every child opened as its work begins.
         """
         if self._unit is None:
             return NULL_DRAFT  # type: ignore[return-value]
-        return self._unit.open_span(intent, subject=subject, key=selector)
+        return self._unit.open_span(intent, subject=subject, key=selector, start_ns=start_ns)
 
     def close_child(
         self,
@@ -337,13 +338,15 @@ class Scope:
         *,
         status: StatusCode = StatusCode.OK,
         error_type: str | None = None,
+        end_ns: int | None = None,
     ) -> None:
+        """Close a child. `end_ns` is `child_draft(start_ns=)`'s other half."""
         # Short-circuited on IDENTITY, not on `self._unit`: a null draft can
         # outlive the scope that handed it out, and closing a span that was
         # never opened is the one thing the registry has no honest answer for.
         if self._unit is None or draft is NULL_DRAFT:
             return
-        self._unit.close_span(draft, status=status, error_type=error_type)
+        self._unit.close_span(draft, status=status, error_type=error_type, end_ns=end_ns)
 
     def record_input(self, data: bytes) -> None:
         if self._unit is not None:
@@ -624,19 +627,16 @@ class AdapterContext:
         """Fork-child reset: replace the PatchSet's lock, drop the per-object
         slots, and nothing else.
 
-        The context's other state is per-install bookkeeping the child keeps
-        (I-fork-4: the patches recorded here crossed the fork and still work,
-        and the child's teardown needs the records to restore them). The lock
-        is the one thing that cannot be trusted — `restore_all()` holds it
-        across the whole restore walk, and `AdapterRegistry.uninstall` takes
-        exactly that path in the child (P/Q/R row Q). The slots are the other:
-        they hold the parent's in-flight run bookkeeping — handles onto units
-        the registry's own fork reset has already dropped — and an adapter
-        that keys every run on `slot()` (openai-agents does) would otherwise
-        finish the parent's runs in the child. Called by
-        `AdapterRegistry._at_fork_reinit`, the owner of every live context —
-        adapters like LangGraph patch exclusively through their context and
-        declare no reset of their own.
+        The context's other state is per-install bookkeeping the child keeps (I-fork-4: the patches
+        recorded here crossed the fork and still work, and the child's teardown needs the records to
+        restore them). The lock is the one thing that cannot be trusted — `restore_all()` holds it
+        across the whole restore walk, and `AdapterRegistry.uninstall` takes exactly that path in
+        the child (P/Q/R row Q). The slots are the other: they hold the parent's in-flight run
+        bookkeeping — handles onto units the registry's own fork reset has already dropped — and an
+        adapter that keys every run on `slot()` (openai-agents does) would otherwise finish the
+        parent's runs in the child. Called by `AdapterRegistry._at_fork_reinit`, the owner of every
+        live context — adapters like LangGraph patch exclusively through their context and declare
+        no reset of their own.
         """
         self.patches._at_fork_reinit()
         # Replaced, never acquired: the parent may have held it at the fork.

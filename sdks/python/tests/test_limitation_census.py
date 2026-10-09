@@ -229,7 +229,17 @@ _MEMBER_SITES: dict[str, frozenset[str]] = {
     "CONNECT_TIMING_UNAVAILABLE": frozenset({"_interceptors/_socket.py", "_interceptors/_ssl.py"}),
     "TTFT_UNAVAILABLE_H2": frozenset({"_interceptors/_seam.py"}),
     "TTFT_IPC_APPROXIMATION": frozenset({"_adapters/_assembler.py"}),
-    "TRANSPORT_TIMING_UNAVAILABLE_SUBPROCESS": frozenset({"_adapters/_assembler.py"}),
+    # The Codex adapter's chat and tool spans are built from the CLI's own
+    # stream too, so their timing is the process's, not the call's.
+    "TRANSPORT_TIMING_UNAVAILABLE_SUBPROCESS": frozenset(
+        {"_adapters/_assembler.py", "_adapters/_codex_exec.py"}
+    ),
+    # --- a CLI agent read from what crosses the host's own process ---
+    # The Codex adapter, both: the payloads on its spans are the host's stdin
+    # and stdout, never the model's wire bytes, and the --json stream it reads
+    # names neither the model nor where one model call ends.
+    "NO_WIRE_EVIDENCE": frozenset({"_adapters/_codex_exec.py"}),
+    "SUBPROCESS_MODEL_CALLS_UNOBSERVED": frozenset({"_adapters/_codex_exec.py"}),
     # --- caps ---
     "GRPC_MESSAGE_TRUNCATED": frozenset({"_semantics/_grpc.py"}),
     "WS_PAYLOAD_TRUNCATED": frozenset({"_interceptors/_seam.py", "_interceptors/_trackers.py"}),
@@ -334,8 +344,12 @@ _MEMBER_SITES: dict[str, frozenset[str]] = {
     # live bridge session). One emitting file, by design — the receiver and
     # the classifier report through counters and hand the marker decision to
     # the one place that holds the root draft.
-    "OTEL_BRIDGE_NO_DATA": frozenset({"_adapters/_assembler.py"}),
-    "OTEL_BRIDGE_SCHEMA_UNKNOWN": frozenset({"_adapters/_assembler.py"}),
+    # The Codex bridge says the same two things on its run's root, from the
+    # one place that holds that root draft (`_codex_exec.py::_emit`).
+    "OTEL_BRIDGE_NO_DATA": frozenset({"_adapters/_assembler.py", "_adapters/_codex_exec.py"}),
+    "OTEL_BRIDGE_SCHEMA_UNKNOWN": frozenset(
+        {"_adapters/_assembler.py", "_adapters/_codex_exec.py"}
+    ),
     # The bridge's join-quality marker, attached by the same `_merge_bridge` to
     # a CHAT span the tolerance pass placed. The classifier (`_otel_merge.py`)
     # only reports which pairs that pass made; the marker decision stays with
@@ -363,6 +377,7 @@ _MEMBER_SITES: dict[str, frozenset[str]] = {
     "ADAPTER_UNINSTALLED": frozenset(
         {
             "_adapters/_anthropic_agent_sdk.py",
+            "_adapters/_codex_exec.py",
             "_adapters/_langgraph.py",
             "_adapters/_openai_agents.py",
             "testing/conformance.py",
@@ -727,6 +742,13 @@ _EMITTED_MEMBERS: frozenset[str] = frozenset(
         # `provider_inferred`). Before it, a gateway, a mock or an Azure
         # deployment labelled `openai` looked exactly like `api.openai.com`.
         "PROVIDER_INFERRED",
+        # The twenty-fifth: a CLI agent's unseen model calls, minted WITH its
+        # emitter (the Codex adapter, on the run's root and on the one chat its
+        # --json stream supports). Before it, a `codex exec` produced no span.
+        "SUBPROCESS_MODEL_CALLS_UNOBSERVED",
+        # Declared long before an emitter: its first is the Codex adapter,
+        # whose payloads are the host's stdin and stdout, not wire bytes.
+        "NO_WIRE_EVIDENCE",
     }
 )
 """Which MEMBERS have an emit site today, derived independently below.
@@ -1277,6 +1299,8 @@ _UNRESOLVED_PY: frozenset[tuple[str, str]] = frozenset(
         ("_adapters/_langgraph.py", "Name:marker"),
         # `close_units(*, marker)` again, the openai-agents adapter's copy.
         ("_adapters/_openai_agents.py", "Name:marker"),
+        # And the Codex adapter's: `close_units(*, marker)` passing it on whole.
+        ("_adapters/_codex_exec.py", "Name:marker"),
         ("_adapters/_registry.py", "Name:marker"),
         # The adapter contract's own two forwards. `Name:marker` is the `marker`
         # parameter of `Scope.note` / `RunHandle.note` / `Attachment.note` and
@@ -1725,10 +1749,15 @@ _VOCABULARY: dict[str, str] = {
     #     body shape or an API shape, rather than the provider's own host —
     #     kept apart from SSE_UNKNOWN_PROVIDER (no label exists there at all) ---
     "PROVIDER_INFERRED": "provider_inferred",
+    # --- added after the census, by the Codex adapter (1): a CLI agent read
+    #     from its --json stream, which names no model and no call boundary —
+    #     kept apart from TRANSPORT_TIMING_UNAVAILABLE_SUBPROCESS (that one is
+    #     about a call's timing; this one says the calls were never seen) ---
+    "SUBPROCESS_MODEL_CALLS_UNOBSERVED": "subprocess_model_calls_unobserved",
 }
 
 
-def test_the_vocabulary_is_exactly_these_fifty_four() -> None:
+def test_the_vocabulary_is_exactly_these_fifty_five() -> None:
     """15 declared before the census + 21 from it + 1 from §5.4 + 1 for wardex
     itself + 1 for the OTLP size guard + 1 for the registry breadth bound
     + 2 for the OTel bridge's fail-open pair + 1 for the adapter's per-session
@@ -1737,8 +1766,8 @@ def test_the_vocabulary_is_exactly_these_fifty_four() -> None:
     WebSocket LLM-transport marker + 1 for the ambiguous LangGraph join
     + 1 for the unresolved peer address + 1 for the alias bound's forgotten
     id + 1 for the OTel bridge's tolerant chat join + 1 for the h2 stream
-    table's evicted request half + 1 for the inferred provider label, name by
-    name.
+    table's evicted request half + 1 for the inferred provider label + 1 for
+    a CLI agent's unobserved model calls, name by name.
 
     A count alone is not enough: a RENAME keeps the count and is the single most
     expensive mistake available here. These are proto enum values in

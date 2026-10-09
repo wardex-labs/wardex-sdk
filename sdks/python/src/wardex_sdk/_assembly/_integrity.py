@@ -124,13 +124,11 @@ Two emit sites, and the first is the mechanism the second restates.
     ``ParentSource.UNRESOLVED`` for a snapshot taken outside any span and names
     no member itself, leaving the ``_MARKER`` table to do it.
 
-    A byte-seam span reaches it the same way, through
-    ``resolve_observed``'s ``_ORPHANED_BY_WARDEX`` evidence, in three cases: the
-    latched parent's unit had already closed, the request was issued inside a
-    span wardex failed to open, and the latched parent was discarded by the h2
-    stream latch's own cap. The last two arrive carrying
-    ``INSTRUMENTATION_DEGRADED`` as well, which is what separates "wardex lost
-    the parent" from "the parent was never there".
+    A byte-seam span reaches it the same way, through ``resolve_observed``'s ``_ORPHANED_BY_WARDEX``
+    evidence, in three cases: the latched parent's unit had already closed, the request was issued
+    inside a span wardex failed to open, and the latched parent was discarded by the h2 stream
+    latch's own cap. The last two arrive carrying ``INSTRUMENTATION_DEGRADED`` as well, which is
+    what separates "wardex lost the parent" from "the parent was never there".
     """
 
     UNIT_INFERRED_SOLE = "unit_inferred_sole"
@@ -163,27 +161,22 @@ Two emit sites, and the first is the mechanism the second restates.
       is declared for a task other than the one calling — a self-consistent lie
       that no confidence value downstream could reveal.
     * ``UnitRegistry.open`` and ``UnitRegistry.resolve`` attach it when they
-      REFUSE the scope a CLOSED pin left standing: the opened unit becomes a
-      trace root, or the edge is rebuilt from the remaining tiers, instead of
-      hanging later work off a finished unit at confidence 1.0 — unless the
-      unit died by the registry's OWN eviction, in which case the refusal
-      carries ``INSTRUMENTATION_DEGRADED`` instead
-      (``UnitRegistry.refused_ambient_marker``): the two strands have
-      different repairs, and this member's is pin and lifetime discipline,
-      not a capacity knob.
+      REFUSE the scope a CLOSED pin left standing: the opened unit becomes a trace root, or the edge
+      is rebuilt from the remaining tiers, instead of hanging later work off a finished unit at
+      confidence 1.0 — unless the unit died by the registry's OWN eviction, in which case the
+      refusal carries ``INSTRUMENTATION_DEGRADED`` instead
+      (``UnitRegistry.refused_ambient_marker``): the two strands have different repairs, and this
+      member's is pin and lifetime discipline, not a capacity knob.
     * ``_adapters/_context.py`` — the one emit path outside the registry —
-      marks the span whose edge a declared fallback decided while a dead pin
-      was standing. Taking a parent unit is precisely what stops ``open()``
-      from seeing the poisoned ambient for itself, so without this the two
-      reasons a guess happened are byte-identical: "nothing was pinned" and
-      "what was pinned had died", the second being a call filed inside a run
-      it has nothing to do with. The pinned session's own span is not
-      reachable either way — it was materialized and shipped inside the very
-      ``close()`` that made the pin stale, and ``Unit.note()`` on a closed
-      unit is a no-op. The site spells no member of its own: it asks
-      ``refused_ambient_marker`` for the word, so an evict-origin strand says
-      ``INSTRUMENTATION_DEGRADED`` there exactly as it would had ``open()``
-      seen the corpse itself.
+      marks the span whose edge a declared fallback decided while a dead pin was standing. Taking a
+      parent unit is precisely what stops ``open()`` from seeing the poisoned ambient for itself, so
+      without this the two reasons a guess happened are byte-identical: "nothing was pinned" and
+      "what was pinned had died", the second being a call filed inside a run it has nothing to do
+      with. The pinned session's own span is not reachable either way — it was materialized and
+      shipped inside the very ``close()`` that made the pin stale, and ``Unit.note()`` on a closed
+      unit is a no-op. The site spells no member of its own: it asks ``refused_ambient_marker`` for
+      the word, so an evict-origin strand says ``INSTRUMENTATION_DEGRADED`` there exactly as it
+      would had ``open()`` seen the corpse itself.
     """
 
     ALIAS_FORGOTTEN = "alias_forgotten"
@@ -266,14 +259,12 @@ Two emit sites, and the first is the mechanism the second restates.
     Three emit sites across two modules, all of them the same rule: a bound or a
     teardown CLOSES what it stops tracking, it never drops it.
 
-    In ``_assembly/_units.py`` — ``UnitRegistry._close_locked``, for both the
-    surviving children and the still-open drafts of a unit being closed; a
-    per-unit table crossing ``max_entries_per_unit`` used to land here too and
-    now carries ``UNIT_TABLE_FULL``, because a bound and a teardown demand
-    different next actions from the reader. The one
-    thing evicted WITHOUT a marker is an arbitration loser, which is discarded
-    exactly as ``close_span`` would discard it: a bound is a reason to stop
-    tracking a draft, never a reason to promote one ``claim()`` already rejected.
+    In ``_assembly/_units.py`` — ``UnitRegistry._close_locked``, for both the surviving children and
+    the still-open drafts of a unit being closed; a per-unit table crossing ``max_entries_per_unit``
+    used to land here too and now carries ``UNIT_TABLE_FULL``, because a bound and a teardown demand
+    different next actions from the reader. The one thing evicted WITHOUT a marker is an arbitration
+    loser, which is discarded exactly as ``close_span`` would discard it: a bound is a reason to
+    stop tracking a draft, never a reason to promote one ``claim()`` already rejected.
 
     In ``_adapters/_assembler.py`` — ``::_drain_children``, when a session stops
     being driven with tools still open, which happens either because the
@@ -301,27 +292,22 @@ Two emit sites, and the first is the mechanism the second restates.
     """A per-unit table crossed ``max_entries_per_unit`` and its OLDEST entry
     was force-closed and emitted to admit the new one.
 
-    Points at that one knob, and naming it is the whole reason this member
-    exists (§6.5.1: if the user's next action differs, they are separate
-    members). ``UNIT_EVICTED`` names ``max_units`` / ``max_sessions`` — whole
-    roots crossing the unit-count cap. ``CHILD_SPAN_UNCLOSED`` names no knob
-    at all: it says someone else's TEARDOWN closed the span. Before this
-    member the breadth bound borrowed ``CHILD_SPAN_UNCLOSED``, so the
-    canonical wide fan-out (300 simultaneously-live Send workers over a
-    256-entry table) put a teardown marker on 44 healthy spans and sent the
-    reader hunting for a close that never happened instead of to the knob
-    that did it.
+    Points at that one knob, and naming it is the whole reason this member exists (§6.5.1: if the
+    user's next action differs, they are separate members). ``UNIT_EVICTED`` names ``max_units`` /
+    ``max_sessions`` — whole roots crossing the unit-count cap. ``CHILD_SPAN_UNCLOSED`` names no
+    knob at all: it says someone else's TEARDOWN closed the span. Before this member the breadth
+    bound borrowed ``CHILD_SPAN_UNCLOSED``, so the canonical wide fan-out (300 simultaneously-live
+    Send workers over a 256-entry table) put a teardown marker on 44 healthy spans and sent the
+    reader hunting for a close that never happened instead of to the knob that did it.
 
-    Two emit sites, both in ``_assembly/_units.py`` and both the registry's
-    own breadth bound: ``UnitRegistry.open`` closes the oldest CHILD unit of
-    a full ``_children`` table, and ``Unit.open_span`` force-closes the
-    oldest OPEN DRAFT of a full ``_open`` table (except an arbitration loser,
-    which stays discarded — a bound is never a reason to promote a draft
-    ``claim()`` already rejected). Only the entry that HIT the bound carries
-    this marker: its descendants, closed by the same walk, keep
-    ``CHILD_SPAN_UNCLOSED``, because they were closed by their parent's
-    teardown — which is that member's exact sentence — and the table-full
-    fact is not theirs to report.
+    Two emit sites, both in ``_assembly/_units.py`` and both the registry's own breadth bound:
+    ``UnitRegistry.open`` closes the oldest CHILD unit of a full ``_children`` table, and
+    ``Unit.open_span`` force-closes the oldest OPEN DRAFT of a full ``_open`` table (except an
+    arbitration loser, which stays discarded — a bound is never a reason to promote a draft
+    ``claim()`` already rejected). Only the entry that HIT the bound carries this marker: its
+    descendants, closed by the same walk, keep ``CHILD_SPAN_UNCLOSED``, because they were closed by
+    their parent's teardown — which is that member's exact sentence — and the table-full fact is not
+    theirs to report.
 
     Deliberately NOT widened to ``max_session_entries``: that bound has its own
     member, ``SESSION_ENTRY_TABLE_FULL`` (43), decided on its own evidence as
@@ -337,16 +323,14 @@ Two emit sites, and the first is the mechanism the second restates.
     """A per-SESSION table crossed ``max_session_entries`` and its OLDEST entry
     was force-closed and emitted to admit the new one.
 
-    Points at that one knob, and naming it is the whole reason this member
-    exists (§6.5.1: if the user's next action differs, they are separate
-    members). ``UNIT_TABLE_FULL`` names ``max_entries_per_unit`` — the unit
-    REGISTRY's per-unit tables — and although ``crates/wardex-limits`` calls
-    that knob a generalization of this one, they are separate FIELDS: raising
-    one leaves the other at its default, so a reader sent to the wrong one
-    turns a knob that changes nothing. ``UNIT_EVICTED`` names the two COUNT
-    caps (``max_units`` / ``max_sessions``); ``CHILD_SPAN_UNCLOSED`` names no
-    knob at all — it says someone else's TEARDOWN closed the span, which is
-    what these sites used to claim about a teardown that never happened.
+    Points at that one knob, and naming it is the whole reason this member exists (§6.5.1: if the
+    user's next action differs, they are separate members). ``UNIT_TABLE_FULL`` names
+    ``max_entries_per_unit`` — the unit REGISTRY's per-unit tables — and although
+    ``crates/wardex-limits`` calls that knob a generalization of this one, they are separate FIELDS:
+    raising one leaves the other at its default, so a reader sent to the wrong one turns a knob that
+    changes nothing. ``UNIT_EVICTED`` names the two COUNT caps (``max_units`` / ``max_sessions``);
+    ``CHILD_SPAN_UNCLOSED`` names no knob at all — it says someone else's TEARDOWN closed the span,
+    which is what these sites used to claim about a teardown that never happened.
 
     Five emit sites, all in ``_adapters/_assembler.py`` and all one bound.
     ``SessionAssembler._open_tool`` force-closes the oldest OPEN TOOL of a full ``open_tools``
@@ -424,15 +408,13 @@ Two emit sites, and the first is the mechanism the second restates.
     a subtree missing because an adapter threw looks exactly like a subtree that
     never ran.
 
-    Emitted from ``_adapters/_context.py``: on a unit whose open or description
-    failed, on one whose activation failed, and on the ENCLOSING unit when the
-    span itself will not ship. BEST EFFORT by contract, and the contract is what
-    matters here — the span that would carry it is sometimes the very one that
-    could not be built, so it lands on the enclosing unit instead, and where
-    there is no enclosing unit it cannot land at all. A registry fault wide
-    enough to reach the enclosing unit takes the marker with it. What always
-    survives is the line the same failure prints to stderr, which touches
-    nothing that can itself be broken.
+    Emitted from ``_adapters/_context.py``: on a unit whose open or description failed, on one whose
+    activation failed, and on the ENCLOSING unit when the span itself will not ship. BEST EFFORT by
+    contract, and the contract is what matters here — the span that would carry it is sometimes the
+    very one that could not be built, so it lands on the enclosing unit instead, and where there is
+    no enclosing unit it cannot land at all. A registry fault wide enough to reach the enclosing
+    unit takes the marker with it. What always survives is the line the same failure prints to
+    stderr, which touches nothing that can itself be broken.
 
     And from ``_assembly/_parentage.py::resolve_observed``, which is the same
     sentence said about an EDGE rather than about a unit: a byte-seam span whose
@@ -444,17 +426,15 @@ Two emit sites, and the first is the mechanism the second restates.
     which ``_MARKER`` attaches from the ``UNRESOLVED`` source; this one is what
     stops the pair reading as "the host has an untraced caller".
 
-    And from ``_assembly/_units.py``, for the refusal of an EVICT-ORIGIN
-    leftover scope: ``open()`` and ``resolve()`` refuse the standing fork of a
-    unit the registry itself evicted (``Unit._evicted``), and the refused span
-    carries this member rather than ``CORRELATION_CONFLICT`` — the strand is
-    wardex's own bound at work, so the repair is ``max_units``, not the
-    adapter's pinning or lifetime. The word is chosen in
-    ``UnitRegistry.refused_ambient_marker``, which the adapter surface's
-    declared fallback asks too, so the strand reads the same wherever the
-    refusal happens. The same sentence ``resolve_observed`` already says for a
-    byte-seam span whose latched parent wardex discarded to stay inside a
-    bound.
+    And from ``_assembly/_units.py``, for the refusal of an EVICT-ORIGIN leftover scope: ``open()``
+    and ``resolve()`` refuse the standing fork of a unit the registry itself evicted
+    (``Unit._evicted``), and the refused span carries this member rather than
+    ``CORRELATION_CONFLICT`` — the strand is wardex's own bound at work, so the repair is
+    ``max_units``, not the adapter's pinning or lifetime. The word is chosen in
+    ``UnitRegistry.refused_ambient_marker``, which the adapter surface's declared fallback asks too,
+    so the strand reads the same wherever the refusal happens. The same sentence
+    ``resolve_observed`` already says for a byte-seam span whose latched parent wardex discarded to
+    stay inside a bound.
 
     And from ``_interceptors/_seam.py``, on the deferred finalization's
     parse exception: ``_assemble`` runs ``parse_llm_semantics`` under the
@@ -481,16 +461,14 @@ Two emit sites, and the first is the mechanism the second restates.
     its per-connection tracking state, so parsing may have started mid-stream
     and the timing/stream fields' origin is younger than the connection.
 
-    Emitted from ``_interceptors/_seam.py``. At fork the child's reset latches
-    the ids of every connection the seam was tracking and clears the table
-    (an inherited entry would otherwise hand a recycled ``id()`` a dead
-    connection's tracker and its latched gate — the cross-process edition of
-    the close-hook bug). When the host keeps using an INHERITED socket, the
-    seam builds it a fresh state, finds its id in the latch, and the FIRST
-    span assembled on it carries this marker, exactly once — the honest label
-    for a body parsed from its middle and a ``connection_reused``/TTFB story
-    whose epoch is the fork, not the connect. A brand-new connection opened in
-    the child matches nothing and carries nothing.
+    Emitted from ``_interceptors/_seam.py``. At fork the child's reset latches the ids of every
+    connection the seam was tracking and clears the table (an inherited entry would otherwise hand a
+    recycled ``id()`` a dead connection's tracker and its latched gate — the cross-process edition
+    of the close-hook bug). When the host keeps using an INHERITED socket, the seam builds it a
+    fresh state, finds its id in the latch, and the FIRST span assembled on it carries this marker,
+    exactly once — the honest label for a body parsed from its middle and a
+    ``connection_reused``/TTFB story whose epoch is the fork, not the connect. A brand-new
+    connection opened in the child matches nothing and carries nothing.
 
     Not ``CONNECTION_EVICTED`` (24), by the census rule the caps band states:
     the reader's next action differs, because the KNOB differs. That member
@@ -522,7 +500,9 @@ Two emit sites, and the first is the mechanism the second restates.
     """The span was assembled entirely from framework callbacks; no interceptor
     ever saw the bytes, so payloads are the framework's account of them.
 
-    Declared; no emitter until the ownership table of §8.2.
+    Emitted from ``_adapters/_codex_exec.py`` on every span that carries a ``codex exec`` run's
+    payload: the prompt the host wrote to stdin and the answer it read back, without the
+    instructions Codex wraps around the prompt. Other adapters await the ownership table of §8.2.
     """
 
     POSSIBLE_DUPLICATE_CHAT = "possible_duplicate_chat"
@@ -1073,6 +1053,23 @@ Two emit sites, and the first is the mechanism the second restates.
     but KEEPS ``TRANSPORT_TIMING_UNAVAILABLE_SUBPROCESS`` and ``TTFT_IPC_APPROXIMATION``: when a
     chat's own request never reached the bridge, the one in the widened window is a neighbour's.
     Next action: read the timing as an estimate. Not ``CORRELATION_CONFLICT``: nothing disagreed.
+    """
+
+    # ------------------------------------------------------------------
+    # CLI agent observed as a subprocess
+    # ------------------------------------------------------------------
+
+    SUBPROCESS_MODEL_CALLS_UNOBSERVED = "subprocess_model_calls_unobserved"
+    """A CLI agent ran as a subprocess and its output stream named neither the model nor how many
+    times it was asked: ``codex exec --json`` reports one usage total per turn, no model, and not
+    every tool call (Codex's built-in ``exec`` tool leaves no item). So no chat span ships, and the
+    run's own span carries the turn's total usage.
+
+    Emitted from ``_adapters/_codex_exec.py``, on the run's ``invoke_agent`` span, whenever the
+    OTel bridge did not supply the calls (off, or fail-open). Reader's next action:
+    ``CodexExecConfig(otel_bridge=True)``, which reads each call's model, usage and interval from
+    the CLI's own traces. Not ``TRANSPORT_TIMING_UNAVAILABLE_SUBPROCESS``: that one says a call's
+    TIMING is the IPC stream's; this one says the calls themselves were never seen.
     """
 
 

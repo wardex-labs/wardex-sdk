@@ -7,6 +7,38 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- **A `codex exec` your code runs is now an agent run in the trace.** Codex
+  talks to its model from its own process, so before, an app that ran
+  `codex exec` (as a model, or as a sub-agent) recorded nothing at all for
+  it. Now each run is an `invoke_agent codex` span under whatever your code
+  had open when it started Codex, read from what your process already
+  exchanges with it and nothing else: the prompt it wrote to stdin and, under
+  `--json`, the events it read back — the final answer, the tool calls the
+  stream reports (command executions, MCP calls, file changes, web searches)
+  as `execute_tool` spans, and the turn's token usage. The command, its
+  environment and both streams are left exactly as they were; `subprocess.run`
+  / `Popen.communicate`, a `Popen` read by hand, and
+  `asyncio.create_subprocess_exec` are all covered. That stream names neither
+  the model nor how many times it was asked — measured, a run with one answer
+  and no tool item in its stream asked the model twice, because Codex's
+  built-in `exec` tool leaves no item — so the run carries the turn's total
+  itself, no chat span is invented, and the run says so with the new
+  `subprocess_model_calls_unobserved` limitation. **Opt in to the model calls**
+  with `AdaptersConfig(codex_exec=CodexExecConfig(otel_bridge=True))`: the
+  adapter then adds a trace-exporter `-c` override and a `TRACEPARENT` to each
+  `codex exec`, receives Codex's own traces on a loopback port, and ships one
+  `chat` span per model call with the model, that call's usage and its own
+  interval, plus the Codex version and the warm-up request it sends first
+  (`wardex.codex.version`, `wardex.codex.warmup.*`). It never takes over
+  telemetry you set up: a run whose command sets `otel.*`, whose environment
+  carries `OTEL_*` or `TRACEPARENT`, or whose Codex config names a
+  `trace_exporter` is recorded from its stream alone, with one warning. Codex's
+  log exporter, whose events carry the account's e-mail address, is never
+  enabled. The adapter auto-detects when `codex` is on `PATH`; name
+  `AdapterName.CODEX_EXEC` in `enabled=` otherwise. Verified against
+  `codex-cli` 0.160.0; another version is recorded and marked
+  `wardex.codex.version_verified = false`.
+
 - **A span your code raised out of now says it failed, and why.** Before, an
   exception leaving a `@wardex.workflow` / `@wardex.agent` / `@wardex.step` /
   `@wardex.tool` function or a `with wardex.span()` / `wardex.conversation()`
