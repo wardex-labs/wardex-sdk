@@ -57,7 +57,7 @@ TOOL_ITEMS = frozenset(
     {"command_execution", "mcp_tool_call", "file_change", "web_search", "collab_tool_call"}
 )
 
-_TRACE_EXPORTER_LINE = re.compile(r"^\s*(?:otel\s*\.\s*)?trace_exporter\s*=", re.MULTILINE)
+_TRACE_EXPORTER = re.compile(r"\btrace_exporter\b")
 _CONFIG_READ_CAP = 256 * 1024
 
 
@@ -149,10 +149,13 @@ def match_codex_exec(args: Any, executable: Any = None, shell: bool = False) -> 
 def user_config_sets_traces(env: Mapping[str, str]) -> bool:
     """Whether the user's Codex config already names a trace exporter.
 
-    A textual check on purpose: the rule is "never take over telemetry the
-    user configured", and a line naming `trace_exporter` anywhere — the
-    `[otel]` table, a dotted key, a profile table — is that, whatever TOML
-    nesting it sits in. Unreadable answers False: no config is no telemetry.
+    A textual check, FAIL-CLOSED on purpose: the rule is "never take over
+    telemetry the user configured", and TOML spells that key many ways — an
+    `[otel]` key, a dotted key, an `[otel.trace_exporter.otlp-http]` table
+    header, an inline table, a quoted key, a profile table. So the word
+    `trace_exporter` anywhere outside a comment counts; a false positive costs
+    one run its bridge, a false negative would take over the user's exporter.
+    Unreadable answers False: no config is no telemetry.
     """
     home = env.get("CODEX_HOME") or os.path.join(os.path.expanduser("~"), ".codex")
     try:
@@ -164,7 +167,7 @@ def user_config_sets_traces(env: Mapping[str, str]) -> bool:
         counters.bump("adapters.codex_exec.user_config_unread")
         return False
     uncommented = "\n".join(line.split("#", 1)[0] for line in text.splitlines())
-    return _TRACE_EXPORTER_LINE.search(uncommented) is not None
+    return _TRACE_EXPORTER.search(uncommented) is not None
 
 
 def as_bytes(data: Any, encoding: str | None) -> bytes:
@@ -184,7 +187,10 @@ class Reading:
     thread_id: str | None = None
     final_text: str | None = None
     tools: list[CodexExecEvent] = field(default_factory=list)
+    #: `turn.failed` messages: the turn did not complete.
     failures: list[str] = field(default_factory=list)
+    #: Top-level `error` events: reported, not by themselves a failure.
+    errors: list[str] = field(default_factory=list)
     turns: int = 0
     usage: CodexExecEvent | None = None
     parsed: int = 0
@@ -205,8 +211,10 @@ def read_stream(stdout: bytes) -> Reading:
             reading.turns += 1
             if ev.has_usage:
                 reading.usage = ev
-        elif ev.kind in ("turn_failed", "error"):
+        elif ev.kind == "turn_failed":
             reading.failures.append(ev.message or ev.kind)
+        elif ev.kind == "error":
+            reading.errors.append(ev.message or ev.kind)
         elif ev.kind == "item_completed":
             if ev.item_type == "agent_message" and ev.text is not None:
                 reading.final_text = ev.text

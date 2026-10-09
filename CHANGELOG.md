@@ -12,13 +12,15 @@ All notable changes to this project are documented here. The format follows
   `codex exec` (as a model, or as a sub-agent) recorded nothing at all for
   it. Now each run is an `invoke_agent codex` span under whatever your code
   had open when it started Codex, read from what your process already
-  exchanges with it and nothing else: the prompt it wrote to stdin and, under
-  `--json`, the events it read back — the final answer, the tool calls the
+  exchanges with it and nothing else: the prompt it passed to `communicate()`
+  and, under `--json`, the events it read back — the final answer, the tool
+  calls the
   stream reports (command executions, MCP calls, file changes, web searches)
   as `execute_tool` spans, and the turn's token usage. The command, its
   environment and both streams are left exactly as they were; `subprocess.run`
-  / `Popen.communicate`, a `Popen` read by hand, and
-  `asyncio.create_subprocess_exec` are all covered. That stream names neither
+  / `Popen.communicate` and `asyncio.create_subprocess_exec` are read in full,
+  and a `Popen` whose pipes your code reads by hand still becomes a run, closed
+  by `wait()` or `poll()`, without content. That stream names neither
   the model nor how many times it was asked — measured, a run with one answer
   and no tool item in its stream asked the model twice, because Codex's
   built-in `exec` tool leaves no item — so the run carries the turn's total

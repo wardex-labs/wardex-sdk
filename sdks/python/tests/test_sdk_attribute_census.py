@@ -136,7 +136,7 @@ _SITES: list[tuple[str, str, str, str]] = [
     (_CX, "'wardex.codex.thread_id'", "reading.thread_id", HOST),
     (_CX, "'wardex.codex.item_type'", "ev.item_type", HOST),
     (_CX, "'wardex.codex.version'", "view.version", HOST),
-    (_CX, "'wardex.codex.error'", "reading.failures[-1][:500]", HOST),
+    (_CX, "'wardex.codex.error'", "messages[-1][:500]", HOST),
     # -- the LangGraph adapter --
     (_LG, "'wardex.framework'", "_FRAMEWORK", LITERAL),
     (_LG, "'wardex.framework'", "_FRAMEWORK", LITERAL),

@@ -39,7 +39,6 @@ telemetry keeps it, and the run is read from the stream alone.
 from __future__ import annotations
 
 import asyncio
-import inspect
 import os
 import secrets
 import subprocess
@@ -57,6 +56,7 @@ from .._assembly import (
     SpanIntent,
     ToolAttributes,
     UnitKind,
+    counters,
     report_once,
 )
 from .._config import CodexExecConfig
@@ -114,17 +114,79 @@ class _Run:
     lock: threading.RLock = field(default_factory=threading.RLock)
 
 
+#: `Popen.__init__`'s positional parameters after `self`, in order — the same
+#: on every supported CPython (3.10 to 3.14; held against the live signature
+#: by a test). Read by index rather than through `inspect.signature`, because
+#: another library's `Popen.__init__` wrapper without `functools.wraps` turns
+#: that signature into `(*args, **kwargs)`, and nothing would be found in it.
+_POPEN_POSITIONAL = (
+    "args",
+    "bufsize",
+    "executable",
+    "stdin",
+    "stdout",
+    "stderr",
+    "preexec_fn",
+    "close_fds",
+    "shell",
+    "cwd",
+    "env",
+    "universal_newlines",
+)
+
+#: How many runs whose process object cannot be weakly referenced are held
+#: strongly at once; past it the oldest is forgotten (it still closes, marked,
+#: at uninstall).
+_STRONG_CAP = 1024
+
+
+class _ByIdentity:
+    """Runs keyed by the host's OBJECT IDENTITY — never by its hash or `__eq__`.
+
+    A `Popen` subclass that defines `__eq__` is unhashable, and a mapping keyed
+    by the object would raise into the host on every `communicate()` in the
+    process, Codex or not. Keyed by `id()`, with the entry checked to hold that
+    very object, and dropped when the object dies (a weak reference's
+    callback, which only pops a dict entry: no lock, no emission).
+    """
+
+    def __init__(self) -> None:
+        self._entries: dict[int, tuple[Any, _Run]] = {}
+        self._strong: list[int] = []
+
+    def put(self, obj: Any, run: _Run) -> None:
+        key = id(obj)
+        try:
+            holder: Any = weakref.ref(obj, lambda _ref, key=key: self._entries.pop(key, None))
+        except TypeError:
+            counters.bump("adapters.codex_exec.process_not_weakrefable")
+            holder = lambda obj=obj: obj  # noqa: E731 — the strong half of `holder()`
+            self._strong.append(key)
+            while len(self._strong) > _STRONG_CAP:
+                self._entries.pop(self._strong.pop(0), None)
+        self._entries[key] = (holder, run)
+
+    def get(self, obj: Any) -> _Run | None:
+        entry = self._entries.get(id(obj))
+        if entry is None or entry[0]() is not obj:
+            return None
+        return entry[1]
+
+    def drop(self, run: _Run) -> None:
+        for key in [k for k, (_, r) in self._entries.items() if r is run]:
+            self._entries.pop(key, None)
+
+
 class CodexExecAdapter(AdapterInterface):
     def __init__(self) -> None:
         self._installed = False
         self._ctx: AdapterContext | None = None
         self._opts = CodexExecConfig()
-        self._runs: weakref.WeakKeyDictionary[Any, _Run] = weakref.WeakKeyDictionary()
-        self._async_runs: weakref.WeakKeyDictionary[Any, _Run] = weakref.WeakKeyDictionary()
+        self._runs = _ByIdentity()
+        self._async_runs = _ByIdentity()
         self._lock = threading.RLock()
         self._bridge: Any = None
         self._bridge_failed = False
-        self._popen_signature: inspect.Signature | None = None
 
     def name(self) -> str:
         return _FRAMEWORK
@@ -147,7 +209,7 @@ class CodexExecAdapter(AdapterInterface):
         orig_init = popen.__init__
         orig_communicate = popen.communicate
         orig_wait = popen.wait
-        self._popen_signature = inspect.signature(orig_init)
+        orig_poll = popen.poll
         adapter = self
 
         def __init__(popen_self: Any, *args: Any, **kwargs: Any) -> None:  # noqa: N807
@@ -187,9 +249,19 @@ class CodexExecAdapter(AdapterInterface):
                 adapter._finish(run, None, code, stdout_read=False)
             return code
 
+        def poll(popen_self: Any) -> Any:
+            # A host that loops on `poll()` and never waits ends its run here.
+            code = orig_poll(popen_self)
+            if code is not None and adapter._installed:
+                run = adapter._runs.get(popen_self)
+                if run is not None and not run.communicating:
+                    adapter._finish(run, None, code, stdout_read=False)
+            return code
+
         ctx.patches.patch(popen, "__init__", __init__)
         ctx.patches.patch(popen, "communicate", communicate)
         ctx.patches.patch(popen, "wait", wait)
+        ctx.patches.patch(popen, "poll", poll)
 
         # asyncio builds its own `Popen` (so `__init__` above opened the run)
         # and wraps it in a `Process`; the transport hands that Popen back as
@@ -207,7 +279,7 @@ class CodexExecAdapter(AdapterInterface):
             with ctx.guard("async_link"):
                 run = adapter._runs.get(transport.get_extra_info("subprocess"))
                 if run is not None:
-                    adapter._async_runs[process] = run
+                    adapter._async_runs.put(process, run)
 
         orig_acommunicate = process_cls.communicate
         orig_await = process_cls.wait
@@ -273,8 +345,8 @@ class CodexExecAdapter(AdapterInterface):
         built lazily, so the child's first bridged spawn gets a fresh one.
         """
         self._lock = threading.RLock()
-        self._runs = weakref.WeakKeyDictionary()
-        self._async_runs = weakref.WeakKeyDictionary()
+        self._runs = _ByIdentity()
+        self._async_runs = _ByIdentity()
         bridge, self._bridge = self._bridge, None
         if bridge is not None and self._ctx is not None:
             with self._ctx.guard("otel_bridge_fork_teardown"):
@@ -291,31 +363,34 @@ class CodexExecAdapter(AdapterInterface):
         """Decide, open and (bridge on) rewrite — or hand the call back untouched.
 
         The cheap test first: almost every spawn in a host is not Codex, and it
-        must cost a name comparison, not a signature bind.
+        must cost a name comparison. Arguments are read by name OR by position
+        exactly as `Popen.__init__` would bind them (`_POPEN_POSITIONAL`).
         """
         ctx = self._ctx
-        if ctx is None or not args:
+        if ctx is None:
             return None, args, kwargs
-        first = args[0]
-        executable = kwargs.get("executable", args[2] if len(args) > 2 else None)
-        if isinstance(first, (list, tuple)) and first:
-            head = executable if executable is not None else first[0]
-            if program_name(head) != "codex":
-                return None, args, kwargs
-        else:
+
+        def arg(name: str, default: Any = None) -> Any:
+            if name in kwargs:
+                return kwargs[name]
+            index = _POPEN_POSITIONAL.index(name)
+            return args[index] if index < len(args) else default
+
+        argv = arg("args")
+        if not isinstance(argv, (list, tuple)) or not argv:
+            if hasattr(argv, "__next__"):
+                # A one-shot iterable: reading it would consume the host's
+                # command, so it stays unread — counted, not silent.
+                counters.bump("adapters.codex_exec.argv_iterator_unread")
+            return None, args, kwargs
+        executable = arg("executable")
+        if program_name(executable if executable is not None else argv[0]) != "codex":
             return None, args, kwargs
 
         run = None
         new_args, new_kwargs = args, kwargs
         with ctx.guard("spawn"):
-            signature = self._popen_signature
-            bound = signature.bind_partial(None, *args, **kwargs) if signature else None
-            arguments = bound.arguments if bound is not None else {}
-            match = match_codex_exec(
-                arguments.get("args", first),
-                arguments.get("executable"),
-                bool(arguments.get("shell", False)),
-            )
+            match = match_codex_exec(argv, executable, bool(arg("shell", False)))
             if match is None:
                 return None, args, kwargs
             start_ns = time.time_ns()
@@ -327,17 +402,25 @@ class CodexExecAdapter(AdapterInterface):
                 start_ns=start_ns,
                 describe=self._describe_run,
             )
+            encoding = kwargs.get("encoding")
             run = _Run(
                 handle=handle,
                 match=match,
                 start_ns=start_ns,
-                encoding=self._text_encoding(arguments),
+                encoding=encoding if isinstance(encoding, str) else None,
             )
-            if self._opts.otel_bridge and bound is not None:
-                rewritten = self._inject_bridge(run, match, arguments)
+            if self._opts.otel_bridge:
+                rewritten = self._inject_bridge(run, match, arg("env"))
                 if rewritten is not None:
-                    new_args = tuple(bound.args[1:])
-                    new_kwargs = dict(bound.kwargs)
+                    new_argv, new_env = rewritten
+                    new_args, new_kwargs = list(args), dict(kwargs)
+                    for name, value in (("args", new_argv), ("env", new_env)):
+                        index = _POPEN_POSITIONAL.index(name)
+                        if name not in kwargs and index < len(new_args):
+                            new_args[index] = value
+                        else:
+                            new_kwargs[name] = value
+                    new_args = tuple(new_args)
         return run, new_args, new_kwargs
 
     @staticmethod
@@ -345,14 +428,9 @@ class CodexExecAdapter(AdapterInterface):
         handle.draft.set_agent(AgentAttributes(name="codex", agent_type=AgentType.PRIMARY))
         handle.draft.add_source(CaptureSource.STDIO)
 
-    @staticmethod
-    def _text_encoding(arguments: Mapping[str, Any]) -> str | None:
-        encoding = arguments.get("encoding")
-        return encoding if isinstance(encoding, str) else None
-
     def _spawned(self, popen: Any, run: _Run) -> None:
         with self._lock:
-            self._runs[popen] = run
+            self._runs.put(popen, run)
 
     def _spawn_failed(self, run: _Run, exc: BaseException) -> None:
         """The CLI never started. The run ships, failed, so the attempt is not silent."""
@@ -391,11 +469,12 @@ class CodexExecAdapter(AdapterInterface):
                 )
             return self._bridge
 
-    def _inject_bridge(self, run: _Run, match: Match, arguments: dict[str, Any]) -> bool | None:
-        """Rewrite `arguments` in place to point Codex's traces here. None: untouched."""
+    def _inject_bridge(
+        self, run: _Run, match: Match, env: Any
+    ) -> tuple[list[str], dict[str, str]] | None:
+        """The argv and env that point Codex's traces here. None: leave the call untouched."""
         ctx = self._ctx
         assert ctx is not None
-        env = arguments.get("env")
         effective = env if isinstance(env, Mapping) else os.environ
         reason = None
         if match.sets_otel():
@@ -427,11 +506,9 @@ class CodexExecAdapter(AdapterInterface):
         argv[match.exec_at + 1 : match.exec_at + 1] = ["-c", exporter]
         new_env = dict(effective)
         new_env["TRACEPARENT"] = f"00-{trace_hex}-{secrets.token_hex(8)}-01"
-        arguments["args"] = argv
-        arguments["env"] = new_env
         run.bridge_key = trace_hex
         ctx.count("otel_bridge.injected")
-        return True
+        return argv, new_env
 
     def _release_bridge(self, run: _Run) -> None:
         if run.bridge_key is not None and self._bridge is not None:
@@ -482,6 +559,8 @@ class CodexExecAdapter(AdapterInterface):
             if run.done:
                 return
             run.done = True
+        self._runs.drop(run)
+        self._async_runs.drop(run)
         ctx = self._ctx
         if ctx is None:
             return
@@ -556,8 +635,12 @@ class CodexExecAdapter(AdapterInterface):
             failed = "turn_failed"
         elif isinstance(returncode, int) and returncode != 0:
             failed = "nonzero_exit"
-        if reading.failures:
-            draft.set_extra("wardex.codex.error", reading.failures[-1][:500])
+        # A failed turn's message, or else the last stream `error` event —
+        # which alone does not fail the run: Codex also reports a retried
+        # reconnect that way, before a turn that completes.
+        messages = reading.failures or reading.errors
+        if messages:
+            draft.set_extra("wardex.codex.error", messages[-1][:500])
         handle.close(
             status=StatusCode.ERROR if failed else StatusCode.OK,
             error_type=failed,

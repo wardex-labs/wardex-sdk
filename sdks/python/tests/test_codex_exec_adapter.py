@@ -640,3 +640,141 @@ def test_an_open_run_ships_at_uninstall_marked(fake_codex, codex_wardex):
     finally:
         proc.stdin.close()
         proc.wait()
+
+
+# -- shapes an independent review found the first version got wrong ----------
+
+
+@pytest.mark.parametrize(
+    "toml",
+    [
+        '[otel.trace_exporter.otlp-http]\nendpoint = "http://mine"\n',
+        'otel = { trace_exporter = { otlp-http = { endpoint = "http://mine" } } }\n',
+        '[otel]\ntrace_exporter.otlp-http.endpoint = "http://mine"\n',
+        '[otel]\n"trace_exporter" = "none"\n',
+        '[profiles.work.otel]\ntrace_exporter = "none"\n',
+    ],
+    ids=["table_header", "inline_table", "dotted", "quoted_key", "profile"],
+)
+def test_every_toml_spelling_of_a_trace_exporter_keeps_the_bridge_away(
+    fake_codex, codex_wardex, toml
+):
+    codex_wardex(bridge=True)
+    fake_codex.home.mkdir()
+    (fake_codex.home / "config.toml").write_text(toml)
+    argv = [str(fake_codex.path), "exec", "--json", "-"]
+    subprocess.run(argv, input=b"x", capture_output=True, env=fake_codex.env())
+    (invocation,) = fake_codex.invocations()
+    assert invocation["argv"] == argv[1:]
+
+
+def test_a_comment_naming_it_does_not_count(fake_codex, codex_wardex):
+    codex_wardex(bridge=True)
+    fake_codex.home.mkdir()
+    (fake_codex.home / "config.toml").write_text("# trace_exporter = 'none'\nmodel = 'o3'\n")
+    subprocess.run(
+        [str(fake_codex.path), "exec", "--json", "-"],
+        input=b"x",
+        capture_output=True,
+        env=fake_codex.env(),
+    )
+    (invocation,) = fake_codex.invocations()
+    assert "TRACEPARENT" in invocation["env"]
+
+
+def test_an_unhashable_popen_subclass_never_raises_into_the_host(fake_codex, codex_wardex):
+    """A subclass with `__eq__` and no `__hash__` cannot be a dict key; the
+    adapter keys runs by identity, so every subprocess still works — and a
+    Codex one is still recorded."""
+
+    class Unhashable(subprocess.Popen):
+        def __eq__(self, other):
+            return self is other
+
+    rec = codex_wardex()
+    plain = Unhashable([sys.executable, "-c", "print('hi')"], stdout=subprocess.PIPE)
+    assert plain.communicate()[0].strip() == b"hi"
+    assert plain.wait() == 0
+    codex = Unhashable(
+        _cmd(fake_codex, "--json", "-"),
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        env=fake_codex.env(),
+    )
+    codex.communicate(b"prompt")
+    assert _one(_spans(rec), "invoke_agent").input_data == b"prompt"
+
+
+def test_a_host_that_only_polls_gets_its_run_when_the_process_ends(fake_codex, codex_wardex):
+    rec = codex_wardex(bridge=True)
+    proc = subprocess.Popen(
+        _cmd(fake_codex, "--json", "-"),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        env=fake_codex.env(),
+    )
+    while proc.poll() is None:
+        pass
+    spans = _spans(rec)
+    assert _one(spans, "invoke_agent").status is not StatusCode.ERROR
+    assert _one(spans, "chat").gen_ai.request_model == "gpt-6.1-sol"
+
+
+def test_args_by_keyword_is_found(fake_codex, codex_wardex):
+    rec = codex_wardex()
+    subprocess.Popen(
+        args=_cmd(fake_codex, "--json", "-"),
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        env=fake_codex.env(),
+    ).communicate(b"x")
+    assert _one(_spans(rec), "invoke_agent")
+
+
+def test_a_popen_another_library_wrapped_without_wraps_is_still_read(
+    fake_codex, codex_wardex, monkeypatch
+):
+    """APM agents wrap `Popen.__init__` as `(self, *args, **kwargs)`; the
+    adapter reads the host's own arguments, never the wrapper's signature."""
+    original = subprocess.Popen.__init__
+
+    def foreign(self, *args, **kwargs):
+        original(self, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess.Popen, "__init__", foreign)
+    rec = codex_wardex(bridge=True)
+    subprocess.run(
+        _cmd(fake_codex, "--json", "-"), input=b"x", capture_output=True, env=fake_codex.env()
+    )
+    assert _one(_spans(rec), "chat").gen_ai.request_model == "gpt-6.1-sol"
+
+
+def test_the_positional_table_matches_popen():
+    """`_POPEN_POSITIONAL` is read by index; it must be Popen's own order."""
+    import inspect
+
+    from wardex_sdk._adapters._codex_exec import _POPEN_POSITIONAL
+
+    params = list(inspect.signature(subprocess.Popen.__init__).parameters)[1:]
+    assert tuple(params[: len(_POPEN_POSITIONAL)]) == _POPEN_POSITIONAL
+
+
+def test_a_stream_error_event_alone_does_not_fail_the_run(fake_codex, codex_wardex):
+    rec = codex_wardex()
+    stdout = (
+        '{"type":"thread.started","thread_id":"t-1"}\n{"type":"turn.started"}\n'
+        '{"type":"error","message":"Reconnecting... 1/5"}\n'
+        '{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"ok"}}\n'
+        '{"type":"turn.completed","usage":{"input_tokens":5,"output_tokens":1}}\n'
+    )
+    subprocess.run(
+        _cmd(fake_codex, "--json", "-"),
+        input=b"x",
+        capture_output=True,
+        env=fake_codex.env(FAKE_CODEX_STDOUT=stdout),
+    )
+    run = _one(_spans(rec), "invoke_agent")
+    assert run.status is not StatusCode.ERROR
+    assert _extra(run)["wardex.codex.error"] == "Reconnecting... 1/5"

@@ -190,7 +190,8 @@ Codex adapter when `codex` is on `PATH`); `AdaptersConfig` selects and
 configures them.
 
 The Codex adapter only reads what your process already exchanges with
-`codex exec` — the prompt on stdin and the `--json` events on stdout — and
+`codex exec` — the prompt passed to `communicate()` and the `--json` events
+on stdout — and
 never changes the command. That stream names neither the model nor how many
 times it was asked, so the run carries the turn's total and says so. With
 `otel_bridge=True` the adapter adds a trace exporter override and a
