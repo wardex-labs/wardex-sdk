@@ -1452,3 +1452,66 @@ fn a_checkpoint_namespace_keeps_its_task_ids_on_both_wires() {
         assert!(shipped.is_empty(), "{producer}: {shipped:?}");
     }
 }
+
+/// A secret name the application gives one of these keys
+/// (`extra_secret_names`) outranks the exemption: it says the value is a
+/// secret whoever wrote it. Both wires replace the value whole and record
+/// the name, the conversation id's typed field included, which OTLP ships
+/// under `gen_ai.conversation.id`.
+#[test]
+fn a_secret_name_the_application_gives_an_exempt_key_wins_on_both_wires() {
+    let task_id = FRAMEWORK_ID_ATTRS[0].2;
+    let namespace = format!("outer:{task_id}");
+    let minted = MINTED_CONVERSATION_IDS[0].1;
+    for (key, value) in [
+        (SDK_COMPUTED_ATTRS[0].0, SDK_COMPUTED_ATTRS[0].2),
+        (FRAMEWORK_ID_ATTRS[0].0, task_id),
+        ("wardex.step.namespace", namespace.as_str()),
+        ("gen_ai.conversation.id", minted),
+    ] {
+        let engine = PiiEngine::with_names(&[], &[key.to_string()], &[]).unwrap();
+        let env = span_with(vec![text_kv(key, value)], "");
+        let mut masked = env.clone();
+        mask_envelope(&engine, &mut masked);
+        let span = the_span(&masked);
+        assert_eq!(span.extra[0].value, text_kv(key, "[SECRET]").value, "{key}");
+        assert_eq!(redaction_rules(span), vec![Rule::SecretUserName], "{key}");
+        let mut req = envelope_to_traces(env, PYTHON);
+        mask_otlp(&engine, &mut req);
+        assert_eq!(
+            otlp_texts(&req)
+                .get(&format!("Span[0].attributes[{key}]"))
+                .map(String::as_str),
+            Some("[SECRET]"),
+            "{key}"
+        );
+    }
+    let engine = PiiEngine::with_names(&[], &["gen_ai.conversation.id".into()], &[]).unwrap();
+    let env = pb::Envelope {
+        header: None,
+        items: vec![pb::EnvelopeItem {
+            header: None,
+            payload: Some(pb::envelope_item::Payload::Span(pb::Span {
+                conversation: Some(pb::ConversationContext {
+                    conversation_id: minted.into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })),
+        }],
+    };
+    let mut masked = env.clone();
+    mask_envelope(&engine, &mut masked);
+    let span = the_span(&masked);
+    assert_eq!(
+        span.conversation.as_ref().unwrap().conversation_id,
+        "[SECRET]"
+    );
+    assert_eq!(redaction_rules(span), vec![Rule::SecretUserName]);
+    let mut req = envelope_to_traces(env, PYTHON);
+    mask_otlp(&engine, &mut req);
+    assert_eq!(
+        otlp_texts(&req).get(CONVERSATION_ATTR).map(String::as_str),
+        Some("[SECRET]")
+    );
+}

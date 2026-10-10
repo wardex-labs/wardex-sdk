@@ -274,7 +274,9 @@ type SdkForm = fn(&str) -> bool;
 /// writes it under and that exact form. An attribute matching both ships as
 /// written and goes into no record; under any other key, or in any other
 /// form, the same text is judged like everything else the host put on the
-/// span. `tests/sdk_generated_fields.rs` proves both sides, and
+/// span, and so is any value under a key the application named a secret
+/// (`extra_secret_names`), which outranks the exemption.
+/// `tests/sdk_generated_fields.rs` proves both sides, and
 /// `sdks/python/tests/test_sdk_attribute_census.py` reads every attribute the
 /// SDK writes out of its source and fails until each is classified, this
 /// list included.
@@ -307,6 +309,17 @@ fn otlp_text(v: &Option<otlp_pb::common::AnyValue>) -> Option<&str> {
         otlp_pb::common::any_value::Value::StringValue(s) => Some(s),
         _ => None,
     }
+}
+
+/// Replace a text field that sits under a secret name, as `replace_any`
+/// replaces a string attribute.
+fn replace_text(m: &mut Masker<'_>, s: &mut String, rule: Rule, key: &str) -> bool {
+    if s.is_empty() || s == PLACEHOLDER {
+        return false;
+    }
+    *s = PLACEHOLDER.into();
+    m.report.record(rule, Some(key));
+    true
 }
 
 fn mask_string(m: &mut Masker<'_>, s: &mut String) -> bool {
@@ -517,15 +530,19 @@ fn mask_span(engine: &PiiEngine, span: &mut pb::Span) {
     // OTLP mapping ships `extra` under the same keys, and the conversation
     // id's key also holds the typed field there, so `mask_otlp_span` judges
     // the same pairs the same way and the two wires agree on what was
-    // masked.
-    for kv in extra
-        .iter_mut()
-        .filter(|kv| !is_sdk_value_attr(&kv.key, pb_text(&kv.value)))
-    {
-        if kv.key == STEP_NAMESPACE_KEY && m.key_rule(&kv.key).is_none() {
-            if let Some(pb::AnyValue {
-                value: Some(pb::any_value::Value::StringValue(ns)),
-            }) = &mut kv.value
+    // masked. A secret name the application gave a key outranks all of it:
+    // `extra_secret_names` says the value is a secret whoever wrote it.
+    for kv in extra.iter_mut() {
+        if m.key_rule(&kv.key).is_none() {
+            if is_sdk_value_attr(&kv.key, pb_text(&kv.value)) {
+                continue;
+            }
+            if let (
+                STEP_NAMESPACE_KEY,
+                Some(pb::AnyValue {
+                    value: Some(pb::any_value::Value::StringValue(ns)),
+                }),
+            ) = (kv.key.as_str(), &mut kv.value)
             {
                 hit |= mask_keeping_task_ids(m, ns);
                 continue;
@@ -582,9 +599,13 @@ fn mask_span(engine: &PiiEngine, span: &mut pb::Span) {
     }) = conversation
     {
         // The host's when it named the conversation, the SDK's when it did
-        // not: masked, except a value in the form the SDK mints.
-        if !is_sdk_minted_id(conversation_id) {
-            hit |= mask_string(m, conversation_id);
+        // not: masked, except a value in the form the SDK mints. OTLP ships
+        // it under `gen_ai.conversation.id`, so a secret name the
+        // application gave that key replaces it here as it does there.
+        match m.key_rule(CONVERSATION_ID_KEY) {
+            Some(rule) => hit |= replace_text(m, conversation_id, rule, CONVERSATION_ID_KEY),
+            None if !is_sdk_minted_id(conversation_id) => hit |= mask_string(m, conversation_id),
+            None => {}
         }
         hit |= mask_string(m, session_id);
     }
@@ -855,14 +876,20 @@ fn mask_otlp_span(engine: &PiiEngine, span: &mut otlp_pb::trace::Span) -> Option
     // `extra`'s pairs arrive here under their own keys, and the typed
     // conversation id under `gen_ai.conversation.id` — see `mask_span`. The
     // SDK's own connection id arrives under a name only the SDK may write.
-    for kv in attributes.iter_mut().filter(|kv| {
-        !SDK_SPAN_KEYS.contains(&kv.key.as_str())
-            && !is_sdk_value_attr(&kv.key, otlp_text(&kv.value))
-    }) {
-        if kv.key == STEP_NAMESPACE_KEY && m.key_rule(&kv.key).is_none() {
-            if let Some(otlp_pb::common::AnyValue {
-                value: Some(otlp_pb::common::any_value::Value::StringValue(ns)),
-            }) = &mut kv.value
+    for kv in attributes
+        .iter_mut()
+        .filter(|kv| !SDK_SPAN_KEYS.contains(&kv.key.as_str()))
+    {
+        if m.key_rule(&kv.key).is_none() {
+            if is_sdk_value_attr(&kv.key, otlp_text(&kv.value)) {
+                continue;
+            }
+            if let (
+                STEP_NAMESPACE_KEY,
+                Some(otlp_pb::common::AnyValue {
+                    value: Some(otlp_pb::common::any_value::Value::StringValue(ns)),
+                }),
+            ) = (kv.key.as_str(), &mut kv.value)
             {
                 hit |= mask_keeping_task_ids(m, ns);
                 continue;

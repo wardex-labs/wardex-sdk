@@ -383,7 +383,12 @@ All notable changes to this project are documented here. The format follows
   inside `wardex.step.namespace`, on both wires. The node names in the
   namespace are yours and are masked as before, as is the same id anywhere
   else or any other form under these two keys. The card rule is the only
-  built-in rule that can match inside the form.
+  built-in rule that can match inside the form. A key you list in
+  `extra_secret_names` now outranks every value the SDK leaves alone this
+  way, these two, the MCP tool-list digest and a minted conversation id:
+  the value becomes `[SECRET]` on both wires, the conversation id's
+  typed field on the wardex envelope included, where before the exemption
+  won.
 - **A wrong project key, a receiver that is down, and every other loss no
   span can carry now say so once with `debug` off, and are counted.**
   Before, with the default `debug=False`, an export your receiver refused or
