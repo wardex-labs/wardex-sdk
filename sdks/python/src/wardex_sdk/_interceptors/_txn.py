@@ -136,7 +136,9 @@ def _url_target(txn: _Txn, origin: str, withhold: bool = False) -> str:
     A target in absolute form (`GET http://h:80/p HTTP/1.1`: a request line written for a forward
     proxy, or by hand) already IS the URL, and is taken whole; prefixed with the origin it read
     `http://127.0.0.1:80http://h:80/p`. Its userinfo is the native masker's to replace, as in any
-    URL, and its host is the one the client asked for, while `server.address` stays the peer.
+    URL, and its host is the one the client asked for, while `server.address` stays the peer. The
+    two other forms are not paths either: `OPTIONS *` names the origin itself, and a `CONNECT`'s
+    `host:443` names the authority the tunnel was asked for (a refused one ships a span).
 
     The query rides in the URL like a body rides in the payload, and under the same policy: when the
     seam withholds a transaction's bodies (capture admitted only by wardex's own degradation), the
@@ -144,4 +146,10 @@ def _url_target(txn: _Txn, origin: str, withhold: bool = False) -> str:
     userinfo is replaced even when masking is off.
     """
     target = txn.path if withhold or txn.target is None else txn.target
-    return target if _ABSOLUTE_FORM.match(target) else f"{origin}{target}"
+    if _ABSOLUTE_FORM.match(target):
+        return target
+    if target == "*":  # asterisk form (`OPTIONS *`): the server itself, not a path on it
+        return origin
+    if txn.method == "CONNECT" and not target.startswith("/"):  # authority form (`h:443`)
+        return f"{origin.partition('://')[0]}://{target}"
+    return f"{origin}{target}"
