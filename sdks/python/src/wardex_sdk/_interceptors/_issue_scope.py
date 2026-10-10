@@ -47,3 +47,16 @@ def issued_scope() -> ScopeSnapshot:
     with _READ:
         snapshot = _hub.get_merged_tags_and_user()
     return snapshot
+
+
+def same_issuer(first: ScopeSnapshot, later: ScopeSnapshot) -> bool:
+    """Was `later` issued under the identity `first` names, for work that ships as ONE span (a
+    WebSocket session)? The same user id, or neither has one, and the same value for every tag
+    `first` carried. A tag added afterwards, or the same user gaining an email, is that identity
+    annotating its own work, not another one; a different user id, a tag the first snapshot had
+    now changed or gone (another tenant's request, or a thread outside every scope) is."""
+    tags, user = first
+    later_tags, later_user = later
+    if getattr(user, "id", None) != getattr(later_user, "id", None):
+        return False
+    return all(later_tags.get(key) == value for key, value in tags.items())
