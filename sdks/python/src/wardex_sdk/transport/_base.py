@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import abc
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 from .._assembly import counters, diag_info, guard, report_once
 from .._native import NATIVE_OK, native, unavailable_reason
@@ -215,6 +215,52 @@ def _report_reserved_overwritten(overwritten: int) -> None:
     )
 
 
+def _report_payload_dropped(dropped: int) -> None:
+    """Count and say the spans exported without their payload.
+
+    A span too large for `max_otlp_request_bytes` on its own ships without
+    its input, output and tool payload rather than not at all. The span says
+    so -- `otlp_attribute_truncated`, and `wardex.payload_dropped.reason`
+    naming the cap -- but only to whoever opens it, so the count is here too,
+    with the knob that brings the payload back.
+    """
+    if not dropped:
+        return
+    for _ in range(dropped):
+        counters.bump("transport.otlp.span_payload_dropped")
+    report_once(
+        f"{dropped} span(s) exceeded max_otlp_request_bytes on their own and were "
+        "exported without their payload (input, output, tool arguments and "
+        "results), marked with wardex.payload_dropped.reason. Raise "
+        "max_otlp_request_bytes if your collector accepts more (counted under "
+        "transport.otlp.span_payload_dropped)",
+        key="transport.otlp.span_payload_dropped",
+    )
+
+
+class _EncodeReports(NamedTuple):
+    """What one OTLP encode could not ship as captured, for the caller to count.
+
+    Returned uncounted by `Transport._encode_requests` and counted by
+    `_report_encode` at the point the batch's fate is known, so a batch handed
+    back as `UNDELIVERED` and encoded again is counted once.
+    """
+
+    unmarshalled: list[str]
+    """Reasons for the spans the marshaller skipped, `"{name}: {exception}"`."""
+    overwritten: int
+    """Host attributes under a reserved `wardex.transport.*` name not shipped as set."""
+    payload_dropped: int
+    """Spans exported without their payload to fit `max_otlp_request_bytes`."""
+
+
+def _report_encode(reports: _EncodeReports, *, debug: bool) -> None:
+    """Count and say everything in `reports`, each under its own counter."""
+    _report_unmarshalled(reports.unmarshalled, debug=debug)
+    _report_reserved_overwritten(reports.overwritten)
+    _report_payload_dropped(reports.payload_dropped)
+
+
 class Transport(abc.ABC):
     """The one advertised extension point: where finished envelopes go.
 
@@ -346,28 +392,24 @@ class Transport(abc.ABC):
         the wire to carry a marker. The report lives here, concrete and
         shared, so every transport that encodes gets it.
         """
-        bodies, unmarshalled, overwritten = self._encode_requests(envelope, compress=compress)
-        _report_unmarshalled(unmarshalled, debug=_debug_enabled())
-        _report_reserved_overwritten(overwritten)
+        bodies, reports = self._encode_requests(envelope, compress=compress)
+        _report_encode(reports, debug=_debug_enabled())
         return bodies
 
     def _encode_requests(
         self, envelope: Envelope, *, compress: bool
-    ) -> tuple[tuple[bytes, ...], list[str], int]:
-        """`encode()` without its two counted reports: the bodies, the reasons
-        for the spans the marshaller skipped, and the number of host attributes
-        under a reserved `wardex.transport.*` name the mapping replaced or left
-        out, for a transport that has to decide the batch's fate before it
-        counts them.
+    ) -> tuple[tuple[bytes, ...], _EncodeReports]:
+        """`encode()` without its counted reports: the bodies, and an
+        `_EncodeReports` of what the encode could not ship as captured, for a
+        transport that has to decide the batch's fate before it counts them.
 
-        `encode()` counts both the moment it encodes. A transport that may
+        `encode()` counts them the moment it encodes. A transport that may
         then hand the batch back as `UNDELIVERED` -- the encode spent its
         budget -- would have the next attempt meet and count the same span
         again, so one bad span read as two. Such a transport encodes here and
-        calls `_report_unmarshalled` and `_report_reserved_overwritten` at the
-        point the batch's fate is known. Masking, limits and the over-cap
-        report are identical to `encode()`'s; only the timing of those two
-        reports moves.
+        calls `_report_encode` at the point the batch's fate is known.
+        Masking, limits and the over-cap report are identical to `encode()`'s;
+        only the timing of the counted reports moves.
         """
         if not NATIVE_OK:
             # Reachable from a hand-constructed transport that never went
@@ -383,13 +425,15 @@ class Transport(abc.ABC):
         # more -- it skips that one span and names it, for the caller to
         # count and report. A raise here is still a raise: a corrupt envelope
         # or an absent native module is not a per-span loss.
-        bodies, dropped, unmarshalled, overwritten = native.codec.encode_otlp_requests(
-            envelope,
-            self._pii_mode,
-            list(self._pii_disabled),
-            self._limits,
-            compress,
-            **self._pii_names(),
+        bodies, dropped, unmarshalled, overwritten, payload_dropped = (
+            native.codec.encode_otlp_requests(
+                envelope,
+                self._pii_mode,
+                list(self._pii_disabled),
+                self._limits,
+                compress,
+                **self._pii_names(),
+            )
         )
         if dropped:
             # A span so large it would not fit a request even with its payload
@@ -407,7 +451,7 @@ class Transport(abc.ABC):
                 f"max_otlp_request_bytes if your collector accepts more.",
                 key="transport.otlp.span_over_request_cap",
             )
-        return tuple(bodies), unmarshalled, overwritten
+        return tuple(bodies), _EncodeReports(unmarshalled, overwritten, payload_dropped)
 
     def _set_pii_policy(self, policy: PIIConfig) -> None:
         """Install the PII policy resolved from `WardexConfig`. Called by

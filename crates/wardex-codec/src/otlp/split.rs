@@ -30,6 +30,11 @@ pub struct Requests {
     /// dropped. Returned rather than logged here: the core has no channel to a
     /// user, and a loss that only the core knows about is the silent kind.
     pub dropped_spans: usize,
+    /// Spans that were sent only because their payload was removed: each
+    /// carries `wardex.payload_dropped.reason` naming the cap that removed it.
+    /// A span counted under `dropped_spans` is not counted here — it was not
+    /// sent at all.
+    pub payload_dropped_spans: usize,
 }
 
 /// Encode an export, splitting it into as many bodies as
@@ -154,9 +159,16 @@ fn emit(
         // its payload: dropping it keeps the node in the trace, its parent edge,
         // its timing and its semantics, and says on the span itself what was
         // removed.
-        map::drop_payload_attributes(&mut span);
+        let removed = map::drop_payload_attributes(&mut span);
         match fit(&template.request(vec![span]), cap, compress)? {
-            Fit::Fits(body) => out.bodies.push(body),
+            Fit::Fits(body) => {
+                out.bodies.push(body);
+                // Counted for the same reason `dropped_spans` is: the marker
+                // reaches whoever reads the span, and nobody who does not.
+                if removed {
+                    out.payload_dropped_spans += 1;
+                }
+            }
             // A span whose METADATA alone will not fit — a pathological name or
             // an event list past the cap. Counted, so the caller can say one
             // span was lost rather than let a batch quietly arrive short.
@@ -313,6 +325,7 @@ mod tests {
             encode_requests(request(vec![payload_span(1, 10)]), Limits::default(), false).unwrap();
         assert_eq!(out.bodies.len(), 1);
         assert_eq!(out.dropped_spans, 0);
+        assert_eq!(out.payload_dropped_spans, 0);
     }
 
     #[test]
@@ -441,6 +454,7 @@ mod tests {
         // instead and ships without its payload.
         assert_eq!(under.bodies.len(), 1);
         assert_eq!(under.dropped_spans, 0);
+        assert_eq!(under.payload_dropped_spans, 1);
         let sp = &decode(&under.bodies[0], false).resource_spans[0].scope_spans[0].spans[0];
         assert!(!sp.attributes.iter().any(|kv| kv.key == "wardex.input_data"));
     }
@@ -454,6 +468,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out.dropped_spans, 0);
+        assert_eq!(
+            out.payload_dropped_spans, 1,
+            "only the giant lost its payload"
+        );
         assert_eq!(span_ids(&out, false), vec![1, 2], "the small span went too");
         let giant = out
             .bodies
@@ -475,6 +493,19 @@ mod tests {
             .iter()
             .any(|kv| kv.key == "wardex.limitations");
         assert!(marked, "the loss reached the wire unmarked");
+        // And the knob that removed it is named on the span, beside the marker.
+        let reason = giant
+            .attributes
+            .iter()
+            .find(|kv| kv.key == map::PAYLOAD_DROPPED_REASON_KEY)
+            .and_then(|kv| kv.value.as_ref())
+            .and_then(|v| v.value.as_ref());
+        assert_eq!(
+            reason,
+            Some(&otlp_pb::common::any_value::Value::StringValue(
+                "max_otlp_request_bytes".into()
+            ))
+        );
     }
 
     #[test]
@@ -491,6 +522,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out.dropped_spans, 1);
+        // Its payload was removed on the way, but it was not sent: it is a
+        // dropped span, and counting it as a payload-dropped one too would
+        // report one loss twice.
+        assert_eq!(out.payload_dropped_spans, 0);
         assert_eq!(span_ids(&out, false), vec![2]);
     }
 }

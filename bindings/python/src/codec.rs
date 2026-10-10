@@ -17,7 +17,7 @@
 #![allow(clippy::useless_conversion)]
 
 use pyo3::prelude::*;
-use pyo3::types::{PyBool, PyBytes, PyDict, PyList};
+use pyo3::types::{PyBool, PyBytes, PyDict, PyInt, PyList};
 
 use wardex_core::codec::otlp::{self, otlp_pb};
 use wardex_core::codec::proto::wardex::v1 as pb;
@@ -47,19 +47,85 @@ fn enum_str(obj: &Bound<PyAny>) -> PyResult<String> {
 
 // --- value types ---
 
-/// str|int|float|bool Python scalar → proto AnyValue. (bool is a subtype of int, so check it first)
-fn any_value(v: &Bound<PyAny>) -> PyResult<pb::AnyValue> {
+/// What one host attribute value became on the wire.
+enum HostValue {
+    /// Shipped as the type the host gave it.
+    Kept(pb::AnyValue),
+    /// Shipped, but not as the host's type: an integer outside `int64`, as
+    /// the string of its decimal digits. Named under `UNMARSHALLED_FIELD_KEY`.
+    Digits(pb::AnyValue),
+    /// Nothing the wire can hold: left out, and named under
+    /// `UNMARSHALLED_FIELD_KEY`.
+    Unreadable,
+}
+
+/// `Ok(Some)` for a value, `Ok(None)` for a failure that is an `Exception` —
+/// a host value this read could not take — and `Err` for one that is not:
+/// a `KeyboardInterrupt` raised from a host `__index__`, `__float__` or
+/// `__str__` is the host's control flow, and must reach the host untouched.
+fn tolerated<T>(py: Python<'_>, r: PyResult<T>) -> PyResult<Option<T>> {
+    match r {
+        Ok(v) => Ok(Some(v)),
+        Err(e) if e.is_instance_of::<pyo3::exceptions::PyException>(py) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// A host's attribute value → proto AnyValue, never by raising.
+///
+/// `Span.set_attribute` promises `str | int | float | bool`, and validates
+/// nothing, so this reads what arrives in that order (a bool is an int, so it
+/// goes first) and refuses to bend a value into a type it is not. An integer
+/// outside `int64` used to fall through to the `float` read and ship as
+/// `1.18e+21` — a different number, under the type of a measurement, with
+/// nothing on the span to say so; it now ships as its exact decimal digits,
+/// named. A value no read takes (`10**400` once past every numeric read
+/// before this, `object()`, a `str` holding a lone surrogate) used to raise
+/// here, and on the export path that raise cost the WHOLE batch: the client's
+/// drain is fail-closed and silent off-debug. It is now left out, named, and
+/// the span and its batch ship.
+///
+/// The digits come from `int.__repr__` rather than from the value's own
+/// `__str__`, which an `int` subclass may override. A value too long for
+/// Python's integer-to-string limit (`sys.get_int_max_str_digits()`, 4300 by
+/// default) cannot be written that way and is the unreadable kind.
+fn any_value(v: &Bound<PyAny>) -> PyResult<HostValue> {
     use pb::any_value::Value;
-    let value = if v.is_instance_of::<PyBool>() {
-        Value::BoolValue(v.extract()?)
-    } else if let Ok(i) = v.extract::<i64>() {
-        Value::IntValue(i)
-    } else if let Ok(f) = v.extract::<f64>() {
-        Value::DoubleValue(f)
-    } else {
-        Value::StringValue(v.extract()?)
-    };
-    Ok(pb::AnyValue { value: Some(value) })
+    let py = v.py();
+    let kept = |value| HostValue::Kept(pb::AnyValue { value: Some(value) });
+    if v.is_instance_of::<PyBool>() {
+        return Ok(match tolerated(py, v.extract::<bool>())? {
+            Some(b) => kept(Value::BoolValue(b)),
+            None => HostValue::Unreadable,
+        });
+    }
+    // Before the `int` check: an integer type that is not an `int` subclass
+    // (numpy's) still reads through `__index__` here.
+    if let Some(i) = tolerated(py, v.extract::<i64>())? {
+        return Ok(kept(Value::IntValue(i)));
+    }
+    if v.is_instance_of::<PyInt>() {
+        let digits = tolerated(
+            py,
+            py.get_type_bound::<PyInt>()
+                .getattr("__repr__")
+                .and_then(|repr| repr.call1((v,)))
+                .and_then(|s| s.extract::<String>()),
+        )?;
+        return Ok(match digits {
+            Some(d) => HostValue::Digits(pb::AnyValue {
+                value: Some(Value::StringValue(d)),
+            }),
+            None => HostValue::Unreadable,
+        });
+    }
+    if let Some(f) = tolerated(py, v.extract::<f64>())? {
+        return Ok(kept(Value::DoubleValue(f)));
+    }
+    Ok(match tolerated(py, v.extract::<String>())? {
+        Some(s) => kept(Value::StringValue(s)),
+        None => HostValue::Unreadable,
+    })
 }
 
 fn kv_str(key: &str, v: String) -> pb::KeyValue {
@@ -123,15 +189,42 @@ fn kv_strs(key: &str, vs: Vec<String>) -> pb::KeyValue {
     }
 }
 
-/// Python tuple[(key, scalar)] → Vec<KeyValue>.
-fn kv_list(extra: &Bound<PyAny>, out: &mut Vec<pb::KeyValue>) -> PyResult<()> {
+/// Python tuple[(key, scalar)] → Vec<KeyValue>, with the key of every value
+/// that did not ship as the host gave it pushed onto `unmarshalled`.
+fn kv_list(
+    extra: &Bound<PyAny>,
+    out: &mut Vec<pb::KeyValue>,
+    unmarshalled: &mut Vec<String>,
+) -> PyResult<()> {
     for pair in extra.iter()? {
         let pair = pair?;
         let key: String = pair.get_item(0)?.extract()?;
-        out.push(pb::KeyValue {
-            key,
-            value: Some(any_value(&pair.get_item(1)?)?),
-        });
+        match any_value(&pair.get_item(1)?)? {
+            HostValue::Kept(value) => out.push(pb::KeyValue {
+                key,
+                value: Some(value),
+            }),
+            HostValue::Digits(value) => {
+                unmarshalled.push(key.clone());
+                out.push(pb::KeyValue {
+                    key,
+                    value: Some(value),
+                });
+            }
+            HostValue::Unreadable => unmarshalled.push(key),
+        }
+    }
+    Ok(())
+}
+
+/// `kv_list` for a record whose attributes are its own: an event's, a
+/// snapshot's. The keys it could not ship as given are named on that same
+/// record, under `UNMARSHALLED_FIELD_KEY`, one attribute however many.
+fn kv_list_noted(extra: &Bound<PyAny>, out: &mut Vec<pb::KeyValue>) -> PyResult<()> {
+    let mut unmarshalled = Vec::new();
+    kv_list(extra, out, &mut unmarshalled)?;
+    if !unmarshalled.is_empty() {
+        out.push(kv_str(UNMARSHALLED_FIELD_KEY, unmarshalled.join(",")));
     }
     Ok(())
 }
@@ -386,15 +479,17 @@ fn flatten_tool(t: &Bound<PyAny>, out: &mut Vec<pb::KeyValue>) -> PyResult<()> {
     Ok(())
 }
 
-/// The key that names a typed-block field whose VALUE the marshaller could
-/// not read as the type the block declares. The rest of the span ships; the
-/// field is omitted; this note says which one. Without it a
-/// `ConversationContext(conversation_id=uuid)` or an
-/// `EvaluationAttributes(score_value="0.9")` raised out of the encoder and
-/// the client dropped the ENTIRE batch, every good span with it, in silence.
-/// One attribute per span, comma-joined in block order: two bad fields
-/// used to push the key twice, and an OTLP decoder keeps one of a
-/// duplicated key.
+/// The key that names each value the marshaller could not ship as the host
+/// gave it: a typed-block field whose value is not the type the block
+/// declares, or an attribute the host set (`Span.set_attribute`, a snapshot's
+/// `attributes`) to a value the wire cannot hold. The rest of the record
+/// ships; such a value is omitted — except an integer outside `int64`, which
+/// ships as its decimal digits in a string — and this note says which. Without
+/// it a `ConversationContext(conversation_id=uuid)` or a `set_attribute("k",
+/// 10**400)` raised out of the encoder and the client dropped the ENTIRE
+/// batch, every good span with it, in silence. One attribute per record,
+/// comma-joined in the order the values were read: two bad fields used to
+/// push the key twice, and an OTLP decoder keeps one of a duplicated key.
 const UNMARSHALLED_FIELD_KEY: &str = "wardex.codec.unmarshalled";
 
 /// `float(v)`-tolerant read: an f64, or a string that parses as one.
@@ -778,7 +873,7 @@ fn state_to_proto(s: &Bound<PyAny>) -> PyResult<pb::StateSnapshot> {
         conversation_state: s.getattr("conversation_state")?.extract()?,
         ..Default::default()
     };
-    kv_list(&s.getattr("attributes")?, &mut ss.attributes)?;
+    kv_list_noted(&s.getattr("attributes")?, &mut ss.attributes)?;
     for r in s.getattr("input_refs")?.iter()? {
         let r = r?;
         let mut ir = pb::InputRef {
@@ -838,8 +933,10 @@ fn state_to_proto(s: &Bound<PyAny>) -> PyResult<pb::StateSnapshot> {
 ///
 /// The head is the core fields and the caller's `extra`, in wire order
 /// ahead of the typed blocks so the attribute sequence is unchanged by the
-/// split.
-fn span_head_to_proto(sp: &Bound<PyAny>) -> PyResult<pb::Span> {
+/// split. An `extra` value the wire cannot hold as given is named onto
+/// `unmarshalled` rather than raised, so the head stays the encoder's own:
+/// nothing a host can set fails it.
+fn span_head_to_proto(sp: &Bound<PyAny>, unmarshalled: &mut Vec<String>) -> PyResult<pb::Span> {
     let ctx = sp.getattr("context")?;
     let mut span = pb::Span {
         trace_id: id_bytes(&ctx.getattr("trace_id")?)?,
@@ -877,7 +974,7 @@ fn span_head_to_proto(sp: &Bound<PyAny>) -> PyResult<pb::Span> {
             .push(map_capture_source(&enum_str(&src?)?));
     }
     // extra passthrough
-    kv_list(&sp.getattr("extra")?, &mut span.extra)?;
+    kv_list(&sp.getattr("extra")?, &mut span.extra, unmarshalled)?;
     Ok(span)
 }
 
@@ -885,8 +982,13 @@ fn span_head_to_proto(sp: &Bound<PyAny>) -> PyResult<pb::Span> {
 /// `retrieval` and `evaluation` flattened into `extra`, `conversation` and
 /// `call_site` written to the typed fields the schema declares for them. The
 /// one step whose failure `envelope_to_proto` may turn into a skipped span,
-/// because every value read here was written by the host.
-fn flatten_typed_blocks(sp: &Bound<PyAny>, span: &mut pb::Span) -> PyResult<()> {
+/// because every value read here was written by the host. A field read here
+/// but not shipped as given is named onto `unmarshalled`, after the head's.
+fn flatten_typed_blocks(
+    sp: &Bound<PyAny>,
+    span: &mut pb::Span,
+    unmarshalled: &mut Vec<String>,
+) -> PyResult<()> {
     if let Some(g) = opt(sp, "gen_ai")? {
         flatten_gen_ai(&g, &mut span.extra)?;
     }
@@ -902,28 +1004,17 @@ fn flatten_typed_blocks(sp: &Bound<PyAny>, span: &mut pb::Span) -> PyResult<()> 
     if let Some(r) = opt(sp, "retrieval")? {
         flatten_retrieval(&r, &mut span.extra)?;
     }
-    // The fields the blocks below could not read are named under ONE key:
-    // a key pushed per field would be a duplicate attribute, of which an
-    // OTLP decoder keeps one, and the other loss would go unnamed. Owned
-    // strings, deliberately: `Vec<&'static str>` is the shape of a
-    // limitation-marker channel in this codebase and the census reads every
-    // such declaration as one; these are attribute names, not markers.
-    let mut unmarshalled: Vec<String> = Vec::new();
     // The two host-facing blocks the schema gives a typed field of their own.
     // They are written THERE and nowhere else: a value with two homes on one
     // envelope is a value whose readers can each pick a different one.
     if let Some(c) = opt(sp, "conversation")? {
-        span.conversation = Some(conversation_to_proto(&c, &mut unmarshalled));
+        span.conversation = Some(conversation_to_proto(&c, unmarshalled));
     }
     if let Some(c) = opt(sp, "call_site")? {
-        span.call_site = Some(call_site_to_proto(&c, &mut unmarshalled));
+        span.call_site = Some(call_site_to_proto(&c, unmarshalled));
     }
     if let Some(e) = opt(sp, "evaluation")? {
-        flatten_evaluation(&e, &mut span.extra, &mut unmarshalled)?;
-    }
-    if !unmarshalled.is_empty() {
-        span.extra
-            .push(kv_str(UNMARSHALLED_FIELD_KEY, unmarshalled.join(",")));
+        flatten_evaluation(&e, &mut span.extra, unmarshalled)?;
     }
     Ok(())
 }
@@ -976,7 +1067,7 @@ fn events_to_proto(sp: &Bound<PyAny>, out: &mut Vec<pb::SpanEvent>) -> PyResult<
             time_unix_nano: ev.getattr("timestamp_ns")?.extract()?,
             ..Default::default()
         };
-        kv_list(&ev.getattr("attributes")?, &mut event.attributes)?;
+        kv_list_noted(&ev.getattr("attributes")?, &mut event.attributes)?;
         out.push(event);
     }
     Ok(())
@@ -1104,8 +1195,16 @@ fn envelope_to_proto(
     let mut unmarshalled = Vec::new();
     for sp in env.getattr("spans")?.iter()? {
         let sp = sp?;
-        let mut span = span_head_to_proto(&sp)?;
-        if let Err(e) = flatten_typed_blocks(&sp, &mut span) {
+        // What the head and the typed blocks could not ship as given, named
+        // under ONE key: a key pushed per field would be a duplicate
+        // attribute, of which an OTLP decoder keeps one, and the other loss
+        // would go unnamed. Owned strings, deliberately: `Vec<&'static str>`
+        // is the shape of a limitation-marker channel in this codebase and
+        // the census reads every such declaration as one; these are attribute
+        // names, not markers.
+        let mut not_as_given: Vec<String> = Vec::new();
+        let mut span = span_head_to_proto(&sp, &mut not_as_given)?;
+        if let Err(e) = flatten_typed_blocks(&sp, &mut span, &mut not_as_given) {
             // Only an `Exception` is a value the marshaller could not read. A
             // `BaseException` that is not one — `KeyboardInterrupt` from a
             // host `__str__`, `SystemExit` — is the host's control flow and
@@ -1116,6 +1215,12 @@ fn envelope_to_proto(
             }
             unmarshalled.push(skip_reason(&sp, &e)?);
             continue;
+        }
+        // After the typed blocks' attributes and before the tail's, where the
+        // note has always sat.
+        if !not_as_given.is_empty() {
+            span.extra
+                .push(kv_str(UNMARSHALLED_FIELD_KEY, not_as_given.join(",")));
         }
         span_tail_to_proto(&sp, &mut span)?;
         items.push(pb::EnvelopeItem {
@@ -1462,6 +1567,10 @@ fn envelope_to_dict(py: Python<'_>, env: &pb::Envelope) -> PyResult<PyObject> {
                 refs.append(rd)?;
             }
             sd.set_item("input_refs", refs)?;
+            // The snapshot's markers and its unmarshalled-value note ride
+            // here (`wardex.limitations`, `wardex.codec.unmarshalled`): a
+            // decoder that left the bag out left both unassertable.
+            sd.set_item("attributes", kv_to_py(py, &ss.attributes)?)?;
             if let Some(td_set) = &ss.tool_definitions {
                 let tdd = PyDict::new_bound(py);
                 tdd.set_item("set_hash", &td_set.set_hash)?;
@@ -1849,6 +1958,10 @@ fn encode_otlp_traces(
     })
 }
 
+/// What `encode_otlp_requests` hands the caller: the request bodies, then each
+/// count the export path reports, in the order that function's doc gives.
+type OtlpExport = (Py<PyAny>, usize, Vec<String>, usize, usize);
+
 /// Envelope → `(request bodies, spans dropped)` — the export path's encoder.
 ///
 /// Several bodies rather than one because an OTLP request is rejected WHOLE: a
@@ -1862,10 +1975,12 @@ fn encode_otlp_traces(
 /// the spans that could not be MARSHALLED at all (a typed block holding a
 /// value of the wrong Python type), each as `"{name}: {reason}"`; the fourth
 /// counts the host attributes under a reserved `wardex.transport.*` name the
-/// mapping did not ship as set (`otlp::map::Mapped`). They exist because the
-/// core has no channel to a user: a loss reported nowhere is the silent kind,
-/// and the caller is the only one who can say it out loud. The third used to
-/// be a raise, and the raise cost the whole batch.
+/// mapping did not ship as set (`otlp::map::Mapped`); the fifth counts the
+/// spans that shipped only because their payload was removed to fit
+/// `max_otlp_request_bytes` (`otlp::split::Requests::payload_dropped_spans`).
+/// They exist because the core has no channel to a user: a loss reported
+/// nowhere is the silent kind, and the caller is the only one who can say it
+/// out loud. The third used to be a raise, and the raise cost the whole batch.
 #[pyfunction]
 #[pyo3(signature = (envelope, pii_mode = "off", pii_disabled = Vec::new(), limits = None, compress = true, *, pii_extra_names = Vec::new(), pii_reveal_names = Vec::new()))]
 // One argument per Python keyword: the signature IS the Python API, and a
@@ -1880,7 +1995,7 @@ fn encode_otlp_requests(
     compress: bool,
     pii_extra_names: Vec<String>,
     pii_reveal_names: Vec<String>,
-) -> PyResult<(Py<PyAny>, usize, Vec<String>, usize)> {
+) -> PyResult<OtlpExport> {
     let policy = PiiPolicy {
         mode: pii_mode,
         disabled: pii_disabled,
@@ -1906,6 +2021,7 @@ fn encode_otlp_requests(
             requests.dropped_spans,
             unmarshalled,
             overwritten,
+            requests.payload_dropped_spans,
         ))
     })
 }

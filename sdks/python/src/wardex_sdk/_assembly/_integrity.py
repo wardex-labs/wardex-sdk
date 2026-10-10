@@ -764,13 +764,13 @@ Two emit sites, and the first is the mechanism the second restates.
     """An attribute value hit ``max_otlp_attribute_bytes`` on the way out, so
     what a backend shows for it is a prefix of what wardex captured.
 
-    Emitted from ``crates/wardex-codec/src/otlp/map.rs`` — ``cap_attribute_values``
-    for a value over the bound, and ``drop_payload_attributes`` for a span whose
-    encoded size alone exceeds ``max_otlp_request_bytes``, where the payload
-    goes entirely so the span itself can still be exported. Both attach it by
-    proto NUMBER rather than by a string literal, which is why
-    ``test_limitation_census.py`` scans Rust for ``Limitation::`` references as
-    well as for marker literals.
+    Emitted from ``crates/wardex-codec/src/otlp/map.rs`` — ``cap_attribute_values`` for a value
+    over the bound, and ``drop_payload_attributes`` for a span whose encoded size alone exceeds
+    ``max_otlp_request_bytes``, where the payload goes entirely so the span can still be exported.
+    That span also carries ``wardex.payload_dropped.reason = "max_otlp_request_bytes"``, the knob
+    that brings the payload back (raising ``max_otlp_attribute_bytes`` does not), and is counted as
+    ``transport.otlp.span_payload_dropped``. Both attach it by proto NUMBER, which is why
+    ``test_limitation_census.py`` scans Rust for ``Limitation::`` references as well as literals.
 
     The one marker in this enum that describes the EXPORT rather than the
     capture, and the reason it is not ``BODY_CAP_EXCEEDED``: that one names
