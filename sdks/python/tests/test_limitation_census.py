@@ -422,6 +422,10 @@ _MEMBER_SITES: dict[str, frozenset[str]] = {
             # A callback body that failed under `_contained`: the live agent's
             # span (else the run root's) says one of its spans is missing.
             "_adapters/_openai_agents.py",
+            # A Claude Agent SDK session whose `initialize` handshake carried
+            # none of the adapter's hooks (a `query` bound before `init()`):
+            # its root says the hook-built spans below it are missing.
+            "_adapters/_hook_reach.py",
         }
     ),
 }

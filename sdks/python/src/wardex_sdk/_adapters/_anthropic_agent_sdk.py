@@ -68,6 +68,7 @@ from ._anthropic_names import McpToolCatalog, ServerHandle
 from ._assembler import SessionAssembler
 from ._base import AdapterInterface
 from ._context import AdapterContext, Fallback, Observer, Placement, Scope
+from ._hook_reach import HookReach
 from ._session_outcome import reader_stopped
 from ._session_state import _BridgeBinding
 
@@ -349,26 +350,22 @@ def _describe_tool_call(
     remember. What is left is what only this adapter can know.
     """
     call.draft.set_tool(ToolAttributes(name=tool_name, execution_type=ToolExecutionType.IN_PROCESS))
-    # Take the key at the handler's rank, ON THE RUN rather than on this call:
-    # the hook observer claims on the session, and two claims in two tables
-    # arbitrate nothing. The return value is deliberately NOT a gate — at this
-    # rank a refusal means another INVOCATION of the same tool is in flight
-    # (Claude issues tool calls in parallel), not that a rival observer owns the
-    # event, and standing down there would delete a real call's span. What the
-    # claim does is make the hook observer, which opened at rank 0 before this
-    # body ran, discard its own.
+    # Take the key at the handler's rank, ON THE RUN rather than on this call: the hook observer
+    # claims on the session, and two claims in two tables arbitrate nothing. The return value is
+    # deliberately NOT a gate — at this rank a refusal means another INVOCATION of the same tool is
+    # in flight (Claude issues tool calls in parallel), not that a rival observer owns the event,
+    # and standing down there would delete a real call's span. What the claim does is make the hook
+    # observer, which opened at rank 0 before this body ran, discard its own.
     call.claim_run(handle.key_for(tool_name), observer=Observer.EXECUTOR)
-    # The handler is handed `{name, arguments}` and nothing else — no
-    # `tool_use_id` reaches it, verified in the SDK's own dispatch. Guessing one
-    # by matching name+args against the stream in arrival order is precisely the
-    # framework-identifier heuristic this design removes, so the span records
-    # that the id is unavailable instead of inventing one.
+    # The handler is handed `{name, arguments}` and nothing else — no `tool_use_id` reaches it,
+    # verified in the SDK's own dispatch. Guessing one by matching name+args against the stream in
+    # arrival order is precisely the framework-identifier heuristic this design removes, so the span
+    # records that the id is unavailable instead of inventing one.
     call.note(Limitation.TOOL_CALL_ID_UNAVAILABLE_IN_PROCESS)
     if not handle.token_resolved:
-        # The server was never found in an options' `mcp_servers`, so its token
-        # is the server's own name and the hook — which sees the DICT KEY — may
-        # be building a different key. That is a key SPLIT, which `claim()`
-        # cannot arbitrate: both observers emit.
+        # The server was never found in an options' `mcp_servers`, so its token is the server's own
+        # name and the hook — which sees the DICT KEY — may be building a different key. That is a
+        # key SPLIT, which `claim()` cannot arbitrate: both observers emit.
         call.note(Limitation.TOOL_NAME_COLLISION)
     if adapter._names.ambiguous_bare(tool_name):
         # Two wrapped servers export this bare name and the CLI is shipping
@@ -419,10 +416,9 @@ async def _run_tool(
     """
     ctx = adapter._ctx
     if ctx is None:
-        # Uninstalled while this wrapper survived in a reference the host still
-        # holds. Nothing to attach to, so the handler runs exactly as if wardex
-        # had never been here. The one branch this function keeps, and it is
-        # about the ADAPTER's lifetime rather than about a failure.
+        # Uninstalled while this wrapper survived in a reference the host still holds. Nothing to
+        # attach to, so the handler runs exactly as if wardex had never been here. The one branch
+        # this function keeps, and it is about the ADAPTER's lifetime rather than about a failure.
         return await handler(args)
 
     with ctx.enter(
@@ -486,6 +482,8 @@ class AnthropicAgentSdkAdapter(AdapterInterface):
         # on one key (design §5.4). Replaces `skip_tool_names`, which compared a
         # bare name against a namespaced one and therefore never matched.
         self._names = McpToolCatalog()
+        # Whether each session's handshake carried the hooks above (see `_hook_reach`).
+        self._hooks = HookReach(_WARDEX_HOOK_EVENTS)
         # The OTel bridge receiver — built in `install()` iff the adapter's
         # own options say `otel_bridge=True` (the first real consumer of
         # `ctx.options`). None keeps every bridge branch dead.
@@ -510,11 +508,13 @@ class AnthropicAgentSdkAdapter(AdapterInterface):
     # --- observation callbacks (delegate to the SessionAssembler) ---
 
     def _on_outbound(self, key: int, data: str, transport: Any = None) -> None:
-        if self._assembler is not None:
+        assembler = self._assembler
+        if assembler is not None:
             binding = None
             if self._bridge is not None and transport is not None:
                 binding = self._bridge_binding_for(transport)
-            self._assembler.on_outbound(key, data, bridge=binding)
+            assembler.on_outbound(key, data, bridge=binding)
+            self._hooks.observe(key, data, assembler)
 
     def _bridge_binding_for(self, transport: Any) -> _BridgeBinding | None:
         """The injection-correlation verdict for one transport's spawn.
@@ -605,6 +605,7 @@ class AnthropicAgentSdkAdapter(AdapterInterface):
             self._assembler.on_inbound(key, msg)
 
     def _on_close(self, key: int, error: str | None) -> None:
+        self._hooks.forget(key)
         if self._assembler is not None:
             self._assembler.on_close(key, error)
 
@@ -854,6 +855,7 @@ class AnthropicAgentSdkAdapter(AdapterInterface):
         """
         self._patches._at_fork_reinit()
         self._names._at_fork_reinit()
+        self._hooks._at_fork_reinit()
         bridge = self._bridge
         self._bridge = None
         assembler = self._assembler
@@ -875,12 +877,12 @@ class AnthropicAgentSdkAdapter(AdapterInterface):
         # surface raised `KeyError` out of `uninstall()` — into the host.
         self._patches.restore_all()
         self._names.clear()
-        # Latch first, drain second. Every callback into this adapter gates on
-        # `self._assembler is not None`, so nulling it before the drain leaves a
-        # straggler — a read already in flight on the reader task — no session
-        # table to open a fresh root in. Draining first would leave that window
-        # open for the whole walk, and the root it opened would be live in a
-        # registry nothing will ever close again.
+        self._hooks.clear()
+        # Latch first, drain second. Every callback into this adapter gates on `self._assembler is
+        # not None`, so nulling it before the drain leaves a straggler — a read already in flight on
+        # the reader task — no session table to open a fresh root in. Draining first would leave
+        # that window open for the whole walk, and the root it opened would be live in a registry
+        # nothing will ever close again.
         assembler = self._assembler
         self._assembler = None
         # Dropped in the same latch: a tool wrapper the host still holds a
@@ -894,12 +896,10 @@ class AnthropicAgentSdkAdapter(AdapterInterface):
         if assembler is not None:
             assembler.close_all_sessions(marker=Limitation.ADAPTER_UNINSTALLED)
         if bridge is not None:
-            # AFTER the session drain, whose opportunistic merge is the last
-            # legitimate reader of the receiver's slots; the socket teardown
-            # rides the same uninstall path everything else does
-            # (test_uninstall_isolation's scope). `close_units` — the signal
-            # path — deliberately leaves the receiver running: the adapter
-            # stays installed there.
+            # AFTER the session drain, whose opportunistic merge is the last legitimate reader of
+            # the receiver's slots; the socket teardown rides the same uninstall path everything
+            # else does (test_uninstall_isolation's scope). `close_units` — the signal path —
+            # deliberately leaves the receiver running: the adapter stays installed there.
             with self._guard("adapters.anthropic.otel_bridge_receiver_close"):
                 bridge.close()
 
