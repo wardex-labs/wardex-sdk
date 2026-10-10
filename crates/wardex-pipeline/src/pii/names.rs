@@ -11,7 +11,8 @@
 //! occur:
 //!
 //! * `name=value` — a URL query, a form body, a `.env` line, a WebSocket
-//!   upgrade target;
+//!   upgrade target, also inside a JSON string right after an escape such
+//!   as `\n`;
 //! * `"name": value` — JSON, including JSON escaped inside a JSON string (a
 //!   tool call's `arguments`), and `'name': value` (a Python dict's repr).
 //!
@@ -210,8 +211,7 @@ impl NameRules {
         if start == eq {
             return None;
         }
-        let name = &text[start..eq];
-        let rule = self.judge(name, Shape::UrlForm);
+        let (name, rule) = self.judge_form_name(text, start, eq);
         // A secret's value runs to a terminator. An ordinary value is only
         // read for `%` escapes, so it also stops at the next `=` — a raw `=`
         // is never inside an encoded value, and stopping there keeps a long
@@ -245,6 +245,34 @@ impl NameRules {
                 None
             }
         }
+    }
+
+    /// The `name=` name running from `start` to `eq`, and the rule it falls
+    /// to.
+    ///
+    /// A name read back to a backslash may begin with the letter of a JSON
+    /// escape. Inside a JSON string, `log\npassword=x` is a newline and then
+    /// `password`; read as written, the name is `npassword`, which names
+    /// nothing, and the value shipped. Whether a text is the body of a JSON
+    /// string or plain text holding a backslash (`C:\token=x`) is nothing
+    /// the scanner can tell, so both readings are judged and the value is a
+    /// secret when either one names a secret. The name recorded is the
+    /// reading without the escape when that reading is the secret, since
+    /// escaped text is what agent traffic mostly carries.
+    fn judge_form_name<'t>(
+        &self,
+        text: &'t str,
+        start: usize,
+        eq: usize,
+    ) -> (&'t str, Option<Rule>) {
+        if let Some(after) = json_escape_end(text.as_bytes(), start, eq) {
+            let unescaped = &text[after..eq];
+            if let Some(rule) = self.judge(unescaped, Shape::UrlForm) {
+                return (unescaped, Some(rule));
+            }
+        }
+        let as_written = &text[start..eq];
+        (as_written, self.judge(as_written, Shape::UrlForm))
     }
 
     /// Scan the percent-decoded form of `text[start..end]` and map each hit
@@ -578,6 +606,29 @@ fn backslashes_before(b: &[u8], pos: usize) -> usize {
     n
 }
 
+/// Where a name that starts at `start` and ends at `end` begins once a JSON
+/// escape in front of it is set aside: `None` unless a backslash sits just
+/// before `start` and the bytes from `start` complete an escape, which is one
+/// letter for `\b \f \n \r \t` and a `u` with four hex digits for `\uXXXX`,
+/// and some of the name is left after it. Any run of backslashes counts: an
+/// even run is a literal backslash at this depth but the same escape one
+/// JSON string further in (a tool call's `arguments`). `\" \\ \/` need no
+/// case of their own, since a quote, a backslash and a slash are not name
+/// bytes and the scan backwards has already stopped at them.
+fn json_escape_end(b: &[u8], start: usize, end: usize) -> Option<usize> {
+    if start == 0 || b[start - 1] != b'\\' {
+        return None;
+    }
+    let after = match b[start] {
+        b'b' | b'f' | b'n' | b'r' | b't' => start + 1,
+        b'u' if end - start > 5 && b[start + 1..start + 5].iter().all(u8::is_ascii_hexdigit) => {
+            start + 5
+        }
+        _ => return None,
+    };
+    (after < end).then_some(after)
+}
+
 /// Bytes a `name=` may be made of. Anything else ends the name scanning
 /// backwards, which is also what rejects `a != b` and `x == y`.
 fn is_form_name_byte(c: u8) -> bool {
@@ -787,6 +838,60 @@ mod tests {
         );
         let num = r#"{"arguments":"{\"pin_token\":42}"}"#;
         assert_eq!(mask(num), r#"{"arguments":"{\"pin_token\":\"[SECRET]\"}"}"#);
+    }
+
+    #[test]
+    fn a_name_right_after_a_json_escape_is_read_without_it() {
+        // Every escape a JSON writer puts before a letter, and a newline
+        // escaped once more inside a JSON string's JSON (a tool call's
+        // `arguments`).
+        for (text, value, name) in [
+            (r#""log\npassword=hunter2xyz\n""#, "hunter2xyz", "password"),
+            (r#""a\tsecret=s3cr3tvalue""#, "s3cr3tvalue", "secret"),
+            (r#""a\r\npassword=P1""#, "P1", "password"),
+            (r#""a\bpassword=P2""#, "P2", "password"),
+            (r#""a\fapi_key=P3""#, "P3", "api_key"),
+            (r#""a\u0001password=P4""#, "P4", "password"),
+            (r#""caf\u00e9secret=P5""#, "P5", "secret"),
+            (r#""a\\npassword=P6\\n""#, "P6", "password"),
+            (
+                r#""log\nGITHUB_TOKEN=abcdefg12345\n""#,
+                "abcdefg12345",
+                "GITHUB_TOKEN",
+            ),
+        ] {
+            let mut hits = Vec::new();
+            rules().scan(text, &mut hits);
+            assert_eq!(hits.len(), 1, "{text}");
+            assert_eq!(&text[hits[0].start..hits[0].end], value, "{text}");
+            assert_eq!(hits[0].name, name, "{text}");
+        }
+    }
+
+    #[test]
+    fn a_backslash_in_plain_text_keeps_the_name_as_written() {
+        // `\t` would begin `\token`, but `oken` names nothing and `token`
+        // does: the name as written is the one judged and recorded.
+        let path = r"C:\Users\me\token=w1";
+        assert_eq!(mask(path), r"C:\Users\me\token=[SECRET]");
+        let mut hits = Vec::new();
+        rules().scan(path, &mut hits);
+        assert_eq!(hits[0].name, "token");
+        // Either reading being a secret is enough: plain or escaped, the
+        // scanner cannot tell which one this is.
+        assert_eq!(mask(r"C:\npassword=P1"), r"C:\npassword=[SECRET]");
+        // Neither reading names a secret.
+        for text in [
+            r#""a\nkeyword=v""#,
+            r#""a\nq=v""#,
+            r"C:\temp\note=v",
+            r#""\u00e9=v""#,
+            r#""\u00e=v""#,
+        ] {
+            let mut hits = Vec::new();
+            rules().scan(text, &mut hits);
+            assert!(hits.is_empty(), "{text}");
+        }
     }
 
     #[test]
