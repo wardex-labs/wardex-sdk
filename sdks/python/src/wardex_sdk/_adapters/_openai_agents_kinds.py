@@ -16,28 +16,33 @@ module, so the two never form an import cycle.
   server-side tool search, and a shell call the provider ran (its output arrives in the same
   response). The provider runs them inside the model call, so the framework opens no function
   span for them. One `execute_tool` each, read off the response that carried it: its call id is
-  the item's id, which is also the id of the `server_tool_call` part on the wire span; its
-  interval is the model call that ran it, because the provider reports no per-tool timing
-  (`wardex.openai_agents.hosted_tool` says so); its status is the item's own. Its arguments and
-  results stay the wire span's, joined by that id, rather than being copied a second time.
+  the item's own `id`; its interval is the model call that ran it, because the provider reports
+  no per-tool timing (`wardex.openai_agents.hosted_tool` says so); its status is the item's own.
+  Its arguments and results stay the wire span's rather than being copied a second time. The
+  wire span holds them as a `server_tool_call` part with that same id for web search, file
+  search, code interpreter, image generation and a hosted MCP call; a tool search and a shell
+  call are on the wire span too, but as parts the wire parser does not map, so no id joins them.
 * The step kinds (`STEP_KINDS`) — a host's `custom_span`, the framework's sandbox spans, and the
-  voice pipeline's speech, speech-group and transcription spans. One `execute_step` each, open
-  for the span's own lifetime, and NOT pinned: the framework starts and finishes some of these on
-  different tasks, and keeps several open at once on one task, where a pin's stack discipline
-  would not hold. So work inside one nests under the agent or tool around it, not under the step.
-  A custom span's `data` mapping is recorded as the step's input, shaped like a tool's arguments.
+  voice pipeline's speech, speech-group and transcription spans. One `execute_step` each, from
+  the span's start to its end — or to the close of the agent or tool it sits under, if it
+  outlives that: it is then cut there and says `child_span_unclosed`. NOT pinned: the framework
+  starts and finishes some of these on different tasks, and keeps several open at once on one
+  task, where a pin's stack discipline would not hold. So work inside one nests under the agent
+  or tool around it, not under the step. A custom span's `data` mapping is recorded as the
+  step's input, shaped like a tool's arguments.
 * What the framework withheld — `trace_include_sensitive_data=False` strips a tool's arguments
   and result, and every model response, from the framework's spans. The tool span and the agent
   span then carry `wardex.openai_agents.sensitive_data_withheld`, so an empty payload, a missing
-  call id or an absent hosted tool reads as withheld rather than as never having existed.
-* What this adapter drops — a span it cannot place, or whose run it never saw. Each reason is a
-  counter and one WARNING per process (`_dropped`).
+  call id or an absent hosted tool reads as withheld rather than as never having existed. Read
+  off the run's own config (`RunCall.content_withheld`), never off a missing response, which a
+  failed, cancelled or cut call leaves too.
+* What this adapter drops — a span it cannot place, whose run it never saw start, or that arrived
+  after its run ended. Each reason is a counter and one WARNING per process (`_dropped`).
 """
 
 from __future__ import annotations
 
 import contextvars
-import sys
 from collections.abc import Mapping
 from datetime import datetime, timezone
 from typing import Any
@@ -52,6 +57,7 @@ from .._assembly import (
 )
 from .._enums import StatusCode, ToolExecutionType, ToolType
 from ._context import AdapterContext, Placement, RunHandle
+from ._openai_agents_entry import RUN_CALL
 from ._payload import _shaped_payload
 
 _FRAMEWORK = "openai_agents"
@@ -167,13 +173,10 @@ def _model_end(adapter: Any, run: dict[str, Any], span: Any) -> None:
     sd = span.span_data
     kind = type(sd).__name__
     held = sd.output if kind == "GenerationSpanData" else sd.response
-    # Only a call that COMPLETED with nothing on it was stripped by the framework. One that failed
-    # carries an error; one that was cancelled (a sibling guardrail's tripwire) carries none, and
-    # is told apart by the cancellation in flight where the span closes — this callback runs
-    # inside its `__exit__`. What the host was already handling when the agent opened is not it.
-    inflight = sys.exc_info()[1]
-    interrupted = inflight is not None and inflight is not agent.get("host_inflight")
-    if held is None and span.error is None and not interrupted:
+    # Withheld only where the run's own config says the framework strips content: a missing
+    # response alone is also a failed, cancelled or cut call, which withheld nothing.
+    call = RUN_CALL.get()
+    if held is None and span.error is None and call is not None and call.content_withheld:
         agent["withheld"] = True
         ctx.count("model_output_withheld")
     agent["calls_from"] = _CALL_ID_SOURCES.get(kind)
@@ -292,7 +295,9 @@ def _hosted_tool(
     name, tool_type = _HOSTED[kind]
     if kind == "mcp_call":
         name = str(item.name)
-    raw_id = getattr(item, "call_id", None) or getattr(item, "id", None)
+    # The item's own `id`, for every kind: the key a wire span's server tool part carries. A
+    # shell call's `call_id` is the model's, and no wire part is keyed by it.
+    raw_id = getattr(item, "id", None)
     call_id = str(raw_id) if raw_id is not None else None
     server = getattr(item, "server_label", None) if kind == "mcp_call" else None
     turn = agent.get("turn")
@@ -414,7 +419,18 @@ _DROPPED: dict[str, str] = {
     "span_kind_ignored": (
         "the framework opened a span of a kind this adapter does not map, so it was not recorded"
     ),
+    "span_after_run": (
+        "a span arrived after its run had ended (from a task the run left running), so it was "
+        "not recorded"
+    ),
 }
+
+
+def _run_missing(ctx: AdapterContext | None, trace: Any) -> None:
+    """A span whose run is not open: one that ENDED (`_close_run` leaves `ended` on the run's
+    slot) or one wardex never saw start. Read with `peek`, so asking allocates nothing."""
+    run = ctx.peek(trace) if ctx is not None else None
+    _dropped(ctx, "span_after_run" if run is not None and run.get("ended") else "span_without_run")
 
 
 def _dropped(ctx: AdapterContext | None, reason: str, kind: str | None = None) -> None:

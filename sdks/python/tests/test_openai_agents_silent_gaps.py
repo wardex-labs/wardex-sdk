@@ -205,9 +205,10 @@ def test_hosted_tools_are_tool_spans_joined_to_the_wire_span_that_ran_them(
 ):
     """Before: the run read `invoke_agent agent_a` and one `chat` span, and the six tools the
     provider ran inside that call were visible only as parts of the chat span's output. Now each
-    is an `execute_tool` under the agent that asked, carrying the item's id — the same id as the
-    wire span's `server_tool_call` part — the response id that carried it, and the model call's
-    interval, because the provider reports no per-tool timing."""
+    is an `execute_tool` under the agent that asked, carrying the item's id, the response id that
+    carried it, and the model call's interval, because the provider reports no per-tool timing.
+    Five of the six kinds join the wire span by that id today; the tool search is on the wire
+    span as a part the wire parser does not map, so it carries no id to join."""
     scenario(lambda inp: _hosted_items())
     _init()
     try:
@@ -245,6 +246,101 @@ def test_hosted_tools_are_tool_spans_joined_to_the_wire_span_that_ran_them(
     assert counters.get(_P + "active.hosted_tool") == 6
 
 
+def test_a_hosted_tool_with_no_outcome_is_unset(agents_env, scenario):
+    """An item the provider returned before it finished (`in_progress`, `searching`,
+    `incomplete`) reports no outcome: the span says nothing it did not see, neither OK nor
+    ERROR."""
+    items = [
+        ResponseFunctionWebSearch(
+            id=f"ws_{status}",
+            status=status,
+            type="web_search_call",
+            action=ActionSearch(type="search"),
+        ).model_dump(exclude_none=True)
+        for status in ("in_progress", "searching")
+    ]
+    items.append(
+        ResponseFileSearchToolCall(
+            id="fs_incomplete", queries=["q"], status="incomplete", type="file_search_call"
+        ).model_dump(exclude_none=True)
+    )
+    scenario(lambda inp: [*items, *_DONE])
+    _init()
+    try:
+        assert _drive("run", _hosted_agent()) == "done"
+        spans = _spans()
+    finally:
+        wardex.close()
+    hosted = {s.tool.call_id: s for s in _adapter_spans(spans) if s.tool is not None}
+    assert set(hosted) == {"ws_in_progress", "ws_searching", "fs_incomplete"}
+    for span in hosted.values():
+        assert (span.status, span.error_type) == (StatusCode.UNSET, None), span.tool.call_id
+
+
+def test_a_tool_search_the_client_must_run_is_not_a_hosted_span(agents_env, scenario):
+    """A `tool_search_call` with `execution="client"` is the client's to run, not the
+    provider's; the framework's runner refuses it. It is never recorded as a hosted tool."""
+    from agents.exceptions import ModelBehaviorError
+
+    item = ResponseToolSearchCall(
+        id="ts_1",
+        arguments={"query": "x"},
+        execution="client",
+        status="completed",
+        type="tool_search_call",
+    ).model_dump(exclude_none=True)
+    scenario(lambda inp: [item, *_DONE])
+    _init()
+    try:
+        with pytest.raises(ModelBehaviorError):
+            _drive("run", _hosted_agent())
+        spans = _spans()
+    finally:
+        wardex.close()
+    assert [s.name for s in _adapter_spans(spans) if s.name.startswith("execute_tool")] == []
+    assert counters.get(_P + "active.hosted_tool") == 0
+
+
+def test_a_local_shell_call_is_the_frameworks_one_span_not_a_hosted_one(agents_env, scenario):
+    """A shell call with no output in the same response is the client's: the framework runs it
+    through the agent's executor and opens its own function span. It is never doubled by a
+    hosted span."""
+    from agents.tool import ShellCommandOutput, ShellResult
+
+    call = ResponseFunctionShellToolCall(
+        id="sh_1",
+        call_id="call_sh",
+        action={"commands": ["ls"]},
+        status="completed",
+        type="shell_call",
+    ).model_dump(exclude_none=True)
+
+    def decide(inp: object) -> list[dict]:
+        items = inp if isinstance(inp, list) else []
+        if any(isinstance(x, dict) and x.get("type") == "shell_call_output" for x in items):
+            return _DONE
+        return [call]
+
+    def executor(request: Any) -> ShellResult:
+        return ShellResult(output=[ShellCommandOutput(stdout="a.txt")])
+
+    scenario(decide)
+    agent = Agent(
+        name="agent_a", instructions="a", model="gpt-4o-mini", tools=[ShellTool(executor=executor)]
+    )
+    _init()
+    try:
+        assert _drive("run", agent) == "done"
+        spans = _spans()
+    finally:
+        wardex.close()
+    shells = [s for s in _adapter_spans(spans) if s.name == "execute_tool shell"]
+    assert len(shells) == 1
+    assert "wardex.openai_agents.hosted_tool" not in _extra(shells[0])
+    assert counters.get(_P + "active.hosted_tool") == 0
+    assert counters.get(_P + "active.tool") == 1
+
+
 def test_a_hosted_shell_call_is_a_tool_span_and_a_local_one_is_not_duplicated(agents_env, scenario):
     """A shell call the provider ran comes back WITH its output in the same response: that one
     is hosted and gets a span here. A shell call without its output is the client's to run, gets
@@ -278,7 +374,8 @@ def test_a_hosted_shell_call_is_a_tool_span_and_a_local_one_is_not_duplicated(ag
     finally:
         wardex.close()
     shell = _one(spans, "execute_tool shell")
-    assert shell.tool.call_id == "call_sh"
+    # The item's own id, like every hosted kind; the model's `call_id` keys no wire part.
+    assert shell.tool.call_id == "sh_1"
     assert shell.parent_span_id == _one(spans, "invoke_agent agent_a").context.span_id
     assert counters.get(_P + "active.hosted_tool") == 1
 
@@ -445,23 +542,119 @@ def test_a_run_inside_a_disabled_trace_is_said_once(agents_env, wardex_log):
     assert len(_warnings(wardex_log, "inside a disabled trace")) == 1
 
 
-def test_a_disabling_run_config_inside_an_open_trace_keeps_the_agents_and_says_what_is_lost(
-    agents_env, wardex_log
+def _web_and_tool(inp: object) -> list[dict]:
+    """A web search and a function call in the first response, the answer after."""
+    if _outputs_done(inp) == 0:
+        web = ResponseFunctionWebSearch(
+            id="ws_1",
+            status="completed",
+            type="web_search_call",
+            action=ActionSearch(type="search"),
+        ).model_dump(exclude_none=True)
+        return [web, _fc("get_weather", "call_1", '{"city":"Seoul"}')]
+    return _DONE
+
+
+def _weather_and_web_agent(name: str = "agent_a") -> Agent:
+    @function_tool
+    def get_weather(city: str) -> str:
+        return f"sunny in {city}"
+
+    return Agent(
+        name=name, instructions="a", model="gpt-4o-mini", tools=[WebSearchTool(), get_weather]
+    )
+
+
+def test_a_disabling_run_config_inside_an_open_trace_says_exactly_what_is_lost(
+    agents_env, scenario, wardex_log
 ):
-    """Inside a trace the host opened, the run's own `tracing_disabled` cannot stop the run's
-    spans — the framework opens no trace of its own there — but it does stop the spans of its
-    computer, shell, apply-patch and custom tools. The agents are recorded; that loss is said."""
+    """Inside a trace the host opened, the run's own `tracing_disabled` cannot stop its agent and
+    function-tool spans — the framework opens no trace of its own there — but the framework hands
+    its model a disabled tracing mode, so no model span ever reaches the adapter: no call id for
+    the tool, no response id, no hosted tool span. That is what the line says, and the tool's
+    missing call id is counted as this run's loss, never as a failed match."""
+    scenario(_web_and_tool)
     _init()
     try:
         with trace("host"):
-            assert _drive("run", _agents(), run_config=RunConfig(tracing_disabled=True)) == "done"
+            cfg = RunConfig(tracing_disabled=True)
+            assert _drive("run", _weather_and_web_agent(), run_config=cfg) == "done"
         spans = _spans()
     finally:
         wardex.close()
-    assert "invoke_agent agent_a" in {s.name for s in _adapter_spans(spans)}
+    tool = _one(spans, "execute_tool get_weather")
+    assert tool.tool.call_id is None
+    assert counters.get(_P + "tool_call_id_tracing_disabled") == 1
+    assert counters.get(_P + "tool_call_id_unmatched") == 0
+    assert counters.get(_P + "active.hosted_tool") == 0
+    assert "wardex.openai_agents.last_response_id" not in _extra(
+        _one(spans, "invoke_agent agent_a")
+    )
     assert counters.get(_P + "tracing_disabled_run") == 0
-    assert counters.get(_P + "tool_spans_disabled_run") == 1
-    assert len(_warnings(wardex_log, "computer, shell, apply-patch or custom tool")) == 1
+    assert counters.get(_P + "tracing_disabled_run_partial") == 1
+    [line] = _warnings(wardex_log, "RunConfig(tracing_disabled=True)")
+    for loss in ("no call id", "no response id", "no hosted tool span", "computer, shell"):
+        assert loss in line, loss
+
+
+def test_a_disabled_nested_run_inside_a_traced_one_loses_only_its_own_joins(
+    agents_env, scenario, wardex_log
+):
+    """A tool that runs a nested `Runner.run` with its own `RunConfig(tracing_disabled=True)`,
+    inside a traced outer run: the nested run's tool has no call id, counted as that run's
+    loss; the outer run's own tool keeps its id."""
+    inner = _weather_and_web_agent("inner")
+
+    @function_tool
+    async def ask_inner(q: str) -> str:
+        result = await Runner.run(inner, q, run_config=RunConfig(tracing_disabled=True))
+        return str(result.final_output)
+
+    def decide(inp: object) -> list[dict]:
+        items = inp if isinstance(inp, list) else []
+        if any(isinstance(x, dict) and x.get("content") == "INNER" for x in items):
+            return _web_and_tool(inp)
+        if _outputs_done(inp) == 0:
+            return [_fc("ask_inner", "call_o", '{"q":"INNER"}')]
+        return _DONE
+
+    scenario(decide)
+    outer = Agent(name="outer", instructions="o", model="gpt-4o-mini", tools=[ask_inner])
+    _init()
+    try:
+        assert _drive("run", outer) == "done"
+        spans = _spans()
+    finally:
+        wardex.close()
+    assert _one(spans, "execute_tool ask_inner").tool.call_id == "call_o"
+    assert _one(spans, "execute_tool get_weather").tool.call_id is None
+    assert counters.get(_P + "tool_call_id_tracing_disabled") == 1
+    assert counters.get(_P + "tool_call_id_unmatched") == 0
+    assert counters.get(_P + "tracing_disabled_run_partial") == 1
+
+
+def test_a_switch_cached_before_init_is_the_installs_notice_not_a_late_change(
+    agents_env, wardex_log, switch_restored, monkeypatch
+):
+    """The framework cached `OPENAI_AGENTS_DISABLE_TRACING=1` when its first trace opened, before
+    `wardex.init()`, and the variable is gone since. Install and the run read the same cached
+    value: install says tracing is off, and the run is counted without a line claiming the
+    switch moved after init."""
+    provider = switch_restored
+    provider._manual_disabled = None
+    provider._env_disabled = True
+    provider._refresh_disabled_flag()
+    monkeypatch.delenv("OPENAI_AGENTS_DISABLE_TRACING", raising=False)
+    _init()
+    try:
+        assert _drive("run", _agents()) == "done"
+        spans = _spans()
+    finally:
+        wardex.close()
+    assert _adapter_spans(spans) == []
+    assert counters.get(_P + "tracing_disabled_at_install") == 1
+    assert counters.get(_P + "tracing_disabled_run") == 1
+    assert _warnings(wardex_log, "tracing") == []
 
 
 def test_the_switch_turned_off_inside_an_open_host_trace_is_the_switch(
@@ -526,7 +719,7 @@ def test_a_run_with_tracing_on_says_nothing(agents_env, wardex_log):
     finally:
         wardex.close()
     assert counters.get(_P + "tracing_disabled_run") == 0
-    assert counters.get(_P + "tool_spans_disabled_run") == 0
+    assert counters.get(_P + "tracing_disabled_run_partial") == 0
     assert wardex_log.lines(logging.WARNING) == []
 
 
@@ -619,6 +812,46 @@ def test_a_cancelled_model_call_is_not_read_as_withheld(agents_env, scenario):
         wardex.close()
     agent_span = _one(spans, "invoke_agent agent_a")
     assert "wardex.openai_agents.sensitive_data_withheld" not in _extra(agent_span)
+    assert counters.get(_P + "model_output_withheld") == 0
+
+
+def _sse_cut(r: dict) -> bytes:
+    """A stream that ends after its items with no terminal event: a cut connection, a proxy."""
+    created = {**r, "status": "in_progress", "output": [], "usage": None}
+    events = [
+        (
+            "response.created",
+            {"type": "response.created", "sequence_number": 0, "response": created},
+        )
+    ]
+    for i, item in enumerate(r["output"]):
+        for name in ("response.output_item.added", "response.output_item.done"):
+            events.append(
+                (name, {"type": name, "sequence_number": 1, "output_index": i, "item": item})
+            )
+    return "".join(f"event: {n}\ndata: {json.dumps(d)}\n\n" for n, d in events).encode()
+
+
+def test_a_stream_cut_before_its_end_is_not_read_as_withheld(agents_env, scenario, monkeypatch):
+    """A streamed call whose stream ends without its terminal event leaves the framework's
+    response span with no response and no error, and the framework raises only after that span
+    closed. Sensitive data is on, so nothing was withheld, and nothing is marked: the mark is
+    read off the run's config, never off a missing response."""
+    from agents.exceptions import ModelBehaviorError
+
+    import test_openai_agents_wire as wire
+
+    scenario(lambda inp: _DONE)
+    monkeypatch.setattr(wire, "_sse", _sse_cut)
+    _init()
+    try:
+        with pytest.raises(ModelBehaviorError):
+            _drive("run_streamed", Agent(name="agent_a", instructions="a", model="gpt-4o-mini"))
+        spans = _spans()
+    finally:
+        wardex.close()
+    agent = _one(spans, "invoke_agent agent_a")
+    assert "wardex.openai_agents.sensitive_data_withheld" not in _extra(agent)
     assert counters.get(_P + "model_output_withheld") == 0
 
 
@@ -925,6 +1158,46 @@ def test_a_tool_span_lost_at_its_start_is_said_once_not_twice(agents_env, wardex
     assert counters.get(_P + "tool_end_unmatched") == 1
     assert len(wardex_log.lines(logging.WARNING)) == 1
     assert len(_warnings(wardex_log, _P + "trace_lookup_miss")) == 1
+
+
+def test_a_span_from_a_task_the_run_left_behind_is_said_with_its_own_reason(
+    agents_env, scenario, wardex_log
+):
+    """A tool starts a background task that opens a custom span after the run has ended. Its run
+    root is closed, so the span cannot be placed; the line says the run had ended, not that wardex
+    never saw it start."""
+
+    async def late() -> None:
+        await asyncio.sleep(0.3)
+        with custom_span("late_audit"):
+            pass
+
+    @function_tool
+    async def get_weather(city: str) -> str:
+        asyncio.get_running_loop().create_task(late())
+        return f"sunny in {city}"
+
+    def decide(inp: object) -> list[dict]:
+        if _outputs_done(inp) == 0:
+            return [_fc("get_weather", "call_1", '{"city":"Seoul"}')]
+        return _DONE
+
+    scenario(decide)
+    agent = Agent(name="agent_a", instructions="a", model="gpt-4o-mini", tools=[get_weather])
+    _init()
+    try:
+
+        async def go() -> None:
+            assert (await Runner.run(agent, "hi")).final_output == "done"
+            await asyncio.sleep(0.6)
+
+        asyncio.run(go())
+    finally:
+        wardex.close()
+    assert counters.get(_P + "span_after_run") == 1
+    assert counters.get(_P + "span_without_run") == 0
+    assert len(_warnings(wardex_log, _P + "span_after_run")) == 1
+    assert _warnings(wardex_log, "never saw") == []
 
 
 def test_spans_of_a_run_wardex_never_saw_start_are_said_once(agents_env, scenario, wardex_log):

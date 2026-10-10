@@ -285,7 +285,7 @@ _OVERSIZED_BUDGET = {
     # Lowered from 1588 when the span pieces its later span kinds share with it
     # (`_open_child`, the start instant, the error sentences) moved out to
     # `_openai_agents_kinds.py` beside those kinds, with the model call's join.
-    "_adapters/_openai_agents.py": 1466,
+    "_adapters/_openai_agents.py": 1465,
     "_client.py": 1581,
     "_adapters/_context.py": 1305,
     "_interceptors/_seam.py": 1181,
