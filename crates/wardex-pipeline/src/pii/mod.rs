@@ -768,6 +768,22 @@ mod tests {
     }
 
     #[test]
+    fn a_secret_right_after_a_json_escape_is_masked_under_its_own_name() {
+        // A log or a tool result carried as a JSON string: the same lines a
+        // plain body masks, with each line break written `\n` or `\t`.
+        let e = engine();
+        let mut r = Report::default();
+        let body = r#"{"content": "log\npassword=hunter2xyz\n\tsecret=s3cr3tvalue\nGITHUB_TOKEN=abcdefg12345\n"}"#;
+        assert_eq!(
+            e.mask_text_into(body, &mut r).unwrap(),
+            r#"{"content": "log\npassword=[SECRET]\n\tsecret=[SECRET]\nGITHUB_TOKEN=[SECRET]\n"}"#
+        );
+        assert_eq!(r.count, 3);
+        assert_eq!(r.names, vec!["password", "secret", "GITHUB_TOKEN"]);
+        assert_eq!(r.rules, vec![Rule::SecretWord, Rule::SecretLastWord]);
+    }
+
+    #[test]
     fn reported_names_are_capped_but_the_count_is_not() {
         let e = engine();
         let body: String = (0..40)

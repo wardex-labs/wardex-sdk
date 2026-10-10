@@ -340,6 +340,21 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- **A secret that follows a line break inside a JSON string is masked
+  again, under its real name.** A log or a tool result your agent sends to
+  a model travels as a JSON string, so its line breaks are written `\n` and
+  its tabs `\t`. The name rule read `\npassword=hunter2` as the name
+  `npassword`, which is not a secret name, and the value shipped in the
+  clear, though masking was on and the same line in a plain body was
+  masked; `\tsecret=…` shipped the same way. Where the value was masked
+  anyway (`\nGITHUB_TOKEN=…`), the span recorded the name as
+  `nGITHUB_TOKEN`. A name after any JSON escape (`\n`, `\t`, `\r`, `\b`,
+  `\f`, `\uXXXX`, also escaped once more inside a tool call's `arguments`) is
+  now judged without the escape, and recorded that way in
+  `redaction_names`. A backslash in plain text, such as the Windows path
+  `C:\Users\me\token=…`, is masked as before: the scanner cannot tell the
+  two apart, so it judges both readings and masks the value when either one
+  names a secret.
 - **A wrong project key, a receiver that is down, and every other loss no
   span can carry now say so once with `debug` off, and are counted.**
   Before, with the default `debug=False`, an export your receiver refused or
