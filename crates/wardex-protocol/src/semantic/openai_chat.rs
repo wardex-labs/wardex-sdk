@@ -1,5 +1,6 @@
 //! OpenAI Chat Completions: request/response fill and SSE reassembly.
 
+use super::event_json::{is_done_marker, parse_event};
 use super::parts::*;
 use super::usage::{flatten_usage, UsageBounds, UsageView};
 use super::{LlmSemantics, StringOrVec};
@@ -426,14 +427,16 @@ pub(super) fn reassemble_openai(events: &[SseEvent]) -> Reassembled {
     // Asked of every chunk, choices or not: OpenRouter's documented
     // mid-stream error carries a choice beside the error.
     let mut error: Option<serde_json::Value> = None;
+    // Events whose data is not JSON: skipped, and counted so the span says so.
+    let mut unparsed: u32 = 0;
     for ev in events {
-        if ev.data.trim() == "[DONE]" {
+        if is_done_marker(&ev.data) {
             terminated = true;
             continue;
         }
-        let v: serde_json::Value = match serde_json::from_str(&ev.data) {
-            Ok(v) => v,
-            Err(_) => continue,
+        let Some(v) = parse_event(&ev.data) else {
+            unparsed = unparsed.saturating_add(1);
+            continue;
         };
         if id.is_none() {
             id = v.get("id").and_then(|x| x.as_str()).map(str::to_string);
@@ -526,6 +529,7 @@ pub(super) fn reassemble_openai(events: &[SseEvent]) -> Reassembled {
     Reassembled {
         body: serde_json::to_vec(&obj).unwrap_or_default(),
         terminated,
+        unparsed,
     }
 }
 

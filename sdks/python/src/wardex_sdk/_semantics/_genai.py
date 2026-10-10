@@ -126,6 +126,27 @@ def provider_limitation(sem: Any) -> Limitation | None:
     return limitation
 
 
+def stream_limitation(sem: Any) -> Limitation | None:
+    """`SSE_EVENT_UNPARSED` when a reassembler skipped a stream event it could not read, else None.
+
+    The native reassemblers read each event's data as JSON, an out-of-range number taken as its own
+    spelling; an event that is still not JSON (cut short, or not JSON at all) is skipped and counted
+    in `stream_events_unparsed`, and the body, finish or error it carried may be missing. The count
+    travels with the marker as one fact, as `provider_limitation`'s does.
+    """
+    if not getattr(sem, "stream_events_unparsed", 0):
+        return None
+    counters.bump("protocol.semantic.sse_event_unparsed")
+    limitation = Limitation.SSE_EVENT_UNPARSED
+    return limitation
+
+
+def parse_limitations(sem: Any) -> tuple[Limitation, ...]:
+    """Every marker the parse result itself decides, for the seam to put on an identified span."""
+    decided = (provider_limitation(sem), stream_limitation(sem))
+    return tuple(limitation for limitation in decided if limitation is not None)
+
+
 def declared_error_type(sem: Any) -> str | None:
     """The `error.type` of a failure the provider declared INSIDE a response, else None.
 

@@ -363,6 +363,13 @@ enum Limitation {
   LIMITATION_REASSEMBLED_FROM_STREAM = 31;
   LIMITATION_STREAM_USAGE_UNAVAILABLE = 32;
   LIMITATION_SSE_UNKNOWN_PROVIDER = 33;
+  //    An event of a stream a reassembler DID recognize was not JSON, even
+  //    with an out-of-range number read as its own spelling (cut short, or not
+  //    JSON at all), so it was skipped and what it carried may be missing.
+  //    Names NO knob. Not SEMANTIC_PARSE_FAILED (26): the rest of the stream
+  //    was read and the span has gen_ai truth. Not SSE_UNKNOWN_PROVIDER (33):
+  //    there no reassembler recognized the stream at all.
+  LIMITATION_SSE_EVENT_UNPARSED = 56;
 
   // -- Protocol-specific.
   LIMITATION_GRPC_WEB_UNSUPPORTED = 34;

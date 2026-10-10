@@ -261,12 +261,16 @@ pub(super) fn declared_error_class(err: &serde_json::Value, keys: &[&str]) -> St
     String::new()
 }
 
-/// One reassembled SSE stream: the synthetic body plus whether the stream
-/// carried its provider's terminal event. `terminated == false` is the
-/// volume-evidence condition the seam counts
+/// One reassembled SSE stream: the synthetic body, whether the stream
+/// carried its provider's terminal event, and how many events the
+/// reassembler skipped because their data was not JSON. `terminated ==
+/// false` is the volume-evidence condition the seam counts
 /// (`interceptors.seam.stream_unterminated`) — no marker is minted for it
-/// until that counter shows real volume.
+/// until that counter shows real volume. `unparsed > 0` is a loss the body
+/// cannot show (the text, finish or error such an event carried may simply
+/// be absent), so the seam marks the span with it.
 pub(super) struct Reassembled {
     pub(super) body: Vec<u8>,
     pub(super) terminated: bool,
+    pub(super) unparsed: u32,
 }

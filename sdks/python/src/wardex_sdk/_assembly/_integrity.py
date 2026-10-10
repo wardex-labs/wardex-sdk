@@ -535,14 +535,12 @@ Two emit sites, and the first is the mechanism the second restates.
     arrival order — is the framework-identifier heuristic this design exists to
     remove, and it would be indistinguishable from a real join downstream.
 
-    Also emitted from ``_adapters/_openai_agents.py::_function_start``, where the
-    one recovery this marker's ABSENCE may mean is an EXACT and UNIQUE
-    ``(name, arguments)`` match against the response that requested the call —
-    not arrival order — labelled at the source with
-    ``wardex.openai_agents.tool_call_id_source``. Two identical requests in one
-    response, or a response the adapter never saw, ship the marker instead of a
-    guess. Re-examination: remove the matching when the framework's
-    ``FunctionSpanData`` carries the call id itself.
+    Also emitted from ``_adapters/_openai_agents.py::_function_start``, where the one recovery this
+    marker's ABSENCE may mean is an EXACT and UNIQUE ``(name, arguments)`` match against the
+    response that requested the call — not arrival order — labelled at the source with
+    ``wardex.openai_agents.tool_call_id_source``. Two identical requests in one response, or a
+    response the adapter never saw, ship the marker instead of a guess. Re-examination: remove the
+    matching when the framework's ``FunctionSpanData`` carries the call id itself.
     """
 
     SNAPSHOT_TYPE_UNKNOWN = "snapshot_type_unknown"
@@ -679,10 +677,9 @@ Two emit sites, and the first is the mechanism the second restates.
     """An HTTP body was stored up to ``max_body_bytes`` / ``max_opaque_body_bytes``
     and the rest was consumed without being kept.
 
-    The only marker produced in Rust: ``crates/wardex-protocol/src/http1.rs``,
-    ``append_capped``. It crosses the PyO3 boundary as
-    ``Vec<&'static str>`` (``bindings/python/src/lib.rs``), is read back at
-    ``_protocol/_http1.py``, and is folded into the span's markers by
+    The only marker produced in Rust: ``crates/wardex-protocol/src/http1.rs``, ``append_capped``. It
+    crosses the PyO3 boundary as ``Vec<&'static str>`` (``bindings/python/src/lib.rs``), is read
+    back at ``_protocol/_http1.py``, and is folded into the span's markers by
     ``_interceptors/_seam.py::ByteSeamInterceptor._build_span``.
     """
 
@@ -690,37 +687,32 @@ Two emit sites, and the first is the mechanism the second restates.
     """A gRPC message runs past the end of the captured body: the last
     length-prefixed frame is incomplete, so its payload is not the whole message.
 
-    Emitted from ``_semantics/_grpc.py::build_grpc_fields`` when
-    ``parse_grpc_frames`` (``crates/wardex-protocol/src/grpc.rs``) reports
-    ``truncated`` — which it does when fewer than 5 bytes remain for a prefix or
-    the declared length runs past the buffer. That parser takes no ``Limits`` at
-    all, so the knob upstream of it is the HTTP body cap: ``application/grpc``
-    is classified meaningful by ``cap_for_content_type``, so a gRPC body is
-    stored up to ``max_body_bytes``, not the opaque cap. NOT
-    ``max_decoded_bytes``, which bounds decompression in ``semantic.rs`` and
-    never reaches gRPC framing — the semantic parser is not even called on the
+    Emitted from ``_semantics/_grpc.py::build_grpc_fields`` when ``parse_grpc_frames``
+    (``crates/wardex-protocol/src/grpc.rs``) reports ``truncated`` — which it does when fewer than 5
+    bytes remain for a prefix or the declared length runs past the buffer. That parser takes no
+    ``Limits`` at all, so the knob upstream of it is the HTTP body cap: ``application/grpc`` is
+    classified meaningful by ``cap_for_content_type``, so a gRPC body is stored up to
+    ``max_body_bytes``, not the opaque cap. NOT ``max_decoded_bytes``, which bounds decompression in
+    ``semantic.rs`` and never reaches gRPC framing — the semantic parser is not even called on the
     gRPC branch.
 
-    Kept separate from ``BODY_CAP_EXCEEDED`` despite sharing that knob. "The
-    body was stored short" and "a message was cut in half" are different facts
-    with different replay consequences, and on HTTP/2 — where gRPC actually
-    lives — they do not even co-occur: ``http2.rs`` records its truncation on
-    the stream and pushes no marker, so ``body_cap_exceeded`` never appears and
-    this is the only marker a user gets.
+    Kept separate from ``BODY_CAP_EXCEEDED`` despite sharing that knob. "The body was stored short"
+    and "a message was cut in half" are different facts with different replay consequences, and on
+    HTTP/2 — where gRPC actually lives — they do not even co-occur: ``http2.rs`` records its
+    truncation on the stream and pushes no marker, so ``body_cap_exceeded`` never appears and this
+    is the only marker a user gets.
     """
 
     WS_PAYLOAD_TRUNCATED = "ws_payload_truncated"
     """The WebSocket content sample hit ``ws_sample_bytes`` in either direction,
     so the body bytes on this span are a prefix of the conversation.
 
-    Emitted from ``_interceptors/_trackers.py::_WebSocketTracker._build_txn``,
-    from the truncation flags ``_append_sample`` sets when the accumulated
-    sample passes the cap — resolved from ``limits_defaults()["ws_sample_bytes"]``
-    (and passed as ``sample_cap`` by ``_interceptors/_seam.py``). NOT
-    ``max_ws_frame_bytes``: that one bounds a single frame's declared length in
-    ``crates/wardex-protocol/src/websocket.rs`` and an oversize frame does not
-    truncate anything — it disables the parser, which surfaces as
-    ``FRAME_PARSE_FAILED``.
+    Emitted from ``_interceptors/_trackers.py::_WebSocketTracker._build_txn``, from the truncation
+    flags ``_append_sample`` sets when the accumulated sample passes the cap — resolved from
+    ``limits_defaults()["ws_sample_bytes"]`` (and passed as ``sample_cap`` by
+    ``_interceptors/_seam.py``). NOT ``max_ws_frame_bytes``: that one bounds a single frame's
+    declared length in ``crates/wardex-protocol/src/websocket.rs`` and an oversize frame does not
+    truncate anything — it disables the parser, which surfaces as ``FRAME_PARSE_FAILED``.
     """
 
     CONNECTION_EVICTED = "connection_evicted"
@@ -747,10 +739,9 @@ Two emit sites, and the first is the mechanism the second restates.
     (``max_connections``, a whole connection) — see ``common.proto``."""
 
     PARSE_SKIPPED_AT_SHUTDOWN = "parse_skipped_at_shutdown"
-    """The process was ending and the shutdown budget ran out before this
-    transaction's deferred LLM-semantic parse: it shipped unparsed rather than
-    not at all — transport, timing and status are measured; ``gen_ai`` is
-    absent because the parser never ran.
+    """The process was ending and the shutdown budget ran out before this transaction's deferred
+    LLM-semantic parse: it shipped unparsed rather than not at all — transport, timing and status
+    are measured; ``gen_ai`` is absent because the parser never ran.
 
     Emitted from ``_finalize.py`` — the single site that names it, on the
     fallback ``drain_all`` assembles for every job still pending when the
@@ -802,14 +793,12 @@ Two emit sites, and the first is the mechanism the second restates.
     table follows (design §6.5 tier 1 is this exact case). Lowering the
     knob prunes usage leaves only until draft-level enforcement lands.
 
-    Not ``OTLP_ATTRIBUTE_TRUNCATED`` (39), by the census rule: that one
-    names ``max_otlp_attribute_bytes`` and cuts VALUES on the export
-    surface; this one names ``max_extra_keys`` and drops whole KEYS at
-    capture. An integer usage leaf can never carry 39 at all (numeric
-    values are not truncatable), and a string leaf can carry both,
-    independently. The count also includes two structural sanity bounds on
-    the same family (path > 120 bytes, depth > 6) that no real provider
-    usage object approaches — so every drop a real workload sees is
+    Not ``OTLP_ATTRIBUTE_TRUNCATED`` (39), by the census rule: that one names
+    ``max_otlp_attribute_bytes`` and cuts VALUES on the export surface; this one names
+    ``max_extra_keys`` and drops whole KEYS at capture. An integer usage leaf can never carry 39 at
+    all (numeric values are not truncatable), and a string leaf can carry both, independently. The
+    count also includes two structural sanity bounds on the same family (path > 120 bytes, depth >
+    6) that no real provider usage object approaches — so every drop a real workload sees is
     ``max_extra_keys``'s, and the marker's knob is the user's next action.
     """
 
@@ -936,6 +925,17 @@ Two emit sites, and the first is the mechanism the second restates.
     shape, so nothing was mapped out of it.
 
     Emitted from ``_interceptors/_seam.py::ByteSeamInterceptor._build_span``.
+    """
+
+    SSE_EVENT_UNPARSED = "sse_event_unparsed"
+    """An event of a reassembled LLM stream was not JSON even with an out-of-range number read as
+    its spelling (cut short, or not JSON at all), so it was skipped: what it carried may be missing.
+
+    Decided by ``_semantics/_genai.py::stream_limitation`` from the native
+    ``stream_events_unparsed``, counted as ``protocol.semantic.sse_event_unparsed``, attached by
+    ``_seam.py::_assemble`` on an identified span. Names NO knob (a body cut at its cap also carries
+    ``BODY_CAP_EXCEEDED``). Not ``SEMANTIC_PARSE_FAILED`` (no gen_ai truth at all) nor
+    ``SSE_UNKNOWN_PROVIDER`` (no reassembler recognized the stream).
     """
 
     # ------------------------------------------------------------------

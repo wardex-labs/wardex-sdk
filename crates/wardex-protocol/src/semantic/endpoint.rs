@@ -321,7 +321,7 @@ pub fn from_sse_shape(events: &[crate::sse::SseEvent]) -> Option<Endpoint> {
                 return lookup(Api::AnthropicMessages);
             }
         }
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&ev.data) {
+        if let Some(v) = super::event_json::parse_event(&ev.data) {
             if let Some(ty) = v.get("type").and_then(|x| x.as_str()) {
                 if ty.starts_with("response.") {
                     return lookup(Api::OpenAiResponses);

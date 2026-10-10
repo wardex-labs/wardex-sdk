@@ -1,5 +1,6 @@
 //! Anthropic Messages: request/response fill and SSE reassembly.
 
+use super::event_json::{is_done_marker, parse_event};
 use super::parts::*;
 use super::usage::{deep_merge, flatten_usage, UsageBounds, UsageView};
 use super::LlmSemantics;
@@ -342,10 +343,13 @@ pub(super) fn reassemble_anthropic(events: &[SseEvent]) -> Reassembled {
         BTreeMap::new();
     // web_search_tool_result: received fully-formed in the start event, no deltas
     let mut web_search_results: BTreeMap<i64, serde_json::Value> = BTreeMap::new();
+    // Events whose data is not JSON: skipped, and counted so the span says so.
+    // An OpenAI-style `[DONE]` from a gateway carries nothing and is not one.
+    let mut unparsed: u32 = 0;
     for ev in events {
-        let v: serde_json::Value = match serde_json::from_str(&ev.data) {
-            Ok(v) => v,
-            Err(_) => continue,
+        let Some(v) = parse_event(&ev.data) else {
+            unparsed = unparsed.saturating_add(u32::from(!is_done_marker(&ev.data)));
+            continue;
         };
         let typ = ev
             .event
@@ -508,6 +512,7 @@ pub(super) fn reassemble_anthropic(events: &[SseEvent]) -> Reassembled {
     Reassembled {
         body: serde_json::to_vec(&obj).unwrap_or_default(),
         terminated,
+        unparsed,
     }
 }
 
