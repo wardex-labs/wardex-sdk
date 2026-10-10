@@ -332,7 +332,7 @@ def test_import_reads_no_wardex_environment_variable(imported):
     and both reads are CPython's own. `subprocess` reads
     `_PYTHON_SUBPROCESS_USE_POSIX_SPAWN` at ITS import, and wardex pulls
     `subprocess` in transitively. The promise is about `WARDEX_*`, so that is
-    what is asserted -- with `OTEL_*` added because `_endpoint_from_env`
+    what is asserted -- with `OTEL_*` added because `endpoint_from_env`
     reads those too and they would be the same mistake.
     """
     read = imported["import_spies"]["env"]

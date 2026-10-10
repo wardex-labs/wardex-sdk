@@ -30,6 +30,8 @@ from ._config import (
 )
 from ._config import _resolve_config as _resolve_config_from_env
 from ._config import region_of_key as _region_of_key
+from ._config_checks import env_typo_messages as _env_typo_messages
+from ._config_checks import unusable_otel_endpoint as _unusable_otel_endpoint
 from ._diagnostics import AdapterStatus, Diagnostics
 from ._enums import (
     AdapterName,
@@ -222,6 +224,9 @@ def init(
         debug                WARDEX_DEBUG=true (case-insensitive)
 
     so `wardex.init()` with only `WARDEX_API_KEY` set is a working first run.
+    A set `WARDEX_*` variable outside this table is named in a
+    `WardexConfigWarning` together with the closest name in it, and an OTel
+    endpoint that is not an http(s) URL is left unused rather than exported to.
     What the environment resolved is written into the config the client
     carries — `client.config` answers with the resolved values, not the bare
     arguments. `WARDEX_DEBUG` can only turn `debug` ON: `debug=False` is this
@@ -279,6 +284,14 @@ def init(
         before_send_envelope=before_send_envelope,
         debug=debug,
     )
+    # A `WARDEX_*` variable wardex does not read -- `WARDEX_ENDPONT` -- was read
+    # by nobody and mentioned by nobody, and its symptom (no spans) looked
+    # exactly like a healthy backend receiving nothing. Named here with the
+    # closest real name. A warning rather than a raise, unlike a bad argument:
+    # a stray variable left in a deployment's environment must not be able to
+    # stop a process from starting.
+    for message in _env_typo_messages():
+        _warnings.warn(message, WardexConfigWarning, stacklevel=2)
     # The config is built FIRST so that a caller's bad argument still raises
     # the same TypeError/ValueError it raises with a working wheel. Degraded
     # mode must not turn a programming error into a shrug.
@@ -411,6 +424,18 @@ def init(
         )
     else:
         resolved_transport = NoOpTransport()
+        unusable = _unusable_otel_endpoint()
+        if unusable is not None:
+            # Said only here, where that value would have been the destination;
+            # under a `transport=` or a key it would have lost anyway.
+            _warnings.warn(
+                f"{unusable} is set but is not an http:// or https:// URL, so wardex does not "
+                "export to it (wardex exports OTLP over HTTP; a scheme-less host:port is the "
+                "form gRPC exporters take). Set WARDEX_ENDPOINT or backend.endpoint to the "
+                "collector's OTLP/HTTP address.",
+                WardexConfigWarning,
+                stacklevel=2,
+            )
         # Unconditional, like the degraded-mode line and for the same reason: a
         # wardex that captures into nothing looks exactly like a backend that
         # is up and receiving no traffic, so nobody goes looking.
