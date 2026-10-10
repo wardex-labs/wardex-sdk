@@ -1,6 +1,6 @@
 //! OpenAI Chat Completions: request/response fill and SSE reassembly.
 
-use super::event_json::{is_done_marker, parse_event};
+use super::event_json::{carries_nothing, is_done_marker, parse_event};
 use super::parts::*;
 use super::usage::{flatten_usage, UsageBounds, UsageView};
 use super::{LlmSemantics, StringOrVec};
@@ -428,6 +428,7 @@ pub(super) fn reassemble_openai(events: &[SseEvent]) -> Reassembled {
     // mid-stream error carries a choice beside the error.
     let mut error: Option<serde_json::Value> = None;
     // Events whose data is not JSON: skipped, and counted so the span says so.
+    // An empty heartbeat event carries nothing and is not one.
     let mut unparsed: u32 = 0;
     for ev in events {
         if is_done_marker(&ev.data) {
@@ -435,7 +436,7 @@ pub(super) fn reassemble_openai(events: &[SseEvent]) -> Reassembled {
             continue;
         }
         let Some(v) = parse_event(&ev.data) else {
-            unparsed = unparsed.saturating_add(1);
+            unparsed = unparsed.saturating_add(u32::from(!carries_nothing(&ev.data)));
             continue;
         };
         if id.is_none() {

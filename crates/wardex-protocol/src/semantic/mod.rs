@@ -114,7 +114,8 @@ pub struct LlmSemantics {
     /// SSE only (0 otherwise): events a reassembler skipped because their
     /// data was not JSON, even with an out-of-range number read as its own
     /// spelling (`semantic/event_json.rs`) — cut short, or not JSON at all.
-    /// The stream's end marker `[DONE]` is not one. The reassembled body may
+    /// The stream's end marker `[DONE]` is not one, nor is an event whose data
+    /// is empty or only whitespace (a heartbeat). The reassembled body may
     /// lack whatever such an event carried (a Responses terminal snapshot
     /// repeats the deltas, nothing repeats a lost Chat chunk), so the seam
     /// marks the span when this is not 0.
