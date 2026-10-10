@@ -239,13 +239,13 @@ Two emit sites, and the first is the mechanism the second restates.
     """The unit was torn down by cancellation or interpreter shutdown rather than by a normal
     end-of-run.
 
-    Emitted by ``_runtime.py``'s signal handler, and by that one alone. It is reached only on the
-    disposition where the app left the signal at its default: there the handler ends the process
-    itself, so ``atexit`` never runs and the ordinary teardown never gets its turn. Under any other
-    disposition the program either exits through the interpreter — where atexit reaches the
-    adapter's ``uninstall`` and the span carries ``ADAPTER_UNINSTALLED`` instead — or carries on
-    running, and closing a session that is still being driven would be the lie this marker exists to
-    avoid telling.
+    Emitted by ``_runtime.py`` alone, on two paths. The signal handler marks adapter units and
+    hand-opened spans (decorators, ``wardex.span()``) on the one disposition where the app left the
+    signal at its default: the handler ends the process itself, so ``atexit`` never runs and the
+    ordinary teardown never gets its turn. Under any other disposition the program carries on, or
+    exits through the interpreter, where atexit reaches the adapter's ``uninstall`` and an adapter
+    span carries ``ADAPTER_UNINSTALLED`` instead. ``wardex.close()`` and atexit mark the open
+    hand-opened spans too: no adapter's uninstall closed those, so the other marker would be false.
 
     Reads as the more honest of the pair: it says a shutdown cut the run off, which is what a user
     wants to know, where its sibling says only that wardex stopped watching.
