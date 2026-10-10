@@ -311,6 +311,37 @@ def test_a_span_held_across_a_yield_and_closed_on_another_thread_restores_the_pa
     assert _parent(spans["after"]) == root
 
 
+def test_a_plain_generators_span_closed_on_a_pool_thread_leaves_that_thread_alone(recording):
+    """The other side of the same rule: a span held across a `yield` by a plain
+    generator, opened inside one request and ended by `next()` on a pool
+    thread, must not leave that request's scope installed on the pool thread,
+    where unrelated work would then be parented under a request it is not in."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    def held():
+        with span("held-plain"):
+            yield
+        yield
+
+    pool = ThreadPoolExecutor(max_workers=1)
+    try:
+        with span("request-a"):
+            g = held()
+            next(g)
+            pool.submit(lambda: next(g, None)).result()
+
+        def unrelated():
+            with span("unrelated-on-pool"):
+                pass
+
+        pool.submit(unrelated).result()
+    finally:
+        pool.shutdown()
+    spans = _by_name(recording)
+    assert _parent(spans["unrelated-on-pool"]) is None
+    assert _parent(spans["held-plain"]) == spans["request-a"].context.span_id.value
+
+
 def test_an_async_generator_stepped_from_several_tasks_restores_the_parent(recording):
     @agent(name="twotask")
     async def twotask():

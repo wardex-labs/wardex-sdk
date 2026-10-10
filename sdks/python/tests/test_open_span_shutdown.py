@@ -20,6 +20,7 @@ import signal
 import subprocess
 import sys
 import threading
+import time
 
 import pytest
 
@@ -27,7 +28,7 @@ import wardex_sdk as wardex
 from wardex_sdk import _hub, _runtime
 from wardex_sdk._assembly import Limitation, counters
 from wardex_sdk._assembly._diag import reset_reports_for_test
-from wardex_sdk._client import Client
+from wardex_sdk._client import Client, _UnnamedTimeout
 from wardex_sdk._config import BackendConfig, BatchingConfig, WardexConfig
 from wardex_sdk._limits import LimitsConfig
 from wardex_sdk._types import Envelope
@@ -203,12 +204,10 @@ def test_the_signal_handler_never_waits_on_the_lock_it_interrupted(tmp_path):
     assert "handler returned" in done.stdout
 
 
-def test_a_full_buffer_keeps_its_finished_spans_and_counts_the_open_ones(monkeypatch, capsys):
-    """The finished spans are the children the open ones exist to parent; making
-    room for a parent by evicting its children is no trade. The signal handler
-    cannot wait for a flush, so it ships what fits, roots first, and counts the
-    rest under its own counter, with one line."""
-    reset_reports_for_test()
+def test_the_signal_handler_drains_finished_spans_to_make_room(monkeypatch):
+    """The finished spans are the children the open ones exist to parent, so
+    room is never made by evicting them: the handler exports them first, then
+    buffers the open spans, all within its own flush budget."""
     transport, client = _install(max_buffer_spans=10)
     _full_of_finished_spans(client, 6)
     managers = _open_nested(8)
@@ -217,16 +216,57 @@ def test_a_full_buffer_keeps_its_finished_spans_and_counts_the_open_ones(monkeyp
     names = [sp.name for sp in transport.spans()]
     finished = sorted(n for n in names if n.startswith("finished-"))
     assert finished == [f"finished-{i}" for i in range(6)]
-    assert sorted(n for n in names if n.startswith("open-")) == [f"open-{i}" for i in range(4)]
+    assert sorted(n for n in names if n.startswith("open-")) == sorted(
+        f"open-{i}" for i in range(8)
+    )
+    assert counters.snapshot().get("_runtime.open_spans_unshipped", 0) == before
+    _close_all(managers)
+
+
+def _an_export_in_flight(client):
+    """Hold the export slot from another thread, as a POST that never returns
+    would: no drain can make room. Returns the release."""
+    held, release = threading.Event(), threading.Event()
+
+    def exporting():
+        with client._export_lock:
+            held.set()
+            release.wait(10)
+
+    threading.Thread(target=exporting, daemon=True).start()
+    assert held.wait(5)
+    return release
+
+
+def test_with_no_way_to_drain_the_handler_keeps_finished_spans_and_counts_the_rest(
+    monkeypatch, capsys
+):
+    """A buffer that cannot be drained in time: the open spans fill only the
+    room there is, oldest entries first, the finished spans stay, and the rest
+    is counted under its own counter with one line."""
+    reset_reports_for_test()
+    monkeypatch.setattr(_runtime, "_SIGNAL_FLUSH_TIMEOUT", _UnnamedTimeout(0.2, "<test budget>"))
+    transport, client = _install(max_buffer_spans=10)
+    _full_of_finished_spans(client, 6)
+    managers = _open_nested(8)
+    before = counters.snapshot().get("_runtime.open_spans_unshipped", 0)
+    release = _an_export_in_flight(client)
+    _signal_with(signal.SIG_DFL, monkeypatch)
+    release.set()
     assert counters.snapshot().get("_runtime.open_spans_unshipped", 0) == before + 4
     lines = [ln for ln in capsys.readouterr().err.splitlines() if "open_spans_unshipped" in ln]
     assert len(lines) == 1 and "4 span(s)" in lines[0]
+    client.flush()
+    names = [sp.name for sp in transport.spans()]
+    finished = sorted(n for n in names if n.startswith("finished-"))
+    assert finished == [f"finished-{i}" for i in range(6)]
+    assert sorted(n for n in names if n.startswith("open-")) == [f"open-{i}" for i in range(4)]
     _close_all(managers)
     client.flush()
     assert len([sp for sp in transport.spans() if sp.name.startswith("open-")]) == 4
 
 
-def test_close_flushes_between_chunks_so_every_open_span_ships():
+def test_close_drains_between_chunks_so_every_open_span_ships():
     transport, client = _install(max_buffer_spans=10)
     _full_of_finished_spans(client, 6)
     managers = _open_nested(25)
@@ -239,11 +279,24 @@ def test_close_flushes_between_chunks_so_every_open_span_ships():
     assert len(transport.spans()) == 31  # no block's end added a copy
 
 
+def test_every_cut_off_span_ends_at_one_time_across_chunks(monkeypatch):
+    """One end time for all of them, however many chunks they take, so no child
+    is recorded as ending after its parent."""
+    monkeypatch.setattr(_runtime, "_CUT_OFF_CHUNK", 3)
+    ticks = iter(range(10**12, 10**13, 1_000_000))
+    monkeypatch.setattr(_runtime.time, "time_ns", lambda: next(ticks))
+    transport, _client = _install()
+    managers = _open_nested(7)
+    wardex.close()
+    ends = {sp.end_time_ns for sp in transport.spans() if sp.name.startswith("open-")}
+    assert len(ends) == 1
+    _close_all(managers)
+
+
 def test_a_signal_in_the_middle_of_close_still_finds_the_spans_left(monkeypatch):
     """`close()` takes the table a chunk at a time, so a SIGTERM landing between
-    two chunks ships what the buffer has room for from what is left, rather than
-    finding the table already emptied into a close the process will not finish.
-    What does not fit is counted, and nothing ships twice."""
+    two chunks ships what is left rather than finding the table already emptied
+    into a close the process will not finish. Nothing ships twice."""
     transport, client = _install(max_buffer_spans=10)
     before = counters.snapshot().get("_runtime.open_spans_unshipped", 0)
     managers = _open_nested(25)
@@ -259,11 +312,117 @@ def test_a_signal_in_the_middle_of_close_still_finds_the_spans_left(monkeypatch)
     monkeypatch.setattr(client, "_drain", drain_then_signal)
     _runtime.runtime().teardown()
     shipped = [sp.name for sp in transport.spans() if sp.name.startswith("open-")]
-    # ten from close() before the signal, ten from the handler, five counted
-    assert len(shipped) == len(set(shipped)) == 20
-    assert counters.snapshot().get("_runtime.open_spans_unshipped", 0) == before + 5
+    assert len(shipped) == len(set(shipped)) == 25
+    assert counters.snapshot().get("_runtime.open_spans_unshipped", 0) == before
     _close_all(managers)
-    assert len([sp for sp in transport.spans() if sp.name.startswith("open-")]) == 20
+    assert len([sp for sp in transport.spans() if sp.name.startswith("open-")]) == 25
+
+
+def test_a_signal_counts_the_chunk_an_interrupted_close_was_holding(monkeypatch):
+    """The process ends in the handler, so a chunk the interrupted `close()` had
+    taken from the table and not yet buffered never ships: counted as lost."""
+    monkeypatch.setattr(_runtime, "_CUT_OFF_CHUNK", 10)
+    transport, client = _install()
+    before = counters.snapshot().get("_runtime.open_spans_unshipped", 0)
+    managers = _open_nested(30)
+    real_door = client._return_to_buffer
+    fired = []
+
+    def signal_then_buffer(spans, snapshots):
+        if not fired:  # close() holds its first chunk of ten, not yet buffered
+            fired.append(True)
+            _signal_with(signal.SIG_DFL, monkeypatch)
+        return real_door(spans, snapshots)
+
+    monkeypatch.setattr(client, "_return_to_buffer", signal_then_buffer)
+    _runtime.runtime().teardown()
+    assert counters.snapshot().get("_runtime.open_spans_unshipped", 0) == before + 10
+    _close_all(managers)
+
+
+def test_close_spends_one_budget_on_cut_off_spans_and_its_own_steps():
+    """Draining between chunks of cut-off spans is part of `close()`'s budget, not
+    a second budget before it. With an export stuck in flight, the cut-off spans
+    wait out their half making room, and `close()`'s own final drain waits only
+    for what is left — one second in all, not one and a half."""
+    _transport, client = _install(max_buffer_spans=10)
+    managers = _open_nested(30)
+    release = _an_export_in_flight(client)
+    started = time.monotonic()
+    try:
+        wardex.close(1.0)
+    finally:
+        elapsed = time.monotonic() - started
+        release.set()
+    assert 0.9 <= elapsed < 1.25, f"close(1.0) took {elapsed:.2f}s"
+    _close_all(managers)
+
+
+_WAKE_VIA_FINALIZE_CHILD = r"""
+import contextvars, signal, threading, time
+import wardex_sdk as wardex
+from wardex_sdk import _hub, _runtime
+from wardex_sdk.transport._base import Transport
+
+class Quiet(Transport):
+    def export(self, envelope):
+        pass
+
+wardex.init(transport=Quiet(), intercept=False, backend=wardex.BackendConfig(api_key="k"),
+            batching=wardex.BatchingConfig(flush_interval=3600.0))
+client = _hub.get_client()
+with wardex.span("seed"):
+    pass
+seed = client._buffer.spans[0]
+for i in range(300):  # below the wake threshold (512)
+    with wardex.span(f"finished-{i}"):
+        pass
+release = threading.Event()
+
+class Job:
+    size = 10
+    def __init__(self, blocking):
+        self.blocking = blocking
+        self.ctx = contextvars.copy_context()
+    def run(self):
+        if self.blocking:
+            release.wait()
+        return seed
+    def fallback(self, marker):
+        return seed
+
+client.capture_deferred(Job(blocking=True))  # the finalize worker is busy in a parse
+time.sleep(0.05)
+client.capture_deferred(Job(blocking=False))  # pending when the signal lands
+held = []
+for i in range(300):  # cut-off spans that lift the buffer past the threshold
+    cm = wardex.span(f"open-{i}")
+    cm.__enter__()
+    held.append(cm)
+    _hub._current_scope.set(None)
+_runtime.os.kill = lambda *a: None
+_runtime.runtime()._prev_handlers[signal.SIGTERM] = signal.SIG_DFL
+with client._worker._wake._cond:  # the frame the signal interrupts is inside a wake
+    _runtime._handler(signal.SIGTERM, None)
+print("handler returned", flush=True)
+release.set()
+"""
+
+
+def test_nothing_the_signal_handler_admits_wakes_the_worker(tmp_path):
+    """The shutdown flush finishes pending parses and admits their spans; with
+    the cut-off spans already buffered, one such admit crosses the wake
+    threshold. A wake from the handler waits on the lock its own frame holds."""
+    script = tmp_path / "child.py"
+    script.write_text(_WAKE_VIA_FINALIZE_CHILD)
+    try:
+        done = subprocess.run(
+            [sys.executable, str(script)], capture_output=True, text=True, timeout=30
+        )
+    except subprocess.TimeoutExpired:
+        pytest.fail("the signal handler woke the worker and hung on its own frame's lock")
+    assert done.returncode == 0, done.stderr
+    assert "handler returned" in done.stdout
 
 
 # ==========================================================================
