@@ -620,16 +620,19 @@ def test_a_named_adapter_installs_a_framework_that_has_no_package_metadata(tmp_p
     installs on its own import. What the probe could not do (the shadow
     check needs a distribution to compare against) is said once as a
     warning; the empty `tracing` module of this stand-in then declines the
-    surface, which is the second warning and the only counter."""
+    surface, which is the second warning and the only counter. The third is
+    the registry filing the adapter as not installed, with the version it
+    found (none, here) and what to do."""
     marker = _fake_agents_package(tmp_path, with_tracing=True)
     out = _decline_in_a_fresh_process(tmp_path, "absent")
     assert marker.exists()
     assert out["agents_imported"] is True
     assert out["shadowed"] == 0 and out["unsupported"] == 1
     warnings = [m for lvl, m in out["lines"] if lvl == logging.WARNING]
-    assert len(warnings) == 2
+    assert len(warnings) == 3
     assert "without package metadata" in warnings[0] and "shadow check" in warnings[0]
     assert "surface unrecognized" in warnings[1]
+    assert "did not install" in warnings[2] and "version unknown" in warnings[2]
     assert not any("failed to load" in m for m in warnings)
 
 
