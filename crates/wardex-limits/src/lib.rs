@@ -218,18 +218,23 @@ pub struct Limits {
     /// Maximum spans buffered before the oldest are dropped.
     pub max_buffer_spans: usize,
     /// Maximum approximate bytes buffered across pending spans. Each pending
-    /// span counts a fixed per-span overhead plus every payload it holds: its
-    /// raw request and response bodies, the length of every string attribute
-    /// it carries, and its events' string attributes. The attributes are not a
+    /// span counts a fixed per-span overhead plus what it holds as text or
+    /// bytes: its raw request and response bodies; its name and status
+    /// message; every attribute's key and value; its events' names and
+    /// attributes; and its typed payload fields (system instructions,
+    /// retrieval documents and query). Text counts its length and bytes their
+    /// size; a list, set or map value counts the text and bytes directly
+    /// inside it, one level deep; a number, a boolean, or a value of any other
+    /// type adds nothing beyond the overhead. The attributes are not a
     /// rounding error: the message copies the semantic parse stores beside a
     /// body (`gen_ai.input.messages` and its siblings) are close to a second
     /// copy of a multimodal request, base64 image included.
     ///
     /// Over the bound, the oldest spans are evicted, and every eviction is
-    /// counted. The final backstop: resident span memory stays within this
-    /// bound even if every parser cap fails, with one exception stated rather
-    /// than hidden — a single span larger than the bound is still admitted,
-    /// alone, once everything older has been evicted.
+    /// counted. The final backstop: resident span memory, measured as above,
+    /// stays within this bound even if every parser cap fails, with one
+    /// exception stated rather than hidden — a single span larger than the
+    /// bound is still admitted, alone, once everything older has been evicted.
     pub max_buffer_bytes: usize,
     /// Replay ring-buffer depth. Reserved: no SDK reads this value today, so
     /// setting it changes nothing. It stays in the schema because it is part
