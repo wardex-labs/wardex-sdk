@@ -1135,7 +1135,7 @@ def test_the_transports_own_debug_flag_reveals_the_skipped_span_names():
 
 
 @pytest.mark.usefixtures("fresh_counters")
-@pytest.mark.parametrize("endpoint", ["collector.internal/v1/traces", "collector:4318/v1/traces"])
+@pytest.mark.parametrize("endpoint", ["collector.internal/v1/traces", "//collector:4318/v1/traces"])
 def test_a_malformed_address_fails_the_export_inside_the_transport_not_out_of_it(endpoint):
     """`init()` refuses such an address; a transport constructed directly is
     still handed one. Building the request raised `ValueError` before the

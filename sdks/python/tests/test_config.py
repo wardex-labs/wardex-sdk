@@ -665,10 +665,37 @@ def test_a_refused_endpoint_is_not_quoted_back():
     assert "t0k" not in str(excinfo.value)
 
 
-def test_a_scheme_less_wardex_endpoint_variable_is_refused_at_configuration(monkeypatch):
+def test_a_scheme_less_wardex_endpoint_variable_is_refused_when_it_is_the_destination(
+    monkeypatch,
+):
+    """With nothing else naming a destination, wardex would export nothing:
+    refused at configuration time, like the same value passed as the argument."""
     monkeypatch.setenv("WARDEX_ENDPOINT", "collector:4318")
+    assert _resolve_config().backend.endpoint is None
     with pytest.raises(ValueError, match="WARDEX_ENDPOINT"):
-        _resolve_config()
+        wardex_sdk.init(intercept=False)
+
+
+@pytest.mark.parametrize(
+    ("given", "says"),
+    [
+        ({"transport": "noop"}, "transport= carries its own address"),
+        ({"backend": BackendConfig(api_key="wdx_us_secret123")}, "api_key routes"),
+    ],
+    ids=["transport", "api_key"],
+)
+def test_a_scheme_less_wardex_endpoint_variable_that_lost_anyway_only_warns(
+    monkeypatch, given, says
+):
+    """Under a `transport=` or a project key the variable was never going to be
+    the destination. A stray value left in the environment must not stop the
+    process from starting; it is named as the endpoint that was ignored."""
+    monkeypatch.setenv("WARDEX_ENDPOINT", "collector:4318")
+    if given.get("transport") == "noop":
+        given = {"transport": wardex_sdk.NoOpTransport()}
+    with pytest.warns(wardex_sdk.WardexConfigWarning, match=says):
+        wardex_sdk.init(intercept=False, **given)
+    wardex_sdk.close()
 
 
 @pytest.mark.parametrize(
@@ -724,6 +751,8 @@ _TYPOS = [
 ]
 if sys.platform != "win32":  # Windows folds variable names to upper case
     _TYPOS.append(("wardex_endpoint", "WARDEX_ENDPOINT"))
+    # The same rule for a tooling name: only its exact spelling is read.
+    _TYPOS.append(("wardex_record", "WARDEX_RECORD"))
 
 
 @pytest.mark.parametrize(("typo", "meant"), _TYPOS)
