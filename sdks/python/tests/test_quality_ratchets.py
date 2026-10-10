@@ -300,7 +300,7 @@ _OVERSIZED_BUDGET = {
     # emit site was added, each paid for the same way.
     "_assembly/_integrity.py": 1078,
     "_assembly/_builder.py": 963,
-    "_adapters/_anthropic_agent_sdk.py": 944,
+    "_adapters/_anthropic_agent_sdk.py": 924,
 }
 
 

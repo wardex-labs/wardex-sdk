@@ -63,6 +63,7 @@ import secrets
 import threading
 import time
 import zlib
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -141,6 +142,10 @@ class _OtelBridgeReceiver:
         self._lock = threading.RLock()
         self._by_trace: dict[str, _BridgeSlot] = {}
         self._by_session_id: dict[str, _BridgeSlot] = {}
+        #: The owner's periodic work, run on the serve loop between requests
+        #: (`_tick`). The serve thread exists exactly as long as the bridge
+        #: does, which is when the owner has bridge sessions to look after.
+        self.on_tick: Callable[[], None] | None = None
 
         receiver = self
 
@@ -150,6 +155,11 @@ class _OtelBridgeReceiver:
             # hostname resolves to on some platforms; the bind address below
             # is the whole security story and must stay literal.
             allow_reuse_address = False
+
+            def service_actions(self) -> None:
+                # `serve_forever` calls this once per loop pass: after each
+                # request, and at least every poll interval (0.5 s) when idle.
+                receiver._tick()
 
         class _Handler(http.server.BaseHTTPRequestHandler):
             protocol_version = "HTTP/1.1"
@@ -181,6 +191,17 @@ class _OtelBridgeReceiver:
             daemon=True,
         )
         self._thread.start()
+
+    def _tick(self) -> None:
+        """Run `on_tick` once, on the serve thread. Contained and counted: a
+        failure here must not stop the server, whose loop calls it."""
+        hook = self.on_tick
+        if hook is None:
+            return
+        try:
+            hook()
+        except Exception:  # noqa: BLE001 — the owner's bug, not the server's
+            counters.bump(f"adapters.{self._owner}.otel_bridge.tick_failed")
 
     @property
     def endpoint(self) -> str:
