@@ -241,13 +241,15 @@ and your code still receives the same exception. Hand-started threads need
 ## Data safety
 
 Masking is on by default and runs in your process before export. It covers
-e-mail addresses, North American phone numbers and South Korean mobile
-numbers, card numbers, US SSNs, IP addresses, IBANs, bank routing numbers,
-credential formats (`sk-…`, `AKIA…`, `ghp_…`, JWTs, PEM private keys and
-more), and any value passed under a secret-looking name such as `api_key` or
-`password`, whether it sits in a URL, a JSON body, a form field or a span
-attribute. Argument names stay readable, and each masked span records how
-many values were replaced and by which rule.
+e-mail addresses, North American phone numbers, South Korean mobile numbers
+(`010-2481-7730` with hyphens, en dashes, spaces, dots or nothing between the
+groups, with `+82`, `(+82)` or `0082` in front, or as `(010) 2481-7730`),
+card numbers, US SSNs, IP addresses, IBANs, bank routing numbers, credential
+formats (`sk-…`, `AKIA…`, `ghp_…`, JWTs, PEM private keys and more), and any
+value passed under a secret-looking name such as `api_key` or `password`,
+whether it sits in a URL, a JSON body, a form field or a span attribute.
+Argument names stay readable, and each masked span records how many values
+were replaced and by which rule.
 
 ```python
 from wardex_sdk import PIIConfig
@@ -264,8 +266,11 @@ What masking does not catch:
 
 - a secret under an ordinary name with no recognisable shape, such as
   `{"value": "hunter2"}`;
+- a phone number in any other form: another country's (`+44 20 7946 0958`),
+  a South Korean landline (`02-2481-7730`), a country code with neither `+`
+  nor `00` (`82-10-2481-7730`), full-width digits, or a number run into
+  letters or an underscore (`user_01024817730.json`);
 - a secret name with an escape inside it, such as `pass\u0077ord=…`;
-- a phone number in any other format, such as `+44 20 7946 0958`;
 - `name: value` in prose or YAML, and XML such as `<password>…</password>`;
 - a credential inside a URL path, such as `/bot<token>/sendMessage`;
 - payloads that are not text, and bodies compressed with anything other than

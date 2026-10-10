@@ -381,12 +381,13 @@ All notable changes to this project are documented here. The format follows
   a request body reached your backend as written, though the README lists
   phone numbers among what masking covers. It now becomes `[PHONE]` under the
   same `phone_number` category: `010`, `011` and `016` to `019` numbers with
-  hyphens, spaces, dots or no separators (`01024817730`), `+82 10-…` with or
-  without the `0`, and a number with a Korean particle written straight after
-  it (`010-2481-7730으로`). A ten-digit run with no separators, a date, and a
-  number inside a longer run of digits or letters are left alone. The README
-  now says which phone formats are covered and lists every other format among
-  what masking does not catch.
+  hyphens, en dashes, spaces, dots or no separators (`01024817730`), after
+  `+82`, `(+82)` or `0082` with or without the `0`, with the prefix in
+  parentheses (`(010) 2481-7730`), and with a Korean particle written
+  straight after the number (`010-2481-7730으로`). A ten-digit run with no
+  separators, a date, and a number inside a longer run of digits, letters or
+  underscores are left alone. The README now says exactly which forms are
+  covered and lists the others among what masking does not catch.
 - **LangGraph's step ids are no longer masked as a card number.** The
   LangGraph adapter writes the id LangGraph gives each node run as
   `wardex.step.task_id`, and the checkpoint namespace that holds it as
