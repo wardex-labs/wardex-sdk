@@ -596,3 +596,61 @@ def test_append_increment_cannot_overstate_across_a_reentrant_drain():
         assert len(t.envelopes[0].spans) == 2  # baseline + new_span, both exported
     finally:
         c.close()
+
+
+class _LazyProxy:
+    """The shape of Werkzeug's `LocalProxy` and Django's `SimpleLazyObject`:
+    `__class__` is a property that evaluates what the proxy wraps."""
+
+    def __init__(self, thunk) -> None:
+        self._thunk = thunk
+        self.evaluations = 0
+
+    @property
+    def __class__(self):  # type: ignore[override]
+        self.evaluations += 1
+        return type(self._thunk())
+
+
+def _db_outside_a_request() -> str:
+    raise RuntimeError("database access outside a request")
+
+
+@pytest.mark.parametrize(
+    "thunk",
+    [lambda: "alice@example.com", _db_outside_a_request],
+    ids=["proxy-to-str", "proxy-whose-evaluation-raises"],
+)
+def test_a_lazy_proxy_attribute_neither_runs_nor_loses_the_span(thunk):
+    """Counting dispatched on `isinstance`, which reads `__class__`: the proxy
+    evaluated what it wraps on the capture path, then claimed to be a `str`
+    that `str.__len__` refused, or raised outright -- and the manual span was
+    lost. The count reads the real type, which runs nothing."""
+    import wardex_sdk
+    from wardex_sdk import _hub
+
+    proxy = _LazyProxy(thunk)
+    wardex_sdk.init(transport=_Recording(), intercept=False)
+    try:
+        client = _hub.get_client()
+        client._worker.stop()
+        with wardex_sdk.span("request") as span:
+            span.set_attribute("user", proxy)  # type: ignore[arg-type]
+        client._settle()
+        assert [s.name for s in client._spans] == ["request"]
+        assert proxy.evaluations == 0, "counting the span ran the proxy's code"
+    finally:
+        wardex_sdk.close()
+
+
+def test_a_huge_collection_is_read_only_up_to_a_bounded_number_of_items():
+    """Counting runs on the host's capture path: its cost may not grow with
+    whatever a host attached. Past the cap, items count nothing."""
+    from wardex_sdk._types import _COUNTED_ITEMS, span_buffer_bytes
+
+    base = span_buffer_bytes(_span(extra=(("k", []),)))
+    long_list = ["x"] * (_COUNTED_ITEMS * 50)
+    assert span_buffer_bytes(_span(extra=(("k", long_list),))) - base == _COUNTED_ITEMS
+    long_dict = {str(i): "v" for i in range(_COUNTED_ITEMS * 50)}
+    counted = span_buffer_bytes(_span(extra=(("k", long_dict),))) - base
+    assert _COUNTED_ITEMS < counted <= _COUNTED_ITEMS * 6

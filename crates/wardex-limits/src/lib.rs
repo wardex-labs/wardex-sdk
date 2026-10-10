@@ -224,11 +224,14 @@ pub struct Limits {
     /// attributes; and its typed payload fields (system instructions,
     /// retrieval documents and query). Text counts its length and bytes their
     /// size; a list, set or map value counts the text and bytes directly
-    /// inside it, one level deep; a number, a boolean, or a value of any other
-    /// type adds nothing beyond the overhead. The attributes are not a
-    /// rounding error: the message copies the semantic parse stores beside a
-    /// body (`gen_ai.input.messages` and its siblings) are close to a second
-    /// copy of a multimodal request, base64 image included.
+    /// inside it, one level deep and over a bounded number of its first items
+    /// (1024 in the Python SDK), so counting costs the same however large a
+    /// value a host attached; a number, a boolean, or a value of any other type
+    /// (a lazy proxy included) adds nothing beyond the overhead. The
+    /// attributes are not a rounding error: the message copies the semantic
+    /// parse stores beside a body (`gen_ai.input.messages` and its siblings)
+    /// are close to a second copy of a multimodal request, base64 image
+    /// included.
     ///
     /// Over the bound, the oldest spans are evicted, and every eviction is
     /// counted. The final backstop: resident span memory, measured as above,
