@@ -116,7 +116,7 @@ class _FakeClient:
     def __init__(self) -> None:
         self.spans: list = []
 
-    def capture_span(self, span) -> None:  # noqa: ANN001
+    def capture_span(self, span, *, scope=None) -> None:  # noqa: ANN001
         self.spans.append(span)
 
 

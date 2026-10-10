@@ -93,6 +93,10 @@ class _Pending:
     #: The tags and user the span is stamped with, snapshotted with the
     #: ambient for the same reason (`_issue_scope`): the reader that captures
     #: the span runs in whichever context started it, often another request's.
+    #: Both are read on the task that WRITES stdin. That is the caller where
+    #: the host writes its own requests; the official `mcp` SDK writes from a
+    #: task the session's opener started, so there the parent and the identity
+    #: are still the opener's, not each caller's (a known gap, not fixed here).
     scope: ScopeSnapshot = UNKNOWN_ISSUER
 
 

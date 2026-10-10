@@ -54,6 +54,11 @@ class RecordingClient:
     rule the real client has ("visible after flush", here "after settle").
     A double of your own needs the same method; to keep old synchronous
     semantics, implement it as `self.capture_span(job.ctx.run(job.run))`.
+
+    `capture_span` takes the keyword the byte seams and MCP stdio pass,
+    `scope`: the `(tags, user)` the span's work was issued under, which the
+    real client stamps and this double ignores. A double without it raises
+    inside the seam, where the error is swallowed and the span is lost.
     """
 
     config = None
@@ -70,7 +75,7 @@ class RecordingClient:
     def _admit(self, span: Any, *, scope: Any = None) -> None:
         self.spans.append(span)
 
-    def capture_span(self, span: Any) -> None:
+    def capture_span(self, span: Any, *, scope: Any = None) -> None:
         self.spans.append(span)
 
     def capture_deferred(self, job: Any) -> None:

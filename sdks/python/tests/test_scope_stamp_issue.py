@@ -349,3 +349,53 @@ def test_a_snapshot_that_cannot_be_read_stamps_nothing_and_is_counted(recorded, 
         itc._on_response_bytes(sock, b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}")
     (span,) = _spans(recorded)
     assert _identity(span) == (None, None)
+
+
+def test_a_websocket_session_written_to_by_another_tenant_names_no_identity(recorded):
+    """The session is ONE span. Opened by A, written to by B, closed by C: it
+    carries B's payload, so A's identity on it would put B's data under A's
+    name. The rule the conversation id already follows: the handshake's
+    identity holds only while every message the client sends is issued under
+    it, and otherwise none is named."""
+    itc = _seam()
+    held: list[Any] = []
+    with _tenant("A"):
+        _open_websocket(itc, held)
+    with _tenant("B"):
+        itc._on_request_bytes(held[0], _TEXT)
+    with _tenant("C"):
+        close_registry().fire(held.pop())
+    (span,) = [s for s in _spans(recorded) if s.name.startswith("WS")]
+    assert _identity(span) == (None, None)
+
+
+def test_the_public_recording_client_takes_what_the_seams_pass():
+    """`wardex_sdk.testing.RecordingClient` is the double users copy. The seams
+    call `capture_span(span, scope=...)`; a double without the keyword raises
+    inside the patched socket call, where the seam's guard swallows it and the
+    span is gone without a trace. Driven through the real `send` wrapper."""
+    import inspect
+
+    from wardex_sdk._client import Client
+    from wardex_sdk.testing import RecordingClient
+
+    def keywords(fn: Any) -> set[str]:
+        return {
+            p.name
+            for p in inspect.signature(fn).parameters.values()
+            if p.kind is inspect.Parameter.KEYWORD_ONLY
+        }
+
+    assert keywords(Client.capture_span) <= keywords(RecordingClient.capture_span)
+
+    client = RecordingClient()
+    itc = SSLInterceptor()
+    itc._client = client
+    itc._load_limits(client)
+    sock = _FakeSSLSocket(None)
+    close = bytes([0x88, 0x02]) + (1000).to_bytes(2, "big")
+    itc._on_request_bytes(sock, _UPGRADE)
+    itc._on_response_bytes(sock, _SWITCHED + close)
+    send = itc._mk_send("send", lambda this, data, *a, **k: len(data))
+    send(sock, close)  # the client's Close answers the server's: the session span ships here
+    assert [s.name for s in client.spans] == ["WS /chat"]

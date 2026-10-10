@@ -344,7 +344,7 @@ class _InlineClient:
     class config:  # noqa: N801 - mirrors `Client.config`
         debug = False
 
-    def capture_span(self, span: object) -> None:
+    def capture_span(self, span: object, *, scope: object = None) -> None:
         pass
 
     def capture_deferred(self, job: object) -> None:

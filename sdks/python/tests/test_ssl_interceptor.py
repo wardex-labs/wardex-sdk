@@ -306,7 +306,7 @@ class _DebugRecordingClient:
         self.spans: list[object] = []
         self.config = _DebugConfig()
 
-    def capture_span(self, span: object) -> None:
+    def capture_span(self, span: object, *, scope: object = None) -> None:
         self.spans.append(span)
 
 

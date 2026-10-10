@@ -195,7 +195,7 @@ def test_responses_error_response_is_a_chat_span_with_request_identity(fake_ssl_
         def __init__(self) -> None:
             self.spans: list = []
 
-        def capture_span(self, span) -> None:
+        def capture_span(self, span, *, scope=None) -> None:
             self.spans.append(span)
 
         def capture_deferred(self, job) -> None:

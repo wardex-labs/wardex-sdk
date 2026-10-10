@@ -383,7 +383,7 @@ class _ClientWithLimits:
         self.config = self._Config(limits)
         self.spans: list = []
 
-    def capture_span(self, span) -> None:
+    def capture_span(self, span, *, scope=None) -> None:
         self.spans.append(span)
 
 

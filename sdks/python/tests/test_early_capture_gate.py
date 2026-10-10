@@ -80,7 +80,7 @@ class _RecordingClient:
         self.config = WardexConfig(capture_mode=mode, backend=BackendConfig(api_key="k"))
         self.spans: list[Any] = []
 
-    def capture_span(self, span: Any) -> None:
+    def capture_span(self, span: Any, *, scope: object = None) -> None:
         self.spans.append(span)
 
     def capture_deferred(self, job) -> None:
