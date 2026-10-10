@@ -32,7 +32,7 @@ from ._types import (
     InternalSpan,
     ToolAttributes,
 )
-from .context._contextvar import fork_active_span
+from .context._contextvar import fork_scope
 from .context._with_only import WithOnly
 
 if TYPE_CHECKING:
@@ -41,7 +41,6 @@ if TYPE_CHECKING:
     # used to wear existed to dodge exactly this import, and a TYPE_CHECKING
     # import states the same fact without leaving the properties untyped.
     from ._assembly import Limitation
-    from ._client import Client
     from ._types import CorrelationInfo, SpanContext, SpanId
 
 
@@ -341,7 +340,7 @@ def _begin(
         return
 
     builder = Span(draft)
-    fork = None if stepped else _install_parent(draft.context)
+    restore = _NOT_INSTALLED if stepped else _install_parent(draft.context)
     tracked = None
     with guard("tracing.manual_track", debug=_debug_enabled()):
         tracked = _runtime.runtime().track_open_span(
@@ -350,9 +349,9 @@ def _begin(
     try:
         yield builder
     finally:
-        if fork is not None:
+        if restore is not _NOT_INSTALLED:
             with guard("tracing.manual_fork_exit", debug=_debug_enabled()):
-                fork.__exit__(None, None, None)
+                _hub._current_scope.set(restore)
         # Gone from the table means a shutdown already shipped this span,
         # marked as cut off, while the block was still open; a second copy
         # under the same span id would contradict it. No `return` here: in a
@@ -361,55 +360,71 @@ def _begin(
             _emit(builder)
 
 
-def _emit(span: Span, client: Client | None = None) -> None:
-    """Finish `span` and hand it to `client`, or to the process client."""
+def _emit(span: Span) -> None:
+    """Finish `span` and hand it to the process client."""
     finished = None
     # `_finish()` validates, and a vocabulary breach must not reach the host
     # (I6) — a `with wardex.span(...)` block would otherwise raise on the
     # way out of code that has nothing to do with wardex.
     with guard("tracing.manual_span", debug=_debug_enabled()):
         finished = span._finish()
-    if client is None:
-        with guard("tracing.manual_client", debug=_debug_enabled()):
-            client = _hub.get_client()
+    client = None
+    with guard("tracing.manual_client", debug=_debug_enabled()):
+        client = _hub.get_client()
     if client is not None and finished is not None:
         with guard("tracing.manual_emit", debug=_debug_enabled()):
             client.capture_span(finished)
 
 
-def _interrupt(span: Span, client: Client, marker: Limitation) -> None:
-    """Ship a span whose block is still open, because the process is stopping.
+def _interrupt(span: Span, marker: Limitation, end_ns: int) -> InternalSpan | None:
+    """Finish a span whose block is still open, because the process is stopping.
 
     What `Runtime.interrupt_open_spans` calls, once, for a span it took from
-    the table. The status and any end time the host set are kept; the marker
-    says the block never reached its end.
+    the table; the runtime, not this, puts the result in the buffer. The status
+    and any end time the host set are kept; the marker says the block never
+    reached its end. None when the span fails validation, as `_emit` drops it.
     """
+    finished = None
     with guard("tracing.manual_interrupt", debug=_debug_enabled()):
         span._draft.add_limitation(marker)
-    _emit(span, client)
+        finished = span._draft.finish(span.end_time_ns or end_ns)
+    return finished
+
+
+#: `_install_parent`'s "nothing was installed, so put nothing back".
+_NOT_INSTALLED: Any = object()
 
 
 def _install_parent(context: SpanContext) -> Any:
-    """Make the span the active parent; None, said once, when that fails.
+    """Make the span the active parent; return the scope to put back after it.
 
-    The span still ships either way; what a failure loses is everything opened
-    INSIDE the block, which finds whatever was standing before it instead. A
-    fork whose `__enter__` raised is half-entered at worst, so it is never
-    returned to be exited.
+    Installed with a plain `set()` and taken down with one, not with a Token: a
+    Token resets only in the Context that made it, and a block can end in
+    another one — a decorated generator's body resumed on a worker thread or in
+    another task, holding a `with wardex.span()` open across its `yield`. There
+    the reset raised, and the closed span stayed installed as the parent of all
+    the generator did next. In the Context that made it, a reset IS a set back
+    to the old value, so nothing changes there.
+
+    `_NOT_INSTALLED`, said once, when installing failed. The span still ships;
+    what is lost is everything opened INSIDE the block, which finds whatever
+    was standing before it instead.
     """
-    fork = None
+    restore: Any = None
+    installed = False
     with guard("tracing.manual_fork", debug=_debug_enabled()):
-        entering = fork_active_span(context)
-        entering.__enter__()
-        fork = entering
-    if fork is None:
+        restore = _hub._current_scope.get()
+        _hub._current_scope.set(fork_scope(context))
+        installed = True
+    if not installed:
         report_once(
             "wardex.span(): internal error installing the span as the "
             "active parent; work inside this block will be attached one level "
             "too high (re-run with debug=True for the traceback)",
             key="wardex.span.manual_fork",
         )
-    return fork
+        return _NOT_INSTALLED
+    return restore
 
 
 def _debug_enabled() -> bool:
@@ -489,12 +504,17 @@ def _conversation(name: str, *, id: str | None, op: OperationName | None) -> Ite
     # conversation read this block's id for as long as the block was open, and
     # the last block to close restored the id the other one had written — so a
     # call after both blocks still carried a conversation it was never in.
-    token = None
+    #
+    # Put back with a plain `set()`, for the reason `_install_parent` gives.
+    restore: Any = None
+    installed = False
     with guard("tracing.conversation_scope", debug=_debug_enabled()):
+        restore = _hub._current_scope.get()
         fork = _hub.get_current_scope().clone()
         fork.conversation = conversation
-        token = _hub._current_scope.set(fork)
-    if token is None:
+        _hub._current_scope.set(fork)
+        installed = True
+    if not installed:
         report_once(
             "wardex.conversation(): internal error reading the active "
             "scope; spans in this block will not carry a conversation id "
@@ -506,9 +526,9 @@ def _conversation(name: str, *, id: str | None, op: OperationName | None) -> Ite
             builder.operation = op
             yield builder
     finally:
-        if token is not None:
+        if installed:
             with guard("tracing.conversation_scope_restore", debug=_debug_enabled()):
-                _hub._current_scope.reset(token)
+                _hub._current_scope.set(restore)
 
 
 def conversation(
