@@ -28,6 +28,7 @@ from dataclasses import dataclass, fields
 from enum import Enum
 from typing import Any, NamedTuple
 
+from ._config_checks import refuses_unknown_keywords
 from ._native import NATIVE_OK, native, unavailable_reason
 
 
@@ -48,6 +49,7 @@ def _no_core() -> RuntimeError:
     )
 
 
+@refuses_unknown_keywords
 @dataclass(frozen=True, slots=True, kw_only=True)
 class LimitsConfig:
     """Resource limit overrides. None means the core default is used."""

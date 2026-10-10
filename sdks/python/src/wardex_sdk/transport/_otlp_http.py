@@ -347,8 +347,13 @@ class OtlpHttpTransport(Transport):
                 # come back as `UNDELIVERED`, so its skipped spans are counted
                 # here, exactly once.
                 self._count_encode_reports(unmarshalled, overwritten)
-            req = urllib.request.Request(self._endpoint, data=body, headers=headers, method="POST")
             try:
+                # Built inside the `try`: an address with no scheme makes the
+                # constructor raise `ValueError`, and that is a failed export
+                # to count, not a raise out of `export()`.
+                req = urllib.request.Request(
+                    self._endpoint, data=body, headers=headers, method="POST"
+                )
                 with suppress_capture():
                     with urllib.request.urlopen(req, timeout=remaining):
                         pass
