@@ -10,7 +10,9 @@ stamped one tenant's user and tags on another tenant's span.
 
 So every producer snapshots the identity where it latches the parent, on the same line, and the
 snapshot travels with the transaction to the client (`Client.capture_span(scope=)`, and
-`_PendingTxn.scope` for a deferred parse).
+`_PendingTxn.scope` for a deferred parse). The snapshot is only as right as that latch: MCP stdio
+latches on the task that writes stdin, which with the official `mcp` SDK is a writer task the
+session's opener started, so there the identity, like the parent, is still the opener's.
 
 Where the issuer is not known — an HTTP/2 stream whose opener was never proven (`_h2_issuer`), a
 latch entry the stream cap dropped, a reply to a request the seam never saw — the span carries

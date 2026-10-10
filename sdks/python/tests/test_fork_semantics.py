@@ -486,7 +486,7 @@ def _bare_seam():
             )
             self.spans: list = []
 
-        def capture_span(self, span) -> None:  # noqa: ANN001
+        def capture_span(self, span, *, scope=None) -> None:  # noqa: ANN001
             self.spans.append(span)
 
         def capture_deferred(self, job) -> None:
@@ -708,7 +708,7 @@ def test_assembler_fork_reinit_forgets_sessions_without_emitting():
         def __init__(self) -> None:
             self.spans: list = []
 
-        def capture_span(self, span) -> None:  # noqa: ANN001
+        def capture_span(self, span, *, scope=None) -> None:  # noqa: ANN001
             self.spans.append(span)
 
     client = _FakeClient()

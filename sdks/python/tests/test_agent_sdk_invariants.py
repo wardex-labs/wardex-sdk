@@ -18,7 +18,7 @@ class FakeClient:
     def __init__(self):
         self.spans = []
 
-    def capture_span(self, span):
+    def capture_span(self, span, *, scope=None):
         self.spans.append(span)
 
 

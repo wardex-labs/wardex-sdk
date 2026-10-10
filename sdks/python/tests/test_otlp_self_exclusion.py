@@ -22,7 +22,7 @@ class _RecordingClient:
     def __init__(self) -> None:
         self.spans: list[InternalSpan] = []
 
-    def capture_span(self, span: InternalSpan) -> None:
+    def capture_span(self, span: InternalSpan, *, scope: object = None) -> None:
         self.spans.append(span)
 
     def capture_deferred(self, job) -> None:

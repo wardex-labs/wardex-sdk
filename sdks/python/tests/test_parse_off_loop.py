@@ -903,7 +903,7 @@ class _JobTrap:
         self.jobs: list = []
         self.spans: list = []
 
-    def capture_span(self, span) -> None:
+    def capture_span(self, span, *, scope=None) -> None:
         self.spans.append(span)
 
     def capture_deferred(self, job) -> None:

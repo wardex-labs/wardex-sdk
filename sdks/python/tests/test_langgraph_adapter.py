@@ -53,7 +53,7 @@ class RecordingClient:
     def __init__(self) -> None:
         self.spans: list[Any] = []
 
-    def capture_span(self, span) -> None:
+    def capture_span(self, span, *, scope=None) -> None:
         self.spans.append(span)
 
     def close(self) -> None:

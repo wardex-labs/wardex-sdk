@@ -587,7 +587,7 @@ class _StubClient:
         self.config = self._Config(limits)
         self.spans: list = []
 
-    def capture_span(self, span) -> None:
+    def capture_span(self, span, *, scope=None) -> None:
         self.spans.append(span)
 
     def capture_deferred(self, job) -> None:
@@ -821,7 +821,7 @@ class _RecordingClient:
     def __init__(self) -> None:
         self.spans: list[object] = []
 
-    def capture_span(self, span: object) -> None:
+    def capture_span(self, span: object, *, scope: object = None) -> None:
         self.spans.append(span)
 
     def capture_deferred(self, job: object) -> None:
@@ -1446,7 +1446,7 @@ def test_a_configured_bound_reaches_the_registry_the_adapter_actually_uses():
             backend=BackendConfig(api_key="k"),
         )
 
-        def capture_span(self, span) -> None:
+        def capture_span(self, span, *, scope=None) -> None:
             pass
 
     ctx = context_for("probe", _Client())

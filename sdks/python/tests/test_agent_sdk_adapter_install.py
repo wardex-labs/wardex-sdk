@@ -167,7 +167,7 @@ def test_the_query_prompt_rides_the_first_chat_span():
         def __init__(self):
             self.spans = []
 
-        def capture_span(self, span):
+        def capture_span(self, span, *, scope=None):
             self.spans.append(span)
 
     client = RecordingClient()
@@ -194,7 +194,7 @@ def test_query_passthrough_with_fake_transport():
         def __init__(self):
             self.spans = []
 
-        def capture_span(self, span):
+        def capture_span(self, span, *, scope=None):
             self.spans.append(span)
 
     client = RecordingClient()
@@ -235,7 +235,7 @@ def test_uninstall_emits_the_span_of_a_run_that_never_finished():
         def __init__(self):
             self.spans = []
 
-        def capture_span(self, span):
+        def capture_span(self, span, *, scope=None):
             self.spans.append(span)
 
     client = RecordingClient()
@@ -281,7 +281,7 @@ def test_a_read_still_in_flight_cannot_reopen_a_session_during_uninstall():
         def __init__(self):
             self.spans = []
 
-        def capture_span(self, span):
+        def capture_span(self, span, *, scope=None):
             self.spans.append(span)
 
     client = RecordingClient()

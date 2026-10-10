@@ -20,7 +20,7 @@ from .._protocol._http2 import Http2Parser
 from .._types import ConversationContext, ParsedMessage, SpanContext
 from ._h2_issuer import IssuerLink
 from ._http1_requests import RequestSide
-from ._issue_scope import UNKNOWN_ISSUER, ScopeSnapshot
+from ._issue_scope import UNKNOWN_ISSUER, ScopeSnapshot, issued_scope
 from ._txn import _name_path, _Txn
 
 
@@ -557,7 +557,10 @@ class _WebSocketTracker:
         # it too: the session is ONE span, so a socket reused across conversations names none of
         # them rather than whichever one happened to open it.
         self._conversation = conversation
-        self._scope = scope  # the handshake's identity, as its parent: the session is ONE span
+        # The handshake's identity, kept by the same rule as the conversation: only while every
+        # message the client sends is issued under it too. A socket one tenant opened and another
+        # writes to would otherwise ship the second tenant's payload under the first one's name.
+        self._scope = scope
         self._start_ns = start_ns
         # None means "use the core default" — resolved here (rather than hardcoded)
         # so this can never silently drift from crates/wardex-limits.
@@ -586,9 +589,13 @@ class _WebSocketTracker:
         self._sent_bytes += self._count(r.frames, "sent")
         self._sent_msgs += len(r.messages)
         # A parser that died can no longer tell a message from a frame, so every write counts then.
-        if (r.messages or self._sent.is_disabled()) and self._conversation is not None:
-            if _hub.get_current_scope().conversation != self._conversation:
-                self._conversation = None
+        if r.messages or self._sent.is_disabled():
+            if self._conversation is not None:
+                if _hub.get_current_scope().conversation != self._conversation:
+                    self._conversation = None
+            if self._scope is not None and self._scope != UNKNOWN_ISSUER:
+                if issued_scope() != self._scope:
+                    self._scope = UNKNOWN_ISSUER  # issued under more than one: names no one
         if self._llm_upgrade is not None:
             if r.messages:
                 self._decide_llm(r.messages[0])

@@ -2586,7 +2586,7 @@ class _RecordingClient:
         self.spans: list = []
         self.snapshots: list = []
 
-    def capture_span(self, span) -> None:
+    def capture_span(self, span, *, scope=None) -> None:
         self.spans.append(span)
 
     def capture_snapshot(self, snapshot) -> None:
