@@ -52,16 +52,17 @@ class InterceptorRegistry:
         each undoes whatever it got as far as, and is safe to call on a seam
         that installed nothing (`_seam.ByteSeamInterceptor.uninstall`).
 
-        Routing the patches through a registry-owned `PatchSet` — the shape
-        `AdapterRegistry` uses, where `ctx.patches.restore_all()` runs
-        unconditionally — was the other candidate and it undoes strictly less
-        here. A seam's install is not only patches: it takes a refcounted
-        reference on the shared connection-timing probe and it holds live
-        WebSocket sessions whose spans are emitted at teardown. A registry that
-        restored the patches and nothing else would leave that refcount raised
-        forever, which is a `socket.connect` patch nothing can ever remove, and
-        `uninstall()` would still have to be total for the rest — so it buys a
-        second mechanism and keeps the bug.
+        Routing the patches through a registry-owned `PatchSet` — the
+        `ctx.patches` that `AdapterRegistry` offers its adapters — was the other
+        candidate and it undoes strictly less here. Even there it restores only
+        what was routed through it: whatever an adapter changes outside it is
+        still its own `uninstall()`'s to undo. A seam's install is not only
+        patches: it takes a refcounted reference on the shared connection-timing
+        probe and it holds live WebSocket sessions whose spans are emitted at
+        teardown. A registry that restored the patches and nothing else would
+        leave that refcount raised forever, which is a `socket.connect` patch
+        nothing can ever remove, and `uninstall()` would still have to be total
+        for the rest — so it buys a second mechanism and keeps the bug.
 
         POP FIRST, then roll back. The pop used to sit after the rollback, where
         a `BaseException` out of `uninstall()` — `guard` re-raises those by

@@ -645,6 +645,78 @@ class AnthropicAgentSdkAdapter(AdapterInterface):
         adapter = self
         self._patches = PatchSet("adapters.anthropic_agent_sdk", debug=self._debug)
 
+        # Everything that can raise runs BEFORE the first patch, so an install that fails here
+        # leaves the framework untouched. One that fails later is rolled back by the registry
+        # through `uninstall()`, which is total: it never waits for `_installed`.
+        from .._limits import LimitsConfig, LimitsConsumer, limits_kwargs
+
+        config = getattr(client, "config", None)
+        lim = config.limits if config is not None else LimitsConfig()
+        resolved = lim.resolved()
+        # The tool catalog is built in `__init__`, before there is a client, so this is where the
+        # host's bound reaches it. BEFORE the `create_sdk_mcp_server` patch below: install the patch
+        # first and a host thread calling `create_sdk_mcp_server()` in between registers handles
+        # against the OLD ceiling. On a FIRST install this ordering also means the new ceiling lands
+        # on a table nothing has written yet; on a re-install it cannot promise that — a wrapper the
+        # host bound directly survives `restore_all()` and may have registered handles since the
+        # uninstall. `apply_bound` documents why a non-empty table is safe without a trim.
+        self._names.apply_bound(**limits_kwargs(LimitsConsumer.MCP_TOOL_CATALOG, resolved))
+
+        # The adapter's own options — the first real `ctx.options` consumer.
+        # The isinstance narrowing keeps every duck-typed test double honest:
+        # anything but the real group means default options, bridge off.
+        opts = getattr(ctx, "options", None)
+        opts = opts if isinstance(opts, AnthropicAgentSdkConfig) else None
+        # Slice 1's gate, snapshotted at install (the `_debug` precedent).
+        self._propagation_enabled = bool(
+            getattr(getattr(config, "propagation", None), "enabled", False)
+        )
+        if opts is not None and opts.otel_bridge:
+            self._drain_seconds = opts.otel_bridge_drain
+            with self._guard("adapters.anthropic.otel_bridge_receiver"):
+                from ._otel_receiver import _OtelBridgeReceiver
+
+                self._bridge = _OtelBridgeReceiver(
+                    **limits_kwargs(LimitsConsumer.OTEL_BRIDGE_RECEIVER, resolved)
+                )
+            if self._bridge is None:
+                # Bind/start failed inside the guard: the adapter installs
+                # WITHOUT the bridge (fail-open), and the loss is announced
+                # because "otel_bridge=True changed nothing" is otherwise
+                # unfalsifiable from the outside.
+                report_once(
+                    "anthropic_agent_sdk otel bridge: the loopback receiver could "
+                    "not start, so the bridge is off for this process (fail-open)",
+                    key="adapters.anthropic_agent_sdk.otel_bridge.receiver_failed",
+                )
+        self._assembler = SessionAssembler(
+            client,
+            # The context's registry, so the adapter and its assembler share ONE
+            # table. Two would make `owner` scoping decorative: the filter picks
+            # this adapter's units out of a table that also holds another
+            # adapter's, and a private table has nothing to pick them out of.
+            units=getattr(ctx, "_units", None),
+            names=self._names,
+            bridge=self._bridge,
+            **limits_kwargs(LimitsConsumer.SESSION_ASSEMBLER, resolved),
+        )
+        # Held for `_run_tool`. Narrowed here rather than trusted, because a
+        # wrapper that survives an uninstall reads it and must get None rather
+        # than a context whose registry is gone.
+        self._ctx = ctx if isinstance(ctx, AdapterContext) else None
+        if self._ctx is None:
+            # A caller that built this adapter by hand instead of going through
+            # `AdapterRegistry`. Everything driven by the transport still works;
+            # what silently does not is the in-process tool span, because it is
+            # the one thing that opens through the surface. Said out loud, since
+            # "my tool calls are missing" is otherwise unfalsifiable from here.
+            report_once(
+                "anthropic_agent_sdk adapter: installed without an adapter "
+                "context, so in-process MCP tool calls will not get their own spans; "
+                "install through wardex.init() or pass adapters._registry.context_for(...)",
+                key="adapters.anthropic_agent_sdk.no_context",
+            )
+
         # (1) default path: tee SubprocessCLITransport at CLASS level.
         #
         # These stay class patches, and the reason is that this adapter never
@@ -717,23 +789,6 @@ class AnthropicAgentSdkAdapter(AdapterInterface):
 
         self._patches.patch(sdk.ClaudeSDKClient, "__init__", client_init)
 
-        from .._limits import LimitsConfig, LimitsConsumer, limits_kwargs
-
-        config = getattr(client, "config", None)
-        lim = config.limits if config is not None else LimitsConfig()
-        resolved = lim.resolved()
-        # The tool catalog is built in `__init__`, before there is a client, so
-        # this is where the host's bound reaches it. BEFORE the
-        # `create_sdk_mcp_server` patch below: install the patch first and a
-        # host thread calling `create_sdk_mcp_server()` in between registers
-        # handles against the OLD ceiling. On a FIRST install this ordering
-        # also means the new ceiling lands on a table nothing has written yet;
-        # on a re-install it cannot promise that — a wrapper the host bound
-        # directly survives `restore_all()` and may have registered handles
-        # since the uninstall. `apply_bound` documents why a non-empty table is
-        # safe without a trim.
-        self._names.apply_bound(**limits_kwargs(LimitsConsumer.MCP_TOOL_CATALOG, resolved))
-
         # (3) in-process custom tools: run each handler inside a CALL unit whose
         # span is a child of the session — which is what closes the broken tree.
         # The unit is also ACTIVE for the body, so any outbound HTTP the tool
@@ -762,61 +817,6 @@ class AnthropicAgentSdkAdapter(AdapterInterface):
             # the table's only writer, so binding first means no registration
             # this install enables can land against a stale ceiling.
             self._patches.patch(sdk, "create_sdk_mcp_server", create_sdk_mcp_server)
-
-        # The adapter's own options — the first real `ctx.options` consumer.
-        # The isinstance narrowing keeps every duck-typed test double honest:
-        # anything but the real group means default options, bridge off.
-        opts = getattr(ctx, "options", None)
-        opts = opts if isinstance(opts, AnthropicAgentSdkConfig) else None
-        # Slice 1's gate, snapshotted at install (the `_debug` precedent).
-        self._propagation_enabled = bool(
-            getattr(getattr(config, "propagation", None), "enabled", False)
-        )
-        if opts is not None and opts.otel_bridge:
-            self._drain_seconds = opts.otel_bridge_drain
-            with self._guard("adapters.anthropic.otel_bridge_receiver"):
-                from ._otel_receiver import _OtelBridgeReceiver
-
-                self._bridge = _OtelBridgeReceiver(
-                    **limits_kwargs(LimitsConsumer.OTEL_BRIDGE_RECEIVER, resolved)
-                )
-            if self._bridge is None:
-                # Bind/start failed inside the guard: the adapter installs
-                # WITHOUT the bridge (fail-open), and the loss is announced
-                # because "otel_bridge=True changed nothing" is otherwise
-                # unfalsifiable from the outside.
-                report_once(
-                    "anthropic_agent_sdk otel bridge: the loopback receiver could "
-                    "not start, so the bridge is off for this process (fail-open)",
-                    key="adapters.anthropic_agent_sdk.otel_bridge.receiver_failed",
-                )
-        self._assembler = SessionAssembler(
-            client,
-            # The context's registry, so the adapter and its assembler share ONE
-            # table. Two would make `owner` scoping decorative: the filter picks
-            # this adapter's units out of a table that also holds another
-            # adapter's, and a private table has nothing to pick them out of.
-            units=getattr(ctx, "_units", None),
-            names=self._names,
-            bridge=self._bridge,
-            **limits_kwargs(LimitsConsumer.SESSION_ASSEMBLER, resolved),
-        )
-        # Held for `_run_tool`. Narrowed here rather than trusted, because a
-        # wrapper that survives an uninstall reads it and must get None rather
-        # than a context whose registry is gone.
-        self._ctx = ctx if isinstance(ctx, AdapterContext) else None
-        if self._ctx is None:
-            # A caller that built this adapter by hand instead of going through
-            # `AdapterRegistry`. Everything driven by the transport still works;
-            # what silently does not is the in-process tool span, because it is
-            # the one thing that opens through the surface. Said out loud, since
-            # "my tool calls are missing" is otherwise unfalsifiable from here.
-            report_once(
-                "anthropic_agent_sdk adapter: installed without an adapter "
-                "context, so in-process MCP tool calls will not get their own spans; "
-                "install through wardex.init() or pass adapters._registry.context_for(...)",
-                key="adapters.anthropic_agent_sdk.no_context",
-            )
         self._installed = True
 
     def close_units(self, *, marker: Limitation) -> None:
@@ -867,12 +867,12 @@ class AnthropicAgentSdkAdapter(AdapterInterface):
                 diag_info("anthropic_agent_sdk otel bridge: inherited receiver closed after fork")
 
     def uninstall(self) -> None:
-        if not self._installed:
-            return
-        # No re-import and no key lookups: the PatchSet holds the targets it
-        # patched. The old form re-imported `claude_agent_sdk` here and indexed
-        # `self._originals` by hand, so an install that had patched only some of
-        # the surface raised `KeyError` out of `uninstall()` — into the host.
+        # Never gated on `_installed`, which `install()` sets LAST: the registry's rollback calls
+        # this for an install that raised partway, and each step below undoes exactly what that
+        # install got to (`restore_all()` is idempotent). No re-import and no key lookups: the
+        # PatchSet holds the targets it patched. The old form re-imported `claude_agent_sdk` here
+        # and indexed `self._originals` by hand, so an install that had patched only some of the
+        # surface raised `KeyError` out of `uninstall()` — into the host.
         self._patches.restore_all()
         self._names.clear()
         # Latch first, drain second. Every callback into this adapter gates on
