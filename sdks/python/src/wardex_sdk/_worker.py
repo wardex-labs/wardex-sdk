@@ -26,7 +26,7 @@ import os
 import threading
 from collections.abc import Callable
 
-from ._assembly import diag_warning, report_worker_pass_raised
+from ._assembly import debug_host_error, diag_warning, report_worker_pass_raised
 from .transport._base import DEFAULT_TIMEOUT
 
 
@@ -195,4 +195,8 @@ class BatchWorker:
             except Exception as exc:
                 report_worker_pass_raised(self._name)
                 if self._debug:
-                    diag_warning(f"background flush failed: {exc}")
+                    # Through the guarded helper: rendering `exc` runs host code, and a
+                    # raise here used to leave this loop and end the thread.
+                    debug_host_error(
+                        "background flush failed", exc, unprintable="worker.error_unprintable"
+                    )

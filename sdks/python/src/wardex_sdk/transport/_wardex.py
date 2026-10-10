@@ -34,7 +34,7 @@ from __future__ import annotations
 import time
 import urllib.request
 
-from .._assembly import counters, diag_info, diag_warning, report_export_failed, report_once
+from .._assembly import counters, debug_host_error, diag_info, report_export_failed, report_once
 from .._native import NATIVE_OK, native, unavailable_reason
 from .._types import Envelope
 from ._base import UNDELIVERED, Transport, Undelivered, _debug_enabled
@@ -196,7 +196,9 @@ class WardexTransport(Transport):
             # `exc` may quote the URL; it never quotes the Authorization
             # header, so the debug line cannot echo the key.
             if self._debug:
-                diag_warning(f"wardex export failed: {exc}")
+                debug_host_error(
+                    "wardex export failed", exc, unprintable="transport.wardex.error_unprintable"
+                )
             cut_short_by = _cut_short_by_the_caller(exc, timeout, self._timeout, effective)
             if cut_short_by is not None:
                 # Reported, NOT re-queued: the POST was open, so the receiver
