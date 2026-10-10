@@ -31,7 +31,7 @@ import pytest
 from wardex_sdk import _hub, _wardex_native
 from wardex_sdk._client import Client
 from wardex_sdk._config import BackendConfig, WardexConfig
-from wardex_sdk._tracing import _call_site_file, workflow
+from wardex_sdk._decorators import _call_site_file, workflow
 from wardex_sdk._types import Envelope
 from wardex_sdk.transport._base import Transport
 from wardex_sdk.transport._codec import decode, encode
@@ -412,16 +412,16 @@ def test_the_rule_on_windows_shaped_paths(path, module, modules, expected):
 def test_the_file_is_placed_once_at_decoration_not_per_call(project, recording, monkeypatch):
     """The call path pays nothing: the file is placed when the decorator runs, and
     no call afterwards places it again."""
-    import wardex_sdk._tracing as tracing
+    import wardex_sdk._decorators as decorators
 
     placed: list[str] = []
-    real = tracing._call_site_file
+    real = decorators._call_site_file
 
     def counting(*args):
         placed.append(args[0])
         return real(*args)
 
-    monkeypatch.setattr(tracing, "_call_site_file", counting)
+    monkeypatch.setattr(decorators, "_call_site_file", counting)
     _write(project / "support_bot" / "__init__.py", "")
     _write(project / "support_bot" / "agent.py")
     mod = importlib.import_module("support_bot.agent")
