@@ -328,16 +328,48 @@ def test_max_connections_reaches_the_seam():
 
         # Default max_connections (4096) would never evict after just 4
         # connections -- eviction only fires here because the override of 1
-        # reached the seam. Steady-state size is max_connections + 1 (the
-        # eviction check runs before the new entry is added), so the two
-        # oldest connections must be gone and the two newest must remain.
-        assert len(itc._conns) == 2
+        # reached the seam. The table holds at most max_connections entries,
+        # so the three oldest connections must be gone and only the newest
+        # remains.
+        assert len(itc._conns) == 1
         assert id(socks[0]) not in itc._conns
         assert id(socks[1]) not in itc._conns
-        assert id(socks[2]) in itc._conns
+        assert id(socks[2]) not in itc._conns
         assert id(socks[3]) in itc._conns
     finally:
         wardex_sdk.close()
+
+
+@pytest.mark.parametrize("cap", [1, 2, 5])
+def test_both_connection_tables_hold_exactly_max_connections(cap):
+    """One knob, one meaning. The core defines `max_connections` as the most
+    connections tracked, applied to the byte seam's connection map AND the
+    shared connection-timing store. The seam evicted only once it held N + 1,
+    the store at N: one setting enforced as two different bounds."""
+    from wardex_sdk._interceptors._conn_timing import ConnTimingStore
+    from wardex_sdk._interceptors._ssl import SSLInterceptor
+    from wardex_sdk._limits import LimitsConsumer, limits_kwargs
+
+    class _FakeSock:
+        def selected_alpn_protocol(self) -> str | None:
+            return None
+
+        def getpeername(self) -> tuple[str, int]:
+            return ("127.0.0.1", 443)
+
+    resolved = LimitsConfig(max_connections=cap).resolved()
+    itc = SSLInterceptor()
+    itc._limits = resolved
+    store = ConnTimingStore(**limits_kwargs(LimitsConsumer.CONN_TIMING, resolved))
+    socks = [_FakeSock() for _ in range(cap + 3)]  # alive: the close hook would evict them
+    held = []
+    for fileno, sock in enumerate(socks, start=1):
+        itc._state(sock)
+        store.set_connect(fileno, 1.0)
+        held.append((len(itc._conns), len(store._by_fileno)))
+    assert held == [(min(n, cap), min(n, cap)) for n in range(1, cap + 4)]
+    assert set(itc._conns) == {id(s) for s in socks[-cap:]}, "the oldest go first"
+    assert list(store._by_fileno) == list(range(4, cap + 4))
 
 
 def test_max_link_targets_reaches_the_registry_context_for_builds():
@@ -781,9 +813,8 @@ def _probe_max_connections() -> bool:
             itc._state(sock)
         return len(itc._conns)
 
-    # Steady state is max_connections + 1: the eviction check runs before the
-    # new entry is inserted.
-    return tracked(LimitsConfig(max_connections=1)) == 2 and tracked(LimitsConfig()) == 4
+    # Steady state is max_connections: the table holds at most that many.
+    return tracked(LimitsConfig(max_connections=1)) == 1 and tracked(LimitsConfig()) == 4
 
 
 class _RecordingClient:

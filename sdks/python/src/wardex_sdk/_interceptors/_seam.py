@@ -450,7 +450,7 @@ class ByteSeamInterceptor(InterceptorInterface):
                 # the id — the marker is a fact about the reset, and the reset happened once.
                 self._reset_at_fork_ids.discard(cid)
                 st.reset_at_fork = True
-            if len(self._conns) > self._limits["max_connections"]:
+            if len(self._conns) >= self._limits["max_connections"]:
                 oldest = self._conns.pop(next(iter(self._conns)))
                 self._retire(oldest, Limitation.CONNECTION_EVICTED, still_open=True)
             self._conns[cid] = st
