@@ -182,10 +182,22 @@ tree.
 | OpenAI Agents SDK (`openai-agents>=0.22,<0.23`) | each run, agent, function tool, handoff and guardrail; model calls read from the wire |
 | LangGraph (`langgraph>=1.2`) | each graph run, node and `ToolNode` tool call, including subgraphs and the functional API |
 | Claude Agent SDK (`claude_agent_sdk`) | agent turns and model calls, with tool calls correlated |
+| Codex CLI (`codex exec`, run as a subprocess) | each run, with its prompt, answer, tool calls and the turn's token usage; with `CodexExecConfig(otel_bridge=True)`, one span per model call with its model and timing |
 | Any other framework, or your own loop | model calls with model, messages and token usage; decorators add the structure |
 
-Adapters are detected automatically when the framework is installed;
-`AdaptersConfig` selects and configures them.
+Adapters are detected automatically when the framework is installed (the
+Codex adapter when `codex` is on `PATH`); `AdaptersConfig` selects and
+configures them.
+
+The Codex adapter only reads what your process already exchanges with
+`codex exec` — the prompt passed to `communicate()` and the `--json` events
+on stdout — and
+never changes the command. That stream names neither the model nor how many
+times it was asked, so the run carries the turn's total and says so. With
+`otel_bridge=True` the adapter adds a trace exporter override and a
+`TRACEPARENT` to each `codex exec` and reads each model call from Codex's own
+traces; it leaves alone a run whose command, environment or Codex config
+already sets up telemetry. Verified against `codex-cli` 0.160.0.
 
 ## Adding structure to your own code
 

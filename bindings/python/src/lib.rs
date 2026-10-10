@@ -17,6 +17,7 @@ use pyo3::types::PyBytes;
 use pyo3::wrap_pyfunction;
 use shield::shielded;
 use wardex_core::protocol::claude_stream_json as ccs;
+use wardex_core::protocol::codex_exec_json as cej;
 use wardex_core::protocol::grpc::{
     grpc_status_name as core_grpc_status_name, parse_grpc_frames as core_parse_grpc_frames,
     GrpcFrames as CoreGrpcFrames, GrpcMessage as CoreGrpcMessage,
@@ -880,6 +881,107 @@ fn parse_claude_stream_line(data: &[u8], outbound: bool) -> PyResult<Option<Clau
     shielded(|| Ok(ccs::parse_stream_line(data, outbound).map(|inner| ClaudeStreamEvent { inner })))
 }
 
+/// One parsed `codex exec --json` event (flat; kind discriminates).
+#[pyclass]
+struct CodexExecEvent {
+    inner: cej::CodexExecEvent,
+}
+
+#[pymethods]
+impl CodexExecEvent {
+    #[getter]
+    fn kind(&self) -> &'static str {
+        match self.inner.kind {
+            cej::CodexEventKind::ThreadStarted => "thread_started",
+            cej::CodexEventKind::TurnStarted => "turn_started",
+            cej::CodexEventKind::TurnCompleted => "turn_completed",
+            cej::CodexEventKind::TurnFailed => "turn_failed",
+            cej::CodexEventKind::ItemStarted => "item_started",
+            cej::CodexEventKind::ItemUpdated => "item_updated",
+            cej::CodexEventKind::ItemCompleted => "item_completed",
+            cej::CodexEventKind::Error => "error",
+        }
+    }
+    #[getter]
+    fn thread_id(&self) -> Option<String> {
+        self.inner.thread_id.clone()
+    }
+    #[getter]
+    fn message(&self) -> Option<String> {
+        self.inner.message.clone()
+    }
+    #[getter]
+    fn item_id(&self) -> Option<String> {
+        self.inner.item_id.clone()
+    }
+    #[getter]
+    fn item_type(&self) -> Option<String> {
+        self.inner.item_type.clone()
+    }
+    #[getter]
+    fn text(&self) -> Option<String> {
+        self.inner.text.clone()
+    }
+    #[getter]
+    fn item_json<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyBytes>> {
+        self.inner
+            .item_json
+            .as_ref()
+            .map(|b| PyBytes::new_bound(py, b))
+    }
+    #[getter]
+    fn has_usage(&self) -> bool {
+        self.inner.usage.is_some()
+    }
+    /// Semconv-inclusive, as `TokenUsage` keeps every usage in this crate.
+    #[getter]
+    fn input_tokens(&self) -> Option<i64> {
+        self.inner.usage.as_ref().and_then(|u| u.input_tokens())
+    }
+    #[getter]
+    fn output_tokens(&self) -> Option<i64> {
+        self.inner.usage.as_ref().and_then(|u| u.output_tokens())
+    }
+    #[getter]
+    fn cache_read_tokens(&self) -> Option<i64> {
+        self.inner
+            .usage
+            .as_ref()
+            .and_then(|u| u.cache_read_input_tokens())
+    }
+    #[getter]
+    fn cache_creation_tokens(&self) -> Option<i64> {
+        self.inner
+            .usage
+            .as_ref()
+            .and_then(|u| u.cache_creation_input_tokens())
+    }
+    #[getter]
+    fn reasoning_output_tokens(&self) -> Option<i64> {
+        self.inner
+            .usage
+            .as_ref()
+            .and_then(|u| u.reasoning_output_tokens())
+    }
+    #[getter]
+    fn usage_totals_unpaired(&self) -> bool {
+        self.inner
+            .usage
+            .as_ref()
+            .is_some_and(|u| u.totals_unpaired())
+    }
+    #[getter]
+    fn usage_overflowed(&self) -> bool {
+        self.inner.usage.as_ref().is_some_and(|u| u.overflowed())
+    }
+}
+
+/// Parse one `codex exec --json` line. Returns None for unknown lines.
+#[pyfunction]
+fn parse_codex_exec_line(data: &[u8]) -> PyResult<Option<CodexExecEvent>> {
+    shielded(|| Ok(cej::parse_exec_line(data).map(|inner| CodexExecEvent { inner })))
+}
+
 #[pyfunction]
 fn parse_grpc_frames(body: &[u8]) -> PyResult<GrpcFrames> {
     shielded(|| {
@@ -999,6 +1101,8 @@ fn _wardex_native(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     protocol.add_function(wrap_pyfunction!(grpc_status_name, &protocol)?)?;
     protocol.add_class::<ClaudeStreamEvent>()?;
     protocol.add_function(wrap_pyfunction!(parse_claude_stream_line, &protocol)?)?;
+    protocol.add_class::<CodexExecEvent>()?;
+    protocol.add_function(wrap_pyfunction!(parse_codex_exec_line, &protocol)?)?;
     m.add_submodule(&protocol)?;
     // Register in sys.modules so that `import wardex_sdk._wardex_native.protocol` works
     py.import_bound("sys")?

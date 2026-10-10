@@ -56,6 +56,7 @@ class AdapterName(Enum):
     """
 
     ANTHROPIC_AGENT_SDK = "anthropic_agent_sdk"
+    CODEX_EXEC = "codex_exec"
     LANGGRAPH = "langgraph"
     OPENAI_AGENTS = "openai_agents"
 

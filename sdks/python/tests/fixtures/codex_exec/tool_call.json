@@ -1,0 +1,466 @@
+{
+ "_provenance": "codex-cli 0.160.0, `codex exec --json` under ChatGPT sign-in, recorded 2026-10-09 with the trace exporter pointed at a loopback sink. Curated: only the spans the bridge reads plus their ancestors and some neighbours, an allowlist of attributes, times shifted onto a fixed clock. Nothing else was edited.",
+ "stdin": "Run the shell command `echo wardex-fixture` and then reply with only the word it printed.",
+ "stdout": "{\"type\":\"thread.started\",\"thread_id\":\"01a1206e-068c-7bb1-914f-002bac8a3211\"}\n{\"type\":\"turn.started\"}\n{\"type\":\"item.started\",\"item\":{\"id\":\"item_0\",\"type\":\"command_execution\",\"command\":\"/bin/zsh -lc 'echo wardex-fixture'\",\"aggregated_output\":\"\",\"exit_code\":null,\"status\":\"in_progress\"}}\n{\"type\":\"item.completed\",\"item\":{\"id\":\"item_0\",\"type\":\"command_execution\",\"command\":\"/bin/zsh -lc 'echo wardex-fixture'\",\"aggregated_output\":\"wardex-fixture\\n\",\"exit_code\":0,\"status\":\"completed\"}}\n{\"type\":\"item.completed\",\"item\":{\"id\":\"item_1\",\"type\":\"agent_message\",\"text\":\"wardex-fixture\"}}\n{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":23130,\"cached_input_tokens\":20992,\"cache_write_input_tokens\":0,\"output_tokens\":44,\"reasoning_output_tokens\":0}}\n",
+ "resource": {
+  "service.name": "codex_exec",
+  "service.version": "0.160.0"
+ },
+ "process_ns": [
+  1700000000000000000,
+  1700000009681385000
+ ],
+ "spans": [
+  {
+   "name": "codex.exec",
+   "span_id": "aa02f6ec4e13938a",
+   "parent_span_id": "",
+   "start_ns": 1700000000021772000,
+   "end_ns": 1700000008858577000,
+   "attrs": {}
+  },
+  {
+   "name": "thread/start",
+   "span_id": "a0301ffe4d9812b7",
+   "parent_span_id": "",
+   "start_ns": 1700000000030833000,
+   "end_ns": 1700000000097531000,
+   "attrs": {}
+  },
+  {
+   "name": "thread_spawn",
+   "span_id": "481a5708e4ba17f4",
+   "parent_span_id": "a0301ffe4d9812b7",
+   "start_ns": 1700000000033265000,
+   "end_ns": 1700000000093263000,
+   "attrs": {}
+  },
+  {
+   "name": "session_init",
+   "span_id": "431174ffe21d7c91",
+   "parent_span_id": "481a5708e4ba17f4",
+   "start_ns": 1700000000034742000,
+   "end_ns": 1700000000093244000,
+   "attrs": {}
+  },
+  {
+   "name": "startup_prewarm",
+   "span_id": "c800051314fdfe09",
+   "parent_span_id": "431174ffe21d7c91",
+   "start_ns": 1700000000093208000,
+   "end_ns": 1700000001546508000,
+   "attrs": {}
+  },
+  {
+   "name": "step_context.capture",
+   "span_id": "45b26cc42ee750ef",
+   "parent_span_id": "c800051314fdfe09",
+   "start_ns": 1700000000094791000,
+   "end_ns": 1700000000124225000,
+   "attrs": {}
+  },
+  {
+   "name": "built_tools",
+   "span_id": "4ff903157b452aa9",
+   "parent_span_id": "45b26cc42ee750ef",
+   "start_ns": 1700000000096304000,
+   "end_ns": 1700000000124014000,
+   "attrs": {
+    "model": "gpt-6.1-sol"
+   }
+  },
+  {
+   "name": "build_tool_router",
+   "span_id": "f4d8dd2a913cb864",
+   "parent_span_id": "4ff903157b452aa9",
+   "start_ns": 1700000000096370000,
+   "end_ns": 1700000000124004000,
+   "attrs": {}
+  },
+  {
+   "name": "turn/start",
+   "span_id": "63fad4953a31db84",
+   "parent_span_id": "",
+   "start_ns": 1700000000097783000,
+   "end_ns": 1700000000100512000,
+   "attrs": {}
+  },
+  {
+   "name": "op.dispatch.turn_input",
+   "span_id": "0e9ae4d5c8fd3150",
+   "parent_span_id": "63fad4953a31db84",
+   "start_ns": 1700000000098453000,
+   "end_ns": 1700000000100479000,
+   "attrs": {}
+  },
+  {
+   "name": "session_task.turn",
+   "span_id": "05b3328033f47181",
+   "parent_span_id": "0e9ae4d5c8fd3150",
+   "start_ns": 1700000000100458000,
+   "end_ns": 1700000008040827000,
+   "attrs": {
+    "model": "gpt-6.1-sol",
+    "codex.turn.token_usage.input_tokens": 23130,
+    "codex.turn.token_usage.cached_input_tokens": 20992,
+    "codex.turn.token_usage.cache_write_input_tokens": 0,
+    "codex.turn.token_usage.non_cached_input_tokens": 2138,
+    "codex.turn.token_usage.output_tokens": 44,
+    "codex.turn.token_usage.reasoning_output_tokens": 0,
+    "codex.turn.token_usage.total_tokens": 23174
+   }
+  },
+  {
+   "name": "session_task.run",
+   "span_id": "fd9c66cdad776c27",
+   "parent_span_id": "05b3328033f47181",
+   "start_ns": 1700000000100525000,
+   "end_ns": 1700000008035804000,
+   "attrs": {}
+  },
+  {
+   "name": "run_turn",
+   "span_id": "19cc5f284b857d0d",
+   "parent_span_id": "fd9c66cdad776c27",
+   "start_ns": 1700000000100530000,
+   "end_ns": 1700000008035784000,
+   "attrs": {}
+  },
+  {
+   "name": "model_client.websocket_connection",
+   "span_id": "ff31b589efa280b5",
+   "parent_span_id": "c800051314fdfe09",
+   "start_ns": 1700000000420758000,
+   "end_ns": 1700000001031885000,
+   "attrs": {
+    "provider": "OpenAI",
+    "wire_api": "responses",
+    "transport": "responses_websocket",
+    "api.path": "/responses"
+   }
+  },
+  {
+   "name": "model_client.stream_responses_websocket",
+   "span_id": "791d5c66bdfdbcf0",
+   "parent_span_id": "c800051314fdfe09",
+   "start_ns": 1700000001031955000,
+   "end_ns": 1700000001035221000,
+   "attrs": {
+    "model": "gpt-6.1-sol",
+    "wire_api": "responses",
+    "transport": "responses_websocket",
+    "websocket.warmup": true,
+    "api.path": "/responses"
+   }
+  },
+  {
+   "name": "model_client.websocket_connection",
+   "span_id": "722431f924393065",
+   "parent_span_id": "791d5c66bdfdbcf0",
+   "start_ns": 1700000001035005000,
+   "end_ns": 1700000001035015000,
+   "attrs": {
+    "provider": "OpenAI",
+    "wire_api": "responses",
+    "transport": "responses_websocket",
+    "api.path": "/responses"
+   }
+  },
+  {
+   "name": "responses_websocket.stream_request",
+   "span_id": "b42d4688568ecba2",
+   "parent_span_id": "791d5c66bdfdbcf0",
+   "start_ns": 1700000001035088000,
+   "end_ns": 1700000001546188000,
+   "attrs": {
+    "transport": "responses_websocket",
+    "api.path": "/responses"
+   }
+  },
+  {
+   "name": "step_context.capture",
+   "span_id": "95d115546a97016e",
+   "parent_span_id": "19cc5f284b857d0d",
+   "start_ns": 1700000001546630000,
+   "end_ns": 1700000001576024000,
+   "attrs": {}
+  },
+  {
+   "name": "built_tools",
+   "span_id": "9629ddb2411d9c81",
+   "parent_span_id": "95d115546a97016e",
+   "start_ns": 1700000001547935000,
+   "end_ns": 1700000001575938000,
+   "attrs": {
+    "model": "gpt-6.1-sol"
+   }
+  },
+  {
+   "name": "build_tool_router",
+   "span_id": "708fedf6f65cc545",
+   "parent_span_id": "9629ddb2411d9c81",
+   "start_ns": 1700000001547993000,
+   "end_ns": 1700000001575934000,
+   "attrs": {}
+  },
+  {
+   "name": "run_sampling_request",
+   "span_id": "7ac09b24210d3047",
+   "parent_span_id": "19cc5f284b857d0d",
+   "start_ns": 1700000001920635000,
+   "end_ns": 1700000005840389000,
+   "attrs": {
+    "model": "gpt-6.1-sol"
+   }
+  },
+  {
+   "name": "try_run_sampling_request",
+   "span_id": "eaa6bdd4ed028688",
+   "parent_span_id": "7ac09b24210d3047",
+   "start_ns": 1700000001920665000,
+   "end_ns": 1700000005840383000,
+   "attrs": {
+    "model": "gpt-6.1-sol"
+   }
+  },
+  {
+   "name": "stream_request",
+   "span_id": "29478b509adf3750",
+   "parent_span_id": "eaa6bdd4ed028688",
+   "start_ns": 1700000001920754000,
+   "end_ns": 1700000001922098000,
+   "attrs": {}
+  },
+  {
+   "name": "model_client.stream_responses_websocket",
+   "span_id": "17dcf32d50b9c965",
+   "parent_span_id": "29478b509adf3750",
+   "start_ns": 1700000001920765000,
+   "end_ns": 1700000001922097000,
+   "attrs": {
+    "model": "gpt-6.1-sol",
+    "wire_api": "responses",
+    "transport": "responses_websocket",
+    "websocket.warmup": false,
+    "api.path": "/responses"
+   }
+  },
+  {
+   "name": "model_client.websocket_connection",
+   "span_id": "16f55d335120fb79",
+   "parent_span_id": "17dcf32d50b9c965",
+   "start_ns": 1700000001922007000,
+   "end_ns": 1700000001922013000,
+   "attrs": {
+    "provider": "OpenAI",
+    "wire_api": "responses",
+    "transport": "responses_websocket",
+    "api.path": "/responses"
+   }
+  },
+  {
+   "name": "responses_websocket.stream_request",
+   "span_id": "c469a8fc15e368a9",
+   "parent_span_id": "17dcf32d50b9c965",
+   "start_ns": 1700000001922056000,
+   "end_ns": 1700000005448905000,
+   "attrs": {
+    "transport": "responses_websocket",
+    "api.path": "/responses"
+   }
+  },
+  {
+   "name": "receiving_stream",
+   "span_id": "77a3984d2e06cdc5",
+   "parent_span_id": "eaa6bdd4ed028688",
+   "start_ns": 1700000001922100000,
+   "end_ns": 1700000005840378000,
+   "attrs": {}
+  },
+  {
+   "name": "handle_responses",
+   "span_id": "c8e055966b55f0a1",
+   "parent_span_id": "77a3984d2e06cdc5",
+   "start_ns": 1700000005388146000,
+   "end_ns": 1700000005449586000,
+   "attrs": {
+    "codex.request.reasoning_effort": "low"
+   }
+  },
+  {
+   "name": "handle_output_item_done",
+   "span_id": "63aa7b7974ef06ef",
+   "parent_span_id": "c8e055966b55f0a1",
+   "start_ns": 1700000005449055000,
+   "end_ns": 1700000005449584000,
+   "attrs": {}
+  },
+  {
+   "name": "handle_tool_call_with_source",
+   "span_id": "8d7b36308af821b0",
+   "parent_span_id": "63aa7b7974ef06ef",
+   "start_ns": 1700000005449216000,
+   "end_ns": 1700000005840318000,
+   "attrs": {}
+  },
+  {
+   "name": "exec",
+   "span_id": "ed5e48af1a7c8f09",
+   "parent_span_id": "8d7b36308af821b0",
+   "start_ns": 1700000005449549000,
+   "end_ns": 1700000005840294000,
+   "attrs": {
+    "tool_name": "exec",
+    "call_id": "call_bdad614bc9184a609287a7eda528142f"
+   }
+  },
+  {
+   "name": "handle_responses",
+   "span_id": "e742ffefad4ba7fe",
+   "parent_span_id": "77a3984d2e06cdc5",
+   "start_ns": 1700000005449593000,
+   "end_ns": 1700000005449787000,
+   "attrs": {
+    "codex.request.reasoning_effort": "low",
+    "gen_ai.usage.input_tokens": 11533,
+    "gen_ai.usage.cache_read.input_tokens": 9600,
+    "gen_ai.usage.cache_write.input_tokens": 0,
+    "gen_ai.usage.output_tokens": 36,
+    "codex.usage.reasoning_output_tokens": 0,
+    "codex.usage.total_tokens": 11569
+   }
+  },
+  {
+   "name": "drain_in_flight",
+   "span_id": "b1d2ccc939eef40a",
+   "parent_span_id": "eaa6bdd4ed028688",
+   "start_ns": 1700000005449791000,
+   "end_ns": 1700000005840368000,
+   "attrs": {}
+  },
+  {
+   "name": "handle_tool_call",
+   "span_id": "350209aead87b5a4",
+   "parent_span_id": "b1d2ccc939eef40a",
+   "start_ns": 1700000005449804000,
+   "end_ns": 1700000005840324000,
+   "attrs": {}
+  },
+  {
+   "name": "step_context.capture",
+   "span_id": "81bc30165a860376",
+   "parent_span_id": "19cc5f284b857d0d",
+   "start_ns": 1700000005840440000,
+   "end_ns": 1700000005841827000,
+   "attrs": {}
+  },
+  {
+   "name": "built_tools",
+   "span_id": "6f40c0b35afc727d",
+   "parent_span_id": "81bc30165a860376",
+   "start_ns": 1700000005840554000,
+   "end_ns": 1700000005841790000,
+   "attrs": {
+    "model": "gpt-6.1-sol"
+   }
+  },
+  {
+   "name": "build_tool_router",
+   "span_id": "e3c580d2246544ff",
+   "parent_span_id": "6f40c0b35afc727d",
+   "start_ns": 1700000005840627000,
+   "end_ns": 1700000005841785000,
+   "attrs": {}
+  },
+  {
+   "name": "run_sampling_request",
+   "span_id": "1698ec06663f22e4",
+   "parent_span_id": "19cc5f284b857d0d",
+   "start_ns": 1700000005842296000,
+   "end_ns": 1700000008035165000,
+   "attrs": {
+    "model": "gpt-6.1-sol"
+   }
+  },
+  {
+   "name": "try_run_sampling_request",
+   "span_id": "669092f0d65f4b8b",
+   "parent_span_id": "1698ec06663f22e4",
+   "start_ns": 1700000005842323000,
+   "end_ns": 1700000008035135000,
+   "attrs": {
+    "model": "gpt-6.1-sol"
+   }
+  },
+  {
+   "name": "stream_request",
+   "span_id": "bdb1f72dde418a95",
+   "parent_span_id": "669092f0d65f4b8b",
+   "start_ns": 1700000005842414000,
+   "end_ns": 1700000005843849000,
+   "attrs": {}
+  },
+  {
+   "name": "model_client.stream_responses_websocket",
+   "span_id": "a7559fbb56d1447d",
+   "parent_span_id": "bdb1f72dde418a95",
+   "start_ns": 1700000005842422000,
+   "end_ns": 1700000005843848000,
+   "attrs": {
+    "model": "gpt-6.1-sol",
+    "wire_api": "responses",
+    "transport": "responses_websocket",
+    "websocket.warmup": false,
+    "api.path": "/responses"
+   }
+  },
+  {
+   "name": "model_client.websocket_connection",
+   "span_id": "2ea550dca39dc976",
+   "parent_span_id": "a7559fbb56d1447d",
+   "start_ns": 1700000005843763000,
+   "end_ns": 1700000005843769000,
+   "attrs": {
+    "provider": "OpenAI",
+    "wire_api": "responses",
+    "transport": "responses_websocket",
+    "api.path": "/responses"
+   }
+  },
+  {
+   "name": "responses_websocket.stream_request",
+   "span_id": "41a2c3b09266c530",
+   "parent_span_id": "a7559fbb56d1447d",
+   "start_ns": 1700000005843814000,
+   "end_ns": 1700000008034440000,
+   "attrs": {
+    "transport": "responses_websocket",
+    "api.path": "/responses"
+   }
+  },
+  {
+   "name": "receiving_stream",
+   "span_id": "7accac24c78ea61e",
+   "parent_span_id": "669092f0d65f4b8b",
+   "start_ns": 1700000005843851000,
+   "end_ns": 1700000008035118000,
+   "attrs": {}
+  },
+  {
+   "name": "handle_responses",
+   "span_id": "f806768f7fcf112c",
+   "parent_span_id": "7accac24c78ea61e",
+   "start_ns": 1700000007725290000,
+   "end_ns": 1700000008035017000,
+   "attrs": {
+    "codex.request.reasoning_effort": "low",
+    "gen_ai.usage.input_tokens": 11597,
+    "gen_ai.usage.cache_read.input_tokens": 11392,
+    "gen_ai.usage.cache_write.input_tokens": 0,
+    "gen_ai.usage.output_tokens": 8,
+    "codex.usage.reasoning_output_tokens": 0,
+    "codex.usage.total_tokens": 11605
+   }
+  }
+ ]
+}

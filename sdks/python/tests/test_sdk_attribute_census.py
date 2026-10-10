@@ -71,6 +71,7 @@ _LG = "_adapters/_langgraph.py"
 _AS = "_adapters/_assembler.py"
 _SEAM = "_interceptors/_seam.py"
 _GENAI = "_semantics/_genai.py"
+_CX = "_adapters/_codex_exec.py"
 
 #: Every `set_extra` call in the package: (module, key as written, value as
 #: written) and where the value comes from. One row per call, so a key written
@@ -108,6 +109,34 @@ _SITES: list[tuple[str, str, str, str]] = [
     (_OA, "'wardex.openai_agents.mcp.server'", "str(mcp['server'])", HOST),
     (_OA, "'wardex.openai_agents.mcp.server'", "server if server is not None else ''", HOST),
     (_OA, "'wardex.openai_agents.max_turns'", "max_turns", HOST),
+    # -- the Codex CLI adapter --
+    # The process's exit code, the turn's usage totals off the --json stream,
+    # and what the OTel bridge counted: whether the version is the verified
+    # one, how many warm-up requests there were and how long they took.
+    (_CX, "'wardex.codex.exit_code'", "returncode", NUMBER),
+    (_CX, "'wardex.codex.turn.input_tokens'", "usage.input_tokens", NUMBER),
+    (_CX, "'wardex.codex.turn.output_tokens'", "usage.output_tokens", NUMBER),
+    (_CX, "'wardex.codex.turn.cache_read_input_tokens'", "usage.cache_read_tokens", NUMBER),
+    (
+        _CX,
+        "'wardex.codex.turn.reasoning_output_tokens'",
+        "usage.reasoning_output_tokens",
+        NUMBER,
+    ),
+    (_CX, "'wardex.codex.version_verified'", "view.version == VERIFIED_VERSION", NUMBER),
+    (_CX, "'wardex.codex.warmup.requests'", "len(view.warmups)", NUMBER),
+    (
+        _CX,
+        "'wardex.codex.warmup.duration_ms'",
+        "sum((max(0, w.end_ns - w.start_ns) for w in view.warmups)) // 1000000",
+        NUMBER,
+    ),
+    # What Codex itself wrote: its thread id, an item's type, the version it
+    # reports and the message of a failed turn.
+    (_CX, "'wardex.codex.thread_id'", "reading.thread_id", HOST),
+    (_CX, "'wardex.codex.item_type'", "ev.item_type", HOST),
+    (_CX, "'wardex.codex.version'", "view.version", HOST),
+    (_CX, "'wardex.codex.error'", "messages[-1][:500]", HOST),
     # -- the LangGraph adapter --
     (_LG, "'wardex.framework'", "_FRAMEWORK", LITERAL),
     (_LG, "'wardex.framework'", "_FRAMEWORK", LITERAL),

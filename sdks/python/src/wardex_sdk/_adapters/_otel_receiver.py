@@ -1,9 +1,13 @@
-"""Loopback OTLP receiver for the Anthropic Agent SDK OTel bridge.
+"""Loopback OTLP receiver for the CLI OTel bridges.
 
-The Claude Code CLI carries its own OpenTelemetry telemetry; with
-``AnthropicAgentSdkConfig(otel_bridge=True)`` the adapter points the CLI's
-exporter at this receiver (``_prepare_options`` injects the env) and the
-assembler merges what arrives into the session tree at finalize. This module
+A CLI wardex observes as a subprocess can carry its own OpenTelemetry
+telemetry. With ``AnthropicAgentSdkConfig(otel_bridge=True)`` the Agent SDK
+adapter points the Claude Code CLI's exporter at this receiver
+(``_prepare_options`` injects the env) and the assembler merges what arrives
+into the session tree at finalize; with ``CodexExecConfig(otel_bridge=True)``
+the Codex adapter does the same for each ``codex exec`` it sees
+(``_codex_exec.py``). Each adapter owns its own receiver — ``owner`` names it
+in every counter, so one CLI's failures never read as the other's. This module
 is the LISTENING half only: it accepts, bounds, scrubs and files spans by
 session — it interprets nothing (``_otel_merge`` does) and emits nothing
 (the assembler does).
@@ -120,7 +124,12 @@ class _OtelBridgeReceiver:
         max_body_bytes: int,
         max_spans_per_session: int,
         max_sessions: int,
+        owner: str = "anthropic",
     ) -> None:
+        #: Whose bridge this is, in every counter and one-time report key:
+        #: ``adapters.<owner>.otel_bridge.*``. The Agent SDK's spelling is the
+        #: default because its counter names predate a second bridge.
+        self._owner = owner
         self._max_body_bytes = max_body_bytes
         self._max_spans_per_session = max_spans_per_session
         self._max_sessions = max_sessions
@@ -153,7 +162,7 @@ class _OtelBridgeReceiver:
                 try:
                     receiver._handle_post(self)
                 except Exception:  # noqa: BLE001 — a broken peer, not the host
-                    counters.bump("adapters.anthropic.otel_bridge.handler_error")
+                    counters.bump(f"adapters.{receiver._owner}.otel_bridge.handler_error")
 
             def do_GET(self) -> None:  # noqa: N802
                 receiver._refuse(self, 405)
@@ -202,34 +211,35 @@ class _OtelBridgeReceiver:
         if not hmac.compare_digest(supplied.encode(), self.token.encode()):
             # The body is never read: an unauthorized peer does not get to
             # choose how many bytes this process buffers.
-            counters.bump("adapters.anthropic.otel_bridge.token_rejected")
+            counters.bump(f"adapters.{self._owner}.otel_bridge.token_rejected")
             self._refuse(handler, 403)
             return
         length = self._declared_length(handler)
         if length < 0 or length > self._max_body_bytes:
-            counters.bump("adapters.anthropic.otel_bridge.body_rejected")
+            counters.bump(f"adapters.{self._owner}.otel_bridge.body_rejected")
             self._refuse(handler, 413)
             return
         body = handler.rfile.read(length)
         if (handler.headers.get("Content-Encoding") or "").lower() == "gzip":
             body = self._gunzip_bounded(body)
             if body is None:
-                counters.bump("adapters.anthropic.otel_bridge.body_rejected")
+                counters.bump(f"adapters.{self._owner}.otel_bridge.body_rejected")
                 self._refuse(handler, 413)
                 return
         decoded: dict | None = None
         try:
             decoded = native.codec.decode_otlp_traces(body)
         except Exception:  # noqa: BLE001 — foreign bytes; fail-open is the contract
-            counters.bump("adapters.anthropic.otel_bridge.decode_error")
+            counters.bump(f"adapters.{self._owner}.otel_bridge.decode_error")
         if decoded is None:
             # 200 on purpose: an error status would put the CLI's exporter
             # into retry against a receiver that will never accept the bytes.
-            counters.bump("adapters.anthropic.otel_bridge.undecodable")
+            counters.bump(f"adapters.{self._owner}.otel_bridge.undecodable")
+            label = "anthropic_agent_sdk" if self._owner == "anthropic" else self._owner
             report_once(
-                "anthropic_agent_sdk otel bridge: a telemetry POST did not decode "
+                f"{label} otel bridge: a telemetry POST did not decode "
                 "as OTLP; the session tree is unchanged (fail-open)",
-                key="adapters.anthropic_agent_sdk.otel_bridge.undecodable",
+                key=f"adapters.{label}.otel_bridge.undecodable",
             )
             self._note_schema_failure()
         else:
@@ -252,7 +262,7 @@ class _OtelBridgeReceiver:
         try:
             return int(raw)
         except ValueError:
-            counters.bump("adapters.anthropic.otel_bridge.body_rejected")
+            counters.bump(f"adapters.{self._owner}.otel_bridge.body_rejected")
             return -1
 
     def _gunzip_bounded(self, body: bytes) -> bytes | None:
@@ -261,7 +271,7 @@ class _OtelBridgeReceiver:
             d = zlib.decompressobj(wbits=31)
             out = d.decompress(body, self._max_body_bytes + 1)
         except zlib.error:
-            counters.bump("adapters.anthropic.otel_bridge.gzip_error")
+            counters.bump(f"adapters.{self._owner}.otel_bridge.gzip_error")
             return None
         if len(out) > self._max_body_bytes or d.unconsumed_tail:
             return None
@@ -300,7 +310,7 @@ class _OtelBridgeReceiver:
                 dead = self._by_trace.pop(oldest)
                 if dead.session_key:
                     self._by_session_id.pop(dead.session_key, None)
-                counters.bump("adapters.anthropic.otel_bridge.reservation_evicted")
+                counters.bump(f"adapters.{self._owner}.otel_bridge.reservation_evicted")
             slot = _BridgeSlot()
             slot.trace_key = trace_id_hex
             self._by_trace[trace_id_hex] = slot
@@ -326,13 +336,13 @@ class _OtelBridgeReceiver:
                     # trace span (measured), so a session whose TRACEPARENT
                     # injection could not be read back still converges here.
                     if len(self._by_session_id) >= self._max_sessions:
-                        counters.bump("adapters.anthropic.otel_bridge.span_unroutable")
+                        counters.bump(f"adapters.{self._owner}.otel_bridge.span_unroutable")
                         return
                     slot = _BridgeSlot()
                     slot.session_key = session_id
                     self._by_session_id[session_id] = slot
             if slot is None:
-                counters.bump("adapters.anthropic.otel_bridge.span_unroutable")
+                counters.bump(f"adapters.{self._owner}.otel_bridge.span_unroutable")
                 return
             if isinstance(session_id, str) and session_id and slot.session_key is None:
                 # Index a trace-routed slot by its session id too, so the two
@@ -342,7 +352,7 @@ class _OtelBridgeReceiver:
             slot.last_arrival = now
             if len(slot.spans) >= self._max_spans_per_session:
                 slot.dropped += 1
-                counters.bump("adapters.anthropic.otel_bridge.span_dropped")
+                counters.bump(f"adapters.{self._owner}.otel_bridge.span_dropped")
                 return
             slot.resource = resource_attrs
             slot.spans.append(span)

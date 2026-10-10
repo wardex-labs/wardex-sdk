@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import importlib.util
+import shutil
 from operator import attrgetter
 from typing import TYPE_CHECKING, NamedTuple
 
-from .._assembly import counters, diag_info, diag_warning, report_once
+from .._assembly import counters, diag_info, diag_warning, guard, report_once
 from .._config import AdaptersConfig, _non_default_adapter_options
 from .._enums import AdapterName
 from ._probe import probe
@@ -33,10 +34,12 @@ class _Registration(NamedTuple):
     the shape of "the adapter shipped and captured nothing".
     """
 
-    detect: str
-    """The framework's import name, probed to decide whether it is here."""
+    detect: str | None
+    """The framework's import name, probed to decide whether it is here.
+    `None` for a framework the host RUNS rather than imports — see
+    `executable`."""
 
-    distribution: str
+    distribution: str | None
     """The framework's distribution name, as `importlib.metadata` knows it.
 
     What the pre-build probe checks `detect` against: a module that resolves
@@ -63,6 +66,25 @@ class _Registration(NamedTuple):
     per-adapter class is created with its first real option, never ahead of
     it), and `AdapterContext.options` is `None` for it.
     """
+
+    executable: str | None = None
+    """For a framework that is a CLI the host spawns rather than a package it
+    imports: the executable's name, looked up on `PATH` to auto-detect it.
+
+    There is no module to probe and nothing to shadow, so such a row has
+    `detect` and `distribution` of `None`. What is detected is only that the
+    CLI is installed; whether a given spawn IS that CLI is the adapter's own
+    decision, made per process. Auto-detection keyed on the CLI keeps the
+    adapter's process-wide patch off every host that could never run it; a
+    host that runs the CLI from a path off `PATH` names the adapter in
+    `enabled=`.
+    """
+
+
+def _codex_exec() -> AdapterInterface:
+    from ._codex_exec import CodexExecAdapter
+
+    return CodexExecAdapter()
 
 
 def _anthropic_agent_sdk() -> AdapterInterface:
@@ -92,6 +114,13 @@ _ADAPTERS: dict[AdapterName, _Registration] = {
         _anthropic_agent_sdk,
         attrgetter("anthropic_agent_sdk"),
     ),
+    AdapterName.CODEX_EXEC: _Registration(
+        None,
+        None,
+        _codex_exec,
+        attrgetter("codex_exec"),
+        executable="codex",
+    ),
     AdapterName.LANGGRAPH: _Registration("langgraph", "langgraph", _langgraph),
     AdapterName.OPENAI_AGENTS: _Registration("agents", "openai-agents", _openai_agents),
 }
@@ -99,14 +128,34 @@ _ADAPTERS: dict[AdapterName, _Registration] = {
 #: AdapterName -> distribution package to probe for auto-detection. DERIVED from
 #: `_ADAPTERS` and never maintained beside it: a second literal table is exactly
 #: the drift the single row above exists to make impossible.
-_DETECT_PACKAGES: dict[AdapterName, str] = {name: row.detect for name, row in _ADAPTERS.items()}
+_DETECT_PACKAGES: dict[AdapterName, str | None] = {
+    name: row.detect for name, row in _ADAPTERS.items()
+}
 
 
-def _detect_package(module_name: str) -> bool:
+def _detect_package(module_name: str | None) -> bool:
+    if module_name is None:
+        return False
     try:
         return importlib.util.find_spec(module_name) is not None
     except Exception:  # noqa: BLE001 — detection must never raise
         return False
+
+
+def _detect_executable(name: str | None) -> bool:
+    if name is None:
+        return False
+    found = False
+    with guard("adapters.detect_executable"):  # detection must never raise
+        found = shutil.which(name) is not None
+    return found
+
+
+def _detected(row: _Registration) -> bool:
+    """Whether auto-detection finds `row`'s framework: its module, or its CLI."""
+    if row.detect is not None:
+        return _detect_package(row.detect)
+    return _detect_executable(row.executable)
 
 
 def _framework_present(name: str, *, explicit: bool, debug: bool) -> bool:
@@ -132,7 +181,10 @@ def _framework_present(name: str, *, explicit: bool, debug: bool) -> bool:
     once as a warning and counted under `distribution_absent_explicit`.
     """
     row = next((r for member, r in _ADAPTERS.items() if member.value == name), None)
-    if row is None:
+    if row is None or row.detect is None or row.distribution is None:
+        # No registration row (a test double), or a CLI framework: there is no
+        # module to import here and so nothing to shadow — the adapter decides
+        # per spawn whether a process is its CLI.
         return True
     verdict = probe(row.distribution, row.detect, where=f"adapters.{name}")
     if verdict.outcome == "present":
@@ -197,7 +249,7 @@ def install_configured_adapters(client: Client | None, config: WardexConfig) -> 
     if config.adapters.enabled is not None:
         wanted = list(config.adapters.enabled)
     else:
-        wanted = [name for name, pkg in _DETECT_PACKAGES.items() if _detect_package(pkg)]
+        wanted = [name for name, row in _ADAPTERS.items() if _detected(row)]
         # Configured-but-not-installed has TWO announcement channels, split by
         # who caused the absence. An adapter EXCLUDED BY `enabled=` while its
         # options are set is a contradiction the user wrote into one config

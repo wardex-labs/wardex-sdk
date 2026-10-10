@@ -196,7 +196,8 @@ _LIMIT_DELIVERY: dict[LimitsConsumer, _Delivery] = {
             "max_sessions": "max_sessions",
         },
         native=frozenset(),
-        passthrough=frozenset(),
+        # Whose bridge the receiver is: a name in its counters, not a bound.
+        passthrough=frozenset({"owner"}),
     ),
     LimitsConsumer.WS_TRACKER: _Delivery(
         target="wardex_sdk._interceptors._trackers:_WebSocketTracker",

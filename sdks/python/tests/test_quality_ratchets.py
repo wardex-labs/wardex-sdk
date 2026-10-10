@@ -295,7 +295,7 @@ _OVERSIZED_BUDGET = {
     # sections' docstrings to the line length, words unchanged. Lowered to 1081
     # when frame_parse_failed gained its HTTP/1 emitter and a fifth session-table
     # emit site was added, each paid for the same way.
-    "_assembly/_integrity.py": 1081,
+    "_assembly/_integrity.py": 1078,
     "_assembly/_builder.py": 963,
     "_adapters/_anthropic_agent_sdk.py": 944,
 }

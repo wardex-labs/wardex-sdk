@@ -1,70 +1,57 @@
 """Configuration object — spec §2.3.
 
-`WardexConfig` is the immutable configuration for SDK initialization. All
-fields have sensible defaults, every field is keyword-only, and `init()`'s
-keyword parameters mirror these fields one for one (a drift test holds the two
-signatures together).
+`WardexConfig` is the immutable configuration for SDK initialization. All fields have sensible
+defaults, every field is keyword-only, and `init()`'s keyword parameters mirror these fields one for
+one (a drift test holds the two signatures together).
 
-THE GROUPS ARE A CROSS-LANGUAGE CONTRACT. wardex ships one SDK per language
-against one core, and a user who has configured the Python SDK must be able to
-read the Node or Java one without relearning it — so the group names below are
-part of the wire the SDKs share, not a Python spelling choice. They are
-recorded here, in the module that defines them, because a contract kept in a
-design document is a contract nobody edits when the code moves:
+THE GROUPS ARE A CROSS-LANGUAGE CONTRACT. wardex ships one SDK per language against one core, and a
+user who has configured the Python SDK must be able to read the Node or Java one without relearning
+it — so the group names below are part of the wire the SDKs share, not a Python spelling choice.
+They are recorded here, in the module that defines them, because a contract kept in a design
+document is a contract nobody edits when the code moves:
 
     backend=BackendConfig(...)          WHERE the data goes and whose it is.
-                                        The project key (which names the
-                                        wardex receiver), a self-hosted
-                                        receiver's base URL, or a third-party
-                                        OTLP collector's endpoint and headers.
+                                        The project key (which names the wardex receiver), a
+                                        self-hosted receiver's base URL, or a third-party OTLP
+                                        collector's endpoint and headers.
 
     pii=PIIConfig(...)                  WHAT LEAVES THE PROCESS. The masking
-                                        mode and the categories exempted from
-                                        it.
+                                        mode and the categories exempted from it.
 
     batching=BatchingConfig(...)        WHEN buffered spans are sent — the
-                                        periodic flush, whether a shutdown
-                                        signal triggers one, and the budget a
-                                        bare `close()` spends.
+                                        periodic flush, whether a shutdown signal triggers one, and
+                                        the budget a bare `close()` spends.
 
     limits=LimitsConfig(...)            HOW MUCH is captured. Resource bounds,
                                         owned by the core.
 
     propagation=PropagationConfig(...)  WHETHER wardex MUTATES outbound traffic
-                                        by injecting W3C trace headers, and
-                                        into which hosts.
+                                        by injecting W3C trace headers, and into which hosts.
 
     adapters=AdaptersConfig(...)        WHICH framework adapters install, and
                                         each adapter's own options.
 
-What stays top-level is what belongs to no group or to the SDK as a whole:
-`debug`, `before_send_envelope`, `capture_mode`, `service_name`, `release`,
-`environment`, and the
-interception trio (`intercept`, `intercept_hosts`, `interceptors`).
-The trio stays flat deliberately — `intercept` is the switch, `interceptors`
-refines it and `intercept_hosts` scopes it, so filing one of the three under a
-group would split a single concern across two levels, which is the
-inconsistency grouping exists to remove. That is the GROUPING BOUNDARY RULE,
-and it decides both directions: a capture surface gets a group when its
-members carry option payloads — which is why `adapters` is a group, its
-per-adapter options being payloads no flat tuple can hold — while a bare
+What stays top-level is what belongs to no group or to the SDK as a whole: `debug`,
+`before_send_envelope`, `capture_mode`, `service_name`, `release`, `environment`, and the
+interception trio (`intercept`, `intercept_hosts`, `interceptors`). The trio stays flat deliberately
+— `intercept` is the switch, `interceptors` refines it and `intercept_hosts` scopes it, so filing
+one of the three under a group would split a single concern across two levels, which is the
+inconsistency grouping exists to remove. That is the GROUPING BOUNDARY RULE, and it decides both
+directions: a capture surface gets a group when its members carry option payloads — which is why
+`adapters` is a group, its per-adapter options being payloads no flat tuple can hold — while a bare
 switch/refinement/scope trio stays flat.
 
-CONFIG ROUND-TRIPS AS WRITTEN. Lossless bijective canonicalization is
-permitted — every collection field accepts any iterable and is canonicalized
-in `__post_init__` (list→tuple, set→frozenset) so two configs built from
-different container types compare equal. Value mutation — case folding,
-trimming, path or default substitution — is not: what a user typed is what
-they read back. Derived values (the endpoint path append, env fallbacks) are
-computed at the consumer and never written back into the config object; the
-one exception is `init()`'s environment resolution, whose whole job is to
-build the RESOLVED config, so what it read from `WARDEX_*` is exactly what its
-config carries.
+CONFIG ROUND-TRIPS AS WRITTEN. Lossless bijective canonicalization is permitted — every collection
+field accepts any iterable and is canonicalized in `__post_init__` (list→tuple, set→frozenset) so
+two configs built from different container types compare equal. Value mutation — case folding,
+trimming, path or default substitution — is not: what a user typed is what they read back. Derived
+values (the endpoint path append, env fallbacks) are computed at the consumer and never written back
+into the config object; the one exception is `init()`'s environment resolution, whose whole job is
+to build the RESOLVED config, so what it read from `WARDEX_*` is exactly what its config carries.
 
-There are no compatibility shims for an old spelling. `WardexConfig` is in
-beta and a silent ignore is the one outcome a config change may not have, so
-every moved name is refused in `__new__` with a message naming its new home,
-and every removed name with a message saying why it is gone.
+There are no compatibility shims for an old spelling. `WardexConfig` is in beta and a silent ignore
+is the one outcome a config change may not have, so every moved name is refused in `__new__` with a
+message naming its new home, and every removed name with a message saying why it is gone.
 """
 
 from __future__ import annotations
@@ -91,13 +78,12 @@ from ._types import BeforeSendEnvelopeCallback
 class WardexConfigWarning(UserWarning):
     """A configuration that is legal but conflicts with itself.
 
-    Raised-as-a-warning (never an exception) by `init()` when one setting
-    silently disables another: an explicit `transport=` next to a
-    `backend.endpoint`, PII category exemptions under `PIIMode.OFF`, or an
-    `interceptors=` selection with `intercept=False`. Each is a valid program
-    — the warning exists because the losing setting would otherwise be
-    indistinguishable from one that was honoured. Filter it like any warning
-    category (`warnings.simplefilter("ignore", WardexConfigWarning)`).
+    Raised-as-a-warning (never an exception) by `init()` when one setting silently disables another:
+    an explicit `transport=` next to a `backend.endpoint`, PII category exemptions under
+    `PIIMode.OFF`, or an `interceptors=` selection with `intercept=False`. Each is a valid program —
+    the warning exists because the losing setting would otherwise be indistinguishable from one that
+    was honoured. Filter it like any warning category (`warnings.simplefilter("ignore",
+    WardexConfigWarning)`).
     """
 
 
@@ -167,11 +153,10 @@ _KEY_PREFIX = "wdx_"
 def region_of_key(api_key: str) -> str:
     """The region tag a project key carries: `wdx_<region>_<secret>` -> `<region>`.
 
-    Raises `ValueError` for anything else. The alternative -- falling back to
-    some default host for a key that does not say where it belongs -- would
-    send a batch to a receiver that rejects it, with a 401 the transport is
-    fail-silent about; the whole point of the region riding in the key is that
-    the SDK never has to guess.
+    Raises `ValueError` for anything else. The alternative -- falling back to some default host for
+    a key that does not say where it belongs -- would send a batch to a receiver that rejects it,
+    with a 401 the transport is fail-silent about; the whole point of the region riding in the key
+    is that the SDK never has to guess.
     """
     if not api_key.startswith(_KEY_PREFIX):
         raise ValueError(
@@ -190,28 +175,24 @@ def region_of_key(api_key: str) -> str:
 class BackendConfig:
     """Where captured data goes, and whose project it belongs to.
 
-    Named for the destination rather than for the `Transport` that reaches it,
-    and the difference is not cosmetic: `init(transport=...)` already takes the
-    Transport OBJECT, so a group called `transport=` could never be spelled
-    through the SDK's only entry point, and a user who tried would hand `init()`
-    a config group where a Transport was expected.
+    Named for the destination rather than for the `Transport` that reaches it, and the difference is
+    not cosmetic: `init(transport=...)` already takes the Transport OBJECT, so a group called
+    `transport=` could never be spelled through the SDK's only entry point, and a user who tried
+    would hand `init()` a config group where a Transport was expected.
 
-    Two destinations live here and they do not mix. A WARDEX RECEIVER is named
-    by `api_key` (the project key; its region picks the host) or by `base_url`
-    (a self-hosted receiver). A THIRD-PARTY OTLP COLLECTOR is named by
-    `endpoint`, with `headers` for whatever that collector wants. `init()`
-    picks the wardex receiver whenever `api_key` is set and announces a losing
-    `endpoint` with a `WardexConfigWarning`; the project key is never sent to
-    a collector that is not ours.
+    Two destinations live here and they do not mix. A WARDEX RECEIVER is named by `api_key` (the
+    project key; its region picks the host) or by `base_url` (a self-hosted receiver). A THIRD-PARTY
+    OTLP COLLECTOR is named by `endpoint`, with `headers` for whatever that collector wants.
+    `init()` picks the wardex receiver whenever `api_key` is set and announces a losing `endpoint`
+    with a `WardexConfigWarning`; the project key is never sent to a collector that is not ours.
     """
 
     api_key: str | None = field(default=None, repr=False)
     """The wardex project key: one key names one project at the receiver, and
-    its region tag (`wdx_us_...`) names the receiver. The default exporter
-    sends it as an `Authorization: Bearer` header to the wardex receiver and
-    NOWHERE ELSE -- it is not written into an envelope (the receiver stamps
-    the project it names onto each stored batch, so stored data holds no
-    credential) and it is not sent to a third-party OTLP collector.
+    its region tag (`wdx_us_...`) names the receiver. The default exporter sends it as an
+    `Authorization: Bearer` header to the wardex receiver and NOWHERE ELSE -- it is not written into
+    an envelope (the receiver stamps the project it names onto each stored batch, so stored data
+    holds no credential) and it is not sent to a third-party OTLP collector.
 
     `repr=False` because a config object's string form ends up in logs, crash
     reports and debugger output, none of which is a place for a credential:
@@ -222,28 +203,25 @@ class BackendConfig:
 
     base_url: str | None = None
     """A wardex receiver's address, for a self-hosted receiver or a proxy in
-    front of ours -- `http://127.0.0.1:8080`, without the route. Unset, the
-    receiver is the one the key's region names (`WARDEX_INGEST_HOSTS`). Only
-    meaningful with `api_key`: a receiver address with no key cannot
-    authenticate, and `init()` refuses the pair with a `ValueError`.
+    front of ours -- `http://127.0.0.1:8080`, without the route. Unset, the receiver is the one the
+    key's region names (`WARDEX_INGEST_HOSTS`). Only meaningful with `api_key`: a receiver address
+    with no key cannot authenticate, and `init()` refuses the pair with a `ValueError`.
 
     Unset, `init()` reads `WARDEX_BASE_URL` from the environment.
     """
 
     endpoint: str | None = None
     """A third-party OTLP/HTTP collector to send to instead. `init()` without
-    a `transport=` and without an `api_key` builds the OTLP exporter against
-    this address; with none of the three, it installs `NoOpTransport`,
-    captures into nothing, and says so once on stderr.
+    a `transport=` and without an `api_key` builds the OTLP exporter against this address; with none
+    of the three, it installs `NoOpTransport`, captures into nothing, and says so once on stderr.
 
     Unset, `init()` reads `WARDEX_ENDPOINT`, then
     `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`, then `OTEL_EXPORTER_OTLP_ENDPOINT`.
 
-    THE ENDPOINT RULE: a URL whose path is empty or `/` gets `/v1/traces`
-    appended when the default transport is built -- `http://collector:4318`
-    exports to `http://collector:4318/v1/traces` -- while a URL with an explicit
-    path is used verbatim. The append happens at transport construction and is
-    never written back here: this field reads back exactly as configured.
+    THE ENDPOINT RULE: a URL whose path is empty or `/` gets `/v1/traces` appended when the default
+    transport is built -- `http://collector:4318` exports to `http://collector:4318/v1/traces` --
+    while a URL with an explicit path is used verbatim. The append happens at transport construction
+    and is never written back here: this field reads back exactly as configured.
 
     An explicit `transport=` wins over this field, and so does `api_key` (the
     project key routes to the wardex receiver); the losing endpoint is
@@ -252,10 +230,9 @@ class BackendConfig:
 
     headers: Mapping[str, str] | None = None
     """Request headers for the third-party OTLP exporter -- the collector's own
-    authentication, in whatever spelling it wants (`{"x-honeycomb-team": ...}`,
-    `{"Authorization": "Basic ..."}`). Read only when `endpoint` builds the
-    OTLP transport; the wardex receiver authenticates with `api_key` and
-    ignores this field. Reads back as an immutable mapping.
+    authentication, in whatever spelling it wants (`{"x-honeycomb-team": ...}`, `{"Authorization":
+    "Basic ..."}`). Read only when `endpoint` builds the OTLP transport; the wardex receiver
+    authenticates with `api_key` and ignores this field. Reads back as an immutable mapping.
 
     Unset, `init()` reads `OTEL_EXPORTER_OTLP_HEADERS` from the environment,
     in the OpenTelemetry form `key=value,key2=value2` with percent-encoded
@@ -394,21 +371,18 @@ class BatchingConfig:
 class PropagationConfig:
     """Whether wardex mutates outbound traffic, and into which hosts.
 
-    The only group that can change what the host application SENDS, which is
-    why it is off by default and why it has a group of its own rather than a
-    flag among flags.
+    The only group that can change what the host application SENDS, which is why it is off by
+    default and why it has a group of its own rather than a flag among flags.
     """
 
     enabled: bool = False
     targets: Iterable[str] | None = None
     """Glob patterns matched against the outbound host. Accepts any iterable
-    of strings; reads back as a tuple. `None` means every host the patched
-    clients reach.
+    of strings; reads back as a tuple. `None` means every host the patched clients reach.
 
-    MATCHING IS CASE-INSENSITIVE — hostnames are, so `*.MyCorp.com` admits
-    `api.mycorp.com` — but the field reads back EXACTLY as written: config
-    round-trips as written, and the folding both sides of the match need lives
-    in the injector (`context._inject`), computed once per configured
+    MATCHING IS CASE-INSENSITIVE — hostnames are, so `*.MyCorp.com` admits `api.mycorp.com` — but
+    the field reads back EXACTLY as written: config round-trips as written, and the folding both
+    sides of the match need lives in the injector (`context._inject`), computed once per configured
     allowlist rather than per request.
     """
 
@@ -438,36 +412,71 @@ class AnthropicAgentSdkConfig:
     """The Anthropic Agent SDK adapter's own options.
 
     Both fields gate the OTel BRIDGE, which is landed and is their consumer:
-    `_adapters/_anthropic_agent_sdk.py` reads them off `ctx.options` at
-    install — the first real consumer of the per-adapter options channel.
-    This class shipped one release ahead of the bridge, with that stated here
-    as a promise ("the release that ships these fields must contain it");
-    this paragraph is that promise being discharged rather than deleted — a
-    config field never ships before its consumer, and these no longer do.
+    `_adapters/_anthropic_agent_sdk.py` reads them off `ctx.options` at install — the first real
+    consumer of the per-adapter options channel. This class shipped one release ahead of the bridge,
+    with that stated here as a promise ("the release that ships these fields must contain it"); this
+    paragraph is that promise being discharged rather than deleted — a config field never ships
+    before its consumer, and these no longer do.
     """
 
     otel_bridge: bool = False
     """Opt in to merging the Claude CLI's own OTel telemetry into wardex's
-    tree: the adapter points the CLI's exporter at an in-process loopback
-    receiver and joins what arrives into the session's spans at close —
-    merged LLM turns gain the CLI's own timing (and shed the
-    `transport_timing_unavailable_subprocess` marker), and CLI-internal work
-    (hooks, MCP RPCs, subprocesses, compaction) appears as new step spans.
-    `False` — the default — reproduces today's tree byte-for-byte. NEVER a
-    hijack: a user whose environment already carries `OTEL_*` or
+    tree: the adapter points the CLI's exporter at an in-process loopback receiver and joins what
+    arrives into the session's spans at close — merged LLM turns gain the CLI's own timing (and shed
+    the `transport_timing_unavailable_subprocess` marker), and CLI-internal work (hooks, MCP RPCs,
+    subprocesses, compaction) appears as new step spans. `False` — the default — reproduces today's
+    tree byte-for-byte. NEVER a hijack: a user whose environment already carries `OTEL_*` or
     `CLAUDE_CODE_ENABLE_TELEMETRY` keeps their own telemetry untouched and
     the bridge stands down for that session, with one warning."""
 
     otel_bridge_drain: float = 0.2
     """How long, in SECONDS (every duration field is), a session's end waits
-    for the CLI's final telemetry batch before the bridge stops listening.
-    Must be >= 0; `0` means no wait at all. Paid ONLY by sessions the bridge
-    actually fed — a session with no bridge data closes at full speed — and
-    only inside the transport's own async close; skipped structurally on the
-    atexit and signal paths, whose budgets are the shutdown's to spend. The
-    default is priced against the measured export cadence: the CLI's final
-    batch ordinarily arrives BEFORE the stream ends, so this is a tail
+    for the CLI's final telemetry batch before the bridge stops listening. Must be >= 0; `0` means
+    no wait at all. Paid ONLY by sessions the bridge actually fed — a session with no bridge data
+    closes at full speed — and only inside the transport's own async close; skipped structurally on
+    the atexit and signal paths, whose budgets are the shutdown's to spend. The default is priced
+    against the measured export cadence: the CLI's final batch ordinarily arrives BEFORE the stream
+    ends, so this is a tail
     guard, not a wait every close incurs."""
+
+    def __post_init__(self) -> None:
+        if self.otel_bridge_drain < 0:
+            raise ValueError(
+                f"otel_bridge_drain must be >= 0 (seconds), got {self.otel_bridge_drain}"
+            )
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class CodexExecConfig:
+    """The Codex CLI (`codex exec`) adapter's own options.
+
+    The adapter itself only READS: it sees the prompt a host hands `codex exec` on stdin and the
+    `--json` events the host reads back, and changes neither the command, the environment nor a byte
+    of either stream. That reading names no model and no per-call timing, because the stream does
+    not carry them. Both fields here gate the one thing that does: the OTel bridge, which is the
+    adapter CHANGING the command it was given.
+    """
+
+    otel_bridge: bool = False
+    """Opt in to merging the Codex CLI's own OTel traces into wardex's tree:
+    the adapter adds a trace-exporter `-c` override pointing at an in-process loopback receiver, and
+    a `TRACEPARENT` that routes what arrives, to each `codex exec` it sees — and nothing else
+    (Codex's log and metric exporters are left exactly as configured; its log events carry the
+    account's e-mail address). Merged runs gain one `chat` span per model call, with the model name,
+    that call's usage and its own interval, and the model's warm-up request is reported apart from
+    them. `False` — the default — never changes the command. NEVER a hijack: a run whose command
+    already sets `otel.*`, whose environment already carries `OTEL_*` or `TRACEPARENT`, or whose
+    user config (read only when the command does not pass `--ignore-user-config`) already names a
+    `trace_exporter` keeps its own telemetry untouched, and the bridge stands down for that run with
+    one
+    warning."""
+
+    otel_bridge_drain: float = 0.2
+    """How long, in SECONDS, a bridged run's end waits for Codex's telemetry
+    when none has arrived yet. Must be >= 0; `0` means no wait. Paid ONLY by a
+    run whose bridge delivered nothing by the time the process ended: Codex
+    flushes its exporter before it exits (measured on 0.160.0), so a run
+    whose telemetry arrived closes at full speed."""
 
     def __post_init__(self) -> None:
         if self.otel_bridge_drain < 0:
@@ -480,23 +489,20 @@ class AnthropicAgentSdkConfig:
 class AdaptersConfig:
     """WHICH framework adapters install, and each adapter's own options.
 
-    SELECTION AND OPTIONS ARE SEPARATE FIELDS OF ONE GROUP, deliberately:
-    configuring an adapter's option never touches `enabled`, so auto-detection
-    survives — `AdaptersConfig(anthropic_agent_sdk=AnthropicAgentSdkConfig(
-    otel_bridge=True))` still leaves every other installed framework
-    auto-detected. The alternative shapes both collapse that: a per-adapter
-    top-level kwarg couples selection to spelling, and an instance list makes
-    naming an option a de-selection of everything unnamed.
+    SELECTION AND OPTIONS ARE SEPARATE FIELDS OF ONE GROUP, deliberately: configuring an adapter's
+    option never touches `enabled`, so auto-detection survives —
+    `AdaptersConfig(anthropic_agent_sdk=AnthropicAgentSdkConfig( otel_bridge=True))` still leaves
+    every other installed framework auto-detected. The alternative shapes both collapse that: a
+    per-adapter top-level kwarg couples selection to spelling, and an instance list makes naming an
+    option a de-selection of everything unnamed.
 
-    ONE IDENTIFIER PER ADAPTER: the per-adapter field name equals the
-    `AdapterName` value equals `adapter.name()` — `anthropic_agent_sdk`, never
-    a second spelling — so selection, options and the registry's install table
-    key one adapter the same way.
+    ONE IDENTIFIER PER ADAPTER: the per-adapter field name equals the `AdapterName` value equals
+    `adapter.name()` — `anthropic_agent_sdk`, never a second spelling — so selection, options and
+    the registry's install table key one adapter the same way.
 
-    A PER-ADAPTER CONFIG CLASS IS CREATED WITH ITS FIRST REAL OPTION, never
-    ahead of it — which is why `langgraph` has no field here. An empty options
-    class is a name a user can spell that configures nothing, the config-shaped
-    twin of a selectable no-op.
+    A PER-ADAPTER CONFIG CLASS IS CREATED WITH ITS FIRST REAL OPTION, never ahead of it — which is
+    why `langgraph` has no field here. An empty options class is a name a user can spell that
+    configures nothing, the config-shaped twin of a selectable no-op.
     """
 
     enabled: tuple[AdapterName, ...] | None = None
@@ -511,6 +517,10 @@ class AdaptersConfig:
     anthropic_agent_sdk: AnthropicAgentSdkConfig = field(default_factory=AnthropicAgentSdkConfig)
     """The Anthropic Agent SDK adapter's options. Setting them selects
     nothing and disturbs no auto-detection; see the class docstring."""
+
+    codex_exec: CodexExecConfig = field(default_factory=CodexExecConfig)
+    """The Codex CLI adapter's options. Setting them selects nothing and
+    disturbs no auto-detection; see the class docstring."""
 
     def __post_init__(self) -> None:
         if self.enabled is None:

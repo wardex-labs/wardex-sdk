@@ -125,6 +125,17 @@ def _shield_tests_from_ambient_env(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _shield_tests_from_installed_clis(monkeypatch):
+    """Auto-detection of a CLI adapter (`codex_exec`) looks the CLI up on
+    `PATH` — so on a developer machine with Codex installed every `init()`
+    in the suite would install that adapter, and on CI, where it is absent,
+    none would: the same suite testing two different processes. Pinned to
+    "not installed" here, the way `_shield_tests_from_ambient_env` pins the
+    env; a test that WANTS the CLI detected patches the lookup back itself."""
+    monkeypatch.setattr("wardex_sdk._adapters._detect_executable", lambda name: False)
+
+
+@pytest.fixture(autouse=True)
 def _no_job_left_pending(request):
     """A test that leaves deferred-parse jobs pending has read its spans too
     early — on a fast machine the worker often wins the race, so the bare

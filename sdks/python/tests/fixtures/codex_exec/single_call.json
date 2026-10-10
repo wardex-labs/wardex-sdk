@@ -1,0 +1,297 @@
+{
+ "_provenance": "codex-cli 0.160.0, `codex exec --json` under ChatGPT sign-in, recorded 2026-10-09 with the trace exporter pointed at a loopback sink. Curated: only the spans the bridge reads plus their ancestors and some neighbours, an allowlist of attributes, times shifted onto a fixed clock. Nothing else was edited.",
+ "stdin": "You are the model in a tool loop. Reply with exactly this JSON and nothing else: {\"action\":\"tool\",\"tool\":\"lookup\",\"arguments_json\":\"{\\\"q\\\":\\\"ABC123\\\"}\",\"text\":\"\"}",
+ "stdout": "{\"type\":\"thread.started\",\"thread_id\":\"01a1206d-e415-7cb3-945f-80da3580c711\"}\n{\"type\":\"turn.started\"}\n{\"type\":\"item.completed\",\"item\":{\"id\":\"item_0\",\"type\":\"agent_message\",\"text\":\"{\\\"action\\\":\\\"tool\\\",\\\"tool\\\":\\\"lookup\\\",\\\"arguments_json\\\":\\\"{\\\\\\\"q\\\\\\\":\\\\\\\"ABC123\\\\\\\"}\\\",\\\"text\\\":\\\"\\\"}\"}}\n{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":10914,\"cached_input_tokens\":0,\"cache_write_input_tokens\":0,\"output_tokens\":28,\"reasoning_output_tokens\":0}}\n",
+ "resource": {
+  "service.name": "codex_exec",
+  "service.version": "0.160.0"
+ },
+ "process_ns": [
+  1700000000000000000,
+  1700000006422642000
+ ],
+ "spans": [
+  {
+   "name": "codex.exec",
+   "span_id": "88cfe9cd475ef595",
+   "parent_span_id": "",
+   "start_ns": 1700000000026796000,
+   "end_ns": 1700000005477857000,
+   "attrs": {}
+  },
+  {
+   "name": "thread/start",
+   "span_id": "74795aa46c97d80a",
+   "parent_span_id": "",
+   "start_ns": 1700000000033437000,
+   "end_ns": 1700000000097558000,
+   "attrs": {}
+  },
+  {
+   "name": "thread_spawn",
+   "span_id": "48ba589314de0e07",
+   "parent_span_id": "74795aa46c97d80a",
+   "start_ns": 1700000000035490000,
+   "end_ns": 1700000000094608000,
+   "attrs": {}
+  },
+  {
+   "name": "session_init",
+   "span_id": "77f5e8e3637cf81b",
+   "parent_span_id": "48ba589314de0e07",
+   "start_ns": 1700000000036914000,
+   "end_ns": 1700000000094596000,
+   "attrs": {}
+  },
+  {
+   "name": "startup_prewarm",
+   "span_id": "bc5b1020b83277a5",
+   "parent_span_id": "77f5e8e3637cf81b",
+   "start_ns": 1700000000094558000,
+   "end_ns": 1700000001401679000,
+   "attrs": {}
+  },
+  {
+   "name": "step_context.capture",
+   "span_id": "87104b2240ea5ecb",
+   "parent_span_id": "bc5b1020b83277a5",
+   "start_ns": 1700000000097283000,
+   "end_ns": 1700000000124769000,
+   "attrs": {}
+  },
+  {
+   "name": "turn/start",
+   "span_id": "42f36f78825c15f6",
+   "parent_span_id": "",
+   "start_ns": 1700000000097780000,
+   "end_ns": 1700000000099908000,
+   "attrs": {}
+  },
+  {
+   "name": "op.dispatch.turn_input",
+   "span_id": "9384120d6c2e2ee6",
+   "parent_span_id": "42f36f78825c15f6",
+   "start_ns": 1700000000098447000,
+   "end_ns": 1700000000099880000,
+   "attrs": {}
+  },
+  {
+   "name": "built_tools",
+   "span_id": "b36141522d5f9c6d",
+   "parent_span_id": "87104b2240ea5ecb",
+   "start_ns": 1700000000098720000,
+   "end_ns": 1700000000124614000,
+   "attrs": {
+    "model": "gpt-6.1-sol"
+   }
+  },
+  {
+   "name": "build_tool_router",
+   "span_id": "499182846c8df078",
+   "parent_span_id": "b36141522d5f9c6d",
+   "start_ns": 1700000000098783000,
+   "end_ns": 1700000000124607000,
+   "attrs": {}
+  },
+  {
+   "name": "session_task.turn",
+   "span_id": "9fb6bbea7d04a2a1",
+   "parent_span_id": "9384120d6c2e2ee6",
+   "start_ns": 1700000000099862000,
+   "end_ns": 1700000005143664000,
+   "attrs": {
+    "model": "gpt-6.1-sol",
+    "codex.turn.token_usage.input_tokens": 10914,
+    "codex.turn.token_usage.cached_input_tokens": 0,
+    "codex.turn.token_usage.cache_write_input_tokens": 0,
+    "codex.turn.token_usage.non_cached_input_tokens": 10914,
+    "codex.turn.token_usage.output_tokens": 28,
+    "codex.turn.token_usage.reasoning_output_tokens": 0,
+    "codex.turn.token_usage.total_tokens": 10942
+   }
+  },
+  {
+   "name": "session_task.run",
+   "span_id": "f13db28000f2f0fb",
+   "parent_span_id": "9fb6bbea7d04a2a1",
+   "start_ns": 1700000000099893000,
+   "end_ns": 1700000005138713000,
+   "attrs": {}
+  },
+  {
+   "name": "run_turn",
+   "span_id": "d06cdff8834e7848",
+   "parent_span_id": "f13db28000f2f0fb",
+   "start_ns": 1700000000099895000,
+   "end_ns": 1700000005138707000,
+   "attrs": {}
+  },
+  {
+   "name": "model_client.websocket_connection",
+   "span_id": "f2d6a001c2c59517",
+   "parent_span_id": "bc5b1020b83277a5",
+   "start_ns": 1700000000383126000,
+   "end_ns": 1700000000927446000,
+   "attrs": {
+    "provider": "OpenAI",
+    "wire_api": "responses",
+    "transport": "responses_websocket",
+    "api.path": "/responses"
+   }
+  },
+  {
+   "name": "model_client.stream_responses_websocket",
+   "span_id": "a479196e5683f567",
+   "parent_span_id": "bc5b1020b83277a5",
+   "start_ns": 1700000000927588000,
+   "end_ns": 1700000000932194000,
+   "attrs": {
+    "model": "gpt-6.1-sol",
+    "wire_api": "responses",
+    "transport": "responses_websocket",
+    "websocket.warmup": true,
+    "api.path": "/responses"
+   }
+  },
+  {
+   "name": "model_client.websocket_connection",
+   "span_id": "aad855f199d642b8",
+   "parent_span_id": "a479196e5683f567",
+   "start_ns": 1700000000931928000,
+   "end_ns": 1700000000931945000,
+   "attrs": {
+    "provider": "OpenAI",
+    "wire_api": "responses",
+    "transport": "responses_websocket",
+    "api.path": "/responses"
+   }
+  },
+  {
+   "name": "responses_websocket.stream_request",
+   "span_id": "3815841421ad9a07",
+   "parent_span_id": "a479196e5683f567",
+   "start_ns": 1700000000932030000,
+   "end_ns": 1700000001401210000,
+   "attrs": {
+    "transport": "responses_websocket",
+    "api.path": "/responses"
+   }
+  },
+  {
+   "name": "step_context.capture",
+   "span_id": "d50d82cbc29cbab5",
+   "parent_span_id": "d06cdff8834e7848",
+   "start_ns": 1700000001401868000,
+   "end_ns": 1700000001441440000,
+   "attrs": {}
+  },
+  {
+   "name": "built_tools",
+   "span_id": "f6f0bda2773b7d04",
+   "parent_span_id": "d50d82cbc29cbab5",
+   "start_ns": 1700000001403934000,
+   "end_ns": 1700000001441363000,
+   "attrs": {
+    "model": "gpt-6.1-sol"
+   }
+  },
+  {
+   "name": "build_tool_router",
+   "span_id": "5b8129334fd172d1",
+   "parent_span_id": "f6f0bda2773b7d04",
+   "start_ns": 1700000001404033000,
+   "end_ns": 1700000001441358000,
+   "attrs": {}
+  },
+  {
+   "name": "run_sampling_request",
+   "span_id": "35d023f20015115b",
+   "parent_span_id": "d06cdff8834e7848",
+   "start_ns": 1700000001826387000,
+   "end_ns": 1700000005138590000,
+   "attrs": {
+    "model": "gpt-6.1-sol"
+   }
+  },
+  {
+   "name": "try_run_sampling_request",
+   "span_id": "3bfdaffb63dcd4a5",
+   "parent_span_id": "35d023f20015115b",
+   "start_ns": 1700000001826449000,
+   "end_ns": 1700000005138584000,
+   "attrs": {
+    "model": "gpt-6.1-sol"
+   }
+  },
+  {
+   "name": "stream_request",
+   "span_id": "4d0b6f249de56676",
+   "parent_span_id": "3bfdaffb63dcd4a5",
+   "start_ns": 1700000001826647000,
+   "end_ns": 1700000001829980000,
+   "attrs": {}
+  },
+  {
+   "name": "model_client.stream_responses_websocket",
+   "span_id": "2e18098ebdb26ae5",
+   "parent_span_id": "4d0b6f249de56676",
+   "start_ns": 1700000001826674000,
+   "end_ns": 1700000001829977000,
+   "attrs": {
+    "model": "gpt-6.1-sol",
+    "wire_api": "responses",
+    "transport": "responses_websocket",
+    "websocket.warmup": false,
+    "api.path": "/responses"
+   }
+  },
+  {
+   "name": "model_client.websocket_connection",
+   "span_id": "7fae6fb9e88ff814",
+   "parent_span_id": "2e18098ebdb26ae5",
+   "start_ns": 1700000001829764000,
+   "end_ns": 1700000001829775000,
+   "attrs": {
+    "provider": "OpenAI",
+    "wire_api": "responses",
+    "transport": "responses_websocket",
+    "api.path": "/responses"
+   }
+  },
+  {
+   "name": "responses_websocket.stream_request",
+   "span_id": "4c60608b42d623c8",
+   "parent_span_id": "2e18098ebdb26ae5",
+   "start_ns": 1700000001829877000,
+   "end_ns": 1700000005138445000,
+   "attrs": {
+    "transport": "responses_websocket",
+    "api.path": "/responses"
+   }
+  },
+  {
+   "name": "receiving_stream",
+   "span_id": "fc8a8b65d221fe73",
+   "parent_span_id": "3bfdaffb63dcd4a5",
+   "start_ns": 1700000001829984000,
+   "end_ns": 1700000005138580000,
+   "attrs": {}
+  },
+  {
+   "name": "handle_responses",
+   "span_id": "495a40ff091f7e3f",
+   "parent_span_id": "fc8a8b65d221fe73",
+   "start_ns": 1700000005054327000,
+   "end_ns": 1700000005138564000,
+   "attrs": {
+    "codex.request.reasoning_effort": "low",
+    "gen_ai.usage.input_tokens": 10914,
+    "gen_ai.usage.cache_read.input_tokens": 0,
+    "gen_ai.usage.cache_write.input_tokens": 0,
+    "gen_ai.usage.output_tokens": 28,
+    "codex.usage.reasoning_output_tokens": 0,
+    "codex.usage.total_tokens": 10942
+   }
+  }
+ ]
+}

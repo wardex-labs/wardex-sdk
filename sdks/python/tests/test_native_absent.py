@@ -212,6 +212,7 @@ def _config_groups_ctor():
         adapters=wardex_sdk.AdaptersConfig(
             enabled=(),
             anthropic_agent_sdk=wardex_sdk.AnthropicAgentSdkConfig(otel_bridge_drain=0.1),
+            codex_exec=wardex_sdk.CodexExecConfig(otel_bridge_drain=0.1),
         ),
     )
 
@@ -557,6 +558,7 @@ _DRIVEN = frozenset(
         "AnthropicAgentSdkConfig",
         "BackendConfig",
         "BatchingConfig",
+        "CodexExecConfig",
         "PIIConfig",
         "PropagationConfig",
         "UserInfo",
