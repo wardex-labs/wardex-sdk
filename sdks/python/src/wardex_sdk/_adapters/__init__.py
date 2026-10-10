@@ -7,9 +7,11 @@ import shutil
 from operator import attrgetter
 from typing import TYPE_CHECKING, NamedTuple
 
-from .._assembly import counters, diag_info, diag_warning, guard, report_once
+from .._assembly import counters, diag_info, guard, report_once
 from .._config import AdaptersConfig, _non_default_adapter_options
-from .._enums import AdapterName
+from .._diagnostics import AdapterStatus
+from .._enums import AdapterName, AdapterState
+from ._measured import MEASURED, Measured, installed_version, is_measured, spelled
 from ._probe import probe
 from ._registry import get_registry
 
@@ -158,9 +160,10 @@ def _detected(row: _Registration) -> bool:
     return _detect_executable(row.executable)
 
 
-def _framework_present(name: str, *, explicit: bool, debug: bool) -> bool:
-    """Whether the framework of the adapter called `name` is here to be
-    adapted. Run by `AdapterRegistry.install` — ONCE, in front of
+def _framework_absence(name: str, *, explicit: bool, debug: bool) -> AdapterState | None:
+    """Why the framework of the adapter called `name` is NOT here to be
+    adapted — `SHADOWED` or `ABSENT` — or None when it is. Run by
+    `AdapterRegistry.install` — ONCE, in front of
     `adapter.install()`, the step that imports the framework — for every way
     in, and without importing anything of the host's. An adapter with no
     registration row (every test double) has no framework to probe and is
@@ -185,10 +188,10 @@ def _framework_present(name: str, *, explicit: bool, debug: bool) -> bool:
         # No registration row (a test double), or a CLI framework: there is no
         # module to import here and so nothing to shadow — the adapter decides
         # per spawn whether a process is its CLI.
-        return True
+        return None
     verdict = probe(row.distribution, row.detect, where=f"adapters.{name}")
     if verdict.outcome == "present":
-        return True
+        return None
     if verdict.outcome == "shadowed":
         report_once(
             f"{name} adapter: the module '{row.detect}' resolved to {verdict.found}, "
@@ -197,7 +200,7 @@ def _framework_present(name: str, *, explicit: bool, debug: bool) -> bool:
             key=f"adapters.{name}.shadowed",
         )
         counters.bump(f"adapters.{name}.shadowed")
-        return False
+        return AdapterState.SHADOWED
     if explicit and _detect_package(row.detect):
         report_once(
             f"{name} adapter: the module '{row.detect}' was found without package "
@@ -206,11 +209,136 @@ def _framework_present(name: str, *, explicit: bool, debug: bool) -> bool:
             key=f"adapters.{name}.distribution_absent_explicit",
         )
         counters.bump(f"adapters.{name}.distribution_absent_explicit")
-        return True
+        return None
     counters.bump(f"adapters.{name}.distribution_absent")
     if debug:
         diag_info(f"{name} adapter: distribution {row.distribution} not installed")
-    return False
+    return AdapterState.ABSENT
+
+
+#: Each distribution an adapter's table entry names, with its installed version
+#: (None when it is not installed).
+_Found = tuple[tuple[Measured, str | None], ...]
+
+
+def _framework_versions(name: str) -> _Found:
+    """The installed version of every distribution the adapter called `name`
+    was measured against, read from package metadata — nothing is imported.
+    Empty for an adapter with no table entry (a test double, or a CLI)."""
+    member = next((m for m in MEASURED if m.value == name), None)
+    entries = MEASURED[member] if member is not None else ()
+    return tuple((entry, installed_version(entry.distribution)) for entry in entries)
+
+
+def _status(name: str, state: AdapterState, found: _Found, detail: str = "") -> AdapterStatus:
+    """`name`'s status in `state`. Measured-ness is judged only for an adapter
+    whose framework is here and was tried — installed, unsupported or failed —
+    and only from versions that could be read."""
+    if not found:
+        return AdapterStatus(name, state, detail=detail)
+    primary, version = found[0]
+    tried = state in (AdapterState.INSTALLED, AdapterState.UNSUPPORTED, AdapterState.FAILED)
+    readable = [(entry, v) for entry, v in found if v is not None]
+    measured = all(is_measured(entry, v) for entry, v in readable) if tried and readable else None
+    ranges = tuple(f"{minor}.x" for minor in primary.minors)
+    return AdapterStatus(name, state, primary.distribution, version, measured, ranges, detail)
+
+
+def _versions_said(found: _Found) -> str:
+    """ "langgraph 1.2.10, langgraph-prebuilt 1.1.0": what was found, unknowns included."""
+    return ", ".join(f"{entry.distribution} {v or '(version unknown)'}" for entry, v in found)
+
+
+def _say(name: str, key: str, line: str, *, count: bool = True) -> str:
+    """One `[wardex]` line per adapter per kind, counted under `key`, and kept
+    as the status's `detail` so it is readable after stderr has scrolled."""
+    report_once(line, key=f"adapters.{name}.{key}")
+    if count:
+        counters.bump(f"adapters.{name}.{key}")
+    return line
+
+
+def _installed_status(name: str) -> AdapterStatus:
+    """An adapter that installed. Says so once when a framework version it
+    depends on is outside what this release was tested against: it stays
+    installed — most of what it records is still right — but the reader of
+    its tree has to know the tree may be wrong somewhere."""
+    found = _framework_versions(name)
+    off = [(entry, v) for entry, v in found if v is not None and not is_measured(entry, v)]
+    if not off:
+        return _status(name, AdapterState.INSTALLED, found)
+    what = ", ".join(f"{entry.distribution} {v} (tested: {spelled(entry)})" for entry, v in off)
+    pins = ", ".join(
+        f"{entry.distribution} to a tested release ({spelled(entry)})" for entry, _ in off
+    )
+    line = _say(
+        name,
+        "unmeasured_version",
+        f"{name} adapter: this wardex release was not tested against {what}. The "
+        "adapter is installed and recording, but parts of what it records may be wrong. "
+        f"Pin {pins} for a tested setup, or upgrade wardex-sdk",
+    )
+    return _status(name, AdapterState.INSTALLED, found, line)
+
+
+def _not_installed(
+    name: str, state: AdapterState, key: str, line: str, found: _Found, *, count: bool = True
+) -> AdapterStatus:
+    """THE one place an adapter whose framework is here is filed as not
+    installed — `UNSUPPORTED` or `FAILED` — so whatever else has to know that
+    a whole framework's spans are missing is told from here and nowhere else."""
+    return _status(name, state, found, _say(name, key, line, count=count))
+
+
+def _unsupported_status(name: str) -> AdapterStatus:
+    """An adapter whose `install()` returned without installing: its framework
+    is here, and its surface is not the one the adapter was written for."""
+    found = _framework_versions(name)
+    status = _status(name, AdapterState.UNSUPPORTED, found)
+    seen = _versions_said(found) or "its framework"
+    if status.measured is False:
+        off = [entry for entry, v in found if v is not None and not is_measured(entry, v)]
+        pins = ", ".join(
+            f"{entry.distribution} to a tested release ({spelled(entry)})" for entry in off
+        )
+        then = f"Pin {pins}, or upgrade wardex-sdk"
+    else:
+        # A version the release WAS tested on, or one that could not be read:
+        # the surface should have been there, so the installation itself is
+        # suspect — not something a version pin fixes.
+        then = "Reinstall the framework; if this persists, report it with the debug=True output"
+    return _not_installed(
+        name,
+        AdapterState.UNSUPPORTED,
+        "unsupported",
+        f"{name} adapter: found {seen}, but not the surface this wardex release was "
+        f"written for, so the adapter did not install and its spans will be absent. {then}",
+        found,
+    )
+
+
+def _failed_status(name: str) -> AdapterStatus:
+    """An adapter that raised while it was being built or installed.
+
+    The registry attempts the rollback, but an adapter whose patches live
+    outside `ctx.patches` undoes them only through its own `uninstall()`, so
+    the line says what is known — the adapter did not finish installing — and
+    does not promise that nothing of it is left behind.
+    """
+    found = _framework_versions(name)
+    seen = f" ({_versions_said(found)})" if found else ""
+    return _not_installed(
+        name,
+        AdapterState.FAILED,
+        "install_failed",
+        f"{name} adapter: an error was raised while installing it{seen}, so it did not "
+        "finish installing and its spans may be missing. Re-run with debug=True to see "
+        "the traceback",
+        found,
+        # Not counted again: the guard the error passed through already counted
+        # it, under `adapters.<name>.install` or `adapters.<name>.load`.
+        count=False,
+    )
 
 
 def _make_adapter(name: AdapterName) -> AdapterInterface | None:
@@ -265,11 +393,23 @@ def install_configured_adapters(client: Client | None, config: WardexConfig) -> 
                         f"{name.value} options set but the adapter is not installed (not detected)"
                     )
     explicit = config.adapters.enabled is not None
+    registry = get_registry()
     for name in wanted:
-        try:
+        # A broken adapter must not break init(). Guarded rather than caught, so
+        # the failure is counted under `adapters.<name>.load` and its traceback
+        # prints under debug, and said once as that adapter's failure line.
+        loaded = False
+        with guard(f"adapters.{name.value}.load", debug=bool(config.debug)):
             adapter = _make_adapter(name)
             if adapter is not None:
-                get_registry().install(adapter, client, explicit=explicit)
-        except Exception as exc:  # noqa: BLE001 — a broken adapter must not break init()
-            diag_warning(f"adapter {name.value} failed to load ({exc})")
-            continue
+                registry.install(adapter, client, explicit=explicit)
+            loaded = True
+        if not loaded:
+            registry.record(_failed_status(name.value))
+    # Every adapter this release ships gets a status, so `wardex.diagnostics()`
+    # answers for the ones that were never tried as well: left out by `enabled=`,
+    # or not detected.
+    for member in _ADAPTERS:
+        if member not in wanted:
+            state = AdapterState.DISABLED if explicit else AdapterState.ABSENT
+            registry.record(_status(member.value, state, _framework_versions(member.value)))

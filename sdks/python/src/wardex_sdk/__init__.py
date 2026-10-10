@@ -30,8 +30,10 @@ from ._config import (
 )
 from ._config import _resolve_config as _resolve_config_from_env
 from ._config import region_of_key as _region_of_key
+from ._diagnostics import AdapterStatus, Diagnostics
 from ._enums import (
     AdapterName,
+    AdapterState,
     AgentType,
     CaptureMode,
     InterceptorName,
@@ -106,6 +108,7 @@ __all__ = [
     "new_scope",
     "flush",
     "close",
+    "diagnostics",
     "bind_context",
     "continue_trace",
     "continue_from_otel",
@@ -125,6 +128,7 @@ __all__ = [
     "WardexConfigWarning",
     # Enums — importable directly from user code
     "AdapterName",
+    "AdapterState",
     "AgentType",
     "CaptureMode",
     "InterceptorName",
@@ -139,6 +143,8 @@ __all__ = [
     "ToolExecutionType",
     "ToolType",
     # Types
+    "AdapterStatus",
+    "Diagnostics",
     "Span",
     "UserInfo",
     "Scope",
@@ -544,6 +550,25 @@ def close(timeout: float | None = None) -> None:
     # each other's state, so `close()` dropped the propagation patches and the
     # atexit path did not.
     _runtime.runtime().teardown(timeout=timeout)
+
+
+def diagnostics() -> Diagnostics:
+    """wardex's own account of this process: what each adapter is doing.
+
+    One entry per adapter this release ships, with its state and, where it
+    found its framework, the installed version and whether this release was
+    tested against it. An adapter that is installed on an untested version is
+    `INSTALLED` with `measured=False`; one whose framework is here but whose
+    surface it did not recognize is `UNSUPPORTED`. The line wardex printed
+    about an adapter, if any, is its `detail`.
+
+    Reads state and changes none, so it is safe to call at any time and from
+    any thread. Before `init()`, after `close()`, and when the native
+    extension is unavailable, `initialized` is False and there are no adapters
+    to describe.
+    """
+    live, adapters = _runtime.runtime().describe()
+    return Diagnostics(initialized=live, adapters=adapters)
 
 
 # Root-namespace hygiene: the stdlib names above are imported under

@@ -61,6 +61,23 @@ class AdapterName(Enum):
     OPENAI_AGENTS = "openai_agents"
 
 
+class AdapterState(Enum):
+    """What one adapter is doing in this process, as `wardex.diagnostics()` reports it.
+
+    Closed, and each member is a different thing to do next. `ABSENT` and
+    `DISABLED` are nothing to look at; `UNSUPPORTED`, `FAILED` and `SHADOWED`
+    mean the framework is here and its spans are not, which is the case that
+    used to read as installed.
+    """
+
+    INSTALLED = "installed"
+    UNSUPPORTED = "unsupported"  # the framework is here; its surface is not one this wardex knows
+    FAILED = "failed"  # the adapter raised while installing
+    SHADOWED = "shadowed"  # a local package answers the framework's import name
+    ABSENT = "absent"  # the framework is not installed
+    DISABLED = "disabled"  # `AdaptersConfig(enabled=...)` leaves it out
+
+
 class InterceptorName(Enum):
     """The interceptors that EXIST, each named by what it calls itself.
 

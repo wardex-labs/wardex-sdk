@@ -92,6 +92,7 @@ _STEPS = (
     "close",
     "init_intercept",
     "close_again",
+    "diagnostics",
     # Last, and deliberately so: the two scope steps import internal packages,
     # and a package whose import fails half way leaves whatever it already
     # bound in `sys.modules`. Running them after the checklist means nothing
@@ -376,6 +377,14 @@ def _submodules_that_still_raise():
         )
 
 
+def _diagnostics():
+    # Degraded `init()` installs nothing, so there is nothing to describe —
+    # and answering must not build the adapter registry, whose package reaches
+    # the extension.
+    got = wardex_sdk.diagnostics()
+    assert (got.initialized, got.adapters) == (False, ()), got
+
+
 STEPS = [
     ("limits_ctor", lambda: LimitsConfig(max_headers=4)),
     ("config_groups_ctor", _config_groups_ctor),
@@ -411,6 +420,7 @@ STEPS = [
     ("close", lambda: wardex_sdk.close()),
     ("init_intercept", lambda: wardex_sdk.init(intercept=True)),
     ("close_again", lambda: wardex_sdk.close()),
+    ("diagnostics", _diagnostics),
     ("submodules_that_degrade", _submodules_that_degrade),
     ("submodules_that_still_raise", _submodules_that_still_raise),
 ]
@@ -566,6 +576,7 @@ _DRIVEN = frozenset(
         "ConsoleTransport",
         "OtlpHttpTransport",
         "WardexTransport",
+        "diagnostics",
     }
 )
 
@@ -593,10 +604,13 @@ def test_the_degraded_checklist_covers_the_whole_public_surface():
     # three concrete transports above implement, a warning category, and the
     # plain types the tracing surface is typed with (attribute blocks, tool
     # definitions, the scope object, and `Span` — the type the CMs yield, which
-    # the `conversation`/`span` steps above already drive).
+    # the `conversation`/`span` steps above already drive), and the two records
+    # `diagnostics()` returns, which the `diagnostics` step drives.
     inert = {
         "__version__",
         "Transport",
+        "AdapterStatus",
+        "Diagnostics",
         "AgentAttributes",
         "BeforeSendEnvelopeCallback",
         "Span",
