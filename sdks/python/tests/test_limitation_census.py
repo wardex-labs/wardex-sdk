@@ -266,6 +266,10 @@ _MEMBER_SITES: dict[str, frozenset[str]] = {
     "REASSEMBLED_FROM_STREAM": frozenset({"_interceptors/_seam.py"}),
     "STREAM_USAGE_UNAVAILABLE": frozenset({"_interceptors/_seam.py"}),
     "SSE_UNKNOWN_PROVIDER": frozenset({"_interceptors/_seam.py"}),
+    # Decided in `_semantics/_genai.py::stream_limitation` off the native
+    # reassemblers' `stream_events_unparsed`; the seam forwards it through
+    # `parse_limitations`, the same hole PROVIDER_INFERRED uses.
+    "SSE_EVENT_UNPARSED": frozenset({"_semantics/_genai.py"}),
     # --- protocol-specific ---
     "GRPC_WEB_UNSUPPORTED": frozenset({"_interceptors/_seam.py"}),
     "GRPC_STATUS_UNAVAILABLE": frozenset({"_semantics/_grpc.py"}),
@@ -747,6 +751,11 @@ _EMITTED_MEMBERS: frozenset[str] = frozenset(
         # emitter (the Codex adapter, on the run's root and on the one chat its
         # --json stream supports). Before it, a `codex exec` produced no span.
         "SUBPROCESS_MODEL_CALLS_UNOBSERVED",
+        # The twenty-sixth: a stream event no reassembler could read, minted
+        # WITH its emitter (`stream_limitation`, fed by the native parser's
+        # `stream_events_unparsed`). Before it, a chunk that was not JSON was
+        # skipped with no trace, its text or finish or error simply absent.
+        "SSE_EVENT_UNPARSED",
         # Declared long before an emitter: its first is the Codex adapter,
         # whose payloads are the host's stdin and stdout, not wire bytes.
         "NO_WIRE_EVIDENCE",
@@ -1758,10 +1767,16 @@ _VOCABULARY: dict[str, str] = {
     #     kept apart from TRANSPORT_TIMING_UNAVAILABLE_SUBPROCESS (that one is
     #     about a call's timing; this one says the calls were never seen) ---
     "SUBPROCESS_MODEL_CALLS_UNOBSERVED": "subprocess_model_calls_unobserved",
+    # --- added after the census, by the LLM stream reassemblers (1): an event
+    #     whose data was not JSON was skipped, so what it carried may be
+    #     missing — kept apart from SEMANTIC_PARSE_FAILED (the rest of the
+    #     stream was read; the span has gen_ai truth) and from
+    #     SSE_UNKNOWN_PROVIDER (a reassembler did recognize the stream) ---
+    "SSE_EVENT_UNPARSED": "sse_event_unparsed",
 }
 
 
-def test_the_vocabulary_is_exactly_these_fifty_five() -> None:
+def test_the_vocabulary_is_exactly_these_fifty_six() -> None:
     """15 declared before the census + 21 from it + 1 from §5.4 + 1 for wardex
     itself + 1 for the OTLP size guard + 1 for the registry breadth bound
     + 2 for the OTel bridge's fail-open pair + 1 for the adapter's per-session
@@ -1771,7 +1786,8 @@ def test_the_vocabulary_is_exactly_these_fifty_five() -> None:
     + 1 for the unresolved peer address + 1 for the alias bound's forgotten
     id + 1 for the OTel bridge's tolerant chat join + 1 for the h2 stream
     table's evicted request half + 1 for the inferred provider label + 1 for
-    a CLI agent's unobserved model calls, name by name.
+    a CLI agent's unobserved model calls + 1 for a stream event no
+    reassembler could read, name by name.
 
     A count alone is not enough: a RENAME keeps the count and is the single most
     expensive mistake available here. These are proto enum values in

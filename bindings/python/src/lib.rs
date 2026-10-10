@@ -399,6 +399,12 @@ impl LlmSemantics {
     fn stream_terminated(&self) -> Option<bool> {
         self.inner.stream_terminated
     }
+    /// SSE only (0 otherwise): events the reassembler skipped because their
+    /// data was not JSON. Not 0 marks the span: what they carried is missing.
+    #[getter]
+    fn stream_events_unparsed(&self) -> u32 {
+        self.inner.stream_events_unparsed
+    }
     /// The provider's classification of a failure it declared inside a
     /// response (an in-stream `error` event, a `failed` Responses status): its
     /// `code`, else its `type`, else "" (declared, unclassified). None when no

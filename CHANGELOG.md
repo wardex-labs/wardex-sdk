@@ -371,6 +371,25 @@ All notable changes to this project are documented here. The format follows
   stream's only event, and for a 200 body whose status is `failed`. A
   `cancelled` response is not a failure and stays OK, as do completed and
   incomplete ones.
+- **A stream chunk holding a number too large for a 64-bit float is no longer
+  dropped, and a chunk wardex cannot read is now marked.** A number such as
+  `1e400` or `-1e400` (a token's `logprob`, a stray field) made the whole
+  chunk unreadable to the Rust parser, so its text, its finish reason or its
+  error vanished from the span without a trace: one Chat Completions chunk
+  lost its words while the answer still read as finished, an `error` chunk
+  holding one left the failure unreported, and in a Responses stream the final
+  snapshot, and with it the whole answer, was lost. Python's `json`, which the
+  openai and anthropic SDKs read the stream with, takes such a number as
+  infinity and reads the chunk, so your code saw what wardex did not. Now the
+  chunk is read, with the number kept as the text the provider sent
+  (`"-1e400"`) rather than a number nobody sent, in Chat Completions,
+  Anthropic Messages and Responses streams alike, and on a gateway path where
+  the stream's shape picks the parser. A chunk that is still not JSON (cut
+  short, or not JSON at all) is skipped as before, but the span now carries
+  the new `sse_event_unparsed` limitation and the
+  `protocol.semantic.sse_event_unparsed` counter moves, so a missing piece of
+  the answer is never silent. The `[DONE]` marker that ends an OpenAI stream
+  is not counted.
 - **A secret that follows a line break inside a JSON string is masked
   again, under its real name.** A log or a tool result your agent sends to
   a model travels as a JSON string, so its line breaks are written `\n` and

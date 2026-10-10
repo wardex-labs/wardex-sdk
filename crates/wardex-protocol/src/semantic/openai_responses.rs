@@ -12,6 +12,7 @@
 //! name the failure — and is preserved into the synthetic body rather than
 //! dropped.
 
+use super::event_json::{is_done_marker, parse_event};
 use super::parts::*;
 use super::usage::{flatten_usage, UsageBounds, UsageView};
 use super::LlmSemantics;
@@ -618,11 +619,14 @@ pub(super) fn reassemble_responses(events: &[SseEvent]) -> Reassembled {
     let mut refusal_deltas: BTreeMap<(String, i64), String> = BTreeMap::new();
     let mut args_deltas: BTreeMap<String, String> = BTreeMap::new();
     let mut summary_deltas: BTreeMap<(String, i64), String> = BTreeMap::new();
+    // Events whose data is not JSON: skipped, and counted so the span says so.
+    // An OpenAI-style `[DONE]` from a gateway carries nothing and is not one.
+    let mut unparsed: u32 = 0;
 
     for ev in events {
-        let v: serde_json::Value = match serde_json::from_str(&ev.data) {
-            Ok(v) => v,
-            Err(_) => continue,
+        let Some(v) = parse_event(&ev.data) else {
+            unparsed = unparsed.saturating_add(u32::from(!is_done_marker(&ev.data)));
+            continue;
         };
         let ty = ev
             .event
@@ -722,6 +726,7 @@ pub(super) fn reassemble_responses(events: &[SseEvent]) -> Reassembled {
         return Reassembled {
             body: serde_json::to_vec(&snapshot).unwrap_or_default(),
             terminated: true,
+            unparsed,
         };
     }
 
@@ -814,6 +819,7 @@ pub(super) fn reassemble_responses(events: &[SseEvent]) -> Reassembled {
     Reassembled {
         body: serde_json::to_vec(&body).unwrap_or_default(),
         terminated,
+        unparsed,
     }
 }
 

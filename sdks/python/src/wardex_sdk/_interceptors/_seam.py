@@ -48,8 +48,8 @@ from .._semantics import (
     embeddings_attrs,
     has_core_semantics,
     identifies_llm_call,
+    parse_limitations,
     provider_extras,
-    provider_limitation,
     ws_close_name,
 )
 from .._suppress import is_suppressed
@@ -1044,8 +1044,8 @@ def _assemble(p: _PendingTxn, *, parse: bool, extra: tuple[Limitation, ...]) -> 
                     status_code, error_type = StatusCode.ERROR, declared  # failed in-stream
                 known = txn.issuer_proven and not txn.parent_closed  # closed: refused at the edge
                 apply_request_conversation(draft, edge.conversation, sem.conversation_id, known)
-                if (limitation := provider_limitation(sem)) is not None:
-                    draft.add_limitation(limitation)  # the label above is a guess
+                for limitation in parse_limitations(sem):  # a guessed label, an unread event
+                    draft.add_limitation(limitation)
                 # The open half rides only on an IDENTIFIED span: the `openai.*` scalars, the
                 # provider-usage mirror, and — when the key-count bound dropped leaves — the
                 # marker, the count and the diagnostics bump as ONE fact. An unidentified span

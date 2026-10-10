@@ -45,7 +45,7 @@ import pytest
 
 import wardex_sdk as wardex
 from conftest import llm_fixture
-from wardex_sdk._assembly import Limitation
+from wardex_sdk._assembly import Limitation, counters
 from wardex_sdk._enums import CaptureMode, StatusCode
 from wardex_sdk.testing import RecordingTransport
 
@@ -710,6 +710,61 @@ def test_a_responses_stream_that_fails_midway_fails_the_chat_span(ending):
     assert span.gen_ai.finish_reasons == finishes
     assert span.gen_ai.request_model == "gpt-4.1"
     assert Limitation.FRAME_PARSE_FAILED not in _markers(span)
+
+
+#: A Chat Completions stream whose middle chunk is replaced per case.
+_CHAT_FIRST = {
+    "id": "c1",
+    "model": "gpt-4o",
+    "choices": [{"index": 0, "delta": {"content": "Hel"}}],
+}
+_CHAT_LAST = {
+    "id": "c1",
+    "model": "gpt-4o",
+    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+}
+#: (middle chunk's data, text the span keeps, whether a chunk was skipped)
+CHAT_MIDDLE_CHUNKS = {
+    "ordinary": (
+        b'{"id":"c1","model":"gpt-4o","choices":[{"index":0,"delta":{"content":"lo"}}]}',
+        "Hello",
+        False,
+    ),
+    # A number past f64's range, in a field nothing reads: Python's json reads it as an infinity,
+    # so the chunk is ordinary to the openai SDK, and its text must survive here too.
+    "out-of-range-number": (
+        b'{"id":"c1","model":"gpt-4o","choices":[{"index":0,"delta":{"content":"lo"},'
+        b'"logprobs":{"content":[{"token":"lo","logprob":-1e400}]}}]}',
+        "Hello",
+        False,
+    ),
+    # Not JSON at all: skipped, and the span says so instead of shipping "Hel" as the answer.
+    "not-json": (b'{"id":"c1","model":"gpt-4o","choices":[{"delta":{"content":"lo', "Hel", True),
+}
+
+
+@pytest.mark.usefixtures("fresh_counters")
+@pytest.mark.parametrize("middle", sorted(CHAT_MIDDLE_CHUNKS))
+def test_a_stream_chunk_wardex_cannot_read_is_marked_not_dropped(middle):
+    """A chunk is never lost without a trace. One holding a number outside f64's range is read
+    (the number as its own spelling), so its text is on the span; one that is not JSON is skipped,
+    and the span carries SSE_EVENT_UNPARSED and the count moves. An ordinary stream carries
+    neither."""
+    data, text, skipped = CHAT_MIDDLE_CHUNKS[middle]
+    stream = b"".join(
+        b"data: " + chunk + b"\n\n"
+        for chunk in (json.dumps(_CHAT_FIRST).encode(), data, json.dumps(_CHAT_LAST).encode())
+    )
+    stream += b"data: [DONE]\n\n"
+    port = _serve_once(SSE_HEAD + f"Content-Length: {len(stream)}\r\n\r\n".encode() + stream)
+
+    span = _one_chat_span(_captured(lambda: _post(port, "/v1/chat/completions", CHAT_REQUEST)))
+
+    assert span.status is StatusCode.OK
+    assert span.gen_ai.finish_reasons == ("stop",)
+    assert json.loads(span.output_data)["choices"][0]["message"]["content"] == text
+    assert (Limitation.SSE_EVENT_UNPARSED in _markers(span)) is skipped
+    assert counters.get("protocol.semantic.sse_event_unparsed") == int(skipped)
 
 
 def _post_tls(port: int, server_name: str, path: str, body: bytes) -> None:

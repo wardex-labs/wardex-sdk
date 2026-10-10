@@ -6,6 +6,7 @@ use std::io::Read;
 
 mod anthropic;
 pub mod endpoint;
+mod event_json;
 mod openai_chat;
 mod openai_embeddings;
 mod openai_responses;
@@ -110,6 +111,14 @@ pub struct LlmSemantics {
     /// SSE only (None otherwise): whether the stream carried its provider's
     /// terminal event. `Some(false)` feeds a diagnostics counter, not a marker.
     pub stream_terminated: Option<bool>,
+    /// SSE only (0 otherwise): events a reassembler skipped because their
+    /// data was not JSON, even with an out-of-range number read as its own
+    /// spelling (`semantic/event_json.rs`) — cut short, or not JSON at all.
+    /// The stream's end marker `[DONE]` is not one. The reassembled body may
+    /// lack whatever such an event carried (a Responses terminal snapshot
+    /// repeats the deltas, nothing repeats a lost Chat chunk), so the seam
+    /// marks the span when this is not 0.
+    pub stream_events_unparsed: u32,
     /// The provider declared a failure INSIDE a response — the in-stream
     /// `error` event of a Chat, Anthropic or Responses stream, whose error
     /// object the reassembler keeps in the synthetic body, or a Responses
@@ -245,6 +254,7 @@ fn sse_semantics(
         api_type: endpoint.api_type,
         reassembled_from_stream: true,
         stream_terminated: Some(reassembled.terminated),
+        stream_events_unparsed: reassembled.unparsed,
         decoded_response: Some(reassembled.body),
         ..Default::default()
     }
