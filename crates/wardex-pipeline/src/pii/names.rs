@@ -183,10 +183,11 @@ impl NameRules {
     pub fn scan(&self, text: &str, hits: &mut Vec<NameHit>) {
         self.scan_multipart(text, hits);
         let b = text.as_bytes();
+        let mut quotes = Quotes::default();
         let mut i = 0;
         while i < b.len() {
             let resume = match b[i] {
-                b'=' => self.scan_form(text, i, hits),
+                b'=' => self.scan_form(text, i, quotes.inside_at(b, i), hits),
                 b':' => self.scan_json(text, i, hits),
                 _ => None,
             };
@@ -198,8 +199,15 @@ impl NameRules {
     }
 
     /// `name=value`. Returns where scanning resumes when a value was
-    /// replaced.
-    fn scan_form(&self, text: &str, eq: usize, hits: &mut Vec<NameHit>) -> Option<usize> {
+    /// replaced. `quoted` says whether the `=` sits inside a double-quoted
+    /// string.
+    fn scan_form(
+        &self,
+        text: &str,
+        eq: usize,
+        quoted: bool,
+        hits: &mut Vec<NameHit>,
+    ) -> Option<usize> {
         let b = text.as_bytes();
         let mut start = eq;
         while start > 0 && is_form_name_byte(b[start - 1]) {
@@ -211,7 +219,7 @@ impl NameRules {
         if start == eq {
             return None;
         }
-        let (name, rule) = self.judge_form_name(text, start, eq);
+        let (name, rule) = self.judge_form_name(text, start, eq, quoted);
         // A secret's value runs to a terminator. An ordinary value is only
         // read for `%` escapes, so it also stops at the next `=` — a raw `=`
         // is never inside an encoded value, and stopping there keeps a long
@@ -253,26 +261,34 @@ impl NameRules {
     /// A name read back to a backslash may begin with the letter of a JSON
     /// escape. Inside a JSON string, `log\npassword=x` is a newline and then
     /// `password`; read as written, the name is `npassword`, which names
-    /// nothing, and the value shipped. Whether a text is the body of a JSON
-    /// string or plain text holding a backslash (`C:\token=x`) is nothing
-    /// the scanner can tell, so both readings are judged and the value is a
-    /// secret when either one names a secret. The name recorded is the
-    /// reading without the escape when that reading is the secret, since
-    /// escaped text is what agent traffic mostly carries.
+    /// nothing, and the value shipped. Whether the backslash is an escape or
+    /// a literal one (`C:\token=x`) the bytes cannot always say, so both
+    /// readings are judged and the value is a secret when either one names
+    /// a secret. Which name is recorded when both do is `reads_as_escape`'s
+    /// call.
     fn judge_form_name<'t>(
         &self,
         text: &'t str,
         start: usize,
         eq: usize,
+        quoted: bool,
     ) -> (&'t str, Option<Rule>) {
-        if let Some(after) = json_escape_end(text.as_bytes(), start, eq) {
-            let unescaped = &text[after..eq];
-            if let Some(rule) = self.judge(unescaped, Shape::UrlForm) {
-                return (unescaped, Some(rule));
-            }
-        }
+        let b = text.as_bytes();
         let as_written = &text[start..eq];
-        (as_written, self.judge(as_written, Shape::UrlForm))
+        let Some(after) = json_escape_end(b, start, eq) else {
+            return (as_written, self.judge(as_written, Shape::UrlForm));
+        };
+        let unescaped = &text[after..eq];
+        let Some(rule) = self.judge(unescaped, Shape::UrlForm) else {
+            return (as_written, self.judge(as_written, Shape::UrlForm));
+        };
+        if reads_as_escape(b, start, after, quoted) {
+            return (unescaped, Some(rule));
+        }
+        match self.judge(as_written, Shape::UrlForm) {
+            Some(written) => (as_written, Some(written)),
+            None => (unescaped, Some(rule)),
+        }
     }
 
     /// Scan the percent-decoded form of `text[start..end]` and map each hit
@@ -629,6 +645,52 @@ fn json_escape_end(b: &[u8], start: usize, end: usize) -> Option<usize> {
     (after < end).then_some(after)
 }
 
+/// Which reading names a value that is a secret both with and without the
+/// JSON escape in front of its name, `start..after` being the escape's tail.
+/// The escape wins when it cannot be the start of a word: `\uXXXX`, or a
+/// letter followed by something other than a lowercase letter or a digit
+/// (`\nGITHUB_TOKEN`, where `nGITHUB` is no word). Otherwise the letter may
+/// as well begin the name (`C:\backup_key`, `path\new_api_key`), and only a
+/// double-quoted string says it is an escape, as JSON writes one: always
+/// after an odd run of backslashes, and after an even run (a literal
+/// backslash at this depth, an escape one JSON string further in) only for
+/// `\n \t \r`, since a backspace or a form feed in a nested string is far
+/// rarer than a path segment starting with `b` or `f`.
+fn reads_as_escape(b: &[u8], start: usize, after: usize, quoted: bool) -> bool {
+    if after - start == 5 || !(b[after].is_ascii_lowercase() || b[after].is_ascii_digit()) {
+        return true;
+    }
+    quoted && (backslashes_before(b, start) % 2 == 1 || !matches!(b[start], b'b' | b'f'))
+}
+
+/// Whether a position sits inside a double-quoted string, read left to right
+/// the way JSON reads one: an unescaped `"` opens or closes it, a backslash
+/// inside it escapes the byte after it, and a raw line break closes it, since
+/// a JSON string never holds one (a stray quote in plain text then reaches no
+/// further than its line).
+#[derive(Default)]
+struct Quotes {
+    at: usize,
+    inside: bool,
+}
+
+impl Quotes {
+    /// The state at `to`; positions are asked for in increasing order, so the
+    /// whole text is read once.
+    fn inside_at(&mut self, b: &[u8], to: usize) -> bool {
+        while self.at < to {
+            match b[self.at] {
+                b'\\' if self.inside => self.at += 1,
+                b'"' => self.inside = !self.inside,
+                b'\n' => self.inside = false,
+                _ => {}
+            }
+            self.at += 1;
+        }
+        self.inside
+    }
+}
+
 /// Bytes a `name=` may be made of. Anything else ends the name scanning
 /// backwards, which is also what rejects `a != b` and `x == y`.
 fn is_form_name_byte(c: u8) -> bool {
@@ -869,6 +931,34 @@ mod tests {
     }
 
     #[test]
+    fn a_name_that_is_a_secret_either_way_is_named_by_the_escape_when_it_is_one() {
+        for (text, name) in [
+            // A letter on its own before a capital or a separator is no
+            // word's start, quoted or not.
+            (r"log\nGITHUB_TOKEN=D1", "GITHUB_TOKEN"),
+            (r"log\n_api_key=D2", "_api_key"),
+            (r"caf\u00e9api_key=D3", "api_key"),
+            // Inside a double-quoted string an odd run of backslashes is an
+            // escape, whatever its letter.
+            (r#"{"log": "a\napi_key=D4"}"#, "api_key"),
+            (r#"{"log": "a\tsecret_key=D5"}"#, "secret_key"),
+            (r#"{"log": "a\backup_key=D6"}"#, "ackup_key"),
+            // An even run is a newline one JSON string further in (a tool
+            // call's `arguments`), but a `b` or `f` after it is a path.
+            (
+                r#"{"arguments": "{\"log\": \"a\\napi_key=D7\"}"}"#,
+                "api_key",
+            ),
+            (r#"{"path": "C:\\backup_key=D8"}"#, "backup_key"),
+        ] {
+            let mut hits = Vec::new();
+            rules().scan(text, &mut hits);
+            assert_eq!(hits.len(), 1, "{text}");
+            assert_eq!(hits[0].name, name, "{text}");
+        }
+    }
+
+    #[test]
     fn a_backslash_in_plain_text_keeps_the_name_as_written() {
         // `\t` would begin `\token`, but `oken` names nothing and `token`
         // does: the name as written is the one judged and recorded.
@@ -880,6 +970,26 @@ mod tests {
         // Either reading being a secret is enough: plain or escaped, the
         // scanner cannot tell which one this is.
         assert_eq!(mask(r"C:\npassword=P1"), r"C:\npassword=[SECRET]");
+        // A secret either way: outside a double-quoted string a letter that
+        // runs on into a lowercase word begins the name, so the name as
+        // written is the one recorded.
+        for (text, name) in [
+            (r"path\bot_token=C6", "bot_token"),
+            (r"C:\backup_key=C9", "backup_key"),
+            (r"path\new_api_key=C7", "new_api_key"),
+            (r"path\tapi_token=C8", "tapi_token"),
+            (r"C:\tmpGITHUB_TOKEN=C10", "tmpGITHUB_TOKEN"),
+            (r"C:\temp\fix_token=C11", "fix_token"),
+            // A stray quote reaches no further than its line.
+            ("he said \"hi\nC:\\new_api_key=C12", "new_api_key"),
+            // Not JSON: a single-quoted repr says nothing either way.
+            (r"'log\napi_key=C13'", "napi_key"),
+        ] {
+            let mut hits = Vec::new();
+            rules().scan(text, &mut hits);
+            assert_eq!(hits.len(), 1, "{text}");
+            assert_eq!(hits[0].name, name, "{text}");
+        }
         // Neither reading names a secret.
         for text in [
             r#""a\nkeyword=v""#,
@@ -1000,6 +1110,8 @@ mod tests {
             "x_api_key_v2=S1",
             "<password>S1</password>",
             r#"{"api\u005fkey": "S1"}"#,
+            r"pass\u0077ord=S1",
+            r"\u0070assword=S1",
             r#"{"code": "4/0AX4XfWh"}"#,
         ] {
             let mut hits = Vec::new();
