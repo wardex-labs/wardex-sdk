@@ -562,10 +562,10 @@ class _WebSocketTracker:
         # them rather than whichever one happened to open it.
         self._conversation = conversation
         # The handshake's identity, kept by the same rule as the conversation: only while every
-        # message the client sends is issued under it too (`same_issuer`: the same user id and
-        # the handshake's tag values; tags added later do not count). A socket one tenant opened
-        # and another writes to would otherwise ship the second tenant's payload under the first
-        # one's name.
+        # message the client sends is issued under it too (`same_issuer`: every tag and user
+        # field the handshake carried, unchanged; fields added later do not count). A socket one
+        # tenant opened and another writes to would otherwise ship the second tenant's payload
+        # under the first one's name.
         self._scope = scope
         self._start_ns = start_ns
         # None means "use the core default" — resolved here (rather than hardcoded)

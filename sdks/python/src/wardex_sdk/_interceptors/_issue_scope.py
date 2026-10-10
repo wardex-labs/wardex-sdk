@@ -49,14 +49,21 @@ def issued_scope() -> ScopeSnapshot:
     return snapshot
 
 
+#: The `UserInfo` fields the stamp exports (`user.id`, `user.email`, `user.name`, `client.address`).
+_USER_FIELDS = ("id", "email", "username", "ip_address")
+
+
 def same_issuer(first: ScopeSnapshot, later: ScopeSnapshot) -> bool:
     """Was `later` issued under the identity `first` names, for work that ships as ONE span (a
-    WebSocket session)? The same user id, or neither has one, and the same value for every tag
-    `first` carried. A tag added afterwards, or the same user gaining an email, is that identity
-    annotating its own work, not another one; a different user id, a tag the first snapshot had
-    now changed or gone (another tenant's request, or a thread outside every scope) is."""
+    WebSocket session)? Every identity field `first` carried keeps its value: each tag, and each
+    user field (id, email, username, ip address), since any of them alone can be all that tells
+    two tenants apart. A field that appears only later (a tag added afterwards, a user gaining an
+    email or an id) is that identity annotating its own work, not another one; a field `first` had
+    now changed or gone (another tenant's request, a thread outside every scope) is another."""
     tags, user = first
     later_tags, later_user = later
-    if getattr(user, "id", None) != getattr(later_user, "id", None):
-        return False
+    for name in _USER_FIELDS:
+        value = getattr(user, name, None)
+        if value is not None and getattr(later_user, name, None) != value:
+            return False
     return all(later_tags.get(key) == value for key, value in tags.items())
