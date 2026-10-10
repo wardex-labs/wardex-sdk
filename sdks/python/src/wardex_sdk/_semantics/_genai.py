@@ -129,12 +129,12 @@ def provider_limitation(sem: Any) -> Limitation | None:
 def declared_error_type(sem: Any) -> str | None:
     """The `error.type` of a failure the provider declared INSIDE a response, else None.
 
-    The native parser fills `error_type` from an in-stream `error` event (Chat, Anthropic), whose
-    error object it keeps in the reassembled body while `finish_reasons` reads `error`. On a 2xx
-    that is an observed failure, so the seam makes the span ERROR with this type: the provider's
-    own class, or `_OTHER` — OTel's "unclassified" — when the error object named none. An HTTP
-    4xx/5xx keeps its status-code type instead; it is the first failure the wire showed. `getattr`
-    for the same reason as `identifies_llm_call`.
+    The native parser fills `error_type` from an in-stream `error` event (Chat, Anthropic,
+    Responses) or a `failed` Responses status, whose error object it keeps in the reassembled body
+    while `finish_reasons` reads `error`. On a 2xx that is an observed failure, so the seam makes
+    the span ERROR with this type: the provider's own class, or `_OTHER` (OTel's "unclassified")
+    when the error object named none. An HTTP 4xx/5xx keeps its status-code type instead; it is the
+    first failure the wire showed. `getattr` for the same reason as `identifies_llm_call`.
     """
     declared = getattr(sem, "error_type", None)
     if declared is None:

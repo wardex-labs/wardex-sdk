@@ -358,6 +358,19 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- **An OpenAI Responses stream that fails midway now fails its chat span.**
+  A Responses API stream (`responses.create(stream=True)`, the openai-agents
+  default) that started with a 200 and then ended in a `response.failed`
+  event or an `error` event shipped as a success: status OK, though its
+  finish reason already read `error`. The openai SDK hands both events to
+  your code without raising, so the span was the one place the failure
+  could show, and it did not. Now the span's status is ERROR with the
+  provider's own error class as `error.type` (the error's `code`; for the
+  `error` event, whose `type` is only the event's name, the `code` alone),
+  or `_OTHER` when it names none. That holds when the error is the
+  stream's only event, and for a 200 body whose status is `failed`. A
+  `cancelled` response is not a failure and stays OK, as do completed and
+  incomplete ones.
 - **A secret that follows a line break inside a JSON string is masked
   again, under its real name.** A log or a tool result your agent sends to
   a model travels as a JSON string, so its line breaks are written `\n` and

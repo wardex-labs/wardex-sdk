@@ -400,8 +400,9 @@ impl LlmSemantics {
         self.inner.stream_terminated
     }
     /// The provider's classification of a failure it declared inside a
-    /// response (an in-stream `error` event): its `code`, else its `type`,
-    /// else "" (declared, unclassified). None when no such failure arrived.
+    /// response (an in-stream `error` event, a `failed` Responses status): its
+    /// `code`, else its `type`, else "" (declared, unclassified). None when no
+    /// such failure arrived.
     #[getter]
     fn error_type(&self) -> Option<String> {
         self.inner.error_type.clone()

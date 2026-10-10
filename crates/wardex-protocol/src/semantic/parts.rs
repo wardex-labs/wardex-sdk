@@ -244,7 +244,14 @@ pub fn normalize_finish_reason(provider: &str, raw: &str) -> String {
 /// Provider spellings pass through as they are; nothing here is a wardex
 /// vocabulary.
 pub(super) fn declared_error_type(err: &serde_json::Value) -> String {
-    for key in ["code", "type"] {
+    declared_error_class(err, &["code", "type"])
+}
+
+/// [`declared_error_type`] over the given keys, in order: for an error object
+/// whose `type` names something other than a class (the Responses `error`
+/// stream event, where it is the event's own name).
+pub(super) fn declared_error_class(err: &serde_json::Value, keys: &[&str]) -> String {
+    for &key in keys {
         match err.get(key) {
             Some(serde_json::Value::String(s)) if !s.is_empty() => return s.clone(),
             Some(serde_json::Value::Number(n)) => return n.to_string(),

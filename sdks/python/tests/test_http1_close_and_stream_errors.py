@@ -464,6 +464,12 @@ def test_a_proxy_tunnel_ships_the_call_inside_and_no_cut_opening():
             "The server had an error while processing your request.",
         ),
         ("anthropic_messages_sse_error", "/v1/messages", "overloaded_error", "Overloaded"),
+        (
+            "openai_responses_sse_error",
+            "/v1/responses",
+            "server_error",
+            "The model failed to generate a response.",
+        ),
     ],
 )
 def test_a_provider_error_mid_stream_fails_the_chat_span(case, path, error_type, message):
@@ -603,6 +609,106 @@ def test_a_stream_that_is_only_the_providers_error_fails_the_chat_span(provider,
     assert span.gen_ai.response_model is None  # no chunk named one; none is invented
     assert json.loads(span.output_data)["error"]["type"] == error_type
     assert span.capture_integrity.truncated is False
+    assert Limitation.FRAME_PARSE_FAILED not in _markers(span)
+
+
+RESPONSES_REQUEST = json.dumps({"model": "gpt-4.1", "input": "hi", "stream": True}).encode()
+_RESPONSE = {"id": "resp_1", "object": "response", "model": "gpt-4.1-2025-04-14", "output": []}
+
+
+def _responses_event(name: str, **payload) -> bytes:
+    data = json.dumps({"type": name, **payload}).encode()
+    return b"event: " + name.encode() + b"\ndata: " + data + b"\n\n"
+
+
+#: A Responses stream that starts and writes a delta before it ends.
+RESPONSES_HEAD = (
+    _responses_event("response.created", response={**_RESPONSE, "status": "in_progress"})
+    + _responses_event(
+        "response.output_item.added",
+        output_index=0,
+        item={"id": "msg_1", "type": "message", "role": "assistant", "content": []},
+    )
+    + _responses_event(
+        "response.output_text.delta",
+        item_id="msg_1",
+        output_index=0,
+        content_index=0,
+        delta="Starting",
+    )
+)
+#: Each way a Responses stream ends: (stream, status, error.type, finish reasons).
+RESPONSES_STREAMS = {
+    "failed-snapshot": (
+        RESPONSES_HEAD
+        + _responses_event(
+            "response.failed",
+            response={
+                **_RESPONSE,
+                "status": "failed",
+                "error": {"code": "server_error", "message": "The model failed."},
+            },
+        ),
+        StatusCode.ERROR,
+        "server_error",
+        ("error",),
+    ),
+    "error-event": (
+        RESPONSES_HEAD
+        + _responses_event("error", code="rate_limit_exceeded", message="slow down", param=None),
+        StatusCode.ERROR,
+        "rate_limit_exceeded",
+        ("error",),
+    ),
+    "error-event-alone": (
+        _responses_event("error", code=None, message="The model failed.", param=None),
+        StatusCode.ERROR,
+        "_OTHER",
+        ("error",),
+    ),
+    "completed": (
+        RESPONSES_HEAD
+        + _responses_event(
+            "response.completed",
+            response={
+                **_RESPONSE,
+                "status": "completed",
+                "output": [
+                    {
+                        "id": "msg_1",
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [
+                            {"type": "output_text", "text": "Starting.", "annotations": []}
+                        ],
+                    }
+                ],
+                "usage": {"input_tokens": 2, "output_tokens": 2},
+            },
+        ),
+        StatusCode.OK,
+        None,
+        ("stop",),
+    ),
+}
+
+
+@pytest.mark.parametrize("ending", sorted(RESPONSES_STREAMS))
+def test_a_responses_stream_that_fails_midway_fails_the_chat_span(ending):
+    """A Responses stream that starts with a 200 and then fails, in either shape the API ends one
+    with (a `response.failed` snapshot, an `error` event) or before any event named the response,
+    ships ERROR with the provider's class (`_OTHER` when it named none). The openai SDK hands both
+    events to the caller without raising, so the span is where the failure shows. A stream that
+    completes stays OK."""
+    stream, status, error_type, finishes = RESPONSES_STREAMS[ending]
+    port = _serve_once(SSE_HEAD + f"Content-Length: {len(stream)}\r\n\r\n".encode() + stream)
+
+    span = _one_chat_span(_captured(lambda: _post(port, "/v1/responses", RESPONSES_REQUEST)))
+
+    assert span.status is status
+    assert span.error_type == error_type
+    assert span.gen_ai.finish_reasons == finishes
+    assert span.gen_ai.request_model == "gpt-4.1"
     assert Limitation.FRAME_PARSE_FAILED not in _markers(span)
 
 

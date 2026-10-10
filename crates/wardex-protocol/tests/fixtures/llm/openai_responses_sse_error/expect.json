@@ -13,6 +13,7 @@
  "output_messages_present": true,
  "response_status": "failed",
  "stream_terminated": true,
+ "error_type": "server_error",
  "error_code": "server_error",
  "usage_leaves": {}
 }
