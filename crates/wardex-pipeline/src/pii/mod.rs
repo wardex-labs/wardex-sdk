@@ -588,6 +588,20 @@ mod tests {
             ("call +821024817730", "call [PHONE]"),
             ("call +82 010-2481-7730", "call [PHONE]"),
             ("call +82 (0)10-2481-7730", "call [PHONE]"),
+            ("call (+82) 10-2481-7730", "call [PHONE]"),
+            ("call (+82)10-2481-7730", "call [PHONE]"),
+            ("call +82)10-2481-7730", "call [PHONE]"),
+            ("call 0082-10-2481-7730", "call [PHONE]"),
+            ("call 0082 10 2481 7730", "call [PHONE]"),
+            ("call (010) 2481-7730", "call [PHONE]"),
+            ("call (010)2481-7730", "call [PHONE]"),
+            ("call 010)2481-7730", "call [PHONE]"),
+            ("call 010 - 2481 - 7730", "call [PHONE]"),
+            ("call 010\u{2013}2481\u{2013}7730", "call [PHONE]"),
+            ("call 010\u{2011}2481\u{2011}7730", "call [PHONE]"),
+            // Only a pair of parentheses is taken into the match.
+            ("(010-2481-7730)", "([PHONE])"),
+            ("(+82 10-2481-7730)", "([PHONE])"),
             ("legacy 011-234-5678", "legacy [PHONE]"),
             ("legacy 016-2345-6789", "legacy [PHONE]"),
             ("legacy 019 234 5678", "legacy [PHONE]"),
@@ -633,11 +647,20 @@ mod tests {
     }
 
     /// Only North American and South Korean mobile numbers are phone
-    /// numbers to the rules; the documentation lists every other format as
-    /// a limit. If this starts being masked, the documentation changes too.
+    /// numbers to the rules; the documentation lists these other forms as
+    /// limits. If one starts being masked, the documentation changes too.
     #[test]
-    fn a_phone_number_in_another_format_is_a_documented_limit() {
-        assert_eq!(engine().mask_text("call +44 20 7946 0958"), None);
+    fn a_phone_number_in_another_form_is_a_documented_limit() {
+        for text in [
+            "call +44 20 7946 0958",
+            "call 02-2481-7730",
+            "call 82-10-2481-7730",
+            "call \u{ff10}\u{ff11}\u{ff10}-\u{ff12}\u{ff14}\u{ff18}\u{ff11}-\u{ff17}\u{ff17}\u{ff13}\u{ff10}",
+            "file user_01024817730.json",
+            "tel_01024817730",
+        ] {
+            assert_eq!(engine().mask_text(text), None, "{text}");
+        }
     }
 
     // --- overlap / determinism / idempotency (§5.2) ---

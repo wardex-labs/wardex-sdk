@@ -39,6 +39,15 @@ pub(crate) const CATEGORIES: [&str; 8] = [
     "secret",
 ];
 
+/// A separator inside a South Korean mobile number: a space, a dot, a hyphen
+/// or a typographic dash (U+2010 to U+2013), or a hyphen or dash with a
+/// space on each side.
+macro_rules! kr_sep {
+    () => {
+        r"(?:[ .\-\x{2010}-\x{2013}]| [\-\x{2010}-\x{2013}] )"
+    };
+}
+
 pub(crate) static BUILTINS: &[PatternDef] = &[
     PatternDef {
         category: "email",
@@ -61,13 +70,34 @@ pub(crate) static BUILTINS: &[PatternDef] = &[
     // without separators (`01024817730` is how forms and databases keep
     // one); a three-digit middle, which only older numbers have, needs both
     // separators, since a bare ten-digit run is an id far more often than a
-    // number. `+82` drops the leading `0`, which some people write back as
-    // `0` or `(0)`. The boundaries are ASCII ones, so a Korean particle
-    // written straight after the number (`010-2481-7730으로`) still ends it
-    // while a longer run of digits or letters does not.
+    // number. The country code is `+82`, `(+82)` or `0082`, after which the
+    // leading `0` is dropped or written back as `0` or `(0)`; a prefix may
+    // sit in parentheses (`(010) 2481-7730`), and only a pair of them is
+    // taken into the match, so `(010-2481-7730)` keeps both. The boundaries
+    // are ASCII ones, so a Korean particle written straight after the number
+    // (`010-2481-7730으로`) still ends it while a longer run of digits or
+    // letters, an underscore included, does not.
     PatternDef {
         category: "phone_number",
-        regex: r"(?:\+82[ .-]?(?:\(0\)[ .-]?|0)?|(?-u:\b)0)1[016789](?:[ .-]?[0-9]{4}[ .-]?|[ .-][0-9]{3}[ .-])[0-9]{4}(?-u:\b)",
+        regex: concat!(
+            r"(?:(?:\(\+82\)|\+82\)?|(?-u:\b)0082)",
+            kr_sep!(),
+            r"?(?:\(0\)",
+            kr_sep!(),
+            r"?|0)?|(?-u:\b)0)1[016789]\)?(?:",
+            kr_sep!(),
+            r"?[0-9]{4}",
+            kr_sep!(),
+            r"?|",
+            kr_sep!(),
+            r"[0-9]{3}",
+            kr_sep!(),
+            r")[0-9]{4}(?-u:\b)|\((?-u:\b)01[016789]\)",
+            kr_sep!(),
+            r"?[0-9]{4}",
+            kr_sep!(),
+            r"?[0-9]{4}(?-u:\b)",
+        ),
         validator: None,
         replacement: Replacement::Label("[PHONE]"),
         retry_on_reject: false,
