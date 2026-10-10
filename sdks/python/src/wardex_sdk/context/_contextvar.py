@@ -91,6 +91,15 @@ def install_span(
     return prev, fork
 
 
+def fork_scope(ctx: SpanContext) -> Scope:
+    """The current scope forked with `ctx` active — built, and NOT installed.
+
+    For a carrier that installs the fork itself, and more than once: a
+    decorated generator's span is current only while one of its steps runs.
+    """
+    return _fork(_hub.get_current_scope(), ctx, None, None)
+
+
 def retire_fork(fork: Scope, prev: Scope) -> None:
     """Make `fork` read as `prev` again, IN PLACE, from any task.
 

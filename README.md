@@ -232,7 +232,8 @@ with wardex.conversation("support-chat", id="session-123"):
 ```
 
 The decorators produce `invoke_agent` and `execute_tool` spans (`@workflow`
-and `@step` produce `invoke_workflow` and `execute_step`). Every span inside a
+and `@step` produce `invoke_workflow` and `execute_step`); on a generator the
+span lasts from the first item to the last. Every span inside a
 `conversation()` block, model calls included, carries
 `gen_ai.conversation.id`. An exception that leaves a span is recorded on it,
 and your code still receives the same exception. Hand-started threads need

@@ -187,6 +187,15 @@ All notable changes to this project are documented here. The format follows
 
 ### Changed
 
+- **BREAKING: `isolation_scope()`, `new_scope()`, `continue_trace()` and
+  `continue_from_otel()` are `with` blocks only, like `span()` and
+  `conversation()`.** Used as a decorator, each of them wrapped only the
+  call, so on an `async def` or a generator it closed before the body ran:
+  the body's spans silently left the scope or the caller's trace (and
+  `@wardex.continue_trace(headers)` read the headers once, at import). Each
+  now raises a `TypeError` when used as a decorator, naming the `with` form to
+  write instead. The `with` form is unchanged; a decorator over a plain
+  function, which did work, now needs the same `with` block inside it.
 - **The wardex envelope says what the SDK observed about a transport, or
   nothing.** Transport fields nobody measured used to ship under their zero
   values as if they had been read off the connection: every span said
@@ -407,6 +416,33 @@ All notable changes to this project are documented here. The format follows
   the value becomes `[SECRET]` on both wires, the conversation id's
   typed field on the wardex envelope included, where before the exemption
   won.
+- **A decorated generator is traced over its whole iteration.** Putting
+  `@wardex.workflow`, `@wardex.agent`, `@wardex.tool` or `@wardex.step` on a
+  generator or an async generator — a streaming endpoint, a tool that
+  yields — used to produce a span that closed when the call merely built the
+  generator, about 0.03 ms long and before any of the body ran, while every
+  span the body opened became the root of a trace of its own, with nothing
+  saying so. Now the span opens at the first item and closes when the
+  generator is exhausted, closed or raises, and the body's spans are its
+  children in one trace. It is the active parent only while the body runs:
+  what your code does between two items is not recorded inside it. `send()`,
+  `throw()`, `close()` and a generator's return value reach the body as they
+  would without the decorator, and `inspect.isgeneratorfunction` /
+  `isasyncgenfunction` still answer `True` for the decorated function.
+- **The decorators accept every function shape, and refuse the rest where
+  they are applied.** Placed above `@staticmethod` or `@classmethod`, or
+  given a `functools.partial`, a `functools.lru_cache` wrapper or a builtin,
+  a decorator used to stop your app at import with an `AttributeError` about
+  wardex's internals (`'staticmethod' object has no attribute '__code__'`).
+  Those shapes are now wrapped (the descriptor is kept, so the class still
+  binds the method). What cannot be wrapped faithfully raises a `TypeError`
+  at decoration time that says what was refused, why, and what to write
+  instead: a class, a callable object such as a framework's tool object (a
+  function in its place would hide the object's type from whatever uses it —
+  decorate the plain function first, or the class's `__call__`), a caching
+  wrapper around an async function, and the span name passed positionally
+  (`@wardex.tool("search")` or `with wardex.workflow("x")` — the name is
+  `name=`, and a block is `with wardex.span("x")`).
 - **A wrong project key, a receiver that is down, and every other loss no
   span can carry now say so once with `debug` off, and are counted.**
   Before, with the default `debug=False`, an export your receiver refused or
