@@ -216,7 +216,8 @@ _MEMBER_SITES: dict[str, frozenset[str]] = {
             "_adapters/_assembler.py",
             # A child opened while the live agent's pin had been refused: the
             # context it read is the run's, not the agent's it sits under.
-            "_adapters/_openai_agents.py",
+            # `_open_child` lives beside the span kinds it is shared with.
+            "_adapters/_openai_agents_kinds.py",
             # `_EDGE_MARKERS` again — see PARENT_UNRESOLVED above.
             "testing/conformance.py",
             # The same cross-trace disagreement as `resolve()`'s, reached after

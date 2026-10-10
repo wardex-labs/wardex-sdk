@@ -76,6 +76,7 @@ NUMBER = "number"
 HOST = "host"
 
 _OA = "_adapters/_openai_agents.py"
+_OK = "_adapters/_openai_agents_kinds.py"
 _LG = "_adapters/_langgraph.py"
 _AS = "_adapters/_assembler.py"
 _SEAM = "_interceptors/_seam.py"
@@ -94,7 +95,8 @@ _SITES: list[tuple[str, str, str, str]] = [
     (_OA, "'wardex.framework'", "_FRAMEWORK", LITERAL),
     (_OA, "'wardex.framework'", "_FRAMEWORK", LITERAL),
     (_OA, "'wardex.step.name'", "'mcp.list_tools'", LITERAL),
-    (_OA, "'wardex.openai_agents.tool_call_id_source'", "'response_output_match'", LITERAL),
+    # How a function tool's call id was recovered: one of `_CALL_ID_SOURCES`.
+    (_OA, "'wardex.openai_agents.tool_call_id_source'", "source", LITERAL),
     # `hash_canonical(sorted(tool names))[:16]`.
     (_OA, "'wardex.openai_agents.mcp.tools_hash'", "digest", COMPUTED),
     (_OA, "'wardex.openai_agents.mcp.tools_count'", "count", NUMBER),
@@ -106,6 +108,8 @@ _SITES: list[tuple[str, str, str, str]] = [
     (_OA, "'wardex.openai_agents.turn'", "int(turn)", NUMBER),
     (_OA, "'wardex.openai_agents.turn'", "int(turn)", NUMBER),
     (_OA, "'wardex.openai_agents.resumed'", "True", NUMBER),
+    (_OA, "'wardex.openai_agents.sensitive_data_withheld'", "True", NUMBER),
+    (_OA, "'wardex.openai_agents.sensitive_data_withheld'", "True", NUMBER),
     (_OA, "'wardex.evaluation.triggered'", "True", NUMBER),
     (_OA, "'wardex.evaluation.triggered'", "False", NUMBER),
     # The framework's trace and group ids, the provider's response ids, the
@@ -118,6 +122,17 @@ _SITES: list[tuple[str, str, str, str]] = [
     (_OA, "'wardex.openai_agents.mcp.server'", "str(mcp['server'])", HOST),
     (_OA, "'wardex.openai_agents.mcp.server'", "server if server is not None else ''", HOST),
     (_OA, "'wardex.openai_agents.max_turns'", "max_turns", HOST),
+    # -- the OpenAI Agents adapter's later span kinds: hosted tools and steps --
+    (_OK, "'wardex.framework'", "_FRAMEWORK", LITERAL),
+    (_OK, "'wardex.framework'", "_FRAMEWORK", LITERAL),
+    (_OK, "'wardex.openai_agents.tool_call_id_source'", "'response_output_item'", LITERAL),
+    (_OK, "'wardex.openai_agents.hosted_tool'", "True", NUMBER),
+    (_OK, "'wardex.openai_agents.turn'", "int(turn)", NUMBER),
+    # The provider's response id and hosted MCP server label, and a step's name: the name a host
+    # gave its custom span, or the voice pipeline's own word for the kind.
+    (_OK, "'wardex.openai_agents.response_id'", "str(response_id)", HOST),
+    (_OK, "'wardex.openai_agents.mcp.server'", "str(server)", HOST),
+    (_OK, "'wardex.step.name'", "name", HOST),
     # -- the Codex CLI adapter --
     # The process's exit code, the turn's usage totals off the --json stream,
     # and what the OTel bridge counted: whether the version is the verified
@@ -240,6 +255,12 @@ _LITERAL_SETS: dict[tuple[str, str], Callable[[], tuple[str, ...]]] = {
     (_AS, "step_name"): lambda: (
         *importlib.import_module("wardex_sdk._adapters._otel_merge")._STEP_NAMES.values(),
         "llm_request",
+    ),
+    # The kind of model span that requested the call, or the Responses label when none said.
+    (_OA, "source"): lambda: tuple(
+        importlib.import_module(
+            "wardex_sdk._adapters._openai_agents_kinds"
+        )._CALL_ID_SOURCES.values()
     ),
 }
 
