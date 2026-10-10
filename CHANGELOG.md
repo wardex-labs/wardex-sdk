@@ -490,12 +490,18 @@ All notable changes to this project are documented here. The format follows
   now ships at that moment marked `unit_interrupted`, the marker an adapter's
   run already carried in the same situation, with its children under it, and
   the block ending later adds no second copy. The finished spans already
-  buffered are never evicted to make room: `close()` flushes them out between
-  chunks within its budget, and the SIGTERM handler, which cannot wait, ships
-  the run's roots first into the room there is. What does not fit is counted
-  under `_runtime.open_spans_unshipped` and said once on stderr. A SIGTERM
-  your app handles or ignores, and a second `init()`, leave open spans
-  running as before, since the program carries on.
+  buffered are never evicted to make room: the shutdown exports them first,
+  between chunks of open spans, within half of its own budget (`close()`'s
+  timeout, or the SIGTERM handler's 2 s), and buffers the open spans oldest
+  first, so a run's root goes before anything opened under it. `close()`
+  spends one budget across both, not two. What does not fit in that time is
+  counted under `_runtime.open_spans_unshipped` and said once on stderr. A
+  SIGTERM that lands while `close()` is exporting can lose that export, which
+  leaves one span in the trace without its parent. A SIGTERM your app handles
+  or ignores, and a second `init()`, leave open spans running as before,
+  since the program carries on. No signal handler of wardex's wakes the
+  background worker any more: a SIGTERM landing while your code was waking it
+  could hang the process instead of ending it.
 - **A wrong project key, a receiver that is down, and every other loss no
   span can carry now say so once with `debug` off, and are counted.**
   Before, with the default `debug=False`, an export your receiver refused or

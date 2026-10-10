@@ -510,10 +510,9 @@ class Client:
         # silently, and the conservative direction is a loss report for a
         # span the drain may in fact have shipped, never a silent parking.
         self._finalize_drained = False
-        # Whether THIS process registered its multiprocessing tail-flush
-        # finalizer (see `_register_mp_tail_flush`). Reset by
-        # `_at_fork_reinit`, because the flag answers a per-process question
-        # and a grandchild is a new process.
+        # Whether THIS process registered its multiprocessing tail-flush finalizer (see
+        # `_register_mp_tail_flush`). Reset by `_at_fork_reinit`, because the flag
+        # answers a per-process question and a grandchild is a new process.
         self._mp_tail_flush_registered = False
         # The SDK's one non-reentrant lock, and the only one -- a source scan in
         # `test_finalizer_reentrancy` enumerates plain `Lock()` sites and fails
@@ -552,6 +551,7 @@ class Client:
         self._max_buffer_spans = limits["max_buffer_spans"]
         self._max_buffer_bytes = limits["max_buffer_bytes"]
         self._flush_threshold = max(1, self._max_buffer_spans // 4)
+        self._quiet_wake = False  # up while the signal handler runs: see Runtime.handle_signal
         # The deferred-parse queue. Its worker thread is LAZY — nothing spawns
         # until the first `capture_deferred` calls `ensure_alive()` — so a
         # client that only ever captures ready spans pays one allocation here
@@ -820,7 +820,7 @@ class Client:
                 self._dropped += 1
             self._buffer.append(span, size)
             should_wake = len(self._buffer.spans) >= self._flush_threshold
-        if should_wake:
+        if should_wake and not self._quiet_wake:
             self._worker.wake()
 
     def capture_snapshot(self, snapshot: InternalStateSnapshot) -> None:
