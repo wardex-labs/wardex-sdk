@@ -213,6 +213,16 @@ times it was asked, so the run carries the turn's total and says so. With
 traces; it leaves alone a run whose command, environment or Codex config
 already sets up telemetry. Verified against `codex-cli` 0.160.0.
 
+The Claude Agent SDK adapter reads every session's CLI output, and adds
+observation-only hooks to the options of each `query()` call and
+`ClaudeSDKClient` it wraps; the hooks are what give each sub-agent a span of
+its own. It wraps `claude_agent_sdk.query` as a module attribute, so a
+`from claude_agent_sdk import query` that runs before `init()` keeps the
+unwrapped function, and so does a client constructed before it. Such a session
+is still recorded, from the CLI's output alone: its root span carries
+`instrumentation_degraded`, and a warning on stderr says so once. Call `init()`
+before that import, or call `claude_agent_sdk.query(...)` through the module.
+
 ## Adding structure to your own code
 
 ```python
