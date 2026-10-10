@@ -20,7 +20,10 @@
 //! A span attribute the SDK computes is judged the same way, by its key and
 //! the exact form the SDK writes under it — see `SDK_VALUE_ATTRS`. Attributes
 //! are a map anyone can write into, so a key alone does not say the SDK wrote
-//! the value; the form says the SDK could have.
+//! the value; the form says the SDK could have. A framework's id the SDK
+//! copies as written (LangGraph's task id) is judged the same way, and so are
+//! the task ids inside the checkpoint namespace the SDK copies beside it,
+//! whose node names stay masked — see `mask_keeping_task_ids`.
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
@@ -186,14 +189,92 @@ fn is_sdk_tools_digest(text: &str) -> bool {
             .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
 }
 
+/// Where the LangGraph adapter writes the id LangGraph gave a node's run:
+/// `str(task.id)`.
+const STEP_TASK_ID_KEY: &str = "wardex.step.task_id";
+
+/// FRAMEWORK-MINTED: `text` is, byte for byte, a task id of the form
+/// LangGraph makes: a 128-bit hash of the task's identity (xxh3 since its
+/// second checkpoint format, SHA-1 before) in lowercase hex, laid out in a
+/// UUID's 8-4-4-4-12 groups. Unlike a version-4 UUID it fixes no version or
+/// variant digit, so all thirty-two digits are free.
+///
+/// When the 8-4-4 or the 4-12 groups are all decimal and pass the card
+/// checksum, about one task in eighteen thousand, the card rule rewrote the
+/// id and wrote `credit_card` into the span's record, and the id is the one
+/// thing that tells a fan-out's sibling steps apart. The SDK does not make
+/// this value, but it copies it as LangGraph made it, and a host writing a
+/// text of exactly this form under the key loses what leaving the SDK's own
+/// forms alone loses: the card rule's matches, the only built-in rule that
+/// can match inside the form, and nothing else.
+fn is_langgraph_task_id(text: &str) -> bool {
+    let b = text.as_bytes();
+    b.len() == 36
+        && b.iter().enumerate().all(|(i, &c)| match i {
+            8 | 13 | 18 | 23 => c == b'-',
+            _ => c.is_ascii_digit() || (b'a'..=b'f').contains(&c),
+        })
+}
+
+/// Where the LangGraph adapter writes the checkpoint namespace a node ran in,
+/// `str(ns)`: a `name:task_id` segment per graph level, joined by `|`
+/// (`outer:<id>|inner:<id>`). The names are the host's graph nodes.
+const STEP_NAMESPACE_KEY: &str = "wardex.step.namespace";
+
+/// Mask a checkpoint namespace with the task ids in it left as written. The
+/// node names are the host's, so the text between the ids is masked like any
+/// host text, each piece on its own. An id is a `:` and then the form
+/// `is_langgraph_task_id` accepts, ending at a `|` or at the end of the
+/// value; it is kept with the `:` before it and the `|` after it, so a piece
+/// is a node name and nothing else. A value with no such id is masked whole,
+/// as before.
+fn mask_keeping_task_ids(m: &mut Masker<'_>, s: &mut String) -> bool {
+    let mut ids = Vec::new();
+    let mut from = 0;
+    while let Some(off) = s[from..].find(':') {
+        let start = from + off + 1;
+        let end = start + 36;
+        if s.get(start..end).is_some_and(is_langgraph_task_id)
+            && s.as_bytes().get(end).is_none_or(|&c| c == b'|')
+        {
+            let kept_end = (end + 1).min(s.len());
+            ids.push(start - 1..kept_end);
+            from = kept_end;
+        } else {
+            from = start;
+        }
+    }
+    if ids.is_empty() {
+        return mask_string(m, s);
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut hit = false;
+    let mut pos = 0;
+    for id in ids {
+        let mut piece = s[pos..id.start].to_string();
+        hit |= mask_string(m, &mut piece);
+        out.push_str(&piece);
+        out.push_str(&s[id.clone()]);
+        pos = id.end;
+    }
+    let mut tail = s[pos..].to_string();
+    hit |= mask_string(m, &mut tail);
+    out.push_str(&tail);
+    if hit {
+        *s = out;
+    }
+    hit
+}
+
 /// Whether a text is in the exact form the SDK writes under one key.
 type SdkForm = fn(&str) -> bool;
 
-/// Span attributes whose value the SDK makes itself, each by the key it
-/// writes it under and the exact form it writes. An attribute matching both
-/// ships as written and goes into no record; under any other key, or in any
-/// other form, the same text is judged like everything else the host put on
-/// the span. `tests/sdk_generated_fields.rs` proves both sides, and
+/// Span attributes whose value the SDK makes itself, or copies as written
+/// from a framework that makes it in one fixed form, each by the key it
+/// writes it under and that exact form. An attribute matching both ships as
+/// written and goes into no record; under any other key, or in any other
+/// form, the same text is judged like everything else the host put on the
+/// span. `tests/sdk_generated_fields.rs` proves both sides, and
 /// `sdks/python/tests/test_sdk_attribute_census.py` reads every attribute the
 /// SDK writes out of its source and fails until each is classified, this
 /// list included.
@@ -201,6 +282,7 @@ const SDK_VALUE_ATTRS: &[(&str, SdkForm)] = &[
     // The SDK's when nobody named the conversation; see `is_sdk_minted_id`.
     (CONVERSATION_ID_KEY, is_sdk_minted_id),
     (MCP_TOOLS_HASH_KEY, is_sdk_tools_digest),
+    (STEP_TASK_ID_KEY, is_langgraph_task_id),
 ];
 
 /// A span attribute holding a value the SDK could have written itself —
@@ -431,14 +513,24 @@ fn mask_span(engine: &PiiEngine, span: &mut pb::Span) {
         hit |= mask_string(m, message);
     }
     // The attributes the SDK computes, in the form it writes them, are left
-    // as written. The OTLP mapping ships `extra` under the same keys, and
-    // the conversation id's key also holds the typed field there, so
-    // `mask_otlp_span` judges the same pairs the same way and the two wires
-    // agree on what was masked.
+    // as written, and so are the task ids inside a checkpoint namespace. The
+    // OTLP mapping ships `extra` under the same keys, and the conversation
+    // id's key also holds the typed field there, so `mask_otlp_span` judges
+    // the same pairs the same way and the two wires agree on what was
+    // masked.
     for kv in extra
         .iter_mut()
         .filter(|kv| !is_sdk_value_attr(&kv.key, pb_text(&kv.value)))
     {
+        if kv.key == STEP_NAMESPACE_KEY && m.key_rule(&kv.key).is_none() {
+            if let Some(pb::AnyValue {
+                value: Some(pb::any_value::Value::StringValue(ns)),
+            }) = &mut kv.value
+            {
+                hit |= mask_keeping_task_ids(m, ns);
+                continue;
+            }
+        }
         hit |= mask_kvs(m, std::slice::from_mut(kv));
     }
     for ev in events {
@@ -767,6 +859,15 @@ fn mask_otlp_span(engine: &PiiEngine, span: &mut otlp_pb::trace::Span) -> Option
         !SDK_SPAN_KEYS.contains(&kv.key.as_str())
             && !is_sdk_value_attr(&kv.key, otlp_text(&kv.value))
     }) {
+        if kv.key == STEP_NAMESPACE_KEY && m.key_rule(&kv.key).is_none() {
+            if let Some(otlp_pb::common::AnyValue {
+                value: Some(otlp_pb::common::any_value::Value::StringValue(ns)),
+            }) = &mut kv.value
+            {
+                hit |= mask_keeping_task_ids(m, ns);
+                continue;
+            }
+        }
         hit |= mask_otlp_kvs(m, std::slice::from_mut(kv));
     }
     for ev in events {
@@ -1243,6 +1344,120 @@ mod tests {
             "0123456789abcdeg",
         ] {
             assert!(!is_sdk_tools_digest(text), "{text}");
+        }
+    }
+
+    /// What LangGraph's own `_xxhash_str` returns for the pull task of a node
+    /// `agent` at step 27026: its 8-4-4 groups are decimal and pass the card
+    /// checksum.
+    const CARD_SHAPED_TASK_ID: &str = "21085070-2022-5109-e53a-53cc476ce164";
+
+    #[test]
+    fn a_langgraph_task_id_that_passes_the_card_checksum_is_left_alone() {
+        let id = CARD_SHAPED_TASK_ID;
+        assert_eq!(
+            engine().mask_text(id).as_deref(),
+            Some("****-****-****-5109-e53a-53cc476ce164")
+        );
+        let with = |key: &str, value: &str| {
+            env_with(pb::Span {
+                name: "execute_step agent".into(),
+                extra: vec![text_kv(key, value)],
+                ..Default::default()
+            })
+        };
+        let mut env = with(STEP_TASK_ID_KEY, id);
+        let before = env.clone();
+        mask_envelope(&engine(), &mut env);
+        assert_eq!(env, before);
+        // The same id under another key, or another form under this key, is
+        // judged as before.
+        let upper = id.to_ascii_uppercase();
+        let run_on = format!("{id}5");
+        for (key, value) in [
+            ("wardex.step.name", id),
+            (STEP_TASK_ID_KEY, "4111-1111-1111-1111"),
+            (STEP_TASK_ID_KEY, upper.as_str()),
+            (STEP_TASK_ID_KEY, run_on.as_str()),
+        ] {
+            let mut env = with(key, value);
+            mask_envelope(&engine(), &mut env);
+            let span = span_of(&env);
+            assert_eq!(
+                span.capture_integrity.as_ref().unwrap().redaction_rules,
+                vec![Rule::CreditCard as i32],
+                "{key} = {value}"
+            );
+        }
+        assert!(is_langgraph_task_id(id));
+        assert!(is_langgraph_task_id("00000000-0000-0000-0000-000000000000"));
+        for text in [
+            "21085070-2022-5109-E53A-53CC476CE164",
+            "21085070-2022-5109-e53a-53cc476ce16",
+            "21085070-2022-5109-e53a-53cc476ce1645",
+            "21085070-2022-5109-e53a-53cc476ce16g",
+            "21085070_2022-5109-e53a-53cc476ce164",
+            "2108507020225109e53a53cc476ce164",
+        ] {
+            assert!(!is_langgraph_task_id(text), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_checkpoint_namespace_keeps_its_task_ids_and_masks_its_names() {
+        let id = CARD_SHAPED_TASK_ID;
+        let with = |value: &str| {
+            env_with(pb::Span {
+                extra: vec![text_kv(STEP_NAMESPACE_KEY, value)],
+                ..Default::default()
+            })
+        };
+        // The namespace LangGraph writes for a node inside a subgraph.
+        for ns in [format!("outer:{id}|inner:{id}"), format!("에이전트:{id}")] {
+            let mut env = with(&ns);
+            let before = env.clone();
+            mask_envelope(&engine(), &mut env);
+            assert_eq!(env, before, "{ns}");
+        }
+        // The node names are the host's and are masked around the ids; text
+        // that is not an id ending at `|` or at the end is masked whole.
+        let card = "****-****-****-5109-e53a-53cc476ce164";
+        for (ns, masked, rules) in [
+            (
+                format!("ops@corp.example:{id}|4111-1111-1111-1111:{id}"),
+                format!("[EMAIL]:{id}|****-****-****-1111:{id}"),
+                vec![Rule::Email, Rule::CreditCard],
+            ),
+            (
+                format!("password=hunter2:{id}"),
+                format!("password=[SECRET]:{id}"),
+                vec![Rule::SecretWord],
+            ),
+            (
+                format!("outer:{id}x"),
+                format!("outer:{card}x"),
+                vec![Rule::CreditCard],
+            ),
+            (
+                format!("outer:{id}:{id}"),
+                format!("outer:{card}:{id}"),
+                vec![Rule::CreditCard],
+            ),
+            (
+                "4111-1111-1111-1111".to_string(),
+                "****-****-****-1111".to_string(),
+                vec![Rule::CreditCard],
+            ),
+        ] {
+            let mut env = with(&ns);
+            mask_envelope(&engine(), &mut env);
+            let span = span_of(&env);
+            assert_eq!(pb_text(&span.extra[0].value), Some(masked.as_str()), "{ns}");
+            assert_eq!(
+                span.capture_integrity.as_ref().unwrap().redaction_rules,
+                rules.iter().map(|r| *r as i32).collect::<Vec<_>>(),
+                "{ns}"
+            );
         }
     }
 

@@ -19,7 +19,9 @@
 //! passes under its own key in the form the SDK writes; the same text
 //! anywhere else, or another form under that key, is masked. The last
 //! tests here pin that, for the list the Python suite's attribute census
-//! derives from the SDK's source.
+//! derives from the SDK's source, and for the one framework id the SDK
+//! copies as written: LangGraph's task id, alone and inside the checkpoint
+//! namespace whose node names stay masked.
 use std::collections::{BTreeMap, BTreeSet};
 
 use wardex_codec::otlp::map::{envelope_to_traces, Producer};
@@ -1161,6 +1163,26 @@ const SDK_COMPUTED_ATTRS: &[(&str, &str, &str)] = &[(
     "8096697742134142",
 )];
 
+/// Span attributes whose value a framework makes in one fixed form and the
+/// SDK copies as written, each with the code that makes it and a value that
+/// code really produced. The walk leaves them alone exactly as it does the
+/// SDK's own; the Python census classifies them apart, since the SDK does
+/// not compute them.
+const FRAMEWORK_ID_ATTRS: &[(&str, &str, &str)] = &[(
+    "wardex.step.task_id",
+    // LangGraph's `_xxhash_str(checkpoint id, "agent", "27026", "agent",
+    // "__pregel_pull", "branch:to:agent")` with the checkpoint id
+    // `bytes(range(16))`: a pull task's id, xxh3 laid out as a UUID. The
+    // 8-4-4 groups are decimal and pass the card checksum.
+    "LangGraph _xxhash_str for a pull task",
+    "21085070-2022-5109-e53a-53cc476ce164",
+)];
+
+/// Every attribute the walk leaves alone by key and form.
+fn exempt_attrs() -> impl Iterator<Item = &'static (&'static str, &'static str, &'static str)> {
+    SDK_COMPUTED_ATTRS.iter().chain(FRAMEWORK_ID_ATTRS)
+}
+
 fn span_with(extra: Vec<pb::KeyValue>, payload: &str) -> pb::Envelope {
     pb::Envelope {
         header: None,
@@ -1189,7 +1211,7 @@ fn text_kv(key: &str, value: &str) -> pb::KeyValue {
 #[test]
 fn an_sdk_computed_attribute_is_shipped_as_written_and_unrecorded() {
     let engine = engine();
-    for (key, producer, value) in SDK_COMPUTED_ATTRS {
+    for (key, producer, value) in exempt_attrs() {
         // The value is one the card rule rewrites anywhere it judges it.
         let mut report = Report::default();
         assert!(
@@ -1220,7 +1242,7 @@ fn an_sdk_computed_attribute_is_shipped_as_written_and_unrecorded() {
 #[test]
 fn the_same_value_anywhere_else_is_still_masked() {
     let engine = engine();
-    for (_, producer, value) in SDK_COMPUTED_ATTRS {
+    for (_, producer, value) in exempt_attrs() {
         // A tool call's arguments and result, and the same digits under the
         // neighbouring attribute the adapter fills from the host's config.
         let env = span_with(
@@ -1260,7 +1282,7 @@ fn the_same_value_anywhere_else_is_still_masked() {
 fn a_value_of_any_other_form_under_an_sdk_key_is_still_masked() {
     let engine = engine();
     let every = every_rule();
-    for (key, producer, value) in SDK_COMPUTED_ATTRS {
+    for (key, producer, value) in exempt_attrs() {
         for other in [
             // A card spelled as a card, one digit longer than the form, the
             // form with text run on, and a value every rule fires on.
@@ -1335,4 +1357,98 @@ fn nothing_but_the_card_rule_can_match_inside_a_tool_list_digest() {
         }
     }
     assert!(card > 100, "only {card} digests hit the card rule");
+}
+
+/// What leaving a LangGraph task id alone gives up: nothing a rule exists
+/// for. Unlike a minted UUID the form fixes no version or variant digit, so
+/// all thirty-two digits are drawn, nearly all decimal (the case that
+/// reaches the digit rules), and the card rule is the only rule that ever
+/// fires, and only on the id's own 8-4-4 or 4-12 groups.
+#[test]
+fn nothing_but_the_card_rule_can_match_inside_a_langgraph_task_id() {
+    let mut state = 0x1a96_7a5c_u64;
+    let mut next = move || {
+        state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^ (z >> 31)
+    };
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let engine = engine();
+    let mut card = 0usize;
+    for _ in 0..20_000 {
+        let hex: String = (0..32)
+            .map(|_| {
+                let r = next();
+                char::from(if r % 8 == 0 {
+                    HEX[10 + (r >> 8) as usize % 6]
+                } else {
+                    HEX[(r >> 8) as usize % 10]
+                })
+            })
+            .collect();
+        let id = format!(
+            "{}-{}-{}-{}-{}",
+            &hex[0..8],
+            &hex[8..12],
+            &hex[12..16],
+            &hex[16..20],
+            &hex[20..32]
+        );
+        let mut report = Report::default();
+        if engine.mask_text_into(&id, &mut report).is_some() {
+            assert_eq!(report.rules, vec![Rule::CreditCard], "{id}");
+            card += 1;
+        }
+    }
+    assert!(card > 100, "only {card} task ids hit the card rule");
+}
+
+/// The checkpoint namespace LangGraph writes beside the task id holds the
+/// same ids, one per graph level, after the host's node names:
+/// `outer:<id>|inner:<id>`. The ids ship as written on both wires and go
+/// into no record; the node names around them are masked like host text.
+#[test]
+fn a_checkpoint_namespace_keeps_its_task_ids_on_both_wires() {
+    const KEY: &str = "wardex.step.namespace";
+    let engine = engine();
+    let attr = format!("Span[0].attributes[{KEY}]");
+    for (_, producer, id) in FRAMEWORK_ID_ATTRS {
+        let ns = format!("outer:{id}|inner:{id}");
+        let env = span_with(vec![text_kv(KEY, &ns)], "");
+        let mut masked = env.clone();
+        mask_envelope(&engine, &mut masked);
+        assert_eq!(masked, env, "{producer}");
+        let mut req = envelope_to_traces(env, PYTHON);
+        let before = req.clone();
+        mask_otlp(&engine, &mut req);
+        assert_eq!(req, before, "{producer}");
+        assert!(!otlp_redacted(&req), "{producer}");
+
+        let host = format!("ops@corp.example:{id}|4111-1111-1111-1111:{id}");
+        let want = format!("[EMAIL]:{id}|****-****-****-1111:{id}");
+        let env = span_with(vec![text_kv(KEY, &host)], "");
+        let mut masked = env.clone();
+        mask_envelope(&engine, &mut masked);
+        let span = the_span(&masked);
+        assert_eq!(
+            redaction_rules(span),
+            vec![Rule::Email, Rule::CreditCard],
+            "{producer}"
+        );
+        let mut req = envelope_to_traces(env, PYTHON);
+        mask_otlp(&engine, &mut req);
+        assert!(otlp_redacted(&req), "{producer}");
+        assert_eq!(
+            otlp_texts(&req).get(&attr).map(String::as_str),
+            Some(want.as_str()),
+            "{producer}"
+        );
+        let shipped: Vec<_> = texts(&mut masked)
+            .into_iter()
+            .filter(|(_, text)| text.contains("ops@corp.example") || text.contains("4111"))
+            .collect();
+        assert!(shipped.is_empty(), "{producer}: {shipped:?}");
+    }
 }
