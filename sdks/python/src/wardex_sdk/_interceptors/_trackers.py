@@ -334,7 +334,8 @@ class _Http2Tracker:
         #: The evicted ids whose entry held a parent that would have admitted its transaction
         #: (`_admits`): the half of the mark above that `_mk` may hand the capture gate. Bounded by
         #: the same cap and dropped lowest id first, so it is not the unbounded table the mark
-        #: avoids; an id it forgets reads as a parentless eviction, the gate staying shut.
+        #: avoids; an id it forgets reads as a parentless eviction, the gate staying shut, and is
+        #: counted (`protocol.http2.evicted_parent_forgotten`).
         self._evicted_admitting: set[int] = set()
         #: Who opened each stream, read in the opening call itself (`_h2_issuer`).
         self._issuers = IssuerLink(self._latch_cap)
@@ -366,7 +367,10 @@ class _Http2Tracker:
             if _admits(*self._latch.pop(evicted)[:2]):
                 self._evicted_admitting.add(evicted)
                 if len(self._evicted_admitting) > self._latch_cap:
+                    # A late answer to the forgotten stream is refused under AGENT like traffic
+                    # outside agent work; this count is its only trace.
                     self._evicted_admitting.discard(min(self._evicted_admitting))
+                    counters.bump("protocol.http2.evicted_parent_forgotten")
             self._latch_evicted_below = max(self._latch_evicted_below, evicted)
         return self._ship(txns)
 

@@ -879,10 +879,12 @@ def test_an_evicted_entry_that_held_a_live_local_parent_tells_the_gate():
     assert tracker._evicted_admitting == set(), "claimed once, then forgotten"
 
 
+@pytest.mark.usefixtures("fresh_counters")
 def test_the_record_of_admitting_evictions_is_bounded_by_the_stream_cap():
     """Not the unbounded table the eviction mark exists to avoid: it holds at
     most `max_streams` ids, the newest evictions. One it forgot reads as an
-    eviction that lost no parent, so the gate stays shut for it."""
+    eviction that lost no parent, so the gate stays shut for it, and the
+    forgetting is counted: a late answer refused for it leaves no other trace."""
     tracker = _Http2Tracker(LimitsConfig(max_streams=2).to_native())
     client_enc, server_enc = Encoder(), Encoder()
     with _issued_under(_local_parent()):
@@ -890,6 +892,8 @@ def test_the_record_of_admitting_evictions_is_bounded_by_the_stream_cap():
             tracker.on_request_bytes(_h2_open(client_enc, sid))
     assert set(tracker._latch) == {97, 99}
     assert tracker._evicted_admitting == {93, 95}
+
+    assert counters.get("protocol.http2.evicted_parent_forgotten") == 46, "48 evicted, 2 kept"
 
     (forgotten,) = tracker.on_response_bytes(_h2_answer(server_enc, 1))
     assert (forgotten.parent_evicted, forgotten.parent_lost) == (True, False)
