@@ -368,11 +368,14 @@ All notable changes to this project are documented here. The format follows
   anyway (`\nGITHUB_TOKEN=…`), the span recorded the name as
   `nGITHUB_TOKEN`. A name after any JSON escape (`\n`, `\t`, `\r`, `\b`,
   `\f`, `\uXXXX`, also escaped once more inside a tool call's `arguments`) is
-  now judged without the escape, and recorded that way in
-  `redaction_names`. A backslash in plain text, such as the Windows path
-  `C:\Users\me\token=…`, is masked as before: the scanner cannot tell the
-  two apart, so it judges both readings and masks the value when either one
-  names a secret.
+  now also judged without the escape, and the value is masked when either
+  reading names a secret, so a backslash in plain text, such as the Windows
+  path `C:\Users\me\token=…`, is masked as before. `redaction_names`
+  records the name without the escape when only that reading is a secret,
+  or when the escape is unmistakable: inside a double-quoted string, as JSON
+  writes one, or a letter on its own before a capital (`\nGITHUB_TOKEN`).
+  Otherwise a name that is a secret either way keeps its first letter, as
+  plain text spells it (`C:\backup_key=…` records `backup_key`).
 - **South Korean mobile numbers are masked.** The phone rule knew only North
   American numbers, so `010-2481-7730` in a user's message, a tool result or
   a request body reached your backend as written, though the README lists

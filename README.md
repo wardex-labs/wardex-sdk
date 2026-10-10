@@ -264,6 +264,7 @@ What masking does not catch:
 
 - a secret under an ordinary name with no recognisable shape, such as
   `{"value": "hunter2"}`;
+- a secret name with an escape inside it, such as `pass\u0077ord=…`;
 - a phone number in any other format, such as `+44 20 7946 0958`;
 - `name: value` in prose or YAML, and XML such as `<password>…</password>`;
 - a credential inside a URL path, such as `/bot<token>/sendMessage`;

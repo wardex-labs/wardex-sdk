@@ -38,8 +38,13 @@ fn masks_one_mebibyte_under_100ms() {
         "\"password\":[".repeat(1024 * 1024 / 12 + 1),
         "form-data; name=\"q\"\r\n".repeat(1024 * 1024 / 24 + 1),
         "a://u@h/ password=x ".repeat(1024 * 1024 / 20 + 1),
-        // A secret name right after a JSON escape, line after line: every
-        // name is also read without the escape in front of it.
+        // A secret name right after a JSON escape, line after line, as a
+        // JSON string carries a log (each name read once without the
+        // escape) and with no quote around it (each name read both ways).
+        format!(
+            "{{\"log\": \"{}\"}}",
+            r"\npassword=x".repeat(1024 * 1024 / 12 + 1)
+        ),
         r"\npassword=x".repeat(1024 * 1024 / 12 + 1),
     ] {
         let start = std::time::Instant::now();
