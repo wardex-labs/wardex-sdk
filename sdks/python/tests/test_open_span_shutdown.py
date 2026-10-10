@@ -17,6 +17,8 @@ Two halves live beside their kind: the real SIGTERM in a child process is in
 from __future__ import annotations
 
 import signal
+import subprocess
+import sys
 import threading
 
 import pytest
@@ -24,8 +26,10 @@ import pytest
 import wardex_sdk as wardex
 from wardex_sdk import _hub, _runtime
 from wardex_sdk._assembly import Limitation, counters
+from wardex_sdk._assembly._diag import reset_reports_for_test
 from wardex_sdk._client import Client
 from wardex_sdk._config import BackendConfig, BatchingConfig, WardexConfig
+from wardex_sdk._limits import LimitsConfig
 from wardex_sdk._types import Envelope
 from wardex_sdk.transport._base import Transport
 
@@ -50,18 +54,43 @@ def _markers(sp):
     return () if sp.capture_integrity is None else sp.capture_integrity.limitations
 
 
-def _install(transport=None):
+def _install(transport=None, *, max_buffer_spans=None):
     transport = transport or _Recording()
     client = Client(
         WardexConfig(
             backend=BackendConfig(api_key="k"),
             intercept=False,
             batching=BatchingConfig(flush_interval=3600.0),
+            limits=LimitsConfig(max_buffer_spans=max_buffer_spans),
         ),
         transport,
     )
     _runtime.runtime().install(client, client.config)
     return transport, client
+
+
+def _full_of_finished_spans(client, count):
+    """`count` finished spans held in the buffer: the worker is never woken."""
+    client._flush_threshold = 10**9
+    for i in range(count):
+        with wardex.span(f"finished-{i}"):
+            pass
+    assert len(client._buffer.spans) == count
+
+
+def _open_nested(count):
+    """`count` nested spans left open, outermost first; returns their managers."""
+    managers = []
+    for i in range(count):
+        cm = wardex.span(f"open-{i}")
+        cm.__enter__()
+        managers.append(cm)
+    return managers
+
+
+def _close_all(managers):
+    for cm in reversed(managers):
+        cm.__exit__(None, None, None)
 
 
 @pytest.fixture(autouse=True)
@@ -126,6 +155,115 @@ def test_one_span_that_fails_to_ship_cannot_cost_the_others_or_the_flush(monkeyp
         _signal_with(signal.SIG_DFL, monkeypatch)
         (good,) = transport.named("good")
     assert Limitation.UNIT_INTERRUPTED in _markers(good)
+
+
+_DEADLOCK_CHILD = r"""
+import signal, sys
+import wardex_sdk as wardex
+from wardex_sdk import _hub, _runtime
+from wardex_sdk.transport._base import Transport
+
+class Quiet(Transport):
+    def export(self, envelope):
+        pass
+
+wardex.init(transport=Quiet(), intercept=False, backend=wardex.BackendConfig(api_key="k"),
+            batching=wardex.BatchingConfig(flush_interval=3600.0))
+client = _hub.get_client()
+client._flush_threshold = 1  # every buffered span would wake the worker
+with wardex.span("finished"):
+    pass
+still_open = wardex.span("open")  # held: a dropped manager would close its span
+still_open.__enter__()
+_runtime.os.kill = lambda *a: None  # the handler would end the process here
+_runtime.runtime()._prev_handlers[signal.SIGTERM] = signal.SIG_DFL
+# The frame SIGTERM interrupts: the main thread inside the worker's wake,
+# holding the plain lock under its Event.
+with client._worker._wake._cond:
+    _runtime._handler(signal.SIGTERM, None)
+print("handler returned", flush=True)
+"""
+
+
+def test_the_signal_handler_never_waits_on_the_lock_it_interrupted(tmp_path):
+    """Waking the worker takes the plain lock under its `Event`. A SIGTERM landing
+    while the main thread holds it — inside a capture that is waking the worker —
+    must not wake it again from the handler, or the handler waits forever, the
+    signal is never re-raised, and the buffer dies with the process. Run in a
+    child so a regression is a timeout here rather than a hung suite."""
+    script = tmp_path / "child.py"
+    script.write_text(_DEADLOCK_CHILD)
+    try:
+        done = subprocess.run(
+            [sys.executable, str(script)], capture_output=True, text=True, timeout=30
+        )
+    except subprocess.TimeoutExpired:
+        pytest.fail("the signal handler hung on the lock its own frame was holding")
+    assert done.returncode == 0, done.stderr
+    assert "handler returned" in done.stdout
+
+
+def test_a_full_buffer_keeps_its_finished_spans_and_counts_the_open_ones(monkeypatch, capsys):
+    """The finished spans are the children the open ones exist to parent; making
+    room for a parent by evicting its children is no trade. The signal handler
+    cannot wait for a flush, so it ships what fits, roots first, and counts the
+    rest under its own counter, with one line."""
+    reset_reports_for_test()
+    transport, client = _install(max_buffer_spans=10)
+    _full_of_finished_spans(client, 6)
+    managers = _open_nested(8)
+    before = counters.snapshot().get("_runtime.open_spans_unshipped", 0)
+    _signal_with(signal.SIG_DFL, monkeypatch)
+    names = [sp.name for sp in transport.spans()]
+    finished = sorted(n for n in names if n.startswith("finished-"))
+    assert finished == [f"finished-{i}" for i in range(6)]
+    assert sorted(n for n in names if n.startswith("open-")) == [f"open-{i}" for i in range(4)]
+    assert counters.snapshot().get("_runtime.open_spans_unshipped", 0) == before + 4
+    lines = [ln for ln in capsys.readouterr().err.splitlines() if "open_spans_unshipped" in ln]
+    assert len(lines) == 1 and "4 span(s)" in lines[0]
+    _close_all(managers)
+    client.flush()
+    assert len([sp for sp in transport.spans() if sp.name.startswith("open-")]) == 4
+
+
+def test_close_flushes_between_chunks_so_every_open_span_ships():
+    transport, client = _install(max_buffer_spans=10)
+    _full_of_finished_spans(client, 6)
+    managers = _open_nested(25)
+    wardex.close()
+    names = [sp.name for sp in transport.spans()]
+    finished = sorted(n for n in names if n.startswith("finished-"))
+    assert finished == [f"finished-{i}" for i in range(6)]
+    assert len([n for n in names if n.startswith("open-")]) == 25
+    _close_all(managers)
+    assert len(transport.spans()) == 31  # no block's end added a copy
+
+
+def test_a_signal_in_the_middle_of_close_still_finds_the_spans_left(monkeypatch):
+    """`close()` takes the table a chunk at a time, so a SIGTERM landing between
+    two chunks ships what the buffer has room for from what is left, rather than
+    finding the table already emptied into a close the process will not finish.
+    What does not fit is counted, and nothing ships twice."""
+    transport, client = _install(max_buffer_spans=10)
+    before = counters.snapshot().get("_runtime.open_spans_unshipped", 0)
+    managers = _open_nested(25)
+    real_drain = client._drain
+    fired = []
+
+    def drain_then_signal(timeout, **kwargs):
+        real_drain(timeout, **kwargs)
+        if not fired:  # once: after close() exported its first chunk
+            fired.append(True)
+            _signal_with(signal.SIG_DFL, monkeypatch)
+
+    monkeypatch.setattr(client, "_drain", drain_then_signal)
+    _runtime.runtime().teardown()
+    shipped = [sp.name for sp in transport.spans() if sp.name.startswith("open-")]
+    # ten from close() before the signal, ten from the handler, five counted
+    assert len(shipped) == len(set(shipped)) == 20
+    assert counters.snapshot().get("_runtime.open_spans_unshipped", 0) == before + 5
+    _close_all(managers)
+    assert len([sp for sp in transport.spans() if sp.name.startswith("open-")]) == 20
 
 
 # ==========================================================================
@@ -206,14 +344,19 @@ def test_an_open_decorated_generator_ships_marked_at_close():
 # ==========================================================================
 
 
-def test_a_full_table_turns_new_spans_away_and_counts_them(monkeypatch):
+def test_a_full_table_turns_new_spans_away_and_counts_them(monkeypatch, capsys):
+    reset_reports_for_test()
     monkeypatch.setattr(_runtime, "_MAX_OPEN_SPANS", 1)
     transport, _client = _install()
     before = counters.snapshot().get("_runtime.open_spans_full", 0)
     with wardex.span("root"):
         with wardex.span("overflow"):
-            assert counters.snapshot().get("_runtime.open_spans_full", 0) == before + 1
+            with wardex.span("overflow-too"):
+                pass
+            assert counters.snapshot().get("_runtime.open_spans_full", 0) == before + 2
             wardex.close()
+    lines = [ln for ln in capsys.readouterr().err.splitlines() if "open_spans_full" in ln]
+    assert len(lines) == 1  # said once, counted every time
     # The tracked root is the one shipped; the overflow had no guarantee.
     (root,) = transport.named("root")
     assert Limitation.UNIT_INTERRUPTED in _markers(root)

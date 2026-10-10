@@ -14,7 +14,7 @@ from contextlib import AbstractContextManager, contextmanager
 from .. import _hub
 from .._types import SpanContext
 from ._w3c import format_traceparent, parse_traceparent, sanitize_tracestate
-from ._with_only import WithOnly
+from ._with_only import WithOrSyncDecorator
 
 
 def continue_trace(headers: Mapping[str, str]) -> AbstractContextManager[None]:
@@ -22,15 +22,14 @@ def continue_trace(headers: Mapping[str, str]) -> AbstractContextManager[None]:
 
     Always enters an isolation scope (per-request state isolation). A valid
     traceparent installs a remote parent; a missing/malformed one starts a
-    fresh trace (W3C restart rule) — never raises. A `with` block, never a
-    decorator (see `WithOnly`).
+    fresh trace (W3C restart rule) — never raises. As a decorator it serves a
+    plain function only (see `WithOrSyncDecorator`), with the headers read once.
     """
-    return WithOnly(
+    return WithOrSyncDecorator(
         "continue_trace",
         _continue_trace(headers),
-        "As a decorator it would also read the headers only once, when the module "
-        "loads. Open it inside the function, where the request's headers are in "
-        "hand: `with wardex.continue_trace(headers):`.",
+        "Open it inside the function, where the request's headers are in hand: "
+        "`with wardex.continue_trace(headers):`.",
     )
 
 
@@ -114,9 +113,9 @@ def continue_from_otel() -> AbstractContextManager[None]:
 
     Entry semantics match continue_trace (isolation + remote parent).
     No opentelemetry installed, or no active/valid span -> plain isolation.
-    A `with` block, never a decorator (see `WithOnly`).
+    As a decorator it serves a plain function only (see `WithOrSyncDecorator`).
     """
-    return WithOnly(
+    return WithOrSyncDecorator(
         "continue_from_otel",
         _continue_from_otel(),
         "Open it inside the function: `with wardex.continue_from_otel():`.",
