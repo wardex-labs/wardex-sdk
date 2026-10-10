@@ -360,7 +360,10 @@ _MEMBER_SITES: dict[str, frozenset[str]] = {
     # `uninstall()` names ADAPTER_UNINSTALLED, and it is what an ordinary exit
     # reaches, because atexit tears the adapter down. `_runtime.py` names
     # UNIT_INTERRUPTED from the signal handler, on the one disposition where
-    # the process dies inside the handler and atexit provably never runs.
+    # the process dies inside the handler and atexit provably never runs, and
+    # from `teardown()` for the hand-opened spans still open at `close()` or
+    # atexit — no adapter's uninstall closed those. `_tracing.py` attaches the
+    # marker it is handed and names no member, so it is not a site here.
     #
     # Both members existed here as declarations with no emitter for as long as
     # `close_all` had no production caller — the state this table is designed to
@@ -1302,6 +1305,11 @@ _UNRESOLVED_PY: frozenset[tuple[str, str]] = frozenset(
         # And the Codex adapter's: `close_units(*, marker)` passing it on whole.
         ("_adapters/_codex_exec.py", "Name:marker"),
         ("_adapters/_registry.py", "Name:marker"),
+        # The same forward for a hand-opened span: `_tracing._interrupt` puts
+        # the marker `Runtime.interrupt_open_spans` hands it onto the span's
+        # draft, whole. Its callers spell the member at the sites that decide
+        # it (the signal handler and `teardown()`), both in `_MEMBER_SITES`.
+        ("_tracing.py", "Name:marker"),
         # The adapter contract's own two forwards. `Name:marker` is the `marker`
         # parameter of `Scope.note` / `RunHandle.note` / `Attachment.note` and
         # `AdapterContext.close_all`, each a one-line pass onto the registry.

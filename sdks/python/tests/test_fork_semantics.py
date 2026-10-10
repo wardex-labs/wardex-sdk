@@ -132,6 +132,31 @@ def installed_recording():
     wardex.close()
 
 
+@fork_only
+def test_a_fork_child_does_not_inherit_the_parents_open_manual_spans(installed_recording):
+    """A hand-opened span open across a fork ships from the parent, once.
+
+    The runtime tracks open manual spans so a shutdown can ship them marked as
+    cut off. A child holding the parent's table would ship them a second time,
+    under the same span ids, the moment it was closed — the N+1 shape this
+    file exists for. The block that crossed the fork pops itself from the table
+    it registered in, so the parent ships it exactly as before.
+    """
+    transport, client = installed_recording
+
+    def child():
+        inherited = len(_runtime.runtime()._open_spans)
+        wardex.close()
+        return {"inherited": inherited, "shipped": _exported_names(transport)}
+
+    with wardex.span("crossing"):
+        code, payload = _run_in_child(child)
+    client.flush()
+    assert code == 0, payload
+    assert payload == {"inherited": 0, "shipped": []}
+    assert _exported_names(transport).count("crossing") == 1
+
+
 # --------------------------------------------------------------------------
 # §6.1 — the duplication itself: one span, one process, once
 # --------------------------------------------------------------------------

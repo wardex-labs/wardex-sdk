@@ -443,6 +443,18 @@ All notable changes to this project are documented here. The format follows
   wrapper around an async function, and the span name passed positionally
   (`@wardex.tool("search")` or `with wardex.workflow("x")` — the name is
   `name=`, and a block is `with wardex.span("x")`).
+- **A run cut off by SIGTERM or `wardex.close()` keeps its root.** A
+  `@wardex.workflow` (or any decorator, `wardex.span()` or
+  `wardex.conversation()` block, or a decorated generator not yet exhausted)
+  still open when the process got the default SIGTERM — a deploy, `docker
+  stop` — or when `wardex.close()` or the exit hook ran, never shipped: its
+  block never reached its end. The backend got only the children that had
+  already finished, each pointing at a parent that never arrived. Such a span
+  now ships at that moment marked `unit_interrupted`, the marker an adapter's
+  run already carried in the same situation, with its children under it, and
+  the block ending later adds no second copy. A SIGTERM your app handles or
+  ignores, and a second `init()`, leave open spans running as before, since
+  the program carries on.
 - **A wrong project key, a receiver that is down, and every other loss no
   span can carry now say so once with `debug` off, and are counted.**
   Before, with the default `debug=False`, an export your receiver refused or

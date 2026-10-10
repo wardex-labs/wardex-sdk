@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 import time
 import uuid
 from collections.abc import Iterator
@@ -7,7 +8,7 @@ from contextlib import AbstractContextManager, contextmanager
 from types import TracebackType
 from typing import TYPE_CHECKING, Any
 
-from . import _hub
+from . import _hub, _runtime
 from ._assembly import (
     EMPTY_AMBIENT,
     Evidence,
@@ -39,6 +40,8 @@ if TYPE_CHECKING:
     # module's runtime namespace — the `noqa: ANN201` escape these properties
     # used to wear existed to dodge exactly this import, and a TYPE_CHECKING
     # import states the same fact without leaving the properties untyped.
+    from ._assembly import Limitation
+    from ._client import Client
     from ._types import CorrelationInfo, SpanContext, SpanId
 
 
@@ -339,24 +342,51 @@ def _begin(
 
     builder = Span(draft)
     fork = None if stepped else _install_parent(draft.context)
+    tracked = None
+    with guard("tracing.manual_track", debug=_debug_enabled()):
+        tracked = _runtime.runtime().track_open_span(
+            id(builder), functools.partial(_interrupt, builder)
+        )
     try:
         yield builder
     finally:
         if fork is not None:
             with guard("tracing.manual_fork_exit", debug=_debug_enabled()):
                 fork.__exit__(None, None, None)
-        finished = None
-        # `_finish()` validates, and a vocabulary breach must not reach the host
-        # (I6) — a `with wardex.span(...)` block would otherwise raise on the
-        # way out of code that has nothing to do with wardex.
-        with guard("tracing.manual_span", debug=_debug_enabled()):
-            finished = builder._finish()
-        client = None
+        # Gone from the table means a shutdown already shipped this span,
+        # marked as cut off, while the block was still open; a second copy
+        # under the same span id would contradict it. No `return` here: in a
+        # `finally` it would swallow the host's exception.
+        if tracked is None or tracked.pop(id(builder), None) is not None:
+            _emit(builder)
+
+
+def _emit(span: Span, client: Client | None = None) -> None:
+    """Finish `span` and hand it to `client`, or to the process client."""
+    finished = None
+    # `_finish()` validates, and a vocabulary breach must not reach the host
+    # (I6) — a `with wardex.span(...)` block would otherwise raise on the
+    # way out of code that has nothing to do with wardex.
+    with guard("tracing.manual_span", debug=_debug_enabled()):
+        finished = span._finish()
+    if client is None:
         with guard("tracing.manual_client", debug=_debug_enabled()):
             client = _hub.get_client()
-        if client is not None and finished is not None:
-            with guard("tracing.manual_emit", debug=_debug_enabled()):
-                client.capture_span(finished)
+    if client is not None and finished is not None:
+        with guard("tracing.manual_emit", debug=_debug_enabled()):
+            client.capture_span(finished)
+
+
+def _interrupt(span: Span, client: Client, marker: Limitation) -> None:
+    """Ship a span whose block is still open, because the process is stopping.
+
+    What `Runtime.interrupt_open_spans` calls, once, for a span it took from
+    the table. The status and any end time the host set are kept; the marker
+    says the block never reached its end.
+    """
+    with guard("tracing.manual_interrupt", debug=_debug_enabled()):
+        span._draft.add_limitation(marker)
+    _emit(span, client)
 
 
 def _install_parent(context: SpanContext) -> Any:

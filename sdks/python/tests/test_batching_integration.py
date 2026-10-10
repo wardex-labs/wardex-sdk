@@ -1,5 +1,6 @@
 """End-to-end batching & lifecycle — real signals, real fork, real HTTP."""
 
+import json
 import os
 import signal
 import subprocess
@@ -17,6 +18,10 @@ from wardex_sdk._limits import LimitsConfig
 from wardex_sdk._types import Envelope, InternalSpan, SpanContext, SpanId, TraceId
 from wardex_sdk.transport._base import Transport
 from wardex_sdk.transport._otlp_http import OtlpHttpTransport
+
+#: The SIGTERM tests below need the POSIX default disposition: a child that
+#: dies of the signal itself, with the exit code saying so.
+posix_signals = pytest.mark.skipif(sys.platform == "win32", reason="POSIX signal semantics")
 
 
 def _wait_for(predicate, timeout=5.0):
@@ -109,7 +114,7 @@ time.sleep(60)
 """
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="POSIX signal semantics")
+@posix_signals
 def test_sigterm_flushes_and_preserves_exit_code(tmp_path):
     script = tmp_path / "child.py"
     script.write_text(_SIGTERM_CHILD)
@@ -129,6 +134,86 @@ def test_sigterm_flushes_and_preserves_exit_code(tmp_path):
             proc.wait()  # reap — no zombie on the failure path
     assert rc == -signal.SIGTERM  # default termination (exit code) preserved
     assert marker.read_text() == "1"  # our handler flushed the span first
+
+
+# A run cut off mid-way by SIGTERM: the spans still open ship marked, once,
+# with the children that had already finished under them.
+
+_SIGTERM_OPEN_RUN_CHILD = r"""
+import json, os, signal, sys, time
+import wardex_sdk as wardex
+from wardex_sdk.transport._base import Transport
+
+out = sys.argv[1]
+
+class FileTransport(Transport):
+    def export(self, envelope):
+        with open(out, "a") as f:
+            for s in envelope.spans:
+                integ = s.capture_integrity
+                f.write(json.dumps({
+                    "name": s.name,
+                    "span": s.context.span_id.value.hex(),
+                    "parent": None if s.parent_span_id is None else s.parent_span_id.value.hex(),
+                    "start": s.start_time_ns,
+                    "end": s.end_time_ns,
+                    "markers": [] if integ is None else [m.value for m in integ.limitations],
+                }) + "\n")
+
+# interval 3600: only the signal handler can flush anything here
+wardex.init(transport=FileTransport(), intercept=False,
+            backend=wardex.BackendConfig(api_key="k"),
+            batching=wardex.BatchingConfig(flush_interval=3600.0))
+
+@wardex.tool(name="stream")
+def stream():
+    yield 1
+    yield 2
+
+@wardex.workflow(name="run")
+def run():
+    with wardex.span("chat"):
+        pass
+    items = stream()
+    next(items)
+    with wardex.span("inner"):
+        print("ready", flush=True)
+        time.sleep(30)
+
+run()
+"""
+
+
+@posix_signals
+def test_sigterm_ships_the_open_run_marked_with_its_finished_children_under_it(tmp_path):
+    script = tmp_path / "child.py"
+    script.write_text(_SIGTERM_OPEN_RUN_CHILD)
+    out = tmp_path / "spans.jsonl"
+    proc = subprocess.Popen(
+        [sys.executable, str(script), str(out)], stdout=subprocess.PIPE, text=True
+    )
+    try:
+        assert proc.stdout.readline().strip() == "ready"
+        proc.send_signal(signal.SIGTERM)
+        rc = proc.wait(timeout=15)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+    assert rc == -signal.SIGTERM  # the default termination is unchanged
+    spans = [json.loads(line) for line in out.read_text().splitlines()]
+    names = sorted(s["name"] for s in spans)
+    assert names == ["chat", "inner", "run", "stream"]  # each exactly once
+    by = {s["name"]: s for s in spans}
+    run = by["run"]
+    assert run["parent"] is None
+    assert run["markers"] == ["unit_interrupted"]
+    assert by["chat"]["parent"] == run["span"]
+    assert by["chat"]["markers"] == []  # it finished on its own
+    for still_open in ("inner", "stream"):
+        assert by[still_open]["parent"] == run["span"]
+        assert by[still_open]["markers"] == ["unit_interrupted"]
+        assert by[still_open]["end"] <= run["end"]  # newest first: no child outlives its parent
 
 
 _SIGTERM_PENDING_CHILD = """
@@ -178,7 +263,7 @@ time.sleep(60)
 """
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="POSIX signal semantics")
+@posix_signals
 def test_sigterm_ships_the_pending_parse_too(tmp_path):
     """The signal path is a flush with no second chance: a deferred job still
     pending when SIGTERM lands must leave — parsed inside the half-budget or

@@ -510,7 +510,7 @@ _BARE_MARKERS = frozenset({"pytest.mark.skip", "pytest.mark.skipif", "pytest.mar
 #: constitution, not a detail of the change that wanted it. This also keeps the
 #: scan honest: a scanner that stopped seeing markers would report 0 and fail
 #: here rather than pass an empty check.
-_SKIP_SITE_BUDGET = 11
+_SKIP_SITE_BUDGET = 10
 
 
 def _dotted_name(node: ast.AST) -> str | None:

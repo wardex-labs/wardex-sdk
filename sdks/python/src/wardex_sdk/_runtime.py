@@ -1,10 +1,10 @@
 """The one owner of everything wardex installs into the host process.
 
 Every piece of interpreter-global state the SDK holds — the signal table,
-atexit, the current client, the interceptor and adapter registries, and the
-shared connection-timing probe — belongs to the single `Runtime` below
-(design §4.3). Nothing else in the SDK keeps a mutable module global that
-outlives a call.
+atexit, the current client, the interceptor and adapter registries, the table
+of open manual spans, and the shared connection-timing probe — belongs to the
+single `Runtime` below (design §4.3). Nothing else in the SDK keeps a mutable
+module global that outlives a call.
 
 WHY ONE OWNER. Those five things used to be five module globals spread over
 four modules, and the teardown that undoes them was written twice — once in
@@ -62,6 +62,7 @@ import signal
 import sys
 import threading
 import time
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 from ._assembly import Limitation, counters, diag_info, guard, report_signal_flush_raised
@@ -99,6 +100,20 @@ _SIGNALS = (signal.SIGINT, signal.SIGTERM)
 #: process is being torn down. The fact is not hidden either -- the transport
 #: still logs the failed POST under `debug`, at the layer that observed it.
 _SIGNAL_FLUSH_TIMEOUT = _UnnamedTimeout(2.0, "<wardex's own signal-flush budget>")
+
+#: How many open manual spans the runtime tracks for shutdown at once.
+#:
+#: A span past this bound still opens and ships when its block ends; what it
+#: loses is the shutdown guarantee, and the loss is counted
+#: (`_runtime.open_spans_full`). New spans are the ones turned away, never the
+#: tracked ones: the longest-open span is the run's root, the one the
+#: guarantee exists for. Ten thousand is far above any nesting depth times
+#: concurrency a host reaches; the bound is there for a host that leaks open
+#: frames, so the table cannot grow with the leak.
+_MAX_OPEN_SPANS = 10_000
+
+#: What an open span hands the runtime: ship me now, to this client, saying why.
+Interrupt = Callable[[Client, Limitation], None]
 
 
 def _handler(signum: int, frame: object) -> None:
@@ -144,6 +159,7 @@ class Runtime:
         "_fork_reinit_us",
         "_interceptors",
         "_lock",
+        "_open_spans",
         "_prev_handlers",
         "_signals_installed",
     )
@@ -167,6 +183,10 @@ class Runtime:
         #: can land in the middle of an import and hand the handler a
         #: half-initialized module.
         self._close_units: Any = None
+        #: The manual spans whose blocks are open right now — see
+        #: `track_open_span`. Replaced, never cleared, by a fork child and a
+        #: reset: a block registered in the old table pops itself from THAT one.
+        self._open_spans: dict[int, Interrupt] = {}
 
     # -- the client ---------------------------------------------------------
 
@@ -267,9 +287,13 @@ class Runtime:
     def teardown(self, *, timeout: float | None = None) -> None:
         """Uninstall everything and close the process client. Idempotent.
 
-        The one implementation `wardex.close()`, `atexit` and re-init all reach.
+        The one implementation `wardex.close()` and `atexit` reach; re-init
+        reaches `_teardown` alone. Only this path interrupts open manual spans:
+        a re-init leaves the program running, and a block still open then ends
+        normally and ships to the new client.
         """
         with self._lock:
+            self.interrupt_open_spans(self._client, Limitation.UNIT_INTERRUPTED)
             self._teardown(self._client, timeout=timeout)
 
     def _teardown(self, client: Client | None, *, timeout: float | None = None) -> None:
@@ -383,7 +407,11 @@ class Runtime:
         """
         started = time.perf_counter()
         # step 0 — replace the locks the hook itself would otherwise step on.
+        # The open-span table is replaced too: the parent ships those spans
+        # (I-fork-3), and the one block that crossed the fork pops itself from
+        # the table it registered in and ships from here as it always has.
         self._lock = threading.RLock()
+        self._open_spans = {}
         diag_reset_for_new_process()
         with guard("_runtime.fork_reinit_failed"):
             # step 1 — slots, directly.
@@ -446,7 +474,54 @@ class Runtime:
             self._uninstall_signal_handlers()
             self._close_units = None
             self._client = None
+            self._open_spans = {}
             _reset_shared_timing()
+
+    # -- open manual spans --------------------------------------------------
+
+    def track_open_span(self, key: int, interrupt: Interrupt) -> dict[int, Interrupt] | None:
+        """Record a manual span whose block is open, so shutdown can close it.
+
+        A hand-opened span ships when its block ends, and a process stopped
+        mid-block never gets there: the default SIGTERM ends it inside the
+        signal handler, and `close()` refuses every capture after it. Before
+        this table, such a run shipped the children that had already finished,
+        each pointing at a parent that never arrived. Adapter units always had
+        the guarantee (`close_units_all`); this gives hand-opened spans the same.
+
+        Returns the table the span is in, or None when it is full. The block
+        pops its own key from THAT table on the way out, and the pop is the
+        arbiter: whoever takes the entry — the block or `interrupt_open_spans`
+        — is the one that ships the span, so it ships exactly once. Plain dict
+        operations with no lock, because the other party can be a signal
+        handler on this very thread, between any two bytecodes.
+        """
+        table = self._open_spans
+        if len(table) >= _MAX_OPEN_SPANS:
+            counters.bump("_runtime.open_spans_full")
+            return None
+        table[key] = interrupt
+        return table
+
+    def interrupt_open_spans(self, client: Client | None, marker: Limitation) -> None:
+        """Ship every tracked open span now, newest first, saying why.
+
+        Newest first (`popitem` is LIFO), so a child ends no later than its
+        parent. A closed client is left alone: its `close()` already ran, and a
+        span opened after it ships to whatever client its block finds at the
+        end, as before. Each span is guarded on its own, so one that fails
+        cannot cost the rest — or, from the signal handler, the flush after.
+        """
+        if client is None or client._closed:
+            return
+        table = self._open_spans
+        while True:
+            try:
+                _key, interrupt = table.popitem()
+            except KeyError:  # empty, possibly emptied by a block on another thread
+                return
+            with guard("_runtime.interrupt_open_span"):
+                interrupt(client, marker)
 
     # -- signals ------------------------------------------------------------
 
@@ -471,6 +546,10 @@ class Runtime:
                 # second net here would add an unsanctioned one and hide nothing
                 # that is not already caught.
                 close_units(marker=Limitation.UNIT_INTERRUPTED)
+            if prev is signal.SIG_DFL:
+                # The same disposition and the same reason, for the spans the
+                # host opened by hand (`@wardex.workflow`, `wardex.span()`).
+                self.interrupt_open_spans(client, Limitation.UNIT_INTERRUPTED)
             try:
                 # The shutdown arm of flush, not the public one: the process
                 # dies in this handler (SIG_DFL is re-raised below), so
