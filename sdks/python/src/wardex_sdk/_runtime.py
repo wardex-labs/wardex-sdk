@@ -71,6 +71,7 @@ from ._client import Client, _UnnamedTimeout
 if TYPE_CHECKING:
     from ._adapters._registry import AdapterRegistry
     from ._config import WardexConfig
+    from ._diagnostics import AdapterStatus
     from ._interceptors._registry import InterceptorRegistry
 
 _SIGNALS = (signal.SIGINT, signal.SIGTERM)
@@ -203,6 +204,23 @@ class Runtime:
 
                 self._adapters = _registry.AdapterRegistry()
             return self._adapters
+
+    def describe(self) -> tuple[bool, tuple[AdapterStatus, ...]]:
+        """Whether a client is installed and still open, and what became of each
+        adapter at the last `init()` — read together, under the lock `install`
+        holds from setting the client to filing the last adapter, so a reader on
+        another thread never sees an open client with no adapters yet.
+
+        The client slot alone does not say "live": teardown closes the client
+        and leaves it in place. Never BUILDS the registry: one that was never
+        built has nothing to report, and building it would import `_adapters/`,
+        which reaches the native extension.
+        """
+        with self._lock:
+            client = self._client
+            live = client is not None and not getattr(client, "_closed", False)
+            registry = self._adapters
+            return live, (() if registry is None else registry.statuses())
 
     # -- install ------------------------------------------------------------
 

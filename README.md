@@ -160,7 +160,7 @@ short `gpt-4o-mini` calls against your OpenAI key.
 ```bash
 git clone https://github.com/wardex-labs/wardex-sdk && cd wardex-sdk
 python3 -m venv .venv-quickstart && source .venv-quickstart/bin/activate
-pip install "wardex-sdk>=0.6.0b1" openai-agents
+pip install "wardex-sdk>=0.6.0b1" "openai-agents>=0.22,<0.23"
 export OPENAI_API_KEY=sk-...                             # the framework's own requirement
 export WARDEX_ENDPOINT=http://127.0.0.1:6006/v1/traces   # a local Phoenix
 python examples/openai_agents_quickstart.py
@@ -179,15 +179,29 @@ tree.
 
 | Framework | What becomes a span |
 |---|---|
-| OpenAI Agents SDK (`openai-agents>=0.22,<0.23`) | each run, agent, function tool, handoff and guardrail; model calls read from the wire |
-| LangGraph (`langgraph>=1.2`) | each graph run, node and `ToolNode` tool call, including subgraphs and the functional API |
-| Claude Agent SDK (`claude_agent_sdk`) | agent turns and model calls, with tool calls correlated |
+| OpenAI Agents SDK (tested on `openai-agents` 0.22.x) | each run, agent, function tool, handoff and guardrail; model calls read from the wire |
+| LangGraph (tested on `langgraph` 1.2.x) | each graph run, node and `ToolNode` tool call, including subgraphs and the functional API |
+| Claude Agent SDK (tested on `claude-agent-sdk` 0.2.x) | agent turns and model calls, with tool calls correlated |
 | Codex CLI (`codex exec`, run as a subprocess) | each run, with its prompt, answer, tool calls and the turn's token usage; with `CodexExecConfig(otel_bridge=True)`, one span per model call with its model and timing |
 | Any other framework, or your own loop | model calls with model, messages and token usage; decorators add the structure |
 
 Adapters are detected automatically when the framework is installed (the
 Codex adapter when `codex` is on `PATH`); `AdaptersConfig` selects and
 configures them.
+
+Each adapter is tested against the framework releases in the table above. On
+any other release it still installs and records, and says so once on stderr
+with the installed version, the tested range and the pin that gets back to it,
+because a framework release can change what an adapter records without
+changing anything the adapter can check. An adapter whose framework is
+installed but not in a shape it recognizes does not install, and says that
+once too. `wardex.diagnostics()` returns each adapter's state, the framework
+version it found and whether that version was tested, at any time:
+
+```python
+for adapter in wardex.diagnostics().adapters:
+    print(adapter.name, adapter.state.value, adapter.version, adapter.measured)
+```
 
 The Codex adapter only reads what your process already exchanges with
 `codex exec` — the prompt passed to `communicate()` and the `--json` events

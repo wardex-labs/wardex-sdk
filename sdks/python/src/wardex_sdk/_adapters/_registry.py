@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 
 from .._assembly import Limitation, UnitRegistry, counters, guard
 from .._config import AdaptersConfig
+from .._diagnostics import AdapterStatus
 from .._limits import LimitsConfig, LimitsConsumer, limits_kwargs
 from ._base import AdapterInterface
 from ._context import AdapterContext
@@ -90,6 +91,10 @@ class AdapterRegistry:
     def __init__(self) -> None:
         self._installed: dict[str, AdapterInterface] = {}
         self._contexts: dict[str, AdapterContext] = {}
+        #: What became of every adapter tried in this process, installed or not.
+        #: Cleared with the adapters themselves, so it describes the current
+        #: `init()` and nothing before it.
+        self._statuses: dict[str, AdapterStatus] = {}
 
     def install(
         self, adapter: AdapterInterface, client: Client | None, *, explicit: bool = False
@@ -101,7 +106,7 @@ class AdapterRegistry:
         have its body executed by that import — so the framework probe
         (distribution present, module not shadowed) runs in front of it, at
         the one place every way in passes through: auto-detection,
-        `enabled=` (which sets `explicit`, see `_framework_present`), and
+        `enabled=` (which sets `explicit`, see `_framework_absence`), and
         `testing.installed_adapter`. Spelled per adapter, it was spelled in
         one adapter and missing from the others.
 
@@ -129,20 +134,38 @@ class AdapterRegistry:
             return
         # Lazily, for the reason `context_for` gives: the package `__init__`
         # imports this module before the registration table exists.
-        from . import _framework_present
+        from . import (
+            _failed_status,
+            _framework_absence,
+            _framework_versions,
+            _installed_status,
+            _status,
+            _unsupported_status,
+        )
 
         debug = bool(getattr(getattr(client, "config", None), "debug", False))
-        if not _framework_present(name, explicit=explicit, debug=debug):
+        absence = _framework_absence(name, explicit=explicit, debug=debug)
+        if absence is not None:
+            self._statuses[name] = _status(name, absence, _framework_versions(name))
             return
         ctx = context_for(name, client, adapter)
         self._installed[name] = adapter
         self._contexts[name] = ctx
 
         ok = False
-        with guard(f"adapters.{name}.install"):
+        # `debug` passed so the traceback the failure line points to is there.
+        with guard(f"adapters.{name}.install", debug=debug):
             adapter.install(client, ctx)
             ok = True
-        if ok:
+        # RETURNING IS NOT INSTALLING. An adapter whose framework is here but
+        # whose surface it does not recognize returns without patching, and
+        # this used to file it as installed: `is_installed` said yes, and the
+        # spans were simply never there. Every shipped adapter raises its
+        # `_installed` flag as the last line of a real install, so a flag left
+        # down after a clean return is the decline. An adapter that keeps no
+        # such flag (a test double, an out-of-tree adapter) is taken at its word.
+        if ok and getattr(adapter, "_installed", True) is not False:
+            self._statuses[name] = _installed_status(name)
             return
 
         with guard(f"adapters.{name}.install_rollback"):
@@ -150,6 +173,15 @@ class AdapterRegistry:
         ctx.patches.restore_all()
         self._installed.pop(name, None)
         self._contexts.pop(name, None)
+        self._statuses[name] = _unsupported_status(name) if ok else _failed_status(name)
+
+    def record(self, status: AdapterStatus) -> None:
+        """File the status of an adapter that was never handed to `install`."""
+        self._statuses[status.name] = status
+
+    def statuses(self) -> tuple[AdapterStatus, ...]:
+        """Every adapter's status, by name. A snapshot: later installs do not change it."""
+        return tuple(self._statuses[name] for name in sorted(self._statuses))
 
     def uninstall_all(self) -> None:
         """Uninstall every adapter. Total: one failure cannot stop the rest.
@@ -194,6 +226,7 @@ class AdapterRegistry:
             name = next(reversed(self._installed))
             ordered.append((name, self._installed.pop(name)))
             self._contexts.pop(name, None)
+        self._statuses.clear()
         self._sweep(ordered, act, where)
 
     @staticmethod

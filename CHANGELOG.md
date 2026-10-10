@@ -7,6 +7,24 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- **wardex now says when an adapter is on a framework release it was not
+  tested against, and when an adapter did not install at all.** A framework
+  release can change what an adapter records without changing the names and
+  signatures it checks before installing, so before, an upgrade could leave
+  the tree quietly wrong, or, when it moved something the adapter patches,
+  leave no tree at all while wardex still counted the adapter as installed.
+  Now each adapter carries the releases it was tested on (openai-agents
+  0.22.x, langgraph 1.2.x with langgraph-prebuilt 1.1.x, claude-agent-sdk
+  0.2.x). On another release it still installs and records, and one
+  `[wardex]` line at `init()` names the installed version, the tested range
+  and the pin back to it. An adapter that finds its framework but not the
+  surface it was written for, or that raises while installing, is no longer
+  counted as installed, and says so once with the version it found. The new
+  `wardex.diagnostics()` returns every adapter's `AdapterState` (`installed`,
+  `unsupported`, `failed`, `shadowed`, `absent`, `disabled`), the framework
+  version, whether that version was tested, and the line wardex printed about
+  it.
+
 - **A `codex exec` your code runs is now an agent run in the trace.** Codex
   talks to its model from its own process, so before, an app that ran
   `codex exec` (as a model, or as a sub-agent) recorded nothing at all for

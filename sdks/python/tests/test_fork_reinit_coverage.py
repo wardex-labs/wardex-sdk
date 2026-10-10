@@ -104,6 +104,7 @@ _FORK_EXEMPT: dict[tuple[str, str], str] = {
     #    forgetting them would strand the child's teardown.
     ("_adapters/_registry.py", "_installed"): "install record, kept (I-fork-4)",
     ("_adapters/_registry.py", "_contexts"): "install record, kept (I-fork-4)",
+    ("_adapters/_registry.py", "_statuses"): "install record, kept (I-fork-4)",
     ("_interceptors/_registry.py", "_installed"): "install record, kept (I-fork-4)",
     ("context/_inject.py", "_installed"): "patch record, kept (I-fork-4)",
     ("_assembly/_patchset.py", "_patches"): "restore records, kept (I-fork-4)",
@@ -458,6 +459,7 @@ _LOCK_TYPE = type(threading.Lock())
 _WALK_ALLOWED_POPULATED: dict[str, str] = {
     "_installed": "install/patch records are kept (I-fork-4)",
     "_contexts": "install records are kept (I-fork-4)",
+    "_statuses": "install records are kept (I-fork-4)",
     "_patches": "restore records are kept (I-fork-4)",
     "_prev_handlers": "signal dispositions survive fork by design (§3.8)",
     "_limits": "resolved config projection — immutable by convention",

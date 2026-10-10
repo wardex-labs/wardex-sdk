@@ -526,7 +526,11 @@ def test_an_unrecognized_surface_declines_loudly_and_registers_nothing(
         assert not live.adapter._installed
         assert counters.get("adapters.openai_agents.unsupported_surface") == 1
     warnings = wardex_log.lines(logging.WARNING)
-    assert len(warnings) == 1 and "surface unrecognized" in warnings[0]
+    # Two lines, each said once: the adapter's, naming what will be missing,
+    # and the registry's, naming the version it found and what to do.
+    assert len(warnings) == 2
+    assert "surface unrecognized" in warnings[0]
+    assert "did not install" in warnings[1] and "openai-agents " in warnings[1]
 
 
 def _fake_agents_package(tmp_path, *, with_tracing: bool):  # noqa: ANN001, ANN202

@@ -162,7 +162,7 @@ if it and the table in that file are not the same fact.
 
 ```
 rank 0   `_enums.py` · `_hash.py` · `_native.py` · `_source_paths.py` · `_suppress.py` · `_version.py` · `_wardex_native`
-rank 1   `_limits.py` · `_types.py`
+rank 1   `_diagnostics.py` · `_limits.py` · `_types.py`
 rank 2   `_config.py` · `_hub.py` · `_scope.py`
 rank 3   `context/`
 rank 4   `_assembly/`
@@ -177,7 +177,7 @@ rank 12  `__init__.py` · `testing/`
 ```
 
 - Ranks 2..10 are the order the imports are meant to have, not one they already
-  have. Twelve of the twenty-six Python units form a single import cycle, and
+  have. Twelve of the twenty-seven Python units form a single import cycle, and
   `_hub.py` is its hinge: it hands out the process-global client, so nearly
   every layer below imports it, and to do that it imports `_client.py` and
   `_runtime.py`. No rank is widened to absorb that cycle. The five imports that

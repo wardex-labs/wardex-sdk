@@ -109,7 +109,7 @@ before typing:
 
 ```bash
 python3 -m venv .venv-quickstart && source .venv-quickstart/bin/activate
-pip install "wardex-sdk>=0.6.0b1" openai-agents
+pip install "wardex-sdk>=0.6.0b1" "openai-agents>=0.22,<0.23"
 ```
 
 (The virtualenv is named `.venv-quickstart` rather than `.venv` so that a
