@@ -42,7 +42,7 @@ class _FakeClient:
         self.spans: list = []
         self.snapshots: list = []
 
-    def capture_span(self, span) -> None:
+    def capture_span(self, span, *, scope=None) -> None:
         self.spans.append(span)
 
     def capture_deferred(self, job) -> None:
@@ -141,7 +141,7 @@ def _site_mcp_stdio(client: _FakeClient):
     state = _ProcState()
     state.feed_request(b'{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"t"}}\n')
     spans = state.feed_response(b'{"jsonrpc":"2.0","id":1,"result":{"content":[]}}\n')
-    return spans[0]
+    return spans[0][0]
 
 
 def _site_adapter_root(client: _FakeClient):

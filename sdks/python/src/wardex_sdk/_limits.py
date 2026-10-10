@@ -204,8 +204,8 @@ _LIMIT_DELIVERY: dict[LimitsConsumer, _Delivery] = {
         delivers={"sample_cap": "ws_sample_bytes"},
         native=frozenset({"limits"}),
         # `llm_upgrade` is the endpoint table's answer about the upgrade
-        # path, not a bound: a decision the seam passes through. So is
-        # `conversation`, latched with the upgrade's parent.
+        # path, not a bound: a decision the seam passes through. So are
+        # `conversation` and `scope`, latched with the upgrade's parent.
         passthrough=frozenset(
             {
                 "path",
@@ -213,6 +213,7 @@ _LIMIT_DELIVERY: dict[LimitsConsumer, _Delivery] = {
                 "parent",
                 "parent_closed",
                 "conversation",
+                "scope",
                 "start_ns",
                 "llm_upgrade",
             }

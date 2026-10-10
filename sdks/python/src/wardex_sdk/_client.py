@@ -606,25 +606,25 @@ class Client:
         span: InternalSpan,
         merged: tuple[dict[str, str], Any] | None = None,
     ) -> InternalSpan:
-        """Fold the ambient scope's tags and user into the span's `extra`.
+        """Fold a scope's tags and user into the span's `extra`.
 
         This is the one place the scope stratum reaches the wire: every capture
         path converges on `_admit`, so stamping here is what makes
         `set_tag`/`set_user` mean something on EXPORTED spans instead of being
-        write-only state. Read at capture time, from the calling context —
-        which is the context the span was produced on, so an
-        `isolation_scope()` block's tags reach exactly the spans captured
-        inside it.
+        write-only state. WHICH scope is the producer's to say: the one the
+        work was issued in, which need not be the context that captures the
+        span — the byte seams ship from whoever read the reply or closed the
+        socket, MCP stdio from a reader task the session's opener started.
 
-        `merged` is a `(tags, user)` SNAPSHOT taken earlier, on the thread
-        that produced the span — the deferred-parse path's stamp. It exists
-        because `Scope` is MUTABLE and `contextvars.copy_context()` preserves
-        bindings, not the contents of the object bound: a worker re-reading
-        the scope at finalize time would stamp "the dict as it is now" rather
-        than "the dict as it was at capture", and one queued request later
-        that is another tenant's user id on this tenant's span (design §3.7).
-        `None` means "read the ambient scope now", which is the synchronous
-        path and exactly what this method always did.
+        `merged` is a `(tags, user)` SNAPSHOT the producer took where the work
+        was issued (`_interceptors/_issue_scope.py`), or, for a deferred parse
+        that brought none, at submit. A snapshot because `Scope` is MUTABLE and
+        `contextvars.copy_context()` preserves bindings, not the contents of
+        the object bound: a later read stamps "the dict as it is now", and one
+        queued request later that is another tenant's user id on this tenant's
+        span (design §3.7). `None` means "read the calling context's scope
+        now", right only where a span is captured in the context its work was
+        issued in, as a `wardex.span()` block's span is.
 
         Precedence: a key the span already carries wins over the scope (a
         span-local `set_attribute` is more specific than ambient state), and
@@ -670,10 +670,10 @@ class Client:
                     stamped = replace(span, extra=span.extra + tuple(additions))
         return stamped
 
-    def capture_span(self, span: InternalSpan) -> None:
+    def capture_span(self, span: InternalSpan, *, scope: Any = _AMBIENT) -> None:
         if self._closed:
             return
-        self._admit(span)
+        self._admit(span, scope=scope)
 
     def capture_deferred(self, job: Any) -> None:
         """Hand one sealed `DeferredSpan` to the finalize queue.
@@ -688,10 +688,10 @@ class Client:
            `capture_span`'s silent return, a sealed job represents bodies the
            seam already captured, and dropping those uncounted is the silent
            loss I6 forbids;
-        2. the mutable-Scope snapshot is taken HERE, on the submitting
-           thread, right now (§3.7): `set_user(B)` one request later must
-           not retag this request's span. Guarded, because the host may be
-           mutating the scope's dicts on another thread this very instant;
+        2. the mutable-Scope snapshot is the job's own (`job.scope`, taken
+           where its request was issued), else taken HERE, right now (§3.7):
+           `set_user(B)` one request later must not retag this span. Guarded,
+           as the host may be mutating the scope's dicts on another thread;
         3. the worker spawn is guarded separately (`ulimit` can make
            `Thread.start` raise), and a spawn failure DOWNGRADES rather than
            drops: the job is finalized inline, parse-less, carrying
@@ -707,7 +707,7 @@ class Client:
             # type, so the edge cannot exist at import time in this direction.
             from . import _hub  # noqa: PLC0415
 
-            scope = _hub.get_merged_tags_and_user()
+            scope = getattr(job, "scope", None) or _hub.get_merged_tags_and_user()
         alive = False
         with guard("client.finalize.spawn", debug=self._config.debug):
             self._finalize.ensure_alive()
@@ -733,9 +733,9 @@ class Client:
         even while `close()` is mid-teardown — step 4 of `close()` finalizes
         pending parses precisely so their spans reach the final drain.
 
-        `scope` is `_AMBIENT` (read the calling context's scope now — the
-        synchronous path, unchanged behaviour) or the `(tags, user)` snapshot
-        a `capture_deferred` took on the submitting thread. A sentinel and
+        `scope` is `_AMBIENT` (read the calling context's scope now) or the
+        `(tags, user)` snapshot the producer took where the work was issued,
+        or `capture_deferred` at submit (`_stamp_scope`). A sentinel and
         not `None`, because an EMPTY snapshot is a real value: "there were no
         tags at capture time" must not decay into "read whatever this worker
         thread's scope holds now" (design §3.7).

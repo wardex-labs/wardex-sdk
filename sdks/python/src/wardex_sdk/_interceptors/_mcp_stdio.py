@@ -48,6 +48,7 @@ from .._types import (
     TransportTiming,
 )
 from ._base import InterceptorInterface
+from ._issue_scope import UNKNOWN_ISSUER, ScopeSnapshot, issued_scope
 
 # OPTIONAL, and it has to be: anyio is a third-party package, this wheel
 # declares no runtime dependencies, and `_backends._asyncio` is anyio's PRIVATE
@@ -89,6 +90,10 @@ class _Pending:
     #: Latched with the ambient, on the task that issued the request; the
     #: subprocess reader that answers the response cannot re-ask it.
     parent_closed: bool = False
+    #: The tags and user the span is stamped with, snapshotted with the
+    #: ambient for the same reason (`_issue_scope`): the reader that captures
+    #: the span runs in whichever context started it, often another request's.
+    scope: ScopeSnapshot = UNKNOWN_ISSUER
 
 
 class _ProcState:
@@ -151,12 +156,15 @@ class _ProcState:
                     start_ns=time.time_ns(),
                     ambient=ambient,
                     parent_closed=parent_is_closed_unit(ambient.span_context),
+                    scope=issued_scope(),
                 )
             if len(self._latch) > 4096:  # leak-defense cap
                 self._latch.pop(next(iter(self._latch)))
 
-    def feed_response(self, data: bytes) -> list[InternalSpan]:
-        out: list[InternalSpan] = []
+    def feed_response(self, data: bytes) -> list[tuple[InternalSpan, ScopeSnapshot]]:
+        """The spans the responses in `data` complete, each with the scope identity its request
+        was issued under (`_Pending.scope`), for `Client.capture_span(scope=)`."""
+        out: list[tuple[InternalSpan, ScopeSnapshot]] = []
         self._resp_bytes += len(data)
         for m in self._resp.feed(data):
             # Counted BEFORE the correlation filter below, and that ordering is
@@ -195,7 +203,7 @@ class _ProcState:
             with guard("interceptors.mcp_stdio.build_span", debug=self._debug):
                 span = _build_mcp_span(pending, m)
             if span is not None:
-                out.append(span)
+                out.append((span, pending.scope))
         return out
 
     def should_detach(self) -> bool:
@@ -570,9 +578,9 @@ class McpStdioInterceptor(InterceptorInterface):
                         detach()
                 raise
             try:
-                for span in state.feed_response(bytes(data)):
+                for span, scope in state.feed_response(bytes(data)):
                     if client is not None:
-                        client.capture_span(span)
+                        client.capture_span(span, scope=scope)
                 _maybe_log_disabled(client, state, pid)
                 # Asked on THIS side too, which is the half that was missing: a
                 # subprocess that writes little to stdin and streams a lot back
@@ -634,9 +642,9 @@ class McpStdioInterceptor(InterceptorInterface):
         async def readline(*, _oreadline: Any = _oreadline, state: _ProcState = state) -> Any:
             data = await _oreadline()
             try:
-                for span in state.feed_response(bytes(data)):
+                for span, scope in state.feed_response(bytes(data)):
                     if client is not None:
-                        client.capture_span(span)
+                        client.capture_span(span, scope=scope)
                 _maybe_log_disabled(client, state, pid)
                 if not data:
                     # `readline` reports EOF by returning b"" — this seam's

@@ -32,6 +32,7 @@ from .._assembly import counters, parent_is_closed_unit
 from .._protocol import REQUEST_METHODS
 from .._protocol._http1 import Http1RequestParser
 from .._types import ConversationContext, ParsedMessage, SpanContext
+from ._issue_scope import UNKNOWN_ISSUER, ScopeSnapshot, issued_scope
 
 
 @dataclass(frozen=True)
@@ -45,10 +46,14 @@ class Issue:
     #: to do with that run (`assembly.parent_is_closed_unit`).
     parent_closed: bool
     conversation: ConversationContext | None
+    #: The tags and user the span is stamped with (`_issue_scope`): read here, not where the reply
+    #: is read or the socket closed, which may be another request's context.
+    scope: ScopeSnapshot
 
 
-#: What a reply pairs with when no request byte was latched: its start is the reply's own.
-NOT_SEEN = Issue(0, None, False, None)
+#: What a reply pairs with when no request byte was latched: its start is the reply's own, and no
+#: issuer's identity is guessed for it.
+NOT_SEEN = Issue(0, None, False, None, UNKNOWN_ISSUER)
 
 
 def _opens_like_a_request(data: bytes) -> bool:
@@ -63,7 +68,8 @@ def _sent_by_a_client(method: str | None) -> bool:
 def _issued_here() -> Issue:
     scope = _hub.get_current_scope()  # ONE read: parent and conversation are one fact
     parent = scope.active_span_context
-    return Issue(time.time_ns(), parent, parent_is_closed_unit(parent), scope.conversation)
+    closed = parent_is_closed_unit(parent)
+    return Issue(time.time_ns(), parent, closed, scope.conversation, issued_scope())
 
 
 class _Reading:

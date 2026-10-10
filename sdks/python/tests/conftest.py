@@ -366,7 +366,7 @@ def bare_ssl_interceptor():
             self.config = _Config()
             self.spans: list[object] = []
 
-        def capture_span(self, span: object) -> None:
+        def capture_span(self, span: object, *, scope: object = None) -> None:
             self.spans.append(span)
 
         def capture_deferred(self, job: object) -> None:

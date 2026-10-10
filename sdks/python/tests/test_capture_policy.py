@@ -55,7 +55,7 @@ class _FakeClient:
         self.config = WardexConfig(capture_mode=mode, backend=BackendConfig(api_key="k"))
         self.spans: list[Any] = []
 
-    def capture_span(self, span: Any) -> None:
+    def capture_span(self, span: Any, *, scope: Any = None) -> None:
         self.spans.append(span)
 
     def capture_deferred(self, job: Any) -> None:
@@ -993,7 +993,7 @@ def test_mcp_stdio_does_not_parent_a_tool_call_into_a_finished_run():
         spans = state.feed_response(b'{"jsonrpc":"2.0","id":1,"result":{"content":[]}}\n')
 
     assert len(spans) == 1, "agent_semantic=True keeps the span; only its PARENT changes"
-    span = spans[0]
+    span, _scope = spans[0]
     assert span.parent_span_id is None
     assert span.context.trace_id != dead.context.trace_id
     assert span.correlation.strategy is ParentSource.UNRESOLVED

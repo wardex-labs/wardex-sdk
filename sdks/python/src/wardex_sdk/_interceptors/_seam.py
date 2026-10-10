@@ -256,11 +256,10 @@ class ByteSeamInterceptor(InterceptorInterface):
     def _fresh_patchset(self) -> PatchSet:
         """This seam's PatchSet, wired to the client's debug setting.
 
-        Built at install() rather than in `__init__` because `config.debug` is
-        not known until a client arrives, and a restore that fails invisibly
-        under `debug=True` is exactly what `_diag` exists to prevent. The empty
-        set `__init__` makes is what keeps `uninstall()` safe before any
-        `install()`.
+        Built at install() rather than in `__init__` because `config.debug` is not known until a
+        client arrives, and a restore that fails invisibly under `debug=True` is exactly what
+        `_diag` exists to prevent. The empty set `__init__` makes is what keeps `uninstall()` safe
+        before any `install()`.
         """
         config = getattr(self._client, "config", None)
         return PatchSet(f"interceptors.{self.name()}", debug=bool(getattr(config, "debug", False)))
@@ -333,10 +332,9 @@ class ByteSeamInterceptor(InterceptorInterface):
     def _acquire_probes(self) -> None:
         """Take this seam's references on the two shared, refcounted probes.
 
-        One call so that a seam cannot take the timing probe and forget the
-        close hook: without the second, this seam's per-connection state is
-        evicted only when the socket is COLLECTED, which a pooled connection
-        may never be while the process runs.
+        One call so that a seam cannot take the timing probe and forget the close hook: without the
+        second, this seam's per-connection state is evicted only when the socket is COLLECTED, which
+        a pooled connection may never be while the process runs.
         """
         self._acquire_timing()
         self._acquire_close_hook()
@@ -385,10 +383,9 @@ class ByteSeamInterceptor(InterceptorInterface):
     def _guard(self, where: str) -> guard:
         """The one authorized swallow, wired to this seam's debug setting.
 
-        Span assembly runs `SpanDraft.finish()`, which raises `VocabularyError`
-        on a vocabulary breach, and I6 forbids that reaching the host. It is
-        counted and — under `config.debug` — logged with a traceback, so the
-        span this deletes is at least findable.
+        Span assembly runs `SpanDraft.finish()`, which raises `VocabularyError` on a vocabulary
+        breach, and I6 forbids that reaching the host. It is counted and — under `config.debug` —
+        logged with a traceback, so the span this deletes is at least findable.
         """
         config = getattr(self._client, "config", None)
         return guard(where, debug=bool(getattr(config, "debug", False)))
@@ -542,6 +539,7 @@ class ByteSeamInterceptor(InterceptorInterface):
                     parent=txn.parent,
                     parent_closed=txn.parent_closed,
                     conversation=txn.conversation,
+                    scope=txn.scope,
                     start_ns=txn.start_ns,
                     limits=self._native_limits,
                     llm_upgrade=classify_ws_upgrade(url_host, txn.ws_upgrade_path or "/"),
@@ -661,6 +659,7 @@ class ByteSeamInterceptor(InterceptorInterface):
             limits=self._native_limits,
             debug=bool(getattr(config, "debug", False)),
             ctx=contextvars.copy_context(),
+            scope=txn.scope,
             size=len(txn.request_body) + len(txn.response_body),
         )
 
@@ -704,7 +703,7 @@ class ByteSeamInterceptor(InterceptorInterface):
             if pending is not None:
                 client.capture_deferred(pending)
         if span is not None:
-            client.capture_span(span)
+            client.capture_span(span, scope=txn.scope)
 
     def _emit_ws(self, st: _ConnectionState, txn: _Txn, *, whole: bool = True) -> None:
         client = self._client
@@ -714,7 +713,7 @@ class ByteSeamInterceptor(InterceptorInterface):
         with self._guard("interceptors.seam.emit_ws"):
             span = self._build_ws_span(st, txn, whole)
         if span is not None:
-            client.capture_span(span)
+            client.capture_span(span, scope=txn.scope)
 
     def _build_ws_span(self, st: _ConnectionState, txn: _Txn, whole: bool) -> Any:
         # The tracker's LLM-transport answer and an unread peer (`_peer.py`), counted HERE and
@@ -816,9 +815,9 @@ class _PendingTxn:
     Structure over promise.)
 
     `ctx` carries the IMMUTABLE-fact ContextVars (`in_degraded_run` and friends) — `run`/`fallback`
-    execute inside it. Mutable Scope state travels separately, as the snapshot
-    `Client.capture_deferred` takes (design §3.7). `size` is the queue's byte-accounting unit: the
-    raw bodies this job keeps resident while it waits.
+    execute inside it. Mutable Scope state travels separately, as `scope`: the snapshot taken where
+    the request was ISSUED (`_issue_scope`), stamped by `Client.capture_deferred` (design §3.7).
+    `size` is the queue's byte-accounting unit: the raw bodies the job keeps resident as it waits.
     """
 
     txn: _Txn
@@ -841,6 +840,7 @@ class _PendingTxn:
     limits: Any
     debug: bool
     ctx: contextvars.Context
+    scope: Any  # `_issue_scope.ScopeSnapshot`, or None for a hand-built `_Txn`
     size: int
 
     def run(self) -> Any:
