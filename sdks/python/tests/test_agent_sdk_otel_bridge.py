@@ -14,17 +14,26 @@ import asyncio
 import gzip
 import http.client
 import json
+import os
 import time
+from types import SimpleNamespace
 
+import anyio
+import claude_agent_sdk
 import pytest
 
 import _otlp_build
+from _claude_cli_double import CliDouble, cli_double
+from wardex_sdk._adapters._anthropic_agent_sdk import AnthropicAgentSdkAdapter
 from wardex_sdk._adapters._assembler import SessionAssembler
 from wardex_sdk._adapters._otel_receiver import _OtelBridgeReceiver
 from wardex_sdk._adapters._session_state import _BridgeBinding
 from wardex_sdk._assembly import Limitation, counters
 from wardex_sdk._assembly._diag import reset_reports_for_test
+from wardex_sdk._config import AdaptersConfig, AnthropicAgentSdkConfig
 from wardex_sdk._enums import CaptureSource, StatusCode
+from wardex_sdk._limits import LimitsConfig
+from wardex_sdk.testing.harness import RecordingClient, installed_adapter
 
 TRACE = "aa" * 16
 
@@ -1598,3 +1607,151 @@ def test_a_request_beyond_the_tolerance_window_is_not_joined(receiver):
     assert Limitation.CORRELATION_CONFLICT in _limitations(sibling)
     assert counters.get("adapters.anthropic.otel_bridge.llm_join_ambiguous") == 1
     assert counters.get("adapters.anthropic.otel_bridge.llm_join_tolerant") == 0
+
+
+# --------------------------------------------------------------------------
+# closing: the CLI's last export leaves as it exits, and is still merged
+# --------------------------------------------------------------------------
+
+
+def _bridge_client() -> RecordingClient:
+    """A recording client whose config turns the bridge on, with a drain long
+    enough that only quiescence ever ends it here."""
+    client = RecordingClient()
+    client.config = SimpleNamespace(
+        limits=LimitsConfig(),
+        debug=False,
+        propagation=None,
+        adapters=AdaptersConfig(
+            anthropic_agent_sdk=AnthropicAgentSdkConfig(otel_bridge=True, otel_bridge_drain=5.0)
+        ),
+    )
+    return client
+
+
+def _export_as_it_exits(cli: CliDouble) -> None:
+    """What the CLI does on stdin EOF: one last OTLP POST, to wherever the
+    environment the SDK spawned it with points its exporter."""
+    env = cli._options.env
+    trace_hex = env["TRACEPARENT"].split("-")[1]
+    token = env["OTEL_EXPORTER_OTLP_HEADERS"].split("=", 1)[1]
+    host, port = env["OTEL_EXPORTER_OTLP_ENDPOINT"].removeprefix("http://").split(":")
+    body = _otlp_build.request(
+        [
+            _otlp_build.span(
+                name="claude_code.hook",
+                trace_id=trace_hex,
+                span_id="0e" * 8,
+                start_ns=1,
+                end_ns=2,
+                attrs={"session.id": "s-1"},
+            )
+        ]
+    )
+    conn = http.client.HTTPConnection(host, int(port), timeout=5)
+    try:
+        conn.request("POST", "/v1/traces", body=body, headers={"x-wardex-bridge": token})
+        assert conn.getresponse().status == 200
+    finally:
+        conn.close()
+
+
+async def _client_turn() -> None:
+    async with claude_agent_sdk.ClaudeSDKClient() as client:
+        await client.query("hi")
+        async for _ in client.receive_response():
+            pass
+
+
+async def _query_turn() -> None:
+    async for _ in claude_agent_sdk.query(prompt="hi"):
+        pass
+
+
+@pytest.mark.parametrize("turn", [_client_turn, _query_turn], ids=["client", "query"])
+def test_the_export_the_cli_sends_as_it_exits_is_merged(turn, monkeypatch):
+    """`ClaudeSDKClient.disconnect()` cancels its reader BEFORE it closes the
+    transport, and the CLI only flushes its last export once that close ends
+    its stdin. The session used to be merged at the cancel: the drain then
+    found no session, and the batch landed in a slot nobody takes. `query()`
+    ends its CLI first and closes after, which is why it never lost it — and
+    is held to that here, since the close order it runs through changed too.
+    """
+    for key in [
+        k for k in os.environ if k.startswith("OTEL_") or k == "CLAUDE_CODE_ENABLE_TELEMETRY"
+    ]:
+        monkeypatch.delenv(key)
+    with (
+        installed_adapter(AnthropicAgentSdkAdapter, client=_bridge_client()) as live,
+        cli_double(monkeypatch, on_exit=_export_as_it_exits),
+    ):
+        receiver = live.adapter._bridge
+        anyio.run(turn)
+        spans = list(live.spans)
+        unclaimed = (dict(receiver._by_trace), dict(receiver._by_session_id))
+
+    root = _named(spans, "invoke_agent")
+    step = _named(spans, "execute_step hook")
+    assert step.parent_span_id == root.context.span_id
+    assert CaptureSource.OTEL_BRIDGE in step.capture_sources
+    assert Limitation.OTEL_BRIDGE_NO_DATA not in _limitations(root)
+    assert unclaimed == ({}, {}), "the last batch landed in a slot no session will take"
+
+
+def _bridge_session(receiver):  # noqa: ANN001, ANN202
+    adapter = _adapter_with(receiver)
+    client = FakeClient()
+    adapter._assembler = SessionAssembler(client, bridge=receiver)
+    receiver.reserve(TRACE)
+    _outbound(adapter._assembler, 1, bridge=_binding())
+    adapter._assembler.on_inbound(1, INIT)
+    return adapter, client
+
+
+async def _sdk_close_ok() -> None:
+    return None
+
+
+def test_a_stopped_reader_leaves_a_bridge_session_to_the_transport_close(receiver):
+    adapter, client = _bridge_session(receiver)
+
+    adapter._reader_ended(1, asyncio.CancelledError())
+    assert adapter._assembler.unit_for(1) is not None, "merged before the CLI's last export"
+    assert client.spans == []
+
+    asyncio.run(adapter._close_session(1, _sdk_close_ok()))
+    assert _named(client.spans, "invoke_agent").status is not StatusCode.ERROR
+    assert adapter._assembler.unit_for(1) is None
+
+
+def test_a_stopped_reader_still_closes_a_session_without_the_bridge():
+    """Nothing to wait for, so nothing changes: the stop closes it, as before."""
+    adapter = AnthropicAgentSdkAdapter()
+    client = FakeClient()
+    adapter._assembler = SessionAssembler(client)
+    _outbound(adapter._assembler, 1)
+    adapter._assembler.on_inbound(1, INIT)
+
+    adapter._reader_ended(1, asyncio.CancelledError())
+    assert _named(client.spans, "invoke_agent").status is not StatusCode.ERROR
+
+
+def test_a_failed_reader_closes_a_bridge_session_at_once_as_an_error(receiver):
+    """A broken pipe is not a stop: the session ends there, with what arrived."""
+    adapter, client = _bridge_session(receiver)
+
+    adapter._reader_ended(1, OSError("pipe closed"))
+    assert _named(client.spans, "invoke_agent").status is StatusCode.ERROR
+
+
+def test_a_raising_sdk_close_still_drains_and_merges(receiver):
+    adapter, client = _bridge_session(receiver)
+    assert _post(receiver, _one_span_body()) == 200
+
+    async def sdk_close_fails() -> None:
+        raise OSError("the CLI would not die")
+
+    with pytest.raises(OSError, match="would not die"):
+        asyncio.run(adapter._close_session(1, sdk_close_fails()))
+    assert _named(client.spans, "execute_step hook")  # merged anyway
+    assert adapter._assembler.unit_for(1) is None

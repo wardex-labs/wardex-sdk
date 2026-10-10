@@ -6,34 +6,28 @@ This adapter tees the Transport boundary (raw JSON in/out) and merges
 observation-only hooks into options to recover span trees and semantics.
 Invariant: never alter or break the host application (observe-only).
 
-THE TREE COMES FROM THE CONTEXT, NOT FROM AN IDENTIFIER. The session unit is
-opened on the first transport write — on the task that issued it, so it hangs
-off whatever wardex span the host was inside — and then PINNED onto the task
-that drives the transport's message loop. An async generator body has no context
-of its own: its frames run in the context of the task DRIVING it, so the pin
-lands on the SDK's reader task, and every hook callback and in-process MCP tool
-handler dispatched from that loop inherits the session by ordinary ContextVar
-copying. No `session_id` is consulted to build a parent edge; the CLI's ids are
-recorded as hints and used as lookup aliases, which is the whole difference from
-reconstructing a tree out of framework callback identifiers.
+THE TREE COMES FROM THE CONTEXT, NOT FROM AN IDENTIFIER. The session unit is opened on the first
+transport write — on the task that issued it, so it hangs off whatever wardex span the host was
+inside — and then PINNED onto the task that drives the transport's message loop. An async generator
+body has no context of its own: its frames run in the context of the task DRIVING it, so the pin
+lands on the SDK's reader task, and every hook callback and in-process MCP tool handler dispatched
+from that loop inherits the session by ordinary ContextVar copying. No `session_id` is consulted to
+build a parent edge; the CLI's ids are recorded as hints and used as lookup aliases, which is the
+whole difference from reconstructing a tree out of framework callback identifiers.
 
-THE OTEL BRIDGE NEVER HIJACKS. With `otel_bridge=True` the adapter points the
-CLI's own OpenTelemetry exporter at an in-process loopback receiver — but only
-for a spawn whose environment carries NO user telemetry key (`OTEL_*` or
-`CLAUDE_CODE_ENABLE_TELEMETRY`, in `os.environ` or the user's `options.env`).
-A user who wired their own collector keeps it untouched, endpoint and all,
-and hears exactly one warning about the bridge standing down: redirecting
-their exporter would make spans silently vanish from their own dashboard.
-The check runs at SPAWN time — the only moment it can still change what the
-subprocess inherits — so a user exporting `OTEL_*` mid-session is out of
-scope by design. Slice 1 is the inverse case and injects strictly LESS: when
-the user already runs the CLI's telemetry themselves and `propagation.enabled`
-is True, only `TRACEPARENT`/`TRACESTATE` from the AMBIENT wardex context are
-added (no endpoint, no toggle — never-hijack holds by construction), so the
-CLI's spans join the host's trace in the USER'S backend. Ambient-only: with
-no ambient wardex context there is nothing to align with and nothing is
-injected; for `ClaudeSDKClient` the ambient read happens at construction
-time, which may differ from the context at first write.
+THE OTEL BRIDGE NEVER HIJACKS. With `otel_bridge=True` the adapter points the CLI's own
+OpenTelemetry exporter at an in-process loopback receiver — but only for a spawn whose environment
+carries NO user telemetry key (`OTEL_*` or `CLAUDE_CODE_ENABLE_TELEMETRY`, in `os.environ` or the
+user's `options.env`). A user who wired their own collector keeps it untouched, endpoint and all,
+and hears exactly one warning about the bridge standing down: redirecting their exporter would make
+spans silently vanish from their own dashboard. The check runs at SPAWN time — the only moment it
+can still change what the subprocess inherits — so a user exporting `OTEL_*` mid-session is out of
+scope by design. Slice 1 is the inverse case and injects strictly LESS: when the user already runs
+the CLI's telemetry themselves and `propagation.enabled` is True, only `TRACEPARENT`/`TRACESTATE`
+from the AMBIENT wardex context are added (no endpoint, no toggle — never-hijack holds by
+construction), so the CLI's spans join the host's trace in the USER'S backend. Ambient-only: with no
+ambient wardex context there is nothing to align with and nothing is injected; for `ClaudeSDKClient`
+the ambient read happens at construction time, which may differ from the context at first write.
 """
 
 from __future__ import annotations
@@ -44,7 +38,7 @@ import json
 import os
 import threading
 import time
-from collections.abc import Mapping
+from collections.abc import Awaitable, Mapping
 from dataclasses import replace
 from functools import partial
 from typing import TYPE_CHECKING, Any
@@ -135,19 +129,17 @@ def _user_telemetry_key(*envs: Any) -> str | None:
 def _bridge_env(options: Any, adapter: AnthropicAgentSdkAdapter) -> dict | None:
     """The env this spawn gets, or None to leave the user's env untouched.
 
-    SLICE 2 (bridge receiver live, zero user telemetry keys): the full
-    exporter wiring plus a MINTED per-session TRACEPARENT. Minted, not
-    ambient, deliberately: the reservation is a pure ROUTING key — these
-    traces terminate at the loopback receiver and no user ever sees them —
-    and an ambient id would collide across concurrent sessions under one
-    host trace, breaking trace_id -> session routing.
+    SLICE 2 (bridge receiver live, zero user telemetry keys): the full exporter wiring plus a MINTED
+    per-session TRACEPARENT. Minted, not ambient, deliberately: the reservation is a pure ROUTING
+    key — these traces terminate at the loopback receiver and no user ever sees them — and an
+    ambient id would collide across concurrent sessions under one host trace, breaking trace_id ->
+    session routing.
 
-    SLICE 1 (user runs their OWN CLI telemetry, `propagation.enabled`): add
-    TRACEPARENT (+ TRACESTATE when the ambient context carries one) from the
-    AMBIENT wardex context, and nothing else. The two slices are mutually
-    exclusive by construction: a user telemetry key is exactly what disables
-    slice 2. No ambient context -> no injection (the CLI minting its own
-    trace is today's behavior); a TRACEPARENT the user set themselves wins.
+    SLICE 1 (user runs their OWN CLI telemetry, `propagation.enabled`): add TRACEPARENT (+
+    TRACESTATE when the ambient context carries one) from the AMBIENT wardex context, and nothing
+    else. The two slices are mutually exclusive by construction: a user telemetry key is exactly
+    what disables slice 2. No ambient context -> no injection (the CLI minting its own trace is
+    today's behavior); a TRACEPARENT the user set themselves wins.
     """
     user_env = getattr(options, "env", None) or {}
     offending = _user_telemetry_key(os.environ, user_env)
@@ -247,10 +239,9 @@ def _prepare_options(options: Any, adapter: AnthropicAgentSdkAdapter) -> Any:
     merged: dict[str, list[Any]] = {k: list(v) for k, v in (options.hooks or {}).items()}
     for event in _WARDEX_HOOK_EVENTS:
         merged.setdefault(event, []).append(sdk.HookMatcher(hooks=[_make_hook(adapter, event)]))
-    # The bridge's env fold (`_bridge_env`), under its own guard so a bridge
-    # failure costs the env injection alone and never the hook merge above.
-    # Copy-on-write is preserved: one `replace()` carries both fields, and the
-    # user's own env dict is never mutated.
+    # The bridge's env fold (`_bridge_env`), under its own guard so a bridge failure costs the env
+    # injection alone and never the hook merge above. Copy-on-write is preserved: one `replace()`
+    # carries both fields, and the user's own env dict is never mutated.
     env = None
     with adapter._guard("adapters.anthropic.otel_bridge_inject"):
         env = _bridge_env(options, adapter)
@@ -307,13 +298,12 @@ def _existing_handle(tools: Any) -> ServerHandle | None:
 def _tool_input(args: Any) -> bytes:
     """Serialize a handler's arguments or its result. TOTAL, deliberately.
 
-    `Exception` and not `(TypeError, ValueError)`, which is what `json.dumps`
-    documents for an unserializable value. The input here is the HOST's own
-    object, and a container whose `items()` raises, a `__getattr__` that throws,
-    a lazy proxy over a closed session — none of those are `TypeError`. This is
-    called on the result INSIDE the `with` body, where nothing else is left to
-    contain a raise, so a narrower except is a place the host breaks over a span
-    attribute nobody would have missed.
+    `Exception` and not `(TypeError, ValueError)`, which is what `json.dumps` documents for an
+    unserializable value. The input here is the HOST's own object, and a container whose `items()`
+    raises, a `__getattr__` that throws, a lazy proxy over a closed session — none of those are
+    `TypeError`. This is called on the result INSIDE the `with` body, where nothing else is left to
+    contain a raise, so a narrower except is a place the host breaks over a span attribute nobody
+    would have missed.
 
     Not a silent swallow: the counter is the record, and an empty body ships
     with `response_body_captured=False` beside it.
@@ -337,11 +327,10 @@ def _describe_tool_call(
     Runs INSIDE `enter()`'s guard, before the host's handler, while the span can
     still be abandoned. `call` is LAST so `functools.partial` binds the rest.
 
-    Every statement here reads the FRAMEWORK — `handle.token_resolved`,
-    `adapter._names`, the handler's own arguments — which is exactly the code
-    that breaks when an SDK moves an attribute between releases. That is why it
-    belongs in one guarded region with the open rather than in the `with` body:
-    a half-described tool span reading `status=OK` with full io and its markers
+    Every statement here reads the FRAMEWORK — `handle.token_resolved`, `adapter._names`, the
+    handler's own arguments — which is exactly the code that breaks when an SDK moves an attribute
+    between releases. That is why it belongs in one guarded region with the open rather than in the
+    `with` body: a half-described tool span reading `status=OK` with full io and its markers
     silently gone is worse than no span at all.
 
     The three parentage tiers that used to live here are gone. `enter()` latches
@@ -396,15 +385,13 @@ async def _run_tool(
     never happen: a failing tool would report success to its caller AND on the
     wire.
 
-    NOTHING IN THE HEADER CAN RAISE, and that is a property of its shape rather
-    than of the values it happens to hold today. Every expression there — the
-    `partial`, the arguments to it, the subject — runs BEFORE `__enter__`, so it
-    is outside every failure boundary wardex has: a framework attribute read
-    among them breaks the host as surely as one in the body would. This site
-    used to build its own selector out of `handle.effective_token`, an f-string
-    and a counter; the context mints an anonymous one now, and `test_import_
-    graph.py` refuses a header that is anything but names, enum members and a
-    `partial` of a name.
+    NOTHING IN THE HEADER CAN RAISE, and that is a property of its shape rather than of the values
+    it happens to hold today. Every expression there — the `partial`, the arguments to it, the
+    subject — runs BEFORE `__enter__`, so it is outside every failure boundary wardex has: a
+    framework attribute read among them breaks the host as surely as one in the body would. This
+    site used to build its own selector out of `handle.effective_token`, an f-string and a counter;
+    the context mints an anonymous one now, and `test_import_ graph.py` refuses a header that is
+    anything but names, enum members and a `partial` of a name.
 
     `fallback=SOLE_LIVE_RUN` is the one guess this site declares, and it is
     declared rather than computed. The pin normally reaches this handler through
@@ -448,7 +435,7 @@ def _read_tee(adapter: AnthropicAgentSdkAdapter, key: int, inner: Any):
     is legal here for three measured reasons: `_read_messages` does not re-enter `read_messages`,
     there is one reader task per Query, and that task is cancelled and awaited at close — so the
     deliberately unbalanced `set()` cannot outlive the unit it names. That cancel is no failure
-    (`reader_stopped`): the CLI's own `result` decides the root, and without one it is UNSET.
+    (`reader_stopped`), and what it means for the session is `_reader_ended`'s call.
     """
     pinnable = inspect.isasyncgen(inner)
 
@@ -463,7 +450,7 @@ def _read_tee(adapter: AnthropicAgentSdkAdapter, key: int, inner: Any):
                 yield msg
         except BaseException as exc:
             with adapter._guard("adapters.anthropic.transport_error"):
-                adapter._on_close(key, None if reader_stopped(exc) else repr(exc))
+                adapter._reader_ended(key, exc)
             raise
 
     return gen()
@@ -575,14 +562,12 @@ class AnthropicAgentSdkAdapter(AdapterInterface):
         """Wait for the CLI's final export — bounded, async, and only when
         there is something to wait FOR.
 
-        The drain's whole budget lives HERE, in the transport's own async
-        close, BEFORE the subprocess goes away (it must still be alive to
-        finish exporting) and before `_on_close` merges. It is structurally
-        absent from every sync teardown: `close_all_sessions` (atexit,
-        signal, uninstall) never waits, so the bridge cannot grow those
-        paths' flush budgets — the property `test_flush_budget.py` guards.
-        Exit early once nothing has arrived for `_DRAIN_QUIET_S`; give up at
-        `otel_bridge_drain` regardless.
+        The drain's whole budget lives HERE, in the transport's own async close (`_close_session`),
+        AFTER the SDK's close has ended the CLI's stdin and before `_on_close` merges. It is
+        structurally absent from every sync teardown: `close_all_sessions` (atexit, signal,
+        uninstall) never waits, so the bridge cannot grow those paths' flush budgets — the property
+        `test_flush_budget.py` guards. Exit early once nothing has arrived for `_DRAIN_QUIET_S`;
+        give up at `otel_bridge_drain` regardless.
         """
         plan = None
         with self._guard("adapters.anthropic.otel_bridge_drain"):
@@ -599,6 +584,36 @@ class AnthropicAgentSdkAdapter(AdapterInterface):
             if last is not None and time.monotonic() - last >= _DRAIN_QUIET_S:
                 return
             await asyncio.sleep(_DRAIN_POLL_S)
+
+    async def _close_session(self, key: int, closing: Awaitable[Any]) -> Any:
+        """The transport's own close, then the drain, then the merge — in that order, every time.
+
+        The SDK's close ends the CLI's stdin, which is what makes the CLI flush its last OTel
+        export; merged before it, a session missed that batch, left in a receiver slot no session
+        takes. The merge sits in a `finally` of both: a raising close or a cancelled drain ends it.
+        """
+        try:
+            return await closing
+        finally:
+            try:
+                await self._drain_bridge(key)
+            finally:
+                with self._guard("adapters.anthropic.transport_close"):
+                    self._on_close(key, None)
+
+    def _reader_ended(self, key: int, exc: BaseException) -> None:
+        """The tee's reader stopped (no failure, `reader_stopped`) or failed (an error root).
+
+        A STOPPED reader of a bridge session closes nothing: `ClaudeSDKClient.disconnect()` cancels
+        its reader before closing its transport, the CLI's last export leaves during that close, and
+        `Query.close()` always runs it next — `_close_session` closes the session then.
+        """
+        stopped = reader_stopped(exc)
+        assembler = self._assembler
+        if stopped and self._bridge is not None and assembler is not None:
+            if assembler.bridge_route(key) is not None:
+                return
+        self._on_close(key, None if stopped else repr(exc))
 
     def _on_inbound(self, key: int, msg: dict) -> None:
         if self._assembler is not None:
@@ -681,10 +696,9 @@ class AnthropicAgentSdkAdapter(AdapterInterface):
                     **limits_kwargs(LimitsConsumer.OTEL_BRIDGE_RECEIVER, resolved)
                 )
             if self._bridge is None:
-                # Bind/start failed inside the guard: the adapter installs
-                # WITHOUT the bridge (fail-open), and the loss is announced
-                # because "otel_bridge=True changed nothing" is otherwise
-                # unfalsifiable from the outside.
+                # Bind/start failed inside the guard: the adapter installs WITHOUT the bridge
+                # (fail-open), and the loss is announced because "otel_bridge=True changed nothing"
+                # is otherwise unfalsifiable from the outside.
                 report_once(
                     "anthropic_agent_sdk otel bridge: the loopback receiver could "
                     "not start, so the bridge is off for this process (fail-open)",
@@ -701,16 +715,14 @@ class AnthropicAgentSdkAdapter(AdapterInterface):
             bridge=self._bridge,
             **limits_kwargs(LimitsConsumer.SESSION_ASSEMBLER, resolved),
         )
-        # Held for `_run_tool`. Narrowed here rather than trusted, because a
-        # wrapper that survives an uninstall reads it and must get None rather
-        # than a context whose registry is gone.
+        # Held for `_run_tool`. Narrowed here rather than trusted, because a wrapper that survives
+        # an uninstall reads it and must get None rather than a context whose registry is gone.
         self._ctx = ctx if isinstance(ctx, AdapterContext) else None
         if self._ctx is None:
-            # A caller that built this adapter by hand instead of going through
-            # `AdapterRegistry`. Everything driven by the transport still works;
-            # what silently does not is the in-process tool span, because it is
-            # the one thing that opens through the surface. Said out loud, since
-            # "my tool calls are missing" is otherwise unfalsifiable from here.
+            # A caller that built this adapter by hand instead of going through `AdapterRegistry`.
+            # Everything driven by the transport still works; what silently does not is the
+            # in-process tool span, because it is the one thing that opens through the surface. Said
+            # out loud, since "my tool calls are missing" is otherwise unfalsifiable from here.
             report_once(
                 "anthropic_agent_sdk adapter: installed without an adapter "
                 "context, so in-process MCP tool calls will not get their own spans; "
@@ -751,16 +763,10 @@ class AnthropicAgentSdkAdapter(AdapterInterface):
             return _read_tee(adapter, id(self), orig_read(self))
 
         async def close(self):  # noqa: ANN001
-            # The drain, and ONLY here (plus the tee's close, the same seam
-            # for user transports): async, before `_on_close` merges and
-            # before the subprocess is closed, so the CLI is still alive to
-            # finish its export. The `_read_tee` ERROR path deliberately does
-            # not drain — the transport already failed, and the merge uses
-            # whatever arrived.
-            await adapter._drain_bridge(id(self))
-            with adapter._guard("adapters.anthropic.transport_close"):
-                adapter._on_close(id(self), None)
-            return await orig_close(self)
+            # The drain, and ONLY here (plus the tee's close, the same seam for user transports),
+            # after the SDK's own close: see `_close_session`. A reader that FAILED does not drain —
+            # the transport already broke, and the merge uses whatever arrived.
+            return await adapter._close_session(id(self), orig_close(self))
 
         self._patches.patch(cls, "write", write)
         self._patches.patch(cls, "read_messages", read_messages)
@@ -840,18 +846,15 @@ class AnthropicAgentSdkAdapter(AdapterInterface):
         start Claude sessions of its own), and nothing is emitted — the
         parent owns every inherited session and will finalize it (I-fork-3).
 
-        The bridge is the delicate half. Its serve thread did not survive the
-        fork, its bound fd is SHARED with the parent (so the CLI's OTLP POSTs
-        would scatter between the two accept queues), and its normal
-        `close()` hangs without the serve loop — today's child-exit hang.
-        Both references are severed (adapter and assembler) so no later child
-        path can reach the object, then `close_inherited_after_fork()` closes
-        the child's fd without touching `shutdown()`. Torn down, not
-        re-armed: sessions the child then runs bridge-less say so with the
-        existing `OTEL_BRIDGE_NO_DATA`; re-arming is an independent
-        follow-up. The stderr line is debug-gated — in a prefork deployment
-        this runs once per worker, and 32 identical lines about a designed
-        state are noise (the diagnostic record is the counter).
+        The bridge is the delicate half. Its serve thread did not survive the fork, its bound fd is
+        SHARED with the parent (so the CLI's OTLP POSTs would scatter between the two accept
+        queues), and its normal `close()` hangs without the serve loop — today's child-exit hang.
+        Both references are severed (adapter and assembler) so no later child path can reach the
+        object, then `close_inherited_after_fork()` closes the child's fd without touching
+        `shutdown()`. Torn down, not re-armed: sessions the child then runs bridge-less say so with
+        the existing `OTEL_BRIDGE_NO_DATA`; re-arming is an independent follow-up. The stderr line
+        is debug-gated — in a prefork deployment this runs once per worker, and 32 identical lines
+        about a designed state are noise (the diagnostic record is the counter).
         """
         self._patches._at_fork_reinit()
         self._names._at_fork_reinit()
@@ -936,9 +939,6 @@ class _TransportTee:
         return _read_tee(self._adapter, id(self._inner), self._inner.read_messages())
 
     async def close(self):
-        # The same drain seam as the class patch: a user transport that
-        # spawned a CLI with our env still deserves the final batch.
-        await self._adapter._drain_bridge(id(self._inner))
-        with self._adapter._guard("adapters.anthropic.transport_close"):
-            self._adapter._on_close(id(self._inner), None)
-        return await self._inner.close()
+        # The same seam as the class patch: a user transport that spawned a CLI with our env still
+        # deserves its final batch.
+        return await self._adapter._close_session(id(self._inner), self._inner.close())
