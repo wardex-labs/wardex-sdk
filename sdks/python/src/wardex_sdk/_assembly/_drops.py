@@ -131,11 +131,27 @@ def debug_host_error(head: str, exc: BaseException, *, unprintable: str) -> None
     transport's export(), which is documented never to raise, or the background worker's loop,
     which an escaping raise used to end. A line that cannot be rendered is replaced by a fixed
     one and counted under `unprintable`. The caller checks its own debug setting first.
+
+    The rendered text is cut at `_HOST_ERROR_CHARS`: its length is host code's choice too, and
+    an error that renders to megabytes would otherwise write megabytes to stderr on every
+    failed export.
     """
     line = f"{head} (an error whose text could not be rendered)"
     with guard(unprintable):
-        line = f"{head} ({exc})"
+        # `str.__str__` makes an exact `str` of whatever `__str__` returned -- a
+        # subclass's own `__len__`/`__format__` would be host code running a
+        # second time, and the cut below must not call it.
+        text = str.__str__(f"{exc}")
+        if len(text) > _HOST_ERROR_CHARS:
+            text = (
+                f"{text[:_HOST_ERROR_CHARS]}... ({len(text) - _HOST_ERROR_CHARS} more characters)"
+            )
+        line = f"{head} ({text})"
     diag_warning(line)
+
+
+#: How much of a host error's text a debug line carries.
+_HOST_ERROR_CHARS = 1024
 
 
 def report_worker_pass_raised(name: str) -> None:

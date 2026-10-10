@@ -586,6 +586,27 @@ def test_a_raising_error_message_cannot_escape_a_transport_export(
     assert counters.get(unprintable) == 1
 
 
+def test_a_host_error_cannot_choose_how_much_a_debug_line_writes(capsys, monkeypatch):
+    """How long an error renders is host code's choice too: one that renders to
+    megabytes wrote megabytes to stderr on every failed export."""
+
+    class _Huge(Exception):
+        def __str__(self) -> str:
+            return "e" * (20 * 1024)
+
+    def fail(req, timeout=None):
+        raise _Huge()
+
+    monkeypatch.setattr(urllib.request, "urlopen", fail)
+    transport = OtlpHttpTransport(endpoint="http://r.invalid/v1/traces", debug=True)
+    capsys.readouterr()
+    transport.export(_envelope())
+    err = capsys.readouterr().err
+    [line] = [x for x in _lines(err, "") if x.startswith("[wardex] OTLP export failed (")]
+    assert len(line) < 1200
+    assert line.endswith(f"... ({20 * 1024 - 1024} more characters))")
+
+
 def test_a_transport_close_that_raises_is_counted_and_said_once(capsys):
     client = _client(_CloseRaises())
     client.capture_span(_span())
