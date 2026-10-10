@@ -135,10 +135,15 @@ pub(super) fn fill_openai_responses(
         // `finish_reasons=["error"]` and an empty assistant output message
         // the provider never sent. The sibling endpoints ship an HTTP error
         // with the response half EMPTY (`test_llm_error_spans` pins it), and
-        // this endpoint does the same. The SSE synthetic body and every real
-        // terminal snapshot DO carry id/status/output, so the in-stream
-        // `error` event still maps to `failed` below.
-        let is_response_object = r.id.is_some() || r.status.is_some() || !r.output.is_empty();
+        // this endpoint does the same. Every real terminal snapshot carries
+        // id/status/output, and a reassembled stream is a Response by
+        // construction — an HTTP error envelope is never an event stream — so
+        // an in-stream `error` event maps to `failed` below even when it was
+        // the stream's only event and nothing before it named an id.
+        let is_response_object = out.reassembled_from_stream
+            || r.id.is_some()
+            || r.status.is_some()
+            || !r.output.is_empty();
         out.response_id = r.id;
         out.response_model = r.model;
         if let Some(v) = r.service_tier {
@@ -178,6 +183,16 @@ pub(super) fn fill_openai_responses(
         // but only on a body that IS a Response object (see above): a bare
         // error envelope gets no response half at all.
         if is_response_object {
+            // The declared failure, classified: the seam makes the span ERROR
+            // with this as its `error.type`, the same contract as Chat's and
+            // Anthropic's in-stream errors. `failed` with no error object is
+            // still the provider saying the response failed — declared, not
+            // classified. `cancelled` is not a failure: someone stopped it.
+            out.error_type = match (&r.error, r.status.as_deref()) {
+                (Some(e), _) => Some(responses_error_type(e)),
+                (None, Some("failed")) => Some(String::new()),
+                _ => None,
+            };
             let finish: Option<String> = if r.error.is_some() {
                 out.response_status = Some("failed".to_string());
                 Some(normalize_finish_reason("openai", "failed"))
@@ -241,6 +256,22 @@ pub(super) fn fill_openai_responses(
         let format = q.text.as_ref().and_then(|t| t.get("format"));
         out.output_type = Some(super::openai_chat::output_type_from_format(format).to_string());
         fill_responses_input(out, q.instructions, q.input.as_ref());
+    }
+}
+
+/// How the provider classified the failure a Responses body declares. A
+/// Response object's `error` is `{code, message}`. The `error` STREAM event,
+/// which the reassembler keeps whole in that place, comes flat —
+/// `{"type":"error","code":...,"message":...}`, where `type` is the event's
+/// own name and no class, so only its `code` is read — or wraps the error
+/// object under its own `error` key, which is then read like any other.
+fn responses_error_type(err: &serde_json::Value) -> String {
+    match err.get("error") {
+        Some(inner) if !inner.is_null() => declared_error_type(inner),
+        _ if err.get("type").and_then(|t| t.as_str()) == Some("error") => {
+            declared_error_class(err, &["code"])
+        }
+        _ => declared_error_type(err),
     }
 }
 
@@ -776,11 +807,177 @@ pub(super) fn reassemble_responses(events: &[SseEvent]) -> Reassembled {
     if let Some(e) = error {
         // The only bytes that name the failure — preserved, not dropped. The
         // fill maps them to `response_status="failed"` / `finish_reasons=
-        // ["error"]`: the provider's own failure declaration, normalized.
+        // ["error"]` and `error_type`: the provider's own failure
+        // declaration, normalized.
         body["error"] = e;
     }
     Reassembled {
         body: serde_json::to_vec(&body).unwrap_or_default(),
         terminated,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::{parse_llm, LlmSemantics};
+    use wardex_limits::Limits;
+
+    const REQUEST: &[u8] = br#"{"model":"gpt-4.1","input":"hi","stream":true}"#;
+    const CREATED: &str = r#"event: response.created
+data: {"type":"response.created","sequence_number":0,"response":{"id":"resp_1","object":"response","status":"in_progress","model":"gpt-4.1","output":[],"usage":null,"error":null}}
+
+event: response.output_item.added
+data: {"type":"response.output_item.added","sequence_number":1,"output_index":0,"item":{"id":"msg_1","type":"message","role":"assistant","content":[]}}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","sequence_number":2,"item_id":"msg_1","output_index":0,"content_index":0,"delta":"Starting"}
+
+"#;
+
+    fn responses(resp: &[u8]) -> LlmSemantics {
+        parse_llm(
+            "api.openai.com",
+            "/v1/responses",
+            REQUEST,
+            resp,
+            Limits::default(),
+        )
+        .expect("a Responses endpoint always parses")
+    }
+
+    fn stream(tail: &str) -> LlmSemantics {
+        responses(format!("{CREATED}{tail}").as_bytes())
+    }
+
+    fn failed(s: &LlmSemantics, error_type: &str) {
+        assert_eq!(s.error_type.as_deref(), Some(error_type));
+        assert_eq!(s.response_status.as_deref(), Some("failed"));
+        assert_eq!(s.finish_reasons, Some(vec!["error".to_string()]));
+        assert_eq!(s.stream_terminated, Some(true));
+    }
+
+    /// `response.failed` is the terminal snapshot of a stream that failed
+    /// midway: its `error.code` is the provider's class for the failure, so
+    /// the span this becomes can say ERROR rather than OK.
+    #[test]
+    fn a_failed_snapshot_declares_the_failure_with_its_code() {
+        let s = stream(
+            "event: response.failed\ndata: {\"type\":\"response.failed\",\"sequence_number\":3,\
+             \"response\":{\"id\":\"resp_1\",\"object\":\"response\",\"status\":\"failed\",\
+             \"model\":\"gpt-4.1\",\"output\":[],\"usage\":null,\"error\":{\"code\":\"server_error\",\
+             \"message\":\"The model failed to generate a response.\"}}}\n\n",
+        );
+        failed(&s, "server_error");
+    }
+
+    /// The `error` stream event comes flat, its `type` the event's own name:
+    /// the class is its `code`, never `"error"` — and with no code the failure
+    /// is declared but unclassified, not classified as `"error"`.
+    #[test]
+    fn a_flat_error_event_is_classified_by_its_code_alone() {
+        for (event, expected) in [
+            (
+                r#"{"type":"error","code":"server_error","message":"boom","param":null,"sequence_number":3}"#,
+                "server_error",
+            ),
+            (
+                r#"{"type":"error","code":null,"message":"boom","param":null,"sequence_number":3}"#,
+                "",
+            ),
+            (r#"{"type":"error","message":"boom"}"#, ""),
+        ] {
+            let s = stream(&format!("event: error\ndata: {event}\n\n"));
+            failed(&s, expected);
+            let msgs: serde_json::Value =
+                serde_json::from_str(s.output_messages.as_deref().unwrap()).unwrap();
+            assert_eq!(msgs[0]["parts"][0]["content"], "Starting", "{event}");
+        }
+    }
+
+    /// The `error` event that wraps the error object under its own `error`
+    /// key: the inner object is read like any other declared error.
+    #[test]
+    fn a_wrapped_error_event_is_classified_by_the_inner_object() {
+        for (event, expected) in [
+            (
+                r#"{"type":"error","error":{"type":"invalid_request_error","code":"context_length_exceeded","message":"too long","param":"input"},"sequence_number":3}"#,
+                "context_length_exceeded",
+            ),
+            (
+                r#"{"type":"error","error":{"type":"server_error","code":null,"message":"boom"}}"#,
+                "server_error",
+            ),
+        ] {
+            let s = stream(&format!("event: error\ndata: {event}\n\n"));
+            failed(&s, expected);
+        }
+    }
+
+    /// An `error` event as the stream's only event, before anything named an
+    /// id: a reassembled stream is a Response by construction, so the failure
+    /// is still declared. No response field names the model, and none is
+    /// invented.
+    #[test]
+    fn an_error_event_alone_still_declares_the_failure() {
+        let s = responses(
+            b"event: error\ndata: {\"type\":\"error\",\"code\":\"server_error\",\
+              \"message\":\"boom\",\"param\":null,\"sequence_number\":0}\n\n",
+        );
+        failed(&s, "server_error");
+        assert_eq!(s.request_model.as_deref(), Some("gpt-4.1"));
+        assert_eq!(s.response_model, None);
+        assert_eq!(s.response_id, None);
+    }
+
+    /// A non-streaming Response object goes through the same fill: `failed`
+    /// with its error object carries the code, and `failed` with none is still
+    /// a declared failure, unclassified.
+    #[test]
+    fn a_failed_response_body_declares_the_failure() {
+        for (error, expected) in [
+            (
+                r#","error":{"code":"rate_limit_exceeded","message":"x"}"#,
+                "rate_limit_exceeded",
+            ),
+            ("", ""),
+        ] {
+            let body = format!(
+                r#"{{"id":"resp_f","object":"response","status":"failed","model":"gpt-4.1","output":[]{error}}}"#
+            );
+            let s = responses(body.as_bytes());
+            assert_eq!(s.error_type.as_deref(), Some(expected), "{body}");
+            assert_eq!(s.finish_reasons, Some(vec!["error".to_string()]), "{body}");
+        }
+    }
+
+    /// What is not a failure stays one: a completed or incomplete stream, a
+    /// cancelled response (someone stopped it), a stream that simply ended,
+    /// and the bare HTTP error envelope (its span takes the HTTP status).
+    #[test]
+    fn what_declares_no_failure_carries_no_error_type() {
+        let completed = stream(
+            "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":\
+             {\"id\":\"resp_1\",\"object\":\"response\",\"status\":\"completed\",\"model\":\"gpt-4.1\",\
+             \"error\":null,\"output\":[{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\
+             \"content\":[{\"type\":\"output_text\",\"text\":\"Starting.\",\"annotations\":[]}]}],\
+             \"usage\":{\"input_tokens\":2,\"output_tokens\":2}}}\n\n",
+        );
+        assert_eq!(completed.finish_reasons, Some(vec!["stop".to_string()]));
+        let incomplete = stream(
+            "event: response.incomplete\ndata: {\"type\":\"response.incomplete\",\"response\":\
+             {\"id\":\"resp_1\",\"status\":\"incomplete\",\"output\":[],\
+             \"incomplete_details\":{\"reason\":\"max_output_tokens\"}}}\n\n",
+        );
+        assert_eq!(incomplete.finish_reasons, Some(vec!["length".to_string()]));
+        let unterminated = stream("");
+        assert_eq!(unterminated.stream_terminated, Some(false));
+        let cancelled =
+            responses(br#"{"id":"resp_c","object":"response","status":"cancelled","output":[]}"#);
+        assert_eq!(cancelled.response_status.as_deref(), Some("cancelled"));
+        let envelope = responses(br#"{"error":{"type":"server_error","code":"server_error"}}"#);
+        assert_eq!(envelope.finish_reasons, None);
+        for s in [completed, incomplete, unterminated, cancelled, envelope] {
+            assert_eq!(s.error_type, None, "{:?}", s.response_status);
+        }
     }
 }
