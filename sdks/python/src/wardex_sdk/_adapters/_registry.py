@@ -123,11 +123,19 @@ class AdapterRegistry:
         the process, with nothing able to remove them. Recording first means the
         teardown path can always find it.
 
-        The undo is best-effort today and says so rather than pretending: the
-        adapter's patches live in a `PatchSet` it builds itself, so restoring
-        them is its `uninstall()`'s job, and an adapter that sets its installed
-        flag last will decline. Routing every patch through `ctx.patches` is
-        what makes the undo unconditional, and that is a later step.
+        THE UNDO IS TWO CALLS, and both run whether `install()` raised (FAILED)
+        or returned with its installed flag still down (a decline, UNSUPPORTED,
+        below): the adapter's `uninstall()`, and `ctx.patches.restore_all()` for
+        the patches routed through the context. Neither reaches the other's
+        changes, so whatever an adapter changes outside `ctx.patches` — a
+        `PatchSet` of its own, a processor registered with the framework — is
+        undone by its `uninstall()` alone. That undo must not wait for the
+        installed flag such an install never set (the Agent SDK adapter's is
+        total), or the change must come after everything that can fail (the
+        OpenAI Agents adapter registers its processor last).
+        `AdapterConformanceSuite` fails an install at every patch it makes and
+        holds each adapter to the result; the Codex adapter, which is not a
+        suite subject, runs that one check from its own tests.
         """
         name = adapter.name()
         if name in self._installed:

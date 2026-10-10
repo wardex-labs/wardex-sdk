@@ -364,14 +364,16 @@ class OpenAIAgentsAdapter(AdapterInterface):
     def install(self, client: object | None = None, ctx: object | None = None) -> None:
         """Probe, then register. ORDER IS LOAD-BEARING and is spelled out.
 
-        The distribution and the shadow check (`_probe.probe`, shared with
-        every adapter) have already run: `AdapterRegistry.install` runs them
-        in front of this call for every way in, including
-        `wardex_sdk.testing.installed_adapter`, so a host without the
-        framework pays no import and a host with a local package called
-        `agents` is declined without that package's body ever running. This
-        method starts at the framework import: `agents.tracing` is imported
-        and its surface probed. `self._installed = True` stays the LAST line.
+        The distribution and the shadow check (`_probe.probe`, shared with every adapter) have
+        already run: `AdapterRegistry.install` runs them in front of this call for every way in,
+        including `wardex_sdk.testing.installed_adapter`, so a host without the framework pays no
+        import and a host with a local package called `agents` is declined without that package's
+        body ever running. This method starts at the framework import: `agents.tracing` is imported
+        and its surface probed. The processor is registered AFTER the `Runner` entry points are
+        wrapped: those patches go through `ctx.patches`, which the registry's rollback restores,
+        while the registration is undone only by an `uninstall()` that waits for `_installed` — so
+        an install that fails partway has not reached it. `self._installed = True` stays the LAST
+        line.
         """
         if self._installed:
             return
@@ -408,13 +410,13 @@ class OpenAIAgentsAdapter(AdapterInterface):
                 key="adapters.openai_agents.processors_read_failed",
             )
             ctx.count("processors_read_failed")
-        tracing.add_trace_processor(self._processor)
         install_entry_hook(
             ctx,
             lambda: self._installed,
             lambda: _host_root(self),
             lambda config: note_tracing_off(ctx, tracing, config, said=self._off_at_install),
         )
+        tracing.add_trace_processor(self._processor)
         self._installed = True
 
     def _notice_if_tracing_disabled(self, tracing: Any) -> None:
@@ -533,11 +535,10 @@ class OpenAIAgentsAdapter(AdapterInterface):
         ctx = self._ctx
         if ctx is None:
             return
-        # In REVERSE slot order, the way a stack unwinds. Slots are made in
-        # pin order (run, then its agent, then that agent's tool), and each
-        # unpin restores what was current when ITS pin was installed: swept
-        # run-first, the run's unpin restored the host's scope and the agent's
-        # then put the run's dead fork back on top of it.
+        # In REVERSE slot order, the way a stack unwinds. Slots are made in pin order (run, then its
+        # agent, then that agent's tool), and each unpin restores what was current when ITS pin was
+        # installed: swept run-first, the run's unpin restored the host's scope and the agent's then
+        # put the run's dead fork back on top of it.
         for entry in reversed(ctx.slots_snapshot()):
             h = entry.get("handle")
             if not isinstance(h, RunHandle) or h.degraded:
@@ -730,11 +731,10 @@ def _span_start(adapter: OpenAIAgentsAdapter, span: Any) -> None:
         return
     run = _run_state(adapter, trace)
     if run is None and _is_reattached(adapter, trace):
-        # The ignored kinds take part in this one lookup on purpose: the
-        # resumed half's FIRST span is the framework's task span, on the run
-        # task, before the approved tool runs on a subtask of its own. A root
-        # opened there is pinned where the run's spans will look for it, and
-        # its pin lives in a context the framework resets when the run ends.
+        # The ignored kinds take part in this one lookup on purpose: the resumed half's FIRST span
+        # is the framework's task span, on the run task, before the approved tool runs on a subtask
+        # of its own. A root opened there is pinned where the run's spans will look for it, and its
+        # pin lives in a context the framework resets when the run ends.
         _trace_start(adapter, trace, resumed=True)
         run = _run_state(adapter, trace)
     if handler is None:
