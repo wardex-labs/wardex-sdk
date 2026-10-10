@@ -226,14 +226,41 @@ class Transport(abc.ABC):
     path gets the configured masking and limits without ever reading a field.
 
     THE ASYNC CONTRACT, and it is the cross-language one: `export`, `flush`
-    and `close` are invoked from wardex's OWN worker thread -- never from the
-    host's event loop or request threads -- and each may BLOCK up to its
-    budget; blocking I/O here stalls no host code. That behavioral contract is
-    what every wardex SDK keeps, each in its platform's idiom: Node binds
-    `export` as async (`Promise`) and its pipeline awaits it, Java stays
-    blocking on its exporter thread. `before_send_envelope` is SYNCHRONOUS in
-    Python. (`CallerBudget` below is a Python-only diagnostic refinement and
-    is excluded from this cross-language SPI -- see its docstring.)
+    and `close` may each BLOCK up to their budget, and `export`/`flush` are
+    never entered by two threads at once. That behavioral contract is what
+    every wardex SDK keeps, each in its platform's idiom: Node binds `export`
+    as async (`Promise`) and its pipeline awaits it, Java stays blocking on
+    its exporter thread. `before_send_envelope` is SYNCHRONOUS in Python.
+    (`CallerBudget` below is a Python-only diagnostic refinement and is
+    excluded from this cross-language SPI -- see its docstring.)
+
+    THE THREAD they run on is not always wardex's. The periodic drain runs on
+    wardex's own worker thread, but `wardex.flush()` drains on the thread that
+    calls it, and `wardex.close()` -- the `atexit` hook, a re-`init()`, the
+    host's own shutdown code -- drains and then closes the transport on ITS
+    caller's thread, the main thread included. A blocking export therefore
+    blocks a host thread exactly when the host asked to wait for one; and a
+    transport must not assume any particular thread.
+
+    THE SELF-EXCLUSION CONTRACT: what these calls send ON THE THREAD THAT
+    CALLS THEM is never recorded as a span. The client runs
+    `before_send_envelope`, `export`, `flush` and `close` with wardex's capture
+    suppressed for their duration, so a transport that sends inline needs no
+    rule of its own -- a plain HTTP POST from `export()` is not captured even
+    under `capture_mode=ALL`, or from a `flush()` made inside a live span.
+
+    The suppression is context-local (a `contextvars.ContextVar`), and a new
+    thread or an executor's worker does not inherit the caller's context. A
+    transport that hands its sending to a thread it owns must carry the
+    context across itself, with the standard-library idiom:
+
+        ctx = contextvars.copy_context()  # inside export()/flush()/close()
+        self._pool.submit(ctx.run, self._post, body)
+
+    Without it, that thread's requests are ordinary outbound traffic to
+    wardex: recorded under `capture_mode=ALL`, or when the collector's host is
+    in `intercept_hosts`. Copy the context at the call, not once at startup --
+    the suppression is only set for the duration of the call.
 
     THE FORK EXTENSION POINT, optional: a transport may define
     `at_fork_child()` (no arguments), and wardex's `os.register_at_fork`

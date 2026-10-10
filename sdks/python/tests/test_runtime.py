@@ -13,6 +13,7 @@ import signal
 import socket
 import ssl
 import threading
+import warnings
 
 import pytest
 
@@ -519,6 +520,48 @@ def test_an_explicit_transport_wins_over_the_endpoint_and_a_warning_says_so():
         assert client._transport is transport
     finally:
         wardex.close()
+
+
+_AMBIENT_OTEL = ["OTEL_EXPORTER_OTLP_ENDPOINT", "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"]
+
+
+@pytest.mark.parametrize("name", _AMBIENT_OTEL)
+def test_an_ambient_otel_endpoint_losing_to_a_transport_is_not_announced(monkeypatch, name):
+    """Every OTel SDK in the process reads these variables, so a team already
+    exporting OTLP has one set globally. It is not a setting anyone gave
+    wardex, and it losing to an explicit `transport=` is not a conflict: the
+    warning about it named an endpoint the host never passed."""
+    monkeypatch.setenv(name, "http://otel-collector.invalid:4318")
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", wardex.WardexConfigWarning)
+        wardex.init(transport=_Recording(), intercept=False)
+    wardex.close()
+
+
+@pytest.mark.parametrize("name", _AMBIENT_OTEL)
+def test_an_ambient_otel_endpoint_losing_to_a_project_key_is_not_announced(monkeypatch, name):
+    monkeypatch.setenv(name, "http://otel-collector.invalid:4318")
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", wardex.WardexConfigWarning)
+        wardex.init(intercept=False, backend=BackendConfig(api_key="wdx_us_secret123"))
+    wardex.close()
+
+
+def test_a_wardex_endpoint_variable_losing_to_a_transport_is_still_announced(monkeypatch):
+    """`WARDEX_ENDPOINT` is wardex's own variable: a host that set it told
+    wardex where to send, and that losing in silence would look exactly like
+    it being honoured."""
+    monkeypatch.setenv("WARDEX_ENDPOINT", "http://collector.invalid:4318")
+    with pytest.warns(wardex.WardexConfigWarning, match="endpoint ignored"):
+        wardex.init(transport=_Recording(), intercept=False)
+    wardex.close()
+
+
+def test_a_wardex_endpoint_variable_losing_to_a_project_key_is_still_announced(monkeypatch):
+    monkeypatch.setenv("WARDEX_ENDPOINT", "http://collector.invalid:4318")
+    with pytest.warns(wardex.WardexConfigWarning, match="api_key routes to the wardex receiver"):
+        wardex.init(intercept=False, backend=BackendConfig(api_key="wdx_us_secret123"))
+    wardex.close()
 
 
 def test_pii_exemptions_under_mode_off_are_announced():

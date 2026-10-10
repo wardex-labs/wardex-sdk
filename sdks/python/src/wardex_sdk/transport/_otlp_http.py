@@ -23,7 +23,14 @@ import time
 import urllib.error
 import urllib.request
 
-from .._assembly import counters, diag_info, diag_warning, report_export_failed, report_once
+from .._assembly import (
+    counters,
+    debug_host_error,
+    diag_info,
+    diag_warning,
+    report_export_failed,
+    report_once,
+)
 from .._native import NATIVE_OK, unavailable_reason
 from .._types import Envelope
 from ._base import (
@@ -347,8 +354,13 @@ class OtlpHttpTransport(Transport):
                 # come back as `UNDELIVERED`, so its skipped spans are counted
                 # here, exactly once.
                 self._count_encode_reports(unmarshalled, overwritten)
-            req = urllib.request.Request(self._endpoint, data=body, headers=headers, method="POST")
             try:
+                # Built inside the `try`: an address with no scheme makes the
+                # constructor raise `ValueError`, and that is a failed export
+                # to count, not a raise out of `export()`.
+                req = urllib.request.Request(
+                    self._endpoint, data=body, headers=headers, method="POST"
+                )
                 with suppress_capture():
                     with urllib.request.urlopen(req, timeout=remaining):
                         pass
@@ -357,7 +369,9 @@ class OtlpHttpTransport(Transport):
                 # and before the debug line, whose `str(exc)` is host text.
                 counters.bump("transport.otlp.export_failed")
                 if self._debug:
-                    diag_warning(f"OTLP export failed: {exc}")
+                    debug_host_error(
+                        "OTLP export failed", exc, unprintable="transport.otlp.error_unprintable"
+                    )
                 cut_short_by = _cut_short_by_the_caller(exc, timeout, self._timeout, effective)
                 if cut_short_by is not None:
                     # Reported, NOT re-queued: the POST was open, so the backend

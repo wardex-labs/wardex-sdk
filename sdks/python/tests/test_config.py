@@ -2,6 +2,9 @@
 
 import dataclasses
 import inspect
+import os
+import sys
+import warnings
 
 import pytest
 
@@ -13,6 +16,7 @@ from wardex_sdk._config import (
     AnthropicAgentSdkConfig,
     BackendConfig,
     BatchingConfig,
+    CodexExecConfig,
     PIIConfig,
     PropagationConfig,
     WardexConfig,
@@ -574,3 +578,229 @@ def test_region_of_key_parses_the_tag_and_refuses_everything_else():
     for bad in ("k", "wdx_", "wdx_us", "wdx_us_", "wdx__abc", "sk-lf-abc"):
         with pytest.raises(ValueError, match="not a wardex project key"):
             region_of_key(bad)
+
+
+# --------------------------------------------------------------------------
+# refused, never ignored: the mistakes that used to read as "no spans arrive"
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("cls", "typo", "meant"),
+    [
+        (BackendConfig, "apikey", "api_key"),
+        (PIIConfig, "mod", "mode"),
+        (BatchingConfig, "flush_intervl", "flush_interval"),
+        (LimitsConfig, "max_buffer_byte", "max_buffer_bytes"),
+        (PropagationConfig, "enable", "enabled"),
+        (AdaptersConfig, "enabeld", "enabled"),
+        (AnthropicAgentSdkConfig, "otel_brige", "otel_bridge"),
+        (CodexExecConfig, "otel_bridge_drian", "otel_bridge_drain"),
+    ],
+    ids=lambda v: v.__name__ if isinstance(v, type) else None,
+)
+def test_a_misspelled_group_field_names_the_right_spelling_on_every_interpreter(cls, typo, meant):
+    """CPython adds "Did you mean" to an unknown keyword only from 3.12; on the
+    3.10 floor the refusal said what was wrong and not what was meant. The
+    groups now say it themselves, the same way on every interpreter."""
+    with pytest.raises(TypeError) as excinfo:
+        cls(**{typo: 1})
+    message = str(excinfo.value)
+    assert f"{typo!r} (did you mean {meant!r}?)" in message
+    assert message.startswith(cls.__name__)
+
+
+def test_every_unknown_keyword_is_named_and_one_with_no_near_miss_lists_the_fields():
+    with pytest.raises(TypeError) as excinfo:
+        BackendConfig(apikey="k", colour="blue")
+    message = str(excinfo.value)
+    assert "'apikey' (did you mean 'api_key'?)" in message
+    assert "'colour'," in message or "'colour';" in message
+    assert "api_key, base_url, endpoint, headers" in message
+
+
+def test_the_refusal_leaves_the_groups_signatures_and_copies_intact():
+    """The check wraps the generated `__init__`; it must not hide its signature
+    from `inspect` (editors, `help()`) or break `dataclasses.replace`."""
+    params = list(inspect.signature(BackendConfig).parameters)
+    assert params == ["api_key", "base_url", "endpoint", "headers"]
+    c = dataclasses.replace(BackendConfig(api_key="k"), endpoint="http://collector:4318")
+    assert (c.api_key, c.endpoint) == ("k", "http://collector:4318")
+    assert LimitsConfig(max_buffer_bytes=1).max_buffer_bytes == 1
+
+
+@pytest.mark.parametrize(
+    "endpoint",
+    [
+        "collector:4318",  # parses with `collector` as the scheme
+        "collector.internal/v1/traces",  # no scheme at all: a relative path
+        "http://",  # a scheme and no host
+        "ftp://collector/v1/traces",
+        "//collector:4318",
+    ],
+)
+def test_an_endpoint_no_export_could_reach_is_refused_when_configured(endpoint):
+    with pytest.raises(ValueError, match="absolute http:// or https:// URL"):
+        BackendConfig(endpoint=endpoint)
+
+
+@pytest.mark.parametrize(
+    "endpoint",
+    [
+        "http://collector:4318",
+        "https://collector.example/v1/traces",
+        "HTTP://Collector.Example:4318/",
+        "http://[::1]:4318",
+        "",  # unset, as init() already reads it
+    ],
+)
+def test_an_absolute_http_endpoint_is_accepted_as_written(endpoint):
+    assert BackendConfig(endpoint=endpoint).endpoint == endpoint
+
+
+def test_a_refused_endpoint_is_not_quoted_back():
+    """An endpoint can carry a credential, and this message reaches logs."""
+    with pytest.raises(ValueError) as excinfo:
+        BackendConfig(endpoint="collector.internal/v1/traces?token=t0k")
+    assert "t0k" not in str(excinfo.value)
+
+
+def test_a_scheme_less_wardex_endpoint_variable_is_refused_when_it_is_the_destination(
+    monkeypatch,
+):
+    """With nothing else naming a destination, wardex would export nothing:
+    refused at configuration time, like the same value passed as the argument."""
+    monkeypatch.setenv("WARDEX_ENDPOINT", "collector:4318")
+    assert _resolve_config().backend.endpoint is None
+    with pytest.raises(ValueError, match="WARDEX_ENDPOINT"):
+        wardex_sdk.init(intercept=False)
+
+
+@pytest.mark.parametrize(
+    ("given", "says"),
+    [
+        ({"transport": "noop"}, "transport= carries its own address"),
+        ({"backend": BackendConfig(api_key="wdx_us_secret123")}, "api_key routes"),
+    ],
+    ids=["transport", "api_key"],
+)
+def test_a_scheme_less_wardex_endpoint_variable_that_lost_anyway_only_warns(
+    monkeypatch, given, says
+):
+    """Under a `transport=` or a project key the variable was never going to be
+    the destination. A stray value left in the environment must not stop the
+    process from starting; it is named as the endpoint that was ignored."""
+    monkeypatch.setenv("WARDEX_ENDPOINT", "collector:4318")
+    if given.get("transport") == "noop":
+        given = {"transport": wardex_sdk.NoOpTransport()}
+    with pytest.warns(wardex_sdk.WardexConfigWarning, match=says):
+        wardex_sdk.init(intercept=False, **given)
+    wardex_sdk.close()
+
+
+@pytest.mark.parametrize(
+    "name", ["OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "OTEL_EXPORTER_OTLP_ENDPOINT"]
+)
+def test_a_scheme_less_otel_endpoint_is_left_unused_rather_than_fatal(monkeypatch, name):
+    """The OTel variables are shared with every exporter in the process, and a
+    gRPC exporter's `collector:4317` is a legal value for them. wardex does not
+    export to it, and does not stop `init()` over it either."""
+    monkeypatch.setenv(name, "collector:4317")
+    assert _resolve_config().backend.endpoint is None
+
+
+def test_an_unusable_specific_otel_endpoint_does_not_fall_through_to_the_generic_one(
+    monkeypatch,
+):
+    """The traces-specific variable overrides the generic one for traces; one
+    wardex cannot use leaves it with no OTel endpoint, not with the setting the
+    host overrode."""
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "collector:4317")
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://generic.example")
+    assert _resolve_config().backend.endpoint is None
+
+
+def test_an_unusable_otel_endpoint_is_named_when_it_would_have_been_the_destination(
+    monkeypatch,
+):
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "collector:4317")
+    with pytest.warns(wardex_sdk.WardexConfigWarning, match="OTEL_EXPORTER_OTLP_ENDPOINT"):
+        wardex_sdk.init(intercept=False)
+    wardex_sdk.close()
+
+
+def test_an_unusable_otel_endpoint_that_lost_anyway_is_not_announced(monkeypatch):
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "collector:4317")
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", wardex_sdk.WardexConfigWarning)
+        wardex_sdk.init(intercept=False, transport=wardex_sdk.NoOpTransport())
+    wardex_sdk.close()
+
+
+def _without_wardex_variables(monkeypatch) -> None:
+    """Start from no `WARDEX_*` variable at all, whatever the shell exported."""
+    for name in list(os.environ):
+        if name.upper().startswith("WARDEX_"):
+            monkeypatch.delenv(name)
+
+
+_TYPOS = [
+    ("WARDEX_ENDPONT", "WARDEX_ENDPOINT"),
+    ("WARDEX_APIKEY", "WARDEX_API_KEY"),
+    ("WARDEX_SERVICE_NAM", "WARDEX_SERVICE_NAME"),
+]
+if sys.platform != "win32":  # Windows folds variable names to upper case
+    _TYPOS.append(("wardex_endpoint", "WARDEX_ENDPOINT"))
+    # The same rule for a tooling name: only its exact spelling is read.
+    _TYPOS.append(("wardex_record", "WARDEX_RECORD"))
+
+
+@pytest.mark.parametrize(("typo", "meant"), _TYPOS)
+def test_a_misspelled_wardex_variable_is_named_with_its_correct_spelling(monkeypatch, typo, meant):
+    """A variable wardex does not read used to be ignored by everyone, and the
+    symptom -- no spans -- looked exactly like a healthy backend receiving
+    nothing. A warning, not an error: a stray variable left in a deployment's
+    environment must not stop a process from starting."""
+    _without_wardex_variables(monkeypatch)
+    monkeypatch.setenv(typo, "x")
+    with pytest.warns(wardex_sdk.WardexConfigWarning) as record:
+        wardex_sdk.init(intercept=False, transport=wardex_sdk.NoOpTransport())
+    wardex_sdk.close()
+    [message] = [str(w.message) for w in record if typo in str(w.message)]
+    assert f"Did you mean {meant}?" in message
+
+
+def test_known_variables_and_the_repository_tooling_ones_pass_without_a_warning(monkeypatch):
+    _without_wardex_variables(monkeypatch)
+    for name in (
+        "WARDEX_SERVICE_NAME",
+        "WARDEX_RELEASE",
+        "WARDEX_E2E_PHOENIX",
+        "WARDEX_E2E_LANGFUSE_PK",
+        "WARDEX_RECORD",
+        "WARDEX_REGEN_ENVELOPES",
+        "WARDEX_SMOKE_SCENARIO",
+    ):
+        monkeypatch.setenv(name, "1")
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", wardex_sdk.WardexConfigWarning)
+        wardex_sdk.init(intercept=False, transport=wardex_sdk.NoOpTransport())
+    wardex_sdk.close()
+
+
+def test_the_known_variable_names_are_exactly_the_ones_the_sdk_reads():
+    """The typo check is only as good as its list: a variable read but not
+    listed would be called a typo, one listed but not read would be silently
+    ignored. Both halves are read off the source."""
+    import pathlib
+    import re
+
+    from wardex_sdk._config_checks import WARDEX_ENV_NAMES
+
+    src = pathlib.Path(wardex_sdk.__file__).parent
+    read: set[str] = set()
+    for path in src.rglob("*.py"):
+        text = path.read_text(encoding="utf-8")
+        read |= set(re.findall(r"(?:environ\.get|getenv)\(\s*\"(WARDEX_[A-Z0-9_]+)\"", text))
+        read |= set(re.findall(r"environ\[\s*\"(WARDEX_[A-Z0-9_]+)\"", text))
+    assert read == set(WARDEX_ENV_NAMES)

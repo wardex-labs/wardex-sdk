@@ -1132,3 +1132,18 @@ def test_the_transports_own_debug_flag_reveals_the_skipped_span_names():
     finally:
         srv.shutdown()
         srv.server_close()
+
+
+@pytest.mark.usefixtures("fresh_counters")
+@pytest.mark.parametrize("endpoint", ["collector.internal/v1/traces", "//collector:4318/v1/traces"])
+def test_a_malformed_address_fails_the_export_inside_the_transport_not_out_of_it(endpoint):
+    """`init()` refuses such an address; a transport constructed directly is
+    still handed one. Building the request raised `ValueError` before the
+    failure handling began, so `export()` -- documented never to raise --
+    raised, and the batch was lost to the caller's handler instead of being
+    counted as the failed export it is."""
+    from wardex_sdk._assembly import counters
+
+    t = OtlpHttpTransport(endpoint=endpoint)
+    assert t.export(_envelope_with_span()) is None
+    assert counters.get("transport.otlp.export_failed") == 1

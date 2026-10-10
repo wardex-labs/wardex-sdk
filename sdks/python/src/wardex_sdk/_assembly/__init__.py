@@ -73,6 +73,7 @@ from ._builder import NULL_DRAFT, OTEL_ERROR_TYPE_OTHER, IntegrityBuilder, SpanD
 from ._diag import Counters, counters, diag_info, diag_warning, guard, report_once
 from ._drops import (
     count_drain_drop,
+    debug_host_error,
     report_buffer_evicted,
     report_connection_parser_disabled,
     report_export_failed,
@@ -160,6 +161,7 @@ __all__ = [
     "child_of",
     "count_drain_drop",
     "counters",
+    "debug_host_error",
     "degraded_run",
     "diag_info",
     "diag_warning",

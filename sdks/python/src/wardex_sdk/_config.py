@@ -63,6 +63,7 @@ from dataclasses import dataclass, field, fields
 from types import MappingProxyType
 from urllib.parse import unquote
 
+from ._config_checks import endpoint_from_env, refuses_unknown_keywords, require_http_url
 from ._enums import (
     AdapterName,
     CaptureMode,
@@ -82,7 +83,9 @@ class WardexConfigWarning(UserWarning):
     an explicit `transport=` next to a `backend.endpoint`, PII category exemptions under
     `PIIMode.OFF`, or an `interceptors=` selection with `intercept=False`. Each is a valid program —
     the warning exists because the losing setting would otherwise be indistinguishable from one that
-    was honoured. Filter it like any warning category (`warnings.simplefilter("ignore",
+    was honoured. The same category names a `WARDEX_*` environment variable wardex does not read
+    (most likely a misspelling of one it does), and an OTel endpoint variable it had to leave
+    unused. Filter it like any warning category (`warnings.simplefilter("ignore",
     WardexConfigWarning)`).
     """
 
@@ -171,6 +174,7 @@ def region_of_key(api_key: str) -> str:
     return region
 
 
+@refuses_unknown_keywords
 @dataclass(frozen=True, slots=True, kw_only=True)
 class BackendConfig:
     """Where captured data goes, and whose project it belongs to.
@@ -226,6 +230,12 @@ class BackendConfig:
     An explicit `transport=` wins over this field, and so does `api_key` (the
     project key routes to the wardex receiver); the losing endpoint is
     announced with a `WardexConfigWarning` rather than ignored in silence.
+
+    A value with no `http://` or `https://` scheme, or no host, is refused
+    with `ValueError` here: `collector:4318` parses with `collector` as its
+    scheme, and every export to it would fail. A variable holding one is left
+    unused; `init()` refuses `WARDEX_ENDPOINT` only when it would have been
+    the destination, and warns about an OTel spelling in that case.
     """
 
     headers: Mapping[str, str] | None = None
@@ -240,6 +250,7 @@ class BackendConfig:
     """
 
     def __post_init__(self) -> None:
+        require_http_url(self.endpoint)
         if self.headers is not None:
             # Canonicalize to an immutable mapping (lossless, like the tuple
             # and frozenset canonicalizations elsewhere): a config that reads
@@ -268,6 +279,7 @@ def _otlp_headers_from_env() -> Mapping[str, str] | None:
     return headers
 
 
+@refuses_unknown_keywords
 @dataclass(frozen=True, slots=True, kw_only=True)
 class PIIConfig:
     """What leaves the process, and in what shape."""
@@ -343,6 +355,7 @@ def _secret_names(field_name: str, names: object) -> frozenset[str]:
     return frozenset(out)
 
 
+@refuses_unknown_keywords
 @dataclass(frozen=True, slots=True, kw_only=True)
 class BatchingConfig:
     """When buffered spans are sent, and how long a shutdown may spend on them."""
@@ -367,6 +380,7 @@ class BatchingConfig:
             raise ValueError(f"shutdown_timeout must be > 0, got {self.shutdown_timeout}")
 
 
+@refuses_unknown_keywords
 @dataclass(frozen=True, slots=True, kw_only=True)
 class PropagationConfig:
     """Whether wardex mutates outbound traffic, and into which hosts.
@@ -407,6 +421,7 @@ class PropagationConfig:
         object.__setattr__(self, "targets", targets)
 
 
+@refuses_unknown_keywords
 @dataclass(frozen=True, slots=True, kw_only=True)
 class AnthropicAgentSdkConfig:
     """The Anthropic Agent SDK adapter's own options.
@@ -446,6 +461,7 @@ class AnthropicAgentSdkConfig:
             )
 
 
+@refuses_unknown_keywords
 @dataclass(frozen=True, slots=True, kw_only=True)
 class CodexExecConfig:
     """The Codex CLI (`codex exec`) adapter's own options.
@@ -485,6 +501,7 @@ class CodexExecConfig:
             )
 
 
+@refuses_unknown_keywords
 @dataclass(frozen=True, slots=True, kw_only=True)
 class AdaptersConfig:
     """WHICH framework adapters install, and each adapter's own options.
@@ -750,7 +767,7 @@ def _resolve_config(
     resolved_backend = BackendConfig(
         api_key=given.api_key or os.environ.get("WARDEX_API_KEY"),
         base_url=given.base_url or os.environ.get("WARDEX_BASE_URL"),
-        endpoint=given.endpoint or _endpoint_from_env(),
+        endpoint=given.endpoint or endpoint_from_env(),
         headers=given.headers if given.headers is not None else _otlp_headers_from_env(),
     )
     return WardexConfig(
@@ -778,23 +795,3 @@ def _resolve_config(
         before_send_envelope=before_send_envelope,
         debug=bool(debug) or os.environ.get("WARDEX_DEBUG", "").lower() == "true",
     )
-
-
-def _endpoint_from_env() -> str | None:
-    """The exporter address the environment names, in precedence order.
-
-    `WARDEX_ENDPOINT` first; then the OTel spellings, specific before generic,
-    so a host already exporting OTLP elsewhere points wardex at the same
-    collector with zero new variables. The value is stored as read — the
-    `/v1/traces` default path is the transport builder's to append (see
-    `BackendConfig.endpoint`), never this function's to bake in.
-    """
-    for name in (
-        "WARDEX_ENDPOINT",
-        "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
-        "OTEL_EXPORTER_OTLP_ENDPOINT",
-    ):
-        endpoint = os.environ.get(name)
-        if endpoint:
-            return endpoint
-    return None
