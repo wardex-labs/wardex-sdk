@@ -369,6 +369,55 @@ def test_a_websocket_session_written_to_by_another_tenant_names_no_identity(reco
     assert _identity(span) == (None, None)
 
 
+@pytest.mark.parametrize(
+    "writer", ["a thread outside every scope", "the opener, its tenant tag changed"]
+)
+def test_a_websocket_message_issued_under_no_or_a_changed_identity_disowns_it(recorded, writer):
+    """The rule's other edges: a message sent from a thread with no scope at
+    all names no identity (as for the conversation id), and neither does one
+    sent after the opener changed a tag the handshake carried."""
+    import threading
+
+    itc = _seam()
+    held: list[Any] = []
+    with _tenant("A"):
+        _open_websocket(itc, held)
+        if writer == "a thread outside every scope":
+            sender = threading.Thread(target=itc._on_request_bytes, args=(held[0], _TEXT))
+            sender.start()
+            sender.join()
+        else:
+            wardex.set_tag("tenant", "A2")
+            itc._on_request_bytes(held[0], _TEXT)
+    close_registry().fire(held.pop())
+    (span,) = [s for s in _spans(recorded) if s.name.startswith("WS")]
+    assert _identity(span) == (None, None)
+
+
+@pytest.mark.parametrize(
+    "annotation", ["a new tag", "the same user again", "the same user with an email"]
+)
+def test_a_tenant_annotating_its_own_websocket_session_keeps_its_identity(recorded, annotation):
+    """Only another identity disowns the session. The tenant that opened it
+    adding a tag, or setting the same user again with more fields, is
+    annotating its own work, and the span keeps the handshake's identity."""
+    itc = _seam()
+    held: list[Any] = []
+    with _tenant("A"):
+        _open_websocket(itc, held)
+        if annotation == "a new tag":
+            wardex.set_tag("turn", "2")
+        elif annotation == "the same user again":
+            wardex.set_user(UserInfo(id="user-A"))
+        else:
+            wardex.set_user(UserInfo(id="user-A", email="a@example.com"))
+        itc._on_request_bytes(held[0], _TEXT)
+    with _tenant("C"):
+        close_registry().fire(held.pop())
+    (span,) = [s for s in _spans(recorded) if s.name.startswith("WS")]
+    assert _identity(span) == ("A", "user-A")
+
+
 def test_the_public_recording_client_takes_what_the_seams_pass():
     """`wardex_sdk.testing.RecordingClient` is the double users copy. The seams
     call `capture_span(span, scope=...)`; a double without the keyword raises

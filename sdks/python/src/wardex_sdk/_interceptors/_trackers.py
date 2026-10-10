@@ -20,7 +20,7 @@ from .._protocol._http2 import Http2Parser
 from .._types import ConversationContext, ParsedMessage, SpanContext
 from ._h2_issuer import IssuerLink
 from ._http1_requests import RequestSide
-from ._issue_scope import UNKNOWN_ISSUER, ScopeSnapshot, issued_scope
+from ._issue_scope import UNKNOWN_ISSUER, ScopeSnapshot, issued_scope, same_issuer
 from ._txn import _name_path, _Txn
 
 
@@ -562,8 +562,10 @@ class _WebSocketTracker:
         # them rather than whichever one happened to open it.
         self._conversation = conversation
         # The handshake's identity, kept by the same rule as the conversation: only while every
-        # message the client sends is issued under it too. A socket one tenant opened and another
-        # writes to would otherwise ship the second tenant's payload under the first one's name.
+        # message the client sends is issued under it too (`same_issuer`: the same user id and
+        # the handshake's tag values; tags added later do not count). A socket one tenant opened
+        # and another writes to would otherwise ship the second tenant's payload under the first
+        # one's name.
         self._scope = scope
         self._start_ns = start_ns
         # None means "use the core default" — resolved here (rather than hardcoded)
@@ -598,7 +600,7 @@ class _WebSocketTracker:
                 if _hub.get_current_scope().conversation != self._conversation:
                     self._conversation = None
             if self._scope is not None and self._scope != UNKNOWN_ISSUER:
-                if issued_scope() != self._scope:
+                if not same_issuer(self._scope, issued_scope()):
                     self._scope = UNKNOWN_ISSUER  # issued under more than one: names no one
         if self._llm_upgrade is not None:
             if r.messages:
