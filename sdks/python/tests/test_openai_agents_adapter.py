@@ -490,6 +490,20 @@ class _ResponseMoved:
         self.result = result
 
 
+class _GenerationOutputMoved:
+    """`GenerationSpanData` whose `output` keyword moved, which `_model_end` reads."""
+
+    def __init__(self, result: Any = None) -> None:
+        self.result = result
+
+
+class _CustomDataMoved:
+    """`CustomSpanData` whose `data` keyword moved, which `_step_end` reads."""
+
+    def __init__(self, name: str, payload: Any = None) -> None:
+        self.name, self.payload = name, payload
+
+
 class _TraceGroupMoved:
     """`TraceImpl` without `group_id`, which `_trace_start` reads. The
     abstract `Trace` never had the attribute — only the concrete class sets
@@ -506,9 +520,19 @@ class _TraceGroupMoved:
         ("agents.tracing", "AgentSpanData", _AgentToolsMoved),
         ("agents.tracing", "FunctionSpanData", _FunctionMcpMoved),
         ("agents.tracing", "ResponseSpanData", _ResponseMoved),
+        ("agents.tracing", "GenerationSpanData", _GenerationOutputMoved),
+        ("agents.tracing", "CustomSpanData", _CustomDataMoved),
         ("agents.tracing.traces", "TraceImpl", _TraceGroupMoved),
     ],
-    ids=["agent.name", "agent.tools", "function.mcp_data", "response.response", "trace.group_id"],
+    ids=[
+        "agent.name",
+        "agent.tools",
+        "function.mcp_data",
+        "response.response",
+        "generation.output",
+        "custom.data",
+        "trace.group_id",
+    ],
 )
 def test_an_unrecognized_surface_declines_loudly_and_registers_nothing(
     agents_env, monkeypatch, wardex_log, module, symbol, moved
@@ -1280,15 +1304,17 @@ def test_without_task_and_turn_spans_only_the_turn_attribute_disappears(agents_e
     assert _extra(_one(spans, "invoke_workflow Agent workflow"))["wardex.openai_agents.turns"] == 0
 
 
-def test_no_framework_identifier_can_shape_this_adapters_tree():
-    """The product claim as an AST test over the shipped module's own source:
+@pytest.mark.parametrize("module", ["_openai_agents", "_openai_agents_kinds"])
+def test_no_framework_identifier_can_shape_this_adapters_tree(module):
+    """The product claim as an AST test over the shipped modules' own source:
     none of the verbs by which an identifier could shape the tree, and no
-    read of the framework's `parent_id`, appears anywhere in it."""
+    read of the framework's `parent_id`, appears anywhere in the mapping or in
+    the module its later span kinds and shared span pieces live in."""
     import ast
+    import importlib
     import inspect
 
-    import wardex_sdk._adapters._openai_agents as mod
-
+    mod = importlib.import_module(f"wardex_sdk._adapters.{module}")
     source = inspect.getsource(mod)
     assert "parent_id" not in source
     forbidden = {"rejoin", "attach", "claim", "claim_run"}
@@ -3307,10 +3333,10 @@ def test_a_raised_run_fails_the_root_even_when_the_message_is_unmapped(
     type the agent span's own error was given."""
     from agents.exceptions import MaxTurnsExceeded
 
-    import wardex_sdk._adapters._openai_agents as mod
+    import wardex_sdk._adapters._openai_agents_kinds as kinds
     from wardex_sdk._assembly._diag import reset_reports_for_test
 
-    monkeypatch.delitem(mod._ERROR_TABLE, "Max turns exceeded")
+    monkeypatch.delitem(kinds._ERROR_TABLE, "Max turns exceeded")
     scenario(_decide_loop)
     _init()
     try:

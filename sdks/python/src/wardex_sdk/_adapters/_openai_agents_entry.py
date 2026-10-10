@@ -44,6 +44,13 @@ the run's conversation when one is set, and the requests' own id then rides
 along on each LLM call (`wardex.openai.conversation_id`, written by the
 semantics layer). Only with no `group_id` does the call's id become the run's
 conversation.
+
+The entry is also where a run whose tracing is OFF is seen (`note_tracing_off`).
+The framework records nothing for such a run — no trace, so no callback ever
+reaches the adapter — and it is decided per run: by the switch as it stands at
+the call, which a host may flip after install, and by the call's own
+`RunConfig(tracing_disabled=True)`. So it is read here, from the same state the
+framework reads, before the framework opens anything.
 """
 
 from __future__ import annotations
@@ -51,14 +58,18 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import functools
+import os
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from inspect import iscoroutinefunction, signature
 from typing import Any
 
 from .._assembly import ConversationContext, report_once
 from ._context import AdapterContext
 from ._conversation import framework_conversation
+
+#: The environment variable the framework reads its tracing switch from when no manual one is set.
+ENV_DISABLED = "OPENAI_AGENTS_DISABLE_TRACING"
 
 #: The run's entry points, and whether each is a coroutine function.
 ENTRY_POINTS: tuple[tuple[str, bool], ...] = (
@@ -227,6 +238,96 @@ def call_conversation(ctx: AdapterContext, run: dict[str, Any]) -> ConversationC
     return conversation
 
 
+# -- a run whose tracing is off ------------------------------------------------
+
+#: Why a run's spans will not reach the adapter, as the line that says so.
+_OFF_LINES: dict[str, str] = {
+    "switch": (
+        "openai-agents tracing was turned off after wardex.init() "
+        "(agents.set_tracing_disabled(True), or OPENAI_AGENTS_DISABLE_TRACING read when the "
+        "first trace opened), so wardex records only the LLM calls of the runs that follow: "
+        "no agent, handoff, tool or guardrail spans"
+    ),
+    "run_config": (
+        "an openai-agents run was started with RunConfig(tracing_disabled=True), so wardex "
+        "recorded only its LLM calls: no agent, handoff, tool or guardrail spans"
+    ),
+    "trace_disabled": (
+        "an openai-agents run was started inside a disabled trace (trace(..., disabled=True), "
+        "or another run whose tracing was off), so wardex recorded only its LLM calls: no "
+        "agent, handoff, tool or guardrail spans"
+    ),
+    "tool_spans": (
+        "an openai-agents run inside an open trace was started with "
+        "RunConfig(tracing_disabled=True): its agent spans are recorded, but the framework "
+        "opens no span for its computer, shell, apply-patch or custom tool calls"
+    ),
+}
+
+
+def note_tracing_off(ctx: AdapterContext, tracing: Any, run_config: Any, *, said: bool) -> None:
+    """At an entry-point call: count, and say once, a run the framework will record nothing of.
+
+    The framework's own order, read before it acts. The switch (`_switch_off`) comes first: the
+    framework checks it as it creates every trace and every span, so with it off nothing of the
+    run is recorded, whatever trace is current. `said` is the install's notice: a switch that was
+    off then is counted without a second line. Then a trace already current is the run's: a
+    disabled one (`trace_id == "no-op"`, the framework's own test) records nothing — said here
+    unless this call runs inside another entry-point call, whose own entry already said why —
+    while a live one records the run, except, under `RunConfig(tracing_disabled=True)`, the tool
+    calls the framework wraps in `with_tool_function_span`. With no trace current the run opens
+    its own, which the run's config can disable.
+    """
+    off = _config_flag(run_config, "tracing_disabled")
+    if _switch_off(tracing.get_trace_provider()):
+        if said:
+            ctx.count("tracing_disabled_run")
+        else:
+            _off(ctx, "switch", "tracing_disabled_run")
+        return
+    current = tracing.get_current_trace()
+    if current is None:
+        if off:
+            _off(ctx, "run_config", "tracing_disabled_run")
+    elif getattr(current, "trace_id", None) == "no-op":
+        if RUN_CALL.get() is not None:
+            ctx.count("tracing_disabled_run")
+        else:
+            _off(ctx, "trace_disabled", "tracing_disabled_run")
+    elif off:
+        _off(ctx, "tool_spans", "tool_spans_disabled_run")
+
+
+def _switch_off(provider: Any) -> bool:
+    """The framework's switch as its next trace will read it (`_refresh_disabled_flag`): the
+    manual setting when there is one, else the environment value it cached on first use, else
+    the environment now, parsed the framework's way."""
+    manual = getattr(provider, "_manual_disabled", None)
+    if manual is not None:
+        return bool(manual)
+    cached = getattr(provider, "_env_disabled", None)
+    if cached is not None:
+        return bool(cached)
+    return os.environ.get(ENV_DISABLED, "false").lower() in ("true", "1")
+
+
+def _config_flag(config: Any, name: str) -> bool:
+    """A `RunConfig` field as the framework reads it: off the object, or off the mapping it
+    coerces into one; no config at all is the default, False."""
+    if isinstance(config, Mapping):
+        return bool(config.get(name, False))
+    return bool(getattr(config, name, False))
+
+
+def _off(ctx: AdapterContext, reason: str, counter: str) -> None:
+    ctx.count(counter)
+    report_once(
+        f"openai-agents adapter: {_OFF_LINES[reason]}; the counter "
+        f"adapters.openai_agents.{counter} counts such runs",
+        key=f"adapters.openai_agents.tracing_off.{reason}",
+    )
+
+
 # -- the hook ------------------------------------------------------------------
 
 
@@ -234,6 +335,7 @@ def install_entry_hook(
     ctx: AdapterContext,
     live: Callable[[], bool],
     host_root: Callable[[], dict[str, Any] | None],
+    tracing_off: Callable[[Any], None],
 ) -> None:
     """Group 3 of the adapter's probe, declined on its own without touching
     the processor.
@@ -247,7 +349,8 @@ def install_entry_hook(
     whether the adapter is still installed: a wrapper someone kept a reference
     to only passes calls through once it is not. `host_root` answers, at a
     call's entry, the state of the root the host opened that the call runs
-    under, or None.
+    under, or None. `tracing_off` is handed the call's `run_config` at its
+    entry (`note_tracing_off`).
     """
     run_mod = None
     surface = None
@@ -268,7 +371,8 @@ def install_entry_hook(
     state_cls = state_cls if isinstance(state_cls, type) else None
     runner = run_mod.Runner
     for name, awaited in ENTRY_POINTS:
-        reader = _Reader(ctx, live, host_root, state_cls, surface[name], name == "run_streamed")
+        streamed = name == "run_streamed"
+        reader = _Reader(ctx, live, host_root, state_cls, surface[name], streamed, tracing_off)
         ctx.patches.patch(runner, name, _wrap(vars(runner)[name], reader, awaited=awaited))
 
 
@@ -276,9 +380,10 @@ def _position(names: list[str], name: str) -> int | None:
     return names.index(name) if name in names else None
 
 
-def _entry_surface(run_mod: Any) -> dict[str, tuple[int | None, int | None]] | None:
-    """Where each entry point takes `input` and `conversation_id` positionally
-    (None: by keyword only), or None when the surface is not the one measured.
+def _entry_surface(run_mod: Any) -> dict[str, tuple[int | None, ...]] | None:
+    """Where each entry point takes `input`, `conversation_id` and `run_config`
+    positionally (None: by keyword only, or for `run_config` not at all), or
+    None when the surface is not the one measured.
 
     Each is a classmethod in `Runner`'s OWN namespace — the raw descriptor is
     what gets wrapped and handed back — `run` a coroutine function and the
@@ -289,7 +394,7 @@ def _entry_surface(run_mod: Any) -> dict[str, tuple[int | None, int | None]] | N
     runner = getattr(run_mod, "Runner", None)
     if not isinstance(runner, type):
         return None
-    out: dict[str, tuple[int | None, int | None]] = {}
+    out: dict[str, tuple[int | None, ...]] = {}
     for name, awaited in ENTRY_POINTS:
         raw = vars(runner).get(name)
         if not isinstance(raw, classmethod) or iscoroutinefunction(raw.__func__) is not awaited:
@@ -300,17 +405,30 @@ def _entry_surface(run_mod: Any) -> dict[str, tuple[int | None, int | None]] | N
         positional = [
             p.name for p in params if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
         ]
-        out[name] = (_position(positional, "input"), _position(positional, "conversation_id"))
+        out[name] = tuple(
+            _position(positional, n) for n in ("input", "conversation_id", "run_config")
+        )
     return out
 
 
 class _Reader:
     """What one wrapped entry point needs to read a call: the adapter's
     context, liveness and host-root lookup, the framework's `RunState`, where
-    the entry point takes `input` and `conversation_id` positionally, and
-    whether its outcome arrives after it returns (`run_streamed`)."""
+    the entry point takes `input`, `conversation_id` and `run_config`
+    positionally, whether its outcome arrives after it returns
+    (`run_streamed`), and what to tell of a run whose tracing is off."""
 
-    __slots__ = ("ctx", "live", "host_root", "state_cls", "input_at", "conversation_at", "streamed")
+    __slots__ = (
+        "ctx",
+        "live",
+        "host_root",
+        "state_cls",
+        "input_at",
+        "conversation_at",
+        "config_at",
+        "streamed",
+        "tracing_off",
+    )
 
     def __init__(
         self,
@@ -318,15 +436,17 @@ class _Reader:
         live: Callable[[], bool],
         host_root: Callable[[], dict[str, Any] | None],
         state_cls: type | None,
-        at: tuple[int | None, int | None],
+        at: tuple[int | None, ...],
         streamed: bool,
+        tracing_off: Callable[[Any], None],
     ) -> None:
         self.ctx = ctx
         self.live = live
         self.host_root = host_root
         self.state_cls = state_cls
-        self.input_at, self.conversation_at = at
+        self.input_at, self.conversation_at, self.config_at = at
         self.streamed = streamed
+        self.tracing_off = tracing_off
 
     def request(self, args: tuple[Any, ...], kwargs: dict[str, Any]) -> RunRequest | None:
         """The conversation the call names, or None.
@@ -357,6 +477,8 @@ class _Reader:
         call = functools.partial(original.__get__(None, cls), *args, **kwargs)
         if not self.live():
             return [call], None
+        with self.ctx.guard("run_tracing_state"):
+            self.tracing_off(_argument(args, kwargs, "run_config", self.config_at))
         request = None
         with self.ctx.guard("run_entry"):
             request = self.request(args, kwargs)

@@ -282,7 +282,10 @@ _MODULE_CEILING = 800
 _OVERSIZED_BUDGET = {
     "_assembly/_units.py": 2100,
     "_adapters/_assembler.py": 1929,
-    "_adapters/_openai_agents.py": 1588,
+    # Lowered from 1588 when the span pieces its later span kinds share with it
+    # (`_open_child`, the start instant, the error sentences) moved out to
+    # `_openai_agents_kinds.py` beside those kinds, with the model call's join.
+    "_adapters/_openai_agents.py": 1466,
     "_client.py": 1581,
     "_adapters/_context.py": 1305,
     "_interceptors/_seam.py": 1181,
