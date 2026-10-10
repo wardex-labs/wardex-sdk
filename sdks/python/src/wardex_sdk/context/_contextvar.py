@@ -91,6 +91,15 @@ def install_span(
     return prev, fork
 
 
+def fork_scope(ctx: SpanContext) -> Scope:
+    """The current scope forked with `ctx` active — built, and NOT installed.
+
+    For a carrier that installs the fork itself, and more than once: a
+    decorated generator's span is current only while one of its steps runs.
+    """
+    return _fork(_hub.get_current_scope(), ctx, None, None)
+
+
 def retire_fork(fork: Scope, prev: Scope) -> None:
     """Make `fork` read as `prev` again, IN PLACE, from any task.
 
@@ -148,7 +157,7 @@ def activate_span(
         _hub._current_scope.reset(token)
 
 
-#: The original name, kept because it is what `_tracing.py` and the tests call.
+#: The original name, kept because it is what the tests call.
 #: A plain alias rather than a wrapper: a delegating `fork_active_span` would be
 #: a second entry point to grow a second opinion in, which is the drift the
 #: whole `_assembly/` extraction exists to end.

@@ -867,8 +867,8 @@ _NATIVE_TARGETS = frozenset({f"{_PKG}._wardex_native", f"{_PKG}:_wardex_native"}
 #: granularity the architecture is actually described at.
 #:
 #: There is deliberately NO default and no catch-all "leaf" bucket. Only six of
-#: the nineteen top-level modules import nothing from the package; a bucket
-#: would be a guess about the other thirteen. A new file fails
+#: the twenty top-level modules import nothing from the package; a bucket
+#: would be a guess about the other fourteen. A new file fails
 #: `test_the_rank_table_covers_every_unit_on_disk` until someone ranks it, which
 #: is the one moment the decision is cheap.
 _LAYER_RANK: dict[str, int] = {
@@ -912,6 +912,7 @@ _LAYER_RANK: dict[str, int] = {
     # 10 — the composition root: what installs the observers.
     "_runtime.py": 10,
     # 11 — the public verbs.
+    "_decorators.py": 11,
     "_snapshot_api.py": 11,
     "_tracing.py": 11,
     # 12 — the published surface, and the harness that exercises it.
@@ -926,7 +927,7 @@ _LAYER_RANK: dict[str, int] = {
 #: must leave this dict in the same commit.
 #:
 #: These five are not scattered accidents. Together they are the cycle that
-#: makes twelve of the twenty-seven units mutually reachable, which is why ranks
+#: makes twelve of the twenty-eight units mutually reachable, which is why ranks
 #: 2..10 above describe an intended order rather than a proven one.
 _LAYER_RANK_DEBT = {
     # The hinge, and the only entry whose removal would change the shape of the

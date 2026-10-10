@@ -5,6 +5,7 @@ from __future__ import annotations
 import warnings as _warnings
 from collections.abc import Iterator as _Iterator
 from collections.abc import Sequence as _Sequence
+from contextlib import AbstractContextManager as _AbstractContextManager
 from contextlib import contextmanager as _contextmanager
 from typing import Any as _Any
 from urllib.parse import urlsplit as _urlsplit
@@ -30,6 +31,7 @@ from ._config import (
 )
 from ._config import _resolve_config as _resolve_config_from_env
 from ._config import region_of_key as _region_of_key
+from ._decorators import agent, step, tool, workflow
 from ._diagnostics import AdapterStatus, Diagnostics
 from ._enums import (
     AdapterName,
@@ -62,7 +64,7 @@ from ._native import NATIVE_OK as _NATIVE_OK
 from ._native import unavailable_reason as _unavailable_reason
 from ._scope import Scope, UserInfo
 from ._snapshot_api import capture_state_snapshot
-from ._tracing import Span, agent, conversation, span, step, tool, workflow
+from ._tracing import Span, conversation, span
 from ._types import (
     AgentAttributes,
     BeforeSendEnvelopeCallback,
@@ -84,6 +86,7 @@ from .context._propagate import (
     get_trace_headers,
     get_traceparent,
 )
+from .context._with_only import WithOrSyncDecorator as _WithOrSyncDecorator
 from .context._wsgi import WardexWsgiMiddleware
 from .transport._base import Transport
 from .transport._console import ConsoleTransport
@@ -468,22 +471,38 @@ def set_context(key: str, value: dict[str, _Any]) -> None:
     _hub.get_isolation_scope().set_context(key, value)
 
 
-@_contextmanager
-def isolation_scope() -> _Iterator[Scope]:
+def isolation_scope() -> _AbstractContextManager[Scope]:
     """Fork the current isolation scope for the block, then restore it.
 
     The new isolation scope is a CLONE of the current one — ambient context
     (tags, user, contexts) is inherited, and mutations made inside the block
     are isolated to it (Sentry 2.x fork semantics). The current scope is
-    replaced with a fresh one for the block's duration.
+    replaced with a fresh one for the block's duration. As a decorator it serves
+    a plain function only (see `WithOrSyncDecorator`).
     """
+    return _WithOrSyncDecorator(
+        "isolation_scope",
+        _isolation_scope(),
+        "Open it inside the function: `with wardex.isolation_scope():`.",
+    )
+
+
+@_contextmanager
+def _isolation_scope() -> _Iterator[Scope]:
     with _hub.isolation_scope() as s:
         yield s
 
 
+def new_scope() -> _AbstractContextManager[Scope]:
+    """Fork the current scope for the block, then restore it. As a decorator it
+    serves a plain function only (see `WithOrSyncDecorator`)."""
+    return _WithOrSyncDecorator(
+        "new_scope", _new_scope(), "Open it inside the function: `with wardex.new_scope():`."
+    )
+
+
 @_contextmanager
-def new_scope() -> _Iterator[Scope]:
-    """Fork the current scope for the block, then restore it."""
+def _new_scope() -> _Iterator[Scope]:
     with _hub.new_scope() as s:
         yield s
 

@@ -172,12 +172,12 @@ rank 7   `_worker.py` · `transport/`
 rank 8   `_client.py` · `_finalize.py`
 rank 9   `_adapters/` · `_interceptors/`
 rank 10  `_runtime.py`
-rank 11  `_snapshot_api.py` · `_tracing.py`
+rank 11  `_decorators.py` · `_snapshot_api.py` · `_tracing.py`
 rank 12  `__init__.py` · `testing/`
 ```
 
 - Ranks 2..10 are the order the imports are meant to have, not one they already
-  have. Twelve of the twenty-seven Python units form a single import cycle, and
+  have. Twelve of the twenty-eight Python units form a single import cycle, and
   `_hub.py` is its hinge: it hands out the process-global client, so nearly
   every layer below imports it, and to do that it imports `_client.py` and
   `_runtime.py`. No rank is widened to absorb that cycle. The five imports that

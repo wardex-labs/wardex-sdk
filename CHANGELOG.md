@@ -407,6 +407,61 @@ All notable changes to this project are documented here. The format follows
   the value becomes `[SECRET]` on both wires, the conversation id's
   typed field on the wardex envelope included, where before the exemption
   won.
+- **A decorated generator is traced over its whole iteration.** Putting
+  `@wardex.workflow`, `@wardex.agent`, `@wardex.tool` or `@wardex.step` on a
+  generator or an async generator — a streaming endpoint, a tool that
+  yields — used to produce a span that closed when the call merely built the
+  generator, about 0.03 ms long and before any of the body ran, while every
+  span the body opened became the root of a trace of its own, with nothing
+  saying so. Now the span opens at the first item and closes when the
+  generator is exhausted, closed or raises, and the body's spans are its
+  children in one trace. It is the active parent only while the body runs:
+  what your code does between two items is not recorded inside it. `send()`,
+  `throw()`, `close()` and a generator's return value reach the body as they
+  would without the decorator, and `inspect.isgeneratorfunction` /
+  `isasyncgenfunction` still answer `True` for the decorated function.
+- **The decorators accept every function shape, and refuse the rest where
+  they are applied.** Placed above `@staticmethod` or `@classmethod`, or
+  given a `functools.partial`, a `functools.lru_cache` wrapper or a builtin,
+  a decorator used to stop your app at import with an `AttributeError` about
+  wardex's internals (`'staticmethod' object has no attribute '__code__'`).
+  Those shapes are now wrapped (the descriptor is kept, so the class still
+  binds the method). What cannot be wrapped faithfully raises a `TypeError`
+  at decoration time that says what was refused, why, and what to write
+  instead: a class, a callable object such as a framework's tool object (a
+  function in its place would hide the object's type from whatever uses it —
+  decorate the plain function first, or the class's `__call__`), a caching
+  wrapper around an async function, and the span name passed positionally
+  (`@wardex.tool("search")` or `with wardex.workflow("x")` — the name is
+  `name=`, and a block is `with wardex.span("x")`). A caching wrapper keeps
+  its API: `cache_info()` and `cache_clear()` still work on the decorated
+  name. A `with wardex.span()` held open across a `yield` no longer leaves its
+  closed span as the parent of what the generator does next when the
+  generator is resumed on another thread or task (Starlette's
+  `iterate_in_threadpool`, `asyncio.to_thread(next, g)`).
+- **`isolation_scope()`, `new_scope()`, `continue_trace()` and
+  `continue_from_otel()` refuse to decorate an async function or a
+  generator.** As a decorator each of them wrapped only the call, which for
+  those shapes returns before the body runs, so the body silently left the
+  scope or the caller's trace. They now raise a `TypeError` naming the `with`
+  form to write instead. Over a plain function the decorator form covers the
+  whole call, and it keeps working as before.
+- **A run cut off by SIGTERM or `wardex.close()` keeps its root.** A
+  `@wardex.workflow` (or any decorator, `wardex.span()` or
+  `wardex.conversation()` block, or a decorated generator not yet exhausted)
+  still open when the process got the default SIGTERM — a deploy, `docker
+  stop` — or when `wardex.close()` or the exit hook ran, never shipped: its
+  block never reached its end. The backend got only the children that had
+  already finished, each pointing at a parent that never arrived. Such a span
+  now ships at that moment marked `unit_interrupted`, the marker an adapter's
+  run already carried in the same situation, with its children under it, and
+  the block ending later adds no second copy. The finished spans already
+  buffered are never evicted to make room: `close()` flushes them out between
+  chunks within its budget, and the SIGTERM handler, which cannot wait, ships
+  the run's roots first into the room there is. What does not fit is counted
+  under `_runtime.open_spans_unshipped` and said once on stderr. A SIGTERM
+  your app handles or ignores, and a second `init()`, leave open spans
+  running as before, since the program carries on.
 - **A wrong project key, a receiver that is down, and every other loss no
   span can carry now say so once with `debug` off, and are counted.**
   Before, with the default `debug=False`, an export your receiver refused or

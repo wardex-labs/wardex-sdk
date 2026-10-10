@@ -9,21 +9,32 @@ Automatic injection (middleware, client patches) is sugar on top of these.
 from __future__ import annotations
 
 from collections.abc import Iterator, Mapping
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager
 
 from .. import _hub
 from .._types import SpanContext
 from ._w3c import format_traceparent, parse_traceparent, sanitize_tracestate
+from ._with_only import WithOrSyncDecorator
 
 
-@contextmanager
-def continue_trace(headers: Mapping[str, str]) -> Iterator[None]:
+def continue_trace(headers: Mapping[str, str]) -> AbstractContextManager[None]:
     """Join the distributed trace described by W3C headers.
 
     Always enters an isolation scope (per-request state isolation). A valid
     traceparent installs a remote parent; a missing/malformed one starts a
-    fresh trace (W3C restart rule) — never raises.
+    fresh trace (W3C restart rule) — never raises. As a decorator it serves a
+    plain function only (see `WithOrSyncDecorator`), with the headers read once.
     """
+    return WithOrSyncDecorator(
+        "continue_trace",
+        _continue_trace(headers),
+        "Open it inside the function, where the request's headers are in hand: "
+        "`with wardex.continue_trace(headers):`.",
+    )
+
+
+@contextmanager
+def _continue_trace(headers: Mapping[str, str]) -> Iterator[None]:
     parsed = None
     tracestate: str | None = None
     try:
@@ -97,13 +108,22 @@ def get_trace_headers() -> dict[str, str]:
     return _emit_headers()
 
 
-@contextmanager
-def continue_from_otel() -> Iterator[None]:
+def continue_from_otel() -> AbstractContextManager[None]:
     """Adopt the current OpenTelemetry span (if any) as a remote parent.
 
     Entry semantics match continue_trace (isolation + remote parent).
     No opentelemetry installed, or no active/valid span -> plain isolation.
+    As a decorator it serves a plain function only (see `WithOrSyncDecorator`).
     """
+    return WithOrSyncDecorator(
+        "continue_from_otel",
+        _continue_from_otel(),
+        "Open it inside the function: `with wardex.continue_from_otel():`.",
+    )
+
+
+@contextmanager
+def _continue_from_otel() -> Iterator[None]:
     ctx: SpanContext | None = None
     try:
         from opentelemetry import trace as _otel  # noqa: PLC0415

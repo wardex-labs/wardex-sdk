@@ -152,6 +152,41 @@ def report_signal_flush_raised() -> None:
     )
 
 
+def report_open_spans_untracked() -> None:
+    """A manual span opened while the table of open spans was full.
+
+    The span still ships when its block ends. What it lost is the shutdown
+    guarantee, and this says so before a shutdown can make it matter: stopped
+    while that span is open, the process will not ship it.
+    """
+    counters.bump("_runtime.open_spans_full")
+    report_once(
+        "more manual spans were open at once than wardex tracks for shutdown, so one "
+        "opened past that bound is not shipped if the process stops while it is still "
+        "open (counted under _runtime.open_spans_full)",
+        key="_runtime.open_spans_full",
+    )
+
+
+def report_open_spans_unshipped(lost: int) -> None:
+    """Spans still open at shutdown that the buffer had no room for.
+
+    The shutdown ships open spans beside the finished ones already buffered and
+    never evicts a finished span to make room: those are the children the open
+    spans exist to parent. What does not fit is counted here, after the buffer
+    lock is released (`report_buffer_evicted` says why that order matters).
+    """
+    for _ in range(lost):
+        counters.bump("_runtime.open_spans_unshipped")
+    report_once(
+        f"{lost} span(s) still open when the process was stopping did not fit in the "
+        "buffer beside the finished spans already in it, and were not shipped. Raise "
+        "limits.max_buffer_spans, or give close() a larger budget (counted under "
+        "_runtime.open_spans_unshipped)",
+        key="_runtime.open_spans_unshipped",
+    )
+
+
 def _debug_of(client: object) -> bool:
     return bool(getattr(getattr(client, "config", None), "debug", False))
 

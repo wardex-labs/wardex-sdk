@@ -3,8 +3,9 @@ import asyncio
 from wardex_sdk import _hub
 from wardex_sdk._client import Client
 from wardex_sdk._config import BackendConfig, WardexConfig
-from wardex_sdk._tracing import agent as agent_deco
-from wardex_sdk._tracing import conversation, step, tool, workflow
+from wardex_sdk._decorators import agent as agent_deco
+from wardex_sdk._decorators import step, tool, workflow
+from wardex_sdk._tracing import conversation
 from wardex_sdk._types import AgentAttributes, Envelope, ToolAttributes
 from wardex_sdk.transport._base import Transport
 
