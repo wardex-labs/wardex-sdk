@@ -580,3 +580,120 @@ def test_a_connection_close_response_is_captured_after_the_socket_was_closed():
         assert spans[0].gen_ai is not None
     finally:
         wardex.close()
+
+
+# --------------------------------------------------------------------------
+# an absolute-form request target is the URL
+# --------------------------------------------------------------------------
+
+
+def _urls_on_the_wire(targets: list[str], port: int) -> tuple[list[str], list[str]]:
+    """POST each target over `http.client` (which writes it into the request
+    line as given) and read back each span's URL, in memory and as `url.full`
+    on the OTLP export a receiver decodes."""
+    from wardex_sdk import CaptureMode, _hub, _wardex_native
+    from wardex_sdk.testing import RecordingTransport
+
+    t = RecordingTransport()
+    wardex.init(transport=t, intercept=True, capture_mode=CaptureMode.ALL)
+    try:
+        for target in targets:
+            conn = http.client.HTTPConnection("127.0.0.1", port)
+            conn.request("POST", target, b"{}", {"Content-Type": "application/json"})
+            conn.getresponse().read()
+            conn.close()
+        _hub.get_client()._settle()
+        wardex.flush()
+    finally:
+        wardex.close()
+    urls = [s.transport.http.url for env in t.envelopes for s in env.spans]
+    wire = []
+    for env in t.envelopes:
+        traces = _wardex_native.codec.encode_otlp_traces(env)
+        for rs in _wardex_native.codec.decode_otlp_traces(traces)["resource_spans"]:
+            for ss in rs["scope_spans"]:
+                wire += [sp["attributes"]["url.full"] for sp in ss["spans"]]
+    return urls, wire
+
+
+def test_an_absolute_form_request_target_is_the_span_url_once():
+    """A request line written for a forward proxy, or by hand, names the whole
+    URL. It was glued onto the connection's origin:
+    `http://127.0.0.1:P` + `http://127.0.0.1:P/p` in one string. An origin-form
+    target on the same server is unchanged."""
+    httpd, host, port = _server(_PLAIN_RESP)
+    try:
+        urls, wire = _urls_on_the_wire([f"http://{host}:{port}/p?q=1", "/o?q=2"], port)
+    finally:
+        httpd.shutdown()
+    want = [f"http://{host}:{port}/p?q=1", f"http://{host}:{port}/o?q=2"]
+    assert urls == want
+    assert wire == want
+
+
+def test_the_password_in_an_absolute_form_target_is_redacted_on_the_wire():
+    """The URL's userinfo is a credential, and taking the target whole must not
+    take it past the masker: it is replaced even with masking off, and kept in
+    memory only."""
+    httpd, host, port = _server(_PLAIN_RESP)
+    try:
+        urls, wire = _urls_on_the_wire([f"http://user:hunter2@{host}:{port}/p"], port)
+    finally:
+        httpd.shutdown()
+    assert urls == [f"http://user:hunter2@{host}:{port}/p"]
+    assert wire == [f"http://REDACTED:REDACTED@{host}:{port}/p"]
+
+
+@pytest.mark.parametrize(
+    ("target", "withhold", "want"),
+    [
+        ("http://h:80/p?q=1", False, "http://h:80/p?q=1"),
+        # withheld bodies withhold the query, and the name form drops the userinfo too
+        ("http://u:pw@h:80/p?q=1", True, "http://h:80/p"),
+        ("ws://h/chat", False, "ws://h/chat"),
+        # origin form, even when a URL rides in its query: the origin goes in front
+        ("/r?u=http://x/y", False, "https://a:443/r?u=http://x/y"),
+        ("/r?u=http://x/y", True, "https://a:443/r"),
+        # not a scheme: a scheme starts with a letter
+        ("/1http://x", False, "https://a:443/1http://x"),
+    ],
+)
+def test_the_url_helper_takes_an_absolute_target_whole(target, withhold, want):
+    from wardex_sdk._interceptors._txn import _name_path, _Txn, _url_target
+
+    txn = _Txn(
+        method="GET",
+        path=_name_path(target),
+        target=target,
+        status=200,
+        request_body=b"",
+        response_body=b"",
+        parent=None,
+        start_ns=1,
+        end_ns=2,
+        ttfb_ms=None,
+    )
+    assert _url_target(txn, "https://a:443", withhold) == want
+
+
+def test_an_absolute_form_websocket_handshake_is_the_session_url(
+    fake_ssl_socket, bare_ssl_interceptor
+):
+    from wardex_sdk._enums import CaptureMode
+
+    itc = bare_ssl_interceptor
+    itc._client.config.capture_mode = CaptureMode.ALL
+    sock = fake_ssl_socket(alpn=None)
+    itc._on_request_bytes(
+        sock,
+        b"GET wss://chat.example/socket HTTP/1.1\r\nHost: chat.example\r\nUpgrade: websocket\r\n"
+        b"Connection: Upgrade\r\nSec-WebSocket-Key: x\r\n\r\n",
+    )
+    itc._on_response_bytes(
+        sock,
+        b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n"
+        b"\x88\x02\x03\xe8",
+    )
+    itc._on_request_bytes(sock, b"\x88\x02\x03\xe8")
+    (span,) = itc._client.spans
+    assert span.transport.http.url == "wss://chat.example/socket"

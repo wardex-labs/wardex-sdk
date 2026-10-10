@@ -7,6 +7,7 @@ readings of the request target the span ships: its name and its URL.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 from .._assembly import Limitation
@@ -123,14 +124,24 @@ def _name_path(target: str) -> str:
     return f"{scheme}://{authority.rpartition('@')[2]}{slash}{tail}"
 
 
-def _url_target(txn: _Txn, withhold: bool = False) -> str:
-    """The request target a span's URL carries: the whole target as sent.
+#: A request target in absolute form (`http://h/p`): a URI scheme (RFC 3986 §3.1) and `://`, from
+#: its first byte. An origin-form target starts with `/`, so `/r?u=http://x` is not one.
+_ABSOLUTE_FORM = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://")
+
+
+def _url_target(txn: _Txn, origin: str, withhold: bool = False) -> str:
+    """The URL a span carries: the connection's `origin` (`scheme://host:port`) and the request
+    target as sent.
+
+    A target in absolute form (`GET http://h:80/p HTTP/1.1`: a request line written for a forward
+    proxy, or by hand) already IS the URL, and is taken whole; prefixed with the origin it read
+    `http://127.0.0.1:80http://h:80/p`. Its userinfo is the native masker's to replace, as in any
+    URL, and its host is the one the client asked for, while `server.address` stays the peer.
 
     The query rides in the URL like a body rides in the payload, and under the same policy: when the
     seam withholds a transaction's bodies (capture admitted only by wardex's own degradation), the
     query is withheld with them. Credentials in it are the native masker's to replace, and a URL's
     userinfo is replaced even when masking is off.
     """
-    if withhold or txn.target is None:
-        return txn.path
-    return txn.target
+    target = txn.path if withhold or txn.target is None else txn.target
+    return target if _ABSOLUTE_FORM.match(target) else f"{origin}{target}"

@@ -784,8 +784,8 @@ class ByteSeamInterceptor(InterceptorInterface):
                 response_size=received,
                 http=HttpMeta(
                     method="GET",
-                    url=(
-                        f"{self._url_scheme(True)}://{st.server_address}:{st.server_port}{_url_target(txn)}"
+                    url=_url_target(
+                        txn, f"{self._url_scheme(True)}://{st.server_address}:{st.server_port}"
                     ),
                     status_code=101,
                 ),
@@ -954,7 +954,7 @@ def _assemble(p: _PendingTxn, *, parse: bool, extra: tuple[Limitation, ...]) -> 
         _latched(txn), parent_closed=txn.parent_closed, parent_evicted=txn.parent_evicted
     )
     # `:0` too; see `_peer.py`. The target keeps its query unless the bodies are withheld.
-    url = f"{p.url_scheme}://{p.url_host}:{p.server_port}{_url_target(txn, withhold_bodies)}"
+    url = _url_target(txn, f"{p.url_scheme}://{p.url_host}:{p.server_port}", withhold_bodies)
     ttfb = txn.ttfb_ms  # None when not timed; the transfer after it is then unknowable too
     transfer = None if ttfb is None else max(0.0, (txn.end_ns - txn.start_ns) / 1e6 - ttfb)
 
