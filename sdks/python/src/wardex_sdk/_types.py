@@ -380,40 +380,89 @@ class InternalSpan:
     links: tuple[InternalSpanLink, ...] = ()
 
 
-#: Fixed per-span overhead: context, timing, typed attributes, and the deque
-#: slot. An exact figure would mean encoding every span on the hot path.
+#: Fixed per-span overhead: context, timing, the typed attribute blocks' small
+#: fields, and the deque slot. An exact figure would mean encoding every span on
+#: the hot path.
 _SPAN_OVERHEAD_BYTES = 512
+
+#: Builtin collections whose items are counted, one level deep. Matched on the
+#: exact type, so reading them runs no host code.
+_COUNTED_COLLECTIONS = (list, tuple, set, frozenset)
 
 
 def span_buffer_bytes(span: InternalSpan) -> int:
     """Approximately how much memory `span` keeps resident while it waits in the
     client's buffer -- the unit `max_buffer_bytes` is measured in.
 
-    The raw bodies count, and so does every string attribute. The semantic parse
-    stores the request's and response's messages as `extra` strings
-    (`gen_ai.input.messages` and its siblings) beside the body they were parsed
-    from, and for a multimodal request that is close to a second copy of it, the
-    base64 image included. Counting the body alone let a buffer bounded at N
-    bytes hold far more than N. An event's attributes count for the same reason:
-    an exception event carries the whole stack trace.
+    The fixed overhead, plus everything the span holds as text or bytes: the raw
+    bodies, its name and status message, every attribute's key and value, its
+    events' names and attributes, and the payload fields of its typed blocks
+    (system instructions, retrieval documents and query). The attributes are
+    the reason this is not just the bodies: the semantic parse stores the
+    request's and response's messages as `extra` strings (`gen_ai.input.messages`
+    and its siblings) beside the body they were parsed from, and for a
+    multimodal request that is close to a second copy of it, the base64 image
+    included. An exception event carries the whole stack trace.
 
     A string counts its length: its size in bytes for the ASCII payloads this
     exists for (base64, JSON), an approximation for other text. Not
     `sys.getsizeof`, which grows when CPython later attaches a UTF-8 copy to a
     string -- the same span would then weigh more at its eviction than at its
     append, and the buffer's running total is only right while the two agree.
-    And `str.__len__`, not `len()`: the value is host data, and a `str`
-    subclass's own `__len__` is host code that may raise on the capture path.
+    A value of a type the exporter cannot encode (a host may pass anything to
+    `Span.set_attribute`) is measured by `_value_bytes`, without running host
+    code.
     """
     size = _SPAN_OVERHEAD_BYTES + len(span.input_data or b"") + len(span.output_data or b"")
-    for _, value in span.extra:
-        if isinstance(value, str):
-            size += str.__len__(value)
+    size += _value_bytes(span.name) + _value_bytes(span.status_message)
+    for key, value in span.extra:
+        # Exact `str` first: by far the common case, and `len()` on it runs no
+        # host code. Everything else goes through the careful path.
+        size += len(key) if type(key) is str else _value_bytes(key)
+        size += len(value) if type(value) is str else _value_bytes(value)
     for event in span.events:
-        for _, value in event.attributes:
-            if isinstance(value, str):
-                size += str.__len__(value)
+        size += _value_bytes(event.name)
+        for key, value in event.attributes:
+            size += _value_bytes(key) + _value_bytes(value)
+    if span.gen_ai is not None:
+        size += _value_bytes(span.gen_ai.system_instructions)
+    if span.retrieval is not None:
+        size += _value_bytes(span.retrieval.documents) + _value_bytes(span.retrieval.query_text)
     return size
+
+
+def _value_bytes(value: object, *, nested: bool = False) -> int:
+    """What one value holds as text or bytes, read without running host code.
+
+    A string counts its length and a bytes-like object its size, through the
+    builtin type's own method rather than `len()`: the value is host data, and
+    a subclass's `__len__` is host code that may raise on the capture path. A
+    builtin list, tuple, set or dict counts the same for its items, one level
+    deep, read through a snapshot that a concurrent mutation cannot interrupt.
+    A number, a bool or None is inside the fixed overhead, and anything else --
+    an object of some other type, a collection nested deeper -- counts nothing:
+    its size cannot be read without its own code.
+    """
+    if isinstance(value, str):
+        return str.__len__(value)
+    if isinstance(value, bytes):
+        return bytes.__len__(value)
+    if isinstance(value, bytearray):
+        return bytearray.__len__(value)
+    kind = type(value)
+    if kind is memoryview:
+        try:
+            return value.nbytes  # type: ignore[union-attr]
+        except ValueError:  # a released view, which holds no memory: not a failure
+            return 0
+    if nested:
+        return 0
+    if kind in _COUNTED_COLLECTIONS:
+        return sum(_value_bytes(item, nested=True) for item in tuple(value))  # type: ignore[call-overload]
+    if kind is dict:
+        items = list(value.items())  # type: ignore[union-attr]
+        return sum(_value_bytes(k, nested=True) + _value_bytes(v, nested=True) for k, v in items)
+    return 0
 
 
 @dataclass(frozen=True, slots=True)
