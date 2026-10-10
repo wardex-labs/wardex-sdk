@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
+from itertools import islice
 from typing import TYPE_CHECKING
 from typing import Protocol as TypingProtocol
 
@@ -389,6 +390,12 @@ _SPAN_OVERHEAD_BYTES = 512
 #: exact type, so reading them runs no host code.
 _COUNTED_COLLECTIONS = (list, tuple, set, frozenset)
 
+#: How many items of one such collection are read. Counting is on the host's
+#: capture path, so its cost must not grow with what a host chose to attach:
+#: walking a ten-million-item list took over a second there. Items past this
+#: many count nothing.
+_COUNTED_ITEMS = 1024
+
 
 def span_buffer_bytes(span: InternalSpan) -> int:
     """Approximately how much memory `span` keeps resident while it waits in the
@@ -424,9 +431,12 @@ def span_buffer_bytes(span: InternalSpan) -> int:
         size += _value_bytes(event.name)
         for key, value in event.attributes:
             size += _value_bytes(key) + _value_bytes(value)
-    if span.gen_ai is not None:
+    # The typed blocks are read only when they are exactly the type declared: a
+    # host can assign anything to `Span.retrieval`, and reading an attribute of
+    # some other object would run its code.
+    if type(span.gen_ai) is GenAIAttributes:
         size += _value_bytes(span.gen_ai.system_instructions)
-    if span.retrieval is not None:
+    if type(span.retrieval) is RetrievalAttributes:
         size += _value_bytes(span.retrieval.documents) + _value_bytes(span.retrieval.query_text)
     return size
 
@@ -434,22 +444,29 @@ def span_buffer_bytes(span: InternalSpan) -> int:
 def _value_bytes(value: object, *, nested: bool = False) -> int:
     """What one value holds as text or bytes, read without running host code.
 
+    Dispatched on `type(value)`, never `isinstance`: `isinstance` consults a
+    host-defined `__class__`, and a lazy proxy (Werkzeug's `LocalProxy`,
+    Django's `SimpleLazyObject`) answers that by evaluating what it wraps --
+    a database read, or a raise outside a request -- and then claims to be a
+    `str` that `str.__len__` refuses. `type()` reads the real type and runs
+    nothing, so such a proxy, like any object of another type, counts nothing.
+
     A string counts its length and a bytes-like object its size, through the
-    builtin type's own method rather than `len()`: the value is host data, and
-    a subclass's `__len__` is host code that may raise on the capture path. A
-    builtin list, tuple, set or dict counts the same for its items, one level
-    deep, read through a snapshot that a concurrent mutation cannot interrupt.
-    A number, a bool or None is inside the fixed overhead, and anything else --
-    an object of some other type, a collection nested deeper -- counts nothing:
-    its size cannot be read without its own code.
+    builtin type's own method rather than `len()`, which a subclass overrides.
+    A builtin list, tuple, set or dict counts the same for its first
+    `_COUNTED_ITEMS` items, one level deep, read through a snapshot taken in one
+    step, so a concurrent mutation cannot interrupt it. A number, a bool or
+    None is inside the fixed overhead, and anything else -- an object of some
+    other type, a collection nested deeper, items past the cap -- counts
+    nothing: its size cannot be read cheaply without its own code.
     """
-    if isinstance(value, str):
-        return str.__len__(value)
-    if isinstance(value, bytes):
-        return bytes.__len__(value)
-    if isinstance(value, bytearray):
-        return bytearray.__len__(value)
     kind = type(value)
+    if issubclass(kind, str):
+        return str.__len__(value)  # type: ignore[arg-type]
+    if issubclass(kind, bytes):
+        return bytes.__len__(value)  # type: ignore[arg-type]
+    if issubclass(kind, bytearray):
+        return bytearray.__len__(value)  # type: ignore[arg-type]
     if kind is memoryview:
         try:
             return value.nbytes  # type: ignore[union-attr]
@@ -458,10 +475,11 @@ def _value_bytes(value: object, *, nested: bool = False) -> int:
     if nested:
         return 0
     if kind in _COUNTED_COLLECTIONS:
-        return sum(_value_bytes(item, nested=True) for item in tuple(value))  # type: ignore[call-overload]
+        items = tuple(islice(value, _COUNTED_ITEMS))  # type: ignore[call-overload]
+        return sum(_value_bytes(item, nested=True) for item in items)
     if kind is dict:
-        items = list(value.items())  # type: ignore[union-attr]
-        return sum(_value_bytes(k, nested=True) + _value_bytes(v, nested=True) for k, v in items)
+        pairs = tuple(islice(dict.items(value), _COUNTED_ITEMS))  # type: ignore[arg-type]
+        return sum(_value_bytes(k, nested=True) + _value_bytes(v, nested=True) for k, v in pairs)
     return 0
 
 
