@@ -645,24 +645,29 @@ def test_the_password_in_an_absolute_form_target_is_redacted_on_the_wire():
 
 
 @pytest.mark.parametrize(
-    ("target", "withhold", "want"),
+    ("method", "target", "withhold", "want"),
     [
-        ("http://h:80/p?q=1", False, "http://h:80/p?q=1"),
+        ("GET", "http://h:80/p?q=1", False, "http://h:80/p?q=1"),
         # withheld bodies withhold the query, and the name form drops the userinfo too
-        ("http://u:pw@h:80/p?q=1", True, "http://h:80/p"),
-        ("ws://h/chat", False, "ws://h/chat"),
+        ("GET", "http://u:pw@h:80/p?q=1", True, "http://h:80/p"),
+        ("GET", "ws://h/chat", False, "ws://h/chat"),
         # origin form, even when a URL rides in its query: the origin goes in front
-        ("/r?u=http://x/y", False, "https://a:443/r?u=http://x/y"),
-        ("/r?u=http://x/y", True, "https://a:443/r"),
+        ("GET", "/r?u=http://x/y", False, "https://a:443/r?u=http://x/y"),
+        ("GET", "/r?u=http://x/y", True, "https://a:443/r"),
         # not a scheme: a scheme starts with a letter
-        ("/1http://x", False, "https://a:443/1http://x"),
+        ("GET", "/1http://x", False, "https://a:443/1http://x"),
+        # asterisk form names the server itself
+        ("OPTIONS", "*", False, "https://a:443"),
+        # authority form names the tunnel's far end; an h2 CONNECT has no path to name
+        ("CONNECT", "example.com:443", False, "https://example.com:443"),
+        ("CONNECT", "/", False, "https://a:443/"),
     ],
 )
-def test_the_url_helper_takes_an_absolute_target_whole(target, withhold, want):
+def test_the_url_helper_takes_an_absolute_target_whole(method, target, withhold, want):
     from wardex_sdk._interceptors._txn import _name_path, _Txn, _url_target
 
     txn = _Txn(
-        method="GET",
+        method=method,
         path=_name_path(target),
         target=target,
         status=200,
