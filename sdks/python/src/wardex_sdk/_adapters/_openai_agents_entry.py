@@ -109,11 +109,18 @@ class RunCall:
     — says nothing about this call.
     """
 
-    __slots__ = ("root", "root_closed_ok")
+    __slots__ = ("root", "root_closed_ok", "models_untraced", "content_withheld")
 
     def __init__(self, root: dict[str, Any] | None) -> None:
         self.root = root
         self.root_closed_ok: bool | None = None
+        #: The call's own `RunConfig(tracing_disabled=True)` under a live trace: the framework
+        #: traces none of its model calls, so no tool call id can be recovered
+        #: (`note_tracing_off`).
+        self.models_untraced = False
+        #: The call's `trace_include_sensitive_data` is off: the framework strips every model
+        #: response and tool payload of this run from its spans (`include_data`).
+        self.content_withheld = False
 
     def undecided(self) -> bool:
         """Whether the call's outcome could still change what ships: its own
@@ -257,58 +264,99 @@ _OFF_LINES: dict[str, str] = {
         "or another run whose tracing was off), so wardex recorded only its LLM calls: no "
         "agent, handoff, tool or guardrail spans"
     ),
-    "tool_spans": (
+    "partial": (
         "an openai-agents run inside an open trace was started with "
-        "RunConfig(tracing_disabled=True): its agent spans are recorded, but the framework "
-        "opens no span for its computer, shell, apply-patch or custom tool calls"
+        "RunConfig(tracing_disabled=True): its agent, function-tool, handoff and guardrail spans "
+        "are recorded, but the framework traces none of its model calls, so its tool spans carry "
+        "no call id and there is no response id and no hosted tool span, and it opens no span "
+        "for its computer, shell, apply-patch or custom tool calls"
     ),
 }
 
 
-def note_tracing_off(ctx: AdapterContext, tracing: Any, run_config: Any, *, said: bool) -> None:
-    """At an entry-point call: count, and say once, a run the framework will record nothing of.
+def note_tracing_off(
+    ctx: AdapterContext, tracing: Any, run_config: Any, *, said: bool
+) -> str | None:
+    """At an entry-point call: count, and say once, a run the framework will record nothing of —
+    or, inside a live trace, nothing of its model calls. Answers the reason, or None.
 
-    The framework's own order, read before it acts. The switch (`_switch_off`) comes first: the
+    The framework's own order, read before it acts. The switch (`switch_off`) comes first: the
     framework checks it as it creates every trace and every span, so with it off nothing of the
     run is recorded, whatever trace is current. `said` is the install's notice: a switch that was
     off then is counted without a second line. Then a trace already current is the run's: a
     disabled one (`trace_id == "no-op"`, the framework's own test) records nothing — said here
     unless this call runs inside another entry-point call, whose own entry already said why —
-    while a live one records the run, except, under `RunConfig(tracing_disabled=True)`, the tool
-    calls the framework wraps in `with_tool_function_span`. With no trace current the run opens
-    its own, which the run's config can disable.
+    while a live one records the run's agents and function tools, but under
+    `RunConfig(tracing_disabled=True)` none of its model calls (the framework hands the model a
+    disabled tracing mode) and none of the tool calls it wraps in `with_tool_function_span`. With
+    no trace current the run opens its own, which the run's config can disable.
     """
     off = _config_flag(run_config, "tracing_disabled")
-    if _switch_off(tracing.get_trace_provider()):
+    switch = switch_off(tracing.get_trace_provider())
+    if switch is None:
+        switch = env_off()
+    if switch:
         if said:
             ctx.count("tracing_disabled_run")
         else:
             _off(ctx, "switch", "tracing_disabled_run")
-        return
+        return "switch"
     current = tracing.get_current_trace()
     if current is None:
-        if off:
-            _off(ctx, "run_config", "tracing_disabled_run")
-    elif getattr(current, "trace_id", None) == "no-op":
+        if not off:
+            return None
+        _off(ctx, "run_config", "tracing_disabled_run")
+        return "run_config"
+    if getattr(current, "trace_id", None) == "no-op":
         if RUN_CALL.get() is not None:
             ctx.count("tracing_disabled_run")
         else:
             _off(ctx, "trace_disabled", "tracing_disabled_run")
-    elif off:
-        _off(ctx, "tool_spans", "tool_spans_disabled_run")
+        return "trace_disabled"
+    if not off:
+        return None
+    _off(ctx, "partial", "tracing_disabled_run_partial")
+    return "partial"
 
 
-def _switch_off(provider: Any) -> bool:
+def switch_off(provider: Any) -> bool | None:
     """The framework's switch as its next trace will read it (`_refresh_disabled_flag`): the
     manual setting when there is one, else the environment value it cached on first use, else
-    the environment now, parsed the framework's way."""
-    manual = getattr(provider, "_manual_disabled", None)
+    the environment now (`env_off`). None for a provider with no manual switch to read — not the
+    framework's default one — whose own rule wardex cannot know.
+
+    The install-time notice reads the same answer, so the two never disagree about a value the
+    framework cached before `wardex.init()`."""
+    if not hasattr(provider, "_manual_disabled"):
+        return None
+    manual = provider._manual_disabled
     if manual is not None:
         return bool(manual)
     cached = getattr(provider, "_env_disabled", None)
     if cached is not None:
         return bool(cached)
+    return env_off()
+
+
+def env_off() -> bool:
+    """The environment's tracing switch, parsed the framework's way."""
     return os.environ.get(ENV_DISABLED, "false").lower() in ("true", "1")
+
+
+_SENSITIVE = "trace_include_sensitive_data"
+
+
+def include_data(config: Any) -> bool:
+    """`RunConfig.trace_include_sensitive_data` as the framework resolves it: off the object, or
+    off the mapping it coerces into one, else the framework's default, which reads
+    `OPENAI_AGENTS_TRACE_INCLUDE_SENSITIVE_DATA` its own way."""
+    stated = (
+        config.get(_SENSITIVE) if isinstance(config, Mapping) else getattr(config, _SENSITIVE, None)
+    )
+    if stated is not None:
+        return bool(stated)
+    raw = os.environ.get("OPENAI_AGENTS_TRACE_INCLUDE_SENSITIVE_DATA", "true")
+    return raw.strip().lower() in ("1", "true", "yes", "on")
 
 
 def _config_flag(config: Any, name: str) -> bool:
@@ -335,7 +383,7 @@ def install_entry_hook(
     ctx: AdapterContext,
     live: Callable[[], bool],
     host_root: Callable[[], dict[str, Any] | None],
-    tracing_off: Callable[[Any], None],
+    tracing_off: Callable[[Any], str | None],
 ) -> None:
     """Group 3 of the adapter's probe, declined on its own without touching
     the processor.
@@ -438,7 +486,7 @@ class _Reader:
         state_cls: type | None,
         at: tuple[int | None, ...],
         streamed: bool,
-        tracing_off: Callable[[Any], None],
+        tracing_off: Callable[[Any], str | None],
     ) -> None:
         self.ctx = ctx
         self.live = live
@@ -477,8 +525,10 @@ class _Reader:
         call = functools.partial(original.__get__(None, cls), *args, **kwargs)
         if not self.live():
             return [call], None
+        config = _argument(args, kwargs, "run_config", self.config_at)
+        reason = None
         with self.ctx.guard("run_tracing_state"):
-            self.tracing_off(_argument(args, kwargs, "run_config", self.config_at))
+            reason = self.tracing_off(config)
         request = None
         with self.ctx.guard("run_entry"):
             request = self.request(args, kwargs)
@@ -486,6 +536,9 @@ class _Reader:
         with self.ctx.guard("run_entry_root"):
             root = self.host_root()
         record = RunCall(root)
+        record.models_untraced = reason == "partial"
+        with self.ctx.guard("run_content_state"):
+            record.content_withheld = not include_data(config)
         return [call], (RUN_REQUEST.set(request), RUN_CALL.set(record), record)
 
     def leave(

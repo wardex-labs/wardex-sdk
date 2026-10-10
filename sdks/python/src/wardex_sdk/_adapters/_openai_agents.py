@@ -99,7 +99,6 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
-import os
 import sys
 import threading
 import weakref
@@ -123,14 +122,16 @@ from .._hash import hash_canonical
 from ._base import AdapterInterface
 from ._context import AdapterContext, Placement, RunHandle
 from ._openai_agents_entry import (
-    ENV_DISABLED,
+    RUN_CALL,
     call_conversation,
+    env_off,
     failure_leaving,
     host_opened,
     install_entry_hook,
     note_tracing_off,
     open_root,
     run_conversation,
+    switch_off,
 )
 from ._openai_agents_kinds import (
     _CURRENT_AGENT,
@@ -142,6 +143,7 @@ from ._openai_agents_kinds import (
     _error_message,
     _model_end,
     _open_child,
+    _run_missing,
     _started_ns,
     _step_end,
     _step_start,
@@ -416,29 +418,23 @@ class OpenAIAgentsAdapter(AdapterInterface):
         self._installed = True
 
     def _notice_if_tracing_disabled(self, tracing: Any) -> None:
-        """One INFO line when the hook will be silent, following the
-        framework's own precedence: the manual switch wins over the
-        environment variable, and the environment variable is read the way
-        the framework reads it."""
+        """One INFO line when the hook will be silent, following the framework's own precedence
+        (`switch_off`, which each run's entry reads too): the manual switch wins over the
+        environment value, which is the one the framework cached if it has read it already."""
         ctx = self._ctx
         if ctx is None:
             return
-        manual = None
-        read = False
+        disabled = None
         with ctx.guard("tracing_state"):
-            manual = tracing.get_trace_provider()._manual_disabled
-            read = True
-        if not read:
+            disabled = switch_off(tracing.get_trace_provider())
+        if disabled is None:
             report_once(
                 "openai-agents adapter: could not read the framework's manual tracing "
                 "switch; the tracing notice below follows the environment variable only",
                 key="adapters.openai_agents.tracing_state_unknown",
             )
             ctx.count("tracing_state_unknown")
-        if manual is not None:
-            disabled = bool(manual)
-        else:
-            disabled = os.environ.get(ENV_DISABLED, "false").lower() in ("true", "1")
+            disabled = env_off()
         self._off_at_install = disabled
         if disabled:
             diag_info(_TRACING_DISABLED_NOTICE)
@@ -524,18 +520,15 @@ class OpenAIAgentsAdapter(AdapterInterface):
                 self._ctx.close_all(marker=marker)
 
     def _unpin_held(self) -> None:
-        """Take down the pins of every handle this adapter still holds, BEFORE
-        the units close.
+        """Take down the pins of every handle this adapter still holds, BEFORE the units close.
 
-        A run still open at `wardex.close()` never sees its own end: the
-        framework's `on_trace_end` arrives after the uninstall and is ignored,
-        so the pin its start installed would stay on the carrier. A task's
-        carrier dies with the task; a THREAD's does not (`with trace(...)`
-        on the host's main thread pins there), and the next run on that
-        thread would then open under a finished unit's scope and read that
-        unit's conversation as the host's. Only a pin on THIS task can come
-        down; the rest are counted as stranded, and the open path treats an
-        ambient unit of this adapter's own as a leftover, never as the host.
+        A run still open at `wardex.close()` never sees its own end: the framework's `on_trace_end`
+        arrives after the uninstall and is ignored, so the pin its start installed would stay on the
+        carrier. A task's carrier dies with the task; a THREAD's does not (`with trace(...)` on the
+        host's main thread pins there), and the next run on that thread would then open under a
+        finished unit's scope and read that unit's conversation as the host's. Only a pin on THIS
+        task can come down; the rest are counted as stranded, and the open path treats an ambient
+        unit of this adapter's own as a leftover, never as the host.
         """
         ctx = self._ctx
         if ctx is None:
@@ -747,7 +740,7 @@ def _span_start(adapter: OpenAIAgentsAdapter, span: Any) -> None:
     if handler is None:
         return
     if run is None:
-        _dropped(ctx, "span_without_run")
+        _run_missing(ctx, trace)
         return
     ctx.slot(span)["trace"] = trace
     handler(adapter, run, span)
@@ -778,7 +771,7 @@ def _span_end(adapter: OpenAIAgentsAdapter, span: Any) -> None:
     if run is not None:
         handler(adapter, run, span)
     elif trace is not None and kind in _END_ONLY:
-        _dropped(adapter._ctx, "span_without_run")
+        _run_missing(adapter._ctx, trace)
     if kind not in _END_ONLY:
         # The span's bookkeeping ends with the span. The slot is weakly keyed and would go when the
         # framework drops the object, but the framework may hold a finished span for as long as it
@@ -986,6 +979,7 @@ def _close_run(adapter: OpenAIAgentsAdapter, run: dict[str, Any]) -> None:
     if run.get("call") is not None:
         run["call"].root_closed_ok = error is None
     run.clear()
+    run["ended"] = True  # a span a left-behind task opens later is told apart (`_run_missing`)
     _drop_pending_handoff(ctx)
     _unpin(adapter, h)
     if error is not None:
@@ -1284,7 +1278,6 @@ def _function_start(adapter: OpenAIAgentsAdapter, run: dict[str, Any], span: Any
     _pin(adapter, h, driver, name)
     entry["calls"] = (agent.get("calls") if agent is not None else None) or {}
     entry["calls_from"] = agent.get("calls_from") if agent is not None else None
-    entry["withheld"] = bool(agent.get("withheld")) if agent is not None else False
 
 
 def _function_end(adapter: OpenAIAgentsAdapter, run: dict[str, Any], span: Any) -> None:
@@ -1305,6 +1298,7 @@ def _function_end(adapter: OpenAIAgentsAdapter, run: dict[str, Any], span: Any) 
     sd = span.span_data
     name = str(entry.get("name"))
     raw_input = sd.input
+    call = RUN_CALL.get()
     calls = entry.get("calls") or {}
     ids = calls.get((name, str(raw_input)), []) if raw_input is not None else []
     call_id = ids[0] if len(ids) == 1 else None
@@ -1319,10 +1313,15 @@ def _function_end(adapter: OpenAIAgentsAdapter, run: dict[str, Any], span: Any) 
         source = str(entry.get("calls_from") or "response_output_match")
         h.draft.set_extra("wardex.openai_agents.tool_call_id_source", source)
     else:
+        # A run whose model calls the framework did not trace has nothing to match against: its
+        # loss was said at the run's entry, and is not a failed match.
         h.note(Limitation.TOOL_CALL_ID_UNAVAILABLE_IN_PROCESS)
-        ctx.count("tool_call_id_ambiguous" if len(ids) > 1 else "tool_call_id_unmatched")
-    if raw_input is None and entry.get("withheld"):
-        # No arguments, in a run whose model responses the framework also stripped.
+        if call is not None and call.models_untraced:
+            ctx.count("tool_call_id_tracing_disabled")
+        else:
+            ctx.count("tool_call_id_ambiguous" if len(ids) > 1 else "tool_call_id_unmatched")
+    if raw_input is None and call is not None and call.content_withheld:
+        # The run's config strips tool payloads: an empty one here was withheld, not absent.
         h.draft.set_extra("wardex.openai_agents.sensitive_data_withheld", True)
     budget = ctx.record_budget
     if raw_input is not None:
