@@ -278,6 +278,14 @@ class SessionAssembler:
                 return None
             return (sess.bridge.trace_id_hex, sess.session_id)
 
+    def cut_short(self, key: int) -> None:
+        """Unconfirm the session's binding: ended without awaiting the CLI's last export, it can
+        no longer claim `OTEL_BRIDGE_NO_DATA` (`_session_end.SessionEnd._cut_short`)."""
+        with self._lock:
+            sess = self._by_key.get(key)
+            if sess is not None and sess.bridge is not None:
+                sess.bridge = replace(sess.bridge, confirmed=False)
+
     def pin_reader(self, key: int, owner_task: object) -> bool:
         """Pin the session unit onto the task driving this transport's reader.
 
@@ -426,15 +434,13 @@ class SessionAssembler:
     def on_close(self, key: int, error: str | None) -> None:
         now = time.time_ns()
         with self._lock:
-            # The liveness check and not a bare pop, because a transport can
-            # close AFTER the registry evicted its root and nothing else arrived
-            # in between — the one route to `_finalize` that no other event
-            # guards. Finalizing a retired session would `_stamp_root` a draft
-            # whose span shipped seconds ago (`finish()` neither freezes nor
-            # refuses a second call) and then emit nothing, since
-            # `UnitRegistry.close()` returns empty for a unit already closed. The
-            # retirement path drains what the session still held open against the
-            # span it actually hung off, and says so in a counter.
+            # The liveness check and not a bare pop, because a transport can close AFTER the
+            # registry evicted its root and nothing else arrived in between — the one route to
+            # `_finalize` that no other event guards. Finalizing a retired session would
+            # `_stamp_root` a draft whose span shipped seconds ago (`finish()` neither freezes nor
+            # refuses a second call) and then emit nothing, since `UnitRegistry.close()` returns
+            # empty for a unit already closed. The retirement path drains what the session still
+            # held open against the span it actually hung off, and says so in a counter.
             sess = self._live_session(key, now)
             if sess is None:
                 return
@@ -474,14 +480,12 @@ class SessionAssembler:
                             markers=(Limitation.SESSION_ENTRY_TABLE_FULL,),
                             status=StatusCode.UNSET,
                         )
-                        # And the ANCHOR outlives the span, because the three
-                        # lookups that resolve a sub-agent do so at EMIT time.
-                        # Without this, evicting the oldest — i.e. the
-                        # longest-lived, outermost one — would re-parent every
-                        # still-open tool and every later chat turn beneath it
-                        # onto the session root and say nothing: one silent drop
-                        # traded for a whole silently flattened subtree. A
-                        # context stays a valid parent after its span ships.
+                        # And the ANCHOR outlives the span, because the three lookups that resolve a
+                        # sub-agent do so at EMIT time. Without this, evicting the oldest — i.e. the
+                        # longest-lived, outermost one — would re-parent every still-open tool and
+                        # every later chat turn beneath it onto the session root and say nothing:
+                        # one silent drop traded for a whole silently flattened subtree. A context
+                        # stays a valid parent after its span ships.
                         self._room_for(sess.evicted_subagents, "evicted_subagent")
                         sess.evicted_subagents[evicted_id] = _EvictedSubagent(
                             context=entry.draft.context, agent_type=entry.agent_type
@@ -799,19 +803,16 @@ class SessionAssembler:
 
         if by_context is not None:
             if by_id is not None and by_id is not by_context:
-                # COUNTED, not marked, and the reason is that there is nothing
-                # here to mark. This method chooses a SESSION; it builds no span,
-                # and the only span in hand is that session's own root — whose
-                # edge came from a real scope read and is not what disagreed, so
-                # stamping `CORRELATION_CONFLICT` on it would charge one payload's
-                # disagreement to the whole run. The spans the choice feeds make
-                # no correlation claim at all (see `_IN_SESSION`), precisely
-                # because which session a hook belongs to is this method's guess.
-                # Design §3.4 is what ends the guess: the payload becomes a
-                # `UnitKey` handed to `UnitRegistry.resolve()`, which already
-                # emits that member when an id and the live context land in
-                # different traces. Until then the counter is the record, the
-                # same way it is for the unattributable hook below.
+                # COUNTED, not marked, and the reason is that there is nothing here to mark. This
+                # method chooses a SESSION; it builds no span, and the only span in hand is that
+                # session's own root — whose edge came from a real scope read and is not what
+                # disagreed, so stamping `CORRELATION_CONFLICT` on it would charge one payload's
+                # disagreement to the whole run. The spans the choice feeds make no correlation
+                # claim at all (see `_IN_SESSION`), precisely because which session a hook belongs
+                # to is this method's guess. Design §3.4 is what ends the guess: the payload becomes
+                # a `UnitKey` handed to `UnitRegistry.resolve()`, which already emits that member
+                # when an id and the live context land in different traces. Until then the counter
+                # is the record, the same way it is for the unattributable hook below.
                 counters.bump("adapters.assembler.hook_session_conflict")
             return by_context, False
         if by_id is not None:
@@ -1106,11 +1107,10 @@ class SessionAssembler:
             return
         evicted = self._room_for(sess.open_tools, "open_tool")
         if evicted is not None:
-            # The bound names ITSELF. `CHILD_SPAN_UNCLOSED` used to ride here and
-            # says a parent's teardown closed the span — a teardown that never
-            # happened — sending the reader to look for a close instead of to
-            # `max_session_entries`. UNSET rather than OK for the same reason:
-            # this span's outcome was never observed.
+            # The bound names ITSELF. `CHILD_SPAN_UNCLOSED` used to ride here and says a parent's
+            # teardown closed the span — a teardown that never happened — sending the reader to look
+            # for a close instead of to `max_session_entries`. UNSET rather than OK for the same
+            # reason: this span's outcome was never observed.
             oldest_id, oldest = evicted
             self._emit_tool(
                 sess,
@@ -1613,9 +1613,9 @@ class SessionAssembler:
             elif binding.confirmed:
                 root.add_limitation(Limitation.OTEL_BRIDGE_NO_DATA)
             else:
-                # Injection was never read back from the subprocess env, so
-                # "the CLI sent nothing" is a claim this session cannot back
-                # (I4): a counter, not a marker.
+                # Injection never read back from the subprocess env, or the session was cut short
+                # before the CLI's last export (`cut_short`): "the CLI sent nothing" is a claim
+                # this session cannot back (I4), so a counter, not a marker.
                 counters.bump("adapters.assembler.otel_bridge_unconfirmed_no_data")
             return
         view = classify(slot.spans)

@@ -1718,6 +1718,9 @@ def test_a_stopped_reader_leaves_a_bridge_session_to_the_transport_close(receive
     adapter._end.reader_ended(1, asyncio.CancelledError())
     assert adapter._assembler.unit_for(1) is not None, "merged before the CLI's last export"
     assert client.spans == []
+    # A loop stalled between the reader's stop and the close must not lose the session to the
+    # reaper: the handover window is seconds, not the moment the SDK usually takes.
+    assert adapter._end._due[1] - time.monotonic() > 2.0
 
     asyncio.run(adapter._end.transport_closed(1, _sdk_close_ok()))
     assert _named(client.spans, "invoke_agent").status is not StatusCode.ERROR
@@ -1787,9 +1790,17 @@ def test_a_session_whose_close_never_comes_is_ended_late_not_never(receiver, mon
     monkeypatch.setattr(_session_end, "_HANDOFF_S", 0.0)
     adapter._end._due[1] = 0.0  # the deadline the reader's stop would have set, already past
     adapter._end.reap()
-    assert _named(client.spans, "invoke_agent")
+    root = _named(client.spans, "invoke_agent")
     assert counters.get("adapters.anthropic.otel_bridge.session_ended_late") == 1
     assert (receiver._by_trace, receiver._by_session_id) == ({}, {})
+    # Cut short, so it says wardex's capture fell short and never that the CLI sent nothing:
+    # the CLI's last export was not awaited, and may simply not have arrived yet.
+    assert Limitation.INSTRUMENTATION_DEGRADED in _limitations(root)
+    assert Limitation.OTEL_BRIDGE_NO_DATA not in _limitations(root)
+    assert counters.get("adapters.assembler.otel_bridge_unconfirmed_no_data") == 1
+
+    assert _post(receiver, _one_span_body()) == 200  # the CLI's export, after all
+    assert counters.get("adapters.anthropic.otel_bridge.span_after_close") == 1
 
     shipped = len(client.spans)
     asyncio.run(adapter._end.transport_closed(1, _sdk_close_ok()))  # the close, after all
@@ -1828,9 +1839,11 @@ def test_the_receiver_reaps_a_session_whose_host_never_disconnected(monkeypatch)
         unclaimed = (dict(receiver._by_trace), dict(receiver._by_session_id))
         late = counters.get("adapters.anthropic.otel_bridge.session_ended_late")
 
-    assert _named(spans, "invoke_agent"), "the session waited for a close that never came"
+    root = _named(spans, "invoke_agent")
     assert unclaimed == ({}, {})
     assert late == 1
+    assert Limitation.INSTRUMENTATION_DEGRADED in _limitations(root)
+    assert Limitation.OTEL_BRIDGE_NO_DATA not in _limitations(root)
 
 
 class _Suspend:
@@ -1881,7 +1894,7 @@ def test_a_failing_drain_never_reaches_the_host(receiver):
 
     assert asyncio.run(adapter._end.transport_closed(1, sdk_close())) == "closed"
     assert _named(client.spans, "invoke_agent")
-    assert counters.get("adapters.anthropic.otel_bridge_drain") == 1
+    assert counters.get("adapters.anthropic.session_end.drain_failed") == 1
 
 
 def test_the_drain_waits_through_anyio_so_a_trio_host_is_never_broken(receiver, monkeypatch):
@@ -1932,3 +1945,17 @@ def test_a_close_dropped_during_its_drain_waits_only_the_drain_budget(receiver):
     closing.close()  # dropped inside the drain: still ends the session
     assert _named(client.spans, "invoke_agent")
     assert adapter._end._due == {}
+
+
+def test_an_uninstall_that_cuts_a_handed_over_session_short_does_not_claim_no_data(receiver):
+    """Uninstall ends a session still waiting for its close the way the reaper
+    does, before the CLI's last export: it says why it is short, and never that
+    the CLI sent nothing."""
+    adapter, client = _bridge_session(receiver)
+    adapter._end.reader_ended(1, asyncio.CancelledError())
+
+    adapter._end.clear()  # uninstall's order: the table first, then the sessions
+    adapter._assembler.close_all_sessions(marker=Limitation.ADAPTER_UNINSTALLED)
+    root = _named(client.spans, "invoke_agent")
+    assert Limitation.ADAPTER_UNINSTALLED in _limitations(root)
+    assert Limitation.OTEL_BRIDGE_NO_DATA not in _limitations(root)

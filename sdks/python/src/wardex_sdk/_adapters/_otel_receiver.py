@@ -146,6 +146,10 @@ class _OtelBridgeReceiver:
         #: (`_tick`). The serve thread exists exactly as long as the bridge
         #: does, which is when the owner has bridge sessions to look after.
         self.on_tick: Callable[[], None] | None = None
+        #: Trace and session keys of slots already taken, so a span that
+        #: arrives for one afterwards is counted as late (`_file`). Oldest
+        #: first, bounded at twice `max_sessions` (two keys per slot).
+        self._taken: dict[str, None] = {}
 
         receiver = self
 
@@ -350,6 +354,13 @@ class _OtelBridgeReceiver:
         with self._lock:
             slot = self._by_trace.get(span.get("trace_id") or "")
             session_id = span["attributes"].get("session.id")
+            late = span.get("trace_id") in self._taken or (
+                isinstance(session_id, str) and session_id in self._taken
+            )
+            if slot is None and late:
+                # The session this span belongs to was already merged: it is
+                # late, and nothing will take it. Counted, then filed as before.
+                counters.bump(f"adapters.{self._owner}.otel_bridge.span_after_close")
             if slot is None and isinstance(session_id, str) and session_id:
                 slot = self._by_session_id.get(session_id)
                 if slot is None:
@@ -398,6 +409,11 @@ class _OtelBridgeReceiver:
                 self._by_trace.pop(slot.trace_key, None)
             if slot.session_key:
                 self._by_session_id.pop(slot.session_key, None)
+            for taken in (slot.trace_key, slot.session_key):
+                if taken:
+                    self._taken[taken] = None
+            while len(self._taken) > 2 * self._max_sessions:
+                del self._taken[next(iter(self._taken))]
             return slot
 
     def has_data(self, trace_id_hex: str | None, session_id: str | None) -> bool:
@@ -454,3 +470,4 @@ class _OtelBridgeReceiver:
         self._lock = threading.RLock()
         self._by_trace.clear()
         self._by_session_id.clear()
+        self._taken.clear()

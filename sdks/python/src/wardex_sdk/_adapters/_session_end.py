@@ -14,10 +14,11 @@ A handover can fail in two ways, and each has a deadline. A host that drops a cl
 until its deadline: `_HANDOFF_S` from its reader stopping, `_CLOSE_BUDGET_S` from its close
 starting, and the drain's own budget plus `_HANDOFF_S` once the SDK's close has returned. If nothing
 has ended it by then, the receiver's serve loop (`reap`, roughly twice a second) ends it with
-whatever arrived and counts the late close. Every end goes through `_on_close`, which closes a
-session once and ignores later calls, so the reaper and a slow close racing each other cannot
-finalize a session twice. A close that is cancelled (`GeneratorExit`, when its coroutine is dropped)
-skips the drain, because nothing may be awaited then, and still ends the session.
+whatever arrived, marks it cut short (`_cut_short`) and counts it. Every end goes through
+`_on_close`, which closes a session once and ignores later calls, so the reaper and a slow close
+racing each other cannot finalize a session twice. A close that is cancelled (`GeneratorExit`, when
+its coroutine is dropped) skips the drain, because nothing may be awaited then, and still ends the
+session.
 """
 
 from __future__ import annotations
@@ -27,13 +28,15 @@ import time
 from collections.abc import Awaitable
 from typing import Any
 
-from .._assembly import counters
+from .._assembly import Limitation, counters
 from ._session_outcome import reader_stopped
 
 #: From a reader stopping to its transport's close starting. The SDK makes that call right after
-#: the cancel, in the same shielded `Query.close()`, so a close that is not under way by then is
-#: not coming.
-_HANDOFF_S = 1.0
+#: the cancel, in the same shielded `Query.close()`, so only a stalled event loop separates the two:
+#: 30 sessions closing at once were measured 0.6 s apart, and the window is more than ten times
+#: that. A session ended here before its close comes loses the CLI's last export, while a longer
+#: window costs only how long a session whose close never comes is held before it is ended.
+_HANDOFF_S = 10.0
 
 #: From a bridge session's close starting to its end. Longer than `SubprocessCLITransport.close()`'s
 #: own bounded worst case (lock, graceful exit, SIGTERM and SIGKILL waits of 5 s each).
@@ -56,13 +59,30 @@ class SessionEnd:
             return False
         return assembler.bridge_route(key) is not None
 
-    def _end(self, key: int) -> bool:
-        """End the session, whoever gets here first. True when it was still pending here."""
+    def _end(self, key: int, *, late: bool = False) -> None:
+        """End the session, whoever gets here first. `late` is the reaper, which ends only a session
+        still pending here, and says that it cut the session short."""
         with self._lock:
             pending = self._due.pop(key, None) is not None
-        with self._adapter._guard("adapters.anthropic.transport_close"):
-            self._adapter._on_close(key, None)
-        return pending
+        if late and not pending:
+            return
+        adapter = self._adapter
+        with adapter._guard("adapters.anthropic.transport_close"):
+            if late:
+                self._cut_short(key)
+            adapter._on_close(key, None)
+
+    def _cut_short(self, key: int) -> None:
+        """A session ended on its deadline, without awaiting the CLI's last export: its bridge data
+        may be incomplete. The root says wardex's capture fell short (`INSTRUMENTATION_DEGRADED`),
+        the counter says how, and the session may no longer claim `OTEL_BRIDGE_NO_DATA` — that the
+        CLI sent nothing is exactly what a session that stopped waiting cannot know."""
+        counters.bump("adapters.anthropic.otel_bridge.session_ended_late")
+        assembler = self._adapter._assembler
+        unit = assembler.unit_for(key) if assembler is not None else None
+        if unit is not None:
+            unit.note(Limitation.INSTRUMENTATION_DEGRADED)
+            assembler.cut_short(key)
 
     def reader_ended(self, key: int, exc: BaseException) -> None:
         """The tee's reader stopped (`reader_stopped`: no failure) or failed (an error root)."""
@@ -94,7 +114,7 @@ class SessionEnd:
                     self._due[key] = time.monotonic() + adapter._drain_seconds + _HANDOFF_S
             try:
                 if not abandoned:
-                    with adapter._guard("adapters.anthropic.otel_bridge_drain"):
+                    with adapter._guard("adapters.anthropic.session_end.drain_failed"):
                         await adapter._drain_bridge(key)
             finally:
                 self._end(key)
@@ -105,13 +125,16 @@ class SessionEnd:
         with self._lock:
             late = [key for key, deadline in self._due.items() if deadline <= now]
         for key in late:
-            if self._end(key):
-                counters.bump("adapters.anthropic.otel_bridge.session_ended_late")
+            self._end(key, late=True)
 
     def clear(self) -> None:
-        """Uninstall: `close_all_sessions` ends whatever was still pending here."""
+        """Uninstall: `close_all_sessions` ends whatever was still pending here, without the CLI's
+        last export, so those sessions may not claim `OTEL_BRIDGE_NO_DATA` either."""
         with self._lock:
-            self._due.clear()
+            pending, self._due = list(self._due), {}
+        assembler = self._adapter._assembler
+        for key in pending if assembler is not None else ():
+            assembler.cut_short(key)
 
     def _at_fork_reinit(self) -> None:
         """Fork child: the lock is REPLACED, never acquired; the parent's sessions are its own."""

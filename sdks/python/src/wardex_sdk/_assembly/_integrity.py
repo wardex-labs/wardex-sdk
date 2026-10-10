@@ -119,10 +119,9 @@ Two emit sites, and the first is the mechanism the second restates.
     decides. It used to be a third site here, stamping this by hand at the end
     of a tier ladder the adapter walked itself.
 
-    The path that puts it on the most records is neither:
-    ``__init__.py``'s ``capture_state_snapshot`` passes
-    ``ParentSource.UNRESOLVED`` for a snapshot taken outside any span and names
-    no member itself, leaving the ``_MARKER`` table to do it.
+    The path that puts it on the most records is neither: ``__init__.py``'s
+    ``capture_state_snapshot`` passes ``ParentSource.UNRESOLVED`` for a snapshot taken outside any
+    span and names no member itself, leaving the ``_MARKER`` table to do it.
 
     A byte-seam span reaches it the same way, through ``resolve_observed``'s ``_ORPHANED_BY_WARDEX``
     evidence, in three cases: the latched parent's unit had already closed, the request was issued
@@ -385,12 +384,11 @@ Two emit sites, and the first is the mechanism the second restates.
     """Something else re-patched a symbol wardex had already patched, so the
     interception wardex installed is no longer the one in effect.
 
-    Emitted from ``_assembly/_patchset.py::PatchSet._restore``, when the attribute
-    being restored no longer holds the exact wrapper this ``PatchSet`` installed
-    — another library patched over wardex, or removed wardex's patch outright.
-    That patch is then LEFT IN PLACE, which is the point: restoring over it would
-    delete the other library's interception from a component that has just
-    announced it is gone.
+    Emitted from ``_assembly/_patchset.py::PatchSet._restore``, when the attribute being restored no
+    longer holds the exact wrapper this ``PatchSet`` installed — another library patched over
+    wardex, or removed wardex's patch outright. That patch is then LEFT IN PLACE, which is the
+    point: restoring over it would delete the other library's interception from a component that has
+    just announced it is gone.
 
     Detectable only at restore time, when the component has stopped producing spans — so the live
     signal is the counter ``PatchSet`` bumps (``<owner>.patch_superseded``), and
@@ -450,6 +448,11 @@ Two emit sites, and the first is the mechanism the second restates.
     ``initialize`` handshake did not register the adapter's hooks — a ``query`` bound before
     ``wardex.init()``, or a client built before it. The session is recorded from the CLI's stream
     alone, without the sub-agent spans only the hooks open, so the run reads as one that had none.
+
+    And from ``_adapters/_session_end.py``, on the root of a Claude Agent SDK session with the OTel
+    bridge that was ended on a deadline because its transport's close never came, or came too late:
+    the CLI's last export was never awaited, so the bridge data merged into it may be incomplete.
+    Such a root never carries ``OTEL_BRIDGE_NO_DATA``, which would claim the CLI sent nothing.
 
     Deliberately not ``CONTEXT_PROPAGATION_DEGRADED``, which is declared as a property of the
     RUNTIME — work whose carrier legitimately could not inherit the context. Reusing it here would
@@ -529,12 +532,11 @@ Two emit sites, and the first is the mechanism the second restates.
     """The framework ran the tool in-process and never exposed a tool-call id,
     so the tool span cannot be joined to the assistant message that requested it.
 
-    Emitted from ``_adapters/_anthropic_agent_sdk.py::_describe_tool_call``, on every
-    span an in-process SDK MCP tool produces. The handler is dispatched with
-    ``{name, arguments}`` and nothing else, so the id genuinely does not reach
-    it; the alternative — matching name and arguments against the stream in
-    arrival order — is the framework-identifier heuristic this design exists to
-    remove, and it would be indistinguishable from a real join downstream.
+    Emitted from ``_adapters/_anthropic_agent_sdk.py::_describe_tool_call``, on every span an
+    in-process SDK MCP tool produces. The handler is dispatched with ``{name, arguments}`` and
+    nothing else, so the id genuinely does not reach it; the alternative — matching name and
+    arguments against the stream in arrival order — is the framework-identifier heuristic this
+    design exists to remove, and it would be indistinguishable from a real join downstream.
 
     Also emitted from ``_adapters/_openai_agents.py::_function_start``, where the one recovery this
     marker's ABSENCE may mean is an EXACT and UNIQUE ``(name, arguments)`` match against the
@@ -548,11 +550,10 @@ Two emit sites, and the first is the mechanism the second restates.
     """A snapshot arrived with a type outside ``SnapshotType``, so it was
     recorded as ``UNSPECIFIED``.
 
-    Emitted from ``_assembly/_snapshot.py::SnapshotDraft.__init__``, when
-    ``coerce_snapshot_type`` cannot resolve the value the caller handed
-    ``capture_state_snapshot``. Closing ``SnapshotType`` is what built this
-    emitter; before it, an unrecognized type was flattened to ``UNSPECIFIED``
-    by ``codec.rs``'s ``map_snap`` with nothing recorded anywhere.
+    Emitted from ``_assembly/_snapshot.py::SnapshotDraft.__init__``, when ``coerce_snapshot_type``
+    cannot resolve the value the caller handed ``capture_state_snapshot``. Closing ``SnapshotType``
+    is what built this emitter; before it, an unrecognized type was flattened to ``UNSPECIFIED`` by
+    ``codec.rs``'s ``map_snap`` with nothing recorded anywhere.
     """
 
     # ------------------------------------------------------------------
@@ -581,14 +582,13 @@ Two emit sites, and the first is the mechanism the second restates.
     naming its source has more than one reading, or none this seam can check.
 
     Emitted from ``_adapters/_langgraph_links.py::_node_links`` for a LangGraph
-    ``join:{a}+{b}:{end}`` trigger. ``+`` is legal inside a node name and is
-    also the source separator, so ``join:a+b+a:c`` is ``a+b``, ``a`` in one
-    graph and ``a``, ``b``, ``a`` in another; ``_join_sources`` reads it
-    against the run's node set and links only a unique reading. Travels with
-    the counter ``adapters.langgraph.join_ambiguous``. Reader's next action:
-    the real sources are in the graph definition; node names without ``+``
-    make every join resolvable. Names NO knob. Not ``TOOL_NAME_COLLISION``:
-    that is a span's own identity; here its edge to another span is unsure.
+    ``join:{a}+{b}:{end}`` trigger. ``+`` is legal inside a node name and is also the source
+    separator, so ``join:a+b+a:c`` is ``a+b``, ``a`` in one graph and ``a``, ``b``, ``a`` in
+    another; ``_join_sources`` reads it against the run's node set and links only a unique reading.
+    Travels with the counter ``adapters.langgraph.join_ambiguous``. Reader's next action: the real
+    sources are in the graph definition; node names without ``+`` make every join resolvable. Names
+    NO knob. Not ``TOOL_NAME_COLLISION``: that is a span's own identity; here its edge to another
+    span is unsure.
     """
 
     # ------------------------------------------------------------------
