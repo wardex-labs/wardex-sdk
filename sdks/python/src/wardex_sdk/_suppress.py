@@ -1,6 +1,12 @@
 """Self-exclusion — prevents the exporter's outbound POST from being re-captured by the byte seam.
 
-A ContextVar guard. The transport sets it while POSTing → the seam (ByteSeamInterceptor) skips it.
+A ContextVar guard. While it is set, the seam (ByteSeamInterceptor) captures nothing and no trace
+header is injected. The CLIENT sets it around everything on the export path that can reach host
+code -- its whole drain (`before_send_envelope`, `Transport.export`, `Transport.flush`) and the
+transport's `close()` -- so a `Transport` the host wrote is excluded without knowing this module
+exists. That is why it is not exported: a transport needs nothing from it, and a public switch that
+stops capture would also be a way to hide host traffic. The built-in transports still enter it
+around their own POST, so they stay excluded when called outside a drain.
 
 It lives at the package root, beside `_hub` and `_scope`, because both ends of
 the guard sit BELOW the observers: `transport/` sets it and `context/` reads it,
