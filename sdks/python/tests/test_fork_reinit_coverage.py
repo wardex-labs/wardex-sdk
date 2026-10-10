@@ -85,6 +85,9 @@ _FORK_EXEMPT: dict[tuple[str, str], str] = {
     ("_interceptors/_trackers.py", "_latch"): (
         "per-connection tracker state; rides _ConnectionState, dropped by the seam's clear"
     ),
+    ("_interceptors/_trackers.py", "_evicted_admitting"): (
+        "per-connection tracker state; rides _ConnectionState, dropped by the seam's clear"
+    ),
     ("_interceptors/_trackers.py", "_close_from"): (
         "per-connection tracker state; rides _ConnectionState, dropped by the seam's clear"
     ),

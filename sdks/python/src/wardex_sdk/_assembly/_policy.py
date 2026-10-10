@@ -126,8 +126,9 @@ def should_capture(
     missing". Three producers say it, and they are one fact seen at three
     moments: `assembly._parentage.in_degraded_run()` — a span wardex FAILED
     to open is what should have been ambient here; the byte seam's
-    `_Txn.parent_evicted`, where a parent WAS latched and wardex's own
-    per-connection bound dropped the record before the response claimed it;
+    `_Txn.parent_lost`, where a parent that would have admitted the span WAS
+    latched and wardex's own per-connection bound dropped the record before
+    the response claimed it;
     and the seam's `unparsed` — a finalization whose LLM-semantic parse
     wardex itself skipped (backlog eviction, shutdown budget, a raising
     parser), so the `agent_semantic` claim cannot honestly be answered.
