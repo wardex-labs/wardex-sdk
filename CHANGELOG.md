@@ -366,6 +366,20 @@ All notable changes to this project are documented here. The format follows
   number inside a longer run of digits or letters are left alone. The README
   now says which phone formats are covered and lists every other format among
   what masking does not catch.
+- **LangGraph's step ids are no longer masked as a card number.** The
+  LangGraph adapter writes the id LangGraph gives each node run as
+  `wardex.step.task_id`, and the checkpoint namespace that holds it as
+  `wardex.step.namespace` (`outer:<id>|inner:<id>`). The id is a hash laid
+  out as a UUID, so for about one step in eighteen thousand its first three
+  or last two groups are all decimal and pass the card checksum; the default
+  `credit_card` rule then rewrote it to `****-****-****-…` and recorded a
+  card on the span, and the id is what tells a fan-out's sibling steps
+  apart. A value of exactly that form, lowercase hex in 8-4-4-4-12 groups, is
+  now left as written under `wardex.step.task_id`, and so is each such id
+  inside `wardex.step.namespace`, on both wires. The node names in the
+  namespace are yours and are masked as before, as is the same id anywhere
+  else or any other form under these two keys. The card rule is the only
+  built-in rule that can match inside the form.
 - **A wrong project key, a receiver that is down, and every other loss no
   span can carry now say so once with `debug` off, and are counted.**
   Before, with the default `debug=False`, an export your receiver refused or

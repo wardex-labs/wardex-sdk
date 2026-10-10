@@ -11,24 +11,32 @@ that server, since the digest of a tool list does not change.
 The walk in the Rust core leaves an attribute alone when the SDK computes its
 value, by the key the SDK writes it under and the exact form it writes there
 (`SDK_VALUE_ATTRS` in `crates/wardex-pipeline/src/pii/walk.rs`); everything
-else is judged. Which attributes those are is a fact about this package's
-source, so this file reads it from the source: every `set_extra(key, value)`
-call under `wardex_sdk`, by AST, with key and value spelled as the code spells
-them. `_SITES` says where each call's value comes from. A new call fails here
-until someone decides that; a call that is gone fails until its row goes.
+else is judged. A framework's id the SDK copies as the framework made it is
+left alone the same way: LangGraph's task id is a hash laid out as a UUID, and
+for about one task in eighteen thousand the card rule rewrote it. Which
+attributes those are is a fact about this package's source, so this file reads
+it from the source: every `set_extra(key, value)` call under `wardex_sdk`, by
+AST, with key and value spelled as the code spells them. `_SITES` says where
+each call's value comes from. A new call fails here until someone decides that;
+a call that is gone fails until its row goes.
 
-The four answers, and what each one is held to below:
+The five answers, and what each one is held to below:
 
 * `COMPUTED` -- text the SDK computes. The walk must list its key, and a value
   the producer really makes that the card rule fires on ships as written, with
   no record, on both wires. The same value anywhere else is still masked.
+* `FRAMEWORK` -- an id the host's framework makes in one fixed form, which the
+  SDK copies as written. Held to what a `COMPUTED` key is held to, with the
+  framework's own code as the producer.
 * `LITERAL` -- text the SDK picks from a fixed set. No rule may fire on any
   member, so no exemption is needed and none exists.
 * `NUMBER` -- a count or flag the SDK writes as a number. The walk reads only
   text, so no rule reads it.
 * `HOST` -- the host's, its framework's or its traffic's: a node name, a
   response id, a thread id, a CLI's measurement. Judged like any host text,
-  which a card number under each such key proves.
+  which a card number under each such key proves. LangGraph's checkpoint
+  namespace is one: the host's node names, each followed by a task id, and
+  the walk keeps the ids in it as written while it masks the names.
 
 `set_extra` is how SDK code writes a span attribute. The other ways an
 attribute reaches a span carry no computed text: the builder's
@@ -62,6 +70,7 @@ _WALK = _REPO / "crates" / "wardex-pipeline" / "src" / "pii" / "walk.rs"
 _RUST_CENSUS = _REPO / "crates" / "wardex-pipeline" / "tests" / "sdk_generated_fields.rs"
 
 COMPUTED = "computed"
+FRAMEWORK = "framework"
 LITERAL = "literal"
 NUMBER = "number"
 HOST = "host"
@@ -142,10 +151,11 @@ _SITES: list[tuple[str, str, str, str]] = [
     (_LG, "'wardex.framework'", "_FRAMEWORK", LITERAL),
     (_LG, "'wardex.framework'", "_FRAMEWORK", LITERAL),
     (_LG, "'wardex.langgraph.remote'", "'true'", LITERAL),
-    # The graph's node names, LangGraph's task ids, step numbers, triggers and
-    # checkpoint namespaces, and the host's thread id and `Command` target.
+    # LangGraph's task id: xxh3 of the task's identity, laid out as a UUID.
+    (_LG, "'wardex.step.task_id'", "str(task.id)", FRAMEWORK),
+    # The graph's node names, step numbers, triggers and checkpoint
+    # namespaces, and the host's thread id and `Command` target.
     (_LG, "'wardex.step.name'", "task.name", HOST),
-    (_LG, "'wardex.step.task_id'", "str(task.id)", HOST),
     (_LG, "'wardex.step.index'", "index", HOST),
     (_LG, "'wardex.step.trigger'", "','.join((str(t) for t in triggers))", HOST),
     (_LG, "'wardex.step.namespace'", "str(ns)", HOST),
@@ -198,6 +208,23 @@ _COMPUTED_SAMPLES: dict[str, Callable[[], str]] = {
     "wardex.openai_agents.mcp.tools_hash": lambda: importlib.import_module(
         "wardex_sdk._adapters._openai_agents"
     )._tools_digest(sorted(("get_weather", "search_docs_v28401"))),
+}
+
+#: For each FRAMEWORK key, the framework's own code, run for real on an input
+#: whose output the card rule fires on.
+_FRAMEWORK_SAMPLES: dict[str, Callable[[], str]] = {
+    # The id LangGraph gives the pull task of a node `agent` at step 27026,
+    # the first step whose id has decimal 8-4-4 groups that pass the checksum.
+    "wardex.step.task_id": lambda: importlib.import_module("langgraph.pregel._algo")._xxhash_str(
+        bytes(range(16)), "agent", "27026", "agent", "__pregel_pull", "branch:to:agent"
+    ),
+}
+
+#: For each key a sample above is shipped under, a host key of the same span
+#: family, where the card rule still takes the same value.
+_NEIGHBOUR = {
+    "wardex.openai_agents.mcp.tools_hash": "wardex.openai_agents.mcp.server",
+    "wardex.step.task_id": "wardex.step.name",
 }
 
 #: LITERAL values the AST cannot read off the call, and where the set comes from.
@@ -288,24 +315,30 @@ def test_every_set_extra_call_in_the_sdk_is_classified():
     expected = Counter((rel, key, value) for rel, key, value, _ in _SITES)
     assert scanned - expected == Counter(), "calls with no row: classify them in _SITES"
     assert expected - scanned == Counter(), "rows with no call: remove them from _SITES"
-    assert {o for *_, o in _SITES} == {COMPUTED, LITERAL, NUMBER, HOST}
+    assert {o for *_, o in _SITES} == {COMPUTED, FRAMEWORK, LITERAL, NUMBER, HOST}
 
 
-def test_a_computed_key_is_never_also_written_from_anything_else():
-    computed = _keys(COMPUTED)
-    others = {_resolve(rel, key) for rel, key, _, o in _SITES if o != COMPUTED}
-    assert computed and not computed & others, computed & others
+@pytest.mark.parametrize("origin", [COMPUTED, FRAMEWORK])
+def test_an_exempt_key_is_never_also_written_from_anything_else(origin):
+    exempt = _keys(origin)
+    others = {_resolve(rel, key) for rel, key, _, o in _SITES if o != origin}
+    assert exempt and not exempt & others, exempt & others
 
 
-def test_the_walk_exempts_exactly_the_computed_keys():
+def test_the_walk_exempts_exactly_the_computed_and_framework_keys():
     # The conversation id is the one exemption no `set_extra` call writes: it
     # is where the OTLP mapping spells the typed conversation field.
-    assert _walk_exempt_keys() == _keys(COMPUTED) | {"gen_ai.conversation.id"}
+    assert _walk_exempt_keys() == (_keys(COMPUTED) | _keys(FRAMEWORK) | {"gen_ai.conversation.id"})
     census = _RUST_CENSUS.read_text(encoding="utf-8")
-    block = census.split("const SDK_COMPUTED_ATTRS", 1)[1].split("];", 1)[0]
-    for key in _keys(COMPUTED):
-        assert f'"{key}"' in block, f"{key} has no row in the Rust census"
+    for origin, const in ((COMPUTED, "SDK_COMPUTED_ATTRS"), (FRAMEWORK, "FRAMEWORK_ID_ATTRS")):
+        block = census.split(f"const {const}", 1)[1].split("];", 1)[0]
+        for key in _keys(origin):
+            assert f'"{key}"' in block, f"{key} has no row in the Rust census"
     assert set(_COMPUTED_SAMPLES) == _keys(COMPUTED)
+    assert set(_FRAMEWORK_SAMPLES) == _keys(FRAMEWORK)
+    assert set(_NEIGHBOUR) == _keys(COMPUTED) | _keys(FRAMEWORK)
+    host = {k for rel, key, _, o in _SITES if o == HOST and (k := _resolve(rel, key)) is not None}
+    assert set(_NEIGHBOUR.values()) <= host
 
 
 def test_a_literal_value_is_read_off_the_call_or_named_here():
@@ -434,12 +467,12 @@ def _rules(env: dict[str, Any]) -> list[str]:
     return env.get("capture_integrity", {}).get("redaction_rules", [])
 
 
-@pytest.mark.parametrize("key", sorted(_COMPUTED_SAMPLES))
-def test_a_computed_value_ships_as_written_and_unrecorded(key):
-    value = _COMPUTED_SAMPLES[key]()
+@pytest.mark.parametrize("key", sorted(_COMPUTED_SAMPLES | _FRAMEWORK_SAMPLES))
+def test_an_exempt_value_ships_as_written_and_unrecorded(key):
+    value = (_COMPUTED_SAMPLES | _FRAMEWORK_SAMPLES)[key]()
     # The card rule takes it anywhere else: under a host key of the same span
-    # family, the neighbouring MCP server name.
-    env, otlp = _ship({"wardex.openai_agents.mcp.server": value})
+    # family.
+    env, otlp = _ship({_NEIGHBOUR[key]: value})
     assert _rules(env) == ["credit_card"]
     assert value not in repr(env) and value not in repr(otlp)
     env, otlp = _ship({key: value})
@@ -447,6 +480,21 @@ def test_a_computed_value_ships_as_written_and_unrecorded(key):
     assert _rules(env) == []
     assert otlp["attributes"][key] == value
     assert not any(k.startswith("wardex.redact") for k in otlp["attributes"])
+
+
+def test_a_checkpoint_namespace_ships_its_task_ids_as_written_and_masks_its_names():
+    task_id = _FRAMEWORK_SAMPLES["wardex.step.task_id"]()
+    key = "wardex.step.namespace"
+    ns = f"outer:{task_id}|inner:{task_id}"
+    env, otlp = _ship({key: ns})
+    assert _extra(env)[key] == ns
+    assert _rules(env) == []
+    assert otlp["attributes"][key] == ns
+    env, otlp = _ship({key: f"ops@corp.example:{task_id}|{_CARD}:{task_id}"})
+    masked = f"[EMAIL]:{task_id}|****-****-****-1111:{task_id}"
+    assert _extra(env)[key] == masked
+    assert sorted(_rules(env)) == ["credit_card", "email"]
+    assert otlp["attributes"][key] == masked
 
 
 def test_no_rule_fires_on_any_literal_the_sdk_writes():
