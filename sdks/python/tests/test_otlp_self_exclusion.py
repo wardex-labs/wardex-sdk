@@ -268,3 +268,44 @@ def test_every_call_into_host_code_on_the_export_path_runs_excluded():
     assert set(seen) == {"before_send_envelope", "export", "flush", "close"}
     assert all(all(calls) for calls in seen.values()), seen
     assert is_suppressed() is False, "the exclusion leaked out of the drain"
+
+
+def test_a_transport_sending_from_its_own_thread_is_excluded_with_the_documented_idiom():
+    """The exclusion is context-local, and an executor's worker thread does not
+    inherit the caller's context. The `Transport` docstring tells a transport
+    that sends from a thread it owns to run that work in a copy of the caller's
+    context; this holds the documented idiom to its promise under the mode that
+    records every outbound call."""
+    import contextvars
+    from concurrent.futures import ThreadPoolExecutor
+
+    class _ExecutorTransport(_PostingTransport):
+        def __init__(self, port: int) -> None:
+            super().__init__(port)
+            self.pool = ThreadPoolExecutor(max_workers=1)
+
+        def export(self, envelope: Envelope) -> None:
+            self.batches.append([span.name for span in envelope.spans])
+            ctx = contextvars.copy_context()
+            self.pool.submit(ctx.run, self.post, "/ingest").result()
+
+    httpd, received = _collector()
+    transport = _ExecutorTransport(httpd.server_address[1])
+    try:
+        wardex.init(
+            transport=transport,
+            capture_mode=CaptureMode.ALL,
+            batching=BatchingConfig(flush_interval=3600.0),
+        )
+        with wardex.span("work"):
+            pass
+        wardex.flush()
+        wardex.flush()
+        wardex.flush()
+        wardex.close()
+        assert received.count("/ingest") >= 1, "precondition: the transport really POSTed"
+        assert _exported_self_traffic(transport) == []
+    finally:
+        transport.pool.shutdown()
+        httpd.shutdown()
+        httpd.server_close()

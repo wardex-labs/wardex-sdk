@@ -242,12 +242,25 @@ class Transport(abc.ABC):
     blocks a host thread exactly when the host asked to wait for one; and a
     transport must not assume any particular thread.
 
-    THE SELF-EXCLUSION CONTRACT: whatever these calls send is never recorded
-    as a span. The client runs `before_send_envelope`, `export`, `flush` and
-    `close` with wardex's capture suppressed for their duration, so a
-    transport needs no rule of its own -- a plain HTTP POST from `export()` is
-    not captured even under `capture_mode=ALL`, or from a `flush()` made
-    inside a live span.
+    THE SELF-EXCLUSION CONTRACT: what these calls send ON THE THREAD THAT
+    CALLS THEM is never recorded as a span. The client runs
+    `before_send_envelope`, `export`, `flush` and `close` with wardex's capture
+    suppressed for their duration, so a transport that sends inline needs no
+    rule of its own -- a plain HTTP POST from `export()` is not captured even
+    under `capture_mode=ALL`, or from a `flush()` made inside a live span.
+
+    The suppression is context-local (a `contextvars.ContextVar`), and a new
+    thread or an executor's worker does not inherit the caller's context. A
+    transport that hands its sending to a thread it owns must carry the
+    context across itself, with the standard-library idiom:
+
+        ctx = contextvars.copy_context()  # inside export()/flush()/close()
+        self._pool.submit(ctx.run, self._post, body)
+
+    Without it, that thread's requests are ordinary outbound traffic to
+    wardex: recorded under `capture_mode=ALL`, or when the collector's host is
+    in `intercept_hosts`. Copy the context at the call, not once at startup --
+    the suppression is only set for the duration of the call.
 
     THE FORK EXTENSION POINT, optional: a transport may define
     `at_fork_child()` (no arguments), and wardex's `os.register_at_fork`

@@ -8,6 +8,10 @@ exists. That is why it is not exported: a transport needs nothing from it, and a
 stops capture would also be a way to hide host traffic. The built-in transports still enter it
 around their own POST, so they stay excluded when called outside a drain.
 
+It reaches only the calling thread's context. A transport that sends from a thread it owns must
+run that work in a copy of the caller's context (`contextvars.copy_context().run`), as the
+`Transport` docstring says; one that does not is not excluded.
+
 It lives at the package root, beside `_hub` and `_scope`, because both ends of
 the guard sit BELOW the observers: `transport/` sets it and `context/` reads it,
 and while it lived under `_interceptors/` those two were the only modules in the
