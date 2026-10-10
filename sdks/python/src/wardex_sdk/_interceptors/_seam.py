@@ -898,7 +898,7 @@ def _should_capture(
             parent=getattr(txn, "parent", None),
             agent_semantic=(sem is not None and _is_llm_traffic(txn, sem))
             or getattr(txn, "ws_llm_call", False),
-            degraded=unparsed or in_degraded_run() or getattr(txn, "parent_evicted", False),
+            degraded=unparsed or in_degraded_run() or getattr(txn, "parent_lost", False),
             parent_closed=getattr(txn, "parent_closed", False),
         )
     except Exception:

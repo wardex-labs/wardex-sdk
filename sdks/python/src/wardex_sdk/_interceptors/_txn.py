@@ -42,6 +42,12 @@ class _Txn:
     #: latched and wardex threw it away, which is a defect the span has to carry rather than a fact
     #: about the traffic. See `assembly._parentage.resolve_observed`.
     parent_evicted: bool = False
+    #: The evicted entry held a parent that would by itself have admitted this transaction past the
+    #: capture gate (`_trackers._admits`). Only this half of `parent_evicted` is the gate's
+    #: `degraded` input: an entry evicted with no parent, a remote one or a closed unit's lost
+    #: nothing the gate acts on, and calling it degraded let bodies out under a mode that had
+    #: filtered the traffic. `parent_evicted` alone stays the marker (`resolve_observed`).
+    parent_lost: bool = False
     #: The conversation the request was ISSUED in, latched beside `parent` for the same reason.
     conversation: ConversationContext | None = None
     #: The tags and user the span is stamped with, snapshotted beside `parent` for the same reason

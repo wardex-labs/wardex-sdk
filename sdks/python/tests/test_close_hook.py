@@ -11,13 +11,15 @@ import gc
 import socket
 from functools import partial
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 from hpack import Encoder
 
+from wardex_sdk import _hub
 from wardex_sdk._assembly import Limitation, counters
 from wardex_sdk._enums import CaptureMode
-from wardex_sdk._interceptors import _close_hook, _seam
+from wardex_sdk._interceptors import _close_hook, _seam, _trackers
 from wardex_sdk._interceptors._close_hook import (
     CloseRegistry,
     close_registry,
@@ -26,6 +28,7 @@ from wardex_sdk._interceptors._close_hook import (
 )
 from wardex_sdk._interceptors._trackers import _Http2Tracker, _WebSocketTracker
 from wardex_sdk._limits import LimitsConfig
+from wardex_sdk._types import SpanContext, SpanId, TraceId
 
 
 @pytest.fixture(autouse=True)
@@ -806,33 +809,96 @@ def test_closing_the_connection_forgets_the_eviction_mark_too():
     """
     tracker = _Http2Tracker(LimitsConfig(max_streams=2).to_native())
     enc = Encoder()
-    for sid in (1, 3, 5):
-        tracker.on_request_bytes(_h2_open(enc, sid))
+    with _issued_under(_local_parent()):
+        for sid in (1, 3, 5):
+            tracker.on_request_bytes(_h2_open(enc, sid))
     assert tracker._latch_evicted_below and tracker._latch_first
+    assert tracker._evicted_admitting == {1}
 
     assert tracker.on_connection_close(Limitation.CONNECTION_EVICTED) == []
     assert tracker._latch == {}
     assert tracker._latch_evicted_below == 0
     assert tracker._latch_first == 0
+    assert tracker._evicted_admitting == set()
 
     (fresh,) = tracker.on_response_bytes(_h2_answer(Encoder(), 1))
     assert fresh.parent_evicted is False
+    assert fresh.parent_lost is False
 
 
-def test_a_dropped_latch_entry_reaches_the_span_as_wardexs_own_fault():
-    """End to end, because the decision is only worth making if it ships.
+def _local_parent(*, remote: bool = False) -> SpanContext:
+    return SpanContext(TraceId.generate(), SpanId.generate(), is_remote=remote)
 
-    Two things had to happen for it to. The edge is `UNRESOLVED` rather than a
-    trace root, so a consumer cannot mistake the span for one the host issued
-    outside any agent work — and it carries `INSTRUMENTATION_DEGRADED`, which is
-    what says the missing parent is wardex's doing rather than the traffic's.
-    The AGENT-mode gate had to let it through as well: it reads an absent parent
-    as "not agent work", so without the same signal the span would be dropped
-    before anything could explain itself, which is the silent failure the cap
-    would otherwise have introduced.
-    """
-    from conftest import _FakeSSLSocket
-    from wardex_sdk._assembly import ParentSource
+
+class _issued_under:  # noqa: N801 — a context manager reads as a clause at the call site
+    """Issue requests with `parent` as the ambient span (None: outside any)."""
+
+    def __init__(self, parent: SpanContext | None) -> None:
+        self._parent = parent
+
+    def __enter__(self) -> None:
+        self._cm = _hub.new_scope()
+        self._cm.__enter__().active_span_context = self._parent
+
+    def __exit__(self, *exc: object) -> None:
+        self._cm.__exit__(*exc)
+
+
+@pytest.mark.parametrize("held", ["no parent", "a remote parent", "a closed unit's parent"])
+def test_an_evicted_entry_whose_parent_would_not_have_admitted_it_keeps_the_gate_shut(
+    held, monkeypatch
+):
+    """The marker and the gate are told different things. The marker says the
+    cap dropped the entry, whatever it held. The gate hears only whether what
+    it dropped would by itself have admitted the span: an entry with no parent,
+    a remote one or a closed unit's would have been refused under AGENT had it
+    survived, so its eviction must not be what lets the bodies out."""
+    if held == "a closed unit's parent":
+        monkeypatch.setattr(_trackers, "parent_is_closed_unit", lambda parent: parent is not None)
+    parent = None if held == "no parent" else _local_parent(remote=held == "a remote parent")
+    tracker = _Http2Tracker(LimitsConfig(max_streams=2).to_native())
+    client_enc, server_enc = Encoder(), Encoder()
+    with _issued_under(parent):
+        for sid in (1, 3, 5):
+            tracker.on_request_bytes(_h2_open(client_enc, sid))
+    assert tracker._evicted_admitting == set()
+
+    (late,) = tracker.on_response_bytes(_h2_answer(server_enc, 1))
+    assert late.parent_evicted is True, "the marker half is unchanged"
+    assert late.parent_lost is False
+
+
+def test_an_evicted_entry_that_held_a_live_local_parent_tells_the_gate():
+    tracker = _Http2Tracker(LimitsConfig(max_streams=2).to_native())
+    client_enc, server_enc = Encoder(), Encoder()
+    with _issued_under(_local_parent()):
+        for sid in (1, 3, 5):
+            tracker.on_request_bytes(_h2_open(client_enc, sid))
+    (late,) = tracker.on_response_bytes(_h2_answer(server_enc, 1))
+    assert (late.parent_evicted, late.parent_lost) == (True, True)
+    assert tracker._evicted_admitting == set(), "claimed once, then forgotten"
+
+
+def test_the_record_of_admitting_evictions_is_bounded_by_the_stream_cap():
+    """Not the unbounded table the eviction mark exists to avoid: it holds at
+    most `max_streams` ids, the newest evictions. One it forgot reads as an
+    eviction that lost no parent, so the gate stays shut for it."""
+    tracker = _Http2Tracker(LimitsConfig(max_streams=2).to_native())
+    client_enc, server_enc = Encoder(), Encoder()
+    with _issued_under(_local_parent()):
+        for sid in range(1, 100, 2):
+            tracker.on_request_bytes(_h2_open(client_enc, sid))
+    assert set(tracker._latch) == {97, 99}
+    assert tracker._evicted_admitting == {93, 95}
+
+    (forgotten,) = tracker.on_response_bytes(_h2_answer(server_enc, 1))
+    assert (forgotten.parent_evicted, forgotten.parent_lost) == (True, False)
+    (kept,) = tracker.on_response_bytes(_h2_answer(server_enc, 95))
+    assert (kept.parent_evicted, kept.parent_lost) == (True, True)
+
+
+def _agent_mode_seam() -> tuple[Any, Any]:
+    """An SSL seam whose client keeps what the default capture mode, AGENT, admits."""
     from wardex_sdk._interceptors._ssl import SSLInterceptor
 
     class _Client:
@@ -859,13 +925,40 @@ def test_a_dropped_latch_entry_reaches_the_span_as_wardexs_own_fault():
     itc = SSLInterceptor()
     itc._client = client
     itc._load_limits(client)
+    return itc, client
+
+
+def _evict_and_answer(itc: Any, parent: SpanContext | None) -> None:
+    """Streams 1, 3, 5 issued under `parent`; the cap of 2 drops stream 1's
+    entry; stream 1 is answered late. Nothing in the bodies is LLM-semantic."""
+    from conftest import _FakeSSLSocket
 
     sock = _FakeSSLSocket("h2")
     sock.server_hostname = "api.anthropic.com"
     client_enc, server_enc = Encoder(), Encoder()
-    for sid in (1, 3, 5):
-        itc._on_request_bytes(sock, _h2_open(client_enc, sid))
+    with _issued_under(parent):
+        for sid in (1, 3, 5):
+            itc._on_request_bytes(sock, _h2_open(client_enc, sid))
     itc._on_response_bytes(sock, _h2_answer(server_enc, 1))
+
+
+def test_a_dropped_latch_entry_reaches_the_span_as_wardexs_own_fault():
+    """End to end, because the decision is only worth making if it ships.
+
+    The request was issued inside agent work: a live local parent was latched,
+    and the cap dropped it. Two things had to happen for the span to ship. The
+    edge is `UNRESOLVED` rather than a trace root, so a consumer cannot mistake
+    the span for one the host issued outside any agent work — and it carries
+    `INSTRUMENTATION_DEGRADED`, which is what says the missing parent is
+    wardex's doing rather than the traffic's. The AGENT-mode gate had to let it
+    through as well: it reads an absent parent as "not agent work", so without
+    the same signal the span would be dropped before anything could explain
+    itself, which is the silent failure the cap would otherwise have introduced.
+    """
+    from wardex_sdk._assembly import ParentSource
+
+    itc, client = _agent_mode_seam()
+    _evict_and_answer(itc, _local_parent())
 
     assert len(client.spans) == 1, "the gate dropped the span the cap had degraded"
     integrity = client.spans[0].capture_integrity
@@ -873,6 +966,15 @@ def test_a_dropped_latch_entry_reaches_the_span_as_wardexs_own_fault():
     assert Limitation.INSTRUMENTATION_DEGRADED in integrity.limitations
     assert client.spans[0].correlation.strategy is ParentSource.UNRESOLVED
     assert client.spans[0].parent_span_id is None
+
+
+def test_an_evicted_entry_that_held_no_parent_is_not_let_through_the_agent_gate():
+    """The same eviction of a request issued OUTSIDE any agent work. Had its
+    entry survived, AGENT would have dropped the span; the cap dropping the
+    entry is no reason to export its request and response bodies instead."""
+    itc, client = _agent_mode_seam()
+    _evict_and_answer(itc, None)
+    assert client.spans == []
 
 
 def test_a_state_rebuilt_on_a_live_socket_does_not_stack_retirement_hooks(

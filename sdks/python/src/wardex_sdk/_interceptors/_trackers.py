@@ -12,7 +12,8 @@ import time
 from typing import Any
 
 from .. import _hub, _wardex_native
-from .._assembly import Limitation, counters, parent_is_closed_unit
+from .._assembly import Limitation, counters, parent_is_closed_unit, should_capture
+from .._enums import CaptureMode
 from .._protocol import WsParser
 from .._protocol._http1 import Http1ResponseParser, declares_event_stream
 from .._protocol._http2 import Http2Parser
@@ -57,6 +58,15 @@ def _max_streams(limits: object | None) -> int:
     if not isinstance(cap, int) or cap <= 0:
         cap = _wardex_native.limits_defaults()["max_streams"]
     return max(1, int(cap))
+
+
+def _admits(parent: SpanContext | None, parent_closed: bool) -> bool:
+    """Would this latched parent by itself admit a transaction past the capture gate? Asked of the
+    policy (`should_capture` under AGENT, the one mode in which a parent decides anything) rather
+    than restated here, so the latch and the gate cannot disagree about what a parent is worth."""
+    return should_capture(
+        CaptureMode.AGENT, parent=parent, agent_semantic=False, parent_closed=parent_closed
+    )
 
 
 def _merge_markers(*groups: tuple[Limitation, ...]) -> tuple[Limitation, ...]:
@@ -317,10 +327,15 @@ class _Http2Tracker:
         #: before the seam was watching has no latch entry either, and its id is strictly below
         #: anything this tracker put in the table. Without the floor such a stream reads as evicted
         #: once the cap has run — a span blaming wardex for a parent wardex was never in a position
-        #: to hold, and, since `parent_evicted` also opens the AGENT-mode gate, a span whose bodies
-        #: ship under a mode that had filtered it out. Zero means "nothing latched yet", which fails
-        #: the test for every real stream id.
+        #: to hold. (It cannot open the capture gate: only an id `_evicted_admitting` recorded at
+        #: the eviction can.) Zero means "nothing latched yet", which fails the test for every real
+        #: stream id.
         self._latch_first = 0
+        #: The evicted ids whose entry held a parent that would have admitted its transaction
+        #: (`_admits`): the half of the mark above that `_mk` may hand the capture gate. Bounded by
+        #: the same cap and dropped lowest id first, so it is not the unbounded table the mark
+        #: avoids; an id it forgets reads as a parentless eviction, the gate staying shut.
+        self._evicted_admitting: set[int] = set()
         #: Who opened each stream, read in the opening call itself (`_h2_issuer`).
         self._issuers = IssuerLink(self._latch_cap)
 
@@ -348,7 +363,10 @@ class _Http2Tracker:
         # keys, run only on the writes that overflow the cap.
         while len(self._latch) > self._latch_cap:
             evicted = min(self._latch)
-            self._latch.pop(evicted)
+            if _admits(*self._latch.pop(evicted)[:2]):
+                self._evicted_admitting.add(evicted)
+                if len(self._evicted_admitting) > self._latch_cap:
+                    self._evicted_admitting.discard(min(self._evicted_admitting))
             self._latch_evicted_below = max(self._latch_evicted_below, evicted)
         return self._ship(txns)
 
@@ -409,6 +427,7 @@ class _Http2Tracker:
         """
         self._latch.clear()
         self._issuers.clear()
+        self._evicted_admitting.clear()
         self._latch_evicted_below = 0
         self._latch_first = 0
         return []
@@ -433,23 +452,28 @@ class _Http2Tracker:
             # say, from the site that owns the edge. `resolve_observed` attaches them; this only
             # reports the fact.
             #
-            # It reports the EVICTION and not "a parent was lost", because the two are not separable
-            # from here: what the entry held went with it. That is also why the claim is never an
-            # over-reach on a stream that had no parent to lose — every entry carries the REQUEST
-            # START INSTANT as well, so `start` below is a fabrication on this path regardless, the
-            # span's duration is near-zero and its start is the response instant. Something that
-            # belongs on this span is missing in every case, which is the whole content of the
-            # marker; a second marker for the clock half would split one fact across two words.
+            # The MARKER reports the EVICTION and not "a parent was lost", and is no over-reach on a
+            # stream that had no parent to lose: every entry carries the REQUEST START INSTANT as
+            # well, so `start` below is a fabrication on this path regardless, the span's duration
+            # is near-zero and its start is the response instant. Something that belongs on this
+            # span is missing in every case, which is the whole content of the marker; a second
+            # marker for the clock half would split one fact across two words.
             #
-            # Bounded at BOTH ends, and the floor is not decoration: the mark alone would also claim
-            # a stream opened before capture attached, whose id is below everything this tracker
-            # latched. That claim is not merely imprecise — `parent_evicted` feeds the capture gate
-            # as well as the marker, so a false one exports request and response bodies under a mode
-            # that had filtered the span out.
+            # The capture GATE is told less (`parent_lost`): only that the entry held a parent that
+            # would by itself have admitted the span, which the eviction recorded before the entry
+            # went. An eviction that lost no parent, or one the gate refuses, lost nothing the gate
+            # acts on; calling it degraded exported request and response bodies under a mode that
+            # had filtered the span out.
+            #
+            # The marker is bounded at BOTH ends, and the floor is not decoration: the mark alone
+            # would also claim a stream opened before capture attached, whose id is below everything
+            # this tracker latched, and blame wardex for a parent it never held.
             parent_evicted = self._latch_first <= t.stream_id <= self._latch_evicted_below
+            parent_lost = t.stream_id in self._evicted_admitting
+            self._evicted_admitting.discard(t.stream_id)
         else:
             parent, parent_closed, conversation, scope, proven, start = entry
-            parent_evicted = False
+            parent_evicted = parent_lost = False
         # The OTHER half of the same bound: the native stream table evicted this stream's request
         # before its response completed. The response is a real observation — a status, an end — so
         # the span ships, but its `? /` is a display fallback for a request wardex lost, and it may
@@ -471,6 +495,7 @@ class _Http2Tracker:
             parent=parent,
             parent_closed=parent_closed,
             parent_evicted=parent_evicted,
+            parent_lost=parent_lost,
             conversation=conversation,
             scope=scope,
             issuer_proven=proven,
