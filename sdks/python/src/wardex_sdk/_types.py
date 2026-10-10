@@ -380,6 +380,42 @@ class InternalSpan:
     links: tuple[InternalSpanLink, ...] = ()
 
 
+#: Fixed per-span overhead: context, timing, typed attributes, and the deque
+#: slot. An exact figure would mean encoding every span on the hot path.
+_SPAN_OVERHEAD_BYTES = 512
+
+
+def span_buffer_bytes(span: InternalSpan) -> int:
+    """Approximately how much memory `span` keeps resident while it waits in the
+    client's buffer -- the unit `max_buffer_bytes` is measured in.
+
+    The raw bodies count, and so does every string attribute. The semantic parse
+    stores the request's and response's messages as `extra` strings
+    (`gen_ai.input.messages` and its siblings) beside the body they were parsed
+    from, and for a multimodal request that is close to a second copy of it, the
+    base64 image included. Counting the body alone let a buffer bounded at N
+    bytes hold far more than N. An event's attributes count for the same reason:
+    an exception event carries the whole stack trace.
+
+    A string counts its length: its size in bytes for the ASCII payloads this
+    exists for (base64, JSON), an approximation for other text. Not
+    `sys.getsizeof`, which grows when CPython later attaches a UTF-8 copy to a
+    string -- the same span would then weigh more at its eviction than at its
+    append, and the buffer's running total is only right while the two agree.
+    And `str.__len__`, not `len()`: the value is host data, and a `str`
+    subclass's own `__len__` is host code that may raise on the capture path.
+    """
+    size = _SPAN_OVERHEAD_BYTES + len(span.input_data or b"") + len(span.output_data or b"")
+    for _, value in span.extra:
+        if isinstance(value, str):
+            size += str.__len__(value)
+    for event in span.events:
+        for _, value in event.attributes:
+            if isinstance(value, str):
+                size += str.__len__(value)
+    return size
+
+
 @dataclass(frozen=True, slots=True)
 class TransportTiming:
     """Transport intervals in milliseconds.

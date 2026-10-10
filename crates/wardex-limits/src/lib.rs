@@ -217,8 +217,19 @@ pub struct Limits {
     pub max_parse_backlog_bytes: usize,
     /// Maximum spans buffered before the oldest are dropped.
     pub max_buffer_spans: usize,
-    /// Maximum approximate bytes buffered across pending spans. The final
-    /// backstop: resident memory stays bounded even if every parser cap fails.
+    /// Maximum approximate bytes buffered across pending spans. Each pending
+    /// span counts a fixed per-span overhead plus every payload it holds: its
+    /// raw request and response bodies, the length of every string attribute
+    /// it carries, and its events' string attributes. The attributes are not a
+    /// rounding error: the message copies the semantic parse stores beside a
+    /// body (`gen_ai.input.messages` and its siblings) are close to a second
+    /// copy of a multimodal request, base64 image included.
+    ///
+    /// Over the bound, the oldest spans are evicted, and every eviction is
+    /// counted. The final backstop: resident span memory stays within this
+    /// bound even if every parser cap fails, with one exception stated rather
+    /// than hidden — a single span larger than the bound is still admitted,
+    /// alone, once everything older has been evicted.
     pub max_buffer_bytes: usize,
     /// Replay ring-buffer depth. Reserved: no SDK reads this value today, so
     /// setting it changes nothing. It stays in the schema because it is part

@@ -38,6 +38,7 @@ from ._types import (
     ResourceInfo,
     SdkInfo,
 )
+from ._types import span_buffer_bytes as _span_size
 from ._version import __version__
 from ._worker import BatchWorker
 from .transport._base import DEFAULT_TIMEOUT, UNDELIVERED, CallerBudget, Transport
@@ -51,15 +52,6 @@ def build_sdk_info() -> SdkInfo:
         os=sys.platform,
         arch=platform.machine(),
     )
-
-
-# Fixed per-span overhead: context, timing, attributes, and the deque slot.
-# An exact figure would mean encoding every span on the hot path.
-_SPAN_OVERHEAD_BYTES = 512
-
-
-def _span_size(span: InternalSpan) -> int:
-    return _SPAN_OVERHEAD_BYTES + len(span.input_data or b"") + len(span.output_data or b"")
 
 
 # Handed to Transport.flush() on the periodic path, which carries no deadline of
