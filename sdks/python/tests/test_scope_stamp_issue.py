@@ -418,6 +418,42 @@ def test_a_tenant_annotating_its_own_websocket_session_keeps_its_identity(record
     assert _identity(span) == ("A", "user-A")
 
 
+@contextlib.contextmanager
+def _as_user(user: UserInfo) -> Iterator[None]:
+    with wardex.isolation_scope():
+        wardex.set_user(user)
+        yield
+
+
+def test_a_websocket_written_to_by_another_id_less_user_names_no_identity(recorded):
+    """Every `UserInfo` field is optional and each one is stamped, so two
+    tenants told apart only by email are two identities: the opener's email
+    must not ride on a span that carries the other tenant's payload."""
+    itc = _seam()
+    held: list[Any] = []
+    with _as_user(UserInfo(email="alice@tenant-a.example")):
+        _open_websocket(itc, held)
+    with _as_user(UserInfo(email="bob@tenant-b.example")):
+        itc._on_request_bytes(held[0], _TEXT)
+    close_registry().fire(held.pop())
+    (span,) = [s for s in _spans(recorded) if s.name.startswith("WS")]
+    assert "user.email" not in dict(span.extra)
+
+
+def test_an_id_less_user_that_gains_an_id_keeps_the_session_identity(recorded):
+    """A field that appears only later is the same identity annotating
+    itself: the opener's email-only user later set with an id as well."""
+    itc = _seam()
+    held: list[Any] = []
+    with _as_user(UserInfo(email="alice@a")):
+        _open_websocket(itc, held)
+        wardex.set_user(UserInfo(id="user-A", email="alice@a"))
+        itc._on_request_bytes(held[0], _TEXT)
+    close_registry().fire(held.pop())
+    (span,) = [s for s in _spans(recorded) if s.name.startswith("WS")]
+    assert dict(span.extra).get("user.email") == "alice@a"
+
+
 def test_the_public_recording_client_takes_what_the_seams_pass():
     """`wardex_sdk.testing.RecordingClient` is the double users copy. The seams
     call `capture_span(span, scope=...)`; a double without the keyword raises
