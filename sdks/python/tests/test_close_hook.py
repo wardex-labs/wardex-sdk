@@ -846,7 +846,7 @@ def test_a_dropped_latch_entry_reaches_the_span_as_wardexs_own_fault():
             self.config = self._Config()
             self.spans: list = []
 
-        def capture_span(self, span) -> None:
+        def capture_span(self, span, *, scope=None) -> None:
             self.spans.append(span)
 
         def capture_deferred(self, job) -> None:

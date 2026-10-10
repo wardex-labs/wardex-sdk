@@ -48,7 +48,9 @@ chunk copied before it was written) or the stream was opened before capture,
 and the writer's scope is a guess on a shared connection. A conversation is
 never guessed, and a request body's own id does not stand in for the unknown
 one either (`_semantics.apply_request_conversation`): the host's, had it been
-read, would have won. Its parent is latched as it was before this module existed.
+read, would have won. Nor is the scope identity guessed: no tag and no user
+of the writer's scope is stamped on the stream's span (`_issue_scope`). Its
+parent is latched as it was before this module existed.
 """
 
 from __future__ import annotations
@@ -62,10 +64,12 @@ from typing import Any
 from .. import _hub
 from .._assembly import PatchSet, guard, parent_is_closed_unit
 from .._types import ConversationContext, SpanContext
+from ._issue_scope import UNKNOWN_ISSUER, ScopeSnapshot, issued_scope
 
 #: What the issuing task's scope said when it opened a stream: its active span,
-#: whether that span's unit had already closed, and its conversation.
-Issued = tuple[SpanContext | None, bool, ConversationContext | None]
+#: whether that span's unit had already closed, its conversation, and the tags
+#: and user its span is stamped with (`_issue_scope`).
+Issued = tuple[SpanContext | None, bool, ConversationContext | None, ScopeSnapshot]
 
 #: The sizes of chunk offered for linking. An offer holds its bytes until the
 #: state machine is linked or offers again, so a connection no tracker ever
@@ -138,7 +142,8 @@ class StreamIssuers:
             return False
         scope = _hub.get_current_scope()  # ONE read: parent and conversation are one fact
         parent = scope.active_span_context
-        self._by_stream[stream_id] = (parent, parent_is_closed_unit(parent), scope.conversation)
+        closed, identity = parent_is_closed_unit(parent), issued_scope()
+        self._by_stream[stream_id] = (parent, closed, scope.conversation, identity)
         while len(self._by_stream) > self._cap:
             self._by_stream.pop(min(self._by_stream))
         return True
@@ -198,13 +203,16 @@ class IssuerLink:
 
     def latch(
         self, stream_id: int, parent: SpanContext | None, parent_closed: bool
-    ) -> tuple[SpanContext | None, bool, ConversationContext | None, bool]:
-        """`(parent, parent_closed, conversation, proven)` for a stream that just
-        opened. Its issuer's, where one was proven. Otherwise the WRITER's
+    ) -> tuple[SpanContext | None, bool, ConversationContext | None, ScopeSnapshot, bool]:
+        """`(parent, parent_closed, conversation, scope, proven)` for a stream that
+        just opened. Its issuer's, where one was proven. Otherwise the WRITER's
         parent, which on a shared connection may be any task's, and so never
-        anyone's conversation: none is named, and `proven` says it is unknown."""
+        anyone's conversation or identity: none is named, no tag or user is
+        stamped (`UNKNOWN_ISSUER`), and `proven` says the issuer is unknown."""
         issued = self._issuers.take(stream_id) if self._issuers is not None else None
-        return (*issued, True) if issued is not None else (parent, parent_closed, None, False)
+        if issued is not None:
+            return (*issued, True)
+        return (parent, parent_closed, None, UNKNOWN_ISSUER, False)
 
     def clear(self) -> None:
         if self._issuers is not None:

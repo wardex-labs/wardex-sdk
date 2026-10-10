@@ -19,6 +19,7 @@ from .._protocol._http2 import Http2Parser
 from .._types import ConversationContext, ParsedMessage, SpanContext
 from ._h2_issuer import IssuerLink
 from ._http1_requests import RequestSide
+from ._issue_scope import UNKNOWN_ISSUER, ScopeSnapshot
 from ._txn import _name_path, _Txn
 
 
@@ -87,7 +88,7 @@ def _is_ws_upgrade_request(headers: object) -> bool:
 #: bounded by the message, which the frame parser already caps. Consulted only when nothing hides
 #: the payload.
 _RESPONSES_CREATE = re.compile(rb'"type"\s*:\s*"response\.create"')
-_StreamLatch = tuple[SpanContext | None, bool, ConversationContext | None, bool, int]
+_StreamLatch = tuple[SpanContext | None, bool, ConversationContext | None, ScopeSnapshot, bool, int]
 
 
 class _Http1Tracker:
@@ -145,6 +146,7 @@ class _Http1Tracker:
                         parent=issue.parent,
                         parent_closed=issue.parent_closed,
                         conversation=issue.conversation,
+                        scope=issue.scope,
                         start_ns=issue.start_ns or now,
                         end_ns=now,
                         ttfb_ms=None,
@@ -230,6 +232,7 @@ class _Http1Tracker:
             parent=issue.parent,
             parent_closed=issue.parent_closed,
             conversation=issue.conversation,
+            scope=issue.scope,
             start_ns=issue.start_ns or now,
             end_ns=now,
             ttfb_ms=ttfb,
@@ -270,8 +273,9 @@ class _Http2Tracker:
 
     def __init__(self, limits: object | None = None) -> None:
         self._conn = Http2Parser(limits)
-        # stream_id -> (parent span, whether its unit had already closed, the conversation — the
-        # issuer's, where `_h2_issuer` proved it — whether it was proved, request start ns)
+        # stream_id -> (parent span, whether its unit had already closed, the conversation and the
+        # scope identity — the issuer's, where `_h2_issuer` proved it — whether it was proved,
+        # request start ns)
         #
         # `_mk` pops on every transaction, so the entries that accumulate are the streams that end
         # WITHOUT one: RST_STREAM, a GOAWAY that strands everything above `last_stream_id`, a server
@@ -326,7 +330,8 @@ class _Http2Tracker:
         now = time.time_ns()
         # The WRITER's scope, which on a shared connection may be any task's: any
         # of them flushes the others' queued frames. So it is the parent only of
-        # a stream with no proven issuer, and never anyone's conversation.
+        # a stream with no proven issuer, and never anyone's conversation or
+        # identity (`IssuerLink.latch`).
         parent = _hub.get_current_scope().active_span_context
         parent_closed = parent_is_closed_unit(parent) if opened else False
         for sid in opened:
@@ -413,6 +418,7 @@ class _Http2Tracker:
         entry = self._latch.pop(t.stream_id, None)
         if entry is None:
             parent, parent_closed, conversation, proven, start = None, False, None, False, now
+            scope = UNKNOWN_ISSUER  # whoever issued it, nothing here says who
             # The DECISION the cap owes the span. An absent latch entry has two causes that look
             # identical here and mean opposite things: nothing was ambient when the request went out
             # (an honest trace root, and under `capture_mode=AGENT` the gate has usually dropped it
@@ -442,7 +448,7 @@ class _Http2Tracker:
             # that had filtered the span out.
             parent_evicted = self._latch_first <= t.stream_id <= self._latch_evicted_below
         else:
-            parent, parent_closed, conversation, proven, start = entry
+            parent, parent_closed, conversation, scope, proven, start = entry
             parent_evicted = False
         # The OTHER half of the same bound: the native stream table evicted this stream's request
         # before its response completed. The response is a real observation — a status, an end — so
@@ -466,6 +472,7 @@ class _Http2Tracker:
             parent_closed=parent_closed,
             parent_evicted=parent_evicted,
             conversation=conversation,
+            scope=scope,
             issuer_proven=proven,
             start_ns=start,
             end_ns=now,
@@ -502,6 +509,7 @@ class _WebSocketTracker:
         sample_cap: int | None = None,
         llm_upgrade: str | None = None,
         conversation: ConversationContext | None = None,
+        scope: ScopeSnapshot | None = None,
     ) -> None:
         # "known_provider" | "unknown_host" | None: the endpoint table's answer about the upgrade
         # path (`classify_ws_upgrade`), decided by the seam at the swap site. The tracker only
@@ -524,6 +532,7 @@ class _WebSocketTracker:
         # it too: the session is ONE span, so a socket reused across conversations names none of
         # them rather than whichever one happened to open it.
         self._conversation = conversation
+        self._scope = scope  # the handshake's identity, as its parent: the session is ONE span
         self._start_ns = start_ns
         # None means "use the core default" — resolved here (rather than hardcoded)
         # so this can never silently drift from crates/wardex-limits.
@@ -664,6 +673,7 @@ class _WebSocketTracker:
             parent=self._parent,
             parent_closed=self._parent_closed,
             conversation=self._conversation,
+            scope=self._scope,
             start_ns=self._start_ns,
             end_ns=now,
             ttfb_ms=None,

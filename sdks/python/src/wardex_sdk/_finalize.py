@@ -63,10 +63,11 @@ class DeferredSpan(Protocol):
     `fallback` are ALWAYS executed inside it (`ctx.run(...)`), so every
     immutable-fact ContextVar the gate reads (`in_degraded_run()` and
     friends) answers as it did at the response instant. Mutable Scope state
-    (tags/user) is NOT carried here — `Client.capture_deferred` snapshots it
-    at submit time and the queue hands the snapshot back at admit (§3.7 of
-    the design: `copy_context` preserves bindings, not the contents of a
-    mutable object bound in one).
+    (tags/user) is NOT read from `ctx` — `Client.capture_deferred` takes the
+    job's own snapshot (an optional `scope`, taken where the request was
+    issued) or snapshots it at submit time, and the queue hands the snapshot
+    back at admit (§3.7 of the design: `copy_context` preserves bindings, not
+    the contents of a mutable object bound in one).
     """
 
     size: int
@@ -96,8 +97,8 @@ class Leftover(Enum):
 @dataclass(frozen=True, slots=True)
 class _Entry:
     job: DeferredSpan
-    #: the mutable-Scope snapshot (tags, user) `capture_deferred` took on the
-    #: submitting thread — the values the span is stamped with at admit.
+    #: the mutable-Scope snapshot (tags, user) `capture_deferred` handed in —
+    #: the values the span is stamped with at admit.
     scope: tuple[dict[str, str], Any]
 
 

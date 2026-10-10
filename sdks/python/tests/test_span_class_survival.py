@@ -58,7 +58,7 @@ class _FakeClient:
         self.spans: list = []
         self.snapshots: list = []
 
-    def capture_span(self, span) -> None:
+    def capture_span(self, span, *, scope=None) -> None:
         self.spans.append(span)
 
     def capture_deferred(self, job) -> None:
@@ -491,7 +491,7 @@ def test_mcp_stdio_tool_call_span_survives(client):
 
     spans = state.feed_response(b'{"jsonrpc":"2.0","id":1,"result":{"content":[{"a":1}]}}\n')
 
-    (sp,) = spans
+    ((sp, _scope),) = spans
     assert sp.name == "MCP tools/call"
     assert sp.kind is SpanKind.CLIENT
     assert sp.tool is not None
@@ -516,7 +516,7 @@ def test_mcp_stdio_error_span_survives_and_gains_an_error_type(client):
         b'{"jsonrpc":"2.0","id":7,"error":{"code":-32601,"message":"nope"}}\n'
     )
 
-    (sp,) = spans
+    ((sp, _scope),) = spans
     assert sp.name == "MCP tools/call"
     assert sp.status is StatusCode.ERROR
     assert sp.error_type == "json_rpc_-32601"
@@ -535,7 +535,7 @@ def test_mcp_stdio_non_tool_method_span_survives(client):
 
     spans = state.feed_response(b'{"jsonrpc":"2.0","id":2,"result":{}}\n')
 
-    (sp,) = spans
+    ((sp, _scope),) = spans
     assert sp.name == "MCP ping"
     assert sp.tool is None
 

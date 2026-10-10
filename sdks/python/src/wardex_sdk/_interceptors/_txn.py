@@ -11,6 +11,7 @@ from dataclasses import dataclass
 
 from .._assembly import Limitation
 from .._types import ConversationContext, SpanContext
+from ._issue_scope import ScopeSnapshot
 
 
 @dataclass
@@ -43,6 +44,9 @@ class _Txn:
     parent_evicted: bool = False
     #: The conversation the request was ISSUED in, latched beside `parent` for the same reason.
     conversation: ConversationContext | None = None
+    #: The tags and user the span is stamped with, snapshotted beside `parent` for the same reason
+    #: (`_issue_scope`). None only for a record built by hand: the client then reads its own scope.
+    scope: ScopeSnapshot | None = None
     #: False where no h2 issuer was proven (`_h2_issuer`): `conversation` is unknown, not none.
     issuer_proven: bool = True
     truncated: bool = False

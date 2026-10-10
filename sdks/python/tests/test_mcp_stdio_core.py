@@ -5,7 +5,7 @@ from wardex_sdk._interceptors._mcp_stdio import _ProcState
 def _drive(req: bytes, resp: bytes):
     st = _ProcState()
     st.feed_request(req)
-    return st.feed_response(resp)
+    return [span for span, _scope in st.feed_response(resp)]
 
 
 def test_tools_call_extracts_tool_and_io():
