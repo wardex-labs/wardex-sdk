@@ -2,15 +2,18 @@
 //! `f64`'s range.
 //!
 //! `serde_json` refuses a literal such as `1e400` ("number out of range"),
-//! and every reassembler used to skip the event that carried one: its text,
-//! its finish reason, its error, all for one number nothing reads (a token's
+//! and also a few at the very top of the range that a correctly rounded parse
+//! makes finite (`1.7976931348623158e308`, where its fast parse overflows).
+//! Every reassembler used to skip the event that carried one: its text, its
+//! finish reason, its error, all for one number nothing reads (a token's
 //! `logprob`, a stray field). Python's `json`, which the provider SDKs read
-//! the same stream with, takes the literal as an infinity, and a
-//! `serde_json::Value` cannot hold one. So each such literal is read as the
-//! JSON string of its own spelling (`-1e400` becomes `"-1e400"`): the
-//! provider's exact characters rather than a number nobody sent (saturating to
-//! `f64::MAX` would be one), and a truthy value wherever truthiness is the
-//! test, so `"error": 1e400` still declares a failure.
+//! the same stream with, reads the literal (as an infinity, or as that
+//! largest finite value) and keeps the event. So each literal the strict
+//! parse refuses is read as the JSON string of its own spelling (`-1e400`
+//! becomes `"-1e400"`): the provider's exact characters rather than a number
+//! nobody sent (saturating to `f64::MAX` would be one), and a truthy value
+//! wherever truthiness is the test, so `"error": 1e400` still declares a
+//! failure.
 //!
 //! The strict parse runs first and the rewrite only on an event it refused,
 //! so an ordinary event costs nothing more. An event that is still not JSON
@@ -33,8 +36,19 @@ pub(super) fn is_done_marker(data: &str) -> bool {
     data.trim() == "[DONE]"
 }
 
-/// `text` with every JSON number literal outside `f64`'s range wrapped in
-/// quotes, or None when it holds none (there is nothing to retry). A literal
+/// An event that carried nothing a reassembler could have kept: the end
+/// marker, or data that is empty or only whitespace (a `data:` line with no
+/// value is legal SSE, and some gateways send one as a heartbeat). Skipping it
+/// loses nothing, so it is never counted as an event wardex could not read.
+pub(super) fn carries_nothing(data: &str) -> bool {
+    data.trim().is_empty() || is_done_marker(data)
+}
+
+/// `text` with every JSON number literal the strict parser refuses wrapped in
+/// quotes, or None when it holds none (there is nothing to retry). Refused is
+/// exactly what `serde_json` refuses as a lone number, not what overflows a
+/// correctly rounded parse: the two differ at the very top of the range, and
+/// a retry narrower than the refusal would still drop the event. A literal
 /// inside a string is left alone, as is anything that is not a well-formed
 /// JSON number: the retry must not accept text the strict parse rightly
 /// refused for another reason.
@@ -56,7 +70,7 @@ fn quote_out_of_range_numbers(text: &str) -> Option<String> {
                 // ASCII bounds on both sides, so slicing cannot split a char.
                 let literal = &text[start..i];
                 if is_json_number(literal.as_bytes())
-                    && literal.parse::<f64>().is_ok_and(f64::is_infinite)
+                    && serde_json::from_str::<f64>(literal).is_err()
                 {
                     out.push_str(&text[copied..start]);
                     out.push('"');
@@ -222,6 +236,42 @@ mod tests {
         assert!(!is_done_marker("[DONE] x"));
         assert!(!is_done_marker("{}"));
     }
+
+    /// An event with no data, or only whitespace (a heartbeat), carries
+    /// nothing, like the end marker; anything else might have.
+    #[test]
+    fn an_empty_event_carries_nothing() {
+        for nothing in ["", " ", "\n", " \t\r\n ", "[DONE]", " [DONE]\r"] {
+            assert!(carries_nothing(nothing), "{nothing:?}");
+        }
+        for something in ["{", "x", "[DONE] x", "{\"delta\":\"x"] {
+            assert!(!carries_nothing(something), "{something:?}");
+        }
+    }
+
+    /// The retry takes exactly what the strict parser refuses. At the top of
+    /// the range `serde_json`'s fast parse overflows on a few literals a
+    /// correctly rounded parse (Python's, the provider SDKs') reads as the
+    /// largest finite value; those are read as their spelling too, and the
+    /// largest finite value spelled the usual way stays a number.
+    #[test]
+    fn a_literal_the_strict_parser_refuses_at_the_top_of_the_range_is_read() {
+        for literal in [
+            "1.7976931348623158e308",
+            "1.797693134862315807e308",
+            "1797693134862315700000000000e281",
+        ] {
+            let data = format!("{{\"n\":{literal},\"t\":\" world\"}}");
+            assert!(serde_json::from_str::<Value>(&data).is_err(), "{literal}");
+            let v = parse_event(&data).unwrap_or_else(|| panic!("{literal} unread"));
+            assert_eq!(v["n"], Value::from(literal), "{literal}");
+            assert_eq!(v["t"], " world", "{literal}");
+        }
+        let v =
+            parse_event(r#"{"max":1.7976931348623157e308,"over":1.7976931348623158e308}"#).unwrap();
+        assert_eq!(v["max"], f64::MAX);
+        assert_eq!(v["over"], "1.7976931348623158e308");
+    }
 }
 
 /// The reassemblers and the stream-shape dispatch, end to end through
@@ -272,12 +322,14 @@ mod reassembled {
 
     #[test]
     fn a_chat_chunk_with_an_out_of_range_logprob_keeps_its_text() {
-        let s = chat(
-            r#"{"id":"c1","model":"gpt-4o","choices":[{"index":0,"delta":{"content":" world"},"logprobs":{"content":[{"token":" world","logprob":-1e400}]}}]}"#,
-        );
-        assert_eq!(texts(&s), ["Hello world"]);
-        assert_eq!(s.finish_reasons, Some(vec!["stop".to_string()]));
-        assert_eq!(s.stream_events_unparsed, 0);
+        for logprob in ["-1e400", "-1.7976931348623158e308"] {
+            let s = chat(&format!(
+                r#"{{"id":"c1","model":"gpt-4o","choices":[{{"index":0,"delta":{{"content":" world"}},"logprobs":{{"content":[{{"token":" world","logprob":{logprob}}}]}}}}]}}"#
+            ));
+            assert_eq!(texts(&s), ["Hello world"], "{logprob}");
+            assert_eq!(s.finish_reasons, Some(vec!["stop".to_string()]));
+            assert_eq!(s.stream_events_unparsed, 0);
+        }
     }
 
     /// The error chunk itself holding the number: the failure is still
@@ -370,14 +422,17 @@ mod reassembled {
     }
 
     /// What is still not JSON is counted, per stream, by every reassembler;
-    /// `[DONE]` never is (it ends the stream and carries nothing), and a body
-    /// that is not a stream counts nothing.
+    /// `[DONE]` and an empty heartbeat event never are (they carry nothing),
+    /// and a body that is not a stream counts nothing.
     #[test]
     fn an_event_still_not_json_is_counted_and_done_is_not() {
         let cut = r#"{"id":"c1","choices":[{"delta":{"content":" wor"#;
         assert_eq!(chat(cut).stream_events_unparsed, 1);
         assert_eq!(texts(&chat(cut)), ["Hello"]);
         assert_eq!(chat(C1).stream_events_unparsed, 0);
+        // An empty heartbeat event (`data:` with no value, or only spaces).
+        assert_eq!(chat("").stream_events_unparsed, 0);
+        assert_eq!(chat("   ").stream_events_unparsed, 0);
 
         let anthropic = |tail: &str| {
             parse(
@@ -394,6 +449,7 @@ mod reassembled {
         };
         assert_eq!(anthropic(""), 0);
         assert_eq!(anthropic("data: [DONE]\n\n"), 0);
+        assert_eq!(anthropic("data:\n\nevent: ping\ndata:  \n\n"), 0);
         assert_eq!(
             anthropic("event: content_block_delta\ndata: {\"type\":\n\n"),
             1
@@ -414,6 +470,7 @@ mod reassembled {
         };
         assert_eq!(responses(""), 0);
         assert_eq!(responses("data: [DONE]\n\n"), 0);
+        assert_eq!(responses("data:\n\ndata:\ndata:\n\n"), 0);
         assert_eq!(
             responses("event: response.output_text.delta\ndata: {\"delta\":\"x\n\n"),
             1

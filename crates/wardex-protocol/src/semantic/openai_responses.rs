@@ -12,7 +12,7 @@
 //! name the failure — and is preserved into the synthetic body rather than
 //! dropped.
 
-use super::event_json::{is_done_marker, parse_event};
+use super::event_json::{carries_nothing, parse_event};
 use super::parts::*;
 use super::usage::{flatten_usage, UsageBounds, UsageView};
 use super::LlmSemantics;
@@ -620,12 +620,13 @@ pub(super) fn reassemble_responses(events: &[SseEvent]) -> Reassembled {
     let mut args_deltas: BTreeMap<String, String> = BTreeMap::new();
     let mut summary_deltas: BTreeMap<(String, i64), String> = BTreeMap::new();
     // Events whose data is not JSON: skipped, and counted so the span says so.
-    // An OpenAI-style `[DONE]` from a gateway carries nothing and is not one.
+    // An OpenAI-style `[DONE]` from a gateway, or an empty heartbeat event,
+    // carries nothing and is not one.
     let mut unparsed: u32 = 0;
 
     for ev in events {
         let Some(v) = parse_event(&ev.data) else {
-            unparsed = unparsed.saturating_add(u32::from(!is_done_marker(&ev.data)));
+            unparsed = unparsed.saturating_add(u32::from(!carries_nothing(&ev.data)));
             continue;
         };
         let ty = ev
