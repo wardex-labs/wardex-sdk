@@ -30,6 +30,7 @@ from ._config import (
 )
 from ._config import _resolve_config as _resolve_config_from_env
 from ._config import region_of_key as _region_of_key
+from ._config_checks import endpoint_named_for_wardex as _endpoint_named_for_wardex
 from ._config_checks import env_typo_messages as _env_typo_messages
 from ._config_checks import unusable_otel_endpoint as _unusable_otel_endpoint
 from ._diagnostics import AdapterStatus, Diagnostics
@@ -253,7 +254,10 @@ def init(
     `transport=` or under a project key, PII exemptions under `PIIMode.OFF`,
     an `interceptors=` selection under `intercept=False` — a
     `WardexConfigWarning` is emitted, because a config value that loses in
-    silence is indistinguishable from one that was honoured.
+    silence is indistinguishable from one that was honoured. The endpoint
+    counts only when it was given to wardex, as the argument or as
+    `WARDEX_ENDPOINT`: one inherited from the OTel variables, which every OTel
+    SDK in the process shares, was never set for wardex and is not announced.
 
     `intercept=True` is the default: `init()` is the consent and
     zero-instrumentation capture is the product. Mutation of outbound traffic
@@ -324,13 +328,18 @@ def init(
             "a receiver rejects unauthenticated requests. Set WARDEX_API_KEY or "
             "BackendConfig(api_key=...)"
         )
-    if transport is not None and config.backend.endpoint:
+    # Judged on the endpoint the host gave WARDEX -- the argument, else
+    # `WARDEX_ENDPOINT` -- not on the resolved one: an endpoint inherited from
+    # the process-wide OTel variables was never passed to wardex, and the
+    # warning used to name it to a host that had set it for other tooling.
+    named_endpoint = _endpoint_named_for_wardex(backend.endpoint if backend is not None else None)
+    if transport is not None and named_endpoint:
         _warnings.warn(
             "backend endpoint ignored: transport= carries its own address",
             WardexConfigWarning,
             stacklevel=2,
         )
-    elif config.backend.api_key and config.backend.endpoint:
+    elif config.backend.api_key and named_endpoint:
         # Two destinations named, and they do not mix: the project key routes
         # to the wardex receiver and is never sent to a third-party collector.
         # Said once, here, rather than letting the OTLP address sit inert.

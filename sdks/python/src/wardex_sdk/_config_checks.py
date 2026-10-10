@@ -172,6 +172,17 @@ def _first_otel_endpoint() -> tuple[str, str] | None:
     return None
 
 
+def endpoint_named_for_wardex(argument: str | None) -> str | None:
+    """The endpoint the host gave WARDEX: the argument, else `WARDEX_ENDPOINT`.
+
+    Not the OTel spellings. Every OTel SDK in the process reads those, so an
+    endpoint inherited from them is not a setting anyone gave wardex, and it
+    losing to an explicit `transport=` or project key is the expected case, not
+    the conflict `init()` announces.
+    """
+    return argument or os.environ.get("WARDEX_ENDPOINT") or None
+
+
 def env_typo_messages(environ: Mapping[str, str] | None = None) -> list[str]:
     """One message per set variable that looks like wardex's and is not one it reads.
 
