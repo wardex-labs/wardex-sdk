@@ -855,7 +855,7 @@ def test_a_half_installed_agent_sdk_adapter_leaves_no_wrapper_on_the_framework(b
             propagation=None,
             adapters=AdaptersConfig(anthropic_agent_sdk=options),
         )
-        return SimpleNamespace(config=config, capture_span=lambda span: None)
+        return SimpleNamespace(config=config, capture_span=lambda span, scope=None: None)
 
     adapter = AnthropicAgentSdkAdapter()
     if breaks == "limits":

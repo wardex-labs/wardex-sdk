@@ -433,6 +433,9 @@ _MEMBER_SITES: dict[str, frozenset[str]] = {
             # none of the adapter's hooks (a `query` bound before `init()`):
             # its root says the hook-built spans below it are missing.
             "_adapters/_hook_reach.py",
+            # A bridge session the deadline reaper ended before the CLI's last
+            # export could be awaited: its bridge data may be incomplete.
+            "_adapters/_session_end.py",
         }
     ),
 }
