@@ -117,6 +117,9 @@ def is_http_url(value: object) -> bool:
 def require_http_url(endpoint: str | None) -> None:
     """Refuse a `backend.endpoint` no export could reach.
 
+    For the value a host WROTE -- a bad argument raises like any other. One read
+    from the environment never reaches here; see `endpoint_from_env`.
+
     The value is not quoted back: an endpoint can carry a credential in its
     query or its userinfo, and this message ends up in tracebacks and logs.
     An empty string is left alone, as unset: `init()` already reads it so.
@@ -125,47 +128,44 @@ def require_http_url(endpoint: str | None) -> None:
         raise ValueError(
             "backend.endpoint must be an absolute http:// or https:// URL with a host, such as "
             "'http://collector:4318'; the configured value has no such scheme or no host, so "
-            "every export to it would fail. Write the scheme and the host (when the argument "
-            "is unset, init() reads this value from WARDEX_ENDPOINT)."
+            "every export to it would fail. Write the scheme and the host."
         )
 
 
 def endpoint_from_env() -> str | None:
     """The exporter address the environment names, in precedence order.
 
-    `WARDEX_ENDPOINT` first, returned as read: it is wardex's own variable, so a
-    value no export could reach is a mistake made about wardex, and
-    `BackendConfig` refuses it with a `ValueError` at configuration time.
+    `WARDEX_ENDPOINT` first, then the OTel spellings, specific before generic,
+    so a host already exporting OTLP elsewhere points wardex at the same
+    collector with zero new variables. The first variable that is SET decides,
+    and its value is used only when it IS an http(s) URL; one that is not does
+    not fall through to a less specific variable it overrides.
 
-    Then the OTel spellings, specific before generic, so a host already
-    exporting OTLP elsewhere points wardex at the same collector with zero new
-    variables -- but only a value that IS an http(s) URL. Those variables are
-    shared by every OTel SDK in the process, and a scheme-less `collector:4317`
-    is a legal value for a gRPC exporter; refusing it would let a setting meant
-    for some other exporter stop `init()` in a process that had told wardex
-    nothing. The first OTel variable that is SET decides: a specific one wardex
-    cannot use does not fall through to the generic one it overrides.
-    `unusable_otel_endpoint()` names it for the one case where it would have
-    been wardex's destination.
+    A value no export could reach is left unused here rather than refused,
+    because whether it matters depends on what `init()` was also given. Under a
+    `transport=` or a project key it was never going to be the destination, and
+    a stray variable must not be able to stop a process from starting -- for
+    the OTel spellings, which every OTel SDK in the process shares, all the
+    more: a scheme-less `collector:4317` is a legal value for a gRPC exporter.
+    `unusable_env_endpoint()` names the variable, and `init()` decides: refused
+    when it would have been the destination and is wardex's own
+    `WARDEX_ENDPOINT`, said with a warning when it is an OTel spelling.
 
-    The value is stored as read -- the `/v1/traces` default path is the
+    The value is returned as read -- the `/v1/traces` default path is the
     transport builder's to append (see `BackendConfig.endpoint`).
     """
-    endpoint = os.environ.get("WARDEX_ENDPOINT")
-    if endpoint:
-        return endpoint
-    otel = _first_otel_endpoint()
-    return otel[1] if otel is not None and is_http_url(otel[1]) else None
+    found = _first_env_endpoint()
+    return found[1] if found is not None and is_http_url(found[1]) else None
 
 
-def unusable_otel_endpoint() -> str | None:
-    """The OTel variable `endpoint_from_env` passed over as not an http(s) URL."""
-    otel = _first_otel_endpoint()
-    return otel[0] if otel is not None and not is_http_url(otel[1]) else None
+def unusable_env_endpoint() -> str | None:
+    """The variable `endpoint_from_env` passed over as not an http(s) URL, or None."""
+    found = _first_env_endpoint()
+    return found[0] if found is not None and not is_http_url(found[1]) else None
 
 
-def _first_otel_endpoint() -> tuple[str, str] | None:
-    for name in _OTEL_ENDPOINT_NAMES:
+def _first_env_endpoint() -> tuple[str, str] | None:
+    for name in ("WARDEX_ENDPOINT", *_OTEL_ENDPOINT_NAMES):
         value = os.environ.get(name)
         if value:
             return name, value
@@ -184,11 +184,16 @@ def endpoint_named_for_wardex(argument: str | None) -> str | None:
 
 
 def env_typo_messages(environ: Mapping[str, str] | None = None) -> list[str]:
-    """One message per set variable that looks like wardex's and is not one it reads.
+    """One message per set variable that looks like wardex's and nothing reads.
 
-    The prefix is matched case-insensitively, because `wardex_endpoint` is the
-    same mistake as `WARDEX_ENDPONT`: variable names are case-sensitive, and
-    neither is read.
+    ONE rule, applied the same way to every name: a variable passes only when
+    its name is EXACTLY one that something reads -- wardex's own, or the
+    repository tooling's -- because variable names are case-sensitive and so
+    is everything that reads them. Only the prefix is matched without regard to
+    case, which is what makes `wardex_endpoint` and `wardex_record` the same
+    mistake as `WARDEX_ENDPONT`: none of the three is read. A name that differs
+    from a tooling name only in case is pointed at that name; any other at the
+    closest name wardex reads.
     """
     env: Mapping[str, str] = os.environ if environ is None else environ
     messages = []
@@ -196,9 +201,10 @@ def env_typo_messages(environ: Mapping[str, str] | None = None) -> list[str]:
         upper = name.upper()
         if not upper.startswith("WARDEX_") or name in WARDEX_ENV_NAMES:
             continue
-        if upper in _RESERVED_ENV_NAMES or upper.startswith(_RESERVED_ENV_PREFIXES):
+        if name in _RESERVED_ENV_NAMES or name.startswith(_RESERVED_ENV_PREFIXES):
             continue
-        hint = closest(upper, WARDEX_ENV_NAMES)
+        tooling = upper in _RESERVED_ENV_NAMES or upper.startswith(_RESERVED_ENV_PREFIXES)
+        hint = upper if tooling else closest(upper, WARDEX_ENV_NAMES)
         messages.append(
             f"{name} is set, but wardex reads no environment variable by that name, so its "
             "value is ignored. "

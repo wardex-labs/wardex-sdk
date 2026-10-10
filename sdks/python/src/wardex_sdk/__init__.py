@@ -32,7 +32,7 @@ from ._config import _resolve_config as _resolve_config_from_env
 from ._config import region_of_key as _region_of_key
 from ._config_checks import endpoint_named_for_wardex as _endpoint_named_for_wardex
 from ._config_checks import env_typo_messages as _env_typo_messages
-from ._config_checks import unusable_otel_endpoint as _unusable_otel_endpoint
+from ._config_checks import unusable_env_endpoint as _unusable_env_endpoint
 from ._diagnostics import AdapterStatus, Diagnostics
 from ._enums import (
     AdapterName,
@@ -226,8 +226,12 @@ def init(
 
     so `wardex.init()` with only `WARDEX_API_KEY` set is a working first run.
     A set `WARDEX_*` variable outside this table is named in a
-    `WardexConfigWarning` together with the closest name in it, and an OTel
-    endpoint that is not an http(s) URL is left unused rather than exported to.
+    `WardexConfigWarning` together with the closest name in it -- a warning,
+    so a stray variable cannot stop a process from starting, unless the
+    process turns warnings into errors (`-W error`), which reaches it like any
+    other. An endpoint variable that is not an http(s) URL is left unused
+    rather than exported to; when nothing else names a destination, a
+    `WARDEX_ENDPOINT` like that raises `ValueError` and an OTel one warns.
     What the environment resolved is written into the config the client
     carries — `client.config` answers with the resolved values, not the bare
     arguments. `WARDEX_DEBUG` can only turn `debug` ON: `debug=False` is this
@@ -433,10 +437,21 @@ def init(
         )
     else:
         resolved_transport = NoOpTransport()
-        unusable = _unusable_otel_endpoint()
+        unusable = _unusable_env_endpoint()
+        # Judged only here, where that value would have been the destination;
+        # under a `transport=` or a key it lost anyway, and the "endpoint
+        # ignored" warning above already named a `WARDEX_ENDPOINT` that did.
+        if unusable == "WARDEX_ENDPOINT":
+            # wardex's own variable, and nothing else names a destination: a
+            # process that would export nothing, refused at configuration time
+            # like the same value passed as the argument.
+            raise ValueError(
+                "WARDEX_ENDPOINT must be an absolute http:// or https:// URL with a host, such "
+                "as 'http://collector:4318'; the value set has no such scheme or no host, and "
+                "with no transport= or api_key it would be wardex's only destination, so every "
+                "export would fail. Write the scheme and the host."
+            )
         if unusable is not None:
-            # Said only here, where that value would have been the destination;
-            # under a `transport=` or a key it would have lost anyway.
             _warnings.warn(
                 f"{unusable} is set but is not an http:// or https:// URL, so wardex does not "
                 "export to it (wardex exports OTLP over HTTP; a scheme-less host:port is the "

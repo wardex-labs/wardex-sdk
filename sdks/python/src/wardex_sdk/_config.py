@@ -232,9 +232,10 @@ class BackendConfig:
     announced with a `WardexConfigWarning` rather than ignored in silence.
 
     A value with no `http://` or `https://` scheme, or no host, is refused
-    with `ValueError` here, as written or as read from `WARDEX_ENDPOINT`:
-    `collector:4318` parses with `collector` as its scheme, and every export
-    to it would fail. An OTel variable holding one is left unused instead.
+    with `ValueError` here: `collector:4318` parses with `collector` as its
+    scheme, and every export to it would fail. A variable holding one is left
+    unused; `init()` refuses `WARDEX_ENDPOINT` only when it would have been
+    the destination, and warns about an OTel spelling in that case.
     """
 
     headers: Mapping[str, str] | None = None
