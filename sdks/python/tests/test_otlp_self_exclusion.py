@@ -2,11 +2,17 @@
 
 from __future__ import annotations
 
+import http.server
+import threading
+import urllib.request
 from typing import Any
 
+import wardex_sdk as wardex
+from wardex_sdk import BatchingConfig, CaptureMode
 from wardex_sdk._interceptors._ssl import SSLInterceptor
 from wardex_sdk._suppress import is_suppressed, suppress_capture
-from wardex_sdk._types import InternalSpan
+from wardex_sdk._types import Envelope, InternalSpan
+from wardex_sdk.transport._base import Transport
 
 
 def test_suppress_capture_toggles():
@@ -126,3 +132,139 @@ def test_otlp_transport_wraps_post_with_suppress_capture(monkeypatch):
     assert observed["suppressed"] is True
     # suppression is scoped to the with block only — reverts to normal after the call
     assert is_suppressed() is False
+
+
+# -- a transport the HOST wrote: the client, not the transport, excludes it ----
+#
+# The built-in transports enter `suppress_capture()` around their own POST, but
+# `Transport` is public and a host's implementation knows no such rule -- nor
+# should it have to. The client runs every call it makes into host code on the
+# export path (`before_send_envelope`, `export`, `flush`, `close`) under the
+# exclusion, so what those calls send is never recorded as a span.
+
+
+def _collector() -> tuple[http.server.HTTPServer, list[str]]:
+    received: list[str] = []
+
+    class _Handler(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def do_POST(self) -> None:
+            self.rfile.read(int(self.headers.get("Content-Length", 0)))
+            received.append(self.path)
+            self.send_response(200)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def log_message(self, *args: object) -> None:
+            pass
+
+    httpd = http.server.HTTPServer(("127.0.0.1", 0), _Handler)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    return httpd, received
+
+
+class _PostingTransport(Transport):
+    """What a host writes: a plain urllib POST per batch, nothing wardex-specific."""
+
+    def __init__(self, port: int) -> None:
+        self._base = f"http://127.0.0.1:{port}"
+        self.batches: list[list[str]] = []
+
+    def post(self, path: str) -> None:
+        req = urllib.request.Request(self._base + path, data=b"x" * 64, method="POST")
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            resp.read()
+
+    def export(self, envelope: Envelope) -> None:
+        self.batches.append([span.name for span in envelope.spans])
+        self.post("/ingest")
+
+
+def _exported_self_traffic(transport: _PostingTransport) -> list[str]:
+    return [name for batch in transport.batches for name in batch if "/ingest" in name]
+
+
+def test_a_host_transport_post_is_not_captured_under_capture_mode_all():
+    """`capture_mode=ALL` records every outbound call, which is what made the
+    self-capture a loop: drain N's POST became a span, drain N+1 exported it and
+    was captured in turn, each batch carrying the one before it."""
+    httpd, received = _collector()
+    transport = _PostingTransport(httpd.server_address[1])
+    try:
+        wardex.init(
+            transport=transport,
+            capture_mode=CaptureMode.ALL,
+            batching=BatchingConfig(flush_interval=3600.0),
+        )
+        with wardex.span("work"):
+            pass
+        wardex.flush()  # drain 1: exports `work`, POSTs
+        wardex.flush()  # drain 2: would export drain 1's POST, had it been captured
+        wardex.flush()
+        wardex.close()
+        assert received.count("/ingest") >= 1, "precondition: the transport really POSTed"
+        assert _exported_self_traffic(transport) == []
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_a_flush_inside_a_live_span_does_not_capture_the_export_in_agent_mode():
+    """The default mode captures an outbound call made under a live span, and a
+    `flush()` drains on the CALLER's thread -- so a host flushing inside its own
+    span had wardex's export recorded as one of its children."""
+    httpd, received = _collector()
+    transport = _PostingTransport(httpd.server_address[1])
+    try:
+        wardex.init(transport=transport, batching=BatchingConfig(flush_interval=3600.0))
+        with wardex.span("outer"):
+            with wardex.span("inner"):
+                pass
+            wardex.flush()  # exports `inner` under the live `outer`
+            wardex.flush()
+        wardex.flush()
+        wardex.close()
+        assert received.count("/ingest") >= 2, "precondition: the transport really POSTed"
+        assert _exported_self_traffic(transport) == []
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_every_call_into_host_code_on_the_export_path_runs_excluded():
+    """The four seams one by one, including the two whose traffic no later batch
+    could show: `close()` runs after the final drain, and a hook's POST would
+    only surface one batch later."""
+    seen: dict[str, list[bool]] = {}
+
+    def probe(call: str) -> None:
+        seen.setdefault(call, []).append(is_suppressed())
+
+    class _Probing(Transport):
+        def export(self, envelope: Envelope) -> None:
+            probe("export")
+
+        def flush(self, timeout: float = 5.0) -> None:
+            probe("flush")
+
+        def close(self, timeout: float = 5.0) -> None:
+            probe("close")
+
+    def hook(envelope: Envelope) -> Envelope:
+        probe("before_send_envelope")
+        return envelope
+
+    wardex.init(
+        transport=_Probing(),
+        intercept=False,
+        before_send_envelope=hook,
+        batching=BatchingConfig(flush_interval=3600.0),
+    )
+    with wardex.span("work"):
+        pass
+    wardex.flush()
+    wardex.close()
+    assert set(seen) == {"before_send_envelope", "export", "flush", "close"}
+    assert all(all(calls) for calls in seen.values()), seen
+    assert is_suppressed() is False, "the exclusion leaked out of the drain"

@@ -30,6 +30,7 @@ from ._assembly._diag import _log_with_traceback
 from ._config import WardexConfig
 from ._finalize import FinalizeQueue, Leftover
 from ._limits import LimitsConsumer, limits_kwargs
+from ._suppress import suppress_capture
 from ._types import (
     Envelope,
     EnvelopeHeader,
@@ -956,6 +957,7 @@ class Client:
         # immediately even at budget=0, so reentrancy never spuriously declines.
         return self._export_lock.acquire(timeout=budget)
 
+    @suppress_capture()  # what a drain sends is wardex's own traffic, whoever wrote the transport
     def _drain(
         self,
         timeout: float | None,
@@ -1392,21 +1394,19 @@ class Client:
             key=key,
         )
 
+    @suppress_capture()
     def _close_transport(self, budget: float) -> None:
-        """Close the transport, and keep whatever it raises out of the host's
-        shutdown path.
+        """Close the transport, and keep whatever it raises out of the host's shutdown path.
 
-        The last unguarded reach into a caller-supplied `Transport` on this
-        path. `Transport` is public: `close` can be a property that raises, a
-        `__getattr__`, or simply a socket teardown that throws, and step 4 called
-        it bare -- so a third-party transport turned `wardex.close()`, which
-        hosts call from `atexit` hooks and `finally` blocks, into a raise out of
-        their exit path. Fail-silent like `_flush_transport`, for the same reason
-        and with the same debug line.
+        The last unguarded reach into a caller-supplied `Transport` on this path. `Transport` is
+        public: `close` can be a property that raises, a `__getattr__`, or simply a socket teardown
+        that throws, and step 4 called it bare -- so a third-party transport turned
+        `wardex.close()`, which hosts call from `atexit` hooks and `finally` blocks, into a raise
+        out of their exit path. Fail-silent like `_flush_transport`, for the same reason and with
+        the same debug line; excluded from capture like `_drain`, as what it sends is wardex's own.
 
-        `KeyboardInterrupt` and `CancelledError` are BaseExceptions and still
-        propagate: a host tearing the process down must not be swallowed by an
-        observability SDK's cleanup.
+        `KeyboardInterrupt` and `CancelledError` are BaseExceptions and still propagate: a host
+        tearing the process down must not be swallowed by an observability SDK's cleanup.
         """
         try:
             self._transport.close(budget)
