@@ -177,7 +177,14 @@ fn widen(v: f32) -> f64 {
 /// bottom of this file append to whatever that produced. A second spelling here
 /// would put a span's markers in two attributes, one of which no dashboard
 /// reads.
-const LIMITATIONS_KEY: &str = "wardex.limitations";
+pub const LIMITATIONS_KEY: &str = "wardex.limitations";
+
+/// `wardex.limitations` holding `member` alone, for a pass that rebuilds a
+/// span's attributes from nothing — the PII engine's fail-closed scrub — so
+/// that its marker is spelled where, and the way, every other one is.
+pub fn limitation_attribute(member: pb::Limitation) -> otlp_pb::common::KeyValue {
+    kv_strs(LIMITATIONS_KEY, vec![vocab::limitation_name(member as i32)])
+}
 
 /// `CorrelationInfo` and `CaptureIntegrity` → OTLP span attributes.
 ///
@@ -1321,14 +1328,30 @@ pub fn cap_attribute_values(
     }
 }
 
+/// The attribute that names the knob behind a payload removed WHOLE.
+///
+/// `otlp_attribute_truncated` (39) names `max_otlp_attribute_bytes`, and a
+/// span whose payload was removed to fit `max_otlp_request_bytes` carries 39
+/// too: its content is short, and a consumer that gates on the closed
+/// vocabulary must still see that. But raising the knob 39 names does not bring
+/// that payload back, so this attribute says which knob does — set only by
+/// [`drop_payload_attributes`], so a span cut by the attribute cap alone never
+/// carries it.
+pub const PAYLOAD_DROPPED_REASON_KEY: &str = "wardex.payload_dropped.reason";
+
+/// The one value [`PAYLOAD_DROPPED_REASON_KEY`] takes: the `wardex-limits`
+/// field whose bound removed the payload, spelled as a host configures it.
+pub const PAYLOAD_DROPPED_FOR_REQUEST_CAP: &str = "max_otlp_request_bytes";
+
 /// Remove a span's captured payload and mark it — the last thing tried for a
-/// span whose encoded size ALONE exceeds the per-request cap.
+/// span whose encoded size ALONE exceeds the per-request cap. `true` when a
+/// payload was there to remove.
 ///
 /// The alternative at that point is dropping the span, and a span is worth more
 /// than its payload: its identity, its parent edge, its timing and its
 /// gen_ai semantics are what a trace is made of, and a hole in the tree is
 /// read as "this call never happened" rather than as "this call was large".
-pub fn drop_payload_attributes(sp: &mut otlp_pb::trace::Span) {
+pub fn drop_payload_attributes(sp: &mut otlp_pb::trace::Span) -> bool {
     // Both key pairs a payload can land under: the wardex.* defaults and the
     // semconv pair an `execute_tool` span uses. Whichever pair `span()` chose,
     // this pass has to find it — a payload it cannot name is one it cannot
@@ -1347,9 +1370,17 @@ pub fn drop_payload_attributes(sp: &mut otlp_pb::trace::Span) {
         let base = kv.key.strip_suffix(".encoding").unwrap_or(&kv.key);
         !PAYLOAD.contains(&base)
     });
-    if sp.attributes.len() != before {
-        mark_truncated(&mut sp.attributes);
+    if sp.attributes.len() == before {
+        return false;
     }
+    mark_truncated(&mut sp.attributes);
+    // Replacing any same-keyed host attribute, as the mapping's own keys do:
+    // a duplicated key is one of which an OTLP decoder keeps one.
+    set_attr(
+        &mut sp.attributes,
+        kv_str(PAYLOAD_DROPPED_REASON_KEY, PAYLOAD_DROPPED_FOR_REQUEST_CAP),
+    );
+    true
 }
 
 fn mark_truncated(attrs: &mut Vec<otlp_pb::common::KeyValue>) {
@@ -2302,8 +2333,46 @@ mod tests {
     fn dropping_a_payload_that_was_never_there_marks_nothing() {
         let mut req = envelope_to_traces(envelope(pb::Span::default()), PRODUCER);
         let sp = &mut req.resource_spans[0].scope_spans[0].spans[0];
-        drop_payload_attributes(sp);
+        assert!(!drop_payload_attributes(sp));
         assert!(attr(sp, "wardex.limitations").is_none());
+        assert!(attr(sp, PAYLOAD_DROPPED_REASON_KEY).is_none());
+    }
+
+    #[test]
+    fn a_payload_removed_for_the_request_cap_names_that_knob_and_a_cut_value_does_not() {
+        // Both passes leave `otlp_attribute_truncated` — the content is short
+        // either way, and a consumer gating on the closed vocabulary has to
+        // see that. Only the removal names `max_otlp_request_bytes`, because
+        // raising `max_otlp_attribute_bytes`, the knob 39 names, does not
+        // bring a removed payload back.
+        let cut = capped(
+            envelope(pb::Span {
+                input_data: vec![b'a'; 4096],
+                ..Default::default()
+            }),
+            limits_with_attribute_cap(100),
+        );
+        assert_eq!(markers(&cut), vec!["otlp_attribute_truncated"]);
+        assert!(attr(&cut, PAYLOAD_DROPPED_REASON_KEY).is_none());
+
+        let mut req = envelope_to_traces(
+            envelope(pb::Span {
+                input_data: b"prompt".to_vec(),
+                // A host attribute squatting on the key is replaced, not
+                // duplicated: a decoder keeps one of a duplicated key.
+                extra: vec![kv_wardex(PAYLOAD_DROPPED_REASON_KEY, "host value")],
+                ..Default::default()
+            }),
+            PRODUCER,
+        );
+        let sp = &mut req.resource_spans[0].scope_spans[0].spans[0];
+        assert!(drop_payload_attributes(sp));
+        assert_eq!(markers(sp), vec!["otlp_attribute_truncated"]);
+        assert_eq!(keys(sp, PAYLOAD_DROPPED_REASON_KEY), 1);
+        assert_eq!(
+            attr(sp, PAYLOAD_DROPPED_REASON_KEY),
+            Some(&str_value("max_otlp_request_bytes"))
+        );
     }
 
     use otlp_pb::common::any_value::Value as V;

@@ -39,8 +39,8 @@ from ._base import (
     Transport,
     Undelivered,
     _debug_enabled,
-    _report_reserved_overwritten,
-    _report_unmarshalled,
+    _EncodeReports,
+    _report_encode,
 )
 
 
@@ -194,12 +194,11 @@ class OtlpHttpTransport(Transport):
     def export(self, envelope: Envelope, *, timeout: float | None = None) -> Undelivered | None:
         return self._send_batch(envelope, timeout)
 
-    def _count_encode_reports(self, unmarshalled: list[str], overwritten: int) -> None:
+    def _count_encode_reports(self, reports: _EncodeReports) -> None:
         # "Debug" is this transport's flag OR the client's, as on the wardex
         # envelope exporter: the report tells a person to re-run with
         # debug=True, and either place they set it must reveal the names.
-        _report_unmarshalled(unmarshalled, debug=self._debug or _debug_enabled())
-        _report_reserved_overwritten(overwritten)
+        _report_encode(reports, debug=self._debug or _debug_enabled())
 
     def _send_batch(self, envelope: Envelope, timeout: float | None = None) -> Undelivered | None:
         # zero spans means an empty batch — skip the POST. Not a decline: there
@@ -265,24 +264,25 @@ class OtlpHttpTransport(Transport):
         # the time you asked for".
         started = time.monotonic()
         deadline = started + effective
-        # THE SANCTIONED PATH, minus two reports: `_encode_requests` is
+        # THE SANCTIONED PATH, minus its counted reports: `_encode_requests` is
         # `Transport.encode()` -- the native encoder with this transport's
         # stored PII policy and limits, split at `max_otlp_request_bytes`, the
-        # over-cap span reported once per process -- except that the spans the
-        # marshaller skipped, and the host attributes the mapping replaced
-        # under a reserved `wardex.transport.*` name, come back uncounted.
-        # They are counted below, where this batch's fate is decided: counting
-        # here, before a spent budget hands the batch back as `UNDELIVERED`,
-        # made the retry count the same span again. The `compress` constructor
-        # flag feeds it.
-        bodies, unmarshalled, overwritten = self._encode_requests(envelope, compress=self._compress)
+        # over-cap span reported once per process -- except that what the
+        # encode could not ship as captured (`_EncodeReports`: the spans the
+        # marshaller skipped, the reserved-name attributes the mapping
+        # replaced, the spans sent without their payload) comes back
+        # uncounted. It is counted below, where this batch's fate is decided:
+        # counting here, before a spent budget hands the batch back as
+        # `UNDELIVERED`, made the retry count the same span again. The
+        # `compress` constructor flag feeds it.
+        bodies, reports = self._encode_requests(envelope, compress=self._compress)
         if not bodies:
             # Every span in the batch was dropped -- by encode()'s over-cap
             # guard, or skipped as unmarshallable. Nothing to POST, and not
             # `UNDELIVERED`: a later attempt would encode to the same nothing.
             # The fate is decided, so the skipped spans (and any replaced
             # reserved-name attributes) are counted now.
-            self._count_encode_reports(unmarshalled, overwritten)
+            self._count_encode_reports(reports)
             return None
         headers = {"Content-Type": "application/x-protobuf"}
         # Host headers next, as they always have been: a caller who sets one of
@@ -353,7 +353,7 @@ class OtlpHttpTransport(Transport):
                 # The first request is going on the wire: this batch will not
                 # come back as `UNDELIVERED`, so its skipped spans are counted
                 # here, exactly once.
-                self._count_encode_reports(unmarshalled, overwritten)
+                self._count_encode_reports(reports)
             try:
                 # Built inside the `try`: an address with no scheme makes the
                 # constructor raise `ValueError`, and that is a failed export

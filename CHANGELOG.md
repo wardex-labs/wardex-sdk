@@ -358,6 +358,25 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- **An attribute value the wire cannot hold no longer costs the batch, and a
+  large integer no longer turns into a float.** `span.set_attribute("req_id",
+  2**70)` exported `1.1805916207174113e+21`: a different number, with nothing
+  on the span to say so. A value the encoder could not read at all
+  (`10**400`, `object()`, `bytes`, a list) raised inside the export, and the
+  whole batch it was in was dropped, every good span with it, with no marker
+  and no counter. Now an integer outside the 64-bit range ships as its exact
+  decimal digits in a string, a value the wire cannot hold is left out, and
+  either way the attribute's key is named under `wardex.codec.unmarshalled` on
+  that span while the span and its batch ship. The same holds for a state
+  snapshot's `attributes`, on both the OTLP and the wardex exporter.
+- **A span sent without its payload now names the setting that removed it.**
+  A span too large for `max_otlp_request_bytes` on its own is exported without
+  its input, output and tool payload rather than not at all. It was marked
+  only `otlp_attribute_truncated`, whose setting is `max_otlp_attribute_bytes`,
+  and raising that brought nothing back. The span now also carries
+  `wardex.payload_dropped.reason = "max_otlp_request_bytes"`, each such span
+  is counted under `transport.otlp.span_payload_dropped`, and one line per
+  process says which setting to raise.
 - **An OpenAI Responses stream that fails midway now fails its chat span.**
   A Responses API stream (`responses.create(stream=True)`, the openai-agents
   default) that started with a 200 and then ended in a `response.failed`

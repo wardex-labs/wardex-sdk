@@ -276,6 +276,56 @@ def test_a_span_dropped_by_the_request_cap_is_reported_off_debug(capsys):
     assert "1 span(s)" in lines[0]
 
 
+@pytest.mark.usefixtures("fresh_counters")
+def test_a_span_sent_without_its_payload_names_the_request_cap_and_is_counted_once():
+    """A span too large for `max_otlp_request_bytes` on its own ships without
+    its payload. Its marker, `otlp_attribute_truncated`, names
+    `max_otlp_attribute_bytes`, and raising that does not bring the payload
+    back: the span also names the knob that does, and the loss is counted --
+    once, by the attempt that decides the batch's fate, like every other
+    encode report."""
+    from wardex_sdk._assembly import counters
+
+    srv = _serve()
+    try:
+        port = srv.server_address[1]
+        spans = (
+            _span(
+                name="big",
+                input_data=os.urandom(8192),
+                context=SpanContext(trace_id=TraceId(b"\x01" * 16), span_id=SpanId(b"\x0a" * 8)),
+            ),
+            _span(
+                name="small",
+                context=SpanContext(trace_id=TraceId(b"\x01" * 16), span_id=SpanId(b"\x0b" * 8)),
+            ),
+        )
+        env = Envelope(header=_header(), spans=spans)
+        t = OtlpHttpTransport(endpoint=f"http://127.0.0.1:{port}/v1/traces", compress=False)
+        t._set_limits(_wardex_native.Limits(max_otlp_request_bytes=4096))
+        assert t.export(env, timeout=1e-9) is UNDELIVERED
+        assert counters.get("transport.otlp.span_payload_dropped") == 0
+        lines = _report_lines(lambda: t.export(env))
+        assert counters.get("transport.otlp.span_payload_dropped") == 1
+        (report,) = [line for line in lines if "span_payload_dropped" in line]
+        assert "max_otlp_request_bytes" in report
+        by_name = {
+            sp["name"]: sp["attributes"]
+            for request in _Handler.requests
+            for rs in _decode(request)["resource_spans"]
+            for ss in rs["scope_spans"]
+            for sp in ss["spans"]
+        }
+        assert set(by_name) == {"big", "small"}
+        assert "wardex.input_data" not in by_name["big"]
+        assert by_name["big"]["wardex.limitations"] == ["otlp_attribute_truncated"]
+        assert by_name["big"]["wardex.payload_dropped.reason"] == "max_otlp_request_bytes"
+        assert "wardex.payload_dropped.reason" not in by_name["small"]
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
 def test_a_split_export_abandoned_partway_says_so_off_debug(monkeypatch, capsys):
     """Splitting introduced an outcome one POST per envelope did not have: the
     backend keeps the first chunks and never receives the rest, so the trace

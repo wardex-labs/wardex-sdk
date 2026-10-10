@@ -316,6 +316,12 @@ enum Limitation {
   //    one names `max_otlp_attribute_bytes`, a cap on what one attribute may
   //    COST on a wire that measures it after the base64 rewrite. A body inside
   //    the first and outside the second is the ordinary case, not a corner.
+  //    Also attached when a span alone exceeded `max_otlp_request_bytes` and
+  //    its payload attributes were removed whole so it could ship: the content
+  //    is short either way. That span ALSO carries the attribute
+  //    `wardex.payload_dropped.reason = "max_otlp_request_bytes"`, the knob
+  //    that brings the payload back; raising `max_otlp_attribute_bytes` does
+  //    not. A span without that attribute was cut by the attribute cap alone.
   LIMITATION_OTLP_ATTRIBUTE_TRUNCATED = 39;
   //    Names `max_extra_keys`: an open dynamic key family (today exactly one —
   //    the provider-usage mirror, `wardex.usage.*`) crossed the key-count
