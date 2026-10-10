@@ -22,7 +22,7 @@ import pytest
 
 from wardex_sdk._adapters._base import AdapterInterface
 from wardex_sdk._adapters._context import AdapterContext, Placement
-from wardex_sdk._assembly import Limitation, SpanIntent, ToolAttributes, UnitKind
+from wardex_sdk._assembly import Limitation, PatchSet, SpanIntent, ToolAttributes, UnitKind
 from wardex_sdk.testing import (
     AdapterConformanceSuite,
     AdapterSubject,
@@ -231,6 +231,32 @@ class _CollapsedAdapter(_FakeAdapter):
     _step_seam = staticmethod(_mk_collapsed_step)
 
 
+class _GatedUndoAdapter(_FakeAdapter):
+    """THE defect the half-install check exists for: the patches go through a
+    `PatchSet` of the adapter's own, which the registry's `ctx.patches` cannot
+    reach, and the undo waits for the installed flag `install()` sets last."""
+
+    def install(self, client=None, ctx=None) -> None:  # noqa: ANN001
+        if self._installed:
+            return
+        self._ctx = ctx if isinstance(ctx, AdapterContext) else None
+        if self._ctx is None:
+            return
+        self._own = PatchSet("fake_conformance.gated")
+        self._own.patch(FakeFramework, "run", _mk_run(FakeFramework.run, self))
+        self._own.patch(FakeFramework, "stream", _mk_stream(FakeFramework.stream, self))
+        self._own.patch(FakeFramework, "run_step", _mk_step(FakeFramework.run_step, self))
+        self._installed = True
+
+    def uninstall(self) -> None:
+        if not self._installed:
+            return
+        self._installed = False
+        self._own.restore_all()
+        if self._ctx is not None:
+            self._ctx.close_all(marker=Limitation.ADAPTER_UNINSTALLED)
+
+
 # --------------------------------------------------------------------------
 # the subject
 # --------------------------------------------------------------------------
@@ -288,6 +314,11 @@ def collapsed() -> AdapterSubject:
     return _subject(_CollapsedAdapter)
 
 
+@pytest.fixture
+def gated() -> AdapterSubject:
+    return _subject(_GatedUndoAdapter)
+
+
 # --------------------------------------------------------------------------
 # the suite passes a correct adapter
 # --------------------------------------------------------------------------
@@ -295,6 +326,7 @@ def collapsed() -> AdapterSubject:
 _TREE_CHECKS = (
     "check_the_declared_tree_is_one_a_collapse_could_break",
     "check_install_replaces_every_seam_and_uninstall_restores_it",
+    "check_an_install_that_fails_partway_is_undone_by_identity",
     "check_a_restored_seam_captures_nothing",
     "check_the_workload_ships_one_read_tree",
     "check_the_causal_chain_holds_by_span_id",
@@ -322,6 +354,24 @@ def test_the_check_list_is_covered_here_or_named_as_uncovered(healthy):
         "check_the_adapter_names_itself_after_its_enum_member",
         "check_every_span_site_declares_its_placement",
     }
+
+
+def test_an_undo_that_waits_for_its_installed_flag_fails_the_half_install_check(gated):
+    """The half-install check's own proof of life. This adapter installs and
+    uninstalls cleanly, so every other check passes it; only an install that
+    fails partway shows that its undo declines exactly when it is needed."""
+    AdapterConformanceSuite(gated).run(
+        "check_install_replaces_every_seam_and_uninstall_restores_it"
+    )
+    pristine = {name: FakeFramework.__dict__[name] for name in ("run", "run_step", "stream")}
+    try:
+        with pytest.raises(AssertionError, match="not holding the framework's own attribute"):
+            AdapterConformanceSuite(gated).run(
+                "check_an_install_that_fails_partway_is_undone_by_identity"
+            )
+    finally:
+        for name, original in pristine.items():
+            setattr(FakeFramework, name, original)
 
 
 # --------------------------------------------------------------------------

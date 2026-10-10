@@ -793,3 +793,114 @@ def test_uninstall_closes_the_bridge_receiver_socket():
         socket.create_connection(("127.0.0.1", port), timeout=1)
     assert not any(t.name == "wardex-otel-bridge" and t.is_alive() for t in threading.enumerate())
     adapter.uninstall()  # idempotent
+
+
+def _agent_sdk_seams() -> dict[str, object]:
+    """The six attributes the Agent SDK adapter patches, by their live values."""
+    import claude_agent_sdk as sdk
+    from claude_agent_sdk._internal.transport import subprocess_cli
+
+    cls = subprocess_cli.SubprocessCLITransport
+    return {
+        "sdk.query": sdk.query,
+        "sdk.create_sdk_mcp_server": sdk.create_sdk_mcp_server,
+        "ClaudeSDKClient.__init__": sdk.ClaudeSDKClient.__init__,
+        "SubprocessCLITransport.write": cls.write,
+        "SubprocessCLITransport.read_messages": cls.read_messages,
+        "SubprocessCLITransport.close": cls.close,
+    }
+
+
+@pytest.mark.parametrize("breaks", ["limits", "assembler"])
+def test_a_half_installed_agent_sdk_adapter_leaves_no_wrapper_on_the_framework(breaks, monkeypatch):
+    """The SSL seam's twin above, asked of the Agent SDK adapter.
+
+    The adapter patches six attributes through a `PatchSet` of its own, so the
+    registry's `ctx.patches.restore_all()` has nothing to undo, and its
+    `uninstall()` opened with `if not self._installed: return` against a flag
+    `install()` sets last. Its patches came first, and the limits resolving and
+    the session assembler being built came after them, outside any guard: a
+    raise there left all six wrappers on the SDK, the registry dropped the
+    name, and the next `init()` recorded those wrappers as the SDK's own
+    attributes — welded on for the life of the process.
+
+    With the bridge on, the assembler is also built after the receiver socket
+    is listening, so that case asks the rollback to close it as well.
+    """
+    import socket
+    from types import SimpleNamespace
+
+    from wardex_sdk._adapters import _anthropic_agent_sdk
+    from wardex_sdk._adapters._anthropic_agent_sdk import AnthropicAgentSdkAdapter
+    from wardex_sdk._config import AdaptersConfig, AnthropicAgentSdkConfig
+    from wardex_sdk._limits import LimitsConfig
+
+    pristine = _agent_sdk_seams()
+    broken = {"limits": False}
+    ports: list[int] = []
+
+    class _Limits:
+        """Resolves for the registry's context, then breaks inside `install()`."""
+
+        def resolved(self):  # noqa: ANN202
+            if broken["limits"]:
+                raise RuntimeError("the limits do not resolve in this environment")
+            return LimitsConfig().resolved()
+
+    def _client():  # noqa: ANN202
+        options = AnthropicAgentSdkConfig(otel_bridge=True)
+        config = SimpleNamespace(
+            limits=_Limits(),
+            debug=False,
+            propagation=None,
+            adapters=AdaptersConfig(anthropic_agent_sdk=options),
+        )
+        return SimpleNamespace(config=config, capture_span=lambda span: None)
+
+    adapter = AnthropicAgentSdkAdapter()
+    if breaks == "limits":
+        install = adapter.install
+
+        def install_with_broken_limits(client, ctx=None):  # noqa: ANN001, ANN202
+            broken["limits"] = True
+            install(client, ctx)
+
+        monkeypatch.setattr(adapter, "install", install_with_broken_limits)
+    else:
+
+        def assembler_fails(*args, bridge=None, **kwargs):  # noqa: ANN001, ANN002, ANN003, ANN202
+            if bridge is not None:
+                ports.append(bridge.port)
+            raise RuntimeError("the session assembler cannot be built in this environment")
+
+        monkeypatch.setattr(_anthropic_agent_sdk, "SessionAssembler", assembler_fails)
+
+    reg = AdapterRegistry()
+    reg.install(adapter, _client())  # must not raise
+
+    try:
+        assert not reg.is_installed("anthropic_agent_sdk")
+        welded = [key for key, value in _agent_sdk_seams().items() if value is not pristine[key]]
+        assert not welded, (
+            f"{welded} still hold wardex's wrapper after a failed install was rolled back — "
+            "and the next init() would record them as the SDK's own"
+        )
+        if breaks == "assembler":
+            assert ports, "the receiver was meant to be listening before the failure"
+            with pytest.raises(ConnectionRefusedError):
+                socket.create_connection(("127.0.0.1", ports[0]), timeout=1)
+
+        # The next init() installs over the SDK's own attributes and hands them back.
+        monkeypatch.undo()
+        broken["limits"] = False
+        again = AdapterRegistry()
+        again.install(AnthropicAgentSdkAdapter(), _client())
+        assert again.is_installed("anthropic_agent_sdk")
+        again.uninstall_all()
+        assert all(_agent_sdk_seams()[key] is value for key, value in pristine.items())
+    finally:
+        # Not `uninstall()`: this must clean up even when an assertion above
+        # bites, without depending on the code under test to do it.
+        adapter._patches.restore_all()
+        if adapter._bridge is not None:
+            adapter._bridge.close()

@@ -51,15 +51,20 @@ from __future__ import annotations
 import ast
 import importlib
 import inspect
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
+from typing import Any
 
 from .._adapters import _DETECT_PACKAGES, _make_adapter
-from .._assembly import Limitation, ParentSource
+from .._adapters._registry import AdapterRegistry
+from .._assembly import Limitation, ParentSource, PatchSet
 from .._enums import AdapterName
 from .harness import (
     AdapterSubject,
+    RecordingClient,
     SpanNode,
     UsageSnapshot,
+    clean_state,
     collapse_onto_root,
     exactly_one,
     installed_adapter,
@@ -101,6 +106,7 @@ class AdapterConformanceSuite:
         "check_the_declared_tree_is_one_a_collapse_could_break",
         "check_the_adapter_names_itself_after_its_enum_member",
         "check_install_replaces_every_seam_and_uninstall_restores_it",
+        "check_an_install_that_fails_partway_is_undone_by_identity",
         "check_a_restored_seam_captures_nothing",
         "check_the_workload_ships_one_read_tree",
         "check_the_causal_chain_holds_by_span_id",
@@ -224,6 +230,55 @@ class AdapterConformanceSuite:
             live.teardown()
             live.adapter.uninstall()
             assert len(live.spans) == shipped, "a second uninstall shipped another span"
+            self._assert_restored(before)
+
+    def check_an_install_that_fails_partway_is_undone_by_identity(self) -> None:
+        """An install that raises halfway leaves the framework exactly as it was.
+
+        The registry undoes a failed install with two calls, `adapter.uninstall()`
+        and `ctx.patches.restore_all()`, and neither can see a patch the other
+        holds. An adapter that keeps a `PatchSet` of its own and opens its
+        `uninstall()` with `if not self._installed: return`, against a flag its
+        `install()` sets last, declines the one undo that could reach its
+        patches: the wrappers stay on the framework's classes with nothing left
+        able to remove them, and the next `init()` records them as the
+        framework's own attributes, which welds them on for good.
+
+        So the install is made to fail at EVERY patch it performs, one run per
+        position: the k-th `PatchSet.patch` call raises, with the k-1 before it
+        applied. The fault is injected at the one mechanism every adapter
+        patches through, so no adapter has to expose a hook for it, and a run
+        that never reaches the k-th patch fails here rather than passing
+        vacuously. Each run must leave every seam holding the framework's own
+        attribute, by identity, and the registry without the adapter; and a
+        clean install after all of them must still restore on teardown.
+        """
+        subject = self._subject
+        before = dict(subject.seams())
+        with clean_state(), _patch_calls(fail_at=None) as counted:
+            registry = AdapterRegistry()
+            registry.install(subject.factory(), RecordingClient())
+            registry.uninstall_all()
+        assert counted, (
+            "a clean install performed no PatchSet.patch call, so this check could not fail; "
+            "an adapter patches the framework through a PatchSet or not at all"
+        )
+        for k in range(1, len(counted) + 1):
+            with clean_state(), _patch_calls(fail_at=k) as fired:
+                registry = AdapterRegistry()
+                registry.install(subject.factory(), RecordingClient())  # must not raise
+            assert len(fired) == k, f"the install stopped before its patch {k} ({counted[k - 1]})"
+            assert not registry.is_installed(subject.name), (
+                f"an install that failed at patch {k} stayed registered"
+            )
+            welded = [key for key in before if subject.seams()[key] is not before[key]]
+            assert not welded, (
+                f"an install that failed at patch {k} ({counted[k - 1]}) was rolled back with "
+                f"{welded} not holding the framework's own attribute; the undo must not wait "
+                "for an installed flag the failed install never set"
+            )
+        with installed_adapter(subject.factory) as live:
+            live.teardown()
             self._assert_restored(before)
 
     def check_a_restored_seam_captures_nothing(self) -> None:
@@ -567,6 +622,30 @@ def _carries_usage(usage: UsageSnapshot) -> bool:
         or usage.reasoning_output_tokens is not None
         or usage.gen_ai_usage_extras != ()
     )
+
+
+class _InjectedInstallFault(RuntimeError):
+    """Raised from `PatchSet.patch` by the half-install check, never otherwise."""
+
+
+@contextmanager
+def _patch_calls(*, fail_at: int | None) -> Iterator[list[str]]:
+    """Record every `PatchSet.patch` call by attribute name; raise at call
+    `fail_at` (1-based) instead of patching. Restored whatever happens."""
+    original = PatchSet.patch
+    calls: list[str] = []
+
+    def patch(self: PatchSet, target: Any, name: str, wrapper: Any) -> bool:
+        calls.append(name)
+        if len(calls) == fail_at:
+            raise _InjectedInstallFault(f"injected at patch {fail_at} ({name})")
+        return original(self, target, name, wrapper)
+
+    PatchSet.patch = patch  # type: ignore[method-assign]
+    try:
+        yield calls
+    finally:
+        PatchSet.patch = original  # type: ignore[method-assign]
 
 
 def _declares_placement(site: ast.Call) -> bool:

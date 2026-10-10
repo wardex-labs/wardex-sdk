@@ -401,12 +401,11 @@ Two emit sites, and the first is the mechanism the second restates.
     """wardex's own instrumentation failed at this site, so something that
     belongs on this span — or the whole span below it — is missing.
 
-    Every other member of this vocabulary describes a limit of what could be
-    OBSERVED: the framework did not say, the protocol does not carry it, a bound
-    was reached. This one describes a limit of wardex. It exists because the two
-    are indistinguishable downstream without it, and the wrong one gets blamed:
-    a subtree missing because an adapter threw looks exactly like a subtree that
-    never ran.
+    Every other member of this vocabulary describes a limit of what could be OBSERVED: the framework
+    did not say, the protocol does not carry it, a bound was reached. This one describes a limit of
+    wardex. It exists because the two are indistinguishable downstream without it, and the wrong one
+    gets blamed: a subtree missing because an adapter threw looks exactly like a subtree that never
+    ran.
 
     Emitted from ``_adapters/_context.py``: on a unit whose open or description failed, on one whose
     activation failed, and on the ENCLOSING unit when the span itself will not ship. BEST EFFORT by
@@ -416,15 +415,14 @@ Two emit sites, and the first is the mechanism the second restates.
     unit takes the marker with it. What always survives is the line the same failure prints to
     stderr, which touches nothing that can itself be broken.
 
-    And from ``_assembly/_parentage.py::resolve_observed``, which is the same
-    sentence said about an EDGE rather than about a unit: a byte-seam span whose
-    parent wardex owed it and does not have. Two conditions reach that branch —
-    a request issued inside a ``degraded_run`` (a span wardex failed to open, so
-    nothing was ambient to latch) and one whose latched parent wardex itself
-    discarded to stay inside a bound (``_interceptors/_trackers.py``, the h2
-    stream latch at ``max_streams``). It travels with ``PARENT_UNRESOLVED``,
-    which ``_MARKER`` attaches from the ``UNRESOLVED`` source; this one is what
-    stops the pair reading as "the host has an untraced caller".
+    And from ``_assembly/_parentage.py::resolve_observed``, which is the same sentence said about an
+    EDGE rather than about a unit: a byte-seam span whose parent wardex owed it and does not have.
+    Two conditions reach that branch — a request issued inside a ``degraded_run`` (a span wardex
+    failed to open, so nothing was ambient to latch) and one whose latched parent wardex itself
+    discarded to stay inside a bound (``_interceptors/_trackers.py``, the h2 stream latch at
+    ``max_streams``). It travels with ``PARENT_UNRESOLVED``, which ``_MARKER`` attaches from the
+    ``UNRESOLVED`` source; this one is what stops the pair reading as "the host has an untraced
+    caller".
 
     And from ``_assembly/_units.py``, for the refusal of an EVICT-ORIGIN leftover scope: ``open()``
     and ``resolve()`` refuse the standing fork of a unit the registry itself evicted
@@ -436,24 +434,27 @@ Two emit sites, and the first is the mechanism the second restates.
     ``resolve_observed`` already says for a byte-seam span whose latched parent wardex discarded to
     stay inside a bound.
 
-    And from ``_interceptors/_seam.py``, on the deferred finalization's
-    parse exception: ``_assemble`` runs ``parse_llm_semantics`` under the
-    ``interceptors.seam.parse`` guard, and a parser that RAISES (as opposed
-    to answering None — "not an LLM body") marks the span with this member
-    and ships it. Before the deferred split that raise was swallowed
-    uncounted, and under AGENT mode with no parent the span vanished
-    entirely — a zero counter over deleted data, the exact I6 shape.
+    And from ``_interceptors/_seam.py``, on the deferred finalization's parse exception:
+    ``_assemble`` runs ``parse_llm_semantics`` under the ``interceptors.seam.parse`` guard, and a
+    parser that RAISES (as opposed to answering None — "not an LLM body") marks the span with this
+    member and ships it. Before the deferred split that raise was swallowed uncounted, and under
+    AGENT mode with no parent the span vanished entirely — a zero counter over deleted data, the
+    exact I6 shape.
 
-    And from ``_client.py``, on the deferred-parse path's spawn failure:
-    ``capture_deferred`` could not bring the finalize worker up (a host at
-    its thread ulimit is the measured shape), so the job is finalized
-    inline, parse-less, carrying this member — wardex's own failure, and
-    the span still ships rather than silently losing captured bodies.
+    And from ``_client.py``, on the deferred-parse path's spawn failure: ``capture_deferred`` could
+    not bring the finalize worker up (a host at its thread ulimit is the measured shape), so the job
+    is finalized inline, parse-less, carrying this member — wardex's own failure, and the span still
+    ships rather than silently losing captured bodies.
 
-    Deliberately not ``CONTEXT_PROPAGATION_DEGRADED``, which is declared as a
-    property of the RUNTIME — work whose carrier legitimately could not inherit
-    the context. Reusing it here would file a wardex bug under "the host's
-    threading model", which is the attribution this member exists to correct.
+    And from ``_adapters/_hook_reach.py``, on the root of a Claude Agent SDK session whose
+    ``initialize`` handshake did not register the adapter's hooks — a ``query`` bound before
+    ``wardex.init()``, or a client built before it. The session is recorded from the CLI's stream
+    alone, without the sub-agent spans only the hooks open, so the run reads as one that had none.
+
+    Deliberately not ``CONTEXT_PROPAGATION_DEGRADED``, which is declared as a property of the
+    RUNTIME — work whose carrier legitimately could not inherit the context. Reusing it here would
+    file a wardex bug under "the host's threading model", which is the attribution this member
+    exists to correct.
     """
 
     TRACKING_RESET_AT_FORK = "tracking_reset_at_fork"
@@ -999,9 +1000,8 @@ Two emit sites, and the first is the mechanism the second restates.
     """The agent session ended without a clean result: an error was raised, or
     teardown arrived with no result message at all.
 
-    Emitted from ``_adapters/_assembler.py::SessionAssembler._stamp_root``, on
-    all three of its terminal branches (result present but errored, no result
-    and an error, no result and no error).
+    Emitted from ``_adapters/_assembler.py::SessionAssembler._stamp_root``, on all three of its
+    terminal branches (result present but errored, no result and an error, no result and no error).
     """
 
     # ------------------------------------------------------------------

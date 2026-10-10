@@ -778,3 +778,45 @@ def test_a_stream_error_event_alone_does_not_fail_the_run(fake_codex, codex_ward
     run = _one(_spans(rec), "invoke_agent")
     assert run.status is not StatusCode.ERROR
     assert _extra(run)["wardex.codex.error"] == "Reconnecting... 1/5"
+
+
+def test_an_install_that_fails_partway_is_undone_by_identity():
+    """The conformance suite's half-install check, run for this adapter too.
+
+    It is not wired into the suite as a whole subject (its spans come from a
+    CLI the suite cannot drive), but the rollback check needs only what it
+    patches: an install made to fail at each of its patches in turn must leave
+    every one of them holding the stdlib's own attribute.
+    """
+    from wardex_sdk._adapters._codex_exec import CodexExecAdapter
+    from wardex_sdk.testing import AdapterConformanceSuite, AdapterSubject
+
+    def seams() -> dict[str, object]:
+        popen, process = subprocess.Popen, asyncio.subprocess.Process
+        return {
+            "Popen.__init__": popen.__init__,
+            "Popen.communicate": popen.communicate,
+            "Popen.wait": popen.wait,
+            "Popen.poll": popen.poll,
+            "Process.__init__": process.__init__,
+            "Process.communicate": process.communicate,
+            "Process.wait": process.wait,
+        }
+
+    def unused(live):  # noqa: ANN001, ANN202
+        raise AssertionError("the half-install check drives no workload")
+
+    subject = AdapterSubject(
+        name="codex_exec",
+        module="wardex_sdk._adapters._codex_exec",
+        factory=CodexExecAdapter,
+        seams=seams,
+        workload=unused,
+        chains=(("invoke_agent", "chat", "execute_tool"),),
+        stall=unused,
+        detect_package="codex",
+        usage_expected="totals",
+    )
+    AdapterConformanceSuite(subject).run(
+        "check_an_install_that_fails_partway_is_undone_by_identity"
+    )
