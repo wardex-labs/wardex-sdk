@@ -22,7 +22,7 @@ class _Recording(Transport):
         self.envelopes.append(envelope)
 
 
-def _span(output_data: bytes = b""):
+def _span(output_data: bytes = b"", **fields):
     return InternalSpan(
         context=SpanContext(TraceId.generate(), SpanId.generate()),
         parent_span_id=None,
@@ -31,6 +31,7 @@ def _span(output_data: bytes = b""):
         start_time_ns=1,
         end_time_ns=2,
         output_data=output_data,
+        **fields,
     )
 
 
@@ -143,6 +144,95 @@ def test_byte_budget_leaves_small_spans_alone():
         assert len(c._spans) == 10
     finally:
         c.close()
+
+
+_MIB = 1024 * 1024
+
+
+def test_message_copies_count_against_the_buffer_byte_budget():
+    """The semantic parse stores the request's and response's messages as
+    `extra` strings beside the body they were parsed from -- for a multimodal
+    request, close to a second copy of it. Counting the body alone let a buffer
+    bounded at N bytes hold far more than N."""
+    t = _Recording()
+    cfg = WardexConfig(
+        limits=LimitsConfig(max_buffer_bytes=6 * _MIB, max_buffer_spans=1000),
+        backend=BackendConfig(api_key="k"),
+    )
+    c = Client(cfg, t)
+    c._worker.stop()  # no periodic drain may empty the buffer mid-test
+    try:
+        copy = "x" * (4 * _MIB)
+        c.capture_span(_span(extra=(("gen_ai.input.messages", copy), ("n", 7))))
+        assert c._buffered_bytes >= 4 * _MIB, "the message copy was not counted"
+        assert c._dropped == 0
+
+        c.capture_span(_span(extra=(("gen_ai.output.messages", copy),)))
+        # Two 4 MiB copies do not fit under 6 MiB: the older span goes.
+        assert c._dropped == 1
+        assert len(c._spans) == 1
+        assert c._buffered_bytes <= 6 * _MIB
+    finally:
+        c.close()
+
+
+def test_event_attributes_count_against_the_buffer_byte_budget():
+    """An exception event carries the whole stack trace as a string."""
+    from wardex_sdk._types import InternalSpanEvent
+
+    event = InternalSpanEvent(
+        name="exception",
+        timestamp_ns=1,
+        attributes=(("exception.stacktrace", "y" * _MIB), ("exception.escaped", True)),
+    )
+    t = _Recording()
+    c = Client(WardexConfig(backend=BackendConfig(api_key="k")), t)
+    c._worker.stop()
+    try:
+        c.capture_span(_span(events=(event,)))
+        assert c._buffered_bytes >= _MIB
+    finally:
+        c.close()
+
+
+def test_a_public_span_attribute_is_evicted_at_the_buffer_byte_budget():
+    """The same bound, reached the way a host reaches it: `Span.set_attribute`
+    writes the draft's `extra` through `set_extra`, exactly as the semantic
+    parse does for the message copies."""
+    import wardex_sdk
+    from wardex_sdk import _hub
+
+    wardex_sdk.init(
+        transport=_Recording(),
+        intercept=False,
+        limits=LimitsConfig(max_buffer_bytes=6 * _MIB),
+    )
+    try:
+        client = _hub.get_client()
+        client._worker.stop()
+        copy = "z" * (4 * _MIB)
+        for name in ("first", "second"):
+            with wardex_sdk.span(name) as span:
+                span.set_attribute("payload", copy)
+        client._settle()
+        assert [s.name for s in client._spans] == ["second"]
+        assert client._dropped == 1
+    finally:
+        wardex_sdk.close()
+
+
+def test_a_hostile_string_subclass_cannot_raise_out_of_the_buffer_size_count():
+    """An attribute value is host data, and a `str` subclass's own `__len__` is
+    host code on the capture path; the count reads the real length instead."""
+    from wardex_sdk._types import span_buffer_bytes
+
+    class _Hostile(str):
+        def __len__(self) -> int:
+            raise RuntimeError("host __len__")
+
+    assert span_buffer_bytes(_span(extra=(("k", _Hostile("abc")),))) == (
+        span_buffer_bytes(_span()) + 3
+    )
 
 
 def test_byte_counter_survives_a_reentrant_drain_mid_eviction(monkeypatch):
