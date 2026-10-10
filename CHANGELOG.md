@@ -373,6 +373,17 @@ All notable changes to this project are documented here. The format follows
   `C:\Users\me\token=…`, is masked as before: the scanner cannot tell the
   two apart, so it judges both readings and masks the value when either one
   names a secret.
+- **South Korean mobile numbers are masked.** The phone rule knew only North
+  American numbers, so `010-2481-7730` in a user's message, a tool result or
+  a request body reached your backend as written, though the README lists
+  phone numbers among what masking covers. It now becomes `[PHONE]` under the
+  same `phone_number` category: `010`, `011` and `016` to `019` numbers with
+  hyphens, spaces, dots or no separators (`01024817730`), `+82 10-…` with or
+  without the `0`, and a number with a Korean particle written straight after
+  it (`010-2481-7730으로`). A ten-digit run with no separators, a date, and a
+  number inside a longer run of digits or letters are left alone. The README
+  now says which phone formats are covered and lists every other format among
+  what masking does not catch.
 - **A wrong project key, a receiver that is down, and every other loss no
   span can carry now say so once with `debug` off, and are counted.**
   Before, with the default `debug=False`, an export your receiver refused or
