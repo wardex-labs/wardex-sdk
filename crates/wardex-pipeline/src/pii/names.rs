@@ -157,14 +157,18 @@ impl NameRules {
 
     /// The rule a value under `name` falls to, if any.
     pub fn judge(&self, name: &str, shape: Shape) -> Option<Rule> {
-        let w = words(name);
-        if w.is_empty() || self.reveal.contains(&w) {
+        self.judge_words(&words(name), shape)
+    }
+
+    /// `judge`, for a name already split into its `words`.
+    fn judge_words(&self, w: &[String], shape: Shape) -> Option<Rule> {
+        if w.is_empty() || self.reveal.iter().any(|r| r == w) {
             return None;
         }
-        if self.extra.contains(&w) {
+        if self.extra.iter().any(|x| x == w) {
             return Some(Rule::SecretUserName);
         }
-        if exact_names().contains(&w) {
+        if exact_names().iter().any(|x| x == w) {
             return Some(Rule::SecretExactName);
         }
         if shape == Shape::UrlForm && w.len() == 1 && URL_FORM_ONLY_NAMES.contains(&w[0].as_str()) {
@@ -279,15 +283,25 @@ impl NameRules {
             return (as_written, self.judge(as_written, Shape::UrlForm));
         };
         let unescaped = &text[after..eq];
-        let Some(rule) = self.judge(unescaped, Shape::UrlForm) else {
-            return (as_written, self.judge(as_written, Shape::UrlForm));
-        };
-        if reads_as_escape(b, start, after, quoted) {
-            return (unescaped, Some(rule));
+        let unescaped_words = words(unescaped);
+        let escaped = self.judge_words(&unescaped_words, Shape::UrlForm);
+        if escaped.is_some() && reads_as_escape(b, start, after, quoted) {
+            return (unescaped, escaped);
         }
-        match self.judge(as_written, Shape::UrlForm) {
-            Some(written) => (as_written, Some(written)),
-            None => (unescaped, Some(rule)),
+        // A one-letter escape that runs on into a lowercase letter joins the
+        // first word: the name as written has the same words with that
+        // letter in front of the first one, and splitting it again would
+        // double the cost of every such name.
+        let written = match unescaped_words {
+            mut w if after == start + 1 && b[after].is_ascii_lowercase() && !w.is_empty() => {
+                w[0].insert(0, char::from(b[start]));
+                self.judge_words(&w, Shape::UrlForm)
+            }
+            _ => self.judge(as_written, Shape::UrlForm),
+        };
+        match (escaped, written) {
+            (Some(rule), None) => (unescaped, Some(rule)),
+            (_, written) => (as_written, written),
         }
     }
 
@@ -927,6 +941,33 @@ mod tests {
             assert_eq!(hits.len(), 1, "{text}");
             assert_eq!(&text[hits[0].start..hits[0].end], value, "{text}");
             assert_eq!(hits[0].name, name, "{text}");
+        }
+    }
+
+    /// `judge_form_name` judges the name as written from the words of the
+    /// name without its escape, with the escape's letter put in front of the
+    /// first word, whenever the name runs on in lowercase. That is exactly
+    /// how `words` splits the name as written.
+    #[test]
+    fn a_letter_running_on_in_lowercase_joins_the_first_word() {
+        for name in [
+            "password",
+            "api_key",
+            "ackup_key",
+            "mpGITHUB_TOKEN",
+            "a1",
+            "a1b2_key3",
+            "xKey",
+            "ab%5Fkey",
+            "token%",
+            "pw.x-y[z]",
+            "é_key",
+        ] {
+            for letter in ['b', 'f', 'n', 'r', 't'] {
+                let mut joined = words(name);
+                joined[0].insert(0, letter);
+                assert_eq!(joined, words(&format!("{letter}{name}")), "{letter}{name}");
+            }
         }
     }
 
