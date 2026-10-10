@@ -6,7 +6,10 @@ the `await` for an `async def`, every step from the first `next()` to the last
 for a generator. Each shape gets its own wrapper below. Wrapping only the call
 was right for the first and wrong for the other two: a generator's call merely
 builds the generator, so its span closed before the body ran and every span the
-body opened became the root of a trace of its own.
+body opened became the root of a trace of its own. A generator's wrapper is a
+generator function itself, which frameworks branch on; the price is the one
+every generator wrapper pays: its arguments reach the body at the first
+`next()`, so a call with the wrong arguments raises there, not at the call.
 
 Anything that is not a function of one of those shapes is refused HERE, when
 the decorator is applied, with a `TypeError` that says what was refused, why,
@@ -65,8 +68,9 @@ def _unwrapped(obj: object) -> Any:
     return base if base is not obj and _has_code(base) else None
 
 
-def _resolve(api: str, fn: object) -> tuple[str, Any]:
-    """`(shape, code)` for a callable the decorator can wrap; a `TypeError` otherwise.
+def _resolve(api: str, fn: object) -> tuple[str, Any, bool]:
+    """`(shape, code, is_wrapper_object)` for a callable the decorator can wrap;
+    a `TypeError` otherwise.
 
     `code` is the function whose source the span's call site names: `fn` itself
     for a plain function (a `functools.wraps` wrapper included — its own code
@@ -102,27 +106,41 @@ def _resolve(api: str, fn: object) -> tuple[str, Any]:
         else:
             break
     if _has_code(inner):
-        return _shape(fn), inner
+        return _shape(fn), inner, False
     if inspect.isbuiltin(inner):
-        return _FUNCTION, None
+        return _FUNCTION, None, False
     base = _unwrapped(inner)
     if base is None:
         raise TypeError(
-            f"wardex.{api}() cannot decorate a {kind} object: it wraps functions, "
-            "and putting a function in place of an object hides the object's own "
-            "type and attributes from whatever uses it (a framework's tool "
-            f"registry, say). Apply @wardex.{api} to the plain function first — "
-            "closest to its `def`, below any decorator that turns it into an "
-            "object — or decorate the class's `__call__` method."
+            f"wardex.{api}() cannot decorate a {kind} object. Apply @wardex.{api} to "
+            "the plain function first — closest to its `def`, below any decorator "
+            "that turns it into an object — or decorate the class's `__call__` "
+            "method: the decorators wrap functions, and putting a function in place "
+            "of an object hides the object's own type and attributes from whatever "
+            "uses it (a framework's tool registry, say)."
         )
     if _shape(base) != _shape(fn):
         raise TypeError(
-            f"wardex.{api}() cannot decorate this {kind} object: it wraps the "
-            f"{_shape(base)} {base.__name__!r} but is not itself one, so a span "
-            "around a call to it would end before the body runs. Apply "
-            f"@wardex.{api} directly to the function, below the {kind} decorator."
+            f"wardex.{api}() cannot decorate this {kind} object. Apply @wardex.{api} "
+            f"directly to the function, below the {kind} decorator: the object wraps "
+            f"the {_shape(base)} {base.__name__!r} but is not itself one, so a span "
+            "around a call to it would end before the body runs."
         )
-    return _shape(fn), base
+    return _shape(fn), base, inner is fn
+
+
+def _keep_api(wrapper: Any, obj: object) -> None:
+    """Keep a wrapper object's own public API reachable on the function replacing it.
+
+    `functools.wraps` copies a function's attributes, and a caching wrapper's
+    are methods of its type — so `@wardex.tool` over `@functools.lru_cache`
+    used to hide `cache_info()` and `cache_clear()`. Each public attribute the
+    function does not already have is set on it, bound to the object.
+    """
+    with guard("tracing.decorator_api", debug=_debug_enabled()):
+        for attr in dir(obj):
+            if not attr.startswith("_") and not hasattr(wrapper, attr):
+                setattr(wrapper, attr, getattr(obj, attr))
 
 
 def _name_of(fn: object, code: Any) -> str:
@@ -238,7 +256,13 @@ def _decorate(
             # put the same descriptor back around it, so the class still binds it.
             rewrap = staticmethod if isinstance(fn, staticmethod) else classmethod
             return rewrap(deco(fn.__func__))
-        shape, code = _resolve(api, fn)
+        shape, code, is_wrapper_object = _resolve(api, fn)
+        wrapper = shaped(fn, shape, code)
+        if is_wrapper_object:
+            _keep_api(wrapper, fn)
+        return wrapper
+
+    def shaped(fn: Any, shape: str, code: Any) -> Any:
         span_name = name if name is not None else _name_of(fn, code)
         workflow_name = span_name if names_workflow else None
         cs = _call_site(code)

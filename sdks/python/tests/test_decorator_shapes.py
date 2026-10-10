@@ -203,6 +203,50 @@ def test_closing_a_generator_early_closes_the_body_and_ends_the_span(recording):
     assert spans["early"].status is not StatusCode.ERROR
 
 
+def test_cleanup_in_a_closed_generators_finally_runs_inside_its_span(recording):
+    """Closing the decorated generator closes the body right there, inside the
+    span: work in the body's `finally` is the span's child and ends before it.
+    Left to the garbage collector instead, it would run outside the span, after
+    it had already shipped."""
+
+    @tool(name="early")
+    def early():
+        try:
+            yield 1
+            yield 2
+        finally:
+            with span("cleanup"):
+                pass
+
+    g = early()
+    assert next(g) == 1
+    g.close()
+    spans = _by_name(recording)
+    assert _parent(spans["cleanup"]) == spans["early"].context.span_id.value
+    assert spans["cleanup"].end_time_ns <= spans["early"].end_time_ns
+
+
+def test_cleanup_in_a_closed_async_generators_finally_runs_inside_its_span(recording):
+    @tool(name="aearly")
+    async def aearly():
+        try:
+            yield 1
+            yield 2
+        finally:
+            with span("acleanup"):
+                pass
+
+    async def main():
+        g = aearly()
+        assert await g.__anext__() == 1
+        await g.aclose()
+
+    asyncio.run(main())
+    spans = _by_name(recording)
+    assert _parent(spans["acleanup"]) == spans["aearly"].context.span_id.value
+    assert spans["acleanup"].end_time_ns <= spans["aearly"].end_time_ns
+
+
 def test_an_exception_from_a_generator_body_marks_its_span_failed(recording):
     @tool(name="boom")
     def boom():
@@ -235,6 +279,59 @@ def test_an_async_generator_closed_early_closes_its_body(recording):
     asyncio.run(main())
     assert closed == [True]
     assert "aearly" in _by_name(recording)
+
+
+def test_a_span_held_across_a_yield_and_closed_on_another_thread_restores_the_parent(
+    recording,
+):
+    """Starlette's `iterate_in_threadpool` and `asyncio.to_thread(next, g)` resume
+    a generator on a worker thread. A `with wardex.span()` the body held across
+    the `yield` then ends there, in another context than it began, and the body's
+    later work belongs under the generator's span again — not under the span
+    that just closed."""
+
+    @workflow(name="handoff")
+    def handoff():
+        with span("held"):
+            yield 1
+        with span("after"):
+            pass
+        yield 2
+
+    g = handoff()
+    assert next(g) == 1
+    rest = []
+    worker = threading.Thread(target=lambda: rest.extend(g))
+    worker.start()
+    worker.join(timeout=10)
+    assert rest == [2]
+    spans = _by_name(recording)
+    root = spans["handoff"].context.span_id.value
+    assert _parent(spans["held"]) == root
+    assert _parent(spans["after"]) == root
+
+
+def test_an_async_generator_stepped_from_several_tasks_restores_the_parent(recording):
+    @agent(name="twotask")
+    async def twotask():
+        with span("a-held"):
+            yield 1
+        with span("a-after"):
+            pass
+        yield 2
+
+    async def main():
+        g = twotask()
+        await asyncio.create_task(g.__anext__())
+        await asyncio.create_task(g.__anext__())
+        with pytest.raises(StopAsyncIteration):
+            await asyncio.create_task(g.__anext__())
+
+    asyncio.run(main())
+    spans = _by_name(recording)
+    root = spans["twotask"].context.span_id.value
+    assert _parent(spans["a-held"]) == root
+    assert _parent(spans["a-after"]) == root
 
 
 def test_a_generator_resumed_on_another_thread_stays_in_its_trace(recording):
@@ -344,6 +441,23 @@ def test_above_staticmethod_and_classmethod_the_descriptor_is_kept(recording, ap
     assert class_result == ("Tools", "b", spans["build"].context.span_id.value.hex())
 
 
+def test_a_cache_wrapper_keeps_its_cache_api(recording):
+    """`@wardex.tool` over `@functools.lru_cache` hid `cache_info()` and
+    `cache_clear()`, which code that manages the cache calls by name."""
+
+    @tool
+    @functools.lru_cache(maxsize=8)
+    def lookup(key):
+        return key * 2
+
+    assert lookup(2) == 4
+    assert lookup(2) == 4
+    assert lookup.cache_info().hits == 1
+    lookup.cache_clear()
+    assert lookup.cache_info().currsize == 0
+    assert lookup.cache_parameters()["maxsize"] == 8
+
+
 def test_a_partial_and_a_cache_wrapper_name_the_functions_own_source(recording):
     for decorated in (
         tool(functools.partial(_sync)),
@@ -358,7 +472,7 @@ def test_a_partial_and_a_cache_wrapper_name_the_functions_own_source(recording):
 
 _REFUSED = {
     "a class": (lambda: _Holder, "cannot decorate the class _Holder"),
-    "a callable object": (lambda: _CallableObject(), "or decorate the class's `__call__`"),
+    "a callable object": (lambda: _CallableObject(), "or decorate the class's `__call__` method"),
     "a cache over an async function": (
         lambda: functools.lru_cache(maxsize=None)(_async),
         "directly to the function, below the _lru_cache_wrapper decorator",
@@ -389,34 +503,98 @@ def test_with_a_decorator_name_positionally_the_block_form_is_suggested(recordin
 
 
 # ==========================================================================
-# the six published context managers: `with` only, never a decorator
+# the six published context managers: never a decorator over a body that
+# runs after its call returns
 # ==========================================================================
 
-_CONTEXT_MANAGERS = {
+_TRACEPARENT = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"
+
+_SPAN_OPENERS = {
     "span": lambda: wardex_sdk.span("x"),
     "conversation": lambda: wardex_sdk.conversation("x"),
+}
+
+_SCOPE_MANAGERS = {
     "isolation_scope": wardex_sdk.isolation_scope,
     "new_scope": wardex_sdk.new_scope,
-    "continue_trace": lambda: wardex_sdk.continue_trace(
-        {"traceparent": "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"}
-    ),
+    "continue_trace": lambda: wardex_sdk.continue_trace({"traceparent": _TRACEPARENT}),
     "continue_from_otel": wardex_sdk.continue_from_otel,
 }
 
 
-@pytest.mark.parametrize("name", sorted(_CONTEXT_MANAGERS))
-def test_a_published_context_manager_refuses_to_decorate(recording, name):
-    make = _CONTEXT_MANAGERS[name]
-    with pytest.raises(TypeError) as refused:
+async def _a_coroutine_function():
+    return 1
 
-        @make()
-        async def handler():
-            return 1
 
-    message = str(refused.value)
-    assert message.startswith(f"wardex.{name}() is a context manager, not a decorator")
-    assert "with wardex." in message
+def _a_generator_function():
+    yield 1
+
+
+async def _an_async_generator_function():
+    yield 1
+
+
+_LATE_BODIES = {
+    "async function": _a_coroutine_function,
+    "generator function": _a_generator_function,
+    "async generator function": _an_async_generator_function,
+}
+
+
+@pytest.mark.parametrize("name", sorted(_SPAN_OPENERS))
+def test_a_span_opener_refuses_to_decorate_anything(recording, name):
+    make = _SPAN_OPENERS[name]
+    for target in (_sync, *_LATE_BODIES.values()):
+        with pytest.raises(TypeError) as refused:
+            make()(target)
+        message = str(refused.value)
+        assert message.startswith(f"wardex.{name}() is a context manager, not a decorator")
+        assert "@workflow/@agent/@step/@tool" in message
     with make():
+        pass
+
+
+@pytest.mark.parametrize("shape", sorted(_LATE_BODIES))
+@pytest.mark.parametrize("name", sorted(_SCOPE_MANAGERS))
+def test_a_scope_manager_refuses_a_body_that_runs_after_its_call(recording, name, shape):
+    """As a decorator these wrapped only the call, which for these shapes returns
+    before the body runs: the body silently left the scope or the trace."""
+    with pytest.raises(TypeError) as refused:
+        _SCOPE_MANAGERS[name]()(_LATE_BODIES[shape])
+    message = str(refused.value)
+    assert message.startswith(f"wardex.{name}() cannot decorate")
+    assert f"({shape})" in message
+    assert f"`with wardex.{name}(" in message
+
+
+def test_a_scope_manager_still_decorates_a_plain_function(recording):
+    """Over a plain function the decorator form covered the whole call before
+    the refusal existed, and it still does — each call in a fresh manager."""
+
+    @wardex_sdk.continue_trace({"traceparent": _TRACEPARENT})
+    def handler():
+        with span("joined"):
+            pass
+
+    @wardex_sdk.isolation_scope()
+    def tagged(value):
+        wardex_sdk.set_tag("request", value)
+        with span(f"tagged-{value}"):
+            pass
+
+    handler()
+    tagged("a")
+    tagged("b")
+    spans = _by_name(recording)
+    assert spans["joined"].context.trace_id.value.hex() == _TRACEPARENT.split("-")[1]
+    assert ("request", "a") in spans["tagged-a"].extra
+    assert ("request", "b") in spans["tagged-b"].extra
+    assert _hub.get_isolation_scope().tags.get("request") is None  # nothing leaked out
+
+
+@pytest.mark.parametrize("name", sorted(_SCOPE_MANAGERS))
+def test_a_scope_manager_still_works_as_a_with_block(recording, name):
+    with _SCOPE_MANAGERS[name]():
         pass
 
 

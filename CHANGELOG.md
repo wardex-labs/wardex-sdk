@@ -187,15 +187,6 @@ All notable changes to this project are documented here. The format follows
 
 ### Changed
 
-- **BREAKING: `isolation_scope()`, `new_scope()`, `continue_trace()` and
-  `continue_from_otel()` are `with` blocks only, like `span()` and
-  `conversation()`.** Used as a decorator, each of them wrapped only the
-  call, so on an `async def` or a generator it closed before the body ran:
-  the body's spans silently left the scope or the caller's trace (and
-  `@wardex.continue_trace(headers)` read the headers once, at import). Each
-  now raises a `TypeError` when used as a decorator, naming the `with` form to
-  write instead. The `with` form is unchanged; a decorator over a plain
-  function, which did work, now needs the same `with` block inside it.
 - **The wardex envelope says what the SDK observed about a transport, or
   nothing.** Transport fields nobody measured used to ship under their zero
   values as if they had been read off the connection: every span said
@@ -442,7 +433,19 @@ All notable changes to this project are documented here. The format follows
   decorate the plain function first, or the class's `__call__`), a caching
   wrapper around an async function, and the span name passed positionally
   (`@wardex.tool("search")` or `with wardex.workflow("x")` — the name is
-  `name=`, and a block is `with wardex.span("x")`).
+  `name=`, and a block is `with wardex.span("x")`). A caching wrapper keeps
+  its API: `cache_info()` and `cache_clear()` still work on the decorated
+  name. A `with wardex.span()` held open across a `yield` no longer leaves its
+  closed span as the parent of what the generator does next when the
+  generator is resumed on another thread or task (Starlette's
+  `iterate_in_threadpool`, `asyncio.to_thread(next, g)`).
+- **`isolation_scope()`, `new_scope()`, `continue_trace()` and
+  `continue_from_otel()` refuse to decorate an async function or a
+  generator.** As a decorator each of them wrapped only the call, which for
+  those shapes returns before the body runs, so the body silently left the
+  scope or the caller's trace. They now raise a `TypeError` naming the `with`
+  form to write instead. Over a plain function the decorator form covers the
+  whole call, and it keeps working as before.
 - **A run cut off by SIGTERM or `wardex.close()` keeps its root.** A
   `@wardex.workflow` (or any decorator, `wardex.span()` or
   `wardex.conversation()` block, or a decorated generator not yet exhausted)
@@ -452,9 +455,13 @@ All notable changes to this project are documented here. The format follows
   already finished, each pointing at a parent that never arrived. Such a span
   now ships at that moment marked `unit_interrupted`, the marker an adapter's
   run already carried in the same situation, with its children under it, and
-  the block ending later adds no second copy. A SIGTERM your app handles or
-  ignores, and a second `init()`, leave open spans running as before, since
-  the program carries on.
+  the block ending later adds no second copy. The finished spans already
+  buffered are never evicted to make room: `close()` flushes them out between
+  chunks within its budget, and the SIGTERM handler, which cannot wait, ships
+  the run's roots first into the room there is. What does not fit is counted
+  under `_runtime.open_spans_unshipped` and said once on stderr. A SIGTERM
+  your app handles or ignores, and a second `init()`, leave open spans
+  running as before, since the program carries on.
 - **A wrong project key, a receiver that is down, and every other loss no
   span can carry now say so once with `debug` off, and are counted.**
   Before, with the default `debug=False`, an export your receiver refused or

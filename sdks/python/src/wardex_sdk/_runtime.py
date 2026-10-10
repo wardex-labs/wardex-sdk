@@ -62,12 +62,22 @@ import signal
 import sys
 import threading
 import time
+from collections import deque
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
-from ._assembly import Limitation, counters, diag_info, guard, report_signal_flush_raised
+from ._assembly import (
+    Limitation,
+    counters,
+    diag_info,
+    guard,
+    report_open_spans_unshipped,
+    report_open_spans_untracked,
+    report_signal_flush_raised,
+)
 from ._assembly._diag import diag_reset_for_new_process
-from ._client import Client, _UnnamedTimeout
+from ._client import Client, _sanitize_timeout, _UnnamedTimeout
+from ._types import InternalSpan
 
 if TYPE_CHECKING:
     from ._adapters._registry import AdapterRegistry
@@ -104,16 +114,25 @@ _SIGNAL_FLUSH_TIMEOUT = _UnnamedTimeout(2.0, "<wardex's own signal-flush budget>
 #: How many open manual spans the runtime tracks for shutdown at once.
 #:
 #: A span past this bound still opens and ships when its block ends; what it
-#: loses is the shutdown guarantee, and the loss is counted
+#: loses is the shutdown guarantee, which is counted and said
 #: (`_runtime.open_spans_full`). New spans are the ones turned away, never the
 #: tracked ones: the longest-open span is the run's root, the one the
-#: guarantee exists for. Ten thousand is far above any nesting depth times
-#: concurrency a host reaches; the bound is there for a host that leaks open
-#: frames, so the table cannot grow with the leak.
+#: guarantee exists for. The bound is there for a host that leaks open frames,
+#: so the table cannot grow with the leak, and it is deliberately not the
+#: buffer's: `close()` ships the table in buffer-sized chunks, draining between
+#: them, so it can ship more than one buffer's worth within its budget. The
+#: signal handler cannot wait, and ships only what the buffer has room for.
 _MAX_OPEN_SPANS = 10_000
 
-#: What an open span hands the runtime: ship me now, to this client, saying why.
-Interrupt = Callable[[Client, Limitation], None]
+#: What an open span hands the runtime: finish me now, ending at this time and
+#: saying why — the finished span, or None when it fails validation.
+Interrupt = Callable[[Limitation, int], InternalSpan | None]
+
+#: At most this many cut-off spans are taken from the table, finished and
+#: buffered at a time. It bounds two windows: how long the buffer lock is held
+#: per chunk, and how many spans a signal landing mid-chunk catches already
+#: taken by the frame it interrupted — those die with the process, counted.
+_CUT_OFF_CHUNK = 256
 
 
 def _handler(signum: int, frame: object) -> None:
@@ -155,6 +174,7 @@ class Runtime:
         "_atexit_registered",
         "_client",
         "_close_units",
+        "_cut_off_in_flight",
         "_fork_hooks_registered",
         "_fork_reinit_us",
         "_interceptors",
@@ -187,6 +207,10 @@ class Runtime:
         #: `track_open_span`. Replaced, never cleared, by a fork child and a
         #: reset: a block registered in the old table pops itself from THAT one.
         self._open_spans: dict[int, Interrupt] = {}
+        #: How many spans an `interrupt_open_spans` call has taken from the
+        #: table and not yet buffered. Read by the signal handler, which counts
+        #: them as lost: the frame holding them dies with the process.
+        self._cut_off_in_flight = 0
 
     # -- the client ---------------------------------------------------------
 
@@ -293,8 +317,13 @@ class Runtime:
         normally and ships to the new client.
         """
         with self._lock:
-            self.interrupt_open_spans(self._client, Limitation.UNIT_INTERRUPTED)
-            self._teardown(self._client, timeout=timeout)
+            client = self._client
+            if client is not None:
+                budget = client.config.batching.shutdown_timeout if timeout is None else timeout
+                self.interrupt_open_spans(
+                    client, Limitation.UNIT_INTERRUPTED, budget=_sanitize_timeout(budget)
+                )
+            self._teardown(client, timeout=timeout)
 
     def _teardown(self, client: Client | None, *, timeout: float | None = None) -> None:
         """THE uninstall order, run against `client`. Caller holds the lock.
@@ -412,6 +441,7 @@ class Runtime:
         # the table it registered in and ships from here as it always has.
         self._lock = threading.RLock()
         self._open_spans = {}
+        self._cut_off_in_flight = 0
         diag_reset_for_new_process()
         with guard("_runtime.fork_reinit_failed"):
             # step 1 — slots, directly.
@@ -475,6 +505,7 @@ class Runtime:
             self._close_units = None
             self._client = None
             self._open_spans = {}
+            self._cut_off_in_flight = 0
             _reset_shared_timing()
 
     # -- open manual spans --------------------------------------------------
@@ -498,30 +529,85 @@ class Runtime:
         """
         table = self._open_spans
         if len(table) >= _MAX_OPEN_SPANS:
-            counters.bump("_runtime.open_spans_full")
+            report_open_spans_untracked()
             return None
         table[key] = interrupt
         return table
 
-    def interrupt_open_spans(self, client: Client | None, marker: Limitation) -> None:
-        """Ship every tracked open span now, newest first, saying why.
+    def interrupt_open_spans(
+        self, client: Client | None, marker: Limitation, *, budget: float | None = None
+    ) -> None:
+        """Ship every tracked open span now, marked, without costing a finished span.
 
-        Newest first (`popitem` is LIFO), so a child ends no later than its
-        parent. A closed client is left alone: its `close()` already ran, and a
-        span opened after it ships to whatever client its block finds at the
-        end, as before. Each span is guarded on its own, so one that fails
-        cannot cost the rest — or, from the signal handler, the flush after.
+        The buffer already holds the finished spans these were opened to parent,
+        and buffering through `capture_span` would evict them oldest-first to
+        make room — a SIGTERM over a thousand open requests shipped none of the
+        thousand chat spans under them. So the spans go in through the client's
+        no-evict door (`_return_to_buffer`, the one a declined batch takes back):
+        only into room that is there, the run's roots first (the oldest entries),
+        and what does not fit is counted and said. That door also never wakes
+        the worker, which the signal handler must not do: the wake takes a plain
+        lock the frame the signal interrupted may be holding, and the handler
+        drains synchronously right after anyway.
+
+        `budget` is `close()`'s: between chunks it exports the buffer, finished
+        spans first, to make room, until the budget runs out. None is the signal
+        handler's, which cannot wait: it ships what fits. One end time for all
+        of them, so no child ends after its parent. A closed client is left
+        alone: its `close()` already ran, and a span opened after it ships to
+        whatever client its block finds at the end, as before.
+
+        Two windows remain, both bounded by `_CUT_OFF_CHUNK`. A signal that lands
+        while a `close()` holds a chunk it has taken and not yet buffered ships
+        the rest of the table but not that chunk, which it counts as lost. And
+        the shutdown flush's own lock order, which this adds no wait to: the
+        spans enter under the buffer lock once per chunk, not once per span.
         """
         if client is None or client._closed:
             return
         table = self._open_spans
-        while True:
+        deadline = None if budget is None else time.monotonic() + budget
+        end_ns = time.time_ns()
+        while table:
+            room = _make_room(client, deadline)
+            if room <= 0:
+                break
+            # Taken a chunk at a time, oldest first (the run's roots lead), so a
+            # signal landing in the middle of a `close()` still finds the rest
+            # in the table. Each `pop` is the arbiter against the span's block
+            # ending on another thread: whoever takes the entry ships the span.
+            keys = list(table)[: min(room, _CUT_OFF_CHUNK)]
+            chunk = [i for key in keys if (i := table.pop(key, None)) is not None]
+            self._cut_off_in_flight += len(chunk)
             try:
-                _key, interrupt = table.popitem()
-            except KeyError:  # empty, possibly emptied by a block on another thread
-                return
-            with guard("_runtime.interrupt_open_span"):
-                interrupt(client, marker)
+                spans: deque[InternalSpan] = deque()
+                for interrupt in chunk:
+                    with guard("_runtime.interrupt_open_span"):
+                        finished = interrupt(marker, end_ns)
+                        if finished is not None:
+                            spans.appendleft(client._stamp_scope(finished))
+                # Walked newest-first by the door, which keeps those it walks
+                # first: handed over reversed, the roots are the ones kept.
+                taken = False
+                with guard("_runtime.interrupt_buffer"):
+                    taken = client._return_to_buffer(spans, deque())
+            finally:
+                self._cut_off_in_flight -= len(chunk)
+            if not taken:
+                report_open_spans_unshipped(len(chunk))  # closed under us
+                break
+        # What is left will not ship: the process is ending, or `close()` is
+        # about to refuse it. Taken out so its block's end cannot ship a copy
+        # the shutdown already counted as lost.
+        lost = 0
+        for key in list(table):
+            lost += table.pop(key, None) is not None
+        if budget is None:
+            # The signal handler: a `close()` it interrupted mid-chunk holds
+            # spans it took and never buffers, because the process ends here.
+            lost += self._cut_off_in_flight
+        if lost:
+            report_open_spans_unshipped(lost)
 
     # -- signals ------------------------------------------------------------
 
@@ -652,6 +738,28 @@ def _fork_reinit_module(name: str) -> None:
     module = sys.modules.get(f"{__package__}.{name}")
     if module is not None:
         module._at_fork_reinit()
+
+
+def _make_room(client: Client, deadline: float | None) -> int:
+    """The buffer's room, after exporting it if it is full and `deadline` (the
+    `close()` budget's end) leaves time to; None, the signal path, never waits.
+
+    The drain alone, not `flush()`: the pending parses are `close()`'s own
+    next step, and this budget is wardex's, so a drain it cuts short is never
+    reported as a host's number (`named_by_caller` stays False).
+    """
+    room = _room(client)
+    if room <= 0 and deadline is not None and (left := deadline - time.monotonic()) > 0:
+        client._drain(left)
+        room = _room(client)
+    return room
+
+
+def _room(client: Client) -> int:
+    """How many more spans the client's buffer takes before its cap. A read
+    without the lock: the door re-checks the cap under it, and a span that
+    then does not fit is counted on the buffer's own drop counter."""
+    return client._max_buffer_spans - len(client._buffer.spans)
 
 
 _RUNTIME = Runtime()

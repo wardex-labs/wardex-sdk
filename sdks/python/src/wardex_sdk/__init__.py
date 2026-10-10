@@ -86,7 +86,7 @@ from .context._propagate import (
     get_trace_headers,
     get_traceparent,
 )
-from .context._with_only import WithOnly as _WithOnly
+from .context._with_only import WithOrSyncDecorator as _WithOrSyncDecorator
 from .context._wsgi import WardexWsgiMiddleware
 from .transport._base import Transport
 from .transport._console import ConsoleTransport
@@ -477,10 +477,10 @@ def isolation_scope() -> _AbstractContextManager[Scope]:
     The new isolation scope is a CLONE of the current one — ambient context
     (tags, user, contexts) is inherited, and mutations made inside the block
     are isolated to it (Sentry 2.x fork semantics). The current scope is
-    replaced with a fresh one for the block's duration. A `with` block, never a
-    decorator (see `WithOnly`).
+    replaced with a fresh one for the block's duration. As a decorator it serves
+    a plain function only (see `WithOrSyncDecorator`).
     """
-    return _WithOnly(
+    return _WithOrSyncDecorator(
         "isolation_scope",
         _isolation_scope(),
         "Open it inside the function: `with wardex.isolation_scope():`.",
@@ -494,9 +494,9 @@ def _isolation_scope() -> _Iterator[Scope]:
 
 
 def new_scope() -> _AbstractContextManager[Scope]:
-    """Fork the current scope for the block, then restore it. A `with` block,
-    never a decorator (see `WithOnly`)."""
-    return _WithOnly(
+    """Fork the current scope for the block, then restore it. As a decorator it
+    serves a plain function only (see `WithOrSyncDecorator`)."""
+    return _WithOrSyncDecorator(
         "new_scope", _new_scope(), "Open it inside the function: `with wardex.new_scope():`."
     )
 
