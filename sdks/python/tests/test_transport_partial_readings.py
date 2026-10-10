@@ -629,7 +629,7 @@ def _ws_session_ended_by(client, ending: str, *, client_closed: bool = False):
     elif ending == "uninstall":
         ByteSeamInterceptor.uninstall(seam)  # the real one; the harness stubs it out
     else:  # the connection table is full and this session is its oldest entry
-        seam._limits = {**seam._limits, "max_connections": 0}
+        seam._limits = {**seam._limits, "max_connections": 1}
         seam._state(SimpleNamespace(getpeername=lambda: ("203.0.113.10", 443)))
     (span,) = client.spans
     return span
