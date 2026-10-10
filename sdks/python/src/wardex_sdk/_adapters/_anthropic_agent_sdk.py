@@ -38,7 +38,7 @@ import json
 import os
 import threading
 import time
-from collections.abc import Awaitable, Mapping
+from collections.abc import Mapping
 from dataclasses import replace
 from functools import partial
 from typing import TYPE_CHECKING, Any
@@ -63,7 +63,7 @@ from ._assembler import SessionAssembler
 from ._base import AdapterInterface
 from ._context import AdapterContext, Fallback, Observer, Placement, Scope
 from ._hook_reach import HookReach
-from ._session_outcome import reader_stopped
+from ._session_end import SessionEnd
 from ._session_state import _BridgeBinding
 
 if TYPE_CHECKING:
@@ -435,7 +435,7 @@ def _read_tee(adapter: AnthropicAgentSdkAdapter, key: int, inner: Any):
     is legal here for three measured reasons: `_read_messages` does not re-enter `read_messages`,
     there is one reader task per Query, and that task is cancelled and awaited at close — so the
     deliberately unbalanced `set()` cannot outlive the unit it names. That cancel is no failure
-    (`reader_stopped`), and what it means for the session is `_reader_ended`'s call.
+    (`reader_stopped`), and what it means for the session is `SessionEnd.reader_ended`'s call.
     """
     pinnable = inspect.isasyncgen(inner)
 
@@ -450,7 +450,7 @@ def _read_tee(adapter: AnthropicAgentSdkAdapter, key: int, inner: Any):
                 yield msg
         except BaseException as exc:
             with adapter._guard("adapters.anthropic.transport_error"):
-                adapter._reader_ended(key, exc)
+                adapter._end.reader_ended(key, exc)
             raise
 
     return gen()
@@ -471,6 +471,8 @@ class AnthropicAgentSdkAdapter(AdapterInterface):
         self._names = McpToolCatalog()
         # Whether each session's handshake carried the hooks above (see `_hook_reach`).
         self._hooks = HookReach(_WARDEX_HOOK_EVENTS)
+        # Where each session ends: its reader, its transport's close, or late (see `_session_end`).
+        self._end = SessionEnd(self)
         # The OTel bridge receiver — built in `install()` iff the adapter's
         # own options say `otel_bridge=True` (the first real consumer of
         # `ctx.options`). None keeps every bridge branch dead.
@@ -562,7 +564,7 @@ class AnthropicAgentSdkAdapter(AdapterInterface):
         """Wait for the CLI's final export — bounded, async, and only when
         there is something to wait FOR.
 
-        The drain's whole budget lives HERE, in the transport's own async close (`_close_session`),
+        The drain's whole budget lives HERE, in the transport's own async close (`SessionEnd`),
         AFTER the SDK's close has ended the CLI's stdin and before `_on_close` merges. It is
         structurally absent from every sync teardown: `close_all_sessions` (atexit, signal,
         uninstall) never waits, so the bridge cannot grow those paths' flush budgets — the property
@@ -575,6 +577,10 @@ class AnthropicAgentSdkAdapter(AdapterInterface):
         if plan is None:
             return
         trace_hex, session_id = plan
+        # anyio's sleep, not asyncio's: the SDK runs on either backend, and under trio
+        # `asyncio.sleep` raises instead of waiting. anyio is the SDK's own dependency.
+        from anyio import sleep
+
         deadline = time.monotonic() + self._drain_seconds
         while time.monotonic() < deadline:
             last = None
@@ -583,37 +589,7 @@ class AnthropicAgentSdkAdapter(AdapterInterface):
                 last = bridge.last_arrival(trace_hex, session_id) if bridge else None
             if last is not None and time.monotonic() - last >= _DRAIN_QUIET_S:
                 return
-            await asyncio.sleep(_DRAIN_POLL_S)
-
-    async def _close_session(self, key: int, closing: Awaitable[Any]) -> Any:
-        """The transport's own close, then the drain, then the merge — in that order, every time.
-
-        The SDK's close ends the CLI's stdin, which is what makes the CLI flush its last OTel
-        export; merged before it, a session missed that batch, left in a receiver slot no session
-        takes. The merge sits in a `finally` of both: a raising close or a cancelled drain ends it.
-        """
-        try:
-            return await closing
-        finally:
-            try:
-                await self._drain_bridge(key)
-            finally:
-                with self._guard("adapters.anthropic.transport_close"):
-                    self._on_close(key, None)
-
-    def _reader_ended(self, key: int, exc: BaseException) -> None:
-        """The tee's reader stopped (no failure, `reader_stopped`) or failed (an error root).
-
-        A STOPPED reader of a bridge session closes nothing: `ClaudeSDKClient.disconnect()` cancels
-        its reader before closing its transport, the CLI's last export leaves during that close, and
-        `Query.close()` always runs it next — `_close_session` closes the session then.
-        """
-        stopped = reader_stopped(exc)
-        assembler = self._assembler
-        if stopped and self._bridge is not None and assembler is not None:
-            if assembler.bridge_route(key) is not None:
-                return
-        self._on_close(key, None if stopped else repr(exc))
+            await sleep(_DRAIN_POLL_S)
 
     def _on_inbound(self, key: int, msg: dict) -> None:
         if self._assembler is not None:
@@ -704,6 +680,8 @@ class AnthropicAgentSdkAdapter(AdapterInterface):
                     "not start, so the bridge is off for this process (fail-open)",
                     key="adapters.anthropic_agent_sdk.otel_bridge.receiver_failed",
                 )
+            else:
+                self._bridge.on_tick = self._end.reap  # ends sessions whose close never came
         self._assembler = SessionAssembler(
             client,
             # The context's registry, so the adapter and its assembler share ONE
@@ -764,9 +742,9 @@ class AnthropicAgentSdkAdapter(AdapterInterface):
 
         async def close(self):  # noqa: ANN001
             # The drain, and ONLY here (plus the tee's close, the same seam for user transports),
-            # after the SDK's own close: see `_close_session`. A reader that FAILED does not drain —
+            # after the SDK's own close: see `SessionEnd`. A reader that FAILED does not drain —
             # the transport already broke, and the merge uses whatever arrived.
-            return await adapter._close_session(id(self), orig_close(self))
+            return await adapter._end.transport_closed(id(self), orig_close(self))
 
         self._patches.patch(cls, "write", write)
         self._patches.patch(cls, "read_messages", read_messages)
@@ -859,6 +837,7 @@ class AnthropicAgentSdkAdapter(AdapterInterface):
         self._patches._at_fork_reinit()
         self._names._at_fork_reinit()
         self._hooks._at_fork_reinit()
+        self._end._at_fork_reinit()
         bridge = self._bridge
         self._bridge = None
         assembler = self._assembler
@@ -881,6 +860,7 @@ class AnthropicAgentSdkAdapter(AdapterInterface):
         self._patches.restore_all()
         self._names.clear()
         self._hooks.clear()
+        self._end.clear()
         # Latch first, drain second. Every callback into this adapter gates on `self._assembler is
         # not None`, so nulling it before the drain leaves a straggler — a read already in flight on
         # the reader task — no session table to open a fresh root in. Draining first would leave
@@ -941,4 +921,4 @@ class _TransportTee:
     async def close(self):
         # The same seam as the class patch: a user transport that spawned a CLI with our env still
         # deserves its final batch.
-        return await self._adapter._close_session(id(self._inner), self._inner.close())
+        return await self._adapter._end.transport_closed(id(self._inner), self._inner.close())

@@ -1715,11 +1715,11 @@ async def _sdk_close_ok() -> None:
 def test_a_stopped_reader_leaves_a_bridge_session_to_the_transport_close(receiver):
     adapter, client = _bridge_session(receiver)
 
-    adapter._reader_ended(1, asyncio.CancelledError())
+    adapter._end.reader_ended(1, asyncio.CancelledError())
     assert adapter._assembler.unit_for(1) is not None, "merged before the CLI's last export"
     assert client.spans == []
 
-    asyncio.run(adapter._close_session(1, _sdk_close_ok()))
+    asyncio.run(adapter._end.transport_closed(1, _sdk_close_ok()))
     assert _named(client.spans, "invoke_agent").status is not StatusCode.ERROR
     assert adapter._assembler.unit_for(1) is None
 
@@ -1732,7 +1732,7 @@ def test_a_stopped_reader_still_closes_a_session_without_the_bridge():
     _outbound(adapter._assembler, 1)
     adapter._assembler.on_inbound(1, INIT)
 
-    adapter._reader_ended(1, asyncio.CancelledError())
+    adapter._end.reader_ended(1, asyncio.CancelledError())
     assert _named(client.spans, "invoke_agent").status is not StatusCode.ERROR
 
 
@@ -1740,7 +1740,7 @@ def test_a_failed_reader_closes_a_bridge_session_at_once_as_an_error(receiver):
     """A broken pipe is not a stop: the session ends there, with what arrived."""
     adapter, client = _bridge_session(receiver)
 
-    adapter._reader_ended(1, OSError("pipe closed"))
+    adapter._end.reader_ended(1, OSError("pipe closed"))
     assert _named(client.spans, "invoke_agent").status is StatusCode.ERROR
 
 
@@ -1752,6 +1752,183 @@ def test_a_raising_sdk_close_still_drains_and_merges(receiver):
         raise OSError("the CLI would not die")
 
     with pytest.raises(OSError, match="would not die"):
-        asyncio.run(adapter._close_session(1, sdk_close_fails()))
+        asyncio.run(adapter._end.transport_closed(1, sdk_close_fails()))
     assert _named(client.spans, "execute_step hook")  # merged anyway
     assert adapter._assembler.unit_for(1) is None
+
+
+def test_a_stopped_reader_with_no_bridge_binding_ends_at_once_with_the_receiver_on(receiver):
+    """Only a session the bridge is bound to waits for its transport's close.
+    One the injection never reached — the user's own telemetry won, say — has
+    no export to wait for, so its stop ends it then and there."""
+    adapter = _adapter_with(receiver)
+    client = FakeClient()
+    adapter._assembler = SessionAssembler(client, bridge=receiver)
+    _outbound(adapter._assembler, 1)  # no binding
+    adapter._assembler.on_inbound(1, INIT)
+
+    adapter._end.reader_ended(1, asyncio.CancelledError())
+    assert _named(client.spans, "invoke_agent")
+    assert adapter._end._due == {}
+
+
+def test_a_session_whose_close_never_comes_is_ended_late_not_never(receiver, monkeypatch):
+    """A host that drops a client without `disconnect()` stops its reader at
+    loop teardown and never closes the transport. The session must not wait
+    for that close forever, holding its receiver slot: past the handover
+    window the reaper ends it, once, and counts it."""
+    from wardex_sdk._adapters import _session_end
+
+    adapter, client = _bridge_session(receiver)
+    adapter._end.reader_ended(1, asyncio.CancelledError())
+    adapter._end.reap()
+    assert client.spans == [], "the handover window had not passed yet"
+
+    monkeypatch.setattr(_session_end, "_HANDOFF_S", 0.0)
+    adapter._end._due[1] = 0.0  # the deadline the reader's stop would have set, already past
+    adapter._end.reap()
+    assert _named(client.spans, "invoke_agent")
+    assert counters.get("adapters.anthropic.otel_bridge.session_ended_late") == 1
+    assert (receiver._by_trace, receiver._by_session_id) == ({}, {})
+
+    shipped = len(client.spans)
+    asyncio.run(adapter._end.transport_closed(1, _sdk_close_ok()))  # the close, after all
+    adapter._end.reap()
+    assert len(client.spans) == shipped, "a session ended twice"
+
+
+async def _client_without_disconnect() -> None:
+    client = claude_agent_sdk.ClaudeSDKClient()
+    await client.connect()
+    await client.query("hi")
+    async for _ in client.receive_response():
+        pass
+    # No disconnect(): the loop's teardown cancels the SDK's reader, and no close follows.
+
+
+def test_the_receiver_reaps_a_session_whose_host_never_disconnected(monkeypatch):
+    """The same, end to end: the real serve loop's tick is what ends it."""
+    from wardex_sdk._adapters import _session_end
+
+    for key in [
+        k for k in os.environ if k.startswith("OTEL_") or k == "CLAUDE_CODE_ENABLE_TELEMETRY"
+    ]:
+        monkeypatch.delenv(key)
+    monkeypatch.setattr(_session_end, "_HANDOFF_S", 0.1)
+    with (
+        installed_adapter(AnthropicAgentSdkAdapter, client=_bridge_client()) as live,
+        cli_double(monkeypatch),
+    ):
+        receiver = live.adapter._bridge
+        asyncio.run(_client_without_disconnect())
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and not any(s.name == "invoke_agent" for s in live.spans):
+            time.sleep(0.05)
+        spans = list(live.spans)
+        unclaimed = (dict(receiver._by_trace), dict(receiver._by_session_id))
+        late = counters.get("adapters.anthropic.otel_bridge.session_ended_late")
+
+    assert _named(spans, "invoke_agent"), "the session waited for a close that never came"
+    assert unclaimed == ({}, {})
+    assert late == 1
+
+
+class _Suspend:
+    def __await__(self):  # noqa: ANN204
+        yield
+
+
+async def _sdk_close_that_never_finishes() -> None:
+    await _Suspend()
+
+
+def test_a_close_dropped_mid_way_still_ends_the_session(receiver):
+    """A close the event loop abandons (the coroutine is closed while the SDK's
+    own close is still waiting) cannot await the drain, and must not leave the
+    session open: it ends there, with what arrived."""
+    adapter, client = _bridge_session(receiver)
+    assert _post(receiver, _one_span_body()) == 200
+    drained = []
+
+    async def drain_that_waits(key):  # noqa: ANN001, ANN202
+        drained.append(key)
+        await _Suspend()  # what a real drain does while the export is still arriving
+
+    adapter._drain_bridge = drain_that_waits
+    closing = adapter._end.transport_closed(1, _sdk_close_that_never_finishes())
+    closing.send(None)  # suspended inside the SDK's close
+    assert client.spans == []
+
+    closing.close()  # GeneratorExit, as when the loop drops the task: must not await, or raise
+    assert _named(client.spans, "invoke_agent")
+    assert _named(client.spans, "execute_step hook")  # merged with what had arrived
+    assert drained == [], "a dropped coroutine may not await"
+    assert adapter._end._due == {}
+
+
+def test_a_failing_drain_never_reaches_the_host(receiver):
+    """The drain is wardex's: whatever it raises is counted, and the host's
+    close returns as if it had not run — with the session ended all the same."""
+    adapter, client = _bridge_session(receiver)
+
+    async def drain_fails(key):  # noqa: ANN001, ANN202
+        raise RuntimeError("no running event loop")
+
+    adapter._drain_bridge = drain_fails
+
+    async def sdk_close() -> str:
+        return "closed"
+
+    assert asyncio.run(adapter._end.transport_closed(1, sdk_close())) == "closed"
+    assert _named(client.spans, "invoke_agent")
+    assert counters.get("adapters.anthropic.otel_bridge_drain") == 1
+
+
+def test_the_drain_waits_through_anyio_so_a_trio_host_is_never_broken(receiver, monkeypatch):
+    """The SDK runs on trio as well as asyncio, through anyio. The drain used
+    asyncio's sleep, which raises under trio, into the host's `disconnect()`.
+    It must wait through anyio's, which works on whichever backend is running.
+    (trio itself is not a test dependency; asyncio's sleep is made to fail the
+    way it does under trio instead.)"""
+    import anyio as anyio_module
+
+    adapter, _ = _bridge_session(receiver)
+    adapter._drain_seconds = 5.0
+    assert _post(receiver, _one_span_body()) == 200
+    real_sleep = asyncio.sleep
+    waited = []
+
+    async def anyio_sleep(delay):  # noqa: ANN001, ANN202
+        waited.append(delay)
+        await real_sleep(0.05)
+
+    async def asyncio_sleep_as_under_trio(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202
+        raise RuntimeError("no running event loop")
+
+    monkeypatch.setattr(anyio_module, "sleep", anyio_sleep)
+    monkeypatch.setattr(asyncio, "sleep", asyncio_sleep_as_under_trio)
+    asyncio.run(adapter._drain_bridge(1))
+    assert waited, "the drain never waited at all"
+
+
+def test_a_close_dropped_during_its_drain_waits_only_the_drain_budget(receiver):
+    """Once the SDK's own close has returned, only the drain is left, so a
+    close dropped there is reaped on the drain's budget, not the SDK's."""
+    from wardex_sdk._adapters import _session_end
+
+    adapter, client = _bridge_session(receiver)
+    adapter._drain_seconds = 0.2
+
+    async def drain_that_waits(key):  # noqa: ANN001, ANN202
+        await _Suspend()
+
+    adapter._drain_bridge = drain_that_waits
+    closing = adapter._end.transport_closed(1, _sdk_close_ok())
+    closing.send(None)  # the SDK's close returned; suspended in the drain
+    remaining = adapter._end._due[1] - time.monotonic()
+    assert remaining <= 0.2 + _session_end._HANDOFF_S
+    assert client.spans == []
+
+    closing.close()  # dropped inside the drain: still ends the session
+    assert _named(client.spans, "invoke_agent")
+    assert adapter._end._due == {}
