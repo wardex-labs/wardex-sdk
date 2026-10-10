@@ -117,13 +117,25 @@ def report_transport_raised(call: str, exc: BaseException, *, debug: bool) -> No
         key=counter,
     )
     if debug:
-        # Rendering `exc` runs host code -- its `__str__`, the `__format__` of whatever that
-        # returns, its class's `__name__` -- and any of it may raise. The whole line is built
-        # inside the guard, so none of that can reach the host's flush() or close().
-        line = f"transport {call} failed (an error whose text could not be rendered)"
-        with guard("client.transport.error_unprintable"):
-            line = f"transport {call} failed ({exc})"
-        diag_warning(line)
+        debug_host_error(
+            f"transport {call} failed", exc, unprintable="client.transport.error_unprintable"
+        )
+
+
+def debug_host_error(head: str, exc: BaseException, *, unprintable: str) -> None:
+    """Say `<head> (<exc>)` on the debug channel, where `exc` came from host code.
+
+    Rendering `exc` runs host code too -- its `__str__`, the `__format__` of whatever that
+    returns, its class's `__name__` -- and any of it may raise. The whole line is built inside
+    the guard, so none of that can reach the caller: a host's own flush() or close(), a
+    transport's export(), which is documented never to raise, or the background worker's loop,
+    which an escaping raise used to end. A line that cannot be rendered is replaced by a fixed
+    one and counted under `unprintable`. The caller checks its own debug setting first.
+    """
+    line = f"{head} (an error whose text could not be rendered)"
+    with guard(unprintable):
+        line = f"{head} ({exc})"
+    diag_warning(line)
 
 
 def report_worker_pass_raised(name: str) -> None:

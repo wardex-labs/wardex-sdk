@@ -515,6 +515,77 @@ def test_text_that_cannot_be_formatted_cannot_reach_the_host_either(capsys):
     assert "transport flush failed (text)" in capsys.readouterr().err
 
 
+class _Unprintable(Exception):
+    """An error whose text cannot be rendered: an ORM error over a detached
+    session, an httpx error over an unread response."""
+
+    def __str__(self) -> str:
+        raise RuntimeError("detached session")
+
+
+def test_a_raising_error_message_cannot_stop_the_background_worker(capsys):
+    """With debug on, the worker rendered the pass's error outside any guard.
+    A raise there left `_run`'s loop and ended the thread, so periodic drains
+    stopped until some later capture happened to revive it."""
+    passes: list[int] = []
+
+    def drain() -> None:
+        passes.append(1)
+        raise _Unprintable()
+
+    worker = BatchWorker(drain, interval=0.01, debug=True)
+    worker.ensure_alive()
+    try:
+        deadline = time.monotonic() + 5.0
+        while len(passes) < 3 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert len(passes) >= 3, "the worker stopped draining after an unprintable error"
+        assert worker._thread is not None and worker._thread.is_alive()
+    finally:
+        worker.stop()
+    err = capsys.readouterr().err
+    assert "background flush failed (an error whose text could not be rendered)" in err
+    assert counters.get("worker.error_unprintable") >= 1
+
+
+@pytest.mark.parametrize(
+    ("make", "head", "failed", "unprintable"),
+    [
+        (
+            lambda: OtlpHttpTransport(endpoint="http://r.invalid/v1/traces", debug=True),
+            "OTLP export failed",
+            "transport.otlp.export_failed",
+            "transport.otlp.error_unprintable",
+        ),
+        (
+            lambda: WardexTransport("http://r.invalid", KEY, debug=True),
+            "wardex export failed",
+            "transport.wardex.export_failed",
+            "transport.wardex.error_unprintable",
+        ),
+    ],
+    ids=["otlp", "wardex"],
+)
+def test_a_raising_error_message_cannot_escape_a_transport_export(
+    capsys, monkeypatch, make, head, failed, unprintable
+):
+    """With debug on, each transport rendered the failed POST's error outside
+    any guard, so `export()` -- documented never to raise -- raised it."""
+
+    def fail(req, timeout=None):
+        raise _Unprintable()
+
+    monkeypatch.setattr(urllib.request, "urlopen", fail)
+    transport = make()
+    capsys.readouterr()
+    assert transport.export(_envelope()) is None  # must not raise
+    err = capsys.readouterr().err
+
+    assert counters.get(failed) == 1
+    assert f"{head} (an error whose text could not be rendered)" in err
+    assert counters.get(unprintable) == 1
+
+
 def test_a_transport_close_that_raises_is_counted_and_said_once(capsys):
     client = _client(_CloseRaises())
     client.capture_span(_span())
