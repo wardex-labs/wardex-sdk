@@ -56,6 +56,22 @@ pub(crate) static BUILTINS: &[PatternDef] = &[
         replacement: Replacement::Label("[PHONE]"),
         retry_on_reject: false,
     },
+    // South Korean mobile numbers: `010`, and the `011` and `016`-`019`
+    // prefixes still in service. A four-digit middle group may run on
+    // without separators (`01024817730` is how forms and databases keep
+    // one); a three-digit middle, which only older numbers have, needs both
+    // separators, since a bare ten-digit run is an id far more often than a
+    // number. `+82` drops the leading `0`, which some people write back as
+    // `0` or `(0)`. The boundaries are ASCII ones, so a Korean particle
+    // written straight after the number (`010-2481-7730으로`) still ends it
+    // while a longer run of digits or letters does not.
+    PatternDef {
+        category: "phone_number",
+        regex: r"(?:\+82[ .-]?(?:\(0\)[ .-]?|0)?|(?-u:\b)0)1[016789](?:[ .-]?[0-9]{4}[ .-]?|[ .-][0-9]{3}[ .-])[0-9]{4}(?-u:\b)",
+        validator: None,
+        replacement: Replacement::Label("[PHONE]"),
+        retry_on_reject: false,
+    },
     PatternDef {
         category: "credit_card",
         regex: r"\b[0-9](?:[ -]?[0-9]){12,18}\b",

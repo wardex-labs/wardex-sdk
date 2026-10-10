@@ -574,6 +574,72 @@ mod tests {
         }
     }
 
+    #[test]
+    fn masks_south_korean_mobile_numbers() {
+        for (text, masked) in [
+            ("연락처 010-2481-7730", "연락처 [PHONE]"),
+            ("010-2481-7730으로 연락주세요", "[PHONE]으로 연락주세요"),
+            ("번호:010-2481-7730.", "번호:[PHONE]."),
+            ("phone 01024817730", "phone [PHONE]"),
+            ("phone 010 2481 7730", "phone [PHONE]"),
+            ("phone 010.2481.7730", "phone [PHONE]"),
+            ("call +82 10-2481-7730", "call [PHONE]"),
+            ("call +82-10-2481-7730", "call [PHONE]"),
+            ("call +821024817730", "call [PHONE]"),
+            ("call +82 010-2481-7730", "call [PHONE]"),
+            ("call +82 (0)10-2481-7730", "call [PHONE]"),
+            ("legacy 011-234-5678", "legacy [PHONE]"),
+            ("legacy 016-2345-6789", "legacy [PHONE]"),
+            ("legacy 019 234 5678", "legacy [PHONE]"),
+            (r#"{"phone": "01024817730"}"#, r#"{"phone": "[PHONE]"}"#),
+            ("ONCALL_PHONE=010-2481-7730\n", "ONCALL_PHONE=[PHONE]\n"),
+        ] {
+            let mut r = Report::default();
+            assert_eq!(
+                engine().mask_text_into(text, &mut r).as_deref(),
+                Some(masked),
+                "{text}"
+            );
+            assert_eq!(r.rules, vec![Rule::PhoneNumber], "{text}");
+        }
+    }
+
+    #[test]
+    fn digit_runs_that_are_not_korean_mobile_numbers_are_kept() {
+        for text in [
+            "date 2026-10-10",
+            "ts 2026-10-10T01:01:01Z",
+            "order 1234567890",
+            "version 1.2.3.4.5",
+            "build 2010.1234.5678",
+            // Ten digits under 010 with no separators: no number has that.
+            "id 0101234567",
+            // A three-digit middle runs on only as an id.
+            "id 0112345678",
+            // The number inside a longer run of digits or letters.
+            "id 010-2481-77301",
+            "id 1010-2481-7730",
+            "id a01024817730",
+            "id 01024817730_x",
+            "uuid 01012345-6789-0123-4567-890123456789",
+            // Not a mobile prefix.
+            "landline 02-2481-7730",
+            "prefix 012-2481-7730",
+        ] {
+            let mut r = Report::default();
+            engine().mask_text_into(text, &mut r);
+            assert!(!r.rules.contains(&Rule::PhoneNumber), "{text}: {r:?}");
+        }
+    }
+
+    /// Only North American and South Korean mobile numbers are phone
+    /// numbers to the rules; the documentation lists every other format as
+    /// a limit. If this starts being masked, the documentation changes too.
+    #[test]
+    fn a_phone_number_in_another_format_is_a_documented_limit() {
+        assert_eq!(engine().mask_text("call +44 20 7946 0958"), None);
+    }
+
     // --- overlap / determinism / idempotency (§5.2) ---
 
     #[test]
