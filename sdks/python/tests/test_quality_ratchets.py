@@ -288,7 +288,7 @@ _OVERSIZED_BUDGET = {
     "_adapters/_openai_agents.py": 1465,
     "_client.py": 1581,
     "_adapters/_context.py": 1305,
-    "_interceptors/_seam.py": 1181,
+    "_interceptors/_seam.py": 1180,
     "_adapters/_langgraph.py": 1035,
     # Raised by exactly one member (h2_request_evicted, 53): the closed
     # Limitation enum cannot move a member out, and the census demands each

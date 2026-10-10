@@ -1353,6 +1353,9 @@ _UNRESOLVED_PY: frozenset[tuple[str, str]] = frozenset(
         ("_interceptors/_trackers.py", "Call:list"),
         ("_interceptors/_trackers.py", "Call:tuple"),
         ("_interceptors/_trackers.py", "Tuple"),
+        # `_Txn`'s two marker fields default to the empty tuple
+        # (`limitations: ... = ()`, `ws_markers: ... = ()`): no marker value.
+        ("_interceptors/_txn.py", "Tuple"),
         # The conformance suite READS markers off spans that have already
         # shipped; it never builds a draft and never reaches a sink, so neither
         # of these slots can put a value on a span. `harness.py`'s

@@ -1,8 +1,8 @@
 """gRPC semantics — framing and trailer status mapped onto span fields.
 
 Pure functions over a transaction the byte seam already parsed. The transaction
-is typed `Any` rather than `interceptors._trackers._Txn`: naming that record
-here would be an import from a sibling observer package, which is the one edge
+is typed `Any` rather than `interceptors._txn._Txn`: naming that record here
+would be an import from a sibling observer package, which is the one edge
 this package's layering forbids (see `_semantics/__init__.py`). What is actually
 required of it is structural — `method`, `path`, `status`, `request_body`,
 `response_body`, `grpc_status`, `grpc_message` — and the call site is the byte

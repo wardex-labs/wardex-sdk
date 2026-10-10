@@ -62,7 +62,8 @@ from ._base import InterceptorInterface
 from ._close_hook import install_shared_close_hook, on_close, uninstall_shared_close_hook
 from ._conn_timing import install_shared_timing, opening_timing, uninstall_shared_timing
 from ._peer import UNRESOLVED_HOST, UNRESOLVED_PORT, peer_address, placeholder_host
-from ._trackers import _Txn, _url_target, _WebSocketTracker
+from ._trackers import _WebSocketTracker
+from ._txn import _Txn, _url_target
 
 if TYPE_CHECKING:
     from .._client import Client
@@ -80,19 +81,17 @@ if TYPE_CHECKING:
 # INVARIANT — settled for the life of the connection, so `_capture_possible` answers them in the
 # patch wrapper, before the send/recv buffer is copied and before a single byte reaches a tracker:
 #
-#   * no client on this seam. Both emit paths already returned on a `None`
-#     client, so nothing behind one was ever going to become a span — but the
-#     bodies were still accumulated in a tracker that is kept for the life of
-#     the connection, which is memory held for an output that cannot exist.
-#   * the self-exclusion flag. The exporter's own POST, which must never be
-#     re-captured whatever else is true.
-#   * a connection the sniff-latch already classified "ignore". `_gate` is
-#     latched once, from the first bytes, and never re-decided — so a
-#     TLS-backed Redis, Postgres or Kafka connection is settled for its whole
-#     life, and every call on one was still materializing its buffer
-#     (`bytes(data)`, a real copy whenever the caller passes a memoryview or a
-#     bytearray, which is the shape the asyncio and httpx paths use) to
-#     re-derive a verdict that was reached on the first write.
+#   * no client on this seam. Both emit paths already returned on a `None` client, so nothing behind
+#     one was ever going to become a span — but the bodies were still accumulated in a tracker that
+#     is kept for the life of the connection, which is memory held for an output that cannot exist.
+#   * the self-exclusion flag. The exporter's own POST, which must never be re-captured whatever
+#     else is true.
+#   * a connection the sniff-latch already classified "ignore". `_gate` is latched once, from the
+#     first bytes, and never re-decided — so a TLS-backed Redis, Postgres or Kafka connection is
+#     settled for its whole life, and every call on one was still materializing its buffer
+#     (`bytes(data)`, a real copy whenever the caller passes a memoryview or a bytearray, which is
+#     the shape the asyncio and httpx paths use) to re-derive a verdict that was reached on the
+#     first write.
 #
 # CONTEXT-DEPENDENT — an answer about ONE transaction, and only ever correct for the instant it was
 # asked, so they live in the module `_should_capture` on the response side: the shared policy's
