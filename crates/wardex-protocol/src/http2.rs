@@ -12,8 +12,18 @@ pub struct Http2Frame {
 
 /// Incremental decoder that accumulates bytes for one direction and carves out completed frames.
 /// (The connection preface is stripped beforehand by Http2Connection.)
+///
+/// Holds at most one frame plus the read it arrived in: the 24-bit length
+/// field caps a frame at 16 MiB + 9 bytes, so that is the decoder's own bound.
 pub struct Http2FrameDecoder {
     buf: Vec<u8>,
+    /// Read cursor into `buf`: bytes before it belong to frames already
+    /// carved. The prefix is dropped once per `feed`, not once per frame, so a
+    /// read of many small frames costs one pass over it rather than one
+    /// memmove of the rest of the read per frame.
+    pos: usize,
+    /// Bytes copied into `buf` or relocated inside it — see `bytes_moved`.
+    moved: u64,
 }
 
 impl Default for Http2FrameDecoder {
@@ -24,42 +34,81 @@ impl Default for Http2FrameDecoder {
 
 impl Http2FrameDecoder {
     pub fn new() -> Self {
-        Self { buf: Vec::new() }
+        Self {
+            buf: Vec::new(),
+            pos: 0,
+            moved: 0,
+        }
     }
 
     pub fn feed(&mut self, data: &[u8]) -> Vec<Http2Frame> {
         self.buf.extend_from_slice(data);
+        self.moved += data.len() as u64;
         let mut out = Vec::new();
         loop {
-            if self.buf.len() < 9 {
+            let buf = &self.buf[self.pos..];
+            if buf.len() < 9 {
                 break;
             }
-            let length = ((self.buf[0] as usize) << 16)
-                | ((self.buf[1] as usize) << 8)
-                | (self.buf[2] as usize);
+            let length = ((buf[0] as usize) << 16) | ((buf[1] as usize) << 8) | (buf[2] as usize);
             let total = 9 + length;
-            if self.buf.len() < total {
+            if buf.len() < total {
                 break;
             }
-            let frame_type = self.buf[3];
-            let flags = self.buf[4];
-            let stream_id = (((self.buf[5] & 0x7f) as u32) << 24)
-                | ((self.buf[6] as u32) << 16)
-                | ((self.buf[7] as u32) << 8)
-                | (self.buf[8] as u32);
-            let payload = self.buf[9..total].to_vec();
+            let frame_type = buf[3];
+            let flags = buf[4];
+            let stream_id = (((buf[5] & 0x7f) as u32) << 24)
+                | ((buf[6] as u32) << 16)
+                | ((buf[7] as u32) << 8)
+                | (buf[8] as u32);
+            let payload = buf[9..total].to_vec();
             out.push(Http2Frame {
                 frame_type,
                 flags,
                 stream_id,
                 payload,
             });
-            self.buf.drain(..total);
+            self.pos += total;
         }
+        self.compact();
         out
+    }
+
+    /// Bytes copied into the buffer or relocated inside it, counted since
+    /// construction: every fed byte once on arrival, plus the residue a
+    /// compaction moves to the front. What a compaction moves is the start of
+    /// one frame still incomplete, and no compaction runs again until that
+    /// frame is carved, so each byte moves at most once and the count stays
+    /// under twice the input. Dropping each carved frame from the front of the
+    /// buffer instead moves the rest of the read once per frame, and that is
+    /// what this count exists to catch.
+    pub fn bytes_moved(&self) -> u64 {
+        self.moved
+    }
+
+    /// Releases the buffer for good: the connection latched off and will
+    /// never carve another frame.
+    fn release(&mut self) {
+        self.buf = Vec::new();
+        self.pos = 0;
+    }
+
+    /// Drops the consumed prefix, once per `feed`.
+    fn compact(&mut self) {
+        if self.pos == 0 {
+            return;
+        }
+        if self.pos >= self.buf.len() {
+            self.buf.clear();
+        } else {
+            self.moved += (self.buf.len() - self.pos) as u64;
+            self.buf.drain(..self.pos);
+        }
+        self.pos = 0;
     }
 }
 
+use fluke_hpack::decoder::DecoderError;
 use fluke_hpack::Decoder;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use wardex_limits::Limits;
@@ -76,6 +125,21 @@ const FLAG_PADDED: u8 = 0x8;
 const FLAG_PRIORITY: u8 = 0x20;
 
 const PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+
+/// The largest HPACK dynamic table either decoder accepts, in the size RFC
+/// 7541 section 4.1 defines (name + value + 32 per entry). A peer's encoder
+/// may grow the table only up to the SETTINGS_HEADER_TABLE_SIZE the other
+/// side advertised, and the largest value common peers advertise is 65536
+/// (Chrome and Firefox; HAProxy caps its setting at 65535), sixteen times the
+/// RFC default of 4096 that nghttp2, Go, hyper, Envoy, Netty and Python's h2
+/// use. Without a bound a size update could ask for about 256 MiB — the most
+/// the decoder's integer reaches — per decoder, per connection.
+///
+/// A size update past it fails the block, so the connection latches off with
+/// `hpack_table_size_exceeded`: refusing the update while decoding on would
+/// leave this side's table out of step with the encoder's and corrupt every
+/// later header block on the connection.
+const MAX_HPACK_TABLE_BYTES: usize = 64 * 1024;
 
 /// A completed request/response transaction for one stream.
 pub struct Http2Transaction {
@@ -193,7 +257,16 @@ pub struct Http2Connection {
     /// silent: a later frame for that id recreates it, still flagged as
     /// evicted, so the transaction completes marked (with no status).
     orphans: BTreeMap<u32, StreamState>,
+    /// Header blocks a HEADERS frame opened without END_HEADERS, awaiting
+    /// their CONTINUATION frames. RFC 9113 section 6.10 lets a peer hold one
+    /// such block open at a time, so a conformant connection has at most one
+    /// per direction; the bounds below are for the peer that does not stop.
+    /// Held to `max_streams` blocks and `max_stream_buffer_bytes` bytes in
+    /// all (`pending_bytes`); past either the connection latches off with
+    /// `stream_buffer_exceeded`, the reason the other stream parsers give when
+    /// what they hold awaiting a terminator outgrows the same bound.
     pending: HashMap<u32, Pending>,
+    pending_bytes: usize,
     preface_buf: Vec<u8>,
     preface_seen: bool,
     /// Set once, by the first frame that fails; `feed` is a no-op afterwards.
@@ -240,11 +313,12 @@ impl Http2Connection {
         Self {
             client_frames: Http2FrameDecoder::new(),
             server_frames: Http2FrameDecoder::new(),
-            req_decoder: Decoder::new(),
-            resp_decoder: Decoder::new(),
+            req_decoder: hpack_decoder(),
+            resp_decoder: hpack_decoder(),
             streams: BTreeMap::new(),
             orphans: BTreeMap::new(),
             pending: HashMap::new(),
+            pending_bytes: 0,
             preface_buf: Vec::new(),
             preface_seen: false,
             disabled: None,
@@ -273,22 +347,43 @@ impl Http2Connection {
         if self.disabled.is_some() {
             return result;
         }
-        let frames = if from_client {
+        let frames = if !from_client {
+            self.server_frames.feed(data)
+        } else if self.preface_seen {
+            self.client_frames.feed(data)
+        } else {
             match self.strip_preface(data) {
                 Some(rest) => self.client_frames.feed(&rest),
                 None => return result,
             }
-        } else {
-            self.server_frames.feed(data)
         };
         for frame in frames {
             if let Err(Fail(reason)) = self.handle_frame(from_client, frame, &mut result) {
                 self.disabled = Some(reason);
+                self.release();
                 break;
             }
             self.evict_past_bound();
         }
         result
+    }
+
+    /// Bytes both frame decoders copied into their buffers or relocated
+    /// inside them; see `Http2FrameDecoder::bytes_moved`.
+    pub fn bytes_moved(&self) -> u64 {
+        self.client_frames.bytes_moved() + self.server_frames.bytes_moved()
+    }
+
+    /// Frees what the connection holds once it has latched off: `feed` is a
+    /// no-op from here on, so nothing will ever read it again.
+    fn release(&mut self) {
+        self.client_frames.release();
+        self.server_frames.release();
+        self.pending = HashMap::new();
+        self.pending_bytes = 0;
+        self.streams = BTreeMap::new();
+        self.orphans = BTreeMap::new();
+        self.preface_buf = Vec::new();
     }
 
     /// The table entry for `stream_id`, created if absent. Every path that
@@ -344,10 +439,8 @@ impl Http2Connection {
 
     /// Strips the connection preface (24 bytes) from the client's first bytes. Handles split arrival.
     /// If the bytes don't match the actual preface, pass through immediately (middlebox/test compatibility).
+    /// Only reached until the preface is settled; `feed` hands later bytes to the decoder directly.
     fn strip_preface(&mut self, data: &[u8]) -> Option<Vec<u8>> {
-        if self.preface_seen {
-            return Some(data.to_vec());
-        }
         self.preface_buf.extend_from_slice(data);
         let n = self.preface_buf.len().min(PREFACE.len());
         if self.preface_buf[..n] != PREFACE[..n] {
@@ -383,7 +476,9 @@ impl Http2Connection {
             FRAME_RST_STREAM => {
                 self.streams.remove(&frame.stream_id);
                 self.orphans.remove(&frame.stream_id);
-                self.pending.remove(&frame.stream_id);
+                if let Some(p) = self.pending.remove(&frame.stream_id) {
+                    self.pending_bytes -= p.buf.len();
+                }
                 self.reset.insert(frame.stream_id);
                 let cap = self.limits.max_streams.max(1);
                 while self.reset.len() > cap {
@@ -425,7 +520,7 @@ impl Http2Connection {
         if frame.flags & FLAG_END_HEADERS != 0 {
             self.decode_block(from_client, frame.stream_id, block, end_stream, result)
         } else {
-            self.pending.insert(
+            let replaced = self.pending.insert(
                 frame.stream_id,
                 Pending {
                     from_client,
@@ -433,6 +528,15 @@ impl Http2Connection {
                     buf: block.to_vec(),
                 },
             );
+            if let Some(old) = replaced {
+                self.pending_bytes -= old.buf.len();
+            }
+            self.pending_bytes += block.len();
+            if self.pending.len() > self.limits.max_streams.max(1)
+                || self.pending_bytes > self.limits.max_stream_buffer_bytes
+            {
+                return Err(Fail("stream_buffer_exceeded"));
+            }
             Ok(())
         }
     }
@@ -446,11 +550,18 @@ impl Http2Connection {
             Some(p) => p,
             None => return Err(Fail("continuation_without_headers")),
         };
+        self.pending_bytes -= p.buf.len();
         p.buf.extend_from_slice(&frame.payload);
+        // Checked before the block is decoded too: a header block past the
+        // bound is never handed to HPACK, whichever frame completes it.
+        if self.pending_bytes + p.buf.len() > self.limits.max_stream_buffer_bytes {
+            return Err(Fail("stream_buffer_exceeded"));
+        }
         if frame.flags & FLAG_END_HEADERS != 0 {
             let block = std::mem::take(&mut p.buf);
             self.decode_block(p.from_client, frame.stream_id, &block, p.end_stream, result)
         } else {
+            self.pending_bytes += p.buf.len();
             self.pending.insert(frame.stream_id, p);
             Ok(())
         }
@@ -650,8 +761,17 @@ impl Http2Connection {
 /// One decoded header, name and value, as `fluke-hpack` hands it back.
 type HeaderField = (Vec<u8>, Vec<u8>);
 
-/// HPACK-decode one header block, turning every way it can fail into the one
-/// latch reason.
+/// An HPACK decoder whose dynamic table a size update cannot grow past
+/// `MAX_HPACK_TABLE_BYTES`.
+fn hpack_decoder() -> Decoder<'static> {
+    let mut decoder = Decoder::new();
+    decoder.set_max_allowed_table_size(MAX_HPACK_TABLE_BYTES);
+    decoder
+}
+
+/// HPACK-decode one header block, turning every way it can fail into a latch
+/// reason: `hpack_table_size_exceeded` for a size update past
+/// `MAX_HPACK_TABLE_BYTES`, `hpack_decode_failed` for everything else.
 ///
 /// `fluke-hpack` 0.3 unwraps inside its dynamic-table size update: a `0x3f`
 /// prefix whose integer continues past the end of the block, or continues for
@@ -662,9 +782,11 @@ type HeaderField = (Vec<u8>, Vec<u8>);
 /// and stays off. PUSH_PROMISE blocks go through here too: they feed the same
 /// response decoder, so they reach the same `unwrap`.
 fn hpack_decode(decoder: &mut Decoder<'static>, block: &[u8]) -> Result<Vec<HeaderField>, Fail> {
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| decoder.decode(block)))
-        .map_err(|_| Fail("hpack_decode_failed"))?
-        .map_err(|_| Fail("hpack_decode_failed"))
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| decoder.decode(block))) {
+        Ok(Ok(headers)) => Ok(headers),
+        Ok(Err(DecoderError::InvalidMaxDynamicSize)) => Err(Fail("hpack_table_size_exceeded")),
+        Ok(Err(_)) | Err(_) => Err(Fail("hpack_decode_failed")),
+    }
 }
 
 #[cfg(test)]
@@ -1380,6 +1502,132 @@ mod tests {
                 "the parser must latch off after a panic inside HPACK, payload {payload:?}"
             );
         }
+    }
+
+    #[test]
+    fn open_header_blocks_past_max_streams_latch_off() {
+        // HEADERS without END_HEADERS on five streams, never continued: a
+        // conformant peer holds at most one such block open, and each one used
+        // to stay in the table forever.
+        let limits = Limits {
+            max_streams: 4,
+            ..Default::default()
+        };
+        let mut c = Http2Connection::new(limits);
+        let block = hpack(&[(b":method", b"GET"), (b":path", b"/")]);
+        for (i, sid) in [1u32, 3, 5, 7].iter().enumerate() {
+            c.feed(true, &frame(FRAME_HEADERS, FS, *sid, &block));
+            assert_eq!(c.disabled_reason(), None, "{} open blocks fit", i + 1);
+        }
+        c.feed(true, &frame(FRAME_HEADERS, FS, 9, &block));
+        assert_eq!(c.disabled_reason(), Some("stream_buffer_exceeded"));
+        assert!(
+            c.pending.is_empty() && c.pending_bytes == 0,
+            "a latched connection holds nothing"
+        );
+    }
+
+    #[test]
+    fn a_continuation_chain_past_the_stream_buffer_latches_off() {
+        let limits = Limits {
+            max_stream_buffer_bytes: 1024,
+            ..Default::default()
+        };
+        // Under the bound: a block split across CONTINUATION frames decodes.
+        let mut c = Http2Connection::new(limits);
+        let block = hpack(&[(b":method", b"GET"), (b":path", b"/under")]);
+        let mut req = frame(FRAME_HEADERS, FS, 1, &block[..2]);
+        req.extend_from_slice(&frame(FRAME_CONTINUATION, FH, 1, &block[2..]));
+        assert_eq!(c.feed(true, &req).opened_request_streams, vec![1]);
+        assert_eq!(c.pending_bytes, 0);
+
+        // A chain that never sets END_HEADERS used to grow without bound.
+        let mut c = Http2Connection::new(limits);
+        c.feed(true, &frame(FRAME_HEADERS, FS, 1, &[0x82; 100]));
+        for i in 0..9 {
+            c.feed(true, &frame(FRAME_CONTINUATION, 0, 1, &[0x82; 100]));
+            assert_eq!(c.disabled_reason(), None, "{} bytes held", 200 + 100 * i);
+        }
+        c.feed(true, &frame(FRAME_CONTINUATION, 0, 1, &[0x82; 100]));
+        assert_eq!(c.disabled_reason(), Some("stream_buffer_exceeded"));
+
+        // The bound holds on the frame that would complete the block, too: a
+        // block past it is never handed to HPACK.
+        let mut c = Http2Connection::new(limits);
+        c.feed(true, &frame(FRAME_HEADERS, FS, 1, &[0x82; 1000]));
+        c.feed(true, &frame(FRAME_CONTINUATION, FH, 1, &[0x82; 100]));
+        assert_eq!(c.disabled_reason(), Some("stream_buffer_exceeded"));
+    }
+
+    #[test]
+    fn a_reset_stream_releases_its_open_header_block() {
+        let limits = Limits {
+            max_streams: 1,
+            ..Default::default()
+        };
+        let mut c = Http2Connection::new(limits);
+        let block = hpack(&[(b":method", b"GET"), (b":path", b"/")]);
+        c.feed(true, &frame(FRAME_HEADERS, FS, 1, &block));
+        c.feed(true, &frame(FRAME_RST_STREAM, 0, 1, &[0, 0, 0, 8]));
+        assert_eq!(c.pending_bytes, 0);
+        c.feed(true, &frame(FRAME_HEADERS, FS, 3, &block));
+        assert_eq!(c.disabled_reason(), None);
+    }
+
+    #[test]
+    fn an_hpack_table_size_update_past_the_cap_latches_off() {
+        // `0x3f` opens a dynamic table size update whose 5-bit prefix
+        // saturates; the octets after it carry the rest of the integer. The
+        // block then indexes `:method GET` (0x82), because a block may not end
+        // with a size update.
+        let at_cap = [0x3f, 0xe1, 0xff, 0x03, 0x82]; // 65536
+        let past_cap = [0x3f, 0xe2, 0xff, 0x03, 0x82]; // 65537
+        for from_client in [true, false] {
+            let mut c = Http2Connection::new(Limits::default());
+            c.feed(from_client, &frame(FRAME_HEADERS, FH | FS, 1, &at_cap));
+            assert_eq!(
+                c.disabled_reason(),
+                None,
+                "an update to the cap is accepted"
+            );
+
+            let mut c = Http2Connection::new(Limits::default());
+            c.feed(from_client, &frame(FRAME_HEADERS, FH | FS, 1, &past_cap));
+            assert_eq!(c.disabled_reason(), Some("hpack_table_size_exceeded"));
+        }
+        // The largest update the decoder's integer reaches, about 256 MiB.
+        let mut c = Http2Connection::new(Limits::default());
+        c.feed(
+            false,
+            &frame(FRAME_HEADERS, FH, 1, &[0x3f, 0xff, 0xff, 0xff, 0x7f, 0x82]),
+        );
+        assert_eq!(c.disabled_reason(), Some("hpack_table_size_exceeded"));
+    }
+
+    #[test]
+    fn a_read_of_many_small_frames_is_linear_not_quadratic() {
+        // 256 KiB of 9-byte frames in ONE read: removing each frame from the
+        // front of the buffer moved the rest of the read once per frame,
+        // about 3.8 GB of memmove for this input.
+        let raw = frame(0x6, 0, 0, b"").repeat(256 * 1024 / 9);
+        let mut c = Http2Connection::new(Limits::default());
+        c.feed(false, &raw);
+        assert_eq!(c.disabled_reason(), None);
+        assert!(
+            c.bytes_moved() <= 2 * raw.len() as u64,
+            "moved {} bytes for a {}-byte read",
+            c.bytes_moved(),
+            raw.len()
+        );
+
+        // The client side, preface first, in reads that tear frames apart.
+        let mut stream = PREFACE.to_vec();
+        stream.extend_from_slice(&raw);
+        let mut c = Http2Connection::new(Limits::default());
+        for part in stream.chunks(1000) {
+            c.feed(true, part);
+        }
+        assert!(c.bytes_moved() <= 2 * stream.len() as u64);
     }
 
     #[test]

@@ -1,5 +1,19 @@
+import json
+from collections.abc import Iterator
+
+import pytest
+
+from wardex_sdk._assembly import counters
+from wardex_sdk._assembly._diag import reset_reports_for_test
 from wardex_sdk._enums import CaptureSource, Protocol, SpanKind, StatusCode
 from wardex_sdk._interceptors._mcp_stdio import _ProcState
+
+
+@pytest.fixture
+def _fresh_reports() -> Iterator[None]:
+    reset_reports_for_test()
+    yield
+    reset_reports_for_test()
 
 
 def _drive(req: bytes, resp: bytes):
@@ -182,3 +196,31 @@ def test_a_dead_server_does_not_strand_its_pending_requests():
     assert st.on_stream_end() == 2
     assert st._latch == {}
     assert st.on_stream_end() == 0  # idempotent: EOF can be observed more than once
+
+
+def _call(result: object, *, rid: int = 1) -> tuple[bytes, bytes]:
+    """A `tools/call` of tool `t` and the response carrying `result`, as two lines."""
+    req = {"jsonrpc": "2.0", "id": rid, "method": "tools/call", "params": {"name": "t"}}
+    resp = {"jsonrpc": "2.0", "id": rid, "result": result}
+    return (json.dumps(req) + "\n").encode(), (json.dumps(resp) + "\n").encode()
+
+
+@pytest.mark.usefixtures("fresh_counters", "_fresh_reports")
+def test_a_message_longer_than_the_line_cap_is_counted_and_said_once(capsys):
+    from wardex_sdk import LimitsConfig
+
+    st = _ProcState(limits=LimitsConfig(max_stream_buffer_bytes=128).to_native())
+    big = {"content": [{"type": "text", "text": "x" * 500}]}
+    for rid in (1, 2):
+        req, resp = _call(big, rid=rid)
+        st.feed_request(req)
+        assert st.feed_response(resp) == []
+    assert counters.get("interceptors.mcp_stdio.line_over_cap") == 2
+    assert st.disabled_reason() is None, "a skipped line costs only itself"
+    err = capsys.readouterr().err
+    lines = [line for line in err.splitlines() if "line_over_cap" in line]
+    assert len(lines) == 1 and lines[0].startswith("[wardex] ")
+    # The next call that fits is still captured.
+    req, resp = _call({"content": []}, rid=3)
+    st.feed_request(req)
+    assert len(st.feed_response(resp)) == 1
