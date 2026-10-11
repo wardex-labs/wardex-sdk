@@ -391,6 +391,35 @@ All notable changes to this project are documented here. The format follows
   envelope), each one is counted under `transport.otlp.pii_scrubbed` or
   `transport.wardex.pii_scrubbed`, and one line per process says that masking
   failed and asks for a report.
+- **A conversation id now stays inside its `wardex.conversation(...)` block
+  at every edge of it.** Three edges lost it or leaked it. A trace continued
+  inside a conversation (`continue_trace`, with or without a `traceparent`,
+  or `continue_from_otel`) started from a blank scope, so every span in the
+  request, LLM calls included, shipped with no `gen_ai.conversation.id`; the
+  conversation now carries on, while the trace still starts over as before.
+  Work started inside a block inherits it, so a long-lived worker started
+  inside one request's block now carries that conversation into every trace
+  it continues: `wardex.isolation_scope()` still starts from a blank scope
+  and is the way to step out of a conversation. An async generator that
+  holds a block (or a `continue_trace`, `isolation_scope` or `new_scope`)
+  across a `yield` and is abandoned with `break` (a client that hung up
+  mid-stream) left the dead block's id, and its span as the parent, on every
+  later call the consumer made, because the event loop closes such a
+  generator on a task of its own; with a `continue_trace` it also raised a
+  `ValueError` out of that cleanup task into your logs. The consumer now
+  takes back the scope it had before the block (counted as
+  `tracing.block_scope_retired`): at once when the block is closed on the
+  consumer task's own event loop on Python 3.12 or later (the usual case: an
+  abandoned async generator finalized by its loop), otherwise on its next
+  wardex read, so a thread, a task or a `copy_context()` it takes before that
+  read still carries the dead block's id. A task or callback the block
+  started keeps the block's conversation and parent, as it does when a block
+  ends normally.
+  And an openai-agents trace started inside a block and finished outside it
+  put the block's id back on every later call, while one started outside and
+  finished inside cost the rest of the block its id and its parent and
+  brought the finished trace's group id back after the block; a trace now
+  puts back the scope it found only while its own is still the current one.
 - **An OpenAI Responses stream that fails midway now fails its chat span.**
   A Responses API stream (`responses.create(stream=True)`, the openai-agents
   default) that started with a 200 and then ended in a `response.failed`

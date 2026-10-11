@@ -119,15 +119,27 @@ def retire_fork(fork: Scope, prev: Scope) -> None:
     fork.tracestate = prev.tracestate
 
 
-def restore_scope(prev: Scope) -> None:
-    """Put `prev` back as the current scope. MUST run on the installing task.
+def restore_scope(prev: Scope, fork: Scope) -> None:
+    """Take a pin's `fork` down, putting `prev` back. MUST run on the installing task.
 
     A plain `set()` rather than a Token reset, because `install_span` has no
     Token to reset — and because a `set()` from another task would land on THAT
     task's scope, silently. The caller checks task identity; see
     `_assembly/_units.py::_Carrier.remove`.
+
+    Only while `fork` is still the current scope. A block that ended after the
+    pin went up has already taken this task past it, and setting `prev` then
+    would reinstall the scope of a block that is over — a trace started inside
+    a host's conversation and finished outside it put the conversation back on
+    every later call. A block opened ON the pin and still open would lose its
+    own scope instead. Either way the fork is retired to `prev` for this Context,
+    the pinning task's (`_hub.retire`), so a block that later restores the fork
+    here reads `prev`, while a task started under the pin keeps it.
     """
-    _hub._current_scope.set(prev)
+    if _hub._current_scope.get() is fork:
+        _hub._current_scope.set(prev)
+    else:
+        _hub.retire(fork, prev, _hub.here())
 
 
 @contextmanager

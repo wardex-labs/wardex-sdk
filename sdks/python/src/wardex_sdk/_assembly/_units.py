@@ -298,7 +298,7 @@ class _Carrier:
             elif self.owner is not _current_task():
                 raise ValueError("a pin may only be removed on the task that installed it")
             else:
-                restore_scope(self._prev_scope)
+                restore_scope(self._prev_scope, self._fork)
 
     def retire_from_afar(self) -> None:
         """Take a PIN's fork out of service from a task that cannot remove it.

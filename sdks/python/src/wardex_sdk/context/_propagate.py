@@ -24,6 +24,13 @@ def continue_trace(headers: Mapping[str, str]) -> AbstractContextManager[None]:
     traceparent installs a remote parent; a missing/malformed one starts a
     fresh trace (W3C restart rule) — never raises. As a decorator it serves a
     plain function only (see `WithOrSyncDecorator`), with the headers read once.
+
+    The ambient `wardex.conversation(...)` is KEPT: the trace starts over, the
+    conversation does not, so a request continued inside a conversation is
+    still in it. Work started inside a block inherits the block, and this no
+    longer clears it: a long-lived worker started inside one request's block
+    carries that conversation into every trace it continues. Enter
+    `wardex.isolation_scope()` to step out of a conversation.
     """
     return WithOrSyncDecorator(
         "continue_trace",
@@ -50,7 +57,7 @@ def _continue_trace(headers: Mapping[str, str]) -> Iterator[None]:
     except Exception:
         parsed = None
         tracestate = None
-    with _hub.isolation_scope():
+    with _hub.isolation_scope(keep_conversation=True):
         if parsed is not None:
             tid, sid, flags = parsed
             scope = _hub.get_current_scope()
@@ -111,8 +118,9 @@ def get_trace_headers() -> dict[str, str]:
 def continue_from_otel() -> AbstractContextManager[None]:
     """Adopt the current OpenTelemetry span (if any) as a remote parent.
 
-    Entry semantics match continue_trace (isolation + remote parent).
-    No opentelemetry installed, or no active/valid span -> plain isolation.
+    Entry semantics match continue_trace (isolation + remote parent), the
+    ambient conversation kept as there: `wardex.isolation_scope()` steps out
+    of one. No opentelemetry installed, or no active/valid span -> isolation alone.
     As a decorator it serves a plain function only (see `WithOrSyncDecorator`).
     """
     return WithOrSyncDecorator(
@@ -140,7 +148,7 @@ def _continue_from_otel() -> Iterator[None]:
             )
     except Exception:
         ctx = None
-    with _hub.isolation_scope():
+    with _hub.isolation_scope(keep_conversation=True):
         if ctx is not None:
             _hub.get_current_scope().active_span_context = ctx
         yield
