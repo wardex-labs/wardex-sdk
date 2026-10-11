@@ -59,7 +59,8 @@ MEASURED: dict[AdapterName, tuple[Measured, ...]] = {
         Measured("langgraph-prebuilt", ("1.1",)),
     ),
     # 0.23 lists an agent's tools inside the agent's span rather than before opening it, so an
-    # MCP listing and a failing tool gate land under the agent there; both trees are measured.
+    # MCP listing and a failing tool gate land under the agent there, and its streamed path
+    # checks input guardrails before leaving a handoff's sender; both trees are measured.
     AdapterName.OPENAI_AGENTS: (Measured("openai-agents", ("0.22", "0.23")),),
 }
 

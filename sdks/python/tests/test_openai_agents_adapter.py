@@ -179,11 +179,11 @@ def _tools_listed_inside_the_agent() -> bool:
     installed release actually produces; CI runs them on both tested minors.
     """
     import importlib.metadata
+    import re
 
-    major, minor = (
-        int(part) for part in importlib.metadata.version("openai-agents").split(".")[:2]
-    )
-    return (major, minor) >= (0, 23)
+    found = re.match(r"(\d+)\.(\d+)", importlib.metadata.version("openai-agents"))
+    assert found is not None, "openai-agents reports no major.minor version"
+    return (int(found[1]), int(found[2])) >= (0, 23)
 
 
 def _one(spans: list[Any], name: str) -> Any:
