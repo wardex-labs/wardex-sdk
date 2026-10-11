@@ -1,7 +1,8 @@
 //! PyO3 core marshaling — `InternalEnvelope`(Python) ↔ `pb::Envelope`(prost).
 //!
 //! Option 1 (Rust getattr traversal): walks the Python object directly to populate the proto struct.
-//! Lossless round-trip including the transport tree, capture_integrity, correlation, and state_snapshots.
+//! Lossless round-trip including the transport tree, capture_integrity, correlation, state_snapshots
+//! and client_reports.
 //!
 //! Marshaling is all this file does. What an exported span MEANS — its OTLP
 //! name, the `gen_ai.*`/`http.*`/`wardex.*` keys, the resource and scope around
@@ -1256,12 +1257,36 @@ fn skip_reason(sp: &Bound<'_, PyAny>, e: &PyErr) -> PyResult<String> {
     Ok(format!("{name}: {kind}: {text}"))
 }
 
+/// `ClientReport`(Python) → `pb::ClientReport`: one window of the drop
+/// ledger, its counts keyed `"<reason>:<unit>"`.
+///
+/// The ledger already cuts every count at `i32::MAX` and carries the rest to
+/// its next report, so the clamp here is a backstop: a value out of range from
+/// anywhere else costs that value, never the envelope it rides in. A repeated
+/// key adds up rather than overwriting, for the same reason.
+fn client_report_to_proto(r: &Bound<PyAny>) -> PyResult<pb::ClientReport> {
+    let clamp = |n: i64| i32::try_from(n.clamp(0, i64::from(i32::MAX))).unwrap_or(i32::MAX);
+    let mut discarded_events = std::collections::HashMap::new();
+    for pair in r.getattr("discarded_events")?.iter()? {
+        let (key, n): (String, i64) = pair?.extract()?;
+        let total: &mut i32 = discarded_events.entry(key).or_insert(0);
+        *total = total.saturating_add(clamp(n));
+    }
+    Ok(pb::ClientReport {
+        timestamp_ns: r.getattr("timestamp_ns")?.extract()?,
+        discarded_events,
+        failed_sends: clamp(r.getattr("failed_sends")?.extract()?),
+        queue_depth: clamp(r.getattr("queue_depth")?.extract()?),
+        uptime_ms: r.getattr("uptime_ms")?.extract()?,
+    })
+}
+
 /// `InternalEnvelope`(Python) → `pb::Envelope`.
 ///
-/// `state_snapshots` is a parameter because the OTLP surface is traces-only:
-/// marshaling snapshots the mapping then drops would spend the walk on data
-/// that cannot reach that wire, and would let a malformed snapshot fail an
-/// export whose spans were fine.
+/// `non_span_items` is a parameter because the OTLP surface is traces-only:
+/// marshaling state snapshots and drop reports the mapping then drops would
+/// spend the walk on data that cannot reach that wire, and would let a
+/// malformed one fail an export whose spans were fine.
 /// Envelope → proto, plus the spans it could NOT marshal, when asked to go on.
 ///
 /// `skip_unmarshallable` is the export path's setting. A span whose typed
@@ -1277,7 +1302,7 @@ fn skip_reason(sp: &Bound<'_, PyAny>, e: &PyErr) -> PyResult<String> {
 /// flag does not turn that into a quiet per-span loss.
 fn envelope_to_proto(
     env: &Bound<PyAny>,
-    state_snapshots: bool,
+    non_span_items: bool,
     skip_unmarshallable: bool,
 ) -> PyResult<(pb::Envelope, Vec<String>)> {
     let mut items = Vec::new();
@@ -1317,7 +1342,7 @@ fn envelope_to_proto(
             payload: Some(pb::envelope_item::Payload::Span(span)),
         });
     }
-    if state_snapshots {
+    if non_span_items {
         for s in env.getattr("state_snapshots")?.iter()? {
             items.push(pb::EnvelopeItem {
                 header: Some(pb::EnvelopeItemHeader {
@@ -1327,6 +1352,19 @@ fn envelope_to_proto(
                 payload: Some(pb::envelope_item::Payload::StateSnapshot(state_to_proto(
                     &s?,
                 )?)),
+            });
+        }
+        // The drop ledger's reports ride last: they describe the window that
+        // ends with this batch, not any one span in it.
+        for r in env.getattr("client_reports")?.iter()? {
+            items.push(pb::EnvelopeItem {
+                header: Some(pb::EnvelopeItemHeader {
+                    r#type: "client_report".into(),
+                    length: 0,
+                }),
+                payload: Some(pb::envelope_item::Payload::ClientReport(
+                    client_report_to_proto(&r?)?,
+                )),
             });
         }
     }
@@ -1668,6 +1706,21 @@ fn envelope_to_dict(py: Python<'_>, env: &pb::Envelope) -> PyResult<PyObject> {
                 sd.set_item("tool_definitions", tdd)?;
             }
             id.set_item("state_snapshot", sd)?;
+        }
+        if let Some(pb::envelope_item::Payload::ClientReport(cr)) = &item.payload {
+            let cd = PyDict::new_bound(py);
+            cd.set_item("timestamp_ns", cr.timestamp_ns)?;
+            let mut keys: Vec<&String> = cr.discarded_events.keys().collect();
+            keys.sort();
+            let events = PyDict::new_bound(py);
+            for key in keys {
+                events.set_item(key, cr.discarded_events[key])?;
+            }
+            cd.set_item("discarded_events", events)?;
+            cd.set_item("failed_sends", cr.failed_sends)?;
+            cd.set_item("queue_depth", cr.queue_depth)?;
+            cd.set_item("uptime_ms", cr.uptime_ms)?;
+            id.set_item("client_report", cd)?;
         }
         items.append(id)?;
     }

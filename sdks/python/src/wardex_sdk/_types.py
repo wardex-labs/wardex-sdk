@@ -658,6 +658,13 @@ class ResourceInfo:
 
 @dataclass(frozen=True, slots=True)
 class ClientReport:
+    """What wardex lost in one reporting window, as the drop ledger cuts it.
+
+    `discarded_events` is `(("<reason>:<unit>", count), ...)` in the closed
+    vocabulary of `_assembly._ledger`; counts are int32 on the wire, so a larger
+    one rides the next report. `timestamp_ns` is unique per process and is what
+    a receiver folds a resent report on, with the header's process pid."""
+
     timestamp_ns: int
     discarded_events: tuple[tuple[str, int], ...] = ()
     failed_sends: int = 0
@@ -700,7 +707,7 @@ class Envelope:
     header: EnvelopeHeader
     spans: tuple[InternalSpan, ...] = ()
     state_snapshots: tuple[InternalStateSnapshot, ...] = ()
-    client_report: ClientReport | None = None
+    client_reports: tuple[ClientReport, ...] = ()
 
     @property
     def span_count(self) -> int:
