@@ -58,8 +58,10 @@ Only a transport that can carry a report gets one: `carries()` asks for
 counts for a transport that cannot ship them would make them vanish.
 
 A drain with nothing else to send ships a ledger-only envelope at most once per
-`SOLO_INTERVAL_S` (close's final drain excepted), so a process that only ever
-loses data still says so without spending the receiver's request budget.
+`SOLO_INTERVAL_S`, so a process that only ever loses data still says so without
+spending the receiver's request budget. The interval starts when such an
+envelope actually carries a report, and the last drain a process gets (close's
+final one, or one `expedite` announced) does not wait for it.
 
 The ledger is process-global. A fork child starts from zero
 (`_at_fork_reinit`): the parent owns what it counted and ships it itself.
@@ -88,6 +90,7 @@ __all__ = [
     "attach",
     "carries",
     "due",
+    "expedite",
     "record",
     "record_failed_send",
     "record_items",
@@ -236,22 +239,29 @@ def carries(transport: object) -> bool:
 
 def due(transport: object, *, final: bool = False) -> bool:
     """Whether a drain with nothing else to send should send a ledger-only
-    envelope now. Claims the interval when it answers yes."""
-    global _last_solo
+    envelope now. Claims nothing: `attach` starts the interval when such an
+    envelope actually carries a report, so a drain that could not take the
+    fold does not spend it."""
     if not carries(transport):
         return False
     if not (_PENDING or _UNACKED or _INBOX or _SETTLED or _failed_sends):
         return False
-    now = _monotonic()
-    if not final and _last_solo is not None and now - _last_solo < SOLO_INTERVAL_S:
-        return False
-    _last_solo = now
-    return True
+    if final or _last_solo is None:
+        return True
+    return _monotonic() - _last_solo >= SOLO_INTERVAL_S
+
+
+def expedite() -> None:
+    """The next drain is the last this process gets (a shutdown signal's): it
+    may send a ledger-only envelope whatever the interval, as close's does."""
+    global _last_solo
+    _last_solo = None
 
 
 def attach(envelope: Envelope, transport: object, queue_depth: int) -> Envelope:
     """`envelope` with the ledger's reports added, when `transport` carries
     them and the fold is free; otherwise `envelope` unchanged."""
+    global _last_solo
     _last_unsent[0] = None  # a new batch: the last one's settles are over
     if type(envelope) is not Envelope or not carries(transport):
         return envelope
@@ -271,6 +281,8 @@ def attach(envelope: Envelope, transport: object, queue_depth: int) -> Envelope:
         _release()
     if not reports:
         return envelope
+    if not envelope.spans and not envelope.state_snapshots:
+        _last_solo = _monotonic()  # a ledger-only envelope is going out: the interval starts
     return replace(envelope, client_reports=envelope.client_reports + tuple(reports))
 
 

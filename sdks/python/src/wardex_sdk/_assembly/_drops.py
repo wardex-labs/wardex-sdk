@@ -300,13 +300,15 @@ def report_stream_parser_disabled(reason: str, pid: int | None, client: object) 
         diag_warning(f"json-rpc parser disabled (pid={pid}): {reason}")
 
 
-def report_undelivered_drops(client: object) -> None:
+def report_undelivered_drops(client: object, *, who: str = "close()") -> None:
     """Say, in one line, what the drop ledger still holds that no receiver
     confirmed. `wardex.close()` and the exit hook call this last: after the
     final drain there is no next envelope to carry the counts, so stderr is
-    the only channel left. A re-init's teardown does not: the new client's
-    first envelope carries them, so a process re-initializing in a loop
-    writes nothing here.
+    the only channel left. So does a shutdown signal's handler, after its
+    flush, when the process is about to die on the signal (atexit does not
+    run there); `who` names which of the two finished. A re-init's teardown
+    does not: the new client's first envelope carries them, so a process
+    re-initializing in a loop writes nothing here.
 
     Only for a client whose transport carries the ledger. One that does not
     never had a send of the counts to fail; the losses it saw were each said
@@ -316,26 +318,28 @@ def report_undelivered_drops(client: object) -> None:
     Silent when nothing was lost -- the reasons that are not losses
     (`before_send`, `excluded_by_policy`) never print this on their own --
     and silent when the line would repeat the last one word for word, so a
-    second `close()` with nothing new to say says nothing.
+    second `close()` with nothing new to say says nothing. Never raises: a
+    signal handler calls it with nothing around it.
     """
     global _last_undelivered_line
-    if not _ledger.carries(getattr(client, "_transport", None)):
-        return
-    held = _ledger.undelivered()
-    if not any(n and REASONS[reason].loss != "none" for (reason, _), n in held.items()):
-        return
-    counts = ", ".join(
-        f"{reason.value}:{unit.value}={n}"
-        for (reason, unit), n in sorted(held.items(), key=lambda kv: _ledger._wire_key(kv[0]))
-        if n
-    )
-    line = (
-        "close() finished holding counts of lost data that no receiver has confirmed, and "
-        f"nothing will send them now (reason:unit=count): {counts}"
-    )
-    if line != _last_undelivered_line:
-        _last_undelivered_line = line
-        diag_warning(line)
+    with guard("drops.undelivered_report"):
+        if not _ledger.carries(getattr(client, "_transport", None)):
+            return
+        held = _ledger.undelivered()
+        if not any(n and REASONS[reason].loss != "none" for (reason, _), n in held.items()):
+            return
+        counts = ", ".join(
+            f"{reason.value}:{unit.value}={n}"
+            for (reason, unit), n in sorted(held.items(), key=lambda kv: _ledger._wire_key(kv[0]))
+            if n
+        )
+        line = (
+            f"{who} finished holding counts of lost data that no receiver has confirmed, and "
+            f"nothing will send them now (reason:unit=count): {counts}"
+        )
+        if line != _last_undelivered_line:
+            _last_undelivered_line = line
+            diag_warning(line)
 
 
 #: The last line `report_undelivered_drops` printed, so it is not printed twice.

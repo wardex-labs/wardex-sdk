@@ -15,6 +15,7 @@ cases are the contract:
     once per interval;
   * a fork child's first report carries none of the parent's counts;
   * a drain never waits for the ledger, and neither does a signal's flush;
+  * a process dying on a signal ships the counts it holds, or says them;
   * one failed batch is accounted once, however its transport raised.
 
 The rest pins the ledger's own rules: never raising, never reduced by sending,
@@ -25,6 +26,9 @@ prints when the final send fails.
 from __future__ import annotations
 
 import os
+import signal
+import subprocess
+import sys
 import threading
 import time
 from collections.abc import Iterator
@@ -33,6 +37,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import pytest
 
 import wardex_sdk
+from test_batching_integration import posix_signals  # the suite's signal marker, shared
 from test_fork_semantics import fork_only  # the suite's POSIX-only marker, shared
 from wardex_sdk import _hub, _wardex_native
 from wardex_sdk._assembly import _ledger, counters, guard, lose
@@ -468,6 +473,66 @@ def test_a_ledger_only_envelope_goes_out_at_most_once_per_interval(receiver, mon
     client.flush(5.0)  # nothing pending at all: no POST
     assert len(receiver.posts) == 2
     client.close(1.0)
+
+
+def test_a_drain_that_could_not_take_the_fold_does_not_spend_the_interval(receiver):
+    """The interval starts when a ledger-only envelope actually carries a
+    report. A drain that found the fold busy sent nothing, so the next drain
+    sends the counts at once rather than an interval later."""
+    client = _client(receiver.url)
+    _ledger.record(DropReason.INTERNAL_SDK_ERROR)
+    assert _ledger._claim()  # "another frame is folding"
+    try:
+        client.flush(5.0)
+    finally:
+        _ledger._release()
+    assert receiver.posts == []
+    client.flush(5.0)
+    assert len(receiver.posts) == 1
+    assert _events(_reports(receiver.decoded()[0][1])) == {"internal_sdk_error:failure": 1}
+    client.close(1.0)
+
+
+_SIGNAL_CHILD = r"""
+import os, signal, sys
+import wardex_sdk
+from wardex_sdk import _hub
+from wardex_sdk._assembly import _ledger
+from wardex_sdk._assembly._ledger import DropReason
+from wardex_sdk._config import BackendConfig
+
+wardex_sdk.init(backend=BackendConfig(api_key=sys.argv[2], base_url=sys.argv[1]), intercept=False)
+client = _hub.get_client()
+client._worker.stop()
+_ledger.record(DropReason.TABLE_FULL)
+client.flush(5.0)  # a ledger-only envelope: the interval starts
+_ledger.record(DropReason.TABLE_FULL, 5)  # inside the interval, with nothing buffered
+os.kill(os.getpid(), signal.SIGTERM)
+"""
+
+
+@posix_signals
+@pytest.mark.parametrize("reachable", [True, False], ids=["delivered", "unreachable"])
+def test_a_process_dying_on_a_signal_ships_or_says_what_the_ledger_holds(receiver, reachable):
+    """A process that dies on SIGTERM gets no later drain, so the ledger-only
+    interval does not hold its counts back; and counts it cannot deliver are
+    said on stderr, as close() says them, because atexit does not run."""
+    url = receiver.url if reachable else CLOSED
+    proc = subprocess.run(
+        [sys.executable, "-c", _SIGNAL_CHILD, url, KEY],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert proc.returncode == -signal.SIGTERM
+    said = [ln for ln in proc.stderr.splitlines() if "no receiver has confirmed" in ln]
+    if reachable:
+        delivered = [r for _, d in receiver.decoded() for r in _reports(d)]
+        assert _events(delivered) == {"table_full:entry": 6}
+        assert said == []
+    else:
+        [line] = said
+        assert "shutdown signal" in line and "table_full:entry=6" in line
 
 
 def test_close_sends_what_the_ledger_holds_whatever_the_interval(receiver, monkeypatch):
