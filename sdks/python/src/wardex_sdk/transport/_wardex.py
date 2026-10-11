@@ -37,7 +37,7 @@ import urllib.request
 from .._assembly import counters, debug_host_error, diag_info, report_export_failed, report_once
 from .._native import NATIVE_OK, native, unavailable_reason
 from .._types import Envelope
-from ._base import UNDELIVERED, Transport, Undelivered, _debug_enabled
+from ._base import UNDELIVERED, Transport, Undelivered, _debug_enabled, _report_pii_scrubbed
 from ._otlp_http import _cut_short_by_the_caller, _describe_failure
 
 #: The receiver route every wardex receiver serves, appended to `base_url`.
@@ -139,7 +139,7 @@ class WardexTransport(Transport):
         # WHOLE batch -- every good span beside the bad one, silently
         # off-debug. A failure outside the typed blocks still raises: that is
         # an encoder bug, not one host value.
-        body, unmarshalled = native.codec.encode_envelope_export(
+        body, unmarshalled, scrubbed = native.codec.encode_envelope_export(
             envelope, self._pii_mode, list(self._pii_disabled), self._limits, **self._pii_names()
         )
         remaining = deadline - time.monotonic()
@@ -171,6 +171,9 @@ class WardexTransport(Transport):
             )
             if self._debug or _debug_enabled():
                 diag_info("spans not marshalled: " + "; ".join(unmarshalled))
+        # Here, with the skipped spans, and for the same reason: past the
+        # `UNDELIVERED` return above, so a retried batch is counted once.
+        _report_pii_scrubbed(scrubbed, wire="wardex")
         if body is None:
             # Every item was skipped. Not `UNDELIVERED`: handing the batch
             # back would fail on the same spans at every retry and pin them in

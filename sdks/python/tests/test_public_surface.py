@@ -149,3 +149,45 @@ def test_py_typed_ships_next_to_the_package():
         "marker every inline annotation in the wheel is invisible to type "
         "checkers (see [tool.maturin] include in pyproject.toml)"
     )
+
+
+# --------------------------------------------------------------------------
+# the release wheel has no failure injection
+# --------------------------------------------------------------------------
+
+_REPO = pathlib.Path(__file__).resolve().parents[3]
+
+
+def test_the_release_build_never_turns_on_panic_injection():
+    """The `panic-injection` cargo feature adds `_panic_for_test()` and makes
+    the PII masker panic on a span named `__wardex_test_panic__`, so this
+    suite can watch the fail-closed scrub end to end. The development build
+    turns it on, through `config-settings-package` in the workspace
+    `pyproject.toml`, which only `uv` reads. A shipped wheel must not have it:
+    a masker with an input it fails on by design is a way to empty any span.
+
+    The release wheel is built by maturin from `[tool.maturin]` in
+    `sdks/python/pyproject.toml` and the args in the release workflow, so
+    neither may name the feature, and no crate may turn it on by default --
+    a `default` feature list is the one switch that would reach the wheel
+    without either file saying so.
+    """
+    package = (_REPO / "sdks" / "python" / "pyproject.toml").read_text(encoding="utf-8")
+    assert "[tool.maturin]" in package
+    assert "panic-injection" not in package
+    release = (_REPO / ".github" / "workflows" / "release-python.yml").read_text(encoding="utf-8")
+    assert "PyO3/maturin-action" in release
+    assert "panic-injection" not in release
+    manifests = sorted(_REPO.glob("crates/*/Cargo.toml")) + [
+        _REPO / "bindings" / "python" / "Cargo.toml"
+    ]
+    declared = [m for m in manifests if "panic-injection" in m.read_text(encoding="utf-8")]
+    # Not vacuous: the feature is declared where the injection lives.
+    assert _REPO / "crates" / "wardex-pipeline" / "Cargo.toml" in declared
+    for manifest in declared:
+        for line in manifest.read_text(encoding="utf-8").splitlines():
+            if line.strip().startswith("default"):
+                assert "panic-injection" not in line, f"{manifest}: {line}"
+    # The one place that does turn it on is the development build's.
+    workspace = (_REPO / "pyproject.toml").read_text(encoding="utf-8")
+    assert '"--features panic-injection"' in workspace

@@ -70,14 +70,25 @@ impl<'e> Masker<'e> {
     }
 }
 
-/// Test-only panic injection for the fail-closed path.
-#[cfg(test)]
+/// Panic injection for the fail-closed path: a span with this name, or a
+/// snapshot whose conversation state is these bytes, panics the masker before
+/// it reads anything else.
+///
+/// Compiled into this crate's own tests and into a build with the
+/// `panic-injection` feature — the development build of the Python wheel turns
+/// it on (`bindings/python/Cargo.toml`), so the wheel's tests can watch the
+/// scrub, its marker and its count end to end. A release wheel never does, so
+/// a shipped masker has no input it fails on by design.
+#[cfg(any(test, feature = "panic-injection"))]
 pub(super) const TEST_PANIC_SPAN_NAME: &str = "__wardex_test_panic__";
 
 /// Mask every outbound text surface of a wardex envelope (design §3).
 /// A span/snapshot that panics during masking is scrubbed whole (fail-closed §8);
-/// other items keep processing.
-pub fn mask_envelope(engine: &PiiEngine, env: &mut pb::Envelope) {
+/// other items keep processing. Returns how many were scrubbed — spans and
+/// snapshots — for the caller to count: each also carries
+/// `Limitation::PiiFilterFailed`, but only to whoever opens it.
+pub fn mask_envelope(engine: &PiiEngine, env: &mut pb::Envelope) -> usize {
+    let mut scrubbed = 0;
     let pb::Envelope { header, items } = env;
     if let Some(h) = header {
         mask_header(&mut Masker::new(engine), h);
@@ -97,6 +108,7 @@ pub fn mask_envelope(engine: &PiiEngine, env: &mut pb::Envelope) {
                 let masked = catch_unwind(AssertUnwindSafe(|| mask_span(engine, span)));
                 if masked.is_err() {
                     scrub_span_fail_closed(span);
+                    scrubbed += 1;
                 }
             }
             Some(pb::envelope_item::Payload::StateSnapshot(snap)) => {
@@ -105,6 +117,7 @@ pub fn mask_envelope(engine: &PiiEngine, env: &mut pb::Envelope) {
                 }));
                 if masked.is_err() {
                     scrub_snapshot_fail_closed(snap);
+                    scrubbed += 1;
                 }
             }
             Some(pb::envelope_item::Payload::ClientReport(report)) => {
@@ -122,6 +135,7 @@ pub fn mask_envelope(engine: &PiiEngine, env: &mut pb::Envelope) {
             None => {}
         }
     }
+    scrubbed
 }
 
 // --- primitives ---
@@ -488,7 +502,7 @@ fn mask_header(m: &mut Masker<'_>, h: &mut pb::EnvelopeHeader) {
 
 fn mask_span(engine: &PiiEngine, span: &mut pb::Span) {
     let m = &mut Masker::new(engine);
-    #[cfg(test)]
+    #[cfg(any(test, feature = "panic-injection"))]
     if span.name == TEST_PANIC_SPAN_NAME {
         panic!("injected test panic");
     }
@@ -721,6 +735,10 @@ fn mask_transport(m: &mut Masker<'_>, t: &mut pb::TransportAttributes) -> bool {
 }
 
 fn mask_snapshot(m: &mut Masker<'_>, snap: &mut pb::StateSnapshot) {
+    #[cfg(any(test, feature = "panic-injection"))]
+    if snap.conversation_state == TEST_PANIC_SPAN_NAME.as_bytes() {
+        panic!("injected test panic");
+    }
     let pb::StateSnapshot {
         trace_id: _,
         span_id: _,
@@ -792,7 +810,12 @@ const SDK_SPAN_KEYS: [&str; 1] = [wardex_codec::otlp::map::T_CONNECTION_ID];
 /// Mask an OTLP export request (design §4.2, OTLP path). A span that panics
 /// is scrubbed whole; a span with replacements gains `wardex.redacted=true`
 /// (OTLP spans have no capture_integrity — this is the OTLP equivalent).
-pub fn mask_otlp(engine: &PiiEngine, req: &mut otlp_pb::trace_service::ExportTraceServiceRequest) {
+/// Returns how many spans were scrubbed, for the caller to count.
+pub fn mask_otlp(
+    engine: &PiiEngine,
+    req: &mut otlp_pb::trace_service::ExportTraceServiceRequest,
+) -> usize {
+    let mut scrubbed = 0;
     let otlp_pb::trace_service::ExportTraceServiceRequest { resource_spans } = req;
     for rs in resource_spans {
         // Destructure exhaustively; if the vendored OTLP proto carries extra
@@ -836,19 +859,23 @@ pub fn mask_otlp(engine: &PiiEngine, req: &mut otlp_pb::trace_service::ExportTra
             mask_string(&mut Masker::new(engine), schema_url);
             for span in spans {
                 match catch_unwind(AssertUnwindSafe(|| mask_otlp_span(engine, span))) {
-                    Err(_) => scrub_otlp_span_fail_closed(span),
+                    Err(_) => {
+                        scrub_otlp_span_fail_closed(span);
+                        scrubbed += 1;
+                    }
                     Ok(Some(report)) => push_otlp_report(&mut span.attributes, report),
                     Ok(None) => {}
                 }
             }
         }
     }
+    scrubbed
 }
 
 /// `Some(report)` when anything in the span was replaced.
 fn mask_otlp_span(engine: &PiiEngine, span: &mut otlp_pb::trace::Span) -> Option<Report> {
     let m = &mut Masker::new(engine);
-    #[cfg(test)]
+    #[cfg(any(test, feature = "panic-injection"))]
     if span.name == TEST_PANIC_SPAN_NAME {
         panic!("injected test panic");
     }
@@ -1090,6 +1117,15 @@ fn otlp_kv_bool(key: &str, v: bool) -> otlp_pb::common::KeyValue {
     }
 }
 
+// --- fail-closed scrubs (§8): identity/timing survive, no text does ---
+//
+// Each one also says so in the closed vocabulary, `PiiFilterFailed`, and only
+// that: `redacted` is set on every span masking touched, so it cannot tell a
+// span that lost one e-mail address from one that lost everything, and the
+// `[PII_FILTER_ERROR]` name is a string no consumer was ever told to look for.
+// The record's own markers are not kept — the masker panicked inside this
+// record, and nothing read out of it is shipped.
+
 fn scrub_otlp_span_fail_closed(span: &mut otlp_pb::trace::Span) {
     *span = otlp_pb::trace::Span {
         trace_id: span.trace_id.clone(),
@@ -1099,12 +1135,13 @@ fn scrub_otlp_span_fail_closed(span: &mut otlp_pb::trace::Span) {
         start_time_unix_nano: span.start_time_unix_nano,
         end_time_unix_nano: span.end_time_unix_nano,
         name: PII_FILTER_ERROR.into(),
-        attributes: vec![otlp_kv_bool("wardex.redacted", true)],
+        attributes: vec![
+            otlp_kv_bool("wardex.redacted", true),
+            wardex_codec::otlp::map::limitation_attribute(pb::Limitation::PiiFilterFailed),
+        ],
         ..Default::default()
     };
 }
-
-// --- fail-closed scrubs (§8): identity/timing survive, no text does ---
 
 fn scrub_span_fail_closed(span: &mut pb::Span) {
     *span = pb::Span {
@@ -1117,6 +1154,7 @@ fn scrub_span_fail_closed(span: &mut pb::Span) {
         name: PII_FILTER_ERROR.into(),
         capture_integrity: Some(pb::CaptureIntegrity {
             redacted: true,
+            limitation_codes: vec![pb::Limitation::PiiFilterFailed as i32],
             ..Default::default()
         }),
         ..Default::default()
@@ -1131,6 +1169,17 @@ fn scrub_snapshot_fail_closed(snap: &mut pb::StateSnapshot) {
         snapshot_type: snap.snapshot_type,
         turn_index: snap.turn_index,
         conversation_state: PII_FILTER_ERROR.as_bytes().to_vec(),
+        // A snapshot has no `limitation_codes`; its markers ride this key in
+        // its attribute bag, comma-joined, as the Python snapshot draft
+        // writes them.
+        attributes: vec![pb::KeyValue {
+            key: wardex_codec::otlp::map::LIMITATIONS_KEY.into(),
+            value: Some(pb::AnyValue {
+                value: Some(pb::any_value::Value::StringValue(
+                    wardex_codec::vocab::limitation_name(pb::Limitation::PiiFilterFailed as i32),
+                )),
+            }),
+        }],
         ..Default::default()
     };
 }
@@ -1542,13 +1591,95 @@ mod tests {
     fn panicking_span_is_scrubbed_fail_closed() {
         let mut span = pii_span();
         span.name = TEST_PANIC_SPAN_NAME.into(); // test-only injection point
+        span.capture_integrity = Some(pb::CaptureIntegrity {
+            truncated: true,
+            redaction_count: 2,
+            ..Default::default()
+        });
         let mut env = env_with(span);
-        mask_envelope(&engine(), &mut env);
+        assert_eq!(
+            mask_envelope(&engine(), &mut env),
+            1,
+            "the scrub is counted"
+        );
         let s = span_of(&env);
         assert_eq!(s.name, crate::pii::PII_FILTER_ERROR);
         assert!(s.input_data.is_empty());
         assert!(s.status.is_none());
-        assert!(s.capture_integrity.as_ref().unwrap().redacted);
+        let integrity = s.capture_integrity.as_ref().unwrap();
+        assert!(integrity.redacted);
+        // The loss is in the closed vocabulary, and nothing read out of the
+        // record the masker panicked in ships beside it.
+        assert_eq!(
+            integrity.limitation_codes,
+            vec![pb::Limitation::PiiFilterFailed as i32]
+        );
+        assert!(!integrity.truncated);
+        assert_eq!(integrity.redaction_count, 0);
+    }
+
+    #[test]
+    fn a_masked_envelope_with_no_failure_counts_no_scrub() {
+        let mut env = env_with(pii_span());
+        assert_eq!(mask_envelope(&engine(), &mut env), 0);
+        assert!(span_of(&env)
+            .capture_integrity
+            .as_ref()
+            .is_none_or(|c| c.limitation_codes.is_empty()));
+    }
+
+    #[test]
+    fn panicking_snapshot_is_scrubbed_fail_closed_and_marked() {
+        let snapshot = |conversation_state: &[u8]| pb::EnvelopeItem {
+            header: None,
+            payload: Some(pb::envelope_item::Payload::StateSnapshot(
+                pb::StateSnapshot {
+                    trace_id: vec![0xAB; 16],
+                    turn_index: 3,
+                    conversation_state: conversation_state.to_vec(),
+                    attributes: vec![pb::KeyValue {
+                        key: "owner".into(),
+                        value: Some(pb::AnyValue {
+                            value: Some(pb::any_value::Value::StringValue("a@b.io".into())),
+                        }),
+                    }],
+                    ..Default::default()
+                },
+            )),
+        };
+        let mut env = pb::Envelope {
+            header: None,
+            items: vec![
+                snapshot(TEST_PANIC_SPAN_NAME.as_bytes()),
+                snapshot(b"user john@x.io asked"),
+            ],
+        };
+        assert_eq!(mask_envelope(&engine(), &mut env), 1, "one of two scrubbed");
+        let snap = |i: usize| match &env.items[i].payload {
+            Some(pb::envelope_item::Payload::StateSnapshot(s)) => s.clone(),
+            _ => panic!("expected snapshot"),
+        };
+        let scrubbed = snap(0);
+        assert_eq!(scrubbed.trace_id, vec![0xAB; 16]);
+        assert_eq!(scrubbed.turn_index, 3);
+        assert_eq!(
+            scrubbed.conversation_state,
+            crate::pii::PII_FILTER_ERROR.as_bytes()
+        );
+        assert_eq!(
+            scrubbed.attributes,
+            vec![pb::KeyValue {
+                key: "wardex.limitations".into(),
+                value: Some(pb::AnyValue {
+                    value: Some(pb::any_value::Value::StringValue(
+                        "pii_filter_failed".into()
+                    )),
+                }),
+            }],
+            "the host's attributes are gone and the marker is all that is left"
+        );
+        // The other snapshot was masked as usual.
+        assert_eq!(snap(1).conversation_state, b"user [EMAIL] asked".to_vec());
     }
 
     // --- OTLP tests ---
@@ -1786,7 +1917,7 @@ mod tests {
         span.span_id = vec![0xCD; 8];
         span.start_time_unix_nano = 1000;
         span.end_time_unix_nano = 2000;
-        mask_otlp(&engine(), &mut req);
+        assert_eq!(mask_otlp(&engine(), &mut req), 1, "the scrub is counted");
         let span = &req.resource_spans[0].scope_spans[0].spans[0];
         assert_eq!(span.name, crate::pii::PII_FILTER_ERROR);
         assert_eq!(span.trace_id, vec![0xAB; 16]);
@@ -1795,9 +1926,31 @@ mod tests {
         assert_eq!(span.end_time_unix_nano, 2000);
         assert_eq!(
             span.attributes,
-            vec![otlp_kv_bool("wardex.redacted", true)],
-            "attributes reduced to wardex.redacted=true only"
+            vec![
+                otlp_kv_bool("wardex.redacted", true),
+                otlp_pb::common::KeyValue {
+                    key: "wardex.limitations".into(),
+                    value: Some(otlp_pb::common::AnyValue {
+                        value: Some(otlp_pb::common::any_value::Value::ArrayValue(
+                            otlp_pb::common::ArrayValue {
+                                values: vec![otlp_pb::common::AnyValue {
+                                    value: Some(otlp_pb::common::any_value::Value::StringValue(
+                                        "pii_filter_failed".into()
+                                    )),
+                                }],
+                            }
+                        )),
+                    }),
+                },
+            ],
+            "attributes reduced to wardex.redacted=true and the scrub's marker"
         );
+    }
+
+    #[test]
+    fn otlp_masking_with_no_failure_counts_no_scrub() {
+        let mut req = otlp_req_with_pii();
+        assert_eq!(mask_otlp(&engine(), &mut req), 0);
     }
 
     #[test]

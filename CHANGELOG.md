@@ -377,6 +377,16 @@ All notable changes to this project are documented here. The format follows
   `wardex.payload_dropped.reason = "max_otlp_request_bytes"`, each such span
   is counted under `transport.otlp.span_payload_dropped`, and one line per
   process says which setting to raise.
+- **A span that masking failed on now says so, and is counted.** When the PII
+  engine itself fails on a span or a state snapshot, the record is not sent
+  unmasked: it leaves with only its ids, kind and timing, named
+  `[PII_FILTER_ERROR]`. That name was the only sign of it. The `redacted` flag
+  it also carries is set on every span masking touched, and nothing counted
+  the loss. Now the record carries the new `pii_filter_failed` limitation
+  (in `wardex.limitations` on OTLP, in its limitations on the wardex
+  envelope), each one is counted under `transport.otlp.pii_scrubbed` or
+  `transport.wardex.pii_scrubbed`, and one line per process says that masking
+  failed and asks for a report.
 - **An OpenAI Responses stream that fails midway now fails its chat span.**
   A Responses API stream (`responses.create(stream=True)`, the openai-agents
   default) that started with a 200 and then ended in a `response.failed`

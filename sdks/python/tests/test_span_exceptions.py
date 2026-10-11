@@ -93,7 +93,7 @@ def _envelope_events(t: _Recording, name: str) -> list[dict]:
     """The span's events as the wardex envelope encoder ships them."""
     out = []
     for env in t.envelopes:
-        wire, _ = native.codec.encode_envelope_export(
+        wire, *_ = native.codec.encode_envelope_export(
             env, t._pii_mode, list(t._pii_disabled), t._limits, **t._pii_names()
         )
         for item in decode(wire)["items"]:

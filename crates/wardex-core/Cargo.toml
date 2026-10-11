@@ -12,3 +12,8 @@ wardex-codec    = { path = "../wardex-codec" }
 wardex-pipeline = { path = "../wardex-pipeline" }
 wardex-protocol = { path = "../wardex-protocol" }
 wardex-replay   = { path = "../wardex-replay" }
+
+[features]
+# Forwards the PII masker's test-only panic injection; see
+# `crates/wardex-pipeline/Cargo.toml`.
+panic-injection = ["wardex-pipeline/panic-injection"]

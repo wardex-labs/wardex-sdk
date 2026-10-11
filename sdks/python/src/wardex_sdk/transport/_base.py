@@ -238,6 +238,29 @@ def _report_payload_dropped(dropped: int) -> None:
     )
 
 
+def _report_pii_scrubbed(scrubbed: int, *, wire: str) -> None:
+    """Count and say the records masking itself failed on.
+
+    A span (or snapshot) the PII engine fails on is not shipped as captured:
+    fail-closed, it leaves with only its ids, kind and times, named
+    `[PII_FILTER_ERROR]` and marked `pii_filter_failed`. That is the largest
+    loss masking can cause and a defect in wardex, so it is counted per
+    record and said once per process. `wire` is `"otlp"` or `"wardex"`, the
+    exporter's own counter family.
+    """
+    if not scrubbed:
+        return
+    key = f"transport.{wire}.pii_scrubbed"
+    for _ in range(scrubbed):
+        counters.bump(key)
+    report_once(
+        f"PII masking failed on {scrubbed} record(s), which were exported without "
+        "their content (ids, kind and times only, marked pii_filter_failed) rather "
+        f"than unmasked. This is a wardex bug; please report it (counted under {key})",
+        key=key,
+    )
+
+
 class _EncodeReports(NamedTuple):
     """What one OTLP encode could not ship as captured, for the caller to count.
 
@@ -252,6 +275,8 @@ class _EncodeReports(NamedTuple):
     """Host attributes under a reserved `wardex.transport.*` name not shipped as set."""
     payload_dropped: int
     """Spans exported without their payload to fit `max_otlp_request_bytes`."""
+    pii_scrubbed: int
+    """Spans masking itself failed on, exported emptied and marked `pii_filter_failed`."""
 
 
 def _report_encode(reports: _EncodeReports, *, debug: bool) -> None:
@@ -259,6 +284,7 @@ def _report_encode(reports: _EncodeReports, *, debug: bool) -> None:
     _report_unmarshalled(reports.unmarshalled, debug=debug)
     _report_reserved_overwritten(reports.overwritten)
     _report_payload_dropped(reports.payload_dropped)
+    _report_pii_scrubbed(reports.pii_scrubbed, wire="otlp")
 
 
 class Transport(abc.ABC):
@@ -425,7 +451,7 @@ class Transport(abc.ABC):
         # more -- it skips that one span and names it, for the caller to
         # count and report. A raise here is still a raise: a corrupt envelope
         # or an absent native module is not a per-span loss.
-        bodies, dropped, unmarshalled, overwritten, payload_dropped = (
+        bodies, dropped, unmarshalled, overwritten, payload_dropped, scrubbed = (
             native.codec.encode_otlp_requests(
                 envelope,
                 self._pii_mode,
@@ -451,7 +477,7 @@ class Transport(abc.ABC):
                 f"max_otlp_request_bytes if your collector accepts more.",
                 key="transport.otlp.span_over_request_cap",
             )
-        return tuple(bodies), _EncodeReports(unmarshalled, overwritten, payload_dropped)
+        return tuple(bodies), _EncodeReports(unmarshalled, overwritten, payload_dropped, scrubbed)
 
     def _set_pii_policy(self, policy: PIIConfig) -> None:
         """Install the PII policy resolved from `WardexConfig`. Called by

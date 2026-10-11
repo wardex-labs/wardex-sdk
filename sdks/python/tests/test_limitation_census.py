@@ -95,6 +95,7 @@ file exists.
 _CENSUS_RUST_ENUM: dict[str, frozenset[str]] = {
     "body_cap_exceeded": frozenset({"crates/wardex-codec/src/otlp/map.rs"}),
     "otlp_attribute_truncated": frozenset({"crates/wardex-codec/src/otlp/map.rs"}),
+    "pii_filter_failed": frozenset({"crates/wardex-pipeline/src/pii/walk.rs"}),
     "vocabulary_unmapped": frozenset(
         {
             "bindings/python/src/codec.rs",
@@ -124,7 +125,7 @@ all; it appears here because the scan finds it, and `_members_with_an_emitter`
 filters it out rather than pretending it is vocabulary.
 """
 
-_RUST_ENUM_EMITTERS: frozenset[str] = frozenset({"otlp_attribute_truncated"})
+_RUST_ENUM_EMITTERS: frozenset[str] = frozenset({"otlp_attribute_truncated", "pii_filter_failed"})
 """Of the references above, the ones that ATTACH a marker to a span.
 
 Hand-declared, and the one place in this file that is. Telling a production
@@ -766,6 +767,11 @@ _EMITTED_MEMBERS: frozenset[str] = frozenset(
         # `stream_events_unparsed`). Before it, a chunk that was not JSON was
         # skipped with no trace, its text or finish or error simply absent.
         "SSE_EVENT_UNPARSED",
+        # The twenty-seventh: masking's own failure, minted WITH its emitter
+        # (the PII engine's three fail-closed scrubs in `pii/walk.rs`). Before
+        # it, a span emptied because masking panicked said so only by the
+        # name `[PII_FILTER_ERROR]`, a string no consumer was told about.
+        "PII_FILTER_FAILED",
         # Declared long before an emitter: its first is the Codex adapter,
         # whose payloads are the host's stdin and stdout, not wire bytes.
         "NO_WIRE_EVIDENCE",
@@ -1788,10 +1794,15 @@ _VOCABULARY: dict[str, str] = {
     #     stream was read; the span has gen_ai truth) and from
     #     SSE_UNKNOWN_PROVIDER (a reassembler did recognize the stream) ---
     "SSE_EVENT_UNPARSED": "sse_event_unparsed",
+    # --- added after the census, by the PII engine (1): masking itself failed
+    #     on the record and its content was removed fail-closed — kept apart
+    #     from INSTRUMENTATION_DEGRADED (there the capture was incomplete;
+    #     here it was whole and was emptied on its way out) ---
+    "PII_FILTER_FAILED": "pii_filter_failed",
 }
 
 
-def test_the_vocabulary_is_exactly_these_fifty_six() -> None:
+def test_the_vocabulary_is_exactly_these_fifty_seven() -> None:
     """15 declared before the census + 21 from it + 1 from §5.4 + 1 for wardex
     itself + 1 for the OTLP size guard + 1 for the registry breadth bound
     + 2 for the OTel bridge's fail-open pair + 1 for the adapter's per-session
@@ -1802,7 +1813,7 @@ def test_the_vocabulary_is_exactly_these_fifty_six() -> None:
     id + 1 for the OTel bridge's tolerant chat join + 1 for the h2 stream
     table's evicted request half + 1 for the inferred provider label + 1 for
     a CLI agent's unobserved model calls + 1 for a stream event no
-    reassembler could read, name by name.
+    reassembler could read + 1 for masking's own failure, name by name.
 
     A count alone is not enough: a RENAME keeps the count and is the single most
     expensive mistake available here. These are proto enum values in

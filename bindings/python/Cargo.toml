@@ -24,6 +24,8 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("gil-refs"
 
 [features]
 # Test-only: exposes `_panic_for_test()` so the FFI panic conversion can be
-# exercised end to end. The development build turns it on; release wheels
-# never do (see `bindings/python/src/shield.rs`).
-panic-injection = []
+# exercised end to end, and makes a span named `__wardex_test_panic__` panic the
+# PII masker so its fail-closed scrub can be (`crates/wardex-pipeline/src/pii/
+# walk.rs`). The development build turns it on; release wheels never do (see
+# `bindings/python/src/shield.rs`).
+panic-injection = ["wardex-core/panic-injection"]
