@@ -80,6 +80,7 @@ _OK = "_adapters/_openai_agents_kinds.py"
 _LG = "_adapters/_langgraph.py"
 _AS = "_adapters/_assembler.py"
 _SEAM = "_interceptors/_seam.py"
+_MCP = "_interceptors/_mcp_stdio.py"
 _GENAI = "_semantics/_genai.py"
 _CX = "_adapters/_codex_exec.py"
 
@@ -206,6 +207,10 @@ _SITES: list[tuple[str, str, str, str]] = [
     (_SEAM, "'gen_ai.output.messages'", "om", HOST),
     (_SEAM, "'gen_ai.input.messages'", "im", HOST),
     (_SEAM, "'gen_ai.system_instructions'", "si", HOST),
+    # -- the MCP stdio seam --
+    # The MCP revision the client and server named: a request's own `_meta`
+    # stamp, or the version their `initialize` exchange settled on. Traffic.
+    (_MCP, "'mcp.protocol.version'", "protocol_version", HOST),
     # -- the semantics layer --
     # The conversation a Responses request body names: the provider's id for a
     # conversation it holds, put in the request by the host or its framework.

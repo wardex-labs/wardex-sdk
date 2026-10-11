@@ -82,6 +82,11 @@ test = [
     # error types (2026-10-10), so it stays out of the pin and out of the table of
     # tested versions until the adapter is fixed for it.
     "openai-agents>=0.22,<0.23",
+    # The MCP stdio seam is tested against the official SDK on both ends of the
+    # pipe (test_mcp_real_server.py). Measured with 2.3.0; capped at that minor
+    # because the test's server is written to 2.x's low-level `Server`
+    # signature, which 1.x does not have and a later minor may change.
+    "mcp>=2.3,<2.4",
     "langchain-core>=0.3",
     # `langchain` (not just langchain-core) because `langchain.agents.create_agent`
     # is the non-deprecated successor to `create_react_agent`, and the tool seam's

@@ -492,7 +492,8 @@ def test_mcp_stdio_tool_call_span_survives(client):
     spans = state.feed_response(b'{"jsonrpc":"2.0","id":1,"result":{"content":[{"a":1}]}}\n')
 
     ((sp, _scope),) = spans
-    assert sp.name == "MCP tools/call"
+    # No framework adapter is installed here, so the seam's span is the call's execute_tool span.
+    assert sp.name == "execute_tool search"
     assert sp.kind is SpanKind.CLIENT
     assert sp.tool is not None
     assert sp.tool.name == "search"
@@ -517,7 +518,7 @@ def test_mcp_stdio_error_span_survives_and_gains_an_error_type(client):
     )
 
     ((sp, _scope),) = spans
-    assert sp.name == "MCP tools/call"
+    assert sp.name == "execute_tool t"
     assert sp.status is StatusCode.ERROR
     assert sp.error_type == "json_rpc_-32601"
 

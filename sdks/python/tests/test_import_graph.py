@@ -1610,7 +1610,10 @@ _CS4_BUDGET = {
     # now `guard()` blocks. Lowered in the same commit rather than left stale:
     # `_assert_within_budget` only fails on `actual > budget`, so a number left
     # high is a free slot for a brand-new silent swallow that no test notices.
-    "_interceptors/_mcp_stdio.py": 7,
+    # 7 -> 5 when the tool-call span builder's two `except Exception: pass`
+    # around reading the params and the result became `guard()` blocks: those
+    # bytes are the native parser's re-encoding, so a failure there is wardex's.
+    "_interceptors/_mcp_stdio.py": 5,
     # 5 -> 4 when extracting `build_grpc_fields` into `_semantics/` took its
     # `except Exception:` with it; 4 -> 3 when the deferred-parse split
     # replaced `_parse_semantics`'s uncounted `except: return None` with the

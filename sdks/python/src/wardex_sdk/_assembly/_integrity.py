@@ -839,11 +839,11 @@ Two emit sites, and the first is the mechanism the second restates.
     """
 
     SEMANTIC_PARSE_FAILED = "semantic_parse_failed"
-    """Framing succeeded but the LLM body parser produced no core semantics and no output messages,
-    so the span has transport truth and no gen_ai truth.
+    """Framing succeeded but the meaning did not: the span has transport truth and no semantics.
 
-    Emitted from ``_interceptors/_seam.py::ByteSeamInterceptor._build_span``.
-    """
+    Emitted from ``_interceptors/_seam.py::ByteSeamInterceptor._build_span`` (an LLM body gave no
+    core semantics and no output messages) and ``_interceptors/_mcp_stdio.py`` (an MCP tool result
+    ``_mcp_result.read_tool_result`` cannot vouch for, shipped raw and UNSET)."""
 
     PAYLOAD_COMPRESSED = "payload_compressed"
     """The payload was observed compressed and wardex did not decompress it, so body bytes on this
