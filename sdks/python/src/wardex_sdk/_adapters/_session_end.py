@@ -33,9 +33,10 @@ from ._session_outcome import reader_stopped
 
 #: From a reader stopping to its transport's close starting. The SDK makes that call right after
 #: the cancel, in the same shielded `Query.close()`, so only a stalled event loop separates the two:
-#: 30 sessions closing at once were measured 0.6 s apart, and the window is more than ten times
-#: that. A session ended here before its close comes loses the CLI's last export, while a longer
-#: window costs only how long a session whose close never comes is held before it is ended.
+#: a simulated 0.6 s stall per close across 30 concurrent sessions (a test, not a field
+#: measurement) fits in it more than ten times over. A session ended here before its close comes
+#: loses the CLI's last export, while a longer window costs only how long a session whose close
+#: never comes is held before it is ended.
 _HANDOFF_S = 10.0
 
 #: From a bridge session's close starting to its end. Longer than `SubprocessCLITransport.close()`'s
