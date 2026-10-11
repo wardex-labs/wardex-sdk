@@ -869,6 +869,45 @@ def test_unconfirmed_reports_are_bounded_and_the_overflow_is_counted():
     assert _ledger.snapshot().counts[(DropReason.LEDGER_OVERFLOW, DropUnit.REPORT)] == 1
 
 
+def test_what_an_overflowed_report_carried_is_kept_as_undeliverable():
+    """The report the overflow pushes out is gone with everything it carried:
+    no receiver will get those counts. The snapshot keeps them apart, in
+    `undeliverable`, while `counts` stays exactly what was recorded. Sending
+    and settling the overflow count afterwards never reduces the view; only a
+    reset empties it."""
+    queue = (DropReason.QUEUE_OVERFLOW, DropUnit.SPAN)
+    table = (DropReason.TABLE_FULL, DropUnit.SESSION)
+    overflow = (DropReason.LEDGER_OVERFLOW, DropUnit.REPORT)
+    envelopes = []
+    for i in range(_ledger._UNACKED_CAP + 1):
+        _ledger.record(DropReason.QUEUE_OVERFLOW, 2 if i == 0 else 1)
+        if i == 0:
+            _ledger.record(DropReason.TABLE_FULL, 3, DropUnit.SESSION)
+        env = _ledger.attach(_envelope(), WardexTransport(CLOSED, KEY), 0)
+        envelopes.append(env)
+        _ledger.unsent(env, definite=False)
+    (dropped,) = envelopes[0].client_reports
+    assert dict(dropped.discarded_events) == {"queue_overflow:span": 2, "table_full:session": 3}
+
+    snap = _ledger.snapshot()
+    assert dict(snap.undeliverable) == {queue: 2, table: 3}
+    assert dict(snap.counts) == {queue: 2 + _ledger._UNACKED_CAP, table: 3, overflow: 1}
+    assert snap.total(DropReason.QUEUE_OVERFLOW) == 10
+    held = _ledger.undelivered()
+    assert table not in held  # the dropped report left the unconfirmed view whole
+    assert held == {queue: _ledger._UNACKED_CAP, overflow: 1}
+
+    taken = _ledger.attach(_envelope(), WardexTransport(CLOSED, KEY), 0)
+    _ledger.done(taken)  # everything else delivered
+    assert _ledger.undelivered() == {}
+    after = _ledger.snapshot()
+    assert dict(after.undeliverable) == {queue: 2, table: 3}
+    assert dict(after.counts) == dict(snap.counts)
+
+    _ledger._at_fork_reinit()  # what a fork child and a test reset both run
+    assert dict(_ledger.snapshot().undeliverable) == {}
+
+
 # -- (f) a ledger-only envelope -------------------------------------------------
 
 

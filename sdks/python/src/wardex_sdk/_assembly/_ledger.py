@@ -58,7 +58,8 @@ the POST carrying it fails, the transport says how (`unsent`):
 * MAYBE stored (no answer came back): the SAME report, same timestamp, is held
   and sent again with the next envelope, so the receiver can fold the repeat.
   At most `_UNACKED_CAP` such reports are held; past that the oldest is dropped
-  and counted as `ledger_overflow:report`.
+  and counted as `ledger_overflow:report`, and what it carried is added to the
+  snapshot's `undeliverable` view: those counts will never reach a receiver.
 
 When the drain that sent it finishes with no failure said (`done`), it was
 delivered. Until one of the three, the report is out, and `undelivered` counts
@@ -191,6 +192,9 @@ _MOVING: list[tuple[ClientReport, dict] | None] = [None]
 _failed_sends = 0
 #: Reports whose POST may or may not have arrived, oldest first.
 _UNACKED: deque[ClientReport] = deque()
+#: What the reports pushed out of `_UNACKED` carried, monotonic: counts no
+#: receiver will ever get. Only ever added to; reset with the rest.
+_UNDELIVERABLE: dict[tuple[DropReason, DropUnit], int] = {}
 #: (report, outcome), applied in order at the next fold: True from `unsent`
 #: when the receiver definitely did not store it, False when it may have, None
 #: from `done` (delivered, unless a failure settled it first). An entry leaves
@@ -221,10 +225,15 @@ class LedgerSnapshot:
     `counts` is keyed by `(reason, unit)` and includes `ledger_overflow`.
     `where` is the local-only breakdown by call-site label (a guard's label,
     `adapters.<name>`); the wire carries only the per-reason sum.
+    `undeliverable` is the part of `counts` that will never reach a receiver,
+    keyed the same way: what each unconfirmed report dropped for
+    `ledger_overflow:report` carried. It is already in `counts`, never shrinks,
+    and empties only when the whole ledger does (a fork child, a test reset).
     """
 
     counts: Mapping[tuple[DropReason, DropUnit], int]
     where: Mapping[tuple[DropReason, str], int]
+    undeliverable: Mapping[tuple[DropReason, DropUnit], int]
 
     def total(self, reason: DropReason) -> int:
         return sum(n for (r, _), n in self.counts.items() if r is reason)
@@ -311,7 +320,11 @@ def snapshot() -> LedgerSnapshot:
                 counts[(reason, unit)] = counts.get((reason, unit), 0) + n
                 if label is not None:
                     where[(reason, label)] = where.get((reason, label), 0) + n
-    return LedgerSnapshot(counts=MappingProxyType(counts), where=MappingProxyType(where))
+    return LedgerSnapshot(
+        counts=MappingProxyType(counts),
+        where=MappingProxyType(where),
+        undeliverable=MappingProxyType(dict(_UNDELIVERABLE)),
+    )
 
 
 def hold_signal(handler: Callable[[int, object], object], signum: int, frame: object) -> bool:
@@ -462,7 +475,9 @@ def _out_in(envelope: object) -> tuple[ClientReport, ...]:
 
 def undelivered() -> dict[tuple[DropReason, DropUnit], int]:
     """What no receiver has confirmed: the pending counts, every report held
-    for resending, and every report still out on a POST nobody settled.
+    for resending, and every report still out on a POST nobody settled. A
+    report dropped for `ledger_overflow` is none of these any more; what it
+    carried is in `snapshot().undeliverable`.
 
     When another thread holds the fold, this reads around it, for that fold
     parked wherever the interpreter switched away from it: what it has not
@@ -591,7 +606,10 @@ def _fold_held() -> None:
             while len(_UNACKED) > _UNACKED_CAP:
                 _add(_TOTALS, (DropReason.LEDGER_OVERFLOW, DropUnit.REPORT), 1)
                 _add(_PENDING, (DropReason.LEDGER_OVERFLOW, DropUnit.REPORT), 1)
-                _UNACKED.remove(min(_UNACKED, key=lambda r: r.timestamp_ns))
+                oldest = min(_UNACKED, key=lambda r: r.timestamp_ns)
+                for key, n in _keys_of(oldest):
+                    _add(_UNDELIVERABLE, key, n)
+                _UNACKED.remove(oldest)
         # Delivered, or not out (settled already, or never handed out): nothing to move.
         _OUT.pop(id(report), None)
         _MOVING[0] = None
@@ -673,6 +691,7 @@ def _at_fork_reinit() -> None:
     _PENDING = {}
     _MOVING[0] = None
     _UNACKED.clear()
+    _UNDELIVERABLE.clear()
     _SETTLED.clear()
     _OUT.clear()
     _UNSENT.clear()
