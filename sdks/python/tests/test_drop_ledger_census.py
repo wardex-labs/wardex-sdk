@@ -156,13 +156,13 @@ _CENSUS: dict[tuple[str, str, str], object] = {
         "'adapters.anthropic_agent_sdk.otel_bridge.receiver_failed'",
     ): _BRIDGE,
     ("_adapters/_anthropic_names.py", "bump", "'adapters.anthropic.hook_tool_name_ambiguous'"): (
-        NotADrop("the handler span ships carrying the tool-name collision marker")
+        Marker("TOOL_NAME_COLLISION", at="_adapters/_anthropic_agent_sdk.py")
     ),
     ("_adapters/_anthropic_names.py", "bump", "'adapters.anthropic.server_table_full'"): NotADrop(
         "an old handle stops being re-read; no span is dropped"
     ),
     ("_adapters/_assembler.py", "bump", "'adapters.anthropic.otel_bridge.llm_join_tolerant'"): (
-        NotADrop("the merge happened; the span carries the tolerant-join marker")
+        Marker("OTEL_BRIDGE_JOIN_TOLERANT")
     ),
     ("_adapters/_assembler.py", "bump", "'adapters.assembler.chat_line_after_evict'"): _CLAUDE,
     ("_adapters/_assembler.py", "bump", "'adapters.assembler.close_all_sessions_reentrant'"): (
@@ -183,8 +183,8 @@ _CENSUS: dict[tuple[str, str, str], object] = {
         _BRIDGE
     ),
     ("_adapters/_assembler.py", "bump", "'adapters.assembler.prompt_overwritten'"): _CLAUDE,
-    ("_adapters/_assembler.py", "bump", "'adapters.assembler.session_key_recycled'"): NotADrop(
-        "both runs ship under one root, which carries the correlation-conflict marker"
+    ("_adapters/_assembler.py", "bump", "'adapters.assembler.session_key_recycled'"): Marker(
+        "CORRELATION_CONFLICT"
     ),
     ("_adapters/_assembler.py", "bump", "'adapters.assembler.session_unit_evicted'"): _CLAUDE,
     ("_adapters/_assembler.py", "bump", "'adapters.assembler.stream_usage_overflowed'"): _USAGE,
@@ -192,14 +192,14 @@ _CENSUS: dict[tuple[str, str, str], object] = {
         _USAGE
     ),
     ("_adapters/_assembler.py", "bump", "'adapters.assembler.subagent_stop_after_evict'"): (
-        NotADrop("the evicted subagent span already shipped with its eviction marker")
+        Marker("SESSION_ENTRY_TABLE_FULL", at="_adapters/_assembler.py")
     ),
     ("_adapters/_assembler.py", "bump", "'adapters.assembler.tool_claim_lost'"): NotADrop(
         "another observer of the same tool call emits it"
     ),
     ("_adapters/_assembler.py", "bump", "'adapters.assembler.tool_close_without_open'"): _CLAUDE,
     ("_adapters/_assembler.py", "bump", "'adapters.assembler.tool_completion_after_evict'"): (
-        NotADrop("the evicted tool span already shipped with its eviction marker")
+        Marker("SESSION_ENTRY_TABLE_FULL")
     ),
     (
         "_adapters/_assembler.py",
@@ -207,7 +207,7 @@ _CENSUS: dict[tuple[str, str, str], object] = {
         "'adapters.assembler.tool_completion_after_evict_duplicate'",
     ): NotADrop("a repeat of a completion already handled"),
     ("_adapters/_assembler.py", "bump", "'adapters.assembler.tool_name_unattributable'"): (
-        NotADrop("the tool span ships; only a name that could not be attributed is left off")
+        Marker("TOOL_NAME_COLLISION", at="_adapters/_anthropic_agent_sdk.py")
     ),
     ("_adapters/_assembler.py", "bump", "f'adapters.assembler.{where}_table_full'"): _CLAUDE,
     ("_adapters/_hook_reach.py", "bump", "'adapters.anthropic.handshake_unreadable'"): _CLAUDE,
@@ -231,8 +231,8 @@ _CENSUS: dict[tuple[str, str, str], object] = {
     ("_adapters/_codex_exec.py", "count", "'otel_bridge.injected'"): NotADrop(
         "a tally of the bridge being switched on"
     ),
-    ("_adapters/_codex_exec.py", "count", "'otel_bridge.stood_down'"): NotADrop(
-        "the host's own telemetry settings win, by design; the run carries a marker"
+    ("_adapters/_codex_exec.py", "count", "'otel_bridge.stood_down'"): Marker(
+        "SUBPROCESS_MODEL_CALLS_UNOBSERVED", at="_adapters/_codex_exec.py"
     ),
     (
         "_adapters/_codex_exec.py",
@@ -240,10 +240,10 @@ _CENSUS: dict[tuple[str, str, str], object] = {
         "'adapters.codex_exec.otel_bridge.receiver_failed'",
     ): _BRIDGE,
     ("_adapters/_codex_exec.py", "report_once", "'adapters.codex_exec.otel_bridge.stood_down'"): (
-        NotADrop("the host's own telemetry settings win, by design; the run carries a marker")
+        Marker("SUBPROCESS_MODEL_CALLS_UNOBSERVED", at="_adapters/_codex_exec.py")
     ),
-    ("_adapters/_codex_exec.py", "report_once", "'adapters.codex_exec.stream_only'"): NotADrop(
-        "says what a stream-only run records; its spans carry the matching marker"
+    ("_adapters/_codex_exec.py", "report_once", "'adapters.codex_exec.stream_only'"): Marker(
+        "SUBPROCESS_MODEL_CALLS_UNOBSERVED"
     ),
     ("_adapters/_codex_read.py", "bump", "'adapters.codex_exec.argv_unreadable'"): _CODEX,
     ("_adapters/_codex_read.py", "bump", "'adapters.codex_exec.item_unparsed'"): _CODEX,
@@ -285,9 +285,7 @@ _CENSUS: dict[tuple[str, str, str], object] = {
     ("_adapters/_langgraph.py", "report_once", "'adapters.langgraph.unsupported_tool_surface'"): (
         _LANGGRAPH
     ),
-    ("_adapters/_langgraph_links.py", "count", "'join_ambiguous'"): NotADrop(
-        "no link is guessed; the span carries the ambiguous-link marker"
-    ),
+    ("_adapters/_langgraph_links.py", "count", "'join_ambiguous'"): Marker("LINK_AMBIGUOUS"),
     ("_adapters/_langgraph_links.py", "count", "'unsupported_config_merge'"): _LANGGRAPH,
     (
         "_adapters/_langgraph_links.py",
@@ -311,12 +309,12 @@ _CENSUS: dict[tuple[str, str, str], object] = {
         "a tally of the run's own outcome, which its span records"
     ),
     ("_adapters/_openai_agents.py", "count", "'handoff_receiver_never_started'"): _OPENAI,
-    ("_adapters/_openai_agents.py", "count", "'handoff_unresolved'"): NotADrop(
-        "no link is guessed; the span ships without it, carrying a marker"
-    ),
+    # The handoff span closes as an error and its causal edge is lost, with no marker on any
+    # span to say so: a loss, left with this adapter's others.
+    ("_adapters/_openai_agents.py", "count", "'handoff_unresolved'"): _OPENAI,
     ("_adapters/_openai_agents.py", "count", "'handoff_without_agent'"): _OPENAI,
-    ("_adapters/_openai_agents.py", "count", "'pin_ok' if ok else 'pin_refused'"): NotADrop(
-        "a tally of pinning; a refusal carries the correlation-conflict marker"
+    ("_adapters/_openai_agents.py", "count", "'pin_ok' if ok else 'pin_refused'"): Marker(
+        "CORRELATION_CONFLICT", at="_adapters/_openai_agents_kinds.py"
     ),
     ("_adapters/_openai_agents.py", "count", "'pin_stranded'"): NotADrop(
         "a pin left behind is released; nothing is dropped"
@@ -340,7 +338,7 @@ _CENSUS: dict[tuple[str, str, str], object] = {
         "_adapters/_openai_agents.py",
         "count",
         "'tool_call_id_ambiguous' if len(ids) > 1 else 'tool_call_id_unmatched'",
-    ): NotADrop("the tool span ships; it carries the call-id marker instead of a guess"),
+    ): Marker("TOOL_CALL_ID_UNAVAILABLE_IN_PROCESS"),
     ("_adapters/_openai_agents.py", "count", "'tool_call_id_tracing_disabled'"): _OPENAI,
     ("_adapters/_openai_agents.py", "count", "'tool_end_unmatched'"): NotADrop(
         "an end with no start; the loss, if any, was counted at the start"
@@ -363,7 +361,7 @@ _CENSUS: dict[tuple[str, str, str], object] = {
     ("_adapters/_openai_agents.py", "count", "'unsupported_surface'"): _OPENAI,
     ("_adapters/_openai_agents.py", "count", "f'{site}_missed'"): _OPENAI,
     ("_adapters/_openai_agents.py", "report_once", "'adapters.openai_agents.pin_refused'"): (
-        NotADrop("a refusal carries the correlation-conflict marker on its span")
+        Marker("CORRELATION_CONFLICT", at="_adapters/_openai_agents_kinds.py")
     ),
     ("_adapters/_openai_agents.py", "report_once", "'adapters.openai_agents.processor_removed'"): (
         _OPENAI
@@ -426,11 +424,11 @@ _CENSUS: dict[tuple[str, str, str], object] = {
         "the error ships under the generic error type"
     ),
     ("_adapters/_openai_agents_kinds.py", "count", "'model_output_withheld'"): _OPENAI,
-    ("_adapters/_openai_agents_kinds.py", "count", "'response_id_unavailable'"): NotADrop(
-        "the tool span downstream carries the call-id marker"
+    ("_adapters/_openai_agents_kinds.py", "count", "'response_id_unavailable'"): Marker(
+        "TOOL_CALL_ID_UNAVAILABLE_IN_PROCESS", at="_adapters/_openai_agents.py"
     ),
-    ("_adapters/_openai_agents_kinds.py", "count", "'response_without_agent'"): NotADrop(
-        "the tool span downstream carries the call-id marker"
+    ("_adapters/_openai_agents_kinds.py", "count", "'response_without_agent'"): Marker(
+        "TOOL_CALL_ID_UNAVAILABLE_IN_PROCESS", at="_adapters/_openai_agents.py"
     ),
     ("_adapters/_openai_agents_kinds.py", "count", "'started_at_unparsed'"): NotADrop(
         "the span ships with the time wardex observed instead"
@@ -448,7 +446,7 @@ _CENSUS: dict[tuple[str, str, str], object] = {
         NotADrop("an attribute outside the bridge's allow-list, left out by policy")
     ),
     ("_adapters/_otel_merge.py", "bump", "'adapters.anthropic.otel_bridge.llm_join_ambiguous'"): (
-        NotADrop("the unjoined call ships on its own, carrying the correlation-conflict marker")
+        Marker("CORRELATION_CONFLICT", at="_adapters/_assembler.py")
     ),
     ("_adapters/_otel_merge.py", "bump", "'adapters.anthropic.otel_bridge.span_unrecognized'"): (
         _BRIDGE
@@ -681,7 +679,7 @@ _CENSUS: dict[tuple[str, str, str], object] = {
         "H2_REQUEST_EVICTED", at="_interceptors/_trackers.py"
     ),
     ("_protocol/_http1.py", "bump", "'protocol.limitation_unresolved'"): NotADrop(
-        "unreachable while the limitation census holds: every core marker has a member"
+        "unreachable while the limitation census holds: each code the core emits has a member"
     ),
     ("_semantics/_genai.py", "bump", "'protocol.semantic.provider_inferred'"): Marker(
         "PROVIDER_INFERRED", at="_semantics/_genai.py"
@@ -992,6 +990,15 @@ def test_every_entry_says_why_in_plain_words():
             continue
         assert text and len(text) > 10, f"{key}: say why"
         assert not _INTERNAL_REFERENCE.search(text), f"{key}: {text!r} cites an internal key"
+
+
+def test_a_loss_a_marker_carries_is_filed_as_a_marker():
+    """Nothing checks a `NotADrop` reason against the source; a `Marker` entry
+    is checked. So "a span carries a marker for it" is never a `NotADrop`
+    reason: it is a `Marker`, with `at` naming the module that attaches the
+    member when that is not the signal's own function."""
+    wrong = [k for k, d in _CENSUS.items() if isinstance(d, NotADrop) and "marker" in d.why.lower()]
+    assert not wrong, f"file these as Marker(member, at=...): {wrong}"
 
 
 def test_the_ledger_vocabulary_is_used_through_its_members_only(scanned):
