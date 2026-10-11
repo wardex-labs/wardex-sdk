@@ -87,9 +87,11 @@ pub struct Limits {
     /// left *after* a parse pass — a header block with no terminator, a torn
     /// chunk-size line, an unterminated JSON-RPC line, or bytes that are not
     /// the expected protocol at all. HTTP/2 applies it to the header blocks
-    /// awaiting CONTINUATION frames, and the JSON-RPC parser also skips (and
-    /// counts) a COMPLETE line longer than this, so a line is held to the same
-    /// length whether it arrives in one read or in many. Body bytes never appear in that residue:
+    /// awaiting CONTINUATION frames. The JSON-RPC parser never parses a line
+    /// longer than this: one that lands whole in a single read is skipped and
+    /// counted with the stream kept, while one arriving across reads (the usual
+    /// way a large pipe write arrives) latches the stream off like any other
+    /// unterminated residue. Body bytes never appear in that residue:
     /// the parser moves them into the message as it consumes them, and how
     /// many are stored is `max_body_bytes`'s decision alone. A body of any
     /// declared size therefore passes through whatever this value is, so the
