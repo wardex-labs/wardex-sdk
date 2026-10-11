@@ -220,14 +220,17 @@ class WardexTransport(Transport):
             counters.bump("transport.wardex.export_failed")
             # What the batch is lost as, and whether its drop report can go
             # back into the ledger or must be resent as it was. Counted only
-            # when this settle is news: a subclass that sends the same batch
-            # twice has lost it once.
+            # when this failure is news: a subclass that sends the same batch
+            # twice has lost it once. Counted BEFORE the settle: `unsent` folds,
+            # and a shutdown signal that lands in that fold runs as it ends,
+            # where the process dies.
             lost_as, definite = _classify_failure(exc)
-            ledger.record_failed_send()
-            if ledger.unsent(envelope, definite=definite):
+            if not ledger.already_unsent(envelope):
                 ledger.record_items(
                     lost_as, len(envelope.spans) - len(unmarshalled), len(envelope.state_snapshots)
                 )
+            ledger.record_failed_send()
+            ledger.unsent(envelope, definite=definite)
             # `exc` may quote the URL; it never quotes the Authorization
             # header, so the debug line cannot echo the key.
             if self._debug:

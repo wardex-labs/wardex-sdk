@@ -109,7 +109,7 @@ def _fresh_drop_ledger() -> Iterator[None]:
     from wardex_sdk._assembly import _drops, _ledger
 
     _ledger._reset_for_tests()
-    _drops._last_undelivered_line = ""
+    _drops._last_undelivered = None
     yield
 
 

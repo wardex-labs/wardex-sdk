@@ -45,7 +45,10 @@ and its process dies before the frame resumes. So wardex's handler asks
 and runs as that fold ends, microseconds later, with the tables whole. A fold
 on another thread is read around instead (`undelivered`): each move between
 tables is ordered so that a reader finds it on one side only while that fold
-is parked.
+is parked. The process may die as the fold ends, so a caller puts what it
+must have counted by then into the inbox before the call that folds: a failed
+batch's items before `unsent`, and both units of `record_items` before either
+record can fold.
 
 DELIVERY, and why a count is never sent twice nor dropped. `attach` cuts the
 pending counts into a report stamped with a strictly increasing `timestamp_ns`,
@@ -69,9 +72,10 @@ A report is settled at most once per time it is handed out, and only by the
 drain that handed it out: a drain a signal handler runs on top of one whose
 POST is still in flight takes only what is not out already, and leaves the
 outer drain's reports for the outer drain to settle. A batch's failure is
-accounted at most once: a transport subclass that raises after its own
-`export` already settled the batch gets `False` back from `unsent` and counts
-nothing a second time.
+accounted at most once, and before it is settled: the caller asks
+`already_unsent` first, records the batch's items only when it says False (a
+transport subclass that raises after its own `export` settled the batch has
+them counted already), and then calls `unsent`.
 
 Only a transport that can carry a report gets one: `carries()` asks for
 `_carries_client_report`, which the wardex envelope transport sets. Taking the
@@ -110,6 +114,7 @@ __all__ = [
     "LedgerSnapshot",
     "Loss",
     "ReasonInfo",
+    "already_unsent",
     "attach",
     "carries",
     "done",
@@ -291,7 +296,14 @@ def record(
 def record_items(
     reason: DropReason, spans: int, snapshots: int, *, where: str | None = None
 ) -> None:
-    """`record` for a batch: its spans and its state snapshots, each in its own unit."""
+    """`record` for a batch: its spans and its state snapshots, each in its own unit.
+
+    Both are in the inbox before either record can fold: a signal held in that
+    fold runs as it ends and may end the process there, before a second record."""
+    member = _REASON_OF.get(reason)
+    if member is not None and spans > 0 and snapshots > 0:
+        _INBOX.append((member, DropUnit.SNAPSHOT, snapshots, where))  # the record below folds it
+        snapshots = 0
     record(reason, spans, DropUnit.SPAN, where=where)
     record(reason, snapshots, DropUnit.SNAPSHOT, where=where)
 
@@ -424,19 +436,30 @@ def attach(envelope: Envelope, transport: object, queue_depth: int) -> Envelope:
     return replace(envelope, client_reports=held + tuple(reports))
 
 
+def already_unsent(envelope: object) -> bool:
+    """Whether `unsent` already settled this envelope's failure for the drain
+    still holding it -- a transport subclass that raised after its own `export`
+    settled the batch, or one that sent the same batch twice. The batch's items
+    are in the ledger once already then, so a caller accounting the failed
+    batch records them only when this is False.
+
+    Asked BEFORE `unsent`, and the items recorded before it too: `unsent`
+    folds, and a shutdown signal that lands in that fold runs as it ends, where
+    its process dies. Reads one entry; never waits."""
+    return _UNSENT.get(id(envelope)) is envelope
+
+
 def unsent(envelope: Envelope, *, definite: bool, last: bool = False) -> bool:
     """The POST carrying `envelope` failed. `definite`: the receiver certainly
     did not store it, so its fresh counts go back into the pending table;
     otherwise every report it carried is held and sent again unchanged.
 
-    Returns whether this is news. False, changing nothing, when this same
-    envelope was already settled -- a transport subclass that raised after its
-    own `export` settled the batch -- so the caller does not count the batch's
-    items twice. Every caller that accounts a failed batch asks this first.
+    Returns whether this is news, as `already_unsent` said before the call:
+    False, changing nothing, when this same envelope was already settled.
     `last`: no settle of this envelope follows (the drain's raise path), so it
     is not remembered past the answer."""
     key = id(envelope)
-    if _UNSENT.get(key) is envelope:
+    if already_unsent(envelope):
         if last:
             _UNSENT.pop(key, None)
         return False

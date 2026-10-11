@@ -18,13 +18,14 @@ cases are the contract:
   * a fork child's first report carries none of the parent's counts;
   * a drain never waits for the ledger, and neither does a signal's flush;
   * a process dying on a signal ships the counts it holds, or says them, and
-    a signal that lands inside a fold waits for the fold to end;
+    a signal that lands inside a fold waits for the fold to end, then finds a
+    failed batch counted (or back in the buffer) even when that fold settled it;
   * one failed batch is accounted once, however its transport raised, and
     is not kept once its drain is over.
 
 The rest pins the ledger's own rules: never raising, never reduced by sending,
 the bound on unconfirmed reports, the int32 carry, and the one line `close()`
-prints when the final send fails.
+prints when the final send fails, again for a new loss that reads the same.
 """
 
 from __future__ import annotations
@@ -1103,6 +1104,118 @@ def test_a_signal_landing_inside_a_fold_is_neither_lost_nor_kept_from_the_receiv
         assert every in line
 
 
+_SIGNAL_IN_SETTLE_CHILD = r"""
+import os, signal, sys
+import wardex_sdk
+from wardex_sdk import _hub
+from wardex_sdk._assembly import _ledger
+from wardex_sdk._assembly._ledger import DropReason
+from wardex_sdk._config import BackendConfig
+from wardex_sdk.transport._base import UNDELIVERED
+
+wardex_sdk.init(backend=BackendConfig(api_key=sys.argv[2], base_url=sys.argv[1]), intercept=False)
+client = _hub.get_client()
+client._worker.stop()
+transport = client._transport
+transport._timeout = 0.3  # an unanswered POST gives up well inside the receiver's stall
+real_export = transport.export
+first = [True]
+
+
+def export(envelope, **kwargs):
+    if first[0]:
+        first[0] = False
+        if sys.argv[3] == "raised":
+            raise RuntimeError("the transport raised")
+        if sys.argv[3] == "declined":
+            return UNDELIVERED
+    return real_export(envelope, **kwargs)
+
+
+transport.export = export
+_ledger.record(DropReason.TABLE_FULL, 3)  # so the failed batch carries a drop report
+with wardex_sdk.span("s"):
+    pass
+
+
+def hook(frame, event, arg):
+    # The fold that settles the failed batch's report: the first with a settle queued.
+    if event == "c_call" and frame.f_code is _ledger._fold_held.__code__ and _ledger._SETTLED:
+        sys.setprofile(None)
+        os.kill(os.getpid(), signal.SIGTERM)
+
+
+sys.setprofile(hook)
+client.flush(5.0)
+sys.setprofile(None)
+"""
+
+_SETTLE_CASES = {
+    "refused": ([("status", 500), ("status", 202)], {"send_error:span": 1}),
+    "unanswered": ([("stall", 1.0), ("status", 202)], {"send_unconfirmed:span": 1}),
+    "raised": ([("status", 202)], {"send_error:span": 1}),
+    "declined": ([("status", 202)], {}),
+}
+
+
+@posix_signals
+@pytest.mark.parametrize("how", list(_SETTLE_CASES), ids=list(_SETTLE_CASES))
+def test_a_signal_landing_in_a_failed_batchs_settle_finds_the_batch_counted(receiver, how):
+    """A real SIGTERM, landing in the fold that settles a failed batch's drop
+    report. It runs as that fold ends and the process dies there, so whatever
+    the failure costs must be in the ledger, or back in the buffer, before the
+    settle: the refused, unanswered or raised batch's own spans used to be
+    counted after it, and reached neither the receiver nor the line; a
+    declined batch went back to the buffer after it, so the dying flush never
+    saw it."""
+    receiver.script, lost = _SETTLE_CASES[how]
+    proc = subprocess.run(
+        [sys.executable, "-c", _SIGNAL_IN_SETTLE_CHILD, receiver.url, KEY, how],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert proc.returncode == -signal.SIGTERM, proc.stderr
+    stored = [d for status, d in receiver.decoded() if status is None or status < 300]
+    folded = {r["timestamp_ns"]: r for d in stored for r in _reports(d)}  # as the receiver folds
+    assert _events(list(folded.values())) == {"table_full:entry": 3, **lost}
+    assert [ln for ln in proc.stderr.splitlines() if "no receiver has confirmed" in ln] == []
+    if how == "declined":
+        assert [name for d in stored for name in _span_names(d)] == ["s"]
+
+
+def test_a_batch_is_whole_in_the_ledger_before_its_record_can_fold():
+    """A signal held in the fold a batch's span record makes runs as that fold
+    ends, and may end the process there: the batch's snapshots are in the
+    ledger by then too."""
+    seen: list[dict] = []
+    held: list[bool] = []
+
+    def handler(signum: int, frame: object) -> None:
+        seen.append(dict(_ledger.snapshot().counts))
+
+    def hook(frame, event, arg):  # noqa: ANN001, ANN202
+        if event == "c_call" and frame.f_code is _ledger.record.__code__ and _ledger._folding:
+            if not held:
+                held.append(_ledger.hold_signal(handler, signal.SIGTERM, frame))
+
+    for _ in range(_ledger._FOLD_AT - 1):  # the inbox one record short of a fold
+        _ledger.record(DropReason.TABLE_FULL)
+    sys.setprofile(hook)
+    try:
+        _ledger.record_items(DropReason.SEND_ERROR, 2, 3)
+    finally:
+        sys.setprofile(None)
+    assert held == [True]
+    assert seen == [
+        {
+            (DropReason.TABLE_FULL, DropUnit.ENTRY): _ledger._FOLD_AT - 1,
+            (DropReason.SEND_ERROR, DropUnit.SPAN): 2,
+            (DropReason.SEND_ERROR, DropUnit.SNAPSHOT): 3,
+        }
+    ]
+
+
 def test_close_sends_what_the_ledger_holds_whatever_the_interval(receiver, monkeypatch):
     now = [1000.0]
     monkeypatch.setattr(_ledger, "_monotonic", lambda: now[0])
@@ -1571,6 +1684,46 @@ def test_close_says_nothing_when_the_report_was_delivered(receiver, capsys):
         }
     finally:
         _hub.reset_for_test()
+
+
+def test_close_says_a_new_loss_that_reads_like_the_last_one(receiver, capsys):
+    """The line is a repeat only when nothing was lost since it was said. A
+    re-init delivers the counts the first close() said; two new spans lost the
+    same way read word for word the same, and are said again."""
+    from wardex_sdk._assembly import report_undelivered_drops
+
+    def said() -> list[str]:
+        return [
+            ln for ln in capsys.readouterr().err.splitlines() if "no receiver has confirmed" in ln
+        ]
+
+    receiver.script = [("status", 500)]
+    lines: list[list[str]] = []
+    try:
+        for again in (False, True):
+            wardex_sdk.init(
+                backend=BackendConfig(api_key=KEY, base_url=receiver.url), intercept=False
+            )
+            client = _hub.get_client()
+            client._worker.stop()
+            if again:
+                receiver.script = [("status", 202)]
+                wardex_sdk.flush(5.0)  # what the first close() said is delivered here
+                receiver.script = [("status", 500)]
+            for _ in range(2):
+                with wardex_sdk.span("s"):
+                    pass
+            said()
+            wardex_sdk.close(1.0)
+            lines.append(said())
+        report_undelivered_drops(client)  # nothing lost since the last line: nothing said
+        lines.append(said())
+    finally:
+        _hub.reset_for_test()
+    [[first], [second], []] = lines
+    assert first == second and first.endswith("(reason:unit=count): send_error:span=2")
+    stored = [r for status, d in receiver.decoded() if status == 202 for r in _reports(d)]
+    assert _events(stored) == {"send_error:span": 2}
 
 
 def test_the_fork_reset_starts_from_zero_with_a_fresh_lock():

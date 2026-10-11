@@ -25,6 +25,7 @@ printed here only where the caller passes its debug setting in.
 
 from __future__ import annotations
 
+import os
 from collections import deque
 
 from .._types import Envelope
@@ -61,15 +62,15 @@ def lose(
     report_once(line, key=key)
 
 
-def count_drain_drop(
-    cause: str, envelope: Envelope, spans: deque, snapshots: deque, *, news: bool = True
-) -> str:
+def count_drain_drop(cause: str, envelope: Envelope, spans: deque, snapshots: deque) -> str:
     """Tally each item a raise made `_drain` drop, under `client.drain.span_dropped.<cause>`
     and `client.drain.snapshot_dropped.<cause>`, and say how many: the envelope the raise took
     (a hook may have filtered it on purpose), else the whole batch if it has no readable items.
 
-    `news` is `_ledger.unsent`'s answer for the envelope: False when the transport already
-    settled this batch's failure and then raised, so its items are in the ledger once already.
+    The ledger records them unless it settled this envelope's failure already: a transport that
+    did that and then raised has them in it once (`_ledger.already_unsent`). The caller settles
+    the envelope only after this, since that settle folds and a signal held there may end the
+    process as it ends.
 
     Runs inside a fail-closed handler, so it may not raise either: an envelope whose items
     cannot be read (a hook may have returned anything) falls back to the batch, through
@@ -81,7 +82,7 @@ def count_drain_drop(
         counters.bump(f"client.drain.span_dropped.{cause}")
     for _ in range(n_snapshots):
         counters.bump(f"client.drain.snapshot_dropped.{cause}")
-    if news:
+    if not _ledger.already_unsent(envelope):
         record_items(_DRAIN_DROP_REASONS.get(cause, DropReason.SEND_ERROR), n_spans, n_snapshots)
     return f"{n_spans} span(s)" + (f" and {n_snapshots} state snapshot(s)" if n_snapshots else "")
 
@@ -317,11 +318,15 @@ def report_undelivered_drops(client: object, *, who: str = "close()") -> None:
 
     Silent when nothing was lost -- the reasons that are not losses
     (`before_send`, `excluded_by_policy`) never print this on their own --
-    and silent when the line would repeat the last one word for word, so a
-    second `close()` with nothing new to say says nothing. Never raises: a
-    signal handler calls it with nothing around it.
+    and silent when nothing was lost since the last line and this one would
+    repeat it word for word, so a second `close()` with nothing new to say
+    says nothing. A new loss that reads the same (a re-init delivered what the
+    last line said, then the same loss happened again) is said: the process's
+    loss totals only grow, and grow with every loss, so they tell the two
+    apart. A fork child starts its totals from zero, so its pid is compared
+    too. Never raises: a signal handler calls it with nothing around it.
     """
-    global _last_undelivered_line
+    global _last_undelivered
     with guard("drops.undelivered_report"):
         if not _ledger.carries(getattr(client, "_transport", None)):
             return
@@ -337,10 +342,17 @@ def report_undelivered_drops(client: object, *, who: str = "close()") -> None:
             f"{who} finished holding counts of lost data that no receiver has confirmed, and "
             f"nothing will send them now (reason:unit=count): {counts}"
         )
-        if line != _last_undelivered_line:
-            _last_undelivered_line = line
+        totals = _ledger.snapshot().counts
+        said = (
+            os.getpid(),
+            line,
+            {k: n for k, n in totals.items() if REASONS[k[0]].loss != "none"},
+        )
+        if said != _last_undelivered:
+            _last_undelivered = said
             diag_warning(line)
 
 
-#: The last line `report_undelivered_drops` printed, so it is not printed twice.
-_last_undelivered_line = ""
+#: What `report_undelivered_drops` last printed, as (pid, line, the loss totals
+#: then), so the same line is not printed twice with nothing lost between.
+_last_undelivered: tuple[int, str, dict] | None = None

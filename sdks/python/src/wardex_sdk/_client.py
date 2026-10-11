@@ -1037,15 +1037,13 @@ class Client:
                 event_id=str(uuid.uuid4()),
                 sdk=self._sdk_info,
                 sent_at_ns=time.time_ns(),
-                # The pid is stamped LIVE, per batch, never cached: it is then
-                # correct in every process — a fork child before its hook ran,
-                # a platform where no hook runs at all — because the process
-                # doing the drain is by definition the process the number
-                # names. One getpid() per batch, on the worker's periodic
-                # path, nowhere near a capture. This is what lets a backend
-                # attribute a span to parent or child (OTel Python stamps its
-                # resource once at construction, and a forked child exports
-                # under the parent's pid — a known gap, closed here).
+                # The pid is stamped LIVE, per batch, never cached: it is then correct in every
+                # process — a fork child before its hook ran, a platform where no hook runs at all —
+                # because the process doing the drain is by definition the process the number names.
+                # One getpid() per batch, on the worker's periodic path, nowhere near a capture.
+                # This is what lets a backend attribute a span to parent or child (OTel Python
+                # stamps its resource once at construction, and a forked child exports under the
+                # parent's pid — a known gap, closed here).
                 resource=replace(self._resource_info, process_pid=os.getpid()),
             )
             envelope = Envelope(
@@ -1092,7 +1090,6 @@ class Client:
                 )
                 shipped = self._export(envelope, deadline, named)
             except Exception as exc:  # fail-closed: drop, never ship half-filtered data
-                news = ledger.unsent(envelope, definite=False, last=True)  # may have gone: resend
                 # Also not routed into `_undelivered`, deliberately. A raise means an attempt
                 # of unknown outcome -- the transport may have sent half of it -- so
                 # re-queueing risks a duplicate. (The hook's own raise is handled above, where
@@ -1100,7 +1097,10 @@ class Client:
                 # which would pin the batch in the buffer forever if re-queued.)
                 # Counted and said off-debug, as the hook's raise is: a transport that raised on
                 # every batch must not look, in a default process, like one with nothing to send.
-                what = count_drain_drop("export_raised", envelope, spans, snapshots, news=news)
+                what = count_drain_drop("export_raised", envelope, spans, snapshots)
+                # Settled after the count: the settle folds, and a signal held there may end the
+                # process as it ends. Its reports may have gone, so they are resent.
+                ledger.unsent(envelope, definite=False, last=True)
                 report_once(
                     f"transport export raised; a batch of {what} was dropped and is not "
                     "retried, because the transport may have sent part of it (every such drop "
@@ -1111,9 +1111,9 @@ class Client:
                 if self._config.debug:
                     _log_with_traceback("client.export", exc)
                 return
-            if not shipped:
-                ledger.unsent(envelope, definite=True)
+            if not shipped:  # back in the buffer, or counted, before the settle folds
                 self._undelivered(spans, snapshots, final=final)
+                ledger.unsent(envelope, definite=True)
             ledger.done(envelope)  # its reports no failure above settled were delivered
             self._flush_transport(deadline)
         finally:
