@@ -420,6 +420,20 @@ All notable changes to this project are documented here. The format follows
   finished inside cost the rest of the block its id and its parent and
   brought the finished trace's group id back after the block; a trace now
   puts back the scope it found only while its own is still the current one.
+- **A conversation opened inside a framework run now reaches the runs it
+  starts.** A `wardex.conversation(...)` opened inside a LangGraph node did
+  not reach the subgraph the node ran: the inner run, its steps and its
+  tools carried the outer run's thread id, and a subgraph one level deeper
+  its own. A unit wardex opens under another one inherited the parent's
+  conversation without looking at what your code had opened since. Now a run
+  started inside the block (a LangGraph graph run, an openai-agents agent)
+  carries the block's conversation, and so does everything under it, at any
+  depth, whether or not the run finishes inside the block. A run's
+  conversation is fixed when it starts, so one run never spans two
+  conversations: the structural step spans of a run that started before the
+  block keep that run's conversation where they open inside the block, while
+  the spans your code opens and the LLM calls made inside the block carry
+  the block's.
 - **An OpenAI Responses stream that fails midway now fails its chat span.**
   A Responses API stream (`responses.create(stream=True)`, the openai-agents
   default) that started with a 200 and then ended in a `response.failed`

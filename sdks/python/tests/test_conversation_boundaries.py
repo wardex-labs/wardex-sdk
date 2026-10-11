@@ -31,6 +31,7 @@ from collections.abc import Callable
 from typing import Any
 
 import pytest
+from agents import agent_span, custom_span, function_span
 from agents import trace as agents_trace
 
 import wardex_sdk as wardex
@@ -587,3 +588,28 @@ def test_a_trace_finished_inside_a_conversation_leaves_the_block_its_own(llm):  
     assert _conv(_call(spans, "in-block")) == "Z"
     assert _conv(_named(spans, "after")) is None
     assert _conv(_call(spans, "after-block")) is None
+
+
+@pytest.mark.usefixtures("agents_env")
+@pytest.mark.parametrize("group_id", ["G", None])
+def test_an_agent_started_in_a_host_conversation_inside_a_run_carries_it(group_id):
+    """A unit opened under another unit inherits the parent's conversation,
+    unless it starts a run of its own inside a conversation the host opened
+    within the parent: an agent started inside the host's block is in the
+    block, and so is everything under it. A run's conversation is fixed when
+    the run starts, so a step of the outer run opened in the same block keeps
+    the run's, as do the run's spans opened before the block."""
+
+    def run() -> None:
+        with agents_trace("wf", group_id=group_id), function_span("tool"):
+            with wardex.conversation("chat", id="H"):
+                with agent_span("Inner"), custom_span("inner-step"):
+                    pass
+                with custom_span("outer-step"):
+                    pass
+
+    spans = _shipped(run, **_AGENTS)
+    assert _conv(_named(spans, "invoke_agent Inner")) == "H"
+    assert _conv(_named(spans, "execute_step inner-step")) == "H"
+    assert _conv(_named(spans, "execute_step outer-step")) == group_id
+    assert _conv(_named(spans, "execute_tool tool")) == group_id
