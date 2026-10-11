@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+import types
 
 import pytest
 
@@ -401,3 +402,131 @@ def test_a_snapshot_attribute_is_named_on_the_snapshot_and_the_batch_ships():
     assert items[0]["span"]["name"] == "good"
     attrs = {kv["key"]: kv["value"] for kv in items[1]["state_snapshot"]["attributes"]}
     assert attrs == {"big": str(2**70), "fine": "yes", _UNMARSHALLED: "big,odd"}
+
+
+# An integer that is not an `int`: numpy's, or anything with `__index__`.
+# `float()` falls back to `__index__`, so before these were read EXACTLY a
+# `np.uint64(2**64 - 1)` shipped as `1.8446744073709552e+19`, rounded and
+# unnamed. numpy is not a test dependency; these stand in for its scalars,
+# and the real ones join the parametrization wherever numpy is installed.
+
+
+class _IndexOnly:
+    """Only `__index__`, as a numpy integer scalar is to the encoder."""
+
+    def __init__(self, n: int) -> None:
+        self.n = n
+
+    def __index__(self) -> int:
+        return self.n
+
+
+class _Uint64Like(_IndexOnly):
+    """`__index__` AND `__float__`, so the float read would also take it."""
+
+    def __float__(self) -> float:
+        return float(self.n)
+
+
+def _numpy_scalars() -> list:
+    try:
+        import numpy
+    except ImportError:
+        return []
+    return [
+        pytest.param(numpy.uint64(2**64 - 1), str(2**64 - 1), id="numpy.uint64-max"),
+        pytest.param(numpy.uint64(2**63), str(2**63), id="numpy.uint64-2**63"),
+        pytest.param(numpy.int64(-5), -5, id="numpy.int64"),
+    ]
+
+
+@pytest.mark.parametrize("encode", _EXPORT_ENCODERS)
+@pytest.mark.parametrize(
+    ("value", "shipped"),
+    [
+        pytest.param(_IndexOnly(2**70), str(2**70), id="__index__-2**70"),
+        pytest.param(_Uint64Like(2**64 - 1), str(2**64 - 1), id="uint64-like-max"),
+        pytest.param(_IndexOnly(-(2**63) - 1), str(-(2**63) - 1), id="__index__-below-int64"),
+        pytest.param(_IndexOnly(5), 5, id="__index__-in-range"),
+        *_numpy_scalars(),
+    ],
+)
+def test_an_integer_that_is_not_an_int_is_read_exactly(encode, value, shipped):
+    bad = encode(_batch(value))["bad"]
+    assert bad["req_id"] == shipped and type(bad["req_id"]) is type(shipped)
+    if isinstance(shipped, str):
+        assert bad[_UNMARSHALLED] == "req_id"
+    else:
+        assert _UNMARSHALLED not in bad
+
+
+class _FakeNumpyBool:
+    def __init__(self, value: bool) -> None:
+        self.value = value
+
+    def __bool__(self) -> bool:
+        return self.value
+
+    def __float__(self) -> float:
+        return float(self.value)
+
+
+@pytest.mark.parametrize("encode", _EXPORT_ENCODERS)
+def test_a_numpy_bool_ships_as_a_bool_not_as_its_float(encode, monkeypatch):
+    # numpy 2's `bool_` is neither an `int` nor an `__index__`, so the float
+    # read took it as `1.0`. It is recognized through `sys.modules`, never by
+    # importing numpy, which this stand-in module exercises without numpy.
+    fake = types.ModuleType("numpy")
+    fake.bool_ = _FakeNumpyBool  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "numpy", fake)
+    for flag in (True, False):
+        bad = encode(_batch(_FakeNumpyBool(flag)))["bad"]
+        assert bad["req_id"] is flag
+        assert _UNMARSHALLED not in bad
+
+
+@pytest.mark.parametrize("encode", _EXPORT_ENCODERS)
+@pytest.mark.parametrize(
+    ("key", "named"),
+    [
+        pytest.param(123, "<non-str key>", id="int-key"),
+        pytest.param(b"req_id", "<non-str key>", id="bytes-key"),
+        pytest.param("\ud800", "<unencodable key>", id="lone-surrogate-key"),
+    ],
+)
+def test_a_key_the_wire_cannot_hold_is_left_out_named_and_the_batch_ships(encode, key, named):
+    good = _span(name="good", extra=(("n", 1),))
+    bad = _span(
+        name="bad",
+        context=SpanContext(trace_id=TraceId(b"\x01" * 16), span_id=SpanId(b"\x03" * 8)),
+        extra=(("before", "kept"), (key, "x"), ("after", 2.5)),
+    )
+    spans = encode(Envelope(header=_header(), spans=(good, bad)))
+    assert set(spans) == {"good", "bad"}, "one key cost the whole batch"
+    # Named by a fixed placeholder: spelling the key would run its host code.
+    assert spans["bad"] == {"before": "kept", "after": 2.5, _UNMARSHALLED: named}
+
+
+@pytest.mark.parametrize("encode", _EXPORT_ENCODERS)
+def test_the_note_replaces_a_host_attribute_of_the_same_name(encode):
+    # Pushed beside it, the key would ship twice, and a decoder keeps one of a
+    # duplicated key -- the backend's choice which.
+    env = Envelope(
+        header=_header(),
+        spans=(_span(extra=((_UNMARSHALLED, "host value"), ("odd", object()))),),
+    )
+    if encode is _otlp_spans:
+        bodies, *_ = _wardex_native.codec.encode_otlp_requests(env, "off", [], None, False)
+        decoded = _wardex_native.codec.decode_otlp_traces(bodies[0])
+        assert bodies[0].count(_UNMARSHALLED.encode()) == 1
+        (span,) = decoded["resource_spans"][0]["scope_spans"][0]["spans"]
+        assert span["attributes"][_UNMARSHALLED] == "odd"
+    else:
+        body, *_ = _wardex_native.codec.encode_envelope_export(env, "off", [], None)
+        (item,) = _codec.decode(body)["items"]
+        notes = [kv["value"] for kv in item["span"]["extra"] if kv["key"] == _UNMARSHALLED]
+        assert notes == ["odd"]
+    # With nothing to name, the host's own attribute is left as it was.
+    clean = Envelope(header=_header(), spans=(_span(extra=((_UNMARSHALLED, "host value"),)),))
+    (attrs,) = encode(clean).values()
+    assert attrs[_UNMARSHALLED] == "host value"

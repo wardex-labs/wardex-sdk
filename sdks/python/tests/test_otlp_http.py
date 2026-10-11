@@ -326,6 +326,48 @@ def test_a_span_sent_without_its_payload_names_the_request_cap_and_is_counted_on
         srv.server_close()
 
 
+@pytest.mark.usefixtures("fresh_counters")
+def test_a_non_str_attribute_key_costs_that_attribute_not_the_batch():
+    """Through the public path: `set_attribute(123, ...)` used to raise inside
+    the encoder, and the client's drain then dropped the whole batch -- every
+    span in it -- counted only as an export that raised. The attribute is left
+    out now, named by a placeholder rather than by the key's own text, and the
+    batch ships."""
+    import wardex_sdk
+    from wardex_sdk._assembly import counters
+
+    srv = _serve()
+    try:
+        port = srv.server_address[1]
+        wardex_sdk.init(
+            transport=OtlpHttpTransport(endpoint=f"http://127.0.0.1:{port}/v1/traces"),
+            intercept=False,
+        )
+        with wardex_sdk.span("first"):
+            pass
+        with wardex_sdk.span("odd-key") as span:
+            span.set_attribute(123, "x")  # type: ignore[arg-type]
+            span.set_attribute("kept", "yes")
+        with wardex_sdk.span("last"):
+            pass
+        wardex_sdk.flush()
+        wardex_sdk.close()
+        by_name = {
+            sp["name"]: sp["attributes"]
+            for request in _Handler.requests
+            for rs in _decode(request)["resource_spans"]
+            for ss in rs["scope_spans"]
+            for sp in ss["spans"]
+        }
+        assert set(by_name) == {"first", "odd-key", "last"}
+        assert by_name["odd-key"]["kept"] == "yes"
+        assert by_name["odd-key"]["wardex.codec.unmarshalled"] == "<non-str key>"
+        assert counters.get("client.drain.span_dropped.export_raised") == 0
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
 def test_a_split_export_abandoned_partway_says_so_off_debug(monkeypatch, capsys):
     """Splitting introduced an outcome one POST per envelope did not have: the
     backend keeps the first chunks and never receives the rest, so the trace
