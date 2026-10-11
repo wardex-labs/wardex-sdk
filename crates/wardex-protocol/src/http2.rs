@@ -139,6 +139,12 @@ const PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 /// `hpack_table_size_exceeded`: refusing the update while decoding on would
 /// leave this side's table out of step with the encoder's and corrupt every
 /// later header block on the connection.
+///
+/// The parser does not read SETTINGS frames, so this is one fixed bound on
+/// both decoders rather than the size each side advertised. It is lenient
+/// toward the 4096 every measured LLM API leaves in place, and a process that
+/// configures its own HTTP/2 stack's table above 64 KiB loses capture of that
+/// connection, visibly, with `hpack_table_size_exceeded`.
 const MAX_HPACK_TABLE_BYTES: usize = 64 * 1024;
 
 /// A completed request/response transaction for one stream.

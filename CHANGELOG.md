@@ -358,6 +358,54 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- **A read made of many small HTTP/2, WebSocket or JSON-RPC frames no longer
+  stalls your thread.** Each of those parsers removed every frame it parsed
+  from the front of its buffer, moving the rest of the read once per frame, on
+  your own thread with the GIL held: one 256 KiB read cost 68 ms as 9-byte
+  HTTP/2 frames, 309 ms as 2-byte WebSocket frames and 636 ms as empty
+  JSON-RPC lines. The same reads now cost 0.19, 0.66 and 0.34 ms, and the cost
+  grows with the read, not with its square.
+- **Three things the protocol parsers held had no bound; now each has one,
+  and crossing it is said.** HTTP/2 header blocks waiting for their
+  CONTINUATION frames count against `max_streams` and
+  `max_stream_buffer_bytes`, and past either the connection stops being read
+  (`stream_buffer_exceeded`). An HTTP/2 peer can no longer grow the header
+  compression table past 64 KiB, the most common peers ask for; a request for
+  more stops reading that connection (`hpack_table_size_exceeded`). Both reach
+  the existing "a protocol parser stopped reading a connection" line. An MCP
+  stdio line longer than `max_stream_buffer_bytes` is never parsed: when the
+  whole line arrives in one read it is skipped on its own, counted under
+  `interceptors.mcp_stdio.line_over_cap` and said once, and the subprocess
+  stays captured; when it arrives across reads, which is how a write that large
+  usually arrives, the stream stops being read, as it did before, and the
+  existing parser-stopped line says so.
+- **An HTTP/2 body cut at its cap now says so the way HTTP/1 does.** The span
+  carries `body_cap_exceeded`, so one query finds capped bodies on both.
+- **An MCP tool's whole answer now reaches the span.** A tool that answered
+  with `structuredContent` and an empty `content` list shipped as an OK span
+  whose output was `[]`, and next to `content` the `structuredContent` and
+  `_meta` were dropped. The output is now the `content` list when that is all
+  the result holds, as before, and the whole result object whenever it holds
+  more. `isError: true` is an error whatever else the result lacks. A result
+  wardex cannot vouch for (not an object, a `resultType` other than
+  `complete` such as `input_required`, an `isError` that is not a boolean or
+  is spelled another way, a `content` that is not a list, or no tool output at
+  all) ships as it came, with status `UNSET` and `semantic_parse_failed`,
+  instead of as a success. Spans carry `mcp.protocol.version`, the MCP
+  revision they were read against, when the peer names one that reads as a
+  revision identifier; one that does not is left off, counted and said once.
+- **An MCP tool call over stdio is now an `execute_tool` span.** It is named
+  `execute_tool {tool}`, kind CLIENT, with `gen_ai.operation.name` set, so it
+  is counted with every other tool call (before, every one was `MCP
+  tools/call`). The tool name names the span only when it is a printable string
+  of at most 128 characters. While the openai-agents or LangGraph adapter is
+  installed, the call stays `MCP tools/call`: those adapters already record
+  it as their own `execute_tool` span, in another trace, and one call must not
+  count twice. That choice is said once, naming the adapter; leave the adapter
+  out with `AdaptersConfig(enabled=...)` to have a raw `mcp` client's calls
+  counted. JSON-RPC batch lines, which older MCP revisions allowed and which
+  were dropped, are read message by message, and a request dropped because
+  4096 were already waiting is counted and said once.
 - **An attribute the wire cannot hold no longer costs the batch, and a large
   integer no longer turns into a float.** `span.set_attribute("req_id",
   2**70)` exported `1.1805916207174113e+21`, and so did a numpy integer such

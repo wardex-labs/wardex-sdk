@@ -8,11 +8,13 @@
 //! non-JSON-RPC line is. Older MCP revisions allowed batches, so a server written against one
 //! can answer a batch with a batch.
 //!
-//! No line longer than `max_stream_buffer_bytes` is ever parsed, however it arrives. A line that
-//! never terminates within that many bytes latches the stream off (`disabled_reason`), because
-//! the parser cannot find where it ends; a line that arrives complete in one read is skipped on
-//! its own and counted (`lines_over_cap`), because the framing around it is intact and the next
-//! line is still readable.
+//! No line longer than `max_stream_buffer_bytes` is ever parsed, however it arrives, but what
+//! happens to the stream depends on how it arrives. Only a line that lands WHOLE in one read is
+//! skipped on its own and counted (`lines_over_cap`), with the stream kept: its newline is in
+//! hand, so the framing around it is intact. A line that arrives across reads latches the whole
+//! stream off (`disabled_reason() == "stream_buffer_exceeded"`) as soon as the unterminated part
+//! passes the bound, because the parser cannot yet find where it ends. The second is the usual
+//! case: a pipe write over 16 MiB reaches the reader in pieces far smaller than that.
 
 use serde_json::Value;
 use wardex_limits::Limits;
