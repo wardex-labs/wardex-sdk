@@ -569,6 +569,7 @@ _CENSUS: dict[tuple[str, str, str], object] = {
         "SEND_ERROR",
         "RATELIMIT_BACKOFF",
         "SEND_UNCONFIRMED",
+        "REQUEST_TOO_LARGE",
         at="transport/_otlp_http.py",
     ),
     ("_assembly/_drops.py", "report_once", "key"): Structural(
@@ -708,11 +709,14 @@ _CENSUS: dict[tuple[str, str, str], object] = {
     ("transport/_base.py", "bump", "key"): L("INTERNAL_SDK_ERROR"),
     ("transport/_base.py", "record", "DropReason.INTERNAL_SDK_ERROR"): L("INTERNAL_SDK_ERROR"),
     ("transport/_base.py", "record", "DropReason.ATTRIBUTE_DROPPED"): L("ATTRIBUTE_DROPPED"),
+    ("transport/_base.py", "record", "DropReason.REQUEST_TOO_LARGE"): L("REQUEST_TOO_LARGE"),
     ("transport/_base.py", "record", "DropReason.UNMARSHALLABLE"): L("UNMARSHALLABLE"),
     ("transport/_base.py", "report_once", "'transport.otlp.reserved_attribute_overwritten'"): L(
         "ATTRIBUTE_DROPPED"
     ),
-    ("transport/_base.py", "report_once", "'transport.otlp.span_over_request_cap'"): _REQUEST_CAP,
+    ("transport/_base.py", "report_once", "'transport.otlp.span_over_request_cap'"): L(
+        "REQUEST_TOO_LARGE"
+    ),
     ("transport/_base.py", "report_once", "'transport.otlp.span_payload_dropped'"): _REQUEST_CAP,
     ("transport/_base.py", "report_once", "key"): L("INTERNAL_SDK_ERROR"),
     ("transport/_base.py", "report_once", "'transport.otlp.span_unmarshalled'"): L(
@@ -723,6 +727,7 @@ _CENSUS: dict[tuple[str, str, str], object] = {
         "SEND_ERROR",
         "RATELIMIT_BACKOFF",
         "SEND_UNCONFIRMED",
+        "REQUEST_TOO_LARGE",
         at="transport/_otlp_http.py",
     ),
     ("transport/_otlp_http.py", "record", "DropReason.BUDGET_EXHAUSTED"): L("BUDGET_EXHAUSTED"),
@@ -731,6 +736,7 @@ _CENSUS: dict[tuple[str, str, str], object] = {
         "SEND_ERROR",
         "RATELIMIT_BACKOFF",
         "SEND_UNCONFIRMED",
+        "REQUEST_TOO_LARGE",
         at="transport/_otlp_http.py",
     ),
     ("transport/_otlp_http.py", "report_once", "'transport.otlp.caller_budget_cut_short'"): L(
@@ -742,6 +748,7 @@ _CENSUS: dict[tuple[str, str, str], object] = {
         "SEND_ERROR",
         "RATELIMIT_BACKOFF",
         "SEND_UNCONFIRMED",
+        "REQUEST_TOO_LARGE",
         at="transport/_otlp_http.py",
     ),
     ("transport/_otlp_http.py", "report_once", "'transport.otlp.split_export_out_of_budget'"): L(
@@ -752,6 +759,7 @@ _CENSUS: dict[tuple[str, str, str], object] = {
         "SEND_ERROR",
         "RATELIMIT_BACKOFF",
         "SEND_UNCONFIRMED",
+        "REQUEST_TOO_LARGE",
         at="transport/_otlp_http.py",
     ),
     ("transport/_wardex.py", "bump", "'transport.wardex.span_unmarshalled'"): L("UNMARSHALLABLE"),
@@ -761,6 +769,7 @@ _CENSUS: dict[tuple[str, str, str], object] = {
         "SEND_ERROR",
         "RATELIMIT_BACKOFF",
         "SEND_UNCONFIRMED",
+        "REQUEST_TOO_LARGE",
         at="transport/_otlp_http.py",
     ),
     ("transport/_wardex.py", "report_once", "'transport.wardex.caller_budget_cut_short'"): L(

@@ -125,12 +125,16 @@ def _classify_failure(exc: BaseException) -> tuple[DropReason, bool]:
 
       * An HTTP status: the receiver answered, so it did not store the batch.
         429, and 503 (a wardex receiver's "retry later"), are back-pressure.
-        502 and 504 come from a gateway in front of the receiver, which may
-        have handed the batch on, so they are unconfirmed. Any other status is
-        a refusal.
+        413 is a request over the receiver's size limit, which the split at
+        `max_otlp_request_bytes` did not bring under it. 502 and 504 come from
+        a gateway in front of the receiver, which may have handed the batch
+        on, so they are unconfirmed. Any other status is a refusal.
       * `URLError`: urllib raises it from connecting and sending, before any
         answer exists -- a refused connection, a name that did not resolve, a
         connect timeout. The request never arrived whole.
+      * `ValueError`: urllib and `http.client` raise it while BUILDING the
+        request -- an address with no scheme, an invalid port, a header that
+        cannot be encoded -- before a byte is written. Nothing was sent.
       * Anything else -- a read timeout, a connection cut before the answer:
         the request went out and nothing came back.
 
@@ -142,11 +146,15 @@ def _classify_failure(exc: BaseException) -> tuple[DropReason, bool]:
             status = int(exc.code)
             if status in (429, 503):
                 return DropReason.RATELIMIT_BACKOFF, True
+            if status == 413:
+                return DropReason.REQUEST_TOO_LARGE, True
             if status in (502, 504):
                 return DropReason.SEND_UNCONFIRMED, False
             return DropReason.SEND_ERROR, True
         if isinstance(exc, urllib.error.URLError):
             return DropReason.NETWORK_ERROR, True
+        if isinstance(exc, ValueError):
+            return DropReason.SEND_ERROR, True
     except Exception:  # noqa: BLE001 — a classifying probe, never a throw
         return DropReason.SEND_UNCONFIRMED, False
     return DropReason.SEND_UNCONFIRMED, False
@@ -309,22 +317,22 @@ class OtlpHttpTransport(Transport):
         deadline = started + effective
         # THE SANCTIONED PATH, minus its counted reports: `_encode_requests` is
         # `Transport.encode()` -- the native encoder with this transport's
-        # stored PII policy and limits, split at `max_otlp_request_bytes`, the
-        # over-cap span reported once per process -- except that what the
-        # encode could not ship as captured (`_EncodeReports`: the spans the
-        # marshaller skipped, the reserved-name attributes the mapping
-        # replaced, the spans sent without their payload) comes back
-        # uncounted. It is counted below, where this batch's fate is decided:
-        # counting here, before a spent budget hands the batch back as
-        # `UNDELIVERED`, made the retry count the same span again. The
+        # stored PII policy and limits, split at `max_otlp_request_bytes` --
+        # except that what the encode could not ship as captured
+        # (`_EncodeReports`: the spans the marshaller skipped, the
+        # reserved-name attributes the mapping replaced, the spans sent
+        # without their payload, the spans too large to send at all) comes
+        # back uncounted. It is counted below, where this batch's fate is
+        # decided: counting here, before a spent budget hands the batch back
+        # as `UNDELIVERED`, made the retry count the same span again. The
         # `compress` constructor flag feeds it.
         bodies, reports = self._encode_requests(envelope, compress=self._compress)
         if not bodies:
             # Every span in the batch was dropped -- by encode()'s over-cap
             # guard, or skipped as unmarshallable. Nothing to POST, and not
             # `UNDELIVERED`: a later attempt would encode to the same nothing.
-            # The fate is decided, so the skipped spans (and any replaced
-            # reserved-name attributes) are counted now.
+            # The fate is decided, so the skipped and over-cap spans (and any
+            # replaced reserved-name attributes) are counted now.
             self._count_encode_reports(reports)
             return None
         headers = {"Content-Type": "application/x-protobuf"}
@@ -417,8 +425,9 @@ class OtlpHttpTransport(Transport):
                 lost_as, _ = _classify_failure(exc)
                 if index:  # the requests not sent; how many spans they held is the core's
                     record(lost_as, len(bodies) - index, DropUnit.REQUEST)
-                else:  # nothing of this batch was accepted
-                    record(lost_as, len(envelope.spans) - len(reports.unmarshalled))
+                else:  # nothing of this batch was accepted; its over-cap spans were not in it
+                    lost = len(envelope.spans) - len(reports.unmarshalled) - reports.over_cap
+                    record(lost_as, lost)
                 if self._debug:
                     debug_host_error(
                         "OTLP export failed", exc, unprintable="transport.otlp.error_unprintable"

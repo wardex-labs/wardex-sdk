@@ -211,7 +211,12 @@ def test_a_receiver_500_is_counted_as_send_error_on_the_next_envelope(receiver):
 
 @pytest.mark.parametrize(
     ("status", "expected"),
-    [(429, "ratelimit_backoff"), (503, "ratelimit_backoff"), (401, "send_error")],
+    [
+        (429, "ratelimit_backoff"),
+        (503, "ratelimit_backoff"),
+        (401, "send_error"),
+        (413, "request_too_large"),
+    ],
 )
 def test_a_refusing_status_names_its_reason(receiver, status, expected):
     receiver.script = [("status", status), ("status", 202)]
@@ -248,6 +253,38 @@ def test_an_otlp_export_that_fails_is_recorded_and_kept_out_of_its_wire(receiver
     client.flush(5.0)
     client.close(1.0)
     assert _ledger.undelivered() == {(DropReason(expected), DropUnit.SPAN): 2}
+
+
+def test_an_otlp_span_too_large_to_send_is_not_counted_in_a_refused_request(receiver):
+    """A span the encoder dropped whole, too large for `max_otlp_request_bytes`
+    even without its payload, was in no request: it is `request_too_large`,
+    once, and only the span the refused request carried is `send_error`."""
+    from wardex_sdk.transport import OtlpHttpTransport
+
+    receiver.script = [("status", 500)]
+    limits = LimitsConfig(max_otlp_request_bytes=8192)
+    transport = OtlpHttpTransport(receiver.url + "/v1/traces", compress=False)
+    transport._set_limits(limits.to_native())
+    client = Client(WardexConfig(limits=limits, debug=False), transport)
+    client._worker.stop()
+    client.capture_span(_span("h" * 8192 * 4))  # a name alone over the cap
+    client.capture_span(_span("small"))
+    client.flush(5.0)
+    client.close(1.0)
+    assert len(receiver.posts) == 1
+    assert _ledger.undelivered() == {
+        (DropReason.REQUEST_TOO_LARGE, DropUnit.SPAN): 1,
+        (DropReason.SEND_ERROR, DropUnit.SPAN): 1,
+    }
+
+
+def test_a_request_that_could_not_be_built_was_definitely_not_sent():
+    """urllib raises `ValueError` while building a request -- an address with
+    no scheme, an invalid port -- before a byte is written: a definite
+    `send_error`, never an unconfirmed send."""
+    from wardex_sdk.transport._otlp_http import _classify_failure
+
+    assert _classify_failure(ValueError("unknown url type")) == (DropReason.SEND_ERROR, True)
 
 
 # -- (c) a parser that latches off ---------------------------------------------
