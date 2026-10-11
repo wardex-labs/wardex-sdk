@@ -34,7 +34,7 @@ from .._assembly import (
     report_export_failed,
     report_once,
 )
-from .._assembly._ledger import record_failed_send
+from .._assembly._ledger import record_failed_send, unsent
 from .._native import NATIVE_OK, unavailable_reason
 from .._types import Envelope
 from ._base import (
@@ -422,10 +422,11 @@ class OtlpHttpTransport(Transport):
                 # and before the debug line, whose `str(exc)` is host text.
                 counters.bump("transport.otlp.export_failed")
                 record_failed_send()
-                lost_as, _ = _classify_failure(exc)
-                if index:  # the requests not sent; how many spans they held is the core's
+                lost_as, definite = _classify_failure(exc)
+                news = unsent(envelope, definite=definite)  # False: this batch is counted already
+                if news and index:  # the requests not sent; how many spans they held is the core's
                     record(lost_as, len(bodies) - index, DropUnit.REQUEST)
-                else:  # nothing of this batch was accepted; its over-cap spans were not in it
+                elif news:  # nothing of this batch was accepted; its over-cap spans were not in it
                     lost = len(envelope.spans) - len(reports.unmarshalled) - reports.over_cap
                     record(lost_as, lost)
                 if self._debug:

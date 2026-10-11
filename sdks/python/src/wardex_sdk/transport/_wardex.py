@@ -219,13 +219,15 @@ class WardexTransport(Transport):
         except Exception as exc:  # fail-silent: never crash the app
             counters.bump("transport.wardex.export_failed")
             # What the batch is lost as, and whether its drop report can go
-            # back into the ledger or must be resent as it was.
+            # back into the ledger or must be resent as it was. Counted only
+            # when this settle is news: a subclass that sends the same batch
+            # twice has lost it once.
             lost_as, definite = _classify_failure(exc)
-            ledger.record_items(
-                lost_as, len(envelope.spans) - len(unmarshalled), len(envelope.state_snapshots)
-            )
             ledger.record_failed_send()
-            ledger.unsent(envelope, definite=definite)
+            if ledger.unsent(envelope, definite=definite):
+                ledger.record_items(
+                    lost_as, len(envelope.spans) - len(unmarshalled), len(envelope.state_snapshots)
+                )
             # `exc` may quote the URL; it never quotes the Authorization
             # header, so the debug line cannot echo the key.
             if self._debug:

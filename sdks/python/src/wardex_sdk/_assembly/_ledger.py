@@ -48,6 +48,11 @@ the POST carrying it fails, the transport says how (`unsent`):
   At most `_UNACKED_CAP` such reports are held; past that the oldest is dropped
   and counted as `ledger_overflow:report`.
 
+A report is settled at most once per time it is handed out, and a batch's
+failure is accounted at most once: a transport subclass that raises after its
+own `export` already settled the batch gets `False` back from `unsent` and
+counts nothing a second time.
+
 Only a transport that can carry a report gets one: `carries()` asks for
 `_carries_client_report`, which the wardex envelope transport sets. Taking the
 counts for a transport that cannot ship them would make them vanish.
@@ -139,9 +144,16 @@ _failed_sends = 0
 _UNACKED: deque[ClientReport] = deque()
 #: (report, definitely_not_stored) from `unsent`, applied at the next fold.
 _SETTLED: deque[tuple[ClientReport, bool]] = deque()
-#: Timestamps of reports cut but never yet in doubt: only these may go back
-#: into the pending table when their POST definitely failed.
-_FRESH: deque[int] = deque(maxlen=64)
+#: The reports the last `attach` handed out and nobody has settled since, by
+#: timestamp, each mapped to whether it was cut fresh then. Only a fresh one
+#: may go back into the pending table when its POST definitely failed; one
+#: that is not here any more was settled already, and settling it again would
+#: count it twice.
+_OUT: dict[int, bool] = {}
+#: The last envelope `unsent` settled, held by identity so its id cannot be
+#: reused while it is compared. Cleared by the next `attach`: every settle of
+#: one batch happens inside the drain that sent it.
+_last_unsent: list[object] = [None]
 _last_timestamp = 0
 _last_solo: float | None = None
 _started = _monotonic()
@@ -240,6 +252,7 @@ def due(transport: object, *, final: bool = False) -> bool:
 def attach(envelope: Envelope, transport: object, queue_depth: int) -> Envelope:
     """`envelope` with the ledger's reports added, when `transport` carries
     them and the fold is free; otherwise `envelope` unchanged."""
+    _last_unsent[0] = None  # a new batch: the last one's settles are over
     if type(envelope) is not Envelope or not carries(transport):
         return envelope
     if not _claim():
@@ -248,25 +261,36 @@ def attach(envelope: Envelope, transport: object, queue_depth: int) -> Envelope:
         _fold_held()
         reports = list(_UNACKED)
         _UNACKED.clear()
+        _OUT.clear()
+        _OUT.update((r.timestamp_ns, False) for r in reports)
         fresh = _cut_held(queue_depth)
+        if fresh is not None:
+            reports.append(fresh)
+            _OUT[fresh.timestamp_ns] = True
     finally:
         _release()
-    if fresh is not None:
-        reports.append(fresh)
     if not reports:
         return envelope
     return replace(envelope, client_reports=envelope.client_reports + tuple(reports))
 
 
-def unsent(envelope: Envelope, *, definite: bool) -> None:
+def unsent(envelope: Envelope, *, definite: bool) -> bool:
     """The POST carrying `envelope` failed. `definite`: the receiver certainly
     did not store it, so its fresh counts go back into the pending table;
-    otherwise every report it carried is held and sent again unchanged."""
-    if type(envelope) is not Envelope:
-        return
-    for report in envelope.client_reports:
-        _SETTLED.append((report, definite))
-    _try_fold()
+    otherwise every report it carried is held and sent again unchanged.
+
+    Returns whether this is news. False, changing nothing, when this same
+    envelope was already settled -- a transport subclass that raised after its
+    own `export` settled the batch -- so the caller does not count the batch's
+    items twice. Every caller that accounts a failed batch asks this first."""
+    if envelope is _last_unsent[0]:
+        return False
+    _last_unsent[0] = envelope
+    if type(envelope) is Envelope:
+        for report in envelope.client_reports:
+            _SETTLED.append((report, definite))
+        _try_fold()
+    return True
 
 
 def undelivered() -> dict[tuple[DropReason, DropUnit], int]:
@@ -331,9 +355,9 @@ def _fold_held() -> None:
             _add(_WHERE, (reason, label), n)
     while _SETTLED:
         report, definite = _SETTLED.popleft()
-        fresh = report.timestamp_ns in _FRESH
-        if fresh:
-            _FRESH.remove(report.timestamp_ns)
+        fresh = _OUT.pop(report.timestamp_ns, None)
+        if fresh is None:
+            continue  # not out (settled already, or never handed out): nothing to settle
         if definite and fresh:
             for key, n in _keys_of(report):
                 _add(_PENDING, key, n)
@@ -367,7 +391,6 @@ def _cut_held(queue_depth: int) -> ClientReport | None:
         queue_depth=min(max(queue_depth, 0), _INT32_MAX),
         uptime_ms=int((_monotonic() - _started) * 1000),
     )
-    _FRESH.append(report.timestamp_ns)
     return report
 
 
@@ -403,7 +426,8 @@ def _at_fork_reinit() -> None:
     _PENDING.clear()
     _UNACKED.clear()
     _SETTLED.clear()
-    _FRESH.clear()
+    _OUT.clear()
+    _last_unsent[0] = None
     _failed_sends = 0
     _last_timestamp = 0
     _last_solo = None

@@ -61,10 +61,15 @@ def lose(
     report_once(line, key=key)
 
 
-def count_drain_drop(cause: str, envelope: Envelope, spans: deque, snapshots: deque) -> str:
+def count_drain_drop(
+    cause: str, envelope: Envelope, spans: deque, snapshots: deque, *, news: bool = True
+) -> str:
     """Tally each item a raise made `_drain` drop, under `client.drain.span_dropped.<cause>`
     and `client.drain.snapshot_dropped.<cause>`, and say how many: the envelope the raise took
     (a hook may have filtered it on purpose), else the whole batch if it has no readable items.
+
+    `news` is `_ledger.unsent`'s answer for the envelope: False when the transport already
+    settled this batch's failure and then raised, so its items are in the ledger once already.
 
     Runs inside a fail-closed handler, so it may not raise either: an envelope whose items
     cannot be read (a hook may have returned anything) falls back to the batch, through
@@ -76,7 +81,8 @@ def count_drain_drop(cause: str, envelope: Envelope, spans: deque, snapshots: de
         counters.bump(f"client.drain.span_dropped.{cause}")
     for _ in range(n_snapshots):
         counters.bump(f"client.drain.snapshot_dropped.{cause}")
-    record_items(_DRAIN_DROP_REASONS.get(cause, DropReason.SEND_ERROR), n_spans, n_snapshots)
+    if news:
+        record_items(_DRAIN_DROP_REASONS.get(cause, DropReason.SEND_ERROR), n_spans, n_snapshots)
     return f"{n_spans} span(s)" + (f" and {n_snapshots} state snapshot(s)" if n_snapshots else "")
 
 

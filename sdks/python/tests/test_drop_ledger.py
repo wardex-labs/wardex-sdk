@@ -14,7 +14,8 @@ cases are the contract:
   * with nothing else to send, a ledger-only envelope goes out, no more than
     once per interval;
   * a fork child's first report carries none of the parent's counts;
-  * a drain never waits for the ledger, and neither does a signal's flush.
+  * a drain never waits for the ledger, and neither does a signal's flush;
+  * one failed batch is accounted once, however its transport raised.
 
 The rest pins the ledger's own rules: never raising, never reduced by sending,
 the bound on unconfirmed reports, the int32 carry, and the one line `close()`
@@ -388,6 +389,37 @@ def test_an_export_that_raises_keeps_its_reports_for_resending(receiver):
     first, second = _reports(decoded)
     assert first["discarded_events"] == {"queue_overflow:span": 1}
     assert second["discarded_events"] == {"send_error:span": 1}
+
+
+def test_a_transport_that_raises_after_settling_its_failure_is_counted_once(receiver):
+    """A subclass whose `export` raises after the base export already settled a
+    refused POST: the drain's raise path must not settle the same batch again.
+    The refused report rides once, not again beside its own returned counts,
+    and the batch's span is lost once."""
+
+    class _RaisesAfter(WardexTransport):
+        raise_next = True
+
+        def export(self, envelope, *, timeout=None):  # noqa: ANN001, ANN202
+            result = super().export(envelope, timeout=timeout)
+            if self.raise_next:
+                self.raise_next = False
+                raise RuntimeError("raised after the send was settled")
+            return result
+
+    receiver.script = [("status", 500), ("status", 202)]
+    config = WardexConfig(limits=LimitsConfig(max_buffer_spans=1), debug=False)
+    client = Client(config, _RaisesAfter(receiver.url, KEY))
+    client._worker.stop()
+    client.capture_span(_span())
+    client.capture_span(_span())  # one eviction, so the refused POST carries a report
+    client.flush(5.0)
+    client.capture_span(_span())
+    client.flush(5.0)
+    client.close(1.0)
+    accepted = [r for status, d in receiver.decoded() if status == 202 for r in _reports(d)]
+    assert _events(accepted) == {"queue_overflow:span": 1, "send_error:span": 1}
+    assert sum(r["failed_sends"] for r in accepted) == 1
 
 
 def test_unconfirmed_reports_are_bounded_and_the_overflow_is_counted():

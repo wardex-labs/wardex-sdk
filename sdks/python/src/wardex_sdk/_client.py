@@ -1093,7 +1093,7 @@ class Client:
                 )
                 shipped = self._export(envelope, deadline, named)
             except Exception as exc:  # fail-closed: drop, never ship half-filtered data
-                ledger.unsent(envelope, definite=False)  # its reports may have gone: resend as is
+                news = ledger.unsent(envelope, definite=False)  # reports may have gone: resend
                 # Also not routed into `_undelivered`, deliberately. A raise means an attempt
                 # of unknown outcome -- the transport may have sent half of it -- so
                 # re-queueing risks a duplicate. (The hook's own raise is handled above, where
@@ -1101,7 +1101,7 @@ class Client:
                 # which would pin the batch in the buffer forever if re-queued.)
                 # Counted and said off-debug, as the hook's raise is: a transport that raised on
                 # every batch must not look, in a default process, like one with nothing to send.
-                what = count_drain_drop("export_raised", envelope, spans, snapshots)
+                what = count_drain_drop("export_raised", envelope, spans, snapshots, news=news)
                 report_once(
                     f"transport export raised; a batch of {what} was dropped and is not "
                     "retried, because the transport may have sent part of it (every such drop "
