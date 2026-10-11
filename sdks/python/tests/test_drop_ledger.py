@@ -631,6 +631,30 @@ def test_an_encoded_report_round_trips_through_the_native_codec():
     assert body is not None and skipped == [] and scrubbed == 0, "a report alone is sent"
 
 
+def test_a_report_value_past_any_range_costs_that_value_not_the_envelope():
+    """The codec's clamp holds for a Python int of any size or sign: past i64,
+    past u64, below zero. Nothing the ledger cuts gets there; anything else
+    that does must not fail the envelope it rides in."""
+    report = ClientReport(
+        timestamp_ns=-1,
+        discarded_events=(("queue_overflow:span", 2**70), ("send_error:span", -(2**70))),
+        failed_sends=2**64,
+        queue_depth=-5,
+        uptime_ms=2**70,
+    )
+    env = Envelope(header=_envelope().header, client_reports=(report,))
+    [item] = _wardex_native.codec.decode_envelope(_wardex_native.codec.encode_envelope(env))[
+        "items"
+    ]
+    assert item["client_report"] == {
+        "timestamp_ns": 0,
+        "discarded_events": {"queue_overflow:span": 2**31 - 1, "send_error:span": 0},
+        "failed_sends": 2**31 - 1,
+        "queue_depth": 0,
+        "uptime_ms": 2**63 - 1,
+    }
+
+
 def test_a_swallowed_internal_error_is_a_loss_with_its_label_kept_locally():
     with guard("test.ledger.where"):
         raise RuntimeError("boom")

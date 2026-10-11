@@ -1261,24 +1261,44 @@ fn skip_reason(sp: &Bound<'_, PyAny>, e: &PyErr) -> PyResult<String> {
 /// ledger, its counts keyed `"<reason>:<unit>"`.
 ///
 /// The ledger already cuts every count at `i32::MAX` and carries the rest to
-/// its next report, so the clamp here is a backstop: a value out of range from
-/// anywhere else costs that value, never the envelope it rides in. A repeated
-/// key adds up rather than overwriting, for the same reason.
+/// its next report, so the clamp here is a backstop: a number out of range
+/// from anywhere else, however far out, costs that value, never the envelope
+/// it rides in. A repeated key adds up rather than overwriting, for the same
+/// reason. A value that is not an integer at all still raises: that is a bug
+/// in what built the report, not a range.
 fn client_report_to_proto(r: &Bound<PyAny>) -> PyResult<pb::ClientReport> {
-    let clamp = |n: i64| i32::try_from(n.clamp(0, i64::from(i32::MAX))).unwrap_or(i32::MAX);
+    let count = |v: Bound<PyAny>| -> PyResult<i32> {
+        let n = saturating_int(&v, i64::MIN, i64::MAX)?;
+        Ok(i32::try_from(n.clamp(0, i64::from(i32::MAX))).unwrap_or(i32::MAX))
+    };
     let mut discarded_events = std::collections::HashMap::new();
     for pair in r.getattr("discarded_events")?.iter()? {
-        let (key, n): (String, i64) = pair?.extract()?;
+        let (key, n): (String, Bound<PyAny>) = pair?.extract()?;
+        let n = count(n)?;
         let total: &mut i32 = discarded_events.entry(key).or_insert(0);
-        *total = total.saturating_add(clamp(n));
+        *total = total.saturating_add(n);
     }
     Ok(pb::ClientReport {
-        timestamp_ns: r.getattr("timestamp_ns")?.extract()?,
+        timestamp_ns: saturating_int(&r.getattr("timestamp_ns")?, 0, u64::MAX)?,
         discarded_events,
-        failed_sends: clamp(r.getattr("failed_sends")?.extract()?),
-        queue_depth: clamp(r.getattr("queue_depth")?.extract()?),
-        uptime_ms: r.getattr("uptime_ms")?.extract()?,
+        failed_sends: count(r.getattr("failed_sends")?)?,
+        queue_depth: count(r.getattr("queue_depth")?)?,
+        uptime_ms: saturating_int(&r.getattr("uptime_ms")?, i64::MIN, i64::MAX)?,
     })
+}
+
+/// A Python int as `T`, saturated at `low`/`high` when it is past what `T`
+/// holds: the sign says which end. Any other extraction error is returned.
+fn saturating_int<T>(v: &Bound<PyAny>, low: T, high: T) -> PyResult<T>
+where
+    T: for<'py> FromPyObject<'py>,
+{
+    match v.extract::<T>() {
+        Err(e) if e.is_instance_of::<pyo3::exceptions::PyOverflowError>(v.py()) => {
+            Ok(if v.lt(0)? { low } else { high })
+        }
+        other => other,
+    }
 }
 
 /// `InternalEnvelope`(Python) → `pb::Envelope`.
