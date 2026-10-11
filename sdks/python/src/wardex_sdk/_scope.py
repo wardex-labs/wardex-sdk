@@ -22,6 +22,12 @@ class Scope:
     active_span_context: SpanContext | None = None
     conversation: ConversationContext | None = None
     tracestate: str | None = None
+    #: Set when the block that installed this scope ended in another Context
+    #: than it began in (`_hub.retire`): the scope to read in its place, and
+    #: the marker of the Context that installed it, the one that reads it so.
+    #: Neither is a field a fork inherits.
+    _retired_to: Scope | None = field(default=None, init=False, repr=False, compare=False)
+    _retired_by: object = field(default=None, init=False, repr=False, compare=False)
 
     def set_tag(self, key: str, value: str) -> None:
         self.tags[key] = value

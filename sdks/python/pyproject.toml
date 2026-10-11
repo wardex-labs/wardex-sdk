@@ -82,6 +82,11 @@ test = [
     # 0.23.x; CI runs the openai-agents tests once more on 0.22.3, because 0.23
     # moved where an agent's tools are listed and the two trees differ.
     "openai-agents>=0.22,<0.24",
+    # The MCP stdio seam is tested against the official SDK on both ends of the
+    # pipe (test_mcp_real_server.py). Measured with 2.3.0; capped at that minor
+    # because the test's server is written to 2.x's low-level `Server`
+    # signature, which 1.x does not have and a later minor may change.
+    "mcp>=2.3,<2.4",
     "langchain-core>=0.3",
     # `langchain` (not just langchain-core) because `langchain.agents.create_agent`
     # is the non-deprecated successor to `create_react_agent`, and the tool seam's

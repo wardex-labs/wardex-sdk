@@ -517,9 +517,9 @@ Two emit sites, and the first is the mechanism the second restates.
 
     Declared; no emitter yet. Reportable only on the MCP-stdio JSON-RPC path
     (``crates/wardex-protocol/src/json_rpc.rs``), where a pending request means a span already
-    exists to carry it — design §4.6 site-3 wires that up. The identically-named HTTP/1 latch in
-    ``http1.rs`` is NOT this: it is a connection-level ``disabled_reason``, it has no span, and it
-    stays a debug string. Same string, two fates; see the module docstring.
+    exists to carry it — design §4.6 site-3 wires that up. The identically-named HTTP/1 and HTTP/2
+    latches in ``http1.rs`` and ``http2.rs`` are NOT this: each is a connection-level
+    ``disabled_reason`` with no span, and stays a debug string. Same string, two fates.
     """
 
     TOOL_CALL_ID_UNAVAILABLE_IN_PROCESS = "tool_call_id_unavailable_in_process"
@@ -671,11 +671,12 @@ Two emit sites, and the first is the mechanism the second restates.
     """An HTTP body was stored up to ``max_body_bytes`` / ``max_opaque_body_bytes``
     and the rest was consumed without being kept.
 
-    The only marker produced in Rust: ``crates/wardex-protocol/src/http1.rs``, ``append_capped``. It
-    crosses the PyO3 boundary as ``Vec<&'static str>`` (``bindings/python/src/lib.rs``), is read
-    back at ``_protocol/_http1.py``, and is folded into the span's markers by
-    ``_interceptors/_seam.py::ByteSeamInterceptor._build_span``.
-    """
+    On HTTP/1 the marker is produced in Rust: ``crates/wardex-protocol/src/http1.rs``,
+    ``append_capped``. It crosses the PyO3 boundary as ``Vec<&'static str>``
+    (``bindings/python/src/lib.rs``) and is read back at ``_protocol/_http1.py``. On HTTP/2,
+    ``http2.rs`` reports the cut per direction and ``_interceptors/_trackers.py::_Http2Tracker``
+    turns either flag into this member. Both are folded into the span's markers by
+    ``_interceptors/_seam.py::ByteSeamInterceptor._build_span``."""
 
     GRPC_MESSAGE_TRUNCATED = "grpc_message_truncated"
     """A gRPC message runs past the end of the captured body: the last
@@ -691,10 +692,9 @@ Two emit sites, and the first is the mechanism the second restates.
     gRPC branch.
 
     Kept separate from ``BODY_CAP_EXCEEDED`` despite sharing that knob. "The body was stored short"
-    and "a message was cut in half" are different facts with different replay consequences, and on
-    HTTP/2 — where gRPC actually lives — they do not even co-occur: ``http2.rs`` records its
-    truncation on the stream and pushes no marker, so ``body_cap_exceeded`` never appears and this
-    is the only marker a user gets.
+    and "a message was cut in half" are different facts with different replay consequences: a cut
+    body on HTTP/2, where gRPC actually lives, carries both, and only this one says that the last
+    message is the casualty.
     """
 
     WS_PAYLOAD_TRUNCATED = "ws_payload_truncated"
@@ -839,11 +839,11 @@ Two emit sites, and the first is the mechanism the second restates.
     """
 
     SEMANTIC_PARSE_FAILED = "semantic_parse_failed"
-    """Framing succeeded but the LLM body parser produced no core semantics and no output messages,
-    so the span has transport truth and no gen_ai truth.
+    """Framing succeeded but the meaning did not: the span has transport truth and no semantics.
 
-    Emitted from ``_interceptors/_seam.py::ByteSeamInterceptor._build_span``.
-    """
+    Emitted from ``_interceptors/_seam.py::ByteSeamInterceptor._build_span`` (an LLM body gave no
+    core semantics and no output messages) and ``_interceptors/_mcp_stdio.py`` (an MCP tool result
+    ``_mcp_result.read_tool_result`` cannot vouch for, shipped raw and UNSET)."""
 
     PAYLOAD_COMPRESSED = "payload_compressed"
     """The payload was observed compressed and wardex did not decompress it, so body bytes on this

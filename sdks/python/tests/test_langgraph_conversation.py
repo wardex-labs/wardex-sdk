@@ -13,17 +13,22 @@ framework SAID is carried, what nobody said stays empty, and the host's own
 
 from __future__ import annotations
 
+from langchain_core.messages import AIMessage
 from langgraph.checkpoint.memory import InMemorySaver
-from langgraph.graph import END, START, StateGraph
+from langgraph.graph import END, START, MessagesState, StateGraph
+from langgraph.prebuilt import ToolNode
 
+import wardex_sdk as wardex
 from test_langgraph_adapter import (
     TrailState,
     _clean_scope,  # noqa: F401 — the autouse determinism fixture this module needs too
     adapter_counters,
     extra_of,
     installed,  # noqa: F401 — a fixture, usable here only because it is imported
+    pure_add,
     runs,
     steps,
+    tools,
 )
 from wardex_sdk import _hub
 from wardex_sdk._types import ConversationContext
@@ -188,41 +193,145 @@ def test_a_uuid_thread_id_is_carried_as_its_text(installed):  # noqa: F811
     assert _conversation_ids(installed.spans) == {str(thread)}
 
 
-def test_a_host_conversation_opened_inside_a_node_does_not_reach_the_inner_run_yet(installed):  # noqa: F811
-    """A KNOWN GAP, pinned so that closing it is a visible edit here.
+def _leaf(name, node=None):
+    g = StateGraph(TrailState)
+    g.add_node("s1", node or (lambda s: {"trail": ["s1"]}))
+    g.add_edge(START, "s1")
+    g.add_edge("s1", END)
+    app = g.compile()
+    app.name = name
+    return app
 
-    The outer run STATED its thread, and then the host opens a conversation of
-    its own inside a node before calling a subgraph. The rule in
-    `framework_conversation` does its half: it sees a conversation on the scope
-    that no unit of this adapter stated, and the inner run yields — it does NOT
-    take its own thread id. What it inherits instead is wrong: the unit
-    registry hands a nested unit its PARENT UNIT's conversation and never
-    consults the scope, so the inner run ships the outer thread, not the
-    host's word. That precedence predates this adapter stating conversations
-    at all, and it is the registry's to change, for every adapter at once.
-    """
-    inner = StateGraph(TrailState)
-    inner.add_node("s1", lambda s: {"trail": ["s1"]})
-    inner.add_edge(START, "s1")
-    inner.add_edge("s1", END)
-    sub = inner.compile()
 
-    def node(state):
-        scope = _hub.get_current_scope()
-        before = scope.conversation
-        scope.conversation = ConversationContext(conversation_id="host-in-node")
-        try:
-            return sub.invoke(state, {"configurable": {"thread_id": "INNER"}})
-        finally:
-            scope.conversation = before
-
+def _outer_calling(node):
     outer = StateGraph(TrailState)
     outer.add_node("sub", node)
     outer.add_edge(START, "sub")
     outer.add_edge("sub", END)
-    outer.compile(checkpointer=InMemorySaver()).invoke(
-        {"trail": []}, {"configurable": {"thread_id": "OUTER"}}
-    )
-    by_run = sorted(r.conversation.conversation_id for r in runs(installed.spans))
-    assert "INNER" not in by_run  # the half that holds: the inner thread yielded
-    assert by_run == ["OUTER", "OUTER"]  # the gap: "host-in-node" is what it should carry
+    app = outer.compile(checkpointer=InMemorySaver())
+    app.name = "Outer"
+    return app
+
+
+def _by_name(spans):
+    return {s.name: _conversation_ids([s]).pop() for s in spans}
+
+
+def test_a_host_conversation_opened_inside_a_node_reaches_the_inner_run(installed):  # noqa: F811
+    """The outer run STATED its thread, and then the host opens a conversation
+    of its own inside a node before calling a subgraph. The inner run yields its
+    own thread id to it (`framework_conversation`), and what it carries instead
+    is the host's id — it used to inherit the OUTER thread, because the unit
+    registry handed a nested unit its parent unit's conversation and never
+    consulted the scope. The node's own step was opened before the block and
+    keeps the outer thread."""
+    inner = _leaf("Inner")
+
+    def node(state):
+        with wardex.conversation("chat", id="host-in-node"):
+            return inner.invoke(state, {"configurable": {"thread_id": "INNER"}})
+
+    _outer_calling(node).invoke({"trail": []}, {"configurable": {"thread_id": "OUTER"}})
+    assert _by_name(runs(installed.spans)) == {
+        "invoke_workflow Outer": "OUTER",
+        "invoke_workflow Inner": "host-in-node",
+    }
+    assert _by_name(steps(installed.spans)) == {
+        "execute_step sub": "OUTER",
+        "execute_step s1": "host-in-node",
+    }
+
+
+def test_a_host_conversation_opened_inside_a_node_reaches_every_depth_below_it(installed):  # noqa: F811
+    """A subgraph two levels down yields to the host too. The middle run carries
+    the host's id as INHERITED, not stated, so the deeper run reads it as the
+    host's word rather than as this adapter's — the rule that keeps one block
+    one conversation however deep the graphs nest."""
+    deep = _leaf("Deep")
+    mid = _leaf("Mid", lambda s: deep.invoke(s, {"configurable": {"thread_id": "DEEP"}}))
+
+    def node(state):
+        with wardex.conversation("chat", id="host-in-node"):
+            return mid.invoke(state, {"configurable": {"thread_id": "MID"}})
+
+    _outer_calling(node).invoke({"trail": []}, {"configurable": {"thread_id": "OUTER"}})
+    assert _by_name(runs(installed.spans)) == {
+        "invoke_workflow Outer": "OUTER",
+        "invoke_workflow Mid": "host-in-node",
+        "invoke_workflow Deep": "host-in-node",
+    }
+    assert adapter_counters()["adapters.langgraph.thread_id_shadowed_by_host"] == 2
+
+
+def test_a_tool_in_a_subgraph_under_a_host_conversation_carries_it(installed):  # noqa: F811
+    def model(state):
+        call = {"name": "pure_add", "args": {"a": 1, "b": 2}, "id": "c1", "type": "tool_call"}
+        return {"messages": [AIMessage(content="", tool_calls=[call])]}
+
+    g = StateGraph(MessagesState)
+    g.add_node("model", model)
+    g.add_node("tools", ToolNode([pure_add]))
+    g.add_edge(START, "model")
+    g.add_edge("model", "tools")
+    g.add_edge("tools", END)
+    sub = g.compile()
+
+    def node(state):
+        with wardex.conversation("chat", id="host-in-node"):
+            sub.invoke({"messages": []}, {"configurable": {"thread_id": "INNER"}})
+        return {"trail": ["sub"]}
+
+    _outer_calling(node).invoke({"trail": []}, {"configurable": {"thread_id": "OUTER"}})
+    (tool,) = tools(installed.spans)
+    assert _conversation_ids([tool]) == {"host-in-node"}
+
+
+def _two_steps(name):
+    g = StateGraph(TrailState)
+    g.add_node("s1", lambda s: {"trail": ["s1"]})
+    g.add_node("s2", lambda s: {"trail": ["s2"]})
+    g.add_edge(START, "s1")
+    g.add_edge("s1", "s2")
+    g.add_edge("s2", END)
+    app = g.compile()
+    app.name = name
+    return app
+
+
+def test_a_run_started_inside_a_host_block_keeps_its_conversation_after_the_block(installed):  # noqa: F811
+    """A run's conversation is fixed when it starts. A subgraph streamed from
+    inside the block and pumped to its end after the block closed is one run
+    in one conversation: its later steps used to take the outer thread id,
+    which the scope showed again once the block was gone."""
+    inner = _two_steps("Inner")
+
+    def node(state):
+        with wardex.conversation("chat", id="host-in-node"):
+            stream = inner.stream(state, {"configurable": {"thread_id": "INNER"}})
+            next(stream)
+        list(stream)
+        return {"trail": ["sub"]}
+
+    _outer_calling(node).invoke({"trail": []}, {"configurable": {"thread_id": "OUTER"}})
+    assert _by_name(runs(installed.spans))["invoke_workflow Inner"] == "host-in-node"
+    inner_steps = [s for s in steps(installed.spans) if s.name.endswith(("s1", "s2"))]
+    assert _conversation_ids(inner_steps) == {"host-in-node"}
+
+
+def test_a_host_block_opened_while_a_run_streams_does_not_relabel_its_steps(installed):  # noqa: F811
+    """The mirror: the run started before the block, so its steps keep the
+    run's conversation (here its own thread id) even where one of them runs
+    inside the block."""
+    inner = _two_steps("Inner")
+
+    def node(state):
+        stream = inner.stream(state, {"configurable": {"thread_id": "INNER"}})
+        next(stream)
+        with wardex.conversation("chat", id="host-in-node"):
+            list(stream)
+        return {"trail": ["sub"]}
+
+    _outer_calling(node).invoke({"trail": []}, {"configurable": {"thread_id": "OUTER"}})
+    assert _by_name(runs(installed.spans))["invoke_workflow Inner"] == "INNER"
+    inner_steps = [s for s in steps(installed.spans) if s.name.endswith(("s1", "s2"))]
+    assert _conversation_ids(inner_steps) == {"INNER"}

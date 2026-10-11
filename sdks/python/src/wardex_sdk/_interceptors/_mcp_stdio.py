@@ -2,7 +2,31 @@
 
 Parses subprocess stdin (request) / stdout (response) bytes as JSON-RPC and correlates
 them by id to assemble CLIENT spans. Hooking (the anyio patch) lives in
-`McpStdioInterceptor`, further down this same file.
+`McpStdioInterceptor`, further down this same file; what a tool result means is
+`_mcp_result.py`'s.
+
+A `tools/call` is an `execute_tool` span — named `execute_tool {tool}`, kind CLIENT, with
+`gen_ai.operation.name` set — so it is counted with every other tool call. The OpenTelemetry
+MCP conventions ask for exactly that operation name on a tool call span, and in the same
+breath ask an MCP instrumentation NOT to record a separate span when an outer GenAI one
+already traces the tool's execution. Under openai-agents and LangGraph the framework's
+adapter does: it records the same call as its own `execute_tool` span. Measured with
+openai-agents 0.22 against a real `mcp` stdio server, the two land in DIFFERENT traces with
+ids that cannot be joined (the framework's call id against the JSON-RPC id), because the
+official SDK writes stdin from a task the session's opener started, not from the caller.
+No per-call test can tell the two apart, so the rule is per process: while one of those
+adapters is installed, this seam leaves the call a transport span (`MCP tools/call`, no
+operation name) and the framework's span is the one counted. Everything else about the
+span — the tool, its arguments, its result — is the same either way. Declining is said
+once per process, naming the adapter: a tool call a raw `mcp` client makes in that process
+is then counted as `execute_tool` nowhere, and leaving the adapter out is how to change it.
+
+The name is wardex's `execute_tool {tool}`, the one every other tool span carries and the
+GenAI conventions give it, not the MCP conventions' `tools/call {tool}`: the same call then
+reads the same in a trace whichever observer recorded it, and `mcp.method.name` still says
+`tools/call`. `mcp.protocol.version` names the MCP revision a span was read against: the
+request's own `_meta` stamp (2026-07-28 and later), else the version the subprocess's
+`initialize` exchange settled on.
 """
 
 from __future__ import annotations
@@ -14,11 +38,13 @@ import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from .. import _wardex_native
+from .. import _hub, _wardex_native
 from .._assembly import (
     Ambient,
+    Limitation,
     PatchSet,
     SpanDraft,
+    SpanIntent,
     TransportLabel,
     capture_mode_of,
     counters,
@@ -31,10 +57,12 @@ from .._assembly import (
     should_capture,
 )
 from .._enums import (
+    AdapterName,
     CaptureMode,
     CaptureSource,
     Direction,
     Protocol,
+    SpanKind,
     StatusCode,
     ToolExecutionType,
 )
@@ -49,6 +77,14 @@ from .._types import (
 )
 from ._base import InterceptorInterface
 from ._issue_scope import UNKNOWN_ISSUER, ScopeSnapshot, issued_scope
+from ._mcp_result import (
+    json_object,
+    negotiated_version,
+    read_tool_result,
+    readable_version,
+    refuse_version,
+    span_tool_name,
+)
 
 # OPTIONAL, and it has to be: anyio is a third-party package, this wheel
 # declares no runtime dependencies, and `_backends._asyncio` is anyio's PRIVATE
@@ -76,6 +112,19 @@ _in_anyio_open: contextvars.ContextVar[bool] = contextvars.ContextVar(
 
 if TYPE_CHECKING:
     from .._client import Client
+
+#: Requests one subprocess may have awaiting a response. No `Limits` field means "requests in
+#: flight per connection" (`max_streams` is HTTP/2's stream table, `max_session_entries` an
+#: adapter's session tables), so the bound is this named constant. Past it the oldest request
+#: is dropped, its eventual response becomes no span, and that is counted and said once.
+MAX_PENDING_REQUESTS = 4096
+
+#: The adapters that record an MCP tool call as their own `execute_tool` span. While one is
+#: installed this seam does not promote `tools/call` (module docstring).
+_TOOL_SPAN_OWNERS = frozenset({AdapterName.OPENAI_AGENTS.value, AdapterName.LANGGRAPH.value})
+
+#: Where the 2026-07-28 revision stamps the protocol version on every request.
+_VERSION_META_KEY = "io.modelcontextprotocol/protocolVersion"
 
 
 @dataclass
@@ -136,6 +185,10 @@ class _ProcState:
         # whole of the asymmetry `should_detach` describes.
         self._resp_bytes = 0
         self._msgs = 0
+        # The version this subprocess's `initialize` exchange settled on, once it has.
+        self._protocol_version: str | None = None
+        # Lines either parser skipped for exceeding `max_stream_buffer_bytes`, as last counted.
+        self._lines_over_cap = 0
         # Guards the once-per-stream count and debug log in McpStdioInterceptor —
         # mirrors the seam's st.gate-adjacent dedupe for the HTTP/1 path, but on a
         # field owned solely by this concern (nothing else reads or writes it).
@@ -162,8 +215,34 @@ class _ProcState:
                     parent_closed=parent_is_closed_unit(ambient.span_context),
                     scope=issued_scope(),
                 )
-            if len(self._latch) > 4096:  # leak-defense cap
+            if len(self._latch) > MAX_PENDING_REQUESTS:
                 self._latch.pop(next(iter(self._latch)))
+                counters.bump("interceptors.mcp_stdio.pending_evicted")
+                report_once(
+                    f"an MCP subprocess had more than {MAX_PENDING_REQUESTS} requests awaiting a "
+                    "response; the oldest was dropped and its call will not become a span. Counted "
+                    "under interceptors.mcp_stdio.pending_evicted.",
+                    key="interceptors.mcp_stdio.pending_evicted",
+                )
+        self._count_lines_over_cap()
+
+    def _count_lines_over_cap(self) -> None:
+        """Make the native parsers' skipped over-cap lines visible: one count per line, one line
+        per process. A line is never parsed past `max_stream_buffer_bytes`, so if it held a
+        JSON-RPC message — a request, or the response that would have completed a call — that
+        message is lost whole. Unparsed, it cannot be told from a long line of anything else."""
+        seen = self._req.lines_over_cap() + self._resp.lines_over_cap()
+        if seen <= self._lines_over_cap:
+            return
+        for _ in range(seen - self._lines_over_cap):
+            counters.bump("interceptors.mcp_stdio.line_over_cap")
+        self._lines_over_cap = seen
+        report_once(
+            "a line on an MCP subprocess's pipe was longer than max_stream_buffer_bytes and was "
+            "skipped unparsed; if it was a JSON-RPC message, its call is not captured. Counted "
+            "under interceptors.mcp_stdio.line_over_cap.",
+            key="interceptors.mcp_stdio.line_over_cap",
+        )
 
     def feed_response(self, data: bytes) -> list[tuple[InternalSpan, ScopeSnapshot]]:
         """The spans the responses in `data` complete, each with the scope identity its request
@@ -185,6 +264,15 @@ class _ProcState:
             pending = self._latch.pop(m.id, None)
             if pending is None:
                 continue
+            if pending.method == "initialize" and m.result is not None:
+                self._protocol_version = negotiated_version(m.result) or self._protocol_version
+            owners = (
+                _hub.installed_adapters() & _TOOL_SPAN_OWNERS
+                if pending.method == "tools/call"
+                else frozenset()
+            )
+            if owners:
+                _report_ceded(owners)
             # The gate this path never had. `agent_semantic=True` is the claim
             # the site makes about itself and it is the whole reason MCP stdio
             # survives `capture_mode=AGENT`: a JSON-RPC tool call over a
@@ -205,9 +293,15 @@ class _ProcState:
                 continue
             span = None
             with guard("interceptors.mcp_stdio.build_span", debug=self._debug):
-                span = _build_mcp_span(pending, m)
+                span = _build_mcp_span(
+                    pending,
+                    m,
+                    protocol_version=self._protocol_version,
+                    promote=pending.method == "tools/call" and not owners,
+                )
             if span is not None:
                 out.append((span, pending.scope))
+        self._count_lines_over_cap()
         return out
 
     def should_detach(self) -> bool:
@@ -253,7 +347,9 @@ class _ProcState:
         return stranded
 
 
-def _build_mcp_span(p: _Pending, resp: Any) -> InternalSpan:
+def _build_mcp_span(
+    p: _Pending, resp: Any, *, protocol_version: str | None, promote: bool
+) -> InternalSpan:
     now = time.time_ns()
     method = p.method
     # `resolve_observed`, not `resolve_parentage`: the gate above lets this
@@ -275,11 +371,19 @@ def _build_mcp_span(p: _Pending, resp: Any) -> InternalSpan:
     # invented; an unreadable error body degrades to the generic name instead of
     # deleting the span.
     error_type: str | None = _json_rpc_error_type(resp.error) if resp.error is not None else None
+    uninterpreted = False
+    params = json_object(params_bytes)
+    meta = params.get("_meta") if params is not None else None
+    if isinstance(meta, dict) and _VERSION_META_KEY in meta:
+        # The request names its own revision, so it is the only claim for this span: one that does
+        # not read as a revision is refused, not replaced by the negotiated one.
+        protocol_version = readable_version(meta[_VERSION_META_KEY])
+        if protocol_version is None:
+            refuse_version()
 
     if method == "tools/call":
-        try:
-            params = json.loads(params_bytes) if params_bytes else {}
-            if isinstance(params, dict):
+        with guard("interceptors.mcp_stdio.tool_params"):
+            if params is not None:
                 name = params.get("name")
                 if name is not None:
                     # IPC, not NETWORK. The default was a guess and it was
@@ -294,38 +398,39 @@ def _build_mcp_span(p: _Pending, resp: Any) -> InternalSpan:
                 args = params.get("arguments")
                 if args is not None:
                     input_data = json.dumps(args, ensure_ascii=False).encode("utf-8")
-        except Exception:  # noqa: BLE001 — fail-safe: keep the default mapping even if semantic extraction fails
-            pass
         if resp.result is not None:
-            try:
-                result = json.loads(resp.result)
-                if isinstance(result, dict):
-                    if result.get("isError") is True:
-                        status = StatusCode.ERROR
-                        error_type = "tool_error"
-                    content = result.get("content")
-                    if content is not None:
-                        output_data = json.dumps(content, ensure_ascii=False).encode("utf-8")
-            except Exception:  # noqa: BLE001
-                pass
+            read = read_tool_result(resp.result)
+            output_data, status, error_type = read.output, read.status, read.error_type
+            uninterpreted = read.uninterpreted
 
-    # TRANSPORT mode: `MCP tools/call` reports the JSON-RPC method wardex
-    # observed on the pipe. Design §4.6's sketch names `EXECUTE_TOOL` here, but
-    # this seam sees every method — `initialize`, `ping`, `resources/read` — and
-    # calling a `ping` an `execute_tool` would be a vocabulary lie for the sake
-    # of a table row. The tool SEMANTICS are still attached when the method
-    # really is `tools/call`; promoting the span to the tool intent belongs with
-    # the work that routes this seam through `assembly.UnitRegistry`, which is
-    # what would also give the call its own parentage instead of the ambient.
-    draft = SpanDraft.transport(
-        parentage,
-        label=TransportLabel.MCP,
-        subject=method,
-        source=CaptureSource.STDIO,
-        start_ns=p.start_ns,
-    )
+    span_name = span_tool_name(params.get("name")) if params is not None else None
+    if promote and tool is not None and span_name is not None:
+        draft = SpanDraft(
+            parentage,
+            intent=SpanIntent.EXECUTE_TOOL,
+            subject=span_name,
+            source=CaptureSource.STDIO,
+            start_ns=p.start_ns,
+            kind=SpanKind.CLIENT,
+        )
+    else:
+        # A transport observation: `MCP tools/call` reports the JSON-RPC method
+        # wardex observed on the pipe. This seam sees every method —
+        # `initialize`, `ping`, `resources/read` — and calling a `ping` an
+        # `execute_tool` would be a vocabulary lie.
+        draft = SpanDraft.transport(
+            parentage,
+            label=TransportLabel.MCP,
+            subject=method,
+            source=CaptureSource.STDIO,
+            start_ns=p.start_ns,
+        )
     if tool is not None:
         draft.set_tool(tool)
+    if uninterpreted:
+        draft.add_limitation(Limitation.SEMANTIC_PARSE_FAILED)
+    if protocol_version:
+        draft.set_extra("mcp.protocol.version", protocol_version)
     draft.set_transport(
         TransportAttributes(
             connection_id="",
@@ -341,6 +446,21 @@ def _build_mcp_span(p: _Pending, resp: Any) -> InternalSpan:
     draft.set_error(error_type)
     draft.set_io(input_data=input_data, output_data=output_data)
     return draft.finish(now)
+
+
+def _report_ceded(owners: frozenset[str]) -> None:
+    """A `tools/call` stays a transport span because an installed adapter owns tool spans."""
+    counters.bump("interceptors.mcp_stdio.execute_tool_ceded")
+    names = ", ".join(sorted(owners))
+    report_once(
+        f"MCP tool calls are recorded as `MCP tools/call` spans, not `execute_tool`, while the "
+        f"{names} adapter(s) are installed, because those record a call made through their "
+        "framework as their own execute_tool span. A raw `mcp` client's tool calls in this process "
+        "are therefore not counted as execute_tool; leave the adapter(s) out with "
+        "AdaptersConfig(enabled=...) to have them counted. Counted under "
+        "interceptors.mcp_stdio.execute_tool_ceded.",
+        key="interceptors.mcp_stdio.execute_tool_ceded",
+    )
 
 
 def _json_rpc_error_type(error: bytes | None) -> str:

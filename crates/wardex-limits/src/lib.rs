@@ -8,6 +8,38 @@
 //! others by the host SDK (span buffer, connection maps, adapter session maps).
 //! Ownership of the *values* stays here regardless, so a limit can never drift
 //! between two declaration sites.
+//!
+//! # Worst-case resident memory of the stream parsers
+//!
+//! What each parser in `wardex-protocol` can hold at once, as a formula of the
+//! fields below. "One read" is the chunk the current `feed` call was handed: it
+//! is appended before parsing, so it is resident for the length of that call,
+//! and its size is the caller's (a socket read), not a field here. Messages a
+//! call completes are handed to the caller and are not counted.
+//!
+//! * HTTP/1, per direction: `max_stream_buffer_bytes` of unparsed residue (a
+//!   header block or chunk-size line still unterminated; past it the stream
+//!   latches off) + one read + the body of the message in flight, stored up to
+//!   `max_body_bytes` (`max_opaque_body_bytes` for content types with no
+//!   extractable meaning).
+//! * HTTP/2, per connection: two frame decoders, each holding at most one
+//!   frame — 16 MiB + 9 bytes, the most the 24-bit length field can declare —
+//!   plus one read; `max_stream_buffer_bytes` of header blocks awaiting their
+//!   CONTINUATION frames, in at most `max_streams` blocks; two HPACK dynamic
+//!   tables of at most 64 KiB each (a fixed bound in `http2.rs`, not a field);
+//!   and the stream table: up to `max_streams` live entries plus up to
+//!   `max_streams` whose request half was evicted, each holding a request and
+//!   a response body of up to `max_body_bytes` apiece. That last term, `4 *
+//!   max_streams * max_body_bytes`, is the one that dominates on paper (128 GiB
+//!   at the defaults) and almost never in practice: it needs every stream of a
+//!   saturated table to carry two bodies at the cap at the same instant.
+//! * WebSocket, per direction: one frame of at most `max_ws_frame_bytes` + 14
+//!   header bytes (a larger declared length latches the parser off) + one read,
+//!   and the message being reassembled, kept up to `ws_sample_bytes`.
+//! * JSON-RPC, per direction: `max_stream_buffer_bytes` of unterminated line
+//!   (past it the stream latches off) + one read. No line longer than
+//!   `max_stream_buffer_bytes` is ever parsed, so the transient cost of parsing
+//!   one line is bounded by the same field.
 
 /// Tunable resource bounds. Every field is a hard ceiling except `zstd_level`,
 /// which is a compression tuning knob included under the same rule: it is a
@@ -54,7 +86,12 @@ pub struct Limits {
     /// need not be larger than it. A parser measures this against the residue
     /// left *after* a parse pass — a header block with no terminator, a torn
     /// chunk-size line, an unterminated JSON-RPC line, or bytes that are not
-    /// the expected protocol at all. Body bytes never appear in that residue:
+    /// the expected protocol at all. HTTP/2 applies it to the header blocks
+    /// awaiting CONTINUATION frames. The JSON-RPC parser never parses a line
+    /// longer than this: one that lands whole in a single read is skipped and
+    /// counted with the stream kept, while one arriving across reads (the usual
+    /// way a large pipe write arrives) latches the stream off like any other
+    /// unterminated residue. Body bytes never appear in that residue:
     /// the parser moves them into the message as it consumes them, and how
     /// many are stored is `max_body_bytes`'s decision alone. A body of any
     /// declared size therefore passes through whatever this value is, so the
@@ -63,7 +100,9 @@ pub struct Limits {
     pub max_stream_buffer_bytes: usize,
     /// Maximum size of a decompressed body during semantic extraction.
     pub max_decoded_bytes: usize,
-    /// Maximum concurrently tracked HTTP/2 streams per connection.
+    /// Maximum concurrently tracked HTTP/2 streams per connection, and the
+    /// most header blocks awaiting CONTINUATION frames that one connection may
+    /// hold (a conformant peer holds one per direction).
     pub max_streams: usize,
     /// Maximum accepted WebSocket frame payload length.
     pub max_ws_frame_bytes: usize,

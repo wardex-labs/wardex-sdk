@@ -14,6 +14,7 @@ from ._assembly import (
     Evidence,
     ParentSource,
     SpanDraft,
+    counters,
     degraded_run,
     guard,
     latch_ambient,
@@ -394,28 +395,30 @@ class _Installed:
     """A scope a block installed as current, and how to take it down again.
 
     By its Token, as a `with` block always was — except where the block ends in
-    another Context than it began in and its own scope is still the current one
-    there: a decorated generator's body, resumed on a worker thread or in
-    another task, holding a `with wardex.span()` open across its `yield`. A
-    Token cannot reset outside the Context that made it; it raised, and the
-    closed span stayed the parent of all the generator did next. There the
-    scope from before the block is set back instead. Never a plain `set()`
-    anywhere else: in a Context where this block's scope is NOT current, that
-    would write a scope from another request over whatever is.
+    another Context than it began in, which a Token refuses. A generator's body
+    does that: resumed on a worker thread or in another task, or abandoned by an
+    `async for ... break` and closed by the event loop on a task of its own,
+    holding a `with wardex.span()` or `wardex.conversation()` open across its
+    `yield`. There the scope is RETIRED for the Context that installed it
+    (`_hub.take_down`): the consumer that abandoned the generator reads the
+    scope from before the block again, where it used to keep the closed block's
+    conversation and span for every later call, and a task or callback started
+    inside the block keeps what it was started with, as after any other block.
     """
 
-    __slots__ = ("_fork", "_previous", "_token")
+    __slots__ = ("_fork", "_owner", "_previous", "_token")
 
     def __init__(self, fork: Scope) -> None:
-        self._previous = _hub._current_scope.get()
+        self._previous = _hub.get_current_scope()
+        self._owner = _hub.here()
         self._fork = fork
         self._token = _hub._current_scope.set(fork)
 
     def take_down(self) -> None:
-        if _hub._current_scope.get() is self._fork:
-            _hub._current_scope.set(self._previous)
-        else:
-            _hub._current_scope.reset(self._token)
+        if _hub.take_down(
+            _hub._current_scope, self._token, self._fork, self._previous, self._owner
+        ):
+            counters.bump("tracing.block_scope_retired")
 
 
 def _install_parent(context: SpanContext) -> _Installed | None:
@@ -541,13 +544,13 @@ def _conversation(name: str, *, id: str | None, op: OperationName | None) -> Ite
 def conversation(
     name: str, *, id: str | None = None, op: OperationName | None = None
 ) -> AbstractContextManager[Span]:
-    """Open a conversation: every span inside carries `gen_ai.conversation.id`.
+    """Open a conversation: spans and calls opened inside carry `gen_ai.conversation.id`.
 
     This is NOT a trace root, which is why it is not called "trace": the span
     it opens joins the ambient trace as a child like any other, and no new
     `trace_id` is minted here. What it opens is a CONVERSATION — the
-    `gen_ai.conversation.id` every span captured inside the block is stamped
-    with, which is how a backend groups the turns of one chat.
+    `gen_ai.conversation.id` the spans and calls opened inside the block are
+    stamped with, which is how a backend groups the turns of one chat.
 
     `id=None` (or `""`) mints a fresh uuid4. An explicit `id` is used verbatim: a
     multi-turn chat app passes its own session id so that every turn joins ONE
@@ -560,6 +563,23 @@ def conversation(
     conversation. Outside the block, the framework's id is the conversation.
     The block scopes the id, not the trace: two blocks opened side by side
     under one span are two conversations in one trace.
+
+    ONE RUN, ONE CONVERSATION. A framework run's conversation is fixed when the
+    run starts. The structural step spans of a run that started BEFORE the block
+    keep that run's conversation where they open inside the block, while the
+    spans your code opens and the LLM calls made inside the block carry this id.
+    A run started INSIDE the block carries this id on everything under it, even
+    what it does after the block ends.
+
+    A task or callback started inside the block keeps the id after the block
+    ends, however it ends; `wardex.isolation_scope()` steps out of the
+    conversation, `wardex.continue_trace()` does not. A block held across a
+    `yield` in a generator the consumer abandons is closed elsewhere, and the
+    consumer gets its own scope back: at once when the block is closed on the
+    consumer task's own event loop on Python 3.12+ (the usual case: an abandoned
+    async generator finalized by its loop), otherwise on its next wardex read,
+    so a thread, a task or a `copy_context()` it takes before that read still
+    carries this id.
     """
     return _WithOnly("conversation", _conversation(name, id=id, op=op))
 

@@ -369,6 +369,54 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- **A read made of many small HTTP/2, WebSocket or JSON-RPC frames no longer
+  stalls your thread.** Each of those parsers removed every frame it parsed
+  from the front of its buffer, moving the rest of the read once per frame, on
+  your own thread with the GIL held: one 256 KiB read cost 68 ms as 9-byte
+  HTTP/2 frames, 309 ms as 2-byte WebSocket frames and 636 ms as empty
+  JSON-RPC lines. The same reads now cost 0.19, 0.66 and 0.34 ms, and the cost
+  grows with the read, not with its square.
+- **Three things the protocol parsers held had no bound; now each has one,
+  and crossing it is said.** HTTP/2 header blocks waiting for their
+  CONTINUATION frames count against `max_streams` and
+  `max_stream_buffer_bytes`, and past either the connection stops being read
+  (`stream_buffer_exceeded`). An HTTP/2 peer can no longer grow the header
+  compression table past 64 KiB, the most common peers ask for; a request for
+  more stops reading that connection (`hpack_table_size_exceeded`). Both reach
+  the existing "a protocol parser stopped reading a connection" line. An MCP
+  stdio line longer than `max_stream_buffer_bytes` is never parsed: when the
+  whole line arrives in one read it is skipped on its own, counted under
+  `interceptors.mcp_stdio.line_over_cap` and said once, and the subprocess
+  stays captured; when it arrives across reads, which is how a write that large
+  usually arrives, the stream stops being read, as it did before, and the
+  existing parser-stopped line says so.
+- **An HTTP/2 body cut at its cap now says so the way HTTP/1 does.** The span
+  carries `body_cap_exceeded`, so one query finds capped bodies on both.
+- **An MCP tool's whole answer now reaches the span.** A tool that answered
+  with `structuredContent` and an empty `content` list shipped as an OK span
+  whose output was `[]`, and next to `content` the `structuredContent` and
+  `_meta` were dropped. The output is now the `content` list when that is all
+  the result holds, as before, and the whole result object whenever it holds
+  more. `isError: true` is an error whatever else the result lacks. A result
+  wardex cannot vouch for (not an object, a `resultType` other than
+  `complete` such as `input_required`, an `isError` that is not a boolean or
+  is spelled another way, a `content` that is not a list, or no tool output at
+  all) ships as it came, with status `UNSET` and `semantic_parse_failed`,
+  instead of as a success. Spans carry `mcp.protocol.version`, the MCP
+  revision they were read against, when the peer names one that reads as a
+  revision identifier; one that does not is left off, counted and said once.
+- **An MCP tool call over stdio is now an `execute_tool` span.** It is named
+  `execute_tool {tool}`, kind CLIENT, with `gen_ai.operation.name` set, so it
+  is counted with every other tool call (before, every one was `MCP
+  tools/call`). The tool name names the span only when it is a printable string
+  of at most 128 characters. While the openai-agents or LangGraph adapter is
+  installed, the call stays `MCP tools/call`: those adapters already record
+  it as their own `execute_tool` span, in another trace, and one call must not
+  count twice. That choice is said once, naming the adapter; leave the adapter
+  out with `AdaptersConfig(enabled=...)` to have a raw `mcp` client's calls
+  counted. JSON-RPC batch lines, which older MCP revisions allowed and which
+  were dropped, are read message by message, and a request dropped because
+  4096 were already waiting is counted and said once.
 - **An attribute the wire cannot hold no longer costs the batch, and a large
   integer no longer turns into a float.** `span.set_attribute("req_id",
   2**70)` exported `1.1805916207174113e+21`, and so did a numpy integer such
@@ -402,6 +450,49 @@ All notable changes to this project are documented here. The format follows
   envelope), each one is counted under `transport.otlp.pii_scrubbed` or
   `transport.wardex.pii_scrubbed`, and one line per process says that masking
   failed and asks for a report.
+- **A conversation id now stays inside its `wardex.conversation(...)` block
+  at every edge of it.** Three edges lost it or leaked it. A trace continued
+  inside a conversation (`continue_trace`, with or without a `traceparent`,
+  or `continue_from_otel`) started from a blank scope, so every span in the
+  request, LLM calls included, shipped with no `gen_ai.conversation.id`; the
+  conversation now carries on, while the trace still starts over as before.
+  Work started inside a block inherits it, so a long-lived worker started
+  inside one request's block now carries that conversation into every trace
+  it continues: `wardex.isolation_scope()` still starts from a blank scope
+  and is the way to step out of a conversation. An async generator that
+  holds a block (or a `continue_trace`, `isolation_scope` or `new_scope`)
+  across a `yield` and is abandoned with `break` (a client that hung up
+  mid-stream) left the dead block's id, and its span as the parent, on every
+  later call the consumer made, because the event loop closes such a
+  generator on a task of its own; with a `continue_trace` it also raised a
+  `ValueError` out of that cleanup task into your logs. The consumer now
+  takes back the scope it had before the block (counted as
+  `tracing.block_scope_retired`): at once when the block is closed on the
+  consumer task's own event loop on Python 3.12 or later (the usual case: an
+  abandoned async generator finalized by its loop), otherwise on its next
+  wardex read, so a thread, a task or a `copy_context()` it takes before that
+  read still carries the dead block's id. A task or callback the block
+  started keeps the block's conversation and parent, as it does when a block
+  ends normally.
+  And an openai-agents trace started inside a block and finished outside it
+  put the block's id back on every later call, while one started outside and
+  finished inside cost the rest of the block its id and its parent and
+  brought the finished trace's group id back after the block; a trace now
+  puts back the scope it found only while its own is still the current one.
+- **A conversation opened inside a framework run now reaches the runs it
+  starts.** A `wardex.conversation(...)` opened inside a LangGraph node did
+  not reach the subgraph the node ran: the inner run, its steps and its
+  tools carried the outer run's thread id, and a subgraph one level deeper
+  its own. A unit wardex opens under another one inherited the parent's
+  conversation without looking at what your code had opened since. Now a run
+  started inside the block (a LangGraph graph run, an openai-agents agent)
+  carries the block's conversation, and so does everything under it, at any
+  depth, whether or not the run finishes inside the block. A run's
+  conversation is fixed when it starts, so one run never spans two
+  conversations: the structural step spans of a run that started before the
+  block keep that run's conversation where they open inside the block, while
+  the spans your code opens and the LLM calls made inside the block carry
+  the block's.
 - **An OpenAI Responses stream that fails midway now fails its chat span.**
   A Responses API stream (`responses.create(stream=True)`, the openai-agents
   default) that started with a 200 and then ended in a `response.failed`

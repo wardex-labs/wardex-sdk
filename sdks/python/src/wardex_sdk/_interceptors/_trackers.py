@@ -512,7 +512,13 @@ class _Http2Tracker:
             request_counted=t.request_ended and not (t.request_truncated or request_evicted),
             response_counted=not t.response_truncated,
             stream_id=t.stream_id,
-            limitations=(Limitation.H2_REQUEST_EVICTED,) if request_evicted else (),
+            # A body past its cap carries the marker HTTP/1 gives the same cut (`append_capped`), so
+            # one query finds every capped body whatever version carried it. HTTP/2 reports the cut
+            # per direction instead of as a marker, and this is where those two flags become one.
+            limitations=_merge_markers(
+                (Limitation.H2_REQUEST_EVICTED,) if request_evicted else (),
+                (Limitation.BODY_CAP_EXCEEDED,) if t.truncated else (),
+            ),
             version="2",
             ttft_ms=None,  # per-h2-stream first-body-byte not tracked: not measured
             content_type=getattr(t, "content_type", None),

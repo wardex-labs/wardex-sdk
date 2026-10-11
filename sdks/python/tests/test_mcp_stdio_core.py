@@ -1,11 +1,41 @@
+import json
+from collections.abc import Iterator
+
+import pytest
+
+from wardex_sdk import _hub
+from wardex_sdk._assembly import Limitation, counters
+from wardex_sdk._assembly._diag import reset_reports_for_test
 from wardex_sdk._enums import CaptureSource, Protocol, SpanKind, StatusCode
+from wardex_sdk._interceptors import _mcp_stdio
 from wardex_sdk._interceptors._mcp_stdio import _ProcState
+
+
+@pytest.fixture(autouse=True)
+def _no_framework_adapter(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Whether a framework adapter owns MCP tool spans is decided per process; pin it per test
+    so no adapter an earlier test installed decides it here. Tests that need an owner say so."""
+    monkeypatch.setattr(_hub, "installed_adapters", frozenset)
+
+
+@pytest.fixture
+def _fresh_reports() -> Iterator[None]:
+    reset_reports_for_test()
+    yield
+    reset_reports_for_test()
 
 
 def _drive(req: bytes, resp: bytes):
     st = _ProcState()
     st.feed_request(req)
     return [span for span, _scope in st.feed_response(resp)]
+
+
+def _call(result: object, *, rid: int = 1, name: object = "t") -> tuple[bytes, bytes]:
+    """A `tools/call` of tool `name` and the response carrying `result`, as two lines."""
+    req = {"jsonrpc": "2.0", "id": rid, "method": "tools/call", "params": {"name": name}}
+    resp = {"jsonrpc": "2.0", "id": rid, "result": result}
+    return (json.dumps(req) + "\n").encode(), (json.dumps(resp) + "\n").encode()
 
 
 def test_tools_call_extracts_tool_and_io():
@@ -18,7 +48,8 @@ def test_tools_call_extracts_tool_and_io():
     assert len(spans) == 1
     sp = spans[0]
     assert sp.kind == SpanKind.CLIENT
-    assert sp.name == "MCP tools/call"
+    assert sp.name == "execute_tool create_issue"
+    assert dict(sp.extra)["gen_ai.operation.name"] == "execute_tool"
     assert sp.transport.protocol == Protocol.MCP_STDIO
     assert sp.transport.mcp.rpc_method == "tools/call"
     assert sp.transport.mcp.rpc_id == "1"
@@ -182,3 +213,310 @@ def test_a_dead_server_does_not_strand_its_pending_requests():
     assert st.on_stream_end() == 2
     assert st._latch == {}
     assert st.on_stream_end() == 0  # idempotent: EOF can be observed more than once
+
+
+# -- what a tool result reads as ------------------------------------------------------------
+
+
+def test_a_result_of_structured_content_alone_ships_it_as_the_output():
+    """A server answering with `structuredContent` and an empty `content` list used to ship an
+    OK span whose output was `[]`: the tool's whole answer was dropped."""
+    (sp,) = _drive(*_call({"content": [], "structuredContent": {"temperature": 21.5}}))
+    assert json.loads(sp.output_data)["structuredContent"] == {"temperature": 21.5}
+    assert sp.status == StatusCode.OK
+    assert not sp.capture_integrity or not sp.capture_integrity.limitations
+
+    (sp,) = _drive(*_call({"structuredContent": {"n": 1}}))
+    assert json.loads(sp.output_data) == {"structuredContent": {"n": 1}}
+    assert sp.status == StatusCode.OK
+
+
+def test_content_beside_structured_content_and_meta_loses_neither():
+    result = {
+        "content": [{"type": "text", "text": '{"n": 1}'}],
+        "structuredContent": {"n": 1},
+        "_meta": {"io.example/trace": "abc"},
+        "isError": False,
+        "resultType": "complete",
+    }
+    (sp,) = _drive(*_call(result))
+    assert json.loads(sp.output_data) == result
+    assert sp.status == StatusCode.OK
+
+
+def test_a_plain_content_result_still_ships_its_content_list():
+    """The common shape keeps the output it always had: the `content` list itself."""
+    content = [{"type": "text", "text": "ok"}]
+    for result in (
+        {"content": content},
+        {"content": content, "isError": False, "resultType": "complete"},
+    ):
+        (sp,) = _drive(*_call(result))
+        assert json.loads(sp.output_data) == content
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        # An interim answer: the call goes on in a retry under a new JSON-RPC id.
+        {"resultType": "input_required", "inputRequests": {"a": {"method": "elicitation/create"}}},
+        # A result type this reader does not know.
+        {"content": [], "resultType": "deferred"},
+        # A failure flag under another spelling, which may well say the tool failed.
+        {"content": [{"type": "text", "text": "boom"}], "is_error": True},
+        {"content": [], "IsError": True},
+        # A failure flag that is not a boolean.
+        {"content": [], "isError": "yes"},
+        # A `content` that is not the list of blocks every revision defines.
+        {"content": "oops"},
+        {"content": None},
+        # Neither shape of tool output at all.
+        {},
+        # Not an object.
+        [{"type": "text", "text": "x"}],
+        "done",
+    ],
+)
+def test_a_result_the_reader_cannot_vouch_for_ships_raw_unset_and_marked(result: object):
+    (sp,) = _drive(*_call(result))
+    assert json.loads(sp.output_data) == result
+    assert sp.status == StatusCode.UNSET
+    assert sp.error_type is None
+    assert Limitation.SEMANTIC_PARSE_FAILED in sp.capture_integrity.limitations
+
+
+def test_is_error_true_is_a_tool_error():
+    (sp,) = _drive(*_call({"content": [], "structuredContent": {"e": 1}, "isError": True}))
+    assert sp.status == StatusCode.ERROR
+    assert sp.error_type == "tool_error"
+    assert json.loads(sp.output_data)["structuredContent"] == {"e": 1}
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        {"isError": True},
+        {"isError": True, "content": "not a list"},
+        {"isError": True, "resultType": "input_required"},
+    ],
+)
+def test_a_server_stated_failure_is_an_error_whatever_else_the_shape_lacks(result: object):
+    """`isError: true` is the server saying the tool failed; nothing missing beside it makes that
+    a claim wardex cannot vouch for."""
+    (sp,) = _drive(*_call(result))
+    assert sp.status == StatusCode.ERROR
+    assert sp.error_type == "tool_error"
+    assert json.loads(sp.output_data) == result
+    assert not sp.capture_integrity or not sp.capture_integrity.limitations
+
+
+# -- which revision the shapes were read against -------------------------------------------
+
+
+def _version(sp) -> str | None:
+    return dict(sp.extra).get("mcp.protocol.version")
+
+
+def test_spans_carry_the_version_initialize_settled_on():
+    st = _ProcState()
+    st.feed_request(
+        b'{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-11-25"}}\n'
+    )
+    # Before the server answers, the client's proposal is not a version anything was read under.
+    req, resp = _call({"content": []}, rid=1)
+    st.feed_request(req)
+    (init,) = [
+        sp
+        for sp, _ in st.feed_response(
+            b'{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":"2025-06-18"}}\n'
+        )
+    ]
+    assert _version(init) == "2025-06-18"
+    (call,) = [sp for sp, _ in st.feed_response(resp)]
+    assert _version(call) == "2025-06-18"
+
+
+def test_a_request_stamped_with_its_own_version_carries_that_one():
+    """The 2026-07-28 revision has no `initialize`: every request names its version in `_meta`."""
+    meta = {"io.modelcontextprotocol/protocolVersion": "2026-07-28"}
+    req = {"jsonrpc": "2.0", "id": 7, "method": "tools/list", "params": {"_meta": meta}}
+    (sp,) = _drive(
+        (json.dumps(req) + "\n").encode(), b'{"jsonrpc":"2.0","id":7,"result":{"tools":[]}}\n'
+    )
+    assert _version(sp) == "2026-07-28"
+
+
+def test_no_version_is_claimed_when_none_was_seen():
+    (sp,) = _drive(*_call({"content": []}))
+    assert _version(sp) is None
+
+
+@pytest.mark.usefixtures("fresh_counters", "_fresh_reports")
+@pytest.mark.parametrize(
+    "version",
+    ["v" * (2 << 20), "9999-99-99 spoof", "dave@example.com 4111111111111111", 12345, "", None],
+    # Named, never derived from the value: the 2 MiB string would be a 2 MiB test id, which
+    # `pytest -v` prints as one line and a CI log runner cannot take.
+    ids=["two-mib", "spoofed-date", "free-text-pii", "int", "empty", "none"],
+)
+def test_a_version_that_does_not_read_as_a_revision_is_refused_counted_and_said(version, capsys):
+    """The version is the peer's text. A 2 MiB one rode every later span of the subprocess, and
+    free text (an address, a card number) was taken verbatim; neither is a revision."""
+    st = _ProcState()
+    st.feed_request(b'{"jsonrpc":"2.0","id":0,"method":"initialize","params":{}}\n')
+    answer = {"jsonrpc": "2.0", "id": 0, "result": {"protocolVersion": version}}
+    (init,) = [sp for sp, _ in st.feed_response((json.dumps(answer) + "\n").encode())]
+    req, resp = _call({"content": []}, rid=1)
+    st.feed_request(req)
+    (call,) = [sp for sp, _ in st.feed_response(resp)]
+    assert _version(init) is None and _version(call) is None
+    assert counters.get("interceptors.mcp_stdio.protocol_version_unreadable") == 1
+
+    # A request's own stamp is its only claim: refused, it is not replaced by a negotiated one.
+    st.feed_request(b'{"jsonrpc":"2.0","id":2,"method":"initialize","params":{}}\n')
+    st.feed_response(b'{"jsonrpc":"2.0","id":2,"result":{"protocolVersion":"2025-06-18"}}\n')
+    meta = {"io.modelcontextprotocol/protocolVersion": version}
+    stamped = {"jsonrpc": "2.0", "id": 3, "method": "tools/list", "params": {"_meta": meta}}
+    st.feed_request((json.dumps(stamped) + "\n").encode())
+    (sp,) = [sp for sp, _ in st.feed_response(b'{"jsonrpc":"2.0","id":3,"result":{"tools":[]}}\n')]
+    assert _version(sp) is None
+    assert counters.get("interceptors.mcp_stdio.protocol_version_unreadable") == 2
+    lines = [x for x in capsys.readouterr().err.splitlines() if "protocol_version_unreadable" in x]
+    assert len(lines) == 1 and lines[0].startswith("[wardex] ")
+
+
+def test_a_revision_shaped_version_of_any_spelling_is_kept():
+    """Revisions are dates today; a later one need not be, so the test is a shape, not a date."""
+    for version in ("2025-06-18", "2027-01-15-draft", "v3.0_rc1", "x" * 32):
+        meta = {"io.modelcontextprotocol/protocolVersion": version}
+        req = {"jsonrpc": "2.0", "id": 1, "method": "ping", "params": {"_meta": meta}}
+        (sp,) = _drive((json.dumps(req) + "\n").encode(), b'{"jsonrpc":"2.0","id":1,"result":{}}\n')
+        assert _version(sp) == version
+
+
+# -- execute_tool, and who owns it ---------------------------------------------------------
+
+
+def test_an_installed_framework_adapter_keeps_the_call_a_transport_span(monkeypatch):
+    """Under openai-agents or LangGraph the adapter records the same call as its own
+    `execute_tool` span, in another trace; promoting this one too would count the call twice."""
+    for owner in ("openai_agents", "langgraph"):
+        monkeypatch.setattr(_hub, "installed_adapters", lambda o=owner: frozenset({o}))
+        (sp,) = _drive(*_call({"content": []}))
+        assert sp.name == "MCP tools/call"
+        assert "gen_ai.operation.name" not in dict(sp.extra)
+        assert sp.tool.name == "t"
+
+    monkeypatch.setattr(_hub, "installed_adapters", lambda: frozenset({"anthropic_agent_sdk"}))
+    (sp,) = _drive(*_call({"content": []}))
+    assert sp.name == "execute_tool t"
+
+
+@pytest.mark.usefixtures("fresh_counters", "_fresh_reports")
+def test_ceding_a_tool_call_to_an_adapter_is_said_once_naming_it(monkeypatch, capsys):
+    """An adapter auto-installed because its framework is importable, and never used, still turns
+    a raw `mcp` client's tool calls into transport spans; that must not happen in silence."""
+    monkeypatch.setattr(
+        _hub, "installed_adapters", lambda: frozenset({"openai_agents", "langgraph", "codex_exec"})
+    )
+    for rid in (1, 2):
+        (sp,) = _drive(*_call({"content": []}, rid=rid))
+        assert sp.name == "MCP tools/call"
+    lines = [x for x in capsys.readouterr().err.splitlines() if "execute_tool_ceded" in x]
+    assert len(lines) == 1
+    assert "langgraph, openai_agents adapter(s)" in lines[0]
+    assert "codex_exec" not in lines[0]
+    assert "AdaptersConfig(enabled=" in lines[0]
+    assert counters.get("interceptors.mcp_stdio.execute_tool_ceded") == 2
+
+    # A call that is not a tool call cedes nothing, and says nothing more.
+    _drive(
+        b'{"jsonrpc":"2.0","id":9,"method":"tools/list","params":{}}\n',
+        b'{"jsonrpc":"2.0","id":9,"result":{"tools":[]}}\n',
+    )
+    assert counters.get("interceptors.mcp_stdio.execute_tool_ceded") == 2
+
+
+def test_only_a_tool_call_is_ever_an_execute_tool():
+    spans = _drive(
+        b'{"jsonrpc":"2.0","id":4,"method":"tools/list","params":{}}\n',
+        b'{"jsonrpc":"2.0","id":4,"result":{"tools":[]}}\n',
+    )
+    assert spans[0].name == "MCP tools/list"
+    assert "gen_ai.operation.name" not in dict(spans[0].extra)
+    # A tool call whose tool name is unreadable stays a transport observation.
+    (sp,) = _drive(
+        b'{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{}}\n',
+        b'{"jsonrpc":"2.0","id":5,"result":{"content":[]}}\n',
+    )
+    assert sp.name == "MCP tools/call"
+
+
+@pytest.mark.parametrize(
+    "name",
+    [{"x": 1}, 123, ["a"], True, "", "   ", "a b\n\tc", "x\x00y", "n" * 129],
+    ids=["dict", "int", "list", "bool", "empty", "blank", "newline-tab", "nul", "129-chars"],
+)
+def test_a_tool_name_that_cannot_name_a_span_leaves_it_a_transport_span(name: object):
+    """The tool name is the peer's text, and a span name is the label every backend indexes:
+    an object, a number or a list was `str()`-ed into the name, a newline split it, and a name of
+    thousands of characters became the name."""
+    (sp,) = _drive(*_call({"content": []}, name=name))
+    assert sp.name == "MCP tools/call"
+    assert "gen_ai.operation.name" not in dict(sp.extra)
+
+
+def test_a_tool_name_at_the_length_bound_still_names_the_span():
+    for name in ("n" * 128, "get weather", "tools.search_v2"):
+        (sp,) = _drive(*_call({"content": []}, name=name))
+        assert sp.name == f"execute_tool {name}"
+
+
+# -- batches, and what is lost visibly ------------------------------------------------------
+
+
+def test_a_batch_of_calls_becomes_one_span_per_call():
+    """Batches were dropped like lines that are not JSON-RPC at all: 24 calls, 0 spans."""
+    calls = [
+        {"jsonrpc": "2.0", "id": i, "method": "tools/call", "params": {"name": f"t{i}"}}
+        for i in range(24)
+    ]
+    answers = [{"jsonrpc": "2.0", "id": i, "result": {"content": []}} for i in range(24)]
+    st = _ProcState()
+    st.feed_request((json.dumps(calls) + "\n").encode())
+    spans = [sp for sp, _ in st.feed_response((json.dumps(answers) + "\n").encode())]
+    assert sorted(sp.tool.name for sp in spans) == sorted(f"t{i}" for i in range(24))
+
+
+@pytest.mark.usefixtures("fresh_counters", "_fresh_reports")
+def test_a_request_dropped_at_the_pending_bound_is_counted_and_said_once(monkeypatch, capsys):
+    monkeypatch.setattr(_mcp_stdio, "MAX_PENDING_REQUESTS", 2)
+    st = _ProcState()
+    for i in range(5):
+        st.feed_request(_call({"content": []}, rid=i)[0])
+    assert len(st._latch) == 2
+    assert counters.get("interceptors.mcp_stdio.pending_evicted") == 3
+    err = capsys.readouterr().err
+    lines = [line for line in err.splitlines() if "pending_evicted" in line]
+    assert len(lines) == 1 and lines[0].startswith("[wardex] ")
+
+
+@pytest.mark.usefixtures("fresh_counters", "_fresh_reports")
+def test_a_message_longer_than_the_line_cap_is_counted_and_said_once(capsys):
+    from wardex_sdk import LimitsConfig
+
+    st = _ProcState(limits=LimitsConfig(max_stream_buffer_bytes=128).to_native())
+    big = {"content": [{"type": "text", "text": "x" * 500}]}
+    for rid in (1, 2):
+        req, resp = _call(big, rid=rid)
+        st.feed_request(req)
+        assert st.feed_response(resp) == []
+    assert counters.get("interceptors.mcp_stdio.line_over_cap") == 2
+    assert st.disabled_reason() is None, "a skipped line costs only itself"
+    err = capsys.readouterr().err
+    lines = [line for line in err.splitlines() if "line_over_cap" in line]
+    assert len(lines) == 1 and lines[0].startswith("[wardex] ")
+    # The next call that fits is still captured.
+    req, resp = _call({"content": []}, rid=3)
+    st.feed_request(req)
+    assert len(st.feed_response(resp)) == 1

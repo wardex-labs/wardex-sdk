@@ -298,7 +298,7 @@ class _Carrier:
             elif self.owner is not _current_task():
                 raise ValueError("a pin may only be removed on the task that installed it")
             else:
-                restore_scope(self._prev_scope)
+                restore_scope(self._prev_scope, self._fork)
 
     def retire_from_afar(self) -> None:
         """Take a PIN's fork out of service from a task that cannot remove it.
@@ -484,18 +484,21 @@ class Unit:
 
     # -- parentage handout -----------------------------------------------
 
-    def child(self, evidence: Evidence = _IN_UNIT) -> Parentage:
+    def child(
+        self, evidence: Evidence = _IN_UNIT, conversation: ConversationContext | None = None
+    ) -> Parentage:
         """The only way an adapter obtains a parent.
 
         `child_of` is what actually builds the edge; this method exists so that
         the anchor cannot be anything other than a context the registry owns.
         The conversation identity and the tracestate ride along, so a sub-agent
-        span does not silently lose the conversation id its session issued.
+        span does not silently lose the conversation id its session issued —
+        the unit's own, or the one `_conversation_under` found the host opened inside it.
         """
         return child_of(
             self.context,
             evidence,
-            conversation=self.conversation,
+            conversation=self.conversation if conversation is None else conversation,
             tracestate=self.tracestate,
         )
 
@@ -1038,44 +1041,40 @@ class UnitRegistry:
     ) -> Unit:
         """Open a unit and the span it owns.
 
-        `conversation`, when given, is the identity the FRAMEWORK stated for
-        this unit — a run's group id — and it replaces what the parent unit or
-        the parentage would have handed down, so children and the carrier a
-        pin installs inherit the framework's word rather than an issued one.
-        Absent, the inheritance rules below are unchanged. PRECEDENCE is the
-        caller's to decide before it states one: the openai-agents adapter
-        yields to a host conversation already ambient (the host wins) and
-        states the group id only when nothing is.
+        `conversation`, when given, is the identity the FRAMEWORK stated for this unit — a run's
+        group id — and it replaces what the parent unit or the parentage would have handed down, so
+        children and the carrier a pin installs inherit the framework's word rather than an issued
+        one. Absent, the inheritance rules below are unchanged. PRECEDENCE is the caller's to decide
+        before it states one: the openai-agents adapter yields to a host conversation already
+        ambient (the host wins) and states the group id only when nothing is. A unit under
+        `parent_unit` inherits the parent's, or, for a run, the host's when the host opened one
+        inside the parent (`_conversation_under`).
 
-        `owner` names the adapter this unit belongs to, for the day one
-        process-wide registry serves several at once. Defaulting it to None
-        keeps every caller's meaning unchanged; what it must never become is a
-        default that matches — see `sole_live`.
+        `owner` names the adapter this unit belongs to, for the day one process-wide registry serves
+        several at once. Defaulting it to None keeps every caller's meaning unchanged; what it must
+        never become is a default that matches — see `sole_live`.
 
-        `ambient` has no default on purpose. It is a snapshot taken by
-        `latch_ambient()` at the moment the work was ISSUED, on the task that
-        issued it; letting the registry latch it for the caller would move that
-        read to whenever the framework happened to call us, which is the single
-        most likely way an adapter silently breaks the tree. A unit that hangs
-        off another unit passes `EMPTY_AMBIENT` and `parent_unit`.
+        `ambient` has no default on purpose. It is a snapshot taken by `latch_ambient()` at the
+        moment the work was ISSUED, on the task that issued it; letting the registry latch it for
+        the caller would move that read to whenever the framework happened to call us, which is the
+        single most likely way an adapter silently breaks the tree. A unit that hangs off another
+        unit passes `EMPTY_AMBIENT` and `parent_unit`.
 
-        A scope left behind by a unit of this registry that has already CLOSED
-        — a leaked pin, or an `activate()` fork `close()` could not take down —
-        is refused here for the same reason `resolve()` refuses it: it is a
-        finished unit's own context, so a unit opened from it would be a fresh
-        subtree hanging off a dead session at confidence 1.0 with nothing on the
-        wire to say so. The unit becomes a trace root instead and carries
-        `CORRELATION_CONFLICT` — or `INSTRUMENTATION_DEGRADED` when the unit
-        died by the registry's OWN eviction (`refused_ambient_marker`): the two
-        strands have different repairs.
+        A scope left behind by a unit of this registry that has already CLOSED — a leaked pin, or an
+        `activate()` fork `close()` could not take down — is refused here for the same reason
+        `resolve()` refuses it: it is a finished unit's own context, so a unit opened from it would
+        be a fresh subtree hanging off a dead session at confidence 1.0 with nothing on the wire to
+        say so. The unit becomes a trace root instead and carries `CORRELATION_CONFLICT` — or
+        `INSTRUMENTATION_DEGRADED` when the unit died by the registry's OWN eviction
+        (`refused_ambient_marker`): the two strands have different repairs.
         """
         now = start_ns if start_ns is not None else time.time_ns()
         stated = conversation
         if parent_unit is not None:
             if evidence is AMBIENT:
                 evidence = _IN_UNIT
-            parentage = parent_unit.child(evidence)
-            conversation = parent_unit.conversation
+            conversation = _conversation_under(parent_unit, kind, ambient)
+            parentage = parent_unit.child(evidence, conversation)
             tracestate = parent_unit.tracestate
         elif self._poisoned(ambient):
             self._note_refused_ambient()
@@ -1260,22 +1259,19 @@ class UnitRegistry:
     def current(self) -> Unit | None:
         """The unit made ambient by `activate()` or a pin, if any.
 
-        ContextVar-backed, so an asyncio task created after the installation
-        inherits it by ordinary context copying — which is exactly how a hook
-        callback and an in-process tool handler see their session with zero
-        framework identifiers and confidence 1.0.
+        ContextVar-backed, so an asyncio task created after the installation inherits it by ordinary
+        context copying — which is exactly how a hook callback and an in-process tool handler see
+        their session with zero framework identifiers and confidence 1.0.
 
-        A carrier whose unit has since CLOSED returns None rather than the dead
-        unit. That is the detection the pin restriction asks for: a pin leaked
-        onto a pooled worker is self-consistent (same task, same ContextVar) and
-        would otherwise parent unrelated later work into a finished unit, which
-        no confidence value or marker downstream could reveal.
+        A carrier whose unit has since CLOSED returns None rather than the dead unit. That is the
+        detection the pin restriction asks for: a pin leaked onto a pooled worker is self-consistent
+        (same task, same ContextVar) and would otherwise parent unrelated later work into a finished
+        unit, which no confidence value or marker downstream could reveal.
 
-        Ownership is checked FIRST, ahead of liveness, and the order is not
-        cosmetic: a foreign CLOSED unit would otherwise bump `pin_stale` /
-        `pin_leaked` and attribute another registry's teardown to this
-        registry's pin discipline, polluting the very counters the pin
-        restriction is audited by.
+        Ownership is checked FIRST, ahead of liveness, and the order is not cosmetic: a foreign
+        CLOSED unit would otherwise bump `pin_stale` / `pin_leaked` and attribute another registry's
+        teardown to this registry's pin discipline, polluting the very counters the pin restriction
+        is audited by.
         """
         entry = _ambient_unit.get()
         if entry is None:
@@ -1302,51 +1298,43 @@ class UnitRegistry:
     def closed_unit_in_scope(self) -> bool:
         """Is the scope on this task the leftover of a unit that has DIED?
 
-        `current()` refusing the dead unit is only half of an activation's
-        safety, and the other half is what makes the first half matter. A
-        carrier installs TWO things (`_Carrier.__init__`): the ambient UNIT,
-        which `current()` gates on liveness, and the ambient SPAN CONTEXT in the
-        scope, which nothing can invalidate — `close()` may run on a different
-        task, and a ContextVar cannot be reset from one. So after the unit
-        closes, the very next `latch_ambient()` still returns the DEAD unit's
-        own span context, and an edge built from it reads `contextvar` / 1.0 /
-        no marker: the failure `current()`'s docstring says it exists to
-        prevent, arriving by the other carrier.
+        `current()` refusing the dead unit is only half of an activation's safety, and the other
+        half is what makes the first half matter. A carrier installs TWO things
+        (`_Carrier.__init__`): the ambient UNIT, which `current()` gates on liveness, and the
+        ambient SPAN CONTEXT in the scope, which nothing can invalidate — `close()` may run on a
+        different task, and a ContextVar cannot be reset from one. So after the unit closes, the
+        very next `latch_ambient()` still returns the DEAD unit's own span context, and an edge
+        built from it reads `contextvar` / 1.0 / no marker: the failure `current()`'s docstring says
+        it exists to prevent, arriving by the other carrier.
 
-        PINNED OR NOT (design §10.3), and the widening is the whole of (a).
-        This gated on `entry.pinned` on the reading that only a pin installs a
-        fork nobody can take down. That was wrong about `activate()`, and
-        measurably so: a generator-scoped activation (LangGraph's
-        `Pregel.stream`) is entered on the carrier that pumps the first
-        `next()` and can only be undone when the generator is FINALIZED, on
-        whatever carrier finalizes it. A `close_units()` mid-stream, or a
-        finalization on a foreign carrier, strands exactly the same corpse — and
-        it was not merely uncounted, it was a CONFIDENT PARENT: an entire later
-        graph run adopted into an already-shipped span at 1.0 with no marker,
-        one trace where two belong. A pin is one way to strand a fork, not the
-        definition of one. `entry.pinned` survives below only to NAME a counter,
-        which is exactly the role it already plays in `current()`.
+        PINNED OR NOT (design §10.3), and the widening is the whole of (a). This gated on
+        `entry.pinned` on the reading that only a pin installs a fork nobody can take down. That was
+        wrong about `activate()`, and measurably so: a generator-scoped activation (LangGraph's
+        `Pregel.stream`) is entered on the carrier that pumps the first `next()` and can only be
+        undone when the generator is FINALIZED, on whatever carrier finalizes it. A `close_units()`
+        mid-stream, or a finalization on a foreign carrier, strands exactly the same corpse — and it
+        was not merely uncounted, it was a CONFIDENT PARENT: an entire later graph run adopted into
+        an already-shipped span at 1.0 with no marker, one trace where two belong. A pin is one way
+        to strand a fork, not the definition of one. `entry.pinned` survives below only to NAME a
+        counter, which is exactly the role it already plays in `current()`.
 
-        This predicate is what lets `open()` and `resolve()` refuse that scope
-        and SAY SO on the span whose parent edge it would have decided — design
-        §5.6 asks for a hard `CORRELATION_CONFLICT` rather than an internal
-        count (or `INSTRUMENTATION_DEGRADED` when the strand is wardex's own
-        eviction — `refused_ambient_marker`), because the consequence is a tree
-        shape and a tree shape has to be falsifiable from the data.
+        This predicate is what lets `open()` and `resolve()` refuse that scope and SAY SO on the
+        span whose parent edge it would have decided — design §5.6 asks for a hard
+        `CORRELATION_CONFLICT` rather than an internal count (or `INSTRUMENTATION_DEGRADED` when the
+        strand is wardex's own eviction — `refused_ambient_marker`), because the consequence is a
+        tree shape and a tree shape has to be falsifiable from the data.
 
-        LIVENESS, not §5.6's literal "any read from a different task id". Every
-        hook callback and every in-process tool handler runs on a descendant
-        task, which is the mechanism the whole design rests on; the literal rule
-        would stamp `CORRELATION_CONFLICT` on the product's own exhibit A.
+        LIVENESS, not §5.6's literal "any read from a different task id". Every hook callback and
+        every in-process tool handler runs on a descendant task, which is the mechanism the whole
+        design rests on; the literal rule would stamp `CORRELATION_CONFLICT` on the product's own
+        exhibit A.
 
-        The NAME is the question the predicate answers: a CLOSED unit of THIS
-        registry left its span context in this scope — whether a pin, an
-        `activate()` leftover or the registry's own eviction stranded it. The
-        counters underneath keep the three-way split (`stale_pin_ambient` /
-        `stale_activation_ambient` / `stale_ambient_evicted`, via
-        `_note_refused_ambient`) because they name the REPAIR — which task
-        was pinned vs the adapter's lifetime vs `max_units` — not the
-        predicate. The implementation is `_closed_ambient_context`.
+        The NAME is the question the predicate answers: a CLOSED unit of THIS registry left its span
+        context in this scope — whether a pin, an `activate()` leftover or the registry's own
+        eviction stranded it. The counters underneath keep the three-way split (`stale_pin_ambient`
+        / `stale_activation_ambient` / `stale_ambient_evicted`, via `_note_refused_ambient`) because
+        they name the REPAIR — which task was pinned vs the adapter's lifetime vs `max_units` — not
+        the predicate. The implementation is `_closed_ambient_context`.
         """
         return self._closed_ambient_context() is not None
 
@@ -1619,33 +1607,28 @@ class UnitRegistry:
     def pin_driver(self, unit: Unit, *, owner_task: object) -> PinToken:
         """Install `unit` as ambient for the REMAINDER OF THE CURRENT TASK.
 
-        RESTRICTED. Legal only on a long-lived driver task the adapter itself
-        created or patched and whose lifetime is bounded by the unit — a
-        transport read loop. It is ILLEGAL on a pooled or shared worker, where a
-        leaked pin would silently parent unrelated later work into a dead unit.
-        Reachable only through the registry, never exported as a free function,
-        because the free-function form put that leak one import away for every
-        adapter author (a CrewAI ThreadPoolExecutor worker, a uvicorn/anyio
-        worker, an ADK `run_in_executor` thread).
+        RESTRICTED. Legal only on a long-lived driver task the adapter itself created or patched and
+        whose lifetime is bounded by the unit — a transport read loop. It is ILLEGAL on a pooled or
+        shared worker, where a leaked pin would silently parent unrelated later work into a dead
+        unit. Reachable only through the registry, never exported as a free function, because the
+        free-function form put that leak one import away for every adapter author (a CrewAI
+        ThreadPoolExecutor worker, a uvicorn/anyio worker, an ADK `run_in_executor` thread).
 
-        `owner_task` is the caller's DECLARATION of which task it is pinning, and
-        the registry checks it against the task it actually observes. A mismatch
-        is refused, not corrected: a `ContextVar.set()` lands on the calling
-        task, so pinning "on behalf of" another task would install the unit
-        somewhere the caller did not mean and leave the named task unpinned —
-        a self-consistent lie. The refusal is recorded as a hard
-        `CORRELATION_CONFLICT` on the unit's own span rather than an internal
-        counter, because the consequence is a tree shape and a tree shape has to
-        be falsifiable from the data.
+        `owner_task` is the caller's DECLARATION of which task it is pinning, and the registry
+        checks it against the task it actually observes. A mismatch is refused, not corrected: a
+        `ContextVar.set()` lands on the calling task, so pinning "on behalf of" another task would
+        install the unit somewhere the caller did not mean and leave the named task unpinned — a
+        self-consistent lie. The refusal is recorded as a hard `CORRELATION_CONFLICT` on the unit's
+        own span rather than an internal counter, because the consequence is a tree shape and a tree
+        shape has to be falsifiable from the data.
 
-        The returned token is a HANDLE, not the pin. The pin's scope fork is
-        installed by `install_span`, which has no finaliser by design, so
-        dropping the token cannot undo it — `_assembler.py` reads `.installed`
-        off a temporary and discards the rest, which is the shape a handle whose
-        only advertised member is a bool has to survive.
+        The returned token is a HANDLE, not the pin. The pin's scope fork is installed by
+        `install_span`, which has no finaliser by design, so dropping the token cannot undo it —
+        `_assembler.py` reads `.installed` off a temporary and discards the rest, which is the shape
+        a handle whose only advertised member is a bool has to survive.
 
-        Staleness is the other half and is enforced in `current()`: a pinned unit
-        that has closed stops being ambient.
+        Staleness is the other half and is enforced in `current()`: a pinned unit that has closed
+        stops being ambient.
         """
         observed = _current_task()
         if owner_task is not observed:
@@ -1698,42 +1681,35 @@ class UnitRegistry:
     def close_all(self, *, reason: Limitation, owner: str | None = None) -> None:
         """Close every live root. The teardown BACKSTOP, not the teardown itself.
 
-        A caller that owns state ABOUT a unit — the Agent SDK assembler owns a
-        session's model, conversation and still-open tool spans — must finalize
-        through its own path first, or this emits a root stripped of everything
-        that caller had not yet stamped onto it. What is left afterwards is the
-        units no such caller owns: an in-process tool call opened with no
-        holder is registered as a root here and is reachable from nowhere else.
-        Those are what this closes.
+        A caller that owns state ABOUT a unit — the Agent SDK assembler owns a session's model,
+        conversation and still-open tool spans — must finalize through its own path first, or this
+        emits a root stripped of everything that caller had not yet stamped onto it. What is left
+        afterwards is the units no such caller owns: an in-process tool call opened with no holder
+        is registered as a root here and is reachable from nowhere else. Those are what this closes.
 
-        `reason` is the caller's — `ADAPTER_UNINSTALLED` from an uninstall,
-        `UNIT_INTERRUPTED` from a cancelled or shutting-down process — so the
-        limitation census records this as a slot it cannot follow rather than
-        pretending to have read it.
+        `reason` is the caller's — `ADAPTER_UNINSTALLED` from an uninstall, `UNIT_INTERRUPTED` from
+        a cancelled or shutting-down process — so the limitation census records this as a slot it
+        cannot follow rather than pretending to have read it.
 
-        `owner` scopes the sweep to one adapter, for the day one registry serves
-        several: an Anthropic uninstall must not close a LangGraph run that is
-        still being driven. Omitted, it closes everything, which is what a
-        process-wide teardown wants and what every caller means today.
+        `owner` scopes the sweep to one adapter, for the day one registry serves several: an
+        Anthropic uninstall must not close a LangGraph run that is still being driven. Omitted, it
+        closes everything, which is what a process-wide teardown wants and what every caller means
+        today.
 
-        Declines rather than proceeds when this thread already holds the lock.
-        The lock is an `RLock`, so re-entering does not deadlock — it does
-        something worse, and quietly: a signal handler runs on the main thread
-        at an arbitrary bytecode boundary, so it can land INSIDE a half-finished
-        mutation, walk `self._roots` while an outer frame is mid-update, and
-        emit from state no reader was ever supposed to see. Declining costs a
-        teardown that was already racing a dying process; proceeding costs
-        correctness at the one moment nothing can be re-run.
+        Declines rather than proceeds when this thread already holds the lock. The lock is an
+        `RLock`, so re-entering does not deadlock — it does something worse, and quietly: a signal
+        handler runs on the main thread at an arbitrary bytecode boundary, so it can land INSIDE a
+        half-finished mutation, walk `self._roots` while an outer frame is mid-update, and emit from
+        state no reader was ever supposed to see. Declining costs a teardown that was already racing
+        a dying process; proceeding costs correctness at the one moment nothing can be re-run.
 
-        The signal handler is no longer the only shape of that. A weakref
-        finalizer — the seams' close hook backstop — runs out of its referent's
-        DEALLOCATION, so it lands wherever a reference count reaches zero (and
-        at any allocation, through a cyclic collection) and on whatever thread
-        dropped that reference: the same half-finished mutation is now reachable
-        off the main thread too.
-        Nothing routes a finalizer here today, and this guard does not depend on
-        that: it asks the lock who owns it, which is true of every re-entry
-        route there is or will be.
+        The signal handler is no longer the only shape of that. A weakref finalizer — the seams'
+        close hook backstop — runs out of its referent's DEALLOCATION, so it lands wherever a
+        reference count reaches zero (and at any allocation, through a cyclic collection) and on
+        whatever thread dropped that reference: the same half-finished mutation is now reachable off
+        the main thread too. Nothing routes a finalizer here today, and this guard does not depend
+        on that: it asks the lock who owns it, which is true of every re-entry route there is or
+        will be.
         """
         # `_is_owned()` and not `acquire(blocking=False)`: on an `RLock` the
         # non-blocking acquire SUCCEEDS for the thread that already owns it, so
@@ -2043,39 +2019,63 @@ def ambient_stated_conversation(owner: str, conversation: ConversationContext) -
     return False
 
 
+#: The units that START a run. A run's conversation is fixed when it starts: its steps and calls
+#: inherit it, wherever a block boundary falls in the run's lifetime.
+_RUNS = frozenset((UnitKind.SESSION, UnitKind.AGENT))
+
+
+def _conversation_under(
+    parent: Unit, kind: UnitKind, ambient: Ambient
+) -> ConversationContext | None:
+    """What a unit opened under `parent` inherits: `parent`'s conversation or, for a RUN started
+    inside a `wardex.conversation(...)` the host opened within `parent` on this task, the host's.
+
+    The host's is a conversation on the scope that no unit on this task's carrier chain holds, with
+    `parent` on that chain: a block a graph node opened around a subgraph. An ancestor's back on
+    the scope is a carrier a block's exit took off, not the host's word. The parentage carries the
+    object, so a run nested deeper reads it as the host's too (`ambient_stated_conversation`). With
+    no carrier, or another run's, the parent's stands: a unit opened by alias from another task
+    must not take that task's conversation.
+    """
+    said, entry = ambient.conversation, _ambient_unit.get()
+    if said is None or kind not in _RUNS or entry is None:
+        return parent.conversation
+    inside, unit = False, entry.unit
+    while unit is not None:
+        if unit.conversation is said:
+            return parent.conversation
+        inside, unit = inside or unit is parent, unit.parent
+    return said if inside else parent.conversation
+
+
 def parent_is_closed_unit(parent: SpanContext | None) -> bool:
     """Was `parent` latched off a unit that had ALREADY CLOSED? — design §10.3(b).
 
-    The registry predicates above answer this for callers that hold a registry.
-    The byte seams and MCP stdio hold a `Client` and nothing else, and
-    `_interceptors/` may not import `_adapters/`, where the registries are built.
-    So the fact is exported as a function of the ambient CARRIER — the one thing
-    the two ends share — and travels to `should_capture` and `resolve_observed`
-    as a DECLARED input, which is the shape `degraded` already has and for the
-    same reason: `_parentage` is imported BY this module, so neither of those
-    two may ask the question for itself without a cycle.
+    The registry predicates above answer this for callers that hold a registry. The byte seams and
+    MCP stdio hold a `Client` and nothing else, and `_interceptors/` may not import `_adapters/`,
+    where the registries are built. So the fact is exported as a function of the ambient CARRIER —
+    the one thing the two ends share — and travels to `should_capture` and `resolve_observed` as a
+    DECLARED input, which is the shape `degraded` already has and for the same reason: `_parentage`
+    is imported BY this module, so neither of those two may ask the question for itself without a
+    cycle.
 
-    NO REGISTRY, and that is sound rather than a shortcut. "The span I latched
-    has already shipped" is registry-independent: whoever opened the unit, its
-    span left the process when the unit closed, and hanging later work off it is
-    the same wrong tree either way. The ownership guard inside
-    `UnitRegistry._closed_ambient_context` exists to stop one registry CHARGING
-    a `CORRELATION_CONFLICT` to another registry's teardown; a seam charges
-    nothing to anyone. What matters is the guard that IS here: liveness is
-    tested first, so a LIVE unit from any registry — the ordinary state of a
-    two-adapter process — is never refused.
+    NO REGISTRY, and that is sound rather than a shortcut. "The span I latched has already shipped"
+    is registry-independent: whoever opened the unit, its span left the process when the unit
+    closed, and hanging later work off it is the same wrong tree either way. The ownership guard
+    inside `UnitRegistry._closed_ambient_context` exists to stop one registry CHARGING a
+    `CORRELATION_CONFLICT` to another registry's teardown; a seam charges nothing to anyone. What
+    matters is the guard that IS here: liveness is tested first, so a LIVE unit from any registry —
+    the ordinary state of a two-adapter process — is never refused.
 
-    IDENTITY, not descent, for the reason `_poisoned` gives: a host span or a
-    nested activation standing on top of the leftover is a real parent, and
-    moving live work out of the host's trace to escape a ghost that is no longer
-    in front of us is a wrong tree of its own shape.
+    IDENTITY, not descent, for the reason `_poisoned` gives: a host span or a nested activation
+    standing on top of the leftover is a real parent, and moving live work out of the host's trace
+    to escape a ghost that is no longer in front of us is a wrong tree of its own shape.
 
-    ASK THIS WHERE YOU LATCH, on the task that ISSUED the work, and store the
-    answer beside the parent. Asked on the response path it would be a different
-    carrier at a different instant, and it would refuse a request that was
-    legitimately issued INSIDE a run that has since finished — real data lost to
-    escape a corpse that was not in front of the request when it left. That is
-    the same mistake `latch_ambient`'s docstring names, one field over.
+    ASK THIS WHERE YOU LATCH, on the task that ISSUED the work, and store the answer beside the
+    parent. Asked on the response path it would be a different carrier at a different instant, and
+    it would refuse a request that was legitimately issued INSIDE a run that has since finished —
+    real data lost to escape a corpse that was not in front of the request when it left. That is the
+    same mistake `latch_ambient`'s docstring names, one field over.
     """
     entry = _ambient_unit.get()
     if entry is None or parent is None:
