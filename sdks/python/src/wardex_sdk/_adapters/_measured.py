@@ -58,8 +58,10 @@ MEASURED: dict[AdapterName, tuple[Measured, ...]] = {
         Measured("langgraph", ("1.2",)),
         Measured("langgraph-prebuilt", ("1.1",)),
     ),
-    # 0.23 is not measured: its runs record wrong parents and error types.
-    AdapterName.OPENAI_AGENTS: (Measured("openai-agents", ("0.22",)),),
+    # 0.23 lists an agent's tools inside the agent's span rather than before opening it, so an
+    # MCP listing and a failing tool gate land under the agent there, and its streamed path
+    # checks input guardrails before leaving a handoff's sender; both trees are measured.
+    AdapterName.OPENAI_AGENTS: (Measured("openai-agents", ("0.22", "0.23")),),
 }
 
 _FINAL = re.compile(r"(\d+)\.(\d+)(?:\.\d+)*")

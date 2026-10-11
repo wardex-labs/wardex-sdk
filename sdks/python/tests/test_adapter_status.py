@@ -239,12 +239,12 @@ def test_an_untested_framework_version_installs_and_says_which_once(lines, monke
     assert status.state is AdapterState.INSTALLED
     assert get_registry().is_installed("openai_agents")
     assert (status.version, status.measured) == ("0.99.1", False)
-    assert status.measured_versions == ("0.22.x",)
+    assert status.measured_versions == ("0.22.x", "0.23.x")
     assert len(lines.messages) == 1
     line = lines.messages[0]
     assert "openai-agents 0.99.1" in line
-    assert "0.22.x" in line
-    assert "Pin openai-agents to a tested release (0.22.x)" in line
+    assert "(tested: 0.22.x, 0.23.x)" in line
+    assert "Pin openai-agents to a tested release (0.22.x, 0.23.x)" in line
     assert status.detail == line
     assert counters.get("adapters.openai_agents.unmeasured_version") == 1
 
@@ -341,6 +341,17 @@ def test_the_test_pins_are_exactly_the_table_of_tested_versions():
                 f"{entry.distribution}: the pin says >={lower},<{upper} but the table "
                 f"says {', '.join(minors)}"
             )
+
+
+def test_ci_runs_openai_agents_on_its_oldest_tested_minor_too():
+    """The pin resolves to the newest tested minor, so the oldest one is tested only by the
+    extra CI step that installs it. That step has to name a release of the lowest minor in
+    the table, or the table claims a minor nothing runs."""
+    ci = (_PYPROJECT.parents[2] / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+    pinned = re.findall(r"openai-agents==(\d+)\.(\d+)\.\d+", ci)
+    (entry,) = MEASURED[AdapterName.OPENAI_AGENTS]
+    lowest = min(entry.minors, key=lambda m: tuple(map(int, m.split("."))))
+    assert pinned and {f"{major}.{minor}" for major, minor in pinned} == {lowest}, pinned
 
 
 def test_diagnostics_reads_no_framework(lines):

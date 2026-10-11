@@ -187,6 +187,17 @@ All notable changes to this project are documented here. The format follows
 
 ### Changed
 
+- **openai-agents 0.23 is a tested release.** It was the release `pip install
+  openai-agents` installed, and wardex said on every `init()` that it had not
+  been tested against it. 0.23 lists an agent's tools — its `is_enabled` gates
+  and every MCP server's `list_tools` — after it opens the agent's span rather
+  than before, so on 0.23 an MCP listing is recorded under its agent and a tool
+  gate that raises fails inside the agent that owns it. Its streamed runs also
+  check input guardrails before leaving a handoff's sender, so a tripped
+  guardrail fails the run there rather than after the receiver has run. wardex
+  records the tree each release produces, and both 0.22.x and 0.23.x are now
+  tested on every change. The quickstart installs `openai-agents>=0.22,<0.24`.
+
 - **The wardex envelope says what the SDK observed about a transport, or
   nothing.** Transport fields nobody measured used to ship under their zero
   values as if they had been read off the connection: every span said

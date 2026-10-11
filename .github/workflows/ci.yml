@@ -130,3 +130,12 @@ jobs:
         run: uv run ruff format --check sdks/python examples
       - name: pytest
         run: uv run pytest sdks/python/tests -v
+      # The openai-agents test pin resolves to the newest tested minor. The oldest
+      # tested minor lists an agent's tools in a different place, so its tree is
+      # different, and claiming it as tested means running it: the same tests
+      # again on it. `test_adapter_status.py` holds this version to the lowest
+      # minor in the adapters' table of tested versions.
+      - name: pytest (openai-agents adapter, oldest tested minor)
+        run: |
+          uv run --with 'openai-agents==0.22.3' python -c "import importlib.metadata as m; v = m.version('openai-agents'); print('openai-agents', v); assert v == '0.22.3', v"
+          uv run --with 'openai-agents==0.22.3' pytest -v sdks/python/tests/test_openai_agents_adapter.py sdks/python/tests/test_openai_agents_conformance.py sdks/python/tests/test_openai_agents_wire.py
