@@ -24,13 +24,17 @@ import urllib.error
 import urllib.request
 
 from .._assembly import (
+    DropReason,
+    DropUnit,
     counters,
     debug_host_error,
     diag_info,
     diag_warning,
+    record,
     report_export_failed,
     report_once,
 )
+from .._assembly._ledger import record_failed_send
 from .._native import NATIVE_OK, unavailable_reason
 from .._types import Envelope
 from ._base import (
@@ -107,6 +111,45 @@ def _cut_short_by_the_caller(
     except Exception:  # noqa: BLE001 — a probe with a safe answer, never a throw
         return None
     return budget if expired else None
+
+
+def _classify_failure(exc: BaseException) -> tuple[DropReason, bool]:
+    """The drop ledger's reason for a failed POST, and whether the receiver
+    DEFINITELY did not keep the batch.
+
+    The second half decides what happens to a drop report that rode the same
+    POST: definitely not kept, its counts go back into the ledger for the next
+    report; maybe kept, the same report is sent again and the receiver folds
+    the repeat. Guessing "not kept" when it was would count the same losses
+    twice, so every case that cannot be decided reads as "maybe kept".
+
+      * An HTTP status: the receiver answered, so it did not store the batch.
+        429, and 503 (a wardex receiver's "retry later"), are back-pressure.
+        502 and 504 come from a gateway in front of the receiver, which may
+        have handed the batch on, so they are unconfirmed. Any other status is
+        a refusal.
+      * `URLError`: urllib raises it from connecting and sending, before any
+        answer exists -- a refused connection, a name that did not resolve, a
+        connect timeout. The request never arrived whole.
+      * Anything else -- a read timeout, a connection cut before the answer:
+        the request went out and nothing came back.
+
+    Every attribute read is inside the `try`, as in `_describe_failure`: an
+    exception whose `code` raises reads as unconfirmed, the safe direction.
+    """
+    try:
+        if isinstance(exc, urllib.error.HTTPError):
+            status = int(exc.code)
+            if status in (429, 503):
+                return DropReason.RATELIMIT_BACKOFF, True
+            if status in (502, 504):
+                return DropReason.SEND_UNCONFIRMED, False
+            return DropReason.SEND_ERROR, True
+        if isinstance(exc, urllib.error.URLError):
+            return DropReason.NETWORK_ERROR, True
+    except Exception:  # noqa: BLE001 — a classifying probe, never a throw
+        return DropReason.SEND_UNCONFIRMED, False
+    return DropReason.SEND_UNCONFIRMED, False
 
 
 def _describe_failure(exc: BaseException) -> tuple[str, int | None]:
@@ -338,7 +381,9 @@ class OtlpHttpTransport(Transport):
                 # retry could not duplicate anything, and here it would. What is
                 # left is to say so. Unconditional and bounded, like the reports
                 # around it: off-debug this was a trace arriving with holes in
-                # the middle and nothing on any channel about it.
+                # the middle and nothing on any channel about it. Counted in
+                # requests: how many spans each unsent body held is the core's.
+                record(DropReason.BUDGET_EXHAUSTED, len(bodies) - index, DropUnit.REQUEST)
                 report_once(
                     f"an OTLP export ran out of budget after {index} of "
                     f"{len(bodies)} requests; the spans in the remaining request(s) were "
@@ -368,6 +413,12 @@ class OtlpHttpTransport(Transport):
                 # Every failed POST is counted, whichever line below says it,
                 # and before the debug line, whose `str(exc)` is host text.
                 counters.bump("transport.otlp.export_failed")
+                record_failed_send()
+                lost_as, _ = _classify_failure(exc)
+                if index:  # the requests not sent; how many spans they held is the core's
+                    record(lost_as, len(bodies) - index, DropUnit.REQUEST)
+                else:  # nothing of this batch was accepted
+                    record(lost_as, len(envelope.spans) - len(reports.unmarshalled))
                 if self._debug:
                     debug_host_error(
                         "OTLP export failed", exc, unprintable="transport.otlp.error_unprintable"

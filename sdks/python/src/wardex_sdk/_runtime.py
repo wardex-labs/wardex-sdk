@@ -68,12 +68,14 @@ from typing import TYPE_CHECKING, Any
 
 from ._assembly import (
     Limitation,
+    _ledger,
     counters,
     diag_info,
     guard,
     report_open_spans_unshipped,
     report_open_spans_untracked,
     report_signal_flush_raised,
+    report_undelivered_drops,
 )
 from ._assembly._diag import diag_reset_for_new_process
 from ._client import Client, _sanitize_timeout, _UnnamedTimeout
@@ -325,6 +327,7 @@ class Runtime:
                     left = max(0.0, started + budget - time.monotonic())
                     timeout = _UnnamedTimeout(left, _CUT_OFF_BUDGET_LABEL)
             self._teardown(client, timeout=timeout)
+            report_undelivered_drops(client)  # no next envelope now; re-init's has one
 
     def _teardown(self, client: Client | None, *, timeout: float | None = None) -> None:
         """THE uninstall order, run against `client`. Caller holds the lock.
@@ -442,6 +445,7 @@ class Runtime:
         self._open_spans = {}
         self._cut_off_in_flight = 0
         diag_reset_for_new_process()
+        _ledger._at_fork_reinit()  # the child counts its own losses; the parent ships its own
         with guard("_runtime.fork_reinit_failed"):
             # step 1 — slots, directly.
             client = self._client

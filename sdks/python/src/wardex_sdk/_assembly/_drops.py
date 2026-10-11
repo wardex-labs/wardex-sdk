@@ -11,7 +11,9 @@ receiver was down concluded the install had not taken.
 Each now bumps a named counter and says so through `report_once`: one line per
 kind of loss per process, however often it recurs, which is what makes an
 unconditional line affordable on a per-call path. The counter is how much was
-lost; the line is that it is happening, and which counter to read.
+lost; the line is that it is happening, and which counter to read. Each is also
+recorded in the drop ledger (`_ledger`), which is what carries the count out of
+the process, to the receiver, in the next envelope's `ClientReport`.
 
 The lines carry wardex's own words only. A host's exception text, a URL and a
 project key stay off them: a URL can carry a credential, and host text on
@@ -26,7 +28,37 @@ from __future__ import annotations
 from collections import deque
 
 from .._types import Envelope
+from . import _ledger
 from ._diag import counters, diag_warning, guard, report_once
+from ._ledger import REASONS, DropReason, DropUnit, record, record_items
+
+#: The ledger reason for each cause `count_drain_drop` is given. A transport
+#: that raised may have sent part of the batch; the ledger's word for "the
+#: transport raised while sending" is `send_error`.
+_DRAIN_DROP_REASONS = {
+    "before_send_raised": DropReason.BEFORE_SEND_ERROR,
+    "export_raised": DropReason.SEND_ERROR,
+}
+
+
+def lose(
+    reason: DropReason,
+    n: int = 1,
+    *,
+    unit: DropUnit | None = None,
+    where: str | None = None,
+    line: str,
+    key: str,
+) -> None:
+    """Record `n` lost items in the ledger and say so once per process.
+
+    The one-call form of what every function below does by hand: the ledger
+    carries the count to the receiver, `report_once` tells the person reading
+    stderr that it is happening. `line` follows the rules in this module's
+    docstring -- wardex's own words, no host text, no URL, no key.
+    """
+    record(reason, n, unit, where=where)
+    report_once(line, key=key)
 
 
 def count_drain_drop(cause: str, envelope: Envelope, spans: deque, snapshots: deque) -> str:
@@ -44,6 +76,7 @@ def count_drain_drop(cause: str, envelope: Envelope, spans: deque, snapshots: de
         counters.bump(f"client.drain.span_dropped.{cause}")
     for _ in range(n_snapshots):
         counters.bump(f"client.drain.snapshot_dropped.{cause}")
+    record_items(_DRAIN_DROP_REASONS.get(cause, DropReason.SEND_ERROR), n_spans, n_snapshots)
     return f"{n_spans} span(s)" + (f" and {n_snapshots} state snapshot(s)" if n_snapshots else "")
 
 
@@ -78,14 +111,17 @@ def report_buffer_evicted(evicted: int, *, debug: bool) -> None:
     small for the traffic lost its oldest spans with no word anywhere. The
     per-drain line stays debug's, in its old words.
 
-    COUNTED HERE, never at the eviction, and that is a lock-order rule rather
-    than a convenience. A signal can land inside a `bump` on the main thread,
-    holding the counters' lock, and run the shutdown flush, which takes the
-    client's buffer lock and its export slot. So neither may be held while
-    waiting on the counters' lock: under the buffer lock it was a SIGTERM that
+    The ledger records each eviction where it happens, in the client: recording
+    there waits on nothing. The counter and the line come HERE, after the
+    client has released its buffer lock and its export slot, and that is a
+    lock-order rule rather than a convenience. A signal can land while the main
+    thread holds a diagnostics lock, and run the shutdown flush, which takes
+    the client's buffer lock and its export slot. So neither may be held while
+    waiting on a diagnostics lock: under the buffer lock it was a SIGTERM that
     never finished, and under the export lock a signal flush that waited out
     its whole budget while the batch it could have shipped died with the
-    process. Callers reach this only after releasing both.
+    process. `Counters.bump` no longer waits at all; `report_once` still takes
+    its lock, which is why callers reach this only after releasing both.
     """
     for _ in range(evicted):
         counters.bump("client.buffer.evicted")
@@ -110,6 +146,7 @@ def report_transport_raised(call: str, exc: BaseException, *, debug: bool) -> No
     """
     counter = f"client.transport.{call}_failed"
     counters.bump(counter)
+    record(DropReason.SEND_ERROR, unit=DropUnit.FAILURE)
     report_once(
         f"the transport's {call}() raised and was ignored; anything it was still holding "
         f"may not have been sent (counted under {counter}; re-run with debug=True for the "
@@ -159,6 +196,7 @@ def report_worker_pass_raised(name: str) -> None:
     not be silent about it either: whatever the pass was handling may be gone.
     `name` is the worker thread's, which wardex chose."""
     counters.bump("worker.drain_raised")
+    record(DropReason.INTERNAL_SDK_ERROR, where="worker.drain_raised")
     report_once(
         f"a background pass of {name} raised and was skipped; whatever it was handling "
         "may be lost, and the worker keeps running (counted under worker.drain_raised; "
@@ -206,6 +244,7 @@ def report_open_spans_unshipped(lost: int) -> None:
     """
     for _ in range(lost):
         counters.bump("_runtime.open_spans_unshipped")
+    record(DropReason.SHUTDOWN_TAIL, lost)
     report_once(
         f"{lost} span(s) still open when the process was stopping did not fit in the "
         "buffer beside the finished spans already in it, and were not shipped. Raise "
@@ -228,6 +267,7 @@ def report_connection_parser_disabled(reason: str, address: object, client: obje
     debug line, since one line per process could not name every connection.
     """
     counters.bump("interceptors.seam.parser_disabled")
+    record(DropReason.PARSER_DISABLED, unit=DropUnit.CONNECTION)
     report_once(
         f"a protocol parser stopped reading a connection ({reason}); exchanges on it from "
         "that point are not captured. Counted per connection under "
@@ -243,6 +283,7 @@ def report_stream_parser_disabled(reason: str, pid: int | None, client: object) 
     stdio twin of `report_connection_parser_disabled`, with the pid on the
     per-stream debug line."""
     counters.bump("interceptors.mcp_stdio.parser_disabled")
+    record(DropReason.PARSER_DISABLED, unit=DropUnit.STREAM)
     report_once(
         f"a JSON-RPC parser stopped reading a subprocess stream ({reason}); MCP messages on "
         "it from that point are not captured. Counted per stream under "
@@ -251,3 +292,45 @@ def report_stream_parser_disabled(reason: str, pid: int | None, client: object) 
     )
     if _debug_of(client):
         diag_warning(f"json-rpc parser disabled (pid={pid}): {reason}")
+
+
+def report_undelivered_drops(client: object) -> None:
+    """Say, in one line, what the drop ledger still holds that no receiver
+    confirmed. `wardex.close()` and the exit hook call this last: after the
+    final drain there is no next envelope to carry the counts, so stderr is
+    the only channel left. A re-init's teardown does not: the new client's
+    first envelope carries them, so a process re-initializing in a loop
+    writes nothing here.
+
+    Only for a client whose transport carries the ledger. One that does not
+    never had a send of the counts to fail; the losses it saw were each said
+    on their own line, and carrying the counts over its own wire is a
+    separate change to that transport.
+
+    Silent when nothing was lost -- the reasons that are not losses
+    (`before_send`, `excluded_by_policy`) never print this on their own --
+    and silent when the line would repeat the last one word for word, so a
+    second `close()` with nothing new to say says nothing.
+    """
+    global _last_undelivered_line
+    if not _ledger.carries(getattr(client, "_transport", None)):
+        return
+    held = _ledger.undelivered()
+    if not any(n and REASONS[reason].loss != "none" for (reason, _), n in held.items()):
+        return
+    counts = ", ".join(
+        f"{reason.value}:{unit.value}={n}"
+        for (reason, unit), n in sorted(held.items(), key=lambda kv: _ledger._wire_key(kv[0]))
+        if n
+    )
+    line = (
+        "close() finished holding counts of lost data that no receiver has confirmed, and "
+        f"nothing will send them now (reason:unit=count): {counts}"
+    )
+    if line != _last_undelivered_line:
+        _last_undelivered_line = line
+        diag_warning(line)
+
+
+#: The last line `report_undelivered_drops` printed, so it is not printed twice.
+_last_undelivered_line = ""

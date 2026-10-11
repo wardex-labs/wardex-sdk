@@ -1052,12 +1052,20 @@ def _shape(node: ast.expr) -> str:
     return type(node).__name__
 
 
+#: Modules that are a DIFFERENT closed vocabulary and only look like this one to
+#: a name-based scan. The drop ledger's reasons and units name what left no
+#: span to carry a marker; one of them counts markers that could not be
+#: attached (`marker_lost`, unit `marker`), so the scan reads its enum members
+#: as marker strings. Nothing in it reaches `CaptureIntegrity.limitations`; its
+#: own census is `test_drop_ledger_census.py`.
+_OTHER_VOCABULARIES: frozenset[str] = frozenset({"_assembly/_drop_reasons.py"})
+
+
 def _trees() -> dict[str, ast.Module]:
     return {
-        path.relative_to(_SRC).as_posix(): ast.parse(
-            path.read_text(encoding="utf-8"), filename=str(path)
-        )
+        rel: ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         for path in sorted(_SRC.rglob("*.py"))
+        if (rel := path.relative_to(_SRC).as_posix()) not in _OTHER_VOCABULARIES
     }
 
 

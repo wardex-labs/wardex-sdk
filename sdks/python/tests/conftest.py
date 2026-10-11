@@ -101,6 +101,19 @@ def queued_server(
 
 
 @pytest.fixture(autouse=True)
+def _fresh_drop_ledger() -> Iterator[None]:
+    """The drop ledger is process-global, like `counters`, but every test gets
+    it fresh: what it holds rides the next envelope to a wardex receiver and is
+    said at `close()`, so a loss one test caused would otherwise appear on
+    another test's wire and stderr."""
+    from wardex_sdk._assembly import _drops, _ledger
+
+    _ledger._reset_for_tests()
+    _drops._last_undelivered_line = ""
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _shield_tests_from_ambient_env(monkeypatch):
     """`init()` reads `WARDEX_*` and the OTel endpoint spellings since the
     slice-2 env fold — so a developer machine (or CI runner) that exports

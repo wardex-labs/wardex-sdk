@@ -24,6 +24,7 @@ import logging
 import sys
 import threading
 import traceback
+from collections import deque
 from collections.abc import Callable
 from functools import wraps
 from types import TracebackType
@@ -31,6 +32,8 @@ from typing import Any, TypeVar
 
 from .. import _native
 from .._suppress import suppress_capture
+from . import _ledger
+from ._ledger import _FOLD_AT, DropReason
 
 _F = TypeVar("_F", bound=Callable[..., Any])
 
@@ -53,45 +56,73 @@ class Counters:
     because a Python literal here is exactly the drift `test_limits.py`
     forbids.
 
-    Reentrancy: an RLock, because a guarded block can be interrupted on the same
-    thread and re-enter `bump()`. Two ways in, not one: a signal handler that
-    runs wardex code (`_runtime.py` installs one), and a `weakref.finalize`
-    callback, which the byte seams' close hook uses as its backstop and which
-    lands wherever a reference count reaches zero — plus, through a cyclic
-    collection, at any allocation. A plain Lock would deadlock the host on
-    either.
-    The RLock buys deadlock-freedom and cross-thread serialization, and that is
-    all it buys: `bump()` is a read-modify-write with a Python-level call in the
-    middle, so a signal delivered between the read and the store still loses one
-    increment to the reentrant bump. An undercounted diagnostic tally is an
-    accepted cost; hand-rolling a signal-atomic increment is not worth it.
+    Reentrancy: a guarded block can be interrupted on the same thread and
+    re-enter `bump()`. Two ways in, not one: a signal handler that runs wardex
+    code (`_runtime.py` installs one), and a `weakref.finalize` callback, which
+    the byte seams' close hook uses as its backstop and which lands wherever a
+    reference count reaches zero — plus, through a cyclic collection, at any
+    allocation.
+
+    `bump()` NEVER WAITS. It appends to an inbox (one C call), and every
+    `_FOLD_AT` bumps it folds the inbox, only if the lock is free right now
+    (`acquire(blocking=False)`). That is a lock-order rule, not a speed-up: a
+    signal can land while the main thread holds this lock, and the shutdown
+    flush it runs takes the export slot -- so a drain on another thread that
+    bumped a counter while holding the slot, and waited here, made that flush
+    wait out its whole budget. Nothing can wait here now, so nothing can wait
+    behind it. A bump left in the inbox is not lost: every reader folds before
+    it reads. The readers do take the lock and wait for it: they are
+    diagnostics and tests, never the export or signal path.
     """
 
-    __slots__ = ("_counts", "_lock")
+    __slots__ = ("_counts", "_folding", "_inbox", "_lock")
 
     def __init__(self) -> None:
         self._lock = threading.RLock()
         self._counts: dict[str, int] = {}
+        self._inbox: deque[str] = deque()
+        self._folding = False
 
     def bump(self, where: str) -> None:
-        with self._lock:
-            self._counts[where] = self._counts.get(where, 0) + 1
+        self._inbox.append(where)
+        if len(self._inbox) >= _FOLD_AT and self._lock.acquire(blocking=False):
+            try:
+                self._fold()
+            finally:
+                self._lock.release()
+
+    def _fold(self) -> None:
+        """Move the inbox into the table. The lock is held; a fold this one
+        interrupted on the same thread is left to finish the job."""
+        if self._folding:
+            return
+        self._folding = True
+        try:
+            while self._inbox:
+                where = self._inbox.popleft()
+                self._counts[where] = self._counts.get(where, 0) + 1
+        finally:
+            self._folding = False
 
     def get(self, where: str) -> int:
         with self._lock:
+            self._fold()
             return self._counts.get(where, 0)
 
     def total(self) -> int:
         with self._lock:
+            self._fold()
             return sum(self._counts.values())
 
     def snapshot(self) -> dict[str, int]:
         """A copy of the tallies. Safe to read while other threads bump."""
         with self._lock:
+            self._fold()
             return dict(self._counts)
 
     def reset(self) -> None:
         with self._lock:
+            self._inbox.clear()
             self._counts.clear()
 
 
@@ -165,6 +196,7 @@ class _StderrAtEmitTime(logging.StreamHandler):
             stream.flush()
         except Exception:  # noqa: BLE001 — the reporting path may not become a throw
             counters.bump(LOG_FAILED)
+            _ledger.record(DropReason.DIAGNOSTIC_UNWRITABLE)
 
 
 def _install_default_handler() -> None:
@@ -207,6 +239,7 @@ def _emit(level: int, message: str) -> None:
             logger.log(level, message)
     except Exception:  # noqa: BLE001 — the reporting path may not become a throw
         counters.bump(LOG_FAILED)
+        _ledger.record(DropReason.DIAGNOSTIC_UNWRITABLE)
 
 
 def diag_info(message: str) -> None:
@@ -260,6 +293,7 @@ def _log_with_traceback(where: str, exc: BaseException) -> None:
         text = "".join(traceback.format_exception(cls, exc, exc.__traceback__))
     except Exception:  # noqa: BLE001 — the reporting path may not become a throw
         counters.bump(LOG_FAILED)
+        _ledger.record(DropReason.DIAGNOSTIC_UNWRITABLE)
         return
     # `text` ends with the traceback's own newline; the handler appends the
     # terminator, so that one is trimmed to keep the emitted bytes identical
@@ -380,6 +414,8 @@ def diag_reset_for_new_process() -> None:
     global _REPORT_LOCK
     counters._lock = threading.RLock()
     counters._counts.clear()
+    counters._inbox.clear()
+    counters._folding = False
     _REPORT_LOCK = threading.RLock()
     _REPORTED.clear()
 
@@ -443,6 +479,9 @@ class guard:  # noqa: N801 — a context manager reads as a verb at the call sit
         if not issubclass(exc_type, Exception):
             return False  # CancelledError/KeyboardInterrupt propagate
         counters.bump(self._where)
+        # A swallow is a loss until shown otherwise: whatever the block was
+        # handling is gone. Local views keep the label; the wire, the sum.
+        _ledger.record(DropReason.INTERNAL_SDK_ERROR, where=self._where)
         if _native.NATIVE_PANIC is not None and issubclass(exc_type, _native.NATIVE_PANIC):
             # A Rust panic the FFI converted (`bindings/python/src/shield.rs`).
             # Counted a second time under one fixed name so that a panic

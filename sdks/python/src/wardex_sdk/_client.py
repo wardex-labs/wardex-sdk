@@ -21,12 +21,14 @@ from ._assembly import (
     report_once,
     report_transport_raised,
 )
+from ._assembly import _ledger as ledger
 
 # The debug-gated traceback printer `guard()` itself uses: contained rendering
 # of a host exception (repr may raise, stderr may be gone) without a second
 # implementation of either containment. Reached into `_diag` the way
 # `testing/harness.py` already reaches `reset_reports_for_test`.
 from ._assembly._diag import _log_with_traceback
+from ._assembly._ledger import DropReason, DropUnit
 from ._config import WardexConfig
 from ._finalize import FinalizeQueue, Leftover
 from ._limits import LimitsConsumer, limits_kwargs
@@ -132,37 +134,31 @@ class _UnnamedTimeout(float):
     follows_shutdown_config: bool
     """Whether this budget means "ask the config's `batching.shutdown_timeout`".
 
-    `close()`'s twin of `follows_transport`, and a fact about the budget for
-    the same reason: a bare `close()` names no number, and the number it
-    should spend belongs to the installed config (one number, one home), not
-    to this module's constant. `Client.close` resolves the flag against its
-    OWN config, so the atexit hook, re-init's teardown of the previous client
-    and a bare `wardex.close()` all follow the same field without any of them
-    restating it. The float value underneath stays `_DEFAULT_TIMEOUT`, so a
-    path that misses the flag degrades to the old fixed default instead of
-    misbehaving.
+    `close()`'s twin of `follows_transport`, and a fact about the budget for the same reason: a
+    bare `close()` names no number, and the number it should spend belongs to the installed config
+    (one number, one home), not to this module's constant. `Client.close` resolves the flag against
+    its OWN config, so the atexit hook, re-init's teardown of the previous client and a bare
+    `wardex.close()` all follow the same field without any of them restating it. The float value
+    underneath stays `_DEFAULT_TIMEOUT`, so a path that misses the flag degrades to the old fixed
+    default instead of misbehaving.
     """
 
     follows_transport: bool
     """Whether this budget means "ask the transport how long it wants".
 
-    The second fact these objects carry, and it is a FACT ABOUT THE BUDGET, so
-    it travels with the budget rather than being recovered at the point of use.
-    It was recovered at the point of use -- `Client.flush` asked
-    `timeout is _FOLLOW_TRANSPORT_TIMEOUT` -- and that read the right answer
-    from the wrong question. "Is this object the one `flush`'s signature
-    happens to name" answers about ONE instance; "does this budget follow the
-    transport" answers about the whole class, which is what every other
-    consumer in this area already asks (see `_named_by_caller`).
+    The second fact these objects carry, and it is a FACT ABOUT THE BUDGET, so it travels with the
+    budget rather than being recovered at the point of use. It was recovered at the point of use --
+    `Client.flush` asked `timeout is _FOLLOW_TRANSPORT_TIMEOUT` -- and that read the right answer
+    from the wrong question. "Is this object the one `flush`'s signature happens to name" answers
+    about ONE instance; "does this budget follow the transport" answers about the whole class,
+    which is what every other consumer in this area already asks (see `_named_by_caller`).
 
-    Two things fell out of the identity form. A copy of the default -- and
-    these are the defaults of a PUBLIC signature, so a host that deepcopies a
-    config dict holding one has made a copy -- is not the same object, so it
-    quietly stopped following the transport and took 5 seconds instead. And any
-    future wardex-chosen budget that wants to follow the transport would have
-    had to be added to a growing identity check, with no signal at the class
-    that such a check exists; it would simply have got 5 seconds, silently, in
-    the direction that looks like it works.
+    Two things fell out of the identity form. A copy of the default -- and these are the defaults
+    of a PUBLIC signature, so a host that deepcopies a config dict holding one has made a copy --
+    is not the same object, so it quietly stopped following the transport and took 5 seconds
+    instead. And any future wardex-chosen budget that wants to follow the transport would have had
+    to be added to a growing identity check, with no signal at the class that such a check exists;
+    it would simply have got 5 seconds, silently, in the direction that looks like it works.
     """
 
     def __new__(
@@ -192,13 +188,11 @@ class _UnnamedTimeout(float):
         and passed back. Raising `TypeError` out of any of those is wardex
         raising into host code over a default it chose itself.
 
-        All the facts are in the tuple, which is what makes a copy usable
-        rather than merely constructible: the result is an `_UnnamedTimeout`,
-        so it is still not blamed for a cut-short export, and it still follows
-        the transport (or the shutdown config) if the original did. Rebuilding
-        by type is only safe because nothing asks these objects for identity
-        any more -- see `follows_transport` for the check that used to, and
-        what it cost.
+        All the facts are in the tuple, which is what makes a copy usable rather than merely
+        constructible: the result is an `_UnnamedTimeout`, so it is still not blamed for a
+        cut-short export, and it still follows the transport (or the shutdown config) if the
+        original did. Rebuilding by type is only safe because nothing asks these objects for
+        identity any more -- see `follows_transport` for the check that used to, and what it cost.
         """
         return (
             type(self),
@@ -250,14 +244,12 @@ def _configured_transport_timeout(transport: Transport) -> float:
     """How long `transport` was configured to spend on one export, or
     `_DEFAULT_TIMEOUT` when that cannot be learned.
 
-    `Transport.export_timeout` is a declared attribute with a default, so the
-    common case cannot fail -- but the read stays guarded, because a
-    DECLARATION is not a guarantee. `Transport` is public and subclassable:
-    `export_timeout` may be a property that raises, a `__getattr__` that
-    returns something `float()` rejects, or absent entirely on a duck-typed
-    object that never inherited from `Transport` at all. Two defects in this
-    area came from a transport read that sat outside a handler, so the read,
-    the conversion and the validation are all inside this one try.
+    `Transport.export_timeout` is a declared attribute with a default, so the common case cannot
+    fail -- but the read stays guarded, because a DECLARATION is not a guarantee. `Transport` is
+    public and subclassable: `export_timeout` may be a property that raises, a `__getattr__` that
+    returns something `float()` rejects, or absent entirely on a duck-typed object that never
+    inherited from `Transport` at all. Two defects in this area came from a transport read that sat
+    outside a handler, so the read, the conversion and the validation are all inside this one try.
 
     Every unusable answer falls back to `_DEFAULT_TIMEOUT` rather than being
     rejected, for the reason `_sanitize_timeout` gives: rejecting means raising,
@@ -364,26 +356,22 @@ class _SpanBuffer:
     _drain() can only ever replace the *whole* pair via a single attribute
     assignment (`self._buffer = ...`).
 
-    A prior design kept the deque and the byte total as two separate Client
-    attributes, guarded by an `if self._spans is spans:` identity check
-    before every counter update. That check and the update it guarded were
-    still two separate statements, and a reentrant drain landing between
-    them could invalidate the check's premise: the drain resets the counter
-    to 0 out from under a subtraction that already passed the check,
-    producing a negative total, or exports the just-appended span and resets
-    to 0 out from under an increment that already passed, producing an
-    overstated total. No amount of additional checking closes that gap,
-    because every check is itself a statement a drain can land after.
+    A prior design kept the deque and the byte total as two separate Client attributes, guarded by
+    an `if self._spans is spans:` identity check before every counter update. That check and the
+    update it guarded were still two separate statements, and a reentrant drain landing between
+    them could invalidate the check's premise: the drain resets the counter to 0 out from under a
+    subtraction that already passed the check, producing a negative total, or exports the
+    just-appended span and resets to 0 out from under an increment that already passed, producing
+    an overstated total. No amount of additional checking closes that gap, because every check is
+    itself a statement a drain can land after.
 
-    Folding spans+bytes into one object sidesteps the problem instead of
-    arguing around it: every mutation here (evict_oldest, append) is
-    unconditional and operates on *this* object's own fields. Whether or not
-    `self` is still the live `Client._buffer` by the time the mutation
-    returns is irrelevant, because nothing here ever depends on that -- an
-    eviction subtracts from the same object it popped from, so it can never
-    go negative; an append adds to the same object it appended to, so it can
-    never overstate. There is no separate counter left for a reentrant swap
-    to desynchronize.
+    Folding spans+bytes into one object sidesteps the problem instead of arguing around it: every
+    mutation here (evict_oldest, append) is unconditional and operates on *this* object's own
+    fields. Whether or not `self` is still the live `Client._buffer` by the time the mutation
+    returns is irrelevant, because nothing here ever depends on that -- an eviction subtracts from
+    the same object it popped from, so it can never go negative; an append adds to the same object
+    it appended to, so it can never overstate. There is no separate counter left for a reentrant
+    swap to desynchronize.
     """
 
     __slots__ = ("spans", "bytes")
@@ -609,15 +597,13 @@ class Client:
         span — the byte seams ship from whoever read the reply or closed the
         socket, MCP stdio from a reader task the session's opener started.
 
-        `merged` is a `(tags, user)` SNAPSHOT the producer took where the work
-        was issued (`_interceptors/_issue_scope.py`), or, for a deferred parse
-        that brought none, at submit. A snapshot because `Scope` is MUTABLE and
-        `contextvars.copy_context()` preserves bindings, not the contents of
-        the object bound: a later read stamps "the dict as it is now", and one
-        queued request later that is another tenant's user id on this tenant's
-        span (design §3.7). `None` means "read the calling context's scope
-        now", right only where a span is captured in the context its work was
-        issued in, as a `wardex.span()` block's span is.
+        `merged` is a `(tags, user)` SNAPSHOT the producer took where the work was issued
+        (`_interceptors/_issue_scope.py`), or, for a deferred parse that brought none, at submit. A
+        snapshot because `Scope` is MUTABLE and `contextvars.copy_context()` preserves bindings,
+        not the contents of the object bound: a later read stamps "the dict as it is now", and one
+        queued request later that is another tenant's user id on this tenant's span (design §3.7).
+        `None` means "read the calling context's scope now", right only where a span is captured in
+        the context its work was issued in, as a `wardex.span()` block's span is.
 
         Precedence: a key the span already carries wins over the scope (a
         span-local `set_attribute` is more specific than ambient state), and
@@ -665,6 +651,7 @@ class Client:
 
     def capture_span(self, span: InternalSpan, *, scope: Any = _AMBIENT) -> None:
         if self._closed:
+            ledger.record(DropReason.AFTER_CLOSE)
             return
         self._admit(span, scope=scope)
 
@@ -693,6 +680,7 @@ class Client:
         """
         if self._closed:
             counters.bump("client.finalize.rejected_closed")
+            ledger.record(DropReason.AFTER_CLOSE)
             return
         scope: tuple[dict[str, str], Any] = ({}, None)
         with guard("client.scope_stamp", debug=self._config.debug):
@@ -818,6 +806,7 @@ class Client:
             ):
                 buf.evict_oldest()
                 self._dropped += 1
+                ledger.record(DropReason.QUEUE_OVERFLOW)  # never waits, so safe under this lock
             self._buffer.append(span, size)
             should_wake = len(self._buffer.spans) >= self._flush_threshold
         if should_wake and not self._quiet_wake:
@@ -825,6 +814,7 @@ class Client:
 
     def capture_snapshot(self, snapshot: InternalStateSnapshot) -> None:
         if self._closed:
+            ledger.record(DropReason.AFTER_CLOSE, unit=DropUnit.SNAPSHOT)
             return
         self._worker.ensure_alive()
         with self._buffer_lock:
@@ -837,19 +827,18 @@ class Client:
                 snapshots.popleft()
                 if self._snapshots is snapshots:
                     self._dropped += 1
+                    ledger.record(DropReason.QUEUE_OVERFLOW, unit=DropUnit.SNAPSHOT)
             self._snapshots.append(snapshot)
 
     def flush(self, timeout: float = _FOLLOW_TRANSPORT_TIMEOUT) -> None:
         """Export everything buffered and wait for it, up to `timeout` seconds.
 
-        With no argument the budget is the transport's OWN configured timeout
-        (see `_UnnamedTimeout`): a bare `flush()` is "send what you have, I will
-        wait", so it must not cap the POST below the number the host configured
-        the transport with. An explicit `flush(t)` is a real wall-clock bound and
-        is honoured as one -- that is the bounded-drain win and it is untouched.
-        `close()` is the other operation and follows the config's
-        `batching.shutdown_timeout` (default 5.0); it does not follow the
-        transport.
+        With no argument the budget is the transport's OWN configured timeout (see
+        `_UnnamedTimeout`): a bare `flush()` is "send what you have, I will wait", so it must not
+        cap the POST below the number the host configured the transport with. An explicit
+        `flush(t)` is a real wall-clock bound and is honoured as one -- that is the bounded-drain
+        win and it is untouched. `close()` is the other operation and follows the config's
+        `batching.shutdown_timeout` (default 5.0); it does not follow the transport.
         """
         # Public API: `timeout` is application input, so it is sanitized here and
         # _drain() may then assume a usable number. Note that None does NOT
@@ -905,16 +894,14 @@ class Client:
     def _shutdown_flush(self, timeout: float) -> None:
         """The signal handler's flush — a flush with no second chance.
 
-        `Runtime.handle_signal` re-raises the signal with SIG_DFL after this
-        returns, so the process is ENDING: `KEEP` would discard the pending
-        parses with it, which is why the parse phase runs in FALLBACK — every
-        job leaves, parsed if the half-budget allowed and as a
-        `PARSE_SKIPPED_AT_SHUTDOWN` fallback if not (fallbacks are µs each,
-        so the queue is always empty afterwards). The export keeps a floor of
-        half the budget (I-F11): on the throttled pod this design is for, a
-        parse drain that ate the whole 2 s would turn "the backlog's tail is
-        lost" into "nothing is exported at all" — including the spans that
-        were already buffered before the signal.
+        `Runtime.handle_signal` re-raises the signal with SIG_DFL after this returns, so the
+        process is ENDING: `KEEP` would discard the pending parses with it, which is why the parse
+        phase runs in FALLBACK — every job leaves, parsed if the half-budget allowed and as a
+        `PARSE_SKIPPED_AT_SHUTDOWN` fallback if not (fallbacks are µs each, so the queue is always
+        empty afterwards). The export keeps a floor of half the budget (I-F11): on the throttled
+        pod this design is for, a parse drain that ate the whole 2 s would turn "the backlog's tail
+        is lost" into "nothing is exported at all" — including the spans that were already buffered
+        before the signal.
         """
         budget = _sanitize_timeout(timeout)
         start = time.monotonic()
@@ -1043,7 +1030,7 @@ class Client:
             # -- buffer lock released here; new captures flow. The EXPORT lock
             # is still held: assembly and I/O below are serialized against every
             # other drain, which is what keeps swap order == wire order.
-            if not spans and not snapshots:
+            if not spans and not snapshots and not ledger.due(self._transport, final=final):
                 self._flush_transport(deadline)
                 return
             header = EnvelopeHeader(
@@ -1067,7 +1054,7 @@ class Client:
                 state_snapshots=tuple(snapshots),
             )
             try:
-                if self._config.before_send_envelope is not None:
+                if (spans or snapshots) and self._config.before_send_envelope is not None:
                     try:
                         maybe = self._config.before_send_envelope(envelope)
                     except Exception as exc:
@@ -1091,9 +1078,12 @@ class Client:
                     if maybe is None:
                         # The host dropped it on purpose. Not a loss, so it is
                         # neither returned to the buffer (it would come straight
-                        # back here) nor reported.
+                        # back here) nor reported -- the ledger counts it as such.
+                        ledger.record_items(DropReason.BEFORE_SEND, len(spans), len(snapshots))
                         return
                     envelope = maybe
+                # After the hook: the ledger is wardex's own accounting, not the host's data.
+                envelope = ledger.attach(envelope, self._transport, len(spans) + len(snapshots))
                 # `requested` (when given) is the number the caller actually
                 # NAMED; `timeout` may be that number minus what the finalize
                 # phase already spent, and the cut-short report must quote the
@@ -1103,6 +1093,7 @@ class Client:
                 )
                 shipped = self._export(envelope, deadline, named)
             except Exception as exc:  # fail-closed: drop, never ship half-filtered data
+                ledger.unsent(envelope, definite=False)  # its reports may have gone: resend as is
                 # Also not routed into `_undelivered`, deliberately. A raise means an attempt
                 # of unknown outcome -- the transport may have sent half of it -- so
                 # re-queueing risks a duplicate. (The hook's own raise is handled above, where
@@ -1122,6 +1113,7 @@ class Client:
                     _log_with_traceback("client.export", exc)
                 return
             if not shipped:
+                ledger.unsent(envelope, definite=True)
                 self._undelivered(spans, snapshots, final=final)
             self._flush_transport(deadline)
         finally:
@@ -1330,12 +1322,14 @@ class Client:
                     or buf.bytes + size > self._max_buffer_bytes
                 ):
                     dropped += 1
+                    ledger.record(DropReason.QUEUE_OVERFLOW)
                     continue
                 self._buffer.prepend(span, size)
             for snapshot in reversed(snapshots):
                 pending = self._snapshots
                 if pending and len(pending) >= self._max_buffer_spans:
                     dropped += 1
+                    ledger.record(DropReason.QUEUE_OVERFLOW, unit=DropUnit.SNAPSHOT)
                     continue
                 self._snapshots.appendleft(snapshot)
             self._dropped += dropped
@@ -1388,6 +1382,7 @@ class Client:
             return
         with self._buffer_lock:
             self._lost += lost
+        ledger.record(DropReason.SHUTDOWN_TAIL, lost)
         report_once(
             f"could not ship {lost} buffered span(s): {why} "
             f"They are out of the buffer and nothing will retry them. {fix}",
@@ -1537,19 +1532,16 @@ class Client:
         transport's own budget" is exactly the tail-flush contract, and the
         budget question was settled where `_UnnamedTimeout` lives.
 
-        PLANTED THROUGH `register_after_fork`, not by calling `Finalize`
-        here, and the indirection is load-bearing (measured, not read off
-        the docs): an mp child runs this hook DURING `os.fork()`, and the
-        very next thing `BaseProcess._bootstrap` does is
-        `util._finalizer_registry.clear()` — a Finalize registered here is
-        wiped before the worker runs a line. What `_bootstrap` runs AFTER
-        that clear is `util._run_after_forkers()`, so an after-forker
-        registered here (this hook runs strictly before `_bootstrap`
-        continues) is the one registration that survives to arm the real
-        Finalize. In a raw `os.fork` child `_run_after_forkers` never runs
-        and never needs to: a raw child either exits through the interpreter
-        (atexit's teardown flushes) or through `os._exit` (out of reach by
-        construction — such a child must call `wardex.flush()` itself).
+        PLANTED THROUGH `register_after_fork`, not by calling `Finalize` here, and the indirection
+        is load-bearing (measured, not read off the docs): an mp child runs this hook DURING
+        `os.fork()`, and the very next thing `BaseProcess._bootstrap` does is
+        `util._finalizer_registry.clear()` — a Finalize registered here is wiped before the worker
+        runs a line. What `_bootstrap` runs AFTER that clear is `util._run_after_forkers()`, so an
+        after-forker registered here (this hook runs strictly before `_bootstrap` continues) is the
+        one registration that survives to arm the real Finalize. In a raw `os.fork` child
+        `_run_after_forkers` never runs and never needs to: a raw child either exits through the
+        interpreter (atexit's teardown flushes) or through `os._exit` (out of reach by construction
+        — such a child must call `wardex.flush()` itself).
         """
         if self._closed or self._mp_tail_flush_registered:
             return

@@ -7,7 +7,7 @@ import shutil
 from operator import attrgetter
 from typing import TYPE_CHECKING, NamedTuple
 
-from .._assembly import counters, diag_info, guard, report_once
+from .._assembly import DropReason, DropUnit, counters, diag_info, guard, record, report_once
 from .._config import AdaptersConfig, _non_default_adapter_options
 from .._diagnostics import AdapterStatus
 from .._enums import AdapterName, AdapterState
@@ -287,6 +287,7 @@ def _not_installed(
     """THE one place an adapter whose framework is here is filed as not
     installed — `UNSUPPORTED` or `FAILED` — so whatever else has to know that
     a whole framework's spans are missing is told from here and nowhere else."""
+    record(DropReason.INSTRUMENTATION_UNAVAILABLE, unit=DropUnit.ADAPTER, where=f"adapters.{name}")
     return _status(name, state, found, _say(name, key, line, count=count))
 
 

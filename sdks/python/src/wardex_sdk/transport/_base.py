@@ -3,7 +3,7 @@ from __future__ import annotations
 import abc
 from typing import TYPE_CHECKING, NamedTuple
 
-from .._assembly import counters, diag_info, guard, report_once
+from .._assembly import DropReason, DropUnit, counters, diag_info, guard, record, report_once
 from .._native import NATIVE_OK, native, unavailable_reason
 from .._types import Envelope
 
@@ -180,6 +180,7 @@ def _report_unmarshalled(unmarshalled: list[str], *, debug: bool) -> None:
         return
     for _ in unmarshalled:
         counters.bump("transport.otlp.span_unmarshalled")
+    record(DropReason.UNMARSHALLABLE, len(unmarshalled))
     report_once(
         f"{len(unmarshalled)} span(s) could not be marshalled for export and "
         "were left out; the other spans in their batch were not affected "
@@ -205,6 +206,7 @@ def _report_reserved_overwritten(overwritten: int) -> None:
         return
     for _ in range(overwritten):
         counters.bump("transport.otlp.reserved_attribute_overwritten")
+    record(DropReason.ATTRIBUTE_DROPPED, overwritten)
     report_once(
         f"{overwritten} span attribute(s) set under a reserved wardex.transport.* name "
         "were not exported as set: those names carry the transport values the SDK "
@@ -253,6 +255,7 @@ def _report_pii_scrubbed(scrubbed: int, *, wire: str) -> None:
     key = f"transport.{wire}.pii_scrubbed"
     for _ in range(scrubbed):
         counters.bump(key)
+    record(DropReason.INTERNAL_SDK_ERROR, scrubbed, DropUnit.SPAN, where=key)
     report_once(
         f"PII masking failed on {scrubbed} record(s), which were exported without "
         "their content (ids, kind and times only, marked pii_filter_failed) rather "
