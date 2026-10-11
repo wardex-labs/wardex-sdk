@@ -355,6 +355,9 @@ def test_no_version_is_claimed_when_none_was_seen():
 @pytest.mark.parametrize(
     "version",
     ["v" * (2 << 20), "9999-99-99 spoof", "dave@example.com 4111111111111111", 12345, "", None],
+    # Named, never derived from the value: the 2 MiB string would be a 2 MiB test id, which
+    # `pytest -v` prints as one line and a CI log runner cannot take.
+    ids=["two-mib", "spoofed-date", "free-text-pii", "int", "empty", "none"],
 )
 def test_a_version_that_does_not_read_as_a_revision_is_refused_counted_and_said(version, capsys):
     """The version is the peer's text. A 2 MiB one rode every later span of the subprocess, and
@@ -452,6 +455,7 @@ def test_only_a_tool_call_is_ever_an_execute_tool():
 @pytest.mark.parametrize(
     "name",
     [{"x": 1}, 123, ["a"], True, "", "   ", "a b\n\tc", "x\x00y", "n" * 129],
+    ids=["dict", "int", "list", "bool", "empty", "blank", "newline-tab", "nul", "129-chars"],
 )
 def test_a_tool_name_that_cannot_name_a_span_leaves_it_a_transport_span(name: object):
     """The tool name is the peer's text, and a span name is the label every backend indexes:
