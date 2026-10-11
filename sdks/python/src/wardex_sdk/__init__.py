@@ -526,7 +526,9 @@ def isolation_scope() -> _AbstractContextManager[Scope]:
     The new isolation scope is a CLONE of the current one — ambient context
     (tags, user, contexts) is inherited, and mutations made inside the block
     are isolated to it (Sentry 2.x fork semantics). The current scope is
-    replaced with a fresh one for the block's duration. As a decorator it serves
+    replaced with a fresh one for the block's duration, which is also how to
+    step out of a `wardex.conversation(...)`: spans inside carry none.
+    (`continue_trace` keeps the conversation instead.) As a decorator it serves
     a plain function only (see `WithOrSyncDecorator`).
     """
     return _WithOrSyncDecorator(
