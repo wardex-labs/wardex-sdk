@@ -258,7 +258,10 @@ _MEMBER_SITES: dict[str, frozenset[str]] = {
     "FRAME_PARSE_FAILED": frozenset(
         {"_interceptors/_seam.py", "_interceptors/_trackers.py", "_semantics/_grpc.py"}
     ),
-    "SEMANTIC_PARSE_FAILED": frozenset({"_interceptors/_seam.py"}),
+    # Framing succeeded and the meaning did not: an LLM body the semantic parser
+    # read nothing from (the seam), or an MCP tool result whose shape the stdio
+    # seam cannot vouch for (`_mcp_result.read_tool_result` decides it).
+    "SEMANTIC_PARSE_FAILED": frozenset({"_interceptors/_mcp_stdio.py", "_interceptors/_seam.py"}),
     "PAYLOAD_COMPRESSED": frozenset({"_interceptors/_trackers.py", "_semantics/_grpc.py"}),
     "TOOL_ARGS_UNPARSED": frozenset({"_interceptors/_seam.py"}),
     "OUTPUT_MESSAGES_UNMAPPED_PART": frozenset({"_interceptors/_seam.py"}),

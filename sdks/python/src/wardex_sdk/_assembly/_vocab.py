@@ -253,6 +253,7 @@ _VOCABULARY_PREFIXES = (GEN_AI_PREFIX, WARDEX_PREFIX)
 # `wardex.*`, where a dashboard renders it as flat key/value and never as
 # structure.
 _REGISTRY_PREFIXES = (
+    "mcp.",  # semconv registry docs/registry/attributes/mcp.md — mcp.protocol.version
     "network.",  # network.protocol.version
     "openai.",  # semconv registry docs/registry/attributes/openai.md — api.type, *.service_tier
     "rpc.",  # rpc.system, rpc.service, rpc.method, rpc.grpc.*

@@ -38,7 +38,8 @@ _ECHO = (
 
 @pytest.mark.asyncio
 async def test_anyio_stdio_tools_call_is_captured():
-    wardex.init(intercept=True)
+    # No framework adapter: the seam's span is then the call's execute_tool span.
+    wardex.init(intercept=True, adapters=wardex.AdaptersConfig(enabled=()))
     proc = await anyio.open_process([sys.executable, "-c", _ECHO])
     req = (
         b'{"jsonrpc":"2.0","id":1,"method":"tools/call",'
@@ -58,7 +59,8 @@ async def test_anyio_stdio_tools_call_is_captured():
     mcp = [s for s in spans if s.transport and s.transport.mcp is not None]
     assert len(mcp) == 1
     sp = mcp[0]
-    assert sp.name == "MCP tools/call"
+    assert sp.name == "execute_tool create_issue"
+    assert dict(sp.extra)["gen_ai.operation.name"] == "execute_tool"
     assert sp.tool.name == "create_issue"
     assert b'"repo"' in sp.input_data
     assert b"Created #42" in sp.output_data

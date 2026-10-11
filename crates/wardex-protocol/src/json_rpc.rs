@@ -3,6 +3,11 @@
 //! serde_json, not as the bytes on the pipe: a sender's whitespace and needless `\u` escapes are
 //! dropped (semantic extraction happens upstream).
 //!
+//! A line holding a JSON array is a batch (JSON-RPC 2.0 section 6): each element is read as one
+//! message, in order, and an element that is not a JSON-RPC object is skipped exactly as a
+//! non-JSON-RPC line is. Older MCP revisions allowed batches, so a server written against one
+//! can answer a batch with a batch.
+//!
 //! No line longer than `max_stream_buffer_bytes` is ever parsed, however it arrives. A line that
 //! never terminates within that many bytes latches the stream off (`disabled_reason`), because
 //! the parser cannot find where it ends; a line that arrives complete in one read is skipped on
@@ -166,12 +171,15 @@ impl JsonRpcStream {
     }
 }
 
-/// One line: one message, when it is JSON-RPC.
+/// One line: a single message, or a batch of them.
 fn parse_line(line: &[u8], out: &mut Vec<JsonRpcMessage>) {
     let Ok(v) = serde_json::from_slice::<Value>(line) else {
         return;
     };
-    out.extend(parse_message(&v));
+    match &v {
+        Value::Array(items) => out.extend(items.iter().filter_map(parse_message)),
+        single => out.extend(parse_message(single)),
+    }
 }
 
 fn parse_message(v: &Value) -> Option<JsonRpcMessage> {
@@ -393,6 +401,32 @@ mod tests {
         assert_eq!(at.len(), 64);
         assert_eq!(s.feed(format!("{at}\n").as_bytes()).len(), 1);
         assert_eq!(s.lines_over_cap(), 1);
+    }
+
+    #[test]
+    fn a_batch_line_yields_every_message_in_it() {
+        // 24 calls batched on one line, answered by a batch of 24 responses:
+        // each element is one message, in order.
+        let mut s = JsonRpcStream::new(Limits::default());
+        let calls: Vec<String> = (0..24)
+            .map(|i| format!("{{\"jsonrpc\":\"2.0\",\"id\":{i},\"method\":\"tools/call\"}}"))
+            .collect();
+        let v = s.feed(format!("[{}]\n", calls.join(",")).as_bytes());
+        assert_eq!(v.len(), 24);
+        assert!(v.iter().all(|m| m.kind == JsonRpcKind::Request));
+        assert_eq!(v[23].id.as_deref(), Some("23"));
+
+        let answers: Vec<String> = (0..24)
+            .map(|i| format!("{{\"jsonrpc\":\"2.0\",\"id\":{i},\"result\":{{}}}}"))
+            .collect();
+        let v = s.feed(format!("[{}]\n", answers.join(",")).as_bytes());
+        assert_eq!(v.len(), 24);
+        assert!(v.iter().all(|m| m.kind == JsonRpcKind::Response));
+
+        // Elements that are not JSON-RPC objects are skipped like such lines.
+        let v = s.feed(b"[1,\"x\",{\"hello\":1},{\"jsonrpc\":\"2.0\",\"method\":\"n\"}]\n[]\n");
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].kind, JsonRpcKind::Notification);
     }
 
     #[test]
