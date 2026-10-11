@@ -24,13 +24,17 @@ import urllib.error
 import urllib.request
 
 from .._assembly import (
+    DropReason,
+    DropUnit,
     counters,
     debug_host_error,
     diag_info,
     diag_warning,
+    record,
     report_export_failed,
     report_once,
 )
+from .._assembly._ledger import already_unsent, record_failed_send, unsent
 from .._native import NATIVE_OK, unavailable_reason
 from .._types import Envelope
 from ._base import (
@@ -107,6 +111,53 @@ def _cut_short_by_the_caller(
     except Exception:  # noqa: BLE001 — a probe with a safe answer, never a throw
         return None
     return budget if expired else None
+
+
+def _classify_failure(exc: BaseException) -> tuple[DropReason, bool]:
+    """The drop ledger's reason for a failed POST, and whether the receiver
+    DEFINITELY did not keep the batch.
+
+    The second half decides what happens to a drop report that rode the same
+    POST: definitely not kept, its counts go back into the ledger for the next
+    report; maybe kept, the same report is sent again and the receiver folds
+    the repeat. Guessing "not kept" when it was would count the same losses
+    twice, so every case that cannot be decided reads as "maybe kept".
+
+      * An HTTP status: the receiver answered, so it did not store the batch.
+        429, and 503 (a wardex receiver's "retry later"), are back-pressure.
+        413 is a request over the receiver's size limit, which the split at
+        `max_otlp_request_bytes` did not bring under it. 502 and 504 come from
+        a gateway in front of the receiver, which may have handed the batch
+        on, so they are unconfirmed. Any other status is a refusal.
+      * `URLError`: urllib raises it from connecting and sending, before any
+        answer exists -- a refused connection, a name that did not resolve, a
+        connect timeout. The request never arrived whole.
+      * `ValueError`: urllib and `http.client` raise it while BUILDING the
+        request -- an address with no scheme, an invalid port, a header that
+        cannot be encoded -- before a byte is written. Nothing was sent.
+      * Anything else -- a read timeout, a connection cut before the answer:
+        the request went out and nothing came back.
+
+    Every attribute read is inside the `try`, as in `_describe_failure`: an
+    exception whose `code` raises reads as unconfirmed, the safe direction.
+    """
+    try:
+        if isinstance(exc, urllib.error.HTTPError):
+            status = int(exc.code)
+            if status in (429, 503):
+                return DropReason.RATELIMIT_BACKOFF, True
+            if status == 413:
+                return DropReason.REQUEST_TOO_LARGE, True
+            if status in (502, 504):
+                return DropReason.SEND_UNCONFIRMED, False
+            return DropReason.SEND_ERROR, True
+        if isinstance(exc, urllib.error.URLError):
+            return DropReason.NETWORK_ERROR, True
+        if isinstance(exc, ValueError):
+            return DropReason.SEND_ERROR, True
+    except Exception:  # noqa: BLE001 — a classifying probe, never a throw
+        return DropReason.SEND_UNCONFIRMED, False
+    return DropReason.SEND_UNCONFIRMED, False
 
 
 def _describe_failure(exc: BaseException) -> tuple[str, int | None]:
@@ -266,22 +317,22 @@ class OtlpHttpTransport(Transport):
         deadline = started + effective
         # THE SANCTIONED PATH, minus its counted reports: `_encode_requests` is
         # `Transport.encode()` -- the native encoder with this transport's
-        # stored PII policy and limits, split at `max_otlp_request_bytes`, the
-        # over-cap span reported once per process -- except that what the
-        # encode could not ship as captured (`_EncodeReports`: the spans the
-        # marshaller skipped, the reserved-name attributes the mapping
-        # replaced, the spans sent without their payload) comes back
-        # uncounted. It is counted below, where this batch's fate is decided:
-        # counting here, before a spent budget hands the batch back as
-        # `UNDELIVERED`, made the retry count the same span again. The
+        # stored PII policy and limits, split at `max_otlp_request_bytes` --
+        # except that what the encode could not ship as captured
+        # (`_EncodeReports`: the spans the marshaller skipped, the
+        # reserved-name attributes the mapping replaced, the spans sent
+        # without their payload, the spans too large to send at all) comes
+        # back uncounted. It is counted below, where this batch's fate is
+        # decided: counting here, before a spent budget hands the batch back
+        # as `UNDELIVERED`, made the retry count the same span again. The
         # `compress` constructor flag feeds it.
         bodies, reports = self._encode_requests(envelope, compress=self._compress)
         if not bodies:
             # Every span in the batch was dropped -- by encode()'s over-cap
             # guard, or skipped as unmarshallable. Nothing to POST, and not
             # `UNDELIVERED`: a later attempt would encode to the same nothing.
-            # The fate is decided, so the skipped spans (and any replaced
-            # reserved-name attributes) are counted now.
+            # The fate is decided, so the skipped and over-cap spans (and any
+            # replaced reserved-name attributes) are counted now.
             self._count_encode_reports(reports)
             return None
         headers = {"Content-Type": "application/x-protobuf"}
@@ -338,7 +389,9 @@ class OtlpHttpTransport(Transport):
                 # retry could not duplicate anything, and here it would. What is
                 # left is to say so. Unconditional and bounded, like the reports
                 # around it: off-debug this was a trace arriving with holes in
-                # the middle and nothing on any channel about it.
+                # the middle and nothing on any channel about it. Counted in
+                # requests: how many spans each unsent body held is the core's.
+                record(DropReason.BUDGET_EXHAUSTED, len(bodies) - index, DropUnit.REQUEST)
                 report_once(
                     f"an OTLP export ran out of budget after {index} of "
                     f"{len(bodies)} requests; the spans in the remaining request(s) were "
@@ -368,6 +421,18 @@ class OtlpHttpTransport(Transport):
                 # Every failed POST is counted, whichever line below says it,
                 # and before the debug line, whose `str(exc)` is host text.
                 counters.bump("transport.otlp.export_failed")
+                lost_as, definite = _classify_failure(exc)
+                # Counted before the settle: `unsent` folds, and a shutdown signal that
+                # lands in that fold runs as it ends, where the process dies.
+                if already_unsent(envelope):
+                    pass  # this batch is counted already
+                elif index:  # the requests not sent; how many spans they held is the core's
+                    record(lost_as, len(bodies) - index, DropUnit.REQUEST)
+                else:  # nothing of this batch was accepted; its over-cap spans were not in it
+                    lost = len(envelope.spans) - len(reports.unmarshalled) - reports.over_cap
+                    record(lost_as, lost)
+                record_failed_send()
+                unsent(envelope, definite=definite)
                 if self._debug:
                     debug_host_error(
                         "OTLP export failed", exc, unprintable="transport.otlp.error_unprintable"

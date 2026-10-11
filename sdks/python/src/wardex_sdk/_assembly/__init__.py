@@ -34,6 +34,9 @@ What lives here, and the duplication each module exists to remove:
 * `_parentage` + `_diag` + the `Limitation` enum are the base. All six
   parentage sites resolve through `resolve_parentage` / `child_of`, so "how
   did I know this was the parent" has one answer and one vocabulary.
+* `_ledger` is the other half of that honesty: `Limitation` marks what a span
+  is missing, `DropReason` counts what left no span to mark, and `record()`
+  is the one way to add to it — it never waits, so any lock may be held.
 * `_policy` holds the capture gate, so it has one implementation and the byte
   seams compose with it instead of overriding it.
 * `_vocab`, `_builder` and `_snapshot` give those same six sites one span
@@ -74,6 +77,7 @@ from ._diag import Counters, counters, diag_info, diag_warning, guard, report_on
 from ._drops import (
     count_drain_drop,
     debug_host_error,
+    lose,
     report_buffer_evicted,
     report_connection_parser_disabled,
     report_export_failed,
@@ -82,9 +86,11 @@ from ._drops import (
     report_signal_flush_raised,
     report_stream_parser_disabled,
     report_transport_raised,
+    report_undelivered_drops,
     report_worker_pass_raised,
 )
 from ._integrity import Limitation
+from ._ledger import DropReason, DropUnit, record
 from ._parentage import (
     AMBIENT,
     EMPTY_AMBIENT,
@@ -131,6 +137,8 @@ __all__ = [
     "Block",
     "ConversationContext",
     "Counters",
+    "DropReason",
+    "DropUnit",
     "EMPTY_AMBIENT",
     "EvaluationAttributes",
     "Evidence",
@@ -171,7 +179,9 @@ __all__ = [
     "in_degraded_run",
     "is_declared_extra_key",
     "latch_ambient",
+    "lose",
     "parent_is_closed_unit",
+    "record",
     "report_buffer_evicted",
     "report_connection_parser_disabled",
     "report_export_failed",
@@ -181,6 +191,7 @@ __all__ = [
     "report_signal_flush_raised",
     "report_stream_parser_disabled",
     "report_transport_raised",
+    "report_undelivered_drops",
     "report_worker_pass_raised",
     "resolve_observed",
     "resolve_parentage",

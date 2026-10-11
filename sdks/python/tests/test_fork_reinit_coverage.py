@@ -471,6 +471,7 @@ _WALK_ALLOWED_POPULATED: dict[str, str] = {
     "_proc_limits": "prebuilt limits kwargs — immutable projection, reset not needed",
     "_reset_at_fork_ids": "the fork latch: deliberately populated BY the reset",
     "_counts": "the child's own post-reset diagnostics (fork_child_reinit)",
+    "_inbox": "the child's own post-reset counter bumps, not yet folded into _counts",
     "_afterfork_registry": "multiprocessing's own machinery, not SDK state",
 }
 

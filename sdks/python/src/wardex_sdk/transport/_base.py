@@ -3,7 +3,7 @@ from __future__ import annotations
 import abc
 from typing import TYPE_CHECKING, NamedTuple
 
-from .._assembly import counters, diag_info, guard, report_once
+from .._assembly import DropReason, DropUnit, counters, diag_info, guard, record, report_once
 from .._native import NATIVE_OK, native, unavailable_reason
 from .._types import Envelope
 
@@ -180,6 +180,7 @@ def _report_unmarshalled(unmarshalled: list[str], *, debug: bool) -> None:
         return
     for _ in unmarshalled:
         counters.bump("transport.otlp.span_unmarshalled")
+    record(DropReason.UNMARSHALLABLE, len(unmarshalled))
     report_once(
         f"{len(unmarshalled)} span(s) could not be marshalled for export and "
         "were left out; the other spans in their batch were not affected "
@@ -205,6 +206,7 @@ def _report_reserved_overwritten(overwritten: int) -> None:
         return
     for _ in range(overwritten):
         counters.bump("transport.otlp.reserved_attribute_overwritten")
+    record(DropReason.ATTRIBUTE_DROPPED, overwritten)
     report_once(
         f"{overwritten} span attribute(s) set under a reserved wardex.transport.* name "
         "were not exported as set: those names carry the transport values the SDK "
@@ -212,6 +214,31 @@ def _report_reserved_overwritten(overwritten: int) -> None:
         "where it observed none. Rename the attribute to keep it (counted under "
         "transport.otlp.reserved_attribute_overwritten)",
         key="transport.otlp.reserved_attribute_overwritten",
+    )
+
+
+def _report_over_cap(dropped: int) -> None:
+    """Record and say the spans dropped whole: too large for a request even
+    with their payload removed.
+
+    `report_once` rather than a debug print: the marker mechanism cannot reach
+    this loss -- the span is not on the wire to carry one -- so off-debug it
+    would be byte-identical to those spans never having been captured. Bounded
+    to one line per process, which is what makes it affordable on a per-call
+    path, and keyed apart from the budget reports so "one span is too big for
+    your collector" stays separately actionable. Recorded here, where the
+    batch's fate is known, so an encode repeated after `UNDELIVERED` counts
+    each span once; and never in a failed request's count, since no request
+    carried them.
+    """
+    if not dropped:
+        return
+    record(DropReason.REQUEST_TOO_LARGE, dropped)
+    report_once(
+        f"{dropped} span(s) exceeded max_otlp_request_bytes even with "
+        f"their payload removed and were not exported. Raise "
+        f"max_otlp_request_bytes if your collector accepts more.",
+        key="transport.otlp.span_over_request_cap",
     )
 
 
@@ -253,6 +280,7 @@ def _report_pii_scrubbed(scrubbed: int, *, wire: str) -> None:
     key = f"transport.{wire}.pii_scrubbed"
     for _ in range(scrubbed):
         counters.bump(key)
+    record(DropReason.INTERNAL_SDK_ERROR, scrubbed, DropUnit.SPAN, where=key)
     report_once(
         f"PII masking failed on {scrubbed} record(s), which were exported without "
         "their content (ids, kind and times only, marked pii_filter_failed) rather "
@@ -277,6 +305,8 @@ class _EncodeReports(NamedTuple):
     """Spans exported without their payload to fit `max_otlp_request_bytes`."""
     pii_scrubbed: int
     """Spans masking itself failed on, exported emptied and marked `pii_filter_failed`."""
+    over_cap: int = 0
+    """Spans dropped whole, too large for a request even without their payload."""
 
 
 def _report_encode(reports: _EncodeReports, *, debug: bool) -> None:
@@ -285,6 +315,7 @@ def _report_encode(reports: _EncodeReports, *, debug: bool) -> None:
     _report_reserved_overwritten(reports.overwritten)
     _report_payload_dropped(reports.payload_dropped)
     _report_pii_scrubbed(reports.pii_scrubbed, wire="otlp")
+    _report_over_cap(reports.over_cap)
 
 
 class Transport(abc.ABC):
@@ -434,8 +465,8 @@ class Transport(abc.ABC):
         budget -- would have the next attempt meet and count the same span
         again, so one bad span read as two. Such a transport encodes here and
         calls `_report_encode` at the point the batch's fate is known.
-        Masking, limits and the over-cap report are identical to `encode()`'s;
-        only the timing of the counted reports moves.
+        Masking and limits are identical to `encode()`'s; only the timing of
+        the counted reports, the over-cap one among them, moves.
         """
         if not NATIVE_OK:
             # Reachable from a hand-constructed transport that never went
@@ -461,23 +492,11 @@ class Transport(abc.ABC):
                 **self._pii_names(),
             )
         )
-        if dropped:
-            # A span so large it would not fit a request even with its payload
-            # removed. `report_once` rather than a debug print: the marker
-            # mechanism cannot reach this loss -- the span is not on the wire
-            # to carry one -- so off-debug it would be byte-identical to those
-            # spans never having been captured. Bounded to one line per
-            # process, which is what makes it affordable on a per-call path,
-            # and keyed apart from the budget reports so "one span is too big
-            # for your collector" stays separately actionable. No counter, so
-            # an encode repeated after `UNDELIVERED` cannot inflate anything.
-            report_once(
-                f"{dropped} span(s) exceeded max_otlp_request_bytes even with "
-                f"their payload removed and were not exported. Raise "
-                f"max_otlp_request_bytes if your collector accepts more.",
-                key="transport.otlp.span_over_request_cap",
-            )
-        return tuple(bodies), _EncodeReports(unmarshalled, overwritten, payload_dropped, scrubbed)
+        # `dropped`, the spans too large for a request even without their
+        # payload, rides back with the other reports (`_report_over_cap`).
+        return tuple(bodies), _EncodeReports(
+            unmarshalled, overwritten, payload_dropped, scrubbed, dropped
+        )
 
     def _set_pii_policy(self, policy: PIIConfig) -> None:
         """Install the PII policy resolved from `WardexConfig`. Called by

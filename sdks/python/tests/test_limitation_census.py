@@ -872,10 +872,16 @@ def _defaults(a: ast.arguments):  # noqa: ANN202
 
 
 def _bound_name(node: ast.expr) -> str | None:
-    """The identifier a target/operand binds, for `x` and for `self.x` alike."""
+    """The identifier a target/operand binds, for `x` and for `self.x` alike.
+
+    None for a member of the drop vocabulary's enums (`_OTHER_VOCABULARIES`):
+    `DropReason.MARKER_LOST` names a reason, not a marker, so recording it does
+    not make the ledger's `record` a marker sink."""
     if isinstance(node, ast.Name):
         return node.id
     if isinstance(node, ast.Attribute):
+        if isinstance(node.value, ast.Name) and node.value.id in _OTHER_VOCABULARY_ENUMS:
+            return None
         return node.attr
     return None
 
@@ -1052,12 +1058,22 @@ def _shape(node: ast.expr) -> str:
     return type(node).__name__
 
 
+#: Modules that are a DIFFERENT closed vocabulary and only look like this one to
+#: a name-based scan. The drop ledger's reasons and units name what left no
+#: span to carry a marker; one of them counts markers that could not be
+#: attached (`marker_lost`, unit `marker`), so the scan reads its enum members
+#: as marker strings. Nothing in it reaches `CaptureIntegrity.limitations`; its
+#: own census is `test_drop_ledger_census.py`.
+_OTHER_VOCABULARIES: frozenset[str] = frozenset({"_assembly/_drop_reasons.py"})
+#: That vocabulary's enums, as the modules that record into it spell them.
+_OTHER_VOCABULARY_ENUMS: frozenset[str] = frozenset({"DropReason", "DropUnit"})
+
+
 def _trees() -> dict[str, ast.Module]:
     return {
-        path.relative_to(_SRC).as_posix(): ast.parse(
-            path.read_text(encoding="utf-8"), filename=str(path)
-        )
+        rel: ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         for path in sorted(_SRC.rglob("*.py"))
+        if (rel := path.relative_to(_SRC).as_posix()) not in _OTHER_VOCABULARIES
     }
 
 
@@ -1813,7 +1829,7 @@ _VOCABULARY: dict[str, str] = {
 }
 
 
-def test_the_vocabulary_is_exactly_these_fifty_seven() -> None:
+def test_the_vocabulary_is_exactly_the_recorded_table() -> None:
     """15 declared before the census + 21 from it + 1 from §5.4 + 1 for wardex
     itself + 1 for the OTLP size guard + 1 for the registry breadth bound
     + 2 for the OTel bridge's fail-open pair + 1 for the adapter's per-session
@@ -2262,6 +2278,25 @@ def test_a_marker_written_into_a_parameter_default_is_censused(source, expected)
         "a marker string written as a parameter's default reaches a span every "
         "time the funnel is called bare, and no call-site scan can ever see it"
     )
+
+
+def test_a_drop_reason_named_for_markers_does_not_make_a_marker_sink():
+    """`record(DropReason.MARKER_LOST)` counts a marker a span could not carry.
+    The name is the drop vocabulary's, so it does not make `record` a marker
+    sink and every label recorded elsewhere a marker; a marker container handed
+    to the same function still does."""
+    source = (
+        "def record(reason, *, where=None): ...\n"
+        "def lost():\n"
+        "    record(DropReason.MARKER_LOST, where='a_label')\n"
+    )
+    census = _PythonCensus({"synthetic.py": ast.parse(source)})
+    assert "record" not in census.marker_functions
+    assert "a_label" not in census.markers
+    handed = source + "def kept(markers):\n    record(markers, where='a_marker')\n"
+    census = _PythonCensus({"synthetic.py": ast.parse(handed)})
+    assert "record" in census.marker_functions
+    assert "a_marker" in census.markers
 
 
 def test_scanner_is_not_blind(py_census: _PythonCensus, rust_census: _RustCensus) -> None:

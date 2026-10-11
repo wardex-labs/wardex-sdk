@@ -68,12 +68,14 @@ from typing import TYPE_CHECKING, Any
 
 from ._assembly import (
     Limitation,
+    _ledger,
     counters,
     diag_info,
     guard,
     report_open_spans_unshipped,
     report_open_spans_untracked,
     report_signal_flush_raised,
+    report_undelivered_drops,
 )
 from ._assembly._diag import diag_reset_for_new_process
 from ._client import Client, _sanitize_timeout, _UnnamedTimeout
@@ -325,6 +327,7 @@ class Runtime:
                     left = max(0.0, started + budget - time.monotonic())
                     timeout = _UnnamedTimeout(left, _CUT_OFF_BUDGET_LABEL)
             self._teardown(client, timeout=timeout)
+            report_undelivered_drops(client)  # no next envelope now; re-init's has one
 
     def _teardown(self, client: Client | None, *, timeout: float | None = None) -> None:
         """THE uninstall order, run against `client`. Caller holds the lock.
@@ -442,6 +445,7 @@ class Runtime:
         self._open_spans = {}
         self._cut_off_in_flight = 0
         diag_reset_for_new_process()
+        _ledger._at_fork_reinit()  # the child counts its own losses; the parent ships its own
         with guard("_runtime.fork_reinit_failed"):
             # step 1 — slots, directly.
             client = self._client
@@ -615,6 +619,8 @@ class Runtime:
     # -- signals ------------------------------------------------------------
 
     def handle_signal(self, signum: int, frame: object) -> None:
+        if _ledger.hold_signal(_handler, signum, frame):
+            return  # it landed inside a ledger fold on this thread: it runs as the fold ends
         client, prev, close_units = self._signal_state(signum)
         if client is not None:
             # Nothing here may wake the batch worker: the wake takes the plain
@@ -639,50 +645,48 @@ class Runtime:
         """What the handler does for the client; `handle_signal` holds the wake quiet."""
         started = time.monotonic()
         budget: float = _SIGNAL_FLUSH_TIMEOUT
-        if prev is signal.SIG_DFL and close_units is not None:
-            # Close live units BEFORE the flush, or the flush has nothing of
-            # them to send. Gated on SIG_DFL because that is exactly the
-            # disposition where the process ends in this handler, via
-            # `os.kill`, and atexit does NOT run — measured for SIGTERM. Any
-            # other disposition either exits through the interpreter (atexit
-            # runs, and the adapter uninstall closes the units there) or
-            # keeps the program running, and closing every live unit under a
-            # program that carries on would truncate sessions still being
-            # driven.
+        ending = prev is signal.SIG_DFL  # the process ends in this handler, via `os.kill`
+        if ending and close_units is not None:
+            # Close live units BEFORE the flush, or the flush has nothing of them to send. Gated on
+            # SIG_DFL because that is exactly the disposition where the process ends in this
+            # handler, via `os.kill`, and atexit does NOT run — measured for SIGTERM. Any other
+            # disposition either exits through the interpreter (atexit runs, and the adapter
+            # uninstall closes the units there) or keeps the program running, and closing every
+            # live unit under a program that carries on would truncate sessions still being driven.
             #
-            # No `try` around it, and that is not an oversight:
-            # `close_units_all` guards every adapter individually with the
-            # one sanctioned swallow (I6), so a failing adapter is already
-            # counted and already cannot reach the flush below. Adding a
-            # second net here would add an unsanctioned one and hide nothing
-            # that is not already caught.
+            # No `try` around it, and that is not an oversight: `close_units_all` guards every
+            # adapter individually with the one sanctioned swallow (I6), so a failing adapter is
+            # already counted and already cannot reach the flush below. Adding a second net here
+            # would add an unsanctioned one and hide nothing that is not already caught.
             close_units(marker=Limitation.UNIT_INTERRUPTED)
-        if prev is signal.SIG_DFL:
-            # The same disposition and the same reason, for the spans the
-            # host opened by hand (`@wardex.workflow`, `wardex.span()`). They
-            # may drain the buffer between chunks for up to half the flush
-            # budget; the flush below keeps the rest, never a fresh 2 s.
+        if ending:
+            # The same disposition and the same reason, for the spans the host opened by hand
+            # (`@wardex.workflow`, `wardex.span()`). They may drain the buffer between chunks for
+            # up to half the flush budget; the flush below keeps the rest, never a fresh 2 s.
             total = float(_SIGNAL_FLUSH_TIMEOUT)
             if self.interrupt_open_spans(
                 client, Limitation.UNIT_INTERRUPTED, budget=total / 2, signalled=True
             ):
                 left = max(0.0, started + total - time.monotonic())
                 budget = _UnnamedTimeout(left, _CUT_OFF_BUDGET_LABEL)
+            # No drain comes after this one, so the drop ledger may ship alone now, as at close().
+            _ledger.expedite()
         try:
-            # The shutdown arm of flush, not the public one: the process
-            # dies in this handler (SIG_DFL is re-raised below), so
-            # pending deferred parses are drained in FALLBACK — parsed
-            # inside half the budget, shipped as PARSE_SKIPPED_AT_SHUTDOWN
-            # after — and the export keeps a floor of the other half. A
-            # plain flush() would KEEP the leftover, and a kept job here
-            # is a job the process takes down with it.
+            # The shutdown arm of flush, not the public one: the process dies in this handler
+            # (SIG_DFL is re-raised below), so pending deferred parses are drained in FALLBACK —
+            # parsed inside half the budget, shipped as PARSE_SKIPPED_AT_SHUTDOWN after — and the
+            # export keeps a floor of the other half. A plain flush() would KEEP the leftover, and
+            # a kept job here is a job the process takes down with it.
             client._shutdown_flush(budget)
         except Exception:
-            # A failed flush must never block the chain to the app's
-            # handler -- and must not vanish either: under SIG_DFL this is
-            # the last thing the process does, so the line is the only
-            # record that the buffered tail went down with it.
+            # A failed flush must never block the chain to the app's handler -- and must not
+            # vanish either: under SIG_DFL this is the last thing the process does, so the line is
+            # the only record that the buffered tail went down with it.
             report_signal_flush_raised()
+        if ending:
+            # And the counts of what was lost that the flush could not deliver: stderr is the
+            # only channel left to a process about to die on the signal.
+            report_undelivered_drops(client, who="a shutdown signal's flush")
 
     def _signal_state(self, signum: int) -> tuple[Client | None, Any, Any]:
         """What the handler needs, read under the lock when the lock is free.

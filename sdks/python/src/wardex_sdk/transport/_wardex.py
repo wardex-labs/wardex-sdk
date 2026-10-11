@@ -34,11 +34,20 @@ from __future__ import annotations
 import time
 import urllib.request
 
-from .._assembly import counters, debug_host_error, diag_info, report_export_failed, report_once
+from .._assembly import (
+    DropReason,
+    counters,
+    debug_host_error,
+    diag_info,
+    record,
+    report_export_failed,
+    report_once,
+)
+from .._assembly import _ledger as ledger
 from .._native import NATIVE_OK, native, unavailable_reason
 from .._types import Envelope
 from ._base import UNDELIVERED, Transport, Undelivered, _debug_enabled, _report_pii_scrubbed
-from ._otlp_http import _cut_short_by_the_caller, _describe_failure
+from ._otlp_http import _classify_failure, _cut_short_by_the_caller, _describe_failure
 
 #: The receiver route every wardex receiver serves, appended to `base_url`.
 ENVELOPE_PATH = "/v1/envelope"
@@ -55,7 +64,16 @@ class WardexTransport(Transport):
     `timeout` bounds ONE export, in seconds, and is what a bare `flush()`
     follows (see `export_timeout`). A caller's own budget narrows it and never
     widens it.
+
+    It is the transport that carries wardex's drop report: the client attaches
+    the ledger's `ClientReport`s to the envelopes it hands this transport, and
+    this transport tells the ledger when a POST carrying them failed, and how
+    (see `_assembly._ledger`).
     """
+
+    #: Read by `_assembly._ledger.carries`: envelopes for this transport get the
+    #: ledger's reports, because the wardex receiver stores them.
+    _carries_client_report = True
 
     def __init__(
         self,
@@ -95,7 +113,7 @@ class WardexTransport(Transport):
     def export(self, envelope: Envelope, *, timeout: float | None = None) -> Undelivered | None:
         # An empty batch is nothing to send, and not a decline either: there is
         # nothing here for a later attempt to deliver.
-        if not envelope.spans and not envelope.state_snapshots:
+        if not envelope.spans and not envelope.state_snapshots and not envelope.client_reports:
             return None
         if not NATIVE_OK:
             # Same reasoning as the OTLP transport's guard, and the same order:
@@ -109,6 +127,9 @@ class WardexTransport(Transport):
                 f"wardex export skipped, native extension unavailable ({unavailable_reason()})",
                 key="transport.wardex.native_unavailable",
             )
+            # Nothing can be sent, the drop report included: its counts stay
+            # in the ledger, where close() will say them.
+            ledger.unsent(envelope, definite=True)
             return None
         # The caller's remaining budget narrows the configured timeout, never
         # widens it: a flush(99.0) must not turn a 10-second transport into one
@@ -162,6 +183,7 @@ class WardexTransport(Transport):
             # too.
             for _ in unmarshalled:
                 counters.bump("transport.wardex.span_unmarshalled")
+            record(DropReason.UNMARSHALLABLE, len(unmarshalled))
             report_once(
                 f"{len(unmarshalled)} span(s) could not be marshalled for export and "
                 "were left out; the other spans in their batch were not affected "
@@ -196,6 +218,19 @@ class WardexTransport(Transport):
                     pass
         except Exception as exc:  # fail-silent: never crash the app
             counters.bump("transport.wardex.export_failed")
+            # What the batch is lost as, and whether its drop report can go
+            # back into the ledger or must be resent as it was. Counted only
+            # when this failure is news: a subclass that sends the same batch
+            # twice has lost it once. Counted BEFORE the settle: `unsent` folds,
+            # and a shutdown signal that lands in that fold runs as it ends,
+            # where the process dies.
+            lost_as, definite = _classify_failure(exc)
+            if not ledger.already_unsent(envelope):
+                ledger.record_items(
+                    lost_as, len(envelope.spans) - len(unmarshalled), len(envelope.state_snapshots)
+                )
+            ledger.record_failed_send()
+            ledger.unsent(envelope, definite=definite)
             # `exc` may quote the URL; it never quotes the Authorization
             # header, so the debug line cannot echo the key.
             if self._debug:

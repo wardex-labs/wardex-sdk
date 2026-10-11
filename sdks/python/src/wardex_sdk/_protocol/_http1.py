@@ -5,7 +5,7 @@ from __future__ import annotations
 import zlib
 
 from .. import _wardex_native
-from .._assembly import Limitation, counters, guard
+from .._assembly import DropReason, Limitation, counters, guard, record
 from .._enums import Protocol
 from .._types import ParsedMessage
 from ._base import ProtocolParserInterface
@@ -33,7 +33,8 @@ def _resolve_markers(raw: object) -> tuple[Limitation, ...]:
     vocabulary is actually entered. A string with no member cannot be carried
     forward — `CaptureIntegrity.limitations` holds members now — so the choice is
     between dropping it in silence and saying so. It says so: the drop is
-    counted and, under `init(debug=True)`, logged.
+    counted and, under `init(debug=True)`, logged, and the drop ledger records
+    a marker lost, since the span now looks more complete than it is.
 
     It should be unreachable. `tests/test_limitation_census.py` reads every
     marker literal in `crates/` on every test run and fails if one has no member
@@ -45,6 +46,7 @@ def _resolve_markers(raw: object) -> tuple[Limitation, ...]:
         member = Limitation.from_wire(value)
         if member is None:
             counters.bump("protocol.limitation_unresolved")
+            record(DropReason.MARKER_LOST)
             continue
         out.append(member)
     return tuple(out)

@@ -218,13 +218,19 @@ def test_one_unmarshallable_span_costs_that_span_not_the_batch(receiver):
     with wardex_sdk.span("good-b"):
         pass
     wardex_sdk.flush()
+    body = _Handler.received.get("body")
     wardex_sdk.close()
 
-    body = _Handler.received.get("body")
     assert body, "nothing reached the receiver: the batch was dropped whole"
     decoded = _wardex_native.codec.decode_envelope(body)
     assert [item["span"]["name"] for item in decoded["items"]] == ["good-a", "good-b"]
     assert _counter("transport.wardex.span_unmarshalled") == before + 1
+    # And the receiver hears about the one it did not get: with nothing else
+    # left to send, close()'s final drain carries the drop report alone.
+    items = _wardex_native.codec.decode_envelope(_Handler.received["body"])["items"]
+    assert [item["client_report"]["discarded_events"] for item in items] == [
+        {"unmarshallable:span": 1}
+    ]
 
 
 def test_a_batch_with_no_marshallable_span_is_not_posted(receiver):
