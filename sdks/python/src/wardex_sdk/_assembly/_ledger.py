@@ -72,16 +72,19 @@ envelope actually carries a report, and the last drain a process gets (close's
 final one, or one `expedite` announced) does not wait for it.
 
 The ledger is process-global. A fork child starts from zero
-(`_at_fork_reinit`): the parent owns what it counted and ships it itself.
+(`_at_fork_reinit`): the parent owns what it counted and ships it itself. The
+first record arms that reset for every later fork, so a count recorded before
+`init()` (which arms the runtime's own fork hook) does not cross into a child.
 """
 
 from __future__ import annotations
 
 import inspect
+import os
 import threading
 import time
 from collections import deque
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from types import MappingProxyType
 
@@ -139,6 +142,13 @@ _WHERE_CAP = 1024
 #: Read through the module, so tests can move the clock.
 _monotonic = time.monotonic
 
+#: Emptied by the first record, which registers the fork reset with it: at
+#: import nothing is registered (importing wardex leaves no trace), and waiting
+#: for `init()` would let a count recorded before it cross a fork made before it.
+_UNARMED: dict[int, Callable[..., None]] = (
+    {0: os.register_at_fork} if hasattr(os, "register_at_fork") else {}
+)
+
 # --- state, all of it reset at fork and for tests -----------------------------
 
 #: (reason, unit, n, where) per record; `reason is None` is a failed send.
@@ -172,6 +182,8 @@ _last_unsent: list[object] = [None]
 _last_timestamp = 0
 _last_solo: float | None = None
 _started = _monotonic()
+#: The process the state above was last reset in; see `_at_fork_child`.
+_reset_pid = os.getpid()
 
 
 @dataclass(frozen=True)
@@ -209,6 +221,10 @@ def record(
     if member is None or n <= 0:
         return
     _INBOX.append((member, _DEFAULT_UNIT[member] if unit is None else unit, n, where))
+    if _UNARMED:
+        arm = _UNARMED.pop(0, None)  # one caller gets it, whatever the threads do
+        if arm is not None:
+            arm(after_in_child=_at_fork_child)
     if len(_INBOX) < _FOLD_AT or not _FOLD.acquire(blocking=False):
         return
     try:
@@ -242,6 +258,10 @@ def record_items(
 def record_failed_send() -> None:
     """Count one failed send attempt, for the next report's `failed_sends`."""
     _INBOX.append((None, None, 1, None))
+    if _UNARMED:
+        arm = _UNARMED.pop(0, None)
+        if arm is not None:
+            arm(after_in_child=_at_fork_child)
     if len(_INBOX) >= _FOLD_AT:
         _try_fold()
 
@@ -499,10 +519,12 @@ def _keys_of(report: ClientReport) -> list[tuple[tuple[DropReason, DropUnit], in
 
 
 def _at_fork_reinit() -> None:
-    """Fork-child reset, run from `Runtime.after_in_child` step 0: start from
-    zero with a fresh lock. Acquires nothing, since a parent thread may have
-    held the fold at the fork; the parent ships what it counted."""
+    """Fork-child reset, run from `Runtime.after_in_child` step 0 and from the
+    ledger's own fork hook: start from zero with a fresh lock. Acquires
+    nothing, since a parent thread may have held the fold at the fork; the
+    parent ships what it counted."""
     global _FOLD, _folding, _failed_sends, _last_timestamp, _last_solo, _started
+    global _reset_pid
     _FOLD = threading.RLock()
     _folding = False
     _INBOX.clear()
@@ -517,6 +539,15 @@ def _at_fork_reinit() -> None:
     _last_timestamp = 0
     _last_solo = None
     _started = _monotonic()
+    _reset_pid = os.getpid()
+
+
+def _at_fork_child() -> None:
+    """The ledger's own fork hook, armed by the first record. It covers a fork
+    made before `init()` armed the runtime's hook; a child that hook already
+    reset is left alone, so nothing recorded since is wiped."""
+    if _reset_pid != os.getpid():
+        _at_fork_reinit()
 
 
 def _reset_for_tests() -> None:

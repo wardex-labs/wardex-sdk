@@ -699,7 +699,11 @@ def test_a_transport_that_cannot_carry_reports_never_has_them_taken():
 
 
 @fork_only
-def test_a_fork_childs_first_report_carries_none_of_the_parents_counts(receiver):
+def test_a_fork_childs_first_report_carries_none_of_the_parents_counts(receiver, monkeypatch):
+    # The child's first POST must not ask macOS for its proxy settings: that
+    # call is not safe after fork() in a threaded parent, and whether this
+    # parent already asked depends on which tests ran before this one.
+    monkeypatch.setenv("no_proxy", "*")
     wardex_sdk.init(backend=BackendConfig(api_key=KEY, base_url=receiver.url), intercept=False)
     try:
         _ledger.record(DropReason.SEND_ERROR, 7)  # the parent's, still pending
@@ -727,6 +731,66 @@ def test_a_fork_childs_first_report_carries_none_of_the_parents_counts(receiver)
         by_pid.setdefault(d["header"]["resource"]["process_pid"], []).extend(_reports(d))
     assert _events(by_pid[pid]) == {"table_full:entry": 2}
     assert _events(by_pid[os.getpid()]) == {"send_error:span": 7}
+
+
+_FORK_BEFORE_INIT_CHILD = r"""
+import os, sys
+import wardex_sdk
+from wardex_sdk._assembly import _ledger
+from wardex_sdk._assembly._ledger import DropReason
+from wardex_sdk._config import BackendConfig
+
+_ledger.record(DropReason.INTERNAL_SDK_ERROR, 9)  # before init(): the runtime has no fork hook yet
+pid = os.fork()
+if pid == 0:
+    code = 1
+    try:
+        backend = BackendConfig(api_key=sys.argv[2], base_url=sys.argv[1])
+        wardex_sdk.init(backend=backend, intercept=False)
+        _ledger.record(DropReason.TABLE_FULL, 2)
+        with wardex_sdk.span("child"):
+            pass
+        wardex_sdk.flush(5.0)
+        code = 0
+    finally:
+        os._exit(code)
+_, status = os.waitpid(pid, 0)
+held = _ledger.snapshot().total(DropReason.INTERNAL_SDK_ERROR)
+print(pid, os.WEXITSTATUS(status), held)
+"""
+
+
+@fork_only
+def test_a_child_forked_before_init_ships_none_of_the_parents_counts(receiver):
+    """The runtime arms its fork hook at `init()`. A count the parent recorded
+    before that, then a fork, then a child that inits: the ledger's own hook,
+    armed by the first record, still starts the child from zero. The parent
+    keeps its count."""
+    env = {**os.environ, "no_proxy": "*"}  # see the fork test above
+    proc = subprocess.run(
+        [sys.executable, "-c", _FORK_BEFORE_INIT_CHILD, receiver.url, KEY],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env=env,
+    )
+    pid, status, parent_held = (int(x) for x in proc.stdout.split())
+    assert status == 0, proc.stderr
+    assert parent_held == 9
+    by_pid: dict[int, list[dict]] = {}
+    for _, d in receiver.decoded():
+        by_pid.setdefault(d["header"]["resource"]["process_pid"], []).extend(_reports(d))
+    assert _events(by_pid[pid]) == {"table_full:entry": 2}
+
+
+def test_the_ledgers_own_fork_hook_leaves_a_child_the_runtime_reset_alone():
+    """Both fork hooks run in a child. Whichever runs second finds the reset
+    done in this process and keeps what was recorded since."""
+    _ledger._at_fork_reinit()  # "the runtime's hook ran in this child"
+    _ledger.record(DropReason.TABLE_FULL, 3)  # a loss its later steps recorded
+    _ledger._at_fork_child()
+    assert _ledger.undelivered() == {(DropReason.TABLE_FULL, DropUnit.ENTRY): 3}
+    assert _ledger._UNARMED == {}, "a record arms the ledger's own hook"
 
 
 # -- (h) a drain never waits for the ledger ------------------------------------
