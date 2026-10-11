@@ -39,6 +39,7 @@ import time
 from collections.abc import Iterator
 from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from types import SimpleNamespace
 
 import pytest
 
@@ -46,7 +47,7 @@ import wardex_sdk
 from test_batching_integration import posix_signals  # the suite's signal marker, shared
 from test_fork_semantics import fork_only  # the suite's POSIX-only marker, shared
 from wardex_sdk import _hub, _wardex_native
-from wardex_sdk._assembly import _ledger, counters, guard, lose
+from wardex_sdk._assembly import Limitation, _ledger, counters, guard, lose
 from wardex_sdk._assembly._diag import Counters, reset_reports_for_test
 from wardex_sdk._assembly._ledger import REASONS, DropReason, DropUnit
 from wardex_sdk._client import Client
@@ -943,6 +944,16 @@ def test_an_adapter_that_did_not_install_is_counted_per_adapter():
     snap = _ledger.snapshot()
     assert snap.counts[(DropReason.INSTRUMENTATION_UNAVAILABLE, DropUnit.ADAPTER)] == 1
     assert snap.where[(DropReason.INSTRUMENTATION_UNAVAILABLE, "adapters.langgraph")] == 1
+
+
+def test_a_marker_the_core_names_and_the_sdk_cannot_is_counted_lost():
+    """A limitation string with no member cannot ride the span, which then
+    looks more complete than it is: a marker lost, in the ledger."""
+    from wardex_sdk._protocol._http1 import _resolve_markers
+
+    raw = SimpleNamespace(limitations=["body_cap_exceeded", "a_marker_from_a_newer_core"])
+    assert _resolve_markers(raw) == (Limitation.BODY_CAP_EXCEEDED,)
+    assert dict(_ledger.snapshot().counts) == {(DropReason.MARKER_LOST, DropUnit.MARKER): 1}
 
 
 def test_a_counter_bump_is_never_lost_to_a_held_lock():

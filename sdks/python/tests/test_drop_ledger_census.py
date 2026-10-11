@@ -678,9 +678,10 @@ _CENSUS: dict[tuple[str, str, str], object] = {
     ("_interceptors/_trackers.py", "bump", "'protocol.http2.stream_evicted'"): Marker(
         "H2_REQUEST_EVICTED", at="_interceptors/_trackers.py"
     ),
-    ("_protocol/_http1.py", "bump", "'protocol.limitation_unresolved'"): NotADrop(
-        "unreachable while the limitation census holds: each code the core emits has a member"
-    ),
+    # Unreachable while the limitation census holds (each code the core emits
+    # has a member), but a marker the span cannot carry when it is reached.
+    ("_protocol/_http1.py", "bump", "'protocol.limitation_unresolved'"): L("MARKER_LOST"),
+    ("_protocol/_http1.py", "record", "DropReason.MARKER_LOST"): L("MARKER_LOST"),
     ("_semantics/_genai.py", "bump", "'protocol.semantic.provider_inferred'"): Marker(
         "PROVIDER_INFERRED", at="_semantics/_genai.py"
     ),
