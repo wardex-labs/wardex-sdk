@@ -157,6 +157,49 @@ def test_py_typed_ships_next_to_the_package():
 
 _REPO = pathlib.Path(__file__).resolve().parents[3]
 
+try:
+    import tomllib as _toml
+except ImportError:  # Python 3.10; pytest itself depends on tomli there
+    import tomli as _toml
+
+
+def _turns_on_panic_injection(manifest: dict) -> list[str]:
+    """Every way one parsed Cargo manifest enables `panic-injection` without
+    being asked: its `default` features, followed through the local features
+    they name, and any dependency declared with the feature switched on.
+    Parsed rather than grepped, so an array split across lines is read whole."""
+    features = manifest.get("features", {})
+    found: list[str] = []
+    seen: set[str] = set()
+    pending = list(features.get("default", []))
+    while pending:
+        name = pending.pop()
+        if name in seen:
+            continue
+        seen.add(name)
+        if name.rsplit("/", 1)[-1] == "panic-injection":
+            found.append(f"default enables {name}")
+        pending.extend(features.get(name, []))
+    tables = [manifest, manifest.get("workspace", {})]
+    for table in tables:
+        for section in ("dependencies", "build-dependencies"):
+            for dep, spec in table.get(section, {}).items():
+                if isinstance(spec, dict) and "panic-injection" in spec.get("features", []):
+                    found.append(f"{section}.{dep} enables it")
+    return found
+
+
+def test_the_injection_scan_reads_a_default_split_across_lines():
+    """The check below is only as good as its reading of a manifest: a
+    line-by-line scan passed `default = [` on one line and the feature on the
+    next."""
+    split = _toml.loads('[features]\ndefault = [\n    "x",\n]\nx = [\n    "panic-injection",\n]\n')
+    assert _turns_on_panic_injection(split) == ["default enables panic-injection"]
+    dep = _toml.loads(
+        '[dependencies]\ncore = { path = "..", features = [\n "panic-injection"\n] }\n'
+    )
+    assert _turns_on_panic_injection(dep) == ["dependencies.core enables it"]
+
 
 def test_the_release_build_never_turns_on_panic_injection():
     """The `panic-injection` cargo feature adds `_panic_for_test()` and makes
@@ -168,9 +211,9 @@ def test_the_release_build_never_turns_on_panic_injection():
 
     The release wheel is built by maturin from `[tool.maturin]` in
     `sdks/python/pyproject.toml` and the args in the release workflow, so
-    neither may name the feature, and no crate may turn it on by default --
-    a `default` feature list is the one switch that would reach the wheel
-    without either file saying so.
+    neither may name the feature, and no crate may turn it on unasked -- a
+    `default` feature list, or a dependency declared with the feature, is a
+    switch that would reach the wheel without either file saying so.
     """
     package = (_REPO / "sdks" / "python" / "pyproject.toml").read_text(encoding="utf-8")
     assert "[tool.maturin]" in package
@@ -179,15 +222,16 @@ def test_the_release_build_never_turns_on_panic_injection():
     assert "PyO3/maturin-action" in release
     assert "panic-injection" not in release
     manifests = sorted(_REPO.glob("crates/*/Cargo.toml")) + [
-        _REPO / "bindings" / "python" / "Cargo.toml"
+        _REPO / "bindings" / "python" / "Cargo.toml",
+        _REPO / "Cargo.toml",
     ]
-    declared = [m for m in manifests if "panic-injection" in m.read_text(encoding="utf-8")]
+    parsed = {m: _toml.loads(m.read_text(encoding="utf-8")) for m in manifests}
     # Not vacuous: the feature is declared where the injection lives.
-    assert _REPO / "crates" / "wardex-pipeline" / "Cargo.toml" in declared
-    for manifest in declared:
-        for line in manifest.read_text(encoding="utf-8").splitlines():
-            if line.strip().startswith("default"):
-                assert "panic-injection" not in line, f"{manifest}: {line}"
+    assert "panic-injection" in parsed[_REPO / "crates" / "wardex-pipeline" / "Cargo.toml"].get(
+        "features", {}
+    )
+    turned_on = {str(m): _turns_on_panic_injection(t) for m, t in parsed.items()}
+    assert not {m: why for m, why in turned_on.items() if why}, turned_on
     # The one place that does turn it on is the development build's.
     workspace = (_REPO / "pyproject.toml").read_text(encoding="utf-8")
     assert '"--features panic-injection"' in workspace
