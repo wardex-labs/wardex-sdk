@@ -360,6 +360,50 @@ def test_a_parser_latching_off_is_counted_per_connection(bare_ssl_interceptor, r
     assert _events(_reports(decoded)) == {"parser_disabled:connection": 1}
 
 
+#: An HPACK dynamic table size update to 65537 bytes, one past the decoder's
+#: cap, then `:method GET`, since a block may not end with an update.
+_HPACK_UPDATE_PAST_CAP = bytes([0x3F, 0xE2, 0xFF, 0x03, 0x82])
+
+
+@pytest.mark.parametrize(
+    ("limits", "flags", "block", "latch"),
+    [
+        pytest.param(
+            {},
+            0x5,
+            _HPACK_UPDATE_PAST_CAP,
+            "hpack_table_size_exceeded",
+            id="hpack-table-past-its-cap",
+        ),
+        pytest.param(
+            {"max_stream_buffer_bytes": 16},
+            0x0,  # no END_HEADERS: the block waits for a CONTINUATION
+            b"\x82" * 32,
+            "stream_buffer_exceeded",
+            id="header-block-past-the-buffer-cap",
+        ),
+    ],
+)
+def test_an_http2_parser_cap_latching_off_is_counted_per_connection(limits, flags, block, latch):
+    """The HTTP/2 parser's caps on what it holds (an HPACK table, header blocks
+    awaiting CONTINUATION) latch the connection off, and the seam counts it
+    like any other latch: one `parser_disabled:connection`, however many
+    reads follow."""
+    import test_span_class_survival as h
+    from wardex_sdk._interceptors._trackers import _Http2Tracker
+
+    client = h._FakeClient()
+    tracker = _Http2Tracker(_wardex_native.Limits(**limits))
+    seam = h._seam(client, tracker)
+    conn = SimpleNamespace(server_hostname="api.example", getpeername=lambda: ("203.0.113.10", 443))
+    seam._on_request_bytes(conn, h._h2_frame(0x1, 0x5, 1, b"\x82"))  # HEADERS, :method GET
+    for _ in range(3):
+        seam._on_response_bytes(conn, h._h2_frame(0x1, flags, 1, block))
+    assert tracker.disabled_reason() == latch
+    assert dict(_ledger.snapshot().counts) == {(DropReason.PARSER_DISABLED, DropUnit.CONNECTION): 1}
+    assert client.spans == []
+
+
 # -- (d) a definite failure, then a success ------------------------------------
 
 

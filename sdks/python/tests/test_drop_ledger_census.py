@@ -90,6 +90,12 @@ _SEAM = Pending("byte-seam capture loss")
 _MODE = Pending("default-mode refusal")
 _POLICY = Pending("policy exclusion, to be counted as not a loss")
 _MCP = Pending("MCP stdio capture loss")
+_MCP_PENDING_TABLE = Pending(
+    "MCP stdio requests evicted from the bounded pending table, meant for table_full:request"
+)
+_MCP_LINE_CAP = Pending(
+    "MCP stdio lines skipped unparsed past the size cap, meant for body_cap:message"
+)
 _USAGE = Pending("usage totals withheld")
 _UNITS = Pending("assembly-core unit tables and patches")
 _SIGNAL = Pending("signal-path shutdown tail")
@@ -97,6 +103,13 @@ _REQUEST_CAP = Pending("OTLP request-cap drop")
 _NATIVE = Pending("native extension missing: no batch, the drop report included, can be encoded")
 
 _GUARDED = Structural("the line said for a swallow guard() has already recorded")
+_VERSION_REFUSED = NotADrop(
+    "a peer's version that does not read as a revision is left off on purpose; the call ships"
+)
+_TOOL_CEDED = NotADrop(
+    "the call still ships as an MCP tools/call span with its tool; only the execute_tool name "
+    "is ceded to the installed adapter"
+)
 
 # -- the census ------------------------------------------------------------------
 
@@ -529,6 +542,9 @@ _CENSUS: dict[tuple[str, str, str], object] = {
     ("_assembly/_drops.py", "bump", "'interceptors.mcp_stdio.parser_disabled'"): L(
         "PARSER_DISABLED"
     ),
+    # Every latch a native parser sets on a connection is counted here, the
+    # HTTP/2 caps on the HPACK table and on header blocks awaiting CONTINUATION
+    # included: the seam asks the tracker for its latch reason, whatever it is.
     ("_assembly/_drops.py", "bump", "'interceptors.seam.parser_disabled'"): L("PARSER_DISABLED"),
     ("_assembly/_drops.py", "bump", "'worker.drain_raised'"): L("INTERNAL_SDK_ERROR"),
     ("_assembly/_drops.py", "bump", "counter"): L("SEND_ERROR"),
@@ -651,12 +667,45 @@ _CENSUS: dict[tuple[str, str, str], object] = {
     ("_tracing.py", "report_once", "'wardex.conversation.scope'"): _GUARDED,
     ("_tracing.py", "report_once", "'wardex.span.manual_fork'"): _GUARDED,
     ("_tracing.py", "report_once", "'wardex.span.manual_open'"): _GUARDED,
+    ("_tracing.py", "bump", "'tracing.block_scope_retired'"): NotADrop(
+        "a block taken down from another context; the consumer gets its own scope back"
+    ),
     # -- the byte seams and protocols
     ("_interceptors/_http1_requests.py", "bump", "'protocol.http1.request_unfinished'"): _SEAM,
     ("_interceptors/_http1_requests.py", "bump", "'protocol.http1.request_unobserved'"): _SEAM,
+    (
+        "_interceptors/_mcp_result.py",
+        "bump",
+        "'interceptors.mcp_stdio.protocol_version_unreadable'",
+    ): _VERSION_REFUSED,
+    (
+        "_interceptors/_mcp_result.py",
+        "report_once",
+        "'interceptors.mcp_stdio.protocol_version_unreadable'",
+    ): _VERSION_REFUSED,
     ("_interceptors/_mcp_stdio.py", "bump", "'interceptors.mcp_stdio.anyio_unavailable'"): _MCP,
+    ("_interceptors/_mcp_stdio.py", "bump", "'interceptors.mcp_stdio.execute_tool_ceded'"): (
+        _TOOL_CEDED
+    ),
+    ("_interceptors/_mcp_stdio.py", "bump", "'interceptors.mcp_stdio.line_over_cap'"): (
+        _MCP_LINE_CAP
+    ),
+    ("_interceptors/_mcp_stdio.py", "bump", "'interceptors.mcp_stdio.pending_evicted'"): (
+        _MCP_PENDING_TABLE
+    ),
     ("_interceptors/_mcp_stdio.py", "bump", "'interceptors.mcp_stdio.stranded_requests'"): _MCP,
+    (
+        "_interceptors/_mcp_stdio.py",
+        "report_once",
+        "'interceptors.mcp_stdio.execute_tool_ceded'",
+    ): _TOOL_CEDED,
+    ("_interceptors/_mcp_stdio.py", "report_once", "'interceptors.mcp_stdio.line_over_cap'"): (
+        _MCP_LINE_CAP
+    ),
     ("_interceptors/_mcp_stdio.py", "report_once", "'interceptors.mcp_stdio.no_anyio'"): _MCP,
+    ("_interceptors/_mcp_stdio.py", "report_once", "'interceptors.mcp_stdio.pending_evicted'"): (
+        _MCP_PENDING_TABLE
+    ),
     ("_interceptors/_seam.py", "bump", "'interceptors.seam.path_excluded'"): _POLICY,
     ("_interceptors/_seam.py", "bump", "'interceptors.seam.peer_unresolved'"): Marker(
         "PEER_UNRESOLVED", at="_interceptors/_seam.py"
@@ -673,6 +722,8 @@ _CENSUS: dict[tuple[str, str, str], object] = {
     ("_interceptors/_seam.py", "bump", "'interceptors.seam.ws_llm_semantics_unread'"): Marker(
         "WS_LLM_SEMANTICS_UNREAD", at="_interceptors/_trackers.py"
     ),
+    # An HTTP/2 body past its cap bumps nothing: the span ships with
+    # `Limitation.BODY_CAP_EXCEEDED`, and the limitation census holds that site.
     ("_interceptors/_trackers.py", "bump", "'protocol.http2.evicted_parent_forgotten'"): _SEAM,
     ("_interceptors/_trackers.py", "bump", "'protocol.http2.request_unobserved'"): _SEAM,
     ("_interceptors/_trackers.py", "bump", "'protocol.http2.stream_evicted'"): Marker(
