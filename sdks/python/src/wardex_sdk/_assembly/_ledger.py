@@ -124,6 +124,11 @@ _INT32_MAX = 2**31 - 1
 #: How many reports of unknown fate are held for resending.
 _UNACKED_CAP = 8
 
+#: How many failed envelopes `unsent` remembers past a drain that never
+#: reached its last settle (one that raised a `BaseException`, or a transport
+#: exported by hand). Each is a whole batch, so the memory is kept short.
+_UNSENT_CAP = 4
+
 #: The least time between two ledger-only envelopes.
 SOLO_INTERVAL_S = 30.0
 
@@ -175,10 +180,10 @@ _SETTLED: deque[tuple[ClientReport, bool | None]] = deque()
 #: again would count it twice. An entry leaves only when its own drain settles
 #: it, never because another drain began.
 _OUT: dict[int, tuple[ClientReport, bool]] = {}
-#: The last envelope `unsent` settled, held by identity so its id cannot be
-#: reused while it is compared. Cleared by the next `attach`: every settle of
-#: one batch happens inside the drain that sent it.
-_last_unsent: list[object] = [None]
+#: The envelopes `unsent` settled whose drain has not finished with them, by
+#: identity (held, so an id cannot be reused while it is compared). The drain's
+#: last settle forgets its envelope: `done`, or `unsent(last=True)`.
+_UNSENT: dict[int, object] = {}
 _last_timestamp = 0
 _last_solo: float | None = None
 _started = _monotonic()
@@ -318,11 +323,22 @@ def attach(envelope: Envelope, transport: object, queue_depth: int) -> Envelope:
 
     The drain that calls this settles every report it got: `unsent` when the
     POST failed, `done` when it finished. Reports another drain still has out
-    are not touched here."""
+    are not touched here.
+
+    `before_send_envelope` ran first and may have handed back anything. What
+    is read of it is read before the cut, so nothing past the cut can raise and
+    take the cut counts with it. Its `client_reports` as a list, as `list(...)`
+    makes them, is read as the tuple it was; as anything else but a tuple,
+    nothing is added and the counts ride the next envelope."""
     global _last_solo
-    _last_unsent[0] = None  # a new batch: the last one's settles are over
     if type(envelope) is not Envelope or not carries(transport):
         return envelope
+    held = envelope.client_reports
+    if type(held) is list:
+        held = tuple(held)
+    if type(held) is not tuple:
+        return envelope
+    alone = not envelope.spans and not envelope.state_snapshots
     if not _claim():
         return envelope
     try:
@@ -338,12 +354,12 @@ def attach(envelope: Envelope, transport: object, queue_depth: int) -> Envelope:
         _release()
     if not reports:
         return envelope
-    if not envelope.spans and not envelope.state_snapshots:
+    if alone:
         _last_solo = _monotonic()  # a ledger-only envelope is going out: the interval starts
-    return replace(envelope, client_reports=envelope.client_reports + tuple(reports))
+    return replace(envelope, client_reports=held + tuple(reports))
 
 
-def unsent(envelope: Envelope, *, definite: bool) -> bool:
+def unsent(envelope: Envelope, *, definite: bool, last: bool = False) -> bool:
     """The POST carrying `envelope` failed. `definite`: the receiver certainly
     did not store it, so its fresh counts go back into the pending table;
     otherwise every report it carried is held and sent again unchanged.
@@ -351,10 +367,18 @@ def unsent(envelope: Envelope, *, definite: bool) -> bool:
     Returns whether this is news. False, changing nothing, when this same
     envelope was already settled -- a transport subclass that raised after its
     own `export` settled the batch -- so the caller does not count the batch's
-    items twice. Every caller that accounts a failed batch asks this first."""
-    if envelope is _last_unsent[0]:
+    items twice. Every caller that accounts a failed batch asks this first.
+    `last`: no settle of this envelope follows (the drain's raise path), so it
+    is not remembered past the answer."""
+    key = id(envelope)
+    if _UNSENT.get(key) is envelope:
+        if last:
+            _UNSENT.pop(key, None)
         return False
-    _last_unsent[0] = envelope
+    if not last:
+        _UNSENT[key] = envelope
+        for stale in list(_UNSENT)[: max(0, len(_UNSENT) - _UNSENT_CAP)]:
+            _UNSENT.pop(stale, None)
     for report in _out_in(envelope):
         _SETTLED.append((report, definite))
     _try_fold()
@@ -365,7 +389,8 @@ def done(envelope: Envelope) -> None:
     """The drain that sent `envelope` is finished with it, and nothing it
     still holds out failed: those reports were delivered. Queued behind any
     `unsent` for the same envelope, so a failure the transport settled first
-    stands."""
+    stands. The envelope is forgotten here: its drain settles it no more."""
+    _UNSENT.pop(id(envelope), None)
     reports = _out_in(envelope)
     for report in reports:
         _SETTLED.append((report, None))
@@ -534,7 +559,7 @@ def _at_fork_reinit() -> None:
     _UNACKED.clear()
     _SETTLED.clear()
     _OUT.clear()
-    _last_unsent[0] = None
+    _UNSENT.clear()
     _failed_sends = 0
     _last_timestamp = 0
     _last_solo = None

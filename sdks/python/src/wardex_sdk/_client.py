@@ -1092,7 +1092,7 @@ class Client:
                 )
                 shipped = self._export(envelope, deadline, named)
             except Exception as exc:  # fail-closed: drop, never ship half-filtered data
-                news = ledger.unsent(envelope, definite=False)  # reports may have gone: resend
+                news = ledger.unsent(envelope, definite=False, last=True)  # may have gone: resend
                 # Also not routed into `_undelivered`, deliberately. A raise means an attempt
                 # of unknown outcome -- the transport may have sent half of it -- so
                 # re-queueing risks a duplicate. (The hook's own raise is handled above, where

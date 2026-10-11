@@ -18,7 +18,8 @@ cases are the contract:
   * a fork child's first report carries none of the parent's counts;
   * a drain never waits for the ledger, and neither does a signal's flush;
   * a process dying on a signal ships the counts it holds, or says them;
-  * one failed batch is accounted once, however its transport raised.
+  * one failed batch is accounted once, however its transport raised, and
+    is not kept once its drain is over.
 
 The rest pins the ledger's own rules: never raising, never reduced by sending,
 the bound on unconfirmed reports, the int32 carry, and the one line `close()`
@@ -434,6 +435,72 @@ def test_a_transport_that_raises_after_settling_its_failure_is_counted_once(rece
     assert sum(r["failed_sends"] for r in accepted) == 1
 
 
+def test_a_batch_settled_before_a_drain_run_inside_it_is_still_counted_once(receiver):
+    """The same transport, with a signal's flush landing between the base
+    export's settle and the raise: the drain that flush runs finishes first,
+    and that must not make the outer batch's settle news a second time."""
+
+    class _RaisesAfterAnInnerDrain(WardexTransport):
+        client: Client
+
+        def export(self, envelope, *, timeout=None):  # noqa: ANN001, ANN202
+            result = super().export(envelope, timeout=timeout)
+            if [s.name for s in envelope.spans] == ["outer"]:
+                self.client.capture_span(_span("inner"))
+                self.client._shutdown_flush(2.0)  # what the handler runs, on this thread
+                raise RuntimeError("raised after the send was settled")
+            return result
+
+    receiver.script = [("status", 500), ("status", 202)]
+    transport = _RaisesAfterAnInnerDrain(receiver.url, KEY)
+    client = transport.client = Client(WardexConfig(debug=False), transport)
+    client._worker.stop()
+    client.capture_span(_span("outer"))
+    client.flush(5.0)
+    client.close(1.0)
+    assert _ledger.undelivered() == {}
+    accepted = [r for status, d in receiver.decoded() if status == 202 for r in _reports(d)]
+    assert _events(accepted) == {"send_error:span": 1}
+
+
+def test_the_failed_envelopes_remembered_are_bounded():
+    """A drain that never reached its last settle (one a `BaseException` cut
+    short, or a transport exported by hand) leaves its envelope remembered.
+    Past `_UNSENT_CAP` the oldest go, and none goes before that."""
+    envelopes = [_envelope() for _ in range(_ledger._UNSENT_CAP + 2)]
+    for i, envelope in enumerate(envelopes, 1):
+        assert _ledger.unsent(envelope, definite=True)
+        assert len(_ledger._UNSENT) == min(i, _ledger._UNSENT_CAP)
+    kept = [id(e) for e in envelopes[-_ledger._UNSENT_CAP :]]
+    assert [id(e) for e in _ledger._UNSENT.values()] == kept
+    assert not _ledger.unsent(envelopes[-1], definite=True)
+
+
+@pytest.mark.parametrize("how", ["refused", "raised", "otlp_refused"])
+def test_a_failed_batch_is_not_kept_once_its_drain_is_over(receiver, how):
+    """The ledger remembers a failed envelope only while its drain may settle
+    it again. An idle flush that never reaches `attach` -- every flush of the
+    OTLP transport, which carries no report -- must not keep the batch's
+    spans alive, nor must close()."""
+    from wardex_sdk.transport import OtlpHttpTransport
+
+    receiver.script = [("status", 500)]
+    transport = {
+        "refused": lambda: WardexTransport(receiver.url, KEY),
+        "raised": lambda: _Raising(receiver.url, KEY),
+        "otlp_refused": lambda: OtlpHttpTransport(receiver.url + "/v1/traces"),
+    }[how]()
+    client = Client(WardexConfig(debug=False), transport)
+    client._worker.stop()
+    for _ in range(3):
+        client.capture_span(_span())
+    client.flush(5.0)
+    assert _ledger._UNSENT == {}
+    client.flush(5.0)
+    client.close(1.0)
+    assert _ledger._UNSENT == {}
+
+
 @pytest.mark.parametrize("definite", [True, False], ids=["refused", "unanswered"])
 def test_a_drain_begun_inside_another_leaves_the_outer_report_to_it(definite):
     """A signal handler's flush runs a drain on the thread whose own drain is
@@ -537,6 +604,44 @@ def test_a_hook_that_hands_back_any_report_never_makes_a_settle_raise(junk):
     client.flush(5.0)  # refused: the settle is the transport's, and then `done`
     client.close(1.0)
     assert _ledger.undelivered()[(DropReason.QUEUE_OVERFLOW, DropUnit.SPAN)] == 1
+
+
+def test_a_hook_that_hands_back_a_list_of_reports_still_ships_the_ledgers(receiver):
+    """A hook may rebuild the envelope with its reports as a list, as
+    `list(...)` makes them. They are read as the tuple they were, before the
+    counts are cut: every batch ships with its report, rather than the add
+    raising after the cut and taking the batch and the counts with it."""
+
+    def hook(envelope: Envelope) -> Envelope:
+        return replace(envelope, client_reports=list(envelope.client_reports))
+
+    config = WardexConfig(
+        limits=LimitsConfig(max_buffer_spans=1), debug=False, before_send_envelope=hook
+    )
+    client = Client(config, WardexTransport(receiver.url, KEY))
+    client._worker.stop()
+    for name in ("a", "b"):
+        _ledger.record(DropReason.TABLE_FULL)
+        client.capture_span(_span(name))
+        client.flush(5.0)
+    client.close(1.0)
+    posts = receiver.decoded()
+    assert [(status, _span_names(d)) for status, d in posts] == [(202, ["a"]), (202, ["b"])]
+    assert _events([r for _, d in posts for r in _reports(d)]) == {"table_full:entry": 2}
+    assert counters.get("client.drain.span_dropped.export_raised") == 0
+    assert _ledger._OUT == {} and _ledger.undelivered() == {}
+
+
+def test_reports_a_hook_left_unreadable_are_not_cut_for_that_envelope():
+    """Anything else in their place is not read: the envelope goes as the hook
+    left it, and the counts wait for the next one."""
+    transport = WardexTransport(CLOSED, KEY)
+    _ledger.record(DropReason.TABLE_FULL, 2)
+    odd = replace(_envelope(), client_reports=object())  # type: ignore[arg-type]
+    assert _ledger.attach(odd, transport, 0) is odd
+    assert _ledger._OUT == {}
+    [report] = _ledger.attach(_envelope(), transport, 0).client_reports
+    assert report.discarded_events == (("table_full:entry", 2),)
 
 
 def test_counts_still_in_the_inbox_are_said_while_another_frame_folds():
