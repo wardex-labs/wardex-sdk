@@ -219,8 +219,9 @@ class _ProcState:
 
     def _count_lines_over_cap(self) -> None:
         """Make the native parsers' skipped over-cap lines visible: one count per line, one line
-        per process. A line is never parsed past `max_stream_buffer_bytes`, so the message it held
-        — a request, or the response that would have completed a call — is lost whole."""
+        per process. A line is never parsed past `max_stream_buffer_bytes`, so if it held a
+        JSON-RPC message — a request, or the response that would have completed a call — that
+        message is lost whole. Unparsed, it cannot be told from a long line of anything else."""
         seen = self._req.lines_over_cap() + self._resp.lines_over_cap()
         if seen <= self._lines_over_cap:
             return
@@ -228,8 +229,9 @@ class _ProcState:
             counters.bump("interceptors.mcp_stdio.line_over_cap")
         self._lines_over_cap = seen
         report_once(
-            "an MCP message longer than max_stream_buffer_bytes was skipped unparsed, so the call "
-            "it belonged to is not captured. Counted under interceptors.mcp_stdio.line_over_cap.",
+            "a line on an MCP subprocess's pipe was longer than max_stream_buffer_bytes and was "
+            "skipped unparsed; if it was a JSON-RPC message, its call is not captured. Counted "
+            "under interceptors.mcp_stdio.line_over_cap.",
             key="interceptors.mcp_stdio.line_over_cap",
         )
 
