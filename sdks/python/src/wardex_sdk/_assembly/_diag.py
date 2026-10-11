@@ -84,16 +84,28 @@ class Counters:
         self._folding = False
 
     def bump(self, where: str) -> None:
+        """Count one at `where`. The fold is `_fold` written out, calling no
+        Python function: `guard.__exit__` bumps here at whatever depth the
+        swallowed error left, and a frame pushed on every `_FOLD_AT`th bump
+        would let a `RecursionError` escape the guard on that bump only."""
         self._inbox.append(where)
         if len(self._inbox) >= _FOLD_AT and self._lock.acquire(blocking=False):
             try:
-                self._fold()
+                if not self._folding:
+                    self._folding = True
+                    try:
+                        while self._inbox:
+                            where = self._inbox.popleft()
+                            self._counts[where] = self._counts.get(where, 0) + 1
+                    finally:
+                        self._folding = False
             finally:
                 self._lock.release()
 
     def _fold(self) -> None:
         """Move the inbox into the table. The lock is held; a fold this one
-        interrupted on the same thread is left to finish the job."""
+        interrupted on the same thread is left to finish the job. `bump`
+        carries a copy of this loop, and a test holds the two the same."""
         if self._folding:
             return
         self._folding = True

@@ -25,10 +25,13 @@ prints when the final send fails.
 
 from __future__ import annotations
 
+import ast
+import inspect
 import os
 import signal
 import subprocess
 import sys
+import textwrap
 import threading
 import time
 from collections.abc import Iterator
@@ -41,7 +44,7 @@ from test_batching_integration import posix_signals  # the suite's signal marker
 from test_fork_semantics import fork_only  # the suite's POSIX-only marker, shared
 from wardex_sdk import _hub, _wardex_native
 from wardex_sdk._assembly import _ledger, counters, guard, lose
-from wardex_sdk._assembly._diag import reset_reports_for_test
+from wardex_sdk._assembly._diag import Counters, reset_reports_for_test
 from wardex_sdk._assembly._ledger import REASONS, DropReason, DropUnit
 from wardex_sdk._client import Client
 from wardex_sdk._config import BackendConfig, WardexConfig
@@ -830,6 +833,67 @@ def test_a_counter_bump_is_never_lost_to_a_held_lock():
         counters._lock.release()
         t.join(5.0)
     assert counters.get("test.ledger.k") == 200
+
+
+def test_each_written_out_fold_is_the_loop_it_copies():
+    """`record` and `Counters.bump` fold without calling the loop they copy (so
+    that `guard.__exit__` pushes no frame for it); the copies are held to the
+    originals here, statement for statement."""
+
+    def loops(fn: object) -> list[str]:
+        tree = ast.parse(textwrap.dedent(inspect.getsource(fn)))  # type: ignore[arg-type]
+        return [ast.dump(node) for node in ast.walk(tree) if isinstance(node, ast.While)]
+
+    assert loops(_ledger.record) == loops(_ledger._fold_inbox_held) != []
+    assert loops(Counters.bump) == loops(Counters._fold) != []
+
+
+def test_a_guard_swallows_at_the_recursion_limit_however_full_the_inboxes_are():
+    """`guard.__exit__` runs at whatever depth the swallowed error left, and its
+    bookkeeping folds an inbox on every `_FOLD_AT`th call. A fold that pushed a
+    frame let a `RecursionError` escape into the host on that call only. Swept
+    across the limit, the guard does the same at every depth whether both
+    inboxes are empty or one short of a fold."""
+
+    def deeper(n: int) -> None:
+        return deeper(n - 1) if n else None
+
+    def guarded() -> None:
+        with guard("test.ledger.recursion"):
+            deeper(3)
+
+    def descend(k: int) -> None:
+        return guarded() if k == 0 else descend(k - 1)
+
+    def outcome(k: int, fill: int) -> str:
+        _ledger._reset_for_tests()
+        counters.reset()
+        for _ in range(fill):
+            _ledger.record(DropReason.TABLE_FULL)
+            counters.bump("test.ledger.fill")
+        try:
+            descend(k)
+        except RecursionError:
+            return "escaped"
+        return "swallowed" if counters.get("test.ledger.recursion") else "untouched"
+
+    depth, frame = 0, sys._getframe()
+    while frame is not None:
+        depth, frame = depth + 1, frame.f_back
+    limit = sys.getrecursionlimit()
+    sys.setrecursionlimit(depth + 100)
+    try:
+        seen = {k: (outcome(k, 0), outcome(k, _ledger._FOLD_AT - 1)) for k in range(100)}
+    finally:
+        sys.setrecursionlimit(limit)
+    outcomes = {empty for empty, _ in seen.values()}
+    assert "escaped" in outcomes, "the sweep did not reach the limit"
+    if sys.version_info >= (3, 12):
+        # Before 3.12 C calls count against the limit as well. On 3.10 that has
+        # the guard's own bookkeeping meet it first at every depth, so no
+        # swallow happens on either side and the sweep can only show they agree.
+        assert "swallowed" in outcomes, seen
+    assert {k: pair for k, pair in seen.items() if pair[0] != pair[1]} == {}
 
 
 def test_close_says_what_its_final_send_could_not_deliver(capsys):

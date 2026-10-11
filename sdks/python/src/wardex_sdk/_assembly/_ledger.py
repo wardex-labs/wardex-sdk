@@ -20,10 +20,11 @@ records it also folds the inbox into the tables, with a lock taken only by
 `acquire(blocking=False)`. It is therefore safe to call under the client's
 buffer lock, inside the export slot, from a signal handler that interrupted
 either, and from a finalizer: none of them can make it wait, so none of them
-can deadlock on it. It also calls no Python function on its common path, which
+can deadlock on it. It also calls no Python function, the fold included, which
 matters in `guard.__exit__` at the recursion limit: a swallowed `RecursionError`
 leaves only the frames it unwound, and the counter bump beside it already needs
-one.
+one. A fold that pushed a frame would let that error escape the guard on one
+swallow in `_FOLD_AT`, chosen by how full the inbox happened to be.
 Every reader folds before it reads, so a record waiting in the inbox is never
 missed. The read for the wire (`attach`) never waits either: a drain that
 cannot take the fold ships its envelope without a report, and the counts ride
@@ -188,13 +189,35 @@ def record(
 
     `unit` defaults to the reason's own (`REASONS[reason].unit`). `where` is a
     low-cardinality call-site label kept in the local view only.
+
+    The fold below is `_fold_inbox_held` written out: a call would push the
+    frame the module docstring says this path may not push.
     """
+    global _folding, _failed_sends
     member = _REASON_OF.get(reason)
     if member is None or n <= 0:
         return
     _INBOX.append((member, _DEFAULT_UNIT[member] if unit is None else unit, n, where))
-    if len(_INBOX) >= _FOLD_AT:
-        _try_fold()
+    if len(_INBOX) < _FOLD_AT or not _FOLD.acquire(blocking=False):
+        return
+    try:
+        if not _folding:
+            _folding = True
+            try:
+                while _INBOX:
+                    r, u, k, w = _INBOX.popleft()
+                    if r is None or u is None:
+                        _failed_sends += k
+                        continue
+                    _TOTALS[r, u] = _TOTALS.get((r, u), 0) + k
+                    _PENDING[r, u] = _PENDING.get((r, u), 0) + k
+                    if w is not None:
+                        w = w if (r, w) in _WHERE or len(_WHERE) < _WHERE_CAP else "<other>"
+                        _WHERE[r, w] = _WHERE.get((r, w), 0) + k
+            finally:
+                _folding = False
+    finally:
+        _FOLD.release()
 
 
 def record_items(
@@ -352,19 +375,26 @@ def _add(table: dict, key: object, n: int) -> None:
     table[key] = table.get(key, 0) + n
 
 
+def _fold_inbox_held() -> None:
+    """Move the inbox into the tables. Fold held. `record` carries a copy of
+    this loop, word for word, and a test holds the two the same."""
+    global _failed_sends
+    while _INBOX:
+        r, u, k, w = _INBOX.popleft()
+        if r is None or u is None:
+            _failed_sends += k
+            continue
+        _TOTALS[r, u] = _TOTALS.get((r, u), 0) + k
+        _PENDING[r, u] = _PENDING.get((r, u), 0) + k
+        if w is not None:
+            w = w if (r, w) in _WHERE or len(_WHERE) < _WHERE_CAP else "<other>"
+            _WHERE[r, w] = _WHERE.get((r, w), 0) + k
+
+
 def _fold_held() -> None:
     """Move the inbox and the settled reports into the tables. Fold held."""
     global _failed_sends
-    while _INBOX:
-        reason, unit, n, where = _INBOX.popleft()
-        if reason is None or unit is None:
-            _failed_sends += n
-            continue
-        _add(_TOTALS, (reason, unit), n)
-        _add(_PENDING, (reason, unit), n)
-        if where is not None:
-            label = where if (reason, where) in _WHERE or len(_WHERE) < _WHERE_CAP else "<other>"
-            _add(_WHERE, (reason, label), n)
+    _fold_inbox_held()
     while _SETTLED:
         report, definite = _SETTLED.popleft()
         fresh = _OUT.pop(report.timestamp_ns, None)
