@@ -17,7 +17,9 @@ official SDK writes stdin from a task the session's opener started, not from the
 No per-call test can tell the two apart, so the rule is per process: while one of those
 adapters is installed, this seam leaves the call a transport span (`MCP tools/call`, no
 operation name) and the framework's span is the one counted. Everything else about the
-span — the tool, its arguments, its result — is the same either way.
+span — the tool, its arguments, its result — is the same either way. Declining is said
+once per process, naming the adapter: a tool call a raw `mcp` client makes in that process
+is then counted as `execute_tool` nowhere, and leaving the adapter out is how to change it.
 
 The name is wardex's `execute_tool {tool}`, the one every other tool span carries and the
 GenAI conventions give it, not the MCP conventions' `tools/call {tool}`: the same call then
@@ -75,7 +77,14 @@ from .._types import (
 )
 from ._base import InterceptorInterface
 from ._issue_scope import UNKNOWN_ISSUER, ScopeSnapshot, issued_scope
-from ._mcp_result import read_tool_result
+from ._mcp_result import (
+    json_object,
+    negotiated_version,
+    read_tool_result,
+    readable_version,
+    refuse_version,
+    span_tool_name,
+)
 
 # OPTIONAL, and it has to be: anyio is a third-party package, this wheel
 # declares no runtime dependencies, and `_backends._asyncio` is anyio's PRIVATE
@@ -256,7 +265,14 @@ class _ProcState:
             if pending is None:
                 continue
             if pending.method == "initialize" and m.result is not None:
-                self._protocol_version = _negotiated_version(m.result) or self._protocol_version
+                self._protocol_version = negotiated_version(m.result) or self._protocol_version
+            owners = (
+                _hub.installed_adapters() & _TOOL_SPAN_OWNERS
+                if pending.method == "tools/call"
+                else frozenset()
+            )
+            if owners:
+                _report_ceded(owners)
             # The gate this path never had. `agent_semantic=True` is the claim
             # the site makes about itself and it is the whole reason MCP stdio
             # survives `capture_mode=AGENT`: a JSON-RPC tool call over a
@@ -281,8 +297,7 @@ class _ProcState:
                     pending,
                     m,
                     protocol_version=self._protocol_version,
-                    promote=pending.method == "tools/call"
-                    and not (_hub.installed_adapters() & _TOOL_SPAN_OWNERS),
+                    promote=pending.method == "tools/call" and not owners,
                 )
             if span is not None:
                 out.append((span, pending.scope))
@@ -357,11 +372,14 @@ def _build_mcp_span(
     # deleting the span.
     error_type: str | None = _json_rpc_error_type(resp.error) if resp.error is not None else None
     uninterpreted = False
-    params = _json_object(params_bytes)
+    params = json_object(params_bytes)
     meta = params.get("_meta") if params is not None else None
-    stamped = meta.get(_VERSION_META_KEY) if isinstance(meta, dict) else None
-    if isinstance(stamped, str) and stamped:
-        protocol_version = stamped
+    if isinstance(meta, dict) and _VERSION_META_KEY in meta:
+        # The request names its own revision, so it is the only claim for this span: one that does
+        # not read as a revision is refused, not replaced by the negotiated one.
+        protocol_version = readable_version(meta[_VERSION_META_KEY])
+        if protocol_version is None:
+            refuse_version()
 
     if method == "tools/call":
         with guard("interceptors.mcp_stdio.tool_params"):
@@ -385,11 +403,12 @@ def _build_mcp_span(
             output_data, status, error_type = read.output, read.status, read.error_type
             uninterpreted = read.uninterpreted
 
-    if promote and tool is not None:
+    span_name = span_tool_name(params.get("name")) if params is not None else None
+    if promote and tool is not None and span_name is not None:
         draft = SpanDraft(
             parentage,
             intent=SpanIntent.EXECUTE_TOOL,
-            subject=tool.name,
+            subject=span_name,
             source=CaptureSource.STDIO,
             start_ns=p.start_ns,
             kind=SpanKind.CLIENT,
@@ -429,25 +448,19 @@ def _build_mcp_span(
     return draft.finish(now)
 
 
-def _json_object(data: bytes | None) -> dict[str, Any] | None:
-    """`data` parsed as a JSON object, or None for anything else (absent, not an object).
-
-    The bytes are the native parser's compact re-encoding, never the pipe's, so a decode failure
-    is wardex's own: counted by `guard`, and the span still ships, unread.
-    """
-    if not data:
-        return None
-    parsed = None
-    with guard("interceptors.mcp_stdio.json_object"):
-        parsed = json.loads(data)
-    return parsed if isinstance(parsed, dict) else None
-
-
-def _negotiated_version(result: bytes) -> str | None:
-    """The `protocolVersion` an `initialize` result settled on, or None."""
-    parsed = _json_object(result)
-    version = parsed.get("protocolVersion") if parsed is not None else None
-    return version if isinstance(version, str) and version else None
+def _report_ceded(owners: frozenset[str]) -> None:
+    """A `tools/call` stays a transport span because an installed adapter owns tool spans."""
+    counters.bump("interceptors.mcp_stdio.execute_tool_ceded")
+    names = ", ".join(sorted(owners))
+    report_once(
+        f"MCP tool calls are recorded as `MCP tools/call` spans, not `execute_tool`, while the "
+        f"{names} adapter(s) are installed, because those record a call made through their "
+        "framework as their own execute_tool span. A raw `mcp` client's tool calls in this process "
+        "are therefore not counted as execute_tool; leave the adapter(s) out with "
+        "AdaptersConfig(enabled=...) to have them counted. Counted under "
+        "interceptors.mcp_stdio.execute_tool_ceded.",
+        key="interceptors.mcp_stdio.execute_tool_ceded",
+    )
 
 
 def _json_rpc_error_type(error: bytes | None) -> str:
