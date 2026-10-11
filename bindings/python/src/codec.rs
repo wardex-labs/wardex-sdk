@@ -17,7 +17,7 @@
 #![allow(clippy::useless_conversion)]
 
 use pyo3::prelude::*;
-use pyo3::types::{PyBool, PyBytes, PyDict, PyInt, PyList};
+use pyo3::types::{PyBool, PyBytes, PyDict, PyFloat, PyInt, PyList, PyString};
 
 use wardex_core::codec::otlp::{self, otlp_pb};
 use wardex_core::codec::proto::wardex::v1 as pb;
@@ -74,21 +74,23 @@ fn tolerated<T>(py: Python<'_>, r: PyResult<T>) -> PyResult<Option<T>> {
 /// A host's attribute value → proto AnyValue, never by raising.
 ///
 /// `Span.set_attribute` promises `str | int | float | bool`, and validates
-/// nothing, so this reads what arrives in that order (a bool is an int, so it
-/// goes first) and refuses to bend a value into a type it is not. An integer
-/// outside `int64` used to fall through to the `float` read and ship as
-/// `1.18e+21` — a different number, under the type of a measurement, with
-/// nothing on the span to say so; it now ships as its exact decimal digits,
-/// named. A value no read takes (`10**400` once past every numeric read
-/// before this, `object()`, a `str` holding a lone surrogate) used to raise
-/// here, and on the export path that raise cost the WHOLE batch: the client's
-/// drain is fail-closed and silent off-debug. It is now left out, named, and
-/// the span and its batch ship.
+/// nothing, so this reads each value as the type it IS, and refuses to bend it
+/// into one it is not. An integer outside `int64` used to fall through to the
+/// `float` read and ship as `1.18e+21` — a different number, under the type of
+/// a measurement, with nothing on the span to say so; it now ships as its
+/// exact decimal digits, named. A value no read takes (`object()`, `bytes`, a
+/// `str` holding a lone surrogate) used to raise here, and on the export path
+/// that raise cost the WHOLE batch: the client's drain is fail-closed and
+/// silent off-debug. It is now left out, named, and the span and its batch
+/// ship.
 ///
-/// The digits come from `int.__repr__` rather than from the value's own
-/// `__str__`, which an `int` subclass may override. A value too long for
-/// Python's integer-to-string limit (`sys.get_int_max_str_digits()`, 4300 by
-/// default) cannot be written that way and is the unreadable kind.
+/// The order is the point. A `bool` is an `int`, so it goes first; the three
+/// other promised types are read as themselves; then an integer that is not
+/// an `int` (numpy's, or anything with `__index__`) is read EXACTLY, through
+/// `operator.index`, before the `float` read gets a chance at it — `float()`
+/// falls back to `__index__` as well, and would round `np.uint64(2**64 - 1)`
+/// to `1.8446744073709552e+19` without a word. Whatever is left (a `Decimal`,
+/// a `Fraction`) is what `float()` makes of it.
 fn any_value(v: &Bound<PyAny>) -> PyResult<HostValue> {
     use pb::any_value::Value;
     let py = v.py();
@@ -99,33 +101,86 @@ fn any_value(v: &Bound<PyAny>) -> PyResult<HostValue> {
             None => HostValue::Unreadable,
         });
     }
-    // Before the `int` check: an integer type that is not an `int` subclass
-    // (numpy's) still reads through `__index__` here.
-    if let Some(i) = tolerated(py, v.extract::<i64>())? {
-        return Ok(kept(Value::IntValue(i)));
-    }
-    if v.is_instance_of::<PyInt>() {
-        let digits = tolerated(
-            py,
-            py.get_type_bound::<PyInt>()
-                .getattr("__repr__")
-                .and_then(|repr| repr.call1((v,)))
-                .and_then(|s| s.extract::<String>()),
-        )?;
-        return Ok(match digits {
-            Some(d) => HostValue::Digits(pb::AnyValue {
-                value: Some(Value::StringValue(d)),
-            }),
+    if v.is_instance_of::<PyString>() {
+        return Ok(match tolerated(py, v.extract::<String>())? {
+            Some(s) => kept(Value::StringValue(s)),
             None => HostValue::Unreadable,
         });
     }
-    if let Some(f) = tolerated(py, v.extract::<f64>())? {
-        return Ok(kept(Value::DoubleValue(f)));
+    if v.is_instance_of::<PyInt>() {
+        return int_value(v);
     }
-    Ok(match tolerated(py, v.extract::<String>())? {
-        Some(s) => kept(Value::StringValue(s)),
+    if v.is_instance_of::<PyFloat>() {
+        return Ok(match tolerated(py, v.extract::<f64>())? {
+            Some(f) => kept(Value::DoubleValue(f)),
+            None => HostValue::Unreadable,
+        });
+    }
+    if is_numpy_bool(v)? {
+        return Ok(match tolerated(py, v.is_truthy())? {
+            Some(b) => kept(Value::BoolValue(b)),
+            None => HostValue::Unreadable,
+        });
+    }
+    let index = py
+        .import_bound("operator")
+        .and_then(|operator| operator.getattr("index"))
+        .and_then(|index| index.call1((v,)));
+    if let Some(n) = tolerated(py, index)? {
+        return int_value(&n);
+    }
+    Ok(match tolerated(py, v.extract::<f64>())? {
+        Some(f) => kept(Value::DoubleValue(f)),
         None => HostValue::Unreadable,
     })
+}
+
+/// A Python `int` → an `IntValue` when it fits `int64`, else its decimal
+/// digits, named.
+///
+/// The digits come from `int.__repr__` rather than from the value's own
+/// `__str__`, which an `int` subclass may override. A value too long for
+/// Python's integer-to-string limit (`sys.get_int_max_str_digits()`, 4300 by
+/// default) cannot be written that way and is the unreadable kind.
+fn int_value(n: &Bound<PyAny>) -> PyResult<HostValue> {
+    use pb::any_value::Value;
+    let py = n.py();
+    if let Some(i) = tolerated(py, n.extract::<i64>())? {
+        return Ok(HostValue::Kept(pb::AnyValue {
+            value: Some(Value::IntValue(i)),
+        }));
+    }
+    let digits = tolerated(
+        py,
+        py.get_type_bound::<PyInt>()
+            .getattr("__repr__")
+            .and_then(|repr| repr.call1((n,)))
+            .and_then(|s| s.extract::<String>()),
+    )?;
+    Ok(match digits {
+        Some(d) => HostValue::Digits(pb::AnyValue {
+            value: Some(Value::StringValue(d)),
+        }),
+        None => HostValue::Unreadable,
+    })
+}
+
+/// Whether `v` is a `numpy.bool_`: neither an `int` nor, since numpy 2, an
+/// `__index__`, so without this it would ship as the `float()` of itself,
+/// `1.0`. Looked up in `sys.modules` rather than imported: if numpy is not
+/// loaded, nothing can be one of its bools, and an encoder must not be what
+/// imports it.
+fn is_numpy_bool(v: &Bound<PyAny>) -> PyResult<bool> {
+    let py = v.py();
+    let numpy_bool = py
+        .import_bound("sys")
+        .and_then(|sys| sys.getattr("modules"))
+        .and_then(|modules| modules.get_item("numpy"))
+        .and_then(|numpy| numpy.getattr("bool_"));
+    let Some(numpy_bool) = tolerated(py, numpy_bool)? else {
+        return Ok(false);
+    };
+    Ok(tolerated(py, v.is_instance(&numpy_bool))?.unwrap_or(false))
 }
 
 fn kv_str(key: &str, v: String) -> pb::KeyValue {
@@ -189,16 +244,40 @@ fn kv_strs(key: &str, vs: Vec<String>) -> pb::KeyValue {
     }
 }
 
+/// What names an attribute whose KEY is not a `str` (`set_attribute(123, v)`)
+/// in the `UNMARSHALLED_FIELD_KEY` note. Fixed text, because the key is the
+/// host's object: spelling it would run its `__str__`, and a key that is
+/// neither text nor anything the wire can name has no honest spelling.
+const NON_STR_KEY: &str = "<non-str key>";
+
+/// What names an attribute whose key is a `str` the wire cannot encode (a
+/// lone surrogate), for the same reason: the key's own text is the one thing
+/// that cannot be written.
+const UNENCODABLE_KEY: &str = "<unencodable key>";
+
 /// Python tuple[(key, scalar)] → Vec<KeyValue>, with the key of every value
 /// that did not ship as the host gave it pushed onto `unmarshalled`.
+///
+/// A key that is not a `str`, or is one the wire cannot encode, raised here
+/// like a bad value did, and cost the batch the same way. Its attribute is
+/// left out, value unread, and named by a fixed placeholder.
 fn kv_list(
     extra: &Bound<PyAny>,
     out: &mut Vec<pb::KeyValue>,
     unmarshalled: &mut Vec<String>,
 ) -> PyResult<()> {
+    let py = extra.py();
     for pair in extra.iter()? {
         let pair = pair?;
-        let key: String = pair.get_item(0)?.extract()?;
+        let key = pair.get_item(0)?;
+        if !key.is_instance_of::<PyString>() {
+            unmarshalled.push(NON_STR_KEY.into());
+            continue;
+        }
+        let Some(key) = tolerated(py, key.extract::<String>())? else {
+            unmarshalled.push(UNENCODABLE_KEY.into());
+            continue;
+        };
         match any_value(&pair.get_item(1)?)? {
             HostValue::Kept(value) => out.push(pb::KeyValue {
                 key,
@@ -223,10 +302,20 @@ fn kv_list(
 fn kv_list_noted(extra: &Bound<PyAny>, out: &mut Vec<pb::KeyValue>) -> PyResult<()> {
     let mut unmarshalled = Vec::new();
     kv_list(extra, out, &mut unmarshalled)?;
-    if !unmarshalled.is_empty() {
-        out.push(kv_str(UNMARSHALLED_FIELD_KEY, unmarshalled.join(",")));
-    }
+    set_unmarshalled_note(out, &unmarshalled);
     Ok(())
+}
+
+/// The `UNMARSHALLED_FIELD_KEY` note onto `attrs`, when there is anything to
+/// name — REPLACING a same-keyed attribute the host set itself. Pushed beside
+/// it, the key would ship twice, and an OTLP decoder keeps one of a duplicated
+/// key: the backend's choice whether the note or the host's value survives.
+fn set_unmarshalled_note(attrs: &mut Vec<pb::KeyValue>, names: &[String]) {
+    if names.is_empty() {
+        return;
+    }
+    attrs.retain(|kv| kv.key != UNMARSHALLED_FIELD_KEY);
+    attrs.push(kv_str(UNMARSHALLED_FIELD_KEY, names.join(",")));
 }
 
 // --- enum mapping (unmapped → *_UNSPECIFIED) ---
@@ -933,9 +1022,9 @@ fn state_to_proto(s: &Bound<PyAny>) -> PyResult<pb::StateSnapshot> {
 ///
 /// The head is the core fields and the caller's `extra`, in wire order
 /// ahead of the typed blocks so the attribute sequence is unchanged by the
-/// split. An `extra` value the wire cannot hold as given is named onto
-/// `unmarshalled` rather than raised, so the head stays the encoder's own:
-/// nothing a host can set fails it.
+/// split. An `extra` key or value the wire cannot hold as given is named
+/// onto `unmarshalled` rather than raised, so the head stays the encoder's
+/// own: nothing a host can set fails it.
 fn span_head_to_proto(sp: &Bound<PyAny>, unmarshalled: &mut Vec<String>) -> PyResult<pb::Span> {
     let ctx = sp.getattr("context")?;
     let mut span = pb::Span {
@@ -1218,10 +1307,7 @@ fn envelope_to_proto(
         }
         // After the typed blocks' attributes and before the tail's, where the
         // note has always sat.
-        if !not_as_given.is_empty() {
-            span.extra
-                .push(kv_str(UNMARSHALLED_FIELD_KEY, not_as_given.join(",")));
-        }
+        set_unmarshalled_note(&mut span.extra, &not_as_given);
         span_tail_to_proto(&sp, &mut span)?;
         items.push(pb::EnvelopeItem {
             header: Some(pb::EnvelopeItemHeader {

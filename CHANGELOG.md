@@ -358,17 +358,21 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
-- **An attribute value the wire cannot hold no longer costs the batch, and a
-  large integer no longer turns into a float.** `span.set_attribute("req_id",
-  2**70)` exported `1.1805916207174113e+21`: a different number, with nothing
-  on the span to say so. A value the encoder could not read at all
-  (`10**400`, `object()`, `bytes`, a list) raised inside the export, and the
-  whole batch it was in was dropped, every good span with it, with no marker
-  and no counter. Now an integer outside the 64-bit range ships as its exact
-  decimal digits in a string, a value the wire cannot hold is left out, and
-  either way the attribute's key is named under `wardex.codec.unmarshalled` on
-  that span while the span and its batch ship. The same holds for a state
-  snapshot's `attributes`, on both the OTLP and the wardex exporter.
+- **An attribute the wire cannot hold no longer costs the batch, and a large
+  integer no longer turns into a float.** `span.set_attribute("req_id",
+  2**70)` exported `1.1805916207174113e+21`, and so did a numpy integer such
+  as `np.uint64(2**64 - 1)`: a different number, with nothing on the span to
+  say so. A value the encoder could not read at all (`object()`, `bytes`, a
+  list), or a key that is not a string (`set_attribute(123, "x")`), raised
+  inside the export, and the whole batch it was in was dropped, every good
+  span with it, with no marker and no counter. Now an integer outside the
+  64-bit range, Python's or numpy's, ships as its exact decimal digits in a
+  string, a numpy bool ships as a bool rather than `1.0`, and a value or key
+  the wire cannot hold is left out. Either way the attribute is named under
+  `wardex.codec.unmarshalled` on that span (a key that is not a string as
+  `<non-str key>`, since its own text cannot be trusted), and the span and its
+  batch ship. The same holds for a state snapshot's `attributes`, on both the
+  OTLP and the wardex exporter.
 - **A span sent without its payload now names the setting that removed it.**
   A span too large for `max_otlp_request_bytes` on its own is exported without
   its input, output and tool payload rather than not at all. It was marked
