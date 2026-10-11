@@ -49,10 +49,17 @@ the POST carrying it fails, the transport says how (`unsent`):
   At most `_UNACKED_CAP` such reports are held; past that the oldest is dropped
   and counted as `ledger_overflow:report`.
 
-A report is settled at most once per time it is handed out, and a batch's
-failure is accounted at most once: a transport subclass that raises after its
-own `export` already settled the batch gets `False` back from `unsent` and
-counts nothing a second time.
+When the drain that sent it finishes with no failure said (`done`), it was
+delivered. Until one of the three, the report is out, and `undelivered` counts
+it: a process that dies with the POST in flight never confirmed it.
+
+A report is settled at most once per time it is handed out, and only by the
+drain that handed it out: a drain a signal handler runs on top of one whose
+POST is still in flight takes only what is not out already, and leaves the
+outer drain's reports for the outer drain to settle. A batch's failure is
+accounted at most once: a transport subclass that raises after its own
+`export` already settled the batch gets `False` back from `unsent` and counts
+nothing a second time.
 
 Only a transport that can carry a report gets one: `carries()` asks for
 `_carries_client_report`, which the wardex envelope transport sets. Taking the
@@ -90,6 +97,7 @@ __all__ = [
     "ReasonInfo",
     "attach",
     "carries",
+    "done",
     "due",
     "expedite",
     "record",
@@ -146,14 +154,17 @@ _PENDING: dict[tuple[DropReason, DropUnit], int] = {}
 _failed_sends = 0
 #: Reports whose POST may or may not have arrived, oldest first.
 _UNACKED: deque[ClientReport] = deque()
-#: (report, definitely_not_stored) from `unsent`, applied at the next fold.
-_SETTLED: deque[tuple[ClientReport, bool]] = deque()
-#: The reports the last `attach` handed out and nobody has settled since, by
-#: timestamp, each mapped to whether it was cut fresh then. Only a fresh one
-#: may go back into the pending table when its POST definitely failed; one
-#: that is not here any more was settled already, and settling it again would
-#: count it twice.
-_OUT: dict[int, bool] = {}
+#: (report, outcome), applied in order at the next fold: True from `unsent`
+#: when the receiver definitely did not store it, False when it may have, None
+#: from `done` (delivered, unless a failure settled it first).
+_SETTLED: deque[tuple[ClientReport, bool | None]] = deque()
+#: The reports handed out and not settled yet, by identity (each is held here,
+#: so its id cannot be reused while it is), with whether it was cut fresh then.
+#: Only a fresh one may go back into the pending table when its POST definitely
+#: failed; one that is not here any more was settled already, and settling it
+#: again would count it twice. An entry leaves only when its own drain settles
+#: it, never because another drain began.
+_OUT: dict[int, tuple[ClientReport, bool]] = {}
 #: The last envelope `unsent` settled, held by identity so its id cannot be
 #: reused while it is compared. Cleared by the next `attach`: every settle of
 #: one batch happens inside the drain that sent it.
@@ -283,7 +294,11 @@ def expedite() -> None:
 
 def attach(envelope: Envelope, transport: object, queue_depth: int) -> Envelope:
     """`envelope` with the ledger's reports added, when `transport` carries
-    them and the fold is free; otherwise `envelope` unchanged."""
+    them and the fold is free; otherwise `envelope` unchanged.
+
+    The drain that calls this settles every report it got: `unsent` when the
+    POST failed, `done` when it finished. Reports another drain still has out
+    are not touched here."""
     global _last_solo
     _last_unsent[0] = None  # a new batch: the last one's settles are over
     if type(envelope) is not Envelope or not carries(transport):
@@ -293,13 +308,12 @@ def attach(envelope: Envelope, transport: object, queue_depth: int) -> Envelope:
     try:
         _fold_held()
         reports = list(_UNACKED)
+        _OUT.update((id(r), (r, False)) for r in reports)
         _UNACKED.clear()
-        _OUT.clear()
-        _OUT.update((r.timestamp_ns, False) for r in reports)
         fresh = _cut_held(queue_depth)
         if fresh is not None:
             reports.append(fresh)
-            _OUT[fresh.timestamp_ns] = True
+            _OUT[id(fresh)] = (fresh, True)
     finally:
         _release()
     if not reports:
@@ -321,21 +335,50 @@ def unsent(envelope: Envelope, *, definite: bool) -> bool:
     if envelope is _last_unsent[0]:
         return False
     _last_unsent[0] = envelope
-    if type(envelope) is Envelope:
-        for report in envelope.client_reports:
-            _SETTLED.append((report, definite))
-        _try_fold()
+    for report in _out_in(envelope):
+        _SETTLED.append((report, definite))
+    _try_fold()
     return True
 
 
+def done(envelope: Envelope) -> None:
+    """The drain that sent `envelope` is finished with it, and nothing it
+    still holds out failed: those reports were delivered. Queued behind any
+    `unsent` for the same envelope, so a failure the transport settled first
+    stands."""
+    reports = _out_in(envelope)
+    for report in reports:
+        _SETTLED.append((report, None))
+    if reports:
+        _try_fold()
+
+
+def _out_in(envelope: object) -> tuple[ClientReport, ...]:
+    """The reports in `envelope` this ledger has out, matched by identity.
+    A host's `before_send_envelope` runs before `attach` and may put anything
+    beside them; none of it is read, so no value of the host's can make a
+    settle raise, on the drain's path or outside its `try`."""
+    if type(envelope) is not Envelope or type(envelope.client_reports) is not tuple:
+        return ()
+    return tuple(r for r in envelope.client_reports if id(r) in _OUT)
+
+
 def undelivered() -> dict[tuple[DropReason, DropUnit], int]:
-    """What no receiver has confirmed: the pending counts plus every report
-    held for resending."""
-    _try_fold()
+    """What no receiver has confirmed: the pending counts, every report held
+    for resending, and every report still out on a POST nobody settled.
+
+    When another frame holds the fold -- a signal handler that interrupted a
+    record on its own thread is the caller that gets here -- the records it
+    has not reached are still in the inbox, and are counted from there."""
+    folded = _try_fold()
     out = dict(_PENDING)
-    for report in tuple(_UNACKED) + tuple(r for r, _ in tuple(_SETTLED)):
+    for report in tuple(_UNACKED) + tuple(r for r, _ in tuple(_OUT.values())):
         for key, n in _keys_of(report):
             out[key] = out.get(key, 0) + n
+    if not folded:
+        for reason, unit, n, _ in tuple(_INBOX):
+            if reason is not None and unit is not None:
+                out[(reason, unit)] = out.get((reason, unit), 0) + n
     return out
 
 
@@ -397,10 +440,10 @@ def _fold_held() -> None:
     _fold_inbox_held()
     while _SETTLED:
         report, definite = _SETTLED.popleft()
-        fresh = _OUT.pop(report.timestamp_ns, None)
-        if fresh is None:
-            continue  # not out (settled already, or never handed out): nothing to settle
-        if definite and fresh:
+        out = _OUT.pop(id(report), None)
+        if out is None or definite is None:
+            continue  # delivered, or not out (settled already, or never handed out)
+        if definite and out[1]:  # a fresh report the receiver certainly did not store
             for key, n in _keys_of(report):
                 _add(_PENDING, key, n)
             _failed_sends += report.failed_sends

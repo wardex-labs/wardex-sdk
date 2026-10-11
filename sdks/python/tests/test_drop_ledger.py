@@ -11,6 +11,8 @@ cases are the contract:
   * a report whose POST definitely failed is counted exactly once later;
   * a report whose POST may have arrived is sent again with the same
     `timestamp_ns`, for the receiver to fold;
+  * a drain run inside another on its thread, as a signal's flush runs,
+    settles none of the outer drain's reports;
   * with nothing else to send, a ledger-only envelope goes out, no more than
     once per interval;
   * a fork child's first report carries none of the parent's counts;
@@ -35,6 +37,7 @@ import textwrap
 import threading
 import time
 from collections.abc import Iterator
+from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
@@ -428,6 +431,130 @@ def test_a_transport_that_raises_after_settling_its_failure_is_counted_once(rece
     accepted = [r for status, d in receiver.decoded() if status == 202 for r in _reports(d)]
     assert _events(accepted) == {"queue_overflow:span": 1, "send_error:span": 1}
     assert sum(r["failed_sends"] for r in accepted) == 1
+
+
+@pytest.mark.parametrize("definite", [True, False], ids=["refused", "unanswered"])
+def test_a_drain_begun_inside_another_leaves_the_outer_report_to_it(definite):
+    """A signal handler's flush runs a drain on the thread whose own drain is
+    still inside its POST. The inner drain takes only what is not out already,
+    and finishing it settles nothing of the outer drain's. The outer report is
+    unconfirmed until its own POST says otherwise, and then it is settled as
+    that POST went: refused, its counts ride the next report; unanswered, the
+    same report is sent again."""
+    transport = WardexTransport(CLOSED, KEY)
+    _ledger.record(DropReason.TABLE_FULL, 7)
+    outer = _ledger.attach(_envelope(), transport, 0)
+    _ledger.record(DropReason.QUEUE_OVERFLOW)
+    inner = _ledger.attach(_envelope(), transport, 0)
+    assert [r.discarded_events for r in inner.client_reports] == [(("queue_overflow:span", 1),)]
+    _ledger.done(inner)  # the inner POST went through
+    assert _ledger.undelivered() == {(DropReason.TABLE_FULL, DropUnit.ENTRY): 7}
+    assert _ledger.unsent(outer, definite=definite)
+    [report] = _ledger.attach(_envelope(), transport, 0).client_reports
+    assert report.discarded_events == (("table_full:entry", 7),)
+    assert (report == outer.client_reports[0]) is not definite
+
+
+def test_a_drain_run_inside_another_on_its_thread_loses_no_drop_report(receiver):
+    """The same through the client: the outer drain's POST is refused after a
+    drain run inside it, as a signal handler's flush runs, has finished. The
+    receiver still gets the outer report's counts, once."""
+
+    class _Interrupted(WardexTransport):
+        client: Client
+
+        def export(self, envelope, *, timeout=None):  # noqa: ANN001, ANN202
+            if [s.name for s in envelope.spans] == ["outer"]:
+                self.client.capture_span(_span("inner"))
+                self.client._shutdown_flush(2.0)  # what the handler runs, on this thread
+            return super().export(envelope, timeout=timeout)
+
+    receiver.script = [("status", 202), ("status", 500), ("status", 202)]
+    transport = _Interrupted(receiver.url, KEY)
+    client = transport.client = Client(WardexConfig(debug=False), transport)
+    client._worker.stop()
+    _ledger.record(DropReason.TABLE_FULL, 7)
+    client.capture_span(_span("outer"))
+    client.flush(5.0)
+    client.capture_span(_span("later"))
+    client.flush(5.0)
+    client.close(1.0)
+    posts = receiver.decoded()
+    assert [(status, _span_names(d)) for status, d in posts] == [
+        (202, ["inner"]),
+        (500, ["outer"]),
+        (202, ["later"]),
+    ]
+    accepted = [r for status, d in posts if status == 202 for r in _reports(d)]
+    assert _events(accepted) == {"table_full:entry": 7, "send_error:span": 1}
+
+
+class _Raising(WardexTransport):
+    """Raises from its first export without sending; sends after that."""
+
+    raise_next = True
+
+    def export(self, envelope, *, timeout=None):  # noqa: ANN001, ANN202
+        if self.raise_next:
+            self.raise_next = False
+            raise RuntimeError("transport blew up mid-send")
+        return super().export(envelope, timeout=timeout)
+
+
+@pytest.mark.parametrize(
+    "junk",
+    [
+        object(),
+        ClientReport(
+            timestamp_ns=[1],  # type: ignore[arg-type]
+            discarded_events=(),
+            failed_sends=0,
+            queue_depth=0,
+            uptime_ms=0,
+        ),
+    ],
+    ids=["not_a_report", "unhashable_timestamp"],
+)
+def test_a_hook_that_hands_back_any_report_never_makes_a_settle_raise(junk):
+    """`before_send_envelope` runs before the ledger attaches its reports, and
+    a host's hook may hand back anything in `client_reports`. Settling the
+    batch, failed or finished, reads only the ledger's own reports, so flush()
+    returns and the ledger's report is still accounted for."""
+
+    def hook(envelope: Envelope) -> Envelope:
+        return replace(envelope, client_reports=(junk,))
+
+    config = WardexConfig(
+        limits=LimitsConfig(max_buffer_spans=1), debug=False, before_send_envelope=hook
+    )
+    client = Client(config, _Raising(CLOSED, KEY))
+    client._worker.stop()
+    client.capture_span(_span())
+    client.capture_span(_span())  # one eviction: the batch carries the ledger's report
+    client.flush(5.0)  # the transport raises: the settle is on the drain's raise path
+    client.capture_span(_span())
+    client.flush(5.0)  # refused: the settle is the transport's, and then `done`
+    client.close(1.0)
+    assert _ledger.undelivered()[(DropReason.QUEUE_OVERFLOW, DropUnit.SPAN)] == 1
+
+
+def test_counts_still_in_the_inbox_are_said_while_another_frame_folds():
+    """A shutdown signal that lands inside a fold on its own thread cannot fold
+    in turn: what the interrupted fold had not reached is still in the inbox,
+    and the line the handler says before the process dies includes it."""
+    _ledger.record(DropReason.TABLE_FULL, 5)
+    _ledger.snapshot()  # folded into the pending table
+    assert _ledger._claim()  # "the signal landed inside a fold on this thread"
+    try:
+        for _ in range(3):
+            _ledger.record(DropReason.QUEUE_OVERFLOW)
+        held = _ledger.undelivered()
+    finally:
+        _ledger._release()
+    assert held == {
+        (DropReason.TABLE_FULL, DropUnit.ENTRY): 5,
+        (DropReason.QUEUE_OVERFLOW, DropUnit.SPAN): 3,
+    }
 
 
 def test_unconfirmed_reports_are_bounded_and_the_overflow_is_counted():

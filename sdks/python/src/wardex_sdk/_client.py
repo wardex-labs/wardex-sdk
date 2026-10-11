@@ -1084,10 +1084,9 @@ class Client:
                     envelope = maybe
                 # After the hook: the ledger is wardex's own accounting, not the host's data.
                 envelope = ledger.attach(envelope, self._transport, len(spans) + len(snapshots))
-                # `requested` (when given) is the number the caller actually
-                # NAMED; `timeout` may be that number minus what the finalize
-                # phase already spent, and the cut-short report must quote the
-                # caller's own figure, never wardex's remainder.
+                # `requested` (when given) is the number the caller actually NAMED; `timeout` may
+                # be that number minus what the finalize phase already spent, and the cut-short
+                # report must quote the caller's own figure, never wardex's remainder.
                 named = (
                     (requested if requested is not None else timeout) if named_by_caller else None
                 )
@@ -1115,6 +1114,7 @@ class Client:
             if not shipped:
                 ledger.unsent(envelope, definite=True)
                 self._undelivered(spans, snapshots, final=final)
+            ledger.done(envelope)  # its reports no failure above settled were delivered
             self._flush_transport(deadline)
         finally:
             self._export_lock.release()
