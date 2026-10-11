@@ -160,7 +160,7 @@ short `gpt-4o-mini` calls against your OpenAI key.
 ```bash
 git clone https://github.com/wardex-labs/wardex-sdk && cd wardex-sdk
 python3 -m venv .venv-quickstart && source .venv-quickstart/bin/activate
-pip install "wardex-sdk>=0.6.0b1" "openai-agents>=0.22,<0.23"
+pip install "wardex-sdk>=0.6.0b1" "openai-agents>=0.22,<0.24"
 export OPENAI_API_KEY=sk-...                             # the framework's own requirement
 export WARDEX_ENDPOINT=http://127.0.0.1:6006/v1/traces   # a local Phoenix
 python examples/openai_agents_quickstart.py
@@ -179,7 +179,7 @@ tree.
 
 | Framework | What becomes a span |
 |---|---|
-| OpenAI Agents SDK (tested on `openai-agents` 0.22.x) | each run, agent, function tool, handoff and guardrail; model calls read from the wire |
+| OpenAI Agents SDK (tested on `openai-agents` 0.22.x, 0.23.x) | each run, agent, function tool, handoff and guardrail; model calls read from the wire |
 | LangGraph (tested on `langgraph` 1.2.x) | each graph run, node and `ToolNode` tool call, including subgraphs and the functional API |
 | Claude Agent SDK (tested on `claude-agent-sdk` 0.2.x) | agent turns and model calls, with tool calls correlated |
 | Codex CLI (`codex exec`, run as a subprocess) | each run, with its prompt, answer, tool calls and the turn's token usage; with `CodexExecConfig(otel_bridge=True)`, one span per model call with its model and timing |

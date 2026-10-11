@@ -168,6 +168,24 @@ def _chat_spans(spans: list[Any]) -> list[Any]:
     return [s for s in spans if s.kind is SpanKind.CLIENT]
 
 
+def _tools_listed_inside_the_agent() -> bool:
+    """Whether the installed framework builds an agent's tool list after it opens that agent's span.
+
+    openai-agents 0.23 moved `get_all_tools` — the `is_enabled` gates and every MCP server's
+    `list_tools` — from before the agent's span opens to after it. What happens there therefore
+    has a different parent from 0.23 on: an MCP listing is the agent's child rather than the
+    run's, and a tool gate that raises fails inside the receiving agent rather than between two
+    agents. The tests that depend on where the listing happens read this and assert the tree the
+    installed release actually produces; CI runs them on both tested minors.
+    """
+    import importlib.metadata
+
+    major, minor = (
+        int(part) for part in importlib.metadata.version("openai-agents").split(".")[:2]
+    )
+    return (major, minor) >= (0, 23)
+
+
 def _one(spans: list[Any], name: str) -> Any:
     found = [s for s in spans if s.name == name]
     assert len(found) == 1, f"expected one {name!r}, got {[s.name for s in spans]}"
@@ -1370,13 +1388,14 @@ def test_a_handoff_whose_receiver_never_starts_does_not_leak_into_the_next_run(
 ):
     """The sender's end publishes the pending handoff for the receiver that
     starts NEXT on this task. Here the receiver never starts: its tool's
-    `is_enabled` raises inside `get_all_tools`, which the framework runs
-    BEFORE it opens the receiver's span, so the run fails with the handoff
-    still pending. The next run on the same task then opens a TOP-LEVEL
-    agent of the receiver's name -- and shipped `parent_agent="agent_a"`
-    with a HANDOFF_FROM link into the previous trace, at confidence 1.0 and
-    with no marker. The pending handoff belongs to its run: a receiver in
-    another run is not that handoff's receiver."""
+    `is_enabled` raises inside `get_all_tools`, which the framework ran
+    BEFORE it opened the receiver's span until 0.23 moved it inside, so on
+    0.22 the run fails with the handoff still pending. The next run on the
+    same task then opens a TOP-LEVEL agent of the receiver's name -- and
+    shipped `parent_agent="agent_a"` with a HANDOFF_FROM link into the
+    previous trace, at confidence 1.0 and with no marker. The pending handoff
+    belongs to its run: a receiver in another run is not that handoff's
+    receiver."""
     from agents import function_tool
 
     first = [True]
@@ -1414,12 +1433,28 @@ def test_a_handoff_whose_receiver_never_starts_does_not_leak_into_the_next_run(
     marker = _one(spans, "handoff agent_a→agent_b")
     assert marker.status is StatusCode.OK
     agents = [s for s in _adapter_spans(spans) if s.name.startswith("invoke_agent")]
-    assert [s.agent.name for s in agents] == ["agent_a", "agent_b"]
-    later_b = agents[1]
+    roots = [s for s in _adapter_spans(spans) if s.parent_span_id is None]
+    assert len(roots) == 2
+    # Whatever happened to the first run's receiver, the next run's agent of the same name is
+    # top-level: no parent agent, no link into the previous trace.
+    later_b = agents[-1]
+    assert later_b.agent.name == "agent_b"
     assert later_b.agent.parent_agent is None
     assert later_b.links == ()
-    roots = [s for s in _adapter_spans(spans) if s.parent_span_id is None]
-    assert len(roots) == 2 and later_b.context.trace_id == roots[1].context.trace_id
+    assert later_b.context.trace_id == roots[1].context.trace_id
+    if _tools_listed_inside_the_agent():
+        # The receiver's tool gate runs inside its span, so the receiver DID start: it is the
+        # handoff's real receiver, fails with the framework's generic run error, and fails the
+        # root; nothing was left pending for the next run to pick up.
+        receiver = agents[1]
+        assert [s.agent.name for s in agents] == ["agent_a", "agent_b", "agent_b"]
+        assert receiver.agent.parent_agent == "agent_a"
+        assert receiver.context.trace_id == roots[0].context.trace_id
+        assert (receiver.status, receiver.error_type) == (StatusCode.ERROR, "agent_run_error")
+        assert (roots[0].status, roots[0].error_type) == (StatusCode.ERROR, "agent_run_error")
+        assert counters.get("adapters.openai_agents.handoff_receiver_never_started") == 0
+        return
+    assert [s.agent.name for s in agents] == ["agent_a", "agent_b"]
     assert counters.get("adapters.openai_agents.handoff_receiver_never_started") == 1
     # No agent span was open when the first run raised, so the exception was read where the
     # framework closed that run's own trace: the root is ERROR while both agents are OK.
@@ -2238,7 +2273,13 @@ def test_a_refused_agent_pin_marks_the_mcp_list_tools_step_under_it(
     finally:
         wardex.close()
     step = _one(spans, "execute_step mcp.list_tools")
-    assert Limitation.CORRELATION_CONFLICT in _edge(step)[2], _edge(step)
+    if _tools_listed_inside_the_agent():
+        # The helper's tools are listed inside the helper's own span, so the step is the
+        # helper's child and the marker sits on the helper. The window this test was written
+        # for — a listing while the OUTER agent is current — no longer occurs on this release.
+        assert step.parent_span_id == _one(spans, "invoke_agent helper").context.span_id
+    else:
+        assert Limitation.CORRELATION_CONFLICT in _edge(step)[2], _edge(step)
     for name in ("execute_tool helper_tool", "invoke_agent helper"):
         assert Limitation.CORRELATION_CONFLICT in _edge(_one(spans, name))[2], name
 
@@ -2891,8 +2932,14 @@ def test_an_mcp_list_tools_span_carries_a_hash_and_never_a_name(agents_env, scen
     for s in _adapter_spans(spans):
         assert "secret_tool_name" not in repr(s.extra)
         assert "secret_tool_name" not in s.name
-    # fired before the agent's first turn: the run root is its parent
-    assert step.parent_span_id == _one(spans, "invoke_workflow Agent workflow").context.span_id
+    # Fired before the agent's first turn: under the run root while the framework listed tools
+    # before opening the agent's span, under the agent once it lists them inside it.
+    parent = (
+        "invoke_agent agent_a"
+        if _tools_listed_inside_the_agent()
+        else "invoke_workflow Agent workflow"
+    )
+    assert step.parent_span_id == _one(spans, parent).context.span_id
 
 
 def _passes_card_checksum(digits: str) -> bool:
@@ -3463,9 +3510,17 @@ def test_a_run_that_fails_between_two_agents_fails_the_root_the_host_opened(
     finally:
         wardex.close()
     root = _one(spans, "invoke_workflow host workflow")
-    assert (root.status, root.error_type) == (StatusCode.ERROR, "RuntimeError")
     assert _one(spans, "invoke_agent agent_a").status is StatusCode.OK
-    assert (failed_at_exit, backstop) == (1, 0)
+    if _tools_listed_inside_the_agent():
+        # The receiver's tool gate now runs inside the receiver's span: the framework fails
+        # that span with its generic run error, and the receiver fails the root first.
+        receiver = _one(spans, "invoke_agent agent_b")
+        assert (receiver.status, receiver.error_type) == (StatusCode.ERROR, "agent_run_error")
+        assert (root.status, root.error_type) == (StatusCode.ERROR, "agent_run_error")
+        assert (failed_at_exit, backstop) == (0, 0)
+    else:
+        assert (root.status, root.error_type) == (StatusCode.ERROR, "RuntimeError")
+        assert (failed_at_exit, backstop) == (1, 0)
 
 
 def test_a_nested_run_a_hosts_tool_handles_leaves_the_host_root_ok(agents_env, scenario):
@@ -3565,6 +3620,9 @@ def test_a_trace_a_tool_opens_does_not_stand_in_for_the_root_of_the_run_it_is_in
         model="gpt-4o-mini",
     )
     raised = RuntimeError if failure == "between_agents" else ModelBehaviorError
+    # Between two agents no span was open while the framework listed tools before opening one;
+    # once it lists them inside the receiver's span, the receiver fails the root first.
+    in_receiver = failure == "between_agents" and _tools_listed_inside_the_agent()
     reset_reports_for_test()  # the line is once per process: let this run say it if it would
     _init()
     try:
@@ -3577,12 +3635,14 @@ def test_a_trace_a_tool_opens_does_not_stand_in_for_the_root_of_the_run_it_is_in
         wardex.close()
         reset_reports_for_test()
     root = _one(spans, "invoke_workflow host workflow")
-    assert (root.status, root.error_type) == (StatusCode.ERROR, raised.__name__)
+    expected = "agent_run_error" if in_receiver else raised.__name__
+    assert (root.status, root.error_type) == (StatusCode.ERROR, expected)
     for name in ("invoke_workflow inner workflow", "invoke_agent helper"):
         assert _one(spans, name).status is StatusCode.OK
-    # Between two agents no span is open, so the call's exit fails the root; a typed handoff's
-    # failure leaves the agent while its span is open, and the agent fails the root first.
-    assert (failed_at_exit, backstop) == (1 if failure == "between_agents" else 0, 0)
+    # With no span open, the call's exit fails the root; a failure that leaves an agent while
+    # its span is open (a typed handoff, or the receiver's own tool gate) fails the root first.
+    at_exit = failure == "between_agents" and not in_receiver
+    assert (failed_at_exit, backstop) == (1 if at_exit else 0, 0)
     assert [m for m in wardex_log.lines(logging.WARNING) if "under-reports" in m] == []
 
 

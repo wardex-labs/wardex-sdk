@@ -74,14 +74,14 @@ test = [
     # measures it; the adapter's table of tested versions names it beside
     # langgraph, and a test holds every pin here to that table.
     "langgraph-prebuilt>=1.1,<1.2",
-    # Only 0.22.x is measured (2026-09-05): the Responses request shape on
+    # 0.22.x and 0.23.x are measured: the Responses request shape on
     # Runner.run / Runner.run_streamed, the `transfer_to_<agent>` handoff tool
     # name, the trace exporter's hardcoded `/v1/traces/ingest` endpoint and the
     # `httpx2` client it rides are all internals the surface probe cannot see —
-    # the wire test plus this pin IS the floor. 0.23.x records wrong parents and
-    # error types (2026-10-10), so it stays out of the pin and out of the table of
-    # tested versions until the adapter is fixed for it.
-    "openai-agents>=0.22,<0.23",
+    # the wire test plus this pin IS the floor. This range resolves to the newest
+    # 0.23.x; CI runs the openai-agents tests once more on 0.22.3, because 0.23
+    # moved where an agent's tools are listed and the two trees differ.
+    "openai-agents>=0.22,<0.24",
     "langchain-core>=0.3",
     # `langchain` (not just langchain-core) because `langchain.agents.create_agent`
     # is the non-deprecated successor to `create_react_agent`, and the tool seam's
