@@ -568,6 +568,8 @@ def conversation(
     run starts. The structural step spans of a run that started BEFORE the block
     keep that run's conversation where they open inside the block, while the
     spans your code opens and the LLM calls made inside the block carry this id.
+    A run started INSIDE the block carries this id on everything under it, even
+    what it does after the block ends.
 
     A task or callback started inside the block keeps the id after the block
     ends, however it ends; `wardex.isolation_scope()` steps out of the
