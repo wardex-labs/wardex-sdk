@@ -14,6 +14,13 @@ and in a script.
     from wardex_sdk.testing import AdapterConformanceSuite, AdapterSubject
 
 See `conformance.py` for what makes this a gate rather than a checklist.
+
+The other half is for applications rather than adapters: `assert_no_capture_gaps`
+fails when wardex missed something it should have recorded, at the moment the
+caller chooses (see `strict.py`). `pytest --wardex-strict` makes that check
+around every test through `pytest_plugin.py`, which is the one module here that
+imports a test framework. pytest reaches it through `_wardex_pytestplugin`, a
+module outside this package, and only when the flag is given.
 """
 
 from .conformance import AdapterConformanceSuite
@@ -34,16 +41,21 @@ from .harness import (
     read_spans,
     read_usage,
 )
+from .strict import CaptureGap, CaptureGapError, assert_no_capture_gaps, capture_gaps
 
 __all__ = [
     "AdapterConformanceSuite",
     "AdapterSubject",
+    "CaptureGap",
+    "CaptureGapError",
     "LiveAdapter",
     "RecordingClient",
     "RecordingTransport",
     "SpanNode",
     "StalledRun",
     "UsageSnapshot",
+    "assert_no_capture_gaps",
+    "capture_gaps",
     "clean_state",
     "collapse_onto_root",
     "exactly_one",

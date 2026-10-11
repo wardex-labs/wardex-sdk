@@ -25,6 +25,31 @@ All notable changes to this project are documented here. The format follows
   version, whether that version was tested, and the line wardex printed about
   it.
 
+- **`pytest --wardex-strict` fails a test during which wardex missed
+  something.** wardex never raises into the application it observes, so a
+  span the buffer evicted, an adapter that did not install or runs on an
+  untested framework release, or an error wardex swallowed inside itself was
+  one line on stderr: easy to scroll past in CI, where the change that caused
+  it is in front of the person who can undo it. With the flag, the plugin the
+  package registers checks every test, and one during which wardex lost
+  something fails with what was lost, how many and what to do, even when it
+  then skipped or failed as expected. What a `conftest.py` lost before the
+  first test, or anything lost after the last one, fails the session, and so
+  does a session that ran tests and never initialized wardex, because nothing
+  was checked. Under pytest-xdist each worker checks its own tests and hands
+  the rest to the controller. Accept a reason on purpose with
+  `--wardex-strict-allow=REASON` or `REASON:SUBJECT`
+  (`untested_framework_version:openai_agents`). Without the flag nothing about
+  a suite changes: pytest loads a module that imports nothing of wardex, and
+  the check itself only when the flag is given. Outside pytest,
+  `wardex.testing.assert_no_capture_gaps()` makes the same check at a moment
+  you choose, and `wardex.diagnostics().losses` reads the counts behind it at
+  any time: every kind of loss since the process started, with its count, and
+  the sentences that say what it means and what to do. A drop the host asked
+  for (`before_send_envelope` returning None) is counted there and is not a
+  failure. Adapter states are now kept after `close()`, so a check made once
+  the run is over still reads them.
+
 - **A `codex exec` your code runs is now an agent run in the trace.** Codex
   talks to its model from its own process, so before, an app that ran
   `codex exec` (as a model, or as a sub-agent) recorded nothing at all for

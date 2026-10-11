@@ -50,6 +50,7 @@ def lines() -> Iterator[_Lines]:
     reset_reports_for_test()
     counters.reset()
     get_registry().uninstall_all()
+    get_registry().reset_statuses()
     logger = logging.getLogger("wardex_sdk")
     handler = _Lines()
     logger.addHandler(handler)
@@ -265,9 +266,11 @@ def test_every_framework_installed_here_is_one_this_release_was_tested_on(lines)
 # --- the public read ---------------------------------------------------------
 
 
-def test_diagnostics_is_empty_before_init_and_after_close(lines):
-    before = wardex.diagnostics()
-    assert (before.initialized, before.adapters) == (False, ())
+def test_diagnostics_keeps_the_last_inits_account_after_close(lines):
+    """A check made once the run is over — after `close()`, the common place
+    for one — still reads what happened to each adapter; the next `init()`
+    writes a fresh account rather than adding to the old one."""
+    assert not wardex.diagnostics().initialized
 
     wardex.init(transport=wardex.NoOpTransport(), adapters=AdaptersConfig(enabled=()))
     during = wardex.diagnostics()
@@ -277,7 +280,18 @@ def test_diagnostics_is_empty_before_init_and_after_close(lines):
 
     wardex.close()
     after = wardex.diagnostics()
-    assert (after.initialized, after.adapters) == (False, ())
+    assert not after.initialized
+    assert after.adapters == during.adapters
+
+    wardex.init(
+        transport=wardex.NoOpTransport(), adapters=AdaptersConfig(enabled=(AdapterName.LANGGRAPH,))
+    )
+    try:
+        states = {s.name: s.state for s in wardex.diagnostics().adapters}
+    finally:
+        wardex.close()
+    assert states["langgraph"] is AdapterState.INSTALLED
+    assert states["openai_agents"] is AdapterState.DISABLED
 
 
 # --- the table of tested versions --------------------------------------------
