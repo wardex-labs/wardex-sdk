@@ -771,3 +771,51 @@ def test_a_request_the_http2_stream_table_evicted_has_no_size():
     assert sorted(str(v) for v in sizes) == sorted(["None"] * 6 + [str(len(body))] * 2)
     # The response half was observed: its size still ships.
     assert all(s["transport"]["response_size"] == len(_JSON) for s in decoded)
+
+
+def test_an_http2_body_past_its_cap_carries_the_marker_http1_gives_the_same_cut():
+    """A body the cap cut short says so with `body_cap_exceeded` on HTTP/2 too.
+
+    HTTP/1 attaches the marker in the parser; HTTP/2 used to set only its
+    per-direction truncation flags, so the span said `truncated` with no marker
+    naming the cap, and a query for capped bodies found HTTP/1 traffic only.
+    """
+    from hpack import Encoder
+
+    import test_span_class_survival as h
+    from test_codec import _header
+    from wardex_sdk import _hub
+    from wardex_sdk._interceptors._trackers import _Http2Tracker
+
+    def one_call(limits: Any, body: bytes) -> Any:
+        client = h._FakeClient()
+        _hub.set_client(client)
+        seam = h._seam(client, _Http2Tracker(limits))
+        request_headers = [
+            (b":method", b"POST"),
+            (b":path", b"/v1/chat/completions"),
+            (b":authority", b"api.openai.com"),
+            (b"content-type", b"application/json"),
+        ]
+        request = h._h2_frame(0x1, 0x4, 1, Encoder().encode(request_headers)) + h._h2_frame(
+            0x0, 0x1, 1, body
+        )
+        status = [(b":status", b"200"), (b"content-type", b"application/json")]
+        response = h._h2_frame(0x1, 0x4, 1, Encoder().encode(status)) + h._h2_frame(
+            0x0, 0x1, 1, _JSON
+        )
+        h._drive_seam(seam, "api.openai.com", request, response)
+        (span,) = client.spans
+        return span
+
+    body = json.dumps({"model": "gpt-4o", "messages": [{"role": "user", "content": "x" * 64}]})
+    capped = one_call(_wardex_native.Limits(max_body_bytes=len(body) - 1), body.encode())
+    assert Limitation.BODY_CAP_EXCEEDED in capped.capture_integrity.limitations
+    assert capped.transport.request_size is None
+    env = Envelope(header=_header(), spans=(capped,))
+    (decoded,) = [i["span"] for i in _codec.decode(_codec.encode(env))["items"] if "span" in i]
+    assert "body_cap_exceeded" in decoded["capture_integrity"]["limitations"]
+
+    whole = one_call(_wardex_native.Limits(), body.encode())
+    assert Limitation.BODY_CAP_EXCEEDED not in whole.capture_integrity.limitations
+    assert whole.transport.request_size == len(body)

@@ -615,6 +615,12 @@ impl JsonRpcParser {
     fn buffered_len(&self) -> PyResult<usize> {
         shielded(|| Ok(self.inner.buffered_len()))
     }
+
+    /// Complete lines longer than `max_stream_buffer_bytes`, skipped unparsed
+    /// since the parser was built. Each is one message lost whole.
+    fn lines_over_cap(&self) -> PyResult<u64> {
+        shielded(|| Ok(self.inner.lines_over_cap()))
+    }
 }
 
 /// Metadata for a single gRPC message (for Python exposure).
@@ -1017,8 +1023,16 @@ fn normalize_finish_reason(provider: &str, raw: &str) -> PyResult<String> {
 
 /// The one whole-body parse on the capture path, and the one native call that
 /// releases the GIL (design: parse-off-loop §4.2). The per-chunk parsers
-/// (`Http1Parser.feed` and friends) deliberately do NOT: they are O(chunk) µs
-/// work under an `&mut self` borrow, where a GIL round-trip buys nothing.
+/// (`Http1Parser.feed` and friends) deliberately do NOT. Each moves a fed byte
+/// at most twice — into its buffer, and once more if it is left over as the
+/// start of a torn frame — so a call is linear in its chunk. Measured on a
+/// release build (2026-10-11), one 256 KiB read costs 0.2 ms as 9-byte HTTP/2
+/// frames, 0.7 ms as 2-byte WebSocket frames and 2.1 ms as 87-byte JSON-RPC
+/// lines, the last spent parsing JSON. Releasing the GIL would also unguard
+/// the `&mut self` borrow: the HTTP/2 parser is one object that both
+/// directions of a connection feed, and a second thread reaching it while the
+/// first had the GIL released would get a borrow error raised into the host's
+/// own socket call instead of waiting its turn.
 /// `parse_grpc_frames` stays `&[u8]` for the same reason — measured at µs even
 /// on pathological inputs, and `PyBackedBytes` would narrow its accepted types
 /// (`memoryview` callers exist) for no gain.

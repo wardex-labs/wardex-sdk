@@ -64,6 +64,13 @@ enum ParseStep {
 
 pub struct WsParser {
     buf: Vec<u8>,
+    /// Read cursor into `buf`: bytes before it belong to frames already
+    /// parsed. The prefix is dropped once per `feed`, not once per frame, so a
+    /// read holding many small frames costs one pass over it rather than one
+    /// memmove of the rest of the read per frame.
+    pos: usize,
+    /// Bytes copied into `buf` or relocated inside it — see `bytes_moved`.
+    moved: u64,
     frag_opcode: Option<WsOpcode>,
     frag_payload: Vec<u8>,
     disabled: bool,
@@ -80,6 +87,8 @@ impl WsParser {
     pub fn new(limits: Limits) -> Self {
         Self {
             buf: Vec::new(),
+            pos: 0,
+            moved: 0,
             frag_opcode: None,
             frag_payload: Vec::new(),
             disabled: false,
@@ -93,18 +102,52 @@ impl WsParser {
             return result;
         }
         self.buf.extend_from_slice(data);
+        self.moved += data.len() as u64;
         loop {
             match self.try_parse_one(&mut result) {
                 ParseStep::Parsed => continue,
                 ParseStep::NeedMore => break,
                 ParseStep::Error => {
                     self.disabled = true;
-                    self.buf.clear();
+                    self.buf = Vec::new();
+                    self.pos = 0;
                     break;
                 }
             }
         }
+        self.compact();
         result
+    }
+
+    /// Bytes copied into the parser's buffer or relocated inside it, counted
+    /// since construction: every fed byte once on arrival, plus the residue a
+    /// compaction moves to the front. Each byte is moved at most once, because
+    /// what a compaction moves is the start of a frame still incomplete, and
+    /// the next compaction that runs is after that frame completes — so the
+    /// count stays under twice the input. A parser that drops each parsed
+    /// frame from the front of the buffer moves the rest of the read once per
+    /// frame, and this count is what grows quadratically then.
+    pub fn bytes_moved(&self) -> u64 {
+        self.moved
+    }
+
+    /// Bytes fed but not yet consumed by a parsed frame.
+    fn avail(&self) -> &[u8] {
+        &self.buf[self.pos..]
+    }
+
+    /// Drops the consumed prefix, once per `feed`.
+    fn compact(&mut self) {
+        if self.pos == 0 {
+            return;
+        }
+        if self.pos >= self.buf.len() {
+            self.buf.clear();
+        } else {
+            self.moved += (self.buf.len() - self.pos) as u64;
+            self.buf.drain(..self.pos);
+        }
+        self.pos = 0;
     }
 
     /// Whether disabled (desync/oversize) — used by the tracker to decide markers.
@@ -113,11 +156,12 @@ impl WsParser {
     }
 
     fn try_parse_one(&mut self, result: &mut WsFeedResult) -> ParseStep {
-        if self.buf.len() < 2 {
+        let buf = self.avail();
+        if buf.len() < 2 {
             return ParseStep::NeedMore;
         }
-        let b0 = self.buf[0];
-        let b1 = self.buf[1];
+        let b0 = buf[0];
+        let b1 = buf[1];
         let fin = b0 & 0x80 != 0;
         let opcode = WsOpcode::from_u8(b0 & 0x0f);
         let masked = b1 & 0x80 != 0;
@@ -127,18 +171,18 @@ impl WsParser {
         let payload_len: u64 = if len7 < 126 {
             len7
         } else if len7 == 126 {
-            if self.buf.len() < offset + 2 {
+            if buf.len() < offset + 2 {
                 return ParseStep::NeedMore;
             }
-            let l = u16::from_be_bytes([self.buf[offset], self.buf[offset + 1]]) as u64;
+            let l = u16::from_be_bytes([buf[offset], buf[offset + 1]]) as u64;
             offset += 2;
             l
         } else {
-            if self.buf.len() < offset + 8 {
+            if buf.len() < offset + 8 {
                 return ParseStep::NeedMore;
             }
             let mut arr = [0u8; 8];
-            arr.copy_from_slice(&self.buf[offset..offset + 8]);
+            arr.copy_from_slice(&buf[offset..offset + 8]);
             offset += 8;
             u64::from_be_bytes(arr)
         };
@@ -149,11 +193,11 @@ impl WsParser {
         }
 
         let mask_key: Option<[u8; 4]> = if masked {
-            if self.buf.len() < offset + 4 {
+            if buf.len() < offset + 4 {
                 return ParseStep::NeedMore;
             }
             let mut k = [0u8; 4];
-            k.copy_from_slice(&self.buf[offset..offset + 4]);
+            k.copy_from_slice(&buf[offset..offset + 4]);
             offset += 4;
             Some(k)
         } else {
@@ -161,12 +205,12 @@ impl WsParser {
         };
 
         let plen = payload_len as usize;
-        if self.buf.len() < offset + plen {
+        if buf.len() < offset + plen {
             return ParseStep::NeedMore;
         }
 
         // Unmask — copy separately only up to the sample cap (wire length is preserved in payload_len).
-        let raw = &self.buf[offset..offset + plen];
+        let raw = &buf[offset..offset + plen];
         let take = plen.min(self.limits.ws_sample_bytes);
         let mut payload = Vec::with_capacity(take);
         if let Some(k) = mask_key {
@@ -211,7 +255,7 @@ impl WsParser {
             payload_len,
             close_code,
         });
-        self.buf.drain(..offset + plen);
+        self.pos += offset + plen;
         ParseStep::Parsed
     }
 
@@ -352,5 +396,38 @@ mod tests {
         // 5-byte payload text frame, unmasked
         let r = s.feed(b"\x81\x05hello");
         assert!(r.frames.is_empty(), "frame above the cap must be rejected");
+    }
+
+    #[test]
+    fn a_read_of_many_small_frames_is_linear_not_quadratic() {
+        // 256 KiB of 2-byte frames in ONE read: dropping each frame from the
+        // front of the buffer moved the rest of the read 131072 times, about
+        // 17 GB of memmove. Moving each byte at most once after it arrives
+        // keeps the count under twice the input.
+        let raw = frame(true, 0x9, None, b"").repeat(128 * 1024);
+        let mut p = WsParser::new(Limits::default());
+        let r = p.feed(&raw);
+        assert_eq!(r.frames.len(), 128 * 1024);
+        assert!(
+            p.bytes_moved() <= 2 * raw.len() as u64,
+            "moved {} bytes for a {}-byte read",
+            p.bytes_moved(),
+            raw.len()
+        );
+    }
+
+    #[test]
+    fn residue_split_across_reads_is_still_linear_and_intact() {
+        // The same stream in 1000-byte reads leaves a torn frame at the end of
+        // nearly every read; that residue is moved once and then completed.
+        let one = frame(true, 0x1, Some([1, 2, 3, 4]), b"hello world, 25 bytes...");
+        let raw = one.repeat(4096);
+        let mut p = WsParser::new(Limits::default());
+        let mut messages = 0;
+        for part in raw.chunks(1000) {
+            messages += p.feed(part).messages.len();
+        }
+        assert_eq!(messages, 4096);
+        assert!(p.bytes_moved() <= 2 * raw.len() as u64);
     }
 }

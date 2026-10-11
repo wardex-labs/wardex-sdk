@@ -136,6 +136,8 @@ class _ProcState:
         # whole of the asymmetry `should_detach` describes.
         self._resp_bytes = 0
         self._msgs = 0
+        # Lines either parser skipped for exceeding `max_stream_buffer_bytes`, as last counted.
+        self._lines_over_cap = 0
         # Guards the once-per-stream count and debug log in McpStdioInterceptor —
         # mirrors the seam's st.gate-adjacent dedupe for the HTTP/1 path, but on a
         # field owned solely by this concern (nothing else reads or writes it).
@@ -164,6 +166,23 @@ class _ProcState:
                 )
             if len(self._latch) > 4096:  # leak-defense cap
                 self._latch.pop(next(iter(self._latch)))
+        self._count_lines_over_cap()
+
+    def _count_lines_over_cap(self) -> None:
+        """Make the native parsers' skipped over-cap lines visible: one count per line, one line
+        per process. A line is never parsed past `max_stream_buffer_bytes`, so the message it held
+        — a request, or the response that would have completed a call — is lost whole."""
+        seen = self._req.lines_over_cap() + self._resp.lines_over_cap()
+        if seen <= self._lines_over_cap:
+            return
+        for _ in range(seen - self._lines_over_cap):
+            counters.bump("interceptors.mcp_stdio.line_over_cap")
+        self._lines_over_cap = seen
+        report_once(
+            "an MCP message longer than max_stream_buffer_bytes was skipped unparsed, so the call "
+            "it belonged to is not captured. Counted under interceptors.mcp_stdio.line_over_cap.",
+            key="interceptors.mcp_stdio.line_over_cap",
+        )
 
     def feed_response(self, data: bytes) -> list[tuple[InternalSpan, ScopeSnapshot]]:
         """The spans the responses in `data` complete, each with the scope identity its request
@@ -208,6 +227,7 @@ class _ProcState:
                 span = _build_mcp_span(pending, m)
             if span is not None:
                 out.append((span, pending.scope))
+        self._count_lines_over_cap()
         return out
 
     def should_detach(self) -> bool:

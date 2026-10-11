@@ -2,6 +2,12 @@
 //! MCP-agnostic, pyo3-free. params/result/error are kept as JSON bytes re-encoded compact by
 //! serde_json, not as the bytes on the pipe: a sender's whitespace and needless `\u` escapes are
 //! dropped (semantic extraction happens upstream).
+//!
+//! No line longer than `max_stream_buffer_bytes` is ever parsed, however it arrives. A line that
+//! never terminates within that many bytes latches the stream off (`disabled_reason`), because
+//! the parser cannot find where it ends; a line that arrives complete in one read is skipped on
+//! its own and counted (`lines_over_cap`), because the framing around it is intact and the next
+//! line is still readable.
 
 use serde_json::Value;
 use wardex_limits::Limits;
@@ -28,6 +34,17 @@ pub struct JsonRpcMessage {
 #[derive(Default)]
 pub struct JsonRpcStream {
     buf: Vec<u8>,
+    /// Read cursor into `buf`: bytes before it belong to lines already
+    /// carved. Dropped once per `feed`, so a read of many short lines costs
+    /// one pass rather than one memmove of the rest of the read per line.
+    pos: usize,
+    /// Where the next newline search starts. Everything between `pos` and
+    /// here is already known to hold no newline, so a long line arriving in
+    /// many reads is searched once rather than from its start on every read.
+    scan: usize,
+    moved: u64,
+    scanned: u64,
+    lines_over_cap: u64,
     limits: Limits,
     /// Why the parser latched off, if it did. Mirrors `http1::Http1Stream`'s
     /// disable latch: a line that never terminates (the stdio equivalent of
@@ -39,15 +56,14 @@ pub struct JsonRpcStream {
 impl JsonRpcStream {
     pub fn new(limits: Limits) -> Self {
         Self {
-            buf: Vec::new(),
             limits,
-            disabled_reason: None,
+            ..Default::default()
         }
     }
 
     /// Bytes currently held awaiting a newline.
     pub fn buffered_len(&self) -> usize {
-        self.buf.len()
+        self.buf.len() - self.pos
     }
 
     /// Why the parser latched off, if it did. Surfaced for debug logging: no
@@ -56,46 +72,109 @@ impl JsonRpcStream {
         self.disabled_reason
     }
 
+    /// Complete lines longer than `max_stream_buffer_bytes` that were skipped
+    /// unparsed, counted since construction. Each one is a message lost
+    /// whole: a request whose call is never seen, or a response whose call
+    /// never completes.
+    pub fn lines_over_cap(&self) -> u64 {
+        self.lines_over_cap
+    }
+
+    /// Bytes copied into the buffer or relocated inside it since
+    /// construction: each fed byte once on arrival, plus the residue a
+    /// compaction moves to the front. The residue is the start of one line
+    /// still unterminated, and no compaction runs again until that line is
+    /// carved, so each byte moves at most once and the count stays under
+    /// twice the input.
+    pub fn bytes_moved(&self) -> u64 {
+        self.moved
+    }
+
+    /// Bytes the newline search examined since construction. Each byte is
+    /// examined once, so the count never exceeds the input.
+    pub fn bytes_scanned(&self) -> u64 {
+        self.scanned
+    }
+
     /// Accumulates bytes and returns zero or more completed (newline-terminated) JSON-RPC messages. Non-JSON-RPC lines are skipped.
     pub fn feed(&mut self, data: &[u8]) -> Vec<JsonRpcMessage> {
         if self.disabled_reason.is_some() {
             return Vec::new();
         }
         self.buf.extend_from_slice(data);
+        self.moved += data.len() as u64;
         let mut out = Vec::new();
-        while let Some(nl) = self.buf.iter().position(|&b| b == b'\n') {
-            let line: Vec<u8> = self.buf.drain(..=nl).collect(); // consume including '\n'
-            let mut end = line.len() - 1; // exclude '\n'
-            if end > 0 && line[end - 1] == b'\r' {
+        loop {
+            let from = self.scan.max(self.pos);
+            let Some(offset) = self.buf[from..].iter().position(|&b| b == b'\n') else {
+                self.scanned += (self.buf.len() - from) as u64;
+                self.scan = self.buf.len();
+                break;
+            };
+            self.scanned += (offset + 1) as u64;
+            let nl = from + offset;
+            let start = self.pos;
+            self.pos = nl + 1; // consume including '\n'
+            self.scan = self.pos;
+            let mut end = nl; // exclude '\n'
+            if end > start && self.buf[end - 1] == b'\r' {
                 end -= 1; // handle CRLF
             }
-            let line = &line[..end];
+            let line = &self.buf[start..end];
             if line.is_empty() {
                 continue;
             }
-            if let Some(msg) = parse_line(line) {
-                out.push(msg);
+            if line.len() > self.limits.max_stream_buffer_bytes {
+                self.lines_over_cap += 1;
+                continue;
             }
+            parse_line(line, &mut out);
         }
-        // What is left after every complete line has been drained is a line
+        self.compact();
+        // What is left after every complete line has been carved is a line
         // that never terminates: bytes keep arriving but no message ever
         // completes. Latch off rather than growing without bound.
         //
-        // Measured after the drain, not on the raw appended buffer: a single
+        // Measured after the pass, not on the raw appended buffer: a single
         // write carrying many complete lines is fully consumed here, and
         // disabling the stream over it would cost every later message on it.
         // Peak memory is identical either way — `data` is appended before
         // either check.
-        if self.buf.len() > self.limits.max_stream_buffer_bytes {
+        if self.buffered_len() > self.limits.max_stream_buffer_bytes {
             self.disabled_reason = Some("stream_buffer_exceeded");
             self.buf = Vec::new();
+            self.pos = 0;
+            self.scan = 0;
         }
         out
     }
+
+    /// Drops the consumed prefix, once per `feed`.
+    fn compact(&mut self) {
+        if self.pos == 0 {
+            return;
+        }
+        if self.pos >= self.buf.len() {
+            self.buf.clear();
+        } else {
+            self.moved += (self.buf.len() - self.pos) as u64;
+            self.buf.drain(..self.pos);
+        }
+        // `scan` never trails `pos`: it is at or past the start of the residue.
+        self.scan -= self.pos;
+        self.pos = 0;
+    }
 }
 
-fn parse_line(line: &[u8]) -> Option<JsonRpcMessage> {
-    let v: Value = serde_json::from_slice(line).ok()?;
+/// One line: one message, when it is JSON-RPC.
+fn parse_line(line: &[u8], out: &mut Vec<JsonRpcMessage>) {
+    let Ok(v) = serde_json::from_slice::<Value>(line) else {
+        return;
+    };
+    out.extend(parse_message(&v));
+}
+
+fn parse_message(v: &Value) -> Option<JsonRpcMessage> {
     let obj = v.as_object()?;
     let id = obj.get("id").and_then(normalize_id);
     let method = obj
@@ -282,6 +361,76 @@ mod tests {
         let v = s.feed(b"{\"jsonrpc\":\"2.0\",\"id\":99,\"method\":\"ping\"}\n");
         assert_eq!(v.len(), 1);
         assert_eq!(v[0].id.as_deref(), Some("99"));
+    }
+
+    #[test]
+    fn a_complete_line_longer_than_the_ceiling_is_skipped_and_counted() {
+        // One read carries a short line, a line over the ceiling and another
+        // short line. The long line is never parsed, whatever its size; the
+        // framing around it is intact, so the lines either side still are.
+        let limits = Limits {
+            max_stream_buffer_bytes: 64,
+            ..Default::default()
+        };
+        let mut s = JsonRpcStream::new(limits);
+        let long = format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{{\"x\":\"{}\"}}}}\n",
+            "y".repeat(100)
+        );
+        let mut data = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"a\"}\n".to_vec();
+        data.extend_from_slice(long.as_bytes());
+        data.extend_from_slice(b"{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"c\"}\n");
+        let v = s.feed(&data);
+        let ids: Vec<_> = v.iter().map(|m| m.id.as_deref().unwrap()).collect();
+        assert_eq!(ids, ["1", "3"]);
+        assert_eq!(s.lines_over_cap(), 1);
+        assert_eq!(s.disabled_reason(), None);
+        // A line exactly at the ceiling is still parsed.
+        let at = format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"{}\"}}",
+            "m".repeat(28)
+        );
+        assert_eq!(at.len(), 64);
+        assert_eq!(s.feed(format!("{at}\n").as_bytes()).len(), 1);
+        assert_eq!(s.lines_over_cap(), 1);
+    }
+
+    #[test]
+    fn a_read_of_many_short_lines_is_linear_not_quadratic() {
+        // 256 KiB of empty lines in ONE read: removing each line from the
+        // front of the buffer moved the rest of the read once per line, about
+        // 34 GB of memmove for this input.
+        let raw = vec![b'\n'; 256 * 1024];
+        let mut s = JsonRpcStream::new(Limits::default());
+        assert!(s.feed(&raw).is_empty());
+        assert!(s.bytes_moved() <= 2 * raw.len() as u64);
+        assert!(s.bytes_scanned() <= raw.len() as u64);
+    }
+
+    #[test]
+    fn a_long_line_arriving_in_many_reads_is_searched_once() {
+        // A 1 MiB line in 1 KiB reads: searching the whole held line for a
+        // newline on every read examined ~512 MB. The search resumes where the
+        // last one stopped.
+        let mut line = format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":\"{}\"}}",
+            "z".repeat(1 << 20)
+        )
+        .into_bytes();
+        line.push(b'\n');
+        let mut s = JsonRpcStream::new(Limits::default());
+        let mut got = Vec::new();
+        for part in line.chunks(1024) {
+            got.extend(s.feed(part));
+        }
+        assert_eq!(got.len(), 1);
+        assert!(
+            s.bytes_scanned() <= line.len() as u64,
+            "scanned {} bytes for a {}-byte line",
+            s.bytes_scanned(),
+            line.len()
+        );
+        assert!(s.bytes_moved() <= 2 * line.len() as u64);
     }
 
     #[test]

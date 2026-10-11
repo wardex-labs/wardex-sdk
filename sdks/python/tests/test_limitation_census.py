@@ -243,6 +243,10 @@ _MEMBER_SITES: dict[str, frozenset[str]] = {
     "NO_WIRE_EVIDENCE": frozenset({"_adapters/_codex_exec.py"}),
     "SUBPROCESS_MODEL_CALLS_UNOBSERVED": frozenset({"_adapters/_codex_exec.py"}),
     # --- caps ---
+    # HTTP/2's half of the body cap: the h2 tracker's `_mk` turns the native
+    # transaction's per-direction truncation flags into the member. HTTP/1's half
+    # is a Rust string, recorded in `_CENSUS_RUST`.
+    "BODY_CAP_EXCEEDED": frozenset({"_interceptors/_trackers.py"}),
     "GRPC_MESSAGE_TRUNCATED": frozenset({"_semantics/_grpc.py"}),
     "WS_PAYLOAD_TRUNCATED": frozenset({"_interceptors/_seam.py", "_interceptors/_trackers.py"}),
     "CONNECTION_EVICTED": frozenset({"_interceptors/_seam.py"}),
@@ -475,8 +479,8 @@ mirror image — three source sites for two decisions, because `_units.py` and t
 adapter each name it at the tier that CHOSE `ParentSource.UNIT_SOLE` and
 `_parentage.py`'s table would have attached it there regardless.
 
-`BODY_CAP_EXCEEDED` is absent for a different reason: it is produced in Rust and
-crosses the PyO3 boundary as a string, so `_CENSUS_RUST` is where it is
+`BODY_CAP_EXCEEDED` is here for HTTP/2 alone. On HTTP/1 it is produced in Rust and
+crosses the PyO3 boundary as a string, so `_CENSUS_RUST` is where that half is
 recorded. `_protocol/_http1.py` resolves it with `Limitation.from_wire` — the one
 string-to-member crossing left — and `_interceptors/_seam.py` copies the
 resulting member onto the span. Neither spells a member out, so neither appears
@@ -490,10 +494,13 @@ _DISABLED_REASONS: frozenset[str] = frozenset(
         "chunk_size_exceeded",
         "stream_buffer_exceeded",
         # The HTTP/2 connection latch (`crates/wardex-protocol/src/http2.rs`).
-        # All four latch the whole connection before any transaction exists,
+        # All of them latch the whole connection before any transaction exists,
         # so none has a span to ride; the seam counts them
         # (`interceptors.seam.parser_disabled`) and debug mode prints them.
+        # `stream_buffer_exceeded` above is one of them too: header blocks left
+        # awaiting CONTINUATION past `max_streams` or `max_stream_buffer_bytes`.
         "hpack_decode_failed",
+        "hpack_table_size_exceeded",
         "continuation_without_headers",
         "push_promise_unsynced",
         "frame_malformed",
@@ -513,10 +520,11 @@ contract and one a debug string.
 _TWO_FATES = "stream_buffer_exceeded"
 """The one string that is both, and the trap §6.5.1 names explicitly.
 
-The HTTP/1 latch (`crates/wardex-protocol/src/http1.rs`) is a `disabled_reason`
-and stays out of the enum. The MCP-stdio JSON-RPC instance (`json_rpc.rs`)
-happens with a pending request already open, so a span exists and design §4.6
-site-3 makes it reportable as `Limitation.STREAM_BUFFER_EXCEEDED`. The member is
+The HTTP/1 and HTTP/2 latches (`crates/wardex-protocol/src/http1.rs`,
+`http2.rs`) are `disabled_reason`s and stay out of the enum. The MCP-stdio
+JSON-RPC instance (`json_rpc.rs`) happens with a pending request already open,
+so a span exists and design §4.6 site-3 makes it reportable as
+`Limitation.STREAM_BUFFER_EXCEEDED`. The member is
 therefore correct AND the string must not be reachable from the span-marker
 scanner today, because nothing reports it yet. Both halves are asserted below;
 either one alone would let the trap close.
@@ -2484,8 +2492,8 @@ def test_stream_buffer_exceeded_has_two_fates(
 
     It IS a member, because design §4.6 site-3 makes the MCP-stdio JSON-RPC
     instance reportable on a span that already exists. It is NOT emitted as a
-    span marker today, because that wiring has not landed; today's two
-    occurrences are both parser latches. Assert only the first half and a future
+    span marker today, because that wiring has not landed; today's three
+    occurrences are all parser latches. Assert only the first half and a future
     reader concludes the HTTP/1 latch should be promoted too; assert only the
     second and someone deletes the member as unused.
     """
@@ -2494,6 +2502,7 @@ def test_stream_buffer_exceeded_has_two_fates(
     assert _TWO_FATES not in rust_census.markers
     assert rust_census.disabled_reasons[_TWO_FATES] == {
         "crates/wardex-protocol/src/http1.rs",
+        "crates/wardex-protocol/src/http2.rs",
         "crates/wardex-protocol/src/json_rpc.rs",
     }
 
