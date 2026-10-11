@@ -619,6 +619,8 @@ class Runtime:
     # -- signals ------------------------------------------------------------
 
     def handle_signal(self, signum: int, frame: object) -> None:
+        if _ledger.hold_signal(_handler, signum, frame):
+            return  # it landed inside a ledger fold on this thread: it runs as the fold ends
         client, prev, close_units = self._signal_state(signum)
         if client is not None:
             # Nothing here may wake the batch worker: the wake takes the plain

@@ -17,7 +17,8 @@ cases are the contract:
     once per interval;
   * a fork child's first report carries none of the parent's counts;
   * a drain never waits for the ledger, and neither does a signal's flush;
-  * a process dying on a signal ships the counts it holds, or says them;
+  * a process dying on a signal ships the counts it holds, or says them, and
+    a signal that lands inside a fold waits for the fold to end;
   * one failed batch is accounted once, however its transport raised, and
     is not kept once its drain is over.
 
@@ -38,6 +39,7 @@ import textwrap
 import threading
 import time
 from collections.abc import Iterator
+from contextlib import ExitStack, contextmanager
 from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import SimpleNamespace
@@ -166,6 +168,42 @@ def _client(url: str, *, timeout: float = 5.0, **limits: int) -> Client:
     client = Client(config, WardexTransport(url, KEY, timeout=timeout))
     client._worker.stop()
     return client
+
+
+@contextmanager
+def _folding_here() -> Iterator[None]:
+    """The fold held on this thread, its flag set, by no fold function: what a
+    frame mid-fold looks like to a reader, without the frame a signal is held
+    for."""
+    assert _ledger._free()
+    _ledger._folding = True
+    try:
+        yield
+    finally:
+        _ledger._end_fold()
+
+
+@contextmanager
+def _folding_on_another_thread() -> Iterator[None]:
+    """The fold held mid-way by another thread, as one the interpreter switched
+    away from in the middle of a fold holds it."""
+    holding, release = threading.Event(), threading.Event()
+
+    def hold() -> None:
+        with _ledger._FOLD:
+            _ledger._folding = True
+            holding.set()
+            release.wait(5.0)
+            _ledger._folding = False
+
+    holder = threading.Thread(target=hold)
+    holder.start()
+    assert holding.wait(5.0)
+    try:
+        yield
+    finally:
+        release.set()
+        holder.join(5.0)
 
 
 # -- (a) a buffer eviction ------------------------------------------------------
@@ -644,23 +682,129 @@ def test_reports_a_hook_left_unreadable_are_not_cut_for_that_envelope():
     assert report.discarded_events == (("table_full:entry", 2),)
 
 
-def test_counts_still_in_the_inbox_are_said_while_another_frame_folds():
-    """A shutdown signal that lands inside a fold on its own thread cannot fold
-    in turn: what the interrupted fold had not reached is still in the inbox,
-    and the line the handler says before the process dies includes it."""
+def test_counts_still_in_the_inbox_are_said_while_another_thread_folds():
+    """The line a dying process says reads the ledger without waiting for a
+    fold another thread is in the middle of: what that fold had not reached is
+    still in the inbox, and the line includes it."""
     _ledger.record(DropReason.TABLE_FULL, 5)
     _ledger.snapshot()  # folded into the pending table
-    assert _ledger._claim()  # "the signal landed inside a fold on this thread"
-    try:
+    with _folding_on_another_thread():
         for _ in range(3):
             _ledger.record(DropReason.QUEUE_OVERFLOW)
         held = _ledger.undelivered()
-    finally:
-        _ledger._release()
     assert held == {
         (DropReason.TABLE_FULL, DropUnit.ENTRY): 5,
         (DropReason.QUEUE_OVERFLOW, DropUnit.SPAN): 3,
     }
+
+
+@pytest.mark.parametrize(
+    ("settle", "said"),
+    [("done", {}), ("unsent_definite", {"table_full": 3}), ("unsent_maybe", {"table_full": 3})],
+)
+def test_a_settle_queued_behind_another_threads_fold_is_read_as_it_will_land(settle, said):
+    """A drain whose POST went through cannot fold its `done` while another
+    thread holds the fold, so the report is still out. Read around that fold,
+    a delivered report is not called undelivered (the false line `close()`
+    printed); a failed one is, as the settle will leave it."""
+    _ledger.record(DropReason.TABLE_FULL, 3)
+    sent = _ledger.attach(_envelope(), WardexTransport(CLOSED, KEY), 0)
+    with _folding_on_another_thread():
+        if settle == "done":
+            _ledger.done(sent)
+        else:
+            _ledger.unsent(sent, definite=settle == "unsent_definite")
+        assert _ledger._OUT, "the settle should still be queued"
+        held = _ledger.undelivered()
+    assert {r.value: n for (r, _), n in held.items()} == said
+    assert {r.value: n for (r, _), n in _ledger.undelivered().items()} == said  # folded now
+
+
+def test_close_says_nothing_while_another_thread_holds_the_fold_across_it(receiver, capsys):
+    """End to end: the fold held by another thread from the final POST onward.
+    The receiver stored the report, so `close()` has nothing to say."""
+    from wardex_sdk._assembly import report_undelivered_drops
+
+    client = _client(receiver.url)
+    _ledger.record(DropReason.TABLE_FULL, 3)
+    client.capture_span(_span())
+    export = client._transport.export
+    with ExitStack() as stack:
+
+        def held_from_the_post(envelope, *, timeout=None):  # noqa: ANN001, ANN202
+            stack.enter_context(_folding_on_another_thread())
+            return export(envelope, timeout=timeout)
+
+        client._transport.export = held_from_the_post  # type: ignore[method-assign]
+        capsys.readouterr()
+        client.close(1.0)
+        report_undelivered_drops(client)  # what the runtime's teardown runs next
+        err = capsys.readouterr().err
+    assert _events([r for _, d in receiver.decoded() for r in _reports(d)]) == {
+        "table_full:entry": 3
+    }
+    assert "no receiver has confirmed" not in err
+
+
+@pytest.mark.parametrize("direction", ["cut", "returned"])
+def test_a_report_whose_counts_are_moving_is_counted_once(direction):
+    """Counts move between a report and the pending table in one store, the
+    table replaced whole. Until it is, `_MOVING` names the report and the
+    table that also holds them, and a reader around the fold counts them from
+    the table only; after it, from wherever they now are."""
+    _ledger.record(DropReason.TABLE_FULL, 4)
+    _ledger.snapshot()
+    before = _ledger._PENDING
+    sent = _ledger.attach(_envelope(), WardexTransport(CLOSED, KEY), 0)
+    [report] = sent.client_reports
+    expected = {(DropReason.TABLE_FULL, DropUnit.ENTRY): 4}
+    with _folding_on_another_thread():
+        if direction == "cut":
+            # Out already, the counts still in the table it is being cut from.
+            _ledger._PENDING = before
+            _ledger._MOVING[0] = (report, before)
+        else:
+            # Definitely refused: the counts already back in a new table, the
+            # report not yet taken off the reports out.
+            table = {(DropReason.TABLE_FULL, DropUnit.ENTRY): 4}
+            _ledger._PENDING = table
+            _ledger._MOVING[0] = (report, table)
+        assert _ledger.undelivered() == expected
+        _ledger._MOVING[0] = None
+        _ledger._PENDING = {} if direction == "cut" else table
+        if direction == "returned":
+            _ledger._OUT.pop(id(report))
+        assert _ledger.undelivered() == expected
+
+
+def test_a_cut_on_another_thread_is_counted_while_it_is_parked(monkeypatch):
+    """The same with a real cut, parked by the interpreter on another thread
+    after the report is built: a dying process's line read then has every
+    count, though no table and no report out has them yet."""
+    _ledger.record(DropReason.TABLE_FULL, 6)
+    _ledger.snapshot()
+    parked, resume = threading.Event(), threading.Event()
+    real = _ledger._monotonic
+
+    def parks_in_the_cut() -> float:
+        if sys._getframe(1).f_code is _ledger._cut_held.__code__:
+            parked.set()
+            resume.wait(5.0)
+        return real()
+
+    monkeypatch.setattr(_ledger, "_monotonic", parks_in_the_cut)
+    cutter = threading.Thread(
+        target=lambda: _ledger.attach(_envelope(), WardexTransport(CLOSED, KEY), 0)
+    )
+    cutter.start()
+    try:
+        assert parked.wait(5.0)
+        held = _ledger.undelivered()
+    finally:
+        resume.set()
+        cutter.join(5.0)
+    assert held == {(DropReason.TABLE_FULL, DropUnit.ENTRY): 6}
+    assert _ledger.undelivered() == {(DropReason.TABLE_FULL, DropUnit.ENTRY): 6}
 
 
 def test_unconfirmed_reports_are_bounded_and_the_overflow_is_counted():
@@ -717,11 +861,8 @@ def test_a_drain_that_could_not_take_the_fold_does_not_spend_the_interval(receiv
     sends the counts at once rather than an interval later."""
     client = _client(receiver.url)
     _ledger.record(DropReason.INTERNAL_SDK_ERROR)
-    assert _ledger._claim()  # "another frame is folding"
-    try:
+    with _folding_on_another_thread():
         client.flush(5.0)
-    finally:
-        _ledger._release()
     assert receiver.posts == []
     client.flush(5.0)
     assert len(receiver.posts) == 1
@@ -769,6 +910,114 @@ def test_a_process_dying_on_a_signal_ships_or_says_what_the_ledger_holds(receive
     else:
         [line] = said
         assert "shutdown signal" in line and "table_full:entry=6" in line
+
+
+def test_a_signal_landing_inside_a_fold_runs_as_the_fold_ends(monkeypatch):
+    """A handler run inside a cut would find the counts in the cutting frame's
+    hands, in no table: it could neither ship them nor say them. Held, it runs
+    as the fold ends, and sees them out on the report."""
+    seen: list[tuple[int, dict]] = []
+    held: list[bool] = []
+    real = _ledger._monotonic
+
+    def handler(signum: int, frame: object) -> None:
+        seen.append((signum, _ledger.undelivered()))
+
+    def inside_the_cut() -> float:
+        caller = sys._getframe(1)
+        if caller.f_code is _ledger._cut_held.__code__ and not held:
+            held.append(_ledger.hold_signal(handler, signal.SIGTERM, caller))
+            assert seen == [], "the handler ran inside the fold"
+        return real()
+
+    _ledger.record(DropReason.TABLE_FULL, 6)
+    monkeypatch.setattr(_ledger, "_monotonic", inside_the_cut)
+    sent = _ledger.attach(_envelope(), WardexTransport(CLOSED, KEY), 0)
+    assert held == [True]
+    assert seen == [(signal.SIGTERM, {(DropReason.TABLE_FULL, DropUnit.ENTRY): 6})]
+    assert [r.discarded_events for r in sent.client_reports] == [(("table_full:entry", 6),)]
+
+
+def test_a_signal_is_held_only_for_a_fold_it_can_see_end():
+    """Nothing folding, another thread folding, or a fold flag that no fold
+    function on the interrupted stack set: the handler runs now, as before,
+    so a fold flag left set can never keep a signal from its handler."""
+
+    def handler(signum: int, frame: object) -> None:
+        raise AssertionError("a handler that was not held ran")
+
+    here = sys._getframe()
+    assert not _ledger.hold_signal(handler, signal.SIGTERM, here)
+    with _folding_on_another_thread():
+        assert not _ledger.hold_signal(handler, signal.SIGTERM, here)
+    with _folding_here():
+        assert not _ledger.hold_signal(handler, signal.SIGTERM, here)
+    assert not _ledger._HELD_SIGNALS
+
+
+_SIGNAL_IN_FOLD_CHILD = r"""
+import os, signal, sys, time
+import wardex_sdk
+from wardex_sdk import _hub
+from wardex_sdk._assembly import _ledger
+from wardex_sdk._assembly._ledger import DropReason
+from wardex_sdk._config import BackendConfig
+
+wardex_sdk.init(backend=BackendConfig(api_key=sys.argv[2], base_url=sys.argv[1]), intercept=False)
+client = _hub.get_client()
+client._worker.stop()
+for _ in range(_ledger._FOLD_AT - 1):
+    _ledger.record(DropReason.TABLE_FULL)
+
+
+def kill_at(code, callee):
+    def hook(frame, event, arg):
+        if event == "c_call" and frame.f_code is code and _ledger._folding:
+            if callee is None or arg is callee:
+                sys.setprofile(None)
+                os.kill(os.getpid(), signal.SIGTERM)
+    return hook
+
+
+if sys.argv[3] == "record":
+    # The next record folds the inbox, and the signal lands inside that fold.
+    sys.setprofile(kill_at(_ledger.record.__code__, None))
+    _ledger.record(DropReason.TABLE_FULL)
+else:
+    # A flush's cut, where the counts are no longer only in the pending table.
+    _ledger.record(DropReason.TABLE_FULL)
+    sys.setprofile(kill_at(_ledger._cut_held.__code__, time.time_ns))
+    client.flush(5.0)
+sys.setprofile(None)
+"""
+
+
+@posix_signals
+@pytest.mark.parametrize("where", ["record", "cut"])
+def test_a_signal_landing_inside_a_fold_is_neither_lost_nor_kept_from_the_receiver(receiver, where):
+    """A real SIGTERM, landing while the main thread folds. In a record's fold,
+    the dying flush used to find the fold taken and say on stderr what the
+    receiver, up and reachable, never got; now it ships. In a flush's cut, the
+    counts were in the cutting frame alone and reached neither channel; now
+    the report that cut made is out on a POST the process dies before sending,
+    and the line says it."""
+    proc = subprocess.run(
+        [sys.executable, "-c", _SIGNAL_IN_FOLD_CHILD, receiver.url, KEY, where],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert proc.returncode == -signal.SIGTERM, proc.stderr
+    shipped = _events([r for _, d in receiver.decoded() for r in _reports(d)])
+    said = [ln for ln in proc.stderr.splitlines() if "no receiver has confirmed" in ln]
+    every = f"table_full:entry={_ledger._FOLD_AT}"
+    if where == "record":
+        assert shipped == {"table_full:entry": _ledger._FOLD_AT}
+        assert said == []
+    else:
+        assert shipped == {}
+        [line] = said
+        assert every in line
 
 
 def test_close_sends_what_the_ledger_holds_whatever_the_interval(receiver, monkeypatch):
@@ -965,22 +1214,22 @@ def test_a_signal_flush_does_not_spend_its_budget_behind_a_recording(held):
     drain = threading.Thread(target=lambda: client.flush(5.0))
     drain.start()
     assert entered.wait(5.0)
-    # "The signal landed inside a record on this thread": the fold claimed
-    # mid-record, or the counters' lock held mid-bump.
-    if held == "ledger_fold":
-        assert _ledger._claim()
-        release = _ledger._release
-    else:
-        counters._lock.acquire()
-        release = counters._lock.release
+    # "This thread is inside a record": the fold held mid-record, or the
+    # counters' lock held mid-bump. A signal landing in a fold now waits for it
+    # to end, but the flush must not need that to finish in time.
     try:
-        client.capture_span(_span())
-        gate.set()
-        started = time.monotonic()
-        client._shutdown_flush(2.0)  # what the signal handler runs, on this thread
-        elapsed = time.monotonic() - started
+        with ExitStack() as held_here:
+            if held == "ledger_fold":
+                held_here.enter_context(_folding_here())
+            else:
+                counters._lock.acquire()
+                held_here.callback(counters._lock.release)
+            client.capture_span(_span())
+            gate.set()
+            started = time.monotonic()
+            client._shutdown_flush(2.0)  # what the signal handler runs, on this thread
+            elapsed = time.monotonic() - started
     finally:
-        release()
         drain.join(5.0)
     failed = counters.get("transport.wardex.export_failed")
     client.close(0.5)

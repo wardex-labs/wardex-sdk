@@ -24,7 +24,8 @@ can deadlock on it. It also calls no Python function, the fold included, which
 matters in `guard.__exit__` at the recursion limit: a swallowed `RecursionError`
 leaves only the frames it unwound, and the counter bump beside it already needs
 one. A fold that pushed a frame would let that error escape the guard on one
-swallow in `_FOLD_AT`, chosen by how full the inbox happened to be.
+swallow in `_FOLD_AT`, chosen by how full the inbox happened to be. (The one
+call it can make is a signal handler held for the fold, below.)
 Every reader folds before it reads, so a record waiting in the inbox is never
 missed. The read for the wire (`attach`) never waits either: a drain that
 cannot take the fold ships its envelope without a report, and the counts ride
@@ -32,9 +33,19 @@ the next one.
 
 The fold lock is an RLock with a `_folding` flag rather than a plain Lock,
 because the SDK keeps exactly one non-reentrant lock and a source scan holds it
-to that. Reentrancy is the one thing the flag adds back: a signal handler that
-re-enters on the thread already folding gets the RLock, sees the flag, and
-leaves its entry in the inbox for the next fold.
+to that. Reentrancy is the one thing the flag adds back: a finalizer that
+records on the thread already folding gets the RLock, sees the flag, and leaves
+its entry in the inbox for the next fold.
+
+A SIGNAL NEVER RUNS INSIDE A FOLD. A fold moves counts from one table to
+another, and between two steps they are in the folding frame's hands, in no
+table. A shutdown handler that ran there could neither ship them nor say them,
+and its process dies before the frame resumes. So wardex's handler asks
+`hold_signal` first: when it interrupted a fold on its own thread, it is held
+and runs as that fold ends, microseconds later, with the tables whole. A fold
+on another thread is read around instead (`undelivered`): each move between
+tables is ordered so that a reader finds it on one side only while that fold
+is parked.
 
 DELIVERY, and why a count is never sent twice nor dropped. `attach` cuts the
 pending counts into a report stamped with a strictly increasing `timestamp_ns`,
@@ -103,6 +114,7 @@ __all__ = [
     "done",
     "due",
     "expedite",
+    "hold_signal",
     "record",
     "record_failed_send",
     "record_items",
@@ -161,17 +173,28 @@ _INBOX: deque[tuple[DropReason | None, DropUnit | None, int, str | None]] = dequ
 #: Taken only with `acquire(blocking=False)`; see the module docstring.
 _FOLD = threading.RLock()
 _folding = False
+#: Signal handlers that landed inside a fold on its own thread, as
+#: (handler, signum, frame), run when that fold ends (`hold_signal`).
+_HELD_SIGNALS: deque[tuple[Callable[[int, object], object], int, object]] = deque()
 #: Process totals, monotonic: what `snapshot()` reads.
 _TOTALS: dict[tuple[DropReason, DropUnit], int] = {}
 _WHERE: dict[tuple[DropReason, str], int] = {}
-#: Counted but not yet cut into a report.
+#: Counted but not yet cut into a report. Replaced whole, never emptied key by
+#: key, when counts move between it and a report; see `_MOVING`.
 _PENDING: dict[tuple[DropReason, DropUnit], int] = {}
+#: A report whose counts are in the pending table too, for as long as
+#: `_PENDING` is the table named here: a cut has it out before the table loses
+#: them, and a definitely-failed report is out until the table gains them. A
+#: reader that cannot take the fold counts that report's counts from the table
+#: only.
+_MOVING: list[tuple[ClientReport, dict] | None] = [None]
 _failed_sends = 0
 #: Reports whose POST may or may not have arrived, oldest first.
 _UNACKED: deque[ClientReport] = deque()
 #: (report, outcome), applied in order at the next fold: True from `unsent`
 #: when the receiver definitely did not store it, False when it may have, None
-#: from `done` (delivered, unless a failure settled it first).
+#: from `done` (delivered, unless a failure settled it first). An entry leaves
+#: only once its report is where the outcome puts it.
 _SETTLED: deque[tuple[ClientReport, bool | None]] = deque()
 #: The reports handed out and not settled yet, by identity (each is held here,
 #: so its id cannot be reused while it is), with whether it was cut fresh then.
@@ -232,24 +255,28 @@ def record(
             arm(after_in_child=_at_fork_child)
     if len(_INBOX) < _FOLD_AT or not _FOLD.acquire(blocking=False):
         return
-    try:
-        if not _folding:
-            _folding = True
-            try:
-                while _INBOX:
-                    r, u, k, w = _INBOX.popleft()
-                    if r is None or u is None:
-                        _failed_sends += k
-                        continue
-                    _TOTALS[r, u] = _TOTALS.get((r, u), 0) + k
-                    _PENDING[r, u] = _PENDING.get((r, u), 0) + k
-                    if w is not None:
-                        w = w if (r, w) in _WHERE or len(_WHERE) < _WHERE_CAP else "<other>"
-                        _WHERE[r, w] = _WHERE.get((r, w), 0) + k
-            finally:
-                _folding = False
-    finally:
+    if _folding:
         _FOLD.release()
+        return
+    _folding = True  # set where the `finally` that clears it begins
+    try:
+        while _INBOX:
+            r, u, k, w = _INBOX[0]
+            if r is None or u is None:
+                _failed_sends += k
+                _INBOX.popleft()
+                continue
+            _TOTALS[r, u] = _TOTALS.get((r, u), 0) + k
+            if w is not None:
+                w = w if (r, w) in _WHERE or len(_WHERE) < _WHERE_CAP else "<other>"
+                _WHERE[r, w] = _WHERE.get((r, w), 0) + k
+            _PENDING[r, u] = _PENDING.get((r, u), 0) + k
+            _INBOX.popleft()
+    finally:
+        _folding = False
+        _FOLD.release()
+        if _HELD_SIGNALS:
+            _run_held_signals()
 
 
 def record_items(
@@ -285,6 +312,31 @@ def snapshot() -> LedgerSnapshot:
                 if label is not None:
                     where[(reason, label)] = where.get((reason, label), 0) + n
     return LedgerSnapshot(counts=MappingProxyType(counts), where=MappingProxyType(where))
+
+
+def hold_signal(handler: Callable[[int, object], object], signum: int, frame: object) -> bool:
+    """A signal handler's first question: did this signal land inside a fold
+    on this thread? Then `handler(signum, frame)` is held, run as that fold
+    ends, and the answer is True: the caller returns at once. Otherwise False.
+
+    The fold is only trusted to end when one of the functions that fold is on
+    the stack the signal interrupted, since those wait on nothing and always
+    reach the `finally` that runs the held handler. A fold flag nothing on that
+    stack set is not waited for: the handler runs now, as it always did."""
+    if not _folding or not _FOLD.acquire(blocking=False):
+        return False  # nothing is folding, or another thread is
+    try:
+        if not _folding:
+            return False
+        at = frame
+        while at is not None:
+            if getattr(at, "f_code", None) in _FOLDERS:
+                _HELD_SIGNALS.append((handler, signum, frame))
+                return True
+            at = getattr(at, "f_back", None)
+        return False
+    finally:
+        _FOLD.release()
 
 
 # --- delivery -----------------------------------------------------------------
@@ -330,7 +382,7 @@ def attach(envelope: Envelope, transport: object, queue_depth: int) -> Envelope:
     take the cut counts with it. Its `client_reports` as a list, as `list(...)`
     makes them, is read as the tuple it was; as anything else but a tuple,
     nothing is added and the counts ride the next envelope."""
-    global _last_solo
+    global _folding, _last_solo
     if type(envelope) is not Envelope or not carries(transport):
         return envelope
     held = envelope.client_reports
@@ -339,19 +391,19 @@ def attach(envelope: Envelope, transport: object, queue_depth: int) -> Envelope:
     if type(held) is not tuple:
         return envelope
     alone = not envelope.spans and not envelope.state_snapshots
-    if not _claim():
+    if not _free():
         return envelope
+    _folding = True  # set where the `finally` that clears it begins
     try:
         _fold_held()
         reports = list(_UNACKED)
-        _OUT.update((id(r), (r, False)) for r in reports)
+        _OUT.update((id(r), (r, False)) for r in reports)  # out before they leave `_UNACKED`
         _UNACKED.clear()
         fresh = _cut_held(queue_depth)
         if fresh is not None:
             reports.append(fresh)
-            _OUT[id(fresh)] = (fresh, True)
     finally:
-        _release()
+        _end_fold()
     if not reports:
         return envelope
     if alone:
@@ -412,12 +464,29 @@ def undelivered() -> dict[tuple[DropReason, DropUnit], int]:
     """What no receiver has confirmed: the pending counts, every report held
     for resending, and every report still out on a POST nobody settled.
 
-    When another frame holds the fold -- a signal handler that interrupted a
-    record on its own thread is the caller that gets here -- the records it
-    has not reached are still in the inbox, and are counted from there."""
+    When another thread holds the fold, this reads around it, for that fold
+    parked wherever the interpreter switched away from it: what it has not
+    reached is still in the inbox; a report whose settle is queued is counted
+    as that settle leaves it (a delivered one not at all), once even while it
+    is moving into `_UNACKED`; and a report whose counts are moving to or from
+    the pending table is counted from the table only (`_MOVING`). The one
+    record that fold is adding may be counted twice, never missed. The reads
+    are not one snapshot: a fold that moves on in the middle of them can skew
+    the result by what it moved."""
     folded = _try_fold()
-    out = dict(_PENDING)
-    for report in tuple(_UNACKED) + tuple(r for r, _ in tuple(_OUT.values())):
+    moving = _MOVING[0]
+    table = _PENDING
+    out = dict(table)
+    first: dict[int, bool | None] = {}
+    for report, outcome in tuple(_SETTLED):
+        first.setdefault(id(report), outcome)
+    reports = {id(r): r for r in tuple(_UNACKED)}
+    for report, _ in tuple(_OUT.values()):
+        if id(report) not in first or first[id(report)] is not None:
+            reports[id(report)] = report  # a delivered one is not
+    for report in reports.values():
+        if moving is not None and report is moving[0] and table is moving[1]:
+            continue  # its counts are in the table already
         for key, n in _keys_of(report):
             out[key] = out.get(key, 0) + n
     if not folded:
@@ -430,32 +499,47 @@ def undelivered() -> dict[tuple[DropReason, DropUnit], int]:
 # --- the fold -----------------------------------------------------------------
 
 
-def _claim() -> bool:
-    """Take the fold for this frame without waiting. False when another
-    thread holds it, or this thread is already inside a fold it interrupted."""
-    global _folding
+def _free() -> bool:
+    """Take the fold lock without waiting, for a frame about to fold, which
+    then sets `_folding` and opens the `try` whose `finally` is `_end_fold`.
+    False, holding nothing, when another thread holds the lock or this thread
+    is folding already (in a frame below this one, or a fold that ran this as
+    a finalizer)."""
     if not _FOLD.acquire(blocking=False):
         return False
     if _folding:
         _FOLD.release()
         return False
-    _folding = True
     return True
 
 
-def _release() -> None:
+def _end_fold() -> None:
+    """Close the fold this frame opened, then run what it held (`hold_signal`)."""
     global _folding
     _folding = False
     _FOLD.release()
+    if _HELD_SIGNALS:
+        _run_held_signals()
+
+
+def _run_held_signals() -> None:
+    """Run the signal handlers a fold held, in arrival order. The fold has
+    ended, so each sees the tables whole and may fold, attach, or end the
+    process, as it would have where the signal landed."""
+    while _HELD_SIGNALS:
+        handler, signum, frame = _HELD_SIGNALS.popleft()
+        handler(signum, frame)
 
 
 def _try_fold() -> bool:
-    if not _claim():
+    global _folding
+    if not _free():
         return False
+    _folding = True  # set where the `finally` that clears it begins
     try:
         _fold_held()
     finally:
-        _release()
+        _end_fold()
     return True
 
 
@@ -465,54 +549,74 @@ def _add(table: dict, key: object, n: int) -> None:
 
 def _fold_inbox_held() -> None:
     """Move the inbox into the tables. Fold held. `record` carries a copy of
-    this loop, word for word, and a test holds the two the same."""
+    this loop, word for word, and a test holds the two the same. A record
+    leaves the inbox only once it is in the pending table."""
     global _failed_sends
     while _INBOX:
-        r, u, k, w = _INBOX.popleft()
+        r, u, k, w = _INBOX[0]
         if r is None or u is None:
             _failed_sends += k
+            _INBOX.popleft()
             continue
         _TOTALS[r, u] = _TOTALS.get((r, u), 0) + k
-        _PENDING[r, u] = _PENDING.get((r, u), 0) + k
         if w is not None:
             w = w if (r, w) in _WHERE or len(_WHERE) < _WHERE_CAP else "<other>"
             _WHERE[r, w] = _WHERE.get((r, w), 0) + k
+        _PENDING[r, u] = _PENDING.get((r, u), 0) + k
+        _INBOX.popleft()
 
 
 def _fold_held() -> None:
-    """Move the inbox and the settled reports into the tables. Fold held."""
-    global _failed_sends
+    """Move the inbox and the settled reports into the tables. Fold held.
+
+    Each settle is read in place and leaves `_SETTLED` last; its report leaves
+    `_OUT` only once it is in `_UNACKED` or its counts are pending again. So a
+    reader that cannot take the fold finds every report in one place."""
+    global _PENDING, _failed_sends
     _fold_inbox_held()
     while _SETTLED:
-        report, definite = _SETTLED.popleft()
-        out = _OUT.pop(id(report), None)
-        if out is None or definite is None:
-            continue  # delivered, or not out (settled already, or never handed out)
-        if definite and out[1]:  # a fresh report the receiver certainly did not store
+        report, definite = _SETTLED[0]
+        out = _OUT.get(id(report))
+        if out is not None and definite and out[1]:
+            # A fresh report the receiver certainly did not store: its counts
+            # are pending again, in one store, before it stops being out.
+            table = dict(_PENDING)
             for key, n in _keys_of(report):
-                _add(_PENDING, key, n)
+                table[key] = table.get(key, 0) + n
+            _MOVING[0] = (report, table)
+            _PENDING = table
             _failed_sends += report.failed_sends
-            continue
-        _UNACKED.append(report)
-        while len(_UNACKED) > _UNACKED_CAP:
-            _UNACKED.remove(min(_UNACKED, key=lambda r: r.timestamp_ns))
-            _add(_TOTALS, (DropReason.LEDGER_OVERFLOW, DropUnit.REPORT), 1)
-            _add(_PENDING, (DropReason.LEDGER_OVERFLOW, DropUnit.REPORT), 1)
+        elif out is not None and definite is not None:
+            _UNACKED.append(report)
+            while len(_UNACKED) > _UNACKED_CAP:
+                _add(_TOTALS, (DropReason.LEDGER_OVERFLOW, DropUnit.REPORT), 1)
+                _add(_PENDING, (DropReason.LEDGER_OVERFLOW, DropUnit.REPORT), 1)
+                _UNACKED.remove(min(_UNACKED, key=lambda r: r.timestamp_ns))
+        # Delivered, or not out (settled already, or never handed out): nothing to move.
+        _OUT.pop(id(report), None)
+        _MOVING[0] = None
+        _SETTLED.popleft()
 
 
 def _cut_held(queue_depth: int) -> ClientReport | None:
-    """The pending counts as one new report, or None when there are none."""
-    global _failed_sends, _last_timestamp
-    if not _PENDING and not _failed_sends:
+    """The pending counts as one new report, out from here, or None when
+    there are none. Fold held.
+
+    The report is out before the counts leave the pending table, and they
+    leave it in one store, by replacing the table; until then `_MOVING` says
+    they are in both, so a reader counts them once."""
+    global _PENDING, _failed_sends, _last_timestamp
+    table = _PENDING
+    if not table and not _failed_sends:
         return None
     events: list[tuple[str, int]] = []
-    for key in sorted(_PENDING, key=_wire_key):
-        n = _PENDING.pop(key)
+    rest: dict[tuple[DropReason, DropUnit], int] = {}
+    for key in sorted(table, key=_wire_key):
+        n = table[key]
         events.append((_wire_key(key), min(n, _INT32_MAX)))
         if n > _INT32_MAX:
-            _PENDING[key] = n - _INT32_MAX
+            rest[key] = n - _INT32_MAX
     sends = min(_failed_sends, _INT32_MAX)
-    _failed_sends -= sends
     _last_timestamp = max(time.time_ns(), _last_timestamp + 1)
     report = ClientReport(
         timestamp_ns=_last_timestamp,
@@ -521,6 +625,11 @@ def _cut_held(queue_depth: int) -> ClientReport | None:
         queue_depth=min(max(queue_depth, 0), _INT32_MAX),
         uptime_ms=int((_monotonic() - _started) * 1000),
     )
+    _MOVING[0] = (report, table)
+    _OUT[id(report)] = (report, True)
+    _PENDING = rest
+    _failed_sends -= sends
+    _MOVING[0] = None
     return report
 
 
@@ -540,6 +649,11 @@ def _keys_of(report: ClientReport) -> list[tuple[tuple[DropReason, DropUnit], in
     return out
 
 
+#: The functions that set `_folding`. A frame of one of them on the stack a
+#: signal interrupted is what `hold_signal` takes as proof the fold will end.
+_FOLDERS = frozenset({record.__code__, attach.__code__, _try_fold.__code__})
+
+
 # --- resets -------------------------------------------------------------------
 
 
@@ -547,15 +661,17 @@ def _at_fork_reinit() -> None:
     """Fork-child reset, run from `Runtime.after_in_child` step 0 and from the
     ledger's own fork hook: start from zero with a fresh lock. Acquires
     nothing, since a parent thread may have held the fold at the fork; the
-    parent ships what it counted."""
-    global _FOLD, _folding, _failed_sends, _last_timestamp, _last_solo, _started
+    parent ships what it counted, and runs the handlers its fold held."""
+    global _FOLD, _folding, _PENDING, _failed_sends, _last_timestamp, _last_solo, _started
     global _reset_pid
     _FOLD = threading.RLock()
     _folding = False
     _INBOX.clear()
+    _HELD_SIGNALS.clear()
     _TOTALS.clear()
     _WHERE.clear()
-    _PENDING.clear()
+    _PENDING = {}
+    _MOVING[0] = None
     _UNACKED.clear()
     _SETTLED.clear()
     _OUT.clear()
