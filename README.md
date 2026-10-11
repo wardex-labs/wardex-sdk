@@ -260,7 +260,11 @@ formats (`sk-…`, `AKIA…`, `ghp_…`, JWTs, PEM private keys and more), and a
 value passed under a secret-looking name such as `api_key` or `password`,
 whether it sits in a URL, a JSON body, a form field or a span attribute.
 Argument names stay readable, and each masked span records how many values
-were replaced and by which rule.
+were replaced and by which rule. If masking itself fails on a span, the span
+is never sent unmasked: it leaves with only its ids, kind and timing, named
+`[PII_FILTER_ERROR]` and marked `pii_filter_failed`, and is counted under
+`transport.otlp.pii_scrubbed` (`transport.wardex.pii_scrubbed` for the wardex
+receiver) with one log line. That is a wardex bug; please report it.
 
 ```python
 from wardex_sdk import PIIConfig

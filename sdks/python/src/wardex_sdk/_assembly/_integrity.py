@@ -278,12 +278,11 @@ Two emit sites, and the first is the mechanism the second restates.
     member kept it only until that site was decided on its own evidence, which
     is what the paragraph in ``UNIT_TABLE_FULL`` used to ask for.
 
-    NOTE (census): the four-way merge that loses nothing. ``tool_span_unclosed``
-    folded into this already-declared member because the marker rides the tool span
-    itself, where ``gen_ai.operation.name=execute_tool`` already says the child
-    was a tool. This is the single point where the two drifts overlapped —
-    vocabulary without an emitter meeting an emitter without vocabulary — and
-    without the census it would have frozen into the wire as two names for one
+    NOTE (census): the four-way merge that loses nothing. ``tool_span_unclosed`` folded into this
+    already-declared member because the marker rides the tool span itself, where
+    ``gen_ai.operation.name=execute_tool`` already says the child was a tool. This is the single
+    point where the two drifts overlapped — vocabulary without an emitter meeting an emitter without
+    vocabulary — and without the census it would have frozen into the wire as two names for one
     fact.
     """
 
@@ -308,14 +307,13 @@ Two emit sites, and the first is the mechanism the second restates.
     their parent's teardown — which is that member's exact sentence — and the table-full fact is not
     theirs to report.
 
-    Deliberately NOT widened to ``max_session_entries``: that bound has its own
-    member, ``SESSION_ENTRY_TABLE_FULL`` (43), decided on its own evidence as
-    this paragraph used to ask for. ``crates/wardex-limits`` calls this knob a
-    generalization of that one — same order, same semantics — and the decision
-    turned on the census's operative test rather than on semantics: they are
-    separate FIELDS, so a reader sent to the wrong one raises a number that
-    changes nothing about the marker they are looking at. If the two fields are
-    ever unified, 43 becomes an alias of this member.
+    Deliberately NOT widened to ``max_session_entries``: that bound has its own member,
+    ``SESSION_ENTRY_TABLE_FULL`` (43), decided on its own evidence as this paragraph used to ask
+    for. ``crates/wardex-limits`` calls this knob a generalization of that one — same order, same
+    semantics — and the decision turned on the census's operative test rather than on semantics:
+    they are separate FIELDS, so a reader sent to the wrong one raises a number that changes nothing
+    about the marker they are looking at. If the two fields are ever unified, 43 becomes an alias of
+    this member.
     """
 
     SESSION_ENTRY_TABLE_FULL = "session_entry_table_full"
@@ -474,25 +472,22 @@ Two emit sites, and the first is the mechanism the second restates.
     ``connection_reused``/TTFB story whose epoch is the fork, not the connect. A brand-new
     connection opened in the child matches nothing and carries nothing.
 
-    Not ``CONNECTION_EVICTED`` (24), by the census rule the caps band states:
-    the reader's next action differs, because the KNOB differs. That member
-    names ``limits.max_connections`` — raise it and the marker goes away —
-    while this one names no knob at all: it reports a process event, and no
-    limits field can prevent a host from forking. Merging them would send the
-    reader to turn a knob that cannot help.
+    Not ``CONNECTION_EVICTED`` (24), by the census rule the caps band states: the reader's next
+    action differs, because the KNOB differs. That member names ``limits.max_connections`` — raise
+    it and the marker goes away — while this one names no knob at all: it reports a process event,
+    and no limits field can prevent a host from forking. Merging them would send the reader to turn
+    a knob that cannot help.
 
-    Best-effort by one bounded false positive: the latch keys on ``id()``, so
-    an inherited socket that is garbage-collected before the child touches it
-    can donate its id to a NEW connection, which then wears the marker on one
-    span. That is the pre-existing id-reuse class, bounded to one span per
-    latched id, and accepted — the alternative (holding the socket objects)
-    would pin the parent's file descriptors open for the child's lifetime.
+    Best-effort by one bounded false positive: the latch keys on ``id()``, so an inherited socket
+    that is garbage-collected before the child touches it can donate its id to a NEW connection,
+    which then wears the marker on one span. That is the pre-existing id-reuse class, bounded to one
+    span per latched id, and accepted — the alternative (holding the socket objects) would pin the
+    parent's file descriptors open for the child's lifetime.
 
-    The DISCARDED side of the fork reset — the parent-owned buffer, sessions
-    and units the child drops without emitting — carries no marker anywhere,
-    deliberately: nothing was lost, it ships from the process that owns it.
-    The fork event itself is a process fact, not a span fact, and lives in the
-    ``_runtime.fork_child_reinit`` diagnostic counter (the ``disabled_reason``
+    The DISCARDED side of the fork reset — the parent-owned buffer, sessions and units the child
+    drops without emitting — carries no marker anywhere, deliberately: nothing was lost, it ships
+    from the process that owns it. The fork event itself is a process fact, not a span fact, and
+    lives in the ``_runtime.fork_child_reinit`` diagnostic counter (the ``disabled_reason``
     disposition).
     """
 
@@ -521,11 +516,10 @@ Two emit sites, and the first is the mechanism the second restates.
     the parser latched off mid-stream.
 
     Declared; no emitter yet. Reportable only on the MCP-stdio JSON-RPC path
-    (``crates/wardex-protocol/src/json_rpc.rs``), where a pending request means
-    a span already exists to carry it — design §4.6 site-3 wires that up. The
-    identically-named HTTP/1 latch in ``http1.rs`` is NOT this: it is a
-    connection-level ``disabled_reason``, it has no span, and it stays a debug
-    string. Same string, two fates; see the module docstring.
+    (``crates/wardex-protocol/src/json_rpc.rs``), where a pending request means a span already
+    exists to carry it — design §4.6 site-3 wires that up. The identically-named HTTP/1 latch in
+    ``http1.rs`` is NOT this: it is a connection-level ``disabled_reason``, it has no span, and it
+    stays a debug string. Same string, two fates; see the module docstring.
     """
 
     TOOL_CALL_ID_UNAVAILABLE_IN_PROCESS = "tool_call_id_unavailable_in_process"
@@ -649,11 +643,10 @@ Two emit sites, and the first is the mechanism the second restates.
 
     PEER_UNRESOLVED = "peer_unresolved"
     """``server.address``/``server.port`` and the URL's host and port are a
-    placeholder: no INET ``(host, port)`` was read — a unix socket's peer is a
-    path; a memory-BIO ``SSLObject`` on uvloop or trio TLS, sync TLS in TLS,
-    or set up before install, has no ``getpeername`` and no asyncio/anyio
-    stamp — so the port is ``0`` and the host the TLS server name, else
-    ``unknown``. Still captured; the old fallback said 443, marked nothing.
+    placeholder: no INET ``(host, port)`` was read — a unix socket's peer is a path; a memory-BIO
+    ``SSLObject`` on uvloop or trio TLS, sync TLS in TLS, or set up before install, has no
+    ``getpeername`` and no asyncio/anyio stamp — so the port is ``0`` and the host the TLS server
+    name, else ``unknown``. Still captured; the old fallback said 443, marked nothing.
 
     Emitted from ``_interceptors/_seam.py::ByteSeamInterceptor._seal``/``._build_ws_span``
     on port 0, counted as ``interceptors.seam.peer_unresolved``; the placeholder
@@ -733,31 +726,28 @@ Two emit sites, and the first is the mechanism the second restates.
 
     H2_REQUEST_EVICTED = "h2_request_evicted"
     """The h2 stream table hit ``max_streams`` and evicted this stream's request
-    half (lowest id first) before its response completed: method, path and
-    request body are absent (``? /``); status and response are observed. Emitted,
-    ``truncated`` and counted (``protocol.http2.stream_evicted``) from
-    ``_interceptors/_trackers.py::_Http2Tracker._mk``. Not ``CONNECTION_EVICTED``
-    (``max_connections``, a whole connection) — see ``common.proto``."""
+    half (lowest id first) before its response completed: method, path and request body are absent
+    (``? /``); status and response are observed. Emitted, ``truncated`` and counted
+    (``protocol.http2.stream_evicted``) from ``_interceptors/_trackers.py::_Http2Tracker._mk``. Not
+    ``CONNECTION_EVICTED`` (``max_connections``, a whole connection) — see ``common.proto``."""
 
     PARSE_SKIPPED_AT_SHUTDOWN = "parse_skipped_at_shutdown"
     """The process was ending and the shutdown budget ran out before this transaction's deferred
     LLM-semantic parse: it shipped unparsed rather than not at all — transport, timing and status
     are measured; ``gen_ai`` is absent because the parser never ran.
 
-    Emitted from ``_finalize.py`` — the single site that names it, on the
-    fallback ``drain_all`` assembles for every job still pending when the
-    shutdown budget ends (``Leftover.FALLBACK``: close and the signal path,
-    where a kept job would die with the process).
+    Emitted from ``_finalize.py`` — the single site that names it, on the fallback ``drain_all``
+    assembles for every job still pending when the shutdown budget ends (``Leftover.FALLBACK``:
+    close and the signal path, where a kept job would die with the process).
 
     The knob is a SHUTDOWN BUDGET, not a capacity cap — ``close(timeout)`` /
-    ``batching.shutdown_timeout``, or wardex's own 2 s signal-flush budget —
-    which is what keeps it apart from ``PARSE_BACKLOG_FULL`` (same unparsed
-    shipment, capacity knob) under the census rule: the reader's next action
-    differs. Not ``SEMANTIC_PARSE_FAILED`` (the parser ran and understood
-    nothing) and not ``INSTRUMENTATION_DEGRADED`` (the parser raised): here
-    the parser was never given the chance. Same body-withholding rule as
-    ``PARSE_BACKLOG_FULL``: when wardex's own degradation is the only thing
-    that admitted the span past the capture gate, the payload stays home.
+    ``batching.shutdown_timeout``, or wardex's own 2 s signal-flush budget — which is what keeps it
+    apart from ``PARSE_BACKLOG_FULL`` (same unparsed shipment, capacity knob) under the census rule:
+    the reader's next action differs. Not ``SEMANTIC_PARSE_FAILED`` (the parser ran and understood
+    nothing) and not ``INSTRUMENTATION_DEGRADED`` (the parser raised): here the parser was never
+    given the chance. Same body-withholding rule as ``PARSE_BACKLOG_FULL``: when wardex's own
+    degradation is the only thing that admitted the span past the capture gate, the payload stays
+    home.
     """
 
     OTLP_ATTRIBUTE_TRUNCATED = "otlp_attribute_truncated"
@@ -772,13 +762,12 @@ Two emit sites, and the first is the mechanism the second restates.
     ``transport.otlp.span_payload_dropped``. Both attach it by proto NUMBER, which is why
     ``test_limitation_census.py`` scans Rust for ``Limitation::`` references as well as literals.
 
-    The one marker in this enum that describes the EXPORT rather than the
-    capture, and the reason it is not ``BODY_CAP_EXCEEDED``: that one names
-    ``max_body_bytes``, a bound on the raw bytes a parser keeps, while this
-    names a bound on what one attribute costs on a wire that measures it after
-    the base64 rewrite. A payload inside the first and outside the second is
-    the ordinary case rather than a corner, and merging the two would send a
-    user to raise a capture cap that was never the constraint.
+    The one marker in this enum that describes the EXPORT rather than the capture, and the reason it
+    is not ``BODY_CAP_EXCEEDED``: that one names ``max_body_bytes``, a bound on the raw bytes a
+    parser keeps, while this names a bound on what one attribute costs on a wire that measures it
+    after the base64 rewrite. A payload inside the first and outside the second is the ordinary case
+    rather than a corner, and merging the two would send a user to raise a capture cap that was
+    never the constraint.
     """
 
     EXTRA_KEYS_DROPPED = "extra_keys_dropped"
@@ -786,13 +775,12 @@ Two emit sites, and the first is the mechanism the second restates.
     were dropped; how many rides beside the marker as
     ``wardex.usage_leaves.dropped_count``.
 
-    Emitted from ``_interceptors/_seam.py``, off the native parser's
-    ``usage_dropped_count`` — today the bound has exactly one enforcement
-    site, the provider-usage mirror (``wardex.usage.*``): every scalar leaf
-    of the provider's usage object, spelling preserved, which is an OPEN
-    family because providers add billing counters faster than any typed
-    table follows (design §6.5 tier 1 is this exact case). Lowering the
-    knob prunes usage leaves only until draft-level enforcement lands.
+    Emitted from ``_interceptors/_seam.py``, off the native parser's ``usage_dropped_count`` — today
+    the bound has exactly one enforcement site, the provider-usage mirror (``wardex.usage.*``):
+    every scalar leaf of the provider's usage object, spelling preserved, which is an OPEN family
+    because providers add billing counters faster than any typed table follows (design §6.5 tier 1
+    is this exact case). Lowering the knob prunes usage leaves only until draft-level enforcement
+    lands.
 
     Not ``OTLP_ATTRIBUTE_TRUNCATED`` (39), by the census rule: that one names
     ``max_otlp_attribute_bytes`` and cuts VALUES on the export surface; this one names
@@ -1070,6 +1058,18 @@ Two emit sites, and the first is the mechanism the second restates.
     ``CodexExecConfig(otel_bridge=True)``, which reads each call's model, usage and interval from
     the CLI's own traces. Not ``TRANSPORT_TIMING_UNAVAILABLE_SUBPROCESS``: that one says a call's
     TIMING is the IPC stream's; this one says the calls themselves were never seen.
+    """
+
+    # ------------------------------------------------------------------
+    # Export-time masking
+    # ------------------------------------------------------------------
+
+    PII_FILTER_FAILED = "pii_filter_failed"
+    """PII masking itself failed (the engine panicked) on this span or snapshot, so its content was
+    removed fail-closed rather than shipped unmasked: ids, kind and times remain, named
+    ``[PII_FILTER_ERROR]``. Emitted from ``crates/wardex-pipeline/src/pii/walk.rs`` by the three
+    fail-closed scrubs; counted as ``transport.{otlp,wardex}.pii_scrubbed``. Names NO knob: a
+    wardex defect, to report. Not ``INSTRUMENTATION_DEGRADED``: there the capture was incomplete.
     """
 
 

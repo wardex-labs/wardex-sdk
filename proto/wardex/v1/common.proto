@@ -448,6 +448,17 @@ enum Limitation {
   //    is the IPC stream's; this says the calls themselves were never seen.
   LIMITATION_SUBPROCESS_MODEL_CALLS_UNOBSERVED = 55;
 
+  // -- Export-time masking. The PII engine itself failed (it panicked) on this
+  //    span or snapshot, so its content was removed fail-closed instead of
+  //    shipped unmasked: only the ids, kind and times remain, the name reads
+  //    `[PII_FILTER_ERROR]` (a snapshot's conversation state is those bytes),
+  //    and `redacted` is set. Counted in-process as `transport.otlp.pii_scrubbed`
+  //    / `transport.wardex.pii_scrubbed`. Names NO knob: it is a defect in
+  //    wardex, and the reader's next action is to report it. Not
+  //    INSTRUMENTATION_DEGRADED (38): that says the CAPTURE was incomplete;
+  //    here capture was whole and the record was emptied on its way out.
+  LIMITATION_PII_FILTER_FAILED = 57;
+
   // A META value, not vocabulary — hence the separate number band. It means
   // "the sending SDK held a marker this schema has no value for", and it always
   // travels with the original string in `Span.extra["wardex.limitation.unmapped"]`.

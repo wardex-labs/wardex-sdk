@@ -11,3 +11,11 @@ description            = "Normalizer + Sampler + PII regex for Wardex SDK"
 wardex-codec = { path = "../wardex-codec" }
 regex.workspace     = true
 thiserror.workspace = true
+
+[features]
+# Test-only: a span named `__wardex_test_panic__` (or a snapshot whose
+# conversation state is those bytes) panics the PII masker, so the fail-closed
+# scrub can be exercised from outside this crate. Forwarded by `wardex-core`
+# and turned on by the Python binding's own `panic-injection`, which only the
+# development build enables; a release wheel never has it.
+panic-injection = []

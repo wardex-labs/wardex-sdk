@@ -201,7 +201,7 @@ class TestTransportPolicy:
             # is unreachable). Returning no bodies at all would let the
             # transport return before it ever built a request, which is a
             # different path from the one under test.
-            return ([b""], 0, [], 0, 0)
+            return ([b""], 0, [], 0, 0, 0)
 
         monkeypatch.setattr(_wardex_native.codec, "encode_otlp_requests", fake_encode)
         t = OtlpHttpTransport(endpoint="http://localhost:1")
@@ -220,3 +220,148 @@ class TestTransportPolicy:
             "pii_extra_names": ["x_corp_auth"],
             "pii_reveal_names": ["page_token"],
         }
+
+
+# --------------------------------------------------------------------------
+# masking's own failure: fail-closed, marked, counted
+# --------------------------------------------------------------------------
+
+#: The masker's injection point: a span with this name, or a snapshot whose
+#: conversation state is these bytes, panics the PII engine. It exists only in
+#: a build with the `panic-injection` cargo feature, which the workspace
+#: `pyproject.toml` turns on for `uv sync` and a release wheel never has.
+_INJECTED = "__wardex_test_panic__"
+
+_REBUILD = (
+    "the native module was built without the `panic-injection` feature the "
+    "workspace pyproject.toml asks for, most likely because it predates this "
+    "source tree. Run `uv sync --reinstall-package wardex-sdk`."
+)
+
+
+def _report_lines(fn) -> list[str]:
+    import logging
+
+    from wardex_sdk._assembly._diag import reset_reports_for_test
+
+    lines: list[str] = []
+
+    class _Records(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            lines.append(record.getMessage())
+
+    reset_reports_for_test()
+    logger = logging.getLogger("wardex_sdk")
+    handler = _Records(level=logging.DEBUG)
+    logger.addHandler(handler)
+    try:
+        fn()
+    finally:
+        logger.removeHandler(handler)
+        reset_reports_for_test()
+    return lines
+
+
+def _two_spans() -> Envelope:
+    """A span masking succeeds on, and one it fails on, in ONE batch."""
+    return Envelope(
+        header=_header(),
+        spans=(
+            _span(name="kept", input_data=PII_INPUT),
+            _span(
+                name=_INJECTED,
+                input_data=PII_INPUT,
+                context=SpanContext(trace_id=TraceId(b"\x01" * 16), span_id=SpanId(b"\x03" * 8)),
+            ),
+        ),
+    )
+
+
+@pytest.mark.usefixtures("fresh_counters")
+class TestMaskingFailure:
+    """When the PII engine itself fails on a record, the record does not ship
+    as captured: it leaves with its ids, kind and times only, named
+    `[PII_FILTER_ERROR]`. That used to be all it said -- `redacted` is set on
+    every span masking touched, so the name was the only tell, and nothing
+    counted it. Now it carries `pii_filter_failed` in the closed vocabulary
+    and each exporter counts it, on the build this suite runs against."""
+
+    def test_the_development_build_carries_the_injection(self):
+        from wardex_sdk import _wardex_native
+
+        # The masker's injection and `_panic_for_test` are one cargo feature.
+        assert hasattr(_wardex_native, "_panic_for_test"), _REBUILD
+
+    def test_an_otlp_span_masking_failed_on_ships_emptied_marked_and_counted(self):
+        from wardex_sdk import _wardex_native
+        from wardex_sdk._assembly import counters
+        from wardex_sdk.transport import Transport
+
+        class _Encoding(Transport):
+            def export(self, envelope, *, timeout=None):
+                self.bodies = self.encode(envelope, compress=False)
+
+        t = _Encoding()
+        lines = _report_lines(lambda: t.export(_two_spans()))
+        (body,) = t.bodies
+        decoded = _wardex_native.codec.decode_otlp_traces(body)
+        spans = {
+            sp["name"]: sp
+            for rs in decoded["resource_spans"]
+            for ss in rs["scope_spans"]
+            for sp in ss["spans"]
+        }
+        assert set(spans) == {"kept", "[PII_FILTER_ERROR]"}, _REBUILD
+        scrubbed = spans["[PII_FILTER_ERROR]"]
+        assert scrubbed["span_id"] == "03" * 8
+        assert scrubbed["attributes"] == {
+            "wardex.redacted": True,
+            "wardex.limitations": ["pii_filter_failed"],
+        }
+        # The other span was masked as usual and carries no such marker.
+        kept = spans["kept"]["attributes"]
+        assert "[EMAIL]" in kept["wardex.input_data"]
+        assert "wardex.limitations" not in kept
+        assert counters.get("transport.otlp.pii_scrubbed") == 1
+        (report,) = [line for line in lines if "transport.otlp.pii_scrubbed" in line]
+        assert "john.doe" not in report
+
+    def test_a_wardex_envelope_record_masking_failed_on_ships_emptied_marked_and_counted(self):
+        from wardex_sdk import _wardex_native
+        from wardex_sdk._assembly import counters
+        from wardex_sdk._types import InternalStateSnapshot
+        from wardex_sdk.transport import WardexTransport
+
+        snap = InternalStateSnapshot(
+            trace_id=TraceId(b"\x01" * 16),
+            span_id=SpanId(b"\x02" * 8),
+            timestamp_ns=1500,
+            snapshot_type="turn_start",
+            turn_index=1,
+            conversation_state=_INJECTED.encode(),
+            attributes=(("owner", "john.doe@acme.com"),),
+        )
+        env = _two_spans()
+        env = Envelope(header=env.header, spans=env.spans, state_snapshots=(snap,))
+        body, unmarshalled, scrubbed = _wardex_native.codec.encode_envelope_export(
+            env, "mask", [], None
+        )
+        assert (unmarshalled, scrubbed) == ([], 2), _REBUILD
+        items = _codec.decode(body)["items"]
+        spans = {it["span"]["name"]: it["span"] for it in items if "span" in it}
+        integrity = spans["[PII_FILTER_ERROR]"]["capture_integrity"]
+        assert integrity["limitations"] == ["pii_filter_failed"]
+        assert integrity["redacted"] is True
+        assert spans["[PII_FILTER_ERROR]"]["input_data"] == b""
+        assert spans["kept"]["capture_integrity"]["limitations"] == []
+        (snapshot,) = [it["state_snapshot"] for it in items if "state_snapshot" in it]
+        assert snapshot["conversation_state"] == b"[PII_FILTER_ERROR]"
+        assert snapshot["attributes"] == [
+            {"key": "wardex.limitations", "value": "pii_filter_failed"}
+        ]
+
+        # The exporter counts both, before it tries the (unreachable) POST.
+        transport = WardexTransport("http://127.0.0.1:1", "test-key")
+        lines = _report_lines(lambda: transport.export(env, timeout=1.0))
+        assert counters.get("transport.wardex.pii_scrubbed") == 2
+        assert any("transport.wardex.pii_scrubbed" in line for line in lines)

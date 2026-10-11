@@ -1752,19 +1752,19 @@ impl PiiPolicy<'_> {
     }
 }
 
-/// Apply the PII policy to a marshalled wardex envelope (design §4.2).
-fn pii_apply_envelope(proto: &mut pb::Envelope, policy: &PiiPolicy<'_>) -> PyResult<()> {
-    pii::mask_envelope(&*policy.engine()?, proto);
-    Ok(())
+/// Apply the PII policy to a marshalled wardex envelope (design §4.2), and
+/// say how many records masking itself failed on and scrubbed fail-closed.
+fn pii_apply_envelope(proto: &mut pb::Envelope, policy: &PiiPolicy<'_>) -> PyResult<usize> {
+    Ok(pii::mask_envelope(&*policy.engine()?, proto))
 }
 
-/// Apply the PII policy to a marshalled OTLP export request (design §4.2).
+/// Apply the PII policy to a marshalled OTLP export request (design §4.2), and
+/// say how many spans masking itself failed on and scrubbed fail-closed.
 fn pii_apply_otlp(
     req: &mut otlp_pb::trace_service::ExportTraceServiceRequest,
     policy: &PiiPolicy<'_>,
-) -> PyResult<()> {
-    pii::mask_otlp(&*policy.engine()?, req);
-    Ok(())
+) -> PyResult<usize> {
+    Ok(pii::mask_otlp(&*policy.engine()?, req))
 }
 
 #[pyfunction]
@@ -1786,12 +1786,15 @@ fn encode_envelope_py(
     };
     shielded(|| {
         // Marshalling walks Python objects — the only part that needs the GIL.
+        // The fidelity encoder counts nothing: a scrubbed record still says so
+        // itself, and the count is the export path's to report.
         let (proto, _) = envelope_to_proto(envelope, true, false)?;
-        masked_envelope_bytes(py, proto, &policy, limits)
+        Ok(masked_envelope_bytes(py, proto, &policy, limits)?.0)
     })
 }
 
-/// Envelope → `(body, unmarshalled)` — the export path's envelope encoder.
+/// Envelope → `(body, unmarshalled, scrubbed)` — the export path's envelope
+/// encoder.
 ///
 /// `encode_envelope` is the fidelity encoder: a span it cannot marshal is a
 /// raise, because a round-trip tool that hides a span is lying about what it
@@ -1804,6 +1807,8 @@ fn encode_envelope_py(
 ///
 /// `body` is `None` when no item survived the skip: an envelope with nothing
 /// in it is nothing to send, and the caller must not post a header alone.
+/// `scrubbed` counts the spans and snapshots masking itself failed on, each
+/// shipped emptied and marked `pii_filter_failed`, for the caller to report.
 #[pyfunction]
 #[pyo3(signature = (envelope, pii_mode = "off", pii_disabled = Vec::new(), limits = None, *, pii_extra_names = Vec::new(), pii_reveal_names = Vec::new()))]
 fn encode_envelope_export(
@@ -1814,7 +1819,7 @@ fn encode_envelope_export(
     limits: Option<PyLimits>,
     pii_extra_names: Vec<String>,
     pii_reveal_names: Vec<String>,
-) -> PyResult<(Option<Py<PyBytes>>, Vec<String>)> {
+) -> PyResult<(Option<Py<PyBytes>>, Vec<String>, usize)> {
     let policy = PiiPolicy {
         mode: pii_mode,
         disabled: pii_disabled,
@@ -1824,36 +1829,36 @@ fn encode_envelope_export(
     shielded(|| {
         let (proto, unmarshalled) = envelope_to_proto(envelope, true, true)?;
         if proto.items.is_empty() {
-            return Ok((None, unmarshalled));
+            return Ok((None, unmarshalled, 0));
         }
-        Ok((
-            Some(masked_envelope_bytes(py, proto, &policy, limits)?),
-            unmarshalled,
-        ))
+        let (body, scrubbed) = masked_envelope_bytes(py, proto, &policy, limits)?;
+        Ok((Some(body), unmarshalled, scrubbed))
     })
 }
 
-/// A marshalled envelope → masked, serialized, zstd-framed bytes: the half
-/// both envelope encoders share, so the fidelity and export paths cannot
-/// drift on masking or compression.
+/// A marshalled envelope → masked, serialized, zstd-framed bytes, and the
+/// number of records masking scrubbed fail-closed: the half both envelope
+/// encoders share, so the fidelity and export paths cannot drift on masking
+/// or compression.
 fn masked_envelope_bytes(
     py: Python<'_>,
     mut proto: pb::Envelope,
     policy: &PiiPolicy<'_>,
     limits: Option<PyLimits>,
-) -> PyResult<Py<PyBytes>> {
+) -> PyResult<(Py<PyBytes>, usize)> {
     // `zstd_level` is the only limit the codec reads, and it must come from
     // the caller's resolved limits: hardcoding the default here would let a
     // configured level be validated and then silently discarded.
     let limits = limits.map(|p| p.inner).unwrap_or_default();
     // Masking + protobuf + zstd are pure Rust: release the GIL so app threads
     // keep running while the batch worker encodes (design §9).
-    let bytes = py.allow_threads(|| -> PyResult<Vec<u8>> {
-        pii_apply_envelope(&mut proto, policy)?;
-        encode_envelope(&proto, limits)
-            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    let (bytes, scrubbed) = py.allow_threads(|| -> PyResult<(Vec<u8>, usize)> {
+        let scrubbed = pii_apply_envelope(&mut proto, policy)?;
+        let bytes = encode_envelope(&proto, limits)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        Ok((bytes, scrubbed))
     })?;
-    Ok(PyBytes::new_bound(py, &bytes).unbind())
+    Ok((PyBytes::new_bound(py, &bytes).unbind(), scrubbed))
 }
 
 #[pyfunction]
@@ -1889,13 +1894,18 @@ const PRODUCER: otlp::map::Producer<'static> = otlp::map::Producer {
 ///     `bytes_value` and this is the point of no return for the raw payload.
 ///
 /// Shared by both entry points below so the two cannot drift into applying a
-/// different policy to the same envelope. The count beside the request is the
-/// mapping's `reserved_overwritten`, for the export path to report.
+/// different policy to the same envelope. The two counts beside the request are
+/// the mapping's `reserved_overwritten` and the spans masking scrubbed
+/// fail-closed, for the export path to report.
 fn otlp_request(
     proto: pb::Envelope,
     policy: &PiiPolicy<'_>,
     limits: wardex_limits::Limits,
-) -> PyResult<(otlp_pb::trace_service::ExportTraceServiceRequest, usize)> {
+) -> PyResult<(
+    otlp_pb::trace_service::ExportTraceServiceRequest,
+    usize,
+    usize,
+)> {
     // `proto` is CONSUMED here, so the envelope's payloads move into the
     // request instead of being copied beside it — one flush of a full batch
     // holds one copy of every captured body, not two.
@@ -1903,10 +1913,10 @@ fn otlp_request(
         request: mut req,
         reserved_overwritten,
     } = otlp::map::map_envelope(proto, PRODUCER);
-    pii_apply_otlp(&mut req, policy)?;
+    let scrubbed = pii_apply_otlp(&mut req, policy)?;
     otlp::map::cap_attribute_values(&mut req, limits);
     otlp::map::strip_bytes_values(&mut req);
-    Ok((req, reserved_overwritten))
+    Ok((req, reserved_overwritten, scrubbed))
 }
 
 #[pyfunction]
@@ -1949,8 +1959,8 @@ fn encode_otlp_traces(
         // threads keep running while the batch worker encodes (design §9).
         let bytes = py.allow_threads(move || -> PyResult<Vec<u8>> {
             // Not an export, so nothing here is counted: the reserved-name
-            // count is the export encoder's to report.
-            let (req, _) = otlp_request(proto, &policy, limits)?;
+            // and scrub counts are the export encoder's to report.
+            let (req, _, _) = otlp_request(proto, &policy, limits)?;
             otlp::encode_traces(&req)
                 .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
         })?;
@@ -1960,7 +1970,7 @@ fn encode_otlp_traces(
 
 /// What `encode_otlp_requests` hands the caller: the request bodies, then each
 /// count the export path reports, in the order that function's doc gives.
-type OtlpExport = (Py<PyAny>, usize, Vec<String>, usize, usize);
+type OtlpExport = (Py<PyAny>, usize, Vec<String>, usize, usize, usize);
 
 /// Envelope → `(request bodies, spans dropped)` — the export path's encoder.
 ///
@@ -1977,8 +1987,9 @@ type OtlpExport = (Py<PyAny>, usize, Vec<String>, usize, usize);
 /// counts the host attributes under a reserved `wardex.transport.*` name the
 /// mapping did not ship as set (`otlp::map::Mapped`); the fifth counts the
 /// spans that shipped only because their payload was removed to fit
-/// `max_otlp_request_bytes` (`otlp::split::Requests::payload_dropped_spans`).
-/// They exist because the core has no channel to a user: a loss reported
+/// `max_otlp_request_bytes` (`otlp::split::Requests::payload_dropped_spans`);
+/// the sixth counts the spans masking itself failed on, shipped emptied and
+/// marked `pii_filter_failed`. They exist because the core has no channel to a user: a loss reported
 /// nowhere is the silent kind, and the caller is the only one who can say it
 /// out loud. The third used to be a raise, and the raise cost the whole batch.
 #[pyfunction]
@@ -2005,12 +2016,12 @@ fn encode_otlp_requests(
     shielded(|| {
         let (proto, unmarshalled) = envelope_to_proto(envelope, false, true)?;
         let limits = limits.map(|p| p.inner).unwrap_or_default();
-        let (requests, overwritten) =
-            py.allow_threads(move || -> PyResult<(otlp::split::Requests, usize)> {
-                let (req, overwritten) = otlp_request(proto, &policy, limits)?;
+        let (requests, overwritten, scrubbed) =
+            py.allow_threads(move || -> PyResult<(otlp::split::Requests, usize, usize)> {
+                let (req, overwritten, scrubbed) = otlp_request(proto, &policy, limits)?;
                 let requests = otlp::split::encode_requests(req, limits, compress)
                     .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
-                Ok((requests, overwritten))
+                Ok((requests, overwritten, scrubbed))
             })?;
         let bodies = PyList::empty_bound(py);
         for body in &requests.bodies {
@@ -2022,6 +2033,7 @@ fn encode_otlp_requests(
             unmarshalled,
             overwritten,
             requests.payload_dropped_spans,
+            scrubbed,
         ))
     })
 }
