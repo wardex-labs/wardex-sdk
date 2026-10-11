@@ -345,9 +345,9 @@ _CENSUS: dict[tuple[str, str, str], object] = {
     ("_adapters/_openai_agents.py", "count", "'tool_end_unmatched'"): NotADrop(
         "an end with no start; the loss, if any, was counted at the start"
     ),
-    ("_adapters/_openai_agents.py", "count", "'trace_end_unmatched'"): NotADrop(
-        "an end with no start; the loss, if any, was counted at the start"
-    ),
+    # A run that began before wardex.init() ends here with its root never recorded, and
+    # nothing counted it at a start wardex did not see.
+    ("_adapters/_openai_agents.py", "count", "'trace_end_unmatched'"): _OPENAI,
     ("_adapters/_openai_agents.py", "count", "'trace_lookup_miss'"): _OPENAI,
     ("_adapters/_openai_agents.py", "count", "'trace_start_twice'"): NotADrop(
         "a repeated start is ignored; the first one stands"
@@ -787,10 +787,37 @@ _CENSUS: dict[tuple[str, str, str], object] = {
 # ==============================================================================
 
 #: The ledger's own calls, as a caller spells them: bare after `from ... import
-#: record`, or through the module (`ledger.record`, `_ledger.record`). A
-#: `registry.record(status)` is not one.
+#: record` (under any alias), or through the module (`ledger.record`,
+#: `_ledger.record`, a dotted path ending in `_ledger`, or any alias the module
+#: was imported under). A `registry.record(status)` is not one.
 _LEDGER_CALLS = frozenset({"record", "record_items", "lose"})
 _LEDGER_MODULES = frozenset({"ledger", "_ledger"})
+#: The signal functions a module can import by name, and so under another one.
+_IMPORTED_SIGNALS = _LEDGER_CALLS | {"report_once"}
+
+
+@dataclass(frozen=True)
+class _Bindings:
+    """What a module's imports bind, under whatever alias: names that stand for
+    a signal function (mapped to its own name), and names for the ledger module."""
+
+    calls: dict[str, str]
+    modules: frozenset[str]
+
+
+def _bindings(tree: ast.AST) -> _Bindings:
+    calls: dict[str, str] = {}
+    modules = set(_LEDGER_MODULES)
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Import | ast.ImportFrom):
+            continue
+        for alias in node.names:
+            last = alias.name.rsplit(".", 1)[-1]
+            if last == "_ledger" and (alias.asname or isinstance(node, ast.ImportFrom)):
+                modules.add(alias.asname or last)
+            elif last in _IMPORTED_SIGNALS and isinstance(node, ast.ImportFrom):
+                calls[alias.asname or last] = last
+    return _Bindings(calls, frozenset(modules))
 
 
 @dataclass(frozen=True)
@@ -805,14 +832,32 @@ def _keyword(call: ast.Call, name: str) -> ast.expr | None:
     return next((kw.value for kw in call.keywords if kw.arg == name), None)
 
 
-def _signal(call: ast.Call, module: str) -> tuple[str, ast.expr | None] | None:
+def _getattr_spelled(func: ast.expr) -> ast.expr:
+    """`getattr(obj, "name")` read as the `obj.name` it is."""
+    if (
+        isinstance(func, ast.Call)
+        and isinstance(func.func, ast.Name)
+        and func.func.id == "getattr"
+        and len(func.args) >= 2
+        and isinstance(func.args[1], ast.Constant)
+        and isinstance(func.args[1].value, str)
+    ):
+        return ast.Attribute(value=func.args[0], attr=func.args[1].value, ctx=ast.Load())
+    return func
+
+
+def _tail(node: ast.expr) -> str | None:
+    """The last name in `a.b.c` (`c`), or the name itself."""
+    return node.id if isinstance(node, ast.Name) else getattr(node, "attr", None)
+
+
+def _signal(call: ast.Call, module: str, bindings: _Bindings) -> tuple[str, ast.expr | None] | None:
     """`(kind, key node)` when `call` is a drop signal, else None."""
-    func = call.func
+    func = _getattr_spelled(call.func)
     if isinstance(func, ast.Name):
-        name, base = func.id, None
+        name, base = bindings.calls.get(func.id, func.id), None
     elif isinstance(func, ast.Attribute):
-        name = func.attr
-        base = func.value.id if isinstance(func.value, ast.Name) else None
+        name, base = func.attr, _tail(func.value)
     else:
         return None
     first = call.args[0] if call.args else None
@@ -824,7 +869,7 @@ def _signal(call: ast.Call, module: str) -> tuple[str, ast.expr | None] | None:
         return "report_once", _keyword(call, "key")
     if name == "_report_lost":
         return "report_lost", _keyword(call, "key")
-    if name in _LEDGER_CALLS and (isinstance(func, ast.Name) or base in _LEDGER_MODULES):
+    if name in _LEDGER_CALLS and (isinstance(func, ast.Name) or base in bindings.modules):
         return ("lose", _keyword(call, "key")) if name == "lose" else ("record", first)
     return None
 
@@ -834,8 +879,11 @@ def _scan(root: pathlib.Path) -> dict[tuple[str, str, str], list[_Site]]:
     for path in sorted(root.rglob("*.py")):
         module = path.relative_to(root).as_posix()
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        bindings = _bindings(tree)
 
-        def visit(node: ast.AST, scope: ast.AST, module: str = module) -> None:
+        def visit(
+            node: ast.AST, scope: ast.AST, module: str = module, bindings: _Bindings = bindings
+        ) -> None:
             for child in ast.iter_child_nodes(node):
                 inner = (
                     child
@@ -843,7 +891,7 @@ def _scan(root: pathlib.Path) -> dict[tuple[str, str, str], list[_Site]]:
                     else scope
                 )
                 if isinstance(child, ast.Call):
-                    found = _signal(child, module)
+                    found = _signal(child, module, bindings)
                     if found is not None:
                         kind, key = found
                         text = ast.unparse(key) if key is not None else "<no key>"
@@ -1029,3 +1077,101 @@ def test_a_new_silent_bump_fails_the_census(tmp_path):
     )
     new = set(_scan(copy)) - set(_CENSUS)
     assert new == {("_worker.py", "bump", "'x.y'")}
+
+
+def test_the_census_sees_a_signal_under_any_name(tmp_path):
+    """A signal does not hide behind an alias: an imported name, a module
+    alias, a dotted path, or a `getattr` spelling of the call is still the
+    signal, and the census sees each."""
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "mod.py").write_text(
+        "from ._assembly import _ledger as led\n"
+        "from ._assembly._ledger import record as _rec, record_items as _ri\n"
+        "from ._assembly import report_once as say\n"
+        "import wardex_sdk._assembly._ledger\n"
+        "def f(counters):\n"
+        "    led.record(DropReason.TABLE_FULL)\n"
+        "    _rec(DropReason.QUEUE_OVERFLOW)\n"
+        "    _ri(DropReason.SEND_ERROR, 1, 0)\n"
+        "    wardex_sdk._assembly._ledger.record(DropReason.AFTER_CLOSE)\n"
+        "    getattr(counters, 'bump')('x.alias')\n"
+        "    say('line', key='k.alias')\n",
+        encoding="utf-8",
+    )
+    assert set(_scan(src)) == {
+        ("mod.py", "record", "DropReason.TABLE_FULL"),
+        ("mod.py", "record", "DropReason.QUEUE_OVERFLOW"),
+        ("mod.py", "record", "DropReason.SEND_ERROR"),
+        ("mod.py", "record", "DropReason.AFTER_CLOSE"),
+        ("mod.py", "bump", "'x.alias'"),
+        ("mod.py", "report_once", "'k.alias'"),
+    }
+
+
+def _uncalled_signals(tree: ast.AST, module: str) -> list[str]:
+    """Every place `tree` names a signal callable without calling it there."""
+    bindings = _bindings(tree)
+    called = {id(node.func) for node in ast.walk(tree) if isinstance(node, ast.Call)}
+    found: list[str] = []
+    for node in ast.walk(tree):
+        if id(node) in called:
+            continue
+        spelled = _getattr_spelled(node) if isinstance(node, ast.Call) else node
+        if isinstance(spelled, ast.Name) and isinstance(spelled.ctx, ast.Load):
+            hit = spelled.id in bindings.calls
+        elif isinstance(spelled, ast.Attribute) and isinstance(spelled.ctx, ast.Load):
+            name = spelled.attr
+            hit = (
+                name in {"bump", "report_once", "_report_lost"}
+                or (name == "count" and module.startswith("_adapters/"))
+                or (name in _LEDGER_CALLS and _tail(spelled.value) in bindings.modules)
+            )
+        else:
+            hit = False
+        if hit:
+            found.append(f"{module}:{node.lineno}: {ast.unparse(node)}")
+    return found
+
+
+def test_a_signal_is_only_ever_called_never_passed_or_renamed():
+    """The rule that keeps the census closed under aliasing: a signal callable
+    is never assigned to another name, passed along, or stored -- `say =
+    report_once`, `bump = counters.bump`, `map(ledger.record, ...)` -- because
+    the call made through the new name is one no scanner can attribute."""
+    offenders = [
+        hit
+        for path in sorted(_SRC.rglob("*.py"))
+        for hit in _uncalled_signals(
+            ast.parse(path.read_text(encoding="utf-8")), path.relative_to(_SRC).as_posix()
+        )
+    ]
+    assert not offenders, offenders
+
+
+def test_the_renaming_rule_sees_each_way_of_renaming():
+    """The negative control for the rule above: every renaming it forbids is
+    seen, and an ordinary local named like a signal is not."""
+    tree = ast.parse(
+        "from ._assembly import report_once\n"
+        "from ._ledger import record as _rec\n"
+        "from . import _ledger\n"
+        "def f(counters, ctx, rows):\n"
+        "    say = report_once\n"
+        "    bump = counters.bump\n"
+        "    later = _rec\n"
+        "    hooks = [_ledger.record_items]\n"
+        "    tally = getattr(counters, 'bump')\n"
+        "    sink = ctx.count\n"
+        "    for record in rows:\n"
+        "        record.close()\n"
+    )
+    found = {hit.split(": ", 1)[1] for hit in _uncalled_signals(tree, "_adapters/mod.py")}
+    assert found == {
+        "report_once",
+        "counters.bump",
+        "_rec",
+        "_ledger.record_items",
+        "getattr(counters, 'bump')",
+        "ctx.count",
+    }
