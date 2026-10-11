@@ -88,7 +88,10 @@ def test_every_schema_limitation_has_a_python_member(tables: dict) -> None:
 
 
 def test_the_vocabulary_is_the_same_size_on_both_sides(tables: dict) -> None:
-    assert len(tables["Limitation"]) == len(list(Limitation)) == 57
+    """Numbered from 1 with no gap, so the highest number IS the count: a
+    new member moves both, and no figure here needs restating for it."""
+    highest = max(tables["Limitation"].values())
+    assert len(tables["Limitation"]) == len(list(Limitation)) == highest
 
 
 def test_parent_source_agrees_in_both_directions(tables: dict) -> None:
@@ -122,7 +125,7 @@ def test_the_meta_value_is_not_part_of_the_vocabulary(tables: dict) -> None:
     """
     assert "vocabulary_unmapped" not in tables["Limitation"]
     assert tables["LimitationMeta"] == {"vocabulary_unmapped": 9001}
-    assert all(n <= 57 for n in tables["Limitation"].values())
+    assert all(n <= len(list(Limitation)) for n in tables["Limitation"].values())
 
 
 # ------------------------------------------------------------------ round trip

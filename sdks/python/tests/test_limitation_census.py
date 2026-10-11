@@ -1813,7 +1813,7 @@ _VOCABULARY: dict[str, str] = {
 }
 
 
-def test_the_vocabulary_is_exactly_these_fifty_seven() -> None:
+def test_the_vocabulary_is_exactly_the_recorded_table() -> None:
     """15 declared before the census + 21 from it + 1 from §5.4 + 1 for wardex
     itself + 1 for the OTLP size guard + 1 for the registry breadth bound
     + 2 for the OTel bridge's fail-open pair + 1 for the adapter's per-session
