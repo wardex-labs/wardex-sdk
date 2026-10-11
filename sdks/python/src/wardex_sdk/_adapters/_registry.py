@@ -297,6 +297,11 @@ class AdapterRegistry:
     def is_installed(self, name: str) -> bool:
         return name in self._installed
 
+    def installed_names(self) -> frozenset[str]:
+        """The adapters installed right now. Not `statuses()`: that is the last
+        `init()`'s account, and it is kept after `close()` has uninstalled them."""
+        return frozenset(self._installed)
+
 
 def get_registry() -> AdapterRegistry:
     """The process registry, which `Runtime` owns and builds on first use.

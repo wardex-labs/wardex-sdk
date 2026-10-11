@@ -353,7 +353,12 @@ def test_a_failure_wardex_caused_is_printed_once(run):
         "skips",
     )
     result.assert_outcomes(failed=1, deselected=1)
-    assert result.stdout.str().count("network_error: 7 span(s)") == 1
+    # The failure itself, not pytest's one-line summary of it, which repeats
+    # the message in full or cut to the terminal's width depending on where it
+    # runs.
+    failure = result.stdout.str().split("short test summary info")[0]
+    assert failure.count("network_error: 7 span(s)") == 1
+    assert "wardex --wardex-strict" not in failure, "said again as a section"
 
 
 def test_collecting_only_checks_nothing_and_passes(run):

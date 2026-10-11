@@ -20,7 +20,7 @@ from unittest import mock
 import pytest
 
 import wardex_sdk as wardex
-from wardex_sdk import AdapterName, AdapterState
+from wardex_sdk import AdapterName, AdapterState, _hub
 from wardex_sdk._adapters import _ADAPTERS, install_configured_adapters
 from wardex_sdk._adapters._base import AdapterInterface
 from wardex_sdk._adapters._measured import MEASURED, Measured, installed_version, is_measured
@@ -292,6 +292,22 @@ def test_diagnostics_keeps_the_last_inits_account_after_close(lines):
         wardex.close()
     assert states["langgraph"] is AdapterState.INSTALLED
     assert states["openai_agents"] is AdapterState.DISABLED
+
+
+def test_an_account_kept_after_close_is_not_read_as_an_adapter_still_installed(lines):
+    """The MCP stdio seam cedes a tool call to an installed framework adapter,
+    and asks which ones are installed. Read off the kept account, an adapter
+    that `close()` uninstalled went on claiming every later raw MCP tool call."""
+    wardex.init(
+        transport=wardex.NoOpTransport(), adapters=AdaptersConfig(enabled=(AdapterName.LANGGRAPH,))
+    )
+    try:
+        assert _hub.installed_adapters() == {"langgraph"}
+    finally:
+        wardex.close()
+    still = {s.name: s.state for s in wardex.diagnostics().adapters}
+    assert still["langgraph"] is AdapterState.INSTALLED, "the account itself is kept"
+    assert _hub.installed_adapters() == frozenset()
 
 
 # --- the table of tested versions --------------------------------------------
