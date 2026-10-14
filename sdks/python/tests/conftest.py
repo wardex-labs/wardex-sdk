@@ -211,9 +211,18 @@ def _close_hub_client_after_test():
     in test_worker.py. Closing whatever the hub currently holds after each
     test, at this single choke point, joins those threads without touching
     the ~15 individual test files that construct a client through the hub.
+
+    A test double does not outlive its test. A real client stays in the slot
+    once closed, as the product leaves it after `close()`. A double left there
+    is what the process's exit teardown finds when its file runs last after
+    any real `init()` registered that teardown, and a double lacks what the
+    teardown reads (`_closed`): the run ends in "Exception ignored in atexit
+    callback" after every test passed. The runtime is reset instead, here
+    once rather than in each file that installs a double.
     """
     yield
     from wardex_sdk import _hub
+    from wardex_sdk._client import Client
 
     client = _hub.get_client()
     if client is not None:
@@ -225,6 +234,8 @@ def _close_hub_client_after_test():
             # buffer). This is a benign transport quirk unrelated to the
             # worker-thread cleanup this fixture manages, so ignore it.
             pass
+        if not isinstance(client, Client):
+            _hub.reset_for_test()
 
 
 class _Handler(http.server.BaseHTTPRequestHandler):
