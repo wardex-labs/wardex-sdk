@@ -246,21 +246,22 @@ class Runtime:
             return self._adapters
 
     def describe(self) -> tuple[bool, tuple[AdapterStatus, ...]]:
-        """Whether a client is installed and still open, and what became of each
-        adapter at the last `init()` — read together, under the lock `install`
-        holds from setting the client to filing the last adapter, so a reader on
-        another thread never sees an open client with no adapters yet.
-
-        The client slot alone does not say "live": teardown closes the client
-        and leaves it in place. Never BUILDS the registry: one that was never
-        built has nothing to report, and building it would import `_adapters/`,
-        which reaches the native extension.
-        """
+        """Whether a client is installed and still open, and what became of each adapter at the
+        last `init()` — read together, under the lock `install` holds from setting the client to
+        filing the last adapter, so a reader on another thread never sees an open client with no
+        adapters yet. The client slot alone does not say "live": teardown closes the client and
+        leaves it in place. Never BUILDS the registry: one that was never built has nothing to
+        report, and building it would import `_adapters/`, which reaches the native extension."""
         with self._lock:
             client = self._client
             live = client is not None and not getattr(client, "_closed", False)
             registry = self._adapters
             return live, (() if registry is None else registry.statuses())
+
+    def installed_adapters(self) -> frozenset[str]:
+        """The adapters installed now; `describe` gives the last `init()`'s, kept past close."""
+        with self._lock:
+            return frozenset() if self._adapters is None else self._adapters.installed_names()
 
     # -- install ------------------------------------------------------------
 

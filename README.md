@@ -203,6 +203,21 @@ for adapter in wardex.diagnostics().adapters:
     print(adapter.name, adapter.state.value, adapter.version, adapter.measured)
 ```
 
+wardex never raises into your application, so what it misses (spans a full
+buffer evicted, an adapter that did not install or runs on an untested
+release, an error inside wardex itself) is one line on stderr. In your test
+suite you can make it a failure instead:
+
+```bash
+pytest --wardex-strict
+```
+
+A test during which wardex lost something fails with what was lost, how many
+and what to do. Accept one on purpose with
+`--wardex-strict-allow=queue_overflow`, or scope it as `REASON:SUBJECT`.
+Outside pytest, call `wardex.testing.assert_no_capture_gaps()` at the end of a
+run; `wardex.diagnostics().losses` reads the same counts at any time.
+
 The Codex adapter only reads what your process already exchanges with
 `codex exec` — the prompt passed to `communicate()` and the `--json` events
 on stdout — and

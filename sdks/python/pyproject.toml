@@ -25,6 +25,11 @@ classifiers = [
     "Topic :: System :: Monitoring",
 ]
 
+# `pytest --wardex-strict`. Registered as an entry point so the flag is the whole
+# setup; without it the plugin only adds its options to `pytest --help`.
+[project.entry-points.pytest11]
+wardex = "_wardex_pytestplugin"
+
 [project.urls]
 Homepage   = "https://github.com/wardex-labs/wardex-sdk"
 Repository = "https://github.com/wardex-labs/wardex-sdk"
@@ -37,7 +42,17 @@ module-name    = "wardex_sdk._wardex_native"
 features       = ["pyo3/extension-module"]
 # PEP 561: the wheel ships inline annotations, and type checkers ignore them
 # without this marker. Declared for both formats so an sdist build keeps it.
-include        = [{ path = "src/wardex_sdk/py.typed", format = ["sdist", "wheel"] }]
+#
+# The pytest entry point lives beside the package, not in it: pytest imports it
+# at every startup, and importing anything under `wardex_sdk` loads the native
+# extension and the adapters (see the module's docstring). maturin ships only
+# the package on its own, and an entry point whose module is missing makes
+# every pytest run in a project with wardex-sdk installed fail to start, so the
+# module is listed here and a test holds the two together.
+include        = [
+    { path = "src/wardex_sdk/py.typed", format = ["sdist", "wheel"] },
+    { path = "src/_wardex_pytestplugin.py", format = ["sdist", "wheel"] },
+]
 
 [dependency-groups]
 # Everything `tests/` imports beyond the package itself, and nothing else. The
@@ -46,6 +61,9 @@ include        = [{ path = "src/wardex_sdk/py.typed", format = ["sdist", "wheel"
 # it silently shrinks what the run covers.
 test = [
     "pytest>=8",
+    # `pytest --wardex-strict` hands each worker's account to the controller;
+    # without xdist here those tests skip, and CI would never run them.
+    "pytest-xdist>=3",
     "pytest-asyncio>=0.24",
     "syrupy>=4",
     "aiohttp>=3.9",

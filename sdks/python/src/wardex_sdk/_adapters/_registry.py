@@ -91,9 +91,10 @@ class AdapterRegistry:
     def __init__(self) -> None:
         self._installed: dict[str, AdapterInterface] = {}
         self._contexts: dict[str, AdapterContext] = {}
-        #: What became of every adapter tried in this process, installed or not.
-        #: Cleared with the adapters themselves, so it describes the current
-        #: `init()` and nothing before it.
+        #: What became of every adapter at the most recent `init()`, installed or
+        #: not. Kept through `close()`, so a check made after the run — the
+        #: common place for one — still reads what happened; the next `init()`
+        #: starts it over (`reset_statuses`).
         self._statuses: dict[str, AdapterStatus] = {}
 
     def install(
@@ -187,6 +188,10 @@ class AdapterRegistry:
         """File the status of an adapter that was never handed to `install`."""
         self._statuses[status.name] = status
 
+    def reset_statuses(self) -> None:
+        """Forget the previous `init()`'s account; this one is about to be written."""
+        self._statuses.clear()
+
     def statuses(self) -> tuple[AdapterStatus, ...]:
         """Every adapter's status, by name. A snapshot: later installs do not change it."""
         return tuple(self._statuses[name] for name in sorted(self._statuses))
@@ -234,7 +239,6 @@ class AdapterRegistry:
             name = next(reversed(self._installed))
             ordered.append((name, self._installed.pop(name)))
             self._contexts.pop(name, None)
-        self._statuses.clear()
         self._sweep(ordered, act, where)
 
     @staticmethod
@@ -292,6 +296,11 @@ class AdapterRegistry:
 
     def is_installed(self, name: str) -> bool:
         return name in self._installed
+
+    def installed_names(self) -> frozenset[str]:
+        """The adapters installed right now. Not `statuses()`: that is the last
+        `init()`'s account, and it is kept after `close()` has uninstalled them."""
+        return frozenset(self._installed)
 
 
 def get_registry() -> AdapterRegistry:

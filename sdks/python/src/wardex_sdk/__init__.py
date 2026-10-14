@@ -11,6 +11,7 @@ from typing import Any as _Any
 from urllib.parse import urlsplit as _urlsplit
 
 from . import _hub, _runtime
+from ._assembly import _ledger
 from ._assembly import diag_info as _diag_info
 from ._assembly import diag_warning as _diag_warning
 from ._client import _FOLLOW_TRANSPORT_TIMEOUT
@@ -35,7 +36,7 @@ from ._config_checks import endpoint_named_for_wardex as _endpoint_named_for_war
 from ._config_checks import env_typo_messages as _env_typo_messages
 from ._config_checks import unusable_env_endpoint as _unusable_env_endpoint
 from ._decorators import agent, step, tool, workflow
-from ._diagnostics import AdapterStatus, Diagnostics
+from ._diagnostics import AdapterStatus, Diagnostics, Loss
 from ._enums import (
     AdapterName,
     AdapterState,
@@ -151,6 +152,7 @@ __all__ = [
     # Types
     "AdapterStatus",
     "Diagnostics",
+    "Loss",
     "Span",
     "UserInfo",
     "Scope",
@@ -623,7 +625,8 @@ def close(timeout: float | None = None) -> None:
 
 
 def diagnostics() -> Diagnostics:
-    """wardex's own account of this process: what each adapter is doing.
+    """wardex's own account of this process: what each adapter is doing, and
+    what wardex has lost.
 
     One entry per adapter this release ships, with its state and, where it
     found its framework, the installed version and whether this release was
@@ -632,13 +635,43 @@ def diagnostics() -> Diagnostics:
     surface it did not recognize is `UNSUPPORTED`. The line wardex printed
     about an adapter, if any, is its `detail`.
 
+    `losses` is every kind of thing wardex did not record since the process
+    started, each with its count and the sentences that say what it means and
+    what to do. They are the counts wardex reports to a wardex receiver, kept
+    here as running totals that sending them does not reset.
+
     Reads state and changes none, so it is safe to call at any time and from
-    any thread. Before `init()`, after `close()`, and when the native
-    extension is unavailable, `initialized` is False and there are no adapters
-    to describe.
+    any thread. `initialized` is False before `init()`, after `close()`, and
+    when the native extension is unavailable. After `close()` the adapters are
+    still described as the last `init()` left them, so a check made once the
+    run is over reads what happened; before the first `init()` there are none.
     """
     live, adapters = _runtime.runtime().describe()
-    return Diagnostics(initialized=live, adapters=adapters)
+    return Diagnostics(initialized=live, adapters=adapters, losses=_losses())
+
+
+def _losses() -> tuple[Loss, ...]:
+    """The drop ledger's totals as `Loss` entries, in the vocabulary's order."""
+    taken = _ledger.snapshot()
+    order = {reason: i for i, reason in enumerate(_ledger.DropReason)}
+    where: dict[_ledger.DropReason, list[tuple[str, int]]] = {}
+    for (reason, label), n in taken.where.items():
+        where.setdefault(reason, []).append((label, n))
+    found = sorted(taken.counts.items(), key=lambda item: (order[item[0][0]], item[0][1].value))
+    return tuple(
+        Loss(
+            reason.value,
+            unit.value,
+            n,
+            _ledger.REASONS[reason].loss,
+            _ledger.REASONS[reason].meaning,
+            _ledger.REASONS[reason].next_step,
+            tuple(sorted(where.get(reason, ()))),
+            taken.undeliverable.get((reason, unit), 0),
+        )
+        for (reason, unit), n in found
+        if n > 0
+    )
 
 
 # Root-namespace hygiene: the stdlib names above are imported under

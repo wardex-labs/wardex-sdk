@@ -395,6 +395,7 @@ def install_configured_adapters(client: Client | None, config: WardexConfig) -> 
                     )
     explicit = config.adapters.enabled is not None
     registry = get_registry()
+    registry.reset_statuses()
     for name in wanted:
         # A broken adapter must not break init(). Guarded rather than caught, so
         # the failure is counted under `adapters.<name>.load` and its traceback

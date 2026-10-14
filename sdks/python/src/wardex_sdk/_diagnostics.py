@@ -14,7 +14,7 @@ from dataclasses import dataclass
 
 from ._enums import AdapterState
 
-__all__ = ["AdapterStatus", "Diagnostics"]
+__all__ = ["AdapterStatus", "Diagnostics", "Loss"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,13 +39,50 @@ class AdapterStatus:
 
 
 @dataclass(frozen=True, slots=True)
+class Loss:
+    """One kind of thing wardex did not record, counted since the process started.
+
+    `reason` is a closed vocabulary (`queue_overflow`, `internal_sdk_error`,
+    ...) and `unit` says what was counted (`span`, `request`, `adapter`, ...).
+    `nature` is `"loss"` when the thing is gone, `"partial"` when it was
+    recorded incomplete, and `"none"` when nothing was lost because the drop
+    was asked for (a `before_send_envelope` hook that returned None).
+    `meaning` and `next_step` are the sentences wardex uses for this reason
+    everywhere it reports one. `where` breaks the reason down by the place in
+    wardex that counted it (`internal_sdk_error` by where it raised, an adapter
+    that did not install as `adapters.<name>`), across all of the reason's
+    units.
+
+    The counts only grow: sending them to a receiver does not reset them, so
+    two readings can be subtracted to get what was lost between them. They are
+    exact for this process whether or not they were sent. `undeliverable` is
+    how many of `count` never will be: the report carrying them was dropped
+    because more reports awaited the receiver's confirmation than wardex holds
+    (counted itself as `ledger_overflow`).
+    """
+
+    reason: str
+    unit: str
+    count: int
+    nature: str
+    meaning: str = ""
+    next_step: str = ""
+    where: tuple[tuple[str, int], ...] = ()
+    undeliverable: int = 0
+
+
+@dataclass(frozen=True, slots=True)
 class Diagnostics:
     """What `wardex.diagnostics()` returns: wardex's own account of this process.
 
-    `initialized` is False before `init()` and after `close()`, and then the
-    other fields are empty because there is nothing installed to describe.
-    `adapters` has one entry per adapter this release ships.
+    `initialized` is True between `init()` and `close()`. `adapters` is what
+    became of each adapter this release ships at the most recent `init()`, and
+    it is kept after `close()`, so a check made once the run is over still
+    reads it; before the first `init()` it is empty. `losses` counts every
+    kind of loss since the process started, one entry per reason and unit
+    that has happened at least once; a forked child starts its own from zero.
     """
 
     initialized: bool
     adapters: tuple[AdapterStatus, ...] = ()
+    losses: tuple[Loss, ...] = ()

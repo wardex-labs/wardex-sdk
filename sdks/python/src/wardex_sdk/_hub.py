@@ -7,7 +7,6 @@ from contextlib import contextmanager
 from contextvars import ContextVar, Token
 
 from ._client import Client
-from ._enums import AdapterState
 from ._runtime import runtime
 from ._scope import Scope, UserInfo, merge_scopes, merged_tags_and_user, merged_trace_fields
 from ._types import SpanContext
@@ -49,10 +48,10 @@ def installed_adapters() -> frozenset[str]:
     For an observer that must not import `_adapters/` itself — the byte and stdio seams sit beside
     it, not above it — and still has to know which framework already records an operation, so the
     seam does not record it a second time. Never builds the adapter registry: one never built has
-    installed nothing.
+    installed nothing. Read from the registry, not from the adapter statuses: those are the last
+    `init()`'s account and outlive `close()`, which has uninstalled the adapters they name.
     """
-    _live, statuses = runtime().describe()
-    return frozenset(s.name for s in statuses if s.state is AdapterState.INSTALLED)
+    return runtime().installed_adapters()
 
 
 def get_global_scope() -> Scope:

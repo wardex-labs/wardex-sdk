@@ -611,6 +611,7 @@ def test_the_degraded_checklist_covers_the_whole_public_surface():
         "Transport",
         "AdapterStatus",
         "Diagnostics",
+        "Loss",
         "AgentAttributes",
         "BeforeSendEnvelopeCallback",
         "Span",
