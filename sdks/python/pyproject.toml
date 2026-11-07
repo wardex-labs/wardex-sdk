@@ -100,6 +100,22 @@ test = [
     # 0.23.x; CI runs the openai-agents tests once more on 0.22.3, because 0.23
     # moved where an agent's tools are listed and the two trees differ.
     "openai-agents>=0.22,<0.24",
+    # The whole 2.x major is measured: the adapter reads pydantic-ai's own
+    # OpenTelemetry spans (instrumentation schema version 5), not its internals,
+    # so a minor release does not move what it reads; a schema version other
+    # than 5 is said once at `init()`. 2.55 dropped Python 3.10, so the floor
+    # check resolves the newest 2.x that still supports it (2.54.0). Capped at
+    # the major so CI tests exactly what `_adapters/_measured.py` claims; a
+    # test holds every pin here to that table. No extras: `openai` already
+    # arrives through openai-agents.
+    "pydantic-ai-slim>=2,<3",
+    # pydantic-ai 2.x reaches stdio MCP servers only through `MCPToolset` over
+    # fastmcp's `StdioTransport` (`MCPServerStdio` was removed), and the suite
+    # drives one (test_pydantic_ai_mcp.py). The `client` extra is what
+    # `pydantic-ai-slim[mcp]` asks for; without it `fastmcp.client` refuses to
+    # import. Resolves on the 3.10 floor beside pydantic-ai-slim 2.54.0
+    # (fastmcp-slim 4.1.6, mcp 2.3.0).
+    "fastmcp-slim[client]>=4.1,<5",
     # The MCP stdio seam is tested against the official SDK on both ends of the
     # pipe (test_mcp_real_server.py). Measured with 2.3.0; capped at that minor
     # because the test's server is written to 2.x's low-level `Server`

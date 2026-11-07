@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import shutil
+from dataclasses import replace
 from operator import attrgetter
 from typing import TYPE_CHECKING, NamedTuple
 
@@ -107,6 +108,12 @@ def _openai_agents() -> AdapterInterface:
     return OpenAIAgentsAdapter()
 
 
+def _pydantic_ai() -> AdapterInterface:
+    from ._pydantic_ai import PydanticAiAdapter
+
+    return PydanticAiAdapter()
+
+
 #: Every adapter this SDK ships, in install order. Adding one is this row plus
 #: its module — nothing else in this file, and no branch anywhere.
 _ADAPTERS: dict[AdapterName, _Registration] = {
@@ -125,6 +132,9 @@ _ADAPTERS: dict[AdapterName, _Registration] = {
     ),
     AdapterName.LANGGRAPH: _Registration("langgraph", "langgraph", _langgraph),
     AdapterName.OPENAI_AGENTS: _Registration("agents", "openai-agents", _openai_agents),
+    # The module is shipped by the slim distribution; the `pydantic-ai`
+    # metapackage has no module files of its own, so it is not what to probe.
+    AdapterName.PYDANTIC_AI: _Registration("pydantic_ai", "pydantic-ai-slim", _pydantic_ai),
 }
 
 #: AdapterName -> distribution package to probe for auto-detection. DERIVED from
@@ -249,24 +259,31 @@ def _versions_said(found: _Found) -> str:
     return ", ".join(f"{entry.distribution} {v or '(version unknown)'}" for entry, v in found)
 
 
-def _say(name: str, key: str, line: str, *, count: bool = True) -> str:
+def _say(name: str, key: str, line: str, *, count: bool = True, said: bool = False) -> str:
     """One `[wardex]` line per adapter per kind, counted under `key`, and kept
-    as the status's `detail` so it is readable after stderr has scrolled."""
-    report_once(line, key=f"adapters.{name}.{key}")
+    as the status's `detail` so it is readable after stderr has scrolled.
+    `said`: the adapter already printed this sentence, so it is only kept."""
+    if not said:
+        report_once(line, key=f"adapters.{name}.{key}")
     if count:
         counters.bump(f"adapters.{name}.{key}")
     return line
 
 
-def _installed_status(name: str) -> AdapterStatus:
+def _installed_status(name: str, unmeasured: str = "") -> AdapterStatus:
     """An adapter that installed. Says so once when a framework version it
     depends on is outside what this release was tested against: it stays
     installed — most of what it records is still right — but the reader of
-    its tree has to know the tree may be wrong somewhere."""
+    its tree has to know the tree may be wrong somewhere. `unmeasured` is the
+    adapter's own sentence for a surface the version table cannot see
+    (`AdapterInterface.unmeasured_reason`); it files the status unmeasured too."""
     found = _framework_versions(name)
     off = [(entry, v) for entry, v in found if v is not None and not is_measured(entry, v)]
     if not off:
-        return _status(name, AdapterState.INSTALLED, found)
+        status = _status(name, AdapterState.INSTALLED, found)
+        if unmeasured and status.measured is not None:
+            status = replace(status, measured=False, detail=unmeasured)
+        return status
     what = ", ".join(f"{entry.distribution} {v} (tested: {spelled(entry)})" for entry, v in off)
     pins = ", ".join(
         f"{entry.distribution} to a tested release ({spelled(entry)})" for entry, _ in off
@@ -282,19 +299,33 @@ def _installed_status(name: str) -> AdapterStatus:
 
 
 def _not_installed(
-    name: str, state: AdapterState, key: str, line: str, found: _Found, *, count: bool = True
+    name: str,
+    state: AdapterState,
+    key: str,
+    line: str,
+    found: _Found,
+    *,
+    count: bool = True,
+    said: bool = False,
 ) -> AdapterStatus:
     """THE one place an adapter whose framework is here is filed as not
     installed — `UNSUPPORTED` or `FAILED` — so whatever else has to know that
     a whole framework's spans are missing is told from here and nowhere else."""
     record(DropReason.INSTRUMENTATION_UNAVAILABLE, unit=DropUnit.ADAPTER, where=f"adapters.{name}")
-    return _status(name, state, found, _say(name, key, line, count=count))
+    return _status(name, state, found, _say(name, key, line, count=count, said=said))
 
 
-def _unsupported_status(name: str) -> AdapterStatus:
+def _unsupported_status(name: str, reason: str = "") -> AdapterStatus:
     """An adapter whose `install()` returned without installing: its framework
-    is here, and its surface is not the one the adapter was written for."""
+    is here, and its surface is not the one the adapter was written for — or,
+    with `reason` (`AdapterInterface.decline_reason`), the adapter declined for
+    a cause it has already said, which is kept as the detail and not said
+    again."""
     found = _framework_versions(name)
+    if reason:
+        return _not_installed(
+            name, AdapterState.UNSUPPORTED, "unsupported", reason, found, said=True
+        )
     status = _status(name, AdapterState.UNSUPPORTED, found)
     seen = _versions_said(found) or "its framework"
     if status.measured is False:

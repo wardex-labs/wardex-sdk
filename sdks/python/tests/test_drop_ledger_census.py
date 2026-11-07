@@ -271,6 +271,9 @@ _CENSUS: dict[tuple[str, str, str], object] = {
         "an entry point that ran: evidence of coverage, not of a loss"
     ),
     ("_adapters/_context.py", "report_once", "f'{self.name}.{where}'"): _GUARDED,
+    ("_adapters/_context_bridge.py", "count", "'usage_hold_refused'"): NotADrop(
+        "a bridge asked to hold usage it may not hold; its numbers stay demoted extras on the span"
+    ),
     ("_adapters/_conversation.py", "count", "shadowed_counter"): NotADrop(
         "the host's conversation id wins over the framework's, which stays on the span"
     ),
@@ -454,6 +457,81 @@ _CENSUS: dict[tuple[str, str, str], object] = {
     ("_adapters/_openai_agents_kinds.py", "report_once", "f'adapters.openai_agents.{reason}'"): (
         _OPENAI
     ),
+    # -- adapters: Pydantic AI
+    ("_adapters/_pydantic_ai.py", "count", "'attempt_without_chat'"): NotADrop(
+        "a failed attempt with no chat unit to hang under is left off by policy; the model "
+        "call it belonged to still ships"
+    ),
+    ("_adapters/_pydantic_ai.py", "count", "'attribute_not_scalar'"): NotADrop(
+        "a framework attribute with no scalar form is left off by policy; its span ships"
+    ),
+    ("_adapters/_pydantic_ai.py", "count", "'chat_lost_no_parent'"): NotADrop(
+        "a chat span that ended before it named its model, with no open run to sit under, "
+        "sent nothing; there is no model call to lose"
+    ),
+    ("_adapters/_pydantic_ai.py", "count", "'chat_open_off_start_task'"): NotADrop(
+        "a tally: the chat unit opened off its span's task and is reached through the "
+        "current-span resolver; it ships"
+    ),
+    ("_adapters/_pydantic_ai.py", "count", "'chat_opened_at_end'"): Marker("NO_WIRE_EVIDENCE"),
+    ("_adapters/_pydantic_ai.py", "count", "'end_without_start'"): NotADrop(
+        "an end for a span this install never saw start; nothing of it was open to lose"
+    ),
+    ("_adapters/_pydantic_ai.py", "count", "'held_close'"): NotADrop(
+        "a run held open until its last child closes; it ships then"
+    ),
+    ("_adapters/_pydantic_ai.py", "count", "'instrumentation_replaced'"): NotADrop(
+        "a tally: the host replaced wardex's instrumentation settings after init(), so the "
+        "adapter received no spans from then on; said once at close"
+    ),
+    ("_adapters/_pydantic_ai.py", "count", "'instrumentation_unreachable'"): L(
+        "INSTRUMENTATION_UNAVAILABLE", at="_adapters/__init__.py"
+    ),
+    ("_adapters/_pydantic_ai.py", "count", "'late_callback'"): NotADrop(
+        "a framework callback after uninstall; the uninstall already closed and shipped the span"
+    ),
+    ("_adapters/_pydantic_ai.py", "count", "'pin_refused'"): Marker(
+        "CORRELATION_CONFLICT", at="_assembly/_units.py"
+    ),
+    ("_adapters/_pydantic_ai.py", "count", "'pin_stranded'"): NotADrop(
+        "a pin left behind is released; nothing is dropped"
+    ),
+    ("_adapters/_pydantic_ai.py", "count", "'processor_left_inert'"): NotADrop(
+        "a processor the provider cannot remove stays registered and records nothing"
+    ),
+    ("_adapters/_pydantic_ai.py", "count", "'schema_version'"): NotADrop(
+        "a tally of an instrumentation schema this release was not written against; spans ship"
+    ),
+    ("_adapters/_pydantic_ai.py", "count", "'unknown_attribute'"): NotADrop(
+        "an attribute no table names is left off and counted as drift; its span ships"
+    ),
+    ("_adapters/_pydantic_ai.py", "count", "'unknown_span'"): NotADrop(
+        "a span the framework emits that wardex does not record by policy; work inside it "
+        "nests under the ambient unit"
+    ),
+    (
+        "_adapters/_pydantic_ai.py",
+        "report_once",
+        "'adapters.pydantic_ai.processor_left_inert'",
+    ): NotADrop("a processor the provider cannot remove stays registered and records nothing"),
+    (
+        "_adapters/_pydantic_ai.py",
+        "report_once",
+        "'adapters.pydantic_ai.instrumentation_replaced'",
+    ): NotADrop(
+        "the host replaced wardex's instrumentation settings after init(); said once at close"
+    ),
+    ("_adapters/_pydantic_ai.py", "report_once", "'adapters.pydantic_ai.schema_version'"): (
+        NotADrop(
+            "an instrumentation schema this release was not written against, said once; spans ship"
+        )
+    ),
+    ("_adapters/_pydantic_ai.py", "report_once", "'adapters.pydantic_ai.unreachable'"): L(
+        "INSTRUMENTATION_UNAVAILABLE", at="_adapters/__init__.py"
+    ),
+    ("_adapters/_pydantic_ai.py", "report_once", "f'adapters.pydantic_ai.degraded.{where}'"): (
+        _GUARDED
+    ),
     # -- adapters: the OTel bridge
     ("_adapters/_otel_merge.py", "bump", "'adapters.anthropic.otel_bridge.attr_dropped'"): (
         NotADrop("an attribute outside the bridge's allow-list, left out by policy")
@@ -521,6 +599,9 @@ _CENSUS: dict[tuple[str, str, str], object] = {
         "f'adapters.{label}.otel_bridge.undecodable'",
     ): _BRIDGE,
     # -- assembly core
+    ("_assembly/_bridge_latch.py", "bump", "'assembly._bridge_latch.parent_resolved'"): NotADrop(
+        "a request parented one level deeper, to a bridge unit below the ambient one; nothing lost"
+    ),
     ("_assembly/_builder.py", "bump", "'assembly.builder.gen_ai_usage_not_inclusive'"): NotADrop(
         "an observation about upstream usage numbers; the span ships whole"
     ),
@@ -630,6 +711,18 @@ _CENSUS: dict[tuple[str, str, str], object] = {
     ("_assembly/_units.py", "bump", "'assembly._units.stale_pin_ambient'"): _UNITS,
     ("_assembly/_units.py", "bump", "'assembly._units.stale_pin_foreign_registry'"): _UNITS,
     ("_assembly/_units.py", "bump", "f'assembly._units.{where}_table_full'"): _UNITS,
+    ("_assembly/_usage_hold.py", "bump", "'assembly._usage_hold.hold_refused'"): NotADrop(
+        "a usage hold refused; the framework's numbers stay demoted extras on the span"
+    ),
+    ("_assembly/_usage_hold.py", "bump", "'assembly._usage_hold.promote_skipped'"): NotADrop(
+        "a demoted usage pair left where it was, still on the span as an extra"
+    ),
+    ("_assembly/_usage_hold.py", "bump", "'assembly._usage_hold.usage_kept_demoted'"): NotADrop(
+        "the wire span under the unit carries the usage; the framework's copy stays demoted"
+    ),
+    ("_assembly/_usage_hold.py", "bump", "'assembly._usage_hold.usage_promoted'"): Marker(
+        "NO_WIRE_EVIDENCE"
+    ),
     # -- the client
     ("_client.py", "bump", "'client.finalize.rejected_closed'"): L("AFTER_CLOSE"),
     ("_client.py", "record", "DropReason.AFTER_CLOSE"): L("AFTER_CLOSE"),

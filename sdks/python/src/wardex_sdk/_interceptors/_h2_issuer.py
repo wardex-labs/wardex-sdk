@@ -62,7 +62,7 @@ import weakref
 from typing import Any
 
 from .. import _hub
-from .._assembly import PatchSet, guard, parent_is_closed_unit
+from .._assembly import PatchSet, guard, latch_parent, parent_is_closed_unit
 from .._types import ConversationContext, SpanContext
 from ._issue_scope import UNKNOWN_ISSUER, ScopeSnapshot, issued_scope
 
@@ -141,9 +141,9 @@ class StreamIssuers:
         if stream_id in self._by_stream:
             return False
         scope = _hub.get_current_scope()  # ONE read: parent and conversation are one fact
-        parent = scope.active_span_context
+        parent, conversation = latch_parent(scope.active_span_context, scope.conversation)
         closed, identity = parent_is_closed_unit(parent), issued_scope()
-        self._by_stream[stream_id] = (parent, closed, scope.conversation, identity)
+        self._by_stream[stream_id] = (parent, closed, conversation, identity)
         while len(self._by_stream) > self._cap:
             self._by_stream.pop(min(self._by_stream))
         return True

@@ -95,6 +95,7 @@ from ._parentage import (
     latch_ambient,
     resolve_parentage,
 )
+from ._usage_hold import settle_usage
 from ._vocab import SpanIntent
 
 
@@ -822,13 +823,12 @@ class Unit:
     ) -> SpanDraft:
         """Stamp the unit's own span. Caller holds the lock; does not emit.
 
-        Takes no marker argument, deliberately. A `marker=marker` keyword here
-        would hand the limitation census a value it cannot follow AND — because
-        any function passed a marker-ish name becomes a read-every-argument sink
-        for the whole program — would make `status`, `end_ns` and `error_type`
-        unreadable holes at every call site of every same-named method in the
-        SDK. A marker is attached where it is DECIDED, by `note()`, which is
-        also where the literal is spelled.
+        Takes no marker argument, deliberately. A `marker=marker` keyword here would hand the
+        limitation census a value it cannot follow AND — because any function passed a
+        marker-ish name becomes a read-every-argument sink for the whole program — would make
+        `status`, `end_ns` and `error_type` unreadable holes at every call site of every
+        same-named method in the SDK. A marker is attached where it is DECIDED, by `note()`,
+        which is also where the literal is spelled. A bridge's usage hold settles on the way out.
         """
         draft = self._draft
         if self._input_recorded or self._output_recorded:
@@ -851,7 +851,7 @@ class Unit:
         if error_type is not None:
             draft.set_error(error_type)
         draft.set_end_ns(end_ns)
-        return draft
+        return settle_usage(draft)
 
 
 def _append_capped(buf: bytearray, data: bytes, cap: int) -> bool:

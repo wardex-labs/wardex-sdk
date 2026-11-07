@@ -80,6 +80,7 @@ from .._assembly import (
     report_once,
 )
 from .._enums import StatusCode
+from ._context_bridge import BridgeVerbs
 
 
 class Placement(Enum):
@@ -547,7 +548,7 @@ _SOLE = Evidence(ParentSource.UNIT_SOLE)
 _IN_UNIT = Evidence(ParentSource.UNIT_ACTIVE)  # what `UnitRegistry.open` swaps AMBIENT for
 
 
-class AdapterContext:
+class AdapterContext(BridgeVerbs):
     """The SDK, as an adapter sees it.
 
     Holds no client. `capture_span` is not reachable from an adapter, so the
@@ -951,8 +952,7 @@ class AdapterContext:
         # opened), so testing it first made the ROOT branch unreachable and
         # every run entry reported as "one span". A ROOT site is the one place
         # the loss is not one span: the description died before the intent's
-        # required block, so `finish()` refuses the draft and NOTHING ships for
-        # the whole run.
+        # required block, so `finish()` refuses the draft and NOTHING ships for the whole run.
         if placement is Placement.ROOT:
             # Measured rather than reasoned: 0 spans ship, and the body then
             # runs inside `degraded_run()`. So traffic inside is still captured

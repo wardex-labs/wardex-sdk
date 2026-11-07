@@ -476,6 +476,7 @@ class Runtime:
             # the extension point is a duck-typed `at_fork_child()` the
             # transport may implement; ours are stateless and don't.
             with guard("adapters.fork_reinit_failed"):
+                _fork_reinit_module("_assembly._usage_hold")  # first: an adapter raise skips none
                 if self._adapters is not None:
                     self._adapters._at_fork_reinit()
             if client is not None:

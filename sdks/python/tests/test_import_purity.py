@@ -92,7 +92,18 @@ SIGNALS = (("SIGINT", signal.SIGINT), ("SIGTERM", signal.SIGTERM))
 # The provider packages wardex has adapters for. `httpx` is in the list even
 # though it is not an agent framework: it is the transitive import that would
 # most plausibly sneak in, because the transport speaks HTTP.
-PROVIDERS = ("agents", "langgraph", "claude_agent_sdk", "langchain", "openai", "httpx")
+# `opentelemetry` is in it too: the pydantic-ai bridge imports it, and only from inside its
+# own `install()`.
+PROVIDERS = (
+    "agents",
+    "langgraph",
+    "claude_agent_sdk",
+    "langchain",
+    "openai",
+    "httpx",
+    "pydantic_ai",
+    "opentelemetry",
+)
 
 
 def snapshot():

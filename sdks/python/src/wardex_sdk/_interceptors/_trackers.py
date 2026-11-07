@@ -12,7 +12,14 @@ import time
 from typing import Any
 
 from .. import _hub, _wardex_native
-from .._assembly import Limitation, counters, parent_is_closed_unit, should_capture
+from .._assembly import (
+    Limitation,
+    counters,
+    latch_parent,
+    parent_is_closed_unit,
+    should_capture,
+    witness_request,
+)
 from .._enums import CaptureMode
 from .._protocol import WsParser
 from .._protocol._http1 import Http1ResponseParser, declares_event_stream
@@ -349,9 +356,16 @@ class _Http2Tracker:
         # a stream with no proven issuer, and never anyone's conversation or
         # identity (`IssuerLink.latch`).
         parent = _hub.get_current_scope().active_span_context
+        if opened:  # latched only for the streams this write opens
+            parent, _ = latch_parent(parent, None, witnessed=False)
         parent_closed = parent_is_closed_unit(parent) if opened else False
         for sid in opened:
-            self._latch[sid] = (*self._issuers.latch(sid, parent, parent_closed), now)
+            latched = self._issuers.latch(sid, parent, parent_closed)
+            if not latched[4]:
+                # The writer is this stream's parent only when no issuer was proven; a proven
+                # stream was witnessed by its issuer, and this writer may be another task.
+                witness_request(parent)
+            self._latch[sid] = (*latched, now)
         if opened:
             low = min(opened)
             self._latch_first = low if self._latch_first == 0 else min(self._latch_first, low)

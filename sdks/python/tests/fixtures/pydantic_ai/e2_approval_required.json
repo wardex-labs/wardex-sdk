@@ -1,0 +1,73 @@
+{
+ "scenario": "e2_approval_required",
+ "spans": [
+  {
+   "name": "invoke_agent approving",
+   "kind": "INTERNAL",
+   "parent": null,
+   "status": "UNSET",
+   "scope": "pydantic-ai",
+   "attributes": {
+    "model_name": "test",
+    "agent_name": "approving",
+    "gen_ai.agent.name": "approving",
+    "gen_ai.agent.call.id": "01a1b75b-a70d-77b4-b7db-d681f586fde8",
+    "gen_ai.conversation.id": "01a1b75b-a70d-77b4-b7db-d682ca013df0",
+    "gen_ai.operation.name": "invoke_agent",
+    "logfire.msg": "approving run",
+    "final_result": "{\"calls\":[],\"approvals\":[{\"tool_name\":\"dangerous\",\"args\":{\"x...",
+    "gen_ai.aggregated_usage.input_tokens": 51,
+    "gen_ai.aggregated_usage.output_tokens": 4,
+    "pydantic_ai.all_messages": "[{\"role\":\"user\",\"parts\":[{\"type\":\"text\",\"content\":\"go\"}]},{\"...",
+    "logfire.json_schema": "{\"type\":\"object\",\"properties\":{\"pydantic_ai.all_messages\":{\"..."
+   },
+   "events": []
+  },
+  {
+   "name": "chat test",
+   "kind": "CLIENT",
+   "parent": "invoke_agent approving",
+   "status": "UNSET",
+   "scope": "pydantic-ai",
+   "attributes": {
+    "gen_ai.operation.name": "chat",
+    "gen_ai.agent.name": "approving",
+    "gen_ai.agent.call.id": "01a1b75b-a70d-77b4-b7db-d681f586fde8",
+    "gen_ai.conversation.id": "01a1b75b-a70d-77b4-b7db-d682ca013df0",
+    "gen_ai.provider.name": "test",
+    "gen_ai.system": "test",
+    "gen_ai.request.model": "test",
+    "model_request_parameters": "{\"function_tools\":[{\"name\":\"dangerous\",\"parameters_json_sche...",
+    "gen_ai.tool.definitions": "[{\"type\":\"function\",\"name\":\"dangerous\",\"parameters\":{\"additi...",
+    "gen_ai.input.messages": "[{\"role\":\"user\",\"parts\":[{\"type\":\"text\",\"content\":\"go\"}]}]",
+    "gen_ai.output.messages": "[{\"role\":\"assistant\",\"parts\":[{\"type\":\"tool_call\",\"id\":\"pyd_...",
+    "logfire.json_schema": "{\"type\":\"object\",\"properties\":{\"gen_ai.input.messages\":{\"typ...",
+    "gen_ai.usage.input_tokens": 51,
+    "gen_ai.usage.output_tokens": 4,
+    "gen_ai.response.model": "test"
+   },
+   "events": []
+  },
+  {
+   "name": "execute_tool dangerous",
+   "kind": "INTERNAL",
+   "parent": "invoke_agent approving",
+   "status": "UNSET",
+   "scope": "pydantic-ai",
+   "attributes": {
+    "gen_ai.operation.name": "execute_tool",
+    "gen_ai.tool.name": "dangerous",
+    "gen_ai.tool.call.id": "pyd_ai_tool_call_id__dangerous",
+    "gen_ai.tool.call.arguments": "{\"x\":0}",
+    "gen_ai.agent.name": "approving",
+    "gen_ai.agent.call.id": "01a1b75b-a70d-77b4-b7db-d681f586fde8",
+    "gen_ai.conversation.id": "01a1b75b-a70d-77b4-b7db-d682ca013df0",
+    "logfire.msg": "running tool: dangerous",
+    "logfire.json_schema": "{\"type\":\"object\",\"properties\":{\"gen_ai.tool.call.arguments\":...",
+    "pydantic_ai.tool.deferral.name": "ApprovalRequired",
+    "pydantic_ai.tool.deferral.metadata": "{\"why\":\"dangerous\"}"
+   },
+   "events": []
+  }
+ ]
+}

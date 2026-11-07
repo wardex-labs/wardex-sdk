@@ -1,0 +1,153 @@
+{
+ "scenario": "d1_tool_model_retry",
+ "spans": [
+  {
+   "name": "invoke_agent retrying",
+   "kind": "INTERNAL",
+   "parent": null,
+   "status": "UNSET",
+   "scope": "pydantic-ai",
+   "attributes": {
+    "model_name": "test",
+    "agent_name": "retrying",
+    "gen_ai.agent.name": "retrying",
+    "gen_ai.agent.call.id": "01a1b75b-a6e9-75f2-9d74-a165c6e7b2ad",
+    "gen_ai.conversation.id": "01a1b75b-a6e9-75f2-9d74-a166eaa49d46",
+    "gen_ai.operation.name": "invoke_agent",
+    "logfire.msg": "retrying run",
+    "final_result": "{\"flaky\":0}",
+    "gen_ai.aggregated_usage.input_tokens": 168,
+    "gen_ai.aggregated_usage.output_tokens": 23,
+    "pydantic_ai.all_messages": "[{\"role\":\"user\",\"parts\":[{\"type\":\"text\",\"content\":\"go\"}]},{\"...",
+    "logfire.json_schema": "{\"type\":\"object\",\"properties\":{\"pydantic_ai.all_messages\":{\"..."
+   },
+   "events": []
+  },
+  {
+   "name": "chat test",
+   "kind": "CLIENT",
+   "parent": "invoke_agent retrying",
+   "status": "UNSET",
+   "scope": "pydantic-ai",
+   "attributes": {
+    "gen_ai.operation.name": "chat",
+    "gen_ai.agent.name": "retrying",
+    "gen_ai.agent.call.id": "01a1b75b-a6e9-75f2-9d74-a165c6e7b2ad",
+    "gen_ai.conversation.id": "01a1b75b-a6e9-75f2-9d74-a166eaa49d46",
+    "gen_ai.provider.name": "test",
+    "gen_ai.system": "test",
+    "gen_ai.request.model": "test",
+    "model_request_parameters": "{\"function_tools\":[{\"name\":\"flaky\",\"parameters_json_schema\":...",
+    "gen_ai.tool.definitions": "[{\"type\":\"function\",\"name\":\"flaky\",\"parameters\":{\"additional...",
+    "gen_ai.input.messages": "[{\"role\":\"user\",\"parts\":[{\"type\":\"text\",\"content\":\"go\"}]}]",
+    "gen_ai.output.messages": "[{\"role\":\"assistant\",\"parts\":[{\"type\":\"tool_call\",\"id\":\"pyd_...",
+    "logfire.json_schema": "{\"type\":\"object\",\"properties\":{\"gen_ai.input.messages\":{\"typ...",
+    "gen_ai.usage.input_tokens": 51,
+    "gen_ai.usage.output_tokens": 4,
+    "gen_ai.response.model": "test"
+   },
+   "events": []
+  },
+  {
+   "name": "execute_tool flaky",
+   "kind": "INTERNAL",
+   "parent": "invoke_agent retrying",
+   "status": "ERROR",
+   "scope": "pydantic-ai",
+   "attributes": {
+    "gen_ai.operation.name": "execute_tool",
+    "gen_ai.tool.name": "flaky",
+    "gen_ai.tool.call.id": "pyd_ai_tool_call_id__flaky",
+    "gen_ai.tool.call.arguments": "{\"x\":0}",
+    "gen_ai.agent.name": "retrying",
+    "gen_ai.agent.call.id": "01a1b75b-a6e9-75f2-9d74-a165c6e7b2ad",
+    "gen_ai.conversation.id": "01a1b75b-a6e9-75f2-9d74-a166eaa49d46",
+    "logfire.msg": "running tool: flaky",
+    "logfire.json_schema": "{\"type\":\"object\",\"properties\":{\"gen_ai.tool.call.arguments\":...",
+    "pydantic_ai.tool.retry.cause": "model_retry",
+    "pydantic_ai.tool.retry.attempt": 1,
+    "pydantic_ai.tool.retry.max_retries": 1,
+    "gen_ai.tool.call.result": "try again with care"
+   },
+   "events": [
+    {
+     "name": "exception",
+     "attributes": {
+      "exception.type": "pydantic_ai.exceptions.ToolRetryError",
+      "exception.escaped": "True"
+     }
+    }
+   ]
+  },
+  {
+   "name": "chat test",
+   "kind": "CLIENT",
+   "parent": "invoke_agent retrying",
+   "status": "UNSET",
+   "scope": "pydantic-ai",
+   "attributes": {
+    "gen_ai.operation.name": "chat",
+    "gen_ai.agent.name": "retrying",
+    "gen_ai.agent.call.id": "01a1b75b-a6e9-75f2-9d74-a165c6e7b2ad",
+    "gen_ai.conversation.id": "01a1b75b-a6e9-75f2-9d74-a166eaa49d46",
+    "gen_ai.provider.name": "test",
+    "gen_ai.system": "test",
+    "gen_ai.request.model": "test",
+    "model_request_parameters": "{\"function_tools\":[{\"name\":\"flaky\",\"parameters_json_schema\":...",
+    "gen_ai.tool.definitions": "[{\"type\":\"function\",\"name\":\"flaky\",\"parameters\":{\"additional...",
+    "gen_ai.input.messages": "[{\"role\":\"user\",\"parts\":[{\"type\":\"text\",\"content\":\"go\"}]},{\"...",
+    "gen_ai.output.messages": "[{\"role\":\"assistant\",\"parts\":[{\"type\":\"tool_call\",\"id\":\"pyd_...",
+    "logfire.json_schema": "{\"type\":\"object\",\"properties\":{\"gen_ai.input.messages\":{\"typ...",
+    "gen_ai.usage.input_tokens": 58,
+    "gen_ai.usage.output_tokens": 8,
+    "gen_ai.response.model": "test"
+   },
+   "events": []
+  },
+  {
+   "name": "execute_tool flaky",
+   "kind": "INTERNAL",
+   "parent": "invoke_agent retrying",
+   "status": "UNSET",
+   "scope": "pydantic-ai",
+   "attributes": {
+    "gen_ai.operation.name": "execute_tool",
+    "gen_ai.tool.name": "flaky",
+    "gen_ai.tool.call.id": "pyd_ai_a1d63b6163db40d193befb9067a40777",
+    "gen_ai.tool.call.arguments": "{\"x\":0}",
+    "gen_ai.agent.name": "retrying",
+    "gen_ai.agent.call.id": "01a1b75b-a6e9-75f2-9d74-a165c6e7b2ad",
+    "gen_ai.conversation.id": "01a1b75b-a6e9-75f2-9d74-a166eaa49d46",
+    "logfire.msg": "running tool: flaky",
+    "logfire.json_schema": "{\"type\":\"object\",\"properties\":{\"gen_ai.tool.call.arguments\":...",
+    "gen_ai.tool.call.result": "0"
+   },
+   "events": []
+  },
+  {
+   "name": "chat test",
+   "kind": "CLIENT",
+   "parent": "invoke_agent retrying",
+   "status": "UNSET",
+   "scope": "pydantic-ai",
+   "attributes": {
+    "gen_ai.operation.name": "chat",
+    "gen_ai.agent.name": "retrying",
+    "gen_ai.agent.call.id": "01a1b75b-a6e9-75f2-9d74-a165c6e7b2ad",
+    "gen_ai.conversation.id": "01a1b75b-a6e9-75f2-9d74-a166eaa49d46",
+    "gen_ai.provider.name": "test",
+    "gen_ai.system": "test",
+    "gen_ai.request.model": "test",
+    "model_request_parameters": "{\"function_tools\":[{\"name\":\"flaky\",\"parameters_json_schema\":...",
+    "gen_ai.tool.definitions": "[{\"type\":\"function\",\"name\":\"flaky\",\"parameters\":{\"additional...",
+    "gen_ai.input.messages": "[{\"role\":\"user\",\"parts\":[{\"type\":\"text\",\"content\":\"go\"}]},{\"...",
+    "gen_ai.output.messages": "[{\"role\":\"assistant\",\"parts\":[{\"type\":\"text\",\"content\":\"{\\\"f...",
+    "logfire.json_schema": "{\"type\":\"object\",\"properties\":{\"gen_ai.input.messages\":{\"typ...",
+    "gen_ai.usage.input_tokens": 59,
+    "gen_ai.usage.output_tokens": 11,
+    "gen_ai.response.model": "test"
+   },
+   "events": []
+  }
+ ]
+}

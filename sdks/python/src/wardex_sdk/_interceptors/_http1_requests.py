@@ -28,7 +28,7 @@ import time
 from dataclasses import dataclass
 
 from .. import _hub
-from .._assembly import counters, parent_is_closed_unit
+from .._assembly import counters, latch_parent, parent_is_closed_unit
 from .._protocol import REQUEST_METHODS
 from .._protocol._http1 import Http1RequestParser
 from .._types import ConversationContext, ParsedMessage, SpanContext
@@ -67,9 +67,9 @@ def _sent_by_a_client(method: str | None) -> bool:
 
 def _issued_here() -> Issue:
     scope = _hub.get_current_scope()  # ONE read: parent and conversation are one fact
-    parent = scope.active_span_context
+    parent, conversation = latch_parent(scope.active_span_context, scope.conversation)
     closed = parent_is_closed_unit(parent)
-    return Issue(time.time_ns(), parent, closed, scope.conversation, issued_scope())
+    return Issue(time.time_ns(), parent, closed, conversation, issued_scope())
 
 
 class _Reading:
