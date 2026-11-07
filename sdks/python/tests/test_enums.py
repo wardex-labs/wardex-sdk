@@ -12,12 +12,14 @@ def test_adapter_name_has_a_member_iff_its_adapter_ships():
     select that installed nothing at all. Same doctrine as InterceptorName's
     GRPC/WEBSOCKET/SSE removals: a name that cannot be spelled needs no
     validation, and each returns as a member when its adapter ships —
-    OPENAI_AGENTS has; LANGCHAIN has not. CODEX_EXEC arrived with its adapter."""
+    OPENAI_AGENTS has; LANGCHAIN has not. CODEX_EXEC arrived with its adapter,
+    and so did PYDANTIC_AI."""
     assert {m.value for m in _enums.AdapterName} == {
         "anthropic_agent_sdk",
         "codex_exec",
         "langgraph",
         "openai_agents",
+        "pydantic_ai",
     }
     assert not hasattr(_enums.AdapterName, "LANGCHAIN")
 

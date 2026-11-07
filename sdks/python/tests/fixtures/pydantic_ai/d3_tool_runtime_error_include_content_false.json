@@ -1,0 +1,85 @@
+{
+ "scenario": "d3_tool_runtime_error_include_content_false",
+ "spans": [
+  {
+   "name": "invoke_agent crashing_nocontent",
+   "kind": "INTERNAL",
+   "parent": null,
+   "status": "ERROR",
+   "scope": "pydantic-ai",
+   "attributes": {
+    "model_name": "test",
+    "agent_name": "crashing_nocontent",
+    "gen_ai.agent.name": "crashing_nocontent",
+    "gen_ai.agent.call.id": "01a1b75b-a703-733f-ad48-b8bb42283767",
+    "gen_ai.conversation.id": "01a1b75b-a703-733f-ad48-b8bc67af4740",
+    "gen_ai.operation.name": "invoke_agent",
+    "logfire.msg": "crashing_nocontent run",
+    "gen_ai.aggregated_usage.input_tokens": 51,
+    "gen_ai.aggregated_usage.output_tokens": 4,
+    "pydantic_ai.all_messages": "[{\"role\":\"user\",\"parts\":[{\"type\":\"text\"}]}]",
+    "logfire.json_schema": "{\"type\":\"object\",\"properties\":{\"pydantic_ai.all_messages\":{\"..."
+   },
+   "events": [
+    {
+     "name": "exception",
+     "attributes": {
+      "exception.type": "RuntimeError",
+      "exception.escaped": "False"
+     }
+    }
+   ]
+  },
+  {
+   "name": "chat test",
+   "kind": "CLIENT",
+   "parent": "invoke_agent crashing_nocontent",
+   "status": "UNSET",
+   "scope": "pydantic-ai",
+   "attributes": {
+    "gen_ai.operation.name": "chat",
+    "gen_ai.agent.name": "crashing_nocontent",
+    "gen_ai.agent.call.id": "01a1b75b-a703-733f-ad48-b8bb42283767",
+    "gen_ai.conversation.id": "01a1b75b-a703-733f-ad48-b8bc67af4740",
+    "gen_ai.provider.name": "test",
+    "gen_ai.system": "test",
+    "gen_ai.request.model": "test",
+    "model_request_parameters": "{\"function_tools\":[{\"name\":\"boom2\",\"parameters_json_schema\":...",
+    "gen_ai.tool.definitions": "[{\"type\":\"function\",\"name\":\"boom2\",\"parameters\":{\"additional...",
+    "gen_ai.input.messages": "[{\"role\":\"user\",\"parts\":[{\"type\":\"text\"}]}]",
+    "gen_ai.output.messages": "[{\"role\":\"assistant\",\"parts\":[{\"type\":\"tool_call\",\"id\":\"pyd_...",
+    "logfire.json_schema": "{\"type\":\"object\",\"properties\":{\"gen_ai.input.messages\":{\"typ...",
+    "gen_ai.usage.input_tokens": 51,
+    "gen_ai.usage.output_tokens": 4,
+    "gen_ai.response.model": "test"
+   },
+   "events": []
+  },
+  {
+   "name": "execute_tool boom2",
+   "kind": "INTERNAL",
+   "parent": "invoke_agent crashing_nocontent",
+   "status": "ERROR",
+   "scope": "pydantic-ai",
+   "attributes": {
+    "gen_ai.operation.name": "execute_tool",
+    "gen_ai.tool.name": "boom2",
+    "gen_ai.tool.call.id": "pyd_ai_tool_call_id__boom2",
+    "gen_ai.agent.name": "crashing_nocontent",
+    "gen_ai.agent.call.id": "01a1b75b-a703-733f-ad48-b8bb42283767",
+    "gen_ai.conversation.id": "01a1b75b-a703-733f-ad48-b8bc67af4740",
+    "logfire.msg": "running tool: boom2",
+    "logfire.json_schema": "{\"type\":\"object\",\"properties\":{\"gen_ai.tool.name\":{},\"gen_ai..."
+   },
+   "events": [
+    {
+     "name": "exception",
+     "attributes": {
+      "exception.type": "RuntimeError",
+      "exception.escaped": "True"
+     }
+    }
+   ]
+  }
+ ]
+}

@@ -1,0 +1,81 @@
+{
+ "scenario": "e4_call_deferred_version4",
+ "spans": [
+  {
+   "name": "invoke_agent deferring_v4",
+   "kind": "INTERNAL",
+   "parent": null,
+   "status": "UNSET",
+   "scope": "pydantic-ai",
+   "attributes": {
+    "model_name": "test",
+    "agent_name": "deferring_v4",
+    "gen_ai.agent.name": "deferring_v4",
+    "gen_ai.agent.call.id": "01a1b75b-a717-712e-ad65-b63f71a15120",
+    "gen_ai.conversation.id": "01a1b75b-a717-712e-ad65-b64072138768",
+    "gen_ai.operation.name": "invoke_agent",
+    "logfire.msg": "deferring_v4 run",
+    "final_result": "{\"calls\":[{\"tool_name\":\"later4\",\"args\":{\"x\":0},\"tool_call_id...",
+    "gen_ai.aggregated_usage.input_tokens": 51,
+    "gen_ai.aggregated_usage.output_tokens": 4,
+    "pydantic_ai.all_messages": "[{\"role\":\"user\",\"parts\":[{\"type\":\"text\",\"content\":\"go\"}]},{\"...",
+    "logfire.json_schema": "{\"type\":\"object\",\"properties\":{\"pydantic_ai.all_messages\":{\"..."
+   },
+   "events": []
+  },
+  {
+   "name": "chat test",
+   "kind": "CLIENT",
+   "parent": "invoke_agent deferring_v4",
+   "status": "UNSET",
+   "scope": "pydantic-ai",
+   "attributes": {
+    "gen_ai.operation.name": "chat",
+    "gen_ai.agent.name": "deferring_v4",
+    "gen_ai.agent.call.id": "01a1b75b-a717-712e-ad65-b63f71a15120",
+    "gen_ai.conversation.id": "01a1b75b-a717-712e-ad65-b64072138768",
+    "gen_ai.provider.name": "test",
+    "gen_ai.system": "test",
+    "gen_ai.request.model": "test",
+    "model_request_parameters": "{\"function_tools\":[{\"name\":\"later4\",\"parameters_json_schema\"...",
+    "gen_ai.tool.definitions": "[{\"type\":\"function\",\"name\":\"later4\",\"parameters\":{\"additiona...",
+    "gen_ai.input.messages": "[{\"role\":\"user\",\"parts\":[{\"type\":\"text\",\"content\":\"go\"}]}]",
+    "gen_ai.output.messages": "[{\"role\":\"assistant\",\"parts\":[{\"type\":\"tool_call\",\"id\":\"pyd_...",
+    "logfire.json_schema": "{\"type\":\"object\",\"properties\":{\"gen_ai.input.messages\":{\"typ...",
+    "gen_ai.usage.input_tokens": 51,
+    "gen_ai.usage.output_tokens": 4,
+    "gen_ai.response.model": "test"
+   },
+   "events": []
+  },
+  {
+   "name": "execute_tool later4",
+   "kind": "INTERNAL",
+   "parent": "invoke_agent deferring_v4",
+   "status": "ERROR",
+   "scope": "pydantic-ai",
+   "attributes": {
+    "gen_ai.operation.name": "execute_tool",
+    "gen_ai.tool.name": "later4",
+    "gen_ai.tool.call.id": "pyd_ai_tool_call_id__later4",
+    "gen_ai.tool.call.arguments": "{\"x\":0}",
+    "gen_ai.agent.name": "deferring_v4",
+    "gen_ai.agent.call.id": "01a1b75b-a717-712e-ad65-b63f71a15120",
+    "gen_ai.conversation.id": "01a1b75b-a717-712e-ad65-b64072138768",
+    "logfire.msg": "running tool: later4",
+    "logfire.json_schema": "{\"type\":\"object\",\"properties\":{\"gen_ai.tool.call.arguments\":...",
+    "pydantic_ai.tool.deferral.name": "CallDeferred",
+    "pydantic_ai.tool.deferral.metadata": "{\"reason\":\"external\"}"
+   },
+   "events": [
+    {
+     "name": "exception",
+     "attributes": {
+      "exception.type": "pydantic_ai.exceptions.CallDeferred",
+      "exception.escaped": "True"
+     }
+    }
+   ]
+  }
+ ]
+}

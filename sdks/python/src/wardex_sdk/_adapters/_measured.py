@@ -11,10 +11,13 @@ installs: most of what it records is usually still right, and a framework that
 ships a patch every few days would otherwise have its tree switched off most of
 the time.
 
-THE UNIT IS THE MINOR VERSION, final releases only. A pre-release, dev, post or
-local version was never the subject of a measurement, so it is unmeasured even
-when its minor is listed. A patch inside a measured minor that is known to
-break the suite is listed under `known_bad`.
+THE UNIT IS A DECLARED RANGE, final releases only: a minor (`"0.22"`) by
+default; a whole major (`"2"`) for a framework that releases minors faster than
+a suite can be re-run and whose contract the adapter reads carries its own
+version, checked at install. A pre-release, dev, post or local version was
+never the subject of a measurement, so it is unmeasured even when its range is
+listed. A patch inside a measured range that is known to break the suite is
+listed under `known_bad`.
 
 No dependency on `packaging`: the SDK has none at runtime, and a regular
 expression over the release segment is all the comparison needs.
@@ -34,14 +37,14 @@ __all__ = ["MEASURED", "Measured", "installed_version", "is_measured", "spelled"
 
 @dataclass(frozen=True, slots=True)
 class Measured:
-    """One distribution an adapter depends on, and the minors it was measured on."""
+    """One distribution an adapter depends on, and the ranges it was measured on."""
 
     distribution: str
     minors: tuple[str, ...]
-    """Measured minor versions, as "major.minor"."""
+    """Measured ranges: "major.minor", or a bare "major" meaning every final release of it."""
 
     known_bad: tuple[str, ...] = ()
-    """Exact versions inside a measured minor that fail the adapter's suite."""
+    """Exact versions inside a measured range that fail the adapter's suite."""
 
 
 #: Every adapter this release ships, and what its suite was last run against
@@ -62,6 +65,10 @@ MEASURED: dict[AdapterName, tuple[Measured, ...]] = {
     # MCP listing and a failing tool gate land under the agent there, and its streamed path
     # checks input guardrails before leaving a handoff's sender; both trees are measured.
     AdapterName.OPENAI_AGENTS: (Measured("openai-agents", ("0.22", "0.23")),),
+    # The whole major: what the adapter reads is pydantic-ai's own OpenTelemetry spans at
+    # instrumentation schema version 5, versioned separately from the package and checked at
+    # install; the framework releases minors weekly. Last run against 2.66.0 (2026-11-08).
+    AdapterName.PYDANTIC_AI: (Measured("pydantic-ai-slim", ("2",)),),
 }
 
 _FINAL = re.compile(r"(\d+)\.(\d+)(?:\.\d+)*")
@@ -72,7 +79,8 @@ def is_measured(entry: Measured, version: str) -> bool:
     found = _FINAL.fullmatch(version)
     if found is None or version in entry.known_bad:
         return False
-    return f"{int(found[1])}.{int(found[2])}" in entry.minors
+    major, minor = int(found[1]), int(found[2])
+    return f"{major}.{minor}" in entry.minors or str(major) in entry.minors
 
 
 def spelled(entry: Measured) -> str:

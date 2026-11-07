@@ -1,0 +1,120 @@
+{
+ "scenario": "h_function_model_ids_usage",
+ "spans": [
+  {
+   "name": "invoke_agent ids",
+   "kind": "INTERNAL",
+   "parent": null,
+   "status": "UNSET",
+   "scope": "pydantic-ai",
+   "attributes": {
+    "model_name": "function:fn:",
+    "agent_name": "ids",
+    "gen_ai.agent.name": "ids",
+    "gen_ai.agent.call.id": "01a1b75b-a750-7516-b78e-f10e4023cebd",
+    "gen_ai.conversation.id": "01a1b75b-a750-7516-b78e-f10f9f42f9ed",
+    "gen_ai.operation.name": "invoke_agent",
+    "logfire.msg": "ids run",
+    "final_result": "3",
+    "gen_ai.aggregated_usage.input_tokens": 31,
+    "gen_ai.aggregated_usage.output_tokens": 8,
+    "gen_ai.aggregated_usage.cache_read.input_tokens": 3,
+    "gen_ai.aggregated_usage.details.cache_read_tokens": 3,
+    "pydantic_ai.all_messages": "[{\"role\":\"user\",\"parts\":[{\"type\":\"text\",\"content\":\"1+2\"}]},{...",
+    "gen_ai.system_instructions": "[{\"type\":\"text\",\"content\":\"Be terse.\"}]",
+    "logfire.json_schema": "{\"type\":\"object\",\"properties\":{\"pydantic_ai.all_messages\":{\"..."
+   },
+   "events": []
+  },
+  {
+   "name": "chat function:fn:",
+   "kind": "CLIENT",
+   "parent": "invoke_agent ids",
+   "status": "UNSET",
+   "scope": "pydantic-ai",
+   "attributes": {
+    "gen_ai.operation.name": "chat",
+    "gen_ai.agent.name": "ids",
+    "gen_ai.agent.call.id": "01a1b75b-a750-7516-b78e-f10e4023cebd",
+    "gen_ai.conversation.id": "01a1b75b-a750-7516-b78e-f10f9f42f9ed",
+    "gen_ai.provider.name": "function",
+    "gen_ai.system": "function",
+    "gen_ai.request.model": "function:fn:",
+    "model_request_parameters": "{\"function_tools\":[{\"name\":\"add\",\"parameters_json_schema\":{\"...",
+    "gen_ai.tool.definitions": "[{\"type\":\"function\",\"name\":\"add\",\"parameters\":{\"additionalPr...",
+    "gen_ai.request.max_tokens": 50,
+    "gen_ai.request.temperature": 0.2,
+    "gen_ai.input.messages": "[{\"role\":\"user\",\"parts\":[{\"type\":\"text\",\"content\":\"1+2\"}]}]",
+    "gen_ai.output.messages": "[{\"role\":\"assistant\",\"parts\":[{\"type\":\"tool_call\",\"id\":\"call...",
+    "gen_ai.system_instructions": "[{\"type\":\"text\",\"content\":\"Be terse.\"}]",
+    "logfire.json_schema": "{\"type\":\"object\",\"properties\":{\"gen_ai.input.messages\":{\"typ...",
+    "gen_ai.usage.input_tokens": 11,
+    "gen_ai.usage.output_tokens": 7,
+    "gen_ai.usage.cache_read.input_tokens": 3,
+    "gen_ai.usage.details.cache_read_tokens": 3,
+    "gen_ai.response.model": "function:fn:",
+    "gen_ai.response.id": "resp_123",
+    "gen_ai.response.finish_reasons": [
+     "tool_call"
+    ],
+    "pydantic_ai.cache.hit_ratio": 0.2727272727272727,
+    "pydantic_ai.cache.established_tokens": 3
+   },
+   "events": []
+  },
+  {
+   "name": "execute_tool add",
+   "kind": "INTERNAL",
+   "parent": "invoke_agent ids",
+   "status": "UNSET",
+   "scope": "pydantic-ai",
+   "attributes": {
+    "gen_ai.operation.name": "execute_tool",
+    "gen_ai.tool.name": "add",
+    "gen_ai.tool.call.id": "call_abc",
+    "gen_ai.tool.call.arguments": "{\"x\":1,\"y\":2}",
+    "gen_ai.agent.name": "ids",
+    "gen_ai.agent.call.id": "01a1b75b-a750-7516-b78e-f10e4023cebd",
+    "gen_ai.conversation.id": "01a1b75b-a750-7516-b78e-f10f9f42f9ed",
+    "logfire.msg": "running tool: add",
+    "logfire.json_schema": "{\"type\":\"object\",\"properties\":{\"gen_ai.tool.call.arguments\":...",
+    "gen_ai.tool.call.result": "3"
+   },
+   "events": []
+  },
+  {
+   "name": "chat function:fn:",
+   "kind": "CLIENT",
+   "parent": "invoke_agent ids",
+   "status": "UNSET",
+   "scope": "pydantic-ai",
+   "attributes": {
+    "gen_ai.operation.name": "chat",
+    "gen_ai.agent.name": "ids",
+    "gen_ai.agent.call.id": "01a1b75b-a750-7516-b78e-f10e4023cebd",
+    "gen_ai.conversation.id": "01a1b75b-a750-7516-b78e-f10f9f42f9ed",
+    "gen_ai.provider.name": "function",
+    "gen_ai.system": "function",
+    "gen_ai.request.model": "function:fn:",
+    "model_request_parameters": "{\"function_tools\":[{\"name\":\"add\",\"parameters_json_schema\":{\"...",
+    "gen_ai.tool.definitions": "[{\"type\":\"function\",\"name\":\"add\",\"parameters\":{\"additionalPr...",
+    "gen_ai.request.max_tokens": 50,
+    "gen_ai.request.temperature": 0.2,
+    "gen_ai.input.messages": "[{\"role\":\"user\",\"parts\":[{\"type\":\"text\",\"content\":\"1+2\"}]},{...",
+    "gen_ai.output.messages": "[{\"role\":\"assistant\",\"parts\":[{\"type\":\"text\",\"content\":\"3\"}]...",
+    "gen_ai.system_instructions": "[{\"type\":\"text\",\"content\":\"Be terse.\"}]",
+    "logfire.json_schema": "{\"type\":\"object\",\"properties\":{\"gen_ai.input.messages\":{\"typ...",
+    "gen_ai.usage.input_tokens": 20,
+    "gen_ai.usage.output_tokens": 1,
+    "gen_ai.response.model": "function:fn:",
+    "gen_ai.response.id": "resp_456",
+    "gen_ai.response.finish_reasons": [
+     "stop"
+    ],
+    "pydantic_ai.cache.hit_ratio": 0.0,
+    "pydantic_ai.cache.established_tokens": 3
+   },
+   "events": []
+  }
+ ]
+}

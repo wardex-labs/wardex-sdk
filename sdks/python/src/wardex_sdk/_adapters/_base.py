@@ -33,6 +33,19 @@ class AdapterInterface(ABC):
     #: exception is being classified, so install-time population suffices.
     CONTROL_FLOW: tuple[type[BaseException], ...] = ()
 
+    #: Set by `install()` when the adapter installs but reads a surface outside
+    #: what this release was measured on, in a way the version table cannot see
+    #: (an instrumentation schema versioned apart from its package). The
+    #: registry then files the adapter `measured=False` with this sentence as
+    #: its detail. The adapter says it on stderr itself; the registry does not.
+    unmeasured_reason: str = ""
+
+    #: Set by `install()` just before it declines (returns without installing)
+    #: for a reason it has already said once on stderr. The registry files that
+    #: sentence as the UNSUPPORTED detail in place of its generic line, which
+    #: would otherwise tell the user to reinstall a framework that is fine.
+    decline_reason: str = ""
+
     @abstractmethod
     def name(self) -> str: ...
 

@@ -240,7 +240,12 @@ _MEMBER_SITES: dict[str, frozenset[str]] = {
     # The Codex adapter, both: the payloads on its spans are the host's stdin
     # and stdout, never the model's wire bytes, and the --json stream it reads
     # names neither the model nor where one model call ends.
-    "NO_WIRE_EVIDENCE": frozenset({"_adapters/_codex_exec.py"}),
+    # The usage hold: a bridge CHAT unit no wire request was issued under ships the
+    # framework's usage, promoted, and says so. The pydantic-ai bridge's chat span that
+    # ended before it named its model is opened at its end, with nothing sent under it.
+    "NO_WIRE_EVIDENCE": frozenset(
+        {"_adapters/_codex_exec.py", "_adapters/_pydantic_ai.py", "_assembly/_usage_hold.py"}
+    ),
     "SUBPROCESS_MODEL_CALLS_UNOBSERVED": frozenset({"_adapters/_codex_exec.py"}),
     # --- caps ---
     # HTTP/2's half of the body cap: the h2 tracker's `_mk` turns the native
@@ -396,6 +401,7 @@ _MEMBER_SITES: dict[str, frozenset[str]] = {
             "_adapters/_codex_exec.py",
             "_adapters/_langgraph.py",
             "_adapters/_openai_agents.py",
+            "_adapters/_pydantic_ai.py",
             "testing/conformance.py",
         }
     ),
@@ -444,6 +450,9 @@ _MEMBER_SITES: dict[str, frozenset[str]] = {
             # A bridge session the deadline reaper ended before the CLI's last
             # export could be awaited: its bridge data may be incomplete.
             "_adapters/_session_end.py",
+            # A pydantic-ai bridge callback whose own step failed: the nearest
+            # live unit says part of the run's tree is missing.
+            "_adapters/_pydantic_ai.py",
         }
     ),
 }
@@ -1352,6 +1361,8 @@ _UNRESOLVED_PY: frozenset[tuple[str, str]] = frozenset(
         ("_adapters/_langgraph.py", "Name:marker"),
         # `close_units(*, marker)` again, the openai-agents adapter's copy.
         ("_adapters/_openai_agents.py", "Name:marker"),
+        # And the pydantic-ai bridge's: `close_units(*, marker)` passing it on whole.
+        ("_adapters/_pydantic_ai.py", "Name:marker"),
         # And the Codex adapter's: `close_units(*, marker)` passing it on whole.
         ("_adapters/_codex_exec.py", "Name:marker"),
         ("_adapters/_registry.py", "Name:marker"),

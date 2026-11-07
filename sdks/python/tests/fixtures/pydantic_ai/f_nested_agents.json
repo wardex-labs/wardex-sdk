@@ -1,0 +1,143 @@
+{
+ "scenario": "f_nested_agents",
+ "spans": [
+  {
+   "name": "invoke_agent outer",
+   "kind": "INTERNAL",
+   "parent": null,
+   "status": "UNSET",
+   "scope": "pydantic-ai",
+   "attributes": {
+    "model_name": "test",
+    "agent_name": "outer",
+    "gen_ai.agent.name": "outer",
+    "gen_ai.agent.call.id": "01a1b75b-a71d-748a-b56d-048fae61a44e",
+    "gen_ai.conversation.id": "01a1b75b-a71d-748a-b56d-0490661157d6",
+    "gen_ai.operation.name": "invoke_agent",
+    "logfire.msg": "outer run",
+    "final_result": "{\"delegate\":\"inner says hi\"}",
+    "gen_ai.aggregated_usage.input_tokens": 107,
+    "gen_ai.aggregated_usage.output_tokens": 16,
+    "pydantic_ai.all_messages": "[{\"role\":\"user\",\"parts\":[{\"type\":\"text\",\"content\":\"delegate ...",
+    "logfire.json_schema": "{\"type\":\"object\",\"properties\":{\"pydantic_ai.all_messages\":{\"..."
+   },
+   "events": []
+  },
+  {
+   "name": "chat test",
+   "kind": "CLIENT",
+   "parent": "invoke_agent outer",
+   "status": "UNSET",
+   "scope": "pydantic-ai",
+   "attributes": {
+    "gen_ai.operation.name": "chat",
+    "gen_ai.agent.name": "outer",
+    "gen_ai.agent.call.id": "01a1b75b-a71d-748a-b56d-048fae61a44e",
+    "gen_ai.conversation.id": "01a1b75b-a71d-748a-b56d-0490661157d6",
+    "gen_ai.provider.name": "test",
+    "gen_ai.system": "test",
+    "gen_ai.request.model": "test",
+    "model_request_parameters": "{\"function_tools\":[{\"name\":\"delegate\",\"parameters_json_schem...",
+    "gen_ai.tool.definitions": "[{\"type\":\"function\",\"name\":\"delegate\",\"parameters\":{\"additio...",
+    "gen_ai.input.messages": "[{\"role\":\"user\",\"parts\":[{\"type\":\"text\",\"content\":\"delegate ...",
+    "gen_ai.output.messages": "[{\"role\":\"assistant\",\"parts\":[{\"type\":\"tool_call\",\"id\":\"pyd_...",
+    "logfire.json_schema": "{\"type\":\"object\",\"properties\":{\"gen_ai.input.messages\":{\"typ...",
+    "gen_ai.usage.input_tokens": 52,
+    "gen_ai.usage.output_tokens": 5,
+    "gen_ai.response.model": "test"
+   },
+   "events": []
+  },
+  {
+   "name": "execute_tool delegate",
+   "kind": "INTERNAL",
+   "parent": "invoke_agent outer",
+   "status": "UNSET",
+   "scope": "pydantic-ai",
+   "attributes": {
+    "gen_ai.operation.name": "execute_tool",
+    "gen_ai.tool.name": "delegate",
+    "gen_ai.tool.call.id": "pyd_ai_tool_call_id__delegate",
+    "gen_ai.tool.call.arguments": "{\"q\":\"a\"}",
+    "gen_ai.agent.name": "outer",
+    "gen_ai.agent.call.id": "01a1b75b-a71d-748a-b56d-048fae61a44e",
+    "gen_ai.conversation.id": "01a1b75b-a71d-748a-b56d-0490661157d6",
+    "logfire.msg": "running tool: delegate",
+    "logfire.json_schema": "{\"type\":\"object\",\"properties\":{\"gen_ai.tool.call.arguments\":...",
+    "gen_ai.tool.call.result": "inner says hi"
+   },
+   "events": []
+  },
+  {
+   "name": "invoke_agent inner",
+   "kind": "INTERNAL",
+   "parent": "execute_tool delegate",
+   "status": "UNSET",
+   "scope": "pydantic-ai",
+   "attributes": {
+    "model_name": "test",
+    "agent_name": "inner",
+    "gen_ai.agent.name": "inner",
+    "gen_ai.agent.call.id": "01a1b75b-a720-75b7-95d7-7eb55575d8b1",
+    "gen_ai.conversation.id": "01a1b75b-a720-75b7-95d7-7eb6e230f802",
+    "gen_ai.operation.name": "invoke_agent",
+    "logfire.msg": "inner run",
+    "final_result": "inner says hi",
+    "gen_ai.aggregated_usage.input_tokens": 51,
+    "gen_ai.aggregated_usage.output_tokens": 3,
+    "pydantic_ai.all_messages": "[{\"role\":\"user\",\"parts\":[{\"type\":\"text\",\"content\":\"a\"}]},{\"r...",
+    "logfire.json_schema": "{\"type\":\"object\",\"properties\":{\"pydantic_ai.all_messages\":{\"..."
+   },
+   "events": []
+  },
+  {
+   "name": "chat test",
+   "kind": "CLIENT",
+   "parent": "invoke_agent inner",
+   "status": "UNSET",
+   "scope": "pydantic-ai",
+   "attributes": {
+    "gen_ai.operation.name": "chat",
+    "gen_ai.agent.name": "inner",
+    "gen_ai.agent.call.id": "01a1b75b-a720-75b7-95d7-7eb55575d8b1",
+    "gen_ai.conversation.id": "01a1b75b-a720-75b7-95d7-7eb6e230f802",
+    "gen_ai.provider.name": "test",
+    "gen_ai.system": "test",
+    "gen_ai.request.model": "test",
+    "model_request_parameters": "{\"function_tools\":[],\"native_tools\":[],\"tool_visibility\":{},...",
+    "gen_ai.input.messages": "[{\"role\":\"user\",\"parts\":[{\"type\":\"text\",\"content\":\"a\"}]}]",
+    "gen_ai.output.messages": "[{\"role\":\"assistant\",\"parts\":[{\"type\":\"text\",\"content\":\"inne...",
+    "logfire.json_schema": "{\"type\":\"object\",\"properties\":{\"gen_ai.input.messages\":{\"typ...",
+    "gen_ai.usage.input_tokens": 51,
+    "gen_ai.usage.output_tokens": 3,
+    "gen_ai.response.model": "test"
+   },
+   "events": []
+  },
+  {
+   "name": "chat test",
+   "kind": "CLIENT",
+   "parent": "invoke_agent outer",
+   "status": "UNSET",
+   "scope": "pydantic-ai",
+   "attributes": {
+    "gen_ai.operation.name": "chat",
+    "gen_ai.agent.name": "outer",
+    "gen_ai.agent.call.id": "01a1b75b-a71d-748a-b56d-048fae61a44e",
+    "gen_ai.conversation.id": "01a1b75b-a71d-748a-b56d-0490661157d6",
+    "gen_ai.provider.name": "test",
+    "gen_ai.system": "test",
+    "gen_ai.request.model": "test",
+    "model_request_parameters": "{\"function_tools\":[{\"name\":\"delegate\",\"parameters_json_schem...",
+    "gen_ai.tool.definitions": "[{\"type\":\"function\",\"name\":\"delegate\",\"parameters\":{\"additio...",
+    "gen_ai.input.messages": "[{\"role\":\"user\",\"parts\":[{\"type\":\"text\",\"content\":\"delegate ...",
+    "gen_ai.output.messages": "[{\"role\":\"assistant\",\"parts\":[{\"type\":\"text\",\"content\":\"{\\\"d...",
+    "logfire.json_schema": "{\"type\":\"object\",\"properties\":{\"gen_ai.input.messages\":{\"typ...",
+    "gen_ai.usage.input_tokens": 55,
+    "gen_ai.usage.output_tokens": 11,
+    "gen_ai.response.model": "test"
+   },
+   "events": []
+  }
+ ]
+}
