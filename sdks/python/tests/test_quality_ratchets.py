@@ -10,9 +10,12 @@ reviewable on its own and cannot ride along inside an unrelated change.
 
 The failure each ratchet closes:
 
-  * `unwrap()`/`expect(` in Rust reachable from Python — a panic crosses PyO3
-    as `PanicException`, which derives from `BaseException`, so the seams'
-    `except Exception` guards do not catch it and the host's call dies.
+  * `unwrap()`/`expect(` in non-test Rust — a panic costs the host a record
+    or a connection, and its message lands on the host's stderr. The compiler
+    is the gate (`clippy::unwrap_used` / `expect_used` in the workspace
+    lints); the text scan here is kept identical to the one in
+    `scripts/quality-snapshot.sh`, so the number the snapshot prints is a
+    number a test also defends.
   * a panic-site counter that stops reading a file at the first `#[cfg(test)]`
     line — the marker does not always open a trailing test module. In
     `crates/wardex-protocol/src/semantic/mod.rs` it decorates the one-line
@@ -24,6 +27,9 @@ The failure each ratchet closes:
     under-reports reads precisely like a ratchet holding, so nothing turns
     red while the number decays: `_count_unwrap_lines` skips the
     brace-matched `#[cfg(test)]` ITEM and keeps scanning the rest of the file.
+    A file that exists only because a `#[cfg(test)] mod name;` declaration
+    pulls it in (`semantic/tests.rs`) is test code too, and is skipped whole;
+    counting it once hid 167 lines of slack behind a budget of 172.
   * modules over 800 lines — the file nobody dares open is where the second
     emitter path gets added.
   * hand-run checks missing from `AGENTS.md` — a check nobody is told to run
@@ -83,24 +89,17 @@ _TESTS = pathlib.Path(__file__).resolve().parent
 # P1 — panic surface in Rust
 # --------------------------------------------------------------------------
 
-#: `unwrap()`/`expect(` lines in non-test Rust under `crates/*/src`, counted by
-#: `_count_unwrap_lines` (same method as `scripts/quality-snapshot.sh`; the two
-#: implementations must stay identical, and a divergence between them is its
-#: own defect).
+#: `unwrap()`/`expect(` lines in non-test Rust, counted by `_count_unwrap_lines`
+#: (same method as `scripts/quality-snapshot.sh`; the two implementations must
+#: stay identical, and a divergence between them is its own defect).
 #:
-#: Recorded 2026-09-11 as 169. Down only — and 172 is NOT a relaxation.
-#: Raised from 169 to 172 on 2026-09-13, in the `quality:` commit that §0 makes
-#: the only route for raising a recorded value. The cause is a measurement
-#: error, not new debt: the counter used to stop at the first `#[cfg(test)]`
-#: line in a file, which in `crates/wardex-protocol/src/semantic/mod.rs` is the
-#: one-line declaration `mod tests;` at line 13 of 532. The scan abandoned the
-#: file there and never saw the three production `.unwrap()` calls in the SSE
-#: streaming dispatch at lines 159, 166 and 173 — reachable from Python through
-#: the FFI, which is the entire point of this budget. Not one line of Rust
-#: changed in that commit; the counter stopped being blind. Read this as the
-#: ratchet moving to where it always was, and do not raise it again for any
-#: reason other than a measurement that was demonstrably wrong.
-_UNWRAP_BUDGET_CRATES = 172
+#: This was a budget (recorded 2026-09-11 as 169, corrected to 172 on
+#: 2026-09-13 when the counter stopped abandoning files at a `mod tests;`
+#: line). It became a HARD RULE at zero on 2026-11-08, when the counter also
+#: stopped counting files that only a `#[cfg(test)] mod name;` declaration
+#: pulls in (167 of the 172 were `semantic/tests.rs`), and the last production
+#: sites were rewritten to prove their invariant by pattern. The compiler now
+#: enforces the same rule through `clippy::unwrap_used` and `expect_used`.
 
 _UNWRAP_RE = re.compile(r"\.unwrap\(\)|\.expect\(")
 _CFG_TEST_RE = re.compile(r"#\[\s*cfg\(test\)\s*\]")
@@ -214,26 +213,61 @@ def _end_of_cfg_test_item(code: list[str], start: int, col: int) -> int:
     return len(code)
 
 
+_CFG_TEST_MOD_DECL_RE = re.compile(
+    r"#\[\s*cfg\(test\)\s*\]\s*(?:#\[[^\]]*\]\s*)*(?:pub(?:\([^)]*\))?\s+)?mod\s+(\w+)\s*;"
+)
+#: An `#[expect(clippy::unwrap_used | expect_used, reason = "...")]` marks the
+#: one sanctioned shape of a production `expect`: the attribute states the
+#: invariant for review, and the compiler reports it the day the site is gone.
+#: The item it decorates is skipped the way a `#[cfg(test)]` item is.
+_EXPECT_PANIC_LINT_RE = re.compile(r"#\[\s*expect\(\s*clippy::(?:unwrap_used|expect_used)\b")
+
+
+def _test_only_files(root: pathlib.Path) -> set[pathlib.Path]:
+    """Files that exist only because a `#[cfg(test)] mod name;` pulls them in.
+
+    `mod tests;` under `#[cfg(test)]` makes `tests.rs` (or `tests/mod.rs`)
+    beside it a test file whose own text carries no marker at all, so the
+    per-item skip below cannot see it. The declaration is matched on blanked
+    code so a `mod` in a comment or a string does not count.
+    """
+    out: set[pathlib.Path] = set()
+    for path in root.rglob("*.rs"):
+        code = "\n".join(_rust_code_lines(path.read_text(encoding="utf-8")))
+        for m in _CFG_TEST_MOD_DECL_RE.finditer(code):
+            name = m.group(1)
+            if path.name in ("mod.rs", "lib.rs", "main.rs"):
+                base = path.parent
+            else:
+                base = path.with_suffix("")
+            out.add(base / f"{name}.rs")
+            out.add(base / name / "mod.rs")
+    return out
+
+
 def _count_unwrap_lines(*roots: pathlib.Path) -> int:
     """Lines matching `.unwrap()`/`.expect(` in non-test Rust under `roots`.
 
-    Files under a `tests/` directory are skipped whole; inside a file, each
-    `#[cfg(test)]` item is skipped and the scan RESUMES after it, because the
-    marker decorates a trailing test module, a one-line `mod tests;`, and a
-    statement inside a live function, and only the first of those three is the
-    end of the production code in that file.
+    Files under a `tests/` directory and files a `#[cfg(test)] mod name;`
+    declaration pulls in are skipped whole; inside a file, each `#[cfg(test)]`
+    item and each item under an `#[expect(clippy::unwrap_used | expect_used)]`
+    is skipped and the scan RESUMES after it, because the marker decorates a
+    trailing test module, a one-line `mod tests;`, and a statement inside a
+    live function, and only the first of those three is the end of the
+    production code in that file.
     """
     total = 0
     for root in roots:
+        test_only = _test_only_files(root)
         for path in sorted(root.rglob("*.rs")):
-            if "tests" in path.relative_to(root).parts:
+            if "tests" in path.relative_to(root).parts or path in test_only:
                 continue
             text = path.read_text(encoding="utf-8")
             raw = text.splitlines()
             code = _rust_code_lines(text)
             i = 0
             while i < len(raw):
-                marker = _CFG_TEST_RE.search(code[i])
+                marker = _CFG_TEST_RE.search(code[i]) or _EXPECT_PANIC_LINT_RE.search(code[i])
                 if marker:
                     i = _end_of_cfg_test_item(code, i, marker.end())
                     continue
@@ -247,27 +281,124 @@ def test_ffi_layer_has_no_unwrap_or_expect():
     """HARD RULE: zero in `bindings/python/src`, zero forever."""
     n = _count_unwrap_lines(_ROOT / "bindings" / "python" / "src")
     assert n == 0, (
-        f"{n} unwrap()/expect( in bindings/python/src. A panic here reaches the "
-        "host as PanicException (BaseException) and the seam guards cannot catch "
-        "it. Return a PyResult error instead."
+        f"{n} unwrap()/expect( in bindings/python/src. A panic here costs the "
+        "host a record or a connection. Return a PyResult error instead."
     )
 
 
-def test_core_crate_unwrap_count_only_falls():
-    """BUDGET: `crates/*/src` non-test unwrap()/expect( lines, down only."""
+def test_core_crates_have_no_unwrap_or_expect():
+    """HARD RULE: zero in non-test `crates/*/src` (was a budget of 172)."""
     n = _count_unwrap_lines(*sorted((_ROOT / "crates").glob("*/src")))
-    assert n <= _UNWRAP_BUDGET_CRATES, (
-        f"unwrap()/expect( in crates/*/src rose to {n} (budget "
-        f"{_UNWRAP_BUDGET_CRATES}). Every one is reachable from Python through "
-        "the FFI. Handle the error, or if the branch is truly unreachable, prove "
-        "it with a type rather than a message."
+    assert n == 0, (
+        f"{n} unwrap()/expect( in non-test crates/*/src outside any "
+        "`#[expect(clippy::expect_used, reason)]` item. Prove the branch by "
+        "pattern (`let Some(x) = .. else`), or if it is truly unreachable, "
+        "state the invariant in `expect(..)` under that attribute so the reason "
+        "is reviewable. The compiler enforces the same rule through "
+        "clippy::unwrap_used / expect_used; this scan keeps the snapshot honest."
     )
-    if n < _UNWRAP_BUDGET_CRATES:
-        pytest.fail(
-            f"unwrap()/expect( in crates/*/src fell to {n}. Lower "
-            f"_UNWRAP_BUDGET_CRATES to {n} in this commit so the ratchet holds "
-            "the new position — and say so in the commit body."
-        )
+
+
+def test_cfg_test_mod_declaration_marks_the_file_test_only():
+    """The counter must not count `semantic/tests.rs`: `mod tests;` pulls it in
+    under `#[cfg(test)]`, and the file itself carries no marker."""
+    root = _ROOT / "crates" / "wardex-protocol" / "src"
+    assert root / "semantic" / "tests.rs" in _test_only_files(root)
+
+
+# --------------------------------------------------------------------------
+# Build and lint configuration — the rules in Cargo.toml hold for every crate
+# --------------------------------------------------------------------------
+
+try:
+    import tomllib as _toml
+except ImportError:  # Python 3.10; pytest itself depends on tomli there
+    import tomli as _toml  # type: ignore[import-not-found,no-redef]  # the 3.10 floor has no tomllib
+
+_ROOT_MANIFEST = _ROOT / "Cargo.toml"
+
+
+def _member_manifests() -> list[pathlib.Path]:
+    with _ROOT_MANIFEST.open("rb") as fh:
+        members = _toml.load(fh)["workspace"]["members"]
+    return [_ROOT / m / "Cargo.toml" for m in members]
+
+
+def test_every_workspace_member_inherits_lints_and_publish():
+    """HARD RULE: a member that forgets `[lints] workspace = true` silently
+    opts out of every rule in the root Cargo.toml, and one that forgets
+    `publish.workspace = true` could be uploaded to crates.io by accident."""
+    missing = []
+    for path in _member_manifests():
+        with path.open("rb") as fh:
+            manifest = _toml.load(fh)
+        if manifest.get("lints", {}).get("workspace") is not True:
+            missing.append(f"{path.relative_to(_ROOT)}: [lints] workspace = true")
+        if manifest.get("package", {}).get("publish", {}) not in ({"workspace": True}, False):
+            missing.append(f"{path.relative_to(_ROOT)}: publish.workspace = true")
+    with _ROOT_MANIFEST.open("rb") as fh:
+        root_publish = _toml.load(fh)["workspace"]["package"].get("publish")
+    if root_publish is not False:
+        missing.append("Cargo.toml: [workspace.package] publish = false")
+    assert not missing, "\n".join(missing)
+
+
+def test_abi3_floor_equals_the_declared_python_floor():
+    """HARD RULE: the extension's stable-ABI floor (`abi3-py3NN` on pyo3) and
+    `requires-python` are one fact stated in two files. A floor above
+    `requires-python` ships a wheel pip refuses on the oldest supported Python."""
+    with _ROOT_MANIFEST.open("rb") as fh:
+        pyo3 = _toml.load(fh)["workspace"]["dependencies"]["pyo3"]
+    abi3 = [f for f in pyo3["features"] if f.startswith("abi3-py")]
+    assert len(abi3) == 1, abi3
+    abi3_floor = abi3[0].removeprefix("abi3-py")
+    with _PYPROJECT.open("rb") as fh:
+        requires = _toml.load(fh)["project"]["requires-python"]
+    floor = re.search(r">=\s*(\d+)\.(\d+)", requires)
+    assert floor is not None, requires
+    declared = floor.group(1) + floor.group(2)
+    assert abi3_floor == declared, f"pyo3 {abi3[0]} vs requires-python {requires}"
+
+
+def test_rust_crates_stay_exhaustive_and_undeprecated():
+    """HARD RULE: these crates have no consumers outside this workspace, so a
+    new variant or field must break every match and literal that has to decide
+    what to do with it, and a changed signature is fixed at its callers in the
+    same change instead of deprecated."""
+    attr = re.compile(r"#\[\s*(?:cfg_attr\([^]]*?,\s*)?(?:non_exhaustive|deprecated)\b")
+    hits = []
+    for root in (_ROOT / "crates", _ROOT / "bindings"):
+        for path in root.rglob("*.rs"):
+            # Blanked code, so a mention in a comment or a string is not a hit.
+            for i, line in enumerate(_rust_code_lines(path.read_text(encoding="utf-8")), 1):
+                if attr.search(line):
+                    hits.append(f"{path.relative_to(_ROOT)}:{i}: {line.strip()}")
+    assert not hits, "\n".join(hits)
+
+
+def test_nothing_sets_panic_abort():
+    """HARD RULE: the FFI shield and the fail-closed PII scrub catch panics;
+    under `panic = "abort"` a caught panic is a dead host process. The gate is
+    the `compile_error!` behind `cfg(not(panic = "unwind"))` in
+    `bindings/python/src/lib.rs` and `crates/wardex-pipeline/src/lib.rs`, which
+    stops any build that sets abort by whatever route (profile, RUSTFLAGS, a
+    `CARGO_PROFILE_*_PANIC` variable). This scan is the early warning that
+    names the file and line before a build has to fail."""
+    pattern = re.compile(r"""panic\s*=\s*['"]abort['"]|panic=abort|CARGO_PROFILE_\w+_PANIC""")
+    hits = []
+    candidates = list(_ROOT.rglob("Cargo.toml")) + list(_ROOT.glob(".cargo/config*"))
+    candidates += list((_ROOT / ".github").rglob("*.yml")) + list(
+        (_ROOT / ".github").rglob("*.yaml")
+    )
+    candidates += list((_ROOT / "scripts").glob("*.sh")) + [_ROOT / "pyproject.toml", _PYPROJECT]
+    for path in candidates:
+        if "target" in path.parts or ".venv" in str(path) or not path.exists():
+            continue
+        for i, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+            code = line.split("#", 1)[0]
+            if pattern.search(code):
+                hits.append(f"{path.relative_to(_ROOT)}:{i}: {line.strip()}")
+    assert not hits, "\n".join(hits)
 
 
 # --------------------------------------------------------------------------
