@@ -1,0 +1,20 @@
+# Dependency movement arrives as pull requests whose CI (cargo-deny, the MSRV
+# check, the test suites) runs against the new lockfile, instead of silently on
+# the next build. Actions are pinned by commit SHA in the workflows; Dependabot
+# keeps those SHAs current.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: monthly
+    groups:
+      cargo:
+        patterns: ["*"]
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    groups:
+      actions:
+        patterns: ["*"]

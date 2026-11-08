@@ -5,6 +5,10 @@ edition.workspace      = true
 rust-version.workspace = true
 authors.workspace      = true
 license.workspace      = true
+publish.workspace      = true
 description            = "Configurable resource limits shared by every Wardex core crate and language SDK"
 
 [dependencies]
+
+[lints]
+workspace = true

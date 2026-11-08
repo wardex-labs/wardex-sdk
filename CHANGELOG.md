@@ -5,6 +5,20 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- The message of a native codec error now names the operation that failed
+  (`compression failed: ...`, `decompression failed: ...`, `protobuf decode
+  failed: ...`) instead of attributing every failure to zstd, which was wrong
+  for the gzip path used by OTLP. The exception type is unchanged
+  (`ValueError`); only the text differs, and nothing in the SDK matched on it.
+- The PII engine cache no longer panics for the rest of the process after one
+  masking panic poisoned its lock; it recovers, and engines are now compiled
+  outside the lock so one slow pattern set does not stall other exporters.
+- The Rust workspace declares the compiler it actually builds with
+  (`rust-version = "1.85"`; the previous 1.83 could not build) and ships its
+  `Cargo.lock`, so a wheel's dependency graph is tied to its commit.
+
 ### Added
 
 - **wardex now says when an adapter is on a framework release it was not

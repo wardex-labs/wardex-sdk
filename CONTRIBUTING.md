@@ -13,13 +13,17 @@ uv run pytest sdks/python/tests -v
 ## Before opening a PR
 
 ```bash
-cargo fmt --all --check
-cargo clippy --workspace --all-targets -- -D warnings
+scripts/check-rust.sh    # fmt, clippy, rustdoc, Rust tests (the same script CI runs)
 uv run ruff check sdks/python examples
 uv run ruff format --check sdks/python examples
 buf lint
 scripts/check-py310.sh   # if you touched anything under sdks/python
 ```
+
+The Rust rules and the reason behind each one live in `Cargo.toml`
+(`[workspace.lints]`), `clippy.toml` and `deny.toml`; the conventions no tool
+can check are in the "Rust style" section of `AGENTS.md`. The toolchain is
+pinned in `rust-toolchain.toml`, so `cargo` installs the right version itself.
 
 Then read what your change did to the recorded numbers:
 

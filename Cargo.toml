@@ -1,5 +1,7 @@
 [workspace]
-resolver = "2"
+# Resolver 3 is MSRV-aware: `cargo update` prefers dependency versions whose
+# `rust-version` fits the floor declared below instead of silently raising it.
+resolver = "3"
 members  = [
     "bindings/python",
     "crates/wardex-codec",
@@ -7,24 +9,27 @@ members  = [
     "crates/wardex-limits",
     "crates/wardex-pipeline",
     "crates/wardex-protocol",
-    "crates/wardex-replay",
 ]
 
 [workspace.package]
 edition       = "2021"
-rust-version  = "1.83"
+# The oldest compiler CI builds this workspace with (the `rust-msrv` job), not a
+# guess: the locked dependency graph needs 1.85 through indexmap, hashbrown,
+# getrandom and jobserver. Clippy reads this value for its MSRV-aware lints.
+rust-version  = "1.85"
 authors       = ["Wardex Team"]
 license       = "Apache-2.0"
+# These crates ship only inside the Python wheel; they are not published to
+# crates.io, so their Rust API carries no semver promise and must never be
+# uploaded by accident.
+publish       = false
 
 [workspace.dependencies]
 # Core
-bytes         = "1"
 thiserror     = "2"
-tracing       = "0.1"
 
 # Protobuf
 prost                 = "0.13"
-prost-types           = "0.13"
 prost-build           = "0.13"
 protoc-bin-vendored   = "3"
 
@@ -51,8 +56,165 @@ flate2        = "1"
 # PII masking — linear-time regex engine, no backtracking
 regex         = "1"
 
-# Test tooling — snapshot assertions
-insta         = "1"
-
 # Shared resource limits
 wardex-limits = { path = "crates/wardex-limits" }
+
+# The release profile builds the wheel that runs inside customer processes.
+[profile.release]
+# Whole-program optimization: a smaller, faster extension module that inlines
+# small functions across the parser, pipeline and binding crates without any
+# `#[inline]` attributes, at the cost of a slower release build.
+lto           = "fat"
+codegen-units = 1
+# Shipped code behaves like tested code: debug builds already check overflow,
+# and an overflow that wrapped silently in release would publish a fabricated
+# count or offset instead of a counted failure. The release-mode PII perf guard
+# in CI keeps measuring what the checks cost on the masking path.
+overflow-checks = true
+# The FFI shield and the fail-closed PII scrub catch panics with
+# `catch_unwind`; under `abort` every one of them would instead end the host
+# process. A `compile_error!` in `bindings/python/src/lib.rs` enforces this.
+panic = "unwind"
+
+# Every lint below is `warn` (except `unsafe_code`, which is `forbid`) so an
+# edit-compile loop is never blocked locally; CI and the release gate run clippy
+# and rustdoc with `-D warnings`, so a warning fails CI and is never published.
+# Each entry carries its reason. Changing a rule means changing the reason too.
+#
+# The rules follow from three facts about this library: it runs inside someone
+# else's process (it must never end, block or corrupt the host), it reports
+# observations (it must never publish a value it did not observe), and it
+# handles captured traffic (it must never leak that traffic through a side
+# channel such as a panic message).
+[workspace.lints.rust]
+# This SDK runs inside the host's process; memory safety there is not ours to
+# trade, and all native-boundary unsafety is delegated to PyO3. Lifting this
+# needs `undocumented_unsafe_blocks`, `unsafe_op_in_unsafe_fn` and a Miri job in
+# the same change.
+unsafe_code = "forbid"
+# A hidden lifetime in a type path hides that the value borrows something.
+rust_2018_idioms = { level = "warn", priority = -1 }
+# `pub` means "another crate uses this"; anything narrower is spelled
+# `pub(crate)` so the compiler's dead-code analysis can see it.
+unreachable_pub = "warn"
+# A public type that no path can name is an accidental public surface.
+unnameable_types = "warn"
+# A name already in scope does not need its path repeated.
+unused_qualifications = "warn"
+# Every item another crate can name is a contract between crates; its doc
+# states what the type cannot, such as units, caps and what `None` means.
+# Generated protobuf code is exempted where it is included.
+missing_docs = "warn"
+# Every public type has a Debug impl so test failures are diagnosable. Production
+# code never Debug-formats a value (`clippy::use_debug` below), so a derived
+# impl on a message type is safe; the long-lived parser and connection state
+# that buffers captured traffic writes its own impl printing sizes, never bytes.
+missing_debug_implementations = "warn"
+# `pyo3::create_exception!` in PyO3 0.22 expands to items gated on pyo3's own
+# `gil-refs` feature, which no crate here declares. Remove after upgrading PyO3.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("gil-refs"))'] }
+
+[workspace.lints.clippy]
+# --- The host must keep running ---------------------------------------------
+# A panic in this library costs the host a record or a connection, and its
+# message lands on the host's stderr. Production code proves an `Option` or
+# `Result` by pattern or states the invariant in `expect` under an
+# `#[expect(..., reason = "...")]`; tests may unwrap (see clippy.toml).
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+unreachable = "warn"
+# A placeholder that panics must not ship inside someone else's process.
+todo = "warn"
+unimplemented = "warn"
+# A library must never end the host process.
+exit = "warn"
+# `mem::forget` leaks inside a process that is not ours.
+mem_forget = "warn"
+# The host owns stdout and stderr. In a stdio MCP server stdout is the
+# protocol, so one stray line corrupts the host's messages.
+print_stdout = "warn"
+print_stderr = "warn"
+dbg_macro = "warn"
+# A stack overflow is a SIGSEGV that no `catch_unwind` can catch. Thresholds
+# live in clippy.toml.
+large_stack_frames = "warn"
+large_stack_arrays = "warn"
+large_types_passed_by_value = "warn"
+
+# --- Never publish a value that was not observed -----------------------------
+# A truncating or sign-changing cast silently produces a different number;
+# this SDK reports counts and sizes. Widen with `From`, narrow with `try_from`
+# and say what happens on overflow. After that, every remaining `as` is a
+# lossless one on every supported target.
+cast_possible_truncation = "warn"
+cast_possible_wrap = "warn"
+cast_sign_loss = "warn"
+cast_precision_loss = "warn"
+cast_lossless = "warn"
+# `as _` hides the target type from review.
+as_underscore = "warn"
+# Dropping an error, or replacing it with one that forgets its cause, hides the
+# root cause the SDK must report. `#[must_use]` marks the functions whose return
+# value is the only record of what was consumed or redacted.
+unused_result_ok = "warn"
+map_err_ignore = "warn"
+let_underscore_must_use = "warn"
+
+# --- Captured traffic must not leak ------------------------------------------
+# A failed `str` slice panics with up to 256 bytes of the string in its
+# message, which the host's panic hook prints before any catch runs. In this
+# codebase an index bug is therefore a data leak, so `str` is sliced with `get`
+# or under an `#[expect]` that states why the offset is a char boundary.
+string_slice = "warn"
+# `{:?}` in production output would print whatever a derived Debug holds,
+# including captured bytes. Debug formatting belongs in tests.
+use_debug = "warn"
+
+# --- Allocations and copies that buy nothing ---------------------------------
+# Each of these flags an allocation or copy with no effect; they cost nothing
+# to keep at zero on the span-capture hot path.
+implicit_clone = "warn"
+inefficient_to_string = "warn"
+format_push_string = "warn"
+format_collect = "warn"
+cloned_instead_of_copied = "warn"
+naive_bytecount = "warn"
+stable_sort_primitive = "warn"
+linkedlist = "warn"
+zero_sized_map_values = "warn"
+trivially_copy_pass_by_ref = "warn"
+redundant_clone = "warn"
+# Arguments to `unwrap_or`/`or`/`map_or` are evaluated even on the success
+# path; an allocation there is paid on every call.
+or_fun_call = "warn"
+
+# --- Readable to a newcomer --------------------------------------------------
+# Explicit imports show where a name comes from without an IDE. `use super::*`
+# in test modules and prelude imports stay allowed.
+wildcard_imports = "warn"
+# Handle the exceptional case first and keep the main path at one indentation.
+manual_let_else = "warn"
+needless_continue = "warn"
+# `{name}` in a format string keeps the value next to its slot.
+uninlined_format_args = "warn"
+# An item declared mid-body exists from the top of the scope; declaring it
+# mid-body hides that.
+items_after_statements = "warn"
+# Unit statements look like statements.
+semicolon_if_nothing_returned = "warn"
+# Several one-letter locals in one scope are not names.
+many_single_char_names = "warn"
+# `Some(A | B)` states the shared shape once.
+unnested_or_patterns = "warn"
+# In a library that must not panic into its host, a remaining panic path is
+# what a reader most needs to see.
+missing_panics_doc = "warn"
+# `cargo test` output reads as a list of behaviors; `test_` adds nothing.
+redundant_test_prefix = "warn"
+# One module layout: a module's files live in one directory under `mod.rs`.
+self_named_module_files = "warn"
+# Every lint exception carries its reason in the attribute, where the compiler
+# keeps it next to the code. Prefer `#[expect]` in hand-written code so a stale
+# exception fails the build; generated-code anchors stay `#[allow]`.
+allow_attributes_without_reason = "warn"
