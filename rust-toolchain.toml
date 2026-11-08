@@ -1,4 +1,9 @@
+# An exact toolchain, not `stable`: a new clippy release must not turn `main`
+# red on an unchanged commit, and local `cargo clippy` must report what CI
+# reports. Bump it in its own commit that also fixes the lints the new release
+# adds. The weekly `lint-next` CI job runs the current stable and beta so the
+# next bump is foreseen, not discovered.
 [toolchain]
-channel    = "stable"
-components = ["rustfmt", "clippy"]
-profile    = "default"
+channel    = "1.95.0"
+components = ["rustfmt", "clippy", "rust-src"]
+profile    = "minimal"

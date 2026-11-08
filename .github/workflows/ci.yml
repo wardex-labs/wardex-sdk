@@ -4,12 +4,105 @@ on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    # Weekly: run clippy on the current stable and beta (non-blocking) and make
+    # the advisory check blocking, so a toolchain bump or a new advisory is
+    # foreseen on a quiet Monday instead of discovered on someone's PR.
+    - cron: "0 6 * * 1"
+
+# The workflow needs nothing beyond reading the checkout. The repository
+# default is already `read`; stating it here keeps the file from depending on
+# a setting a maintainer can flip.
+permissions:
+  contents: read
+
+# A force-push to a PR branch cancels that branch's running jobs instead of
+# finishing stale ones. Pushes to main are never cancelled.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# Actions are pinned by commit SHA (the tag is in the comment): a tag can be
+# moved, and `release-python.yml` runs with PyPI publish rights. Dependabot
+# keeps the SHAs current.
 
 jobs:
-  rust:
+  # The Rust gate is `scripts/check-rust.sh`; AGENTS.md and the release
+  # workflow run the same script, so the three cannot drift.
+  rust-lint:
+    name: rust lint (fmt, clippy, rustdoc)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: install the pinned toolchain (rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+      - run: scripts/check-rust.sh lint
+
+  rust-test:
+    name: rust test (workspace, PII perf guard)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: install the pinned toolchain (rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+      - run: scripts/check-rust.sh test
+
+  # `rust-version` in Cargo.toml is the oldest compiler this workspace is
+  # checked with, not a guess; this job is what makes that sentence true.
+  rust-msrv:
+    name: rust msrv (cargo check on the declared floor)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - run: scripts/check-rust.sh msrv
+
+  # The wheel statically links every dependency into an artifact shipped to
+  # customers, so each dependency's license and source is checked before it can
+  # ship, and dependencies no code uses are removed.
+  rust-deps:
+    name: rust deps (cargo-deny, cargo-machete)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: install the pinned toolchain (rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: taiki-e/install-action@3a3daafd3b7f23b8f65d9f5ba2db203fb59b79e2 # v2
+        with:
+          tool: cargo-deny@0.20.2,cargo-machete@0.9.2
+      - run: scripts/check-rust.sh deps
+        env:
+          # Advisory data changes independently of the code, so a new entry
+          # fails only the scheduled run, never an unrelated pull request.
+          CHECK_RUST_ADVISORIES_BLOCKING: ${{ github.event_name == 'schedule' && '1' || '0' }}
+
+  # Early warning for the next toolchain bump: the lints the current stable
+  # and beta would add to the pinned toolchain's set. It runs only on the
+  # schedule, so a failure blocks no change; it reaches the maintainer as a
+  # failed scheduled run, which a job-level continue-on-error would hide.
+  lint-next:
+    name: clippy on ${{ matrix.toolchain }} (next toolchain)
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        toolchain: [stable, beta]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - run: rustup toolchain install ${{ matrix.toolchain }} --profile minimal --component clippy
+      - run: cargo +${{ matrix.toolchain }} clippy --workspace --all-targets --all-features --locked -- -D warnings
+
+  proto:
+    name: proto (buf lint, breaking)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           # `buf breaking` resolves its baseline out of the local `.git`, and a
           # depth-limited clone simply does not contain it — the step would then
@@ -18,9 +111,6 @@ jobs:
           # baseline is the state the branch had BEFORE this push, which can be
           # any number of commits back (see the `buf breaking` step).
           fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
       # setup_only: install buf, run nothing. The action's own defaults enable
       # lint/format/breaking ONLY on pull_request, and this repo's history is
       # almost entirely direct pushes to main — so a schema break's most likely
@@ -28,17 +118,9 @@ jobs:
       # turn on `buf format --exit-code`, which the current tree does not pass
       # (all five protos re-format); reformatting them is a separate commit, not
       # this one. Explicit steps below, so what runs is visible here.
-      - uses: bufbuild/buf-action@v1
+      - uses: bufbuild/buf-action@37ac33d8960807670a6e9719080e885197b09cc6 # v1
         with:
           setup_only: true
-      - name: cargo fmt --check
-        run: cargo fmt --all --check
-      - name: cargo clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
-      - name: cargo test (workspace; includes proto roundtrip)
-        run: cargo test --workspace
-      - name: PII perf guard (release)
-        run: cargo test -p wardex-pipeline --release --test pii_perf -- --ignored
       - name: buf lint
         run: buf lint
       # `buf.yaml` has declared `breaking: use: [FILE]` all along with nothing
@@ -51,21 +133,16 @@ jobs:
       # `ignore_only` excuses a whole file, not one field, and once the baseline
       # contains the break there is nothing left to excuse: an entry left behind
       # only switches this step off for every later deletion in that file
-      # (measured: with a stale entry, deleting any `envelope.proto` field exits
-      # 0; without it, the same deletion exits 100).
+      # (with a stale entry, deleting any `envelope.proto` field exits 0;
+      # without it, the same deletion exits 100).
       #
       # The baseline is the state the branch had BEFORE this event, NOT `HEAD~1`.
       # `HEAD~1` is correct only when the event carries exactly one commit: for a
       # push of A..B it compares B against A, so a break introduced in A is
-      # already present in the baseline and passes green (measured). `main` here
-      # takes work by fast-forward as the rule and by merge commit only as the
-      # exception, so a push carrying several commits is the normal case rather
-      # than the edge one, and that is exactly the path this step exists to
-      # cover. Measured 2026-09-13: 4 of the last 108 commits on `main` were
-      # merges, counted by parents per commit —
-      #   git log -108 --pretty='%p' | awk '{if(NF>1)c++} END{print c+0}'
-      # (`git log --merges -108` is the wrong instrument: it filters before the
-      # cap, so it counts merges across all of history instead of this window.)
+      # already present in the baseline and passes green. `main` here takes work
+      # by fast-forward as the rule and by merge commit only as the exception,
+      # so a push carrying several commits is the normal case rather than the
+      # edge one, and that is exactly the path this step exists to cover.
       #
       # `github.event.before` is the pre-push tip; `pull_request.base.sha` is the
       # base branch tip. GitHub sends an all-zero `before` for a branch's first
@@ -97,27 +174,19 @@ jobs:
           fi
           scripts/check-buf-exceptions.sh ".git#format=git,ref=$BUF_BREAKING_BASE"
 
-      # The quality budgets, printed into the run log so anyone reading a public
-      # CI run can recover the numbers without a checkout. The step decides nothing, and `if: always()` plus
-      # `continue-on-error` are deliberate: it reports even after a gate above
-      # has failed, and it can never itself turn a build red. What ENFORCES the
-      # budgets is `sdks/python/tests/test_quality_ratchets.py`, collected by
-      # the pytest step in the job below; this step only records them.
-      - name: quality snapshot (recorded, never gating)
-        if: always()
-        continue-on-error: true
-        run: bash scripts/quality-snapshot.sh
-
   python:
+    name: python ${{ matrix.python-version }}
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
         python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: astral-sh/setup-uv@v3
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: install the pinned toolchain (rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: astral-sh/setup-uv@caf0cab7a618c569241d31dcd442f54681755d39 # v3
         with:
           enable-cache: true
           # uv.lock is gitignored (library convention); key the cache on pyproject instead.
@@ -139,3 +208,14 @@ jobs:
         run: |
           uv run --with 'openai-agents==0.22.3' python -c "import importlib.metadata as m; v = m.version('openai-agents'); print('openai-agents', v); assert v == '0.22.3', v"
           uv run --with 'openai-agents==0.22.3' pytest -v sdks/python/tests/test_openai_agents_adapter.py sdks/python/tests/test_openai_agents_conformance.py sdks/python/tests/test_openai_agents_wire.py
+      # The quality budgets, printed into the run log so anyone reading a public
+      # CI run can recover the numbers without a checkout. The step decides
+      # nothing, and `if: always()` plus `continue-on-error` are deliberate: it
+      # reports even after a gate above has failed, and it can never itself turn
+      # a build red. What ENFORCES the budgets is
+      # `sdks/python/tests/test_quality_ratchets.py`, collected by the pytest
+      # step above; this step only records them.
+      - name: quality snapshot (recorded, never gating)
+        if: always() && matrix.python-version == '3.12'
+        continue-on-error: true
+        run: bash scripts/quality-snapshot.sh

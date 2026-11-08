@@ -43,6 +43,15 @@ actually changed.
   of every SDK version. A breaking wire change means a new package
   (`wardex.v2`), not a mutation of v1.
 
+## Minimum supported Rust version
+
+- `rust-version` in the root `Cargo.toml` is the oldest compiler CI builds the
+  workspace with (the `rust-msrv` job), never an untested number. It is raised
+  only when a dependency or a language feature needs it, in a minor release,
+  with a CHANGELOG line. The Rust crates themselves are not published; the
+  floor matters to contributors today and to users the day a source
+  distribution ships.
+
 ## Probing the version
 
 - `__version__` is the canonical runtime version in every SDK

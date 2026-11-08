@@ -5,7 +5,8 @@ edition.workspace      = true
 rust-version.workspace = true
 authors.workspace      = true
 license.workspace      = true
-description            = "Normalizer + Sampler + PII regex for Wardex SDK"
+publish.workspace      = true
+description            = "PII masking for Wardex SDK"
 
 [dependencies]
 wardex-codec = { path = "../wardex-codec" }
@@ -19,3 +20,6 @@ thiserror.workspace = true
 # and turned on by the Python binding's own `panic-injection`, which only the
 # development build enables; a release wheel never has it.
 panic-injection = []
+
+[lints]
+workspace = true

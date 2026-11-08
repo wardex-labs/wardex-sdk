@@ -1,0 +1,42 @@
+# Companion to `[workspace.lints.clippy]` in Cargo.toml: thresholds and
+# configuration for the lints enabled there.
+
+# Tests may unwrap, expect, panic and print: a failure or a line of output
+# there fails or explains one test, not a host process.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests  = true
+allow-print-in-tests  = true
+
+# `large_stack_frames`: a stack overflow is a SIGSEGV in the host process and
+# cannot be caught by the FFI shield. 128 KiB is the smallest default thread
+# stack among common libc targets (musl); no single frame may claim a
+# meaningful share of it.
+stack-size-threshold = 131072
+
+# The core runs as a guest inside someone else's process: it never changes
+# process-wide state, never ends the process, and never blocks or spawns the
+# host's threads. Each sanctioned exception carries an
+# `#[expect(clippy::disallowed_methods, reason = "...")]` naming which one it is.
+disallowed-methods = [
+    { path = "std::panic::catch_unwind", reason = "Catching a panic is a product decision at a known boundary (the FFI shield, a fail-closed scrub, a dependency known to panic on hostile input), not an error-handling tool; each site states which boundary it is." },
+    { path = "std::panic::set_hook", reason = "The panic hook belongs to the host process." },
+    { path = "std::panic::take_hook", reason = "The panic hook belongs to the host process." },
+    { path = "std::process::abort", reason = "Library code never ends the host process; it bypasses every catch." },
+    { path = "std::env::set_var", reason = "The process environment belongs to the host, and mutation races with concurrent readers." },
+    { path = "std::env::remove_var", reason = "The process environment belongs to the host." },
+    { path = "std::thread::sleep", reason = "Core code may run on the host's own thread; it must never block it." },
+    { path = "std::thread::spawn", reason = "Threads are owned by the language SDK, not the core." },
+    { path = "pyo3::marker::Python::with_gil", reason = "Every entry point already receives Python<'py>; re-acquiring the GIL from Rust is how a Rust lock and the GIL deadlock." },
+]
+
+# The SDK's Python guards catch `Exception` and nothing wider, so anything wider
+# walks through them into the host's own call. Panics are converted to a
+# `RuntimeError` subclass by the FFI shield.
+disallowed-types = [
+    { path = "pyo3::panic::PanicException", reason = "Subclasses BaseException and escapes every `except Exception` guard." },
+    { path = "pyo3::exceptions::PyBaseException", reason = "Only `Exception` subclasses may cross the boundary." },
+    { path = "pyo3::exceptions::PyKeyboardInterrupt", reason = "Only `Exception` subclasses may cross the boundary." },
+    { path = "pyo3::exceptions::PySystemExit", reason = "Only `Exception` subclasses may cross the boundary." },
+    { path = "pyo3::exceptions::PyGeneratorExit", reason = "Only `Exception` subclasses may cross the boundary." },
+]

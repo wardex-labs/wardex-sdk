@@ -33,18 +33,18 @@ jobs:
           - { runner: macos-14,       target: aarch64, manylinux: "" }
           - { runner: windows-latest, target: x64,     manylinux: "" }
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       # Run maturin from the package dir so it reads sdks/python/pyproject.toml
       # (which points at the real crate via [tool.maturin] manifest-path). maturin's
       # own --manifest-path expects a Cargo.toml, not pyproject.toml.
-      - uses: PyO3/maturin-action@v1
+      - uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1
         with:
           command: build
-          args: --release --out dist
+          args: --release --locked --out dist
           target: ${{ matrix.platform.target }}
           manylinux: ${{ matrix.platform.manylinux }}
           working-directory: sdks/python
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: wheels-${{ matrix.platform.runner }}-${{ matrix.platform.target }}
           path: sdks/python/dist
@@ -92,7 +92,7 @@ jobs:
           - { runner: macos-14,       target: aarch64, how: native,  python: "3.12" }
           - { runner: windows-latest, target: x64,     how: native,  python: "3.12" }
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: wheels-${{ matrix.platform.runner }}-${{ matrix.platform.target }}
           path: dist
@@ -107,7 +107,7 @@ jobs:
         if: matrix.platform.how == 'rosetta'
         run: arch -x86_64 /usr/bin/true 2>/dev/null || sudo softwareupdate --install-rosetta --agree-to-license
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         if: matrix.platform.how != 'qemu'
         with:
           python-version: ${{ matrix.platform.python }}
@@ -117,6 +117,10 @@ jobs:
 
       # Import the built wheel (--no-index so it can't silently fall back to PyPI)
       # to catch a broken native extension or missing files before we publish.
+      # The last line proves the wheel was built without the test-only fault
+      # injection: `_panic_for_test` exists only to make the SDK fail, and the
+      # development build is the only one that may carry it (the feature's name
+      # is deliberately absent from this file; a test asserts that).
       - name: install and import the built wheel
         if: matrix.platform.how == 'native'
         shell: bash
@@ -124,6 +128,7 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install --pre --no-index --find-links dist wardex-sdk
           python -c "import wardex_sdk; print('smoke ok:', wardex_sdk.__version__)"
+          python -c "import wardex_sdk._wardex_native as n; assert not hasattr(n, '_panic_for_test'), 'release wheel carries the test-only fault-injection entry point'"
 
       # Selecting the x64 interpreter is not enough on the arm64 runner: a bare
       # `python` has resolved to the system framework build (native arm64), and
@@ -141,7 +146,7 @@ jobs:
           arch -x86_64 "$py" -m pip install --pre --no-index --find-links dist wardex-sdk
           arch -x86_64 "$py" -c "import wardex_sdk; print('smoke ok:', wardex_sdk.__version__)"
 
-      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
         if: matrix.platform.how == 'qemu'
         with:
           platforms: arm64
@@ -162,21 +167,17 @@ jobs:
             -v "$PWD/dist:/dist:ro" -v "$PWD/smoke.sh:/smoke.sh:ro" \
             python:${{ matrix.platform.python }}-slim bash /smoke.sh
 
-  # Every check `ci.yml` runs, re-run on the exact commit the tag points at.
-  # `ci.yml` and this workflow do not know about each other: CI runs on branch
-  # pushes and pull requests, this runs on tags, and before this job existed a
-  # tag on a commit whose CI was red published just the same -- `smoke` only
-  # proves the wheel imports, not that the code in it is right. Now `publish`
-  # waits on this job too, so a wheel reaches PyPI only from a commit on which
-  # rustfmt, clippy, the Rust suite, ruff, and the Python suite all passed,
-  # here, at publish time, and not "on some earlier run somebody checked".
+  # The Rust gate `ci.yml` runs, re-run on the exact commit the tag points at,
+  # through the same script (`scripts/check-rust.sh`), so a check added to CI is
+  # a check the release runs too. Without it, a tag on a commit whose CI was red
+  # would publish just the same: `smoke` only proves the wheel imports, not that
+  # the code in it is right.
   #
   # Two interpreters, not the five `ci.yml` covers: the floor `requires-python`
   # promises (the one that catches a 3.11+-only API, which the newest
-  # interpreter never does) and the newest, in parallel. Same steps as `ci.yml`
-  # -- when one changes, change the other; there is no shared definition yet.
+  # interpreter never does) and the newest, in parallel.
   gate:
-    name: gate (fmt, clippy, cargo test, ruff, pytest on py${{ matrix.python-version }})
+    name: gate (rust lint+test, ruff, pytest on py${{ matrix.python-version }})
     runs-on: ubuntu-latest
     timeout-minutes: 40
     strategy:
@@ -184,17 +185,14 @@ jobs:
       matrix:
         python-version: ["3.10", "3.14"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: install the pinned toolchain (rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: taiki-e/install-action@3a3daafd3b7f23b8f65d9f5ba2db203fb59b79e2 # v2
         with:
-          components: rustfmt, clippy
-      - name: cargo fmt --check
-        run: cargo fmt --all --check
-      - name: cargo clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
-      - name: cargo test (workspace)
-        run: cargo test --workspace
-      - uses: astral-sh/setup-uv@v3
+          tool: cargo-deny@0.20.2,cargo-machete@0.9.2
+      - run: scripts/check-rust.sh lint test deps
+      - uses: astral-sh/setup-uv@caf0cab7a618c569241d31dcd442f54681755d39 # v3
         with:
           enable-cache: true
           cache-dependency-glob: "**/pyproject.toml"
@@ -221,11 +219,11 @@ jobs:
     permissions:
       id-token: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: wheels-*
           merge-multiple: true
           path: dist
-      - uses: pypa/gh-action-pypi-publish@release/v1
+      - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # release/v1
         with:
           packages-dir: dist
