@@ -89,6 +89,7 @@ def test_an_ordinary_failure_is_not_counted_as_a_panic() -> None:
 # --- 3. every entry point runs inside `shielded` ------------------------------
 
 _LINE_COMMENT = re.compile(r"//[^\n]*")
+_BLOCK_COMMENT = re.compile(r"/\*.*?\*/", re.DOTALL)
 
 
 def _close(src: str, k: int, open_c: str, close_c: str) -> int:
@@ -115,17 +116,20 @@ def _fn_body(src: str, fn_at: int) -> tuple[str, str]:
 
 def _entry_points(src: str) -> list[tuple[str, str, bool]]:
     """Every `(name, body, is_getter)` PyO3 exposes from one source file."""
-    src = _LINE_COMMENT.sub("", src)
+    src = _LINE_COMMENT.sub("", _BLOCK_COMMENT.sub("", src))
     out: list[tuple[str, str, bool]] = []
-    for m in re.finditer(r"#\[pyfunction\]", src):
+    for m in re.finditer(r"#\[(?:pyo3::)?pyfunction\b[^\]]*\]", src):
         fn_at = src.index("fn ", m.end())
         name, body = _fn_body(src, fn_at)
         out.append((name, body, False))
-    for m in re.finditer(r"#\[pymethods\]", src):
+    for m in re.finditer(r"#\[(?:pyo3::)?pymethods\]", src):
         impl_open = src.index("{", m.end())
         impl_body = src[impl_open + 1 : _close(src, impl_open, "{", "}") - 1]
         cursor = 0
-        for fm in re.finditer(r"(?m)^\s*(?:pub(?:\(crate\))?\s+)?fn\s+\w+\s*\(", impl_body):
+        for fm in re.finditer(
+            r"(?m)^\s*(?:pub(?:\([^)]*\))?\s+)?(?:(?:unsafe|async|const)\s+)*fn\s+\w+\s*\(",
+            impl_body,
+        ):
             if fm.start() < cursor:
                 continue  # a nested `fn` inside a body already consumed
             attrs = impl_body[cursor : fm.start()]
@@ -137,9 +141,27 @@ def _entry_points(src: str) -> list[tuple[str, str, bool]]:
     return out
 
 
+def _is_one_shielded_call(body: str) -> bool:
+    """Whether `body` (comments already stripped) is exactly one
+    `shielded(...)` expression and nothing else.
+
+    Containing the call is not enough: a statement before it runs outside
+    the shield, so a panic there still reaches the host as a BaseException.
+    """
+    body = body.strip()
+    # The argument must be a closure: `shielded(f(x))` evaluates `f(x)` before
+    # the shield exists, so a panic there still escapes it.
+    head = re.match(r"shielded\s*\(\s*(?:move\s+)?\|\|", body)
+    if head is None:
+        return False
+    open_at = body.index("(")
+    return _close(body, open_at, "(", ")") == len(body)
+
+
 def test_every_non_getter_entry_point_runs_inside_shielded() -> None:
     """HARD RULE: a `#[pyfunction]`, a `#[new]` or a `#[pymethods]` method
-    that is not a `#[getter]` wraps its whole body in `shielded(...)`.
+    that is not a `#[getter]` is one `shielded(...)` expression, with no
+    statement before or after it.
 
     Getters are the one exemption because nothing from the core runs in
     them: they hand back a field the constructor already owns. A getter that
@@ -154,7 +176,7 @@ def test_every_non_getter_entry_point_runs_inside_shielded() -> None:
                 getters += 1
                 continue
             seen += 1
-            if "shielded(" not in body:
+            if not _is_one_shielded_call(body):
                 unshielded.append(f"{path.relative_to(_ROOT)}::{name}")
     # Floors, not exact counts: 29 shielded entries and 140-odd getters on
     # 2026-09-14. Both exist so a parser that quietly stops seeing one kind
@@ -164,7 +186,7 @@ def test_every_non_getter_entry_point_runs_inside_shielded() -> None:
         f"only {getters} getters found -- the getter exemption is not being exercised"
     )
     assert not unshielded, (
-        "PyO3 entry points whose body does not run inside `shielded(...)`: "
+        "PyO3 entry points whose body is not exactly one `shielded(...)` call: "
         f"{unshielded}. A panic there reaches the host as a BaseException "
         "(see bindings/python/src/shield.rs)."
     )

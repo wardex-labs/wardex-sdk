@@ -44,8 +44,11 @@ tracked() {
 }
 
 # --- P1: panic surface -------------------------------------------------------
-# Non-test Rust only: files under a `tests/` dir are skipped whole, and inside a
-# file each `#[cfg(test)]` ITEM is skipped, after which the scan resumes.
+# Non-test Rust only: files under a `tests/` dir and files a `#[cfg(test)] mod
+# name;` declaration pulls in are skipped whole, and inside a file each
+# `#[cfg(test)]` ITEM and each item under `#[expect(clippy::unwrap_used |
+# expect_used)]` (the one sanctioned shape of a production `expect`) is
+# skipped, after which the scan resumes.
 #
 # It resumes because `#[cfg(test)]` does not always open a trailing test module.
 # In `crates/wardex-protocol/src/semantic/mod.rs` it decorates the one-line
@@ -159,14 +162,43 @@ def end_of_cfg_test_item(code, start, col):
     return len(code)
 
 
+CFG_TEST_MOD_DECL_RE = re.compile(
+    r"#\[\s*cfg\(test\)\s*\]\s*(?:#\[[^\]]*\]\s*)*(?:pub(?:\([^)]*\))?\s+)?mod\s+(\w+)\s*;"
+)
+EXPECT_PANIC_LINT_RE = re.compile(r"#\[\s*expect\(\s*clippy::(?:unwrap_used|expect_used)\b")
+
+
+def test_only_files(root):
+    """Files that exist only because a `#[cfg(test)] mod name;` pulls them in;
+    their own text carries no marker, so the per-item skip cannot see them."""
+    out = set()
+    for base, dirs, files in os.walk(root):
+        for name in files:
+            if not name.endswith(".rs"):
+                continue
+            path = os.path.join(base, name)
+            with open(path, encoding="utf-8") as fh:
+                code = "\n".join(code_lines(fh.read()))
+            for m in CFG_TEST_MOD_DECL_RE.finditer(code):
+                mod = m.group(1)
+                if name in ("mod.rs", "lib.rs", "main.rs"):
+                    parent = base
+                else:
+                    parent = os.path.join(base, name[:-3])
+                out.add(os.path.join(parent, mod + ".rs"))
+                out.add(os.path.join(parent, mod, "mod.rs"))
+    return out
+
+
 total = 0
 for root in sys.argv[1:]:
+    skip = test_only_files(root)
     for base, dirs, files in os.walk(root):
         rel = os.path.relpath(base, root).split(os.sep)
         if "tests" in rel:
             continue
         for name in sorted(files):
-            if not name.endswith(".rs"):
+            if not name.endswith(".rs") or os.path.join(base, name) in skip:
                 continue
             with open(os.path.join(base, name), encoding="utf-8") as fh:
                 text = fh.read()
@@ -174,7 +206,7 @@ for root in sys.argv[1:]:
             code = code_lines(text)
             i = 0
             while i < len(raw):
-                marker = CFG_TEST_RE.search(code[i])
+                marker = CFG_TEST_RE.search(code[i]) or EXPECT_PANIC_LINT_RE.search(code[i])
                 if marker:
                     i = end_of_cfg_test_item(code, i, marker.end())
                     continue
@@ -198,7 +230,7 @@ top_modules=$(echo "$module_sizes" | awk '$1 > 800' \
   | sed "s#$PY_SRC/##" | awk '{printf "%s{\"file\":\"%s\",\"lines\":%s}", (NR>1?",":""), $2, $1}')
 
 # --- P5: layering debt --------------------------------------------------------
-# The §3 layering-debt row, read off `_LAYER_RANK_DEBT` in test_import_graph.py
+# The layering-debt row, read off `_LAYER_RANK_DEBT` in test_import_graph.py
 # the same AST way as the budgets above. Both numbers are emitted because they
 # are not the same number, and conflating them is the trap that record sets:
 # five NAMED EDGES point the wrong way and they cost six OCCURRENCES, because
@@ -409,8 +441,8 @@ else
 fi
 
 # --- dated gaps: files that do not exist yet ----------------------------------
-# Two rows of §3 are promised artefacts, not yet written. The radar watches
-# these flags so the day either file appears its row stops reading "unmeasured"
+# Two budget rows are promised artefacts, not yet written. The flags are
+# emitted so the day either file appears its row stops reading "unmeasured"
 # without anyone having to remember to look.
 exists() { if [ -e "$1" ]; then echo true; else echo false; fi; }
 perf_baseline=$(exists quality/perf-baseline.json)
@@ -520,8 +552,8 @@ PY
 )
 
 # --- informational ------------------------------------------------------------
-# Nothing below has a row in §3. They are here as context for the radar, not as
-# ratchets; anything that earns a ratchet moves up into its promise group.
+# Nothing below is a budget. They are here as context for a reader of the
+# snapshot, not as ratchets; anything that earns a ratchet moves up into its promise group.
 py_tests=$(grep -h '^\s*\(async \)\?def test_' "$PY_TESTS"/test_*.py | wc -l | tr -d ' ')
 rust_tests=$(grep -rh '#\[test\]' crates bindings --include='*.rs' | wc -l | tr -d ' ')
 py_src_loc=$(find "$PY_SRC" -name '*.py' -not -path '*/__pycache__/*' -print0 \
