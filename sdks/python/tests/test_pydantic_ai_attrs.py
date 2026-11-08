@@ -307,6 +307,36 @@ def test_a_known_provider_becomes_the_enum_member_and_any_other_stays_as_written
     )
 
 
+@pytest.mark.parametrize(
+    ("written", "named"),
+    [
+        # pydantic-ai's own spelling of a provider wardex has a member for
+        ("bedrock", ProviderName.AWS_BEDROCK),
+        ("google", ProviderName.GCP_GEN_AI),
+        ("mistral", ProviderName.MISTRAL_AI),
+        ("xai", ProviderName.X_AI),
+        # the same spelling on both sides
+        ("openai", ProviderName.OPENAI),
+        ("anthropic", ProviderName.ANTHROPIC),
+        ("groq", ProviderName.GROQ),
+        ("cohere", ProviderName.COHERE),
+        ("deepseek", ProviderName.DEEPSEEK),
+        ("aws.bedrock", ProviderName.AWS_BEDROCK),
+        # no member: kept as written
+        ("azure", "azure"),
+        ("ollama", "ollama"),
+        ("bedrock-mantle", "bedrock-mantle"),
+        ("function", "function"),
+    ],
+)
+def test_pydantic_ais_provider_spelling_maps_to_wardexs_name(written, named):
+    """The bridge's chat span names the provider the way the wire span under it does: a Bedrock
+    model is `aws.bedrock` on both."""
+    provider = pa.chat_block({"gen_ai.provider.name": written}, subject="m").provider
+    assert provider == named
+    assert isinstance(provider, ProviderName) is isinstance(named, ProviderName)
+
+
 def test_the_chat_block_reads_streaming_ttft_and_frozen_sequences():
     chat = _span("c1_run_stream", "chat test")["attributes"]
     assert isinstance(pa.chat_block(chat, subject="m").time_to_first_chunk_s, float)

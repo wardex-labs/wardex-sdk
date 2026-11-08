@@ -21,6 +21,24 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- **Amazon Bedrock Converse calls are now recorded as model calls.** Before,
+  a request to `bedrock-runtime.<region>.amazonaws.com/model/<id>/converse` or
+  `/converse-stream` (what pydantic-ai's Bedrock model and boto3's `converse`
+  send) was an ordinary HTTP span with no model, no messages and no token
+  usage. Now both carry the provider `aws.bedrock`, the model id from the
+  request path, the input messages and system prompt, the reply's text, tool
+  calls and reasoning, the finish reason, and token usage with cached input
+  counted into the input total. A ConverseStream response, which arrives in
+  AWS's binary event-stream encoding rather than as server-sent events, is
+  reassembled into one reply. A stream that ends with an exception
+  (`throttlingException` and the like) marks the call failed with that
+  exception's name. An HTTP error answering a ConverseStream request is
+  recorded as the failed call it is, not as a stream that could not be read. A
+  pydantic-ai agent's model call on Bedrock names the provider `aws.bedrock` on
+  pydantic-ai's span too, as the wire span does. Bedrock's older InvokeModel API (`/invoke`,
+  `/invoke-with-response-stream`) is still not read as a model call, because
+  its bodies are each model family's own format.
+
 - **wardex now says when an adapter is on a framework release it was not
   tested against, and when an adapter did not install at all.** A framework
   release can change what an adapter records without changing the names and
@@ -87,17 +105,32 @@ All notable changes to this project are documented here. The format follows
   model call with no HTTP request under it (`TestModel`, a `FunctionModel`
   that sends nothing) carries pydantic-ai's numbers as its usage and
   `no_wire_evidence`. A request to an API wardex does not read as a model call
-  (Bedrock Converse, a custom model's own endpoint) leaves the numbers only
-  under `wardex.pydantic_ai.otel.*`, with no `gen_ai.usage.*` in that call's
-  tree. Calling `Agent.instrument_all(...)` or
+  (Bedrock InvokeModel, a custom model's own endpoint) is treated the same
+  way: the request's span has no usage, and the model call carries
+  pydantic-ai's numbers and `no_wire_evidence`, counted once. So does a model
+  call whose response never completed (a timeout, a cancellation) or that was
+  sent over a WebSocket connection. Calling `Agent.instrument_all(...)` or
   `logfire.instrument_pydantic_ai()` after `init()` replaces wardex's setup,
-  and the adapter records nothing from then on, said once at `close()`; call
-  them before `init()`. Tool arguments and results, and the run's messages,
+  and your setup stays in place after `close()`; wardex attaches to the new
+  setup and keeps recording, said once on stderr. `Agent.instrument_all(True)`
+  with no OpenTelemetry provider configured keeps wardex's own setup, as at
+  `init()`. Instrumentation turned off after `init()`, or moved to a setup that
+  accepts no span processor, is said once and the adapter records nothing from
+  then on; model calls are still captured from the wire. When wardex turned instrumentation on
+  itself, pydantic-ai's spans carry the ids of the spans wardex exports, so a
+  span your own tracer opens inside a run or a tool names wardex's run or
+  tool span as its parent. Tool arguments and results, and the run's messages,
   go through the capture limits and masking like every other value. An MCP
   tool call is the framework's `execute_tool` span under the run, and the
-  stdio interceptor's `tools/call` span sits beside it under the run (or in a
-  trace of its own when the agent was entered with `async with agent` before
-  the run). An agent given its own instrumentation (`agent.instrument = ...`,
+  stdio interceptor's `MCP tools/call` span, carrying the JSON-RPC request and
+  response, nests under it in both connect orders and under a toolset shared
+  by several agents. The two are matched by tool name and arguments: two calls
+  of one tool in flight at once each nest under their own span, and another MCP
+  client's call with other arguments is never nested under the agent's. When
+  two calls with the same arguments are in flight at once, the interceptor's
+  span keeps its own placement (under the run, or in a trace of its own when
+  the agent was entered with `async with agent` before the run) and the
+  adapter counts it as `adapters.pydantic_ai.tool_call_ambiguous`. An agent given its own instrumentation (`agent.instrument = ...`,
   an `Instrumentation` capability, an `InstrumentedModel`) is not seen by the
   adapter. `AdapterName.PYDANTIC_AI`; detected from `pydantic-ai-slim`;
   tested on 2.x, because the contract the adapter reads is pydantic-ai's

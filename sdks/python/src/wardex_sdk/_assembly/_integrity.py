@@ -496,12 +496,12 @@ Two emit sites, and the first is the mechanism the second restates.
     # ------------------------------------------------------------------
 
     NO_WIRE_EVIDENCE = "no_wire_evidence"
-    """The span was assembled entirely from framework callbacks; no interceptor
-    ever saw the bytes, so payloads are the framework's account of them.
+    """Assembled from framework callbacks: no interceptor READ the bytes as a model call (none saw
+    them, or none parses that endpoint), so its payloads and usage are the framework's account.
 
-    Emitted from ``_adapters/_codex_exec.py`` on every span that carries a ``codex exec`` run's
-    payload: the prompt the host wrote to stdin and the answer it read back, without the
-    instructions Codex wraps around the prompt. Other adapters await the ownership table of §8.2.
+    Emitted from ``_adapters/_codex_exec.py`` on each ``codex exec`` payload span (stdin prompt and
+    answer), ``_adapters/_pydantic_ai.py`` on a chat built at its end, and ``settle_usage`` in
+    ``_assembly/_usage_hold.py`` on a bridge chat unit it promoted usage on (no model call sealed).
     """
 
     POSSIBLE_DUPLICATE_CHAT = "possible_duplicate_chat"

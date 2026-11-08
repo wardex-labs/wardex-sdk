@@ -10,19 +10,39 @@ them.
 So the adapter writes the framework's usage as DEMOTED extras under its own namespace
 (`wardex.<adapter>.otel.gen_ai.usage.*`, the value kept, the name moved) and declares the unit a
 *framework-reported usage holder* here. What happens at the unit's close depends on one fact this
-module records as it happens: was a wire request issued under the unit?
+module records as it happens: was a transaction to a model-call endpoint SEALED under the unit?
 
 * Yes: the demoted extras stay demoted. The wire span below carries the usage.
-* No (a provider the interceptors do not see, a local test model, a call that failed before any
-  byte left): the demoted numbers are the only ones there are, so they are PROMOTED into the typed
-  block and the pairs removed — one number, one home — and the span says
+* No (a provider the interceptors do not see, an endpoint the parser does not read as a model call
+  — Bedrock InvokeModel, a custom model's own API —, a local test model, a call that failed before
+  any byte left): the demoted numbers are the only ones there are, so they are PROMOTED into the
+  typed block and the pairs removed — one number, one home — and the span says
   `Limitation.NO_WIRE_EVIDENCE`, which is literally its definition: assembled from framework
-  callbacks, no interceptor saw the bytes.
+  callbacks, no interceptor read the bytes as a model call.
 
-Why "a request was issued" rather than "a wire CHAT was parsed": the parse is asynchronous and the
-close is not. Waiting for the parser would make the chat span's shape depend on queue timing. The
-witness is written synchronously where the seams LATCH the request's parent (`_bridge_latch.py`),
-so the tree and the usage are decided by the same read and cannot disagree.
+Why "a model-call transaction was sealed" rather than "a request was issued" or "a wire CHAT was
+parsed". Issued is too early: a request to an endpoint the parser does not read ships as a plain
+HTTP span with no usage, and the numbers would stay demoted with nowhere typed to live. Parsed is
+too late: the parse is asynchronous and the close is not, so the chat span's shape would depend on
+queue timing. The seal (`_interceptors/_seam.py::_seal`) sits between them: it runs synchronously
+on the thread that read the response's last byte, BEFORE the client hands that byte to the app and
+so before the framework's chat span can end, and it asks the same endpoint table the parser is
+gated on (`classify_path`), which is a lookup, not a parse. The parent it witnesses is the one the
+tracker latched at issue (`_bridge_latch.py`), the parent the wire span is built under.
+
+What follows from witnessing at the seal, stated so nobody mistakes it for a defect fixed later:
+
+* A request that got no complete response (timeout, cancellation, a stream the app abandoned) is
+  not witnessed before the unit closes: the framework's numbers for that call are promoted with
+  `NO_WIRE_EVIDENCE`. An abandoned stream may still be sealed later, at connection close, as a
+  partial span; usage arrives in a stream's last chunk, so that span normally carries none.
+* A 4xx/5xx from a model-call endpoint IS witnessed: the wire span exists and carries the failure.
+* A WebSocket session is one span, sealed at connection close, and never goes through `_seal`: a
+  chat over a WebSocket transport is never witnessed and its framework numbers are promoted. The
+  WebSocket span carries no `gen_ai` block and no usage, so nothing is counted twice.
+* A sealed transaction the capture policy then refuses keeps the usage demoted with no wire span
+  under it. Under the default mode it cannot happen here: the latched parent is a live local unit,
+  which the policy admits.
 
 Why a side table keyed by span id and not a field on `Unit`: the flag is one bridge's concern and
 `Unit` is shared by every adapter; the table is empty — and every check here a single falsy read —
@@ -68,8 +88,8 @@ class _Holder:
 
     def __init__(self, prefix: str) -> None:
         self.prefix = prefix
-        #: A plain bool, set and never counted up: two seams witnessing one request (the h2
-        #: issuer and the writer-scope fallback) cannot double anything.
+        #: A plain bool, set and never counted up: several model calls sealed under one unit (a
+        #: retry, say) cannot double anything.
         self.issued = False
 
 
@@ -88,10 +108,10 @@ def _at_fork_reinit() -> None:
 def hold_framework_usage(draft: SpanDraft, *, prefix: str) -> bool:
     """Declare `draft` — a UNIT's own draft, CHAT intent — a framework-reported usage holder.
 
-    Its `<prefix>gen_ai.usage.*` extras are promoted into the typed block at close unless a wire
-    request was issued under the unit meanwhile. Refused (False, counted) for a null draft, a
-    non-CHAT intent, or a prefix not of the form `wardex.<something>.` — the prefix is what keeps a
-    holder's promotion inside wardex's own extras namespace.
+    Its `<prefix>gen_ai.usage.*` extras are promoted into the typed block at close unless a
+    model-call transaction was sealed under the unit meanwhile. Refused (False, counted) for a null
+    draft, a non-CHAT intent, or a prefix not of the form `wardex.<something>.` — the prefix is
+    what keeps a holder's promotion inside wardex's own extras namespace.
 
     Only a unit's own draft (`RunHandle.draft`): a `child_draft` never passes the unit close path,
     so its entry would never be settled and would sit here until the process ends or forks.
@@ -108,12 +128,12 @@ def hold_framework_usage(draft: SpanDraft, *, prefix: str) -> bool:
 
 
 def witness_request(parent: SpanContext | None) -> None:
-    """A request is being issued with `parent` as its latched parent. Called by the seams' latch,
-    and by the h2 writer fallback for a stream whose issuer was not proven (its proven streams were
-    witnessed by their own issuer's latch).
+    """A transaction to a model-call endpoint was sealed with `parent` as its latched parent.
 
-    Two module-global reads and nothing else when no bridge holds anything — this runs once per
-    outgoing request on every seam.
+    Called by the byte seam's seal (`_interceptors/_seam.py::_seal`), synchronously on the thread
+    that completed the transaction, for a path the endpoint table classifies `llm_call` — never
+    from the parse, which is asynchronous. Two module-global reads and nothing else when no bridge
+    holds anything: this runs once per sealed model call on every seam.
     """
     if _HOLDERS and parent is not None:
         holder = _HOLDERS.get(parent.span_id)
@@ -125,8 +145,8 @@ def settle_usage(draft: SpanDraft) -> SpanDraft:
     """Decide a holder's usage at its close. Every other draft passes through untouched.
 
     Called from `UnitRegistry`'s finalize step under its lock; does not emit. The witness store
-    happens-before this read: the request is issued while the framework's chat span is open, and
-    the unit closes from that span's end.
+    happens-before this read: the seal runs before the client returns the response's last byte,
+    while the framework's chat span is open, and the unit closes from that span's end.
     """
     if not _HOLDERS:
         return draft

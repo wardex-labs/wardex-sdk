@@ -18,7 +18,6 @@ from .._assembly import (
     latch_parent,
     parent_is_closed_unit,
     should_capture,
-    witness_request,
 )
 from .._enums import CaptureMode
 from .._protocol import WsParser
@@ -357,15 +356,10 @@ class _Http2Tracker:
         # identity (`IssuerLink.latch`).
         parent = _hub.get_current_scope().active_span_context
         if opened:  # latched only for the streams this write opens
-            parent, _ = latch_parent(parent, None, witnessed=False)
+            parent, _ = latch_parent(parent, None)
         parent_closed = parent_is_closed_unit(parent) if opened else False
         for sid in opened:
-            latched = self._issuers.latch(sid, parent, parent_closed)
-            if not latched[4]:
-                # The writer is this stream's parent only when no issuer was proven; a proven
-                # stream was witnessed by its issuer, and this writer may be another task.
-                witness_request(parent)
-            self._latch[sid] = (*latched, now)
+            self._latch[sid] = (*self._issuers.latch(sid, parent, parent_closed), now)
         if opened:
             low = min(opened)
             self._latch_first = low if self._latch_first == 0 else min(self._latch_first, low)

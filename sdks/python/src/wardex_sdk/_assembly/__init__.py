@@ -72,7 +72,13 @@ from .._types import (
     GenAIAttributes,
     ToolAttributes,
 )
-from ._bridge_latch import latch_parent, set_span_resolver
+from ._bridge_latch import (
+    canonical_arguments,
+    latch_parent,
+    latch_tool_call,
+    set_span_resolver,
+    set_tool_call_resolver,
+)
 from ._builder import NULL_DRAFT, OTEL_ERROR_TYPE_OTHER, IntegrityBuilder, SpanDraft
 from ._diag import Counters, counters, diag_info, diag_warning, guard, report_once
 from ._drops import (
@@ -168,6 +174,7 @@ __all__ = [
     "UnitRegistry",
     "VocabularyError",
     "ambient_stated_conversation",
+    "canonical_arguments",
     "cap_at_alias_tier",
     "capture_mode_of",
     "child_of",
@@ -183,6 +190,7 @@ __all__ = [
     "is_declared_extra_key",
     "latch_ambient",
     "latch_parent",
+    "latch_tool_call",
     "lose",
     "parent_is_closed_unit",
     "record",
@@ -200,6 +208,7 @@ __all__ = [
     "resolve_observed",
     "resolve_parentage",
     "set_span_resolver",
+    "set_tool_call_resolver",
     "should_capture",
     "vocabulary_name",
     "witness_request",

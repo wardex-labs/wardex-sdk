@@ -744,7 +744,54 @@ def _left_out(stacktrace: str) -> list[int]:
     return [int(n) for n in found]
 
 
-def test_a_deep_recursion_records_a_bounded_stack_trace_on_every_span(recording):
+#: The lines `traceback` writes between two tracebacks of one chain. Each traceback
+#: is cut on its own, so a bound on frames is a bound per segment, not per string.
+_CHAIN_SEPARATOR = re.compile(
+    r"^(?:During handling of the above exception, another exception occurred:"
+    r"|The above exception was the direct cause of the following exception:)$",
+    re.M,
+)
+
+
+def _segments(stacktrace: str) -> list[str]:
+    return _CHAIN_SEPARATOR.split(stacktrace)
+
+
+def _chain_length(exc: BaseException) -> int:
+    n = 0
+    while exc is not None:
+        n += 1
+        exc = exc.__cause__ if exc.__cause__ is not None else exc.__context__
+    return n
+
+
+def _stack_depth() -> int:
+    frame, n = sys._getframe(1), 0
+    while frame is not None:
+        n += 1
+        frame = frame.f_back
+    return n
+
+
+#: Recursion limit above the test's own frame: about 200 decorated levels, deep
+#: enough for the cut to bite on every span and well under any default limit.
+_HEADROOM = 400
+
+
+# Both parities of the limit, because where the limit lands decides the exception's
+# SHAPE. Each level of the recursion adds the decorator's wrapper and the host's
+# function; opening the next span briefly goes deeper, through wardex's own frames.
+# On 3.11+ one parity of the limit lands on `_tracing._debug_enabled`, whose guard
+# swallows that RecursionError and then raises a second one from its own
+# `counters.bump`, at the same depth: the host receives a RecursionError chained
+# onto wardex's, exactly what Python prints for it too, and the span records that
+# chain. The other parity raises a plain one. With the default limit, the parity
+# was the depth pytest happened to start the test at, and a pytest-xdist worker
+# starts it a frame or so deeper than a plain run: the chained shape failed under
+# `-n` and passed without it. Setting the limit relative to the current depth runs
+# both shapes on every runner.
+@pytest.mark.parametrize("parity", [0, 1])
+def test_a_deep_recursion_records_a_bounded_stack_trace_on_every_span(recording, parity):
     """Every span an exception leaves records it, and each used to format the whole
     traceback below it. A recursion through a decorated function, N spans deep,
     formatted N traces of up to 2N frames while the host unwound: about 10 s and
@@ -756,8 +803,13 @@ def test_a_deep_recursion_records_a_bounded_stack_trace_on_every_span(recording)
     def descend(n):
         return descend(n + 1)
 
-    with pytest.raises(RecursionError) as caught:
-        descend(0)
+    limit = sys.getrecursionlimit()
+    sys.setrecursionlimit(_stack_depth() + _HEADROOM + parity)
+    try:
+        with pytest.raises(RecursionError) as caught:
+            descend(0)
+    finally:
+        sys.setrecursionlimit(limit)
 
     _hub.get_client().flush()
     spans = [sp for env in recording.envelopes for sp in env.spans]
@@ -769,15 +821,20 @@ def test_a_deep_recursion_records_a_bounded_stack_trace_on_every_span(recording)
     }
     assert len(traces) > _source_paths._MAX_FRAMES  # deep enough for the cut to bite
     for trace in traces.values():
-        assert _frame_count(trace) <= _source_paths._MAX_FRAMES
+        for segment in _segments(trace):
+            assert _frame_count(segment) <= _source_paths._MAX_FRAMES
         assert trace.splitlines()[-1].startswith("RecursionError: maximum recursion depth")
 
     (outermost,) = [sp for sp in spans if sp.parent_span_id is None]
     trace = traces[outermost.context.span_id]
-    # The test's own frame is the one frame of the caught traceback above the span.
+    # The outermost span records the exception the host caught, chain and all.
+    assert len(_segments(trace)) == _chain_length(caught.value)
+    # The last segment is the host's own traceback; the test's own frame is the one
+    # frame of it above the span.
+    last = _segments(trace)[-1]
     depth = sum(1 for _ in traceback.walk_tb(caught.tb)) - 1
-    assert _frame_count(trace) == _source_paths._MAX_FRAMES
-    assert _left_out(trace) == [depth - _source_paths._MAX_FRAMES]
+    assert _frame_count(last) == _source_paths._MAX_FRAMES
+    assert _left_out(last) == [depth - _source_paths._MAX_FRAMES]
 
 
 def _sink(n: int) -> None:

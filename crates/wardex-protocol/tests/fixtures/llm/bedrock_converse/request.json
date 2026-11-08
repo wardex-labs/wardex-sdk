@@ -1,0 +1,30 @@
+{
+ "messages": [
+  {
+   "role": "user",
+   "content": [
+    {
+     "text": "Say hello."
+    }
+   ]
+  }
+ ],
+ "system": [
+  {
+   "text": "You are a helpful assistant."
+  },
+  {
+   "cachePoint": {
+    "type": "default"
+   }
+  }
+ ],
+ "inferenceConfig": {
+  "maxTokens": 1024,
+  "temperature": 0.5,
+  "topP": 0.9,
+  "stopSequences": [
+   "END"
+  ]
+ }
+}

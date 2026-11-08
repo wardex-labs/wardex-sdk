@@ -1,0 +1,38 @@
+{
+ "messages": [
+  {
+   "role": "user",
+   "content": [
+    {
+     "text": "What is the weather in Seoul?"
+    }
+   ]
+  }
+ ],
+ "toolConfig": {
+  "tools": [
+   {
+    "toolSpec": {
+     "name": "get_weather",
+     "description": "Current weather for a city.",
+     "inputSchema": {
+      "json": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   }
+  ]
+ },
+ "inferenceConfig": {
+  "maxTokens": 512
+ }
+}

@@ -11,10 +11,12 @@ normalizer (the adapter's `Bridge`), with the same three calls:
   (the wheel promises no runtime dependency, and the API is what pydantic-ai
   itself requires). Its spans are real OpenTelemetry current spans
   (`use_span`), so pydantic and the host's own code see what they would under
-  any exporter. It also delivers the one callback an SDK processor never
-  gets: attributes set after the open, which is when pydantic names the
-  model (`set_attributes` right after the `chat` span opens, before any
-  request byte).
+  any exporter, and once the bridge has opened a unit for a span, the span's
+  ids ARE that unit's ids: what wardex exports is what a span the host's own
+  tracer opens inside a run or a tool names as its parent. It also delivers
+  the one callback an SDK processor never gets: attributes set after the
+  open, which is when pydantic names the model (`set_attributes` right after
+  the `chat` span opens, before any request byte).
 * Mode U — the host turned it on first (Logfire, or its own SDK provider),
   and the adapter must not take that over. `Processor` is a span processor,
   duck-typed so that `opentelemetry.sdk` is never imported, attached to the
@@ -54,6 +56,11 @@ import opentelemetry.trace as _otel_trace
 SCOPE = "pydantic-ai"
 
 
+#: `(trace_id, span_id)` as OpenTelemetry's ints: the ids of the unit the
+#: bridge opened for a span, answered by `started` and `attributes_set`.
+UnitIds = tuple[int, int]
+
+
 class Bridge(Protocol):
     """What both surfaces deliver: three calls keyed by the span OBJECT.
 
@@ -63,6 +70,11 @@ class Bridge(Protocol):
     the exception's bare type name, or None. A status description and an
     exception's message or stack trace are never delivered: pydantic writes
     the raised message into both, so they can quote content.
+
+    `started` and `attributes_set` answer the ids of the unit they opened for
+    the span, or None when they opened none. Mode W gives the span those ids;
+    Mode U ignores them (the host's SDK minted its span's ids, and they are
+    the host's).
     """
 
     def started(
@@ -75,9 +87,9 @@ class Bridge(Protocol):
         parent: object | None,
         start_ns: int,
         attrs_follow: bool,
-    ) -> None: ...
+    ) -> UnitIds | None: ...
 
-    def attributes_set(self, span: object, attrs: Mapping[str, object]) -> None: ...
+    def attributes_set(self, span: object, attrs: Mapping[str, object]) -> UnitIds | None: ...
 
     def ended(
         self,
@@ -118,10 +130,23 @@ def _bare_type(name: object) -> str | None:
 class _Span(_otel_trace.Span):
     """One pydantic span in Mode W.
 
-    Its ids are random OpenTelemetry ids, never wardex's: the unit the bridge
-    opens for it has its own, minted by wardex's parentage. They exist so that
-    `use_span`, baggage and pydantic's own "is this the policy span" checks
-    work exactly as they do under the SDK.
+    Its ids are the ids of the unit the bridge opened for it (`adopt`), so a
+    span the host's own tracer opens under it (in a tool, say), a traceparent
+    read off it, or a log correlated with it names a span wardex exports.
+
+    A span is born with random ids and adopts the unit's when the unit opens:
+    at start for a run or a tool, synchronously inside `start_span`, so
+    nothing can read it in between; for a chat, at the `set_attributes` call
+    that names the model (the chat unit cannot open before its name is known).
+    pydantic itself reads no span context in that window, and no request byte
+    or child span starts in it, but one host hook does run there: pydantic
+    calls `Model.prepare_request` while building the request attributes, so a
+    model or capability that reads the current span's context in that hook
+    sees the run's trace id with a span id wardex never exports (measured on
+    2.66). From the attribute write that names the model on, the chat span's
+    ids are the exported ones. A span the bridge opens no unit for (an
+    unrecorded span, a failed attempt, a degraded open) keeps its random ids,
+    under its parent's trace.
     """
 
     def __init__(
@@ -160,6 +185,13 @@ class _Span(_otel_trace.Span):
     def get_span_context(self) -> _otel_trace.SpanContext:
         return self._ctx
 
+    def adopt(self, ids: UnitIds | None) -> None:
+        """Take the ids of the unit the bridge opened for this span; flags kept."""
+        if ids is not None:
+            self._ctx = _otel_trace.SpanContext(
+                ids[0], ids[1], is_remote=False, trace_flags=self._ctx.trace_flags
+            )
+
     def is_recording(self) -> bool:
         """False once ended or once the adapter is down, so pydantic skips
         serializing content for a span wardex will never read.
@@ -175,14 +207,14 @@ class _Span(_otel_trace.Span):
             return
         self._attrs.update(attributes)
         if not self.inert:
-            self._bridge.attributes_set(self, self._attrs)
+            self.adopt(self._bridge.attributes_set(self, self._attrs))
 
     def set_attribute(self, key: str, value: Any) -> None:
         if self._ended:
             return
         self._attrs[key] = value
         if not self.inert:
-            self._bridge.attributes_set(self, self._attrs)
+            self.adopt(self._bridge.attributes_set(self, self._attrs))
 
     def update_name(self, name: str) -> None:
         """Stored only: the unit's name was fixed when it was opened."""
@@ -247,7 +279,8 @@ class _Tracer(_otel_trace.Tracer):
     ) -> _Span:
         """Both arguments a failed-attempt span is opened with are honoured:
         `context=` names the `chat` span as its parent and `start_time=` back-dates
-        it (`PAI/_model_request_attempts.py`)."""
+        it (`PAI/_model_request_attempts.py`). A child's trace id is its parent's,
+        which is the parent's unit's once that unit is open."""
         parent = _otel_trace.get_current_span(context)
         pctx = parent.get_span_context()
         trace_id = pctx.trace_id if pctx.is_valid else _nonzero(128)
@@ -260,7 +293,7 @@ class _Tracer(_otel_trace.Tracer):
         span = _Span(
             name, kind, dict(attributes or {}), span_context, self._bridge, self._is_installed
         )
-        self._bridge.started(
+        ids = self._bridge.started(
             span,
             name=name,
             kind=kind,
@@ -269,6 +302,7 @@ class _Tracer(_otel_trace.Tracer):
             start_ns=start_time if start_time is not None else time.time_ns(),
             attrs_follow=True,
         )
+        span.adopt(ids)
         return span
 
     @contextlib.contextmanager
@@ -478,4 +512,12 @@ def attach_target(current: object, global_provider: object) -> tuple[str, object
     return "unreachable", None
 
 
-__all__ = ["SCOPE", "Bridge", "Processor", "Provider", "attach_target", "meter_provider"]
+__all__ = [
+    "SCOPE",
+    "Bridge",
+    "Processor",
+    "Provider",
+    "UnitIds",
+    "attach_target",
+    "meter_provider",
+]

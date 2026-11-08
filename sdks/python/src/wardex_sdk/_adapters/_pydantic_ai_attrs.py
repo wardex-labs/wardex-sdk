@@ -25,7 +25,8 @@ module reads. What it rests on:
   key on every span is DEMOTED under `wardex.pydantic_ai.otel.`, value kept
   verbatim, invisible to a backend's `gen_ai.usage.` collector, and the typed
   block built here never carries a token count. The core promotes a chat's
-  demoted numbers back at close when no wire request was issued under it.
+  demoted numbers back at close when no model-call transaction was sealed
+  under it.
 * Content never becomes an extra. `set_extra` is uncapped, and the content
   attributes are O(history) — a 50 000-character prompt produced a
   250 000-character `gen_ai.input.messages` on the next chat span, untruncated.
@@ -370,14 +371,29 @@ def _typed(value: object, kind: type) -> int | float | None:
     return float(value)
 
 
+#: pydantic-ai's provider names (`Provider.name`, which every built-in model reports as
+#: `gen_ai.provider.name`; measured on 2.66) that spell a `ProviderName` member another way, so the
+#: bridge's chat span names the provider the way the wire span under it does. `azure` is left as
+#: written: pydantic's Azure provider also serves models that are not OpenAI's, and the wire names
+#: its host `openai`. Identical spellings (`openai`, `anthropic`, `groq`, ...) need no entry.
+_PROVIDER_SPELLINGS: dict[str, ProviderName] = {
+    "bedrock": ProviderName.AWS_BEDROCK,
+    "google": ProviderName.GCP_GEN_AI,
+    "mistral": ProviderName.MISTRAL_AI,
+    "xai": ProviderName.X_AI,
+}
+
+
 def _provider(value: object) -> ProviderName | str | None:
     text = _text(value)
     if text is None:
         return None
+    if text in _PROVIDER_SPELLINGS:
+        return _PROVIDER_SPELLINGS[text]
     for member in ProviderName:
         if member.value == text:
             return member
-    return text  # pydantic's own names ("test", "function", "google-gla") stay as written
+    return text  # pydantic's own names ("test", "function", "ollama") stay as written
 
 
 def _reasons(value: object) -> tuple[str, ...] | None:

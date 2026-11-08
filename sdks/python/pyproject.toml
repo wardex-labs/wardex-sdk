@@ -116,6 +116,14 @@ test = [
     # import. Resolves on the 3.10 floor beside pydantic-ai-slim 2.54.0
     # (fastmcp-slim 4.1.6, mcp 2.3.0).
     "fastmcp-slim[client]>=4.1,<5",
+    # pydantic-ai's `BedrockConverseModel` needs a boto3 client, and
+    # test_pydantic_ai_bedrock.py drives one against a loopback Bedrock
+    # runtime: SigV4 signing and urllib3 called from a worker thread, the
+    # path a real Bedrock agent takes. Not an adapter framework, so it has no
+    # row in the table of tested versions and no ceiling. Imported plainly, not
+    # `importorskip`ped: a skip would report green on a run that never sent a
+    # Bedrock request.
+    "boto3>=1.35",
     # The MCP stdio seam is tested against the official SDK on both ends of the
     # pipe (test_mcp_real_server.py). Measured with 2.3.0; capped at that minor
     # because the test's server is written to 2.x's low-level `Server`

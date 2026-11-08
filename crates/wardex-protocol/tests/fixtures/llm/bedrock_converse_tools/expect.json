@@ -1,0 +1,23 @@
+{
+ "provider": "aws.bedrock",
+ "operation": "chat",
+ "api_type": null,
+ "request_model": "us.anthropic.claude-sonnet-4-20250514-v1:0",
+ "response_model": null,
+ "response_id": null,
+ "input_tokens": 412,
+ "output_tokens": 58,
+ "finish_reasons": [
+  "tool_call"
+ ],
+ "output_messages_present": true,
+ "output_text": "Let me check.",
+ "tool_call_ids": [
+  "tooluse_kZJMlvQmRJ6eAyJE5GIl7Q"
+ ],
+ "usage_leaves": {
+  "inputTokens": 412,
+  "outputTokens": 58,
+  "totalTokens": 470
+ }
+}

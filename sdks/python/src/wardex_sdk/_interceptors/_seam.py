@@ -28,6 +28,7 @@ from .._assembly import (
     report_connection_parser_disabled,
     resolve_observed,
     should_capture,
+    witness_request,
 )
 from .._enums import (
     CaptureMode,
@@ -573,12 +574,11 @@ class ByteSeamInterceptor(InterceptorInterface):
     def _prefilter_of(self, st: _ConnectionState) -> Prefilter:
         """This seam's transport prefilter, evaluated NOW and fail-open.
 
-        `ALLOW` on an exception, deliberately (review M2-4): the old
-        `_should_capture` swallowed a raising prefilter into `return True` —
-        capture — and any narrower default here (`DEFER`, say) would turn
-        today's captured traffic into a policy drop under AGENT with no
-        parent, which is a new silent loss wearing an error handler. The
-        guard makes the swallow counted instead of invisible.
+        `ALLOW` on an exception, deliberately (review M2-4): the old `_should_capture` swallowed a
+        raising prefilter into `return True` — capture — and any narrower default here (`DEFER`,
+        say) would turn today's captured traffic into a policy drop under AGENT with no parent,
+        which is a new silent loss wearing an error handler. The guard makes the swallow counted
+        instead of invisible.
         """
         pre = Prefilter.ALLOW
         with self._guard("interceptors.seam.prefilter"):
@@ -617,9 +617,10 @@ class ByteSeamInterceptor(InterceptorInterface):
         if txn.stream_id is not None:  # HTTP/2 streams finish out of order: see `opening_timing`
             got = opening_timing(got, partial(self._resolve_timing, obj, st), st, txn.stream_id)
             connect_ms, handshake_ms, reused, timing_markers = got
-        # Classified once here and carried on the job: `_assemble` reads the
-        # same answer for the provider-state count instead of asking again.
+        # Classified once, carried on the job: `_assemble` reuses it for the provider-state count.
         treatment = classify_path(txn.path)
+        if treatment == "llm_call":  # a model call: before any policy return (`_usage_hold`)
+            witness_request(txn.parent)
         if st.server_port == UNRESOLVED_PORT:  # counted even if excluded; see `_peer.py`
             timing_markers = (*timing_markers, Limitation.PEER_UNRESOLVED)
             counters.bump("interceptors.seam.peer_unresolved")
@@ -664,14 +665,13 @@ class ByteSeamInterceptor(InterceptorInterface):
         )
 
     def _stamp_fork_reset(self, st: _ConnectionState, draft: Any) -> None:
-        """Put `TRACKING_RESET_AT_FORK` on the FIRST span of a fork-crossing
-        connection, and only that one.
+        """Put `TRACKING_RESET_AT_FORK` on the FIRST span of a fork-crossing connection, and only
+        that one.
 
-        One helper for both build paths (HTTP and WS), because the fact is the
-        connection's, not the transaction kind's. The flag clears on the first
-        stamp: later spans on the same connection are parsed by a tracker that
-        saw their whole exchange, and a marker repeated forever would read as
-        a per-span defect rather than the one-time event it is.
+        One helper for both build paths (HTTP and WS), because the fact is the connection's, not the
+        transaction kind's. The flag clears on the first stamp: later spans on the same connection
+        are parsed by a tracker that saw their whole exchange, and a marker repeated forever would
+        read as a per-span defect rather than the one-time event it is.
         """
         if st.reset_at_fork:
             st.reset_at_fork = False
