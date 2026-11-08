@@ -27,7 +27,9 @@ failed, so that result is ERROR (`tool_error`) whatever else its shape lacks.
 
 The peer also supplies the tool name and the protocol version, and both are text it chose. A tool
 name becomes part of a span NAME only when it reads as one (`span_tool_name`); a version reaches a
-span only when it reads as a revision identifier (`readable_version`).
+span only when it reads as a revision identifier (`readable_version`). The tool name may also
+choose a `tools/call` span's PARENT, and only through the core's bounded function of the same name
+(`latch_tool_call` below).
 """
 
 from __future__ import annotations
@@ -36,7 +38,8 @@ import json
 from dataclasses import dataclass
 from typing import Any
 
-from .._assembly import counters, guard, report_once
+from .._assembly import Ambient, counters, guard, report_once
+from .._assembly import latch_tool_call as _latch_tool_unit
 from .._enums import StatusCode
 
 #: The keys a plain result may carry and still ship its `content` list as the output: the status
@@ -177,3 +180,29 @@ def refuse_version() -> None:
         "interceptors.mcp_stdio.protocol_version_unreadable.",
         key="interceptors.mcp_stdio.protocol_version_unreadable",
     )
+
+
+def latch_tool_call(ambient: Ambient, params: bytes | None) -> tuple[Ambient, bool]:
+    """`ambient`, deepened to a bridge adapter's live tool unit for this call's name and arguments.
+
+    The official `mcp` client writes stdin from a task its session opener spawned, so the writer's
+    ambient is the connect-time one, never the tool's; a framework that records the call as its
+    own `execute_tool` names that unit to the core instead (the core's `latch_tool_call` bounds
+    it, and compares the arguments). A second parse of the params per `tools/call` at write time is
+    the cost; one that fails costs only the deepening.
+    """
+    arguments: object = None
+    name = None
+    with guard("interceptors.mcp_stdio.tool_call_name"):
+        parsed = json_object(params or b"")
+        # A `tools/call` without `arguments` calls the tool with none, which a framework records
+        # as `{}`.
+        arguments = parsed.get("arguments", {}) if parsed is not None else None
+        raw = parsed.get("name") if parsed is not None else None
+        name = raw if isinstance(raw, str) else None
+    if name is None:
+        return ambient, False
+    deepened, nested = _latch_tool_unit(ambient, name, arguments)
+    if nested:
+        counters.bump("interceptors.mcp_stdio.nested_under_tool_unit")
+    return deepened, nested

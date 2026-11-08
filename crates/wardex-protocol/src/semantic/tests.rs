@@ -1309,6 +1309,14 @@ fn every_normalized_usage_path_is_extracted_from_its_fixture() {
             table: openai_embeddings::NORMALIZED_USAGE_PATHS,
             input_excludes_cache: false,
         },
+        Case {
+            host: "bedrock-runtime.us-east-1.amazonaws.com",
+            path: "/model/anthropic.claude-3-5-sonnet-20241022-v2%3A0/converse",
+            req: fixture!("bedrock_converse", "request.json"),
+            resp: fixture!("bedrock_converse", "response.json"),
+            table: super::bedrock::NORMALIZED_USAGE_PATHS,
+            input_excludes_cache: true,
+        },
     ];
     for case in &cases {
         let s = parse_llm(case.host, case.path, case.req, case.resp, Limits::default())
@@ -1331,7 +1339,13 @@ fn every_normalized_usage_path_is_extracted_from_its_fixture() {
             }
             .unwrap_or_else(|| panic!("{}: {field} not extracted", case.path));
             if *field == "input_tokens" && case.input_excludes_cache {
-                let tiers = leaf("cache_read_input_tokens") + leaf("cache_creation_input_tokens");
+                // The tiers by the table's own spelling of them: Bedrock's
+                // camelCase leaves are not Anthropic's snake_case ones.
+                let tier = |name: &str| match case.table.iter().find(|(f, _)| *f == name) {
+                    Some((_, path)) => leaf(path),
+                    None => panic!("{}: table has no {name} row", case.path),
+                };
+                let tiers = tier("cache_read_input_tokens") + tier("cache_creation_input_tokens");
                 assert_eq!(
                     normalized,
                     mirrored + tiers,

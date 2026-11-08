@@ -3,6 +3,7 @@
 //! priority + body/SSE shape fallback. fail-safe (parse failure = partial/empty result).
 
 mod anthropic;
+mod bedrock;
 pub mod endpoint;
 mod event_json;
 mod openai_chat;
@@ -17,9 +18,11 @@ use std::io::Read;
 
 use serde::Deserialize;
 
+use crate::aws_eventstream;
 use crate::sse;
 use crate::usage::TokenUsage;
 use anthropic::{fill_anthropic, reassemble_anthropic};
+use bedrock::{fill_bedrock_converse, reassemble_converse_stream};
 pub use endpoint::{treatment, ws_upgrade, Treatment, WsUpgrade};
 use endpoint::{Api, Endpoint};
 use openai_chat::{fill_openai_chat, reassemble_openai};
@@ -37,8 +40,8 @@ use wardex_limits::Limits;
 /// unless the field's own doc says so.
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct LlmSemantics {
-    /// The provider label, `"openai"` or `"anthropic"`. Empty when no host,
-    /// path or body shape named one (an unrecognized stream).
+    /// The provider label: `"openai"`, `"anthropic"` or `"aws.bedrock"`. Empty
+    /// when no host, path or body shape named one (an unrecognized stream).
     pub provider: String,
     /// `provider` is a guess: it was not read off one of that provider's own
     /// hosts (`endpoint::is_official_host`) but off a hostname that merely
@@ -200,6 +203,8 @@ fn provider_from_host(host: &str) -> Option<&'static str> {
         Some("openai")
     } else if host.contains("anthropic") {
         Some("anthropic")
+    } else if host.contains("bedrock") {
+        Some(bedrock::PROVIDER)
     } else {
         None
     }
@@ -365,6 +370,12 @@ pub fn parse_llm(
 ) -> Option<LlmSemantics> {
     let decoded = decode_body(resp, limits);
     let bounds = UsageBounds::from_limits(&limits);
+    // Bedrock Converse before the SSE sniff: a ConverseStream body is
+    // binary event-stream framing, which the SSE sniff must never be asked
+    // to judge (its length and CRC bytes can be text by chance).
+    if let Some(e) = endpoint::from_path(path).filter(|e| e.api == Api::BedrockConverse) {
+        return Some(parse_bedrock_converse(e, host, path, req, decoded, bounds));
+    }
     if let Some(s) = try_parse_sse(host, path, req, &decoded, bounds) {
         return Some(s);
     }
@@ -403,8 +414,58 @@ pub fn parse_llm(
         Api::OpenAiResponses => fill_openai_responses(&mut out, req, &decoded, bounds),
         Api::OpenAiEmbeddings => fill_openai_embeddings(&mut out, req, &decoded, bounds),
         Api::AnthropicMessages => fill_anthropic(&mut out, req, &decoded, bounds),
+        // Dispatched above, before the SSE sniff; never reaches here.
+        Api::BedrockConverse => fill_bedrock_converse(&mut out, req, &decoded, bounds),
     }
     Some(out)
+}
+
+/// A Converse or ConverseStream call. The stream is told by its path, or by
+/// a body that opens with a CRC-valid event-stream message (a caller that
+/// read a stream from the plain path, or a gateway that rewrote it). The
+/// label comes from the host when it names a provider and from the API shape
+/// otherwise, as on the SSE path: the path alone already says "Converse",
+/// which only Bedrock speaks.
+fn parse_bedrock_converse(
+    endpoint: Endpoint,
+    host: &str,
+    path: &str,
+    req: &[u8],
+    decoded: Vec<u8>,
+    bounds: UsageBounds,
+) -> LlmSemantics {
+    let streaming_path = endpoint::segments_of(path).last() == Some(&"converse-stream");
+    // The body decides whether it is a stream, not the path alone: an HTTP
+    // error to a ConverseStream request is a plain JSON envelope, and read as
+    // an event stream it would claim a stream whose events could not be read.
+    // A body on the stream path that is neither JSON nor a CRC-valid message
+    // (a stream cut inside its first prelude) is still read as the stream it
+    // was meant to be.
+    let streamed_body = aws_eventstream::starts_with_message(&decoded)
+        || (streaming_path && !decoded.is_empty() && !decoded.trim_ascii_start().starts_with(b"{"));
+    let mut out = if streamed_body {
+        let reassembled = reassemble_converse_stream(&decoded);
+        sse_semantics(endpoint, host, provider_from_host(host), reassembled)
+    } else {
+        let provider = provider_from_host(host).unwrap_or_else(|| endpoint.api.provider());
+        LlmSemantics {
+            provider: provider.to_string(),
+            provider_inferred: label_inferred(provider, host),
+            operation: endpoint.operation.to_string(),
+            api_type: endpoint.api_type,
+            decoded_response: Some(decoded),
+            ..Default::default()
+        }
+    };
+    let body = out.decoded_response.take().unwrap_or_default();
+    fill_bedrock_converse(&mut out, req, &body, bounds);
+    out.decoded_response = Some(body);
+    // The request body has no model and no stream flag: the path carries the
+    // model, and the path OR the body's own framing says it streamed (a
+    // gateway may serve ConverseStream on the plain path).
+    out.request_model = bedrock::model_id_from_path(path);
+    out.stream = Some(streaming_path || out.reassembled_from_stream);
+    out
 }
 
 #[cfg(test)]

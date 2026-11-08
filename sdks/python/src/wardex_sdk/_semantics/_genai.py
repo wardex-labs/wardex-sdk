@@ -21,7 +21,11 @@ from .._enums import OperationName, ProviderName
 from .._types import ConversationContext, EmbeddingsAttributes, GenAIAttributes
 
 _OPERATION_MAP = {"chat": OperationName.CHAT, "embeddings": OperationName.EMBEDDINGS}
-_PROVIDER_MAP = {"openai": ProviderName.OPENAI, "anthropic": ProviderName.ANTHROPIC}
+_PROVIDER_MAP = {
+    "openai": ProviderName.OPENAI,
+    "anthropic": ProviderName.ANTHROPIC,
+    "aws.bedrock": ProviderName.AWS_BEDROCK,
+}
 
 #: LlmSemantics getter -> GenAIAttributes field, SAME name on both sides,
 #: value copied as-is. Everything needing a conversion is spelled out in

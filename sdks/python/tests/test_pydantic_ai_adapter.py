@@ -37,10 +37,12 @@ from _pydantic_ai_support import (
     MODES,
     extras,
     fake_openai,
+    host_provider,
     instrumentation_mode,
     named,
     one,
     openai_model,
+    wardex_owned,
 )
 from wardex_sdk._adapters._pydantic_ai import PydanticAiAdapter
 from wardex_sdk._assembly import Limitation, counters
@@ -499,6 +501,64 @@ def test_a_key_written_at_start_and_at_end_is_written_once(live):
     Agent(TestModel(), name="once").run_sync("go")
     run = one(live.spans, "invoke_agent once")
     assert [k for k, _ in run.extra].count("wardex.pydantic_ai.run_id") == 1
+
+
+# -- the ids pydantic's spans carry (Mode W) -------------------------------------------
+
+
+def _otel_id(wardex_id: Any) -> int:
+    """A wardex `TraceId`/`SpanId` as the int OpenTelemetry carries."""
+    return int.from_bytes(wardex_id.value, "big")
+
+
+def test_a_span_the_hosts_tracer_opens_in_a_tool_has_the_exported_tool_unit_as_parent():
+    """Mode W: pydantic's spans are OpenTelemetry current spans carrying the ids of the units
+    wardex exports, so a span the host's own SDK tracer opens inside a tool names, as its parent
+    and trace, the `execute_tool` unit that ships. The run's traceparent is the run unit's."""
+    from pydantic_ai._utils import get_traceparent
+
+    provider, exporter = host_provider()
+    tracer = provider.get_tracer("host")
+    with wardex_owned(), installed_adapter(PydanticAiAdapter) as live:
+        agent = Agent(TestModel(call_tools=["add"]), name="adder")
+
+        @agent.tool_plain
+        def add(a: int, b: int) -> int:
+            with tracer.start_as_current_span("host work"):
+                return a + b
+
+        result = agent.run_sync("add")
+        spans = live.spans
+    run = one(spans, "invoke_agent adder")
+    tool = one(spans, "execute_tool add")
+    (host,) = exporter.get_finished_spans()
+    assert host.parent is not None
+    assert host.parent.span_id == _otel_id(tool.context.span_id)
+    assert host.context.trace_id == _otel_id(tool.context.trace_id)
+    assert host.context.trace_id == _otel_id(run.context.trace_id)
+    _, trace_id, span_id, _ = get_traceparent(result).split("-")
+    assert (trace_id, span_id) == (run.context.trace_id.hex(), run.context.span_id.hex())
+    provider.shutdown()
+
+
+def test_a_chat_span_takes_its_units_ids_once_the_model_is_named():
+    """The chat unit opens late (at the attribute write that names the model); the span's
+    context changes to the unit's then, and what is current inside the request is the unit."""
+    from opentelemetry import trace as otel_trace
+
+    seen: list[Any] = []
+
+    async def answer(messages: list[Any], info: Any) -> ModelResponse:
+        seen.append(otel_trace.get_current_span().get_span_context())
+        return ModelResponse(parts=[TextPart("done")])
+
+    with wardex_owned(), installed_adapter(PydanticAiAdapter) as live:
+        Agent(FunctionModel(answer), name="named").run_sync("hi")
+        spans = live.spans
+    chat = one(spans, "chat function:answer:")
+    (current,) = seen
+    assert current.span_id == _otel_id(chat.context.span_id)
+    assert current.trace_id == _otel_id(chat.context.trace_id)
 
 
 # -- import purity -------------------------------------------------------------------

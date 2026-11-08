@@ -1,0 +1,24 @@
+{
+ "provider": "aws.bedrock",
+ "operation": "chat",
+ "api_type": null,
+ "request_model": "anthropic.claude-3-5-sonnet-20241022-v2:0",
+ "response_model": null,
+ "response_id": null,
+ "input_tokens": 11000,
+ "output_tokens": 500,
+ "cache_read_input_tokens": 8000,
+ "cache_creation_input_tokens": 2000,
+ "finish_reasons": [
+  "stop"
+ ],
+ "output_messages_present": true,
+ "output_text": "Hello!",
+ "usage_leaves": {
+  "inputTokens": 1000,
+  "outputTokens": 500,
+  "totalTokens": 11500,
+  "cacheReadInputTokens": 8000,
+  "cacheWriteInputTokens": 2000
+ }
+}

@@ -79,6 +79,7 @@ from ._base import InterceptorInterface
 from ._issue_scope import UNKNOWN_ISSUER, ScopeSnapshot, issued_scope
 from ._mcp_result import (
     json_object,
+    latch_tool_call,
     negotiated_version,
     read_tool_result,
     readable_version,
@@ -147,6 +148,10 @@ class _Pending:
     #: task the session's opener started, so there the parent and the identity
     #: are still the opener's, not each caller's (a known gap, not fixed here).
     scope: ScopeSnapshot = UNKNOWN_ISSUER
+    #: Was `ambient` deepened to a bridge adapter's live tool unit (`latch_tool_call`)? Then the
+    #: framework's `execute_tool` is this span's parent, and the span stays the transport
+    #: observation `MCP tools/call` rather than becoming a second `execute_tool`.
+    nested_under_unit: bool = False
 
 
 class _ProcState:
@@ -207,6 +212,9 @@ class _ProcState:
                 # request. The response arrives on the subprocess reader, whose
                 # scope says nothing about who asked (design §4.1).
                 ambient = latch_ambient()
+                nested = False
+                if m.method == "tools/call":
+                    ambient, nested = latch_tool_call(ambient, m.params)
                 self._latch[m.id] = _Pending(
                     method=m.method or "?",
                     params=m.params or b"",
@@ -214,6 +222,7 @@ class _ProcState:
                     ambient=ambient,
                     parent_closed=parent_is_closed_unit(ambient.span_context),
                     scope=issued_scope(),
+                    nested_under_unit=nested,
                 )
             if len(self._latch) > MAX_PENDING_REQUESTS:
                 self._latch.pop(next(iter(self._latch)))
@@ -297,7 +306,9 @@ class _ProcState:
                     pending,
                     m,
                     protocol_version=self._protocol_version,
-                    promote=pending.method == "tools/call" and not owners,
+                    promote=pending.method == "tools/call"
+                    and not owners
+                    and not pending.nested_under_unit,
                 )
             if span is not None:
                 out.append((span, pending.scope))

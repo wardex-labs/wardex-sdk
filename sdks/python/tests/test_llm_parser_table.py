@@ -46,6 +46,14 @@ _CASES: dict[str, tuple[str, str]] = {
     "anthropic_messages": ("api.anthropic.com", "/v1/messages"),
     "anthropic_messages_sse": ("api.anthropic.com", "/v1/messages"),
     "anthropic_messages_sse_error": ("api.anthropic.com", "/v1/messages"),
+    "bedrock_converse": (
+        "bedrock-runtime.us-east-1.amazonaws.com",
+        "/model/anthropic.claude-3-5-sonnet-20241022-v2%3A0/converse",
+    ),
+    "bedrock_converse_tools": (
+        "bedrock-runtime.us-east-1.amazonaws.com",
+        "/model/us.anthropic.claude-sonnet-4-20250514-v1%3A0/converse",
+    ),
 }
 
 
@@ -164,7 +172,9 @@ _MISATTRIBUTION_CEILING = 0.001
 
 #: Hosts that ARE the provider's own. A label read off one of these is proven;
 #: every other label is a guess and must say so.
-_OFFICIAL_HOSTS = frozenset({"api.openai.com", "api.anthropic.com"})
+_OFFICIAL_HOSTS = frozenset(
+    {"api.openai.com", "api.anthropic.com", "bedrock-runtime.us-east-1.amazonaws.com"}
+)
 
 
 def _negative_cases() -> dict[str, dict]:

@@ -3,14 +3,21 @@
 A bridge turns a framework's own `chat` span into a CHAT unit, and the wire CHAT the byte seams
 record from the same call nests under it. Both carry usage; shipping both in the typed block counts
 one call twice. So the bridge writes the framework's numbers as DEMOTED extras and declares the unit
-a holder (`_assembly/_usage_hold.py`); the seams' latch (`_assembly/_bridge_latch.py`) witnesses
-every request issued under a holder, and the unit's close promotes the demoted numbers only when
+a holder (`_assembly/_usage_hold.py`); the seam's seal witnesses every transaction to a model-call
+endpoint completed under a holder, and the unit's close promotes the demoted numbers only when
 nothing was witnessed.
 
 The latch also takes a resolver, because the framework can re-attach its span on a task wardex's
 carrier never reached (measured on pydantic-ai's streaming run: the request leaves from the consumer
 task, whose wardex ambient is the enclosing run). What is pinned here is that the resolver can move
 a request DOWN, to a live descendant of the ambient unit, and nowhere else.
+
+A second resolver answers a tool CALL: a byte seam may see a framework's tool call on a task the
+tool never ran on (pydantic-ai's MCP client writes the server's stdin from a task it spawned when
+the toolset connected), and `latch_tool_call` parents the wire call to the ONE live tool unit of
+that name whose recorded arguments equal the wire's. What is pinned here is that it does so only
+for a live `execute_tool` unit, never to a unit whose arguments differ, by name alone only below
+the writer's ambient unit, never for an ambiguous call, and never at the request's cost.
 
 No framework and no OpenTelemetry here: a slot token stands in for the framework's current span.
 """
@@ -21,13 +28,16 @@ import subprocess
 import sys
 import textwrap
 import threading
+from types import SimpleNamespace
 
 import pytest
 
 from wardex_sdk import _hub, _runtime
 from wardex_sdk._adapters._context import AdapterContext, Placement, RunHandle
 from wardex_sdk._assembly import (
+    EMPTY_AMBIENT,
     NULL_DRAFT,
+    Ambient,
     GenAIAttributes,
     Limitation,
     SpanIntent,
@@ -35,9 +45,11 @@ from wardex_sdk._assembly import (
     UnitRegistry,
     _bridge_latch,
     _usage_hold,
+    canonical_arguments,
     counters,
     hold_framework_usage,
     latch_parent,
+    latch_tool_call,
 )
 from wardex_sdk._assembly._diag import reset_reports_for_test
 from wardex_sdk._assembly._units import _ambient_unit
@@ -45,6 +57,9 @@ from wardex_sdk._enums import AgentType, OperationName
 from wardex_sdk._hub import reset_for_test
 from wardex_sdk._interceptors._h2_issuer import StreamIssuers
 from wardex_sdk._interceptors._http1_requests import _issued_here
+from wardex_sdk._interceptors._mcp_stdio import _ProcState
+from wardex_sdk._interceptors._seam import ByteSeamInterceptor, _ConnectionState
+from wardex_sdk._interceptors._txn import _Txn
 from wardex_sdk._types import AgentAttributes, ConversationContext, ToolAttributes
 
 PREFIX = "wardex.test.otel."
@@ -69,6 +84,7 @@ def _clean(monkeypatch):
     counters.reset()
     reset_reports_for_test()
     monkeypatch.setattr(_bridge_latch, "_RESOLVERS", ())
+    monkeypatch.setattr(_bridge_latch, "_TOOL_RESOLVERS", ())
     _usage_hold._HOLDERS.clear()
     yield
     _usage_hold._HOLDERS.clear()
@@ -138,16 +154,72 @@ def _extras(span) -> dict[str, object]:
 # ==========================================================================
 
 
-def test_a_held_chat_unit_with_a_witnessed_request_keeps_its_usage_demoted():
-    """The wire span under the unit is the authority: nothing is promoted, nothing is marked."""
+class _Seam(ByteSeamInterceptor):
+    """The base seam with no transport opinion: `_emit_span` seals on this thread and hands the job
+    to the client, which records it and never parses it."""
+
+    def _select_tracker(self, obj):  # pragma: no cover - not reached here
+        raise NotImplementedError
+
+    def _resolve_timing(self, obj, st):
+        return 0.0, 0.0, False, ()
+
+    def name(self):
+        return "test-seam"
+
+    def install(self, client, ctx=None):
+        self._client = client
+
+    def uninstall(self):
+        pass
+
+
+class _QueueOnly:
+    """A client that keeps the sealed jobs and runs none: the witness may not wait for a parse."""
+
+    config = None
+
+    def __init__(self) -> None:
+        self.jobs: list = []
+
+    def capture_deferred(self, job) -> None:
+        self.jobs.append(job)
+
+    def capture_span(self, span, *, scope=None) -> None:  # pragma: no cover - gRPC only
+        raise AssertionError("nothing here assembles inline")
+
+
+def _seal(parent, path: str, status: int = 200) -> _QueueOnly:
+    """Complete one HTTP/1 transaction latched to `parent` through the seam's real seal."""
+    seam, client = _Seam(), _QueueOnly()
+    seam._client = client
+    txn = _Txn(
+        method="POST",
+        path=path,
+        status=status,
+        request_body=b"{}",
+        response_body=b"{}",
+        parent=parent,
+        start_ns=1,
+        end_ns=2,
+        ttfb_ms=0.0,
+    )
+    seam._emit_span(SimpleNamespace(), _ConnectionState(None, "api.example.com", 443), txn)
+    return client
+
+
+@pytest.mark.parametrize("status", [200, 500])
+@pytest.mark.parametrize("path", ["/v1/chat/completions", "/v1/responses", "/v1/messages"])
+def test_a_sealed_model_call_under_a_held_chat_unit_keeps_its_usage_demoted(path, status):
+    """The wire span under the unit is the authority: nothing is promoted, nothing is marked. The
+    witness is written at the seal, before the job is queued, so it never waits for the parse; a
+    5xx is witnessed too, because its wire span exists and carries the failure."""
     ctx, sink = context()
     chat = _chat(ctx, **{"gen_ai.usage.input_tokens": 10, "gen_ai.usage.output_tokens": 3})
     assert ctx.hold_framework_usage(chat, prefix=PREFIX) is True
-    assert chat.pin(driver=_here()) is True
 
-    parent, _ = _latch()
-    assert parent == chat.draft.context, "with no resolver the latch is the scope's own parent"
-    chat.unpin()
+    client = _seal(chat.draft.context, path, status)
+    assert len(client.jobs) == 1 and client.jobs[0].treatment == "llm_call", "queued, not parsed"
     chat.close()
 
     span = sink.span("chat m")
@@ -160,21 +232,85 @@ def test_a_held_chat_unit_with_a_witnessed_request_keeps_its_usage_demoted():
     assert not _usage_hold._HOLDERS
 
 
-def test_the_http1_and_h2_seams_witness_the_unit_they_latch():
-    """The witness is written by the seams themselves, at the scope read that latches the parent."""
+@pytest.mark.parametrize("path", ["/v1/anything/else", "/v1/traces/ingest"])
+def test_a_sealed_request_wardex_does_not_read_as_a_model_call_promotes_the_usage(path):
+    """Bedrock InvokeModel, a custom model's own API, a telemetry upload: the request went out under
+    the unit, but its wire span (if any) carries no usage. The framework's numbers are the only
+    ones, so they are promoted and the unit says no interceptor read the call."""
     ctx, sink = context()
-    for name, issue in (
-        ("http1", lambda: _issued_here().parent),
-        ("h2", lambda: _h2_latched()),
-    ):
-        chat = _chat(ctx, **{"gen_ai.usage.input_tokens": 10})
-        ctx.hold_framework_usage(chat, prefix=PREFIX)
-        chat.pin(driver=_here())
-        assert issue() == chat.draft.context, name
-        chat.unpin()
-        chat.close()
-    assert counters.get("assembly._usage_hold.usage_kept_demoted") == 2
-    assert counters.get("assembly._usage_hold.usage_promoted") == 0
+    chat = _chat(ctx, **{"gen_ai.usage.input_tokens": 10, "gen_ai.usage.output_tokens": 3})
+    ctx.hold_framework_usage(chat, prefix=PREFIX)
+    chat.pin(driver=_here())
+    parent = _issued_here().parent
+    assert parent == chat.draft.context, "precondition: the request is latched under the unit"
+    _seal(parent, path)
+    chat.unpin()
+    chat.close()
+
+    span = sink.span("chat m")
+    assert (span.gen_ai.input_tokens, span.gen_ai.output_tokens) == (10, 3)
+    assert PREFIX + "gen_ai.usage.input_tokens" not in _extras(span)
+    assert Limitation.NO_WIRE_EVIDENCE in _limitations(span)
+    assert counters.get("assembly._usage_hold.usage_kept_demoted") == 0
+    assert counters.get("assembly._usage_hold.usage_promoted") == 1
+
+
+class _Recording:
+    """A client that records what the seam hands it, inline or deferred, and parses nothing."""
+
+    config = None
+
+    def __init__(self) -> None:
+        self.spans: list = []
+        self.jobs: list = []
+
+    def capture_deferred(self, job) -> None:
+        self.jobs.append(job)
+
+    def capture_span(self, span, *, scope=None) -> None:
+        self.spans.append(span)
+
+
+def test_a_model_call_over_a_websocket_promotes_the_usage():
+    """A WebSocket session is not read for usage, so it witnesses nothing: the framework's
+    numbers are promoted, marked NO_WIRE_EVIDENCE, and the session span under the unit carries
+    no usage of its own, so the call is counted once."""
+    ctx, sink = context()
+    chat = _chat(ctx, **{"gen_ai.usage.input_tokens": 10, "gen_ai.usage.output_tokens": 3})
+    assert ctx.hold_framework_usage(chat, prefix=PREFIX) is True
+    seam, client = _Seam(), _Recording()
+    seam._client = client
+    txn = _Txn(
+        method="GET",
+        path="/v1/responses",
+        status=101,
+        request_body=b"",
+        response_body=b"",
+        parent=chat.draft.context,
+        start_ns=1,
+        end_ns=2_000_000,
+        ttfb_ms=None,
+        version="websocket",
+        ws_close_code=1000,
+        ws_messages_sent=2,
+        ws_messages_received=3,
+        ws_bytes_sent=10,
+        ws_bytes_received=20,
+        ws_llm_call=True,
+    )
+    seam._emit_ws(_ConnectionState(None, "api.openai.com", 443), txn)
+    chat.close()
+
+    span = sink.span("chat m")
+    assert (span.gen_ai.input_tokens, span.gen_ai.output_tokens) == (10, 3)
+    assert not [k for k in _extras(span) if k.startswith(PREFIX)]
+    assert Limitation.NO_WIRE_EVIDENCE in _limitations(span)
+    [ws] = client.spans
+    assert ws.gen_ai is None, "the session span carries no usage"
+    assert ws.parent_span_id == chat.draft.context.span_id
+    assert client.jobs == []
+    assert counters.get("assembly._usage_hold.usage_promoted") == 1
+    assert counters.get("assembly._usage_hold.usage_kept_demoted") == 0
 
 
 def _h2_latched():
@@ -192,52 +328,34 @@ def _h2_headers(stream_id: int) -> bytes:
     return head + block
 
 
-def test_the_h2_writer_witnesses_a_stream_whose_issuer_was_never_proven():
-    """The writer-scope fallback: with no proven issuer the writer IS the stream's parent, so the
-    held chat unit that wrote the HEADERS frame keeps its usage demoted."""
+def _h2_writer_latched():
     from wardex_sdk._interceptors._trackers import _Http2Tracker
 
-    ctx, _ = context()
-    chat = _chat(ctx, **{"gen_ai.usage.input_tokens": 10})
-    ctx.hold_framework_usage(chat, prefix=PREFIX)
-    chat.pin(driver=_here())
     tracker = _Http2Tracker()
     tracker.on_request_bytes(_h2_headers(1))
     assert tracker._latch[1][4] is False, "precondition: no issuer was recorded for stream 1"
-    chat.unpin()
-    chat.close()
-    assert counters.get("assembly._usage_hold.usage_kept_demoted") == 1
-    assert counters.get("assembly._usage_hold.usage_promoted") == 0
+    return tracker._latch[1][0]
 
 
-def test_the_h2_writer_does_not_witness_a_stream_another_task_issued():
-    """A shared h2 connection: this task merely flushes a HEADERS frame another task issued. The
-    stream's parent is its proven issuer, so the writer's held chat unit saw no request of its
-    own and promotes its usage."""
-    from wardex_sdk._interceptors._h2_issuer import UNKNOWN_ISSUER
-    from wardex_sdk._interceptors._trackers import _Http2Tracker
-
+def test_a_request_issued_but_never_sealed_promotes_the_usage():
+    """Issuing is not evidence: a model call that timed out or was cancelled before its response
+    completed leaves no wire span with usage, so every latch site (HTTP/1, the h2 issuer, the h2
+    writer fallback) latches the parent and witnesses nothing."""
     ctx, sink = context()
-    chat = _chat(ctx, **{"gen_ai.usage.input_tokens": 10})
-    ctx.hold_framework_usage(chat, prefix=PREFIX)
-    chat.pin(driver=_here())
-    tracker = _Http2Tracker()
-
-    class _ProvenElsewhere:
-        def see(self, data: bytes) -> None:
-            return None
-
-        def latch(self, stream_id, parent, parent_closed):
-            return (None, False, None, UNKNOWN_ISSUER, True)
-
-    tracker._issuers = _ProvenElsewhere()
-    tracker.on_request_bytes(_h2_headers(1))
-    assert tracker._latch[1][4] is True
-    chat.unpin()
-    chat.close()
+    for name, issue in (
+        ("http1", lambda: _issued_here().parent),
+        ("h2 issuer", _h2_latched),
+        ("h2 writer", _h2_writer_latched),
+    ):
+        chat = _chat(ctx, **{"gen_ai.usage.input_tokens": 10})
+        ctx.hold_framework_usage(chat, prefix=PREFIX)
+        chat.pin(driver=_here())
+        assert issue() == chat.draft.context, name
+        chat.unpin()
+        chat.close()
     assert counters.get("assembly._usage_hold.usage_kept_demoted") == 0
-    assert counters.get("assembly._usage_hold.usage_promoted") == 1
-    assert sink.span("chat m").gen_ai.input_tokens == 10
+    assert counters.get("assembly._usage_hold.usage_promoted") == 3
+    assert all(Limitation.NO_WIRE_EVIDENCE in _limitations(d.finish()) for d in sink.drafts)
 
 
 def test_a_held_chat_unit_with_no_request_promotes_every_spelling_and_says_so():
@@ -407,7 +525,7 @@ def _follow(ctx: AdapterContext, handle: RunHandle | None) -> object:
 def test_the_resolver_parents_a_request_to_a_live_descendant_of_the_ambient_unit():
     """The streaming shape: the run is ambient on the issuing task, the framework's chat span is
     current there, and the chat unit is below the run. The request goes to the chat unit, and the
-    witness follows it there."""
+    seal witnesses it there."""
     ctx, sink = context()
     run = _run(ctx)
     chat = _chat(ctx, **{"gen_ai.usage.input_tokens": 10})
@@ -420,12 +538,13 @@ def test_the_resolver_parents_a_request_to_a_live_descendant_of_the_ambient_unit
     assert conversation is (chat._unit.conversation or conv)
     assert counters.get("assembly._bridge_latch.parent_resolved") == 1
     assert _issued_here().parent == chat.draft.context, "the HTTP/1 seam takes the same answer"
+    _seal(parent, "/v1/chat/completions")
 
     chat.close()
     run.unpin()
     run.close()
     span = sink.span("chat m")
-    assert span.gen_ai.input_tokens is None, "witnessed through the resolver, so kept demoted"
+    assert span.gen_ai.input_tokens is None, "sealed under the resolved parent, so kept demoted"
     assert counters.get("assembly._usage_hold.usage_kept_demoted") == 1
     del token
 
@@ -507,12 +626,259 @@ def test_unfollow_removes_the_resolver_and_is_idempotent():
 
 
 # ==========================================================================
+# Core change C — the tool-call resolver for a seam that writes from another task
+# ==========================================================================
+
+
+def _tool_call(slot: dict) -> tuple[str, str | None] | None:
+    name = slot.get("tool_name")
+    return (name, slot.get("tool_arguments")) if name is not None else None
+
+
+def _tool(
+    ctx: AdapterContext,
+    name: str,
+    *,
+    intent: SpanIntent = SpanIntent.EXECUTE_TOOL,
+    arguments: str | None = None,
+):
+    """A bridge-shaped tool unit NESTED under the ambient unit, its slot naming the tool and, when
+    given, the JSON arguments the framework recorded at START."""
+    h = ctx.open_run(UnitKind.CALL, intent=intent, placement=Placement.NESTED, subject=name)
+    token = type("FrameworkSpan", (), {})()
+    slot = ctx.slot(token)
+    slot.update(handle=h, tool_name=name)
+    if arguments is not None:
+        slot["tool_arguments"] = canonical_arguments(arguments)
+    return h, token
+
+
+def _ambient_of(handle: RunHandle) -> Ambient:
+    return Ambient(span_context=handle.draft.context, conversation=None, tracestate=None)
+
+
+def test_a_tool_call_is_latched_to_the_one_live_tool_unit_below_the_ambient_unit():
+    ctx, _ = context()
+    run = _run(ctx)
+    tool, token = _tool(ctx, "add")
+    ctx.follow_tool_calls(_tool_call)
+
+    ambient, nested = latch_tool_call(_ambient_of(run), "add", {"a": 1})
+    assert nested is True, "no recorded arguments: the name decides, below the ambient unit"
+    assert ambient.span_context == tool.draft.context
+    assert counters.get("assembly._bridge_latch.tool_call_resolved") == 1
+    assert latch_tool_call(_ambient_of(run), "mul") == (_ambient_of(run), False), "another name"
+    tool.close()
+    run.unpin()
+    run.close()
+    del token
+
+
+def test_canonical_arguments_spells_the_framework_text_and_the_wire_object_alike():
+    assert canonical_arguments('{"b": 3, "a": 2}') == canonical_arguments({"a": 2, "b": 3})
+    assert canonical_arguments(b'{"a":[1,"x"]}') == '{"a":[1,"x"]}'
+    assert canonical_arguments("{}") == canonical_arguments({}) == "{}"
+    assert canonical_arguments({"a": 2}) != canonical_arguments({"a": 3})
+    assert canonical_arguments("not json") is None
+    assert canonical_arguments({"a": object()}) is None
+    assert counters.get("assembly._bridge_latch.canonical_arguments") == 2, "counted, not raised"
+
+
+def test_a_tool_call_is_never_latched_to_a_unit_whose_arguments_differ():
+    """A tool of the same name, called with other arguments (an unrelated MCP client in the same
+    process, say), is not the framework's call: it keeps the seam's own placement."""
+    ctx, _ = context()
+    run = _run(ctx)
+    tool, token = _tool(ctx, "add", arguments='{"a": 2, "b": 3}')
+    ctx.follow_tool_calls(_tool_call)
+    here = _ambient_of(run)
+    assert latch_tool_call(here, "add", {"a": 100, "b": 200}) == (here, False)
+    assert latch_tool_call(EMPTY_AMBIENT, "add", {"a": 100, "b": 200}) == (EMPTY_AMBIENT, False)
+    ambient, nested = latch_tool_call(here, "add", {"b": 3, "a": 2})
+    assert nested is True and ambient.span_context == tool.draft.context
+    tool.close()
+    run.unpin()
+    run.close()
+    del token
+
+
+def test_concurrent_calls_of_one_tool_are_told_apart_by_their_arguments():
+    ctx, _ = context()
+    run = _run(ctx)
+    first, t1 = _tool(ctx, "add", arguments='{"a": 2, "b": 3}')
+    second, t2 = _tool(ctx, "add", arguments='{"a": 4, "b": 5}')
+    ctx.follow_tool_calls(_tool_call)
+    here = _ambient_of(run)
+    assert latch_tool_call(here, "add", {"a": 2, "b": 3})[0].span_context == first.draft.context
+    assert latch_tool_call(here, "add", {"a": 4, "b": 5})[0].span_context == second.draft.context
+    twin, t3 = _tool(ctx, "add", arguments='{"a": 2, "b": 3}')
+    assert latch_tool_call(here, "add", {"a": 2, "b": 3}) == (here, False), "same arguments"
+    assert counters.get("adapters.test.tool_call_ambiguous") == 1
+    for h in (twin, second, first):
+        h.close()
+    run.unpin()
+    run.close()
+    del t1, t2, t3
+
+
+def test_a_tool_call_is_never_latched_outside_the_bounds():
+    ctx, _ = context()
+    run = _run(ctx)
+    tool, t1 = _tool(ctx, "add")
+    chat, t2 = _tool(ctx, "chatty", intent=SpanIntent.CHAT)
+    dead, t3 = _tool(ctx, "gone")
+    dead.close()
+    ctx.follow_tool_calls(_tool_call)
+    here = _ambient_of(run)
+    assert latch_tool_call(here, "chatty") == (here, False), "not an execute_tool unit"
+    assert latch_tool_call(here, "gone") == (here, False), "a closed unit"
+
+    run.unpin()
+    other = _run(ctx)  # a live root of its own: the tool is not below it
+    there = _ambient_of(other)
+    assert latch_tool_call(there, "add") == (there, False), "by name, not below the ambient unit"
+    assert counters.get("assembly._bridge_latch.tool_call_unproved") == 1
+    other.unpin()
+    other.close()
+
+    run.pin(driver=_here())
+    twin, t4 = _tool(ctx, "add")
+    assert latch_tool_call(here, "add") == (here, False), "two live calls of one tool"
+    assert counters.get("adapters.test.tool_call_ambiguous") == 1
+    assert counters.get("assembly._bridge_latch.tool_call_resolved") == 0
+    for h in (twin, chat, tool):
+        h.close()
+    run.unpin()
+    run.close()
+    del t1, t2, t3, t4
+
+
+def test_a_tool_call_whose_arguments_match_may_leave_the_writers_run():
+    """One MCP toolset shared by two agents: its writer task was spawned by run A, so a call from
+    run B is written under A's ambient. The arguments prove B's unit; the name alone would not."""
+    ctx, _ = context()
+    run_b = _run(ctx)
+    tool, token = _tool(ctx, "add", arguments='{"a": 4, "b": 5}')
+    ctx.follow_tool_calls(_tool_call)
+    run_b.unpin()
+    run_a = _run(ctx)
+    under_a = _ambient_of(run_a)
+    ambient, nested = latch_tool_call(under_a, "add", {"a": 4, "b": 5})
+    assert nested is True and ambient.span_context == tool.draft.context
+    assert latch_tool_call(under_a, "add", {"a": 6}) == (under_a, False)
+    run_a.unpin()
+    run_a.close()
+    tool.close()
+    run_b.close()
+    del token
+
+
+def test_a_tool_call_from_a_writer_whose_ambient_names_no_unit_needs_its_arguments_to_match():
+    """The MCP client's writer task predates the run when the agent was entered first, so its
+    ambient says nothing. The arguments the framework recorded are the evidence; a tool name
+    alone, from a framework told not to record content, is too weak to move the call."""
+    ctx, _ = context()
+    run = _run(ctx)
+    tool, token = _tool(ctx, "add", arguments='{"a": 2}')
+    nameless, t2 = _tool(ctx, "mul")
+    ctx.follow_tool_calls(_tool_call)
+    run.unpin()
+
+    ambient, nested = latch_tool_call(EMPTY_AMBIENT, "add", {"a": 2})
+    assert nested is True and ambient.span_context == tool.draft.context
+    foreign = Ambient(
+        span_context=_chat(context("other")[0]).draft.context, conversation=None, tracestate=None
+    )
+    ambient, nested = latch_tool_call(foreign, "add", {"a": 2})
+    assert nested is True and ambient.span_context == tool.draft.context, "a span, not a unit"
+    assert latch_tool_call(EMPTY_AMBIENT, "mul", {"a": 2}) == (EMPTY_AMBIENT, False)
+    assert counters.get("assembly._bridge_latch.tool_call_unproved") == 1
+    nameless.close()
+    tool.close()
+    run.close()
+    del token, t2
+
+
+def test_a_tool_call_resolver_that_raises_costs_the_deepening_never_the_request():
+    ctx, _ = context()
+    run = _run(ctx)
+    tool, token = _tool(ctx, "add")
+
+    def broken(slot: dict) -> tuple[str, str | None] | None:
+        raise RuntimeError("the adapter's name reader blew up")
+
+    ctx.follow_tool_calls(broken)
+    here = _ambient_of(run)
+    assert latch_tool_call(here, "add") == (here, False)
+    assert counters.get("assembly._bridge_latch.resolve_tool_call") == 1
+    tool.close()
+    run.unpin()
+    run.close()
+    del token
+
+
+def test_unfollow_tool_calls_removes_the_resolver_and_is_idempotent():
+    ctx, _ = context()
+    other, _ = context("other")
+    run = _run(ctx)
+    tool, token = _tool(ctx, "add")
+    ctx.follow_tool_calls(_tool_call)
+    ctx.follow_tool_calls(_tool_call)
+    other.follow_tool_calls(_tool_call)
+    assert [owner for owner, _ in _bridge_latch._TOOL_RESOLVERS] == [ctx, other]
+    ctx.unfollow_tool_calls()
+    ctx.unfollow_tool_calls()
+    context("never")[0].unfollow_tool_calls()
+    assert [owner for owner, _ in _bridge_latch._TOOL_RESOLVERS] == [other]
+    here = _ambient_of(run)
+    assert latch_tool_call(here, "add") == (here, False)
+    other.unfollow_tool_calls()
+    assert _bridge_latch._TOOL_RESOLVERS == ()
+    tool.close()
+    run.unpin()
+    run.close()
+    del token
+
+
+_CALL = b'{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"add","arguments":{}}}\n'
+_RESULT = b'{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"5"}]}}\n'
+
+
+def test_the_mcp_seam_nests_its_tools_call_under_the_tool_unit_and_does_not_promote_it():
+    """Written from a task whose ambient names no unit, as pydantic-ai's MCP client does when the
+    agent was entered first: the seam's span is the transport observation under the tool unit."""
+    ctx, _ = context()
+    run = _run(ctx)
+    tool, token = _tool(ctx, "add", arguments="{}")
+    ctx.follow_tool_calls(_tool_call)
+    run.unpin()
+
+    state = _ProcState()
+    state.feed_request(_CALL)
+    [(span, _)] = state.feed_response(_RESULT)
+    assert span.name == "MCP tools/call"
+    assert span.parent_span_id == tool.draft.context.span_id
+    assert span.context.trace_id == tool.draft.context.trace_id
+    assert span.tool is not None and span.tool.name == "add"
+    assert counters.get("interceptors.mcp_stdio.nested_under_tool_unit") == 1
+
+    ctx.unfollow_tool_calls()
+    state.feed_request(_CALL)
+    [(span, _)] = state.feed_response(_RESULT)
+    assert span.name == "execute_tool add", "unresolved: promoted exactly as before"
+    assert span.parent_span_id is None
+    tool.close()
+    run.close()
+    del token
+
+
+# ==========================================================================
 # Cost and process lifecycle
 # ==========================================================================
 
 
 def test_with_no_bridge_the_latch_is_the_identity_and_reaches_nothing(monkeypatch):
-    """Two falsy module-global reads: the resolver path is never entered."""
+    """One falsy module-global read: the resolver path is never entered."""
 
     def entered(*_a: object) -> object:
         raise AssertionError("the resolver path ran with no resolver registered")

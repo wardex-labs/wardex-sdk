@@ -23,6 +23,9 @@ What each test pins:
 * The control: the same streamed run with the resolver removed lands the wire CHAT under the run,
   and the chat unit then promotes the framework's usage — the double count the resolver exists
   to prevent, made visible.
+* A request to an API wardex does not read as a model call: its plain HTTP span sits under the
+  chat unit with no usage, and the chat unit promotes the framework's numbers (`NO_WIRE_EVIDENCE`),
+  because only a sealed transaction to a model-call endpoint keeps them demoted.
 """
 
 from __future__ import annotations
@@ -189,11 +192,11 @@ class _UnreadProvider(http.server.BaseHTTPRequestHandler):
         pass
 
 
-def test_a_request_wardex_does_not_read_as_a_model_call_leaves_the_usage_demoted(recorded):
-    """The documented shape for a provider wardex sees on the wire but does not parse: a request
-    WAS issued under the chat unit, so its framework usage stays demoted and unmarked, and the
-    request's span carries no usage of its own. No `gen_ai.usage.*` appears in that tree; the
-    numbers are only under `wardex.pydantic_ai.otel.*`."""
+def test_a_request_wardex_does_not_read_as_a_model_call_promotes_the_frameworks_usage(recorded):
+    """A provider wardex sees on the wire but does not parse (Bedrock InvokeModel, a custom model's
+    own API): the request went out under the chat unit, but its span is plain HTTP with no usage.
+    So the framework's numbers are the only ones there are: promoted into the chat unit's typed
+    usage, marked `NO_WIRE_EVIDENCE`, and the tree bills the call exactly once."""
     import httpx
 
     httpd = http.server.HTTPServer(("127.0.0.1", 0), _UnreadProvider)
@@ -211,14 +214,18 @@ def test_a_request_wardex_does_not_read_as_a_model_call_leaves_the_usage_demoted
         httpd.shutdown()
         httpd.server_close()
     (response,) = [m for m in result.all_messages() if isinstance(m, ModelResponse)]
-    bridge, other = spans_by_source(_shipped(recorded))
+    usage = (response.usage.input_tokens, response.usage.output_tokens)
+    assert all(usage), "precondition: the framework reported a nonzero usage"
+    spans = _shipped(recorded)
+    bridge, other = spans_by_source(spans)
     chat = one(bridge, "chat custom-1")
     (wire,) = [s for s in other if s.name.startswith("HTTP POST")]
     assert wire.parent_span_id == chat.context.span_id
     assert wire.gen_ai is None
-    assert (chat.gen_ai.input_tokens, chat.gen_ai.output_tokens) == (None, None)
-    assert extras(chat)[_DEMOTED + "input_tokens"] == response.usage.input_tokens
-    assert extras(chat)[_DEMOTED + "output_tokens"] == response.usage.output_tokens
-    limits = chat.capture_integrity.limitations if chat.capture_integrity else ()
-    assert Limitation.NO_WIRE_EVIDENCE not in limits
-    assert counters.get("assembly._usage_hold.usage_kept_demoted") == 1
+    assert (chat.gen_ai.input_tokens, chat.gen_ai.output_tokens) == usage
+    assert _DEMOTED + "input_tokens" not in extras(chat)
+    assert _DEMOTED + "output_tokens" not in extras(chat)
+    assert Limitation.NO_WIRE_EVIDENCE in chat.capture_integrity.limitations
+    assert _typed_usage(spans) == usage, "one call is billed once"
+    assert counters.get("assembly._usage_hold.usage_promoted") == 1
+    assert counters.get("assembly._usage_hold.usage_kept_demoted") == 0

@@ -4,7 +4,7 @@ Mode W (instrumentation off): wardex patches `Agent._instrument_default` to its 
 hands the class its own value back at `close()`. The global tracer and meter providers are never
 set — `set_tracer_provider` is once-only per process, so taking it would silently break a later
 `logfire.configure()` — and a host `instrument_all(x)` made after `init()` is the host's and is
-left in place.
+left in place. wardex follows it: its processor goes to the provider behind `x`, once.
 
 Mode U (instrumentation on): wardex adds a processor to the provider the host's settings resolve
 to and takes it off again; the host's own exporter sees exactly what it saw without wardex.
@@ -20,6 +20,7 @@ import json
 import subprocess
 import sys
 import textwrap
+import threading
 from collections.abc import Iterator
 from typing import Any
 
@@ -35,7 +36,15 @@ from pydantic_ai.models.instrumented import InstrumentationSettings
 from pydantic_ai.models.test import TestModel
 
 import wardex_sdk as wardex
-from _pydantic_ai_support import host_provider, user_owned, wardex_owned
+from _pydantic_ai_support import (
+    fake_openai,
+    host_provider,
+    openai_model,
+    spans_by_source,
+    user_owned,
+    wardex_owned,
+)
+from wardex_sdk._adapters import _pydantic_ai_attach as _attach
 from wardex_sdk._assembly import counters
 from wardex_sdk._assembly._diag import reset_reports_for_test
 from wardex_sdk._config import AdaptersConfig
@@ -83,25 +92,232 @@ def test_wardex_owned_instrumentation_touches_no_global_and_is_handed_back(trans
         assert otel_trace._TRACER_PROVIDER_SET_ONCE._done is False
 
 
-def test_a_host_instrument_all_after_init_is_the_hosts_and_survives_close(transport, capsys):
-    """The host's later settings replace wardex's, so the adapter receives nothing from then on;
-    that is said once at close, and the host's settings are left in place."""
+def test_a_host_instrument_all_after_init_is_the_hosts_and_wardex_keeps_recording(
+    transport, capsys
+):
+    """The host's later settings win and outlive close; wardex attaches to the provider behind
+    them, so the run after the host's call is still recorded, and says so once. The host's own
+    exporter sees exactly the spans it sees without wardex."""
+    provider, exporter = host_provider()
+    mine = InstrumentationSettings(tracer_provider=provider, meter_provider=NoOpMeterProvider())
     with wardex_owned():
-        wardex.init(transport=transport, adapters=_ONLY)
-        provider, exporter = host_provider()
-        mine = InstrumentationSettings(tracer_provider=provider, meter_provider=NoOpMeterProvider())
         Agent.instrument_all(mine)
+        _run()
+        alone = sorted(s.name for s in exporter.get_finished_spans())
+        exporter.clear()
+        Agent._instrument_default = False
+
+        wardex.init(transport=transport, adapters=_ONLY)
+        Agent.instrument_all(mine)
+        assert vars(Agent)["_instrument_default"] is mine
+        _run()
+        assert sorted(s.name for s in exporter.get_finished_spans()) == alone
+        wardex.flush()
+        bridge, _ = spans_by_source([s for e in transport.envelopes for s in e.spans])
+        assert sorted(s.name for s in bridge) == alone, "the adapter recorded the host's run"
         wardex.close()
+
         assert vars(Agent)["_instrument_default"] is mine
         assert counters.get("adapters.pydantic_ai.patch_superseded") == 1
-        assert counters.get("adapters.pydantic_ai.instrumentation_replaced") == 1
+        assert counters.get("adapters.pydantic_ai.instrumentation_followed") == 1
+        assert counters.get("adapters.pydantic_ai.instrumentation_replaced") == 0
         err = capsys.readouterr().err
-        assert err.count("instrumentation was replaced after wardex.init()") == 1
+        assert err.count("wardex attached to the new setup and keeps recording") == 1
+        assert "could not follow it" not in err
+        exporter.clear()
         _run()
-        assert sorted(s.name for s in exporter.get_finished_spans()) == [
-            "chat test",
-            "invoke_agent probe",
-        ]
+        assert sorted(s.name for s in exporter.get_finished_spans()) == alone
+
+
+def _wire_run(transport: RecordingTransport) -> tuple[list[Any], list[Any]]:
+    """One agent run against the loopback OpenAI server: `(bridge spans, wire spans)`."""
+    with fake_openai() as (base, posts):
+        assert Agent(openai_model(base), name="probe").run_sync("hi").output
+    assert len(posts) == 1
+    wardex.flush()
+    return spans_by_source([s for e in transport.envelopes for s in e.spans])
+
+
+def test_instrumentation_turned_off_after_init_is_said_once_and_records_nothing(transport, capsys):
+    """The adapter records nothing of the run; the model call is still captured from the wire."""
+    with wardex_owned():
+        wardex.init(transport=transport, adapters=_ONLY)
+        Agent.instrument_all(False)
+        Agent.instrument_all(False)
+        bridge, wire = _wire_run(transport)
+        assert bridge == []
+        [chat] = [s for s in wire if s.gen_ai is not None]
+        assert chat.gen_ai.input_tokens == 10, "wire-level model calls are still captured"
+        wardex.close()
+        assert vars(Agent)["_instrument_default"] is False
+        assert counters.get("adapters.pydantic_ai.instrumentation_off") == 1
+        assert counters.get("adapters.pydantic_ai.instrumentation_replaced") == 0
+        err = capsys.readouterr().err
+        assert err.count("instrumentation was turned off after wardex.init()") == 1
+        assert "Traceback" not in err
+
+
+class _BareProvider:
+    """A tracer provider whose tracer has no span processor and no provider to attach to."""
+
+    def get_tracer(self, *args: Any, **kwargs: Any) -> Any:
+        return otel_trace.NoOpTracer()
+
+
+def test_instrumentation_moved_to_a_setup_with_no_processor_seam_is_said_once(transport, capsys):
+    """The adapter records nothing of the run from then on, the model call is still captured from
+    the wire, and the reason is said once however often the host calls `instrument_all`."""
+    bare = InstrumentationSettings(
+        tracer_provider=_BareProvider(), meter_provider=NoOpMeterProvider()
+    )
+    with wardex_owned():
+        wardex.init(transport=transport, adapters=_ONLY)
+        Agent.instrument_all(bare)
+        Agent.instrument_all(bare)
+        bridge, wire = _wire_run(transport)
+        assert bridge == []
+        [chat] = [s for s in wire if s.gen_ai is not None]
+        assert chat.gen_ai.input_tokens == 10
+        wardex.close()
+        assert vars(Agent)["_instrument_default"] is bare
+        assert counters.get("adapters.pydantic_ai.instrumentation_not_followed") == 1
+        assert counters.get("adapters.pydantic_ai.instrumentation_replaced") == 0
+        err = capsys.readouterr().err
+        assert err.count("accepts no span processor wardex can attach to") == 1
+
+
+def test_instrument_all_true_after_init_with_the_api_default_provider_keeps_wardex_owned(
+    transport, capsys
+):
+    """`True` with nothing behind the global provider sends pydantic's spans nowhere, after
+    `init()` as at install: wardex's own settings stay in place, and the host's `True` is what
+    `close()` hands back."""
+    with wardex_owned():
+        assert isinstance(otel_trace.get_tracer_provider(), otel_trace.ProxyTracerProvider)
+        wardex.init(transport=transport, adapters=_ONLY)
+        Agent.instrument_all(True)
+        Agent.instrument_all(True)
+        _run()
+        assert _names(transport) == ["chat test", "invoke_agent probe"]
+        wardex.close()
+        assert vars(Agent)["_instrument_default"] is True
+        assert counters.get("adapters.pydantic_ai.instrumentation_not_followed") == 0
+        assert counters.get("adapters.pydantic_ai.instrumentation_replaced") == 0
+        assert "pydantic_ai adapter" not in capsys.readouterr().err
+
+
+def test_a_follow_that_faults_is_said_at_close(transport, capsys, monkeypatch):
+    """A wardex fault while following is counted and never reaches the host's call, and the
+    setup it failed to follow is not taken as followed: `close()` says wardex could not."""
+    provider, _ = host_provider()
+    mine = InstrumentationSettings(tracer_provider=provider, meter_provider=NoOpMeterProvider())
+
+    def broken(current: object) -> Any:
+        raise RuntimeError("route reader blew up")
+
+    with wardex_owned():
+        wardex.init(transport=transport, adapters=_ONLY)
+        monkeypatch.setattr(_attach, "_route", broken)
+        Agent.instrument_all(mine)
+        assert vars(Agent)["_instrument_default"] is mine, "the host's call did its work"
+        wardex.close()
+        assert counters.get("adapters.pydantic_ai.follow") == 1
+        assert counters.get("adapters.pydantic_ai.instrumentation_replaced") == 1
+        assert "could not follow it" in capsys.readouterr().err
+
+
+def test_a_follow_racing_close_never_attaches_after_the_hand_back(transport, monkeypatch):
+    """A host thread inside `instrument_all` while the main thread closes wardex: whichever
+    order the lock gives, the host's processor tuple ends up as it was, with no wardex
+    processor left behind."""
+    provider, _ = host_provider()
+    before = provider._active_span_processor._span_processors
+    mine = InstrumentationSettings(tracer_provider=provider, meter_provider=NoOpMeterProvider())
+    in_route, may_continue = threading.Event(), threading.Event()
+    route = _attach._route
+
+    def slow_route(current: object) -> Any:
+        in_route.set()
+        may_continue.wait(5)
+        return route(current)
+
+    with wardex_owned():
+        wardex.init(transport=transport, adapters=_ONLY)
+        monkeypatch.setattr(_attach, "_route", slow_route)
+        host = threading.Thread(target=Agent.instrument_all, args=(mine,))
+        host.start()
+        assert in_route.wait(5)
+        closer = threading.Thread(target=wardex.close)
+        closer.start()
+        closer.join(0.2)
+        may_continue.set()
+        host.join(5)
+        closer.join(5)
+        assert not host.is_alive() and not closer.is_alive()
+        assert provider._active_span_processor._span_processors is before
+        assert _wardex_processors(provider) == []
+        assert counters.get("adapters.pydantic_ai.processor_left_inert") == 0
+
+
+def _wardex_processors(provider: TracerProvider) -> list[Any]:
+    """wardex's processors in an SDK provider's active tuple."""
+    return [
+        p
+        for p in provider._active_span_processor._span_processors
+        if type(p).__module__.startswith("wardex_sdk.")
+    ]
+
+
+def test_each_later_provider_is_attached_once_and_handed_back(transport):
+    """Mode U, then two host calls onto a second provider (two settings objects, one provider)
+    and one back onto the first: one processor per provider, every tuple restored at close."""
+    with user_owned() as setup:
+        second, _ = host_provider()
+        first_before = setup.processors()
+        second_before = second._active_span_processor._span_processors
+        wardex.init(transport=transport, adapters=_ONLY)
+        for _ in range(2):
+            Agent.instrument_all(
+                InstrumentationSettings(tracer_provider=second, meter_provider=NoOpMeterProvider())
+            )
+        Agent.instrument_all(setup.settings)
+        assert len(_wardex_processors(setup.provider)) == 1
+        assert len(_wardex_processors(second)) == 1
+        assert counters.get("adapters.pydantic_ai.instrumentation_followed") == 1
+        _run()
+        assert _names(transport) == ["chat test", "invoke_agent probe"]
+        assert len(setup.exporter.get_finished_spans()) == 2, "the host's provider is untouched"
+        wardex.close()
+        assert setup.processors() is first_before
+        assert second._active_span_processor._span_processors is second_before
+        assert counters.get("adapters.pydantic_ai.processor_left_inert") == 0
+        second.shutdown()
+
+
+def test_the_instrument_all_wrapper_is_restored_by_identity_at_close(transport):
+    original = Agent.instrument_all
+    record = vars(Agent)["instrument_all"]
+    with wardex_owned():
+        wardex.init(transport=transport, adapters=_ONLY)
+        assert Agent.instrument_all is not original
+        wardex.close()
+    assert Agent.instrument_all is original
+    assert vars(Agent)["instrument_all"] is record
+
+
+def test_a_replacement_the_wrapper_cannot_see_is_said_once_at_close(transport, capsys):
+    """Assigning `Agent._instrument_default` directly bypasses `instrument_all`: the host's
+    value still wins, and that wardex could not follow it is said once at close."""
+    provider, _ = host_provider()
+    mine = InstrumentationSettings(tracer_provider=provider, meter_provider=NoOpMeterProvider())
+    with wardex_owned():
+        wardex.init(transport=transport, adapters=_ONLY)
+        Agent._instrument_default = mine
+        wardex.close()
+        assert vars(Agent)["_instrument_default"] is mine
+        assert counters.get("adapters.pydantic_ai.instrumentation_replaced") == 1
+        assert counters.get("adapters.pydantic_ai.instrumentation_followed") == 0
+        assert capsys.readouterr().err.count("could not follow it") == 1
 
 
 # -- Mode U ------------------------------------------------------------------------
@@ -276,14 +492,18 @@ _CHILD = textwrap.dedent(
         before = sdk._active_span_processor._span_processors
     elif scenario == "true_bare_global":
         t.set_tracer_provider(Bare())
-    if scenario != "later_global":
+    if scenario not in ("later_global", "later_true"):
         Agent.instrument_all(True)
     wardex.init(transport=transport, adapters=AdaptersConfig(enabled=(AdapterName.PYDANTIC_AI,)))
     out["state"] = {s.name: s.state.value for s in wardex.diagnostics().adapters}["pydantic_ai"]
     out["default_is_true"] = vars(Agent)["_instrument_default"] is True
-    if scenario == "later_global":
+    if scenario in ("later_global", "later_true"):
         t.set_tracer_provider(sdk)
         out["took_effect"] = t.get_tracer_provider() is sdk
+    if scenario == "later_true":
+        before = sdk._active_span_processor._span_processors
+        Agent.instrument_all(True)
+        out["followed"] = counters.get("adapters.pydantic_ai.instrumentation_followed")
     Agent(TestModel(), name="probe").run_sync("hi")
     wardex.flush()
     out["wardex"] = sorted(s.name for e in transport.envelopes for s in e.spans)
@@ -293,7 +513,7 @@ _CHILD = textwrap.dedent(
     out["detail"], out["measured"] = status.detail, status.measured
     wardex.close()
     out["default_is_true_after"] = vars(Agent)["_instrument_default"] is True
-    if scenario == "true_sdk_global":
+    if scenario in ("true_sdk_global", "later_true"):
         out["tuple_restored"] = sdk._active_span_processor._span_processors is before
     print(json.dumps(out))
     """
@@ -314,6 +534,16 @@ def test_a_later_global_set_tracer_provider_still_takes_effect(tmp_path):
     out, _ = _child(tmp_path, "later_global")
     assert out["took_effect"] is True
     assert out["wardex"] == ["chat test", "invoke_agent probe"]
+
+
+def test_a_later_instrument_all_true_follows_the_global_provider_set_then(tmp_path):
+    """`instrument_all(True)` after init means the global provider as it is at that call: an SDK
+    provider set after init is read once then, and attached to like any other."""
+    out, _ = _child(tmp_path, "later_true")
+    assert out["took_effect"] is True and out["followed"] == 1
+    assert out["wardex"] == out["host"] == ["chat test", "invoke_agent probe"]
+    assert out["default_is_true_after"] is True
+    assert out["tuple_restored"] is True
 
 
 def test_instrument_all_true_with_the_api_default_provider_is_wardex_owned(tmp_path):

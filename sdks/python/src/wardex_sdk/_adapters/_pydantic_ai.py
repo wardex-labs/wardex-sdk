@@ -20,6 +20,10 @@ holds what each attribute means):
   taking it would silently break a later `logfire.configure()`. Uninstall hands the class its
   original value back by identity, and a host that called `instrument_all` after wardex keeps its
   own (the patch is then superseded and left alone).
+* Either mode follows a host that calls `Agent.instrument_all` (or
+  `logfire.instrument_pydantic_ai()`, which calls it) after `wardex.init()`: the host's value wins
+  untouched, and the adapter attaches its processor to the provider behind it
+  (`_pydantic_ai_attach.py` holds install, follow and hand-back).
 * Mode U — the host turned it on first (Logfire, or its own SDK provider). The adapter attaches a
   span processor to the provider those settings resolve to and removes it at uninstall where the
   provider allows; where it does not (a provider with only a public `add_span_processor`), the
@@ -43,18 +47,21 @@ The rules the units follow, each one a measurement or a decision recorded here:
   the run records the whole history once.
 * Usage is never the framework's to state when the wire saw the call. Every framework usage key
   is DEMOTED under `wardex.pydantic_ai.otel.`; the core promotes a chat unit's numbers back at its
-  close only when no wire request was issued under it, and then marks it `NO_WIRE_EVIDENCE`
-  (`_assembly/_usage_hold.py`). So one call is never billed twice, and a call with no request
-  under it still carries a number, honestly marked; a request the wire parser does not read as a
-  model call leaves the number demoted only.
+  close only when no model-call transaction was sealed under it, and then marks it
+  `NO_WIRE_EVIDENCE` (`_assembly/_usage_hold.py`). So one call is never billed twice, and a call
+  with no request under it still carries a number, honestly marked; a request to an endpoint the
+  wire parser does not read as a model call is promoted the same way, marked `NO_WIRE_EVIDENCE`.
 * A streamed model call is sent from the consumer's task, where wardex's ambient unit is the run
   (measured: pydantic copies the run's context back to the caller, but only re-attaches the
   OpenTelemetry context of the `chat` span there). The adapter hands the core OpenTelemetry's
   current-span reader, and the core parents that request to the chat unit when it is a live
   descendant of the ambient run (`_assembly/_bridge_latch.py`).
-* A tool call is `execute_tool`, placed NESTED and pinned, so HTTP inside the tool and the MCP
-  stdio seam's own `tools/call` span nest under it. Arguments and result go through the capped
-  record path.
+* A tool call is `execute_tool`, placed NESTED and pinned, so HTTP inside the tool nests under it.
+  The MCP stdio seam's `tools/call` is written from the MCP client's own task, so the adapter also
+  names its live tool units to the core, which parents the wire call to the ONE live unit of that
+  tool name whose START arguments equal the wire's (`latch_tool_call`; two in flight with the same
+  arguments keep the seam's own placement). Arguments and result go through the capped record
+  path.
 * `CallDeferred` and `ApprovalRequired` are control flow: the tool and its run close UNSET.
 * A run that ends while a child is still open (a cancellation lands on the run's `end` first,
   measured) is HELD and closed when its last child closes, so the child is never force-closed as
@@ -66,18 +73,25 @@ The rules the units follow, each one a measurement or a decision recorded here:
 from __future__ import annotations
 
 import asyncio
-import inspect
 import threading
 from collections.abc import Iterable, Mapping
 from typing import Any
 
-from .._assembly import Limitation, SpanDraft, SpanIntent, UnitKind, report_once
+from .._assembly import (
+    Limitation,
+    SpanDraft,
+    SpanIntent,
+    UnitKind,
+    canonical_arguments,
+    report_once,
+)
 from .._enums import CaptureSource
 from . import _pydantic_ai_attrs as pa
 from ._base import AdapterInterface
 from ._context import AdapterContext, Placement, RunHandle
 from ._conversation import framework_conversation
 from ._payload import _shaped_payload
+from ._pydantic_ai_attach import Attachment
 
 #: `wardex.framework` on every unit this adapter opens.
 _FRAMEWORK = pa.FRAMEWORK
@@ -99,6 +113,13 @@ def _driver() -> object:
     return task if task is not None else threading.current_thread()
 
 
+def _tool_call_of(slot: dict[str, Any]) -> tuple[str, str | None] | None:
+    """The tool name and canonical START arguments a slot's unit was opened for (`_open_tool`),
+    for the tool-call resolver; None for a slot that is not a tool's."""
+    name = slot.get("tool_name")
+    return (name, slot.get("tool_arguments")) if name is not None else None
+
+
 class PydanticAiAdapter(AdapterInterface):
     """Receives pydantic-ai's own spans and turns them into units.
 
@@ -116,14 +137,12 @@ class PydanticAiAdapter(AdapterInterface):
         #: Read at install; 0 until then (no schema is version 0).
         self._schema_version = 0
         self._bridge = _Bridge(self)
-        #: The provider a Mode U processor was added to through its public method, which has no
-        #: remove; the processor is left there inert at uninstall, and said so.
-        self._public: object | None = None
-        #: Mode U tuple route: `(multi-processor, processor)`, checked at uninstall for a tuple the
-        #: host rebuilt meanwhile (the processor is then left in it, inert, and said so).
-        self._tuple: tuple[Any, object] | None = None
-        #: Mode W: `(Agent, wardex's settings)`, checked at uninstall for a host that replaced them.
-        self._owned: tuple[type, object] | None = None
+        #: Where the spans come from: install's route, the `instrument_all` follow, the hand-back.
+        self._attach = Attachment(self._bridge, self._is_installed, self._note_schema)
+
+    def _at_fork_reinit(self) -> None:
+        """Fork-child reset: the attachment's lock. Its records cross the fork (I-fork-4)."""
+        self._attach._at_fork_reinit()
 
     def name(self) -> str:
         return _FRAMEWORK
@@ -144,23 +163,10 @@ class PydanticAiAdapter(AdapterInterface):
             return
         ctx = self._ctx
         import opentelemetry.trace as _otel_trace
-        from pydantic_ai import Agent
         from pydantic_ai import exceptions as _exc
-        from pydantic_ai.models.instrumented import InstrumentationSettings
-
-        from . import _pydantic_ai_otel as _otel
 
         type(self).CONTROL_FLOW = (_exc.CallDeferred, _exc.ApprovalRequired)
-        # An OWN class attribute: `instrument_all` is the one-liner that assigns it.
-        current = vars(Agent).get("_instrument_default", False)
-        route, target = "not_enabled", None
-        if isinstance(current, InstrumentationSettings) or current is True:
-            # The one global READ wardex makes, and only for `instrument_all(True)`, which IS
-            # "use the global provider".
-            known = _otel_trace.get_tracer_provider() if current is True else None
-            route, target = _otel.attach_target(current, known)
-        elif current:
-            route = "unreachable"
+        route, version = self._attach.install(ctx)
         if route == "unreachable":
             self.decline_reason = (
                 "pydantic_ai adapter: pydantic-ai instrumentation is already on, but its tracer "
@@ -172,38 +178,12 @@ class PydanticAiAdapter(AdapterInterface):
             report_once(self.decline_reason, key="adapters.pydantic_ai.unreachable")
             ctx.count("instrumentation_unreachable")
             return
-        is_installed = self._is_installed
-        processor = None
-        if route == "not_enabled":
-            ours = InstrumentationSettings(
-                tracer_provider=_otel.Provider(self._bridge, is_installed),
-                meter_provider=_otel.meter_provider(),
-            )
-            version: object = ours.version
-            # The PatchSet form of `Agent.instrument_all(ours)`: restored by identity, and a later
-            # host `instrument_all(x)` supersedes it and is left alone at uninstall.
-            if not ctx.patches.patch(Agent, "_instrument_default", ours):
-                return
-            self._owned = (Agent, ours)
-        else:
-            processor = _otel.Processor(self._bridge, is_installed)
-            if current is True:
-                # Reading the signature builds nothing, so the global meter provider is untouched.
-                init = inspect.signature(InstrumentationSettings.__init__)
-                version = init.parameters["version"].default
-            else:
-                version = getattr(current, "version", 0)
-            if route == "tuple":
-                processors = target._span_processors  # type: ignore[union-attr]
-                if ctx.patches.patch(target, "_span_processors", (*processors, processor)):
-                    self._tuple = (target, processor)
-                else:  # a tuple wardex may not replace: the same object's public method
-                    route = "public"
+        if route == "refused":
+            return
         self._note_schema(ctx, version)
         ctx.follow_current_span(_otel_trace.get_current_span)
-        if route == "public":
-            target.add_span_processor(processor)  # type: ignore[union-attr]
-            self._public = target
+        ctx.follow_tool_calls(_tool_call_of)
+        self._attach.commit()
         self._installed = True
 
     def _is_installed(self) -> bool:
@@ -238,35 +218,13 @@ class PydanticAiAdapter(AdapterInterface):
         ctx = self._ctx
         if ctx is not None:
             ctx.unfollow_current_span()
+            ctx.unfollow_tool_calls()
         if not self._installed:
             return
         self._installed = False
         if ctx is None:
             return
-        owned, self._owned = self._owned, None
-        if owned is not None and vars(owned[0]).get("_instrument_default") is not owned[1]:
-            report_once(
-                "pydantic_ai adapter: pydantic-ai's instrumentation was replaced after "
-                "wardex.init() (`Agent.instrument_all` or `logfire.instrument_pydantic_ai`), so "
-                "the adapter recorded none of pydantic-ai's runs from then on; call those before "
-                "init() and wardex attaches to them",
-                key="adapters.pydantic_ai.instrumentation_replaced",
-            )
-            ctx.count("instrumentation_replaced")
-        ctx.patches.restore_all()
-        attached, self._tuple = self._tuple, None
-        if attached is not None and attached[1] in getattr(attached[0], "_span_processors", ()):
-            self._public = attached[0]  # the host rebuilt the tuple: wardex's stays in it
-        if self._public is not None:
-            self._public = None
-            report_once(
-                "pydantic_ai adapter: wardex could not take its span processor back from the "
-                "OpenTelemetry provider it attached to (the provider has no remove, or the host "
-                "added a processor after wardex.init()); it stays registered but inert for the "
-                "life of this process",
-                key="adapters.pydantic_ai.processor_left_inert",
-            )
-            ctx.count("processor_left_inert")
+        self._attach.hand_back()
         try:
             self._unpin_held()
         finally:
@@ -332,34 +290,42 @@ class _Bridge:
         parent: object | None,
         start_ns: int,
         attrs_follow: bool,
-    ) -> None:
+    ) -> tuple[int, int] | None:
+        """Open the span's unit; answer its ids when one opened (Mode W gives them to the span)."""
         ctx = self._live()
         if ctx is None:
-            return
+            return None
+        ids = None
         ok = False
         with ctx.guard("start"):
             self._start(ctx, span, name, attrs, parent, start_ns, attrs_follow)
+            ids = _unit_ids(ctx.peek(span))
             ok = True
         if not ok:
             self._tripped(ctx, "start", ctx.peek(span))
+        return ids
 
-    def attributes_set(self, span: object, attrs: Mapping[str, object]) -> None:
-        """Mode W only, called on every `set_attribute(s)`: read once, for a pending chat."""
+    def attributes_set(self, span: object, attrs: Mapping[str, object]) -> tuple[int, int] | None:
+        """Mode W only, called on every `set_attribute(s)`: read once, for a pending chat, whose
+        unit's ids are answered once it opens."""
         ctx = self._adapter._ctx
         if ctx is None:
-            return
+            return None
         slot = ctx.peek(span)
         if slot is None or not slot.get("pending_chat") or "gen_ai.request.model" not in attrs:
-            return
+            return None
         if self._live() is None:
-            return
+            return None
+        ids = None
         ok = False
         with ctx.guard("attributes"):
             self._open_chat(ctx, slot, attrs, str(attrs["gen_ai.request.model"]))
+            ids = _unit_ids(slot)
             ok = True
         if not ok:
             slot["pending_chat"] = False
             self._tripped(ctx, "attributes", slot)
+        return ids
 
     def ended(
         self,
@@ -523,6 +489,9 @@ class _Bridge:
         arguments, _ = pa.content_for("tool", attrs)  # the arguments are set at START
         if arguments is not None:
             h.record_input(_shaped_payload(arguments, ctx.record_budget))
+        slot["tool_name"] = tool_name
+        if arguments is not None:
+            slot["tool_arguments"] = canonical_arguments(arguments)
         self._adopt(ctx, slot, h, pin=True)
         ctx.confirm_active("tool")
 
@@ -721,6 +690,17 @@ def _owner(ctx: AdapterContext, parent: object | None) -> dict[str, Any] | None:
         parent = record.get("parent")
         seen += 1
     return None
+
+
+def _unit_ids(slot: dict[str, Any] | None) -> tuple[int, int] | None:
+    """The ids wardex exports for the unit in `slot`, as OpenTelemetry's ints; None if none."""
+    h = slot.get("handle") if slot is not None else None
+    if not isinstance(h, RunHandle) or h.degraded:
+        return None
+    context = h.draft.context
+    trace_id = int.from_bytes(context.trace_id.value, "big")
+    span_id = int.from_bytes(context.span_id.value, "big")
+    return (trace_id, span_id) if trace_id and span_id else None
 
 
 def _run_was_cut(slot: dict[str, Any]) -> bool:

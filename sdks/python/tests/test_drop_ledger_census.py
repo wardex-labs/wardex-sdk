@@ -274,6 +274,10 @@ _CENSUS: dict[tuple[str, str, str], object] = {
     ("_adapters/_context_bridge.py", "count", "'usage_hold_refused'"): NotADrop(
         "a bridge asked to hold usage it may not hold; its numbers stay demoted extras on the span"
     ),
+    ("_adapters/_context_bridge.py", "count", "'tool_call_ambiguous'"): NotADrop(
+        "two live tool units share the name and the arguments; the wire call keeps the seam's own "
+        "placement and ships"
+    ),
     ("_adapters/_conversation.py", "count", "shadowed_counter"): NotADrop(
         "the host's conversation id wins over the framework's, which stays on the span"
     ),
@@ -480,9 +484,21 @@ _CENSUS: dict[tuple[str, str, str], object] = {
     ("_adapters/_pydantic_ai.py", "count", "'held_close'"): NotADrop(
         "a run held open until its last child closes; it ships then"
     ),
-    ("_adapters/_pydantic_ai.py", "count", "'instrumentation_replaced'"): NotADrop(
-        "a tally: the host replaced wardex's instrumentation settings after init(), so the "
-        "adapter received no spans from then on; said once at close"
+    ("_adapters/_pydantic_ai_attach.py", "count", "'instrumentation_replaced'"): NotADrop(
+        "a tally: the host replaced the instrumentation settings after init() without "
+        "`instrument_all`, so wardex could not follow; the host's choice, said once at close"
+    ),
+    ("_adapters/_pydantic_ai_attach.py", "count", "'instrumentation_followed'"): NotADrop(
+        "a tally: wardex attached to the instrumentation the host set after init(); nothing lost"
+    ),
+    ("_adapters/_pydantic_ai_attach.py", "count", "'instrumentation_off'"): NotADrop(
+        "a tally: the host turned pydantic-ai's instrumentation off after init(); there are no "
+        "framework spans to lose, and wire-level model calls still ship"
+    ),
+    ("_adapters/_pydantic_ai_attach.py", "count", "'instrumentation_not_followed'"): NotADrop(
+        "a tally: the host moved pydantic-ai's instrumentation after init() to a setup that "
+        "takes no span processor; the host's choice, said once, and wire-level model calls "
+        "still ship"
     ),
     ("_adapters/_pydantic_ai.py", "count", "'instrumentation_unreachable'"): L(
         "INSTRUMENTATION_UNAVAILABLE", at="_adapters/__init__.py"
@@ -496,7 +512,7 @@ _CENSUS: dict[tuple[str, str, str], object] = {
     ("_adapters/_pydantic_ai.py", "count", "'pin_stranded'"): NotADrop(
         "a pin left behind is released; nothing is dropped"
     ),
-    ("_adapters/_pydantic_ai.py", "count", "'processor_left_inert'"): NotADrop(
+    ("_adapters/_pydantic_ai_attach.py", "count", "'processor_left_inert'"): NotADrop(
         "a processor the provider cannot remove stays registered and records nothing"
     ),
     ("_adapters/_pydantic_ai.py", "count", "'schema_version'"): NotADrop(
@@ -510,16 +526,35 @@ _CENSUS: dict[tuple[str, str, str], object] = {
         "nests under the ambient unit"
     ),
     (
-        "_adapters/_pydantic_ai.py",
+        "_adapters/_pydantic_ai_attach.py",
         "report_once",
         "'adapters.pydantic_ai.processor_left_inert'",
     ): NotADrop("a processor the provider cannot remove stays registered and records nothing"),
     (
-        "_adapters/_pydantic_ai.py",
+        "_adapters/_pydantic_ai_attach.py",
         "report_once",
         "'adapters.pydantic_ai.instrumentation_replaced'",
     ): NotADrop(
-        "the host replaced wardex's instrumentation settings after init(); said once at close"
+        "the host replaced the instrumentation settings after init() without `instrument_all`; "
+        "said once at close"
+    ),
+    (
+        "_adapters/_pydantic_ai_attach.py",
+        "report_once",
+        "'adapters.pydantic_ai.instrumentation_followed'",
+    ): NotADrop("wardex attached to the instrumentation the host set after init(); said once"),
+    (
+        "_adapters/_pydantic_ai_attach.py",
+        "report_once",
+        "'adapters.pydantic_ai.instrumentation_off'",
+    ): NotADrop("the host turned pydantic-ai's instrumentation off after init(); said once"),
+    (
+        "_adapters/_pydantic_ai_attach.py",
+        "report_once",
+        "'adapters.pydantic_ai.instrumentation_not_followed'",
+    ): NotADrop(
+        "the host moved pydantic-ai's instrumentation after init() to a setup that takes no span "
+        "processor; said once"
     ),
     ("_adapters/_pydantic_ai.py", "report_once", "'adapters.pydantic_ai.schema_version'"): (
         NotADrop(
@@ -601,6 +636,21 @@ _CENSUS: dict[tuple[str, str, str], object] = {
     # -- assembly core
     ("_assembly/_bridge_latch.py", "bump", "'assembly._bridge_latch.parent_resolved'"): NotADrop(
         "a request parented one level deeper, to a bridge unit below the ambient one; nothing lost"
+    ),
+    (
+        "_assembly/_bridge_latch.py",
+        "bump",
+        "'assembly._bridge_latch.tool_call_resolved'",
+    ): NotADrop(
+        "a wire tool call parented to the bridge's live tool unit of its name; nothing lost"
+    ),
+    (
+        "_assembly/_bridge_latch.py",
+        "bump",
+        "'assembly._bridge_latch.tool_call_unproved'",
+    ): NotADrop(
+        "a tool unit matched by name only, outside the writer's run; the wire call keeps the "
+        "seam's own placement and ships"
     ),
     ("_assembly/_builder.py", "bump", "'assembly.builder.gen_ai_usage_not_inclusive'"): NotADrop(
         "an observation about upstream usage numbers; the span ships whole"
@@ -776,6 +826,11 @@ _CENSUS: dict[tuple[str, str, str], object] = {
         "report_once",
         "'interceptors.mcp_stdio.protocol_version_unreadable'",
     ): _VERSION_REFUSED,
+    (
+        "_interceptors/_mcp_result.py",
+        "bump",
+        "'interceptors.mcp_stdio.nested_under_tool_unit'",
+    ): NotADrop("the seam's tools/call nested under the framework's execute_tool; the span ships"),
     ("_interceptors/_mcp_stdio.py", "bump", "'interceptors.mcp_stdio.anyio_unavailable'"): _MCP,
     ("_interceptors/_mcp_stdio.py", "bump", "'interceptors.mcp_stdio.execute_tool_ceded'"): (
         _TOOL_CEDED
